@@ -3681,6 +3681,24 @@ fn handle_menu_success(
     })
 }
 
+/// Handles `USER32.dll!GetMenu` — returns the HMENU for a window, or 0.
+pub fn handle_get_menu(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let hwnd = engine.read_rcx()?;
+    let menu_handle = state
+        .windows
+        .iter()
+        .find(|w| w.handle == hwnd)
+        .map_or(0, |w| w.menu_handle);
+    let return_address = engine.return_from_win64_api(menu_handle)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: menu_handle,
+    })
+}
+
 /// Handles `USER32.dll!CreateMenu`.
 pub fn handle_create_menu(
     engine: &mut dyn wie_cpu::CpuEngine,

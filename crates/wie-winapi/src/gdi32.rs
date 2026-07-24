@@ -110,6 +110,33 @@ pub fn handle_get_object_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApi
     })
 }
 
+/// Stock object identifiers (wingdi.h).
+const STOCK_WHITE_BRUSH: u64 = 0;
+const STOCK_BLACK_BRUSH: u64 = 1;
+const STOCK_GRAY_BRUSH: u64 = 2;
+const STOCK_NULL_BRUSH: u64 = 5;
+const STOCK_SYSTEM_FONT: u64 = 13;
+const STOCK_DEFAULT_PALETTE: u64 = 15;
+
+/// Handles `GDI32.dll!GetStockObject` — returns predefined stock object handles.
+pub fn handle_get_stock_object(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let n_index = engine.read_rcx()? & 0xffff_ffff;
+    let handle = match n_index {
+        STOCK_WHITE_BRUSH => 0x0000_0000_6800_5001,
+        STOCK_BLACK_BRUSH => 0x0000_0000_6800_5002,
+        STOCK_GRAY_BRUSH => 0x0000_0000_6800_5003,
+        STOCK_NULL_BRUSH => 0x0000_0000_6800_5004,
+        STOCK_SYSTEM_FONT => 0x0000_0000_6800_5005,
+        STOCK_DEFAULT_PALETTE => 0x0000_0000_6800_5006,
+        _ => 0, // NULL for unknown stock objects
+    };
+    let return_address = engine.return_from_win64_api(handle)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: handle,
+    })
+}
+
 /// Handles `GDI32.dll!SelectObject`.
 pub fn handle_select_object(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _device_context_handle = engine

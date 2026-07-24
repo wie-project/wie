@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 
 const ERROR_SUCCESS: u64 = 0;
 const ERROR_FILE_NOT_FOUND: u64 = 2;
+const ERROR_NO_MORE_ITEMS: u64 = 259;
 const REG_CREATED_NEW_KEY: u32 = 1;
 const REG_OPENED_EXISTING_KEY: u32 = 2;
 
@@ -158,6 +159,8 @@ pub fn dispatch_advapi32_extra(
     match n.as_str() {
         "regopenkeyexw" => Ok(Some(handle_reg_open_key_ex_w(engine, state)?)),
         "regcreatekeyexw" => Ok(Some(handle_reg_create_key_ex_w(engine, state)?)),
+        "regenumkeyexw" | "regenumkeyexa" => Ok(Some(handle_reg_enum_key_ex(engine, state)?)),
+        "regenumvaluew" | "regenumvaluea" => Ok(Some(handle_reg_enum_value(engine, state)?)),
         "openprocesstoken" => Ok(Some(handle_open_process_token(engine, state)?)),
         "adjusttokenprivileges" => Ok(Some(handle_adjust_token_privileges(engine)?)),
         "lookupprivilegevaluew" | "lookupprivilegevaluea" => {
@@ -411,6 +414,69 @@ pub fn handle_set_security_descriptor_dacl(
         return_address,
         return_value,
     })
+}
+
+/// `LSTATUS RegEnumKeyExW(HKEY, DWORD, LPWSTR, LPDWORD, ...)`.
+fn handle_reg_enum_key_ex(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let hkey = engine.read_rcx()?;
+    let index = engine.read_rdx()? & 0xffff_ffff;
+    let name_buf = engine.read_r8()?;
+    let name_len_ptr = engine.read_r9()?;
+    let rsp = engine.read_rsp()?;
+    let _reserved = read_guest_u64(engine, checked_address(rsp, 0x28, "lpReserved")?).unwrap_or(0);
+    let _class = read_guest_u64(engine, checked_address(rsp, 0x30, "lpClass")?).unwrap_or(0);
+    let _class_len = read_guest_u64(engine, checked_address(rsp, 0x38, "lpcClass")?).unwrap_or(0);
+    let _ft = read_guest_u64(engine, checked_address(rsp, 0x40, "lpftLastWriteTime")?).unwrap_or(0);
+
+    // Gather all subkeys whose parent == hkey.
+    let subkeys: Vec<&String> = state
+        .registry_keys
+        .iter()
+        .filter(|k| k.parent == hkey)
+        .map(|k| &k.subkey)
+        .collect();
+
+    let idx = usize::try_from(index).unwrap_or(usize::MAX);
+    if idx >= subkeys.len() {
+        return return_status(engine, ERROR_NO_MORE_ITEMS);
+    }
+    let Some(name) = subkeys.get(idx) else {
+        return return_status(engine, ERROR_NO_MORE_ITEMS);
+    };
+    if name_buf == 0 || name_len_ptr == 0 {
+        return return_status(engine, 87); // ERROR_INVALID_PARAMETER
+    }
+    let mut len_buf = [0_u8; 4];
+    engine.mem_read(name_len_ptr, &mut len_buf)?;
+    let buf_len = u32::from_le_bytes(len_buf);
+    let units: Vec<u16> = name.encode_utf16().collect();
+    let needed = u32::try_from(units.len()).unwrap_or(0);
+    if needed >= buf_len {
+        write_guest_u32(engine, name_len_ptr, needed.saturating_add(1))?;
+        return return_status(engine, 122); // ERROR_INSUFFICIENT_BUFFER
+    }
+    let mut bytes = Vec::with_capacity(units.len().saturating_mul(2).saturating_add(2));
+    for u in &units {
+        bytes.extend_from_slice(&u.to_le_bytes());
+    }
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    engine.mem_write(name_buf, &bytes)?;
+    write_guest_u32(engine, name_len_ptr, needed)?;
+    return_status(engine, ERROR_SUCCESS)
+}
+
+/// `LSTATUS RegEnumValueW(HKEY, DWORD, LPWSTR, LPDWORD, ...)` — no values stored.
+fn handle_reg_enum_value(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    _state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _hkey = engine.read_rcx()?;
+    let _index = engine.read_rdx()?;
+    // No registry values are stored in the current model.
+    return_status(engine, ERROR_NO_MORE_ITEMS)
 }
 
 fn open_or_create_registry_key(

@@ -315,9 +315,11 @@ pub enum WinApiId {
     Kernel32Setfilepointerex = 302,
     Kernel32Setendoffile = 303,
     Kernel32Flushfilebuffers = 304,
+    User32Getmenu = 305,
+    Gdi32Getstockobject = 306,
 }
 
-pub const WINAPI_ID_COUNT: usize = 305;
+pub const WINAPI_ID_COUNT: usize = 307;
 
 impl WinApiId {
     /// Discriminant as `u16` (`#[repr(u16)]`).
@@ -1400,6 +1402,8 @@ static WINAPI_NAME_ROWS: &[(&str, &str, WinApiId)] = &[
         "idirect3d9::release",
         WinApiId::D3d9Idirect3d9Release,
     ),
+    ("user32.dll", "getmenu", WinApiId::User32Getmenu),
+    ("gdi32.dll", "getstockobject", WinApiId::Gdi32Getstockobject),
 ];
 
 /// Resolve library/export to id. Case-insensitive, allocation-free.
@@ -2014,6 +2018,8 @@ pub fn dispatch_winapi_id(
         WinApiId::User32Dispatchmessagea => user32::handle_dispatch_message_a(engine, state),
         WinApiId::D3d9Idirect3ddevice9Release => d3d9::handle_device_release(engine, state),
         WinApiId::D3d9Idirect3d9Release => d3d9::handle_direct3d9_release(engine, state),
+        WinApiId::User32Getmenu => user32::handle_get_menu(engine, state),
+        WinApiId::Gdi32Getstockobject => gdi32::handle_get_stock_object(engine),
     }
 }
 

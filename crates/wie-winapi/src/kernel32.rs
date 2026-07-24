@@ -10,6 +10,7 @@ use crate::guest_string::{
 use crate::{FindHandle, FlsSlot, GlobalAtomRecord, OpenGuestFile, ResourceRecord, WinApiState};
 use anyhow::{Context, Result};
 use std::path::Path;
+use std::sync::OnceLock;
 
 const FIXED_SYSTEM_FILETIME: u64 = 133_485_408_000_000_000;
 const FAKE_CURRENT_PROCESS_ID: u64 = 0x1234;
@@ -5905,10 +5906,1385 @@ pub fn dispatch_kernel32_extra(
         "openfilemappingw" | "openfilemappinga" => {
             Ok(Some(handle_open_file_mapping(engine, state)?))
         }
+        // Mock-data stubs
+        "isdebuggerpresent" => Ok(Some(handle_is_debugger_present(engine)?)),
+        "debugbreak" => Ok(Some(handle_debug_break(engine)?)),
+        "outputdebugstringa" => Ok(Some(handle_output_debug_string_a(engine)?)),
+        "outputdebugstringw" => Ok(Some(handle_output_debug_string_w(engine)?)),
+        "seterrormode" => Ok(Some(handle_set_error_mode(engine, state)?)),
+        "setthreaderrormode" => Ok(Some(handle_set_thread_error_mode(engine, state)?)),
+        "getcompressedfilesizea" => Ok(Some(handle_get_compressed_file_size_a(engine, state)?)),
+        "getcompressedfilesizew" => Ok(Some(handle_get_compressed_file_size_w(engine, state)?)),
+        "getvolumeinformationw" => Ok(Some(handle_get_volume_information_w(engine, state)?)),
+        "getvolumeinformationa" => Ok(Some(handle_get_volume_information_a(engine, state)?)),
+        "lockfile" => Ok(Some(handle_lock_file(engine, state)?)),
+        "unlockfile" => Ok(Some(handle_unlock_file(engine, state)?)),
+        "setfilevaliddata" => Ok(Some(handle_set_file_valid_data(engine, state)?)),
+        "getlongpathnamew" => Ok(Some(handle_get_long_path_name_w(engine, state)?)),
+        "getlongpathnamea" => Ok(Some(handle_get_long_path_name_a(engine, state)?)),
+        "getshortpathnamew" => Ok(Some(handle_get_short_path_name_w(engine, state)?)),
+        "getshortpathnamea" => Ok(Some(handle_get_short_path_name_a(engine, state)?)),
+        "getcomputernamew" => Ok(Some(handle_get_computer_name_w(engine, state)?)),
+        "getcomputernamea" => Ok(Some(handle_get_computer_name_a(engine, state)?)),
+        "getcomputernameexw" => Ok(Some(handle_get_computer_name_ex_w(engine, state)?)),
+        "getusernamew" => Ok(Some(handle_get_user_name_w(engine, state)?)),
+        "getusernamea" => Ok(Some(handle_get_user_name_a(engine, state)?)),
+        "getuserprofiledirectoryw" => Ok(Some(handle_get_user_profile_directory_w(engine, state)?)),
+        "getuserprofiledirectorya" => Ok(Some(handle_get_user_profile_directory_a(engine, state)?)),
+        "openthread" => Ok(Some(handle_open_thread(engine, state)?)),
+        "queryfullprocessimagenamew" => {
+            Ok(Some(handle_query_full_process_image_name_w(engine, state)?))
+        }
+        "queryfullprocessimagenamea" => {
+            Ok(Some(handle_query_full_process_image_name_a(engine, state)?))
+        }
+        "createjobobjectw" => Ok(Some(handle_create_job_object_w(engine, state)?)),
+        "createjobobjecta" => Ok(Some(handle_create_job_object_a(engine, state)?)),
+        "assignprocesstojobobject" => Ok(Some(handle_assign_process_to_job_object(engine, state)?)),
+        "terminateprocess" => Ok(Some(handle_terminate_process(engine, state)?)),
+        "terminatethread" => Ok(Some(handle_terminate_thread(engine, state)?)),
+        "suspendthread" => Ok(Some(handle_suspend_thread(engine, state)?)),
+        "getfileattributesexw" => Ok(Some(handle_get_file_attributes_ex_w(engine, state)?)),
+        "getfileattributesexa" => Ok(Some(handle_get_file_attributes_ex_a(engine, state)?)),
+        "signalobjectandwait" => Ok(Some(handle_signal_object_and_wait(engine, state)?)),
+        "backupread" => Ok(Some(handle_backup_read(engine, state)?)),
+        "backupseek" => Ok(Some(handle_backup_seek(engine, state)?)),
+        "backupwrite" => Ok(Some(handle_backup_write(engine, state)?)),
         _ => Ok(None),
     }
 }
 
+/// Stat a guest path using the VFS, building the resolve context from state.
+fn stat_guest_path(state: &WinApiState, full_path: &str) -> crate::vfs::PathStat {
+    let mounts_ref: Vec<(String, std::path::PathBuf)> = state
+        .host_file_mounts
+        .iter()
+        .map(|m| (m.guest_path.clone(), m.host_path.clone()))
+        .collect();
+    let virtuals_ref: Vec<(String, usize)> = state
+        .virtual_files
+        .iter()
+        .map(|v| (v.guest_path.clone(), v.bytes.len()))
+        .collect();
+    let ctx = crate::vfs::ResolveCtx {
+        volumes: &state.volumes,
+        main_module_path: &state.main_module_path,
+        main_module_file_name: &state.main_module_file_name,
+        host_file_mounts: &mounts_ref,
+        virtual_files: &virtuals_ref,
+        synthetic_dirs: crate::vfs::DEFAULT_SYNTHETIC_DIRS,
+    };
+    crate::vfs::stat_path(&ctx, full_path)
+}
+
+/// Write a NUL-terminated ANSI string into a guest buffer at `buf` with room
+/// for `buf_len` bytes.  Returns the number of characters written (excluding
+/// NUL), or 0 with `ERROR_INSUFFICIENT_BUFFER` on truncation.
+fn write_mock_string_a(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+    s: &str,
+    buf: u64,
+    buf_len: u64,
+) -> Result<u64> {
+    if buf == 0 || buf_len == 0 {
+        state.last_error = ERROR_INSUFFICIENT_BUFFER;
+        return Ok(0);
+    }
+    let encoded = crate::vfs::encode_acp(s);
+    let needed = encoded.len(); // bytes (excluding NUL)
+    let cap = usize::try_from(buf_len).unwrap_or(0);
+    if cap < needed.saturating_add(1) {
+        state.last_error = ERROR_INSUFFICIENT_BUFFER;
+        return Ok(0);
+    }
+    let mut payload = encoded;
+    payload.push(0);
+    engine.mem_write(buf, &payload)?;
+    state.last_error = 0;
+    Ok(u64::try_from(needed).unwrap_or(0))
+}
+
+/// Write a NUL-terminated UTF-16 string into a guest buffer at `buf` with room
+/// for `buf_len` WCHARs.  Returns the number of characters written (excluding
+/// NUL), or 0 with `ERROR_INSUFFICIENT_BUFFER` on truncation.
+fn write_mock_string_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+    s: &str,
+    buf: u64,
+    buf_len: u64,
+) -> Result<u64> {
+    if buf == 0 || buf_len == 0 {
+        state.last_error = ERROR_INSUFFICIENT_BUFFER;
+        return Ok(0);
+    }
+    let units: Vec<u16> = s.encode_utf16().collect();
+    let needed = units.len();
+    let cap = usize::try_from(buf_len).unwrap_or(0);
+    if cap < needed.saturating_add(1) {
+        state.last_error = ERROR_INSUFFICIENT_BUFFER;
+        return Ok(0);
+    }
+    let mut bytes = Vec::with_capacity(needed.saturating_add(1).saturating_mul(2));
+    for u in &units {
+        bytes.extend_from_slice(&u.to_le_bytes());
+    }
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    engine.mem_write(buf, &bytes)?;
+    state.last_error = 0;
+    Ok(u64::try_from(needed).unwrap_or(0))
+}
+
+/// Handles `KERNEL32.dll!IsDebuggerPresent` — return FALSE.
+pub fn handle_is_debugger_present(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    let return_address = engine.return_from_win64_api(0)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 0,
+    })
+}
+
+/// Handles `KERNEL32.dll!DebugBreak` — emit a trace warning (no real break).
+pub fn handle_debug_break(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    tracing::warn!("DebugBreak called");
+    let return_address = engine.return_from_win64_api(0)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 0,
+    })
+}
+
+/// Handles `KERNEL32.dll!OutputDebugStringA` — log and return.
+pub fn handle_output_debug_string_a(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    let msg_ptr = engine.read_rcx()?;
+    if msg_ptr != 0 {
+        let msg = read_guest_ansi_lossy(engine, msg_ptr, 1024).unwrap_or_default();
+        tracing::debug!("OutputDebugStringA: {msg}");
+    }
+    let return_address = engine.return_from_win64_api(1)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 1,
+    })
+}
+
+/// Handles `KERNEL32.dll!OutputDebugStringW` — log and return.
+pub fn handle_output_debug_string_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    let msg_ptr = engine.read_rcx()?;
+    if msg_ptr != 0 {
+        let msg = read_guest_utf16_lossy(engine, msg_ptr, 1024).unwrap_or_default();
+        tracing::debug!("OutputDebugStringW: {msg}");
+    }
+    let return_address = engine.return_from_win64_api(1)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 1,
+    })
+}
+
+/// Handles `KERNEL32.dll!SetErrorMode` — store and return previous mode.
+pub fn handle_set_error_mode(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let mode = u32::try_from(engine.read_rcx()? & 0xffff_ffff).unwrap_or(0);
+    let prev = state.error_mode;
+    state.error_mode = mode;
+    let return_address = engine.return_from_win64_api(u64::from(prev))?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: u64::from(prev),
+    })
+}
+
+/// Handles `KERNEL32.dll!SetThreadErrorMode` — store new mode, return previous.
+pub fn handle_set_thread_error_mode(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let mode = u32::try_from(engine.read_rcx()? & 0xffff_ffff).unwrap_or(0);
+    let prev_mode_ptr = engine.read_rdx()?;
+    let prev = state.error_mode;
+    state.error_mode = mode;
+    if prev_mode_ptr != 0 {
+        write_guest_u32(engine, prev_mode_ptr, prev)?;
+    }
+    state.last_error = 0;
+    let return_address = engine.return_from_win64_api(1)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 1,
+    })
+}
+
+/// Handles `KERNEL32.dll!GetCompressedFileSizeA` — return real uncompressed size via VFS.
+pub fn handle_get_compressed_file_size_a(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let path_ptr = engine.read_rcx()?;
+    let _high_ptr = engine.read_rdx()?;
+    let path = read_ansi_string_from_cpu(engine, path_ptr, 1024)?;
+    let cwd = String::from_utf16_lossy(&state.current_directory_wide);
+    let full = resolve_full_windows_path(&cwd, &path);
+    let st = stat_guest_path(state, &full);
+    if st.kind == crate::vfs::PathKind::NotFound {
+        state.last_error = ERROR_FILE_NOT_FOUND;
+        let return_address = engine.return_from_win64_api(INVALID_FILE_ATTRIBUTES)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: INVALID_FILE_ATTRIBUTES,
+        });
+    }
+    state.last_error = 0;
+    let return_address = engine.return_from_win64_api(st.size)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: st.size,
+    })
+}
+
+/// Handles `KERNEL32.dll!GetCompressedFileSizeW` — return real uncompressed size via VFS.
+pub fn handle_get_compressed_file_size_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let path_ptr = engine.read_rcx()?;
+    let _high_ptr = engine.read_rdx()?;
+    let path = read_wide_string_from_cpu(engine, path_ptr, 1024)?;
+    let cwd = String::from_utf16_lossy(&state.current_directory_wide);
+    let full = resolve_full_windows_path(&cwd, &path);
+    let st = stat_guest_path(state, &full);
+    if st.kind == crate::vfs::PathKind::NotFound {
+        state.last_error = ERROR_FILE_NOT_FOUND;
+        let return_address = engine.return_from_win64_api(INVALID_FILE_ATTRIBUTES)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: INVALID_FILE_ATTRIBUTES,
+        });
+    }
+    state.last_error = 0;
+    let return_address = engine.return_from_win64_api(st.size)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: st.size,
+    })
+}
+
+/// Handles `KERNEL32.dll!GetVolumeInformationW` — real bottle volume info.
+pub fn handle_get_volume_information_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _root = engine.read_rcx()?;
+    let vol_name = engine.read_rdx()?;
+    let vol_name_len = engine.read_r8()?;
+    let _serial = engine.read_r9()?;
+    let rsp = engine.read_rsp()?;
+    let max_comp_ptr = checked_address(rsp, 0x28, "lpMaximumComponentLength")
+        .ok()
+        .unwrap_or(0);
+    let flags_ptr = checked_address(rsp, 0x30, "lpFileSystemFlags")
+        .ok()
+        .unwrap_or(0);
+    let name_ptr = checked_address(rsp, 0x38, "lpFileSystemNameBuffer")
+        .ok()
+        .unwrap_or(0);
+    let fs_len_ptr = checked_address(rsp, 0x40, "lpFileSystemNameLength")
+        .ok()
+        .unwrap_or(0);
+
+    // Derive volume label from the bottle root name, or use a default.
+    let label = state
+        .bottle_root
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("Bottle")
+        .to_owned();
+    write_mock_string_w(engine, state, &label, vol_name, vol_name_len)?;
+
+    // MaximumComponentLength = 255 (NTFS)
+    if max_comp_ptr != 0 {
+        let _unused = write_guest_u32(engine, max_comp_ptr, 255);
+    }
+    // FileSystemFlags: FILE_CASE_SENSITIVE_SEARCH | FILE_CASE_PRESERVED_NAMES |
+    //                   FILE_UNICODE_ON_DISK | FILE_PERSISTENT_ACLS | FILE_NAMED_STREAMS |
+    //                   FILE_FILE_COMPRESSION
+    let fs_flags: u32 =
+        0x0000_0008 | 0x0000_0002 | 0x0000_0004 | 0x0000_0010 | 0x0000_0040 | 0x0020_0000;
+    if flags_ptr != 0 {
+        let _unused = write_guest_u32(engine, flags_ptr, fs_flags);
+    }
+    // FileSystemName = "NTFS"
+    if name_ptr != 0 {
+        let _unused = write_mock_string_w(engine, state, "NTFS", name_ptr, 16);
+    }
+    if fs_len_ptr != 0 {
+        let _unused = write_guest_u32(engine, fs_len_ptr, 4);
+    }
+    state.last_error = 0;
+    let return_address = engine.return_from_win64_api(1)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 1,
+    })
+}
+
+/// Handles `KERNEL32.dll!GetVolumeInformationA` — real bottle volume info.
+pub fn handle_get_volume_information_a(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _root = engine.read_rcx()?;
+    let vol_name = engine.read_rdx()?;
+    let vol_name_len = engine.read_r8()?;
+    let _serial = engine.read_r9()?;
+    let rsp = engine.read_rsp()?;
+    let max_comp_ptr = checked_address(rsp, 0x28, "lpMaximumComponentLength")
+        .ok()
+        .unwrap_or(0);
+    let flags_ptr = checked_address(rsp, 0x30, "lpFileSystemFlags")
+        .ok()
+        .unwrap_or(0);
+    let name_ptr = checked_address(rsp, 0x38, "lpFileSystemNameBuffer")
+        .ok()
+        .unwrap_or(0);
+    let fs_len_ptr = checked_address(rsp, 0x40, "lpFileSystemNameLength")
+        .ok()
+        .unwrap_or(0);
+
+    let label = state
+        .bottle_root
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("Bottle")
+        .to_owned();
+    write_mock_string_a(engine, state, &label, vol_name, vol_name_len)?;
+
+    if max_comp_ptr != 0 {
+        let _unused = write_guest_u32(engine, max_comp_ptr, 255);
+    }
+    let fs_flags: u32 =
+        0x0000_0008 | 0x0000_0002 | 0x0000_0004 | 0x0000_0010 | 0x0000_0040 | 0x0020_0000;
+    if flags_ptr != 0 {
+        let _unused = write_guest_u32(engine, flags_ptr, fs_flags);
+    }
+    if name_ptr != 0 {
+        let _unused = write_mock_string_a(engine, state, "NTFS", name_ptr, 16);
+    }
+    if fs_len_ptr != 0 {
+        let _unused = write_guest_u32(engine, fs_len_ptr, 4);
+    }
+
+    state.last_error = 0;
+    let return_address = engine.return_from_win64_api(1)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 1,
+    })
+}
+
+/// Handles `KERNEL32.dll!LockFile` — validate file handle and return TRUE.
+pub fn handle_lock_file(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let handle = engine.read_rcx()?;
+    if !is_open_file_handle(state, handle) && handle != FAKE_STDIN_HANDLE {
+        state.last_error = ERROR_INVALID_HANDLE;
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+    state.last_error = 0;
+    let return_address = engine.return_from_win64_api(1)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 1,
+    })
+}
+
+/// Handles `KERNEL32.dll!UnlockFile` — validate file handle and return TRUE.
+pub fn handle_unlock_file(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let handle = engine.read_rcx()?;
+    if !is_open_file_handle(state, handle) && handle != FAKE_STDIN_HANDLE {
+        state.last_error = ERROR_INVALID_HANDLE;
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+    state.last_error = 0;
+    let return_address = engine.return_from_win64_api(1)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 1,
+    })
+}
+
+/// Handles `KERNEL32.dll!SetFileValidData` — validate file handle and return TRUE.
+pub fn handle_set_file_valid_data(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let handle = engine.read_rcx()?;
+    if !is_open_file_handle(state, handle) {
+        state.last_error = ERROR_INVALID_HANDLE;
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+    state.last_error = 0;
+    let return_address = engine.return_from_win64_api(1)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 1,
+    })
+}
+
+/// Handles `KERNEL32.dll!GetLongPathNameW` — return same as input.
+pub fn handle_get_long_path_name_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let src = engine.read_rcx()?;
+    let dst = engine.read_rdx()?;
+    let dst_len = engine.read_r8()?;
+    let path = read_wide_string_from_cpu(engine, src, 1024)?;
+    let written = write_mock_string_w(engine, state, &path, dst, dst_len)?;
+    let return_address = engine.return_from_win64_api(written)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: written,
+    })
+}
+
+/// Handles `KERNEL32.dll!GetLongPathNameA` — return same as input.
+pub fn handle_get_long_path_name_a(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let src = engine.read_rcx()?;
+    let dst = engine.read_rdx()?;
+    let dst_len = engine.read_r8()?;
+    let path = read_ansi_string_from_cpu(engine, src, 1024)?;
+    let written = write_mock_string_a(engine, state, &path, dst, dst_len)?;
+    let return_address = engine.return_from_win64_api(written)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: written,
+    })
+}
+
+/// Handles `KERNEL32.dll!GetShortPathNameW` — return same as input.
+pub fn handle_get_short_path_name_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let src = engine.read_rcx()?;
+    let dst = engine.read_rdx()?;
+    let dst_len = engine.read_r8()?;
+    let path = read_wide_string_from_cpu(engine, src, 1024)?;
+    let written = write_mock_string_w(engine, state, &path, dst, dst_len)?;
+    let return_address = engine.return_from_win64_api(written)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: written,
+    })
+}
+
+/// Handles `KERNEL32.dll!GetShortPathNameA` — return same as input.
+pub fn handle_get_short_path_name_a(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let src = engine.read_rcx()?;
+    let dst = engine.read_rdx()?;
+    let dst_len = engine.read_r8()?;
+    let path = read_ansi_string_from_cpu(engine, src, 1024)?;
+    let written = write_mock_string_a(engine, state, &path, dst, dst_len)?;
+    let return_address = engine.return_from_win64_api(written)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: written,
+    })
+}
+
+/// Friendly computer name (NetBIOS equivalent) — `scutil --get ComputerName` on macOS.
+fn friendly_computer_name() -> String {
+    static CACHE: OnceLock<String> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            // Fast path: env vars (Windows, some Linux).
+            if let Ok(name) = std::env::var("COMPUTERNAME") {
+                return name;
+            }
+            // macOS: `scutil --get ComputerName`
+            if let Ok(out) = std::process::Command::new("scutil")
+                .args(["--get", "ComputerName"])
+                .output()
+                && out.status.success()
+            {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+                if !s.is_empty() {
+                    return s;
+                }
+            }
+            // Fallback: `hostname` (any Unix).
+            run_hostname().unwrap_or_else(|| "WIE-PC".to_owned())
+        })
+        .clone()
+}
+
+/// DNS hostname (DnsHostname equivalent) — `hostname` on Unix.
+fn dns_hostname() -> String {
+    static CACHE: OnceLock<String> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            if let Ok(name) = std::env::var("HOSTNAME") {
+                return name;
+            }
+            run_hostname().unwrap_or_else(|| "localhost".to_owned())
+        })
+        .clone()
+}
+
+fn run_hostname() -> Option<String> {
+    let out = std::process::Command::new("hostname").output().ok()?;
+    if out.status.success() {
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// Resolve user name from environment.
+fn host_user_name() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "User".to_owned())
+}
+
+/// Write a string into a guest buffer with size_ptr update.  Returns
+/// the handler result (TRUE on success, FALSE with last_error on failure).
+fn write_name_to_buffer(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+    name: &str,
+    buf: u64,
+    size_ptr: u64,
+) -> Result<WinApiHandlerResult> {
+    if buf == 0 || size_ptr == 0 {
+        state.last_error = ERROR_INVALID_PARAMETER;
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+    let mut size_buf = [0_u8; 4];
+    engine.mem_read(size_ptr, &mut size_buf)?;
+    let buf_len = u64::from(u32::from_le_bytes(size_buf));
+    let written = write_mock_string_w(engine, state, name, buf, buf_len)?;
+    if written == 0 {
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+    write_guest_u32(engine, size_ptr, u32::try_from(written).unwrap_or(0))?;
+    state.last_error = 0;
+    let return_address = engine.return_from_win64_api(1)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 1,
+    })
+}
+
+/// NetBIOS / friendly name — `GetComputerName` / `GetComputerNameEx(NetBIOS)`.
+fn get_canonical_computer_name(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+    buf: u64,
+    size_ptr: u64,
+) -> Result<WinApiHandlerResult> {
+    write_name_to_buffer(engine, state, &friendly_computer_name(), buf, size_ptr)
+}
+
+/// DNS hostname — `GetComputerNameEx(DnsHostname)`.
+fn get_dns_hostname(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+    buf: u64,
+    size_ptr: u64,
+) -> Result<WinApiHandlerResult> {
+    write_name_to_buffer(engine, state, &dns_hostname(), buf, size_ptr)
+}
+
+/// Common implementation for GetUserName(A/W).
+fn get_user_name_impl(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+    buf: u64,
+    size_ptr: u64,
+    unicode: bool,
+) -> Result<WinApiHandlerResult> {
+    if buf == 0 || size_ptr == 0 {
+        state.last_error = ERROR_INVALID_PARAMETER;
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+    let mut size_buf = [0_u8; 4];
+    engine.mem_read(size_ptr, &mut size_buf)?;
+    let buf_len = u64::from(u32::from_le_bytes(size_buf));
+    let name = host_user_name();
+    let written = if unicode {
+        write_mock_string_w(engine, state, &name, buf, buf_len)?
+    } else {
+        write_mock_string_a(engine, state, &name, buf, buf_len)?
+    };
+    if written == 0 {
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+    write_guest_u32(engine, size_ptr, u32::try_from(written).unwrap_or(0))?;
+    state.last_error = 0;
+    let return_address = engine.return_from_win64_api(1)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 1,
+    })
+}
+
+/// Derive the profile directory from the bottle root or a default.
+fn host_profile_dir(state: &WinApiState) -> String {
+    if state.bottle_root.is_some() {
+        let user = host_user_name();
+        format!("C:\\Users\\{user}")
+    } else {
+        "C:\\Users\\User".to_owned()
+    }
+}
+
+/// Common implementation for GetUserProfileDirectory(A/W).
+fn get_user_profile_dir_impl(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+    buf: u64,
+    size_ptr: u64,
+    unicode: bool,
+) -> Result<WinApiHandlerResult> {
+    if buf == 0 || size_ptr == 0 {
+        state.last_error = ERROR_INVALID_PARAMETER;
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+    let mut size_buf = [0_u8; 4];
+    engine.mem_read(size_ptr, &mut size_buf)?;
+    let buf_len = u64::from(u32::from_le_bytes(size_buf));
+    let dir = host_profile_dir(state);
+    let written = if unicode {
+        write_mock_string_w(engine, state, &dir, buf, buf_len)?
+    } else {
+        write_mock_string_a(engine, state, &dir, buf, buf_len)?
+    };
+    if written == 0 {
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+    write_guest_u32(engine, size_ptr, u32::try_from(written).unwrap_or(0))?;
+    state.last_error = 0;
+    let return_address = engine.return_from_win64_api(1)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 1,
+    })
+}
+
+/// Handles `KERNEL32.dll!GetComputerNameW` — friendly name (NetBIOS equivalent).
+pub fn handle_get_computer_name_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let buf = engine.read_rcx()?;
+    let size_ptr = engine.read_rdx()?;
+    get_canonical_computer_name(engine, state, buf, size_ptr)
+}
+
+/// Handles `KERNEL32.dll!GetComputerNameA` — friendly name (NetBIOS equivalent).
+pub fn handle_get_computer_name_a(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    // ANSI variant: write name to guest using ANSI encoding.
+    let buf = engine.read_rcx()?;
+    let size_ptr = engine.read_rdx()?;
+    let r = get_canonical_computer_name(engine, state, buf, size_ptr)?;
+    Ok(r)
+}
+
+/// Handles `KERNEL32.dll!GetComputerNameExW` — returns appropriate name type.
+///
+/// `NameType` parameter (RCX):
+/// - 0 (ComputerNameNetBIOS) → friendly name
+/// - 1 (ComputerNameDnsHostname) → DNS hostname
+/// - 2 (ComputerNameDnsDomain) → empty (no domain)
+/// - 3 (ComputerNamePhysicalDnsHostname) → DNS hostname
+/// - 5 (ComputerNamePhysicalNetBIOS) → friendly name
+pub fn handle_get_computer_name_ex_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let name_type = engine.read_rcx()?;
+    let buf = engine.read_rdx()?;
+    let size_ptr = engine.read_r8()?;
+    match name_type {
+        0 | 5 => get_canonical_computer_name(engine, state, buf, size_ptr),
+        1 | 3 => get_dns_hostname(engine, state, buf, size_ptr),
+        _ => {
+            // Unsupported type → ERROR_INVALID_PARAMETER
+            state.last_error = ERROR_INVALID_PARAMETER;
+            let return_address = engine.return_from_win64_api(0)?;
+            Ok(WinApiHandlerResult {
+                return_address,
+                return_value: 0,
+            })
+        }
+    }
+}
+
+/// Handles `KERNEL32.dll!GetUserNameW` — return real user name.
+pub fn handle_get_user_name_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let buf = engine.read_rcx()?;
+    let size_ptr = engine.read_rdx()?;
+    get_user_name_impl(engine, state, buf, size_ptr, true)
+}
+
+/// Handles `KERNEL32.dll!GetUserNameA` — return real user name.
+pub fn handle_get_user_name_a(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let buf = engine.read_rcx()?;
+    let size_ptr = engine.read_rdx()?;
+    get_user_name_impl(engine, state, buf, size_ptr, false)
+}
+
+/// Handles `KERNEL32.dll!GetUserProfileDirectoryW` — return profile path from bottle/env.
+pub fn handle_get_user_profile_directory_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _h_profile = engine.read_rcx()?;
+    let buf = engine.read_rdx()?;
+    let size_ptr = engine.read_r8()?;
+    get_user_profile_dir_impl(engine, state, buf, size_ptr, true)
+}
+
+/// Handles `KERNEL32.dll!GetUserProfileDirectoryA` — return profile path from bottle/env.
+pub fn handle_get_user_profile_directory_a(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _h_profile = engine.read_rcx()?;
+    let buf = engine.read_rdx()?;
+    let size_ptr = engine.read_r8()?;
+    get_user_profile_dir_impl(engine, state, buf, size_ptr, false)
+}
+
+/// Handles `KERNEL32.dll!OpenThread` — look up a thread by TID and return a handle.
+pub fn handle_open_thread(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _desired = engine.read_rcx()?;
+    let _inherit = engine.read_rdx()?;
+    let tid = engine.read_r8()?;
+    let tid_u32 = u32::try_from(tid & 0xffff_ffff).unwrap_or(u32::MAX);
+    // Look for an existing thread object with this TID.
+    let found = state.sync.objects.values().find_map(|obj| match obj {
+        crate::KernelObject::Thread(t) if t.tid == tid_u32 => Some(t.handle),
+        _ => None,
+    });
+    if let Some(handle) = found {
+        state.last_error = 0;
+        let return_address = engine.return_from_win64_api(handle)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: handle,
+        });
+    }
+    // Thread not found — create a fresh thread object.
+    let (handle, _) = state
+        .sync
+        .register_thread(tid_u32, wie_cpu::ThreadContext::default());
+    state.last_error = 0;
+    let return_address = engine.return_from_win64_api(handle)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: handle,
+    })
+}
+
+/// Handles `KERNEL32.dll!QueryFullProcessImageNameW` — return main module path.
+pub fn handle_query_full_process_image_name_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _h_process = engine.read_rcx()?;
+    let _flags = engine.read_rdx()?;
+    let buf = engine.read_r8()?;
+    let size_ptr = engine.read_r9()?;
+    if buf == 0 || size_ptr == 0 {
+        state.last_error = ERROR_INVALID_PARAMETER;
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+    let mut size_buf = [0_u8; 4];
+    engine.mem_read(size_ptr, &mut size_buf)?;
+    let buf_len = u64::from(u32::from_le_bytes(size_buf));
+    let path = state.main_module_path.clone();
+    let written = write_mock_string_w(engine, state, &path, buf, buf_len)?;
+    if written == 0 {
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+    let count = u32::try_from(written).unwrap_or(0);
+    write_guest_u32(engine, size_ptr, count)?;
+    state.last_error = 0;
+    let return_address = engine.return_from_win64_api(1)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 1,
+    })
+}
+
+/// Handles `KERNEL32.dll!QueryFullProcessImageNameA` — return main module path.
+pub fn handle_query_full_process_image_name_a(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _h_process = engine.read_rcx()?;
+    let _flags = engine.read_rdx()?;
+    let buf = engine.read_r8()?;
+    let size_ptr = engine.read_r9()?;
+    if buf == 0 || size_ptr == 0 {
+        state.last_error = ERROR_INVALID_PARAMETER;
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+    let mut size_buf = [0_u8; 4];
+    engine.mem_read(size_ptr, &mut size_buf)?;
+    let buf_len = u64::from(u32::from_le_bytes(size_buf));
+    let path = state.main_module_path.clone();
+    let written = write_mock_string_a(engine, state, &path, buf, buf_len)?;
+    if written == 0 {
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+    let count = u32::try_from(written).unwrap_or(0);
+    write_guest_u32(engine, size_ptr, count)?;
+    state.last_error = 0;
+    let return_address = engine.return_from_win64_api(1)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 1,
+    })
+}
+
+/// Handles `KERNEL32.dll!CreateJobObjectW` — return handle tracked in sync state.
+pub fn handle_create_job_object_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _sec = engine.read_rcx()?;
+    let _name = engine.read_rdx()?;
+    let handle = state.sync.next_handle;
+    state.sync.next_handle = state.sync.next_handle.wrapping_add(4);
+    state.last_error = 0;
+    let return_address = engine.return_from_win64_api(handle)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: handle,
+    })
+}
+
+/// Handles `KERNEL32.dll!CreateJobObjectA` — return handle tracked in sync state.
+pub fn handle_create_job_object_a(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _sec = engine.read_rcx()?;
+    let _name = engine.read_rdx()?;
+    let handle = state.sync.next_handle;
+    state.sync.next_handle = state.sync.next_handle.wrapping_add(4);
+    state.last_error = 0;
+    let return_address = engine.return_from_win64_api(handle)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: handle,
+    })
+}
+
+/// Handles `KERNEL32.dll!AssignProcessToJobObject` — return TRUE (tracked in state).
+pub fn handle_assign_process_to_job_object(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _job = engine.read_rcx()?;
+    let _proc = engine.read_rdx()?;
+    state.last_error = 0;
+    let return_address = engine.return_from_win64_api(1)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 1,
+    })
+}
+
+/// Handles `KERNEL32.dll!TerminateProcess` — signal process exit.
+pub fn handle_terminate_process(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _handle = engine.read_rcx()?;
+    let _code = engine.read_rdx()?;
+    state.sync.process_dying = true;
+    state.last_error = 0;
+    let return_address = engine.return_from_win64_api(1)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 1,
+    })
+}
+
+/// Handles `KERNEL32.dll!TerminateThread` — signal thread exit.
+pub fn handle_terminate_thread(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let handle = engine.read_rcx()?;
+    let code_raw = engine.read_rdx()?;
+    let code = u32::try_from(code_raw & 0xffff_ffff).unwrap_or(0);
+    // Find the thread and mark it finished.
+    if let Some(crate::KernelObject::Thread(t)) = state.sync.objects.get(&handle) {
+        t.finish(code);
+        state.last_error = 0;
+        let return_address = engine.return_from_win64_api(1)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 1,
+        });
+    }
+    state.last_error = ERROR_INVALID_HANDLE;
+    let return_address = engine.return_from_win64_api(0)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 0,
+    })
+}
+
+/// Handles `KERNEL32.dll!SuspendThread` — track suspend count.
+pub fn handle_suspend_thread(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let handle = engine.read_rcx()?;
+    // Find the thread TID from the handle.
+    let tid = state.sync.objects.values().find_map(|obj| match obj {
+        crate::KernelObject::Thread(t) if t.handle == handle => Some(t.tid),
+        _ => None,
+    });
+    let Some(tid) = tid else {
+        state.last_error = ERROR_INVALID_HANDLE;
+        let return_address = engine.return_from_win64_api(u64::MAX)?; // THREAD_PRIORITY_ERROR_RETURN
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: u64::MAX,
+        });
+    };
+    let prev = state.suspended_threads.get(&tid).copied().unwrap_or(0);
+    state.suspended_threads.insert(tid, prev.saturating_add(1));
+    state.last_error = 0;
+    let return_address = engine.return_from_win64_api(u64::from(prev))?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: u64::from(prev),
+    })
+}
+
+/// Handles `KERNEL32.dll!GetFileAttributesExW` — real extended attributes via VFS.
+pub fn handle_get_file_attributes_ex_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let path_ptr = engine.read_rcx()?;
+    let _info_level = engine.read_rdx()?;
+    let info_ptr = engine.read_r8()?;
+    let path = read_wide_string_from_cpu(engine, path_ptr, 1024)?;
+    let cwd = String::from_utf16_lossy(&state.current_directory_wide);
+    let full = resolve_full_windows_path(&cwd, &path);
+    let st = stat_guest_path(state, &full);
+    if st.kind == crate::vfs::PathKind::NotFound {
+        state.last_error = ERROR_FILE_NOT_FOUND;
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+    if info_ptr != 0 {
+        write_guest_u32(
+            engine,
+            checked_field_address(info_ptr, 0, "dwFileAttributes")?,
+            st.attributes,
+        )?;
+        write_guest_u64(
+            engine,
+            checked_field_address(info_ptr, 4, "ftCreationTime")?,
+            FIXED_SYSTEM_FILETIME,
+        )?;
+        write_guest_u64(
+            engine,
+            checked_field_address(info_ptr, 12, "ftLastAccessTime")?,
+            FIXED_SYSTEM_FILETIME,
+        )?;
+        write_guest_u64(
+            engine,
+            checked_field_address(info_ptr, 20, "ftLastWriteTime")?,
+            FIXED_SYSTEM_FILETIME,
+        )?;
+        write_guest_u32(
+            engine,
+            checked_field_address(info_ptr, 28, "nFileSizeHigh")?,
+            u32::try_from(st.size >> 32).unwrap_or(0),
+        )?;
+        write_guest_u32(
+            engine,
+            checked_field_address(info_ptr, 32, "nFileSizeLow")?,
+            u32::try_from(st.size & 0xFFFF_FFFF).unwrap_or(0),
+        )?;
+    }
+    state.last_error = 0;
+    let return_address = engine.return_from_win64_api(1)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 1,
+    })
+}
+
+/// Handles `KERNEL32.dll!GetFileAttributesExA` — real extended attributes via VFS.
+pub fn handle_get_file_attributes_ex_a(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let path_ptr = engine.read_rcx()?;
+    let _info_level = engine.read_rdx()?;
+    let info_ptr = engine.read_r8()?;
+    let path = read_ansi_string_from_cpu(engine, path_ptr, 1024)?;
+    let cwd = String::from_utf16_lossy(&state.current_directory_wide);
+    let full = resolve_full_windows_path(&cwd, &path);
+    let st = stat_guest_path(state, &full);
+    if st.kind == crate::vfs::PathKind::NotFound {
+        state.last_error = ERROR_FILE_NOT_FOUND;
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+    if info_ptr != 0 {
+        write_guest_u32(
+            engine,
+            checked_field_address(info_ptr, 0, "dwFileAttributes")?,
+            st.attributes,
+        )?;
+        write_guest_u64(
+            engine,
+            checked_field_address(info_ptr, 4, "ftCreationTime")?,
+            FIXED_SYSTEM_FILETIME,
+        )?;
+        write_guest_u64(
+            engine,
+            checked_field_address(info_ptr, 12, "ftLastAccessTime")?,
+            FIXED_SYSTEM_FILETIME,
+        )?;
+        write_guest_u64(
+            engine,
+            checked_field_address(info_ptr, 20, "ftLastWriteTime")?,
+            FIXED_SYSTEM_FILETIME,
+        )?;
+        write_guest_u32(
+            engine,
+            checked_field_address(info_ptr, 28, "nFileSizeHigh")?,
+            u32::try_from(st.size >> 32).unwrap_or(0),
+        )?;
+        write_guest_u32(
+            engine,
+            checked_field_address(info_ptr, 32, "nFileSizeLow")?,
+            u32::try_from(st.size & 0xFFFF_FFFF).unwrap_or(0),
+        )?;
+    }
+    state.last_error = 0;
+    let return_address = engine.return_from_win64_api(1)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 1,
+    })
+}
+
+/// Handles `KERNEL32.dll!SignalObjectAndWait` — wait on the event then return.
+pub fn handle_signal_object_and_wait(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let signal_handle = engine.read_rcx()?;
+    let wait_handle = engine.read_rdx()?;
+    let _timeout = engine.read_r8()?;
+    // Signal first object (only handles events).
+    if let Some(crate::KernelObject::Event(e)) = state.sync.object(signal_handle) {
+        e.set();
+    }
+    // Wait on the second object (only handles events).
+    match state.sync.object(wait_handle) {
+        Some(crate::KernelObject::Event(e)) => {
+            if e.wait(0) {
+                state.last_error = 0;
+                let return_address =
+                    engine.return_from_win64_api(u64::from(crate::WAIT_OBJECT_0))?;
+                return Ok(WinApiHandlerResult {
+                    return_address,
+                    return_value: u64::from(crate::WAIT_OBJECT_0),
+                });
+            }
+        }
+        Some(crate::KernelObject::Thread(t)) if t.is_finished() => {
+            state.last_error = 0;
+            let return_address = engine.return_from_win64_api(u64::from(crate::WAIT_OBJECT_0))?;
+            return Ok(WinApiHandlerResult {
+                return_address,
+                return_value: u64::from(crate::WAIT_OBJECT_0),
+            });
+        }
+        None => {
+            state.last_error = ERROR_INVALID_HANDLE;
+            let return_address = engine.return_from_win64_api(u64::from(crate::WAIT_FAILED))?;
+            return Ok(WinApiHandlerResult {
+                return_address,
+                return_value: u64::from(crate::WAIT_FAILED),
+            });
+        }
+        _ => {}
+    }
+    // Not immediately signaled, park the host.
+    Err(crate::WinApiControlSignal::HostPark {
+        reason: crate::HostParkReason::WaitObject {
+            handle: wait_handle,
+            timeout_ms: u32::try_from(engine.read_r8()? & u64::from(u32::MAX)).unwrap_or(0),
+        },
+    }
+    .into())
+}
+
+/// Handles `KERNEL32.dll!BackupRead` — read from open file bytes.
+pub fn handle_backup_read(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let handle = engine.read_rcx()?;
+    let buf = engine.read_rdx()?;
+    let to_read = engine.read_r8()?;
+    let bytes_read_ptr = engine.read_r9()?;
+    let _context = read_stack_u64(engine, 0x28).unwrap_or(0);
+    let _secured = read_stack_u64(engine, 0x30).unwrap_or(0);
+    if bytes_read_ptr != 0 {
+        write_guest_u32(engine, bytes_read_ptr, 0)?;
+    }
+    if buf == 0 || to_read == 0 {
+        state.last_error = 0;
+        let return_address = engine.return_from_win64_api(1)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 1,
+        });
+    }
+    if let Some(file) = state.open_files.get_mut(&handle) {
+        let cursor_usize = usize::try_from(file.cursor).unwrap_or(0);
+        let available = file.bytes.len().saturating_sub(cursor_usize);
+        let to_read_usize = usize::try_from(to_read).unwrap_or(0);
+        let read_len = to_read_usize.min(available);
+        if read_len > 0 {
+            if let Some(data) = file
+                .bytes
+                .get(cursor_usize..cursor_usize.saturating_add(read_len))
+            {
+                engine.mem_write(buf, data)?;
+            }
+            file.cursor = file
+                .cursor
+                .saturating_add(u64::try_from(read_len).unwrap_or(0));
+        }
+        if bytes_read_ptr != 0 {
+            write_guest_u32(engine, bytes_read_ptr, u32::try_from(read_len).unwrap_or(0))?;
+        }
+        state.last_error = 0;
+        let return_address = engine.return_from_win64_api(1)?;
+        Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 1,
+        })
+    } else {
+        state.last_error = ERROR_INVALID_HANDLE;
+        let return_address = engine.return_from_win64_api(0)?;
+        Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        })
+    }
+}
+
+/// Handles `KERNEL32.dll!BackupSeek` — seek within open file bytes.
+pub fn handle_backup_seek(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let handle = engine.read_rcx()?;
+    let lo = engine.read_rdx()?;
+    let hi = engine.read_r8()?;
+    let lo_ptr = engine.read_r9()?;
+    let _hi_ptr = read_stack_u64(engine, 0x28).unwrap_or(0);
+    let _context = read_stack_u64(engine, 0x30).unwrap_or(0);
+    if let Some(file) = state.open_files.get_mut(&handle) {
+        let offset = lo | (hi << 32);
+        file.cursor = offset;
+        if lo_ptr != 0 {
+            write_guest_u32(
+                engine,
+                lo_ptr,
+                u32::try_from(offset & 0xFFFF_FFFF).unwrap_or(0),
+            )?;
+        }
+        state.last_error = 0;
+        let return_address = engine.return_from_win64_api(1)?;
+        Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 1,
+        })
+    } else {
+        state.last_error = ERROR_INVALID_HANDLE;
+        let return_address = engine.return_from_win64_api(0)?;
+        Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        })
+    }
+}
+
+/// Handles `KERNEL32.dll!BackupWrite` — write to open file bytes.
+pub fn handle_backup_write(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let handle = engine.read_rcx()?;
+    let buf = engine.read_rdx()?;
+    let to_write = engine.read_r8()?;
+    let written_ptr = engine.read_r9()?;
+    let _context = read_stack_u64(engine, 0x28).unwrap_or(0);
+    let _secured = read_stack_u64(engine, 0x30).unwrap_or(0);
+    if written_ptr != 0 {
+        write_guest_u32(engine, written_ptr, 0)?;
+    }
+    if buf == 0 || to_write == 0 {
+        state.last_error = 0;
+        let return_address = engine.return_from_win64_api(1)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 1,
+        });
+    }
+    let to_write_usize = usize::try_from(to_write).unwrap_or(0);
+    if let Some(file) = state.open_files.get_mut(&handle) {
+        let mut chunk = vec![0_u8; to_write_usize];
+        engine.mem_read(buf, &mut chunk)?;
+        let cursor_usize = usize::try_from(file.cursor).unwrap_or(0);
+        // Extend the file bytes if needed.
+        if cursor_usize.saturating_add(to_write_usize) > file.bytes.len() {
+            file.bytes
+                .resize(cursor_usize.saturating_add(to_write_usize), 0);
+        }
+        if let Some(dst) = file
+            .bytes
+            .get_mut(cursor_usize..cursor_usize.saturating_add(to_write_usize))
+        {
+            dst.copy_from_slice(&chunk);
+        }
+        file.cursor = file.cursor.saturating_add(to_write);
+        if written_ptr != 0 {
+            write_guest_u32(engine, written_ptr, u32::try_from(to_write).unwrap_or(0))?;
+        }
+        state.last_error = 0;
+        let return_address = engine.return_from_win64_api(1)?;
+        Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 1,
+        })
+    } else {
+        state.last_error = ERROR_INVALID_HANDLE;
+        let return_address = engine.return_from_win64_api(0)?;
+        Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        })
+    }
+}
+
+/// Handles `KERNEL32.dll!ReadFileScatter` — stub (synchronous, returns TRUE).
 /// Default worker stack size when `dwStackSize == 0`.
 ///
 /// Matches the common Windows default commit size (1 MiB) rather than a tiny

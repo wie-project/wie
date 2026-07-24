@@ -328,6 +328,8 @@ pub(crate) fn default_winapi_state(
         loaded_modules: std::collections::HashMap::new(),
         next_module_handle: wie_winapi::dll_loader::REAL_MODULE_HANDLE_BASE,
         main_module_host_dir: None,
+        error_mode: 0,
+        suspended_threads: std::collections::HashMap::new(),
     })
 }
 
