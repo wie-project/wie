@@ -170,6 +170,17 @@ $(OUT)/seh_div_zero.exe: seh/div_zero/main.cpp | $(OUT)
 	$(MINGW_CLANG) $(SEH_CLANG_FLAGS) -o $@ $< -lkernel32
 	@echo "built $@"
 
+# ── Interactive game tests ────────────────────────────────────
+GAME_EXES: $(OUT)/guess_price.exe $(OUT)/snake.exe
+
+$(OUT)/guess_price.exe: guess_price/main.c | $(OUT)
+	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32
+	@echo "built $@"
+
+$(OUT)/snake.exe: snake/main.c | $(OUT)
+	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32 -luser32
+	@echo "built $@"
+
 # ── DLL loader tests ────────────────────────────────────────────
 # Flags for shared library (DLL) builds.
 DLL_CFLAGS   := -O2 -shared
