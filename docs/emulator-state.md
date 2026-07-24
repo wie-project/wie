@@ -103,12 +103,10 @@
 |-----|--------|
 | **Incomplete WinAPI surface** | Many handlers are stubs — enough for the micro-suite but real apps hit unimplemented APIs. Win32k/GDI are sparse. |
 | **No GUI** | No window server, no GPU, no DirectX — console apps only. `7zFM` (GUI 7-Zip) explicitly not claimed. |
-| **Limited C++ EH** | Mingw LSDA works but some paths (e.g. `-md=64k`) exit with error. |
 | **Partial synchronization** | WaitForMultipleObjects, APCs, condition variables — partial coverage. |
 | **No network** | Winsock, pipes, named pipes — not implemented. |
 | **No COM** | Only IUnknown/IDispatch stubs. Many Win10 APIs rely on COM. |
 | **No registry beyond stubs** | RegCreate/Query/Set/DeleteValue work for flat test cases, but real apps expect comprehensive registry. |
-| **No guest-side SEH** | Guest access violations, divide-by-zero not fully modelled. Host-side SEH for C++ unwind works. |
 | **32-bit apps** | Explicit non-goal — only x86-64. |
 | **Wine-style identity mmap** | Explicit non-goal — guest VA always soft-translates. |
 
