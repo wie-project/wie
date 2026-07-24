@@ -247,21 +247,24 @@ fn handle_stdio_common_vfprintf(
     ret(engine, 0)
 }
 
+/// Shared RNG state between `srand` and `rand`.
+/// Uses a host `AtomicU32` so seeding and reading are properly ordered
+/// even if the guest remains single-threaded through the emulator.
+static CRT_RNG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
 /// `srand(seed)` — seed the CRT random number generator.
 fn handle_srand(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    let _seed = engine.read_rcx()?;
+    let seed = engine.read_rcx()?;
+    CRT_RNG.store(seed as u32, std::sync::atomic::Ordering::Relaxed);
     ret(engine, 0)
 }
 
 /// `rand()` → pseudo-random integer between 0 and RAND_MAX (0x7FFF).
 fn handle_rand(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    static mut RNG: u32 = 1;
-    // SAFETY: single-threaded guest access; lock-free for speed.
-    #[expect(unsafe_code)]
-    let val = unsafe {
-        RNG = RNG.wrapping_mul(1103515245).wrapping_add(12345);
-        (RNG >> 16) & 0x7FFF
-    };
+    let prev = CRT_RNG.load(std::sync::atomic::Ordering::Relaxed);
+    let next = prev.wrapping_mul(1103515245).wrapping_add(12345);
+    CRT_RNG.store(next, std::sync::atomic::Ordering::Relaxed);
+    let val = (next >> 16) & 0x7FFF;
     ret(engine, u64::from(val))
 }
 
