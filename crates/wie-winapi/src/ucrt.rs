@@ -100,8 +100,11 @@ pub fn dispatch_ucrt(
         "realloc" => handle_realloc(engine, state),
         "_isatty" => handle_isatty(engine),
         "_get_osfhandle" => handle_get_osfhandle(engine),
+        "puts" => handle_puts(engine),
         "fputc" => handle_fputc(engine),
         "fputs" => handle_fputs(engine),
+        "atoi" => handle_atoi(engine),
+        "fgets" => handle_fgets(engine, state),
         "fgetc" => handle_fgetc(engine),
         "strcmp" => handle_strcmp(engine),
         "wcscmp" => handle_wcscmp(engine),
@@ -114,6 +117,8 @@ pub fn dispatch_ucrt(
         "?terminate@@yaxxz" => handle_terminate_cxx(engine),
         "??1type_info@@ueaa@xz" => handle_type_info_dtor(engine),
         "_cxxthrowexception" => handle_cxx_throw_exception(engine, state),
+        "srand" => handle_srand(engine),
+        "rand" => handle_rand(engine),
         _ => anyhow::bail!("unsupported UCRT export: {name}"),
     }
 }
@@ -240,6 +245,24 @@ fn handle_stdio_common_vfprintf(
 ) -> Result<WinApiHandlerResult> {
     // Signature is options, FILE*, format, locale, va_list — ignore and return 0 chars.
     ret(engine, 0)
+}
+
+/// `srand(seed)` — seed the CRT random number generator.
+fn handle_srand(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let _seed = engine.read_rcx()?;
+    ret(engine, 0)
+}
+
+/// `rand()` → pseudo-random integer between 0 and RAND_MAX (0x7FFF).
+fn handle_rand(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    static mut RNG: u32 = 1;
+    // SAFETY: single-threaded guest access; lock-free for speed.
+    #[expect(unsafe_code)]
+    let val = unsafe {
+        RNG = RNG.wrapping_mul(1103515245).wrapping_add(12345);
+        (RNG >> 16) & 0x7FFF
+    };
+    ret(engine, u64::from(val))
 }
 
 fn handle_malloc(
@@ -663,6 +686,97 @@ fn handle_fputs(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResu
     };
     write_host_console(out, &bytes);
     ret(engine, 0) // non-negative = success
+}
+
+/// `puts(s)` — write NUL-terminated string + newline to stdout.
+fn handle_puts(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let s = engine.read_rcx()?;
+    if s == 0 {
+        return ret(engine, u64::from(u32::MAX)); // EOF
+    }
+    let mut bytes = Vec::new();
+    let mut off = 0_u64;
+    loop {
+        let mut b = [0_u8; 1];
+        engine.mem_read(s.wrapping_add(off), &mut b)?;
+        if b[0] == 0 { break; }
+        bytes.push(b[0]);
+        off = off.saturating_add(1);
+        if off > 1_000_000 { break; }
+    }
+    bytes.push(b'\n');
+    write_host_console(FILE_STDOUT, &bytes);
+    ret(engine, 0) // non-negative = success
+}
+
+/// `fgets(buf, max, stream)` — read one line from stdin.
+fn handle_fgets(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let buf = engine.read_rcx()?;
+    let max = engine.read_rdx()?;
+    let _stream = engine.read_r8()?;
+    if buf == 0 || max == 0 {
+        return ret(engine, 0); // NULL
+    }
+    let cap = usize::try_from(max).unwrap_or(0);
+    // Refill from host stdin if buffer is empty and LiveHost mode.
+    if state.stdin_cursor >= state.stdin_bytes.len()
+        && state.stdin_mode == crate::GuestStdinMode::LiveHost
+    {
+        use std::io::Read;
+        let mut line = Vec::new();
+        let mut byte = [0_u8; 1];
+        let mut stdin = std::io::stdin().lock();
+        loop {
+            if line.len() >= 4096 || stdin.read(&mut byte).unwrap_or(0) == 0 { break; }
+            line.push(byte[0]);
+            if byte[0] == b'\n' { break; }
+        }
+        if !line.is_empty() {
+            state.stdin_bytes = line;
+            state.stdin_cursor = 0;
+        }
+    }
+    // Copy from stdin buffer to guest buffer.
+    let mut written = 0_usize;
+    while written < cap.saturating_sub(1) {
+        let idx = state.stdin_cursor;
+        if idx >= state.stdin_bytes.len() { break; }
+        let c = state.stdin_bytes[idx];
+        state.stdin_cursor = idx.wrapping_add(1);
+        let byte = [c];
+        engine.mem_write(buf.wrapping_add(u64::try_from(written).unwrap_or(0)), &byte)?;
+        written = written.wrapping_add(1);
+        if c == b'\n' { break; }
+    }
+    if written == 0 {
+        return ret(engine, 0); // NULL -> EOF / error
+    }
+    // NUL-terminate.
+    let nul_byte = [0_u8];
+    engine.mem_write(buf.wrapping_add(u64::try_from(written).unwrap_or(0)), &nul_byte)?;
+    ret(engine, buf) // returns buf on success
+}
+
+/// `atoi(s)` — parse ASCII string to int.
+fn handle_atoi(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let s = engine.read_rcx()?;
+    if s == 0 { return ret(engine, 0); }
+    let mut bytes = [0u8; 32];
+    let mut n = 0_usize;
+    loop {
+        if n >= bytes.len() { break; }
+        let mut b = [0_u8; 1];
+        if engine.mem_read(s.wrapping_add(u64::try_from(n).unwrap_or(0)), &mut b).is_err() { break; }
+        if b[0] == 0 { break; }
+        bytes[n] = b[0];
+        n += 1;
+    }
+    let s_str = std::str::from_utf8(&bytes[..n]).unwrap_or("");
+    let val: i32 = s_str.trim().parse().unwrap_or(0);
+    ret(engine, val as u64)
 }
 
 /// `fgetc(stream)` — EOF for empty stdin inject.
