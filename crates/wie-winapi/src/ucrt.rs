@@ -6,6 +6,7 @@
 //! API set DLLs (`api-ms-win-crt-stdio-l1-1-0.dll`, …) are Windows forwarders to
 //! `ucrtbase.dll`; we treat them as one dispatch namespace by export name.
 
+use crate::guest_memory::read_u64 as read_guest_u64;
 use crate::{WinApiEnvironment, WinApiHandlerResult, WinApiState};
 use anyhow::{Context, Result};
 
@@ -60,6 +61,8 @@ pub fn dispatch_ucrt(
         "fflush" => handle_fflush(engine),
         "setvbuf" => handle_setvbuf(engine),
         "__stdio_common_vfprintf" => handle_stdio_common_vfprintf(engine),
+        "__stdio_common_vsprintf" => handle_stdio_common_vsprintf(engine),
+        "__stdio_common_vsscanf" => handle_stdio_common_vsscanf(engine),
         "malloc" => handle_malloc(engine, state),
         "calloc" => handle_calloc(engine, state),
         "free" => handle_free(engine, state),
@@ -85,12 +88,17 @@ pub fn dispatch_ucrt(
         "_crt_atexit" => handle_crt_atexit(engine),
         // UCRT: `_set_app_type`; legacy msvcrt: `__set_app_type`.
         "_set_app_type" | "__set_app_type" => handle_set_app_type(engine),
+        "_time64" => handle_time64(engine),
+        "_localtime64" => handle_localtime64(engine, state),
         "_set_invalid_parameter_handler" => handle_set_invalid_parameter_handler(engine),
         // Legacy msvcrt CRT startup / teardown.
         "getenv" => handle_getenv(engine),
         "__getmainargs" => handle_getmainargs(engine),
         "_xcptfilter" => handle_xcpt_filter(engine),
         "_cexit" | "_c_exit" => handle_cexit(engine),
+        "_errno" => handle_errno(engine),
+        "strerror" => handle_strerror(engine),
+        "setlocale" => handle_setlocale(engine),
         "signal" => handle_signal(engine),
         // exit / _exit / abort: marked exit_process in hooks; still provide handler body
         // in case traits path misses API-set library names.
@@ -115,6 +123,14 @@ pub fn dispatch_ucrt(
         "fgetc" => handle_fgetc(engine),
         "strtok" => handle_strtok(engine),
         "strcmp" => handle_strcmp(engine),
+        "isalpha" => handle_isalpha(engine),
+        "isdigit" => handle_isdigit(engine),
+        "isalnum" => handle_isalnum(engine),
+        "islower" => handle_islower(engine),
+        "isupper" => handle_isupper(engine),
+        "isspace" => handle_isspace(engine),
+        "toupper" => handle_toupper(engine),
+        "tolower" => handle_tolower(engine),
         "wcscmp" => handle_wcscmp(engine),
         "wcsstr" => handle_wcsstr(engine),
         "_onexit" | "__dllonexit" => handle_onexit(engine),
@@ -255,10 +271,179 @@ fn handle_stdio_common_vfprintf(
     ret(engine, 0)
 }
 
+/// `__stdio_common_vsprintf(options, buf, count, format, locale, va_list)`.
+fn handle_stdio_common_vsprintf(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    let buf = engine.read_rdx()?;
+    let fmt_ptr = engine.read_r9()?;
+    if buf == 0 || fmt_ptr == 0 { return ret(engine, 0); }
+    let fmt = read_guest_str(engine, fmt_ptr, 4096)?;
+    let rsp = engine.read_rsp()?;
+    let mut va = read_guest_u64(engine, rsp.wrapping_add(0x30)).unwrap_or(0);
+
+    let mut out = Vec::with_capacity(256);
+    let bytes = fmt.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 1 < bytes.len() {
+            i += 1;
+            match bytes[i] {
+                b'd' | b'i' | b'u' => {
+                    let v = read_guest_u64(engine, va).unwrap_or(0);
+                    va = va.wrapping_add(8);
+                    out.extend_from_slice(if bytes[i] == b'u' { format!("{}", v) } else { format!("{}", v as i64) }.as_bytes());
+                }
+                b'x' | b'X' => {
+                    let v = read_guest_u64(engine, va).unwrap_or(0);
+                    va = va.wrapping_add(8);
+                    out.extend_from_slice(format!("{:x}", v).as_bytes());
+                }
+                b's' => {
+                    let p = read_guest_u64(engine, va).unwrap_or(0);
+                    va = va.wrapping_add(8);
+                    out.extend_from_slice(read_guest_str(engine, p, 1024).unwrap_or_default().as_bytes());
+                }
+                b'c' => {
+                    let v = read_guest_u64(engine, va).unwrap_or(0);
+                    va = va.wrapping_add(8);
+                    out.push(v as u8);
+                }
+                b'%' => out.push(b'%'),
+                _ => { out.push(b'%'); out.push(bytes[i]); }
+            }
+        } else {
+            out.push(bytes[i]);
+        }
+        i += 1;
+    }
+    out.push(0);
+    drop(engine.mem_write(buf, &out));
+    ret(engine, (out.len().saturating_sub(1)) as u64)
+}
+
+/// `__stdio_common_vsscanf(options, buf, count, format, locale, va_list)`.
+fn handle_stdio_common_vsscanf(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    let src_ptr = engine.read_rdx()?;
+    let fmt_ptr = engine.read_r9()?;
+    if src_ptr == 0 || fmt_ptr == 0 { return ret(engine, 0); }
+    let src = read_guest_str(engine, src_ptr, 4096)?;
+    let fmt = read_guest_str(engine, fmt_ptr, 4096)?;
+    let rsp = engine.read_rsp()?;
+    let mut va = read_guest_u64(engine, rsp.wrapping_add(0x30)).unwrap_or(0);
+    let sb = src.as_bytes(); let fb = fmt.as_bytes();
+    let mut si = 0; let mut fi = 0; let mut items = 0;
+    while fi < fb.len() && si < sb.len() {
+        if fb[fi] == b'%' && fi + 1 < fb.len() {
+            fi += 1;
+            match fb[fi] {
+                b'd' | b'i' | b'u' => {
+                    while si < sb.len() && sb[si].is_ascii_whitespace() { si += 1; }
+                    let neg = si < sb.len() && sb[si] == b'-';
+                    if neg || (si < sb.len() && sb[si] == b'+') { si += 1; }
+                    let start = si;
+                    while si < sb.len() && sb[si].is_ascii_digit() { si += 1; }
+                    if si > start {
+                        let s = std::str::from_utf8(&sb[start..si]).unwrap_or("0");
+                        let val: u64 = (if neg { -(s.parse::<i64>().unwrap_or(0)) } else { s.parse::<i64>().unwrap_or(0) }) as u64;
+                        let out = read_guest_u64(engine, va).unwrap_or(0);
+                        va = va.wrapping_add(8);
+                        if out != 0 { drop(engine.mem_write(out, &val.to_le_bytes())); }
+                        items += 1;
+                    }
+                }
+                b's' => {
+                    while si < sb.len() && sb[si].is_ascii_whitespace() { si += 1; }
+                    let start = si;
+                    while si < sb.len() && !sb[si].is_ascii_whitespace() { si += 1; }
+                    let out = read_guest_u64(engine, va).unwrap_or(0);
+                    va = va.wrapping_add(8);
+                    if out != 0 {
+                        let mut w = sb[start..si].to_vec();
+                        w.push(0);
+                        drop(engine.mem_write(out, &w));
+                    }
+                    items += 1;
+                }
+                _ => {}
+            }
+        } else if fb[fi].is_ascii_whitespace() {
+            while si < sb.len() && sb[si].is_ascii_whitespace() { si += 1; }
+        } else if si < sb.len() && sb[si] == fb[fi] { si += 1; }
+        fi += 1;
+    }
+    ret(engine, items)
+}
+
 /// Shared RNG state between `srand` and `rand`.
 /// Uses a host `AtomicU32` so seeding and reading are properly ordered
 /// even if the guest remains single-threaded through the emulator.
 static CRT_RNG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// Convert a Unix timestamp to `struct tm` fields.
+fn unix_ts_to_tm(ts: i64) -> [i32; 9] {
+    let mut days = ts / 86400;
+    if ts < 0 && ts % 86400 != 0 { days -= 1; }
+    let mut y = 1970_i64;
+    loop {
+        let leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+        let yd = if leap { 366 } else { 365 };
+        if days < yd { break; }
+        days -= yd;
+        y += 1;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+    let mdays = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut mon = 0_i64;
+    while mon < 12 && days >= mdays[mon as usize] { days -= mdays[mon as usize]; mon += 1; }
+    let day = days + 1;
+    let rem = ((ts % 86400) + 86400) % 86400;
+    let sec = rem % 60;
+    let min = (rem / 60) % 60;
+    let hr = rem / 3600;
+    let y_adj = if mon < 2 { y - 1 } else { y };
+    let m_adj = if mon < 2 { mon + 13 } else { mon + 1 };
+    let wd = ((day + (13 * m_adj) / 5 + y_adj % 100 + (y_adj % 100) / 4 + (y_adj / 100) / 4 - 2 * (y_adj / 100)) % 7 + 7) % 7;
+    [sec as i32, min as i32, hr as i32, day as i32, mon as i32, (y - 1900) as i32, wd as i32, 0, 0]
+}
+
+/// `_localtime64(t)` — convert time_t to local struct tm.
+fn handle_localtime64(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let t_ptr = engine.read_rcx()?;
+    if t_ptr == 0 { return ret(engine, 0); }
+    let mut buf = [0_u8; 8];
+    engine.mem_read(t_ptr, &mut buf)?;
+    let ts = i64::from_le_bytes(buf);
+    let tm = unix_ts_to_tm(ts);
+    // x64 struct tm layout: tm_sec(4), tm_min(4), tm_hour(4), tm_mday(4),
+    // tm_mon(4), tm_year(4), tm_wday(4), tm_yday(4), tm_isdst(4) = 36 bytes.
+    // Allocate and write from the heap.
+    let va = state.heap.alloc_coherent(engine, 36);
+    if va == 0 { return ret(engine, 0); }
+    for (i, &v) in tm.iter().enumerate() {
+        let off = u64::try_from(i * 4).unwrap_or(0);
+        drop(engine.mem_write(va.wrapping_add(off), &(v as u32).to_le_bytes()));
+    }
+    ret(engine, va)
+}
+
+/// `_time64(t)` — get current time in seconds since epoch.
+fn handle_time64(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let t_ptr = engine.read_rcx()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if t_ptr != 0 {
+        drop(engine.mem_write(t_ptr, &now.to_le_bytes()));
+    }
+    ret(engine, now)
+}
 
 /// `srand(seed)` — seed the CRT random number generator.
 fn handle_srand(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
@@ -901,6 +1086,98 @@ fn handle_strtok(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
 fn handle_fgetc(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _stream = engine.read_rcx()?;
     ret(engine, u64::from(u32::MAX)) // EOF
+}
+
+/// ctype helpers: isalpha, isdigit, isalnum, islower, isupper, isspace, toupper, tolower.
+fn handle_isalpha(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let c = engine.read_rcx()? as u8;
+    ret(engine, if c.is_ascii_alphabetic() { 1 } else { 0 })
+}
+fn handle_isdigit(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let c = engine.read_rcx()? as u8;
+    ret(engine, if c.is_ascii_digit() { 1 } else { 0 })
+}
+fn handle_isalnum(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let c = engine.read_rcx()? as u8;
+    ret(engine, if c.is_ascii_alphanumeric() { 1 } else { 0 })
+}
+fn handle_islower(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let c = engine.read_rcx()? as u8;
+    ret(engine, if c.is_ascii_lowercase() { 1 } else { 0 })
+}
+fn handle_isupper(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let c = engine.read_rcx()? as u8;
+    ret(engine, if c.is_ascii_uppercase() { 1 } else { 0 })
+}
+fn handle_isspace(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let c = engine.read_rcx()? as u8;
+    ret(engine, if c.is_ascii_whitespace() || c == b'\t' || c == b'\n' || c == b'\r' { 1 } else { 0 })
+}
+fn handle_toupper(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let c = engine.read_rcx()?;
+    ret(engine, (c as u8).to_ascii_uppercase() as u64)
+}
+fn handle_tolower(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let c = engine.read_rcx()?;
+    ret(engine, (c as u8).to_ascii_lowercase() as u64)
+}
+
+/// `strerror(errnum)` — returns a string describing the error code.
+fn handle_strerror(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let _code = engine.read_rcx()?;
+    // Return a pointer to a static "Unknown error" string in guest memory.
+    static STRERROR_VA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let va = STRERROR_VA.load(std::sync::atomic::Ordering::Relaxed);
+    if va == 0 {
+        let msg = b"Unknown error\0";
+        // Write to a known address after errno slot.
+        let addr = 0x7EFD_0080;
+        drop(engine.mem_write(addr, msg));
+        STRERROR_VA.store(addr, std::sync::atomic::Ordering::Relaxed);
+        ret(engine, addr)
+    } else {
+        ret(engine, va)
+    }
+}
+
+/// `setlocale(category, locale)` — set/get program locale.
+fn handle_setlocale(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let _cat = engine.read_rcx()?;
+    let locale_ptr = engine.read_rdx()?;
+    if locale_ptr == 0 {
+        // Query: return "C" from a static location.
+        static LOCALE_VA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let va = LOCALE_VA.load(std::sync::atomic::Ordering::Relaxed);
+        if va == 0 {
+            let addr = 0x7EFD_0090;
+            drop(engine.mem_write(addr, b"C\0"));
+            LOCALE_VA.store(addr, std::sync::atomic::Ordering::Relaxed);
+            ret(engine, addr)
+        } else { ret(engine, va) }
+    } else {
+        // Set: ignore, return the old locale.
+        // For now, return "C" as the old locale.
+        let old = 0x7EFD_0090;
+        drop(engine.mem_write(old, b"C\0"));
+        ret(engine, old)
+    }
+}
+
+/// `_errno()` — returns a pointer to the thread-local errno variable.
+fn handle_errno(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    static ERRNO_VA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let va = ERRNO_VA.load(std::sync::atomic::Ordering::Relaxed);
+    if va == 0 {
+        // Use a fixed address in the guest data area for errno.
+        // The TEB page is at 0x7EFD_0000; place errno at 0x7EFD_0070
+        // which is just after TEB.LastErrorValue at 0x68.
+        let addr = 0x7EFD_0070; // TEB page + offset after LastErrorValue
+        engine.mem_write(addr, &[0u8; 4]).ok();
+        ERRNO_VA.store(addr, std::sync::atomic::Ordering::Relaxed);
+        ret(engine, addr)
+    } else {
+        ret(engine, va)
+    }
 }
 
 /// `strcmp(a, b)`.
