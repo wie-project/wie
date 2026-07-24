@@ -1043,8 +1043,8 @@ fn resolve_landing_pad(
         let handler = u32::from_le_bytes(entry_buf[12..16].try_into().unwrap());
         // Sanity check: try range should be within the function, filter should be 1 or a valid RVA
         if try_low >= try_high { continue; }
-        let func_start_rva = u32::try_from(func_start.wrapping_sub(unwound.image_base)).unwrap_or(0);
-        let func_end_rva = u32::try_from(func_end.wrapping_sub(unwound.image_base)).unwrap_or(0);
+        let func_start_rva = u32::try_from(func_start.saturating_sub(unwound.image_base)).unwrap_or(0);
+        let func_end_rva = u32::try_from(func_end.saturating_sub(unwound.image_base)).unwrap_or(0);
         if try_low < func_start_rva || try_high > func_end_rva { continue; }
         // __except(1) always matches; otherwise check if control_pc falls in try range
         if filter == 1 {

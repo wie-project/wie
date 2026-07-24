@@ -7,7 +7,10 @@
 //! `ucrtbase.dll`; we treat them as one dispatch namespace by export name.
 
 use crate::guest_memory::read_u64 as read_guest_u64;
-use crate::{WinApiEnvironment, WinApiHandlerResult, WinApiState};
+use crate::kernel32::create_guest_thread;
+use crate::seh::{self, ThrowPayload};
+use crate::sync_obj::KernelObject;
+use crate::{GuestStdinMode, WinApiControlSignal, WinApiEnvironment, WinApiHandlerResult, WinApiState};
 use anyhow::{Context, Result};
 
 /// Guest VA base for synthetic CRT objects (FILE cookies, env pointers, etc.).
@@ -174,6 +177,9 @@ fn handle_acrt_iob_func(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHan
     ret(engine, ptr)
 }
 
+/// Cap output at 64 KiB per call (matches JIT fast path guard).
+const MAX_FWRITE_OUTPUT: usize = 64 * 1024;
+
 fn handle_fwrite(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let buf = engine.read_rcx()?;
     let size = engine.read_rdx()?;
@@ -185,15 +191,25 @@ fn handle_fwrite(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
     }
     let total = size.saturating_mul(count);
     let total_usize = usize::try_from(total).unwrap_or(0);
-    let mut bytes = vec![0_u8; total_usize];
-    if total_usize > 0 && buf != 0 {
+    if total_usize == 0 {
+        return ret(engine, 0);
+    }
+    // Probe-read first byte to validate buffer is readable.
+    if buf != 0 {
+        let mut probe = [0_u8; 1];
+        if engine.mem_read(buf, &mut probe).is_err() {
+            return ret(engine, count); // skip silently
+        }
+    }
+    let capped = total_usize.min(MAX_FWRITE_OUTPUT);
+    let mut bytes = vec![0_u8; capped];
+    if capped > 0 && buf != 0 {
         engine
             .mem_read(buf, &mut bytes)
             .context("fwrite guest buffer")?;
     }
 
     // Host stdout/stderr for console programs (independent CRT expects console I/O).
-    // Fast-path: direct `libc::write` — skips Rust stdio mutex (matches JIT helper).
     if stream == FILE_STDOUT || stream == FILE_STDERR {
         write_host_console(stream, &bytes);
     }
@@ -282,10 +298,11 @@ fn handle_stdio_common_vsprintf(
     let rsp = engine.read_rsp()?;
     let mut va = read_guest_u64(engine, rsp.wrapping_add(0x30)).unwrap_or(0);
 
+    const MAX_OUTPUT: usize = 4096;
     let mut out = Vec::with_capacity(256);
     let bytes = fmt.as_bytes();
     let mut i = 0;
-    while i < bytes.len() {
+    while i < bytes.len() && out.len() < MAX_OUTPUT {
         if bytes[i] == b'%' && i + 1 < bytes.len() {
             i += 1;
             match bytes[i] {
@@ -942,7 +959,7 @@ fn handle_fgets(
     let cap = usize::try_from(max).unwrap_or(0);
     // Refill from host stdin if buffer is empty and LiveHost mode.
     if state.stdin_cursor >= state.stdin_bytes.len()
-        && state.stdin_mode == crate::GuestStdinMode::LiveHost
+        && state.stdin_mode == GuestStdinMode::LiveHost
     {
         use std::io::Read;
         let mut line = Vec::new();
@@ -1321,7 +1338,7 @@ fn handle_begin_thread_ex(
     // Stack: [rsp+0x28]=initflag, [rsp+0x30]=thrdaddr (after home space).
     let flags = read_stack_u32(engine, 0x28).unwrap_or(0);
     let tid_out = read_stack_u64(engine, 0x30).unwrap_or(0);
-    let handle = crate::kernel32::create_guest_thread(
+    let handle = create_guest_thread(
         engine, state, stack_size, start, arg, flags, tid_out,
     )?;
     ret(engine, handle)
@@ -1336,14 +1353,14 @@ fn handle_end_thread_ex(
     let code = u32::try_from(code_raw & u64::from(u32::MAX)).unwrap_or(0);
     let tid = state.threads.current_tid();
     for obj in state.sync.objects.values() {
-        if let crate::KernelObject::Thread(t) = obj
+        if let KernelObject::Thread(t) = obj
             && t.tid == tid
         {
             t.finish(code);
             break;
         }
     }
-    Err(crate::WinApiControlSignal::ExitThread { code }.into())
+    Err(WinApiControlSignal::ExitThread { code }.into())
 }
 
 fn read_stack_u32(engine: &mut dyn wie_cpu::CpuEngine, offset: u64) -> Result<u32> {
@@ -1413,10 +1430,10 @@ fn handle_cxx_throw_exception(
     engine.mem_write(rec.saturating_add(56), &0_u64.to_le_bytes())?;
     engine.write_rcx(rec)?;
 
-    crate::seh::dispatch_exception_with_payload(
+    seh::dispatch_exception_with_payload(
         engine,
         state,
-        crate::seh::ThrowPayload {
+        ThrowPayload {
             exception_object: pexception_object,
             throw_info: pthrow_info,
             gcc_throw: false,
