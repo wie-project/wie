@@ -382,6 +382,10 @@ pub(super) extern "C" fn wie_ucrt_iob(ix: u64) -> u64 {
 }
 
 /// `fwrite(buf, size, count, stream)` → count written (or 0).
+///
+/// Security: validates `[buf, buf+size*count)` is within readable guest memory
+/// before writing any output to the host console.  Caps output at 64 KiB per
+/// call to limit information disclosure.
 pub(super) unsafe extern "C" fn wie_ucrt_fwrite(
     ctx: *mut JitCtx,
     buf: u64,
@@ -401,18 +405,32 @@ pub(super) unsafe extern "C" fn wie_ucrt_fwrite(
     if total_usize == 0 {
         return 0;
     }
-    // Only console streams write to the host; other FILE* cookies are no-ops
-    // (same as the previous full-buffer path which only wrote stdout/stderr).
+    // Only console streams write to the host; other FILE* cookies are no-ops.
     if stream != FILE_STDOUT && stream != FILE_STDERR {
         return count;
     }
     if buf == 0 {
         return count;
     }
+
+    // Security: validate the entire range `[buf, buf+total)` is readable via
+    // a probe read on the first byte before entering the output loop.
+    // `mem.read()` enforces SPC (Software Permission Check), so unmapped or
+    // non-readable addresses produce an error and no bytes reach the host.
     let mem = mem_mut(ctx);
+    let mut probe = [0_u8; 1];
+    if mem.read(buf, &mut probe).is_err() {
+        return count; // Silently skip: same as /dev/null.
+    }
+
+    // Cap output at 64 KiB per call to limit information disclosure through
+    // hostile `fwrite(buf=<large mapped range>, size, count, stdout)` calls.
+    const MAX_FWRITE_OUTPUT: usize = 64 * 1024;
+    let capped = total_usize.min(MAX_FWRITE_OUTPUT);
+
     // Chunked host write — avoid a single heap allocation the size of the whole
     // transfer (large `fwrite` was a host-RSS spike on the JIT path).
-    let mut remaining = total_usize;
+    let mut remaining = capped;
     let mut src = buf;
     let mut chunk_buf = [0_u8; 4096];
     while remaining > 0 {
