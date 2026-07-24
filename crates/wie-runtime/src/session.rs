@@ -898,12 +898,17 @@ impl RuntimeSession {
         let stack_limit = layout.stack_base;
 
         engine
-            .mem_write(0x08, &stack_top.to_le_bytes())
+            .mem_write(layout.teb_low_base.wrapping_add(0x08), &stack_top.to_le_bytes())
             .context("failed to write fake TEB StackBase")?;
 
         engine
-            .mem_write(0x10, &stack_limit.to_le_bytes())
+            .mem_write(layout.teb_low_base.wrapping_add(0x10), &stack_limit.to_le_bytes())
             .context("failed to write fake TEB StackLimit")?;
+
+        // TEB.Self (x64 offset 0x30) — guest PEB / TLS lookups.
+        engine
+            .mem_write(layout.teb_low_base.wrapping_add(0x30), &layout.teb_low_base.to_le_bytes())
+            .context("failed to write fake TEB Self")?;
 
         // TEB.LastErrorValue (x64 offset 0x68) — guest GetLastError/SetLastError stubs.
         engine
@@ -1330,6 +1335,33 @@ impl RuntimeSession {
 
                 let (hook, invalid_memory) = match hook_result {
                     Ok(result) => (result.code, result.invalid_memory),
+                    Err(wie_cpu::CpuError::DivideByZero(div_rip)) => {
+                        match wie_winapi::seh::dispatch_hardware_fault(
+                            engine,
+                            winapi_state,
+                            wie_cpu::exception_code::INT_DIVIDE_BY_ZERO,
+                            div_rip,
+                        ) {
+                            Ok(result) => {
+                                tracing::trace!(
+                                    rip = div_rip,
+                                    resume_rip = result.return_value,
+                                    "divide-by-zero handled by SEH"
+                                );
+                                continue;
+                            }
+                            Err(_) => {
+                                tracing::debug!(rip = div_rip, "unhandled divide-by-zero");
+                                let reason = format!("integer divide by zero at rip={div_rip:#x}");
+                                break_term = Some(EntryTraceTermination::RuntimeStop(reason));
+                                quantum = Quantum::Break;
+                            }
+                        }
+                        (
+                            wie_cpu::CodeHookOutcome::default(),
+                            wie_cpu::InvalidMemoryAccess::default(),
+                        )
+                    }
                     Err(error) => {
                         let rip = engine
                             .read_rip()
@@ -1362,8 +1394,32 @@ impl RuntimeSession {
                 if matches!(quantum, Quantum::Break) {
                     // already set break_term
                 } else if invalid_memory.hit {
-                    break_term = Some(invalid_memory_diagnostic(engine, &invalid_memory)?);
-                    quantum = Quantum::Break;
+                    // Route through guest SEH before terminating.
+                    match wie_winapi::seh::dispatch_hardware_fault(
+                        engine,
+                        winapi_state,
+                        invalid_memory.exception_code,
+                        invalid_memory.address,
+                    ) {
+                        Ok(result) => {
+                            // Handler found — guest continues at catch block.
+                            tracing::trace!(
+                                exc = invalid_memory.exception_code,
+                                addr = invalid_memory.address,
+                                resume_rip = result.return_value,
+                                "hardware fault handled by guest SEH"
+                            );
+                            continue;
+                        }
+                        Err(_unhandled) => {
+                            tracing::debug!(
+                                exc = invalid_memory.exception_code,
+                                "unhandled hardware fault"
+                            );
+                            break_term = Some(invalid_memory_diagnostic(engine, &invalid_memory)?);
+                            quantum = Quantum::Break;
+                        }
+                    }
                 } else if !hook.hit {
                     self.no_hook_slices = self
                         .no_hook_slices

@@ -130,30 +130,44 @@ $(OUT)/vfs_roundtrip.exe: vfs_roundtrip/main.c | $(OUT)
 	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32
 	@echo "built $@"
 
-# ── C++ exception tests (static, full CRT) ─────────────────────────
-MINGW_CXX ?= x86_64-w64-mingw32-g++
-CPPFLAGS   := -static -O2
+# ── SEH tests ────────────────────────────────────────────
+SEH_CXXFLAGS := -static -O2
+SEH_CLANG_FLAGS := -static -O2 -fms-extensions
+MINGW_CLANG ?= x86_64-w64-mingw32-clang
 
+# C++ exception tests (GCC-compiled, full CRT)
 cpp_exes: $(OUT)/cpp_throw.exe $(OUT)/cpp_dtor.exe $(OUT)/cpp_multi_catch.exe $(OUT)/cpp_types.exe $(OUT)/cpp_threads.exe
 
-$(OUT)/cpp_throw.exe: cpp_exceptions/cpp_throw/main.cpp | $(OUT)
-	$(MINGW_CXX) $(CPPFLAGS) -o $@ $<
+$(OUT)/cpp_throw.exe: seh/cpp_exceptions/cpp_throw/main.cpp | $(OUT)
+	$(MINGW_CXX) $(SEH_CXXFLAGS) -o $@ $<
 	@echo "built $@"
 
-$(OUT)/cpp_dtor.exe: cpp_exceptions/cpp_dtor/main.cpp | $(OUT)
-	$(MINGW_CXX) $(CPPFLAGS) -o $@ $<
+$(OUT)/cpp_dtor.exe: seh/cpp_exceptions/cpp_dtor/main.cpp | $(OUT)
+	$(MINGW_CXX) $(SEH_CXXFLAGS) -o $@ $<
 	@echo "built $@"
 
-$(OUT)/cpp_multi_catch.exe: cpp_exceptions/cpp_multi_catch/main.cpp | $(OUT)
-	$(MINGW_CXX) $(CPPFLAGS) -o $@ $<
+$(OUT)/cpp_multi_catch.exe: seh/cpp_exceptions/cpp_multi_catch/main.cpp | $(OUT)
+	$(MINGW_CXX) $(SEH_CXXFLAGS) -o $@ $<
 	@echo "built $@"
 
-$(OUT)/cpp_types.exe: cpp_exceptions/cpp_types/main.cpp | $(OUT)
-	$(MINGW_CXX) $(CPPFLAGS) -o $@ $<
+$(OUT)/cpp_types.exe: seh/cpp_exceptions/cpp_types/main.cpp | $(OUT)
+	$(MINGW_CXX) $(SEH_CXXFLAGS) -o $@ $<
 	@echo "built $@"
 
-$(OUT)/cpp_threads.exe: cpp_exceptions/cpp_threads/main.cpp | $(OUT)
-	$(MINGW_CXX) $(CPPFLAGS) -o $@ $<
+$(OUT)/cpp_threads.exe: seh/cpp_exceptions/cpp_threads/main.cpp | $(OUT)
+	$(MINGW_CXX) $(SEH_CXXFLAGS) -o $@ $<
+	@echo "built $@"
+
+# SEH hardware-fault tests (Clang-compiled, requires llvm-mingw for __try/__except)
+# Compile with: x86_64-w64-mingw32-clang -fms-extensions -o out.exe main.cpp
+seh_exes: $(OUT)/seh_access_violation.exe $(OUT)/seh_div_zero.exe
+
+$(OUT)/seh_access_violation.exe: seh/access_violation/main.cpp | $(OUT)
+	$(MINGW_CLANG) $(SEH_CLANG_FLAGS) -o $@ $< -lkernel32
+	@echo "built $@"
+
+$(OUT)/seh_div_zero.exe: seh/div_zero/main.cpp | $(OUT)
+	$(MINGW_CLANG) $(SEH_CLANG_FLAGS) -o $@ $< -lkernel32
 	@echo "built $@"
 
 # ── DLL loader tests ────────────────────────────────────────────

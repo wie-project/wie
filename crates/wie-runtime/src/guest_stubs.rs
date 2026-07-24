@@ -433,7 +433,7 @@ fn patch_rel8(buf: &mut [u8], imm_at: usize, target: usize) {
 }
 
 /// x64 TEB.LastErrorValue offset (also used as our guest mirror VA when TEB base is 0).
-pub const TEB_LAST_ERROR_VA: u64 = 0x68;
+pub const TEB_LAST_ERROR_VA: u64 = wie_cpu::GS_BASE + 0x68;
 
 /// Guest FLS table slot count (index 0..N-1 accelerated).
 pub const GUEST_FLS_SLOT_COUNT: u32 = 256;

@@ -868,11 +868,7 @@ fn exec_div(
     let size = op_size_bytes(instr, 0)?;
     let divisor = read_op(mem, regs, instr, 0)? & regs::size_mask(size);
     if divisor == 0 {
-        return Err(StepExecError::Cpu(CpuError::Message(format!(
-            "{} by zero at {:#x}",
-            if signed { "idiv" } else { "div" },
-            instr.ip()
-        ))));
+        return Err(StepExecError::Cpu(CpuError::DivideByZero(instr.ip())));
     }
 
     match size {
@@ -2526,6 +2522,14 @@ fn effective_address(regs: &RegFile, instr: &Instruction) -> Result<u64, StepExe
     }
 
     let mut addr = instr.memory_displacement64();
+
+    // FS/GS segment overrides (x64: FS and GS are the only meaningful segments).
+    // Windows x64 uses GS:0 as TEB base.  When an instruction carries a GS segment
+    // prefix, the effective address is relative to the TEB, not to address zero.
+    let seg = instr.memory_segment();
+    if seg == Register::GS || seg == Register::FS {
+        addr = addr.wrapping_add(crate::GS_BASE);
+    }
     // Non-IP-relative: treat displacement as signed when displ size is set.
     // iced keeps mem_displ as unsigned bits of the signed field; for pure disp
     // with base/index, virtual_address adds the raw mem_displ then masks.

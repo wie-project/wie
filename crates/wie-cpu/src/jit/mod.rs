@@ -1877,6 +1877,7 @@ impl CpuEngine for JitCpu {
                     },
                     invalid_memory: InvalidMemoryAccess {
                         hit: false,
+                        exception_code: 0,
                         access_type: 0,
                         address: 0,
                         size: 0,
@@ -1918,6 +1919,7 @@ impl CpuEngine for JitCpu {
                         },
                         invalid_memory: InvalidMemoryAccess {
                             hit: false,
+                            exception_code: 0,
                             access_type: 0,
                             address: 0,
                             size: 0,
@@ -1932,6 +1934,7 @@ impl CpuEngine for JitCpu {
                         },
                         invalid_memory: InvalidMemoryAccess {
                             hit: true,
+                            exception_code: crate::exception_code::ACCESS_VIOLATION,
                             access_type: inv.access_type,
                             address: inv.address,
                             size: inv.size,
@@ -1956,6 +1959,7 @@ impl CpuEngine for JitCpu {
                         },
                         invalid_memory: InvalidMemoryAccess {
                             hit: false,
+                            exception_code: 0,
                             access_type: 0,
                             address: 0,
                             size: 0,
@@ -1972,6 +1976,7 @@ impl CpuEngine for JitCpu {
                         },
                         invalid_memory: InvalidMemoryAccess {
                             hit: true,
+                            exception_code: crate::exception_code::ACCESS_VIOLATION,
                             access_type: inv.access_type,
                             address: inv.address,
                             size: inv.size,
@@ -1989,6 +1994,7 @@ impl CpuEngine for JitCpu {
             },
             invalid_memory: InvalidMemoryAccess {
                 hit: false,
+                exception_code: 0,
                 access_type: 0,
                 address: 0,
                 size: 0,

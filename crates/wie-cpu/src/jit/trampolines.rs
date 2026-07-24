@@ -11,8 +11,7 @@ use super::lower::{
 };
 use iced_x86::{Mnemonic, OpKind, Register};
 
-/// Guest TEB.LastErrorValue mirror (must match `wie_runtime::guest_stubs::TEB_LAST_ERROR_VA`).
-const TEB_LAST_ERROR_VA: u64 = 0x68;
+const TEB_LAST_ERROR_VA: u64 = crate::GS_BASE + 0x68;
 
 /// Recognized micro-stub patterns that have a hand-written host trampoline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

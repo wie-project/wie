@@ -3,8 +3,8 @@
 use crate::exec::{self, HookWindow, StepResult};
 use crate::mem::{GuestMemory, GuestRegion};
 use crate::regs::RegFile;
-use crate::{CodeHookOutcome, InvalidMemoryAccess};
-use crate::{CpuEngine, CpuError, RunUntilHook};
+use crate::{CodeHookOutcome, CpuError, InvalidMemoryAccess};
+use crate::{CpuEngine, RunUntilHook};
 use std::sync::{Arc, RwLock};
 
 fn lock_rd<T>(m: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
@@ -298,6 +298,7 @@ impl CpuEngine for IcedCpu {
                         },
                         invalid_memory: InvalidMemoryAccess {
                             hit: false,
+                            exception_code: 0,
                             access_type: 0,
                             address: 0,
                             size: 0,
@@ -314,12 +315,16 @@ impl CpuEngine for IcedCpu {
                         },
                         invalid_memory: InvalidMemoryAccess {
                             hit: true,
+                            exception_code: crate::exception_code::ACCESS_VIOLATION,
                             access_type: inv.access_type,
                             address: inv.address,
                             size: inv.size,
                             value: inv.value,
                         },
                     });
+                }
+                Err(CpuError::DivideByZero(rip)) => {
+                    return Err(CpuError::DivideByZero(rip));
                 }
                 Err(e) => {
                     let trace = self.rip_trace_vec();
@@ -361,6 +366,7 @@ impl CpuEngine for IcedCpu {
             },
             invalid_memory: InvalidMemoryAccess {
                 hit: false,
+                exception_code: 0,
                 access_type: 0,
                 address: 0,
                 size: 0,

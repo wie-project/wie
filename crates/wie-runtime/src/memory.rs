@@ -96,7 +96,7 @@ impl RuntimeMemoryLayout {
             // Override with `WIE_PROCESS_HEAP_MB`. Room before shadow at base+1GiB.
             process_heap_size: 0x2000_0000,
             process_heap_shadow_delta: 0x0000_0001_0000_0000,
-            teb_low_base: 0x0000_0000_0000_0000,
+            teb_low_base: wie_cpu::GS_BASE,
             teb_low_size: 0x1000,
             resource_data_base: 0x0000_0000_6400_0000,
             resource_data_size: 0x0001_0000,

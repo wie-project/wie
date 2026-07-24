@@ -33,6 +33,10 @@ pub use mem::{
 };
 pub use regs::{RegFile, ThreadContext};
 
+/// Guest GS segment base — points to the Thread Environment Block (TEB).
+/// Shared with `wie_runtime::DEFAULT_LAYOUT.teb_low_base`.
+pub const GS_BASE: u64 = 0x0000_0000_7EFD_0000;
+
 /// Memory protection flags for [`CpuEngine::mem_map`] (Unicorn-compatible r/w/x bits).
 ///
 /// Convert to Windows `PAGE_*` via [`mem::protect::page_protect_from_rwx`].
@@ -61,11 +65,29 @@ pub struct CodeHookOutcome {
     pub size: u32,
 }
 
+/// Win32 exception codes for hardware faults.
+pub mod exception_code {
+    /// Access violation (read/write/execute of invalid memory).
+    pub const ACCESS_VIOLATION: u32 = 0xC000_0005;
+    /// Integer division by zero.
+    pub const INT_DIVIDE_BY_ZERO: u32 = 0xC000_0094;
+    /// Integer overflow (e.g. `INTO` with overflow flag set).
+    pub const INT_OVERFLOW: u32 = 0xC000_0095;
+    /// Stack overflow (page guard hit near stack limit).
+    pub const STACK_OVERFLOW: u32 = 0xC000_00FD;
+    /// Privileged instruction.
+    pub const PRIV_INSTRUCTION: u32 = 0xC000_0096;
+    /// Illegal instruction.
+    pub const ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
+}
+
 /// Invalid guest memory access diagnostics (demand-paging / faults).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InvalidMemoryAccess {
     /// Whether an invalid access was observed.
     pub hit: bool,
+    /// Win32 exception code (e.g. `exception_code::ACCESS_VIOLATION`).
+    pub exception_code: u32,
     /// Access type (backend-specific; 0 if unused).
     pub access_type: i32,
     /// Faulting address.
@@ -82,6 +104,9 @@ pub enum CpuError {
     /// Interpreter / JIT failure message.
     #[error("{0}")]
     Message(String),
+    /// Integer divide-by-zero at the given instruction pointer.
+    #[error("integer divide by zero at rip={0:#x}")]
+    DivideByZero(u64),
 }
 
 /// Outcome of running until a code hook or stop condition.
