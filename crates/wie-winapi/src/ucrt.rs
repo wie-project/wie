@@ -104,8 +104,16 @@ pub fn dispatch_ucrt(
         "fputc" => handle_fputc(engine),
         "fputs" => handle_fputs(engine),
         "atoi" => handle_atoi(engine),
+        "atol" => handle_atol(engine),
+        "strtol" => handle_strtol(engine),
+        "strtoul" => handle_strtoul(engine),
+        "strtod" => handle_strtod(engine),
+        "strtof" => handle_strtod(engine),
+        "fopen" => handle_fopen(engine, state),
+        "fclose" => handle_fclose(engine, state),
         "fgets" => handle_fgets(engine, state),
         "fgetc" => handle_fgetc(engine),
+        "strtok" => handle_strtok(engine),
         "strcmp" => handle_strcmp(engine),
         "wcscmp" => handle_wcscmp(engine),
         "wcsstr" => handle_wcsstr(engine),
@@ -712,6 +720,29 @@ fn handle_puts(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResul
     ret(engine, 0) // non-negative = success
 }
 
+/// `fopen(path, mode)` — open a file for stdio access.
+fn handle_fopen(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    _state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let p = engine.read_rcx()?;
+    let m = engine.read_rdx()?;
+    let _path = read_guest_str(engine, p, 1024).unwrap_or_default();
+    let _mode = read_guest_str(engine, m, 16).unwrap_or_default();
+    drop((_path, _mode));
+    ret(engine, 0) // NULL = not implemented yet (needs VFS-to-CRT bridge)
+}
+
+/// `fclose(stream)` — close a stdio file handle.
+fn handle_fclose(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    _state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _stream = engine.read_rcx()?;
+    let _ = _stream;
+    ret(engine, u32::MAX as u64) // EOF = not implemented
+}
+
 /// `fgets(buf, max, stream)` — read one line from stdin.
 fn handle_fgets(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -763,23 +794,107 @@ fn handle_fgets(
     ret(engine, buf) // returns buf on success
 }
 
+/// Read a NUL-terminated string from guest memory into a host buffer.
+fn read_guest_str(engine: &mut dyn wie_cpu::CpuEngine, ptr: u64, max: usize) -> Result<String> {
+    if ptr == 0 { return Ok(String::new()); }
+    let mut bytes = Vec::with_capacity(max.min(128));
+    for i in 0..max {
+        let mut b = [0_u8; 1];
+        let off = u64::try_from(i).unwrap_or(0);
+        if engine.mem_read(ptr.wrapping_add(off), &mut b).is_err() { break; }
+        if b[0] == 0 { break; }
+        bytes.push(b[0]);
+    }
+    Ok(String::from_utf8_lossy(&bytes).to_string())
+}
+
 /// `atoi(s)` — parse ASCII string to int.
 fn handle_atoi(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    let s = engine.read_rcx()?;
-    if s == 0 { return ret(engine, 0); }
-    let mut bytes = [0u8; 32];
-    let mut n = 0_usize;
-    loop {
-        if n >= bytes.len() { break; }
-        let mut b = [0_u8; 1];
-        if engine.mem_read(s.wrapping_add(u64::try_from(n).unwrap_or(0)), &mut b).is_err() { break; }
-        if b[0] == 0 { break; }
-        bytes[n] = b[0];
-        n += 1;
-    }
-    let s_str = std::str::from_utf8(&bytes[..n]).unwrap_or("");
-    let val: i32 = s_str.trim().parse().unwrap_or(0);
+    let ptr = engine.read_rcx()?;
+    let s = read_guest_str(engine, ptr, 32)?;
+    let val: i32 = s.trim().parse().unwrap_or(0);
     ret(engine, val as u64)
+}
+
+/// `atol(s)` — parse ASCII string to long.
+fn handle_atol(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let ptr = engine.read_rcx()?;
+    let s = read_guest_str(engine, ptr, 32)?;
+    let val: i64 = s.trim().parse().unwrap_or(0);
+    ret(engine, val as u64)
+}
+
+/// `strtol(s, endptr, base)` — parse string to long.
+fn handle_strtol(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let s_ptr = engine.read_rcx()?;
+    let _endptr = engine.read_rdx()?;
+    let base = engine.read_r8()?;
+    let s = read_guest_str(engine, s_ptr, 64)?;
+    let val = i64::from_str_radix(s.trim(), u32::try_from(base).unwrap_or(10)).unwrap_or(0);
+    ret(engine, val as u64)
+}
+
+/// `strtoul(s, endptr, base)` — parse string to unsigned long.
+fn handle_strtoul(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let s_ptr = engine.read_rcx()?;
+    let _endptr = engine.read_rdx()?;
+    let base = engine.read_r8()?;
+    let s = read_guest_str(engine, s_ptr, 64)?;
+    let val = u64::from_str_radix(s.trim(), u32::try_from(base).unwrap_or(10)).unwrap_or(0);
+    ret(engine, val)
+}
+
+/// `strtod(s, endptr)` — parse string to double.
+fn handle_strtod(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let s_ptr = engine.read_rcx()?;
+    let _endptr = engine.read_rdx()?;
+    let s = read_guest_str(engine, s_ptr, 64)?;
+    let val: f64 = s.trim().parse().unwrap_or(0.0);
+    ret(engine, val.to_bits())
+}
+
+/// `strtok(s, delim)` — tokenize string (single-threaded, static buffer).
+fn handle_strtok(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let s_ptr = engine.read_rcx()?;
+    let d_ptr = engine.read_rdx()?;
+    static SAVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let ptr = if s_ptr == 0 { SAVE.load(std::sync::atomic::Ordering::Relaxed) } else { s_ptr };
+    if ptr == 0 { return ret(engine, 0); }
+    let delim = read_guest_str(engine, d_ptr, 32).unwrap_or_default();
+    // Skip leading delimiters.
+    let start = {
+        let mut p = ptr;
+        loop {
+            let mut b = [0_u8; 1];
+            if engine.mem_read(p, &mut b).is_err() { break; }
+            if b[0] == 0 { break; }
+            if delim.contains(b[0] as char) { p = p.wrapping_add(1); continue; }
+            break;
+        }
+        p
+    };
+    // Find first delimiter after start.
+    let mut end_off = 0_u64;
+    loop {
+        let mut b = [0_u8; 1];
+        if engine.mem_read(start.wrapping_add(end_off), &mut b).is_err() { break; }
+        if b[0] == 0 { break; }
+        if delim.contains(b[0] as char) {
+            let nul = [0_u8];
+            drop(engine.mem_write(start.wrapping_add(end_off), &nul));
+            SAVE.store(start.wrapping_add(end_off).wrapping_add(1), std::sync::atomic::Ordering::Relaxed);
+            return ret(engine, start);
+        }
+        end_off += 1;
+    }
+    // No more delimiters — return remaining token.
+    SAVE.store(0, std::sync::atomic::Ordering::Relaxed);
+    let mut b = [0_u8; 1];
+    if engine.mem_read(start, &mut b).is_ok() && b[0] != 0 {
+        ret(engine, start)
+    } else {
+        ret(engine, 0)
+    }
 }
 
 /// `fgetc(stream)` — EOF for empty stdin inject.

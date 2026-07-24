@@ -330,6 +330,8 @@ pub(crate) fn default_winapi_state(
         main_module_host_dir: None,
         error_mode: 0,
         suspended_threads: std::collections::HashMap::new(),
+        ucrt_files: std::collections::HashMap::new(),
+        ucrt_next_file_va: 0x0000_0000_6900_0000,
     })
 }
 

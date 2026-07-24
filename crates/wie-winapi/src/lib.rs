@@ -354,6 +354,12 @@ pub struct WinApiState {
 
     /// Threads that have been suspended, keyed by TID → suspend count.
     pub suspended_threads: HashMap<u32, u32>,
+
+    /// CRT `fopen` → file handle map: fake FILE* VA → kernel file handle.
+    pub ucrt_files: HashMap<u64, u64>,
+
+    /// Next fake FILE* VA for CRT `fopen`.
+    pub ucrt_next_file_va: u64,
 }
 
 // Manual Debug impl: Box<dyn FnMut + Send> does not implement Debug.
@@ -545,6 +551,8 @@ impl Clone for WinApiState {
             main_module_host_dir: self.main_module_host_dir.clone(),
             error_mode: self.error_mode,
             suspended_threads: self.suspended_threads.clone(),
+            ucrt_files: self.ucrt_files.clone(),
+            ucrt_next_file_va: self.ucrt_next_file_va,
         }
     }
 }
@@ -1127,6 +1135,8 @@ mod tests {
             main_module_host_dir: None,
             error_mode: 0,
             suspended_threads: HashMap::new(),
+            ucrt_files: HashMap::new(),
+            ucrt_next_file_va: 0x0000_0000_6900_0000,
         }
     }
 
