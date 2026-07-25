@@ -70,9 +70,6 @@ make -C micro-exes && ./scripts/run-micro-suite.sh
 # Run a specific category instead of the full suite:
 ./scripts/run-micro-suite.sh cpp_exes    # C++ exception tests only
 ./scripts/run-micro-suite.sh seh_exes    # SEH hardware-fault tests
-./scripts/run-micro-suite.sh game        # interactive game test
-./scripts/run-micro-suite.sh n1          # no-bottle micros only
-./scripts/run-micro-suite.sh n2          # bottle/VFS tests only
 ./scripts/run-micro-suite.sh dll_tests   # DLL loader tests
 
 # JIT / CPU A/B
