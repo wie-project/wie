@@ -626,11 +626,15 @@ impl RuntimeSession {
                     format!("failed to plant soft API {}!{}", entry.library, entry.name)
                 })?;
         }
-        // Read the PE file once; we need the bytes for both identity and loading.
+        // Read the PE file once; parse once and reuse the parsed representation.
         let pe_bytes = std::fs::read(path)
             .with_context(|| format!("failed to read PE file: {}", path.display()))?;
-        let identity = wie_pe::pe_identity_from_bytes(path, &pe_bytes)
-            .context("failed to parse PE identity")?;
+        // Parse PE once (avoids double-parse: pe_identity_from_bytes and
+        // load_pe_direct_from_bytes both used to call PE::parse independently).
+        let pe = wie_pe::PE::parse(&pe_bytes)
+            .context("failed to parse PE image")?;
+        let identity = wie_pe::pe_identity_from_parsed(&pe, path, &pe_bytes)
+            .context("failed to extract PE identity")?;
         let image_size =
             usize::try_from(identity.size_of_image).context("size_of_image does not fit usize")?;
 
@@ -647,15 +651,16 @@ impl RuntimeSession {
             .mem_map_image(identity.image_base, image_size, wie_cpu::perm::ALL)
             .context("failed to map PE image memory")?;
 
-        // Load PE directly into guest memory: single PE parse, writes headers +
-        // sections + patches IAT in-place through the engine. Returns the section
+        // Load PE directly into guest memory: writes headers + sections + patches IAT
+        // in-place through the engine using the already-parsed PE. Returns the section
         // map plan too — no need to re-read the file.
         // Collect RuntimeFakeApiEntry during the resolution pass so we can skip
         // the redundant build_iat_fake_api_entries call later.
         let mut iat_entries: Vec<RuntimeFakeApiEntry> = Vec::new();
         let (image_summary, pe_map_plan, _patched_imports) = {
             let engine_ref = &mut *engine;
-            wie_pe::load_pe_direct_from_bytes(
+            wie_pe::load_pe_direct_from_parsed(
+                &pe,
                 &pe_bytes,
                 identity.image_base,
                 image_size,

@@ -1,7 +1,7 @@
 //! PE64 inspection and loading helpers for WIE (generic PE64 userspace).
 
 use anyhow::{Context, Result, bail};
-use goblin::pe::PE;
+pub use goblin::pe::PE;
 use serde::Serialize;
 use std::path::Path;
 
@@ -129,7 +129,7 @@ pub fn pe_identity_from_bytes(path: &Path, bytes: &[u8]) -> Result<PeIdentity> {
 }
 
 /// Private: extract identity from a pre-parsed PE (no re-parse).
-fn pe_identity_from_parsed(pe: &PE, path: &Path, _bytes: &[u8]) -> Result<PeIdentity> {
+pub fn pe_identity_from_parsed(pe: &PE, path: &Path, _bytes: &[u8]) -> Result<PeIdentity> {
     if !pe.is_64 {
         bail!("expected PE64 image, got PE32");
     }
@@ -914,9 +914,11 @@ where
     load_pe_direct_from_bytes(&bytes, image_base, image_size, mem_write, fake_target)
 }
 
-/// Like [`load_pe_direct`] but takes pre-read PE bytes instead of a path,
-/// allowing the caller to parse the identity *and* load with a single file read.
-pub fn load_pe_direct_from_bytes<F, W>(
+/// Like [`load_pe_direct_from_bytes`] but takes a pre-parsed [`PE`] reference,
+/// avoiding a redundant parse when the caller already parsed the PE bytes
+/// (e.g., to extract identity before mapping guest memory).
+pub fn load_pe_direct_from_parsed<F, W>(
+    pe: &PE,
     bytes: &[u8],
     image_base: u64,
     image_size: usize,
@@ -927,14 +929,12 @@ where
     F: FnMut(&PeImportSummary) -> Result<u64>,
     W: FnMut(u64, &[u8]) -> Result<()>,
 {
-    let pe = PE::parse(bytes).context("failed to parse PE image")?;
-
     if !pe.is_64 {
         bail!("expected PE64 image, got PE32");
     }
 
-    let identity = pe_identity_from_parsed(&pe, Path::new("<memory>"), bytes)?;
-    let map_plan = pe_map_plan_from_parsed(&pe, bytes)?;
+    let identity = pe_identity_from_parsed(pe, Path::new("<memory>"), bytes)?;
+    let map_plan = pe_map_plan_from_parsed(pe, bytes)?;
 
     let header_size =
         usize::try_from(identity.size_of_headers).context("size_of_headers does not fit usize")?;
@@ -979,7 +979,7 @@ where
     }
 
     // Parse imports from the same bytes (no re-parse).
-    let imports = inspect_pe_imports_from_parsed(&pe, bytes)?;
+    let imports = inspect_pe_imports_from_parsed(pe, bytes)?;
 
     // Patch IAT directly in guest memory through the writer.
     let patched =
@@ -995,6 +995,23 @@ where
     };
 
     Ok((summary, map_plan, patched))
+}
+
+/// Like [`load_pe_direct`] but takes pre-read PE bytes instead of a path,
+/// allowing the caller to parse the identity *and* load with a single file read.
+pub fn load_pe_direct_from_bytes<F, W>(
+    bytes: &[u8],
+    image_base: u64,
+    image_size: usize,
+    mem_write: W,
+    fake_target: F,
+) -> Result<(PeLoadedImageSummary, PeMapPlan, Vec<PePatchedImport>)>
+where
+    F: FnMut(&PeImportSummary) -> Result<u64>,
+    W: FnMut(u64, &[u8]) -> Result<()>,
+{
+    let pe = PE::parse(bytes).context("failed to parse PE image")?;
+    load_pe_direct_from_parsed(&pe, bytes, image_base, image_size, mem_write, fake_target)
 }
 
 /// Patches IAT slots in guest memory through a writer callback.

@@ -1654,11 +1654,11 @@ impl JitEngine {
 
 impl CpuEngine for JitCpu {
     fn mem_map(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
-        let r = self.shared.mem.write().unwrap().map(address, size, perms);
-        self.shared.mem_gen.store(
-            self.shared.mem.read().unwrap().generation(),
-            Ordering::Release,
-        );
+        let mut mem = self.shared.mem.write().unwrap();
+        let r = mem.map(address, size, perms);
+        self.shared
+            .mem_gen
+            .store(mem.generation(), Ordering::Release);
         r
     }
 

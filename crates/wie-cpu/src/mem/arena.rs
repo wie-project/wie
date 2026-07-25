@@ -402,6 +402,17 @@ impl ArenaSet {
             return Ok(());
         }
 
+        // Fast path: entire range is fresh (no overlapping arena).
+        // Avoids O(n_pages) page-by-page walk for freshly-mapped regions.
+        // During session init, 17+ regions are mapped — the slow path would
+        // iterate every page for the 512 MiB heap and shadow (~530K
+        // page iterations total).
+        if !self.any_overlap(address, end) {
+            let arena = MmapArena::map_new(address, size, perms)?;
+            self.insert(arena)?;
+            return Ok(());
+        }
+
         // First pass: update perms on arenas that already cover pages in range.
         let mut page_va = address;
         while page_va < end {
