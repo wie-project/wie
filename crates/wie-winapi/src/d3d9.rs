@@ -136,8 +136,8 @@ pub fn handle_direct3d_create9(
             // A COM object starts with a pointer to its vtable.
             write_guest_u64(engine, object_address, vtable_address)?;
 
-            state.d3d9_object_address = object_address;
-            state.d3d9_ref_count = 1;
+            state.d3d9.d3d9_object_address = object_address;
+            state.d3d9.d3d9_ref_count = 1;
 
             object_address
         }
@@ -383,10 +383,10 @@ pub fn handle_get_adapter_display_mode(
     let return_value = if adapter != 0 || display_mode_address == 0 {
         D3DERR_INVALIDCALL
     } else {
-        let width = u32::try_from(state.window_width)
+        let width = u32::try_from(state.window_state.window_width)
             .context("D3D display width is negative or does not fit u32")?;
 
-        let height = u32::try_from(state.window_height)
+        let height = u32::try_from(state.window_state.window_height)
             .context("D3D display height is negative or does not fit u32")?;
 
         write_guest_u32(engine, display_mode_address, width)
@@ -432,7 +432,7 @@ fn allocate_direct3d_block(
     size: u64,
     _allocation_name: &str,
 ) -> u64 {
-    state.heap.alloc_coherent(engine, size)
+    state.heap_state.heap.alloc_coherent(engine, size)
 }
 
 fn read_stack_argument(
@@ -468,7 +468,7 @@ fn normalize_presentation_parameters(
         read_guest_u32(engine, height_address).context("failed to read BackBufferHeight")?;
 
     if width == 0 {
-        let fallback_width = u32::try_from(state.window_width)
+        let fallback_width = u32::try_from(state.window_state.window_width)
             .context("window width is negative or does not fit u32")?;
 
         write_guest_u32(engine, parameters_address, fallback_width)
@@ -476,7 +476,7 @@ fn normalize_presentation_parameters(
     }
 
     if height == 0 {
-        let fallback_height = u32::try_from(state.window_height)
+        let fallback_height = u32::try_from(state.window_state.window_height)
             .context("window height is negative or does not fit u32")?;
 
         write_guest_u32(engine, height_address, fallback_height)
@@ -604,8 +604,8 @@ pub fn handle_create_device(
             write_guest_u64(engine, returned_device_address, object_address)
                 .context("failed to return IDirect3DDevice9 pointer")?;
 
-            state.d3d9_device_object_address = object_address;
-            state.d3d9_device_ref_count = 1;
+            state.d3d9.d3d9_device_object_address = object_address;
+            state.d3d9.d3d9_device_ref_count = 1;
 
             D3D_OK
         }
@@ -641,7 +641,7 @@ pub fn handle_set_vertex_shader(
         .read_rdx()
         .context("failed to read RDX for IDirect3DDevice9::SetVertexShader")?;
 
-    state.d3d9_current_vertex_shader = vertex_shader;
+    state.d3d9.d3d9_current_vertex_shader = vertex_shader;
 
     let return_value = D3D_OK;
 
@@ -672,7 +672,7 @@ pub fn handle_set_fvf(
 
     let fvf = u32::try_from(fvf_low).context("IDirect3DDevice9::SetFVF value does not fit u32")?;
 
-    state.d3d9_current_fvf = fvf;
+    state.d3d9.d3d9_current_fvf = fvf;
 
     let return_value = D3D_OK;
 
@@ -710,13 +710,13 @@ pub fn handle_set_render_state(
         .context("SetRenderState value does not fit u32")?;
 
     if let Some(entry) = state
-        .d3d9_render_states
+        .d3d9.d3d9_render_states
         .iter_mut()
         .find(|(stored_state, _)| *stored_state == render_state)
     {
         entry.1 = value;
     } else {
-        state.d3d9_render_states.push((render_state, value));
+        state.d3d9.d3d9_render_states.push((render_state, value));
     }
 
     let return_value = D3D_OK;
@@ -762,14 +762,14 @@ pub fn handle_set_texture_stage_state(
         .context("SetTextureStageState value does not fit u32")?;
 
     if let Some(entry) = state
-        .d3d9_texture_stage_states
+        .d3d9.d3d9_texture_stage_states
         .iter_mut()
         .find(|(stored_stage, stored_type, _)| *stored_stage == stage && *stored_type == state_type)
     {
         entry.2 = value;
     } else {
         state
-            .d3d9_texture_stage_states
+            .d3d9.d3d9_texture_stage_states
             .push((stage, state_type, value));
     }
 
@@ -805,13 +805,13 @@ pub fn handle_set_sampler_state(
         u32::try_from(engine.read_r9()? & u64::from(u32::MAX)).context("value does not fit u32")?;
 
     if let Some(entry) = state
-        .d3d9_sampler_states
+        .d3d9.d3d9_sampler_states
         .iter_mut()
         .find(|(s, t, _)| *s == sampler && *t == state_type)
     {
         entry.2 = value;
     } else {
-        state.d3d9_sampler_states.push((sampler, state_type, value));
+        state.d3d9.d3d9_sampler_states.push((sampler, state_type, value));
     }
 
     let return_value = D3D_OK;
@@ -835,26 +835,26 @@ pub fn handle_device_release(
         .read_rcx()
         .context("failed to read RCX for IDirect3DDevice9::Release")?;
 
-    let valid_object = this_pointer != 0 && this_pointer == state.d3d9_device_object_address;
+    let valid_object = this_pointer != 0 && this_pointer == state.d3d9.d3d9_device_object_address;
 
     let return_value = if valid_object {
-        state.d3d9_device_ref_count = state.d3d9_device_ref_count.saturating_sub(1);
+        state.d3d9.d3d9_device_ref_count = state.d3d9.d3d9_device_ref_count.saturating_sub(1);
 
-        let remaining_references = state.d3d9_device_ref_count;
+        let remaining_references = state.d3d9.d3d9_device_ref_count;
 
         if remaining_references == 0 {
             let allocation_address = this_pointer
                 .checked_sub(IDIRECT3DDEVICE9_OBJECT_OFFSET)
                 .context("IDirect3DDevice9 allocation address underflow")?;
 
-            let _ = state.heap.free_coherent(engine, allocation_address);
+            let _ = state.heap_state.heap.free_coherent(engine, allocation_address);
 
-            state.d3d9_device_object_address = 0;
-            state.d3d9_current_vertex_shader = 0;
-            state.d3d9_current_fvf = 0;
-            state.d3d9_render_states.clear();
-            state.d3d9_texture_stage_states.clear();
-            state.d3d9_sampler_states.clear();
+            state.d3d9.d3d9_device_object_address = 0;
+            state.d3d9.d3d9_current_vertex_shader = 0;
+            state.d3d9.d3d9_current_fvf = 0;
+            state.d3d9.d3d9_render_states.clear();
+            state.d3d9.d3d9_texture_stage_states.clear();
+            state.d3d9.d3d9_sampler_states.clear();
         }
 
         u64::from(remaining_references)
@@ -881,21 +881,21 @@ pub fn handle_direct3d9_release(
         .read_rcx()
         .context("failed to read RCX for IDirect3D9::Release")?;
 
-    let valid_object = this_pointer != 0 && this_pointer == state.d3d9_object_address;
+    let valid_object = this_pointer != 0 && this_pointer == state.d3d9.d3d9_object_address;
 
     let return_value = if valid_object {
-        state.d3d9_ref_count = state.d3d9_ref_count.saturating_sub(1);
+        state.d3d9.d3d9_ref_count = state.d3d9.d3d9_ref_count.saturating_sub(1);
 
-        let remaining_references = state.d3d9_ref_count;
+        let remaining_references = state.d3d9.d3d9_ref_count;
 
         if remaining_references == 0 {
             let allocation_address = this_pointer
                 .checked_sub(IDIRECT3D9_OBJECT_OFFSET)
                 .context("IDirect3D9 allocation address underflow")?;
 
-            let _ = state.heap.free_coherent(engine, allocation_address);
+            let _ = state.heap_state.heap.free_coherent(engine, allocation_address);
 
-            state.d3d9_object_address = 0;
+            state.d3d9.d3d9_object_address = 0;
         }
 
         u64::from(remaining_references)

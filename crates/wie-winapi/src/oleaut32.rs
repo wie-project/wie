@@ -106,7 +106,7 @@ fn alloc_bstr(
         .saturating_add(u64::from(byte_len))
         .saturating_add(2)
         .saturating_add(8);
-    let raw = state.heap.alloc_coherent(engine, total);
+    let raw = state.heap_state.heap.alloc_coherent(engine, total);
     if raw == 0 {
         return Ok(0);
     }
@@ -178,7 +178,7 @@ fn handle_sys_free_string(
     let bstr = engine.read_rcx()?;
     if bstr != 0 {
         // Free the allocation that includes the 4-byte length prefix.
-        let _ = state.heap.free_coherent(engine, bstr.wrapping_sub(4));
+        let _ = state.heap_state.heap.free_coherent(engine, bstr.wrapping_sub(4));
     }
     ret(engine, 0)
 }
@@ -291,7 +291,7 @@ fn read_bstr_field(engine: &mut dyn wie_cpu::CpuEngine, pvar: u64) -> Result<u64
 
 fn free_bstr_if_any(engine: &mut dyn wie_cpu::CpuEngine, state: &mut WinApiState, bstr: u64) {
     if bstr != 0 {
-        let _ = state.heap.free_coherent(engine, bstr.wrapping_sub(4));
+        let _ = state.heap_state.heap.free_coherent(engine, bstr.wrapping_sub(4));
     }
 }
 

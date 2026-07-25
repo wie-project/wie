@@ -59,7 +59,7 @@ pub fn handle_get_async_key_state(
     let virtual_key = usize::try_from(virtual_key_raw & 0xff).unwrap_or(0);
 
     // Bit 15: key is currently down.  Bit 0: key was pressed since last call.
-    let key_state = state.keyboard_state.get(virtual_key).copied().unwrap_or(0);
+    let key_state = state.window_state.keyboard_state.get(virtual_key).copied().unwrap_or(0);
     let mut result = u64::from(key_state & 0x80);
     if result != 0 {
         result |= 1; // most-significant bit set → key down
@@ -189,16 +189,16 @@ pub fn handle_peek_message_a(
         window_matches && message_matches
     };
 
-    let matching_index = state.message_queue.iter().position(matches_filter);
+    let matching_index = state.window_state.message_queue.iter().position(matches_filter);
 
     let return_value = if let Some(index) = matching_index {
         let queued = if w_remove_msg != 0 {
             // PM_REMOVE: remove from queue.
-            state.message_queue.remove(index)
+            state.window_state.message_queue.remove(index)
         } else {
             // PM_NOREMOVE: leave in queue. Index is from `position` on this Vec.
             state
-                .message_queue
+                .window_state.message_queue
                 .get(index)
                 .cloned()
                 .context("PeekMessageA matching index vanished")?
@@ -1130,14 +1130,14 @@ pub fn handle_post_message_a(
     let valid_window = window_handle == 0 || window_handle == FAKE_WINDOW_HANDLE;
 
     if valid_window {
-        let time = state.next_message_time;
+        let time = state.window_state.next_message_time;
 
-        state.next_message_time = state
-            .next_message_time
+        state.window_state.next_message_time = state
+            .window_state.next_message_time
             .checked_add(1)
             .context("PostMessageA timestamp overflow")?;
 
-        state.message_queue.push(QueuedWindowMessage {
+        state.window_state.message_queue.push(QueuedWindowMessage {
             window_handle,
             message,
             word_parameter,
@@ -1567,7 +1567,7 @@ pub fn handle_get_active_window(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    let return_value = state.active_window_handle;
+    let return_value = state.window_state.active_window_handle;
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -1584,7 +1584,7 @@ pub fn handle_get_foreground_window(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    let return_value = state.foreground_window_handle;
+    let return_value = state.window_state.foreground_window_handle;
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -1609,12 +1609,12 @@ pub fn handle_show_window(
         .read_rdx()
         .context("failed to read RDX for ShowWindow")?;
 
-    let previously_visible = state.window_visible;
+    let previously_visible = state.window_state.window_visible;
 
     if window_handle == FAKE_WINDOW_HANDLE {
         // SW_HIDE is zero. Other commands make the window visible in the
         // current single-window model.
-        state.window_visible = show_command != 0;
+        state.window_state.window_visible = show_command != 0;
     }
 
     let return_value = u64::from(previously_visible);
@@ -1642,10 +1642,10 @@ pub fn handle_enable_window(
         .read_rdx()
         .context("failed to read RDX for EnableWindow")?;
 
-    let previously_disabled = !state.window_enabled;
+    let previously_disabled = !state.window_state.window_enabled;
 
     if window_handle == FAKE_WINDOW_HANDLE {
-        state.window_enabled = enable_raw != 0;
+        state.window_state.window_enabled = enable_raw != 0;
     }
 
     // EnableWindow returns nonzero when the window was previously disabled.
@@ -1673,8 +1673,8 @@ pub fn handle_set_foreground_window(
     let success = window_handle == FAKE_WINDOW_HANDLE;
 
     if success {
-        state.foreground_window_handle = window_handle;
-        state.active_window_handle = window_handle;
+        state.window_state.foreground_window_handle = window_handle;
+        state.window_state.active_window_handle = window_handle;
     }
 
     let return_value = u64::from(success);
@@ -1698,10 +1698,10 @@ pub fn handle_set_active_window(
         .read_rcx()
         .context("failed to read RCX for SetActiveWindow")?;
 
-    let previous_window = state.active_window_handle;
+    let previous_window = state.window_state.active_window_handle;
 
     if window_handle == 0 || window_handle == FAKE_WINDOW_HANDLE {
-        state.active_window_handle = window_handle;
+        state.window_state.active_window_handle = window_handle;
     }
 
     let return_address = engine
@@ -1723,10 +1723,10 @@ pub fn handle_set_focus(
         .read_rcx()
         .context("failed to read RCX for SetFocus")?;
 
-    let previous_window = state.focus_window_handle;
+    let previous_window = state.window_state.focus_window_handle;
 
     if window_handle == 0 || window_handle == FAKE_WINDOW_HANDLE {
-        state.focus_window_handle = window_handle;
+        state.window_state.focus_window_handle = window_handle;
     }
 
     let return_address = engine
@@ -1744,7 +1744,7 @@ pub fn handle_get_focus(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    let return_value = state.focus_window_handle;
+    let return_value = state.window_state.focus_window_handle;
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -1765,10 +1765,10 @@ pub fn handle_set_capture(
         .read_rcx()
         .context("failed to read RCX for SetCapture")?;
 
-    let previous_window = state.capture_window_handle;
+    let previous_window = state.window_state.capture_window_handle;
 
     if window_handle == FAKE_WINDOW_HANDLE {
-        state.capture_window_handle = window_handle;
+        state.window_state.capture_window_handle = window_handle;
     }
 
     let return_address = engine
@@ -1786,7 +1786,7 @@ pub fn handle_get_capture(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    let return_value = state.capture_window_handle;
+    let return_value = state.window_state.capture_window_handle;
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -1803,7 +1803,7 @@ pub fn handle_release_capture(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    state.capture_window_handle = 0;
+    state.window_state.capture_window_handle = 0;
 
     let return_value = 1;
 
@@ -1826,8 +1826,8 @@ pub fn handle_set_cursor(
         .read_rcx()
         .context("failed to read RCX for SetCursor")?;
 
-    let previous_cursor = state.cursor_handle;
-    state.cursor_handle = cursor_handle;
+    let previous_cursor = state.window_state.cursor_handle;
+    state.window_state.cursor_handle = cursor_handle;
 
     let return_address = engine
         .return_from_win64_api(previous_cursor)
@@ -1916,7 +1916,7 @@ pub fn handle_update_window(
     let success = is_known_window(state, window_handle);
 
     if success {
-        state.window_invalidated = false;
+        state.window_state.window_invalidated = false;
     }
 
     let return_value = u64::from(success);
@@ -1951,7 +1951,7 @@ pub fn handle_invalidate_rect(
     let success = window_handle == 0 || is_known_window(state, window_handle);
 
     if success {
-        state.window_invalidated = true;
+        state.window_state.window_invalidated = true;
     }
 
     let return_value = u64::from(success);
@@ -2054,7 +2054,7 @@ pub fn handle_end_paint(
 
     let success = is_known_window(state, window_handle);
     if success {
-        state.window_invalidated = false;
+        state.window_state.window_invalidated = false;
     }
 
     let return_value = u64::from(success);
@@ -2092,7 +2092,7 @@ pub fn handle_redraw_window(
     let success = window_handle == 0 || window_handle == FAKE_WINDOW_HANDLE;
 
     if success {
-        state.window_invalidated = false;
+        state.window_state.window_invalidated = false;
     }
 
     let return_value = u64::from(success);
@@ -2123,7 +2123,7 @@ pub fn handle_set_window_text_a(
     let success = window_handle == FAKE_WINDOW_HANDLE && text_ptr != 0;
 
     if success {
-        state.window_title = read_guest_ansi_lossy(engine, text_ptr, 32_768)
+        state.window_state.window_title = read_guest_ansi_lossy(engine, text_ptr, 32_768)
             .context("failed to read SetWindowTextA text")?;
     }
 
@@ -2155,7 +2155,7 @@ pub fn handle_set_window_text_w(
     let success = window_handle == FAKE_WINDOW_HANDLE && text_ptr != 0;
 
     if success {
-        state.window_title = read_guest_utf16_lossy(engine, text_ptr, 32_768)
+        state.window_state.window_title = read_guest_utf16_lossy(engine, text_ptr, 32_768)
             .context("failed to read SetWindowTextW text")?;
     }
 
@@ -2189,7 +2189,7 @@ pub fn handle_get_window_text_a(
         .context("failed to read R8 for GetWindowTextA")?;
 
     let return_value = if window_handle == FAKE_WINDOW_HANDLE {
-        write_ansi_window_text(engine, buffer_ptr, max_characters, &state.window_title)?
+        write_ansi_window_text(engine, buffer_ptr, max_characters, &state.window_state.window_title)?
     } else {
         0
     };
@@ -2222,7 +2222,7 @@ pub fn handle_get_window_text_w(
         .context("failed to read R8 for GetWindowTextW")?;
 
     let return_value = if window_handle == FAKE_WINDOW_HANDLE {
-        write_wide_window_text(engine, buffer_ptr, max_characters, &state.window_title)?
+        write_wide_window_text(engine, buffer_ptr, max_characters, &state.window_state.window_title)?
     } else {
         0
     };
@@ -2308,13 +2308,13 @@ pub fn handle_move_window(
     let success = window_handle == FAKE_WINDOW_HANDLE;
 
     if success {
-        state.window_x = low_i32(x_raw, "MoveWindow x")?;
-        state.window_y = low_i32(y_raw, "MoveWindow y")?;
-        state.window_width = low_i32(width_raw, "MoveWindow width")?;
-        state.window_height = low_i32(height_raw, "MoveWindow height")?;
+        state.window_state.window_x = low_i32(x_raw, "MoveWindow x")?;
+        state.window_state.window_y = low_i32(y_raw, "MoveWindow y")?;
+        state.window_state.window_width = low_i32(width_raw, "MoveWindow width")?;
+        state.window_state.window_height = low_i32(height_raw, "MoveWindow height")?;
 
         if repaint_raw != 0 {
-            state.window_invalidated = false;
+            state.window_state.window_invalidated = false;
         }
     }
 
@@ -2353,11 +2353,11 @@ pub fn handle_screen_to_client(
         let y = read_guest_i32(engine, y_address)?;
 
         let client_x = x
-            .checked_sub(state.window_x)
+            .checked_sub(state.window_state.window_x)
             .context("ScreenToClient x coordinate overflow")?;
 
         let client_y = y
-            .checked_sub(state.window_y)
+            .checked_sub(state.window_state.window_y)
             .context("ScreenToClient y coordinate overflow")?;
 
         write_guest_i32(engine, point_ptr, client_x)?;
@@ -2399,11 +2399,11 @@ pub fn handle_client_to_screen(
         let y = read_guest_i32(engine, y_address)?;
 
         let screen_x = x
-            .checked_add(state.window_x)
+            .checked_add(state.window_state.window_x)
             .context("ClientToScreen x coordinate overflow")?;
 
         let screen_y = y
-            .checked_add(state.window_y)
+            .checked_add(state.window_state.window_y)
             .context("ClientToScreen y coordinate overflow")?;
 
         write_guest_i32(engine, point_ptr, screen_x)?;
@@ -2671,7 +2671,7 @@ pub fn handle_get_cursor(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    let return_value = state.cursor_handle;
+    let return_value = state.window_state.cursor_handle;
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -2739,7 +2739,7 @@ pub fn handle_set_keyboard_state(
     let success = keyboard_state_ptr != 0;
 
     if success {
-        read_guest_bytes(engine, keyboard_state_ptr, &mut state.keyboard_state)
+        read_guest_bytes(engine, keyboard_state_ptr, &mut state.window_state.keyboard_state)
             .context("failed to read SetKeyboardState buffer")?;
     }
 
@@ -2767,7 +2767,7 @@ pub fn handle_get_keyboard_state(
     let success = keyboard_state_ptr != 0;
 
     if success {
-        write_guest_bytes(engine, keyboard_state_ptr, &state.keyboard_state)
+        write_guest_bytes(engine, keyboard_state_ptr, &state.window_state.keyboard_state)
             .context("failed to write GetKeyboardState buffer")?;
     }
 
@@ -2795,7 +2795,7 @@ pub fn handle_get_key_state(
     let virtual_key = usize::try_from(virtual_key_raw & 0xff)
         .context("GetKeyState virtual key does not fit usize")?;
 
-    let key_state = state.keyboard_state.get(virtual_key).copied().unwrap_or(0);
+    let key_state = state.window_state.keyboard_state.get(virtual_key).copied().unwrap_or(0);
 
     // WinAPI uses the high bit of SHORT to indicate a pressed key.
     let return_value = if (key_state & 0x80) != 0 {
@@ -2864,7 +2864,7 @@ fn get_window_long_ptr_value(
     let index = window_long_ptr_index(index_raw, api_name)?;
 
     Ok(state
-        .window_long_ptr_values
+        .window_state.window_long_ptr_values
         .iter()
         .find(|(stored_window, stored_index, _)| {
             *stored_window == window_handle && *stored_index == index
@@ -2882,7 +2882,7 @@ fn set_window_long_ptr_value(
     let index = window_long_ptr_index(index_raw, api_name)?;
 
     let previous_value = state
-        .window_long_ptr_values
+        .window_state.window_long_ptr_values
         .iter()
         .find(|(stored_window, stored_index, _)| {
             *stored_window == window_handle && *stored_index == index
@@ -2891,7 +2891,7 @@ fn set_window_long_ptr_value(
 
     if let Some(entry) =
         state
-            .window_long_ptr_values
+            .window_state.window_long_ptr_values
             .iter_mut()
             .find(|(stored_window, stored_index, _)| {
                 *stored_window == window_handle && *stored_index == index
@@ -2900,7 +2900,7 @@ fn set_window_long_ptr_value(
         entry.2 = new_value;
     } else {
         state
-            .window_long_ptr_values
+            .window_state.window_long_ptr_values
             .push((window_handle, index, new_value));
     }
 
@@ -3017,10 +3017,10 @@ pub fn handle_set_timer(
 
     let return_value = if valid_window {
         let timer_id = if requested_timer_id == 0 {
-            let generated_id = state.next_timer_id;
+            let generated_id = state.window_state.next_timer_id;
 
-            state.next_timer_id = state
-                .next_timer_id
+            state.window_state.next_timer_id = state
+                .window_state.next_timer_id
                 .checked_add(1)
                 .context("SetTimer identifier overflow")?;
 
@@ -3030,14 +3030,14 @@ pub fn handle_set_timer(
         };
 
         if let Some(timer) = state
-            .timers
+            .window_state.timers
             .iter_mut()
             .find(|timer| timer.window_handle == window_handle && timer.timer_id == timer_id)
         {
             timer.interval_ms = interval_ms;
             timer.callback_address = callback_address;
         } else {
-            state.timers.push(TimerRecord {
+            state.window_state.timers.push(TimerRecord {
                 window_handle,
                 timer_id,
                 interval_ms,
@@ -3074,13 +3074,13 @@ pub fn handle_kill_timer(
         .context("failed to read RDX for KillTimer")?;
 
     let existed = state
-        .timers
+        .window_state.timers
         .iter()
         .any(|timer| timer.window_handle == window_handle && timer.timer_id == timer_id);
 
     if existed {
         state
-            .timers
+            .window_state.timers
             .retain(|timer| timer.window_handle != window_handle || timer.timer_id != timer_id);
     }
 
@@ -3203,14 +3203,14 @@ pub fn handle_set_windows_hook_ex_w(
     let return_value = if callback_address == 0 {
         0
     } else {
-        let handle = state.next_windows_hook_handle;
+        let handle = state.window_state.next_windows_hook_handle;
 
-        state.next_windows_hook_handle = state
-            .next_windows_hook_handle
+        state.window_state.next_windows_hook_handle = state
+            .window_state.next_windows_hook_handle
             .checked_add(1)
             .context("SetWindowsHookExW handle overflow")?;
 
-        state.windows_hooks.push(WindowsHookRecord {
+        state.window_state.windows_hooks.push(WindowsHookRecord {
             handle,
             hook_type,
             callback_address,
@@ -3241,13 +3241,13 @@ pub fn handle_unhook_windows_hook_ex(
         .context("failed to read RCX for UnhookWindowsHookEx")?;
 
     let existed = state
-        .windows_hooks
+        .window_state.windows_hooks
         .iter()
         .any(|hook| hook.handle == hook_handle);
 
     if existed {
         state
-            .windows_hooks
+            .window_state.windows_hooks
             .retain(|hook| hook.handle != hook_handle);
     }
 
@@ -3320,19 +3320,19 @@ pub fn handle_enable_menu_item(
         .context("EnableMenuItem flags do not fit u32")?;
 
     let previous_flags = state
-        .menu_item_states
+        .window_state.menu_item_states
         .iter()
         .find(|(stored_menu, stored_item, _)| *stored_menu == menu_handle && *stored_item == item)
         .map_or(u32::MAX, |(_, _, stored_flags)| *stored_flags);
 
     if let Some(entry) = state
-        .menu_item_states
+        .window_state.menu_item_states
         .iter_mut()
         .find(|(stored_menu, stored_item, _)| *stored_menu == menu_handle && *stored_item == item)
     {
         entry.2 = flags;
     } else {
-        state.menu_item_states.push((menu_handle, item, flags));
+        state.window_state.menu_item_states.push((menu_handle, item, flags));
     }
 
     let return_value = u64::from(previous_flags);
@@ -3371,20 +3371,20 @@ pub fn handle_check_menu_item(
         .context("CheckMenuItem flags do not fit u32")?;
 
     let previous_flags = state
-        .menu_item_check_states
+        .window_state.menu_item_check_states
         .iter()
         .find(|(stored_menu, stored_item, _)| *stored_menu == menu_handle && *stored_item == item)
         .map_or(u32::MAX, |(_, _, stored_flags)| *stored_flags);
 
     if let Some(entry) = state
-        .menu_item_check_states
+        .window_state.menu_item_check_states
         .iter_mut()
         .find(|(stored_menu, stored_item, _)| *stored_menu == menu_handle && *stored_item == item)
     {
         entry.2 = flags;
     } else {
         state
-            .menu_item_check_states
+            .window_state.menu_item_check_states
             .push((menu_handle, item, flags));
     }
 
@@ -3508,19 +3508,19 @@ pub fn handle_get_message_a(
         window_matches && message_matches
     };
 
-    let matching_index = state.message_queue.iter().position(matches_filter);
+    let matching_index = state.window_state.message_queue.iter().position(matches_filter);
 
     let return_value = if message_address == 0 {
         // GetMessage returns -1 on failure.
         u64::from(u32::MAX)
     } else if let Some(index) = matching_index {
-        let queued = state.message_queue.remove(index);
+        let queued = state.window_state.message_queue.remove(index);
 
         write_message_structure(engine, message_address, &queued)?;
 
         u64::from(queued.message != WM_QUIT)
     } else {
-        match state.message_queue_idle_policy {
+        match state.window_state.message_queue_idle_policy {
             MessageQueueIdlePolicy::ExitOnIdle => {
                 /*
                  * Regression mode: represent an empty queue as a synthetic
@@ -3531,13 +3531,13 @@ pub fn handle_get_message_a(
                     message: WM_QUIT,
                     word_parameter: 0,
                     long_parameter: 0,
-                    time: state.next_message_time,
+                    time: state.window_state.next_message_time,
                     point_x: 0,
                     point_y: 0,
                 };
 
-                state.next_message_time = state
-                    .next_message_time
+                state.window_state.next_message_time = state
+                    .window_state.next_message_time
                     .checked_add(1)
                     .context("GetMessageA timestamp overflow")?;
 
@@ -3659,9 +3659,9 @@ pub fn handle_def_mdi_child_proc_w(
 }
 
 fn allocate_menu_handle(state: &mut WinApiState) -> Result<u64> {
-    let handle = state.next_menu_handle;
-    state.next_menu_handle = state
-        .next_menu_handle
+    let handle = state.window_state.next_menu_handle;
+    state.window_state.next_menu_handle = state
+        .window_state.next_menu_handle
         .checked_add(1)
         .context("menu handle allocator overflow")?;
     Ok(handle)
@@ -3688,7 +3688,7 @@ pub fn handle_get_menu(
 ) -> Result<WinApiHandlerResult> {
     let hwnd = engine.read_rcx()?;
     let menu_handle = state
-        .windows
+        .window_state.windows
         .iter()
         .find(|w| w.handle == hwnd)
         .map_or(0, |w| w.menu_handle);
@@ -3974,7 +3974,7 @@ pub fn handle_dispatch_message_a(
         .context("failed to read MSG.lParam for DispatchMessageA")?;
 
     let target_window = state
-        .windows
+        .window_state.windows
         .iter()
         .find(|window| window.handle == window_handle);
 
@@ -4031,26 +4031,26 @@ fn register_window_class(state: &mut WinApiState, mut record: WindowClassRecord)
         return Ok(0);
     }
 
-    if let Some(existing) = state.window_classes.iter().find(|existing| {
+    if let Some(existing) = state.window_state.window_classes.iter().find(|existing| {
         existing.class_name.eq_ignore_ascii_case(&record.class_name)
             && existing.unicode == record.unicode
     }) {
         return Ok(u64::from(existing.atom));
     }
 
-    let atom = state.next_window_class_atom;
+    let atom = state.window_state.next_window_class_atom;
 
     if atom == 0 {
         return Ok(0);
     }
 
-    state.next_window_class_atom = state
-        .next_window_class_atom
+    state.window_state.next_window_class_atom = state
+        .window_state.next_window_class_atom
         .checked_add(1)
         .context("window class atom overflow")?;
 
     record.atom = atom;
-    state.window_classes.push(record);
+    state.window_state.window_classes.push(record);
 
     Ok(u64::from(atom))
 }
@@ -4129,14 +4129,14 @@ fn find_window_class<'a>(
     unicode: bool,
 ) -> Option<&'a WindowClassRecord> {
     state
-        .window_classes
+        .window_state.window_classes
         .iter()
         .find(|record| {
             record.unicode == unicode && window_class_identifier_matches(record, identifier)
         })
         .or_else(|| {
             state
-                .window_classes
+                .window_state.window_classes
                 .iter()
                 .find(|record| window_class_identifier_matches(record, identifier))
         })
@@ -4149,14 +4149,14 @@ fn create_window_record(
 ) -> Result<(u64, u64, bool)> {
     let registered_class = find_window_class(state, &request.class_identifier, unicode).cloned();
 
-    let handle = state.next_window_handle;
+    let handle = state.window_state.next_window_handle;
 
     if handle == 0 {
         return Ok((0, 0, unicode));
     }
 
-    state.next_window_handle = state
-        .next_window_handle
+    state.window_state.next_window_handle = state
+        .window_state.next_window_handle
         .checked_add(1)
         .context("fake window handle overflow")?;
 
@@ -4186,7 +4186,7 @@ fn create_window_record(
             (0, class_name, 0, unicode)
         };
 
-    state.windows.push(WindowRecord {
+    state.window_state.windows.push(WindowRecord {
         handle,
         class_atom,
         class_name,
@@ -4296,7 +4296,7 @@ fn create_mdi_child_from_struct(
 }
 
 fn find_window(state: &WinApiState, handle: u64) -> Option<&WindowRecord> {
-    state.windows.iter().find(|window| window.handle == handle)
+    state.window_state.windows.iter().find(|window| window.handle == handle)
 }
 
 fn is_known_window(state: &WinApiState, handle: u64) -> bool {
@@ -4306,8 +4306,8 @@ fn is_known_window(state: &WinApiState, handle: u64) -> bool {
     handle == FAKE_WINDOW_HANDLE
         || handle == FAKE_DESKTOP_WINDOW_HANDLE
         || find_window(state, handle).is_some()
-        || state.active_window_handle == handle
-        || state.foreground_window_handle == handle
+        || state.window_state.active_window_handle == handle
+        || state.window_state.foreground_window_handle == handle
 }
 
 fn window_client_size(state: &WinApiState, handle: u64) -> (i32, i32) {
@@ -4315,14 +4315,14 @@ fn window_client_size(state: &WinApiState, handle: u64) -> (i32, i32) {
         let width = if window.width > 0 {
             window.width
         } else {
-            state.window_width
+            state.window_state.window_width
         };
         let height = if window.height > 0 {
             window.height
         } else {
-            state.window_height
+            state.window_state.window_height
         };
         return (width.max(1), height.max(1));
     }
-    (state.window_width.max(1), state.window_height.max(1))
+    (state.window_state.window_width.max(1), state.window_state.window_height.max(1))
 }

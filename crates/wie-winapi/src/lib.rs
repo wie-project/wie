@@ -82,15 +82,145 @@ pub struct WinApiEnvironment {
     pub process_heap_handle: u64,
 }
 
-pub struct WinApiState {
+/// Heap and FLS (Fiber-Local Storage) state.
+#[derive(Debug, Clone)]
+pub struct HeapState {
     /// Process heap: segregated freelist + bump (see [`GuestHeap`]).
     pub heap: GuestHeap,
-
     /// Next fake `FLS` index.
     pub next_fls_index: u32,
-
     /// Fake `FLS` slots.
     pub fls_slots: Vec<FlsSlot>,
+    /// Guest VA of the FLS value table (u64 slots), 0 if not installed.
+    pub guest_fls_table_va: u64,
+}
+
+/// File I/O, VFS, and console stdin state.
+#[derive(Debug, Clone)]
+pub struct FileIoState {
+    pub executable_file_size: u64,
+    pub executable_file_bytes: Vec<u8>,
+    pub executable_file_cursor: u64,
+    pub next_find_handle: u64,
+    pub find_handles: Vec<FindHandle>,
+    pub host_file_mounts: Vec<HostFileMount>,
+    pub virtual_files: Vec<VirtualGuestFile>,
+    pub open_files: HashMap<u64, OpenGuestFile>,
+    pub next_file_handle: u64,
+    pub next_resource_handle: u64,
+    pub resources: Vec<ResourceRecord>,
+    pub current_directory_wide: Vec<u16>,
+    pub bottle_root: Option<std::path::PathBuf>,
+    pub volumes: VolumeConfig,
+    pub guest_file_data_next: u64,
+    pub guest_io: Option<GuestIoRuntimeConfig>,
+    pub stdin_bytes: Vec<u8>,
+    pub stdin_cursor: usize,
+    pub stdin_mode: GuestStdinMode,
+    pub ucrt_files: HashMap<u64, u64>,
+    pub ucrt_next_file_va: u64,
+}
+
+/// DLL loading and export resolution cache.
+///
+/// Manual Debug impl because `import_resolver` is a closure.
+/// Manual Clone impl because `Box<dyn FnMut + Send>` does not implement Clone.
+pub struct ModuleState {
+    pub loaded_modules: HashMap<String, dll_loader::LoadedModule>,
+    pub import_resolver: Option<Box<dyn FnMut(&str, &str, u64) -> anyhow::Result<u64> + Send>>,
+    pub get_proc_address_cache: std::collections::HashMap<String, GetProcAddressCacheEntry>,
+    pub next_module_handle: u64,
+}
+
+impl std::fmt::Debug for ModuleState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModuleState")
+            .field("loaded_modules", &self.loaded_modules)
+            .field("import_resolver", &"<closure>")
+            .field("get_proc_address_cache", &self.get_proc_address_cache)
+            .field("next_module_handle", &self.next_module_handle)
+            .finish()
+    }
+}
+
+impl Clone for ModuleState {
+    fn clone(&self) -> Self {
+        Self {
+            loaded_modules: self.loaded_modules.clone(),
+            import_resolver: None,
+            get_proc_address_cache: self.get_proc_address_cache.clone(),
+            next_module_handle: self.next_module_handle,
+        }
+    }
+}
+
+/// Direct3D 9 rendering state.
+#[derive(Debug, Clone)]
+pub struct D3D9State {
+    pub d3d9_current_vertex_shader: u64,
+    pub d3d9_current_fvf: u32,
+    pub d3d9_render_states: Vec<(u32, u32)>,
+    pub d3d9_texture_stage_states: Vec<(u32, u32, u32)>,
+    pub d3d9_sampler_states: Vec<(u32, u32, u32)>,
+    pub d3d9_device_object_address: u64,
+    pub d3d9_device_ref_count: u32,
+    pub d3d9_object_address: u64,
+    pub d3d9_ref_count: u32,
+}
+
+/// Window, UI, and input state.
+#[derive(Debug, Clone)]
+pub struct WindowState {
+    pub window_long_ptr_values: Vec<(u64, i64, u64)>,
+    pub image_list_counts: Vec<(u64, u64)>,
+    pub image_list_background_colors: Vec<(u64, u32)>,
+    pub window_visible: bool,
+    pub window_enabled: bool,
+    pub active_window_handle: u64,
+    pub foreground_window_handle: u64,
+    pub focus_window_handle: u64,
+    pub capture_window_handle: u64,
+    pub cursor_handle: u64,
+    pub window_title: String,
+    pub window_x: i32,
+    pub window_y: i32,
+    pub window_width: i32,
+    pub window_height: i32,
+    pub window_invalidated: bool,
+    pub tick_count: u64,
+    pub keyboard_state: [u8; 256],
+    pub next_timer_id: u64,
+    pub timers: Vec<TimerRecord>,
+    pub next_global_atom: u16,
+    pub global_atoms: Vec<GlobalAtomRecord>,
+    pub next_windows_hook_handle: u64,
+    pub windows_hooks: Vec<WindowsHookRecord>,
+    pub menu_item_states: Vec<(u64, u32, u32)>,
+    pub menu_item_check_states: Vec<(u64, u32, u32)>,
+    pub message_queue: Vec<QueuedWindowMessage>,
+    pub next_message_time: u32,
+    pub message_queue_idle_policy: MessageQueueIdlePolicy,
+    pub next_window_class_atom: u16,
+    pub window_classes: Vec<WindowClassRecord>,
+    pub next_window_handle: u64,
+    pub windows: Vec<WindowRecord>,
+    pub file_dialog_policy: FileDialogPolicy,
+    pub last_file_dialog_path: Option<String>,
+    pub comm_dlg_extended_error: u32,
+    pub next_menu_handle: u64,
+}
+
+pub struct WinApiState {
+    /// Heap + FLS state.
+    pub heap_state: HeapState,
+    /// File I/O, VFS, and console stdin state.
+    pub file_io: FileIoState,
+    /// Window, UI, input, dialog, and atom state.
+    pub window_state: WindowState,
+    /// Direct3D 9 rendering state.
+    pub d3d9: D3D9State,
+    /// DLL loading and export resolution cache.
+    pub module_state: ModuleState,
 
     /// Last WinAPI error value.
     pub last_error: u32,
@@ -101,18 +231,6 @@ pub struct WinApiState {
     /// Fake registry key handles.
     pub registry_keys: Vec<RegistryKey>,
 
-    /// Next fake find-file handle.
-    pub next_find_handle: u64,
-
-    /// Active fake find-file handles.
-    pub find_handles: Vec<FindHandle>,
-
-    /// Size of the executable file visible through fake file handles.
-    pub executable_file_size: u64,
-
-    /// Bytes of the executable file visible through fake file handles.
-    pub executable_file_bytes: Vec<u8>,
-
     /// Basename of the main PE (`heap_alloc.exe`, `Lunar Magic.exe`, …).
     pub main_module_file_name: String,
 
@@ -120,229 +238,13 @@ pub struct WinApiState {
     pub main_module_path: String,
 
     /// Guest thread table + active TLS/TID (MT.0 / MT.1).
-    ///
-    /// TLS **indices** are process-wide; **values** live on
-    /// [`ThreadState::active`]. Prefer helpers on this field over ad-hoc TID
-    /// constants.
     pub threads: ThreadState,
 
     /// Kernel objects, CS wait queues, pending `CreateThread` spawns (MT.2/3).
     pub sync: SyncState,
 
-    /// Optional bottle root: guest `C:\…` maps to `{root}/drive_c/…` on the host.
-    ///
-    /// Set via `WIE_ROOT` / session. When set, CreateFile create/open uses real host files.
-    /// Prefer [`Self::volumes`]; this field is kept in sync for compatibility.
-    pub bottle_root: Option<std::path::PathBuf>,
-
-    /// Volume table: bottle C: + optional host-bridge D:.
-    pub volumes: VolumeConfig,
-
-    /// Current cursor for the fake executable file handle.
-    ///
-    /// Deprecated for multi-file I/O: prefer `open_files`. Kept so the main
-    /// executable still has a stable content source at session start.
-    pub executable_file_cursor: u64,
-
-    /// Host files mounted into the guest path namespace.
-    pub host_file_mounts: Vec<HostFileMount>,
-
-    /// Guest-visible virtual files created at runtime (ini/sidecars/temps).
-    pub virtual_files: Vec<VirtualGuestFile>,
-
-    /// Currently open guest file handles, keyed by handle.
-    pub open_files: HashMap<u64, OpenGuestFile>,
-
-    /// Next handle value for `CreateFile*`.
-    pub next_file_handle: u64,
-
-    /// Next fake resource handle.
-    pub next_resource_handle: u64,
-
-    /// Fake resource records.
-    pub resources: Vec<ResourceRecord>,
-
-    pub current_directory_wide: Vec<u16>,
-
-    pub window_long_ptr_values: Vec<(u64, i64, u64)>,
-
-    pub image_list_counts: Vec<(u64, u64)>,
-
-    /// Background colors associated with fake image lists.
-    pub image_list_background_colors: Vec<(u64, u32)>,
-
-    /// Whether the fake main window is visible.
-    pub window_visible: bool,
-
-    /// Whether the fake main window is enabled.
-    pub window_enabled: bool,
-
-    /// Current fake active window.
-    pub active_window_handle: u64,
-
-    /// Current fake foreground window.
-    pub foreground_window_handle: u64,
-
-    /// Current fake keyboard-focus window.
-    pub focus_window_handle: u64,
-
-    /// Current fake mouse-capture window.
-    pub capture_window_handle: u64,
-
-    /// Current fake cursor handle.
-    pub cursor_handle: u64,
-
-    /// Title of the current fake main window.
-    pub window_title: String,
-
-    /// X coordinate of the current fake main window.
-    pub window_x: i32,
-
-    /// Y coordinate of the current fake main window.
-    pub window_y: i32,
-
-    /// Width of the current fake main window.
-    pub window_width: i32,
-
-    /// Height of the current fake main window.
-    pub window_height: i32,
-
-    /// Whether the current fake main window has a pending repaint.
-    pub window_invalidated: bool,
-
-    /// Monotonic fake millisecond counter.
-    pub tick_count: u64,
-
-    /// State of the 256 virtual keyboard keys.
-    pub keyboard_state: [u8; 256],
-
-    /// Next automatically generated USER32 timer identifier.
-    pub next_timer_id: u64,
-
-    /// Active fake USER32 timers.
-    pub timers: Vec<TimerRecord>,
-
-    /// Next fake global atom identifier.
-    pub next_global_atom: u16,
-
-    /// Fake global atom table.
-    pub global_atoms: Vec<GlobalAtomRecord>,
-
-    /// Next fake USER32 hook handle.
-    pub next_windows_hook_handle: u64,
-
-    /// Registered fake USER32 hooks.
-    pub windows_hooks: Vec<WindowsHookRecord>,
-
-    /// Currently bound fake Direct3D 9 vertex shader.
-    pub d3d9_current_vertex_shader: u64,
-
-    /// Currently selected Direct3D 9 flexible vertex format.
-    pub d3d9_current_fvf: u32,
-
-    /// Direct3D 9 render-state values indexed by `D3DRENDERSTATETYPE`.
-    pub d3d9_render_states: Vec<(u32, u32)>,
-
-    /// Direct3D 9 texture-stage states stored as `(stage, state_type, value)`.
-    pub d3d9_texture_stage_states: Vec<(u32, u32, u32)>,
-
-    /// Direct3D 9 sampler states stored as `(sampler, state_type, value)`.
-    pub d3d9_sampler_states: Vec<(u32, u32, u32)>,
-
-    /// USER32 menu item enable-state records stored as
-    /// `(menu_handle, item, flags)`.
-    pub menu_item_states: Vec<(u64, u32, u32)>,
-
-    /// USER32 menu item check-state records stored as
-    /// `(menu_handle, item, flags)`.
-    pub menu_item_check_states: Vec<(u64, u32, u32)>,
-
-    /// Pending USER32 messages in FIFO order.
-    pub message_queue: Vec<QueuedWindowMessage>,
-
-    /// Monotonic fake USER32 message timestamp.
-    pub next_message_time: u32,
-
-    /// Guest address of the current fake `IDirect3DDevice9` object.
-    pub d3d9_device_object_address: u64,
-
-    /// COM reference count of the current fake `IDirect3DDevice9` object.
-    pub d3d9_device_ref_count: u32,
-
-    /// Guest address of the current fake `IDirect3D9` object.
-    pub d3d9_object_address: u64,
-
-    /// COM reference count of the current fake `IDirect3D9` object.
-    pub d3d9_ref_count: u32,
-
-    /// Policy used when `GetMessageA` finds no matching queued message.
-    pub message_queue_idle_policy: MessageQueueIdlePolicy,
-
-    /// Next atom returned for a registered window class.
-    pub next_window_class_atom: u16,
-
-    /// Registered USER32 window classes.
-    pub window_classes: Vec<WindowClassRecord>,
-
-    /// Next runtime-owned fake HWND.
-    pub next_window_handle: u64,
-
-    /// Windows created through `CreateWindowExA/W`.
-    pub windows: Vec<WindowRecord>,
-
-    /// Cached `GetProcAddress` resolutions keyed by export name (ASCII lower).
-    pub get_proc_address_cache: std::collections::HashMap<String, GetProcAddressCacheEntry>,
-
-    /// Policy applied when the guest opens a common file dialog.
-    pub file_dialog_policy: FileDialogPolicy,
-
-    /// Last path accepted by a simulated file dialog (if any).
-    pub last_file_dialog_path: Option<String>,
-
-    /// Value returned by `CommDlgExtendedError`.
-    pub comm_dlg_extended_error: u32,
-
-    /// Next fake HMENU value for `CreateMenu` / `CreatePopupMenu`.
-    pub next_menu_handle: u64,
-
-    /// Guest I/O acceleration config (None until runtime installs helpers).
-    pub guest_io: Option<GuestIoRuntimeConfig>,
-
-    /// Next free VA in the guest file-data mirror arena.
-    pub guest_file_data_next: u64,
-
-    /// Guest VA of the FLS value table (u64 slots), 0 if not installed.
-    pub guest_fls_table_va: u64,
-
-    /// Buffered guest stdin bytes for console `ReadFile(STD_INPUT_HANDLE)`.
-    ///
-    /// Filled either by host injection (`--stdin` / tests) or by a live host
-    /// line-fill when [`Self::stdin_mode`] is [`GuestStdinMode::LiveHost`].
-    pub stdin_bytes: Vec<u8>,
-
-    /// Read cursor into [`Self::stdin_bytes`].
-    pub stdin_cursor: usize,
-
-    /// How console stdin is sourced when the buffer is empty.
-    pub stdin_mode: GuestStdinMode,
-
     /// In-progress SEH / C++ EH continuation (UnwindMap + catch funclets).
     pub seh_pending: Option<seh::SehPending>,
-
-    /// Import resolver for dynamic DLL loading.
-    ///
-    /// Set once at session init by the runtime (`wie-runtime::session`).
-    /// Resolves `(library, name, iat_slot_va)` → fake API VA for import patching.
-    /// `None` means dynamic loading is unavailable (falls back to fake handles).
-    #[allow(clippy::type_complexity)]
-    pub import_resolver: Option<Box<dyn FnMut(&str, &str, u64) -> anyhow::Result<u64> + Send>>,
-
-    /// Dynamically loaded DLL modules (real, not fake stubs).
-    /// Keyed by normalized (lowercase) module name without extension.
-    pub loaded_modules: HashMap<String, dll_loader::LoadedModule>,
-
-    /// Next real loaded module handle (monotonically increasing, each step by 0x1000).
-    pub next_module_handle: u64,
 
     /// Host filesystem directory of the main executable.
     /// Used as a fallback search directory for DLL loading when VFS/bottle
@@ -354,108 +256,25 @@ pub struct WinApiState {
 
     /// Threads that have been suspended, keyed by TID → suspend count.
     pub suspended_threads: HashMap<u32, u32>,
-
-    /// CRT `fopen` → file handle map: fake FILE* VA → kernel file handle.
-    pub ucrt_files: HashMap<u64, u64>,
-
-    /// Next fake FILE* VA for CRT `fopen`.
-    pub ucrt_next_file_va: u64,
 }
 
 // Manual Debug impl: Box<dyn FnMut + Send> does not implement Debug.
 impl std::fmt::Debug for WinApiState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WinApiState")
-            .field("heap", &self.heap)
-            .field("next_fls_index", &self.next_fls_index)
-            .field("fls_slots", &self.fls_slots)
+            .field("heap_state", &self.heap_state)
+            .field("file_io", &self.file_io)
+            .field("window_state", &self.window_state)
             .field("last_error", &self.last_error)
             .field("next_registry_key_handle", &self.next_registry_key_handle)
             .field("registry_keys", &self.registry_keys)
-            .field("next_find_handle", &self.next_find_handle)
-            .field("find_handles", &self.find_handles)
-            .field("executable_file_size", &self.executable_file_size)
-            .field("executable_file_bytes", &self.executable_file_bytes)
             .field("main_module_file_name", &self.main_module_file_name)
             .field("main_module_path", &self.main_module_path)
             .field("threads", &self.threads)
             .field("sync", &self.sync)
-            .field("bottle_root", &self.bottle_root)
-            .field("volumes", &self.volumes)
-            .field("executable_file_cursor", &self.executable_file_cursor)
-            .field("host_file_mounts", &self.host_file_mounts)
-            .field("virtual_files", &self.virtual_files)
-            .field("open_files", &self.open_files)
-            .field("next_file_handle", &self.next_file_handle)
-            .field("next_resource_handle", &self.next_resource_handle)
-            .field("resources", &self.resources)
-            .field("current_directory_wide", &self.current_directory_wide)
-            .field("window_long_ptr_values", &self.window_long_ptr_values)
-            .field("image_list_counts", &self.image_list_counts)
-            .field(
-                "image_list_background_colors",
-                &self.image_list_background_colors,
-            )
-            .field("window_visible", &self.window_visible)
-            .field("window_enabled", &self.window_enabled)
-            .field("active_window_handle", &self.active_window_handle)
-            .field("foreground_window_handle", &self.foreground_window_handle)
-            .field("focus_window_handle", &self.focus_window_handle)
-            .field("capture_window_handle", &self.capture_window_handle)
-            .field("cursor_handle", &self.cursor_handle)
-            .field("window_title", &self.window_title)
-            .field("window_x", &self.window_x)
-            .field("window_y", &self.window_y)
-            .field("window_width", &self.window_width)
-            .field("window_height", &self.window_height)
-            .field("window_invalidated", &self.window_invalidated)
-            .field("tick_count", &self.tick_count)
-            .field("keyboard_state", &self.keyboard_state)
-            .field("next_timer_id", &self.next_timer_id)
-            .field("timers", &self.timers)
-            .field("next_global_atom", &self.next_global_atom)
-            .field("global_atoms", &self.global_atoms)
-            .field("next_windows_hook_handle", &self.next_windows_hook_handle)
-            .field("windows_hooks", &self.windows_hooks)
-            .field(
-                "d3d9_current_vertex_shader",
-                &self.d3d9_current_vertex_shader,
-            )
-            .field("d3d9_current_fvf", &self.d3d9_current_fvf)
-            .field("d3d9_render_states", &self.d3d9_render_states)
-            .field("d3d9_texture_stage_states", &self.d3d9_texture_stage_states)
-            .field("d3d9_sampler_states", &self.d3d9_sampler_states)
-            .field("menu_item_states", &self.menu_item_states)
-            .field("menu_item_check_states", &self.menu_item_check_states)
-            .field("message_queue", &self.message_queue)
-            .field("next_message_time", &self.next_message_time)
-            .field(
-                "d3d9_device_object_address",
-                &self.d3d9_device_object_address,
-            )
-            .field("d3d9_device_ref_count", &self.d3d9_device_ref_count)
-            .field("d3d9_object_address", &self.d3d9_object_address)
-            .field("d3d9_ref_count", &self.d3d9_ref_count)
-            .field("message_queue_idle_policy", &self.message_queue_idle_policy)
-            .field("next_window_class_atom", &self.next_window_class_atom)
-            .field("window_classes", &self.window_classes)
-            .field("next_window_handle", &self.next_window_handle)
-            .field("windows", &self.windows)
-            .field("get_proc_address_cache", &self.get_proc_address_cache)
-            .field("file_dialog_policy", &self.file_dialog_policy)
-            .field("last_file_dialog_path", &self.last_file_dialog_path)
-            .field("comm_dlg_extended_error", &self.comm_dlg_extended_error)
-            .field("next_menu_handle", &self.next_menu_handle)
-            .field("guest_io", &self.guest_io)
-            .field("guest_file_data_next", &self.guest_file_data_next)
-            .field("guest_fls_table_va", &self.guest_fls_table_va)
-            .field("stdin_bytes", &self.stdin_bytes)
-            .field("stdin_cursor", &self.stdin_cursor)
-            .field("stdin_mode", &self.stdin_mode)
+            .field("d3d9", &self.d3d9)
+            .field("module_state", &self.module_state)
             .field("seh_pending", &self.seh_pending)
-            .field("import_resolver", &"<closure>")
-            .field("loaded_modules", &self.loaded_modules)
-            .field("next_module_handle", &self.next_module_handle)
             .field("main_module_host_dir", &self.main_module_host_dir)
             .field("error_mode", &self.error_mode)
             .field("suspended_threads", &self.suspended_threads)
@@ -467,92 +286,22 @@ impl std::fmt::Debug for WinApiState {
 impl Clone for WinApiState {
     fn clone(&self) -> Self {
         Self {
-            heap: self.heap.clone(),
-            next_fls_index: self.next_fls_index,
-            fls_slots: self.fls_slots.clone(),
+            heap_state: self.heap_state.clone(),
+            file_io: self.file_io.clone(),
+            window_state: self.window_state.clone(),
             last_error: self.last_error,
             next_registry_key_handle: self.next_registry_key_handle,
             registry_keys: self.registry_keys.clone(),
-            next_find_handle: self.next_find_handle,
-            find_handles: self.find_handles.clone(),
-            executable_file_size: self.executable_file_size,
-            executable_file_bytes: self.executable_file_bytes.clone(),
             main_module_file_name: self.main_module_file_name.clone(),
             main_module_path: self.main_module_path.clone(),
             threads: self.threads.clone(),
             sync: self.sync.clone(),
-            bottle_root: self.bottle_root.clone(),
-            volumes: self.volumes.clone(),
-            executable_file_cursor: self.executable_file_cursor,
-            host_file_mounts: self.host_file_mounts.clone(),
-            virtual_files: self.virtual_files.clone(),
-            open_files: self.open_files.clone(),
-            next_file_handle: self.next_file_handle,
-            next_resource_handle: self.next_resource_handle,
-            resources: self.resources.clone(),
-            current_directory_wide: self.current_directory_wide.clone(),
-            window_long_ptr_values: self.window_long_ptr_values.clone(),
-            image_list_counts: self.image_list_counts.clone(),
-            image_list_background_colors: self.image_list_background_colors.clone(),
-            window_visible: self.window_visible,
-            window_enabled: self.window_enabled,
-            active_window_handle: self.active_window_handle,
-            foreground_window_handle: self.foreground_window_handle,
-            focus_window_handle: self.focus_window_handle,
-            capture_window_handle: self.capture_window_handle,
-            cursor_handle: self.cursor_handle,
-            window_title: self.window_title.clone(),
-            window_x: self.window_x,
-            window_y: self.window_y,
-            window_width: self.window_width,
-            window_height: self.window_height,
-            window_invalidated: self.window_invalidated,
-            tick_count: self.tick_count,
-            keyboard_state: self.keyboard_state,
-            next_timer_id: self.next_timer_id,
-            timers: self.timers.clone(),
-            next_global_atom: self.next_global_atom,
-            global_atoms: self.global_atoms.clone(),
-            next_windows_hook_handle: self.next_windows_hook_handle,
-            windows_hooks: self.windows_hooks.clone(),
-            d3d9_current_vertex_shader: self.d3d9_current_vertex_shader,
-            d3d9_current_fvf: self.d3d9_current_fvf,
-            d3d9_render_states: self.d3d9_render_states.clone(),
-            d3d9_texture_stage_states: self.d3d9_texture_stage_states.clone(),
-            d3d9_sampler_states: self.d3d9_sampler_states.clone(),
-            menu_item_states: self.menu_item_states.clone(),
-            menu_item_check_states: self.menu_item_check_states.clone(),
-            message_queue: self.message_queue.clone(),
-            next_message_time: self.next_message_time,
-            d3d9_device_object_address: self.d3d9_device_object_address,
-            d3d9_device_ref_count: self.d3d9_device_ref_count,
-            d3d9_object_address: self.d3d9_object_address,
-            d3d9_ref_count: self.d3d9_ref_count,
-            message_queue_idle_policy: self.message_queue_idle_policy,
-            next_window_class_atom: self.next_window_class_atom,
-            window_classes: self.window_classes.clone(),
-            next_window_handle: self.next_window_handle,
-            windows: self.windows.clone(),
-            get_proc_address_cache: self.get_proc_address_cache.clone(),
-            file_dialog_policy: self.file_dialog_policy.clone(),
-            last_file_dialog_path: self.last_file_dialog_path.clone(),
-            comm_dlg_extended_error: self.comm_dlg_extended_error,
-            next_menu_handle: self.next_menu_handle,
-            guest_io: self.guest_io.clone(),
-            guest_file_data_next: self.guest_file_data_next,
-            guest_fls_table_va: self.guest_fls_table_va,
-            stdin_bytes: self.stdin_bytes.clone(),
-            stdin_cursor: self.stdin_cursor,
-            stdin_mode: self.stdin_mode,
+            d3d9: self.d3d9.clone(),
+            module_state: self.module_state.clone(),
             seh_pending: self.seh_pending.clone(),
-            import_resolver: None, // Box<dyn FnMut + Send> is not Clone
-            loaded_modules: self.loaded_modules.clone(),
-            next_module_handle: self.next_module_handle,
             main_module_host_dir: self.main_module_host_dir.clone(),
             error_mode: self.error_mode,
             suspended_threads: self.suspended_threads.clone(),
-            ucrt_files: self.ucrt_files.clone(),
-            ucrt_next_file_va: self.ucrt_next_file_va,
         }
     }
 }
@@ -1041,7 +790,10 @@ mod tests {
         let mut heap = GuestHeap::new(0x2000, 0x10000);
         heap.attach_guest_control(0x2000);
         WinApiState {
-            heap,
+            heap_state: HeapState {
+                heap,
+                ..winapi_state_default().heap_state
+            },
             ..winapi_state_default()
         }
     }
@@ -1050,93 +802,102 @@ mod tests {
         // This must stay in sync with the fields of WinApiState.
         // Only the heap is customised; everything else is default.
         WinApiState {
-            heap: GuestHeap::new(0x2000, 0x10000),
-            next_fls_index: 0,
-            fls_slots: Vec::new(),
+            heap_state: HeapState {
+                heap: GuestHeap::new(0x2000, 0x10000),
+                next_fls_index: 0,
+                fls_slots: Vec::new(),
+                guest_fls_table_va: 0,
+            },
+            file_io: FileIoState {
+                executable_file_size: 0,
+                executable_file_bytes: Vec::new(),
+                executable_file_cursor: 0,
+                next_find_handle: 0,
+                find_handles: Vec::new(),
+                host_file_mounts: Vec::new(),
+                virtual_files: Vec::new(),
+                open_files: HashMap::new(),
+                next_file_handle: 0,
+                next_resource_handle: 0,
+                resources: Vec::new(),
+                current_directory_wide: Vec::new(),
+                bottle_root: None,
+                volumes: VolumeConfig::default(),
+                guest_file_data_next: 0,
+                guest_io: None,
+                stdin_bytes: Vec::new(),
+                stdin_cursor: 0,
+                stdin_mode: GuestStdinMode::InjectOnly,
+                ucrt_files: HashMap::new(),
+                ucrt_next_file_va: 0x0000_0000_6900_0000,
+            },
             last_error: 0,
             next_registry_key_handle: 0,
             registry_keys: Vec::new(),
-            next_find_handle: 0,
-            find_handles: Vec::new(),
-            executable_file_size: 0,
-            executable_file_bytes: Vec::new(),
             main_module_file_name: String::new(),
             main_module_path: String::new(),
             threads: ThreadState::primary(),
             sync: SyncState::new(),
-            bottle_root: None,
-            volumes: VolumeConfig::default(),
-            // volumes.bottle_root kept in sync via set helpers / session
-            executable_file_cursor: 0,
-            host_file_mounts: Vec::new(),
-            virtual_files: Vec::new(),
-            open_files: HashMap::new(),
-            next_file_handle: 0,
-            next_resource_handle: 0,
-            resources: Vec::new(),
-            current_directory_wide: Vec::new(),
-            window_long_ptr_values: Vec::new(),
-            image_list_counts: Vec::new(),
-            image_list_background_colors: Vec::new(),
-            window_visible: false,
-            window_enabled: false,
-            active_window_handle: 0,
-            foreground_window_handle: 0,
-            focus_window_handle: 0,
-            capture_window_handle: 0,
-            cursor_handle: 0,
-            window_title: String::new(),
-            window_x: 0,
-            window_y: 0,
-            window_width: 0,
-            window_height: 0,
-            window_invalidated: false,
-            tick_count: 0,
-            keyboard_state: [0; 256],
-            next_timer_id: 0,
-            timers: Vec::new(),
-            next_global_atom: 0,
-            global_atoms: Vec::new(),
-            next_windows_hook_handle: 0,
-            windows_hooks: Vec::new(),
-            d3d9_current_vertex_shader: 0,
-            d3d9_current_fvf: 0,
-            d3d9_render_states: Vec::new(),
-            d3d9_texture_stage_states: Vec::new(),
-            d3d9_sampler_states: Vec::new(),
-            menu_item_states: Vec::new(),
-            menu_item_check_states: Vec::new(),
-            message_queue: Vec::new(),
-            next_message_time: 0,
-            d3d9_device_object_address: 0,
-            d3d9_device_ref_count: 0,
-            d3d9_object_address: 0,
-            d3d9_ref_count: 0,
-            message_queue_idle_policy: MessageQueueIdlePolicy::ExitOnIdle,
-            next_window_class_atom: 0,
-            window_classes: Vec::new(),
-            next_window_handle: 0,
-            windows: Vec::new(),
-            get_proc_address_cache: HashMap::new(),
-            file_dialog_policy: FileDialogPolicy::Cancel,
-            last_file_dialog_path: None,
-            comm_dlg_extended_error: 0,
-            next_menu_handle: 0,
-            guest_io: None,
-            guest_file_data_next: 0,
-            guest_fls_table_va: 0,
-            stdin_bytes: Vec::new(),
-            stdin_cursor: 0,
-            stdin_mode: GuestStdinMode::InjectOnly,
+            window_state: WindowState {
+                window_long_ptr_values: Vec::new(),
+                image_list_counts: Vec::new(),
+                image_list_background_colors: Vec::new(),
+                window_visible: false,
+                window_enabled: false,
+                active_window_handle: 0,
+                foreground_window_handle: 0,
+                focus_window_handle: 0,
+                capture_window_handle: 0,
+                cursor_handle: 0,
+                window_title: String::new(),
+                window_x: 0,
+                window_y: 0,
+                window_width: 0,
+                window_height: 0,
+                window_invalidated: false,
+                tick_count: 0,
+                keyboard_state: [0; 256],
+                next_timer_id: 0,
+                timers: Vec::new(),
+                next_global_atom: 0,
+                global_atoms: Vec::new(),
+                next_windows_hook_handle: 0,
+                windows_hooks: Vec::new(),
+                menu_item_states: Vec::new(),
+                menu_item_check_states: Vec::new(),
+                message_queue: Vec::new(),
+                next_message_time: 0,
+                message_queue_idle_policy: MessageQueueIdlePolicy::ExitOnIdle,
+                next_window_class_atom: 0,
+                window_classes: Vec::new(),
+                next_window_handle: 0,
+                windows: Vec::new(),
+                file_dialog_policy: FileDialogPolicy::Cancel,
+                last_file_dialog_path: None,
+                comm_dlg_extended_error: 0,
+                next_menu_handle: 0,
+            },
+            d3d9: D3D9State {
+                d3d9_current_vertex_shader: 0,
+                d3d9_current_fvf: 0,
+                d3d9_render_states: Vec::new(),
+                d3d9_texture_stage_states: Vec::new(),
+                d3d9_sampler_states: Vec::new(),
+                d3d9_device_object_address: 0,
+                d3d9_device_ref_count: 0,
+                d3d9_object_address: 0,
+                d3d9_ref_count: 0,
+            },
+            module_state: ModuleState {
+                loaded_modules: HashMap::new(),
+                import_resolver: None,
+                get_proc_address_cache: HashMap::new(),
+                next_module_handle: dll_loader::REAL_MODULE_HANDLE_BASE,
+            },
             seh_pending: None,
-            import_resolver: None,
-            loaded_modules: HashMap::new(),
-            next_module_handle: dll_loader::REAL_MODULE_HANDLE_BASE,
             main_module_host_dir: None,
             error_mode: 0,
             suspended_threads: HashMap::new(),
-            ucrt_files: HashMap::new(),
-            ucrt_next_file_va: 0x0000_0000_6900_0000,
         }
     }
 
@@ -1296,7 +1057,7 @@ mod tests {
     fn test_heap_free_double_free_returns_false() {
         let mut engine = test_engine();
         let mut state = winapi_state_default();
-        let p = state.heap.alloc(64);
+        let p = state.heap_state.heap.alloc(64);
         assert_ne!(p, 0);
 
         write_regs(&mut engine, 0x1, 0, p, 0, 0);
@@ -1328,7 +1089,7 @@ mod tests {
     fn test_get_async_key_state_down() {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
-        state.keyboard_state[0x0D] = 0x80; // VK_RETURN high bit set
+        state.window_state.keyboard_state[0x0D] = 0x80; // VK_RETURN high bit set
         write_regs(&mut engine, 0x0D, 0, 0, 0, 0);
         assert_return_value!(
             user32::handle_get_async_key_state(&mut engine, &mut state),
@@ -1354,7 +1115,7 @@ mod tests {
         // Map memory for the MSG struct.
         engine.mem_map(msg_va, 0x1000, 7).expect("map msg struct");
         // Push a WM_PAINT message for any window.
-        state.message_queue.push(QueuedWindowMessage {
+        state.window_state.message_queue.push(QueuedWindowMessage {
             window_handle: 0x100,
             message: 15, // WM_PAINT
             word_parameter: 0,
@@ -1370,7 +1131,7 @@ mod tests {
         engine.mem_write(0x3028, &1_u32.to_le_bytes()).ok();
         assert_return_value!(user32::handle_peek_message_a(&mut engine, &mut state), 1);
         // WM_PAINT should have been removed from the queue.
-        assert_eq!(state.message_queue.len(), 0);
+        assert_eq!(state.window_state.message_queue.len(), 0);
     }
 
     #[test]
@@ -1380,7 +1141,7 @@ mod tests {
         let mut state = default_winapi_state();
         let msg_va = 0x4000;
         engine.mem_map(msg_va, 0x1000, 7).expect("map msg struct");
-        state.message_queue.push(QueuedWindowMessage {
+        state.window_state.message_queue.push(QueuedWindowMessage {
             window_handle: 0x100,
             message: 15,
             word_parameter: 0,
@@ -1394,7 +1155,7 @@ mod tests {
         engine.mem_write(0x3028, &0_u32.to_le_bytes()).ok();
         assert_return_value!(user32::handle_peek_message_a(&mut engine, &mut state), 1);
         // Message should still be in the queue.
-        assert_eq!(state.message_queue.len(), 1);
+        assert_eq!(state.window_state.message_queue.len(), 1);
     }
 
     // --- Comctl32 ---
@@ -1790,7 +1551,7 @@ mod tests {
         let mut state = default_winapi_state();
         let hwnd = 0x100;
         let hmenu = 0x200;
-        state.windows.push(crate::WindowRecord {
+        state.window_state.windows.push(crate::WindowRecord {
             handle: hwnd,
             menu_handle: hmenu,
             ..Default::default()

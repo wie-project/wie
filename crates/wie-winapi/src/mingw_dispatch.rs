@@ -33,7 +33,7 @@ pub fn dispatch_stdcpp(
         // __cxa_allocate_exception(size) → guest heap alloc
         "__cxa_allocate_exception" => {
             let size = engine.read_rcx()?;
-            let addr = state.heap.alloc_coherent(engine, size.max(1));
+            let addr = state.heap_state.heap.alloc_coherent(engine, size.max(1));
             let return_address = engine
                 .return_from_win64_api(addr)
                 .context("failed to return from __cxa_allocate_exception")?;
@@ -46,7 +46,7 @@ pub fn dispatch_stdcpp(
         "__cxa_free_exception" => {
             let ptr = engine.read_rcx()?;
             if ptr != 0 {
-                state.heap.free_coherent(engine, ptr);
+                state.heap_state.heap.free_coherent(engine, ptr);
             }
             let return_address = engine
                 .return_from_win64_api(0)

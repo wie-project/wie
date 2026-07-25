@@ -7,10 +7,10 @@ pub fn handle_time_get_time(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    let return_value = state.tick_count;
+    let return_value = state.window_state.tick_count;
 
-    state.tick_count = state
-        .tick_count
+    state.window_state.tick_count = state
+        .window_state.tick_count
         .checked_add(16)
         .context("timeGetTime tick count overflow")?;
 

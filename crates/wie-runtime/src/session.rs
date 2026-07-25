@@ -1078,31 +1078,32 @@ impl RuntimeSession {
             }
         }
 
-        winapi_state.message_queue_idle_policy = idle_policy;
-        winapi_state.guest_io = Some(wie_winapi::GuestIoRuntimeConfig {
+        winapi_state.window_state.message_queue_idle_policy = idle_policy;
+        winapi_state.file_io.guest_io = Some(wie_winapi::GuestIoRuntimeConfig {
             table_va: guest_io_config.table_va,
             file_data_base: guest_io_config.file_data_base,
             file_data_size: guest_io_config.file_data_size,
         });
-        winapi_state.guest_file_data_next = layout.guest_file_data_base;
-        winapi_state.guest_fls_table_va = layout.guest_fls_table_base;
+        winapi_state.file_io.guest_file_data_next = layout.guest_file_data_base;
+        winapi_state.heap_state.guest_fls_table_va = layout.guest_fls_table_base;
         // Empty inject ⇒ live host stdin on ReadFile(STD_INPUT); non-empty
         // inject is deterministic and never blocks on the TTY.
-        winapi_state.stdin_mode = if options.stdin_bytes.is_empty() {
+        winapi_state.file_io.stdin_mode = if options.stdin_bytes.is_empty() {
             wie_winapi::GuestStdinMode::LiveHost
         } else {
             wie_winapi::GuestStdinMode::InjectOnly
         };
-        winapi_state.stdin_bytes = options.stdin_bytes;
-        winapi_state.stdin_cursor = 0;
+        winapi_state.file_io.stdin_bytes = options.stdin_bytes;
+        winapi_state.file_io.stdin_cursor = 0;
         winapi_state
+            .heap_state
             .heap
             .attach_guest_control(guest_heap_cfg.ctrl_va);
 
         // Set the import resolver for dynamic DLL loading.
         {
             let mut soft = soft_apis.clone();
-            winapi_state.import_resolver = Some(Box::new(move |lib, name, slot| {
+            winapi_state.module_state.import_resolver = Some(Box::new(move |lib, name, slot| {
                 let (va, _entry) = crate::hooks::resolve_import_fake_va(lib, name, slot, &mut soft)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                 Ok(va)
@@ -1178,14 +1179,14 @@ impl RuntimeSession {
             if let Some(ref r) = root {
                 let _ = wie_winapi::ensure_bottle_skeleton(r);
             }
-            s.bottle_root = root.clone();
-            s.volumes.bottle_root = root;
+            s.file_io.bottle_root = root.clone();
+            s.file_io.volumes.bottle_root = root;
         });
     }
 
     /// Sets optional host-bridge root for guest `D:\…` (`None` unmounts D:).
     pub fn set_drive_d(&mut self, root: Option<std::path::PathBuf>) {
-        self.process.with_mut(|_, s| s.volumes.drive_d_root = root);
+        self.process.with_mut(|_, s| s.file_io.volumes.drive_d_root = root);
     }
 
     /// Replaces guest stdin buffer for console `ReadFile` on STD_INPUT_HANDLE.
@@ -1194,13 +1195,13 @@ impl RuntimeSession {
     /// next guest read.
     pub fn set_stdin_bytes(&mut self, bytes: Vec<u8>) {
         self.process.with_mut(|_, s| {
-            s.stdin_mode = if bytes.is_empty() {
+            s.file_io.stdin_mode = if bytes.is_empty() {
                 wie_winapi::GuestStdinMode::LiveHost
             } else {
                 wie_winapi::GuestStdinMode::InjectOnly
             };
-            s.stdin_bytes = bytes;
-            s.stdin_cursor = 0;
+            s.file_io.stdin_bytes = bytes;
+            s.file_io.stdin_cursor = 0;
         });
     }
 
@@ -1219,12 +1220,12 @@ impl RuntimeSession {
     /// Changes the behavior of `GetMessageA` when the queue is empty.
     pub fn set_message_queue_idle_policy(&mut self, policy: wie_winapi::MessageQueueIdlePolicy) {
         self.process
-            .with_mut(|_, s| s.message_queue_idle_policy = policy);
+            .with_mut(|_, s| s.window_state.message_queue_idle_policy = policy);
     }
 
     /// Adds one message to the persistent guest message queue.
     pub fn post_message(&mut self, message: wie_winapi::QueuedWindowMessage) {
-        self.process.with_mut(|_, s| s.message_queue.push(message));
+        self.process.with_mut(|_, s| s.window_state.message_queue.push(message));
     }
 
     /// Runs the guest until it yields, terminates, reaches an unsupported API,
@@ -2005,12 +2006,12 @@ impl RuntimeSession {
         long_parameter: u64,
     ) -> Result<()> {
         self.process.with_mut(|_, st| {
-            let time = st.next_message_time;
-            st.next_message_time = st
-                .next_message_time
+            let time = st.window_state.next_message_time;
+            st.window_state.next_message_time = st
+                .window_state.next_message_time
                 .checked_add(1)
                 .context("runtime message timestamp overflow")?;
-            st.message_queue.push(wie_winapi::QueuedWindowMessage {
+            st.window_state.message_queue.push(wie_winapi::QueuedWindowMessage {
                 window_handle,
                 message,
                 word_parameter,
@@ -2027,7 +2028,7 @@ impl RuntimeSession {
     #[must_use]
     pub fn first_guest_window_handle(&self) -> Option<u64> {
         self.process.with_winapi_ref(|st| {
-            st.windows
+            st.window_state.windows
                 .iter()
                 .find(|window| window.window_proc != 0)
                 .map(|window| window.handle)
@@ -2038,7 +2039,7 @@ impl RuntimeSession {
     #[must_use]
     pub fn guest_windows_snapshot(&self) -> Vec<(u64, String, String, bool)> {
         self.process.with_winapi_ref(|st| {
-            st.windows
+            st.window_state.windows
                 .iter()
                 .map(|window| {
                     (
@@ -2060,14 +2061,14 @@ impl RuntimeSession {
 
     /// Configures the next common file dialog outcome (`GetOpenFileName` / `GetSaveFileName`).
     pub fn set_file_dialog_policy(&mut self, policy: wie_winapi::FileDialogPolicy) {
-        self.process.with_mut(|_, s| s.file_dialog_policy = policy);
+        self.process.with_mut(|_, s| s.window_state.file_dialog_policy = policy);
     }
 
     /// Returns the last path accepted by a simulated file dialog.
     #[must_use]
     pub fn last_file_dialog_path(&self) -> Option<String> {
         self.process
-            .with_winapi_ref(|st| st.last_file_dialog_path.clone())
+            .with_winapi_ref(|st| st.window_state.last_file_dialog_path.clone())
     }
 
     /// Mounts a host file so the guest can open it via `CreateFile*` under `guest_path`.
@@ -2090,7 +2091,7 @@ impl RuntimeSession {
     pub fn guest_file_size(&self, handle: u64) -> Result<u64> {
         self.process.with_winapi_ref(|st| {
             let file = st
-                .open_files
+                .file_io.open_files
                 .get(&handle)
                 .with_context(|| format!("unknown guest file handle {handle:#018x}"))?;
             u64::try_from(file.bytes.len()).context("guest file size does not fit u64")
@@ -2101,7 +2102,7 @@ impl RuntimeSession {
     pub fn peek_guest_file(&self, handle: u64, offset: usize, len: usize) -> Result<Vec<u8>> {
         self.process.with_winapi_ref(|st| {
             let file = st
-                .open_files
+                .file_io.open_files
                 .get(&handle)
                 .with_context(|| format!("unknown guest file handle {handle:#018x}"))?;
             let end = offset
@@ -2122,7 +2123,7 @@ impl RuntimeSession {
     #[must_use]
     pub fn open_guest_files_snapshot(&self) -> Vec<(u64, String, u64)> {
         self.process.with_winapi_ref(|st| {
-            st.open_files
+            st.file_io.open_files
                 .iter()
                 .filter_map(|(&handle, file)| {
                     let size = u64::try_from(file.bytes.len()).ok()?;

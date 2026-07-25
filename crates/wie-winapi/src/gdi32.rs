@@ -514,8 +514,8 @@ pub fn handle_create_compatible_bitmap(
 
 fn next_gdi_bitmap_handle(state: &mut WinApiState) -> Result<u64> {
     // Use bump-heap high bits as a cheap monotonic discriminator.
-    let live = u64::try_from(state.heap.live_count()).unwrap_or(0);
-    let index = (state.heap.bump_cursor() >> 4).wrapping_add(live);
+    let live = u64::try_from(state.heap_state.heap.live_count()).unwrap_or(0);
+    let index = (state.heap_state.heap.bump_cursor() >> 4).wrapping_add(live);
     let handle = FAKE_GDI_BITMAP_HANDLE_BASE
         .checked_add(index)
         .context("GDI bitmap handle overflow")?;
@@ -597,10 +597,10 @@ pub fn handle_create_font_indirect_a(
 }
 
 fn next_gdi_font_handle(state: &mut WinApiState) -> Result<u64> {
-    let live = u64::try_from(state.heap.live_count()).unwrap_or(0);
-    let index = (state.heap.bump_cursor() >> 4)
+    let live = u64::try_from(state.heap_state.heap.live_count()).unwrap_or(0);
+    let index = (state.heap_state.heap.bump_cursor() >> 4)
         .wrapping_add(live)
-        .wrapping_add(state.next_file_handle & 0xffff)
+        .wrapping_add(state.file_io.next_file_handle & 0xffff)
         .wrapping_add(1);
     FAKE_GDI_FONT_HANDLE_BASE
         .checked_add(index)
@@ -876,5 +876,5 @@ fn allocate_gdi_heap_block(
     state: &mut WinApiState,
     size: u64,
 ) -> u64 {
-    state.heap.alloc_coherent(engine, size)
+    state.heap_state.heap.alloc_coherent(engine, size)
 }

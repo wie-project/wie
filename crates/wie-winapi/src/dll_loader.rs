@@ -652,9 +652,9 @@ pub fn load_dll(
     let entry_rva = identity.entry_rva;
 
     // Step 2: Allocate a module handle.
-    let handle = state.next_module_handle;
-    state.next_module_handle = state
-        .next_module_handle
+    let handle = state.module_state.next_module_handle;
+    state.module_state.next_module_handle = state
+        .module_state.next_module_handle
         .checked_add(0x1000)
         .context("module handle overflow")?;
 
@@ -799,7 +799,7 @@ pub fn load_dll(
         export_count: exports.export_count,
     };
 
-    state.loaded_modules.insert(module_name, module.clone());
+    state.module_state.loaded_modules.insert(module_name, module.clone());
 
     // Step 8: Apply section protections.
     apply_pe_section_protects(engine, &map_plan, image_base)

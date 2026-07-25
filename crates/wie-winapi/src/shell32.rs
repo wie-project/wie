@@ -123,6 +123,7 @@ fn handle_command_line_to_argv_w(
     // Allocate argv array: one pointer per arg, plus NULL terminator.
     let argv_bytes = args.len().saturating_add(1).checked_mul(8).unwrap_or(8);
     let argv_va = state
+        .heap_state
         .heap
         .alloc_coherent(engine, u64::try_from(argv_bytes).unwrap_or(64));
     if argv_va == 0 {
@@ -157,7 +158,7 @@ fn alloc_shell_bstr(
         .saturating_add(u64::from(byte_len))
         .saturating_add(2)
         .saturating_add(8);
-    let raw = state.heap.alloc_coherent(engine, total);
+    let raw = state.heap_state.heap.alloc_coherent(engine, total);
     if raw == 0 {
         return Ok(0);
     }

@@ -111,7 +111,7 @@ fn read_host_console_stdin_line() -> std::io::Result<Option<Vec<u8>>> {
 }
 
 /// When the inject/live buffer is empty and live mode is on, block on host
-/// stdin for one line and store it in `state.stdin_bytes`.
+/// stdin for one line and store it in `state.file_io.stdin_bytes`.
 ///
 /// Returns `Ok(true)` if bytes were stored, `Ok(false)` on host EOF,
 /// `Err(())` on host I/O failure (caller sets `ERROR_READ_FAULT`).
@@ -119,8 +119,8 @@ fn refill_stdin_from_host(state: &mut WinApiState) -> Result<bool, ()> {
     match read_host_console_stdin_line() {
         Ok(None) => Ok(false),
         Ok(Some(line)) => {
-            state.stdin_bytes = line;
-            state.stdin_cursor = 0;
+            state.file_io.stdin_bytes = line;
+            state.file_io.stdin_cursor = 0;
             Ok(true)
         }
         Err(_) => Err(()),
@@ -917,13 +917,13 @@ fn resolve_or_load_dll(
 
     // 3. Check already-loaded real modules. Bump refcount per LoadLibrary contract.
     let norm = normalize_module_name(name);
-    if let Some(module) = state.loaded_modules.get_mut(&norm) {
+    if let Some(module) = state.module_state.loaded_modules.get_mut(&norm) {
         module.ref_count = module.ref_count.saturating_add(1);
         return module.handle;
     }
 
     // 4. Try to load from disk (requires import_resolver).
-    let mut resolver_opt = state.import_resolver.take();
+    let mut resolver_opt = state.module_state.import_resolver.take();
     let Some(ref mut resolver) = resolver_opt else {
         state.last_error = ERROR_MOD_NOT_FOUND;
         return 0;
@@ -933,11 +933,11 @@ fn resolve_or_load_dll(
     let host_path = crate::dll_loader::resolve_dll_path(
         name,
         &state.main_module_path,
-        &state.volumes,
+        &state.file_io.volumes,
         state.main_module_host_dir.as_deref(),
     );
     let Some(ref host) = host_path else {
-        state.import_resolver = resolver_opt;
+        state.module_state.import_resolver = resolver_opt;
         state.last_error = ERROR_MOD_NOT_FOUND;
         return 0;
     };
@@ -947,7 +947,7 @@ fn resolve_or_load_dll(
 
     match crate::dll_loader::load_dll(engine, state, host, &guest_path, resolver) {
         Ok(result) => {
-            state.import_resolver = resolver_opt;
+            state.module_state.import_resolver = resolver_opt;
             // Recursively load dependencies. If any dependency fails to
             // load, the parent load also fails (Windows LoadLibrary contract).
             for dep in &result.dependencies {
@@ -959,7 +959,7 @@ fn resolve_or_load_dll(
             result.module.handle
         }
         Err(e) => {
-            state.import_resolver = resolver_opt;
+            state.module_state.import_resolver = resolver_opt;
             tracing::warn!("failed to load DLL {}: {e}", name);
             state.last_error = ERROR_MOD_NOT_FOUND;
             0
@@ -1072,17 +1072,17 @@ fn file_attributes_for_path(state: &WinApiState, path: &str) -> u64 {
     }
 
     let mounts_ref: Vec<(String, std::path::PathBuf)> = state
-        .host_file_mounts
+        .file_io.host_file_mounts
         .iter()
         .map(|m| (m.guest_path.clone(), m.host_path.clone()))
         .collect();
     let virtuals_ref: Vec<(String, usize)> = state
-        .virtual_files
+        .file_io.virtual_files
         .iter()
         .map(|v| (v.guest_path.clone(), v.bytes.len()))
         .collect();
     let ctx = crate::vfs::ResolveCtx {
-        volumes: &state.volumes,
+        volumes: &state.file_io.volumes,
         main_module_path: &state.main_module_path,
         main_module_file_name: &state.main_module_file_name,
         host_file_mounts: &mounts_ref,
@@ -1107,17 +1107,17 @@ fn file_attributes_for_path(state: &WinApiState, path: &str) -> u64 {
 /// Collect dir entries for a Find pattern (dir + mask).
 fn collect_find_entries(state: &WinApiState, full_pattern: &str) -> Vec<crate::vfs::DirEntry> {
     let mounts_ref: Vec<(String, std::path::PathBuf)> = state
-        .host_file_mounts
+        .file_io.host_file_mounts
         .iter()
         .map(|m| (m.guest_path.clone(), m.host_path.clone()))
         .collect();
     let virtuals_ref: Vec<(String, usize)> = state
-        .virtual_files
+        .file_io.virtual_files
         .iter()
         .map(|v| (v.guest_path.clone(), v.bytes.len()))
         .collect();
     let ctx = crate::vfs::ResolveCtx {
-        volumes: &state.volumes,
+        volumes: &state.file_io.volumes,
         main_module_path: &state.main_module_path,
         main_module_file_name: &state.main_module_file_name,
         host_file_mounts: &mounts_ref,
@@ -1253,13 +1253,13 @@ fn create_fake_resource_record(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
 ) -> Result<ResourceRecord> {
-    let handle = state.next_resource_handle;
-    state.next_resource_handle = state
-        .next_resource_handle
+    let handle = state.file_io.next_resource_handle;
+    state.file_io.next_resource_handle = state
+        .file_io.next_resource_handle
         .checked_add(1)
         .context("resource handle overflow")?;
 
-    let index = u64::try_from(state.resources.len()).context("resource index does not fit u64")?;
+    let index = u64::try_from(state.file_io.resources.len()).context("resource index does not fit u64")?;
     let data_offset = index
         .checked_mul(0x100)
         .context("resource data offset overflow")?;
@@ -1283,14 +1283,14 @@ fn create_fake_resource_record(
         size: FAKE_RESOURCE_SIZE,
     };
 
-    state.resources.push(record.clone());
+    state.file_io.resources.push(record.clone());
 
     Ok(record)
 }
 
 fn find_resource_by_handle(state: &WinApiState, handle: u64) -> Option<&ResourceRecord> {
     state
-        .resources
+        .file_io.resources
         .iter()
         .find(|resource| resource.handle == handle || resource.loaded_handle == handle)
 }
@@ -1424,9 +1424,9 @@ pub fn handle_heap_alloc(
     } else {
         // Zero-byte requests still need a live block (round-up in GuestHeap).
         let alloc_size = if size == 0 { 1 } else { size };
-        let addr = state.heap.alloc_coherent(engine, alloc_size);
+        let addr = state.heap_state.heap.alloc_coherent(engine, alloc_size);
         if addr != 0 && (flags & HEAP_ZERO_MEMORY) != 0 {
-            let zero_len = state.heap.size_of(addr).unwrap_or(alloc_size);
+            let zero_len = state.heap_state.heap.size_of(addr).unwrap_or(alloc_size);
             if let Ok(len) = usize::try_from(zero_len) {
                 let zeros = vec![0_u8; len];
                 engine.mem_write(addr, &zeros)?;
@@ -1456,7 +1456,7 @@ pub fn handle_heap_free(
     let _flags = engine.read_rdx()?;
     let memory = engine.read_r8()?;
 
-    let ok = memory == 0 || state.heap.free_coherent(engine, memory);
+    let ok = memory == 0 || state.heap_state.heap.free_coherent(engine, memory);
     let return_value = if ok {
         1
     } else {
@@ -1489,13 +1489,14 @@ pub fn handle_heap_realloc(
     let return_value = if heap_handle == 0 || memory == 0 {
         0
     } else if new_size == 0 {
-        let _ = state.heap.free_coherent(engine, memory);
+        let _ = state.heap_state.heap.free_coherent(engine, memory);
         0
-    } else if let Some(same) = state.heap.try_realloc_in_place(memory, new_size) {
+    } else if let Some(same) = state.heap_state.heap.try_realloc_in_place(memory, new_size) {
         // In-place only succeeds when the block already fits; no new bytes to zero.
         same
     } else {
         let old_size = state
+            .heap_state
             .heap
             .size_of(memory)
             .or_else(|| {
@@ -1506,7 +1507,7 @@ pub fn handle_heap_realloc(
                     .map(|()| u64::from_le_bytes(hb))
             })
             .unwrap_or(0);
-        let new_addr = state.heap.alloc_coherent(engine, new_size);
+        let new_addr = state.heap_state.heap.alloc_coherent(engine, new_size);
         if new_addr == 0 {
             // Failure must leave the original block live (Microsoft Learn).
             0
@@ -1525,7 +1526,7 @@ pub fn handle_heap_realloc(
                     engine.mem_write(new_addr.wrapping_add(zero_start), &zeros)?;
                 }
             }
-            let _ = state.heap.free_coherent(engine, memory);
+            let _ = state.heap_state.heap.free_coherent(engine, memory);
             new_addr
         }
     };
@@ -1794,7 +1795,7 @@ fn publish_fls_slot(
     index: u32,
     value: u64,
 ) {
-    let table = state.guest_fls_table_va;
+    let table = state.heap_state.guest_fls_table_va;
     if table == 0 || index >= 256 {
         return;
     }
@@ -1811,14 +1812,14 @@ pub fn handle_fls_alloc(
         .read_rcx()
         .context("failed to read RCX for FlsAlloc")?;
 
-    let index = state.next_fls_index;
+    let index = state.heap_state.next_fls_index;
 
     let return_value = if index == u32::MAX {
         FLS_OUT_OF_INDEXES
     } else {
-        state.next_fls_index = index.checked_add(1).context("FLS index overflow")?;
+        state.heap_state.next_fls_index = index.checked_add(1).context("FLS index overflow")?;
 
-        state.fls_slots.push(FlsSlot { index, value: 0 });
+        state.heap_state.fls_slots.push(FlsSlot { index, value: 0 });
         publish_fls_slot(engine, state, index, 0);
 
         u64::from(index)
@@ -1845,7 +1846,7 @@ pub fn handle_fls_free(
 
     let index = u32::try_from(index_raw).context("FlsFree index does not fit u32")?;
 
-    state.fls_slots.retain(|slot| slot.index != index);
+    state.heap_state.fls_slots.retain(|slot| slot.index != index);
     publish_fls_slot(engine, state, index, 0);
 
     let return_address = engine
@@ -1873,10 +1874,10 @@ pub fn handle_fls_set_value(
 
     let index = u32::try_from(index_raw).context("FlsSetValue index does not fit u32")?;
 
-    if let Some(slot) = state.fls_slots.iter_mut().find(|slot| slot.index == index) {
+    if let Some(slot) = state.heap_state.fls_slots.iter_mut().find(|slot| slot.index == index) {
         slot.value = value;
     } else {
-        state.fls_slots.push(FlsSlot { index, value });
+        state.heap_state.fls_slots.push(FlsSlot { index, value });
     }
     publish_fls_slot(engine, state, index, value);
 
@@ -1902,6 +1903,7 @@ pub fn handle_fls_get_value(
     let index = u32::try_from(index_raw).context("FlsGetValue index does not fit u32")?;
 
     let return_value = state
+        .heap_state
         .fls_slots
         .iter()
         .find(|slot| slot.index == index)
@@ -2496,6 +2498,7 @@ pub fn handle_heap_size(
     let memory = engine.read_r8()?;
 
     let return_value = state
+        .heap_state
         .heap
         .size_of(memory)
         .or_else(|| {
@@ -2602,7 +2605,7 @@ pub fn handle_free_library(
     } else if module_handle >= dll_loader::REAL_MODULE_HANDLE_BASE {
         // Real loaded module — decrement refcount.
         let Some(name) = state
-            .loaded_modules
+            .module_state.loaded_modules
             .iter()
             .find(|(_, m)| m.handle == module_handle)
             .map(|(n, _)| n.clone())
@@ -2615,7 +2618,7 @@ pub fn handle_free_library(
             });
         };
 
-        if let Some(module) = state.loaded_modules.get_mut(&name) {
+        if let Some(module) = state.module_state.loaded_modules.get_mut(&name) {
             if module.ref_count > 0 {
                 module.ref_count = module.ref_count.saturating_sub(1);
             }
@@ -2628,9 +2631,9 @@ pub fn handle_free_library(
                 );
                 // Evict GetProcAddress cache entries for this module.
                 state
-                    .get_proc_address_cache
+                    .module_state.get_proc_address_cache
                     .retain(|_, entry| entry.module_handle != module_handle);
-                state.loaded_modules.remove(&name);
+                state.module_state.loaded_modules.remove(&name);
             }
         }
         state.last_error = 0;
@@ -2682,7 +2685,7 @@ pub fn handle_get_proc_address(
     let name_key = proc_name.to_ascii_lowercase();
 
     // Check cache first.
-    if let Some(cached) = state.get_proc_address_cache.get_mut(&name_key) {
+    if let Some(cached) = state.module_state.get_proc_address_cache.get_mut(&name_key) {
         cached.hit_count = cached.hit_count.saturating_add(1);
         state.last_error = 0;
         let return_address = engine.return_from_win64_api(cached.address)?;
@@ -2695,7 +2698,7 @@ pub fn handle_get_proc_address(
     // For real loaded module handles, search the export table.
     if module_handle >= dll_loader::REAL_MODULE_HANDLE_BASE {
         if let Some(module) = state
-            .loaded_modules
+            .module_state.loaded_modules
             .values()
             .find(|m| m.handle == module_handle)
         {
@@ -2708,7 +2711,7 @@ pub fn handle_get_proc_address(
 
             if let Some(address) = va {
                 // Cache and return.
-                state.get_proc_address_cache.insert(
+                state.module_state.get_proc_address_cache.insert(
                     name_key,
                     crate::GetProcAddressCacheEntry {
                         name: proc_name.clone().into(),
@@ -2735,7 +2738,7 @@ pub fn handle_get_proc_address(
 
     // Fall back to existing fake-API resolution for fake module handles.
     if let Some(address) = crate::dynamic_apis::resolve_get_proc_address(&proc_name) {
-        state.get_proc_address_cache.insert(
+        state.module_state.get_proc_address_cache.insert(
             name_key,
             crate::GetProcAddressCacheEntry {
                 name: proc_name.clone().into(),
@@ -2770,7 +2773,7 @@ pub fn handle_get_file_attributes_a(
         .context("failed to read RCX for GetFileAttributesA")?;
 
     let path = read_ansi_string_from_cpu(engine, path_ptr, 1024)?;
-    let cwd = String::from_utf16_lossy(&state.current_directory_wide);
+    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full_path = resolve_full_windows_path(&cwd, &path);
     let return_value = file_attributes_for_path(state, &full_path);
     if return_value == INVALID_FILE_ATTRIBUTES {
@@ -2799,7 +2802,7 @@ pub fn handle_get_file_attributes_w(
         .context("failed to read RCX for GetFileAttributesW")?;
 
     let path = read_wide_string_from_cpu(engine, path_ptr, 1024)?;
-    let cwd = String::from_utf16_lossy(&state.current_directory_wide);
+    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full_path = resolve_full_windows_path(&cwd, &path);
     let return_value = file_attributes_for_path(state, &full_path);
     if return_value == INVALID_FILE_ATTRIBUTES {
@@ -2882,7 +2885,7 @@ fn finish_find_first(
         return Ok(INVALID_HANDLE_VALUE);
     }
 
-    let cwd = String::from_utf16_lossy(&state.current_directory_wide);
+    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full_pattern = resolve_full_windows_path(&cwd, pattern);
     let mut entries = collect_find_entries(state, &full_pattern);
     if entries.is_empty() {
@@ -2909,13 +2912,13 @@ fn finish_find_first(
         )?;
     }
 
-    let handle = state.next_find_handle;
-    state.next_find_handle = state
-        .next_find_handle
+    let handle = state.file_io.next_find_handle;
+    state.file_io.next_find_handle = state
+        .file_io.next_find_handle
         .checked_add(1)
         .context("find handle overflow")?;
 
-    state.find_handles.push(FindHandle {
+    state.file_io.find_handles.push(FindHandle {
         handle,
         pattern: full_pattern,
         remaining: entries,
@@ -2982,7 +2985,7 @@ fn finish_find_next(
     unicode: bool,
 ) -> Result<u64> {
     let Some(slot) = state
-        .find_handles
+        .file_io.find_handles
         .iter_mut()
         .find(|h| h.handle == find_handle)
     else {
@@ -3027,7 +3030,7 @@ pub fn handle_find_close(
         .context("failed to read RCX for FindClose")?;
 
     state
-        .find_handles
+        .file_io.find_handles
         .retain(|handle| handle.handle != find_handle);
 
     let return_address = engine
@@ -3512,7 +3515,7 @@ pub fn handle_close_handle(
         }
         persist_open_file_to_host(state, handle);
         let _ = crate::guest_io_host::unregister_open_file(engine, state, handle).ok();
-        state.open_files.remove(&handle);
+        state.file_io.open_files.remove(&handle);
         state.last_error = 0;
         1
     } else if state.sync.objects.remove(&handle).is_some() {
@@ -3626,15 +3629,15 @@ fn paths_match_guest(requested: &str, candidate: &str) -> bool {
 }
 
 fn find_open_file(state: &WinApiState, handle: u64) -> Option<&OpenGuestFile> {
-    state.open_files.get(&handle)
+    state.file_io.open_files.get(&handle)
 }
 
 fn find_open_file_mut(state: &mut WinApiState, handle: u64) -> Option<&mut OpenGuestFile> {
-    state.open_files.get_mut(&handle)
+    state.file_io.open_files.get_mut(&handle)
 }
 
 fn is_open_file_handle(state: &WinApiState, handle: u64) -> bool {
-    state.open_files.contains_key(&handle)
+    state.file_io.open_files.contains_key(&handle)
 }
 
 /// Opens a guest path using the same resolution rules as `CreateFile*`.
@@ -3678,14 +3681,14 @@ fn open_or_create_guest_path(
     }
 
     // Keep volumes.bottle_root in sync with legacy field.
-    if state.volumes.bottle_root != state.bottle_root {
-        state.volumes.bottle_root = state.bottle_root.clone();
+    if state.file_io.volumes.bottle_root != state.file_io.bottle_root {
+        state.file_io.volumes.bottle_root = state.file_io.bottle_root.clone();
     }
 
-    let cwd = String::from_utf16_lossy(&state.current_directory_wide);
+    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full_path = resolve_full_windows_path(&cwd, guest_path);
 
-    let bottle_host = crate::vfs::guest_path_to_host(&state.volumes, &full_path).map(|m| m.host);
+    let bottle_host = crate::vfs::guest_path_to_host(&state.file_io.volumes, &full_path).map(|m| m.host);
     let existed = guest_path_exists(state, &full_path);
 
     match creation_disposition {
@@ -3747,7 +3750,7 @@ fn open_existing_guest_file(
 ) -> std::result::Result<u64, u32> {
     let host_path = bottle_host.cloned().or_else(|| {
         state
-            .host_file_mounts
+            .file_io.host_file_mounts
             .iter()
             .find(|m| paths_match_guest(guest_path, &m.guest_path))
             .map(|m| m.host_path.clone())
@@ -3799,14 +3802,14 @@ fn create_new_guest_file(
 
 fn ensure_virtual_file(state: &mut WinApiState, guest_path: &str) {
     if state
-        .virtual_files
+        .file_io.virtual_files
         .iter()
         .any(|entry| paths_match_guest(guest_path, &entry.guest_path))
     {
         return;
     }
 
-    state.virtual_files.push(crate::VirtualGuestFile {
+    state.file_io.virtual_files.push(crate::VirtualGuestFile {
         guest_path: guest_path.to_owned(),
         bytes: Vec::new(),
     });
@@ -3814,11 +3817,11 @@ fn ensure_virtual_file(state: &mut WinApiState, guest_path: &str) {
 
 fn resolve_guest_file_bytes(state: &WinApiState, guest_path: &str) -> Result<Vec<u8>> {
     if is_main_module_path(state, guest_path) {
-        return Ok(state.executable_file_bytes.clone());
+        return Ok(state.file_io.executable_file_bytes.clone());
     }
 
     if let Some(mount) = state
-        .host_file_mounts
+        .file_io.host_file_mounts
         .iter()
         .find(|mount| paths_match_guest(guest_path, &mount.guest_path))
     {
@@ -3830,7 +3833,7 @@ fn resolve_guest_file_bytes(state: &WinApiState, guest_path: &str) -> Result<Vec
         });
     }
 
-    if let Some(map) = crate::vfs::guest_path_to_host(&state.volumes, guest_path)
+    if let Some(map) = crate::vfs::guest_path_to_host(&state.file_io.volumes, guest_path)
         && map.host.is_file()
     {
         return std::fs::read(&map.host).with_context(|| {
@@ -3842,7 +3845,7 @@ fn resolve_guest_file_bytes(state: &WinApiState, guest_path: &str) -> Result<Vec
     }
 
     if let Some(virtual_file) = state
-        .virtual_files
+        .file_io.virtual_files
         .iter()
         .find(|entry| paths_match_guest(guest_path, &entry.guest_path))
     {
@@ -3893,10 +3896,10 @@ fn allocate_open_file_ex(
     host_path: Option<std::path::PathBuf>,
     force_stream: bool,
 ) -> Result<u64> {
-    let handle = state.next_file_handle;
+    let handle = state.file_io.next_file_handle;
 
-    state.next_file_handle = state
-        .next_file_handle
+    state.file_io.next_file_handle = state
+        .file_io.next_file_handle
         .checked_add(1)
         .context("guest file handle allocator overflow")?;
 
@@ -3915,7 +3918,7 @@ fn allocate_open_file_ex(
             && !is_main_module_path(state, path));
     let bytes = if streaming { Vec::new() } else { bytes };
 
-    state.open_files.insert(
+    state.file_io.open_files.insert(
         handle,
         OpenGuestFile {
             handle,
@@ -3931,7 +3934,7 @@ fn allocate_open_file_ex(
 
     // Keep legacy single-handle fields in sync when opening the main executable.
     if is_main_module_path(state, path) {
-        state.executable_file_cursor = 0;
+        state.file_io.executable_file_cursor = 0;
     }
 
     Ok(handle)
@@ -4028,10 +4031,10 @@ pub fn mount_host_file(
 
     // Replace existing mount for the same guest path.
     state
-        .host_file_mounts
+        .file_io.host_file_mounts
         .retain(|mount| !paths_match_guest(guest_path, &mount.guest_path));
 
-    state.host_file_mounts.push(crate::HostFileMount {
+    state.file_io.host_file_mounts.push(crate::HostFileMount {
         guest_path: guest_path.to_owned(),
         host_path: host_path.to_path_buf(),
     });
@@ -4045,20 +4048,20 @@ fn guest_path_exists(state: &WinApiState, path: &str) -> bool {
         return true;
     }
     if state
-        .host_file_mounts
+        .file_io.host_file_mounts
         .iter()
         .any(|mount| paths_match_guest(path, &mount.guest_path))
     {
         return true;
     }
     if state
-        .virtual_files
+        .file_io.virtual_files
         .iter()
         .any(|entry| paths_match_guest(path, &entry.guest_path))
     {
         return true;
     }
-    if let Some(map) = crate::vfs::guest_path_to_host(&state.volumes, path) {
+    if let Some(map) = crate::vfs::guest_path_to_host(&state.file_io.volumes, path) {
         return map.host.is_file();
     }
     false
@@ -4364,7 +4367,7 @@ pub fn handle_set_file_pointer(
 
         if let Some(new_cursor) = new_cursor {
             if is_main_module_path(state, &path) {
-                state.executable_file_cursor = new_cursor;
+                state.file_io.executable_file_cursor = new_cursor;
             }
 
             if distance_high_ptr != 0 {
@@ -4530,11 +4533,11 @@ pub fn handle_read_file(
         let requested =
             usize::try_from(bytes_to_read).context("ReadFile byte count does not fit usize")?;
 
-        let mut available = state.stdin_bytes.len().saturating_sub(state.stdin_cursor);
-        if available == 0 && state.stdin_mode == crate::GuestStdinMode::LiveHost {
+        let mut available = state.file_io.stdin_bytes.len().saturating_sub(state.file_io.stdin_cursor);
+        if available == 0 && state.file_io.stdin_mode == crate::GuestStdinMode::LiveHost {
             match refill_stdin_from_host(state) {
                 Ok(true) => {
-                    available = state.stdin_bytes.len().saturating_sub(state.stdin_cursor);
+                    available = state.file_io.stdin_bytes.len().saturating_sub(state.file_io.stdin_cursor);
                 }
                 Ok(false) => {
                     // Host EOF → success with 0 bytes (already zeroed count).
@@ -4559,17 +4562,17 @@ pub fn handle_read_file(
         let read_len = requested.min(available);
         if read_len > 0 {
             let end = state
-                .stdin_cursor
+                .file_io.stdin_cursor
                 .checked_add(read_len)
                 .context("ReadFile stdin end overflow")?;
             let data = state
-                .stdin_bytes
-                .get(state.stdin_cursor..end)
+                .file_io.stdin_bytes
+                .get(state.file_io.stdin_cursor..end)
                 .context("ReadFile stdin slice out of range")?;
             engine
                 .mem_write(buffer_ptr, data)
                 .context("failed to write ReadFile stdin bytes")?;
-            state.stdin_cursor = end;
+            state.file_io.stdin_cursor = end;
             if bytes_read_ptr != 0 {
                 let read_len_u32 =
                     u32::try_from(read_len).context("ReadFile byte count does not fit u32")?;
@@ -4634,7 +4637,7 @@ pub fn handle_read_file(
                 write_guest_u32(engine, bytes_read_ptr, u32::try_from(n).unwrap_or(0))?;
             }
             if is_main_module_path(state, &path) {
-                state.executable_file_cursor =
+                state.file_io.executable_file_cursor =
                     cursor_before.saturating_add(u64::try_from(n).unwrap_or(0));
             }
             state.last_error = 0;
@@ -4684,7 +4687,7 @@ pub fn handle_read_file(
             }
 
             if is_exe {
-                state.executable_file_cursor = cursor_after;
+                state.file_io.executable_file_cursor = cursor_after;
             }
 
             state.last_error = 0;
@@ -4856,7 +4859,7 @@ pub fn handle_write_file(
         }
 
         if is_main_module_path(state, &path) {
-            state.executable_file_cursor = cursor_after;
+            state.file_io.executable_file_cursor = cursor_after;
         }
 
         let write_len_u32 =
@@ -4920,11 +4923,11 @@ fn sync_open_bytes_to_virtual(state: &mut WinApiState, path: &str, handle: u64) 
         return;
     }
     // Volume-mapped paths without an open host_path still must not accumulate.
-    if crate::vfs::guest_path_to_host(&state.volumes, path).is_some() {
+    if crate::vfs::guest_path_to_host(&state.file_io.volumes, path).is_some() {
         return;
     }
     if state
-        .host_file_mounts
+        .file_io.host_file_mounts
         .iter()
         .any(|mount| paths_match_guest(path, &mount.guest_path))
     {
@@ -4934,7 +4937,7 @@ fn sync_open_bytes_to_virtual(state: &mut WinApiState, path: &str, handle: u64) 
     let bytes = open_file.bytes.clone();
 
     if let Some(virtual_file) = state
-        .virtual_files
+        .file_io.virtual_files
         .iter_mut()
         .find(|entry| paths_match_guest(path, &entry.guest_path))
     {
@@ -4943,7 +4946,7 @@ fn sync_open_bytes_to_virtual(state: &mut WinApiState, path: &str, handle: u64) 
     }
 
     // Pure in-session virtual files only (no bottle/mount/volume backing).
-    state.virtual_files.push(crate::VirtualGuestFile {
+    state.file_io.virtual_files.push(crate::VirtualGuestFile {
         guest_path: path.to_owned(),
         bytes,
     });
@@ -4968,7 +4971,7 @@ pub fn handle_get_current_directory_w(
         .read_rdx()
         .context("failed to read RDX for GetCurrentDirectoryW")?;
 
-    let directory = state.current_directory_wide.clone();
+    let directory = state.file_io.current_directory_wide.clone();
 
     let character_count = u64::try_from(directory.len())
         .context("fake current directory length does not fit in u64")?;
@@ -5034,10 +5037,10 @@ pub fn handle_set_current_directory_w(
             false
         } else {
             // Relative directory names resolve against the current directory (MSDN).
-            let cwd = String::from_utf16_lossy(&state.current_directory_wide);
+            let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
             let full = resolve_full_windows_path(&cwd, &directory);
             if guest_dir_exists(state, &full) {
-                state.current_directory_wide = full.encode_utf16().collect();
+                state.file_io.current_directory_wide = full.encode_utf16().collect();
                 // Keep guest cwd blob in sync when stubs are installed (best-effort).
                 state.last_error = 0;
                 true
@@ -5957,17 +5960,17 @@ pub fn dispatch_kernel32_extra(
 /// Stat a guest path using the VFS, building the resolve context from state.
 fn stat_guest_path(state: &WinApiState, full_path: &str) -> crate::vfs::PathStat {
     let mounts_ref: Vec<(String, std::path::PathBuf)> = state
-        .host_file_mounts
+        .file_io.host_file_mounts
         .iter()
         .map(|m| (m.guest_path.clone(), m.host_path.clone()))
         .collect();
     let virtuals_ref: Vec<(String, usize)> = state
-        .virtual_files
+        .file_io.virtual_files
         .iter()
         .map(|v| (v.guest_path.clone(), v.bytes.len()))
         .collect();
     let ctx = crate::vfs::ResolveCtx {
-        volumes: &state.volumes,
+        volumes: &state.file_io.volumes,
         main_module_path: &state.main_module_path,
         main_module_file_name: &state.main_module_file_name,
         host_file_mounts: &mounts_ref,
@@ -6132,7 +6135,7 @@ pub fn handle_get_compressed_file_size_a(
     let path_ptr = engine.read_rcx()?;
     let _high_ptr = engine.read_rdx()?;
     let path = read_ansi_string_from_cpu(engine, path_ptr, 1024)?;
-    let cwd = String::from_utf16_lossy(&state.current_directory_wide);
+    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full = resolve_full_windows_path(&cwd, &path);
     let st = stat_guest_path(state, &full);
     if st.kind == crate::vfs::PathKind::NotFound {
@@ -6159,7 +6162,7 @@ pub fn handle_get_compressed_file_size_w(
     let path_ptr = engine.read_rcx()?;
     let _high_ptr = engine.read_rdx()?;
     let path = read_wide_string_from_cpu(engine, path_ptr, 1024)?;
-    let cwd = String::from_utf16_lossy(&state.current_directory_wide);
+    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full = resolve_full_windows_path(&cwd, &path);
     let st = stat_guest_path(state, &full);
     if st.kind == crate::vfs::PathKind::NotFound {
@@ -6203,7 +6206,7 @@ pub fn handle_get_volume_information_w(
 
     // Derive volume label from the bottle root name, or use a default.
     let label = state
-        .bottle_root
+        .file_io.bottle_root
         .as_ref()
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str())
@@ -6262,7 +6265,7 @@ pub fn handle_get_volume_information_a(
         .unwrap_or(0);
 
     let label = state
-        .bottle_root
+        .file_io.bottle_root
         .as_ref()
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str())
@@ -6584,7 +6587,7 @@ fn get_user_name_impl(
 
 /// Derive the profile directory from the bottle root or a default.
 fn host_profile_dir(state: &WinApiState) -> String {
-    if state.bottle_root.is_some() {
+    if state.file_io.bottle_root.is_some() {
         let user = host_user_name();
         format!("C:\\Users\\{user}")
     } else {
@@ -6968,7 +6971,7 @@ pub fn handle_get_file_attributes_ex_w(
     let _info_level = engine.read_rdx()?;
     let info_ptr = engine.read_r8()?;
     let path = read_wide_string_from_cpu(engine, path_ptr, 1024)?;
-    let cwd = String::from_utf16_lossy(&state.current_directory_wide);
+    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full = resolve_full_windows_path(&cwd, &path);
     let st = stat_guest_path(state, &full);
     if st.kind == crate::vfs::PathKind::NotFound {
@@ -7028,7 +7031,7 @@ pub fn handle_get_file_attributes_ex_a(
     let _info_level = engine.read_rdx()?;
     let info_ptr = engine.read_r8()?;
     let path = read_ansi_string_from_cpu(engine, path_ptr, 1024)?;
-    let cwd = String::from_utf16_lossy(&state.current_directory_wide);
+    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full = resolve_full_windows_path(&cwd, &path);
     let st = stat_guest_path(state, &full);
     if st.kind == crate::vfs::PathKind::NotFound {
@@ -7154,7 +7157,7 @@ pub fn handle_backup_read(
             return_value: 1,
         });
     }
-    if let Some(file) = state.open_files.get_mut(&handle) {
+    if let Some(file) = state.file_io.open_files.get_mut(&handle) {
         let cursor_usize = usize::try_from(file.cursor).unwrap_or(0);
         let available = file.bytes.len().saturating_sub(cursor_usize);
         let to_read_usize = usize::try_from(to_read).unwrap_or(0);
@@ -7200,7 +7203,7 @@ pub fn handle_backup_seek(
     let lo_ptr = engine.read_r9()?;
     let _hi_ptr = read_stack_u64(engine, 0x28).unwrap_or(0);
     let _context = read_stack_u64(engine, 0x30).unwrap_or(0);
-    if let Some(file) = state.open_files.get_mut(&handle) {
+    if let Some(file) = state.file_io.open_files.get_mut(&handle) {
         let offset = lo | (hi << 32);
         file.cursor = offset;
         if lo_ptr != 0 {
@@ -7249,7 +7252,7 @@ pub fn handle_backup_write(
         });
     }
     let to_write_usize = usize::try_from(to_write).unwrap_or(0);
-    if let Some(file) = state.open_files.get_mut(&handle) {
+    if let Some(file) = state.file_io.open_files.get_mut(&handle) {
         let mut chunk = vec![0_u8; to_write_usize];
         engine.mem_read(buf, &mut chunk)?;
         let cursor_usize = usize::try_from(file.cursor).unwrap_or(0);
@@ -8650,7 +8653,7 @@ fn allocate_fake_heap_block(
     state: &mut WinApiState,
     size: u64,
 ) -> u64 {
-    state.heap.alloc_coherent(engine, size)
+    state.heap_state.heap.alloc_coherent(engine, size)
 }
 
 /// Handles `KERNEL32.dll!LocalAlloc`.
@@ -8698,7 +8701,7 @@ pub fn handle_local_free(
         });
     }
 
-    let existed = state.heap.free_coherent(engine, memory);
+    let existed = state.heap_state.heap.free_coherent(engine, memory);
 
     // LocalFree returns NULL on success and the original handle on failure.
     let return_value = if existed { 0 } else { memory };
@@ -8758,7 +8761,7 @@ pub fn handle_global_free(
         });
     }
 
-    let existed = state.heap.free_coherent(engine, memory);
+    let existed = state.heap_state.heap.free_coherent(engine, memory);
 
     // GlobalFree returns NULL on success and the original handle on failure.
     let return_value = if existed { 0 } else { memory };
@@ -8782,7 +8785,7 @@ pub fn handle_global_lock(
         .read_rcx()
         .context("failed to read RCX for GlobalLock")?;
 
-    let return_value = if state.heap.is_live(memory) {
+    let return_value = if state.heap_state.heap.is_live(memory) {
         memory
     } else {
         0
@@ -8807,7 +8810,7 @@ pub fn handle_global_unlock(
         .read_rcx()
         .context("failed to read RCX for GlobalUnlock")?;
 
-    let existed = state.heap.is_live(memory);
+    let existed = state.heap_state.heap.is_live(memory);
 
     state.last_error = if existed { 0 } else { ERROR_INVALID_HANDLE };
 
@@ -8832,7 +8835,7 @@ pub fn handle_global_size(
         .read_rcx()
         .context("failed to read RCX for GlobalSize")?;
 
-    let return_value = state.heap.size_of(memory).unwrap_or(0);
+    let return_value = state.heap_state.heap.size_of(memory).unwrap_or(0);
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -8899,21 +8902,21 @@ pub fn handle_global_add_atom_a(
             state.last_error = ERROR_INVALID_PARAMETER;
             0
         } else if let Some(existing) = state
-            .global_atoms
+            .window_state.global_atoms
             .iter()
             .find(|record| record.name.eq_ignore_ascii_case(&name))
         {
             state.last_error = 0;
             u64::from(existing.atom)
         } else {
-            let atom = state.next_global_atom;
+            let atom = state.window_state.next_global_atom;
 
-            state.next_global_atom = state
-                .next_global_atom
+            state.window_state.next_global_atom = state
+                .window_state.next_global_atom
                 .checked_add(1)
                 .context("global atom identifier overflow")?;
 
-            state.global_atoms.push(GlobalAtomRecord { atom, name });
+            state.window_state.global_atoms.push(GlobalAtomRecord { atom, name });
             state.last_error = 0;
 
             u64::from(atom)
@@ -8942,10 +8945,10 @@ pub fn handle_global_delete_atom(
     let atom_low = atom_raw & u64::from(u16::MAX);
     let atom = u16::try_from(atom_low).context("GlobalDeleteAtom identifier does not fit u16")?;
 
-    let existed = state.global_atoms.iter().any(|record| record.atom == atom);
+    let existed = state.window_state.global_atoms.iter().any(|record| record.atom == atom);
 
     if existed {
-        state.global_atoms.retain(|record| record.atom != atom);
+        state.window_state.global_atoms.retain(|record| record.atom != atom);
 
         state.last_error = 0;
     } else {
@@ -9007,7 +9010,7 @@ pub fn handle_get_full_path_name_w(
             state.last_error = ERROR_INVALID_PARAMETER;
             0
         } else {
-            let current_directory = String::from_utf16_lossy(&state.current_directory_wide);
+            let current_directory = String::from_utf16_lossy(&state.file_io.current_directory_wide);
 
             let full_path = resolve_full_windows_path(&current_directory, &input_path);
 
@@ -9099,7 +9102,7 @@ pub fn handle_get_full_path_name_a(
             state.last_error = ERROR_INVALID_PARAMETER;
             0
         } else {
-            let current_directory = String::from_utf16_lossy(&state.current_directory_wide);
+            let current_directory = String::from_utf16_lossy(&state.file_io.current_directory_wide);
             let full_path = resolve_full_windows_path(&current_directory, &input_path);
             let path_bytes = crate::vfs::encode_acp(&full_path);
             let path_length = path_bytes.len();
@@ -9141,7 +9144,7 @@ pub fn handle_get_current_directory_a(
 ) -> Result<WinApiHandlerResult> {
     let buffer_length = engine.read_rcx()?;
     let buffer_ptr = engine.read_rdx()?;
-    let directory = String::from_utf16_lossy(&state.current_directory_wide);
+    let directory = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let bytes = crate::vfs::encode_acp(&directory);
     let character_count = u64::try_from(bytes.len()).unwrap_or(0);
     let required_with_nul = character_count.saturating_add(1);
@@ -9176,10 +9179,10 @@ pub fn handle_set_current_directory_a(
             state.last_error = ERROR_PATH_NOT_FOUND;
             false
         } else {
-            let cwd = String::from_utf16_lossy(&state.current_directory_wide);
+            let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
             let full = resolve_full_windows_path(&cwd, &directory);
             if guest_dir_exists(state, &full) {
-                state.current_directory_wide = full.encode_utf16().collect();
+                state.file_io.current_directory_wide = full.encode_utf16().collect();
                 state.last_error = 0;
                 true
             } else {
@@ -9201,16 +9204,16 @@ fn finish_create_directory(state: &mut WinApiState, path: &str) -> u64 {
         state.last_error = ERROR_PATH_NOT_FOUND;
         return 0;
     }
-    if state.volumes.bottle_root != state.bottle_root {
-        state.volumes.bottle_root = state.bottle_root.clone();
+    if state.file_io.volumes.bottle_root != state.file_io.bottle_root {
+        state.file_io.volumes.bottle_root = state.file_io.bottle_root.clone();
     }
-    let cwd = String::from_utf16_lossy(&state.current_directory_wide);
+    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full = resolve_full_windows_path(&cwd, path);
     if guest_dir_exists(state, &full) {
         state.last_error = ERROR_ALREADY_EXISTS;
         return 0;
     }
-    let Some(map) = crate::vfs::guest_path_to_host(&state.volumes, &full) else {
+    let Some(map) = crate::vfs::guest_path_to_host(&state.file_io.volumes, &full) else {
         state.last_error = ERROR_PATH_NOT_FOUND;
         return 0;
     };
@@ -9266,15 +9269,15 @@ fn finish_delete_file(state: &mut WinApiState, path: &str) -> u64 {
         state.last_error = ERROR_PATH_NOT_FOUND;
         return 0;
     }
-    if state.volumes.bottle_root != state.bottle_root {
-        state.volumes.bottle_root = state.bottle_root.clone();
+    if state.file_io.volumes.bottle_root != state.file_io.bottle_root {
+        state.file_io.volumes.bottle_root = state.file_io.bottle_root.clone();
     }
-    let cwd = String::from_utf16_lossy(&state.current_directory_wide);
+    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full = resolve_full_windows_path(&cwd, path);
     state
-        .virtual_files
+        .file_io.virtual_files
         .retain(|v| !paths_match_guest(&full, &v.guest_path));
-    if let Some(map) = crate::vfs::guest_path_to_host(&state.volumes, &full) {
+    if let Some(map) = crate::vfs::guest_path_to_host(&state.file_io.volumes, &full) {
         if crate::vfs::remove_file_host(&map.host).is_ok() {
             state.last_error = 0;
             return 1;
@@ -9329,12 +9332,12 @@ fn finish_remove_directory(state: &mut WinApiState, path: &str) -> u64 {
         state.last_error = ERROR_PATH_NOT_FOUND;
         return 0;
     }
-    if state.volumes.bottle_root != state.bottle_root {
-        state.volumes.bottle_root = state.bottle_root.clone();
+    if state.file_io.volumes.bottle_root != state.file_io.bottle_root {
+        state.file_io.volumes.bottle_root = state.file_io.bottle_root.clone();
     }
-    let cwd = String::from_utf16_lossy(&state.current_directory_wide);
+    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full = resolve_full_windows_path(&cwd, path);
-    let Some(map) = crate::vfs::guest_path_to_host(&state.volumes, &full) else {
+    let Some(map) = crate::vfs::guest_path_to_host(&state.file_io.volumes, &full) else {
         state.last_error = ERROR_PATH_NOT_FOUND;
         return 0;
     };
@@ -9397,17 +9400,17 @@ fn finish_move_file(state: &mut WinApiState, from: &str, to: &str) -> u64 {
         state.last_error = ERROR_PATH_NOT_FOUND;
         return 0;
     }
-    if state.volumes.bottle_root != state.bottle_root {
-        state.volumes.bottle_root = state.bottle_root.clone();
+    if state.file_io.volumes.bottle_root != state.file_io.bottle_root {
+        state.file_io.volumes.bottle_root = state.file_io.bottle_root.clone();
     }
-    let cwd = String::from_utf16_lossy(&state.current_directory_wide);
+    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full_from = resolve_full_windows_path(&cwd, from);
     let full_to = resolve_full_windows_path(&cwd, to);
-    let Some(src) = crate::vfs::guest_path_to_host(&state.volumes, &full_from) else {
+    let Some(src) = crate::vfs::guest_path_to_host(&state.file_io.volumes, &full_from) else {
         state.last_error = ERROR_FILE_NOT_FOUND;
         return 0;
     };
-    let Some(dst) = crate::vfs::guest_path_to_host(&state.volumes, &full_to) else {
+    let Some(dst) = crate::vfs::guest_path_to_host(&state.file_io.volumes, &full_to) else {
         state.last_error = ERROR_PATH_NOT_FOUND;
         return 0;
     };
@@ -9548,8 +9551,8 @@ pub fn handle_get_temp_file_name_w(
     };
     let prefix: String = prefix.chars().take(3).collect();
     let id = if unique == 0 {
-        state.tick_count = state.tick_count.wrapping_add(1);
-        state.tick_count
+        state.window_state.tick_count = state.window_state.tick_count.wrapping_add(1);
+        state.window_state.tick_count
     } else {
         unique
     };
@@ -9576,12 +9579,12 @@ pub fn handle_get_temp_file_name_w(
 }
 
 fn finish_create_file_create_only(state: &mut WinApiState, guest_path: &str) {
-    let cwd = String::from_utf16_lossy(&state.current_directory_wide);
+    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full = resolve_full_windows_path(&cwd, guest_path);
-    if state.volumes.bottle_root != state.bottle_root {
-        state.volumes.bottle_root = state.bottle_root.clone();
+    if state.file_io.volumes.bottle_root != state.file_io.bottle_root {
+        state.file_io.volumes.bottle_root = state.file_io.bottle_root.clone();
     }
-    if let Some(map) = crate::vfs::guest_path_to_host(&state.volumes, &full) {
+    if let Some(map) = crate::vfs::guest_path_to_host(&state.file_io.volumes, &full) {
         drop(crate::vfs::create_host_file(&map.host));
     } else {
         ensure_virtual_file(state, &full);
@@ -9609,8 +9612,8 @@ pub fn handle_get_temp_file_name_a(
     };
     let prefix: String = prefix.chars().take(3).collect();
     let id = if unique == 0 {
-        state.tick_count = state.tick_count.wrapping_add(1);
-        state.tick_count
+        state.window_state.tick_count = state.window_state.tick_count.wrapping_add(1);
+        state.window_state.tick_count
     } else {
         unique
     };
@@ -9647,7 +9650,7 @@ pub fn handle_get_drive_type_w(
     } else {
         read_wide_string_from_cpu(engine, path_ptr, 16)?
     };
-    let return_value = u64::from(crate::vfs::get_drive_type(&state.volumes, &path));
+    let return_value = u64::from(crate::vfs::get_drive_type(&state.file_io.volumes, &path));
     let return_address = engine.return_from_win64_api(return_value)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -9666,7 +9669,7 @@ pub fn handle_get_drive_type_a(
     } else {
         read_ansi_string_from_cpu(engine, path_ptr, 16)?
     };
-    let return_value = u64::from(crate::vfs::get_drive_type(&state.volumes, &path));
+    let return_value = u64::from(crate::vfs::get_drive_type(&state.file_io.volumes, &path));
     let return_address = engine.return_from_win64_api(return_value)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -9679,7 +9682,7 @@ pub fn handle_get_logical_drives(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    let return_value = u64::from(crate::vfs::logical_drives_mask(&state.volumes));
+    let return_value = u64::from(crate::vfs::logical_drives_mask(&state.file_io.volumes));
     let return_address = engine.return_from_win64_api(return_value)?;
     Ok(WinApiHandlerResult {
         return_address,

@@ -440,7 +440,7 @@ fn handle_localtime64(
     // x64 struct tm layout: tm_sec(4), tm_min(4), tm_hour(4), tm_mday(4),
     // tm_mon(4), tm_year(4), tm_wday(4), tm_yday(4), tm_isdst(4) = 36 bytes.
     // Allocate and write from the heap.
-    let va = state.heap.alloc_coherent(engine, 36);
+    let va = state.heap_state.heap.alloc_coherent(engine, 36);
     if va == 0 { return ret(engine, 0); }
     for (i, &v) in tm.iter().enumerate() {
         let off = u64::try_from(i * 4).unwrap_or(0);
@@ -486,7 +486,7 @@ fn handle_malloc(
     let ptr = if size == 0 {
         0
     } else {
-        state.heap.alloc_coherent(engine, size)
+        state.heap_state.heap.alloc_coherent(engine, size)
     };
     ret(engine, ptr)
 }
@@ -501,7 +501,7 @@ fn handle_calloc(
     let ptr = if total == 0 {
         0
     } else {
-        let p = state.heap.alloc_coherent(engine, total);
+        let p = state.heap_state.heap.alloc_coherent(engine, total);
         if p != 0 {
             let len = usize::try_from(total).unwrap_or(0);
             let zeros = vec![0_u8; len];
@@ -518,7 +518,7 @@ fn handle_free(
 ) -> Result<WinApiHandlerResult> {
     let ptr = engine.read_rcx()?;
     if ptr != 0 {
-        let _ = state.heap.free_coherent(engine, ptr);
+        let _ = state.heap_state.heap.free_coherent(engine, ptr);
     }
     ret(engine, 0)
 }
@@ -798,18 +798,19 @@ fn handle_realloc(
         let p = if new_size == 0 {
             0
         } else {
-            state.heap.alloc_coherent(engine, new_size)
+            state.heap_state.heap.alloc_coherent(engine, new_size)
         };
         return ret(engine, p);
     }
     if new_size == 0 {
-        let _ = state.heap.free_coherent(engine, ptr);
+        let _ = state.heap_state.heap.free_coherent(engine, ptr);
         return ret(engine, 0);
     }
-    if let Some(same) = state.heap.try_realloc_in_place(ptr, new_size) {
+    if let Some(same) = state.heap_state.heap.try_realloc_in_place(ptr, new_size) {
         return ret(engine, same);
     }
     let old_size = state
+        .heap_state
         .heap
         .size_of(ptr)
         .or_else(|| {
@@ -820,7 +821,7 @@ fn handle_realloc(
                 .map(|()| u64::from_le_bytes(hb))
         })
         .unwrap_or(0);
-    let new_addr = state.heap.alloc_coherent(engine, new_size);
+    let new_addr = state.heap_state.heap.alloc_coherent(engine, new_size);
     if new_addr == 0 {
         return ret(engine, 0);
     }
@@ -830,7 +831,7 @@ fn handle_realloc(
         engine.mem_read(ptr, &mut bytes)?;
         engine.mem_write(new_addr, &bytes)?;
     }
-    let _ = state.heap.free_coherent(engine, ptr);
+    let _ = state.heap_state.heap.free_coherent(engine, ptr);
     ret(engine, new_addr)
 }
 
@@ -958,8 +959,8 @@ fn handle_fgets(
     }
     let cap = usize::try_from(max).unwrap_or(0);
     // Refill from host stdin if buffer is empty and LiveHost mode.
-    if state.stdin_cursor >= state.stdin_bytes.len()
-        && state.stdin_mode == GuestStdinMode::LiveHost
+    if state.file_io.stdin_cursor >= state.file_io.stdin_bytes.len()
+        && state.file_io.stdin_mode == GuestStdinMode::LiveHost
     {
         use std::io::Read;
         let mut line = Vec::new();
@@ -971,17 +972,17 @@ fn handle_fgets(
             if byte[0] == b'\n' { break; }
         }
         if !line.is_empty() {
-            state.stdin_bytes = line;
-            state.stdin_cursor = 0;
+            state.file_io.stdin_bytes = line;
+            state.file_io.stdin_cursor = 0;
         }
     }
     // Copy from stdin buffer to guest buffer.
     let mut written = 0_usize;
     while written < cap.saturating_sub(1) {
-        let idx = state.stdin_cursor;
-        if idx >= state.stdin_bytes.len() { break; }
-        let c = state.stdin_bytes[idx];
-        state.stdin_cursor = idx.wrapping_add(1);
+        let idx = state.file_io.stdin_cursor;
+        if idx >= state.file_io.stdin_bytes.len() { break; }
+        let c = state.file_io.stdin_bytes[idx];
+        state.file_io.stdin_cursor = idx.wrapping_add(1);
         let byte = [c];
         engine.mem_write(buf.wrapping_add(u64::try_from(written).unwrap_or(0)), &byte)?;
         written = written.wrapping_add(1);

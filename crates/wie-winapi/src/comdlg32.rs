@@ -57,7 +57,7 @@ pub fn handle_comm_dlg_extended_error(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    let return_value = u64::from(state.comm_dlg_extended_error);
+    let return_value = u64::from(state.window_state.comm_dlg_extended_error);
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -78,7 +78,7 @@ pub fn handle_choose_color_a(
         .read_rcx()
         .context("failed to read RCX for ChooseColorA")?;
 
-    state.comm_dlg_extended_error = CDERR_NONE;
+    state.window_state.comm_dlg_extended_error = CDERR_NONE;
 
     // CHOOSECOLORA has rgbResult at offset 0x10 (after lStructSize + hwndOwner + hInstance).
     if choose_color_ptr != 0 {
@@ -110,7 +110,7 @@ fn handle_get_file_name(
         .with_context(|| format!("failed to read RCX for {api_name}"))?;
 
     if ofn_ptr == 0 {
-        state.comm_dlg_extended_error = CDERR_NONE;
+        state.window_state.comm_dlg_extended_error = CDERR_NONE;
         let return_address = engine
             .return_from_win64_api(0)
             .with_context(|| format!("failed to return from {api_name}"))?;
@@ -145,16 +145,16 @@ fn handle_get_file_name(
     )
     .with_context(|| format!("failed to read nMaxFileTitle for {api_name}"))?;
 
-    let return_value = match &state.file_dialog_policy {
+    let return_value = match &state.window_state.file_dialog_policy {
         FileDialogPolicy::Cancel => {
-            state.comm_dlg_extended_error = CDERR_NONE;
+            state.window_state.comm_dlg_extended_error = CDERR_NONE;
             tracing::debug!(api = api_name, "file dialog cancelled by policy");
             0
         }
 
         FileDialogPolicy::Accept { path } => {
             if file_buffer_ptr == 0 || max_file == 0 {
-                state.comm_dlg_extended_error = CDERR_NONE;
+                state.window_state.comm_dlg_extended_error = CDERR_NONE;
                 tracing::warn!(
                     api = api_name,
                     "file dialog accept policy but lpstrFile/nMaxFile invalid"
@@ -175,8 +175,8 @@ fn handle_get_file_name(
                 )
                 .with_context(|| format!("failed to write selected path for {api_name}"))?;
 
-                state.comm_dlg_extended_error = CDERR_NONE;
-                state.last_file_dialog_path = Some(path.clone());
+                state.window_state.comm_dlg_extended_error = CDERR_NONE;
+                state.window_state.last_file_dialog_path = Some(path.clone());
 
                 tracing::info!(api = api_name, %path, unicode, "file dialog accepted");
                 1
