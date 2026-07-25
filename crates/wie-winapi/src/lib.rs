@@ -121,37 +121,50 @@ pub struct FileIoState {
     pub ucrt_next_file_va: u64,
 }
 
-/// DLL loading and export resolution cache.
+/// Thread-safe resolver for dynamic DLL imports.
 ///
-/// Manual Debug impl because `import_resolver` is a closure.
-/// Manual Clone impl because `Box<dyn FnMut + Send>` does not implement Clone.
-pub struct ModuleState {
-    pub loaded_modules: HashMap<String, dll_loader::LoadedModule>,
-    pub import_resolver: Option<Box<dyn FnMut(&str, &str, u64) -> anyhow::Result<u64> + Send>>,
-    pub get_proc_address_cache: std::collections::HashMap<String, GetProcAddressCacheEntry>,
-    pub next_module_handle: u64,
+/// Wraps a closure behind `Arc<Mutex<…>>` so [`ModuleState`] can derive
+/// `Clone` and `Debug` without losing the closure's captured state.
+#[derive(Clone)]
+pub struct ImportResolver {
+    inner: std::sync::Arc<std::sync::Mutex<
+        Box<dyn FnMut(&str, &str, u64) -> anyhow::Result<u64> + Send>,
+    >>,
 }
 
-impl std::fmt::Debug for ModuleState {
+impl std::fmt::Debug for ImportResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ModuleState")
-            .field("loaded_modules", &self.loaded_modules)
-            .field("import_resolver", &"<closure>")
-            .field("get_proc_address_cache", &self.get_proc_address_cache)
-            .field("next_module_handle", &self.next_module_handle)
-            .finish()
+        f.debug_struct("ImportResolver").finish()
     }
 }
 
-impl Clone for ModuleState {
-    fn clone(&self) -> Self {
+impl ImportResolver {
+    pub fn new(
+        f: Box<dyn FnMut(&str, &str, u64) -> anyhow::Result<u64> + Send>,
+    ) -> Self {
         Self {
-            loaded_modules: self.loaded_modules.clone(),
-            import_resolver: None,
-            get_proc_address_cache: self.get_proc_address_cache.clone(),
-            next_module_handle: self.next_module_handle,
+            inner: std::sync::Arc::new(std::sync::Mutex::new(f)),
         }
     }
+
+    pub fn resolve(
+        &mut self,
+        lib: &str,
+        name: &str,
+        slot: u64,
+    ) -> anyhow::Result<u64> {
+        // unwrap: the Mutex is not poisoned in practice (single-threaded use).
+        self.inner.lock().unwrap()(lib, name, slot)
+    }
+}
+
+/// DLL loading and export resolution cache.
+#[derive(Debug, Clone)]
+pub struct ModuleState {
+    pub loaded_modules: HashMap<String, dll_loader::LoadedModule>,
+    pub import_resolver: Option<ImportResolver>,
+    pub get_proc_address_cache: std::collections::HashMap<String, GetProcAddressCacheEntry>,
+    pub next_module_handle: u64,
 }
 
 /// Direct3D 9 rendering state.

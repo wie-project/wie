@@ -155,7 +155,10 @@ pub(crate) fn resolve_or_load_dll(
     // Build a guest-style path from the host path for the module descriptor.
     let guest_path = resolve_windows_dll_path(name, &state.process.main_module_path);
 
-    match crate::dll_loader::load_dll(engine, state, host, &guest_path, resolver) {
+    match crate::dll_loader::load_dll(
+        engine, state, host, &guest_path,
+        &mut |lib, name, slot| resolver.resolve(lib, name, slot),
+    ) {
         Ok(result) => {
             state.module_state.import_resolver = resolver_opt;
             // Recursively load dependencies. If any dependency fails to

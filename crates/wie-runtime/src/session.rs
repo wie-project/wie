@@ -1103,11 +1103,14 @@ impl RuntimeSession {
         // Set the import resolver for dynamic DLL loading.
         {
             let mut soft = soft_apis.clone();
-            winapi_state.module_state.import_resolver = Some(Box::new(move |lib, name, slot| {
-                let (va, _entry) = crate::hooks::resolve_import_fake_va(lib, name, slot, &mut soft)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                Ok(va)
-            }));
+            winapi_state.module_state.import_resolver = Some(wie_winapi::ImportResolver::new(
+                Box::new(move |lib, name, slot| {
+                    let (va, _entry) =
+                        crate::hooks::resolve_import_fake_va(lib, name, slot, &mut soft)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    Ok(va)
+                }),
+            ));
         }
 
         // Store the host directory for DLL search fallback.

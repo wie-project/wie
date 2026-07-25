@@ -2157,51 +2157,62 @@ impl WinApiTraits {
     }
 }
 
+/// Per-API trait flags indexed by [`WinApiId`] discriminant (zero-cost lookup).
+static WINAPI_TRAITS: [WinApiTraits; WINAPI_ID_COUNT] = {
+    let mut t = [WinApiTraits::EMPTY; WINAPI_ID_COUNT];
+
+    // ── CS host-handler requirement (no in-guest / fast-void-sync) ──────
+    t[WinApiId::Kernel32Entercriticalsection as u16 as usize] =
+        WinApiTraits::EMPTY.with_noisy();
+    t[WinApiId::Kernel32Leavecriticalsection as u16 as usize] =
+        WinApiTraits::EMPTY.with_noisy();
+
+    // ── In-guest stubs / guest-accelerated ──────────────────────────────
+    let guest_stub = WinApiTraits::EMPTY.with_noisy().with_guest_stub();
+    t[WinApiId::Kernel32Encodepointer as u16 as usize] = guest_stub;
+    t[WinApiId::Kernel32Decodepointer as u16 as usize] = guest_stub;
+    t[WinApiId::Kernel32Gettickcount as u16 as usize] = guest_stub;
+    t[WinApiId::Kernel32Getcurrentprocessid as u16 as usize] = guest_stub;
+    t[WinApiId::Kernel32Getcurrentthreadid as u16 as usize] = guest_stub;
+    t[WinApiId::Kernel32Sleep as u16 as usize] = guest_stub;
+    t[WinApiId::Kernel32Getacp as u16 as usize] = guest_stub;
+    t[WinApiId::Kernel32Getoemcp as u16 as usize] = guest_stub;
+    t[WinApiId::Kernel32Getsystemdefaultlangid as u16 as usize] = guest_stub;
+    t[WinApiId::Kernel32Getuserdefaultlangid as u16 as usize] = guest_stub;
+    t[WinApiId::Kernel32Getcommandlinea as u16 as usize] = guest_stub;
+    t[WinApiId::Kernel32Getcommandlinew as u16 as usize] = guest_stub;
+    t[WinApiId::Kernel32Getcurrentdirectoryw as u16 as usize] = guest_stub;
+    t[WinApiId::Kernel32Getlasterror as u16 as usize] = guest_stub;
+    t[WinApiId::Kernel32Setlasterror as u16 as usize] = guest_stub;
+    t[WinApiId::Kernel32Flsgetvalue as u16 as usize] = guest_stub;
+    t[WinApiId::Kernel32Flssetvalue as u16 as usize] = guest_stub;
+    t[WinApiId::Kernel32Heapalloc as u16 as usize] = guest_stub;
+    t[WinApiId::Kernel32Heapfree as u16 as usize] = guest_stub;
+    t[WinApiId::Kernel32Readfile as u16 as usize] = guest_stub;
+    t[WinApiId::Kernel32Setfilepointer as u16 as usize] = guest_stub;
+    t[WinApiId::Kernel32Getfilesize as u16 as usize] = guest_stub;
+    t[WinApiId::Kernel32Multibytetowidechar as u16 as usize] = guest_stub;
+    t[WinApiId::User32Getsystemmetrics as u16 as usize] = guest_stub;
+    t[WinApiId::User32Getsyscolor as u16 as usize] = guest_stub;
+    t[WinApiId::User32Getsyscolorbrush as u16 as usize] = guest_stub;
+    t[WinApiId::User32Getdesktopwindow as u16 as usize] = guest_stub;
+
+    // ── Host-only noisy (tracing) ──────────────────────────────────────
+    let noisy = WinApiTraits::EMPTY.with_noisy();
+    t[WinApiId::Kernel32Getfileinformationbyhandle as u16 as usize] = noisy;
+    t[WinApiId::Kernel32Getfiletype as u16 as usize] = noisy;
+    t[WinApiId::Kernel32Getprocaddress as u16 as usize] = noisy;
+    t[WinApiId::Kernel32Heaprealloc as u16 as usize] = noisy;
+    t[WinApiId::Kernel32Heapsize as u16 as usize] = noisy;
+    t[WinApiId::Kernel32Writefile as u16 as usize] = noisy;
+
+    t
+};
+
 impl WinApiId {
+    /// Lookup the trait flags for this API (constant-time array access).
     #[must_use]
-    pub const fn traits(self) -> WinApiTraits {
-        match self {
-            // CS must hit host handlers (owner/recursion). No in-guest VoidRet
-            // and no fast_void_sync — those made Enter/Leave no-ops (MT.1).
-            Self::Kernel32Entercriticalsection | Self::Kernel32Leavecriticalsection => {
-                WinApiTraits::EMPTY.with_noisy()
-            }
-            // In-guest stubs / guest-accelerated (may still hit host fallback VAs).
-            // Only APIs whose guest body matches Microsoft Learn + fixed WIE environment.
-            Self::Kernel32Encodepointer
-            | Self::Kernel32Decodepointer
-            | Self::Kernel32Gettickcount
-            | Self::Kernel32Getcurrentprocessid
-            | Self::Kernel32Getcurrentthreadid
-            | Self::Kernel32Sleep
-            | Self::Kernel32Getacp
-            | Self::Kernel32Getoemcp
-            | Self::Kernel32Getsystemdefaultlangid
-            | Self::Kernel32Getuserdefaultlangid
-            | Self::Kernel32Getcommandlinea
-            | Self::Kernel32Getcommandlinew
-            | Self::Kernel32Getcurrentdirectoryw
-            | Self::Kernel32Getlasterror
-            | Self::Kernel32Setlasterror
-            | Self::Kernel32Flsgetvalue
-            | Self::Kernel32Flssetvalue
-            | Self::Kernel32Heapalloc
-            | Self::Kernel32Heapfree
-            | Self::Kernel32Readfile
-            | Self::Kernel32Setfilepointer
-            | Self::Kernel32Getfilesize
-            | Self::Kernel32Multibytetowidechar
-            | Self::User32Getsystemmetrics
-            | Self::User32Getsyscolor
-            | Self::User32Getsyscolorbrush
-            | Self::User32Getdesktopwindow => WinApiTraits::EMPTY.with_noisy().with_guest_stub(),
-            Self::Kernel32Getfileinformationbyhandle
-            | Self::Kernel32Getfiletype
-            | Self::Kernel32Getprocaddress
-            | Self::Kernel32Heaprealloc
-            | Self::Kernel32Heapsize
-            | Self::Kernel32Writefile => WinApiTraits::EMPTY.with_noisy(),
-            _ => WinApiTraits::EMPTY,
-        }
+    pub fn traits(self) -> WinApiTraits {
+        WINAPI_TRAITS[self as u16 as usize]
     }
 }
