@@ -853,15 +853,17 @@ impl RuntimeSession {
             .install_runtime_hooks(layout.fake_api_base, fake_api_end, stop_bitmap.clone())
             .context("failed to install persistent runtime hooks")?;
 
-        // Selective precompile: only in-guest stubs (GetLastError / CS / …).
-        // Precompiling every fake-API VA (including host-stop passthroughs and
-        // rewire jmps) spikes init peak RAM via Cranelift; hot stubs are cheap
-        // (hand-written trampolines or tiny blocks) and hit early.
+        // Selective precompile: in-guest stubs (GetLastError / CS / …) and the
+        // PE entry point so the first guest block runs compiled instead of iced.
+        // Full .text section precompile is deferred — precompiling every fake-API
+        // VA spikes init peak RAM, and precompiling large sections adds startup
+        // time disproportionate to the interpreted warmup saved.
         for entry in &fake_api_entries {
             if entry.traits.guest_stub() {
                 engine.precompile_at(entry.fake_target_va);
             }
         }
+        engine.precompile_at(image_summary.entry_point_va);
 
         engine
             .mem_map(
@@ -1050,8 +1052,7 @@ impl RuntimeSession {
             module_file_name_w_ptr,
         );
 
-        let executable_file_bytes = std::fs::read(path)
-            .with_context(|| format!("failed to read executable bytes: {}", path.display(),))?;
+        let executable_file_bytes = pe_bytes.clone();
 
         let mut winapi_state = default_winapi_state(&layout, executable_file_bytes, &process)?;
 
