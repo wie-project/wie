@@ -579,6 +579,13 @@ fn search_and_plan(
             break;
         }
     }
+    tracing::warn!(
+        throw_rip,
+        frames = MAX_FRAMES,
+        obj = payload.exception_object,
+        gcc = payload.gcc_throw,
+        "seh: no handler found"
+    );
     Err(anyhow::anyhow!(
         "RaiseException: no handler found (throw_rip={throw_rip:#x}, \
          pExceptionObject={:#x})",
