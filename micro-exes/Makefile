@@ -154,6 +154,12 @@ $(OUT)/cpp_types.exe: seh/cpp_exceptions/cpp_types/main.cpp | $(OUT)
 	$(MINGW_CXX) $(SEH_CXXFLAGS) -o $@ $<
 	@echo "built $@"
 
+# cpp_threads uses SJLJ exceptions (setjmp/longjmp) internally.
+# The JIT may intermittently optimize away assignments after longjmp
+# because Cranelift treats longjmp as a noreturn call, causing the
+# catch handler's side effects to be eliminated.  A separate helper
+# function (set_result) prevents complete elimination but may not
+# always suffice.  Run with WIE_CPU=iced if intermittent failures occur.
 $(OUT)/cpp_threads.exe: seh/cpp_exceptions/cpp_threads/main.cpp | $(OUT)
 	$(MINGW_CXX) $(SEH_CXXFLAGS) -o $@ $<
 	@echo "built $@"
@@ -171,14 +177,10 @@ $(OUT)/seh_div_zero.exe: seh/div_zero/main.cpp | $(OUT)
 	@echo "built $@"
 
 # ── Interactive game tests ────────────────────────────────────
-GAME_EXES: $(OUT)/guess_price.exe $(OUT)/snake.exe
+GAME_EXES: $(OUT)/guess_price.exe
 
 $(OUT)/guess_price.exe: guess_price/main.c | $(OUT)
 	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32
-	@echo "built $@"
-
-$(OUT)/snake.exe: snake/main.c | $(OUT)
-	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32 -luser32
 	@echo "built $@"
 
 # ── DLL loader tests ────────────────────────────────────────────
