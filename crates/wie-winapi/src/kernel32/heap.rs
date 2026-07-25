@@ -1,4 +1,9 @@
-use super::*;
+use super::{
+    Context, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, GlobalAtomRecord, HEAP_SIZE_FAILURE,
+    HEAP_ZERO_MEMORY, Result, WinApiHandlerResult, WinApiState, allocate_fake_heap_block,
+    checked_field_address, read_ansi_string_from_cpu, ret_bool_true, ret_u64, write_guest_u32,
+    write_guest_u64,
+};
 
 pub fn handle_heap_alloc(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -471,7 +476,8 @@ pub fn handle_global_add_atom_a(
             state.process.last_error = ERROR_INVALID_PARAMETER;
             0
         } else if let Some(existing) = state
-            .window_state.global_atoms
+            .window_state
+            .global_atoms
             .iter()
             .find(|record| record.name.eq_ignore_ascii_case(&name))
         {
@@ -481,11 +487,15 @@ pub fn handle_global_add_atom_a(
             let atom = state.window_state.next_global_atom;
 
             state.window_state.next_global_atom = state
-                .window_state.next_global_atom
+                .window_state
+                .next_global_atom
                 .checked_add(1)
                 .context("global atom identifier overflow")?;
 
-            state.window_state.global_atoms.push(GlobalAtomRecord { atom, name });
+            state
+                .window_state
+                .global_atoms
+                .push(GlobalAtomRecord { atom, name });
             state.process.last_error = 0;
 
             u64::from(atom)
@@ -512,10 +522,17 @@ pub fn handle_global_delete_atom(
     let atom_low = atom_raw & u64::from(u16::MAX);
     let atom = u16::try_from(atom_low).context("GlobalDeleteAtom identifier does not fit u16")?;
 
-    let existed = state.window_state.global_atoms.iter().any(|record| record.atom == atom);
+    let existed = state
+        .window_state
+        .global_atoms
+        .iter()
+        .any(|record| record.atom == atom);
 
     if existed {
-        state.window_state.global_atoms.retain(|record| record.atom != atom);
+        state
+            .window_state
+            .global_atoms
+            .retain(|record| record.atom != atom);
 
         state.process.last_error = 0;
     } else {

@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    Context, Result, WinApiHandlerResult, WinApiState, checked_field_address, read_guest_bytes,
+    write_guest_bytes, write_guest_i32,
+};
 
 pub fn handle_get_async_key_state(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -11,7 +14,12 @@ pub fn handle_get_async_key_state(
     let virtual_key = usize::try_from(virtual_key_raw & 0xff).unwrap_or(0);
 
     // Bit 15: key is currently down.  Bit 0: key was pressed since last call.
-    let key_state = state.window_state.keyboard_state.get(virtual_key).copied().unwrap_or(0);
+    let key_state = state
+        .window_state
+        .keyboard_state
+        .get(virtual_key)
+        .copied()
+        .unwrap_or(0);
     let mut result = u64::from(key_state & 0x80);
     if result != 0 {
         result |= 1; // most-significant bit set → key down
@@ -148,8 +156,12 @@ pub fn handle_set_keyboard_state(
     let success = keyboard_state_ptr != 0;
 
     if success {
-        read_guest_bytes(engine, keyboard_state_ptr, &mut state.window_state.keyboard_state)
-            .context("failed to read SetKeyboardState buffer")?;
+        read_guest_bytes(
+            engine,
+            keyboard_state_ptr,
+            &mut state.window_state.keyboard_state,
+        )
+        .context("failed to read SetKeyboardState buffer")?;
     }
 
     let return_value = u64::from(success);
@@ -174,8 +186,12 @@ pub fn handle_get_keyboard_state(
     let success = keyboard_state_ptr != 0;
 
     if success {
-        write_guest_bytes(engine, keyboard_state_ptr, &state.window_state.keyboard_state)
-            .context("failed to write GetKeyboardState buffer")?;
+        write_guest_bytes(
+            engine,
+            keyboard_state_ptr,
+            &state.window_state.keyboard_state,
+        )
+        .context("failed to write GetKeyboardState buffer")?;
     }
 
     let return_value = u64::from(success);
@@ -200,7 +216,12 @@ pub fn handle_get_key_state(
     let virtual_key = usize::try_from(virtual_key_raw & 0xff)
         .context("GetKeyState virtual key does not fit usize")?;
 
-    let key_state = state.window_state.keyboard_state.get(virtual_key).copied().unwrap_or(0);
+    let key_state = state
+        .window_state
+        .keyboard_state
+        .get(virtual_key)
+        .copied()
+        .unwrap_or(0);
 
     // WinAPI uses the high bit of SHORT to indicate a pressed key.
     let return_value = if (key_state & 0x80) != 0 {

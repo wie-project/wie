@@ -1,4 +1,11 @@
-use super::*;
+use super::{
+    CREATE_SUSPENDED, Context, DEFAULT_MT_MAX_THREADS, DEFAULT_WORKER_STACK, ERROR_INVALID_HANDLE,
+    ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_SUPPORTED_MT,
+    FAKE_CURRENT_PROCESS_ID, FIXED_SYSTEM_FILETIME, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE,
+    Result, THREAD_ENTRY_HOME_AND_RET, WORKER_STACK_REGION_BASE, WORKER_STACK_STRIDE,
+    WinApiHandlerResult, WinApiState, checked_address, checked_field_address,
+    read_create_file_stack_u32, read_guest_u64, write_guest_u16, write_guest_u32, write_guest_u64,
+};
 
 pub fn handle_get_startup_info_a(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -110,7 +117,10 @@ pub fn handle_get_current_process(
         return_value,
     })
 }
-pub(crate) fn ret_bool_true(engine: &mut dyn wie_cpu::CpuEngine, api: &str) -> Result<WinApiHandlerResult> {
+pub(crate) fn ret_bool_true(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    api: &str,
+) -> Result<WinApiHandlerResult> {
     let return_address = engine
         .return_from_win64_api(1)
         .with_context(|| format!("failed to return from {api}"))?;
@@ -223,10 +233,15 @@ pub fn handle_open_thread(
     let tid = engine.read_r8()?;
     let tid_u32 = u32::try_from(tid & 0xffff_ffff).unwrap_or(u32::MAX);
     // Look for an existing thread object with this TID.
-    let found = state.kernel.sync.objects.values().find_map(|obj| match obj {
-        crate::KernelObject::Thread(t) if t.tid == tid_u32 => Some(t.handle),
-        _ => None,
-    });
+    let found = state
+        .kernel
+        .sync
+        .objects
+        .values()
+        .find_map(|obj| match obj {
+            crate::KernelObject::Thread(t) if t.tid == tid_u32 => Some(t.handle),
+            _ => None,
+        });
     if let Some(handle) = found {
         state.process.last_error = 0;
         let return_address = engine.return_from_win64_api(handle)?;
@@ -237,7 +252,8 @@ pub fn handle_open_thread(
     }
     // Thread not found — create a fresh thread object.
     let (handle, _) = state
-        .kernel.sync
+        .kernel
+        .sync
         .register_thread(tid_u32, wie_cpu::ThreadContext::default());
     state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(handle)?;
@@ -333,10 +349,15 @@ pub fn handle_suspend_thread(
 ) -> Result<WinApiHandlerResult> {
     let handle = engine.read_rcx()?;
     // Find the thread TID from the handle.
-    let tid = state.kernel.sync.objects.values().find_map(|obj| match obj {
-        crate::KernelObject::Thread(t) if t.handle == handle => Some(t.tid),
-        _ => None,
-    });
+    let tid = state
+        .kernel
+        .sync
+        .objects
+        .values()
+        .find_map(|obj| match obj {
+            crate::KernelObject::Thread(t) if t.handle == handle => Some(t.tid),
+            _ => None,
+        });
     let Some(tid) = tid else {
         state.process.last_error = ERROR_INVALID_HANDLE;
         let return_address = engine.return_from_win64_api(u64::MAX)?; // THREAD_PRIORITY_ERROR_RETURN
@@ -345,8 +366,16 @@ pub fn handle_suspend_thread(
             return_value: u64::MAX,
         });
     };
-    let prev = state.process.suspended_threads.get(&tid).copied().unwrap_or(0);
-    state.process.suspended_threads.insert(tid, prev.saturating_add(1));
+    let prev = state
+        .process
+        .suspended_threads
+        .get(&tid)
+        .copied()
+        .unwrap_or(0);
+    state
+        .process
+        .suspended_threads
+        .insert(tid, prev.saturating_add(1));
     state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(u64::from(prev))?;
     Ok(WinApiHandlerResult {
@@ -416,7 +445,8 @@ pub fn create_guest_thread(
 
     // Cap workers: by_tid includes primary; count pending + suspended too.
     let live_workers = state
-        .kernel.threads
+        .kernel
+        .threads
         .by_tid
         .len()
         .saturating_sub(1)
@@ -607,7 +637,9 @@ pub(crate) fn handle_get_thread_priority(
         return_value: 0,
     })
 }
-pub(crate) fn handle_get_current_thread(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub(crate) fn handle_get_current_thread(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
     // CURRENT_THREAD_PSEUDO_HANDLE = (HANDLE)-2
     let return_value = u64::MAX - 1;
     let return_address = engine.return_from_win64_api(return_value)?;

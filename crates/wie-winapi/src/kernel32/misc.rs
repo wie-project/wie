@@ -1,4 +1,11 @@
-use super::*;
+use super::{
+    Context, ERROR_INVALID_PARAMETER, FIXED_PERFORMANCE_COUNTER, FIXED_PERFORMANCE_FREQUENCY,
+    FIXED_TICK_COUNT, FLS_OUT_OF_INDEXES, FlsSlot, GUEST_OS_BUILD, GUEST_OS_MAJOR, GUEST_OS_MINOR,
+    GUEST_OS_PLATFORM_NT, LANG_EN_US, OnceLock, Result, TIME_ZONE_ID_INVALID, TIME_ZONE_ID_UNKNOWN,
+    WinApiHandlerResult, WinApiState, checked_field_address, low_u32, low_u32_to_i32,
+    read_guest_ansi_lossy, read_guest_utf16_lossy, ret_bool_true, ret_u64, write_guest_u16,
+    write_guest_u32, write_guest_u64, write_mock_string_a, write_mock_string_w,
+};
 
 pub(crate) fn packed_get_version() -> u64 {
     // Low byte major, next minor, high word build; bit 31 set ⇒ Windows NT family.
@@ -170,7 +177,10 @@ pub fn handle_fls_free(
 
     let index = u32::try_from(index_raw).context("FlsFree index does not fit u32")?;
 
-    state.heap_state.fls_slots.retain(|slot| slot.index != index);
+    state
+        .heap_state
+        .fls_slots
+        .retain(|slot| slot.index != index);
     publish_fls_slot(engine, state, index, 0);
 
     let return_address = engine
@@ -196,7 +206,12 @@ pub fn handle_fls_set_value(
 
     let index = u32::try_from(index_raw).context("FlsSetValue index does not fit u32")?;
 
-    if let Some(slot) = state.heap_state.fls_slots.iter_mut().find(|slot| slot.index == index) {
+    if let Some(slot) = state
+        .heap_state
+        .fls_slots
+        .iter_mut()
+        .find(|slot| slot.index == index)
+    {
         slot.value = value;
     } else {
         state.heap_state.fls_slots.push(FlsSlot { index, value });
@@ -1064,7 +1079,8 @@ pub(crate) fn handle_tls_get_value(
     }
     state.kernel.threads.grow_active_tls_to_process_count();
     let value = state
-        .kernel.threads
+        .kernel
+        .threads
         .active
         .tls_values
         .get(idx)

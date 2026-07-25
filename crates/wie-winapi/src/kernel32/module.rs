@@ -1,4 +1,12 @@
-use super::*;
+use super::{
+    Context, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_HANDLE, ERROR_MOD_NOT_FOUND,
+    ERROR_PROC_NOT_FOUND, FAKE_ADVAPI32_MODULE, FAKE_COMCTL32_MODULE, FAKE_COMDLG32_MODULE,
+    FAKE_GDI32_MODULE, FAKE_KERNEL32_MODULE, FAKE_SHELL32_MODULE, FAKE_USER32_MODULE,
+    FAKE_WINMM_MODULE, Result, WinApiHandlerResult, WinApiState, copy_path_a_to_guest_buffer,
+    copy_path_w_to_guest_buffer, create_fake_resource_record, dll_loader, find_resource_by_handle,
+    guest_basename, paths_match_guest, read_ansi_string_from_cpu, read_guest_ansi_lossy,
+    read_guest_utf16_lossy, read_wide_string_from_cpu,
+};
 
 pub fn handle_get_module_handle_a(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -85,7 +93,11 @@ pub(crate) fn is_main_module_path(state: &WinApiState, path: &str) -> bool {
     paths_match_guest(path, &state.process.main_module_path)
         || guest_basename(path).eq_ignore_ascii_case(&state.process.main_module_file_name)
 }
-pub(crate) fn resolve_loaded_module_handle(name: &str, main_image_base: u64, state: &WinApiState) -> u64 {
+pub(crate) fn resolve_loaded_module_handle(
+    name: &str,
+    main_image_base: u64,
+    state: &WinApiState,
+) -> u64 {
     if is_main_module_name(state, name) {
         return main_image_base;
     }
@@ -155,10 +167,9 @@ pub(crate) fn resolve_or_load_dll(
     // Build a guest-style path from the host path for the module descriptor.
     let guest_path = resolve_windows_dll_path(name, &state.process.main_module_path);
 
-    match crate::dll_loader::load_dll(
-        engine, state, host, &guest_path,
-        &mut |lib, name, slot| resolver.resolve(lib, name, slot),
-    ) {
+    match crate::dll_loader::load_dll(engine, state, host, &guest_path, &mut |lib, name, slot| {
+        resolver.resolve(lib, name, slot)
+    }) {
         Ok(result) => {
             state.module_state.import_resolver = resolver_opt;
             // Recursively load dependencies. If any dependency fails to
@@ -338,7 +349,8 @@ pub fn handle_free_library(
     } else if module_handle >= dll_loader::REAL_MODULE_HANDLE_BASE {
         // Real loaded module — decrement refcount.
         let Some(name) = state
-            .module_state.loaded_modules
+            .module_state
+            .loaded_modules
             .iter()
             .find(|(_, m)| m.handle == module_handle)
             .map(|(n, _)| n.clone())
@@ -364,7 +376,8 @@ pub fn handle_free_library(
                 );
                 // Evict GetProcAddress cache entries for this module.
                 state
-                    .module_state.get_proc_address_cache
+                    .module_state
+                    .get_proc_address_cache
                     .retain(|_, entry| entry.module_handle != module_handle);
                 state.module_state.loaded_modules.remove(&name);
             }
@@ -426,7 +439,8 @@ pub fn handle_get_proc_address(
     // For real loaded module handles, search the export table.
     if module_handle >= dll_loader::REAL_MODULE_HANDLE_BASE {
         if let Some(module) = state
-            .module_state.loaded_modules
+            .module_state
+            .loaded_modules
             .values()
             .find(|m| m.handle == module_handle)
         {

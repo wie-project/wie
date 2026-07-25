@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::thread::JoinHandle;
 use wie_cpu::{CpuEngine, GuestMemory, IcedCpu, JitCpu};
 use wie_winapi::kernel32::{resolve_cs_queue, resolve_wait_target};
-use wie_winapi::{HostParkReason, PendingSpawn, WinApiControlSignal, WinApiState};
+use wie_winapi::{HandlerContext, HostParkReason, PendingSpawn, WinApiControlSignal, WinApiState};
 
 // ── Lock helpers ───────────────────────────────────────────────────────
 
@@ -324,16 +324,11 @@ fn worker_main(
                 return;
             }
 
+            let mut ctx = HandlerContext::new(&mut *engine, config.environment, &mut st);
             let dispatch = if let Some(id) = resolved.winapi_id {
-                wie_winapi::dispatch_winapi_id(&mut *engine, config.environment, &mut st, id)
+                wie_winapi::dispatch_winapi_id(&mut ctx, id)
             } else {
-                wie_winapi::dispatch_winapi(
-                    &mut *engine,
-                    config.environment,
-                    &mut st,
-                    &resolved.library,
-                    &resolved.name,
-                )
+                wie_winapi::dispatch_winapi(&mut ctx, &resolved.library, &resolved.name)
             };
 
             match dispatch {
@@ -410,7 +405,8 @@ fn handle_park(
 
 fn finish_tid(st: &WinApiState, tid: u32, code: u32) {
     let thread = st
-        .kernel.sync
+        .kernel
+        .sync
         .objects
         .values()
         .find(|obj| matches!(obj, wie_winapi::KernelObject::Thread(t) if t.tid == tid));

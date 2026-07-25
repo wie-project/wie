@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    Context, FAKE_DEVICE_CONTEXT_HANDLE, Result, WinApiHandlerResult, WinApiState,
+    checked_field_address, write_guest_i32, write_guest_u32, write_guest_u64,
+};
 
 pub fn handle_get_dc(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _window_handle = engine.read_rcx().context("failed to read RCX for GetDC")?;

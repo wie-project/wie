@@ -1,4 +1,3 @@
-use crate::dll_loader;
 pub(crate) use crate::guest_memory::{
     checked_address, checked_field_address, read_u16 as read_guest_u16, read_u64 as read_guest_u64,
     write_u16 as write_guest_u16, write_u32 as write_guest_u32, write_u64 as write_guest_u64,
@@ -7,7 +6,10 @@ pub(crate) use crate::guest_string::{
     read_ansi_lossy as read_guest_ansi_lossy, read_utf16_lossy as read_guest_utf16_lossy,
     write_utf16_units as write_guest_utf16_units,
 };
-pub(crate) use crate::{FindHandle, FlsSlot, GlobalAtomRecord, OpenGuestFile, ResourceRecord, WinApiState};
+pub(crate) use crate::{
+    FindHandle, FlsSlot, GlobalAtomRecord, OpenGuestFile, ResourceRecord, WinApiState,
+};
+use crate::{HandlerContext, dll_loader};
 pub(crate) use anyhow::{Context, Result};
 pub(crate) use std::path::Path;
 pub(crate) use std::sync::OnceLock;
@@ -28,7 +30,6 @@ const FAKE_STDERR_HANDLE: u64 = 0x0000_0000_6000_0003;
 
 /// Host console write for `WriteFile` on stdout/stderr (Microsoft Learn: valid on console handles).
 #[cfg(unix)]
-
 #[cfg(not(unix))]
 pub(crate) fn write_host_console_handle(handle: u64, bytes: &[u8]) {
     use std::io::Write;
@@ -373,12 +374,14 @@ pub(crate) fn file_attributes_for_path(state: &WinApiState, path: &str) -> u64 {
     }
 
     let mounts_ref: Vec<(String, std::path::PathBuf)> = state
-        .file_io.host_file_mounts
+        .file_io
+        .host_file_mounts
         .iter()
         .map(|m| (m.guest_path.clone(), m.host_path.clone()))
         .collect();
     let virtuals_ref: Vec<(String, usize)> = state
-        .file_io.virtual_files
+        .file_io
+        .virtual_files
         .iter()
         .map(|v| (v.guest_path.clone(), v.bytes.len()))
         .collect();
@@ -406,14 +409,19 @@ pub(crate) fn file_attributes_for_path(state: &WinApiState, path: &str) -> u64 {
 }
 
 /// Collect dir entries for a Find pattern (dir + mask).
-pub(crate) fn collect_find_entries(state: &WinApiState, full_pattern: &str) -> Vec<crate::vfs::DirEntry> {
+pub(crate) fn collect_find_entries(
+    state: &WinApiState,
+    full_pattern: &str,
+) -> Vec<crate::vfs::DirEntry> {
     let mounts_ref: Vec<(String, std::path::PathBuf)> = state
-        .file_io.host_file_mounts
+        .file_io
+        .host_file_mounts
         .iter()
         .map(|m| (m.guest_path.clone(), m.host_path.clone()))
         .collect();
     let virtuals_ref: Vec<(String, usize)> = state
-        .file_io.virtual_files
+        .file_io
+        .virtual_files
         .iter()
         .map(|v| (v.guest_path.clone(), v.bytes.len()))
         .collect();
@@ -556,11 +564,13 @@ pub(crate) fn create_fake_resource_record(
 ) -> Result<ResourceRecord> {
     let handle = state.file_io.next_resource_handle;
     state.file_io.next_resource_handle = state
-        .file_io.next_resource_handle
+        .file_io
+        .next_resource_handle
         .checked_add(1)
         .context("resource handle overflow")?;
 
-    let index = u64::try_from(state.file_io.resources.len()).context("resource index does not fit u64")?;
+    let index =
+        u64::try_from(state.file_io.resources.len()).context("resource index does not fit u64")?;
     let data_offset = index
         .checked_mul(0x100)
         .context("resource data offset overflow")?;
@@ -591,7 +601,8 @@ pub(crate) fn create_fake_resource_record(
 
 pub(crate) fn find_resource_by_handle(state: &WinApiState, handle: u64) -> Option<&ResourceRecord> {
     state
-        .file_io.resources
+        .file_io
+        .resources
         .iter()
         .find(|resource| resource.handle == handle || resource.loaded_handle == handle)
 }
@@ -779,7 +790,8 @@ pub(crate) fn finish_find_first(
 
     let handle = state.file_io.next_find_handle;
     state.file_io.next_find_handle = state
-        .file_io.next_find_handle
+        .file_io
+        .next_find_handle
         .checked_add(1)
         .context("find handle overflow")?;
 
@@ -804,7 +816,8 @@ pub(crate) fn finish_find_next(
     unicode: bool,
 ) -> Result<u64> {
     let Some(slot) = state
-        .file_io.find_handles
+        .file_io
+        .find_handles
         .iter_mut()
         .find(|h| h.handle == find_handle)
     else {
@@ -1017,7 +1030,8 @@ pub(crate) fn sync_open_bytes_to_virtual(state: &mut WinApiState, path: &str, ha
         return;
     }
     if state
-        .file_io.host_file_mounts
+        .file_io
+        .host_file_mounts
         .iter()
         .any(|mount| paths_match_guest(path, &mount.guest_path))
     {
@@ -1027,7 +1041,8 @@ pub(crate) fn sync_open_bytes_to_virtual(state: &mut WinApiState, path: &str, ha
     let bytes = open_file.bytes.clone();
 
     if let Some(virtual_file) = state
-        .file_io.virtual_files
+        .file_io
+        .virtual_files
         .iter_mut()
         .find(|entry| paths_match_guest(path, &entry.guest_path))
     {
@@ -1147,7 +1162,6 @@ const LOGICAL_DRIVE_TCHARS: u32 = 4;
 /// `HANDLE OpenFileMappingW` — not found.
 
 /// Extra KERNEL32 exports used by CRT / modern PE (not yet in dense WinApiId table).
-
 pub mod console;
 pub mod file_io;
 pub mod heap;
@@ -1169,11 +1183,12 @@ pub use string::*;
 pub use sync::*;
 
 pub fn dispatch_kernel32_extra(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    environment: crate::WinApiEnvironment,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let environment = ctx.environment;
     let n = name.to_ascii_lowercase();
     match n.as_str() {
         "virtualalloc" => Ok(Some(handle_virtual_alloc(engine, state)?)),
@@ -1313,12 +1328,14 @@ pub fn dispatch_kernel32_extra(
 /// Stat a guest path using the VFS, building the resolve context from state.
 pub(crate) fn stat_guest_path(state: &WinApiState, full_path: &str) -> crate::vfs::PathStat {
     let mounts_ref: Vec<(String, std::path::PathBuf)> = state
-        .file_io.host_file_mounts
+        .file_io
+        .host_file_mounts
         .iter()
         .map(|m| (m.guest_path.clone(), m.host_path.clone()))
         .collect();
     let virtuals_ref: Vec<(String, usize)> = state
-        .file_io.virtual_files
+        .file_io
+        .virtual_files
         .iter()
         .map(|v| (v.guest_path.clone(), v.bytes.len()))
         .collect();
@@ -1708,7 +1725,8 @@ pub(crate) fn finish_delete_file(state: &mut WinApiState, path: &str) -> u64 {
     let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full = resolve_full_windows_path(&cwd, path);
     state
-        .file_io.virtual_files
+        .file_io
+        .virtual_files
         .retain(|v| !paths_match_guest(&full, &v.guest_path));
     if let Some(map) = crate::vfs::guest_path_to_host(&state.file_io.volumes, &full) {
         if crate::vfs::remove_file_host(&map.host).is_ok() {

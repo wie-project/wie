@@ -111,13 +111,17 @@ pub fn handle_image_list_create(
         .context("failed to read R9 for ImageList_Create")?;
 
     if let Some((_, count)) = state
-        .window_state.image_list_counts
+        .window_state
+        .image_list_counts
         .iter_mut()
         .find(|(handle, _)| *handle == FAKE_IMAGE_LIST_HANDLE)
     {
         *count = 0;
     } else {
-        state.window_state.image_list_counts.push((FAKE_IMAGE_LIST_HANDLE, 0));
+        state
+            .window_state
+            .image_list_counts
+            .push((FAKE_IMAGE_LIST_HANDLE, 0));
     }
 
     let return_address = engine
@@ -149,7 +153,8 @@ pub fn handle_image_list_add_masked(
 
     let return_value = if image_list_handle == FAKE_IMAGE_LIST_HANDLE && bitmap_handle != 0 {
         let count = state
-            .window_state.image_list_counts
+            .window_state
+            .image_list_counts
             .iter_mut()
             .find(|(handle, _)| *handle == image_list_handle)
             .map(|(_, count)| count)
@@ -193,13 +198,15 @@ pub fn handle_image_list_set_bk_color(
         .context("ImageList_SetBkColor color does not fit u32")?;
 
     let image_list_exists = state
-        .window_state.image_list_counts
+        .window_state
+        .image_list_counts
         .iter()
         .any(|(handle, _)| *handle == image_list_handle);
 
     let return_value = if image_list_exists {
         if let Some((_, stored_color)) = state
-            .window_state.image_list_background_colors
+            .window_state
+            .image_list_background_colors
             .iter_mut()
             .find(|(handle, _)| *handle == image_list_handle)
         {
@@ -208,7 +215,8 @@ pub fn handle_image_list_set_bk_color(
             u64::from(previous_color)
         } else {
             state
-                .window_state.image_list_background_colors
+                .window_state
+                .image_list_background_colors
                 .push((image_list_handle, background_color));
 
             u64::from(CLR_NONE)
@@ -237,17 +245,20 @@ pub fn handle_image_list_destroy(
         .context("failed to read RCX for ImageList_Destroy")?;
 
     let existed = state
-        .window_state.image_list_counts
+        .window_state
+        .image_list_counts
         .iter()
         .any(|(handle, _)| *handle == image_list_handle);
 
     if existed {
         state
-            .window_state.image_list_counts
+            .window_state
+            .image_list_counts
             .retain(|(handle, _)| *handle != image_list_handle);
 
         state
-            .window_state.image_list_background_colors
+            .window_state
+            .image_list_background_colors
             .retain(|(handle, _)| *handle != image_list_handle);
     }
 

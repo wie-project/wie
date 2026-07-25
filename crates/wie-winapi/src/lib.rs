@@ -953,39 +953,48 @@ mod tests {
     fn test_interlocked_ops_host_atomics() {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
-        let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
         let cell = 0x4000_u64;
         // Zero cell.
-        ctx.engine
-            .mem_write(cell, &0_i32.to_le_bytes())
-            .expect("zero");
+        engine.mem_write(cell, &0_i32.to_le_bytes()).expect("zero");
 
         // Increment → 1
         write_regs(&mut engine, cell, 0, 0, 0, 0);
-        let r = kernel32::dispatch_kernel32_extra(ctx, "InterlockedIncrement")
-            .expect("dispatch")
-            .expect("handled");
+        let r = {
+            let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
+            kernel32::dispatch_kernel32_extra(&mut ctx, "InterlockedIncrement")
+        }
+        .expect("dispatch")
+        .expect("handled");
         assert_eq!(rax_low_i32(r.return_value), 1);
 
         // ExchangeAdd(+5) returns previous 1, cell becomes 6
         write_regs(&mut engine, cell, 5, 0, 0, 0);
-        let r = kernel32::dispatch_kernel32_extra(ctx, "InterlockedExchangeAdd")
-            .expect("dispatch")
-            .expect("handled");
+        let r = {
+            let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
+            kernel32::dispatch_kernel32_extra(&mut ctx, "InterlockedExchangeAdd")
+        }
+        .expect("dispatch")
+        .expect("handled");
         assert_eq!(rax_low_i32(r.return_value), 1);
 
         // CompareExchange success 6→99
         write_regs(&mut engine, cell, 99, 6, 0, 0);
-        let r = kernel32::dispatch_kernel32_extra(ctx, "InterlockedCompareExchange")
-            .expect("dispatch")
-            .expect("handled");
+        let r = {
+            let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
+            kernel32::dispatch_kernel32_extra(&mut ctx, "InterlockedCompareExchange")
+        }
+        .expect("dispatch")
+        .expect("handled");
         assert_eq!(rax_low_i32(r.return_value), 6);
 
         // CompareExchange fail (expect 6, still 99)
         write_regs(&mut engine, cell, 1, 6, 0, 0);
-        let r = kernel32::dispatch_kernel32_extra(ctx, "InterlockedCompareExchange")
-            .expect("dispatch")
-            .expect("handled");
+        let r = {
+            let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
+            kernel32::dispatch_kernel32_extra(&mut ctx, "InterlockedCompareExchange")
+        }
+        .expect("dispatch")
+        .expect("handled");
         assert_eq!(rax_low_i32(r.return_value), 99);
 
         let mut bytes = [0_u8; 4];
@@ -998,9 +1007,12 @@ mod tests {
             .mem_write(cell64, &10_i64.to_le_bytes())
             .expect("zero64");
         write_regs(&mut engine, cell64, 0, 0, 0, 0);
-        let r = kernel32::dispatch_kernel32_extra(ctx, "InterlockedIncrement64")
-            .expect("dispatch")
-            .expect("handled");
+        let r = {
+            let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
+            kernel32::dispatch_kernel32_extra(&mut ctx, "InterlockedIncrement64")
+        }
+        .expect("dispatch")
+        .expect("handled");
         assert_eq!(i64::from_le_bytes(r.return_value.to_le_bytes()), 11);
     }
 
@@ -1420,9 +1432,12 @@ mod tests {
         engine.mem_write(num_args_ptr, &[0_u8; 4]).ok();
         // Call handler directly.
         write_regs(&mut engine, cmd_ptr, num_args_ptr, 0, 0, STACK_TOP);
-        let result = shell32::dispatch_shell32(&mut engine, &mut state, "CommandLineToArgvW")
-            .expect("dispatch failed")
-            .expect("handler not found");
+        let result = {
+            let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
+            shell32::dispatch_shell32(&mut ctx, "CommandLineToArgvW")
+        }
+        .expect("dispatch failed")
+        .expect("handler not found");
         assert!(result.return_value != 0, "return_value is 0");
         let mut argc_buf = [0_u8; 4];
         engine.mem_read(num_args_ptr, &mut argc_buf).ok();
@@ -1449,9 +1464,12 @@ mod tests {
             .mem_write(prhs.wrapping_add(8), &20_u64.to_le_bytes())
             .ok();
         write_regs(&mut engine, presult, plhs, prhs, 0, STACK_TOP);
-        let r = oleaut32::dispatch_oleaut32(&mut engine, &mut state, "VarAdd")
-            .expect("dispatch")
-            .expect("handled");
+        let r = {
+            let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
+            oleaut32::dispatch_oleaut32(&mut ctx, "VarAdd")
+        }
+        .expect("dispatch")
+        .expect("handled");
         assert_eq!(r.return_value, 0); // S_OK
         let mut result_vt = [0_u8; 2];
         engine.mem_read(presult, &mut result_vt).ok();
@@ -1470,9 +1488,12 @@ mod tests {
         let presult = 0x3000;
         // VarBstrFromI4(42, 0, 0, &result)
         write_regs(&mut engine, presult, 42, 0, 0, STACK_TOP);
-        let r = oleaut32::dispatch_oleaut32(&mut engine, &mut state, "VarBstrFromI4")
-            .expect("dispatch")
-            .expect("handled");
+        let r = {
+            let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
+            oleaut32::dispatch_oleaut32(&mut ctx, "VarBstrFromI4")
+        }
+        .expect("dispatch")
+        .expect("handled");
         assert_eq!(r.return_value, 0); // S_OK
         let mut vt = [0_u8; 2];
         engine.mem_read(presult, &mut vt).ok();
@@ -1503,9 +1524,12 @@ mod tests {
         engine.mem_write(name_len_ptr, &name_len.to_le_bytes()).ok();
         // RegEnumKeyExW(hKey=0x100, dwIndex=0, lpName=name_buf, lpcchName=name_len_ptr, ...)
         write_regs(&mut engine, 0x100, 0, name_buf, name_len_ptr, STACK_TOP);
-        let r = advapi32::dispatch_advapi32_extra(&mut engine, &mut state, "RegEnumKeyExW")
-            .expect("dispatch")
-            .expect("handled");
+        let r = {
+            let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
+            advapi32::dispatch_advapi32_extra(&mut ctx, "RegEnumKeyExW")
+        }
+        .expect("dispatch")
+        .expect("handled");
         assert_eq!(r.return_value, 0); // ERROR_SUCCESS
         let mut len_out = [0_u8; 4];
         engine.mem_read(name_len_ptr, &mut len_out).ok();
@@ -1517,9 +1541,12 @@ mod tests {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
         write_regs(&mut engine, 0x100, 0, 0x4000, 0x5000, STACK_TOP);
-        let r = advapi32::dispatch_advapi32_extra(&mut engine, &mut state, "RegEnumValueW")
-            .expect("dispatch")
-            .expect("handled");
+        let r = {
+            let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
+            advapi32::dispatch_advapi32_extra(&mut ctx, "RegEnumValueW")
+        }
+        .expect("dispatch")
+        .expect("handled");
         assert_eq!(r.return_value, 259); // ERROR_NO_MORE_ITEMS
     }
 

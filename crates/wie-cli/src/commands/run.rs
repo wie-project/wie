@@ -11,7 +11,9 @@ use std::path::Path;
 fn is_interactive_stdin(path: &Path) -> bool {
     // `/dev/stdin`, `/dev/tty`, or `-` are the common interactive markers.
     let s = path.to_string_lossy();
-    s == "/dev/stdin" || s == "/dev/tty" || s == "-"
+    s == "/dev/stdin"
+        || s == "/dev/tty"
+        || s == "-"
         || path.file_name().map_or(false, |n| n == "stdin")
 }
 /// Runs a freestanding / micro PE until `ExitProcess` and checks the exit code.

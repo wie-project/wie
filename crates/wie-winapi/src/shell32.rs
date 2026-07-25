@@ -2,7 +2,7 @@
 
 use crate::guest_memory::write_u32 as write_guest_u32;
 use crate::guest_string::write_utf16_c_string;
-use crate::{WinApiHandlerResult, WinApiState};
+use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 use anyhow::{Context, Result};
 
 /// `S_OK` / success for SH* path APIs that return HRESULT.
@@ -22,10 +22,11 @@ fn ret(engine: &mut dyn wie_cpu::CpuEngine, value: u64) -> Result<WinApiHandlerR
 
 /// Soft dispatch for `shell32.dll`.
 pub fn dispatch_shell32(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let n = name.to_ascii_lowercase();
     match n.as_str() {
         "shgetfolderpathw" => Ok(Some(handle_sh_get_folder_path_w(engine)?)),

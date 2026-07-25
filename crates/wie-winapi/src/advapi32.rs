@@ -5,7 +5,7 @@ use crate::guest_memory::{
 use crate::guest_string::{
     read_ansi_lossy as read_guest_ansi_lossy, read_utf16_lossy as read_guest_utf16_lossy,
 };
-use crate::{RegistryKey, WinApiHandlerResult, WinApiState};
+use crate::{HandlerContext, RegistryKey, WinApiHandlerResult, WinApiState};
 use anyhow::{Context, Result};
 
 const ERROR_SUCCESS: u64 = 0;
@@ -151,10 +151,11 @@ pub fn handle_reg_create_key_ex_w(
 
 /// Soft-dispatch path for ADVAPI32 exports not yet in the dense `WinApiId` table.
 pub fn dispatch_advapi32_extra(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let n = name.to_ascii_lowercase();
     match n.as_str() {
         "regopenkeyexw" => Ok(Some(handle_reg_open_key_ex_w(engine, state)?)),
@@ -433,7 +434,8 @@ fn handle_reg_enum_key_ex(
 
     // Gather all subkeys whose parent == hkey.
     let subkeys: Vec<&String> = state
-        .process.registry_keys
+        .process
+        .registry_keys
         .iter()
         .filter(|k| k.parent == hkey)
         .map(|k| &k.subkey)
@@ -485,7 +487,8 @@ fn open_or_create_registry_key(
     subkey: String,
 ) -> Result<(u64, u32)> {
     if let Some(existing) = state
-        .process.registry_keys
+        .process
+        .registry_keys
         .iter()
         .find(|key| key.parent == parent && key.subkey == subkey)
     {
@@ -494,7 +497,8 @@ fn open_or_create_registry_key(
 
     let handle = state.process.next_registry_key_handle;
     state.process.next_registry_key_handle = state
-        .process.next_registry_key_handle
+        .process
+        .next_registry_key_handle
         .checked_add(1)
         .context("registry key handle overflow")?;
 

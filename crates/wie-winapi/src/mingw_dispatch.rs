@@ -4,16 +4,14 @@
 //! patched to fake VAs and dispatched here.  Simple stubs suffice for
 //! most functions since WIE manages the runtime environment directly.
 
-use crate::{WinApiHandlerResult, WinApiState};
+use crate::{HandlerContext, WinApiHandlerResult};
 use anyhow::{Context, Result};
 
 /// Dispatch `libwinpthread-1.dll` exports.  All functions return 0 (success).
-pub fn dispatch_pthread(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    name: &str,
-) -> Result<WinApiHandlerResult> {
+pub fn dispatch_pthread(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiHandlerResult> {
     let _ = name; // unused — all pthread stubs return success
-    let return_address = engine
+    let return_address = ctx
+        .engine
         .return_from_win64_api(0)
         .context("failed to return from pthread function")?;
     Ok(WinApiHandlerResult {
@@ -23,11 +21,9 @@ pub fn dispatch_pthread(
 }
 
 /// Dispatch `libstdc++-6.dll` exports (C++ runtime).
-pub fn dispatch_stdcpp(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-    name: &str,
-) -> Result<WinApiHandlerResult> {
+pub fn dispatch_stdcpp(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let n = name.to_ascii_lowercase();
     match n.as_str() {
         // __cxa_allocate_exception(size) → guest heap alloc

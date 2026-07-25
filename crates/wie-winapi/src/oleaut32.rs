@@ -7,7 +7,7 @@
 //! frees it and leaves a dangling pointer in the destination — 7za method props
 //! with non-numeric values (`-md=64k`, `-m0=Copy`, …) throw `E_INVALIDARG`.
 
-use crate::{WinApiHandlerResult, WinApiState};
+use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 use anyhow::{Context, Result};
 
 /// `VARENUM` / `VARTYPE` constants.
@@ -23,10 +23,11 @@ const VT_UI4: u16 = 19;
 
 /// Soft-dispatch path for OLEAUT32 (name or `ORDINAL N`).
 pub fn dispatch_oleaut32(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let n = name.to_ascii_lowercase();
     // OLEAUT32 export ordinals (Wine / Windows): 2 Alloc, 4 AllocLen, 6 Free,
     // 7 StringLen, 8 VariantInit, 9 VariantClear, 10 VariantCopy, 11 CopyInd.
@@ -178,7 +179,10 @@ fn handle_sys_free_string(
     let bstr = engine.read_rcx()?;
     if bstr != 0 {
         // Free the allocation that includes the 4-byte length prefix.
-        let _ = state.heap_state.heap.free_coherent(engine, bstr.wrapping_sub(4));
+        let _ = state
+            .heap_state
+            .heap
+            .free_coherent(engine, bstr.wrapping_sub(4));
     }
     ret(engine, 0)
 }
@@ -291,7 +295,10 @@ fn read_bstr_field(engine: &mut dyn wie_cpu::CpuEngine, pvar: u64) -> Result<u64
 
 fn free_bstr_if_any(engine: &mut dyn wie_cpu::CpuEngine, state: &mut WinApiState, bstr: u64) {
     if bstr != 0 {
-        let _ = state.heap_state.heap.free_coherent(engine, bstr.wrapping_sub(4));
+        let _ = state
+            .heap_state
+            .heap
+            .free_coherent(engine, bstr.wrapping_sub(4));
     }
 }
 

@@ -10,7 +10,8 @@ pub fn handle_time_get_time(
     let return_value = state.window_state.tick_count;
 
     state.window_state.tick_count = state
-        .window_state.tick_count
+        .window_state
+        .tick_count
         .checked_add(16)
         .context("timeGetTime tick count overflow")?;
 

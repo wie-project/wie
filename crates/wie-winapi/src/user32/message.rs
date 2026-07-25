@@ -1,4 +1,10 @@
-use super::*;
+use super::{
+    Context, FAKE_WINDOW_HANDLE, GuestCallbackRequest, MessageQueueIdlePolicy, QueuedWindowMessage,
+    Result, WM_CHAR, WM_DEADCHAR, WM_KEYDOWN, WM_KEYUP, WM_MDICREATE, WM_QUIT, WM_SYSCHAR,
+    WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WinApiControlSignal, WinApiHandlerResult,
+    WinApiState, checked_field_address, create_mdi_child_from_struct, read_guest_u32,
+    read_guest_u64, write_message_structure,
+};
 
 pub fn handle_peek_message_a(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -42,7 +48,11 @@ pub fn handle_peek_message_a(
         window_matches && message_matches
     };
 
-    let matching_index = state.window_state.message_queue.iter().position(matches_filter);
+    let matching_index = state
+        .window_state
+        .message_queue
+        .iter()
+        .position(matches_filter);
 
     let return_value = if let Some(index) = matching_index {
         let queued = if w_remove_msg != 0 {
@@ -51,7 +61,8 @@ pub fn handle_peek_message_a(
         } else {
             // PM_NOREMOVE: leave in queue. Index is from `position` on this Vec.
             state
-                .window_state.message_queue
+                .window_state
+                .message_queue
                 .get(index)
                 .cloned()
                 .context("PeekMessageA matching index vanished")?
@@ -120,7 +131,8 @@ pub fn handle_post_message_a(
         let time = state.window_state.next_message_time;
 
         state.window_state.next_message_time = state
-            .window_state.next_message_time
+            .window_state
+            .next_message_time
             .checked_add(1)
             .context("PostMessageA timestamp overflow")?;
 
@@ -299,7 +311,11 @@ pub fn handle_get_message_a(
         window_matches && message_matches
     };
 
-    let matching_index = state.window_state.message_queue.iter().position(matches_filter);
+    let matching_index = state
+        .window_state
+        .message_queue
+        .iter()
+        .position(matches_filter);
 
     let return_value = if message_address == 0 {
         // GetMessage returns -1 on failure.
@@ -328,7 +344,8 @@ pub fn handle_get_message_a(
                 };
 
                 state.window_state.next_message_time = state
-                    .window_state.next_message_time
+                    .window_state
+                    .next_message_time
                     .checked_add(1)
                     .context("GetMessageA timestamp overflow")?;
 
@@ -481,7 +498,8 @@ pub fn handle_dispatch_message_a(
         .context("failed to read MSG.lParam for DispatchMessageA")?;
 
     let target_window = state
-        .window_state.windows
+        .window_state
+        .windows
         .iter()
         .find(|window| window.handle == window_handle);
 

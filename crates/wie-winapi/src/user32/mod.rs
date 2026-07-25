@@ -49,178 +49,112 @@ pub(crate) const WM_SYSDEADCHAR: u32 = 0x0107;
 
 /// Handles `USER32.dll!GetAsyncKeyState`.
 
-
-
-
 /// Handles `USER32.dll!PeekMessageA`.
-
 
 /// Handles `USER32.dll!LoadIconA`.
 
-
 /// Handles `USER32.dll!LoadCursorA`.
-
 
 /// Handles `USER32.dll!RegisterClassExW`.
 
-
 /// Handles `USER32.dll!RegisterClassExA`.
-
 
 /// Handles `USER32.dll!MessageBoxW`.
 
-
 /// Handles `USER32.dll!MessageBoxA`.
-
 
 /// Handles dynamic `USER32.dll!SetProcessDPIAware`.
 
-
 /// Handles dynamic `USER32.dll!TrackMouseEvent`.
-
 
 /// Handles `USER32.dll!GetCursorPos`.
 
-
 /// Handles `USER32.dll!ClipCursor` (accept clip rect or release when NULL).
 
-
 /// Handles `USER32.dll!GetClipCursor`.
-
 
 /// Handles `USER32.dll!CallMsgFilterA/W`.
 ///
 /// Returns FALSE so the message continues through the normal dispatch path
 /// (no installed WH_MSGFILTER/WH_SYSMSGFILTER hooks).
 
-
-
-
 /// Handles `USER32.dll!GetSystemMetrics`.
-
 
 /// Handles dynamic `USER32.dll!MonitorFromWindow`.
 
-
 /// Handles dynamic `USER32.dll!GetMonitorInfoA`.
-
 
 /// Handles dynamic `USER32.dll!GetMonitorInfoW`.
 
-
 /// Handles dynamic `USER32.dll!MonitorFromRect`.
-
 
 /// Handles dynamic `USER32.dll!MonitorFromPoint`.
 
-
 /// Handles dynamic `USER32.dll!EnumDisplayMonitors`.
-
 
 /// Handles dynamic `USER32.dll!EnumDisplayDevicesA`.
 
-
 /// Handles dynamic `USER32.dll!EnumDisplayDevicesW`.
-
 
 /// Handles `USER32.dll!GetWindowRect`.
 
-
 /// Handles dynamic `USER32.dll!GetDpiForWindow`.
-
 
 /// Handles `USER32.dll!PostMessageA`.
 
-
-
-
 /// Handles dynamic `USER32.dll!GetSystemMetricsForDpi`.
-
 
 /// Handles dynamic `USER32.dll!AdjustWindowRectExForDpi`.
 
-
 /// Handles `USER32.dll!SetWindowPos`.
-
 
 /// Handles `USER32.dll!GetDC`.
 
-
 /// Handles `USER32.dll!SendMessageA`.
-
 
 /// Handles `USER32.dll!SendMessageW`.
 
-
-
-
 /// Handles `USER32.dll!ReleaseDC`.
-
 
 /// Handles `USER32.dll!LoadImageA`.
 
-
 /// Handles `USER32.dll!LoadImageW`.
-
-
-
 
 /// Handles `USER32.dll!SetWindowLongPtrW`.
 
-
 /// Handles `USER32.dll!DestroyIcon`.
-
 
 /// Handles `USER32.dll!IsWindow`.
 
-
 /// Handles `USER32.dll!IsWindowVisible`.
-
 
 /// Handles `USER32.dll!IsWindowEnabled`.
 
-
 /// Handles `USER32.dll!GetParent`.
-
 
 /// Handles `USER32.dll!GetActiveWindow`.
 
-
 /// Handles `USER32.dll!GetForegroundWindow`.
-
 
 /// Handles `USER32.dll!ShowWindow`.
 
-
 /// Handles `USER32.dll!EnableWindow`.
-
 
 /// Handles `USER32.dll!SetForegroundWindow`.
 
-
 /// Handles `USER32.dll!SetActiveWindow`.
-
 
 /// Handles `USER32.dll!SetFocus`.
 
-
 /// Handles `USER32.dll!GetFocus`.
-
 
 /// Handles `USER32.dll!SetCapture`.
 
-
 /// Handles `USER32.dll!GetCapture`.
-
 
 /// Handles `USER32.dll!ReleaseCapture`.
 
-
 /// Handles `USER32.dll!SetCursor`.
-
-
-
-
 pub mod dc;
 pub mod display;
 pub mod input;
@@ -303,92 +237,63 @@ pub(crate) fn write_wide_window_text(
 
 /// Handles `USER32.dll!UpdateWindow`.
 
-
 /// Handles `USER32.dll!InvalidateRect`.
-
 
 /// Handles `USER32.dll!BeginPaint`.
 ///
 /// Fills `PAINTSTRUCT` with a fake HDC and client rect; real painting is stubbed.
 
-
 /// Handles `USER32.dll!EndPaint`.
-
 
 /// Handles `USER32.dll!RedrawWindow`.
 
-
 /// Handles `USER32.dll!SetWindowTextA`.
-
 
 /// Handles `USER32.dll!SetWindowTextW`.
 
-
 /// Handles `USER32.dll!GetWindowTextA`.
-
 
 /// Handles `USER32.dll!GetWindowTextW`.
 
-
 /// Handles `USER32.dll!GetClientRect`.
-
 
 /// Handles `USER32.dll!MoveWindow`.
 
-
 /// Handles `USER32.dll!ScreenToClient`.
-
 
 /// Handles `USER32.dll!ClientToScreen`.
 
-
 /// Handles `USER32.dll!GetDesktopWindow`.
-
 
 /// Handles `USER32.dll!GetSysColor`.
 
-
 /// Handles `USER32.dll!GetSysColorBrush`.
-
 
 /// Handles `USER32.dll!GetDialogBaseUnits`.
 
-
 /// Handles `USER32.dll!SetRect`.
-
 
 /// Handles `USER32.dll!IsIconic`.
 
-
 /// Handles `USER32.dll!IsZoomed`.
-
 
 /// Handles `USER32.dll!GetWindowThreadProcessId`.
 
-
 /// Handles `USER32.dll!GetDlgCtrlID`.
-
 
 /// Handles `USER32.dll!GetCursor`.
 
-
 /// Handles `USER32.dll!IsChild`.
-
 
 /// Handles `USER32.dll!GetWindow`.
 
-
 /// Handles `USER32.dll!SetKeyboardState`.
-
 
 /// Handles `USER32.dll!GetKeyboardState`.
 
-
 /// Handles `USER32.dll!GetKeyState`.
 
-
 /// Handles `USER32.dll!MapVirtualKeyA`.
-
 
 pub(crate) fn window_long_ptr_index(index_raw: u64, api_name: &str) -> Result<i64> {
     let index_low = u32::try_from(index_raw)
@@ -406,7 +311,8 @@ pub(crate) fn get_window_long_ptr_value(
     let index = window_long_ptr_index(index_raw, api_name)?;
 
     Ok(state
-        .window_state.window_long_ptr_values
+        .window_state
+        .window_long_ptr_values
         .iter()
         .find(|(stored_window, stored_index, _)| {
             *stored_window == window_handle && *stored_index == index
@@ -424,25 +330,24 @@ pub(crate) fn set_window_long_ptr_value(
     let index = window_long_ptr_index(index_raw, api_name)?;
 
     let previous_value = state
-        .window_state.window_long_ptr_values
+        .window_state
+        .window_long_ptr_values
         .iter()
         .find(|(stored_window, stored_index, _)| {
             *stored_window == window_handle && *stored_index == index
         })
         .map_or(0, |(_, _, value)| *value);
 
-    if let Some(entry) =
-        state
-            .window_state.window_long_ptr_values
-            .iter_mut()
-            .find(|(stored_window, stored_index, _)| {
-                *stored_window == window_handle && *stored_index == index
-            })
-    {
+    if let Some(entry) = state.window_state.window_long_ptr_values.iter_mut().find(
+        |(stored_window, stored_index, _)| {
+            *stored_window == window_handle && *stored_index == index
+        },
+    ) {
         entry.2 = new_value;
     } else {
         state
-            .window_state.window_long_ptr_values
+            .window_state
+            .window_long_ptr_values
             .push((window_handle, index, new_value));
     }
 
@@ -451,36 +356,25 @@ pub(crate) fn set_window_long_ptr_value(
 
 /// Handles `USER32.dll!GetWindowLongPtrA`.
 
-
 /// Handles `USER32.dll!GetWindowLongPtrW`.
-
 
 /// Handles `USER32.dll!SetWindowLongPtrA`.
 
-
 /// Handles `USER32.dll!SetTimer`.
-
 
 /// Handles `USER32.dll!KillTimer`.
 
-
 /// Handles `USER32.dll!AdjustWindowRectEx`.
-
 
 /// Handles `USER32.dll!SetWindowsHookExW`.
 
-
 /// Handles `USER32.dll!UnhookWindowsHookEx`.
-
 
 /// Handles `USER32.dll!CallNextHookEx`.
 
-
 /// Handles `USER32.dll!EnableMenuItem`.
 
-
 /// Handles `USER32.dll!CheckMenuItem`.
-
 
 pub(crate) fn write_message_structure(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -553,112 +447,83 @@ pub(crate) fn write_message_structure(
 
 /// Handles `USER32.dll!GetMessageA`.
 
-
 /// Handles `USER32.dll!TranslateMessage`.
-
 
 /// Neutral default message handler used by several USER32 `Def*Proc` APIs.
 
-
 /// Handles `USER32.dll!DefWindowProcA`.
-
 
 /// Handles `USER32.dll!DefWindowProcW`.
 
-
 /// Handles `USER32.dll!DefFrameProcA`.
-
 
 /// Handles `USER32.dll!DefFrameProcW`.
 
-
 /// Handles `USER32.dll!DefMDIChildProcA`.
 
-
 /// Handles `USER32.dll!DefMDIChildProcW`.
-
 
 pub(crate) fn allocate_menu_handle(state: &mut WinApiState) -> Result<u64> {
     let handle = state.window_state.next_menu_handle;
     state.window_state.next_menu_handle = state
-        .window_state.next_menu_handle
+        .window_state
+        .next_menu_handle
         .checked_add(1)
         .context("menu handle allocator overflow")?;
     Ok(handle)
 }
 
-
-
 /// Handles `USER32.dll!GetMenu` — returns the HMENU for a window, or 0.
-
 
 /// Handles `USER32.dll!CreateMenu`.
 
-
 /// Handles `USER32.dll!CreatePopupMenu`.
-
 
 /// Handles `USER32.dll!AppendMenuA`.
 
-
 /// Handles `USER32.dll!AppendMenuW`.
-
 
 /// Handles `USER32.dll!SetMenu`.
 
-
 /// Handles `USER32.dll!DestroyMenu`.
-
 
 /// Handles `USER32.dll!RemoveMenu`.
 
-
 /// Handles `USER32.dll!DeleteMenu`.
-
 
 /// Handles `USER32.dll!ModifyMenuA`.
 
-
 /// Handles `USER32.dll!ModifyMenuW`.
-
 
 /// Handles `USER32.dll!GetSystemMenu`.
 
-
 /// Handles `USER32.dll!TrackPopupMenu`.
-
 
 /// Handles `USER32.dll!GetMenuItemInfoA`.
 
-
 /// Handles `USER32.dll!GetMenuItemInfoW`.
-
 
 /// Handles `USER32.dll!SetMenuItemInfoA`.
 
-
 /// Handles `USER32.dll!SetMenuItemInfoW`.
 
-
 /// Handles `USER32.dll!CheckMenuRadioItem`.
-
 
 /// Handles `USER32.dll!SetScrollInfo`.
 ///
 /// Accepts the call and returns `nPos` (or `nMax` if position is absent) so
 /// scroll-range setup during level-editor open does not abort the guest.
 
-
 /// Handles `USER32.dll!ScrollWindowEx` (no-op success stub).
-
 
 /// Handles `USER32.dll!ScrollDC` (no-op success stub; no real pixel scroll).
 
-
 /// Handles `USER32.dll!DispatchMessageA`.
 
-
-pub(crate) fn register_window_class(state: &mut WinApiState, mut record: WindowClassRecord) -> Result<u64> {
+pub(crate) fn register_window_class(
+    state: &mut WinApiState,
+    mut record: WindowClassRecord,
+) -> Result<u64> {
     if record.class_name.is_empty() || record.window_proc == 0 {
         return Ok(0);
     }
@@ -677,7 +542,8 @@ pub(crate) fn register_window_class(state: &mut WinApiState, mut record: WindowC
     }
 
     state.window_state.next_window_class_atom = state
-        .window_state.next_window_class_atom
+        .window_state
+        .next_window_class_atom
         .checked_add(1)
         .context("window class atom overflow")?;
 
@@ -761,14 +627,16 @@ pub(crate) fn find_window_class<'a>(
     unicode: bool,
 ) -> Option<&'a WindowClassRecord> {
     state
-        .window_state.window_classes
+        .window_state
+        .window_classes
         .iter()
         .find(|record| {
             record.unicode == unicode && window_class_identifier_matches(record, identifier)
         })
         .or_else(|| {
             state
-                .window_state.window_classes
+                .window_state
+                .window_classes
                 .iter()
                 .find(|record| window_class_identifier_matches(record, identifier))
         })
@@ -788,7 +656,8 @@ pub(crate) fn create_window_record(
     }
 
     state.window_state.next_window_handle = state
-        .window_state.next_window_handle
+        .window_state
+        .next_window_handle
         .checked_add(1)
         .context("fake window handle overflow")?;
 
@@ -927,8 +796,6 @@ pub(crate) fn create_mdi_child_from_struct(
     Ok(handle)
 }
 
-
-
 pub(crate) fn is_known_window(state: &WinApiState, handle: u64) -> bool {
     if handle == 0 {
         return false;
@@ -939,5 +806,3 @@ pub(crate) fn is_known_window(state: &WinApiState, handle: u64) -> bool {
         || state.window_state.active_window_handle == handle
         || state.window_state.foreground_window_handle == handle
 }
-
-

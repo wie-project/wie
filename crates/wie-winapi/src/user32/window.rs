@@ -1,4 +1,11 @@
-use super::*;
+use super::{
+    Context, FAKE_DESKTOP_WINDOW_HANDLE, FAKE_PROCESS_ID, FAKE_SYSTEM_COLOR_BRUSH_BASE,
+    FAKE_THREAD_ID, FAKE_WINDOW_HANDLE, Result, WinApiHandlerResult, WinApiState, WindowRecord,
+    checked_field_address, get_window_long_ptr_value, is_known_window, low_i32,
+    read_guest_ansi_lossy, read_guest_i32, read_guest_u64, read_guest_utf16_lossy,
+    set_window_long_ptr_value, window_client_size, write_ansi_window_text, write_guest_i32,
+    write_guest_u32, write_wide_window_text, write_window_rect,
+};
 
 pub fn handle_get_window_rect(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -630,7 +637,12 @@ pub fn handle_get_window_text_a(
         .context("failed to read R8 for GetWindowTextA")?;
 
     let return_value = if window_handle == FAKE_WINDOW_HANDLE {
-        write_ansi_window_text(engine, buffer_ptr, max_characters, &state.window_state.window_title)?
+        write_ansi_window_text(
+            engine,
+            buffer_ptr,
+            max_characters,
+            &state.window_state.window_title,
+        )?
     } else {
         0
     };
@@ -661,7 +673,12 @@ pub fn handle_get_window_text_w(
         .context("failed to read R8 for GetWindowTextW")?;
 
     let return_value = if window_handle == FAKE_WINDOW_HANDLE {
-        write_wide_window_text(engine, buffer_ptr, max_characters, &state.window_state.window_title)?
+        write_wide_window_text(
+            engine,
+            buffer_ptr,
+            max_characters,
+            &state.window_state.window_title,
+        )?
     } else {
         0
     };
@@ -1274,5 +1291,9 @@ pub fn handle_scroll_window_ex(engine: &mut dyn wie_cpu::CpuEngine) -> Result<Wi
     })
 }
 pub(crate) fn find_window(state: &WinApiState, handle: u64) -> Option<&WindowRecord> {
-    state.window_state.windows.iter().find(|window| window.handle == handle)
+    state
+        .window_state
+        .windows
+        .iter()
+        .find(|window| window.handle == handle)
 }

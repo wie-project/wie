@@ -898,16 +898,25 @@ impl RuntimeSession {
         let stack_limit = layout.stack_base;
 
         engine
-            .mem_write(layout.teb_low_base.wrapping_add(0x08), &stack_top.to_le_bytes())
+            .mem_write(
+                layout.teb_low_base.wrapping_add(0x08),
+                &stack_top.to_le_bytes(),
+            )
             .context("failed to write fake TEB StackBase")?;
 
         engine
-            .mem_write(layout.teb_low_base.wrapping_add(0x10), &stack_limit.to_le_bytes())
+            .mem_write(
+                layout.teb_low_base.wrapping_add(0x10),
+                &stack_limit.to_le_bytes(),
+            )
             .context("failed to write fake TEB StackLimit")?;
 
         // TEB.Self (x64 offset 0x30) — guest PEB / TLS lookups.
         engine
-            .mem_write(layout.teb_low_base.wrapping_add(0x30), &layout.teb_low_base.to_le_bytes())
+            .mem_write(
+                layout.teb_low_base.wrapping_add(0x30),
+                &layout.teb_low_base.to_le_bytes(),
+            )
             .context("failed to write fake TEB Self")?;
 
         // TEB.LastErrorValue (x64 offset 0x68) — guest GetLastError/SetLastError stubs.
@@ -1051,7 +1060,8 @@ impl RuntimeSession {
         {
             let ctx = wie_cpu::ThreadContext::default();
             let _ = winapi_state
-                .kernel.sync
+                .kernel
+                .sync
                 .register_thread(wie_winapi::PRIMARY_THREAD_ID, ctx);
         }
 
@@ -1071,7 +1081,8 @@ impl RuntimeSession {
                 let entries = wie_winapi::exception::parse_pdata(raw);
                 if !entries.is_empty() {
                     winapi_state
-                        .kernel.sync
+                        .kernel
+                        .sync
                         .function_tables
                         .insert(image_summary.image_base, entries);
                 }
@@ -1189,7 +1200,8 @@ impl RuntimeSession {
 
     /// Sets optional host-bridge root for guest `D:\…` (`None` unmounts D:).
     pub fn set_drive_d(&mut self, root: Option<std::path::PathBuf>) {
-        self.process.with_mut(|_, s| s.file_io.volumes.drive_d_root = root);
+        self.process
+            .with_mut(|_, s| s.file_io.volumes.drive_d_root = root);
     }
 
     /// Replaces guest stdin buffer for console `ReadFile` on STD_INPUT_HANDLE.
@@ -1228,7 +1240,8 @@ impl RuntimeSession {
 
     /// Adds one message to the persistent guest message queue.
     pub fn post_message(&mut self, message: wie_winapi::QueuedWindowMessage) {
-        self.process.with_mut(|_, s| s.window_state.message_queue.push(message));
+        self.process
+            .with_mut(|_, s| s.window_state.message_queue.push(message));
     }
 
     /// Runs the guest until it yields, terminates, reaches an unsupported API,
@@ -1702,18 +1715,13 @@ impl RuntimeSession {
                             quantum = Quantum::Continue;
                         } else {
                             let handler_t0 = self.profile_enabled.then(Instant::now);
+                            let mut ctx =
+                                wie_winapi::HandlerContext::new(engine, environment, winapi_state);
                             let dispatch_result = if let Some(id) = resolved.winapi_id {
-                                wie_winapi::dispatch_winapi_id(
-                                    engine,
-                                    environment,
-                                    winapi_state,
-                                    id,
-                                )
+                                wie_winapi::dispatch_winapi_id(&mut ctx, id)
                             } else {
                                 wie_winapi::dispatch_winapi(
-                                    engine,
-                                    environment,
-                                    winapi_state,
+                                    &mut ctx,
                                     &resolved.library,
                                     &resolved.name,
                                 )
@@ -1930,9 +1938,9 @@ impl RuntimeSession {
                                 .with_mut(|_, st| st.kernel.sync.multi_wait.remove(&primary_tid));
                             let result = match req {
                                 Some(req) => {
-                                    let targets = self
-                                        .process
-                                        .with_mut(|_, st| st.kernel.sync.wait_targets(&req.handles));
+                                    let targets = self.process.with_mut(|_, st| {
+                                        st.kernel.sync.wait_targets(&req.handles)
+                                    });
                                     match targets {
                                         Some(ts) => {
                                             if req.timeout_ms == wie_winapi::INFINITE {
@@ -2011,18 +2019,21 @@ impl RuntimeSession {
         self.process.with_mut(|_, st| {
             let time = st.window_state.next_message_time;
             st.window_state.next_message_time = st
-                .window_state.next_message_time
+                .window_state
+                .next_message_time
                 .checked_add(1)
                 .context("runtime message timestamp overflow")?;
-            st.window_state.message_queue.push(wie_winapi::QueuedWindowMessage {
-                window_handle,
-                message,
-                word_parameter,
-                long_parameter,
-                time,
-                point_x: 0,
-                point_y: 0,
-            });
+            st.window_state
+                .message_queue
+                .push(wie_winapi::QueuedWindowMessage {
+                    window_handle,
+                    message,
+                    word_parameter,
+                    long_parameter,
+                    time,
+                    point_x: 0,
+                    point_y: 0,
+                });
             Ok(())
         })
     }
@@ -2031,7 +2042,8 @@ impl RuntimeSession {
     #[must_use]
     pub fn first_guest_window_handle(&self) -> Option<u64> {
         self.process.with_winapi_ref(|st| {
-            st.window_state.windows
+            st.window_state
+                .windows
                 .iter()
                 .find(|window| window.window_proc != 0)
                 .map(|window| window.handle)
@@ -2042,7 +2054,8 @@ impl RuntimeSession {
     #[must_use]
     pub fn guest_windows_snapshot(&self) -> Vec<(u64, String, String, bool)> {
         self.process.with_winapi_ref(|st| {
-            st.window_state.windows
+            st.window_state
+                .windows
                 .iter()
                 .map(|window| {
                     (
@@ -2064,7 +2077,8 @@ impl RuntimeSession {
 
     /// Configures the next common file dialog outcome (`GetOpenFileName` / `GetSaveFileName`).
     pub fn set_file_dialog_policy(&mut self, policy: wie_winapi::FileDialogPolicy) {
-        self.process.with_mut(|_, s| s.window_state.file_dialog_policy = policy);
+        self.process
+            .with_mut(|_, s| s.window_state.file_dialog_policy = policy);
     }
 
     /// Returns the last path accepted by a simulated file dialog.
@@ -2094,7 +2108,8 @@ impl RuntimeSession {
     pub fn guest_file_size(&self, handle: u64) -> Result<u64> {
         self.process.with_winapi_ref(|st| {
             let file = st
-                .file_io.open_files
+                .file_io
+                .open_files
                 .get(&handle)
                 .with_context(|| format!("unknown guest file handle {handle:#018x}"))?;
             u64::try_from(file.bytes.len()).context("guest file size does not fit u64")
@@ -2126,7 +2141,8 @@ impl RuntimeSession {
     #[must_use]
     pub fn open_guest_files_snapshot(&self) -> Vec<(u64, String, u64)> {
         self.process.with_winapi_ref(|st| {
-            st.file_io.open_files
+            st.file_io
+                .open_files
                 .iter()
                 .filter_map(|(&handle, file)| {
                     let size = u64::try_from(file.bytes.len()).ok()?;

@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    Context, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICE_PRIMARY_DEVICE,
+    FAKE_MONITOR_HANDLE, Result, WinApiHandlerResult, checked_field_address,
+    write_guest_fixed_ansi, write_guest_fixed_utf16, write_guest_i32, write_guest_u32,
+};
 
 pub(crate) fn write_fake_monitor_info(
     engine: &mut dyn wie_cpu::CpuEngine,

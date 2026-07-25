@@ -10,7 +10,10 @@ use crate::guest_memory::read_u64 as read_guest_u64;
 use crate::kernel32::create_guest_thread;
 use crate::seh::{self, ThrowPayload};
 use crate::sync_obj::KernelObject;
-use crate::{GuestStdinMode, WinApiControlSignal, WinApiEnvironment, WinApiHandlerResult, WinApiState};
+use crate::{
+    GuestStdinMode, HandlerContext, WinApiControlSignal, WinApiEnvironment, WinApiHandlerResult,
+    WinApiState,
+};
 use anyhow::{Context, Result};
 
 /// Guest VA base for synthetic CRT objects (FILE cookies, env pointers, etc.).
@@ -51,12 +54,10 @@ pub fn crt_data_import_va(name: &str) -> Option<u64> {
 }
 
 /// Dispatch a UCRT export by name (case-insensitive).
-pub fn dispatch_ucrt(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    environment: WinApiEnvironment,
-    state: &mut WinApiState,
-    name: &str,
-) -> Result<WinApiHandlerResult> {
+pub fn dispatch_ucrt(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let environment = ctx.environment;
     let n = name.to_ascii_lowercase();
     match n.as_str() {
         "__acrt_iob_func" => handle_acrt_iob_func(engine),
@@ -293,7 +294,9 @@ fn handle_stdio_common_vsprintf(
 ) -> Result<WinApiHandlerResult> {
     let buf = engine.read_rdx()?;
     let fmt_ptr = engine.read_r9()?;
-    if buf == 0 || fmt_ptr == 0 { return ret(engine, 0); }
+    if buf == 0 || fmt_ptr == 0 {
+        return ret(engine, 0);
+    }
     let fmt = read_guest_str(engine, fmt_ptr, 4096)?;
     let rsp = engine.read_rsp()?;
     let mut va = read_guest_u64(engine, rsp.wrapping_add(0x30)).unwrap_or(0);
@@ -309,17 +312,28 @@ fn handle_stdio_common_vsprintf(
                 b'd' | b'i' | b'u' => {
                     let v = read_guest_u64(engine, va).unwrap_or(0);
                     va = va.wrapping_add(8);
-                    out.extend_from_slice(if bytes[i] == b'u' { format!("{}", v) } else { format!("{}", v as i64) }.as_bytes());
+                    out.extend_from_slice(
+                        if bytes[i] == b'u' {
+                            format!("{v}")
+                        } else {
+                            format!("{}", v as i64)
+                        }
+                        .as_bytes(),
+                    );
                 }
                 b'x' | b'X' => {
                     let v = read_guest_u64(engine, va).unwrap_or(0);
                     va = va.wrapping_add(8);
-                    out.extend_from_slice(format!("{:x}", v).as_bytes());
+                    out.extend_from_slice(format!("{v:x}").as_bytes());
                 }
                 b's' => {
                     let p = read_guest_u64(engine, va).unwrap_or(0);
                     va = va.wrapping_add(8);
-                    out.extend_from_slice(read_guest_str(engine, p, 1024).unwrap_or_default().as_bytes());
+                    out.extend_from_slice(
+                        read_guest_str(engine, p, 1024)
+                            .unwrap_or_default()
+                            .as_bytes(),
+                    );
                 }
                 b'c' => {
                     let v = read_guest_u64(engine, va).unwrap_or(0);
@@ -327,7 +341,10 @@ fn handle_stdio_common_vsprintf(
                     out.push(v as u8);
                 }
                 b'%' => out.push(b'%'),
-                _ => { out.push(b'%'); out.push(bytes[i]); }
+                _ => {
+                    out.push(b'%');
+                    out.push(bytes[i]);
+                }
             }
         } else {
             out.push(bytes[i]);
@@ -340,41 +357,60 @@ fn handle_stdio_common_vsprintf(
 }
 
 /// `__stdio_common_vsscanf(options, buf, count, format, locale, va_list)`.
-fn handle_stdio_common_vsscanf(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+fn handle_stdio_common_vsscanf(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let src_ptr = engine.read_rdx()?;
     let fmt_ptr = engine.read_r9()?;
-    if src_ptr == 0 || fmt_ptr == 0 { return ret(engine, 0); }
+    if src_ptr == 0 || fmt_ptr == 0 {
+        return ret(engine, 0);
+    }
     let src = read_guest_str(engine, src_ptr, 4096)?;
     let fmt = read_guest_str(engine, fmt_ptr, 4096)?;
     let rsp = engine.read_rsp()?;
     let mut va = read_guest_u64(engine, rsp.wrapping_add(0x30)).unwrap_or(0);
-    let sb = src.as_bytes(); let fb = fmt.as_bytes();
-    let mut si = 0; let mut fi = 0; let mut items = 0;
+    let sb = src.as_bytes();
+    let fb = fmt.as_bytes();
+    let mut si = 0;
+    let mut fi = 0;
+    let mut items = 0;
     while fi < fb.len() && si < sb.len() {
         if fb[fi] == b'%' && fi + 1 < fb.len() {
             fi += 1;
             match fb[fi] {
                 b'd' | b'i' | b'u' => {
-                    while si < sb.len() && sb[si].is_ascii_whitespace() { si += 1; }
+                    while si < sb.len() && sb[si].is_ascii_whitespace() {
+                        si += 1;
+                    }
                     let neg = si < sb.len() && sb[si] == b'-';
-                    if neg || (si < sb.len() && sb[si] == b'+') { si += 1; }
+                    if neg || (si < sb.len() && sb[si] == b'+') {
+                        si += 1;
+                    }
                     let start = si;
-                    while si < sb.len() && sb[si].is_ascii_digit() { si += 1; }
+                    while si < sb.len() && sb[si].is_ascii_digit() {
+                        si += 1;
+                    }
                     if si > start {
                         let s = std::str::from_utf8(&sb[start..si]).unwrap_or("0");
-                        let val: u64 = (if neg { -(s.parse::<i64>().unwrap_or(0)) } else { s.parse::<i64>().unwrap_or(0) }) as u64;
+                        let val: u64 = (if neg {
+                            -(s.parse::<i64>().unwrap_or(0))
+                        } else {
+                            s.parse::<i64>().unwrap_or(0)
+                        }) as u64;
                         let out = read_guest_u64(engine, va).unwrap_or(0);
                         va = va.wrapping_add(8);
-                        if out != 0 { drop(engine.mem_write(out, &val.to_le_bytes())); }
+                        if out != 0 {
+                            drop(engine.mem_write(out, &val.to_le_bytes()));
+                        }
                         items += 1;
                     }
                 }
                 b's' => {
-                    while si < sb.len() && sb[si].is_ascii_whitespace() { si += 1; }
+                    while si < sb.len() && sb[si].is_ascii_whitespace() {
+                        si += 1;
+                    }
                     let start = si;
-                    while si < sb.len() && !sb[si].is_ascii_whitespace() { si += 1; }
+                    while si < sb.len() && !sb[si].is_ascii_whitespace() {
+                        si += 1;
+                    }
                     let out = read_guest_u64(engine, va).unwrap_or(0);
                     va = va.wrapping_add(8);
                     if out != 0 {
@@ -387,8 +423,12 @@ fn handle_stdio_common_vsscanf(
                 _ => {}
             }
         } else if fb[fi].is_ascii_whitespace() {
-            while si < sb.len() && sb[si].is_ascii_whitespace() { si += 1; }
-        } else if si < sb.len() && sb[si] == fb[fi] { si += 1; }
+            while si < sb.len() && sb[si].is_ascii_whitespace() {
+                si += 1;
+            }
+        } else if si < sb.len() && sb[si] == fb[fi] {
+            si += 1;
+        }
         fi += 1;
     }
     ret(engine, items)
@@ -402,28 +442,62 @@ static CRT_RNG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new
 /// Convert a Unix timestamp to `struct tm` fields.
 fn unix_ts_to_tm(ts: i64) -> [i32; 9] {
     let mut days = ts / 86400;
-    if ts < 0 && ts % 86400 != 0 { days -= 1; }
+    if ts < 0 && ts % 86400 != 0 {
+        days -= 1;
+    }
     let mut y = 1970_i64;
     loop {
         let leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
         let yd = if leap { 366 } else { 365 };
-        if days < yd { break; }
+        if days < yd {
+            break;
+        }
         days -= yd;
         y += 1;
     }
     let leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
-    let mdays = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mdays = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut mon = 0_i64;
-    while mon < 12 && days >= mdays[mon as usize] { days -= mdays[mon as usize]; mon += 1; }
+    while mon < 12 && days >= mdays[mon as usize] {
+        days -= mdays[mon as usize];
+        mon += 1;
+    }
     let day = days + 1;
-    let rem = ((ts % 86400) + 86400) % 86400;
+    let rem = ts.rem_euclid(86400);
     let sec = rem % 60;
     let min = (rem / 60) % 60;
     let hr = rem / 3600;
     let y_adj = if mon < 2 { y - 1 } else { y };
     let m_adj = if mon < 2 { mon + 13 } else { mon + 1 };
-    let wd = ((day + (13 * m_adj) / 5 + y_adj % 100 + (y_adj % 100) / 4 + (y_adj / 100) / 4 - 2 * (y_adj / 100)) % 7 + 7) % 7;
-    [sec as i32, min as i32, hr as i32, day as i32, mon as i32, (y - 1900) as i32, wd as i32, 0, 0]
+    let wd = ((day + (13 * m_adj) / 5 + y_adj % 100 + (y_adj % 100) / 4 + (y_adj / 100) / 4
+        - 2 * (y_adj / 100))
+        % 7
+        + 7)
+        % 7;
+    [
+        sec as i32,
+        min as i32,
+        hr as i32,
+        day as i32,
+        mon as i32,
+        (y - 1900) as i32,
+        wd as i32,
+        0,
+        0,
+    ]
 }
 
 /// `_localtime64(t)` — convert time_t to local struct tm.
@@ -432,7 +506,9 @@ fn handle_localtime64(
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
     let t_ptr = engine.read_rcx()?;
-    if t_ptr == 0 { return ret(engine, 0); }
+    if t_ptr == 0 {
+        return ret(engine, 0);
+    }
     let mut buf = [0_u8; 8];
     engine.mem_read(t_ptr, &mut buf)?;
     let ts = i64::from_le_bytes(buf);
@@ -441,7 +517,9 @@ fn handle_localtime64(
     // tm_mon(4), tm_year(4), tm_wday(4), tm_yday(4), tm_isdst(4) = 36 bytes.
     // Allocate and write from the heap.
     let va = state.heap_state.heap.alloc_coherent(engine, 36);
-    if va == 0 { return ret(engine, 0); }
+    if va == 0 {
+        return ret(engine, 0);
+    }
     for (i, &v) in tm.iter().enumerate() {
         let off = u64::try_from(i * 4).unwrap_or(0);
         drop(engine.mem_write(va.wrapping_add(off), &(v as u32).to_le_bytes()));
@@ -913,10 +991,14 @@ fn handle_puts(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResul
     loop {
         let mut b = [0_u8; 1];
         engine.mem_read(s.wrapping_add(off), &mut b)?;
-        if b[0] == 0 { break; }
+        if b[0] == 0 {
+            break;
+        }
         bytes.push(b[0]);
         off = off.saturating_add(1);
-        if off > 1_000_000 { break; }
+        if off > 1_000_000 {
+            break;
+        }
     }
     bytes.push(b'\n');
     write_host_console(FILE_STDOUT, &bytes);
@@ -943,7 +1025,7 @@ fn handle_fclose(
 ) -> Result<WinApiHandlerResult> {
     let _stream = engine.read_rcx()?;
     let _ = _stream;
-    ret(engine, u32::MAX as u64) // EOF = not implemented
+    ret(engine, u64::from(u32::MAX)) // EOF = not implemented
 }
 
 /// `fgets(buf, max, stream)` — read one line from stdin.
@@ -967,9 +1049,13 @@ fn handle_fgets(
         let mut byte = [0_u8; 1];
         let mut stdin = std::io::stdin().lock();
         loop {
-            if line.len() >= 4096 || stdin.read(&mut byte).unwrap_or(0) == 0 { break; }
+            if line.len() >= 4096 || stdin.read(&mut byte).unwrap_or(0) == 0 {
+                break;
+            }
             line.push(byte[0]);
-            if byte[0] == b'\n' { break; }
+            if byte[0] == b'\n' {
+                break;
+            }
         }
         if !line.is_empty() {
             state.file_io.stdin_bytes = line;
@@ -980,32 +1066,45 @@ fn handle_fgets(
     let mut written = 0_usize;
     while written < cap.saturating_sub(1) {
         let idx = state.file_io.stdin_cursor;
-        if idx >= state.file_io.stdin_bytes.len() { break; }
+        if idx >= state.file_io.stdin_bytes.len() {
+            break;
+        }
         let c = state.file_io.stdin_bytes[idx];
         state.file_io.stdin_cursor = idx.wrapping_add(1);
         let byte = [c];
         engine.mem_write(buf.wrapping_add(u64::try_from(written).unwrap_or(0)), &byte)?;
         written = written.wrapping_add(1);
-        if c == b'\n' { break; }
+        if c == b'\n' {
+            break;
+        }
     }
     if written == 0 {
         return ret(engine, 0); // NULL -> EOF / error
     }
     // NUL-terminate.
     let nul_byte = [0_u8];
-    engine.mem_write(buf.wrapping_add(u64::try_from(written).unwrap_or(0)), &nul_byte)?;
+    engine.mem_write(
+        buf.wrapping_add(u64::try_from(written).unwrap_or(0)),
+        &nul_byte,
+    )?;
     ret(engine, buf) // returns buf on success
 }
 
 /// Read a NUL-terminated string from guest memory into a host buffer.
 fn read_guest_str(engine: &mut dyn wie_cpu::CpuEngine, ptr: u64, max: usize) -> Result<String> {
-    if ptr == 0 { return Ok(String::new()); }
+    if ptr == 0 {
+        return Ok(String::new());
+    }
     let mut bytes = Vec::with_capacity(max.min(128));
     for i in 0..max {
         let mut b = [0_u8; 1];
         let off = u64::try_from(i).unwrap_or(0);
-        if engine.mem_read(ptr.wrapping_add(off), &mut b).is_err() { break; }
-        if b[0] == 0 { break; }
+        if engine.mem_read(ptr.wrapping_add(off), &mut b).is_err() {
+            break;
+        }
+        if b[0] == 0 {
+            break;
+        }
         bytes.push(b[0]);
     }
     Ok(String::from_utf8_lossy(&bytes).to_string())
@@ -1061,17 +1160,30 @@ fn handle_strtok(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
     let s_ptr = engine.read_rcx()?;
     let d_ptr = engine.read_rdx()?;
     static SAVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let ptr = if s_ptr == 0 { SAVE.load(std::sync::atomic::Ordering::Relaxed) } else { s_ptr };
-    if ptr == 0 { return ret(engine, 0); }
+    let ptr = if s_ptr == 0 {
+        SAVE.load(std::sync::atomic::Ordering::Relaxed)
+    } else {
+        s_ptr
+    };
+    if ptr == 0 {
+        return ret(engine, 0);
+    }
     let delim = read_guest_str(engine, d_ptr, 32).unwrap_or_default();
     // Skip leading delimiters.
     let start = {
         let mut p = ptr;
         loop {
             let mut b = [0_u8; 1];
-            if engine.mem_read(p, &mut b).is_err() { break; }
-            if b[0] == 0 { break; }
-            if delim.contains(b[0] as char) { p = p.wrapping_add(1); continue; }
+            if engine.mem_read(p, &mut b).is_err() {
+                break;
+            }
+            if b[0] == 0 {
+                break;
+            }
+            if delim.contains(b[0] as char) {
+                p = p.wrapping_add(1);
+                continue;
+            }
             break;
         }
         p
@@ -1080,12 +1192,22 @@ fn handle_strtok(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
     let mut end_off = 0_u64;
     loop {
         let mut b = [0_u8; 1];
-        if engine.mem_read(start.wrapping_add(end_off), &mut b).is_err() { break; }
-        if b[0] == 0 { break; }
+        if engine
+            .mem_read(start.wrapping_add(end_off), &mut b)
+            .is_err()
+        {
+            break;
+        }
+        if b[0] == 0 {
+            break;
+        }
         if delim.contains(b[0] as char) {
             let nul = [0_u8];
             drop(engine.mem_write(start.wrapping_add(end_off), &nul));
-            SAVE.store(start.wrapping_add(end_off).wrapping_add(1), std::sync::atomic::Ordering::Relaxed);
+            SAVE.store(
+                start.wrapping_add(end_off).wrapping_add(1),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             return ret(engine, start);
         }
         end_off += 1;
@@ -1109,35 +1231,38 @@ fn handle_fgetc(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResu
 /// ctype helpers: isalpha, isdigit, isalnum, islower, isupper, isspace, toupper, tolower.
 fn handle_isalpha(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let c = engine.read_rcx()? as u8;
-    ret(engine, if c.is_ascii_alphabetic() { 1 } else { 0 })
+    ret(engine, u64::from(c.is_ascii_alphabetic()))
 }
 fn handle_isdigit(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let c = engine.read_rcx()? as u8;
-    ret(engine, if c.is_ascii_digit() { 1 } else { 0 })
+    ret(engine, u64::from(c.is_ascii_digit()))
 }
 fn handle_isalnum(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let c = engine.read_rcx()? as u8;
-    ret(engine, if c.is_ascii_alphanumeric() { 1 } else { 0 })
+    ret(engine, u64::from(c.is_ascii_alphanumeric()))
 }
 fn handle_islower(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let c = engine.read_rcx()? as u8;
-    ret(engine, if c.is_ascii_lowercase() { 1 } else { 0 })
+    ret(engine, u64::from(c.is_ascii_lowercase()))
 }
 fn handle_isupper(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let c = engine.read_rcx()? as u8;
-    ret(engine, if c.is_ascii_uppercase() { 1 } else { 0 })
+    ret(engine, u64::from(c.is_ascii_uppercase()))
 }
 fn handle_isspace(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let c = engine.read_rcx()? as u8;
-    ret(engine, if c.is_ascii_whitespace() || c == b'\t' || c == b'\n' || c == b'\r' { 1 } else { 0 })
+    ret(
+        engine,
+        u64::from(c.is_ascii_whitespace() || c == b'\t' || c == b'\n' || c == b'\r'),
+    )
 }
 fn handle_toupper(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let c = engine.read_rcx()?;
-    ret(engine, (c as u8).to_ascii_uppercase() as u64)
+    ret(engine, u64::from((c as u8).to_ascii_uppercase()))
 }
 fn handle_tolower(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let c = engine.read_rcx()?;
-    ret(engine, (c as u8).to_ascii_lowercase() as u64)
+    ret(engine, u64::from((c as u8).to_ascii_lowercase()))
 }
 
 /// `strerror(errnum)` — returns a string describing the error code.
@@ -1171,7 +1296,9 @@ fn handle_setlocale(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandler
             drop(engine.mem_write(addr, b"C\0"));
             LOCALE_VA.store(addr, std::sync::atomic::Ordering::Relaxed);
             ret(engine, addr)
-        } else { ret(engine, va) }
+        } else {
+            ret(engine, va)
+        }
     } else {
         // Set: ignore, return the old locale.
         // For now, return "C" as the old locale.
@@ -1339,9 +1466,7 @@ fn handle_begin_thread_ex(
     // Stack: [rsp+0x28]=initflag, [rsp+0x30]=thrdaddr (after home space).
     let flags = read_stack_u32(engine, 0x28).unwrap_or(0);
     let tid_out = read_stack_u64(engine, 0x30).unwrap_or(0);
-    let handle = create_guest_thread(
-        engine, state, stack_size, start, arg, flags, tid_out,
-    )?;
+    let handle = create_guest_thread(engine, state, stack_size, start, arg, flags, tid_out)?;
     ret(engine, handle)
 }
 

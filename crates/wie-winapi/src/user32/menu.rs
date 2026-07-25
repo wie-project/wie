@@ -1,4 +1,4 @@
-use super::*;
+use super::{Context, Result, WinApiHandlerResult, WinApiState, allocate_menu_handle};
 
 pub fn handle_enable_menu_item(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -23,19 +23,24 @@ pub fn handle_enable_menu_item(
         .context("EnableMenuItem flags do not fit u32")?;
 
     let previous_flags = state
-        .window_state.menu_item_states
+        .window_state
+        .menu_item_states
         .iter()
         .find(|(stored_menu, stored_item, _)| *stored_menu == menu_handle && *stored_item == item)
         .map_or(u32::MAX, |(_, _, stored_flags)| *stored_flags);
 
     if let Some(entry) = state
-        .window_state.menu_item_states
+        .window_state
+        .menu_item_states
         .iter_mut()
         .find(|(stored_menu, stored_item, _)| *stored_menu == menu_handle && *stored_item == item)
     {
         entry.2 = flags;
     } else {
-        state.window_state.menu_item_states.push((menu_handle, item, flags));
+        state
+            .window_state
+            .menu_item_states
+            .push((menu_handle, item, flags));
     }
 
     let return_value = u64::from(previous_flags);
@@ -72,20 +77,22 @@ pub fn handle_check_menu_item(
         .context("CheckMenuItem flags do not fit u32")?;
 
     let previous_flags = state
-        .window_state.menu_item_check_states
+        .window_state
+        .menu_item_check_states
         .iter()
         .find(|(stored_menu, stored_item, _)| *stored_menu == menu_handle && *stored_item == item)
         .map_or(u32::MAX, |(_, _, stored_flags)| *stored_flags);
 
-    if let Some(entry) = state
-        .window_state.menu_item_check_states
-        .iter_mut()
-        .find(|(stored_menu, stored_item, _)| *stored_menu == menu_handle && *stored_item == item)
+    if let Some(entry) =
+        state.window_state.menu_item_check_states.iter_mut().find(
+            |(stored_menu, stored_item, _)| *stored_menu == menu_handle && *stored_item == item,
+        )
     {
         entry.2 = flags;
     } else {
         state
-            .window_state.menu_item_check_states
+            .window_state
+            .menu_item_check_states
             .push((menu_handle, item, flags));
     }
 
@@ -119,7 +126,8 @@ pub fn handle_get_menu(
 ) -> Result<WinApiHandlerResult> {
     let hwnd = engine.read_rcx()?;
     let menu_handle = state
-        .window_state.windows
+        .window_state
+        .windows
         .iter()
         .find(|w| w.handle == hwnd)
         .map_or(0, |w| w.menu_handle);

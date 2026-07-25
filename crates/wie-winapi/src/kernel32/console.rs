@@ -1,4 +1,9 @@
-use super::*;
+use super::{
+    Context, DEFAULT_CONSOLE_MODE_IN, DEFAULT_CONSOLE_MODE_OUT, FAKE_STDERR_HANDLE,
+    FAKE_STDIN_HANDLE, FAKE_STDOUT_HANDLE, INVALID_HANDLE_VALUE, MAX_HOST_STDIN_LINE, Result,
+    STD_ERROR_HANDLE_ID, STD_INPUT_HANDLE_ID, STD_OUTPUT_HANDLE_ID, WinApiHandlerResult,
+    WinApiState, low_u32, ret_bool_true, ret_u64, write_guest_u32,
+};
 
 pub(crate) fn read_host_console_stdin_line() -> std::io::Result<Option<Vec<u8>>> {
     use std::io::Read;

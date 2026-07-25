@@ -1,4 +1,21 @@
-use super::*;
+use super::{
+    CREATE_ALWAYS, CREATE_NEW, Context, ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND,
+    ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_PATH_NOT_FOUND, ERROR_READ_FAULT,
+    FAKE_DISK_CLUSTERS, FAKE_DISK_GIB, FAKE_STDERR_HANDLE, FAKE_STDIN_HANDLE, FAKE_STDOUT_HANDLE,
+    FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY, FILE_BEGIN, FILE_CURRENT, FILE_END,
+    FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_UNKNOWN, FIXED_SYSTEM_FILETIME,
+    INVALID_FILE_ATTRIBUTES, INVALID_HANDLE_VALUE, INVALID_SET_FILE_POINTER, LOGICAL_DRIVE_TCHARS,
+    OPEN_ALWAYS, OPEN_EXISTING, OpenFileOutcome, OpenGuestFile, Path, Result, TRUNCATE_EXISTING,
+    WinApiHandlerResult, WinApiState, checked_address, checked_field_address,
+    file_attributes_for_path, finish_create_directory, finish_create_file,
+    finish_create_file_create_only, finish_delete_file, finish_find_first, finish_find_next,
+    finish_move_file, finish_remove_directory, get_user_profile_dir_impl, is_main_module_path,
+    low_u32, read_ansi_string_from_cpu, read_guest_u64, read_guest_utf16_lossy, read_stack_u64,
+    read_wide_string_from_cpu, refill_stdin_from_host, resolve_full_windows_path, ret_bool_true,
+    ret_u64, stat_guest_path, sync_open_bytes_to_virtual, temp_name_id_u32, write_fixed_dir_a,
+    write_fixed_dir_w, write_guest_u16, write_guest_u32, write_guest_u64, write_guest_utf16_units,
+    write_mock_string_a, write_mock_string_w,
+};
 
 pub(crate) fn is_console_output_handle(handle: u64) -> bool {
     matches!(handle, FAKE_STDOUT_HANDLE | FAKE_STDERR_HANDLE)
@@ -210,7 +227,8 @@ pub fn handle_find_close(
         .context("failed to read RCX for FindClose")?;
 
     state
-        .file_io.find_handles
+        .file_io
+        .find_handles
         .retain(|handle| handle.handle != find_handle);
 
     let return_address = engine
@@ -448,7 +466,10 @@ pub(crate) fn paths_match_guest(requested: &str, candidate: &str) -> bool {
 pub(crate) fn find_open_file(state: &WinApiState, handle: u64) -> Option<&OpenGuestFile> {
     state.file_io.open_files.get(&handle)
 }
-pub(crate) fn find_open_file_mut(state: &mut WinApiState, handle: u64) -> Option<&mut OpenGuestFile> {
+pub(crate) fn find_open_file_mut(
+    state: &mut WinApiState,
+    handle: u64,
+) -> Option<&mut OpenGuestFile> {
     state.file_io.open_files.get_mut(&handle)
 }
 pub(crate) fn is_open_file_handle(state: &WinApiState, handle: u64) -> bool {
@@ -482,7 +503,8 @@ pub(crate) fn open_or_create_guest_path(
     let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full_path = resolve_full_windows_path(&cwd, guest_path);
 
-    let bottle_host = crate::vfs::guest_path_to_host(&state.file_io.volumes, &full_path).map(|m| m.host);
+    let bottle_host =
+        crate::vfs::guest_path_to_host(&state.file_io.volumes, &full_path).map(|m| m.host);
     let existed = guest_path_exists(state, &full_path);
 
     match creation_disposition {
@@ -543,7 +565,8 @@ pub(crate) fn open_existing_guest_file(
 ) -> std::result::Result<u64, u32> {
     let host_path = bottle_host.cloned().or_else(|| {
         state
-            .file_io.host_file_mounts
+            .file_io
+            .host_file_mounts
             .iter()
             .find(|m| paths_match_guest(guest_path, &m.guest_path))
             .map(|m| m.host_path.clone())
@@ -593,7 +616,8 @@ pub(crate) fn create_new_guest_file(
 }
 pub(crate) fn ensure_virtual_file(state: &mut WinApiState, guest_path: &str) {
     if state
-        .file_io.virtual_files
+        .file_io
+        .virtual_files
         .iter()
         .any(|entry| paths_match_guest(guest_path, &entry.guest_path))
     {
@@ -611,7 +635,8 @@ pub(crate) fn resolve_guest_file_bytes(state: &WinApiState, guest_path: &str) ->
     }
 
     if let Some(mount) = state
-        .file_io.host_file_mounts
+        .file_io
+        .host_file_mounts
         .iter()
         .find(|mount| paths_match_guest(guest_path, &mount.guest_path))
     {
@@ -635,7 +660,8 @@ pub(crate) fn resolve_guest_file_bytes(state: &WinApiState, guest_path: &str) ->
     }
 
     if let Some(virtual_file) = state
-        .file_io.virtual_files
+        .file_io
+        .virtual_files
         .iter()
         .find(|entry| paths_match_guest(guest_path, &entry.guest_path))
     {
@@ -652,7 +678,10 @@ pub(crate) fn resolve_guest_file_bytes(state: &WinApiState, guest_path: &str) ->
 
     anyhow::bail!("guest file not found: {guest_path}")
 }
-pub(crate) fn read_create_file_stack_u32(engine: &mut dyn wie_cpu::CpuEngine, offset: u64) -> Result<u32> {
+pub(crate) fn read_create_file_stack_u32(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    offset: u64,
+) -> Result<u32> {
     let rsp = engine
         .read_rsp()
         .context("failed to read RSP for CreateFile stack arg")?;
@@ -686,7 +715,8 @@ pub(crate) fn allocate_open_file_ex(
     let handle = state.file_io.next_file_handle;
 
     state.file_io.next_file_handle = state
-        .file_io.next_file_handle
+        .file_io
+        .next_file_handle
         .checked_add(1)
         .context("guest file handle allocator overflow")?;
 
@@ -810,7 +840,8 @@ pub fn mount_host_file(
 
     // Replace existing mount for the same guest path.
     state
-        .file_io.host_file_mounts
+        .file_io
+        .host_file_mounts
         .retain(|mount| !paths_match_guest(guest_path, &mount.guest_path));
 
     state.file_io.host_file_mounts.push(crate::HostFileMount {
@@ -825,14 +856,16 @@ pub(crate) fn guest_path_exists(state: &WinApiState, path: &str) -> bool {
         return true;
     }
     if state
-        .file_io.host_file_mounts
+        .file_io
+        .host_file_mounts
         .iter()
         .any(|mount| paths_match_guest(path, &mount.guest_path))
     {
         return true;
     }
     if state
-        .file_io.virtual_files
+        .file_io
+        .virtual_files
         .iter()
         .any(|entry| paths_match_guest(path, &entry.guest_path))
     {
@@ -1161,11 +1194,19 @@ pub fn handle_read_file(
         let requested =
             usize::try_from(bytes_to_read).context("ReadFile byte count does not fit usize")?;
 
-        let mut available = state.file_io.stdin_bytes.len().saturating_sub(state.file_io.stdin_cursor);
+        let mut available = state
+            .file_io
+            .stdin_bytes
+            .len()
+            .saturating_sub(state.file_io.stdin_cursor);
         if available == 0 && state.file_io.stdin_mode == crate::GuestStdinMode::LiveHost {
             match refill_stdin_from_host(state) {
                 Ok(true) => {
-                    available = state.file_io.stdin_bytes.len().saturating_sub(state.file_io.stdin_cursor);
+                    available = state
+                        .file_io
+                        .stdin_bytes
+                        .len()
+                        .saturating_sub(state.file_io.stdin_cursor);
                 }
                 Ok(false) => {
                     // Host EOF → success with 0 bytes (already zeroed count).
@@ -1190,11 +1231,13 @@ pub fn handle_read_file(
         let read_len = requested.min(available);
         if read_len > 0 {
             let end = state
-                .file_io.stdin_cursor
+                .file_io
+                .stdin_cursor
                 .checked_add(read_len)
                 .context("ReadFile stdin end overflow")?;
             let data = state
-                .file_io.stdin_bytes
+                .file_io
+                .stdin_bytes
                 .get(state.file_io.stdin_cursor..end)
                 .context("ReadFile stdin slice out of range")?;
             engine
@@ -1913,7 +1956,8 @@ pub fn handle_get_volume_information_w(
 
     // Derive volume label from the bottle root name, or use a default.
     let label = state
-        .file_io.bottle_root
+        .file_io
+        .bottle_root
         .as_ref()
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str())
@@ -1970,7 +2014,8 @@ pub fn handle_get_volume_information_a(
         .unwrap_or(0);
 
     let label = state
-        .file_io.bottle_root
+        .file_io
+        .bottle_root
         .as_ref()
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str())
@@ -2465,7 +2510,8 @@ pub(crate) fn handle_duplicate_handle(
 
     // Pseudohandle path: find or create the ThreadObject for `tid`.
     let source_obj = state
-        .kernel.sync
+        .kernel
+        .sync
         .objects
         .values()
         .find_map(|obj| match obj {
@@ -2474,7 +2520,8 @@ pub(crate) fn handle_duplicate_handle(
         })
         .unwrap_or_else(|| {
             let (_, th) = state
-                .kernel.sync
+                .kernel
+                .sync
                 .register_thread(tid, wie_cpu::ThreadContext::default());
             crate::KernelObject::Thread(th)
         });

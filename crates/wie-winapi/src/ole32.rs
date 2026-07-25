@@ -1,6 +1,6 @@
 //! Minimal `ole32.dll` stubs for COM-touching CLI tools (e.g. 7-Zip).
 
-use crate::{WinApiHandlerResult, WinApiState};
+use crate::{HandlerContext, WinApiHandlerResult};
 use anyhow::{Context, Result};
 
 /// `S_OK`
@@ -23,10 +23,10 @@ fn ret(engine: &mut dyn wie_cpu::CpuEngine, value: u64) -> Result<WinApiHandlerR
 
 /// Soft dispatch for `ole32.dll` exports used by real tools.
 pub fn dispatch_ole32(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    _state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
+    let engine = &mut *ctx.engine;
     let n = name.to_ascii_lowercase();
     match n.as_str() {
         "coinitialize" => Ok(Some(handle_co_initialize(engine)?)),

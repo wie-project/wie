@@ -710,7 +710,8 @@ pub fn handle_set_render_state(
         .context("SetRenderState value does not fit u32")?;
 
     if let Some(entry) = state
-        .d3d9.d3d9_render_states
+        .d3d9
+        .d3d9_render_states
         .iter_mut()
         .find(|(stored_state, _)| *stored_state == render_state)
     {
@@ -762,14 +763,16 @@ pub fn handle_set_texture_stage_state(
         .context("SetTextureStageState value does not fit u32")?;
 
     if let Some(entry) = state
-        .d3d9.d3d9_texture_stage_states
+        .d3d9
+        .d3d9_texture_stage_states
         .iter_mut()
         .find(|(stored_stage, stored_type, _)| *stored_stage == stage && *stored_type == state_type)
     {
         entry.2 = value;
     } else {
         state
-            .d3d9.d3d9_texture_stage_states
+            .d3d9
+            .d3d9_texture_stage_states
             .push((stage, state_type, value));
     }
 
@@ -805,13 +808,17 @@ pub fn handle_set_sampler_state(
         u32::try_from(engine.read_r9()? & u64::from(u32::MAX)).context("value does not fit u32")?;
 
     if let Some(entry) = state
-        .d3d9.d3d9_sampler_states
+        .d3d9
+        .d3d9_sampler_states
         .iter_mut()
         .find(|(s, t, _)| *s == sampler && *t == state_type)
     {
         entry.2 = value;
     } else {
-        state.d3d9.d3d9_sampler_states.push((sampler, state_type, value));
+        state
+            .d3d9
+            .d3d9_sampler_states
+            .push((sampler, state_type, value));
     }
 
     let return_value = D3D_OK;
@@ -847,7 +854,10 @@ pub fn handle_device_release(
                 .checked_sub(IDIRECT3DDEVICE9_OBJECT_OFFSET)
                 .context("IDirect3DDevice9 allocation address underflow")?;
 
-            let _ = state.heap_state.heap.free_coherent(engine, allocation_address);
+            let _ = state
+                .heap_state
+                .heap
+                .free_coherent(engine, allocation_address);
 
             state.d3d9.d3d9_device_object_address = 0;
             state.d3d9.d3d9_current_vertex_shader = 0;
@@ -893,7 +903,10 @@ pub fn handle_direct3d9_release(
                 .checked_sub(IDIRECT3D9_OBJECT_OFFSET)
                 .context("IDirect3D9 allocation address underflow")?;
 
-            let _ = state.heap_state.heap.free_coherent(engine, allocation_address);
+            let _ = state
+                .heap_state
+                .heap
+                .free_coherent(engine, allocation_address);
 
             state.d3d9.d3d9_object_address = 0;
         }

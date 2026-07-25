@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    ERROR_INVALID_PARAMETER, Result, WinApiHandlerResult, WinApiState, ret_bool_true, ret_u64,
+    write_guest_u32,
+};
 
 pub fn handle_map_view_of_file(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -56,7 +59,8 @@ pub(crate) fn handle_virtual_alloc(
             })
         }
         Err(e) => {
-            state.process.last_error = wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
+            state.process.last_error =
+                wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
             tracing::debug!(
                 addr,
                 size,
@@ -100,7 +104,8 @@ pub(crate) fn handle_virtual_free(
             })
         }
         Err(e) => {
-            state.process.last_error = wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
+            state.process.last_error =
+                wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
             let return_address = engine.return_from_win64_api(0)?;
             Ok(WinApiHandlerResult {
                 return_address,
@@ -146,7 +151,8 @@ pub(crate) fn handle_virtual_protect(
             })
         }
         Err(e) => {
-            state.process.last_error = wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
+            state.process.last_error =
+                wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
             let return_address = engine.return_from_win64_api(0)?;
             Ok(WinApiHandlerResult {
                 return_address,

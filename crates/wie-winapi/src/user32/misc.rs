@@ -1,4 +1,10 @@
-use super::*;
+use super::{
+    Context, DIALOG_BASE_UNIT_X, DIALOG_BASE_UNIT_Y, FAKE_CURSOR_HANDLE, FAKE_ICON_HANDLE,
+    FAKE_IMAGE_HANDLE, FAKE_WINDOW_HANDLE, IDOK, Result, TimerRecord, WinApiHandlerResult,
+    WinApiState, WindowClassRecord, WindowsHookRecord, checked_field_address, low_i32,
+    read_guest_ansi_lossy, read_guest_i32, read_guest_u32, read_guest_u64, read_guest_utf16_lossy,
+    register_window_class,
+};
 
 pub fn handle_load_icon_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _instance_handle = engine
@@ -404,7 +410,8 @@ pub fn handle_set_timer(
             let generated_id = state.window_state.next_timer_id;
 
             state.window_state.next_timer_id = state
-                .window_state.next_timer_id
+                .window_state
+                .next_timer_id
                 .checked_add(1)
                 .context("SetTimer identifier overflow")?;
 
@@ -414,7 +421,8 @@ pub fn handle_set_timer(
         };
 
         if let Some(timer) = state
-            .window_state.timers
+            .window_state
+            .timers
             .iter_mut()
             .find(|timer| timer.window_handle == window_handle && timer.timer_id == timer_id)
         {
@@ -456,13 +464,15 @@ pub fn handle_kill_timer(
         .context("failed to read RDX for KillTimer")?;
 
     let existed = state
-        .window_state.timers
+        .window_state
+        .timers
         .iter()
         .any(|timer| timer.window_handle == window_handle && timer.timer_id == timer_id);
 
     if existed {
         state
-            .window_state.timers
+            .window_state
+            .timers
             .retain(|timer| timer.window_handle != window_handle || timer.timer_id != timer_id);
     }
 
@@ -509,7 +519,8 @@ pub fn handle_set_windows_hook_ex_w(
         let handle = state.window_state.next_windows_hook_handle;
 
         state.window_state.next_windows_hook_handle = state
-            .window_state.next_windows_hook_handle
+            .window_state
+            .next_windows_hook_handle
             .checked_add(1)
             .context("SetWindowsHookExW handle overflow")?;
 
@@ -542,13 +553,15 @@ pub fn handle_unhook_windows_hook_ex(
         .context("failed to read RCX for UnhookWindowsHookEx")?;
 
     let existed = state
-        .window_state.windows_hooks
+        .window_state
+        .windows_hooks
         .iter()
         .any(|hook| hook.handle == hook_handle);
 
     if existed {
         state
-            .window_state.windows_hooks
+            .window_state
+            .windows_hooks
             .retain(|hook| hook.handle != hook_handle);
     }
 
@@ -632,5 +645,8 @@ pub(crate) fn window_client_size(state: &WinApiState, handle: u64) -> (i32, i32)
         };
         return (width.max(1), height.max(1));
     }
-    (state.window_state.window_width.max(1), state.window_state.window_height.max(1))
+    (
+        state.window_state.window_width.max(1),
+        state.window_state.window_height.max(1),
+    )
 }

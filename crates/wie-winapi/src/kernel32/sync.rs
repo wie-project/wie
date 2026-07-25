@@ -1,4 +1,9 @@
-use super::*;
+use super::{
+    Context, ERROR_FILE_NOT_FOUND, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER,
+    ERROR_TOO_MANY_POSTS, EnterCsResult, Result, WinApiHandlerResult, WinApiState,
+    checked_field_address, i32_to_rax, i64_to_rax, low_u32, read_guest_u64, ret_u64, trunc_i32,
+    write_guest_u32, write_guest_u64,
+};
 
 pub(crate) fn write_critical_section_unlocked(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -103,7 +108,8 @@ pub fn handle_leave_critical_section(
         .context("failed to read RCX for LeaveCriticalSection")?;
 
     if cs != 0 {
-        let unlocked = leave_critical_section_guest(engine, cs, state.kernel.threads.current_tid())?;
+        let unlocked =
+            leave_critical_section_guest(engine, cs, state.kernel.threads.current_tid())?;
         if unlocked {
             // Wake one host waiter (if any) parked on this CS.
             if let Some(q) = state.kernel.sync.cs_waiters.get(&cs) {
@@ -272,7 +278,8 @@ pub fn handle_release_semaphore(
             .unwrap_or(0)
             .to_le_bytes(),
     );
-    let Some(crate::KernelObject::Semaphore(sem)) = state.kernel.sync.object(handle).cloned() else {
+    let Some(crate::KernelObject::Semaphore(sem)) = state.kernel.sync.object(handle).cloned()
+    else {
         state.process.last_error = ERROR_INVALID_HANDLE;
         return ret_u64(engine, 0, "ReleaseSemaphore");
     };
@@ -563,7 +570,9 @@ pub(crate) fn handle_interlocked_decrement(
         return_value: i32_to_rax(new),
     })
 }
-pub(crate) fn handle_interlocked_exchange(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub(crate) fn handle_interlocked_exchange(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
     use std::sync::atomic::Ordering;
     let addr = engine.read_rcx().context("InterlockedExchange RCX")?;
     // RDX carries the new LONG (low 32 bits).
@@ -914,7 +923,8 @@ pub(crate) fn handle_flush_instruction_cache(
             })
         }
         Err(e) => {
-            state.process.last_error = wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
+            state.process.last_error =
+                wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
             let return_address = engine.return_from_win64_api(0)?;
             Ok(WinApiHandlerResult {
                 return_address,

@@ -302,7 +302,8 @@ pub fn continue_pending(
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
     let mut pending = state
-        .kernel.seh_pending
+        .kernel
+        .seh_pending
         .take()
         .ok_or_else(|| anyhow::anyhow!("SEH continue trampoline with no pending work"))?;
 
@@ -352,7 +353,8 @@ pub fn continue_pending(
 #[must_use]
 pub fn has_cleanup_resume(state: &WinApiState) -> bool {
     state
-        .kernel.seh_pending
+        .kernel
+        .seh_pending
         .as_ref()
         .is_some_and(|p| p.expect_cleanup_resume && !p.steps.is_empty())
 }
@@ -644,7 +646,8 @@ fn run_next_step(
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
     let pending = state
-        .kernel.seh_pending
+        .kernel
+        .seh_pending
         .as_mut()
         .ok_or_else(|| anyhow::anyhow!("SEH run_next_step with empty pending"))?;
 
@@ -1038,21 +1041,32 @@ fn resolve_landing_pad(
     //   filter > 1 → RVA of filter function (not yet supported)
     for &cand in &candidates {
         let mut buf = [0u8; 4];
-        if read_mem(cand, &mut buf).is_err() { continue; }
+        if read_mem(cand, &mut buf).is_err() {
+            continue;
+        }
         let count = u32::from_le_bytes(buf);
-        if count == 0 || count > 64 { continue; }
+        if count == 0 || count > 64 {
+            continue;
+        }
         // Read the first entry to check if format looks like Clang __except
         let mut entry_buf = [0u8; 16];
-        if read_mem(cand.wrapping_add(4), &mut entry_buf).is_err() { continue; }
+        if read_mem(cand.wrapping_add(4), &mut entry_buf).is_err() {
+            continue;
+        }
         let try_low = u32::from_le_bytes(entry_buf[0..4].try_into().unwrap());
         let try_high = u32::from_le_bytes(entry_buf[4..8].try_into().unwrap());
         let filter = u32::from_le_bytes(entry_buf[8..12].try_into().unwrap());
         let handler = u32::from_le_bytes(entry_buf[12..16].try_into().unwrap());
         // Sanity check: try range should be within the function, filter should be 1 or a valid RVA
-        if try_low >= try_high { continue; }
-        let func_start_rva = u32::try_from(func_start.saturating_sub(unwound.image_base)).unwrap_or(0);
+        if try_low >= try_high {
+            continue;
+        }
+        let func_start_rva =
+            u32::try_from(func_start.saturating_sub(unwound.image_base)).unwrap_or(0);
         let func_end_rva = u32::try_from(func_end.saturating_sub(unwound.image_base)).unwrap_or(0);
-        if try_low < func_start_rva || try_high > func_end_rva { continue; }
+        if try_low < func_start_rva || try_high > func_end_rva {
+            continue;
+        }
         // __except(1) always matches; otherwise check if control_pc falls in try range
         if filter == 1 {
             let landing_pad = unwound.image_base.wrapping_add(u64::from(handler));

@@ -3,8 +3,8 @@
 //! Source of truth for handler bodies: historical match arms (kept here as id match).
 
 use crate::{
-    WinApiEnvironment, WinApiHandlerResult, WinApiState, advapi32, comctl32, comdlg32, d3d9, gdi32,
-    kernel32, user32, uxtheme, winmm,
+    HandlerContext, WinApiHandlerResult, advapi32, comctl32, comdlg32, d3d9, gdi32, kernel32,
+    user32, uxtheme, winmm,
 };
 use anyhow::{Result, bail};
 
@@ -1614,11 +1614,12 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
 
 /// Hot-path dispatch: integer match (LLVM jump table), no string work.
 pub fn dispatch_winapi_id(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    environment: WinApiEnvironment,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
     id: WinApiId,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let environment = ctx.environment;
     match id {
         WinApiId::Kernel32Getversionexa => kernel32::handle_get_version_ex_a(engine),
         WinApiId::Kernel32Getmodulehandlea => {
@@ -2025,42 +2026,40 @@ pub fn dispatch_winapi_id(
 
 /// Cold-path wrapper for callers that only have library/name strings.
 pub fn dispatch_winapi(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    environment: WinApiEnvironment,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
     library: &str,
     name: &str,
 ) -> Result<WinApiHandlerResult> {
     if let Some(id) = resolve_winapi_id(library, name) {
-        return dispatch_winapi_id(engine, environment, state, id);
+        return dispatch_winapi_id(ctx, id);
     }
     // UCRT API sets (api-ms-win-crt-*.dll) + ucrtbase/msvcrt — CRT-linked PEs.
     if crate::ucrt::is_ucrt_library(library) {
-        return crate::ucrt::dispatch_ucrt(engine, environment, state, name);
+        return crate::ucrt::dispatch_ucrt(ctx, name);
     }
     // Kernel32 CRT-deps not yet in the dense id table (Virtual*, Tls*).
     if library.eq_ignore_ascii_case("KERNEL32.dll")
-        && let Some(r) = kernel32::dispatch_kernel32_extra(engine, environment, state, name)?
+        && let Some(r) = kernel32::dispatch_kernel32_extra(ctx, name)?
     {
         return Ok(r);
     }
     if library.eq_ignore_ascii_case("ole32.dll")
-        && let Some(r) = crate::ole32::dispatch_ole32(engine, state, name)?
+        && let Some(r) = crate::ole32::dispatch_ole32(ctx, name)?
     {
         return Ok(r);
     }
     if library.eq_ignore_ascii_case("shell32.dll")
-        && let Some(r) = crate::shell32::dispatch_shell32(engine, state, name)?
+        && let Some(r) = crate::shell32::dispatch_shell32(ctx, name)?
     {
         return Ok(r);
     }
     if library.eq_ignore_ascii_case("advapi32.dll")
-        && let Some(r) = advapi32::dispatch_advapi32_extra(engine, state, name)?
+        && let Some(r) = advapi32::dispatch_advapi32_extra(ctx, name)?
     {
         return Ok(r);
     }
     if library.eq_ignore_ascii_case("oleaut32.dll")
-        && let Some(r) = crate::oleaut32::dispatch_oleaut32(engine, state, name)?
+        && let Some(r) = crate::oleaut32::dispatch_oleaut32(ctx, name)?
     {
         return Ok(r);
     }
@@ -2069,13 +2068,13 @@ pub fn dispatch_winapi(
         || library.eq_ignore_ascii_case("libwinpthread-1")
         || library.starts_with("libwinpthread")
     {
-        return crate::mingw_dispatch::dispatch_pthread(engine, name);
+        return crate::mingw_dispatch::dispatch_pthread(ctx, name);
     }
     if library.eq_ignore_ascii_case("libstdc++-6.dll")
         || library.eq_ignore_ascii_case("libstdc++-6")
         || library.starts_with("libstdc++")
     {
-        return crate::mingw_dispatch::dispatch_stdcpp(engine, state, name);
+        return crate::mingw_dispatch::dispatch_stdcpp(ctx, name);
     }
     bail!("unsupported WinAPI call: {library}!{name}");
 }
@@ -2162,10 +2161,8 @@ static WINAPI_TRAITS: [WinApiTraits; WINAPI_ID_COUNT] = {
     let mut t = [WinApiTraits::EMPTY; WINAPI_ID_COUNT];
 
     // ── CS host-handler requirement (no in-guest / fast-void-sync) ──────
-    t[WinApiId::Kernel32Entercriticalsection as u16 as usize] =
-        WinApiTraits::EMPTY.with_noisy();
-    t[WinApiId::Kernel32Leavecriticalsection as u16 as usize] =
-        WinApiTraits::EMPTY.with_noisy();
+    t[WinApiId::Kernel32Entercriticalsection as u16 as usize] = WinApiTraits::EMPTY.with_noisy();
+    t[WinApiId::Kernel32Leavecriticalsection as u16 as usize] = WinApiTraits::EMPTY.with_noisy();
 
     // ── In-guest stubs / guest-accelerated ──────────────────────────────
     let guest_stub = WinApiTraits::EMPTY.with_noisy().with_guest_stub();
