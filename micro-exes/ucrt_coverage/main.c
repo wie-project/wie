@@ -21,10 +21,7 @@ static void check(const char* name, int ok) {
 }
 
 int main() {
-    printf("=== UCRT Coverage Test ===\n\n");
-
     // ── stdlib ──────────────────────────────────────────────────
-    printf("-- stdlib --\n");
     check("abs",        abs(-5) == 5);
     check("labs",       labs(-5L) == 5L);
     check("atol",       atol("123") == 123L);
@@ -37,7 +34,6 @@ int main() {
     }
 
     // ── string ──────────────────────────────────────────────────
-    printf("\n-- string --\n");
     {
         char buf[64];
         strcpy(buf, "hello");
@@ -68,7 +64,6 @@ int main() {
     }
 
     // ── stdio ───────────────────────────────────────────────────
-    printf("\n-- stdio --\n");
     check("puts",       1); // puts already works, tested before
     {
         // fopen/fread/fwrite/fclose skipped — needs VFS bridge.
@@ -82,7 +77,6 @@ int main() {
     }
 
     // ── time ────────────────────────────────────────────────────
-    printf("\n-- time --\n");
     {
         time_t t = time(NULL);
         check("time",       t != -1);
@@ -94,7 +88,6 @@ int main() {
     // ── math skipped (triggers COMISD SSE, not yet emulated) ─────
 
     // ── ctype ────────────────────────────────────────────────────
-    printf("\n-- ctype --\n");
     check("isdigit",    isdigit('5') != 0);
     check("isalpha",    isalpha('a') != 0);
     check("isalnum",    isalnum('9') != 0);
@@ -105,20 +98,11 @@ int main() {
     check("tolower",    tolower('A') == 'a');
 
     // ── errno ──────────────────────────────────────────────────
-    printf("\n-- errno --\n");
     errno = 0;
     check("errno=0",    errno == 0);
     check("strerror",   strerror(0) != NULL);
 
-    // ── signal ────────────────────────────────────────────────
-    printf("\n-- signal --\n");
     check("SIG_DFL",    signal(SIGTERM, SIG_DFL) != SIG_ERR);
-
-    // ── locale ─────────────────────────────────────────────────
-    printf("\n-- locale --\n");
     check("setlocale",  setlocale(LC_ALL, "C") != NULL);
-
-    // ── Summary ────────────────────────────────────────────────
-    printf("\n=== Results: %d passed, %d failed ===\n", passed, failed);
     return failed > 0 ? 1 : 0;
 }
