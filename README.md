@@ -67,6 +67,14 @@ mkdir -p "$BOTTLE/drive_c/App"
 # Full clean-room gate (builds micros + runs all PE gates under WIE_CPU=jit)
 make -C micro-exes && ./scripts/run-micro-suite.sh
 
+# Run a specific category instead of the full suite:
+./scripts/run-micro-suite.sh cpp_exes    # C++ exception tests only
+./scripts/run-micro-suite.sh seh_exes    # SEH hardware-fault tests
+./scripts/run-micro-suite.sh game        # interactive game test
+./scripts/run-micro-suite.sh n1          # no-bottle micros only
+./scripts/run-micro-suite.sh n2          # bottle/VFS tests only
+./scripts/run-micro-suite.sh dll_tests   # DLL loader tests
+
 # JIT / CPU A/B
 WIE_CPU=iced  ./scripts/run-micro-suite.sh          # interpreter only (long_loop may hit slice limit)
 WIE_JIT_MEM=slow ./scripts/run-micro-suite.sh       # helper-only loads/stores
