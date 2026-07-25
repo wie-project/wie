@@ -393,6 +393,7 @@ pub(super) unsafe extern "C" fn wie_ucrt_fwrite(
     count: u64,
     stream: u64,
 ) -> u64 {
+    const MAX_FWRITE_OUTPUT: usize = 64 * 1024;
     let ctx = unsafe { &mut *ctx };
     if ctx.fault != 0 {
         return 0;
@@ -413,9 +414,9 @@ pub(super) unsafe extern "C" fn wie_ucrt_fwrite(
         return count;
     }
 
-    // Security: validate the entire range `[buf, buf+total)` is readable via
+    // Security: validate the entire range [buf, buf+total) is readable via
     // a probe read on the first byte before entering the output loop.
-    // `mem.read()` enforces SPC (Software Permission Check), so unmapped or
+    // mem.read() enforces SPC (Software Permission Check), so unmapped or
     // non-readable addresses produce an error and no bytes reach the host.
     let mem = mem_mut(ctx);
     let mut probe = [0_u8; 1];
@@ -423,9 +424,6 @@ pub(super) unsafe extern "C" fn wie_ucrt_fwrite(
         return count; // Silently skip: same as /dev/null.
     }
 
-    // Cap output at 64 KiB per call to limit information disclosure through
-    // hostile `fwrite(buf=<large mapped range>, size, count, stdout)` calls.
-    const MAX_FWRITE_OUTPUT: usize = 64 * 1024;
     let capped = total_usize.min(MAX_FWRITE_OUTPUT);
 
     // Chunked host write — avoid a single heap allocation the size of the whole

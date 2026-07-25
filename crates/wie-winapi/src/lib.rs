@@ -127,9 +127,9 @@ pub struct FileIoState {
 /// `Clone` and `Debug` without losing the closure's captured state.
 #[derive(Clone)]
 pub struct ImportResolver {
-    inner: std::sync::Arc<std::sync::Mutex<
-        Box<dyn FnMut(&str, &str, u64) -> anyhow::Result<u64> + Send>,
-    >>,
+    inner: std::sync::Arc<
+        std::sync::Mutex<Box<dyn FnMut(&str, &str, u64) -> anyhow::Result<u64> + Send>>,
+    >,
 }
 
 impl std::fmt::Debug for ImportResolver {
@@ -139,20 +139,13 @@ impl std::fmt::Debug for ImportResolver {
 }
 
 impl ImportResolver {
-    pub fn new(
-        f: Box<dyn FnMut(&str, &str, u64) -> anyhow::Result<u64> + Send>,
-    ) -> Self {
+    pub fn new(f: Box<dyn FnMut(&str, &str, u64) -> anyhow::Result<u64> + Send>) -> Self {
         Self {
             inner: std::sync::Arc::new(std::sync::Mutex::new(f)),
         }
     }
 
-    pub fn resolve(
-        &mut self,
-        lib: &str,
-        name: &str,
-        slot: u64,
-    ) -> anyhow::Result<u64> {
+    pub fn resolve(&mut self, lib: &str, name: &str, slot: u64) -> anyhow::Result<u64> {
         // unwrap: the Mutex is not poisoned in practice (single-threaded use).
         self.inner.lock().unwrap()(lib, name, slot)
     }
@@ -287,6 +280,33 @@ impl Clone for WinApiState {
             module_state: self.module_state.clone(),
             process: self.process.clone(),
             kernel: self.kernel.clone(),
+        }
+    }
+}
+
+/// Bundle of everything a WinAPI handler may need.
+///
+/// Passed as `HandlerContext` to every handler so adding new context
+/// fields doesn't touch handler signatures and the dispatch table is uniform.
+pub struct HandlerContext<'a> {
+    /// CPU engine (mem_read / mem_write / register access).
+    pub engine: &'a mut dyn CpuEngine,
+    /// Session environment (image base, command line, heap handle, …).
+    pub environment: WinApiEnvironment,
+    /// Full emulator state.
+    pub state: &'a mut WinApiState,
+}
+
+impl<'a> HandlerContext<'a> {
+    pub fn new(
+        engine: &'a mut dyn CpuEngine,
+        environment: WinApiEnvironment,
+        state: &'a mut WinApiState,
+    ) -> Self {
+        Self {
+            engine,
+            environment,
+            state,
         }
     }
 }
@@ -720,6 +740,7 @@ pub use dispatch_table::{
     WINAPI_ID_COUNT, WinApiId, WinApiTraits, dispatch_winapi, dispatch_winapi_id,
     is_winapi_implemented, resolve_winapi_id, winapi_id_export,
 };
+use wie_cpu::CpuEngine;
 
 #[cfg(test)]
 #[expect(clippy::expect_used)]
@@ -932,56 +953,39 @@ mod tests {
     fn test_interlocked_ops_host_atomics() {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
+        let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
         let cell = 0x4000_u64;
         // Zero cell.
-        engine.mem_write(cell, &0_i32.to_le_bytes()).expect("zero");
+        ctx.engine
+            .mem_write(cell, &0_i32.to_le_bytes())
+            .expect("zero");
 
         // Increment → 1
         write_regs(&mut engine, cell, 0, 0, 0, 0);
-        let r = kernel32::dispatch_kernel32_extra(
-            &mut engine,
-            default_env(),
-            &mut state,
-            "InterlockedIncrement",
-        )
-        .expect("dispatch")
-        .expect("handled");
+        let r = kernel32::dispatch_kernel32_extra(ctx, "InterlockedIncrement")
+            .expect("dispatch")
+            .expect("handled");
         assert_eq!(rax_low_i32(r.return_value), 1);
 
         // ExchangeAdd(+5) returns previous 1, cell becomes 6
         write_regs(&mut engine, cell, 5, 0, 0, 0);
-        let r = kernel32::dispatch_kernel32_extra(
-            &mut engine,
-            default_env(),
-            &mut state,
-            "InterlockedExchangeAdd",
-        )
-        .expect("dispatch")
-        .expect("handled");
+        let r = kernel32::dispatch_kernel32_extra(ctx, "InterlockedExchangeAdd")
+            .expect("dispatch")
+            .expect("handled");
         assert_eq!(rax_low_i32(r.return_value), 1);
 
         // CompareExchange success 6→99
         write_regs(&mut engine, cell, 99, 6, 0, 0);
-        let r = kernel32::dispatch_kernel32_extra(
-            &mut engine,
-            default_env(),
-            &mut state,
-            "InterlockedCompareExchange",
-        )
-        .expect("dispatch")
-        .expect("handled");
+        let r = kernel32::dispatch_kernel32_extra(ctx, "InterlockedCompareExchange")
+            .expect("dispatch")
+            .expect("handled");
         assert_eq!(rax_low_i32(r.return_value), 6);
 
         // CompareExchange fail (expect 6, still 99)
         write_regs(&mut engine, cell, 1, 6, 0, 0);
-        let r = kernel32::dispatch_kernel32_extra(
-            &mut engine,
-            default_env(),
-            &mut state,
-            "InterlockedCompareExchange",
-        )
-        .expect("dispatch")
-        .expect("handled");
+        let r = kernel32::dispatch_kernel32_extra(ctx, "InterlockedCompareExchange")
+            .expect("dispatch")
+            .expect("handled");
         assert_eq!(rax_low_i32(r.return_value), 99);
 
         let mut bytes = [0_u8; 4];
@@ -994,14 +998,9 @@ mod tests {
             .mem_write(cell64, &10_i64.to_le_bytes())
             .expect("zero64");
         write_regs(&mut engine, cell64, 0, 0, 0, 0);
-        let r = kernel32::dispatch_kernel32_extra(
-            &mut engine,
-            default_env(),
-            &mut state,
-            "InterlockedIncrement64",
-        )
-        .expect("dispatch")
-        .expect("handled");
+        let r = kernel32::dispatch_kernel32_extra(ctx, "InterlockedIncrement64")
+            .expect("dispatch")
+            .expect("handled");
         assert_eq!(i64::from_le_bytes(r.return_value.to_le_bytes()), 11);
     }
 
@@ -1580,6 +1579,9 @@ mod tests {
             wie_cpu::exception_code::ACCESS_VIOLATION,
             0x0, // fault at address 0
         );
-        assert!(result.is_err(), "unhandled hardware fault should return error");
+        assert!(
+            result.is_err(),
+            "unhandled hardware fault should return error"
+        );
     }
 }
