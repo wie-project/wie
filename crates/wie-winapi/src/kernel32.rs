@@ -313,15 +313,15 @@ pub fn handle_get_module_handle_a(
         .context("failed to read RCX for GetModuleHandleA")?;
 
     let return_value = if module_name_ptr == 0 {
-        state.last_error = 0;
+        state.process.last_error = 0;
         environment.image_base
     } else {
         let module_name = read_ansi_string_from_cpu(engine, module_name_ptr, 260)?;
         let handle = resolve_loaded_module_handle(&module_name, environment.image_base, state);
         if handle == 0 {
-            state.last_error = ERROR_MOD_NOT_FOUND;
+            state.process.last_error = ERROR_MOD_NOT_FOUND;
         } else {
-            state.last_error = 0;
+            state.process.last_error = 0;
         }
         handle
     };
@@ -347,15 +347,15 @@ pub fn handle_get_module_handle_w(
         .context("failed to read RCX for GetModuleHandleW")?;
 
     let return_value = if module_name_ptr == 0 {
-        state.last_error = 0;
+        state.process.last_error = 0;
         environment.image_base
     } else {
         let module_name = read_guest_utf16_lossy(engine, module_name_ptr, 260)?;
         let handle = resolve_loaded_module_handle(&module_name, environment.image_base, state);
         if handle == 0 {
-            state.last_error = ERROR_MOD_NOT_FOUND;
+            state.process.last_error = ERROR_MOD_NOT_FOUND;
         } else {
-            state.last_error = 0;
+            state.process.last_error = 0;
         }
         handle
     };
@@ -860,14 +860,14 @@ fn is_main_module_name(state: &WinApiState, name: &str) -> bool {
     if norm.is_empty() {
         return true;
     }
-    let main = normalize_module_name(&state.main_module_file_name);
-    norm == main || paths_match_guest(name, &state.main_module_path)
+    let main = normalize_module_name(&state.process.main_module_file_name);
+    norm == main || paths_match_guest(name, &state.process.main_module_path)
 }
 
 /// Whether `path` refers to the loaded main PE (any basename/path form).
 fn is_main_module_path(state: &WinApiState, path: &str) -> bool {
-    paths_match_guest(path, &state.main_module_path)
-        || guest_basename(path).eq_ignore_ascii_case(&state.main_module_file_name)
+    paths_match_guest(path, &state.process.main_module_path)
+        || guest_basename(path).eq_ignore_ascii_case(&state.process.main_module_file_name)
 }
 
 /// Resolve a module that is considered already loaded (`GetModuleHandle*`).
@@ -900,7 +900,7 @@ fn resolve_or_load_dll(
 ) -> u64 {
     let clean = name.trim().trim_matches('"');
     if clean.is_empty() {
-        state.last_error = ERROR_MOD_NOT_FOUND;
+        state.process.last_error = ERROR_MOD_NOT_FOUND;
         return 0;
     }
 
@@ -925,25 +925,25 @@ fn resolve_or_load_dll(
     // 4. Try to load from disk (requires import_resolver).
     let mut resolver_opt = state.module_state.import_resolver.take();
     let Some(ref mut resolver) = resolver_opt else {
-        state.last_error = ERROR_MOD_NOT_FOUND;
+        state.process.last_error = ERROR_MOD_NOT_FOUND;
         return 0;
     };
 
     // Resolve DLL path via search order.
     let host_path = crate::dll_loader::resolve_dll_path(
         name,
-        &state.main_module_path,
+        &state.process.main_module_path,
         &state.file_io.volumes,
-        state.main_module_host_dir.as_deref(),
+        state.process.main_module_host_dir.as_deref(),
     );
     let Some(ref host) = host_path else {
         state.module_state.import_resolver = resolver_opt;
-        state.last_error = ERROR_MOD_NOT_FOUND;
+        state.process.last_error = ERROR_MOD_NOT_FOUND;
         return 0;
     };
 
     // Build a guest-style path from the host path for the module descriptor.
-    let guest_path = resolve_windows_dll_path(name, &state.main_module_path);
+    let guest_path = resolve_windows_dll_path(name, &state.process.main_module_path);
 
     match crate::dll_loader::load_dll(engine, state, host, &guest_path, resolver) {
         Ok(result) => {
@@ -952,7 +952,7 @@ fn resolve_or_load_dll(
             // load, the parent load also fails (Windows LoadLibrary contract).
             for dep in &result.dependencies {
                 if resolve_or_load_dll(dep, engine, environment, state) == 0 {
-                    state.last_error = ERROR_MOD_NOT_FOUND;
+                    state.process.last_error = ERROR_MOD_NOT_FOUND;
                     return 0;
                 }
             }
@@ -961,7 +961,7 @@ fn resolve_or_load_dll(
         Err(e) => {
             state.module_state.import_resolver = resolver_opt;
             tracing::warn!("failed to load DLL {}: {e}", name);
-            state.last_error = ERROR_MOD_NOT_FOUND;
+            state.process.last_error = ERROR_MOD_NOT_FOUND;
             0
         }
     }
@@ -1083,8 +1083,8 @@ fn file_attributes_for_path(state: &WinApiState, path: &str) -> u64 {
         .collect();
     let ctx = crate::vfs::ResolveCtx {
         volumes: &state.file_io.volumes,
-        main_module_path: &state.main_module_path,
-        main_module_file_name: &state.main_module_file_name,
+        main_module_path: &state.process.main_module_path,
+        main_module_file_name: &state.process.main_module_file_name,
         host_file_mounts: &mounts_ref,
         virtual_files: &virtuals_ref,
         synthetic_dirs: crate::vfs::DEFAULT_SYNTHETIC_DIRS,
@@ -1118,8 +1118,8 @@ fn collect_find_entries(state: &WinApiState, full_pattern: &str) -> Vec<crate::v
         .collect();
     let ctx = crate::vfs::ResolveCtx {
         volumes: &state.file_io.volumes,
-        main_module_path: &state.main_module_path,
-        main_module_file_name: &state.main_module_file_name,
+        main_module_path: &state.process.main_module_path,
+        main_module_file_name: &state.process.main_module_file_name,
         host_file_mounts: &mounts_ref,
         virtual_files: &virtuals_ref,
         synthetic_dirs: crate::vfs::DEFAULT_SYNTHETIC_DIRS,
@@ -1392,7 +1392,7 @@ pub fn handle_get_current_thread_id(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    let tid = u64::from(state.threads.current_tid());
+    let tid = u64::from(state.kernel.threads.current_tid());
     let return_address = engine
         .return_from_win64_api(tid)
         .context("failed to return from GetCurrentThreadId")?;
@@ -1460,7 +1460,7 @@ pub fn handle_heap_free(
     let return_value = if ok {
         1
     } else {
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
         0
     };
 
@@ -1631,7 +1631,7 @@ pub fn handle_enter_critical_section(
         .context("failed to read RCX for EnterCriticalSection")?;
 
     if cs != 0 {
-        match try_enter_critical_section_guest(engine, cs, state.threads.current_tid())? {
+        match try_enter_critical_section_guest(engine, cs, state.kernel.threads.current_tid())? {
             EnterCsResult::Acquired => {}
             EnterCsResult::NeedPark => {
                 return Err(crate::WinApiControlSignal::HostPark {
@@ -1662,10 +1662,10 @@ pub fn handle_leave_critical_section(
         .context("failed to read RCX for LeaveCriticalSection")?;
 
     if cs != 0 {
-        let unlocked = leave_critical_section_guest(engine, cs, state.threads.current_tid())?;
+        let unlocked = leave_critical_section_guest(engine, cs, state.kernel.threads.current_tid())?;
         if unlocked {
             // Wake one host waiter (if any) parked on this CS.
-            if let Some(q) = state.sync.cs_waiters.get(&cs) {
+            if let Some(q) = state.kernel.sync.cs_waiters.get(&cs) {
                 q.notify_one();
             }
         }
@@ -2089,7 +2089,7 @@ pub fn handle_get_last_error(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    let return_value = u64::from(state.last_error);
+    let return_value = u64::from(state.process.last_error);
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -2113,7 +2113,7 @@ pub fn handle_set_last_error(
     let error =
         u32::try_from(error_raw & 0xffff_ffff).context("SetLastError value does not fit u32")?;
 
-    state.last_error = error;
+    state.process.last_error = error;
 
     let return_address = engine
         .return_from_win64_api(0)
@@ -2417,7 +2417,7 @@ pub fn handle_get_module_file_name_a(
     let (return_value, truncated) =
         copy_path_a_to_guest_buffer(engine, module_file_name_a_ptr, buffer_ptr, buffer_len)?;
 
-    state.last_error = if truncated {
+    state.process.last_error = if truncated {
         ERROR_INSUFFICIENT_BUFFER
     } else {
         0
@@ -2454,7 +2454,7 @@ pub fn handle_get_module_file_name_w(
     let (return_value, truncated) =
         copy_path_w_to_guest_buffer(engine, module_file_name_w_ptr, buffer_ptr, buffer_len)?;
 
-    state.last_error = if truncated {
+    state.process.last_error = if truncated {
         ERROR_INSUFFICIENT_BUFFER
     } else {
         0
@@ -2533,15 +2533,15 @@ pub fn handle_load_library_a(
         .context("failed to read RCX for LoadLibraryA")?;
 
     let return_value = if library_name_ptr == 0 {
-        state.last_error = ERROR_MOD_NOT_FOUND;
+        state.process.last_error = ERROR_MOD_NOT_FOUND;
         0
     } else {
         let library_name = read_ansi_string_from_cpu(engine, library_name_ptr, 260)?;
         let handle = resolve_or_load_dll(&library_name, engine, environment, state);
         if handle == 0 {
-            state.last_error = ERROR_MOD_NOT_FOUND;
+            state.process.last_error = ERROR_MOD_NOT_FOUND;
         } else {
-            state.last_error = 0;
+            state.process.last_error = 0;
         }
         handle
     };
@@ -2567,15 +2567,15 @@ pub fn handle_load_library_w(
         .context("failed to read RCX for LoadLibraryW")?;
 
     let return_value = if library_name_ptr == 0 {
-        state.last_error = ERROR_MOD_NOT_FOUND;
+        state.process.last_error = ERROR_MOD_NOT_FOUND;
         0
     } else {
         let library_name = read_wide_string_from_cpu(engine, library_name_ptr, 260)?;
         let handle = resolve_or_load_dll(&library_name, engine, environment, state);
         if handle == 0 {
-            state.last_error = ERROR_MOD_NOT_FOUND;
+            state.process.last_error = ERROR_MOD_NOT_FOUND;
         } else {
-            state.last_error = 0;
+            state.process.last_error = 0;
         }
         handle
     };
@@ -2600,7 +2600,7 @@ pub fn handle_free_library(
         .context("failed to read RCX for FreeLibrary")?;
 
     let return_value = if module_handle == 0 {
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
         0
     } else if module_handle >= dll_loader::REAL_MODULE_HANDLE_BASE {
         // Real loaded module — decrement refcount.
@@ -2610,7 +2610,7 @@ pub fn handle_free_library(
             .find(|(_, m)| m.handle == module_handle)
             .map(|(n, _)| n.clone())
         else {
-            state.last_error = ERROR_INVALID_HANDLE;
+            state.process.last_error = ERROR_INVALID_HANDLE;
             let return_address = engine.return_from_win64_api(0)?;
             return Ok(WinApiHandlerResult {
                 return_address,
@@ -2636,11 +2636,11 @@ pub fn handle_free_library(
                 state.module_state.loaded_modules.remove(&name);
             }
         }
-        state.last_error = 0;
+        state.process.last_error = 0;
         1
     } else {
         // Fake module handle — always succeed (legacy behavior).
-        state.last_error = 0;
+        state.process.last_error = 0;
         1
     };
 
@@ -2687,7 +2687,7 @@ pub fn handle_get_proc_address(
     // Check cache first.
     if let Some(cached) = state.module_state.get_proc_address_cache.get_mut(&name_key) {
         cached.hit_count = cached.hit_count.saturating_add(1);
-        state.last_error = 0;
+        state.process.last_error = 0;
         let return_address = engine.return_from_win64_api(cached.address)?;
         return Ok(WinApiHandlerResult {
             return_address,
@@ -2720,7 +2720,7 @@ pub fn handle_get_proc_address(
                         hit_count: 1,
                     },
                 );
-                state.last_error = 0;
+                state.process.last_error = 0;
                 let return_address = engine.return_from_win64_api(address)?;
                 return Ok(WinApiHandlerResult {
                     return_address,
@@ -2728,7 +2728,7 @@ pub fn handle_get_proc_address(
                 });
             }
         }
-        state.last_error = ERROR_PROC_NOT_FOUND;
+        state.process.last_error = ERROR_PROC_NOT_FOUND;
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
             return_address,
@@ -2747,7 +2747,7 @@ pub fn handle_get_proc_address(
                 hit_count: 1,
             },
         );
-        state.last_error = 0;
+        state.process.last_error = 0;
         let return_address = engine.return_from_win64_api(address)?;
         return Ok(WinApiHandlerResult {
             return_address,
@@ -2755,7 +2755,7 @@ pub fn handle_get_proc_address(
         });
     }
 
-    state.last_error = ERROR_PROC_NOT_FOUND;
+    state.process.last_error = ERROR_PROC_NOT_FOUND;
     let return_address = engine.return_from_win64_api(0)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -2777,9 +2777,9 @@ pub fn handle_get_file_attributes_a(
     let full_path = resolve_full_windows_path(&cwd, &path);
     let return_value = file_attributes_for_path(state, &full_path);
     if return_value == INVALID_FILE_ATTRIBUTES {
-        state.last_error = ERROR_FILE_NOT_FOUND;
+        state.process.last_error = ERROR_FILE_NOT_FOUND;
     } else {
-        state.last_error = 0;
+        state.process.last_error = 0;
     }
 
     let return_address = engine
@@ -2806,9 +2806,9 @@ pub fn handle_get_file_attributes_w(
     let full_path = resolve_full_windows_path(&cwd, &path);
     let return_value = file_attributes_for_path(state, &full_path);
     if return_value == INVALID_FILE_ATTRIBUTES {
-        state.last_error = ERROR_FILE_NOT_FOUND;
+        state.process.last_error = ERROR_FILE_NOT_FOUND;
     } else {
-        state.last_error = 0;
+        state.process.last_error = 0;
     }
 
     let return_address = engine
@@ -2881,7 +2881,7 @@ fn finish_find_first(
     unicode: bool,
 ) -> Result<u64> {
     if pattern.trim().is_empty() {
-        state.last_error = ERROR_FILE_NOT_FOUND;
+        state.process.last_error = ERROR_FILE_NOT_FOUND;
         return Ok(INVALID_HANDLE_VALUE);
     }
 
@@ -2889,7 +2889,7 @@ fn finish_find_first(
     let full_pattern = resolve_full_windows_path(&cwd, pattern);
     let mut entries = collect_find_entries(state, &full_pattern);
     if entries.is_empty() {
-        state.last_error = ERROR_FILE_NOT_FOUND;
+        state.process.last_error = ERROR_FILE_NOT_FOUND;
         return Ok(INVALID_HANDLE_VALUE);
     }
 
@@ -2923,7 +2923,7 @@ fn finish_find_first(
         pattern: full_pattern,
         remaining: entries,
     });
-    state.last_error = 0;
+    state.process.last_error = 0;
     Ok(handle)
 }
 
@@ -2989,12 +2989,12 @@ fn finish_find_next(
         .iter_mut()
         .find(|h| h.handle == find_handle)
     else {
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
         return Ok(0);
     };
 
     if slot.remaining.is_empty() {
-        state.last_error = ERROR_NO_MORE_FILES;
+        state.process.last_error = ERROR_NO_MORE_FILES;
         return Ok(0);
     }
 
@@ -3016,7 +3016,7 @@ fn finish_find_next(
             next.size,
         )?;
     }
-    state.last_error = 0;
+    state.process.last_error = 0;
     Ok(1)
 }
 
@@ -3446,21 +3446,21 @@ fn finish_create_file(
     let return_value =
         match open_or_create_guest_path(state, file_name, desired_access, creation_disposition) {
             Ok(OpenFileOutcome::Handle(handle)) => {
-                state.last_error = 0;
+                state.process.last_error = 0;
                 handle
             }
             Ok(OpenFileOutcome::HandleCreated(handle)) => {
                 // OPEN_ALWAYS / CREATE_ALWAYS created a new file (docs: GetLastError may be 0).
-                state.last_error = 0;
+                state.process.last_error = 0;
                 handle
             }
             Ok(OpenFileOutcome::HandleExists(handle)) => {
                 // Microsoft Learn: CREATE_ALWAYS / OPEN_ALWAYS set ERROR_ALREADY_EXISTS
                 // when the named file already existed.
                 if creation_disposition == CREATE_ALWAYS || creation_disposition == OPEN_ALWAYS {
-                    state.last_error = ERROR_ALREADY_EXISTS;
+                    state.process.last_error = ERROR_ALREADY_EXISTS;
                 } else {
-                    state.last_error = 0;
+                    state.process.last_error = 0;
                 }
                 handle
             }
@@ -3472,7 +3472,7 @@ fn finish_create_file(
                     win_error,
                     "{api_name} open failed"
                 );
-                state.last_error = win_error;
+                state.process.last_error = win_error;
                 INVALID_HANDLE_VALUE
             }
         };
@@ -3505,7 +3505,7 @@ pub fn handle_close_handle(
         .context("failed to read RCX for CloseHandle")?;
 
     let return_value = if handle == 0 || handle == INVALID_HANDLE_VALUE {
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
         0
     } else if is_open_file_handle(state, handle) {
         // Flush written bytes to virtual store and/or bottle host path.
@@ -3516,16 +3516,16 @@ pub fn handle_close_handle(
         persist_open_file_to_host(state, handle);
         let _ = crate::guest_io_host::unregister_open_file(engine, state, handle).ok();
         state.file_io.open_files.remove(&handle);
-        state.last_error = 0;
+        state.process.last_error = 0;
         1
-    } else if state.sync.objects.remove(&handle).is_some() {
+    } else if state.kernel.sync.objects.remove(&handle).is_some() {
         // Thread / event kernel handles (object may still be live via Arc).
-        state.last_error = 0;
+        state.process.last_error = 0;
         1
     } else {
         // Console / module / other fake kernel objects: accept and no-op so
         // CRT and UI stubs that close non-file handles keep working.
-        state.last_error = 0;
+        state.process.last_error = 0;
         1
     };
 
@@ -3602,9 +3602,9 @@ pub fn handle_get_file_information_by_handle(
         write_guest_u32(engine, file_index_high_address, 0)?;
         write_guest_u32(engine, file_index_low_address, 1)?;
 
-        state.last_error = 0;
+        state.process.last_error = 0;
     } else {
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
     }
 
     let return_value = u64::from(success);
@@ -4098,9 +4098,9 @@ pub fn handle_file_time_to_local_file_time(
             .mem_write(output_file_time_ptr, &bytes)
             .context("failed to write output FILETIME")?;
 
-        state.last_error = 0;
+        state.process.last_error = 0;
     } else {
-        state.last_error = ERROR_INVALID_PARAMETER;
+        state.process.last_error = ERROR_INVALID_PARAMETER;
     }
 
     let return_value = u64::from(success);
@@ -4160,9 +4160,9 @@ pub fn handle_file_time_to_system_time(
         write_guest_u16(engine, second_address, 0)?;
         write_guest_u16(engine, milliseconds_address, 0)?;
 
-        state.last_error = 0;
+        state.process.last_error = 0;
     } else {
-        state.last_error = ERROR_INVALID_PARAMETER;
+        state.process.last_error = ERROR_INVALID_PARAMETER;
     }
 
     let return_value = u64::from(success);
@@ -4227,9 +4227,9 @@ pub fn handle_get_time_zone_information(
             .context("failed to write TIME_ZONE_INFORMATION DaylightDate")?;
         write_guest_u32(engine, daylight_bias_address, 0)?;
 
-        state.last_error = 0;
+        state.process.last_error = 0;
     } else {
-        state.last_error = ERROR_INVALID_PARAMETER;
+        state.process.last_error = ERROR_INVALID_PARAMETER;
     }
 
     let return_value = if success {
@@ -4284,9 +4284,9 @@ pub fn handle_get_file_time(
             write_guest_u64(engine, last_write_time_ptr, FIXED_SYSTEM_FILETIME)?;
         }
 
-        state.last_error = 0;
+        state.process.last_error = 0;
     } else {
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
     }
 
     let return_value = u64::from(success);
@@ -4326,10 +4326,10 @@ pub fn handle_set_file_pointer(
         move_method == FILE_BEGIN || move_method == FILE_CURRENT || move_method == FILE_END;
 
     let return_value = if !is_open_file_handle(state, handle) {
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
         INVALID_SET_FILE_POINTER
     } else if !valid_method {
-        state.last_error = ERROR_INVALID_PARAMETER;
+        state.process.last_error = ERROR_INVALID_PARAMETER;
         INVALID_SET_FILE_POINTER
     } else {
         let low_u32 = u32::try_from(distance_low & 0xffff_ffff)
@@ -4376,11 +4376,11 @@ pub fn handle_set_file_pointer(
                 write_guest_u32(engine, distance_high_ptr, high)?;
             }
 
-            state.last_error = 0;
+            state.process.last_error = 0;
             let _ = crate::guest_io_host::sync_slot_from_host(engine, state, handle).ok();
             new_cursor & 0xffff_ffff
         } else {
-            state.last_error = ERROR_INVALID_PARAMETER;
+            state.process.last_error = ERROR_INVALID_PARAMETER;
             INVALID_SET_FILE_POINTER
         }
     };
@@ -4421,11 +4421,11 @@ pub fn handle_get_file_size(
             write_guest_u32(engine, file_size_high_ptr, file_size_high)?;
         }
 
-        state.last_error = 0;
+        state.process.last_error = 0;
 
         u64::from(file_size_low)
     } else {
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
         0xffff_ffff
     };
 
@@ -4520,7 +4520,7 @@ pub fn handle_read_file(
     }
 
     if buffer_ptr == 0 {
-        state.last_error = ERROR_INVALID_PARAMETER;
+        state.process.last_error = ERROR_INVALID_PARAMETER;
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
             return_address,
@@ -4541,7 +4541,7 @@ pub fn handle_read_file(
                 }
                 Ok(false) => {
                     // Host EOF → success with 0 bytes (already zeroed count).
-                    state.last_error = 0;
+                    state.process.last_error = 0;
                     let return_address = engine.return_from_win64_api(1)?;
                     return Ok(WinApiHandlerResult {
                         return_address,
@@ -4549,7 +4549,7 @@ pub fn handle_read_file(
                     });
                 }
                 Err(()) => {
-                    state.last_error = ERROR_READ_FAULT;
+                    state.process.last_error = ERROR_READ_FAULT;
                     let return_address = engine.return_from_win64_api(0)?;
                     return Ok(WinApiHandlerResult {
                         return_address,
@@ -4580,7 +4580,7 @@ pub fn handle_read_file(
             }
         }
         // available == 0 && InjectOnly → inject exhausted → EOF (0 bytes, success).
-        state.last_error = 0;
+        state.process.last_error = 0;
         let return_address = engine.return_from_win64_api(1)?;
         return Ok(WinApiHandlerResult {
             return_address,
@@ -4590,7 +4590,7 @@ pub fn handle_read_file(
 
     // Console stdout/stderr are not readable.
     if is_console_output_handle(handle) {
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
             return_address,
@@ -4617,7 +4617,7 @@ pub fn handle_read_file(
                 )
             };
             let Some(host) = host_path else {
-                state.last_error = ERROR_INVALID_HANDLE;
+                state.process.last_error = ERROR_INVALID_HANDLE;
                 let return_address = engine.return_from_win64_api(0)?;
                 return Ok(WinApiHandlerResult {
                     return_address,
@@ -4640,7 +4640,7 @@ pub fn handle_read_file(
                 state.file_io.executable_file_cursor =
                     cursor_before.saturating_add(u64::try_from(n).unwrap_or(0));
             }
-            state.last_error = 0;
+            state.process.last_error = 0;
         } else {
             // Phase 1: advance cursor and capture slice bounds without cloning the path/body.
             let (start, end, cursor_after, is_exe) = {
@@ -4690,11 +4690,11 @@ pub fn handle_read_file(
                 state.file_io.executable_file_cursor = cursor_after;
             }
 
-            state.last_error = 0;
+            state.process.last_error = 0;
             let _ = crate::guest_io_host::sync_slot_from_host(engine, state, handle).ok();
         }
     } else {
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
     }
 
     let return_value = u64::from(success);
@@ -4736,7 +4736,7 @@ pub fn handle_write_file(
     }
 
     if buffer_ptr == 0 {
-        state.last_error = ERROR_INVALID_PARAMETER;
+        state.process.last_error = ERROR_INVALID_PARAMETER;
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
             return_address,
@@ -4760,7 +4760,7 @@ pub fn handle_write_file(
                 u32::try_from(write_len).context("WriteFile byte count does not fit u32")?;
             write_guest_u32(engine, bytes_written_ptr, write_len_u32)?;
         }
-        state.last_error = 0;
+        state.process.last_error = 0;
         let return_address = engine.return_from_win64_api(1)?;
         return Ok(WinApiHandlerResult {
             return_address,
@@ -4770,7 +4770,7 @@ pub fn handle_write_file(
 
     // Console stdin is not writable.
     if handle == FAKE_STDIN_HANDLE {
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
             return_address,
@@ -4881,7 +4881,7 @@ pub fn handle_write_file(
             "WriteFile"
         );
 
-        state.last_error = 0;
+        state.process.last_error = 0;
     } else {
         tracing::debug!(
             handle,
@@ -4889,7 +4889,7 @@ pub fn handle_write_file(
             requested = bytes_to_write,
             "WriteFile invalid handle"
         );
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
     }
 
     let return_value = u64::from(success);
@@ -5026,14 +5026,14 @@ pub fn handle_set_current_directory_w(
         .context("failed to read RCX for SetCurrentDirectoryW")?;
 
     let success = if directory_ptr == 0 {
-        state.last_error = ERROR_PATH_NOT_FOUND;
+        state.process.last_error = ERROR_PATH_NOT_FOUND;
         false
     } else {
         let directory = read_wide_string_from_cpu(engine, directory_ptr, 32_768)
             .context("failed to read SetCurrentDirectoryW path")?;
 
         if directory.is_empty() {
-            state.last_error = ERROR_PATH_NOT_FOUND;
+            state.process.last_error = ERROR_PATH_NOT_FOUND;
             false
         } else {
             // Relative directory names resolve against the current directory (MSDN).
@@ -5042,10 +5042,10 @@ pub fn handle_set_current_directory_w(
             if guest_dir_exists(state, &full) {
                 state.file_io.current_directory_wide = full.encode_utf16().collect();
                 // Keep guest cwd blob in sync when stubs are installed (best-effort).
-                state.last_error = 0;
+                state.process.last_error = 0;
                 true
             } else {
-                state.last_error = ERROR_PATH_NOT_FOUND;
+                state.process.last_error = ERROR_PATH_NOT_FOUND;
                 false
             }
         }
@@ -5565,24 +5565,24 @@ pub fn handle_resume_thread(
 ) -> Result<WinApiHandlerResult> {
     let handle = engine.read_rcx()?;
     // Previous suspend count: 1 if we had it suspended, 0 if already running, -1 on error.
-    if let Some(spawn) = state.sync.suspended_spawns.remove(&handle) {
+    if let Some(spawn) = state.kernel.sync.suspended_spawns.remove(&handle) {
         if std::env::var_os("WIE_MT_DEBUG").is_some() {
-            let pending_after = state.sync.pending_spawns.len().saturating_add(1);
+            let pending_after = state.kernel.sync.pending_spawns.len().saturating_add(1);
             eprintln!(
                 "[mt] ResumeThread handle={handle:#x} tid={:#x} pending→{pending_after}",
                 spawn.tid,
             );
         }
-        state.sync.pending_spawns.push(spawn);
-        state.last_error = 0;
+        state.kernel.sync.pending_spawns.push(spawn);
+        state.process.last_error = 0;
         return ret_u64(engine, 1, "ResumeThread");
     }
-    if state.sync.thread_by_handle(handle).is_some() {
+    if state.kernel.sync.thread_by_handle(handle).is_some() {
         // Already running (or finished) — suspend count was 0.
-        state.last_error = 0;
+        state.process.last_error = 0;
         return ret_u64(engine, 0, "ResumeThread");
     }
-    state.last_error = ERROR_INVALID_HANDLE;
+    state.process.last_error = ERROR_INVALID_HANDLE;
     // `(DWORD)-1`
     ret_u64(engine, u64::from(u32::MAX), "ResumeThread")
 }
@@ -5607,11 +5607,11 @@ pub fn handle_create_semaphore(
             .to_le_bytes(),
     );
     if maximum <= 0 || initial < 0 || initial > maximum {
-        state.last_error = ERROR_INVALID_PARAMETER;
+        state.process.last_error = ERROR_INVALID_PARAMETER;
         return ret_u64(engine, 0, "CreateSemaphore");
     }
-    let (handle, _) = state.sync.register_semaphore(initial, maximum);
-    state.last_error = 0;
+    let (handle, _) = state.kernel.sync.register_semaphore(initial, maximum);
+    state.process.last_error = 0;
     ret_u64(engine, handle, "CreateSemaphore")
 }
 
@@ -5628,8 +5628,8 @@ pub fn handle_release_semaphore(
             .unwrap_or(0)
             .to_le_bytes(),
     );
-    let Some(crate::KernelObject::Semaphore(sem)) = state.sync.object(handle).cloned() else {
-        state.last_error = ERROR_INVALID_HANDLE;
+    let Some(crate::KernelObject::Semaphore(sem)) = state.kernel.sync.object(handle).cloned() else {
+        state.process.last_error = ERROR_INVALID_HANDLE;
         return ret_u64(engine, 0, "ReleaseSemaphore");
     };
     if let Some(prev) = sem.release(release) {
@@ -5637,10 +5637,10 @@ pub fn handle_release_semaphore(
             let prev_u = u32::from_ne_bytes(prev.to_ne_bytes());
             write_guest_u32(engine, prev_out, prev_u)?;
         }
-        state.last_error = 0;
+        state.process.last_error = 0;
         ret_u64(engine, 1, "ReleaseSemaphore")
     } else {
-        state.last_error = ERROR_TOO_MANY_POSTS;
+        state.process.last_error = ERROR_TOO_MANY_POSTS;
         ret_u64(engine, 0, "ReleaseSemaphore")
     }
 }
@@ -5654,7 +5654,7 @@ pub fn handle_open_event(
     let _inherit = engine.read_rdx()?;
     let _name = engine.read_r9().or_else(|_| engine.read_r8())?;
     // Named events not supported yet.
-    state.last_error = ERROR_FILE_NOT_FOUND;
+    state.process.last_error = ERROR_FILE_NOT_FOUND;
     ret_u64(engine, 0, "OpenEventW")
 }
 
@@ -5671,7 +5671,7 @@ pub fn handle_wait_for_multiple_objects(
 
     let count_usize = usize::try_from(count).unwrap_or(usize::MAX);
     if count == 0 || handles_ptr == 0 || count_usize > crate::MAXIMUM_WAIT_OBJECTS {
-        state.last_error = ERROR_INVALID_PARAMETER;
+        state.process.last_error = ERROR_INVALID_PARAMETER;
         return ret_u64(
             engine,
             u64::from(crate::WAIT_FAILED),
@@ -5686,14 +5686,14 @@ pub fn handle_wait_for_multiple_objects(
     }
 
     // Fast path: already satisfied (no host park).
-    if let Some(targets) = state.sync.wait_targets(&handles) {
+    if let Some(targets) = state.kernel.sync.wait_targets(&handles) {
         let result = crate::wait_multiple(&targets, wait_all, 0);
         if result != crate::WAIT_TIMEOUT {
-            state.last_error = 0;
+            state.process.last_error = 0;
             return ret_u64(engine, u64::from(result), "WaitForMultipleObjects");
         }
     } else {
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
         return ret_u64(
             engine,
             u64::from(crate::WAIT_FAILED),
@@ -5702,7 +5702,7 @@ pub fn handle_wait_for_multiple_objects(
     }
 
     if timeout_ms == 0 {
-        state.last_error = 0;
+        state.process.last_error = 0;
         return ret_u64(
             engine,
             u64::from(crate::WAIT_TIMEOUT),
@@ -5711,8 +5711,8 @@ pub fn handle_wait_for_multiple_objects(
     }
 
     // Stash args per waiter TID; HostPark reason stays small/Copy.
-    let waiter = state.threads.current_tid();
-    state.sync.multi_wait.insert(
+    let waiter = state.kernel.threads.current_tid();
+    state.kernel.sync.multi_wait.insert(
         waiter,
         crate::sync_obj::MultiWaitRequest {
             handles,
@@ -5741,7 +5741,7 @@ pub fn handle_create_hard_link_w(
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
     let _ = (engine.read_rcx()?, engine.read_rdx()?, engine.read_r8()?);
-    state.last_error = 1; // ERROR_INVALID_FUNCTION-ish
+    state.process.last_error = 1; // ERROR_INVALID_FUNCTION-ish
     ret_u64(engine, 0, "CreateHardLinkW")
 }
 
@@ -5751,7 +5751,7 @@ pub fn handle_find_first_stream_w(
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
     let _ = (engine.read_rcx()?, engine.read_rdx()?, engine.read_r8()?);
-    state.last_error = 38; // ERROR_HANDLE_EOF
+    state.process.last_error = 38; // ERROR_HANDLE_EOF
     ret_u64(engine, u64::MAX, "FindFirstStreamW") // INVALID_HANDLE_VALUE
 }
 
@@ -5761,7 +5761,7 @@ pub fn handle_find_next_stream_w(
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
     let _ = (engine.read_rcx()?, engine.read_rdx()?);
-    state.last_error = 38;
+    state.process.last_error = 38;
     ret_u64(engine, 0, "FindNextStreamW")
 }
 
@@ -5776,7 +5776,7 @@ pub fn handle_device_io_control(
         engine.read_r8()?,
         engine.read_r9()?,
     );
-    state.last_error = 1;
+    state.process.last_error = 1;
     ret_u64(engine, 0, "DeviceIoControl")
 }
 
@@ -5791,7 +5791,7 @@ pub fn handle_map_view_of_file(
         engine.read_r8()?,
         engine.read_r9()?,
     );
-    state.last_error = 8; // ERROR_NOT_ENOUGH_MEMORY
+    state.process.last_error = 8; // ERROR_NOT_ENOUGH_MEMORY
     ret_u64(engine, 0, "MapViewOfFile")
 }
 
@@ -5810,7 +5810,7 @@ pub fn handle_open_file_mapping(
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
     let _ = (engine.read_rcx()?, engine.read_rdx()?, engine.read_r8()?);
-    state.last_error = 2; // ERROR_FILE_NOT_FOUND
+    state.process.last_error = 2; // ERROR_FILE_NOT_FOUND
     ret_u64(engine, 0, "OpenFileMapping")
 }
 
@@ -5971,8 +5971,8 @@ fn stat_guest_path(state: &WinApiState, full_path: &str) -> crate::vfs::PathStat
         .collect();
     let ctx = crate::vfs::ResolveCtx {
         volumes: &state.file_io.volumes,
-        main_module_path: &state.main_module_path,
-        main_module_file_name: &state.main_module_file_name,
+        main_module_path: &state.process.main_module_path,
+        main_module_file_name: &state.process.main_module_file_name,
         host_file_mounts: &mounts_ref,
         virtual_files: &virtuals_ref,
         synthetic_dirs: crate::vfs::DEFAULT_SYNTHETIC_DIRS,
@@ -5991,20 +5991,20 @@ fn write_mock_string_a(
     buf_len: u64,
 ) -> Result<u64> {
     if buf == 0 || buf_len == 0 {
-        state.last_error = ERROR_INSUFFICIENT_BUFFER;
+        state.process.last_error = ERROR_INSUFFICIENT_BUFFER;
         return Ok(0);
     }
     let encoded = crate::vfs::encode_acp(s);
     let needed = encoded.len(); // bytes (excluding NUL)
     let cap = usize::try_from(buf_len).unwrap_or(0);
     if cap < needed.saturating_add(1) {
-        state.last_error = ERROR_INSUFFICIENT_BUFFER;
+        state.process.last_error = ERROR_INSUFFICIENT_BUFFER;
         return Ok(0);
     }
     let mut payload = encoded;
     payload.push(0);
     engine.mem_write(buf, &payload)?;
-    state.last_error = 0;
+    state.process.last_error = 0;
     Ok(u64::try_from(needed).unwrap_or(0))
 }
 
@@ -6019,14 +6019,14 @@ fn write_mock_string_w(
     buf_len: u64,
 ) -> Result<u64> {
     if buf == 0 || buf_len == 0 {
-        state.last_error = ERROR_INSUFFICIENT_BUFFER;
+        state.process.last_error = ERROR_INSUFFICIENT_BUFFER;
         return Ok(0);
     }
     let units: Vec<u16> = s.encode_utf16().collect();
     let needed = units.len();
     let cap = usize::try_from(buf_len).unwrap_or(0);
     if cap < needed.saturating_add(1) {
-        state.last_error = ERROR_INSUFFICIENT_BUFFER;
+        state.process.last_error = ERROR_INSUFFICIENT_BUFFER;
         return Ok(0);
     }
     let mut bytes = Vec::with_capacity(needed.saturating_add(1).saturating_mul(2));
@@ -6035,7 +6035,7 @@ fn write_mock_string_w(
     }
     bytes.extend_from_slice(&0_u16.to_le_bytes());
     engine.mem_write(buf, &bytes)?;
-    state.last_error = 0;
+    state.process.last_error = 0;
     Ok(u64::try_from(needed).unwrap_or(0))
 }
 
@@ -6098,8 +6098,8 @@ pub fn handle_set_error_mode(
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
     let mode = u32::try_from(engine.read_rcx()? & 0xffff_ffff).unwrap_or(0);
-    let prev = state.error_mode;
-    state.error_mode = mode;
+    let prev = state.process.error_mode;
+    state.process.error_mode = mode;
     let return_address = engine.return_from_win64_api(u64::from(prev))?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -6114,12 +6114,12 @@ pub fn handle_set_thread_error_mode(
 ) -> Result<WinApiHandlerResult> {
     let mode = u32::try_from(engine.read_rcx()? & 0xffff_ffff).unwrap_or(0);
     let prev_mode_ptr = engine.read_rdx()?;
-    let prev = state.error_mode;
-    state.error_mode = mode;
+    let prev = state.process.error_mode;
+    state.process.error_mode = mode;
     if prev_mode_ptr != 0 {
         write_guest_u32(engine, prev_mode_ptr, prev)?;
     }
-    state.last_error = 0;
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -6139,14 +6139,14 @@ pub fn handle_get_compressed_file_size_a(
     let full = resolve_full_windows_path(&cwd, &path);
     let st = stat_guest_path(state, &full);
     if st.kind == crate::vfs::PathKind::NotFound {
-        state.last_error = ERROR_FILE_NOT_FOUND;
+        state.process.last_error = ERROR_FILE_NOT_FOUND;
         let return_address = engine.return_from_win64_api(INVALID_FILE_ATTRIBUTES)?;
         return Ok(WinApiHandlerResult {
             return_address,
             return_value: INVALID_FILE_ATTRIBUTES,
         });
     }
-    state.last_error = 0;
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(st.size)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -6166,14 +6166,14 @@ pub fn handle_get_compressed_file_size_w(
     let full = resolve_full_windows_path(&cwd, &path);
     let st = stat_guest_path(state, &full);
     if st.kind == crate::vfs::PathKind::NotFound {
-        state.last_error = ERROR_FILE_NOT_FOUND;
+        state.process.last_error = ERROR_FILE_NOT_FOUND;
         let return_address = engine.return_from_win64_api(INVALID_FILE_ATTRIBUTES)?;
         return Ok(WinApiHandlerResult {
             return_address,
             return_value: INVALID_FILE_ATTRIBUTES,
         });
     }
-    state.last_error = 0;
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(st.size)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -6233,7 +6233,7 @@ pub fn handle_get_volume_information_w(
     if fs_len_ptr != 0 {
         let _unused = write_guest_u32(engine, fs_len_ptr, 4);
     }
-    state.last_error = 0;
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -6288,7 +6288,7 @@ pub fn handle_get_volume_information_a(
         let _unused = write_guest_u32(engine, fs_len_ptr, 4);
     }
 
-    state.last_error = 0;
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -6303,14 +6303,14 @@ pub fn handle_lock_file(
 ) -> Result<WinApiHandlerResult> {
     let handle = engine.read_rcx()?;
     if !is_open_file_handle(state, handle) && handle != FAKE_STDIN_HANDLE {
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
             return_address,
             return_value: 0,
         });
     }
-    state.last_error = 0;
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -6325,14 +6325,14 @@ pub fn handle_unlock_file(
 ) -> Result<WinApiHandlerResult> {
     let handle = engine.read_rcx()?;
     if !is_open_file_handle(state, handle) && handle != FAKE_STDIN_HANDLE {
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
             return_address,
             return_value: 0,
         });
     }
-    state.last_error = 0;
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -6347,14 +6347,14 @@ pub fn handle_set_file_valid_data(
 ) -> Result<WinApiHandlerResult> {
     let handle = engine.read_rcx()?;
     if !is_open_file_handle(state, handle) {
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
             return_address,
             return_value: 0,
         });
     }
-    state.last_error = 0;
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -6497,7 +6497,7 @@ fn write_name_to_buffer(
     size_ptr: u64,
 ) -> Result<WinApiHandlerResult> {
     if buf == 0 || size_ptr == 0 {
-        state.last_error = ERROR_INVALID_PARAMETER;
+        state.process.last_error = ERROR_INVALID_PARAMETER;
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
             return_address,
@@ -6516,7 +6516,7 @@ fn write_name_to_buffer(
         });
     }
     write_guest_u32(engine, size_ptr, u32::try_from(written).unwrap_or(0))?;
-    state.last_error = 0;
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -6553,7 +6553,7 @@ fn get_user_name_impl(
     unicode: bool,
 ) -> Result<WinApiHandlerResult> {
     if buf == 0 || size_ptr == 0 {
-        state.last_error = ERROR_INVALID_PARAMETER;
+        state.process.last_error = ERROR_INVALID_PARAMETER;
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
             return_address,
@@ -6577,7 +6577,7 @@ fn get_user_name_impl(
         });
     }
     write_guest_u32(engine, size_ptr, u32::try_from(written).unwrap_or(0))?;
-    state.last_error = 0;
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -6604,7 +6604,7 @@ fn get_user_profile_dir_impl(
     unicode: bool,
 ) -> Result<WinApiHandlerResult> {
     if buf == 0 || size_ptr == 0 {
-        state.last_error = ERROR_INVALID_PARAMETER;
+        state.process.last_error = ERROR_INVALID_PARAMETER;
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
             return_address,
@@ -6628,7 +6628,7 @@ fn get_user_profile_dir_impl(
         });
     }
     write_guest_u32(engine, size_ptr, u32::try_from(written).unwrap_or(0))?;
-    state.last_error = 0;
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -6678,7 +6678,7 @@ pub fn handle_get_computer_name_ex_w(
         1 | 3 => get_dns_hostname(engine, state, buf, size_ptr),
         _ => {
             // Unsupported type → ERROR_INVALID_PARAMETER
-            state.last_error = ERROR_INVALID_PARAMETER;
+            state.process.last_error = ERROR_INVALID_PARAMETER;
             let return_address = engine.return_from_win64_api(0)?;
             Ok(WinApiHandlerResult {
                 return_address,
@@ -6740,12 +6740,12 @@ pub fn handle_open_thread(
     let tid = engine.read_r8()?;
     let tid_u32 = u32::try_from(tid & 0xffff_ffff).unwrap_or(u32::MAX);
     // Look for an existing thread object with this TID.
-    let found = state.sync.objects.values().find_map(|obj| match obj {
+    let found = state.kernel.sync.objects.values().find_map(|obj| match obj {
         crate::KernelObject::Thread(t) if t.tid == tid_u32 => Some(t.handle),
         _ => None,
     });
     if let Some(handle) = found {
-        state.last_error = 0;
+        state.process.last_error = 0;
         let return_address = engine.return_from_win64_api(handle)?;
         return Ok(WinApiHandlerResult {
             return_address,
@@ -6754,9 +6754,9 @@ pub fn handle_open_thread(
     }
     // Thread not found — create a fresh thread object.
     let (handle, _) = state
-        .sync
+        .kernel.sync
         .register_thread(tid_u32, wie_cpu::ThreadContext::default());
-    state.last_error = 0;
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(handle)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -6774,7 +6774,7 @@ pub fn handle_query_full_process_image_name_w(
     let buf = engine.read_r8()?;
     let size_ptr = engine.read_r9()?;
     if buf == 0 || size_ptr == 0 {
-        state.last_error = ERROR_INVALID_PARAMETER;
+        state.process.last_error = ERROR_INVALID_PARAMETER;
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
             return_address,
@@ -6784,7 +6784,7 @@ pub fn handle_query_full_process_image_name_w(
     let mut size_buf = [0_u8; 4];
     engine.mem_read(size_ptr, &mut size_buf)?;
     let buf_len = u64::from(u32::from_le_bytes(size_buf));
-    let path = state.main_module_path.clone();
+    let path = state.process.main_module_path.clone();
     let written = write_mock_string_w(engine, state, &path, buf, buf_len)?;
     if written == 0 {
         let return_address = engine.return_from_win64_api(0)?;
@@ -6795,7 +6795,7 @@ pub fn handle_query_full_process_image_name_w(
     }
     let count = u32::try_from(written).unwrap_or(0);
     write_guest_u32(engine, size_ptr, count)?;
-    state.last_error = 0;
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -6813,7 +6813,7 @@ pub fn handle_query_full_process_image_name_a(
     let buf = engine.read_r8()?;
     let size_ptr = engine.read_r9()?;
     if buf == 0 || size_ptr == 0 {
-        state.last_error = ERROR_INVALID_PARAMETER;
+        state.process.last_error = ERROR_INVALID_PARAMETER;
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
             return_address,
@@ -6823,7 +6823,7 @@ pub fn handle_query_full_process_image_name_a(
     let mut size_buf = [0_u8; 4];
     engine.mem_read(size_ptr, &mut size_buf)?;
     let buf_len = u64::from(u32::from_le_bytes(size_buf));
-    let path = state.main_module_path.clone();
+    let path = state.process.main_module_path.clone();
     let written = write_mock_string_a(engine, state, &path, buf, buf_len)?;
     if written == 0 {
         let return_address = engine.return_from_win64_api(0)?;
@@ -6834,7 +6834,7 @@ pub fn handle_query_full_process_image_name_a(
     }
     let count = u32::try_from(written).unwrap_or(0);
     write_guest_u32(engine, size_ptr, count)?;
-    state.last_error = 0;
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -6849,9 +6849,9 @@ pub fn handle_create_job_object_w(
 ) -> Result<WinApiHandlerResult> {
     let _sec = engine.read_rcx()?;
     let _name = engine.read_rdx()?;
-    let handle = state.sync.next_handle;
-    state.sync.next_handle = state.sync.next_handle.wrapping_add(4);
-    state.last_error = 0;
+    let handle = state.kernel.sync.next_handle;
+    state.kernel.sync.next_handle = state.kernel.sync.next_handle.wrapping_add(4);
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(handle)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -6866,9 +6866,9 @@ pub fn handle_create_job_object_a(
 ) -> Result<WinApiHandlerResult> {
     let _sec = engine.read_rcx()?;
     let _name = engine.read_rdx()?;
-    let handle = state.sync.next_handle;
-    state.sync.next_handle = state.sync.next_handle.wrapping_add(4);
-    state.last_error = 0;
+    let handle = state.kernel.sync.next_handle;
+    state.kernel.sync.next_handle = state.kernel.sync.next_handle.wrapping_add(4);
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(handle)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -6883,7 +6883,7 @@ pub fn handle_assign_process_to_job_object(
 ) -> Result<WinApiHandlerResult> {
     let _job = engine.read_rcx()?;
     let _proc = engine.read_rdx()?;
-    state.last_error = 0;
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -6898,8 +6898,8 @@ pub fn handle_terminate_process(
 ) -> Result<WinApiHandlerResult> {
     let _handle = engine.read_rcx()?;
     let _code = engine.read_rdx()?;
-    state.sync.process_dying = true;
-    state.last_error = 0;
+    state.kernel.sync.process_dying = true;
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -6916,16 +6916,16 @@ pub fn handle_terminate_thread(
     let code_raw = engine.read_rdx()?;
     let code = u32::try_from(code_raw & 0xffff_ffff).unwrap_or(0);
     // Find the thread and mark it finished.
-    if let Some(crate::KernelObject::Thread(t)) = state.sync.objects.get(&handle) {
+    if let Some(crate::KernelObject::Thread(t)) = state.kernel.sync.objects.get(&handle) {
         t.finish(code);
-        state.last_error = 0;
+        state.process.last_error = 0;
         let return_address = engine.return_from_win64_api(1)?;
         return Ok(WinApiHandlerResult {
             return_address,
             return_value: 1,
         });
     }
-    state.last_error = ERROR_INVALID_HANDLE;
+    state.process.last_error = ERROR_INVALID_HANDLE;
     let return_address = engine.return_from_win64_api(0)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -6940,21 +6940,21 @@ pub fn handle_suspend_thread(
 ) -> Result<WinApiHandlerResult> {
     let handle = engine.read_rcx()?;
     // Find the thread TID from the handle.
-    let tid = state.sync.objects.values().find_map(|obj| match obj {
+    let tid = state.kernel.sync.objects.values().find_map(|obj| match obj {
         crate::KernelObject::Thread(t) if t.handle == handle => Some(t.tid),
         _ => None,
     });
     let Some(tid) = tid else {
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
         let return_address = engine.return_from_win64_api(u64::MAX)?; // THREAD_PRIORITY_ERROR_RETURN
         return Ok(WinApiHandlerResult {
             return_address,
             return_value: u64::MAX,
         });
     };
-    let prev = state.suspended_threads.get(&tid).copied().unwrap_or(0);
-    state.suspended_threads.insert(tid, prev.saturating_add(1));
-    state.last_error = 0;
+    let prev = state.process.suspended_threads.get(&tid).copied().unwrap_or(0);
+    state.process.suspended_threads.insert(tid, prev.saturating_add(1));
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(u64::from(prev))?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -6975,7 +6975,7 @@ pub fn handle_get_file_attributes_ex_w(
     let full = resolve_full_windows_path(&cwd, &path);
     let st = stat_guest_path(state, &full);
     if st.kind == crate::vfs::PathKind::NotFound {
-        state.last_error = ERROR_FILE_NOT_FOUND;
+        state.process.last_error = ERROR_FILE_NOT_FOUND;
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
             return_address,
@@ -7014,7 +7014,7 @@ pub fn handle_get_file_attributes_ex_w(
             u32::try_from(st.size & 0xFFFF_FFFF).unwrap_or(0),
         )?;
     }
-    state.last_error = 0;
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -7035,7 +7035,7 @@ pub fn handle_get_file_attributes_ex_a(
     let full = resolve_full_windows_path(&cwd, &path);
     let st = stat_guest_path(state, &full);
     if st.kind == crate::vfs::PathKind::NotFound {
-        state.last_error = ERROR_FILE_NOT_FOUND;
+        state.process.last_error = ERROR_FILE_NOT_FOUND;
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
             return_address,
@@ -7074,7 +7074,7 @@ pub fn handle_get_file_attributes_ex_a(
             u32::try_from(st.size & 0xFFFF_FFFF).unwrap_or(0),
         )?;
     }
-    state.last_error = 0;
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -7091,14 +7091,14 @@ pub fn handle_signal_object_and_wait(
     let wait_handle = engine.read_rdx()?;
     let _timeout = engine.read_r8()?;
     // Signal first object (only handles events).
-    if let Some(crate::KernelObject::Event(e)) = state.sync.object(signal_handle) {
+    if let Some(crate::KernelObject::Event(e)) = state.kernel.sync.object(signal_handle) {
         e.set();
     }
     // Wait on the second object (only handles events).
-    match state.sync.object(wait_handle) {
+    match state.kernel.sync.object(wait_handle) {
         Some(crate::KernelObject::Event(e)) => {
             if e.wait(0) {
-                state.last_error = 0;
+                state.process.last_error = 0;
                 let return_address =
                     engine.return_from_win64_api(u64::from(crate::WAIT_OBJECT_0))?;
                 return Ok(WinApiHandlerResult {
@@ -7108,7 +7108,7 @@ pub fn handle_signal_object_and_wait(
             }
         }
         Some(crate::KernelObject::Thread(t)) if t.is_finished() => {
-            state.last_error = 0;
+            state.process.last_error = 0;
             let return_address = engine.return_from_win64_api(u64::from(crate::WAIT_OBJECT_0))?;
             return Ok(WinApiHandlerResult {
                 return_address,
@@ -7116,7 +7116,7 @@ pub fn handle_signal_object_and_wait(
             });
         }
         None => {
-            state.last_error = ERROR_INVALID_HANDLE;
+            state.process.last_error = ERROR_INVALID_HANDLE;
             let return_address = engine.return_from_win64_api(u64::from(crate::WAIT_FAILED))?;
             return Ok(WinApiHandlerResult {
                 return_address,
@@ -7150,7 +7150,7 @@ pub fn handle_backup_read(
         write_guest_u32(engine, bytes_read_ptr, 0)?;
     }
     if buf == 0 || to_read == 0 {
-        state.last_error = 0;
+        state.process.last_error = 0;
         let return_address = engine.return_from_win64_api(1)?;
         return Ok(WinApiHandlerResult {
             return_address,
@@ -7176,14 +7176,14 @@ pub fn handle_backup_read(
         if bytes_read_ptr != 0 {
             write_guest_u32(engine, bytes_read_ptr, u32::try_from(read_len).unwrap_or(0))?;
         }
-        state.last_error = 0;
+        state.process.last_error = 0;
         let return_address = engine.return_from_win64_api(1)?;
         Ok(WinApiHandlerResult {
             return_address,
             return_value: 1,
         })
     } else {
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
         let return_address = engine.return_from_win64_api(0)?;
         Ok(WinApiHandlerResult {
             return_address,
@@ -7213,14 +7213,14 @@ pub fn handle_backup_seek(
                 u32::try_from(offset & 0xFFFF_FFFF).unwrap_or(0),
             )?;
         }
-        state.last_error = 0;
+        state.process.last_error = 0;
         let return_address = engine.return_from_win64_api(1)?;
         Ok(WinApiHandlerResult {
             return_address,
             return_value: 1,
         })
     } else {
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
         let return_address = engine.return_from_win64_api(0)?;
         Ok(WinApiHandlerResult {
             return_address,
@@ -7244,7 +7244,7 @@ pub fn handle_backup_write(
         write_guest_u32(engine, written_ptr, 0)?;
     }
     if buf == 0 || to_write == 0 {
-        state.last_error = 0;
+        state.process.last_error = 0;
         let return_address = engine.return_from_win64_api(1)?;
         return Ok(WinApiHandlerResult {
             return_address,
@@ -7271,14 +7271,14 @@ pub fn handle_backup_write(
         if written_ptr != 0 {
             write_guest_u32(engine, written_ptr, u32::try_from(to_write).unwrap_or(0))?;
         }
-        state.last_error = 0;
+        state.process.last_error = 0;
         let return_address = engine.return_from_win64_api(1)?;
         Ok(WinApiHandlerResult {
             return_address,
             return_value: 1,
         })
     } else {
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
         let return_address = engine.return_from_win64_api(0)?;
         Ok(WinApiHandlerResult {
             return_address,
@@ -7702,7 +7702,7 @@ fn handle_create_thread(
 
 /// Shared guest-thread spawn for `CreateThread` and CRT `_beginthreadex`.
 ///
-/// Returns the kernel handle, or `0` with `state.last_error` set on failure.
+/// Returns the kernel handle, or `0` with `state.process.last_error` set on failure.
 /// Does **not** pop the Win64 API frame (caller completes the return).
 pub fn create_guest_thread(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -7714,26 +7714,26 @@ pub fn create_guest_thread(
     tid_out: u64,
 ) -> Result<u64> {
     if !mt_create_thread_enabled() {
-        state.last_error = ERROR_NOT_SUPPORTED_MT;
+        state.process.last_error = ERROR_NOT_SUPPORTED_MT;
         return Ok(0);
     }
 
     if start == 0 {
-        state.last_error = ERROR_INVALID_PARAMETER;
+        state.process.last_error = ERROR_INVALID_PARAMETER;
         return Ok(0);
     }
 
     // Cap workers: by_tid includes primary; count pending + suspended too.
     let live_workers = state
-        .threads
+        .kernel.threads
         .by_tid
         .len()
         .saturating_sub(1)
-        .saturating_add(state.sync.pending_spawns.len())
-        .saturating_add(state.sync.suspended_spawns.len());
+        .saturating_add(state.kernel.sync.pending_spawns.len())
+        .saturating_add(state.kernel.sync.suspended_spawns.len());
     let max = usize::try_from(mt_max_worker_threads()).unwrap_or(64);
     if live_workers >= max {
-        state.last_error = ERROR_NOT_ENOUGH_MEMORY;
+        state.process.last_error = ERROR_NOT_ENOUGH_MEMORY;
         return Ok(0);
     }
 
@@ -7746,8 +7746,8 @@ pub fn create_guest_thread(
     let stack_size = stack_size.saturating_add(0xfff) & !0xfff;
     let stack_size = stack_size.max(0x1000);
 
-    let slot = state.sync.next_stack_slot;
-    state.sync.next_stack_slot = slot.saturating_add(1);
+    let slot = state.kernel.sync.next_stack_slot;
+    state.kernel.sync.next_stack_slot = slot.saturating_add(1);
     let stack_base = WORKER_STACK_REGION_BASE
         .saturating_add(u64::from(slot).saturating_mul(WORKER_STACK_STRIDE));
 
@@ -7769,7 +7769,7 @@ pub fn create_guest_thread(
             )
             .is_err()
         {
-            state.last_error = ERROR_NOT_ENOUGH_MEMORY;
+            state.process.last_error = ERROR_NOT_ENOUGH_MEMORY;
             return Ok(0);
         }
         stack_base
@@ -7791,7 +7791,7 @@ pub fn create_guest_thread(
     let entry_frame = [0_u8; THREAD_ENTRY_HOME_AND_RET];
     drop(engine.mem_write(entry_rsp, &entry_frame));
 
-    let tid = state.threads.alloc_worker();
+    let tid = state.kernel.threads.alloc_worker();
     let mut ctx = wie_cpu::ThreadContext::new();
     // RCX = lpParameter, RSP = entry, RIP = start
     if let Some(slot) = ctx.gpr.get_mut(1) {
@@ -7802,7 +7802,7 @@ pub fn create_guest_thread(
     }
     ctx.rip = start;
 
-    let (handle, _obj) = state.sync.register_thread(tid, ctx);
+    let (handle, _obj) = state.kernel.sync.register_thread(tid, ctx);
     let spawn = crate::PendingSpawn {
         tid,
         handle,
@@ -7812,9 +7812,9 @@ pub fn create_guest_thread(
         stack_size,
     };
     if (flags & CREATE_SUSPENDED) != 0 {
-        state.sync.suspended_spawns.insert(handle, spawn);
+        state.kernel.sync.suspended_spawns.insert(handle, spawn);
     } else {
-        state.sync.pending_spawns.push(spawn);
+        state.kernel.sync.pending_spawns.push(spawn);
     }
 
     if tid_out != 0 {
@@ -7825,12 +7825,12 @@ pub fn create_guest_thread(
         eprintln!(
             "[mt] CreateThread tid={tid:#x} handle={handle:#x} start={start:#x} param={param:#x} flags={flags:#x} suspended={} pending={} active_tid={:#x}",
             (flags & CREATE_SUSPENDED) != 0,
-            state.sync.pending_spawns.len(),
-            state.threads.current_tid(),
+            state.kernel.sync.pending_spawns.len(),
+            state.kernel.threads.current_tid(),
         );
     }
 
-    state.last_error = 0;
+    state.process.last_error = 0;
     Ok(handle)
 }
 
@@ -7857,9 +7857,9 @@ fn handle_exit_thread(
 ) -> Result<WinApiHandlerResult> {
     let code_raw = engine.read_rcx()?;
     let code = u32::try_from(code_raw & u64::from(u32::MAX)).unwrap_or(0);
-    let tid = state.threads.current_tid();
+    let tid = state.kernel.threads.current_tid();
     // Find thread object by tid.
-    for obj in state.sync.objects.values() {
+    for obj in state.kernel.sync.objects.values() {
         if let crate::KernelObject::Thread(t) = obj
             && t.tid == tid
         {
@@ -7882,10 +7882,10 @@ fn handle_get_exit_code_thread(
 ) -> Result<WinApiHandlerResult> {
     let handle = engine.read_rcx()?;
     let out_ptr = engine.read_rdx()?;
-    let code = if let Some(t) = state.sync.thread_by_handle(handle) {
+    let code = if let Some(t) = state.kernel.sync.thread_by_handle(handle) {
         t.exit_code.load(std::sync::atomic::Ordering::Acquire)
     } else {
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
             return_address,
@@ -7895,7 +7895,7 @@ fn handle_get_exit_code_thread(
     if out_ptr != 0 {
         drop(engine.mem_write(out_ptr, &code.to_le_bytes()));
     }
-    state.last_error = 0;
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -7913,7 +7913,7 @@ fn handle_wait_for_single_object(
     let timeout_ms = u32::try_from(timeout_raw & u64::from(u32::MAX)).unwrap_or(0);
 
     if std::env::var_os("WIE_MT_DEBUG").is_some() {
-        let kind = match state.sync.object(handle) {
+        let kind = match state.kernel.sync.object(handle) {
             Some(crate::KernelObject::Thread(t)) => {
                 format!("Thread(tid={:#x},fin={})", t.tid, t.is_finished())
             }
@@ -7923,16 +7923,16 @@ fn handle_wait_for_single_object(
         };
         eprintln!(
             "[mt] WaitForSingleObject handle={handle:#x} timeout={timeout_ms:#x} kind={kind} active={:#x} pending={}",
-            state.threads.current_tid(),
-            state.sync.pending_spawns.len(),
+            state.kernel.threads.current_tid(),
+            state.kernel.sync.pending_spawns.len(),
         );
     }
 
     // Fast path: already signaled — no park.
-    match state.sync.object(handle) {
+    match state.kernel.sync.object(handle) {
         Some(crate::KernelObject::Thread(t)) => {
             if t.is_finished() {
-                state.last_error = 0;
+                state.process.last_error = 0;
                 let return_address =
                     engine.return_from_win64_api(u64::from(crate::WAIT_OBJECT_0))?;
                 return Ok(WinApiHandlerResult {
@@ -7943,7 +7943,7 @@ fn handle_wait_for_single_object(
         }
         Some(crate::KernelObject::Event(e)) => {
             if e.wait(0) {
-                state.last_error = 0;
+                state.process.last_error = 0;
                 let return_address =
                     engine.return_from_win64_api(u64::from(crate::WAIT_OBJECT_0))?;
                 return Ok(WinApiHandlerResult {
@@ -7954,7 +7954,7 @@ fn handle_wait_for_single_object(
         }
         Some(crate::KernelObject::Semaphore(s)) => {
             if s.try_acquire() {
-                state.last_error = 0;
+                state.process.last_error = 0;
                 let return_address =
                     engine.return_from_win64_api(u64::from(crate::WAIT_OBJECT_0))?;
                 return Ok(WinApiHandlerResult {
@@ -7964,7 +7964,7 @@ fn handle_wait_for_single_object(
             }
         }
         None => {
-            state.last_error = ERROR_INVALID_HANDLE;
+            state.process.last_error = ERROR_INVALID_HANDLE;
             let return_address = engine.return_from_win64_api(u64::from(crate::WAIT_FAILED))?;
             return Ok(WinApiHandlerResult {
                 return_address,
@@ -7985,7 +7985,7 @@ pub fn resolve_wait_target(
     state: &WinApiState,
     handle: u64,
 ) -> Option<crate::sync_obj::WaitTarget> {
-    state.sync.wait_target(handle)
+    state.kernel.sync.wait_target(handle)
 }
 
 /// Clone the CS wait queue for parking **outside** process locks.
@@ -7993,7 +7993,7 @@ pub fn resolve_cs_queue(
     state: &mut WinApiState,
     cs: u64,
 ) -> std::sync::Arc<crate::sync_obj::CsWaitQueue> {
-    state.sync.cs_queue(cs)
+    state.kernel.sync.cs_queue(cs)
 }
 
 /// `CreateEventA/W`.
@@ -8006,8 +8006,8 @@ fn handle_create_event(
     let initial = engine.read_r8()? != 0;
     let _name = engine.read_r9()?; // named events: ignore (anonymous only)
 
-    let (handle, _) = state.sync.register_event(manual, initial);
-    state.last_error = 0;
+    let (handle, _) = state.kernel.sync.register_event(manual, initial);
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(handle)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -8057,26 +8057,26 @@ fn handle_duplicate_handle(
     let tid = if source_handle == u64::MAX || source_handle == u64::MAX - 1 {
         // Pseudohandle → resolve the current TID.  For GetCurrentProcess we
         // use the primary TID since there is no process object.
-        state.threads.current_tid()
+        state.kernel.threads.current_tid()
     } else {
         // Real kernel handle — skip resolution, lookup directly below.
-        let obj = state.sync.objects.get(&source_handle).cloned();
+        let obj = state.kernel.sync.objects.get(&source_handle).cloned();
         if let Some(obj) = obj {
-            let new_handle = state.sync.next_handle;
-            state.sync.next_handle = state.sync.next_handle.wrapping_add(4);
-            state.sync.objects.insert(new_handle, obj.clone());
+            let new_handle = state.kernel.sync.next_handle;
+            state.kernel.sync.next_handle = state.kernel.sync.next_handle.wrapping_add(4);
+            state.kernel.sync.objects.insert(new_handle, obj.clone());
             if close_source {
-                state.sync.objects.remove(&source_handle);
+                state.kernel.sync.objects.remove(&source_handle);
             }
             engine.mem_write(target_handle_ptr, &new_handle.to_le_bytes())?;
-            state.last_error = 0;
+            state.process.last_error = 0;
             let return_address = engine.return_from_win64_api(1)?;
             return Ok(WinApiHandlerResult {
                 return_address,
                 return_value: 1,
             });
         }
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
             return_address,
@@ -8086,7 +8086,7 @@ fn handle_duplicate_handle(
 
     // Pseudohandle path: find or create the ThreadObject for `tid`.
     let source_obj = state
-        .sync
+        .kernel.sync
         .objects
         .values()
         .find_map(|obj| match obj {
@@ -8095,22 +8095,22 @@ fn handle_duplicate_handle(
         })
         .unwrap_or_else(|| {
             let (_, th) = state
-                .sync
+                .kernel.sync
                 .register_thread(tid, wie_cpu::ThreadContext::default());
             crate::KernelObject::Thread(th)
         });
 
-    let new_handle = state.sync.next_handle;
-    state.sync.next_handle = state.sync.next_handle.wrapping_add(4);
-    state.sync.objects.insert(new_handle, source_obj);
+    let new_handle = state.kernel.sync.next_handle;
+    state.kernel.sync.next_handle = state.kernel.sync.next_handle.wrapping_add(4);
+    state.kernel.sync.objects.insert(new_handle, source_obj);
 
     // Honour DUPLICATE_CLOSE_SOURCE: close the source handle after duplication.
     if close_source && source_handle != u64::MAX && source_handle != u64::MAX - 1 {
-        state.sync.objects.remove(&source_handle);
+        state.kernel.sync.objects.remove(&source_handle);
     }
 
     engine.mem_write(target_handle_ptr, &new_handle.to_le_bytes())?;
-    state.last_error = 0;
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?; // TRUE
     Ok(WinApiHandlerResult {
         return_address,
@@ -8130,10 +8130,10 @@ fn handle_get_thread_priority(
     let h_thread = engine.read_rcx()?;
 
     // Pseudohandle CURRENT_THREAD (-2), or a real kernel handle.
-    let valid = h_thread == u64::MAX - 1 || state.sync.objects.contains_key(&h_thread);
+    let valid = h_thread == u64::MAX - 1 || state.kernel.sync.objects.contains_key(&h_thread);
 
     if !valid {
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
         // THREAD_PRIORITY_ERROR_RETURN = MAXLONG (0x7FFFFFFF)
         let return_address = engine.return_from_win64_api(0x7FFF_FFFF)?;
         return Ok(WinApiHandlerResult {
@@ -8245,7 +8245,7 @@ fn handle_set_event(
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
     let handle = engine.read_rcx()?;
-    let ok = match state.sync.object(handle) {
+    let ok = match state.kernel.sync.object(handle) {
         Some(crate::KernelObject::Event(e)) => {
             e.set();
             true
@@ -8253,14 +8253,14 @@ fn handle_set_event(
         _ => false,
     };
     if ok {
-        state.last_error = 0;
+        state.process.last_error = 0;
         let return_address = engine.return_from_win64_api(1)?;
         Ok(WinApiHandlerResult {
             return_address,
             return_value: 1,
         })
     } else {
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
         let return_address = engine.return_from_win64_api(0)?;
         Ok(WinApiHandlerResult {
             return_address,
@@ -8275,7 +8275,7 @@ fn handle_reset_event(
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
     let handle = engine.read_rcx()?;
-    let ok = match state.sync.object(handle) {
+    let ok = match state.kernel.sync.object(handle) {
         Some(crate::KernelObject::Event(e)) => {
             e.reset();
             true
@@ -8283,14 +8283,14 @@ fn handle_reset_event(
         _ => false,
     };
     if ok {
-        state.last_error = 0;
+        state.process.last_error = 0;
         let return_address = engine.return_from_win64_api(1)?;
         Ok(WinApiHandlerResult {
             return_address,
             return_value: 1,
         })
     } else {
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
         let return_address = engine.return_from_win64_api(0)?;
         Ok(WinApiHandlerResult {
             return_address,
@@ -8330,7 +8330,7 @@ fn handle_flush_instruction_cache(
         .context("failed to read R8 for FlushInstructionCache")?;
     let size_usize = usize::try_from(size).unwrap_or(usize::MAX);
     if size_usize == usize::MAX && size != 0 {
-        state.last_error = ERROR_INVALID_PARAMETER;
+        state.process.last_error = ERROR_INVALID_PARAMETER;
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
             return_address,
@@ -8339,7 +8339,7 @@ fn handle_flush_instruction_cache(
     }
     match engine.flush_instruction_cache(base, size_usize) {
         Ok(()) => {
-            state.last_error = 0;
+            state.process.last_error = 0;
             let return_address = engine.return_from_win64_api(1)?;
             Ok(WinApiHandlerResult {
                 return_address,
@@ -8347,7 +8347,7 @@ fn handle_flush_instruction_cache(
             })
         }
         Err(e) => {
-            state.last_error = wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
+            state.process.last_error = wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
             let return_address = engine.return_from_win64_api(0)?;
             Ok(WinApiHandlerResult {
                 return_address,
@@ -8368,7 +8368,7 @@ fn handle_virtual_alloc(
     let protect = u32::try_from(engine.read_r9()? & 0xffff_ffff).unwrap_or(0);
     let size_usize = usize::try_from(size).unwrap_or(usize::MAX);
     if size_usize == usize::MAX {
-        state.last_error = ERROR_INVALID_PARAMETER;
+        state.process.last_error = ERROR_INVALID_PARAMETER;
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
             return_address,
@@ -8377,7 +8377,7 @@ fn handle_virtual_alloc(
     }
     match engine.virtual_alloc(addr, size_usize, alloc_type, protect) {
         Ok(base) => {
-            state.last_error = 0;
+            state.process.last_error = 0;
             tracing::debug!(addr, size, alloc_type, protect, base, "VirtualAlloc ok");
             let return_address = engine.return_from_win64_api(base)?;
             Ok(WinApiHandlerResult {
@@ -8386,14 +8386,14 @@ fn handle_virtual_alloc(
             })
         }
         Err(e) => {
-            state.last_error = wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
+            state.process.last_error = wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
             tracing::debug!(
                 addr,
                 size,
                 alloc_type,
                 protect,
                 error = %e,
-                last_error = state.last_error,
+                last_error = state.process.last_error,
                 "VirtualAlloc failed"
             );
             let return_address = engine.return_from_win64_api(0)?;
@@ -8415,7 +8415,7 @@ fn handle_virtual_free(
     let free_type = u32::try_from(engine.read_r8()? & 0xffff_ffff).unwrap_or(0);
     let size_usize = usize::try_from(size).unwrap_or(usize::MAX);
     if size_usize == usize::MAX {
-        state.last_error = ERROR_INVALID_PARAMETER;
+        state.process.last_error = ERROR_INVALID_PARAMETER;
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
             return_address,
@@ -8424,7 +8424,7 @@ fn handle_virtual_free(
     }
     match engine.virtual_free(addr, size_usize, free_type) {
         Ok(()) => {
-            state.last_error = 0;
+            state.process.last_error = 0;
             let return_address = engine.return_from_win64_api(1)?;
             Ok(WinApiHandlerResult {
                 return_address,
@@ -8432,7 +8432,7 @@ fn handle_virtual_free(
             })
         }
         Err(e) => {
-            state.last_error = wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
+            state.process.last_error = wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
             let return_address = engine.return_from_win64_api(0)?;
             Ok(WinApiHandlerResult {
                 return_address,
@@ -8454,7 +8454,7 @@ fn handle_virtual_protect(
     let old_prot = engine.read_r9()?;
     // Microsoft Learn: if lpflOldProtect is NULL or invalid, the function fails.
     if old_prot == 0 {
-        state.last_error = ERROR_INVALID_PARAMETER;
+        state.process.last_error = ERROR_INVALID_PARAMETER;
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
             return_address,
@@ -8463,7 +8463,7 @@ fn handle_virtual_protect(
     }
     let size_usize = usize::try_from(size).unwrap_or(usize::MAX);
     if size_usize == 0 || size_usize == usize::MAX {
-        state.last_error = ERROR_INVALID_PARAMETER;
+        state.process.last_error = ERROR_INVALID_PARAMETER;
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
             return_address,
@@ -8473,7 +8473,7 @@ fn handle_virtual_protect(
     match engine.virtual_protect(addr, size_usize, new_protect) {
         Ok(old) => {
             write_guest_u32(engine, old_prot, old)?;
-            state.last_error = 0;
+            state.process.last_error = 0;
             let return_address = engine.return_from_win64_api(1)?;
             Ok(WinApiHandlerResult {
                 return_address,
@@ -8481,7 +8481,7 @@ fn handle_virtual_protect(
             })
         }
         Err(e) => {
-            state.last_error = wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
+            state.process.last_error = wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
             let return_address = engine.return_from_win64_api(0)?;
             Ok(WinApiHandlerResult {
                 return_address,
@@ -8501,7 +8501,7 @@ fn handle_virtual_query(
     let length = engine.read_r8()?;
 
     if buffer == 0 || length < 48 {
-        state.last_error = ERROR_INVALID_PARAMETER;
+        state.process.last_error = ERROR_INVALID_PARAMETER;
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
             return_address,
@@ -8512,7 +8512,7 @@ fn handle_virtual_query(
     let mbi = engine.virtual_query(address);
     let bytes = mbi.to_bytes();
     engine.mem_write(buffer, &bytes)?;
-    state.last_error = 0;
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(48)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -8527,24 +8527,24 @@ fn handle_tls_get_value(
     let index = engine.read_rcx()? & 0xffff_ffff;
     let idx = usize::try_from(index).unwrap_or(usize::MAX);
     // Microsoft: invalid index → 0 and last-error ERROR_INVALID_PARAMETER (87).
-    let allocated = usize::try_from(state.threads.tls_index_count).unwrap_or(0);
+    let allocated = usize::try_from(state.kernel.threads.tls_index_count).unwrap_or(0);
     if idx >= allocated {
-        state.last_error = ERROR_INVALID_PARAMETER;
+        state.process.last_error = ERROR_INVALID_PARAMETER;
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
             return_address,
             return_value: 0,
         });
     }
-    state.threads.grow_active_tls_to_process_count();
+    state.kernel.threads.grow_active_tls_to_process_count();
     let value = state
-        .threads
+        .kernel.threads
         .active
         .tls_values
         .get(idx)
         .copied()
         .unwrap_or(0);
-    state.last_error = 0;
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(value)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -8559,26 +8559,26 @@ fn handle_tls_set_value(
     let index = engine.read_rcx()? & 0xffff_ffff;
     let value = engine.read_rdx()?;
     let idx = usize::try_from(index).unwrap_or(usize::MAX);
-    let allocated = usize::try_from(state.threads.tls_index_count).unwrap_or(0);
+    let allocated = usize::try_from(state.kernel.threads.tls_index_count).unwrap_or(0);
     if idx >= allocated {
-        state.last_error = ERROR_INVALID_PARAMETER;
+        state.process.last_error = ERROR_INVALID_PARAMETER;
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
             return_address,
             return_value: 0,
         });
     }
-    state.threads.grow_active_tls_to_process_count();
-    if let Some(slot) = state.threads.active.tls_values.get_mut(idx) {
+    state.kernel.threads.grow_active_tls_to_process_count();
+    if let Some(slot) = state.kernel.threads.active.tls_values.get_mut(idx) {
         *slot = value;
-        state.last_error = 0;
+        state.process.last_error = 0;
         let return_address = engine.return_from_win64_api(1)?;
         return Ok(WinApiHandlerResult {
             return_address,
             return_value: 1,
         });
     }
-    state.last_error = ERROR_INVALID_PARAMETER;
+    state.process.last_error = ERROR_INVALID_PARAMETER;
     let return_address = engine.return_from_win64_api(0)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -8591,10 +8591,10 @@ fn handle_tls_alloc(
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
     // Process-wide index space; value storage is per active guest thread.
-    let index = u64::from(state.threads.tls_index_count);
-    state.threads.tls_index_count = state.threads.tls_index_count.saturating_add(1);
-    state.threads.grow_active_tls_to_process_count();
-    state.last_error = 0;
+    let index = u64::from(state.kernel.threads.tls_index_count);
+    state.kernel.threads.tls_index_count = state.kernel.threads.tls_index_count.saturating_add(1);
+    state.kernel.threads.grow_active_tls_to_process_count();
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(index)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -8610,10 +8610,10 @@ fn handle_tls_free(
     let index = usize::try_from(index_raw).unwrap_or(usize::MAX);
     // Clear active thread value; index remains allocated (Windows does not reuse
     // TLS indices after TlsFree in a way micros depend on — zero is enough).
-    if let Some(slot) = state.threads.active.tls_values.get_mut(index) {
+    if let Some(slot) = state.kernel.threads.active.tls_values.get_mut(index) {
         *slot = 0;
     }
-    state.last_error = 0;
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -8812,7 +8812,7 @@ pub fn handle_global_unlock(
 
     let existed = state.heap_state.heap.is_live(memory);
 
-    state.last_error = if existed { 0 } else { ERROR_INVALID_HANDLE };
+    state.process.last_error = if existed { 0 } else { ERROR_INVALID_HANDLE };
 
     let return_value = 0;
 
@@ -8892,21 +8892,21 @@ pub fn handle_global_add_atom_a(
         .context("failed to read RCX for GlobalAddAtomA")?;
 
     let return_value = if name_ptr == 0 {
-        state.last_error = ERROR_INVALID_PARAMETER;
+        state.process.last_error = ERROR_INVALID_PARAMETER;
         0
     } else {
         let name = read_ansi_string_from_cpu(engine, name_ptr, 255)
             .context("failed to read GlobalAddAtomA name")?;
 
         if name.is_empty() {
-            state.last_error = ERROR_INVALID_PARAMETER;
+            state.process.last_error = ERROR_INVALID_PARAMETER;
             0
         } else if let Some(existing) = state
             .window_state.global_atoms
             .iter()
             .find(|record| record.name.eq_ignore_ascii_case(&name))
         {
-            state.last_error = 0;
+            state.process.last_error = 0;
             u64::from(existing.atom)
         } else {
             let atom = state.window_state.next_global_atom;
@@ -8917,7 +8917,7 @@ pub fn handle_global_add_atom_a(
                 .context("global atom identifier overflow")?;
 
             state.window_state.global_atoms.push(GlobalAtomRecord { atom, name });
-            state.last_error = 0;
+            state.process.last_error = 0;
 
             u64::from(atom)
         }
@@ -8950,9 +8950,9 @@ pub fn handle_global_delete_atom(
     if existed {
         state.window_state.global_atoms.retain(|record| record.atom != atom);
 
-        state.last_error = 0;
+        state.process.last_error = 0;
     } else {
-        state.last_error = ERROR_INVALID_PARAMETER;
+        state.process.last_error = ERROR_INVALID_PARAMETER;
     }
 
     // GlobalDeleteAtom returns zero on success, otherwise the original atom.
@@ -9000,14 +9000,14 @@ pub fn handle_get_full_path_name_w(
         .context("failed to read R9 for GetFullPathNameW")?;
 
     let return_value = if input_path_ptr == 0 {
-        state.last_error = ERROR_INVALID_PARAMETER;
+        state.process.last_error = ERROR_INVALID_PARAMETER;
         0
     } else {
         let input_path = read_guest_utf16_lossy(engine, input_path_ptr, 32_768)
             .context("failed to read GetFullPathNameW input path")?;
 
         if input_path.is_empty() {
-            state.last_error = ERROR_INVALID_PARAMETER;
+            state.process.last_error = ERROR_INVALID_PARAMETER;
             0
         } else {
             let current_directory = String::from_utf16_lossy(&state.file_io.current_directory_wide);
@@ -9030,7 +9030,7 @@ pub fn handle_get_full_path_name_w(
                     write_guest_u64(engine, file_part_ptr_ptr, 0)?;
                 }
 
-                state.last_error = 0;
+                state.process.last_error = 0;
 
                 u64::try_from(required_with_null)
                     .context("GetFullPathNameW required length does not fit u64")?
@@ -9065,7 +9065,7 @@ pub fn handle_get_full_path_name_w(
                     write_guest_u64(engine, file_part_ptr_ptr, file_part_ptr)?;
                 }
 
-                state.last_error = 0;
+                state.process.last_error = 0;
 
                 u64::try_from(path_length)
                     .context("GetFullPathNameW result length does not fit u64")?
@@ -9094,12 +9094,12 @@ pub fn handle_get_full_path_name_a(
     let file_part_ptr_ptr = engine.read_r9()?;
 
     let return_value = if input_path_ptr == 0 {
-        state.last_error = ERROR_INVALID_PARAMETER;
+        state.process.last_error = ERROR_INVALID_PARAMETER;
         0
     } else {
         let input_path = read_ansi_string_from_cpu(engine, input_path_ptr, 32_768)?;
         if input_path.is_empty() {
-            state.last_error = ERROR_INVALID_PARAMETER;
+            state.process.last_error = ERROR_INVALID_PARAMETER;
             0
         } else {
             let current_directory = String::from_utf16_lossy(&state.file_io.current_directory_wide);
@@ -9112,7 +9112,7 @@ pub fn handle_get_full_path_name_a(
                 if file_part_ptr_ptr != 0 {
                     write_guest_u64(engine, file_part_ptr_ptr, 0)?;
                 }
-                state.last_error = 0;
+                state.process.last_error = 0;
                 u64::try_from(required_with_null).unwrap_or(0)
             } else {
                 let mut out = path_bytes;
@@ -9124,7 +9124,7 @@ pub fn handle_get_full_path_name_a(
                         output_buffer_ptr.saturating_add(u64::try_from(file_off).unwrap_or(0));
                     write_guest_u64(engine, file_part_ptr_ptr, file_part_ptr)?;
                 }
-                state.last_error = 0;
+                state.process.last_error = 0;
                 u64::try_from(path_length).unwrap_or(0)
             }
         }
@@ -9171,22 +9171,22 @@ pub fn handle_set_current_directory_a(
 ) -> Result<WinApiHandlerResult> {
     let directory_ptr = engine.read_rcx()?;
     let success = if directory_ptr == 0 {
-        state.last_error = ERROR_PATH_NOT_FOUND;
+        state.process.last_error = ERROR_PATH_NOT_FOUND;
         false
     } else {
         let directory = read_ansi_string_from_cpu(engine, directory_ptr, 32_768)?;
         if directory.is_empty() {
-            state.last_error = ERROR_PATH_NOT_FOUND;
+            state.process.last_error = ERROR_PATH_NOT_FOUND;
             false
         } else {
             let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
             let full = resolve_full_windows_path(&cwd, &directory);
             if guest_dir_exists(state, &full) {
                 state.file_io.current_directory_wide = full.encode_utf16().collect();
-                state.last_error = 0;
+                state.process.last_error = 0;
                 true
             } else {
-                state.last_error = ERROR_PATH_NOT_FOUND;
+                state.process.last_error = ERROR_PATH_NOT_FOUND;
                 false
             }
         }
@@ -9201,7 +9201,7 @@ pub fn handle_set_current_directory_a(
 
 fn finish_create_directory(state: &mut WinApiState, path: &str) -> u64 {
     if path.is_empty() {
-        state.last_error = ERROR_PATH_NOT_FOUND;
+        state.process.last_error = ERROR_PATH_NOT_FOUND;
         return 0;
     }
     if state.file_io.volumes.bottle_root != state.file_io.bottle_root {
@@ -9210,18 +9210,18 @@ fn finish_create_directory(state: &mut WinApiState, path: &str) -> u64 {
     let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full = resolve_full_windows_path(&cwd, path);
     if guest_dir_exists(state, &full) {
-        state.last_error = ERROR_ALREADY_EXISTS;
+        state.process.last_error = ERROR_ALREADY_EXISTS;
         return 0;
     }
     let Some(map) = crate::vfs::guest_path_to_host(&state.file_io.volumes, &full) else {
-        state.last_error = ERROR_PATH_NOT_FOUND;
+        state.process.last_error = ERROR_PATH_NOT_FOUND;
         return 0;
     };
     if crate::vfs::mkdir_host(&map.host).is_ok() {
-        state.last_error = 0;
+        state.process.last_error = 0;
         1
     } else {
-        state.last_error = ERROR_PATH_NOT_FOUND;
+        state.process.last_error = ERROR_PATH_NOT_FOUND;
         0
     }
 }
@@ -9266,7 +9266,7 @@ pub fn handle_create_directory_a(
 
 fn finish_delete_file(state: &mut WinApiState, path: &str) -> u64 {
     if path.is_empty() {
-        state.last_error = ERROR_PATH_NOT_FOUND;
+        state.process.last_error = ERROR_PATH_NOT_FOUND;
         return 0;
     }
     if state.file_io.volumes.bottle_root != state.file_io.bottle_root {
@@ -9279,13 +9279,13 @@ fn finish_delete_file(state: &mut WinApiState, path: &str) -> u64 {
         .retain(|v| !paths_match_guest(&full, &v.guest_path));
     if let Some(map) = crate::vfs::guest_path_to_host(&state.file_io.volumes, &full) {
         if crate::vfs::remove_file_host(&map.host).is_ok() {
-            state.last_error = 0;
+            state.process.last_error = 0;
             return 1;
         }
-        state.last_error = ERROR_FILE_NOT_FOUND;
+        state.process.last_error = ERROR_FILE_NOT_FOUND;
         return 0;
     }
-    state.last_error = ERROR_FILE_NOT_FOUND;
+    state.process.last_error = ERROR_FILE_NOT_FOUND;
     0
 }
 
@@ -9329,7 +9329,7 @@ pub fn handle_delete_file_a(
 
 fn finish_remove_directory(state: &mut WinApiState, path: &str) -> u64 {
     if path.is_empty() {
-        state.last_error = ERROR_PATH_NOT_FOUND;
+        state.process.last_error = ERROR_PATH_NOT_FOUND;
         return 0;
     }
     if state.file_io.volumes.bottle_root != state.file_io.bottle_root {
@@ -9338,20 +9338,20 @@ fn finish_remove_directory(state: &mut WinApiState, path: &str) -> u64 {
     let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full = resolve_full_windows_path(&cwd, path);
     let Some(map) = crate::vfs::guest_path_to_host(&state.file_io.volumes, &full) else {
-        state.last_error = ERROR_PATH_NOT_FOUND;
+        state.process.last_error = ERROR_PATH_NOT_FOUND;
         return 0;
     };
     match crate::vfs::remove_dir_host(&map.host) {
         Ok(()) => {
-            state.last_error = 0;
+            state.process.last_error = 0;
             1
         }
         Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
-            state.last_error = ERROR_DIR_NOT_EMPTY;
+            state.process.last_error = ERROR_DIR_NOT_EMPTY;
             0
         }
         Err(_) => {
-            state.last_error = ERROR_PATH_NOT_FOUND;
+            state.process.last_error = ERROR_PATH_NOT_FOUND;
             0
         }
     }
@@ -9397,7 +9397,7 @@ pub fn handle_remove_directory_a(
 
 fn finish_move_file(state: &mut WinApiState, from: &str, to: &str) -> u64 {
     if from.is_empty() || to.is_empty() {
-        state.last_error = ERROR_PATH_NOT_FOUND;
+        state.process.last_error = ERROR_PATH_NOT_FOUND;
         return 0;
     }
     if state.file_io.volumes.bottle_root != state.file_io.bottle_root {
@@ -9407,18 +9407,18 @@ fn finish_move_file(state: &mut WinApiState, from: &str, to: &str) -> u64 {
     let full_from = resolve_full_windows_path(&cwd, from);
     let full_to = resolve_full_windows_path(&cwd, to);
     let Some(src) = crate::vfs::guest_path_to_host(&state.file_io.volumes, &full_from) else {
-        state.last_error = ERROR_FILE_NOT_FOUND;
+        state.process.last_error = ERROR_FILE_NOT_FOUND;
         return 0;
     };
     let Some(dst) = crate::vfs::guest_path_to_host(&state.file_io.volumes, &full_to) else {
-        state.last_error = ERROR_PATH_NOT_FOUND;
+        state.process.last_error = ERROR_PATH_NOT_FOUND;
         return 0;
     };
     if crate::vfs::rename_host(&src.host, &dst.host).is_ok() {
-        state.last_error = 0;
+        state.process.last_error = 0;
         1
     } else {
-        state.last_error = ERROR_ACCESS_DENIED;
+        state.process.last_error = ERROR_ACCESS_DENIED;
         0
     }
 }
@@ -9496,7 +9496,7 @@ pub fn handle_get_temp_path_w(
         write_guest_utf16_units(engine, buffer_ptr, &terminated)?;
         u64::try_from(terminated.len().saturating_sub(1)).unwrap_or(0)
     };
-    state.last_error = 0;
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(return_value)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -9522,7 +9522,7 @@ pub fn handle_get_temp_path_a(
         engine.mem_write(buffer_ptr, &out)?;
         u64::try_from(out.len().saturating_sub(1)).unwrap_or(0)
     };
-    state.last_error = 0;
+    state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(return_value)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -9569,7 +9569,7 @@ pub fn handle_get_temp_file_name_w(
         units.push(0);
         write_guest_utf16_units(engine, buffer_ptr, &units)?;
     }
-    state.last_error = 0;
+    state.process.last_error = 0;
     let return_value = u64::from(id_u32).max(1);
     let return_address = engine.return_from_win64_api(return_value)?;
     Ok(WinApiHandlerResult {
@@ -9630,7 +9630,7 @@ pub fn handle_get_temp_file_name_a(
         out.push(0);
         engine.mem_write(buffer_ptr, &out)?;
     }
-    state.last_error = 0;
+    state.process.last_error = 0;
     let return_value = u64::from(id_u32).max(1);
     let return_address = engine.return_from_win64_api(return_value)?;
     Ok(WinApiHandlerResult {
@@ -9775,10 +9775,10 @@ pub fn handle_get_file_size_ex(
         if size_ptr != 0 {
             write_guest_u64(engine, size_ptr, open_file.size())?;
         }
-        state.last_error = 0;
+        state.process.last_error = 0;
         1
     } else {
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
         0
     };
     let return_address = engine.return_from_win64_api(return_value)?;
@@ -9803,10 +9803,10 @@ pub fn handle_set_file_pointer_ex(
     let valid_method =
         move_method == FILE_BEGIN || move_method == FILE_CURRENT || move_method == FILE_END;
     let return_value = if !is_open_file_handle(state, handle) {
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
         0
     } else if !valid_method {
-        state.last_error = ERROR_INVALID_PARAMETER;
+        state.process.last_error = ERROR_INVALID_PARAMETER;
         0
     } else {
         let open_file = find_open_file_mut(state, handle)
@@ -9821,7 +9821,7 @@ pub fn handle_set_file_pointer_ex(
         };
         let new_position = base.saturating_add(distance);
         if new_position < 0 {
-            state.last_error = ERROR_INVALID_PARAMETER;
+            state.process.last_error = ERROR_INVALID_PARAMETER;
             0
         } else {
             let new_cursor = u64::try_from(new_position).unwrap_or(0);
@@ -9829,7 +9829,7 @@ pub fn handle_set_file_pointer_ex(
             if new_pos_ptr != 0 {
                 write_guest_u64(engine, new_pos_ptr, new_cursor)?;
             }
-            state.last_error = 0;
+            state.process.last_error = 0;
             1
         }
     };
@@ -9863,10 +9863,10 @@ pub fn handle_set_end_of_file(
             sync_open_bytes_to_virtual(state, &path, handle);
             persist_open_file_to_host(state, handle);
         }
-        state.last_error = 0;
+        state.process.last_error = 0;
         1
     } else {
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
         0
     };
     let return_address = engine.return_from_win64_api(return_value)?;
@@ -9884,10 +9884,10 @@ pub fn handle_flush_file_buffers(
     let handle = engine.read_rcx()?;
     let return_value = if is_open_file_handle(state, handle) {
         persist_open_file_to_host(state, handle);
-        state.last_error = 0;
+        state.process.last_error = 0;
         1
     } else {
-        state.last_error = ERROR_INVALID_HANDLE;
+        state.process.last_error = ERROR_INVALID_HANDLE;
         0
     };
     let return_address = engine.return_from_win64_api(return_value)?;

@@ -554,7 +554,7 @@ impl RuntimeSession {
     /// Publish host `last_error` into guest TEB.LastErrorValue so in-guest
     /// `GetLastError` stubs stay coherent with host-side API failures.
     fn publish_last_error_to_guest(&mut self) {
-        let err = self.process.with_mut(|_, st| st.last_error);
+        let err = self.process.with_mut(|_, st| st.process.last_error);
         if self.last_published_last_error == Some(err) {
             return;
         }
@@ -1051,7 +1051,7 @@ impl RuntimeSession {
         {
             let ctx = wie_cpu::ThreadContext::default();
             let _ = winapi_state
-                .sync
+                .kernel.sync
                 .register_thread(wie_winapi::PRIMARY_THREAD_ID, ctx);
         }
 
@@ -1071,7 +1071,7 @@ impl RuntimeSession {
                 let entries = wie_winapi::exception::parse_pdata(raw);
                 if !entries.is_empty() {
                     winapi_state
-                        .sync
+                        .kernel.sync
                         .function_tables
                         .insert(image_summary.image_base, entries);
                 }
@@ -1112,7 +1112,7 @@ impl RuntimeSession {
 
         // Store the host directory for DLL search fallback.
         if let Some(parent) = path.parent() {
-            winapi_state.main_module_host_dir = Some(parent.to_owned());
+            winapi_state.process.main_module_host_dir = Some(parent.to_owned());
         }
 
         let mut session = Self::from_init(SessionInit {
@@ -1294,8 +1294,8 @@ impl RuntimeSession {
                     .shared_winapi
                     .lock()
                     .unwrap_or_else(|p| p.into_inner());
-                if st.threads.active.tid != primary_tid {
-                    st.threads.activate(primary_tid);
+                if st.kernel.threads.active.tid != primary_tid {
+                    st.kernel.threads.activate(primary_tid);
                 }
             }
 
@@ -1330,8 +1330,8 @@ impl RuntimeSession {
                 // Workers may have activated themselves while we ran pure guest
                 // code without the WinAPI lock. Reclaim primary identity before
                 // any dispatch that uses current_tid() (CS owner, TLS, waits).
-                if winapi_state.threads.active.tid != primary_tid {
-                    winapi_state.threads.activate(primary_tid);
+                if winapi_state.kernel.threads.active.tid != primary_tid {
+                    winapi_state.kernel.threads.activate(primary_tid);
                 }
 
                 let (hook, invalid_memory) = match hook_result {
@@ -1509,7 +1509,7 @@ impl RuntimeSession {
                                     return_value: Some(result.return_value),
                                     return_address: Some(result.return_address),
                                 });
-                                let err = winapi_state.last_error;
+                                let err = winapi_state.process.last_error;
                                 if self.last_published_last_error != Some(err) {
                                     let bytes = err.to_le_bytes();
                                     if engine
@@ -1576,7 +1576,7 @@ impl RuntimeSession {
                                 .mem_read(crate::guest_stubs::TEB_LAST_ERROR_VA, &mut teb_err)
                                 .is_ok()
                             {
-                                winapi_state.last_error = u32::from_le_bytes(teb_err);
+                                winapi_state.process.last_error = u32::from_le_bytes(teb_err);
                             }
                         }
 
@@ -1619,7 +1619,7 @@ impl RuntimeSession {
                             if let Some(t0) = handler_t0 {
                                 record_handler(t0.elapsed().as_nanos(), false);
                             }
-                            winapi_state.sync.process_dying = true;
+                            winapi_state.kernel.sync.process_dying = true;
                             break_term =
                                 Some(EntryTraceTermination::ExitProcess { code: exit_code });
                             quantum = Quantum::Break;
@@ -1633,7 +1633,7 @@ impl RuntimeSession {
                             }
                             noisy_api = noisy_api.saturating_add(1);
                             // publish last error
-                            let err = winapi_state.last_error;
+                            let err = winapi_state.process.last_error;
                             if self.last_published_last_error != Some(err) {
                                 let bytes = err.to_le_bytes();
                                 if engine
@@ -1654,7 +1654,7 @@ impl RuntimeSession {
                                 record_handler(t0.elapsed().as_nanos(), true);
                             }
                             noisy_api = noisy_api.saturating_add(1);
-                            let err = winapi_state.last_error;
+                            let err = winapi_state.process.last_error;
                             if self.last_published_last_error != Some(err) {
                                 let bytes = err.to_le_bytes();
                                 if engine
@@ -1675,7 +1675,7 @@ impl RuntimeSession {
                                 record_handler(t0.elapsed().as_nanos(), true);
                             }
                             noisy_api = noisy_api.saturating_add(1);
-                            let err = winapi_state.last_error;
+                            let err = winapi_state.process.last_error;
                             if self.last_published_last_error != Some(err) {
                                 let bytes = err.to_le_bytes();
                                 if engine
@@ -1736,7 +1736,7 @@ impl RuntimeSession {
                                             return_address: Some(handler_result.return_address),
                                         });
                                     }
-                                    let err = winapi_state.last_error;
+                                    let err = winapi_state.process.last_error;
                                     if self.last_published_last_error != Some(err) {
                                         let bytes = err.to_le_bytes();
                                         if engine
@@ -1811,7 +1811,7 @@ impl RuntimeSession {
                                     Some(wie_winapi::WinApiControlSignal::HostPark { reason }) => {
                                         // Per-thread engine: primary regs are already in `engine`;
                                         // only persist thread bookkeeping for TLS tracking.
-                                        winapi_state.threads.save_active();
+                                        winapi_state.kernel.threads.save_active();
                                         quantum = Quantum::Park(*reason);
                                     }
                                     Some(wie_winapi::WinApiControlSignal::ExitThread { code }) => {
@@ -1868,7 +1868,7 @@ impl RuntimeSession {
                             q.park_brief();
                             // Retry Enter: per-thread engine keeps primary regs; only restore TLS.
                             self.process.with_mut(|_eng, st| {
-                                st.threads.activate(primary_tid);
+                                st.kernel.threads.activate(primary_tid);
                             });
                             // Do not charge API index again — undo increment.
                             self.next_api_index = self.next_api_index.saturating_sub(1);
@@ -1898,7 +1898,7 @@ impl RuntimeSession {
                                             let _ = self.process.drain_spawns();
                                             let dying = self
                                                 .process
-                                                .with_winapi_ref(|st| st.sync.process_dying);
+                                                .with_winapi_ref(|st| st.kernel.sync.process_dying);
                                             if dying {
                                                 break wie_winapi::WAIT_FAILED;
                                             }
@@ -1910,7 +1910,7 @@ impl RuntimeSession {
                                 None => wie_winapi::WAIT_FAILED,
                             };
                             self.process.with_mut(|eng, st| {
-                                st.threads.activate(primary_tid);
+                                st.kernel.threads.activate(primary_tid);
                                 let _ = eng.return_from_win64_api(u64::from(result)).map_err(|e| {
                                     tracing::error!("guest stack corrupted on wait park: {e}")
                                 });
@@ -1924,12 +1924,12 @@ impl RuntimeSession {
                             }
                             let req = self
                                 .process
-                                .with_mut(|_, st| st.sync.multi_wait.remove(&primary_tid));
+                                .with_mut(|_, st| st.kernel.sync.multi_wait.remove(&primary_tid));
                             let result = match req {
                                 Some(req) => {
                                     let targets = self
                                         .process
-                                        .with_mut(|_, st| st.sync.wait_targets(&req.handles));
+                                        .with_mut(|_, st| st.kernel.sync.wait_targets(&req.handles));
                                     match targets {
                                         Some(ts) => {
                                             if req.timeout_ms == wie_winapi::INFINITE {
@@ -1945,7 +1945,7 @@ impl RuntimeSession {
                                                     let _ = self.process.drain_spawns();
                                                     let dying =
                                                         self.process.with_winapi_ref(|st| {
-                                                            st.sync.process_dying
+                                                            st.kernel.sync.process_dying
                                                         });
                                                     if dying {
                                                         break wie_winapi::WAIT_FAILED;
@@ -1965,7 +1965,7 @@ impl RuntimeSession {
                                 None => wie_winapi::WAIT_FAILED,
                             };
                             self.process.with_mut(|eng, st| {
-                                st.threads.activate(primary_tid);
+                                st.kernel.threads.activate(primary_tid);
                                 let _ = eng.return_from_win64_api(u64::from(result)).map_err(|e| {
                                     tracing::error!("guest stack corrupted on wait park: {e}")
                                 });

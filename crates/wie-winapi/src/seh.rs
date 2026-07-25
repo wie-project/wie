@@ -302,7 +302,7 @@ pub fn continue_pending(
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
     let mut pending = state
-        .seh_pending
+        .kernel.seh_pending
         .take()
         .ok_or_else(|| anyhow::anyhow!("SEH continue trampoline with no pending work"))?;
 
@@ -311,7 +311,7 @@ pub fn continue_pending(
         let cont = engine.read_rax()?;
         pending.expect_catch_return = false;
         if cont == 0 || cont >= 0x8000_0000_0000 {
-            state.seh_pending = Some(pending);
+            state.kernel.seh_pending = Some(pending);
             return Err(anyhow::anyhow!(
                 "MSVC catch funclet returned invalid continuation RAX={cont:#x}"
             ));
@@ -329,7 +329,7 @@ pub fn continue_pending(
             });
         }
         // Unusual: more steps after catch — keep going.
-        state.seh_pending = Some(pending);
+        state.kernel.seh_pending = Some(pending);
         return run_next_step(engine, state);
     }
 
@@ -339,11 +339,11 @@ pub fn continue_pending(
             remaining = pending.steps.len(),
             "seh cleanup _Unwind_Resume → next step"
         );
-        state.seh_pending = Some(pending);
+        state.kernel.seh_pending = Some(pending);
         return run_next_step(engine, state);
     }
 
-    state.seh_pending = Some(pending);
+    state.kernel.seh_pending = Some(pending);
     run_next_step(engine, state)
 }
 
@@ -352,7 +352,7 @@ pub fn continue_pending(
 #[must_use]
 pub fn has_cleanup_resume(state: &WinApiState) -> bool {
     state
-        .seh_pending
+        .kernel.seh_pending
         .as_ref()
         .is_some_and(|p| p.expect_cleanup_resume && !p.steps.is_empty())
 }
@@ -631,7 +631,7 @@ fn begin_or_finish(
         });
     }
 
-    state.seh_pending = Some(SehPending {
+    state.kernel.seh_pending = Some(SehPending {
         steps: action_steps,
         expect_catch_return: false,
         expect_cleanup_resume: false,
@@ -644,12 +644,12 @@ fn run_next_step(
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
     let pending = state
-        .seh_pending
+        .kernel.seh_pending
         .as_mut()
         .ok_or_else(|| anyhow::anyhow!("SEH run_next_step with empty pending"))?;
 
     if pending.steps.is_empty() {
-        state.seh_pending = None;
+        state.kernel.seh_pending = None;
         return Err(anyhow::anyhow!("SEH pending queue empty"));
     }
 
@@ -729,7 +729,7 @@ fn run_next_step(
             // Drop the borrow before clearing pending on the terminal jump.
             let cleanup_resume = more;
             if !more {
-                state.seh_pending = None;
+                state.kernel.seh_pending = None;
             }
             let mut tctx = engine.snapshot_thread_context();
             tctx.gpr = gpr;
@@ -862,7 +862,7 @@ fn unwind_one(
     state: &WinApiState,
     current: &UnwindContext,
 ) -> Result<(Unwound, Option<u32>)> {
-    let Some(entry) = exception::lookup_function_entry(&state.sync, current.rip) else {
+    let Some(entry) = exception::lookup_function_entry(&state.kernel.sync, current.rip) else {
         let mut buf = [0u8; 8];
         read_mem(current.rsp, &mut buf)
             .map_err(|()| anyhow::anyhow!("leaf unwind: stack unreadable at {:#x}", current.rsp))?;

@@ -186,7 +186,7 @@ fn handle_open_process_token(
     if token_out != 0 {
         write_guest_u64(engine, token_out, FAKE_PROCESS_TOKEN)?;
     }
-    state.last_error = 0;
+    state.process.last_error = 0;
     return_bool(engine, true)
 }
 
@@ -433,7 +433,7 @@ fn handle_reg_enum_key_ex(
 
     // Gather all subkeys whose parent == hkey.
     let subkeys: Vec<&String> = state
-        .registry_keys
+        .process.registry_keys
         .iter()
         .filter(|k| k.parent == hkey)
         .map(|k| &k.subkey)
@@ -485,20 +485,20 @@ fn open_or_create_registry_key(
     subkey: String,
 ) -> Result<(u64, u32)> {
     if let Some(existing) = state
-        .registry_keys
+        .process.registry_keys
         .iter()
         .find(|key| key.parent == parent && key.subkey == subkey)
     {
         return Ok((existing.handle, REG_OPENED_EXISTING_KEY));
     }
 
-    let handle = state.next_registry_key_handle;
-    state.next_registry_key_handle = state
-        .next_registry_key_handle
+    let handle = state.process.next_registry_key_handle;
+    state.process.next_registry_key_handle = state
+        .process.next_registry_key_handle
         .checked_add(1)
         .context("registry key handle overflow")?;
 
-    state.registry_keys.push(RegistryKey {
+    state.process.registry_keys.push(RegistryKey {
         handle,
         parent,
         subkey,

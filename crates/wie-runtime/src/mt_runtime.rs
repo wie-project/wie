@@ -99,7 +99,7 @@ impl ProcessResources {
     /// Spawn a host thread for each pending `CreateThread` spawn.
     pub(crate) fn drain_spawns(&mut self) -> Result<()> {
         let spawns: Vec<PendingSpawn> =
-            self.with_mut(|_, st| st.sync.pending_spawns.drain(..).collect());
+            self.with_mut(|_, st| st.kernel.sync.pending_spawns.drain(..).collect());
         if spawns.is_empty() {
             return Ok(());
         }
@@ -146,11 +146,11 @@ impl ProcessResources {
 fn join_workers_impl(winapi: &Arc<Mutex<WinApiState>>, joins: &mut Vec<JoinHandle<()>>) {
     {
         let mut st = lock(winapi);
-        st.sync.process_dying = true;
-        for q in st.sync.cs_waiters.values() {
+        st.kernel.sync.process_dying = true;
+        for q in st.kernel.sync.cs_waiters.values() {
             q.notify_all();
         }
-        for obj in st.sync.objects.values() {
+        for obj in st.kernel.sync.objects.values() {
             match obj {
                 wie_winapi::KernelObject::Event(e) => e.set(),
                 wie_winapi::KernelObject::Semaphore(s) => s.notify_all(),
@@ -203,7 +203,7 @@ fn worker_main(
     // Load initial thread context set by CreateThread.
     {
         let st = lock(&shared_winapi);
-        if let Some(ctx) = st.sync.thread_cpu.get(&tid).cloned() {
+        if let Some(ctx) = st.kernel.sync.thread_cpu.get(&tid).cloned() {
             drop(st);
             engine.restore_thread_context(&ctx);
             engine.on_thread_switch();
@@ -215,8 +215,8 @@ fn worker_main(
         // across pure guest execution (per-thread engines need concurrent quanta).
         {
             let mut st = lock(&shared_winapi);
-            st.threads.activate(tid);
-            if st.sync.process_dying {
+            st.kernel.threads.activate(tid);
+            if st.kernel.sync.process_dying {
                 finish_tid(&st, tid, 1);
                 return;
             }
@@ -292,7 +292,7 @@ fn worker_main(
             let mut st = lock(&shared_winapi);
             // Always re-activate: peer threads may have stolen `active` while we
             // ran pure guest code without the WinAPI lock.
-            st.threads.activate(tid);
+            st.kernel.threads.activate(tid);
             if let Err(e) = wie_winapi::seh::continue_pending(&mut *engine, &mut st) {
                 tracing::warn!(tid, error = %e, "worker SEH continue failed");
                 finish_tid(&st, tid, 1);
@@ -311,14 +311,14 @@ fn worker_main(
         {
             let mut st = lock(&shared_winapi);
             // Re-activate after pure guest run (primary/peers may have activated).
-            st.threads.activate(tid);
-            if st.sync.process_dying {
+            st.kernel.threads.activate(tid);
+            if st.kernel.sync.process_dying {
                 finish_tid(&st, tid, 1);
                 return;
             }
 
             if resolved.traits.exit_process() {
-                st.sync.process_dying = true;
+                st.kernel.sync.process_dying = true;
                 let code = u32::try_from(engine.read_rcx().unwrap_or(0) & 0xffff_ffff).unwrap_or(0);
                 finish_tid(&st, tid, code);
                 return;
@@ -380,7 +380,7 @@ fn handle_park(
             };
             let result = wait_on_target(target, timeout_ms, shared_winapi, tid);
             let st = lock(shared_winapi);
-            if st.sync.process_dying {
+            if st.kernel.sync.process_dying {
                 finish_tid(&st, tid, 1);
                 return;
             }
@@ -391,11 +391,11 @@ fn handle_park(
         HostParkReason::WaitMultiple => {
             let req = {
                 let mut st = lock(shared_winapi);
-                st.sync.multi_wait.remove(&tid)
+                st.kernel.sync.multi_wait.remove(&tid)
             };
             let result = wait_multiple_result(req, shared_winapi, tid);
             let st = lock(shared_winapi);
-            if st.sync.process_dying {
+            if st.kernel.sync.process_dying {
                 finish_tid(&st, tid, 1);
                 return;
             }
@@ -410,7 +410,7 @@ fn handle_park(
 
 fn finish_tid(st: &WinApiState, tid: u32, code: u32) {
     let thread = st
-        .sync
+        .kernel.sync
         .objects
         .values()
         .find(|obj| matches!(obj, wie_winapi::KernelObject::Thread(t) if t.tid == tid));
@@ -434,7 +434,7 @@ fn wait_on_target(
                         return r;
                     }
                     let st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
-                    if st.sync.process_dying {
+                    if st.kernel.sync.process_dying {
                         finish_tid(&st, tid, 1);
                         return wie_winapi::WAIT_FAILED;
                     }
@@ -457,7 +457,7 @@ fn wait_multiple_result(
     };
     let targets = {
         let st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
-        st.sync.wait_targets(&req.handles)
+        st.kernel.sync.wait_targets(&req.handles)
     };
     let Some(ts) = targets else {
         return wie_winapi::WAIT_FAILED;
@@ -470,7 +470,7 @@ fn wait_multiple_result(
                 return r;
             }
             let st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
-            if st.sync.process_dying {
+            if st.kernel.sync.process_dying {
                 finish_tid(&st, tid, 1);
                 return wie_winapi::WAIT_FAILED;
             }

@@ -210,6 +210,27 @@ pub struct WindowState {
     pub next_menu_handle: u64,
 }
 
+/// Process-level state (identity, error handling, registry, misc).
+#[derive(Debug, Clone)]
+pub struct ProcessState {
+    pub last_error: u32,
+    pub next_registry_key_handle: u64,
+    pub registry_keys: Vec<RegistryKey>,
+    pub main_module_file_name: String,
+    pub main_module_path: String,
+    pub main_module_host_dir: Option<std::path::PathBuf>,
+    pub error_mode: u32,
+    pub suspended_threads: HashMap<u32, u32>,
+}
+
+/// Kernel execution state (threading, synchronisation, SEH).
+#[derive(Debug, Clone)]
+pub struct KernelState {
+    pub threads: ThreadState,
+    pub sync: SyncState,
+    pub seh_pending: Option<seh::SehPending>,
+}
+
 pub struct WinApiState {
     /// Heap + FLS state.
     pub heap_state: HeapState,
@@ -221,41 +242,10 @@ pub struct WinApiState {
     pub d3d9: D3D9State,
     /// DLL loading and export resolution cache.
     pub module_state: ModuleState,
-
-    /// Last WinAPI error value.
-    pub last_error: u32,
-
-    /// Next fake registry key handle.
-    pub next_registry_key_handle: u64,
-
-    /// Fake registry key handles.
-    pub registry_keys: Vec<RegistryKey>,
-
-    /// Basename of the main PE (`heap_alloc.exe`, `Lunar Magic.exe`, …).
-    pub main_module_file_name: String,
-
-    /// Guest full path of the main PE (`C:\App\…`).
-    pub main_module_path: String,
-
-    /// Guest thread table + active TLS/TID (MT.0 / MT.1).
-    pub threads: ThreadState,
-
-    /// Kernel objects, CS wait queues, pending `CreateThread` spawns (MT.2/3).
-    pub sync: SyncState,
-
-    /// In-progress SEH / C++ EH continuation (UnwindMap + catch funclets).
-    pub seh_pending: Option<seh::SehPending>,
-
-    /// Host filesystem directory of the main executable.
-    /// Used as a fallback search directory for DLL loading when VFS/bottle
-    /// path resolution fails (e.g. micro-exes without a bottle root).
-    pub main_module_host_dir: Option<std::path::PathBuf>,
-
-    /// Current error mode (SetErrorMode / SetThreadErrorMode).
-    pub error_mode: u32,
-
-    /// Threads that have been suspended, keyed by TID → suspend count.
-    pub suspended_threads: HashMap<u32, u32>,
+    /// Process-level state (error, registry, identity, misc).
+    pub process: ProcessState,
+    /// Kernel execution state (threading, sync, SEH).
+    pub kernel: KernelState,
 }
 
 // Manual Debug impl: Box<dyn FnMut + Send> does not implement Debug.
@@ -265,19 +255,10 @@ impl std::fmt::Debug for WinApiState {
             .field("heap_state", &self.heap_state)
             .field("file_io", &self.file_io)
             .field("window_state", &self.window_state)
-            .field("last_error", &self.last_error)
-            .field("next_registry_key_handle", &self.next_registry_key_handle)
-            .field("registry_keys", &self.registry_keys)
-            .field("main_module_file_name", &self.main_module_file_name)
-            .field("main_module_path", &self.main_module_path)
-            .field("threads", &self.threads)
-            .field("sync", &self.sync)
             .field("d3d9", &self.d3d9)
             .field("module_state", &self.module_state)
-            .field("seh_pending", &self.seh_pending)
-            .field("main_module_host_dir", &self.main_module_host_dir)
-            .field("error_mode", &self.error_mode)
-            .field("suspended_threads", &self.suspended_threads)
+            .field("process", &self.process)
+            .field("kernel", &self.kernel)
             .finish()
     }
 }
@@ -289,19 +270,10 @@ impl Clone for WinApiState {
             heap_state: self.heap_state.clone(),
             file_io: self.file_io.clone(),
             window_state: self.window_state.clone(),
-            last_error: self.last_error,
-            next_registry_key_handle: self.next_registry_key_handle,
-            registry_keys: self.registry_keys.clone(),
-            main_module_file_name: self.main_module_file_name.clone(),
-            main_module_path: self.main_module_path.clone(),
-            threads: self.threads.clone(),
-            sync: self.sync.clone(),
             d3d9: self.d3d9.clone(),
             module_state: self.module_state.clone(),
-            seh_pending: self.seh_pending.clone(),
-            main_module_host_dir: self.main_module_host_dir.clone(),
-            error_mode: self.error_mode,
-            suspended_threads: self.suspended_threads.clone(),
+            process: self.process.clone(),
+            kernel: self.kernel.clone(),
         }
     }
 }
@@ -831,13 +803,21 @@ mod tests {
                 ucrt_files: HashMap::new(),
                 ucrt_next_file_va: 0x0000_0000_6900_0000,
             },
-            last_error: 0,
-            next_registry_key_handle: 0,
-            registry_keys: Vec::new(),
-            main_module_file_name: String::new(),
-            main_module_path: String::new(),
-            threads: ThreadState::primary(),
-            sync: SyncState::new(),
+            process: ProcessState {
+                last_error: 0,
+                next_registry_key_handle: 0,
+                registry_keys: Vec::new(),
+                main_module_file_name: String::new(),
+                main_module_path: String::new(),
+                main_module_host_dir: None,
+                error_mode: 0,
+                suspended_threads: HashMap::new(),
+            },
+            kernel: KernelState {
+                threads: ThreadState::primary(),
+                sync: SyncState::new(),
+                seh_pending: None,
+            },
             window_state: WindowState {
                 window_long_ptr_values: Vec::new(),
                 image_list_counts: Vec::new(),
@@ -894,10 +874,6 @@ mod tests {
                 get_proc_address_cache: HashMap::new(),
                 next_module_handle: dll_loader::REAL_MODULE_HANDLE_BASE,
             },
-            seh_pending: None,
-            main_module_host_dir: None,
-            error_mode: 0,
-            suspended_threads: HashMap::new(),
         }
     }
 
@@ -936,7 +912,7 @@ mod tests {
             .mem_read(cs + 16, &mut owner)
             .expect("read owner unlocked");
         assert_eq!(u64::from_le_bytes(owner), 0);
-        assert_eq!(state.threads.current_tid(), PRIMARY_THREAD_ID);
+        assert_eq!(state.kernel.threads.current_tid(), PRIMARY_THREAD_ID);
     }
 
     #[test]
@@ -1022,7 +998,7 @@ mod tests {
         let mut state = default_winapi_state();
         write_regs(&mut engine, 0x6100_0001, 0, 0, 0, 0);
         assert_return_value!(kernel32::handle_free_library(&mut engine, &mut state), 1);
-        assert_eq!(state.last_error, 0);
+        assert_eq!(state.process.last_error, 0);
     }
 
     #[test]
@@ -1031,14 +1007,14 @@ mod tests {
         let mut state = default_winapi_state();
         write_regs(&mut engine, 0, 0, 0, 0, 0);
         assert_return_value!(kernel32::handle_free_library(&mut engine, &mut state), 0);
-        assert_eq!(state.last_error, 6); // ERROR_INVALID_HANDLE
+        assert_eq!(state.process.last_error, 6); // ERROR_INVALID_HANDLE
     }
 
     #[test]
     fn test_get_last_error() {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
-        state.last_error = 123;
+        state.process.last_error = 123;
         let r = kernel32::handle_get_last_error(&mut engine, &state).expect("GetLastError");
         assert_eq!(r.return_value, 123);
     }
@@ -1047,10 +1023,10 @@ mod tests {
     fn test_set_last_error() {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
-        state.last_error = 0;
+        state.process.last_error = 0;
         write_regs(&mut engine, 456, 0, 0, 0, 0);
         let _ = kernel32::handle_set_last_error(&mut engine, &mut state).expect("SetLastError");
-        assert_eq!(state.last_error, 456);
+        assert_eq!(state.process.last_error, 456);
     }
 
     #[test]
@@ -1064,11 +1040,11 @@ mod tests {
         let r = kernel32::handle_heap_free(&mut engine, &mut state).expect("HeapFree");
         assert_eq!(r.return_value, 1, "first free must succeed");
 
-        state.last_error = 0;
+        state.process.last_error = 0;
         write_regs(&mut engine, 0x1, 0, p, 0, 0);
         let r = kernel32::handle_heap_free(&mut engine, &mut state).expect("HeapFree double");
         assert_eq!(r.return_value, 0, "double free must return FALSE");
-        assert_eq!(state.last_error, 6, "ERROR_INVALID_HANDLE");
+        assert_eq!(state.process.last_error, 6, "ERROR_INVALID_HANDLE");
     }
 
     // --- User32 ---
@@ -1262,25 +1238,25 @@ mod tests {
     fn test_set_error_mode() {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
-        state.error_mode = 0;
+        state.process.error_mode = 0;
         write_regs(&mut engine, 0x02, 0, 0, 0, STACK_TOP);
         let r = kernel32::handle_set_error_mode(&mut engine, &mut state).expect("SetErrorMode");
         // Previous mode was 0.
         assert_eq!(r.return_value, 0);
-        assert_eq!(state.error_mode, 2);
+        assert_eq!(state.process.error_mode, 2);
     }
 
     #[test]
     fn test_set_thread_error_mode() {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
-        state.error_mode = 1;
+        state.process.error_mode = 1;
         let prev_ptr = 0x4000;
         write_regs(&mut engine, 0x03, prev_ptr, 0, 0, STACK_TOP);
         let r = kernel32::handle_set_thread_error_mode(&mut engine, &mut state)
             .expect("SetThreadErrorMode");
         assert_eq!(r.return_value, 1); // TRUE
-        assert_eq!(state.error_mode, 3);
+        assert_eq!(state.process.error_mode, 3);
         let mut buf = [0_u8; 4];
         engine.mem_read(prev_ptr, &mut buf).ok();
         assert_eq!(u32::from_le_bytes(buf), 1); // previous mode written back
@@ -1331,13 +1307,13 @@ mod tests {
     fn test_terminate_process() {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
-        state.sync.process_dying = false;
+        state.kernel.sync.process_dying = false;
         write_regs(&mut engine, 0x8000_0001, 0, 0, 0, STACK_TOP);
         assert_return_value!(
             kernel32::handle_terminate_process(&mut engine, &mut state),
             1
         );
-        assert!(state.sync.process_dying);
+        assert!(state.kernel.sync.process_dying);
     }
 
     #[test]
@@ -1375,7 +1351,7 @@ mod tests {
         let r = kernel32::handle_get_file_attributes_ex_w(&mut engine, &mut state)
             .expect("GetFileAttributesExW");
         assert_eq!(r.return_value, 0); // FALSE
-        assert_eq!(state.last_error, 2); // ERROR_FILE_NOT_FOUND
+        assert_eq!(state.process.last_error, 2); // ERROR_FILE_NOT_FOUND
     }
 
     #[test]
@@ -1385,7 +1361,7 @@ mod tests {
         write_regs(&mut engine, 0xDEAD, 0x4000, 64, 0x5000, STACK_TOP);
         let r = kernel32::handle_backup_read(&mut engine, &mut state).expect("BackupRead");
         assert_eq!(r.return_value, 0); // FALSE
-        assert_eq!(state.last_error, 6); // ERROR_INVALID_HANDLE
+        assert_eq!(state.process.last_error, 6); // ERROR_INVALID_HANDLE
     }
 
     #[test]
@@ -1394,7 +1370,7 @@ mod tests {
         let mut state = default_winapi_state();
         write_regs(&mut engine, 0xDEAD, 0, 0, 0, STACK_TOP);
         let _r = kernel32::handle_suspend_thread(&mut engine, &mut state).expect("SuspendThread");
-        assert_eq!(state.last_error, 6); // ERROR_INVALID_HANDLE
+        assert_eq!(state.process.last_error, 6); // ERROR_INVALID_HANDLE
     }
 
     #[test]
@@ -1404,7 +1380,7 @@ mod tests {
         write_regs(&mut engine, 0xDEAD, 0, 0, 0, STACK_TOP);
         let r = kernel32::handle_lock_file(&mut engine, &mut state).expect("LockFile");
         assert_eq!(r.return_value, 0); // FALSE — invalid handle
-        assert_eq!(state.last_error, 6); // ERROR_INVALID_HANDLE
+        assert_eq!(state.process.last_error, 6); // ERROR_INVALID_HANDLE
     }
 
     #[test]
@@ -1415,7 +1391,7 @@ mod tests {
         let r = kernel32::handle_set_file_valid_data(&mut engine, &mut state)
             .expect("SetFileValidData");
         assert_eq!(r.return_value, 0); // FALSE — invalid handle
-        assert_eq!(state.last_error, 6);
+        assert_eq!(state.process.last_error, 6);
     }
 
     // ── Shell32 ───────────────────────────────────────────────────────
@@ -1499,12 +1475,12 @@ mod tests {
         let mut state = default_winapi_state();
         // Create a registry key with parent 0x7000_0001 (HKEY_CURRENT_USER)
         let parent = 0x7000_0001;
-        state.registry_keys.push(crate::RegistryKey {
+        state.process.registry_keys.push(crate::RegistryKey {
             handle: 0x100,
             parent,
             subkey: "Software\\test".into(),
         });
-        state.registry_keys.push(crate::RegistryKey {
+        state.process.registry_keys.push(crate::RegistryKey {
             handle: 0x101,
             parent: 0x100,
             subkey: "Nested".into(),

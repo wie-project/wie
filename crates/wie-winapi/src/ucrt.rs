@@ -1352,8 +1352,8 @@ fn handle_end_thread_ex(
 ) -> Result<WinApiHandlerResult> {
     let code_raw = engine.read_rcx()?;
     let code = u32::try_from(code_raw & u64::from(u32::MAX)).unwrap_or(0);
-    let tid = state.threads.current_tid();
-    for obj in state.sync.objects.values() {
+    let tid = state.kernel.threads.current_tid();
+    for obj in state.kernel.sync.objects.values() {
         if let KernelObject::Thread(t) = obj
             && t.tid == tid
         {

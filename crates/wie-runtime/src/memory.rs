@@ -244,9 +244,21 @@ pub(crate) fn default_winapi_state(
             fls_slots: Vec::new(),
             guest_fls_table_va: layout.guest_fls_table_base,
         },
-        last_error: 0,
-        next_registry_key_handle: 0x0000_0000_7000_0000,
-        registry_keys: Vec::new(),
+        process: wie_winapi::ProcessState {
+            last_error: 0,
+            next_registry_key_handle: 0x0000_0000_7000_0000,
+            registry_keys: Vec::new(),
+            main_module_file_name: process.module_file_name.clone(),
+            main_module_path: process.module_path.clone(),
+            main_module_host_dir: None,
+            error_mode: 0,
+            suspended_threads: std::collections::HashMap::new(),
+        },
+        kernel: wie_winapi::KernelState {
+            threads: wie_winapi::ThreadState::primary(),
+            sync: wie_winapi::SyncState::new(),
+            seh_pending: None,
+        },
         file_io: wie_winapi::FileIoState {
             executable_file_size,
             executable_file_bytes,
@@ -277,10 +289,6 @@ pub(crate) fn default_winapi_state(
             ucrt_files: std::collections::HashMap::new(),
             ucrt_next_file_va: 0x0000_0000_6900_0000,
         },
-        main_module_file_name: process.module_file_name.clone(),
-        main_module_path: process.module_path.clone(),
-        threads: wie_winapi::ThreadState::primary(),
-        sync: wie_winapi::SyncState::new(),
         window_state: wie_winapi::WindowState {
             window_long_ptr_values: Vec::new(),
             image_list_counts: Vec::new(),
@@ -337,10 +345,6 @@ pub(crate) fn default_winapi_state(
             get_proc_address_cache: std::collections::HashMap::with_capacity(64),
             next_module_handle: wie_winapi::dll_loader::REAL_MODULE_HANDLE_BASE,
         },
-        seh_pending: None,
-        main_module_host_dir: None,
-        error_mode: 0,
-        suspended_threads: std::collections::HashMap::new(),
     })
 }
 
