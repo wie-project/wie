@@ -1604,7 +1604,13 @@ fn apply_string_stay(regs: &mut RegFile, instr: &Instruction, stay: bool) {
 }
 
 /// String op kind for interpreter + JIT host helper.
-#[derive(Clone, Copy)]
+///
+/// The discriminants are the ABI contract with [`crate::jit::wie_jit_string`]:
+/// the JIT passes the kind through an `extern "C"` `u64` parameter, so it is
+/// encoded via [`Self::to_abi`] and decoded via [`TryFrom<u64>`]. Those two are
+/// the *only* places the numeric form should appear — everything else works on
+/// the enum, so a mis-typed literal cannot silently select the wrong operation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum StringOpKind {
     Stos = 0,
     Movs = 1,
@@ -1613,24 +1619,115 @@ pub(crate) enum StringOpKind {
     Cmps = 4,
 }
 
-/// Bulk string op shared by iced and JIT. Returns `true` if RIP should stay on the insn.
+impl StringOpKind {
+    /// Classify a string mnemonic, returning the kind and its element size in
+    /// bytes. `None` for any non-string mnemonic.
+    ///
+    /// Note `Movsd` is ambiguous in iced: the string form (`movsd`, 4-byte move)
+    /// shares a mnemonic with the SSE scalar-double form. Only the string form
+    /// reaches here, so it is classified as a 4-byte `Movs`.
+    pub(crate) fn from_mnemonic(m: Mnemonic, size: u32) -> Option<(Self, u32)> {
+        let out = match m {
+            Mnemonic::Stosb | Mnemonic::Stosw | Mnemonic::Stosd | Mnemonic::Stosq => {
+                (Self::Stos, size)
+            }
+            Mnemonic::Movsb | Mnemonic::Movsw | Mnemonic::Movsq => (Self::Movs, size),
+            Mnemonic::Movsd => (Self::Movs, 4),
+            Mnemonic::Lodsb | Mnemonic::Lodsd | Mnemonic::Lodsq => (Self::Lods, size),
+            Mnemonic::Scasb | Mnemonic::Scasw | Mnemonic::Scasd | Mnemonic::Scasq => {
+                (Self::Scas, size)
+            }
+            Mnemonic::Cmpsb | Mnemonic::Cmpsw | Mnemonic::Cmpsd | Mnemonic::Cmpsq => {
+                (Self::Cmps, size)
+            }
+            _ => return None,
+        };
+        Some(out)
+    }
+
+    /// Encode for the `extern "C"` JIT helper ABI.
+    pub(crate) fn to_abi(self) -> u64 {
+        match self {
+            Self::Stos => 0,
+            Self::Movs => 1,
+            Self::Lods => 2,
+            Self::Scas => 3,
+            Self::Cmps => 4,
+        }
+    }
+}
+
+impl TryFrom<u64> for StringOpKind {
+    type Error = ();
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Stos),
+            1 => Ok(Self::Movs),
+            2 => Ok(Self::Lods),
+            3 => Ok(Self::Scas),
+            4 => Ok(Self::Cmps),
+            _ => Err(()),
+        }
+    }
+}
+
+/// REP-family prefixes on a string instruction.
 ///
-/// `rep` covers REP/REPE/REPNE presence; `repe`/`repne` select ZF early-exit for SCAS/CMPS.
+/// Replaces a hand-packed `bit0=rep, bit1=repe, bit2=repne` word that was
+/// encoded in the JIT lowering and decoded in the host helper — two copies of
+/// the same magic layout that had to be kept in sync by hand.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct RepPrefix {
+    /// Any of REP / REPE / REPNE is present (drives the iteration loop).
+    pub rep: bool,
+    /// REPE / REPZ — SCAS and CMPS exit early when ZF clears.
+    pub repe: bool,
+    /// REPNE / REPNZ — SCAS and CMPS exit early when ZF sets.
+    pub repne: bool,
+}
+
+impl RepPrefix {
+    pub(crate) fn from_instr(instr: &Instruction) -> Self {
+        let repe = instr.has_repe_prefix();
+        let repne = instr.has_repne_prefix();
+        Self {
+            // `has_rep_prefix` and `has_repe_prefix` alias the same F3 byte in
+            // iced, so REP presence is the union of all three.
+            rep: instr.has_rep_prefix() || repe || repne,
+            repe,
+            repne,
+        }
+    }
+
+    /// Encode for the `extern "C"` JIT helper ABI.
+    pub(crate) fn to_abi(self) -> u64 {
+        u64::from(self.rep) | (u64::from(self.repe) << 1) | (u64::from(self.repne) << 2)
+    }
+
+    pub(crate) fn from_abi(bits: u64) -> Self {
+        Self {
+            rep: (bits & 1) != 0,
+            repe: (bits & 2) != 0,
+            repne: (bits & 4) != 0,
+        }
+    }
+}
+
+/// Bulk string op shared by iced and JIT. Returns `true` if RIP should stay on the insn.
 pub(crate) fn run_string_op(
     mem: &GuestMemory,
     regs: &mut RegFile,
     kind: StringOpKind,
     size: usize,
-    rep: bool,
-    repe: bool,
-    repne: bool,
+    rep: RepPrefix,
 ) -> Result<bool, StepExecError> {
     match kind {
-        StringOpKind::Stos => string_stos(mem, regs, size, rep),
-        StringOpKind::Movs => string_movs(mem, regs, size, rep),
-        StringOpKind::Lods => string_lods(mem, regs, size, rep),
-        StringOpKind::Scas => string_scas(mem, regs, size, rep, repe, repne),
-        StringOpKind::Cmps => string_cmps(mem, regs, size, rep, repe, repne),
+        StringOpKind::Stos => string_stos(mem, regs, size, rep.rep),
+        StringOpKind::Movs => string_movs(mem, regs, size, rep.rep),
+        StringOpKind::Lods => string_lods(mem, regs, size, rep.rep),
+        StringOpKind::Scas => string_scas(mem, regs, size, rep.rep, rep.repe, rep.repne),
+        StringOpKind::Cmps => string_cmps(mem, regs, size, rep.rep, rep.repe, rep.repne),
     }
 }
 
@@ -2710,4 +2807,64 @@ fn write_mem_value(
         }));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod string_abi_tests {
+    use super::{RepPrefix, StringOpKind};
+
+    const ALL_KINDS: [StringOpKind; 5] = [
+        StringOpKind::Stos,
+        StringOpKind::Movs,
+        StringOpKind::Lods,
+        StringOpKind::Scas,
+        StringOpKind::Cmps,
+    ];
+
+    /// The JIT encodes the kind into an `extern "C"` u64 and the host helper
+    /// decodes it. Encode/decode must be exact inverses or a compiled block
+    /// silently performs the wrong string operation.
+    #[test]
+    fn string_op_kind_abi_roundtrips() {
+        for kind in ALL_KINDS {
+            let decoded = StringOpKind::try_from(kind.to_abi());
+            assert_eq!(decoded, Ok(kind), "round-trip failed for {kind:?}");
+        }
+    }
+
+    /// Discriminants are a wire format; pin them so a reordering of the enum
+    /// cannot silently repoint an already-compiled encoding.
+    #[test]
+    fn string_op_kind_abi_values_are_stable() {
+        assert_eq!(StringOpKind::Stos.to_abi(), 0);
+        assert_eq!(StringOpKind::Movs.to_abi(), 1);
+        assert_eq!(StringOpKind::Lods.to_abi(), 2);
+        assert_eq!(StringOpKind::Scas.to_abi(), 3);
+        assert_eq!(StringOpKind::Cmps.to_abi(), 4);
+    }
+
+    #[test]
+    fn string_op_kind_rejects_out_of_range() {
+        for raw in [5_u64, 6, u64::MAX] {
+            assert_eq!(StringOpKind::try_from(raw), Err(()), "raw={raw}");
+        }
+    }
+
+    /// `rep`/`repe`/`repne` occupy bits 0/1/2. The helper decodes what the
+    /// lowering encoded, so every combination must survive the trip.
+    #[test]
+    fn rep_prefix_abi_roundtrips() {
+        for bits in 0..8_u64 {
+            let prefix = RepPrefix::from_abi(bits);
+            assert_eq!(prefix.to_abi(), bits, "bits={bits}");
+        }
+        for rep in [false, true] {
+            for repe in [false, true] {
+                for repne in [false, true] {
+                    let p = RepPrefix { rep, repe, repne };
+                    assert_eq!(RepPrefix::from_abi(p.to_abi()), p);
+                }
+            }
+        }
+    }
 }

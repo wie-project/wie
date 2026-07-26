@@ -1123,20 +1123,11 @@ pub(super) unsafe extern "C" fn wie_jit_string(
         set_fault(ctx, insn_ip, 0, size, 0);
         return 0;
     }
-    let kind = match op {
-        0 => StringOpKind::Stos,
-        1 => StringOpKind::Movs,
-        2 => StringOpKind::Lods,
-        3 => StringOpKind::Scas,
-        4 => StringOpKind::Cmps,
-        _ => {
-            set_fault(ctx, insn_ip, 0, size, 0);
-            return 0;
-        }
+    let Ok(kind) = StringOpKind::try_from(op) else {
+        set_fault(ctx, insn_ip, 0, size, 0);
+        return 0;
     };
-    let rep = (flags & 1) != 0;
-    let repe = (flags & 2) != 0;
-    let repne = (flags & 4) != 0;
+    let rep = exec::RepPrefix::from_abi(flags);
 
     let mut regs = RegFile::new();
     for i in 0..16 {
@@ -1147,7 +1138,7 @@ pub(super) unsafe extern "C" fn wie_jit_string(
 
     // SAFETY: mem pointer set by run_compiled.
     let mem = unsafe { &*ctx.mem };
-    match exec::run_string_op(mem, &mut regs, kind, size_usize, rep, repe, repne) {
+    match exec::run_string_op(mem, &mut regs, kind, size_usize, rep) {
         Ok(stay) => {
             for i in 0..16 {
                 ctx.gpr[i] = regs.gpr(i);
@@ -3594,16 +3585,19 @@ fn try_lower_inline_rep(
     rflags: &mut Value,
     gpr_loaded: &mut [bool; 16],
     mem: &mut MemEnv,
-    op: u64,
+    kind: StringOpKind,
     size: u32,
 ) -> Option<Value> {
     if !string_inline_enabled() || !jit_simd_enabled() {
         return None;
     }
-    if !matches!(op, 0 | 1) {
-        return None;
-    }
-    if !(instr.has_rep_prefix() || instr.has_repe_prefix() || instr.has_repne_prefix()) {
+    // Only the two block-copyable kinds; SCAS/CMPS/LODS need element semantics.
+    let is_movs = match kind {
+        StringOpKind::Movs => true,
+        StringOpKind::Stos => false,
+        StringOpKind::Lods | StringOpKind::Scas | StringOpKind::Cmps => return None,
+    };
+    if !exec::RepPrefix::from_instr(instr).rep {
         return None;
     }
     if !matches!(size, 1 | 2 | 4 | 8) {
@@ -3615,10 +3609,10 @@ fn try_lower_inline_rep(
     if !gpr_loaded[1] || !gpr_loaded[7] {
         return None;
     }
-    if op == 1 && !gpr_loaded[6] {
+    if is_movs && !gpr_loaded[6] {
         return None;
     }
-    if op == 0 && !gpr_loaded[0] {
+    if !is_movs && !gpr_loaded[0] {
         return None;
     }
 
@@ -3673,7 +3667,7 @@ fn try_lower_inline_rep(
 
     let new_rax = gpr[0];
     let new_rcx = iconst_u64(bcx, 0);
-    let (new_rsi, new_rdi) = if op == 1 {
+    let (new_rsi, new_rdi) = if is_movs {
         let zero = iconst_u64(bcx, 0);
         let call_src = bcx
             .ins()
@@ -3699,14 +3693,26 @@ fn try_lower_inline_rep(
         bcx.ins().brif(src_usable, copy_body, &[], cont_slow, &[]);
         bcx.switch_to_block(copy_body);
         bcx.seal_block(copy_body);
-        emit_inline_copy_chunks(bcx, mem, src_host, dst_host, byte_len, None);
+        emit_inline_copy_chunks(
+            bcx,
+            mem,
+            dst_host,
+            byte_len,
+            InlineCopySrc::Move { src_host },
+        );
         (
             bcx.ins().iadd(gpr[6], byte_len),
             bcx.ins().iadd(gpr[7], byte_len),
         )
     } else {
-        let pat = stos_splat_pattern(bcx, mem, gpr[0], size)?;
-        emit_inline_copy_chunks(bcx, mem, dst_host, dst_host, byte_len, Some(pat));
+        let pattern = stos_splat_pattern(bcx, mem, gpr[0], size)?;
+        emit_inline_copy_chunks(
+            bcx,
+            mem,
+            dst_host,
+            byte_len,
+            InlineCopySrc::Fill { pattern },
+        );
         (gpr[6], bcx.ins().iadd(gpr[7], byte_len))
     };
     let next = iconst_u64(bcx, instr.next_ip());
@@ -3734,14 +3740,10 @@ fn try_lower_inline_rep(
     }
     let rflags_ptr = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_RFLAGS));
     bcx.ins().store(mem.flags, *rflags, rflags_ptr, 0);
-    let mut flags = 1_u64; // REP
-    if instr.has_repe_prefix() {
-        flags |= 2;
-    }
-    if instr.has_repne_prefix() {
-        flags |= 4;
-    }
-    let op_v = iconst_u64(bcx, op);
+    // Reached only when the REP prefix is present (checked on entry), so the
+    // shared encoder always sets the `rep` bit here.
+    let flags = exec::RepPrefix::from_instr(instr).to_abi();
+    let op_v = iconst_u64(bcx, kind.to_abi());
     let size_c = iconst_u64(bcx, u64::from(size));
     let flags_v = iconst_u64(bcx, flags);
     let ip_v = iconst_u64(bcx, instr.ip());
@@ -3795,15 +3797,38 @@ fn try_lower_inline_rep(
     Some(params[0])
 }
 
-/// Unrolled up to 4×16-byte host copies. If `fill` is `Some`, stores that vector
-/// (STOS); otherwise loads from `src_host` (MOVS). `src_host` may equal `dst_host` for fill.
+/// Width of one unrolled store in an inline REP copy.
+///
+/// Only these two widths are emitted, so a plain integer width would admit
+/// values (7, 32, 0) the emitter cannot honour.
+#[derive(Clone, Copy)]
+enum CopyUnit {
+    Bytes8,
+    Bytes16,
+}
+
+/// Source of the bytes an inline REP block copy writes.
+///
+/// Replaces an `Option<Value>` that overloaded `None` to mean "MOVS, read from
+/// a separate `src_host` argument" and `Some(v)` to mean "STOS, splat `v`" —
+/// which additionally required passing `dst_host` as the source for fills.
+/// Encoding the source in the variant removes that dummy argument.
+#[derive(Clone, Copy)]
+enum InlineCopySrc {
+    /// MOVS: load from `src_host + off`, matching the destination offset.
+    Move { src_host: Value },
+    /// STOS: store `pattern`, an `I8X16` splat whose every 8-byte half also
+    /// carries the fill value (so an 8-byte unit can reuse lane 0).
+    Fill { pattern: Value },
+}
+
+/// Emit an exact copy/fill of `byte_len` bytes for `byte_len` in [8, 64].
 fn emit_inline_copy_chunks(
     bcx: &mut FunctionBuilder<'_>,
     mem: &MemEnv,
-    src_host: Value,
     dst_host: Value,
     byte_len: Value,
-    fill: Option<Value>,
+    src: InlineCopySrc,
 ) {
     // Full 16-byte chunks at constant offsets 0/16/32/48.
     for chunk in 0..4_u64 {
@@ -3817,7 +3842,7 @@ fn emit_inline_copy_chunks(
         bcx.ins().brif(take, do_chunk, &[], next_chunk, &[]);
         bcx.switch_to_block(do_chunk);
         bcx.seal_block(do_chunk);
-        emit_one_unit(bcx, mem, src_host, dst_host, off, 16, fill);
+        emit_one_unit(bcx, mem, dst_host, off, CopyUnit::Bytes16, src);
         bcx.ins().jump(next_chunk, &[]);
         bcx.switch_to_block(next_chunk);
         bcx.seal_block(next_chunk);
@@ -3844,7 +3869,7 @@ fn emit_inline_copy_chunks(
         bcx.switch_to_block(do_tail);
         bcx.seal_block(do_tail);
         let tail_off = bcx.ins().iadd_imm(byte_len, -16);
-        emit_one_unit(bcx, mem, src_host, dst_host, tail_off, 16, fill);
+        emit_one_unit(bcx, mem, dst_host, tail_off, CopyUnit::Bytes16, src);
         bcx.ins().jump(after_tail, &[]);
         bcx.switch_to_block(after_tail);
         bcx.seal_block(after_tail);
@@ -3866,46 +3891,42 @@ fn emit_inline_copy_chunks(
         bcx.switch_to_block(do_small);
         bcx.seal_block(do_small);
         let zero_off = iconst_u64(bcx, 0);
-        emit_one_unit(bcx, mem, src_host, dst_host, zero_off, 8, fill);
+        emit_one_unit(bcx, mem, dst_host, zero_off, CopyUnit::Bytes8, src);
         let tail8 = bcx.ins().iadd_imm(byte_len, -8);
-        emit_one_unit(bcx, mem, src_host, dst_host, tail8, 8, fill);
+        emit_one_unit(bcx, mem, dst_host, tail8, CopyUnit::Bytes8, src);
         bcx.ins().jump(after_small, &[]);
         bcx.switch_to_block(after_small);
         bcx.seal_block(after_small);
     }
 }
 
-/// Store one 16- or 8-byte unit at `dst_host + off`, sourcing from
-/// `src_host + off` (MOVS) or splatting `fill` (STOS).
+/// Store one unit at `dst_host + off`, sourcing per [`InlineCopySrc`].
 fn emit_one_unit(
     bcx: &mut FunctionBuilder<'_>,
     mem: &MemEnv,
-    src_host: Value,
     dst_host: Value,
     off: Value,
-    width: u32,
-    fill: Option<Value>,
+    unit: CopyUnit,
+    src: InlineCopySrc,
 ) {
     let dp = bcx.ins().iadd(dst_host, off);
-    if width == 16 {
-        let v = if let Some(pat) = fill {
-            pat
-        } else {
+    let value = match (unit, src) {
+        (CopyUnit::Bytes16, InlineCopySrc::Fill { pattern }) => pattern,
+        (CopyUnit::Bytes16, InlineCopySrc::Move { src_host }) => {
             let sp = bcx.ins().iadd(src_host, off);
             bcx.ins().load(types::I8X16, mem.guest_flags, sp, 0)
-        };
-        bcx.ins().store(mem.guest_flags, v, dp, 0);
-    } else {
-        let v = if let Some(pat) = fill {
+        }
+        (CopyUnit::Bytes8, InlineCopySrc::Fill { pattern }) => {
             // Reuse the I8X16 splat: every 8-byte half carries the pattern.
-            let as_i64x2 = bcx.ins().bitcast(types::I64X2, mem.guest_flags, pat);
+            let as_i64x2 = bcx.ins().bitcast(types::I64X2, mem.guest_flags, pattern);
             bcx.ins().extractlane(as_i64x2, 0)
-        } else {
+        }
+        (CopyUnit::Bytes8, InlineCopySrc::Move { src_host }) => {
             let sp = bcx.ins().iadd(src_host, off);
             bcx.ins().load(types::I64, mem.guest_flags, sp, 0)
-        };
-        bcx.ins().store(mem.guest_flags, v, dp, 0);
-    }
+        }
+    };
+    bcx.ins().store(mem.guest_flags, value, dp, 0);
 }
 
 fn stos_splat_pattern(
@@ -3952,37 +3973,23 @@ fn lower_string(
     gpr_loaded: &mut [bool; 16],
     mem: &mut MemEnv,
 ) -> Result<Value, String> {
-    let size = string_op_size(instr).ok_or("string size")?;
-    let (op, size) = match instr.mnemonic() {
-        Mnemonic::Stosb | Mnemonic::Stosw | Mnemonic::Stosd | Mnemonic::Stosq => (0_u64, size),
-        Mnemonic::Movsb | Mnemonic::Movsw | Mnemonic::Movsq => (1, size),
-        Mnemonic::Movsd => (1, 4), // string form only reaches here
-        Mnemonic::Lodsb | Mnemonic::Lodsd | Mnemonic::Lodsq => (2, size),
-        Mnemonic::Scasb | Mnemonic::Scasw | Mnemonic::Scasd | Mnemonic::Scasq => (3, size),
-        Mnemonic::Cmpsb | Mnemonic::Cmpsw | Mnemonic::Cmpsd | Mnemonic::Cmpsq => (4, size),
-        other => return Err(format!("string op {other:?}")),
-    };
+    let raw_size = string_op_size(instr).ok_or("string size")?;
+    let mnemonic = instr.mnemonic();
+    let (kind, size) = StringOpKind::from_mnemonic(mnemonic, raw_size)
+        .ok_or_else(|| format!("string op {mnemonic:?}"))?;
 
     // Phase 5.5: dual-path inline for small REP MOVS/STOS when helpers available.
-    if matches!(op, 0 | 1)
+    if matches!(kind, StringOpKind::Stos | StringOpKind::Movs)
         && string_inline_enabled()
         && mem.host_span_ref.is_some()
-        && let Some(rip) = try_lower_inline_rep(bcx, instr, gpr, rflags, gpr_loaded, mem, op, size)
+        && let Some(rip) =
+            try_lower_inline_rep(bcx, instr, gpr, rflags, gpr_loaded, mem, kind, size)
     {
         return Ok(rip);
     }
 
     let string_ref = mem.string_ref.ok_or("string helper missing")?;
-    let mut flags = 0_u64;
-    if instr.has_rep_prefix() || instr.has_repe_prefix() || instr.has_repne_prefix() {
-        flags |= 1;
-    }
-    if instr.has_repe_prefix() {
-        flags |= 2;
-    }
-    if instr.has_repne_prefix() {
-        flags |= 4;
-    }
+    let flags = exec::RepPrefix::from_instr(instr).to_abi();
 
     // Flush SSA GPRs + flags into JitCtx for the host helper.
     for i in 0..16 {
@@ -3995,7 +4002,7 @@ fn lower_string(
     let rflags_ptr = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_RFLAGS));
     bcx.ins().store(mem.flags, *rflags, rflags_ptr, 0);
 
-    let op_v = iconst_u64(bcx, op);
+    let op_v = iconst_u64(bcx, kind.to_abi());
     let size_v = iconst_u64(bcx, u64::from(size));
     let flags_v = iconst_u64(bcx, flags);
     let ip_v = iconst_u64(bcx, instr.ip());
