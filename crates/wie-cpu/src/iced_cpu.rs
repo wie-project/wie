@@ -183,6 +183,27 @@ impl CpuEngine for IcedCpu {
         lock_rd(&self.mem).host_span(address, len, write)
     }
 
+    fn host_slice(&self, address: u64, len: usize) -> Option<&[u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        let ptr = lock_rd(&self.mem).host_span(address, len, false)?;
+        // SAFETY: `host_span` validated `len` readable bytes in one arena. The
+        // mmap arena outlives the read guard, and the returned lifetime is tied
+        // to `&self`, so the borrow checker rules out any `&mut self` unmapping
+        // while the slice is alive.
+        #[expect(unsafe_code)]
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    fn mem_copy(&mut self, dst: u64, src: u64, len: usize) -> bool {
+        lock_rd(&self.mem).mem_copy(dst, src, len)
+    }
+
+    fn mem_fill(&mut self, address: u64, byte: u8, len: usize) -> bool {
+        lock_rd(&self.mem).mem_fill(address, byte, len)
+    }
+
     fn mem_generation(&self) -> u64 {
         lock_rd(&self.mem).generation()
     }

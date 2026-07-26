@@ -217,6 +217,33 @@ pub trait CpuEngine: Send {
         None
     }
 
+    /// Borrow a contiguous guest range as a host slice for reading.
+    ///
+    /// The safe counterpart to [`Self::host_span`]: callers get a `&[u8]` whose
+    /// lifetime is tied to `&self`, so the borrow checker prevents holding it
+    /// across a mutation that could remap the arena. Prefer this over
+    /// `host_span` — it keeps `unsafe` inside this crate, which is the only one
+    /// permitted to use it.
+    ///
+    /// `None` when the range is unmapped, denied by software permissions, or
+    /// spans more than one arena; callers fall back to `mem_read`.
+    fn host_slice(&self, _address: u64, _len: usize) -> Option<&[u8]> {
+        None
+    }
+
+    /// Copy `len` bytes guest→guest with `memmove` semantics.
+    ///
+    /// Returns `false` when either side cannot be resolved to a single mapped
+    /// span, leaving the caller to fall back to `mem_read` + `mem_write`.
+    fn mem_copy(&mut self, _dst: u64, _src: u64, _len: usize) -> bool {
+        false
+    }
+
+    /// Fill `len` guest bytes with `byte`. `false` if not directly mappable.
+    fn mem_fill(&mut self, _address: u64, _byte: u8, _len: usize) -> bool {
+        false
+    }
+
     /// Guest memory generation epoch (TLB / pin invalidation). Default `0`.
     fn mem_generation(&self) -> u64 {
         0
@@ -426,6 +453,15 @@ impl CpuEngine for Box<dyn CpuEngine> {
     }
     fn host_span(&mut self, address: u64, len: usize, write: bool) -> Option<*mut u8> {
         (**self).host_span(address, len, write)
+    }
+    fn host_slice(&self, address: u64, len: usize) -> Option<&[u8]> {
+        (**self).host_slice(address, len)
+    }
+    fn mem_copy(&mut self, dst: u64, src: u64, len: usize) -> bool {
+        (**self).mem_copy(dst, src, len)
+    }
+    fn mem_fill(&mut self, address: u64, byte: u8, len: usize) -> bool {
+        (**self).mem_fill(address, byte, len)
     }
     fn mem_generation(&self) -> u64 {
         (**self).mem_generation()

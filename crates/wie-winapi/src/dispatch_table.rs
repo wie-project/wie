@@ -336,10 +336,29 @@ impl WinApiId {
         if (raw as usize) >= WINAPI_ID_COUNT {
             return None;
         }
-        // SAFETY: `WinApiId` is `#[repr(u16)]` with contiguous discriminants 0..COUNT.
+        // SAFETY: `WinApiId` is `#[repr(u16)]` with contiguous discriminants
+        // `0..WINAPI_ID_COUNT`, and `raw` was just bounds-checked against that
+        // count. The invariant is enforced at compile time by the assertion
+        // below, so adding a variant without updating the count (or the
+        // reverse) is a build error rather than latent UB here.
         Some(unsafe { core::mem::transmute::<u16, Self>(raw) })
     }
 }
+
+// The transmute above is only sound while `WINAPI_ID_COUNT` is exactly one past
+// the last discriminant. Both are edited by hand when an API is added, so pin
+// the relationship: if they ever disagree, this fails to compile.
+// `as usize` is an infallible widening from u16 and `TryFrom` is not const,
+// so it is the only option available in a const assertion here.
+#[allow(clippy::as_conversions)]
+const _: () = assert!(
+    (LAST_WINAPI_ID.to_u16() as usize) + 1 == WINAPI_ID_COUNT,
+    "WINAPI_ID_COUNT must equal the last WinApiId discriminant + 1 — \
+     `WinApiId::from_u16` transmutes based on it"
+);
+
+/// Highest-numbered [`WinApiId`]; update alongside the enum's final variant.
+const LAST_WINAPI_ID: WinApiId = WinApiId::Gdi32Getstockobject;
 
 /// Static (library, name, id) rows for one-time resolution.
 static WINAPI_NAME_ROWS: &[(&str, &str, WinApiId)] = &[

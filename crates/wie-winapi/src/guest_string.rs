@@ -1,16 +1,17 @@
 use anyhow::{Context, Result};
 
-/// 4 KiB — the guest page size. Bulk reads probe one page at a time so a single
-/// `host_span` gives up to 4096 bytes of scan for one memory-lock acquisition.
+/// 4 KiB — the guest page size. Bulk reads stop at the page boundary so an
+/// unmapped following page cannot fail a read whose prefix is valid.
 const PAGE_SIZE: u64 = 4096;
 
 /// Read up to `len` guest bytes starting at `addr` into `buf`, staying inside the
 /// current 4 KiB page. Returns the number of bytes actually copied (≤ `len`).
 ///
-/// Uses [`CpuEngine::host_span`] to acquire the guest memory lock once and copy
-/// directly, avoiding a per-byte lock / page-walk round-trip. Falls back to
-/// scalar `mem_read` when the span is unavailable (unmapped, protect denied,
-/// executable page on write, generation raced).
+/// `mem_read` already performs one software-permission check and one bulk copy
+/// for the whole slice, so a single call per page is all the amortisation the
+/// byte-at-a-time loop needed. An earlier version used `host_span` plus
+/// `copy_nonoverlapping` here, which did the *same* copy behind an `unsafe`
+/// block for no additional benefit.
 fn read_page_slice(
     engine: &mut dyn wie_cpu::CpuEngine,
     addr: u64,
@@ -26,20 +27,9 @@ fn read_page_slice(
     let take = usize::try_from(in_page).unwrap_or(buf.len()).min(buf.len());
     let dst = buf.get_mut(..take).context("page-slice buf too small")?;
 
-    if let Some(host) = engine.host_span(addr, take, false) {
-        // SAFETY: host_span validated `[addr, addr+take)` maps into one arena
-        // with read permission; the pointer is valid until the next mutation of
-        // guest memory (we perform no such mutation before the copy).
-        #[allow(unsafe_code)]
-        unsafe {
-            std::ptr::copy_nonoverlapping(host, dst.as_mut_ptr(), take);
-        }
-        return Ok(take);
-    }
-
     engine
         .mem_read(addr, dst)
-        .context("failed bulk read in page-slice fallback")?;
+        .context("failed bulk read in page-slice")?;
     Ok(take)
 }
 

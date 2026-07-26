@@ -26,26 +26,9 @@ pub(crate) fn write_host_console_handle(handle: u64, bytes: &[u8]) {
     } else {
         libc::STDERR_FILENO
     };
-    let mut offset = 0_usize;
-    while offset < bytes.len() {
-        let Some(chunk) = bytes.get(offset..) else {
-            break;
-        };
-        // SAFETY: host stdout/stderr fd; `chunk` is a live contiguous buffer.
-        #[expect(unsafe_code)]
-        let n = unsafe { libc::write(fd, chunk.as_ptr().cast::<libc::c_void>(), chunk.len()) };
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            break;
-        }
-        if n == 0 {
-            break;
-        }
-        offset = offset.saturating_add(usize::try_from(n).unwrap_or(0));
-    }
+    // Single shared implementation — see `ucrt::write_all_fd` for why this is
+    // a raw fd write rather than `std::io`.
+    crate::ucrt::write_all_fd(fd, bytes);
 }
 /// Handles `KERNEL32.dll!GetFileType`.
 pub fn handle_get_file_type(

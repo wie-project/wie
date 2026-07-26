@@ -1705,6 +1705,30 @@ impl CpuEngine for JitCpu {
             .host_span(address, len, write)
     }
 
+    fn host_slice(&self, address: u64, len: usize) -> Option<&[u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        let ptr = self
+            .shared
+            .mem
+            .read()
+            .unwrap()
+            .host_span(address, len, false)?;
+        // SAFETY: as `IcedCpu::host_slice` — the mmap arena outlives the read
+        // guard, and the `&self` borrow excludes concurrent unmapping.
+        #[expect(unsafe_code)]
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    fn mem_copy(&mut self, dst: u64, src: u64, len: usize) -> bool {
+        self.shared.mem.read().unwrap().mem_copy(dst, src, len)
+    }
+
+    fn mem_fill(&mut self, address: u64, byte: u8, len: usize) -> bool {
+        self.shared.mem.read().unwrap().mem_fill(address, byte, len)
+    }
+
     fn mem_generation(&self) -> u64 {
         self.shared.mem.read().unwrap().generation()
     }

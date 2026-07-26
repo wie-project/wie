@@ -1220,6 +1220,47 @@ impl GuestMemory {
     /// On success, the returned pointer is valid for `len` bytes for the lifetime
     /// of this `GuestMemory` borrow (and until the covering arena is released).
     #[must_use]
+    /// Copy `len` bytes guest→guest without bouncing through a host buffer.
+    ///
+    /// Uses `memmove` semantics, so overlapping ranges are well defined — which
+    /// is what `memmove` needs and what `memcpy` callers get for free. Returns
+    /// `false` when either side is not a single mapped span with the required
+    /// permission, leaving the caller to fall back to read+write.
+    pub(crate) fn mem_copy(&self, dst: u64, src: u64, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let (Some(s), Some(d)) = (
+            self.host_span(src, len, false),
+            self.host_span(dst, len, true),
+        ) else {
+            return false;
+        };
+        // SAFETY: both spans validated for `len` bytes with the needed
+        // permission; `copy` (memmove) is defined for overlapping ranges.
+        #[expect(unsafe_code)]
+        unsafe {
+            std::ptr::copy(s, d, len);
+        }
+        true
+    }
+
+    /// Fill `len` guest bytes with `byte`. Returns `false` if not mappable.
+    pub(crate) fn mem_fill(&self, address: u64, byte: u8, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let Some(d) = self.host_span(address, len, true) else {
+            return false;
+        };
+        // SAFETY: span validated writable for `len` bytes.
+        #[expect(unsafe_code)]
+        unsafe {
+            std::ptr::write_bytes(d, byte, len);
+        }
+        true
+    }
+
     pub(crate) fn host_span(&self, address: u64, len: usize, write: bool) -> Option<*mut u8> {
         if len == 0 {
             return None;

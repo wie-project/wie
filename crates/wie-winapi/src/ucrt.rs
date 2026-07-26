@@ -61,10 +61,13 @@ fn ascii_lower<'a>(name: &'a str, scratch: &'a mut [u8], owned: &'a mut Option<S
         for (d, &b) in dst.iter_mut().zip(bytes.iter()) {
             *d = b.to_ascii_lowercase();
         }
-        // SAFETY: dst is a byte-wise lowercase of a valid UTF-8 &str; ASCII
-        // lowering preserves UTF-8 validity (only touches bytes < 0x80).
-        #[allow(unsafe_code)]
-        return unsafe { std::str::from_utf8_unchecked(dst) };
+        // ASCII lowering only rewrites bytes < 0x80, so the result is still
+        // valid UTF-8 and this check always succeeds. It is kept rather than
+        // using `from_utf8_unchecked` because validating ≤96 bytes is a short
+        // vectorised scan — not worth an `unsafe` block to skip.
+        if let Ok(s) = std::str::from_utf8(dst) {
+            return s;
+        }
     }
     // Very long export name (>SCRATCH) — fall back to a heap-owned lowercase.
     *owned = Some(name.to_ascii_lowercase());
@@ -293,8 +296,14 @@ fn write_host_console(stream: u64, bytes: &[u8]) {
 }
 
 /// Write the full buffer to `fd`, retrying EINTR; give up on other errors.
+///
+/// Deliberately raw rather than `std::io::Stdout`: that would take a reentrant
+/// lock and buffer on every guest `fwrite`, and Rust's buffers are not flushed
+/// when the guest's `ExitProcess` terminates the host process, which would lose
+/// trailing output. This is the single console-write path for the crate —
+/// `kernel32`'s console handles delegate here rather than duplicating the loop.
 #[cfg(unix)]
-fn write_all_fd(fd: libc::c_int, bytes: &[u8]) {
+pub(crate) fn write_all_fd(fd: libc::c_int, bytes: &[u8]) {
     let mut offset = 0_usize;
     while offset < bytes.len() {
         let Some(chunk) = bytes.get(offset..) else {
@@ -716,29 +725,14 @@ fn handle_memcpy(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
     if n_usize == 0 || dest == 0 || src == 0 {
         return ret(engine, dest);
     }
-    // Fast path: both src and dst live in single host-contiguous arenas.
-    // Two host_span acquisitions + one raw copy, no host `Vec` bounce.
-    if let (Some(src_host), Some(dst_host)) = (
-        engine.host_span(src, n_usize, false),
-        engine.host_span(dest, n_usize, true),
-    ) {
-        // Non-overlap check: guest memcpy is memcpy semantics (undefined on
-        // overlap in C99, but callers may pass identical destinations to
-        // memmove — fall back to Vec bounce if the raw host ranges overlap).
-        let src_end = src_host.wrapping_add(n_usize);
-        let dst_end = dst_host.wrapping_add(n_usize);
-        let overlap = src_host < dst_end && dst_host < src_end;
-        if !overlap {
-            // SAFETY: both spans validated by host_span for R/W respectively;
-            // engine borrow is exclusive so no concurrent guest write can occur.
-            #[allow(unsafe_code)]
-            unsafe {
-                std::ptr::copy_nonoverlapping(src_host, dst_host, n_usize);
-            }
-            return ret(engine, dest);
-        }
+    // `mem_copy` resolves both spans inside wie-cpu and uses memmove
+    // semantics, so overlapping ranges are handled correctly rather than
+    // being punted to a host bounce buffer. Returns false only when a side
+    // is not a single mapped span.
+    if engine.mem_copy(dest, src, n_usize) {
+        return ret(engine, dest);
     }
-    // Fallback: cross-arena, SPC denied, or overlapping host ranges.
+    // Fallback: cross-arena or SPC-denied.
     let mut buf = vec![0_u8; n_usize];
     engine.mem_read(src, &mut buf)?;
     engine.mem_write(dest, &buf)?;
@@ -754,25 +748,22 @@ fn handle_memcmp(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
         return ret(engine, 0);
     }
     // Fast path: both spans in host-contiguous arenas → direct slice compare.
-    if let (Some(pa), Some(pb)) = (
-        engine.host_span(a, n_usize, false),
-        engine.host_span(b, n_usize, false),
-    ) {
-        // SAFETY: both spans validated for read; engine borrow is exclusive.
-        #[allow(unsafe_code)]
-        let (sa, sb) = unsafe {
-            (
-                std::slice::from_raw_parts(pa, n_usize),
-                std::slice::from_raw_parts(pb, n_usize),
-            )
-        };
-        let mut result: i32 = 0;
-        for (xa, xb) in sa.iter().zip(sb.iter()) {
-            if xa != xb {
-                result = i32::from(*xa).wrapping_sub(i32::from(*xb));
-                break;
+    // Both slices borrow `&engine`, so they can coexist; the borrow ends
+    // before `ret` needs `&mut engine`.
+    let direct = match (engine.host_slice(a, n_usize), engine.host_slice(b, n_usize)) {
+        (Some(sa), Some(sb)) => {
+            let mut result: i32 = 0;
+            for (xa, xb) in sa.iter().zip(sb.iter()) {
+                if xa != xb {
+                    result = i32::from(*xa).wrapping_sub(i32::from(*xb));
+                    break;
+                }
             }
+            Some(result)
         }
+        _ => None,
+    };
+    if let Some(result) = direct {
         return ret(engine, i32_status_to_u64(result));
     }
     let mut ba = vec![0_u8; n_usize];
@@ -798,12 +789,7 @@ fn handle_memset(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
         return ret(engine, dest);
     }
     let value = u8::try_from(c).unwrap_or(0);
-    if let Some(dst_host) = engine.host_span(dest, n_usize, true) {
-        // SAFETY: host_span validated writable arena span; engine borrow exclusive.
-        #[allow(unsafe_code)]
-        unsafe {
-            std::ptr::write_bytes(dst_host, value, n_usize);
-        }
+    if engine.mem_fill(dest, value, n_usize) {
         return ret(engine, dest);
     }
     // Fallback: bounce through a host Vec only when the span isn't directly writable.
@@ -884,13 +870,13 @@ fn handle_strlen(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
         if span_len == 0 {
             break;
         }
-        if let Some(host) = engine.host_span(cursor, span_len, false) {
-            // SAFETY: host_span validated the range maps into a readable arena;
-            // we hold `&mut engine` so no other guest write can occur before we
-            // finish the scan.
-            #[allow(unsafe_code)]
-            let slice = unsafe { std::slice::from_raw_parts(host, span_len) };
-            if let Some(off) = slice.iter().position(|&b| b == 0) {
+        // Scan the page in place through a borrowed slice — no copy, and the
+        // borrow ends before `ret` takes `&mut engine`.
+        if let Some(found) = engine
+            .host_slice(cursor, span_len)
+            .map(|slice| slice.iter().position(|&b| b == 0))
+        {
+            if let Some(off) = found {
                 total = total.saturating_add(u64::try_from(off).unwrap_or(0));
                 return ret(engine, total);
             }
@@ -919,28 +905,23 @@ fn handle_strncmp(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRe
         return ret(engine, 0);
     }
     // Try both spans as one contiguous host slice each; fall back to scalar.
-    if let (Some(pa), Some(pb)) = (
-        engine.host_span(a, n_usize, false),
-        engine.host_span(b, n_usize, false),
-    ) {
-        // SAFETY: both spans validated by host_span; we don't mutate guest mem here.
-        #[allow(unsafe_code)]
-        let (sa, sb) = unsafe {
-            (
-                std::slice::from_raw_parts(pa, n_usize),
-                std::slice::from_raw_parts(pb, n_usize),
-            )
-        };
-        let mut result: i32 = 0;
-        for (&ca, &cb) in sa.iter().zip(sb.iter()) {
-            if ca != cb {
-                result = i32::from(ca).wrapping_sub(i32::from(cb));
-                break;
+    let direct = match (engine.host_slice(a, n_usize), engine.host_slice(b, n_usize)) {
+        (Some(sa), Some(sb)) => {
+            let mut result: i32 = 0;
+            for (&ca, &cb) in sa.iter().zip(sb.iter()) {
+                if ca != cb {
+                    result = i32::from(ca).wrapping_sub(i32::from(cb));
+                    break;
+                }
+                if ca == 0 {
+                    break;
+                }
             }
-            if ca == 0 {
-                break;
-            }
+            Some(result)
         }
+        _ => None,
+    };
+    if let Some(result) = direct {
         return ret(engine, i32_status_to_u64(result));
     }
     let mut result: i32 = 0;
