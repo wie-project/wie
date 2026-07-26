@@ -8,6 +8,8 @@ use super::{
     read_guest_utf16_lossy, read_wide_string_from_cpu,
 };
 
+/// Handles `KERNEL32.dll!GetModuleHandleA`.
+/// Handles `KERNEL32.dll!GetModuleHandleA`.
 pub fn handle_get_module_handle_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     environment: crate::WinApiEnvironment,
@@ -40,6 +42,7 @@ pub fn handle_get_module_handle_a(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GetModuleHandleW`.
 pub fn handle_get_module_handle_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     environment: crate::WinApiEnvironment,
@@ -201,6 +204,7 @@ pub(crate) fn resolve_windows_dll_path(name: &str, main_module_path: &str) -> St
         format!("C:\\App\\{name}")
     }
 }
+/// Handles `KERNEL32.dll!GetModuleFileNameA`.
 pub fn handle_get_module_file_name_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -236,6 +240,7 @@ pub fn handle_get_module_file_name_a(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GetModuleFileNameW`.
 pub fn handle_get_module_file_name_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -271,6 +276,7 @@ pub fn handle_get_module_file_name_w(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!LoadLibraryA` — real DLL loading.
 pub fn handle_load_library_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     environment: crate::WinApiEnvironment,
@@ -303,6 +309,7 @@ pub fn handle_load_library_a(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!LoadLibraryW` — real DLL loading.
 pub fn handle_load_library_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     environment: crate::WinApiEnvironment,
@@ -335,6 +342,7 @@ pub fn handle_load_library_w(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!FreeLibrary`.
 pub fn handle_free_library(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -399,6 +407,7 @@ pub fn handle_free_library(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GetProcAddress`.
 pub fn handle_get_proc_address(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -504,6 +513,7 @@ pub fn handle_get_proc_address(
         return_value: 0,
     })
 }
+/// Handles `KERNEL32.dll!LoadLibraryExA` — real DLL loading.
 pub fn handle_load_library_ex_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     environment: crate::WinApiEnvironment,
@@ -533,6 +543,7 @@ pub fn handle_load_library_ex_a(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!LoadLibraryExW` — real DLL loading.
 pub fn handle_load_library_ex_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     environment: crate::WinApiEnvironment,
@@ -562,6 +573,7 @@ pub fn handle_load_library_ex_w(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!FindResourceA`.
 pub fn handle_find_resource_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -589,6 +601,7 @@ pub fn handle_find_resource_a(
         return_value: record.handle,
     })
 }
+/// Handles `KERNEL32.dll!LoadResource`.
 pub fn handle_load_resource(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -613,6 +626,7 @@ pub fn handle_load_resource(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!LockResource`.
 pub fn handle_lock_resource(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -633,6 +647,7 @@ pub fn handle_lock_resource(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!SizeofResource`.
 pub fn handle_sizeof_resource(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,

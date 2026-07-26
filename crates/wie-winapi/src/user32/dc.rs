@@ -3,6 +3,7 @@ use super::{
     checked_field_address, write_guest_i32, write_guest_u32, write_guest_u64,
 };
 
+/// Handles `USER32.dll!GetDC`.
 pub fn handle_get_dc(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _window_handle = engine.read_rcx().context("failed to read RCX for GetDC")?;
 
@@ -15,6 +16,7 @@ pub fn handle_get_dc(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandle
         return_value: FAKE_DEVICE_CONTEXT_HANDLE,
     })
 }
+/// Handles `USER32.dll!ReleaseDC`.
 pub fn handle_release_dc(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _window_handle = engine
         .read_rcx()
@@ -36,6 +38,7 @@ pub fn handle_release_dc(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHa
         return_value,
     })
 }
+/// Handles `USER32.dll!BeginPaint`.
 pub fn handle_begin_paint(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -105,6 +108,7 @@ pub fn handle_begin_paint(
         return_value,
     })
 }
+/// Handles `USER32.dll!EndPaint`.
 pub fn handle_end_paint(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -132,6 +136,7 @@ pub fn handle_end_paint(
         return_value,
     })
 }
+/// Handles `USER32.dll!ScrollDC` (no-op success stub; no real pixel scroll).
 pub fn handle_scroll_dc(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _hdc = engine
         .read_rcx()

@@ -6,6 +6,7 @@ use super::{
     register_window_class,
 };
 
+/// Handles `USER32.dll!LoadIconA`.
 pub fn handle_load_icon_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _instance_handle = engine
         .read_rcx()
@@ -24,6 +25,7 @@ pub fn handle_load_icon_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiH
         return_value: FAKE_ICON_HANDLE,
     })
 }
+/// Handles `USER32.dll!LoadCursorA`.
 pub fn handle_load_cursor_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _instance_handle = engine
         .read_rcx()
@@ -42,6 +44,7 @@ pub fn handle_load_cursor_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinAp
         return_value: FAKE_CURSOR_HANDLE,
     })
 }
+/// Handles `USER32.dll!RegisterClassExW`.
 pub fn handle_register_class_ex_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -146,6 +149,7 @@ pub fn handle_register_class_ex_w(
         return_value,
     })
 }
+/// Handles `USER32.dll!RegisterClassExA`.
 pub fn handle_register_class_ex_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -234,6 +238,7 @@ pub fn handle_register_class_ex_a(
         return_value,
     })
 }
+/// Handles `USER32.dll!MessageBoxW`.
 pub fn handle_message_box_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _window_handle = engine
         .read_rcx()
@@ -270,6 +275,7 @@ pub fn handle_message_box_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinAp
         return_value: IDOK,
     })
 }
+/// Handles `USER32.dll!MessageBoxA`.
 pub fn handle_message_box_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _window_handle = engine
         .read_rcx()
@@ -304,6 +310,7 @@ pub fn handle_message_box_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinAp
         return_value: IDOK,
     })
 }
+/// Handles dynamic `USER32.dll!SetProcessDPIAware`.
 pub fn handle_set_process_dpi_aware(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -316,9 +323,11 @@ pub fn handle_set_process_dpi_aware(
         return_value: 1,
     })
 }
+/// Handles `USER32.dll!LoadImageA`.
 pub fn handle_load_image_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     handle_load_image(engine, "LoadImageA")
 }
+/// Handles `USER32.dll!LoadImageW`.
 pub fn handle_load_image_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     handle_load_image(engine, "LoadImageW")
 }
@@ -353,6 +362,7 @@ pub(crate) fn handle_load_image(
         return_value: FAKE_IMAGE_HANDLE,
     })
 }
+/// Handles `USER32.dll!DestroyIcon`.
 pub fn handle_destroy_icon(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let icon_handle = engine
         .read_rcx()
@@ -369,6 +379,7 @@ pub fn handle_destroy_icon(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApi
         return_value,
     })
 }
+/// Handles `USER32.dll!GetDialogBaseUnits`.
 pub fn handle_get_dialog_base_units(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -383,6 +394,7 @@ pub fn handle_get_dialog_base_units(
         return_value,
     })
 }
+/// Handles `USER32.dll!SetTimer`.
 pub fn handle_set_timer(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -451,6 +463,7 @@ pub fn handle_set_timer(
         return_value,
     })
 }
+/// Handles `USER32.dll!KillTimer`.
 pub fn handle_kill_timer(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -487,6 +500,7 @@ pub fn handle_kill_timer(
         return_value,
     })
 }
+/// Handles `USER32.dll!SetWindowsHookExW`.
 pub fn handle_set_windows_hook_ex_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -544,6 +558,7 @@ pub fn handle_set_windows_hook_ex_w(
         return_value,
     })
 }
+/// Handles `USER32.dll!UnhookWindowsHookEx`.
 pub fn handle_unhook_windows_hook_ex(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -576,6 +591,7 @@ pub fn handle_unhook_windows_hook_ex(
         return_value,
     })
 }
+/// Handles `USER32.dll!SetScrollInfo`.
 pub fn handle_set_scroll_info(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let window_handle = engine
         .read_rcx()

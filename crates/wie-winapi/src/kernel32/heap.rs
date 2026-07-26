@@ -5,6 +5,7 @@ use super::{
     write_guest_u64,
 };
 
+/// Handles `KERNEL32.dll!HeapAlloc`.
 pub fn handle_heap_alloc(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -36,6 +37,7 @@ pub fn handle_heap_alloc(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!HeapFree`.
 pub fn handle_heap_free(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -59,6 +61,7 @@ pub fn handle_heap_free(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!HeapReAlloc`.
 pub fn handle_heap_realloc(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -120,6 +123,7 @@ pub fn handle_heap_realloc(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!HeapCreate`.
 pub fn handle_heap_create(
     engine: &mut dyn wie_cpu::CpuEngine,
     process_heap_handle: u64,
@@ -145,6 +149,7 @@ pub fn handle_heap_create(
         return_value: process_heap_handle,
     })
 }
+/// Handles `KERNEL32.dll!HeapSetInformation`.
 pub fn handle_heap_set_information(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -169,6 +174,7 @@ pub fn handle_heap_set_information(
         return_value: 1,
     })
 }
+/// Handles `KERNEL32.dll!HeapSize`.
 pub fn handle_heap_size(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -201,6 +207,7 @@ pub fn handle_heap_size(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GlobalMemoryStatus`.
 pub fn handle_global_memory_status(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -280,6 +287,7 @@ pub fn handle_global_memory_status_ex(
     write_guest_u64(engine, ptr.wrapping_add(56), 0)?;
     ret_bool_true(engine, "GlobalMemoryStatusEx")
 }
+/// Handles `KERNEL32.dll!LocalAlloc`.
 pub fn handle_local_alloc(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -303,6 +311,7 @@ pub fn handle_local_alloc(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!LocalFree`.
 pub fn handle_local_free(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -336,6 +345,7 @@ pub fn handle_local_free(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GlobalAlloc`.
 pub fn handle_global_alloc(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -359,6 +369,7 @@ pub fn handle_global_alloc(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GlobalFree`.
 pub fn handle_global_free(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -392,6 +403,7 @@ pub fn handle_global_free(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GlobalLock`.
 pub fn handle_global_lock(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -415,6 +427,7 @@ pub fn handle_global_lock(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GlobalUnlock`.
 pub fn handle_global_unlock(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -438,6 +451,7 @@ pub fn handle_global_unlock(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GlobalSize`.
 pub fn handle_global_size(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -457,6 +471,7 @@ pub fn handle_global_size(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GlobalAddAtomA`.
 pub fn handle_global_add_atom_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -511,6 +526,7 @@ pub fn handle_global_add_atom_a(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GlobalDeleteAtom`.
 pub fn handle_global_delete_atom(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,

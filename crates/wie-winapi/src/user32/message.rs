@@ -6,6 +6,7 @@ use super::{
     read_guest_u64, write_message_structure,
 };
 
+/// Handles `USER32.dll!PeekMessageA`.
 pub fn handle_peek_message_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -82,6 +83,7 @@ pub fn handle_peek_message_a(
         return_value,
     })
 }
+/// Handles `USER32.dll!CallMsgFilterA/W`.
 pub fn handle_call_msg_filter(
     engine: &mut dyn wie_cpu::CpuEngine,
     api_name: &str,
@@ -102,6 +104,7 @@ pub fn handle_call_msg_filter(
         return_value: 0,
     })
 }
+/// Handles `USER32.dll!PostMessageA`.
 pub fn handle_post_message_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -158,12 +161,14 @@ pub fn handle_post_message_a(
         return_value,
     })
 }
+/// Handles `USER32.dll!SendMessageA`.
 pub fn handle_send_message_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
     handle_send_message(engine, state, false, "SendMessageA")
 }
+/// Handles `USER32.dll!SendMessageW`.
 pub fn handle_send_message_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -242,6 +247,7 @@ pub(crate) fn handle_send_message(
         return_value: 0,
     })
 }
+/// Handles `USER32.dll!CallNextHookEx`.
 pub fn handle_call_next_hook_ex(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -273,6 +279,7 @@ pub fn handle_call_next_hook_ex(
         return_value,
     })
 }
+/// Handles `USER32.dll!GetMessageA`.
 pub fn handle_get_message_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -369,6 +376,7 @@ pub fn handle_get_message_a(
         return_value,
     })
 }
+/// Handles `USER32.dll!TranslateMessage`.
 pub fn handle_translate_message(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -423,32 +431,39 @@ pub(crate) fn handle_default_window_procedure(
         return_value: 0,
     })
 }
+/// Handles `USER32.dll!DefWindowProcA`.
 pub fn handle_def_window_proc_a(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
     handle_default_window_procedure(engine, "DefWindowProcA")
 }
+/// Handles `USER32.dll!DefWindowProcW`.
 pub fn handle_def_window_proc_w(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
     handle_default_window_procedure(engine, "DefWindowProcW")
 }
+/// Handles `USER32.dll!DefFrameProcA`.
 pub fn handle_def_frame_proc_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     handle_default_window_procedure(engine, "DefFrameProcA")
 }
+/// Handles `USER32.dll!DefFrameProcW`.
 pub fn handle_def_frame_proc_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     handle_default_window_procedure(engine, "DefFrameProcW")
 }
+/// Handles `USER32.dll!DefMDIChildProcA`.
 pub fn handle_def_mdi_child_proc_a(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
     handle_default_window_procedure(engine, "DefMDIChildProcA")
 }
+/// Handles `USER32.dll!DefMDIChildProcW`.
 pub fn handle_def_mdi_child_proc_w(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
     handle_default_window_procedure(engine, "DefMDIChildProcW")
 }
+/// Handles `USER32.dll!DispatchMessageA`.
 pub fn handle_dispatch_message_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,

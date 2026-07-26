@@ -5,6 +5,7 @@ use super::{
     write_guest_u32,
 };
 
+/// Handles `KERNEL32.dll!lstrlenW`.
 pub fn handle_lstrlen_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let s = engine
         .read_rcx()
@@ -34,6 +35,7 @@ pub fn handle_lstrlen_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHan
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!lstrcpyW` — copy wide string; returns dest.
 pub fn handle_lstrcpy_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let dest = engine
         .read_rcx()
@@ -64,6 +66,7 @@ pub fn handle_lstrcpy_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHan
         return_value: dest,
     })
 }
+/// Handles `KERNEL32.dll!lstrcatW` — append wide string; returns dest.
 pub fn handle_lstrcat_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let dest = engine
         .read_rcx()
@@ -280,6 +283,7 @@ pub(crate) fn read_fixed_bytes(
 
     Ok(bytes)
 }
+/// Handles `KERNEL32.dll!WideCharToMultiByte`.
 pub fn handle_wide_char_to_multi_byte(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -343,6 +347,7 @@ pub fn handle_wide_char_to_multi_byte(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GetACP`.
 pub fn handle_get_acp(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let return_address = engine
         .return_from_win64_api(ANSI_CODE_PAGE)
@@ -353,6 +358,7 @@ pub fn handle_get_acp(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandl
         return_value: ANSI_CODE_PAGE,
     })
 }
+/// Handles `KERNEL32.dll!GetOEMCP`.
 pub fn handle_get_oem_cp(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let return_address = engine
         .return_from_win64_api(OEM_CODE_PAGE)
@@ -363,6 +369,7 @@ pub fn handle_get_oem_cp(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHa
         return_value: OEM_CODE_PAGE,
     })
 }
+/// Handles `KERNEL32.dll!GetCPInfo`.
 pub fn handle_get_cp_info(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _code_page = engine
         .read_rcx()
@@ -395,6 +402,7 @@ pub fn handle_get_cp_info(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiH
         return_value: 1,
     })
 }
+/// Handles `KERNEL32.dll!IsValidCodePage`.
 pub fn handle_is_valid_code_page(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -416,6 +424,7 @@ pub fn handle_is_valid_code_page(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GetStringTypeW`.
 pub fn handle_get_string_type_w(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -469,6 +478,7 @@ pub fn handle_get_string_type_w(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!MultiByteToWideChar`.
 pub fn handle_multi_byte_to_wide_char(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -524,6 +534,7 @@ pub fn handle_multi_byte_to_wide_char(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!LCMapStringW`.
 pub fn handle_lc_map_string_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _locale = engine
         .read_rcx()

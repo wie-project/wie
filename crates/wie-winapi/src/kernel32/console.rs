@@ -40,6 +40,7 @@ pub(crate) fn refill_stdin_from_host(state: &mut WinApiState) -> Result<bool, ()
         Err(_) => Err(()),
     }
 }
+/// Handles `KERNEL32.dll!GetStdHandle`.
 pub fn handle_get_std_handle(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let std_handle_id_raw = engine
         .read_rcx()

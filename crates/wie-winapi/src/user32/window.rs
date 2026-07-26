@@ -7,6 +7,7 @@ use super::{
     write_guest_u32, write_wide_window_text, write_window_rect,
 };
 
+/// Handles `USER32.dll!GetWindowRect`.
 pub fn handle_get_window_rect(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -48,6 +49,7 @@ pub fn handle_get_window_rect(
         return_value,
     })
 }
+/// Handles dynamic `USER32.dll!GetDpiForWindow`.
 pub fn handle_get_dpi_for_window(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -67,6 +69,7 @@ pub fn handle_get_dpi_for_window(
         return_value,
     })
 }
+/// Handles dynamic `USER32.dll!AdjustWindowRectExForDpi`.
 pub fn handle_adjust_window_rect_ex_for_dpi(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -99,6 +102,7 @@ pub fn handle_adjust_window_rect_ex_for_dpi(
         return_value,
     })
 }
+/// Handles `USER32.dll!SetWindowPos`.
 pub fn handle_set_window_pos(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _window_handle = engine
         .read_rcx()
@@ -130,6 +134,7 @@ pub fn handle_set_window_pos(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinA
         return_value,
     })
 }
+/// Handles `USER32.dll!SetWindowLongPtrW`.
 pub fn handle_set_window_long_ptr_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -163,6 +168,7 @@ pub fn handle_set_window_long_ptr_w(
         return_value: previous_value,
     })
 }
+/// Handles `USER32.dll!IsWindow`.
 pub fn handle_is_window(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let window_handle = engine
         .read_rcx()
@@ -179,6 +185,7 @@ pub fn handle_is_window(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHan
         return_value,
     })
 }
+/// Handles `USER32.dll!IsWindowVisible`.
 pub fn handle_is_window_visible(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -197,6 +204,7 @@ pub fn handle_is_window_visible(
         return_value,
     })
 }
+/// Handles `USER32.dll!IsWindowEnabled`.
 pub fn handle_is_window_enabled(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -215,6 +223,7 @@ pub fn handle_is_window_enabled(
         return_value,
     })
 }
+/// Handles `USER32.dll!GetParent`.
 pub fn handle_get_parent(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _window_handle = engine
         .read_rcx()
@@ -232,6 +241,7 @@ pub fn handle_get_parent(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHa
         return_value,
     })
 }
+/// Handles `USER32.dll!GetActiveWindow`.
 pub fn handle_get_active_window(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -247,6 +257,7 @@ pub fn handle_get_active_window(
         return_value,
     })
 }
+/// Handles `USER32.dll!GetForegroundWindow`.
 pub fn handle_get_foreground_window(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -262,6 +273,7 @@ pub fn handle_get_foreground_window(
         return_value,
     })
 }
+/// Handles `USER32.dll!ShowWindow`.
 pub fn handle_show_window(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -293,6 +305,7 @@ pub fn handle_show_window(
         return_value,
     })
 }
+/// Handles `USER32.dll!EnableWindow`.
 pub fn handle_enable_window(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -323,6 +336,7 @@ pub fn handle_enable_window(
         return_value,
     })
 }
+/// Handles `USER32.dll!SetForegroundWindow`.
 pub fn handle_set_foreground_window(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -349,6 +363,7 @@ pub fn handle_set_foreground_window(
         return_value,
     })
 }
+/// Handles `USER32.dll!SetActiveWindow`.
 pub fn handle_set_active_window(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -372,6 +387,7 @@ pub fn handle_set_active_window(
         return_value: previous_window,
     })
 }
+/// Handles `USER32.dll!SetFocus`.
 pub fn handle_set_focus(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -395,6 +411,7 @@ pub fn handle_set_focus(
         return_value: previous_window,
     })
 }
+/// Handles `USER32.dll!GetFocus`.
 pub fn handle_get_focus(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -410,6 +427,7 @@ pub fn handle_get_focus(
         return_value,
     })
 }
+/// Handles `USER32.dll!SetCapture`.
 pub fn handle_set_capture(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -433,6 +451,7 @@ pub fn handle_set_capture(
         return_value: previous_window,
     })
 }
+/// Handles `USER32.dll!GetCapture`.
 pub fn handle_get_capture(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -448,6 +467,7 @@ pub fn handle_get_capture(
         return_value,
     })
 }
+/// Handles `USER32.dll!ReleaseCapture`.
 pub fn handle_release_capture(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -465,6 +485,7 @@ pub fn handle_release_capture(
         return_value,
     })
 }
+/// Handles `USER32.dll!UpdateWindow`.
 pub fn handle_update_window(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -490,6 +511,7 @@ pub fn handle_update_window(
         return_value,
     })
 }
+/// Handles `USER32.dll!InvalidateRect`.
 pub fn handle_invalidate_rect(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -523,6 +545,7 @@ pub fn handle_invalidate_rect(
         return_value,
     })
 }
+/// Handles `USER32.dll!RedrawWindow`.
 pub fn handle_redraw_window(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -560,6 +583,7 @@ pub fn handle_redraw_window(
         return_value,
     })
 }
+/// Handles `USER32.dll!SetWindowTextA`.
 pub fn handle_set_window_text_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -590,6 +614,7 @@ pub fn handle_set_window_text_a(
         return_value,
     })
 }
+/// Handles `USER32.dll!SetWindowTextW`.
 pub fn handle_set_window_text_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -620,6 +645,7 @@ pub fn handle_set_window_text_w(
         return_value,
     })
 }
+/// Handles `USER32.dll!GetWindowTextA`.
 pub fn handle_get_window_text_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -656,6 +682,7 @@ pub fn handle_get_window_text_a(
         return_value,
     })
 }
+/// Handles `USER32.dll!GetWindowTextW`.
 pub fn handle_get_window_text_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -692,6 +719,7 @@ pub fn handle_get_window_text_w(
         return_value,
     })
 }
+/// Handles `USER32.dll!GetClientRect`.
 pub fn handle_get_client_rect(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -722,6 +750,7 @@ pub fn handle_get_client_rect(
         return_value,
     })
 }
+/// Handles `USER32.dll!MoveWindow`.
 pub fn handle_move_window(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -781,6 +810,7 @@ pub fn handle_move_window(
         return_value,
     })
 }
+/// Handles `USER32.dll!ScreenToClient`.
 pub fn handle_screen_to_client(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -825,6 +855,7 @@ pub fn handle_screen_to_client(
         return_value,
     })
 }
+/// Handles `USER32.dll!ClientToScreen`.
 pub fn handle_client_to_screen(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -869,6 +900,7 @@ pub fn handle_client_to_screen(
         return_value,
     })
 }
+/// Handles `USER32.dll!GetDesktopWindow`.
 pub fn handle_get_desktop_window(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -881,6 +913,7 @@ pub fn handle_get_desktop_window(
         return_value: FAKE_DESKTOP_WINDOW_HANDLE,
     })
 }
+/// Handles `USER32.dll!GetSysColor`.
 pub fn handle_get_sys_color(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let color_index = engine
         .read_rcx()
@@ -932,6 +965,7 @@ pub fn handle_get_sys_color(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinAp
         return_value,
     })
 }
+/// Handles `USER32.dll!GetSysColorBrush`.
 pub fn handle_get_sys_color_brush(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -952,6 +986,7 @@ pub fn handle_get_sys_color_brush(
         return_value,
     })
 }
+/// Handles `USER32.dll!SetRect`.
 pub fn handle_set_rect(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let rect_ptr = engine
         .read_rcx()
@@ -999,6 +1034,7 @@ pub fn handle_set_rect(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHand
         return_value,
     })
 }
+/// Handles `USER32.dll!IsIconic`.
 pub fn handle_is_iconic(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _window_handle = engine
         .read_rcx()
@@ -1015,6 +1051,7 @@ pub fn handle_is_iconic(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHan
         return_value,
     })
 }
+/// Handles `USER32.dll!IsZoomed`.
 pub fn handle_is_zoomed(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _window_handle = engine
         .read_rcx()
@@ -1031,6 +1068,7 @@ pub fn handle_is_zoomed(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHan
         return_value,
     })
 }
+/// Handles `USER32.dll!GetWindowThreadProcessId`.
 pub fn handle_get_window_thread_process_id(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -1060,6 +1098,7 @@ pub fn handle_get_window_thread_process_id(
         return_value,
     })
 }
+/// Handles `USER32.dll!GetDlgCtrlID`.
 pub fn handle_get_dlg_ctrl_id(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let window_handle = engine
         .read_rcx()
@@ -1081,6 +1120,7 @@ pub fn handle_get_dlg_ctrl_id(engine: &mut dyn wie_cpu::CpuEngine) -> Result<Win
         return_value,
     })
 }
+/// Handles `USER32.dll!IsChild`.
 pub fn handle_is_child(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _parent_handle = engine
         .read_rcx()
@@ -1101,6 +1141,7 @@ pub fn handle_is_child(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHand
         return_value,
     })
 }
+/// Handles `USER32.dll!GetWindow`.
 pub fn handle_get_window(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _window_handle = engine
         .read_rcx()
@@ -1121,6 +1162,7 @@ pub fn handle_get_window(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHa
         return_value,
     })
 }
+/// Handles `USER32.dll!GetWindowLongPtrA`.
 pub fn handle_get_window_long_ptr_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -1144,6 +1186,7 @@ pub fn handle_get_window_long_ptr_a(
         return_value: value,
     })
 }
+/// Handles `USER32.dll!GetWindowLongPtrW`.
 pub fn handle_get_window_long_ptr_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -1167,6 +1210,7 @@ pub fn handle_get_window_long_ptr_w(
         return_value: value,
     })
 }
+/// Handles `USER32.dll!SetWindowLongPtrA`.
 pub fn handle_set_window_long_ptr_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -1200,6 +1244,7 @@ pub fn handle_set_window_long_ptr_a(
         return_value: previous_value,
     })
 }
+/// Handles `USER32.dll!AdjustWindowRectEx`.
 pub fn handle_adjust_window_rect_ex(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -1275,6 +1320,7 @@ pub fn handle_adjust_window_rect_ex(
         return_value,
     })
 }
+/// Handles `USER32.dll!ScrollWindowEx` (no-op success stub).
 pub fn handle_scroll_window_ex(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _hwnd = engine
         .read_rcx()

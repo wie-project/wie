@@ -3,6 +3,7 @@ use super::{
     write_guest_bytes, write_guest_i32,
 };
 
+/// Handles `USER32.dll!GetAsyncKeyState`.
 pub fn handle_get_async_key_state(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -34,6 +35,7 @@ pub fn handle_get_async_key_state(
         return_value: result,
     })
 }
+/// Handles dynamic `USER32.dll!TrackMouseEvent`.
 pub fn handle_track_mouse_event(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -50,6 +52,7 @@ pub fn handle_track_mouse_event(
         return_value: 1,
     })
 }
+/// Handles `USER32.dll!GetCursorPos`.
 pub fn handle_get_cursor_pos(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let point_ptr = engine
         .read_rcx()
@@ -72,6 +75,7 @@ pub fn handle_get_cursor_pos(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinA
         return_value: 1,
     })
 }
+/// Handles `USER32.dll!ClipCursor` (accept clip rect or release when NULL).
 pub fn handle_clip_cursor(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let rect_ptr = engine
         .read_rcx()
@@ -89,6 +93,7 @@ pub fn handle_clip_cursor(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiH
         return_value: 1,
     })
 }
+/// Handles `USER32.dll!GetClipCursor`.
 pub fn handle_get_clip_cursor(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let rect_ptr = engine
         .read_rcx()
@@ -110,6 +115,7 @@ pub fn handle_get_clip_cursor(engine: &mut dyn wie_cpu::CpuEngine) -> Result<Win
         return_value,
     })
 }
+/// Handles `USER32.dll!SetCursor`.
 pub fn handle_set_cursor(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -130,6 +136,7 @@ pub fn handle_set_cursor(
         return_value: previous_cursor,
     })
 }
+/// Handles `USER32.dll!GetCursor`.
 pub fn handle_get_cursor(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -145,6 +152,7 @@ pub fn handle_get_cursor(
         return_value,
     })
 }
+/// Handles `USER32.dll!SetKeyboardState`.
 pub fn handle_set_keyboard_state(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -175,6 +183,7 @@ pub fn handle_set_keyboard_state(
         return_value,
     })
 }
+/// Handles `USER32.dll!GetKeyboardState`.
 pub fn handle_get_keyboard_state(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -205,6 +214,7 @@ pub fn handle_get_keyboard_state(
         return_value,
     })
 }
+/// Handles `USER32.dll!GetKeyState`.
 pub fn handle_get_key_state(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -239,6 +249,7 @@ pub fn handle_get_key_state(
         return_value,
     })
 }
+/// Handles `USER32.dll!MapVirtualKeyA`.
 pub fn handle_map_virtual_key_a(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {

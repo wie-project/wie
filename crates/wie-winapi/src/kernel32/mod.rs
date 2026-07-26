@@ -1,3 +1,5 @@
+#![allow(clippy::empty_line_after_doc_comments)]
+
 pub(crate) use crate::guest_memory::{
     checked_address, checked_field_address, read_u16 as read_guest_u16, read_u64 as read_guest_u64,
     write_u16 as write_guest_u16, write_u32 as write_guest_u32, write_u64 as write_guest_u64,
@@ -49,17 +51,17 @@ const MAX_HOST_STDIN_LINE: usize = 64 * 1024;
 /// Models Microsoft Learn default console line input (`ENABLE_LINE_INPUT`):
 /// `ReadFile` on a console handle does not complete until a carriage return
 /// is entered. On Unix hosts we treat `\n` as the line terminator.
-///
-/// Returns:
-/// - `Ok(Some(bytes))` — non-empty fill (may omit `\n` if cap hit first)
-/// - `Ok(None)` — host EOF with no bytes
-/// - `Err(_)` — host I/O error
+//
+// Returns:
+// - `Ok(Some(bytes))` — non-empty fill (may omit `\n` if cap hit first)
+// - `Ok(None)` — host EOF with no bytes
+// - `Err(_)` — host I/O error
 
-/// When the inject/live buffer is empty and live mode is on, block on host
-/// stdin for one line and store it in `state.file_io.stdin_bytes`.
-///
-/// Returns `Ok(true)` if bytes were stored, `Ok(false)` on host EOF,
-/// `Err(())` on host I/O failure (caller sets `ERROR_READ_FAULT`).
+// When the inject/live buffer is empty and live mode is on, block on host
+// stdin for one line and store it in `state.file_io.stdin_bytes`.
+//
+// Returns `Ok(true)` if bytes were stored, `Ok(false)` on host EOF,
+// `Err(())` on host I/O failure (caller sets `ERROR_READ_FAULT`).
 
 const FILE_TYPE_UNKNOWN: u64 = 0x0000;
 const FILE_TYPE_DISK: u64 = 0x0001;
@@ -155,43 +157,31 @@ pub(crate) fn low_u32(value: u64, context_name: &str) -> Result<u32> {
         .with_context(|| format!("{context_name} low u32 conversion failed"))
 }
 
-/// Guest OS identity shared by `GetVersion` / `GetVersionEx*`.
+// Guest OS identity shared by `GetVersion` / `GetVersionEx*`.
 const GUEST_OS_MAJOR: u32 = 10;
 const GUEST_OS_MINOR: u32 = 0;
 const GUEST_OS_BUILD: u32 = 19045;
 const GUEST_OS_PLATFORM_NT: u32 = 2;
 
-/// Packed `GetVersion` DWORD for the emulated OS (NT bit set in high word).
-#[must_use]
+// Packed `GetVersion` DWORD for the emulated OS (NT bit set in high word).
 
-/// Handles `KERNEL32.dll!GetVersion` (legacy packed DWORD).
 
-/// Handles `KERNEL32.dll!GetVersionExA`.
 
-/// Handles `KERNEL32.dll!GetModuleHandleA`.
+
 ///
 /// `lpModuleName == NULL` returns the main module image base from the PE
 /// (`WinApiEnvironment::image_base`), not a hardcoded Lunar Magic address.
-/// Handles `KERNEL32.dll!GetModuleHandleA`.
 ///
 /// Microsoft Learn: `lpModuleName == NULL` → handle of the calling process's
 /// `.exe`. Named module must already be loaded; otherwise returns `NULL`.
 
-/// Handles `KERNEL32.dll!GetModuleHandleW`.
 
-/// Handles `KERNEL32.dll!lstrlenW`.
 
-/// Handles `KERNEL32.dll!lstrcpyW` — copy wide string; returns dest.
 
-/// Handles `KERNEL32.dll!lstrcatW` — append wide string; returns dest.
 
-/// Handles `KERNEL32.dll!GetCommandLineA`.
 
-/// Handles `KERNEL32.dll!GetCommandLineW`.
 
-/// Handles `KERNEL32.dll!GetTickCount`.
 
-/// Handles `KERNEL32.dll!QueryPerformanceCounter`.
 
 pub(crate) fn low_u32_to_i32(value: u64, context_name: &str) -> Result<i32> {
     let low = u32::try_from(value & 0xffff_ffff)
@@ -200,7 +190,7 @@ pub(crate) fn low_u32_to_i32(value: u64, context_name: &str) -> Result<i32> {
     Ok(i32::from_ne_bytes(low.to_ne_bytes()))
 }
 
-/// Copy a NUL-terminated ANSI path into a guest buffer.
+// Copy a NUL-terminated ANSI path into a guest buffer.
 ///
 /// Returns `(chars_written_or_nSize, truncated)` per Microsoft Learn
 /// `GetModuleFileNameA` semantics.
@@ -255,7 +245,7 @@ pub(crate) fn copy_path_a_to_guest_buffer(
     }
 }
 
-/// Copy a NUL-terminated UTF-16 path into a guest buffer (WCHAR units).
+// Copy a NUL-terminated UTF-16 path into a guest buffer (WCHAR units).
 pub(crate) fn copy_path_w_to_guest_buffer(
     engine: &mut dyn wie_cpu::CpuEngine,
     source_ptr: u64,
@@ -316,13 +306,13 @@ pub(crate) fn copy_path_w_to_guest_buffer(
     }
 }
 
-/// Whether `path` refers to the loaded main PE (any basename/path form).
+// Whether `path` refers to the loaded main PE (any basename/path form).
 
-/// Resolve a module that is considered already loaded (`GetModuleHandle*`).
+// Resolve a module that is considered already loaded (`GetModuleHandle*`).
 ///
 /// Microsoft Learn: returns `NULL` when the named module is not in the process.
 
-/// Resolve a DLL by name: first check loaded and fake modules, then try to load from disk.
+// Resolve a DLL by name: first check loaded and fake modules, then try to load from disk.
 
 /// Build a guest Windows-style path for a DLL name relative to the main module directory.
 
@@ -607,57 +597,43 @@ pub(crate) fn find_resource_by_handle(state: &WinApiState, handle: u64) -> Optio
         .find(|resource| resource.handle == handle || resource.loaded_handle == handle)
 }
 
-/// Handles `KERNEL32.dll!GetStartupInfoA`.
 
-/// Handles `KERNEL32.dll!GetProcessHeap`.
 
-/// Handles `KERNEL32.dll!GetSystemTimeAsFileTime`.
 
-/// Handles `KERNEL32.dll!GetCurrentProcessId`.
 
-/// Handles `KERNEL32.dll!GetCurrentThreadId`.
 ///
 /// Returns the active guest TID from [`crate::ThreadState`] (primary `0x5678`
 /// until MT.2 spawns workers).
 
-/// Handles `KERNEL32.dll!HeapAlloc`.
 ///
 /// Microsoft Learn (`heapapi.h`):
 /// - success → pointer to allocated block (at least `dwBytes`)
 /// - failure → `NULL` (does not call `SetLastError`)
-/// - `HEAP_ZERO_MEMORY` zeros the block
-/// - `dwBytes == 0` allocates a zero-length item and still returns a valid pointer
+// - `HEAP_ZERO_MEMORY` zeros the block
+// - `dwBytes == 0` allocates a zero-length item and still returns a valid pointer
 ///   (same practical behaviour as the Windows process heap / CRT `malloc(0)`)
 
-/// Handles `KERNEL32.dll!HeapFree`.
 ///
 /// Microsoft Learn: `lpMem` may be `NULL` (no-op, success). Double-free /
 /// unknown pointer fails with a non-zero last-error in this emulator
 /// (`ERROR_INVALID_HANDLE`) so freestanding tests can detect the failure.
 
-/// Handles `KERNEL32.dll!HeapReAlloc`.
 ///
 /// Microsoft Learn: preserves contents; failure leaves the original block valid
 /// and returns `NULL`. `dwBytes == 0` is treated as free + `NULL` (common Windows
 /// process-heap behaviour used by the micro-suite).
 
-/// Handles `KERNEL32.dll!HeapCreate`.
 
-/// Handles `KERNEL32.dll!HeapSetInformation`.
 
-/// Handles `KERNEL32.dll!InitializeCriticalSection`.
 
-/// Handles `KERNEL32.dll!EnterCriticalSection` (reentrant; blocks when needed).
 ///
-/// Guest `RTL_CRITICAL_SECTION` layout (Win64) written by Initialize*:
+// Guest `RTL_CRITICAL_SECTION` layout (Win64) written by Initialize*:
 /// `LockCount` (-1 unlocked), `RecursionCount`, `OwningThread` (guest TID).
 ///
 /// Contended path: returns [`crate::WinApiControlSignal::HostPark`] so the
 /// session drops the shared CPU lock and waits on the CS condvar (MT.3).
 
-/// Handles `KERNEL32.dll!LeaveCriticalSection`.
 
-/// Handles `KERNEL32.dll!DeleteCriticalSection`.
 ///
 /// Zeros the CS fields. Calling Delete while owned is undefined on Windows;
 /// we still clear so a subsequent Initialize can reuse the memory.
@@ -676,78 +652,47 @@ pub(crate) enum EnterCsResult {
 
 /// Publish one FLS slot into the guest table used by in-guest `FlsGetValue`.
 
-/// Handles `KERNEL32.dll!FlsAlloc`.
 
-/// Handles `KERNEL32.dll!FlsFree`.
 
-/// Handles `KERNEL32.dll!FlsSetValue`.
 
-/// Handles `KERNEL32.dll!FlsGetValue`.
 
-/// Handles `KERNEL32.dll!GetStdHandle`.
 
-/// Handles `KERNEL32.dll!GetFileType`.
 
-/// Handles `KERNEL32.dll!SetHandleCount`.
 
-/// Handles `KERNEL32.dll!GetEnvironmentStringsW`.
 
-/// Handles `KERNEL32.dll!FreeEnvironmentStringsW`.
 
-/// Handles `KERNEL32.dll!WideCharToMultiByte`.
 
-/// Handles `KERNEL32.dll!GetLastError`.
 
-/// Handles `KERNEL32.dll!SetLastError`.
 
-/// Handles `KERNEL32.dll!GetACP`.
 
-/// Handles `KERNEL32.dll!GetOEMCP`.
 
-/// Handles `KERNEL32.dll!GetCPInfo`.
 
-/// Handles `KERNEL32.dll!IsValidCodePage`.
 
-/// Handles `KERNEL32.dll!GetStringTypeW`.
 
-/// Handles `KERNEL32.dll!MultiByteToWideChar`.
 ///
 /// Lean host path (also fallback for guest SBCS helper). Single-byte code pages
 /// use zero-extend (matches guest accelerator); others use UTF-8 lossy.
 
 /// Zero-extend each byte to UTF-16 (SBCS / Latin-1 identity).
-/// Handles `KERNEL32.dll!LCMapStringW`.
 
-/// Handles `KERNEL32.dll!GetModuleFileNameA`.
 ///
 /// Microsoft Learn: returns character count excluding NUL. If the buffer is too
 /// small, the path is truncated (NUL-terminated), the return value is `nSize`,
 /// and last-error is `ERROR_INSUFFICIENT_BUFFER`.
 
-/// Handles `KERNEL32.dll!GetModuleFileNameW`.
 
-/// Handles `KERNEL32.dll!SetUnhandledExceptionFilter`.
 
-/// Handles `KERNEL32.dll!HeapSize`.
 
-/// Handles `KERNEL32.dll!LoadLibraryA` — real DLL loading.
 
-/// Handles `KERNEL32.dll!LoadLibraryW` — real DLL loading.
 
-/// Handles `KERNEL32.dll!FreeLibrary`.
 
-/// Handles `KERNEL32.dll!GetProcAddress`.
 ///
 /// Microsoft Learn: returns the export address, or `NULL` if not found
 /// (`GetLastError` → `ERROR_PROC_NOT_FOUND`). Does **not** abort the process.
 
-/// Handles `KERNEL32.dll!GetFileAttributesA`.
 
-/// Handles `KERNEL32.dll!GetFileAttributesW`.
 
-/// Handles `KERNEL32.dll!FindFirstFileW`.
 
-/// Handles `KERNEL32.dll!FindFirstFileA`.
 
 pub(crate) fn finish_find_first(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -804,9 +749,7 @@ pub(crate) fn finish_find_first(
     Ok(handle)
 }
 
-/// Handles `KERNEL32.dll!FindNextFileW`.
 
-/// Handles `KERNEL32.dll!FindNextFileA`.
 
 pub(crate) fn finish_find_next(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -852,31 +795,18 @@ pub(crate) fn finish_find_next(
     Ok(1)
 }
 
-/// Handles `KERNEL32.dll!FindClose`.
 
-/// Handles `KERNEL32.dll!LoadLibraryExA` — real DLL loading.
 
-/// Handles `KERNEL32.dll!LoadLibraryExW` — real DLL loading.
 
-/// Handles `KERNEL32.dll!FindResourceA`.
 
-/// Handles `KERNEL32.dll!LoadResource`.
 
-/// Handles `KERNEL32.dll!LockResource`.
 
-/// Handles `KERNEL32.dll!SizeofResource`.
 
-/// Handles `KERNEL32.dll!GetSystemDefaultLangID`.
 
-/// Handles `KERNEL32.dll!GetUserDefaultLangID`.
 
-/// Handles `KERNEL32.dll!GlobalMemoryStatus`.
 
-/// Handles `KERNEL32.dll!GetLocalTime`.
 
-/// Handles `KERNEL32.dll!CreateFileW`.
 
-/// Handles `KERNEL32.dll!CreateFileA`.
 
 pub(crate) fn finish_create_file(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -934,13 +864,11 @@ pub(crate) fn finish_create_file(
     return_value
 }
 
-/// Handles `KERNEL32.dll!CloseHandle`.
 ///
 /// Microsoft Learn: success → nonzero; failure → zero + last-error.
 /// `NULL` / `INVALID_HANDLE_VALUE` fail with `ERROR_INVALID_HANDLE`.
 /// Open guest files are flushed to the virtual store / bottle host path.
 
-/// Handles `KERNEL32.dll!GetFileInformationByHandle`.
 
 /// Full path equality (case-insensitive). Used for FS identity.
 
@@ -973,36 +901,25 @@ pub(crate) enum OpenFileOutcome {
 
 /// Mounts a host file into the guest path namespace.
 
-/// Whether a **file** exists at the guest path (for CreateFile open dispositions).
+// Whether a **file** exists at the guest path (for CreateFile open dispositions).
 
-/// Handles `KERNEL32.dll!FileTimeToLocalFileTime`.
 
-/// Handles `KERNEL32.dll!FileTimeToSystemTime`.
 
-/// Handles `KERNEL32.dll!GetTimeZoneInformation`.
 
-/// Handles `KERNEL32.dll!GetFileTime`.
 
-/// Handles `KERNEL32.dll!SetFilePointer`.
 
-/// Handles `KERNEL32.dll!GetFileSize`.
 
-/// Handles dynamic `KERNEL32.dll!EncodePointer`.
 
-/// Handles dynamic `KERNEL32.dll!DecodePointer`.
 
-/// Handles dynamic `KERNEL32.dll!InitializeCriticalSectionAndSpinCount`.
 ///
 /// Microsoft Learn: returns nonzero on success; stores the spin count in the CS.
 
-/// Handles `KERNEL32.dll!ReadFile`.
 ///
 /// Microsoft Learn: valid on disk and console handles. Console stdin is served
 /// from `WinApiState::stdin_bytes` (host inject and/or live host line-fill when
 /// `stdin_mode` is `LiveHost`). Default console line input: a live fill blocks
 /// until `\n` or EOF. Success with 0 bytes means EOF.
 
-/// Handles `KERNEL32.dll!WriteFile`.
 ///
 /// Microsoft Learn: valid on disk and console handles. Stdout/stderr write to the
 /// host console; stdin is not writable.
@@ -1057,7 +974,6 @@ pub(crate) fn sync_open_bytes_to_virtual(state: &mut WinApiState, path: &str, ha
     });
 }
 
-/// Handles `KERNEL32.dll!GetCurrentDirectoryW`.
 ///
 /// Microsoft Learn return value:
 /// - success: number of characters written **excluding** the terminating NUL
@@ -1065,9 +981,7 @@ pub(crate) fn sync_open_bytes_to_virtual(state: &mut WinApiState, path: &str, ha
 /// - size query: `lpBuffer == NULL` and `nBufferLength == 0` → required size with NUL
 /// - failure: zero (not used for the insufficient-buffer case)
 
-/// Handles `KERNEL32.dll!SetCurrentDirectoryW`.
 
-/// Handles `KERNEL32.dll!GetCurrentProcess`.
 
 // ─── Soft console / process helpers for real CLI tools (7za) ────────────────
 
@@ -1409,45 +1323,28 @@ pub(crate) fn write_mock_string_w(
     Ok(u64::try_from(needed).unwrap_or(0))
 }
 
-/// Handles `KERNEL32.dll!IsDebuggerPresent` — return FALSE.
 
-/// Handles `KERNEL32.dll!DebugBreak` — emit a trace warning (no real break).
 
-/// Handles `KERNEL32.dll!OutputDebugStringA` — log and return.
 
-/// Handles `KERNEL32.dll!OutputDebugStringW` — log and return.
 
-/// Handles `KERNEL32.dll!SetErrorMode` — store and return previous mode.
 
-/// Handles `KERNEL32.dll!SetThreadErrorMode` — store new mode, return previous.
 
-/// Handles `KERNEL32.dll!GetCompressedFileSizeA` — return real uncompressed size via VFS.
 
-/// Handles `KERNEL32.dll!GetCompressedFileSizeW` — return real uncompressed size via VFS.
 
-/// Handles `KERNEL32.dll!GetVolumeInformationW` — real bottle volume info.
 
-/// Handles `KERNEL32.dll!GetVolumeInformationA` — real bottle volume info.
 
-/// Handles `KERNEL32.dll!LockFile` — validate file handle and return TRUE.
 
-/// Handles `KERNEL32.dll!UnlockFile` — validate file handle and return TRUE.
 
-/// Handles `KERNEL32.dll!SetFileValidData` — validate file handle and return TRUE.
 
-/// Handles `KERNEL32.dll!GetLongPathNameW` — return same as input.
 
-/// Handles `KERNEL32.dll!GetLongPathNameA` — return same as input.
 
-/// Handles `KERNEL32.dll!GetShortPathNameW` — return same as input.
 
-/// Handles `KERNEL32.dll!GetShortPathNameA` — return same as input.
 
 /// Friendly computer name (NetBIOS equivalent) — `scutil --get ComputerName` on macOS.
 
 /// DNS hostname (DnsHostname equivalent) — `hostname` on Unix.
 
-/// Resolve user name from environment.
+// Resolve user name from environment.
 
 /// Write a string into a guest buffer with size_ptr update.  Returns
 /// the handler result (TRUE on success, FALSE with last_error on failure).
@@ -1462,11 +1359,8 @@ pub(crate) fn write_mock_string_w(
 
 /// Common implementation for GetUserProfileDirectory(A/W).
 
-/// Handles `KERNEL32.dll!GetComputerNameW` — friendly name (NetBIOS equivalent).
 
-/// Handles `KERNEL32.dll!GetComputerNameA` — friendly name (NetBIOS equivalent).
 
-/// Handles `KERNEL32.dll!GetComputerNameExW` — returns appropriate name type.
 ///
 /// `NameType` parameter (RCX):
 /// - 0 (ComputerNameNetBIOS) → friendly name
@@ -1475,54 +1369,35 @@ pub(crate) fn write_mock_string_w(
 /// - 3 (ComputerNamePhysicalDnsHostname) → DNS hostname
 /// - 5 (ComputerNamePhysicalNetBIOS) → friendly name
 
-/// Handles `KERNEL32.dll!GetUserNameW` — return real user name.
 
-/// Handles `KERNEL32.dll!GetUserNameA` — return real user name.
 
-/// Handles `KERNEL32.dll!GetUserProfileDirectoryW` — return profile path from bottle/env.
 
-/// Handles `KERNEL32.dll!GetUserProfileDirectoryA` — return profile path from bottle/env.
 
-/// Handles `KERNEL32.dll!OpenThread` — look up a thread by TID and return a handle.
 
-/// Handles `KERNEL32.dll!QueryFullProcessImageNameW` — return main module path.
 
-/// Handles `KERNEL32.dll!QueryFullProcessImageNameA` — return main module path.
 
-/// Handles `KERNEL32.dll!CreateJobObjectW` — return handle tracked in sync state.
 
-/// Handles `KERNEL32.dll!CreateJobObjectA` — return handle tracked in sync state.
 
-/// Handles `KERNEL32.dll!AssignProcessToJobObject` — return TRUE (tracked in state).
 
-/// Handles `KERNEL32.dll!TerminateProcess` — signal process exit.
 
-/// Handles `KERNEL32.dll!TerminateThread` — signal thread exit.
 
-/// Handles `KERNEL32.dll!SuspendThread` — track suspend count.
 
-/// Handles `KERNEL32.dll!GetFileAttributesExW` — real extended attributes via VFS.
 
-/// Handles `KERNEL32.dll!GetFileAttributesExA` — real extended attributes via VFS.
 
-/// Handles `KERNEL32.dll!SignalObjectAndWait` — wait on the event then return.
 
-/// Handles `KERNEL32.dll!BackupRead` — read from open file bytes.
 
-/// Handles `KERNEL32.dll!BackupSeek` — seek within open file bytes.
 
-/// Handles `KERNEL32.dll!BackupWrite` — write to open file bytes.
 
-/// Handles `KERNEL32.dll!ReadFileScatter` — stub (synchronous, returns TRUE).
-/// Default worker stack size when `dwStackSize == 0`.
+// Handles `KERNEL32.dll!ReadFileScatter` — stub (synchronous, returns TRUE).
+// Default worker stack size when `dwStackSize == 0`.
 ///
-/// Matches the common Windows default commit size (1 MiB) rather than a tiny
+// Matches the common Windows default commit size (1 MiB) rather than a tiny
 /// micro-test stack — real PE tools (compressors, CRT workers) need room.
 const DEFAULT_WORKER_STACK: usize = 0x10_0000;
-/// Guest VA region for worker stacks (distinct from primary stack at 0x2000_0000).
+// Guest VA region for worker stacks (distinct from primary stack at 0x2000_0000).
 const WORKER_STACK_REGION_BASE: u64 = 0x0000_0000_2200_0000;
 const WORKER_STACK_STRIDE: u64 = 0x0000_0000_0020_0000;
-/// Windows x64 CALL/thread entry frame: 0x20 home space + 0x8 return address.
+// Windows x64 CALL/thread entry frame: 0x20 home space + 0x8 return address.
 const THREAD_ENTRY_HOME_AND_RET: usize = 0x28;
 
 const CREATE_SUSPENDED: u32 = 0x4;
@@ -1530,7 +1405,7 @@ const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
 const PAGE_READWRITE: u32 = 0x04;
 
-/// Default max guest worker threads (`CreateThread`), overridable by env.
+// Default max guest worker threads (`CreateThread`), overridable by env.
 const DEFAULT_MT_MAX_THREADS: u32 = 64;
 
 /// `WIE_MT=0` kills multi-thread spawn (ST-only). Unset / other = enabled.
@@ -1587,7 +1462,7 @@ const ERROR_TOO_MANY_POSTS: u32 = 298;
 
 /// `WaitForSingleObject` — thread, event, or semaphore (MT.2/3).
 
-/// Resolve a waitable handle to a detachable target (wait **outside** process locks).
+// Resolve a waitable handle to a detachable target (wait **outside** process locks).
 
 /// Clone the CS wait queue for parking **outside** process locks.
 
@@ -1636,36 +1511,25 @@ const ERROR_TOO_MANY_POSTS: u32 = 298;
 
 /// `VirtualQuery` — fill real `MEMORY_BASIC_INFORMATION` from PageMap / VAD.
 
-/// Handles `KERNEL32.dll!Sleep`.
 ///
 /// Idle policy (Phase 6 — see [`crate::idle`]):
-/// - `Sleep(0)` always yields the host thread (`yield_now`).
-/// - `Sleep(n>0)`: **no-op** under `WIE_IDLE=yield|busy` (micros); parks under
+// - `Sleep(0)` always yields the host thread (`yield_now`).
+// - `Sleep(n>0)`: **no-op** under `WIE_IDLE=yield|busy` (micros); parks under
 ///   `WIE_IDLE=park` or legacy `WIE_HOST_SLEEP=1` (capped by `WIE_IDLE_CAP_MS`).
 ///
 /// Not planted as an in-guest stub — side effects depend on host idle policy.
 
-/// Handles `KERNEL32.dll!LocalAlloc`.
 
-/// Handles `KERNEL32.dll!LocalFree`.
 
-/// Handles `KERNEL32.dll!GlobalAlloc`.
 
-/// Handles `KERNEL32.dll!GlobalFree`.
 
-/// Handles `KERNEL32.dll!GlobalLock`.
 
-/// Handles `KERNEL32.dll!GlobalUnlock`.
 
-/// Handles `KERNEL32.dll!GlobalSize`.
 
-/// Handles `KERNEL32.dll!MulDiv`.
 
-/// Handles `KERNEL32.dll!GlobalAddAtomA`.
 
-/// Handles `KERNEL32.dll!GlobalDeleteAtom`.
 
-/// Resolve a Windows path against the process current directory.
+// Resolve a Windows path against the process current directory.
 pub(crate) fn resolve_full_windows_path(current_directory: &str, input_path: &str) -> String {
     crate::vfs::resolve_full_windows_path(current_directory, input_path)
 }
@@ -1675,13 +1539,9 @@ pub(crate) fn normalize_windows_path_components(path: &str) -> String {
     crate::vfs::normalize_windows_path_components(path)
 }
 
-/// Handles `KERNEL32.dll!GetFullPathNameW`.
 
-/// Handles `KERNEL32.dll!GetFullPathNameA`.
 
-/// Handles `KERNEL32.dll!GetCurrentDirectoryA`.
 
-/// Handles `KERNEL32.dll!SetCurrentDirectoryA`.
 
 pub(crate) fn finish_create_directory(state: &mut WinApiState, path: &str) -> u64 {
     if path.is_empty() {
@@ -1710,9 +1570,7 @@ pub(crate) fn finish_create_directory(state: &mut WinApiState, path: &str) -> u6
     }
 }
 
-/// Handles `KERNEL32.dll!CreateDirectoryW`.
 
-/// Handles `KERNEL32.dll!CreateDirectoryA`.
 
 pub(crate) fn finish_delete_file(state: &mut WinApiState, path: &str) -> u64 {
     if path.is_empty() {
@@ -1740,9 +1598,7 @@ pub(crate) fn finish_delete_file(state: &mut WinApiState, path: &str) -> u64 {
     0
 }
 
-/// Handles `KERNEL32.dll!DeleteFileW`.
 
-/// Handles `KERNEL32.dll!DeleteFileA`.
 
 pub(crate) fn finish_remove_directory(state: &mut WinApiState, path: &str) -> u64 {
     if path.is_empty() {
@@ -1774,9 +1630,7 @@ pub(crate) fn finish_remove_directory(state: &mut WinApiState, path: &str) -> u6
     }
 }
 
-/// Handles `KERNEL32.dll!RemoveDirectoryW`.
 
-/// Handles `KERNEL32.dll!RemoveDirectoryA`.
 
 pub(crate) fn finish_move_file(state: &mut WinApiState, from: &str, to: &str) -> u64 {
     if from.is_empty() || to.is_empty() {
@@ -1810,15 +1664,10 @@ pub(crate) fn temp_name_id_u32(id: u64) -> u32 {
     u32::try_from(id & 0xffff_ffff).unwrap_or(0)
 }
 
-/// Handles `KERNEL32.dll!MoveFileW`.
 
-/// Handles `KERNEL32.dll!MoveFileA`.
 
-/// Handles `KERNEL32.dll!GetTempPathW`.
 
-/// Handles `KERNEL32.dll!GetTempPathA`.
 
-/// Handles `KERNEL32.dll!GetTempFileNameW` (unique name under path; creates 0-byte file).
 
 pub(crate) fn finish_create_file_create_only(state: &mut WinApiState, guest_path: &str) {
     let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
@@ -1833,21 +1682,13 @@ pub(crate) fn finish_create_file_create_only(state: &mut WinApiState, guest_path
     }
 }
 
-/// Handles `KERNEL32.dll!GetTempFileNameA`.
 
-/// Handles `KERNEL32.dll!GetDriveTypeW`.
 
-/// Handles `KERNEL32.dll!GetDriveTypeA`.
 
-/// Handles `KERNEL32.dll!GetLogicalDrives`.
 
-/// Handles `KERNEL32.dll!GetSystemDirectoryW`.
 
-/// Handles `KERNEL32.dll!GetSystemDirectoryA`.
 
-/// Handles `KERNEL32.dll!GetWindowsDirectoryW`.
 
-/// Handles `KERNEL32.dll!GetWindowsDirectoryA`.
 
 pub(crate) fn write_fixed_dir_w(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -1895,13 +1736,9 @@ pub(crate) fn write_fixed_dir_a(
     })
 }
 
-/// Handles `KERNEL32.dll!GetFileSizeEx`.
 
-/// Handles `KERNEL32.dll!SetFilePointerEx`.
 
-/// Handles `KERNEL32.dll!SetEndOfFile`.
 
-/// Handles `KERNEL32.dll!FlushFileBuffers`.
 
 #[cfg(test)]
 mod path_resolve_tests {

@@ -120,6 +120,7 @@ pub(crate) fn fake_system_metric(metric_index: u64) -> u64 {
         _ => 0,
     }
 }
+/// Handles `USER32.dll!GetSystemMetrics`.
 pub fn handle_get_system_metrics(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -138,6 +139,7 @@ pub fn handle_get_system_metrics(
         return_value,
     })
 }
+/// Handles dynamic `USER32.dll!MonitorFromWindow`.
 pub fn handle_monitor_from_window(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -158,6 +160,7 @@ pub fn handle_monitor_from_window(
         return_value: FAKE_MONITOR_HANDLE,
     })
 }
+/// Handles dynamic `USER32.dll!GetMonitorInfoA`.
 pub fn handle_get_monitor_info_a(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -186,6 +189,7 @@ pub fn handle_get_monitor_info_a(
         return_value,
     })
 }
+/// Handles dynamic `USER32.dll!GetMonitorInfoW`.
 pub fn handle_get_monitor_info_w(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -214,6 +218,7 @@ pub fn handle_get_monitor_info_w(
         return_value,
     })
 }
+/// Handles dynamic `USER32.dll!MonitorFromRect`.
 pub fn handle_monitor_from_rect(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -234,6 +239,7 @@ pub fn handle_monitor_from_rect(
         return_value: FAKE_MONITOR_HANDLE,
     })
 }
+/// Handles dynamic `USER32.dll!MonitorFromPoint`.
 pub fn handle_monitor_from_point(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -254,6 +260,7 @@ pub fn handle_monitor_from_point(
         return_value: FAKE_MONITOR_HANDLE,
     })
 }
+/// Handles dynamic `USER32.dll!EnumDisplayMonitors`.
 pub fn handle_enum_display_monitors(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -288,6 +295,7 @@ pub fn handle_enum_display_monitors(
         return_value: 1,
     })
 }
+/// Handles dynamic `USER32.dll!EnumDisplayDevicesA`.
 pub fn handle_enum_display_devices_a(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -365,6 +373,7 @@ pub fn handle_enum_display_devices_a(
         return_value,
     })
 }
+/// Handles dynamic `USER32.dll!EnumDisplayDevicesW`.
 pub fn handle_enum_display_devices_w(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -453,6 +462,7 @@ pub(crate) fn scale_system_metric_for_dpi(base_value: u64, dpi: u64) -> Result<u
         .context("GetSystemMetricsForDpi multiplication overflow")?;
     Ok(product.checked_div(96).unwrap_or(0))
 }
+/// Handles dynamic `USER32.dll!GetSystemMetricsForDpi`.
 pub fn handle_get_system_metrics_for_dpi(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {

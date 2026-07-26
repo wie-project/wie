@@ -49,6 +49,7 @@ pub(crate) fn write_critical_section_unlocked(
     )?;
     Ok(())
 }
+/// Handles `KERNEL32.dll!InitializeCriticalSection`.
 pub fn handle_initialize_critical_section(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -70,6 +71,7 @@ pub fn handle_initialize_critical_section(
         return_value: 0,
     })
 }
+/// Handles `KERNEL32.dll!EnterCriticalSection` (reentrant; blocks when needed).
 pub fn handle_enter_critical_section(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -99,6 +101,7 @@ pub fn handle_enter_critical_section(
         return_value: 0,
     })
 }
+/// Handles `KERNEL32.dll!LeaveCriticalSection`.
 pub fn handle_leave_critical_section(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -127,6 +130,7 @@ pub fn handle_leave_critical_section(
         return_value: 0,
     })
 }
+/// Handles `KERNEL32.dll!DeleteCriticalSection`.
 pub fn handle_delete_critical_section(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -372,6 +376,7 @@ pub fn handle_wait_for_multiple_objects(
     }
     .into())
 }
+/// Handles `KERNEL32.dll!SignalObjectAndWait` — wait on the event then return.
 pub fn handle_signal_object_and_wait(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,

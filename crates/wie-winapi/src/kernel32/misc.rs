@@ -12,6 +12,7 @@ pub(crate) fn packed_get_version() -> u64 {
     let packed = GUEST_OS_MAJOR | (GUEST_OS_MINOR << 8) | (GUEST_OS_BUILD << 16) | 0x8000_0000;
     u64::from(packed)
 }
+/// Handles `KERNEL32.dll!GetVersion` (legacy packed DWORD).
 pub fn handle_get_version(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let return_value = packed_get_version();
     let return_address = engine
@@ -22,6 +23,7 @@ pub fn handle_get_version(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiH
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GetVersionExA`.
 pub fn handle_get_version_ex_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let version_info_ptr = engine
         .read_rcx()
@@ -68,6 +70,7 @@ pub fn handle_get_version_ex_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<Wi
         return_value: 1,
     })
 }
+/// Handles `KERNEL32.dll!GetCommandLineA`.
 pub fn handle_get_command_line_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     command_line_ptr: u64,
@@ -81,6 +84,7 @@ pub fn handle_get_command_line_a(
         return_value: command_line_ptr,
     })
 }
+/// Handles `KERNEL32.dll!GetCommandLineW`.
 pub fn handle_get_command_line_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     command_line_ptr: u64,
@@ -94,6 +98,7 @@ pub fn handle_get_command_line_w(
         return_value: command_line_ptr,
     })
 }
+/// Handles `KERNEL32.dll!GetTickCount`.
 pub fn handle_get_tick_count(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let return_address = engine
         .return_from_win64_api(FIXED_TICK_COUNT)
@@ -104,6 +109,7 @@ pub fn handle_get_tick_count(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinA
         return_value: FIXED_TICK_COUNT,
     })
 }
+/// Handles `KERNEL32.dll!QueryPerformanceCounter`.
 pub fn handle_query_performance_counter(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -137,6 +143,7 @@ pub(crate) fn publish_fls_slot(
     let va = table.saturating_add(u64::from(index).saturating_mul(8));
     drop(engine.mem_write(va, &value.to_le_bytes()));
 }
+/// Handles `KERNEL32.dll!FlsAlloc`.
 pub fn handle_fls_alloc(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -167,6 +174,7 @@ pub fn handle_fls_alloc(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!FlsFree`.
 pub fn handle_fls_free(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -192,6 +200,7 @@ pub fn handle_fls_free(
         return_value: 1,
     })
 }
+/// Handles `KERNEL32.dll!FlsSetValue`.
 pub fn handle_fls_set_value(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -227,6 +236,7 @@ pub fn handle_fls_set_value(
         return_value: 1,
     })
 }
+/// Handles `KERNEL32.dll!FlsGetValue`.
 pub fn handle_fls_get_value(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -253,6 +263,7 @@ pub fn handle_fls_get_value(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!SetHandleCount`.
 pub fn handle_set_handle_count(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let handle_count = engine
         .read_rcx()
@@ -267,6 +278,7 @@ pub fn handle_set_handle_count(engine: &mut dyn wie_cpu::CpuEngine) -> Result<Wi
         return_value: handle_count,
     })
 }
+/// Handles `KERNEL32.dll!GetEnvironmentStringsW`.
 pub fn handle_get_environment_strings_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     environment_strings_w_ptr: u64,
@@ -280,6 +292,7 @@ pub fn handle_get_environment_strings_w(
         return_value: environment_strings_w_ptr,
     })
 }
+/// Handles `KERNEL32.dll!FreeEnvironmentStringsW`.
 pub fn handle_free_environment_strings_w(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -296,6 +309,7 @@ pub fn handle_free_environment_strings_w(
         return_value: 1,
     })
 }
+/// Handles `KERNEL32.dll!GetLastError`.
 pub fn handle_get_last_error(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -311,6 +325,7 @@ pub fn handle_get_last_error(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!SetLastError`.
 pub fn handle_set_last_error(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -333,6 +348,7 @@ pub fn handle_set_last_error(
         return_value: 0,
     })
 }
+/// Handles `KERNEL32.dll!SetUnhandledExceptionFilter`.
 pub fn handle_set_unhandled_exception_filter(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -349,6 +365,7 @@ pub fn handle_set_unhandled_exception_filter(
         return_value: 0,
     })
 }
+/// Handles `KERNEL32.dll!GetSystemDefaultLangID`.
 pub fn handle_get_system_default_lang_id(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -361,6 +378,7 @@ pub fn handle_get_system_default_lang_id(
         return_value: LANG_EN_US,
     })
 }
+/// Handles `KERNEL32.dll!GetUserDefaultLangID`.
 pub fn handle_get_user_default_lang_id(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -373,6 +391,7 @@ pub fn handle_get_user_default_lang_id(
         return_value: LANG_EN_US,
     })
 }
+/// Handles `KERNEL32.dll!GetLocalTime`.
 pub fn handle_get_local_time(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let system_time_ptr = engine
         .read_rcx()
@@ -418,6 +437,7 @@ pub fn handle_get_local_time(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinA
         return_value: 0,
     })
 }
+/// Handles `KERNEL32.dll!GetTimeZoneInformation`.
 pub fn handle_get_time_zone_information(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -487,6 +507,7 @@ pub fn handle_get_time_zone_information(
         return_value,
     })
 }
+/// Handles dynamic `KERNEL32.dll!EncodePointer`.
 pub fn handle_encode_pointer(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let pointer = engine
         .read_rcx()
@@ -501,6 +522,7 @@ pub fn handle_encode_pointer(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinA
         return_value: pointer,
     })
 }
+/// Handles dynamic `KERNEL32.dll!DecodePointer`.
 pub fn handle_decode_pointer(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let pointer = engine
         .read_rcx()
@@ -590,6 +612,7 @@ pub fn handle_format_message_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<Wi
     // Buffer args ignored; report 0 characters written.
     ret_u64(engine, 0, "FormatMessageW")
 }
+/// Handles `KERNEL32.dll!IsDebuggerPresent` — return FALSE.
 pub fn handle_is_debugger_present(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -599,6 +622,7 @@ pub fn handle_is_debugger_present(
         return_value: 0,
     })
 }
+/// Handles `KERNEL32.dll!DebugBreak` — emit a trace warning (no real break).
 pub fn handle_debug_break(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     tracing::warn!("DebugBreak called");
     let return_address = engine.return_from_win64_api(0)?;
@@ -607,6 +631,7 @@ pub fn handle_debug_break(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiH
         return_value: 0,
     })
 }
+/// Handles `KERNEL32.dll!OutputDebugStringA` — log and return.
 pub fn handle_output_debug_string_a(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -621,6 +646,7 @@ pub fn handle_output_debug_string_a(
         return_value: 1,
     })
 }
+/// Handles `KERNEL32.dll!OutputDebugStringW` — log and return.
 pub fn handle_output_debug_string_w(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -635,6 +661,7 @@ pub fn handle_output_debug_string_w(
         return_value: 1,
     })
 }
+/// Handles `KERNEL32.dll!SetErrorMode` — store and return previous mode.
 pub fn handle_set_error_mode(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -648,6 +675,7 @@ pub fn handle_set_error_mode(
         return_value: u64::from(prev),
     })
 }
+/// Handles `KERNEL32.dll!SetThreadErrorMode` — store new mode, return previous.
 pub fn handle_set_thread_error_mode(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -852,6 +880,7 @@ pub(crate) fn get_user_profile_dir_impl(
         return_value: 1,
     })
 }
+/// Handles `KERNEL32.dll!GetComputerNameW` — friendly name (NetBIOS equivalent).
 pub fn handle_get_computer_name_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -860,6 +889,7 @@ pub fn handle_get_computer_name_w(
     let size_ptr = engine.read_rdx()?;
     get_canonical_computer_name(engine, state, buf, size_ptr)
 }
+/// Handles `KERNEL32.dll!GetComputerNameA` — friendly name (NetBIOS equivalent).
 pub fn handle_get_computer_name_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -870,6 +900,7 @@ pub fn handle_get_computer_name_a(
     let r = get_canonical_computer_name(engine, state, buf, size_ptr)?;
     Ok(r)
 }
+/// Handles `KERNEL32.dll!GetComputerNameExW` — returns appropriate name type.
 pub fn handle_get_computer_name_ex_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -891,6 +922,7 @@ pub fn handle_get_computer_name_ex_w(
         }
     }
 }
+/// Handles `KERNEL32.dll!GetUserNameW` — return real user name.
 pub fn handle_get_user_name_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -899,6 +931,7 @@ pub fn handle_get_user_name_w(
     let size_ptr = engine.read_rdx()?;
     get_user_name_impl(engine, state, buf, size_ptr, true)
 }
+/// Handles `KERNEL32.dll!GetUserNameA` — return real user name.
 pub fn handle_get_user_name_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -907,6 +940,7 @@ pub fn handle_get_user_name_a(
     let size_ptr = engine.read_rdx()?;
     get_user_name_impl(engine, state, buf, size_ptr, false)
 }
+/// Handles `KERNEL32.dll!QueryFullProcessImageNameW` — return main module path.
 pub fn handle_query_full_process_image_name_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -944,6 +978,7 @@ pub fn handle_query_full_process_image_name_w(
         return_value: 1,
     })
 }
+/// Handles `KERNEL32.dll!QueryFullProcessImageNameA` — return main module path.
 pub fn handle_query_full_process_image_name_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -1159,6 +1194,7 @@ pub(crate) fn handle_tls_free(
         return_value: 1,
     })
 }
+/// Handles `KERNEL32.dll!Sleep`.
 pub fn handle_sleep(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let milliseconds = engine.read_rcx().context("failed to read RCX for Sleep")?;
     let low32 = milliseconds & u64::from(u32::MAX);
@@ -1184,6 +1220,7 @@ pub(crate) fn allocate_fake_heap_block(
 ) -> u64 {
     state.heap_state.heap.alloc_coherent(engine, size)
 }
+/// Handles `KERNEL32.dll!MulDiv`.
 pub fn handle_mul_div(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let number_raw = engine.read_rcx().context("failed to read RCX for MulDiv")?;
 

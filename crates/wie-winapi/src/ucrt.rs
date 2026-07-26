@@ -1,5 +1,19 @@
 //! Host-side UCRT / `api-ms-win-crt-*` API set for PE64 CRT-linked programs.
 //!
+//! The UCRT emulation handles printf/scanf-style format parsing, locale helpers,
+//! and ctype operations with intentional integer arithmetic, indexing, and casts.
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::integer_division,
+    clippy::cast_sign_loss,
+    clippy::items_after_statements,
+    clippy::cast_possible_wrap,
+    clippy::unnecessary_wraps
+)]
+//!
 //! Clean room: implement enough of the Universal CRT surface that a normal
 //! mingw/MSVC CRT startup + `main` can run. Not a port of Wine/ReactOS UCRT.
 //!
@@ -119,8 +133,7 @@ pub fn dispatch_ucrt(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiH
         "atol" => handle_atol(engine),
         "strtol" => handle_strtol(engine),
         "strtoul" => handle_strtoul(engine),
-        "strtod" => handle_strtod(engine),
-        "strtof" => handle_strtod(engine),
+        "strtod" | "strtof" => handle_strtod(engine),
         "fopen" => handle_fopen(engine, state),
         "fclose" => handle_fclose(engine, state),
         "fgets" => handle_fgets(engine, state),
@@ -550,7 +563,7 @@ fn handle_srand(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResu
 /// `rand()` → pseudo-random integer between 0 and RAND_MAX (0x7FFF).
 fn handle_rand(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let prev = CRT_RNG.load(std::sync::atomic::Ordering::Relaxed);
-    let next = prev.wrapping_mul(1103515245).wrapping_add(12345);
+    let next = prev.wrapping_mul(1_103_515_245).wrapping_add(12345);
     CRT_RNG.store(next, std::sync::atomic::Ordering::Relaxed);
     let val = (next >> 16) & 0x7FFF;
     ret(engine, u64::from(val))
@@ -1012,9 +1025,8 @@ fn handle_fopen(
 ) -> Result<WinApiHandlerResult> {
     let p = engine.read_rcx()?;
     let m = engine.read_rdx()?;
-    let _path = read_guest_str(engine, p, 1024).unwrap_or_default();
-    let _mode = read_guest_str(engine, m, 16).unwrap_or_default();
-    drop((_path, _mode));
+    drop(read_guest_str(engine, p, 1024).ok());
+    drop(read_guest_str(engine, m, 16).ok());
     ret(engine, 0) // NULL = not implemented yet (needs VFS-to-CRT bridge)
 }
 
@@ -1023,8 +1035,7 @@ fn handle_fclose(
     engine: &mut dyn wie_cpu::CpuEngine,
     _state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    let _stream = engine.read_rcx()?;
-    let _ = _stream;
+    engine.read_rcx()?;
     ret(engine, u64::from(u32::MAX)) // EOF = not implemented
 }
 

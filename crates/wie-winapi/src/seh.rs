@@ -1053,10 +1053,10 @@ fn resolve_landing_pad(
         if read_mem(cand.wrapping_add(4), &mut entry_buf).is_err() {
             continue;
         }
-        let try_low = u32::from_le_bytes(entry_buf[0..4].try_into().unwrap());
-        let try_high = u32::from_le_bytes(entry_buf[4..8].try_into().unwrap());
-        let filter = u32::from_le_bytes(entry_buf[8..12].try_into().unwrap());
-        let handler = u32::from_le_bytes(entry_buf[12..16].try_into().unwrap());
+        let try_low = u32::from_le_bytes(entry_buf[..4].try_into().unwrap_or([0u8; 4]));
+        let try_high = u32::from_le_bytes(entry_buf[4..8].try_into().unwrap_or([0u8; 4]));
+        let filter = u32::from_le_bytes(entry_buf[8..12].try_into().unwrap_or([0u8; 4]));
+        let handler = u32::from_le_bytes(entry_buf[12..16].try_into().unwrap_or([0u8; 4]));
         // Sanity check: try range should be within the function, filter should be 1 or a valid RVA
         if try_low >= try_high {
             continue;

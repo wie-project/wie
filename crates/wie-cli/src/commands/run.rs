@@ -14,7 +14,7 @@ fn is_interactive_stdin(path: &Path) -> bool {
     s == "/dev/stdin"
         || s == "/dev/tty"
         || s == "-"
-        || path.file_name().map_or(false, |n| n == "stdin")
+        || path.file_name().is_some_and(|n| n == "stdin")
 }
 /// Runs a freestanding / micro PE until `ExitProcess` and checks the exit code.
 pub(crate) fn run_micro(

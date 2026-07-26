@@ -47,6 +47,7 @@ pub(crate) fn write_host_console_handle(handle: u64, bytes: &[u8]) {
         offset = offset.saturating_add(usize::try_from(n).unwrap_or(0));
     }
 }
+/// Handles `KERNEL32.dll!GetFileType`.
 pub fn handle_get_file_type(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -70,6 +71,7 @@ pub fn handle_get_file_type(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GetFileAttributesA`.
 pub fn handle_get_file_attributes_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -97,6 +99,7 @@ pub fn handle_get_file_attributes_a(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GetFileAttributesW`.
 pub fn handle_get_file_attributes_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -124,6 +127,7 @@ pub fn handle_get_file_attributes_w(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!FindFirstFileW`.
 pub fn handle_find_first_file_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -148,6 +152,7 @@ pub fn handle_find_first_file_w(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!FindFirstFileA`.
 pub fn handle_find_first_file_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -172,6 +177,7 @@ pub fn handle_find_first_file_a(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!FindNextFileW`.
 pub fn handle_find_next_file_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -195,6 +201,7 @@ pub fn handle_find_next_file_w(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!FindNextFileA`.
 pub fn handle_find_next_file_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -218,6 +225,7 @@ pub fn handle_find_next_file_a(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!FindClose`.
 pub fn handle_find_close(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -240,6 +248,7 @@ pub fn handle_find_close(
         return_value: 1,
     })
 }
+/// Handles `KERNEL32.dll!CreateFileW`.
 pub fn handle_create_file_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -289,6 +298,7 @@ pub fn handle_create_file_w(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!CreateFileA`.
 pub fn handle_create_file_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -337,6 +347,7 @@ pub fn handle_create_file_a(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!CloseHandle`.
 pub fn handle_close_handle(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -379,6 +390,7 @@ pub fn handle_close_handle(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GetFileInformationByHandle`.
 pub fn handle_get_file_information_by_handle(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -880,6 +892,7 @@ pub(crate) fn guest_dir_exists(state: &WinApiState, path: &str) -> bool {
     let attrs = file_attributes_for_path(state, path);
     attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0
 }
+/// Handles `KERNEL32.dll!FileTimeToLocalFileTime`.
 pub fn handle_file_time_to_local_file_time(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -921,6 +934,7 @@ pub fn handle_file_time_to_local_file_time(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!FileTimeToSystemTime`.
 pub fn handle_file_time_to_system_time(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -981,6 +995,7 @@ pub fn handle_file_time_to_system_time(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GetFileTime`.
 pub fn handle_get_file_time(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -1032,6 +1047,7 @@ pub fn handle_get_file_time(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!SetFilePointer`.
 pub fn handle_set_file_pointer(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -1124,6 +1140,7 @@ pub fn handle_set_file_pointer(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GetFileSize`.
 pub fn handle_get_file_size(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -1166,6 +1183,7 @@ pub fn handle_get_file_size(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!ReadFile`.
 pub fn handle_read_file(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -1376,6 +1394,7 @@ pub fn handle_read_file(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!WriteFile`.
 pub fn handle_write_file(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -1569,6 +1588,7 @@ pub fn handle_write_file(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GetCurrentDirectoryW`.
 pub fn handle_get_current_directory_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -1625,6 +1645,7 @@ pub fn handle_get_current_directory_w(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!SetCurrentDirectoryW`.
 pub fn handle_set_current_directory_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -1882,6 +1903,7 @@ pub fn handle_device_io_control(
     state.process.last_error = 1;
     ret_u64(engine, 0, "DeviceIoControl")
 }
+/// Handles `KERNEL32.dll!GetCompressedFileSizeA` — return real uncompressed size via VFS.
 pub fn handle_get_compressed_file_size_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -1907,6 +1929,7 @@ pub fn handle_get_compressed_file_size_a(
         return_value: st.size,
     })
 }
+/// Handles `KERNEL32.dll!GetCompressedFileSizeW` — return real uncompressed size via VFS.
 pub fn handle_get_compressed_file_size_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -1932,6 +1955,7 @@ pub fn handle_get_compressed_file_size_w(
         return_value: st.size,
     })
 }
+/// Handles `KERNEL32.dll!GetVolumeInformationW` — real bottle volume info.
 pub fn handle_get_volume_information_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -1991,6 +2015,7 @@ pub fn handle_get_volume_information_w(
         return_value: 1,
     })
 }
+/// Handles `KERNEL32.dll!GetVolumeInformationA` — real bottle volume info.
 pub fn handle_get_volume_information_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2045,6 +2070,7 @@ pub fn handle_get_volume_information_a(
         return_value: 1,
     })
 }
+/// Handles `KERNEL32.dll!LockFile` — validate file handle and return TRUE.
 pub fn handle_lock_file(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2065,6 +2091,7 @@ pub fn handle_lock_file(
         return_value: 1,
     })
 }
+/// Handles `KERNEL32.dll!UnlockFile` — validate file handle and return TRUE.
 pub fn handle_unlock_file(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2085,6 +2112,7 @@ pub fn handle_unlock_file(
         return_value: 1,
     })
 }
+/// Handles `KERNEL32.dll!SetFileValidData` — validate file handle and return TRUE.
 pub fn handle_set_file_valid_data(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2105,6 +2133,7 @@ pub fn handle_set_file_valid_data(
         return_value: 1,
     })
 }
+/// Handles `KERNEL32.dll!GetLongPathNameW` — return same as input.
 pub fn handle_get_long_path_name_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2120,6 +2149,7 @@ pub fn handle_get_long_path_name_w(
         return_value: written,
     })
 }
+/// Handles `KERNEL32.dll!GetLongPathNameA` — return same as input.
 pub fn handle_get_long_path_name_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2135,6 +2165,7 @@ pub fn handle_get_long_path_name_a(
         return_value: written,
     })
 }
+/// Handles `KERNEL32.dll!GetShortPathNameW` — return same as input.
 pub fn handle_get_short_path_name_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2150,6 +2181,7 @@ pub fn handle_get_short_path_name_w(
         return_value: written,
     })
 }
+/// Handles `KERNEL32.dll!GetShortPathNameA` — return same as input.
 pub fn handle_get_short_path_name_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2165,6 +2197,7 @@ pub fn handle_get_short_path_name_a(
         return_value: written,
     })
 }
+/// Handles `KERNEL32.dll!GetUserProfileDirectoryW` — return profile path from bottle/env.
 pub fn handle_get_user_profile_directory_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2174,6 +2207,7 @@ pub fn handle_get_user_profile_directory_w(
     let size_ptr = engine.read_r8()?;
     get_user_profile_dir_impl(engine, state, buf, size_ptr, true)
 }
+/// Handles `KERNEL32.dll!GetUserProfileDirectoryA` — return profile path from bottle/env.
 pub fn handle_get_user_profile_directory_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2183,6 +2217,7 @@ pub fn handle_get_user_profile_directory_a(
     let size_ptr = engine.read_r8()?;
     get_user_profile_dir_impl(engine, state, buf, size_ptr, false)
 }
+/// Handles `KERNEL32.dll!GetFileAttributesExW` — real extended attributes via VFS.
 pub fn handle_get_file_attributes_ex_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2241,6 +2276,7 @@ pub fn handle_get_file_attributes_ex_w(
         return_value: 1,
     })
 }
+/// Handles `KERNEL32.dll!GetFileAttributesExA` — real extended attributes via VFS.
 pub fn handle_get_file_attributes_ex_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2299,6 +2335,7 @@ pub fn handle_get_file_attributes_ex_a(
         return_value: 1,
     })
 }
+/// Handles `KERNEL32.dll!BackupRead` — read from open file bytes.
 pub fn handle_backup_read(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2354,6 +2391,7 @@ pub fn handle_backup_read(
         })
     }
 }
+/// Handles `KERNEL32.dll!BackupSeek` — seek within open file bytes.
 pub fn handle_backup_seek(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2389,6 +2427,7 @@ pub fn handle_backup_seek(
         })
     }
 }
+/// Handles `KERNEL32.dll!BackupWrite` — write to open file bytes.
 pub fn handle_backup_write(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2543,6 +2582,7 @@ pub(crate) fn handle_duplicate_handle(
         return_value: 1,
     })
 }
+/// Handles `KERNEL32.dll!GetFullPathNameW`.
 pub fn handle_get_full_path_name_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2646,6 +2686,7 @@ pub fn handle_get_full_path_name_w(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GetFullPathNameA`.
 pub fn handle_get_full_path_name_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2698,6 +2739,7 @@ pub fn handle_get_full_path_name_a(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GetCurrentDirectoryA`.
 pub fn handle_get_current_directory_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -2723,6 +2765,7 @@ pub fn handle_get_current_directory_a(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!SetCurrentDirectoryA`.
 pub fn handle_set_current_directory_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2756,6 +2799,7 @@ pub fn handle_set_current_directory_a(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!CreateDirectoryW`.
 pub fn handle_create_directory_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2773,6 +2817,7 @@ pub fn handle_create_directory_w(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!CreateDirectoryA`.
 pub fn handle_create_directory_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2790,6 +2835,7 @@ pub fn handle_create_directory_a(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!DeleteFileW`.
 pub fn handle_delete_file_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2807,6 +2853,7 @@ pub fn handle_delete_file_w(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!DeleteFileA`.
 pub fn handle_delete_file_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2824,6 +2871,7 @@ pub fn handle_delete_file_a(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!RemoveDirectoryW`.
 pub fn handle_remove_directory_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2841,6 +2889,7 @@ pub fn handle_remove_directory_w(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!RemoveDirectoryA`.
 pub fn handle_remove_directory_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2858,6 +2907,7 @@ pub fn handle_remove_directory_a(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!MoveFileW`.
 pub fn handle_move_file_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2881,6 +2931,7 @@ pub fn handle_move_file_w(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!MoveFileA`.
 pub fn handle_move_file_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2904,6 +2955,7 @@ pub fn handle_move_file_a(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GetTempPathW`.
 pub fn handle_get_temp_path_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2929,6 +2981,7 @@ pub fn handle_get_temp_path_w(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GetTempPathA`.
 pub fn handle_get_temp_path_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2953,6 +3006,7 @@ pub fn handle_get_temp_path_a(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GetTempFileNameW` (unique name under path; creates 0-byte file).
 pub fn handle_get_temp_file_name_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2999,6 +3053,7 @@ pub fn handle_get_temp_file_name_w(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GetTempFileNameA`.
 pub fn handle_get_temp_file_name_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -3045,6 +3100,7 @@ pub fn handle_get_temp_file_name_a(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GetDriveTypeW`.
 pub fn handle_get_drive_type_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -3062,6 +3118,7 @@ pub fn handle_get_drive_type_w(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GetDriveTypeA`.
 pub fn handle_get_drive_type_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -3079,6 +3136,7 @@ pub fn handle_get_drive_type_a(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GetLogicalDrives`.
 pub fn handle_get_logical_drives(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -3090,26 +3148,31 @@ pub fn handle_get_logical_drives(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!GetSystemDirectoryW`.
 pub fn handle_get_system_directory_w(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
     write_fixed_dir_w(engine, crate::vfs::GUEST_SYSTEM_DIR)
 }
+/// Handles `KERNEL32.dll!GetSystemDirectoryA`.
 pub fn handle_get_system_directory_a(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
     write_fixed_dir_a(engine, crate::vfs::GUEST_SYSTEM_DIR)
 }
+/// Handles `KERNEL32.dll!GetWindowsDirectoryW`.
 pub fn handle_get_windows_directory_w(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
     write_fixed_dir_w(engine, crate::vfs::GUEST_WINDOWS_DIR)
 }
+/// Handles `KERNEL32.dll!GetWindowsDirectoryA`.
 pub fn handle_get_windows_directory_a(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
     write_fixed_dir_a(engine, crate::vfs::GUEST_WINDOWS_DIR)
 }
+/// Handles `KERNEL32.dll!GetFileSizeEx`.
 pub fn handle_get_file_size_ex(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -3132,6 +3195,7 @@ pub fn handle_get_file_size_ex(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!SetFilePointerEx`.
 pub fn handle_set_file_pointer_ex(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -3182,6 +3246,7 @@ pub fn handle_set_file_pointer_ex(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!SetEndOfFile`.
 pub fn handle_set_end_of_file(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -3216,6 +3281,7 @@ pub fn handle_set_end_of_file(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!FlushFileBuffers`.
 pub fn handle_flush_file_buffers(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,

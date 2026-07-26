@@ -7,6 +7,7 @@ use super::{
     read_create_file_stack_u32, read_guest_u64, write_guest_u16, write_guest_u32, write_guest_u64,
 };
 
+/// Handles `KERNEL32.dll!GetStartupInfoA`.
 pub fn handle_get_startup_info_a(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -34,6 +35,7 @@ pub fn handle_get_startup_info_a(
         return_value: 0,
     })
 }
+/// Handles `KERNEL32.dll!GetProcessHeap`.
 pub fn handle_get_process_heap(
     engine: &mut dyn wie_cpu::CpuEngine,
     process_heap_handle: u64,
@@ -47,6 +49,7 @@ pub fn handle_get_process_heap(
         return_value: process_heap_handle,
     })
 }
+/// Handles `KERNEL32.dll!GetSystemTimeAsFileTime`.
 pub fn handle_get_system_time_as_file_time(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -76,6 +79,7 @@ pub fn handle_get_system_time_as_file_time(
         return_value: 0,
     })
 }
+/// Handles `KERNEL32.dll!GetCurrentProcessId`.
 pub fn handle_get_current_process_id(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -88,6 +92,7 @@ pub fn handle_get_current_process_id(
         return_value: FAKE_CURRENT_PROCESS_ID,
     })
 }
+/// Handles `KERNEL32.dll!GetCurrentThreadId`.
 pub fn handle_get_current_thread_id(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -102,6 +107,7 @@ pub fn handle_get_current_thread_id(
         return_value: tid,
     })
 }
+/// Handles `KERNEL32.dll!GetCurrentProcess`.
 pub fn handle_get_current_process(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -224,6 +230,7 @@ pub fn handle_resume_thread(
     // `(DWORD)-1`
     ret_u64(engine, u64::from(u32::MAX), "ResumeThread")
 }
+/// Handles `KERNEL32.dll!OpenThread` — look up a thread by TID and return a handle.
 pub fn handle_open_thread(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -262,6 +269,7 @@ pub fn handle_open_thread(
         return_value: handle,
     })
 }
+/// Handles `KERNEL32.dll!CreateJobObjectW` — return handle tracked in sync state.
 pub fn handle_create_job_object_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -277,6 +285,7 @@ pub fn handle_create_job_object_w(
         return_value: handle,
     })
 }
+/// Handles `KERNEL32.dll!CreateJobObjectA` — return handle tracked in sync state.
 pub fn handle_create_job_object_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -292,6 +301,7 @@ pub fn handle_create_job_object_a(
         return_value: handle,
     })
 }
+/// Handles `KERNEL32.dll!AssignProcessToJobObject` — return TRUE (tracked in state).
 pub fn handle_assign_process_to_job_object(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -305,6 +315,7 @@ pub fn handle_assign_process_to_job_object(
         return_value: 1,
     })
 }
+/// Handles `KERNEL32.dll!TerminateProcess` — signal process exit.
 pub fn handle_terminate_process(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -319,6 +330,7 @@ pub fn handle_terminate_process(
         return_value: 1,
     })
 }
+/// Handles `KERNEL32.dll!TerminateThread` — signal thread exit.
 pub fn handle_terminate_thread(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -343,6 +355,7 @@ pub fn handle_terminate_thread(
         return_value: 0,
     })
 }
+/// Handles `KERNEL32.dll!SuspendThread` — track suspend count.
 pub fn handle_suspend_thread(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,

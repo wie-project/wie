@@ -1,5 +1,7 @@
 //! WinAPI dispatcher model for WIE (generic PE64 userspace).
 
+#![allow(clippy::type_complexity)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -125,11 +127,12 @@ pub struct FileIoState {
 ///
 /// Wraps a closure behind `Arc<Mutex<…>>` so [`ModuleState`] can derive
 /// `Clone` and `Debug` without losing the closure's captured state.
+type ImportResolverInner =
+    std::sync::Arc<std::sync::Mutex<Box<dyn FnMut(&str, &str, u64) -> anyhow::Result<u64> + Send>>>;
+
 #[derive(Clone)]
 pub struct ImportResolver {
-    inner: std::sync::Arc<
-        std::sync::Mutex<Box<dyn FnMut(&str, &str, u64) -> anyhow::Result<u64> + Send>>,
-    >,
+    inner: ImportResolverInner,
 }
 
 impl std::fmt::Debug for ImportResolver {
@@ -147,7 +150,9 @@ impl ImportResolver {
 
     pub fn resolve(&mut self, lib: &str, name: &str, slot: u64) -> anyhow::Result<u64> {
         // unwrap: the Mutex is not poisoned in practice (single-threaded use).
-        self.inner.lock().unwrap()(lib, name, slot)
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())(lib, name, slot)
     }
 }
 

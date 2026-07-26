@@ -2157,6 +2157,7 @@ impl WinApiTraits {
 }
 
 /// Per-API trait flags indexed by [`WinApiId`] discriminant (zero-cost lookup).
+#[allow(clippy::indexing_slicing, clippy::as_conversions)]
 static WINAPI_TRAITS: [WinApiTraits; WINAPI_ID_COUNT] = {
     let mut t = [WinApiTraits::EMPTY; WINAPI_ID_COUNT];
 
@@ -2209,6 +2210,7 @@ static WINAPI_TRAITS: [WinApiTraits; WINAPI_ID_COUNT] = {
 impl WinApiId {
     /// Lookup the trait flags for this API (constant-time array access).
     #[must_use]
+    #[allow(clippy::indexing_slicing, clippy::as_conversions)]
     pub fn traits(self) -> WinApiTraits {
         WINAPI_TRAITS[self as u16 as usize]
     }
