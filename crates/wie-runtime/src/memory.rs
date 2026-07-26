@@ -288,6 +288,7 @@ pub(crate) fn default_winapi_state(
             stdin_mode: wie_winapi::GuestStdinMode::InjectOnly,
             ucrt_files: std::collections::HashMap::new(),
             ucrt_next_file_va: 0x0000_0000_6900_0000,
+            cached_streams: std::collections::HashMap::new(),
         },
         window_state: wie_winapi::WindowState {
             window_long_ptr_values: Vec::new(),

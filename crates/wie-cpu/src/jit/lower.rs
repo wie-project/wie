@@ -19,10 +19,17 @@ use crate::mem::{GuestMemory, PAGE_SIZE};
 use crate::regs::{RegFile, rflags};
 use cranelift::codegen::ir::{BlockArg, FuncRef, SigRef, UserFuncName};
 use cranelift::prelude::*;
-use cranelift_codegen::ir::MemFlagsData;
+use cranelift_codegen::ir::{AliasRegionData, MemFlagsData};
 use cranelift_module::{FuncId, Linkage, Module};
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
+use std::borrow::Cow;
 use std::collections::HashMap;
+
+/// User-id for the "guest_data" alias region we install on every compiled function.
+///
+/// Stable so `AliasRegionSet::insert` deduplicates within a function; per-function
+/// scope is enough because we do not enable Cranelift inlining.
+const GUEST_DATA_REGION_USER_ID: u32 = 1;
 
 /// Set-associative TLB: number of sets (power of two). `SETS × WAYS` total entries.
 pub(super) const TLB_SETS: usize = 16;
@@ -1245,6 +1252,14 @@ pub(super) fn compile_block(
 
         let ctx_ptr = bcx.block_params(entry)[0];
         let flags = MemFlagsData::trusted();
+        // Guest data accesses (through pin bias / sticky ptr / super stack /
+        // host_span I8X16) go through a distinct alias region so Cranelift's
+        // alias analysis can hoist JitCtx sticky/pin metadata loads across them.
+        let guest_data_region = bcx.func.dfg.alias_regions.insert(AliasRegionData {
+            user_id: GUEST_DATA_REGION_USER_ID,
+            description: Cow::Borrowed("guest_data"),
+        });
+        let guest_flags = flags.with_alias_region(Some(guest_data_region));
 
         // Exit: gpr[16] + rflags as block params → store and return.
         // XMM is write-through to JitCtx (correct on mid-block mem faults).
@@ -1484,6 +1499,7 @@ pub(super) fn compile_block(
                     f32_ref,
                     f64_ref,
                     flags,
+                    guest_flags,
                     exit,
                     ucrt_refs,
                     // Super path: no per-access probes. Normal: hoisted pins.
@@ -1604,6 +1620,7 @@ pub(super) fn compile_block(
                 f32_ref,
                 f64_ref,
                 flags,
+                guest_flags,
                 exit,
                 ucrt_refs,
                 stack_pin,
@@ -2226,7 +2243,13 @@ struct MemEnv {
     host_span_ref: Option<cranelift::codegen::ir::FuncRef>,
     f32_ref: Option<cranelift::codegen::ir::FuncRef>,
     f64_ref: Option<cranelift::codegen::ir::FuncRef>,
+    /// Flags for JitCtx accesses (gpr slots, rflags, TLB/sticky/pin state, fault, etc.).
     flags: MemFlagsData,
+    /// Flags for soft-translated guest memory accesses through pin bias / sticky ptr
+    /// / super stack / host_span. Tagged with a distinct `AliasRegion` so JitCtx
+    /// stores do not alias-clobber guest loads (and vice-versa), unblocking LICM/CSE
+    /// on sticky metadata inside memop-dense loops.
+    guest_flags: MemFlagsData,
     exit: Block,
     ucrt_refs: [Option<FuncRef>; 7],
     /// Stack region pin (slot 0), hoisted at block entry when inline mem is on.
@@ -2336,17 +2359,12 @@ fn load_xmm_pair(
     loaded[idx] = true;
 }
 
-/// Mark XMMi dirty in `JitCtx.xmm_dirty_bits` (for selective host writeback).
-fn mark_xmm_dirty_ir(bcx: &mut FunctionBuilder<'_>, mem: &MemEnv, idx: usize) {
-    if idx >= 16 {
-        return;
-    }
-    let p = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_XMM_DIRTY));
-    let old = bcx.ins().load(types::I64, mem.flags, p, 0);
-    let bit = iconst_u64(bcx, 1_u64 << idx);
-    let new = bcx.ins().bor(old, bit);
-    bcx.ins().store(mem.flags, new, p, 0);
-}
+// `mark_xmm_dirty_ir` used to emit a `load / or / store` on `JitCtx.xmm_dirty_bits`
+// per XMM def. Removed: `CompiledBlock::xmm_may_def_mask` is a static superset of
+// what those RMWs computed, and the host exit path now always ORs `xmm_dirty_bits`
+// with `xmm_may_def_mask`, so trampolines still contribute their dynamic dirty bits.
+// Skipping the per-def RMW eliminates a JitCtx aliasing edge that was blocking
+// Cranelift LICM/CSE on sticky/pin metadata inside SSE-heavy loop bodies.
 
 fn pair_to_i8x16(
     bcx: &mut FunctionBuilder<'_>,
@@ -2406,7 +2424,8 @@ fn store_xmm_pair(
         bcx.ins().store(mem.flags, lo, p, 0);
         bcx.ins().store(mem.flags, hi, phi, 0);
     }
-    mark_xmm_dirty_ir(bcx, mem, idx);
+    // No `xmm_dirty_bits` RMW: `xmm_may_def_mask` (computed statically at compile)
+    // covers this def, and the host exit path ORs both masks unconditionally.
 }
 
 fn xmm_index(reg: Register) -> Result<usize, String> {
@@ -3761,9 +3780,9 @@ fn emit_inline_copy_chunks(
             pat
         } else {
             let sp = bcx.ins().iadd(src_host, off);
-            bcx.ins().load(types::I8X16, mem.flags, sp, 0)
+            bcx.ins().load(types::I8X16, mem.guest_flags, sp, 0)
         };
-        bcx.ins().store(mem.flags, v, dp, 0);
+        bcx.ins().store(mem.guest_flags, v, dp, 0);
         bcx.ins().jump(next_chunk, &[]);
         bcx.switch_to_block(next_chunk);
         bcx.seal_block(next_chunk);
@@ -4797,9 +4816,15 @@ fn hoisted_pin_probe(
 }
 
 /// Zero-extend a loaded integer of `size` bytes to i64.
-fn load_guest_bytes(bcx: &mut FunctionBuilder<'_>, host: Value, size: u32) -> Value {
-    // Sticky TLB guarantees a mapped host page; trust the pointer.
-    let flags = MemFlagsData::trusted();
+///
+/// `flags` should be the caller's guest-data alias-tagged flags (`mem.guest_flags`)
+/// so this load doesn't alias JitCtx metadata for Cranelift's alias analysis.
+fn load_guest_bytes(
+    bcx: &mut FunctionBuilder<'_>,
+    flags: MemFlagsData,
+    host: Value,
+    size: u32,
+) -> Value {
     match size {
         1 => {
             let v = bcx.ins().load(types::I8, flags, host, 0);
@@ -4817,8 +4842,13 @@ fn load_guest_bytes(bcx: &mut FunctionBuilder<'_>, host: Value, size: u32) -> Va
     }
 }
 
-fn store_guest_bytes(bcx: &mut FunctionBuilder<'_>, host: Value, size: u32, value: Value) {
-    let flags = MemFlagsData::trusted();
+fn store_guest_bytes(
+    bcx: &mut FunctionBuilder<'_>,
+    flags: MemFlagsData,
+    host: Value,
+    size: u32,
+    value: Value,
+) {
     match size {
         1 => {
             let v = bcx.ins().ireduce(types::I8, value);
@@ -4859,7 +4889,7 @@ fn call_load(
     // range sits in the stack pin — emit a bare host load (no bounds IR).
     if let Some(super_s) = mem.super_stack {
         let host = bcx.ins().iadd(super_s.bias, addr);
-        return Ok(load_guest_bytes(bcx, host, size));
+        return Ok(load_guest_bytes(bcx, mem.guest_flags, host, size));
     }
 
     // CFG-ordered probes (not `select`).
@@ -4876,7 +4906,7 @@ fn call_load(
         bcx.ins().brif(ok, hit, &[], miss, &[]);
         bcx.switch_to_block(hit);
         bcx.seal_block(hit);
-        let v = load_guest_bytes(bcx, host, size);
+        let v = load_guest_bytes(bcx, mem.guest_flags, host, size);
         bcx.ins().jump(merge, &[BlockArg::Value(v)]);
         bcx.switch_to_block(miss);
         bcx.seal_block(miss);
@@ -4889,7 +4919,7 @@ fn call_load(
         bcx.ins().brif(ok, hit, &[], miss, &[]);
         bcx.switch_to_block(hit);
         bcx.seal_block(hit);
-        let v = load_guest_bytes(bcx, host, size);
+        let v = load_guest_bytes(bcx, mem.guest_flags, host, size);
         bcx.ins().jump(merge, &[BlockArg::Value(v)]);
         bcx.switch_to_block(miss);
         bcx.seal_block(miss);
@@ -4902,7 +4932,7 @@ fn call_load(
         bcx.ins().brif(ok, hit, &[], miss, &[]);
         bcx.switch_to_block(hit);
         bcx.seal_block(hit);
-        let v = load_guest_bytes(bcx, host, size);
+        let v = load_guest_bytes(bcx, mem.guest_flags, host, size);
         bcx.ins().jump(merge, &[BlockArg::Value(v)]);
         bcx.switch_to_block(miss);
         bcx.seal_block(miss);
@@ -4960,7 +4990,7 @@ fn call_store(
     // Block-wide super-fast path (see `call_load`).
     if let Some(super_s) = mem.super_stack {
         let host = bcx.ins().iadd(super_s.bias, addr);
-        store_guest_bytes(bcx, host, size, value);
+        store_guest_bytes(bcx, mem.guest_flags, host, size, value);
         return Ok(());
     }
 
@@ -4974,7 +5004,7 @@ fn call_store(
         bcx.ins().brif(ok, hit, &[], miss, &[]);
         bcx.switch_to_block(hit);
         bcx.seal_block(hit);
-        store_guest_bytes(bcx, host, size, value);
+        store_guest_bytes(bcx, mem.guest_flags, host, size, value);
         bcx.ins().jump(merge, &[]);
         bcx.switch_to_block(miss);
         bcx.seal_block(miss);
@@ -4987,7 +5017,7 @@ fn call_store(
         bcx.ins().brif(ok, hit, &[], miss, &[]);
         bcx.switch_to_block(hit);
         bcx.seal_block(hit);
-        store_guest_bytes(bcx, host, size, value);
+        store_guest_bytes(bcx, mem.guest_flags, host, size, value);
         bcx.ins().jump(merge, &[]);
         bcx.switch_to_block(miss);
         bcx.seal_block(miss);
@@ -5000,7 +5030,7 @@ fn call_store(
         bcx.ins().brif(ok, hit, &[], miss, &[]);
         bcx.switch_to_block(hit);
         bcx.seal_block(hit);
-        store_guest_bytes(bcx, host, size, value);
+        store_guest_bytes(bcx, mem.guest_flags, host, size, value);
         bcx.ins().jump(merge, &[]);
         bcx.switch_to_block(miss);
         bcx.seal_block(miss);

@@ -42,10 +42,48 @@ const ARGC_SLOT: u64 = CRT_GUEST_BASE + 0x310;
 const COMMODE_SLOT: u64 = CRT_GUEST_BASE + 0x318;
 const FMODE_SLOT: u64 = CRT_GUEST_BASE + 0x320;
 
+/// Return an ASCII-lowercased view of `name` without allocating when possible.
+///
+/// The vast majority of UCRT / msvcrt exports arrive already lowercase from PE
+/// import tables. Detecting that lets dispatch skip a per-call `String` alloc.
+/// Names that do contain uppercase are lowered into `scratch` (stack buffer);
+/// names longer than the scratch buffer fall back to a heap allocation returned
+/// via the `owned` out-parameter.
+///
+/// Returns a `&str` borrowing from either `name`, `scratch`, or `*owned`.
+#[inline]
+fn ascii_lower<'a>(name: &'a str, scratch: &'a mut [u8], owned: &'a mut Option<String>) -> &'a str {
+    let bytes = name.as_bytes();
+    if bytes.iter().all(|b| !b.is_ascii_uppercase()) {
+        return name;
+    }
+    if let Some(dst) = scratch.get_mut(..bytes.len()) {
+        for (d, &b) in dst.iter_mut().zip(bytes.iter()) {
+            *d = b.to_ascii_lowercase();
+        }
+        // SAFETY: dst is a byte-wise lowercase of a valid UTF-8 &str; ASCII
+        // lowering preserves UTF-8 validity (only touches bytes < 0x80).
+        #[allow(unsafe_code)]
+        return unsafe { std::str::from_utf8_unchecked(dst) };
+    }
+    // Very long export name (>SCRATCH) — fall back to a heap-owned lowercase.
+    *owned = Some(name.to_ascii_lowercase());
+    owned.as_deref().unwrap_or(name)
+}
+
+/// Stack buffer size for ASCII-lower of dispatch names.
+///
+/// UCRT / msvcrt export names top out around ~30 bytes; the longest MSVC C++
+/// mangled name we currently match is `??1type_info@@ueaa@xz` (21 bytes).
+/// 96 gives comfortable headroom without cache-line waste.
+const ASCII_LOWER_SCRATCH: usize = 96;
+
 /// Whether `library` is a UCRT API-set or `ucrtbase`.
 #[must_use]
 pub fn is_ucrt_library(library: &str) -> bool {
-    let l = library.to_ascii_lowercase();
+    let mut scratch = [0_u8; ASCII_LOWER_SCRATCH];
+    let mut owned: Option<String> = None;
+    let l = ascii_lower(library, &mut scratch, &mut owned);
     l.starts_with("api-ms-win-crt-") || l == "ucrtbase.dll" || l == "msvcrt.dll"
 }
 
@@ -55,7 +93,10 @@ pub fn is_ucrt_library(library: &str) -> bool {
 /// guest code can `mov` through it. Returns `None` for ordinary function exports.
 #[must_use]
 pub fn crt_data_import_va(name: &str) -> Option<u64> {
-    match name.to_ascii_lowercase().as_str() {
+    let mut scratch = [0_u8; ASCII_LOWER_SCRATCH];
+    let mut owned: Option<String> = None;
+    let n = ascii_lower(name, &mut scratch, &mut owned);
+    match n {
         "_fmode" => Some(FMODE_SLOT),
         "_commode" => Some(COMMODE_SLOT),
         "_acmdln" => Some(ACMDLN_PTR_SLOT),
@@ -72,8 +113,10 @@ pub fn dispatch_ucrt(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiH
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let environment = ctx.environment;
-    let n = name.to_ascii_lowercase();
-    match n.as_str() {
+    let mut scratch = [0_u8; ASCII_LOWER_SCRATCH];
+    let mut owned: Option<String> = None;
+    let n = ascii_lower(name, &mut scratch, &mut owned);
+    match n {
         "__acrt_iob_func" => handle_acrt_iob_func(engine),
         "fwrite" => handle_fwrite(engine),
         "fflush" => handle_fflush(engine),
@@ -670,11 +713,35 @@ fn handle_memcpy(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
     let src = engine.read_rdx()?;
     let n = engine.read_r8()?;
     let n_usize = usize::try_from(n).unwrap_or(0);
-    if n_usize > 0 && dest != 0 && src != 0 {
-        let mut buf = vec![0_u8; n_usize];
-        engine.mem_read(src, &mut buf)?;
-        engine.mem_write(dest, &buf)?;
+    if n_usize == 0 || dest == 0 || src == 0 {
+        return ret(engine, dest);
     }
+    // Fast path: both src and dst live in single host-contiguous arenas.
+    // Two host_span acquisitions + one raw copy, no host `Vec` bounce.
+    if let (Some(src_host), Some(dst_host)) = (
+        engine.host_span(src, n_usize, false),
+        engine.host_span(dest, n_usize, true),
+    ) {
+        // Non-overlap check: guest memcpy is memcpy semantics (undefined on
+        // overlap in C99, but callers may pass identical destinations to
+        // memmove — fall back to Vec bounce if the raw host ranges overlap).
+        let src_end = src_host.wrapping_add(n_usize);
+        let dst_end = dst_host.wrapping_add(n_usize);
+        let overlap = src_host < dst_end && dst_host < src_end;
+        if !overlap {
+            // SAFETY: both spans validated by host_span for R/W respectively;
+            // engine borrow is exclusive so no concurrent guest write can occur.
+            #[allow(unsafe_code)]
+            unsafe {
+                std::ptr::copy_nonoverlapping(src_host, dst_host, n_usize);
+            }
+            return ret(engine, dest);
+        }
+    }
+    // Fallback: cross-arena, SPC denied, or overlapping host ranges.
+    let mut buf = vec![0_u8; n_usize];
+    engine.mem_read(src, &mut buf)?;
+    engine.mem_write(dest, &buf)?;
     ret(engine, dest)
 }
 
@@ -685,6 +752,28 @@ fn handle_memcmp(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
     let n_usize = usize::try_from(n).unwrap_or(0);
     if n_usize == 0 || a == 0 || b == 0 {
         return ret(engine, 0);
+    }
+    // Fast path: both spans in host-contiguous arenas → direct slice compare.
+    if let (Some(pa), Some(pb)) = (
+        engine.host_span(a, n_usize, false),
+        engine.host_span(b, n_usize, false),
+    ) {
+        // SAFETY: both spans validated for read; engine borrow is exclusive.
+        #[allow(unsafe_code)]
+        let (sa, sb) = unsafe {
+            (
+                std::slice::from_raw_parts(pa, n_usize),
+                std::slice::from_raw_parts(pb, n_usize),
+            )
+        };
+        let mut result: i32 = 0;
+        for (xa, xb) in sa.iter().zip(sb.iter()) {
+            if xa != xb {
+                result = i32::from(*xa).wrapping_sub(i32::from(*xb));
+                break;
+            }
+        }
+        return ret(engine, i32_status_to_u64(result));
     }
     let mut ba = vec![0_u8; n_usize];
     let mut bb = vec![0_u8; n_usize];
@@ -705,10 +794,21 @@ fn handle_memset(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
     let c = engine.read_rdx()? & 0xff;
     let n = engine.read_r8()?;
     let n_usize = usize::try_from(n).unwrap_or(0);
-    if n_usize > 0 && dest != 0 {
-        let buf = vec![u8::try_from(c).unwrap_or(0); n_usize];
-        engine.mem_write(dest, &buf)?;
+    if n_usize == 0 || dest == 0 {
+        return ret(engine, dest);
     }
+    let value = u8::try_from(c).unwrap_or(0);
+    if let Some(dst_host) = engine.host_span(dest, n_usize, true) {
+        // SAFETY: host_span validated writable arena span; engine borrow exclusive.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::ptr::write_bytes(dst_host, value, n_usize);
+        }
+        return ret(engine, dest);
+    }
+    // Fallback: bounce through a host Vec only when the span isn't directly writable.
+    let buf = vec![value; n_usize];
+    engine.mem_write(dest, &buf)?;
     ret(engine, dest)
 }
 
@@ -770,19 +870,44 @@ fn handle_strlen(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
     if s == 0 {
         return ret(engine, 0);
     }
-    let mut len = 0_u64;
-    loop {
-        let mut b = [0_u8; 1];
-        engine.mem_read(s.wrapping_add(len), &mut b)?;
-        if b[0] == 0 {
+    // Scan up to one guest page per host_span call; keeps a single memory-lock
+    // acquisition covering ~4 KiB of scan instead of one per byte.
+    const PAGE: u64 = 4096;
+    const CAP: u64 = 1_000_000;
+    let mut cursor = s;
+    let mut total: u64 = 0;
+    while total < CAP {
+        let page_end = (cursor | (PAGE - 1)).wrapping_add(1);
+        let remaining = CAP.saturating_sub(total);
+        let span_len_u64 = page_end.saturating_sub(cursor).min(remaining);
+        let span_len = usize::try_from(span_len_u64).unwrap_or(0);
+        if span_len == 0 {
             break;
         }
-        len = len.saturating_add(1);
-        if len > 1_000_000 {
-            break;
+        if let Some(host) = engine.host_span(cursor, span_len, false) {
+            // SAFETY: host_span validated the range maps into a readable arena;
+            // we hold `&mut engine` so no other guest write can occur before we
+            // finish the scan.
+            #[allow(unsafe_code)]
+            let slice = unsafe { std::slice::from_raw_parts(host, span_len) };
+            if let Some(off) = slice.iter().position(|&b| b == 0) {
+                total = total.saturating_add(u64::try_from(off).unwrap_or(0));
+                return ret(engine, total);
+            }
+            total = total.saturating_add(span_len_u64);
+            cursor = cursor.wrapping_add(span_len_u64);
+            continue;
         }
+        // Fallback (unmapped span / protect denied): scalar byte scan of this page.
+        let mut buf = [0_u8; 1];
+        engine.mem_read(cursor, &mut buf)?;
+        if buf[0] == 0 {
+            return ret(engine, total);
+        }
+        total = total.saturating_add(1);
+        cursor = cursor.wrapping_add(1);
     }
-    ret(engine, len)
+    ret(engine, total)
 }
 
 fn handle_strncmp(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
@@ -790,6 +915,34 @@ fn handle_strncmp(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRe
     let b = engine.read_rdx()?;
     let n = engine.read_r8()?;
     let n_usize = usize::try_from(n).unwrap_or(0);
+    if n_usize == 0 {
+        return ret(engine, 0);
+    }
+    // Try both spans as one contiguous host slice each; fall back to scalar.
+    if let (Some(pa), Some(pb)) = (
+        engine.host_span(a, n_usize, false),
+        engine.host_span(b, n_usize, false),
+    ) {
+        // SAFETY: both spans validated by host_span; we don't mutate guest mem here.
+        #[allow(unsafe_code)]
+        let (sa, sb) = unsafe {
+            (
+                std::slice::from_raw_parts(pa, n_usize),
+                std::slice::from_raw_parts(pb, n_usize),
+            )
+        };
+        let mut result: i32 = 0;
+        for (&ca, &cb) in sa.iter().zip(sb.iter()) {
+            if ca != cb {
+                result = i32::from(ca).wrapping_sub(i32::from(cb));
+                break;
+            }
+            if ca == 0 {
+                break;
+            }
+        }
+        return ret(engine, i32_status_to_u64(result));
+    }
     let mut result: i32 = 0;
     for i in 0..n_usize {
         let mut ba = [0_u8; 1];

@@ -121,6 +121,14 @@ pub struct FileIoState {
     pub stdin_mode: GuestStdinMode,
     pub ucrt_files: HashMap<u64, u64>,
     pub ucrt_next_file_va: u64,
+    /// Cached open `File` handles for streaming host-backed guest files.
+    ///
+    /// Keyed by the guest-visible file handle. Populated lazily on the first
+    /// streamed `ReadFile`/`WriteFile` for that handle and dropped on
+    /// `CloseHandle`. Amortises the per-syscall `File::open` + seek + drop cost
+    /// that dominated 7za-style workloads (a 500 MiB archive read in 64 KiB
+    /// chunks previously did ~8k open/close/fstat triples per side).
+    pub cached_streams: HashMap<u64, std::sync::Arc<std::sync::Mutex<std::fs::File>>>,
 }
 
 /// Thread-safe resolver for dynamic DLL imports.
@@ -839,6 +847,7 @@ mod tests {
                 stdin_mode: GuestStdinMode::InjectOnly,
                 ucrt_files: HashMap::new(),
                 ucrt_next_file_va: 0x0000_0000_6900_0000,
+                cached_streams: HashMap::new(),
             },
             process: ProcessState {
                 last_error: 0,

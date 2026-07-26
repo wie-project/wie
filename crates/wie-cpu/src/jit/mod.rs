@@ -1261,14 +1261,16 @@ impl JitCpu {
             }
         }
         if meta.uses_sse {
-            // Prefer dynamic dirty bits; on fault use may_def so partial defs are visible.
-            let mut mask = if ctx.fault != 0 {
-                u16::try_from(ctx.xmm_dirty_bits).unwrap_or(0xffff) | meta.xmm_may_def_mask
-            } else if ctx.xmm_dirty_bits != 0 {
-                u16::try_from(ctx.xmm_dirty_bits).unwrap_or(0)
+            // Cranelift blocks skip the per-def `xmm_dirty_bits` RMW — the static
+            // `xmm_may_def_mask` covers them. Trampolines still set dirty from Rust,
+            // so we always OR both so trampoline-only writes and Cranelift writes
+            // are both covered.
+            let dirty = if ctx.fault != 0 {
+                u16::try_from(ctx.xmm_dirty_bits).unwrap_or(0xffff)
             } else {
-                meta.xmm_may_def_mask
+                u16::try_from(ctx.xmm_dirty_bits).unwrap_or(0)
             };
+            let mut mask = dirty | meta.xmm_may_def_mask;
             if mask == 0 {
                 mask = meta.xmm_live_mask;
             }

@@ -368,6 +368,8 @@ pub fn handle_close_handle(
         persist_open_file_to_host(state, handle);
         let _ = crate::guest_io_host::unregister_open_file(engine, state, handle).ok();
         state.file_io.open_files.remove(&handle);
+        // Drop the cached streaming `File` (if any) so the host fd is released.
+        state.file_io.cached_streams.remove(&handle);
         state.process.last_error = 0;
         1
     } else if state.kernel.sync.objects.remove(&handle).is_some() {
@@ -1314,7 +1316,23 @@ pub fn handle_read_file(
                 });
             };
             let mut data = vec![0_u8; requested];
-            let n = crate::vfs::host_read_at(&host, cursor_before, &mut data).unwrap_or(0);
+            // Cache an open `File` per handle so streaming ReadFile loops don't
+            // reopen the host file on every 64 KiB chunk.
+            let cached = state
+                .file_io
+                .cached_streams
+                .get(&handle)
+                .cloned()
+                .or_else(|| {
+                    let f = crate::vfs::open_stream_cached(&host).ok()?;
+                    state.file_io.cached_streams.insert(handle, f.clone());
+                    Some(f)
+                });
+            let n = if let Some(ref f) = cached {
+                crate::vfs::cached_read_at(f, cursor_before, &mut data).unwrap_or(0)
+            } else {
+                crate::vfs::host_read_at(&host, cursor_before, &mut data).unwrap_or(0)
+            };
             data.truncate(n);
             engine
                 .mem_write(buffer_ptr, &data)
@@ -1486,8 +1504,23 @@ pub fn handle_write_file(
                 .ok_or_else(|| anyhow::anyhow!("streaming file missing host_path"))?;
             let cursor_before = open_file.cursor;
             let path = open_file.path.clone();
-            crate::vfs::host_write_at(&host, cursor_before, &data)
-                .map_err(|e| anyhow::anyhow!("host WriteFile: {e}"))?;
+            let cached = state
+                .file_io
+                .cached_streams
+                .get(&handle)
+                .cloned()
+                .or_else(|| {
+                    let f = crate::vfs::open_stream_cached(&host).ok()?;
+                    state.file_io.cached_streams.insert(handle, f.clone());
+                    Some(f)
+                });
+            if let Some(ref f) = cached {
+                crate::vfs::cached_write_at(f, cursor_before, &data)
+                    .map_err(|e| anyhow::anyhow!("host WriteFile (cached): {e}"))?;
+            } else {
+                crate::vfs::host_write_at(&host, cursor_before, &data)
+                    .map_err(|e| anyhow::anyhow!("host WriteFile: {e}"))?;
+            }
             let write_len_u64 =
                 u64::try_from(write_len).context("WriteFile byte count does not fit u64")?;
             let cursor_after = cursor_before

@@ -22,9 +22,20 @@ pub fn handle_heap_alloc(
         let addr = state.heap_state.heap.alloc_coherent(engine, alloc_size);
         if addr != 0 && (flags & HEAP_ZERO_MEMORY) != 0 {
             let zero_len = state.heap_state.heap.size_of(addr).unwrap_or(alloc_size);
-            if let Ok(len) = usize::try_from(zero_len) {
-                let zeros = vec![0_u8; len];
-                engine.mem_write(addr, &zeros)?;
+            if let Ok(len) = usize::try_from(zero_len)
+                && len > 0
+            {
+                if let Some(host) = engine.host_span(addr, len, true) {
+                    // SAFETY: host_span validated a single-arena writable span;
+                    // engine borrow is exclusive so no concurrent guest write races.
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        std::ptr::write_bytes(host, 0, len);
+                    }
+                } else {
+                    let zeros = vec![0_u8; len];
+                    engine.mem_write(addr, &zeros)?;
+                }
             }
         }
         addr
@@ -99,16 +110,46 @@ pub fn handle_heap_realloc(
         } else {
             let copy_len = usize::try_from(old_size.min(new_size)).unwrap_or(0);
             if copy_len > 0 {
-                let mut bytes = vec![0_u8; copy_len];
-                engine.mem_read(memory, &mut bytes)?;
-                engine.mem_write(new_addr, &bytes)?;
+                let src_host = engine.host_span(memory, copy_len, false);
+                let dst_host = engine.host_span(new_addr, copy_len, true);
+                let overlap = match (src_host, dst_host) {
+                    (Some(s), Some(d)) => {
+                        let se = s.wrapping_add(copy_len);
+                        let de = d.wrapping_add(copy_len);
+                        s < de && d < se
+                    }
+                    _ => true,
+                };
+                if let (Some(s), Some(d)) = (src_host, dst_host)
+                    && !overlap
+                {
+                    // SAFETY: both spans validated; blocks come from GuestHeap
+                    // arenas that never overlap between distinct allocations.
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(s, d, copy_len);
+                    }
+                } else {
+                    let mut bytes = vec![0_u8; copy_len];
+                    engine.mem_read(memory, &mut bytes)?;
+                    engine.mem_write(new_addr, &bytes)?;
+                }
             }
             if (flags & HEAP_ZERO_MEMORY) != 0 && new_size > old_size {
                 let zero_start = old_size;
                 let zero_len = usize::try_from(new_size.saturating_sub(old_size)).unwrap_or(0);
                 if zero_len > 0 {
-                    let zeros = vec![0_u8; zero_len];
-                    engine.mem_write(new_addr.wrapping_add(zero_start), &zeros)?;
+                    let dst_addr = new_addr.wrapping_add(zero_start);
+                    if let Some(host) = engine.host_span(dst_addr, zero_len, true) {
+                        // SAFETY: host_span validated writable span; exclusive engine borrow.
+                        #[allow(unsafe_code)]
+                        unsafe {
+                            std::ptr::write_bytes(host, 0, zero_len);
+                        }
+                    } else {
+                        let zeros = vec![0_u8; zero_len];
+                        engine.mem_write(dst_addr, &zeros)?;
+                    }
                 }
             }
             let _ = state.heap_state.heap.free_coherent(engine, memory);

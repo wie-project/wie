@@ -325,7 +325,10 @@ pub fn copy_host(from: &Path, to: &Path) -> std::io::Result<u64> {
     fs::copy(from, to)
 }
 
-/// Streamed read at offset from host path.
+/// Streamed read at offset from host path (one-shot open+seek+read+close).
+///
+/// Prefer [`cached_read_at`] on `Arc<Mutex<File>>` for hot loops — the one-shot
+/// form pays an `open` + `close` per call.
 pub fn host_read_at(path: &Path, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut f = File::open(path)?;
     f.seek(SeekFrom::Start(offset))?;
@@ -333,6 +336,8 @@ pub fn host_read_at(path: &Path, offset: u64, buf: &mut [u8]) -> std::io::Result
 }
 
 /// Streamed write at offset (extends file as needed).
+///
+/// Prefer [`cached_write_at`] on `Arc<Mutex<File>>` for hot loops.
 pub fn host_write_at(path: &Path, offset: u64, data: &[u8]) -> std::io::Result<()> {
     let mut f = OpenOptions::new()
         .write(true)
@@ -342,6 +347,48 @@ pub fn host_write_at(path: &Path, offset: u64, data: &[u8]) -> std::io::Result<(
     f.seek(SeekFrom::Start(offset))?;
     f.write_all(data)?;
     Ok(())
+}
+
+/// Open (or reuse a cached) `File` for read+write streaming on `path`.
+///
+/// Reuse is opportunistic: callers pool the returned `Arc<Mutex<File>>` in
+/// `FileIoState::cached_streams`, keyed by the guest-visible file handle, and
+/// drop it on `CloseHandle`. First call pays `File::open`; subsequent calls
+/// are free besides a mutex acquisition and a `seek`.
+pub fn open_stream_cached(path: &Path) -> std::io::Result<std::sync::Arc<std::sync::Mutex<File>>> {
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    Ok(std::sync::Arc::new(std::sync::Mutex::new(f)))
+}
+
+/// Read at `offset` from a cached streaming file. Returns bytes read.
+pub fn cached_read_at(
+    file: &std::sync::Arc<std::sync::Mutex<File>>,
+    offset: u64,
+    buf: &mut [u8],
+) -> std::io::Result<usize> {
+    let mut guard = file
+        .lock()
+        .map_err(|_| std::io::Error::other("cached stream mutex poisoned"))?;
+    guard.seek(SeekFrom::Start(offset))?;
+    guard.read(buf)
+}
+
+/// Write `data` at `offset` to a cached streaming file.
+pub fn cached_write_at(
+    file: &std::sync::Arc<std::sync::Mutex<File>>,
+    offset: u64,
+    data: &[u8],
+) -> std::io::Result<()> {
+    let mut guard = file
+        .lock()
+        .map_err(|_| std::io::Error::other("cached stream mutex poisoned"))?;
+    guard.seek(SeekFrom::Start(offset))?;
+    guard.write_all(data)
 }
 
 pub fn host_file_len(path: &Path) -> std::io::Result<u64> {
