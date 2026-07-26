@@ -37,6 +37,11 @@ make -C "$ROOT/micro-exes" "${CATEGORY}"
 OUT="$ROOT/micro-exes/out"
 
 if [[ "$CATEGORY" == "all" ]]; then
+  # CPU string-instruction gates. `rep_lengths` sweeps REP MOVS/STOS across
+  # lengths 1..70 and guards the JIT inline-REP tail handling.
+  run_one "$OUT/cpu_string.exe"
+  run_one "$OUT/rep_lengths.exe"
+
   run_one "$OUT/cpp_throw.exe"
   run_one "$OUT/cpp_dtor.exe"
   run_one "$OUT/cpp_multi_catch.exe"

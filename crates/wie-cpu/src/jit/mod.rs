@@ -663,12 +663,7 @@ impl JitCpu {
             for (va, entry) in &*cache {
                 if let CacheEntry::Ready(c) = entry {
                     let fn_ptr = c.func as usize as u64;
-                    chain_table_insert(
-                        self.thread.chain_slots.as_mut(),
-                        
-                        *va,
-                        fn_ptr,
-                    );
+                    chain_table_insert(self.thread.chain_slots.as_mut(), *va, fn_ptr);
                 }
             }
         }
@@ -996,12 +991,7 @@ impl JitCpu {
                     self.stats.compiles = self.stats.compiles.saturating_add(1);
                     if jit_chain_enabled() {
                         let fn_ptr = compiled.func as usize as u64;
-                        chain_table_insert(
-                            self.thread.chain_slots.as_mut(),
-                            
-                            rip,
-                            fn_ptr,
-                        );
+                        chain_table_insert(self.thread.chain_slots.as_mut(), rip, fn_ptr);
                     }
                     tracing::debug!(
                         start = format_args!("{rip:#x}"),
@@ -1037,12 +1027,7 @@ impl JitCpu {
                         self.stats.compiles = self.stats.compiles.saturating_add(1);
                         if chain_on {
                             let fn_ptr = compiled.func as usize as u64;
-                            chain_table_insert(
-                                self.thread.chain_slots.as_mut(),
-                                
-                                rip,
-                                fn_ptr,
-                            );
+                            chain_table_insert(self.thread.chain_slots.as_mut(), rip, fn_ptr);
                         }
                         tracing::debug!(
                             start = format_args!("{rip:#x}"),
@@ -1298,7 +1283,7 @@ impl JitCpu {
                 i = i.saturating_add(1);
             }
         }
-        regs.rflags = ctx.rflags;
+        regs.set_rflags_checked(ctx.rflags);
         regs.rip = ctx.rip;
         let fault = if ctx.fault != 0 {
             Some(exec::InvalidMem {
@@ -2157,12 +2142,7 @@ mod tests {
             );
             if jit_chain_enabled() {
                 let fn_ptr = dummy_block as *const () as usize as u64;
-                chain_table_insert(
-                    self.thread.chain_slots.as_mut(),
-                    
-                    rip,
-                    fn_ptr,
-                );
+                chain_table_insert(self.thread.chain_slots.as_mut(), rip, fn_ptr);
             }
             // Simulate edge IC hit for S6.
             self.thread.edge_ic_va[0] = rip;

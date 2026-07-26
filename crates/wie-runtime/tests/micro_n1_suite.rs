@@ -42,3 +42,23 @@ fn n1_heap_alloc_exits_zero() {
 fn n1_heap_core_exits_zero() {
     run_expect_zero("heap_core.exe");
 }
+
+/// String-instruction coverage (MOVS/STOS/SCAS/CMPS + DF).
+///
+/// Previously built by the Makefile but never executed by any test, which is
+/// how the inline-REP tail bug guarded by `rep_lengths` below went unnoticed.
+#[test]
+fn n1_cpu_string_exits_zero() {
+    run_expect_zero("cpu_string.exe");
+}
+
+/// REP MOVS/STOS across every length in [1, 70].
+///
+/// Regression guard for the JIT inline-REP path, which accepted any length in
+/// [16, 64] but only emitted full 16-byte SIMD chunks — silently dropping the
+/// trailing `len & 15` bytes while still zeroing RCX and advancing RSI/RDI.
+/// Verified to fail (exit 51) against the pre-fix lowering.
+#[test]
+fn n1_rep_lengths_exits_zero() {
+    run_expect_zero("rep_lengths.exe");
+}

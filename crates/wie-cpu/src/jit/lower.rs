@@ -1142,7 +1142,7 @@ pub(super) unsafe extern "C" fn wie_jit_string(
     for i in 0..16 {
         regs.set_gpr(i, ctx.gpr[i]);
     }
-    regs.rflags = ctx.rflags;
+    regs.set_rflags_checked(ctx.rflags);
     regs.rip = insn_ip;
 
     // SAFETY: mem pointer set by run_compiled.
@@ -3622,18 +3622,20 @@ fn try_lower_inline_rep(
         return None;
     }
 
-    // DF clear + byte_len in [16, 64].
+    // DF clear + byte_len in [8, 64]. Lengths are handled exactly (including
+    // non-multiples of 16) by `emit_inline_copy_chunks`; the floor is 8 because
+    // that is the smallest unit the overlapping-tail scheme covers.
     let df_mask = iconst_u64(bcx, rflags::DF);
     let df_bits = bcx.ins().band(*rflags, df_mask);
     let df_clear = bcx.ins().icmp_imm(IntCC::Equal, df_bits, 0);
     let rcx = gpr[1];
     let size_v = iconst_u64(bcx, u64::from(size));
     let byte_len = bcx.ins().imul(rcx, size_v);
-    let min16 = iconst_u64(bcx, 16);
+    let min_len = iconst_u64(bcx, 8);
     let max64 = iconst_u64(bcx, 64);
     let ge_min = bcx
         .ins()
-        .icmp(IntCC::UnsignedGreaterThanOrEqual, byte_len, min16);
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, byte_len, min_len);
     let le_max = bcx
         .ins()
         .icmp(IntCC::UnsignedLessThanOrEqual, byte_len, max64);
@@ -3678,8 +3680,23 @@ fn try_lower_inline_rep(
             .call(span_ref, &[mem.ctx_ptr, gpr[6], byte_len, zero]);
         let src_host = bcx.inst_results(call_src)[0];
         let src_ok = bcx.ins().icmp_imm(IntCC::NotEqual, src_host, 0);
+        // Chunked (and overlapping-tail) copying only matches x86 `rep movs`
+        // byte-ascending semantics when source and destination do not overlap:
+        // a forward byte copy propagates a pattern where a 16-byte block copy
+        // does not. Require disjoint host ranges and fall back to the element
+        // loop otherwise.
+        let dst_end = bcx.ins().iadd(dst_host, byte_len);
+        let src_end = bcx.ins().iadd(src_host, byte_len);
+        let dst_before_src = bcx
+            .ins()
+            .icmp(IntCC::UnsignedLessThanOrEqual, dst_end, src_host);
+        let src_before_dst = bcx
+            .ins()
+            .icmp(IntCC::UnsignedLessThanOrEqual, src_end, dst_host);
+        let disjoint = bcx.ins().bor(dst_before_src, src_before_dst);
+        let src_usable = bcx.ins().band(src_ok, disjoint);
         let copy_body = bcx.create_block();
-        bcx.ins().brif(src_ok, copy_body, &[], cont_slow, &[]);
+        bcx.ins().brif(src_usable, copy_body, &[], cont_slow, &[]);
         bcx.switch_to_block(copy_body);
         bcx.seal_block(copy_body);
         emit_inline_copy_chunks(bcx, mem, src_host, dst_host, byte_len, None);
@@ -3788,6 +3805,7 @@ fn emit_inline_copy_chunks(
     byte_len: Value,
     fill: Option<Value>,
 ) {
+    // Full 16-byte chunks at constant offsets 0/16/32/48.
     for chunk in 0..4_u64 {
         let off = iconst_u64(bcx, chunk.saturating_mul(16));
         let need = iconst_u64(bcx, chunk.saturating_mul(16).saturating_add(16));
@@ -3799,7 +3817,77 @@ fn emit_inline_copy_chunks(
         bcx.ins().brif(take, do_chunk, &[], next_chunk, &[]);
         bcx.switch_to_block(do_chunk);
         bcx.seal_block(do_chunk);
-        let dp = bcx.ins().iadd(dst_host, off);
+        emit_one_unit(bcx, mem, src_host, dst_host, off, 16, fill);
+        bcx.ins().jump(next_chunk, &[]);
+        bcx.switch_to_block(next_chunk);
+        bcx.seal_block(next_chunk);
+    }
+
+    // Overlapping 16-byte tail for lengths that are not a multiple of 16.
+    //
+    // Without this, a length like 20 stored only chunk 0 (bytes 0..16) while the
+    // caller still advanced RSI/RDI by 20 and zeroed RCX — the trailing
+    // `len & 15` bytes were silently never written. Copying the *last* 16 bytes
+    // at `len - 16` closes the gap; the overlap with an already-written chunk
+    // re-stores identical bytes, which is why MOVS additionally requires the
+    // host ranges to be disjoint (checked by the caller).
+    {
+        let rem = bcx.ins().band_imm(byte_len, 15);
+        let has_tail = bcx.ins().icmp_imm(IntCC::NotEqual, rem, 0);
+        let big_enough = bcx
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, byte_len, 16);
+        let need_tail = bcx.ins().band(has_tail, big_enough);
+        let do_tail = bcx.create_block();
+        let after_tail = bcx.create_block();
+        bcx.ins().brif(need_tail, do_tail, &[], after_tail, &[]);
+        bcx.switch_to_block(do_tail);
+        bcx.seal_block(do_tail);
+        let tail_off = bcx.ins().iadd_imm(byte_len, -16);
+        emit_one_unit(bcx, mem, src_host, dst_host, tail_off, 16, fill);
+        bcx.ins().jump(after_tail, &[]);
+        bcx.switch_to_block(after_tail);
+        bcx.seal_block(after_tail);
+    }
+
+    // Sub-16 lengths [8, 15]: an 8-byte lead plus an overlapping 8-byte tail
+    // covers [0, len) exactly. Extends the inline fast path below the old
+    // 16-byte floor, capturing small CRT `memcpy`/`memset` fragments that
+    // previously fell through to the bulk helper.
+    {
+        let small = bcx.ins().icmp_imm(IntCC::UnsignedLessThan, byte_len, 16);
+        let ge8 = bcx
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, byte_len, 8);
+        let need_small = bcx.ins().band(small, ge8);
+        let do_small = bcx.create_block();
+        let after_small = bcx.create_block();
+        bcx.ins().brif(need_small, do_small, &[], after_small, &[]);
+        bcx.switch_to_block(do_small);
+        bcx.seal_block(do_small);
+        let zero_off = iconst_u64(bcx, 0);
+        emit_one_unit(bcx, mem, src_host, dst_host, zero_off, 8, fill);
+        let tail8 = bcx.ins().iadd_imm(byte_len, -8);
+        emit_one_unit(bcx, mem, src_host, dst_host, tail8, 8, fill);
+        bcx.ins().jump(after_small, &[]);
+        bcx.switch_to_block(after_small);
+        bcx.seal_block(after_small);
+    }
+}
+
+/// Store one 16- or 8-byte unit at `dst_host + off`, sourcing from
+/// `src_host + off` (MOVS) or splatting `fill` (STOS).
+fn emit_one_unit(
+    bcx: &mut FunctionBuilder<'_>,
+    mem: &MemEnv,
+    src_host: Value,
+    dst_host: Value,
+    off: Value,
+    width: u32,
+    fill: Option<Value>,
+) {
+    let dp = bcx.ins().iadd(dst_host, off);
+    if width == 16 {
         let v = if let Some(pat) = fill {
             pat
         } else {
@@ -3807,9 +3895,16 @@ fn emit_inline_copy_chunks(
             bcx.ins().load(types::I8X16, mem.guest_flags, sp, 0)
         };
         bcx.ins().store(mem.guest_flags, v, dp, 0);
-        bcx.ins().jump(next_chunk, &[]);
-        bcx.switch_to_block(next_chunk);
-        bcx.seal_block(next_chunk);
+    } else {
+        let v = if let Some(pat) = fill {
+            // Reuse the I8X16 splat: every 8-byte half carries the pattern.
+            let as_i64x2 = bcx.ins().bitcast(types::I64X2, mem.guest_flags, pat);
+            bcx.ins().extractlane(as_i64x2, 0)
+        } else {
+            let sp = bcx.ins().iadd(src_host, off);
+            bcx.ins().load(types::I64, mem.guest_flags, sp, 0)
+        };
+        bcx.ins().store(mem.guest_flags, v, dp, 0);
     }
 }
 

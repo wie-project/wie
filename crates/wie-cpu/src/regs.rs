@@ -98,7 +98,7 @@ impl RegFile {
         self.gpr = ctx.gpr;
         self.xmm = ctx.xmm;
         self.rip = ctx.rip;
-        self.rflags = ctx.rflags;
+        self.set_rflags_checked(ctx.rflags);
     }
 
     #[must_use]
@@ -187,6 +187,20 @@ impl RegFile {
 
     /// Read a GPR / partial register (64-bit mode).
     pub fn read_reg(&self, reg: Register) -> Result<u64, CpuError> {
+        // Fast paths for the two dominant operand forms in x86-64 code.
+        //
+        // `is_gpr64` / `is_gpr32` are inline discriminant range checks, and for
+        // those ranges `number()` is exactly the GPR index (RAX→0 … R15→15,
+        // EAX→0 … R15D→15). This collapses the three iced table lookups the
+        // general path performs (`size()`, `full_register()`, `gpr_index()`)
+        // into one, and skips the `Register::None` / RIP / AH-BH tests.
+        if reg.is_gpr64() {
+            return Ok(self.gpr(reg.number()));
+        }
+        if reg.is_gpr32() {
+            // 32-bit read yields the zero-extended low dword.
+            return Ok(self.gpr(reg.number()) & 0xffff_ffff);
+        }
         if reg == Register::None {
             return Ok(0);
         }
@@ -221,6 +235,16 @@ impl RegFile {
 
     /// Write a GPR / partial register. 32-bit writes zero-extend the full 64-bit register.
     pub fn write_reg(&mut self, reg: Register, value: u64) -> Result<(), CpuError> {
+        // Fast paths mirroring `read_reg` — see the rationale there.
+        if reg.is_gpr64() {
+            self.set_gpr(reg.number(), value);
+            return Ok(());
+        }
+        if reg.is_gpr32() {
+            // x86-64: a 32-bit write zero-extends into the full 64-bit register.
+            self.set_gpr(reg.number(), value & 0xffff_ffff);
+            return Ok(());
+        }
         if reg == Register::None {
             return Ok(());
         }
@@ -303,12 +327,22 @@ impl RegFile {
     }
 
     pub(crate) fn set_flag(&mut self, mask: u64, on: bool) {
+        // No `|= ALWAYS1` here: bit 1 does not overlap any flag mask defined in
+        // `rflags`, so a per-flag re-assert is pure overhead (6 redundant
+        // OR+stores per arithmetic op). The invariant is instead established at
+        // every wholesale RFLAGS assignment via [`Self::set_rflags_checked`].
         if on {
             self.rflags |= mask;
         } else {
             self.rflags &= !mask;
         }
-        self.rflags |= rflags::ALWAYS1;
+    }
+
+    /// Assign the whole RFLAGS word, re-asserting the architectural reserved
+    /// bit 1. This is the single place the `ALWAYS1` invariant is maintained;
+    /// use it for any bulk assignment (thread-context restore, JIT writeback).
+    pub(crate) fn set_rflags_checked(&mut self, value: u64) {
+        self.rflags = value | rflags::ALWAYS1;
     }
 }
 
