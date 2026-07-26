@@ -300,7 +300,13 @@ fn execute_one(
         | Mnemonic::Outsw
         | Mnemonic::Outsd
         // SSSE3 byte-shuffle: no-op safe stub (CRT sometimes emits it).
-        | Mnemonic::Pshufb => Ok(()),
+        | Mnemonic::Pshufb
+        // PAUSE (F3 90): spin-wait hint used inside CRT / std::mutex / spinlocks
+        // when the compiler emits contention-friendly busy-waits. On real hardware
+        // it hints the pipeline to pause; semantically it's a no-op. Failure mode
+        // before this stub was intermittent worker crashes in `cpp_threads` when
+        // the CRT lock happened to spin (see also the JIT `Mnemonic::Pause` lower).
+        | Mnemonic::Pause => Ok(()),
 
         Mnemonic::Mov => exec_mov(mem, regs, instr),
         Mnemonic::Movzx => exec_movzx(mem, regs, instr, false),

@@ -1,7 +1,6 @@
 // C++ exception in two threads: both throw and catch independently.
 // Exits 0 if both catches execute.
 // Compile: x86_64-w64-mingw32-g++ -static -O2 -o cpp_threads.exe main.cpp
-// Note: runs with WIE_CPU=iced (JIT has intermittent setjmp/longjmp issue).
 #include <windows.h>
 
 static volatile int g_t1_result = 1;
