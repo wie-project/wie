@@ -11,7 +11,6 @@ pub(crate) use crate::guest_string::{
     write_fixed_utf16 as write_guest_fixed_utf16,
     write_utf16_c_string as write_guest_utf16_c_string,
 };
-
 pub(crate) use crate::{
     GuestCallbackRequest, MessageQueueIdlePolicy, QueuedWindowMessage, TimerRecord,
     WinApiControlSignal, WinApiHandlerResult, WinApiState, WindowClassRecord, WindowRecord,
@@ -49,9 +48,6 @@ pub(crate) const WM_SYSKEYUP: u32 = 0x0105;
 pub(crate) const WM_SYSCHAR: u32 = 0x0106;
 pub(crate) const WM_SYSDEADCHAR: u32 = 0x0107;
 
-///
-/// Returns FALSE so the message continues through the normal dispatch path
-/// (no installed WH_MSGFILTER/WH_SYSMSGFILTER hooks).
 pub mod dc;
 pub mod display;
 pub mod input;
