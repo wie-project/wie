@@ -653,13 +653,16 @@ pub(crate) fn finish_find_first(
 
     let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full_pattern = resolve_full_windows_path(&cwd, pattern);
-    let mut entries = collect_find_entries(state, &full_pattern);
-    if entries.is_empty() {
+    let entries_vec = collect_find_entries(state, &full_pattern);
+    if entries_vec.is_empty() {
         state.process.last_error = ERROR_FILE_NOT_FOUND;
         return Ok(INVALID_HANDLE_VALUE);
     }
 
-    let first = entries.remove(0);
+    let mut entries: std::collections::VecDeque<_> = entries_vec.into();
+    let first = entries
+        .pop_front()
+        .context("find entries went empty after non-empty check")?;
     if unicode {
         write_find_data_w(
             engine,
@@ -711,12 +714,10 @@ pub(crate) fn finish_find_next(
         return Ok(0);
     };
 
-    if slot.remaining.is_empty() {
+    let Some(next) = slot.remaining.pop_front() else {
         state.process.last_error = ERROR_NO_MORE_FILES;
         return Ok(0);
-    }
-
-    let next = slot.remaining.remove(0);
+    };
     if unicode {
         write_find_data_w(
             engine,

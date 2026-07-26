@@ -753,10 +753,10 @@ pub(crate) fn allocate_open_file_ex(
         handle,
         OpenGuestFile {
             handle,
-            path: path.to_owned(),
+            path: std::sync::Arc::from(path),
             bytes,
             cursor: 0,
-            host_path,
+            host_path: host_path.map(|p| std::sync::Arc::from(p.as_path())),
             streaming,
             guest_data_va: None,
             guest_slot_index: None,

@@ -2154,7 +2154,7 @@ impl RuntimeSession {
                 .iter()
                 .filter_map(|(&handle, file)| {
                     let size = u64::try_from(file.bytes.len()).ok()?;
-                    Some((handle, file.path.clone(), size))
+                    Some((handle, file.path.to_string(), size))
                 })
                 .collect()
         })

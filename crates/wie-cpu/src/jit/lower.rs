@@ -63,6 +63,22 @@ pub(super) struct TlbBucketAux {
     pub _pad: [u8; 11],
 }
 
+/// Chain-table slot: guest VA → host fn ptr (0 = empty). AoS pair so that
+/// linear probing loads both fields in one cache-line miss.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct ChainSlot {
+    pub va: u64,
+    pub fn_ptr: u64,
+}
+
+impl ChainSlot {
+    #[inline]
+    pub(super) const fn empty() -> Self {
+        Self { va: 0, fn_ptr: 0 }
+    }
+}
+
 /// Empty bucket constructor (const-friendly for array init).
 #[must_use]
 pub(super) const fn empty_tlb_bucket() -> TlbBucket {
@@ -255,10 +271,11 @@ pub(super) struct JitCtx {
     pub shadow_sp: u64,
     /// Predicted guest return addresses for `call`/`ret` chaining.
     pub shadow_ret: [u64; SHADOW_DEPTH],
-    /// Pointer to [`CHAIN_SLOTS`] guest VAs (owned by `JitCpu`, live for `run_compiled`).
-    pub chain_va: *mut u64,
-    /// Parallel host fn pointers (`0` = empty), same lifetime as `chain_va`.
-    pub chain_fn: *mut u64,
+    /// Pointer to [`CHAIN_SLOTS`] `(va, fn_ptr)` pairs (owned by `JitCpu`,
+    /// live for `run_compiled`). AoS layout — one 16-byte pair per probe
+    /// stays inside a single cache line, halving L1 traffic vs. the previous
+    /// parallel `chain_va` / `chain_fn` arrays that lived in separate lines.
+    pub chain_slots: *mut ChainSlot,
     /// Sticky single-page TLB for inline IR mem (last hit/fill); `TLB_EMPTY` if cold.
     pub tlb_hot_page: u64,
     /// Host base pointer for [`Self::tlb_hot_page`] (page-aligned guest data).
@@ -441,30 +458,31 @@ pub(super) fn chain_hash(va: u64) -> usize {
 }
 
 /// Insert or update a compiled block in the open-addressing chain table.
-pub(super) fn chain_table_insert(chain_va: &mut [u64], chain_fn: &mut [u64], va: u64, fn_ptr: u64) {
+pub(super) fn chain_table_insert(chain_slots: &mut [ChainSlot], va: u64, fn_ptr: u64) {
     if va == 0 || fn_ptr == 0 {
         return;
     }
     let mut i = chain_hash(va);
     for _ in 0..CHAIN_SLOTS {
-        let slot = chain_va[i];
+        let slot = chain_slots[i].va;
         if slot == 0 || slot == va {
-            chain_va[i] = va;
-            chain_fn[i] = fn_ptr;
+            chain_slots[i].va = va;
+            chain_slots[i].fn_ptr = fn_ptr;
             return;
         }
         i = (i + 1) & (CHAIN_SLOTS - 1);
     }
     // Table full: overwrite hashed slot.
     let i = chain_hash(va);
-    chain_va[i] = va;
-    chain_fn[i] = fn_ptr;
+    chain_slots[i].va = va;
+    chain_slots[i].fn_ptr = fn_ptr;
 }
 
 /// Clear all chain-table entries (cache invalidation).
-pub(super) fn chain_table_clear(chain_va: &mut [u64], chain_fn: &mut [u64]) {
-    chain_va.fill(0);
-    chain_fn.fill(0);
+pub(super) fn chain_table_clear(chain_slots: &mut [ChainSlot]) {
+    for s in chain_slots.iter_mut() {
+        *s = ChainSlot::empty();
+    }
 }
 
 // --- Host mem helpers (registered as JIT symbols) ---
@@ -967,30 +985,29 @@ pub(super) unsafe extern "C" fn wie_jit_chain_lookup(ctx: *mut JitCtx, va: u64) 
             }
         }
     }
-    if ctx.chain_va.is_null() || ctx.chain_fn.is_null() {
+    if ctx.chain_slots.is_null() {
         return 0;
     }
-    // SAFETY: tables are `CHAIN_SLOTS` long and live for this call.
-    let keys = unsafe { std::slice::from_raw_parts(ctx.chain_va, CHAIN_SLOTS) };
-    let fns = unsafe { std::slice::from_raw_parts(ctx.chain_fn, CHAIN_SLOTS) };
+    // SAFETY: `chain_slots` points to a live [ChainSlot; CHAIN_SLOTS] array for
+    // the duration of this call (set by `run_compiled`).
+    let slots = unsafe { std::slice::from_raw_parts(ctx.chain_slots, CHAIN_SLOTS) };
     let mut i = chain_hash(va);
     // Bounded probe; empty slot ends search.
     for _ in 0..16 {
-        let k = keys[i];
-        if k == va {
-            let f = fns[i];
-            if f != 0 {
+        let s = slots[i];
+        if s.va == va {
+            if s.fn_ptr != 0 {
                 // Install monomorphic edge IC (RR victim).
                 let slot =
                     usize::try_from(ctx.edge_ic_rr % u64::try_from(EDGE_IC_SLOTS).unwrap_or(4))
                         .unwrap_or(0);
                 ctx.edge_ic_va[slot] = va;
-                ctx.edge_ic_fn[slot] = f;
+                ctx.edge_ic_fn[slot] = s.fn_ptr;
                 ctx.edge_ic_rr = ctx.edge_ic_rr.wrapping_add(1);
             }
-            return f;
+            return s.fn_ptr;
         }
-        if k == 0 {
+        if s.va == 0 {
             return 0;
         }
         i = (i + 1) & (CHAIN_SLOTS - 1);

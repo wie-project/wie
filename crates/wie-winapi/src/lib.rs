@@ -383,7 +383,11 @@ pub struct OpenGuestFile {
     pub handle: u64,
 
     /// Guest path used to open the file.
-    pub path: String,
+    ///
+    /// Stored as `Arc<str>` so the many `open_file.path.clone()` in Read/Write
+    /// / SetFilePointer / SetEndOfFile hot loops are refcount bumps instead of
+    /// full String copies. 100k-Read streams stop allocating 100k Strings.
+    pub path: Arc<str>,
 
     /// File contents (working buffer). Empty when [`Self::streaming`] is true.
     pub bytes: Vec<u8>,
@@ -392,7 +396,10 @@ pub struct OpenGuestFile {
     pub cursor: u64,
 
     /// When set, file is bottle/mount/D-backed and may be flushed/streamed here.
-    pub host_path: Option<std::path::PathBuf>,
+    ///
+    /// `Arc<Path>` for the same reason as [`Self::path`] — streaming Read/Write
+    /// clones per syscall.
+    pub host_path: Option<Arc<std::path::Path>>,
 
     /// Large host file: I/O via `host_path` seek/read/write without full buffer.
     pub streaming: bool,
@@ -643,6 +650,10 @@ pub struct ResourceRecord {
 }
 
 /// Fake find-file handle (materialized directory enumeration).
+///
+/// `remaining` is a `VecDeque` so `FindNextFile` pops in O(1) via `pop_front`.
+/// Was `Vec<DirEntry>` + `remove(0)`, i.e. O(n) shift per FindNext — scanning a
+/// directory with N files became O(N²).
 #[derive(Debug, Clone)]
 pub struct FindHandle {
     /// Fake find handle.
@@ -652,7 +663,7 @@ pub struct FindHandle {
     pub pattern: String,
 
     /// Remaining entries after the one returned by FindFirst (FindNext consumes).
-    pub remaining: Vec<vfs::DirEntry>,
+    pub remaining: std::collections::VecDeque<vfs::DirEntry>,
 }
 
 /// Fake registry key.

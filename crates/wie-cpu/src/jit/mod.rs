@@ -293,8 +293,7 @@ pub struct PerThreadJitState {
     /// Generation at which pins were last rebuilt.
     pub pins_gen: u64,
     /// Open-addressing guest VA → host block fn (late-bound block chaining).
-    pub chain_va: Box<[u64; CHAIN_SLOTS]>,
-    pub chain_fn: Box<[u64; CHAIN_SLOTS]>,
+    pub chain_slots: Box<[lower::ChainSlot; CHAIN_SLOTS]>,
     /// Phase 4.2 monomorphic edge IC.
     pub edge_ic_va: [u64; lower::EDGE_IC_SLOTS],
     pub edge_ic_fn: [u64; lower::EDGE_IC_SLOTS],
@@ -331,8 +330,7 @@ impl PerThreadJitState {
             sticky_rr: 0,
             pins: [MemPin::EMPTY; PIN_SLOTS],
             pins_gen: u64::MAX,
-            chain_va: Box::new([0; CHAIN_SLOTS]),
-            chain_fn: Box::new([0; CHAIN_SLOTS]),
+            chain_slots: Box::new([lower::ChainSlot::empty(); CHAIN_SLOTS]),
             edge_ic_va: [0; lower::EDGE_IC_SLOTS],
             edge_ic_fn: [0; lower::EDGE_IC_SLOTS],
             edge_ic_rr: 0,
@@ -666,8 +664,8 @@ impl JitCpu {
                 if let CacheEntry::Ready(c) = entry {
                     let fn_ptr = c.func as usize as u64;
                     chain_table_insert(
-                        self.thread.chain_va.as_mut(),
-                        self.thread.chain_fn.as_mut(),
+                        self.thread.chain_slots.as_mut(),
+                        
                         *va,
                         fn_ptr,
                     );
@@ -999,8 +997,8 @@ impl JitCpu {
                     if jit_chain_enabled() {
                         let fn_ptr = compiled.func as usize as u64;
                         chain_table_insert(
-                            self.thread.chain_va.as_mut(),
-                            self.thread.chain_fn.as_mut(),
+                            self.thread.chain_slots.as_mut(),
+                            
                             rip,
                             fn_ptr,
                         );
@@ -1040,8 +1038,8 @@ impl JitCpu {
                         if chain_on {
                             let fn_ptr = compiled.func as usize as u64;
                             chain_table_insert(
-                                self.thread.chain_va.as_mut(),
-                                self.thread.chain_fn.as_mut(),
+                                self.thread.chain_slots.as_mut(),
+                                
                                 rip,
                                 fn_ptr,
                             );
@@ -1179,8 +1177,7 @@ impl JitCpu {
             xmm,
             shadow_sp: self.thread.shadow_sp,
             shadow_ret: self.thread.shadow_ret,
-            chain_va: self.thread.chain_va.as_mut_ptr(),
-            chain_fn: self.thread.chain_fn.as_mut_ptr(),
+            chain_slots: self.thread.chain_slots.as_mut_ptr(),
             tlb_hot_page: self.thread.tlb_hot_page,
             tlb_hot_ptr: self.thread.tlb_hot_ptr,
             // 0 = Cranelift path (host falls back to full writeback);
@@ -1335,7 +1332,7 @@ impl JitCpu {
     }
 
     fn invalidate_chain_and_shadow(&mut self) {
-        chain_table_clear(self.thread.chain_va.as_mut(), self.thread.chain_fn.as_mut());
+        chain_table_clear(self.thread.chain_slots.as_mut());
         self.thread.edge_ic_va = [0; lower::EDGE_IC_SLOTS];
         self.thread.edge_ic_fn = [0; lower::EDGE_IC_SLOTS];
         self.thread.edge_ic_rr = 0;
@@ -2161,8 +2158,8 @@ mod tests {
             if jit_chain_enabled() {
                 let fn_ptr = dummy_block as *const () as usize as u64;
                 chain_table_insert(
-                    self.thread.chain_va.as_mut(),
-                    self.thread.chain_fn.as_mut(),
+                    self.thread.chain_slots.as_mut(),
+                    
                     rip,
                     fn_ptr,
                 );

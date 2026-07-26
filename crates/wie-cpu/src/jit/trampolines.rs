@@ -377,19 +377,18 @@ fn chain_tail(ctx: &mut JitCtx) {
 }
 
 fn chain_lookup(ctx: &JitCtx, va: u64) -> u64 {
-    if va == 0 || ctx.chain_va.is_null() || ctx.chain_fn.is_null() {
+    if va == 0 || ctx.chain_slots.is_null() {
         return 0;
     }
-    // SAFETY: tables are CHAIN_SLOTS long and live for this call.
-    let keys = unsafe { std::slice::from_raw_parts(ctx.chain_va, CHAIN_SLOTS) };
-    let fns = unsafe { std::slice::from_raw_parts(ctx.chain_fn, CHAIN_SLOTS) };
+    // SAFETY: `chain_slots` is a live [ChainSlot; CHAIN_SLOTS] pointer for this call.
+    let slots = unsafe { std::slice::from_raw_parts(ctx.chain_slots, CHAIN_SLOTS) };
     let mut i = chain_hash(va);
     for _ in 0..16 {
-        let k = keys[i];
-        if k == va {
-            return fns[i];
+        let s = slots[i];
+        if s.va == va {
+            return s.fn_ptr;
         }
-        if k == 0 {
+        if s.va == 0 {
             return 0;
         }
         i = (i + 1) & (CHAIN_SLOTS - 1);
