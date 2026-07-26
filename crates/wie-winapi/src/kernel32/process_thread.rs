@@ -496,11 +496,7 @@ pub fn create_guest_thread(
     } else {
         // Fallback: map with mem_map if VirtualAlloc path rejects fixed VA.
         if engine
-            .mem_map(
-                stack_base,
-                stack_size,
-                wie_cpu::perm::READ | wie_cpu::perm::WRITE,
-            )
+            .mem_map(stack_base, stack_size, wie_cpu::RwxPerms::READ_WRITE)
             .is_err()
         {
             state.process.last_error = ERROR_NOT_ENOUGH_MEMORY;

@@ -322,7 +322,7 @@ fn register_layout_regions(
         RegionKind::Image,
         image_base,
         image_size,
-        wie_cpu::perm::ALL,
+        wie_cpu::RwxPerms::ALL,
     ));
     if let Some(plan) = pe_plan {
         let header_len = usize::try_from(plan.header_size).unwrap_or(0);
@@ -332,7 +332,11 @@ fn register_layout_regions(
                 RegionKind::Image,
                 image_base,
                 header_len,
-                wie_cpu::protect::rwx_from_page_protect(wie_pe::PeMapPlan::header_protect()),
+                wie_cpu::protect::PageProtect::from_win32(wie_pe::PeMapPlan::header_protect())
+                    .map_or(
+                        wie_cpu::RwxPerms::READ,
+                        wie_cpu::protect::PageProtect::to_rwx,
+                    ),
             ));
         }
         for sec in &plan.sections {
@@ -347,15 +351,18 @@ fn register_layout_regions(
                 RegionKind::Image,
                 va,
                 size,
-                wie_cpu::protect::rwx_from_page_protect(sec.final_protect),
+                wie_cpu::protect::PageProtect::from_win32(sec.final_protect).map_or(
+                    wie_cpu::RwxPerms::READ,
+                    wie_cpu::protect::PageProtect::to_rwx,
+                ),
             ));
         }
     }
 
     // Phase 4.x: pure data regions are RW (not RWX). Soft-translate W is
     // denied on executable pages; stack/heap must stay non-X for pin super path.
-    let data_rw = wie_cpu::perm::READ | wie_cpu::perm::WRITE;
-    let code_rwx = wie_cpu::perm::ALL;
+    let data_rw = wie_cpu::RwxPerms::READ_WRITE;
+    let code_rwx = wie_cpu::RwxPerms::ALL;
     let regs: [GuestRegion; 15] = [
         GuestRegion::new(
             "stack",
@@ -647,7 +654,7 @@ impl RuntimeSession {
         // Phase 3.3: one MEM_IMAGE arena, temporary RWX — headers/sections/IAT
         // are written directly into guest memory (no intermediate Vec<u8> buffer).
         engine
-            .mem_map_image(identity.image_base, image_size, wie_cpu::perm::ALL)
+            .mem_map_image(identity.image_base, image_size, wie_cpu::RwxPerms::ALL)
             .context("failed to map PE image memory")?;
 
         // Load PE directly into guest memory: writes headers + sections + patches IAT
@@ -710,7 +717,7 @@ impl RuntimeSession {
             .mem_map(
                 layout.fake_api_base,
                 layout.fake_api_size,
-                wie_cpu::perm::ALL,
+                wie_cpu::RwxPerms::ALL,
             )
             .context("failed to map fake API memory")?;
 
@@ -728,10 +735,10 @@ impl RuntimeSession {
             .mem_map(
                 layout.guest_io_code_base,
                 layout.guest_io_code_size,
-                wie_cpu::perm::ALL,
+                wie_cpu::RwxPerms::ALL,
             )
             .context("failed to map guest I/O code region")?;
-        let data_rw = wie_cpu::perm::READ | wie_cpu::perm::WRITE;
+        let data_rw = wie_cpu::RwxPerms::READ_WRITE;
         engine
             .mem_map(
                 layout.guest_io_table_base,
@@ -806,7 +813,7 @@ impl RuntimeSession {
             .mem_map(
                 layout.guest_heap_code_base,
                 layout.guest_heap_code_size,
-                wie_cpu::perm::ALL,
+                wie_cpu::RwxPerms::ALL,
             )
             .context("failed to map guest heap code")?;
 
@@ -821,7 +828,7 @@ impl RuntimeSession {
             .mem_map(
                 layout.guest_mbwc_code_base,
                 layout.guest_mbwc_code_size,
-                wie_cpu::perm::ALL,
+                wie_cpu::RwxPerms::ALL,
             )
             .context("failed to map guest MultiByteToWideChar code")?;
         let _guest_mbwc = crate::guest_mbwc::install_guest_mbwc(
@@ -876,7 +883,7 @@ impl RuntimeSession {
             .mem_map(
                 layout.stack_base,
                 layout.stack_size,
-                wie_cpu::perm::READ | wie_cpu::perm::WRITE,
+                wie_cpu::RwxPerms::READ_WRITE,
             )
             .context("failed to map entry stack memory")?;
 
@@ -900,7 +907,7 @@ impl RuntimeSession {
             .mem_map(
                 layout.teb_low_base,
                 layout.teb_low_size,
-                wie_cpu::perm::READ | wie_cpu::perm::WRITE,
+                wie_cpu::RwxPerms::READ_WRITE,
             )
             .context("failed to map fake low TEB page")?;
 
@@ -937,17 +944,13 @@ impl RuntimeSession {
             .mem_map(
                 layout.env_data_base,
                 layout.env_data_size,
-                wie_cpu::perm::READ | wie_cpu::perm::WRITE,
+                wie_cpu::RwxPerms::READ_WRITE,
             )
             .context("failed to map entry environment data memory")?;
 
         // Guest page for UCRT FILE* cookies / CRT pointer slots (ucrt module).
         engine
-            .mem_map(
-                0x0000_0000_6800_0000,
-                0x1000,
-                wie_cpu::perm::READ | wie_cpu::perm::WRITE,
-            )
+            .mem_map(0x0000_0000_6800_0000, 0x1000, wie_cpu::RwxPerms::READ_WRITE)
             .context("failed to map guest UCRT data page")?;
         // Pre-init CRT pointer slots (filled fully after process identity is known).
         {
@@ -1020,7 +1023,7 @@ impl RuntimeSession {
             .mem_map(
                 layout.process_heap_base,
                 layout.process_heap_size,
-                wie_cpu::perm::READ | wie_cpu::perm::WRITE,
+                wie_cpu::RwxPerms::READ_WRITE,
             )
             .context("failed to map fake process heap memory")?;
 
@@ -1028,7 +1031,7 @@ impl RuntimeSession {
             .mem_map(
                 layout.process_heap_shadow_base(),
                 layout.process_heap_size,
-                wie_cpu::perm::READ | wie_cpu::perm::WRITE,
+                wie_cpu::RwxPerms::READ_WRITE,
             )
             .context("failed to map fake process heap shadow memory")?;
 
@@ -1036,7 +1039,7 @@ impl RuntimeSession {
             .mem_map(
                 layout.resource_data_base,
                 layout.resource_data_size,
-                wie_cpu::perm::READ | wie_cpu::perm::WRITE,
+                wie_cpu::RwxPerms::READ_WRITE,
             )
             .context("failed to map fake resource memory")?;
 

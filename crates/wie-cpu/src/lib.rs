@@ -192,7 +192,7 @@ pub trait CpuEngine: Send {
     ///
     /// # Errors
     /// Backend mapping failure.
-    fn mem_map(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError>;
+    fn mem_map(&mut self, address: u64, size: usize, perms: RwxPerms) -> Result<(), CpuError>;
 
     /// Write guest memory.
     ///
@@ -334,7 +334,12 @@ pub trait CpuEngine: Send {
     ///
     /// # Errors
     /// Backend mapping failure.
-    fn mem_map_image(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
+    fn mem_map_image(
+        &mut self,
+        address: u64,
+        size: usize,
+        perms: RwxPerms,
+    ) -> Result<(), CpuError> {
         self.mem_map(address, size, perms)
     }
 
@@ -410,7 +415,7 @@ pub trait CpuEngine: Send {
 }
 
 impl CpuEngine for Box<dyn CpuEngine> {
-    fn mem_map(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
+    fn mem_map(&mut self, address: u64, size: usize, perms: RwxPerms) -> Result<(), CpuError> {
         (**self).mem_map(address, size, perms)
     }
     fn mem_write(&mut self, address: u64, bytes: &[u8]) -> Result<(), CpuError> {
@@ -451,7 +456,12 @@ impl CpuEngine for Box<dyn CpuEngine> {
     fn flush_instruction_cache(&mut self, addr: u64, size: usize) -> Result<(), CpuError> {
         (**self).flush_instruction_cache(addr, size)
     }
-    fn mem_map_image(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
+    fn mem_map_image(
+        &mut self,
+        address: u64,
+        size: usize,
+        perms: RwxPerms,
+    ) -> Result<(), CpuError> {
         (**self).mem_map_image(address, size, perms)
     }
     fn install_runtime_hooks(

@@ -31,7 +31,7 @@ pub use fast_api::{FastApiKind, JitFastPathConfig, JitHeapLayout};
 use crate::exec::{self, HookWindow, StepResult};
 use crate::mem::{self, GuestMemory, PAGE_SIZE, PAGE_SIZE_USIZE};
 use crate::regs::RegFile;
-use crate::{CodeHookOutcome, InvalidMemoryAccess};
+use crate::{CodeHookOutcome, InvalidMemoryAccess, RwxPerms};
 use crate::{CpuEngine, CpuError, RunUntilHook};
 use block::{BlockKind, decode_pure_gpr_block, pure_is_self_loop};
 use fast_api::{
@@ -1678,7 +1678,7 @@ impl JitEngine {
 }
 
 impl CpuEngine for JitCpu {
-    fn mem_map(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
+    fn mem_map(&mut self, address: u64, size: usize, perms: RwxPerms) -> Result<(), CpuError> {
         let mut mem = self.shared.mem.write().unwrap();
         let r = mem.map(address, size, perms);
         self.shared
@@ -1798,7 +1798,12 @@ impl CpuEngine for JitCpu {
         Ok(())
     }
 
-    fn mem_map_image(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
+    fn mem_map_image(
+        &mut self,
+        address: u64,
+        size: usize,
+        perms: RwxPerms,
+    ) -> Result<(), CpuError> {
         let r = self
             .shared
             .mem
@@ -2127,7 +2132,6 @@ mod tests {
     use super::*;
     use crate::mem::protect;
     use crate::mem::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE};
-    use crate::perm;
 
     unsafe extern "C" fn dummy_block(_ctx: *mut JitCtx) {}
 
@@ -2305,7 +2309,7 @@ mod tests {
             .page_tlb_entry(data >> 12)
             .expect("data tlb");
         assert!(e2.allow_r && e2.allow_w);
-        let _ = perm::ALL; // silence if unused in some cfgs
+        let _ = RwxPerms::ALL; // silence if unused in some cfgs
     }
 
     // --- Phase 7 stress residual (invalidation multi-region / FIC) ---

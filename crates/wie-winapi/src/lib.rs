@@ -786,8 +786,9 @@ mod tests {
     /// Minimal engine for handler unit tests: maps guest pages with a valid return address on the stack.
     fn test_engine() -> IcedCpu {
         let mut cpu = IcedCpu::open_x86_64();
-        cpu.mem_map(0x1000, 0x10_0000, 7).expect("map test memory");
-        cpu.mem_map(STACK_VA, STACK_SIZE, 7)
+        cpu.mem_map(0x1000, 0x10_0000, wie_cpu::RwxPerms::ALL)
+            .expect("map test memory");
+        cpu.mem_map(STACK_VA, STACK_SIZE, wie_cpu::RwxPerms::ALL)
             .expect("map test stack");
         // Write a dummy return address — every handler calls return_from_win64_api which reads it.
         cpu.mem_write(STACK_TOP, &0_u64.to_le_bytes())
@@ -1144,7 +1145,9 @@ mod tests {
         let mut state = default_winapi_state();
         let msg_va = 0x4000;
         // Map memory for the MSG struct.
-        engine.mem_map(msg_va, 0x1000, 7).expect("map msg struct");
+        engine
+            .mem_map(msg_va, 0x1000, wie_cpu::RwxPerms::ALL)
+            .expect("map msg struct");
         // Push a WM_PAINT message for any window.
         state.window_state.message_queue.push(QueuedWindowMessage {
             window_handle: 0x100,
@@ -1171,7 +1174,9 @@ mod tests {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
         let msg_va = 0x4000;
-        engine.mem_map(msg_va, 0x1000, 7).expect("map msg struct");
+        engine
+            .mem_map(msg_va, 0x1000, wie_cpu::RwxPerms::ALL)
+            .expect("map msg struct");
         state.window_state.message_queue.push(QueuedWindowMessage {
             window_handle: 0x100,
             message: 15,
@@ -1204,7 +1209,9 @@ mod tests {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
         let cc_ptr = 0x5000;
-        engine.mem_map(cc_ptr, 0x1000, 7).expect("map CHOOSECOLOR");
+        engine
+            .mem_map(cc_ptr, 0x1000, wie_cpu::RwxPerms::ALL)
+            .expect("map CHOOSECOLOR");
         write_regs(&mut engine, cc_ptr, 0, 0, 0, 0);
         assert_return_value!(comdlg32::handle_choose_color_a(&mut engine, &mut state), 1);
         // rgbResult is at offset 0x10 in CHOOSECOLOR — should be RGB black (0).

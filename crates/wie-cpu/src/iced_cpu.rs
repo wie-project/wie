@@ -3,7 +3,7 @@
 use crate::exec::{self, HookWindow, StepResult};
 use crate::mem::{GuestMemory, GuestRegion};
 use crate::regs::RegFile;
-use crate::{CodeHookOutcome, CpuError, InvalidMemoryAccess};
+use crate::{CodeHookOutcome, CpuError, InvalidMemoryAccess, RwxPerms};
 use crate::{CpuEngine, RunUntilHook};
 use std::sync::{Arc, RwLock};
 
@@ -167,7 +167,7 @@ impl IcedCpu {
 }
 
 impl CpuEngine for IcedCpu {
-    fn mem_map(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
+    fn mem_map(&mut self, address: u64, size: usize, perms: RwxPerms) -> Result<(), CpuError> {
         lock_wr(&self.mem).map(address, size, perms)
     }
 
@@ -214,7 +214,12 @@ impl CpuEngine for IcedCpu {
         lock_rd(&self.mem).virtual_query(addr)
     }
 
-    fn mem_map_image(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
+    fn mem_map_image(
+        &mut self,
+        address: u64,
+        size: usize,
+        perms: RwxPerms,
+    ) -> Result<(), CpuError> {
         lock_wr(&self.mem).map_image(address, size, perms)
     }
 

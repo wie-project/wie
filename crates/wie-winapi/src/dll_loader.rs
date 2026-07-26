@@ -662,7 +662,7 @@ pub fn load_dll(
     // Step 3: Map guest memory. Try preferred base first.
     let load_base = preferred_base;
     let image_base = if engine
-        .mem_map(load_base, size_of_image, wie_cpu::perm::ALL)
+        .mem_map(load_base, size_of_image, wie_cpu::RwxPerms::ALL)
         .is_ok()
     {
         load_base
@@ -671,7 +671,7 @@ pub fn load_dll(
         // Use a VA derived from the handle (above fake module range).
         let alt_base = handle & !0xfff;
         engine
-            .mem_map(alt_base, size_of_image, wie_cpu::perm::ALL)
+            .mem_map(alt_base, size_of_image, wie_cpu::RwxPerms::ALL)
             .context("failed to map DLL image memory at alternative base")?;
         alt_base
     };

@@ -244,6 +244,6 @@ mod tests {
         // The dangerous one: execute bits read as read-write.
         assert_eq!(perm::EXEC, PAGE_READWRITE);
         // …and the combined rwx set is not a valid protection at all.
-        assert_eq!(PageProtect::from_win32(perm::ALL), None);
+        assert_eq!(PageProtect::from_win32(RwxPerms::ALL.bits()), None);
     }
 }

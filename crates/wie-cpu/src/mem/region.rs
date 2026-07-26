@@ -3,6 +3,8 @@
 //! Tracks stack, heap, image, fake API, TEB, etc. with permissions and an
 //! optional host base (filled once an mmap arena is attached in Phase 2).
 
+use crate::RwxPerms;
+
 /// Kind of guest memory region (layout bookkeeping).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RegionKind {
@@ -39,8 +41,8 @@ pub struct GuestRegion {
     pub base: u64,
     /// Size in bytes (page-aligned).
     pub size: usize,
-    /// Permission bits (`perm::ALL` etc.).
-    pub perms: u32,
+    /// Permission bits (`RwxPerms::ALL` etc.).
+    pub perms: RwxPerms,
     /// Optional host mapping base once an mmap arena is attached.
     pub host_base: Option<u64>,
 }
@@ -53,7 +55,7 @@ impl GuestRegion {
         kind: RegionKind,
         base: u64,
         size: usize,
-        perms: u32,
+        perms: RwxPerms,
     ) -> Self {
         Self {
             name: name.into(),
@@ -163,14 +165,14 @@ mod tests {
             RegionKind::Stack,
             0x2000_0000,
             0x1_0000,
-            7,
+            crate::RwxPerms::ALL,
         ));
         t.register(GuestRegion::new(
             "heap",
             RegionKind::Heap,
             0x1_6000_0000,
             0x100_0000,
-            7,
+            crate::RwxPerms::ALL,
         ));
         assert_eq!(t.find(0x2000_1000).expect("stack").name, "stack");
         assert_eq!(t.find(0x1_6000_0040).expect("heap").name, "heap");
