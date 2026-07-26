@@ -257,7 +257,7 @@ pub(crate) fn default_winapi_state(
         kernel: wie_winapi::KernelState {
             threads: wie_winapi::ThreadState::primary(),
             sync: wie_winapi::SyncState::new(),
-            seh_pending: None,
+            seh_pending: std::collections::HashMap::new(),
         },
         file_io: wie_winapi::FileIoState {
             executable_file_size,

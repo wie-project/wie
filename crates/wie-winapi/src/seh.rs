@@ -301,10 +301,11 @@ pub fn continue_pending(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
+    let tid = state.kernel.threads.current_tid();
     let mut pending = state
         .kernel
         .seh_pending
-        .take()
+        .remove(&tid)
         .ok_or_else(|| anyhow::anyhow!("SEH continue trampoline with no pending work"))?;
 
     if pending.expect_catch_return {
@@ -312,7 +313,7 @@ pub fn continue_pending(
         let cont = engine.read_rax()?;
         pending.expect_catch_return = false;
         if cont == 0 || cont >= 0x8000_0000_0000 {
-            state.kernel.seh_pending = Some(pending);
+            state.kernel.seh_pending.insert(tid, pending);
             return Err(anyhow::anyhow!(
                 "MSVC catch funclet returned invalid continuation RAX={cont:#x}"
             ));
@@ -330,7 +331,7 @@ pub fn continue_pending(
             });
         }
         // Unusual: more steps after catch — keep going.
-        state.kernel.seh_pending = Some(pending);
+        state.kernel.seh_pending.insert(tid, pending);
         return run_next_step(engine, state);
     }
 
@@ -340,11 +341,11 @@ pub fn continue_pending(
             remaining = pending.steps.len(),
             "seh cleanup _Unwind_Resume → next step"
         );
-        state.kernel.seh_pending = Some(pending);
+        state.kernel.seh_pending.insert(tid, pending);
         return run_next_step(engine, state);
     }
 
-    state.kernel.seh_pending = Some(pending);
+    state.kernel.seh_pending.insert(tid, pending);
     run_next_step(engine, state)
 }
 
@@ -352,10 +353,11 @@ pub fn continue_pending(
 /// should drain the next [`SehPending`] step instead of a generic forced unwind.
 #[must_use]
 pub fn has_cleanup_resume(state: &WinApiState) -> bool {
+    let tid = state.kernel.threads.current_tid();
     state
         .kernel
         .seh_pending
-        .as_ref()
+        .get(&tid)
         .is_some_and(|p| p.expect_cleanup_resume && !p.steps.is_empty())
 }
 
@@ -633,11 +635,15 @@ fn begin_or_finish(
         });
     }
 
-    state.kernel.seh_pending = Some(SehPending {
-        steps: action_steps,
-        expect_catch_return: false,
-        expect_cleanup_resume: false,
-    });
+    let tid = state.kernel.threads.current_tid();
+    state.kernel.seh_pending.insert(
+        tid,
+        SehPending {
+            steps: action_steps,
+            expect_catch_return: false,
+            expect_cleanup_resume: false,
+        },
+    );
     run_next_step(engine, state)
 }
 
@@ -645,14 +651,15 @@ fn run_next_step(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
+    let tid = state.kernel.threads.current_tid();
     let pending = state
         .kernel
         .seh_pending
-        .as_mut()
+        .get_mut(&tid)
         .ok_or_else(|| anyhow::anyhow!("SEH run_next_step with empty pending"))?;
 
     if pending.steps.is_empty() {
-        state.kernel.seh_pending = None;
+        state.kernel.seh_pending.remove(&tid);
         return Err(anyhow::anyhow!("SEH pending queue empty"));
     }
 
@@ -732,7 +739,7 @@ fn run_next_step(
             // Drop the borrow before clearing pending on the terminal jump.
             let cleanup_resume = more;
             if !more {
-                state.kernel.seh_pending = None;
+                state.kernel.seh_pending.remove(&tid);
             }
             let mut tctx = engine.snapshot_thread_context();
             tctx.gpr = gpr;

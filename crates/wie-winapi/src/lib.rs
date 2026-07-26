@@ -245,7 +245,14 @@ pub struct ProcessState {
 pub struct KernelState {
     pub threads: ThreadState,
     pub sync: SyncState,
-    pub seh_pending: Option<seh::SehPending>,
+    /// Per-thread pending SEH / MSVC-EH sequences, keyed by guest TID.
+    ///
+    /// Previously a single `Option<SehPending>` at process scope — that raced
+    /// when two guest threads threw concurrently: whichever throw grabbed the
+    /// shared WinAPI mutex second overwrote the first thread's payload, and
+    /// the second thread later found nothing in the slot and unwound past its
+    /// own catch (see `cpp_threads` micro). Per-TID storage isolates them.
+    pub seh_pending: std::collections::HashMap<u32, seh::SehPending>,
 }
 
 pub struct WinApiState {
@@ -862,7 +869,7 @@ mod tests {
             kernel: KernelState {
                 threads: ThreadState::primary(),
                 sync: SyncState::new(),
-                seh_pending: None,
+                seh_pending: HashMap::new(),
             },
             window_state: WindowState {
                 window_long_ptr_values: Vec::new(),
