@@ -188,19 +188,86 @@ pub(super) const PIN_STRIDE: i32 = 40;
 /// Monomorphic edge inline-cache slots (Phase 4.2 data-plane chaining).
 pub(super) const EDGE_IC_SLOTS: usize = 4;
 
+/// A guest virtual address.
+///
+/// WIE's core invariant is *guest VA ≠ host VA* — every guest access soft
+/// translates through a region/arena base. [`MemPin`] is where both address
+/// spaces meet, and as bare `u64` the only thing separating them was field
+/// naming. `repr(transparent)` keeps the layout byte-identical to `u64`, so
+/// the `repr(C)` struct below and the Cranelift IR that reads it at fixed
+/// offsets are unaffected.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Debug)]
+pub(super) struct GuestVa(u64);
+
+impl GuestVa {
+    pub(super) const ZERO: Self = Self(0);
+
+    #[inline]
+    pub(super) const fn new(va: u64) -> Self {
+        Self(va)
+    }
+
+    /// Exclusive end of `[self, self + len)`, or `None` on overflow.
+    #[inline]
+    pub(super) fn checked_add(self, len: u64) -> Option<Self> {
+        self.0.checked_add(len).map(Self)
+    }
+
+    /// Byte distance from `base` to `self` (caller has ordered them).
+    #[inline]
+    pub(super) fn offset_from(self, base: Self) -> u64 {
+        self.0.wrapping_sub(base.0)
+    }
+}
+
+/// A host address — the integer form of a `*mut u8` into an mmap arena.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub(super) struct HostAddr(u64);
+
+impl HostAddr {
+    pub(super) const NULL: Self = Self(0);
+
+    #[inline]
+    #[expect(clippy::as_conversions)] // pointer → integer for the repr(C) slot
+    pub(super) fn from_ptr(p: *mut u8) -> Self {
+        Self(p as u64)
+    }
+
+    #[inline]
+    pub(super) const fn is_null(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Host pointer `self + off`.
+    ///
+    /// # Safety
+    /// `off` must stay within the mapped arena this address came from.
+    #[inline]
+    #[expect(clippy::as_conversions)] // integer → pointer, inverse of `from_ptr`
+    pub(super) unsafe fn add(self, off: usize) -> *mut u8 {
+        unsafe { (self.0 as *mut u8).add(off) }
+    }
+}
+
 /// Soft-translated region pin (stack / heap / VirtualAlloc) for Phase 4.1 JIT.
 ///
-/// Empty pin: `host_base == 0`. Filled at each `run_compiled` from
+/// Empty pin: `host_base` null. Filled at each `run_compiled` from
 /// [`crate::mem::GuestMemory::jit_region_pins`]; gen must match `mem_gen`.
+///
+/// The two address spaces are distinct types here so that
+/// `host = host_base + (va - guest_base)` cannot be assembled from the wrong
+/// operands — see [`Self::translate`], the single place that arithmetic lives.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(super) struct MemPin {
     /// Inclusive guest base VA.
-    pub guest_base: u64,
+    pub guest_base: GuestVa,
     /// Exclusive guest end VA.
-    pub guest_end: u64,
-    /// Host soft-translate base (integer form of `*mut u8`).
-    pub host_base: u64,
+    pub guest_end: GuestVa,
+    /// Host soft-translate base.
+    pub host_base: HostAddr,
     /// Memory generation at pin install.
     pub mem_gen: u64,
     /// Software R/W bits (`TLB_PROT_R` / `TLB_PROT_W`), intersection over range.
@@ -210,12 +277,47 @@ pub(super) struct MemPin {
 impl MemPin {
     /// Disabled / empty pin.
     pub(super) const EMPTY: Self = Self {
-        guest_base: 0,
-        guest_end: 0,
-        host_base: 0,
+        guest_base: GuestVa::ZERO,
+        guest_end: GuestVa::ZERO,
+        host_base: HostAddr::NULL,
         mem_gen: 0,
         allow: 0,
     };
+
+    /// Whether this slot carries no mapping.
+    #[inline]
+    pub(super) const fn is_empty(&self) -> bool {
+        self.host_base.is_null()
+    }
+
+    /// Guest bytes covered by this pin (0 when empty).
+    #[inline]
+    pub(super) fn span_bytes(&self) -> u64 {
+        self.guest_end.offset_from(self.guest_base)
+    }
+
+    /// Whether `[addr, addr+size)` lies entirely inside the pinned span.
+    #[inline]
+    pub(super) fn contains(&self, addr: GuestVa, end: GuestVa) -> bool {
+        !self.is_empty() && addr >= self.guest_base && end <= self.guest_end
+    }
+
+    /// Soft translate `addr` to its host pointer.
+    ///
+    /// This is the *only* place `host = host_base + (va - guest_base)` is
+    /// computed for a pin. Both operands are distinct types, so the guest and
+    /// host bases cannot be swapped, and the containment check that makes the
+    /// pointer arithmetic sound happens here rather than at each call site.
+    #[inline]
+    pub(super) fn translate(&self, addr: GuestVa, end: GuestVa) -> Option<*mut u8> {
+        if !self.contains(addr, end) {
+            return None;
+        }
+        let off = usize::try_from(addr.offset_from(self.guest_base)).ok()?;
+        // SAFETY: `contains` proved `off` is within the pinned arena span, and
+        // `host_base` is that span's soft-translate base.
+        Some(unsafe { self.host_base.add(off) })
+    }
 
     /// Build from a [`crate::mem::RegionPinInfo`] (or empty if `None`).
     pub(super) fn from_info(info: Option<crate::mem::RegionPinInfo>) -> Self {
@@ -236,9 +338,9 @@ impl MemPin {
             return Self::EMPTY;
         }
         Self {
-            guest_base: p.guest_base,
-            guest_end: p.guest_end,
-            host_base: p.host_base as u64,
+            guest_base: GuestVa::new(p.guest_base),
+            guest_end: GuestVa::new(p.guest_end),
+            host_base: HostAddr::from_ptr(p.host_base),
             mem_gen: p.generation,
             allow,
         }
@@ -573,14 +675,12 @@ fn tlb_set_hot(ctx: &mut JitCtx, page_key: u64, page_base: *mut u8, prot: u8, ge
 ///
 /// Slot 0 = stack; slots 1.. = process heap + VirtualAlloc data pins.
 fn classify_addr_vs_pins(ctx: &mut JitCtx, addr: u64, size: usize) {
-    let end = addr.saturating_add(u64::try_from(size).unwrap_or(0));
+    let va = GuestVa::new(addr);
+    let end = GuestVa::new(addr.saturating_add(u64::try_from(size).unwrap_or(0)));
     let mut in_stack = false;
     let mut in_data = false;
     for (i, pin) in ctx.pins.iter().enumerate() {
-        if pin.host_base == 0 {
-            continue;
-        }
-        if addr >= pin.guest_base && end <= pin.guest_end {
+        if pin.contains(va, end) {
             if i == 0 {
                 in_stack = true;
             } else {
@@ -664,31 +764,31 @@ fn pin_resolve(ctx: &mut JitCtx, addr: u64, size: usize, write: bool) -> Option<
     if size_u == 0 {
         return None;
     }
-    let end = addr.checked_add(size_u)?;
+    let va = GuestVa::new(addr);
+    let end = va.checked_add(size_u)?;
     let cur_gen = ctx.mem_gen;
-    // Collect a matching pin by value so we can mutably update the TLB after.
-    let mut matched: Option<(u64, u64, u64, u8)> = None; // guest_base, host_base, mem_gen, prot
+    // Copy the matching pin out so the TLB can be mutated afterwards.
+    // Previously a positional `(u64, u64, u64, u8)` tuple whose meaning lived
+    // in a trailing comment — transposing guest_base and host_base there would
+    // have compiled and silently translated into the wrong address space.
+    let mut matched: Option<(MemPin, u8)> = None;
     for pin in &ctx.pins {
-        if pin.host_base == 0 || pin.mem_gen != cur_gen {
+        if pin.is_empty() || pin.mem_gen != cur_gen {
             continue;
         }
-        if addr < pin.guest_base || end > pin.guest_end {
+        if !pin.contains(va, end) {
             continue;
         }
         let prot = u8::try_from(pin.allow).unwrap_or(0);
         if !tlb_prot_allows(prot, write) {
             continue;
         }
-        matched = Some((pin.guest_base, pin.host_base, pin.mem_gen, prot));
+        matched = Some((*pin, prot));
         break;
     }
-    let (guest_base, host_base, pin_gen, prot) = matched?;
-    let off = usize::try_from(addr.wrapping_sub(guest_base)).unwrap_or(usize::MAX);
-    if off == usize::MAX {
-        return None;
-    }
-    // SAFETY: host_base is arena soft-translate base; bounds checked above.
-    let host = unsafe { (host_base as *mut u8).add(off) };
+    let (pin, prot) = matched?;
+    let pin_gen = pin.mem_gen;
+    let host = pin.translate(va, end)?;
     let page_off = usize::try_from(addr & (PAGE_SIZE - 1)).unwrap_or(0);
     let page_key = addr >> 12;
     // SAFETY: host points into the pin span; subtract in-page offset for page base.

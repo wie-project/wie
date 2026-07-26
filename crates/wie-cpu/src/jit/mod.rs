@@ -1093,22 +1093,21 @@ impl JitCpu {
         }
         {
             let stack = self.thread.pins[0];
-            self.stats.pin_stack_bytes = if stack.host_base != 0 {
-                stack.guest_end.saturating_sub(stack.guest_base)
-            } else {
+            self.stats.pin_stack_bytes = if stack.is_empty() {
                 0
+            } else {
+                stack.span_bytes()
             };
             let mut data_bytes = 0_u64;
             let mut bits = 0_u64;
-            if stack.host_base != 0 {
+            if !stack.is_empty() {
                 bits |= stack.allow & 0b11;
             }
             for (i, pin) in self.thread.pins.iter().enumerate().skip(1) {
-                if pin.host_base == 0 {
+                if pin.is_empty() {
                     continue;
                 }
-                data_bytes =
-                    data_bytes.saturating_add(pin.guest_end.saturating_sub(pin.guest_base));
+                data_bytes = data_bytes.saturating_add(pin.span_bytes());
                 // Pack first two data pins' allow into bits 2..5 for compact dump.
                 if i <= 2 {
                     let shift = (i.saturating_sub(1).saturating_add(1)) * 2;
