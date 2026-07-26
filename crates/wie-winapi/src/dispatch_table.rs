@@ -2025,14 +2025,17 @@ pub fn dispatch_winapi_id(
 }
 
 /// Cold-path wrapper for callers that only have library/name strings.
+///
+/// Both current callers (session / worker) already checked `resolved.winapi_id`
+/// and only fall through here when the API is NOT in the dense id table, so we
+/// skip the redundant `resolve_winapi_id` scan and go straight to the UCRT /
+/// per-library fallbacks. `resolve_winapi_id` is still available for callers
+/// that don't have a pre-resolved id.
 pub fn dispatch_winapi(
     ctx: &mut HandlerContext<'_>,
     library: &str,
     name: &str,
 ) -> Result<WinApiHandlerResult> {
-    if let Some(id) = resolve_winapi_id(library, name) {
-        return dispatch_winapi_id(ctx, id);
-    }
     // UCRT API sets (api-ms-win-crt-*.dll) + ucrtbase/msvcrt — CRT-linked PEs.
     if crate::ucrt::is_ucrt_library(library) {
         return crate::ucrt::dispatch_ucrt(ctx, name);

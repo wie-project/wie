@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use wie_winapi::{
     FakeVa, WinApiId, WinApiTraits, decode_fake_va, encode_export, encode_unresolved,
@@ -35,10 +35,20 @@ pub struct RuntimeFakeApiEntry {
     pub(crate) stub_kind: Option<crate::guest_stubs::GuestStubKind>,
 }
 
-/// Soft (unresolved) table: indexed by dense soft payload, not a HashMap.
+/// Soft (unresolved) table: indexed by dense soft payload, plus a lowercase
+/// `(library, name)` → index side-map so `intern` is O(1) instead of O(n).
+///
+/// Init cost was O(n²) in import count (linear scan for every intern call);
+/// on large mingw / MSVC CRT bundles this was a measurable startup drag.
 #[derive(Debug, Default, Clone)]
 pub struct SoftApiTable {
     entries: Vec<RuntimeFakeApiEntry>,
+    /// Lowercase key `"library\0name"` → index into `entries`.
+    ///
+    /// Only used by [`Self::intern`]; the enum-of-callers path reads through
+    /// [`Self::get`] by dense index, so lookups on the hot handler path stay
+    /// O(1) without touching this map.
+    lookup: HashMap<String, u16>,
 }
 
 impl SoftApiTable {
@@ -59,10 +69,9 @@ impl SoftApiTable {
         name: &str,
         iat_slot_va: u64,
     ) -> Result<(u64, RuntimeFakeApiEntry)> {
-        if let Some(existing) = self
-            .entries
-            .iter()
-            .find(|e| e.library.eq_ignore_ascii_case(library) && e.name.eq_ignore_ascii_case(name))
+        let key = intern_key(library, name);
+        if let Some(&idx) = self.lookup.get(&key)
+            && let Some(existing) = self.entries.get(usize::from(idx))
         {
             return Ok((existing.fake_target_va, existing.clone()));
         }
@@ -76,8 +85,25 @@ impl SoftApiTable {
         let va = encode_unresolved(idx_u16);
         let entry = make_entry(va, library.to_owned(), name.to_owned(), iat_slot_va);
         self.entries.push(entry.clone());
+        self.lookup.insert(key, idx_u16);
         Ok((va, entry))
     }
+}
+
+/// Build the case-insensitive lookup key: lowercase(lib) + '\0' + lowercase(name).
+///
+/// NUL separator keeps `("a", "bc")` distinct from `("ab", "c")` without needing
+/// a real tuple key (which would require Hash impl on borrowed pairs).
+fn intern_key(library: &str, name: &str) -> String {
+    let mut s = String::with_capacity(library.len().saturating_add(name.len()).saturating_add(1));
+    for c in library.chars() {
+        s.push(c.to_ascii_lowercase());
+    }
+    s.push('\0');
+    for c in name.chars() {
+        s.push(c.to_ascii_lowercase());
+    }
+    s
 }
 
 /// Resolved stop target after bit-decode (no HashMap).

@@ -1,8 +1,7 @@
 use super::{
     Context, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, GlobalAtomRecord, HEAP_SIZE_FAILURE,
     HEAP_ZERO_MEMORY, Result, WinApiHandlerResult, WinApiState, allocate_fake_heap_block,
-    checked_field_address, read_ansi_string_from_cpu, ret_bool_true, ret_u64, write_guest_u32,
-    write_guest_u64,
+    read_ansi_string_from_cpu, ret_bool_true, ret_u64,
 };
 
 /// Handles `KERNEL32.dll!HeapAlloc`.
@@ -257,36 +256,30 @@ pub fn handle_global_memory_status(
         .context("failed to read RCX for GlobalMemoryStatus")?;
 
     if memory_status_ptr != 0 {
-        // MEMORYSTATUS on Win64:
-        // DWORD  dwLength;          offset 0
-        // DWORD  dwMemoryLoad;      offset 4
-        // SIZE_T dwTotalPhys;       offset 8
-        // SIZE_T dwAvailPhys;       offset 16
-        // SIZE_T dwTotalPageFile;   offset 24
-        // SIZE_T dwAvailPageFile;   offset 32
-        // SIZE_T dwTotalVirtual;    offset 40
-        // SIZE_T dwAvailVirtual;    offset 48
-
-        let length_address = checked_field_address(memory_status_ptr, 0, "dwLength")?;
-        let memory_load_address = checked_field_address(memory_status_ptr, 4, "dwMemoryLoad")?;
-        let total_phys_address = checked_field_address(memory_status_ptr, 8, "dwTotalPhys")?;
-        let avail_phys_address = checked_field_address(memory_status_ptr, 16, "dwAvailPhys")?;
-        let total_page_file_address =
-            checked_field_address(memory_status_ptr, 24, "dwTotalPageFile")?;
-        let avail_page_file_address =
-            checked_field_address(memory_status_ptr, 32, "dwAvailPageFile")?;
-        let total_virtual_address = checked_field_address(memory_status_ptr, 40, "dwTotalVirtual")?;
-        let avail_virtual_address = checked_field_address(memory_status_ptr, 48, "dwAvailVirtual")?;
-
-        write_guest_u32(engine, length_address, 56)?;
-        write_guest_u32(engine, memory_load_address, 25)?;
-
-        write_guest_u64(engine, total_phys_address, 8_u64 * 1024 * 1024 * 1024)?;
-        write_guest_u64(engine, avail_phys_address, 6_u64 * 1024 * 1024 * 1024)?;
-        write_guest_u64(engine, total_page_file_address, 16_u64 * 1024 * 1024 * 1024)?;
-        write_guest_u64(engine, avail_page_file_address, 12_u64 * 1024 * 1024 * 1024)?;
-        write_guest_u64(engine, total_virtual_address, 128_u64 * 1024 * 1024 * 1024)?;
-        write_guest_u64(engine, avail_virtual_address, 120_u64 * 1024 * 1024 * 1024)?;
+        // MEMORYSTATUS on Win64 (56 bytes) — build once and push in a single
+        // mem_write to avoid 8 separate scalar writes (each locking guest mem
+        // and page-walking).
+        // Layout:
+        //   +0  dwLength         u32
+        //   +4  dwMemoryLoad     u32
+        //   +8  dwTotalPhys      u64
+        //   +16 dwAvailPhys      u64
+        //   +24 dwTotalPageFile  u64
+        //   +32 dwAvailPageFile  u64
+        //   +40 dwTotalVirtual   u64
+        //   +48 dwAvailVirtual   u64
+        let mut buf = [0_u8; 56];
+        buf[0..4].copy_from_slice(&56_u32.to_le_bytes());
+        buf[4..8].copy_from_slice(&25_u32.to_le_bytes());
+        buf[8..16].copy_from_slice(&(8_u64 * 1024 * 1024 * 1024).to_le_bytes());
+        buf[16..24].copy_from_slice(&(6_u64 * 1024 * 1024 * 1024).to_le_bytes());
+        buf[24..32].copy_from_slice(&(16_u64 * 1024 * 1024 * 1024).to_le_bytes());
+        buf[32..40].copy_from_slice(&(12_u64 * 1024 * 1024 * 1024).to_le_bytes());
+        buf[40..48].copy_from_slice(&(128_u64 * 1024 * 1024 * 1024).to_le_bytes());
+        buf[48..56].copy_from_slice(&(120_u64 * 1024 * 1024 * 1024).to_le_bytes());
+        engine
+            .mem_write(memory_status_ptr, &buf)
+            .context("failed to write MEMORYSTATUS")?;
     }
 
     let return_address = engine
@@ -314,18 +307,29 @@ pub fn handle_global_memory_status_ex(
     if length < 64 {
         return ret_u64(engine, 0, "GlobalMemoryStatusEx");
     }
-    // MEMORYSTATUSEX: dwLength@0, dwMemoryLoad@4, ullTotalPhys@8, ullAvailPhys@16,
-    // ullTotalPageFile@24, ullAvailPageFile@32, ullTotalVirtual@40, ullAvailVirtual@48,
-    // ullAvailExtendedVirtual@56.
-    write_guest_u32(engine, ptr, 64)?;
-    write_guest_u32(engine, ptr.wrapping_add(4), 25)?;
-    write_guest_u64(engine, ptr.wrapping_add(8), 8_u64 * 1024 * 1024 * 1024)?;
-    write_guest_u64(engine, ptr.wrapping_add(16), 6_u64 * 1024 * 1024 * 1024)?;
-    write_guest_u64(engine, ptr.wrapping_add(24), 16_u64 * 1024 * 1024 * 1024)?;
-    write_guest_u64(engine, ptr.wrapping_add(32), 12_u64 * 1024 * 1024 * 1024)?;
-    write_guest_u64(engine, ptr.wrapping_add(40), 128_u64 * 1024 * 1024 * 1024)?;
-    write_guest_u64(engine, ptr.wrapping_add(48), 120_u64 * 1024 * 1024 * 1024)?;
-    write_guest_u64(engine, ptr.wrapping_add(56), 0)?;
+    // MEMORYSTATUSEX (64 bytes) — build on host stack, push in one mem_write:
+    //   +0  dwLength         u32
+    //   +4  dwMemoryLoad     u32
+    //   +8  ullTotalPhys     u64
+    //   +16 ullAvailPhys     u64
+    //   +24 ullTotalPageFile u64
+    //   +32 ullAvailPageFile u64
+    //   +40 ullTotalVirtual  u64
+    //   +48 ullAvailVirtual  u64
+    //   +56 ullAvailExtVirt  u64
+    let mut buf = [0_u8; 64];
+    buf[0..4].copy_from_slice(&64_u32.to_le_bytes());
+    buf[4..8].copy_from_slice(&25_u32.to_le_bytes());
+    buf[8..16].copy_from_slice(&(8_u64 * 1024 * 1024 * 1024).to_le_bytes());
+    buf[16..24].copy_from_slice(&(6_u64 * 1024 * 1024 * 1024).to_le_bytes());
+    buf[24..32].copy_from_slice(&(16_u64 * 1024 * 1024 * 1024).to_le_bytes());
+    buf[32..40].copy_from_slice(&(12_u64 * 1024 * 1024 * 1024).to_le_bytes());
+    buf[40..48].copy_from_slice(&(128_u64 * 1024 * 1024 * 1024).to_le_bytes());
+    buf[48..56].copy_from_slice(&(120_u64 * 1024 * 1024 * 1024).to_le_bytes());
+    // ullAvailExtendedVirtual at [56..64] already zero.
+    engine
+        .mem_write(ptr, &buf)
+        .context("failed to write MEMORYSTATUSEX")?;
     ret_bool_true(engine, "GlobalMemoryStatusEx")
 }
 /// Handles `KERNEL32.dll!LocalAlloc`.

@@ -35,7 +35,7 @@ pub(crate) struct ProcessConfig {
     pub soft_apis: SoftApiTable,
     pub environment: wie_winapi::WinApiEnvironment,
     pub layout: RuntimeMemoryLayout,
-    pub stop_bitmap: Vec<u8>,
+    pub stop_bitmap: Arc<[u8]>,
     pub primary_tid: u32,
 }
 

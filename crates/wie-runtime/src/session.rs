@@ -494,7 +494,7 @@ struct SessionInit {
     winapi_state: wie_winapi::WinApiState,
     soft_apis: SoftApiTable,
     layout: RuntimeMemoryLayout,
-    stop_bitmap: Vec<u8>,
+    stop_bitmap: Arc<[u8]>,
     shared_jit: Option<Arc<wie_cpu::JitShared>>,
     guest_mem: Option<Arc<RwLock<wie_cpu::GuestMemory>>>,
     entry_point_va: u64,
@@ -853,8 +853,11 @@ impl RuntimeSession {
             });
         }
 
+        // Freeze once — every worker + the primary engine share this Arc
+        // instead of paying a per-thread `Vec::clone` of the fake-API bitmap.
+        let stop_bitmap: Arc<[u8]> = Arc::from(stop_bitmap.into_boxed_slice());
         engine
-            .install_runtime_hooks(layout.fake_api_base, fake_api_end, stop_bitmap.clone())
+            .install_runtime_hooks(layout.fake_api_base, fake_api_end, Arc::clone(&stop_bitmap))
             .context("failed to install persistent runtime hooks")?;
 
         // Selective precompile: in-guest stubs (GetLastError / CS / …) and the

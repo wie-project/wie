@@ -245,11 +245,15 @@ impl From<CpuError> for StepExecError {
 }
 
 /// Hook window + stop bitmap (1 = host stop).
+///
+/// Bitmap is immutable after `install_runtime_hooks` — wrap as `Arc<[u8]>`
+/// so cloning per worker/JIT thread is a refcount bump instead of a full
+/// Vec copy (was material at spawn time for large fake-API ranges).
 #[derive(Debug, Clone)]
 pub(crate) struct HookWindow {
     pub begin: u64,
     pub end: u64,
-    pub stop_bitmap: Vec<u8>,
+    pub stop_bitmap: std::sync::Arc<[u8]>,
 }
 
 impl HookWindow {

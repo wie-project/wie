@@ -241,7 +241,7 @@ impl CpuEngine for IcedCpu {
         &mut self,
         hook_begin: u64,
         hook_end: u64,
-        stop_bitmap: Vec<u8>,
+        stop_bitmap: std::sync::Arc<[u8]>,
     ) -> Result<(), CpuError> {
         let range_len = hook_end.saturating_sub(hook_begin).saturating_add(1);
         let expected_bytes = usize::try_from(range_len).unwrap_or(usize::MAX).div_ceil(8);

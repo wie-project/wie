@@ -514,6 +514,11 @@ impl ArenaSet {
     }
 
     /// Zero host bytes in `[address, address+size)` without munmap (MEM_DECOMMIT).
+    ///
+    /// After the zero-write pass, we hint the kernel to release physical memory
+    /// via `madvise` (MADV_FREE_REUSABLE on Darwin, MADV_DONTNEED on Linux) so
+    /// LZMA decommit workloads actually shrink RSS instead of just re-zeroing
+    /// pages that stay resident.
     pub(super) fn discard_range(&mut self, address: u64, size: usize) -> Result<(), CpuError> {
         if size == 0 {
             return Ok(());
@@ -539,7 +544,73 @@ impl ArenaSet {
             offset = offset.saturating_add(chunk);
             va = va.saturating_add(u64::try_from(chunk).unwrap_or(0));
         }
+        self.hint_release(address, size);
         Ok(())
+    }
+
+    /// Hint the OS to release physical pages for `[address, address+size)`.
+    ///
+    /// Best-effort: falls silently through when the range spans arenas or the
+    /// host base can't be resolved. Only page-aligned sub-ranges are advised
+    /// (madvise on unaligned addresses is per-page rounded on Linux but errors
+    /// on Darwin; we align conservatively).
+    fn hint_release(&self, address: u64, size: usize) {
+        // Compute page-aligned inner range.
+        let end = match address.checked_add(u64::try_from(size).unwrap_or(0)) {
+            Some(e) => e,
+            None => return,
+        };
+        let page_size = PAGE_SIZE;
+        let aligned_start = address.checked_add(page_size - 1).map_or(0, |v| v & !(page_size - 1));
+        let aligned_end = end & !(page_size - 1);
+        if aligned_end <= aligned_start {
+            return;
+        }
+        let aligned_len = match usize::try_from(aligned_end.saturating_sub(aligned_start)) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let Some(arena) = self.find_va(aligned_start) else {
+            return;
+        };
+        // Only advise when the whole aligned range stays inside this one arena
+        // (arenas are contiguous host mmap regions; crossing arenas would need
+        // a per-arena split, and it's rare in practice).
+        if aligned_end > arena.guest_end() {
+            return;
+        }
+        let host_base = arena.host();
+        if host_base.is_null() {
+            return;
+        }
+        let offset = aligned_start.saturating_sub(arena.guest_base());
+        let offset_usize = match usize::try_from(offset) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        // SAFETY: `host_base` is a live mmap base owned by `arena`; the aligned
+        // range fits inside the arena's mmap region (checked above); madvise
+        // is documented to be safe on any subrange of a live mmap. Errors are
+        // intentionally ignored (best-effort hint).
+        #[allow(unsafe_code, clippy::as_conversions)]
+        unsafe {
+            let host = host_base.add(offset_usize).cast::<libc::c_void>();
+            #[cfg(target_os = "macos")]
+            {
+                // Darwin's MADV_FREE_REUSABLE returns pages to the system without
+                // unmapping. Falls back to MADV_FREE if unavailable (older SDK).
+                #[allow(clippy::used_underscore_binding)]
+                let _ = libc::madvise(host, aligned_len, libc::MADV_FREE_REUSABLE);
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            {
+                let _ = libc::madvise(host, aligned_len, libc::MADV_DONTNEED);
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (host, aligned_len);
+            }
+        }
     }
 }
 

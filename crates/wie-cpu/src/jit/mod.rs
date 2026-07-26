@@ -1460,13 +1460,16 @@ fn jit_opt_level() -> &'static str {
     })
 }
 
-/// Run Cranelift IR verifier (`WIE_JIT_VERIFY=1` or always under `cfg(test)`).
+/// Run Cranelift IR verifier only when `WIE_JIT_VERIFY=1`.
+///
+/// Previously enabled under `cfg(test)` unconditionally — every test-driven
+/// perf run (release-mode `cargo test`) paid the verifier tax on every
+/// compile. Tests that need verifier coverage should set `WIE_JIT_VERIFY=1`
+/// explicitly. The oracle tests already exercise the lowering paths without
+/// requiring an always-on verifier.
 fn jit_verifier_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    if cfg!(test) {
-        return true;
-    }
     *ON.get_or_init(|| {
         matches!(
             std::env::var("WIE_JIT_VERIFY"),
@@ -1842,7 +1845,7 @@ impl CpuEngine for JitCpu {
         &mut self,
         hook_begin: u64,
         hook_end: u64,
-        stop_bitmap: Vec<u8>,
+        stop_bitmap: std::sync::Arc<[u8]>,
     ) -> Result<(), CpuError> {
         self.clear_compiled();
         self.invalidate_tlb();

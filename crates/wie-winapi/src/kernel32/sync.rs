@@ -10,44 +10,23 @@ pub(crate) fn write_critical_section_unlocked(
     critical_section_ptr: u64,
     spin_count: u64,
 ) -> Result<()> {
-    // RTL_CRITICAL_SECTION on Win64:
-    // +0x00 DebugInfo      pointer
-    // +0x08 LockCount      LONG, initialized to -1 (unlocked)
-    // +0x0c RecursionCount LONG
-    // +0x10 OwningThread   HANDLE
-    // +0x18 LockSemaphore  HANDLE
-    // +0x20 SpinCount      ULONG_PTR
-    write_guest_u64(
-        engine,
-        checked_field_address(critical_section_ptr, 0, "DebugInfo")?,
-        0,
-    )?;
-    write_guest_u32(
-        engine,
-        checked_field_address(critical_section_ptr, 8, "LockCount")?,
-        u32::MAX,
-    )?;
-    write_guest_u32(
-        engine,
-        checked_field_address(critical_section_ptr, 12, "RecursionCount")?,
-        0,
-    )?;
-    write_guest_u64(
-        engine,
-        checked_field_address(critical_section_ptr, 16, "OwningThread")?,
-        0,
-    )?;
-    write_guest_u64(
-        engine,
-        checked_field_address(critical_section_ptr, 24, "LockSemaphore")?,
-        0,
-    )?;
-    write_guest_u64(
-        engine,
-        checked_field_address(critical_section_ptr, 32, "SpinCount")?,
-        spin_count,
-    )?;
-    Ok(())
+    // RTL_CRITICAL_SECTION on Win64 (40 bytes) — built once on the host stack
+    // and pushed in a single mem_write. Was six scalar writes (each locking
+    // guest memory and page-walking).
+    // Layout:
+    //   +0x00 DebugInfo      pointer (0)
+    //   +0x08 LockCount      LONG, unlocked = -1 (u32::MAX bit pattern)
+    //   +0x0c RecursionCount LONG (0)
+    //   +0x10 OwningThread   HANDLE (0)
+    //   +0x18 LockSemaphore  HANDLE (0)
+    //   +0x20 SpinCount      ULONG_PTR
+    let mut buf = [0_u8; 40];
+    // DebugInfo, RecursionCount, OwningThread, LockSemaphore already zero.
+    buf[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+    buf[32..40].copy_from_slice(&spin_count.to_le_bytes());
+    engine
+        .mem_write(critical_section_ptr, &buf)
+        .context("failed to write RTL_CRITICAL_SECTION init state")
 }
 /// Handles `KERNEL32.dll!InitializeCriticalSection`.
 pub fn handle_initialize_critical_section(

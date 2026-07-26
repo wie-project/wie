@@ -436,41 +436,32 @@ pub(crate) fn write_find_data_common(
         return Ok(());
     }
 
-    let attributes_address =
-        checked_field_address(find_data_ptr, 0, "WIN32_FIND_DATA.dwFileAttributes")?;
-    let creation_time_address =
-        checked_field_address(find_data_ptr, 4, "WIN32_FIND_DATA.ftCreationTime")?;
-    let last_access_time_address =
-        checked_field_address(find_data_ptr, 12, "WIN32_FIND_DATA.ftLastAccessTime")?;
-    let last_write_time_address =
-        checked_field_address(find_data_ptr, 20, "WIN32_FIND_DATA.ftLastWriteTime")?;
-    let file_size_high_address =
-        checked_field_address(find_data_ptr, 28, "WIN32_FIND_DATA.nFileSizeHigh")?;
-    let file_size_low_address =
-        checked_field_address(find_data_ptr, 32, "WIN32_FIND_DATA.nFileSizeLow")?;
-    let reserved0_address =
-        checked_field_address(find_data_ptr, 36, "WIN32_FIND_DATA.dwReserved0")?;
-    let reserved1_address =
-        checked_field_address(find_data_ptr, 40, "WIN32_FIND_DATA.dwReserved1")?;
-
-    write_guest_u32(engine, attributes_address, attributes)?;
-    write_guest_u64(engine, creation_time_address, FIXED_SYSTEM_FILETIME)?;
-    write_guest_u64(engine, last_access_time_address, FIXED_SYSTEM_FILETIME)?;
-    write_guest_u64(engine, last_write_time_address, FIXED_SYSTEM_FILETIME)?;
-    write_guest_u32(
-        engine,
-        file_size_high_address,
-        u32::try_from(file_size >> 32).unwrap_or(0),
-    )?;
-    write_guest_u32(
-        engine,
-        file_size_low_address,
-        u32::try_from(file_size & 0xffff_ffff).unwrap_or(0),
-    )?;
-    write_guest_u32(engine, reserved0_address, 0)?;
-    write_guest_u32(engine, reserved1_address, 0)?;
-
-    Ok(())
+    // Build the 44-byte WIN32_FIND_DATA common header on the host stack and
+    // push it in a single mem_write. Previously nine scalar write_guest_u32/u64
+    // calls, each taking a fresh guest memory RwLock and page-walk.
+    //
+    // Layout (from wine/mingw headers, matches Microsoft SDK):
+    //   +0  dwFileAttributes  u32
+    //   +4  ftCreationTime    u64
+    //   +12 ftLastAccessTime  u64
+    //   +20 ftLastWriteTime   u64
+    //   +28 nFileSizeHigh     u32
+    //   +32 nFileSizeLow      u32
+    //   +36 dwReserved0       u32
+    //   +40 dwReserved1       u32
+    let mut header = [0_u8; 44];
+    header[0..4].copy_from_slice(&attributes.to_le_bytes());
+    header[4..12].copy_from_slice(&FIXED_SYSTEM_FILETIME.to_le_bytes());
+    header[12..20].copy_from_slice(&FIXED_SYSTEM_FILETIME.to_le_bytes());
+    header[20..28].copy_from_slice(&FIXED_SYSTEM_FILETIME.to_le_bytes());
+    let hi = u32::try_from(file_size >> 32).unwrap_or(0);
+    let lo = u32::try_from(file_size & 0xffff_ffff).unwrap_or(0);
+    header[28..32].copy_from_slice(&hi.to_le_bytes());
+    header[32..36].copy_from_slice(&lo.to_le_bytes());
+    // header[36..44] already zero (dwReserved0 / dwReserved1)
+    engine
+        .mem_write(find_data_ptr, &header)
+        .context("failed to write WIN32_FIND_DATA header")
 }
 
 pub(crate) fn write_find_data_w(

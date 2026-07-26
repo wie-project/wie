@@ -167,7 +167,7 @@ pub trait CpuEngine: Send {
         &mut self,
         hook_begin: u64,
         hook_end: u64,
-        stop_bitmap: Vec<u8>,
+        stop_bitmap: std::sync::Arc<[u8]>,
     ) -> Result<(), CpuError>;
 
     /// Configure JIT direct-UCRT / heap fast path (no-op for non-JIT backends).
@@ -395,7 +395,7 @@ impl CpuEngine for Box<dyn CpuEngine> {
         &mut self,
         hook_begin: u64,
         hook_end: u64,
-        stop_bitmap: Vec<u8>,
+        stop_bitmap: std::sync::Arc<[u8]>,
     ) -> Result<(), CpuError> {
         (**self).install_runtime_hooks(hook_begin, hook_end, stop_bitmap)
     }
