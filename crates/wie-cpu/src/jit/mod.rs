@@ -578,6 +578,10 @@ impl JitCpu {
         self.invalidate_chain_and_shadow();
     }
 
+    // `fast_api_kind` was the on-demand helper used by the old peek loop;
+    // `block_kind_ends_in_fast_ucrt` inlines the same lookup on the miss path.
+    // Kept accessible for future callers (e.g. non-Pure fast-API detection).
+    #[allow(dead_code)]
     #[inline]
     fn fast_api_kind(&self, va: u64) -> Option<FastApiKind> {
         self.fast_api
@@ -873,9 +877,15 @@ impl JitCpu {
                     }
                 }
             } else {
-                // Miss: need write lock to insert.
-                let is_ucrt = self.peek_fast_ucrt_call(rip);
-                let is_loop = self.peek_self_loop(rip);
+                // Miss: decode the block once and route the same BlockKind through
+                // fast-UCRT / self-loop / try_compile. Was three iced-decode passes
+                // over the same up-to-96-insn body before.
+                let kind = {
+                    let mem = self.shared.mem.read().unwrap();
+                    block::decode_pure_gpr_block(&mem, self.thread.hooks.as_ref(), rip)
+                };
+                let is_ucrt = block_kind_ends_in_fast_ucrt(&self.shared, &self.fast_api, &kind);
+                let is_loop = pure_is_self_loop(&kind, rip);
                 let thr = if is_ucrt {
                     2
                 } else if is_loop {
@@ -884,7 +894,7 @@ impl JitCpu {
                     hotness_threshold()
                 };
                 if thr == 0 || is_ucrt {
-                    if let Some(compiled) = self.try_compile(rip) {
+                    if let Some(compiled) = self.try_compile_from_kind(rip, kind) {
                         let meta = CompiledRunMeta::from(&compiled);
                         self.insert_ready(rip, compiled);
                         return Ok(self.finish_compiled(rip, meta));
@@ -933,23 +943,21 @@ impl JitCpu {
     }
 
     /// True when a Pure block at `rip` ends in a near-call to a registered UCRT fast API.
+    ///
+    /// Kept for callers that don't already have a decoded [`BlockKind`] in hand
+    /// (currently none — the miss path pre-decodes and calls the helper below).
+    #[allow(dead_code)]
     fn peek_fast_ucrt_call(&self, rip: u64) -> bool {
         if self.fast_api.is_empty() {
             return false;
         }
         let mem = self.shared.mem.read().unwrap();
-        match decode_pure_gpr_block(&mem, self.thread.hooks.as_ref(), rip) {
-            BlockKind::Pure {
-                term: Some(block::BlockTerm::Call { target, .. }),
-                ..
-            } => {
-                let final_va = resolve_thunk_va(&mem, target);
-                self.fast_api_kind(final_va).is_some()
-            }
-            _ => false,
-        }
+        let kind = decode_pure_gpr_block(&mem, self.thread.hooks.as_ref(), rip);
+        drop(mem);
+        block_kind_ends_in_fast_ucrt(&self.shared, &self.fast_api, &kind)
     }
 
+    #[allow(dead_code)]
     fn peek_self_loop(&self, rip: u64) -> bool {
         let mem = self.shared.mem.read().unwrap();
         let kind = decode_pure_gpr_block(&mem, self.thread.hooks.as_ref(), rip);
@@ -957,9 +965,16 @@ impl JitCpu {
     }
 
     fn try_compile(&mut self, rip: u64) -> Option<CompiledBlock> {
-        let mem_guard = self.shared.mem.read().unwrap();
-        let result = decode_pure_gpr_block(&mem_guard, self.thread.hooks.as_ref(), rip);
-        drop(mem_guard); // release before compiling (engine needs mutable access)
+        let kind = {
+            let mem_guard = self.shared.mem.read().unwrap();
+            decode_pure_gpr_block(&mem_guard, self.thread.hooks.as_ref(), rip)
+        };
+        self.try_compile_from_kind(rip, kind)
+    }
+
+    /// Compile a block from an already-decoded [`BlockKind`], skipping the
+    /// full iced-decode pass that would otherwise repeat previous work.
+    fn try_compile_from_kind(&mut self, rip: u64, result: BlockKind) -> Option<CompiledBlock> {
         match result {
             BlockKind::Pure {
                 insns,
@@ -1360,6 +1375,29 @@ fn ranges_overlap(a0: u64, a1: u64, b0: u64, b1: u64) -> bool {
 }
 
 /// Follow PE import thunks / short jumps to the final callee VA.
+/// Predicate over an already-decoded [`BlockKind`]: does its terminator call
+/// a registered UCRT fast-path API? Shared between `peek_fast_ucrt_call` and
+/// the miss-path pre-decode so the block is decoded only once.
+fn block_kind_ends_in_fast_ucrt(
+    shared: &JitShared,
+    fast_api: &[(u64, FastApiKind)],
+    kind: &BlockKind,
+) -> bool {
+    if fast_api.is_empty() {
+        return false;
+    }
+    let target = match kind {
+        BlockKind::Pure {
+            term: Some(block::BlockTerm::Call { target, .. }),
+            ..
+        } => *target,
+        _ => return false,
+    };
+    let mem = shared.mem.read().unwrap();
+    let final_va = resolve_thunk_va(&mem, target);
+    fast_api.iter().any(|&(k, _)| k == final_va)
+}
+
 fn resolve_thunk_va(mem: &GuestMemory, mut va: u64) -> u64 {
     let mut buf = [0_u8; 16];
     for _ in 0..4 {

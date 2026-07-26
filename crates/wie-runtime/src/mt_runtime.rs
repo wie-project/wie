@@ -20,6 +20,14 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// Cached `WIE_MT_DEBUG` flag. Was `env::var_os` on every spawn / park /
+/// worker-exit path; now a single `getenv()` guarded by `OnceLock`.
+pub(crate) fn mt_debug() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WIE_MT_DEBUG").is_some())
+}
+
 // ── Shared config ──────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -103,7 +111,7 @@ impl ProcessResources {
         if spawns.is_empty() {
             return Ok(());
         }
-        if std::env::var_os("WIE_MT_DEBUG").is_some() {
+        if mt_debug() {
             eprintln!(
                 "[mt] drain_spawns count={} tids={:?}",
                 spawns.len(),
@@ -175,7 +183,7 @@ fn worker_main(
     config: Arc<ProcessConfig>,
     tid: u32,
 ) {
-    if std::env::var_os("WIE_MT_DEBUG").is_some() {
+    if mt_debug() {
         eprintln!("[mt] worker_main start tid={tid:#x}");
     }
     let layout = &config.layout;
@@ -191,7 +199,7 @@ fn worker_main(
         config.stop_bitmap.clone(),
     ) {
         tracing::error!(tid, error = %e, "failed to install runtime hooks for worker");
-        if std::env::var_os("WIE_MT_DEBUG").is_some() {
+        if mt_debug() {
             eprintln!("[mt] worker_main hooks failed tid={tid:#x}: {e}");
         }
         // Always mark finished so joiners do not hang forever.
@@ -235,7 +243,7 @@ fn worker_main(
             match engine.run_until_stop(begin, 0, 0, budget, layout.fake_api_base, fake_api_end) {
                 Ok(r) => r,
                 Err(e) => {
-                    if std::env::var_os("WIE_MT_DEBUG").is_some() {
+                    if mt_debug() {
                         eprintln!("[mt] worker_main run error tid={tid:#x}: {e}");
                     }
                     let st = lock(&shared_winapi);
@@ -249,7 +257,7 @@ fn worker_main(
         let rip_now = engine.read_rip().unwrap_or(0);
         if rip_now == 0 || (run.invalid_memory.hit && run.invalid_memory.address == 0) {
             let code = u32::try_from(engine.read_rax().unwrap_or(0) & 0xffff_ffff).unwrap_or(0);
-            if std::env::var_os("WIE_MT_DEBUG").is_some() {
+            if mt_debug() {
                 eprintln!("[mt] worker_main exit tid={tid:#x} code={code} (ret-to-0)");
             }
             let st = lock(&shared_winapi);

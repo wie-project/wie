@@ -143,9 +143,16 @@ pub(super) fn string_inline_enabled() -> bool {
     })
 }
 
+/// Set index for the 4-way TLB: XOR-fold high `page_key` bits into the low
+/// `log2(TLB_SETS)` bits so allocations whose base VAs share the same low
+/// bits (e.g. 64 KiB-aligned arenas — stack, heap, VirtualAlloc reserves) do
+/// not all collide on the same set. `page_key = va >> 12`, so bits 0..3 of
+/// `page_key` are va bits 12..15; a 64 KiB-aligned base has those zero and
+/// would land in set 0 without folding.
 #[inline]
 fn tlb_set_index(page_key: u64) -> usize {
-    (page_key as usize) & (TLB_SETS - 1)
+    let mixed = page_key ^ (page_key >> 4) ^ (page_key >> 8) ^ (page_key >> 12);
+    (mixed as usize) & (TLB_SETS - 1)
 }
 
 /// Open-addressing slots for guest-VA → host block fn (block chaining).

@@ -1893,7 +1893,7 @@ impl RuntimeSession {
                             // Detach waitable object, wait **outside** process locks
                             // so workers can ExitThread / SetEvent / CreateThread.
                             let _ = self.process.drain_spawns();
-                            if std::env::var_os("WIE_MT_DEBUG").is_some() {
+                            if crate::mt_runtime::mt_debug() {
                                 eprintln!(
                                     "[mt] primary park WaitObject handle={handle:#x} timeout={timeout_ms:#x}"
                                 );
@@ -1935,7 +1935,7 @@ impl RuntimeSession {
                         }
                         wie_winapi::HostParkReason::WaitMultiple => {
                             let _ = self.process.drain_spawns();
-                            if std::env::var_os("WIE_MT_DEBUG").is_some() {
+                            if crate::mt_runtime::mt_debug() {
                                 eprintln!("[mt] primary park WaitMultiple");
                             }
                             let req = self
@@ -2314,7 +2314,17 @@ fn journal_api_return(
     return_value: u64,
     return_address: u64,
 ) {
-    let Ok(path) = std::env::var("WIE_API_JOURNAL") else {
+    // Cached once: the runtime does not observe env var changes at runtime, so
+    // any subsequent call is a monomorphic branch on an atomic-loaded pointer
+    // instead of a full getenv() + 7 wasted register reads (previously the
+    // env lookup was per-call, followed by 8 register reads before the
+    // OpenOptions::open would bail on IO error).
+    use std::sync::OnceLock;
+    static JOURNAL_PATH: OnceLock<Option<String>> = OnceLock::new();
+    let Some(path) = JOURNAL_PATH
+        .get_or_init(|| std::env::var("WIE_API_JOURNAL").ok())
+        .as_deref()
+    else {
         return;
     };
     let rip = engine.read_rip().unwrap_or(0);

@@ -3,17 +3,11 @@
 //! Absence of a page key means [`PageState::Free`]. Host storage is owned by the
 //! backend; this map is the Windows-visible correctness plane only.
 
-#![allow(clippy::unwrap_used)] // Mutex<RunCache> locks are infallible in practice
-
 use super::backend::{PAGE_SHIFT, PAGE_SIZE};
 use super::protect::{self, AccessKind};
 use crate::CpuError;
 use std::collections::BTreeMap;
-use std::sync::Mutex;
-
-fn lock_cache(m: &Mutex<RunCache>) -> std::sync::MutexGuard<'_, RunCache> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Guest page lifecycle state (Microsoft Learn page states).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -25,6 +19,67 @@ pub enum PageState {
     Reserved,
     /// Committed — access gated by protect bits.
     Committed,
+}
+
+impl PageState {
+    #[inline]
+    fn to_bits(self) -> u64 {
+        match self {
+            Self::Free => 0,
+            Self::Reserved => 1,
+            Self::Committed => 2,
+        }
+    }
+    #[inline]
+    fn from_bits(v: u64) -> Self {
+        match v & 0b11 {
+            1 => Self::Reserved,
+            2 => Self::Committed,
+            _ => Self::Free,
+        }
+    }
+}
+
+/// Packed hot-run cache. Zero = invalid. Bit layout:
+/// - bit 0        : valid
+/// - bits 1..3    : state (2 bits)
+/// - bits 3..11   : protect (8 bits)
+/// - bits 11..35  : start_page (24 bits — up to 64 GiB VA)
+/// - bits 35..59  : pages_len (24 bits — up to 64 GiB span)
+/// Runs whose start or length exceed the 24-bit window are simply not cached.
+#[inline]
+fn pack_cache(run: PageRun) -> u64 {
+    let len = run.end_page.saturating_sub(run.start_page);
+    if run.start_page >> 24 != 0 || len == 0 || len >> 24 != 0 {
+        return 0;
+    }
+    let mut v: u64 = 1; // valid
+    v |= (run.state.to_bits() & 0b11) << 1;
+    v |= (u64::from(run.protect) & 0xff) << 3;
+    v |= (run.start_page & 0xff_ffff) << 11;
+    v |= (len & 0xff_ffff) << 35;
+    v
+}
+
+#[inline]
+fn cache_hit(packed: u64, page_key: u64) -> Option<PageRun> {
+    if packed & 1 == 0 {
+        return None;
+    }
+    let start = (packed >> 11) & 0xff_ffff;
+    let len = (packed >> 35) & 0xff_ffff;
+    let end = start.saturating_add(len);
+    if page_key < start || page_key >= end {
+        return None;
+    }
+    let state = PageState::from_bits(packed >> 1);
+    let protect = u32::try_from((packed >> 3) & 0xff).unwrap_or(0);
+    Some(PageRun {
+        start_page: start,
+        end_page: end,
+        state,
+        protect,
+    })
 }
 
 /// One homogeneous run of guest pages `[start_page, end_page)`.
@@ -60,32 +115,25 @@ impl PageRun {
     }
 }
 
-/// Single-entry cache for hot SPC walks (stack/heap streams).
-#[derive(Debug, Clone, Copy, Default)]
-struct RunCache {
-    valid: bool,
-    start_page: u64,
-    end_page: u64,
-    state: PageState,
-    protect: u32,
-}
-
 /// Sparse run-length page map: `start_page → PageRun` (non-overlapping, sorted).
 ///
-/// Run-cache uses [`Mutex`] so SPC can run on shared [`GuestMemory`] borrows
-/// (interpreter reads, JIT helpers) while remaining `Sync`.
+/// The hot-path run cache is a lock-free packed [`AtomicU64`] — one relaxed
+/// load per `lookup`, one relaxed store per `fill_cache`. Previously used
+/// `Mutex<RunCache>`, which took a mutex per spanned page on every SPC
+/// `check_access` call (the dominant SPC cost on streaming workloads).
 #[derive(Debug)]
 pub struct PageMap {
     /// Keyed by `start_page`; runs do not overlap.
     runs: BTreeMap<u64, PageRun>,
-    cache: Mutex<RunCache>,
+    /// Packed hot-run cache (see [`pack_cache`] / [`cache_hit`]).
+    cache: AtomicU64,
 }
 
 impl Default for PageMap {
     fn default() -> Self {
         Self {
             runs: BTreeMap::new(),
-            cache: Mutex::new(RunCache::default()),
+            cache: AtomicU64::new(0),
         }
     }
 }
@@ -94,7 +142,7 @@ impl Clone for PageMap {
     fn clone(&self) -> Self {
         Self {
             runs: self.runs.clone(),
-            cache: Mutex::new(*lock_cache(&self.cache)),
+            cache: AtomicU64::new(self.cache.load(Ordering::Relaxed)),
         }
     }
 }
@@ -108,20 +156,15 @@ impl PageMap {
 
     /// Invalidate the hot-path run cache (after any mutation).
     fn bump_cache(&mut self) {
-        *lock_cache(&self.cache) = RunCache::default();
+        self.cache.store(0, Ordering::Relaxed);
     }
 
     /// Look up the run covering `page_key`, if any.
     #[must_use]
     pub fn lookup(&self, page_key: u64) -> Option<PageRun> {
-        let c = *lock_cache(&self.cache);
-        if c.valid && page_key >= c.start_page && page_key < c.end_page {
-            return Some(PageRun {
-                start_page: c.start_page,
-                end_page: c.end_page,
-                state: c.state,
-                protect: c.protect,
-            });
+        let packed = self.cache.load(Ordering::Relaxed);
+        if let Some(hit) = cache_hit(packed, page_key) {
+            return Some(hit);
         }
         // Greatest start_page ≤ page_key.
         let (&start, run) = self.runs.range(..=page_key).next_back()?;
@@ -135,13 +178,10 @@ impl PageMap {
 
     /// Cache a successful lookup for subsequent adjacent accesses.
     fn fill_cache(&self, run: PageRun) {
-        *lock_cache(&self.cache) = RunCache {
-            valid: true,
-            start_page: run.start_page,
-            end_page: run.end_page,
-            state: run.state,
-            protect: run.protect,
-        };
+        let packed = pack_cache(run);
+        if packed != 0 {
+            self.cache.store(packed, Ordering::Relaxed);
+        }
     }
 
     /// Software permission check for `[va, va+len)`.
