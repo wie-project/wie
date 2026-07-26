@@ -49,54 +49,9 @@ pub(crate) const WM_SYSKEYUP: u32 = 0x0105;
 pub(crate) const WM_SYSCHAR: u32 = 0x0106;
 pub(crate) const WM_SYSDEADCHAR: u32 = 0x0107;
 
-
-
-
-
-
-
-
-
 ///
 /// Returns FALSE so the message continues through the normal dispatch path
 /// (no installed WH_MSGFILTER/WH_SYSMSGFILTER hooks).
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 pub mod dc;
 pub mod display;
 pub mod input;
@@ -177,31 +132,8 @@ pub(crate) fn write_wide_window_text(
     u64::try_from(copied).context("wide window text length does not fit u64")
 }
 
-
-
 ///
 /// Fills `PAINTSTRUCT` with a fake HDC and client rect; real painting is stubbed.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 pub(crate) fn window_long_ptr_index(index_raw: u64, api_name: &str) -> Result<i64> {
     let index_low = u32::try_from(index_raw)
@@ -261,17 +193,6 @@ pub(crate) fn set_window_long_ptr_value(
 
     Ok(previous_value)
 }
-
-
-
-
-
-
-
-
-
-
-
 
 pub(crate) fn write_message_structure(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -342,15 +263,7 @@ pub(crate) fn write_message_structure(
     Ok(())
 }
 
-
-
 /// Neutral default message handler used by several USER32 `Def*Proc` APIs.
-
-
-
-
-
-
 
 pub(crate) fn allocate_menu_handle(state: &mut WinApiState) -> Result<u64> {
     let handle = state.window_state.next_menu_handle;
@@ -362,29 +275,9 @@ pub(crate) fn allocate_menu_handle(state: &mut WinApiState) -> Result<u64> {
     Ok(handle)
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 ///
 /// Accepts the call and returns `nPos` (or `nMax` if position is absent) so
 /// scroll-range setup during level-editor open does not abort the guest.
-
-
 
 pub(crate) fn register_window_class(
     state: &mut WinApiState,

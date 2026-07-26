@@ -165,23 +165,12 @@ const GUEST_OS_PLATFORM_NT: u32 = 2;
 
 // Packed `GetVersion` DWORD for the emulated OS (NT bit set in high word).
 
-
-
-
 ///
 /// `lpModuleName == NULL` returns the main module image base from the PE
 /// (`WinApiEnvironment::image_base`), not a hardcoded Lunar Magic address.
 ///
 /// Microsoft Learn: `lpModuleName == NULL` → handle of the calling process's
 /// `.exe`. Named module must already be loaded; otherwise returns `NULL`.
-
-
-
-
-
-
-
-
 
 pub(crate) fn low_u32_to_i32(value: u64, context_name: &str) -> Result<i32> {
     let low = u32::try_from(value & 0xffff_ffff)
@@ -597,10 +586,6 @@ pub(crate) fn find_resource_by_handle(state: &WinApiState, handle: u64) -> Optio
         .find(|resource| resource.handle == handle || resource.loaded_handle == handle)
 }
 
-
-
-
-
 ///
 /// Returns the active guest TID from [`crate::ThreadState`] (primary `0x5678`
 /// until MT.2 spawns workers).
@@ -623,16 +608,12 @@ pub(crate) fn find_resource_by_handle(state: &WinApiState, handle: u64) -> Optio
 /// and returns `NULL`. `dwBytes == 0` is treated as free + `NULL` (common Windows
 /// process-heap behaviour used by the micro-suite).
 
-
-
-
 ///
 // Guest `RTL_CRITICAL_SECTION` layout (Win64) written by Initialize*:
 /// `LockCount` (-1 unlocked), `RecursionCount`, `OwningThread` (guest TID).
 ///
 /// Contended path: returns [`crate::WinApiControlSignal::HostPark`] so the
 /// session drops the shared CPU lock and waits on the CS condvar (MT.3).
-
 
 ///
 /// Zeros the CS fields. Calling Delete while owned is undefined on Windows;
@@ -652,23 +633,6 @@ pub(crate) enum EnterCsResult {
 
 /// Publish one FLS slot into the guest table used by in-guest `FlsGetValue`.
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 ///
 /// Lean host path (also fallback for guest SBCS helper). Single-byte code pages
 /// use zero-extend (matches guest accelerator); others use UTF-8 lossy.
@@ -680,19 +644,9 @@ pub(crate) enum EnterCsResult {
 /// small, the path is truncated (NUL-terminated), the return value is `nSize`,
 /// and last-error is `ERROR_INSUFFICIENT_BUFFER`.
 
-
-
-
-
-
-
 ///
 /// Microsoft Learn: returns the export address, or `NULL` if not found
 /// (`GetLastError` → `ERROR_PROC_NOT_FOUND`). Does **not** abort the process.
-
-
-
-
 
 pub(crate) fn finish_find_first(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -749,8 +703,6 @@ pub(crate) fn finish_find_first(
     Ok(handle)
 }
 
-
-
 pub(crate) fn finish_find_next(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -794,19 +746,6 @@ pub(crate) fn finish_find_next(
     state.process.last_error = 0;
     Ok(1)
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 pub(crate) fn finish_create_file(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -869,7 +808,6 @@ pub(crate) fn finish_create_file(
 /// `NULL` / `INVALID_HANDLE_VALUE` fail with `ERROR_INVALID_HANDLE`.
 /// Open guest files are flushed to the virtual store / bottle host path.
 
-
 /// Full path equality (case-insensitive). Used for FS identity.
 
 /// Opens a guest path using the same resolution rules as `CreateFile*`.
@@ -902,14 +840,6 @@ pub(crate) enum OpenFileOutcome {
 /// Mounts a host file into the guest path namespace.
 
 // Whether a **file** exists at the guest path (for CreateFile open dispositions).
-
-
-
-
-
-
-
-
 
 ///
 /// Microsoft Learn: returns nonzero on success; stores the spin count in the CS.
@@ -980,8 +910,6 @@ pub(crate) fn sync_open_bytes_to_virtual(state: &mut WinApiState, path: &str, ha
 /// - buffer too small: required size **including** the terminating NUL
 /// - size query: `lpBuffer == NULL` and `nBufferLength == 0` → required size with NUL
 /// - failure: zero (not used for the insufficient-buffer case)
-
-
 
 // ─── Soft console / process helpers for real CLI tools (7za) ────────────────
 
@@ -1323,23 +1251,6 @@ pub(crate) fn write_mock_string_w(
     Ok(u64::try_from(needed).unwrap_or(0))
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 /// Friendly computer name (NetBIOS equivalent) — `scutil --get ComputerName` on macOS.
 
 /// DNS hostname (DnsHostname equivalent) — `hostname` on Unix.
@@ -1359,8 +1270,6 @@ pub(crate) fn write_mock_string_w(
 
 /// Common implementation for GetUserProfileDirectory(A/W).
 
-
-
 ///
 /// `NameType` parameter (RCX):
 /// - 0 (ComputerNameNetBIOS) → friendly name
@@ -1368,25 +1277,6 @@ pub(crate) fn write_mock_string_w(
 /// - 2 (ComputerNameDnsDomain) → empty (no domain)
 /// - 3 (ComputerNamePhysicalDnsHostname) → DNS hostname
 /// - 5 (ComputerNamePhysicalNetBIOS) → friendly name
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // Handles `KERNEL32.dll!ReadFileScatter` — stub (synchronous, returns TRUE).
 // Default worker stack size when `dwStackSize == 0`.
@@ -1519,16 +1409,6 @@ const ERROR_TOO_MANY_POSTS: u32 = 298;
 ///
 /// Not planted as an in-guest stub — side effects depend on host idle policy.
 
-
-
-
-
-
-
-
-
-
-
 // Resolve a Windows path against the process current directory.
 pub(crate) fn resolve_full_windows_path(current_directory: &str, input_path: &str) -> String {
     crate::vfs::resolve_full_windows_path(current_directory, input_path)
@@ -1538,10 +1418,6 @@ pub(crate) fn resolve_full_windows_path(current_directory: &str, input_path: &st
 pub(crate) fn normalize_windows_path_components(path: &str) -> String {
     crate::vfs::normalize_windows_path_components(path)
 }
-
-
-
-
 
 pub(crate) fn finish_create_directory(state: &mut WinApiState, path: &str) -> u64 {
     if path.is_empty() {
@@ -1570,8 +1446,6 @@ pub(crate) fn finish_create_directory(state: &mut WinApiState, path: &str) -> u6
     }
 }
 
-
-
 pub(crate) fn finish_delete_file(state: &mut WinApiState, path: &str) -> u64 {
     if path.is_empty() {
         state.process.last_error = ERROR_PATH_NOT_FOUND;
@@ -1597,8 +1471,6 @@ pub(crate) fn finish_delete_file(state: &mut WinApiState, path: &str) -> u64 {
     state.process.last_error = ERROR_FILE_NOT_FOUND;
     0
 }
-
-
 
 pub(crate) fn finish_remove_directory(state: &mut WinApiState, path: &str) -> u64 {
     if path.is_empty() {
@@ -1629,8 +1501,6 @@ pub(crate) fn finish_remove_directory(state: &mut WinApiState, path: &str) -> u6
         }
     }
 }
-
-
 
 pub(crate) fn finish_move_file(state: &mut WinApiState, from: &str, to: &str) -> u64 {
     if from.is_empty() || to.is_empty() {
@@ -1664,11 +1534,6 @@ pub(crate) fn temp_name_id_u32(id: u64) -> u32 {
     u32::try_from(id & 0xffff_ffff).unwrap_or(0)
 }
 
-
-
-
-
-
 pub(crate) fn finish_create_file_create_only(state: &mut WinApiState, guest_path: &str) {
     let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full = resolve_full_windows_path(&cwd, guest_path);
@@ -1681,14 +1546,6 @@ pub(crate) fn finish_create_file_create_only(state: &mut WinApiState, guest_path
         ensure_virtual_file(state, &full);
     }
 }
-
-
-
-
-
-
-
-
 
 pub(crate) fn write_fixed_dir_w(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -1735,10 +1592,6 @@ pub(crate) fn write_fixed_dir_a(
         return_value,
     })
 }
-
-
-
-
 
 #[cfg(test)]
 mod path_resolve_tests {

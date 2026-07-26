@@ -631,8 +631,7 @@ impl RuntimeSession {
             .with_context(|| format!("failed to read PE file: {}", path.display()))?;
         // Parse PE once (avoids double-parse: pe_identity_from_bytes and
         // load_pe_direct_from_bytes both used to call PE::parse independently).
-        let pe = wie_pe::PE::parse(&pe_bytes)
-            .context("failed to parse PE image")?;
+        let pe = wie_pe::PE::parse(&pe_bytes).context("failed to parse PE image")?;
         let identity = wie_pe::pe_identity_from_parsed(&pe, path, &pe_bytes)
             .context("failed to extract PE identity")?;
         let image_size =

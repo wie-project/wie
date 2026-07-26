@@ -150,9 +150,7 @@ impl ImportResolver {
 
     pub fn resolve(&mut self, lib: &str, name: &str, slot: u64) -> anyhow::Result<u64> {
         // unwrap: the Mutex is not poisoned in practice (single-threaded use).
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())(lib, name, slot)
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())(lib, name, slot)
     }
 }
 
