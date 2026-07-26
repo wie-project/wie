@@ -30,136 +30,220 @@ pub enum AccessKind {
     Execute,
 }
 
-/// Whether `protect` (a Windows `PAGE_*` value) allows a data read.
-#[inline]
-#[must_use]
-pub fn allows_read(protect: u32) -> bool {
-    matches!(
-        protect,
-        PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE
-    )
+/// A Windows page protection, as a closed set rather than a raw `u32`.
+///
+/// # Why this is a distinct type
+///
+/// WIE carries **two** permission encodings, and as raw `u32` they collide on
+/// every value while meaning opposite things:
+///
+/// | value | [`crate::perm`] rwx bits | Windows `PAGE_*` |
+/// |-------|--------------------------|------------------|
+/// | `1`   | `READ`                   | `PAGE_NOACCESS`  |
+/// | `2`   | `WRITE`                  | `PAGE_READONLY`  |
+/// | `4`   | `EXEC`                   | `PAGE_READWRITE` |
+/// | `7`   | `ALL` (rwx)              | *invalid*        |
+///
+/// Passing rwx bits where a `PAGE_*` was expected used to compile silently and
+/// either deny everything (`READ` reads as `PAGE_NOACCESS`) or *widen*
+/// permissions (`EXEC` reads as `PAGE_READWRITE`, making an execute-only page
+/// writable). Keeping the Windows side in this enum and the rwx side in
+/// [`crate::RwxPerms`] makes that mix-up a type error.
+///
+/// The `u32` form is the guest ABI (`VirtualAlloc`/`VirtualProtect` arguments,
+/// `VirtualQuery` results, PE section characteristics) and appears only in
+/// [`Self::to_win32`] / [`Self::from_win32`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PageProtect {
+    NoAccess,
+    ReadOnly,
+    ReadWrite,
+    Execute,
+    ExecuteRead,
+    ExecuteReadWrite,
 }
 
-/// Whether `protect` allows a data write.
-#[inline]
-#[must_use]
-pub fn allows_write(protect: u32) -> bool {
-    matches!(protect, PAGE_READWRITE | PAGE_EXECUTE_READWRITE)
-}
+impl PageProtect {
+    /// Windows `PAGE_*` value for the guest ABI.
+    #[must_use]
+    pub fn to_win32(self) -> u32 {
+        match self {
+            Self::NoAccess => PAGE_NOACCESS,
+            Self::ReadOnly => PAGE_READONLY,
+            Self::ReadWrite => PAGE_READWRITE,
+            Self::Execute => PAGE_EXECUTE,
+            Self::ExecuteRead => PAGE_EXECUTE_READ,
+            Self::ExecuteReadWrite => PAGE_EXECUTE_READWRITE,
+        }
+    }
 
-/// Whether `protect` allows instruction fetch / execute.
-#[inline]
-#[must_use]
-pub fn allows_execute(protect: u32) -> bool {
-    matches!(
-        protect,
-        PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE
-    )
-}
+    /// Parse a guest-supplied `PAGE_*` value. `None` for unsupported values,
+    /// which callers surface as `ERROR_INVALID_PARAMETER`.
+    #[must_use]
+    pub fn from_win32(value: u32) -> Option<Self> {
+        match value {
+            PAGE_NOACCESS => Some(Self::NoAccess),
+            PAGE_READONLY => Some(Self::ReadOnly),
+            PAGE_READWRITE => Some(Self::ReadWrite),
+            PAGE_EXECUTE => Some(Self::Execute),
+            PAGE_EXECUTE_READ => Some(Self::ExecuteRead),
+            PAGE_EXECUTE_READWRITE => Some(Self::ExecuteReadWrite),
+            _ => None,
+        }
+    }
 
-/// Whether `protect` allows the given access kind.
-#[inline]
-#[must_use]
-pub fn allows(protect: u32, kind: AccessKind) -> bool {
-    match kind {
-        AccessKind::Read => allows_read(protect),
-        AccessKind::Write => allows_write(protect),
-        AccessKind::Execute => allows_execute(protect),
+    /// Whether a data read is permitted.
+    #[must_use]
+    pub fn allows_read(self) -> bool {
+        matches!(
+            self,
+            Self::ReadOnly | Self::ReadWrite | Self::ExecuteRead | Self::ExecuteReadWrite
+        )
+    }
+
+    /// Whether a data write is permitted.
+    #[must_use]
+    pub fn allows_write(self) -> bool {
+        matches!(self, Self::ReadWrite | Self::ExecuteReadWrite)
+    }
+
+    /// Whether instruction fetch is permitted.
+    #[must_use]
+    pub fn allows_execute(self) -> bool {
+        matches!(
+            self,
+            Self::Execute | Self::ExecuteRead | Self::ExecuteReadWrite
+        )
+    }
+
+    /// Whether `kind` is permitted.
+    #[must_use]
+    pub fn allows(self, kind: AccessKind) -> bool {
+        match kind {
+            AccessKind::Read => self.allows_read(),
+            AccessKind::Write => self.allows_write(),
+            AccessKind::Execute => self.allows_execute(),
+        }
+    }
+
+    /// Nearest Windows protection for a set of rwx bits.
+    ///
+    /// Windows has no write-only or write+execute-without-read protection, so
+    /// those widen to the read-inclusive equivalent.
+    #[must_use]
+    pub fn from_rwx(rwx: crate::RwxPerms) -> Self {
+        match (rwx.read(), rwx.write(), rwx.exec()) {
+            (_, true, true) => Self::ExecuteReadWrite,
+            (true, false, true) => Self::ExecuteRead,
+            (_, true, false) => Self::ReadWrite,
+            (true, false, false) => Self::ReadOnly,
+            (false, false, true) => Self::Execute,
+            (false, false, false) => Self::NoAccess,
+        }
+    }
+
+    /// The rwx bits this protection grants.
+    #[must_use]
+    pub fn to_rwx(self) -> crate::RwxPerms {
+        crate::RwxPerms::new(
+            self.allows_read(),
+            self.allows_write(),
+            self.allows_execute(),
+        )
     }
 }
 
-/// Convert legacy Unicorn-style rwx bits (`perm::READ|WRITE|EXEC`) to a Windows `PAGE_*`.
+/// Convert legacy Unicorn-style rwx bits to a Windows `PAGE_*` value.
 ///
-/// | rwx bits | Result |
-/// |----------|--------|
-/// | 7 (rwx)  | `PAGE_EXECUTE_READWRITE` |
-/// | 5 (r-x)  | `PAGE_EXECUTE_READ` |
-/// | 6 (rw-)  | `PAGE_READWRITE` |
-/// | 1 (r--)  | `PAGE_READONLY` |
-/// | 4 (--x)  | `PAGE_EXECUTE` |
-/// | 0        | `PAGE_NOACCESS` |
+/// Raw-`u32` shim for host mapping call sites that still speak in rwx bits.
+/// Prefer [`PageProtect::from_rwx`], which cannot be handed the wrong encoding.
 #[must_use]
 pub fn page_protect_from_rwx(rwx: u32) -> u32 {
-    let r = (rwx & crate::perm::READ) != 0;
-    let w = (rwx & crate::perm::WRITE) != 0;
-    let x = (rwx & crate::perm::EXEC) != 0;
-    match (r, w, x) {
-        // Windows has no write-only / write+exec-without-read; map those to RW(X).
-        (true | false, true, true) => PAGE_EXECUTE_READWRITE,
-        (true, false, true) => PAGE_EXECUTE_READ,
-        (true | false, true, false) => PAGE_READWRITE,
-        (true, false, false) => PAGE_READONLY,
-        (false, false, true) => PAGE_EXECUTE,
-        (false, false, false) => PAGE_NOACCESS,
-    }
+    PageProtect::from_rwx(crate::RwxPerms::from_bits(rwx)).to_win32()
 }
 
 /// Convert a Windows `PAGE_*` value to Unicorn-style rwx bits.
+///
+/// Unsupported values carry no permissions, matching the previous behaviour
+/// where every `allows_*` predicate returned false.
 #[must_use]
 pub fn rwx_from_page_protect(protect: u32) -> u32 {
-    let mut bits = 0_u32;
-    if allows_read(protect) {
-        bits |= crate::perm::READ;
-    }
-    if allows_write(protect) {
-        bits |= crate::perm::WRITE;
-    }
-    if allows_execute(protect) {
-        bits |= crate::perm::EXEC;
-    }
-    bits
+    PageProtect::from_win32(protect).map_or(0, |p| p.to_rwx().bits())
 }
 
 /// True if `value` is one of the Phase 3 primary protect constants.
 #[must_use]
 pub fn is_supported_protect(value: u32) -> bool {
-    matches!(
-        value,
-        PAGE_NOACCESS
-            | PAGE_READONLY
-            | PAGE_READWRITE
-            | PAGE_EXECUTE
-            | PAGE_EXECUTE_READ
-            | PAGE_EXECUTE_READWRITE
-    )
+    PageProtect::from_win32(value).is_some()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RwxPerms;
     use crate::perm;
 
     #[test]
     fn rwx_all_roundtrips_to_erw() {
-        let p = page_protect_from_rwx(perm::ALL);
-        assert_eq!(p, PAGE_EXECUTE_READWRITE);
-        assert!(allows_read(p) && allows_write(p) && allows_execute(p));
-        assert_eq!(rwx_from_page_protect(p), perm::ALL);
+        let p = PageProtect::from_rwx(RwxPerms::ALL);
+        assert_eq!(p, PageProtect::ExecuteReadWrite);
+        assert!(p.allows_read() && p.allows_write() && p.allows_execute());
+        assert_eq!(p.to_rwx(), RwxPerms::ALL);
     }
 
     #[test]
     fn readonly_denies_write_and_exec() {
-        let p = page_protect_from_rwx(perm::READ);
-        assert_eq!(p, PAGE_READONLY);
-        assert!(allows_read(p));
-        assert!(!allows_write(p));
-        assert!(!allows_execute(p));
+        let p = PageProtect::from_rwx(RwxPerms::READ);
+        assert_eq!(p, PageProtect::ReadOnly);
+        assert!(p.allows_read());
+        assert!(!p.allows_write());
+        assert!(!p.allows_execute());
     }
 
     #[test]
     fn execute_read_allows_fetch_not_write() {
-        let p = page_protect_from_rwx(perm::READ | perm::EXEC);
-        assert_eq!(p, PAGE_EXECUTE_READ);
-        assert!(allows(p, AccessKind::Read));
-        assert!(allows(p, AccessKind::Execute));
-        assert!(!allows(p, AccessKind::Write));
+        let p = PageProtect::from_rwx(RwxPerms::new(true, false, true));
+        assert_eq!(p, PageProtect::ExecuteRead);
+        assert!(p.allows(AccessKind::Read));
+        assert!(p.allows(AccessKind::Execute));
+        assert!(!p.allows(AccessKind::Write));
     }
 
     #[test]
     fn execute_only_allows_fetch_not_data_read() {
-        let p = PAGE_EXECUTE;
-        assert!(allows_execute(p));
-        assert!(!allows_read(p));
-        assert!(!allows_write(p));
+        let p = PageProtect::Execute;
+        assert!(p.allows_execute());
+        assert!(!p.allows_read());
+        assert!(!p.allows_write());
+    }
+
+    /// Every variant survives the guest-ABI round trip.
+    #[test]
+    fn win32_roundtrips() {
+        for p in [
+            PageProtect::NoAccess,
+            PageProtect::ReadOnly,
+            PageProtect::ReadWrite,
+            PageProtect::Execute,
+            PageProtect::ExecuteRead,
+            PageProtect::ExecuteReadWrite,
+        ] {
+            assert_eq!(PageProtect::from_win32(p.to_win32()), Some(p), "{p:?}");
+        }
+        assert_eq!(PageProtect::from_win32(0), None);
+        assert_eq!(PageProtect::from_win32(0x1234), None);
+    }
+
+    /// The two encodings collide numerically, which is the whole reason they
+    /// are separate types. Pin the collision so the hazard stays documented:
+    /// reading rwx bits as a `PAGE_*` yields a *different, valid* protection.
+    #[test]
+    fn rwx_bits_and_page_constants_collide_numerically() {
+        assert_eq!(perm::READ, PAGE_NOACCESS);
+        assert_eq!(perm::WRITE, PAGE_READONLY);
+        // The dangerous one: execute bits read as read-write.
+        assert_eq!(perm::EXEC, PAGE_READWRITE);
+        // …and the combined rwx set is not a valid protection at all.
+        assert_eq!(PageProtect::from_win32(perm::ALL), None);
     }
 }

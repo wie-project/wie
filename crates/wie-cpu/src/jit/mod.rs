@@ -29,7 +29,7 @@ mod trampolines;
 pub use fast_api::{FastApiKind, JitFastPathConfig, JitHeapLayout};
 
 use crate::exec::{self, HookWindow, StepResult};
-use crate::mem::{self, GuestMemory, PAGE_SIZE, PAGE_SIZE_USIZE, protect};
+use crate::mem::{self, GuestMemory, PAGE_SIZE, PAGE_SIZE_USIZE};
 use crate::regs::RegFile;
 use crate::{CodeHookOutcome, InvalidMemoryAccess};
 use crate::{CpuEngine, CpuError, RunUntilHook};
@@ -1768,7 +1768,13 @@ impl CpuEngine for JitCpu {
             self.shared.mem.read().unwrap().generation(),
             Ordering::Release,
         );
-        if r.is_ok() && !protect::allows_execute(new_protect) {
+        // X-loss: dropping execute permission invalidates any compiled blocks
+        // over the range. An unparseable protect is treated as non-executable,
+        // matching the previous `allows_execute(u32)`, which returned false for
+        // values outside the supported set.
+        let loses_exec = crate::mem::protect::PageProtect::from_win32(new_protect)
+            .is_none_or(|p| !p.allows_execute());
+        if r.is_ok() && loses_exec {
             self.invalidate_code_range(addr, size);
         }
         self.invalidate_tlb();
@@ -2119,6 +2125,7 @@ impl CpuEngine for JitCpu {
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::mem::protect;
     use crate::mem::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE};
     use crate::perm;
 

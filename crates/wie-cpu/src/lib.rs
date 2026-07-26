@@ -51,6 +51,69 @@ pub mod perm {
     pub const ALL: u32 = READ | WRITE | EXEC;
 }
 
+/// Unicorn-style read/write/execute permission bits.
+///
+/// Deliberately *not* interchangeable with [`mem::protect::PageProtect`]: the
+/// two encodings collide numerically (rwx `EXEC` == `PAGE_READWRITE` == `4`)
+/// while meaning different things, so mixing them silently either denied all
+/// access or widened it. Converting now requires naming the direction, via
+/// [`mem::protect::PageProtect::from_rwx`] / [`mem::protect::PageProtect::to_rwx`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RwxPerms(u32);
+
+impl RwxPerms {
+    /// No access.
+    pub const NONE: Self = Self(0);
+    /// Read + write + execute.
+    pub const ALL: Self = Self(perm::ALL);
+    /// Read only.
+    pub const READ: Self = Self(perm::READ);
+    /// Read + write (typical data mapping).
+    pub const READ_WRITE: Self = Self(perm::READ | perm::WRITE);
+
+    #[must_use]
+    pub const fn new(read: bool, write: bool, exec: bool) -> Self {
+        let mut bits = 0;
+        if read {
+            bits |= perm::READ;
+        }
+        if write {
+            bits |= perm::WRITE;
+        }
+        if exec {
+            bits |= perm::EXEC;
+        }
+        Self(bits)
+    }
+
+    /// Wrap raw Unicorn-style bits (host mapping APIs, legacy call sites).
+    #[must_use]
+    pub const fn from_bits(bits: u32) -> Self {
+        Self(bits & perm::ALL)
+    }
+
+    /// Raw bits, for the arena/mmap layer.
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn read(self) -> bool {
+        self.0 & perm::READ != 0
+    }
+
+    #[must_use]
+    pub const fn write(self) -> bool {
+        self.0 & perm::WRITE != 0
+    }
+
+    #[must_use]
+    pub const fn exec(self) -> bool {
+        self.0 & perm::EXEC != 0
+    }
+}
+
 /// Re-export for call sites that used the old Unicorn-shaped name.
 pub const PROT_ALL: u32 = perm::ALL;
 
