@@ -1167,30 +1167,86 @@ pub(super) unsafe extern "C" fn wie_jit_string(
     }
 }
 
-/// Scalar f32 binop: `op` 0=add 1=sub 2=mul 3=div; args/result in low 32 bits.
+/// SSE floating-point binary operation.
+///
+/// As with [`StringOpKind`], the numeric form is an ABI detail: the JIT passes
+/// it to [`wie_f32_binop`] / [`wie_f64_binop`] through an `extern "C"` `u64`.
+/// [`Self::to_abi`] and [`TryFrom<u64>`] are the only places that encoding
+/// appears; every other site names the operation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum FloatBinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+impl FloatBinOp {
+    pub(super) fn to_abi(self) -> u64 {
+        match self {
+            Self::Add => 0,
+            Self::Sub => 1,
+            Self::Mul => 2,
+            Self::Div => 3,
+        }
+    }
+}
+
+impl TryFrom<u64> for FloatBinOp {
+    type Error = ();
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Add),
+            1 => Ok(Self::Sub),
+            2 => Ok(Self::Mul),
+            3 => Ok(Self::Div),
+            _ => Err(()),
+        }
+    }
+}
+
+/// IEEE width an SSE FP instruction operates on.
+///
+/// Replaces an `is_f64: bool` parameter that sat next to the opcode at call
+/// sites, making them read `(.., 3, true)` — two unlabelled literals.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FloatWidth {
+    F32,
+    F64,
+}
+
+/// Scalar f32 binop; args/result in low 32 bits.
 pub(super) extern "C" fn wie_f32_binop(op: u64, a: u64, b: u64) -> u64 {
     let fa = f32::from_bits(a as u32);
     let fb = f32::from_bits(b as u32);
+    // Unreachable in practice: the lowering only ever emits `to_abi` values.
+    // Returning the left operand preserves the previous defensive behaviour
+    // (these helpers have no JitCtx, so they cannot raise a fault).
+    let Ok(op) = FloatBinOp::try_from(op) else {
+        return a;
+    };
     let r = match op {
-        0 => fa + fb,
-        1 => fa - fb,
-        2 => fa * fb,
-        3 => fa / fb,
-        _ => fa,
+        FloatBinOp::Add => fa + fb,
+        FloatBinOp::Sub => fa - fb,
+        FloatBinOp::Mul => fa * fb,
+        FloatBinOp::Div => fa / fb,
     };
     u64::from(r.to_bits())
 }
 
-/// Scalar f64 binop: `op` 0=add 1=sub 2=mul 3=div.
+/// Scalar f64 binop.
 pub(super) extern "C" fn wie_f64_binop(op: u64, a: u64, b: u64) -> u64 {
     let fa = f64::from_bits(a);
     let fb = f64::from_bits(b);
+    let Ok(op) = FloatBinOp::try_from(op) else {
+        return a;
+    };
     let r = match op {
-        0 => fa + fb,
-        1 => fa - fb,
-        2 => fa * fb,
-        3 => fa / fb,
-        _ => fa,
+        FloatBinOp::Add => fa + fb,
+        FloatBinOp::Sub => fa - fb,
+        FloatBinOp::Mul => fa * fb,
+        FloatBinOp::Div => fa / fb,
     };
     r.to_bits()
 }
@@ -2787,12 +2843,16 @@ fn lower_sse_bitwise(
     Ok(())
 }
 
-fn clif_fbinop(bcx: &mut FunctionBuilder<'_>, op: u64, a: Value, b: Value) -> Value {
+/// Emit the native Cranelift FP instruction for `op`.
+///
+/// Exhaustive: previously any unrecognised opcode fell through to `fadd`,
+/// so a mis-encoded operation silently computed an addition.
+fn clif_fbinop(bcx: &mut FunctionBuilder<'_>, op: FloatBinOp, a: Value, b: Value) -> Value {
     match op {
-        1 => bcx.ins().fsub(a, b),
-        2 => bcx.ins().fmul(a, b),
-        3 => bcx.ins().fdiv(a, b),
-        _ => bcx.ins().fadd(a, b),
+        FloatBinOp::Add => bcx.ins().fadd(a, b),
+        FloatBinOp::Sub => bcx.ins().fsub(a, b),
+        FloatBinOp::Mul => bcx.ins().fmul(a, b),
+        FloatBinOp::Div => bcx.ins().fdiv(a, b),
     }
 }
 
@@ -2804,8 +2864,8 @@ fn lower_sse_scalar_fp(
     rflags: Value,
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
-    op: u64,
-    is_f64: bool,
+    op: FloatBinOp,
+    width: FloatWidth,
 ) -> Result<(), String> {
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
@@ -2814,14 +2874,14 @@ fn lower_sse_scalar_fp(
         OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
         OpKind::Memory => {
             let addr = effective_addr(bcx, instr, gpr)?;
-            let nbytes = if is_f64 { 8 } else { 4 };
+            let nbytes = if width == FloatWidth::F64 { 8 } else { 4 };
             load_sse_mem(bcx, mem, gpr, rflags, addr, nbytes, instr.ip())?
         }
         _ => return Err("sse scalar fp src".into()),
     };
     let _ = b_hi;
     let (new_lo, new_hi) = if jit_simd_enabled() {
-        if is_f64 {
+        if width == FloatWidth::F64 {
             let fa = bcx.ins().bitcast(types::F64, mem.flags, a_lo);
             let fb = bcx.ins().bitcast(types::F64, mem.flags, b_lo);
             let fr = clif_fbinop(bcx, op, fa, fb);
@@ -2841,8 +2901,8 @@ fn lower_sse_scalar_fp(
             (bcx.ins().bor(cleared, r64), a_hi)
         }
     } else {
-        let op_v = iconst_u64(bcx, op);
-        if is_f64 {
+        let op_v = iconst_u64(bcx, op.to_abi());
+        if width == FloatWidth::F64 {
             let fref = mem.f64_ref.ok_or("f64 helper missing")?;
             let call = bcx.ins().call(fref, &[op_v, a_lo, b_lo]);
             let r = bcx.inst_results(call)[0];
@@ -2870,8 +2930,8 @@ fn lower_sse_packed_fp(
     rflags: Value,
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
-    op: u64,
-    is_f64: bool,
+    op: FloatBinOp,
+    width: FloatWidth,
 ) -> Result<(), String> {
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
@@ -2887,7 +2947,7 @@ fn lower_sse_packed_fp(
     if jit_simd_enabled() {
         let a8 = pair_to_i8x16(bcx, mem.flags, a_lo, a_hi);
         let b8 = pair_to_i8x16(bcx, mem.flags, b_lo, b_hi);
-        let (lo, hi) = if is_f64 {
+        let (lo, hi) = if width == FloatWidth::F64 {
             let a = bcx.ins().bitcast(types::F64X2, mem.flags, a8);
             let b = bcx.ins().bitcast(types::F64X2, mem.flags, b8);
             let c = clif_fbinop(bcx, op, a, b);
@@ -2903,8 +2963,8 @@ fn lower_sse_packed_fp(
         store_xmm_pair(bcx, mem, xmm, di, lo, hi);
         return Ok(());
     }
-    let op_v = iconst_u64(bcx, op);
-    if is_f64 {
+    let op_v = iconst_u64(bcx, op.to_abi());
+    if width == FloatWidth::F64 {
         let fref = mem.f64_ref.ok_or("f64 helper missing")?;
         let call0 = bcx.ins().call(fref, &[op_v, a_lo, b_lo]);
         let r0 = bcx.inst_results(call0)[0];
@@ -3541,22 +3601,166 @@ fn lower_insn(
         Mnemonic::Andnps | Mnemonic::Andnpd | Mnemonic::Pandn => {
             lower_sse_bitwise(bcx, instr, gpr, *rflags, mem, xmm, SseBit::Andn)
         }
-        Mnemonic::Addss => lower_sse_scalar_fp(bcx, instr, gpr, *rflags, mem, xmm, 0, false),
-        Mnemonic::Subss => lower_sse_scalar_fp(bcx, instr, gpr, *rflags, mem, xmm, 1, false),
-        Mnemonic::Mulss => lower_sse_scalar_fp(bcx, instr, gpr, *rflags, mem, xmm, 2, false),
-        Mnemonic::Divss => lower_sse_scalar_fp(bcx, instr, gpr, *rflags, mem, xmm, 3, false),
-        Mnemonic::Addsd => lower_sse_scalar_fp(bcx, instr, gpr, *rflags, mem, xmm, 0, true),
-        Mnemonic::Subsd => lower_sse_scalar_fp(bcx, instr, gpr, *rflags, mem, xmm, 1, true),
-        Mnemonic::Mulsd => lower_sse_scalar_fp(bcx, instr, gpr, *rflags, mem, xmm, 2, true),
-        Mnemonic::Divsd => lower_sse_scalar_fp(bcx, instr, gpr, *rflags, mem, xmm, 3, true),
-        Mnemonic::Addps => lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, 0, false),
-        Mnemonic::Subps => lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, 1, false),
-        Mnemonic::Mulps => lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, 2, false),
-        Mnemonic::Divps => lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, 3, false),
-        Mnemonic::Addpd => lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, 0, true),
-        Mnemonic::Subpd => lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, 1, true),
-        Mnemonic::Mulpd => lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, 2, true),
-        Mnemonic::Divpd => lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, 3, true),
+        Mnemonic::Addss => lower_sse_scalar_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Add,
+            FloatWidth::F32,
+        ),
+        Mnemonic::Subss => lower_sse_scalar_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Sub,
+            FloatWidth::F32,
+        ),
+        Mnemonic::Mulss => lower_sse_scalar_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Mul,
+            FloatWidth::F32,
+        ),
+        Mnemonic::Divss => lower_sse_scalar_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Div,
+            FloatWidth::F32,
+        ),
+        Mnemonic::Addsd => lower_sse_scalar_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Add,
+            FloatWidth::F64,
+        ),
+        Mnemonic::Subsd => lower_sse_scalar_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Sub,
+            FloatWidth::F64,
+        ),
+        Mnemonic::Mulsd => lower_sse_scalar_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Mul,
+            FloatWidth::F64,
+        ),
+        Mnemonic::Divsd => lower_sse_scalar_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Div,
+            FloatWidth::F64,
+        ),
+        Mnemonic::Addps => lower_sse_packed_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Add,
+            FloatWidth::F32,
+        ),
+        Mnemonic::Subps => lower_sse_packed_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Sub,
+            FloatWidth::F32,
+        ),
+        Mnemonic::Mulps => lower_sse_packed_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Mul,
+            FloatWidth::F32,
+        ),
+        Mnemonic::Divps => lower_sse_packed_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Div,
+            FloatWidth::F32,
+        ),
+        Mnemonic::Addpd => lower_sse_packed_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Add,
+            FloatWidth::F64,
+        ),
+        Mnemonic::Subpd => lower_sse_packed_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Sub,
+            FloatWidth::F64,
+        ),
+        Mnemonic::Mulpd => lower_sse_packed_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Mul,
+            FloatWidth::F64,
+        ),
+        Mnemonic::Divpd => lower_sse_packed_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Div,
+            FloatWidth::F64,
+        ),
         Mnemonic::Punpcklqdq | Mnemonic::Punpckhqdq => {
             flush_pending(bcx, rflags, pending);
             lower_sse_punpck(bcx, instr, xmm, mem)
@@ -6234,4 +6438,74 @@ fn flags_sub(
     let af_cond = bcx.ins().icmp_imm(IntCC::NotEqual, af_b, 0);
     let af = select_flag(bcx, af_cond, rflags::AF);
     bcx.ins().bor(f, af)
+}
+
+#[cfg(test)]
+mod float_abi_tests {
+    use super::FloatBinOp;
+
+    const ALL: [FloatBinOp; 4] = [
+        FloatBinOp::Add,
+        FloatBinOp::Sub,
+        FloatBinOp::Mul,
+        FloatBinOp::Div,
+    ];
+
+    /// The lowering encodes the op into an `extern "C"` u64 that
+    /// `wie_f32_binop` / `wie_f64_binop` decode. A mismatch would silently
+    /// compute a different arithmetic operation.
+    #[test]
+    fn float_binop_abi_roundtrips() {
+        for op in ALL {
+            assert_eq!(FloatBinOp::try_from(op.to_abi()), Ok(op), "{op:?}");
+        }
+    }
+
+    #[test]
+    fn float_binop_abi_values_are_stable() {
+        assert_eq!(FloatBinOp::Add.to_abi(), 0);
+        assert_eq!(FloatBinOp::Sub.to_abi(), 1);
+        assert_eq!(FloatBinOp::Mul.to_abi(), 2);
+        assert_eq!(FloatBinOp::Div.to_abi(), 3);
+    }
+
+    #[test]
+    fn float_binop_rejects_out_of_range() {
+        for raw in [4_u64, 5, u64::MAX] {
+            assert_eq!(FloatBinOp::try_from(raw), Err(()), "raw={raw}");
+        }
+    }
+
+    /// Guards the helper decode end-to-end: each opcode must produce the
+    /// arithmetic it names, not the `add` the old `_ =>` arm fell back to.
+    #[test]
+    fn float_helpers_compute_the_named_op() {
+        let (a32, b32) = (8.0_f32, 2.0_f32);
+        let enc = |x: f32| u64::from(x.to_bits());
+        let dec32 = |x: u64| f32::from_bits(u32::try_from(x & 0xffff_ffff).unwrap_or(0));
+        for (op, want) in [
+            (FloatBinOp::Add, 10.0_f32),
+            (FloatBinOp::Sub, 6.0),
+            (FloatBinOp::Mul, 16.0),
+            (FloatBinOp::Div, 4.0),
+        ] {
+            let got = dec32(super::wie_f32_binop(op.to_abi(), enc(a32), enc(b32)));
+            assert!((got - want).abs() < f32::EPSILON, "{op:?}: {got} != {want}");
+        }
+
+        let (a64, b64) = (8.0_f64, 2.0_f64);
+        for (op, want) in [
+            (FloatBinOp::Add, 10.0_f64),
+            (FloatBinOp::Sub, 6.0),
+            (FloatBinOp::Mul, 16.0),
+            (FloatBinOp::Div, 4.0),
+        ] {
+            let got = f64::from_bits(super::wie_f64_binop(
+                op.to_abi(),
+                a64.to_bits(),
+                b64.to_bits(),
+            ));
+            assert!((got - want).abs() < f64::EPSILON, "{op:?}: {got} != {want}");
+        }
+    }
 }

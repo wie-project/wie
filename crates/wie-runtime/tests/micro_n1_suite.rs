@@ -52,6 +52,20 @@ fn n1_cpu_string_exits_zero() {
     run_expect_zero("cpu_string.exe");
 }
 
+/// Scalar/packed SSE arithmetic (ADDSS/SUBSD/MULPS/DIVPD and friends).
+///
+/// Same coverage gap as `cpu_string`: built by the Makefile, never executed.
+#[test]
+fn n1_cpu_fp_exits_zero() {
+    run_expect_zero("cpu_fp.exe");
+}
+
+/// Integer ALU / shift / flag coverage.
+#[test]
+fn n1_cpu_math_exits_zero() {
+    run_expect_zero("cpu_math.exe");
+}
+
 /// REP MOVS/STOS across every length in [1, 70].
 ///
 /// Regression guard for the JIT inline-REP path, which accepted any length in
