@@ -416,10 +416,11 @@ impl OpenGuestFile {
     #[must_use]
     pub fn size(&self) -> u64 {
         if self.streaming {
+            // Route through the VFS stat cache rather than a bare `metadata`
+            // syscall — streaming WriteFile queries this per call.
             self.host_path
                 .as_ref()
-                .and_then(|p| std::fs::metadata(p).ok())
-                .map_or(0, |m| m.len())
+                .map_or(0, |p| vfs::host_file_len(p).unwrap_or(0))
         } else {
             u64::try_from(self.bytes.len()).unwrap_or(0)
         }

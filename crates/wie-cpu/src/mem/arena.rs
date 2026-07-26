@@ -556,19 +556,19 @@ impl ArenaSet {
     /// on Darwin; we align conservatively).
     fn hint_release(&self, address: u64, size: usize) {
         // Compute page-aligned inner range.
-        let end = match address.checked_add(u64::try_from(size).unwrap_or(0)) {
-            Some(e) => e,
-            None => return,
+        let Some(end) = address.checked_add(u64::try_from(size).unwrap_or(0)) else {
+            return;
         };
         let page_size = PAGE_SIZE;
-        let aligned_start = address.checked_add(page_size - 1).map_or(0, |v| v & !(page_size - 1));
+        let aligned_start = address
+            .checked_add(page_size - 1)
+            .map_or(0, |v| v & !(page_size - 1));
         let aligned_end = end & !(page_size - 1);
         if aligned_end <= aligned_start {
             return;
         }
-        let aligned_len = match usize::try_from(aligned_end.saturating_sub(aligned_start)) {
-            Ok(v) => v,
-            Err(_) => return,
+        let Ok(aligned_len) = usize::try_from(aligned_end.saturating_sub(aligned_start)) else {
+            return;
         };
         let Some(arena) = self.find_va(aligned_start) else {
             return;
@@ -584,9 +584,8 @@ impl ArenaSet {
             return;
         }
         let offset = aligned_start.saturating_sub(arena.guest_base());
-        let offset_usize = match usize::try_from(offset) {
-            Ok(v) => v,
-            Err(_) => return,
+        let Ok(offset_usize) = usize::try_from(offset) else {
+            return;
         };
         // SAFETY: `host_base` is a live mmap base owned by `arena`; the aligned
         // range fits inside the arena's mmap region (checked above); madvise

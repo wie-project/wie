@@ -46,6 +46,7 @@ impl PageState {
 /// - bits 3..11   : protect (8 bits)
 /// - bits 11..35  : start_page (24 bits — up to 64 GiB VA)
 /// - bits 35..59  : pages_len (24 bits — up to 64 GiB span)
+///
 /// Runs whose start or length exceed the 24-bit window are simply not cached.
 #[inline]
 fn pack_cache(run: PageRun) -> u64 {

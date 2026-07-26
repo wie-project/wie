@@ -2351,7 +2351,7 @@ fn journal_api_return(
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
+        .open(path)
     {
         use std::io::Write;
         let _ = f.write_all(line.as_bytes());
