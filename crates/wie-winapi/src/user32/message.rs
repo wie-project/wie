@@ -84,6 +84,9 @@ pub fn handle_peek_message_a(
     })
 }
 /// Handles `USER32.dll!CallMsgFilterA/W`.
+///
+/// Returns FALSE so the message continues through the normal dispatch path
+/// (no installed WH_MSGFILTER/WH_SYSMSGFILTER hooks).
 pub fn handle_call_msg_filter(
     engine: &mut dyn wie_cpu::CpuEngine,
     api_name: &str,
