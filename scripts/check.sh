@@ -15,6 +15,9 @@ echo "=== cargo test ==="
 cargo test --workspace --manifest-path "$ROOT/Cargo.toml"
 
 echo "=== micro-suite ==="
-make -C "$ROOT/micro-exes" && "$ROOT/scripts/run-micro-suite.sh"
+# Separate statements, not `make && suite`: `set -e` exempts the left operand of
+# `&&`, so a micro-exe compile failure used to skip the suite and still report success.
+make -C "$ROOT/micro-exes"
+"$ROOT/scripts/run-micro-suite.sh"
 
 echo "=== all checks passed ==="
