@@ -1,10 +1,10 @@
-use super::{Context, Result, WinApiHandlerResult, WinApiState, allocate_menu_handle};
+use super::{Context, Result, WinApiHandlerResult, allocate_menu_handle};
+use crate::HandlerContext;
 
 /// Handles `USER32.dll!EnableMenuItem`.
-pub fn handle_enable_menu_item(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_enable_menu_item(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let menu_handle = engine
         .read_rcx()
         .context("failed to read RCX for EnableMenuItem")?;
@@ -56,10 +56,9 @@ pub fn handle_enable_menu_item(
     })
 }
 /// Handles `USER32.dll!CheckMenuItem`.
-pub fn handle_check_menu_item(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_check_menu_item(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let menu_handle = engine
         .read_rcx()
         .context("failed to read RCX for CheckMenuItem")?;
@@ -110,9 +109,10 @@ pub fn handle_check_menu_item(
     })
 }
 pub(crate) fn handle_menu_success(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
     api_name: &str,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let return_address = engine
         .return_from_win64_api(1)
         .with_context(|| format!("failed to return from {api_name}"))?;
@@ -123,10 +123,9 @@ pub(crate) fn handle_menu_success(
     })
 }
 /// Handles `USER32.dll!GetMenu` — returns the HMENU for a window, or 0.
-pub fn handle_get_menu(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let hwnd = engine.read_rcx()?;
     let menu_handle = state
         .window_state
@@ -141,10 +140,9 @@ pub fn handle_get_menu(
     })
 }
 /// Handles `USER32.dll!CreateMenu`.
-pub fn handle_create_menu(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_create_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = allocate_menu_handle(state)?;
     let return_address = engine
         .return_from_win64_api(handle)
@@ -155,10 +153,9 @@ pub fn handle_create_menu(
     })
 }
 /// Handles `USER32.dll!CreatePopupMenu`.
-pub fn handle_create_popup_menu(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_create_popup_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = allocate_menu_handle(state)?;
     let return_address = engine
         .return_from_win64_api(handle)
@@ -169,42 +166,41 @@ pub fn handle_create_popup_menu(
     })
 }
 /// Handles `USER32.dll!AppendMenuA`.
-pub fn handle_append_menu_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    handle_menu_success(engine, "AppendMenuA")
+pub fn handle_append_menu_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_menu_success(ctx, "AppendMenuA")
 }
 /// Handles `USER32.dll!AppendMenuW`.
-pub fn handle_append_menu_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    handle_menu_success(engine, "AppendMenuW")
+pub fn handle_append_menu_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_menu_success(ctx, "AppendMenuW")
 }
 /// Handles `USER32.dll!SetMenu`.
-pub fn handle_set_menu(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    handle_menu_success(engine, "SetMenu")
+pub fn handle_set_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_menu_success(ctx, "SetMenu")
 }
 /// Handles `USER32.dll!DestroyMenu`.
-pub fn handle_destroy_menu(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    handle_menu_success(engine, "DestroyMenu")
+pub fn handle_destroy_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_menu_success(ctx, "DestroyMenu")
 }
 /// Handles `USER32.dll!RemoveMenu`.
-pub fn handle_remove_menu(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    handle_menu_success(engine, "RemoveMenu")
+pub fn handle_remove_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_menu_success(ctx, "RemoveMenu")
 }
 /// Handles `USER32.dll!DeleteMenu`.
-pub fn handle_delete_menu(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    handle_menu_success(engine, "DeleteMenu")
+pub fn handle_delete_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_menu_success(ctx, "DeleteMenu")
 }
 /// Handles `USER32.dll!ModifyMenuA`.
-pub fn handle_modify_menu_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    handle_menu_success(engine, "ModifyMenuA")
+pub fn handle_modify_menu_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_menu_success(ctx, "ModifyMenuA")
 }
 /// Handles `USER32.dll!ModifyMenuW`.
-pub fn handle_modify_menu_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    handle_menu_success(engine, "ModifyMenuW")
+pub fn handle_modify_menu_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_menu_success(ctx, "ModifyMenuW")
 }
 /// Handles `USER32.dll!GetSystemMenu`.
-pub fn handle_get_system_menu(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_system_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = allocate_menu_handle(state)?;
     let return_address = engine
         .return_from_win64_api(handle)
@@ -215,7 +211,8 @@ pub fn handle_get_system_menu(
     })
 }
 /// Handles `USER32.dll!TrackPopupMenu`.
-pub fn handle_track_popup_menu(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_track_popup_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     // No item selected.
     let return_address = engine
         .return_from_win64_api(0)
@@ -226,32 +223,22 @@ pub fn handle_track_popup_menu(engine: &mut dyn wie_cpu::CpuEngine) -> Result<Wi
     })
 }
 /// Handles `USER32.dll!GetMenuItemInfoA`.
-pub fn handle_get_menu_item_info_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
-    handle_menu_success(engine, "GetMenuItemInfoA")
+pub fn handle_get_menu_item_info_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_menu_success(ctx, "GetMenuItemInfoA")
 }
 /// Handles `USER32.dll!GetMenuItemInfoW`.
-pub fn handle_get_menu_item_info_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
-    handle_menu_success(engine, "GetMenuItemInfoW")
+pub fn handle_get_menu_item_info_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_menu_success(ctx, "GetMenuItemInfoW")
 }
 /// Handles `USER32.dll!SetMenuItemInfoA`.
-pub fn handle_set_menu_item_info_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
-    handle_menu_success(engine, "SetMenuItemInfoA")
+pub fn handle_set_menu_item_info_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_menu_success(ctx, "SetMenuItemInfoA")
 }
 /// Handles `USER32.dll!SetMenuItemInfoW`.
-pub fn handle_set_menu_item_info_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
-    handle_menu_success(engine, "SetMenuItemInfoW")
+pub fn handle_set_menu_item_info_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_menu_success(ctx, "SetMenuItemInfoW")
 }
 /// Handles `USER32.dll!CheckMenuRadioItem`.
-pub fn handle_check_menu_radio_item(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
-    handle_menu_success(engine, "CheckMenuRadioItem")
+pub fn handle_check_menu_radio_item(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_menu_success(ctx, "CheckMenuRadioItem")
 }

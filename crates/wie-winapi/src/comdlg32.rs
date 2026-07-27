@@ -5,7 +5,7 @@ use crate::guest_memory::{
     write_u16 as write_guest_u16,
 };
 use crate::guest_string::{write_ansi_c_string, write_utf16_c_string};
-use crate::{FileDialogPolicy, WinApiHandlerResult, WinApiState};
+use crate::{FileDialogPolicy, HandlerContext, WinApiHandlerResult};
 use anyhow::{Context, Result};
 
 /// `OPENFILENAME` field offsets on Win64 (8-byte pointer alignment).
@@ -21,42 +21,29 @@ const OFN_NFILE_EXTENSION: u64 = 102;
 const CDERR_NONE: u32 = 0;
 
 /// Handles `comdlg32.dll!GetOpenFileNameA`.
-pub fn handle_get_open_file_name_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
-    handle_get_file_name(engine, state, false, "GetOpenFileNameA")
+pub fn handle_get_open_file_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_get_file_name(ctx, false, "GetOpenFileNameA")
 }
 
 /// Handles `comdlg32.dll!GetOpenFileNameW`.
-pub fn handle_get_open_file_name_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
-    handle_get_file_name(engine, state, true, "GetOpenFileNameW")
+pub fn handle_get_open_file_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_get_file_name(ctx, true, "GetOpenFileNameW")
 }
 
 /// Handles `comdlg32.dll!GetSaveFileNameA`.
-pub fn handle_get_save_file_name_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
-    handle_get_file_name(engine, state, false, "GetSaveFileNameA")
+pub fn handle_get_save_file_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_get_file_name(ctx, false, "GetSaveFileNameA")
 }
 
 /// Handles `comdlg32.dll!GetSaveFileNameW`.
-pub fn handle_get_save_file_name_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
-    handle_get_file_name(engine, state, true, "GetSaveFileNameW")
+pub fn handle_get_save_file_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_get_file_name(ctx, true, "GetSaveFileNameW")
 }
 
 /// Handles `comdlg32.dll!CommDlgExtendedError`.
-pub fn handle_comm_dlg_extended_error(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_comm_dlg_extended_error(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let return_value = u64::from(state.window_state.comm_dlg_extended_error);
 
     let return_address = engine
@@ -70,10 +57,9 @@ pub fn handle_comm_dlg_extended_error(
 }
 
 /// Handles `comdlg32.dll!ChooseColorA` (simulates accept with black color).
-pub fn handle_choose_color_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_choose_color_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let choose_color_ptr = engine
         .read_rcx()
         .context("failed to read RCX for ChooseColorA")?;
@@ -100,11 +86,12 @@ pub fn handle_choose_color_a(
 }
 
 fn handle_get_file_name(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
     unicode: bool,
     api_name: &str,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let ofn_ptr = engine
         .read_rcx()
         .with_context(|| format!("failed to read RCX for {api_name}"))?;

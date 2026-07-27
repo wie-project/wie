@@ -1676,7 +1676,14 @@ impl RuntimeSession {
                             Some(wie_winapi::WinApiId::Kernel32Heapalloc)
                         ) {
                             let handler_t0 = self.profile_enabled.then(Instant::now);
-                            wie_winapi::kernel32::handle_heap_alloc(engine, winapi_state)?;
+                            {
+                                let mut ctx = wie_winapi::HandlerContext::new(
+                                    engine,
+                                    environment,
+                                    winapi_state,
+                                );
+                                wie_winapi::kernel32::handle_heap_alloc(&mut ctx)?;
+                            }
                             if let Some(t0) = handler_t0 {
                                 record_handler(t0.elapsed().as_nanos(), true);
                             }
@@ -1697,7 +1704,14 @@ impl RuntimeSession {
                             Some(wie_winapi::WinApiId::Kernel32Heapfree)
                         ) {
                             let handler_t0 = self.profile_enabled.then(Instant::now);
-                            wie_winapi::kernel32::handle_heap_free(engine, winapi_state)?;
+                            {
+                                let mut ctx = wie_winapi::HandlerContext::new(
+                                    engine,
+                                    environment,
+                                    winapi_state,
+                                );
+                                wie_winapi::kernel32::handle_heap_free(&mut ctx)?;
+                            }
                             if let Some(t0) = handler_t0 {
                                 record_handler(t0.elapsed().as_nanos(), true);
                             }
@@ -1718,7 +1732,14 @@ impl RuntimeSession {
                             Some(wie_winapi::WinApiId::Kernel32Multibytetowidechar)
                         ) {
                             let handler_t0 = self.profile_enabled.then(Instant::now);
-                            wie_winapi::kernel32::handle_multi_byte_to_wide_char(engine)?;
+                            {
+                                let mut ctx = wie_winapi::HandlerContext::new(
+                                    engine,
+                                    environment,
+                                    winapi_state,
+                                );
+                                wie_winapi::kernel32::handle_multi_byte_to_wide_char(&mut ctx)?;
+                            }
                             if let Some(t0) = handler_t0 {
                                 record_handler(t0.elapsed().as_nanos(), true);
                             }

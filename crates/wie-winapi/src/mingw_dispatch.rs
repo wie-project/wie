@@ -99,7 +99,7 @@ pub fn dispatch_stdcpp(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinAp
 
             // Set RCX to point to the record and dispatch.
             engine.write_rcx(rec)?;
-            crate::kernel32::handle_raise_exception(engine, state)
+            crate::kernel32::handle_raise_exception(ctx)
         }
         // Generic fallback: stub (return success).
         _ => {

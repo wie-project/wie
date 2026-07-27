@@ -1,10 +1,10 @@
 use super::{
     Context, ERROR_INVALID_PARAMETER, FIXED_PERFORMANCE_COUNTER, FIXED_PERFORMANCE_FREQUENCY,
     FIXED_TICK_COUNT, FLS_OUT_OF_INDEXES, FlsSlot, GUEST_OS_BUILD, GUEST_OS_MAJOR, GUEST_OS_MINOR,
-    GUEST_OS_PLATFORM_NT, LANG_EN_US, OnceLock, Result, TIME_ZONE_ID_INVALID, TIME_ZONE_ID_UNKNOWN,
-    WinApiHandlerResult, WinApiState, checked_field_address, low_u32, low_u32_to_i32,
-    read_guest_ansi_lossy, read_guest_utf16_lossy, ret_bool_true, ret_u64, write_guest_u16,
-    write_guest_u32, write_guest_u64, write_mock_string_a, write_mock_string_w,
+    GUEST_OS_PLATFORM_NT, HandlerContext, LANG_EN_US, OnceLock, Result, TIME_ZONE_ID_INVALID,
+    TIME_ZONE_ID_UNKNOWN, WinApiHandlerResult, WinApiState, checked_field_address, low_u32,
+    low_u32_to_i32, read_guest_ansi_lossy, read_guest_utf16_lossy, ret_bool_true, ret_u64,
+    write_guest_u16, write_guest_u32, write_guest_u64, write_mock_string_a, write_mock_string_w,
 };
 
 pub(crate) fn packed_get_version() -> u64 {
@@ -13,7 +13,8 @@ pub(crate) fn packed_get_version() -> u64 {
     u64::from(packed)
 }
 /// Handles `KERNEL32.dll!GetVersion` (legacy packed DWORD).
-pub fn handle_get_version(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_get_version(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let return_value = packed_get_version();
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -24,7 +25,8 @@ pub fn handle_get_version(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiH
     })
 }
 /// Handles `KERNEL32.dll!GetVersionExA`.
-pub fn handle_get_version_ex_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_get_version_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let version_info_ptr = engine
         .read_rcx()
         .context("failed to read RCX for GetVersionExA")?;
@@ -71,10 +73,9 @@ pub fn handle_get_version_ex_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<Wi
     })
 }
 /// Handles `KERNEL32.dll!GetCommandLineA`.
-pub fn handle_get_command_line_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    command_line_ptr: u64,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_command_line_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let command_line_ptr = ctx.environment.command_line_a_ptr;
+    let engine = &mut *ctx.engine;
     let return_address = engine
         .return_from_win64_api(command_line_ptr)
         .context("failed to return from GetCommandLineA")?;
@@ -85,10 +86,9 @@ pub fn handle_get_command_line_a(
     })
 }
 /// Handles `KERNEL32.dll!GetCommandLineW`.
-pub fn handle_get_command_line_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    command_line_ptr: u64,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_command_line_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let command_line_ptr = ctx.environment.command_line_w_ptr;
+    let engine = &mut *ctx.engine;
     let return_address = engine
         .return_from_win64_api(command_line_ptr)
         .context("failed to return from GetCommandLineW")?;
@@ -99,7 +99,8 @@ pub fn handle_get_command_line_w(
     })
 }
 /// Handles `KERNEL32.dll!GetTickCount`.
-pub fn handle_get_tick_count(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_get_tick_count(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let return_address = engine
         .return_from_win64_api(FIXED_TICK_COUNT)
         .context("failed to return from GetTickCount")?;
@@ -111,8 +112,9 @@ pub fn handle_get_tick_count(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinA
 }
 /// Handles `KERNEL32.dll!QueryPerformanceCounter`.
 pub fn handle_query_performance_counter(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let counter_ptr = engine
         .read_rcx()
         .context("failed to read RCX for QueryPerformanceCounter")?;
@@ -144,10 +146,9 @@ pub(crate) fn publish_fls_slot(
     drop(engine.mem_write(va, &value.to_le_bytes()));
 }
 /// Handles `KERNEL32.dll!FlsAlloc`.
-pub fn handle_fls_alloc(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_fls_alloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _callback = engine
         .read_rcx()
         .context("failed to read RCX for FlsAlloc")?;
@@ -175,10 +176,9 @@ pub fn handle_fls_alloc(
     })
 }
 /// Handles `KERNEL32.dll!FlsFree`.
-pub fn handle_fls_free(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_fls_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let index_raw = engine
         .read_rcx()
         .context("failed to read RCX for FlsFree")?;
@@ -201,10 +201,9 @@ pub fn handle_fls_free(
     })
 }
 /// Handles `KERNEL32.dll!FlsSetValue`.
-pub fn handle_fls_set_value(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_fls_set_value(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let index_raw = engine
         .read_rcx()
         .context("failed to read RCX for FlsSetValue")?;
@@ -237,10 +236,9 @@ pub fn handle_fls_set_value(
     })
 }
 /// Handles `KERNEL32.dll!FlsGetValue`.
-pub fn handle_fls_get_value(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_fls_get_value(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let index_raw = engine
         .read_rcx()
         .context("failed to read RCX for FlsGetValue")?;
@@ -264,7 +262,8 @@ pub fn handle_fls_get_value(
     })
 }
 /// Handles `KERNEL32.dll!SetHandleCount`.
-pub fn handle_set_handle_count(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_set_handle_count(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let handle_count = engine
         .read_rcx()
         .context("failed to read RCX for SetHandleCount")?;
@@ -280,9 +279,10 @@ pub fn handle_set_handle_count(engine: &mut dyn wie_cpu::CpuEngine) -> Result<Wi
 }
 /// Handles `KERNEL32.dll!GetEnvironmentStringsW`.
 pub fn handle_get_environment_strings_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    environment_strings_w_ptr: u64,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let environment_strings_w_ptr = ctx.environment.environment_strings_w_ptr;
+    let engine = &mut *ctx.engine;
     let return_address = engine
         .return_from_win64_api(environment_strings_w_ptr)
         .context("failed to return from GetEnvironmentStringsW")?;
@@ -294,8 +294,9 @@ pub fn handle_get_environment_strings_w(
 }
 /// Handles `KERNEL32.dll!FreeEnvironmentStringsW`.
 pub fn handle_free_environment_strings_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _environment_block = engine
         .read_rcx()
         .context("failed to read RCX for FreeEnvironmentStringsW")?;
@@ -310,10 +311,9 @@ pub fn handle_free_environment_strings_w(
     })
 }
 /// Handles `KERNEL32.dll!GetLastError`.
-pub fn handle_get_last_error(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_last_error(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let return_value = u64::from(state.process.last_error);
 
     let return_address = engine
@@ -326,10 +326,9 @@ pub fn handle_get_last_error(
     })
 }
 /// Handles `KERNEL32.dll!SetLastError`.
-pub fn handle_set_last_error(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_last_error(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let error_raw = engine
         .read_rcx()
         .context("failed to read RCX for SetLastError")?;
@@ -350,8 +349,9 @@ pub fn handle_set_last_error(
 }
 /// Handles `KERNEL32.dll!SetUnhandledExceptionFilter`.
 pub fn handle_set_unhandled_exception_filter(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _filter_ptr = engine
         .read_rcx()
         .context("failed to read RCX for SetUnhandledExceptionFilter")?;
@@ -367,8 +367,9 @@ pub fn handle_set_unhandled_exception_filter(
 }
 /// Handles `KERNEL32.dll!GetSystemDefaultLangID`.
 pub fn handle_get_system_default_lang_id(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let return_address = engine
         .return_from_win64_api(LANG_EN_US)
         .context("failed to return from GetSystemDefaultLangID")?;
@@ -380,8 +381,9 @@ pub fn handle_get_system_default_lang_id(
 }
 /// Handles `KERNEL32.dll!GetUserDefaultLangID`.
 pub fn handle_get_user_default_lang_id(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let return_address = engine
         .return_from_win64_api(LANG_EN_US)
         .context("failed to return from GetUserDefaultLangID")?;
@@ -392,7 +394,8 @@ pub fn handle_get_user_default_lang_id(
     })
 }
 /// Handles `KERNEL32.dll!GetLocalTime`.
-pub fn handle_get_local_time(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_get_local_time(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let system_time_ptr = engine
         .read_rcx()
         .context("failed to read RCX for GetLocalTime")?;
@@ -439,9 +442,10 @@ pub fn handle_get_local_time(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinA
 }
 /// Handles `KERNEL32.dll!GetTimeZoneInformation`.
 pub fn handle_get_time_zone_information(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let time_zone_info_ptr = engine
         .read_rcx()
         .context("failed to read RCX for GetTimeZoneInformation")?;
@@ -508,7 +512,8 @@ pub fn handle_get_time_zone_information(
     })
 }
 /// Handles dynamic `KERNEL32.dll!EncodePointer`.
-pub fn handle_encode_pointer(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_encode_pointer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let pointer = engine
         .read_rcx()
         .context("failed to read RCX for EncodePointer")?;
@@ -523,7 +528,8 @@ pub fn handle_encode_pointer(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinA
     })
 }
 /// Handles dynamic `KERNEL32.dll!DecodePointer`.
-pub fn handle_decode_pointer(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_decode_pointer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let pointer = engine
         .read_rcx()
         .context("failed to read RCX for DecodePointer")?;
@@ -537,21 +543,22 @@ pub fn handle_decode_pointer(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinA
         return_value: pointer,
     })
 }
-pub fn handle_set_file_apis_to_oem(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_file_apis_to_oem(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     ret_u64(engine, 0, "SetFileApisToOEM")
 }
 pub fn handle_query_performance_frequency(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let ptr = engine.read_rcx().context("QueryPerformanceFrequency RCX")?;
     if ptr != 0 {
         write_guest_u64(engine, ptr, FIXED_PERFORMANCE_FREQUENCY)?;
     }
     ret_bool_true(engine, "QueryPerformanceFrequency")
 }
-pub fn handle_get_system_info(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_get_system_info(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let ptr = engine.read_rcx().context("GetSystemInfo RCX")?;
     if ptr != 0 {
         // SYSTEM_INFO on x64 (48 bytes):
@@ -590,8 +597,9 @@ pub fn handle_get_system_info(engine: &mut dyn wie_cpu::CpuEngine) -> Result<Win
     ret_u64(engine, 0, "GetSystemInfo")
 }
 pub fn handle_is_processor_feature_present(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let feature = low_u32(engine.read_rcx()?, "IsProcessorFeaturePresent")?;
     // Advertise a few common x64 features as present; unknown → FALSE.
     // 0=floating point, 6=compare exchange double, 7=MMX, 8=XMMI (SSE),
@@ -599,12 +607,12 @@ pub fn handle_is_processor_feature_present(
     let present = matches!(feature, 0 | 6 | 7 | 8 | 10 | 13 | 14 | 21 | 23 | 25);
     ret_u64(engine, u64::from(present), "IsProcessorFeaturePresent")
 }
-pub fn handle_get_large_page_minimum(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_large_page_minimum(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     ret_u64(engine, 0, "GetLargePageMinimum")
 }
-pub fn handle_format_message_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_format_message_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _flags = engine.read_rcx()?;
     let _source = engine.read_rdx()?;
     let _message_id = engine.read_r8()?;
@@ -613,9 +621,8 @@ pub fn handle_format_message_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<Wi
     ret_u64(engine, 0, "FormatMessageW")
 }
 /// Handles `KERNEL32.dll!IsDebuggerPresent` — return FALSE.
-pub fn handle_is_debugger_present(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_is_debugger_present(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let return_address = engine.return_from_win64_api(0)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -623,7 +630,8 @@ pub fn handle_is_debugger_present(
     })
 }
 /// Handles `KERNEL32.dll!DebugBreak` — emit a trace warning (no real break).
-pub fn handle_debug_break(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_debug_break(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     tracing::warn!("DebugBreak called");
     let return_address = engine.return_from_win64_api(0)?;
     Ok(WinApiHandlerResult {
@@ -632,9 +640,8 @@ pub fn handle_debug_break(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiH
     })
 }
 /// Handles `KERNEL32.dll!OutputDebugStringA` — log and return.
-pub fn handle_output_debug_string_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_output_debug_string_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let msg_ptr = engine.read_rcx()?;
     if msg_ptr != 0 {
         let msg = read_guest_ansi_lossy(engine, msg_ptr, 1024).unwrap_or_default();
@@ -647,9 +654,8 @@ pub fn handle_output_debug_string_a(
     })
 }
 /// Handles `KERNEL32.dll!OutputDebugStringW` — log and return.
-pub fn handle_output_debug_string_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_output_debug_string_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let msg_ptr = engine.read_rcx()?;
     if msg_ptr != 0 {
         let msg = read_guest_utf16_lossy(engine, msg_ptr, 1024).unwrap_or_default();
@@ -662,10 +668,9 @@ pub fn handle_output_debug_string_w(
     })
 }
 /// Handles `KERNEL32.dll!SetErrorMode` — store and return previous mode.
-pub fn handle_set_error_mode(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_error_mode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let mode = u32::try_from(engine.read_rcx()? & 0xffff_ffff).unwrap_or(0);
     let prev = state.process.error_mode;
     state.process.error_mode = mode;
@@ -676,10 +681,9 @@ pub fn handle_set_error_mode(
     })
 }
 /// Handles `KERNEL32.dll!SetThreadErrorMode` — store new mode, return previous.
-pub fn handle_set_thread_error_mode(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_thread_error_mode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let mode = u32::try_from(engine.read_rcx()? & 0xffff_ffff).unwrap_or(0);
     let prev_mode_ptr = engine.read_rdx()?;
     let prev = state.process.error_mode;
@@ -881,19 +885,17 @@ pub(crate) fn get_user_profile_dir_impl(
     })
 }
 /// Handles `KERNEL32.dll!GetComputerNameW` — friendly name (NetBIOS equivalent).
-pub fn handle_get_computer_name_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_computer_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let buf = engine.read_rcx()?;
     let size_ptr = engine.read_rdx()?;
     get_canonical_computer_name(engine, state, buf, size_ptr)
 }
 /// Handles `KERNEL32.dll!GetComputerNameA` — friendly name (NetBIOS equivalent).
-pub fn handle_get_computer_name_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_computer_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     // ANSI variant: write name to guest using ANSI encoding.
     let buf = engine.read_rcx()?;
     let size_ptr = engine.read_rdx()?;
@@ -901,10 +903,9 @@ pub fn handle_get_computer_name_a(
     Ok(r)
 }
 /// Handles `KERNEL32.dll!GetComputerNameExW` — returns appropriate name type.
-pub fn handle_get_computer_name_ex_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_computer_name_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let name_type = engine.read_rcx()?;
     let buf = engine.read_rdx()?;
     let size_ptr = engine.read_r8()?;
@@ -923,28 +924,27 @@ pub fn handle_get_computer_name_ex_w(
     }
 }
 /// Handles `KERNEL32.dll!GetUserNameW` — return real user name.
-pub fn handle_get_user_name_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_user_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let buf = engine.read_rcx()?;
     let size_ptr = engine.read_rdx()?;
     get_user_name_impl(engine, state, buf, size_ptr, true)
 }
 /// Handles `KERNEL32.dll!GetUserNameA` — return real user name.
-pub fn handle_get_user_name_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_user_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let buf = engine.read_rcx()?;
     let size_ptr = engine.read_rdx()?;
     get_user_name_impl(engine, state, buf, size_ptr, false)
 }
 /// Handles `KERNEL32.dll!QueryFullProcessImageNameW` — return main module path.
 pub fn handle_query_full_process_image_name_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _h_process = engine.read_rcx()?;
     let _flags = engine.read_rdx()?;
     let buf = engine.read_r8()?;
@@ -980,9 +980,10 @@ pub fn handle_query_full_process_image_name_w(
 }
 /// Handles `KERNEL32.dll!QueryFullProcessImageNameA` — return main module path.
 pub fn handle_query_full_process_image_name_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _h_process = engine.read_rcx()?;
     let _flags = engine.read_rdx()?;
     let buf = engine.read_r8()?;
@@ -1016,17 +1017,16 @@ pub fn handle_query_full_process_image_name_a(
         return_value: 1,
     })
 }
-pub(crate) fn handle_raise_exception(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub(crate) fn handle_raise_exception(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     crate::seh::dispatch_exception(engine, state)
 }
 pub(crate) fn handle_rtl_capture_context(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    _state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     use anyhow::Context;
+    let engine = &mut *ctx.engine;
 
     let ctx_ptr = engine.read_rcx()?;
     if ctx_ptr == 0 {
@@ -1082,10 +1082,9 @@ pub(crate) fn handle_rtl_capture_context(
         return_value: 0,
     })
 }
-pub(crate) fn handle_rtl_unwind_ex(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub(crate) fn handle_rtl_unwind_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let target_frame = engine.read_rcx()?;
     let target_ip = engine.read_rdx()?;
     let return_value = engine.read_r9()?;
@@ -1096,10 +1095,9 @@ pub(crate) fn handle_rtl_unwind_ex(
     };
     crate::seh::forced_unwind_to(engine, state, target_ip, target_frame_rsp, return_value)
 }
-pub(crate) fn handle_tls_get_value(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub(crate) fn handle_tls_get_value(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let index = engine.read_rcx()? & 0xffff_ffff;
     let idx = usize::try_from(index).unwrap_or(usize::MAX);
     // Microsoft: invalid index → 0 and last-error ERROR_INVALID_PARAMETER (87).
@@ -1128,10 +1126,9 @@ pub(crate) fn handle_tls_get_value(
         return_value: value,
     })
 }
-pub(crate) fn handle_tls_set_value(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub(crate) fn handle_tls_set_value(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let index = engine.read_rcx()? & 0xffff_ffff;
     let value = engine.read_rdx()?;
     let idx = usize::try_from(index).unwrap_or(usize::MAX);
@@ -1161,10 +1158,9 @@ pub(crate) fn handle_tls_set_value(
         return_value: 0,
     })
 }
-pub(crate) fn handle_tls_alloc(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub(crate) fn handle_tls_alloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     // Process-wide index space; value storage is per active guest thread.
     let index = u64::from(state.kernel.threads.tls_index_count);
     state.kernel.threads.tls_index_count = state.kernel.threads.tls_index_count.saturating_add(1);
@@ -1176,10 +1172,9 @@ pub(crate) fn handle_tls_alloc(
         return_value: index,
     })
 }
-pub(crate) fn handle_tls_free(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub(crate) fn handle_tls_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let index_raw = engine.read_rcx()?;
     let index = usize::try_from(index_raw).unwrap_or(usize::MAX);
     // Clear active thread value; index remains allocated (Windows does not reuse
@@ -1195,7 +1190,8 @@ pub(crate) fn handle_tls_free(
     })
 }
 /// Handles `KERNEL32.dll!Sleep`.
-pub fn handle_sleep(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_sleep(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let milliseconds = engine.read_rcx().context("failed to read RCX for Sleep")?;
     let low32 = milliseconds & u64::from(u32::MAX);
 
@@ -1221,7 +1217,8 @@ pub(crate) fn allocate_fake_heap_block(
     state.heap_state.heap.alloc_coherent(engine, size)
 }
 /// Handles `KERNEL32.dll!MulDiv`.
-pub fn handle_mul_div(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_mul_div(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let number_raw = engine.read_rcx().context("failed to read RCX for MulDiv")?;
 
     let numerator_raw = engine.read_rdx().context("failed to read RDX for MulDiv")?;

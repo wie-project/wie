@@ -2,19 +2,19 @@ use super::{
     Context, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_HANDLE, ERROR_MOD_NOT_FOUND,
     ERROR_PROC_NOT_FOUND, FAKE_ADVAPI32_MODULE, FAKE_COMCTL32_MODULE, FAKE_COMDLG32_MODULE,
     FAKE_GDI32_MODULE, FAKE_KERNEL32_MODULE, FAKE_SHELL32_MODULE, FAKE_USER32_MODULE,
-    FAKE_WINMM_MODULE, Result, WinApiHandlerResult, WinApiState, copy_path_a_to_guest_buffer,
-    copy_path_w_to_guest_buffer, create_fake_resource_record, dll_loader, find_resource_by_handle,
-    guest_basename, paths_match_guest, read_ansi_string_from_cpu, read_guest_ansi_lossy,
-    read_guest_utf16_lossy, read_wide_string_from_cpu,
+    FAKE_WINMM_MODULE, HandlerContext, Result, WinApiHandlerResult, WinApiState,
+    copy_path_a_to_guest_buffer, copy_path_w_to_guest_buffer, create_fake_resource_record,
+    dll_loader, find_resource_by_handle, guest_basename, paths_match_guest,
+    read_ansi_string_from_cpu, read_guest_ansi_lossy, read_guest_utf16_lossy,
+    read_wide_string_from_cpu,
 };
 
 /// Handles `KERNEL32.dll!GetModuleHandleA`.
 /// Handles `KERNEL32.dll!GetModuleHandleA`.
-pub fn handle_get_module_handle_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    environment: crate::WinApiEnvironment,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_module_handle_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let environment = ctx.environment;
     let module_name_ptr = engine
         .read_rcx()
         .context("failed to read RCX for GetModuleHandleA")?;
@@ -43,11 +43,10 @@ pub fn handle_get_module_handle_a(
     })
 }
 /// Handles `KERNEL32.dll!GetModuleHandleW`.
-pub fn handle_get_module_handle_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    environment: crate::WinApiEnvironment,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_module_handle_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let environment = ctx.environment;
     let module_name_ptr = engine
         .read_rcx()
         .context("failed to read RCX for GetModuleHandleW")?;
@@ -205,11 +204,10 @@ pub(crate) fn resolve_windows_dll_path(name: &str, main_module_path: &str) -> St
     }
 }
 /// Handles `KERNEL32.dll!GetModuleFileNameA`.
-pub fn handle_get_module_file_name_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-    module_file_name_a_ptr: u64,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_module_file_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let module_file_name_a_ptr = ctx.environment.module_file_name_a_ptr;
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _module_handle = engine
         .read_rcx()
         .context("failed to read RCX for GetModuleFileNameA")?;
@@ -241,11 +239,10 @@ pub fn handle_get_module_file_name_a(
     })
 }
 /// Handles `KERNEL32.dll!GetModuleFileNameW`.
-pub fn handle_get_module_file_name_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-    module_file_name_w_ptr: u64,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_module_file_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let module_file_name_w_ptr = ctx.environment.module_file_name_w_ptr;
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _module_handle = engine
         .read_rcx()
         .context("failed to read RCX for GetModuleFileNameW")?;
@@ -277,11 +274,10 @@ pub fn handle_get_module_file_name_w(
     })
 }
 /// Handles `KERNEL32.dll!LoadLibraryA` — real DLL loading.
-pub fn handle_load_library_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    environment: crate::WinApiEnvironment,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_load_library_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let environment = ctx.environment;
     let library_name_ptr = engine
         .read_rcx()
         .context("failed to read RCX for LoadLibraryA")?;
@@ -310,11 +306,10 @@ pub fn handle_load_library_a(
     })
 }
 /// Handles `KERNEL32.dll!LoadLibraryW` — real DLL loading.
-pub fn handle_load_library_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    environment: crate::WinApiEnvironment,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_load_library_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let environment = ctx.environment;
     let library_name_ptr = engine
         .read_rcx()
         .context("failed to read RCX for LoadLibraryW")?;
@@ -343,10 +338,9 @@ pub fn handle_load_library_w(
     })
 }
 /// Handles `KERNEL32.dll!FreeLibrary`.
-pub fn handle_free_library(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_free_library(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let module_handle = engine
         .read_rcx()
         .context("failed to read RCX for FreeLibrary")?;
@@ -408,10 +402,9 @@ pub fn handle_free_library(
     })
 }
 /// Handles `KERNEL32.dll!GetProcAddress`.
-pub fn handle_get_proc_address(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_proc_address(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let module_handle = engine
         .read_rcx()
         .context("failed to read RCX for GetProcAddress")?;
@@ -514,11 +507,10 @@ pub fn handle_get_proc_address(
     })
 }
 /// Handles `KERNEL32.dll!LoadLibraryExA` — real DLL loading.
-pub fn handle_load_library_ex_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    environment: crate::WinApiEnvironment,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_load_library_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let environment = ctx.environment;
     let library_name_ptr = engine
         .read_rcx()
         .context("failed to read RCX for LoadLibraryExA")?;
@@ -544,11 +536,10 @@ pub fn handle_load_library_ex_a(
     })
 }
 /// Handles `KERNEL32.dll!LoadLibraryExW` — real DLL loading.
-pub fn handle_load_library_ex_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    environment: crate::WinApiEnvironment,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_load_library_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let environment = ctx.environment;
     let library_name_ptr = engine
         .read_rcx()
         .context("failed to read RCX for LoadLibraryExW")?;
@@ -574,10 +565,9 @@ pub fn handle_load_library_ex_w(
     })
 }
 /// Handles `KERNEL32.dll!FindResourceA`.
-pub fn handle_find_resource_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_find_resource_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _module_handle = engine
         .read_rcx()
         .context("failed to read RCX for FindResourceA")?;
@@ -602,10 +592,9 @@ pub fn handle_find_resource_a(
     })
 }
 /// Handles `KERNEL32.dll!LoadResource`.
-pub fn handle_load_resource(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_load_resource(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _module_handle = engine
         .read_rcx()
         .context("failed to read RCX for LoadResource")?;
@@ -627,10 +616,9 @@ pub fn handle_load_resource(
     })
 }
 /// Handles `KERNEL32.dll!LockResource`.
-pub fn handle_lock_resource(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_lock_resource(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let resource_handle = engine
         .read_rcx()
         .context("failed to read RCX for LockResource")?;
@@ -648,10 +636,9 @@ pub fn handle_lock_resource(
     })
 }
 /// Handles `KERNEL32.dll!SizeofResource`.
-pub fn handle_sizeof_resource(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_sizeof_resource(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _module_handle = engine
         .read_rcx()
         .context("failed to read RCX for SizeofResource")?;

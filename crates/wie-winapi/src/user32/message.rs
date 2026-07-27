@@ -1,16 +1,15 @@
 use super::{
-    Context, FAKE_WINDOW_HANDLE, GuestCallbackRequest, MessageQueueIdlePolicy, QueuedWindowMessage,
-    Result, WM_CHAR, WM_DEADCHAR, WM_KEYDOWN, WM_KEYUP, WM_MDICREATE, WM_QUIT, WM_SYSCHAR,
-    WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WinApiControlSignal, WinApiHandlerResult,
-    WinApiState, checked_field_address, create_mdi_child_from_struct, read_guest_u32,
+    Context, FAKE_WINDOW_HANDLE, GuestCallbackRequest, HandlerContext, MessageQueueIdlePolicy,
+    QueuedWindowMessage, Result, WM_CHAR, WM_DEADCHAR, WM_KEYDOWN, WM_KEYUP, WM_MDICREATE, WM_QUIT,
+    WM_SYSCHAR, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WinApiControlSignal,
+    WinApiHandlerResult, checked_field_address, create_mdi_child_from_struct, read_guest_u32,
     read_guest_u64, write_message_structure,
 };
 
 /// Handles `USER32.dll!PeekMessageA`.
-pub fn handle_peek_message_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_peek_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let message_address = engine
         .read_rcx()
         .context("failed to read RCX for PeekMessageA")?;
@@ -88,9 +87,10 @@ pub fn handle_peek_message_a(
 /// Returns FALSE so the message continues through the normal dispatch path
 /// (no installed WH_MSGFILTER/WH_SYSMSGFILTER hooks).
 pub fn handle_call_msg_filter(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
     api_name: &str,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _msg_ptr = engine
         .read_rcx()
         .with_context(|| format!("failed to read RCX for {api_name}"))?;
@@ -108,10 +108,9 @@ pub fn handle_call_msg_filter(
     })
 }
 /// Handles `USER32.dll!PostMessageA`.
-pub fn handle_post_message_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_post_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for PostMessageA")?;
@@ -165,25 +164,20 @@ pub fn handle_post_message_a(
     })
 }
 /// Handles `USER32.dll!SendMessageA`.
-pub fn handle_send_message_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
-    handle_send_message(engine, state, false, "SendMessageA")
+pub fn handle_send_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_send_message(ctx, false, "SendMessageA")
 }
 /// Handles `USER32.dll!SendMessageW`.
-pub fn handle_send_message_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
-    handle_send_message(engine, state, true, "SendMessageW")
+pub fn handle_send_message_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_send_message(ctx, true, "SendMessageW")
 }
 pub(crate) fn handle_send_message(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
     prefer_unicode: bool,
     api_name: &str,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .with_context(|| format!("failed to read RCX for {api_name}"))?;
@@ -251,9 +245,8 @@ pub(crate) fn handle_send_message(
     })
 }
 /// Handles `USER32.dll!CallNextHookEx`.
-pub fn handle_call_next_hook_ex(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_call_next_hook_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _hook_handle = engine
         .read_rcx()
         .context("failed to read RCX for CallNextHookEx")?;
@@ -283,10 +276,9 @@ pub fn handle_call_next_hook_ex(
     })
 }
 /// Handles `USER32.dll!GetMessageA`.
-pub fn handle_get_message_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let message_address = engine
         .read_rcx()
         .context("failed to read RCX for GetMessageA")?;
@@ -380,9 +372,8 @@ pub fn handle_get_message_a(
     })
 }
 /// Handles `USER32.dll!TranslateMessage`.
-pub fn handle_translate_message(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_translate_message(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let message_address = engine
         .read_rcx()
         .context("failed to read RCX for TranslateMessage")?;
@@ -420,9 +411,10 @@ pub fn handle_translate_message(
     })
 }
 pub(crate) fn handle_default_window_procedure(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
     api_name: &str,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     // hwnd / msg / wParam / lParam (and optional extra args) are ignored.
     // Returning 0 is the usual default for unhandled messages in stubs.
     let return_address = engine
@@ -435,42 +427,33 @@ pub(crate) fn handle_default_window_procedure(
     })
 }
 /// Handles `USER32.dll!DefWindowProcA`.
-pub fn handle_def_window_proc_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
-    handle_default_window_procedure(engine, "DefWindowProcA")
+pub fn handle_def_window_proc_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_default_window_procedure(ctx, "DefWindowProcA")
 }
 /// Handles `USER32.dll!DefWindowProcW`.
-pub fn handle_def_window_proc_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
-    handle_default_window_procedure(engine, "DefWindowProcW")
+pub fn handle_def_window_proc_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_default_window_procedure(ctx, "DefWindowProcW")
 }
 /// Handles `USER32.dll!DefFrameProcA`.
-pub fn handle_def_frame_proc_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    handle_default_window_procedure(engine, "DefFrameProcA")
+pub fn handle_def_frame_proc_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_default_window_procedure(ctx, "DefFrameProcA")
 }
 /// Handles `USER32.dll!DefFrameProcW`.
-pub fn handle_def_frame_proc_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    handle_default_window_procedure(engine, "DefFrameProcW")
+pub fn handle_def_frame_proc_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_default_window_procedure(ctx, "DefFrameProcW")
 }
 /// Handles `USER32.dll!DefMDIChildProcA`.
-pub fn handle_def_mdi_child_proc_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
-    handle_default_window_procedure(engine, "DefMDIChildProcA")
+pub fn handle_def_mdi_child_proc_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_default_window_procedure(ctx, "DefMDIChildProcA")
 }
 /// Handles `USER32.dll!DefMDIChildProcW`.
-pub fn handle_def_mdi_child_proc_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
-    handle_default_window_procedure(engine, "DefMDIChildProcW")
+pub fn handle_def_mdi_child_proc_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_default_window_procedure(ctx, "DefMDIChildProcW")
 }
 /// Handles `USER32.dll!DispatchMessageA`.
-pub fn handle_dispatch_message_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_dispatch_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let message_address = engine
         .read_rcx()
         .context("failed to read RCX for DispatchMessageA")?;

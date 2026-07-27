@@ -15,10 +15,9 @@ const REG_CREATED_NEW_KEY: u32 = 1;
 const REG_OPENED_EXISTING_KEY: u32 = 2;
 
 /// Handles `ADVAPI32.dll!RegCreateKeyExA`.
-pub fn handle_reg_create_key_ex_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_reg_create_key_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let parent_key = engine
         .read_rcx()
         .context("failed to read RCX for RegCreateKeyExA")?;
@@ -53,10 +52,9 @@ pub fn handle_reg_create_key_ex_a(
 }
 
 /// Handles `ADVAPI32.dll!RegOpenKeyExA`.
-pub fn handle_reg_open_key_ex_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_reg_open_key_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let parent_key = engine
         .read_rcx()
         .context("failed to read RCX for RegOpenKeyExA")?;
@@ -83,10 +81,9 @@ pub fn handle_reg_open_key_ex_a(
 }
 
 /// Handles `ADVAPI32.dll!RegOpenKeyExW`.
-pub fn handle_reg_open_key_ex_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_reg_open_key_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let parent_key = engine
         .read_rcx()
         .context("failed to read RCX for RegOpenKeyExW")?;
@@ -113,10 +110,9 @@ pub fn handle_reg_open_key_ex_w(
 }
 
 /// Handles `ADVAPI32.dll!RegCreateKeyExW`.
-pub fn handle_reg_create_key_ex_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_reg_create_key_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let parent_key = engine
         .read_rcx()
         .context("failed to read RCX for RegCreateKeyExW")?;
@@ -154,22 +150,20 @@ pub fn dispatch_advapi32_extra(
     ctx: &mut HandlerContext<'_>,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
     let n = name.to_ascii_lowercase();
     match n.as_str() {
-        "regopenkeyexw" => Ok(Some(handle_reg_open_key_ex_w(engine, state)?)),
-        "regcreatekeyexw" => Ok(Some(handle_reg_create_key_ex_w(engine, state)?)),
-        "regenumkeyexw" | "regenumkeyexa" => Ok(Some(handle_reg_enum_key_ex(engine, state)?)),
-        "regenumvaluew" | "regenumvaluea" => Ok(Some(handle_reg_enum_value(engine, state)?)),
-        "openprocesstoken" => Ok(Some(handle_open_process_token(engine, state)?)),
-        "adjusttokenprivileges" => Ok(Some(handle_adjust_token_privileges(engine)?)),
+        "regopenkeyexw" => Ok(Some(handle_reg_open_key_ex_w(ctx)?)),
+        "regcreatekeyexw" => Ok(Some(handle_reg_create_key_ex_w(ctx)?)),
+        "regenumkeyexw" | "regenumkeyexa" => Ok(Some(handle_reg_enum_key_ex(ctx)?)),
+        "regenumvaluew" | "regenumvaluea" => Ok(Some(handle_reg_enum_value(ctx)?)),
+        "openprocesstoken" => Ok(Some(handle_open_process_token(ctx)?)),
+        "adjusttokenprivileges" => Ok(Some(handle_adjust_token_privileges(ctx)?)),
         "lookupprivilegevaluew" | "lookupprivilegevaluea" => {
-            Ok(Some(handle_lookup_privilege_value(engine)?))
+            Ok(Some(handle_lookup_privilege_value(ctx)?))
         }
-        "systemfunction036" => Ok(Some(handle_system_function036(engine)?)),
-        "getfilesecurityw" | "getfilesecuritya" => Ok(Some(handle_get_file_security(engine)?)),
-        "setfilesecurityw" | "setfilesecuritya" => Ok(Some(handle_set_file_security(engine)?)),
+        "systemfunction036" => Ok(Some(handle_system_function036(ctx)?)),
+        "getfilesecurityw" | "getfilesecuritya" => Ok(Some(handle_get_file_security(ctx)?)),
+        "setfilesecurityw" | "setfilesecuritya" => Ok(Some(handle_set_file_security(ctx)?)),
         _ => Ok(None),
     }
 }
@@ -177,10 +171,9 @@ pub fn dispatch_advapi32_extra(
 const FAKE_PROCESS_TOKEN: u64 = 0x0000_0000_7000_0001;
 
 /// `BOOL OpenProcessToken(HANDLE ProcessHandle, DWORD DesiredAccess, PHANDLE TokenHandle)`.
-fn handle_open_process_token(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+fn handle_open_process_token(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _process = engine.read_rcx().context("OpenProcessToken RCX")?;
     let _access = engine.read_rdx().context("OpenProcessToken RDX")?;
     let token_out = engine.read_r8().context("OpenProcessToken R8")?;
@@ -192,9 +185,8 @@ fn handle_open_process_token(
 }
 
 /// `BOOL AdjustTokenPrivileges(...)` — succeed without changing privileges.
-fn handle_adjust_token_privileges(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+fn handle_adjust_token_privileges(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _token = engine.read_rcx()?;
     let _disable_all = engine.read_rdx()?;
     let _new_state = engine.read_r8()?;
@@ -203,9 +195,8 @@ fn handle_adjust_token_privileges(
 }
 
 /// `BOOL LookupPrivilegeValueW(LPCWSTR, LPCWSTR, PLUID)`.
-fn handle_lookup_privilege_value(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+fn handle_lookup_privilege_value(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _system = engine.read_rcx()?;
     let _name = engine.read_rdx()?;
     let luid = engine.read_r8()?;
@@ -217,7 +208,8 @@ fn handle_lookup_privilege_value(
 }
 
 /// `BOOLEAN SystemFunction036(PVOID RandomBuffer, ULONG RandomBufferLength)` (RtlGenRandom).
-fn handle_system_function036(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_system_function036(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let buf = engine.read_rcx()?;
     let len = engine.read_rdx()? & 0xffff_ffff;
     let len_usize = usize::try_from(len).unwrap_or(0);
@@ -243,7 +235,8 @@ fn handle_system_function036(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinA
 const FAKE_SD_NEED: u32 = 20;
 
 /// `BOOL GetFileSecurityW(...)` — report not enough buffer / fail soft.
-fn handle_get_file_security(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_get_file_security(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _path = engine.read_rcx()?;
     let _si = engine.read_rdx()?;
     let sd = engine.read_r8()?;
@@ -267,7 +260,8 @@ fn handle_get_file_security(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinAp
 }
 
 /// `BOOL SetFileSecurityW(...)` — accept.
-fn handle_set_file_security(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_set_file_security(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _path = engine.read_rcx()?;
     let _si = engine.read_rdx()?;
     let _sd = engine.read_r8()?;
@@ -286,9 +280,8 @@ fn return_bool(engine: &mut dyn wie_cpu::CpuEngine, ok: bool) -> Result<WinApiHa
 }
 
 /// Handles `ADVAPI32.dll!RegQueryValueExA`.
-pub fn handle_reg_query_value_ex_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_reg_query_value_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _key = engine
         .read_rcx()
         .context("failed to read RCX for RegQueryValueExA")?;
@@ -300,9 +293,8 @@ pub fn handle_reg_query_value_ex_a(
 }
 
 /// Handles `ADVAPI32.dll!RegQueryValueExW`.
-pub fn handle_reg_query_value_ex_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_reg_query_value_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _key = engine
         .read_rcx()
         .context("failed to read RCX for RegQueryValueExW")?;
@@ -314,9 +306,8 @@ pub fn handle_reg_query_value_ex_w(
 }
 
 /// Handles `ADVAPI32.dll!RegSetValueExA`.
-pub fn handle_reg_set_value_ex_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_reg_set_value_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _key = engine
         .read_rcx()
         .context("failed to read RCX for RegSetValueExA")?;
@@ -328,9 +319,8 @@ pub fn handle_reg_set_value_ex_a(
 }
 
 /// Handles `ADVAPI32.dll!RegSetValueExW`.
-pub fn handle_reg_set_value_ex_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_reg_set_value_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _key = engine
         .read_rcx()
         .context("failed to read RCX for RegSetValueExW")?;
@@ -342,9 +332,8 @@ pub fn handle_reg_set_value_ex_w(
 }
 
 /// Handles `ADVAPI32.dll!RegDeleteValueA`.
-pub fn handle_reg_delete_value_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_reg_delete_value_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _key = engine
         .read_rcx()
         .context("failed to read RCX for RegDeleteValueA")?;
@@ -356,7 +345,8 @@ pub fn handle_reg_delete_value_a(
 }
 
 /// Handles `ADVAPI32.dll!RegCloseKey`.
-pub fn handle_reg_close_key(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_reg_close_key(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _key = engine
         .read_rcx()
         .context("failed to read RCX for RegCloseKey")?;
@@ -366,8 +356,9 @@ pub fn handle_reg_close_key(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinAp
 
 /// Handles `ADVAPI32.dll!InitializeSecurityDescriptor`.
 pub fn handle_initialize_security_descriptor(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let security_descriptor_ptr = engine
         .read_rcx()
         .context("failed to read RCX for InitializeSecurityDescriptor")?;
@@ -390,8 +381,9 @@ pub fn handle_initialize_security_descriptor(
 
 /// Handles `ADVAPI32.dll!SetSecurityDescriptorDacl`.
 pub fn handle_set_security_descriptor_dacl(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let security_descriptor_ptr = engine
         .read_rcx()
         .context("failed to read RCX for SetSecurityDescriptorDacl")?;
@@ -418,10 +410,9 @@ pub fn handle_set_security_descriptor_dacl(
 }
 
 /// `LSTATUS RegEnumKeyExW(HKEY, DWORD, LPWSTR, LPDWORD, ...)`.
-fn handle_reg_enum_key_ex(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+fn handle_reg_enum_key_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let hkey = engine.read_rcx()?;
     let index = engine.read_rdx()? & 0xffff_ffff;
     let name_buf = engine.read_r8()?;
@@ -471,10 +462,8 @@ fn handle_reg_enum_key_ex(
 }
 
 /// `LSTATUS RegEnumValueW(HKEY, DWORD, LPWSTR, LPDWORD, ...)` — no values stored.
-fn handle_reg_enum_value(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    _state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+fn handle_reg_enum_value(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _hkey = engine.read_rcx()?;
     let _index = engine.read_rdx()?;
     // No registry values are stored in the current model.

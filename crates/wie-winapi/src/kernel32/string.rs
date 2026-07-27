@@ -1,12 +1,13 @@
 use super::{
     ANSI_CODE_PAGE, C1_ALPHA, C1_BLANK, C1_CNTRL, C1_DIGIT, C1_LOWER, C1_PUNCT, C1_SPACE, C1_UPPER,
-    C1_XDIGIT, CT_CTYPE1, Context, OEM_CODE_PAGE, Result, WinApiHandlerResult, checked_address,
-    checked_field_address, low_u32_to_i32, read_guest_u16, read_guest_u64, write_guest_u16,
-    write_guest_u32,
+    C1_XDIGIT, CT_CTYPE1, Context, HandlerContext, OEM_CODE_PAGE, Result, WinApiHandlerResult,
+    checked_address, checked_field_address, low_u32_to_i32, read_guest_u16, read_guest_u64,
+    write_guest_u16, write_guest_u32,
 };
 
 /// Handles `KERNEL32.dll!lstrlenW`.
-pub fn handle_lstrlen_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_lstrlen_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let s = engine
         .read_rcx()
         .context("failed to read RCX for lstrlenW")?;
@@ -36,7 +37,8 @@ pub fn handle_lstrlen_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHan
     })
 }
 /// Handles `KERNEL32.dll!lstrcpyW` — copy wide string; returns dest.
-pub fn handle_lstrcpy_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_lstrcpy_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let dest = engine
         .read_rcx()
         .context("failed to read RCX for lstrcpyW")?;
@@ -67,7 +69,8 @@ pub fn handle_lstrcpy_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHan
     })
 }
 /// Handles `KERNEL32.dll!lstrcatW` — append wide string; returns dest.
-pub fn handle_lstrcat_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_lstrcat_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let dest = engine
         .read_rcx()
         .context("failed to read RCX for lstrcatW")?;
@@ -284,9 +287,8 @@ pub(crate) fn read_fixed_bytes(
     Ok(bytes)
 }
 /// Handles `KERNEL32.dll!WideCharToMultiByte`.
-pub fn handle_wide_char_to_multi_byte(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_wide_char_to_multi_byte(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let code_page = engine
         .read_rcx()
         .context("failed to read RCX for WideCharToMultiByte")?;
@@ -348,7 +350,8 @@ pub fn handle_wide_char_to_multi_byte(
     })
 }
 /// Handles `KERNEL32.dll!GetACP`.
-pub fn handle_get_acp(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_get_acp(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let return_address = engine
         .return_from_win64_api(ANSI_CODE_PAGE)
         .context("failed to return from GetACP")?;
@@ -359,7 +362,8 @@ pub fn handle_get_acp(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandl
     })
 }
 /// Handles `KERNEL32.dll!GetOEMCP`.
-pub fn handle_get_oem_cp(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_get_oem_cp(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let return_address = engine
         .return_from_win64_api(OEM_CODE_PAGE)
         .context("failed to return from GetOEMCP")?;
@@ -370,7 +374,8 @@ pub fn handle_get_oem_cp(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHa
     })
 }
 /// Handles `KERNEL32.dll!GetCPInfo`.
-pub fn handle_get_cp_info(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_get_cp_info(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _code_page = engine
         .read_rcx()
         .context("failed to read RCX for GetCPInfo")?;
@@ -403,9 +408,8 @@ pub fn handle_get_cp_info(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiH
     })
 }
 /// Handles `KERNEL32.dll!IsValidCodePage`.
-pub fn handle_is_valid_code_page(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_is_valid_code_page(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let code_page = engine
         .read_rcx()
         .context("failed to read RCX for IsValidCodePage")?;
@@ -425,9 +429,8 @@ pub fn handle_is_valid_code_page(
     })
 }
 /// Handles `KERNEL32.dll!GetStringTypeW`.
-pub fn handle_get_string_type_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_string_type_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let info_type = engine
         .read_rcx()
         .context("failed to read RCX for GetStringTypeW")?;
@@ -479,9 +482,8 @@ pub fn handle_get_string_type_w(
     })
 }
 /// Handles `KERNEL32.dll!MultiByteToWideChar`.
-pub fn handle_multi_byte_to_wide_char(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_multi_byte_to_wide_char(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let code_page = engine.read_rcx()?;
     let _flags = engine.read_rdx()?;
     let input_ptr = engine.read_r8()?;
@@ -535,7 +537,8 @@ pub fn handle_multi_byte_to_wide_char(
     })
 }
 /// Handles `KERNEL32.dll!LCMapStringW`.
-pub fn handle_lc_map_string_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_lc_map_string_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _locale = engine
         .read_rcx()
         .context("failed to read RCX for LCMapStringW")?;

@@ -26,8 +26,6 @@ pub fn dispatch_oleaut32(
     ctx: &mut HandlerContext<'_>,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
     let n = name.to_ascii_lowercase();
     // OLEAUT32 export ordinals (Wine / Windows): 2 Alloc, 4 AllocLen, 6 Free,
     // 7 StringLen, 8 VariantInit, 9 VariantClear, 10 VariantCopy, 11 CopyInd.
@@ -49,38 +47,32 @@ pub fn dispatch_oleaut32(
         other => other,
     };
     match key {
-        "sysallocstring" => Ok(Some(handle_sys_alloc_string(engine, state)?)),
+        "sysallocstring" => Ok(Some(handle_sys_alloc_string(ctx)?)),
         "sysallocstringlen" | "sysreallocstring" | "sysreallocstringlen" => {
-            Ok(Some(handle_sys_alloc_string_len(engine, state)?))
+            Ok(Some(handle_sys_alloc_string_len(ctx)?))
         }
-        "sysfreestring" => Ok(Some(handle_sys_free_string(engine, state)?)),
-        "sysstringlen" => Ok(Some(handle_sys_string_len(engine)?)),
-        "sysstringbyteslen" => Ok(Some(handle_sys_string_byte_len(engine)?)),
-        "variantinit" => Ok(Some(handle_variant_init(engine)?)),
-        "variantclear" => Ok(Some(handle_variant_clear(engine, state)?)),
-        "variantcopy" => Ok(Some(handle_variant_copy(engine, state)?)),
+        "sysfreestring" => Ok(Some(handle_sys_free_string(ctx)?)),
+        "sysstringlen" => Ok(Some(handle_sys_string_len(ctx)?)),
+        "sysstringbyteslen" => Ok(Some(handle_sys_string_byte_len(ctx)?)),
+        "variantinit" => Ok(Some(handle_variant_init(ctx)?)),
+        "variantclear" => Ok(Some(handle_variant_clear(ctx)?)),
+        "variantcopy" => Ok(Some(handle_variant_copy(ctx)?)),
         // Variant arithmetic
         "varadd" | "varsub" | "varmul" | "vardiv" | "varmod" => {
-            Ok(Some(handle_var_math(engine, state, key)?))
+            Ok(Some(handle_var_math(ctx, key)?))
         }
         // Variant type conversions: BSTR ← num
-        "varbstrfromi4" => Ok(Some(handle_var_bstr_from_num(engine, state, VT_I4)?)),
-        "varbstrfromr4" => Ok(Some(handle_var_bstr_from_num(engine, state, VT_R4)?)),
-        "varbstrfromr8" | "varbstrfromdate" => {
-            Ok(Some(handle_var_bstr_from_num(engine, state, VT_R8)?))
-        }
+        "varbstrfromi4" => Ok(Some(handle_var_bstr_from_num(ctx, VT_I4)?)),
+        "varbstrfromr4" => Ok(Some(handle_var_bstr_from_num(ctx, VT_R4)?)),
+        "varbstrfromr8" | "varbstrfromdate" => Ok(Some(handle_var_bstr_from_num(ctx, VT_R8)?)),
         // Variant type conversions: num ← BSTR
-        "vari4frombstr" | "vari4fromr8" => {
-            Ok(Some(handle_var_num_from_bstr(engine, state, VT_I4)?))
-        }
-        "varr4frombstr" => Ok(Some(handle_var_num_from_bstr(engine, state, VT_R4)?)),
-        "varr8frombstr" | "vardatefrombstr" => {
-            Ok(Some(handle_var_num_from_bstr(engine, state, VT_R8)?))
-        }
+        "vari4frombstr" | "vari4fromr8" => Ok(Some(handle_var_num_from_bstr(ctx, VT_I4)?)),
+        "varr4frombstr" => Ok(Some(handle_var_num_from_bstr(ctx, VT_R4)?)),
+        "varr8frombstr" | "vardatefrombstr" => Ok(Some(handle_var_num_from_bstr(ctx, VT_R8)?)),
         // Variant type conversions: num ← num
-        "varr8fromi4" => Ok(Some(handle_var_num_from_num(engine, VT_R8, VT_I4)?)),
-        "vardatefromi4" => Ok(Some(handle_var_num_from_num(engine, VT_DATE, VT_I4)?)),
-        "vardatefromr8" => Ok(Some(handle_var_num_from_num(engine, VT_DATE, VT_R8)?)),
+        "varr8fromi4" => Ok(Some(handle_var_num_from_num(ctx, VT_R8, VT_I4)?)),
+        "vardatefromi4" => Ok(Some(handle_var_num_from_num(ctx, VT_DATE, VT_I4)?)),
+        "vardatefromr8" => Ok(Some(handle_var_num_from_num(ctx, VT_DATE, VT_R8)?)),
         _ => Ok(None),
     }
 }
@@ -123,10 +115,9 @@ fn alloc_bstr(
 }
 
 /// `BSTR SysAllocString(const OLECHAR*)`.
-fn handle_sys_alloc_string(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+fn handle_sys_alloc_string(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let src = engine.read_rcx()?;
     if src == 0 {
         return ret(engine, 0);
@@ -151,10 +142,9 @@ fn handle_sys_alloc_string(
 }
 
 /// `BSTR SysAllocStringLen(const OLECHAR*, UINT)`.
-fn handle_sys_alloc_string_len(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+fn handle_sys_alloc_string_len(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let src = engine.read_rcx()?;
     let len = engine.read_rdx()? & 0xffff_ffff;
     let n = usize::try_from(len).unwrap_or(0);
@@ -172,10 +162,9 @@ fn handle_sys_alloc_string_len(
 }
 
 /// `void SysFreeString(BSTR)`.
-fn handle_sys_free_string(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+fn handle_sys_free_string(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let bstr = engine.read_rcx()?;
     if bstr != 0 {
         // Free the allocation that includes the 4-byte length prefix.
@@ -188,7 +177,8 @@ fn handle_sys_free_string(
 }
 
 /// `UINT SysStringLen(BSTR)`.
-fn handle_sys_string_len(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_sys_string_len(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let bstr = engine.read_rcx()?;
     if bstr == 0 {
         return ret(engine, 0);
@@ -200,7 +190,8 @@ fn handle_sys_string_len(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHa
 }
 
 /// `UINT SysStringByteLen(BSTR)`.
-fn handle_sys_string_byte_len(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_sys_string_byte_len(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let bstr = engine.read_rcx()?;
     if bstr == 0 {
         return ret(engine, 0);
@@ -211,7 +202,8 @@ fn handle_sys_string_byte_len(engine: &mut dyn wie_cpu::CpuEngine) -> Result<Win
 }
 
 /// `void VariantInit(VARIANTARG*)` — set VT_EMPTY.
-fn handle_variant_init(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_variant_init(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let pvar = engine.read_rcx()?;
     if pvar != 0 {
         engine.mem_write(pvar, &[0_u8; 24])?;
@@ -344,10 +336,9 @@ fn dup_bstr(
 }
 
 /// `HRESULT VariantClear(VARIANTARG*)` — free owned resources and set `VT_EMPTY`.
-fn handle_variant_clear(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+fn handle_variant_clear(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let pvar = engine.read_rcx()?;
     variant_clear_at(engine, state, pvar)?;
     ret(engine, 0) // S_OK
@@ -357,10 +348,9 @@ fn handle_variant_clear(
 ///
 /// Must **deep-copy** `VT_BSTR` (and clear `dest` first). Shallow memcpy is wrong:
 /// 7-Zip `CPropVariant::InternalCopy` relies on this for method property values.
-fn handle_variant_copy(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+fn handle_variant_copy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let dest = engine.read_rcx()?;
     let src = engine.read_rdx()?;
     if dest == 0 || src == 0 {
@@ -406,11 +396,8 @@ fn handle_variant_copy(
 ///
 /// Win64: RCX = result VARIANT*, RDX = lhs VARIANT*, R8 = rhs VARIANT*.
 #[expect(clippy::integer_division, clippy::arithmetic_side_effects)]
-fn handle_var_math(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    _state: &mut WinApiState,
-    op: &str,
-) -> Result<WinApiHandlerResult> {
+fn handle_var_math(ctx: &mut HandlerContext<'_>, op: &str) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let presult = engine.read_rcx()?;
     let plhs = engine.read_rdx()?;
     let prhs = engine.read_r8()?;
@@ -454,10 +441,11 @@ fn handle_var_math(
 /// Win64: RCX = result VARIANT*, RDX = input number (as VT argument variant).
 #[expect(clippy::cast_possible_truncation, clippy::as_conversions)]
 fn handle_var_bstr_from_num(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
     src_vt: u16,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let presult = engine.read_rcx()?;
     let raw_val = engine.read_rdx()?;
     if presult == 0 {
@@ -488,10 +476,10 @@ fn handle_var_bstr_from_num(
 /// Win64: RCX = result VARIANT*, RDX = source VARIANT*.
 #[expect(clippy::cast_possible_truncation, clippy::as_conversions)]
 fn handle_var_num_from_bstr(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    _state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
     out_vt: u16,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let presult = engine.read_rcx()?;
     let psrc = engine.read_rdx()?;
     if presult == 0 || psrc == 0 {
@@ -539,10 +527,11 @@ fn handle_var_num_from_bstr(
 ///
 /// Win64: RCX = result VARIANT*, RDX = source VARIANT*.
 fn handle_var_num_from_num(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
     out_vt: u16,
     _in_vt: u16,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let presult = engine.read_rcx()?;
     let psrc = engine.read_rdx()?;
     if presult == 0 || psrc == 0 {

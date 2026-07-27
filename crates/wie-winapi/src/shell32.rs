@@ -25,14 +25,12 @@ pub fn dispatch_shell32(
     ctx: &mut HandlerContext<'_>,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
     let n = name.to_ascii_lowercase();
     match n.as_str() {
-        "shgetfolderpathw" => Ok(Some(handle_sh_get_folder_path_w(engine)?)),
-        "shgetpathfromidlistw" => Ok(Some(handle_sh_get_path_from_id_list_w(engine)?)),
-        "shbrowseforfolderw" => Ok(Some(handle_sh_browse_for_folder_w(engine)?)),
-        "commandlinetoargvw" => Ok(Some(handle_command_line_to_argv_w(engine, state)?)),
+        "shgetfolderpathw" => Ok(Some(handle_sh_get_folder_path_w(ctx)?)),
+        "shgetpathfromidlistw" => Ok(Some(handle_sh_get_path_from_id_list_w(ctx)?)),
+        "shbrowseforfolderw" => Ok(Some(handle_sh_browse_for_folder_w(ctx)?)),
+        "commandlinetoargvw" => Ok(Some(handle_command_line_to_argv_w(ctx)?)),
         _ => Ok(None),
     }
 }
@@ -41,7 +39,8 @@ pub fn dispatch_shell32(
 ///
 /// Fills a fixed bottle-friendly path under `C:\Users\WIE\…` style so tools
 /// that only need a writable home directory keep going.
-fn handle_sh_get_folder_path_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_sh_get_folder_path_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _hwnd = engine.read_rcx()?;
     let csidl = engine.read_rdx()? & 0xffff_ffff;
     let _token = engine.read_r8()?;
@@ -77,10 +76,9 @@ fn handle_sh_get_folder_path_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<Wi
 ///
 /// Parses a command-line string into an argv-style array, allocating the result
 /// and the argument strings from the process heap.
-fn handle_command_line_to_argv_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+fn handle_command_line_to_argv_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let cmd_line_ptr = engine.read_rcx()?;
     let num_args_ptr = engine.read_rdx()?;
     if cmd_line_ptr == 0 || num_args_ptr == 0 {
@@ -175,9 +173,8 @@ fn alloc_shell_bstr(
 }
 
 /// `BOOL SHGetPathFromIDListW(pidl, pszPath)` — no real PIDLs; fail cleanly.
-fn handle_sh_get_path_from_id_list_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+fn handle_sh_get_path_from_id_list_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _pidl = engine.read_rcx()?;
     let path_ptr = engine.read_rdx()?;
     if path_ptr != 0 {
@@ -187,9 +184,8 @@ fn handle_sh_get_path_from_id_list_w(
 }
 
 /// `PIDLIST_ABSOLUTE SHBrowseForFolderW(lpbi)` — no UI; return NULL.
-fn handle_sh_browse_for_folder_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+fn handle_sh_browse_for_folder_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _lpbi = engine.read_rcx()?;
     let _ = E_FAIL;
     ret(engine, 0)

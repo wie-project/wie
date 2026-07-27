@@ -12,7 +12,7 @@ pub(crate) use crate::guest_string::{
     write_utf16_c_string as write_guest_utf16_c_string,
 };
 pub(crate) use crate::{
-    GuestCallbackRequest, MessageQueueIdlePolicy, QueuedWindowMessage, TimerRecord,
+    GuestCallbackRequest, HandlerContext, MessageQueueIdlePolicy, QueuedWindowMessage, TimerRecord,
     WinApiControlSignal, WinApiHandlerResult, WinApiState, WindowClassRecord, WindowRecord,
     WindowsHookRecord,
 };

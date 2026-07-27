@@ -1,6 +1,6 @@
 use super::{
     Context, ERROR_FILE_NOT_FOUND, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER,
-    ERROR_TOO_MANY_POSTS, EnterCsResult, Result, WinApiHandlerResult, WinApiState,
+    ERROR_TOO_MANY_POSTS, EnterCsResult, HandlerContext, Result, WinApiHandlerResult, WinApiState,
     checked_field_address, i32_to_rax, i64_to_rax, low_u32, read_guest_u64, ret_u64, trunc_i32,
     write_guest_u32, write_guest_u64,
 };
@@ -30,8 +30,9 @@ pub(crate) fn write_critical_section_unlocked(
 }
 /// Handles `KERNEL32.dll!InitializeCriticalSection`.
 pub fn handle_initialize_critical_section(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let critical_section_ptr = engine
         .read_rcx()
         .context("failed to read RCX for InitializeCriticalSection")?;
@@ -51,10 +52,9 @@ pub fn handle_initialize_critical_section(
     })
 }
 /// Handles `KERNEL32.dll!EnterCriticalSection` (reentrant; blocks when needed).
-pub fn handle_enter_critical_section(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_enter_critical_section(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let cs = engine
         .read_rcx()
         .context("failed to read RCX for EnterCriticalSection")?;
@@ -81,10 +81,9 @@ pub fn handle_enter_critical_section(
     })
 }
 /// Handles `KERNEL32.dll!LeaveCriticalSection`.
-pub fn handle_leave_critical_section(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_leave_critical_section(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let cs = engine
         .read_rcx()
         .context("failed to read RCX for LeaveCriticalSection")?;
@@ -110,9 +109,8 @@ pub fn handle_leave_critical_section(
     })
 }
 /// Handles `KERNEL32.dll!DeleteCriticalSection`.
-pub fn handle_delete_critical_section(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_delete_critical_section(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let cs = engine
         .read_rcx()
         .context("failed to read RCX for DeleteCriticalSection")?;
@@ -200,8 +198,9 @@ pub(crate) fn read_guest_u32_cs(engine: &mut dyn wie_cpu::CpuEngine, va: u64) ->
     Some(u32::from_le_bytes(b))
 }
 pub fn handle_initialize_critical_section_and_spin_count(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let critical_section_ptr = engine
         .read_rcx()
         .context("failed to read RCX for InitializeCriticalSectionAndSpinCount")?;
@@ -223,10 +222,9 @@ pub fn handle_initialize_critical_section_and_spin_count(
         return_value: 1,
     })
 }
-pub fn handle_create_semaphore(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_create_semaphore(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _attrs = engine.read_rcx()?;
     let initial_raw = engine.read_rdx()?;
     let maximum_raw = engine.read_r8()?;
@@ -249,10 +247,9 @@ pub fn handle_create_semaphore(
     state.process.last_error = 0;
     ret_u64(engine, handle, "CreateSemaphore")
 }
-pub fn handle_release_semaphore(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_release_semaphore(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = engine.read_rcx()?;
     let release_raw = engine.read_rdx()?;
     let prev_out = engine.read_r8()?;
@@ -278,10 +275,9 @@ pub fn handle_release_semaphore(
         ret_u64(engine, 0, "ReleaseSemaphore")
     }
 }
-pub fn handle_open_event(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_open_event(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _access = engine.read_rcx()?;
     let _inherit = engine.read_rdx()?;
     let _name = engine.read_r9().or_else(|_| engine.read_r8())?;
@@ -290,9 +286,10 @@ pub fn handle_open_event(
     ret_u64(engine, 0, "OpenEventW")
 }
 pub fn handle_wait_for_multiple_objects(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let count = low_u32(engine.read_rcx()?, "WaitForMultipleObjects count")?;
     let handles_ptr = engine.read_rdx()?;
     let wait_all = (engine.read_r8()? & 0xffff_ffff) != 0;
@@ -356,10 +353,9 @@ pub fn handle_wait_for_multiple_objects(
     .into())
 }
 /// Handles `KERNEL32.dll!SignalObjectAndWait` — wait on the event then return.
-pub fn handle_signal_object_and_wait(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_signal_object_and_wait(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let signal_handle = engine.read_rcx()?;
     let wait_handle = engine.read_rdx()?;
     let _timeout = engine.read_r8()?;
@@ -521,9 +517,10 @@ pub(crate) fn interlocked_i64_prev(
     Ok(prev)
 }
 pub(crate) fn handle_interlocked_increment(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     use std::sync::atomic::Ordering;
+    let engine = &mut *ctx.engine;
     let addr = engine.read_rcx().context("InterlockedIncrement RCX")?;
     let new = interlocked_i32(
         engine,
@@ -538,9 +535,10 @@ pub(crate) fn handle_interlocked_increment(
     })
 }
 pub(crate) fn handle_interlocked_decrement(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     use std::sync::atomic::Ordering;
+    let engine = &mut *ctx.engine;
     let addr = engine.read_rcx().context("InterlockedDecrement RCX")?;
     let new = interlocked_i32(
         engine,
@@ -555,9 +553,10 @@ pub(crate) fn handle_interlocked_decrement(
     })
 }
 pub(crate) fn handle_interlocked_exchange(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     use std::sync::atomic::Ordering;
+    let engine = &mut *ctx.engine;
     let addr = engine.read_rcx().context("InterlockedExchange RCX")?;
     // RDX carries the new LONG (low 32 bits).
     let value = trunc_i32(engine.read_rdx()?);
@@ -574,9 +573,10 @@ pub(crate) fn handle_interlocked_exchange(
     })
 }
 pub(crate) fn handle_interlocked_compare_exchange(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     use std::sync::atomic::Ordering;
+    let engine = &mut *ctx.engine;
     let addr = engine.read_rcx()?;
     let exchange = trunc_i32(engine.read_rdx()?);
     let comparand = trunc_i32(engine.read_r8()?);
@@ -601,9 +601,10 @@ pub(crate) fn handle_interlocked_compare_exchange(
     })
 }
 pub(crate) fn handle_interlocked_exchange_add(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     use std::sync::atomic::Ordering;
+    let engine = &mut *ctx.engine;
     let addr = engine.read_rcx()?;
     let addend = trunc_i32(engine.read_rdx()?);
     let prev = interlocked_i32_prev(
@@ -619,9 +620,10 @@ pub(crate) fn handle_interlocked_exchange_add(
     })
 }
 pub(crate) fn handle_interlocked_increment64(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     use std::sync::atomic::Ordering;
+    let engine = &mut *ctx.engine;
     let addr = engine.read_rcx()?;
     let new = interlocked_i64(
         engine,
@@ -636,9 +638,10 @@ pub(crate) fn handle_interlocked_increment64(
     })
 }
 pub(crate) fn handle_interlocked_decrement64(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     use std::sync::atomic::Ordering;
+    let engine = &mut *ctx.engine;
     let addr = engine.read_rcx()?;
     let new = interlocked_i64(
         engine,
@@ -653,9 +656,10 @@ pub(crate) fn handle_interlocked_decrement64(
     })
 }
 pub(crate) fn handle_interlocked_exchange64(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     use std::sync::atomic::Ordering;
+    let engine = &mut *ctx.engine;
     let addr = engine.read_rcx()?;
     let value = i64::from_le_bytes(engine.read_rdx()?.to_le_bytes());
     let prev = interlocked_i64_prev(
@@ -671,9 +675,10 @@ pub(crate) fn handle_interlocked_exchange64(
     })
 }
 pub(crate) fn handle_interlocked_compare_exchange64(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     use std::sync::atomic::Ordering;
+    let engine = &mut *ctx.engine;
     let addr = engine.read_rcx()?;
     let exchange = i64::from_le_bytes(engine.read_rdx()?.to_le_bytes());
     let comparand = i64::from_le_bytes(engine.read_r8()?.to_le_bytes());
@@ -698,9 +703,10 @@ pub(crate) fn handle_interlocked_compare_exchange64(
     })
 }
 pub(crate) fn handle_interlocked_exchange_add64(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     use std::sync::atomic::Ordering;
+    let engine = &mut *ctx.engine;
     let addr = engine.read_rcx()?;
     let addend = i64::from_le_bytes(engine.read_rdx()?.to_le_bytes());
     let prev = interlocked_i64_prev(
@@ -716,9 +722,10 @@ pub(crate) fn handle_interlocked_exchange_add64(
     })
 }
 pub(crate) fn handle_wait_for_single_object(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = engine.read_rcx()?;
     let timeout_raw = engine.read_rdx()?;
     let timeout_ms = u32::try_from(timeout_raw & u64::from(u32::MAX)).unwrap_or(0);
@@ -802,10 +809,9 @@ pub fn resolve_cs_queue(
 ) -> std::sync::Arc<crate::sync_obj::CsWaitQueue> {
     state.kernel.sync.cs_queue(cs)
 }
-pub(crate) fn handle_create_event(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub(crate) fn handle_create_event(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _security = engine.read_rcx()?;
     let manual = engine.read_rdx()? != 0;
     let initial = engine.read_r8()? != 0;
@@ -819,10 +825,9 @@ pub(crate) fn handle_create_event(
         return_value: handle,
     })
 }
-pub(crate) fn handle_set_event(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub(crate) fn handle_set_event(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = engine.read_rcx()?;
     let ok = match state.kernel.sync.object(handle) {
         Some(crate::KernelObject::Event(e)) => {
@@ -847,10 +852,9 @@ pub(crate) fn handle_set_event(
         })
     }
 }
-pub(crate) fn handle_reset_event(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub(crate) fn handle_reset_event(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = engine.read_rcx()?;
     let ok = match state.kernel.sync.object(handle) {
         Some(crate::KernelObject::Event(e)) => {
@@ -876,9 +880,10 @@ pub(crate) fn handle_reset_event(
     }
 }
 pub(crate) fn handle_flush_instruction_cache(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _process = engine
         .read_rcx()
         .context("failed to read RCX for FlushInstructionCache")?;

@@ -3,7 +3,7 @@ use super::{
     ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_PATH_NOT_FOUND, ERROR_READ_FAULT,
     FAKE_DISK_CLUSTERS, FAKE_DISK_GIB, FAKE_STDERR_HANDLE, FAKE_STDIN_HANDLE, FAKE_STDOUT_HANDLE,
     FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY, FILE_BEGIN, FILE_CURRENT, FILE_END,
-    FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_UNKNOWN, FIXED_SYSTEM_FILETIME,
+    FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_UNKNOWN, FIXED_SYSTEM_FILETIME, HandlerContext,
     INVALID_FILE_ATTRIBUTES, INVALID_HANDLE_VALUE, INVALID_SET_FILE_POINTER, LOGICAL_DRIVE_TCHARS,
     OPEN_ALWAYS, OPEN_EXISTING, OpenFileOutcome, OpenGuestFile, Path, Result, TRUNCATE_EXISTING,
     WinApiHandlerResult, WinApiState, checked_address, checked_field_address,
@@ -31,10 +31,9 @@ pub(crate) fn write_host_console_handle(handle: u64, bytes: &[u8]) {
     crate::ucrt::write_all_fd(fd, bytes);
 }
 /// Handles `KERNEL32.dll!GetFileType`.
-pub fn handle_get_file_type(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_file_type(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = engine
         .read_rcx()
         .context("failed to read RCX for GetFileType")?;
@@ -55,10 +54,9 @@ pub fn handle_get_file_type(
     })
 }
 /// Handles `KERNEL32.dll!GetFileAttributesA`.
-pub fn handle_get_file_attributes_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_file_attributes_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let path_ptr = engine
         .read_rcx()
         .context("failed to read RCX for GetFileAttributesA")?;
@@ -83,10 +81,9 @@ pub fn handle_get_file_attributes_a(
     })
 }
 /// Handles `KERNEL32.dll!GetFileAttributesW`.
-pub fn handle_get_file_attributes_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_file_attributes_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let path_ptr = engine
         .read_rcx()
         .context("failed to read RCX for GetFileAttributesW")?;
@@ -111,10 +108,9 @@ pub fn handle_get_file_attributes_w(
     })
 }
 /// Handles `KERNEL32.dll!FindFirstFileW`.
-pub fn handle_find_first_file_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_find_first_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let pattern_ptr = engine
         .read_rcx()
         .context("failed to read RCX for FindFirstFileW")?;
@@ -136,10 +132,9 @@ pub fn handle_find_first_file_w(
     })
 }
 /// Handles `KERNEL32.dll!FindFirstFileA`.
-pub fn handle_find_first_file_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_find_first_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let pattern_ptr = engine
         .read_rcx()
         .context("failed to read RCX for FindFirstFileA")?;
@@ -161,10 +156,9 @@ pub fn handle_find_first_file_a(
     })
 }
 /// Handles `KERNEL32.dll!FindNextFileW`.
-pub fn handle_find_next_file_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_find_next_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let find_handle = engine
         .read_rcx()
         .context("failed to read RCX for FindNextFileW")?;
@@ -185,10 +179,9 @@ pub fn handle_find_next_file_w(
     })
 }
 /// Handles `KERNEL32.dll!FindNextFileA`.
-pub fn handle_find_next_file_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_find_next_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let find_handle = engine
         .read_rcx()
         .context("failed to read RCX for FindNextFileA")?;
@@ -209,10 +202,9 @@ pub fn handle_find_next_file_a(
     })
 }
 /// Handles `KERNEL32.dll!FindClose`.
-pub fn handle_find_close(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_find_close(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let find_handle = engine
         .read_rcx()
         .context("failed to read RCX for FindClose")?;
@@ -232,10 +224,9 @@ pub fn handle_find_close(
     })
 }
 /// Handles `KERNEL32.dll!CreateFileW`.
-pub fn handle_create_file_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_create_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let file_name_ptr = engine
         .read_rcx()
         .context("failed to read RCX for CreateFileW")?;
@@ -282,10 +273,9 @@ pub fn handle_create_file_w(
     })
 }
 /// Handles `KERNEL32.dll!CreateFileA`.
-pub fn handle_create_file_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_create_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let file_name_ptr = engine
         .read_rcx()
         .context("failed to read RCX for CreateFileA")?;
@@ -331,10 +321,9 @@ pub fn handle_create_file_a(
     })
 }
 /// Handles `KERNEL32.dll!CloseHandle`.
-pub fn handle_close_handle(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_close_handle(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = engine
         .read_rcx()
         .context("failed to read RCX for CloseHandle")?;
@@ -377,9 +366,10 @@ pub fn handle_close_handle(
 }
 /// Handles `KERNEL32.dll!GetFileInformationByHandle`.
 pub fn handle_get_file_information_by_handle(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = engine
         .read_rcx()
         .context("failed to read RCX for GetFileInformationByHandle")?;
@@ -879,9 +869,10 @@ pub(crate) fn guest_dir_exists(state: &WinApiState, path: &str) -> bool {
 }
 /// Handles `KERNEL32.dll!FileTimeToLocalFileTime`.
 pub fn handle_file_time_to_local_file_time(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let input_file_time_ptr = engine
         .read_rcx()
         .context("failed to read RCX for FileTimeToLocalFileTime")?;
@@ -921,9 +912,10 @@ pub fn handle_file_time_to_local_file_time(
 }
 /// Handles `KERNEL32.dll!FileTimeToSystemTime`.
 pub fn handle_file_time_to_system_time(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let input_file_time_ptr = engine
         .read_rcx()
         .context("failed to read RCX for FileTimeToSystemTime")?;
@@ -981,10 +973,9 @@ pub fn handle_file_time_to_system_time(
     })
 }
 /// Handles `KERNEL32.dll!GetFileTime`.
-pub fn handle_get_file_time(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_file_time(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = engine
         .read_rcx()
         .context("failed to read RCX for GetFileTime")?;
@@ -1033,10 +1024,9 @@ pub fn handle_get_file_time(
     })
 }
 /// Handles `KERNEL32.dll!SetFilePointer`.
-pub fn handle_set_file_pointer(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_file_pointer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = engine
         .read_rcx()
         .context("failed to read RCX for SetFilePointer")?;
@@ -1126,10 +1116,9 @@ pub fn handle_set_file_pointer(
     })
 }
 /// Handles `KERNEL32.dll!GetFileSize`.
-pub fn handle_get_file_size(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_file_size(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = engine
         .read_rcx()
         .context("failed to read RCX for GetFileSize")?;
@@ -1169,10 +1158,9 @@ pub fn handle_get_file_size(
     })
 }
 /// Handles `KERNEL32.dll!ReadFile`.
-pub fn handle_read_file(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_read_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = engine.read_rcx()?;
     let buffer_ptr = engine.read_rdx()?;
     let bytes_to_read = engine.read_r8()?;
@@ -1396,10 +1384,9 @@ pub fn handle_read_file(
     })
 }
 /// Handles `KERNEL32.dll!WriteFile`.
-pub fn handle_write_file(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_write_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = engine
         .read_rcx()
         .context("failed to read RCX for WriteFile")?;
@@ -1605,10 +1592,9 @@ pub fn handle_write_file(
     })
 }
 /// Handles `KERNEL32.dll!GetCurrentDirectoryW`.
-pub fn handle_get_current_directory_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_current_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let buffer_length = engine
         .read_rcx()
         .context("failed to read RCX for GetCurrentDirectoryW")?;
@@ -1662,10 +1648,9 @@ pub fn handle_get_current_directory_w(
     })
 }
 /// Handles `KERNEL32.dll!SetCurrentDirectoryW`.
-pub fn handle_set_current_directory_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_current_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let directory_ptr = engine
         .read_rcx()
         .context("failed to read RCX for SetCurrentDirectoryW")?;
@@ -1707,9 +1692,8 @@ pub fn handle_set_current_directory_w(
         return_value,
     })
 }
-pub fn handle_compare_file_time(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_compare_file_time(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let a = engine.read_rcx()?;
     let b = engine.read_rdx()?;
     let ta = if a == 0 {
@@ -1734,8 +1718,9 @@ pub fn handle_compare_file_time(
     )
 }
 pub fn handle_local_file_time_to_file_time(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let local = engine.read_rcx()?;
     let file = engine.read_rdx()?;
     if local == 0 || file == 0 {
@@ -1747,8 +1732,9 @@ pub fn handle_local_file_time_to_file_time(
     ret_bool_true(engine, "LocalFileTimeToFileTime")
 }
 pub fn handle_file_time_to_dos_date_time(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let ft = engine.read_rcx()?;
     let date_ptr = engine.read_rdx()?;
     let time_ptr = engine.read_r8()?;
@@ -1769,8 +1755,9 @@ pub fn handle_file_time_to_dos_date_time(
     ret_bool_true(engine, "FileTimeToDosDateTime")
 }
 pub fn handle_dos_date_time_to_file_time(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _date = engine.read_rcx()?;
     let _time = engine.read_rdx()?;
     let ft = engine.read_r8()?;
@@ -1781,9 +1768,9 @@ pub fn handle_dos_date_time_to_file_time(
     ret_bool_true(engine, "DosDateTimeToFileTime")
 }
 pub fn handle_get_disk_free_space_ex_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    _state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _path = engine.read_rcx()?;
     let free_caller = engine.read_rdx()?;
     let total = engine.read_r8()?;
@@ -1799,10 +1786,8 @@ pub fn handle_get_disk_free_space_ex_w(
     }
     ret_bool_true(engine, "GetDiskFreeSpaceExW")
 }
-pub fn handle_get_disk_free_space_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    _state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_disk_free_space_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _path = engine.read_rcx()?;
     let spc = engine.read_rdx()?; // sectors per cluster
     let bps = engine.read_r8()?; // bytes per sector
@@ -1828,8 +1813,9 @@ pub fn handle_get_disk_free_space_w(
     ret_bool_true(engine, "GetDiskFreeSpaceW")
 }
 pub fn handle_get_logical_drive_strings_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let n_buffer = low_u32(engine.read_rcx()?, "GetLogicalDriveStringsW nBufferLength")?;
     let buffer = engine.read_rdx()?;
     if buffer == 0 || n_buffer == 0 || n_buffer < LOGICAL_DRIVE_TCHARS {
@@ -1856,19 +1842,15 @@ pub fn handle_get_logical_drive_strings_w(
         "GetLogicalDriveStringsW",
     )
 }
-pub fn handle_set_file_attributes_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    _state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_file_attributes_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _path = engine.read_rcx()?;
     let _attrs = engine.read_rdx()?;
     // Best-effort success (VFS does not track Win32 attributes yet).
     ret_bool_true(engine, "SetFileAttributesW")
 }
-pub fn handle_set_file_time(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    _state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_file_time(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _handle = engine.read_rcx()?;
     let _creation = engine.read_rdx()?;
     let _access = engine.read_r8()?;
@@ -1876,40 +1858,35 @@ pub fn handle_set_file_time(
     ret_bool_true(engine, "SetFileTime")
 }
 pub fn handle_move_file_with_progress_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     // Same first two args as MoveFileW (existing/new).
-    handle_move_file_w(engine, state)
+    handle_move_file_w(ctx)
 }
-pub fn handle_create_hard_link_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_create_hard_link_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _ = (engine.read_rcx()?, engine.read_rdx()?, engine.read_r8()?);
     state.process.last_error = 1; // ERROR_INVALID_FUNCTION-ish
     ret_u64(engine, 0, "CreateHardLinkW")
 }
-pub fn handle_find_first_stream_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_find_first_stream_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _ = (engine.read_rcx()?, engine.read_rdx()?, engine.read_r8()?);
     state.process.last_error = 38; // ERROR_HANDLE_EOF
     ret_u64(engine, u64::MAX, "FindFirstStreamW") // INVALID_HANDLE_VALUE
 }
-pub fn handle_find_next_stream_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_find_next_stream_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _ = (engine.read_rcx()?, engine.read_rdx()?);
     state.process.last_error = 38;
     ret_u64(engine, 0, "FindNextStreamW")
 }
-pub fn handle_device_io_control(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_device_io_control(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _ = (
         engine.read_rcx()?,
         engine.read_rdx()?,
@@ -1921,9 +1898,10 @@ pub fn handle_device_io_control(
 }
 /// Handles `KERNEL32.dll!GetCompressedFileSizeA` — return real uncompressed size via VFS.
 pub fn handle_get_compressed_file_size_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let path_ptr = engine.read_rcx()?;
     let _high_ptr = engine.read_rdx()?;
     let path = read_ansi_string_from_cpu(engine, path_ptr, 1024)?;
@@ -1947,9 +1925,10 @@ pub fn handle_get_compressed_file_size_a(
 }
 /// Handles `KERNEL32.dll!GetCompressedFileSizeW` — return real uncompressed size via VFS.
 pub fn handle_get_compressed_file_size_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let path_ptr = engine.read_rcx()?;
     let _high_ptr = engine.read_rdx()?;
     let path = read_wide_string_from_cpu(engine, path_ptr, 1024)?;
@@ -1973,9 +1952,10 @@ pub fn handle_get_compressed_file_size_w(
 }
 /// Handles `KERNEL32.dll!GetVolumeInformationW` — real bottle volume info.
 pub fn handle_get_volume_information_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _root = engine.read_rcx()?;
     let vol_name = engine.read_rdx()?;
     let vol_name_len = engine.read_r8()?;
@@ -2033,9 +2013,10 @@ pub fn handle_get_volume_information_w(
 }
 /// Handles `KERNEL32.dll!GetVolumeInformationA` — real bottle volume info.
 pub fn handle_get_volume_information_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _root = engine.read_rcx()?;
     let vol_name = engine.read_rdx()?;
     let vol_name_len = engine.read_r8()?;
@@ -2087,10 +2068,9 @@ pub fn handle_get_volume_information_a(
     })
 }
 /// Handles `KERNEL32.dll!LockFile` — validate file handle and return TRUE.
-pub fn handle_lock_file(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_lock_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = engine.read_rcx()?;
     if !is_open_file_handle(state, handle) && handle != FAKE_STDIN_HANDLE {
         state.process.last_error = ERROR_INVALID_HANDLE;
@@ -2108,10 +2088,9 @@ pub fn handle_lock_file(
     })
 }
 /// Handles `KERNEL32.dll!UnlockFile` — validate file handle and return TRUE.
-pub fn handle_unlock_file(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_unlock_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = engine.read_rcx()?;
     if !is_open_file_handle(state, handle) && handle != FAKE_STDIN_HANDLE {
         state.process.last_error = ERROR_INVALID_HANDLE;
@@ -2129,10 +2108,9 @@ pub fn handle_unlock_file(
     })
 }
 /// Handles `KERNEL32.dll!SetFileValidData` — validate file handle and return TRUE.
-pub fn handle_set_file_valid_data(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_file_valid_data(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = engine.read_rcx()?;
     if !is_open_file_handle(state, handle) {
         state.process.last_error = ERROR_INVALID_HANDLE;
@@ -2150,10 +2128,9 @@ pub fn handle_set_file_valid_data(
     })
 }
 /// Handles `KERNEL32.dll!GetLongPathNameW` — return same as input.
-pub fn handle_get_long_path_name_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_long_path_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let src = engine.read_rcx()?;
     let dst = engine.read_rdx()?;
     let dst_len = engine.read_r8()?;
@@ -2166,10 +2143,9 @@ pub fn handle_get_long_path_name_w(
     })
 }
 /// Handles `KERNEL32.dll!GetLongPathNameA` — return same as input.
-pub fn handle_get_long_path_name_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_long_path_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let src = engine.read_rcx()?;
     let dst = engine.read_rdx()?;
     let dst_len = engine.read_r8()?;
@@ -2182,10 +2158,9 @@ pub fn handle_get_long_path_name_a(
     })
 }
 /// Handles `KERNEL32.dll!GetShortPathNameW` — return same as input.
-pub fn handle_get_short_path_name_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_short_path_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let src = engine.read_rcx()?;
     let dst = engine.read_rdx()?;
     let dst_len = engine.read_r8()?;
@@ -2198,10 +2173,9 @@ pub fn handle_get_short_path_name_w(
     })
 }
 /// Handles `KERNEL32.dll!GetShortPathNameA` — return same as input.
-pub fn handle_get_short_path_name_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_short_path_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let src = engine.read_rcx()?;
     let dst = engine.read_rdx()?;
     let dst_len = engine.read_r8()?;
@@ -2215,9 +2189,10 @@ pub fn handle_get_short_path_name_a(
 }
 /// Handles `KERNEL32.dll!GetUserProfileDirectoryW` — return profile path from bottle/env.
 pub fn handle_get_user_profile_directory_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _h_profile = engine.read_rcx()?;
     let buf = engine.read_rdx()?;
     let size_ptr = engine.read_r8()?;
@@ -2225,9 +2200,10 @@ pub fn handle_get_user_profile_directory_w(
 }
 /// Handles `KERNEL32.dll!GetUserProfileDirectoryA` — return profile path from bottle/env.
 pub fn handle_get_user_profile_directory_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _h_profile = engine.read_rcx()?;
     let buf = engine.read_rdx()?;
     let size_ptr = engine.read_r8()?;
@@ -2235,9 +2211,10 @@ pub fn handle_get_user_profile_directory_a(
 }
 /// Handles `KERNEL32.dll!GetFileAttributesExW` — real extended attributes via VFS.
 pub fn handle_get_file_attributes_ex_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let path_ptr = engine.read_rcx()?;
     let _info_level = engine.read_rdx()?;
     let info_ptr = engine.read_r8()?;
@@ -2294,9 +2271,10 @@ pub fn handle_get_file_attributes_ex_w(
 }
 /// Handles `KERNEL32.dll!GetFileAttributesExA` — real extended attributes via VFS.
 pub fn handle_get_file_attributes_ex_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let path_ptr = engine.read_rcx()?;
     let _info_level = engine.read_rdx()?;
     let info_ptr = engine.read_r8()?;
@@ -2352,10 +2330,9 @@ pub fn handle_get_file_attributes_ex_a(
     })
 }
 /// Handles `KERNEL32.dll!BackupRead` — read from open file bytes.
-pub fn handle_backup_read(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_backup_read(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = engine.read_rcx()?;
     let buf = engine.read_rdx()?;
     let to_read = engine.read_r8()?;
@@ -2408,10 +2385,9 @@ pub fn handle_backup_read(
     }
 }
 /// Handles `KERNEL32.dll!BackupSeek` — seek within open file bytes.
-pub fn handle_backup_seek(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_backup_seek(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = engine.read_rcx()?;
     let lo = engine.read_rdx()?;
     let hi = engine.read_r8()?;
@@ -2444,10 +2420,9 @@ pub fn handle_backup_seek(
     }
 }
 /// Handles `KERNEL32.dll!BackupWrite` — write to open file bytes.
-pub fn handle_backup_write(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_backup_write(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = engine.read_rcx()?;
     let buf = engine.read_rdx()?;
     let to_write = engine.read_r8()?;
@@ -2500,10 +2475,9 @@ pub fn handle_backup_write(
         })
     }
 }
-pub(crate) fn handle_duplicate_handle(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub(crate) fn handle_duplicate_handle(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     // RCX = hSourceProcessHandle
     // RDX = hSourceHandle
     // R8  = hTargetProcessHandle
@@ -2599,10 +2573,9 @@ pub(crate) fn handle_duplicate_handle(
     })
 }
 /// Handles `KERNEL32.dll!GetFullPathNameW`.
-pub fn handle_get_full_path_name_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_full_path_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let input_path_ptr = engine
         .read_rcx()
         .context("failed to read RCX for GetFullPathNameW")?;
@@ -2703,10 +2676,9 @@ pub fn handle_get_full_path_name_w(
     })
 }
 /// Handles `KERNEL32.dll!GetFullPathNameA`.
-pub fn handle_get_full_path_name_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_full_path_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let input_path_ptr = engine.read_rcx()?;
     let buffer_characters_raw = engine.read_rdx()?;
     let output_buffer_ptr = engine.read_r8()?;
@@ -2756,10 +2728,9 @@ pub fn handle_get_full_path_name_a(
     })
 }
 /// Handles `KERNEL32.dll!GetCurrentDirectoryA`.
-pub fn handle_get_current_directory_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_current_directory_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let buffer_length = engine.read_rcx()?;
     let buffer_ptr = engine.read_rdx()?;
     let directory = String::from_utf16_lossy(&state.file_io.current_directory_wide);
@@ -2782,10 +2753,9 @@ pub fn handle_get_current_directory_a(
     })
 }
 /// Handles `KERNEL32.dll!SetCurrentDirectoryA`.
-pub fn handle_set_current_directory_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_current_directory_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let directory_ptr = engine.read_rcx()?;
     let success = if directory_ptr == 0 {
         state.process.last_error = ERROR_PATH_NOT_FOUND;
@@ -2816,10 +2786,9 @@ pub fn handle_set_current_directory_a(
     })
 }
 /// Handles `KERNEL32.dll!CreateDirectoryW`.
-pub fn handle_create_directory_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_create_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let path_ptr = engine.read_rcx()?;
     let path = if path_ptr == 0 {
         String::new()
@@ -2834,10 +2803,9 @@ pub fn handle_create_directory_w(
     })
 }
 /// Handles `KERNEL32.dll!CreateDirectoryA`.
-pub fn handle_create_directory_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_create_directory_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let path_ptr = engine.read_rcx()?;
     let path = if path_ptr == 0 {
         String::new()
@@ -2852,10 +2820,9 @@ pub fn handle_create_directory_a(
     })
 }
 /// Handles `KERNEL32.dll!DeleteFileW`.
-pub fn handle_delete_file_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_delete_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let path_ptr = engine.read_rcx()?;
     let path = if path_ptr == 0 {
         String::new()
@@ -2870,10 +2837,9 @@ pub fn handle_delete_file_w(
     })
 }
 /// Handles `KERNEL32.dll!DeleteFileA`.
-pub fn handle_delete_file_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_delete_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let path_ptr = engine.read_rcx()?;
     let path = if path_ptr == 0 {
         String::new()
@@ -2888,10 +2854,9 @@ pub fn handle_delete_file_a(
     })
 }
 /// Handles `KERNEL32.dll!RemoveDirectoryW`.
-pub fn handle_remove_directory_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_remove_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let path_ptr = engine.read_rcx()?;
     let path = if path_ptr == 0 {
         String::new()
@@ -2906,10 +2871,9 @@ pub fn handle_remove_directory_w(
     })
 }
 /// Handles `KERNEL32.dll!RemoveDirectoryA`.
-pub fn handle_remove_directory_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_remove_directory_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let path_ptr = engine.read_rcx()?;
     let path = if path_ptr == 0 {
         String::new()
@@ -2924,10 +2888,9 @@ pub fn handle_remove_directory_a(
     })
 }
 /// Handles `KERNEL32.dll!MoveFileW`.
-pub fn handle_move_file_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_move_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let from_ptr = engine.read_rcx()?;
     let to_ptr = engine.read_rdx()?;
     let from = if from_ptr == 0 {
@@ -2948,10 +2911,9 @@ pub fn handle_move_file_w(
     })
 }
 /// Handles `KERNEL32.dll!MoveFileA`.
-pub fn handle_move_file_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_move_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let from_ptr = engine.read_rcx()?;
     let to_ptr = engine.read_rdx()?;
     let from = if from_ptr == 0 {
@@ -2972,10 +2934,9 @@ pub fn handle_move_file_a(
     })
 }
 /// Handles `KERNEL32.dll!GetTempPathW`.
-pub fn handle_get_temp_path_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_temp_path_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let buffer_len = engine.read_rcx()?;
     let buffer_ptr = engine.read_rdx()?;
     // Trailing backslash per Microsoft Learn.
@@ -2998,10 +2959,9 @@ pub fn handle_get_temp_path_w(
     })
 }
 /// Handles `KERNEL32.dll!GetTempPathA`.
-pub fn handle_get_temp_path_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_temp_path_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let buffer_len = engine.read_rcx()?;
     let buffer_ptr = engine.read_rdx()?;
     let temp = format!("{}\\", crate::vfs::GUEST_TEMP_PATH.trim_end_matches('\\'));
@@ -3023,10 +2983,9 @@ pub fn handle_get_temp_path_a(
     })
 }
 /// Handles `KERNEL32.dll!GetTempFileNameW` (unique name under path; creates 0-byte file).
-pub fn handle_get_temp_file_name_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_temp_file_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let path_ptr = engine.read_rcx()?;
     let prefix_ptr = engine.read_rdx()?;
     let unique = engine.read_r8()?;
@@ -3070,10 +3029,9 @@ pub fn handle_get_temp_file_name_w(
     })
 }
 /// Handles `KERNEL32.dll!GetTempFileNameA`.
-pub fn handle_get_temp_file_name_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_temp_file_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let path_ptr = engine.read_rcx()?;
     let prefix_ptr = engine.read_rdx()?;
     let unique = engine.read_r8()?;
@@ -3117,10 +3075,9 @@ pub fn handle_get_temp_file_name_a(
     })
 }
 /// Handles `KERNEL32.dll!GetDriveTypeW`.
-pub fn handle_get_drive_type_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_drive_type_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let path_ptr = engine.read_rcx()?;
     let path = if path_ptr == 0 {
         String::new()
@@ -3135,10 +3092,9 @@ pub fn handle_get_drive_type_w(
     })
 }
 /// Handles `KERNEL32.dll!GetDriveTypeA`.
-pub fn handle_get_drive_type_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_drive_type_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let path_ptr = engine.read_rcx()?;
     let path = if path_ptr == 0 {
         String::new()
@@ -3153,10 +3109,9 @@ pub fn handle_get_drive_type_a(
     })
 }
 /// Handles `KERNEL32.dll!GetLogicalDrives`.
-pub fn handle_get_logical_drives(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_logical_drives(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let return_value = u64::from(crate::vfs::logical_drives_mask(&state.file_io.volumes));
     let return_address = engine.return_from_win64_api(return_value)?;
     Ok(WinApiHandlerResult {
@@ -3165,34 +3120,29 @@ pub fn handle_get_logical_drives(
     })
 }
 /// Handles `KERNEL32.dll!GetSystemDirectoryW`.
-pub fn handle_get_system_directory_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_system_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     write_fixed_dir_w(engine, crate::vfs::GUEST_SYSTEM_DIR)
 }
 /// Handles `KERNEL32.dll!GetSystemDirectoryA`.
-pub fn handle_get_system_directory_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_system_directory_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     write_fixed_dir_a(engine, crate::vfs::GUEST_SYSTEM_DIR)
 }
 /// Handles `KERNEL32.dll!GetWindowsDirectoryW`.
-pub fn handle_get_windows_directory_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_windows_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     write_fixed_dir_w(engine, crate::vfs::GUEST_WINDOWS_DIR)
 }
 /// Handles `KERNEL32.dll!GetWindowsDirectoryA`.
-pub fn handle_get_windows_directory_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_windows_directory_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     write_fixed_dir_a(engine, crate::vfs::GUEST_WINDOWS_DIR)
 }
 /// Handles `KERNEL32.dll!GetFileSizeEx`.
-pub fn handle_get_file_size_ex(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_file_size_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = engine.read_rcx()?;
     let size_ptr = engine.read_rdx()?;
     let return_value = if let Some(open_file) = find_open_file(state, handle) {
@@ -3212,10 +3162,9 @@ pub fn handle_get_file_size_ex(
     })
 }
 /// Handles `KERNEL32.dll!SetFilePointerEx`.
-pub fn handle_set_file_pointer_ex(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_file_pointer_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = engine.read_rcx()?;
     // Win64: DistanceToMove is LARGE_INTEGER by value in RDX (signed 64-bit).
     let distance_raw = engine.read_rdx()?;
@@ -3263,10 +3212,9 @@ pub fn handle_set_file_pointer_ex(
     })
 }
 /// Handles `KERNEL32.dll!SetEndOfFile`.
-pub fn handle_set_end_of_file(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_end_of_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = engine.read_rcx()?;
     let return_value = if is_open_file_handle(state, handle) {
         let (streaming, host, cursor, path) = {
@@ -3298,10 +3246,9 @@ pub fn handle_set_end_of_file(
     })
 }
 /// Handles `KERNEL32.dll!FlushFileBuffers`.
-pub fn handle_flush_file_buffers(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_flush_file_buffers(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = engine.read_rcx()?;
     let return_value = if is_open_file_handle(state, handle) {
         persist_open_file_to_host(state, handle);

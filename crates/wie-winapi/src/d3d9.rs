@@ -5,7 +5,7 @@ use crate::guest_memory::{
     read_u32 as read_guest_u32, read_u64 as read_guest_u64, write_u32 as write_guest_u32,
     write_u64 as write_guest_u64,
 };
-use crate::{WinApiHandlerResult, WinApiState};
+use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 
 /// Expected `D3D_SDK_VERSION` for Direct3D 9.
 const D3D_SDK_VERSION: u64 = 32;
@@ -99,10 +99,9 @@ pub fn idirect3ddevice9_method_name(slot: usize) -> String {
 }
 
 /// Handles dynamically resolved `D3D9.dll!Direct3DCreate9`.
-pub fn handle_direct3d_create9(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_direct3d_create9(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let sdk_version = engine
         .read_rcx()
         .context("failed to read RCX for Direct3DCreate9")?;
@@ -156,9 +155,8 @@ pub fn handle_direct3d_create9(
 }
 
 /// Handles `IDirect3D9::GetAdapterCount`.
-pub fn handle_get_adapter_count(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_adapter_count(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _this_pointer = engine
         .read_rcx()
         .context("failed to read RCX for IDirect3D9::GetAdapterCount")?;
@@ -177,9 +175,8 @@ pub fn handle_get_adapter_count(
 }
 
 /// Handles `IDirect3D9::GetAdapterMonitor`.
-pub fn handle_get_adapter_monitor(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_adapter_monitor(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _this_pointer = engine
         .read_rcx()
         .context("failed to read RCX for IDirect3D9::GetAdapterMonitor")?;
@@ -216,7 +213,8 @@ fn write_caps_u32(
 }
 
 /// Handles `IDirect3D9::GetDeviceCaps`.
-pub fn handle_get_device_caps(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_get_device_caps(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _this_pointer = engine
         .read_rcx()
         .context("failed to read RCX for IDirect3D9::GetDeviceCaps")?;
@@ -365,9 +363,10 @@ pub fn handle_get_device_caps(engine: &mut dyn wie_cpu::CpuEngine) -> Result<Win
 
 /// Handles `IDirect3D9::GetAdapterDisplayMode`.
 pub fn handle_get_adapter_display_mode(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _this_pointer = engine
         .read_rcx()
         .context("failed to read RCX for IDirect3D9::GetAdapterDisplayMode")?;
@@ -500,10 +499,9 @@ fn normalize_presentation_parameters(
 }
 
 /// Handles `IDirect3D9::CreateDevice`.
-pub fn handle_create_device(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_create_device(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _this_pointer = engine
         .read_rcx()
         .context("failed to read RCX for IDirect3D9::CreateDevice")?;
@@ -629,10 +627,9 @@ pub fn handle_create_device(
 }
 
 /// Handles `IDirect3DDevice9::SetVertexShader`.
-pub fn handle_set_vertex_shader(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_vertex_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _this_pointer = engine
         .read_rcx()
         .context("failed to read RCX for IDirect3DDevice9::SetVertexShader")?;
@@ -656,10 +653,9 @@ pub fn handle_set_vertex_shader(
 }
 
 /// Handles `IDirect3DDevice9::SetFVF`.
-pub fn handle_set_fvf(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_fvf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _this_pointer = engine
         .read_rcx()
         .context("failed to read RCX for IDirect3DDevice9::SetFVF")?;
@@ -687,10 +683,9 @@ pub fn handle_set_fvf(
 }
 
 /// Handles `IDirect3DDevice9::SetRenderState`.
-pub fn handle_set_render_state(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_render_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _this_pointer = engine
         .read_rcx()
         .context("failed to read RCX for IDirect3DDevice9::SetRenderState")?;
@@ -733,10 +728,9 @@ pub fn handle_set_render_state(
 }
 
 /// Handles `IDirect3DDevice9::SetTextureStageState`.
-pub fn handle_set_texture_stage_state(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_texture_stage_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _this_pointer = engine
         .read_rcx()
         .context("failed to read RCX for IDirect3DDevice9::SetTextureStageState")?;
@@ -790,10 +784,9 @@ pub fn handle_set_texture_stage_state(
 }
 
 /// Handles `IDirect3DDevice9::SetSamplerState`.
-pub fn handle_set_sampler_state(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_sampler_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _this = engine
         .read_rcx()
         .context("failed to read RCX for SetSamplerState")?;
@@ -834,10 +827,9 @@ pub fn handle_set_sampler_state(
 }
 
 /// Handles `IDirect3DDevice9::Release`.
-pub fn handle_device_release(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_device_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let this_pointer = engine
         .read_rcx()
         .context("failed to read RCX for IDirect3DDevice9::Release")?;
@@ -883,10 +875,9 @@ pub fn handle_device_release(
 }
 
 /// Handles `IDirect3D9::Release`.
-pub fn handle_direct3d9_release(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_direct3d9_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let this_pointer = engine
         .read_rcx()
         .context("failed to read RCX for IDirect3D9::Release")?;

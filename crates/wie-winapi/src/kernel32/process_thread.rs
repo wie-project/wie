@@ -1,16 +1,15 @@
 use super::{
     CREATE_SUSPENDED, Context, DEFAULT_MT_MAX_THREADS, DEFAULT_WORKER_STACK, ERROR_INVALID_HANDLE,
     ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_SUPPORTED_MT,
-    FAKE_CURRENT_PROCESS_ID, FIXED_SYSTEM_FILETIME, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE,
-    Result, THREAD_ENTRY_HOME_AND_RET, WORKER_STACK_REGION_BASE, WORKER_STACK_STRIDE,
-    WinApiHandlerResult, WinApiState, checked_address, checked_field_address,
+    FAKE_CURRENT_PROCESS_ID, FIXED_SYSTEM_FILETIME, HandlerContext, MEM_COMMIT, MEM_RESERVE,
+    PAGE_READWRITE, Result, THREAD_ENTRY_HOME_AND_RET, WORKER_STACK_REGION_BASE,
+    WORKER_STACK_STRIDE, WinApiHandlerResult, WinApiState, checked_address, checked_field_address,
     read_create_file_stack_u32, read_guest_u64, write_guest_u16, write_guest_u32, write_guest_u64,
 };
 
 /// Handles `KERNEL32.dll!GetStartupInfoA`.
-pub fn handle_get_startup_info_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_startup_info_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let startup_info_ptr = engine
         .read_rcx()
         .context("failed to read RCX for GetStartupInfoA")?;
@@ -36,10 +35,9 @@ pub fn handle_get_startup_info_a(
     })
 }
 /// Handles `KERNEL32.dll!GetProcessHeap`.
-pub fn handle_get_process_heap(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    process_heap_handle: u64,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_process_heap(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let process_heap_handle = ctx.environment.process_heap_handle;
+    let engine = &mut *ctx.engine;
     let return_address = engine
         .return_from_win64_api(process_heap_handle)
         .context("failed to return from GetProcessHeap")?;
@@ -51,8 +49,9 @@ pub fn handle_get_process_heap(
 }
 /// Handles `KERNEL32.dll!GetSystemTimeAsFileTime`.
 pub fn handle_get_system_time_as_file_time(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let filetime_ptr = engine
         .read_rcx()
         .context("failed to read RCX for GetSystemTimeAsFileTime")?;
@@ -80,9 +79,8 @@ pub fn handle_get_system_time_as_file_time(
     })
 }
 /// Handles `KERNEL32.dll!GetCurrentProcessId`.
-pub fn handle_get_current_process_id(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_current_process_id(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let return_address = engine
         .return_from_win64_api(FAKE_CURRENT_PROCESS_ID)
         .context("failed to return from GetCurrentProcessId")?;
@@ -93,10 +91,9 @@ pub fn handle_get_current_process_id(
     })
 }
 /// Handles `KERNEL32.dll!GetCurrentThreadId`.
-pub fn handle_get_current_thread_id(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_current_thread_id(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let tid = u64::from(state.kernel.threads.current_tid());
     let return_address = engine
         .return_from_win64_api(tid)
@@ -108,9 +105,8 @@ pub fn handle_get_current_thread_id(
     })
 }
 /// Handles `KERNEL32.dll!GetCurrentProcess`.
-pub fn handle_get_current_process(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_current_process(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     // Windows pseudohandle for the current process: (HANDLE)-1.
     let return_value = u64::MAX;
 
@@ -148,9 +144,8 @@ pub(crate) fn ret_u64(
         return_value: value,
     })
 }
-pub fn handle_get_process_times(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_process_times(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _process = engine.read_rcx().context("GetProcessTimes RCX")?;
     let creation = engine.read_rdx().context("GetProcessTimes RDX")?;
     let exit_t = engine.read_r8().context("GetProcessTimes R8")?;
@@ -176,8 +171,9 @@ pub fn handle_get_process_times(
     ret_bool_true(engine, "GetProcessTimes")
 }
 pub fn handle_get_process_affinity_mask(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _process = engine.read_rcx()?;
     let proc_mask = engine.read_rdx()?;
     let sys_mask = engine.read_r8()?;
@@ -190,23 +186,24 @@ pub fn handle_get_process_affinity_mask(
     ret_bool_true(engine, "GetProcessAffinityMask")
 }
 pub fn handle_set_process_affinity_mask(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _process = engine.read_rcx()?;
     let _mask = engine.read_rdx()?;
     ret_bool_true(engine, "SetProcessAffinityMask")
 }
 pub fn handle_set_thread_affinity_mask(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _thread = engine.read_rcx()?;
     let _mask = engine.read_rdx()?;
     ret_u64(engine, 1, "SetThreadAffinityMask")
 }
-pub fn handle_resume_thread(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_resume_thread(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = engine.read_rcx()?;
     // Previous suspend count: 1 if we had it suspended, 0 if already running, -1 on error.
     if let Some(spawn) = state.kernel.sync.suspended_spawns.remove(&handle) {
@@ -231,10 +228,9 @@ pub fn handle_resume_thread(
     ret_u64(engine, u64::from(u32::MAX), "ResumeThread")
 }
 /// Handles `KERNEL32.dll!OpenThread` — look up a thread by TID and return a handle.
-pub fn handle_open_thread(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_open_thread(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _desired = engine.read_rcx()?;
     let _inherit = engine.read_rdx()?;
     let tid = engine.read_r8()?;
@@ -270,10 +266,9 @@ pub fn handle_open_thread(
     })
 }
 /// Handles `KERNEL32.dll!CreateJobObjectW` — return handle tracked in sync state.
-pub fn handle_create_job_object_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_create_job_object_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _sec = engine.read_rcx()?;
     let _name = engine.read_rdx()?;
     let handle = state.kernel.sync.next_handle;
@@ -286,10 +281,9 @@ pub fn handle_create_job_object_w(
     })
 }
 /// Handles `KERNEL32.dll!CreateJobObjectA` — return handle tracked in sync state.
-pub fn handle_create_job_object_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_create_job_object_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _sec = engine.read_rcx()?;
     let _name = engine.read_rdx()?;
     let handle = state.kernel.sync.next_handle;
@@ -303,9 +297,10 @@ pub fn handle_create_job_object_a(
 }
 /// Handles `KERNEL32.dll!AssignProcessToJobObject` — return TRUE (tracked in state).
 pub fn handle_assign_process_to_job_object(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _job = engine.read_rcx()?;
     let _proc = engine.read_rdx()?;
     state.process.last_error = 0;
@@ -316,10 +311,9 @@ pub fn handle_assign_process_to_job_object(
     })
 }
 /// Handles `KERNEL32.dll!TerminateProcess` — signal process exit.
-pub fn handle_terminate_process(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_terminate_process(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _handle = engine.read_rcx()?;
     let _code = engine.read_rdx()?;
     state.kernel.sync.process_dying = true;
@@ -331,10 +325,9 @@ pub fn handle_terminate_process(
     })
 }
 /// Handles `KERNEL32.dll!TerminateThread` — signal thread exit.
-pub fn handle_terminate_thread(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_terminate_thread(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = engine.read_rcx()?;
     let code_raw = engine.read_rdx()?;
     let code = u32::try_from(code_raw & 0xffff_ffff).unwrap_or(0);
@@ -356,10 +349,9 @@ pub fn handle_terminate_thread(
     })
 }
 /// Handles `KERNEL32.dll!SuspendThread` — track suspend count.
-pub fn handle_suspend_thread(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_suspend_thread(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = engine.read_rcx()?;
     // Find the thread TID from the handle.
     let tid = state
@@ -419,10 +411,9 @@ pub(crate) fn i32_to_rax(v: i32) -> u64 {
 pub(crate) fn i64_to_rax(v: i64) -> u64 {
     u64::from_le_bytes(v.to_le_bytes())
 }
-pub(crate) fn handle_create_thread(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub(crate) fn handle_create_thread(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _security = engine.read_rcx()?;
     let stack_size_raw = engine.read_rdx()?;
     let start = engine.read_r8()?;
@@ -572,10 +563,9 @@ pub(crate) fn read_stack_u64(engine: &mut dyn wie_cpu::CpuEngine, offset: u64) -
     engine.mem_read(address, &mut bytes)?;
     Ok(u64::from_le_bytes(bytes))
 }
-pub(crate) fn handle_exit_thread(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub(crate) fn handle_exit_thread(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let code_raw = engine.read_rcx()?;
     let code = u32::try_from(code_raw & u64::from(u32::MAX)).unwrap_or(0);
     let tid = state.kernel.threads.current_tid();
@@ -596,9 +586,10 @@ pub(crate) fn handle_exit_thread(
     Err(crate::WinApiControlSignal::ExitThread { code }.into())
 }
 pub(crate) fn handle_get_exit_code_thread(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let handle = engine.read_rcx()?;
     let out_ptr = engine.read_rdx()?;
     let code = if let Some(t) = state.kernel.sync.thread_by_handle(handle) {
@@ -622,9 +613,10 @@ pub(crate) fn handle_get_exit_code_thread(
     })
 }
 pub(crate) fn handle_get_thread_priority(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let h_thread = engine.read_rcx()?;
 
     // Pseudohandle CURRENT_THREAD (-2), or a real kernel handle.
@@ -647,8 +639,9 @@ pub(crate) fn handle_get_thread_priority(
     })
 }
 pub(crate) fn handle_get_current_thread(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     // CURRENT_THREAD_PSEUDO_HANDLE = (HANDLE)-2
     let return_value = u64::MAX - 1;
     let return_address = engine.return_from_win64_api(return_value)?;

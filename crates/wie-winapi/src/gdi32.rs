@@ -5,7 +5,7 @@ use crate::guest_memory::{
     read_u32 as read_guest_u32, write_i32 as write_guest_i32, write_u16 as write_guest_u16,
     write_u32 as write_guest_u32, write_u64 as write_guest_u64,
 };
-use crate::{WinApiHandlerResult, WinApiState};
+use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 
 const FAKE_PREVIOUS_GDI_OBJECT_HANDLE: u64 = 0x0000_0000_6800_0001;
 const BITMAP_STRUCT_SIZE: u64 = 32;
@@ -15,7 +15,8 @@ const FAKE_GDI_BITMAP_HANDLE_BASE: u64 = 0x0000_0000_6800_2000;
 const FAKE_GDI_FONT_HANDLE_BASE: u64 = 0x0000_0000_6800_3000;
 
 /// Handles `GDI32.dll!GetObjectA`.
-pub fn handle_get_object_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_get_object_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let object_handle = engine
         .read_rcx()
         .context("failed to read RCX for GetObjectA")?;
@@ -119,7 +120,8 @@ const STOCK_SYSTEM_FONT: u64 = 13;
 const STOCK_DEFAULT_PALETTE: u64 = 15;
 
 /// Handles `GDI32.dll!GetStockObject` — returns predefined stock object handles.
-pub fn handle_get_stock_object(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_get_stock_object(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let n_index = engine.read_rcx()? & 0xffff_ffff;
     let handle = match n_index {
         STOCK_WHITE_BRUSH => 0x0000_0000_6800_5001,
@@ -138,7 +140,8 @@ pub fn handle_get_stock_object(engine: &mut dyn wie_cpu::CpuEngine) -> Result<Wi
 }
 
 /// Handles `GDI32.dll!SelectObject`.
-pub fn handle_select_object(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_select_object(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _device_context_handle = engine
         .read_rcx()
         .context("failed to read RCX for SelectObject")?;
@@ -161,22 +164,23 @@ pub fn handle_select_object(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinAp
 
 /// Handles `GDI32.dll!GetTextExtentPoint32A`.
 pub fn handle_get_text_extent_point_32_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
-    handle_get_text_extent_point_32(engine, "GetTextExtentPoint32A")
+    handle_get_text_extent_point_32(ctx, "GetTextExtentPoint32A")
 }
 
 /// Handles `GDI32.dll!GetTextExtentPoint32W`.
 pub fn handle_get_text_extent_point_32_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
-    handle_get_text_extent_point_32(engine, "GetTextExtentPoint32W")
+    handle_get_text_extent_point_32(ctx, "GetTextExtentPoint32W")
 }
 
 fn handle_get_text_extent_point_32(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
     api_name: &str,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _device_context_handle = engine
         .read_rcx()
         .with_context(|| format!("failed to read RCX for {api_name}"))?;
@@ -221,7 +225,8 @@ fn handle_get_text_extent_point_32(
 }
 
 /// Handles `GDI32.dll!ExtTextOutW` (success stub).
-pub fn handle_ext_text_out_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_ext_text_out_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _hdc = engine
         .read_rcx()
         .context("failed to read RCX for ExtTextOutW")?;
@@ -237,9 +242,8 @@ pub fn handle_ext_text_out_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinA
 }
 
 /// Handles `GDI32.dll!CreateCompatibleDC`.
-pub fn handle_create_compatible_dc(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_create_compatible_dc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _source_device_context = engine
         .read_rcx()
         .context("failed to read RCX for CreateCompatibleDC")?;
@@ -258,7 +262,8 @@ pub fn handle_create_compatible_dc(
 ///
 /// Returns plausible values for a 1920×1080 32-bpp desktop so Lunar Magic's
 /// display-mode probes succeed without real GDI.
-pub fn handle_get_device_caps(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_get_device_caps(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _hdc = engine
         .read_rcx()
         .context("failed to read RCX for GetDeviceCaps")?;
@@ -312,7 +317,8 @@ pub fn handle_get_device_caps(engine: &mut dyn wie_cpu::CpuEngine) -> Result<Win
 }
 
 /// Handles `GDI32.dll!GetPixel`.
-pub fn handle_get_pixel(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_get_pixel(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _device_context_handle = engine
         .read_rcx()
         .context("failed to read RCX for GetPixel")?;
@@ -334,7 +340,8 @@ pub fn handle_get_pixel(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHan
 }
 
 /// Handles `GDI32.dll!DeleteDC`.
-pub fn handle_delete_dc(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_delete_dc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let device_context_handle = engine
         .read_rcx()
         .context("failed to read RCX for DeleteDC")?;
@@ -352,7 +359,8 @@ pub fn handle_delete_dc(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHan
 }
 
 /// Handles `GDI32.dll!DeleteObject`.
-pub fn handle_delete_object(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_delete_object(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let object_handle = engine
         .read_rcx()
         .context("failed to read RCX for DeleteObject")?;
@@ -373,10 +381,9 @@ pub fn handle_delete_object(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinAp
 ///
 /// Allocates a guest pixel buffer from the process heap and returns a fake
 /// `HBITMAP`. Pixel contents are zeroed; rendering is not implemented.
-pub fn handle_create_dib_section(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_create_dib_section(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _hdc = engine
         .read_rcx()
         .context("failed to read RCX for CreateDIBSection")?;
@@ -479,9 +486,10 @@ pub fn handle_create_dib_section(
 
 /// Handles `GDI32.dll!CreateCompatibleBitmap`.
 pub fn handle_create_compatible_bitmap(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _hdc = engine
         .read_rcx()
         .context("failed to read RCX for CreateCompatibleBitmap")?;
@@ -523,10 +531,9 @@ fn next_gdi_bitmap_handle(state: &mut WinApiState) -> Result<u64> {
 }
 
 /// Handles `GDI32.dll!CreateFontA` / font creation (returns a unique fake HFONT).
-pub fn handle_create_font_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_create_font_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     // CreateFontA has many stack args; we only need a non-null HFONT.
     let _height = engine
         .read_rcx()
@@ -547,10 +554,9 @@ pub fn handle_create_font_a(
 }
 
 /// Handles `GDI32.dll!CreateFontW`.
-pub fn handle_create_font_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_create_font_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _height = engine
         .read_rcx()
         .context("failed to read RCX for CreateFontW")?;
@@ -570,10 +576,9 @@ pub fn handle_create_font_w(
 }
 
 /// Handles `GDI32.dll!CreateFontIndirectA`.
-pub fn handle_create_font_indirect_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_create_font_indirect_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let logfont_ptr = engine
         .read_rcx()
         .context("failed to read RCX for CreateFontIndirectA")?;
@@ -610,9 +615,8 @@ fn next_gdi_font_handle(state: &mut WinApiState) -> Result<u64> {
 /// Handles `GDI32.dll!GetTextMetricsA`.
 ///
 /// Fills a plausible `TEXTMETRICA` for a 16px UI font.
-pub fn handle_get_text_metrics_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_text_metrics_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _hdc = engine
         .read_rcx()
         .context("failed to read RCX for GetTextMetricsA")?;
@@ -723,7 +727,8 @@ pub fn handle_get_text_metrics_a(
 }
 
 /// Handles `GDI32.dll!SetTextColor` (returns previous color).
-pub fn handle_set_text_color(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_set_text_color(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _hdc = engine
         .read_rcx()
         .context("failed to read RCX for SetTextColor")?;
@@ -743,7 +748,8 @@ pub fn handle_set_text_color(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinA
 }
 
 /// Handles `GDI32.dll!SetBkColor`.
-pub fn handle_set_bk_color(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_set_bk_color(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _hdc = engine
         .read_rcx()
         .context("failed to read RCX for SetBkColor")?;
@@ -765,7 +771,8 @@ pub fn handle_set_bk_color(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApi
 }
 
 /// Handles `GDI32.dll!SetBkMode` (TRANSPARENT=1, OPAQUE=2).
-pub fn handle_set_bk_mode(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_set_bk_mode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _hdc = engine
         .read_rcx()
         .context("failed to read RCX for SetBkMode")?;
@@ -785,7 +792,8 @@ pub fn handle_set_bk_mode(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiH
 }
 
 /// Handles `GDI32.dll!TextOutA` (reads params; no actual rendering).
-pub fn handle_text_out_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_text_out_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _hdc = engine
         .read_rcx()
         .context("failed to read RCX for TextOutA")?;
@@ -813,7 +821,8 @@ pub fn handle_text_out_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHa
 }
 
 /// Handles `GDI32.dll!BitBlt` (reads params; no actual blit).
-pub fn handle_bit_blt(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _hdc_dst = engine.read_rcx().context("failed to read RCX for BitBlt")?;
     let _x = engine.read_rdx().context("failed to read RDX for BitBlt")?;
     let _y = engine.read_r8().context("failed to read R8 for BitBlt")?;
@@ -830,7 +839,8 @@ pub fn handle_bit_blt(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandl
 }
 
 /// Handles `GDI32.dll!StretchBlt` (reads params; no actual stretch).
-pub fn handle_stretch_blt(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_stretch_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _hdc_dst = engine
         .read_rcx()
         .context("failed to read RCX for StretchBlt")?;
@@ -855,7 +865,8 @@ pub fn handle_stretch_blt(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiH
 }
 
 /// Handles `GDI32.dll!PatBlt` (reads params; no actual pattern).
-pub fn handle_pat_blt(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_pat_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _hdc = engine.read_rcx().context("failed to read RCX for PatBlt")?;
     let _x = engine.read_rdx().context("failed to read RDX for PatBlt")?;
     let _y = engine.read_r8().context("failed to read R8 for PatBlt")?;

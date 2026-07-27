@@ -1,12 +1,11 @@
 use anyhow::{Context, Result};
 
-use crate::{WinApiHandlerResult, WinApiState};
+use crate::{HandlerContext, WinApiHandlerResult};
 
 /// Handles `WINMM.dll!timeGetTime`.
-pub fn handle_time_get_time(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_time_get_time(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let return_value = state.window_state.tick_count;
 
     state.window_state.tick_count = state

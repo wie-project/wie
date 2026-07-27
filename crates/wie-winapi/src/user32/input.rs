@@ -1,13 +1,12 @@
 use super::{
-    Context, Result, WinApiHandlerResult, WinApiState, checked_field_address, read_guest_bytes,
+    Context, HandlerContext, Result, WinApiHandlerResult, checked_field_address, read_guest_bytes,
     write_guest_bytes, write_guest_i32,
 };
 
 /// Handles `USER32.dll!GetAsyncKeyState`.
-pub fn handle_get_async_key_state(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_async_key_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let virtual_key_raw = engine
         .read_rcx()
         .context("failed to read RCX for GetAsyncKeyState")?;
@@ -36,9 +35,8 @@ pub fn handle_get_async_key_state(
     })
 }
 /// Handles dynamic `USER32.dll!TrackMouseEvent`.
-pub fn handle_track_mouse_event(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_track_mouse_event(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _track_mouse_event_ptr = engine
         .read_rcx()
         .context("failed to read RCX for TrackMouseEvent")?;
@@ -53,7 +51,8 @@ pub fn handle_track_mouse_event(
     })
 }
 /// Handles `USER32.dll!GetCursorPos`.
-pub fn handle_get_cursor_pos(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_get_cursor_pos(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let point_ptr = engine
         .read_rcx()
         .context("failed to read RCX for GetCursorPos")?;
@@ -76,7 +75,8 @@ pub fn handle_get_cursor_pos(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinA
     })
 }
 /// Handles `USER32.dll!ClipCursor` (accept clip rect or release when NULL).
-pub fn handle_clip_cursor(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_clip_cursor(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let rect_ptr = engine
         .read_rcx()
         .context("failed to read RCX for ClipCursor")?;
@@ -94,7 +94,8 @@ pub fn handle_clip_cursor(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiH
     })
 }
 /// Handles `USER32.dll!GetClipCursor`.
-pub fn handle_get_clip_cursor(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_get_clip_cursor(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let rect_ptr = engine
         .read_rcx()
         .context("failed to read RCX for GetClipCursor")?;
@@ -116,10 +117,9 @@ pub fn handle_get_clip_cursor(engine: &mut dyn wie_cpu::CpuEngine) -> Result<Win
     })
 }
 /// Handles `USER32.dll!SetCursor`.
-pub fn handle_set_cursor(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_cursor(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let cursor_handle = engine
         .read_rcx()
         .context("failed to read RCX for SetCursor")?;
@@ -137,10 +137,9 @@ pub fn handle_set_cursor(
     })
 }
 /// Handles `USER32.dll!GetCursor`.
-pub fn handle_get_cursor(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_cursor(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let return_value = state.window_state.cursor_handle;
 
     let return_address = engine
@@ -153,10 +152,9 @@ pub fn handle_get_cursor(
     })
 }
 /// Handles `USER32.dll!SetKeyboardState`.
-pub fn handle_set_keyboard_state(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_keyboard_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let keyboard_state_ptr = engine
         .read_rcx()
         .context("failed to read RCX for SetKeyboardState")?;
@@ -184,10 +182,9 @@ pub fn handle_set_keyboard_state(
     })
 }
 /// Handles `USER32.dll!GetKeyboardState`.
-pub fn handle_get_keyboard_state(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_keyboard_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let keyboard_state_ptr = engine
         .read_rcx()
         .context("failed to read RCX for GetKeyboardState")?;
@@ -215,10 +212,9 @@ pub fn handle_get_keyboard_state(
     })
 }
 /// Handles `USER32.dll!GetKeyState`.
-pub fn handle_get_key_state(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_key_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let virtual_key_raw = engine
         .read_rcx()
         .context("failed to read RCX for GetKeyState")?;
@@ -250,9 +246,8 @@ pub fn handle_get_key_state(
     })
 }
 /// Handles `USER32.dll!MapVirtualKeyA`.
-pub fn handle_map_virtual_key_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_map_virtual_key_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let code = engine
         .read_rcx()
         .context("failed to read RCX for MapVirtualKeyA")?;

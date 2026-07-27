@@ -1,14 +1,13 @@
 use super::{
     Context, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, GlobalAtomRecord, HEAP_SIZE_FAILURE,
-    HEAP_ZERO_MEMORY, Result, WinApiHandlerResult, WinApiState, allocate_fake_heap_block,
+    HEAP_ZERO_MEMORY, HandlerContext, Result, WinApiHandlerResult, allocate_fake_heap_block,
     read_ansi_string_from_cpu, ret_bool_true, ret_u64,
 };
 
 /// Handles `KERNEL32.dll!HeapAlloc`.
-pub fn handle_heap_alloc(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_heap_alloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let heap_handle = engine.read_rcx()?;
     let flags = engine.read_rdx()?;
     let size = engine.read_r8()?;
@@ -40,10 +39,9 @@ pub fn handle_heap_alloc(
     })
 }
 /// Handles `KERNEL32.dll!HeapFree`.
-pub fn handle_heap_free(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_heap_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _heap_handle = engine.read_rcx()?;
     let _flags = engine.read_rdx()?;
     let memory = engine.read_r8()?;
@@ -64,10 +62,9 @@ pub fn handle_heap_free(
     })
 }
 /// Handles `KERNEL32.dll!HeapReAlloc`.
-pub fn handle_heap_realloc(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_heap_realloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let heap_handle = engine.read_rcx()?;
     let flags = engine.read_rdx()?;
     let memory = engine.read_r8()?;
@@ -133,10 +130,9 @@ pub fn handle_heap_realloc(
     })
 }
 /// Handles `KERNEL32.dll!HeapCreate`.
-pub fn handle_heap_create(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    process_heap_handle: u64,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_heap_create(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let process_heap_handle = ctx.environment.process_heap_handle;
+    let engine = &mut *ctx.engine;
     let _options = engine
         .read_rcx()
         .context("failed to read RCX for HeapCreate")?;
@@ -159,9 +155,8 @@ pub fn handle_heap_create(
     })
 }
 /// Handles `KERNEL32.dll!HeapSetInformation`.
-pub fn handle_heap_set_information(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_heap_set_information(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _heap_handle = engine
         .read_rcx()
         .context("failed to read RCX for HeapSetInformation")?;
@@ -184,10 +179,9 @@ pub fn handle_heap_set_information(
     })
 }
 /// Handles `KERNEL32.dll!HeapSize`.
-pub fn handle_heap_size(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_heap_size(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _heap_handle = engine.read_rcx()?;
     let _flags = engine.read_rdx()?;
     let memory = engine.read_r8()?;
@@ -217,9 +211,8 @@ pub fn handle_heap_size(
     })
 }
 /// Handles `KERNEL32.dll!GlobalMemoryStatus`.
-pub fn handle_global_memory_status(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_global_memory_status(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let memory_status_ptr = engine
         .read_rcx()
         .context("failed to read RCX for GlobalMemoryStatus")?;
@@ -260,9 +253,8 @@ pub fn handle_global_memory_status(
         return_value: 0,
     })
 }
-pub fn handle_global_memory_status_ex(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_global_memory_status_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let ptr = engine.read_rcx().context("GlobalMemoryStatusEx RCX")?;
     if ptr == 0 {
         return ret_u64(engine, 0, "GlobalMemoryStatusEx");
@@ -302,10 +294,9 @@ pub fn handle_global_memory_status_ex(
     ret_bool_true(engine, "GlobalMemoryStatusEx")
 }
 /// Handles `KERNEL32.dll!LocalAlloc`.
-pub fn handle_local_alloc(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_local_alloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _flags = engine
         .read_rcx()
         .context("failed to read RCX for LocalAlloc")?;
@@ -326,10 +317,9 @@ pub fn handle_local_alloc(
     })
 }
 /// Handles `KERNEL32.dll!LocalFree`.
-pub fn handle_local_free(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_local_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let memory = engine
         .read_rcx()
         .context("failed to read RCX for LocalFree")?;
@@ -360,10 +350,9 @@ pub fn handle_local_free(
     })
 }
 /// Handles `KERNEL32.dll!GlobalAlloc`.
-pub fn handle_global_alloc(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_global_alloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _flags = engine
         .read_rcx()
         .context("failed to read RCX for GlobalAlloc")?;
@@ -384,10 +373,9 @@ pub fn handle_global_alloc(
     })
 }
 /// Handles `KERNEL32.dll!GlobalFree`.
-pub fn handle_global_free(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_global_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let memory = engine
         .read_rcx()
         .context("failed to read RCX for GlobalFree")?;
@@ -418,10 +406,9 @@ pub fn handle_global_free(
     })
 }
 /// Handles `KERNEL32.dll!GlobalLock`.
-pub fn handle_global_lock(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_global_lock(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let memory = engine
         .read_rcx()
         .context("failed to read RCX for GlobalLock")?;
@@ -442,10 +429,9 @@ pub fn handle_global_lock(
     })
 }
 /// Handles `KERNEL32.dll!GlobalUnlock`.
-pub fn handle_global_unlock(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_global_unlock(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let memory = engine
         .read_rcx()
         .context("failed to read RCX for GlobalUnlock")?;
@@ -466,10 +452,9 @@ pub fn handle_global_unlock(
     })
 }
 /// Handles `KERNEL32.dll!GlobalSize`.
-pub fn handle_global_size(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_global_size(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let memory = engine
         .read_rcx()
         .context("failed to read RCX for GlobalSize")?;
@@ -486,10 +471,9 @@ pub fn handle_global_size(
     })
 }
 /// Handles `KERNEL32.dll!GlobalAddAtomA`.
-pub fn handle_global_add_atom_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_global_add_atom_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let name_ptr = engine
         .read_rcx()
         .context("failed to read RCX for GlobalAddAtomA")?;
@@ -541,10 +525,9 @@ pub fn handle_global_add_atom_a(
     })
 }
 /// Handles `KERNEL32.dll!GlobalDeleteAtom`.
-pub fn handle_global_delete_atom(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_global_delete_atom(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let atom_raw = engine
         .read_rcx()
         .context("failed to read RCX for GlobalDeleteAtom")?;

@@ -1,14 +1,15 @@
 use anyhow::{Context, Result};
 
 use crate::guest_memory::{checked_field_address, write_u32 as write_guest_u32};
-use crate::{WinApiHandlerResult, WinApiState};
+use crate::{HandlerContext, WinApiHandlerResult};
 
 const S_OK: u64 = 0;
 const FAKE_IMAGE_LIST_HANDLE: u64 = 0x0000_0000_6900_0001;
 const CLR_NONE: u32 = 0xffff_ffff;
 
 /// Handles dynamic `COMCTL32.dll!DllGetVersion`.
-pub fn handle_dll_get_version(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_dll_get_version(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let version_info_ptr = engine
         .read_rcx()
         .context("failed to read RCX for DllGetVersion")?;
@@ -56,9 +57,8 @@ pub fn handle_dll_get_version(engine: &mut dyn wie_cpu::CpuEngine) -> Result<Win
 }
 
 /// Handles `COMCTL32.dll!InitCommonControls` imported as ordinal 17.
-pub fn handle_init_common_controls(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_init_common_controls(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let return_address = engine
         .return_from_win64_api(1)
         .context("failed to return from InitCommonControls")?;
@@ -70,9 +70,8 @@ pub fn handle_init_common_controls(
 }
 
 /// Handles dynamic `COMCTL32.dll!InitCommonControlsEx`.
-pub fn handle_init_common_controls_ex(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_init_common_controls_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let init_common_controls_ex_ptr = engine
         .read_rcx()
         .context("failed to read RCX for InitCommonControlsEx")?;
@@ -90,10 +89,9 @@ pub fn handle_init_common_controls_ex(
 }
 
 /// Handles `COMCTL32.dll!ImageList_Create`.
-pub fn handle_image_list_create(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_image_list_create(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _icon_width = engine
         .read_rcx()
         .context("failed to read RCX for ImageList_Create")?;
@@ -135,10 +133,9 @@ pub fn handle_image_list_create(
 }
 
 /// Handles `COMCTL32.dll!ImageList_AddMasked`.
-pub fn handle_image_list_add_masked(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_image_list_add_masked(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let image_list_handle = engine
         .read_rcx()
         .context("failed to read RCX for ImageList_AddMasked")?;
@@ -182,10 +179,9 @@ pub fn handle_image_list_add_masked(
 }
 
 /// Handles `COMCTL32.dll!ImageList_SetBkColor`.
-pub fn handle_image_list_set_bk_color(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_image_list_set_bk_color(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let image_list_handle = engine
         .read_rcx()
         .context("failed to read RCX for ImageList_SetBkColor")?;
@@ -236,10 +232,9 @@ pub fn handle_image_list_set_bk_color(
 }
 
 /// Handles `COMCTL32.dll!ImageList_Destroy`.
-pub fn handle_image_list_destroy(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_image_list_destroy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let image_list_handle = engine
         .read_rcx()
         .context("failed to read RCX for ImageList_Destroy")?;

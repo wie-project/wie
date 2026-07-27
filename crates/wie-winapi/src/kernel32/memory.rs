@@ -1,12 +1,11 @@
 use super::{
-    ERROR_INVALID_PARAMETER, Result, WinApiHandlerResult, WinApiState, ret_bool_true, ret_u64,
+    ERROR_INVALID_PARAMETER, HandlerContext, Result, WinApiHandlerResult, ret_bool_true, ret_u64,
     write_guest_u32,
 };
 
-pub fn handle_map_view_of_file(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_map_view_of_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _ = (
         engine.read_rcx()?,
         engine.read_rdx()?,
@@ -16,25 +15,21 @@ pub fn handle_map_view_of_file(
     state.process.last_error = 8; // ERROR_NOT_ENOUGH_MEMORY
     ret_u64(engine, 0, "MapViewOfFile")
 }
-pub fn handle_unmap_view_of_file(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    _state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_unmap_view_of_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _base = engine.read_rcx()?;
     ret_bool_true(engine, "UnmapViewOfFile")
 }
-pub fn handle_open_file_mapping(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_open_file_mapping(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _ = (engine.read_rcx()?, engine.read_rdx()?, engine.read_r8()?);
     state.process.last_error = 2; // ERROR_FILE_NOT_FOUND
     ret_u64(engine, 0, "OpenFileMapping")
 }
-pub(crate) fn handle_virtual_alloc(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub(crate) fn handle_virtual_alloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let addr = engine.read_rcx()?;
     let size = engine.read_rdx()?;
     let alloc_type = u32::try_from(engine.read_r8()? & 0xffff_ffff).unwrap_or(0);
@@ -78,10 +73,9 @@ pub(crate) fn handle_virtual_alloc(
         }
     }
 }
-pub(crate) fn handle_virtual_free(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub(crate) fn handle_virtual_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let addr = engine.read_rcx()?;
     let size = engine.read_rdx()?;
     let free_type = u32::try_from(engine.read_r8()? & 0xffff_ffff).unwrap_or(0);
@@ -114,10 +108,9 @@ pub(crate) fn handle_virtual_free(
         }
     }
 }
-pub(crate) fn handle_virtual_protect(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub(crate) fn handle_virtual_protect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let addr = engine.read_rcx()?;
     let size = engine.read_rdx()?;
     let new_protect = u32::try_from(engine.read_r8()? & 0xffff_ffff).unwrap_or(0);
@@ -161,10 +154,9 @@ pub(crate) fn handle_virtual_protect(
         }
     }
 }
-pub(crate) fn handle_virtual_query(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub(crate) fn handle_virtual_query(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let address = engine.read_rcx()?;
     let buffer = engine.read_rdx()?;
     let length = engine.read_r8()?;

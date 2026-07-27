@@ -943,6 +943,19 @@ mod tests {
         }
     }
 
+    /// All-zero environment for handlers that don't read it.
+    fn test_environment() -> WinApiEnvironment {
+        WinApiEnvironment {
+            image_base: 0,
+            command_line_a_ptr: 0,
+            command_line_w_ptr: 0,
+            environment_strings_w_ptr: 0,
+            module_file_name_a_ptr: 0,
+            module_file_name_w_ptr: 0,
+            process_heap_handle: 0,
+        }
+    }
+
     macro_rules! assert_return_value {
         ($result:expr, $expected:expr) => {
             let r = $result.expect("handler should succeed");
@@ -959,11 +972,26 @@ mod tests {
         // `test_engine` maps [0x1000, 0x101000); place CS there.
         let cs = 0x3000_u64;
         write_regs(&mut engine, cs, 0, 0, 0, 0);
-        kernel32::handle_initialize_critical_section(&mut engine).expect("init");
+        kernel32::handle_initialize_critical_section(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("init");
         write_regs(&mut engine, cs, 0, 0, 0, 0);
-        kernel32::handle_enter_critical_section(&mut engine, &state).expect("enter1");
+        kernel32::handle_enter_critical_section(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("enter1");
         write_regs(&mut engine, cs, 0, 0, 0, 0);
-        kernel32::handle_enter_critical_section(&mut engine, &state).expect("enter2");
+        kernel32::handle_enter_critical_section(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("enter2");
         let mut rec = [0_u8; 4];
         engine.mem_read(cs + 12, &mut rec).expect("read recursion");
         assert_eq!(u32::from_le_bytes(rec), 2);
@@ -971,9 +999,19 @@ mod tests {
         engine.mem_read(cs + 16, &mut owner).expect("read owner");
         assert_eq!(u64::from_le_bytes(owner), u64::from(PRIMARY_THREAD_ID));
         write_regs(&mut engine, cs, 0, 0, 0, 0);
-        kernel32::handle_leave_critical_section(&mut engine, &mut state).expect("leave1");
+        kernel32::handle_leave_critical_section(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("leave1");
         write_regs(&mut engine, cs, 0, 0, 0, 0);
-        kernel32::handle_leave_critical_section(&mut engine, &mut state).expect("leave2");
+        kernel32::handle_leave_critical_section(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("leave2");
         engine
             .mem_read(cs + 16, &mut owner)
             .expect("read owner unlocked");
@@ -1053,7 +1091,14 @@ mod tests {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
         write_regs(&mut engine, 0x6100_0001, 0, 0, 0, 0);
-        assert_return_value!(kernel32::handle_free_library(&mut engine, &mut state), 1);
+        assert_return_value!(
+            kernel32::handle_free_library(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            1
+        );
         assert_eq!(state.process.last_error, 0);
     }
 
@@ -1062,7 +1107,14 @@ mod tests {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
         write_regs(&mut engine, 0, 0, 0, 0, 0);
-        assert_return_value!(kernel32::handle_free_library(&mut engine, &mut state), 0);
+        assert_return_value!(
+            kernel32::handle_free_library(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            0
+        );
         assert_eq!(state.process.last_error, 6); // ERROR_INVALID_HANDLE
     }
 
@@ -1071,7 +1123,12 @@ mod tests {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
         state.process.last_error = 123;
-        let r = kernel32::handle_get_last_error(&mut engine, &state).expect("GetLastError");
+        let r = kernel32::handle_get_last_error(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("GetLastError");
         assert_eq!(r.return_value, 123);
     }
 
@@ -1081,7 +1138,12 @@ mod tests {
         let mut state = default_winapi_state();
         state.process.last_error = 0;
         write_regs(&mut engine, 456, 0, 0, 0, 0);
-        let _ = kernel32::handle_set_last_error(&mut engine, &mut state).expect("SetLastError");
+        let _ = kernel32::handle_set_last_error(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("SetLastError");
         assert_eq!(state.process.last_error, 456);
     }
 
@@ -1093,12 +1155,22 @@ mod tests {
         assert_ne!(p, 0);
 
         write_regs(&mut engine, 0x1, 0, p, 0, 0);
-        let r = kernel32::handle_heap_free(&mut engine, &mut state).expect("HeapFree");
+        let r = kernel32::handle_heap_free(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("HeapFree");
         assert_eq!(r.return_value, 1, "first free must succeed");
 
         state.process.last_error = 0;
         write_regs(&mut engine, 0x1, 0, p, 0, 0);
-        let r = kernel32::handle_heap_free(&mut engine, &mut state).expect("HeapFree double");
+        let r = kernel32::handle_heap_free(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("HeapFree double");
         assert_eq!(r.return_value, 0, "double free must return FALSE");
         assert_eq!(state.process.last_error, 6, "ERROR_INVALID_HANDLE");
     }
@@ -1112,7 +1184,11 @@ mod tests {
         // VK_RETURN = 0x0D, keyboard_state starts all zero.
         write_regs(&mut engine, 0x0D, 0, 0, 0, 0);
         assert_return_value!(
-            user32::handle_get_async_key_state(&mut engine, &mut state),
+            user32::handle_get_async_key_state(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
             0
         );
     }
@@ -1124,7 +1200,11 @@ mod tests {
         state.window_state.keyboard_state[0x0D] = 0x80; // VK_RETURN high bit set
         write_regs(&mut engine, 0x0D, 0, 0, 0, 0);
         assert_return_value!(
-            user32::handle_get_async_key_state(&mut engine, &mut state),
+            user32::handle_get_async_key_state(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
             0x81
         );
     }
@@ -1135,7 +1215,14 @@ mod tests {
         let mut state = default_winapi_state();
         // Write a valid MSG struct address (doesn't matter since queue is empty).
         write_regs(&mut engine, 0x1000, 0, 0, 0, 0x2000);
-        assert_return_value!(user32::handle_peek_message_a(&mut engine, &mut state), 0);
+        assert_return_value!(
+            user32::handle_peek_message_a(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            0
+        );
     }
 
     #[test]
@@ -1163,7 +1250,14 @@ mod tests {
         write_regs(&mut engine, msg_va, 0, 0, 0, 0x3000);
         // Write wRemoveMsg=1 (PM_REMOVE) at RSP+0x28.
         engine.mem_write(0x3028, &1_u32.to_le_bytes()).ok();
-        assert_return_value!(user32::handle_peek_message_a(&mut engine, &mut state), 1);
+        assert_return_value!(
+            user32::handle_peek_message_a(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            1
+        );
         // WM_PAINT should have been removed from the queue.
         assert_eq!(state.window_state.message_queue.len(), 0);
     }
@@ -1189,7 +1283,14 @@ mod tests {
         write_regs(&mut engine, msg_va, 0, 0, 0, 0x3000);
         // wRemoveMsg=0 (PM_NOREMOVE) at RSP+0x28.
         engine.mem_write(0x3028, &0_u32.to_le_bytes()).ok();
-        assert_return_value!(user32::handle_peek_message_a(&mut engine, &mut state), 1);
+        assert_return_value!(
+            user32::handle_peek_message_a(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            1
+        );
         // Message should still be in the queue.
         assert_eq!(state.window_state.message_queue.len(), 1);
     }
@@ -1199,7 +1300,15 @@ mod tests {
     #[test]
     fn test_init_common_controls() {
         let mut engine = test_engine();
-        assert_return_value!(comctl32::handle_init_common_controls(&mut engine), 1);
+        let mut state = default_winapi_state();
+        assert_return_value!(
+            comctl32::handle_init_common_controls(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            1
+        );
     }
 
     // --- Comdlg32 ---
@@ -1213,7 +1322,14 @@ mod tests {
             .mem_map(cc_ptr, 0x1000, wie_cpu::RwxPerms::ALL)
             .expect("map CHOOSECOLOR");
         write_regs(&mut engine, cc_ptr, 0, 0, 0, 0);
-        assert_return_value!(comdlg32::handle_choose_color_a(&mut engine, &mut state), 1);
+        assert_return_value!(
+            comdlg32::handle_choose_color_a(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            1
+        );
         // rgbResult is at offset 0x10 in CHOOSECOLOR — should be RGB black (0).
         let mut rgb = [0_u8; 4];
         engine.mem_read(cc_ptr + 0x10, &mut rgb).ok();
@@ -1225,31 +1341,63 @@ mod tests {
     #[test]
     fn test_text_out_a_returns_cch() {
         let mut engine = test_engine();
+        let mut state = default_winapi_state();
         write_regs(&mut engine, 0x100, 10, 20, 0x2000, 0x3000);
         // cchString at RSP+0x28 = 5.
         engine.mem_write(0x3028, &5_u32.to_le_bytes()).ok();
-        assert_return_value!(gdi32::handle_text_out_a(&mut engine), 5);
+        assert_return_value!(
+            gdi32::handle_text_out_a(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            5
+        );
     }
 
     #[test]
     fn test_bit_blt_success() {
         let mut engine = test_engine();
+        let mut state = default_winapi_state();
         write_regs(&mut engine, 0x100, 0, 0, 100, 0);
-        assert_return_value!(gdi32::handle_bit_blt(&mut engine), 1);
+        assert_return_value!(
+            gdi32::handle_bit_blt(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            1
+        );
     }
 
     #[test]
     fn test_stretch_blt_success() {
         let mut engine = test_engine();
+        let mut state = default_winapi_state();
         write_regs(&mut engine, 0x100, 0, 0, 100, 0);
-        assert_return_value!(gdi32::handle_stretch_blt(&mut engine), 1);
+        assert_return_value!(
+            gdi32::handle_stretch_blt(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            1
+        );
     }
 
     #[test]
     fn test_pat_blt_success() {
         let mut engine = test_engine();
+        let mut state = default_winapi_state();
         write_regs(&mut engine, 0x100, 0, 0, 100, 0);
-        assert_return_value!(gdi32::handle_pat_blt(&mut engine), 1);
+        assert_return_value!(
+            gdi32::handle_pat_blt(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            1
+        );
     }
 
     // --- Advapi32 ---
@@ -1257,9 +1405,14 @@ mod tests {
     #[test]
     fn test_set_security_descriptor_dacl_null_fails() {
         let mut engine = test_engine();
+        let mut state = default_winapi_state();
         write_regs(&mut engine, 0, 0, 0, 0, 0);
         assert_return_value!(
-            advapi32::handle_set_security_descriptor_dacl(&mut engine),
+            advapi32::handle_set_security_descriptor_dacl(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
             0
         );
     }
@@ -1267,9 +1420,14 @@ mod tests {
     #[test]
     fn test_set_security_descriptor_dacl_valid_succeeds() {
         let mut engine = test_engine();
+        let mut state = default_winapi_state();
         write_regs(&mut engine, 0x1000, 1, 0x2000, 1, 0);
         assert_return_value!(
-            advapi32::handle_set_security_descriptor_dacl(&mut engine),
+            advapi32::handle_set_security_descriptor_dacl(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
             1
         );
     }
@@ -1279,21 +1437,45 @@ mod tests {
     #[test]
     fn test_is_debugger_present() {
         let mut engine = test_engine();
-        assert_return_value!(kernel32::handle_is_debugger_present(&mut engine), 0);
+        let mut state = default_winapi_state();
+        assert_return_value!(
+            kernel32::handle_is_debugger_present(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            0
+        );
     }
 
     #[test]
     fn test_debug_break() {
         let mut engine = test_engine();
-        assert_return_value!(kernel32::handle_debug_break(&mut engine), 0);
+        let mut state = default_winapi_state();
+        assert_return_value!(
+            kernel32::handle_debug_break(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            0
+        );
     }
 
     #[test]
     fn test_output_debug_string_a() {
         let mut engine = test_engine();
+        let mut state = default_winapi_state();
         write_regs(&mut engine, 0x3000, 0, 0, 0, STACK_TOP);
         engine.mem_write(0x3000, b"hello\0").ok();
-        assert_return_value!(kernel32::handle_output_debug_string_a(&mut engine), 1);
+        assert_return_value!(
+            kernel32::handle_output_debug_string_a(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            1
+        );
     }
 
     #[test]
@@ -1302,7 +1484,12 @@ mod tests {
         let mut state = default_winapi_state();
         state.process.error_mode = 0;
         write_regs(&mut engine, 0x02, 0, 0, 0, STACK_TOP);
-        let r = kernel32::handle_set_error_mode(&mut engine, &mut state).expect("SetErrorMode");
+        let r = kernel32::handle_set_error_mode(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("SetErrorMode");
         // Previous mode was 0.
         assert_eq!(r.return_value, 0);
         assert_eq!(state.process.error_mode, 2);
@@ -1315,8 +1502,12 @@ mod tests {
         state.process.error_mode = 1;
         let prev_ptr = 0x4000;
         write_regs(&mut engine, 0x03, prev_ptr, 0, 0, STACK_TOP);
-        let r = kernel32::handle_set_thread_error_mode(&mut engine, &mut state)
-            .expect("SetThreadErrorMode");
+        let r = kernel32::handle_set_thread_error_mode(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("SetThreadErrorMode");
         assert_eq!(r.return_value, 1); // TRUE
         assert_eq!(state.process.error_mode, 3);
         let mut buf = [0_u8; 4];
@@ -1339,8 +1530,12 @@ mod tests {
         bytes.push(0); // NUL terminator
         engine.mem_write(src, &bytes).ok();
         write_regs(&mut engine, src, dst, 260, 0, STACK_TOP);
-        let r = kernel32::handle_get_long_path_name_w(&mut engine, &mut state)
-            .expect("GetLongPathNameW");
+        let r = kernel32::handle_get_long_path_name_w(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("GetLongPathNameW");
         assert_eq!(r.return_value, 7); // "C:\test" = 7 chars
     }
 
@@ -1349,8 +1544,12 @@ mod tests {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
         write_regs(&mut engine, 0, 0, 0, 0, STACK_TOP);
-        let r = kernel32::handle_create_job_object_w(&mut engine, &mut state)
-            .expect("CreateJobObjectW");
+        let r = kernel32::handle_create_job_object_w(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("CreateJobObjectW");
         assert!(r.return_value != 0);
     }
 
@@ -1360,7 +1559,11 @@ mod tests {
         let mut state = default_winapi_state();
         write_regs(&mut engine, 0x8000_0001, 0, 0, 0, STACK_TOP);
         assert_return_value!(
-            kernel32::handle_assign_process_to_job_object(&mut engine, &mut state),
+            kernel32::handle_assign_process_to_job_object(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
             1
         );
     }
@@ -1372,7 +1575,11 @@ mod tests {
         state.kernel.sync.process_dying = false;
         write_regs(&mut engine, 0x8000_0001, 0, 0, 0, STACK_TOP);
         assert_return_value!(
-            kernel32::handle_terminate_process(&mut engine, &mut state),
+            kernel32::handle_terminate_process(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
             1
         );
         assert!(state.kernel.sync.process_dying);
@@ -1383,7 +1590,12 @@ mod tests {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
         write_regs(&mut engine, 0x1000, 0, 0x5678, 0, STACK_TOP);
-        let r = kernel32::handle_open_thread(&mut engine, &mut state).expect("OpenThread");
+        let r = kernel32::handle_open_thread(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("OpenThread");
         assert!(r.return_value != 0);
     }
 
@@ -1410,8 +1622,12 @@ mod tests {
             0,
             STACK_TOP,
         );
-        let r = kernel32::handle_get_file_attributes_ex_w(&mut engine, &mut state)
-            .expect("GetFileAttributesExW");
+        let r = kernel32::handle_get_file_attributes_ex_w(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("GetFileAttributesExW");
         assert_eq!(r.return_value, 0); // FALSE
         assert_eq!(state.process.last_error, 2); // ERROR_FILE_NOT_FOUND
     }
@@ -1421,7 +1637,12 @@ mod tests {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
         write_regs(&mut engine, 0xDEAD, 0x4000, 64, 0x5000, STACK_TOP);
-        let r = kernel32::handle_backup_read(&mut engine, &mut state).expect("BackupRead");
+        let r = kernel32::handle_backup_read(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("BackupRead");
         assert_eq!(r.return_value, 0); // FALSE
         assert_eq!(state.process.last_error, 6); // ERROR_INVALID_HANDLE
     }
@@ -1431,7 +1652,12 @@ mod tests {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
         write_regs(&mut engine, 0xDEAD, 0, 0, 0, STACK_TOP);
-        let _r = kernel32::handle_suspend_thread(&mut engine, &mut state).expect("SuspendThread");
+        let _r = kernel32::handle_suspend_thread(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("SuspendThread");
         assert_eq!(state.process.last_error, 6); // ERROR_INVALID_HANDLE
     }
 
@@ -1440,7 +1666,12 @@ mod tests {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
         write_regs(&mut engine, 0xDEAD, 0, 0, 0, STACK_TOP);
-        let r = kernel32::handle_lock_file(&mut engine, &mut state).expect("LockFile");
+        let r = kernel32::handle_lock_file(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("LockFile");
         assert_eq!(r.return_value, 0); // FALSE — invalid handle
         assert_eq!(state.process.last_error, 6); // ERROR_INVALID_HANDLE
     }
@@ -1450,8 +1681,12 @@ mod tests {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
         write_regs(&mut engine, 0xDEAD, 0, 0, 0, STACK_TOP);
-        let r = kernel32::handle_set_file_valid_data(&mut engine, &mut state)
-            .expect("SetFileValidData");
+        let r = kernel32::handle_set_file_valid_data(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("SetFileValidData");
         assert_eq!(r.return_value, 0); // FALSE — invalid handle
         assert_eq!(state.process.last_error, 6);
     }
@@ -1593,9 +1828,16 @@ mod tests {
     #[test]
     fn test_get_menu_returns_zero_for_unknown_window() {
         let mut engine = test_engine();
-        let state = default_winapi_state();
+        let mut state = default_winapi_state();
         write_regs(&mut engine, 0xDEAD, 0, 0, 0, STACK_TOP);
-        assert_return_value!(user32::handle_get_menu(&mut engine, &state), 0);
+        assert_return_value!(
+            user32::handle_get_menu(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            0
+        );
     }
 
     #[test]
@@ -1610,7 +1852,12 @@ mod tests {
             ..Default::default()
         });
         write_regs(&mut engine, hwnd, 0, 0, 0, STACK_TOP);
-        let r = user32::handle_get_menu(&mut engine, &state).expect("GetMenu");
+        let r = user32::handle_get_menu(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("GetMenu");
         assert_eq!(r.return_value, hmenu);
     }
 
@@ -1619,16 +1866,30 @@ mod tests {
     #[test]
     fn test_get_stock_object_white_brush() {
         let mut engine = test_engine();
+        let mut state = default_winapi_state();
         write_regs(&mut engine, 0, 0, 0, 0, STACK_TOP);
-        let r = gdi32::handle_get_stock_object(&mut engine).expect("GetStockObject(WHITE_BRUSH)");
+        let r = gdi32::handle_get_stock_object(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("GetStockObject(WHITE_BRUSH)");
         assert!(r.return_value != 0);
     }
 
     #[test]
     fn test_get_stock_object_unknown_returns_zero() {
         let mut engine = test_engine();
+        let mut state = default_winapi_state();
         write_regs(&mut engine, 0xFF, 0, 0, 0, STACK_TOP);
-        assert_return_value!(gdi32::handle_get_stock_object(&mut engine), 0);
+        assert_return_value!(
+            gdi32::handle_get_stock_object(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            0
+        );
     }
 
     // ── SEH hardware fault dispatch ──────────────────────────────────

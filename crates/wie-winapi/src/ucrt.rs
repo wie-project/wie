@@ -24,10 +24,7 @@ use crate::guest_memory::read_u64 as read_guest_u64;
 use crate::kernel32::create_guest_thread;
 use crate::seh::{self, ThrowPayload};
 use crate::sync_obj::KernelObject;
-use crate::{
-    GuestStdinMode, HandlerContext, WinApiControlSignal, WinApiEnvironment, WinApiHandlerResult,
-    WinApiState,
-};
+use crate::{GuestStdinMode, HandlerContext, WinApiControlSignal, WinApiHandlerResult};
 use anyhow::{Context, Result};
 
 /// Guest VA base for synthetic CRT objects (FILE cookies, env pointers, etc.).
@@ -113,99 +110,96 @@ pub fn crt_data_import_va(name: &str) -> Option<u64> {
 
 /// Dispatch a UCRT export by name (case-insensitive).
 pub fn dispatch_ucrt(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let environment = ctx.environment;
     let mut scratch = [0_u8; ASCII_LOWER_SCRATCH];
     let mut owned: Option<String> = None;
     let n = ascii_lower(name, &mut scratch, &mut owned);
     match n {
-        "__acrt_iob_func" => handle_acrt_iob_func(engine),
-        "fwrite" => handle_fwrite(engine),
-        "fflush" => handle_fflush(engine),
-        "setvbuf" => handle_setvbuf(engine),
-        "__stdio_common_vfprintf" => handle_stdio_common_vfprintf(engine),
-        "__stdio_common_vsprintf" => handle_stdio_common_vsprintf(engine),
-        "__stdio_common_vsscanf" => handle_stdio_common_vsscanf(engine),
-        "malloc" => handle_malloc(engine, state),
-        "calloc" => handle_calloc(engine, state),
-        "free" => handle_free(engine, state),
-        "_set_new_mode" => handle_set_new_mode(engine),
-        "__p__environ" => handle_p_environ(engine),
-        "__p__acmdln" => handle_p_acmdln(engine),
-        "__p___argc" => handle_p_argc(engine),
-        "__p___argv" => handle_p_argv(engine),
-        "__p__commode" => handle_p_commode(engine),
-        "__p__fmode" => handle_p_fmode(engine),
-        "_configthreadlocale" => handle_config_thread_locale(engine),
-        "__setusermatherr" => handle_set_user_matherr(engine),
-        "__c_specific_handler" | "__cxxframehandler" => handle_c_specific_handler(engine),
-        "memcpy" | "memmove" => handle_memcpy(engine),
-        "memcmp" => handle_memcmp(engine),
-        "memset" => handle_memset(engine),
-        "strlen" => handle_strlen(engine),
-        "strncmp" => handle_strncmp(engine),
-        "_initterm" => handle_initterm(engine),
-        "_initterm_e" => handle_initterm_e(engine),
-        "_configure_narrow_argv" => handle_configure_narrow_argv(engine),
-        "_initialize_narrow_environment" => handle_initialize_narrow_environment(engine),
-        "_crt_atexit" => handle_crt_atexit(engine),
+        "__acrt_iob_func" => handle_acrt_iob_func(ctx),
+        "fwrite" => handle_fwrite(ctx),
+        "fflush" => handle_fflush(ctx),
+        "setvbuf" => handle_setvbuf(ctx),
+        "__stdio_common_vfprintf" => handle_stdio_common_vfprintf(ctx),
+        "__stdio_common_vsprintf" => handle_stdio_common_vsprintf(ctx),
+        "__stdio_common_vsscanf" => handle_stdio_common_vsscanf(ctx),
+        "malloc" => handle_malloc(ctx),
+        "calloc" => handle_calloc(ctx),
+        "free" => handle_free(ctx),
+        "_set_new_mode" => handle_set_new_mode(ctx),
+        "__p__environ" => handle_p_environ(ctx),
+        "__p__acmdln" => handle_p_acmdln(ctx),
+        "__p___argc" => handle_p_argc(ctx),
+        "__p___argv" => handle_p_argv(ctx),
+        "__p__commode" => handle_p_commode(ctx),
+        "__p__fmode" => handle_p_fmode(ctx),
+        "_configthreadlocale" => handle_config_thread_locale(ctx),
+        "__setusermatherr" => handle_set_user_matherr(ctx),
+        "__c_specific_handler" | "__cxxframehandler" => handle_c_specific_handler(ctx),
+        "memcpy" | "memmove" => handle_memcpy(ctx),
+        "memcmp" => handle_memcmp(ctx),
+        "memset" => handle_memset(ctx),
+        "strlen" => handle_strlen(ctx),
+        "strncmp" => handle_strncmp(ctx),
+        "_initterm" => handle_initterm(ctx),
+        "_initterm_e" => handle_initterm_e(ctx),
+        "_configure_narrow_argv" => handle_configure_narrow_argv(ctx),
+        "_initialize_narrow_environment" => handle_initialize_narrow_environment(ctx),
+        "_crt_atexit" => handle_crt_atexit(ctx),
         // UCRT: `_set_app_type`; legacy msvcrt: `__set_app_type`.
-        "_set_app_type" | "__set_app_type" => handle_set_app_type(engine),
-        "_time64" => handle_time64(engine),
-        "_localtime64" => handle_localtime64(engine, state),
-        "_set_invalid_parameter_handler" => handle_set_invalid_parameter_handler(engine),
+        "_set_app_type" | "__set_app_type" => handle_set_app_type(ctx),
+        "_time64" => handle_time64(ctx),
+        "_localtime64" => handle_localtime64(ctx),
+        "_set_invalid_parameter_handler" => handle_set_invalid_parameter_handler(ctx),
         // Legacy msvcrt CRT startup / teardown.
-        "getenv" => handle_getenv(engine),
-        "__getmainargs" => handle_getmainargs(engine),
-        "_xcptfilter" => handle_xcpt_filter(engine),
-        "_cexit" | "_c_exit" => handle_cexit(engine),
-        "_errno" => handle_errno(engine),
-        "strerror" => handle_strerror(engine),
-        "setlocale" => handle_setlocale(engine),
-        "signal" => handle_signal(engine),
+        "getenv" => handle_getenv(ctx),
+        "__getmainargs" => handle_getmainargs(ctx),
+        "_xcptfilter" => handle_xcpt_filter(ctx),
+        "_cexit" | "_c_exit" => handle_cexit(ctx),
+        "_errno" => handle_errno(ctx),
+        "strerror" => handle_strerror(ctx),
+        "setlocale" => handle_setlocale(ctx),
+        "signal" => handle_signal(ctx),
         // exit / _exit / abort: marked exit_process in hooks; still provide handler body
         // in case traits path misses API-set library names.
-        "exit" | "_exit" => handle_exit_like(engine, environment),
-        "abort" => handle_abort(engine),
+        "exit" | "_exit" => handle_exit_like(ctx),
+        "abort" => handle_abort(ctx),
         // Legacy msvcrt used heavily by standalone 7za / MSVC CRT apps.
-        "realloc" => handle_realloc(engine, state),
-        "_isatty" => handle_isatty(engine),
-        "_get_osfhandle" => handle_get_osfhandle(engine),
-        "puts" => handle_puts(engine),
-        "fputc" => handle_fputc(engine),
-        "fputs" => handle_fputs(engine),
-        "atoi" => handle_atoi(engine),
-        "atol" => handle_atol(engine),
-        "strtol" => handle_strtol(engine),
-        "strtoul" => handle_strtoul(engine),
-        "strtod" | "strtof" => handle_strtod(engine),
-        "fopen" => handle_fopen(engine, state),
-        "fclose" => handle_fclose(engine, state),
-        "fgets" => handle_fgets(engine, state),
-        "fgetc" => handle_fgetc(engine),
-        "strtok" => handle_strtok(engine),
-        "strcmp" => handle_strcmp(engine),
-        "isalpha" => handle_isalpha(engine),
-        "isdigit" => handle_isdigit(engine),
-        "isalnum" => handle_isalnum(engine),
-        "islower" => handle_islower(engine),
-        "isupper" => handle_isupper(engine),
-        "isspace" => handle_isspace(engine),
-        "toupper" => handle_toupper(engine),
-        "tolower" => handle_tolower(engine),
-        "wcscmp" => handle_wcscmp(engine),
-        "wcsstr" => handle_wcsstr(engine),
-        "_onexit" | "__dllonexit" => handle_onexit(engine),
-        "_beginthreadex" => handle_begin_thread_ex(engine, state),
-        "_endthreadex" => handle_end_thread_ex(engine, state),
-        "_purecall" => handle_purecall(engine),
+        "realloc" => handle_realloc(ctx),
+        "_isatty" => handle_isatty(ctx),
+        "_get_osfhandle" => handle_get_osfhandle(ctx),
+        "puts" => handle_puts(ctx),
+        "fputc" => handle_fputc(ctx),
+        "fputs" => handle_fputs(ctx),
+        "atoi" => handle_atoi(ctx),
+        "atol" => handle_atol(ctx),
+        "strtol" => handle_strtol(ctx),
+        "strtoul" => handle_strtoul(ctx),
+        "strtod" | "strtof" => handle_strtod(ctx),
+        "fopen" => handle_fopen(ctx),
+        "fclose" => handle_fclose(ctx),
+        "fgets" => handle_fgets(ctx),
+        "fgetc" => handle_fgetc(ctx),
+        "strtok" => handle_strtok(ctx),
+        "strcmp" => handle_strcmp(ctx),
+        "isalpha" => handle_isalpha(ctx),
+        "isdigit" => handle_isdigit(ctx),
+        "isalnum" => handle_isalnum(ctx),
+        "islower" => handle_islower(ctx),
+        "isupper" => handle_isupper(ctx),
+        "isspace" => handle_isspace(ctx),
+        "toupper" => handle_toupper(ctx),
+        "tolower" => handle_tolower(ctx),
+        "wcscmp" => handle_wcscmp(ctx),
+        "wcsstr" => handle_wcsstr(ctx),
+        "_onexit" | "__dllonexit" => handle_onexit(ctx),
+        "_beginthreadex" => handle_begin_thread_ex(ctx),
+        "_endthreadex" => handle_end_thread_ex(ctx),
+        "_purecall" => handle_purecall(ctx),
         // MSVC C++ mangled names (matched after to_ascii_lowercase).
-        "?terminate@@yaxxz" => handle_terminate_cxx(engine),
-        "??1type_info@@ueaa@xz" => handle_type_info_dtor(engine),
-        "_cxxthrowexception" => handle_cxx_throw_exception(engine, state),
-        "srand" => handle_srand(engine),
-        "rand" => handle_rand(engine),
+        "?terminate@@yaxxz" => handle_terminate_cxx(ctx),
+        "??1type_info@@ueaa@xz" => handle_type_info_dtor(ctx),
+        "_cxxthrowexception" => handle_cxx_throw_exception(ctx),
+        "srand" => handle_srand(ctx),
+        "rand" => handle_rand(ctx),
         _ => anyhow::bail!("unsupported UCRT export: {name}"),
     }
 }
@@ -226,7 +220,8 @@ fn i32_status_to_u64(v: i32) -> u64 {
 }
 
 /// `__acrt_iob_func(ix)` → `FILE*` for stdin/stdout/stderr.
-fn handle_acrt_iob_func(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_acrt_iob_func(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let ix = engine.read_rcx()? & 0xffff_ffff;
     let ptr = match ix {
         0 => FILE_STDIN,
@@ -240,7 +235,8 @@ fn handle_acrt_iob_func(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHan
 /// Cap output at 64 KiB per call (matches JIT fast path guard).
 const MAX_FWRITE_OUTPUT: usize = 64 * 1024;
 
-fn handle_fwrite(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_fwrite(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let buf = engine.read_rcx()?;
     let size = engine.read_rdx()?;
     let count = engine.read_r8()?;
@@ -277,7 +273,8 @@ fn handle_fwrite(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
     ret(engine, count)
 }
 
-fn handle_fflush(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_fflush(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _stream = engine.read_rcx()?;
     // Console I/O uses unbuffered `libc::write`; no userspace buffer / no stdio lock.
     ret(engine, 0)
@@ -337,7 +334,8 @@ fn write_host_console(stream: u64, bytes: &[u8]) {
     }
 }
 
-fn handle_setvbuf(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_setvbuf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _stream = engine.read_rcx()?;
     let _buf = engine.read_rdx()?;
     let _mode = engine.read_r8()?;
@@ -346,17 +344,15 @@ fn handle_setvbuf(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRe
 }
 
 /// Minimal stub: treat as success / no output formatting for CRT init paths.
-fn handle_stdio_common_vfprintf(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+fn handle_stdio_common_vfprintf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     // Signature is options, FILE*, format, locale, va_list — ignore and return 0 chars.
     ret(engine, 0)
 }
 
 /// `__stdio_common_vsprintf(options, buf, count, format, locale, va_list)`.
-fn handle_stdio_common_vsprintf(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+fn handle_stdio_common_vsprintf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let buf = engine.read_rdx()?;
     let fmt_ptr = engine.read_r9()?;
     if buf == 0 || fmt_ptr == 0 {
@@ -422,7 +418,8 @@ fn handle_stdio_common_vsprintf(
 }
 
 /// `__stdio_common_vsscanf(options, buf, count, format, locale, va_list)`.
-fn handle_stdio_common_vsscanf(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_stdio_common_vsscanf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let src_ptr = engine.read_rdx()?;
     let fmt_ptr = engine.read_r9()?;
     if src_ptr == 0 || fmt_ptr == 0 {
@@ -566,10 +563,9 @@ fn unix_ts_to_tm(ts: i64) -> [i32; 9] {
 }
 
 /// `_localtime64(t)` — convert time_t to local struct tm.
-fn handle_localtime64(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+fn handle_localtime64(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let t_ptr = engine.read_rcx()?;
     if t_ptr == 0 {
         return ret(engine, 0);
@@ -593,7 +589,8 @@ fn handle_localtime64(
 }
 
 /// `_time64(t)` — get current time in seconds since epoch.
-fn handle_time64(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_time64(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let t_ptr = engine.read_rcx()?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -606,14 +603,16 @@ fn handle_time64(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
 }
 
 /// `srand(seed)` — seed the CRT random number generator.
-fn handle_srand(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_srand(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let seed = engine.read_rcx()?;
     CRT_RNG.store(seed as u32, std::sync::atomic::Ordering::Relaxed);
     ret(engine, 0)
 }
 
 /// `rand()` → pseudo-random integer between 0 and RAND_MAX (0x7FFF).
-fn handle_rand(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_rand(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let prev = CRT_RNG.load(std::sync::atomic::Ordering::Relaxed);
     let next = prev.wrapping_mul(1_103_515_245).wrapping_add(12345);
     CRT_RNG.store(next, std::sync::atomic::Ordering::Relaxed);
@@ -621,10 +620,9 @@ fn handle_rand(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResul
     ret(engine, u64::from(val))
 }
 
-fn handle_malloc(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+fn handle_malloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let size = engine.read_rcx()?;
     let ptr = if size == 0 {
         0
@@ -634,10 +632,9 @@ fn handle_malloc(
     ret(engine, ptr)
 }
 
-fn handle_calloc(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+fn handle_calloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let n = engine.read_rcx()?;
     let size = engine.read_rdx()?;
     let total = n.saturating_mul(size);
@@ -655,10 +652,9 @@ fn handle_calloc(
     ret(engine, ptr)
 }
 
-fn handle_free(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+fn handle_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let ptr = engine.read_rcx()?;
     if ptr != 0 {
         let _ = state.heap_state.heap.free_coherent(engine, ptr);
@@ -666,58 +662,69 @@ fn handle_free(
     ret(engine, 0)
 }
 
-fn handle_set_new_mode(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_set_new_mode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _mode = engine.read_rcx()?;
     ret(engine, 0)
 }
 
-fn handle_p_environ(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_p_environ(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     // char*** — point at a slot holding NULL (empty environment block list).
     engine.mem_write(ENVIRON_PTR_SLOT, &0_u64.to_le_bytes())?;
     ret(engine, ENVIRON_PTR_SLOT)
 }
 
-fn handle_p_acmdln(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_p_acmdln(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     // Slot is filled at session start (points at GetCommandLineA buffer).
     ret(engine, ACMDLN_PTR_SLOT)
 }
 
-fn handle_p_argc(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_p_argc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     // Slot is filled at session start from guest argv.
     ret(engine, ARGC_SLOT)
 }
 
-fn handle_p_argv(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_p_argv(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     // Slot holds char** filled at session start.
     ret(engine, ARGV_PTR_SLOT)
 }
 
-fn handle_p_commode(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_p_commode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     engine.mem_write(COMMODE_SLOT, &0_u32.to_le_bytes())?;
     ret(engine, COMMODE_SLOT)
 }
 
-fn handle_p_fmode(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_p_fmode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     engine.mem_write(FMODE_SLOT, &0_u32.to_le_bytes())?;
     ret(engine, FMODE_SLOT)
 }
 
-fn handle_config_thread_locale(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_config_thread_locale(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _ = engine.read_rcx()?;
     ret(engine, 0)
 }
 
-fn handle_set_user_matherr(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_set_user_matherr(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _ = engine.read_rcx()?;
     ret(engine, 0)
 }
 
-fn handle_c_specific_handler(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_c_specific_handler(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     // Exception filter: continue search.
     ret(engine, 1)
 }
 
-fn handle_memcpy(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_memcpy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let dest = engine.read_rcx()?;
     let src = engine.read_rdx()?;
     let n = engine.read_r8()?;
@@ -739,7 +746,8 @@ fn handle_memcpy(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
     ret(engine, dest)
 }
 
-fn handle_memcmp(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_memcmp(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let a = engine.read_rcx()?;
     let b = engine.read_rdx()?;
     let n = engine.read_r8()?;
@@ -780,7 +788,8 @@ fn handle_memcmp(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
     ret(engine, i32_status_to_u64(result))
 }
 
-fn handle_memset(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_memset(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let dest = engine.read_rcx()?;
     let c = engine.read_rdx()? & 0xff;
     let n = engine.read_r8()?;
@@ -801,14 +810,16 @@ fn handle_memset(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
 /// Legacy msvcrt `__getmainargs(argc*, argv**, env**, doWildcard, startupinfo*)`.
 ///
 /// Fills caller out-params from the CRT page prepared at session start.
-fn handle_getenv(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_getenv(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     // `getenv(const char* name)` → returns NULL (variable not found).
     // The C++ runtime checks for debug/env flags during startup; returning
     // NULL is safe — no deployment expects these to be set.
     ret(engine, 0)
 }
 
-fn handle_getmainargs(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_getmainargs(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let argc_ptr = engine.read_rcx()?;
     let argv_ptr = engine.read_rdx()?;
     let env_ptr = engine.read_r8()?;
@@ -844,14 +855,16 @@ fn handle_getmainargs(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandl
 }
 
 /// `_XcptFilter` — SEH filter; continue search (no host exception model).
-fn handle_xcpt_filter(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_xcpt_filter(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _xcptnum = engine.read_rcx()?;
     let _info = engine.read_rdx()?;
     // EXCEPTION_CONTINUE_SEARCH
     ret(engine, 0)
 }
 
-fn handle_strlen(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_strlen(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let s = engine.read_rcx()?;
     if s == 0 {
         return ret(engine, 0);
@@ -896,7 +909,8 @@ fn handle_strlen(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
     ret(engine, total)
 }
 
-fn handle_strncmp(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_strncmp(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let a = engine.read_rcx()?;
     let b = engine.read_rdx()?;
     let n = engine.read_r8()?;
@@ -945,7 +959,8 @@ fn handle_strncmp(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRe
 ///
 /// v0: **no-op**. Calling guest constructors requires a full call bridge; empty/noncritical
 /// `.CRT` sections still allow simple `main` programs. Tighten when a CRT PE needs ctors.
-fn handle_initterm(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_initterm(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _first = engine.read_rcx()?;
     let _last = engine.read_rdx()?;
     ret(engine, 0)
@@ -953,70 +968,74 @@ fn handle_initterm(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerR
 
 /// `_initterm_e` — same as `_initterm` but entries return `int`; non-zero aborts.
 /// v0: no-op success (return 0).
-fn handle_initterm_e(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_initterm_e(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _first = engine.read_rcx()?;
     let _last = engine.read_rdx()?;
     ret(engine, 0)
 }
 
-fn handle_configure_narrow_argv(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+fn handle_configure_narrow_argv(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _mode = engine.read_rcx()?;
     ret(engine, 0)
 }
 
 fn handle_initialize_narrow_environment(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     ret(engine, 0)
 }
 
-fn handle_crt_atexit(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_crt_atexit(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _fn = engine.read_rcx()?;
     ret(engine, 0)
 }
 
-fn handle_set_app_type(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_set_app_type(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _t = engine.read_rcx()?;
     ret(engine, 0)
 }
 
 fn handle_set_invalid_parameter_handler(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _h = engine.read_rcx()?;
     ret(engine, 0)
 }
 
-fn handle_cexit(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_cexit(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     ret(engine, 0)
 }
 
-fn handle_signal(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_signal(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _sig = engine.read_rcx()?;
     let _handler = engine.read_rdx()?;
     ret(engine, 0)
 }
 
-fn handle_exit_like(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    _environment: WinApiEnvironment,
-) -> Result<WinApiHandlerResult> {
+fn handle_exit_like(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     // Should be intercepted via exit_process trait; if not, still return.
     let code = engine.read_rcx()?;
     ret(engine, code)
 }
 
-fn handle_abort(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_abort(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     ret(engine, 3)
 }
 
 /// CRT `realloc(ptr, size)`.
-fn handle_realloc(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+fn handle_realloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let ptr = engine.read_rcx()?;
     let new_size = engine.read_rdx()?;
     if ptr == 0 {
@@ -1061,14 +1080,16 @@ fn handle_realloc(
 }
 
 /// `_isatty(fd)` — treat 0/1/2 as console TTYs.
-fn handle_isatty(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_isatty(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let fd = engine.read_rcx()? & 0xffff_ffff;
     let is_tty = (0..=2).contains(&fd);
     ret(engine, u64::from(is_tty))
 }
 
 /// `_get_osfhandle(fd)` → fake console HANDLE for std streams.
-fn handle_get_osfhandle(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_get_osfhandle(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let fd = engine.read_rcx()? & 0xffff_ffff;
     // Align with kernel32 fake std handles.
     let handle = match fd {
@@ -1081,7 +1102,8 @@ fn handle_get_osfhandle(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHan
 }
 
 /// `fputc(c, stream)`.
-fn handle_fputc(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_fputc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let c = engine.read_rcx()? & 0xff;
     let stream = engine.read_rdx()?;
     let ch = u8::try_from(c).unwrap_or(0);
@@ -1098,7 +1120,8 @@ fn handle_fputc(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResu
 }
 
 /// `fputs(s, stream)`.
-fn handle_fputs(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_fputs(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let s = engine.read_rcx()?;
     let stream = engine.read_rdx()?;
     if s == 0 {
@@ -1128,7 +1151,8 @@ fn handle_fputs(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResu
 }
 
 /// `puts(s)` — write NUL-terminated string + newline to stdout.
-fn handle_puts(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_puts(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let s = engine.read_rcx()?;
     if s == 0 {
         return ret(engine, u64::from(u32::MAX)); // EOF
@@ -1153,10 +1177,8 @@ fn handle_puts(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResul
 }
 
 /// `fopen(path, mode)` — open a file for stdio access.
-fn handle_fopen(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    _state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+fn handle_fopen(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let p = engine.read_rcx()?;
     let m = engine.read_rdx()?;
     drop(read_guest_str(engine, p, 1024).ok());
@@ -1165,19 +1187,16 @@ fn handle_fopen(
 }
 
 /// `fclose(stream)` — close a stdio file handle.
-fn handle_fclose(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    _state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+fn handle_fclose(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     engine.read_rcx()?;
     ret(engine, u64::from(u32::MAX)) // EOF = not implemented
 }
 
 /// `fgets(buf, max, stream)` — read one line from stdin.
-fn handle_fgets(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+fn handle_fgets(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let buf = engine.read_rcx()?;
     let max = engine.read_rdx()?;
     let _stream = engine.read_r8()?;
@@ -1256,7 +1275,8 @@ fn read_guest_str(engine: &mut dyn wie_cpu::CpuEngine, ptr: u64, max: usize) -> 
 }
 
 /// `atoi(s)` — parse ASCII string to int.
-fn handle_atoi(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_atoi(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let ptr = engine.read_rcx()?;
     let s = read_guest_str(engine, ptr, 32)?;
     let val: i32 = s.trim().parse().unwrap_or(0);
@@ -1264,7 +1284,8 @@ fn handle_atoi(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResul
 }
 
 /// `atol(s)` — parse ASCII string to long.
-fn handle_atol(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_atol(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let ptr = engine.read_rcx()?;
     let s = read_guest_str(engine, ptr, 32)?;
     let val: i64 = s.trim().parse().unwrap_or(0);
@@ -1272,7 +1293,8 @@ fn handle_atol(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResul
 }
 
 /// `strtol(s, endptr, base)` — parse string to long.
-fn handle_strtol(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_strtol(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let s_ptr = engine.read_rcx()?;
     let _endptr = engine.read_rdx()?;
     let base = engine.read_r8()?;
@@ -1282,7 +1304,8 @@ fn handle_strtol(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
 }
 
 /// `strtoul(s, endptr, base)` — parse string to unsigned long.
-fn handle_strtoul(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_strtoul(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let s_ptr = engine.read_rcx()?;
     let _endptr = engine.read_rdx()?;
     let base = engine.read_r8()?;
@@ -1292,7 +1315,8 @@ fn handle_strtoul(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRe
 }
 
 /// `strtod(s, endptr)` — parse string to double.
-fn handle_strtod(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_strtod(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let s_ptr = engine.read_rcx()?;
     let _endptr = engine.read_rdx()?;
     let s = read_guest_str(engine, s_ptr, 64)?;
@@ -1301,7 +1325,8 @@ fn handle_strtod(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
 }
 
 /// `strtok(s, delim)` — tokenize string (single-threaded, static buffer).
-fn handle_strtok(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_strtok(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let s_ptr = engine.read_rcx()?;
     let d_ptr = engine.read_rdx()?;
     static SAVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1368,50 +1393,60 @@ fn handle_strtok(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
 }
 
 /// `fgetc(stream)` — EOF for empty stdin inject.
-fn handle_fgetc(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_fgetc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _stream = engine.read_rcx()?;
     ret(engine, u64::from(u32::MAX)) // EOF
 }
 
 /// ctype helpers: isalpha, isdigit, isalnum, islower, isupper, isspace, toupper, tolower.
-fn handle_isalpha(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_isalpha(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let c = engine.read_rcx()? as u8;
     ret(engine, u64::from(c.is_ascii_alphabetic()))
 }
-fn handle_isdigit(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_isdigit(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let c = engine.read_rcx()? as u8;
     ret(engine, u64::from(c.is_ascii_digit()))
 }
-fn handle_isalnum(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_isalnum(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let c = engine.read_rcx()? as u8;
     ret(engine, u64::from(c.is_ascii_alphanumeric()))
 }
-fn handle_islower(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_islower(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let c = engine.read_rcx()? as u8;
     ret(engine, u64::from(c.is_ascii_lowercase()))
 }
-fn handle_isupper(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_isupper(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let c = engine.read_rcx()? as u8;
     ret(engine, u64::from(c.is_ascii_uppercase()))
 }
-fn handle_isspace(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_isspace(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let c = engine.read_rcx()? as u8;
     ret(
         engine,
         u64::from(c.is_ascii_whitespace() || c == b'\t' || c == b'\n' || c == b'\r'),
     )
 }
-fn handle_toupper(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_toupper(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let c = engine.read_rcx()?;
     ret(engine, u64::from((c as u8).to_ascii_uppercase()))
 }
-fn handle_tolower(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_tolower(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let c = engine.read_rcx()?;
     ret(engine, u64::from((c as u8).to_ascii_lowercase()))
 }
 
 /// `strerror(errnum)` — returns a string describing the error code.
-fn handle_strerror(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_strerror(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _code = engine.read_rcx()?;
     // Return a pointer to a static "Unknown error" string in guest memory.
     static STRERROR_VA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1429,7 +1464,8 @@ fn handle_strerror(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerR
 }
 
 /// `setlocale(category, locale)` — set/get program locale.
-fn handle_setlocale(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_setlocale(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _cat = engine.read_rcx()?;
     let locale_ptr = engine.read_rdx()?;
     if locale_ptr == 0 {
@@ -1454,7 +1490,8 @@ fn handle_setlocale(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandler
 }
 
 /// `_errno()` — returns a pointer to the thread-local errno variable.
-fn handle_errno(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_errno(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     static ERRNO_VA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let va = ERRNO_VA.load(std::sync::atomic::Ordering::Relaxed);
     if va == 0 {
@@ -1471,7 +1508,8 @@ fn handle_errno(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResu
 }
 
 /// `strcmp(a, b)`.
-fn handle_strcmp(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_strcmp(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let a = engine.read_rcx()?;
     let b = engine.read_rdx()?;
     if a == 0 || b == 0 {
@@ -1503,7 +1541,8 @@ fn handle_strcmp(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
 }
 
 /// `wcscmp(a, b)`.
-fn handle_wcscmp(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_wcscmp(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let a = engine.read_rcx()?;
     let b = engine.read_rdx()?;
     if a == 0 || b == 0 {
@@ -1538,7 +1577,8 @@ fn handle_wcscmp(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
 }
 
 /// `wcsstr(haystack, needle)` — return pointer to first match or NULL.
-fn handle_wcsstr(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_wcsstr(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let hay = engine.read_rcx()?;
     let needle = engine.read_rdx()?;
     if hay == 0 || needle == 0 {
@@ -1590,7 +1630,8 @@ fn handle_wcsstr(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
 }
 
 /// `_onexit` / `__dllonexit` — accept callback, return it (success).
-fn handle_onexit(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_onexit(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let func = engine.read_rcx()?;
     // Return the function pointer to indicate registration success (MSVC CRT contract).
     ret(engine, func)
@@ -1600,10 +1641,9 @@ fn handle_onexit(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
 ///
 /// ABI (x64): security, stack_size, start, arg, initflag, thrdaddr — identical
 /// layout to `CreateThread` for the args we care about.
-fn handle_begin_thread_ex(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+fn handle_begin_thread_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let _security = engine.read_rcx()?;
     let stack_size = engine.read_rdx()?;
     let start = engine.read_r8()?;
@@ -1616,10 +1656,9 @@ fn handle_begin_thread_ex(
 }
 
 /// `_endthreadex` — terminate the current guest worker (like `ExitThread`).
-fn handle_end_thread_ex(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+fn handle_end_thread_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let code_raw = engine.read_rcx()?;
     let code = u32::try_from(code_raw & u64::from(u32::MAX)).unwrap_or(0);
     let tid = state.kernel.threads.current_tid();
@@ -1654,16 +1693,19 @@ fn read_stack_u64(engine: &mut dyn wie_cpu::CpuEngine, offset: u64) -> Result<u6
     Ok(u64::from_le_bytes(bytes))
 }
 
-fn handle_purecall(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_purecall(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     // Pure virtual call — abort-like.
     ret(engine, 0)
 }
 
-fn handle_terminate_cxx(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_terminate_cxx(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     ret(engine, 0)
 }
 
-fn handle_type_info_dtor(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_type_info_dtor(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let this = engine.read_rcx()?;
     ret(engine, this)
 }
@@ -1672,10 +1714,9 @@ fn handle_type_info_dtor(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHa
 ///
 /// Builds the usual MSVC EH `EXCEPTION_RECORD` payload and enters the shared
 /// two-pass SEH dispatcher (host FuncInfo / LSDA search + register restore).
-fn handle_cxx_throw_exception(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+fn handle_cxx_throw_exception(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let pexception_object = engine.read_rcx()?;
     let pthrow_info = engine.read_rdx()?;
     tracing::debug!(

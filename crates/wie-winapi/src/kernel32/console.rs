@@ -1,8 +1,8 @@
 use super::{
     Context, DEFAULT_CONSOLE_MODE_IN, DEFAULT_CONSOLE_MODE_OUT, FAKE_STDERR_HANDLE,
-    FAKE_STDIN_HANDLE, FAKE_STDOUT_HANDLE, INVALID_HANDLE_VALUE, MAX_HOST_STDIN_LINE, Result,
-    STD_ERROR_HANDLE_ID, STD_INPUT_HANDLE_ID, STD_OUTPUT_HANDLE_ID, WinApiHandlerResult,
-    WinApiState, low_u32, ret_bool_true, ret_u64, write_guest_u32,
+    FAKE_STDIN_HANDLE, FAKE_STDOUT_HANDLE, HandlerContext, INVALID_HANDLE_VALUE,
+    MAX_HOST_STDIN_LINE, Result, STD_ERROR_HANDLE_ID, STD_INPUT_HANDLE_ID, STD_OUTPUT_HANDLE_ID,
+    WinApiHandlerResult, WinApiState, low_u32, ret_bool_true, ret_u64, write_guest_u32,
 };
 
 pub(crate) fn read_host_console_stdin_line() -> std::io::Result<Option<Vec<u8>>> {
@@ -41,7 +41,8 @@ pub(crate) fn refill_stdin_from_host(state: &mut WinApiState) -> Result<bool, ()
     }
 }
 /// Handles `KERNEL32.dll!GetStdHandle`.
-pub fn handle_get_std_handle(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_get_std_handle(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let std_handle_id_raw = engine
         .read_rcx()
         .context("failed to read RCX for GetStdHandle")?;
@@ -66,13 +67,15 @@ pub fn handle_get_std_handle(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinA
     })
 }
 pub fn handle_set_console_ctrl_handler(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _handler = engine.read_rcx().context("SetConsoleCtrlHandler RCX")?;
     let _add = engine.read_rdx().context("SetConsoleCtrlHandler RDX")?;
     ret_bool_true(engine, "SetConsoleCtrlHandler")
 }
-pub fn handle_get_console_mode(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_get_console_mode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let handle = engine.read_rcx().context("GetConsoleMode RCX")?;
     let mode_ptr = engine.read_rdx().context("GetConsoleMode RDX")?;
     if mode_ptr == 0 {
@@ -86,14 +89,16 @@ pub fn handle_get_console_mode(engine: &mut dyn wie_cpu::CpuEngine) -> Result<Wi
     write_guest_u32(engine, mode_ptr, mode)?;
     ret_bool_true(engine, "GetConsoleMode")
 }
-pub fn handle_set_console_mode(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_set_console_mode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _handle = engine.read_rcx().context("SetConsoleMode RCX")?;
     let _mode = engine.read_rdx().context("SetConsoleMode RDX")?;
     ret_bool_true(engine, "SetConsoleMode")
 }
 pub fn handle_get_console_screen_buffer_info(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _handle = engine
         .read_rcx()
         .context("GetConsoleScreenBufferInfo RCX")?;

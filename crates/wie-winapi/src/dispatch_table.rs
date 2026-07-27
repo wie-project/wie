@@ -1636,410 +1636,340 @@ pub fn dispatch_winapi_id(
     ctx: &mut HandlerContext<'_>,
     id: WinApiId,
 ) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let environment = ctx.environment;
     match id {
-        WinApiId::Kernel32Getversionexa => kernel32::handle_get_version_ex_a(engine),
-        WinApiId::Kernel32Getmodulehandlea => {
-            kernel32::handle_get_module_handle_a(engine, environment, state)
-        }
-        WinApiId::Kernel32Getcommandlinea => {
-            kernel32::handle_get_command_line_a(engine, environment.command_line_a_ptr)
-        }
-        WinApiId::Kernel32Getcommandlinew => {
-            kernel32::handle_get_command_line_w(engine, environment.command_line_w_ptr)
-        }
-        WinApiId::Kernel32Getstartupinfoa => kernel32::handle_get_startup_info_a(engine),
-        WinApiId::Kernel32Getprocessheap => {
-            kernel32::handle_get_process_heap(engine, environment.process_heap_handle)
-        }
+        WinApiId::Kernel32Getversionexa => kernel32::handle_get_version_ex_a(ctx),
+        WinApiId::Kernel32Getmodulehandlea => kernel32::handle_get_module_handle_a(ctx),
+        WinApiId::Kernel32Getcommandlinea => kernel32::handle_get_command_line_a(ctx),
+        WinApiId::Kernel32Getcommandlinew => kernel32::handle_get_command_line_w(ctx),
+        WinApiId::Kernel32Getstartupinfoa => kernel32::handle_get_startup_info_a(ctx),
+        WinApiId::Kernel32Getprocessheap => kernel32::handle_get_process_heap(ctx),
         WinApiId::Kernel32Getsystemtimeasfiletime => {
-            kernel32::handle_get_system_time_as_file_time(engine)
+            kernel32::handle_get_system_time_as_file_time(ctx)
         }
-        WinApiId::Kernel32Getcurrentprocessid => kernel32::handle_get_current_process_id(engine),
-        WinApiId::Kernel32Getcurrentthreadid => {
-            kernel32::handle_get_current_thread_id(engine, state)
-        }
-        WinApiId::Kernel32Gettickcount => kernel32::handle_get_tick_count(engine),
+        WinApiId::Kernel32Getcurrentprocessid => kernel32::handle_get_current_process_id(ctx),
+        WinApiId::Kernel32Getcurrentthreadid => kernel32::handle_get_current_thread_id(ctx),
+        WinApiId::Kernel32Gettickcount => kernel32::handle_get_tick_count(ctx),
         WinApiId::Kernel32Queryperformancecounter => {
-            kernel32::handle_query_performance_counter(engine)
+            kernel32::handle_query_performance_counter(ctx)
         }
-        WinApiId::Kernel32Heapalloc => kernel32::handle_heap_alloc(engine, state),
-        WinApiId::Kernel32Heapfree => kernel32::handle_heap_free(engine, state),
-        WinApiId::Kernel32Heaprealloc => kernel32::handle_heap_realloc(engine, state),
-        WinApiId::Kernel32Heapcreate => {
-            kernel32::handle_heap_create(engine, environment.process_heap_handle)
-        }
-        WinApiId::Kernel32Heapsetinformation => kernel32::handle_heap_set_information(engine),
+        WinApiId::Kernel32Heapalloc => kernel32::handle_heap_alloc(ctx),
+        WinApiId::Kernel32Heapfree => kernel32::handle_heap_free(ctx),
+        WinApiId::Kernel32Heaprealloc => kernel32::handle_heap_realloc(ctx),
+        WinApiId::Kernel32Heapcreate => kernel32::handle_heap_create(ctx),
+        WinApiId::Kernel32Heapsetinformation => kernel32::handle_heap_set_information(ctx),
         WinApiId::Kernel32Initializecriticalsection => {
-            kernel32::handle_initialize_critical_section(engine)
+            kernel32::handle_initialize_critical_section(ctx)
         }
-        WinApiId::Kernel32Entercriticalsection => {
-            kernel32::handle_enter_critical_section(engine, state)
-        }
-        WinApiId::Kernel32Leavecriticalsection => {
-            kernel32::handle_leave_critical_section(engine, state)
-        }
-        WinApiId::Kernel32Deletecriticalsection => kernel32::handle_delete_critical_section(engine),
-        WinApiId::Kernel32Flsalloc => kernel32::handle_fls_alloc(engine, state),
-        WinApiId::Kernel32Flsfree => kernel32::handle_fls_free(engine, state),
-        WinApiId::Kernel32Flssetvalue => kernel32::handle_fls_set_value(engine, state),
-        WinApiId::Kernel32Flsgetvalue => kernel32::handle_fls_get_value(engine, state),
-        WinApiId::Kernel32Getstdhandle => kernel32::handle_get_std_handle(engine),
-        WinApiId::Kernel32Getfiletype => kernel32::handle_get_file_type(engine, state),
-        WinApiId::Kernel32Sethandlecount => kernel32::handle_set_handle_count(engine),
-        WinApiId::Kernel32Getenvironmentstringsw => kernel32::handle_get_environment_strings_w(
-            engine,
-            environment.environment_strings_w_ptr,
-        ),
+        WinApiId::Kernel32Entercriticalsection => kernel32::handle_enter_critical_section(ctx),
+        WinApiId::Kernel32Leavecriticalsection => kernel32::handle_leave_critical_section(ctx),
+        WinApiId::Kernel32Deletecriticalsection => kernel32::handle_delete_critical_section(ctx),
+        WinApiId::Kernel32Flsalloc => kernel32::handle_fls_alloc(ctx),
+        WinApiId::Kernel32Flsfree => kernel32::handle_fls_free(ctx),
+        WinApiId::Kernel32Flssetvalue => kernel32::handle_fls_set_value(ctx),
+        WinApiId::Kernel32Flsgetvalue => kernel32::handle_fls_get_value(ctx),
+        WinApiId::Kernel32Getstdhandle => kernel32::handle_get_std_handle(ctx),
+        WinApiId::Kernel32Getfiletype => kernel32::handle_get_file_type(ctx),
+        WinApiId::Kernel32Sethandlecount => kernel32::handle_set_handle_count(ctx),
+        WinApiId::Kernel32Getenvironmentstringsw => kernel32::handle_get_environment_strings_w(ctx),
         WinApiId::Kernel32Freeenvironmentstringsw => {
-            kernel32::handle_free_environment_strings_w(engine)
+            kernel32::handle_free_environment_strings_w(ctx)
         }
-        WinApiId::Kernel32Widechartomultibyte => kernel32::handle_wide_char_to_multi_byte(engine),
-        WinApiId::Kernel32Getlasterror => kernel32::handle_get_last_error(engine, state),
-        WinApiId::Kernel32Setlasterror => kernel32::handle_set_last_error(engine, state),
-        WinApiId::Kernel32Getacp => kernel32::handle_get_acp(engine),
-        WinApiId::Kernel32Getoemcp => kernel32::handle_get_oem_cp(engine),
-        WinApiId::Kernel32Getcpinfo => kernel32::handle_get_cp_info(engine),
-        WinApiId::Kernel32Isvalidcodepage => kernel32::handle_is_valid_code_page(engine),
-        WinApiId::Kernel32Getstringtypew => kernel32::handle_get_string_type_w(engine),
-        WinApiId::Kernel32Multibytetowidechar => kernel32::handle_multi_byte_to_wide_char(engine),
-        WinApiId::Kernel32Lcmapstringw => kernel32::handle_lc_map_string_w(engine),
-        WinApiId::Kernel32Getmodulefilenamea => kernel32::handle_get_module_file_name_a(
-            engine,
-            state,
-            environment.module_file_name_a_ptr,
-        ),
-        WinApiId::Kernel32Getmodulefilenamew => kernel32::handle_get_module_file_name_w(
-            engine,
-            state,
-            environment.module_file_name_w_ptr,
-        ),
+        WinApiId::Kernel32Widechartomultibyte => kernel32::handle_wide_char_to_multi_byte(ctx),
+        WinApiId::Kernel32Getlasterror => kernel32::handle_get_last_error(ctx),
+        WinApiId::Kernel32Setlasterror => kernel32::handle_set_last_error(ctx),
+        WinApiId::Kernel32Getacp => kernel32::handle_get_acp(ctx),
+        WinApiId::Kernel32Getoemcp => kernel32::handle_get_oem_cp(ctx),
+        WinApiId::Kernel32Getcpinfo => kernel32::handle_get_cp_info(ctx),
+        WinApiId::Kernel32Isvalidcodepage => kernel32::handle_is_valid_code_page(ctx),
+        WinApiId::Kernel32Getstringtypew => kernel32::handle_get_string_type_w(ctx),
+        WinApiId::Kernel32Multibytetowidechar => kernel32::handle_multi_byte_to_wide_char(ctx),
+        WinApiId::Kernel32Lcmapstringw => kernel32::handle_lc_map_string_w(ctx),
+        WinApiId::Kernel32Getmodulefilenamea => kernel32::handle_get_module_file_name_a(ctx),
+        WinApiId::Kernel32Getmodulefilenamew => kernel32::handle_get_module_file_name_w(ctx),
         WinApiId::Kernel32Setunhandledexceptionfilter => {
-            kernel32::handle_set_unhandled_exception_filter(engine)
+            kernel32::handle_set_unhandled_exception_filter(ctx)
         }
-        WinApiId::Kernel32Heapsize => kernel32::handle_heap_size(engine, state),
-        WinApiId::Advapi32Regcreatekeyexa => advapi32::handle_reg_create_key_ex_a(engine, state),
-        WinApiId::Advapi32Regopenkeyexa => advapi32::handle_reg_open_key_ex_a(engine, state),
-        WinApiId::Advapi32Regqueryvalueexa => advapi32::handle_reg_query_value_ex_a(engine),
-        WinApiId::Advapi32Regqueryvalueexw => advapi32::handle_reg_query_value_ex_w(engine),
-        WinApiId::Advapi32Regsetvalueexa => advapi32::handle_reg_set_value_ex_a(engine),
-        WinApiId::Advapi32Regsetvalueexw => advapi32::handle_reg_set_value_ex_w(engine),
-        WinApiId::Advapi32Regdeletevaluea => advapi32::handle_reg_delete_value_a(engine),
-        WinApiId::Advapi32Regclosekey => advapi32::handle_reg_close_key(engine),
+        WinApiId::Kernel32Heapsize => kernel32::handle_heap_size(ctx),
+        WinApiId::Advapi32Regcreatekeyexa => advapi32::handle_reg_create_key_ex_a(ctx),
+        WinApiId::Advapi32Regopenkeyexa => advapi32::handle_reg_open_key_ex_a(ctx),
+        WinApiId::Advapi32Regqueryvalueexa => advapi32::handle_reg_query_value_ex_a(ctx),
+        WinApiId::Advapi32Regqueryvalueexw => advapi32::handle_reg_query_value_ex_w(ctx),
+        WinApiId::Advapi32Regsetvalueexa => advapi32::handle_reg_set_value_ex_a(ctx),
+        WinApiId::Advapi32Regsetvalueexw => advapi32::handle_reg_set_value_ex_w(ctx),
+        WinApiId::Advapi32Regdeletevaluea => advapi32::handle_reg_delete_value_a(ctx),
+        WinApiId::Advapi32Regclosekey => advapi32::handle_reg_close_key(ctx),
         WinApiId::Advapi32Initializesecuritydescriptor => {
-            advapi32::handle_initialize_security_descriptor(engine)
+            advapi32::handle_initialize_security_descriptor(ctx)
         }
         WinApiId::Advapi32Setsecuritydescriptordacl => {
-            advapi32::handle_set_security_descriptor_dacl(engine)
+            advapi32::handle_set_security_descriptor_dacl(ctx)
         }
-        WinApiId::Kernel32Loadlibrarya => {
-            kernel32::handle_load_library_a(engine, environment, state)
-        }
-        WinApiId::Kernel32Loadlibraryw => {
-            kernel32::handle_load_library_w(engine, environment, state)
-        }
-        WinApiId::Kernel32Freelibrary => kernel32::handle_free_library(engine, state),
-        WinApiId::Kernel32Getprocaddress => kernel32::handle_get_proc_address(engine, state),
-        WinApiId::Kernel32Getfileattributesa => {
-            kernel32::handle_get_file_attributes_a(engine, state)
-        }
-        WinApiId::Kernel32Getfileattributesw => {
-            kernel32::handle_get_file_attributes_w(engine, state)
-        }
-        WinApiId::Kernel32Findfirstfilew => kernel32::handle_find_first_file_w(engine, state),
-        WinApiId::Kernel32Findfirstfilea => kernel32::handle_find_first_file_a(engine, state),
-        WinApiId::Kernel32Findnextfilew => kernel32::handle_find_next_file_w(engine, state),
-        WinApiId::Kernel32Findnextfilea => kernel32::handle_find_next_file_a(engine, state),
-        WinApiId::Kernel32Findclose => kernel32::handle_find_close(engine, state),
-        WinApiId::User32Getasynckeystate => user32::handle_get_async_key_state(engine, state),
-        WinApiId::User32Peekmessagea => user32::handle_peek_message_a(engine, state),
-        WinApiId::Kernel32Loadlibraryexa => {
-            kernel32::handle_load_library_ex_a(engine, environment, state)
-        }
-        WinApiId::Kernel32Loadlibraryexw => {
-            kernel32::handle_load_library_ex_w(engine, environment, state)
-        }
-        WinApiId::Kernel32Findresourcea => kernel32::handle_find_resource_a(engine, state),
-        WinApiId::Kernel32Loadresource => kernel32::handle_load_resource(engine, state),
-        WinApiId::Kernel32Lockresource => kernel32::handle_lock_resource(engine, state),
-        WinApiId::Kernel32Sizeofresource => kernel32::handle_sizeof_resource(engine, state),
+        WinApiId::Kernel32Loadlibrarya => kernel32::handle_load_library_a(ctx),
+        WinApiId::Kernel32Loadlibraryw => kernel32::handle_load_library_w(ctx),
+        WinApiId::Kernel32Freelibrary => kernel32::handle_free_library(ctx),
+        WinApiId::Kernel32Getprocaddress => kernel32::handle_get_proc_address(ctx),
+        WinApiId::Kernel32Getfileattributesa => kernel32::handle_get_file_attributes_a(ctx),
+        WinApiId::Kernel32Getfileattributesw => kernel32::handle_get_file_attributes_w(ctx),
+        WinApiId::Kernel32Findfirstfilew => kernel32::handle_find_first_file_w(ctx),
+        WinApiId::Kernel32Findfirstfilea => kernel32::handle_find_first_file_a(ctx),
+        WinApiId::Kernel32Findnextfilew => kernel32::handle_find_next_file_w(ctx),
+        WinApiId::Kernel32Findnextfilea => kernel32::handle_find_next_file_a(ctx),
+        WinApiId::Kernel32Findclose => kernel32::handle_find_close(ctx),
+        WinApiId::User32Getasynckeystate => user32::handle_get_async_key_state(ctx),
+        WinApiId::User32Peekmessagea => user32::handle_peek_message_a(ctx),
+        WinApiId::Kernel32Loadlibraryexa => kernel32::handle_load_library_ex_a(ctx),
+        WinApiId::Kernel32Loadlibraryexw => kernel32::handle_load_library_ex_w(ctx),
+        WinApiId::Kernel32Findresourcea => kernel32::handle_find_resource_a(ctx),
+        WinApiId::Kernel32Loadresource => kernel32::handle_load_resource(ctx),
+        WinApiId::Kernel32Lockresource => kernel32::handle_lock_resource(ctx),
+        WinApiId::Kernel32Sizeofresource => kernel32::handle_sizeof_resource(ctx),
         WinApiId::Kernel32Getsystemdefaultlangid => {
-            kernel32::handle_get_system_default_lang_id(engine)
+            kernel32::handle_get_system_default_lang_id(ctx)
         }
-        WinApiId::Kernel32Getuserdefaultlangid => kernel32::handle_get_user_default_lang_id(engine),
-        WinApiId::Kernel32Globalmemorystatus => kernel32::handle_global_memory_status(engine),
-        WinApiId::Kernel32Getlocaltime => kernel32::handle_get_local_time(engine),
-        WinApiId::User32Loadicona => user32::handle_load_icon_a(engine),
-        WinApiId::User32Loadcursora => user32::handle_load_cursor_a(engine),
-        WinApiId::User32Registerclassexw => user32::handle_register_class_ex_w(engine, state),
-        WinApiId::User32Registerclassexa => user32::handle_register_class_ex_a(engine, state),
-        WinApiId::Kernel32Createfilew => kernel32::handle_create_file_w(engine, state),
-        WinApiId::Kernel32Createfilea => kernel32::handle_create_file_a(engine, state),
-        WinApiId::Kernel32Closehandle => kernel32::handle_close_handle(engine, state),
-        WinApiId::User32Messageboxw => user32::handle_message_box_w(engine),
-        WinApiId::User32Messageboxa => user32::handle_message_box_a(engine),
+        WinApiId::Kernel32Getuserdefaultlangid => kernel32::handle_get_user_default_lang_id(ctx),
+        WinApiId::Kernel32Globalmemorystatus => kernel32::handle_global_memory_status(ctx),
+        WinApiId::Kernel32Getlocaltime => kernel32::handle_get_local_time(ctx),
+        WinApiId::User32Loadicona => user32::handle_load_icon_a(ctx),
+        WinApiId::User32Loadcursora => user32::handle_load_cursor_a(ctx),
+        WinApiId::User32Registerclassexw => user32::handle_register_class_ex_w(ctx),
+        WinApiId::User32Registerclassexa => user32::handle_register_class_ex_a(ctx),
+        WinApiId::Kernel32Createfilew => kernel32::handle_create_file_w(ctx),
+        WinApiId::Kernel32Createfilea => kernel32::handle_create_file_a(ctx),
+        WinApiId::Kernel32Closehandle => kernel32::handle_close_handle(ctx),
+        WinApiId::User32Messageboxw => user32::handle_message_box_w(ctx),
+        WinApiId::User32Messageboxa => user32::handle_message_box_a(ctx),
         WinApiId::Kernel32Getfileinformationbyhandle => {
-            kernel32::handle_get_file_information_by_handle(engine, state)
+            kernel32::handle_get_file_information_by_handle(ctx)
         }
         WinApiId::Kernel32Filetimetolocalfiletime => {
-            kernel32::handle_file_time_to_local_file_time(engine, state)
+            kernel32::handle_file_time_to_local_file_time(ctx)
         }
-        WinApiId::Kernel32Filetimetosystemtime => {
-            kernel32::handle_file_time_to_system_time(engine, state)
-        }
-        WinApiId::Kernel32Gettimezoneinformation => {
-            kernel32::handle_get_time_zone_information(engine, state)
-        }
-        WinApiId::Kernel32Getfiletime => kernel32::handle_get_file_time(engine, state),
-        WinApiId::Kernel32Setfilepointer => kernel32::handle_set_file_pointer(engine, state),
-        WinApiId::Kernel32Getfilesize => kernel32::handle_get_file_size(engine, state),
-        WinApiId::Kernel32Encodepointer => kernel32::handle_encode_pointer(engine),
-        WinApiId::Kernel32Decodepointer => kernel32::handle_decode_pointer(engine),
+        WinApiId::Kernel32Filetimetosystemtime => kernel32::handle_file_time_to_system_time(ctx),
+        WinApiId::Kernel32Gettimezoneinformation => kernel32::handle_get_time_zone_information(ctx),
+        WinApiId::Kernel32Getfiletime => kernel32::handle_get_file_time(ctx),
+        WinApiId::Kernel32Setfilepointer => kernel32::handle_set_file_pointer(ctx),
+        WinApiId::Kernel32Getfilesize => kernel32::handle_get_file_size(ctx),
+        WinApiId::Kernel32Encodepointer => kernel32::handle_encode_pointer(ctx),
+        WinApiId::Kernel32Decodepointer => kernel32::handle_decode_pointer(ctx),
         WinApiId::Kernel32Initializecriticalsectionandspincount => {
-            kernel32::handle_initialize_critical_section_and_spin_count(engine)
+            kernel32::handle_initialize_critical_section_and_spin_count(ctx)
         }
-        WinApiId::User32Setprocessdpiaware => user32::handle_set_process_dpi_aware(engine),
-        WinApiId::User32Trackmouseevent => user32::handle_track_mouse_event(engine),
-        WinApiId::Comctl32Dllgetversion => comctl32::handle_dll_get_version(engine),
-        WinApiId::Kernel32Readfile => kernel32::handle_read_file(engine, state),
-        WinApiId::Kernel32Writefile => kernel32::handle_write_file(engine, state),
-        WinApiId::User32Getcursorpos => user32::handle_get_cursor_pos(engine),
-        WinApiId::User32Getsystemmetrics => user32::handle_get_system_metrics(engine),
-        WinApiId::User32Monitorfromwindow => user32::handle_monitor_from_window(engine),
-        WinApiId::User32Getmonitorinfoa => user32::handle_get_monitor_info_a(engine),
-        WinApiId::User32Getmonitorinfow => user32::handle_get_monitor_info_w(engine),
-        WinApiId::User32Enumdisplaymonitors => user32::handle_enum_display_monitors(engine),
-        WinApiId::User32Enumdisplaydevicesa => user32::handle_enum_display_devices_a(engine),
-        WinApiId::User32Enumdisplaydevicesw => user32::handle_enum_display_devices_w(engine),
-        WinApiId::User32Monitorfrompoint => user32::handle_monitor_from_point(engine),
-        WinApiId::Comctl32Ordinal17 => comctl32::handle_init_common_controls(engine),
-        WinApiId::User32Getwindowrect => user32::handle_get_window_rect(engine, state),
-        WinApiId::User32Getdpiforwindow => user32::handle_get_dpi_for_window(engine),
-        WinApiId::User32Postmessagea => user32::handle_post_message_a(engine, state),
-        WinApiId::User32Getsystemmetricsfordpi => user32::handle_get_system_metrics_for_dpi(engine),
+        WinApiId::User32Setprocessdpiaware => user32::handle_set_process_dpi_aware(ctx),
+        WinApiId::User32Trackmouseevent => user32::handle_track_mouse_event(ctx),
+        WinApiId::Comctl32Dllgetversion => comctl32::handle_dll_get_version(ctx),
+        WinApiId::Kernel32Readfile => kernel32::handle_read_file(ctx),
+        WinApiId::Kernel32Writefile => kernel32::handle_write_file(ctx),
+        WinApiId::User32Getcursorpos => user32::handle_get_cursor_pos(ctx),
+        WinApiId::User32Getsystemmetrics => user32::handle_get_system_metrics(ctx),
+        WinApiId::User32Monitorfromwindow => user32::handle_monitor_from_window(ctx),
+        WinApiId::User32Getmonitorinfoa => user32::handle_get_monitor_info_a(ctx),
+        WinApiId::User32Getmonitorinfow => user32::handle_get_monitor_info_w(ctx),
+        WinApiId::User32Enumdisplaymonitors => user32::handle_enum_display_monitors(ctx),
+        WinApiId::User32Enumdisplaydevicesa => user32::handle_enum_display_devices_a(ctx),
+        WinApiId::User32Enumdisplaydevicesw => user32::handle_enum_display_devices_w(ctx),
+        WinApiId::User32Monitorfrompoint => user32::handle_monitor_from_point(ctx),
+        WinApiId::Comctl32Ordinal17 => comctl32::handle_init_common_controls(ctx),
+        WinApiId::User32Getwindowrect => user32::handle_get_window_rect(ctx),
+        WinApiId::User32Getdpiforwindow => user32::handle_get_dpi_for_window(ctx),
+        WinApiId::User32Postmessagea => user32::handle_post_message_a(ctx),
+        WinApiId::User32Getsystemmetricsfordpi => user32::handle_get_system_metrics_for_dpi(ctx),
         WinApiId::User32Adjustwindowrectexfordpi => {
-            user32::handle_adjust_window_rect_ex_for_dpi(engine)
+            user32::handle_adjust_window_rect_ex_for_dpi(ctx)
         }
-        WinApiId::User32Setwindowpos => user32::handle_set_window_pos(engine),
-        WinApiId::User32Setscrollinfo => user32::handle_set_scroll_info(engine),
-        WinApiId::User32Scrollwindowex => user32::handle_scroll_window_ex(engine),
-        WinApiId::User32Scrolldc => user32::handle_scroll_dc(engine),
-        WinApiId::User32Beginpaint => user32::handle_begin_paint(engine, state),
-        WinApiId::User32Endpaint => user32::handle_end_paint(engine, state),
-        WinApiId::User32Clipcursor => user32::handle_clip_cursor(engine),
-        WinApiId::User32Getclipcursor => user32::handle_get_clip_cursor(engine),
-        WinApiId::User32Callmsgfiltera => user32::handle_call_msg_filter(engine, "CallMsgFilterA"),
-        WinApiId::User32Callmsgfilterw => user32::handle_call_msg_filter(engine, "CallMsgFilterW"),
-        WinApiId::User32Getdc => user32::handle_get_dc(engine),
-        WinApiId::User32Sendmessagea => user32::handle_send_message_a(engine, state),
-        WinApiId::User32Sendmessagew => user32::handle_send_message_w(engine, state),
-        WinApiId::Comdlg32Getopenfilenamea => comdlg32::handle_get_open_file_name_a(engine, state),
-        WinApiId::Comdlg32Getopenfilenamew => comdlg32::handle_get_open_file_name_w(engine, state),
-        WinApiId::Comdlg32Getsavefilenamea => comdlg32::handle_get_save_file_name_a(engine, state),
-        WinApiId::Comdlg32Getsavefilenamew => comdlg32::handle_get_save_file_name_w(engine, state),
-        WinApiId::Comdlg32Commdlgextendederror => {
-            comdlg32::handle_comm_dlg_extended_error(engine, state)
-        }
-        WinApiId::Comdlg32Choosecolora => comdlg32::handle_choose_color_a(engine, state),
-        WinApiId::Gdi32Selectobject => gdi32::handle_select_object(engine),
-        WinApiId::Gdi32Gettextextentpoint32a => gdi32::handle_get_text_extent_point_32_a(engine),
-        WinApiId::Gdi32Gettextextentpoint32w => gdi32::handle_get_text_extent_point_32_w(engine),
-        WinApiId::Gdi32Exttextoutw => gdi32::handle_ext_text_out_w(engine),
-        WinApiId::User32Releasedc => user32::handle_release_dc(engine),
-        WinApiId::Kernel32Getcurrentdirectoryw => {
-            kernel32::handle_get_current_directory_w(engine, state)
-        }
-        WinApiId::Kernel32Setcurrentdirectoryw => {
-            kernel32::handle_set_current_directory_w(engine, state)
-        }
-        WinApiId::User32Loadimagea => user32::handle_load_image_a(engine),
-        WinApiId::User32Loadimagew => user32::handle_load_image_w(engine),
-        WinApiId::Comctl32Initcommoncontrolsex => comctl32::handle_init_common_controls_ex(engine),
-        WinApiId::UxthemeSetwindowtheme => uxtheme::handle_set_window_theme(engine),
-        WinApiId::User32Setwindowlongptrw => user32::handle_set_window_long_ptr_w(engine, state),
-        WinApiId::User32Getwindowlongptra => user32::handle_get_window_long_ptr_a(engine, state),
-        WinApiId::User32Getwindowlongptrw => user32::handle_get_window_long_ptr_w(engine, state),
-        WinApiId::Gdi32Getobjecta => gdi32::handle_get_object_a(engine),
-        WinApiId::Comctl32ImagelistCreate => comctl32::handle_image_list_create(engine, state),
-        WinApiId::Gdi32Createcompatibledc => gdi32::handle_create_compatible_dc(engine),
-        WinApiId::Gdi32Createdibsection => gdi32::handle_create_dib_section(engine, state),
-        WinApiId::Gdi32Createcompatiblebitmap => {
-            gdi32::handle_create_compatible_bitmap(engine, state)
-        }
-        WinApiId::Gdi32Getdevicecaps => gdi32::handle_get_device_caps(engine),
-        WinApiId::Gdi32Createfonta => gdi32::handle_create_font_a(engine, state),
-        WinApiId::Gdi32Createfontw => gdi32::handle_create_font_w(engine, state),
-        WinApiId::Gdi32Createfontindirecta => gdi32::handle_create_font_indirect_a(engine, state),
-        WinApiId::Gdi32Gettextmetricsa => gdi32::handle_get_text_metrics_a(engine),
-        WinApiId::Gdi32Settextcolor => gdi32::handle_set_text_color(engine),
-        WinApiId::Gdi32Setbkcolor => gdi32::handle_set_bk_color(engine),
-        WinApiId::Gdi32Setbkmode => gdi32::handle_set_bk_mode(engine),
-        WinApiId::Gdi32Textouta => gdi32::handle_text_out_a(engine),
-        WinApiId::Gdi32Bitblt => gdi32::handle_bit_blt(engine),
-        WinApiId::Gdi32Stretchblt => gdi32::handle_stretch_blt(engine),
-        WinApiId::Gdi32Patblt => gdi32::handle_pat_blt(engine),
-        WinApiId::Gdi32Getpixel => gdi32::handle_get_pixel(engine),
-        WinApiId::Gdi32Deletedc => gdi32::handle_delete_dc(engine),
-        WinApiId::Comctl32ImagelistAddmasked => {
-            comctl32::handle_image_list_add_masked(engine, state)
-        }
-        WinApiId::Comctl32ImagelistSetbkcolor => {
-            comctl32::handle_image_list_set_bk_color(engine, state)
-        }
-        WinApiId::Comctl32ImagelistDestroy => comctl32::handle_image_list_destroy(engine, state),
-        WinApiId::Gdi32Deleteobject => gdi32::handle_delete_object(engine),
-        WinApiId::User32Destroyicon => user32::handle_destroy_icon(engine),
-        WinApiId::User32Iswindow => user32::handle_is_window(engine),
-        WinApiId::User32Iswindowvisible => user32::handle_is_window_visible(engine),
-        WinApiId::User32Iswindowenabled => user32::handle_is_window_enabled(engine),
-        WinApiId::User32Getparent => user32::handle_get_parent(engine),
-        WinApiId::User32Getactivewindow => user32::handle_get_active_window(engine, state),
-        WinApiId::User32Getforegroundwindow => user32::handle_get_foreground_window(engine, state),
-        WinApiId::User32Showwindow => user32::handle_show_window(engine, state),
-        WinApiId::User32Enablewindow => user32::handle_enable_window(engine, state),
-        WinApiId::User32Setforegroundwindow => user32::handle_set_foreground_window(engine, state),
-        WinApiId::User32Setactivewindow => user32::handle_set_active_window(engine, state),
-        WinApiId::User32Setfocus => user32::handle_set_focus(engine, state),
-        WinApiId::User32Getfocus => user32::handle_get_focus(engine, state),
-        WinApiId::User32Setcapture => user32::handle_set_capture(engine, state),
-        WinApiId::User32Getcapture => user32::handle_get_capture(engine, state),
-        WinApiId::User32Releasecapture => user32::handle_release_capture(engine, state),
-        WinApiId::User32Setcursor => user32::handle_set_cursor(engine, state),
-        WinApiId::User32Updatewindow => user32::handle_update_window(engine, state),
-        WinApiId::User32Invalidaterect => user32::handle_invalidate_rect(engine, state),
-        WinApiId::User32Redrawwindow => user32::handle_redraw_window(engine, state),
-        WinApiId::User32Setwindowtexta => user32::handle_set_window_text_a(engine, state),
-        WinApiId::User32Setwindowtextw => user32::handle_set_window_text_w(engine, state),
-        WinApiId::User32Getwindowtexta => user32::handle_get_window_text_a(engine, state),
-        WinApiId::User32Getwindowtextw => user32::handle_get_window_text_w(engine, state),
-        WinApiId::User32Getclientrect => user32::handle_get_client_rect(engine, state),
-        WinApiId::User32Movewindow => user32::handle_move_window(engine, state),
-        WinApiId::User32Screentoclient => user32::handle_screen_to_client(engine, state),
-        WinApiId::User32Clienttoscreen => user32::handle_client_to_screen(engine, state),
-        WinApiId::User32Getdesktopwindow => user32::handle_get_desktop_window(engine),
-        WinApiId::User32Getsyscolor => user32::handle_get_sys_color(engine),
-        WinApiId::User32Getsyscolorbrush => user32::handle_get_sys_color_brush(engine),
-        WinApiId::User32Getdialogbaseunits => user32::handle_get_dialog_base_units(engine),
-        WinApiId::User32Setrect => user32::handle_set_rect(engine),
-        WinApiId::User32Isiconic => user32::handle_is_iconic(engine),
-        WinApiId::User32Iszoomed => user32::handle_is_zoomed(engine),
+        WinApiId::User32Setwindowpos => user32::handle_set_window_pos(ctx),
+        WinApiId::User32Setscrollinfo => user32::handle_set_scroll_info(ctx),
+        WinApiId::User32Scrollwindowex => user32::handle_scroll_window_ex(ctx),
+        WinApiId::User32Scrolldc => user32::handle_scroll_dc(ctx),
+        WinApiId::User32Beginpaint => user32::handle_begin_paint(ctx),
+        WinApiId::User32Endpaint => user32::handle_end_paint(ctx),
+        WinApiId::User32Clipcursor => user32::handle_clip_cursor(ctx),
+        WinApiId::User32Getclipcursor => user32::handle_get_clip_cursor(ctx),
+        WinApiId::User32Callmsgfiltera => user32::handle_call_msg_filter(ctx, "CallMsgFilterA"),
+        WinApiId::User32Callmsgfilterw => user32::handle_call_msg_filter(ctx, "CallMsgFilterW"),
+        WinApiId::User32Getdc => user32::handle_get_dc(ctx),
+        WinApiId::User32Sendmessagea => user32::handle_send_message_a(ctx),
+        WinApiId::User32Sendmessagew => user32::handle_send_message_w(ctx),
+        WinApiId::Comdlg32Getopenfilenamea => comdlg32::handle_get_open_file_name_a(ctx),
+        WinApiId::Comdlg32Getopenfilenamew => comdlg32::handle_get_open_file_name_w(ctx),
+        WinApiId::Comdlg32Getsavefilenamea => comdlg32::handle_get_save_file_name_a(ctx),
+        WinApiId::Comdlg32Getsavefilenamew => comdlg32::handle_get_save_file_name_w(ctx),
+        WinApiId::Comdlg32Commdlgextendederror => comdlg32::handle_comm_dlg_extended_error(ctx),
+        WinApiId::Comdlg32Choosecolora => comdlg32::handle_choose_color_a(ctx),
+        WinApiId::Gdi32Selectobject => gdi32::handle_select_object(ctx),
+        WinApiId::Gdi32Gettextextentpoint32a => gdi32::handle_get_text_extent_point_32_a(ctx),
+        WinApiId::Gdi32Gettextextentpoint32w => gdi32::handle_get_text_extent_point_32_w(ctx),
+        WinApiId::Gdi32Exttextoutw => gdi32::handle_ext_text_out_w(ctx),
+        WinApiId::User32Releasedc => user32::handle_release_dc(ctx),
+        WinApiId::Kernel32Getcurrentdirectoryw => kernel32::handle_get_current_directory_w(ctx),
+        WinApiId::Kernel32Setcurrentdirectoryw => kernel32::handle_set_current_directory_w(ctx),
+        WinApiId::User32Loadimagea => user32::handle_load_image_a(ctx),
+        WinApiId::User32Loadimagew => user32::handle_load_image_w(ctx),
+        WinApiId::Comctl32Initcommoncontrolsex => comctl32::handle_init_common_controls_ex(ctx),
+        WinApiId::UxthemeSetwindowtheme => uxtheme::handle_set_window_theme(ctx),
+        WinApiId::User32Setwindowlongptrw => user32::handle_set_window_long_ptr_w(ctx),
+        WinApiId::User32Getwindowlongptra => user32::handle_get_window_long_ptr_a(ctx),
+        WinApiId::User32Getwindowlongptrw => user32::handle_get_window_long_ptr_w(ctx),
+        WinApiId::Gdi32Getobjecta => gdi32::handle_get_object_a(ctx),
+        WinApiId::Comctl32ImagelistCreate => comctl32::handle_image_list_create(ctx),
+        WinApiId::Gdi32Createcompatibledc => gdi32::handle_create_compatible_dc(ctx),
+        WinApiId::Gdi32Createdibsection => gdi32::handle_create_dib_section(ctx),
+        WinApiId::Gdi32Createcompatiblebitmap => gdi32::handle_create_compatible_bitmap(ctx),
+        WinApiId::Gdi32Getdevicecaps => gdi32::handle_get_device_caps(ctx),
+        WinApiId::Gdi32Createfonta => gdi32::handle_create_font_a(ctx),
+        WinApiId::Gdi32Createfontw => gdi32::handle_create_font_w(ctx),
+        WinApiId::Gdi32Createfontindirecta => gdi32::handle_create_font_indirect_a(ctx),
+        WinApiId::Gdi32Gettextmetricsa => gdi32::handle_get_text_metrics_a(ctx),
+        WinApiId::Gdi32Settextcolor => gdi32::handle_set_text_color(ctx),
+        WinApiId::Gdi32Setbkcolor => gdi32::handle_set_bk_color(ctx),
+        WinApiId::Gdi32Setbkmode => gdi32::handle_set_bk_mode(ctx),
+        WinApiId::Gdi32Textouta => gdi32::handle_text_out_a(ctx),
+        WinApiId::Gdi32Bitblt => gdi32::handle_bit_blt(ctx),
+        WinApiId::Gdi32Stretchblt => gdi32::handle_stretch_blt(ctx),
+        WinApiId::Gdi32Patblt => gdi32::handle_pat_blt(ctx),
+        WinApiId::Gdi32Getpixel => gdi32::handle_get_pixel(ctx),
+        WinApiId::Gdi32Deletedc => gdi32::handle_delete_dc(ctx),
+        WinApiId::Comctl32ImagelistAddmasked => comctl32::handle_image_list_add_masked(ctx),
+        WinApiId::Comctl32ImagelistSetbkcolor => comctl32::handle_image_list_set_bk_color(ctx),
+        WinApiId::Comctl32ImagelistDestroy => comctl32::handle_image_list_destroy(ctx),
+        WinApiId::Gdi32Deleteobject => gdi32::handle_delete_object(ctx),
+        WinApiId::User32Destroyicon => user32::handle_destroy_icon(ctx),
+        WinApiId::User32Iswindow => user32::handle_is_window(ctx),
+        WinApiId::User32Iswindowvisible => user32::handle_is_window_visible(ctx),
+        WinApiId::User32Iswindowenabled => user32::handle_is_window_enabled(ctx),
+        WinApiId::User32Getparent => user32::handle_get_parent(ctx),
+        WinApiId::User32Getactivewindow => user32::handle_get_active_window(ctx),
+        WinApiId::User32Getforegroundwindow => user32::handle_get_foreground_window(ctx),
+        WinApiId::User32Showwindow => user32::handle_show_window(ctx),
+        WinApiId::User32Enablewindow => user32::handle_enable_window(ctx),
+        WinApiId::User32Setforegroundwindow => user32::handle_set_foreground_window(ctx),
+        WinApiId::User32Setactivewindow => user32::handle_set_active_window(ctx),
+        WinApiId::User32Setfocus => user32::handle_set_focus(ctx),
+        WinApiId::User32Getfocus => user32::handle_get_focus(ctx),
+        WinApiId::User32Setcapture => user32::handle_set_capture(ctx),
+        WinApiId::User32Getcapture => user32::handle_get_capture(ctx),
+        WinApiId::User32Releasecapture => user32::handle_release_capture(ctx),
+        WinApiId::User32Setcursor => user32::handle_set_cursor(ctx),
+        WinApiId::User32Updatewindow => user32::handle_update_window(ctx),
+        WinApiId::User32Invalidaterect => user32::handle_invalidate_rect(ctx),
+        WinApiId::User32Redrawwindow => user32::handle_redraw_window(ctx),
+        WinApiId::User32Setwindowtexta => user32::handle_set_window_text_a(ctx),
+        WinApiId::User32Setwindowtextw => user32::handle_set_window_text_w(ctx),
+        WinApiId::User32Getwindowtexta => user32::handle_get_window_text_a(ctx),
+        WinApiId::User32Getwindowtextw => user32::handle_get_window_text_w(ctx),
+        WinApiId::User32Getclientrect => user32::handle_get_client_rect(ctx),
+        WinApiId::User32Movewindow => user32::handle_move_window(ctx),
+        WinApiId::User32Screentoclient => user32::handle_screen_to_client(ctx),
+        WinApiId::User32Clienttoscreen => user32::handle_client_to_screen(ctx),
+        WinApiId::User32Getdesktopwindow => user32::handle_get_desktop_window(ctx),
+        WinApiId::User32Getsyscolor => user32::handle_get_sys_color(ctx),
+        WinApiId::User32Getsyscolorbrush => user32::handle_get_sys_color_brush(ctx),
+        WinApiId::User32Getdialogbaseunits => user32::handle_get_dialog_base_units(ctx),
+        WinApiId::User32Setrect => user32::handle_set_rect(ctx),
+        WinApiId::User32Isiconic => user32::handle_is_iconic(ctx),
+        WinApiId::User32Iszoomed => user32::handle_is_zoomed(ctx),
         WinApiId::User32Getwindowthreadprocessid => {
-            user32::handle_get_window_thread_process_id(engine)
+            user32::handle_get_window_thread_process_id(ctx)
         }
-        WinApiId::User32Getdlgctrlid => user32::handle_get_dlg_ctrl_id(engine),
-        WinApiId::Kernel32Getcurrentprocess => kernel32::handle_get_current_process(engine),
-        WinApiId::Kernel32Sleep => kernel32::handle_sleep(engine),
-        WinApiId::WinmmTimegettime => winmm::handle_time_get_time(engine, state),
-        WinApiId::Kernel32Localalloc => kernel32::handle_local_alloc(engine, state),
-        WinApiId::Kernel32Localfree => kernel32::handle_local_free(engine, state),
-        WinApiId::Kernel32Globalalloc => kernel32::handle_global_alloc(engine, state),
-        WinApiId::Kernel32Globalfree => kernel32::handle_global_free(engine, state),
-        WinApiId::Kernel32Globallock => kernel32::handle_global_lock(engine, state),
-        WinApiId::Kernel32Globalunlock => kernel32::handle_global_unlock(engine, state),
-        WinApiId::Kernel32Globalsize => kernel32::handle_global_size(engine, state),
-        WinApiId::Kernel32Muldiv => kernel32::handle_mul_div(engine),
-        WinApiId::User32Getcursor => user32::handle_get_cursor(engine, state),
-        WinApiId::User32Ischild => user32::handle_is_child(engine),
-        WinApiId::User32Getwindow => user32::handle_get_window(engine),
-        WinApiId::User32Setkeyboardstate => user32::handle_set_keyboard_state(engine, state),
-        WinApiId::User32Getkeyboardstate => user32::handle_get_keyboard_state(engine, state),
-        WinApiId::User32Getkeystate => user32::handle_get_key_state(engine, state),
-        WinApiId::User32Mapvirtualkeya => user32::handle_map_virtual_key_a(engine),
-        WinApiId::User32Setwindowlongptra => user32::handle_set_window_long_ptr_a(engine, state),
-        WinApiId::User32Settimer => user32::handle_set_timer(engine, state),
-        WinApiId::User32Killtimer => user32::handle_kill_timer(engine, state),
-        WinApiId::User32Adjustwindowrectex => user32::handle_adjust_window_rect_ex(engine),
-        WinApiId::Kernel32Globaladdatoma => kernel32::handle_global_add_atom_a(engine, state),
-        WinApiId::Kernel32Globaldeleteatom => kernel32::handle_global_delete_atom(engine, state),
-        WinApiId::User32Setwindowshookexw => user32::handle_set_windows_hook_ex_w(engine, state),
-        WinApiId::User32Unhookwindowshookex => user32::handle_unhook_windows_hook_ex(engine, state),
-        WinApiId::User32Callnexthookex => user32::handle_call_next_hook_ex(engine),
-        WinApiId::Kernel32Getfullpathnamew => kernel32::handle_get_full_path_name_w(engine, state),
-        WinApiId::Kernel32Getfullpathnamea => kernel32::handle_get_full_path_name_a(engine, state),
-        WinApiId::Kernel32Getcurrentdirectorya => {
-            kernel32::handle_get_current_directory_a(engine, state)
-        }
-        WinApiId::Kernel32Setcurrentdirectorya => {
-            kernel32::handle_set_current_directory_a(engine, state)
-        }
-        WinApiId::Kernel32Createdirectoryw => kernel32::handle_create_directory_w(engine, state),
-        WinApiId::Kernel32Createdirectorya => kernel32::handle_create_directory_a(engine, state),
-        WinApiId::Kernel32Removefirectoryw => kernel32::handle_remove_directory_w(engine, state),
-        WinApiId::Kernel32Removefirectorya => kernel32::handle_remove_directory_a(engine, state),
-        WinApiId::Kernel32Deletefilew => kernel32::handle_delete_file_w(engine, state),
-        WinApiId::Kernel32Deletefilea => kernel32::handle_delete_file_a(engine, state),
-        WinApiId::Kernel32Movefilew => kernel32::handle_move_file_w(engine, state),
-        WinApiId::Kernel32Movefilea => kernel32::handle_move_file_a(engine, state),
-        WinApiId::Kernel32Gettemppathw => kernel32::handle_get_temp_path_w(engine, state),
-        WinApiId::Kernel32Gettemppatha => kernel32::handle_get_temp_path_a(engine, state),
-        WinApiId::Kernel32Gettempfilenamew => kernel32::handle_get_temp_file_name_w(engine, state),
-        WinApiId::Kernel32Gettempfilenamea => kernel32::handle_get_temp_file_name_a(engine, state),
-        WinApiId::Kernel32Getdrivetypew => kernel32::handle_get_drive_type_w(engine, state),
-        WinApiId::Kernel32Getdrivetypea => kernel32::handle_get_drive_type_a(engine, state),
-        WinApiId::Kernel32Getlogicaldrives => kernel32::handle_get_logical_drives(engine, state),
-        WinApiId::Kernel32Getsystemdirectoryw => kernel32::handle_get_system_directory_w(engine),
-        WinApiId::Kernel32Getsystemdirectorya => kernel32::handle_get_system_directory_a(engine),
-        WinApiId::Kernel32Getwindowsdirectoryw => kernel32::handle_get_windows_directory_w(engine),
-        WinApiId::Kernel32Getwindowsdirectorya => kernel32::handle_get_windows_directory_a(engine),
-        WinApiId::Kernel32Getfilesizeex => kernel32::handle_get_file_size_ex(engine, state),
-        WinApiId::Kernel32Setfilepointerex => kernel32::handle_set_file_pointer_ex(engine, state),
-        WinApiId::Kernel32Setendoffile => kernel32::handle_set_end_of_file(engine, state),
-        WinApiId::Kernel32Flushfilebuffers => kernel32::handle_flush_file_buffers(engine, state),
-        WinApiId::D3d9Direct3dcreate9 => d3d9::handle_direct3d_create9(engine, state),
-        WinApiId::D3d9Idirect3d9Getadaptercount => d3d9::handle_get_adapter_count(engine),
-        WinApiId::D3d9Idirect3d9Getadaptermonitor => d3d9::handle_get_adapter_monitor(engine),
-        WinApiId::D3d9Idirect3d9Getdevicecaps => d3d9::handle_get_device_caps(engine),
-        WinApiId::D3d9Idirect3d9Getadapterdisplaymode => {
-            d3d9::handle_get_adapter_display_mode(engine, state)
-        }
-        WinApiId::D3d9Idirect3d9Createdevice => d3d9::handle_create_device(engine, state),
-        WinApiId::D3d9Idirect3ddevice9Setvertexshader => {
-            d3d9::handle_set_vertex_shader(engine, state)
-        }
-        WinApiId::D3d9Idirect3ddevice9Setfvf => d3d9::handle_set_fvf(engine, state),
-        WinApiId::D3d9Idirect3ddevice9Setrenderstate => {
-            d3d9::handle_set_render_state(engine, state)
-        }
+        WinApiId::User32Getdlgctrlid => user32::handle_get_dlg_ctrl_id(ctx),
+        WinApiId::Kernel32Getcurrentprocess => kernel32::handle_get_current_process(ctx),
+        WinApiId::Kernel32Sleep => kernel32::handle_sleep(ctx),
+        WinApiId::WinmmTimegettime => winmm::handle_time_get_time(ctx),
+        WinApiId::Kernel32Localalloc => kernel32::handle_local_alloc(ctx),
+        WinApiId::Kernel32Localfree => kernel32::handle_local_free(ctx),
+        WinApiId::Kernel32Globalalloc => kernel32::handle_global_alloc(ctx),
+        WinApiId::Kernel32Globalfree => kernel32::handle_global_free(ctx),
+        WinApiId::Kernel32Globallock => kernel32::handle_global_lock(ctx),
+        WinApiId::Kernel32Globalunlock => kernel32::handle_global_unlock(ctx),
+        WinApiId::Kernel32Globalsize => kernel32::handle_global_size(ctx),
+        WinApiId::Kernel32Muldiv => kernel32::handle_mul_div(ctx),
+        WinApiId::User32Getcursor => user32::handle_get_cursor(ctx),
+        WinApiId::User32Ischild => user32::handle_is_child(ctx),
+        WinApiId::User32Getwindow => user32::handle_get_window(ctx),
+        WinApiId::User32Setkeyboardstate => user32::handle_set_keyboard_state(ctx),
+        WinApiId::User32Getkeyboardstate => user32::handle_get_keyboard_state(ctx),
+        WinApiId::User32Getkeystate => user32::handle_get_key_state(ctx),
+        WinApiId::User32Mapvirtualkeya => user32::handle_map_virtual_key_a(ctx),
+        WinApiId::User32Setwindowlongptra => user32::handle_set_window_long_ptr_a(ctx),
+        WinApiId::User32Settimer => user32::handle_set_timer(ctx),
+        WinApiId::User32Killtimer => user32::handle_kill_timer(ctx),
+        WinApiId::User32Adjustwindowrectex => user32::handle_adjust_window_rect_ex(ctx),
+        WinApiId::Kernel32Globaladdatoma => kernel32::handle_global_add_atom_a(ctx),
+        WinApiId::Kernel32Globaldeleteatom => kernel32::handle_global_delete_atom(ctx),
+        WinApiId::User32Setwindowshookexw => user32::handle_set_windows_hook_ex_w(ctx),
+        WinApiId::User32Unhookwindowshookex => user32::handle_unhook_windows_hook_ex(ctx),
+        WinApiId::User32Callnexthookex => user32::handle_call_next_hook_ex(ctx),
+        WinApiId::Kernel32Getfullpathnamew => kernel32::handle_get_full_path_name_w(ctx),
+        WinApiId::Kernel32Getfullpathnamea => kernel32::handle_get_full_path_name_a(ctx),
+        WinApiId::Kernel32Getcurrentdirectorya => kernel32::handle_get_current_directory_a(ctx),
+        WinApiId::Kernel32Setcurrentdirectorya => kernel32::handle_set_current_directory_a(ctx),
+        WinApiId::Kernel32Createdirectoryw => kernel32::handle_create_directory_w(ctx),
+        WinApiId::Kernel32Createdirectorya => kernel32::handle_create_directory_a(ctx),
+        WinApiId::Kernel32Removefirectoryw => kernel32::handle_remove_directory_w(ctx),
+        WinApiId::Kernel32Removefirectorya => kernel32::handle_remove_directory_a(ctx),
+        WinApiId::Kernel32Deletefilew => kernel32::handle_delete_file_w(ctx),
+        WinApiId::Kernel32Deletefilea => kernel32::handle_delete_file_a(ctx),
+        WinApiId::Kernel32Movefilew => kernel32::handle_move_file_w(ctx),
+        WinApiId::Kernel32Movefilea => kernel32::handle_move_file_a(ctx),
+        WinApiId::Kernel32Gettemppathw => kernel32::handle_get_temp_path_w(ctx),
+        WinApiId::Kernel32Gettemppatha => kernel32::handle_get_temp_path_a(ctx),
+        WinApiId::Kernel32Gettempfilenamew => kernel32::handle_get_temp_file_name_w(ctx),
+        WinApiId::Kernel32Gettempfilenamea => kernel32::handle_get_temp_file_name_a(ctx),
+        WinApiId::Kernel32Getdrivetypew => kernel32::handle_get_drive_type_w(ctx),
+        WinApiId::Kernel32Getdrivetypea => kernel32::handle_get_drive_type_a(ctx),
+        WinApiId::Kernel32Getlogicaldrives => kernel32::handle_get_logical_drives(ctx),
+        WinApiId::Kernel32Getsystemdirectoryw => kernel32::handle_get_system_directory_w(ctx),
+        WinApiId::Kernel32Getsystemdirectorya => kernel32::handle_get_system_directory_a(ctx),
+        WinApiId::Kernel32Getwindowsdirectoryw => kernel32::handle_get_windows_directory_w(ctx),
+        WinApiId::Kernel32Getwindowsdirectorya => kernel32::handle_get_windows_directory_a(ctx),
+        WinApiId::Kernel32Getfilesizeex => kernel32::handle_get_file_size_ex(ctx),
+        WinApiId::Kernel32Setfilepointerex => kernel32::handle_set_file_pointer_ex(ctx),
+        WinApiId::Kernel32Setendoffile => kernel32::handle_set_end_of_file(ctx),
+        WinApiId::Kernel32Flushfilebuffers => kernel32::handle_flush_file_buffers(ctx),
+        WinApiId::D3d9Direct3dcreate9 => d3d9::handle_direct3d_create9(ctx),
+        WinApiId::D3d9Idirect3d9Getadaptercount => d3d9::handle_get_adapter_count(ctx),
+        WinApiId::D3d9Idirect3d9Getadaptermonitor => d3d9::handle_get_adapter_monitor(ctx),
+        WinApiId::D3d9Idirect3d9Getdevicecaps => d3d9::handle_get_device_caps(ctx),
+        WinApiId::D3d9Idirect3d9Getadapterdisplaymode => d3d9::handle_get_adapter_display_mode(ctx),
+        WinApiId::D3d9Idirect3d9Createdevice => d3d9::handle_create_device(ctx),
+        WinApiId::D3d9Idirect3ddevice9Setvertexshader => d3d9::handle_set_vertex_shader(ctx),
+        WinApiId::D3d9Idirect3ddevice9Setfvf => d3d9::handle_set_fvf(ctx),
+        WinApiId::D3d9Idirect3ddevice9Setrenderstate => d3d9::handle_set_render_state(ctx),
         WinApiId::D3d9Idirect3ddevice9Settexturestagestate => {
-            d3d9::handle_set_texture_stage_state(engine, state)
+            d3d9::handle_set_texture_stage_state(ctx)
         }
-        WinApiId::D3d9Idirect3ddevice9Setsamplerstate => {
-            d3d9::handle_set_sampler_state(engine, state)
-        }
-        WinApiId::User32Enablemenuitem => user32::handle_enable_menu_item(engine, state),
-        WinApiId::User32Checkmenuitem => user32::handle_check_menu_item(engine, state),
-        WinApiId::User32Getmessagea => user32::handle_get_message_a(engine, state),
-        WinApiId::User32Translatemessage => user32::handle_translate_message(engine),
-        WinApiId::User32Defwindowproca => user32::handle_def_window_proc_a(engine),
-        WinApiId::User32Defwindowprocw => user32::handle_def_window_proc_w(engine),
-        WinApiId::User32Defframeproca => user32::handle_def_frame_proc_a(engine),
-        WinApiId::User32Defframeprocw => user32::handle_def_frame_proc_w(engine),
-        WinApiId::User32Defmdichildproca => user32::handle_def_mdi_child_proc_a(engine),
-        WinApiId::User32Defmdichildprocw => user32::handle_def_mdi_child_proc_w(engine),
-        WinApiId::User32Createmenu => user32::handle_create_menu(engine, state),
-        WinApiId::User32Createpopupmenu => user32::handle_create_popup_menu(engine, state),
-        WinApiId::User32Appendmenua => user32::handle_append_menu_a(engine),
-        WinApiId::User32Appendmenuw => user32::handle_append_menu_w(engine),
-        WinApiId::User32Setmenu => user32::handle_set_menu(engine),
-        WinApiId::User32Destroymenu => user32::handle_destroy_menu(engine),
-        WinApiId::User32Removemenu => user32::handle_remove_menu(engine),
-        WinApiId::User32Deletemenu => user32::handle_delete_menu(engine),
-        WinApiId::User32Modifymenua => user32::handle_modify_menu_a(engine),
-        WinApiId::User32Modifymenuw => user32::handle_modify_menu_w(engine),
-        WinApiId::User32Getsystemmenu => user32::handle_get_system_menu(engine, state),
-        WinApiId::User32Trackpopupmenu => user32::handle_track_popup_menu(engine),
-        WinApiId::User32Getmenuiteminfoa => user32::handle_get_menu_item_info_a(engine),
-        WinApiId::User32Getmenuiteminfow => user32::handle_get_menu_item_info_w(engine),
-        WinApiId::User32Setmenuiteminfoa => user32::handle_set_menu_item_info_a(engine),
-        WinApiId::User32Setmenuiteminfow => user32::handle_set_menu_item_info_w(engine),
-        WinApiId::User32Checkmenuradioitem => user32::handle_check_menu_radio_item(engine),
-        WinApiId::User32Dispatchmessagea => user32::handle_dispatch_message_a(engine, state),
-        WinApiId::D3d9Idirect3ddevice9Release => d3d9::handle_device_release(engine, state),
-        WinApiId::D3d9Idirect3d9Release => d3d9::handle_direct3d9_release(engine, state),
-        WinApiId::User32Getmenu => user32::handle_get_menu(engine, state),
-        WinApiId::Gdi32Getstockobject => gdi32::handle_get_stock_object(engine),
+        WinApiId::D3d9Idirect3ddevice9Setsamplerstate => d3d9::handle_set_sampler_state(ctx),
+        WinApiId::User32Enablemenuitem => user32::handle_enable_menu_item(ctx),
+        WinApiId::User32Checkmenuitem => user32::handle_check_menu_item(ctx),
+        WinApiId::User32Getmessagea => user32::handle_get_message_a(ctx),
+        WinApiId::User32Translatemessage => user32::handle_translate_message(ctx),
+        WinApiId::User32Defwindowproca => user32::handle_def_window_proc_a(ctx),
+        WinApiId::User32Defwindowprocw => user32::handle_def_window_proc_w(ctx),
+        WinApiId::User32Defframeproca => user32::handle_def_frame_proc_a(ctx),
+        WinApiId::User32Defframeprocw => user32::handle_def_frame_proc_w(ctx),
+        WinApiId::User32Defmdichildproca => user32::handle_def_mdi_child_proc_a(ctx),
+        WinApiId::User32Defmdichildprocw => user32::handle_def_mdi_child_proc_w(ctx),
+        WinApiId::User32Createmenu => user32::handle_create_menu(ctx),
+        WinApiId::User32Createpopupmenu => user32::handle_create_popup_menu(ctx),
+        WinApiId::User32Appendmenua => user32::handle_append_menu_a(ctx),
+        WinApiId::User32Appendmenuw => user32::handle_append_menu_w(ctx),
+        WinApiId::User32Setmenu => user32::handle_set_menu(ctx),
+        WinApiId::User32Destroymenu => user32::handle_destroy_menu(ctx),
+        WinApiId::User32Removemenu => user32::handle_remove_menu(ctx),
+        WinApiId::User32Deletemenu => user32::handle_delete_menu(ctx),
+        WinApiId::User32Modifymenua => user32::handle_modify_menu_a(ctx),
+        WinApiId::User32Modifymenuw => user32::handle_modify_menu_w(ctx),
+        WinApiId::User32Getsystemmenu => user32::handle_get_system_menu(ctx),
+        WinApiId::User32Trackpopupmenu => user32::handle_track_popup_menu(ctx),
+        WinApiId::User32Getmenuiteminfoa => user32::handle_get_menu_item_info_a(ctx),
+        WinApiId::User32Getmenuiteminfow => user32::handle_get_menu_item_info_w(ctx),
+        WinApiId::User32Setmenuiteminfoa => user32::handle_set_menu_item_info_a(ctx),
+        WinApiId::User32Setmenuiteminfow => user32::handle_set_menu_item_info_w(ctx),
+        WinApiId::User32Checkmenuradioitem => user32::handle_check_menu_radio_item(ctx),
+        WinApiId::User32Dispatchmessagea => user32::handle_dispatch_message_a(ctx),
+        WinApiId::D3d9Idirect3ddevice9Release => d3d9::handle_device_release(ctx),
+        WinApiId::D3d9Idirect3d9Release => d3d9::handle_direct3d9_release(ctx),
+        WinApiId::User32Getmenu => user32::handle_get_menu(ctx),
+        WinApiId::Gdi32Getstockobject => gdi32::handle_get_stock_object(ctx),
     }
 }
 

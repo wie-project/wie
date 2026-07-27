@@ -1,17 +1,16 @@
 use super::{
     Context, FAKE_DESKTOP_WINDOW_HANDLE, FAKE_PROCESS_ID, FAKE_SYSTEM_COLOR_BRUSH_BASE,
-    FAKE_THREAD_ID, FAKE_WINDOW_HANDLE, Result, WinApiHandlerResult, WinApiState, WindowRecord,
-    checked_field_address, get_window_long_ptr_value, is_known_window, low_i32,
+    FAKE_THREAD_ID, FAKE_WINDOW_HANDLE, HandlerContext, Result, WinApiHandlerResult, WinApiState,
+    WindowRecord, checked_field_address, get_window_long_ptr_value, is_known_window, low_i32,
     read_guest_ansi_lossy, read_guest_i32, read_guest_u64, read_guest_utf16_lossy,
     set_window_long_ptr_value, window_client_size, write_ansi_window_text, write_guest_i32,
     write_guest_u32, write_wide_window_text, write_window_rect,
 };
 
 /// Handles `USER32.dll!GetWindowRect`.
-pub fn handle_get_window_rect(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_window_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for GetWindowRect")?;
@@ -50,9 +49,8 @@ pub fn handle_get_window_rect(
     })
 }
 /// Handles dynamic `USER32.dll!GetDpiForWindow`.
-pub fn handle_get_dpi_for_window(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_dpi_for_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _window_handle = engine
         .read_rcx()
         .context("failed to read RCX for GetDpiForWindow")?;
@@ -71,8 +69,9 @@ pub fn handle_get_dpi_for_window(
 }
 /// Handles dynamic `USER32.dll!AdjustWindowRectExForDpi`.
 pub fn handle_adjust_window_rect_ex_for_dpi(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let rect_ptr = engine
         .read_rcx()
         .context("failed to read RCX for AdjustWindowRectExForDpi")?;
@@ -103,7 +102,8 @@ pub fn handle_adjust_window_rect_ex_for_dpi(
     })
 }
 /// Handles `USER32.dll!SetWindowPos`.
-pub fn handle_set_window_pos(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_set_window_pos(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _window_handle = engine
         .read_rcx()
         .context("failed to read RCX for SetWindowPos")?;
@@ -135,10 +135,9 @@ pub fn handle_set_window_pos(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinA
     })
 }
 /// Handles `USER32.dll!SetWindowLongPtrW`.
-pub fn handle_set_window_long_ptr_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_window_long_ptr_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for SetWindowLongPtrW")?;
@@ -169,7 +168,8 @@ pub fn handle_set_window_long_ptr_w(
     })
 }
 /// Handles `USER32.dll!IsWindow`.
-pub fn handle_is_window(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_is_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for IsWindow")?;
@@ -186,9 +186,8 @@ pub fn handle_is_window(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHan
     })
 }
 /// Handles `USER32.dll!IsWindowVisible`.
-pub fn handle_is_window_visible(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_is_window_visible(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for IsWindowVisible")?;
@@ -205,9 +204,8 @@ pub fn handle_is_window_visible(
     })
 }
 /// Handles `USER32.dll!IsWindowEnabled`.
-pub fn handle_is_window_enabled(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_is_window_enabled(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for IsWindowEnabled")?;
@@ -224,7 +222,8 @@ pub fn handle_is_window_enabled(
     })
 }
 /// Handles `USER32.dll!GetParent`.
-pub fn handle_get_parent(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_get_parent(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _window_handle = engine
         .read_rcx()
         .context("failed to read RCX for GetParent")?;
@@ -242,10 +241,9 @@ pub fn handle_get_parent(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHa
     })
 }
 /// Handles `USER32.dll!GetActiveWindow`.
-pub fn handle_get_active_window(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_active_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let return_value = state.window_state.active_window_handle;
 
     let return_address = engine
@@ -258,10 +256,9 @@ pub fn handle_get_active_window(
     })
 }
 /// Handles `USER32.dll!GetForegroundWindow`.
-pub fn handle_get_foreground_window(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_foreground_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let return_value = state.window_state.foreground_window_handle;
 
     let return_address = engine
@@ -274,10 +271,9 @@ pub fn handle_get_foreground_window(
     })
 }
 /// Handles `USER32.dll!ShowWindow`.
-pub fn handle_show_window(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_show_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for ShowWindow")?;
@@ -306,10 +302,9 @@ pub fn handle_show_window(
     })
 }
 /// Handles `USER32.dll!EnableWindow`.
-pub fn handle_enable_window(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_enable_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for EnableWindow")?;
@@ -337,10 +332,9 @@ pub fn handle_enable_window(
     })
 }
 /// Handles `USER32.dll!SetForegroundWindow`.
-pub fn handle_set_foreground_window(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_foreground_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for SetForegroundWindow")?;
@@ -364,10 +358,9 @@ pub fn handle_set_foreground_window(
     })
 }
 /// Handles `USER32.dll!SetActiveWindow`.
-pub fn handle_set_active_window(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_active_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for SetActiveWindow")?;
@@ -388,10 +381,9 @@ pub fn handle_set_active_window(
     })
 }
 /// Handles `USER32.dll!SetFocus`.
-pub fn handle_set_focus(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_focus(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for SetFocus")?;
@@ -412,10 +404,9 @@ pub fn handle_set_focus(
     })
 }
 /// Handles `USER32.dll!GetFocus`.
-pub fn handle_get_focus(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_focus(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let return_value = state.window_state.focus_window_handle;
 
     let return_address = engine
@@ -428,10 +419,9 @@ pub fn handle_get_focus(
     })
 }
 /// Handles `USER32.dll!SetCapture`.
-pub fn handle_set_capture(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_capture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for SetCapture")?;
@@ -452,10 +442,9 @@ pub fn handle_set_capture(
     })
 }
 /// Handles `USER32.dll!GetCapture`.
-pub fn handle_get_capture(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_capture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let return_value = state.window_state.capture_window_handle;
 
     let return_address = engine
@@ -468,10 +457,9 @@ pub fn handle_get_capture(
     })
 }
 /// Handles `USER32.dll!ReleaseCapture`.
-pub fn handle_release_capture(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_release_capture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     state.window_state.capture_window_handle = 0;
 
     let return_value = 1;
@@ -486,10 +474,9 @@ pub fn handle_release_capture(
     })
 }
 /// Handles `USER32.dll!UpdateWindow`.
-pub fn handle_update_window(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_update_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for UpdateWindow")?;
@@ -512,10 +499,9 @@ pub fn handle_update_window(
     })
 }
 /// Handles `USER32.dll!InvalidateRect`.
-pub fn handle_invalidate_rect(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_invalidate_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for InvalidateRect")?;
@@ -546,10 +532,9 @@ pub fn handle_invalidate_rect(
     })
 }
 /// Handles `USER32.dll!RedrawWindow`.
-pub fn handle_redraw_window(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_redraw_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for RedrawWindow")?;
@@ -584,10 +569,9 @@ pub fn handle_redraw_window(
     })
 }
 /// Handles `USER32.dll!SetWindowTextA`.
-pub fn handle_set_window_text_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_window_text_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for SetWindowTextA")?;
@@ -615,10 +599,9 @@ pub fn handle_set_window_text_a(
     })
 }
 /// Handles `USER32.dll!SetWindowTextW`.
-pub fn handle_set_window_text_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_window_text_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for SetWindowTextW")?;
@@ -646,10 +629,9 @@ pub fn handle_set_window_text_w(
     })
 }
 /// Handles `USER32.dll!GetWindowTextA`.
-pub fn handle_get_window_text_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_window_text_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for GetWindowTextA")?;
@@ -683,10 +665,9 @@ pub fn handle_get_window_text_a(
     })
 }
 /// Handles `USER32.dll!GetWindowTextW`.
-pub fn handle_get_window_text_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_window_text_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for GetWindowTextW")?;
@@ -720,10 +701,9 @@ pub fn handle_get_window_text_w(
     })
 }
 /// Handles `USER32.dll!GetClientRect`.
-pub fn handle_get_client_rect(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_client_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for GetClientRect")?;
@@ -751,10 +731,9 @@ pub fn handle_get_client_rect(
     })
 }
 /// Handles `USER32.dll!MoveWindow`.
-pub fn handle_move_window(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_move_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for MoveWindow")?;
@@ -811,10 +790,9 @@ pub fn handle_move_window(
     })
 }
 /// Handles `USER32.dll!ScreenToClient`.
-pub fn handle_screen_to_client(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_screen_to_client(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for ScreenToClient")?;
@@ -856,10 +834,9 @@ pub fn handle_screen_to_client(
     })
 }
 /// Handles `USER32.dll!ClientToScreen`.
-pub fn handle_client_to_screen(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_client_to_screen(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for ClientToScreen")?;
@@ -901,9 +878,8 @@ pub fn handle_client_to_screen(
     })
 }
 /// Handles `USER32.dll!GetDesktopWindow`.
-pub fn handle_get_desktop_window(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_desktop_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let return_address = engine
         .return_from_win64_api(FAKE_DESKTOP_WINDOW_HANDLE)
         .context("failed to return from GetDesktopWindow")?;
@@ -914,7 +890,8 @@ pub fn handle_get_desktop_window(
     })
 }
 /// Handles `USER32.dll!GetSysColor`.
-pub fn handle_get_sys_color(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_get_sys_color(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let color_index = engine
         .read_rcx()
         .context("failed to read RCX for GetSysColor")?;
@@ -966,9 +943,8 @@ pub fn handle_get_sys_color(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinAp
     })
 }
 /// Handles `USER32.dll!GetSysColorBrush`.
-pub fn handle_get_sys_color_brush(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_sys_color_brush(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let color_index = engine
         .read_rcx()
         .context("failed to read RCX for GetSysColorBrush")?;
@@ -987,7 +963,8 @@ pub fn handle_get_sys_color_brush(
     })
 }
 /// Handles `USER32.dll!SetRect`.
-pub fn handle_set_rect(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_set_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let rect_ptr = engine
         .read_rcx()
         .context("failed to read RCX for SetRect")?;
@@ -1035,7 +1012,8 @@ pub fn handle_set_rect(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHand
     })
 }
 /// Handles `USER32.dll!IsIconic`.
-pub fn handle_is_iconic(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_is_iconic(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _window_handle = engine
         .read_rcx()
         .context("failed to read RCX for IsIconic")?;
@@ -1052,7 +1030,8 @@ pub fn handle_is_iconic(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHan
     })
 }
 /// Handles `USER32.dll!IsZoomed`.
-pub fn handle_is_zoomed(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_is_zoomed(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _window_handle = engine
         .read_rcx()
         .context("failed to read RCX for IsZoomed")?;
@@ -1070,8 +1049,9 @@ pub fn handle_is_zoomed(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHan
 }
 /// Handles `USER32.dll!GetWindowThreadProcessId`.
 pub fn handle_get_window_thread_process_id(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for GetWindowThreadProcessId")?;
@@ -1099,7 +1079,8 @@ pub fn handle_get_window_thread_process_id(
     })
 }
 /// Handles `USER32.dll!GetDlgCtrlID`.
-pub fn handle_get_dlg_ctrl_id(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_get_dlg_ctrl_id(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for GetDlgCtrlID")?;
@@ -1121,7 +1102,8 @@ pub fn handle_get_dlg_ctrl_id(engine: &mut dyn wie_cpu::CpuEngine) -> Result<Win
     })
 }
 /// Handles `USER32.dll!IsChild`.
-pub fn handle_is_child(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_is_child(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _parent_handle = engine
         .read_rcx()
         .context("failed to read RCX for IsChild")?;
@@ -1142,7 +1124,8 @@ pub fn handle_is_child(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHand
     })
 }
 /// Handles `USER32.dll!GetWindow`.
-pub fn handle_get_window(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_get_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _window_handle = engine
         .read_rcx()
         .context("failed to read RCX for GetWindow")?;
@@ -1163,10 +1146,9 @@ pub fn handle_get_window(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHa
     })
 }
 /// Handles `USER32.dll!GetWindowLongPtrA`.
-pub fn handle_get_window_long_ptr_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_window_long_ptr_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for GetWindowLongPtrA")?;
@@ -1187,10 +1169,9 @@ pub fn handle_get_window_long_ptr_a(
     })
 }
 /// Handles `USER32.dll!GetWindowLongPtrW`.
-pub fn handle_get_window_long_ptr_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_window_long_ptr_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for GetWindowLongPtrW")?;
@@ -1211,10 +1192,9 @@ pub fn handle_get_window_long_ptr_w(
     })
 }
 /// Handles `USER32.dll!SetWindowLongPtrA`.
-pub fn handle_set_window_long_ptr_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_window_long_ptr_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for SetWindowLongPtrA")?;
@@ -1245,9 +1225,8 @@ pub fn handle_set_window_long_ptr_a(
     })
 }
 /// Handles `USER32.dll!AdjustWindowRectEx`.
-pub fn handle_adjust_window_rect_ex(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_adjust_window_rect_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let rect_ptr = engine
         .read_rcx()
         .context("failed to read RCX for AdjustWindowRectEx")?;
@@ -1321,7 +1300,8 @@ pub fn handle_adjust_window_rect_ex(
     })
 }
 /// Handles `USER32.dll!ScrollWindowEx` (no-op success stub).
-pub fn handle_scroll_window_ex(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_scroll_window_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _hwnd = engine
         .read_rcx()
         .context("failed to read RCX for ScrollWindowEx")?;

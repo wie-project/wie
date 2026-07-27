@@ -1,6 +1,6 @@
 use super::{
     Context, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICE_PRIMARY_DEVICE,
-    FAKE_MONITOR_HANDLE, Result, WinApiHandlerResult, checked_field_address,
+    FAKE_MONITOR_HANDLE, HandlerContext, Result, WinApiHandlerResult, checked_field_address,
     write_guest_fixed_ansi, write_guest_fixed_utf16, write_guest_i32, write_guest_u32,
 };
 
@@ -121,9 +121,8 @@ pub(crate) fn fake_system_metric(metric_index: u64) -> u64 {
     }
 }
 /// Handles `USER32.dll!GetSystemMetrics`.
-pub fn handle_get_system_metrics(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_system_metrics(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let metric_index = engine
         .read_rcx()
         .context("failed to read RCX for GetSystemMetrics")?;
@@ -140,9 +139,8 @@ pub fn handle_get_system_metrics(
     })
 }
 /// Handles dynamic `USER32.dll!MonitorFromWindow`.
-pub fn handle_monitor_from_window(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_monitor_from_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _window_handle = engine
         .read_rcx()
         .context("failed to read RCX for MonitorFromWindow")?;
@@ -161,9 +159,8 @@ pub fn handle_monitor_from_window(
     })
 }
 /// Handles dynamic `USER32.dll!GetMonitorInfoA`.
-pub fn handle_get_monitor_info_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_monitor_info_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let monitor_handle = engine
         .read_rcx()
         .context("failed to read RCX for GetMonitorInfoA")?;
@@ -190,9 +187,8 @@ pub fn handle_get_monitor_info_a(
     })
 }
 /// Handles dynamic `USER32.dll!GetMonitorInfoW`.
-pub fn handle_get_monitor_info_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_monitor_info_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let monitor_handle = engine
         .read_rcx()
         .context("failed to read RCX for GetMonitorInfoW")?;
@@ -219,9 +215,8 @@ pub fn handle_get_monitor_info_w(
     })
 }
 /// Handles dynamic `USER32.dll!MonitorFromRect`.
-pub fn handle_monitor_from_rect(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_monitor_from_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _rect_ptr = engine
         .read_rcx()
         .context("failed to read RCX for MonitorFromRect")?;
@@ -240,9 +235,8 @@ pub fn handle_monitor_from_rect(
     })
 }
 /// Handles dynamic `USER32.dll!MonitorFromPoint`.
-pub fn handle_monitor_from_point(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_monitor_from_point(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _point_low = engine
         .read_rcx()
         .context("failed to read RCX for MonitorFromPoint")?;
@@ -261,9 +255,8 @@ pub fn handle_monitor_from_point(
     })
 }
 /// Handles dynamic `USER32.dll!EnumDisplayMonitors`.
-pub fn handle_enum_display_monitors(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_enum_display_monitors(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _device_context = engine
         .read_rcx()
         .context("failed to read RCX for EnumDisplayMonitors")?;
@@ -296,9 +289,8 @@ pub fn handle_enum_display_monitors(
     })
 }
 /// Handles dynamic `USER32.dll!EnumDisplayDevicesA`.
-pub fn handle_enum_display_devices_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_enum_display_devices_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _device_name_ptr = engine
         .read_rcx()
         .context("failed to read RCX for EnumDisplayDevicesA")?;
@@ -374,9 +366,8 @@ pub fn handle_enum_display_devices_a(
     })
 }
 /// Handles dynamic `USER32.dll!EnumDisplayDevicesW`.
-pub fn handle_enum_display_devices_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_enum_display_devices_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _device_name_ptr = engine
         .read_rcx()
         .context("failed to read RCX for EnumDisplayDevicesW")?;
@@ -464,8 +455,9 @@ pub(crate) fn scale_system_metric_for_dpi(base_value: u64, dpi: u64) -> Result<u
 }
 /// Handles dynamic `USER32.dll!GetSystemMetricsForDpi`.
 pub fn handle_get_system_metrics_for_dpi(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let metric_index = engine
         .read_rcx()
         .context("failed to read RCX for GetSystemMetricsForDpi")?;

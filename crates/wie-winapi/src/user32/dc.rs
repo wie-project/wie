@@ -1,10 +1,11 @@
 use super::{
-    Context, FAKE_DEVICE_CONTEXT_HANDLE, Result, WinApiHandlerResult, WinApiState,
+    Context, FAKE_DEVICE_CONTEXT_HANDLE, HandlerContext, Result, WinApiHandlerResult,
     checked_field_address, write_guest_i32, write_guest_u32, write_guest_u64,
 };
 
 /// Handles `USER32.dll!GetDC`.
-pub fn handle_get_dc(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_get_dc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _window_handle = engine.read_rcx().context("failed to read RCX for GetDC")?;
 
     let return_address = engine
@@ -17,7 +18,8 @@ pub fn handle_get_dc(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandle
     })
 }
 /// Handles `USER32.dll!ReleaseDC`.
-pub fn handle_release_dc(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_release_dc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _window_handle = engine
         .read_rcx()
         .context("failed to read RCX for ReleaseDC")?;
@@ -39,10 +41,9 @@ pub fn handle_release_dc(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHa
     })
 }
 /// Handles `USER32.dll!BeginPaint`.
-pub fn handle_begin_paint(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_begin_paint(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for BeginPaint")?;
@@ -109,10 +110,9 @@ pub fn handle_begin_paint(
     })
 }
 /// Handles `USER32.dll!EndPaint`.
-pub fn handle_end_paint(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_end_paint(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for EndPaint")?;
@@ -137,7 +137,8 @@ pub fn handle_end_paint(
     })
 }
 /// Handles `USER32.dll!ScrollDC` (no-op success stub; no real pixel scroll).
-pub fn handle_scroll_dc(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_scroll_dc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _hdc = engine
         .read_rcx()
         .context("failed to read RCX for ScrollDC")?;

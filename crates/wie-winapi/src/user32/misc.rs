@@ -1,13 +1,14 @@
 use super::{
     Context, DIALOG_BASE_UNIT_X, DIALOG_BASE_UNIT_Y, FAKE_CURSOR_HANDLE, FAKE_ICON_HANDLE,
-    FAKE_IMAGE_HANDLE, FAKE_WINDOW_HANDLE, IDOK, Result, TimerRecord, WinApiHandlerResult,
-    WinApiState, WindowClassRecord, WindowsHookRecord, checked_field_address, low_i32,
-    read_guest_ansi_lossy, read_guest_i32, read_guest_u32, read_guest_u64, read_guest_utf16_lossy,
-    register_window_class,
+    FAKE_IMAGE_HANDLE, FAKE_WINDOW_HANDLE, HandlerContext, IDOK, Result, TimerRecord,
+    WinApiHandlerResult, WinApiState, WindowClassRecord, WindowsHookRecord, checked_field_address,
+    low_i32, read_guest_ansi_lossy, read_guest_i32, read_guest_u32, read_guest_u64,
+    read_guest_utf16_lossy, register_window_class,
 };
 
 /// Handles `USER32.dll!LoadIconA`.
-pub fn handle_load_icon_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_load_icon_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _instance_handle = engine
         .read_rcx()
         .context("failed to read RCX for LoadIconA")?;
@@ -26,7 +27,8 @@ pub fn handle_load_icon_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiH
     })
 }
 /// Handles `USER32.dll!LoadCursorA`.
-pub fn handle_load_cursor_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_load_cursor_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _instance_handle = engine
         .read_rcx()
         .context("failed to read RCX for LoadCursorA")?;
@@ -45,10 +47,9 @@ pub fn handle_load_cursor_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinAp
     })
 }
 /// Handles `USER32.dll!RegisterClassExW`.
-pub fn handle_register_class_ex_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_register_class_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_class_ptr = engine
         .read_rcx()
         .context("failed to read RCX for RegisterClassExW")?;
@@ -150,10 +151,9 @@ pub fn handle_register_class_ex_w(
     })
 }
 /// Handles `USER32.dll!RegisterClassExA`.
-pub fn handle_register_class_ex_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_register_class_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_class_ptr = engine
         .read_rcx()
         .context("failed to read RCX for RegisterClassExA")?;
@@ -239,7 +239,8 @@ pub fn handle_register_class_ex_a(
     })
 }
 /// Handles `USER32.dll!MessageBoxW`.
-pub fn handle_message_box_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_message_box_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _window_handle = engine
         .read_rcx()
         .context("failed to read RCX for MessageBoxW")?;
@@ -276,7 +277,8 @@ pub fn handle_message_box_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinAp
     })
 }
 /// Handles `USER32.dll!MessageBoxA`.
-pub fn handle_message_box_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_message_box_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _window_handle = engine
         .read_rcx()
         .context("failed to read RCX for MessageBoxA")?;
@@ -311,9 +313,8 @@ pub fn handle_message_box_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinAp
     })
 }
 /// Handles dynamic `USER32.dll!SetProcessDPIAware`.
-pub fn handle_set_process_dpi_aware(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_process_dpi_aware(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let return_address = engine
         .return_from_win64_api(1)
         .context("failed to return from SetProcessDPIAware")?;
@@ -324,17 +325,18 @@ pub fn handle_set_process_dpi_aware(
     })
 }
 /// Handles `USER32.dll!LoadImageA`.
-pub fn handle_load_image_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    handle_load_image(engine, "LoadImageA")
+pub fn handle_load_image_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_load_image(ctx, "LoadImageA")
 }
 /// Handles `USER32.dll!LoadImageW`.
-pub fn handle_load_image_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    handle_load_image(engine, "LoadImageW")
+pub fn handle_load_image_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_load_image(ctx, "LoadImageW")
 }
 pub(crate) fn handle_load_image(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
     api_name: &str,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _instance_handle = engine
         .read_rcx()
         .with_context(|| format!("failed to read RCX for {api_name}"))?;
@@ -363,7 +365,8 @@ pub(crate) fn handle_load_image(
     })
 }
 /// Handles `USER32.dll!DestroyIcon`.
-pub fn handle_destroy_icon(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_destroy_icon(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let icon_handle = engine
         .read_rcx()
         .context("failed to read RCX for DestroyIcon")?;
@@ -380,9 +383,8 @@ pub fn handle_destroy_icon(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApi
     })
 }
 /// Handles `USER32.dll!GetDialogBaseUnits`.
-pub fn handle_get_dialog_base_units(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_dialog_base_units(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let return_value = u64::from(DIALOG_BASE_UNIT_X | (DIALOG_BASE_UNIT_Y << 16));
 
     let return_address = engine
@@ -395,10 +397,9 @@ pub fn handle_get_dialog_base_units(
     })
 }
 /// Handles `USER32.dll!SetTimer`.
-pub fn handle_set_timer(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_timer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for SetTimer")?;
@@ -464,10 +465,9 @@ pub fn handle_set_timer(
     })
 }
 /// Handles `USER32.dll!KillTimer`.
-pub fn handle_kill_timer(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_kill_timer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for KillTimer")?;
@@ -501,10 +501,9 @@ pub fn handle_kill_timer(
     })
 }
 /// Handles `USER32.dll!SetWindowsHookExW`.
-pub fn handle_set_windows_hook_ex_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_windows_hook_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let hook_type_raw = engine
         .read_rcx()
         .context("failed to read RCX for SetWindowsHookExW")?;
@@ -559,10 +558,9 @@ pub fn handle_set_windows_hook_ex_w(
     })
 }
 /// Handles `USER32.dll!UnhookWindowsHookEx`.
-pub fn handle_unhook_windows_hook_ex(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_unhook_windows_hook_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let hook_handle = engine
         .read_rcx()
         .context("failed to read RCX for UnhookWindowsHookEx")?;
@@ -592,7 +590,8 @@ pub fn handle_unhook_windows_hook_ex(
     })
 }
 /// Handles `USER32.dll!SetScrollInfo`.
-pub fn handle_set_scroll_info(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+pub fn handle_set_scroll_info(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for SetScrollInfo")?;
