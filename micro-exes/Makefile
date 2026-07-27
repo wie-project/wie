@@ -10,9 +10,9 @@ LDFLAGS  := -nostdlib -Wl,--subsystem,console -Wl,--entry,entry
 # Ordinary CRT-linked apps (independent-style): full toolchain defaults.
 CRT_CFLAGS := -O2
 
-.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths
+.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention
 
-all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths
+all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention
 
 $(OUT):
 	mkdir -p $(OUT)
@@ -40,6 +40,7 @@ interlocked_basic: $(OUT)/interlocked_basic.exe
 mt_stress: $(OUT)/mt_stress.exe
 vfs_roundtrip: $(OUT)/vfs_roundtrip.exe
 rep_lengths: $(OUT)/rep_lengths.exe
+mt_contention: $(OUT)/mt_contention.exe
 
 $(OUT)/heap_alloc.exe: heap_alloc/main.c | $(OUT)
 	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32
@@ -129,6 +130,16 @@ $(OUT)/mt_stress.exe: mt_stress/main.c | $(OUT)
 
 $(OUT)/vfs_roundtrip.exe: vfs_roundtrip/main.c | $(OUT)
 	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32
+	@echo "built $@"
+
+# Multi-threaded contention + guest-memory benchmark (argv-configurable).
+#
+# `-fno-tree-vectorize`: the point is to measure *scalar* guest load/store
+# traffic through the JIT's sticky/TLB/pin paths. Letting GCC turn the byte
+# loops into SSE2 (paddd, punpcklbw) would both change what is measured and
+# depend on packed-integer ops the iced interpreter does not implement.
+$(OUT)/mt_contention.exe: mt_contention/main.c | $(OUT)
+	$(MINGW_CC) $(CFLAGS) -fno-tree-vectorize $(LDFLAGS) -o $@ $< -lkernel32
 	@echo "built $@"
 
 # REP MOVS/STOS length sweep. Guards the JIT inline-REP tail handling; must be
