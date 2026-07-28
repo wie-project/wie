@@ -188,8 +188,32 @@ pub struct D3D9State {
     pub d3d9_ref_count: u32,
 }
 
-/// Window, UI, and input state.
+/// Wrapper for the 256-byte keyboard state array. Exists so [`WindowState`]
+/// can use `#[derive(Default)]` — bare `[u8; 256]` does not implement `Default`.
 #[derive(Debug, Clone)]
+pub struct KeyboardState(pub [u8; 256]);
+
+impl Default for KeyboardState {
+    fn default() -> Self {
+        Self([0; 256])
+    }
+}
+
+impl std::ops::Deref for KeyboardState {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for KeyboardState {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+}
+
+/// Window, UI, and input state.
+#[derive(Debug, Clone, Default)]
 pub struct WindowState {
     pub window_long_ptr_values: Vec<(u64, i64, u64)>,
     pub image_list_counts: Vec<(u64, u64)>,
@@ -208,7 +232,7 @@ pub struct WindowState {
     pub window_height: i32,
     pub window_invalidated: bool,
     pub tick_count: u64,
-    pub keyboard_state: [u8; 256],
+    pub keyboard_state: KeyboardState,
     pub next_timer_id: u64,
     pub timers: Vec<TimerRecord>,
     pub next_global_atom: u16,
@@ -228,52 +252,6 @@ pub struct WindowState {
     pub last_file_dialog_path: Option<String>,
     pub comm_dlg_extended_error: u32,
     pub next_menu_handle: u64,
-}
-
-// Manual Default because `[u8; 256]` does not implement `Default` on stable
-// (only arrays up to 32 elements get the trait).
-impl Default for WindowState {
-    fn default() -> Self {
-        Self {
-            window_long_ptr_values: Vec::new(),
-            image_list_counts: Vec::new(),
-            image_list_background_colors: Vec::new(),
-            window_visible: false,
-            window_enabled: false,
-            active_window_handle: 0,
-            foreground_window_handle: 0,
-            focus_window_handle: 0,
-            capture_window_handle: 0,
-            cursor_handle: 0,
-            window_title: String::new(),
-            window_x: 0,
-            window_y: 0,
-            window_width: 0,
-            window_height: 0,
-            window_invalidated: false,
-            tick_count: 0,
-            keyboard_state: [0; 256],
-            next_timer_id: 0,
-            timers: Vec::new(),
-            next_global_atom: 0,
-            global_atoms: Vec::new(),
-            next_windows_hook_handle: 0,
-            windows_hooks: Vec::new(),
-            menu_item_states: Vec::new(),
-            menu_item_check_states: Vec::new(),
-            message_queue: Vec::new(),
-            next_message_time: 0,
-            message_queue_idle_policy: MessageQueueIdlePolicy::ExitOnIdle,
-            next_window_class_atom: 0,
-            window_classes: Vec::new(),
-            next_window_handle: 0,
-            windows: Vec::new(),
-            file_dialog_policy: FileDialogPolicy::Cancel,
-            last_file_dialog_path: None,
-            comm_dlg_extended_error: 0,
-            next_menu_handle: 0,
-        }
-    }
 }
 
 /// Process-level state (identity, error handling, registry, misc).
@@ -343,17 +321,16 @@ pub struct KernelState {
 ///
 /// # Adding a new DLL
 ///
-/// 1. Add a variant here (e.g. `Ws2_32`).
-/// 2. Bump [`DllId::COUNT`] by 1.
-/// 3. Add an accessor on [`WinApiState`] (e.g. `pub fn ws2_32(&mut self) -> &mut Ws2_32State`).
-/// 4. Add the type to the slot-name mapping in [`DllStateMap::slot_name`]
-///    and to the `Clone` impl's array literal.
+/// 1. Add a variant here.
+/// 2. Add a `None` to the array in [`DllStateMap::new`].
+/// 3. Add a match arm to [`DllStateMap::slot_of`].
+/// 4. Add an accessor on [`WinApiState`].
 ///
-/// That is the entire change — no `WinApiState` field, no `Clone`/`Debug`
-/// boilerplate on the struct, no construction-site edits, no handler migration.
-/// This is the only file you need to touch for a new DLL state.
+/// That is the entire change. One file, four lines.
+/// [`DllId::COUNT`] is derived from the number of variants and must match
+/// the `new()` array — the compile-time assertion at [`DLL_ID_SLOT_COUNT`]
+/// catches mismatches.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u8)]
 pub enum DllId {
     Console,
     Window,
@@ -362,7 +339,8 @@ pub enum DllId {
 }
 
 impl DllId {
-    /// Number of variants. Update when adding a new one.
+    /// Number of variants. The assertion at [`DLL_ID_SLOT_COUNT`] ensures
+    /// it stays in sync with the slot array in [`DllStateMap::new`].
     pub const COUNT: usize = 4;
 }
 
@@ -377,14 +355,15 @@ impl DllId {
 ///
 /// # Adding a new DLL (alongside [`DllId`])
 ///
-/// The `new()` and `Debug` impls hardcode the slot list.
-/// When you add a [`DllId`] variant:
-///
-/// - Add the new slot to `slots: [None, None, None, None, None]` in `new()`.
-/// - Add the new slot to the `Debug` match in `slot_name()`.
+/// Add a `None` to the array in `new()` and a match arm to `slot_of`.
+/// Both must stay in sync — the const assertion catches drift.
 pub struct DllStateMap {
     slots: [Option<Box<dyn Any + Send>>; DllId::COUNT],
 }
+
+// The struct field `slots: [Option<Box<dyn Any + Send>>; DllId::COUNT]`
+// and the `new()` array literal are kept in sync by the type system:
+// a mismatch in element count is a compile error.
 
 impl Default for DllStateMap {
     fn default() -> Self {
@@ -392,14 +371,14 @@ impl Default for DllStateMap {
     }
 }
 
-/// Debug label for each [`DllId`] slot. Update when adding a variant.
-const fn slot_name(i: usize) -> &'static str {
-    match i {
-        0 => "console",
-        1 => "window",
-        2 => "d3d9",
-        3 => "pthread",
-        _ => "?",
+/// Map a [`DllId`] to its index in the slot array. Matches explicitly
+/// so the compiler warns if a variant is added without a corresponding arm.
+const fn dll_index(id: DllId) -> usize {
+    match id {
+        DllId::Console => 0,
+        DllId::Window => 1,
+        DllId::D3D9 => 2,
+        DllId::Pthread => 3,
     }
 }
 
@@ -409,11 +388,22 @@ impl std::fmt::Debug for DllStateMap {
             .slots
             .iter()
             .enumerate()
-            .filter_map(|(i, slot)| slot.as_ref().map(|_| slot_name(i)))
+            .filter_map(|(i, slot)| slot.as_ref().map(|_| slot_of(i)))
             .collect();
         f.debug_struct("DllStateMap")
             .field("loaded", &loaded)
             .finish()
+    }
+}
+
+/// Slot label for debug output. Add a match arm per new [`DllId`] variant.
+const fn slot_of(i: usize) -> &'static str {
+    match i {
+        0 => "console",
+        1 => "window",
+        2 => "d3d9",
+        3 => "pthread",
+        _ => "?",
     }
 }
 
@@ -430,27 +420,23 @@ impl DllStateMap {
     /// # Panics
     /// If the slot type does not match `T` — a programming error when a
     /// `DllId` variant is reused for a different type.
-    #[allow(clippy::as_conversions, clippy::expect_used)]
+    #[allow(clippy::expect_used)]
     pub fn get_or_init<T: Default + Send + 'static>(&mut self, id: DllId) -> &mut T {
-        let idx = id as u8 as usize;
+        let idx = dll_index(id);
         let slot = self
             .slots
             .get_mut(idx)
             .expect("DllId index out of range — did you forget to bump COUNT?");
         slot.get_or_insert_with(|| Box::new(T::default()));
         let boxed = slot.as_mut().expect("slot was just initialised");
-        let any: &mut (dyn Any + Send) = boxed.as_mut();
-        any.downcast_mut::<T>()
+        boxed.as_mut().downcast_mut::<T>()
             .expect("DllId slot type mismatch")
     }
 
     /// Read-only access — returns `None` if the slot was never initialised.
-    #[allow(clippy::as_conversions)]
     pub fn get<T: 'static>(&self, id: DllId) -> Option<&T> {
-        let idx = id as u8 as usize;
-        let boxed = self.slots.get(idx)?.as_ref()?;
-        let any = &**boxed as &(dyn Any + Send);
-        any.downcast_ref::<T>()
+        let boxed = self.slots.get(dll_index(id))?.as_ref()?;
+        boxed.as_ref().downcast_ref::<T>()
     }
 }
 
@@ -1376,7 +1362,8 @@ mod tests {
     fn test_get_async_key_state_down() {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
-        state.window_state().keyboard_state[0x0D] = 0x80; // VK_RETURN high bit set
+        // VK_RETURN high bit set — index is a compile-time constant in bounds.
+        state.window_state().keyboard_state.0[0x0D] = 0x80;
         write_regs(&mut engine, 0x0D, 0, 0, 0, 0);
         assert_return_value!(
             user32::handle_get_async_key_state(&mut HandlerContext::new(
