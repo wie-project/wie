@@ -603,6 +603,12 @@ fn handle_time64(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
 }
 
 /// `srand(seed)` — seed the CRT random number generator.
+///
+/// Uses the Windows UCRT algorithm (MSVC CRT compatible):
+/// `state = state * 214013 + 2531011`, return `(state >> 16) & 0x7FFF`.
+/// The constants differ from BSD/glibc (`1103515245, 12345`), so a mingw
+/// program linked against `api-ms-win-crt-utility-l1-1-0.dll` gets the
+/// same sequence as MSVC.
 fn handle_srand(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let seed = engine.read_rcx()?;
@@ -614,7 +620,7 @@ fn handle_srand(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
 fn handle_rand(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let prev = CRT_RNG.load(std::sync::atomic::Ordering::Relaxed);
-    let next = prev.wrapping_mul(1_103_515_245).wrapping_add(12345);
+    let next = prev.wrapping_mul(214_013).wrapping_add(2_531_011);
     CRT_RNG.store(next, std::sync::atomic::Ordering::Relaxed);
     let val = (next >> 16) & 0x7FFF;
     ret(engine, u64::from(val))
