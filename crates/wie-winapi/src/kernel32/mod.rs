@@ -1,8 +1,9 @@
 #![allow(clippy::empty_line_after_doc_comments)]
 
 pub(crate) use crate::guest_memory::{
-    checked_address, checked_field_address, read_u16 as read_guest_u16, read_u64 as read_guest_u64,
-    write_u16 as write_guest_u16, write_u32 as write_guest_u32, write_u64 as write_guest_u64,
+    checked_address, checked_field_address, read_u16 as read_guest_u16, read_u32 as read_guest_u32,
+    read_u64 as read_guest_u64, write_u16 as write_guest_u16, write_u32 as write_guest_u32,
+    write_u64 as write_guest_u64,
 };
 pub(crate) use crate::guest_string::{
     read_ansi_lossy as read_guest_ansi_lossy, read_utf16_lossy as read_guest_utf16_lossy,
@@ -29,18 +30,6 @@ const STD_ERROR_HANDLE_ID: u32 = 0xffff_fff4;
 const FAKE_STDIN_HANDLE: u64 = 0x0000_0000_6000_0001;
 const FAKE_STDOUT_HANDLE: u64 = 0x0000_0000_6000_0002;
 const FAKE_STDERR_HANDLE: u64 = 0x0000_0000_6000_0003;
-
-/// Host console write for `WriteFile` on stdout/stderr (Microsoft Learn: valid on console handles).
-#[cfg(unix)]
-#[cfg(not(unix))]
-pub(crate) fn write_host_console_handle(handle: u64, bytes: &[u8]) {
-    use std::io::Write;
-    if handle == FAKE_STDOUT_HANDLE {
-        drop(std::io::stdout().write_all(bytes));
-    } else if handle == FAKE_STDERR_HANDLE {
-        drop(std::io::stderr().write_all(bytes));
-    }
-}
 
 /// Cap for a single host console line fill (safety against huge pastes).
 const MAX_HOST_STDIN_LINE: usize = 64 * 1024;
@@ -906,13 +895,8 @@ pub(crate) fn sync_open_bytes_to_virtual(state: &mut WinApiState, path: &str, ha
 // ─── Soft console / process helpers for real CLI tools (7za) ────────────────
 
 const FIXED_PERFORMANCE_FREQUENCY: u64 = 10_000_000;
-const ENABLE_PROCESSED_INPUT: u32 = 0x0001;
-const ENABLE_LINE_INPUT: u32 = 0x0002;
-const ENABLE_ECHO_INPUT: u32 = 0x0004;
-const ENABLE_PROCESSED_OUTPUT: u32 = 0x0001;
-const ENABLE_WRAP_AT_EOL_OUTPUT: u32 = 0x0002;
-const DEFAULT_CONSOLE_MODE_IN: u32 = ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT;
-const DEFAULT_CONSOLE_MODE_OUT: u32 = ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT;
+// Console mode bits and their defaults now live in `crate::console`, which owns
+// the mode words themselves rather than reporting a fixed constant.
 
 /// `BOOL SetConsoleCtrlHandler(PHANDLER_ROUTINE, BOOL)` — accept, ignore handler.
 
@@ -996,7 +980,11 @@ const LOGICAL_DRIVE_TCHARS: u32 = 4;
 /// `HANDLE OpenFileMappingW` — not found.
 
 /// Extra KERNEL32 exports used by CRT / modern PE (not yet in dense WinApiId table).
+pub mod clock;
 pub mod console;
+pub mod console_cells;
+pub mod console_input;
+pub mod environment;
 pub mod file_io;
 pub mod heap;
 pub mod memory;
@@ -1006,7 +994,11 @@ pub mod process_thread;
 pub mod string;
 pub mod sync;
 
+pub use clock::*;
 pub use console::*;
+pub use console_cells::*;
+pub use console_input::*;
+pub use environment::*;
 pub use file_io::*;
 pub use heap::*;
 pub use memory::*;
@@ -1057,11 +1049,52 @@ pub fn dispatch_kernel32_extra(
         "lstrlenw" => Ok(Some(handle_lstrlen_w(ctx)?)),
         "lstrcpyw" => Ok(Some(handle_lstrcpy_w(ctx)?)),
         "lstrcatw" => Ok(Some(handle_lstrcat_w(ctx)?)),
-        // Console / process identity (7za CLI startup)
-        "setconsolectrlhandler" => Ok(Some(handle_set_console_ctrl_handler(ctx)?)),
-        "getconsolemode" => Ok(Some(handle_get_console_mode(ctx)?)),
-        "setconsolemode" => Ok(Some(handle_set_console_mode(ctx)?)),
+        // Console / process identity
+        "allocconsole" => Ok(Some(handle_alloc_console(ctx)?)),
+        "attachconsole" => Ok(Some(handle_attach_console(ctx)?)),
+        "createconsolescreenbuffer" => Ok(Some(handle_create_console_screen_buffer(ctx)?)),
+        "fillconsoleoutputattribute" => Ok(Some(handle_fill_console_output_attribute(ctx)?)),
+        "fillconsoleoutputcharactera" => Ok(Some(handle_fill_console_output_character_a(ctx)?)),
+        "fillconsoleoutputcharacterw" => Ok(Some(handle_fill_console_output_character_w(ctx)?)),
+        "flushconsoleinputbuffer" => Ok(Some(handle_flush_console_input_buffer(ctx)?)),
+        "freeconsole" => Ok(Some(handle_free_console(ctx)?)),
+        "getconsolecp" => Ok(Some(handle_get_console_cp(ctx)?)),
+        "getconsolecursorinfo" => Ok(Some(handle_get_console_cursor_info(ctx)?)),
+        "getconsoleoutputcp" => Ok(Some(handle_get_console_output_cp(ctx)?)),
         "getconsolescreenbufferinfo" => Ok(Some(handle_get_console_screen_buffer_info(ctx)?)),
+        "getconsoletitlea" => Ok(Some(handle_get_console_title_a(ctx)?)),
+        "getconsoletitlew" => Ok(Some(handle_get_console_title_w(ctx)?)),
+        "getconsolewindow" => Ok(Some(handle_get_console_window(ctx)?)),
+        "getlargestconsolewindowsize" => Ok(Some(handle_get_largest_console_window_size(ctx)?)),
+        "getnumberofconsoleinputevents" => Ok(Some(handle_get_number_of_console_input_events(ctx)?)),
+        "getnumberofconsolemousebuttons" => Ok(Some(handle_get_number_of_console_mouse_buttons(ctx)?)),
+        "peekconsoleinputw" => Ok(Some(handle_peek_console_input_w(ctx)?)),
+        "readconsoleinputw" => Ok(Some(handle_read_console_input_w(ctx)?)),
+        "readconsolew" => Ok(Some(handle_read_console_w(ctx)?)),
+        "readconsolea" => Ok(Some(handle_read_console_a(ctx)?)),
+        "scrollconsolescreenbufferw" => Ok(Some(handle_scroll_console_screen_buffer_w(ctx)?)),
+        "setconsoleactivescreenbuffer" => Ok(Some(handle_set_console_active_screen_buffer(ctx)?)),
+        "setconsolecp" => Ok(Some(handle_set_console_cp(ctx)?)),
+        "setconsolecursorinfo" => Ok(Some(handle_set_console_cursor_info(ctx)?)),
+        "setconsolemode" => Ok(Some(handle_set_console_mode(ctx)?)),
+        "getconsolemode" => Ok(Some(handle_get_console_mode(ctx)?)),
+        "setconsoleoutputcp" => Ok(Some(handle_set_console_output_cp(ctx)?)),
+        "setconsolescreenbuffersize" => Ok(Some(handle_set_console_screen_buffer_size(ctx)?)),
+        "setconsolectrlhandler" => Ok(Some(handle_set_console_ctrl_handler(ctx)?)),
+        "setconsoletitlea" => Ok(Some(handle_set_console_title_a(ctx)?)),
+        "setconsoletitlew" => Ok(Some(handle_set_console_title_w(ctx)?)),
+        "setconsolewindowinfo" => Ok(Some(handle_set_console_window_info(ctx)?)),
+        "writeconsolew" => Ok(Some(handle_write_console_w(ctx)?)),
+        "writeconsolea" => Ok(Some(handle_write_console_a(ctx)?)),
+        "writeconsoleoutputcharacterw" => Ok(Some(handle_write_console_output_character_w(ctx)?)),
+        "writeconsoleoutputattribute" => Ok(Some(handle_write_console_output_attribute(ctx)?)),
+        "gettickcount64" => Ok(Some(handle_get_tick_count_64(ctx)?)),
+        "getenvironmentvariablew" => Ok(Some(handle_get_environment_variable_w(ctx)?)),
+        "getenvironmentvariablea" => Ok(Some(handle_get_environment_variable_a(ctx)?)),
+        "setenvironmentvariablew" => Ok(Some(handle_set_environment_variable_w(ctx)?)),
+        "setenvironmentvariablea" => Ok(Some(handle_set_environment_variable_a(ctx)?)),
+        "expandenvironmentstringsw" => Ok(Some(handle_expand_environment_strings_w(ctx)?)),
+        "expandenvironmentstringsa" => Ok(Some(handle_expand_environment_strings_a(ctx)?)),
         "setfileapistooem" => Ok(Some(handle_set_file_apis_to_oem(ctx)?)),
         "queryperformancefrequency" => Ok(Some(handle_query_performance_frequency(ctx)?)),
         "getsysteminfo" => Ok(Some(handle_get_system_info(ctx)?)),
@@ -1140,7 +1173,9 @@ pub fn dispatch_kernel32_extra(
         "backupread" => Ok(Some(handle_backup_read(ctx)?)),
         "backupseek" => Ok(Some(handle_backup_seek(ctx)?)),
         "backupwrite" => Ok(Some(handle_backup_write(ctx)?)),
-        _ => Ok(None),
+        // Console surface: the hot calls have their own arms above; the rest
+        // live in `console` so this match does not grow a fourth screenful.
+        _ => console::dispatch_console_extra(ctx, n.as_str()),
     }
 }
 

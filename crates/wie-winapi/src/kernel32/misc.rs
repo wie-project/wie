@@ -1,6 +1,5 @@
 use super::{
-    Context, ERROR_INVALID_PARAMETER, FIXED_PERFORMANCE_COUNTER, FIXED_PERFORMANCE_FREQUENCY,
-    FIXED_TICK_COUNT, FLS_OUT_OF_INDEXES, FlsSlot, GUEST_OS_BUILD, GUEST_OS_MAJOR, GUEST_OS_MINOR,
+    Context, ERROR_INVALID_PARAMETER, FIXED_PERFORMANCE_FREQUENCY, FLS_OUT_OF_INDEXES, FlsSlot, GUEST_OS_BUILD, GUEST_OS_MAJOR, GUEST_OS_MINOR,
     GUEST_OS_PLATFORM_NT, HandlerContext, LANG_EN_US, OnceLock, Result, TIME_ZONE_ID_INVALID,
     TIME_ZONE_ID_UNKNOWN, WinApiHandlerResult, WinApiState, checked_field_address, low_u32,
     low_u32_to_i32, read_guest_ansi_lossy, read_guest_utf16_lossy, ret_bool_true, ret_u64,
@@ -101,13 +100,27 @@ pub fn handle_get_command_line_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 /// Handles `KERNEL32.dll!GetTickCount`.
 pub fn handle_get_tick_count(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
+    let return_value = super::clock::tick_count_32();
     let return_address = engine
-        .return_from_win64_api(FIXED_TICK_COUNT)
+        .return_from_win64_api(return_value)
         .context("failed to return from GetTickCount")?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: FIXED_TICK_COUNT,
+        return_value,
+    })
+}
+/// Handles `KERNEL32.dll!GetTickCount64`.
+pub fn handle_get_tick_count_64(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let return_value = super::clock::tick_count_64();
+    let return_address = engine
+        .return_from_win64_api(return_value)
+        .context("failed to return from GetTickCount64")?;
+
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
     })
 }
 /// Handles `KERNEL32.dll!QueryPerformanceCounter`.
@@ -120,7 +133,7 @@ pub fn handle_query_performance_counter(
         .context("failed to read RCX for QueryPerformanceCounter")?;
 
     if counter_ptr != 0 {
-        write_guest_u64(engine, counter_ptr, FIXED_PERFORMANCE_COUNTER)?;
+        write_guest_u64(engine, counter_ptr, super::clock::performance_counter())?;
     }
 
     let return_address = engine

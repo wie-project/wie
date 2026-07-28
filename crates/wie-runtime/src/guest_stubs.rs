@@ -561,9 +561,10 @@ pub(crate) fn classify_guest_stub(
     {
         return Some(GuestStubKind::VoidRet);
     }
-    if n.eq_ignore_ascii_case("GetTickCount") {
-        return Some(GuestStubKind::ReturnImm32(12_345));
-    }
+    // GetTickCount deliberately has no in-guest stub: it must reach the host so
+    // the monotonic clock advances. A planted constant made every frame loop
+    // see dt == 0 forever. `WIE_FIXED_CLOCK=1` restores the frozen value for
+    // deterministic traces, but it does so on the host side.
     if n.eq_ignore_ascii_case("GetCurrentProcessId") {
         return Some(GuestStubKind::ReturnImm32(0x1234));
     }
@@ -903,7 +904,6 @@ mod tests {
             ("KERNEL32.dll", "SetHandleCount"),
             ("KERNEL32.dll", "OutputDebugStringA"),
             ("KERNEL32.dll", "OutputDebugStringW"),
-            ("KERNEL32.dll", "GetTickCount"),
             ("KERNEL32.dll", "GetCurrentProcessId"),
             ("KERNEL32.dll", "GetCurrentThreadId"),
             ("KERNEL32.dll", "IsDebuggerPresent"),

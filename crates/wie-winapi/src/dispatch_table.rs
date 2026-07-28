@@ -317,9 +317,22 @@ pub enum WinApiId {
     Kernel32Flushfilebuffers = 304,
     User32Getmenu = 305,
     Gdi32Getstockobject = 306,
+    Kernel32Writeconsolew = 307,
+    Kernel32Writeconsolea = 308,
+    Kernel32Readconsolew = 309,
+    Kernel32Readconsolea = 310,
+    Kernel32Getconsolemode = 311,
+    Kernel32Setconsolemode = 312,
+    Kernel32Writeconsoleoutputw = 313,
+    Kernel32Fillconsoleoutputcharacterw = 314,
+    Kernel32Setconsolecursorposition = 315,
+    Kernel32Setconsoletextattribute = 316,
+    Kernel32Gettickcount64 = 317,
+    Kernel32Getenvironmentvariablew = 318,
+    Kernel32Setenvironmentvariablew = 319,
 }
 
-pub const WINAPI_ID_COUNT: usize = 307;
+pub const WINAPI_ID_COUNT: usize = 320;
 
 impl WinApiId {
     /// Discriminant as `u16` (`#[repr(u16)]`).
@@ -358,7 +371,7 @@ const _: () = assert!(
 );
 
 /// Highest-numbered [`WinApiId`]; update alongside the enum's final variant.
-const LAST_WINAPI_ID: WinApiId = WinApiId::Gdi32Getstockobject;
+const LAST_WINAPI_ID: WinApiId = WinApiId::Kernel32Setenvironmentvariablew;
 
 /// Static (library, name, id) rows for one-time resolution.
 static WINAPI_NAME_ROWS: &[(&str, &str, WinApiId)] = &[
@@ -1423,6 +1436,19 @@ static WINAPI_NAME_ROWS: &[(&str, &str, WinApiId)] = &[
     ),
     ("user32.dll", "getmenu", WinApiId::User32Getmenu),
     ("gdi32.dll", "getstockobject", WinApiId::Gdi32Getstockobject),
+    ("kernel32.dll", "writeconsolew", WinApiId::Kernel32Writeconsolew),
+    ("kernel32.dll", "writeconsolea", WinApiId::Kernel32Writeconsolea),
+    ("kernel32.dll", "readconsolew", WinApiId::Kernel32Readconsolew),
+    ("kernel32.dll", "readconsolea", WinApiId::Kernel32Readconsolea),
+    ("kernel32.dll", "getconsolemode", WinApiId::Kernel32Getconsolemode),
+    ("kernel32.dll", "setconsolemode", WinApiId::Kernel32Setconsolemode),
+    ("kernel32.dll", "writeconsoleoutputw", WinApiId::Kernel32Writeconsoleoutputw),
+    ("kernel32.dll", "fillconsoleoutputcharacterw", WinApiId::Kernel32Fillconsoleoutputcharacterw),
+    ("kernel32.dll", "setconsolecursorposition", WinApiId::Kernel32Setconsolecursorposition),
+    ("kernel32.dll", "setconsoletextattribute", WinApiId::Kernel32Setconsoletextattribute),
+    ("kernel32.dll", "gettickcount64", WinApiId::Kernel32Gettickcount64),
+    ("kernel32.dll", "getenvironmentvariablew", WinApiId::Kernel32Getenvironmentvariablew),
+    ("kernel32.dll", "setenvironmentvariablew", WinApiId::Kernel32Setenvironmentvariablew),
 ];
 
 /// Resolve library/export to id. Case-insensitive, allocation-free.
@@ -1590,6 +1616,31 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
                 | "getconsolemode"
                 | "setconsolemode"
                 | "getconsolescreenbufferinfo"
+                | "writeconsolew"
+                | "writeconsolea"
+                | "readconsolew"
+                | "readconsolea"
+                | "getconsolecp"
+                | "getconsoleoutputcp"
+                | "setconsolecp"
+                | "setconsoleoutputcp"
+                | "setconsoletitlew"
+                | "setconsoletitlea"
+                | "getconsoletitlew"
+                | "getconsoletitlea"
+                | "allocconsole"
+                | "freeconsole"
+                | "attachconsole"
+                | "getconsolewindow"
+                | "getlargestconsolewindowsize"
+                | "getnumberofconsolemousebuttons"
+                | "gettickcount64"
+                | "getenvironmentvariablea"
+                | "getenvironmentvariablew"
+                | "setenvironmentvariablea"
+                | "setenvironmentvariablew"
+                | "expandenvironmentstringsa"
+                | "expandenvironmentstringsw"
                 | "setfileapistooem"
                 | "queryperformancefrequency"
                 | "getsysteminfo"
@@ -1970,6 +2021,19 @@ pub fn dispatch_winapi_id(
         WinApiId::D3d9Idirect3d9Release => d3d9::handle_direct3d9_release(ctx),
         WinApiId::User32Getmenu => user32::handle_get_menu(ctx),
         WinApiId::Gdi32Getstockobject => gdi32::handle_get_stock_object(ctx),
+        WinApiId::Kernel32Writeconsolew => kernel32::console::handle_write_console_w(ctx),
+        WinApiId::Kernel32Writeconsolea => kernel32::console::handle_write_console_a(ctx),
+        WinApiId::Kernel32Readconsolew => kernel32::console::handle_read_console_w(ctx),
+        WinApiId::Kernel32Readconsolea => kernel32::console::handle_read_console_a(ctx),
+        WinApiId::Kernel32Getconsolemode => kernel32::console::handle_get_console_mode(ctx),
+        WinApiId::Kernel32Setconsolemode => kernel32::console::handle_set_console_mode(ctx),
+        WinApiId::Kernel32Writeconsoleoutputw => kernel32::console_cells::handle_write_console_output_w(ctx),
+        WinApiId::Kernel32Fillconsoleoutputcharacterw => kernel32::console_cells::handle_fill_console_output_character_w(ctx),
+        WinApiId::Kernel32Setconsolecursorposition => kernel32::console_cells::handle_set_console_cursor_position(ctx),
+        WinApiId::Kernel32Setconsoletextattribute => kernel32::console_cells::handle_set_console_text_attribute(ctx),
+        WinApiId::Kernel32Gettickcount64 => kernel32::misc::handle_get_tick_count_64(ctx),
+        WinApiId::Kernel32Getenvironmentvariablew => kernel32::environment::handle_get_environment_variable_w(ctx),
+        WinApiId::Kernel32Setenvironmentvariablew => kernel32::environment::handle_set_environment_variable_w(ctx),
     }
 }
 

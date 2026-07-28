@@ -8,6 +8,7 @@ use std::sync::Arc;
 pub mod advapi32;
 pub mod bottle;
 pub mod comctl32;
+pub mod console;
 pub mod comdlg32;
 pub mod d3d9;
 pub mod dll_loader;
@@ -238,7 +239,32 @@ pub struct ProcessState {
     pub main_module_host_dir: Option<std::path::PathBuf>,
     pub error_mode: u32,
     pub suspended_threads: HashMap<u32, u32>,
+    /// Win32 process environment, as `(name, value)` in insertion order.
+    ///
+    /// Kept beside the guest-memory block that `GetEnvironmentStringsW`
+    /// returns rather than inside it. Windows draws the same distinction: the
+    /// block is a snapshot copy, so a later `SetEnvironmentVariable` is visible
+    /// to `GetEnvironmentVariable` without rewriting memory the guest may still
+    /// hold a pointer into.
+    pub environment: Vec<(String, String)>,
 }
+
+/// Environment every guest process starts with.
+///
+/// Single source of truth: `wie-runtime` builds the in-guest UTF-16 block from
+/// this same list, so the block and [`ProcessState::environment`] cannot drift.
+pub const DEFAULT_ENVIRONMENT: &[(&str, &str)] = &[
+    ("PATH", "C:\\Windows\\System32"),
+    ("TEMP", "C:\\Users\\WIE\\AppData\\Local\\Temp"),
+    ("TMP", "C:\\Users\\WIE\\AppData\\Local\\Temp"),
+    ("SystemRoot", "C:\\Windows"),
+    ("windir", "C:\\Windows"),
+    ("COMPUTERNAME", "WIE"),
+    ("USERNAME", "WIE"),
+    ("OS", "Windows_NT"),
+    ("PROCESSOR_ARCHITECTURE", "AMD64"),
+    ("NUMBER_OF_PROCESSORS", "4"),
+];
 
 /// Kernel execution state (threading, synchronisation, SEH).
 #[derive(Debug, Clone)]
@@ -270,6 +296,8 @@ pub struct WinApiState {
     pub process: ProcessState,
     /// Kernel execution state (threading, sync, SEH).
     pub kernel: KernelState,
+    /// Console screen buffers, modes, and decoded input records.
+    pub console: console::ConsoleState,
 }
 
 // Manual Debug impl: Box<dyn FnMut + Send> does not implement Debug.
@@ -283,6 +311,7 @@ impl std::fmt::Debug for WinApiState {
             .field("module_state", &self.module_state)
             .field("process", &self.process)
             .field("kernel", &self.kernel)
+            .field("console", &self.console)
             .finish()
     }
 }
@@ -298,6 +327,7 @@ impl Clone for WinApiState {
             module_state: self.module_state.clone(),
             process: self.process.clone(),
             kernel: self.kernel.clone(),
+            console: self.console.clone(),
         }
     }
 }
@@ -878,12 +908,17 @@ mod tests {
                 main_module_host_dir: None,
                 error_mode: 0,
                 suspended_threads: HashMap::new(),
+                environment: DEFAULT_ENVIRONMENT
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .collect(),
             },
             kernel: KernelState {
                 threads: ThreadState::primary(),
                 sync: SyncState::new(),
                 seh_pending: HashMap::new(),
             },
+            console: console::ConsoleState::default(),
             window_state: WindowState {
                 window_long_ptr_values: Vec::new(),
                 image_list_counts: Vec::new(),

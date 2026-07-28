@@ -10,9 +10,9 @@ LDFLAGS  := -nostdlib -Wl,--subsystem,console -Wl,--entry,entry
 # Ordinary CRT-linked apps (independent-style): full toolchain defaults.
 CRT_CFLAGS := -O2
 
-.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention
+.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells
 
-all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention
+all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells
 
 $(OUT):
 	mkdir -p $(OUT)
@@ -41,6 +41,8 @@ mt_stress: $(OUT)/mt_stress.exe
 vfs_roundtrip: $(OUT)/vfs_roundtrip.exe
 rep_lengths: $(OUT)/rep_lengths.exe
 mt_contention: $(OUT)/mt_contention.exe
+console_hello: $(OUT)/console_hello.exe
+console_cells: $(OUT)/console_cells.exe
 
 $(OUT)/heap_alloc.exe: heap_alloc/main.c | $(OUT)
 	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32
@@ -75,6 +77,13 @@ $(OUT)/crt_hello.exe: crt_hello/main.c | $(OUT)
 	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $<
 	@echo "built $@"
 
+$(OUT)/console_hello.exe: console_hello/main.c | $(OUT)
+	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $<
+	@echo "built $@"
+
+$(OUT)/console_cells.exe: console_cells/main.c | $(OUT)
+	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $<
+	@echo "built $@"
 
 $(OUT)/long_loop.exe: long_loop/main.c | $(OUT)
 	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32

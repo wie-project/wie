@@ -253,6 +253,7 @@ pub(crate) fn default_winapi_state(
             main_module_host_dir: None,
             error_mode: 0,
             suspended_threads: std::collections::HashMap::new(),
+            environment: Vec::new(),
         },
         kernel: wie_winapi::KernelState {
             threads: wie_winapi::ThreadState::primary(),
@@ -340,6 +341,7 @@ pub(crate) fn default_winapi_state(
             d3d9_object_address: 0,
             d3d9_ref_count: 0,
         },
+        console: Default::default(),
         module_state: wie_winapi::ModuleState {
             loaded_modules: std::collections::HashMap::new(),
             import_resolver: None,
