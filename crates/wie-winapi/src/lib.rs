@@ -991,7 +991,7 @@ mod tests {
                 get_proc_address_cache: HashMap::new(),
                 next_module_handle: dll_loader::REAL_MODULE_HANDLE_BASE,
             },
-            pthread: Default::default(),
+            pthread: pthread::PthreadState::default(),
         }
     }
 

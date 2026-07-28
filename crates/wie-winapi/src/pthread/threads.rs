@@ -1,13 +1,15 @@
 //! Thread lifecycle, attributes, thread-specific data, once-control, and
 //! cancellation.
 
+#![allow(clippy::match_same_arms, clippy::single_match_else)]
+
 use anyhow::{Context, Result};
 use wie_cpu::CpuEngine;
 
 use super::objects::PtThread;
 use super::{
     BARRIER_SERIAL_THREAD, CANCEL_ASYNCHRONOUS, CANCEL_ENABLE, CANCELED, CREATE_DETACHED, EAGAIN,
-    EDEADLK, EINVAL, ENOTSUP, EPERM, ESRCH, INHERIT_SCHED, PtOnce, PtPending, SCOPE_SYSTEM,
+    EDEADLK, EINVAL, ENOTSUP, EPERM, ESRCH, INHERIT_SCHED, PtPending, SCOPE_SYSTEM,
     call_guest, finish_guest_call, park_on, read_cstr, read_u32, read_u64, ret_int, ret_u64,
     slice_until, trunc_i32, write_i32, write_u32, write_u64,
 };
@@ -307,7 +309,8 @@ pub(super) fn dispatch(
         "pthread_setspecific" => {
             let key = u32::try_from(engine.read_rcx()? & 0xffff_ffff).unwrap_or(0);
             let value = engine.read_rdx()?;
-            if !state.pthread.keys.contains_key(&key) {
+            let missing = !state.pthread.keys.contains_key(&key);
+            if missing {
                 ret_int(engine, EINVAL)?
             } else {
                 let pt = self_pt(engine, state);
@@ -867,7 +870,7 @@ fn once(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<WinApiHan
         .pthread
         .onces
         .entry(once_va)
-        .or_insert_with(PtOnce::new);
+        .or_default();
     if entry.done {
         return ret_int(engine, 0);
     }

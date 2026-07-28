@@ -342,6 +342,7 @@ pub(crate) fn default_winapi_state(
             d3d9_ref_count: 0,
         },
         console: Default::default(),
+        pthread: wie_winapi::pthread::PthreadState::default(),
         module_state: wie_winapi::ModuleState {
             loaded_modules: std::collections::HashMap::new(),
             import_resolver: None,

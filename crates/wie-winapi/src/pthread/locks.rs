@@ -1,6 +1,8 @@
 //! Mutexes, condition variables, rwlocks, spinlocks, barriers, and semaphores.
 //!
 //! Every blocking entry point is written as a *retry loop across re-entries*:
+
+#![allow(clippy::match_same_arms, clippy::range_plus_one)]
 //! it re-reads the object, and either completes or queues a park and returns
 //! [`crate::WinApiControlSignal::HostPark`]. The runtime sleeps with no process
 //! locks held and then re-enters the handler at the same RIP.
@@ -547,7 +549,7 @@ fn mutex_destroy(
     let word = read_u64(engine, m);
     // Destroying a never-locked static initialiser is a no-op, not an error.
     if !is_pt_id(word) {
-        return ret_int(engine, if matches!(word.cast_signed(), 0 | -1 | -2 | -3) { 0 } else { EINVAL });
+        return ret_int(engine, if matches!(word.cast_signed(), -3..=0) { 0 } else { EINVAL });
     }
     match state.pthread.mutexes.get(&word) {
         None => ret_int(engine, EINVAL),

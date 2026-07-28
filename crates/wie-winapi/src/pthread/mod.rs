@@ -9,7 +9,19 @@
 //! with its own CPU engine.
 
 #![expect(dead_code)]
-#![allow(unreachable_pub, clippy::module_name_repetitions)]
+#![allow(
+    unreachable_pub,
+    clippy::module_name_repetitions,
+    clippy::match_same_arms,
+    clippy::single_match_else,
+    clippy::struct_excessive_bools,
+    clippy::arithmetic_side_effects,
+    clippy::range_plus_one,
+    clippy::nonminimal_bool,
+    clippy::or_fun_call,
+    clippy::manual_range_contains,
+    clippy::default_trait_access,
+)]
 //!
 //! # Guest ABI
 //!
