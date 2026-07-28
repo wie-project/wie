@@ -1290,19 +1290,21 @@ fn handle_get_osfhandle(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 
 /// `fputc(c, stream)`.
 fn handle_fputc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let c = engine.read_rcx()? & 0xff;
-    let stream = engine.read_rdx()?;
+    let c = ctx.engine.read_rcx()? & 0xff;
+    let stream = ctx.engine.read_rdx()?;
     let ch = u8::try_from(c).unwrap_or(0);
-    if stream == FILE_STDOUT || stream == FILE_STDERR {
-        write_host_console(stream, &[ch]);
+    if stream == FILE_STDERR {
+        write_host_console(FILE_STDERR, &[ch]);
+        let engine = &mut *ctx.engine;
         return ret(engine, u64::from(ch));
     }
     if stream == FILE_STDIN {
+        let engine = &mut *ctx.engine;
         return ret(engine, u64::from(u32::MAX)); // EOF
     }
-    // Unknown FILE* — still echo to stdout (best-effort for &_iob[1] offsets).
-    write_host_console(FILE_STDOUT, &[ch]);
+    // stdout or unknown FILE* — route through console buffer.
+    crate::kernel32::console::emit_text_from_bytes(ctx, &[ch]);
+    let engine = &mut *ctx.engine;
     ret(engine, u64::from(ch))
 }
 
@@ -1338,16 +1340,15 @@ fn handle_fputs(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
 
 /// `puts(s)` — write NUL-terminated string + newline to stdout.
 fn handle_puts(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let s = engine.read_rcx()?;
+    let s = ctx.engine.read_rcx()?;
     if s == 0 {
-        return ret(engine, u64::from(u32::MAX)); // EOF
+        return ret(&mut *ctx.engine, u64::from(u32::MAX)); // EOF
     }
     let mut bytes = Vec::new();
     let mut off = 0_u64;
     loop {
         let mut b = [0_u8; 1];
-        engine.mem_read(s.wrapping_add(off), &mut b)?;
+        ctx.engine.mem_read(s.wrapping_add(off), &mut b)?;
         if b[0] == 0 {
             break;
         }
@@ -1358,7 +1359,8 @@ fn handle_puts(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
         }
     }
     bytes.push(b'\n');
-    write_host_console(FILE_STDOUT, &bytes);
+    crate::kernel32::console::emit_text_from_bytes(ctx, &bytes);
+    let engine = &mut *ctx.engine;
     ret(engine, 0) // non-negative = success
 }
 

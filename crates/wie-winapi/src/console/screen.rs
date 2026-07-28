@@ -196,7 +196,7 @@ pub fn flush(buffer: &ScreenBuffer, previous: Option<&ScreenBuffer>) -> String {
 ///
 /// NUL is the value a zeroed `CHAR_INFO` carries, and a guest that clears a
 /// region by writing zeroed records means "blank", not "emit a NUL byte".
-fn char_of(cell: CharInfo) -> char {
+pub(crate) fn char_of(cell: CharInfo) -> char {
     if cell.unit == 0 {
         return ' ';
     }

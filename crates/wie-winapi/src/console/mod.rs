@@ -379,39 +379,60 @@ impl Default for ConsoleState {
 
 impl ConsoleState {
     /// Flush buffered output to the host terminal.
-    /// On first frame the raw text is flushed for instant full-screen paint.
-    /// On subsequent frames only cells that changed are emitted via screen::flush.
+    /// Flush all pending output to the terminal.
+    ///
+    /// 1. If `stream_buf` has data, fold it into the grid via `fold_text_into_grid`
+    ///    (handles ANSI escapes like \033[H, \033[2J, \n, plain text).
+    /// 2. Diff the current grid against the last rendered state and emit only
+    ///    changed cells — no clear-screen escape ever reaches the terminal.
+    ///
+    /// Called on natural frame boundaries: `Sleep`, `_getch`, `_kbhit`, `fflush`.
+    /// Every CRT output path (`fputs`, `printf`, `puts`, `putchar`, `WriteConsoleA`,
+    /// `system("cls")`) converges here.
     pub fn flush_stream_output(&mut self) {
-        if !self.needs_flush || self.stream_buf.is_empty() {
+        if !self.needs_flush {
             return;
         }
         self.needs_flush = false;
-        let raw = std::mem::take(&mut self.stream_buf);
         let is_first = self.rendered.is_none();
 
-        // Fold the raw bytes into the grid (handles \033[H, \033[2J, \n, etc.)
-        let Some(buffer_handle) = self.buffer_handle_for(PRIMARY_BUFFER_HANDLE) else { return; };
-        let units: Vec<u16> = raw.iter().map(|&b| u16::from(b)).collect();
-        crate::kernel32::console::fold_text_into_grid(self, buffer_handle, &units);
+        // Fold any buffered CRT output into the grid first.
+        if !self.stream_buf.is_empty() {
+            let raw = std::mem::take(&mut self.stream_buf);
+            if let Some(handle) = self.buffer_handle_for(PRIMARY_BUFFER_HANDLE) {
+                let units: Vec<u16> = raw.iter().map(|&b| u16::from(b)).collect();
+                crate::kernel32::console::fold_text_into_grid(self, handle, &units);
+            }
+        }
 
-        // Reset the terminal's colour attributes so every frame starts from
-        // the same base state — \033[0m restores the terminal's native palette
-        // without forcing any particular foreground/background.
+        // Everything between the last flush and now is now in the grid.
+        // Diff against the last rendered state and emit only changed cells.
         const SGR_RESET: &str = "\u{1b}[0m";
-
-        if is_first {
-            // First frame: write \033[H + raw text for instant full paint.
-            // Strip \033[2J because the alt/empty-screen doesn't need clearing.
-            let clean = strip_csi_clear(&raw);
-            let mut out = Vec::with_capacity(clean.len() + SGR_RESET.len() + 4);
-            out.extend_from_slice(b"\x1b[H");
-            out.extend_from_slice(SGR_RESET.as_bytes());
-            out.extend_from_slice(&clean);
-            host_term::write_stdout(&out);
-        } else {
-            // Subsequent frames: diff against previous state, emit only changed cells.
-            if let Some(buffer) = self.buffer(PRIMARY_BUFFER_HANDLE) {
-                let diff = screen::flush(buffer, self.rendered.as_ref());
+        if let Some(buffer) = self.buffer(PRIMARY_BUFFER_HANDLE) {
+            if is_first {
+                // First frame: write \033[H + raw text for instant full paint.
+                // No \033[2J — the alt/empty-screen doesn't need clearing.
+                // Reconstruct the grid content as raw text with newlines.
+                let stride = usize::from(buffer.width);
+                let rows = usize::from(buffer.height);
+                let mut raw = Vec::with_capacity(stride * rows + rows);
+                for row in 0..rows {
+                    let base = row * stride;
+                    for col in 0..stride {
+                        if let Some(cell) = buffer.cells.get(base + col) {
+                            let ch = crate::console::screen::char_of(*cell);
+                            raw.push(ch as u8);
+                        }
+                    }
+                    raw.push(b'\n');
+                }
+                let mut out = Vec::with_capacity(raw.len() + SGR_RESET.len() + 4);
+                out.extend_from_slice(b"\x1b[H");
+                out.extend_from_slice(SGR_RESET.as_bytes());
+                out.extend_from_slice(&raw);
+                host_term::write_stdout(&out);
+            } else {
+                let diff = crate::console::screen::flush(buffer, self.rendered.as_ref());
                 if !diff.is_empty() {
                     let mut out = Vec::with_capacity(diff.len() + SGR_RESET.len() + 4);
                     out.extend_from_slice(b"\x1b[H");
@@ -420,9 +441,6 @@ impl ConsoleState {
                     host_term::write_stdout(&out);
                 }
             }
-        }
-        // Save rendered state for next diff.
-        if let Some(buffer) = self.buffer(PRIMARY_BUFFER_HANDLE) {
             self.rendered = Some(buffer.clone());
         }
     }
@@ -438,26 +456,7 @@ impl ConsoleState {
     }
 }
 
-/// Strip \033[J, \033[0J, \033[1J, \033[2J from raw frame data.
-fn strip_csi_clear(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == 0x1b && i + 2 < bytes.len() && bytes[i + 1] == b'[' {
-            let j = i + 2;
-            let is_clear = (j < bytes.len() && bytes[j] == b'J')
-                || (j + 1 < bytes.len() && matches!(bytes[j], b'0' | b'1' | b'2') && bytes[j + 1] == b'J');
-            if is_clear {
-                let skip = if bytes[j] == b'J' { 1 } else { 2 };
-                i = j + skip;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    out
-}
+
 
 impl ConsoleState {
     /// Borrow the screen buffer behind an output handle.
