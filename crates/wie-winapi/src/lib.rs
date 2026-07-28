@@ -230,6 +230,8 @@ pub struct WindowState {
     pub next_menu_handle: u64,
 }
 
+// Manual Default because `[u8; 256]` does not implement `Default` on stable
+// (only arrays up to 32 elements get the trait).
 impl Default for WindowState {
     fn default() -> Self {
         Self {
