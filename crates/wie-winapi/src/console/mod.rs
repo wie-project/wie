@@ -407,15 +407,14 @@ impl ConsoleState {
             }
         }
 
-        // Reconstruct the full grid as text (every cell, every frame).
-        // No diff — the terminal overwrites the previous frame in place.
-        const SGR_RESET: &str = "\u{1b}[0m";
+        // Reconstruct the full grid as text and write it at the terminal's
+        // home position. No trailing newline on the last row so the cursor
+        // never advances past the bottom of the frame.
         if let Some(buffer) = self.buffer(PRIMARY_BUFFER_HANDLE) {
             let stride = usize::from(buffer.width);
             let rows = usize::from(buffer.height);
-            let mut raw = Vec::with_capacity(stride * rows + rows + SGR_RESET.len() + 4);
+            let mut raw = Vec::with_capacity(stride * rows + rows + 6);
             raw.extend_from_slice(b"\x1b[H");
-            raw.extend_from_slice(SGR_RESET.as_bytes());
             for row in 0..rows {
                 let base = row * stride;
                 for col in 0..stride {
@@ -423,7 +422,9 @@ impl ConsoleState {
                         raw.push(crate::console::screen::char_of(*cell) as u8);
                     }
                 }
-                raw.push(b'\n');
+                if row < rows.saturating_sub(1) {
+                    raw.push(b'\n');
+                }
             }
             host_term::write_stdout(&raw);
             self.rendered = Some(buffer.clone());
