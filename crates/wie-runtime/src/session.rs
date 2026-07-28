@@ -1961,8 +1961,14 @@ impl RuntimeSession {
                             charged_api = charged_api.saturating_add(1);
                         }
                         wie_winapi::HostParkReason::PthreadWait => {
-                            // Pthread parking uses WakeQueue; yield briefly so
-                            // the handler can re-check its condition on re-entry.
+                            // Drain any pending CreateThread/pthread_create spawns
+                            // so the worker can start executing guest code.
+                            let _ = self.process.drain_spawns();
+                            if crate::mt_runtime::mt_debug() {
+                                eprintln!("[mt] primary park PthreadWait");
+                            }
+                            // Yield briefly so the handler can re-check its
+                            // condition (WakeQueue park) on re-entry.
                             std::thread::sleep(std::time::Duration::from_millis(1));
                         }
                         wie_winapi::HostParkReason::WaitMultiple => {

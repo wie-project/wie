@@ -9,15 +9,7 @@ use anyhow::{Context, Result};
 
 /// Dispatch `libwinpthread-1.dll` exports.  All functions return 0 (success).
 pub fn dispatch_pthread(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiHandlerResult> {
-    let _ = name; // unused — all pthread stubs return success
-    let return_address = ctx
-        .engine
-        .return_from_win64_api(0)
-        .context("failed to return from pthread function")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 0,
-    })
+    crate::pthread::dispatch(ctx, name)
 }
 
 /// Dispatch `libstdc++-6.dll` exports (C++ runtime).

@@ -252,6 +252,30 @@ fn worker_main(
                 }
             };
 
+        // Pthread return trampoline: the start routine returned. RAX holds
+        // the `void *` result. Mark the pthread finished, wake joiners, exit.
+        // Check BEFORE the generic invalid-memory handler so the trampoline
+        // fault is recognised as a normal thread completion.
+        if run.invalid_memory.hit
+            && run.invalid_memory.address == wie_winapi::pthread_return_trampoline_va()
+        {
+            let return_value = engine.read_rax().unwrap_or(0);
+            if mt_debug() {
+                eprintln!("[mt] worker tid={tid:#x} pthread return value={return_value:#x}");
+            }
+            let mut st = lock(&shared_winapi);
+            st.kernel.threads.activate(tid);
+            if let Some(pt) = st.pthread().by_tid.get(&tid).copied()
+                && let Some(thread) = st.pthread().threads.get_mut(&pt)
+            {
+                thread.exit_value = return_value;
+                thread.finished = true;
+                thread.queue.wake();
+            }
+            finish_tid(&st, tid, 0);
+            return;
+        }
+
         // ThreadProc that `ret`s to the planted 0 return address: RIP becomes 0,
         // or the next fetch faults at VA 0. Both mean normal exit (code in RAX).
         let rip_now = engine.read_rip().unwrap_or(0);
@@ -268,16 +292,8 @@ fn worker_main(
         // Invalid guest access must not soft-yield forever (same RIP retried).
         // Primary session path treats this as a hard stop; workers must too.
         if run.invalid_memory.hit {
-            let rsp = engine.read_rsp().unwrap_or(0);
-            let inv = run.invalid_memory;
-            eprintln!(
-                "[mt] worker tid={tid:#x} invalid_memory type={} addr={:#x} size={} \
-                 value={:#x} rip={rip_now:#x} rsp={rsp:#x} begin={begin:#x}",
-                inv.access_type,
-                inv.address,
-                inv.size,
-                inv.value.cast_unsigned()
-            );
+            let _rsp = engine.read_rsp().unwrap_or(0);
+            let _inv = run.invalid_memory;
             let st = lock(&shared_winapi);
             finish_tid(&st, tid, 1);
             return;
@@ -393,9 +409,8 @@ fn handle_park(
         }
         HostParkReason::PthreadWait => {
             // Pthread parking is handled through WakeQueue inside the handler.
-            // The handler returns HostPark with PthreadWait after registering
-            // the park on the thread's PtPark. Here we just yield briefly so
-            // the next handler re-entry can check the condition.
+            // Yield briefly so the next handler re-entry can check the condition.
+            // Spawns are drained by the caller before entering handle_park.
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         HostParkReason::WaitMultiple => {
