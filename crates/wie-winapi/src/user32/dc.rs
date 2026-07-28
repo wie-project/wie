@@ -123,7 +123,7 @@ pub fn handle_end_paint(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 
     let success = super::is_known_window(state, window_handle);
     if success {
-        state.window_state.window_invalidated = false;
+        state.window_state().window_invalidated = false;
     }
 
     let return_value = u64::from(success);

@@ -38,22 +38,22 @@ const MAX_PENDING_BYTES: usize = 64 * 1024;
 /// Resize detection runs on every call regardless of key input, because
 /// `SIGWINCH` is the one event with no bytes attached.
 pub fn pump(state: &mut WinApiState, timeout_ms: i32) -> usize {
-    let before = state.console.pending_input.len();
+    let before = state.console().pending_input.len();
 
     // A resize is reported by signal, so check it even when no bytes arrive.
     if host_term::resize_pending()
-        && let Some(size) = state.console.sync_window_size()
-        && state.console.input_mode & super::ENABLE_WINDOW_INPUT != 0
+        && let Some(size) = state.console().sync_window_size()
+        && state.console().input_mode & super::ENABLE_WINDOW_INPUT != 0
     {
         state
-            .console
+            .console()
             .pending_input
             .push_back(InputRecord::WindowBufferSize(size));
     }
 
     // SIGINT → Ctrl+C key event, delivered even when no bytes are pending.
     if host_term::drain_ctrlc() {
-        state.console.pending_input.push_back(InputRecord::Key(KeyEvent {
+        state.console().pending_input.push_back(InputRecord::Key(KeyEvent {
             key_down: true,
             repeat_count: 1,
             virtual_key_code: 0x43, // 'C'
@@ -68,37 +68,37 @@ pub fn pump(state: &mut WinApiState, timeout_ms: i32) -> usize {
         let got = host_term::read_stdin(&mut chunk);
         if got > 0
             && let Some(bytes) = chunk.get(..got)
-            && state.console.input_bytes.len() < MAX_PENDING_BYTES
+            && state.console().input_bytes.len() < MAX_PENDING_BYTES
         {
-            state.console.input_bytes.extend_from_slice(bytes);
+            state.console().input_bytes.extend_from_slice(bytes);
         }
     }
 
-    if !state.console.input_bytes.is_empty() {
+    if !state.console().input_bytes.is_empty() {
         // A full read means more bytes are probably queued behind it, so a
         // trailing ESC should wait rather than resolve as the Escape key.
-        let more_coming = state.console.input_bytes.len() >= READ_CHUNK;
-        let (records, used) = input::decode(&state.console.input_bytes, more_coming);
+        let more_coming = state.console().input_bytes.len() >= READ_CHUNK;
+        let (records, used) = input::decode(&state.console().input_bytes, more_coming);
         if used > 0 {
-            state.console.input_bytes.drain(..used);
+            state.console().input_bytes.drain(..used);
         }
-        let mouse_enabled = state.console.input_mode & super::ENABLE_MOUSE_INPUT != 0;
+        let mouse_enabled = state.console().input_mode & super::ENABLE_MOUSE_INPUT != 0;
         for record in records {
             // Windows filters by mode at the queue, not at ReadConsoleInput.
             let keep = match record {
                 InputRecord::Mouse(_) => mouse_enabled,
                 InputRecord::WindowBufferSize(_) => {
-                    state.console.input_mode & super::ENABLE_WINDOW_INPUT != 0
+                    state.console().input_mode & super::ENABLE_WINDOW_INPUT != 0
                 }
                 InputRecord::Key(_) => true,
             };
             if keep {
-                state.console.pending_input.push_back(record);
+                state.console().pending_input.push_back(record);
             }
         }
     }
 
-    state.console.pending_input.len().saturating_sub(before)
+    state.console().pending_input.len().saturating_sub(before)
 }
 
 /// Enable or disable xterm SGR mouse reporting on the host terminal.
@@ -174,7 +174,7 @@ fn put_u32(buffer: &mut [u8; INPUT_RECORD_SIZE], offset: usize, value: u32) {
 /// (`_getch`, `_kbhit`) expect to see.
 pub fn next_key_press(state: &mut WinApiState, block: bool) -> Option<super::KeyEvent> {
     loop {
-        while let Some(record) = state.console.pending_input.pop_front() {
+        while let Some(record) = state.console().pending_input.pop_front() {
             if let InputRecord::Key(event) = record
                 && event.key_down
             {
@@ -197,11 +197,11 @@ pub fn next_key_press(state: &mut WinApiState, block: bool) -> Option<super::Key
 /// Idempotent, and cheap enough to call at the top of any input handler: a
 /// program that calls `ReadConsoleInput` without first clearing
 /// `ENABLE_LINE_INPUT` still needs cbreak mode to get per-key delivery.
-pub fn ensure_input_ready(state: &WinApiState) {
+pub fn ensure_input_ready(state: &mut WinApiState) {
     if host_term::raw_active() {
         return;
     }
-    let processed = state.console.input_mode & super::ENABLE_PROCESSED_INPUT != 0;
+    let processed = state.console().input_mode & super::ENABLE_PROCESSED_INPUT != 0;
     host_term::enter_raw(processed);
 }
 

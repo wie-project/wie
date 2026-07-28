@@ -49,7 +49,7 @@ pub fn handle_peek_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     };
 
     let matching_index = state
-        .window_state
+        .window_state()
         .message_queue
         .iter()
         .position(matches_filter);
@@ -57,11 +57,11 @@ pub fn handle_peek_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     let return_value = if let Some(index) = matching_index {
         let queued = if w_remove_msg != 0 {
             // PM_REMOVE: remove from queue.
-            state.window_state.message_queue.remove(index)
+            state.window_state().message_queue.remove(index)
         } else {
             // PM_NOREMOVE: leave in queue. Index is from `position` on this Vec.
             state
-                .window_state
+                .window_state()
                 .message_queue
                 .get(index)
                 .cloned()
@@ -133,15 +133,15 @@ pub fn handle_post_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     let valid_window = window_handle == 0 || window_handle == FAKE_WINDOW_HANDLE;
 
     if valid_window {
-        let time = state.window_state.next_message_time;
+        let time = state.window_state().next_message_time;
 
-        state.window_state.next_message_time = state
-            .window_state
+        state.window_state().next_message_time = state
+            .window_state()
             .next_message_time
             .checked_add(1)
             .context("PostMessageA timestamp overflow")?;
 
-        state.window_state.message_queue.push(QueuedWindowMessage {
+        state.window_state().message_queue.push(QueuedWindowMessage {
             window_handle,
             message,
             word_parameter,
@@ -314,7 +314,7 @@ pub fn handle_get_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     };
 
     let matching_index = state
-        .window_state
+        .window_state()
         .message_queue
         .iter()
         .position(matches_filter);
@@ -323,13 +323,13 @@ pub fn handle_get_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         // GetMessage returns -1 on failure.
         u64::from(u32::MAX)
     } else if let Some(index) = matching_index {
-        let queued = state.window_state.message_queue.remove(index);
+        let queued = state.window_state().message_queue.remove(index);
 
         write_message_structure(engine, message_address, &queued)?;
 
         u64::from(queued.message != WM_QUIT)
     } else {
-        match state.window_state.message_queue_idle_policy {
+        match state.window_state().message_queue_idle_policy {
             MessageQueueIdlePolicy::ExitOnIdle => {
                 /*
                  * Regression mode: represent an empty queue as a synthetic
@@ -340,13 +340,13 @@ pub fn handle_get_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
                     message: WM_QUIT,
                     word_parameter: 0,
                     long_parameter: 0,
-                    time: state.window_state.next_message_time,
+                    time: state.window_state().next_message_time,
                     point_x: 0,
                     point_y: 0,
                 };
 
-                state.window_state.next_message_time = state
-                    .window_state
+                state.window_state().next_message_time = state
+                    .window_state()
                     .next_message_time
                     .checked_add(1)
                     .context("GetMessageA timestamp overflow")?;
@@ -499,7 +499,7 @@ pub fn handle_dispatch_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         .context("failed to read MSG.lParam for DispatchMessageA")?;
 
     let target_window = state
-        .window_state
+        .window_state()
         .windows
         .iter()
         .find(|window| window.handle == window_handle);

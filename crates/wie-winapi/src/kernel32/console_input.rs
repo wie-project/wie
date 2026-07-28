@@ -64,7 +64,7 @@ fn read_or_peek(
 
     // ReadConsoleInput blocks until at least one record exists; Peek returns
     // immediately with whatever is already queued.
-    if ctx.state.console.pending_input.is_empty() {
+    if ctx.state.console().pending_input.is_empty() {
         let timeout = if consume { -1 } else { 0 };
         let added = pump::pump(ctx.state, timeout);
         if added == 0 && consume {
@@ -77,13 +77,13 @@ fn read_or_peek(
         }
     }
 
-    let take = capacity.min(ctx.state.console.pending_input.len());
+    let take = capacity.min(ctx.state.console().pending_input.len());
     let mut bytes = Vec::with_capacity(take.saturating_mul(INPUT_RECORD_SIZE));
     for index in 0..take {
         let record = if consume {
-            ctx.state.console.pending_input.pop_front()
+            ctx.state.console().pending_input.pop_front()
         } else {
-            ctx.state.console.pending_input.get(index).copied()
+            ctx.state.console().pending_input.get(index).copied()
         };
         let Some(record) = record else {
             break;
@@ -139,7 +139,7 @@ pub fn handle_get_number_of_console_input_events(
     }
     pump::ensure_input_ready(ctx.state);
     let _ = pump::pump(ctx.state, 0);
-    let count = u32::try_from(ctx.state.console.pending_input.len()).unwrap_or(u32::MAX);
+    let count = u32::try_from(ctx.state.console().pending_input.len()).unwrap_or(u32::MAX);
     write_guest_u32(ctx.engine, count_ptr, count)?;
     ret_bool_true(ctx.engine, "GetNumberOfConsoleInputEvents")
 }
@@ -158,8 +158,8 @@ pub fn handle_flush_console_input_buffer(
     // Drain the host side too: bytes already read but not yet decoded would
     // otherwise reappear as records immediately after the flush.
     let _ = pump::pump(ctx.state, 0);
-    ctx.state.console.pending_input.clear();
-    ctx.state.console.input_bytes.clear();
+    ctx.state.console().pending_input.clear();
+    ctx.state.console().input_bytes.clear();
     ret_bool_true(ctx.engine, "FlushConsoleInputBuffer")
 }
 
@@ -202,7 +202,7 @@ pub(crate) fn conio_key_waiting(ctx: &mut HandlerContext<'_>) -> bool {
     pump::ensure_input_ready(ctx.state);
     let _ = pump::pump(ctx.state, 0);
     ctx.state
-        .console
+        .console()
         .pending_input
         .iter()
         .any(|record| matches!(record, InputRecord::Key(event) if event.key_down))

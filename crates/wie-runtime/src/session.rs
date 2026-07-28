@@ -1100,7 +1100,7 @@ impl RuntimeSession {
             }
         }
 
-        winapi_state.window_state.message_queue_idle_policy = idle_policy;
+        winapi_state.window_state().message_queue_idle_policy = idle_policy;
         winapi_state.file_io.guest_io = Some(wie_winapi::GuestIoRuntimeConfig {
             table_va: guest_io_config.table_va,
             file_data_base: guest_io_config.file_data_base,
@@ -1246,13 +1246,13 @@ impl RuntimeSession {
     /// Changes the behavior of `GetMessageA` when the queue is empty.
     pub fn set_message_queue_idle_policy(&mut self, policy: wie_winapi::MessageQueueIdlePolicy) {
         self.process
-            .with_mut(|_, s| s.window_state.message_queue_idle_policy = policy);
+            .with_mut(|_, s| s.window_state().message_queue_idle_policy = policy);
     }
 
     /// Adds one message to the persistent guest message queue.
     pub fn post_message(&mut self, message: wie_winapi::QueuedWindowMessage) {
         self.process
-            .with_mut(|_, s| s.window_state.message_queue.push(message));
+            .with_mut(|_, s| s.window_state().message_queue.push(message));
     }
 
     /// Runs the guest until it yields, terminates, reaches an unsupported API,
@@ -2054,13 +2054,13 @@ impl RuntimeSession {
         long_parameter: u64,
     ) -> Result<()> {
         self.process.with_mut(|_, st| {
-            let time = st.window_state.next_message_time;
-            st.window_state.next_message_time = st
-                .window_state
+            let time = st.window_state().next_message_time;
+            st.window_state().next_message_time = st
+                .window_state()
                 .next_message_time
                 .checked_add(1)
                 .context("runtime message timestamp overflow")?;
-            st.window_state
+            st.window_state()
                 .message_queue
                 .push(wie_winapi::QueuedWindowMessage {
                     window_handle,
@@ -2079,11 +2079,13 @@ impl RuntimeSession {
     #[must_use]
     pub fn first_guest_window_handle(&self) -> Option<u64> {
         self.process.with_winapi_ref(|st| {
-            st.window_state
-                .windows
-                .iter()
-                .find(|window| window.window_proc != 0)
-                .map(|window| window.handle)
+            st.try_window_state()
+                .and_then(|ws| {
+                    ws.windows
+                        .iter()
+                        .find(|window| window.window_proc != 0)
+                        .map(|window| window.handle)
+                })
         })
     }
 
@@ -2091,18 +2093,21 @@ impl RuntimeSession {
     #[must_use]
     pub fn guest_windows_snapshot(&self) -> Vec<(u64, String, String, bool)> {
         self.process.with_winapi_ref(|st| {
-            st.window_state
-                .windows
-                .iter()
-                .map(|window| {
-                    (
-                        window.handle,
-                        window.class_name.clone(),
-                        window.title.clone(),
-                        window.window_proc != 0,
-                    )
+            st.try_window_state()
+                .map(|ws| {
+                    ws.windows
+                        .iter()
+                        .map(|window| {
+                            (
+                                window.handle,
+                                window.class_name.clone(),
+                                window.title.clone(),
+                                window.window_proc != 0,
+                            )
+                        })
+                        .collect()
                 })
-                .collect()
+                .unwrap_or_default()
         })
     }
 
@@ -2115,14 +2120,14 @@ impl RuntimeSession {
     /// Configures the next common file dialog outcome (`GetOpenFileName` / `GetSaveFileName`).
     pub fn set_file_dialog_policy(&mut self, policy: wie_winapi::FileDialogPolicy) {
         self.process
-            .with_mut(|_, s| s.window_state.file_dialog_policy = policy);
+            .with_mut(|_, s| s.window_state().file_dialog_policy = policy);
     }
 
     /// Returns the last path accepted by a simulated file dialog.
     #[must_use]
     pub fn last_file_dialog_path(&self) -> Option<String> {
         self.process
-            .with_winapi_ref(|st| st.window_state.last_file_dialog_path.clone())
+            .with_winapi_ref(|st| st.try_window_state().and_then(|ws| ws.last_file_dialog_path.clone()))
     }
 
     /// Mounts a host file so the guest can open it via `CreateFile*` under `guest_path`.

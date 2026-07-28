@@ -174,7 +174,7 @@ pub struct ModuleState {
 }
 
 /// Direct3D 9 rendering state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct D3D9State {
     pub d3d9_current_vertex_shader: u64,
     pub d3d9_current_fvf: u32,
@@ -227,6 +227,50 @@ pub struct WindowState {
     pub last_file_dialog_path: Option<String>,
     pub comm_dlg_extended_error: u32,
     pub next_menu_handle: u64,
+}
+
+impl Default for WindowState {
+    fn default() -> Self {
+        Self {
+            window_long_ptr_values: Vec::new(),
+            image_list_counts: Vec::new(),
+            image_list_background_colors: Vec::new(),
+            window_visible: false,
+            window_enabled: false,
+            active_window_handle: 0,
+            foreground_window_handle: 0,
+            focus_window_handle: 0,
+            capture_window_handle: 0,
+            cursor_handle: 0,
+            window_title: String::new(),
+            window_x: 0,
+            window_y: 0,
+            window_width: 0,
+            window_height: 0,
+            window_invalidated: false,
+            tick_count: 0,
+            keyboard_state: [0; 256],
+            next_timer_id: 0,
+            timers: Vec::new(),
+            next_global_atom: 0,
+            global_atoms: Vec::new(),
+            next_windows_hook_handle: 0,
+            windows_hooks: Vec::new(),
+            menu_item_states: Vec::new(),
+            menu_item_check_states: Vec::new(),
+            message_queue: Vec::new(),
+            next_message_time: 0,
+            message_queue_idle_policy: MessageQueueIdlePolicy::ExitOnIdle,
+            next_window_class_atom: 0,
+            window_classes: Vec::new(),
+            next_window_handle: 0,
+            windows: Vec::new(),
+            file_dialog_policy: FileDialogPolicy::Cancel,
+            last_file_dialog_path: None,
+            comm_dlg_extended_error: 0,
+            next_menu_handle: 0,
+        }
+    }
 }
 
 /// Process-level state (identity, error handling, registry, misc).
@@ -291,25 +335,129 @@ pub struct KernelState {
     pub seh_pending: std::collections::HashMap<u32, seh::SehPending>,
 }
 
+/// Identifies a slot in [`DllStateMap`]. One variant per emulated DLL
+/// that carries state.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum DllId {
+    Console,
+    Window,
+    D3D9,
+    Pthread,
+}
+
+impl DllId {
+    pub const COUNT: usize = 4;
+}
+
+/// Combines `Any` for downcasting with `Clone` for cloning through a
+/// trait object. Stored in [`DllStateMap`] slots.
+trait CloneBoxAny: std::any::Any + Send {
+    fn clone_box(&self) -> Box<dyn CloneBoxAny>;
+}
+impl<T: Clone + Send + 'static> CloneBoxAny for T {
+    fn clone_box(&self) -> Box<dyn CloneBoxAny> {
+        Box::new(self.clone())
+    }
+}
+
+/// Lazy DLL state storage. Fixed-size array, zero per-call overhead.
+///
+/// Each slot is `Option<Box<dyn CloneBoxAny>>` — a nullable fat pointer
+/// (16 bytes) when unloaded. Access is a direct array index + one `TypeId`
+/// compare. No hash, no indirect dispatch.
+pub struct DllStateMap {
+    slots: [Option<Box<dyn CloneBoxAny>>; DllId::COUNT],
+}
+
+impl Default for DllStateMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for DllStateMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let loaded: Vec<&str> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| slot.as_ref().map(|_| match i {
+                0 => "console",
+                1 => "window",
+                2 => "d3d9",
+                3 => "pthread",
+                _ => "?",
+            }))
+            .collect();
+        f.debug_struct("DllStateMap")
+            .field("loaded", &loaded)
+            .finish()
+    }
+}
+
+impl DllStateMap {
+    pub fn new() -> Self {
+        Self {
+            slots: [None, None, None, None],
+        }
+    }
+
+    /// Access the state for `id`, heap-allocating a default on first call.
+    ///
+    /// # Panics
+    /// If the slot type does not match `T` — a programming error when a
+    /// `DllId` variant is reused for a different type.
+    #[allow(clippy::as_conversions, clippy::expect_used)]
+    pub fn get_or_init<T: Clone + Default + Send + 'static>(&mut self, id: DllId) -> &mut T {
+        let idx = id as u8 as usize;
+        let slot = self
+            .slots
+            .get_mut(idx)
+            .expect("DllId index out of range — did you forget to bump COUNT?");
+        slot.get_or_insert_with(|| Box::new(T::default()));
+        let boxed = slot.as_mut().expect("slot was just initialised");
+        let any: &mut dyn std::any::Any = boxed.as_mut();
+        any.downcast_mut::<T>()
+            .expect("DllId slot type mismatch")
+    }
+
+    /// Read-only access — returns `None` if the slot was never initialised.
+    #[allow(clippy::as_conversions)]
+    pub fn get<T: 'static>(&self, id: DllId) -> Option<&T> {
+        let idx = id as u8 as usize;
+        let boxed = self.slots.get(idx)?.as_ref()?;
+        let any: &dyn std::any::Any = boxed.as_ref();
+        any.downcast_ref::<T>()
+    }
+}
+
+impl Clone for DllStateMap {
+    fn clone(&self) -> Self {
+        DllStateMap {
+            slots: [
+                self.slots[0].as_ref().map(|boxed| boxed.clone_box()),
+                self.slots[1].as_ref().map(|boxed| boxed.clone_box()),
+                self.slots[2].as_ref().map(|boxed| boxed.clone_box()),
+                self.slots[3].as_ref().map(|boxed| boxed.clone_box()),
+            ],
+        }
+    }
+}
+
 pub struct WinApiState {
     /// Heap + FLS state.
     pub heap_state: HeapState,
     /// File I/O, VFS, and console stdin state.
     pub file_io: FileIoState,
-    /// Window, UI, input, dialog, and atom state.
-    pub window_state: WindowState,
-    /// Direct3D 9 rendering state.
-    pub d3d9: D3D9State,
     /// DLL loading and export resolution cache.
     pub module_state: ModuleState,
     /// Process-level state (error, registry, identity, misc).
     pub process: ProcessState,
     /// Kernel execution state (threading, sync, SEH).
     pub kernel: KernelState,
-    /// Console screen buffers, modes, and decoded input records.
-    pub console: console::ConsoleState,
-    /// `libwinpthread-1.dll` emulation state.
-    pub pthread: pthread::PthreadState,
+    /// On-demand state for optional WIE-hosted DLLs.
+    pub dll_states: DllStateMap,
 }
 
 // Manual Debug impl: Box<dyn FnMut + Send> does not implement Debug.
@@ -318,13 +466,10 @@ impl std::fmt::Debug for WinApiState {
         f.debug_struct("WinApiState")
             .field("heap_state", &self.heap_state)
             .field("file_io", &self.file_io)
-            .field("window_state", &self.window_state)
-            .field("d3d9", &self.d3d9)
+            .field("dll_states", &self.dll_states)
             .field("module_state", &self.module_state)
             .field("process", &self.process)
             .field("kernel", &self.kernel)
-            .field("console", &self.console)
-            .field("pthread", &self.pthread)
             .finish()
     }
 }
@@ -335,14 +480,43 @@ impl Clone for WinApiState {
         Self {
             heap_state: self.heap_state.clone(),
             file_io: self.file_io.clone(),
-            window_state: self.window_state.clone(),
-            d3d9: self.d3d9.clone(),
+            dll_states: self.dll_states.clone(),
             module_state: self.module_state.clone(),
             process: self.process.clone(),
             kernel: self.kernel.clone(),
-            console: self.console.clone(),
-            pthread: self.pthread.clone(),
         }
+    }
+}
+
+// ── DLL state accessors ─────────────────────────────────────────────────
+impl WinApiState {
+    /// Mutable access — lazy-initialises on first call.
+    pub fn console(&mut self) -> &mut console::ConsoleState {
+        self.dll_states.get_or_init::<console::ConsoleState>(DllId::Console)
+    }
+    pub fn window_state(&mut self) -> &mut WindowState {
+        self.dll_states.get_or_init::<WindowState>(DllId::Window)
+    }
+    pub fn d3d9(&mut self) -> &mut D3D9State {
+        self.dll_states.get_or_init::<D3D9State>(DllId::D3D9)
+    }
+    pub fn pthread(&mut self) -> &mut pthread::PthreadState {
+        self.dll_states.get_or_init::<pthread::PthreadState>(DllId::Pthread)
+    }
+
+    /// Read-only access — returns `None` if the state was never initialised.
+    /// Use when the caller only holds `&Self`.
+    pub fn try_console(&self) -> Option<&console::ConsoleState> {
+        self.dll_states.get::<console::ConsoleState>(DllId::Console)
+    }
+    pub fn try_window_state(&self) -> Option<&WindowState> {
+        self.dll_states.get::<WindowState>(DllId::Window)
+    }
+    pub fn try_d3d9(&self) -> Option<&D3D9State> {
+        self.dll_states.get::<D3D9State>(DllId::D3D9)
+    }
+    pub fn try_pthread(&self) -> Option<&pthread::PthreadState> {
+        self.dll_states.get::<pthread::PthreadState>(DllId::Pthread)
     }
 }
 
@@ -398,8 +572,9 @@ pub struct GuestIoRuntimeConfig {
 }
 
 /// Host-side decision for `GetOpenFileName` / `GetSaveFileName`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum FileDialogPolicy {
+    #[default]
     /// Simulate the user cancelling the dialog (`return FALSE`).
     Cancel,
 
@@ -745,8 +920,9 @@ pub struct FlsSlot {
 }
 
 /// Behavior of `GetMessageA` when no matching message is available.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MessageQueueIdlePolicy {
+    #[default]
     /// Produce a synthetic `WM_QUIT`.
     ///
     /// This preserves the deterministic bootstrap regression path.
@@ -934,64 +1110,13 @@ mod tests {
                 sync: SyncState::new(),
                 seh_pending: HashMap::new(),
             },
-            console: console::ConsoleState::default(),
-            window_state: WindowState {
-                window_long_ptr_values: Vec::new(),
-                image_list_counts: Vec::new(),
-                image_list_background_colors: Vec::new(),
-                window_visible: false,
-                window_enabled: false,
-                active_window_handle: 0,
-                foreground_window_handle: 0,
-                focus_window_handle: 0,
-                capture_window_handle: 0,
-                cursor_handle: 0,
-                window_title: String::new(),
-                window_x: 0,
-                window_y: 0,
-                window_width: 0,
-                window_height: 0,
-                window_invalidated: false,
-                tick_count: 0,
-                keyboard_state: [0; 256],
-                next_timer_id: 0,
-                timers: Vec::new(),
-                next_global_atom: 0,
-                global_atoms: Vec::new(),
-                next_windows_hook_handle: 0,
-                windows_hooks: Vec::new(),
-                menu_item_states: Vec::new(),
-                menu_item_check_states: Vec::new(),
-                message_queue: Vec::new(),
-                next_message_time: 0,
-                message_queue_idle_policy: MessageQueueIdlePolicy::ExitOnIdle,
-                next_window_class_atom: 0,
-                window_classes: Vec::new(),
-                next_window_handle: 0,
-                windows: Vec::new(),
-                file_dialog_policy: FileDialogPolicy::Cancel,
-                last_file_dialog_path: None,
-                comm_dlg_extended_error: 0,
-                next_menu_handle: 0,
-            },
-            d3d9: D3D9State {
-                d3d9_current_vertex_shader: 0,
-                d3d9_current_fvf: 0,
-                d3d9_render_states: Vec::new(),
-                d3d9_texture_stage_states: Vec::new(),
-                d3d9_sampler_states: Vec::new(),
-                d3d9_device_object_address: 0,
-                d3d9_device_ref_count: 0,
-                d3d9_object_address: 0,
-                d3d9_ref_count: 0,
-            },
+            dll_states: DllStateMap::new(),
             module_state: ModuleState {
                 loaded_modules: HashMap::new(),
                 import_resolver: None,
                 get_proc_address_cache: HashMap::new(),
                 next_module_handle: dll_loader::REAL_MODULE_HANDLE_BASE,
             },
-            pthread: pthread::PthreadState::default(),
         }
     }
 
@@ -1249,7 +1374,7 @@ mod tests {
     fn test_get_async_key_state_down() {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
-        state.window_state.keyboard_state[0x0D] = 0x80; // VK_RETURN high bit set
+        state.window_state().keyboard_state[0x0D] = 0x80; // VK_RETURN high bit set
         write_regs(&mut engine, 0x0D, 0, 0, 0, 0);
         assert_return_value!(
             user32::handle_get_async_key_state(&mut HandlerContext::new(
@@ -1288,7 +1413,7 @@ mod tests {
             .mem_map(msg_va, 0x1000, wie_cpu::RwxPerms::ALL)
             .expect("map msg struct");
         // Push a WM_PAINT message for any window.
-        state.window_state.message_queue.push(QueuedWindowMessage {
+        state.window_state().message_queue.push(QueuedWindowMessage {
             window_handle: 0x100,
             message: 15, // WM_PAINT
             word_parameter: 0,
@@ -1311,7 +1436,7 @@ mod tests {
             1
         );
         // WM_PAINT should have been removed from the queue.
-        assert_eq!(state.window_state.message_queue.len(), 0);
+        assert_eq!(state.window_state().message_queue.len(), 0);
     }
 
     #[test]
@@ -1323,7 +1448,7 @@ mod tests {
         engine
             .mem_map(msg_va, 0x1000, wie_cpu::RwxPerms::ALL)
             .expect("map msg struct");
-        state.window_state.message_queue.push(QueuedWindowMessage {
+        state.window_state().message_queue.push(QueuedWindowMessage {
             window_handle: 0x100,
             message: 15,
             word_parameter: 0,
@@ -1344,7 +1469,7 @@ mod tests {
             1
         );
         // Message should still be in the queue.
-        assert_eq!(state.window_state.message_queue.len(), 1);
+        assert_eq!(state.window_state().message_queue.len(), 1);
     }
 
     // --- Comctl32 ---
@@ -1898,7 +2023,7 @@ mod tests {
         let mut state = default_winapi_state();
         let hwnd = 0x100;
         let hmenu = 0x200;
-        state.window_state.windows.push(crate::WindowRecord {
+        state.window_state().windows.push(crate::WindowRecord {
             handle: hwnd,
             menu_handle: hmenu,
             ..Default::default()

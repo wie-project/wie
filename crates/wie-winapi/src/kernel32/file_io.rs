@@ -3002,8 +3002,8 @@ pub fn handle_get_temp_file_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinAp
     };
     let prefix: String = prefix.chars().take(3).collect();
     let id = if unique == 0 {
-        state.window_state.tick_count = state.window_state.tick_count.wrapping_add(1);
-        state.window_state.tick_count
+        state.window_state().tick_count = state.window_state().tick_count.wrapping_add(1);
+        state.window_state().tick_count
     } else {
         unique
     };
@@ -3048,8 +3048,8 @@ pub fn handle_get_temp_file_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinAp
     };
     let prefix: String = prefix.chars().take(3).collect();
     let id = if unique == 0 {
-        state.window_state.tick_count = state.window_state.tick_count.wrapping_add(1);
-        state.window_state.tick_count
+        state.window_state().tick_count = state.window_state().tick_count.wrapping_add(1);
+        state.window_state().tick_count
     } else {
         unique
     };

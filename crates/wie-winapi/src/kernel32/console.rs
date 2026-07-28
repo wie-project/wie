@@ -127,9 +127,9 @@ pub fn handle_get_console_mode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         return ret_invalid_handle(ctx, "GetConsoleMode");
     }
     let mode = if handle == FAKE_STDIN_HANDLE {
-        ctx.state.console.input_mode
-    } else if let Some(buffer) = buffer_handle_for(&ctx.state.console, handle) {
-        ctx.state.console.output_mode(buffer)
+        ctx.state.console().input_mode
+    } else if let Some(buffer) = buffer_handle_for(ctx.state.console(), handle) {
+        ctx.state.console().output_mode(buffer)
     } else {
         return ret_invalid_handle(ctx, "GetConsoleMode");
     };
@@ -152,9 +152,9 @@ pub fn handle_set_console_mode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
             ctx.state.process.last_error = super::ERROR_INVALID_PARAMETER;
             return ret_u64(ctx.engine, 0, "SetConsoleMode");
         }
-        let prev_mode = ctx.state.console.input_mode;
-        ctx.state.console.input_mode = requested;
-        apply_input_mode_to_host(&ctx.state.console);
+        let prev_mode = ctx.state.console().input_mode;
+        ctx.state.console().input_mode = requested;
+        apply_input_mode_to_host(ctx.state.console());
         // Toggle xterm mouse reporting when the guest changes ENABLE_MOUSE_INPUT
         if (prev_mode ^ requested) & console::ENABLE_MOUSE_INPUT != 0 {
             crate::console::pump::set_mouse_reporting(
@@ -164,14 +164,14 @@ pub fn handle_set_console_mode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         return ret_bool_true(ctx.engine, "SetConsoleMode");
     }
 
-    let Some(buffer) = buffer_handle_for(&ctx.state.console, handle) else {
+    let Some(buffer) = buffer_handle_for(ctx.state.console(), handle) else {
         return ret_invalid_handle(ctx, "SetConsoleMode");
     };
     if requested & !VALID_OUTPUT_MODE != 0 {
         ctx.state.process.last_error = super::ERROR_INVALID_PARAMETER;
         return ret_u64(ctx.engine, 0, "SetConsoleMode");
     }
-    ctx.state.console.set_output_mode(buffer, requested);
+    ctx.state.console().set_output_mode(buffer, requested);
     ret_bool_true(ctx.engine, "SetConsoleMode")
 }
 
@@ -208,14 +208,14 @@ pub fn handle_get_console_screen_buffer_info(
     if info_ptr == 0 {
         return ret_invalid_handle(ctx, "GetConsoleScreenBufferInfo");
     }
-    let Some(buffer_handle) = buffer_handle_for(&ctx.state.console, handle) else {
+    let Some(buffer_handle) = buffer_handle_for(ctx.state.console(), handle) else {
         return ret_invalid_handle(ctx, "GetConsoleScreenBufferInfo");
     };
     // Adopt any terminal resize that happened since the last call, so a guest
     // that sizes its playfield from this struct tracks the real window.
-    let _ = ctx.state.console.sync_window_size();
+    let _ = ctx.state.console().sync_window_size();
 
-    let Some(buffer) = ctx.state.console.buffer(buffer_handle) else {
+    let Some(buffer) = ctx.state.console().buffer(buffer_handle) else {
         return ret_invalid_handle(ctx, "GetConsoleScreenBufferInfo");
     };
     let columns = buffer.width;
@@ -269,7 +269,7 @@ fn write_console(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiHandl
     )?;
     let written_ptr = ctx.engine.read_r9().context("WriteConsole R9")?;
 
-    if !is_console_output_handle(&ctx.state.console, handle) {
+    if !is_console_output_handle(ctx.state.console(), handle) {
         return ret_invalid_handle(ctx, api);
     }
 
@@ -294,7 +294,7 @@ fn write_console(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiHandl
         let mut bytes = vec![0_u8; count_usize];
         read_guest_bytes(ctx.engine, buffer_ptr, &mut bytes)
             .context("WriteConsoleA guest buffer")?;
-        let code_page = ctx.state.console.output_code_page;
+        let code_page = ctx.state.console().output_code_page;
         codepage::decode_to_units(code_page, &bytes)
     };
 
@@ -315,12 +315,12 @@ fn emit_console_text(ctx: &mut HandlerContext<'_>, handle: u64, units: &[u16]) {
     if units.is_empty() {
         return;
     }
-    let Some(buffer_handle) = buffer_handle_for(&ctx.state.console, handle) else {
+    let Some(buffer_handle) = buffer_handle_for(ctx.state.console(), handle) else {
         return;
     };
 
-    if ctx.state.console.render_mode == console::RenderMode::Cells {
-        fold_text_into_grid(&mut ctx.state.console, buffer_handle, units);
+    if ctx.state.console().render_mode == console::RenderMode::Cells {
+        fold_text_into_grid(ctx.state.console(), buffer_handle, units);
         return;
     }
 
@@ -328,9 +328,9 @@ fn emit_console_text(ctx: &mut HandlerContext<'_>, handle: u64, units: &[u16]) {
     // An ESC in the stream means the guest is driving the terminal directly;
     // the tracked cursor can no longer be trusted to match the real one.
     if text.contains('\u{1b}') {
-        ctx.state.console.note_stream_escape();
+        ctx.state.console().note_stream_escape();
     }
-    advance_tracked_cursor(&mut ctx.state.console, buffer_handle, units);
+    advance_tracked_cursor(ctx.state.console(), buffer_handle, units);
     if handle == FAKE_STDERR_HANDLE {
         write_host_stderr(text.as_bytes());
     } else {
@@ -480,7 +480,7 @@ fn read_console(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiHandle
     ctx.state.file_io.stdin_cursor = cursor.saturating_add(take);
 
     let written = if wide {
-        let units = codepage::decode_to_units(ctx.state.console.input_code_page, &chunk);
+        let units = codepage::decode_to_units(ctx.state.console().input_code_page, &chunk);
         let units = units.get(..units.len().min(capacity_usize)).unwrap_or(&[]);
         let mut bytes = Vec::with_capacity(units.len().saturating_mul(2));
         for unit in units {
@@ -518,12 +518,12 @@ fn is_supported_code_page(code_page: u32) -> bool {
 }
 
 pub fn handle_get_console_cp(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let value = u64::from(ctx.state.console.input_code_page);
+    let value = u64::from(ctx.state.console().input_code_page);
     ret_u64(ctx.engine, value, "GetConsoleCP")
 }
 
 pub fn handle_get_console_output_cp(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let value = u64::from(ctx.state.console.output_code_page);
+    let value = u64::from(ctx.state.console().output_code_page);
     ret_u64(ctx.engine, value, "GetConsoleOutputCP")
 }
 
@@ -536,7 +536,7 @@ pub fn handle_set_console_cp(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         ctx.state.process.last_error = super::ERROR_INVALID_PARAMETER;
         return ret_u64(ctx.engine, 0, "SetConsoleCP");
     }
-    ctx.state.console.input_code_page = code_page;
+    ctx.state.console().input_code_page = code_page;
     ret_bool_true(ctx.engine, "SetConsoleCP")
 }
 
@@ -549,7 +549,7 @@ pub fn handle_set_console_output_cp(ctx: &mut HandlerContext<'_>) -> Result<WinA
         ctx.state.process.last_error = super::ERROR_INVALID_PARAMETER;
         return ret_u64(ctx.engine, 0, "SetConsoleOutputCP");
     }
-    ctx.state.console.output_code_page = code_page;
+    ctx.state.console().output_code_page = code_page;
     ret_bool_true(ctx.engine, "SetConsoleOutputCP")
 }
 
@@ -570,7 +570,7 @@ fn set_console_title(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiH
         read_guest_utf16_lossy(ctx.engine, title_ptr, 1024)?
     } else {
         let bytes = read_ansi_bytes(ctx.engine, title_ptr, 1024)?;
-        let code_page = ctx.state.console.output_code_page;
+        let code_page = ctx.state.console().output_code_page;
         codepage::units_to_host_utf8(&codepage::decode_to_units(code_page, &bytes))
     };
 
@@ -580,7 +580,7 @@ fn set_console_title(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiH
     if host_term::is_tty() {
         host_term::write_stdout(format!("\u{1b}]2;{sanitised}\u{7}").as_bytes());
     }
-    ctx.state.console.title = title;
+    ctx.state.console().title = title;
     ret_bool_true(ctx.engine, api)
 }
 
@@ -610,7 +610,7 @@ fn get_console_title(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiH
         return ret_u64(ctx.engine, 0, api);
     }
 
-    let title = ctx.state.console.title.clone();
+    let title = ctx.state.console().title.clone();
     let written = if wide {
         let mut units: Vec<u16> = title.encode_utf16().collect();
         units.truncate(capacity_usize.saturating_sub(1));
@@ -625,7 +625,7 @@ fn get_console_title(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiH
             .context("GetConsoleTitleW write")?;
         count
     } else {
-        let code_page = ctx.state.console.output_code_page;
+        let code_page = ctx.state.console().output_code_page;
         let units: Vec<u16> = title.encode_utf16().collect();
         let mut bytes = codepage::encode_from_units(code_page, &units);
         bytes.truncate(capacity_usize.saturating_sub(1));

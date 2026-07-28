@@ -489,24 +489,25 @@ pub fn handle_global_add_atom_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
             state.process.last_error = ERROR_INVALID_PARAMETER;
             0
         } else if let Some(existing) = state
-            .window_state
+            .window_state()
             .global_atoms
             .iter()
             .find(|record| record.name.eq_ignore_ascii_case(&name))
+            .cloned()
         {
             state.process.last_error = 0;
             u64::from(existing.atom)
         } else {
-            let atom = state.window_state.next_global_atom;
+            let atom = state.window_state().next_global_atom;
 
-            state.window_state.next_global_atom = state
-                .window_state
+            state.window_state().next_global_atom = state
+                .window_state()
                 .next_global_atom
                 .checked_add(1)
                 .context("global atom identifier overflow")?;
 
             state
-                .window_state
+                .window_state()
                 .global_atoms
                 .push(GlobalAtomRecord { atom, name });
             state.process.last_error = 0;
@@ -536,14 +537,14 @@ pub fn handle_global_delete_atom(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let atom = u16::try_from(atom_low).context("GlobalDeleteAtom identifier does not fit u16")?;
 
     let existed = state
-        .window_state
+        .window_state()
         .global_atoms
         .iter()
         .any(|record| record.atom == atom);
 
     if existed {
         state
-            .window_state
+            .window_state()
             .global_atoms
             .retain(|record| record.atom != atom);
 

@@ -15,7 +15,7 @@ pub fn handle_get_async_key_state(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 
     // Bit 15: key is currently down.  Bit 0: key was pressed since last call.
     let key_state = state
-        .window_state
+        .window_state()
         .keyboard_state
         .get(virtual_key)
         .copied()
@@ -124,8 +124,8 @@ pub fn handle_set_cursor(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
         .read_rcx()
         .context("failed to read RCX for SetCursor")?;
 
-    let previous_cursor = state.window_state.cursor_handle;
-    state.window_state.cursor_handle = cursor_handle;
+    let previous_cursor = state.window_state().cursor_handle;
+    state.window_state().cursor_handle = cursor_handle;
 
     let return_address = engine
         .return_from_win64_api(previous_cursor)
@@ -140,7 +140,7 @@ pub fn handle_set_cursor(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 pub fn handle_get_cursor(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let return_value = state.window_state.cursor_handle;
+    let return_value = state.window_state().cursor_handle;
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -165,7 +165,7 @@ pub fn handle_set_keyboard_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         read_guest_bytes(
             engine,
             keyboard_state_ptr,
-            &mut state.window_state.keyboard_state,
+            &mut state.window_state().keyboard_state,
         )
         .context("failed to read SetKeyboardState buffer")?;
     }
@@ -195,7 +195,7 @@ pub fn handle_get_keyboard_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         write_guest_bytes(
             engine,
             keyboard_state_ptr,
-            &state.window_state.keyboard_state,
+            &state.window_state().keyboard_state,
         )
         .context("failed to write GetKeyboardState buffer")?;
     }
@@ -223,7 +223,7 @@ pub fn handle_get_key_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         .context("GetKeyState virtual key does not fit usize")?;
 
     let key_state = state
-        .window_state
+        .window_state()
         .keyboard_state
         .get(virtual_key)
         .copied()

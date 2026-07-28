@@ -420,10 +420,10 @@ pub fn handle_set_timer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 
     let return_value = if valid_window {
         let timer_id = if requested_timer_id == 0 {
-            let generated_id = state.window_state.next_timer_id;
+            let generated_id = state.window_state().next_timer_id;
 
-            state.window_state.next_timer_id = state
-                .window_state
+            state.window_state().next_timer_id = state
+                .window_state()
                 .next_timer_id
                 .checked_add(1)
                 .context("SetTimer identifier overflow")?;
@@ -434,7 +434,7 @@ pub fn handle_set_timer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
         };
 
         if let Some(timer) = state
-            .window_state
+            .window_state()
             .timers
             .iter_mut()
             .find(|timer| timer.window_handle == window_handle && timer.timer_id == timer_id)
@@ -442,7 +442,7 @@ pub fn handle_set_timer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
             timer.interval_ms = interval_ms;
             timer.callback_address = callback_address;
         } else {
-            state.window_state.timers.push(TimerRecord {
+            state.window_state().timers.push(TimerRecord {
                 window_handle,
                 timer_id,
                 interval_ms,
@@ -477,14 +477,14 @@ pub fn handle_kill_timer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
         .context("failed to read RDX for KillTimer")?;
 
     let existed = state
-        .window_state
+        .window_state()
         .timers
         .iter()
         .any(|timer| timer.window_handle == window_handle && timer.timer_id == timer_id);
 
     if existed {
         state
-            .window_state
+            .window_state()
             .timers
             .retain(|timer| timer.window_handle != window_handle || timer.timer_id != timer_id);
     }
@@ -529,15 +529,15 @@ pub fn handle_set_windows_hook_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinA
     let return_value = if callback_address == 0 {
         0
     } else {
-        let handle = state.window_state.next_windows_hook_handle;
+        let handle = state.window_state().next_windows_hook_handle;
 
-        state.window_state.next_windows_hook_handle = state
-            .window_state
+        state.window_state().next_windows_hook_handle = state
+            .window_state()
             .next_windows_hook_handle
             .checked_add(1)
             .context("SetWindowsHookExW handle overflow")?;
 
-        state.window_state.windows_hooks.push(WindowsHookRecord {
+        state.window_state().windows_hooks.push(WindowsHookRecord {
             handle,
             hook_type,
             callback_address,
@@ -566,14 +566,14 @@ pub fn handle_unhook_windows_hook_ex(ctx: &mut HandlerContext<'_>) -> Result<Win
         .context("failed to read RCX for UnhookWindowsHookEx")?;
 
     let existed = state
-        .window_state
+        .window_state()
         .windows_hooks
         .iter()
         .any(|hook| hook.handle == hook_handle);
 
     if existed {
         state
-            .window_state
+            .window_state()
             .windows_hooks
             .retain(|hook| hook.handle != hook_handle);
     }
@@ -646,22 +646,23 @@ pub fn handle_set_scroll_info(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         return_value,
     })
 }
-pub(crate) fn window_client_size(state: &WinApiState, handle: u64) -> (i32, i32) {
+pub(crate) fn window_client_size(state: &mut WinApiState, handle: u64) -> (i32, i32) {
+    // Extract window dimensions before any other mutable access.
     if let Some(window) = super::find_window(state, handle) {
         let width = if window.width > 0 {
             window.width
         } else {
-            state.window_state.window_width
+            return (1, 1);
         };
         let height = if window.height > 0 {
             window.height
         } else {
-            state.window_state.window_height
+            return (1, 1);
         };
         return (width.max(1), height.max(1));
     }
     (
-        state.window_state.window_width.max(1),
-        state.window_state.window_height.max(1),
+        state.window_state().window_width.max(1),
+        state.window_state().window_height.max(1),
     )
 }

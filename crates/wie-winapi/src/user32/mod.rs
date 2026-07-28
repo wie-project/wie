@@ -141,13 +141,13 @@ pub(crate) fn window_long_ptr_index(index_raw: u64, api_name: &str) -> Result<i6
 pub(crate) fn get_window_long_ptr_value(
     window_handle: u64,
     index_raw: u64,
-    state: &WinApiState,
+    state: &mut WinApiState,
     api_name: &str,
 ) -> Result<u64> {
     let index = window_long_ptr_index(index_raw, api_name)?;
 
     Ok(state
-        .window_state
+        .window_state()
         .window_long_ptr_values
         .iter()
         .find(|(stored_window, stored_index, _)| {
@@ -166,7 +166,7 @@ pub(crate) fn set_window_long_ptr_value(
     let index = window_long_ptr_index(index_raw, api_name)?;
 
     let previous_value = state
-        .window_state
+        .window_state()
         .window_long_ptr_values
         .iter()
         .find(|(stored_window, stored_index, _)| {
@@ -174,7 +174,7 @@ pub(crate) fn set_window_long_ptr_value(
         })
         .map_or(0, |(_, _, value)| *value);
 
-    if let Some(entry) = state.window_state.window_long_ptr_values.iter_mut().find(
+    if let Some(entry) = state.window_state().window_long_ptr_values.iter_mut().find(
         |(stored_window, stored_index, _)| {
             *stored_window == window_handle && *stored_index == index
         },
@@ -182,7 +182,7 @@ pub(crate) fn set_window_long_ptr_value(
         entry.2 = new_value;
     } else {
         state
-            .window_state
+            .window_state()
             .window_long_ptr_values
             .push((window_handle, index, new_value));
     }
@@ -262,9 +262,9 @@ pub(crate) fn write_message_structure(
 /// Neutral default message handler used by several USER32 `Def*Proc` APIs.
 
 pub(crate) fn allocate_menu_handle(state: &mut WinApiState) -> Result<u64> {
-    let handle = state.window_state.next_menu_handle;
-    state.window_state.next_menu_handle = state
-        .window_state
+    let handle = state.window_state().next_menu_handle;
+    state.window_state().next_menu_handle = state
+        .window_state()
         .next_menu_handle
         .checked_add(1)
         .context("menu handle allocator overflow")?;
@@ -283,27 +283,27 @@ pub(crate) fn register_window_class(
         return Ok(0);
     }
 
-    if let Some(existing) = state.window_state.window_classes.iter().find(|existing| {
+    if let Some(existing) = state.window_state().window_classes.iter().find(|existing| {
         existing.class_name.eq_ignore_ascii_case(&record.class_name)
             && existing.unicode == record.unicode
     }) {
         return Ok(u64::from(existing.atom));
     }
 
-    let atom = state.window_state.next_window_class_atom;
+    let atom = state.window_state().next_window_class_atom;
 
     if atom == 0 {
         return Ok(0);
     }
 
-    state.window_state.next_window_class_atom = state
-        .window_state
+    state.window_state().next_window_class_atom = state
+        .window_state()
         .next_window_class_atom
         .checked_add(1)
         .context("window class atom overflow")?;
 
     record.atom = atom;
-    state.window_state.window_classes.push(record);
+    state.window_state().window_classes.push(record);
 
     Ok(u64::from(atom))
 }
@@ -381,17 +381,14 @@ pub(crate) fn find_window_class<'a>(
     identifier: &WindowClassIdentifier,
     unicode: bool,
 ) -> Option<&'a WindowClassRecord> {
-    state
-        .window_state
-        .window_classes
+    let ws = state.try_window_state()?;
+    ws.window_classes
         .iter()
         .find(|record| {
             record.unicode == unicode && window_class_identifier_matches(record, identifier)
         })
         .or_else(|| {
-            state
-                .window_state
-                .window_classes
+            ws.window_classes
                 .iter()
                 .find(|record| window_class_identifier_matches(record, identifier))
         })
@@ -404,14 +401,14 @@ pub(crate) fn create_window_record(
 ) -> Result<(u64, u64, bool)> {
     let registered_class = find_window_class(state, &request.class_identifier, unicode).cloned();
 
-    let handle = state.window_state.next_window_handle;
+    let handle = state.window_state().next_window_handle;
 
     if handle == 0 {
         return Ok((0, 0, unicode));
     }
 
-    state.window_state.next_window_handle = state
-        .window_state
+    state.window_state().next_window_handle = state
+        .window_state()
         .next_window_handle
         .checked_add(1)
         .context("fake window handle overflow")?;
@@ -442,7 +439,7 @@ pub(crate) fn create_window_record(
             (0, class_name, 0, unicode)
         };
 
-    state.window_state.windows.push(WindowRecord {
+    state.window_state().windows.push(WindowRecord {
         handle,
         class_atom,
         class_name,
@@ -551,13 +548,13 @@ pub(crate) fn create_mdi_child_from_struct(
     Ok(handle)
 }
 
-pub(crate) fn is_known_window(state: &WinApiState, handle: u64) -> bool {
+pub(crate) fn is_known_window(state: &mut WinApiState, handle: u64) -> bool {
     if handle == 0 {
         return false;
     }
     handle == FAKE_WINDOW_HANDLE
         || handle == FAKE_DESKTOP_WINDOW_HANDLE
         || find_window(state, handle).is_some()
-        || state.window_state.active_window_handle == handle
-        || state.window_state.foreground_window_handle == handle
+        || state.window_state().active_window_handle == handle
+        || state.window_state().foreground_window_handle == handle
 }

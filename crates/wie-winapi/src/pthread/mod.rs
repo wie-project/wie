@@ -311,7 +311,7 @@ pub fn is_pt_id(value: u64) -> bool {
 
 /// Take the park queued for `tid`, if any. Called by the runtime park handler.
 pub fn take_park(state: &mut WinApiState, tid: u32) -> Option<PtPark> {
-    state.pthread.parks.remove(&tid)
+    state.pthread().parks.remove(&tid)
 }
 
 // ── Small guest-memory helpers ─────────────────────────────────────────
@@ -429,7 +429,7 @@ fn park_on(
 ) -> anyhow::Error {
     let tid = state.kernel.threads.current_tid();
     let observed = queue.observe();
-    state.pthread.parks.insert(
+    state.pthread().parks.insert(
         tid,
         PtPark {
             queue: std::sync::Arc::clone(queue),
@@ -617,8 +617,8 @@ fn dispatch_misc(
 
         // ── concurrency / processor count ──────────────────────────────
         "pthread_num_processors_np" => {
-            let n = if state.pthread.num_processors > 0 {
-                state.pthread.num_processors
+            let n = if state.pthread().num_processors > 0 {
+                state.pthread().num_processors
             } else {
                 i32::try_from(
                     std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
@@ -629,26 +629,26 @@ fn dispatch_misc(
         }
         "pthread_set_num_processors_np" => {
             let n = trunc_i32(engine.read_rcx()?);
-            state.pthread.num_processors = n.max(0);
+            state.pthread().num_processors = n.max(0);
             ret_int(engine, 0)?
         }
-        "pthread_getconcurrency" => ret_int(engine, state.pthread.concurrency)?,
+        "pthread_getconcurrency" => ret_int(engine, state.pthread().concurrency)?,
         "pthread_setconcurrency" => {
             let level = trunc_i32(engine.read_rcx()?);
             if level < 0 {
                 ret_int(engine, EINVAL)?
             } else {
-                state.pthread.concurrency = level;
+                state.pthread().concurrency = level;
                 ret_int(engine, 0)?
             }
         }
         "pthread_get_concurrency" => {
             let out = engine.read_rcx()?;
-            write_i32(engine, out, state.pthread.concurrency);
+            write_i32(engine, out, state.pthread().concurrency);
             ret_int(engine, 0)?
         }
         "pthread_set_concurrency" => {
-            state.pthread.concurrency = trunc_i32(engine.read_rcx()?);
+            state.pthread().concurrency = trunc_i32(engine.read_rcx()?);
             ret_int(engine, 0)?
         }
 
@@ -726,7 +726,7 @@ fn dispatch_misc(
 /// `clock_gettime(clockid, struct timespec *)`.
 fn clock_gettime(
     engine: &mut dyn CpuEngine,
-    state: &WinApiState,
+    state: &mut WinApiState,
     bits64: bool,
 ) -> Result<WinApiHandlerResult> {
     let clock_id = trunc_i32(engine.read_rcx()?);
@@ -741,7 +741,7 @@ fn clock_gettime(
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
     } else {
-        state.pthread.monotonic()
+        state.pthread().monotonic()
     };
     write_timespec(engine, out, d, bits64);
     ret_int(engine, 0)

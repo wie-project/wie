@@ -8,8 +8,8 @@
 #![allow(clippy::map_identity, clippy::option_map_unit_fn)]
 
 use super::{
-    Context, HandlerContext, Result, WinApiHandlerResult, low_u32, ret_bool_true, ret_u64,
-    write_guest_u32,
+    Context, HandlerContext, Result, WinApiHandlerResult, WinApiState, low_u32, ret_bool_true,
+    ret_u64, write_guest_u32,
 };
 use crate::console::{
     CharInfo, Coord, RenderMode, ScreenBuffer, SmallRect, codepage, host_term, screen,
@@ -37,8 +37,8 @@ fn stack_arg(ctx: &mut HandlerContext<'_>, index: usize, api: &str) -> Result<u6
 }
 
 /// Resolve an output handle to a screen-buffer handle.
-fn buffer_handle_for(ctx: &HandlerContext<'_>, handle: u64) -> Option<u64> {
-    super::console::buffer_handle_for(&ctx.state.console, handle)
+fn buffer_handle_for(state: &WinApiState, handle: u64) -> Option<u64> {
+    state.try_console().and_then(|c| super::console::buffer_handle_for(c, handle))
 }
 
 /// Switch into Cells mode the first time a cell API is used.
@@ -46,11 +46,11 @@ fn buffer_handle_for(ctx: &HandlerContext<'_>, handle: u64) -> Option<u64> {
 /// The alternate screen goes with it: a program painting whole frames should
 /// not shred the user's scrollback, and their shell prompt should return intact.
 fn enter_cells_mode(ctx: &mut HandlerContext<'_>) {
-    if ctx.state.console.render_mode == RenderMode::Cells {
+    if ctx.state.console().render_mode == RenderMode::Cells {
         return;
     }
-    ctx.state.console.render_mode = RenderMode::Cells;
-    ctx.state.console.rendered = None;
+    ctx.state.console().render_mode = RenderMode::Cells;
+    ctx.state.console().rendered = None;
     screen::enter_alternate_screen();
 }
 
@@ -59,20 +59,20 @@ fn enter_cells_mode(ctx: &mut HandlerContext<'_>) {
 /// A write to a non-displayed buffer changes nothing on screen, which is
 /// exactly the property double buffering relies on.
 fn flush_active(ctx: &mut HandlerContext<'_>) {
-    if ctx.state.console.render_mode != RenderMode::Cells || !host_term::is_tty() {
+    if ctx.state.console().render_mode != RenderMode::Cells || !host_term::is_tty() {
         return;
     }
-    let active = ctx.state.console.active_buffer;
-    let Some(buffer) = ctx.state.console.buffer(active).cloned() else {
+    let active = ctx.state.console().active_buffer;
+    let Some(buffer) = ctx.state.console().buffer(active).cloned() else {
         return;
     };
-    let previous = ctx.state.console.rendered.take();
+    let previous = ctx.state.console().rendered.take();
     let output = screen::flush(&buffer, previous.as_ref());
     if !output.is_empty() {
         host_term::write_stdout(output.as_bytes());
     }
-    ctx.state.console.rendered = Some(buffer);
-    ctx.state.console.repaint_forced = false;
+    ctx.state.console().rendered = Some(buffer);
+    ctx.state.console().repaint_forced = false;
 }
 
 fn ret_invalid_handle(ctx: &mut HandlerContext<'_>, api: &str) -> Result<WinApiHandlerResult> {
@@ -93,23 +93,23 @@ pub fn handle_set_console_cursor_position(
             .read_rdx()
             .context("SetConsoleCursorPosition RDX")?,
     );
-    let Some(buffer_handle) = buffer_handle_for(ctx, handle) else {
+    let Some(buffer_handle) = buffer_handle_for(ctx.state, handle) else {
         return ret_invalid_handle(ctx, "SetConsoleCursorPosition");
     };
     let in_bounds = ctx
         .state
-        .console
+        .console()
         .buffer(buffer_handle)
         .is_some_and(|buffer| buffer.index_of(position.x, position.y).is_some());
     if !in_bounds {
         ctx.state.process.last_error = super::ERROR_INVALID_PARAMETER;
         return ret_u64(ctx.engine, 0, "SetConsoleCursorPosition");
     }
-    if let Some(buffer) = ctx.state.console.buffer_mut(buffer_handle) {
+    if let Some(buffer) = ctx.state.console().buffer_mut(buffer_handle) {
         buffer.cursor = position;
     }
     // Stream mode has no grid to repaint, so move the real cursor now.
-    if ctx.state.console.render_mode == RenderMode::Stream {
+    if ctx.state.console().render_mode == RenderMode::Stream {
         screen::move_cursor(position.x, position.y);
     } else {
         flush_active(ctx);
@@ -132,13 +132,13 @@ pub fn handle_set_console_text_attribute(
         "SetConsoleTextAttribute",
     )?;
     let attributes = u16::try_from(attributes & 0xFFFF).unwrap_or(0);
-    let Some(buffer_handle) = buffer_handle_for(ctx, handle) else {
+    let Some(buffer_handle) = buffer_handle_for(ctx.state, handle) else {
         return ret_invalid_handle(ctx, "SetConsoleTextAttribute");
     };
-    if let Some(buffer) = ctx.state.console.buffer_mut(buffer_handle) {
+    if let Some(buffer) = ctx.state.console().buffer_mut(buffer_handle) {
         buffer.attributes = attributes;
     }
-    if ctx.state.console.render_mode == RenderMode::Stream {
+    if ctx.state.console().render_mode == RenderMode::Stream {
         screen::apply_attributes(attributes);
     }
     ret_bool_true(ctx.engine, "SetConsoleTextAttribute")
@@ -155,12 +155,12 @@ pub fn handle_get_console_cursor_info(
     if info_ptr == 0 {
         return ret_invalid_handle(ctx, "GetConsoleCursorInfo");
     }
-    let Some(buffer_handle) = buffer_handle_for(ctx, handle) else {
+    let Some(buffer_handle) = buffer_handle_for(ctx.state, handle) else {
         return ret_invalid_handle(ctx, "GetConsoleCursorInfo");
     };
     let (size, visible) = ctx
         .state
-        .console
+        .console()
         .buffer(buffer_handle)
         .map_or((25, 1), |buffer| {
             (buffer.cursor_size, u32::from(buffer.cursor_visible))
@@ -180,18 +180,18 @@ pub fn handle_set_console_cursor_info(
     if info_ptr == 0 {
         return ret_invalid_handle(ctx, "SetConsoleCursorInfo");
     }
-    let Some(buffer_handle) = buffer_handle_for(ctx, handle) else {
+    let Some(buffer_handle) = buffer_handle_for(ctx.state, handle) else {
         return ret_invalid_handle(ctx, "SetConsoleCursorInfo");
     };
     let size = super::read_guest_u32(ctx.engine, info_ptr)?;
     let visible_ptr = super::checked_address(info_ptr, 4, "SetConsoleCursorInfo bVisible")?;
     let visible = super::read_guest_u32(ctx.engine, visible_ptr)? != 0;
-    if let Some(buffer) = ctx.state.console.buffer_mut(buffer_handle) {
+    if let Some(buffer) = ctx.state.console().buffer_mut(buffer_handle) {
         buffer.cursor_size = size;
         buffer.cursor_visible = visible;
     }
     // Only the displayed buffer's caret is the one the user sees.
-    if buffer_handle == ctx.state.console.active_buffer {
+    if buffer_handle == ctx.state.console().active_buffer {
         screen::set_cursor_visible(visible);
     }
     ret_bool_true(ctx.engine, "SetConsoleCursorInfo")
@@ -218,7 +218,7 @@ fn fill_console_output(
     let start = Coord::from_packed(ctx.engine.read_r9().context("FillConsoleOutput R9")?);
     let written_ptr = stack_arg(ctx, 0, api)?;
 
-    let Some(buffer_handle) = buffer_handle_for(ctx, handle) else {
+    let Some(buffer_handle) = buffer_handle_for(ctx.state, handle) else {
         return ret_invalid_handle(ctx, api);
     };
     enter_cells_mode(ctx);
@@ -227,7 +227,7 @@ fn fill_console_output(
         FillKind::Wide => u16::try_from(raw_value & 0xFFFF).unwrap_or(u16::from(b' ')),
         FillKind::Ansi => {
             let byte = u8::try_from(raw_value & 0xFF).unwrap_or(b' ');
-            let code_page = ctx.state.console.output_code_page;
+            let code_page = ctx.state.console().output_code_page;
             codepage::decode_to_units(code_page, &[byte])
                 .first()
                 .copied()
@@ -237,7 +237,7 @@ fn fill_console_output(
     };
 
     let mut filled = 0_u32;
-    if let Some(buffer) = ctx.state.console.buffer_mut(buffer_handle) {
+    if let Some(buffer) = ctx.state.console().buffer_mut(buffer_handle) {
         let total = usize::try_from(length).unwrap_or(0).min(MAX_CELLS);
         let Some(origin) = buffer.index_of(start.x, start.y) else {
             ctx.state.process.last_error = super::ERROR_INVALID_PARAMETER;
@@ -345,7 +345,7 @@ fn write_console_output(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinA
     let source_origin = Coord::from_packed(ctx.engine.read_r9().context("WriteConsoleOutput R9")?);
     let region_ptr = stack_arg(ctx, 0, api)?;
 
-    let Some(buffer_handle) = buffer_handle_for(ctx, handle) else {
+    let Some(buffer_handle) = buffer_handle_for(ctx.state, handle) else {
         return ret_invalid_handle(ctx, api);
     };
     if source_ptr == 0 || region_ptr == 0 {
@@ -365,11 +365,11 @@ fn write_console_output(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinA
 
     let mut raw = vec![0_u8; source_cells.saturating_mul(CHAR_INFO_SIZE)];
     read_guest_bytes(ctx.engine, source_ptr, &mut raw).context("WriteConsoleOutput source")?;
-    let code_page = ctx.state.console.output_code_page;
+    let code_page = ctx.state.console().output_code_page;
 
     let (width, height) = ctx
         .state
-        .console
+        .console()
         .buffer(buffer_handle)
         .map_or((0, 0), |buffer| (buffer.width, buffer.height));
     let clipped = SmallRect {
@@ -383,7 +383,7 @@ fn write_console_output(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinA
             .min(i16::try_from(height).unwrap_or(i16::MAX).saturating_sub(1)),
     };
 
-    if let Some(buffer) = ctx.state.console.buffer_mut(buffer_handle) {
+    if let Some(buffer) = ctx.state.console().buffer_mut(buffer_handle) {
         let mut row = clipped.top;
         while row <= clipped.bottom {
             let mut column = clipped.left;
@@ -475,7 +475,7 @@ fn write_console_output_run(
     let start = Coord::from_packed(ctx.engine.read_r9().context("WriteConsoleOutputRun R9")?);
     let written_ptr = stack_arg(ctx, 0, api)?;
 
-    let Some(buffer_handle) = buffer_handle_for(ctx, handle) else {
+    let Some(buffer_handle) = buffer_handle_for(ctx.state, handle) else {
         return ret_invalid_handle(ctx, api);
     };
     enter_cells_mode(ctx);
@@ -489,7 +489,7 @@ fn write_console_output_run(
                 let mut bytes = vec![0_u8; count];
                 read_guest_bytes(ctx.engine, source_ptr, &mut bytes)
                     .context("WriteConsoleOutputCharacterA source")?;
-                codepage::decode_to_units(ctx.state.console.output_code_page, &bytes)
+                codepage::decode_to_units(ctx.state.console().output_code_page, &bytes)
             }
             RunKind::Wide | RunKind::Attribute => {
                 let mut bytes = vec![0_u8; count.saturating_mul(2)];
@@ -509,7 +509,7 @@ fn write_console_output_run(
     };
 
     let mut written = 0_u32;
-    if let Some(buffer) = ctx.state.console.buffer_mut(buffer_handle) {
+    if let Some(buffer) = ctx.state.console().buffer_mut(buffer_handle) {
         let Some(origin) = buffer.index_of(start.x, start.y) else {
             ctx.state.process.last_error = super::ERROR_INVALID_PARAMETER;
             return ret_u64(ctx.engine, 0, api);
@@ -577,14 +577,14 @@ fn read_console_output_run(
     let start = Coord::from_packed(ctx.engine.read_r9().context("ReadConsoleOutputRun R9")?);
     let read_ptr = stack_arg(ctx, 0, api)?;
 
-    let Some(buffer_handle) = buffer_handle_for(ctx, handle) else {
+    let Some(buffer_handle) = buffer_handle_for(ctx.state, handle) else {
         return ret_invalid_handle(ctx, api);
     };
     let count = usize::try_from(length).unwrap_or(0).min(MAX_CELLS);
-    let code_page = ctx.state.console.output_code_page;
+    let code_page = ctx.state.console().output_code_page;
 
     let mut values: Vec<u16> = Vec::with_capacity(count);
-    if let Some(buffer) = ctx.state.console.buffer(buffer_handle)
+    if let Some(buffer) = ctx.state.console().buffer(buffer_handle)
         && let Some(origin) = buffer.index_of(start.x, start.y)
     {
         for step in 0..count {
@@ -654,7 +654,7 @@ fn read_console_output(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinAp
     let dest_origin = Coord::from_packed(ctx.engine.read_r9().context("ReadConsoleOutput R9")?);
     let region_ptr = stack_arg(ctx, 0, api)?;
 
-    let Some(buffer_handle) = buffer_handle_for(ctx, handle) else {
+    let Some(buffer_handle) = buffer_handle_for(ctx.state, handle) else {
         return ret_invalid_handle(ctx, api);
     };
     if dest_ptr == 0 || region_ptr == 0 {
@@ -670,11 +670,11 @@ fn read_console_output(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinAp
         return ret_bool_true(ctx.engine, api);
     }
 
-    let code_page = ctx.state.console.output_code_page;
+    let code_page = ctx.state.console().output_code_page;
     let mut raw = vec![0_u8; cells.saturating_mul(CHAR_INFO_SIZE)];
     let (width, height) = ctx
         .state
-        .console
+        .console()
         .buffer(buffer_handle)
         .map_or((0, 0), |buffer| (buffer.width, buffer.height));
     let clipped = SmallRect {
@@ -688,7 +688,7 @@ fn read_console_output(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinAp
             .min(i16::try_from(height).unwrap_or(i16::MAX).saturating_sub(1)),
     };
 
-    if let Some(buffer) = ctx.state.console.buffer(buffer_handle) {
+    if let Some(buffer) = ctx.state.console().buffer(buffer_handle) {
         let mut row = clipped.top;
         while row <= clipped.bottom {
             let mut column = clipped.left;
@@ -764,7 +764,7 @@ fn scroll_console_screen_buffer(
     let destination = Coord::from_packed(ctx.engine.read_r9().context("ScrollConsole R9")?);
     let fill_ptr = stack_arg(ctx, 0, api)?;
 
-    let Some(buffer_handle) = buffer_handle_for(ctx, handle) else {
+    let Some(buffer_handle) = buffer_handle_for(ctx.state, handle) else {
         return ret_invalid_handle(ctx, api);
     };
     if scroll_ptr == 0 {
@@ -790,7 +790,7 @@ fn scroll_console_screen_buffer(
         }
     };
 
-    if let Some(buffer) = ctx.state.console.buffer_mut(buffer_handle) {
+    if let Some(buffer) = ctx.state.console().buffer_mut(buffer_handle) {
         scroll_region(buffer, scroll, clip, destination, fill);
     }
     flush_active(ctx);
@@ -879,7 +879,7 @@ pub fn handle_create_console_screen_buffer(
     let _security = ctx.engine.read_r8().context("CreateConsoleScreenBuffer R8")?;
     let _flags = ctx.engine.read_r9().context("CreateConsoleScreenBuffer R9")?;
     enter_cells_mode(ctx);
-    let handle = ctx.state.console.create_buffer();
+    let handle = ctx.state.console().create_buffer();
     ret_u64(ctx.engine, handle, "CreateConsoleScreenBuffer")
 }
 
@@ -891,13 +891,13 @@ pub fn handle_set_console_active_screen_buffer(
         .engine
         .read_rcx()
         .context("SetConsoleActiveScreenBuffer RCX")?;
-    let Some(buffer_handle) = buffer_handle_for(ctx, handle) else {
+    let Some(buffer_handle) = buffer_handle_for(ctx.state, handle) else {
         return ret_invalid_handle(ctx, "SetConsoleActiveScreenBuffer");
     };
-    ctx.state.console.active_buffer = buffer_handle;
+    ctx.state.console().active_buffer = buffer_handle;
     // The newly displayed buffer has nothing in common with what is on screen,
     // so the next flush must repaint rather than diff.
-    ctx.state.console.rendered = None;
+    ctx.state.console().rendered = None;
     flush_active(ctx);
     ret_bool_true(ctx.engine, "SetConsoleActiveScreenBuffer")
 }
@@ -919,20 +919,20 @@ pub fn handle_set_console_screen_buffer_size(
             .read_rdx()
             .context("SetConsoleScreenBufferSize RDX")?,
     );
-    let Some(buffer_handle) = buffer_handle_for(ctx, handle) else {
+    let Some(buffer_handle) = buffer_handle_for(ctx.state, handle) else {
         return ret_invalid_handle(ctx, "SetConsoleScreenBufferSize");
     };
     if size.x <= 0 || size.y <= 0 {
         ctx.state.process.last_error = super::ERROR_INVALID_PARAMETER;
         return ret_u64(ctx.engine, 0, "SetConsoleScreenBufferSize");
     }
-    if let Some(buffer) = ctx.state.console.buffer_mut(buffer_handle) {
+    if let Some(buffer) = ctx.state.console().buffer_mut(buffer_handle) {
         buffer.resize(
             u16::try_from(size.x).unwrap_or(0),
             u16::try_from(size.y).unwrap_or(0),
         );
     }
-    ctx.state.console.rendered = None;
+    ctx.state.console().rendered = None;
     flush_active(ctx);
     ret_bool_true(ctx.engine, "SetConsoleScreenBufferSize")
 }
@@ -948,7 +948,7 @@ pub fn handle_set_console_window_info(
     let handle = ctx.engine.read_rcx().context("SetConsoleWindowInfo RCX")?;
     let _absolute = ctx.engine.read_rdx().context("SetConsoleWindowInfo RDX")?;
     let rect_ptr = ctx.engine.read_r8().context("SetConsoleWindowInfo R8")?;
-    if buffer_handle_for(ctx, handle).is_none() {
+    if buffer_handle_for(ctx.state, handle).is_none() {
         return ret_invalid_handle(ctx, "SetConsoleWindowInfo");
     }
     if rect_ptr == 0 {

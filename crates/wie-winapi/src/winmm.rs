@@ -6,10 +6,10 @@ use crate::{HandlerContext, WinApiHandlerResult};
 pub fn handle_time_get_time(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let return_value = state.window_state.tick_count;
+    let return_value = state.window_state().tick_count;
 
-    state.window_state.tick_count = state
-        .window_state
+    state.window_state().tick_count = state
+        .window_state()
         .tick_count
         .checked_add(16)
         .context("timeGetTime tick count overflow")?;

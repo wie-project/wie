@@ -65,7 +65,7 @@ pub(super) fn dispatch(
         }
         "pthread_gethandle" => {
             let pt = engine.read_rcx()?;
-            let h = state.pthread.threads.get(&pt).map_or(0, |t| t.win_handle);
+            let h = state.pthread().threads.get(&pt).map_or(0, |t| t.win_handle);
             ret_u64(engine, h)?
         }
         // winpthreads hands out a per-thread auto-reset event for cancellation.
@@ -75,7 +75,7 @@ pub(super) fn dispatch(
             let pt = engine.read_rcx()?;
             let name_va = engine.read_rdx()?;
             let value = read_cstr(engine, name_va);
-            match state.pthread.threads.get_mut(&pt) {
+            match state.pthread().threads.get_mut(&pt) {
                 Some(t) => {
                     t.name = value;
                     ret_int(engine, 0)?
@@ -221,7 +221,7 @@ pub(super) fn dispatch(
             let pt = engine.read_rcx()?;
             let pol_out = engine.read_rdx()?;
             let param_out = engine.read_r8()?;
-            match state.pthread.threads.get(&pt) {
+            match state.pthread().threads.get(&pt) {
                 Some(t) => {
                     write_i32(engine, pol_out, t.policy);
                     write_i32(engine, param_out, t.priority);
@@ -235,7 +235,7 @@ pub(super) fn dispatch(
             let policy = trunc_i32(engine.read_rdx()?);
             let param = engine.read_r8()?;
             let priority = trunc_i32(u64::from(read_u32(engine, param)));
-            match state.pthread.threads.get_mut(&pt) {
+            match state.pthread().threads.get_mut(&pt) {
                 Some(t) => {
                     t.policy = policy;
                     t.priority = priority;
@@ -247,7 +247,7 @@ pub(super) fn dispatch(
         "pthread_setschedprio" => {
             let pt = engine.read_rcx()?;
             let prio = trunc_i32(engine.read_rdx()?);
-            match state.pthread.threads.get_mut(&pt) {
+            match state.pthread().threads.get_mut(&pt) {
                 Some(t) => {
                     t.priority = prio;
                     ret_int(engine, 0)?
@@ -277,19 +277,19 @@ pub(super) fn dispatch(
             if key_out == 0 {
                 ret_int(engine, EINVAL)?
             } else {
-                let key = state.pthread.next_key;
-                state.pthread.next_key = state.pthread.next_key.saturating_add(1);
-                state.pthread.keys.insert(key, dtor);
+                let key = state.pthread().next_key;
+                state.pthread().next_key = state.pthread().next_key.saturating_add(1);
+                state.pthread().keys.insert(key, dtor);
                 write_u32(engine, key_out, key);
                 ret_int(engine, 0)?
             }
         }
         "pthread_key_delete" => {
             let key = u32::try_from(engine.read_rcx()? & 0xffff_ffff).unwrap_or(0);
-            if state.pthread.keys.remove(&key).is_none() {
+            if state.pthread().keys.remove(&key).is_none() {
                 ret_int(engine, EINVAL)?
             } else {
-                for t in state.pthread.threads.values_mut() {
+                for t in state.pthread().threads.values_mut() {
                     t.tls.remove(&key);
                 }
                 ret_int(engine, 0)?
@@ -299,7 +299,7 @@ pub(super) fn dispatch(
             let key = u32::try_from(engine.read_rcx()? & 0xffff_ffff).unwrap_or(0);
             let pt = self_pt(engine, state);
             let v = state
-                .pthread
+                .pthread()
                 .threads
                 .get(&pt)
                 .and_then(|t| t.tls.get(&key).copied())
@@ -309,12 +309,12 @@ pub(super) fn dispatch(
         "pthread_setspecific" => {
             let key = u32::try_from(engine.read_rcx()? & 0xffff_ffff).unwrap_or(0);
             let value = engine.read_rdx()?;
-            let missing = !state.pthread.keys.contains_key(&key);
+            let missing = !state.pthread().keys.contains_key(&key);
             if missing {
                 ret_int(engine, EINVAL)?
             } else {
                 let pt = self_pt(engine, state);
-                if let Some(t) = state.pthread.threads.get_mut(&pt) {
+                if let Some(t) = state.pthread().threads.get_mut(&pt) {
                     t.tls.insert(key, value);
                 }
                 ret_int(engine, 0)?
@@ -339,7 +339,7 @@ pub(super) fn dispatch(
             let new = trunc_i32(engine.read_rcx()?);
             let out = engine.read_rdx()?;
             let pt = self_pt(engine, state);
-            if let Some(t) = state.pthread.threads.get_mut(&pt) {
+            if let Some(t) = state.pthread().threads.get_mut(&pt) {
                 write_i32(engine, out, i32::from(t.cancel_enabled) * CANCEL_ENABLE);
                 t.cancel_enabled = new & CANCEL_ENABLE != 0;
             }
@@ -349,7 +349,7 @@ pub(super) fn dispatch(
             let new = trunc_i32(engine.read_rcx()?);
             let out = engine.read_rdx()?;
             let pt = self_pt(engine, state);
-            if let Some(t) = state.pthread.threads.get_mut(&pt) {
+            if let Some(t) = state.pthread().threads.get_mut(&pt) {
                 write_i32(
                     engine,
                     out,
@@ -361,7 +361,7 @@ pub(super) fn dispatch(
         }
         "pthread_cancel" => {
             let pt = engine.read_rcx()?;
-            match state.pthread.threads.get_mut(&pt) {
+            match state.pthread().threads.get_mut(&pt) {
                 Some(t) if !t.finished => {
                     t.cancel_requested = true;
                     // Nudge every queue the target could be parked on so it
@@ -393,7 +393,7 @@ pub(super) fn dispatch(
             let pt = engine.read_rcx()?;
             let sig = trunc_i32(engine.read_rdx()?);
             let alive = state
-                .pthread
+                .pthread()
                 .threads
                 .get(&pt)
                 .is_some_and(|t| !t.finished);
@@ -421,46 +421,46 @@ pub(super) fn dispatch(
 /// expects `pthread_self` to work there.
 pub(super) fn self_pt(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> u64 {
     let tid = state.kernel.threads.current_tid();
-    if let Some(&pt) = state.pthread.by_tid.get(&tid) {
+    if let Some(&pt) = state.pthread().by_tid.get(&tid) {
         return pt;
     }
     let _ = engine;
-    let pt = state.pthread.alloc_id();
+    let pt = state.pthread().alloc_id();
     let mut t = PtThread::new(pt, tid, 0, 0, false);
     // A thread WIE did not start has no entry frame to unwind to.
     t.entry_rsp = 0;
-    state.pthread.threads.insert(pt, t);
-    state.pthread.by_tid.insert(tid, pt);
+    state.pthread().threads.insert(pt, t);
+    state.pthread().by_tid.insert(tid, pt);
     pt
 }
 
 /// Whether a cancel has been requested and enabled for `pt`.
-fn cancel_pending(state: &WinApiState, pt: u64) -> bool {
+fn cancel_pending(state: &mut WinApiState, pt: u64) -> bool {
     state
-        .pthread
+        .pthread()
         .threads
         .get(&pt)
         .is_some_and(|t| t.cancel_requested && t.cancel_enabled)
 }
 
 /// Wake every pthread park queue (used when a cancel is posted).
-fn wake_all_queues(state: &WinApiState) {
-    for m in state.pthread.mutexes.values() {
+fn wake_all_queues(state: &mut WinApiState) {
+    for m in state.pthread().mutexes.values() {
         m.queue.wake();
     }
-    for c in state.pthread.conds.values() {
+    for c in state.pthread().conds.values() {
         c.queue.wake();
     }
-    for r in state.pthread.rwlocks.values() {
+    for r in state.pthread().rwlocks.values() {
         r.queue.wake();
     }
-    for b in state.pthread.barriers.values() {
+    for b in state.pthread().barriers.values() {
         b.queue.wake();
     }
-    for s in state.pthread.sems.values() {
+    for s in state.pthread().sems.values() {
         s.queue.wake();
     }
-    for t in state.pthread.threads.values() {
+    for t in state.pthread().threads.values() {
         t.queue.wake();
     }
 }
@@ -476,8 +476,8 @@ pub(super) fn cancellation_point(
     }
     // Drop any half-finished wait bookkeeping before unwinding.
     let tid = state.kernel.threads.current_tid();
-    state.pthread.pending.remove(&tid);
-    for c in state.pthread.conds.values_mut() {
+    state.pthread().pending.remove(&tid);
+    for c in state.pthread().conds.values_mut() {
         c.remove(pt);
     }
     Ok(Some(begin_termination(engine, state, CANCELED)?))
@@ -537,11 +537,11 @@ fn create(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<WinApiH
         ));
     }
 
-    let pt = state.pthread.alloc_id();
+    let pt = state.pthread().alloc_id();
     let mut t = PtThread::new(pt, tid, handle, start, detached);
     t.entry_rsp = entry_rsp;
-    state.pthread.threads.insert(pt, t);
-    state.pthread.by_tid.insert(tid, pt);
+    state.pthread().threads.insert(pt, t);
+    state.pthread().by_tid.insert(tid, pt);
 
     write_u64(engine, th_out, pt);
     ret_int(engine, 0)
@@ -565,7 +565,7 @@ fn join(
     if target == me {
         return ret_int(engine, EDEADLK);
     }
-    let Some(t) = state.pthread.threads.get(&target) else {
+    let Some(t) = state.pthread().threads.get(&target).cloned() else {
         return ret_int(engine, ESRCH);
     };
     if t.detached || t.joined {
@@ -591,7 +591,7 @@ fn join(
     }
 
     let value = t.exit_value;
-    if let Some(t) = state.pthread.threads.get_mut(&target) {
+    if let Some(t) = state.pthread().threads.get_mut(&target) {
         t.joined = true;
         t.finished = true;
     }
@@ -606,7 +606,7 @@ const EBUSY_TRYJOIN: i32 = super::EBUSY;
 /// `pthread_detach(t)`.
 fn detach(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<WinApiHandlerResult> {
     let target = engine.read_rcx()?;
-    let Some(t) = state.pthread.threads.get_mut(&target) else {
+    let Some(t) = state.pthread().threads.get_mut(&target) else {
         return ret_int(engine, ESRCH);
     };
     if t.detached {
@@ -622,16 +622,16 @@ fn detach(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<WinApiH
 
 /// Drop a terminated thread's bookkeeping once nobody can observe it again.
 fn reap(state: &mut WinApiState, pt: u64) {
-    let Some(t) = state.pthread.threads.get(&pt) else {
+    let Some(t) = state.pthread().threads.get(&pt) else {
         return;
     };
     if !t.finished || (!t.detached && !t.joined) {
         return;
     }
     let tid = t.tid;
-    state.pthread.threads.remove(&pt);
-    if state.pthread.by_tid.get(&tid) == Some(&pt) {
-        state.pthread.by_tid.remove(&tid);
+    state.pthread().threads.remove(&pt);
+    if state.pthread().by_tid.get(&tid) == Some(&pt) {
+        state.pthread().by_tid.remove(&tid);
     }
 }
 
@@ -640,7 +640,7 @@ fn reap(state: &mut WinApiState, pt: u64) {
 /// `pthread_exit(void *res)`.
 fn exit(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<WinApiHandlerResult> {
     let tid = state.kernel.threads.current_tid();
-    if state.pthread.pending.contains_key(&tid) {
+    if state.pthread().pending.contains_key(&tid) {
         // Re-entered because a cleanup handler or destructor just returned.
         return continue_termination(engine, state);
     }
@@ -661,7 +661,7 @@ pub fn handle_thread_return(
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
     let tid = state.kernel.threads.current_tid();
-    if state.pthread.pending.contains_key(&tid) {
+    if state.pthread().pending.contains_key(&tid) {
         return continue_termination(engine, state);
     }
     let value = engine.read_rax()?;
@@ -678,7 +678,7 @@ fn begin_termination(
     let tid = state.kernel.threads.current_tid();
 
     // Collect the `pthread_cleanup_push` chain (LIFO — the head is newest).
-    let head_slot = state.pthread.threads.get(&pt).map_or(0, |t| t.clean_head_va);
+    let head_slot = state.pthread().threads.get(&pt).map_or(0, |t| t.clean_head_va);
     let mut remaining = Vec::new();
     let mut node = read_u64(engine, head_slot);
     let mut guard = 0_u32;
@@ -695,7 +695,7 @@ fn begin_termination(
     write_u64(engine, head_slot, 0);
 
     let frame_rsp = call_frame(engine)?;
-    state.pthread.pending.insert(
+    state.pthread().pending.insert(
         tid,
         PtPending::Destructors {
             remaining,
@@ -718,7 +718,7 @@ fn continue_termination(
         mut pass,
         exit_value,
         frame_rsp,
-    }) = state.pthread.pending.remove(&tid)
+    }) = state.pthread().pending.remove(&tid)
     else {
         // Nothing in flight: finish immediately.
         return finish_thread(engine, state, 0);
@@ -728,7 +728,7 @@ fn continue_termination(
 
     loop {
         if let Some((func, arg)) = remaining.pop() {
-            state.pthread.pending.insert(
+            state.pthread().pending.insert(
                 tid,
                 PtPending::Destructors {
                     remaining,
@@ -756,9 +756,9 @@ fn continue_termination(
 
 /// Clear every non-null TSD value that has a destructor, returning the pairs.
 fn take_destructor_values(state: &mut WinApiState, pt: u64) -> Vec<(u64, u64)> {
-    let keys = state.pthread.keys.clone();
+    let keys = state.pthread().keys.clone();
     let mut out = Vec::new();
-    let Some(t) = state.pthread.threads.get_mut(&pt) else {
+    let Some(t) = state.pthread().threads.get_mut(&pt) else {
         return out;
     };
     for (key, dtor) in &keys {
@@ -787,9 +787,9 @@ fn finish_thread(
         .kernel
         .threads
         .current_tid();
-    let pt = state.pthread.by_tid.get(&pt).copied().unwrap_or(0);
+    let pt = state.pthread().by_tid.get(&pt).copied().unwrap_or(0);
     let mut detached = false;
-    if let Some(t) = state.pthread.threads.get_mut(&pt) {
+    if let Some(t) = state.pthread().threads.get_mut(&pt) {
         t.finished = true;
         t.exit_value = exit_value;
         detached = t.detached;
@@ -843,10 +843,10 @@ fn once(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<WinApiHan
     let tid = state.kernel.threads.current_tid();
 
     // Re-entry: the init routine just returned.
-    if let Some(PtPending::Once { once_va, return_va }) = state.pthread.pending.get(&tid).cloned() {
-        state.pthread.pending.remove(&tid);
+    if let Some(PtPending::Once { once_va, return_va }) = state.pthread().pending.get(&tid).cloned() {
+        state.pthread().pending.remove(&tid);
         write_u32(engine, once_va, 1);
-        if let Some(o) = state.pthread.onces.get_mut(&once_va) {
+        if let Some(o) = state.pthread().onces.get_mut(&once_va) {
             o.done = true;
             o.running = None;
             o.queue.wake();
@@ -867,7 +867,7 @@ fn once(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<WinApiHan
 
     let me = self_pt(engine, state);
     let entry = state
-        .pthread
+        .pthread()
         .onces
         .entry(once_va)
         .or_default();
@@ -887,7 +887,7 @@ fn once(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<WinApiHan
 
     let return_va = call_guest(engine, func, 0)?;
     state
-        .pthread
+        .pthread()
         .pending
         .insert(tid, PtPending::Once { once_va, return_va });
     Ok(WinApiHandlerResult {
@@ -905,7 +905,7 @@ fn once(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<WinApiHan
 /// guest heap on first use.
 fn getclean(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<WinApiHandlerResult> {
     let pt = self_pt(engine, state);
-    let existing = state.pthread.threads.get(&pt).map_or(0, |t| t.clean_head_va);
+    let existing = state.pthread().threads.get(&pt).map_or(0, |t| t.clean_head_va);
     if existing != 0 {
         return ret_u64(engine, existing);
     }
@@ -914,7 +914,7 @@ fn getclean(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<WinAp
         return ret_u64(engine, 0);
     }
     write_u64(engine, va, 0);
-    if let Some(t) = state.pthread.threads.get_mut(&pt) {
+    if let Some(t) = state.pthread().threads.get_mut(&pt) {
         t.clean_head_va = va;
     }
     ret_u64(engine, va)
@@ -951,7 +951,7 @@ fn getname(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<WinApi
     let pt = engine.read_rcx()?;
     let buf = engine.read_rdx()?;
     let len = engine.read_r8()?;
-    let Some(t) = state.pthread.threads.get(&pt) else {
+    let Some(t) = state.pthread().threads.get(&pt) else {
         return ret_int(engine, ESRCH);
     };
     if buf == 0 || len == 0 {

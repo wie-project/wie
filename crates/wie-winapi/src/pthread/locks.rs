@@ -132,8 +132,8 @@ pub(super) fn dispatch(
             if cv == 0 {
                 ret_int(engine, EINVAL)?
             } else {
-                let id = state.pthread.alloc_id();
-                state.pthread.conds.insert(id, PtCond::new());
+                let id = state.pthread().alloc_id();
+                state.pthread().conds.insert(id, PtCond::new());
                 write_u64(engine, cv, id);
                 ret_int(engine, 0)?
             }
@@ -144,14 +144,14 @@ pub(super) fn dispatch(
                 None => ret_int(engine, EINVAL)?,
                 Some(id) => {
                     if state
-                        .pthread
+                        .pthread()
                         .conds
                         .get(&id)
                         .is_some_and(|c| !c.waiters.is_empty())
                     {
                         ret_int(engine, EBUSY)?
                     } else {
-                        state.pthread.conds.remove(&id);
+                        state.pthread().conds.remove(&id);
                         write_u64(engine, cv, 0);
                         ret_int(engine, 0)?
                     }
@@ -219,8 +219,8 @@ pub(super) fn dispatch(
             if l == 0 {
                 ret_int(engine, EINVAL)?
             } else {
-                let id = state.pthread.alloc_id();
-                state.pthread.rwlocks.insert(id, PtRwLock::new());
+                let id = state.pthread().alloc_id();
+                state.pthread().rwlocks.insert(id, PtRwLock::new());
                 write_u64(engine, l, id);
                 ret_int(engine, 0)?
             }
@@ -230,10 +230,10 @@ pub(super) fn dispatch(
             match rwlock_id(engine, state, l) {
                 None => ret_int(engine, EINVAL)?,
                 Some(id) => {
-                    if state.pthread.rwlocks.get(&id).is_some_and(PtRwLock::is_held) {
+                    if state.pthread().rwlocks.get(&id).is_some_and(PtRwLock::is_held) {
                         ret_int(engine, EBUSY)?
                     } else {
-                        state.pthread.rwlocks.remove(&id);
+                        state.pthread().rwlocks.remove(&id);
                         write_u64(engine, l, 0);
                         ret_int(engine, 0)?
                     }
@@ -303,8 +303,8 @@ pub(super) fn dispatch(
             if l == 0 {
                 ret_int(engine, EINVAL)?
             } else {
-                let id = state.pthread.alloc_id();
-                state.pthread.spins.insert(id, PtSpin::new());
+                let id = state.pthread().alloc_id();
+                state.pthread().spins.insert(id, PtSpin::new());
                 write_u64(engine, l, id);
                 ret_int(engine, 0)?
             }
@@ -314,7 +314,7 @@ pub(super) fn dispatch(
             match spin_id(engine, state, l) {
                 None => ret_int(engine, EINVAL)?,
                 Some(id) => {
-                    state.pthread.spins.remove(&id);
+                    state.pthread().spins.remove(&id);
                     write_u64(engine, l, 0);
                     ret_int(engine, 0)?
                 }
@@ -331,8 +331,8 @@ pub(super) fn dispatch(
             if b == 0 || count == 0 {
                 ret_int(engine, EINVAL)?
             } else {
-                let id = state.pthread.alloc_id();
-                state.pthread.barriers.insert(id, PtBarrier::new(count));
+                let id = state.pthread().alloc_id();
+                state.pthread().barriers.insert(id, PtBarrier::new(count));
                 write_u64(engine, b, id);
                 ret_int(engine, 0)?
             }
@@ -340,11 +340,11 @@ pub(super) fn dispatch(
         "pthread_barrier_destroy" => {
             let b = engine.read_rcx()?;
             let word = read_u64(engine, b);
-            match state.pthread.barriers.get(&word) {
+            match state.pthread().barriers.get(&word) {
                 None => ret_int(engine, EINVAL)?,
                 Some(bar) if bar.arrived > 0 => ret_int(engine, EBUSY)?,
                 Some(_) => {
-                    state.pthread.barriers.remove(&word);
+                    state.pthread().barriers.remove(&word);
                     write_u64(engine, b, 0);
                     ret_int(engine, 0)?
                 }
@@ -408,7 +408,7 @@ pub(super) fn dispatch(
             match sem_lookup(engine, state, s) {
                 None => ret_errno(engine, EINVAL)?,
                 Some(id) => {
-                    let v = state.pthread.sems.get(&id).map_or(0, |x| x.count);
+                    let v = state.pthread().sems.get(&id).map_or(0, |x| x.count);
                     write_i32(engine, out, v);
                     ret_int(engine, 0)?
                 }
@@ -435,7 +435,7 @@ fn mutex_id(engine: &mut dyn CpuEngine, state: &mut WinApiState, va: u64) -> Opt
         return None;
     }
     let word = read_u64(engine, va);
-    if is_pt_id(word) && state.pthread.mutexes.contains_key(&word) {
+    if is_pt_id(word) && state.pthread().mutexes.contains_key(&word) {
         return Some(word);
     }
     let kind = match word.cast_signed() {
@@ -444,8 +444,8 @@ fn mutex_id(engine: &mut dyn CpuEngine, state: &mut WinApiState, va: u64) -> Opt
         -3 => MUTEX_RECURSIVE,
         _ => return None,
     };
-    let id = state.pthread.alloc_id();
-    state.pthread.mutexes.insert(id, PtMutex::new(kind));
+    let id = state.pthread().alloc_id();
+    state.pthread().mutexes.insert(id, PtMutex::new(kind));
     write_u64(engine, va, id);
     Some(id)
 }
@@ -456,14 +456,14 @@ fn cond_id(engine: &mut dyn CpuEngine, state: &mut WinApiState, va: u64) -> Opti
         return None;
     }
     let word = read_u64(engine, va);
-    if is_pt_id(word) && state.pthread.conds.contains_key(&word) {
+    if is_pt_id(word) && state.pthread().conds.contains_key(&word) {
         return Some(word);
     }
     if !matches!(word.cast_signed(), 0 | -1) {
         return None;
     }
-    let id = state.pthread.alloc_id();
-    state.pthread.conds.insert(id, PtCond::new());
+    let id = state.pthread().alloc_id();
+    state.pthread().conds.insert(id, PtCond::new());
     write_u64(engine, va, id);
     Some(id)
 }
@@ -474,14 +474,14 @@ fn rwlock_id(engine: &mut dyn CpuEngine, state: &mut WinApiState, va: u64) -> Op
         return None;
     }
     let word = read_u64(engine, va);
-    if is_pt_id(word) && state.pthread.rwlocks.contains_key(&word) {
+    if is_pt_id(word) && state.pthread().rwlocks.contains_key(&word) {
         return Some(word);
     }
     if !matches!(word.cast_signed(), 0 | -1) {
         return None;
     }
-    let id = state.pthread.alloc_id();
-    state.pthread.rwlocks.insert(id, PtRwLock::new());
+    let id = state.pthread().alloc_id();
+    state.pthread().rwlocks.insert(id, PtRwLock::new());
     write_u64(engine, va, id);
     Some(id)
 }
@@ -492,25 +492,25 @@ fn spin_id(engine: &mut dyn CpuEngine, state: &mut WinApiState, va: u64) -> Opti
         return None;
     }
     let word = read_u64(engine, va);
-    if is_pt_id(word) && state.pthread.spins.contains_key(&word) {
+    if is_pt_id(word) && state.pthread().spins.contains_key(&word) {
         return Some(word);
     }
     if !matches!(word.cast_signed(), 0 | -1) {
         return None;
     }
-    let id = state.pthread.alloc_id();
-    state.pthread.spins.insert(id, PtSpin::new());
+    let id = state.pthread().alloc_id();
+    state.pthread().spins.insert(id, PtSpin::new());
     write_u64(engine, va, id);
     Some(id)
 }
 
 /// Resolve a `sem_t *`. Semaphores have no static initialiser.
-fn sem_lookup(engine: &mut dyn CpuEngine, state: &WinApiState, va: u64) -> Option<u64> {
+fn sem_lookup(engine: &mut dyn CpuEngine, state: &mut WinApiState, va: u64) -> Option<u64> {
     if va == 0 {
         return None;
     }
     let word = read_u64(engine, va);
-    if state.pthread.sems.contains_key(&word) {
+    if state.pthread().sems.contains_key(&word) {
         Some(word)
     } else {
         None
@@ -531,8 +531,8 @@ fn mutex_init(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<Win
     } else {
         (read_u32(engine, attr) & 0x3).cast_signed()
     };
-    let id = state.pthread.alloc_id();
-    state.pthread.mutexes.insert(id, PtMutex::new(kind));
+    let id = state.pthread().alloc_id();
+    state.pthread().mutexes.insert(id, PtMutex::new(kind));
     write_u64(engine, m, id);
     ret_int(engine, 0)
 }
@@ -551,11 +551,11 @@ fn mutex_destroy(
     if !is_pt_id(word) {
         return ret_int(engine, if matches!(word.cast_signed(), -3..=0) { 0 } else { EINVAL });
     }
-    match state.pthread.mutexes.get(&word) {
+    match state.pthread().mutexes.get(&word) {
         None => ret_int(engine, EINVAL),
         Some(mx) if mx.is_held() => ret_int(engine, EBUSY),
         Some(_) => {
-            state.pthread.mutexes.remove(&word);
+            state.pthread().mutexes.remove(&word);
             write_u64(engine, m, 0);
             ret_int(engine, 0)
         }
@@ -574,7 +574,7 @@ fn mutex_lock(
         return ret_int(engine, EINVAL);
     };
     let me = self_pt(engine, state);
-    let Some(mx) = state.pthread.mutexes.get_mut(&id) else {
+    let Some(mx) = state.pthread().mutexes.get_mut(&id) else {
         return ret_int(engine, EINVAL);
     };
     match mx.try_acquire(me) {
@@ -602,7 +602,7 @@ fn mutex_unlock(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<W
         return ret_int(engine, EINVAL);
     };
     let me = self_pt(engine, state);
-    let Some(mx) = state.pthread.mutexes.get_mut(&id) else {
+    let Some(mx) = state.pthread().mutexes.get_mut(&id) else {
         return ret_int(engine, EINVAL);
     };
     match mx.release(me) {
@@ -645,7 +645,7 @@ fn cond_wake(
     let Some(id) = cond_id(engine, state, cv) else {
         return ret_int(engine, EINVAL);
     };
-    if let Some(c) = state.pthread.conds.get_mut(&id) {
+    if let Some(c) = state.pthread().conds.get_mut(&id) {
         if all {
             c.signal_all();
         } else {
@@ -671,7 +671,7 @@ fn cond_wait(
     let tid = state.kernel.threads.current_tid();
     let me = self_pt(engine, state);
 
-    match state.pthread.pending.get(&tid).cloned() {
+    match state.pthread().pending.get(&tid).cloned() {
         // Phase 2: parked, waiting for a signal or the deadline.
         Some(PtPending::CondWait {
             cond,
@@ -680,24 +680,24 @@ fn cond_wait(
             deadline,
         }) => {
             let signaled = state
-                .pthread
+                .pthread()
                 .conds
                 .get(&cond)
                 .is_some_and(|c| c.is_signaled(me));
             let expired = deadline.is_some_and(|dl| Instant::now() >= dl);
             if !signaled && !expired {
-                let Some(c) = state.pthread.conds.get(&cond) else {
-                    state.pthread.pending.remove(&tid);
+                let Some(c) = state.pthread().conds.get(&cond) else {
+                    state.pthread().pending.remove(&tid);
                     return ret_int(engine, EINVAL);
                 };
                 let queue = Arc::clone(&c.queue);
                 return Err(park_on(state, &queue, slice_until(deadline)));
             }
-            if let Some(c) = state.pthread.conds.get_mut(&cond) {
+            if let Some(c) = state.pthread().conds.get_mut(&cond) {
                 c.remove(me);
             }
             let result = if signaled { 0 } else { ETIMEDOUT };
-            state.pthread.pending.insert(
+            state.pthread().pending.insert(
                 tid,
                 PtPending::CondReacquire {
                     mutex,
@@ -731,7 +731,7 @@ fn cond_wait(
             ) else {
                 return ret_int(engine, EINVAL);
             };
-            let Some(mx) = state.pthread.mutexes.get_mut(&mutex) else {
+            let Some(mx) = state.pthread().mutexes.get_mut(&mutex) else {
                 return ret_int(engine, EINVAL);
             };
             let depth = match mx.release_all(me) {
@@ -740,7 +740,7 @@ fn cond_wait(
             };
             mx.queue.wake();
 
-            let Some(c) = state.pthread.conds.get_mut(&cond) else {
+            let Some(c) = state.pthread().conds.get_mut(&cond) else {
                 return ret_int(engine, EINVAL);
             };
             c.waiters.push(CondWaiter {
@@ -748,7 +748,7 @@ fn cond_wait(
                 signaled: false,
             });
             let queue = Arc::clone(&c.queue);
-            state.pthread.pending.insert(
+            state.pthread().pending.insert(
                 tid,
                 PtPending::CondWait {
                     cond,
@@ -772,8 +772,8 @@ fn cond_reacquire(
 ) -> Result<WinApiHandlerResult> {
     let tid = state.kernel.threads.current_tid();
     let me = self_pt(engine, state);
-    let Some(mx) = state.pthread.mutexes.get_mut(&mutex) else {
-        state.pthread.pending.remove(&tid);
+    let Some(mx) = state.pthread().mutexes.get_mut(&mutex) else {
+        state.pthread().pending.remove(&tid);
         return ret_int(engine, EINVAL);
     };
     if mx.owner.is_some() && mx.owner != Some(me) {
@@ -782,7 +782,7 @@ fn cond_reacquire(
     }
     mx.owner = Some(me);
     mx.depth = depth.max(1);
-    state.pthread.pending.remove(&tid);
+    state.pthread().pending.remove(&tid);
     ret_int(engine, result)
 }
 
@@ -801,7 +801,7 @@ fn rwlock_acquire(
         return ret_int(engine, EINVAL);
     };
     let me = self_pt(engine, state);
-    let Some(rw) = state.pthread.rwlocks.get_mut(&id) else {
+    let Some(rw) = state.pthread().rwlocks.get_mut(&id) else {
         return ret_int(engine, EINVAL);
     };
     let got = if write { rw.try_write(me) } else { rw.try_read() };
@@ -830,7 +830,7 @@ fn rwlock_unlock(
         return ret_int(engine, EINVAL);
     };
     let me = self_pt(engine, state);
-    let Some(rw) = state.pthread.rwlocks.get_mut(&id) else {
+    let Some(rw) = state.pthread().rwlocks.get_mut(&id) else {
         return ret_int(engine, EINVAL);
     };
     match rw.unlock(me) {
@@ -855,7 +855,7 @@ fn spin_lock(
         return ret_int(engine, EINVAL);
     };
     let me = self_pt(engine, state);
-    let Some(sp) = state.pthread.spins.get_mut(&id) else {
+    let Some(sp) = state.pthread().spins.get_mut(&id) else {
         return ret_int(engine, EINVAL);
     };
     if sp.owner.is_none() {
@@ -876,7 +876,7 @@ fn spin_unlock(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<Wi
         return ret_int(engine, EINVAL);
     };
     let me = self_pt(engine, state);
-    let Some(sp) = state.pthread.spins.get_mut(&id) else {
+    let Some(sp) = state.pthread().spins.get_mut(&id) else {
         return ret_int(engine, EINVAL);
     };
     if sp.owner != Some(me) {
@@ -906,14 +906,14 @@ fn barrier_wait(
     if let Some(PtPending::Barrier {
         barrier,
         generation,
-    }) = state.pthread.pending.get(&tid).cloned()
+    }) = state.pthread().pending.get(&tid).cloned()
     {
-        let Some(bar) = state.pthread.barriers.get(&barrier) else {
-            state.pthread.pending.remove(&tid);
+        let Some(bar) = state.pthread().barriers.get(&barrier) else {
+            state.pthread().pending.remove(&tid);
             return ret_int(engine, EINVAL);
         };
         if bar.generation != generation {
-            state.pthread.pending.remove(&tid);
+            state.pthread().pending.remove(&tid);
             return ret_int(engine, 0);
         }
         let queue = Arc::clone(&bar.queue);
@@ -922,7 +922,7 @@ fn barrier_wait(
 
     let b = engine.read_rcx()?;
     let word = read_u64(engine, b);
-    let Some(bar) = state.pthread.barriers.get_mut(&word) else {
+    let Some(bar) = state.pthread().barriers.get_mut(&word) else {
         return ret_int(engine, EINVAL);
     };
     bar.arrived = bar.arrived.saturating_add(1);
@@ -934,7 +934,7 @@ fn barrier_wait(
     }
     let generation = bar.generation;
     let queue = Arc::clone(&bar.queue);
-    state.pthread.pending.insert(
+    state.pthread().pending.insert(
         tid,
         PtPending::Barrier {
             barrier: word,
@@ -956,8 +956,8 @@ fn sem_init(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<WinAp
     if s == 0 {
         return ret_errno(engine, EINVAL);
     }
-    let id = state.pthread.alloc_id();
-    state.pthread.sems.insert(id, PtSem::new(count, None));
+    let id = state.pthread().alloc_id();
+    state.pthread().sems.insert(id, PtSem::new(count, None));
     write_u64(engine, s, id);
     ret_int(engine, 0)
 }
@@ -968,7 +968,7 @@ fn sem_destroy(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<Wi
     let Some(id) = sem_lookup(engine, state, s) else {
         return ret_errno(engine, EINVAL);
     };
-    state.pthread.sems.remove(&id);
+    state.pthread().sems.remove(&id);
     write_u64(engine, s, 0);
     ret_int(engine, 0)
 }
@@ -987,7 +987,7 @@ fn sem_wait(
     let Some(id) = sem_lookup(engine, state, s) else {
         return ret_errno(engine, EINVAL);
     };
-    let Some(sem) = state.pthread.sems.get_mut(&id) else {
+    let Some(sem) = state.pthread().sems.get_mut(&id) else {
         return ret_errno(engine, EINVAL);
     };
     if sem.count > 0 {
@@ -1019,7 +1019,7 @@ fn sem_post(
     let Some(id) = sem_lookup(engine, state, s) else {
         return ret_errno(engine, EINVAL);
     };
-    let Some(sem) = state.pthread.sems.get_mut(&id) else {
+    let Some(sem) = state.pthread().sems.get_mut(&id) else {
         return ret_errno(engine, EINVAL);
     };
     let Some(next) = sem.count.checked_add(count) else {
@@ -1043,12 +1043,12 @@ fn sem_open(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<WinAp
         return ret_u64(engine, 0);
     }
 
-    if let Some(&id) = state.pthread.named_sems.get(&name) {
+    if let Some(&id) = state.pthread().named_sems.get(&name) {
         if oflag & O_CREAT != 0 && oflag & O_EXCL != 0 {
             set_errno_failed(engine, EEXIST);
             return ret_u64(engine, 0);
         }
-        if let Some(sem) = state.pthread.sems.get_mut(&id) {
+        if let Some(sem) = state.pthread().sems.get_mut(&id) {
             sem.refs = sem.refs.saturating_add(1);
         }
         return ret_u64(engine, id);
@@ -1062,24 +1062,24 @@ fn sem_open(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<WinAp
         set_errno_failed(engine, EINVAL);
         return ret_u64(engine, 0);
     };
-    let id = state.pthread.alloc_id();
+    let id = state.pthread().alloc_id();
     state
-        .pthread
+        .pthread()
         .sems
         .insert(id, PtSem::new(count, Some(name.clone())));
-    state.pthread.named_sems.insert(name, id);
+    state.pthread().named_sems.insert(name, id);
     ret_u64(engine, id)
 }
 
 /// `sem_close(sem)`.
 fn sem_close(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<WinApiHandlerResult> {
     let id = engine.read_rcx()?;
-    let Some(sem) = state.pthread.sems.get_mut(&id) else {
+    let Some(sem) = state.pthread().sems.get_mut(&id) else {
         return ret_errno(engine, EINVAL);
     };
     sem.refs = sem.refs.saturating_sub(1);
     if sem.refs == 0 && sem.unlinked {
-        state.pthread.sems.remove(&id);
+        state.pthread().sems.remove(&id);
     }
     ret_int(engine, 0)
 }
@@ -1088,10 +1088,10 @@ fn sem_close(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<WinA
 fn sem_unlink(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<WinApiHandlerResult> {
     let rcx = engine.read_rcx()?;
     let name = read_cstr(engine, rcx);
-    let Some(id) = state.pthread.named_sems.remove(&name) else {
+    let Some(id) = state.pthread().named_sems.remove(&name) else {
         return ret_errno(engine, ENOENT);
     };
-    let drop_now = match state.pthread.sems.get_mut(&id) {
+    let drop_now = match state.pthread().sems.get_mut(&id) {
         Some(sem) => {
             sem.unlinked = true;
             sem.refs == 0
@@ -1099,7 +1099,7 @@ fn sem_unlink(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<Win
         None => false,
     };
     if drop_now {
-        state.pthread.sems.remove(&id);
+        state.pthread().sems.remove(&id);
     }
     ret_int(engine, 0)
 }

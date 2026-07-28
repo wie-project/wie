@@ -244,7 +244,7 @@ pub fn handle_get_parent(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 pub fn handle_get_active_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let return_value = state.window_state.active_window_handle;
+    let return_value = state.window_state().active_window_handle;
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -259,7 +259,7 @@ pub fn handle_get_active_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 pub fn handle_get_foreground_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let return_value = state.window_state.foreground_window_handle;
+    let return_value = state.window_state().foreground_window_handle;
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -282,12 +282,12 @@ pub fn handle_show_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         .read_rdx()
         .context("failed to read RDX for ShowWindow")?;
 
-    let previously_visible = state.window_state.window_visible;
+    let previously_visible = state.window_state().window_visible;
 
     if window_handle == FAKE_WINDOW_HANDLE {
         // SW_HIDE is zero. Other commands make the window visible in the
         // current single-window model.
-        state.window_state.window_visible = show_command != 0;
+        state.window_state().window_visible = show_command != 0;
     }
 
     let return_value = u64::from(previously_visible);
@@ -313,10 +313,10 @@ pub fn handle_enable_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         .read_rdx()
         .context("failed to read RDX for EnableWindow")?;
 
-    let previously_disabled = !state.window_state.window_enabled;
+    let previously_disabled = !state.window_state().window_enabled;
 
     if window_handle == FAKE_WINDOW_HANDLE {
-        state.window_state.window_enabled = enable_raw != 0;
+        state.window_state().window_enabled = enable_raw != 0;
     }
 
     // EnableWindow returns nonzero when the window was previously disabled.
@@ -342,8 +342,8 @@ pub fn handle_set_foreground_window(ctx: &mut HandlerContext<'_>) -> Result<WinA
     let success = window_handle == FAKE_WINDOW_HANDLE;
 
     if success {
-        state.window_state.foreground_window_handle = window_handle;
-        state.window_state.active_window_handle = window_handle;
+        state.window_state().foreground_window_handle = window_handle;
+        state.window_state().active_window_handle = window_handle;
     }
 
     let return_value = u64::from(success);
@@ -365,10 +365,10 @@ pub fn handle_set_active_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .read_rcx()
         .context("failed to read RCX for SetActiveWindow")?;
 
-    let previous_window = state.window_state.active_window_handle;
+    let previous_window = state.window_state().active_window_handle;
 
     if window_handle == 0 || window_handle == FAKE_WINDOW_HANDLE {
-        state.window_state.active_window_handle = window_handle;
+        state.window_state().active_window_handle = window_handle;
     }
 
     let return_address = engine
@@ -388,10 +388,10 @@ pub fn handle_set_focus(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
         .read_rcx()
         .context("failed to read RCX for SetFocus")?;
 
-    let previous_window = state.window_state.focus_window_handle;
+    let previous_window = state.window_state().focus_window_handle;
 
     if window_handle == 0 || window_handle == FAKE_WINDOW_HANDLE {
-        state.window_state.focus_window_handle = window_handle;
+        state.window_state().focus_window_handle = window_handle;
     }
 
     let return_address = engine
@@ -407,7 +407,7 @@ pub fn handle_set_focus(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 pub fn handle_get_focus(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let return_value = state.window_state.focus_window_handle;
+    let return_value = state.window_state().focus_window_handle;
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -426,10 +426,10 @@ pub fn handle_set_capture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         .read_rcx()
         .context("failed to read RCX for SetCapture")?;
 
-    let previous_window = state.window_state.capture_window_handle;
+    let previous_window = state.window_state().capture_window_handle;
 
     if window_handle == FAKE_WINDOW_HANDLE {
-        state.window_state.capture_window_handle = window_handle;
+        state.window_state().capture_window_handle = window_handle;
     }
 
     let return_address = engine
@@ -445,7 +445,7 @@ pub fn handle_set_capture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 pub fn handle_get_capture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let return_value = state.window_state.capture_window_handle;
+    let return_value = state.window_state().capture_window_handle;
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -460,7 +460,7 @@ pub fn handle_get_capture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 pub fn handle_release_capture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    state.window_state.capture_window_handle = 0;
+    state.window_state().capture_window_handle = 0;
 
     let return_value = 1;
 
@@ -484,7 +484,7 @@ pub fn handle_update_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     let success = is_known_window(state, window_handle);
 
     if success {
-        state.window_state.window_invalidated = false;
+        state.window_state().window_invalidated = false;
     }
 
     let return_value = u64::from(success);
@@ -517,7 +517,7 @@ pub fn handle_invalidate_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     let success = window_handle == 0 || is_known_window(state, window_handle);
 
     if success {
-        state.window_state.window_invalidated = true;
+        state.window_state().window_invalidated = true;
     }
 
     let return_value = u64::from(success);
@@ -554,7 +554,7 @@ pub fn handle_redraw_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     let success = window_handle == 0 || window_handle == FAKE_WINDOW_HANDLE;
 
     if success {
-        state.window_state.window_invalidated = false;
+        state.window_state().window_invalidated = false;
     }
 
     let return_value = u64::from(success);
@@ -583,7 +583,7 @@ pub fn handle_set_window_text_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let success = window_handle == FAKE_WINDOW_HANDLE && text_ptr != 0;
 
     if success {
-        state.window_state.window_title = read_guest_ansi_lossy(engine, text_ptr, 32_768)
+        state.window_state().window_title = read_guest_ansi_lossy(engine, text_ptr, 32_768)
             .context("failed to read SetWindowTextA text")?;
     }
 
@@ -613,7 +613,7 @@ pub fn handle_set_window_text_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let success = window_handle == FAKE_WINDOW_HANDLE && text_ptr != 0;
 
     if success {
-        state.window_state.window_title = read_guest_utf16_lossy(engine, text_ptr, 32_768)
+        state.window_state().window_title = read_guest_utf16_lossy(engine, text_ptr, 32_768)
             .context("failed to read SetWindowTextW text")?;
     }
 
@@ -649,7 +649,7 @@ pub fn handle_get_window_text_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
             engine,
             buffer_ptr,
             max_characters,
-            &state.window_state.window_title,
+            &state.window_state().window_title,
         )?
     } else {
         0
@@ -685,7 +685,7 @@ pub fn handle_get_window_text_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
             engine,
             buffer_ptr,
             max_characters,
-            &state.window_state.window_title,
+            &state.window_state().window_title,
         )?
     } else {
         0
@@ -768,13 +768,13 @@ pub fn handle_move_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     let success = window_handle == FAKE_WINDOW_HANDLE;
 
     if success {
-        state.window_state.window_x = low_i32(x_raw, "MoveWindow x")?;
-        state.window_state.window_y = low_i32(y_raw, "MoveWindow y")?;
-        state.window_state.window_width = low_i32(width_raw, "MoveWindow width")?;
-        state.window_state.window_height = low_i32(height_raw, "MoveWindow height")?;
+        state.window_state().window_x = low_i32(x_raw, "MoveWindow x")?;
+        state.window_state().window_y = low_i32(y_raw, "MoveWindow y")?;
+        state.window_state().window_width = low_i32(width_raw, "MoveWindow width")?;
+        state.window_state().window_height = low_i32(height_raw, "MoveWindow height")?;
 
         if repaint_raw != 0 {
-            state.window_state.window_invalidated = false;
+            state.window_state().window_invalidated = false;
         }
     }
 
@@ -811,11 +811,11 @@ pub fn handle_screen_to_client(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         let y = read_guest_i32(engine, y_address)?;
 
         let client_x = x
-            .checked_sub(state.window_state.window_x)
+            .checked_sub(state.window_state().window_x)
             .context("ScreenToClient x coordinate overflow")?;
 
         let client_y = y
-            .checked_sub(state.window_state.window_y)
+            .checked_sub(state.window_state().window_y)
             .context("ScreenToClient y coordinate overflow")?;
 
         write_guest_i32(engine, point_ptr, client_x)?;
@@ -855,11 +855,11 @@ pub fn handle_client_to_screen(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         let y = read_guest_i32(engine, y_address)?;
 
         let screen_x = x
-            .checked_add(state.window_state.window_x)
+            .checked_add(state.window_state().window_x)
             .context("ClientToScreen x coordinate overflow")?;
 
         let screen_y = y
-            .checked_add(state.window_state.window_y)
+            .checked_add(state.window_state().window_y)
             .context("ClientToScreen y coordinate overflow")?;
 
         write_guest_i32(engine, point_ptr, screen_x)?;
@@ -1316,9 +1316,9 @@ pub fn handle_scroll_window_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         return_value: 1,
     })
 }
-pub(crate) fn find_window(state: &WinApiState, handle: u64) -> Option<&WindowRecord> {
+pub(crate) fn find_window(state: &mut WinApiState, handle: u64) -> Option<&WindowRecord> {
     state
-        .window_state
+        .window_state()
         .windows
         .iter()
         .find(|window| window.handle == handle)
