@@ -391,6 +391,13 @@ fn handle_park(
                 .return_from_win64_api(u64::from(result))
                 .map_err(|e| tracing::error!("guest stack corrupted on wait park: {e}"));
         }
+        HostParkReason::PthreadWait => {
+            // Pthread parking is handled through WakeQueue inside the handler.
+            // The handler returns HostPark with PthreadWait after registering
+            // the park on the thread's PtPark. Here we just yield briefly so
+            // the next handler re-entry can check the condition.
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         HostParkReason::WaitMultiple => {
             let req = {
                 let mut st = lock(shared_winapi);

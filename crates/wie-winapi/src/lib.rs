@@ -13,6 +13,7 @@ pub mod comdlg32;
 pub mod d3d9;
 pub mod dll_loader;
 pub mod dynamic_apis;
+pub mod pthread;
 pub use dynamic_apis::{DYNAMIC_FAKE_APIS, PREPLANTED_SOFT_APIS, resolve_get_proc_address};
 pub mod exception;
 pub mod fake_va;
@@ -266,6 +267,15 @@ pub const DEFAULT_ENVIRONMENT: &[(&str, &str)] = &[
     ("NUMBER_OF_PROCESSORS", "4"),
 ];
 
+/// Fake VA for the pthread return trampoline.
+pub const PTHREAD_RETURN_TRAMPOLINE_VA: u64 = 0x7000_0000_0000_FF00;
+
+/// Return the fake VA for the pthread return trampoline.
+#[must_use]
+pub fn pthread_return_trampoline_va() -> u64 {
+    PTHREAD_RETURN_TRAMPOLINE_VA
+}
+
 /// Kernel execution state (threading, synchronisation, SEH).
 #[derive(Debug, Clone)]
 pub struct KernelState {
@@ -298,6 +308,8 @@ pub struct WinApiState {
     pub kernel: KernelState,
     /// Console screen buffers, modes, and decoded input records.
     pub console: console::ConsoleState,
+    /// `libwinpthread-1.dll` emulation state.
+    pub pthread: pthread::PthreadState,
 }
 
 // Manual Debug impl: Box<dyn FnMut + Send> does not implement Debug.
@@ -312,6 +324,7 @@ impl std::fmt::Debug for WinApiState {
             .field("process", &self.process)
             .field("kernel", &self.kernel)
             .field("console", &self.console)
+            .field("pthread", &self.pthread)
             .finish()
     }
 }
@@ -328,6 +341,7 @@ impl Clone for WinApiState {
             process: self.process.clone(),
             kernel: self.kernel.clone(),
             console: self.console.clone(),
+            pthread: self.pthread.clone(),
         }
     }
 }
@@ -781,6 +795,8 @@ pub enum HostParkReason {
         /// Guest `RTL_CRITICAL_SECTION*`.
         cs: u64,
     },
+    /// Waiting on a pthread object.
+    PthreadWait,
     /// `WaitForSingleObject` (or similar) on a kernel handle.
     WaitObject {
         /// Kernel handle.
@@ -975,6 +991,7 @@ mod tests {
                 get_proc_address_cache: HashMap::new(),
                 next_module_handle: dll_loader::REAL_MODULE_HANDLE_BASE,
             },
+            pthread: Default::default(),
         }
     }
 

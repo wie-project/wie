@@ -1960,6 +1960,11 @@ impl RuntimeSession {
                             });
                             charged_api = charged_api.saturating_add(1);
                         }
+                        wie_winapi::HostParkReason::PthreadWait => {
+                            // Pthread parking uses WakeQueue; yield briefly so
+                            // the handler can re-check its condition on re-entry.
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
                         wie_winapi::HostParkReason::WaitMultiple => {
                             let _ = self.process.drain_spawns();
                             if crate::mt_runtime::mt_debug() {
