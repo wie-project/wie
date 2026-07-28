@@ -168,6 +168,16 @@ fn put_u32(buffer: &mut [u8; INPUT_RECORD_SIZE], offset: usize, value: u32) {
     }
 }
 
+/// Check if a key press is available without consuming it.
+/// Used by `_kbhit`, which must not remove the key from the queue.
+pub fn peek_key_press(state: &mut WinApiState) -> bool {
+    // Pump the terminal first so keys that arrived between frames are seen.
+    pump(state, 0);
+    state.console().pending_input.iter().any(|record| {
+        matches!(record, InputRecord::Key(event) if event.key_down)
+    })
+}
+
 /// Take the next queued key press, pumping the terminal if the queue is empty.
 ///
 /// Skips releases and non-key events, which is what the `conio` functions

@@ -205,6 +205,8 @@ mod imp {
             return false;
         }
         RAW_ACTIVE.store(true, Ordering::SeqCst);
+        // Clear the screen on entry so there's no stale content visible.
+        crate::console::host_term::write_stdout(b"\x1b[H\x1b[J");
         true
     }
 
@@ -215,6 +217,9 @@ mod imp {
         if !RAW_ACTIVE.swap(false, Ordering::SeqCst) {
             return;
         }
+        // Show the cursor before restoring — the guest may have hidden it
+        // via SetConsoleCursorInfo. Without this the terminal stays cursorless.
+        crate::console::screen::set_cursor_visible(true);
         let saved = match SAVED_TERMIOS.lock() {
             Ok(guard) => *guard,
             // A poisoned lock means a thread panicked mid-update; the snapshot

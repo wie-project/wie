@@ -338,10 +338,14 @@ pub struct ConsoleState {
     pub pending_input: VecDeque<InputRecord>,
     /// Undecoded bytes from the host terminal.
     pub input_bytes: Vec<u8>,
-    /// Last grid painted to the terminal, for diffing in Cells mode.
+    /// Last grid painted to the terminal, for diffing.
     pub rendered: Option<ScreenBuffer>,
     /// Set when a stream write may have moved the real cursor unpredictably.
     pub repaint_forced: bool,
+    /// Accumulated frame data (system(cls) + fputs + ...) flushed on Sleep.
+    pub stream_buf: Vec<u8>,
+    /// Set when stream_buf has data pending flush.
+    pub needs_flush: bool,
 }
 
 /// Handle of the screen buffer bound to `STD_OUTPUT_HANDLE` / `STD_ERROR_HANDLE`.
@@ -367,8 +371,92 @@ impl Default for ConsoleState {
             input_bytes: Vec::new(),
             rendered: None,
             repaint_forced: false,
+            stream_buf: Vec::new(),
+            needs_flush: false,
         }
     }
+}
+
+impl ConsoleState {
+    /// Flush buffered output to the host terminal.
+    /// On first frame the raw text is flushed for instant full-screen paint.
+    /// On subsequent frames only cells that changed are emitted via screen::flush.
+    pub fn flush_stream_output(&mut self) {
+        if !self.needs_flush || self.stream_buf.is_empty() {
+            return;
+        }
+        self.needs_flush = false;
+        let raw = std::mem::take(&mut self.stream_buf);
+        let is_first = self.rendered.is_none();
+
+        // Fold the raw bytes into the grid (handles \033[H, \033[2J, \n, etc.)
+        let Some(buffer_handle) = self.buffer_handle_for(PRIMARY_BUFFER_HANDLE) else { return; };
+        let units: Vec<u16> = raw.iter().map(|&b| u16::from(b)).collect();
+        crate::kernel32::console::fold_text_into_grid(self, buffer_handle, &units);
+
+        // Reset the terminal's colour attributes so every frame starts from
+        // the same base state — \033[0m restores the terminal's native palette
+        // without forcing any particular foreground/background.
+        const SGR_RESET: &str = "\u{1b}[0m";
+
+        if is_first {
+            // First frame: write \033[H + raw text for instant full paint.
+            // Strip \033[2J because the alt/empty-screen doesn't need clearing.
+            let clean = strip_csi_clear(&raw);
+            let mut out = Vec::with_capacity(clean.len() + SGR_RESET.len() + 4);
+            out.extend_from_slice(b"\x1b[H");
+            out.extend_from_slice(SGR_RESET.as_bytes());
+            out.extend_from_slice(&clean);
+            host_term::write_stdout(&out);
+        } else {
+            // Subsequent frames: diff against previous state, emit only changed cells.
+            if let Some(buffer) = self.buffer(PRIMARY_BUFFER_HANDLE) {
+                let diff = screen::flush(buffer, self.rendered.as_ref());
+                if !diff.is_empty() {
+                    let mut out = Vec::with_capacity(diff.len() + SGR_RESET.len() + 4);
+                    out.extend_from_slice(b"\x1b[H");
+                    out.extend_from_slice(SGR_RESET.as_bytes());
+                    out.extend_from_slice(diff.as_bytes());
+                    host_term::write_stdout(&out);
+                }
+            }
+        }
+        // Save rendered state for next diff.
+        if let Some(buffer) = self.buffer(PRIMARY_BUFFER_HANDLE) {
+            self.rendered = Some(buffer.clone());
+        }
+    }
+
+    /// Helper: get a handle to the primary screen buffer.
+    fn buffer_handle_for(&self, handle: u64) -> Option<u64> {
+        let stdout = 0x0000_0000_6000_0002; // FAKE_STDOUT_HANDLE
+        if handle == stdout || handle == 0x0000_0000_6000_0003 {
+            Some(PRIMARY_BUFFER_HANDLE)
+        } else {
+            self.buffer(handle).map(|_| handle)
+        }
+    }
+}
+
+/// Strip \033[J, \033[0J, \033[1J, \033[2J from raw frame data.
+fn strip_csi_clear(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 2 < bytes.len() && bytes[i + 1] == b'[' {
+            let j = i + 2;
+            let is_clear = (j < bytes.len() && bytes[j] == b'J')
+                || (j + 1 < bytes.len() && matches!(bytes[j], b'0' | b'1' | b'2') && bytes[j + 1] == b'J');
+            if is_clear {
+                let skip = if bytes[j] == b'J' { 1 } else { 2 };
+                i = j + skip;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
 }
 
 impl ConsoleState {

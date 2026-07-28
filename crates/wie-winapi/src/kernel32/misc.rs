@@ -1204,6 +1204,8 @@ pub(crate) fn handle_tls_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 }
 /// Handles `KERNEL32.dll!Sleep`.
 pub fn handle_sleep(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    // Flush any buffered console output so the frame is visible before sleeping.
+    ctx.state.flush_console();
     let engine = &mut *ctx.engine;
     let milliseconds = engine.read_rcx().context("failed to read RCX for Sleep")?;
     let low32 = milliseconds & u64::from(u32::MAX);

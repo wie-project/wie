@@ -61,6 +61,13 @@ pub fn sgr_for(previous: Option<u16>, current: u16) -> String {
     if previous == Some(current) {
         return String::new();
     }
+    // DEFAULT_ATTRIBUTES (white on black) is the Windows console default.
+    // On a Unix terminal the user's theme is the real default — don't force
+    // 0;37;40 over it when the \033[0m reset at the start of the frame
+    // already restores the terminal's native palette.
+    if previous.is_none() && current == super::DEFAULT_ATTRIBUTES {
+        return String::new();
+    }
     let foreground = ansi_colour_index(current & 0x7);
     let background = ansi_colour_index((current >> 4) & 0x7);
     let bright_foreground = current & FOREGROUND_INTENSITY != 0;
@@ -101,9 +108,10 @@ pub fn flush(buffer: &ScreenBuffer, previous: Option<&ScreenBuffer>) -> String {
     let mut cursor: Option<(u16, u16)> = None;
 
     if full_repaint {
-        // Home the cursor and clear, so stale content below a shrunk buffer
-        // cannot survive.
-        out.push_str("\u{1b}[H\u{1b}[2J");
+        // Home the cursor so the first frame starts from (0,0).
+        // No \033[2J here — the alt screen starts empty, and the
+        // clear would cause a visible blank frame before the content.
+        out.push_str("\u{1b}[H");
     }
 
     for row in 0..buffer.height {
@@ -270,7 +278,12 @@ mod tests {
     #[test]
     fn default_attributes_render_as_grey_on_black() {
         let sgr = sgr_for(None, DEFAULT_ATTRIBUTES);
-        assert_eq!(sgr, "\u{1b}[0;37;40m");
+        // DEFAULT_ATTRIBUTES is the Windows console default and should not
+        // emit any SGR — the \033[0m reset at frame start is enough.
+        assert_eq!(sgr, "", "default attributes should not emit SGR");
+        // But a non-default attribute should still emit SGR.
+        let bright = sgr_for(None, DEFAULT_ATTRIBUTES | 0x0008);
+        assert_eq!(bright, "\u{1b}[0;97;40m", "bright + default = bright white on black");
     }
 
     #[test]
@@ -288,7 +301,9 @@ mod tests {
     fn first_flush_clears_and_repaints() {
         let buffer = grid(4, 2);
         let out = flush(&buffer, None);
-        assert!(out.contains("\u{1b}[2J"), "expected a clear on first paint");
+        assert!(out.contains("\u{1b}[H"), "expected cursor home on first paint");
+        // A 4×2 grid of spaces: cursor home, row 0 (4 spaces), row 1 (4 spaces).
+        assert!(!out.is_empty(), "expected repaint output");
     }
 
     #[test]
@@ -297,7 +312,7 @@ mod tests {
         let painted = buffer.clone();
         let out = flush(&buffer, Some(&painted));
         // Only the trailing cursor reposition should survive the diff.
-        assert!(!out.contains("\u{1b}[2J"));
+        assert!(!out.contains("\u{1b}[H\u{1b}[2J"));
         assert_eq!(out, "\u{1b}[1;1H");
     }
 
@@ -325,7 +340,7 @@ mod tests {
         let painted = grid(10, 2);
         let buffer = grid(20, 2);
         let out = flush(&buffer, Some(&painted));
-        assert!(out.contains("\u{1b}[2J"), "resize must clear stale content");
+        assert!(out.contains("\u{1b}[H"), "resize must home cursor");
     }
 
     #[test]

@@ -318,32 +318,25 @@ fn emit_console_text(ctx: &mut HandlerContext<'_>, handle: u64, units: &[u16]) {
     let Some(buffer_handle) = buffer_handle_for(ctx.state.console(), handle) else {
         return;
     };
-
-    if ctx.state.console().render_mode == console::RenderMode::Cells {
-        fold_text_into_grid(ctx.state.console(), buffer_handle, units);
-        return;
-    }
-
-    let text = codepage::units_to_host_utf8(units);
-    // An ESC in the stream means the guest is driving the terminal directly;
-    // the tracked cursor can no longer be trusted to match the real one.
-    if text.contains('\u{1b}') {
-        ctx.state.console().note_stream_escape();
-    }
-    advance_tracked_cursor(ctx.state.console(), buffer_handle, units);
-    if handle == FAKE_STDERR_HANDLE {
-        write_host_stderr(text.as_bytes());
-    } else {
-        host_term::write_stdout(text.as_bytes());
-    }
+    // Always fold into the grid. The stream_buf/flush mechanism is no longer
+    // needed — the grid diff renderer (screen::flush) emits only the changed
+    // cells as targeted Ansi escapes, so the terminal never does full-frame
+    // progressive painting.
+    ctx.state.console().render_mode = console::RenderMode::Cells;
+    fold_text_into_grid(ctx.state.console(), buffer_handle, units);
+    // Mark that the grid needs flushing — the diff will be emitted on Sleep,
+    // _getch, or _kbhit via flush_stream_output.
+    ctx.state.console().needs_flush = true;
 }
 
 #[cfg(unix)]
+#[allow(dead_code)]
 fn write_host_stderr(bytes: &[u8]) {
     crate::ucrt::write_all_fd(libc::STDERR_FILENO, bytes);
 }
 
 #[cfg(not(unix))]
+#[allow(dead_code)]
 fn write_host_stderr(bytes: &[u8]) {
     use std::io::Write;
     drop(std::io::stderr().write_all(bytes));
@@ -354,6 +347,7 @@ fn write_host_stderr(bytes: &[u8]) {
 /// Models the four control characters a console interprets plus wrapping. It is
 /// deliberately not a VT parser — escape sequences are handled by
 /// [`ConsoleState::note_stream_escape`] marking the position unknown.
+#[allow(dead_code)]
 fn advance_tracked_cursor(state: &mut ConsoleState, buffer_handle: u64, units: &[u16]) {
     let Some(buffer) = state.buffer_mut(buffer_handle) else {
         return;
@@ -388,14 +382,85 @@ fn advance_tracked_cursor(state: &mut ConsoleState, buffer_handle: u64, units: &
 }
 
 /// Apply stream text to the cell grid at the cursor (Cells mode only).
-fn fold_text_into_grid(state: &mut ConsoleState, buffer_handle: u64, units: &[u16]) {
+/// Fold decoded text into the grid, interpreting CSI cursor positioning
+/// and clear-screen escapes so programs using Ansi via WriteConsole
+/// (like the snake game's `\033[H\033[2JScore:...`) render correctly.
+pub(crate) fn fold_text_into_grid(state: &mut ConsoleState, buffer_handle: u64, units: &[u16]) {
     let Some(buffer) = state.buffer_mut(buffer_handle) else {
         return;
     };
     let attributes = buffer.attributes;
     let width = i16::try_from(buffer.width).unwrap_or(i16::MAX).max(1);
     let height = i16::try_from(buffer.height).unwrap_or(i16::MAX).max(1);
-    for &unit in units {
+
+    // Simple CSI sequence parser state.
+    let mut i = 0;
+    while i < units.len() {
+        let unit = units[i];
+        // ESC (0x1B) starts an escape sequence.
+        if unit == 0x1B && i + 1 < units.len() && units[i + 1] == u16::from(b'[') {
+            i += 2; // skip ESC + '['
+            if i < units.len() && units[i] == u16::from(b'2') && i + 1 < units.len() && units[i + 1] == u16::from(b'J') {
+                // \033[2J — clear entire screen
+                for cell in buffer.cells.iter_mut() {
+                    *cell = console::CharInfo { unit: u16::from(b' '), attributes };
+                }
+                i += 2;
+                continue;
+            }
+            if i < units.len() && units[i] == u16::from(b'J') {
+                // \033[J or \033[0J — clear from cursor to end
+                if let Some(start) = buffer.index_of(buffer.cursor.x, buffer.cursor.y) {
+                    for cell in buffer.cells.get_mut(start..).unwrap_or(&mut []) {
+                        *cell = console::CharInfo { unit: u16::from(b' '), attributes };
+                    }
+                }
+                i += 1;
+                continue;
+            }
+            if i < units.len() && units[i] == u16::from(b'1') && i + 1 < units.len() && units[i + 1] == u16::from(b'J') {
+                // \033[1J — clear from start to cursor
+                if let Some(end) = buffer.index_of(buffer.cursor.x, buffer.cursor.y) {
+                    for cell in buffer.cells.get_mut(..=end).unwrap_or(&mut []) {
+                        *cell = console::CharInfo { unit: u16::from(b' '), attributes };
+                    }
+                }
+                i += 2;
+                continue;
+            }
+            if i < units.len() && units[i] == u16::from(b'H') {
+                // \033[H — cursor home (1,1 → 0,0)
+                buffer.cursor.x = 0;
+                buffer.cursor.y = 0;
+                i += 1;
+                continue;
+            }
+            if i + 1 < units.len() && units[i + 1] == u16::from(b'H') {
+                // \033[<row>;<col>H — cursor position (1-based)
+                // Parse row and col from params before H
+                // We handle single-digit positions (enough for the snake game's 20x30)
+                let ch = char::from_u32(u32::from(units[i])).unwrap_or(' ');
+                let ch2 = char::from_u32(u32::from(units[i + 1])).unwrap_or(' ');
+                if ch.is_ascii_digit() && ch2 == 'H' {
+                    let row = ch.to_digit(10).unwrap_or(1).saturating_sub(1) as i16;
+                    buffer.cursor.y = row.max(0).min(height.saturating_sub(1));
+                    buffer.cursor.x = 0;
+                    i += 2;
+                    continue;
+                }
+            }
+            // Unknown escape — skip to the final byte (letter).
+            while i < units.len() {
+                let c = char::from_u32(u32::from(units[i])).unwrap_or(' ');
+                if c.is_ascii_uppercase() || c.is_ascii_lowercase() {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // Regular character or control code.
         match unit {
             0x0A => {
                 buffer.cursor.x = 0;
@@ -424,6 +489,7 @@ fn fold_text_into_grid(state: &mut ConsoleState, buffer_handle: u64, units: &[u1
             buffer.cursor.y = height.saturating_sub(1);
             buffer.scroll_up();
         }
+        i += 1;
     }
 }
 
@@ -433,6 +499,15 @@ pub fn handle_write_console_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 
 pub fn handle_write_console_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     write_console(ctx, false)
+}
+
+/// Buffer CRT `fputs` output through the console module so it flushes
+/// atomically on `Sleep` (or `_getch`), rather than writing directly to
+/// the host fd. This eliminates flicker from per-write rendering.
+pub fn emit_text_from_bytes(ctx: &mut HandlerContext<'_>, bytes: &[u8]) {
+    let console = ctx.state.console();
+    console.stream_buf.extend_from_slice(bytes);
+    console.needs_flush = true;
 }
 
 /// Shared body of `ReadConsoleW` / `ReadConsoleA`.

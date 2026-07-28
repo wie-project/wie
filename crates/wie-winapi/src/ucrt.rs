@@ -200,6 +200,9 @@ pub fn dispatch_ucrt(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiH
         "_cxxthrowexception" => handle_cxx_throw_exception(ctx),
         "srand" => handle_srand(ctx),
         "rand" => handle_rand(ctx),
+        "_kbhit" => handle_kbhit(ctx),
+        "_getch" => handle_getch(ctx),
+        "system" => handle_system(ctx),
         _ => anyhow::bail!("unsupported UCRT export: {name}"),
     }
 }
@@ -276,7 +279,8 @@ fn handle_fwrite(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
 fn handle_fflush(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let _stream = engine.read_rcx()?;
-    // Console I/O uses unbuffered `libc::write`; no userspace buffer / no stdio lock.
+    // Don't flush the console buffer here — it waits for Sleep so the
+    // terminal receives the frame atomically rather than per-write.
     ret(engine, 0)
 }
 
@@ -286,7 +290,6 @@ fn write_host_console(stream: u64, bytes: &[u8]) {
     let fd = if stream == FILE_STDOUT {
         libc::STDOUT_FILENO
     } else {
-        // FILE_STDERR (caller already filtered).
         libc::STDERR_FILENO
     };
     write_all_fd(fd, bytes);
@@ -343,11 +346,61 @@ fn handle_setvbuf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     ret(engine, 0)
 }
 
-/// Minimal stub: treat as success / no output formatting for CRT init paths.
+/// `__stdio_common_vfprintf(options, FILE*, format, locale, va_list)`.
+/// Formats the string and writes it to the host console.
 fn handle_stdio_common_vfprintf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    // Signature is options, FILE*, format, locale, va_list — ignore and return 0 chars.
-    ret(engine, 0)
+    let (out, is_stderr) = {
+        let engine = &mut *ctx.engine;
+        let _options = engine.read_rcx()?;
+        let file_ptr = engine.read_rdx()?; // FILE* (0=stdin, 1=stdout, 2=stderr)
+        let fmt_ptr = engine.read_r8()?;
+        let _locale = engine.read_r9()?;
+        if fmt_ptr == 0 {
+            return ret(engine, 0);
+        }
+        let fmt = read_guest_str(engine, fmt_ptr, 4096)?;
+        let rsp = engine.read_rsp()?;
+        let mut va = read_guest_u64(engine, rsp.wrapping_add(0x28)).unwrap_or(0);
+
+        const MAX_OUTPUT: usize = 4096;
+        let mut out = Vec::with_capacity(256);
+        let bytes = fmt.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() && out.len() < MAX_OUTPUT {
+            if bytes[i] == b'%' && i + 1 < bytes.len() {
+                i += 1;
+                match bytes[i] {
+                    b'd' | b'i' | b'u' | b'X' | b'x' => {
+                        let v = read_guest_u64(engine, va).unwrap_or(0);
+                        va = va.wrapping_add(8);
+                        out.extend_from_slice(format!("{}", v as i64).as_bytes());
+                    }
+                    b's' => {
+                        let p = read_guest_u64(engine, va).unwrap_or(0);
+                        va = va.wrapping_add(8);
+                        out.extend_from_slice(read_guest_str(engine, p, 1024).unwrap_or_default().as_bytes());
+                    }
+                    b'c' => {
+                        let v = read_guest_u64(engine, va).unwrap_or(0);
+                        va = va.wrapping_add(8);
+                        out.push(v as u8);
+                    }
+                    _ => { va = va.wrapping_add(8); }
+                }
+            } else {
+                out.push(bytes[i]);
+            }
+            i += 1;
+        }
+        (out, file_ptr == 2)
+    };
+    // Engine borrow is dropped — now we can use ctx.
+    if is_stderr {
+        write_host_console(FILE_STDERR, &out);
+    } else {
+        crate::kernel32::console::emit_text_from_bytes(ctx, &out);
+    }
+    ret(&mut *ctx.engine, out.len() as u64)
 }
 
 /// `__stdio_common_vsprintf(options, buf, count, format, locale, va_list)`.
@@ -624,6 +677,134 @@ fn handle_rand(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     CRT_RNG.store(next, std::sync::atomic::Ordering::Relaxed);
     let val = (next >> 16) & 0x7FFF;
     ret(engine, u64::from(val))
+}
+
+/// `_kbhit()` — non-blocking key-press check (peek, does NOT consume).
+fn handle_kbhit(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    ctx.state.flush_console();
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    crate::console::pump::ensure_input_ready(state);
+    let ready = crate::console::pump::peek_key_press(state);
+    ret(engine, u64::from(ready))
+}
+
+// Map a Windows VK code to the scan code MSVC `_getch` returns for
+// extended keys (arrows, F-keys, etc.) — the two-call protocol.
+const fn vk_to_scan(vk: u16) -> Option<u8> {
+    Some(match vk {
+        0x25 => 75,   // VK_LEFT
+        0x26 => 72,   // VK_UP
+        0x27 => 77,   // VK_RIGHT
+        0x28 => 80,   // VK_DOWN
+        0x24 => 71,   // VK_HOME
+        0x23 => 79,   // VK_END
+        0x2D => 82,   // VK_INSERT
+        0x2E => 83,   // VK_DELETE
+        0x21 => 73,   // VK_PRIOR (PgUp)
+        0x22 => 81,   // VK_NEXT (PgDn)
+        0x70..=0x7B => 59 + (vk - 0x70) as u8, // VK_F1..VK_F12 → 59..68, 133..134
+        _ => return None,
+    })
+}
+
+// Per-thread state for the two-call extended-key protocol.
+std::thread_local! {
+    static PENDING_SCAN: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+/// `_getch()` — blocking key read (no echo).
+///
+/// Extended keys (arrows, F-keys, etc.) use a two-call protocol:
+/// 1. First call returns 0 (signals an extended key).
+/// 2. Second call returns the scan code.
+fn handle_getch(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    ctx.state.flush_console();
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+
+    // If a scan code is pending from a previous extended-key prefix, return it.
+    if let Some(scan) = PENDING_SCAN.get() {
+        PENDING_SCAN.set(None);
+        return ret(engine, u64::from(scan));
+    }
+
+    crate::console::pump::ensure_input_ready(state);
+    let Some(key) = crate::console::pump::next_key_press(state, true) else {
+        return ret(engine, 0);
+    };
+
+    if key.unit != 0 {
+        // Regular key: return the character directly.
+        return ret(engine, u64::from(key.unit));
+    }
+
+    // Extended key (no character): return 0 now, save scan code for next call.
+    if let Some(scan) = vk_to_scan(key.virtual_key_code) {
+        PENDING_SCAN.set(Some(scan));
+    }
+    ret(engine, 0)
+}
+
+/// `system(command)` — run a shell command on the host.
+///
+/// Reads the command string from guest memory, executes it via the host
+/// shell, and returns the exit code. When `command` is NULL, returns
+/// non-zero to indicate a command processor is available (per spec).
+fn handle_system(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let cmd_ptr = ctx.engine.read_rcx()?;
+    if cmd_ptr == 0 {
+        // MSDN: passing NULL queries whether a command processor exists.
+        let eng = &mut *ctx.engine;
+        #[cfg(not(target_os = "windows"))]
+        return ret(eng, 1);
+        #[cfg(target_os = "windows")]
+        return ret(eng, 0);
+    }
+    // Read the command string from guest memory (null-terminated).
+    let mut cmd_bytes = Vec::new();
+    let mut addr = cmd_ptr;
+    loop {
+        let mut byte = [0_u8];
+        ctx.engine.mem_read(addr, &mut byte)?;
+        if byte[0] == 0 {
+            break;
+        }
+        cmd_bytes.push(byte[0]);
+        addr = addr.wrapping_add(1);
+        if cmd_bytes.len() > 4096 {
+            break; // safety cap
+        }
+    }
+    let cmd = String::from_utf8_lossy(&cmd_bytes);
+    // Handle cls directly — this is the most common system() call and
+    // shelling it on macOS/Linux would fail (cls is a Windows command).
+    if cmd.trim().eq_ignore_ascii_case("cls") {
+        // Route through the console buffer so the clear and the
+        // subsequent fputs(frame) arrive at the terminal as one
+        // atomic write on Sleep.
+        crate::kernel32::console::emit_text_from_bytes(ctx, b"\x1b[H\x1b[J");
+        let eng = &mut *ctx.engine;
+        return ret(eng, 0);
+    }
+    // Other commands are passed to the host shell.
+    let eng = &mut *ctx.engine;
+    #[cfg(not(target_os = "windows"))]
+    {
+        let result = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd.as_ref())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status();
+        let code = result.ok().and_then(|s| s.code()).unwrap_or(-1);
+        ret(eng, code as u64)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = cmd;
+        ret(eng, 0)
+    }
 }
 
 fn handle_malloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -1127,17 +1308,16 @@ fn handle_fputc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
 
 /// `fputs(s, stream)`.
 fn handle_fputs(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let s = engine.read_rcx()?;
-    let stream = engine.read_rdx()?;
+    let s = ctx.engine.read_rcx()?;
+    let stream = ctx.engine.read_rdx()?;
     if s == 0 {
-        return ret(engine, u64::from(u32::MAX)); // EOF
+        return ret(&mut *ctx.engine, u64::from(u32::MAX)); // EOF
     }
     let mut bytes = Vec::new();
     let mut off = 0_u64;
     loop {
         let mut b = [0_u8; 1];
-        engine.mem_read(s.wrapping_add(off), &mut b)?;
+        ctx.engine.mem_read(s.wrapping_add(off), &mut b)?;
         if b[0] == 0 {
             break;
         }
@@ -1147,13 +1327,13 @@ fn handle_fputs(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
             break;
         }
     }
-    let out = if stream == FILE_STDERR {
-        FILE_STDERR
+    if stream == FILE_STDERR {
+        write_host_console(FILE_STDERR, &bytes);
     } else {
-        FILE_STDOUT
-    };
-    write_host_console(out, &bytes);
-    ret(engine, 0) // non-negative = success
+        // Buffer through the console module — flushes atomically on Sleep.
+        crate::kernel32::console::emit_text_from_bytes(ctx, &bytes);
+    }
+    ret(&mut *ctx.engine, 0)
 }
 
 /// `puts(s)` — write NUL-terminated string + newline to stdout.

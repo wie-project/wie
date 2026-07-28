@@ -478,6 +478,15 @@ impl std::fmt::Debug for WinApiState {
 // When adding a new DLL, add a pair of methods here (mut + try_)
 // and a variant to [`DllId`]. That is the only change needed.
 impl WinApiState {
+    /// Flush buffered Stream-mode console output to the host terminal.
+    /// Called at frame boundaries (Sleep, _getch, etc.) so multiple
+    /// WriteConsole calls within one frame render atomically.
+    pub fn flush_console(&mut self) {
+        // get_or_init is fine — if the console state hasn't been allocated
+        // yet there's nothing to flush, and allocating an empty state is cheap.
+        self.console().flush_stream_output();
+    }
+
     /// Mutable access — lazy-initialises on first call.
     pub fn console(&mut self) -> &mut console::ConsoleState {
         self.dll_states.get_or_init::<console::ConsoleState>(DllId::Console)
