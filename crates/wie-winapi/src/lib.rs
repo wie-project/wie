@@ -2,6 +2,7 @@
 
 #![allow(clippy::type_complexity)]
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -363,33 +364,24 @@ impl DllId {
     pub const COUNT: usize = 4;
 }
 
-/// Combines `Any` for downcasting with `Clone` for cloning through a
-/// trait object. Stored in [`DllStateMap`] slots.
-trait CloneBoxAny: std::any::Any + Send {
-    fn clone_box(&self) -> Box<dyn CloneBoxAny>;
-}
-impl<T: Clone + Send + 'static> CloneBoxAny for T {
-    fn clone_box(&self) -> Box<dyn CloneBoxAny> {
-        Box::new(self.clone())
-    }
-}
-
 /// Lazy DLL state storage. Fixed-size array, zero per-call overhead.
 ///
-/// Each slot is `Option<Box<dyn CloneBoxAny>>` — a nullable fat pointer
+/// Each slot is `Option<Box<dyn Any + Send>>` — a nullable fat pointer
 /// (16 bytes) when unloaded. Access is a direct array index + one `TypeId`
 /// compare. No hash, no indirect dispatch.
 ///
+/// `WinApiState` is shared behind `Arc<Mutex<>>` and is **never cloned**.
+/// Do not add `Clone` to this type or to [`WinApiState`].
+///
 /// # Adding a new DLL (alongside [`DllId`])
 ///
-/// The `Clone`, `Debug`, and `new()` impls all hardcode the slot list.
+/// The `new()` and `Debug` impls hardcode the slot list.
 /// When you add a [`DllId`] variant:
 ///
 /// - Add the new slot to `slots: [None, None, None, None, None]` in `new()`.
-/// - Add the new slot to each tuple in the `Clone` impl.
 /// - Add the new slot to the `Debug` match in `slot_name()`.
 pub struct DllStateMap {
-    slots: [Option<Box<dyn CloneBoxAny>>; DllId::COUNT],
+    slots: [Option<Box<dyn Any + Send>>; DllId::COUNT],
 }
 
 impl Default for DllStateMap {
@@ -437,7 +429,7 @@ impl DllStateMap {
     /// If the slot type does not match `T` — a programming error when a
     /// `DllId` variant is reused for a different type.
     #[allow(clippy::as_conversions, clippy::expect_used)]
-    pub fn get_or_init<T: Clone + Default + Send + 'static>(&mut self, id: DllId) -> &mut T {
+    pub fn get_or_init<T: Default + Send + 'static>(&mut self, id: DllId) -> &mut T {
         let idx = id as u8 as usize;
         let slot = self
             .slots
@@ -445,7 +437,7 @@ impl DllStateMap {
             .expect("DllId index out of range — did you forget to bump COUNT?");
         slot.get_or_insert_with(|| Box::new(T::default()));
         let boxed = slot.as_mut().expect("slot was just initialised");
-        let any: &mut dyn std::any::Any = boxed.as_mut();
+        let any: &mut (dyn Any + Send) = boxed.as_mut();
         any.downcast_mut::<T>()
             .expect("DllId slot type mismatch")
     }
@@ -455,22 +447,8 @@ impl DllStateMap {
     pub fn get<T: 'static>(&self, id: DllId) -> Option<&T> {
         let idx = id as u8 as usize;
         let boxed = self.slots.get(idx)?.as_ref()?;
-        let any: &dyn std::any::Any = boxed.as_ref();
+        let any = &**boxed as &(dyn Any + Send);
         any.downcast_ref::<T>()
-    }
-}
-
-impl Clone for DllStateMap {
-    /// Clone each loaded slot. Add one tuple per new [`DllId`] variant.
-    fn clone(&self) -> Self {
-        DllStateMap {
-            slots: [
-                self.slots[0].as_ref().map(|boxed| boxed.clone_box()),
-                self.slots[1].as_ref().map(|boxed| boxed.clone_box()),
-                self.slots[2].as_ref().map(|boxed| boxed.clone_box()),
-                self.slots[3].as_ref().map(|boxed| boxed.clone_box()),
-            ],
-        }
     }
 }
 
@@ -489,6 +467,9 @@ pub struct WinApiState {
     pub dll_states: DllStateMap,
 }
 
+// NOTE: WinApiState is deliberately not Clone. It lives behind
+// Arc<Mutex<>> in the MT runtime and is never copied per thread.
+
 // Manual Debug impl: Box<dyn FnMut + Send> does not implement Debug.
 impl std::fmt::Debug for WinApiState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -504,19 +485,6 @@ impl std::fmt::Debug for WinApiState {
 }
 
 // Manual Clone impl: Box<dyn FnMut + Send> does not implement Clone.
-impl Clone for WinApiState {
-    fn clone(&self) -> Self {
-        Self {
-            heap_state: self.heap_state.clone(),
-            file_io: self.file_io.clone(),
-            dll_states: self.dll_states.clone(),
-            module_state: self.module_state.clone(),
-            process: self.process.clone(),
-            kernel: self.kernel.clone(),
-        }
-    }
-}
-
 // ── DLL state accessors ─────────────────────────────────────────────────
 //
 // When adding a new DLL, add a pair of methods here (mut + try_)
