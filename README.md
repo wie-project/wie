@@ -63,6 +63,17 @@ mkdir -p "$BOTTLE/drive_c/App"
 # Kill-switch: WIE_MT=0 makes CreateThread fail (ST-only)
 ```
 
+# Interactive snake game (WASD / arrow keys, q to quit)
+```bash
+cargo build -p wie-cli --release
+x86_64-w64-mingw32-gcc -std=c11 -O2 -o micro-exes/out/snake.exe micro-exes/snake/main.c
+./target/release/wie-cli run --persistent --max-api 100000000 micro-exes/out/snake.exe
+```
+Also builds natively on macOS for comparison:
+```bash
+clang -std=c11 -O2 -o snake micro-exes/snake/main.c && ./snake
+```
+
 ```bash
 # Full clean-room gate (builds micros + runs all PE gates under WIE_CPU=jit)
 make -C micro-exes && ./scripts/run-micro-suite.sh
