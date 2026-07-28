@@ -217,8 +217,9 @@ mod imp {
         if !RAW_ACTIVE.swap(false, Ordering::SeqCst) {
             return;
         }
-        // Show the cursor before restoring — the guest may have hidden it
-        // via SetConsoleCursorInfo. Without this the terminal stays cursorless.
+        // Clear the screen and show the cursor so no gameboard content
+        // remains visible after the emulated process terminates.
+        crate::console::host_term::write_stdout(b"\x1b[2J\x1b[H");
         crate::console::screen::set_cursor_visible(true);
         let saved = match SAVED_TERMIOS.lock() {
             Ok(guard) => *guard,

@@ -381,20 +381,22 @@ impl ConsoleState {
     /// Flush buffered output to the host terminal.
     /// Flush all pending output to the terminal.
     ///
-    /// 1. If `stream_buf` has data, fold it into the grid via `fold_text_into_grid`
-    ///    (handles ANSI escapes like \033[H, \033[2J, \n, plain text).
-    /// 2. Diff the current grid against the last rendered state and emit only
-    ///    changed cells — no clear-screen escape ever reaches the terminal.
+    /// 1. Folds `stream_buf` into the grid via `fold_text_into_grid`.
+    /// 2. Reconstructs the full grid as plain text with `\n` row separators.
+    /// 3. Writes `\033[H` + SGR reset + reconstructed text.
     ///
-    /// Called on natural frame boundaries: `Sleep`, `_getch`, `_kbhit`, `fflush`.
-    /// Every CRT output path (`fputs`, `printf`, `puts`, `putchar`, `WriteConsoleA`,
-    /// `system("cls")`) converges here.
+    /// No diff renderer — the full grid is always written as text. This
+    /// avoids ordering issues where the old character at a position is
+    /// cleared before the new one is drawn (or vice versa), which looks
+    /// like flickering or double-images.
+    ///
+    /// Called on natural frame boundaries: `Sleep`, `_getch`, `_kbhit`,
+    /// `fflush`. Every CRT output path converges here.
     pub fn flush_stream_output(&mut self) {
         if !self.needs_flush {
             return;
         }
         self.needs_flush = false;
-        let is_first = self.rendered.is_none();
 
         // Fold any buffered CRT output into the grid first.
         if !self.stream_buf.is_empty() {
@@ -405,42 +407,25 @@ impl ConsoleState {
             }
         }
 
-        // Everything between the last flush and now is now in the grid.
-        // Diff against the last rendered state and emit only changed cells.
+        // Reconstruct the full grid as text (every cell, every frame).
+        // No diff — the terminal overwrites the previous frame in place.
         const SGR_RESET: &str = "\u{1b}[0m";
         if let Some(buffer) = self.buffer(PRIMARY_BUFFER_HANDLE) {
-            if is_first {
-                // First frame: write \033[H + raw text for instant full paint.
-                // No \033[2J — the alt/empty-screen doesn't need clearing.
-                // Reconstruct the grid content as raw text with newlines.
-                let stride = usize::from(buffer.width);
-                let rows = usize::from(buffer.height);
-                let mut raw = Vec::with_capacity(stride * rows + rows);
-                for row in 0..rows {
-                    let base = row * stride;
-                    for col in 0..stride {
-                        if let Some(cell) = buffer.cells.get(base + col) {
-                            let ch = crate::console::screen::char_of(*cell);
-                            raw.push(ch as u8);
-                        }
+            let stride = usize::from(buffer.width);
+            let rows = usize::from(buffer.height);
+            let mut raw = Vec::with_capacity(stride * rows + rows + SGR_RESET.len() + 4);
+            raw.extend_from_slice(b"\x1b[H");
+            raw.extend_from_slice(SGR_RESET.as_bytes());
+            for row in 0..rows {
+                let base = row * stride;
+                for col in 0..stride {
+                    if let Some(cell) = buffer.cells.get(base + col) {
+                        raw.push(crate::console::screen::char_of(*cell) as u8);
                     }
-                    raw.push(b'\n');
                 }
-                let mut out = Vec::with_capacity(raw.len() + SGR_RESET.len() + 4);
-                out.extend_from_slice(b"\x1b[H");
-                out.extend_from_slice(SGR_RESET.as_bytes());
-                out.extend_from_slice(&raw);
-                host_term::write_stdout(&out);
-            } else {
-                let diff = crate::console::screen::flush(buffer, self.rendered.as_ref());
-                if !diff.is_empty() {
-                    let mut out = Vec::with_capacity(diff.len() + SGR_RESET.len() + 4);
-                    out.extend_from_slice(b"\x1b[H");
-                    out.extend_from_slice(SGR_RESET.as_bytes());
-                    out.extend_from_slice(diff.as_bytes());
-                    host_term::write_stdout(&out);
-                }
+                raw.push(b'\n');
             }
+            host_term::write_stdout(&raw);
             self.rendered = Some(buffer.clone());
         }
     }
