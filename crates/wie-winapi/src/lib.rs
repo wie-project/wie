@@ -336,7 +336,19 @@ pub struct KernelState {
 }
 
 /// Identifies a slot in [`DllStateMap`]. One variant per emulated DLL
-/// that carries state.
+/// that carries host-side state.
+///
+/// # Adding a new DLL
+///
+/// 1. Add a variant here (e.g. `Ws2_32`).
+/// 2. Bump [`DllId::COUNT`] by 1.
+/// 3. Add an accessor on [`WinApiState`] (e.g. `pub fn ws2_32(&mut self) -> &mut Ws2_32State`).
+/// 4. Add the type to the slot-name mapping in [`DllStateMap::slot_name`]
+///    and to the `Clone` impl's array literal.
+///
+/// That is the entire change — no `WinApiState` field, no `Clone`/`Debug`
+/// boilerplate on the struct, no construction-site edits, no handler migration.
+/// This is the only file you need to touch for a new DLL state.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum DllId {
@@ -347,6 +359,7 @@ pub enum DllId {
 }
 
 impl DllId {
+    /// Number of variants. Update when adding a new one.
     pub const COUNT: usize = 4;
 }
 
@@ -366,6 +379,15 @@ impl<T: Clone + Send + 'static> CloneBoxAny for T {
 /// Each slot is `Option<Box<dyn CloneBoxAny>>` — a nullable fat pointer
 /// (16 bytes) when unloaded. Access is a direct array index + one `TypeId`
 /// compare. No hash, no indirect dispatch.
+///
+/// # Adding a new DLL (alongside [`DllId`])
+///
+/// The `Clone`, `Debug`, and `new()` impls all hardcode the slot list.
+/// When you add a [`DllId`] variant:
+///
+/// - Add the new slot to `slots: [None, None, None, None, None]` in `new()`.
+/// - Add the new slot to each tuple in the `Clone` impl.
+/// - Add the new slot to the `Debug` match in `slot_name()`.
 pub struct DllStateMap {
     slots: [Option<Box<dyn CloneBoxAny>>; DllId::COUNT],
 }
@@ -376,19 +398,24 @@ impl Default for DllStateMap {
     }
 }
 
+/// Debug label for each [`DllId`] slot. Update when adding a variant.
+const fn slot_name(i: usize) -> &'static str {
+    match i {
+        0 => "console",
+        1 => "window",
+        2 => "d3d9",
+        3 => "pthread",
+        _ => "?",
+    }
+}
+
 impl std::fmt::Debug for DllStateMap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let loaded: Vec<&str> = self
             .slots
             .iter()
             .enumerate()
-            .filter_map(|(i, slot)| slot.as_ref().map(|_| match i {
-                0 => "console",
-                1 => "window",
-                2 => "d3d9",
-                3 => "pthread",
-                _ => "?",
-            }))
+            .filter_map(|(i, slot)| slot.as_ref().map(|_| slot_name(i)))
             .collect();
         f.debug_struct("DllStateMap")
             .field("loaded", &loaded)
@@ -397,6 +424,7 @@ impl std::fmt::Debug for DllStateMap {
 }
 
 impl DllStateMap {
+    /// All slots start unloaded. Add a `None` per new [`DllId`] variant.
     pub fn new() -> Self {
         Self {
             slots: [None, None, None, None],
@@ -433,6 +461,7 @@ impl DllStateMap {
 }
 
 impl Clone for DllStateMap {
+    /// Clone each loaded slot. Add one tuple per new [`DllId`] variant.
     fn clone(&self) -> Self {
         DllStateMap {
             slots: [
@@ -489,6 +518,9 @@ impl Clone for WinApiState {
 }
 
 // ── DLL state accessors ─────────────────────────────────────────────────
+//
+// When adding a new DLL, add a pair of methods here (mut + try_)
+// and a variant to [`DllId`]. That is the only change needed.
 impl WinApiState {
     /// Mutable access — lazy-initialises on first call.
     pub fn console(&mut self) -> &mut console::ConsoleState {
