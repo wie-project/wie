@@ -14,13 +14,13 @@ use anyhow::Result;
 use wie_cpu::CpuEngine;
 
 use super::objects::{CondWaiter, PtBarrier, PtCond, PtMutex, PtRwLock, PtSem, PtSpin};
-use super::{
-    BARRIER_SERIAL_THREAD, EAGAIN, EBUSY, EEXIST, EINVAL, ENOENT, EPERM, ETIMEDOUT, MUTEX_ERRORCHECK,
-    MUTEX_NORMAL, MUTEX_RECURSIVE, PROCESS_SHARED, PtPending, absolute_deadline, is_pt_id,
-    park_on, read_cstr, read_u32, read_u64, relative_deadline, ret_errno, ret_int, ret_u64,
-    slice_until, stack_arg, trunc_i32, write_i32, write_u32, write_u64,
-};
 use super::threads::{cancellation_point, self_pt};
+use super::{
+    BARRIER_SERIAL_THREAD, EAGAIN, EBUSY, EEXIST, EINVAL, ENOENT, EPERM, ETIMEDOUT,
+    MUTEX_ERRORCHECK, MUTEX_NORMAL, MUTEX_RECURSIVE, PROCESS_SHARED, PtPending, absolute_deadline,
+    is_pt_id, park_on, read_cstr, read_u32, read_u64, relative_deadline, ret_errno, ret_int,
+    ret_u64, slice_until, stack_arg, trunc_i32, write_i32, write_u32, write_u64,
+};
 use crate::{WinApiHandlerResult, WinApiState};
 
 /// Dispatch the synchronisation exports. `None` if unrecognised.
@@ -230,7 +230,12 @@ pub(super) fn dispatch(
             match rwlock_id(engine, state, l) {
                 None => ret_int(engine, EINVAL)?,
                 Some(id) => {
-                    if state.pthread().rwlocks.get(&id).is_some_and(PtRwLock::is_held) {
+                    if state
+                        .pthread()
+                        .rwlocks
+                        .get(&id)
+                        .is_some_and(PtRwLock::is_held)
+                    {
                         ret_int(engine, EBUSY)?
                     } else {
                         state.pthread().rwlocks.remove(&id);
@@ -549,7 +554,14 @@ fn mutex_destroy(
     let word = read_u64(engine, m);
     // Destroying a never-locked static initialiser is a no-op, not an error.
     if !is_pt_id(word) {
-        return ret_int(engine, if matches!(word.cast_signed(), -3..=0) { 0 } else { EINVAL });
+        return ret_int(
+            engine,
+            if matches!(word.cast_signed(), -3..=0) {
+                0
+            } else {
+                EINVAL
+            },
+        );
     }
     match state.pthread().mutexes.get(&word) {
         None => ret_int(engine, EINVAL),
@@ -596,7 +608,10 @@ fn mutex_lock(
 }
 
 /// `pthread_mutex_unlock(m)`.
-fn mutex_unlock(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<WinApiHandlerResult> {
+fn mutex_unlock(
+    engine: &mut dyn CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
     let m = engine.read_rcx()?;
     let Some(id) = mutex_id(engine, state, m) else {
         return ret_int(engine, EINVAL);
@@ -725,10 +740,9 @@ fn cond_wait(
                 DeadlineSource::Absolute { bits64 } => absolute_deadline(engine, ts, bits64),
                 DeadlineSource::Relative { bits64 } => relative_deadline(engine, ts, bits64),
             };
-            let (Some(cond), Some(mutex)) = (
-                cond_id(engine, state, cv),
-                mutex_id(engine, state, m),
-            ) else {
+            let (Some(cond), Some(mutex)) =
+                (cond_id(engine, state, cv), mutex_id(engine, state, m))
+            else {
                 return ret_int(engine, EINVAL);
             };
             let Some(mx) = state.pthread().mutexes.get_mut(&mutex) else {
@@ -804,7 +818,11 @@ fn rwlock_acquire(
     let Some(rw) = state.pthread().rwlocks.get_mut(&id) else {
         return ret_int(engine, EINVAL);
     };
-    let got = if write { rw.try_write(me) } else { rw.try_read() };
+    let got = if write {
+        rw.try_write(me)
+    } else {
+        rw.try_read()
+    };
     if got {
         return ret_int(engine, 0);
     }

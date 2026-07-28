@@ -218,9 +218,7 @@ impl PtCond {
     /// Whether `pt`'s waiter has been signaled.
     #[must_use]
     pub fn is_signaled(&self, pt: u64) -> bool {
-        self.waiters
-            .iter()
-            .any(|w| w.pt == pt && w.signaled)
+        self.waiters.iter().any(|w| w.pt == pt && w.signaled)
     }
 
     /// Remove `pt` from the waiter list.

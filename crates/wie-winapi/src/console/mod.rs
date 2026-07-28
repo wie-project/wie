@@ -44,6 +44,7 @@
     clippy::items_after_statements,
     clippy::format_push_string,
     clippy::cast_lossless,
+    clippy::arithmetic_side_effects
 )]
 
 pub(crate) mod codepage;
@@ -284,7 +285,8 @@ impl ScreenBuffer {
                     .saturating_mul(usize::from(self.width))
                     .saturating_add(col);
                 let to = row.saturating_mul(usize::from(width)).saturating_add(col);
-                if let (Some(cell), Some(slot)) = (self.cells.get(from).copied(), next.get_mut(to)) {
+                if let (Some(cell), Some(slot)) = (self.cells.get(from).copied(), next.get_mut(to))
+                {
                     *slot = cell;
                 }
             }
@@ -442,8 +444,6 @@ impl ConsoleState {
     }
 }
 
-
-
 impl ConsoleState {
     /// Borrow the screen buffer behind an output handle.
     #[must_use]
@@ -490,7 +490,8 @@ impl ConsoleState {
         let (columns, rows) = host_term::window_size();
         let handle = self.next_buffer_handle;
         self.next_buffer_handle = self.next_buffer_handle.saturating_add(1);
-        self.buffers.push((handle, ScreenBuffer::new(columns, rows)));
+        self.buffers
+            .push((handle, ScreenBuffer::new(columns, rows)));
         self.output_modes.push((handle, DEFAULT_OUTPUT_MODE));
         // A guest that allocates its own buffer is double-buffering, which only
         // makes sense against the cell APIs.

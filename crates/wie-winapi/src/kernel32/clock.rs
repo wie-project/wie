@@ -12,7 +12,12 @@
 //! `WIE_FIXED_CLOCK=1` restores the old constants for deterministic traces —
 //! the diff between two runs should be instruction flow, not wall time.
 
-#![allow(clippy::integer_division, clippy::map_unwrap_or, clippy::checked_conversions, clippy::arithmetic_side_effects)]
+#![allow(
+    clippy::integer_division,
+    clippy::map_unwrap_or,
+    clippy::checked_conversions,
+    clippy::arithmetic_side_effects
+)]
 
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -87,7 +92,10 @@ mod tests {
         }
         let first = performance_counter();
         let second = performance_counter();
-        assert!(second >= first, "counter went backwards: {second} < {first}");
+        assert!(
+            second >= first,
+            "counter went backwards: {second} < {first}"
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@
     clippy::cast_sign_loss,
     clippy::match_same_arms,
     clippy::unnecessary_fold,
-    clippy::option_if_let_else,
+    clippy::option_if_let_else
 )]
 //! carrying a virtual-key code, a scan code, the translated character, and a
 //! modifier mask. A Unix terminal reports *characters*, with special keys
@@ -79,7 +79,10 @@ const VK_F1: u16 = 0x70;
 /// Outcome of trying to decode one key from the head of the buffer.
 enum Step {
     /// Consumed `used` bytes and produced records.
-    Emit { used: usize, records: Vec<InputRecord> },
+    Emit {
+        used: usize,
+        records: Vec<InputRecord>,
+    },
     /// A valid prefix, but the rest has not arrived yet.
     Incomplete,
 }
@@ -596,9 +599,18 @@ mod tests {
 
     #[test]
     fn function_and_navigation_keys_decode() {
-        assert_eq!(keys(b"\x1b[11~").first().map(|k| k.virtual_key_code), Some(VK_F1));
-        assert_eq!(keys(b"\x1b[3~").first().map(|k| k.virtual_key_code), Some(VK_DELETE));
-        assert_eq!(keys(b"\x1b[5~").first().map(|k| k.virtual_key_code), Some(VK_PRIOR));
+        assert_eq!(
+            keys(b"\x1b[11~").first().map(|k| k.virtual_key_code),
+            Some(VK_F1)
+        );
+        assert_eq!(
+            keys(b"\x1b[3~").first().map(|k| k.virtual_key_code),
+            Some(VK_DELETE)
+        );
+        assert_eq!(
+            keys(b"\x1b[5~").first().map(|k| k.virtual_key_code),
+            Some(VK_PRIOR)
+        );
     }
 
     #[test]
@@ -632,7 +644,10 @@ mod tests {
         ));
         assert!(matches!(
             records.get(1),
-            Some(InputRecord::Key(KeyEvent { key_down: false, .. }))
+            Some(InputRecord::Key(KeyEvent {
+                key_down: false,
+                ..
+            }))
         ));
     }
 

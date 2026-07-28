@@ -20,7 +20,7 @@
     clippy::nonminimal_bool,
     clippy::or_fun_call,
     clippy::manual_range_contains,
-    clippy::default_trait_access,
+    clippy::default_trait_access
 )]
 //!
 //! # Guest ABI

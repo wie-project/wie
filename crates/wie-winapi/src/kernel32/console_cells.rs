@@ -30,7 +30,10 @@ const MAX_CELLS: usize = 4 * 1024 * 1024;
 /// The Win64 ABI puts the 5th argument at `RSP + 0x28` on entry: 0x20 of shadow
 /// space plus the 8-byte return address.
 fn stack_arg(ctx: &mut HandlerContext<'_>, index: usize, api: &str) -> Result<u64> {
-    let rsp = ctx.engine.read_rsp().with_context(|| format!("{api} RSP"))?;
+    let rsp = ctx
+        .engine
+        .read_rsp()
+        .with_context(|| format!("{api} RSP"))?;
     let offset = 0x28_u64.saturating_add((u64::try_from(index).unwrap_or(0)).saturating_mul(8));
     let address = super::checked_address(rsp, offset, api)?;
     super::read_guest_u64(ctx.engine, address)
@@ -38,7 +41,9 @@ fn stack_arg(ctx: &mut HandlerContext<'_>, index: usize, api: &str) -> Result<u6
 
 /// Resolve an output handle to a screen-buffer handle.
 fn buffer_handle_for(state: &WinApiState, handle: u64) -> Option<u64> {
-    state.try_console().and_then(|c| super::console::buffer_handle_for(c, handle))
+    state
+        .try_console()
+        .and_then(|c| super::console::buffer_handle_for(c, handle))
 }
 
 /// Switch into Cells mode the first time a cell API is used.
@@ -147,9 +152,7 @@ pub fn handle_set_console_text_attribute(
 /// `GetConsoleCursorInfo(HANDLE, PCONSOLE_CURSOR_INFO)`.
 ///
 /// `CONSOLE_CURSOR_INFO` is `{ DWORD dwSize; BOOL bVisible; }`.
-pub fn handle_get_console_cursor_info(
-    ctx: &mut HandlerContext<'_>,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_console_cursor_info(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let handle = ctx.engine.read_rcx().context("GetConsoleCursorInfo RCX")?;
     let info_ptr = ctx.engine.read_rdx().context("GetConsoleCursorInfo RDX")?;
     if info_ptr == 0 {
@@ -172,9 +175,7 @@ pub fn handle_get_console_cursor_info(
 }
 
 /// `SetConsoleCursorInfo(HANDLE, const CONSOLE_CURSOR_INFO*)`.
-pub fn handle_set_console_cursor_info(
-    ctx: &mut HandlerContext<'_>,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_console_cursor_info(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let handle = ctx.engine.read_rcx().context("SetConsoleCursorInfo RCX")?;
     let info_ptr = ctx.engine.read_rdx().context("SetConsoleCursorInfo RDX")?;
     if info_ptr == 0 {
@@ -395,7 +396,10 @@ fn write_console_output(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinA
                 let source_y = source_origin
                     .y
                     .saturating_add(row.saturating_sub(region.top));
-                if source_x < 0 || source_y < 0 || source_x >= source_size.x || source_y >= source_size.y
+                if source_x < 0
+                    || source_y < 0
+                    || source_x >= source_size.x
+                    || source_y >= source_size.y
                 {
                     column = column.saturating_add(1);
                     continue;
@@ -445,15 +449,11 @@ fn write_console_output(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinA
     ret_bool_true(ctx.engine, api)
 }
 
-pub fn handle_write_console_output_w(
-    ctx: &mut HandlerContext<'_>,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_write_console_output_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     write_console_output(ctx, true)
 }
 
-pub fn handle_write_console_output_a(
-    ctx: &mut HandlerContext<'_>,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_write_console_output_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     write_console_output(ctx, false)
 }
 
@@ -829,7 +829,9 @@ fn scroll_region(
     }
 
     let inside_clip = |x: i16, y: i16| -> bool {
-        clip.is_none_or(|rect| x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom)
+        clip.is_none_or(|rect| {
+            x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
+        })
     };
 
     // Blank the source region first, then paint the moved cells over it.
@@ -874,10 +876,22 @@ pub fn handle_scroll_console_screen_buffer_a(
 pub fn handle_create_console_screen_buffer(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
-    let _access = ctx.engine.read_rcx().context("CreateConsoleScreenBuffer RCX")?;
-    let _share = ctx.engine.read_rdx().context("CreateConsoleScreenBuffer RDX")?;
-    let _security = ctx.engine.read_r8().context("CreateConsoleScreenBuffer R8")?;
-    let _flags = ctx.engine.read_r9().context("CreateConsoleScreenBuffer R9")?;
+    let _access = ctx
+        .engine
+        .read_rcx()
+        .context("CreateConsoleScreenBuffer RCX")?;
+    let _share = ctx
+        .engine
+        .read_rdx()
+        .context("CreateConsoleScreenBuffer RDX")?;
+    let _security = ctx
+        .engine
+        .read_r8()
+        .context("CreateConsoleScreenBuffer R8")?;
+    let _flags = ctx
+        .engine
+        .read_r9()
+        .context("CreateConsoleScreenBuffer R9")?;
     enter_cells_mode(ctx);
     let handle = ctx.state.console().create_buffer();
     ret_u64(ctx.engine, handle, "CreateConsoleScreenBuffer")
@@ -942,9 +956,7 @@ pub fn handle_set_console_screen_buffer_size(
 /// Accepted and recorded, but the terminal window is the user's to size. A
 /// guest that shrinks its window still renders correctly because the grid, not
 /// the window rect, drives the diff.
-pub fn handle_set_console_window_info(
-    ctx: &mut HandlerContext<'_>,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_console_window_info(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let handle = ctx.engine.read_rcx().context("SetConsoleWindowInfo RCX")?;
     let _absolute = ctx.engine.read_rdx().context("SetConsoleWindowInfo RDX")?;
     let rect_ptr = ctx.engine.read_r8().context("SetConsoleWindowInfo R8")?;

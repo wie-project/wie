@@ -1066,8 +1066,12 @@ pub fn dispatch_kernel32_extra(
         "getconsoletitlew" => Ok(Some(handle_get_console_title_w(ctx)?)),
         "getconsolewindow" => Ok(Some(handle_get_console_window(ctx)?)),
         "getlargestconsolewindowsize" => Ok(Some(handle_get_largest_console_window_size(ctx)?)),
-        "getnumberofconsoleinputevents" => Ok(Some(handle_get_number_of_console_input_events(ctx)?)),
-        "getnumberofconsolemousebuttons" => Ok(Some(handle_get_number_of_console_mouse_buttons(ctx)?)),
+        "getnumberofconsoleinputevents" => {
+            Ok(Some(handle_get_number_of_console_input_events(ctx)?))
+        }
+        "getnumberofconsolemousebuttons" => {
+            Ok(Some(handle_get_number_of_console_mouse_buttons(ctx)?))
+        }
         "peekconsoleinputw" => Ok(Some(handle_peek_console_input_w(ctx)?)),
         "readconsoleinputw" => Ok(Some(handle_read_console_input_w(ctx)?)),
         "readconsolew" => Ok(Some(handle_read_console_w(ctx)?)),

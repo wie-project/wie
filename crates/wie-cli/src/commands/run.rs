@@ -149,7 +149,9 @@ pub(crate) fn run_until_yield(path: &Path, max_api: usize) -> Result<()> {
     // thread when waiting for messages. Otherwise every Sleep is a no-op
     // and interactive programs render all frames instantly.
     #[expect(unsafe_code)]
-    unsafe { std::env::set_var("WIE_IDLE", "park"); }
+    unsafe {
+        std::env::set_var("WIE_IDLE", "park");
+    }
     let summary = wie_runtime::run_persistent_until_yield(path, max_api)?;
     let stdout = io::stdout();
     let mut output = stdout.lock();

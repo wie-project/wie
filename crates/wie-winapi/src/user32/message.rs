@@ -141,15 +141,18 @@ pub fn handle_post_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
             .checked_add(1)
             .context("PostMessageA timestamp overflow")?;
 
-        state.window_state().message_queue.push(QueuedWindowMessage {
-            window_handle,
-            message,
-            word_parameter,
-            long_parameter,
-            time,
-            point_x: 0,
-            point_y: 0,
-        });
+        state
+            .window_state()
+            .message_queue
+            .push(QueuedWindowMessage {
+                window_handle,
+                message,
+                word_parameter,
+                long_parameter,
+                time,
+                point_x: 0,
+                point_y: 0,
+            });
     }
 
     let return_value = u64::from(valid_window);

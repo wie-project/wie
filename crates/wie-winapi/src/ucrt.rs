@@ -378,14 +378,20 @@ fn handle_stdio_common_vfprintf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
                     b's' => {
                         let p = read_guest_u64(engine, va).unwrap_or(0);
                         va = va.wrapping_add(8);
-                        out.extend_from_slice(read_guest_str(engine, p, 1024).unwrap_or_default().as_bytes());
+                        out.extend_from_slice(
+                            read_guest_str(engine, p, 1024)
+                                .unwrap_or_default()
+                                .as_bytes(),
+                        );
                     }
                     b'c' => {
                         let v = read_guest_u64(engine, va).unwrap_or(0);
                         va = va.wrapping_add(8);
                         out.push(v as u8);
                     }
-                    _ => { va = va.wrapping_add(8); }
+                    _ => {
+                        va = va.wrapping_add(8);
+                    }
                 }
             } else {
                 out.push(bytes[i]);
@@ -693,16 +699,16 @@ fn handle_kbhit(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
 // extended keys (arrows, F-keys, etc.) — the two-call protocol.
 const fn vk_to_scan(vk: u16) -> Option<u8> {
     Some(match vk {
-        0x25 => 75,   // VK_LEFT
-        0x26 => 72,   // VK_UP
-        0x27 => 77,   // VK_RIGHT
-        0x28 => 80,   // VK_DOWN
-        0x24 => 71,   // VK_HOME
-        0x23 => 79,   // VK_END
-        0x2D => 82,   // VK_INSERT
-        0x2E => 83,   // VK_DELETE
-        0x21 => 73,   // VK_PRIOR (PgUp)
-        0x22 => 81,   // VK_NEXT (PgDn)
+        0x25 => 75,                            // VK_LEFT
+        0x26 => 72,                            // VK_UP
+        0x27 => 77,                            // VK_RIGHT
+        0x28 => 80,                            // VK_DOWN
+        0x24 => 71,                            // VK_HOME
+        0x23 => 79,                            // VK_END
+        0x2D => 82,                            // VK_INSERT
+        0x2E => 83,                            // VK_DELETE
+        0x21 => 73,                            // VK_PRIOR (PgUp)
+        0x22 => 81,                            // VK_NEXT (PgDn)
         0x70..=0x7B => 59 + (vk - 0x70) as u8, // VK_F1..VK_F12 → 59..68, 133..134
         _ => return None,
     })

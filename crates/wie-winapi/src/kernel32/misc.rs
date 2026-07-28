@@ -1,9 +1,10 @@
 use super::{
-    Context, ERROR_INVALID_PARAMETER, FIXED_PERFORMANCE_FREQUENCY, FLS_OUT_OF_INDEXES, FlsSlot, GUEST_OS_BUILD, GUEST_OS_MAJOR, GUEST_OS_MINOR,
-    GUEST_OS_PLATFORM_NT, HandlerContext, LANG_EN_US, OnceLock, Result, TIME_ZONE_ID_INVALID,
-    TIME_ZONE_ID_UNKNOWN, WinApiHandlerResult, WinApiState, checked_field_address, low_u32,
-    low_u32_to_i32, read_guest_ansi_lossy, read_guest_utf16_lossy, ret_bool_true, ret_u64,
-    write_guest_u16, write_guest_u32, write_guest_u64, write_mock_string_a, write_mock_string_w,
+    Context, ERROR_INVALID_PARAMETER, FIXED_PERFORMANCE_FREQUENCY, FLS_OUT_OF_INDEXES, FlsSlot,
+    GUEST_OS_BUILD, GUEST_OS_MAJOR, GUEST_OS_MINOR, GUEST_OS_PLATFORM_NT, HandlerContext,
+    LANG_EN_US, OnceLock, Result, TIME_ZONE_ID_INVALID, TIME_ZONE_ID_UNKNOWN, WinApiHandlerResult,
+    WinApiState, checked_field_address, low_u32, low_u32_to_i32, read_guest_ansi_lossy,
+    read_guest_utf16_lossy, ret_bool_true, ret_u64, write_guest_u16, write_guest_u32,
+    write_guest_u64, write_mock_string_a, write_mock_string_w,
 };
 
 pub(crate) fn packed_get_version() -> u64 {

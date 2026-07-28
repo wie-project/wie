@@ -58,9 +58,7 @@ pub(crate) fn refill_stdin_from_host(state: &mut WinApiState) -> Result<bool, ()
 
 /// True for the three fake std handles plus any allocated screen buffer.
 fn is_console_output_handle(state: &ConsoleState, handle: u64) -> bool {
-    handle == FAKE_STDOUT_HANDLE
-        || handle == FAKE_STDERR_HANDLE
-        || state.buffer(handle).is_some()
+    handle == FAKE_STDOUT_HANDLE || handle == FAKE_STDERR_HANDLE || state.buffer(handle).is_some()
 }
 
 /// Map an output handle to the screen buffer it is bound to.
@@ -79,7 +77,10 @@ pub(crate) fn buffer_handle_for(state: &ConsoleState, handle: u64) -> Option<u64
 }
 
 /// Return `FALSE` with `SetLastError(ERROR_INVALID_HANDLE)`.
-pub(crate) fn ret_invalid_handle(ctx: &mut HandlerContext<'_>, api: &str) -> Result<WinApiHandlerResult> {
+pub(crate) fn ret_invalid_handle(
+    ctx: &mut HandlerContext<'_>,
+    api: &str,
+) -> Result<WinApiHandlerResult> {
     ctx.state.process.last_error = ERROR_INVALID_HANDLE;
     ret_u64(ctx.engine, 0, api)
 }
@@ -157,9 +158,7 @@ pub fn handle_set_console_mode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         apply_input_mode_to_host(ctx.state.console());
         // Toggle xterm mouse reporting when the guest changes ENABLE_MOUSE_INPUT
         if (prev_mode ^ requested) & console::ENABLE_MOUSE_INPUT != 0 {
-            crate::console::pump::set_mouse_reporting(
-                requested & console::ENABLE_MOUSE_INPUT != 0,
-            );
+            crate::console::pump::set_mouse_reporting(requested & console::ENABLE_MOUSE_INPUT != 0);
         }
         return ret_bool_true(ctx.engine, "SetConsoleMode");
     }
@@ -260,7 +259,11 @@ fn write_le_i16(buf: &mut [u8; 24], offset: usize, value: i16) {
 /// Win64 ABI: `hConsoleOutput`, `lpBuffer`, `nNumberOfCharsToWrite`,
 /// `lpNumberOfCharsWritten`, `lpReserved` (stack).
 fn write_console(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiHandlerResult> {
-    let api = if wide { "WriteConsoleW" } else { "WriteConsoleA" };
+    let api = if wide {
+        "WriteConsoleW"
+    } else {
+        "WriteConsoleA"
+    };
     let handle = ctx.engine.read_rcx().context("WriteConsole RCX")?;
     let buffer_ptr = ctx.engine.read_rdx().context("WriteConsole RDX")?;
     let count = low_u32(
@@ -385,6 +388,13 @@ fn advance_tracked_cursor(state: &mut ConsoleState, buffer_handle: u64, units: &
 /// Fold decoded text into the grid, interpreting CSI cursor positioning
 /// and clear-screen escapes so programs using Ansi via WriteConsole
 /// (like the snake game's `\033[H\033[2JScore:...`) render correctly.
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation,
+    clippy::as_conversions,
+    clippy::explicit_iter_loop
+)]
 pub(crate) fn fold_text_into_grid(state: &mut ConsoleState, buffer_handle: u64, units: &[u16]) {
     let Some(buffer) = state.buffer_mut(buffer_handle) else {
         return;
@@ -400,10 +410,17 @@ pub(crate) fn fold_text_into_grid(state: &mut ConsoleState, buffer_handle: u64, 
         // ESC (0x1B) starts an escape sequence.
         if unit == 0x1B && i + 1 < units.len() && units[i + 1] == u16::from(b'[') {
             i += 2; // skip ESC + '['
-            if i < units.len() && units[i] == u16::from(b'2') && i + 1 < units.len() && units[i + 1] == u16::from(b'J') {
+            if i < units.len()
+                && units[i] == u16::from(b'2')
+                && i + 1 < units.len()
+                && units[i + 1] == u16::from(b'J')
+            {
                 // \033[2J — clear entire screen
                 for cell in buffer.cells.iter_mut() {
-                    *cell = console::CharInfo { unit: u16::from(b' '), attributes };
+                    *cell = console::CharInfo {
+                        unit: u16::from(b' '),
+                        attributes,
+                    };
                 }
                 i += 2;
                 continue;
@@ -412,17 +429,27 @@ pub(crate) fn fold_text_into_grid(state: &mut ConsoleState, buffer_handle: u64, 
                 // \033[J or \033[0J — clear from cursor to end
                 if let Some(start) = buffer.index_of(buffer.cursor.x, buffer.cursor.y) {
                     for cell in buffer.cells.get_mut(start..).unwrap_or(&mut []) {
-                        *cell = console::CharInfo { unit: u16::from(b' '), attributes };
+                        *cell = console::CharInfo {
+                            unit: u16::from(b' '),
+                            attributes,
+                        };
                     }
                 }
                 i += 1;
                 continue;
             }
-            if i < units.len() && units[i] == u16::from(b'1') && i + 1 < units.len() && units[i + 1] == u16::from(b'J') {
+            if i < units.len()
+                && units[i] == u16::from(b'1')
+                && i + 1 < units.len()
+                && units[i + 1] == u16::from(b'J')
+            {
                 // \033[1J — clear from start to cursor
                 if let Some(end) = buffer.index_of(buffer.cursor.x, buffer.cursor.y) {
                     for cell in buffer.cells.get_mut(..=end).unwrap_or(&mut []) {
-                        *cell = console::CharInfo { unit: u16::from(b' '), attributes };
+                        *cell = console::CharInfo {
+                            unit: u16::from(b' '),
+                            attributes,
+                        };
                     }
                 }
                 i += 2;
@@ -762,11 +789,7 @@ pub fn handle_get_largest_console_window_size(
         i16::try_from(rows).unwrap_or(i16::MAX),
     )
     .to_packed();
-    ret_u64(
-        ctx.engine,
-        u64::from(packed),
-        "GetLargestConsoleWindowSize",
-    )
+    ret_u64(ctx.engine, u64::from(packed), "GetLargestConsoleWindowSize")
 }
 
 /// `GetNumberOfConsoleMouseButtons`.

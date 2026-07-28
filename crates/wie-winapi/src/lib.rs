@@ -9,8 +9,8 @@ use std::sync::Arc;
 pub mod advapi32;
 pub mod bottle;
 pub mod comctl32;
-pub mod console;
 pub mod comdlg32;
+pub mod console;
 pub mod d3d9;
 pub mod dll_loader;
 pub mod dynamic_apis;
@@ -429,7 +429,9 @@ impl DllStateMap {
             .expect("DllId index out of range — did you forget to bump COUNT?");
         slot.get_or_insert_with(|| Box::new(T::default()));
         let boxed = slot.as_mut().expect("slot was just initialised");
-        boxed.as_mut().downcast_mut::<T>()
+        boxed
+            .as_mut()
+            .downcast_mut::<T>()
             .expect("DllId slot type mismatch")
     }
 
@@ -489,7 +491,8 @@ impl WinApiState {
 
     /// Mutable access — lazy-initialises on first call.
     pub fn console(&mut self) -> &mut console::ConsoleState {
-        self.dll_states.get_or_init::<console::ConsoleState>(DllId::Console)
+        self.dll_states
+            .get_or_init::<console::ConsoleState>(DllId::Console)
     }
     pub fn window_state(&mut self) -> &mut WindowState {
         self.dll_states.get_or_init::<WindowState>(DllId::Window)
@@ -498,7 +501,8 @@ impl WinApiState {
         self.dll_states.get_or_init::<D3D9State>(DllId::D3D9)
     }
     pub fn pthread(&mut self) -> &mut pthread::PthreadState {
-        self.dll_states.get_or_init::<pthread::PthreadState>(DllId::Pthread)
+        self.dll_states
+            .get_or_init::<pthread::PthreadState>(DllId::Pthread)
     }
 
     /// Read-only access — returns `None` if the state was never initialised.
@@ -1411,15 +1415,18 @@ mod tests {
             .mem_map(msg_va, 0x1000, wie_cpu::RwxPerms::ALL)
             .expect("map msg struct");
         // Push a WM_PAINT message for any window.
-        state.window_state().message_queue.push(QueuedWindowMessage {
-            window_handle: 0x100,
-            message: 15, // WM_PAINT
-            word_parameter: 0,
-            long_parameter: 0,
-            time: 1,
-            point_x: 0,
-            point_y: 0,
-        });
+        state
+            .window_state()
+            .message_queue
+            .push(QueuedWindowMessage {
+                window_handle: 0x100,
+                message: 15, // WM_PAINT
+                word_parameter: 0,
+                long_parameter: 0,
+                time: 1,
+                point_x: 0,
+                point_y: 0,
+            });
         // PeekMessageA(msg_ptr=msg_va, hwnd=0, min=0, max=0, wRemoveMsg=1)
         // wRemoveMsg is on the stack at RSP+0x28.
         write_regs(&mut engine, msg_va, 0, 0, 0, 0x3000);
@@ -1446,15 +1453,18 @@ mod tests {
         engine
             .mem_map(msg_va, 0x1000, wie_cpu::RwxPerms::ALL)
             .expect("map msg struct");
-        state.window_state().message_queue.push(QueuedWindowMessage {
-            window_handle: 0x100,
-            message: 15,
-            word_parameter: 0,
-            long_parameter: 0,
-            time: 1,
-            point_x: 0,
-            point_y: 0,
-        });
+        state
+            .window_state()
+            .message_queue
+            .push(QueuedWindowMessage {
+                window_handle: 0x100,
+                message: 15,
+                word_parameter: 0,
+                long_parameter: 0,
+                time: 1,
+                point_x: 0,
+                point_y: 0,
+            });
         write_regs(&mut engine, msg_va, 0, 0, 0, 0x3000);
         // wRemoveMsg=0 (PM_NOREMOVE) at RSP+0x28.
         engine.mem_write(0x3028, &0_u32.to_le_bytes()).ok();

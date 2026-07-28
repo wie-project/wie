@@ -9,9 +9,9 @@ use wie_cpu::CpuEngine;
 use super::objects::PtThread;
 use super::{
     BARRIER_SERIAL_THREAD, CANCEL_ASYNCHRONOUS, CANCEL_ENABLE, CANCELED, CREATE_DETACHED, EAGAIN,
-    EDEADLK, EINVAL, ENOTSUP, EPERM, ESRCH, INHERIT_SCHED, PtPending, SCOPE_SYSTEM,
-    call_guest, finish_guest_call, park_on, read_cstr, read_u32, read_u64, ret_int, ret_u64,
-    slice_until, trunc_i32, write_i32, write_u32, write_u64,
+    EDEADLK, EINVAL, ENOTSUP, EPERM, ESRCH, INHERIT_SCHED, PtPending, SCOPE_SYSTEM, call_guest,
+    finish_guest_call, park_on, read_cstr, read_u32, read_u64, ret_int, ret_u64, slice_until,
+    trunc_i32, write_i32, write_u32, write_u64,
 };
 use crate::{WinApiHandlerResult, WinApiState};
 
@@ -350,11 +350,7 @@ pub(super) fn dispatch(
             let out = engine.read_rdx()?;
             let pt = self_pt(engine, state);
             if let Some(t) = state.pthread().threads.get_mut(&pt) {
-                write_i32(
-                    engine,
-                    out,
-                    i32::from(t.cancel_async) * CANCEL_ASYNCHRONOUS,
-                );
+                write_i32(engine, out, i32::from(t.cancel_async) * CANCEL_ASYNCHRONOUS);
                 t.cancel_async = new & CANCEL_ASYNCHRONOUS != 0;
             }
             ret_int(engine, 0)?
@@ -678,7 +674,11 @@ fn begin_termination(
     let tid = state.kernel.threads.current_tid();
 
     // Collect the `pthread_cleanup_push` chain (LIFO — the head is newest).
-    let head_slot = state.pthread().threads.get(&pt).map_or(0, |t| t.clean_head_va);
+    let head_slot = state
+        .pthread()
+        .threads
+        .get(&pt)
+        .map_or(0, |t| t.clean_head_va);
     let mut remaining = Vec::new();
     let mut node = read_u64(engine, head_slot);
     let mut guard = 0_u32;
@@ -783,10 +783,7 @@ fn finish_thread(
     exit_value: u64,
 ) -> Result<WinApiHandlerResult> {
     let _ = engine;
-    let pt = state
-        .kernel
-        .threads
-        .current_tid();
+    let pt = state.kernel.threads.current_tid();
     let pt = state.pthread().by_tid.get(&pt).copied().unwrap_or(0);
     let mut detached = false;
     if let Some(t) = state.pthread().threads.get_mut(&pt) {
@@ -808,7 +805,9 @@ fn finish_thread(
 /// `RSP` up through the caller's live frame; carving a gap keeps every call at
 /// the same, private depth.
 fn call_frame(engine: &mut dyn CpuEngine) -> Result<u64> {
-    let rsp = engine.read_rsp().context("read RSP for pthread call frame")?;
+    let rsp = engine
+        .read_rsp()
+        .context("read RSP for pthread call frame")?;
     // 16-byte align, then bias by 8 so the callee sees the post-CALL alignment
     // the Win64 ABI guarantees.
     Ok(((rsp.saturating_sub(CALL_FRAME_GAP)) & !0xF_u64).wrapping_sub(8))
@@ -843,7 +842,8 @@ fn once(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<WinApiHan
     let tid = state.kernel.threads.current_tid();
 
     // Re-entry: the init routine just returned.
-    if let Some(PtPending::Once { once_va, return_va }) = state.pthread().pending.get(&tid).cloned() {
+    if let Some(PtPending::Once { once_va, return_va }) = state.pthread().pending.get(&tid).cloned()
+    {
         state.pthread().pending.remove(&tid);
         write_u32(engine, once_va, 1);
         if let Some(o) = state.pthread().onces.get_mut(&once_va) {
@@ -866,11 +866,7 @@ fn once(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<WinApiHan
     }
 
     let me = self_pt(engine, state);
-    let entry = state
-        .pthread()
-        .onces
-        .entry(once_va)
-        .or_default();
+    let entry = state.pthread().onces.entry(once_va).or_default();
     if entry.done {
         return ret_int(engine, 0);
     }
@@ -905,7 +901,11 @@ fn once(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<WinApiHan
 /// guest heap on first use.
 fn getclean(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<WinApiHandlerResult> {
     let pt = self_pt(engine, state);
-    let existing = state.pthread().threads.get(&pt).map_or(0, |t| t.clean_head_va);
+    let existing = state
+        .pthread()
+        .threads
+        .get(&pt)
+        .map_or(0, |t| t.clean_head_va);
     if existing != 0 {
         return ret_u64(engine, existing);
     }
@@ -965,7 +965,10 @@ fn getname(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<WinApi
         return ret_int(engine, EINVAL);
     };
     drop(engine.mem_write(buf, slice));
-    drop(engine.mem_write(buf.saturating_add(u64::try_from(copy).unwrap_or(0)), &[0_u8]));
+    drop(engine.mem_write(
+        buf.saturating_add(u64::try_from(copy).unwrap_or(0)),
+        &[0_u8],
+    ));
     ret_int(engine, 0)
 }
 

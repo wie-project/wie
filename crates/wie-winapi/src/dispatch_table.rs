@@ -1436,19 +1436,71 @@ static WINAPI_NAME_ROWS: &[(&str, &str, WinApiId)] = &[
     ),
     ("user32.dll", "getmenu", WinApiId::User32Getmenu),
     ("gdi32.dll", "getstockobject", WinApiId::Gdi32Getstockobject),
-    ("kernel32.dll", "writeconsolew", WinApiId::Kernel32Writeconsolew),
-    ("kernel32.dll", "writeconsolea", WinApiId::Kernel32Writeconsolea),
-    ("kernel32.dll", "readconsolew", WinApiId::Kernel32Readconsolew),
-    ("kernel32.dll", "readconsolea", WinApiId::Kernel32Readconsolea),
-    ("kernel32.dll", "getconsolemode", WinApiId::Kernel32Getconsolemode),
-    ("kernel32.dll", "setconsolemode", WinApiId::Kernel32Setconsolemode),
-    ("kernel32.dll", "writeconsoleoutputw", WinApiId::Kernel32Writeconsoleoutputw),
-    ("kernel32.dll", "fillconsoleoutputcharacterw", WinApiId::Kernel32Fillconsoleoutputcharacterw),
-    ("kernel32.dll", "setconsolecursorposition", WinApiId::Kernel32Setconsolecursorposition),
-    ("kernel32.dll", "setconsoletextattribute", WinApiId::Kernel32Setconsoletextattribute),
-    ("kernel32.dll", "gettickcount64", WinApiId::Kernel32Gettickcount64),
-    ("kernel32.dll", "getenvironmentvariablew", WinApiId::Kernel32Getenvironmentvariablew),
-    ("kernel32.dll", "setenvironmentvariablew", WinApiId::Kernel32Setenvironmentvariablew),
+    (
+        "kernel32.dll",
+        "writeconsolew",
+        WinApiId::Kernel32Writeconsolew,
+    ),
+    (
+        "kernel32.dll",
+        "writeconsolea",
+        WinApiId::Kernel32Writeconsolea,
+    ),
+    (
+        "kernel32.dll",
+        "readconsolew",
+        WinApiId::Kernel32Readconsolew,
+    ),
+    (
+        "kernel32.dll",
+        "readconsolea",
+        WinApiId::Kernel32Readconsolea,
+    ),
+    (
+        "kernel32.dll",
+        "getconsolemode",
+        WinApiId::Kernel32Getconsolemode,
+    ),
+    (
+        "kernel32.dll",
+        "setconsolemode",
+        WinApiId::Kernel32Setconsolemode,
+    ),
+    (
+        "kernel32.dll",
+        "writeconsoleoutputw",
+        WinApiId::Kernel32Writeconsoleoutputw,
+    ),
+    (
+        "kernel32.dll",
+        "fillconsoleoutputcharacterw",
+        WinApiId::Kernel32Fillconsoleoutputcharacterw,
+    ),
+    (
+        "kernel32.dll",
+        "setconsolecursorposition",
+        WinApiId::Kernel32Setconsolecursorposition,
+    ),
+    (
+        "kernel32.dll",
+        "setconsoletextattribute",
+        WinApiId::Kernel32Setconsoletextattribute,
+    ),
+    (
+        "kernel32.dll",
+        "gettickcount64",
+        WinApiId::Kernel32Gettickcount64,
+    ),
+    (
+        "kernel32.dll",
+        "getenvironmentvariablew",
+        WinApiId::Kernel32Getenvironmentvariablew,
+    ),
+    (
+        "kernel32.dll",
+        "setenvironmentvariablew",
+        WinApiId::Kernel32Setenvironmentvariablew,
+    ),
 ];
 
 /// Resolve library/export to id. Case-insensitive, allocation-free.
@@ -2027,13 +2079,25 @@ pub fn dispatch_winapi_id(
         WinApiId::Kernel32Readconsolea => kernel32::console::handle_read_console_a(ctx),
         WinApiId::Kernel32Getconsolemode => kernel32::console::handle_get_console_mode(ctx),
         WinApiId::Kernel32Setconsolemode => kernel32::console::handle_set_console_mode(ctx),
-        WinApiId::Kernel32Writeconsoleoutputw => kernel32::console_cells::handle_write_console_output_w(ctx),
-        WinApiId::Kernel32Fillconsoleoutputcharacterw => kernel32::console_cells::handle_fill_console_output_character_w(ctx),
-        WinApiId::Kernel32Setconsolecursorposition => kernel32::console_cells::handle_set_console_cursor_position(ctx),
-        WinApiId::Kernel32Setconsoletextattribute => kernel32::console_cells::handle_set_console_text_attribute(ctx),
+        WinApiId::Kernel32Writeconsoleoutputw => {
+            kernel32::console_cells::handle_write_console_output_w(ctx)
+        }
+        WinApiId::Kernel32Fillconsoleoutputcharacterw => {
+            kernel32::console_cells::handle_fill_console_output_character_w(ctx)
+        }
+        WinApiId::Kernel32Setconsolecursorposition => {
+            kernel32::console_cells::handle_set_console_cursor_position(ctx)
+        }
+        WinApiId::Kernel32Setconsoletextattribute => {
+            kernel32::console_cells::handle_set_console_text_attribute(ctx)
+        }
         WinApiId::Kernel32Gettickcount64 => kernel32::misc::handle_get_tick_count_64(ctx),
-        WinApiId::Kernel32Getenvironmentvariablew => kernel32::environment::handle_get_environment_variable_w(ctx),
-        WinApiId::Kernel32Setenvironmentvariablew => kernel32::environment::handle_set_environment_variable_w(ctx),
+        WinApiId::Kernel32Getenvironmentvariablew => {
+            kernel32::environment::handle_get_environment_variable_w(ctx)
+        }
+        WinApiId::Kernel32Setenvironmentvariablew => {
+            kernel32::environment::handle_set_environment_variable_w(ctx)
+        }
     }
 }
 

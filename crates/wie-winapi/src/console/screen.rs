@@ -25,7 +25,7 @@
     unreachable_pub,
     clippy::format_push_string,
     clippy::cast_possible_truncation,
-    clippy::arithmetic_side_effects,
+    clippy::arithmetic_side_effects
 )]
 
 use super::{CharInfo, ScreenBuffer, host_term};
@@ -97,9 +97,8 @@ pub fn sgr_for(previous: Option<u16>, current: u16) -> String {
 /// first draw, after a resize, or after the guest emitted its own escapes).
 /// Returns the bytes written, which the caller stores as the new `previous`.
 pub fn flush(buffer: &ScreenBuffer, previous: Option<&ScreenBuffer>) -> String {
-    let full_repaint = previous.is_none_or(|prior| {
-        prior.width != buffer.width || prior.height != buffer.height
-    });
+    let full_repaint =
+        previous.is_none_or(|prior| prior.width != buffer.width || prior.height != buffer.height);
 
     let mut out = String::new();
     let mut last_attributes: Option<u16> = None;
@@ -208,11 +207,7 @@ pub fn set_cursor_visible(visible: bool) {
     if !host_term::is_tty() {
         return;
     }
-    host_term::write_stdout(if visible {
-        b"\x1b[?25h"
-    } else {
-        b"\x1b[?25l"
-    });
+    host_term::write_stdout(if visible { b"\x1b[?25h" } else { b"\x1b[?25l" });
 }
 
 /// Move the terminal cursor directly, for Stream mode.
@@ -283,13 +278,19 @@ mod tests {
         assert_eq!(sgr, "", "default attributes should not emit SGR");
         // But a non-default attribute should still emit SGR.
         let bright = sgr_for(None, DEFAULT_ATTRIBUTES | 0x0008);
-        assert_eq!(bright, "\u{1b}[0;97;40m", "bright + default = bright white on black");
+        assert_eq!(
+            bright, "\u{1b}[0;97;40m",
+            "bright + default = bright white on black"
+        );
     }
 
     #[test]
     fn intensity_selects_the_bright_colour_range() {
         let bright = sgr_for(None, 0x0007 | FOREGROUND_INTENSITY);
-        assert!(bright.contains(";97"), "expected bright white, got {bright}");
+        assert!(
+            bright.contains(";97"),
+            "expected bright white, got {bright}"
+        );
     }
 
     #[test]
@@ -301,7 +302,10 @@ mod tests {
     fn first_flush_clears_and_repaints() {
         let buffer = grid(4, 2);
         let out = flush(&buffer, None);
-        assert!(out.contains("\u{1b}[H"), "expected cursor home on first paint");
+        assert!(
+            out.contains("\u{1b}[H"),
+            "expected cursor home on first paint"
+        );
         // A 4×2 grid of spaces: cursor home, row 0 (4 spaces), row 1 (4 spaces).
         assert!(!out.is_empty(), "expected repaint output");
     }

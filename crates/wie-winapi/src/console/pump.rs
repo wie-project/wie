@@ -53,14 +53,17 @@ pub fn pump(state: &mut WinApiState, timeout_ms: i32) -> usize {
 
     // SIGINT → Ctrl+C key event, delivered even when no bytes are pending.
     if host_term::drain_ctrlc() {
-        state.console().pending_input.push_back(InputRecord::Key(KeyEvent {
-            key_down: true,
-            repeat_count: 1,
-            virtual_key_code: 0x43, // 'C'
-            virtual_scan_code: 0,
-            unit: 3, // Ctrl+C
-            control_key_state: super::input::LEFT_CTRL_PRESSED,
-        }));
+        state
+            .console()
+            .pending_input
+            .push_back(InputRecord::Key(KeyEvent {
+                key_down: true,
+                repeat_count: 1,
+                virtual_key_code: 0x43, // 'C'
+                virtual_scan_code: 0,
+                unit: 3, // Ctrl+C
+                control_key_state: super::input::LEFT_CTRL_PRESSED,
+            }));
     }
 
     if host_term::is_tty() && host_term::poll_stdin_ready(timeout_ms) {
@@ -173,9 +176,11 @@ fn put_u32(buffer: &mut [u8; INPUT_RECORD_SIZE], offset: usize, value: u32) {
 pub fn peek_key_press(state: &mut WinApiState) -> bool {
     // Pump the terminal first so keys that arrived between frames are seen.
     pump(state, 0);
-    state.console().pending_input.iter().any(|record| {
-        matches!(record, InputRecord::Key(event) if event.key_down)
-    })
+    state
+        .console()
+        .pending_input
+        .iter()
+        .any(|record| matches!(record, InputRecord::Key(event) if event.key_down))
 }
 
 /// Take the next queued key press, pumping the terminal if the queue is empty.

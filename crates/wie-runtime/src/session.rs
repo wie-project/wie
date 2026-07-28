@@ -2085,13 +2085,12 @@ impl RuntimeSession {
     #[must_use]
     pub fn first_guest_window_handle(&self) -> Option<u64> {
         self.process.with_winapi_ref(|st| {
-            st.try_window_state()
-                .and_then(|ws| {
-                    ws.windows
-                        .iter()
-                        .find(|window| window.window_proc != 0)
-                        .map(|window| window.handle)
-                })
+            st.try_window_state().and_then(|ws| {
+                ws.windows
+                    .iter()
+                    .find(|window| window.window_proc != 0)
+                    .map(|window| window.handle)
+            })
         })
     }
 
@@ -2132,8 +2131,10 @@ impl RuntimeSession {
     /// Returns the last path accepted by a simulated file dialog.
     #[must_use]
     pub fn last_file_dialog_path(&self) -> Option<String> {
-        self.process
-            .with_winapi_ref(|st| st.try_window_state().and_then(|ws| ws.last_file_dialog_path.clone()))
+        self.process.with_winapi_ref(|st| {
+            st.try_window_state()
+                .and_then(|ws| ws.last_file_dialog_path.clone())
+        })
     }
 
     /// Mounts a host file so the guest can open it via `CreateFile*` under `guest_path`.

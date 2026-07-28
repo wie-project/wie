@@ -68,8 +68,14 @@ fn get_environment_variable(
     } else {
         "GetEnvironmentVariableA"
     };
-    let name_ptr = ctx.engine.read_rcx().context("GetEnvironmentVariable RCX")?;
-    let buffer_ptr = ctx.engine.read_rdx().context("GetEnvironmentVariable RDX")?;
+    let name_ptr = ctx
+        .engine
+        .read_rcx()
+        .context("GetEnvironmentVariable RCX")?;
+    let buffer_ptr = ctx
+        .engine
+        .read_rdx()
+        .context("GetEnvironmentVariable RDX")?;
     let capacity = low_u32(
         ctx.engine.read_r8().context("GetEnvironmentVariable R8")?,
         "GetEnvironmentVariable size",
@@ -136,8 +142,14 @@ fn set_environment_variable(
     } else {
         "SetEnvironmentVariableA"
     };
-    let name_ptr = ctx.engine.read_rcx().context("SetEnvironmentVariable RCX")?;
-    let value_ptr = ctx.engine.read_rdx().context("SetEnvironmentVariable RDX")?;
+    let name_ptr = ctx
+        .engine
+        .read_rcx()
+        .context("SetEnvironmentVariable RCX")?;
+    let value_ptr = ctx
+        .engine
+        .read_rdx()
+        .context("SetEnvironmentVariable RDX")?;
 
     if name_ptr == 0 {
         ctx.state.process.last_error = super::ERROR_INVALID_PARAMETER;
@@ -158,7 +170,11 @@ fn set_environment_variable(
     let value = if value_ptr == 0 {
         None
     } else if wide {
-        Some(read_guest_utf16_lossy(ctx.engine, value_ptr, MAX_ENV_CHARS)?)
+        Some(read_guest_utf16_lossy(
+            ctx.engine,
+            value_ptr,
+            MAX_ENV_CHARS,
+        )?)
     } else {
         Some(read_guest_ansi_lossy(ctx.engine, value_ptr, MAX_ENV_CHARS)?)
     };
@@ -236,7 +252,9 @@ fn expand_environment_strings(
         .read_rdx()
         .context("ExpandEnvironmentStrings RDX")?;
     let capacity = low_u32(
-        ctx.engine.read_r8().context("ExpandEnvironmentStrings R8")?,
+        ctx.engine
+            .read_r8()
+            .context("ExpandEnvironmentStrings R8")?,
         "ExpandEnvironmentStrings size",
     )?;
 
