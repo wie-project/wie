@@ -285,7 +285,9 @@ fn write_console(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiHandl
         read_guest_bytes(ctx.engine, buffer_ptr, &mut bytes)
             .context("WriteConsoleW guest buffer")?;
         bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 u16::from_le_bytes([
                     pair.first().copied().unwrap_or(0),

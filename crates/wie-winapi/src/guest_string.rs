@@ -116,7 +116,8 @@ pub(crate) fn read_utf16_lossy(
         for chunk in slice
             .get(..got_pairs)
             .context("UTF-16 got_pairs bounds")?
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
         {
             let lo = *chunk.first().unwrap_or(&0);
             let hi = *chunk.get(1).unwrap_or(&0);

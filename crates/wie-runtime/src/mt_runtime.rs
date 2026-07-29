@@ -107,7 +107,7 @@ impl ProcessResources {
     /// Spawn a host thread for each pending `CreateThread` spawn.
     pub(crate) fn drain_spawns(&mut self) -> Result<()> {
         let spawns: Vec<PendingSpawn> =
-            self.with_mut(|_, st| st.kernel.sync.pending_spawns.drain(..).collect());
+            self.with_mut(|_, st| std::mem::take(&mut st.kernel.sync.pending_spawns));
         if spawns.is_empty() {
             return Ok(());
         }

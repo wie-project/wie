@@ -496,7 +496,9 @@ fn write_console_output_run(
                 read_guest_bytes(ctx.engine, source_ptr, &mut bytes)
                     .context("WriteConsoleOutputRun source")?;
                 bytes
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|pair| {
                         u16::from_le_bytes([
                             pair.first().copied().unwrap_or(0),

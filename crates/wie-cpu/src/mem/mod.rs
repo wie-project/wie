@@ -168,7 +168,7 @@ impl GuestMemory {
         // Saturating add without wrapping forever in pathological cases.
         let _ = self
             .generation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |g| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |g| {
                 Some(g.saturating_add(1))
             });
     }
