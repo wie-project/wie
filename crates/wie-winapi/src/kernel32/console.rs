@@ -832,3 +832,181 @@ pub fn dispatch_console_extra(
     };
     Ok(Some(result))
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+    use crate::console::{
+        CharInfo, ConsoleState, DEFAULT_OUTPUT_MODE, PRIMARY_BUFFER_HANDLE, ScreenBuffer,
+    };
+
+    fn test_state() -> ConsoleState {
+        let mut state = ConsoleState {
+            buffers: vec![(PRIMARY_BUFFER_HANDLE, ScreenBuffer::new(10, 5))],
+            output_modes: vec![(PRIMARY_BUFFER_HANDLE, DEFAULT_OUTPUT_MODE)],
+            ..ConsoleState::default()
+        };
+        // Set a known attribute so we can verify it propagates.
+        state.buffer_mut(PRIMARY_BUFFER_HANDLE).unwrap().attributes = 0x1F; // white on blue
+        state
+    }
+
+    fn cell(state: &ConsoleState, x: i16, y: i16) -> CharInfo {
+        state
+            .buffer(PRIMARY_BUFFER_HANDLE)
+            .and_then(|b| b.index_of(x, y).and_then(|i| b.cells.get(i)))
+            .copied()
+            .unwrap_or(CharInfo {
+                unit: 0,
+                attributes: 0,
+            })
+    }
+
+    #[test]
+    fn plain_text_writes_at_cursor() {
+        let mut state = test_state();
+        fold_text_into_grid(
+            &mut state,
+            PRIMARY_BUFFER_HANDLE,
+            &[u16::from(b'A'), u16::from(b'B'), u16::from(b'C')],
+        );
+        assert_eq!(cell(&state, 0, 0).unit, u16::from(b'A'));
+        assert_eq!(cell(&state, 1, 0).unit, u16::from(b'B'));
+        assert_eq!(cell(&state, 2, 0).unit, u16::from(b'C'));
+        // Cursor advanced
+        assert_eq!(state.buffer(PRIMARY_BUFFER_HANDLE).unwrap().cursor.x, 3);
+    }
+
+    #[test]
+    fn newline_moves_cursor_to_next_row() {
+        let mut state = test_state();
+        fold_text_into_grid(&mut state, PRIMARY_BUFFER_HANDLE, &[0x0A]);
+        let cursor = state.buffer(PRIMARY_BUFFER_HANDLE).unwrap().cursor;
+        assert_eq!(cursor.x, 0);
+        assert_eq!(cursor.y, 1);
+    }
+
+    #[test]
+    fn carriage_return_moves_to_column_zero() {
+        let mut state = test_state();
+        // Move cursor right first, then CR
+        fold_text_into_grid(&mut state, PRIMARY_BUFFER_HANDLE, &[u16::from(b'X')]);
+        fold_text_into_grid(&mut state, PRIMARY_BUFFER_HANDLE, &[0x0D]);
+        let cursor = state.buffer(PRIMARY_BUFFER_HANDLE).unwrap().cursor;
+        assert_eq!(cursor.x, 0);
+        assert_eq!(cursor.y, 0);
+    }
+
+    #[test]
+    fn backspace_moves_cursor_left() {
+        let mut state = test_state();
+        fold_text_into_grid(&mut state, PRIMARY_BUFFER_HANDLE, &[u16::from(b'A'), 0x08]);
+        let cursor = state.buffer(PRIMARY_BUFFER_HANDLE).unwrap().cursor;
+        // After writing A at (0,0), cursor is at 1. After BS, at 0.
+        assert_eq!(cursor.x, 0);
+    }
+
+    #[test]
+    fn tab_advances_to_next_stop() {
+        let mut state = test_state();
+        fold_text_into_grid(&mut state, PRIMARY_BUFFER_HANDLE, &[0x09]);
+        let cursor = state.buffer(PRIMARY_BUFFER_HANDLE).unwrap().cursor;
+        // Next tab stop is column 8
+        assert_eq!(cursor.x, 8);
+    }
+
+    #[test]
+    fn escape_2j_clears_entire_screen() {
+        let mut state = test_state();
+        // Write some content first.
+        for i in 0..10_usize {
+            if let Some(cell) = state
+                .buffer_mut(PRIMARY_BUFFER_HANDLE)
+                .unwrap()
+                .cells
+                .get_mut(i)
+            {
+                cell.unit = u16::from(b'X');
+            }
+        }
+        fold_text_into_grid(
+            &mut state,
+            PRIMARY_BUFFER_HANDLE,
+            &[0x1B, u16::from(b'['), u16::from(b'2'), u16::from(b'J')],
+        );
+        // All cells should be spaces now.
+        let buf = state.buffer(PRIMARY_BUFFER_HANDLE).unwrap();
+        assert!(buf.cells.iter().all(|c| c.unit == u16::from(b' ')));
+        // The buffer's attribute should be used for the cleared cells.
+        assert!(buf.cells.iter().all(|c| c.attributes == 0x1F));
+    }
+
+    #[test]
+    fn escape_h_moves_cursor_home() {
+        let mut state = test_state();
+        // Move cursor to (5, 3)
+        state.buffer_mut(PRIMARY_BUFFER_HANDLE).unwrap().cursor.x = 5;
+        state.buffer_mut(PRIMARY_BUFFER_HANDLE).unwrap().cursor.y = 3;
+        fold_text_into_grid(
+            &mut state,
+            PRIMARY_BUFFER_HANDLE,
+            &[0x1B, u16::from(b'['), u16::from(b'H')],
+        );
+        let cursor = state.buffer(PRIMARY_BUFFER_HANDLE).unwrap().cursor;
+        assert_eq!(cursor.x, 0);
+        assert_eq!(cursor.y, 0);
+    }
+
+    #[test]
+    fn escape_single_digit_row_h_moves_cursor_to_row() {
+        let mut state = test_state();
+        // \033[2H — row 2 (1-based -> y=1), column stays at 0
+        fold_text_into_grid(
+            &mut state,
+            PRIMARY_BUFFER_HANDLE,
+            &[0x1B, u16::from(b'['), u16::from(b'2'), u16::from(b'H')],
+        );
+        let cursor = state.buffer(PRIMARY_BUFFER_HANDLE).unwrap().cursor;
+        assert_eq!(cursor.y, 1); // row 2 (1-based) = y=1
+        assert_eq!(cursor.x, 0);
+    }
+
+    #[test]
+    fn text_wrapping_at_eol_moves_to_next_row() {
+        let mut state = test_state();
+        // Buffer is 10 wide. Write 10 chars to fill row 0.
+        let mut input = Vec::new();
+        for i in 0..10_u16 {
+            input.push(u16::from(b'A') + i);
+        }
+        fold_text_into_grid(&mut state, PRIMARY_BUFFER_HANDLE, &input);
+        // After writing char at column 9, cursor.x is 10, which triggers wrap
+        let cursor = state.buffer(PRIMARY_BUFFER_HANDLE).unwrap().cursor;
+        assert_eq!(cursor.x, 0);
+        assert_eq!(cursor.y, 1);
+    }
+
+    #[test]
+    fn unknown_escape_sequence_is_skipped() {
+        let mut state = test_state();
+        // Some made-up escape that we don't parse.
+        fold_text_into_grid(
+            &mut state,
+            PRIMARY_BUFFER_HANDLE,
+            &[0x1B, u16::from(b'['), u16::from(b'z')],
+        );
+        // Nothing written to grid; cursor unchanged.
+        let cursor = state.buffer(PRIMARY_BUFFER_HANDLE).unwrap().cursor;
+        assert_eq!(cursor.x, 0);
+        assert_eq!(cursor.y, 0);
+    }
+
+    #[test]
+    fn regular_characters_use_the_buffer_attribute() {
+        let mut state = test_state();
+        fold_text_into_grid(&mut state, PRIMARY_BUFFER_HANDLE, &[u16::from(b'Z')]);
+        let c = cell(&state, 0, 0);
+        assert_eq!(c.attributes, 0x1F);
+    }
+}

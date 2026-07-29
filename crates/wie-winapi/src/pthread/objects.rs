@@ -471,6 +471,310 @@ pub struct PtThread {
     pub queue: Arc<WakeQueue>,
 }
 
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::{
+        CondWaiter, MUTEX_ERRORCHECK, MUTEX_NORMAL, MUTEX_RECURSIVE, PtCond, PtMutex, PtOnce,
+        PtRwLock, PtSem, PtSpin, PtThread, WakeQueue,
+    };
+    use crate::pthread::{EDEADLK, EPERM, is_pt_id};
+    use std::time::Duration;
+
+    // ── WakeQueue ───────────────────────────────────────────────────────
+
+    #[test]
+    fn wake_queue_observe_returns_current_seq() {
+        let q = WakeQueue::new();
+        let s = q.observe();
+        q.wake();
+        assert_eq!(q.observe(), s.wrapping_add(1));
+    }
+
+    #[test]
+    fn wake_queue_park_returns_immediately_when_seq_changed() {
+        let q = WakeQueue::new();
+        let s = q.observe();
+        q.wake(); // seq advances before park
+        // park(observed = s) should see seq != observed and return
+        q.park(s, Duration::from_secs(10));
+        // If we got here without blocking for 10s, the no-wait worked.
+    }
+
+    #[test]
+    fn wake_queue_multiple_wakes_increment_seq() {
+        let q = WakeQueue::new();
+        let s = q.observe();
+        for _ in 0..5 {
+            q.wake();
+        }
+        assert_eq!(q.observe(), s.wrapping_add(5));
+    }
+
+    // ── PtMutex ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn mutex_new_is_unlocked() {
+        let m = PtMutex::new(MUTEX_NORMAL);
+        assert!(!m.is_held());
+        assert_eq!(m.depth, 0);
+    }
+
+    #[test]
+    fn mutex_try_acquire_succeeds_on_free() {
+        let mut m = PtMutex::new(MUTEX_NORMAL);
+        assert_eq!(m.try_acquire(42), Ok(true));
+        assert!(m.is_held());
+        assert_eq!(m.depth, 1);
+    }
+
+    #[test]
+    fn mutex_release_frees_the_mutex() {
+        let mut m = PtMutex::new(MUTEX_NORMAL);
+        m.try_acquire(42).unwrap();
+        assert_eq!(m.release(42), Ok(true));
+        assert!(!m.is_held());
+    }
+
+    #[test]
+    fn mutex_release_by_non_owner_returns_eperm() {
+        let mut m = PtMutex::new(MUTEX_NORMAL);
+        m.try_acquire(42).unwrap();
+        assert_eq!(m.release(99), Err(EPERM));
+    }
+
+    #[test]
+    fn mutex_try_acquire_busy_returns_false() {
+        let mut m = PtMutex::new(MUTEX_NORMAL);
+        m.try_acquire(42).unwrap();
+        assert_eq!(m.try_acquire(99), Ok(false));
+    }
+
+    #[test]
+    fn mutex_normal_self_lock_returns_false() {
+        let mut m = PtMutex::new(MUTEX_NORMAL);
+        m.try_acquire(42).unwrap();
+        assert_eq!(m.try_acquire(42), Ok(false));
+    }
+
+    #[test]
+    fn mutex_errorcheck_self_lock_returns_edeadlk() {
+        let mut m = PtMutex::new(MUTEX_ERRORCHECK);
+        m.try_acquire(42).unwrap();
+        assert_eq!(m.try_acquire(42), Err(EDEADLK));
+    }
+
+    #[test]
+    fn mutex_recursive_allows_reentry() {
+        let mut m = PtMutex::new(MUTEX_RECURSIVE);
+        m.try_acquire(42).unwrap();
+        assert_eq!(m.try_acquire(42), Ok(true));
+        assert_eq!(m.depth, 2);
+        // One release drops depth to 1
+        m.release(42).unwrap();
+        assert!(m.is_held());
+        // Final release frees
+        m.release(42).unwrap();
+        assert!(!m.is_held());
+    }
+
+    #[test]
+    fn mutex_release_all_returns_depth() {
+        let mut m = PtMutex::new(MUTEX_RECURSIVE);
+        m.try_acquire(42).unwrap(); // depth = 1
+        m.try_acquire(42).unwrap(); // depth = 2
+        assert_eq!(m.release_all(42), Ok(2));
+        assert!(!m.is_held());
+    }
+
+    #[test]
+    fn mutex_release_all_by_non_owner_returns_eperm() {
+        let mut m = PtMutex::new(MUTEX_NORMAL);
+        m.try_acquire(42).unwrap();
+        assert_eq!(m.release_all(99), Err(EPERM));
+    }
+
+    #[test]
+    fn mutex_static_initializers_are_not_tagged_ids() {
+        // winpthreads uses -1, -2, -3 as static initializers
+        assert!(!is_pt_id(u64::from(u32::MAX))); // PTHREAD_MUTEX_INITIALIZER
+    }
+
+    // ── PtCond ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn cond_new_has_no_waiters() {
+        let c = PtCond::new();
+        assert!(c.waiters.is_empty());
+    }
+
+    #[test]
+    fn cond_signal_one_wakes_oldest_waiter() {
+        let mut c = PtCond::new();
+        c.waiters.push(CondWaiter {
+            pt: 1,
+            signaled: false,
+        });
+        c.waiters.push(CondWaiter {
+            pt: 2,
+            signaled: false,
+        });
+        assert!(c.signal_one());
+        assert!(c.is_signaled(1));
+        // second still not signaled
+        assert!(!c.is_signaled(2));
+    }
+
+    #[test]
+    fn cond_signal_all_wakes_everyone() {
+        let mut c = PtCond::new();
+        c.waiters.push(CondWaiter {
+            pt: 10,
+            signaled: false,
+        });
+        c.waiters.push(CondWaiter {
+            pt: 20,
+            signaled: false,
+        });
+        c.signal_all();
+        assert!(c.is_signaled(10));
+        assert!(c.is_signaled(20));
+    }
+
+    #[test]
+    fn cond_remove_cleans_up_a_waiter() {
+        let mut c = PtCond::new();
+        c.waiters.push(CondWaiter {
+            pt: 7,
+            signaled: false,
+        });
+        c.remove(7);
+        assert!(c.waiters.is_empty());
+    }
+
+    // ── PtRwLock ────────────────────────────────────────────────────────
+
+    #[test]
+    fn rwlock_new_is_free() {
+        let l = PtRwLock::new();
+        assert!(!l.is_held());
+        assert_eq!(l.readers, 0);
+        assert!(l.writer.is_none());
+    }
+
+    #[test]
+    fn rwlock_read_lock_succeeds_when_free() {
+        let mut l = PtRwLock::new();
+        assert!(l.try_read());
+        assert_eq!(l.readers, 1);
+    }
+
+    #[test]
+    fn rwlock_multiple_readers_succeed() {
+        let mut l = PtRwLock::new();
+        l.try_read();
+        assert!(l.try_read());
+        assert_eq!(l.readers, 2);
+    }
+
+    #[test]
+    fn rwlock_write_lock_succeeds_when_free() {
+        let mut l = PtRwLock::new();
+        assert!(l.try_write(1));
+        assert_eq!(l.writer, Some(1));
+    }
+
+    #[test]
+    fn rwlock_write_lock_fails_with_active_reader() {
+        let mut l = PtRwLock::new();
+        l.try_read();
+        assert!(!l.try_write(2));
+    }
+
+    #[test]
+    fn rwlock_write_lock_fails_with_active_writer() {
+        let mut l = PtRwLock::new();
+        l.try_write(1);
+        assert!(!l.try_write(2));
+    }
+
+    #[test]
+    fn rwlock_unlock_reader_releases_one_read() {
+        let mut l = PtRwLock::new();
+        l.try_read();
+        l.try_read();
+        assert!(l.unlock(1).is_ok());
+        assert_eq!(l.readers, 1);
+        assert!(l.unlock(1).is_ok());
+        assert_eq!(l.readers, 0);
+    }
+
+    #[test]
+    fn rwlock_unlock_writer_releases() {
+        let mut l = PtRwLock::new();
+        l.try_write(1);
+        assert!(l.unlock(1).is_ok());
+        assert_eq!(l.writer, None);
+    }
+
+    #[test]
+    fn rwlock_unlock_unowned_returns_eperm() {
+        let mut l = PtRwLock::new();
+        assert_eq!(l.unlock(1), Err(EPERM));
+    }
+
+    // ── PtSpin ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn spin_new_is_unlocked() {
+        let s = PtSpin::new();
+        assert!(s.owner.is_none());
+    }
+
+    // ── PtOnce ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn once_new_is_not_done() {
+        let o = PtOnce::new();
+        assert!(!o.done);
+        assert!(o.running.is_none());
+    }
+
+    // ── PtSem ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn sem_new_has_specified_count() {
+        let s = PtSem::new(3, None);
+        assert_eq!(s.count, 3);
+        assert!(s.name.is_none());
+    }
+
+    #[test]
+    fn sem_new_with_name_is_unnlinked() {
+        let s = PtSem::new(0, Some("test".into()));
+        assert_eq!(s.name.as_deref(), Some("test"));
+        assert!(!s.unlinked);
+    }
+
+    // ── PtThread ────────────────────────────────────────────────────────
+
+    #[test]
+    fn thread_new_is_not_finished() {
+        let t = PtThread::new(0x5054_0000_0000_0001, 100, 0x6000_0001, 0x1400_1000, false);
+        assert!(!t.finished);
+        assert!(!t.detached);
+        assert!(t.cancel_enabled);
+        assert_eq!(t.tid, 100);
+    }
+
+    #[test]
+    fn thread_detached_flag_is_stored() {
+        let t = PtThread::new(0x5054_0000_0000_0002, 101, 0x6000_0001, 0x1400_1000, true);
+        assert!(t.detached);
+    }
+}
+
 impl PtThread {
     /// New joinable, cancellable thread record.
     #[must_use]

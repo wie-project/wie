@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run micro-EXE test gates by category. Exit non-zero on first failure.
 # Usage: ./run-micro-suite.sh [category]
-#   category: all (default), cpp_exes, seh_exes, dll_tests
+#   category: all (default), cpp_exes, seh_exes, dll_tests, console_tests, pthread_tests
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -54,6 +54,26 @@ if [[ "$CATEGORY" == "all" ]]; then
   for exe in "$OUT"/dll_*.exe; do
     [ -f "$exe" ] && run_one "$exe"
   done
+
+  # Console output tests (non-interactive: no stdin needed)
+  run_one "$OUT/console_cells.exe"
+
+  # CRT convergence gate (srand/rand constants, UCRT coverage)
+  run_one "$OUT/rand_test.exe"
+  run_one "$OUT/ucrt_coverage.exe"
+
+  # Pthread tests via libwinpthread-1.dll
+  run_one "$OUT/pt_basic.exe"
+  run_one "$OUT/pt_cond.exe"
+fi
+
+if [[ "$CATEGORY" == "console_tests" ]]; then
+  run_one "$OUT/console_cells.exe"
+fi
+
+if [[ "$CATEGORY" == "pthread_tests" ]]; then
+  run_one "$OUT/pt_basic.exe"
+  run_one "$OUT/pt_cond.exe"
 fi
 
 if [[ "$CATEGORY" == "cpp_exes" ]]; then

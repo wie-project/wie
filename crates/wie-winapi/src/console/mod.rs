@@ -531,3 +531,164 @@ impl ConsoleState {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+    use crate::console::{DEFAULT_OUTPUT_MODE, ScreenBuffer};
+
+    fn default_state() -> ConsoleState {
+        // host_term::window_size is overridden by env in CI.
+        // Construct one with a known fixed size.
+        ConsoleState {
+            buffers: vec![(PRIMARY_BUFFER_HANDLE, ScreenBuffer::new(80, 25))],
+            output_modes: vec![(PRIMARY_BUFFER_HANDLE, DEFAULT_OUTPUT_MODE)],
+            ..ConsoleState::default()
+        }
+    }
+
+    // --- ScreenBuffer ---
+
+    #[test]
+    fn screen_buffer_new_has_correct_dimensions() {
+        let buf = ScreenBuffer::new(30, 20);
+        assert_eq!(buf.width, 30);
+        assert_eq!(buf.height, 20);
+        assert_eq!(buf.cells.len(), 600);
+        assert!(buf.cells.iter().all(|c| c.unit == u16::from(b' ')));
+    }
+
+    #[test]
+    fn index_of_out_of_bounds_returns_none() {
+        let buf = ScreenBuffer::new(10, 5);
+        assert!(buf.index_of(-1, 0).is_none());
+        assert!(buf.index_of(0, -1).is_none());
+        assert!(buf.index_of(10, 0).is_none());
+        assert!(buf.index_of(0, 5).is_none());
+    }
+
+    #[test]
+    fn index_of_returns_linear_offset() {
+        let buf = ScreenBuffer::new(10, 5);
+        // row 1 col 5 -> index 15
+        assert_eq!(buf.index_of(5, 1), Some(15));
+        assert_eq!(buf.index_of(0, 0), Some(0));
+        assert_eq!(buf.index_of(9, 4), Some(49));
+    }
+
+    #[test]
+    fn resize_preserves_top_left_content() {
+        let mut buf = ScreenBuffer::new(10, 5);
+        if let Some(cell) = buf.cells.get_mut(0) {
+            cell.unit = u16::from(b'X');
+        }
+        if let Some(cell) = buf.cells.get_mut(14) {
+            // Row 1, col 4 — survives the overlap (min 5 cols, min 3 rows)
+            cell.unit = u16::from(b'Y');
+        }
+        buf.resize(5, 3);
+        assert_eq!(buf.width, 5);
+        assert_eq!(buf.height, 3);
+        assert_eq!(buf.cells.len(), 15);
+        // Top-left overlap preserved
+        assert_eq!(buf.cells[0].unit, u16::from(b'X'));
+        let index = buf.index_of(4, 1).unwrap();
+        assert_eq!(buf.cells[index].unit, u16::from(b'Y'));
+        // Cells outside the overlap are blanked
+        let outside = buf.index_of(4, 2).unwrap();
+        assert_eq!(buf.cells[outside].unit, u16::from(b' '));
+    }
+
+    #[test]
+    fn scroll_up_moves_content_and_blanks_bottom() {
+        let mut buf = ScreenBuffer::new(4, 3);
+        // Write a pattern
+        buf.cells[0].unit = u16::from(b'A');
+        buf.cells[4].unit = u16::from(b'B');
+        buf.cells[8].unit = u16::from(b'C');
+        buf.scroll_up();
+        // Row 0 now holds what was row 1
+        assert_eq!(buf.cells[0].unit, u16::from(b'B'));
+        // Row 1 now holds what was row 2
+        assert_eq!(buf.cells[4].unit, u16::from(b'C'));
+        // Row 2 is blanked
+        assert!(buf.cells[8..12].iter().all(|c| c.unit == u16::from(b' ')));
+    }
+
+    // --- ConsoleState ---
+
+    #[test]
+    fn buffer_resolves_primary_and_alt_handles() {
+        let state = default_state();
+        assert!(state.buffer(PRIMARY_BUFFER_HANDLE).is_some());
+        // Non-existent handle
+        assert!(state.buffer(0xDEAD).is_none());
+    }
+
+    #[test]
+    fn create_buffer_allocates_and_switches_to_cells_mode() {
+        let mut state = default_state();
+        assert_eq!(state.render_mode, RenderMode::Stream);
+        let handle = state.create_buffer();
+        assert!(state.buffer(handle).is_some());
+        assert_eq!(state.render_mode, RenderMode::Cells);
+    }
+
+    #[test]
+    fn output_mode_defaults_and_can_be_set() {
+        let mut state = default_state();
+        assert_eq!(
+            state.output_mode(PRIMARY_BUFFER_HANDLE),
+            DEFAULT_OUTPUT_MODE
+        );
+        // Non-existent handle gets the default
+        assert_eq!(state.output_mode(0xDEAD), DEFAULT_OUTPUT_MODE);
+
+        state.set_output_mode(PRIMARY_BUFFER_HANDLE, 0xABCD);
+        assert_eq!(state.output_mode(PRIMARY_BUFFER_HANDLE), 0xABCD);
+    }
+
+    #[test]
+    fn set_output_mode_adds_entry_for_unknown_handle() {
+        let mut state = default_state();
+        state.set_output_mode(0x9999, 0x1234);
+        assert_eq!(state.output_mode(0x9999), 0x1234);
+    }
+
+    #[test]
+    fn note_stream_escape_repaints_only_in_cells_mode() {
+        let mut state = default_state();
+        state.render_mode = RenderMode::Stream;
+        state.rendered = Some(ScreenBuffer::new(1, 1));
+        state.note_stream_escape();
+        // Stream mode: no effect
+        assert!(state.rendered.is_some());
+
+        state.render_mode = RenderMode::Cells;
+        state.note_stream_escape();
+        assert!(state.rendered.is_none());
+        assert!(state.repaint_forced);
+    }
+
+    // --- Coord ---
+
+    #[test]
+    fn coord_round_trips_through_packed_form() {
+        for (x, y) in &[(0, 0), (10, 20), (-1, -1), (i16::MAX, i16::MIN)] {
+            let c = Coord::new(*x, *y);
+            assert_eq!(Coord::from_packed(u64::from(c.to_packed())), c);
+        }
+    }
+
+    // --- SmallRect ---
+
+    #[test]
+    fn small_rect_default_is_all_zeros() {
+        let r = SmallRect::default();
+        assert_eq!(r.left, 0);
+        assert_eq!(r.top, 0);
+        assert_eq!(r.right, 0);
+        assert_eq!(r.bottom, 0);
+    }
+}
