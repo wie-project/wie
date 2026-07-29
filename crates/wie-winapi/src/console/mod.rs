@@ -400,40 +400,16 @@ impl ConsoleState {
         }
         self.needs_flush = false;
 
-        // Fold any buffered CRT output into the grid first.
+        // Write buffered output directly to the terminal so that ANSI
+        // escape codes (colours, cursor movement) pass through intact.
         if !self.stream_buf.is_empty() {
             let raw = std::mem::take(&mut self.stream_buf);
-            if let Some(handle) = self.buffer_handle_for(PRIMARY_BUFFER_HANDLE) {
-                let units: Vec<u16> = raw.iter().map(|&b| u16::from(b)).collect();
-                crate::kernel32::console::fold_text_into_grid(self, handle, &units);
-            }
-        }
-
-        // Reconstruct the full grid as text and write it at the terminal's
-        // home position. No trailing newline on the last row so the cursor
-        // never advances past the bottom of the frame.
-        if let Some(buffer) = self.buffer(PRIMARY_BUFFER_HANDLE) {
-            let stride = usize::from(buffer.width);
-            let rows = usize::from(buffer.height);
-            let mut raw = Vec::with_capacity(stride * rows + rows + 6);
-            raw.extend_from_slice(b"\x1b[H");
-            for row in 0..rows {
-                let base = row * stride;
-                for col in 0..stride {
-                    if let Some(cell) = buffer.cells.get(base + col) {
-                        raw.push(crate::console::screen::char_of(*cell) as u8);
-                    }
-                }
-                if row < rows.saturating_sub(1) {
-                    raw.push(b'\n');
-                }
-            }
             host_term::write_stdout(&raw);
-            self.rendered = Some(buffer.clone());
         }
     }
 
     /// Helper: get a handle to the primary screen buffer.
+    #[expect(dead_code)]
     fn buffer_handle_for(&self, handle: u64) -> Option<u64> {
         let stdout = 0x0000_0000_6000_0002; // FAKE_STDOUT_HANDLE
         if handle == stdout || handle == 0x0000_0000_6000_0003 {
