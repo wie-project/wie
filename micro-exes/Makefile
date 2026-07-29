@@ -12,9 +12,9 @@ LDFLAGS  := -nostdlib -Wl,--subsystem,console -Wl,--entry,entry
 # Ordinary CRT-linked apps (independent-style): full toolchain defaults.
 CRT_CFLAGS := -O2
 
-.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes dll_tests game_exes ucrt_coverage
+.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes dll_tests game_exes interactive_exes ucrt_coverage
 
-all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes game_exes dll_tests ucrt_coverage
+all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes game_exes interactive_exes dll_tests ucrt_coverage
 
 $(OUT):
 	mkdir -p $(OUT)
@@ -103,10 +103,6 @@ $(OUT)/pt_cond.exe: pt_cond/main.c | $(OUT)
 	@echo "built $@"
 
 $(OUT)/rand_test.exe: rand_test/main.c | $(OUT)
-	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $<
-	@echo "built $@"
-
-$(OUT)/snake.exe: snake/main.c | $(OUT)
 	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $<
 	@echo "built $@"
 
@@ -207,6 +203,13 @@ game_exes: $(OUT)/guess_price.exe
 
 $(OUT)/guess_price.exe: guess_price/main.c | $(OUT)
 	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $< -lkernel32
+	@echo "built $@"
+
+# ---- Interactive full-CRT games (snake) ----
+interactive_exes: $(OUT)/snake.exe
+
+$(OUT)/snake.exe: interactive/snake.c | $(OUT)
+	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $<
 	@echo "built $@"
 
 # ---- DLL loader tests ----

@@ -63,6 +63,14 @@ mkdir -p "$BOTTLE/drive_c/App"
 # Kill-switch: WIE_MT=0 makes CreateThread fail (ST-only)
 ```
 
+# 2048 puzzle game
+```bash
+cargo build -p wie-cli --release
+./scripts/fetch-2048.sh
+./target/release/wie-cli run real_exes/2048.exe --max-api 50000 2>/dev/null
+```
+**Controls:** `WASD` or arrow keys, `q` to quit, `r` to restart.
+
 # Interactive snake game (WASD / arrow keys, q to quit)
 ```bash
 cargo build -p wie-cli --release
@@ -118,6 +126,22 @@ When a thread parks (`WaitFor*`, contended critical section, …) it drops the W
 | `WIE_MT_MAX_THREADS` | Cap on guest workers                         | `64`    |
 
 Default **guest** worker stack is **1 MiB** when `dwStackSize == 0`. Host OS threads for workers use **8 MiB** (JIT/iced need room on secondary threads).
+
+## Interactive games: 2048
+
+WIE runs **mevdschee/2048.c** — a terminal version of the 2048 puzzle game (650+ ★ on GitHub). The game uses `getchar` for input, ANSI 256-colour escape codes for rendering, and standard CRT functions.
+
+```bash
+# Fetch source and compile (requires mingw-w64)
+./scripts/fetch-2048.sh
+
+# Play interactively
+./target/release/wie-cli run real_exes/2048.exe --max-api 50000 2>/dev/null
+```
+
+**Controls:** `WASD` or arrow keys to move tiles, `q` to quit, `r` to restart.
+
+The game processes raw keyboard input — each `getchar()` returns one byte, and arrow key escape sequences (`\033[A` etc.) are delivered byte-by-byte. The ANSI output bypasses the console grid buffer so 256-colour SGR codes pass through to the terminal intact.
 
 ## 7-Zip console status (`7za`)
 

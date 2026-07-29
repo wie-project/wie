@@ -37,3 +37,5 @@ rm -rf "$TMP"
 
 echo "downloaded:"
 file "$DEST/7za.exe"
+echo ""
+echo "See also: scripts/fetch-2048.sh — download the 2048 terminal game"
