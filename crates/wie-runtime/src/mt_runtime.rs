@@ -12,12 +12,20 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::thread::JoinHandle;
 use wie_cpu::{CpuEngine, GuestMemory, IcedCpu, JitCpu};
 use wie_winapi::kernel32::{resolve_cs_queue, resolve_wait_target};
-use wie_winapi::{HostParkReason, PendingSpawn, WinApiControlSignal, WinApiState};
+use wie_winapi::{HandlerContext, HostParkReason, PendingSpawn, WinApiControlSignal, WinApiState};
 
 // ── Lock helpers ───────────────────────────────────────────────────────
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Cached `WIE_MT_DEBUG` flag. Was `env::var_os` on every spawn / park /
+/// worker-exit path; now a single `getenv()` guarded by `OnceLock`.
+pub(crate) fn mt_debug() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WIE_MT_DEBUG").is_some())
 }
 
 // ── Shared config ──────────────────────────────────────────────────────
@@ -27,7 +35,7 @@ pub(crate) struct ProcessConfig {
     pub soft_apis: SoftApiTable,
     pub environment: wie_winapi::WinApiEnvironment,
     pub layout: RuntimeMemoryLayout,
-    pub stop_bitmap: Vec<u8>,
+    pub stop_bitmap: Arc<[u8]>,
     pub primary_tid: u32,
 }
 
@@ -99,11 +107,11 @@ impl ProcessResources {
     /// Spawn a host thread for each pending `CreateThread` spawn.
     pub(crate) fn drain_spawns(&mut self) -> Result<()> {
         let spawns: Vec<PendingSpawn> =
-            self.with_mut(|_, st| st.sync.pending_spawns.drain(..).collect());
+            self.with_mut(|_, st| st.kernel.sync.pending_spawns.drain(..).collect());
         if spawns.is_empty() {
             return Ok(());
         }
-        if std::env::var_os("WIE_MT_DEBUG").is_some() {
+        if mt_debug() {
             eprintln!(
                 "[mt] drain_spawns count={} tids={:?}",
                 spawns.len(),
@@ -146,11 +154,11 @@ impl ProcessResources {
 fn join_workers_impl(winapi: &Arc<Mutex<WinApiState>>, joins: &mut Vec<JoinHandle<()>>) {
     {
         let mut st = lock(winapi);
-        st.sync.process_dying = true;
-        for q in st.sync.cs_waiters.values() {
+        st.kernel.sync.process_dying = true;
+        for q in st.kernel.sync.cs_waiters.values() {
             q.notify_all();
         }
-        for obj in st.sync.objects.values() {
+        for obj in st.kernel.sync.objects.values() {
             match obj {
                 wie_winapi::KernelObject::Event(e) => e.set(),
                 wie_winapi::KernelObject::Semaphore(s) => s.notify_all(),
@@ -175,7 +183,7 @@ fn worker_main(
     config: Arc<ProcessConfig>,
     tid: u32,
 ) {
-    if std::env::var_os("WIE_MT_DEBUG").is_some() {
+    if mt_debug() {
         eprintln!("[mt] worker_main start tid={tid:#x}");
     }
     let layout = &config.layout;
@@ -191,7 +199,7 @@ fn worker_main(
         config.stop_bitmap.clone(),
     ) {
         tracing::error!(tid, error = %e, "failed to install runtime hooks for worker");
-        if std::env::var_os("WIE_MT_DEBUG").is_some() {
+        if mt_debug() {
             eprintln!("[mt] worker_main hooks failed tid={tid:#x}: {e}");
         }
         // Always mark finished so joiners do not hang forever.
@@ -203,7 +211,7 @@ fn worker_main(
     // Load initial thread context set by CreateThread.
     {
         let st = lock(&shared_winapi);
-        if let Some(ctx) = st.sync.thread_cpu.get(&tid).cloned() {
+        if let Some(ctx) = st.kernel.sync.thread_cpu.get(&tid).cloned() {
             drop(st);
             engine.restore_thread_context(&ctx);
             engine.on_thread_switch();
@@ -215,8 +223,8 @@ fn worker_main(
         // across pure guest execution (per-thread engines need concurrent quanta).
         {
             let mut st = lock(&shared_winapi);
-            st.threads.activate(tid);
-            if st.sync.process_dying {
+            st.kernel.threads.activate(tid);
+            if st.kernel.sync.process_dying {
                 finish_tid(&st, tid, 1);
                 return;
             }
@@ -235,7 +243,7 @@ fn worker_main(
             match engine.run_until_stop(begin, 0, 0, budget, layout.fake_api_base, fake_api_end) {
                 Ok(r) => r,
                 Err(e) => {
-                    if std::env::var_os("WIE_MT_DEBUG").is_some() {
+                    if mt_debug() {
                         eprintln!("[mt] worker_main run error tid={tid:#x}: {e}");
                     }
                     let st = lock(&shared_winapi);
@@ -244,12 +252,36 @@ fn worker_main(
                 }
             };
 
+        // Pthread return trampoline: the start routine returned. RAX holds
+        // the `void *` result. Mark the pthread finished, wake joiners, exit.
+        // Check BEFORE the generic invalid-memory handler so the trampoline
+        // fault is recognised as a normal thread completion.
+        if run.invalid_memory.hit
+            && run.invalid_memory.address == wie_winapi::pthread_return_trampoline_va()
+        {
+            let return_value = engine.read_rax().unwrap_or(0);
+            if mt_debug() {
+                eprintln!("[mt] worker tid={tid:#x} pthread return value={return_value:#x}");
+            }
+            let mut st = lock(&shared_winapi);
+            st.kernel.threads.activate(tid);
+            if let Some(pt) = st.pthread().by_tid.get(&tid).copied()
+                && let Some(thread) = st.pthread().threads.get_mut(&pt)
+            {
+                thread.exit_value = return_value;
+                thread.finished = true;
+                thread.queue.wake();
+            }
+            finish_tid(&st, tid, 0);
+            return;
+        }
+
         // ThreadProc that `ret`s to the planted 0 return address: RIP becomes 0,
         // or the next fetch faults at VA 0. Both mean normal exit (code in RAX).
         let rip_now = engine.read_rip().unwrap_or(0);
         if rip_now == 0 || (run.invalid_memory.hit && run.invalid_memory.address == 0) {
             let code = u32::try_from(engine.read_rax().unwrap_or(0) & 0xffff_ffff).unwrap_or(0);
-            if std::env::var_os("WIE_MT_DEBUG").is_some() {
+            if mt_debug() {
                 eprintln!("[mt] worker_main exit tid={tid:#x} code={code} (ret-to-0)");
             }
             let st = lock(&shared_winapi);
@@ -260,16 +292,8 @@ fn worker_main(
         // Invalid guest access must not soft-yield forever (same RIP retried).
         // Primary session path treats this as a hard stop; workers must too.
         if run.invalid_memory.hit {
-            let rsp = engine.read_rsp().unwrap_or(0);
-            let inv = run.invalid_memory;
-            eprintln!(
-                "[mt] worker tid={tid:#x} invalid_memory type={} addr={:#x} size={} \
-                 value={:#x} rip={rip_now:#x} rsp={rsp:#x} begin={begin:#x}",
-                inv.access_type,
-                inv.address,
-                inv.size,
-                inv.value.cast_unsigned()
-            );
+            let _rsp = engine.read_rsp().unwrap_or(0);
+            let _inv = run.invalid_memory;
             let st = lock(&shared_winapi);
             finish_tid(&st, tid, 1);
             return;
@@ -292,7 +316,7 @@ fn worker_main(
             let mut st = lock(&shared_winapi);
             // Always re-activate: peer threads may have stolen `active` while we
             // ran pure guest code without the WinAPI lock.
-            st.threads.activate(tid);
+            st.kernel.threads.activate(tid);
             if let Err(e) = wie_winapi::seh::continue_pending(&mut *engine, &mut st) {
                 tracing::warn!(tid, error = %e, "worker SEH continue failed");
                 finish_tid(&st, tid, 1);
@@ -311,29 +335,24 @@ fn worker_main(
         {
             let mut st = lock(&shared_winapi);
             // Re-activate after pure guest run (primary/peers may have activated).
-            st.threads.activate(tid);
-            if st.sync.process_dying {
+            st.kernel.threads.activate(tid);
+            if st.kernel.sync.process_dying {
                 finish_tid(&st, tid, 1);
                 return;
             }
 
             if resolved.traits.exit_process() {
-                st.sync.process_dying = true;
+                st.kernel.sync.process_dying = true;
                 let code = u32::try_from(engine.read_rcx().unwrap_or(0) & 0xffff_ffff).unwrap_or(0);
                 finish_tid(&st, tid, code);
                 return;
             }
 
+            let mut ctx = HandlerContext::new(&mut *engine, config.environment, &mut st);
             let dispatch = if let Some(id) = resolved.winapi_id {
-                wie_winapi::dispatch_winapi_id(&mut *engine, config.environment, &mut st, id)
+                wie_winapi::dispatch_winapi_id(&mut ctx, id)
             } else {
-                wie_winapi::dispatch_winapi(
-                    &mut *engine,
-                    config.environment,
-                    &mut st,
-                    &resolved.library,
-                    &resolved.name,
-                )
+                wie_winapi::dispatch_winapi(&mut ctx, &resolved.library, &resolved.name)
             };
 
             match dispatch {
@@ -380,7 +399,7 @@ fn handle_park(
             };
             let result = wait_on_target(target, timeout_ms, shared_winapi, tid);
             let st = lock(shared_winapi);
-            if st.sync.process_dying {
+            if st.kernel.sync.process_dying {
                 finish_tid(&st, tid, 1);
                 return;
             }
@@ -388,14 +407,20 @@ fn handle_park(
                 .return_from_win64_api(u64::from(result))
                 .map_err(|e| tracing::error!("guest stack corrupted on wait park: {e}"));
         }
+        HostParkReason::PthreadWait => {
+            // Pthread parking is handled through WakeQueue inside the handler.
+            // Yield briefly so the next handler re-entry can check the condition.
+            // Spawns are drained by the caller before entering handle_park.
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         HostParkReason::WaitMultiple => {
             let req = {
                 let mut st = lock(shared_winapi);
-                st.sync.multi_wait.remove(&tid)
+                st.kernel.sync.multi_wait.remove(&tid)
             };
             let result = wait_multiple_result(req, shared_winapi, tid);
             let st = lock(shared_winapi);
-            if st.sync.process_dying {
+            if st.kernel.sync.process_dying {
                 finish_tid(&st, tid, 1);
                 return;
             }
@@ -410,6 +435,7 @@ fn handle_park(
 
 fn finish_tid(st: &WinApiState, tid: u32, code: u32) {
     let thread = st
+        .kernel
         .sync
         .objects
         .values()
@@ -434,7 +460,7 @@ fn wait_on_target(
                         return r;
                     }
                     let st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
-                    if st.sync.process_dying {
+                    if st.kernel.sync.process_dying {
                         finish_tid(&st, tid, 1);
                         return wie_winapi::WAIT_FAILED;
                     }
@@ -457,7 +483,7 @@ fn wait_multiple_result(
     };
     let targets = {
         let st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
-        st.sync.wait_targets(&req.handles)
+        st.kernel.sync.wait_targets(&req.handles)
     };
     let Some(ts) = targets else {
         return wie_winapi::WAIT_FAILED;
@@ -470,7 +496,7 @@ fn wait_multiple_result(
                 return r;
             }
             let st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
-            if st.sync.process_dying {
+            if st.kernel.sync.process_dying {
                 finish_tid(&st, tid, 1);
                 return wie_winapi::WAIT_FAILED;
             }

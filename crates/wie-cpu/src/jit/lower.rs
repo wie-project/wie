@@ -19,10 +19,17 @@ use crate::mem::{GuestMemory, PAGE_SIZE};
 use crate::regs::{RegFile, rflags};
 use cranelift::codegen::ir::{BlockArg, FuncRef, SigRef, UserFuncName};
 use cranelift::prelude::*;
-use cranelift_codegen::ir::MemFlagsData;
+use cranelift_codegen::ir::{AliasRegionData, MemFlagsData};
 use cranelift_module::{FuncId, Linkage, Module};
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
+use std::borrow::Cow;
 use std::collections::HashMap;
+
+/// User-id for the "guest_data" alias region we install on every compiled function.
+///
+/// Stable so `AliasRegionSet::insert` deduplicates within a function; per-function
+/// scope is enough because we do not enable Cranelift inlining.
+const GUEST_DATA_REGION_USER_ID: u32 = 1;
 
 /// Set-associative TLB: number of sets (power of two). `SETS × WAYS` total entries.
 pub(super) const TLB_SETS: usize = 16;
@@ -54,6 +61,22 @@ pub(super) struct TlbBucketAux {
     /// Next victim way within the set (0..3).
     pub rr: u8,
     pub _pad: [u8; 11],
+}
+
+/// Chain-table slot: guest VA → host fn ptr (0 = empty). AoS pair so that
+/// linear probing loads both fields in one cache-line miss.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct ChainSlot {
+    pub va: u64,
+    pub fn_ptr: u64,
+}
+
+impl ChainSlot {
+    #[inline]
+    pub(super) const fn empty() -> Self {
+        Self { va: 0, fn_ptr: 0 }
+    }
 }
 
 /// Empty bucket constructor (const-friendly for array init).
@@ -136,9 +159,16 @@ pub(super) fn string_inline_enabled() -> bool {
     })
 }
 
+/// Set index for the 4-way TLB: XOR-fold high `page_key` bits into the low
+/// `log2(TLB_SETS)` bits so allocations whose base VAs share the same low
+/// bits (e.g. 64 KiB-aligned arenas — stack, heap, VirtualAlloc reserves) do
+/// not all collide on the same set. `page_key = va >> 12`, so bits 0..3 of
+/// `page_key` are va bits 12..15; a 64 KiB-aligned base has those zero and
+/// would land in set 0 without folding.
 #[inline]
 fn tlb_set_index(page_key: u64) -> usize {
-    (page_key as usize) & (TLB_SETS - 1)
+    let mixed = page_key ^ (page_key >> 4) ^ (page_key >> 8) ^ (page_key >> 12);
+    (mixed as usize) & (TLB_SETS - 1)
 }
 
 /// Open-addressing slots for guest-VA → host block fn (block chaining).
@@ -158,19 +188,86 @@ pub(super) const PIN_STRIDE: i32 = 40;
 /// Monomorphic edge inline-cache slots (Phase 4.2 data-plane chaining).
 pub(super) const EDGE_IC_SLOTS: usize = 4;
 
+/// A guest virtual address.
+///
+/// WIE's core invariant is *guest VA ≠ host VA* — every guest access soft
+/// translates through a region/arena base. [`MemPin`] is where both address
+/// spaces meet, and as bare `u64` the only thing separating them was field
+/// naming. `repr(transparent)` keeps the layout byte-identical to `u64`, so
+/// the `repr(C)` struct below and the Cranelift IR that reads it at fixed
+/// offsets are unaffected.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Debug)]
+pub(super) struct GuestVa(u64);
+
+impl GuestVa {
+    pub(super) const ZERO: Self = Self(0);
+
+    #[inline]
+    pub(super) const fn new(va: u64) -> Self {
+        Self(va)
+    }
+
+    /// Exclusive end of `[self, self + len)`, or `None` on overflow.
+    #[inline]
+    pub(super) fn checked_add(self, len: u64) -> Option<Self> {
+        self.0.checked_add(len).map(Self)
+    }
+
+    /// Byte distance from `base` to `self` (caller has ordered them).
+    #[inline]
+    pub(super) fn offset_from(self, base: Self) -> u64 {
+        self.0.wrapping_sub(base.0)
+    }
+}
+
+/// A host address — the integer form of a `*mut u8` into an mmap arena.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub(super) struct HostAddr(u64);
+
+impl HostAddr {
+    pub(super) const NULL: Self = Self(0);
+
+    #[inline]
+    #[expect(clippy::as_conversions)] // pointer → integer for the repr(C) slot
+    pub(super) fn from_ptr(p: *mut u8) -> Self {
+        Self(p as u64)
+    }
+
+    #[inline]
+    pub(super) const fn is_null(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Host pointer `self + off`.
+    ///
+    /// # Safety
+    /// `off` must stay within the mapped arena this address came from.
+    #[inline]
+    #[expect(clippy::as_conversions)] // integer → pointer, inverse of `from_ptr`
+    pub(super) unsafe fn add(self, off: usize) -> *mut u8 {
+        unsafe { (self.0 as *mut u8).add(off) }
+    }
+}
+
 /// Soft-translated region pin (stack / heap / VirtualAlloc) for Phase 4.1 JIT.
 ///
-/// Empty pin: `host_base == 0`. Filled at each `run_compiled` from
+/// Empty pin: `host_base` null. Filled at each `run_compiled` from
 /// [`crate::mem::GuestMemory::jit_region_pins`]; gen must match `mem_gen`.
+///
+/// The two address spaces are distinct types here so that
+/// `host = host_base + (va - guest_base)` cannot be assembled from the wrong
+/// operands — see [`Self::translate`], the single place that arithmetic lives.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(super) struct MemPin {
     /// Inclusive guest base VA.
-    pub guest_base: u64,
+    pub guest_base: GuestVa,
     /// Exclusive guest end VA.
-    pub guest_end: u64,
-    /// Host soft-translate base (integer form of `*mut u8`).
-    pub host_base: u64,
+    pub guest_end: GuestVa,
+    /// Host soft-translate base.
+    pub host_base: HostAddr,
     /// Memory generation at pin install.
     pub mem_gen: u64,
     /// Software R/W bits (`TLB_PROT_R` / `TLB_PROT_W`), intersection over range.
@@ -180,12 +277,47 @@ pub(super) struct MemPin {
 impl MemPin {
     /// Disabled / empty pin.
     pub(super) const EMPTY: Self = Self {
-        guest_base: 0,
-        guest_end: 0,
-        host_base: 0,
+        guest_base: GuestVa::ZERO,
+        guest_end: GuestVa::ZERO,
+        host_base: HostAddr::NULL,
         mem_gen: 0,
         allow: 0,
     };
+
+    /// Whether this slot carries no mapping.
+    #[inline]
+    pub(super) const fn is_empty(&self) -> bool {
+        self.host_base.is_null()
+    }
+
+    /// Guest bytes covered by this pin (0 when empty).
+    #[inline]
+    pub(super) fn span_bytes(&self) -> u64 {
+        self.guest_end.offset_from(self.guest_base)
+    }
+
+    /// Whether `[addr, addr+size)` lies entirely inside the pinned span.
+    #[inline]
+    pub(super) fn contains(&self, addr: GuestVa, end: GuestVa) -> bool {
+        !self.is_empty() && addr >= self.guest_base && end <= self.guest_end
+    }
+
+    /// Soft translate `addr` to its host pointer.
+    ///
+    /// This is the *only* place `host = host_base + (va - guest_base)` is
+    /// computed for a pin. Both operands are distinct types, so the guest and
+    /// host bases cannot be swapped, and the containment check that makes the
+    /// pointer arithmetic sound happens here rather than at each call site.
+    #[inline]
+    pub(super) fn translate(&self, addr: GuestVa, end: GuestVa) -> Option<*mut u8> {
+        if !self.contains(addr, end) {
+            return None;
+        }
+        let off = usize::try_from(addr.offset_from(self.guest_base)).ok()?;
+        // SAFETY: `contains` proved `off` is within the pinned arena span, and
+        // `host_base` is that span's soft-translate base.
+        Some(unsafe { self.host_base.add(off) })
+    }
 
     /// Build from a [`crate::mem::RegionPinInfo`] (or empty if `None`).
     pub(super) fn from_info(info: Option<crate::mem::RegionPinInfo>) -> Self {
@@ -206,9 +338,9 @@ impl MemPin {
             return Self::EMPTY;
         }
         Self {
-            guest_base: p.guest_base,
-            guest_end: p.guest_end,
-            host_base: p.host_base as u64,
+            guest_base: GuestVa::new(p.guest_base),
+            guest_end: GuestVa::new(p.guest_end),
+            host_base: HostAddr::from_ptr(p.host_base),
             mem_gen: p.generation,
             allow,
         }
@@ -241,10 +373,11 @@ pub(super) struct JitCtx {
     pub shadow_sp: u64,
     /// Predicted guest return addresses for `call`/`ret` chaining.
     pub shadow_ret: [u64; SHADOW_DEPTH],
-    /// Pointer to [`CHAIN_SLOTS`] guest VAs (owned by `JitCpu`, live for `run_compiled`).
-    pub chain_va: *mut u64,
-    /// Parallel host fn pointers (`0` = empty), same lifetime as `chain_va`.
-    pub chain_fn: *mut u64,
+    /// Pointer to [`CHAIN_SLOTS`] `(va, fn_ptr)` pairs (owned by `JitCpu`,
+    /// live for `run_compiled`). AoS layout — one 16-byte pair per probe
+    /// stays inside a single cache line, halving L1 traffic vs. the previous
+    /// parallel `chain_va` / `chain_fn` arrays that lived in separate lines.
+    pub chain_slots: *mut ChainSlot,
     /// Sticky single-page TLB for inline IR mem (last hit/fill); `TLB_EMPTY` if cold.
     pub tlb_hot_page: u64,
     /// Host base pointer for [`Self::tlb_hot_page`] (page-aligned guest data).
@@ -427,30 +560,31 @@ pub(super) fn chain_hash(va: u64) -> usize {
 }
 
 /// Insert or update a compiled block in the open-addressing chain table.
-pub(super) fn chain_table_insert(chain_va: &mut [u64], chain_fn: &mut [u64], va: u64, fn_ptr: u64) {
+pub(super) fn chain_table_insert(chain_slots: &mut [ChainSlot], va: u64, fn_ptr: u64) {
     if va == 0 || fn_ptr == 0 {
         return;
     }
     let mut i = chain_hash(va);
     for _ in 0..CHAIN_SLOTS {
-        let slot = chain_va[i];
+        let slot = chain_slots[i].va;
         if slot == 0 || slot == va {
-            chain_va[i] = va;
-            chain_fn[i] = fn_ptr;
+            chain_slots[i].va = va;
+            chain_slots[i].fn_ptr = fn_ptr;
             return;
         }
         i = (i + 1) & (CHAIN_SLOTS - 1);
     }
     // Table full: overwrite hashed slot.
     let i = chain_hash(va);
-    chain_va[i] = va;
-    chain_fn[i] = fn_ptr;
+    chain_slots[i].va = va;
+    chain_slots[i].fn_ptr = fn_ptr;
 }
 
 /// Clear all chain-table entries (cache invalidation).
-pub(super) fn chain_table_clear(chain_va: &mut [u64], chain_fn: &mut [u64]) {
-    chain_va.fill(0);
-    chain_fn.fill(0);
+pub(super) fn chain_table_clear(chain_slots: &mut [ChainSlot]) {
+    for s in chain_slots.iter_mut() {
+        *s = ChainSlot::empty();
+    }
 }
 
 // --- Host mem helpers (registered as JIT symbols) ---
@@ -541,14 +675,12 @@ fn tlb_set_hot(ctx: &mut JitCtx, page_key: u64, page_base: *mut u8, prot: u8, ge
 ///
 /// Slot 0 = stack; slots 1.. = process heap + VirtualAlloc data pins.
 fn classify_addr_vs_pins(ctx: &mut JitCtx, addr: u64, size: usize) {
-    let end = addr.saturating_add(u64::try_from(size).unwrap_or(0));
+    let va = GuestVa::new(addr);
+    let end = GuestVa::new(addr.saturating_add(u64::try_from(size).unwrap_or(0)));
     let mut in_stack = false;
     let mut in_data = false;
     for (i, pin) in ctx.pins.iter().enumerate() {
-        if pin.host_base == 0 {
-            continue;
-        }
-        if addr >= pin.guest_base && end <= pin.guest_end {
+        if pin.contains(va, end) {
             if i == 0 {
                 in_stack = true;
             } else {
@@ -632,31 +764,31 @@ fn pin_resolve(ctx: &mut JitCtx, addr: u64, size: usize, write: bool) -> Option<
     if size_u == 0 {
         return None;
     }
-    let end = addr.checked_add(size_u)?;
+    let va = GuestVa::new(addr);
+    let end = va.checked_add(size_u)?;
     let cur_gen = ctx.mem_gen;
-    // Collect a matching pin by value so we can mutably update the TLB after.
-    let mut matched: Option<(u64, u64, u64, u8)> = None; // guest_base, host_base, mem_gen, prot
+    // Copy the matching pin out so the TLB can be mutated afterwards.
+    // Previously a positional `(u64, u64, u64, u8)` tuple whose meaning lived
+    // in a trailing comment — transposing guest_base and host_base there would
+    // have compiled and silently translated into the wrong address space.
+    let mut matched: Option<(MemPin, u8)> = None;
     for pin in &ctx.pins {
-        if pin.host_base == 0 || pin.mem_gen != cur_gen {
+        if pin.is_empty() || pin.mem_gen != cur_gen {
             continue;
         }
-        if addr < pin.guest_base || end > pin.guest_end {
+        if !pin.contains(va, end) {
             continue;
         }
         let prot = u8::try_from(pin.allow).unwrap_or(0);
         if !tlb_prot_allows(prot, write) {
             continue;
         }
-        matched = Some((pin.guest_base, pin.host_base, pin.mem_gen, prot));
+        matched = Some((*pin, prot));
         break;
     }
-    let (guest_base, host_base, pin_gen, prot) = matched?;
-    let off = usize::try_from(addr.wrapping_sub(guest_base)).unwrap_or(usize::MAX);
-    if off == usize::MAX {
-        return None;
-    }
-    // SAFETY: host_base is arena soft-translate base; bounds checked above.
-    let host = unsafe { (host_base as *mut u8).add(off) };
+    let (pin, prot) = matched?;
+    let pin_gen = pin.mem_gen;
+    let host = pin.translate(va, end)?;
     let page_off = usize::try_from(addr & (PAGE_SIZE - 1)).unwrap_or(0);
     let page_key = addr >> 12;
     // SAFETY: host points into the pin span; subtract in-page offset for page base.
@@ -953,30 +1085,29 @@ pub(super) unsafe extern "C" fn wie_jit_chain_lookup(ctx: *mut JitCtx, va: u64) 
             }
         }
     }
-    if ctx.chain_va.is_null() || ctx.chain_fn.is_null() {
+    if ctx.chain_slots.is_null() {
         return 0;
     }
-    // SAFETY: tables are `CHAIN_SLOTS` long and live for this call.
-    let keys = unsafe { std::slice::from_raw_parts(ctx.chain_va, CHAIN_SLOTS) };
-    let fns = unsafe { std::slice::from_raw_parts(ctx.chain_fn, CHAIN_SLOTS) };
+    // SAFETY: `chain_slots` points to a live [ChainSlot; CHAIN_SLOTS] array for
+    // the duration of this call (set by `run_compiled`).
+    let slots = unsafe { std::slice::from_raw_parts(ctx.chain_slots, CHAIN_SLOTS) };
     let mut i = chain_hash(va);
     // Bounded probe; empty slot ends search.
     for _ in 0..16 {
-        let k = keys[i];
-        if k == va {
-            let f = fns[i];
-            if f != 0 {
+        let s = slots[i];
+        if s.va == va {
+            if s.fn_ptr != 0 {
                 // Install monomorphic edge IC (RR victim).
                 let slot =
                     usize::try_from(ctx.edge_ic_rr % u64::try_from(EDGE_IC_SLOTS).unwrap_or(4))
                         .unwrap_or(0);
                 ctx.edge_ic_va[slot] = va;
-                ctx.edge_ic_fn[slot] = f;
+                ctx.edge_ic_fn[slot] = s.fn_ptr;
                 ctx.edge_ic_rr = ctx.edge_ic_rr.wrapping_add(1);
             }
-            return f;
+            return s.fn_ptr;
         }
-        if k == 0 {
+        if s.va == 0 {
             return 0;
         }
         i = (i + 1) & (CHAIN_SLOTS - 1);
@@ -1092,31 +1223,22 @@ pub(super) unsafe extern "C" fn wie_jit_string(
         set_fault(ctx, insn_ip, 0, size, 0);
         return 0;
     }
-    let kind = match op {
-        0 => StringOpKind::Stos,
-        1 => StringOpKind::Movs,
-        2 => StringOpKind::Lods,
-        3 => StringOpKind::Scas,
-        4 => StringOpKind::Cmps,
-        _ => {
-            set_fault(ctx, insn_ip, 0, size, 0);
-            return 0;
-        }
+    let Ok(kind) = StringOpKind::try_from(op) else {
+        set_fault(ctx, insn_ip, 0, size, 0);
+        return 0;
     };
-    let rep = (flags & 1) != 0;
-    let repe = (flags & 2) != 0;
-    let repne = (flags & 4) != 0;
+    let rep = exec::RepPrefix::from_abi(flags);
 
     let mut regs = RegFile::new();
     for i in 0..16 {
         regs.set_gpr(i, ctx.gpr[i]);
     }
-    regs.rflags = ctx.rflags;
+    regs.set_rflags_checked(ctx.rflags);
     regs.rip = insn_ip;
 
     // SAFETY: mem pointer set by run_compiled.
     let mem = unsafe { &*ctx.mem };
-    match exec::run_string_op(mem, &mut regs, kind, size_usize, rep, repe, repne) {
+    match exec::run_string_op(mem, &mut regs, kind, size_usize, rep) {
         Ok(stay) => {
             for i in 0..16 {
                 ctx.gpr[i] = regs.gpr(i);
@@ -1145,30 +1267,86 @@ pub(super) unsafe extern "C" fn wie_jit_string(
     }
 }
 
-/// Scalar f32 binop: `op` 0=add 1=sub 2=mul 3=div; args/result in low 32 bits.
+/// SSE floating-point binary operation.
+///
+/// As with [`StringOpKind`], the numeric form is an ABI detail: the JIT passes
+/// it to [`wie_f32_binop`] / [`wie_f64_binop`] through an `extern "C"` `u64`.
+/// [`Self::to_abi`] and [`TryFrom<u64>`] are the only places that encoding
+/// appears; every other site names the operation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum FloatBinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+impl FloatBinOp {
+    pub(super) fn to_abi(self) -> u64 {
+        match self {
+            Self::Add => 0,
+            Self::Sub => 1,
+            Self::Mul => 2,
+            Self::Div => 3,
+        }
+    }
+}
+
+impl TryFrom<u64> for FloatBinOp {
+    type Error = ();
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Add),
+            1 => Ok(Self::Sub),
+            2 => Ok(Self::Mul),
+            3 => Ok(Self::Div),
+            _ => Err(()),
+        }
+    }
+}
+
+/// IEEE width an SSE FP instruction operates on.
+///
+/// Replaces an `is_f64: bool` parameter that sat next to the opcode at call
+/// sites, making them read `(.., 3, true)` — two unlabelled literals.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FloatWidth {
+    F32,
+    F64,
+}
+
+/// Scalar f32 binop; args/result in low 32 bits.
 pub(super) extern "C" fn wie_f32_binop(op: u64, a: u64, b: u64) -> u64 {
     let fa = f32::from_bits(a as u32);
     let fb = f32::from_bits(b as u32);
+    // Unreachable in practice: the lowering only ever emits `to_abi` values.
+    // Returning the left operand preserves the previous defensive behaviour
+    // (these helpers have no JitCtx, so they cannot raise a fault).
+    let Ok(op) = FloatBinOp::try_from(op) else {
+        return a;
+    };
     let r = match op {
-        0 => fa + fb,
-        1 => fa - fb,
-        2 => fa * fb,
-        3 => fa / fb,
-        _ => fa,
+        FloatBinOp::Add => fa + fb,
+        FloatBinOp::Sub => fa - fb,
+        FloatBinOp::Mul => fa * fb,
+        FloatBinOp::Div => fa / fb,
     };
     u64::from(r.to_bits())
 }
 
-/// Scalar f64 binop: `op` 0=add 1=sub 2=mul 3=div.
+/// Scalar f64 binop.
 pub(super) extern "C" fn wie_f64_binop(op: u64, a: u64, b: u64) -> u64 {
     let fa = f64::from_bits(a);
     let fb = f64::from_bits(b);
+    let Ok(op) = FloatBinOp::try_from(op) else {
+        return a;
+    };
     let r = match op {
-        0 => fa + fb,
-        1 => fa - fb,
-        2 => fa * fb,
-        3 => fa / fb,
-        _ => fa,
+        FloatBinOp::Add => fa + fb,
+        FloatBinOp::Sub => fa - fb,
+        FloatBinOp::Mul => fa * fb,
+        FloatBinOp::Div => fa / fb,
     };
     r.to_bits()
 }
@@ -1245,6 +1423,14 @@ pub(super) fn compile_block(
 
         let ctx_ptr = bcx.block_params(entry)[0];
         let flags = MemFlagsData::trusted();
+        // Guest data accesses (through pin bias / sticky ptr / super stack /
+        // host_span I8X16) go through a distinct alias region so Cranelift's
+        // alias analysis can hoist JitCtx sticky/pin metadata loads across them.
+        let guest_data_region = bcx.func.dfg.alias_regions.insert(AliasRegionData {
+            user_id: GUEST_DATA_REGION_USER_ID,
+            description: Cow::Borrowed("guest_data"),
+        });
+        let guest_flags = flags.with_alias_region(Some(guest_data_region));
 
         // Exit: gpr[16] + rflags as block params → store and return.
         // XMM is write-through to JitCtx (correct on mid-block mem faults).
@@ -1484,6 +1670,7 @@ pub(super) fn compile_block(
                     f32_ref,
                     f64_ref,
                     flags,
+                    guest_flags,
                     exit,
                     ucrt_refs,
                     // Super path: no per-access probes. Normal: hoisted pins.
@@ -1604,6 +1791,7 @@ pub(super) fn compile_block(
                 f32_ref,
                 f64_ref,
                 flags,
+                guest_flags,
                 exit,
                 ucrt_refs,
                 stack_pin,
@@ -2226,7 +2414,13 @@ struct MemEnv {
     host_span_ref: Option<cranelift::codegen::ir::FuncRef>,
     f32_ref: Option<cranelift::codegen::ir::FuncRef>,
     f64_ref: Option<cranelift::codegen::ir::FuncRef>,
+    /// Flags for JitCtx accesses (gpr slots, rflags, TLB/sticky/pin state, fault, etc.).
     flags: MemFlagsData,
+    /// Flags for soft-translated guest memory accesses through pin bias / sticky ptr
+    /// / super stack / host_span. Tagged with a distinct `AliasRegion` so JitCtx
+    /// stores do not alias-clobber guest loads (and vice-versa), unblocking LICM/CSE
+    /// on sticky metadata inside memop-dense loops.
+    guest_flags: MemFlagsData,
     exit: Block,
     ucrt_refs: [Option<FuncRef>; 7],
     /// Stack region pin (slot 0), hoisted at block entry when inline mem is on.
@@ -2336,17 +2530,12 @@ fn load_xmm_pair(
     loaded[idx] = true;
 }
 
-/// Mark XMMi dirty in `JitCtx.xmm_dirty_bits` (for selective host writeback).
-fn mark_xmm_dirty_ir(bcx: &mut FunctionBuilder<'_>, mem: &MemEnv, idx: usize) {
-    if idx >= 16 {
-        return;
-    }
-    let p = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_XMM_DIRTY));
-    let old = bcx.ins().load(types::I64, mem.flags, p, 0);
-    let bit = iconst_u64(bcx, 1_u64 << idx);
-    let new = bcx.ins().bor(old, bit);
-    bcx.ins().store(mem.flags, new, p, 0);
-}
+// `mark_xmm_dirty_ir` used to emit a `load / or / store` on `JitCtx.xmm_dirty_bits`
+// per XMM def. Removed: `CompiledBlock::xmm_may_def_mask` is a static superset of
+// what those RMWs computed, and the host exit path now always ORs `xmm_dirty_bits`
+// with `xmm_may_def_mask`, so trampolines still contribute their dynamic dirty bits.
+// Skipping the per-def RMW eliminates a JitCtx aliasing edge that was blocking
+// Cranelift LICM/CSE on sticky/pin metadata inside SSE-heavy loop bodies.
 
 fn pair_to_i8x16(
     bcx: &mut FunctionBuilder<'_>,
@@ -2406,7 +2595,8 @@ fn store_xmm_pair(
         bcx.ins().store(mem.flags, lo, p, 0);
         bcx.ins().store(mem.flags, hi, phi, 0);
     }
-    mark_xmm_dirty_ir(bcx, mem, idx);
+    // No `xmm_dirty_bits` RMW: `xmm_may_def_mask` (computed statically at compile)
+    // covers this def, and the host exit path ORs both masks unconditionally.
 }
 
 fn xmm_index(reg: Register) -> Result<usize, String> {
@@ -2753,12 +2943,16 @@ fn lower_sse_bitwise(
     Ok(())
 }
 
-fn clif_fbinop(bcx: &mut FunctionBuilder<'_>, op: u64, a: Value, b: Value) -> Value {
+/// Emit the native Cranelift FP instruction for `op`.
+///
+/// Exhaustive: previously any unrecognised opcode fell through to `fadd`,
+/// so a mis-encoded operation silently computed an addition.
+fn clif_fbinop(bcx: &mut FunctionBuilder<'_>, op: FloatBinOp, a: Value, b: Value) -> Value {
     match op {
-        1 => bcx.ins().fsub(a, b),
-        2 => bcx.ins().fmul(a, b),
-        3 => bcx.ins().fdiv(a, b),
-        _ => bcx.ins().fadd(a, b),
+        FloatBinOp::Add => bcx.ins().fadd(a, b),
+        FloatBinOp::Sub => bcx.ins().fsub(a, b),
+        FloatBinOp::Mul => bcx.ins().fmul(a, b),
+        FloatBinOp::Div => bcx.ins().fdiv(a, b),
     }
 }
 
@@ -2770,8 +2964,8 @@ fn lower_sse_scalar_fp(
     rflags: Value,
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
-    op: u64,
-    is_f64: bool,
+    op: FloatBinOp,
+    width: FloatWidth,
 ) -> Result<(), String> {
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
@@ -2780,14 +2974,14 @@ fn lower_sse_scalar_fp(
         OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
         OpKind::Memory => {
             let addr = effective_addr(bcx, instr, gpr)?;
-            let nbytes = if is_f64 { 8 } else { 4 };
+            let nbytes = if width == FloatWidth::F64 { 8 } else { 4 };
             load_sse_mem(bcx, mem, gpr, rflags, addr, nbytes, instr.ip())?
         }
         _ => return Err("sse scalar fp src".into()),
     };
     let _ = b_hi;
     let (new_lo, new_hi) = if jit_simd_enabled() {
-        if is_f64 {
+        if width == FloatWidth::F64 {
             let fa = bcx.ins().bitcast(types::F64, mem.flags, a_lo);
             let fb = bcx.ins().bitcast(types::F64, mem.flags, b_lo);
             let fr = clif_fbinop(bcx, op, fa, fb);
@@ -2807,8 +3001,8 @@ fn lower_sse_scalar_fp(
             (bcx.ins().bor(cleared, r64), a_hi)
         }
     } else {
-        let op_v = iconst_u64(bcx, op);
-        if is_f64 {
+        let op_v = iconst_u64(bcx, op.to_abi());
+        if width == FloatWidth::F64 {
             let fref = mem.f64_ref.ok_or("f64 helper missing")?;
             let call = bcx.ins().call(fref, &[op_v, a_lo, b_lo]);
             let r = bcx.inst_results(call)[0];
@@ -2836,8 +3030,8 @@ fn lower_sse_packed_fp(
     rflags: Value,
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
-    op: u64,
-    is_f64: bool,
+    op: FloatBinOp,
+    width: FloatWidth,
 ) -> Result<(), String> {
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
@@ -2853,7 +3047,7 @@ fn lower_sse_packed_fp(
     if jit_simd_enabled() {
         let a8 = pair_to_i8x16(bcx, mem.flags, a_lo, a_hi);
         let b8 = pair_to_i8x16(bcx, mem.flags, b_lo, b_hi);
-        let (lo, hi) = if is_f64 {
+        let (lo, hi) = if width == FloatWidth::F64 {
             let a = bcx.ins().bitcast(types::F64X2, mem.flags, a8);
             let b = bcx.ins().bitcast(types::F64X2, mem.flags, b8);
             let c = clif_fbinop(bcx, op, a, b);
@@ -2869,8 +3063,8 @@ fn lower_sse_packed_fp(
         store_xmm_pair(bcx, mem, xmm, di, lo, hi);
         return Ok(());
     }
-    let op_v = iconst_u64(bcx, op);
-    if is_f64 {
+    let op_v = iconst_u64(bcx, op.to_abi());
+    if width == FloatWidth::F64 {
         let fref = mem.f64_ref.ok_or("f64 helper missing")?;
         let call0 = bcx.ins().call(fref, &[op_v, a_lo, b_lo]);
         let r0 = bcx.inst_results(call0)[0];
@@ -3507,22 +3701,166 @@ fn lower_insn(
         Mnemonic::Andnps | Mnemonic::Andnpd | Mnemonic::Pandn => {
             lower_sse_bitwise(bcx, instr, gpr, *rflags, mem, xmm, SseBit::Andn)
         }
-        Mnemonic::Addss => lower_sse_scalar_fp(bcx, instr, gpr, *rflags, mem, xmm, 0, false),
-        Mnemonic::Subss => lower_sse_scalar_fp(bcx, instr, gpr, *rflags, mem, xmm, 1, false),
-        Mnemonic::Mulss => lower_sse_scalar_fp(bcx, instr, gpr, *rflags, mem, xmm, 2, false),
-        Mnemonic::Divss => lower_sse_scalar_fp(bcx, instr, gpr, *rflags, mem, xmm, 3, false),
-        Mnemonic::Addsd => lower_sse_scalar_fp(bcx, instr, gpr, *rflags, mem, xmm, 0, true),
-        Mnemonic::Subsd => lower_sse_scalar_fp(bcx, instr, gpr, *rflags, mem, xmm, 1, true),
-        Mnemonic::Mulsd => lower_sse_scalar_fp(bcx, instr, gpr, *rflags, mem, xmm, 2, true),
-        Mnemonic::Divsd => lower_sse_scalar_fp(bcx, instr, gpr, *rflags, mem, xmm, 3, true),
-        Mnemonic::Addps => lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, 0, false),
-        Mnemonic::Subps => lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, 1, false),
-        Mnemonic::Mulps => lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, 2, false),
-        Mnemonic::Divps => lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, 3, false),
-        Mnemonic::Addpd => lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, 0, true),
-        Mnemonic::Subpd => lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, 1, true),
-        Mnemonic::Mulpd => lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, 2, true),
-        Mnemonic::Divpd => lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, 3, true),
+        Mnemonic::Addss => lower_sse_scalar_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Add,
+            FloatWidth::F32,
+        ),
+        Mnemonic::Subss => lower_sse_scalar_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Sub,
+            FloatWidth::F32,
+        ),
+        Mnemonic::Mulss => lower_sse_scalar_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Mul,
+            FloatWidth::F32,
+        ),
+        Mnemonic::Divss => lower_sse_scalar_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Div,
+            FloatWidth::F32,
+        ),
+        Mnemonic::Addsd => lower_sse_scalar_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Add,
+            FloatWidth::F64,
+        ),
+        Mnemonic::Subsd => lower_sse_scalar_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Sub,
+            FloatWidth::F64,
+        ),
+        Mnemonic::Mulsd => lower_sse_scalar_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Mul,
+            FloatWidth::F64,
+        ),
+        Mnemonic::Divsd => lower_sse_scalar_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Div,
+            FloatWidth::F64,
+        ),
+        Mnemonic::Addps => lower_sse_packed_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Add,
+            FloatWidth::F32,
+        ),
+        Mnemonic::Subps => lower_sse_packed_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Sub,
+            FloatWidth::F32,
+        ),
+        Mnemonic::Mulps => lower_sse_packed_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Mul,
+            FloatWidth::F32,
+        ),
+        Mnemonic::Divps => lower_sse_packed_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Div,
+            FloatWidth::F32,
+        ),
+        Mnemonic::Addpd => lower_sse_packed_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Add,
+            FloatWidth::F64,
+        ),
+        Mnemonic::Subpd => lower_sse_packed_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Sub,
+            FloatWidth::F64,
+        ),
+        Mnemonic::Mulpd => lower_sse_packed_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Mul,
+            FloatWidth::F64,
+        ),
+        Mnemonic::Divpd => lower_sse_packed_fp(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            FloatBinOp::Div,
+            FloatWidth::F64,
+        ),
         Mnemonic::Punpcklqdq | Mnemonic::Punpckhqdq => {
             flush_pending(bcx, rflags, pending);
             lower_sse_punpck(bcx, instr, xmm, mem)
@@ -3551,16 +3889,19 @@ fn try_lower_inline_rep(
     rflags: &mut Value,
     gpr_loaded: &mut [bool; 16],
     mem: &mut MemEnv,
-    op: u64,
+    kind: StringOpKind,
     size: u32,
 ) -> Option<Value> {
     if !string_inline_enabled() || !jit_simd_enabled() {
         return None;
     }
-    if !matches!(op, 0 | 1) {
-        return None;
-    }
-    if !(instr.has_rep_prefix() || instr.has_repe_prefix() || instr.has_repne_prefix()) {
+    // Only the two block-copyable kinds; SCAS/CMPS/LODS need element semantics.
+    let is_movs = match kind {
+        StringOpKind::Movs => true,
+        StringOpKind::Stos => false,
+        StringOpKind::Lods | StringOpKind::Scas | StringOpKind::Cmps => return None,
+    };
+    if !exec::RepPrefix::from_instr(instr).rep {
         return None;
     }
     if !matches!(size, 1 | 2 | 4 | 8) {
@@ -3572,25 +3913,27 @@ fn try_lower_inline_rep(
     if !gpr_loaded[1] || !gpr_loaded[7] {
         return None;
     }
-    if op == 1 && !gpr_loaded[6] {
+    if is_movs && !gpr_loaded[6] {
         return None;
     }
-    if op == 0 && !gpr_loaded[0] {
+    if !is_movs && !gpr_loaded[0] {
         return None;
     }
 
-    // DF clear + byte_len in [16, 64].
+    // DF clear + byte_len in [8, 64]. Lengths are handled exactly (including
+    // non-multiples of 16) by `emit_inline_copy_chunks`; the floor is 8 because
+    // that is the smallest unit the overlapping-tail scheme covers.
     let df_mask = iconst_u64(bcx, rflags::DF);
     let df_bits = bcx.ins().band(*rflags, df_mask);
     let df_clear = bcx.ins().icmp_imm(IntCC::Equal, df_bits, 0);
     let rcx = gpr[1];
     let size_v = iconst_u64(bcx, u64::from(size));
     let byte_len = bcx.ins().imul(rcx, size_v);
-    let min16 = iconst_u64(bcx, 16);
+    let min_len = iconst_u64(bcx, 8);
     let max64 = iconst_u64(bcx, 64);
     let ge_min = bcx
         .ins()
-        .icmp(IntCC::UnsignedGreaterThanOrEqual, byte_len, min16);
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, byte_len, min_len);
     let le_max = bcx
         .ins()
         .icmp(IntCC::UnsignedLessThanOrEqual, byte_len, max64);
@@ -3628,25 +3971,52 @@ fn try_lower_inline_rep(
 
     let new_rax = gpr[0];
     let new_rcx = iconst_u64(bcx, 0);
-    let (new_rsi, new_rdi) = if op == 1 {
+    let (new_rsi, new_rdi) = if is_movs {
         let zero = iconst_u64(bcx, 0);
         let call_src = bcx
             .ins()
             .call(span_ref, &[mem.ctx_ptr, gpr[6], byte_len, zero]);
         let src_host = bcx.inst_results(call_src)[0];
         let src_ok = bcx.ins().icmp_imm(IntCC::NotEqual, src_host, 0);
+        // Chunked (and overlapping-tail) copying only matches x86 `rep movs`
+        // byte-ascending semantics when source and destination do not overlap:
+        // a forward byte copy propagates a pattern where a 16-byte block copy
+        // does not. Require disjoint host ranges and fall back to the element
+        // loop otherwise.
+        let dst_end = bcx.ins().iadd(dst_host, byte_len);
+        let src_end = bcx.ins().iadd(src_host, byte_len);
+        let dst_before_src = bcx
+            .ins()
+            .icmp(IntCC::UnsignedLessThanOrEqual, dst_end, src_host);
+        let src_before_dst = bcx
+            .ins()
+            .icmp(IntCC::UnsignedLessThanOrEqual, src_end, dst_host);
+        let disjoint = bcx.ins().bor(dst_before_src, src_before_dst);
+        let src_usable = bcx.ins().band(src_ok, disjoint);
         let copy_body = bcx.create_block();
-        bcx.ins().brif(src_ok, copy_body, &[], cont_slow, &[]);
+        bcx.ins().brif(src_usable, copy_body, &[], cont_slow, &[]);
         bcx.switch_to_block(copy_body);
         bcx.seal_block(copy_body);
-        emit_inline_copy_chunks(bcx, mem, src_host, dst_host, byte_len, None);
+        emit_inline_copy_chunks(
+            bcx,
+            mem,
+            dst_host,
+            byte_len,
+            InlineCopySrc::Move { src_host },
+        );
         (
             bcx.ins().iadd(gpr[6], byte_len),
             bcx.ins().iadd(gpr[7], byte_len),
         )
     } else {
-        let pat = stos_splat_pattern(bcx, mem, gpr[0], size)?;
-        emit_inline_copy_chunks(bcx, mem, dst_host, dst_host, byte_len, Some(pat));
+        let pattern = stos_splat_pattern(bcx, mem, gpr[0], size)?;
+        emit_inline_copy_chunks(
+            bcx,
+            mem,
+            dst_host,
+            byte_len,
+            InlineCopySrc::Fill { pattern },
+        );
         (gpr[6], bcx.ins().iadd(gpr[7], byte_len))
     };
     let next = iconst_u64(bcx, instr.next_ip());
@@ -3674,14 +4044,10 @@ fn try_lower_inline_rep(
     }
     let rflags_ptr = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_RFLAGS));
     bcx.ins().store(mem.flags, *rflags, rflags_ptr, 0);
-    let mut flags = 1_u64; // REP
-    if instr.has_repe_prefix() {
-        flags |= 2;
-    }
-    if instr.has_repne_prefix() {
-        flags |= 4;
-    }
-    let op_v = iconst_u64(bcx, op);
+    // Reached only when the REP prefix is present (checked on entry), so the
+    // shared encoder always sets the `rep` bit here.
+    let flags = exec::RepPrefix::from_instr(instr).to_abi();
+    let op_v = iconst_u64(bcx, kind.to_abi());
     let size_c = iconst_u64(bcx, u64::from(size));
     let flags_v = iconst_u64(bcx, flags);
     let ip_v = iconst_u64(bcx, instr.ip());
@@ -3735,16 +4101,40 @@ fn try_lower_inline_rep(
     Some(params[0])
 }
 
-/// Unrolled up to 4×16-byte host copies. If `fill` is `Some`, stores that vector
-/// (STOS); otherwise loads from `src_host` (MOVS). `src_host` may equal `dst_host` for fill.
+/// Width of one unrolled store in an inline REP copy.
+///
+/// Only these two widths are emitted, so a plain integer width would admit
+/// values (7, 32, 0) the emitter cannot honour.
+#[derive(Clone, Copy)]
+enum CopyUnit {
+    Bytes8,
+    Bytes16,
+}
+
+/// Source of the bytes an inline REP block copy writes.
+///
+/// Replaces an `Option<Value>` that overloaded `None` to mean "MOVS, read from
+/// a separate `src_host` argument" and `Some(v)` to mean "STOS, splat `v`" —
+/// which additionally required passing `dst_host` as the source for fills.
+/// Encoding the source in the variant removes that dummy argument.
+#[derive(Clone, Copy)]
+enum InlineCopySrc {
+    /// MOVS: load from `src_host + off`, matching the destination offset.
+    Move { src_host: Value },
+    /// STOS: store `pattern`, an `I8X16` splat whose every 8-byte half also
+    /// carries the fill value (so an 8-byte unit can reuse lane 0).
+    Fill { pattern: Value },
+}
+
+/// Emit an exact copy/fill of `byte_len` bytes for `byte_len` in [8, 64].
 fn emit_inline_copy_chunks(
     bcx: &mut FunctionBuilder<'_>,
     mem: &MemEnv,
-    src_host: Value,
     dst_host: Value,
     byte_len: Value,
-    fill: Option<Value>,
+    src: InlineCopySrc,
 ) {
+    // Full 16-byte chunks at constant offsets 0/16/32/48.
     for chunk in 0..4_u64 {
         let off = iconst_u64(bcx, chunk.saturating_mul(16));
         let need = iconst_u64(bcx, chunk.saturating_mul(16).saturating_add(16));
@@ -3756,18 +4146,91 @@ fn emit_inline_copy_chunks(
         bcx.ins().brif(take, do_chunk, &[], next_chunk, &[]);
         bcx.switch_to_block(do_chunk);
         bcx.seal_block(do_chunk);
-        let dp = bcx.ins().iadd(dst_host, off);
-        let v = if let Some(pat) = fill {
-            pat
-        } else {
-            let sp = bcx.ins().iadd(src_host, off);
-            bcx.ins().load(types::I8X16, mem.flags, sp, 0)
-        };
-        bcx.ins().store(mem.flags, v, dp, 0);
+        emit_one_unit(bcx, mem, dst_host, off, CopyUnit::Bytes16, src);
         bcx.ins().jump(next_chunk, &[]);
         bcx.switch_to_block(next_chunk);
         bcx.seal_block(next_chunk);
     }
+
+    // Overlapping 16-byte tail for lengths that are not a multiple of 16.
+    //
+    // Without this, a length like 20 stored only chunk 0 (bytes 0..16) while the
+    // caller still advanced RSI/RDI by 20 and zeroed RCX — the trailing
+    // `len & 15` bytes were silently never written. Copying the *last* 16 bytes
+    // at `len - 16` closes the gap; the overlap with an already-written chunk
+    // re-stores identical bytes, which is why MOVS additionally requires the
+    // host ranges to be disjoint (checked by the caller).
+    {
+        let rem = bcx.ins().band_imm(byte_len, 15);
+        let has_tail = bcx.ins().icmp_imm(IntCC::NotEqual, rem, 0);
+        let big_enough = bcx
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, byte_len, 16);
+        let need_tail = bcx.ins().band(has_tail, big_enough);
+        let do_tail = bcx.create_block();
+        let after_tail = bcx.create_block();
+        bcx.ins().brif(need_tail, do_tail, &[], after_tail, &[]);
+        bcx.switch_to_block(do_tail);
+        bcx.seal_block(do_tail);
+        let tail_off = bcx.ins().iadd_imm(byte_len, -16);
+        emit_one_unit(bcx, mem, dst_host, tail_off, CopyUnit::Bytes16, src);
+        bcx.ins().jump(after_tail, &[]);
+        bcx.switch_to_block(after_tail);
+        bcx.seal_block(after_tail);
+    }
+
+    // Sub-16 lengths [8, 15]: an 8-byte lead plus an overlapping 8-byte tail
+    // covers [0, len) exactly. Extends the inline fast path below the old
+    // 16-byte floor, capturing small CRT `memcpy`/`memset` fragments that
+    // previously fell through to the bulk helper.
+    {
+        let small = bcx.ins().icmp_imm(IntCC::UnsignedLessThan, byte_len, 16);
+        let ge8 = bcx
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, byte_len, 8);
+        let need_small = bcx.ins().band(small, ge8);
+        let do_small = bcx.create_block();
+        let after_small = bcx.create_block();
+        bcx.ins().brif(need_small, do_small, &[], after_small, &[]);
+        bcx.switch_to_block(do_small);
+        bcx.seal_block(do_small);
+        let zero_off = iconst_u64(bcx, 0);
+        emit_one_unit(bcx, mem, dst_host, zero_off, CopyUnit::Bytes8, src);
+        let tail8 = bcx.ins().iadd_imm(byte_len, -8);
+        emit_one_unit(bcx, mem, dst_host, tail8, CopyUnit::Bytes8, src);
+        bcx.ins().jump(after_small, &[]);
+        bcx.switch_to_block(after_small);
+        bcx.seal_block(after_small);
+    }
+}
+
+/// Store one unit at `dst_host + off`, sourcing per [`InlineCopySrc`].
+fn emit_one_unit(
+    bcx: &mut FunctionBuilder<'_>,
+    mem: &MemEnv,
+    dst_host: Value,
+    off: Value,
+    unit: CopyUnit,
+    src: InlineCopySrc,
+) {
+    let dp = bcx.ins().iadd(dst_host, off);
+    let value = match (unit, src) {
+        (CopyUnit::Bytes16, InlineCopySrc::Fill { pattern }) => pattern,
+        (CopyUnit::Bytes16, InlineCopySrc::Move { src_host }) => {
+            let sp = bcx.ins().iadd(src_host, off);
+            bcx.ins().load(types::I8X16, mem.guest_flags, sp, 0)
+        }
+        (CopyUnit::Bytes8, InlineCopySrc::Fill { pattern }) => {
+            // Reuse the I8X16 splat: every 8-byte half carries the pattern.
+            let as_i64x2 = bcx.ins().bitcast(types::I64X2, mem.guest_flags, pattern);
+            bcx.ins().extractlane(as_i64x2, 0)
+        }
+        (CopyUnit::Bytes8, InlineCopySrc::Move { src_host }) => {
+            let sp = bcx.ins().iadd(src_host, off);
+            bcx.ins().load(types::I64, mem.guest_flags, sp, 0)
+        }
+    };
+    bcx.ins().store(mem.guest_flags, value, dp, 0);
 }
 
 fn stos_splat_pattern(
@@ -3814,37 +4277,23 @@ fn lower_string(
     gpr_loaded: &mut [bool; 16],
     mem: &mut MemEnv,
 ) -> Result<Value, String> {
-    let size = string_op_size(instr).ok_or("string size")?;
-    let (op, size) = match instr.mnemonic() {
-        Mnemonic::Stosb | Mnemonic::Stosw | Mnemonic::Stosd | Mnemonic::Stosq => (0_u64, size),
-        Mnemonic::Movsb | Mnemonic::Movsw | Mnemonic::Movsq => (1, size),
-        Mnemonic::Movsd => (1, 4), // string form only reaches here
-        Mnemonic::Lodsb | Mnemonic::Lodsd | Mnemonic::Lodsq => (2, size),
-        Mnemonic::Scasb | Mnemonic::Scasw | Mnemonic::Scasd | Mnemonic::Scasq => (3, size),
-        Mnemonic::Cmpsb | Mnemonic::Cmpsw | Mnemonic::Cmpsd | Mnemonic::Cmpsq => (4, size),
-        other => return Err(format!("string op {other:?}")),
-    };
+    let raw_size = string_op_size(instr).ok_or("string size")?;
+    let mnemonic = instr.mnemonic();
+    let (kind, size) = StringOpKind::from_mnemonic(mnemonic, raw_size)
+        .ok_or_else(|| format!("string op {mnemonic:?}"))?;
 
     // Phase 5.5: dual-path inline for small REP MOVS/STOS when helpers available.
-    if matches!(op, 0 | 1)
+    if matches!(kind, StringOpKind::Stos | StringOpKind::Movs)
         && string_inline_enabled()
         && mem.host_span_ref.is_some()
-        && let Some(rip) = try_lower_inline_rep(bcx, instr, gpr, rflags, gpr_loaded, mem, op, size)
+        && let Some(rip) =
+            try_lower_inline_rep(bcx, instr, gpr, rflags, gpr_loaded, mem, kind, size)
     {
         return Ok(rip);
     }
 
     let string_ref = mem.string_ref.ok_or("string helper missing")?;
-    let mut flags = 0_u64;
-    if instr.has_rep_prefix() || instr.has_repe_prefix() || instr.has_repne_prefix() {
-        flags |= 1;
-    }
-    if instr.has_repe_prefix() {
-        flags |= 2;
-    }
-    if instr.has_repne_prefix() {
-        flags |= 4;
-    }
+    let flags = exec::RepPrefix::from_instr(instr).to_abi();
 
     // Flush SSA GPRs + flags into JitCtx for the host helper.
     for i in 0..16 {
@@ -3857,7 +4306,7 @@ fn lower_string(
     let rflags_ptr = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_RFLAGS));
     bcx.ins().store(mem.flags, *rflags, rflags_ptr, 0);
 
-    let op_v = iconst_u64(bcx, op);
+    let op_v = iconst_u64(bcx, kind.to_abi());
     let size_v = iconst_u64(bcx, u64::from(size));
     let flags_v = iconst_u64(bcx, flags);
     let ip_v = iconst_u64(bcx, instr.ip());
@@ -4797,9 +5246,15 @@ fn hoisted_pin_probe(
 }
 
 /// Zero-extend a loaded integer of `size` bytes to i64.
-fn load_guest_bytes(bcx: &mut FunctionBuilder<'_>, host: Value, size: u32) -> Value {
-    // Sticky TLB guarantees a mapped host page; trust the pointer.
-    let flags = MemFlagsData::trusted();
+///
+/// `flags` should be the caller's guest-data alias-tagged flags (`mem.guest_flags`)
+/// so this load doesn't alias JitCtx metadata for Cranelift's alias analysis.
+fn load_guest_bytes(
+    bcx: &mut FunctionBuilder<'_>,
+    flags: MemFlagsData,
+    host: Value,
+    size: u32,
+) -> Value {
     match size {
         1 => {
             let v = bcx.ins().load(types::I8, flags, host, 0);
@@ -4817,8 +5272,13 @@ fn load_guest_bytes(bcx: &mut FunctionBuilder<'_>, host: Value, size: u32) -> Va
     }
 }
 
-fn store_guest_bytes(bcx: &mut FunctionBuilder<'_>, host: Value, size: u32, value: Value) {
-    let flags = MemFlagsData::trusted();
+fn store_guest_bytes(
+    bcx: &mut FunctionBuilder<'_>,
+    flags: MemFlagsData,
+    host: Value,
+    size: u32,
+    value: Value,
+) {
     match size {
         1 => {
             let v = bcx.ins().ireduce(types::I8, value);
@@ -4859,7 +5319,7 @@ fn call_load(
     // range sits in the stack pin — emit a bare host load (no bounds IR).
     if let Some(super_s) = mem.super_stack {
         let host = bcx.ins().iadd(super_s.bias, addr);
-        return Ok(load_guest_bytes(bcx, host, size));
+        return Ok(load_guest_bytes(bcx, mem.guest_flags, host, size));
     }
 
     // CFG-ordered probes (not `select`).
@@ -4876,7 +5336,7 @@ fn call_load(
         bcx.ins().brif(ok, hit, &[], miss, &[]);
         bcx.switch_to_block(hit);
         bcx.seal_block(hit);
-        let v = load_guest_bytes(bcx, host, size);
+        let v = load_guest_bytes(bcx, mem.guest_flags, host, size);
         bcx.ins().jump(merge, &[BlockArg::Value(v)]);
         bcx.switch_to_block(miss);
         bcx.seal_block(miss);
@@ -4889,7 +5349,7 @@ fn call_load(
         bcx.ins().brif(ok, hit, &[], miss, &[]);
         bcx.switch_to_block(hit);
         bcx.seal_block(hit);
-        let v = load_guest_bytes(bcx, host, size);
+        let v = load_guest_bytes(bcx, mem.guest_flags, host, size);
         bcx.ins().jump(merge, &[BlockArg::Value(v)]);
         bcx.switch_to_block(miss);
         bcx.seal_block(miss);
@@ -4902,7 +5362,7 @@ fn call_load(
         bcx.ins().brif(ok, hit, &[], miss, &[]);
         bcx.switch_to_block(hit);
         bcx.seal_block(hit);
-        let v = load_guest_bytes(bcx, host, size);
+        let v = load_guest_bytes(bcx, mem.guest_flags, host, size);
         bcx.ins().jump(merge, &[BlockArg::Value(v)]);
         bcx.switch_to_block(miss);
         bcx.seal_block(miss);
@@ -4960,7 +5420,7 @@ fn call_store(
     // Block-wide super-fast path (see `call_load`).
     if let Some(super_s) = mem.super_stack {
         let host = bcx.ins().iadd(super_s.bias, addr);
-        store_guest_bytes(bcx, host, size, value);
+        store_guest_bytes(bcx, mem.guest_flags, host, size, value);
         return Ok(());
     }
 
@@ -4974,7 +5434,7 @@ fn call_store(
         bcx.ins().brif(ok, hit, &[], miss, &[]);
         bcx.switch_to_block(hit);
         bcx.seal_block(hit);
-        store_guest_bytes(bcx, host, size, value);
+        store_guest_bytes(bcx, mem.guest_flags, host, size, value);
         bcx.ins().jump(merge, &[]);
         bcx.switch_to_block(miss);
         bcx.seal_block(miss);
@@ -4987,7 +5447,7 @@ fn call_store(
         bcx.ins().brif(ok, hit, &[], miss, &[]);
         bcx.switch_to_block(hit);
         bcx.seal_block(hit);
-        store_guest_bytes(bcx, host, size, value);
+        store_guest_bytes(bcx, mem.guest_flags, host, size, value);
         bcx.ins().jump(merge, &[]);
         bcx.switch_to_block(miss);
         bcx.seal_block(miss);
@@ -5000,7 +5460,7 @@ fn call_store(
         bcx.ins().brif(ok, hit, &[], miss, &[]);
         bcx.switch_to_block(hit);
         bcx.seal_block(hit);
-        store_guest_bytes(bcx, host, size, value);
+        store_guest_bytes(bcx, mem.guest_flags, host, size, value);
         bcx.ins().jump(merge, &[]);
         bcx.switch_to_block(miss);
         bcx.seal_block(miss);
@@ -6078,4 +6538,74 @@ fn flags_sub(
     let af_cond = bcx.ins().icmp_imm(IntCC::NotEqual, af_b, 0);
     let af = select_flag(bcx, af_cond, rflags::AF);
     bcx.ins().bor(f, af)
+}
+
+#[cfg(test)]
+mod float_abi_tests {
+    use super::FloatBinOp;
+
+    const ALL: [FloatBinOp; 4] = [
+        FloatBinOp::Add,
+        FloatBinOp::Sub,
+        FloatBinOp::Mul,
+        FloatBinOp::Div,
+    ];
+
+    /// The lowering encodes the op into an `extern "C"` u64 that
+    /// `wie_f32_binop` / `wie_f64_binop` decode. A mismatch would silently
+    /// compute a different arithmetic operation.
+    #[test]
+    fn float_binop_abi_roundtrips() {
+        for op in ALL {
+            assert_eq!(FloatBinOp::try_from(op.to_abi()), Ok(op), "{op:?}");
+        }
+    }
+
+    #[test]
+    fn float_binop_abi_values_are_stable() {
+        assert_eq!(FloatBinOp::Add.to_abi(), 0);
+        assert_eq!(FloatBinOp::Sub.to_abi(), 1);
+        assert_eq!(FloatBinOp::Mul.to_abi(), 2);
+        assert_eq!(FloatBinOp::Div.to_abi(), 3);
+    }
+
+    #[test]
+    fn float_binop_rejects_out_of_range() {
+        for raw in [4_u64, 5, u64::MAX] {
+            assert_eq!(FloatBinOp::try_from(raw), Err(()), "raw={raw}");
+        }
+    }
+
+    /// Guards the helper decode end-to-end: each opcode must produce the
+    /// arithmetic it names, not the `add` the old `_ =>` arm fell back to.
+    #[test]
+    fn float_helpers_compute_the_named_op() {
+        let (a32, b32) = (8.0_f32, 2.0_f32);
+        let enc = |x: f32| u64::from(x.to_bits());
+        let dec32 = |x: u64| f32::from_bits(u32::try_from(x & 0xffff_ffff).unwrap_or(0));
+        for (op, want) in [
+            (FloatBinOp::Add, 10.0_f32),
+            (FloatBinOp::Sub, 6.0),
+            (FloatBinOp::Mul, 16.0),
+            (FloatBinOp::Div, 4.0),
+        ] {
+            let got = dec32(super::wie_f32_binop(op.to_abi(), enc(a32), enc(b32)));
+            assert!((got - want).abs() < f32::EPSILON, "{op:?}: {got} != {want}");
+        }
+
+        let (a64, b64) = (8.0_f64, 2.0_f64);
+        for (op, want) in [
+            (FloatBinOp::Add, 10.0_f64),
+            (FloatBinOp::Sub, 6.0),
+            (FloatBinOp::Mul, 16.0),
+            (FloatBinOp::Div, 4.0),
+        ] {
+            let got = f64::from_bits(super::wie_f64_binop(
+                op.to_abi(),
+                a64.to_bits(),
+                b64.to_bits(),
+            ));
+            assert!((got - want).abs() < f64::EPSILON, "{op:?}: {got} != {want}");
+        }
+    }
 }

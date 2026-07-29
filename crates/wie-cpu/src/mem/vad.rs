@@ -57,7 +57,7 @@ pub struct VadNode {
     /// Reservation size in bytes (page-aligned; typically granularity-aligned).
     pub size: u64,
     /// `flProtect` at reserve / create time.
-    pub allocation_protect: u32,
+    pub allocation_protect: super::protect::PageProtect,
     /// Private vs image.
     pub mem_type: MemType,
     /// When true, `MEM_RELEASE` should drop host storage for the full span.
@@ -292,7 +292,7 @@ mod tests {
         t.insert(VadNode {
             allocation_base: 0x1_0000,
             size: 0x1_0000,
-            allocation_protect: 0x04,
+            allocation_protect: crate::mem::protect::PageProtect::ReadWrite,
             mem_type: MemType::Private,
             owns_host: true,
         })
@@ -307,7 +307,7 @@ mod tests {
         t.insert(VadNode {
             allocation_base: 0x1_0000,
             size: 0x2_0000,
-            allocation_protect: 0x04,
+            allocation_protect: crate::mem::protect::PageProtect::ReadWrite,
             mem_type: MemType::Private,
             owns_host: true,
         })
@@ -316,7 +316,7 @@ mod tests {
             t.insert(VadNode {
                 allocation_base: 0x2_0000,
                 size: 0x1_0000,
-                allocation_protect: 0x04,
+                allocation_protect: crate::mem::protect::PageProtect::ReadWrite,
                 mem_type: MemType::Private,
                 owns_host: true,
             })
@@ -337,7 +337,7 @@ mod tests {
         t.insert(VadNode {
             allocation_base: 0x0000_0001_0000_0000,
             size: 0x1_0000,
-            allocation_protect: 0x04,
+            allocation_protect: crate::mem::protect::PageProtect::ReadWrite,
             mem_type: MemType::Private,
             owns_host: true,
         })

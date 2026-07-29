@@ -3,8 +3,8 @@
 use crate::exec::{self, HookWindow, StepResult};
 use crate::mem::{GuestMemory, GuestRegion};
 use crate::regs::RegFile;
-use crate::{CodeHookOutcome, InvalidMemoryAccess};
-use crate::{CpuEngine, CpuError, RunUntilHook};
+use crate::{CodeHookOutcome, CpuError, InvalidMemoryAccess, RwxPerms};
+use crate::{CpuEngine, RunUntilHook};
 use std::sync::{Arc, RwLock};
 
 fn lock_rd<T>(m: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
@@ -167,7 +167,7 @@ impl IcedCpu {
 }
 
 impl CpuEngine for IcedCpu {
-    fn mem_map(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
+    fn mem_map(&mut self, address: u64, size: usize, perms: RwxPerms) -> Result<(), CpuError> {
         lock_wr(&self.mem).map(address, size, perms)
     }
 
@@ -181,6 +181,27 @@ impl CpuEngine for IcedCpu {
 
     fn host_span(&mut self, address: u64, len: usize, write: bool) -> Option<*mut u8> {
         lock_rd(&self.mem).host_span(address, len, write)
+    }
+
+    fn host_slice(&self, address: u64, len: usize) -> Option<&[u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        let ptr = lock_rd(&self.mem).host_span(address, len, false)?;
+        // SAFETY: `host_span` validated `len` readable bytes in one arena. The
+        // mmap arena outlives the read guard, and the returned lifetime is tied
+        // to `&self`, so the borrow checker rules out any `&mut self` unmapping
+        // while the slice is alive.
+        #[expect(unsafe_code)]
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    fn mem_copy(&mut self, dst: u64, src: u64, len: usize) -> bool {
+        lock_rd(&self.mem).mem_copy(dst, src, len)
+    }
+
+    fn mem_fill(&mut self, address: u64, byte: u8, len: usize) -> bool {
+        lock_rd(&self.mem).mem_fill(address, byte, len)
     }
 
     fn mem_generation(&self) -> u64 {
@@ -214,7 +235,12 @@ impl CpuEngine for IcedCpu {
         lock_rd(&self.mem).virtual_query(addr)
     }
 
-    fn mem_map_image(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
+    fn mem_map_image(
+        &mut self,
+        address: u64,
+        size: usize,
+        perms: RwxPerms,
+    ) -> Result<(), CpuError> {
         lock_wr(&self.mem).map_image(address, size, perms)
     }
 
@@ -241,7 +267,7 @@ impl CpuEngine for IcedCpu {
         &mut self,
         hook_begin: u64,
         hook_end: u64,
-        stop_bitmap: Vec<u8>,
+        stop_bitmap: std::sync::Arc<[u8]>,
     ) -> Result<(), CpuError> {
         let range_len = hook_end.saturating_sub(hook_begin).saturating_add(1);
         let expected_bytes = usize::try_from(range_len).unwrap_or(usize::MAX).div_ceil(8);
@@ -298,6 +324,7 @@ impl CpuEngine for IcedCpu {
                         },
                         invalid_memory: InvalidMemoryAccess {
                             hit: false,
+                            exception_code: 0,
                             access_type: 0,
                             address: 0,
                             size: 0,
@@ -314,12 +341,16 @@ impl CpuEngine for IcedCpu {
                         },
                         invalid_memory: InvalidMemoryAccess {
                             hit: true,
+                            exception_code: crate::exception_code::ACCESS_VIOLATION,
                             access_type: inv.access_type,
                             address: inv.address,
                             size: inv.size,
                             value: inv.value,
                         },
                     });
+                }
+                Err(CpuError::DivideByZero(rip)) => {
+                    return Err(CpuError::DivideByZero(rip));
                 }
                 Err(e) => {
                     let trace = self.rip_trace_vec();
@@ -361,6 +392,7 @@ impl CpuEngine for IcedCpu {
             },
             invalid_memory: InvalidMemoryAccess {
                 hit: false,
+                exception_code: 0,
                 access_type: 0,
                 address: 0,
                 size: 0,

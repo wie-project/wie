@@ -243,14 +243,69 @@ pub fn dispatch_exception_with_payload(
     begin_or_finish(engine, state, &handler, steps, payload)
 }
 
+/// Dispatch a hardware fault (access violation, divide-by-zero) through the
+/// guest SEH handler chain.
+///
+/// Captures the thread context at the fault point, builds an `EXCEPTION_RECORD`
+/// in guest memory so filter expressions can inspect it via `GetExceptionCode`,
+/// and reuses the existing two-pass search + unwind machinery.
+///
+/// Returns `Ok(WinApiHandlerResult)` when a handler is found and the guest can
+/// continue. Returns an error / `ExitThread` control signal when the exception
+/// is unhandled.
+pub fn dispatch_hardware_fault(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+    exception_code: u32,
+    fault_address: u64,
+) -> Result<WinApiHandlerResult> {
+    let tctx = engine.snapshot_thread_context();
+    let throw_rsp = tctx.gpr.get(4).copied().unwrap_or(0);
+    let throw_rip = tctx.rip;
+
+    // Build a minimal EXCEPTION_RECORD on the guest stack so that
+    // __except filter expressions can inspect it via GetExceptionCode().
+    //
+    // x64 EXCEPTION_RECORD layout (80 bytes):
+    //   +0x00 ExceptionCode        (u32)
+    //   +0x04 ExceptionFlags       (u32)  — 1 = noncontinuable
+    //   +0x08 ExceptionRecord      (u64)  — chain
+    //   +0x10 ExceptionAddress     (u64)  — RIP at fault
+    //   +0x18 NumberParameters     (u32)
+    //   +0x20 ExceptionInformation (u64 × 15)
+    //
+    // For ACCESS_VIOLATION:
+    //   param[0] = 0 (read) or 1 (write)
+    //   param[1] = faulting address
+    let rec_va = throw_rsp.saturating_sub(128);
+    let mut rec = [0u8; 80];
+    rec[0..4].copy_from_slice(&exception_code.to_le_bytes());
+    rec[4..8].copy_from_slice(&1_u32.to_le_bytes()); // noncontinuable
+    rec[8..16].copy_from_slice(&0_u64.to_le_bytes()); // no chain
+    rec[16..24].copy_from_slice(&fault_address.to_le_bytes());
+    rec[24..28].copy_from_slice(&2_u32.to_le_bytes()); // NumberParameters
+    rec[32..40].copy_from_slice(&0_u64.to_le_bytes()); // param[0] = 0 (read)
+    rec[40..48].copy_from_slice(&fault_address.to_le_bytes()); // param[1] = addr
+    drop(engine.mem_write(rec_va, &rec));
+
+    // Build an empty ThrowPayload — no C++ type info for hardware faults.
+    // The __except filter is matched by `adjectives & 8 != 0` (frame handler).
+    let payload = ThrowPayload::default();
+
+    let (handler, steps) = search_and_plan(engine, state, &tctx, throw_rip, throw_rsp, payload)?;
+    begin_or_finish(engine, state, &handler, steps, payload)
+}
+
 /// Continue a pending SEH sequence after a guest UnwindMap action or catch funclet returns.
 pub fn continue_pending(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
+    let tid = state.kernel.threads.current_tid();
     let mut pending = state
+        .kernel
         .seh_pending
-        .take()
+        .remove(&tid)
         .ok_or_else(|| anyhow::anyhow!("SEH continue trampoline with no pending work"))?;
 
     if pending.expect_catch_return {
@@ -258,7 +313,7 @@ pub fn continue_pending(
         let cont = engine.read_rax()?;
         pending.expect_catch_return = false;
         if cont == 0 || cont >= 0x8000_0000_0000 {
-            state.seh_pending = Some(pending);
+            state.kernel.seh_pending.insert(tid, pending);
             return Err(anyhow::anyhow!(
                 "MSVC catch funclet returned invalid continuation RAX={cont:#x}"
             ));
@@ -276,7 +331,7 @@ pub fn continue_pending(
             });
         }
         // Unusual: more steps after catch — keep going.
-        state.seh_pending = Some(pending);
+        state.kernel.seh_pending.insert(tid, pending);
         return run_next_step(engine, state);
     }
 
@@ -286,11 +341,11 @@ pub fn continue_pending(
             remaining = pending.steps.len(),
             "seh cleanup _Unwind_Resume → next step"
         );
-        state.seh_pending = Some(pending);
+        state.kernel.seh_pending.insert(tid, pending);
         return run_next_step(engine, state);
     }
 
-    state.seh_pending = Some(pending);
+    state.kernel.seh_pending.insert(tid, pending);
     run_next_step(engine, state)
 }
 
@@ -298,9 +353,11 @@ pub fn continue_pending(
 /// should drain the next [`SehPending`] step instead of a generic forced unwind.
 #[must_use]
 pub fn has_cleanup_resume(state: &WinApiState) -> bool {
+    let tid = state.kernel.threads.current_tid();
     state
+        .kernel
         .seh_pending
-        .as_ref()
+        .get(&tid)
         .is_some_and(|p| p.expect_cleanup_resume && !p.steps.is_empty())
 }
 
@@ -526,6 +583,13 @@ fn search_and_plan(
             break;
         }
     }
+    tracing::warn!(
+        throw_rip,
+        frames = MAX_FRAMES,
+        obj = payload.exception_object,
+        gcc = payload.gcc_throw,
+        "seh: no handler found"
+    );
     Err(anyhow::anyhow!(
         "RaiseException: no handler found (throw_rip={throw_rip:#x}, \
          pExceptionObject={:#x})",
@@ -571,11 +635,15 @@ fn begin_or_finish(
         });
     }
 
-    state.seh_pending = Some(SehPending {
-        steps: action_steps,
-        expect_catch_return: false,
-        expect_cleanup_resume: false,
-    });
+    let tid = state.kernel.threads.current_tid();
+    state.kernel.seh_pending.insert(
+        tid,
+        SehPending {
+            steps: action_steps,
+            expect_catch_return: false,
+            expect_cleanup_resume: false,
+        },
+    );
     run_next_step(engine, state)
 }
 
@@ -583,13 +651,15 @@ fn run_next_step(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
+    let tid = state.kernel.threads.current_tid();
     let pending = state
+        .kernel
         .seh_pending
-        .as_mut()
+        .get_mut(&tid)
         .ok_or_else(|| anyhow::anyhow!("SEH run_next_step with empty pending"))?;
 
     if pending.steps.is_empty() {
-        state.seh_pending = None;
+        state.kernel.seh_pending.remove(&tid);
         return Err(anyhow::anyhow!("SEH pending queue empty"));
     }
 
@@ -669,7 +739,7 @@ fn run_next_step(
             // Drop the borrow before clearing pending on the terminal jump.
             let cleanup_resume = more;
             if !more {
-                state.seh_pending = None;
+                state.kernel.seh_pending.remove(&tid);
             }
             let mut tctx = engine.snapshot_thread_context();
             tctx.gpr = gpr;
@@ -802,7 +872,7 @@ fn unwind_one(
     state: &WinApiState,
     current: &UnwindContext,
 ) -> Result<(Unwound, Option<u32>)> {
-    let Some(entry) = exception::lookup_function_entry(&state.sync, current.rip) else {
+    let Some(entry) = exception::lookup_function_entry(&state.kernel.sync, current.rip) else {
         let mut buf = [0u8; 8];
         read_mem(current.rsp, &mut buf)
             .map_err(|()| anyhow::anyhow!("leaf unwind: stack unreadable at {:#x}", current.rsp))?;
@@ -965,6 +1035,52 @@ fn resolve_landing_pad(
                 return Some(ResolvedPad {
                     landing_pad: c.landing_pad,
                     msvc: Some(c),
+                    switch_value: None,
+                });
+            }
+        }
+    }
+
+    // Clang `__except` format (llvm-mingw with -fms-extensions).
+    // Scope table format: [count: u32, entries...]
+    // Each entry: [try_low: u32, try_high: u32, filter: u32, handler: u32]
+    //   filter == 1 (EXCEPTION_EXECUTE_HANDLER) → always match (like __except(1))
+    //   filter > 1 → RVA of filter function (not yet supported)
+    for &cand in &candidates {
+        let mut buf = [0u8; 4];
+        if read_mem(cand, &mut buf).is_err() {
+            continue;
+        }
+        let count = u32::from_le_bytes(buf);
+        if count == 0 || count > 64 {
+            continue;
+        }
+        // Read the first entry to check if format looks like Clang __except
+        let mut entry_buf = [0u8; 16];
+        if read_mem(cand.wrapping_add(4), &mut entry_buf).is_err() {
+            continue;
+        }
+        let try_low = u32::from_le_bytes(entry_buf[..4].try_into().unwrap_or([0u8; 4]));
+        let try_high = u32::from_le_bytes(entry_buf[4..8].try_into().unwrap_or([0u8; 4]));
+        let filter = u32::from_le_bytes(entry_buf[8..12].try_into().unwrap_or([0u8; 4]));
+        let handler = u32::from_le_bytes(entry_buf[12..16].try_into().unwrap_or([0u8; 4]));
+        // Sanity check: try range should be within the function, filter should be 1 or a valid RVA
+        if try_low >= try_high {
+            continue;
+        }
+        let func_start_rva =
+            u32::try_from(func_start.saturating_sub(unwound.image_base)).unwrap_or(0);
+        let func_end_rva = u32::try_from(func_end.saturating_sub(unwound.image_base)).unwrap_or(0);
+        if try_low < func_start_rva || try_high > func_end_rva {
+            continue;
+        }
+        // __except(1) always matches; otherwise check if control_pc falls in try range
+        if filter == 1 {
+            let landing_pad = unwound.image_base.wrapping_add(u64::from(handler));
+            if in_image(landing_pad) {
+                return Some(ResolvedPad {
+                    landing_pad,
+                    msvc: None,
                     switch_value: None,
                 });
             }

@@ -4,36 +4,24 @@
 //! patched to fake VAs and dispatched here.  Simple stubs suffice for
 //! most functions since WIE manages the runtime environment directly.
 
-use crate::{WinApiHandlerResult, WinApiState};
+use crate::{HandlerContext, WinApiHandlerResult};
 use anyhow::{Context, Result};
 
 /// Dispatch `libwinpthread-1.dll` exports.  All functions return 0 (success).
-pub fn dispatch_pthread(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    name: &str,
-) -> Result<WinApiHandlerResult> {
-    let _ = name; // unused — all pthread stubs return success
-    let return_address = engine
-        .return_from_win64_api(0)
-        .context("failed to return from pthread function")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 0,
-    })
+pub fn dispatch_pthread(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiHandlerResult> {
+    crate::pthread::dispatch(ctx, name)
 }
 
 /// Dispatch `libstdc++-6.dll` exports (C++ runtime).
-pub fn dispatch_stdcpp(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-    name: &str,
-) -> Result<WinApiHandlerResult> {
+pub fn dispatch_stdcpp(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let n = name.to_ascii_lowercase();
     match n.as_str() {
         // __cxa_allocate_exception(size) → guest heap alloc
         "__cxa_allocate_exception" => {
             let size = engine.read_rcx()?;
-            let addr = state.heap.alloc_coherent(engine, size.max(1));
+            let addr = state.heap_state.heap.alloc_coherent(engine, size.max(1));
             let return_address = engine
                 .return_from_win64_api(addr)
                 .context("failed to return from __cxa_allocate_exception")?;
@@ -46,7 +34,7 @@ pub fn dispatch_stdcpp(
         "__cxa_free_exception" => {
             let ptr = engine.read_rcx()?;
             if ptr != 0 {
-                state.heap.free_coherent(engine, ptr);
+                state.heap_state.heap.free_coherent(engine, ptr);
             }
             let return_address = engine
                 .return_from_win64_api(0)
@@ -103,7 +91,7 @@ pub fn dispatch_stdcpp(
 
             // Set RCX to point to the record and dispatch.
             engine.write_rcx(rec)?;
-            crate::kernel32::handle_raise_exception(engine, state)
+            crate::kernel32::handle_raise_exception(ctx)
         }
         // Generic fallback: stub (return success).
         _ => {

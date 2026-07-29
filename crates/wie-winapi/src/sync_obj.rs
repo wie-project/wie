@@ -483,10 +483,22 @@ impl CsWaitQueue {
         );
     }
 
-    /// Preferred park for contended CS: yield, then brief condvar wait.
+    /// Preferred park for contended CS: short exponential backoff yielding,
+    /// then a brief condvar wait.
+    ///
+    /// Was a fixed 16× `yield_now` spin before the condvar wait, which burns
+    /// CPU under contention with many host threads. Modern schedulers punish
+    /// long yield spins; a bounded backoff (2, 4, 8 yields) covers the "peer
+    /// unlocks immediately" case without the same cost, then falls through
+    /// to `wait_ms(1)` for genuine contention.
     pub fn park_brief(&self) {
-        for _ in 0..16 {
-            std::thread::yield_now();
+        for iters in [2_u32, 4, 8] {
+            for _ in 0..iters {
+                std::thread::yield_now();
+            }
+            // No cheap ownership signal to break early; the yields simply give
+            // the current CS owner a scheduling slot to Leave. If they haven't
+            // released after 14 yields (2+4+8), fall through to condvar wait.
         }
         self.wait_ms(1);
     }

@@ -19,9 +19,21 @@ pub fn strip_extended_prefix(path: &str) -> &str {
 
 #[must_use]
 pub fn normalize_windows_path_separators(path: &str) -> String {
-    path.chars()
-        .map(|character| if character == '/' { '\\' } else { character })
-        .collect()
+    normalize_windows_path_separators_cow(path).into_owned()
+}
+
+/// Cow-returning normaliser: borrows when the input contains no `/`, allocates
+/// only when a real replacement is needed. Hot on VFS translation.
+#[must_use]
+pub fn normalize_windows_path_separators_cow(path: &str) -> std::borrow::Cow<'_, str> {
+    if path.bytes().all(|b| b != b'/') {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    let mut out = String::with_capacity(path.len());
+    for character in path.chars() {
+        out.push(if character == '/' { '\\' } else { character });
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 #[must_use]
@@ -138,11 +150,54 @@ fn looks_like_drive_relative(path: &str) -> bool {
 }
 
 /// Case-insensitive full path equality (ASCII fold).
+///
+/// Fast path: when both inputs are already normalised (no `.`/`..` segments,
+/// no `//` runs, no forward slashes), skip the two normalise + to_lowercase
+/// allocations and compare byte-wise with `eq_ignore_ascii_case`. The full
+/// path stays correct because `normalize_windows_path_components` on an
+/// already-normalised input returns the input verbatim.
 #[must_use]
 pub fn paths_equal_ci(a: &str, b: &str) -> bool {
-    let na = normalize_windows_path_components(a).to_ascii_lowercase();
-    let nb = normalize_windows_path_components(b).to_ascii_lowercase();
-    na == nb
+    if is_already_normalised(a) && is_already_normalised(b) {
+        return a.eq_ignore_ascii_case(b);
+    }
+    let na = normalize_windows_path_components(a);
+    let nb = normalize_windows_path_components(b);
+    na.eq_ignore_ascii_case(&nb)
+}
+
+#[inline]
+fn is_already_normalised(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if bytes.contains(&b'/') {
+        return false;
+    }
+    // Look for `\\` mid-path (leading `\\?\` extended prefix is handled elsewhere).
+    // Also reject any `\.\`, `\..\`, or a trailing `\.`, `\..`.
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes.get(i) == Some(&b'\\') {
+            match bytes.get(i.saturating_add(1)) {
+                Some(&b'\\') if i > 0 => return false, // mid-path `\\`
+                Some(&b'.') => {
+                    let after = bytes.get(i.saturating_add(2));
+                    match after {
+                        None | Some(&b'\\') => return false, // `\.` or `\.\`
+                        Some(&b'.') => {
+                            let after2 = bytes.get(i.saturating_add(3));
+                            if matches!(after2, None | Some(&b'\\')) {
+                                return false; // `\..` or `\..\`
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        i = i.saturating_add(1);
+    }
+    true
 }
 
 /// Basename after last `\` or `/`.
@@ -196,23 +251,28 @@ pub fn split_find_pattern(full_pattern: &str) -> (String, String) {
 /// Simple case-insensitive `*` / `?` wildcard match (Win32-ish, not full DOS 8.3).
 #[must_use]
 pub fn wildcard_match(pattern: &str, name: &str) -> bool {
-    let pat: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
-    let text: Vec<char> = name.to_ascii_lowercase().chars().collect();
-    match_glob(&pat, &text)
+    // Byte-wise ASCII fold; skips two `String` + two `Vec<char>` allocations
+    // that the `.to_ascii_lowercase()` / `.chars().collect()` chain paid per call.
+    match_glob_bytes(pattern.as_bytes(), name.as_bytes())
 }
 
-fn match_glob(pat: &[char], text: &[char]) -> bool {
+fn match_glob_bytes(pat: &[u8], text: &[u8]) -> bool {
     let mut pi = 0_usize;
     let mut ti = 0_usize;
     let mut star_pi: Option<usize> = None;
     let mut star_ti = 0_usize;
     while ti < text.len() {
-        let pat_ch = pat.get(pi).copied();
-        let text_ch = text.get(ti).copied();
-        if pat_ch.is_some_and(|p| p == '?' || Some(p) == text_ch) {
+        let pat_b = pat.get(pi).copied();
+        let text_b = text.get(ti).copied();
+        let matches = match (pat_b, text_b) {
+            (Some(b'?'), Some(_)) => true,
+            (Some(p), Some(t)) => p.eq_ignore_ascii_case(&t),
+            _ => false,
+        };
+        if matches {
             pi = pi.saturating_add(1);
             ti = ti.saturating_add(1);
-        } else if pat_ch == Some('*') {
+        } else if pat_b == Some(b'*') {
             star_pi = Some(pi);
             star_ti = ti;
             pi = pi.saturating_add(1);
@@ -224,7 +284,7 @@ fn match_glob(pat: &[char], text: &[char]) -> bool {
             return false;
         }
     }
-    while pat.get(pi) == Some(&'*') {
+    while pat.get(pi) == Some(&b'*') {
         pi = pi.saturating_add(1);
     }
     pi == pat.len()

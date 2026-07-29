@@ -11,6 +11,90 @@ pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 pub const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
 pub const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 
+// ── Host stat cache ────────────────────────────────────────────────────
+//
+// A guest file probe typically costs 3-4 real `stat()` syscalls: 7-Zip does
+// `GetFileAttributes` → `CreateFile` → `GetFileInformationByHandle` →
+// `CloseHandle` per archive member, and the size-threshold check in
+// `allocate_open_file_ex` adds another. On a wide directory tree that
+// dominates scan time.
+//
+// Two independent guards keep the cache honest:
+//
+// 1. **Mutation epoch** — every mutating VFS entry point bumps
+//    [`FS_EPOCH`]. A cache entry recorded at an older epoch is discarded,
+//    so writes *we* perform are never masked by a stale hit. This is exact,
+//    not heuristic.
+// 2. **Wall-clock TTL** — bounds staleness w.r.t. mutations made by other
+//    host processes, which we cannot observe. Deliberately short: the
+//    3-4 stats inside one guest API sequence land microseconds apart, so a
+//    small TTL captures the whole win while keeping externally-visible
+//    staleness under [`STAT_TTL`].
+//
+// Prior behaviour also had no cross-process guarantee — each `stat()` was a
+// point-in-time snapshot — so this narrows, rather than introduces, a race.
+
+/// Global filesystem mutation counter; bumped by every mutating entry point.
+static FS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Max age of a cached stat before it is re-issued.
+const STAT_TTL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Cap on cached paths per thread; cleared wholesale on overflow (a scan that
+/// touches this many distinct paths gets no reuse from the older entries anyway).
+const STAT_CACHE_CAP: usize = 1024;
+
+#[derive(Clone)]
+struct StatCacheEntry {
+    epoch: u64,
+    at: std::time::Instant,
+    stat: PathStat,
+}
+
+thread_local! {
+    static STAT_CACHE: std::cell::RefCell<std::collections::HashMap<PathBuf, StatCacheEntry>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Invalidate every cached stat. Called by mutating entry points.
+///
+/// Uses a global epoch bump rather than a targeted eviction: mutations are
+/// rare relative to stats, and a bump is one relaxed atomic add versus
+/// having to reason about which derived paths a rename/copy touched.
+pub fn bump_fs_epoch() {
+    FS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn stat_cache_get(host: &Path) -> Option<PathStat> {
+    let epoch_now = FS_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+    STAT_CACHE.with(|c| {
+        let cache = c.borrow();
+        let entry = cache.get(host)?;
+        if entry.epoch != epoch_now || entry.at.elapsed() > STAT_TTL {
+            return None;
+        }
+        Some(entry.stat.clone())
+    })
+}
+
+fn stat_cache_put(host: &Path, stat: &PathStat) {
+    let epoch_now = FS_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+    STAT_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        if cache.len() >= STAT_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(
+            host.to_path_buf(),
+            StatCacheEntry {
+                epoch: epoch_now,
+                at: std::time::Instant::now(),
+                stat: stat.clone(),
+            },
+        );
+    });
+}
+
 /// Open fully into memory when size ≤ this (also gates guest I/O mirror).
 pub const BUFFER_SIZE_THRESHOLD: u64 = 16 * 1024 * 1024;
 
@@ -149,6 +233,15 @@ fn is_synthetic_dir(ctx: &ResolveCtx<'_>, path: &str) -> bool {
 }
 
 fn stat_host_path(host: &Path) -> PathStat {
+    if let Some(hit) = stat_cache_get(host) {
+        return hit;
+    }
+    let stat = stat_host_path_uncached(host);
+    stat_cache_put(host, &stat);
+    stat
+}
+
+fn stat_host_path_uncached(host: &Path) -> PathStat {
     match fs::metadata(host) {
         Ok(meta) if meta.is_dir() => PathStat {
             kind: PathKind::Directory,
@@ -292,6 +385,7 @@ pub fn read_all_host(path: &Path) -> std::io::Result<Vec<u8>> {
 
 /// Create parent dirs and empty file on host.
 pub fn create_host_file(path: &Path) -> std::io::Result<()> {
+    bump_fs_epoch();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -300,18 +394,22 @@ pub fn create_host_file(path: &Path) -> std::io::Result<()> {
 }
 
 pub fn mkdir_host(path: &Path) -> std::io::Result<()> {
+    bump_fs_epoch();
     fs::create_dir_all(path)
 }
 
 pub fn remove_file_host(path: &Path) -> std::io::Result<()> {
+    bump_fs_epoch();
     fs::remove_file(path)
 }
 
 pub fn remove_dir_host(path: &Path) -> std::io::Result<()> {
+    bump_fs_epoch();
     fs::remove_dir(path)
 }
 
 pub fn rename_host(from: &Path, to: &Path) -> std::io::Result<()> {
+    bump_fs_epoch();
     if let Some(parent) = to.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -319,13 +417,17 @@ pub fn rename_host(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 pub fn copy_host(from: &Path, to: &Path) -> std::io::Result<u64> {
+    bump_fs_epoch();
     if let Some(parent) = to.parent() {
         fs::create_dir_all(parent)?;
     }
     fs::copy(from, to)
 }
 
-/// Streamed read at offset from host path.
+/// Streamed read at offset from host path (one-shot open+seek+read+close).
+///
+/// Prefer [`cached_read_at`] on `Arc<Mutex<File>>` for hot loops — the one-shot
+/// form pays an `open` + `close` per call.
 pub fn host_read_at(path: &Path, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut f = File::open(path)?;
     f.seek(SeekFrom::Start(offset))?;
@@ -333,7 +435,11 @@ pub fn host_read_at(path: &Path, offset: u64, buf: &mut [u8]) -> std::io::Result
 }
 
 /// Streamed write at offset (extends file as needed).
+///
+/// Prefer [`cached_write_at`] on `Arc<Mutex<File>>` for hot loops.
 pub fn host_write_at(path: &Path, offset: u64, data: &[u8]) -> std::io::Result<()> {
+    // Writes can extend the file, so the cached size/kind is now stale.
+    bump_fs_epoch();
     let mut f = OpenOptions::new()
         .write(true)
         .create(true)
@@ -344,11 +450,61 @@ pub fn host_write_at(path: &Path, offset: u64, data: &[u8]) -> std::io::Result<(
     Ok(())
 }
 
+/// Open (or reuse a cached) `File` for read+write streaming on `path`.
+///
+/// Reuse is opportunistic: callers pool the returned `Arc<Mutex<File>>` in
+/// `FileIoState::cached_streams`, keyed by the guest-visible file handle, and
+/// drop it on `CloseHandle`. First call pays `File::open`; subsequent calls
+/// are free besides a mutex acquisition and a `seek`.
+pub fn open_stream_cached(path: &Path) -> std::io::Result<std::sync::Arc<std::sync::Mutex<File>>> {
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    Ok(std::sync::Arc::new(std::sync::Mutex::new(f)))
+}
+
+/// Read at `offset` from a cached streaming file. Returns bytes read.
+pub fn cached_read_at(
+    file: &std::sync::Arc<std::sync::Mutex<File>>,
+    offset: u64,
+    buf: &mut [u8],
+) -> std::io::Result<usize> {
+    let mut guard = file
+        .lock()
+        .map_err(|_| std::io::Error::other("cached stream mutex poisoned"))?;
+    guard.seek(SeekFrom::Start(offset))?;
+    guard.read(buf)
+}
+
+/// Write `data` at `offset` to a cached streaming file.
+pub fn cached_write_at(
+    file: &std::sync::Arc<std::sync::Mutex<File>>,
+    offset: u64,
+    data: &[u8],
+) -> std::io::Result<()> {
+    // May extend the file — invalidate cached stats.
+    bump_fs_epoch();
+    let mut guard = file
+        .lock()
+        .map_err(|_| std::io::Error::other("cached stream mutex poisoned"))?;
+    guard.seek(SeekFrom::Start(offset))?;
+    guard.write_all(data)
+}
+
+/// File length via the shared stat cache (avoids a bare `metadata` syscall).
 pub fn host_file_len(path: &Path) -> std::io::Result<u64> {
-    Ok(fs::metadata(path)?.len())
+    let stat = stat_host_path(path);
+    if stat.kind == PathKind::NotFound {
+        return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+    }
+    Ok(stat.size)
 }
 
 pub fn host_set_len(path: &Path, len: u64) -> std::io::Result<()> {
+    bump_fs_epoch();
     let f = OpenOptions::new().write(true).open(path)?;
     f.set_len(len)
 }

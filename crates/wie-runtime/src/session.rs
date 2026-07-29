@@ -322,7 +322,7 @@ fn register_layout_regions(
         RegionKind::Image,
         image_base,
         image_size,
-        wie_cpu::perm::ALL,
+        wie_cpu::RwxPerms::ALL,
     ));
     if let Some(plan) = pe_plan {
         let header_len = usize::try_from(plan.header_size).unwrap_or(0);
@@ -332,7 +332,11 @@ fn register_layout_regions(
                 RegionKind::Image,
                 image_base,
                 header_len,
-                wie_cpu::protect::rwx_from_page_protect(wie_pe::PeMapPlan::header_protect()),
+                wie_cpu::protect::PageProtect::from_win32(wie_pe::PeMapPlan::header_protect())
+                    .map_or(
+                        wie_cpu::RwxPerms::READ,
+                        wie_cpu::protect::PageProtect::to_rwx,
+                    ),
             ));
         }
         for sec in &plan.sections {
@@ -347,15 +351,18 @@ fn register_layout_regions(
                 RegionKind::Image,
                 va,
                 size,
-                wie_cpu::protect::rwx_from_page_protect(sec.final_protect),
+                wie_cpu::protect::PageProtect::from_win32(sec.final_protect).map_or(
+                    wie_cpu::RwxPerms::READ,
+                    wie_cpu::protect::PageProtect::to_rwx,
+                ),
             ));
         }
     }
 
     // Phase 4.x: pure data regions are RW (not RWX). Soft-translate W is
     // denied on executable pages; stack/heap must stay non-X for pin super path.
-    let data_rw = wie_cpu::perm::READ | wie_cpu::perm::WRITE;
-    let code_rwx = wie_cpu::perm::ALL;
+    let data_rw = wie_cpu::RwxPerms::READ_WRITE;
+    let code_rwx = wie_cpu::RwxPerms::ALL;
     let regs: [GuestRegion; 15] = [
         GuestRegion::new(
             "stack",
@@ -494,7 +501,7 @@ struct SessionInit {
     winapi_state: wie_winapi::WinApiState,
     soft_apis: SoftApiTable,
     layout: RuntimeMemoryLayout,
-    stop_bitmap: Vec<u8>,
+    stop_bitmap: Arc<[u8]>,
     shared_jit: Option<Arc<wie_cpu::JitShared>>,
     guest_mem: Option<Arc<RwLock<wie_cpu::GuestMemory>>>,
     entry_point_va: u64,
@@ -554,7 +561,7 @@ impl RuntimeSession {
     /// Publish host `last_error` into guest TEB.LastErrorValue so in-guest
     /// `GetLastError` stubs stay coherent with host-side API failures.
     fn publish_last_error_to_guest(&mut self) {
-        let err = self.process.with_mut(|_, st| st.last_error);
+        let err = self.process.with_mut(|_, st| st.process.last_error);
         if self.last_published_last_error == Some(err) {
             return;
         }
@@ -626,11 +633,14 @@ impl RuntimeSession {
                     format!("failed to plant soft API {}!{}", entry.library, entry.name)
                 })?;
         }
-        // Read the PE file once; we need the bytes for both identity and loading.
+        // Read the PE file once; parse once and reuse the parsed representation.
         let pe_bytes = std::fs::read(path)
             .with_context(|| format!("failed to read PE file: {}", path.display()))?;
-        let identity = wie_pe::pe_identity_from_bytes(path, &pe_bytes)
-            .context("failed to parse PE identity")?;
+        // Parse PE once (avoids double-parse: pe_identity_from_bytes and
+        // load_pe_direct_from_bytes both used to call PE::parse independently).
+        let pe = wie_pe::PE::parse(&pe_bytes).context("failed to parse PE image")?;
+        let identity = wie_pe::pe_identity_from_parsed(&pe, path, &pe_bytes)
+            .context("failed to extract PE identity")?;
         let image_size =
             usize::try_from(identity.size_of_image).context("size_of_image does not fit usize")?;
 
@@ -644,18 +654,19 @@ impl RuntimeSession {
         // Phase 3.3: one MEM_IMAGE arena, temporary RWX — headers/sections/IAT
         // are written directly into guest memory (no intermediate Vec<u8> buffer).
         engine
-            .mem_map_image(identity.image_base, image_size, wie_cpu::perm::ALL)
+            .mem_map_image(identity.image_base, image_size, wie_cpu::RwxPerms::ALL)
             .context("failed to map PE image memory")?;
 
-        // Load PE directly into guest memory: single PE parse, writes headers +
-        // sections + patches IAT in-place through the engine. Returns the section
+        // Load PE directly into guest memory: writes headers + sections + patches IAT
+        // in-place through the engine using the already-parsed PE. Returns the section
         // map plan too — no need to re-read the file.
         // Collect RuntimeFakeApiEntry during the resolution pass so we can skip
         // the redundant build_iat_fake_api_entries call later.
         let mut iat_entries: Vec<RuntimeFakeApiEntry> = Vec::new();
         let (image_summary, pe_map_plan, _patched_imports) = {
             let engine_ref = &mut *engine;
-            wie_pe::load_pe_direct_from_bytes(
+            wie_pe::load_pe_direct_from_parsed(
+                &pe,
                 &pe_bytes,
                 identity.image_base,
                 image_size,
@@ -706,7 +717,7 @@ impl RuntimeSession {
             .mem_map(
                 layout.fake_api_base,
                 layout.fake_api_size,
-                wie_cpu::perm::ALL,
+                wie_cpu::RwxPerms::ALL,
             )
             .context("failed to map fake API memory")?;
 
@@ -724,10 +735,10 @@ impl RuntimeSession {
             .mem_map(
                 layout.guest_io_code_base,
                 layout.guest_io_code_size,
-                wie_cpu::perm::ALL,
+                wie_cpu::RwxPerms::ALL,
             )
             .context("failed to map guest I/O code region")?;
-        let data_rw = wie_cpu::perm::READ | wie_cpu::perm::WRITE;
+        let data_rw = wie_cpu::RwxPerms::READ_WRITE;
         engine
             .mem_map(
                 layout.guest_io_table_base,
@@ -802,7 +813,7 @@ impl RuntimeSession {
             .mem_map(
                 layout.guest_heap_code_base,
                 layout.guest_heap_code_size,
-                wie_cpu::perm::ALL,
+                wie_cpu::RwxPerms::ALL,
             )
             .context("failed to map guest heap code")?;
 
@@ -817,7 +828,7 @@ impl RuntimeSession {
             .mem_map(
                 layout.guest_mbwc_code_base,
                 layout.guest_mbwc_code_size,
-                wie_cpu::perm::ALL,
+                wie_cpu::RwxPerms::ALL,
             )
             .context("failed to map guest MultiByteToWideChar code")?;
         let _guest_mbwc = crate::guest_mbwc::install_guest_mbwc(
@@ -849,25 +860,30 @@ impl RuntimeSession {
             });
         }
 
+        // Freeze once — every worker + the primary engine share this Arc
+        // instead of paying a per-thread `Vec::clone` of the fake-API bitmap.
+        let stop_bitmap: Arc<[u8]> = Arc::from(stop_bitmap.into_boxed_slice());
         engine
-            .install_runtime_hooks(layout.fake_api_base, fake_api_end, stop_bitmap.clone())
+            .install_runtime_hooks(layout.fake_api_base, fake_api_end, Arc::clone(&stop_bitmap))
             .context("failed to install persistent runtime hooks")?;
 
-        // Selective precompile: only in-guest stubs (GetLastError / CS / …).
-        // Precompiling every fake-API VA (including host-stop passthroughs and
-        // rewire jmps) spikes init peak RAM via Cranelift; hot stubs are cheap
-        // (hand-written trampolines or tiny blocks) and hit early.
+        // Selective precompile: in-guest stubs (GetLastError / CS / …) and the
+        // PE entry point so the first guest block runs compiled instead of iced.
+        // Full .text section precompile is deferred — precompiling every fake-API
+        // VA spikes init peak RAM, and precompiling large sections adds startup
+        // time disproportionate to the interpreted warmup saved.
         for entry in &fake_api_entries {
             if entry.traits.guest_stub() {
                 engine.precompile_at(entry.fake_target_va);
             }
         }
+        engine.precompile_at(image_summary.entry_point_va);
 
         engine
             .mem_map(
                 layout.stack_base,
                 layout.stack_size,
-                wie_cpu::perm::READ | wie_cpu::perm::WRITE,
+                wie_cpu::RwxPerms::READ_WRITE,
             )
             .context("failed to map entry stack memory")?;
 
@@ -891,19 +907,33 @@ impl RuntimeSession {
             .mem_map(
                 layout.teb_low_base,
                 layout.teb_low_size,
-                wie_cpu::perm::READ | wie_cpu::perm::WRITE,
+                wie_cpu::RwxPerms::READ_WRITE,
             )
             .context("failed to map fake low TEB page")?;
 
         let stack_limit = layout.stack_base;
 
         engine
-            .mem_write(0x08, &stack_top.to_le_bytes())
+            .mem_write(
+                layout.teb_low_base.wrapping_add(0x08),
+                &stack_top.to_le_bytes(),
+            )
             .context("failed to write fake TEB StackBase")?;
 
         engine
-            .mem_write(0x10, &stack_limit.to_le_bytes())
+            .mem_write(
+                layout.teb_low_base.wrapping_add(0x10),
+                &stack_limit.to_le_bytes(),
+            )
             .context("failed to write fake TEB StackLimit")?;
+
+        // TEB.Self (x64 offset 0x30) — guest PEB / TLS lookups.
+        engine
+            .mem_write(
+                layout.teb_low_base.wrapping_add(0x30),
+                &layout.teb_low_base.to_le_bytes(),
+            )
+            .context("failed to write fake TEB Self")?;
 
         // TEB.LastErrorValue (x64 offset 0x68) — guest GetLastError/SetLastError stubs.
         engine
@@ -914,17 +944,13 @@ impl RuntimeSession {
             .mem_map(
                 layout.env_data_base,
                 layout.env_data_size,
-                wie_cpu::perm::READ | wie_cpu::perm::WRITE,
+                wie_cpu::RwxPerms::READ_WRITE,
             )
             .context("failed to map entry environment data memory")?;
 
         // Guest page for UCRT FILE* cookies / CRT pointer slots (ucrt module).
         engine
-            .mem_map(
-                0x0000_0000_6800_0000,
-                0x1000,
-                wie_cpu::perm::READ | wie_cpu::perm::WRITE,
-            )
+            .mem_map(0x0000_0000_6800_0000, 0x1000, wie_cpu::RwxPerms::READ_WRITE)
             .context("failed to map guest UCRT data page")?;
         // Pre-init CRT pointer slots (filled fully after process identity is known).
         {
@@ -997,7 +1023,7 @@ impl RuntimeSession {
             .mem_map(
                 layout.process_heap_base,
                 layout.process_heap_size,
-                wie_cpu::perm::READ | wie_cpu::perm::WRITE,
+                wie_cpu::RwxPerms::READ_WRITE,
             )
             .context("failed to map fake process heap memory")?;
 
@@ -1005,7 +1031,7 @@ impl RuntimeSession {
             .mem_map(
                 layout.process_heap_shadow_base(),
                 layout.process_heap_size,
-                wie_cpu::perm::READ | wie_cpu::perm::WRITE,
+                wie_cpu::RwxPerms::READ_WRITE,
             )
             .context("failed to map fake process heap shadow memory")?;
 
@@ -1013,7 +1039,7 @@ impl RuntimeSession {
             .mem_map(
                 layout.resource_data_base,
                 layout.resource_data_size,
-                wie_cpu::perm::READ | wie_cpu::perm::WRITE,
+                wie_cpu::RwxPerms::READ_WRITE,
             )
             .context("failed to map fake resource memory")?;
 
@@ -1036,8 +1062,7 @@ impl RuntimeSession {
             module_file_name_w_ptr,
         );
 
-        let executable_file_bytes = std::fs::read(path)
-            .with_context(|| format!("failed to read executable bytes: {}", path.display(),))?;
+        let executable_file_bytes = pe_bytes.clone();
 
         let mut winapi_state = default_winapi_state(&layout, executable_file_bytes, &process)?;
 
@@ -1046,6 +1071,7 @@ impl RuntimeSession {
         {
             let ctx = wie_cpu::ThreadContext::default();
             let _ = winapi_state
+                .kernel
                 .sync
                 .register_thread(wie_winapi::PRIMARY_THREAD_ID, ctx);
         }
@@ -1066,6 +1092,7 @@ impl RuntimeSession {
                 let entries = wie_winapi::exception::parse_pdata(raw);
                 if !entries.is_empty() {
                     winapi_state
+                        .kernel
                         .sync
                         .function_tables
                         .insert(image_summary.image_base, entries);
@@ -1073,40 +1100,44 @@ impl RuntimeSession {
             }
         }
 
-        winapi_state.message_queue_idle_policy = idle_policy;
-        winapi_state.guest_io = Some(wie_winapi::GuestIoRuntimeConfig {
+        winapi_state.window_state().message_queue_idle_policy = idle_policy;
+        winapi_state.file_io.guest_io = Some(wie_winapi::GuestIoRuntimeConfig {
             table_va: guest_io_config.table_va,
             file_data_base: guest_io_config.file_data_base,
             file_data_size: guest_io_config.file_data_size,
         });
-        winapi_state.guest_file_data_next = layout.guest_file_data_base;
-        winapi_state.guest_fls_table_va = layout.guest_fls_table_base;
+        winapi_state.file_io.guest_file_data_next = layout.guest_file_data_base;
+        winapi_state.heap_state.guest_fls_table_va = layout.guest_fls_table_base;
         // Empty inject ⇒ live host stdin on ReadFile(STD_INPUT); non-empty
         // inject is deterministic and never blocks on the TTY.
-        winapi_state.stdin_mode = if options.stdin_bytes.is_empty() {
+        winapi_state.file_io.stdin_mode = if options.stdin_bytes.is_empty() {
             wie_winapi::GuestStdinMode::LiveHost
         } else {
             wie_winapi::GuestStdinMode::InjectOnly
         };
-        winapi_state.stdin_bytes = options.stdin_bytes;
-        winapi_state.stdin_cursor = 0;
+        winapi_state.file_io.stdin_bytes = options.stdin_bytes;
+        winapi_state.file_io.stdin_cursor = 0;
         winapi_state
+            .heap_state
             .heap
             .attach_guest_control(guest_heap_cfg.ctrl_va);
 
         // Set the import resolver for dynamic DLL loading.
         {
             let mut soft = soft_apis.clone();
-            winapi_state.import_resolver = Some(Box::new(move |lib, name, slot| {
-                let (va, _entry) = crate::hooks::resolve_import_fake_va(lib, name, slot, &mut soft)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                Ok(va)
-            }));
+            winapi_state.module_state.import_resolver = Some(wie_winapi::ImportResolver::new(
+                Box::new(move |lib, name, slot| {
+                    let (va, _entry) =
+                        crate::hooks::resolve_import_fake_va(lib, name, slot, &mut soft)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    Ok(va)
+                }),
+            ));
         }
 
         // Store the host directory for DLL search fallback.
         if let Some(parent) = path.parent() {
-            winapi_state.main_module_host_dir = Some(parent.to_owned());
+            winapi_state.process.main_module_host_dir = Some(parent.to_owned());
         }
 
         let mut session = Self::from_init(SessionInit {
@@ -1173,14 +1204,15 @@ impl RuntimeSession {
             if let Some(ref r) = root {
                 let _ = wie_winapi::ensure_bottle_skeleton(r);
             }
-            s.bottle_root = root.clone();
-            s.volumes.bottle_root = root;
+            s.file_io.bottle_root = root.clone();
+            s.file_io.volumes.bottle_root = root;
         });
     }
 
     /// Sets optional host-bridge root for guest `D:\…` (`None` unmounts D:).
     pub fn set_drive_d(&mut self, root: Option<std::path::PathBuf>) {
-        self.process.with_mut(|_, s| s.volumes.drive_d_root = root);
+        self.process
+            .with_mut(|_, s| s.file_io.volumes.drive_d_root = root);
     }
 
     /// Replaces guest stdin buffer for console `ReadFile` on STD_INPUT_HANDLE.
@@ -1189,13 +1221,13 @@ impl RuntimeSession {
     /// next guest read.
     pub fn set_stdin_bytes(&mut self, bytes: Vec<u8>) {
         self.process.with_mut(|_, s| {
-            s.stdin_mode = if bytes.is_empty() {
+            s.file_io.stdin_mode = if bytes.is_empty() {
                 wie_winapi::GuestStdinMode::LiveHost
             } else {
                 wie_winapi::GuestStdinMode::InjectOnly
             };
-            s.stdin_bytes = bytes;
-            s.stdin_cursor = 0;
+            s.file_io.stdin_bytes = bytes;
+            s.file_io.stdin_cursor = 0;
         });
     }
 
@@ -1214,12 +1246,13 @@ impl RuntimeSession {
     /// Changes the behavior of `GetMessageA` when the queue is empty.
     pub fn set_message_queue_idle_policy(&mut self, policy: wie_winapi::MessageQueueIdlePolicy) {
         self.process
-            .with_mut(|_, s| s.message_queue_idle_policy = policy);
+            .with_mut(|_, s| s.window_state().message_queue_idle_policy = policy);
     }
 
     /// Adds one message to the persistent guest message queue.
     pub fn post_message(&mut self, message: wie_winapi::QueuedWindowMessage) {
-        self.process.with_mut(|_, s| s.message_queue.push(message));
+        self.process
+            .with_mut(|_, s| s.window_state().message_queue.push(message));
     }
 
     /// Runs the guest until it yields, terminates, reaches an unsupported API,
@@ -1288,8 +1321,8 @@ impl RuntimeSession {
                     .shared_winapi
                     .lock()
                     .unwrap_or_else(|p| p.into_inner());
-                if st.threads.active.tid != primary_tid {
-                    st.threads.activate(primary_tid);
+                if st.kernel.threads.active.tid != primary_tid {
+                    st.kernel.threads.activate(primary_tid);
                 }
             }
 
@@ -1324,12 +1357,39 @@ impl RuntimeSession {
                 // Workers may have activated themselves while we ran pure guest
                 // code without the WinAPI lock. Reclaim primary identity before
                 // any dispatch that uses current_tid() (CS owner, TLS, waits).
-                if winapi_state.threads.active.tid != primary_tid {
-                    winapi_state.threads.activate(primary_tid);
+                if winapi_state.kernel.threads.active.tid != primary_tid {
+                    winapi_state.kernel.threads.activate(primary_tid);
                 }
 
                 let (hook, invalid_memory) = match hook_result {
                     Ok(result) => (result.code, result.invalid_memory),
+                    Err(wie_cpu::CpuError::DivideByZero(div_rip)) => {
+                        match wie_winapi::seh::dispatch_hardware_fault(
+                            engine,
+                            winapi_state,
+                            wie_cpu::exception_code::INT_DIVIDE_BY_ZERO,
+                            div_rip,
+                        ) {
+                            Ok(result) => {
+                                tracing::trace!(
+                                    rip = div_rip,
+                                    resume_rip = result.return_value,
+                                    "divide-by-zero handled by SEH"
+                                );
+                                continue;
+                            }
+                            Err(_) => {
+                                tracing::debug!(rip = div_rip, "unhandled divide-by-zero");
+                                let reason = format!("integer divide by zero at rip={div_rip:#x}");
+                                break_term = Some(EntryTraceTermination::RuntimeStop(reason));
+                                quantum = Quantum::Break;
+                            }
+                        }
+                        (
+                            wie_cpu::CodeHookOutcome::default(),
+                            wie_cpu::InvalidMemoryAccess::default(),
+                        )
+                    }
                     Err(error) => {
                         let rip = engine
                             .read_rip()
@@ -1362,8 +1422,32 @@ impl RuntimeSession {
                 if matches!(quantum, Quantum::Break) {
                     // already set break_term
                 } else if invalid_memory.hit {
-                    break_term = Some(invalid_memory_diagnostic(engine, &invalid_memory)?);
-                    quantum = Quantum::Break;
+                    // Route through guest SEH before terminating.
+                    match wie_winapi::seh::dispatch_hardware_fault(
+                        engine,
+                        winapi_state,
+                        invalid_memory.exception_code,
+                        invalid_memory.address,
+                    ) {
+                        Ok(result) => {
+                            // Handler found — guest continues at catch block.
+                            tracing::trace!(
+                                exc = invalid_memory.exception_code,
+                                addr = invalid_memory.address,
+                                resume_rip = result.return_value,
+                                "hardware fault handled by guest SEH"
+                            );
+                            continue;
+                        }
+                        Err(_unhandled) => {
+                            tracing::debug!(
+                                exc = invalid_memory.exception_code,
+                                "unhandled hardware fault"
+                            );
+                            break_term = Some(invalid_memory_diagnostic(engine, &invalid_memory)?);
+                            quantum = Quantum::Break;
+                        }
+                    }
                 } else if !hook.hit {
                     self.no_hook_slices = self
                         .no_hook_slices
@@ -1452,7 +1536,7 @@ impl RuntimeSession {
                                     return_value: Some(result.return_value),
                                     return_address: Some(result.return_address),
                                 });
-                                let err = winapi_state.last_error;
+                                let err = winapi_state.process.last_error;
                                 if self.last_published_last_error != Some(err) {
                                     let bytes = err.to_le_bytes();
                                     if engine
@@ -1519,7 +1603,7 @@ impl RuntimeSession {
                                 .mem_read(crate::guest_stubs::TEB_LAST_ERROR_VA, &mut teb_err)
                                 .is_ok()
                             {
-                                winapi_state.last_error = u32::from_le_bytes(teb_err);
+                                winapi_state.process.last_error = u32::from_le_bytes(teb_err);
                             }
                         }
 
@@ -1562,7 +1646,7 @@ impl RuntimeSession {
                             if let Some(t0) = handler_t0 {
                                 record_handler(t0.elapsed().as_nanos(), false);
                             }
-                            winapi_state.sync.process_dying = true;
+                            winapi_state.kernel.sync.process_dying = true;
                             break_term =
                                 Some(EntryTraceTermination::ExitProcess { code: exit_code });
                             quantum = Quantum::Break;
@@ -1576,7 +1660,7 @@ impl RuntimeSession {
                             }
                             noisy_api = noisy_api.saturating_add(1);
                             // publish last error
-                            let err = winapi_state.last_error;
+                            let err = winapi_state.process.last_error;
                             if self.last_published_last_error != Some(err) {
                                 let bytes = err.to_le_bytes();
                                 if engine
@@ -1592,12 +1676,19 @@ impl RuntimeSession {
                             Some(wie_winapi::WinApiId::Kernel32Heapalloc)
                         ) {
                             let handler_t0 = self.profile_enabled.then(Instant::now);
-                            wie_winapi::kernel32::handle_heap_alloc(engine, winapi_state)?;
+                            {
+                                let mut ctx = wie_winapi::HandlerContext::new(
+                                    engine,
+                                    environment,
+                                    winapi_state,
+                                );
+                                wie_winapi::kernel32::handle_heap_alloc(&mut ctx)?;
+                            }
                             if let Some(t0) = handler_t0 {
                                 record_handler(t0.elapsed().as_nanos(), true);
                             }
                             noisy_api = noisy_api.saturating_add(1);
-                            let err = winapi_state.last_error;
+                            let err = winapi_state.process.last_error;
                             if self.last_published_last_error != Some(err) {
                                 let bytes = err.to_le_bytes();
                                 if engine
@@ -1613,12 +1704,19 @@ impl RuntimeSession {
                             Some(wie_winapi::WinApiId::Kernel32Heapfree)
                         ) {
                             let handler_t0 = self.profile_enabled.then(Instant::now);
-                            wie_winapi::kernel32::handle_heap_free(engine, winapi_state)?;
+                            {
+                                let mut ctx = wie_winapi::HandlerContext::new(
+                                    engine,
+                                    environment,
+                                    winapi_state,
+                                );
+                                wie_winapi::kernel32::handle_heap_free(&mut ctx)?;
+                            }
                             if let Some(t0) = handler_t0 {
                                 record_handler(t0.elapsed().as_nanos(), true);
                             }
                             noisy_api = noisy_api.saturating_add(1);
-                            let err = winapi_state.last_error;
+                            let err = winapi_state.process.last_error;
                             if self.last_published_last_error != Some(err) {
                                 let bytes = err.to_le_bytes();
                                 if engine
@@ -1634,7 +1732,14 @@ impl RuntimeSession {
                             Some(wie_winapi::WinApiId::Kernel32Multibytetowidechar)
                         ) {
                             let handler_t0 = self.profile_enabled.then(Instant::now);
-                            wie_winapi::kernel32::handle_multi_byte_to_wide_char(engine)?;
+                            {
+                                let mut ctx = wie_winapi::HandlerContext::new(
+                                    engine,
+                                    environment,
+                                    winapi_state,
+                                );
+                                wie_winapi::kernel32::handle_multi_byte_to_wide_char(&mut ctx)?;
+                            }
                             if let Some(t0) = handler_t0 {
                                 record_handler(t0.elapsed().as_nanos(), true);
                             }
@@ -1642,18 +1747,13 @@ impl RuntimeSession {
                             quantum = Quantum::Continue;
                         } else {
                             let handler_t0 = self.profile_enabled.then(Instant::now);
+                            let mut ctx =
+                                wie_winapi::HandlerContext::new(engine, environment, winapi_state);
                             let dispatch_result = if let Some(id) = resolved.winapi_id {
-                                wie_winapi::dispatch_winapi_id(
-                                    engine,
-                                    environment,
-                                    winapi_state,
-                                    id,
-                                )
+                                wie_winapi::dispatch_winapi_id(&mut ctx, id)
                             } else {
                                 wie_winapi::dispatch_winapi(
-                                    engine,
-                                    environment,
-                                    winapi_state,
+                                    &mut ctx,
                                     &resolved.library,
                                     &resolved.name,
                                 )
@@ -1679,7 +1779,7 @@ impl RuntimeSession {
                                             return_address: Some(handler_result.return_address),
                                         });
                                     }
-                                    let err = winapi_state.last_error;
+                                    let err = winapi_state.process.last_error;
                                     if self.last_published_last_error != Some(err) {
                                         let bytes = err.to_le_bytes();
                                         if engine
@@ -1754,7 +1854,7 @@ impl RuntimeSession {
                                     Some(wie_winapi::WinApiControlSignal::HostPark { reason }) => {
                                         // Per-thread engine: primary regs are already in `engine`;
                                         // only persist thread bookkeeping for TLS tracking.
-                                        winapi_state.threads.save_active();
+                                        winapi_state.kernel.threads.save_active();
                                         quantum = Quantum::Park(*reason);
                                     }
                                     Some(wie_winapi::WinApiControlSignal::ExitThread { code }) => {
@@ -1811,7 +1911,7 @@ impl RuntimeSession {
                             q.park_brief();
                             // Retry Enter: per-thread engine keeps primary regs; only restore TLS.
                             self.process.with_mut(|_eng, st| {
-                                st.threads.activate(primary_tid);
+                                st.kernel.threads.activate(primary_tid);
                             });
                             // Do not charge API index again — undo increment.
                             self.next_api_index = self.next_api_index.saturating_sub(1);
@@ -1820,7 +1920,7 @@ impl RuntimeSession {
                             // Detach waitable object, wait **outside** process locks
                             // so workers can ExitThread / SetEvent / CreateThread.
                             let _ = self.process.drain_spawns();
-                            if std::env::var_os("WIE_MT_DEBUG").is_some() {
+                            if crate::mt_runtime::mt_debug() {
                                 eprintln!(
                                     "[mt] primary park WaitObject handle={handle:#x} timeout={timeout_ms:#x}"
                                 );
@@ -1841,7 +1941,7 @@ impl RuntimeSession {
                                             let _ = self.process.drain_spawns();
                                             let dying = self
                                                 .process
-                                                .with_winapi_ref(|st| st.sync.process_dying);
+                                                .with_winapi_ref(|st| st.kernel.sync.process_dying);
                                             if dying {
                                                 break wie_winapi::WAIT_FAILED;
                                             }
@@ -1853,26 +1953,37 @@ impl RuntimeSession {
                                 None => wie_winapi::WAIT_FAILED,
                             };
                             self.process.with_mut(|eng, st| {
-                                st.threads.activate(primary_tid);
+                                st.kernel.threads.activate(primary_tid);
                                 let _ = eng.return_from_win64_api(u64::from(result)).map_err(|e| {
                                     tracing::error!("guest stack corrupted on wait park: {e}")
                                 });
                             });
                             charged_api = charged_api.saturating_add(1);
                         }
+                        wie_winapi::HostParkReason::PthreadWait => {
+                            // Drain any pending CreateThread/pthread_create spawns
+                            // so the worker can start executing guest code.
+                            let _ = self.process.drain_spawns();
+                            if crate::mt_runtime::mt_debug() {
+                                eprintln!("[mt] primary park PthreadWait");
+                            }
+                            // Yield briefly so the handler can re-check its
+                            // condition (WakeQueue park) on re-entry.
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
                         wie_winapi::HostParkReason::WaitMultiple => {
                             let _ = self.process.drain_spawns();
-                            if std::env::var_os("WIE_MT_DEBUG").is_some() {
+                            if crate::mt_runtime::mt_debug() {
                                 eprintln!("[mt] primary park WaitMultiple");
                             }
                             let req = self
                                 .process
-                                .with_mut(|_, st| st.sync.multi_wait.remove(&primary_tid));
+                                .with_mut(|_, st| st.kernel.sync.multi_wait.remove(&primary_tid));
                             let result = match req {
                                 Some(req) => {
-                                    let targets = self
-                                        .process
-                                        .with_mut(|_, st| st.sync.wait_targets(&req.handles));
+                                    let targets = self.process.with_mut(|_, st| {
+                                        st.kernel.sync.wait_targets(&req.handles)
+                                    });
                                     match targets {
                                         Some(ts) => {
                                             if req.timeout_ms == wie_winapi::INFINITE {
@@ -1888,7 +1999,7 @@ impl RuntimeSession {
                                                     let _ = self.process.drain_spawns();
                                                     let dying =
                                                         self.process.with_winapi_ref(|st| {
-                                                            st.sync.process_dying
+                                                            st.kernel.sync.process_dying
                                                         });
                                                     if dying {
                                                         break wie_winapi::WAIT_FAILED;
@@ -1908,7 +2019,7 @@ impl RuntimeSession {
                                 None => wie_winapi::WAIT_FAILED,
                             };
                             self.process.with_mut(|eng, st| {
-                                st.threads.activate(primary_tid);
+                                st.kernel.threads.activate(primary_tid);
                                 let _ = eng.return_from_win64_api(u64::from(result)).map_err(|e| {
                                     tracing::error!("guest stack corrupted on wait park: {e}")
                                 });
@@ -1949,20 +2060,23 @@ impl RuntimeSession {
         long_parameter: u64,
     ) -> Result<()> {
         self.process.with_mut(|_, st| {
-            let time = st.next_message_time;
-            st.next_message_time = st
+            let time = st.window_state().next_message_time;
+            st.window_state().next_message_time = st
+                .window_state()
                 .next_message_time
                 .checked_add(1)
                 .context("runtime message timestamp overflow")?;
-            st.message_queue.push(wie_winapi::QueuedWindowMessage {
-                window_handle,
-                message,
-                word_parameter,
-                long_parameter,
-                time,
-                point_x: 0,
-                point_y: 0,
-            });
+            st.window_state()
+                .message_queue
+                .push(wie_winapi::QueuedWindowMessage {
+                    window_handle,
+                    message,
+                    word_parameter,
+                    long_parameter,
+                    time,
+                    point_x: 0,
+                    point_y: 0,
+                });
             Ok(())
         })
     }
@@ -1971,10 +2085,12 @@ impl RuntimeSession {
     #[must_use]
     pub fn first_guest_window_handle(&self) -> Option<u64> {
         self.process.with_winapi_ref(|st| {
-            st.windows
-                .iter()
-                .find(|window| window.window_proc != 0)
-                .map(|window| window.handle)
+            st.try_window_state().and_then(|ws| {
+                ws.windows
+                    .iter()
+                    .find(|window| window.window_proc != 0)
+                    .map(|window| window.handle)
+            })
         })
     }
 
@@ -1982,17 +2098,21 @@ impl RuntimeSession {
     #[must_use]
     pub fn guest_windows_snapshot(&self) -> Vec<(u64, String, String, bool)> {
         self.process.with_winapi_ref(|st| {
-            st.windows
-                .iter()
-                .map(|window| {
-                    (
-                        window.handle,
-                        window.class_name.clone(),
-                        window.title.clone(),
-                        window.window_proc != 0,
-                    )
+            st.try_window_state()
+                .map(|ws| {
+                    ws.windows
+                        .iter()
+                        .map(|window| {
+                            (
+                                window.handle,
+                                window.class_name.clone(),
+                                window.title.clone(),
+                                window.window_proc != 0,
+                            )
+                        })
+                        .collect()
                 })
-                .collect()
+                .unwrap_or_default()
         })
     }
 
@@ -2004,14 +2124,17 @@ impl RuntimeSession {
 
     /// Configures the next common file dialog outcome (`GetOpenFileName` / `GetSaveFileName`).
     pub fn set_file_dialog_policy(&mut self, policy: wie_winapi::FileDialogPolicy) {
-        self.process.with_mut(|_, s| s.file_dialog_policy = policy);
+        self.process
+            .with_mut(|_, s| s.window_state().file_dialog_policy = policy);
     }
 
     /// Returns the last path accepted by a simulated file dialog.
     #[must_use]
     pub fn last_file_dialog_path(&self) -> Option<String> {
-        self.process
-            .with_winapi_ref(|st| st.last_file_dialog_path.clone())
+        self.process.with_winapi_ref(|st| {
+            st.try_window_state()
+                .and_then(|ws| ws.last_file_dialog_path.clone())
+        })
     }
 
     /// Mounts a host file so the guest can open it via `CreateFile*` under `guest_path`.
@@ -2034,6 +2157,7 @@ impl RuntimeSession {
     pub fn guest_file_size(&self, handle: u64) -> Result<u64> {
         self.process.with_winapi_ref(|st| {
             let file = st
+                .file_io
                 .open_files
                 .get(&handle)
                 .with_context(|| format!("unknown guest file handle {handle:#018x}"))?;
@@ -2045,7 +2169,7 @@ impl RuntimeSession {
     pub fn peek_guest_file(&self, handle: u64, offset: usize, len: usize) -> Result<Vec<u8>> {
         self.process.with_winapi_ref(|st| {
             let file = st
-                .open_files
+                .file_io.open_files
                 .get(&handle)
                 .with_context(|| format!("unknown guest file handle {handle:#018x}"))?;
             let end = offset
@@ -2066,11 +2190,12 @@ impl RuntimeSession {
     #[must_use]
     pub fn open_guest_files_snapshot(&self) -> Vec<(u64, String, u64)> {
         self.process.with_winapi_ref(|st| {
-            st.open_files
+            st.file_io
+                .open_files
                 .iter()
                 .filter_map(|(&handle, file)| {
                     let size = u64::try_from(file.bytes.len()).ok()?;
-                    Some((handle, file.path.clone(), size))
+                    Some((handle, file.path.to_string(), size))
                 })
                 .collect()
         })
@@ -2233,7 +2358,17 @@ fn journal_api_return(
     return_value: u64,
     return_address: u64,
 ) {
-    let Ok(path) = std::env::var("WIE_API_JOURNAL") else {
+    // Cached once: the runtime does not observe env var changes at runtime, so
+    // any subsequent call is a monomorphic branch on an atomic-loaded pointer
+    // instead of a full getenv() + 7 wasted register reads (previously the
+    // env lookup was per-call, followed by 8 register reads before the
+    // OpenOptions::open would bail on IO error).
+    use std::sync::OnceLock;
+    static JOURNAL_PATH: OnceLock<Option<String>> = OnceLock::new();
+    let Some(path) = JOURNAL_PATH
+        .get_or_init(|| std::env::var("WIE_API_JOURNAL").ok())
+        .as_deref()
+    else {
         return;
     };
     let rip = engine.read_rip().unwrap_or(0);
@@ -2257,7 +2392,7 @@ fn journal_api_return(
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
+        .open(path)
     {
         use std::io::Write;
         let _ = f.write_all(line.as_bytes());

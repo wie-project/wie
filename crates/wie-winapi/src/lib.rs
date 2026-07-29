@@ -1,5 +1,8 @@
 //! WinAPI dispatcher model for WIE (generic PE64 userspace).
 
+#![allow(clippy::type_complexity)]
+
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -7,9 +10,11 @@ pub mod advapi32;
 pub mod bottle;
 pub mod comctl32;
 pub mod comdlg32;
+pub mod console;
 pub mod d3d9;
 pub mod dll_loader;
 pub mod dynamic_apis;
+pub mod pthread;
 pub use dynamic_apis::{DYNAMIC_FAKE_APIS, PREPLANTED_SOFT_APIS, resolve_get_proc_address};
 pub mod exception;
 pub mod fake_va;
@@ -82,459 +87,463 @@ pub struct WinApiEnvironment {
     pub process_heap_handle: u64,
 }
 
-pub struct WinApiState {
+/// Heap and FLS (Fiber-Local Storage) state.
+#[derive(Debug, Clone)]
+pub struct HeapState {
     /// Process heap: segregated freelist + bump (see [`GuestHeap`]).
     pub heap: GuestHeap,
-
     /// Next fake `FLS` index.
     pub next_fls_index: u32,
-
     /// Fake `FLS` slots.
     pub fls_slots: Vec<FlsSlot>,
-
-    /// Last WinAPI error value.
-    pub last_error: u32,
-
-    /// Next fake registry key handle.
-    pub next_registry_key_handle: u64,
-
-    /// Fake registry key handles.
-    pub registry_keys: Vec<RegistryKey>,
-
-    /// Next fake find-file handle.
-    pub next_find_handle: u64,
-
-    /// Active fake find-file handles.
-    pub find_handles: Vec<FindHandle>,
-
-    /// Size of the executable file visible through fake file handles.
-    pub executable_file_size: u64,
-
-    /// Bytes of the executable file visible through fake file handles.
-    pub executable_file_bytes: Vec<u8>,
-
-    /// Basename of the main PE (`heap_alloc.exe`, `Lunar Magic.exe`, …).
-    pub main_module_file_name: String,
-
-    /// Guest full path of the main PE (`C:\App\…`).
-    pub main_module_path: String,
-
-    /// Guest thread table + active TLS/TID (MT.0 / MT.1).
-    ///
-    /// TLS **indices** are process-wide; **values** live on
-    /// [`ThreadState::active`]. Prefer helpers on this field over ad-hoc TID
-    /// constants.
-    pub threads: ThreadState,
-
-    /// Kernel objects, CS wait queues, pending `CreateThread` spawns (MT.2/3).
-    pub sync: SyncState,
-
-    /// Optional bottle root: guest `C:\…` maps to `{root}/drive_c/…` on the host.
-    ///
-    /// Set via `WIE_ROOT` / session. When set, CreateFile create/open uses real host files.
-    /// Prefer [`Self::volumes`]; this field is kept in sync for compatibility.
-    pub bottle_root: Option<std::path::PathBuf>,
-
-    /// Volume table: bottle C: + optional host-bridge D:.
-    pub volumes: VolumeConfig,
-
-    /// Current cursor for the fake executable file handle.
-    ///
-    /// Deprecated for multi-file I/O: prefer `open_files`. Kept so the main
-    /// executable still has a stable content source at session start.
-    pub executable_file_cursor: u64,
-
-    /// Host files mounted into the guest path namespace.
-    pub host_file_mounts: Vec<HostFileMount>,
-
-    /// Guest-visible virtual files created at runtime (ini/sidecars/temps).
-    pub virtual_files: Vec<VirtualGuestFile>,
-
-    /// Currently open guest file handles, keyed by handle.
-    pub open_files: HashMap<u64, OpenGuestFile>,
-
-    /// Next handle value for `CreateFile*`.
-    pub next_file_handle: u64,
-
-    /// Next fake resource handle.
-    pub next_resource_handle: u64,
-
-    /// Fake resource records.
-    pub resources: Vec<ResourceRecord>,
-
-    pub current_directory_wide: Vec<u16>,
-
-    pub window_long_ptr_values: Vec<(u64, i64, u64)>,
-
-    pub image_list_counts: Vec<(u64, u64)>,
-
-    /// Background colors associated with fake image lists.
-    pub image_list_background_colors: Vec<(u64, u32)>,
-
-    /// Whether the fake main window is visible.
-    pub window_visible: bool,
-
-    /// Whether the fake main window is enabled.
-    pub window_enabled: bool,
-
-    /// Current fake active window.
-    pub active_window_handle: u64,
-
-    /// Current fake foreground window.
-    pub foreground_window_handle: u64,
-
-    /// Current fake keyboard-focus window.
-    pub focus_window_handle: u64,
-
-    /// Current fake mouse-capture window.
-    pub capture_window_handle: u64,
-
-    /// Current fake cursor handle.
-    pub cursor_handle: u64,
-
-    /// Title of the current fake main window.
-    pub window_title: String,
-
-    /// X coordinate of the current fake main window.
-    pub window_x: i32,
-
-    /// Y coordinate of the current fake main window.
-    pub window_y: i32,
-
-    /// Width of the current fake main window.
-    pub window_width: i32,
-
-    /// Height of the current fake main window.
-    pub window_height: i32,
-
-    /// Whether the current fake main window has a pending repaint.
-    pub window_invalidated: bool,
-
-    /// Monotonic fake millisecond counter.
-    pub tick_count: u64,
-
-    /// State of the 256 virtual keyboard keys.
-    pub keyboard_state: [u8; 256],
-
-    /// Next automatically generated USER32 timer identifier.
-    pub next_timer_id: u64,
-
-    /// Active fake USER32 timers.
-    pub timers: Vec<TimerRecord>,
-
-    /// Next fake global atom identifier.
-    pub next_global_atom: u16,
-
-    /// Fake global atom table.
-    pub global_atoms: Vec<GlobalAtomRecord>,
-
-    /// Next fake USER32 hook handle.
-    pub next_windows_hook_handle: u64,
-
-    /// Registered fake USER32 hooks.
-    pub windows_hooks: Vec<WindowsHookRecord>,
-
-    /// Currently bound fake Direct3D 9 vertex shader.
-    pub d3d9_current_vertex_shader: u64,
-
-    /// Currently selected Direct3D 9 flexible vertex format.
-    pub d3d9_current_fvf: u32,
-
-    /// Direct3D 9 render-state values indexed by `D3DRENDERSTATETYPE`.
-    pub d3d9_render_states: Vec<(u32, u32)>,
-
-    /// Direct3D 9 texture-stage states stored as `(stage, state_type, value)`.
-    pub d3d9_texture_stage_states: Vec<(u32, u32, u32)>,
-
-    /// Direct3D 9 sampler states stored as `(sampler, state_type, value)`.
-    pub d3d9_sampler_states: Vec<(u32, u32, u32)>,
-
-    /// USER32 menu item enable-state records stored as
-    /// `(menu_handle, item, flags)`.
-    pub menu_item_states: Vec<(u64, u32, u32)>,
-
-    /// USER32 menu item check-state records stored as
-    /// `(menu_handle, item, flags)`.
-    pub menu_item_check_states: Vec<(u64, u32, u32)>,
-
-    /// Pending USER32 messages in FIFO order.
-    pub message_queue: Vec<QueuedWindowMessage>,
-
-    /// Monotonic fake USER32 message timestamp.
-    pub next_message_time: u32,
-
-    /// Guest address of the current fake `IDirect3DDevice9` object.
-    pub d3d9_device_object_address: u64,
-
-    /// COM reference count of the current fake `IDirect3DDevice9` object.
-    pub d3d9_device_ref_count: u32,
-
-    /// Guest address of the current fake `IDirect3D9` object.
-    pub d3d9_object_address: u64,
-
-    /// COM reference count of the current fake `IDirect3D9` object.
-    pub d3d9_ref_count: u32,
-
-    /// Policy used when `GetMessageA` finds no matching queued message.
-    pub message_queue_idle_policy: MessageQueueIdlePolicy,
-
-    /// Next atom returned for a registered window class.
-    pub next_window_class_atom: u16,
-
-    /// Registered USER32 window classes.
-    pub window_classes: Vec<WindowClassRecord>,
-
-    /// Next runtime-owned fake HWND.
-    pub next_window_handle: u64,
-
-    /// Windows created through `CreateWindowExA/W`.
-    pub windows: Vec<WindowRecord>,
-
-    /// Cached `GetProcAddress` resolutions keyed by export name (ASCII lower).
-    pub get_proc_address_cache: std::collections::HashMap<String, GetProcAddressCacheEntry>,
-
-    /// Policy applied when the guest opens a common file dialog.
-    pub file_dialog_policy: FileDialogPolicy,
-
-    /// Last path accepted by a simulated file dialog (if any).
-    pub last_file_dialog_path: Option<String>,
-
-    /// Value returned by `CommDlgExtendedError`.
-    pub comm_dlg_extended_error: u32,
-
-    /// Next fake HMENU value for `CreateMenu` / `CreatePopupMenu`.
-    pub next_menu_handle: u64,
-
-    /// Guest I/O acceleration config (None until runtime installs helpers).
-    pub guest_io: Option<GuestIoRuntimeConfig>,
-
-    /// Next free VA in the guest file-data mirror arena.
-    pub guest_file_data_next: u64,
-
     /// Guest VA of the FLS value table (u64 slots), 0 if not installed.
     pub guest_fls_table_va: u64,
-
-    /// Buffered guest stdin bytes for console `ReadFile(STD_INPUT_HANDLE)`.
-    ///
-    /// Filled either by host injection (`--stdin` / tests) or by a live host
-    /// line-fill when [`Self::stdin_mode`] is [`GuestStdinMode::LiveHost`].
-    pub stdin_bytes: Vec<u8>,
-
-    /// Read cursor into [`Self::stdin_bytes`].
-    pub stdin_cursor: usize,
-
-    /// How console stdin is sourced when the buffer is empty.
-    pub stdin_mode: GuestStdinMode,
-
-    /// In-progress SEH / C++ EH continuation (UnwindMap + catch funclets).
-    pub seh_pending: Option<seh::SehPending>,
-
-    /// Import resolver for dynamic DLL loading.
-    ///
-    /// Set once at session init by the runtime (`wie-runtime::session`).
-    /// Resolves `(library, name, iat_slot_va)` → fake API VA for import patching.
-    /// `None` means dynamic loading is unavailable (falls back to fake handles).
-    #[allow(clippy::type_complexity)]
-    pub import_resolver: Option<Box<dyn FnMut(&str, &str, u64) -> anyhow::Result<u64> + Send>>,
-
-    /// Dynamically loaded DLL modules (real, not fake stubs).
-    /// Keyed by normalized (lowercase) module name without extension.
-    pub loaded_modules: HashMap<String, dll_loader::LoadedModule>,
-
-    /// Next real loaded module handle (monotonically increasing, each step by 0x1000).
-    pub next_module_handle: u64,
-
-    /// Host filesystem directory of the main executable.
-    /// Used as a fallback search directory for DLL loading when VFS/bottle
-    /// path resolution fails (e.g. micro-exes without a bottle root).
-    pub main_module_host_dir: Option<std::path::PathBuf>,
 }
+
+/// File I/O, VFS, and console stdin state.
+#[derive(Debug, Clone)]
+pub struct FileIoState {
+    pub executable_file_size: u64,
+    pub executable_file_bytes: Vec<u8>,
+    pub executable_file_cursor: u64,
+    pub next_find_handle: u64,
+    pub find_handles: Vec<FindHandle>,
+    pub host_file_mounts: Vec<HostFileMount>,
+    pub virtual_files: Vec<VirtualGuestFile>,
+    pub open_files: HashMap<u64, OpenGuestFile>,
+    pub next_file_handle: u64,
+    pub next_resource_handle: u64,
+    pub resources: Vec<ResourceRecord>,
+    pub current_directory_wide: Vec<u16>,
+    pub bottle_root: Option<std::path::PathBuf>,
+    pub volumes: VolumeConfig,
+    pub guest_file_data_next: u64,
+    pub guest_io: Option<GuestIoRuntimeConfig>,
+    pub stdin_bytes: Vec<u8>,
+    pub stdin_cursor: usize,
+    pub stdin_mode: GuestStdinMode,
+    pub ucrt_files: HashMap<u64, u64>,
+    pub ucrt_next_file_va: u64,
+    /// Cached open `File` handles for streaming host-backed guest files.
+    ///
+    /// Keyed by the guest-visible file handle. Populated lazily on the first
+    /// streamed `ReadFile`/`WriteFile` for that handle and dropped on
+    /// `CloseHandle`. Amortises the per-syscall `File::open` + seek + drop cost
+    /// that dominated 7za-style workloads (a 500 MiB archive read in 64 KiB
+    /// chunks previously did ~8k open/close/fstat triples per side).
+    pub cached_streams: HashMap<u64, std::sync::Arc<std::sync::Mutex<std::fs::File>>>,
+}
+
+/// Thread-safe resolver for dynamic DLL imports.
+///
+/// Wraps a closure behind `Arc<Mutex<…>>` so [`ModuleState`] can derive
+/// `Clone` and `Debug` without losing the closure's captured state.
+type ImportResolverInner =
+    std::sync::Arc<std::sync::Mutex<Box<dyn FnMut(&str, &str, u64) -> anyhow::Result<u64> + Send>>>;
+
+#[derive(Clone)]
+pub struct ImportResolver {
+    inner: ImportResolverInner,
+}
+
+impl std::fmt::Debug for ImportResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImportResolver").finish()
+    }
+}
+
+impl ImportResolver {
+    pub fn new(f: Box<dyn FnMut(&str, &str, u64) -> anyhow::Result<u64> + Send>) -> Self {
+        Self {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(f)),
+        }
+    }
+
+    pub fn resolve(&mut self, lib: &str, name: &str, slot: u64) -> anyhow::Result<u64> {
+        // unwrap: the Mutex is not poisoned in practice (single-threaded use).
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())(lib, name, slot)
+    }
+}
+
+/// DLL loading and export resolution cache.
+#[derive(Debug, Clone)]
+pub struct ModuleState {
+    pub loaded_modules: HashMap<String, dll_loader::LoadedModule>,
+    pub import_resolver: Option<ImportResolver>,
+    pub get_proc_address_cache: std::collections::HashMap<String, GetProcAddressCacheEntry>,
+    pub next_module_handle: u64,
+}
+
+/// Direct3D 9 rendering state.
+#[derive(Debug, Clone, Default)]
+pub struct D3D9State {
+    pub d3d9_current_vertex_shader: u64,
+    pub d3d9_current_fvf: u32,
+    pub d3d9_render_states: Vec<(u32, u32)>,
+    pub d3d9_texture_stage_states: Vec<(u32, u32, u32)>,
+    pub d3d9_sampler_states: Vec<(u32, u32, u32)>,
+    pub d3d9_device_object_address: u64,
+    pub d3d9_device_ref_count: u32,
+    pub d3d9_object_address: u64,
+    pub d3d9_ref_count: u32,
+}
+
+/// Wrapper for the 256-byte keyboard state array. Exists so [`WindowState`]
+/// can use `#[derive(Default)]` — bare `[u8; 256]` does not implement `Default`.
+#[derive(Debug, Clone)]
+pub struct KeyboardState(pub [u8; 256]);
+
+impl Default for KeyboardState {
+    fn default() -> Self {
+        Self([0; 256])
+    }
+}
+
+impl std::ops::Deref for KeyboardState {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for KeyboardState {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+}
+
+/// Window, UI, and input state.
+#[derive(Debug, Clone, Default)]
+pub struct WindowState {
+    pub window_long_ptr_values: Vec<(u64, i64, u64)>,
+    pub image_list_counts: Vec<(u64, u64)>,
+    pub image_list_background_colors: Vec<(u64, u32)>,
+    pub window_visible: bool,
+    pub window_enabled: bool,
+    pub active_window_handle: u64,
+    pub foreground_window_handle: u64,
+    pub focus_window_handle: u64,
+    pub capture_window_handle: u64,
+    pub cursor_handle: u64,
+    pub window_title: String,
+    pub window_x: i32,
+    pub window_y: i32,
+    pub window_width: i32,
+    pub window_height: i32,
+    pub window_invalidated: bool,
+    pub tick_count: u64,
+    pub keyboard_state: KeyboardState,
+    pub next_timer_id: u64,
+    pub timers: Vec<TimerRecord>,
+    pub next_global_atom: u16,
+    pub global_atoms: Vec<GlobalAtomRecord>,
+    pub next_windows_hook_handle: u64,
+    pub windows_hooks: Vec<WindowsHookRecord>,
+    pub menu_item_states: Vec<(u64, u32, u32)>,
+    pub menu_item_check_states: Vec<(u64, u32, u32)>,
+    pub message_queue: Vec<QueuedWindowMessage>,
+    pub next_message_time: u32,
+    pub message_queue_idle_policy: MessageQueueIdlePolicy,
+    pub next_window_class_atom: u16,
+    pub window_classes: Vec<WindowClassRecord>,
+    pub next_window_handle: u64,
+    pub windows: Vec<WindowRecord>,
+    pub file_dialog_policy: FileDialogPolicy,
+    pub last_file_dialog_path: Option<String>,
+    pub comm_dlg_extended_error: u32,
+    pub next_menu_handle: u64,
+}
+
+/// Process-level state (identity, error handling, registry, misc).
+#[derive(Debug, Clone)]
+pub struct ProcessState {
+    pub last_error: u32,
+    pub next_registry_key_handle: u64,
+    pub registry_keys: Vec<RegistryKey>,
+    pub main_module_file_name: String,
+    pub main_module_path: String,
+    pub main_module_host_dir: Option<std::path::PathBuf>,
+    pub error_mode: u32,
+    pub suspended_threads: HashMap<u32, u32>,
+    /// Win32 process environment, as `(name, value)` in insertion order.
+    ///
+    /// Kept beside the guest-memory block that `GetEnvironmentStringsW`
+    /// returns rather than inside it. Windows draws the same distinction: the
+    /// block is a snapshot copy, so a later `SetEnvironmentVariable` is visible
+    /// to `GetEnvironmentVariable` without rewriting memory the guest may still
+    /// hold a pointer into.
+    pub environment: Vec<(String, String)>,
+}
+
+/// Environment every guest process starts with.
+///
+/// Single source of truth: `wie-runtime` builds the in-guest UTF-16 block from
+/// this same list, so the block and [`ProcessState::environment`] cannot drift.
+pub const DEFAULT_ENVIRONMENT: &[(&str, &str)] = &[
+    ("PATH", "C:\\Windows\\System32"),
+    ("TEMP", "C:\\Users\\WIE\\AppData\\Local\\Temp"),
+    ("TMP", "C:\\Users\\WIE\\AppData\\Local\\Temp"),
+    ("SystemRoot", "C:\\Windows"),
+    ("windir", "C:\\Windows"),
+    ("COMPUTERNAME", "WIE"),
+    ("USERNAME", "WIE"),
+    ("OS", "Windows_NT"),
+    ("PROCESSOR_ARCHITECTURE", "AMD64"),
+    ("NUMBER_OF_PROCESSORS", "4"),
+];
+
+/// Fake VA for the pthread return trampoline.
+pub const PTHREAD_RETURN_TRAMPOLINE_VA: u64 = 0x7000_0000_0000_FF00;
+
+/// Return the fake VA for the pthread return trampoline.
+#[must_use]
+pub fn pthread_return_trampoline_va() -> u64 {
+    PTHREAD_RETURN_TRAMPOLINE_VA
+}
+
+/// Kernel execution state (threading, synchronisation, SEH).
+#[derive(Debug, Clone)]
+pub struct KernelState {
+    pub threads: ThreadState,
+    pub sync: SyncState,
+    /// Per-thread pending SEH / MSVC-EH sequences, keyed by guest TID.
+    ///
+    /// Previously a single `Option<SehPending>` at process scope — that raced
+    /// when two guest threads threw concurrently: whichever throw grabbed the
+    /// shared WinAPI mutex second overwrote the first thread's payload, and
+    /// the second thread later found nothing in the slot and unwound past its
+    /// own catch (see `cpp_threads` micro). Per-TID storage isolates them.
+    pub seh_pending: std::collections::HashMap<u32, seh::SehPending>,
+}
+
+/// Identifies a slot in [`DllStateMap`]. One variant per emulated DLL
+/// that carries host-side state.
+///
+/// # Adding a new DLL
+///
+/// 1. Add a variant here.
+/// 2. Add a `None` to the array in [`DllStateMap::new`].
+/// 3. Add a match arm to [`DllStateMap::slot_of`].
+/// 4. Add an accessor on [`WinApiState`].
+///
+/// That is the entire change. One file, four lines.
+/// [`DllId::COUNT`] is derived from the number of variants and must match
+/// the `new()` array — the compile-time assertion at [`DLL_ID_SLOT_COUNT`]
+/// catches mismatches.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DllId {
+    Console,
+    Window,
+    D3D9,
+    Pthread,
+}
+
+impl DllId {
+    /// Number of variants. The assertion at [`DLL_ID_SLOT_COUNT`] ensures
+    /// it stays in sync with the slot array in [`DllStateMap::new`].
+    pub const COUNT: usize = 4;
+}
+
+/// Lazy DLL state storage. Fixed-size array, zero per-call overhead.
+///
+/// Each slot is `Option<Box<dyn Any + Send>>` — a nullable fat pointer
+/// (16 bytes) when unloaded. Access is a direct array index + one `TypeId`
+/// compare. No hash, no indirect dispatch.
+///
+/// `WinApiState` is shared behind `Arc<Mutex<>>` and is **never cloned**.
+/// Do not add `Clone` to this type or to [`WinApiState`].
+///
+/// # Adding a new DLL (alongside [`DllId`])
+///
+/// Add a `None` to the array in `new()` and a match arm to `slot_of`.
+/// Both must stay in sync — the const assertion catches drift.
+pub struct DllStateMap {
+    slots: [Option<Box<dyn Any + Send>>; DllId::COUNT],
+}
+
+// The struct field `slots: [Option<Box<dyn Any + Send>>; DllId::COUNT]`
+// and the `new()` array literal are kept in sync by the type system:
+// a mismatch in element count is a compile error.
+
+impl Default for DllStateMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Map a [`DllId`] to its index in the slot array. Matches explicitly
+/// so the compiler warns if a variant is added without a corresponding arm.
+const fn dll_index(id: DllId) -> usize {
+    match id {
+        DllId::Console => 0,
+        DllId::Window => 1,
+        DllId::D3D9 => 2,
+        DllId::Pthread => 3,
+    }
+}
+
+impl std::fmt::Debug for DllStateMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let loaded: Vec<&str> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| slot.as_ref().map(|_| slot_of(i)))
+            .collect();
+        f.debug_struct("DllStateMap")
+            .field("loaded", &loaded)
+            .finish()
+    }
+}
+
+/// Slot label for debug output. Add a match arm per new [`DllId`] variant.
+const fn slot_of(i: usize) -> &'static str {
+    match i {
+        0 => "console",
+        1 => "window",
+        2 => "d3d9",
+        3 => "pthread",
+        _ => "?",
+    }
+}
+
+impl DllStateMap {
+    /// All slots start unloaded. Add a `None` per new [`DllId`] variant.
+    pub fn new() -> Self {
+        Self {
+            slots: [None, None, None, None],
+        }
+    }
+
+    /// Access the state for `id`, heap-allocating a default on first call.
+    ///
+    /// # Panics
+    /// If the slot type does not match `T` — a programming error when a
+    /// `DllId` variant is reused for a different type.
+    #[allow(clippy::expect_used)]
+    pub fn get_or_init<T: Default + Send + 'static>(&mut self, id: DllId) -> &mut T {
+        let idx = dll_index(id);
+        let slot = self
+            .slots
+            .get_mut(idx)
+            .expect("DllId index out of range — did you forget to bump COUNT?");
+        slot.get_or_insert_with(|| Box::new(T::default()));
+        let boxed = slot.as_mut().expect("slot was just initialised");
+        boxed
+            .as_mut()
+            .downcast_mut::<T>()
+            .expect("DllId slot type mismatch")
+    }
+
+    /// Read-only access — returns `None` if the slot was never initialised.
+    pub fn get<T: 'static>(&self, id: DllId) -> Option<&T> {
+        let boxed = self.slots.get(dll_index(id))?.as_ref()?;
+        boxed.as_ref().downcast_ref::<T>()
+    }
+}
+
+pub struct WinApiState {
+    /// Heap + FLS state.
+    pub heap_state: HeapState,
+    /// File I/O, VFS, and console stdin state.
+    pub file_io: FileIoState,
+    /// DLL loading and export resolution cache.
+    pub module_state: ModuleState,
+    /// Process-level state (error, registry, identity, misc).
+    pub process: ProcessState,
+    /// Kernel execution state (threading, sync, SEH).
+    pub kernel: KernelState,
+    /// On-demand state for optional WIE-hosted DLLs.
+    pub dll_states: DllStateMap,
+}
+
+// NOTE: WinApiState is deliberately not Clone. It lives behind
+// Arc<Mutex<>> in the MT runtime and is never copied per thread.
 
 // Manual Debug impl: Box<dyn FnMut + Send> does not implement Debug.
 impl std::fmt::Debug for WinApiState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WinApiState")
-            .field("heap", &self.heap)
-            .field("next_fls_index", &self.next_fls_index)
-            .field("fls_slots", &self.fls_slots)
-            .field("last_error", &self.last_error)
-            .field("next_registry_key_handle", &self.next_registry_key_handle)
-            .field("registry_keys", &self.registry_keys)
-            .field("next_find_handle", &self.next_find_handle)
-            .field("find_handles", &self.find_handles)
-            .field("executable_file_size", &self.executable_file_size)
-            .field("executable_file_bytes", &self.executable_file_bytes)
-            .field("main_module_file_name", &self.main_module_file_name)
-            .field("main_module_path", &self.main_module_path)
-            .field("threads", &self.threads)
-            .field("sync", &self.sync)
-            .field("bottle_root", &self.bottle_root)
-            .field("volumes", &self.volumes)
-            .field("executable_file_cursor", &self.executable_file_cursor)
-            .field("host_file_mounts", &self.host_file_mounts)
-            .field("virtual_files", &self.virtual_files)
-            .field("open_files", &self.open_files)
-            .field("next_file_handle", &self.next_file_handle)
-            .field("next_resource_handle", &self.next_resource_handle)
-            .field("resources", &self.resources)
-            .field("current_directory_wide", &self.current_directory_wide)
-            .field("window_long_ptr_values", &self.window_long_ptr_values)
-            .field("image_list_counts", &self.image_list_counts)
-            .field(
-                "image_list_background_colors",
-                &self.image_list_background_colors,
-            )
-            .field("window_visible", &self.window_visible)
-            .field("window_enabled", &self.window_enabled)
-            .field("active_window_handle", &self.active_window_handle)
-            .field("foreground_window_handle", &self.foreground_window_handle)
-            .field("focus_window_handle", &self.focus_window_handle)
-            .field("capture_window_handle", &self.capture_window_handle)
-            .field("cursor_handle", &self.cursor_handle)
-            .field("window_title", &self.window_title)
-            .field("window_x", &self.window_x)
-            .field("window_y", &self.window_y)
-            .field("window_width", &self.window_width)
-            .field("window_height", &self.window_height)
-            .field("window_invalidated", &self.window_invalidated)
-            .field("tick_count", &self.tick_count)
-            .field("keyboard_state", &self.keyboard_state)
-            .field("next_timer_id", &self.next_timer_id)
-            .field("timers", &self.timers)
-            .field("next_global_atom", &self.next_global_atom)
-            .field("global_atoms", &self.global_atoms)
-            .field("next_windows_hook_handle", &self.next_windows_hook_handle)
-            .field("windows_hooks", &self.windows_hooks)
-            .field(
-                "d3d9_current_vertex_shader",
-                &self.d3d9_current_vertex_shader,
-            )
-            .field("d3d9_current_fvf", &self.d3d9_current_fvf)
-            .field("d3d9_render_states", &self.d3d9_render_states)
-            .field("d3d9_texture_stage_states", &self.d3d9_texture_stage_states)
-            .field("d3d9_sampler_states", &self.d3d9_sampler_states)
-            .field("menu_item_states", &self.menu_item_states)
-            .field("menu_item_check_states", &self.menu_item_check_states)
-            .field("message_queue", &self.message_queue)
-            .field("next_message_time", &self.next_message_time)
-            .field(
-                "d3d9_device_object_address",
-                &self.d3d9_device_object_address,
-            )
-            .field("d3d9_device_ref_count", &self.d3d9_device_ref_count)
-            .field("d3d9_object_address", &self.d3d9_object_address)
-            .field("d3d9_ref_count", &self.d3d9_ref_count)
-            .field("message_queue_idle_policy", &self.message_queue_idle_policy)
-            .field("next_window_class_atom", &self.next_window_class_atom)
-            .field("window_classes", &self.window_classes)
-            .field("next_window_handle", &self.next_window_handle)
-            .field("windows", &self.windows)
-            .field("get_proc_address_cache", &self.get_proc_address_cache)
-            .field("file_dialog_policy", &self.file_dialog_policy)
-            .field("last_file_dialog_path", &self.last_file_dialog_path)
-            .field("comm_dlg_extended_error", &self.comm_dlg_extended_error)
-            .field("next_menu_handle", &self.next_menu_handle)
-            .field("guest_io", &self.guest_io)
-            .field("guest_file_data_next", &self.guest_file_data_next)
-            .field("guest_fls_table_va", &self.guest_fls_table_va)
-            .field("stdin_bytes", &self.stdin_bytes)
-            .field("stdin_cursor", &self.stdin_cursor)
-            .field("stdin_mode", &self.stdin_mode)
-            .field("seh_pending", &self.seh_pending)
-            .field("import_resolver", &"<closure>")
-            .field("loaded_modules", &self.loaded_modules)
-            .field("next_module_handle", &self.next_module_handle)
-            .field("main_module_host_dir", &self.main_module_host_dir)
+            .field("heap_state", &self.heap_state)
+            .field("file_io", &self.file_io)
+            .field("dll_states", &self.dll_states)
+            .field("module_state", &self.module_state)
+            .field("process", &self.process)
+            .field("kernel", &self.kernel)
             .finish()
     }
 }
 
 // Manual Clone impl: Box<dyn FnMut + Send> does not implement Clone.
-impl Clone for WinApiState {
-    fn clone(&self) -> Self {
+// ── DLL state accessors ─────────────────────────────────────────────────
+//
+// When adding a new DLL, add a pair of methods here (mut + try_)
+// and a variant to [`DllId`]. That is the only change needed.
+impl WinApiState {
+    /// Flush buffered Stream-mode console output to the host terminal.
+    /// Called at frame boundaries (Sleep, _getch, etc.) so multiple
+    /// WriteConsole calls within one frame render atomically.
+    pub fn flush_console(&mut self) {
+        // get_or_init is fine — if the console state hasn't been allocated
+        // yet there's nothing to flush, and allocating an empty state is cheap.
+        self.console().flush_stream_output();
+    }
+
+    /// Mutable access — lazy-initialises on first call.
+    pub fn console(&mut self) -> &mut console::ConsoleState {
+        self.dll_states
+            .get_or_init::<console::ConsoleState>(DllId::Console)
+    }
+    pub fn window_state(&mut self) -> &mut WindowState {
+        self.dll_states.get_or_init::<WindowState>(DllId::Window)
+    }
+    pub fn d3d9(&mut self) -> &mut D3D9State {
+        self.dll_states.get_or_init::<D3D9State>(DllId::D3D9)
+    }
+    pub fn pthread(&mut self) -> &mut pthread::PthreadState {
+        self.dll_states
+            .get_or_init::<pthread::PthreadState>(DllId::Pthread)
+    }
+
+    /// Read-only access — returns `None` if the state was never initialised.
+    /// Use when the caller only holds `&Self`.
+    pub fn try_console(&self) -> Option<&console::ConsoleState> {
+        self.dll_states.get::<console::ConsoleState>(DllId::Console)
+    }
+    pub fn try_window_state(&self) -> Option<&WindowState> {
+        self.dll_states.get::<WindowState>(DllId::Window)
+    }
+    pub fn try_d3d9(&self) -> Option<&D3D9State> {
+        self.dll_states.get::<D3D9State>(DllId::D3D9)
+    }
+    pub fn try_pthread(&self) -> Option<&pthread::PthreadState> {
+        self.dll_states.get::<pthread::PthreadState>(DllId::Pthread)
+    }
+}
+
+/// Bundle of everything a WinAPI handler may need.
+///
+/// Passed as `HandlerContext` to every handler so adding new context
+/// fields doesn't touch handler signatures and the dispatch table is uniform.
+pub struct HandlerContext<'a> {
+    /// CPU engine (mem_read / mem_write / register access).
+    pub engine: &'a mut dyn CpuEngine,
+    /// Session environment (image base, command line, heap handle, …).
+    pub environment: WinApiEnvironment,
+    /// Full emulator state.
+    pub state: &'a mut WinApiState,
+}
+
+impl<'a> HandlerContext<'a> {
+    pub fn new(
+        engine: &'a mut dyn CpuEngine,
+        environment: WinApiEnvironment,
+        state: &'a mut WinApiState,
+    ) -> Self {
         Self {
-            heap: self.heap.clone(),
-            next_fls_index: self.next_fls_index,
-            fls_slots: self.fls_slots.clone(),
-            last_error: self.last_error,
-            next_registry_key_handle: self.next_registry_key_handle,
-            registry_keys: self.registry_keys.clone(),
-            next_find_handle: self.next_find_handle,
-            find_handles: self.find_handles.clone(),
-            executable_file_size: self.executable_file_size,
-            executable_file_bytes: self.executable_file_bytes.clone(),
-            main_module_file_name: self.main_module_file_name.clone(),
-            main_module_path: self.main_module_path.clone(),
-            threads: self.threads.clone(),
-            sync: self.sync.clone(),
-            bottle_root: self.bottle_root.clone(),
-            volumes: self.volumes.clone(),
-            executable_file_cursor: self.executable_file_cursor,
-            host_file_mounts: self.host_file_mounts.clone(),
-            virtual_files: self.virtual_files.clone(),
-            open_files: self.open_files.clone(),
-            next_file_handle: self.next_file_handle,
-            next_resource_handle: self.next_resource_handle,
-            resources: self.resources.clone(),
-            current_directory_wide: self.current_directory_wide.clone(),
-            window_long_ptr_values: self.window_long_ptr_values.clone(),
-            image_list_counts: self.image_list_counts.clone(),
-            image_list_background_colors: self.image_list_background_colors.clone(),
-            window_visible: self.window_visible,
-            window_enabled: self.window_enabled,
-            active_window_handle: self.active_window_handle,
-            foreground_window_handle: self.foreground_window_handle,
-            focus_window_handle: self.focus_window_handle,
-            capture_window_handle: self.capture_window_handle,
-            cursor_handle: self.cursor_handle,
-            window_title: self.window_title.clone(),
-            window_x: self.window_x,
-            window_y: self.window_y,
-            window_width: self.window_width,
-            window_height: self.window_height,
-            window_invalidated: self.window_invalidated,
-            tick_count: self.tick_count,
-            keyboard_state: self.keyboard_state,
-            next_timer_id: self.next_timer_id,
-            timers: self.timers.clone(),
-            next_global_atom: self.next_global_atom,
-            global_atoms: self.global_atoms.clone(),
-            next_windows_hook_handle: self.next_windows_hook_handle,
-            windows_hooks: self.windows_hooks.clone(),
-            d3d9_current_vertex_shader: self.d3d9_current_vertex_shader,
-            d3d9_current_fvf: self.d3d9_current_fvf,
-            d3d9_render_states: self.d3d9_render_states.clone(),
-            d3d9_texture_stage_states: self.d3d9_texture_stage_states.clone(),
-            d3d9_sampler_states: self.d3d9_sampler_states.clone(),
-            menu_item_states: self.menu_item_states.clone(),
-            menu_item_check_states: self.menu_item_check_states.clone(),
-            message_queue: self.message_queue.clone(),
-            next_message_time: self.next_message_time,
-            d3d9_device_object_address: self.d3d9_device_object_address,
-            d3d9_device_ref_count: self.d3d9_device_ref_count,
-            d3d9_object_address: self.d3d9_object_address,
-            d3d9_ref_count: self.d3d9_ref_count,
-            message_queue_idle_policy: self.message_queue_idle_policy,
-            next_window_class_atom: self.next_window_class_atom,
-            window_classes: self.window_classes.clone(),
-            next_window_handle: self.next_window_handle,
-            windows: self.windows.clone(),
-            get_proc_address_cache: self.get_proc_address_cache.clone(),
-            file_dialog_policy: self.file_dialog_policy.clone(),
-            last_file_dialog_path: self.last_file_dialog_path.clone(),
-            comm_dlg_extended_error: self.comm_dlg_extended_error,
-            next_menu_handle: self.next_menu_handle,
-            guest_io: self.guest_io.clone(),
-            guest_file_data_next: self.guest_file_data_next,
-            guest_fls_table_va: self.guest_fls_table_va,
-            stdin_bytes: self.stdin_bytes.clone(),
-            stdin_cursor: self.stdin_cursor,
-            stdin_mode: self.stdin_mode,
-            seh_pending: self.seh_pending.clone(),
-            import_resolver: None, // Box<dyn FnMut + Send> is not Clone
-            loaded_modules: self.loaded_modules.clone(),
-            next_module_handle: self.next_module_handle,
-            main_module_host_dir: self.main_module_host_dir.clone(),
+            engine,
+            environment,
+            state,
         }
     }
 }
@@ -564,8 +573,9 @@ pub struct GuestIoRuntimeConfig {
 }
 
 /// Host-side decision for `GetOpenFileName` / `GetSaveFileName`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum FileDialogPolicy {
+    #[default]
     /// Simulate the user cancelling the dialog (`return FALSE`).
     Cancel,
 
@@ -593,7 +603,11 @@ pub struct OpenGuestFile {
     pub handle: u64,
 
     /// Guest path used to open the file.
-    pub path: String,
+    ///
+    /// Stored as `Arc<str>` so the many `open_file.path.clone()` in Read/Write
+    /// / SetFilePointer / SetEndOfFile hot loops are refcount bumps instead of
+    /// full String copies. 100k-Read streams stop allocating 100k Strings.
+    pub path: Arc<str>,
 
     /// File contents (working buffer). Empty when [`Self::streaming`] is true.
     pub bytes: Vec<u8>,
@@ -602,7 +616,10 @@ pub struct OpenGuestFile {
     pub cursor: u64,
 
     /// When set, file is bottle/mount/D-backed and may be flushed/streamed here.
-    pub host_path: Option<std::path::PathBuf>,
+    ///
+    /// `Arc<Path>` for the same reason as [`Self::path`] — streaming Read/Write
+    /// clones per syscall.
+    pub host_path: Option<Arc<std::path::Path>>,
 
     /// Large host file: I/O via `host_path` seek/read/write without full buffer.
     pub streaming: bool,
@@ -619,10 +636,11 @@ impl OpenGuestFile {
     #[must_use]
     pub fn size(&self) -> u64 {
         if self.streaming {
+            // Route through the VFS stat cache rather than a bare `metadata`
+            // syscall — streaming WriteFile queries this per call.
             self.host_path
                 .as_ref()
-                .and_then(|p| std::fs::metadata(p).ok())
-                .map_or(0, |m| m.len())
+                .map_or(0, |p| vfs::host_file_len(p).unwrap_or(0))
         } else {
             u64::try_from(self.bytes.len()).unwrap_or(0)
         }
@@ -690,7 +708,7 @@ pub struct WindowClassRecord {
 }
 
 /// USER32 window created inside the compatibility runtime.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct WindowRecord {
     /// Runtime-owned fake HWND.
     pub handle: u64,
@@ -853,6 +871,10 @@ pub struct ResourceRecord {
 }
 
 /// Fake find-file handle (materialized directory enumeration).
+///
+/// `remaining` is a `VecDeque` so `FindNextFile` pops in O(1) via `pop_front`.
+/// Was `Vec<DirEntry>` + `remove(0)`, i.e. O(n) shift per FindNext — scanning a
+/// directory with N files became O(N²).
 #[derive(Debug, Clone)]
 pub struct FindHandle {
     /// Fake find handle.
@@ -862,7 +884,7 @@ pub struct FindHandle {
     pub pattern: String,
 
     /// Remaining entries after the one returned by FindFirst (FindNext consumes).
-    pub remaining: Vec<vfs::DirEntry>,
+    pub remaining: std::collections::VecDeque<vfs::DirEntry>,
 }
 
 /// Fake registry key.
@@ -899,8 +921,9 @@ pub struct FlsSlot {
 }
 
 /// Behavior of `GetMessageA` when no matching message is available.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MessageQueueIdlePolicy {
+    #[default]
     /// Produce a synthetic `WM_QUIT`.
     ///
     /// This preserves the deterministic bootstrap regression path.
@@ -949,6 +972,8 @@ pub enum HostParkReason {
         /// Guest `RTL_CRITICAL_SECTION*`.
         cs: u64,
     },
+    /// Waiting on a pthread object.
+    PthreadWait,
     /// `WaitForSingleObject` (or similar) on a kernel handle.
     WaitObject {
         /// Kernel handle.
@@ -968,6 +993,7 @@ pub use dispatch_table::{
     WINAPI_ID_COUNT, WinApiId, WinApiTraits, dispatch_winapi, dispatch_winapi_id,
     is_winapi_implemented, resolve_winapi_id, winapi_id_export,
 };
+use wie_cpu::CpuEngine;
 
 #[cfg(test)]
 #[expect(clippy::expect_used)]
@@ -983,8 +1009,9 @@ mod tests {
     /// Minimal engine for handler unit tests: maps guest pages with a valid return address on the stack.
     fn test_engine() -> IcedCpu {
         let mut cpu = IcedCpu::open_x86_64();
-        cpu.mem_map(0x1000, 0x10_0000, 7).expect("map test memory");
-        cpu.mem_map(STACK_VA, STACK_SIZE, 7)
+        cpu.mem_map(0x1000, 0x10_0000, wie_cpu::RwxPerms::ALL)
+            .expect("map test memory");
+        cpu.mem_map(STACK_VA, STACK_SIZE, wie_cpu::RwxPerms::ALL)
             .expect("map test stack");
         // Write a dummy return address — every handler calls return_from_win64_api which reads it.
         cpu.mem_write(STACK_TOP, &0_u64.to_le_bytes())
@@ -1023,7 +1050,10 @@ mod tests {
         let mut heap = GuestHeap::new(0x2000, 0x10000);
         heap.attach_guest_control(0x2000);
         WinApiState {
-            heap,
+            heap_state: HeapState {
+                heap,
+                ..winapi_state_default().heap_state
+            },
             ..winapi_state_default()
         }
     }
@@ -1032,89 +1062,75 @@ mod tests {
         // This must stay in sync with the fields of WinApiState.
         // Only the heap is customised; everything else is default.
         WinApiState {
-            heap: GuestHeap::new(0x2000, 0x10000),
-            next_fls_index: 0,
-            fls_slots: Vec::new(),
-            last_error: 0,
-            next_registry_key_handle: 0,
-            registry_keys: Vec::new(),
-            next_find_handle: 0,
-            find_handles: Vec::new(),
-            executable_file_size: 0,
-            executable_file_bytes: Vec::new(),
-            main_module_file_name: String::new(),
-            main_module_path: String::new(),
-            threads: ThreadState::primary(),
-            sync: SyncState::new(),
-            bottle_root: None,
-            volumes: VolumeConfig::default(),
-            // volumes.bottle_root kept in sync via set helpers / session
-            executable_file_cursor: 0,
-            host_file_mounts: Vec::new(),
-            virtual_files: Vec::new(),
-            open_files: HashMap::new(),
-            next_file_handle: 0,
-            next_resource_handle: 0,
-            resources: Vec::new(),
-            current_directory_wide: Vec::new(),
-            window_long_ptr_values: Vec::new(),
-            image_list_counts: Vec::new(),
-            image_list_background_colors: Vec::new(),
-            window_visible: false,
-            window_enabled: false,
-            active_window_handle: 0,
-            foreground_window_handle: 0,
-            focus_window_handle: 0,
-            capture_window_handle: 0,
-            cursor_handle: 0,
-            window_title: String::new(),
-            window_x: 0,
-            window_y: 0,
-            window_width: 0,
-            window_height: 0,
-            window_invalidated: false,
-            tick_count: 0,
-            keyboard_state: [0; 256],
-            next_timer_id: 0,
-            timers: Vec::new(),
-            next_global_atom: 0,
-            global_atoms: Vec::new(),
-            next_windows_hook_handle: 0,
-            windows_hooks: Vec::new(),
-            d3d9_current_vertex_shader: 0,
-            d3d9_current_fvf: 0,
-            d3d9_render_states: Vec::new(),
-            d3d9_texture_stage_states: Vec::new(),
-            d3d9_sampler_states: Vec::new(),
-            menu_item_states: Vec::new(),
-            menu_item_check_states: Vec::new(),
-            message_queue: Vec::new(),
-            next_message_time: 0,
-            d3d9_device_object_address: 0,
-            d3d9_device_ref_count: 0,
-            d3d9_object_address: 0,
-            d3d9_ref_count: 0,
-            message_queue_idle_policy: MessageQueueIdlePolicy::ExitOnIdle,
-            next_window_class_atom: 0,
-            window_classes: Vec::new(),
-            next_window_handle: 0,
-            windows: Vec::new(),
-            get_proc_address_cache: HashMap::new(),
-            file_dialog_policy: FileDialogPolicy::Cancel,
-            last_file_dialog_path: None,
-            comm_dlg_extended_error: 0,
-            next_menu_handle: 0,
-            guest_io: None,
-            guest_file_data_next: 0,
-            guest_fls_table_va: 0,
-            stdin_bytes: Vec::new(),
-            stdin_cursor: 0,
-            stdin_mode: GuestStdinMode::InjectOnly,
-            seh_pending: None,
-            import_resolver: None,
-            loaded_modules: HashMap::new(),
-            next_module_handle: dll_loader::REAL_MODULE_HANDLE_BASE,
-            main_module_host_dir: None,
+            heap_state: HeapState {
+                heap: GuestHeap::new(0x2000, 0x10000),
+                next_fls_index: 0,
+                fls_slots: Vec::new(),
+                guest_fls_table_va: 0,
+            },
+            file_io: FileIoState {
+                executable_file_size: 0,
+                executable_file_bytes: Vec::new(),
+                executable_file_cursor: 0,
+                next_find_handle: 0,
+                find_handles: Vec::new(),
+                host_file_mounts: Vec::new(),
+                virtual_files: Vec::new(),
+                open_files: HashMap::new(),
+                next_file_handle: 0,
+                next_resource_handle: 0,
+                resources: Vec::new(),
+                current_directory_wide: Vec::new(),
+                bottle_root: None,
+                volumes: VolumeConfig::default(),
+                guest_file_data_next: 0,
+                guest_io: None,
+                stdin_bytes: Vec::new(),
+                stdin_cursor: 0,
+                stdin_mode: GuestStdinMode::InjectOnly,
+                ucrt_files: HashMap::new(),
+                ucrt_next_file_va: 0x0000_0000_6900_0000,
+                cached_streams: HashMap::new(),
+            },
+            process: ProcessState {
+                last_error: 0,
+                next_registry_key_handle: 0,
+                registry_keys: Vec::new(),
+                main_module_file_name: String::new(),
+                main_module_path: String::new(),
+                main_module_host_dir: None,
+                error_mode: 0,
+                suspended_threads: HashMap::new(),
+                environment: DEFAULT_ENVIRONMENT
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .collect(),
+            },
+            kernel: KernelState {
+                threads: ThreadState::primary(),
+                sync: SyncState::new(),
+                seh_pending: HashMap::new(),
+            },
+            dll_states: DllStateMap::new(),
+            module_state: ModuleState {
+                loaded_modules: HashMap::new(),
+                import_resolver: None,
+                get_proc_address_cache: HashMap::new(),
+                next_module_handle: dll_loader::REAL_MODULE_HANDLE_BASE,
+            },
+        }
+    }
+
+    /// All-zero environment for handlers that don't read it.
+    fn test_environment() -> WinApiEnvironment {
+        WinApiEnvironment {
+            image_base: 0,
+            command_line_a_ptr: 0,
+            command_line_w_ptr: 0,
+            environment_strings_w_ptr: 0,
+            module_file_name_a_ptr: 0,
+            module_file_name_w_ptr: 0,
+            process_heap_handle: 0,
         }
     }
 
@@ -1134,11 +1150,26 @@ mod tests {
         // `test_engine` maps [0x1000, 0x101000); place CS there.
         let cs = 0x3000_u64;
         write_regs(&mut engine, cs, 0, 0, 0, 0);
-        kernel32::handle_initialize_critical_section(&mut engine).expect("init");
+        kernel32::handle_initialize_critical_section(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("init");
         write_regs(&mut engine, cs, 0, 0, 0, 0);
-        kernel32::handle_enter_critical_section(&mut engine, &state).expect("enter1");
+        kernel32::handle_enter_critical_section(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("enter1");
         write_regs(&mut engine, cs, 0, 0, 0, 0);
-        kernel32::handle_enter_critical_section(&mut engine, &state).expect("enter2");
+        kernel32::handle_enter_critical_section(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("enter2");
         let mut rec = [0_u8; 4];
         engine.mem_read(cs + 12, &mut rec).expect("read recursion");
         assert_eq!(u32::from_le_bytes(rec), 2);
@@ -1146,14 +1177,24 @@ mod tests {
         engine.mem_read(cs + 16, &mut owner).expect("read owner");
         assert_eq!(u64::from_le_bytes(owner), u64::from(PRIMARY_THREAD_ID));
         write_regs(&mut engine, cs, 0, 0, 0, 0);
-        kernel32::handle_leave_critical_section(&mut engine, &mut state).expect("leave1");
+        kernel32::handle_leave_critical_section(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("leave1");
         write_regs(&mut engine, cs, 0, 0, 0, 0);
-        kernel32::handle_leave_critical_section(&mut engine, &mut state).expect("leave2");
+        kernel32::handle_leave_critical_section(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("leave2");
         engine
             .mem_read(cs + 16, &mut owner)
             .expect("read owner unlocked");
         assert_eq!(u64::from_le_bytes(owner), 0);
-        assert_eq!(state.threads.current_tid(), PRIMARY_THREAD_ID);
+        assert_eq!(state.kernel.threads.current_tid(), PRIMARY_THREAD_ID);
     }
 
     #[test]
@@ -1166,48 +1207,40 @@ mod tests {
 
         // Increment → 1
         write_regs(&mut engine, cell, 0, 0, 0, 0);
-        let r = kernel32::dispatch_kernel32_extra(
-            &mut engine,
-            default_env(),
-            &mut state,
-            "InterlockedIncrement",
-        )
+        let r = {
+            let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
+            kernel32::dispatch_kernel32_extra(&mut ctx, "InterlockedIncrement")
+        }
         .expect("dispatch")
         .expect("handled");
         assert_eq!(rax_low_i32(r.return_value), 1);
 
         // ExchangeAdd(+5) returns previous 1, cell becomes 6
         write_regs(&mut engine, cell, 5, 0, 0, 0);
-        let r = kernel32::dispatch_kernel32_extra(
-            &mut engine,
-            default_env(),
-            &mut state,
-            "InterlockedExchangeAdd",
-        )
+        let r = {
+            let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
+            kernel32::dispatch_kernel32_extra(&mut ctx, "InterlockedExchangeAdd")
+        }
         .expect("dispatch")
         .expect("handled");
         assert_eq!(rax_low_i32(r.return_value), 1);
 
         // CompareExchange success 6→99
         write_regs(&mut engine, cell, 99, 6, 0, 0);
-        let r = kernel32::dispatch_kernel32_extra(
-            &mut engine,
-            default_env(),
-            &mut state,
-            "InterlockedCompareExchange",
-        )
+        let r = {
+            let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
+            kernel32::dispatch_kernel32_extra(&mut ctx, "InterlockedCompareExchange")
+        }
         .expect("dispatch")
         .expect("handled");
         assert_eq!(rax_low_i32(r.return_value), 6);
 
         // CompareExchange fail (expect 6, still 99)
         write_regs(&mut engine, cell, 1, 6, 0, 0);
-        let r = kernel32::dispatch_kernel32_extra(
-            &mut engine,
-            default_env(),
-            &mut state,
-            "InterlockedCompareExchange",
-        )
+        let r = {
+            let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
+            kernel32::dispatch_kernel32_extra(&mut ctx, "InterlockedCompareExchange")
+        }
         .expect("dispatch")
         .expect("handled");
         assert_eq!(rax_low_i32(r.return_value), 99);
@@ -1222,12 +1255,10 @@ mod tests {
             .mem_write(cell64, &10_i64.to_le_bytes())
             .expect("zero64");
         write_regs(&mut engine, cell64, 0, 0, 0, 0);
-        let r = kernel32::dispatch_kernel32_extra(
-            &mut engine,
-            default_env(),
-            &mut state,
-            "InterlockedIncrement64",
-        )
+        let r = {
+            let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
+            kernel32::dispatch_kernel32_extra(&mut ctx, "InterlockedIncrement64")
+        }
         .expect("dispatch")
         .expect("handled");
         assert_eq!(i64::from_le_bytes(r.return_value.to_le_bytes()), 11);
@@ -1238,8 +1269,15 @@ mod tests {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
         write_regs(&mut engine, 0x6100_0001, 0, 0, 0, 0);
-        assert_return_value!(kernel32::handle_free_library(&mut engine, &mut state), 1);
-        assert_eq!(state.last_error, 0);
+        assert_return_value!(
+            kernel32::handle_free_library(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            1
+        );
+        assert_eq!(state.process.last_error, 0);
     }
 
     #[test]
@@ -1247,16 +1285,28 @@ mod tests {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
         write_regs(&mut engine, 0, 0, 0, 0, 0);
-        assert_return_value!(kernel32::handle_free_library(&mut engine, &mut state), 0);
-        assert_eq!(state.last_error, 6); // ERROR_INVALID_HANDLE
+        assert_return_value!(
+            kernel32::handle_free_library(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            0
+        );
+        assert_eq!(state.process.last_error, 6); // ERROR_INVALID_HANDLE
     }
 
     #[test]
     fn test_get_last_error() {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
-        state.last_error = 123;
-        let r = kernel32::handle_get_last_error(&mut engine, &state).expect("GetLastError");
+        state.process.last_error = 123;
+        let r = kernel32::handle_get_last_error(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("GetLastError");
         assert_eq!(r.return_value, 123);
     }
 
@@ -1264,28 +1314,43 @@ mod tests {
     fn test_set_last_error() {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
-        state.last_error = 0;
+        state.process.last_error = 0;
         write_regs(&mut engine, 456, 0, 0, 0, 0);
-        let _ = kernel32::handle_set_last_error(&mut engine, &mut state).expect("SetLastError");
-        assert_eq!(state.last_error, 456);
+        let _ = kernel32::handle_set_last_error(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("SetLastError");
+        assert_eq!(state.process.last_error, 456);
     }
 
     #[test]
     fn test_heap_free_double_free_returns_false() {
         let mut engine = test_engine();
         let mut state = winapi_state_default();
-        let p = state.heap.alloc(64);
+        let p = state.heap_state.heap.alloc(64);
         assert_ne!(p, 0);
 
         write_regs(&mut engine, 0x1, 0, p, 0, 0);
-        let r = kernel32::handle_heap_free(&mut engine, &mut state).expect("HeapFree");
+        let r = kernel32::handle_heap_free(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("HeapFree");
         assert_eq!(r.return_value, 1, "first free must succeed");
 
-        state.last_error = 0;
+        state.process.last_error = 0;
         write_regs(&mut engine, 0x1, 0, p, 0, 0);
-        let r = kernel32::handle_heap_free(&mut engine, &mut state).expect("HeapFree double");
+        let r = kernel32::handle_heap_free(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("HeapFree double");
         assert_eq!(r.return_value, 0, "double free must return FALSE");
-        assert_eq!(state.last_error, 6, "ERROR_INVALID_HANDLE");
+        assert_eq!(state.process.last_error, 6, "ERROR_INVALID_HANDLE");
     }
 
     // --- User32 ---
@@ -1297,7 +1362,11 @@ mod tests {
         // VK_RETURN = 0x0D, keyboard_state starts all zero.
         write_regs(&mut engine, 0x0D, 0, 0, 0, 0);
         assert_return_value!(
-            user32::handle_get_async_key_state(&mut engine, &mut state),
+            user32::handle_get_async_key_state(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
             0
         );
     }
@@ -1306,10 +1375,15 @@ mod tests {
     fn test_get_async_key_state_down() {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
-        state.keyboard_state[0x0D] = 0x80; // VK_RETURN high bit set
+        // VK_RETURN high bit set — index is a compile-time constant in bounds.
+        state.window_state().keyboard_state.0[0x0D] = 0x80;
         write_regs(&mut engine, 0x0D, 0, 0, 0, 0);
         assert_return_value!(
-            user32::handle_get_async_key_state(&mut engine, &mut state),
+            user32::handle_get_async_key_state(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
             0x81
         );
     }
@@ -1320,7 +1394,14 @@ mod tests {
         let mut state = default_winapi_state();
         // Write a valid MSG struct address (doesn't matter since queue is empty).
         write_regs(&mut engine, 0x1000, 0, 0, 0, 0x2000);
-        assert_return_value!(user32::handle_peek_message_a(&mut engine, &mut state), 0);
+        assert_return_value!(
+            user32::handle_peek_message_a(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            0
+        );
     }
 
     #[test]
@@ -1330,25 +1411,37 @@ mod tests {
         let mut state = default_winapi_state();
         let msg_va = 0x4000;
         // Map memory for the MSG struct.
-        engine.mem_map(msg_va, 0x1000, 7).expect("map msg struct");
+        engine
+            .mem_map(msg_va, 0x1000, wie_cpu::RwxPerms::ALL)
+            .expect("map msg struct");
         // Push a WM_PAINT message for any window.
-        state.message_queue.push(QueuedWindowMessage {
-            window_handle: 0x100,
-            message: 15, // WM_PAINT
-            word_parameter: 0,
-            long_parameter: 0,
-            time: 1,
-            point_x: 0,
-            point_y: 0,
-        });
+        state
+            .window_state()
+            .message_queue
+            .push(QueuedWindowMessage {
+                window_handle: 0x100,
+                message: 15, // WM_PAINT
+                word_parameter: 0,
+                long_parameter: 0,
+                time: 1,
+                point_x: 0,
+                point_y: 0,
+            });
         // PeekMessageA(msg_ptr=msg_va, hwnd=0, min=0, max=0, wRemoveMsg=1)
         // wRemoveMsg is on the stack at RSP+0x28.
         write_regs(&mut engine, msg_va, 0, 0, 0, 0x3000);
         // Write wRemoveMsg=1 (PM_REMOVE) at RSP+0x28.
         engine.mem_write(0x3028, &1_u32.to_le_bytes()).ok();
-        assert_return_value!(user32::handle_peek_message_a(&mut engine, &mut state), 1);
+        assert_return_value!(
+            user32::handle_peek_message_a(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            1
+        );
         // WM_PAINT should have been removed from the queue.
-        assert_eq!(state.message_queue.len(), 0);
+        assert_eq!(state.window_state().message_queue.len(), 0);
     }
 
     #[test]
@@ -1357,22 +1450,34 @@ mod tests {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
         let msg_va = 0x4000;
-        engine.mem_map(msg_va, 0x1000, 7).expect("map msg struct");
-        state.message_queue.push(QueuedWindowMessage {
-            window_handle: 0x100,
-            message: 15,
-            word_parameter: 0,
-            long_parameter: 0,
-            time: 1,
-            point_x: 0,
-            point_y: 0,
-        });
+        engine
+            .mem_map(msg_va, 0x1000, wie_cpu::RwxPerms::ALL)
+            .expect("map msg struct");
+        state
+            .window_state()
+            .message_queue
+            .push(QueuedWindowMessage {
+                window_handle: 0x100,
+                message: 15,
+                word_parameter: 0,
+                long_parameter: 0,
+                time: 1,
+                point_x: 0,
+                point_y: 0,
+            });
         write_regs(&mut engine, msg_va, 0, 0, 0, 0x3000);
         // wRemoveMsg=0 (PM_NOREMOVE) at RSP+0x28.
         engine.mem_write(0x3028, &0_u32.to_le_bytes()).ok();
-        assert_return_value!(user32::handle_peek_message_a(&mut engine, &mut state), 1);
+        assert_return_value!(
+            user32::handle_peek_message_a(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            1
+        );
         // Message should still be in the queue.
-        assert_eq!(state.message_queue.len(), 1);
+        assert_eq!(state.window_state().message_queue.len(), 1);
     }
 
     // --- Comctl32 ---
@@ -1380,7 +1485,15 @@ mod tests {
     #[test]
     fn test_init_common_controls() {
         let mut engine = test_engine();
-        assert_return_value!(comctl32::handle_init_common_controls(&mut engine), 1);
+        let mut state = default_winapi_state();
+        assert_return_value!(
+            comctl32::handle_init_common_controls(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            1
+        );
     }
 
     // --- Comdlg32 ---
@@ -1390,9 +1503,18 @@ mod tests {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
         let cc_ptr = 0x5000;
-        engine.mem_map(cc_ptr, 0x1000, 7).expect("map CHOOSECOLOR");
+        engine
+            .mem_map(cc_ptr, 0x1000, wie_cpu::RwxPerms::ALL)
+            .expect("map CHOOSECOLOR");
         write_regs(&mut engine, cc_ptr, 0, 0, 0, 0);
-        assert_return_value!(comdlg32::handle_choose_color_a(&mut engine, &mut state), 1);
+        assert_return_value!(
+            comdlg32::handle_choose_color_a(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            1
+        );
         // rgbResult is at offset 0x10 in CHOOSECOLOR — should be RGB black (0).
         let mut rgb = [0_u8; 4];
         engine.mem_read(cc_ptr + 0x10, &mut rgb).ok();
@@ -1404,31 +1526,63 @@ mod tests {
     #[test]
     fn test_text_out_a_returns_cch() {
         let mut engine = test_engine();
+        let mut state = default_winapi_state();
         write_regs(&mut engine, 0x100, 10, 20, 0x2000, 0x3000);
         // cchString at RSP+0x28 = 5.
         engine.mem_write(0x3028, &5_u32.to_le_bytes()).ok();
-        assert_return_value!(gdi32::handle_text_out_a(&mut engine), 5);
+        assert_return_value!(
+            gdi32::handle_text_out_a(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            5
+        );
     }
 
     #[test]
     fn test_bit_blt_success() {
         let mut engine = test_engine();
+        let mut state = default_winapi_state();
         write_regs(&mut engine, 0x100, 0, 0, 100, 0);
-        assert_return_value!(gdi32::handle_bit_blt(&mut engine), 1);
+        assert_return_value!(
+            gdi32::handle_bit_blt(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            1
+        );
     }
 
     #[test]
     fn test_stretch_blt_success() {
         let mut engine = test_engine();
+        let mut state = default_winapi_state();
         write_regs(&mut engine, 0x100, 0, 0, 100, 0);
-        assert_return_value!(gdi32::handle_stretch_blt(&mut engine), 1);
+        assert_return_value!(
+            gdi32::handle_stretch_blt(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            1
+        );
     }
 
     #[test]
     fn test_pat_blt_success() {
         let mut engine = test_engine();
+        let mut state = default_winapi_state();
         write_regs(&mut engine, 0x100, 0, 0, 100, 0);
-        assert_return_value!(gdi32::handle_pat_blt(&mut engine), 1);
+        assert_return_value!(
+            gdi32::handle_pat_blt(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            1
+        );
     }
 
     // --- Advapi32 ---
@@ -1436,9 +1590,14 @@ mod tests {
     #[test]
     fn test_set_security_descriptor_dacl_null_fails() {
         let mut engine = test_engine();
+        let mut state = default_winapi_state();
         write_regs(&mut engine, 0, 0, 0, 0, 0);
         assert_return_value!(
-            advapi32::handle_set_security_descriptor_dacl(&mut engine),
+            advapi32::handle_set_security_descriptor_dacl(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
             0
         );
     }
@@ -1446,10 +1605,494 @@ mod tests {
     #[test]
     fn test_set_security_descriptor_dacl_valid_succeeds() {
         let mut engine = test_engine();
+        let mut state = default_winapi_state();
         write_regs(&mut engine, 0x1000, 1, 0x2000, 1, 0);
         assert_return_value!(
-            advapi32::handle_set_security_descriptor_dacl(&mut engine),
+            advapi32::handle_set_security_descriptor_dacl(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
             1
+        );
+    }
+
+    // ── Kernel32: new mock-data-free handlers ─────────────────────────
+
+    #[test]
+    fn test_is_debugger_present() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        assert_return_value!(
+            kernel32::handle_is_debugger_present(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            0
+        );
+    }
+
+    #[test]
+    fn test_debug_break() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        assert_return_value!(
+            kernel32::handle_debug_break(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            0
+        );
+    }
+
+    #[test]
+    fn test_output_debug_string_a() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        write_regs(&mut engine, 0x3000, 0, 0, 0, STACK_TOP);
+        engine.mem_write(0x3000, b"hello\0").ok();
+        assert_return_value!(
+            kernel32::handle_output_debug_string_a(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            1
+        );
+    }
+
+    #[test]
+    fn test_set_error_mode() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        state.process.error_mode = 0;
+        write_regs(&mut engine, 0x02, 0, 0, 0, STACK_TOP);
+        let r = kernel32::handle_set_error_mode(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("SetErrorMode");
+        // Previous mode was 0.
+        assert_eq!(r.return_value, 0);
+        assert_eq!(state.process.error_mode, 2);
+    }
+
+    #[test]
+    fn test_set_thread_error_mode() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        state.process.error_mode = 1;
+        let prev_ptr = 0x4000;
+        write_regs(&mut engine, 0x03, prev_ptr, 0, 0, STACK_TOP);
+        let r = kernel32::handle_set_thread_error_mode(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("SetThreadErrorMode");
+        assert_eq!(r.return_value, 1); // TRUE
+        assert_eq!(state.process.error_mode, 3);
+        let mut buf = [0_u8; 4];
+        engine.mem_read(prev_ptr, &mut buf).ok();
+        assert_eq!(u32::from_le_bytes(buf), 1); // previous mode written back
+    }
+
+    #[test]
+    fn test_get_long_path_name_w_returns_input() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        let src = 0x3000;
+        let dst = 0x4000;
+        let units: Vec<u16> = "C:\\test".encode_utf16().collect();
+        let mut bytes = Vec::new();
+        for u in &units {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        bytes.push(0);
+        bytes.push(0); // NUL terminator
+        engine.mem_write(src, &bytes).ok();
+        write_regs(&mut engine, src, dst, 260, 0, STACK_TOP);
+        let r = kernel32::handle_get_long_path_name_w(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("GetLongPathNameW");
+        assert_eq!(r.return_value, 7); // "C:\test" = 7 chars
+    }
+
+    #[test]
+    fn test_create_job_object_w() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        write_regs(&mut engine, 0, 0, 0, 0, STACK_TOP);
+        let r = kernel32::handle_create_job_object_w(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("CreateJobObjectW");
+        assert!(r.return_value != 0);
+    }
+
+    #[test]
+    fn test_assign_process_to_job_object() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        write_regs(&mut engine, 0x8000_0001, 0, 0, 0, STACK_TOP);
+        assert_return_value!(
+            kernel32::handle_assign_process_to_job_object(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            1
+        );
+    }
+
+    #[test]
+    fn test_terminate_process() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        state.kernel.sync.process_dying = false;
+        write_regs(&mut engine, 0x8000_0001, 0, 0, 0, STACK_TOP);
+        assert_return_value!(
+            kernel32::handle_terminate_process(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            1
+        );
+        assert!(state.kernel.sync.process_dying);
+    }
+
+    #[test]
+    fn test_open_thread_creates_handle() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        write_regs(&mut engine, 0x1000, 0, 0x5678, 0, STACK_TOP);
+        let r = kernel32::handle_open_thread(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("OpenThread");
+        assert!(r.return_value != 0);
+    }
+
+    #[test]
+    fn test_get_file_attributes_ex_w_not_found() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        let path_ptr = 0x3000;
+        engine
+            .mem_write(
+                path_ptr,
+                &"C:\\nonexistent"
+                    .encode_utf16()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            )
+            .ok();
+        engine.mem_write(path_ptr.wrapping_add(26), &[0, 0]).ok();
+        write_regs(
+            &mut engine,
+            path_ptr,
+            1, /* GetFileExInfoStandard */
+            0x4000,
+            0,
+            STACK_TOP,
+        );
+        let r = kernel32::handle_get_file_attributes_ex_w(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("GetFileAttributesExW");
+        assert_eq!(r.return_value, 0); // FALSE
+        assert_eq!(state.process.last_error, 2); // ERROR_FILE_NOT_FOUND
+    }
+
+    #[test]
+    fn test_backup_read_invalid_handle() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        write_regs(&mut engine, 0xDEAD, 0x4000, 64, 0x5000, STACK_TOP);
+        let r = kernel32::handle_backup_read(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("BackupRead");
+        assert_eq!(r.return_value, 0); // FALSE
+        assert_eq!(state.process.last_error, 6); // ERROR_INVALID_HANDLE
+    }
+
+    #[test]
+    fn test_suspend_thread_invalid_handle() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        write_regs(&mut engine, 0xDEAD, 0, 0, 0, STACK_TOP);
+        let _r = kernel32::handle_suspend_thread(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("SuspendThread");
+        assert_eq!(state.process.last_error, 6); // ERROR_INVALID_HANDLE
+    }
+
+    #[test]
+    fn test_lock_file_validates_handle() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        write_regs(&mut engine, 0xDEAD, 0, 0, 0, STACK_TOP);
+        let r = kernel32::handle_lock_file(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("LockFile");
+        assert_eq!(r.return_value, 0); // FALSE — invalid handle
+        assert_eq!(state.process.last_error, 6); // ERROR_INVALID_HANDLE
+    }
+
+    #[test]
+    fn test_set_file_valid_data_validates_handle() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        write_regs(&mut engine, 0xDEAD, 0, 0, 0, STACK_TOP);
+        let r = kernel32::handle_set_file_valid_data(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("SetFileValidData");
+        assert_eq!(r.return_value, 0); // FALSE — invalid handle
+        assert_eq!(state.process.last_error, 6);
+    }
+
+    // ── Shell32 ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_command_line_to_argv_w() {
+        use crate::guest_string::write_utf16_c_string;
+        let mut engine = test_engine();
+        let mut state = winapi_state_default();
+        let cmd_ptr = 0x3000;
+        let num_args_ptr = 0x4000;
+        // Write "hello" as the command line.
+        write_utf16_c_string(&mut engine, cmd_ptr, 10, "hello").ok();
+        engine.mem_write(num_args_ptr, &[0_u8; 4]).ok();
+        // Call handler directly.
+        write_regs(&mut engine, cmd_ptr, num_args_ptr, 0, 0, STACK_TOP);
+        let result = {
+            let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
+            shell32::dispatch_shell32(&mut ctx, "CommandLineToArgvW")
+        }
+        .expect("dispatch failed")
+        .expect("handler not found");
+        assert!(result.return_value != 0, "return_value is 0");
+        let mut argc_buf = [0_u8; 4];
+        engine.mem_read(num_args_ptr, &mut argc_buf).ok();
+        assert_eq!(u32::from_le_bytes(argc_buf), 1);
+    }
+
+    // ── OLEAUT32 ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_var_add() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        let presult = 0x3000;
+        let plhs = 0x4000;
+        let prhs = 0x5000;
+        // lhs = VT_I4, value = 10
+        engine.mem_write(plhs, &(3_u16).to_le_bytes()).ok(); // VT_I4
+        engine
+            .mem_write(plhs.wrapping_add(8), &10_u64.to_le_bytes())
+            .ok();
+        // rhs = VT_I4, value = 20
+        engine.mem_write(prhs, &(3_u16).to_le_bytes()).ok();
+        engine
+            .mem_write(prhs.wrapping_add(8), &20_u64.to_le_bytes())
+            .ok();
+        write_regs(&mut engine, presult, plhs, prhs, 0, STACK_TOP);
+        let r = {
+            let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
+            oleaut32::dispatch_oleaut32(&mut ctx, "VarAdd")
+        }
+        .expect("dispatch")
+        .expect("handled");
+        assert_eq!(r.return_value, 0); // S_OK
+        let mut result_vt = [0_u8; 2];
+        engine.mem_read(presult, &mut result_vt).ok();
+        assert_eq!(u16::from_le_bytes(result_vt), 3); // VT_I4
+        let mut result_val = [0_u8; 8];
+        engine
+            .mem_read(presult.wrapping_add(8), &mut result_val)
+            .ok();
+        assert_eq!(i64::from_le_bytes(result_val), 30);
+    }
+
+    #[test]
+    fn test_var_bstr_from_i4() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        let presult = 0x3000;
+        // VarBstrFromI4(42, 0, 0, &result)
+        write_regs(&mut engine, presult, 42, 0, 0, STACK_TOP);
+        let r = {
+            let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
+            oleaut32::dispatch_oleaut32(&mut ctx, "VarBstrFromI4")
+        }
+        .expect("dispatch")
+        .expect("handled");
+        assert_eq!(r.return_value, 0); // S_OK
+        let mut vt = [0_u8; 2];
+        engine.mem_read(presult, &mut vt).ok();
+        assert_eq!(u16::from_le_bytes(vt), 8); // VT_BSTR
+    }
+
+    // ── ADVAPI32 ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_reg_enum_key_ex() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        // Create a registry key with parent 0x7000_0001 (HKEY_CURRENT_USER)
+        let parent = 0x7000_0001;
+        state.process.registry_keys.push(crate::RegistryKey {
+            handle: 0x100,
+            parent,
+            subkey: "Software\\test".into(),
+        });
+        state.process.registry_keys.push(crate::RegistryKey {
+            handle: 0x101,
+            parent: 0x100,
+            subkey: "Nested".into(),
+        });
+        let name_buf = 0x4000;
+        let name_len_ptr = 0x5000;
+        let name_len: u32 = 32;
+        engine.mem_write(name_len_ptr, &name_len.to_le_bytes()).ok();
+        // RegEnumKeyExW(hKey=0x100, dwIndex=0, lpName=name_buf, lpcchName=name_len_ptr, ...)
+        write_regs(&mut engine, 0x100, 0, name_buf, name_len_ptr, STACK_TOP);
+        let r = {
+            let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
+            advapi32::dispatch_advapi32_extra(&mut ctx, "RegEnumKeyExW")
+        }
+        .expect("dispatch")
+        .expect("handled");
+        assert_eq!(r.return_value, 0); // ERROR_SUCCESS
+        let mut len_out = [0_u8; 4];
+        engine.mem_read(name_len_ptr, &mut len_out).ok();
+        assert_eq!(u32::from_le_bytes(len_out), 6); // "Nested" length
+    }
+
+    #[test]
+    fn test_reg_enum_value_returns_no_more() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        write_regs(&mut engine, 0x100, 0, 0x4000, 0x5000, STACK_TOP);
+        let r = {
+            let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
+            advapi32::dispatch_advapi32_extra(&mut ctx, "RegEnumValueW")
+        }
+        .expect("dispatch")
+        .expect("handled");
+        assert_eq!(r.return_value, 259); // ERROR_NO_MORE_ITEMS
+    }
+
+    // ── USER32 ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_get_menu_returns_zero_for_unknown_window() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        write_regs(&mut engine, 0xDEAD, 0, 0, 0, STACK_TOP);
+        assert_return_value!(
+            user32::handle_get_menu(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            0
+        );
+    }
+
+    #[test]
+    fn test_get_menu_returns_menu_handle() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        let hwnd = 0x100;
+        let hmenu = 0x200;
+        state.window_state().windows.push(crate::WindowRecord {
+            handle: hwnd,
+            menu_handle: hmenu,
+            ..Default::default()
+        });
+        write_regs(&mut engine, hwnd, 0, 0, 0, STACK_TOP);
+        let r = user32::handle_get_menu(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("GetMenu");
+        assert_eq!(r.return_value, hmenu);
+    }
+
+    // ── GDI32 ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_get_stock_object_white_brush() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        write_regs(&mut engine, 0, 0, 0, 0, STACK_TOP);
+        let r = gdi32::handle_get_stock_object(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("GetStockObject(WHITE_BRUSH)");
+        assert!(r.return_value != 0);
+    }
+
+    #[test]
+    fn test_get_stock_object_unknown_returns_zero() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        write_regs(&mut engine, 0xFF, 0, 0, 0, STACK_TOP);
+        assert_return_value!(
+            gdi32::handle_get_stock_object(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            0
+        );
+    }
+
+    // ── SEH hardware fault dispatch ──────────────────────────────────
+
+    #[test]
+    fn test_dispatch_hardware_fault_unhandled_returns_error() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        // No function tables registered → no handler found → should error.
+        let result = crate::seh::dispatch_hardware_fault(
+            &mut engine,
+            &mut state,
+            wie_cpu::exception_code::ACCESS_VIOLATION,
+            0x0, // fault at address 0
+        );
+        assert!(
+            result.is_err(),
+            "unhandled hardware fault should return error"
         );
     }
 }

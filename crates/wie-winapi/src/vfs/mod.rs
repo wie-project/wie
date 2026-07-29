@@ -11,10 +11,10 @@ pub mod volume;
 
 pub use backend::{
     BUFFER_SIZE_THRESHOLD, DEFAULT_SYNTHETIC_DIRS, DirEntry, FILE_ATTRIBUTE_ARCHIVE,
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, PathKind, PathStat, ResolveCtx, copy_host,
-    create_host_file, host_file_len, host_read_at, host_set_len, host_write_at, list_dir,
-    list_dir_filtered, mkdir_host, read_all_host, remove_dir_host, remove_file_host, rename_host,
-    stat_path,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, PathKind, PathStat, ResolveCtx,
+    cached_read_at, cached_write_at, copy_host, create_host_file, host_file_len, host_read_at,
+    host_set_len, host_write_at, list_dir, list_dir_filtered, mkdir_host, open_stream_cached,
+    read_all_host, remove_dir_host, remove_file_host, rename_host, stat_path,
 };
 pub use encoding::{
     CP_ACP, CP_OEMCP, CP_UTF8, decode_acp, encode_acp, multibyte_to_wide, wide_to_multibyte,

@@ -29,9 +29,9 @@ mod trampolines;
 pub use fast_api::{FastApiKind, JitFastPathConfig, JitHeapLayout};
 
 use crate::exec::{self, HookWindow, StepResult};
-use crate::mem::{self, GuestMemory, PAGE_SIZE, PAGE_SIZE_USIZE, protect};
+use crate::mem::{self, GuestMemory, PAGE_SIZE, PAGE_SIZE_USIZE};
 use crate::regs::RegFile;
-use crate::{CodeHookOutcome, InvalidMemoryAccess};
+use crate::{CodeHookOutcome, InvalidMemoryAccess, RwxPerms};
 use crate::{CpuEngine, CpuError, RunUntilHook};
 use block::{BlockKind, decode_pure_gpr_block, pure_is_self_loop};
 use fast_api::{
@@ -293,8 +293,7 @@ pub struct PerThreadJitState {
     /// Generation at which pins were last rebuilt.
     pub pins_gen: u64,
     /// Open-addressing guest VA → host block fn (late-bound block chaining).
-    pub chain_va: Box<[u64; CHAIN_SLOTS]>,
-    pub chain_fn: Box<[u64; CHAIN_SLOTS]>,
+    pub chain_slots: Box<[lower::ChainSlot; CHAIN_SLOTS]>,
     /// Phase 4.2 monomorphic edge IC.
     pub edge_ic_va: [u64; lower::EDGE_IC_SLOTS],
     pub edge_ic_fn: [u64; lower::EDGE_IC_SLOTS],
@@ -331,8 +330,7 @@ impl PerThreadJitState {
             sticky_rr: 0,
             pins: [MemPin::EMPTY; PIN_SLOTS],
             pins_gen: u64::MAX,
-            chain_va: Box::new([0; CHAIN_SLOTS]),
-            chain_fn: Box::new([0; CHAIN_SLOTS]),
+            chain_slots: Box::new([lower::ChainSlot::empty(); CHAIN_SLOTS]),
             edge_ic_va: [0; lower::EDGE_IC_SLOTS],
             edge_ic_fn: [0; lower::EDGE_IC_SLOTS],
             edge_ic_rr: 0,
@@ -578,6 +576,10 @@ impl JitCpu {
         self.invalidate_chain_and_shadow();
     }
 
+    // `fast_api_kind` was the on-demand helper used by the old peek loop;
+    // `block_kind_ends_in_fast_ucrt` inlines the same lookup on the miss path.
+    // Kept accessible for future callers (e.g. non-Pure fast-API detection).
+    #[allow(dead_code)]
     #[inline]
     fn fast_api_kind(&self, va: u64) -> Option<FastApiKind> {
         self.fast_api
@@ -661,12 +663,7 @@ impl JitCpu {
             for (va, entry) in &*cache {
                 if let CacheEntry::Ready(c) = entry {
                     let fn_ptr = c.func as usize as u64;
-                    chain_table_insert(
-                        self.thread.chain_va.as_mut(),
-                        self.thread.chain_fn.as_mut(),
-                        *va,
-                        fn_ptr,
-                    );
+                    chain_table_insert(self.thread.chain_slots.as_mut(), *va, fn_ptr);
                 }
             }
         }
@@ -873,9 +870,15 @@ impl JitCpu {
                     }
                 }
             } else {
-                // Miss: need write lock to insert.
-                let is_ucrt = self.peek_fast_ucrt_call(rip);
-                let is_loop = self.peek_self_loop(rip);
+                // Miss: decode the block once and route the same BlockKind through
+                // fast-UCRT / self-loop / try_compile. Was three iced-decode passes
+                // over the same up-to-96-insn body before.
+                let kind = {
+                    let mem = self.shared.mem.read().unwrap();
+                    block::decode_pure_gpr_block(&mem, self.thread.hooks.as_ref(), rip)
+                };
+                let is_ucrt = block_kind_ends_in_fast_ucrt(&self.shared, &self.fast_api, &kind);
+                let is_loop = pure_is_self_loop(&kind, rip);
                 let thr = if is_ucrt {
                     2
                 } else if is_loop {
@@ -884,7 +887,7 @@ impl JitCpu {
                     hotness_threshold()
                 };
                 if thr == 0 || is_ucrt {
-                    if let Some(compiled) = self.try_compile(rip) {
+                    if let Some(compiled) = self.try_compile_from_kind(rip, kind) {
                         let meta = CompiledRunMeta::from(&compiled);
                         self.insert_ready(rip, compiled);
                         return Ok(self.finish_compiled(rip, meta));
@@ -933,23 +936,21 @@ impl JitCpu {
     }
 
     /// True when a Pure block at `rip` ends in a near-call to a registered UCRT fast API.
+    ///
+    /// Kept for callers that don't already have a decoded [`BlockKind`] in hand
+    /// (currently none — the miss path pre-decodes and calls the helper below).
+    #[allow(dead_code)]
     fn peek_fast_ucrt_call(&self, rip: u64) -> bool {
         if self.fast_api.is_empty() {
             return false;
         }
         let mem = self.shared.mem.read().unwrap();
-        match decode_pure_gpr_block(&mem, self.thread.hooks.as_ref(), rip) {
-            BlockKind::Pure {
-                term: Some(block::BlockTerm::Call { target, .. }),
-                ..
-            } => {
-                let final_va = resolve_thunk_va(&mem, target);
-                self.fast_api_kind(final_va).is_some()
-            }
-            _ => false,
-        }
+        let kind = decode_pure_gpr_block(&mem, self.thread.hooks.as_ref(), rip);
+        drop(mem);
+        block_kind_ends_in_fast_ucrt(&self.shared, &self.fast_api, &kind)
     }
 
+    #[allow(dead_code)]
     fn peek_self_loop(&self, rip: u64) -> bool {
         let mem = self.shared.mem.read().unwrap();
         let kind = decode_pure_gpr_block(&mem, self.thread.hooks.as_ref(), rip);
@@ -957,9 +958,16 @@ impl JitCpu {
     }
 
     fn try_compile(&mut self, rip: u64) -> Option<CompiledBlock> {
-        let mem_guard = self.shared.mem.read().unwrap();
-        let result = decode_pure_gpr_block(&mem_guard, self.thread.hooks.as_ref(), rip);
-        drop(mem_guard); // release before compiling (engine needs mutable access)
+        let kind = {
+            let mem_guard = self.shared.mem.read().unwrap();
+            decode_pure_gpr_block(&mem_guard, self.thread.hooks.as_ref(), rip)
+        };
+        self.try_compile_from_kind(rip, kind)
+    }
+
+    /// Compile a block from an already-decoded [`BlockKind`], skipping the
+    /// full iced-decode pass that would otherwise repeat previous work.
+    fn try_compile_from_kind(&mut self, rip: u64, result: BlockKind) -> Option<CompiledBlock> {
         match result {
             BlockKind::Pure {
                 insns,
@@ -983,12 +991,7 @@ impl JitCpu {
                     self.stats.compiles = self.stats.compiles.saturating_add(1);
                     if jit_chain_enabled() {
                         let fn_ptr = compiled.func as usize as u64;
-                        chain_table_insert(
-                            self.thread.chain_va.as_mut(),
-                            self.thread.chain_fn.as_mut(),
-                            rip,
-                            fn_ptr,
-                        );
+                        chain_table_insert(self.thread.chain_slots.as_mut(), rip, fn_ptr);
                     }
                     tracing::debug!(
                         start = format_args!("{rip:#x}"),
@@ -1024,12 +1027,7 @@ impl JitCpu {
                         self.stats.compiles = self.stats.compiles.saturating_add(1);
                         if chain_on {
                             let fn_ptr = compiled.func as usize as u64;
-                            chain_table_insert(
-                                self.thread.chain_va.as_mut(),
-                                self.thread.chain_fn.as_mut(),
-                                rip,
-                                fn_ptr,
-                            );
+                            chain_table_insert(self.thread.chain_slots.as_mut(), rip, fn_ptr);
                         }
                         tracing::debug!(
                             start = format_args!("{rip:#x}"),
@@ -1095,22 +1093,21 @@ impl JitCpu {
         }
         {
             let stack = self.thread.pins[0];
-            self.stats.pin_stack_bytes = if stack.host_base != 0 {
-                stack.guest_end.saturating_sub(stack.guest_base)
-            } else {
+            self.stats.pin_stack_bytes = if stack.is_empty() {
                 0
+            } else {
+                stack.span_bytes()
             };
             let mut data_bytes = 0_u64;
             let mut bits = 0_u64;
-            if stack.host_base != 0 {
+            if !stack.is_empty() {
                 bits |= stack.allow & 0b11;
             }
             for (i, pin) in self.thread.pins.iter().enumerate().skip(1) {
-                if pin.host_base == 0 {
+                if pin.is_empty() {
                     continue;
                 }
-                data_bytes =
-                    data_bytes.saturating_add(pin.guest_end.saturating_sub(pin.guest_base));
+                data_bytes = data_bytes.saturating_add(pin.span_bytes());
                 // Pack first two data pins' allow into bits 2..5 for compact dump.
                 if i <= 2 {
                     let shift = (i.saturating_sub(1).saturating_add(1)) * 2;
@@ -1164,8 +1161,7 @@ impl JitCpu {
             xmm,
             shadow_sp: self.thread.shadow_sp,
             shadow_ret: self.thread.shadow_ret,
-            chain_va: self.thread.chain_va.as_mut_ptr(),
-            chain_fn: self.thread.chain_fn.as_mut_ptr(),
+            chain_slots: self.thread.chain_slots.as_mut_ptr(),
             tlb_hot_page: self.thread.tlb_hot_page,
             tlb_hot_ptr: self.thread.tlb_hot_ptr,
             // 0 = Cranelift path (host falls back to full writeback);
@@ -1261,14 +1257,16 @@ impl JitCpu {
             }
         }
         if meta.uses_sse {
-            // Prefer dynamic dirty bits; on fault use may_def so partial defs are visible.
-            let mut mask = if ctx.fault != 0 {
-                u16::try_from(ctx.xmm_dirty_bits).unwrap_or(0xffff) | meta.xmm_may_def_mask
-            } else if ctx.xmm_dirty_bits != 0 {
-                u16::try_from(ctx.xmm_dirty_bits).unwrap_or(0)
+            // Cranelift blocks skip the per-def `xmm_dirty_bits` RMW — the static
+            // `xmm_may_def_mask` covers them. Trampolines still set dirty from Rust,
+            // so we always OR both so trampoline-only writes and Cranelift writes
+            // are both covered.
+            let dirty = if ctx.fault != 0 {
+                u16::try_from(ctx.xmm_dirty_bits).unwrap_or(0xffff)
             } else {
-                meta.xmm_may_def_mask
+                u16::try_from(ctx.xmm_dirty_bits).unwrap_or(0)
             };
+            let mut mask = dirty | meta.xmm_may_def_mask;
             if mask == 0 {
                 mask = meta.xmm_live_mask;
             }
@@ -1284,7 +1282,7 @@ impl JitCpu {
                 i = i.saturating_add(1);
             }
         }
-        regs.rflags = ctx.rflags;
+        regs.set_rflags_checked(ctx.rflags);
         regs.rip = ctx.rip;
         let fault = if ctx.fault != 0 {
             Some(exec::InvalidMem {
@@ -1318,7 +1316,7 @@ impl JitCpu {
     }
 
     fn invalidate_chain_and_shadow(&mut self) {
-        chain_table_clear(self.thread.chain_va.as_mut(), self.thread.chain_fn.as_mut());
+        chain_table_clear(self.thread.chain_slots.as_mut());
         self.thread.edge_ic_va = [0; lower::EDGE_IC_SLOTS];
         self.thread.edge_ic_fn = [0; lower::EDGE_IC_SLOTS];
         self.thread.edge_ic_rr = 0;
@@ -1358,6 +1356,29 @@ fn ranges_overlap(a0: u64, a1: u64, b0: u64, b1: u64) -> bool {
 }
 
 /// Follow PE import thunks / short jumps to the final callee VA.
+/// Predicate over an already-decoded [`BlockKind`]: does its terminator call
+/// a registered UCRT fast-path API? Shared between `peek_fast_ucrt_call` and
+/// the miss-path pre-decode so the block is decoded only once.
+fn block_kind_ends_in_fast_ucrt(
+    shared: &JitShared,
+    fast_api: &[(u64, FastApiKind)],
+    kind: &BlockKind,
+) -> bool {
+    if fast_api.is_empty() {
+        return false;
+    }
+    let target = match kind {
+        BlockKind::Pure {
+            term: Some(block::BlockTerm::Call { target, .. }),
+            ..
+        } => *target,
+        _ => return false,
+    };
+    let mem = shared.mem.read().unwrap();
+    let final_va = resolve_thunk_va(&mem, target);
+    fast_api.iter().any(|&(k, _)| k == final_va)
+}
+
 fn resolve_thunk_va(mem: &GuestMemory, mut va: u64) -> u64 {
     let mut buf = [0_u8; 16];
     for _ in 0..4 {
@@ -1420,13 +1441,16 @@ fn jit_opt_level() -> &'static str {
     })
 }
 
-/// Run Cranelift IR verifier (`WIE_JIT_VERIFY=1` or always under `cfg(test)`).
+/// Run Cranelift IR verifier only when `WIE_JIT_VERIFY=1`.
+///
+/// Previously enabled under `cfg(test)` unconditionally — every test-driven
+/// perf run (release-mode `cargo test`) paid the verifier tax on every
+/// compile. Tests that need verifier coverage should set `WIE_JIT_VERIFY=1`
+/// explicitly. The oracle tests already exercise the lowering paths without
+/// requiring an always-on verifier.
 fn jit_verifier_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    if cfg!(test) {
-        return true;
-    }
     *ON.get_or_init(|| {
         matches!(
             std::env::var("WIE_JIT_VERIFY"),
@@ -1653,12 +1677,12 @@ impl JitEngine {
 }
 
 impl CpuEngine for JitCpu {
-    fn mem_map(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
-        let r = self.shared.mem.write().unwrap().map(address, size, perms);
-        self.shared.mem_gen.store(
-            self.shared.mem.read().unwrap().generation(),
-            Ordering::Release,
-        );
+    fn mem_map(&mut self, address: u64, size: usize, perms: RwxPerms) -> Result<(), CpuError> {
+        let mut mem = self.shared.mem.write().unwrap();
+        let r = mem.map(address, size, perms);
+        self.shared
+            .mem_gen
+            .store(mem.generation(), Ordering::Release);
         r
     }
 
@@ -1679,6 +1703,30 @@ impl CpuEngine for JitCpu {
             .read()
             .unwrap()
             .host_span(address, len, write)
+    }
+
+    fn host_slice(&self, address: u64, len: usize) -> Option<&[u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        let ptr = self
+            .shared
+            .mem
+            .read()
+            .unwrap()
+            .host_span(address, len, false)?;
+        // SAFETY: as `IcedCpu::host_slice` — the mmap arena outlives the read
+        // guard, and the `&self` borrow excludes concurrent unmapping.
+        #[expect(unsafe_code)]
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    fn mem_copy(&mut self, dst: u64, src: u64, len: usize) -> bool {
+        self.shared.mem.read().unwrap().mem_copy(dst, src, len)
+    }
+
+    fn mem_fill(&mut self, address: u64, byte: u8, len: usize) -> bool {
+        self.shared.mem.read().unwrap().mem_fill(address, byte, len)
     }
 
     fn mem_generation(&self) -> u64 {
@@ -1743,7 +1791,13 @@ impl CpuEngine for JitCpu {
             self.shared.mem.read().unwrap().generation(),
             Ordering::Release,
         );
-        if r.is_ok() && !protect::allows_execute(new_protect) {
+        // X-loss: dropping execute permission invalidates any compiled blocks
+        // over the range. An unparseable protect is treated as non-executable,
+        // matching the previous `allows_execute(u32)`, which returned false for
+        // values outside the supported set.
+        let loses_exec = crate::mem::protect::PageProtect::from_win32(new_protect)
+            .is_none_or(|p| !p.allows_execute());
+        if r.is_ok() && loses_exec {
             self.invalidate_code_range(addr, size);
         }
         self.invalidate_tlb();
@@ -1767,7 +1821,12 @@ impl CpuEngine for JitCpu {
         Ok(())
     }
 
-    fn mem_map_image(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
+    fn mem_map_image(
+        &mut self,
+        address: u64,
+        size: usize,
+        perms: RwxPerms,
+    ) -> Result<(), CpuError> {
         let r = self
             .shared
             .mem
@@ -1802,7 +1861,7 @@ impl CpuEngine for JitCpu {
         &mut self,
         hook_begin: u64,
         hook_end: u64,
-        stop_bitmap: Vec<u8>,
+        stop_bitmap: std::sync::Arc<[u8]>,
     ) -> Result<(), CpuError> {
         self.clear_compiled();
         self.invalidate_tlb();
@@ -1877,6 +1936,7 @@ impl CpuEngine for JitCpu {
                     },
                     invalid_memory: InvalidMemoryAccess {
                         hit: false,
+                        exception_code: 0,
                         access_type: 0,
                         address: 0,
                         size: 0,
@@ -1918,6 +1978,7 @@ impl CpuEngine for JitCpu {
                         },
                         invalid_memory: InvalidMemoryAccess {
                             hit: false,
+                            exception_code: 0,
                             access_type: 0,
                             address: 0,
                             size: 0,
@@ -1932,6 +1993,7 @@ impl CpuEngine for JitCpu {
                         },
                         invalid_memory: InvalidMemoryAccess {
                             hit: true,
+                            exception_code: crate::exception_code::ACCESS_VIOLATION,
                             access_type: inv.access_type,
                             address: inv.address,
                             size: inv.size,
@@ -1956,6 +2018,7 @@ impl CpuEngine for JitCpu {
                         },
                         invalid_memory: InvalidMemoryAccess {
                             hit: false,
+                            exception_code: 0,
                             access_type: 0,
                             address: 0,
                             size: 0,
@@ -1972,6 +2035,7 @@ impl CpuEngine for JitCpu {
                         },
                         invalid_memory: InvalidMemoryAccess {
                             hit: true,
+                            exception_code: crate::exception_code::ACCESS_VIOLATION,
                             access_type: inv.access_type,
                             address: inv.address,
                             size: inv.size,
@@ -1989,6 +2053,7 @@ impl CpuEngine for JitCpu {
             },
             invalid_memory: InvalidMemoryAccess {
                 hit: false,
+                exception_code: 0,
                 access_type: 0,
                 address: 0,
                 size: 0,
@@ -2088,8 +2153,8 @@ impl CpuEngine for JitCpu {
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::mem::protect;
     use crate::mem::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE};
-    use crate::perm;
 
     unsafe extern "C" fn dummy_block(_ctx: *mut JitCtx) {}
 
@@ -2111,12 +2176,7 @@ mod tests {
             );
             if jit_chain_enabled() {
                 let fn_ptr = dummy_block as *const () as usize as u64;
-                chain_table_insert(
-                    self.thread.chain_va.as_mut(),
-                    self.thread.chain_fn.as_mut(),
-                    rip,
-                    fn_ptr,
-                );
+                chain_table_insert(self.thread.chain_slots.as_mut(), rip, fn_ptr);
             }
             // Simulate edge IC hit for S6.
             self.thread.edge_ic_va[0] = rip;
@@ -2272,7 +2332,7 @@ mod tests {
             .page_tlb_entry(data >> 12)
             .expect("data tlb");
         assert!(e2.allow_r && e2.allow_w);
-        let _ = perm::ALL; // silence if unused in some cfgs
+        let _ = RwxPerms::ALL; // silence if unused in some cfgs
     }
 
     // --- Phase 7 stress residual (invalidation multi-region / FIC) ---

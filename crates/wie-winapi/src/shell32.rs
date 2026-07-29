@@ -1,7 +1,8 @@
 //! Minimal `shell32.dll` stubs (folder paths / browse UI) for CLI tools.
 
+use crate::guest_memory::write_u32 as write_guest_u32;
 use crate::guest_string::write_utf16_c_string;
-use crate::{WinApiHandlerResult, WinApiState};
+use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 use anyhow::{Context, Result};
 
 /// `S_OK` / success for SH* path APIs that return HRESULT.
@@ -21,15 +22,15 @@ fn ret(engine: &mut dyn wie_cpu::CpuEngine, value: u64) -> Result<WinApiHandlerR
 
 /// Soft dispatch for `shell32.dll`.
 pub fn dispatch_shell32(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    _state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
     let n = name.to_ascii_lowercase();
     match n.as_str() {
-        "shgetfolderpathw" => Ok(Some(handle_sh_get_folder_path_w(engine)?)),
-        "shgetpathfromidlistw" => Ok(Some(handle_sh_get_path_from_id_list_w(engine)?)),
-        "shbrowseforfolderw" => Ok(Some(handle_sh_browse_for_folder_w(engine)?)),
+        "shgetfolderpathw" => Ok(Some(handle_sh_get_folder_path_w(ctx)?)),
+        "shgetpathfromidlistw" => Ok(Some(handle_sh_get_path_from_id_list_w(ctx)?)),
+        "shbrowseforfolderw" => Ok(Some(handle_sh_browse_for_folder_w(ctx)?)),
+        "commandlinetoargvw" => Ok(Some(handle_command_line_to_argv_w(ctx)?)),
         _ => Ok(None),
     }
 }
@@ -38,7 +39,8 @@ pub fn dispatch_shell32(
 ///
 /// Fills a fixed bottle-friendly path under `C:\Users\WIE\…` style so tools
 /// that only need a writable home directory keep going.
-fn handle_sh_get_folder_path_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_sh_get_folder_path_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _hwnd = engine.read_rcx()?;
     let csidl = engine.read_rdx()? & 0xffff_ffff;
     let _token = engine.read_r8()?;
@@ -70,10 +72,109 @@ fn handle_sh_get_folder_path_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<Wi
     ret(engine, S_OK)
 }
 
-/// `BOOL SHGetPathFromIDListW(pidl, pszPath)` — no real PIDLs; fail cleanly.
-fn handle_sh_get_path_from_id_list_w(
+/// `LPWSTR* CommandLineToArgvW(LPCWSTR lpCmdLine, int* pNumArgs)`.
+///
+/// Parses a command-line string into an argv-style array, allocating the result
+/// and the argument strings from the process heap.
+fn handle_command_line_to_argv_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let cmd_line_ptr = engine.read_rcx()?;
+    let num_args_ptr = engine.read_rdx()?;
+    if cmd_line_ptr == 0 || num_args_ptr == 0 {
+        return ret(engine, 0); // NULL → failure
+    }
+    // Read the command line.
+    let mut units = Vec::new();
+    let mut i = 0_u64;
+    loop {
+        let mut b = [0_u8; 2];
+        engine.mem_read(cmd_line_ptr.wrapping_add(i.wrapping_mul(2)), &mut b)?;
+        let w = u16::from_le_bytes(b);
+        if w == 0 {
+            break;
+        }
+        units.push(w);
+        i = i.saturating_add(1);
+        if i > 8192 {
+            break;
+        }
+    }
+    // Parse into arguments (simple whitespace splitting).
+    let cmd = String::from_utf16_lossy(&units);
+    let mut args: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = false;
+    for ch in cmd.chars() {
+        if ch == '"' {
+            in_quote = !in_quote;
+        } else if ch.is_whitespace() && !in_quote {
+            if !current.is_empty() {
+                args.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    // Allocate argv array: one pointer per arg, plus NULL terminator.
+    let argv_bytes = args.len().saturating_add(1).checked_mul(8).unwrap_or(8);
+    let argv_va = state
+        .heap_state
+        .heap
+        .alloc_coherent(engine, u64::try_from(argv_bytes).unwrap_or(64));
+    if argv_va == 0 {
+        return ret(engine, 0);
+    }
+    let mut offset = 0_u64;
+    for arg in &args {
+        let units: Vec<u16> = arg.encode_utf16().collect();
+        let bstr = alloc_shell_bstr(engine, state, &units)?;
+        if bstr == 0 {
+            return ret(engine, 0);
+        }
+        engine.mem_write(argv_va.wrapping_add(offset), &bstr.to_le_bytes())?;
+        offset = offset.saturating_add(8);
+    }
+    // NULL terminator.
+    engine.mem_write(argv_va.wrapping_add(offset), &[0_u8; 8])?;
+    // Write argc.
+    let argc_u32 = u32::try_from(args.len()).unwrap_or(0);
+    drop(write_guest_u32(engine, num_args_ptr, argc_u32));
+    ret(engine, argv_va)
+}
+
+/// Allocate a shell-style BSTR from the process heap.
+fn alloc_shell_bstr(
     engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+    state: &mut WinApiState,
+    units: &[u16],
+) -> Result<u64> {
+    let byte_len = u32::try_from(units.len().saturating_mul(2)).unwrap_or(0);
+    let total = 4_u64
+        .saturating_add(u64::from(byte_len))
+        .saturating_add(2)
+        .saturating_add(8);
+    let raw = state.heap_state.heap.alloc_coherent(engine, total);
+    if raw == 0 {
+        return Ok(0);
+    }
+    let data = raw.wrapping_add(4);
+    engine.mem_write(data.wrapping_sub(4), &byte_len.to_le_bytes())?;
+    let mut bytes = Vec::with_capacity(units.len().saturating_mul(2).saturating_add(2));
+    for u in units {
+        bytes.extend_from_slice(&u.to_le_bytes());
+    }
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    engine.mem_write(data, &bytes)?;
+    Ok(data)
+}
+
+/// `BOOL SHGetPathFromIDListW(pidl, pszPath)` — no real PIDLs; fail cleanly.
+fn handle_sh_get_path_from_id_list_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _pidl = engine.read_rcx()?;
     let path_ptr = engine.read_rdx()?;
     if path_ptr != 0 {
@@ -83,9 +184,8 @@ fn handle_sh_get_path_from_id_list_w(
 }
 
 /// `PIDLIST_ABSOLUTE SHBrowseForFolderW(lpbi)` — no UI; return NULL.
-fn handle_sh_browse_for_folder_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+fn handle_sh_browse_for_folder_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _lpbi = engine.read_rcx()?;
     let _ = E_FAIL;
     ret(engine, 0)

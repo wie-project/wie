@@ -33,6 +33,10 @@ pub use mem::{
 };
 pub use regs::{RegFile, ThreadContext};
 
+/// Guest GS segment base — points to the Thread Environment Block (TEB).
+/// Shared with `wie_runtime::DEFAULT_LAYOUT.teb_low_base`.
+pub const GS_BASE: u64 = 0x0000_0000_7EFD_0000;
+
 /// Memory protection flags for [`CpuEngine::mem_map`] (Unicorn-compatible r/w/x bits).
 ///
 /// Convert to Windows `PAGE_*` via [`mem::protect::page_protect_from_rwx`].
@@ -45,6 +49,69 @@ pub mod perm {
     pub const EXEC: u32 = 4;
     /// Read + write + execute.
     pub const ALL: u32 = READ | WRITE | EXEC;
+}
+
+/// Unicorn-style read/write/execute permission bits.
+///
+/// Deliberately *not* interchangeable with [`mem::protect::PageProtect`]: the
+/// two encodings collide numerically (rwx `EXEC` == `PAGE_READWRITE` == `4`)
+/// while meaning different things, so mixing them silently either denied all
+/// access or widened it. Converting now requires naming the direction, via
+/// [`mem::protect::PageProtect::from_rwx`] / [`mem::protect::PageProtect::to_rwx`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RwxPerms(u32);
+
+impl RwxPerms {
+    /// No access.
+    pub const NONE: Self = Self(0);
+    /// Read + write + execute.
+    pub const ALL: Self = Self(perm::ALL);
+    /// Read only.
+    pub const READ: Self = Self(perm::READ);
+    /// Read + write (typical data mapping).
+    pub const READ_WRITE: Self = Self(perm::READ | perm::WRITE);
+
+    #[must_use]
+    pub const fn new(read: bool, write: bool, exec: bool) -> Self {
+        let mut bits = 0;
+        if read {
+            bits |= perm::READ;
+        }
+        if write {
+            bits |= perm::WRITE;
+        }
+        if exec {
+            bits |= perm::EXEC;
+        }
+        Self(bits)
+    }
+
+    /// Wrap raw Unicorn-style bits (host mapping APIs, legacy call sites).
+    #[must_use]
+    pub const fn from_bits(bits: u32) -> Self {
+        Self(bits & perm::ALL)
+    }
+
+    /// Raw bits, for the arena/mmap layer.
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn read(self) -> bool {
+        self.0 & perm::READ != 0
+    }
+
+    #[must_use]
+    pub const fn write(self) -> bool {
+        self.0 & perm::WRITE != 0
+    }
+
+    #[must_use]
+    pub const fn exec(self) -> bool {
+        self.0 & perm::EXEC != 0
+    }
 }
 
 /// Re-export for call sites that used the old Unicorn-shaped name.
@@ -61,11 +128,29 @@ pub struct CodeHookOutcome {
     pub size: u32,
 }
 
+/// Win32 exception codes for hardware faults.
+pub mod exception_code {
+    /// Access violation (read/write/execute of invalid memory).
+    pub const ACCESS_VIOLATION: u32 = 0xC000_0005;
+    /// Integer division by zero.
+    pub const INT_DIVIDE_BY_ZERO: u32 = 0xC000_0094;
+    /// Integer overflow (e.g. `INTO` with overflow flag set).
+    pub const INT_OVERFLOW: u32 = 0xC000_0095;
+    /// Stack overflow (page guard hit near stack limit).
+    pub const STACK_OVERFLOW: u32 = 0xC000_00FD;
+    /// Privileged instruction.
+    pub const PRIV_INSTRUCTION: u32 = 0xC000_0096;
+    /// Illegal instruction.
+    pub const ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
+}
+
 /// Invalid guest memory access diagnostics (demand-paging / faults).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InvalidMemoryAccess {
     /// Whether an invalid access was observed.
     pub hit: bool,
+    /// Win32 exception code (e.g. `exception_code::ACCESS_VIOLATION`).
+    pub exception_code: u32,
     /// Access type (backend-specific; 0 if unused).
     pub access_type: i32,
     /// Faulting address.
@@ -82,6 +167,9 @@ pub enum CpuError {
     /// Interpreter / JIT failure message.
     #[error("{0}")]
     Message(String),
+    /// Integer divide-by-zero at the given instruction pointer.
+    #[error("integer divide by zero at rip={0:#x}")]
+    DivideByZero(u64),
 }
 
 /// Outcome of running until a code hook or stop condition.
@@ -104,7 +192,7 @@ pub trait CpuEngine: Send {
     ///
     /// # Errors
     /// Backend mapping failure.
-    fn mem_map(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError>;
+    fn mem_map(&mut self, address: u64, size: usize, perms: RwxPerms) -> Result<(), CpuError>;
 
     /// Write guest memory.
     ///
@@ -129,6 +217,33 @@ pub trait CpuEngine: Send {
         None
     }
 
+    /// Borrow a contiguous guest range as a host slice for reading.
+    ///
+    /// The safe counterpart to [`Self::host_span`]: callers get a `&[u8]` whose
+    /// lifetime is tied to `&self`, so the borrow checker prevents holding it
+    /// across a mutation that could remap the arena. Prefer this over
+    /// `host_span` — it keeps `unsafe` inside this crate, which is the only one
+    /// permitted to use it.
+    ///
+    /// `None` when the range is unmapped, denied by software permissions, or
+    /// spans more than one arena; callers fall back to `mem_read`.
+    fn host_slice(&self, _address: u64, _len: usize) -> Option<&[u8]> {
+        None
+    }
+
+    /// Copy `len` bytes guest→guest with `memmove` semantics.
+    ///
+    /// Returns `false` when either side cannot be resolved to a single mapped
+    /// span, leaving the caller to fall back to `mem_read` + `mem_write`.
+    fn mem_copy(&mut self, _dst: u64, _src: u64, _len: usize) -> bool {
+        false
+    }
+
+    /// Fill `len` guest bytes with `byte`. `false` if not directly mappable.
+    fn mem_fill(&mut self, _address: u64, _byte: u8, _len: usize) -> bool {
+        false
+    }
+
     /// Guest memory generation epoch (TLB / pin invalidation). Default `0`.
     fn mem_generation(&self) -> u64 {
         0
@@ -142,7 +257,7 @@ pub trait CpuEngine: Send {
         &mut self,
         hook_begin: u64,
         hook_end: u64,
-        stop_bitmap: Vec<u8>,
+        stop_bitmap: std::sync::Arc<[u8]>,
     ) -> Result<(), CpuError>;
 
     /// Configure JIT direct-UCRT / heap fast path (no-op for non-JIT backends).
@@ -246,7 +361,12 @@ pub trait CpuEngine: Send {
     ///
     /// # Errors
     /// Backend mapping failure.
-    fn mem_map_image(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
+    fn mem_map_image(
+        &mut self,
+        address: u64,
+        size: usize,
+        perms: RwxPerms,
+    ) -> Result<(), CpuError> {
         self.mem_map(address, size, perms)
     }
 
@@ -322,7 +442,7 @@ pub trait CpuEngine: Send {
 }
 
 impl CpuEngine for Box<dyn CpuEngine> {
-    fn mem_map(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
+    fn mem_map(&mut self, address: u64, size: usize, perms: RwxPerms) -> Result<(), CpuError> {
         (**self).mem_map(address, size, perms)
     }
     fn mem_write(&mut self, address: u64, bytes: &[u8]) -> Result<(), CpuError> {
@@ -333,6 +453,15 @@ impl CpuEngine for Box<dyn CpuEngine> {
     }
     fn host_span(&mut self, address: u64, len: usize, write: bool) -> Option<*mut u8> {
         (**self).host_span(address, len, write)
+    }
+    fn host_slice(&self, address: u64, len: usize) -> Option<&[u8]> {
+        (**self).host_slice(address, len)
+    }
+    fn mem_copy(&mut self, dst: u64, src: u64, len: usize) -> bool {
+        (**self).mem_copy(dst, src, len)
+    }
+    fn mem_fill(&mut self, address: u64, byte: u8, len: usize) -> bool {
+        (**self).mem_fill(address, byte, len)
     }
     fn mem_generation(&self) -> u64 {
         (**self).mem_generation()
@@ -363,14 +492,19 @@ impl CpuEngine for Box<dyn CpuEngine> {
     fn flush_instruction_cache(&mut self, addr: u64, size: usize) -> Result<(), CpuError> {
         (**self).flush_instruction_cache(addr, size)
     }
-    fn mem_map_image(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
+    fn mem_map_image(
+        &mut self,
+        address: u64,
+        size: usize,
+        perms: RwxPerms,
+    ) -> Result<(), CpuError> {
         (**self).mem_map_image(address, size, perms)
     }
     fn install_runtime_hooks(
         &mut self,
         hook_begin: u64,
         hook_end: u64,
-        stop_bitmap: Vec<u8>,
+        stop_bitmap: std::sync::Arc<[u8]>,
     ) -> Result<(), CpuError> {
         (**self).install_runtime_hooks(hook_begin, hook_end, stop_bitmap)
     }

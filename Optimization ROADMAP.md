@@ -330,6 +330,65 @@ Headline: `long_loop` is **~100% track (A)** under JIT (~1.4s wall); iced cannot
 
 ---
 
+## Evaluated and rejected
+
+Optimizations that were investigated, measured, and deliberately **not** taken.
+Recorded so they are not re-litigated as oversights.
+
+### `PROT_NONE` on `MEM_RESERVE` + `mprotect` on commit — rejected
+
+**Proposal:** `va_reserve_only` maps the whole reserved span host-RW
+(`crate::perm::ALL`) even though SPC marks it `Reserved`. Map it `PROT_NONE`
+instead and open frames with `mprotect` on `MEM_COMMIT`, so a large
+`VirtualAlloc(MEM_RESERVE)` (e.g. a 1 GiB LZMA dictionary) does not sit
+host-writable, and stale host pointers into reserved space trap.
+
+**Measured benefit on macOS/arm64: zero.** An untouched 1 GiB anonymous
+`MAP_PRIVATE` mapping costs the same RSS under `PROT_READ|PROT_WRITE` as under
+`PROT_NONE` — nothing is resident until first touch:
+
+```text
+baseline RSS      = 1296 KB
+after 1GiB RW map = 1296 KB
+after 1GiB NONE   = 1296 KB
+after touch 4MiB  = 5392 KB   (+4096 KB, exactly the touched span)
+```
+
+`MAP_NORESERVE` is likewise a no-op for anonymous private mappings on Darwin,
+and this project is macOS-only, so it would be dead signalling.
+
+**Costs that remain:**
+
+1. **Inverts a core invariant.** Host `mprotect` is documented as a *supplement,
+   never the sole oracle* (SPC is the correctness plane). Making the host mapping
+   able to fault on a *legitimate committed* access moves it onto the correctness
+   path — and "full SIGSEGV-based memory fault handling" is an explicit non-goal
+   below.
+2. **Breaks the `WIE_MPROTECT=0` kill switch.** RUNBOOK lists it as the rollback
+   for "host mprotect noise / faults (SPC still enforces)". With a `PROT_NONE`
+   reserve and `mprotect` disabled, nothing would ever reopen the span, so every
+   access to committed memory would hard-fault. The safety valve would become a
+   crash switch.
+3. **`va_commit_only` does not call `sync_host_protect`.** Only two paths do
+   (`virtual_protect` and `va_release`), so commit would need a new call, with
+   strict ordering against JIT TLB/pin/sticky refill and `host_span` — each of
+   which hands raw host pointers to compiled code that does bare loads/stores.
+4. **Structurally incomplete anyway.** `host_prot_for_frame` intentionally
+   returns host RW for any 16 KiB host frame containing a `Reserved` or free
+   guest 4 KiB page ("keep host RW so SPC alone gates" — the 4K/16K clinch). So
+   every partially-committed frame stays RW regardless, leaving only
+   *fully*-reserved frames hardened.
+5. **`discard_range` writes through the arena.** `MEM_DECOMMIT` zeroes pages via
+   the storage layer, below SPC, so it would fault on a `PROT_NONE` frame unless
+   ordered against the re-protect.
+
+**Verdict:** negative cost/benefit — zero measured gain for a new hard-crash
+class in the one component whose kill switch must stay a safety valve. Revisit
+only if WIE ever gains a real SIGSEGV handler (the separate epic in Non-Goals),
+which would flip constraints 1–3.
+
+---
+
 ## Parallel Workstreams
 
 - **Performance (Memory)** – Phases 0–4, 7 (mostly independent).

@@ -1,6 +1,6 @@
 //! Minimal `ole32.dll` stubs for COM-touching CLI tools (e.g. 7-Zip).
 
-use crate::{WinApiHandlerResult, WinApiState};
+use crate::{HandlerContext, WinApiHandlerResult};
 use anyhow::{Context, Result};
 
 /// `S_OK`
@@ -23,35 +23,37 @@ fn ret(engine: &mut dyn wie_cpu::CpuEngine, value: u64) -> Result<WinApiHandlerR
 
 /// Soft dispatch for `ole32.dll` exports used by real tools.
 pub fn dispatch_ole32(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    _state: &mut WinApiState,
+    ctx: &mut HandlerContext<'_>,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
     let n = name.to_ascii_lowercase();
     match n.as_str() {
-        "coinitialize" => Ok(Some(handle_co_initialize(engine)?)),
-        "coinitializeex" => Ok(Some(handle_co_initialize_ex(engine)?)),
-        "couninitialize" => Ok(Some(handle_co_uninitialize(engine)?)),
-        "cocreateinstance" => Ok(Some(handle_co_create_instance(engine)?)),
+        "coinitialize" => Ok(Some(handle_co_initialize(ctx)?)),
+        "coinitializeex" => Ok(Some(handle_co_initialize_ex(ctx)?)),
+        "couninitialize" => Ok(Some(handle_co_uninitialize(ctx)?)),
+        "cocreateinstance" => Ok(Some(handle_co_create_instance(ctx)?)),
         _ => Ok(None),
     }
 }
 
 /// `HRESULT CoInitialize(LPVOID pvReserved)`
-fn handle_co_initialize(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_co_initialize(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _reserved = engine.read_rcx()?;
     ret(engine, S_OK)
 }
 
 /// `HRESULT CoInitializeEx(LPVOID, DWORD)`
-fn handle_co_initialize_ex(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_co_initialize_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _reserved = engine.read_rcx()?;
     let _coinit = engine.read_rdx()?;
     ret(engine, S_OK)
 }
 
 /// `void CoUninitialize(void)`
-fn handle_co_uninitialize(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_co_uninitialize(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     ret(engine, 0)
 }
 
@@ -59,7 +61,8 @@ fn handle_co_uninitialize(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiH
 ///
 /// No in-process COM servers in WIE yet — always `REGDB_E_CLASSNOTREG` and
 /// zero `*ppv` so callers take the non-COM path.
-fn handle_co_create_instance(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_co_create_instance(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let _clsid = engine.read_rcx()?;
     let _outer = engine.read_rdx()?;
     let _ctx = engine.read_r8()?;

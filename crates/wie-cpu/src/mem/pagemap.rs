@@ -3,17 +3,11 @@
 //! Absence of a page key means [`PageState::Free`]. Host storage is owned by the
 //! backend; this map is the Windows-visible correctness plane only.
 
-#![allow(clippy::unwrap_used)] // Mutex<RunCache> locks are infallible in practice
-
 use super::backend::{PAGE_SHIFT, PAGE_SIZE};
-use super::protect::{self, AccessKind};
+use super::protect::{AccessKind, PageProtect};
 use crate::CpuError;
 use std::collections::BTreeMap;
-use std::sync::Mutex;
-
-fn lock_cache(m: &Mutex<RunCache>) -> std::sync::MutexGuard<'_, RunCache> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Guest page lifecycle state (Microsoft Learn page states).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -27,6 +21,97 @@ pub enum PageState {
     Committed,
 }
 
+impl PageState {
+    #[inline]
+    fn to_bits(self) -> u64 {
+        match self {
+            Self::Free => 0,
+            Self::Reserved => 1,
+            Self::Committed => 2,
+        }
+    }
+    #[inline]
+    fn from_bits(v: u64) -> Self {
+        match v & 0b11 {
+            1 => Self::Reserved,
+            2 => Self::Committed,
+            _ => Self::Free,
+        }
+    }
+}
+
+/// Dense slot for [`PageProtect`] inside the packed cache.
+///
+/// Independent of the Windows `PAGE_*` numbering so the cache layout does not
+/// have to widen if a protection with a large constant is ever added.
+#[inline]
+fn protect_to_slot(p: PageProtect) -> u8 {
+    match p {
+        PageProtect::NoAccess => 0,
+        PageProtect::ReadOnly => 1,
+        PageProtect::ReadWrite => 2,
+        PageProtect::Execute => 3,
+        PageProtect::ExecuteRead => 4,
+        PageProtect::ExecuteReadWrite => 5,
+    }
+}
+
+#[inline]
+fn protect_from_slot(slot: u8) -> Option<PageProtect> {
+    match slot {
+        0 => Some(PageProtect::NoAccess),
+        1 => Some(PageProtect::ReadOnly),
+        2 => Some(PageProtect::ReadWrite),
+        3 => Some(PageProtect::Execute),
+        4 => Some(PageProtect::ExecuteRead),
+        5 => Some(PageProtect::ExecuteReadWrite),
+        _ => None,
+    }
+}
+
+/// Packed hot-run cache. Zero = invalid. Bit layout:
+/// - bit 0        : valid
+/// - bits 1..3    : state (2 bits)
+/// - bits 3..11   : protect slot (8 bits, see [`protect_to_slot`])
+/// - bits 11..35  : start_page (24 bits — up to 64 GiB VA)
+/// - bits 35..59  : pages_len (24 bits — up to 64 GiB span)
+///
+/// Runs whose start or length exceed the 24-bit window are simply not cached.
+#[inline]
+fn pack_cache(run: PageRun) -> u64 {
+    let len = run.end_page.saturating_sub(run.start_page);
+    if run.start_page >> 24 != 0 || len == 0 || len >> 24 != 0 {
+        return 0;
+    }
+    let mut v: u64 = 1; // valid
+    v |= (run.state.to_bits() & 0b11) << 1;
+    v |= (u64::from(protect_to_slot(run.protect)) & 0xff) << 3;
+    v |= (run.start_page & 0xff_ffff) << 11;
+    v |= (len & 0xff_ffff) << 35;
+    v
+}
+
+#[inline]
+fn cache_hit(packed: u64, page_key: u64) -> Option<PageRun> {
+    if packed & 1 == 0 {
+        return None;
+    }
+    let start = (packed >> 11) & 0xff_ffff;
+    let len = (packed >> 35) & 0xff_ffff;
+    let end = start.saturating_add(len);
+    if page_key < start || page_key >= end {
+        return None;
+    }
+    let state = PageState::from_bits(packed >> 1);
+    let protect = protect_from_slot(u8::try_from((packed >> 3) & 0xff).unwrap_or(0))?;
+    Some(PageRun {
+        start_page: start,
+        end_page: end,
+        state,
+        protect,
+    })
+}
+
 /// One homogeneous run of guest pages `[start_page, end_page)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageRun {
@@ -37,7 +122,7 @@ pub struct PageRun {
     /// Run state (never Free inside the map).
     pub state: PageState,
     /// Windows `PAGE_*` when committed; ignored for reserved (treat as no access).
-    pub protect: u32,
+    pub protect: PageProtect,
 }
 
 impl PageRun {
@@ -60,32 +145,25 @@ impl PageRun {
     }
 }
 
-/// Single-entry cache for hot SPC walks (stack/heap streams).
-#[derive(Debug, Clone, Copy, Default)]
-struct RunCache {
-    valid: bool,
-    start_page: u64,
-    end_page: u64,
-    state: PageState,
-    protect: u32,
-}
-
 /// Sparse run-length page map: `start_page → PageRun` (non-overlapping, sorted).
 ///
-/// Run-cache uses [`Mutex`] so SPC can run on shared [`GuestMemory`] borrows
-/// (interpreter reads, JIT helpers) while remaining `Sync`.
+/// The hot-path run cache is a lock-free packed [`AtomicU64`] — one relaxed
+/// load per `lookup`, one relaxed store per `fill_cache`. Previously used
+/// `Mutex<RunCache>`, which took a mutex per spanned page on every SPC
+/// `check_access` call (the dominant SPC cost on streaming workloads).
 #[derive(Debug)]
 pub struct PageMap {
     /// Keyed by `start_page`; runs do not overlap.
     runs: BTreeMap<u64, PageRun>,
-    cache: Mutex<RunCache>,
+    /// Packed hot-run cache (see [`pack_cache`] / [`cache_hit`]).
+    cache: AtomicU64,
 }
 
 impl Default for PageMap {
     fn default() -> Self {
         Self {
             runs: BTreeMap::new(),
-            cache: Mutex::new(RunCache::default()),
+            cache: AtomicU64::new(0),
         }
     }
 }
@@ -94,7 +172,7 @@ impl Clone for PageMap {
     fn clone(&self) -> Self {
         Self {
             runs: self.runs.clone(),
-            cache: Mutex::new(*lock_cache(&self.cache)),
+            cache: AtomicU64::new(self.cache.load(Ordering::Relaxed)),
         }
     }
 }
@@ -108,20 +186,15 @@ impl PageMap {
 
     /// Invalidate the hot-path run cache (after any mutation).
     fn bump_cache(&mut self) {
-        *lock_cache(&self.cache) = RunCache::default();
+        self.cache.store(0, Ordering::Relaxed);
     }
 
     /// Look up the run covering `page_key`, if any.
     #[must_use]
     pub fn lookup(&self, page_key: u64) -> Option<PageRun> {
-        let c = *lock_cache(&self.cache);
-        if c.valid && page_key >= c.start_page && page_key < c.end_page {
-            return Some(PageRun {
-                start_page: c.start_page,
-                end_page: c.end_page,
-                state: c.state,
-                protect: c.protect,
-            });
+        let packed = self.cache.load(Ordering::Relaxed);
+        if let Some(hit) = cache_hit(packed, page_key) {
+            return Some(hit);
         }
         // Greatest start_page ≤ page_key.
         let (&start, run) = self.runs.range(..=page_key).next_back()?;
@@ -135,13 +208,10 @@ impl PageMap {
 
     /// Cache a successful lookup for subsequent adjacent accesses.
     fn fill_cache(&self, run: PageRun) {
-        *lock_cache(&self.cache) = RunCache {
-            valid: true,
-            start_page: run.start_page,
-            end_page: run.end_page,
-            state: run.state,
-            protect: run.protect,
-        };
+        let packed = pack_cache(run);
+        if packed != 0 {
+            self.cache.store(packed, Ordering::Relaxed);
+        }
     }
 
     /// Software permission check for `[va, va+len)`.
@@ -168,7 +238,7 @@ impl PageMap {
             if run.state != PageState::Committed {
                 return Err(access_denied(va, kind, "not committed"));
             }
-            if !protect::allows(run.protect, kind) {
+            if !run.protect.allows(kind) {
                 return Err(access_denied(va, kind, "permission denied"));
             }
             self.fill_cache(run);
@@ -192,7 +262,7 @@ impl PageMap {
         address: u64,
         size: usize,
         state: PageState,
-        protect: u32,
+        protect: PageProtect,
     ) -> Result<(), CpuError> {
         if size == 0 {
             return Ok(());
@@ -220,7 +290,13 @@ impl PageMap {
     }
 
     /// Core mutator on page-key half-open range `[start_page, end_page)`.
-    fn set_page_range(&mut self, start_page: u64, end_page: u64, state: PageState, protect: u32) {
+    fn set_page_range(
+        &mut self,
+        start_page: u64,
+        end_page: u64,
+        state: PageState,
+        protect: PageProtect,
+    ) {
         if start_page >= end_page {
             return;
         }
@@ -337,18 +413,16 @@ fn access_denied(va: u64, kind: AccessKind, why: &str) -> CpuError {
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::mem::protect::{
-        PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
-    };
+    use crate::mem::protect::{AccessKind, PageProtect};
 
     #[test]
     fn set_and_lookup_committed() {
         let mut m = PageMap::new();
-        m.set_range(0x1000, 0x2000, PageState::Committed, PAGE_READWRITE)
+        m.set_range(0x1000, 0x2000, PageState::Committed, PageProtect::ReadWrite)
             .expect("set");
         let r = m.lookup(0x1000 >> 12).expect("run");
         assert_eq!(r.state, PageState::Committed);
-        assert_eq!(r.protect, PAGE_READWRITE);
+        assert_eq!(r.protect, PageProtect::ReadWrite);
         assert_eq!(r.page_count(), 2);
         assert!(m.lookup(0x3000 >> 12).is_none());
     }
@@ -356,9 +430,9 @@ mod tests {
     #[test]
     fn merge_adjacent_same_protect() {
         let mut m = PageMap::new();
-        m.set_range(0x1000, 0x1000, PageState::Committed, PAGE_READONLY)
+        m.set_range(0x1000, 0x1000, PageState::Committed, PageProtect::ReadOnly)
             .expect("a");
-        m.set_range(0x2000, 0x1000, PageState::Committed, PAGE_READONLY)
+        m.set_range(0x2000, 0x1000, PageState::Committed, PageProtect::ReadOnly)
             .expect("b");
         assert_eq!(m.run_count(), 1);
         let r = m.lookup(0x1000 >> 12).expect("run");
@@ -368,22 +442,31 @@ mod tests {
     #[test]
     fn split_on_protect_change() {
         let mut m = PageMap::new();
-        m.set_range(0x1000, 0x3000, PageState::Committed, PAGE_READWRITE)
+        m.set_range(0x1000, 0x3000, PageState::Committed, PageProtect::ReadWrite)
             .expect("set");
-        m.set_range(0x2000, 0x1000, PageState::Committed, PAGE_READONLY)
+        m.set_range(0x2000, 0x1000, PageState::Committed, PageProtect::ReadOnly)
             .expect("mid");
         assert_eq!(m.run_count(), 3);
-        assert_eq!(m.lookup(0x1000 >> 12).expect("l").protect, PAGE_READWRITE);
-        assert_eq!(m.lookup(0x2000 >> 12).expect("m").protect, PAGE_READONLY);
-        assert_eq!(m.lookup(0x3000 >> 12).expect("r").protect, PAGE_READWRITE);
+        assert_eq!(
+            m.lookup(0x1000 >> 12).expect("l").protect,
+            PageProtect::ReadWrite
+        );
+        assert_eq!(
+            m.lookup(0x2000 >> 12).expect("m").protect,
+            PageProtect::ReadOnly
+        );
+        assert_eq!(
+            m.lookup(0x3000 >> 12).expect("r").protect,
+            PageProtect::ReadWrite
+        );
     }
 
     #[test]
     fn free_removes_range() {
         let mut m = PageMap::new();
-        m.set_range(0x1000, 0x3000, PageState::Committed, PAGE_READWRITE)
+        m.set_range(0x1000, 0x3000, PageState::Committed, PageProtect::ReadWrite)
             .expect("set");
-        m.set_range(0x2000, 0x1000, PageState::Free, 0)
+        m.set_range(0x2000, 0x1000, PageState::Free, PageProtect::NoAccess)
             .expect("free");
         assert!(m.lookup(0x2000 >> 12).is_none());
         assert!(m.lookup(0x1000 >> 12).is_some());
@@ -393,7 +476,7 @@ mod tests {
     #[test]
     fn check_access_ro_write_fails() {
         let mut m = PageMap::new();
-        m.set_range(0x1000, 0x1000, PageState::Committed, PAGE_READONLY)
+        m.set_range(0x1000, 0x1000, PageState::Committed, PageProtect::ReadOnly)
             .expect("set");
         assert!(m.check_access(0x1000, 8, AccessKind::Read).is_ok());
         assert!(m.check_access(0x1000, 8, AccessKind::Write).is_err());
@@ -403,8 +486,13 @@ mod tests {
     #[test]
     fn check_access_rx_fetch_ok() {
         let mut m = PageMap::new();
-        m.set_range(0x1000, 0x1000, PageState::Committed, PAGE_EXECUTE_READ)
-            .expect("set");
+        m.set_range(
+            0x1000,
+            0x1000,
+            PageState::Committed,
+            PageProtect::ExecuteRead,
+        )
+        .expect("set");
         assert!(m.check_access(0x1000, 15, AccessKind::Execute).is_ok());
         assert!(m.check_access(0x1000, 8, AccessKind::Write).is_err());
     }
@@ -412,7 +500,7 @@ mod tests {
     #[test]
     fn check_access_reserved_denied() {
         let mut m = PageMap::new();
-        m.set_range(0x1000, 0x1000, PageState::Reserved, PAGE_NOACCESS)
+        m.set_range(0x1000, 0x1000, PageState::Reserved, PageProtect::NoAccess)
             .expect("set");
         assert!(m.check_access(0x1000, 1, AccessKind::Read).is_err());
     }
@@ -420,8 +508,13 @@ mod tests {
     #[test]
     fn check_access_cross_page_all_or_nothing() {
         let mut m = PageMap::new();
-        m.set_range(0x1000, 0x1000, PageState::Committed, PAGE_EXECUTE_READWRITE)
-            .expect("a");
+        m.set_range(
+            0x1000,
+            0x1000,
+            PageState::Committed,
+            PageProtect::ExecuteReadWrite,
+        )
+        .expect("a");
         // Second page unmapped — spanning write must fail entirely.
         let err = m
             .check_access(0x1ffc, 8, AccessKind::Write)
@@ -433,7 +526,7 @@ mod tests {
     #[test]
     fn check_access_cross_page_ok_when_both_committed() {
         let mut m = PageMap::new();
-        m.set_range(0x1000, 0x2000, PageState::Committed, PAGE_READWRITE)
+        m.set_range(0x1000, 0x2000, PageState::Committed, PageProtect::ReadWrite)
             .expect("set");
         m.check_access(0x1ffc, 8, AccessKind::Write).expect("ok");
     }

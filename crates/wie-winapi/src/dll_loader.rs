@@ -652,8 +652,9 @@ pub fn load_dll(
     let entry_rva = identity.entry_rva;
 
     // Step 2: Allocate a module handle.
-    let handle = state.next_module_handle;
-    state.next_module_handle = state
+    let handle = state.module_state.next_module_handle;
+    state.module_state.next_module_handle = state
+        .module_state
         .next_module_handle
         .checked_add(0x1000)
         .context("module handle overflow")?;
@@ -661,7 +662,7 @@ pub fn load_dll(
     // Step 3: Map guest memory. Try preferred base first.
     let load_base = preferred_base;
     let image_base = if engine
-        .mem_map(load_base, size_of_image, wie_cpu::perm::ALL)
+        .mem_map(load_base, size_of_image, wie_cpu::RwxPerms::ALL)
         .is_ok()
     {
         load_base
@@ -670,7 +671,7 @@ pub fn load_dll(
         // Use a VA derived from the handle (above fake module range).
         let alt_base = handle & !0xfff;
         engine
-            .mem_map(alt_base, size_of_image, wie_cpu::perm::ALL)
+            .mem_map(alt_base, size_of_image, wie_cpu::RwxPerms::ALL)
             .context("failed to map DLL image memory at alternative base")?;
         alt_base
     };
@@ -799,7 +800,10 @@ pub fn load_dll(
         export_count: exports.export_count,
     };
 
-    state.loaded_modules.insert(module_name, module.clone());
+    state
+        .module_state
+        .loaded_modules
+        .insert(module_name, module.clone());
 
     // Step 8: Apply section protections.
     apply_pe_section_protects(engine, &map_plan, image_base)

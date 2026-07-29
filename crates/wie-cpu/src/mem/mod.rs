@@ -265,10 +265,10 @@ impl GuestMemory {
             if page < run.start_page || page >= run.end_page {
                 return None;
             }
-            allow_r &= protect::allows_read(run.protect);
+            allow_r &= run.protect.allows_read();
             // Phase 4.x: never soft-translate writes onto executable pages so
             // SMC always hits `GuestMemory::write` + code-invalidate drain.
-            allow_w &= protect::allows_write(run.protect) && !protect::allows_execute(run.protect);
+            allow_w &= run.protect.allows_write() && !run.protect.allows_execute();
             saw = true;
             let next = run.end_page;
             if next <= page {
@@ -449,7 +449,7 @@ impl GuestMemory {
         &mut self,
         address: u64,
         size: usize,
-        perms: u32,
+        perms: crate::RwxPerms,
     ) -> Result<(), crate::CpuError> {
         self.map_with_type(address, size, perms, MemType::Private)
     }
@@ -459,7 +459,7 @@ impl GuestMemory {
         &mut self,
         address: u64,
         size: usize,
-        perms: u32,
+        perms: crate::RwxPerms,
     ) -> Result<(), crate::CpuError> {
         self.map_with_type(address, size, perms, MemType::Image)
     }
@@ -468,11 +468,12 @@ impl GuestMemory {
         &mut self,
         address: u64,
         size: usize,
-        perms: u32,
+        perms: crate::RwxPerms,
         mem_type: MemType,
     ) -> Result<(), crate::CpuError> {
-        self.backend.map(address, size, perms)?;
-        let protect = protect::page_protect_from_rwx(perms);
+        // The arena/mmap layer below still speaks raw rwx bits.
+        self.backend.map(address, size, perms.bits())?;
+        let protect = protect::PageProtect::from_rwx(perms);
         self.pages
             .set_range(address, size, PageState::Committed, protect)?;
         let size_u64 = u64::try_from(size).map_err(|_| {
@@ -510,12 +511,14 @@ impl GuestMemory {
         if size == 0 {
             return Err(va_error(ERROR_INVALID_PARAMETER, "VirtualProtect size 0"));
         }
-        if !protect::is_supported_protect(new_protect) {
-            return Err(va_error(
+        // Parsing *is* the validation: an unsupported `PAGE_*` cannot become a
+        // `PageProtect`, so no separate `is_supported_protect` check is needed.
+        let new_protect = protect::PageProtect::from_win32(new_protect).ok_or_else(|| {
+            va_error(
                 ERROR_INVALID_PARAMETER,
                 "VirtualProtect unsupported protect",
-            ));
-        }
+            )
+        })?;
         let page_base = align_down(addr, PAGE_SIZE);
         let end = addr
             .checked_add(
@@ -542,7 +545,7 @@ impl GuestMemory {
         }
         let mut page = page_base >> 12;
         let last = page_end >> 12;
-        let mut old_protect = 0_u32;
+        let mut old_protect = protect::PageProtect::NoAccess;
         let mut first = true;
         while page < last {
             match self.pages.lookup(page) {
@@ -579,7 +582,7 @@ impl GuestMemory {
             .set_range(page_base, size_usize, PageState::Committed, new_protect)?;
         self.bump_generation();
         self.sync_host_protect(page_base, size_usize);
-        Ok(old_protect)
+        Ok(old_protect.to_win32())
     }
 
     /// `VirtualQuery` — build a real `MEMORY_BASIC_INFORMATION` for `addr`.
@@ -640,14 +643,14 @@ impl GuestMemory {
         let base_address = run_start.saturating_mul(PAGE_SIZE);
         let region_size = run_end.saturating_sub(run_start).saturating_mul(PAGE_SIZE);
         let (state, protect) = match run.state {
-            PageState::Committed => (MEM_COMMIT, run.protect),
+            PageState::Committed => (MEM_COMMIT, run.protect.to_win32()),
             PageState::Reserved => (MEM_RESERVE, 0),
             PageState::Free => (MEM_FREE, 0),
         };
         MemoryBasicInformation {
             base_address,
             allocation_base: node.allocation_base,
-            allocation_protect: node.allocation_protect,
+            allocation_protect: node.allocation_protect.to_win32(),
             region_size,
             state,
             protect,
@@ -751,17 +754,17 @@ impl GuestMemory {
         let mut need_w = false;
         let mut any_committed = false;
         let mut uniform = true;
-        let mut first_protect: Option<u32> = None;
+        let mut first_protect: Option<protect::PageProtect> = None;
         let mut page = frame;
         let end = frame.saturating_add(host_ps);
         while page < end {
             match self.pages.lookup(page >> 12) {
                 Some(run) if run.state == PageState::Committed => {
                     any_committed = true;
-                    if protect::allows_read(run.protect) || protect::allows_execute(run.protect) {
+                    if run.protect.allows_read() || run.protect.allows_execute() {
                         need_r = true;
                     }
-                    if protect::allows_write(run.protect) {
+                    if run.protect.allows_write() {
                         need_w = true;
                     }
                     match first_protect {
@@ -798,8 +801,8 @@ impl GuestMemory {
         }
         // Uniform: optional tighten.
         match first_protect {
-            Some(p) if protect::allows_write(p) => HOST_PROT_READ | HOST_PROT_WRITE,
-            Some(p) if protect::allows_read(p) || protect::allows_execute(p) => HOST_PROT_READ,
+            Some(p) if p.allows_write() => HOST_PROT_READ | HOST_PROT_WRITE,
+            Some(p) if p.allows_read() || p.allows_execute() => HOST_PROT_READ,
             _ => HOST_PROT_READ | HOST_PROT_WRITE,
         }
     }
@@ -835,12 +838,11 @@ impl GuestMemory {
                 "VirtualAlloc unsupported allocation type flags",
             ));
         }
-        if !protect::is_supported_protect(protect) {
-            return Err(va_error(
-                ERROR_INVALID_PARAMETER,
-                "VirtualAlloc unsupported protect",
-            ));
-        }
+        // Parsing is the validation (see `virtual_protect`); the typed value
+        // then flows to the reserve/commit helpers so they cannot be handed an
+        // unvalidated or wrongly-encoded protection.
+        let protect = protect::PageProtect::from_win32(protect)
+            .ok_or_else(|| va_error(ERROR_INVALID_PARAMETER, "VirtualAlloc unsupported protect"))?;
 
         if do_reserve && do_commit {
             self.va_reserve_and_commit(addr, size, protect)
@@ -883,7 +885,7 @@ impl GuestMemory {
         &mut self,
         addr: u64,
         size: usize,
-        protect: u32,
+        protect: protect::PageProtect,
     ) -> Result<u64, crate::CpuError> {
         let (base, size_u64) = self.align_reserve_request(addr, size)?;
         self.ensure_pages_free(base, size_u64)?;
@@ -891,12 +893,13 @@ impl GuestMemory {
         let size_usize = usize::try_from(size_u64)
             .map_err(|_| va_error(ERROR_NOT_ENOUGH_MEMORY, "reserve size does not fit usize"))?;
         // Host RW; SPC uses Reserved so guest cannot touch until commit.
-        self.backend.map(base, size_usize, crate::perm::ALL)?;
+        self.backend
+            .map(base, size_usize, crate::RwxPerms::ALL.bits())?;
         self.pages.set_range(
             base,
             size_usize,
             PageState::Reserved,
-            protect::PAGE_NOACCESS,
+            protect::PageProtect::NoAccess,
         )?;
         self.vad.insert(VadNode {
             allocation_base: base,
@@ -913,7 +916,7 @@ impl GuestMemory {
         &mut self,
         addr: u64,
         size: usize,
-        protect: u32,
+        protect: protect::PageProtect,
     ) -> Result<u64, crate::CpuError> {
         let (base, size_u64) = self.align_reserve_request(addr, size)?;
         self.ensure_pages_free(base, size_u64)?;
@@ -921,7 +924,7 @@ impl GuestMemory {
             .map_err(|_| va_error(ERROR_NOT_ENOUGH_MEMORY, "alloc size does not fit usize"))?;
         // Host storage for full span.
         self.backend
-            .map(base, size_usize, protect::rwx_from_page_protect(protect))?;
+            .map(base, size_usize, protect.to_rwx().bits())?;
         self.pages
             .set_range(base, size_usize, PageState::Committed, protect)?;
         self.vad.insert(VadNode {
@@ -939,7 +942,7 @@ impl GuestMemory {
         &mut self,
         addr: u64,
         size: usize,
-        protect: u32,
+        protect: protect::PageProtect,
     ) -> Result<u64, crate::CpuError> {
         if addr == 0 {
             // COMMIT with NULL address is not supported without RESERVE in Phase 3.
@@ -1000,11 +1003,8 @@ impl GuestMemory {
 
         // Storage already present from RESERVE; only re-map if somehow missing.
         if self.backend.page_data_ptr_walk(page_base >> 12).is_none() {
-            self.backend.map(
-                page_base,
-                size_usize,
-                protect::rwx_from_page_protect(protect),
-            )?;
+            self.backend
+                .map(page_base, size_usize, protect.to_rwx().bits())?;
         }
         self.pages
             .set_range(page_base, size_usize, PageState::Committed, protect)?;
@@ -1070,7 +1070,7 @@ impl GuestMemory {
             page_base,
             size_usize,
             PageState::Reserved,
-            protect::PAGE_NOACCESS,
+            protect::PageProtect::NoAccess,
         )?;
         self.bump_generation();
         Ok(())
@@ -1086,8 +1086,12 @@ impl GuestMemory {
         // Bump generation BEFORE unmap so concurrent readers see the change
         // and abort their generation-guarded access before the arena is freed.
         self.bump_generation();
-        self.pages
-            .set_range(node.allocation_base, size_usize, PageState::Free, 0)?;
+        self.pages.set_range(
+            node.allocation_base,
+            size_usize,
+            PageState::Free,
+            protect::PageProtect::NoAccess,
+        )?;
         let _ = self.vad.remove_base(addr);
         self.backend.unmap_range(node.allocation_base, size_usize);
         Ok(())
@@ -1216,6 +1220,47 @@ impl GuestMemory {
     /// On success, the returned pointer is valid for `len` bytes for the lifetime
     /// of this `GuestMemory` borrow (and until the covering arena is released).
     #[must_use]
+    /// Copy `len` bytes guest→guest without bouncing through a host buffer.
+    ///
+    /// Uses `memmove` semantics, so overlapping ranges are well defined — which
+    /// is what `memmove` needs and what `memcpy` callers get for free. Returns
+    /// `false` when either side is not a single mapped span with the required
+    /// permission, leaving the caller to fall back to read+write.
+    pub(crate) fn mem_copy(&self, dst: u64, src: u64, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let (Some(s), Some(d)) = (
+            self.host_span(src, len, false),
+            self.host_span(dst, len, true),
+        ) else {
+            return false;
+        };
+        // SAFETY: both spans validated for `len` bytes with the needed
+        // permission; `copy` (memmove) is defined for overlapping ranges.
+        #[expect(unsafe_code)]
+        unsafe {
+            std::ptr::copy(s, d, len);
+        }
+        true
+    }
+
+    /// Fill `len` guest bytes with `byte`. Returns `false` if not mappable.
+    pub(crate) fn mem_fill(&self, address: u64, byte: u8, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let Some(d) = self.host_span(address, len, true) else {
+            return false;
+        };
+        // SAFETY: span validated writable for `len` bytes.
+        #[expect(unsafe_code)]
+        unsafe {
+            std::ptr::write_bytes(d, byte, len);
+        }
+        true
+    }
+
     pub(crate) fn host_span(&self, address: u64, len: usize, write: bool) -> Option<*mut u8> {
         if len == 0 {
             return None;
@@ -1362,11 +1407,11 @@ impl GuestMemory {
         if run.state != PageState::Committed {
             return None;
         }
-        let allow_r = protect::allows_read(run.protect);
-        let allow_x = protect::allows_execute(run.protect);
+        let allow_r = run.protect.allows_read();
+        let allow_x = run.protect.allows_execute();
         // Phase 4.x: W soft-translate is denied on executable pages so stores
         // cannot silently SMC under sticky/pin/TLB without `GuestMemory::write`.
-        let allow_w = protect::allows_write(run.protect) && !allow_x;
+        let allow_w = run.protect.allows_write() && !allow_x;
         // NOACCESS / no usable rights → no TLB entry.
         // Keep RX pages installable for data reads (allow_r).
         if !allow_r && !allow_w && !allow_x {
@@ -1388,7 +1433,7 @@ impl GuestMemory {
         let last = end.saturating_sub(1) >> backend::PAGE_SHIFT;
         while page <= last {
             if let Some(run) = self.pages.lookup(page) {
-                if run.state == PageState::Committed && protect::allows_execute(run.protect) {
+                if run.state == PageState::Committed && run.protect.allows_execute() {
                     return true;
                 }
                 let next = run.end_page;
@@ -1462,7 +1507,8 @@ mod tests {
     #[test]
     fn page_table_walk_matches_map() {
         let mut mem = GuestMemory::new();
-        mem.map(0x10_0000, 0x2000, 7).expect("map");
+        mem.map(0x10_0000, 0x2000, crate::RwxPerms::ALL)
+            .expect("map");
         let k = page_key(0x10_0000);
         let p = mem.page_data_ptr_walk(k).expect("walk");
         assert!(!p.is_null());
@@ -1475,7 +1521,8 @@ mod tests {
     fn page_table_high_va() {
         let mut mem = GuestMemory::new();
         let base = 0x0000_7fff_0000_0000_u64;
-        mem.map(base, 0x1000, 7).expect("map high");
+        mem.map(base, 0x1000, crate::RwxPerms::ALL)
+            .expect("map high");
         let k = page_key(base);
         assert!(mem.page_data_ptr_walk(k).is_some());
     }
@@ -1488,9 +1535,10 @@ mod tests {
             RegionKind::Stack,
             0x2000_0000,
             0x1_0000,
-            7,
+            crate::RwxPerms::ALL,
         ));
-        mem.map(0x2000_0000, 0x1_0000, 7).expect("map stack");
+        mem.map(0x2000_0000, 0x1_0000, crate::RwxPerms::ALL)
+            .expect("map stack");
         assert_eq!(mem.find_region(0x2000_0800).expect("found").name, "stack");
         assert_eq!(mem.backend_name(), "mmap");
     }
@@ -1499,36 +1547,28 @@ mod tests {
     fn span_pin_and_va_slots_from_private_vad() {
         let mut mem = GuestMemory::new();
         // Stack + heap named regions (slots 0/1).
-        mem.map(
-            0x2000_0000,
-            0x1_0000,
-            crate::perm::READ | crate::perm::WRITE,
-        )
-        .expect("stack");
+        mem.map(0x2000_0000, 0x1_0000, crate::RwxPerms::READ_WRITE)
+            .expect("stack");
         mem.register_region(GuestRegion::new(
             "stack",
             RegionKind::Stack,
             0x2000_0000,
             0x1_0000,
-            crate::perm::READ | crate::perm::WRITE,
+            crate::RwxPerms::READ_WRITE,
         ));
-        mem.map(
-            0x1600_0000_0000,
-            0x10_0000,
-            crate::perm::READ | crate::perm::WRITE,
-        )
-        .expect("heap");
+        mem.map(0x1600_0000_0000, 0x10_0000, crate::RwxPerms::READ_WRITE)
+            .expect("heap");
         mem.register_region(GuestRegion::new(
             "process_heap",
             RegionKind::Heap,
             0x1600_0000_0000,
             0x10_0000,
-            crate::perm::READ | crate::perm::WRITE,
+            crate::RwxPerms::READ_WRITE,
         ));
         // Separate VirtualAlloc-like private span (should fill a VA pin slot).
         let va_base = 0x0000_0001_2000_0000_u64;
         let va_size = 0x40_0000_usize; // 4 MiB
-        mem.map(va_base, va_size, crate::perm::READ | crate::perm::WRITE)
+        mem.map(va_base, va_size, crate::RwxPerms::READ_WRITE)
             .expect("va");
 
         let pins = mem.jit_region_pins();
@@ -1565,13 +1605,14 @@ mod tests {
     #[test]
     fn mmap_backend_host_base_on_register() {
         let mut mem = GuestMemory::new();
-        mem.map(0x2000_0000, 0x1_0000, 7).expect("map stack");
+        mem.map(0x2000_0000, 0x1_0000, crate::RwxPerms::ALL)
+            .expect("map stack");
         mem.register_region(GuestRegion::new(
             "stack",
             RegionKind::Stack,
             0x2000_0000,
             0x1_0000,
-            7,
+            crate::RwxPerms::ALL,
         ));
         let r = mem.find_region(0x2000_0800).expect("found");
         let hb = r.host_base.expect("host_base should be filled from arena");
@@ -1584,7 +1625,8 @@ mod tests {
     #[test]
     fn mmap_page_ptr_walk() {
         let mut mem = GuestMemory::new();
-        mem.map(0x10_0000, 0x2000, 7).expect("map");
+        mem.map(0x10_0000, 0x2000, crate::RwxPerms::ALL)
+            .expect("map");
         let k = page_key(0x10_0000);
         let p = mem.page_data_ptr_walk(k).expect("walk");
         let p2 = mem.page_data_ptr(k).expect("ptr");
@@ -1594,7 +1636,7 @@ mod tests {
     #[test]
     fn spc_readonly_write_fails_read_ok() {
         let mut mem = GuestMemory::new();
-        mem.map(0x20_0000, 0x1000, crate::perm::READ)
+        mem.map(0x20_0000, 0x1000, crate::RwxPerms::READ)
             .expect("map RO");
         let mut buf = [0_u8; 4];
         mem.read(0x20_0000, &mut buf).expect("read ok");
@@ -1607,7 +1649,7 @@ mod tests {
     #[test]
     fn page_tlb_entry_tags_ro_and_bumps_gen_on_protect() {
         let mut mem = GuestMemory::new();
-        mem.map(0x50_0000, 0x1000, crate::perm::ALL)
+        mem.map(0x50_0000, 0x1000, crate::RwxPerms::ALL)
             .expect("map RWX");
         let k = page_key(0x50_0000);
         let e0 = mem.page_tlb_entry(k).expect("tlb entry");
@@ -1632,12 +1674,12 @@ mod tests {
     #[test]
     fn page_tlb_entry_rw_allows_w_rx_denies_w() {
         let mut mem = GuestMemory::new();
-        mem.map(0x52_0000, 0x1000, crate::perm::READ | crate::perm::WRITE)
+        mem.map(0x52_0000, 0x1000, crate::RwxPerms::READ_WRITE)
             .expect("map RW");
         let e = mem.page_tlb_entry(page_key(0x52_0000)).expect("rw");
         assert!(e.allow_r && e.allow_w);
 
-        mem.map(0x53_0000, 0x1000, crate::perm::READ | crate::perm::EXEC)
+        mem.map(0x53_0000, 0x1000, crate::RwxPerms::new(true, false, true))
             .expect("map RX");
         let e2 = mem.page_tlb_entry(page_key(0x53_0000)).expect("rx");
         assert!(e2.allow_r && !e2.allow_w);
@@ -1646,7 +1688,8 @@ mod tests {
     #[test]
     fn page_tlb_entry_none_for_noaccess() {
         let mut mem = GuestMemory::new();
-        mem.map(0x51_0000, 0x1000, 0).expect("map NA");
+        mem.map(0x51_0000, 0x1000, crate::RwxPerms::NONE)
+            .expect("map NA");
         // perms 0 → PAGE_NOACCESS after map_with_type
         assert!(mem.page_tlb_entry(page_key(0x51_0000)).is_none());
     }
@@ -1655,14 +1698,14 @@ mod tests {
     fn region_pin_requires_host_base_and_intersects_protect() {
         // Mmap backend fills host_base; uniform RW → full pin.
         let mut mem = GuestMemory::new();
-        mem.map(0x2000_0000, 0x1_0000, crate::perm::ALL)
+        mem.map(0x2000_0000, 0x1_0000, crate::RwxPerms::ALL)
             .expect("map stack");
         mem.register_region(GuestRegion::new(
             "stack",
             RegionKind::Stack,
             0x2000_0000,
             0x1_0000,
-            crate::perm::ALL,
+            crate::RwxPerms::ALL,
         ));
         let r = mem.find_region(0x2000_0800).expect("region").clone();
         // Map used ALL (RWX) — Phase 4.x: pin is R-only when any page is X.
@@ -1697,7 +1740,7 @@ mod tests {
             RegionKind::Stack,
             0x2000_0000,
             0x1000,
-            crate::perm::ALL,
+            crate::RwxPerms::ALL,
         ));
         let r = mem.find_region(0x2000_0000).expect("region").clone();
         assert!(r.host_base.is_none());
@@ -1708,7 +1751,7 @@ mod tests {
     fn host_span_single_page() {
         let mut mem = GuestMemory::new();
         // Pure RW data — host-span write allowed (not executable).
-        mem.map(0x40_0000, 0x2000, crate::perm::READ | crate::perm::WRITE)
+        mem.map(0x40_0000, 0x2000, crate::RwxPerms::READ_WRITE)
             .expect("map");
         let p = mem
             .host_span(0x40_0100, 64, true)
@@ -1727,7 +1770,7 @@ mod tests {
     #[test]
     fn host_span_multi_page_mmap() {
         let mut mem = GuestMemory::new();
-        mem.map(0x50_0000, 0x3000, crate::perm::READ | crate::perm::WRITE)
+        mem.map(0x50_0000, 0x3000, crate::RwxPerms::READ_WRITE)
             .expect("map");
         let len = 0x2000_usize;
         let p = mem
@@ -1747,7 +1790,7 @@ mod tests {
     #[test]
     fn host_span_ro_write_denied() {
         let mut mem = GuestMemory::new();
-        mem.map(0x60_0000, 0x1000, crate::perm::READ | crate::perm::WRITE)
+        mem.map(0x60_0000, 0x1000, crate::RwxPerms::READ_WRITE)
             .expect("map");
         mem.virtual_protect(0x60_0000, 0x1000, protect::PAGE_READONLY)
             .expect("ro");
@@ -1758,7 +1801,7 @@ mod tests {
     #[test]
     fn host_span_write_denied_on_executable() {
         let mut mem = GuestMemory::new();
-        mem.map(0x61_0000, 0x1000, crate::perm::ALL)
+        mem.map(0x61_0000, 0x1000, crate::RwxPerms::ALL)
             .expect("map RWX");
         // Phase 4.x: no host-span write onto X pages (SMC via write + invalidate).
         assert!(mem.host_span(0x61_0000, 16, true).is_none());
@@ -1769,9 +1812,9 @@ mod tests {
     fn region_pin_disabled_when_gap_in_range() {
         let mut mem = GuestMemory::new();
         // Two committed islands with a free hole between them.
-        mem.map(0x3000_0000, 0x1000, crate::perm::ALL)
+        mem.map(0x3000_0000, 0x1000, crate::RwxPerms::ALL)
             .expect("map a");
-        mem.map(0x3000_2000, 0x1000, crate::perm::ALL)
+        mem.map(0x3000_2000, 0x1000, crate::RwxPerms::ALL)
             .expect("map b");
         // Register a region that claims the hole too (host_base from first arena).
         mem.register_region(GuestRegion::new(
@@ -1779,7 +1822,7 @@ mod tests {
             RegionKind::Other,
             0x3000_0000,
             0x3000,
-            crate::perm::ALL,
+            crate::RwxPerms::ALL,
         ));
         // host_base may be set from first map only covering part of region —
         // pin must still reject the free middle page.
@@ -1792,7 +1835,7 @@ mod tests {
     #[test]
     fn spc_rx_fetch_ok_write_fails() {
         let mut mem = GuestMemory::new();
-        mem.map(0x30_0000, 0x1000, crate::perm::READ | crate::perm::EXEC)
+        mem.map(0x30_0000, 0x1000, crate::RwxPerms::new(true, false, true))
             .expect("map RX");
         // Seed bytes via backend would bypass SPC; map is zeroed — fetch still ok.
         let mut out = [0_u8; 15];
@@ -1811,7 +1854,7 @@ mod tests {
     #[test]
     fn spc_cross_page_all_or_nothing() {
         let mut mem = GuestMemory::new();
-        mem.map(0x50_0000, 0x1000, crate::perm::ALL)
+        mem.map(0x50_0000, 0x1000, crate::RwxPerms::ALL)
             .expect("map one");
         // Write straddling into unmapped second page must not partial-write.
         let payload = [0xAAu8; 8];
@@ -1824,7 +1867,8 @@ mod tests {
     #[test]
     fn spc_readonly_on_mmap() {
         let mut mem = GuestMemory::new();
-        mem.map(0x60_0000, 0x1000, crate::perm::READ).expect("map");
+        mem.map(0x60_0000, 0x1000, crate::RwxPerms::READ)
+            .expect("map");
         assert!(
             mem.write(0x60_0000, &[1]).is_err(),
             "backend {}",
@@ -1837,10 +1881,11 @@ mod tests {
     #[test]
     fn map_updates_pagemap_committed() {
         let mut mem = GuestMemory::new();
-        mem.map(0x70_0000, 0x2000, crate::perm::ALL).expect("map");
+        mem.map(0x70_0000, 0x2000, crate::RwxPerms::ALL)
+            .expect("map");
         let run = mem.page_map().query_run(0x70_0000).expect("run");
         assert_eq!(run.state, PageState::Committed);
-        assert_eq!(run.protect, protect::PAGE_EXECUTE_READWRITE);
+        assert_eq!(run.protect, protect::PageProtect::ExecuteReadWrite);
         assert!(mem.generation() >= 1);
     }
 
@@ -2072,7 +2117,8 @@ mod tests {
         let mut mem = GuestMemory::new();
         // High canonical-ish guest VA (not low 4 GiB identity).
         let base = 0x0000_7fff_0000_0000_u64;
-        mem.map(base, 0x2000, crate::perm::ALL).expect("map high");
+        mem.map(base, 0x2000, crate::RwxPerms::ALL)
+            .expect("map high");
         mem.write(base + 0x100, &[0xaa, 0xbb, 0xcc, 0xdd])
             .expect("write");
         let mut buf = [0_u8; 4];
@@ -2091,7 +2137,7 @@ mod tests {
         let base = u64::MAX - 0xfff;
         let aligned = base & !0xfff; // 0xffff_ffff_ffff_f000
         let err = mem
-            .map(aligned, 0x2000, crate::perm::ALL)
+            .map(aligned, 0x2000, crate::RwxPerms::ALL)
             .expect_err("wrap");
         let s = err.to_string();
         assert!(
@@ -2134,7 +2180,7 @@ mod tests {
     fn phase7_anti_wine_soft_translate() {
         let mut mem = GuestMemory::new();
         let guest = 0x1800_0000_u64;
-        mem.map(guest, 0x1_0000, crate::perm::ALL).expect("map");
+        mem.map(guest, 0x1_0000, crate::RwxPerms::ALL).expect("map");
         if let Some(page) = mem.page_data_ptr(page_key(guest)) {
             let host = u64::try_from(page.addr()).expect("host addr");
             // Soft translate: host pointer is OS-chosen, never the guest VA.
@@ -2165,7 +2211,7 @@ mod tests {
     #[test]
     fn generation_guard_catches_release() {
         let mut mem = GuestMemory::new();
-        mem.map(0x1_0000, 0x3000, crate::perm::READ | crate::perm::WRITE)
+        mem.map(0x1_0000, 0x3000, crate::RwxPerms::READ_WRITE)
             .expect("map");
         mem.write(0x1_0100, &[1, 2, 3, 4]).expect("seed");
 
@@ -2186,7 +2232,7 @@ mod tests {
     #[test]
     fn generation_guard_rejects_stale_gen() {
         let mut mem = GuestMemory::new();
-        mem.map(0x2_0000, 0x3000, crate::perm::READ | crate::perm::WRITE)
+        mem.map(0x2_0000, 0x3000, crate::RwxPerms::READ_WRITE)
             .expect("map");
         mem.write(0x2_0100, &[0x11, 0x22]).expect("seed");
 
@@ -2195,7 +2241,7 @@ mod tests {
         let stale_gen = mem.generation();
         mem.virtual_free(0x2_0000, 0, MEM_RELEASE).expect("release");
         // Re-map at the same VA so write_ptr resolves (but gen mismatched).
-        mem.map(0x2_0000, 0x3000, crate::perm::READ | crate::perm::WRITE)
+        mem.map(0x2_0000, 0x3000, crate::RwxPerms::READ_WRITE)
             .expect("remap");
         // Write with the stale generation from before the release → must fail.
         // (In practice write() reads fresh generation, so this tests the
