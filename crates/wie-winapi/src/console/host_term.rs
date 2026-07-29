@@ -205,8 +205,6 @@ mod imp {
             return false;
         }
         RAW_ACTIVE.store(true, Ordering::SeqCst);
-        // Clear the screen on entry so there's no stale content visible.
-        crate::console::host_term::write_stdout(b"\x1b[H\x1b[J");
         true
     }
 

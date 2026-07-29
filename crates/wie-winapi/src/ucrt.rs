@@ -284,8 +284,10 @@ fn handle_fwrite(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
 fn handle_fflush(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let _stream = engine.read_rcx()?;
-    // Don't flush the console buffer here — it waits for Sleep so the
-    // terminal receives the frame atomically rather than per-write.
+    // Flush the console buffer so the terminal receives output immediately.
+    // The previous design deferred to Sleep for atomic frame flushing,
+    // but fflush is the standard C mechanism for this purpose.
+    ctx.state.flush_console();
     ret(engine, 0)
 }
 
@@ -1020,7 +1022,7 @@ fn handle_system(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
         // Route through the console buffer so the clear and the
         // subsequent fputs(frame) arrive at the terminal as one
         // atomic write on Sleep.
-        crate::kernel32::console::emit_text_from_bytes(ctx, b"\x1b[H\x1b[J");
+        crate::kernel32::console::emit_text_from_bytes(ctx, b"\x1b[2J\x1b[H");
         let eng = &mut *ctx.engine;
         return ret(eng, 0);
     }
