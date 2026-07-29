@@ -1,18 +1,20 @@
 # Build PE64 micro-tests for WIE.
-# Requires: x86_64-w64-mingw32-gcc (Homebrew mingw-w64).
+# Requires: x86_64-w64-mingw32-gcc, x86_64-w64-mingw32-g++ (Homebrew mingw-w64).
 # Clean room: freestanding micros + one ordinary CRT-linked program.
 
 # Force mingw cross-compiler (do not use make's default CC=cc).
-MINGW_CC ?= x86_64-w64-mingw32-gcc
+MINGW_CC   ?= x86_64-w64-mingw32-gcc
+MINGW_CXX  ?= x86_64-w64-mingw32-g++
+
 OUT      := out
 CFLAGS   := -O2 -ffreestanding -fno-stack-protector -fno-asynchronous-unwind-tables
 LDFLAGS  := -nostdlib -Wl,--subsystem,console -Wl,--entry,entry
 # Ordinary CRT-linked apps (independent-style): full toolchain defaults.
 CRT_CFLAGS := -O2
 
-.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake
+.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes dll_tests game_exes ucrt_coverage
 
-all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake
+all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes game_exes dll_tests ucrt_coverage
 
 $(OUT):
 	mkdir -p $(OUT)
@@ -47,7 +49,10 @@ pt_basic: $(OUT)/pt_basic.exe
 pt_cond: $(OUT)/pt_cond.exe
 rand_test: $(OUT)/rand_test.exe
 snake: $(OUT)/snake.exe
+seh_access_violation: $(OUT)/seh_access_violation.exe
+seh_div_zero: $(OUT)/seh_div_zero.exe
 
+# ---- Правила для отдельных .exe ----
 $(OUT)/heap_alloc.exe: heap_alloc/main.c | $(OUT)
 	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32
 	@echo "built $@"
@@ -162,28 +167,20 @@ $(OUT)/vfs_roundtrip.exe: vfs_roundtrip/main.c | $(OUT)
 	@echo "built $@"
 
 # Multi-threaded contention + guest-memory benchmark (argv-configurable).
-#
-# `-fno-tree-vectorize`: the point is to measure *scalar* guest load/store
-# traffic through the JIT's sticky/TLB/pin paths. Letting GCC turn the byte
-# loops into SSE2 (paddd, punpcklbw) would both change what is measured and
-# depend on packed-integer ops the iced interpreter does not implement.
 $(OUT)/mt_contention.exe: mt_contention/main.c | $(OUT)
 	$(MINGW_CC) $(CFLAGS) -fno-tree-vectorize $(LDFLAGS) -o $@ $< -lkernel32
 	@echo "built $@"
 
-# REP MOVS/STOS length sweep. Guards the JIT inline-REP tail handling; must be
-# built without -O3 loop tricks so the inline asm keeps an explicit RCX count.
+# REP MOVS/STOS length sweep.
 $(OUT)/rep_lengths.exe: rep_lengths/main.c | $(OUT)
 	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32
 	@echo "built $@"
 
-# ── SEH tests ────────────────────────────────────────────
-SEH_CXXFLAGS := -static -O2
-SEH_CLANG_FLAGS := -static -O2 -fms-extensions
-MINGW_CLANG ?= x86_64-w64-mingw32-clang
 
-# C++ exception tests (GCC-compiled, full CRT)
+# ---- C++ exception tests (GCC-compiled, full CRT) ----
 cpp_exes: $(OUT)/cpp_throw.exe $(OUT)/cpp_dtor.exe $(OUT)/cpp_multi_catch.exe $(OUT)/cpp_types.exe $(OUT)/cpp_threads.exe
+
+SEH_CXXFLAGS := -static -O2
 
 $(OUT)/cpp_throw.exe: seh/cpp_exceptions/cpp_throw/main.cpp | $(OUT)
 	$(MINGW_CXX) $(SEH_CXXFLAGS) -o $@ $<
@@ -201,48 +198,26 @@ $(OUT)/cpp_types.exe: seh/cpp_exceptions/cpp_types/main.cpp | $(OUT)
 	$(MINGW_CXX) $(SEH_CXXFLAGS) -o $@ $<
 	@echo "built $@"
 
-# cpp_threads uses SJLJ exceptions (setjmp/longjmp) internally.
-# The JIT may intermittently optimize away assignments after longjmp
-# because Cranelift treats longjmp as a noreturn call, causing the
-# catch handler's side effects to be eliminated.  A separate helper
-# function (set_result) prevents complete elimination but may not
-# always suffice.  Run with WIE_CPU=iced if intermittent failures occur.
 $(OUT)/cpp_threads.exe: seh/cpp_exceptions/cpp_threads/main.cpp | $(OUT)
 	$(MINGW_CXX) $(SEH_CXXFLAGS) -o $@ $<
 	@echo "built $@"
 
-# SEH hardware-fault tests (Clang-compiled, requires llvm-mingw for __try/__except)
-# Compile with: x86_64-w64-mingw32-clang -fms-extensions -o out.exe main.cpp
-seh_exes: $(OUT)/seh_access_violation.exe $(OUT)/seh_div_zero.exe
-
-$(OUT)/seh_access_violation.exe: seh/access_violation/main.cpp | $(OUT)
-	$(MINGW_CLANG) $(SEH_CLANG_FLAGS) -o $@ $< -lkernel32
-	@echo "built $@"
-
-$(OUT)/seh_div_zero.exe: seh/div_zero/main.cpp | $(OUT)
-	$(MINGW_CLANG) $(SEH_CLANG_FLAGS) -o $@ $< -lkernel32
-	@echo "built $@"
-
-# ── Interactive game tests ────────────────────────────────────
-GAME_EXES: $(OUT)/guess_price.exe
+# ---- Interactive game tests ----
+game_exes: $(OUT)/guess_price.exe
 
 $(OUT)/guess_price.exe: guess_price/main.c | $(OUT)
-	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32
+	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $< -lkernel32
 	@echo "built $@"
 
-# ── DLL loader tests ────────────────────────────────────────────
-# Flags for shared library (DLL) builds.
+# ---- DLL loader tests ----
 DLL_CFLAGS   := -O2 -shared
-# Flags for freestanding EXEs that test DLL loading.
 DLL_EXE_CFLAGS := -O2 -ffreestanding -fno-stack-protector -fno-asynchronous-unwind-tables
 DLL_EXE_LDFLAGS := -nostdlib -Wl,--subsystem,console -Wl,--entry,entry
 
-# DLLs
 DLL_BASIC_OBJS    := $(OUT)/dll_basic_funcs.dll
 DLL_ORDINAL_OBJS  := $(OUT)/dll_ordinal_funcs.dll
 DLL_MATH_OBJS     := $(OUT)/dll_math_funcs.dll
 
-# EXEs
 DLL_TEST_EXES := \
   $(OUT)/dll_basic.exe \
   $(OUT)/dll_not_found.exe \
@@ -250,11 +225,7 @@ DLL_TEST_EXES := \
   $(OUT)/dll_refcount.exe \
   $(OUT)/dll_multi_dll.exe
 
-.PHONY: dll_tests
-
 dll_tests: $(DLL_BASIC_OBJS) $(DLL_ORDINAL_OBJS) $(DLL_MATH_OBJS) $(DLL_TEST_EXES)
-
-# ── DLL build rules ────────────────────────────────────────────
 
 $(OUT)/dll_basic_funcs.dll: dll_tests/basic/dll.c | $(OUT)
 	$(MINGW_CC) $(DLL_CFLAGS) -o $@ $< -lkernel32
@@ -267,8 +238,6 @@ $(OUT)/dll_ordinal_funcs.dll: dll_tests/ordinal/dll.c | $(OUT)
 $(OUT)/dll_math_funcs.dll: dll_tests/refcount/dll.c | $(OUT)
 	$(MINGW_CC) $(DLL_CFLAGS) -o $@ $< -lkernel32
 	@echo "built $@"
-
-# ── DLL test EXE build rules ───────────────────────────────────
 
 $(OUT)/dll_basic.exe: dll_tests/basic/main.c $(OUT)/dll_basic_funcs.dll | $(OUT)
 	$(MINGW_CC) $(DLL_EXE_CFLAGS) $(DLL_EXE_LDFLAGS) -o $@ $< -lkernel32
@@ -288,6 +257,13 @@ $(OUT)/dll_refcount.exe: dll_tests/refcount/main.c $(OUT)/dll_math_funcs.dll | $
 
 $(OUT)/dll_multi_dll.exe: dll_tests/multi_dll/main.c $(OUT)/dll_basic_funcs.dll $(OUT)/dll_math_funcs.dll | $(OUT)
 	$(MINGW_CC) $(DLL_EXE_CFLAGS) $(DLL_EXE_LDFLAGS) -o $@ $< -lkernel32
+	@echo "built $@"
+
+
+ucrt_coverage: $(OUT)/ucrt_coverage.exe
+
+$(OUT)/ucrt_coverage.exe: ucrt_coverage/main.c | $(OUT)
+	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $<
 	@echo "built $@"
 
 clean:

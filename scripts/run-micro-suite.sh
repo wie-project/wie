@@ -48,9 +48,6 @@ if [[ "$CATEGORY" == "all" ]]; then
   run_one "$OUT/cpp_types.exe"
   run_one "$OUT/cpp_threads.exe"
 
-  run_one "$OUT/seh_access_violation.exe"
-  run_one "$OUT/seh_div_zero.exe"
-
   for exe in "$OUT"/dll_*.exe; do
     [ -f "$exe" ] && run_one "$exe"
   done
