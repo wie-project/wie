@@ -15,9 +15,9 @@ pub fn handle_get_startup_info_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         .context("failed to read RCX for GetStartupInfoA")?;
 
     if startup_info_ptr != 0 {
-        let cb_address = checked_field_address(startup_info_ptr, 0, "cb")?;
-        let flags_address = checked_field_address(startup_info_ptr, 60, "dwFlags")?;
-        let show_window_address = checked_field_address(startup_info_ptr, 64, "wShowWindow")?;
+        let cb_address = checked_field_address(startup_info_ptr, 0, "cb");
+        let flags_address = checked_field_address(startup_info_ptr, 60, "dwFlags");
+        let show_window_address = checked_field_address(startup_info_ptr, 64, "wShowWindow");
 
         // STARTUPINFOA on Win64 is 104 bytes.
         write_guest_u32(engine, cb_address, 104)?;
@@ -57,8 +57,8 @@ pub fn handle_get_system_time_as_file_time(
         .context("failed to read RCX for GetSystemTimeAsFileTime")?;
 
     if filetime_ptr != 0 {
-        let low_address = checked_field_address(filetime_ptr, 0, "dwLowDateTime")?;
-        let high_address = checked_field_address(filetime_ptr, 4, "dwHighDateTime")?;
+        let low_address = checked_field_address(filetime_ptr, 0, "dwLowDateTime");
+        let high_address = checked_field_address(filetime_ptr, 4, "dwHighDateTime");
 
         let low = u32::try_from(FIXED_SYSTEM_FILETIME & 0xffff_ffff)
             .context("FILETIME low part does not fit u32")?;
@@ -153,7 +153,7 @@ pub fn handle_get_process_times(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let rsp = engine.read_rsp().context("GetProcessTimes RSP")?;
     let user = read_guest_u64(
         engine,
-        checked_address(rsp, 0x28, "GetProcessTimes lpUserTime")?,
+        checked_address(rsp, 0x28, "GetProcessTimes lpUserTime"),
     )?;
     // Fixed synthetic times (100-ns ticks).
     if creation != 0 {

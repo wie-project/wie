@@ -806,7 +806,7 @@ pub fn handle_screen_to_client(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     if success {
         let x = read_guest_i32(engine, point_ptr)?;
 
-        let y_address = checked_field_address(point_ptr, 4, "POINT.y")?;
+        let y_address = checked_field_address(point_ptr, 4, "POINT.y");
 
         let y = read_guest_i32(engine, y_address)?;
 
@@ -850,7 +850,7 @@ pub fn handle_client_to_screen(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     if success {
         let x = read_guest_i32(engine, point_ptr)?;
 
-        let y_address = checked_field_address(point_ptr, 4, "POINT.y")?;
+        let y_address = checked_field_address(point_ptr, 4, "POINT.y");
 
         let y = read_guest_i32(engine, y_address)?;
 
@@ -1248,9 +1248,9 @@ pub fn handle_adjust_window_rect_ex(ctx: &mut HandlerContext<'_>) -> Result<WinA
     if success {
         let left = read_guest_i32(engine, rect_ptr)?;
 
-        let top_address = checked_field_address(rect_ptr, 4, "RECT.top")?;
-        let right_address = checked_field_address(rect_ptr, 8, "RECT.right")?;
-        let bottom_address = checked_field_address(rect_ptr, 12, "RECT.bottom")?;
+        let top_address = checked_field_address(rect_ptr, 4, "RECT.top");
+        let right_address = checked_field_address(rect_ptr, 8, "RECT.right");
+        let bottom_address = checked_field_address(rect_ptr, 12, "RECT.bottom");
 
         let top = read_guest_i32(engine, top_address)?;
         let right = read_guest_i32(engine, right_address)?;

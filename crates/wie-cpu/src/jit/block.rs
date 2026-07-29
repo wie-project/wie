@@ -339,13 +339,6 @@ fn is_lowerable(instr: &Instruction) -> bool {
         | Mnemonic::Subpd
         | Mnemonic::Mulpd
         | Mnemonic::Divpd => sse_packed_fp_is_lowerable(instr),
-        // SSE2 integer compare / shift / sum-of-abs-diff — handled by interpreter only.
-        Mnemonic::Pcmpeqb
-        | Mnemonic::Pcmpeqw
-        | Mnemonic::Pcmpeqd
-        | Mnemonic::Psadbw
-        | Mnemonic::Psrld
-        | Mnemonic::Unpcklpd => false,
         // String ops (REP bulk via JIT host helper); ends block in decoder.
         Mnemonic::Stosb
         | Mnemonic::Stosw
@@ -875,10 +868,7 @@ fn stack_base_gpr_index(r: Register) -> Option<usize> {
 /// iced stores displacements as the bit-pattern of a signed offset.
 #[inline]
 fn mem_disp_i64(instr: &Instruction) -> i64 {
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        instr.memory_displacement64() as i64
-    }
+    i64::from_ne_bytes(instr.memory_displacement64().to_ne_bytes())
 }
 
 fn insn_modifies_stack_ptr(instr: &Instruction) -> bool {

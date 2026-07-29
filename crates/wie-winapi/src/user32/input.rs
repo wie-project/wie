@@ -62,7 +62,7 @@ pub fn handle_get_cursor_pos(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         // LONG x; offset 0
         // LONG y; offset 4
         write_guest_i32(engine, point_ptr, 0)?;
-        write_guest_i32(engine, checked_field_address(point_ptr, 4, "POINT.y")?, 0)?;
+        write_guest_i32(engine, checked_field_address(point_ptr, 4, "POINT.y"), 0)?;
     }
 
     let return_address = engine

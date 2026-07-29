@@ -363,8 +363,8 @@ fn handle_stdio_common_vfprintf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         if fmt_ptr == 0 {
             return ret(engine, 0);
         }
-    let fmt = read_guest_str(engine, fmt_ptr, 4096)?;
-    let rsp = engine.read_rsp()?;
+        let fmt = read_guest_str(engine, fmt_ptr, 4096)?;
+        let rsp = engine.read_rsp()?;
         let mut va = read_guest_u64(engine, rsp.wrapping_add(0x28)).unwrap_or(0);
 
         const MAX_OUTPUT: usize = 4096;
@@ -383,7 +383,9 @@ fn handle_stdio_common_vfprintf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
                 } else if bytes[i].is_ascii_digit() {
                     let mut w: i32 = 0;
                     while i < bytes.len() && bytes[i].is_ascii_digit() {
-                        w = w.saturating_mul(10).saturating_add(i32::from(bytes[i] - b'0'));
+                        w = w
+                            .saturating_mul(10)
+                            .saturating_add(i32::from(bytes[i] - b'0'));
                         i += 1;
                     }
                     field_width = Some(w);
@@ -408,7 +410,7 @@ fn handle_stdio_common_vfprintf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
                         let s = format!("{}", v as i64);
                         pad_or_trim(&mut out, field_width, &s);
                     }
-                b's' => {
+                    b's' => {
                         let p = read_guest_u64(engine, va).unwrap_or(0);
                         va = va.wrapping_add(8);
                         let s = read_guest_str(engine, p, 1024).unwrap_or_default();
@@ -481,7 +483,9 @@ fn handle_stdio_common_vsprintf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
             } else if bytes[i].is_ascii_digit() {
                 let mut w: i32 = 0;
                 while i < bytes.len() && bytes[i].is_ascii_digit() {
-                    w = w.saturating_mul(10).saturating_add(i32::from(bytes[i] - b'0'));
+                    w = w
+                        .saturating_mul(10)
+                        .saturating_add(i32::from(bytes[i] - b'0'));
                     i += 1;
                 }
                 field_width = Some(w);
@@ -666,13 +670,13 @@ fn handle_stdio_common_vfscanf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
                     break;
                 }
             }
-            if !line.is_empty() {
-                state.file_io.stdin_bytes = line;
-                let c = 0_usize;
+            if line.is_empty() {
+                let c = base_cursor;
                 let buf: Vec<u8> = state.file_io.stdin_bytes[c..].to_vec();
                 (buf, c)
             } else {
-                let c = base_cursor;
+                state.file_io.stdin_bytes = line;
+                let c = 0_usize;
                 let buf: Vec<u8> = state.file_io.stdin_bytes[c..].to_vec();
                 (buf, c)
             }
@@ -775,7 +779,9 @@ fn handle_stdio_common_vfscanf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     // Advance stdin cursor only by the bytes actually consumed.
     {
         let state = &mut *ctx.state;
-        state.file_io.stdin_cursor = base.saturating_add(pos).min(state.file_io.stdin_bytes.len());
+        state.file_io.stdin_cursor = base
+            .saturating_add(pos)
+            .min(state.file_io.stdin_bytes.len());
     }
     ret(engine, items.try_into().unwrap_or(0))
 }
@@ -1557,14 +1563,17 @@ fn handle_getchar(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
         // Data already in the guest-side buffer.
         let idx = state.file_io.stdin_cursor;
         let ch = state.file_io.stdin_bytes[idx];
-        if ch != b'\n' {
-            if let Some(nl_pos) =
-                state.file_io.stdin_bytes[idx..].iter().position(|&b| b == b'\n')
-            {
-                state.file_io.stdin_cursor =
-                    idx.wrapping_add(nl_pos).wrapping_add(1);
-                return ret(engine, u64::from(b'\n'));
-            }
+        if ch == b'\n' {
+            state.file_io.stdin_cursor = idx.wrapping_add(1);
+            return ret(engine, u64::from(b'\n'));
+        }
+        // Not '\n' — skip ahead if there's a newline later in the buffer.
+        if let Some(nl_pos) = state.file_io.stdin_bytes[idx..]
+            .iter()
+            .position(|&b| b == b'\n')
+        {
+            state.file_io.stdin_cursor = idx.wrapping_add(nl_pos).wrapping_add(1);
+            return ret(engine, u64::from(b'\n'));
         }
         state.file_io.stdin_cursor = idx.wrapping_add(1);
         return ret(engine, u64::from(ch));
@@ -2091,7 +2100,10 @@ fn handle_strncpy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let mut src_bytes = Vec::with_capacity(cap);
     for i in 0..cap {
         let mut byte = [0_u8; 1];
-        if engine.mem_read(src.wrapping_add(u64::try_from(i).unwrap_or(0)), &mut byte).is_err() {
+        if engine
+            .mem_read(src.wrapping_add(u64::try_from(i).unwrap_or(0)), &mut byte)
+            .is_err()
+        {
             break;
         }
         src_bytes.push(byte[0]);

@@ -49,49 +49,49 @@ pub fn handle_get_object_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
 
         write_guest_i32(
             engine,
-            checked_field_address(object_buffer_ptr, 4, "BITMAP.bmWidth")?,
+            checked_field_address(object_buffer_ptr, 4, "BITMAP.bmWidth"),
             16,
         )
         .context("failed to write BITMAP.bmWidth")?;
 
         write_guest_i32(
             engine,
-            checked_field_address(object_buffer_ptr, 8, "BITMAP.bmHeight")?,
+            checked_field_address(object_buffer_ptr, 8, "BITMAP.bmHeight"),
             16,
         )
         .context("failed to write BITMAP.bmHeight")?;
 
         write_guest_i32(
             engine,
-            checked_field_address(object_buffer_ptr, 12, "BITMAP.bmWidthBytes")?,
+            checked_field_address(object_buffer_ptr, 12, "BITMAP.bmWidthBytes"),
             64,
         )
         .context("failed to write BITMAP.bmWidthBytes")?;
 
         write_guest_u16(
             engine,
-            checked_field_address(object_buffer_ptr, 16, "BITMAP.bmPlanes")?,
+            checked_field_address(object_buffer_ptr, 16, "BITMAP.bmPlanes"),
             1,
         )
         .context("failed to write BITMAP.bmPlanes")?;
 
         write_guest_u16(
             engine,
-            checked_field_address(object_buffer_ptr, 18, "BITMAP.bmBitsPixel")?,
+            checked_field_address(object_buffer_ptr, 18, "BITMAP.bmBitsPixel"),
             32,
         )
         .context("failed to write BITMAP.bmBitsPixel")?;
 
         write_guest_u32(
             engine,
-            checked_field_address(object_buffer_ptr, 20, "BITMAP padding")?,
+            checked_field_address(object_buffer_ptr, 20, "BITMAP padding"),
             0,
         )
         .context("failed to write BITMAP padding")?;
 
         write_guest_u64(
             engine,
-            checked_field_address(object_buffer_ptr, 24, "BITMAP.bmBits")?,
+            checked_field_address(object_buffer_ptr, 24, "BITMAP.bmBits"),
             0,
         )
         .context("failed to write BITMAP.bmBits")?;
@@ -208,7 +208,7 @@ fn handle_get_text_extent_point_32(
         write_guest_u32(engine, size_ptr, width)
             .with_context(|| format!("failed to write SIZE.cx for {api_name}"))?;
 
-        write_guest_u32(engine, checked_field_address(size_ptr, 4, "SIZE.cy")?, 16)
+        write_guest_u32(engine, checked_field_address(size_ptr, 4, "SIZE.cy"), 16)
             .with_context(|| format!("failed to write SIZE.cy for {api_name}"))?;
     }
 
@@ -402,14 +402,14 @@ pub fn handle_create_dib_section(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 
     let (width, height, bit_count) = if bmi_ptr != 0 {
         // BITMAPINFOHEADER: biWidth@4, biHeight@8, biBitCount@14
-        let width = read_guest_i32(engine, checked_field_address(bmi_ptr, 4, "biWidth")?)
+        let width = read_guest_i32(engine, checked_field_address(bmi_ptr, 4, "biWidth"))
             .context("failed to read CreateDIBSection biWidth")?
             .unsigned_abs();
-        let height = read_guest_i32(engine, checked_field_address(bmi_ptr, 8, "biHeight")?)
+        let height = read_guest_i32(engine, checked_field_address(bmi_ptr, 8, "biHeight"))
             .context("failed to read CreateDIBSection biHeight")?
             .unsigned_abs();
         let bit_count = u32::from(
-            read_guest_u16(engine, checked_field_address(bmi_ptr, 14, "biBitCount")?)
+            read_guest_u16(engine, checked_field_address(bmi_ptr, 14, "biBitCount"))
                 .context("failed to read CreateDIBSection biBitCount")?,
         );
         (width.max(1), height.max(1), bit_count.max(1))
@@ -637,82 +637,79 @@ pub fn handle_get_text_metrics_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         write_guest_i32(engine, metrics_ptr, 16)?; // tmHeight
         write_guest_i32(
             engine,
-            checked_field_address(metrics_ptr, 4, "tmAscent")?,
+            checked_field_address(metrics_ptr, 4, "tmAscent"),
             13,
         )?;
         write_guest_i32(
             engine,
-            checked_field_address(metrics_ptr, 8, "tmDescent")?,
+            checked_field_address(metrics_ptr, 8, "tmDescent"),
             3,
         )?;
         write_guest_i32(
             engine,
-            checked_field_address(metrics_ptr, 12, "tmInternalLeading")?,
+            checked_field_address(metrics_ptr, 12, "tmInternalLeading"),
             3,
         )?;
         write_guest_i32(
             engine,
-            checked_field_address(metrics_ptr, 16, "tmExternalLeading")?,
+            checked_field_address(metrics_ptr, 16, "tmExternalLeading"),
             0,
         )?;
         write_guest_i32(
             engine,
-            checked_field_address(metrics_ptr, 20, "tmAveCharWidth")?,
+            checked_field_address(metrics_ptr, 20, "tmAveCharWidth"),
             8,
         )?;
         write_guest_i32(
             engine,
-            checked_field_address(metrics_ptr, 24, "tmMaxCharWidth")?,
+            checked_field_address(metrics_ptr, 24, "tmMaxCharWidth"),
             16,
         )?;
         write_guest_i32(
             engine,
-            checked_field_address(metrics_ptr, 28, "tmWeight")?,
+            checked_field_address(metrics_ptr, 28, "tmWeight"),
             400,
         )?;
         write_guest_i32(
             engine,
-            checked_field_address(metrics_ptr, 32, "tmOverhang")?,
+            checked_field_address(metrics_ptr, 32, "tmOverhang"),
             0,
         )?;
         write_guest_i32(
             engine,
-            checked_field_address(metrics_ptr, 36, "tmDigitizedAspectX")?,
+            checked_field_address(metrics_ptr, 36, "tmDigitizedAspectX"),
             96,
         )?;
         write_guest_i32(
             engine,
-            checked_field_address(metrics_ptr, 40, "tmDigitizedAspectY")?,
+            checked_field_address(metrics_ptr, 40, "tmDigitizedAspectY"),
             96,
         )?;
         // BYTE fields at end
         engine.mem_write(
-            checked_field_address(metrics_ptr, 44, "tmFirstChar")?,
+            checked_field_address(metrics_ptr, 44, "tmFirstChar"),
             &[0x20],
         )?;
         engine.mem_write(
-            checked_field_address(metrics_ptr, 45, "tmLastChar")?,
+            checked_field_address(metrics_ptr, 45, "tmLastChar"),
             &[0xff],
         )?;
         engine.mem_write(
-            checked_field_address(metrics_ptr, 46, "tmDefaultChar")?,
+            checked_field_address(metrics_ptr, 46, "tmDefaultChar"),
             &[0x3f],
         )?;
         engine.mem_write(
-            checked_field_address(metrics_ptr, 47, "tmBreakChar")?,
+            checked_field_address(metrics_ptr, 47, "tmBreakChar"),
             &[0x20],
         )?;
-        engine.mem_write(checked_field_address(metrics_ptr, 48, "tmItalic")?, &[0])?;
+        engine.mem_write(checked_field_address(metrics_ptr, 48, "tmItalic"), &[0])?;
+        engine.mem_write(checked_field_address(metrics_ptr, 49, "tmUnderlined"), &[0])?;
+        engine.mem_write(checked_field_address(metrics_ptr, 50, "tmStruckOut"), &[0])?;
         engine.mem_write(
-            checked_field_address(metrics_ptr, 49, "tmUnderlined")?,
-            &[0],
-        )?;
-        engine.mem_write(checked_field_address(metrics_ptr, 50, "tmStruckOut")?, &[0])?;
-        engine.mem_write(
-            checked_field_address(metrics_ptr, 51, "tmPitchAndFamily")?,
+            checked_field_address(metrics_ptr, 51, "tmPitchAndFamily"),
             &[0x31],
         )?;
-        engine.mem_write(checked_field_address(metrics_ptr, 52, "tmCharSet")?, &[0])?; // ANSI_CHARSET
+        engine.mem_write(checked_field_address(metrics_ptr, 52, "tmCharSet"), &[0])?; // ANSI_CHARSET
     }
 
     let return_value = u64::from(success);

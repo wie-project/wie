@@ -75,49 +75,49 @@ pub fn handle_register_class_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 
         let style = read_guest_u32(
             engine,
-            checked_field_address(window_class_ptr, 4, "WNDCLASSEXW.style")?,
+            checked_field_address(window_class_ptr, 4, "WNDCLASSEXW.style"),
         )
         .context("failed to read WNDCLASSEXW.style")?;
 
         let window_proc = read_guest_u64(
             engine,
-            checked_field_address(window_class_ptr, 8, "WNDCLASSEXW.lpfnWndProc")?,
+            checked_field_address(window_class_ptr, 8, "WNDCLASSEXW.lpfnWndProc"),
         )
         .context("failed to read WNDCLASSEXW.lpfnWndProc")?;
 
         let instance_handle = read_guest_u64(
             engine,
-            checked_field_address(window_class_ptr, 24, "WNDCLASSEXW.hInstance")?,
+            checked_field_address(window_class_ptr, 24, "WNDCLASSEXW.hInstance"),
         )
         .context("failed to read WNDCLASSEXW.hInstance")?;
 
         let icon_handle = read_guest_u64(
             engine,
-            checked_field_address(window_class_ptr, 32, "WNDCLASSEXW.hIcon")?,
+            checked_field_address(window_class_ptr, 32, "WNDCLASSEXW.hIcon"),
         )
         .context("failed to read WNDCLASSEXW.hIcon")?;
 
         let cursor_handle = read_guest_u64(
             engine,
-            checked_field_address(window_class_ptr, 40, "WNDCLASSEXW.hCursor")?,
+            checked_field_address(window_class_ptr, 40, "WNDCLASSEXW.hCursor"),
         )
         .context("failed to read WNDCLASSEXW.hCursor")?;
 
         let background_brush = read_guest_u64(
             engine,
-            checked_field_address(window_class_ptr, 48, "WNDCLASSEXW.hbrBackground")?,
+            checked_field_address(window_class_ptr, 48, "WNDCLASSEXW.hbrBackground"),
         )
         .context("failed to read WNDCLASSEXW.hbrBackground")?;
 
         let class_name_ptr = read_guest_u64(
             engine,
-            checked_field_address(window_class_ptr, 64, "WNDCLASSEXW.lpszClassName")?,
+            checked_field_address(window_class_ptr, 64, "WNDCLASSEXW.lpszClassName"),
         )
         .context("failed to read WNDCLASSEXW.lpszClassName")?;
 
         let small_icon_handle = read_guest_u64(
             engine,
-            checked_field_address(window_class_ptr, 72, "WNDCLASSEXW.hIconSm")?,
+            checked_field_address(window_class_ptr, 72, "WNDCLASSEXW.hIconSm"),
         )
         .context("failed to read WNDCLASSEXW.hIconSm")?;
 
@@ -163,49 +163,49 @@ pub fn handle_register_class_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     } else {
         let style = read_guest_u32(
             engine,
-            checked_field_address(window_class_ptr, 4, "WNDCLASSEXA.style")?,
+            checked_field_address(window_class_ptr, 4, "WNDCLASSEXA.style"),
         )
         .context("failed to read WNDCLASSEXA.style")?;
 
         let window_proc = read_guest_u64(
             engine,
-            checked_field_address(window_class_ptr, 8, "WNDCLASSEXA.lpfnWndProc")?,
+            checked_field_address(window_class_ptr, 8, "WNDCLASSEXA.lpfnWndProc"),
         )
         .context("failed to read WNDCLASSEXA.lpfnWndProc")?;
 
         let instance_handle = read_guest_u64(
             engine,
-            checked_field_address(window_class_ptr, 24, "WNDCLASSEXA.hInstance")?,
+            checked_field_address(window_class_ptr, 24, "WNDCLASSEXA.hInstance"),
         )
         .context("failed to read WNDCLASSEXA.hInstance")?;
 
         let icon_handle = read_guest_u64(
             engine,
-            checked_field_address(window_class_ptr, 32, "WNDCLASSEXA.hIcon")?,
+            checked_field_address(window_class_ptr, 32, "WNDCLASSEXA.hIcon"),
         )
         .context("failed to read WNDCLASSEXA.hIcon")?;
 
         let cursor_handle = read_guest_u64(
             engine,
-            checked_field_address(window_class_ptr, 40, "WNDCLASSEXA.hCursor")?,
+            checked_field_address(window_class_ptr, 40, "WNDCLASSEXA.hCursor"),
         )
         .context("failed to read WNDCLASSEXA.hCursor")?;
 
         let background_brush = read_guest_u64(
             engine,
-            checked_field_address(window_class_ptr, 48, "WNDCLASSEXA.hbrBackground")?,
+            checked_field_address(window_class_ptr, 48, "WNDCLASSEXA.hbrBackground"),
         )
         .context("failed to read WNDCLASSEXA.hbrBackground")?;
 
         let class_name_ptr = read_guest_u64(
             engine,
-            checked_field_address(window_class_ptr, 64, "WNDCLASSEXA.lpszClassName")?,
+            checked_field_address(window_class_ptr, 64, "WNDCLASSEXA.lpszClassName"),
         )
         .context("failed to read WNDCLASSEXA.lpszClassName")?;
 
         let small_icon_handle = read_guest_u64(
             engine,
-            checked_field_address(window_class_ptr, 72, "WNDCLASSEXA.hIconSm")?,
+            checked_field_address(window_class_ptr, 72, "WNDCLASSEXA.hIconSm"),
         )
         .context("failed to read WNDCLASSEXA.hIconSm")?;
 
@@ -619,7 +619,7 @@ pub fn handle_set_scroll_info(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     let return_value = if scroll_info_ptr != 0 {
         let n_pos = read_guest_i32(
             engine,
-            checked_field_address(scroll_info_ptr, 20, "SCROLLINFO.nPos")?,
+            checked_field_address(scroll_info_ptr, 20, "SCROLLINFO.nPos"),
         )
         .unwrap_or(0);
         // Win32 returns the current scroll-box position after the update.

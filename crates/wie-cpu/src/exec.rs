@@ -1486,8 +1486,7 @@ fn exec_sse_pcmpeq(
     let (lanes, bits) = match mnemonic {
         Mnemonic::Pcmpeqb => (16, 8),
         Mnemonic::Pcmpeqw => (8, 16),
-        Mnemonic::Pcmpeqd => (4, 32),
-        _ => unreachable!(),
+        _ => (4, 32), // Pcmpeqd
     };
     let mask = (1u128 << bits) - 1;
     let mut result: u128 = 0;
@@ -1503,10 +1502,7 @@ fn exec_sse_pcmpeq(
 }
 
 /// `Psrld` — shift right logical dword (immediate form: `psrld xmm, imm8`).
-fn exec_sse_psrld(
-    regs: &mut RegFile,
-    instr: &Instruction,
-) -> Result<(), StepExecError> {
+fn exec_sse_psrld(regs: &mut RegFile, instr: &Instruction) -> Result<(), StepExecError> {
     let dst = instr.op_register(0);
     let src_val = regs.read_xmm(dst)?;
     let shift = (instr.immediate(1) & 0xff) as u32;
@@ -1521,10 +1517,7 @@ fn exec_sse_psrld(
 }
 
 /// `Unpcklpd` — unpack low packed double-precision floats (identical to punpcklqdq).
-fn exec_sse_unpcklpd(
-    regs: &mut RegFile,
-    instr: &Instruction,
-) -> Result<(), StepExecError> {
+fn exec_sse_unpcklpd(regs: &mut RegFile, instr: &Instruction) -> Result<(), StepExecError> {
     let dst = instr.op_register(0);
     let src = instr.op_register(1);
     let a = regs.read_xmm(dst)?;

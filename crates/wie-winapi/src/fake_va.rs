@@ -70,7 +70,7 @@ pub enum FakeVa {
 
 /// Pack `kind` + `payload` into a guest fake VA.
 #[must_use]
-#[allow(clippy::as_conversions)] // const: widen kind/payload into the packed VA bitfield
+#[allow(clippy::as_conversions)] // const fn — From is not const-stable yet
 pub const fn encode(kind: u8, payload: u16) -> u64 {
     FAKE_API_BASE | ((kind as u64) << KIND_SHIFT) | ((payload as u64) << ALIGN_SHIFT)
 }
@@ -95,7 +95,7 @@ pub const fn encode_unresolved(index: u16) -> u64 {
 
 /// Encode a COM method address.
 #[must_use]
-#[allow(clippy::as_conversions)]
+#[allow(clippy::as_conversions)] // const fn — From is not const-stable yet
 pub const fn encode_com(iface: u8, method: u8) -> u64 {
     encode(KIND_COM, ((iface as u16) << 8) | (method as u16))
 }

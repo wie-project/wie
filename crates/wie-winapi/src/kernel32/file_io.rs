@@ -394,16 +394,16 @@ pub fn handle_get_file_information_by_handle(
         // DWORD    nFileIndexHigh;       offset 44
         // DWORD    nFileIndexLow;        offset 48
 
-        let attributes_address = checked_field_address(info_ptr, 0, "dwFileAttributes")?;
-        let creation_time_address = checked_field_address(info_ptr, 4, "ftCreationTime")?;
-        let last_access_time_address = checked_field_address(info_ptr, 12, "ftLastAccessTime")?;
-        let last_write_time_address = checked_field_address(info_ptr, 20, "ftLastWriteTime")?;
-        let volume_serial_address = checked_field_address(info_ptr, 28, "dwVolumeSerialNumber")?;
-        let file_size_high_address = checked_field_address(info_ptr, 32, "nFileSizeHigh")?;
-        let file_size_low_address = checked_field_address(info_ptr, 36, "nFileSizeLow")?;
-        let number_of_links_address = checked_field_address(info_ptr, 40, "nNumberOfLinks")?;
-        let file_index_high_address = checked_field_address(info_ptr, 44, "nFileIndexHigh")?;
-        let file_index_low_address = checked_field_address(info_ptr, 48, "nFileIndexLow")?;
+        let attributes_address = checked_field_address(info_ptr, 0, "dwFileAttributes");
+        let creation_time_address = checked_field_address(info_ptr, 4, "ftCreationTime");
+        let last_access_time_address = checked_field_address(info_ptr, 12, "ftLastAccessTime");
+        let last_write_time_address = checked_field_address(info_ptr, 20, "ftLastWriteTime");
+        let volume_serial_address = checked_field_address(info_ptr, 28, "dwVolumeSerialNumber");
+        let file_size_high_address = checked_field_address(info_ptr, 32, "nFileSizeHigh");
+        let file_size_low_address = checked_field_address(info_ptr, 36, "nFileSizeLow");
+        let number_of_links_address = checked_field_address(info_ptr, 40, "nNumberOfLinks");
+        let file_index_high_address = checked_field_address(info_ptr, 44, "nFileIndexHigh");
+        let file_index_low_address = checked_field_address(info_ptr, 48, "nFileIndexLow");
 
         let file_size = open_file.size();
 
@@ -937,14 +937,14 @@ pub fn handle_file_time_to_system_time(
         // WORD wSecond;       offset 12
         // WORD wMilliseconds; offset 14
 
-        let year_address = checked_field_address(system_time_ptr, 0, "wYear")?;
-        let month_address = checked_field_address(system_time_ptr, 2, "wMonth")?;
-        let day_of_week_address = checked_field_address(system_time_ptr, 4, "wDayOfWeek")?;
-        let day_address = checked_field_address(system_time_ptr, 6, "wDay")?;
-        let hour_address = checked_field_address(system_time_ptr, 8, "wHour")?;
-        let minute_address = checked_field_address(system_time_ptr, 10, "wMinute")?;
-        let second_address = checked_field_address(system_time_ptr, 12, "wSecond")?;
-        let milliseconds_address = checked_field_address(system_time_ptr, 14, "wMilliseconds")?;
+        let year_address = checked_field_address(system_time_ptr, 0, "wYear");
+        let month_address = checked_field_address(system_time_ptr, 2, "wMonth");
+        let day_of_week_address = checked_field_address(system_time_ptr, 4, "wDayOfWeek");
+        let day_address = checked_field_address(system_time_ptr, 6, "wDay");
+        let hour_address = checked_field_address(system_time_ptr, 8, "wHour");
+        let minute_address = checked_field_address(system_time_ptr, 10, "wMinute");
+        let second_address = checked_field_address(system_time_ptr, 12, "wSecond");
+        let milliseconds_address = checked_field_address(system_time_ptr, 14, "wMilliseconds");
 
         // Deterministic fake converted time.
         write_guest_u16(engine, year_address, 2026)?;
@@ -1795,7 +1795,7 @@ pub fn handle_get_disk_free_space_w(ctx: &mut HandlerContext<'_>) -> Result<WinA
     let rsp = engine.read_rsp()?;
     let total_clusters = read_guest_u64(
         engine,
-        checked_address(rsp, 0x28, "GetDiskFreeSpaceW total")?,
+        checked_address(rsp, 0x28, "GetDiskFreeSpaceW total"),
     )?;
     if spc != 0 {
         write_guest_u32(engine, spc, 8)?;
@@ -1961,18 +1961,10 @@ pub fn handle_get_volume_information_w(
     let vol_name_len = engine.read_r8()?;
     let _serial = engine.read_r9()?;
     let rsp = engine.read_rsp()?;
-    let max_comp_ptr = checked_address(rsp, 0x28, "lpMaximumComponentLength")
-        .ok()
-        .unwrap_or(0);
-    let flags_ptr = checked_address(rsp, 0x30, "lpFileSystemFlags")
-        .ok()
-        .unwrap_or(0);
-    let name_ptr = checked_address(rsp, 0x38, "lpFileSystemNameBuffer")
-        .ok()
-        .unwrap_or(0);
-    let fs_len_ptr = checked_address(rsp, 0x40, "lpFileSystemNameLength")
-        .ok()
-        .unwrap_or(0);
+    let max_comp_ptr = checked_address(rsp, 0x28, "lpMaximumComponentLength");
+    let flags_ptr = checked_address(rsp, 0x30, "lpFileSystemFlags");
+    let name_ptr = checked_address(rsp, 0x38, "lpFileSystemNameBuffer");
+    let fs_len_ptr = checked_address(rsp, 0x40, "lpFileSystemNameLength");
 
     // Derive volume label from the bottle root name, or use a default.
     let label = state
@@ -2022,18 +2014,10 @@ pub fn handle_get_volume_information_a(
     let vol_name_len = engine.read_r8()?;
     let _serial = engine.read_r9()?;
     let rsp = engine.read_rsp()?;
-    let max_comp_ptr = checked_address(rsp, 0x28, "lpMaximumComponentLength")
-        .ok()
-        .unwrap_or(0);
-    let flags_ptr = checked_address(rsp, 0x30, "lpFileSystemFlags")
-        .ok()
-        .unwrap_or(0);
-    let name_ptr = checked_address(rsp, 0x38, "lpFileSystemNameBuffer")
-        .ok()
-        .unwrap_or(0);
-    let fs_len_ptr = checked_address(rsp, 0x40, "lpFileSystemNameLength")
-        .ok()
-        .unwrap_or(0);
+    let max_comp_ptr = checked_address(rsp, 0x28, "lpMaximumComponentLength");
+    let flags_ptr = checked_address(rsp, 0x30, "lpFileSystemFlags");
+    let name_ptr = checked_address(rsp, 0x38, "lpFileSystemNameBuffer");
+    let fs_len_ptr = checked_address(rsp, 0x40, "lpFileSystemNameLength");
 
     let label = state
         .file_io
@@ -2233,32 +2217,32 @@ pub fn handle_get_file_attributes_ex_w(
     if info_ptr != 0 {
         write_guest_u32(
             engine,
-            checked_field_address(info_ptr, 0, "dwFileAttributes")?,
+            checked_field_address(info_ptr, 0, "dwFileAttributes"),
             st.attributes,
         )?;
         write_guest_u64(
             engine,
-            checked_field_address(info_ptr, 4, "ftCreationTime")?,
+            checked_field_address(info_ptr, 4, "ftCreationTime"),
             FIXED_SYSTEM_FILETIME,
         )?;
         write_guest_u64(
             engine,
-            checked_field_address(info_ptr, 12, "ftLastAccessTime")?,
+            checked_field_address(info_ptr, 12, "ftLastAccessTime"),
             FIXED_SYSTEM_FILETIME,
         )?;
         write_guest_u64(
             engine,
-            checked_field_address(info_ptr, 20, "ftLastWriteTime")?,
+            checked_field_address(info_ptr, 20, "ftLastWriteTime"),
             FIXED_SYSTEM_FILETIME,
         )?;
         write_guest_u32(
             engine,
-            checked_field_address(info_ptr, 28, "nFileSizeHigh")?,
+            checked_field_address(info_ptr, 28, "nFileSizeHigh"),
             u32::try_from(st.size >> 32).unwrap_or(0),
         )?;
         write_guest_u32(
             engine,
-            checked_field_address(info_ptr, 32, "nFileSizeLow")?,
+            checked_field_address(info_ptr, 32, "nFileSizeLow"),
             u32::try_from(st.size & 0xFFFF_FFFF).unwrap_or(0),
         )?;
     }
@@ -2293,32 +2277,32 @@ pub fn handle_get_file_attributes_ex_a(
     if info_ptr != 0 {
         write_guest_u32(
             engine,
-            checked_field_address(info_ptr, 0, "dwFileAttributes")?,
+            checked_field_address(info_ptr, 0, "dwFileAttributes"),
             st.attributes,
         )?;
         write_guest_u64(
             engine,
-            checked_field_address(info_ptr, 4, "ftCreationTime")?,
+            checked_field_address(info_ptr, 4, "ftCreationTime"),
             FIXED_SYSTEM_FILETIME,
         )?;
         write_guest_u64(
             engine,
-            checked_field_address(info_ptr, 12, "ftLastAccessTime")?,
+            checked_field_address(info_ptr, 12, "ftLastAccessTime"),
             FIXED_SYSTEM_FILETIME,
         )?;
         write_guest_u64(
             engine,
-            checked_field_address(info_ptr, 20, "ftLastWriteTime")?,
+            checked_field_address(info_ptr, 20, "ftLastWriteTime"),
             FIXED_SYSTEM_FILETIME,
         )?;
         write_guest_u32(
             engine,
-            checked_field_address(info_ptr, 28, "nFileSizeHigh")?,
+            checked_field_address(info_ptr, 28, "nFileSizeHigh"),
             u32::try_from(st.size >> 32).unwrap_or(0),
         )?;
         write_guest_u32(
             engine,
-            checked_field_address(info_ptr, 32, "nFileSizeLow")?,
+            checked_field_address(info_ptr, 32, "nFileSizeLow"),
             u32::try_from(st.size & 0xFFFF_FFFF).unwrap_or(0),
         )?;
     }

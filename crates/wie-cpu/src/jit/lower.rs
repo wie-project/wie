@@ -5140,10 +5140,8 @@ fn emit_block_wide_stack_guard(
     base: Value,
     plan: &BlockStackPinPlan,
 ) -> Value {
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-    let min_d = iconst_u64(bcx, plan.min_disp as u64);
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-    let max_e = iconst_u64(bcx, plan.max_end as u64);
+    let min_d = iconst_u64(bcx, u64::from_ne_bytes(plan.min_disp.to_ne_bytes()));
+    let max_e = iconst_u64(bcx, u64::from_ne_bytes(plan.max_end.to_ne_bytes()));
     let lo = bcx.ins().iadd(base, min_d);
     let hi = bcx.ins().iadd(base, max_e);
     // Span must not wrap the address space.

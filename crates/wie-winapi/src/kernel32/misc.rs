@@ -53,10 +53,10 @@ pub fn handle_get_version_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     // DWORD dwMinorVersion;      offset 8
     // DWORD dwBuildNumber;       offset 12
     // DWORD dwPlatformId;        offset 16
-    let major_version_address = checked_field_address(version_info_ptr, 4, "dwMajorVersion")?;
-    let minor_version_address = checked_field_address(version_info_ptr, 8, "dwMinorVersion")?;
-    let build_number_address = checked_field_address(version_info_ptr, 12, "dwBuildNumber")?;
-    let platform_id_address = checked_field_address(version_info_ptr, 16, "dwPlatformId")?;
+    let major_version_address = checked_field_address(version_info_ptr, 4, "dwMajorVersion");
+    let minor_version_address = checked_field_address(version_info_ptr, 8, "dwMinorVersion");
+    let build_number_address = checked_field_address(version_info_ptr, 12, "dwBuildNumber");
+    let platform_id_address = checked_field_address(version_info_ptr, 16, "dwPlatformId");
 
     write_guest_u32(engine, major_version_address, major_version)?;
     write_guest_u32(engine, minor_version_address, minor_version)?;
@@ -425,14 +425,14 @@ pub fn handle_get_local_time(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         // WORD wSecond;       offset 12
         // WORD wMilliseconds; offset 14
 
-        let year_address = checked_field_address(system_time_ptr, 0, "wYear")?;
-        let month_address = checked_field_address(system_time_ptr, 2, "wMonth")?;
-        let day_of_week_address = checked_field_address(system_time_ptr, 4, "wDayOfWeek")?;
-        let day_address = checked_field_address(system_time_ptr, 6, "wDay")?;
-        let hour_address = checked_field_address(system_time_ptr, 8, "wHour")?;
-        let minute_address = checked_field_address(system_time_ptr, 10, "wMinute")?;
-        let second_address = checked_field_address(system_time_ptr, 12, "wSecond")?;
-        let milliseconds_address = checked_field_address(system_time_ptr, 14, "wMilliseconds")?;
+        let year_address = checked_field_address(system_time_ptr, 0, "wYear");
+        let month_address = checked_field_address(system_time_ptr, 2, "wMonth");
+        let day_of_week_address = checked_field_address(system_time_ptr, 4, "wDayOfWeek");
+        let day_address = checked_field_address(system_time_ptr, 6, "wDay");
+        let hour_address = checked_field_address(system_time_ptr, 8, "wHour");
+        let minute_address = checked_field_address(system_time_ptr, 10, "wMinute");
+        let second_address = checked_field_address(system_time_ptr, 12, "wSecond");
+        let milliseconds_address = checked_field_address(system_time_ptr, 14, "wMilliseconds");
 
         // Deterministic fake local time.
         write_guest_u16(engine, year_address, 2026)?;
@@ -476,13 +476,13 @@ pub fn handle_get_time_zone_information(
         // SYSTEMTIME DaylightDate;      offset 152
         // LONG       DaylightBias;      offset 168
 
-        let bias_address = checked_field_address(time_zone_info_ptr, 0, "Bias")?;
-        let standard_name_address = checked_field_address(time_zone_info_ptr, 4, "StandardName")?;
-        let standard_date_address = checked_field_address(time_zone_info_ptr, 68, "StandardDate")?;
-        let standard_bias_address = checked_field_address(time_zone_info_ptr, 84, "StandardBias")?;
-        let daylight_name_address = checked_field_address(time_zone_info_ptr, 88, "DaylightName")?;
-        let daylight_date_address = checked_field_address(time_zone_info_ptr, 152, "DaylightDate")?;
-        let daylight_bias_address = checked_field_address(time_zone_info_ptr, 168, "DaylightBias")?;
+        let bias_address = checked_field_address(time_zone_info_ptr, 0, "Bias");
+        let standard_name_address = checked_field_address(time_zone_info_ptr, 4, "StandardName");
+        let standard_date_address = checked_field_address(time_zone_info_ptr, 68, "StandardDate");
+        let standard_bias_address = checked_field_address(time_zone_info_ptr, 84, "StandardBias");
+        let daylight_name_address = checked_field_address(time_zone_info_ptr, 88, "DaylightName");
+        let daylight_date_address = checked_field_address(time_zone_info_ptr, 152, "DaylightDate");
+        let daylight_bias_address = checked_field_address(time_zone_info_ptr, 168, "DaylightBias");
 
         let empty_name = [0_u8; 64];
         let empty_system_time = [0_u8; 16];

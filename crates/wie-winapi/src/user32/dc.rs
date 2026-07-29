@@ -64,31 +64,31 @@ pub fn handle_begin_paint(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         // BOOL fIncUpdate;    32
         // BYTE rgbReserved[32]; 36
         write_guest_u64(engine, paint_ptr, FAKE_DEVICE_CONTEXT_HANDLE)?;
-        write_guest_u32(engine, checked_field_address(paint_ptr, 8, "fErase")?, 1)?;
+        write_guest_u32(engine, checked_field_address(paint_ptr, 8, "fErase"), 1)?;
         write_guest_i32(
             engine,
-            checked_field_address(paint_ptr, 12, "rcPaint.left")?,
+            checked_field_address(paint_ptr, 12, "rcPaint.left"),
             0,
         )?;
         write_guest_i32(
             engine,
-            checked_field_address(paint_ptr, 16, "rcPaint.top")?,
+            checked_field_address(paint_ptr, 16, "rcPaint.top"),
             0,
         )?;
         write_guest_i32(
             engine,
-            checked_field_address(paint_ptr, 20, "rcPaint.right")?,
+            checked_field_address(paint_ptr, 20, "rcPaint.right"),
             width,
         )?;
         write_guest_i32(
             engine,
-            checked_field_address(paint_ptr, 24, "rcPaint.bottom")?,
+            checked_field_address(paint_ptr, 24, "rcPaint.bottom"),
             height,
         )?;
-        write_guest_u32(engine, checked_field_address(paint_ptr, 28, "fRestore")?, 0)?;
+        write_guest_u32(engine, checked_field_address(paint_ptr, 28, "fRestore"), 0)?;
         write_guest_u32(
             engine,
-            checked_field_address(paint_ptr, 32, "fIncUpdate")?,
+            checked_field_address(paint_ptr, 32, "fIncUpdate"),
             0,
         )?;
         // rgbReserved left zeroed by guest or ignored.

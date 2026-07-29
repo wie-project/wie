@@ -384,7 +384,7 @@ pub fn handle_translate_message(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let translated = if message_address == 0 {
         false
     } else {
-        let message_field_address = checked_field_address(message_address, 8, "MSG.message")?;
+        let message_field_address = checked_field_address(message_address, 8, "MSG.message");
 
         let message = crate::guest_memory::read_u32(engine, message_field_address)
             .context("failed to read MSG.message for TranslateMessage")?;
@@ -486,17 +486,17 @@ pub fn handle_dispatch_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let window_handle = read_guest_u64(engine, message_address)
         .context("failed to read MSG.hwnd for DispatchMessageA")?;
 
-    let message_field_address = checked_field_address(message_address, 8, "MSG.message")?;
+    let message_field_address = checked_field_address(message_address, 8, "MSG.message");
 
     let message = read_guest_u32(engine, message_field_address)
         .context("failed to read MSG.message for DispatchMessageA")?;
 
-    let word_parameter_address = checked_field_address(message_address, 16, "MSG.wParam")?;
+    let word_parameter_address = checked_field_address(message_address, 16, "MSG.wParam");
 
     let word_parameter = read_guest_u64(engine, word_parameter_address)
         .context("failed to read MSG.wParam for DispatchMessageA")?;
 
-    let long_parameter_address = checked_field_address(message_address, 24, "MSG.lParam")?;
+    let long_parameter_address = checked_field_address(message_address, 24, "MSG.lParam");
 
     let long_parameter = read_guest_u64(engine, long_parameter_address)
         .context("failed to read MSG.lParam for DispatchMessageA")?;

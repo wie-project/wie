@@ -147,7 +147,7 @@ pub(crate) fn read_null_terminated_utf16_units(
             .checked_mul(2)
             .context("UTF-16 offset overflow")?;
 
-        let address = checked_address(wide_ptr, offset, "UTF-16 NUL scan")?;
+        let address = checked_address(wide_ptr, offset, "UTF-16 NUL scan");
         let unit = read_guest_u16(engine, address)?;
 
         units.push(unit);
@@ -172,7 +172,7 @@ pub(crate) fn read_fixed_utf16_units(
             .checked_mul(2)
             .context("UTF-16 offset overflow")?;
 
-        let address = checked_address(wide_ptr, offset, "fixed UTF-16 read")?;
+        let address = checked_address(wide_ptr, offset, "fixed UTF-16 read");
         units.push(read_guest_u16(engine, address)?);
     }
 
@@ -257,7 +257,7 @@ pub(crate) fn read_null_terminated_bytes(
 
     for index in 0..MAX_BYTES {
         let offset = u64::try_from(index).context("byte index does not fit u64")?;
-        let address = checked_address(input_ptr, offset, "multibyte NUL scan")?;
+        let address = checked_address(input_ptr, offset, "multibyte NUL scan");
 
         let mut byte = [0_u8; 1];
         engine
@@ -309,8 +309,8 @@ pub fn handle_wide_char_to_multi_byte(ctx: &mut HandlerContext<'_>) -> Result<Wi
         .read_rsp()
         .context("failed to read RSP for WideCharToMultiByte")?;
 
-    let out_ptr_address = checked_address(rsp, 0x28, "WideCharToMultiByte lpMultiByteStr")?;
-    let out_len_address = checked_address(rsp, 0x30, "WideCharToMultiByte cbMultiByte")?;
+    let out_ptr_address = checked_address(rsp, 0x28, "WideCharToMultiByte lpMultiByteStr");
+    let out_len_address = checked_address(rsp, 0x30, "WideCharToMultiByte cbMultiByte");
 
     let out_ptr = read_guest_u64(engine, out_ptr_address)?;
     let out_len = read_guest_u64(engine, out_len_address)?;
@@ -385,9 +385,9 @@ pub fn handle_get_cp_info(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         .context("failed to read RDX for GetCPInfo")?;
 
     if cp_info_ptr != 0 {
-        let max_char_size_address = checked_field_address(cp_info_ptr, 0, "MaxCharSize")?;
-        let default_char_address = checked_field_address(cp_info_ptr, 4, "DefaultChar")?;
-        let lead_byte_address = checked_field_address(cp_info_ptr, 6, "LeadByte")?;
+        let max_char_size_address = checked_field_address(cp_info_ptr, 0, "MaxCharSize");
+        let default_char_address = checked_field_address(cp_info_ptr, 4, "DefaultChar");
+        let lead_byte_address = checked_field_address(cp_info_ptr, 6, "LeadByte");
 
         write_guest_u32(engine, max_char_size_address, 1)?;
         engine
@@ -458,7 +458,7 @@ pub fn handle_get_string_type_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
             let offset = index_u64
                 .checked_mul(2)
                 .context("GetStringTypeW output offset overflow")?;
-            let output_address = checked_address(char_type_ptr, offset, "GetStringTypeW output")?;
+            let output_address = checked_address(char_type_ptr, offset, "GetStringTypeW output");
 
             let flags = if info_type == CT_CTYPE1 {
                 classify_ctype1(*unit)
@@ -492,11 +492,11 @@ pub fn handle_multi_byte_to_wide_char(ctx: &mut HandlerContext<'_>) -> Result<Wi
     let rsp = engine.read_rsp()?;
     let output_ptr = read_guest_u64(
         engine,
-        checked_address(rsp, 0x28, "MultiByteToWideChar lpWideCharStr")?,
+        checked_address(rsp, 0x28, "MultiByteToWideChar lpWideCharStr"),
     )?;
     let output_len = read_guest_u64(
         engine,
-        checked_address(rsp, 0x30, "MultiByteToWideChar cchWideChar")?,
+        checked_address(rsp, 0x30, "MultiByteToWideChar cchWideChar"),
     )?;
 
     let input_bytes = read_multibyte_bytes(engine, input_ptr, input_len_raw)?;
@@ -559,8 +559,8 @@ pub fn handle_lc_map_string_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         .read_rsp()
         .context("failed to read RSP for LCMapStringW")?;
 
-    let dest_ptr_address = checked_address(rsp, 0x28, "LCMapStringW lpDestStr")?;
-    let dest_len_address = checked_address(rsp, 0x30, "LCMapStringW cchDest")?;
+    let dest_ptr_address = checked_address(rsp, 0x28, "LCMapStringW lpDestStr");
+    let dest_len_address = checked_address(rsp, 0x30, "LCMapStringW cchDest");
 
     let dest_ptr = read_guest_u64(engine, dest_ptr_address)?;
     let dest_len = read_guest_u64(engine, dest_len_address)?;

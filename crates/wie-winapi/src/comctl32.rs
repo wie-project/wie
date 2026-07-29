@@ -26,22 +26,22 @@ pub fn handle_dll_get_version(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         write_guest_u32(engine, version_info_ptr, 20)?;
         write_guest_u32(
             engine,
-            checked_field_address(version_info_ptr, 4, "dwMajorVersion")?,
+            checked_field_address(version_info_ptr, 4, "dwMajorVersion"),
             6,
         )?;
         write_guest_u32(
             engine,
-            checked_field_address(version_info_ptr, 8, "dwMinorVersion")?,
+            checked_field_address(version_info_ptr, 8, "dwMinorVersion"),
             0,
         )?;
         write_guest_u32(
             engine,
-            checked_field_address(version_info_ptr, 12, "dwBuildNumber")?,
+            checked_field_address(version_info_ptr, 12, "dwBuildNumber"),
             7600,
         )?;
         write_guest_u32(
             engine,
-            checked_field_address(version_info_ptr, 16, "dwPlatformID")?,
+            checked_field_address(version_info_ptr, 16, "dwPlatformID"),
             1,
         )?;
     }
