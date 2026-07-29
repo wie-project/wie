@@ -1586,9 +1586,12 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
                 | "_isatty"
                 | "_get_osfhandle"
                 | "fputc"
+                | "putchar"
+                | "getchar"
                 | "fputs"
                 | "fgetc"
                 | "strcmp"
+                | "strncpy"
                 | "wcscmp"
                 | "wcsstr"
                 | "_onexit"
@@ -1596,6 +1599,7 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
                 | "_beginthreadex"
                 | "_endthreadex"
                 | "_purecall"
+                | "perror"
         );
     }
     if library.eq_ignore_ascii_case("ole32.dll") {

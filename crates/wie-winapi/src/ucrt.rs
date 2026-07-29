@@ -121,6 +121,7 @@ pub fn dispatch_ucrt(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiH
         "__stdio_common_vfprintf" => handle_stdio_common_vfprintf(ctx),
         "__stdio_common_vsprintf" => handle_stdio_common_vsprintf(ctx),
         "__stdio_common_vsscanf" => handle_stdio_common_vsscanf(ctx),
+        "__stdio_common_vfscanf" => handle_stdio_common_vfscanf(ctx),
         "malloc" => handle_malloc(ctx),
         "calloc" => handle_calloc(ctx),
         "free" => handle_free(ctx),
@@ -157,6 +158,7 @@ pub fn dispatch_ucrt(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiH
         "_errno" => handle_errno(ctx),
         "strerror" => handle_strerror(ctx),
         "setlocale" => handle_setlocale(ctx),
+        "perror" => handle_perror(ctx),
         "signal" => handle_signal(ctx),
         // exit / _exit / abort: marked exit_process in hooks; still provide handler body
         // in case traits path misses API-set library names.
@@ -168,6 +170,8 @@ pub fn dispatch_ucrt(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiH
         "_get_osfhandle" => handle_get_osfhandle(ctx),
         "puts" => handle_puts(ctx),
         "fputc" => handle_fputc(ctx),
+        "putchar" => handle_putchar(ctx),
+        "getchar" => handle_getchar(ctx),
         "fputs" => handle_fputs(ctx),
         "atoi" => handle_atoi(ctx),
         "atol" => handle_atol(ctx),
@@ -180,6 +184,7 @@ pub fn dispatch_ucrt(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiH
         "fgetc" => handle_fgetc(ctx),
         "strtok" => handle_strtok(ctx),
         "strcmp" => handle_strcmp(ctx),
+        "strncpy" => handle_strncpy(ctx),
         "isalpha" => handle_isalpha(ctx),
         "isdigit" => handle_isdigit(ctx),
         "isalnum" => handle_isalnum(ctx),
@@ -358,8 +363,8 @@ fn handle_stdio_common_vfprintf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         if fmt_ptr == 0 {
             return ret(engine, 0);
         }
-        let fmt = read_guest_str(engine, fmt_ptr, 4096)?;
-        let rsp = engine.read_rsp()?;
+    let fmt = read_guest_str(engine, fmt_ptr, 4096)?;
+    let rsp = engine.read_rsp()?;
         let mut va = read_guest_u64(engine, rsp.wrapping_add(0x28)).unwrap_or(0);
 
         const MAX_OUTPUT: usize = 4096;
@@ -369,20 +374,45 @@ fn handle_stdio_common_vfprintf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         while i < bytes.len() && out.len() < MAX_OUTPUT {
             if bytes[i] == b'%' && i + 1 < bytes.len() {
                 i += 1;
+                let mut field_width: Option<i32> = None;
+                // Parse optional field width (digits or *).
+                if bytes[i] == b'*' {
+                    field_width = Some(read_guest_u64(engine, va).unwrap_or(0) as i32);
+                    va = va.wrapping_add(8);
+                    i += 1;
+                } else if bytes[i].is_ascii_digit() {
+                    let mut w: i32 = 0;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        w = w.saturating_mul(10).saturating_add(i32::from(bytes[i] - b'0'));
+                        i += 1;
+                    }
+                    field_width = Some(w);
+                }
+                // Skip optional precision (`.` then digits or *).
+                if i < bytes.len() && bytes[i] == b'.' {
+                    i += 1;
+                    if i < bytes.len() && bytes[i] == b'*' {
+                        let _prec: i32 = read_guest_u64(engine, va).unwrap_or(0) as i32;
+                        va = va.wrapping_add(8);
+                        i += 1;
+                    } else {
+                        while i < bytes.len() && bytes[i].is_ascii_digit() {
+                            i += 1;
+                        }
+                    }
+                }
                 match bytes[i] {
                     b'd' | b'i' | b'u' | b'X' | b'x' => {
                         let v = read_guest_u64(engine, va).unwrap_or(0);
                         va = va.wrapping_add(8);
-                        out.extend_from_slice(format!("{}", v as i64).as_bytes());
+                        let s = format!("{}", v as i64);
+                        pad_or_trim(&mut out, field_width, &s);
                     }
-                    b's' => {
+                b's' => {
                         let p = read_guest_u64(engine, va).unwrap_or(0);
                         va = va.wrapping_add(8);
-                        out.extend_from_slice(
-                            read_guest_str(engine, p, 1024)
-                                .unwrap_or_default()
-                                .as_bytes(),
-                        );
+                        let s = read_guest_str(engine, p, 1024).unwrap_or_default();
+                        pad_or_trim(&mut out, field_width, &s);
                     }
                     b'c' => {
                         let v = read_guest_u64(engine, va).unwrap_or(0);
@@ -410,6 +440,20 @@ fn handle_stdio_common_vfprintf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 }
 
 /// `__stdio_common_vsprintf(options, buf, count, format, locale, va_list)`.
+/// Apply field-width padding: if `width` is Some and > `s.len()`, pad left
+/// with spaces; otherwise append `s` as-is.
+fn pad_or_trim(out: &mut Vec<u8>, width: Option<i32>, s: &str) {
+    if let Some(w) = width {
+        let w_usize = w.max(0) as usize;
+        if w_usize > s.len() {
+            for _ in 0..(w_usize.saturating_sub(s.len())) {
+                out.push(b' ');
+            }
+        }
+    }
+    out.extend_from_slice(s.as_bytes());
+}
+
 fn handle_stdio_common_vsprintf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let buf = engine.read_rdx()?;
@@ -428,32 +472,55 @@ fn handle_stdio_common_vsprintf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     while i < bytes.len() && out.len() < MAX_OUTPUT {
         if bytes[i] == b'%' && i + 1 < bytes.len() {
             i += 1;
+            let mut field_width: Option<i32> = None;
+            // Parse optional field width (digits or *).
+            if bytes[i] == b'*' {
+                field_width = Some(read_guest_u64(engine, va).unwrap_or(0) as i32);
+                va = va.wrapping_add(8);
+                i += 1;
+            } else if bytes[i].is_ascii_digit() {
+                let mut w: i32 = 0;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    w = w.saturating_mul(10).saturating_add(i32::from(bytes[i] - b'0'));
+                    i += 1;
+                }
+                field_width = Some(w);
+            }
+            // Skip optional precision (`.` then digits or *).
+            if i < bytes.len() && bytes[i] == b'.' {
+                i += 1;
+                if i < bytes.len() && bytes[i] == b'*' {
+                    let _prec: i32 = read_guest_u64(engine, va).unwrap_or(0) as i32;
+                    va = va.wrapping_add(8);
+                    i += 1;
+                } else {
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                }
+            }
             match bytes[i] {
                 b'd' | b'i' | b'u' => {
                     let v = read_guest_u64(engine, va).unwrap_or(0);
                     va = va.wrapping_add(8);
-                    out.extend_from_slice(
-                        if bytes[i] == b'u' {
-                            format!("{v}")
-                        } else {
-                            format!("{}", v as i64)
-                        }
-                        .as_bytes(),
-                    );
+                    let s = if bytes[i] == b'u' {
+                        format!("{v}")
+                    } else {
+                        format!("{}", v as i64)
+                    };
+                    crate::ucrt::pad_or_trim(&mut out, field_width, &s);
                 }
                 b'x' | b'X' => {
                     let v = read_guest_u64(engine, va).unwrap_or(0);
                     va = va.wrapping_add(8);
-                    out.extend_from_slice(format!("{v:x}").as_bytes());
+                    let s = format!("{v:x}");
+                    crate::ucrt::pad_or_trim(&mut out, field_width, &s);
                 }
                 b's' => {
                     let p = read_guest_u64(engine, va).unwrap_or(0);
                     va = va.wrapping_add(8);
-                    out.extend_from_slice(
-                        read_guest_str(engine, p, 1024)
-                            .unwrap_or_default()
-                            .as_bytes(),
-                    );
+                    let s = read_guest_str(engine, p, 1024).unwrap_or_default();
+                    crate::ucrt::pad_or_trim(&mut out, field_width, &s);
                 }
                 b'c' => {
                     let v = read_guest_u64(engine, va).unwrap_or(0);
@@ -496,6 +563,10 @@ fn handle_stdio_common_vsscanf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     while fi < fb.len() && si < sb.len() {
         if fb[fi] == b'%' && fi + 1 < fb.len() {
             fi += 1;
+            // Skip optional field-width digits (e.g. %2d → skip '2').
+            while fi < fb.len() && fb[fi].is_ascii_digit() {
+                fi += 1;
+            }
             match fb[fi] {
                 b'd' | b'i' | b'u' => {
                     while si < sb.len() && sb[si].is_ascii_whitespace() {
@@ -511,15 +582,15 @@ fn handle_stdio_common_vsscanf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
                     }
                     if si > start {
                         let s = std::str::from_utf8(&sb[start..si]).unwrap_or("0");
-                        let val: u64 = (if neg {
-                            -(s.parse::<i64>().unwrap_or(0))
+                        let val_i32 = if neg {
+                            s.parse::<i32>().unwrap_or(0).wrapping_neg()
                         } else {
-                            s.parse::<i64>().unwrap_or(0)
-                        }) as u64;
+                            s.parse::<i32>().unwrap_or(0)
+                        };
                         let out = read_guest_u64(engine, va).unwrap_or(0);
                         va = va.wrapping_add(8);
                         if out != 0 {
-                            drop(engine.mem_write(out, &val.to_le_bytes()));
+                            drop(engine.mem_write(out, &val_i32.to_le_bytes()));
                         }
                         items += 1;
                     }
@@ -553,6 +624,160 @@ fn handle_stdio_common_vsscanf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         fi += 1;
     }
     ret(engine, items)
+}
+
+/// `__stdio_common_vfscanf(options, FILE*, format, locale, va_list)`.
+/// Used by `scanf`, `fscanf`, etc. — reads from stdin via the file-io buffer.
+///
+/// Only advances the stdin cursor by the bytes actually consumed by format
+/// parsing, so remaining input (e.g. the newline after a number) stays
+/// available for subsequent `getchar` / `fgets` calls.
+fn handle_stdio_common_vfscanf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    ctx.state.flush_console();
+    let engine = &mut *ctx.engine;
+    let fmt_ptr = engine.read_r8()?;
+    if fmt_ptr == 0 {
+        return ret(engine, 0);
+    }
+    let fmt = read_guest_str(engine, fmt_ptr, 4096)?;
+    let rsp = engine.read_rsp()?;
+    let mut va = read_guest_u64(engine, rsp.wrapping_add(0x28)).unwrap_or(0);
+    let fb = fmt.as_bytes();
+    let mut fi = 0;
+    let mut items = 0_usize;
+
+    // Refill from host stdin if needed, then snapshot a local copy.
+    let (input, base) = {
+        let state = &mut *ctx.state;
+        let base_cursor = state.file_io.stdin_cursor;
+        if base_cursor >= state.file_io.stdin_bytes.len()
+            && state.file_io.stdin_mode == GuestStdinMode::LiveHost
+        {
+            use std::io::Read;
+            let mut line = Vec::new();
+            let mut byte = [0_u8; 1];
+            let mut host_stdin = std::io::stdin().lock();
+            loop {
+                if line.len() >= 4096 || host_stdin.read(&mut byte).unwrap_or(0) == 0 {
+                    break;
+                }
+                line.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            if !line.is_empty() {
+                state.file_io.stdin_bytes = line;
+                let c = 0_usize;
+                let buf: Vec<u8> = state.file_io.stdin_bytes[c..].to_vec();
+                (buf, c)
+            } else {
+                let c = base_cursor;
+                let buf: Vec<u8> = state.file_io.stdin_bytes[c..].to_vec();
+                (buf, c)
+            }
+        } else {
+            let c = base_cursor;
+            let buf: Vec<u8> = state.file_io.stdin_bytes[c..].to_vec();
+            (buf, c)
+        }
+    };
+    let engine = &mut *ctx.engine;
+
+    let mut pos = 0_usize;
+    while fi < fb.len() && pos < input.len() {
+        if fb[fi] == b'%' && fi + 1 < fb.len() {
+            fi += 1;
+            // Skip optional field-width digits (e.g. %2d → skip '2').
+            while fi < fb.len() && fb[fi].is_ascii_digit() {
+                fi += 1;
+            }
+            match fb[fi] {
+                b'd' | b'i' | b'u' => {
+                    while pos < input.len() && input[pos].is_ascii_whitespace() {
+                        pos += 1;
+                    }
+                    let neg = if pos < input.len() && input[pos] == b'-' {
+                        pos += 1;
+                        true
+                    } else {
+                        if pos < input.len() && input[pos] == b'+' {
+                            pos += 1;
+                        }
+                        false
+                    };
+                    let start = pos;
+                    while pos < input.len() && input[pos].is_ascii_digit() {
+                        pos += 1;
+                    }
+                    if pos > start {
+                        let s = std::str::from_utf8(&input[start..pos]).unwrap_or("0");
+                        let val_i32 = if neg {
+                            s.parse::<i32>().unwrap_or(0).wrapping_neg()
+                        } else {
+                            s.parse::<i32>().unwrap_or(0)
+                        };
+                        let out = read_guest_u64(engine, va).unwrap_or(0);
+                        va = va.wrapping_add(8);
+                        if out != 0 {
+                            drop(engine.mem_write(out, &val_i32.to_le_bytes()));
+                        }
+                        items += 1;
+                    }
+                }
+                b'c' => {
+                    // Skip optional field-width digits (e.g. %1c → skip '1').
+                    // %c always reads exactly 1 char regardless of field width
+                    // (the width limits the maximum, but the minimum is 1).
+                    if pos < input.len() {
+                        let c = input[pos];
+                        pos += 1;
+                        let out = read_guest_u64(engine, va).unwrap_or(0);
+                        va = va.wrapping_add(8);
+                        if out != 0 {
+                            // Write a full i32 (zero-extended). Many student
+                            // programs store the %c result in an int variable
+                            // and compare with integer constants. A single-byte
+                            // write leaves garbage in the upper 3 bytes.
+                            drop(engine.mem_write(out, &i32::from(c).to_le_bytes()));
+                        }
+                        items += 1;
+                    }
+                }
+                b's' => {
+                    while pos < input.len() && input[pos].is_ascii_whitespace() {
+                        pos += 1;
+                    }
+                    let start = pos;
+                    while pos < input.len() && !input[pos].is_ascii_whitespace() {
+                        pos += 1;
+                    }
+                    let out = read_guest_u64(engine, va).unwrap_or(0);
+                    va = va.wrapping_add(8);
+                    if out != 0 && pos > start {
+                        let mut w = input[start..pos].to_vec();
+                        w.push(0);
+                        drop(engine.mem_write(out, &w));
+                        items += 1;
+                    }
+                }
+                _ => {}
+            }
+        } else if fb[fi].is_ascii_whitespace() {
+            while pos < input.len() && input[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+        } else if pos < input.len() && input[pos] == fb[fi] {
+            pos += 1;
+        }
+        fi += 1;
+    }
+    // Advance stdin cursor only by the bytes actually consumed.
+    {
+        let state = &mut *ctx.state;
+        state.file_io.stdin_cursor = base.saturating_add(pos).min(state.file_io.stdin_bytes.len());
+    }
+    ret(engine, items.try_into().unwrap_or(0))
 }
 
 /// Shared RNG state between `srand` and `rand`.
@@ -1314,6 +1539,91 @@ fn handle_fputc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     ret(engine, u64::from(ch))
 }
 
+/// `putchar(c)` — write character to stdout, return the character or EOF on error.
+fn handle_putchar(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let c = ctx.engine.read_rcx()? & 0xff;
+    let ch = u8::try_from(c).unwrap_or(0);
+    crate::kernel32::console::emit_text_from_bytes(ctx, &[ch]);
+    let engine = &mut *ctx.engine;
+    ret(engine, u64::from(ch))
+}
+
+/// `getchar()` — read one character from stdin, return it or EOF.
+fn handle_getchar(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    ctx.state.flush_console();
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    if state.file_io.stdin_cursor < state.file_io.stdin_bytes.len() {
+        // Data already in the guest-side buffer.
+        let idx = state.file_io.stdin_cursor;
+        let ch = state.file_io.stdin_bytes[idx];
+        if ch != b'\n' {
+            if let Some(nl_pos) =
+                state.file_io.stdin_bytes[idx..].iter().position(|&b| b == b'\n')
+            {
+                state.file_io.stdin_cursor =
+                    idx.wrapping_add(nl_pos).wrapping_add(1);
+                return ret(engine, u64::from(b'\n'));
+            }
+        }
+        state.file_io.stdin_cursor = idx.wrapping_add(1);
+        return ret(engine, u64::from(ch));
+    }
+    if state.file_io.stdin_mode != GuestStdinMode::LiveHost {
+        return ret(engine, u64::from(u32::MAX)); // EOF (InjectOnly)
+    }
+    // LiveHost mode with a TTY: read raw bytes from stdin.
+    // We buffer up to 64 bytes so arrow-key escape sequences
+    // (3 bytes each) don't need three separate poll/read rounds.
+    if crate::console::host_term::is_tty() {
+        use crate::console::host_term;
+        const BUF_CAP: usize = 64;
+        let mut buf = [0_u8; BUF_CAP];
+        // Only poll when the buffer is empty (subsequent getchar
+        // calls after an arrow key will find buffered bytes).
+        if state.file_io.stdin_cursor >= state.file_io.stdin_bytes.len() {
+            state.file_io.stdin_bytes.clear();
+            if host_term::poll_stdin_ready(-1) {
+                let n = host_term::read_stdin(&mut buf);
+                if n > 0 {
+                    state.file_io.stdin_bytes = buf[..n].to_vec();
+                    state.file_io.stdin_cursor = 0;
+                }
+            }
+        }
+        let idx = state.file_io.stdin_cursor;
+        if idx < state.file_io.stdin_bytes.len() {
+            let ch = state.file_io.stdin_bytes[idx];
+            state.file_io.stdin_cursor = idx.wrapping_add(1);
+            return ret(engine, u64::from(ch));
+        }
+    } else {
+        // Piped input: read a line (like fgets) so shared state works.
+        use std::io::Read;
+        let mut line = Vec::new();
+        let mut byte = [0_u8; 1];
+        let mut host_stdin = std::io::stdin().lock();
+        loop {
+            if line.len() >= 4096 || host_stdin.read(&mut byte).unwrap_or(0) == 0 {
+                break;
+            }
+            line.push(byte[0]);
+            if byte[0] == b'\n' {
+                break;
+            }
+        }
+        if !line.is_empty() {
+            state.file_io.stdin_bytes = line;
+            state.file_io.stdin_cursor = 0;
+            let idx = 0_usize;
+            let ch = state.file_io.stdin_bytes[idx];
+            state.file_io.stdin_cursor = idx.wrapping_add(1);
+            return ret(engine, u64::from(ch));
+        }
+    }
+    ret(engine, u64::from(u32::MAX)) // EOF
+}
+
 /// `fputs(s, stream)`.
 fn handle_fputs(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let s = ctx.engine.read_rcx()?;
@@ -1389,6 +1699,7 @@ fn handle_fclose(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
 
 /// `fgets(buf, max, stream)` — read one line from stdin.
 fn handle_fgets(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    ctx.state.flush_console();
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let buf = engine.read_rcx()?;
@@ -1701,6 +2012,37 @@ fn handle_errno(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     }
 }
 
+/// `perror(str)` — print `str: errno_message\n` to stderr.
+fn handle_perror(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let s_ptr = engine.read_rcx()?;
+    let prefix = if s_ptr != 0 {
+        read_guest_str(engine, s_ptr, 256)?
+    } else {
+        String::new()
+    };
+    // Read errno from the fixed guest slot (set by _errno() / pthread).
+    let mut errno_bytes = [0_u8; 4];
+    if engine.mem_read(0x7EFD_0070, &mut errno_bytes).is_ok() {
+        let errno_val = i32::from_le_bytes(errno_bytes);
+        let desc = std::io::Error::from_raw_os_error(errno_val).to_string();
+        let msg = if prefix.is_empty() {
+            format!("{desc}\n")
+        } else {
+            format!("{prefix}: {desc}\n")
+        };
+        crate::kernel32::console::emit_text_from_bytes(ctx, msg.as_bytes());
+    } else {
+        // Can't read errno — still print the prefix.
+        if !prefix.is_empty() {
+            let msg = format!("{prefix}: Unknown error\n");
+            crate::kernel32::console::emit_text_from_bytes(ctx, msg.as_bytes());
+        }
+    }
+    let engine = &mut *ctx.engine;
+    ret(engine, 0)
+}
+
 /// `strcmp(a, b)`.
 fn handle_strcmp(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -1732,6 +2074,37 @@ fn handle_strcmp(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
             return ret(engine, 0);
         }
     }
+}
+
+/// `strncpy(dest, src, n)` — copy at most `n` chars from `src` to `dest`.
+/// Returns `dest`.
+fn handle_strncpy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let dest = engine.read_rcx()?;
+    let src = engine.read_rdx()?;
+    let n = engine.read_r8()?;
+    if dest == 0 || src == 0 || n == 0 {
+        return ret(engine, dest);
+    }
+    let cap = usize::try_from(n).unwrap_or(0).min(4096);
+    // Read src bytes (up to n, looking for null terminator).
+    let mut src_bytes = Vec::with_capacity(cap);
+    for i in 0..cap {
+        let mut byte = [0_u8; 1];
+        if engine.mem_read(src.wrapping_add(u64::try_from(i).unwrap_or(0)), &mut byte).is_err() {
+            break;
+        }
+        src_bytes.push(byte[0]);
+        if byte[0] == 0 {
+            break;
+        }
+    }
+    // Write to dest, padding with zeros if src is shorter than n.
+    let write_len = src_bytes.len().min(cap);
+    let mut buf = vec![0_u8; cap];
+    buf[..write_len].copy_from_slice(&src_bytes[..write_len]);
+    drop(engine.mem_write(dest, &buf));
+    ret(engine, dest)
 }
 
 /// `wcscmp(a, b)`.
