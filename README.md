@@ -74,15 +74,23 @@ cargo build -p wie-cli --release
 # Interactive snake game (WASD / arrow keys, q to quit)
 ```bash
 cargo build -p wie-cli --release
-x86_64-w64-mingw32-gcc -std=c11 -O2 -o micro-exes/out/snake.exe micro-exes/snake/main.c
+make -C micro-exes snake
 ./target/release/wie-cli run --persistent --max-api 100000000 micro-exes/out/snake.exe
 ```
 Also builds natively on macOS for comparison:
 ```bash
+make -C micro-exes snake   # or clang directly:
 clang -std=c11 -O2 -o snake micro-exes/snake/main.c && ./snake
 ```
 
 ```bash
+# Build all micro-exes
+make -C micro-exes
+
+# Build individual targets (snake, chess, crt_hello, …)
+make -C micro-exes snake
+make -C micro-exes interactive_exes
+
 # Full clean-room gate (builds micros + runs all PE gates under WIE_CPU=jit)
 make -C micro-exes && ./scripts/run-micro-suite.sh
 
@@ -127,9 +135,13 @@ When a thread parks (`WaitFor*`, contended critical section, …) it drops the W
 
 Default **guest** worker stack is **1 MiB** when `dwStackSize == 0`. Host OS threads for workers use **8 MiB** (JIT/iced need room on secondary threads).
 
-## Interactive games: 2048
+## Interactive games
 
-WIE runs **mevdschee/2048.c** — a terminal version of the 2048 puzzle game (650+ ★ on GitHub). The game uses `getchar` for input, ANSI 256-colour escape codes for rendering, and standard CRT functions.
+WIE runs interactive terminal games compiled with mingw-w64.
+
+### 2048
+
+**mevdschee/2048.c** (650+ ★ on GitHub) — slide tiles to reach 2048.
 
 ```bash
 # Fetch source and compile (requires mingw-w64)
@@ -139,9 +151,27 @@ WIE runs **mevdschee/2048.c** — a terminal version of the 2048 puzzle game (65
 ./target/release/wie-cli run real_exes/2048.exe --max-api 50000 2>/dev/null
 ```
 
-**Controls:** `WASD` or arrow keys to move tiles, `q` to quit, `r` to restart.
+**Controls:** `WASD` or arrow keys, `q` to quit, `r` to restart.
 
-The game processes raw keyboard input — each `getchar()` returns one byte, and arrow key escape sequences (`\033[A` etc.) are delivered byte-by-byte. The ANSI output bypasses the console grid buffer so 256-colour SGR codes pass through to the terminal intact.
+### Snake
+
+The classic snake game from the micro-exes suite.
+
+```bash
+# Build (using the micro-exes Makefile)
+make -C micro-exes snake
+
+# Play interactively
+./target/release/wie-cli run --persistent --max-api 100000000 micro-exes/out/snake.exe
+```
+
+**Controls:** `WASD` or arrow keys, `q` to quit.
+
+### Implementation notes
+
+Both games use `getchar` for input — arrow key escape sequences (`\033[A`
+etc.) are delivered byte-by-byte. ANSI 256-colour SGR codes pass through
+intact since the console grid folding is bypassed for stream output.
 
 ## 7-Zip console status (`7za`)
 
