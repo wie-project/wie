@@ -339,6 +339,13 @@ fn is_lowerable(instr: &Instruction) -> bool {
         | Mnemonic::Subpd
         | Mnemonic::Mulpd
         | Mnemonic::Divpd => sse_packed_fp_is_lowerable(instr),
+        // SSE2 integer compare / shift / sum-of-abs-diff — handled by interpreter only.
+        Mnemonic::Pcmpeqb
+        | Mnemonic::Pcmpeqw
+        | Mnemonic::Pcmpeqd
+        | Mnemonic::Psadbw
+        | Mnemonic::Psrld
+        | Mnemonic::Unpcklpd => false,
         // String ops (REP bulk via JIT host helper); ends block in decoder.
         Mnemonic::Stosb
         | Mnemonic::Stosw
@@ -447,9 +454,17 @@ fn sse_movq_is_lowerable(instr: &Instruction) -> bool {
     let r1 = instr.op_register(1);
     match (k0, k1) {
         (OpKind::Register, OpKind::Register) => {
-            (r0.is_xmm() && r1.is_xmm())
-                || (r0.is_xmm() && r1.size() == 8)
-                || (r0.size() == 8 && r1.is_xmm())
+            // xmm ← xmm: fine.
+            if r0.is_xmm() && r1.is_xmm() {
+                return true;
+            }
+            // xmm ← gpr64: JIT has a bug — the high 64 bits are wrongly
+            // preserved instead of zeroed. Fall back to interpreter.
+            if r0.is_xmm() && r1.size() == 8 {
+                return false;
+            }
+            // gpr64 ← xmm: fine.
+            r0.size() == 8 && r1.is_xmm()
         }
         (OpKind::Register, OpKind::Memory) => {
             (r0.is_xmm() || r0.size() == 8) && mem_ea_ok(instr) && mem_size_ok_sse(instr)

@@ -2748,9 +2748,9 @@ fn lower_sse_movq(
             }
             _ => return Err("movq src".into()),
         };
-        // movq to xmm: merge low 64, keep high (SSE legacy) — iced path uses scalar_merge.
-        let (_, old_hi) = read_xmm_pair(xmm, r0)?;
-        store_xmm_pair(bcx, mem, xmm, xmm_index(r0)?, lo, old_hi);
+        // movq to xmm: zero-extend, high 64 bits are always zeroed.
+        let hi_zero = iconst_u64(bcx, 0);
+        store_xmm_pair(bcx, mem, xmm, xmm_index(r0)?, lo, hi_zero);
         return Ok(());
     }
     // r64, xmm / m64 from xmm
