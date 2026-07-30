@@ -34,18 +34,18 @@ const FAKE_STDERR_HANDLE: u64 = 0x0000_0000_6000_0003;
 /// Cap for a single host console line fill (safety against huge pastes).
 const MAX_HOST_STDIN_LINE: usize = 64 * 1024;
 
-/// Read one line from host stdin (through `\n` or EOF), capped at
-/// [`MAX_HOST_STDIN_LINE`].
-///
-/// Models Microsoft Learn default console line input (`ENABLE_LINE_INPUT`):
-/// `ReadFile` on a console handle does not complete until a carriage return
-/// is entered. On Unix hosts we treat `\n` as the line terminator.
+// Read one line from host stdin (through `\n` or EOF), capped at
+// [`MAX_HOST_STDIN_LINE`].
+//
+// Models Microsoft Learn default console line input (`ENABLE_LINE_INPUT`):
+// `ReadFile` on a console handle does not complete until a carriage return
+// is entered. On Unix hosts we treat `\n` as the line terminator.
 //
 // Returns:
 // - `Ok(Some(bytes))` — non-empty fill (may omit `\n` if cap hit first)
 // - `Ok(None)` — host EOF with no bytes
 // - `Err(_)` — host I/O error
-
+//
 // When the inject/live buffer is empty and live mode is on, block on host
 // stdin for one line and store it in `state.file_io.stdin_bytes`.
 //
@@ -160,7 +160,6 @@ const GUEST_OS_PLATFORM_NT: u32 = 2;
 ///
 /// Microsoft Learn: `lpModuleName == NULL` → handle of the calling process's
 /// `.exe`. Named module must already be loaded; otherwise returns `NULL`.
-
 pub(crate) fn low_u32_to_i32(value: u64, context_name: &str) -> Result<i32> {
     let low = u32::try_from(value & 0xffff_ffff)
         .with_context(|| format!("{context_name} low u32 conversion failed"))?;
@@ -190,7 +189,7 @@ pub(crate) fn copy_path_a_to_guest_buffer(
     let max_scan = dest_len_usize.saturating_add(1).max(1);
     for index in 0..max_scan {
         let index_u64 = u64::try_from(index).context("guest string index does not fit u64")?;
-        let source_address = checked_address(source_ptr, index_u64, "guest source string")?;
+        let source_address = checked_address(source_ptr, index_u64, "guest source string");
         let mut byte = [0_u8; 1];
         engine
             .mem_read(source_address, &mut byte)
@@ -244,8 +243,7 @@ pub(crate) fn copy_path_w_to_guest_buffer(
         let source_offset = index_u64
             .checked_mul(2)
             .context("wide guest string source offset overflow")?;
-        let source_address =
-            checked_address(source_ptr, source_offset, "wide guest source string")?;
+        let source_address = checked_address(source_ptr, source_offset, "wide guest source string");
         let unit = read_guest_u16(engine, source_address)?;
         if unit == 0 {
             break;
@@ -287,14 +285,14 @@ pub(crate) fn copy_path_w_to_guest_buffer(
 // Whether `path` refers to the loaded main PE (any basename/path form).
 
 // Resolve a module that is considered already loaded (`GetModuleHandle*`).
-///
-/// Microsoft Learn: returns `NULL` when the named module is not in the process.
+//
+// Microsoft Learn: returns `NULL` when the named module is not in the process.
 
 // Resolve a DLL by name: first check loaded and fake modules, then try to load from disk.
 
-/// Build a guest Windows-style path for a DLL name relative to the main module directory.
+// Build a guest Windows-style path for a DLL name relative to the main module directory.
 
-/// Write an unlocked `RTL_CRITICAL_SECTION` (Win64 layout) at `critical_section_ptr`.
+// Write an unlocked `RTL_CRITICAL_SECTION` (Win64 layout) at `critical_section_ptr`.
 
 pub(crate) fn read_ansi_string_from_cpu(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -322,7 +320,7 @@ pub(crate) fn read_wide_string_from_cpu(
         let offset = index_u64
             .checked_mul(2)
             .context("wide string offset overflow")?;
-        let unit_address = checked_address(address, offset, "wide string read")?;
+        let unit_address = checked_address(address, offset, "wide string read");
         let unit = read_guest_u16(engine, unit_address)?;
 
         if unit == 0 {
@@ -467,10 +465,10 @@ pub(crate) fn write_find_data_w(
     }
 
     // cFileName is at offset 44 (after dwReserved1), not 48.
-    let file_name_address = checked_field_address(find_data_ptr, 44, "WIN32_FIND_DATAW.cFileName")?;
+    let file_name_address = checked_field_address(find_data_ptr, 44, "WIN32_FIND_DATAW.cFileName");
     // cAlternateFileName[14] starts at 44 + MAX_PATH*2 = 564.
     let alt_name_address =
-        checked_field_address(find_data_ptr, 564, "WIN32_FIND_DATAW.cAlternateFileName")?;
+        checked_field_address(find_data_ptr, 564, "WIN32_FIND_DATAW.cAlternateFileName");
 
     let mut bytes = Vec::new();
     for unit in file_name.encode_utf16() {
@@ -500,9 +498,9 @@ pub(crate) fn write_find_data_a(
     }
 
     // Same header as W; cFileName is CHAR[MAX_PATH] at offset 44.
-    let file_name_address = checked_field_address(find_data_ptr, 44, "WIN32_FIND_DATAA.cFileName")?;
+    let file_name_address = checked_field_address(find_data_ptr, 44, "WIN32_FIND_DATAA.cFileName");
     let alt_name_address =
-        checked_field_address(find_data_ptr, 304, "WIN32_FIND_DATAA.cAlternateFileName")?;
+        checked_field_address(find_data_ptr, 304, "WIN32_FIND_DATAA.cAlternateFileName");
 
     let mut bytes = crate::vfs::encode_acp(file_name);
     bytes.push(0);
@@ -566,38 +564,33 @@ pub(crate) fn find_resource_by_handle(state: &WinApiState, handle: u64) -> Optio
         .find(|resource| resource.handle == handle || resource.loaded_handle == handle)
 }
 
-///
-/// Returns the active guest TID from [`crate::ThreadState`] (primary `0x5678`
-/// until MT.2 spawns workers).
+// Returns the active guest TID from [`crate::ThreadState`] (primary `0x5678`
+// until MT.2 spawns workers).
 
-///
-/// Microsoft Learn (`heapapi.h`):
-/// - success → pointer to allocated block (at least `dwBytes`)
-/// - failure → `NULL` (does not call `SetLastError`)
+// Microsoft Learn (`heapapi.h`):
+// - success → pointer to allocated block (at least `dwBytes`)
+// - failure → `NULL` (does not call `SetLastError`)
 // - `HEAP_ZERO_MEMORY` zeros the block
 // - `dwBytes == 0` allocates a zero-length item and still returns a valid pointer
-///   (same practical behaviour as the Windows process heap / CRT `malloc(0)`)
+//   (same practical behaviour as the Windows process heap / CRT `malloc(0)`)
 
-///
-/// Microsoft Learn: `lpMem` may be `NULL` (no-op, success). Double-free /
-/// unknown pointer fails with a non-zero last-error in this emulator
-/// (`ERROR_INVALID_HANDLE`) so freestanding tests can detect the failure.
+// Microsoft Learn: `lpMem` may be `NULL` (no-op, success). Double-free /
+// unknown pointer fails with a non-zero last-error in this emulator
+// (`ERROR_INVALID_HANDLE`) so freestanding tests can detect the failure.
 
-///
-/// Microsoft Learn: preserves contents; failure leaves the original block valid
-/// and returns `NULL`. `dwBytes == 0` is treated as free + `NULL` (common Windows
-/// process-heap behaviour used by the micro-suite).
+// Microsoft Learn: preserves contents; failure leaves the original block valid
+// and returns `NULL`. `dwBytes == 0` is treated as free + `NULL` (common Windows
+// process-heap behaviour used by the micro-suite).
 
-///
+//
 // Guest `RTL_CRITICAL_SECTION` layout (Win64) written by Initialize*:
-/// `LockCount` (-1 unlocked), `RecursionCount`, `OwningThread` (guest TID).
-///
-/// Contended path: returns [`crate::WinApiControlSignal::HostPark`] so the
-/// session drops the shared CPU lock and waits on the CS condvar (MT.3).
+// `LockCount` (-1 unlocked), `RecursionCount`, `OwningThread` (guest TID).
+//
+// Contended path: returns [`crate::WinApiControlSignal::HostPark`] so the
+// session drops the shared CPU lock and waits on the CS condvar (MT.3).
 
-///
-/// Zeros the CS fields. Calling Delete while owned is undefined on Windows;
-/// we still clear so a subsequent Initialize can reuse the memory.
+// Zeros the CS fields. Calling Delete while owned is undefined on Windows;
+// we still clear so a subsequent Initialize can reuse the memory.
 
 /// Result of a non-blocking CS enter attempt.
 pub(crate) enum EnterCsResult {

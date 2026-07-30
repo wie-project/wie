@@ -531,9 +531,15 @@ fn execute_one(
         // Move packed floats between XMM upper/lower halves and memory.
         Mnemonic::Movhps => exec_sse_movhps(mem, regs, instr),
         Mnemonic::Movhlps | Mnemonic::Movlhps => exec_sse_movhlps(regs, instr),
-        // SSE2 unpack / shuffle (used by CRT memcpy/memset).
+        // SSE2 unpack / shuffle / compare (used by CRT memcpy/memset).
         Mnemonic::Punpcklqdq | Mnemonic::Punpckhqdq => exec_sse_punpck(regs, instr),
         Mnemonic::Pshufd => exec_sse_pshufd(regs, instr),
+        Mnemonic::Pcmpeqb | Mnemonic::Pcmpeqw | Mnemonic::Pcmpeqd => {
+            exec_sse_pcmpeq(mem, regs, instr, instr.mnemonic())
+        }
+        Mnemonic::Psadbw => exec_sse_psadbw(mem, regs, instr),
+        Mnemonic::Psrld => exec_sse_psrld(regs, instr),
+        Mnemonic::Unpcklpd => exec_sse_unpcklpd(regs, instr),
         Mnemonic::Addss => exec_sse_scalar_fp(mem, regs, instr, FpOp::Add, false),
         Mnemonic::Subss => exec_sse_scalar_fp(mem, regs, instr, FpOp::Sub, false),
         Mnemonic::Mulss => exec_sse_scalar_fp(mem, regs, instr, FpOp::Mul, false),
@@ -1465,6 +1471,91 @@ fn exec_sse_pshufd(regs: &mut RegFile, instr: &Instruction) -> Result<(), StepEx
         .fold(0u128, |acc, (i, lane)| acc | (u128::from(lane) << (i * 32)));
     regs.write_xmm(dst, result)?;
     Ok(())
+}
+
+/// `Pcmpeq{b,w,d}` — compare packed integers for equality.
+/// `mnemonic` determines the lane size: byte (16 lanes), word (8), or dword (4).
+fn exec_sse_pcmpeq(
+    mem: &GuestMemory,
+    regs: &mut RegFile,
+    instr: &Instruction,
+    mnemonic: Mnemonic,
+) -> Result<(), StepExecError> {
+    let a = read_sse_op(mem, regs, instr, 0, 16)?;
+    let b = read_sse_op(mem, regs, instr, 1, 16)?;
+    let (lanes, bits) = match mnemonic {
+        Mnemonic::Pcmpeqb => (16, 8),
+        Mnemonic::Pcmpeqw => (8, 16),
+        _ => (4, 32), // Pcmpeqd
+    };
+    let mask = (1u128 << bits) - 1;
+    let mut result: u128 = 0;
+    for i in 0..lanes {
+        let shift = i * bits;
+        let a_lane = (a >> shift) & mask;
+        let b_lane = (b >> shift) & mask;
+        if a_lane == b_lane {
+            result |= mask << shift;
+        }
+    }
+    write_sse_op(mem, regs, instr, 0, result, 16, false)
+}
+
+/// `Psrld` — shift right logical dword (immediate form: `psrld xmm, imm8`).
+fn exec_sse_psrld(regs: &mut RegFile, instr: &Instruction) -> Result<(), StepExecError> {
+    let dst = instr.op_register(0);
+    let src_val = regs.read_xmm(dst)?;
+    let shift = (instr.immediate(1) & 0xff) as u32;
+    let mut result: u128 = 0;
+    for i in 0..4 {
+        let lane = ((src_val >> (i * 32)) & 0xffff_ffff) as u32;
+        let shifted = lane.wrapping_shr(shift);
+        result |= u128::from(shifted) << (i * 32);
+    }
+    regs.write_xmm(dst, result)?;
+    Ok(())
+}
+
+/// `Unpcklpd` — unpack low packed double-precision floats (identical to punpcklqdq).
+fn exec_sse_unpcklpd(regs: &mut RegFile, instr: &Instruction) -> Result<(), StepExecError> {
+    let dst = instr.op_register(0);
+    let src = instr.op_register(1);
+    let a = regs.read_xmm(dst)?;
+    let b = regs.read_xmm(src)?;
+    // Low 64 bits from dst, low 64 bits from src.
+    let result = (a & 0xffff_ffff_ffff_ffff) | ((b & 0xffff_ffff_ffff_ffff) << 64);
+    regs.write_xmm(dst, result)?;
+    Ok(())
+}
+
+/// `Psadbw` — sum of absolute differences of unsigned bytes.
+/// Low 8 bytes → summed into lower 16 bits of lower qword.
+/// High 8 bytes → summed into lower 16 bits of upper qword.
+fn exec_sse_psadbw(
+    mem: &GuestMemory,
+    regs: &mut RegFile,
+    instr: &Instruction,
+) -> Result<(), StepExecError> {
+    let a = read_sse_op(mem, regs, instr, 0, 16)?;
+    let b = read_sse_op(mem, regs, instr, 1, 16)?;
+    let low_sum: u64 = (0..8)
+        .map(|i| {
+            let shift = i * 8;
+            let a_byte = ((a >> shift) & 0xff) as u64;
+            let b_byte = ((b >> shift) & 0xff) as u64;
+            a_byte.abs_diff(b_byte)
+        })
+        .sum();
+    let high_sum: u64 = (0..8)
+        .map(|i| {
+            let shift = (i + 8) * 8;
+            let a_byte = ((a >> shift) & 0xff) as u64;
+            let b_byte = ((b >> shift) & 0xff) as u64;
+            a_byte.abs_diff(b_byte)
+        })
+        .sum();
+    let result = u128::from(low_sum) | (u128::from(high_sum) << 64);
+    write_sse_op(mem, regs, instr, 0, result, 16, false)
 }
 
 fn read_sse_op(

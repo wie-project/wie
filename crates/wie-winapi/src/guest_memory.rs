@@ -55,17 +55,17 @@ pub(crate) fn write_u64(
 /// Guest addresses are checked at allocation time (bounded to <48-bit VA), so
 /// overflow on field-offset computation is a programming error.  Using
 /// `wrapping_add` avoids the checked-branch on every handler memory access.
-#[allow(clippy::unnecessary_wraps)]
-pub(crate) fn checked_field_address(base: u64, offset: u64, _field_name: &str) -> Result<u64> {
-    Ok(base.wrapping_add(offset))
+#[must_use]
+pub(crate) fn checked_field_address(base: u64, offset: u64, _field_name: &str) -> u64 {
+    base.wrapping_add(offset)
 }
 
 /// Compute a guest address with wrapping arithmetic.
 ///
 /// See [`checked_field_address`] for rationale.
-#[allow(clippy::unnecessary_wraps)]
-pub(crate) fn checked_address(base: u64, offset: u64, _context_name: &str) -> Result<u64> {
-    Ok(base.wrapping_add(offset))
+#[must_use]
+pub(crate) fn checked_address(base: u64, offset: u64, _context_name: &str) -> u64 {
+    base.wrapping_add(offset)
 }
 
 pub(crate) fn read_u16(engine: &mut dyn wie_cpu::CpuEngine, address: u64) -> Result<u16> {

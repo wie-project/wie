@@ -5,8 +5,6 @@
 //! writes escape sequences directly, so the diff always sees a truthful "before"
 //! and cannot be desynchronised by a partial paint.
 
-#![allow(clippy::map_identity, clippy::option_map_unit_fn)]
-
 use super::{
     Context, HandlerContext, Result, WinApiHandlerResult, WinApiState, low_u32, ret_bool_true,
     ret_u64, write_guest_u32,
@@ -35,7 +33,7 @@ fn stack_arg(ctx: &mut HandlerContext<'_>, index: usize, api: &str) -> Result<u6
         .read_rsp()
         .with_context(|| format!("{api} RSP"))?;
     let offset = 0x28_u64.saturating_add((u64::try_from(index).unwrap_or(0)).saturating_mul(8));
-    let address = super::checked_address(rsp, offset, api)?;
+    let address = super::checked_address(rsp, offset, api);
     super::read_guest_u64(ctx.engine, address)
 }
 
@@ -169,7 +167,7 @@ pub fn handle_get_console_cursor_info(ctx: &mut HandlerContext<'_>) -> Result<Wi
             (buffer.cursor_size, u32::from(buffer.cursor_visible))
         });
     write_guest_u32(ctx.engine, info_ptr, size)?;
-    let visible_ptr = super::checked_address(info_ptr, 4, "GetConsoleCursorInfo bVisible")?;
+    let visible_ptr = super::checked_address(info_ptr, 4, "GetConsoleCursorInfo bVisible");
     write_guest_u32(ctx.engine, visible_ptr, visible)?;
     ret_bool_true(ctx.engine, "GetConsoleCursorInfo")
 }
@@ -185,7 +183,7 @@ pub fn handle_set_console_cursor_info(ctx: &mut HandlerContext<'_>) -> Result<Wi
         return ret_invalid_handle(ctx, "SetConsoleCursorInfo");
     };
     let size = super::read_guest_u32(ctx.engine, info_ptr)?;
-    let visible_ptr = super::checked_address(info_ptr, 4, "SetConsoleCursorInfo bVisible")?;
+    let visible_ptr = super::checked_address(info_ptr, 4, "SetConsoleCursorInfo bVisible");
     let visible = super::read_guest_u32(ctx.engine, visible_ptr)? != 0;
     if let Some(buffer) = ctx.state.console().buffer_mut(buffer_handle) {
         buffer.cursor_size = size;
@@ -295,9 +293,9 @@ pub fn handle_fill_console_output_attribute(
 /// Read a `SMALL_RECT` from guest memory (four `SHORT`s, inclusive edges).
 fn read_small_rect(ctx: &mut HandlerContext<'_>, address: u64, api: &str) -> Result<SmallRect> {
     let left = read_guest_u16(ctx.engine, address)?;
-    let top = read_guest_u16(ctx.engine, super::checked_address(address, 2, api)?)?;
-    let right = read_guest_u16(ctx.engine, super::checked_address(address, 4, api)?)?;
-    let bottom = read_guest_u16(ctx.engine, super::checked_address(address, 6, api)?)?;
+    let top = read_guest_u16(ctx.engine, super::checked_address(address, 2, api))?;
+    let right = read_guest_u16(ctx.engine, super::checked_address(address, 4, api))?;
+    let bottom = read_guest_u16(ctx.engine, super::checked_address(address, 6, api))?;
     Ok(SmallRect {
         left: i16::from_ne_bytes(left.to_ne_bytes()),
         top: i16::from_ne_bytes(top.to_ne_bytes()),
@@ -319,7 +317,7 @@ fn write_small_rect(
         (4, rect.right),
         (6, rect.bottom),
     ] {
-        let slot = super::checked_address(address, offset, api)?;
+        let slot = super::checked_address(address, offset, api);
         super::write_guest_u16(ctx.engine, slot, u16::from_ne_bytes(value.to_ne_bytes()))?;
     }
     Ok(())
@@ -723,12 +721,12 @@ fn read_console_output(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinAp
                     .saturating_add(usize::try_from(dest_x).unwrap_or(0));
                 let offset = dest_index.saturating_mul(CHAR_INFO_SIZE);
                 if let Some(slot) = raw.get_mut(offset..offset.saturating_add(CHAR_INFO_SIZE)) {
-                    slot.get_mut(..2).map(|half| {
+                    if let Some(half) = slot.get_mut(..2) {
                         half.copy_from_slice(&stored.to_le_bytes());
-                    });
-                    slot.get_mut(2..).map(|half| {
+                    }
+                    if let Some(half) = slot.get_mut(2..) {
                         half.copy_from_slice(&cell.attributes.to_le_bytes());
-                    });
+                    }
                 }
                 column = column.saturating_add(1);
             }
@@ -785,7 +783,7 @@ fn scroll_console_screen_buffer(
         CharInfo::default()
     } else {
         let raw_char = read_guest_u16(ctx.engine, fill_ptr)?;
-        let attributes = read_guest_u16(ctx.engine, super::checked_address(fill_ptr, 2, api)?)?;
+        let attributes = read_guest_u16(ctx.engine, super::checked_address(fill_ptr, 2, api))?;
         CharInfo {
             unit: raw_char,
             attributes,

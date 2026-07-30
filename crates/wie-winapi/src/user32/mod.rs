@@ -1,5 +1,3 @@
-#![allow(clippy::empty_line_after_doc_comments)]
-
 pub(crate) use crate::guest_memory::{
     checked_field_address, read_bytes as read_guest_bytes, read_i32 as read_guest_i32,
     read_u32 as read_guest_u32, read_u64 as read_guest_u64, write_bytes as write_guest_bytes,
@@ -81,17 +79,17 @@ pub(crate) fn write_window_rect(
 ) -> Result<()> {
     write_guest_i32(engine, rect_ptr, left)?;
 
-    write_guest_i32(engine, checked_field_address(rect_ptr, 4, "RECT.top")?, top)?;
+    write_guest_i32(engine, checked_field_address(rect_ptr, 4, "RECT.top"), top)?;
 
     write_guest_i32(
         engine,
-        checked_field_address(rect_ptr, 8, "RECT.right")?,
+        checked_field_address(rect_ptr, 8, "RECT.right"),
         right,
     )?;
 
     write_guest_i32(
         engine,
-        checked_field_address(rect_ptr, 12, "RECT.bottom")?,
+        checked_field_address(rect_ptr, 12, "RECT.bottom"),
         bottom,
     )?;
 
@@ -130,7 +128,6 @@ pub(crate) fn write_wide_window_text(
 
 ///
 /// Fills `PAINTSTRUCT` with a fake HDC and client rect; real painting is stubbed.
-
 pub(crate) fn window_long_ptr_index(index_raw: u64, api_name: &str) -> Result<i64> {
     let index_low = u32::try_from(index_raw)
         .with_context(|| format!("{api_name} index does not fit in u32"))?;
@@ -200,7 +197,7 @@ pub(crate) fn write_message_structure(
 
     write_guest_u32(
         engine,
-        checked_field_address(message_address, 8, "MSG.message")?,
+        checked_field_address(message_address, 8, "MSG.message"),
         message.message,
     )
     .context("failed to write MSG.message")?;
@@ -208,42 +205,42 @@ pub(crate) fn write_message_structure(
     // Bytes 12..16 are alignment padding on Win64.
     write_guest_u32(
         engine,
-        checked_field_address(message_address, 12, "MSG alignment padding")?,
+        checked_field_address(message_address, 12, "MSG alignment padding"),
         0,
     )
     .context("failed to clear MSG alignment padding")?;
 
     write_guest_u64(
         engine,
-        checked_field_address(message_address, 16, "MSG.wParam")?,
+        checked_field_address(message_address, 16, "MSG.wParam"),
         message.word_parameter,
     )
     .context("failed to write MSG.wParam")?;
 
     write_guest_u64(
         engine,
-        checked_field_address(message_address, 24, "MSG.lParam")?,
+        checked_field_address(message_address, 24, "MSG.lParam"),
         message.long_parameter,
     )
     .context("failed to write MSG.lParam")?;
 
     write_guest_u32(
         engine,
-        checked_field_address(message_address, 32, "MSG.time")?,
+        checked_field_address(message_address, 32, "MSG.time"),
         message.time,
     )
     .context("failed to write MSG.time")?;
 
     write_guest_i32(
         engine,
-        checked_field_address(message_address, 36, "MSG.pt.x")?,
+        checked_field_address(message_address, 36, "MSG.pt.x"),
         message.point_x,
     )
     .context("failed to write MSG.pt.x")?;
 
     write_guest_i32(
         engine,
-        checked_field_address(message_address, 40, "MSG.pt.y")?,
+        checked_field_address(message_address, 40, "MSG.pt.y"),
         message.point_y,
     )
     .context("failed to write MSG.pt.y")?;
@@ -251,7 +248,7 @@ pub(crate) fn write_message_structure(
     // MSG.lPrivate on modern Win64 layouts.
     write_guest_u32(
         engine,
-        checked_field_address(message_address, 44, "MSG.lPrivate")?,
+        checked_field_address(message_address, 44, "MSG.lPrivate"),
         0,
     )
     .context("failed to clear MSG.lPrivate")?;
@@ -260,7 +257,6 @@ pub(crate) fn write_message_structure(
 }
 
 /// Neutral default message handler used by several USER32 `Def*Proc` APIs.
-
 pub(crate) fn allocate_menu_handle(state: &mut WinApiState) -> Result<u64> {
     let handle = state.window_state().next_menu_handle;
     state.window_state().next_menu_handle = state
@@ -274,7 +270,6 @@ pub(crate) fn allocate_menu_handle(state: &mut WinApiState) -> Result<u64> {
 ///
 /// Accepts the call and returns `nPos` (or `nMax` if position is absent) so
 /// scroll-range setup during level-editor open does not abort the guest.
-
 pub(crate) fn register_window_class(
     state: &mut WinApiState,
     mut record: WindowClassRecord,
@@ -486,31 +481,31 @@ pub(crate) fn create_mdi_child_from_struct(
         .context("failed to read MDICREATESTRUCT.szClass")?;
     let title_ptr = read_guest_u64(
         engine,
-        checked_field_address(create_struct_ptr, 8, "MDICREATESTRUCT.szTitle")?,
+        checked_field_address(create_struct_ptr, 8, "MDICREATESTRUCT.szTitle"),
     )?;
     let owner = read_guest_u64(
         engine,
-        checked_field_address(create_struct_ptr, 16, "MDICREATESTRUCT.hOwner")?,
+        checked_field_address(create_struct_ptr, 16, "MDICREATESTRUCT.hOwner"),
     )?;
     let x = read_guest_i32(
         engine,
-        checked_field_address(create_struct_ptr, 24, "MDICREATESTRUCT.x")?,
+        checked_field_address(create_struct_ptr, 24, "MDICREATESTRUCT.x"),
     )?;
     let y = read_guest_i32(
         engine,
-        checked_field_address(create_struct_ptr, 28, "MDICREATESTRUCT.y")?,
+        checked_field_address(create_struct_ptr, 28, "MDICREATESTRUCT.y"),
     )?;
     let cx = read_guest_i32(
         engine,
-        checked_field_address(create_struct_ptr, 32, "MDICREATESTRUCT.cx")?,
+        checked_field_address(create_struct_ptr, 32, "MDICREATESTRUCT.cx"),
     )?;
     let cy = read_guest_i32(
         engine,
-        checked_field_address(create_struct_ptr, 36, "MDICREATESTRUCT.cy")?,
+        checked_field_address(create_struct_ptr, 36, "MDICREATESTRUCT.cy"),
     )?;
     let style = read_guest_u32(
         engine,
-        checked_field_address(create_struct_ptr, 40, "MDICREATESTRUCT.style")?,
+        checked_field_address(create_struct_ptr, 40, "MDICREATESTRUCT.style"),
     )?;
 
     let class_identifier = if unicode {

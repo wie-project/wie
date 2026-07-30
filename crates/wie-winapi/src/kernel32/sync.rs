@@ -133,9 +133,9 @@ pub(crate) fn try_enter_critical_section_guest(
     cs: u64,
     owner_tid: u32,
 ) -> Result<EnterCsResult> {
-    let lock_va = checked_field_address(cs, 8, "LockCount")?;
-    let recursion_va = checked_field_address(cs, 12, "RecursionCount")?;
-    let owner_va = checked_field_address(cs, 16, "OwningThread")?;
+    let lock_va = checked_field_address(cs, 8, "LockCount");
+    let recursion_va = checked_field_address(cs, 12, "RecursionCount");
+    let owner_va = checked_field_address(cs, 16, "OwningThread");
 
     let owning = read_guest_u64(engine, owner_va).unwrap_or(0);
     let me = u64::from(owner_tid);
@@ -168,9 +168,9 @@ pub(crate) fn leave_critical_section_guest(
     cs: u64,
     owner_tid: u32,
 ) -> Result<bool> {
-    let lock_va = checked_field_address(cs, 8, "LockCount")?;
-    let recursion_va = checked_field_address(cs, 12, "RecursionCount")?;
-    let owner_va = checked_field_address(cs, 16, "OwningThread")?;
+    let lock_va = checked_field_address(cs, 8, "LockCount");
+    let recursion_va = checked_field_address(cs, 12, "RecursionCount");
+    let owner_va = checked_field_address(cs, 16, "OwningThread");
 
     let owning = read_guest_u64(engine, owner_va).unwrap_or(0);
     let me = u64::from(owner_tid);

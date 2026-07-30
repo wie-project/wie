@@ -447,9 +447,17 @@ fn sse_movq_is_lowerable(instr: &Instruction) -> bool {
     let r1 = instr.op_register(1);
     match (k0, k1) {
         (OpKind::Register, OpKind::Register) => {
-            (r0.is_xmm() && r1.is_xmm())
-                || (r0.is_xmm() && r1.size() == 8)
-                || (r0.size() == 8 && r1.is_xmm())
+            // xmm ← xmm: fine.
+            if r0.is_xmm() && r1.is_xmm() {
+                return true;
+            }
+            // xmm ← gpr64: JIT has a bug — the high 64 bits are wrongly
+            // preserved instead of zeroed. Fall back to interpreter.
+            if r0.is_xmm() && r1.size() == 8 {
+                return false;
+            }
+            // gpr64 ← xmm: fine.
+            r0.size() == 8 && r1.is_xmm()
         }
         (OpKind::Register, OpKind::Memory) => {
             (r0.is_xmm() || r0.size() == 8) && mem_ea_ok(instr) && mem_size_ok_sse(instr)
@@ -860,10 +868,7 @@ fn stack_base_gpr_index(r: Register) -> Option<usize> {
 /// iced stores displacements as the bit-pattern of a signed offset.
 #[inline]
 fn mem_disp_i64(instr: &Instruction) -> i64 {
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        instr.memory_displacement64() as i64
-    }
+    i64::from_ne_bytes(instr.memory_displacement64().to_ne_bytes())
 }
 
 fn insn_modifies_stack_ptr(instr: &Instruction) -> bool {

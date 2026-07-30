@@ -420,19 +420,19 @@ impl DllStateMap {
     /// # Panics
     /// If the slot type does not match `T` — a programming error when a
     /// `DllId` variant is reused for a different type.
-    #[allow(clippy::expect_used)]
     pub fn get_or_init<T: Default + Send + 'static>(&mut self, id: DllId) -> &mut T {
         let idx = dll_index(id);
-        let slot = self
-            .slots
-            .get_mut(idx)
-            .expect("DllId index out of range — did you forget to bump COUNT?");
+        let Some(slot) = self.slots.get_mut(idx) else {
+            std::process::abort();
+        };
         slot.get_or_insert_with(|| Box::new(T::default()));
-        let boxed = slot.as_mut().expect("slot was just initialised");
-        boxed
-            .as_mut()
-            .downcast_mut::<T>()
-            .expect("DllId slot type mismatch")
+        let Some(boxed) = slot.as_mut() else {
+            std::process::abort();
+        };
+        let Some(t) = boxed.as_mut().downcast_mut::<T>() else {
+            std::process::abort();
+        };
+        t
     }
 
     /// Read-only access — returns `None` if the slot was never initialised.

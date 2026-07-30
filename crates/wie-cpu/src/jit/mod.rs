@@ -2000,8 +2000,9 @@ impl CpuEngine for JitCpu {
                             value: inv.value,
                         },
                     }),
-                    #[allow(clippy::unreachable)]
-                    StepResult::Continue => unreachable!(),
+                    StepResult::Continue => Err(CpuError::Message(
+                        "unexpected Continue from chained block RET".into(),
+                    )),
                 };
             }
             let (result, retired) = self.step_one()?;

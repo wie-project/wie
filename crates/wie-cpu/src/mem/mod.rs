@@ -244,7 +244,7 @@ impl GuestMemory {
         let host_u = host_arena_u.checked_add(off)?;
         // SAFETY: host is arena soft-translate of guest_base; pin is non-owning
         // and invalidated via generation / invalidate_tlb on unmap.
-        #[allow(clippy::as_conversions)] // u64 host address → non-owning data pointer
+        #[allow(clippy::as_conversions)] // required: u64 → non-owning *mut u8 (int-to-ptr)
         let host_base = host_u as *mut u8;
         if host_base.is_null() {
             return None;
@@ -1932,12 +1932,11 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::unreadable_literal)]
     fn virtual_alloc_commit_null_implies_reserve() {
         // Win32/Wine: MEM_COMMIT with NULL address reserves+commits.
         let mut mem = GuestMemory::new();
         let base = mem
-            .virtual_alloc(0, 0x300000, MEM_COMMIT, protect::PAGE_READWRITE)
+            .virtual_alloc(0, 0x300_000, MEM_COMMIT, protect::PAGE_READWRITE)
             .expect("commit-only NULL");
         assert_ne!(base, 0);
         let mut b = [0_u8; 4];

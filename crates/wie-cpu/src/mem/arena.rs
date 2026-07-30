@@ -183,7 +183,6 @@ impl ArenaSet {
     }
 
     /// Binary-search index of the arena that may contain `va` (largest base ≤ va).
-    #[allow(clippy::integer_division)] // binary-search midpoint
     fn candidate_index(&self, va: u64) -> Option<usize> {
         if self.arenas.is_empty() {
             return None;
@@ -191,7 +190,7 @@ impl ArenaSet {
         let mut lo = 0_usize;
         let mut hi = self.arenas.len();
         while lo < hi {
-            let mid = lo.saturating_add(hi.saturating_sub(lo) / 2);
+            let mid = lo.saturating_add(hi.saturating_sub(lo) >> 1);
             let Some(a) = self.arenas.get(mid) else {
                 break;
             };
@@ -260,14 +259,15 @@ impl ArenaSet {
     }
 
     /// Host base of the arena that contains `va` (arena start), if any.
-    #[allow(clippy::as_conversions)] // pointer → address for GuestRegion.host_base
     pub(super) fn arena_host_base_for_va(&self, va: u64) -> Option<u64> {
         let a = self.find_va(va)?;
         if a.host().is_null() {
             return None;
         }
         // Host pointers fit in u64 on supported targets (64-bit).
-        Some(a.host() as usize as u64)
+        // `From<usize> for u64` is absent on 64-bit targets (blanket-impl conflict),
+        // so go through `try_from` — infallible at runtime on all current targets.
+        u64::try_from(a.host().addr()).ok()
     }
 
     /// Guest base of the arena containing `va`, if any.
@@ -598,7 +598,6 @@ impl ArenaSet {
             {
                 // Darwin's MADV_FREE_REUSABLE returns pages to the system without
                 // unmapping. Falls back to MADV_FREE if unavailable (older SDK).
-                #[allow(clippy::used_underscore_binding)]
                 let _ = libc::madvise(host, aligned_len, libc::MADV_FREE_REUSABLE);
             }
             #[cfg(all(unix, not(target_os = "macos")))]

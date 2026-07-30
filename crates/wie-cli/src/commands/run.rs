@@ -66,13 +66,13 @@ pub(crate) fn run_micro(
         },
     )?;
 
-    println!("run_micro: path={}", summary.path);
-    println!("cpu_backend: {}", summary.cpu_backend);
-    println!(
+    eprintln!("run_micro: path={}", summary.path);
+    eprintln!("cpu_backend: {}", summary.cpu_backend);
+    eprintln!(
         "entry={:#018x} initial_rsp={:#018x}",
         summary.entry_point_va, summary.initial_rsp
     );
-    println!(
+    eprintln!(
         "events={} termination={:?}",
         summary.run.events.len(),
         summary.run.termination
@@ -88,7 +88,7 @@ pub(crate) fn run_micro(
     let force_full = std::env::var_os("WIE_API_TRACE").is_some();
     if force_full || events.len() <= HEAD + TAIL {
         for event in events {
-            println!(
+            eprintln!(
                 "  [{:>4}] {}!{} handled={} ret={:?}",
                 event.index,
                 event.library.as_ref(),
@@ -99,7 +99,7 @@ pub(crate) fn run_micro(
         }
     } else {
         for event in events.iter().take(HEAD) {
-            println!(
+            eprintln!(
                 "  [{:>4}] {}!{} handled={} ret={:?}",
                 event.index,
                 event.library.as_ref(),
@@ -109,9 +109,9 @@ pub(crate) fn run_micro(
             );
         }
         let omitted = events.len().saturating_sub(HEAD + TAIL);
-        println!("  … {omitted} events omitted (set WIE_API_TRACE=1 for full dump) …");
+        eprintln!("  … {omitted} events omitted (set WIE_API_TRACE=1 for full dump) …");
         for event in events.iter().skip(events.len().saturating_sub(TAIL)) {
-            println!(
+            eprintln!(
                 "  [{:>4}] {}!{} handled={} ret={:?}",
                 event.index,
                 event.library.as_ref(),
@@ -123,12 +123,12 @@ pub(crate) fn run_micro(
     }
 
     if let Some(profile) = &summary.profile {
-        println!("{}", profile.report());
+        eprintln!("{}", profile.report());
     }
 
     match summary.exit_code {
         Some(code) if code == expect_code => {
-            println!("run_micro: ok exit={code}");
+            eprintln!("run_micro: ok exit={code}");
             Ok(())
         }
         Some(code) => {

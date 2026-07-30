@@ -30,8 +30,8 @@ pub fn handle_reg_create_key_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
         .read_rsp()
         .context("failed to read RSP for RegCreateKeyExA")?;
 
-    let phk_result_address = checked_address(rsp, 0x40, "RegCreateKeyExA phkResult")?;
-    let disposition_address = checked_address(rsp, 0x48, "RegCreateKeyExA lpdwDisposition")?;
+    let phk_result_address = checked_address(rsp, 0x40, "RegCreateKeyExA phkResult");
+    let disposition_address = checked_address(rsp, 0x48, "RegCreateKeyExA lpdwDisposition");
 
     let phk_result = read_guest_u64(engine, phk_result_address)?;
     let disposition_ptr = read_guest_u64(engine, disposition_address)?;
@@ -67,7 +67,7 @@ pub fn handle_reg_open_key_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .read_rsp()
         .context("failed to read RSP for RegOpenKeyExA")?;
 
-    let phk_result_address = checked_address(rsp, 0x30, "RegOpenKeyExA phkResult")?;
+    let phk_result_address = checked_address(rsp, 0x30, "RegOpenKeyExA phkResult");
     let phk_result = read_guest_u64(engine, phk_result_address)?;
 
     let subkey = read_optional_ansi_string(engine, subkey_ptr)?;
@@ -96,7 +96,7 @@ pub fn handle_reg_open_key_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .read_rsp()
         .context("failed to read RSP for RegOpenKeyExW")?;
 
-    let phk_result_address = checked_address(rsp, 0x30, "RegOpenKeyExW phkResult")?;
+    let phk_result_address = checked_address(rsp, 0x30, "RegOpenKeyExW phkResult");
     let phk_result = read_guest_u64(engine, phk_result_address)?;
 
     let subkey = read_optional_utf16_string(engine, subkey_ptr)?;
@@ -125,8 +125,8 @@ pub fn handle_reg_create_key_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApi
         .read_rsp()
         .context("failed to read RSP for RegCreateKeyExW")?;
 
-    let phk_result_address = checked_address(rsp, 0x40, "RegCreateKeyExW phkResult")?;
-    let disposition_address = checked_address(rsp, 0x48, "RegCreateKeyExW lpdwDisposition")?;
+    let phk_result_address = checked_address(rsp, 0x40, "RegCreateKeyExW phkResult");
+    let disposition_address = checked_address(rsp, 0x48, "RegCreateKeyExW lpdwDisposition");
 
     let phk_result = read_guest_u64(engine, phk_result_address)?;
     let disposition_ptr = read_guest_u64(engine, disposition_address)?;
@@ -244,7 +244,7 @@ fn handle_get_file_security(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     let rsp = engine.read_rsp()?;
     let needed_ptr = read_guest_u64(
         engine,
-        checked_address(rsp, 0x28, "GetFileSecurity length needed")?,
+        checked_address(rsp, 0x28, "GetFileSecurity length needed"),
     )?;
     if needed_ptr != 0 {
         write_guest_u32(engine, needed_ptr, FAKE_SD_NEED)?;
@@ -418,10 +418,10 @@ fn handle_reg_enum_key_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     let name_buf = engine.read_r8()?;
     let name_len_ptr = engine.read_r9()?;
     let rsp = engine.read_rsp()?;
-    let _reserved = read_guest_u64(engine, checked_address(rsp, 0x28, "lpReserved")?).unwrap_or(0);
-    let _class = read_guest_u64(engine, checked_address(rsp, 0x30, "lpClass")?).unwrap_or(0);
-    let _class_len = read_guest_u64(engine, checked_address(rsp, 0x38, "lpcClass")?).unwrap_or(0);
-    let _ft = read_guest_u64(engine, checked_address(rsp, 0x40, "lpftLastWriteTime")?).unwrap_or(0);
+    let _reserved = read_guest_u64(engine, checked_address(rsp, 0x28, "lpReserved")).unwrap_or(0);
+    let _class = read_guest_u64(engine, checked_address(rsp, 0x30, "lpClass")).unwrap_or(0);
+    let _class_len = read_guest_u64(engine, checked_address(rsp, 0x38, "lpcClass")).unwrap_or(0);
+    let _ft = read_guest_u64(engine, checked_address(rsp, 0x40, "lpftLastWriteTime")).unwrap_or(0);
 
     // Gather all subkeys whose parent == hkey.
     let subkeys: Vec<&String> = state

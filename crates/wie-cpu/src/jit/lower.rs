@@ -2748,9 +2748,9 @@ fn lower_sse_movq(
             }
             _ => return Err("movq src".into()),
         };
-        // movq to xmm: merge low 64, keep high (SSE legacy) — iced path uses scalar_merge.
-        let (_, old_hi) = read_xmm_pair(xmm, r0)?;
-        store_xmm_pair(bcx, mem, xmm, xmm_index(r0)?, lo, old_hi);
+        // movq to xmm: zero-extend, high 64 bits are always zeroed.
+        let hi_zero = iconst_u64(bcx, 0);
+        store_xmm_pair(bcx, mem, xmm, xmm_index(r0)?, lo, hi_zero);
         return Ok(());
     }
     // r64, xmm / m64 from xmm
@@ -5140,10 +5140,8 @@ fn emit_block_wide_stack_guard(
     base: Value,
     plan: &BlockStackPinPlan,
 ) -> Value {
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-    let min_d = iconst_u64(bcx, plan.min_disp as u64);
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-    let max_e = iconst_u64(bcx, plan.max_end as u64);
+    let min_d = iconst_u64(bcx, u64::from_ne_bytes(plan.min_disp.to_ne_bytes()));
+    let max_e = iconst_u64(bcx, u64::from_ne_bytes(plan.max_end.to_ne_bytes()));
     let lo = bcx.ins().iadd(base, min_d);
     let hi = bcx.ins().iadd(base, max_e);
     // Span must not wrap the address space.

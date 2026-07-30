@@ -110,25 +110,25 @@ fn handle_get_file_name(
 
     let file_buffer_ptr = read_guest_u64(
         engine,
-        checked_field_address(ofn_ptr, OFN_LPSTR_FILE, "OPENFILENAME.lpstrFile")?,
+        checked_field_address(ofn_ptr, OFN_LPSTR_FILE, "OPENFILENAME.lpstrFile"),
     )
     .with_context(|| format!("failed to read lpstrFile for {api_name}"))?;
 
     let max_file = read_guest_u32(
         engine,
-        checked_field_address(ofn_ptr, OFN_NMAX_FILE, "OPENFILENAME.nMaxFile")?,
+        checked_field_address(ofn_ptr, OFN_NMAX_FILE, "OPENFILENAME.nMaxFile"),
     )
     .with_context(|| format!("failed to read nMaxFile for {api_name}"))?;
 
     let file_title_ptr = read_guest_u64(
         engine,
-        checked_field_address(ofn_ptr, OFN_LPSTR_FILE_TITLE, "OPENFILENAME.lpstrFileTitle")?,
+        checked_field_address(ofn_ptr, OFN_LPSTR_FILE_TITLE, "OPENFILENAME.lpstrFileTitle"),
     )
     .with_context(|| format!("failed to read lpstrFileTitle for {api_name}"))?;
 
     let max_file_title = read_guest_u32(
         engine,
-        checked_field_address(ofn_ptr, OFN_NMAX_FILE_TITLE, "OPENFILENAME.nMaxFileTitle")?,
+        checked_field_address(ofn_ptr, OFN_NMAX_FILE_TITLE, "OPENFILENAME.nMaxFileTitle"),
     )
     .with_context(|| format!("failed to read nMaxFileTitle for {api_name}"))?;
 
@@ -240,7 +240,7 @@ fn write_selected_path(
             request.ofn_ptr,
             OFN_NFILE_OFFSET,
             "OPENFILENAME.nFileOffset",
-        )?,
+        ),
         file_offset,
     )?;
 
@@ -250,14 +250,14 @@ fn write_selected_path(
             request.ofn_ptr,
             OFN_NFILE_EXTENSION,
             "OPENFILENAME.nFileExtension",
-        )?,
+        ),
         extension_offset,
     )?;
 
     // Leave Flags as the guest provided them; only offsets/title/path are updated.
     let _flags = read_guest_u32(
         engine,
-        checked_field_address(request.ofn_ptr, OFN_FLAGS, "OPENFILENAME.Flags")?,
+        checked_field_address(request.ofn_ptr, OFN_FLAGS, "OPENFILENAME.Flags"),
     )?;
 
     Ok(())

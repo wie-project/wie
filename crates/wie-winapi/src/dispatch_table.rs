@@ -337,14 +337,16 @@ pub const WINAPI_ID_COUNT: usize = 320;
 impl WinApiId {
     /// Discriminant as `u16` (`#[repr(u16)]`).
     #[must_use]
-    #[allow(clippy::as_conversions)]
+    #[allow(unsafe_code)]
     pub const fn to_u16(self) -> u16 {
-        self as u16
+        // SAFETY: `#[repr(u16)]` guarantees the discriminant is exactly a u16
+        // value, and every variant is valid for transmute.
+        unsafe { core::mem::transmute::<Self, u16>(self) }
     }
 
     /// Reconstruct from the dense discriminant (`0 .. WINAPI_ID_COUNT`).
     #[must_use]
-    #[allow(clippy::as_conversions, unsafe_code)]
+    #[allow(clippy::as_conversions, unsafe_code)] // const fn; From is not const-stable
     pub const fn from_u16(raw: u16) -> Option<Self> {
         if (raw as usize) >= WINAPI_ID_COUNT {
             return None;
@@ -361,8 +363,7 @@ impl WinApiId {
 // The transmute above is only sound while `WINAPI_ID_COUNT` is exactly one past
 // the last discriminant. Both are edited by hand when an API is added, so pin
 // the relationship: if they ever disagree, this fails to compile.
-// `as usize` is an infallible widening from u16 and `TryFrom` is not const,
-// so it is the only option available in a const assertion here.
+// `as usize` is infallible widening; TryFrom / From are not const-stable yet.
 #[allow(clippy::as_conversions)]
 const _: () = assert!(
     (LAST_WINAPI_ID.to_u16() as usize) + 1 == WINAPI_ID_COUNT,
@@ -1586,9 +1587,12 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
                 | "_isatty"
                 | "_get_osfhandle"
                 | "fputc"
+                | "putchar"
+                | "getchar"
                 | "fputs"
                 | "fgetc"
                 | "strcmp"
+                | "strncpy"
                 | "wcscmp"
                 | "wcsstr"
                 | "_onexit"
@@ -1596,6 +1600,7 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
                 | "_beginthreadex"
                 | "_endthreadex"
                 | "_purecall"
+                | "perror"
         );
     }
     if library.eq_ignore_ascii_case("ole32.dll") {
@@ -2290,8 +2295,8 @@ static WINAPI_TRAITS: [WinApiTraits; WINAPI_ID_COUNT] = {
 impl WinApiId {
     /// Lookup the trait flags for this API (constant-time array access).
     #[must_use]
-    #[allow(clippy::indexing_slicing, clippy::as_conversions)]
+    #[allow(clippy::indexing_slicing)]
     pub fn traits(self) -> WinApiTraits {
-        WINAPI_TRAITS[self as u16 as usize]
+        WINAPI_TRAITS[usize::from(self.to_u16())]
     }
 }

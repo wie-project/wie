@@ -5,8 +5,6 @@
 //! block, so updates are visible immediately without invalidating a pointer the
 //! guest may still be holding from `GetEnvironmentStringsW`.
 
-#![allow(clippy::borrow_as_ptr, clippy::single_match, clippy::single_match_else)]
-
 use super::{
     Context, HandlerContext, Result, WinApiHandlerResult, low_u32, read_guest_ansi_lossy,
     read_guest_utf16_lossy, ret_u64,
@@ -209,14 +207,13 @@ fn expand(ctx: &HandlerContext<'_>, input: &str) -> String {
         let tail = after_open.get(1..).unwrap_or("");
         if let Some(close) = tail.find('%') {
             let name = tail.get(..close).unwrap_or("");
-            match lookup(ctx, name) {
-                Some(value) => out.push_str(&value),
+            if let Some(value) = lookup(ctx, name) {
+                out.push_str(&value);
+            } else {
                 // Unknown name: keep the original `%NAME%` text.
-                None => {
-                    out.push('%');
-                    out.push_str(name);
-                    out.push('%');
-                }
+                out.push('%');
+                out.push_str(name);
+                out.push('%');
             }
             rest = tail.get(close.saturating_add(1)..).unwrap_or("");
         } else {
