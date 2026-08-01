@@ -36,6 +36,11 @@ pub(super) enum BlockTerm {
 }
 
 /// Result of trying to form a JIT block at `start`.
+///
+/// `Clone` so the background compiler can be handed the *exact* block a guest
+/// thread classified (background install must compile the same bytes, not a
+/// later re-decode that could observe different guest memory).
+#[derive(Clone)]
 pub(super) enum BlockKind {
     /// Lowerable body (+ optional terminator) ending at `end_rip` when no term / fallthrough.
     Pure {
@@ -207,6 +212,9 @@ fn is_near_branch(instr: &Instruction) -> bool {
     )
 }
 
+// The SSE classification groups intentionally share helper bodies (e.g. all
+// packed-integer ops are `xmm, xmm/m128`); keep the groups readable by mnemonic.
+#[expect(clippy::match_same_arms)]
 fn is_lowerable(instr: &Instruction) -> bool {
     match instr.mnemonic() {
         // Nop, endbranch, sign-extension / DF / rflags stack: always lowerable.
@@ -248,6 +256,9 @@ fn is_lowerable(instr: &Instruction) -> bool {
         | Mnemonic::Btc => alu_is_lowerable(instr),
         Mnemonic::Inc | Mnemonic::Dec | Mnemonic::Not | Mnemonic::Neg => unary_is_lowerable(instr),
         Mnemonic::Imul => imul_is_lowerable(instr),
+        // Integer div/idiv: 32-bit register or simple-mem divisor (v1).
+        // 64-bit stays iced (128-bit RDX:RAX dividend needs i128 helpers).
+        Mnemonic::Div | Mnemonic::Idiv => div_is_lowerable(instr),
         Mnemonic::Xchg => xchg_is_lowerable(instr),
         Mnemonic::Shl
         | Mnemonic::Sal
@@ -339,6 +350,83 @@ fn is_lowerable(instr: &Instruction) -> bool {
         | Mnemonic::Subpd
         | Mnemonic::Mulpd
         | Mnemonic::Divpd => sse_packed_fp_is_lowerable(instr),
+        // Packed integer SSE2: arithmetic / compare / pack / unpack
+        // (dst xmm, src xmm/m128).
+        Mnemonic::Paddb
+        | Mnemonic::Paddw
+        | Mnemonic::Paddd
+        | Mnemonic::Paddq
+        | Mnemonic::Psubb
+        | Mnemonic::Psubw
+        | Mnemonic::Psubd
+        | Mnemonic::Psubq
+        | Mnemonic::Paddsb
+        | Mnemonic::Paddsw
+        | Mnemonic::Paddusb
+        | Mnemonic::Paddusw
+        | Mnemonic::Psubsb
+        | Mnemonic::Psubsw
+        | Mnemonic::Psubusb
+        | Mnemonic::Psubusw
+        | Mnemonic::Pmullw
+        | Mnemonic::Pmulhw
+        | Mnemonic::Pmulhuw
+        | Mnemonic::Pmuludq
+        | Mnemonic::Pmaddwd
+        | Mnemonic::Pcmpeqb
+        | Mnemonic::Pcmpeqw
+        | Mnemonic::Pcmpeqd
+        | Mnemonic::Pcmpgtb
+        | Mnemonic::Pcmpgtw
+        | Mnemonic::Pcmpgtd
+        | Mnemonic::Packsswb
+        | Mnemonic::Packssdw
+        | Mnemonic::Packuswb
+        | Mnemonic::Punpcklbw
+        | Mnemonic::Punpcklwd
+        | Mnemonic::Punpckldq
+        | Mnemonic::Punpckhbw
+        | Mnemonic::Punpckhwd
+        | Mnemonic::Punpckhdq
+        | Mnemonic::Punpcklqdq
+        | Mnemonic::Punpckhqdq => sse_bitwise_is_lowerable(instr),
+        // Packed integer shifts: `xmm, imm8` or `xmm, xmm/m128` (variable count).
+        Mnemonic::Psllw
+        | Mnemonic::Pslld
+        | Mnemonic::Psllq
+        | Mnemonic::Psrlw
+        | Mnemonic::Psrld
+        | Mnemonic::Psrlq
+        | Mnemonic::Psraw
+        | Mnemonic::Psrad => sse_shift_is_lowerable(instr),
+        // Integer ↔ FP converts (GPR↔XMM).
+        Mnemonic::Cvtsi2ss | Mnemonic::Cvtsi2sd => sse_cvt_gpr_to_xmm_is_lowerable(instr),
+        Mnemonic::Cvttss2si | Mnemonic::Cvttsd2si | Mnemonic::Cvtss2si | Mnemonic::Cvtsd2si => {
+            sse_cvt_xmm_to_gpr_is_lowerable(instr)
+        }
+        Mnemonic::Cvtps2dq | Mnemonic::Cvtdq2ps | Mnemonic::Cvttps2dq => {
+            sse_bitwise_is_lowerable(instr)
+        }
+        // Scalar / packed FP sqrt + min/max.
+        Mnemonic::Sqrtss
+        | Mnemonic::Sqrtsd
+        | Mnemonic::Minss
+        | Mnemonic::Minsd
+        | Mnemonic::Maxss
+        | Mnemonic::Maxsd => sse_scalar_fp_is_lowerable(instr),
+        Mnemonic::Sqrtps
+        | Mnemonic::Sqrtpd
+        | Mnemonic::Minps
+        | Mnemonic::Minpd
+        | Mnemonic::Maxps
+        | Mnemonic::Maxpd => sse_packed_fp_is_lowerable(instr),
+        // FP compare → RFLAGS.
+        Mnemonic::Comiss | Mnemonic::Comisd | Mnemonic::Ucomiss | Mnemonic::Ucomisd => {
+            sse_comis_is_lowerable(instr)
+        }
+        // Shuffles.
+        Mnemonic::Pshufd | Mnemonic::Pshuflw | Mnemonic::Pshufhw => sse_pshuf_is_lowerable(instr),
+        Mnemonic::Pshufb => sse_bitwise_is_lowerable(instr),
         // String ops (REP bulk via JIT host helper); ends block in decoder.
         Mnemonic::Stosb
         | Mnemonic::Stosw
@@ -451,10 +539,10 @@ fn sse_movq_is_lowerable(instr: &Instruction) -> bool {
             if r0.is_xmm() && r1.is_xmm() {
                 return true;
             }
-            // xmm ← gpr64: JIT has a bug — the high 64 bits are wrongly
-            // preserved instead of zeroed. Fall back to interpreter.
+            // xmm ← gpr64: `lower_sse_movq` moves the low quadword and zeroes
+            // the high 64 (MOVQ semantics) — lowerable since B4.
             if r0.is_xmm() && r1.size() == 8 {
-                return false;
+                return true;
             }
             // gpr64 ← xmm: fine.
             r0.size() == 8 && r1.is_xmm()
@@ -516,6 +604,71 @@ fn sse_scalar_fp_is_lowerable(instr: &Instruction) -> bool {
 /// addps/mulpd/…: xmm, xmm/m128.
 fn sse_packed_fp_is_lowerable(instr: &Instruction) -> bool {
     sse_bitwise_is_lowerable(instr)
+}
+
+/// Packed shift: dst xmm, src imm8 or xmm/m128 (variable count).
+fn sse_shift_is_lowerable(instr: &Instruction) -> bool {
+    if instr.op0_kind() != OpKind::Register || !instr.op_register(0).is_xmm() {
+        return false;
+    }
+    match instr.op1_kind() {
+        imm if is_imm_kind(imm) => true,
+        OpKind::Register => instr.op_register(1).is_xmm(),
+        OpKind::Memory => mem_ea_ok(instr) && mem_size_ok_sse(instr),
+        _ => false,
+    }
+}
+
+/// cvtsi2ss/cvtsi2sd: dst xmm, src r32/r64 or m32/m64.
+fn sse_cvt_gpr_to_xmm_is_lowerable(instr: &Instruction) -> bool {
+    if instr.op0_kind() != OpKind::Register || !instr.op_register(0).is_xmm() {
+        return false;
+    }
+    match instr.op1_kind() {
+        OpKind::Register => true,
+        OpKind::Memory => mem_ea_ok(instr) && mem_size_ok_sse(instr),
+        _ => false,
+    }
+}
+
+/// cvttss2si/cvtss2si/cvttsd2si/cvtsd2si: dst r32/r64, src xmm or m32/m64.
+fn sse_cvt_xmm_to_gpr_is_lowerable(instr: &Instruction) -> bool {
+    if instr.op0_kind() != OpKind::Register {
+        return false;
+    }
+    let sz = instr.op_register(0).size();
+    if !matches!(sz, 4 | 8) {
+        return false;
+    }
+    match instr.op1_kind() {
+        OpKind::Register => instr.op_register(1).is_xmm(),
+        OpKind::Memory => mem_ea_ok(instr) && mem_size_ok_sse(instr),
+        _ => false,
+    }
+}
+
+/// comiss/comisd/ucomiss/ucomisd: reads xmm, xmm/m32|m64.
+fn sse_comis_is_lowerable(instr: &Instruction) -> bool {
+    if instr.op0_kind() != OpKind::Register || !instr.op_register(0).is_xmm() {
+        return false;
+    }
+    match instr.op1_kind() {
+        OpKind::Register => instr.op_register(1).is_xmm(),
+        OpKind::Memory => mem_ea_ok(instr) && mem_size_ok_sse(instr),
+        _ => false,
+    }
+}
+
+/// pshufd/pshuflw/pshufhw: dst xmm, src xmm/m128, imm8.
+fn sse_pshuf_is_lowerable(instr: &Instruction) -> bool {
+    if instr.op0_kind() != OpKind::Register || !instr.op_register(0).is_xmm() {
+        return false;
+    }
+    match instr.op1_kind() {
+        OpKind::Register => instr.op_register(1).is_xmm(),
+        OpKind::Memory => mem_ea_ok(instr) && mem_size_ok_sse(instr),
+        _ => false,
+    }
 }
 
 /// Memory sizes used by SSE loads/stores (4/8/16).
@@ -582,6 +735,21 @@ fn imul_is_lowerable(instr: &Instruction) -> bool {
             };
             src_ok && is_imm_kind(instr.op2_kind())
         }
+        _ => false,
+    }
+}
+
+/// `div`/`idiv`: 32-bit operand in a register or simple memory operand.
+///
+/// 64-bit forms stay iced (RDX:RAX 128-bit dividend needs i128 helpers that
+/// are not legalized on AArch64).  8/16-bit forms also stay iced.
+fn div_is_lowerable(instr: &Instruction) -> bool {
+    if instr.op_count() != 1 {
+        return false;
+    }
+    match instr.op0_kind() {
+        OpKind::Register => instr.op_register(0).size() == 4,
+        OpKind::Memory => mem_ea_ok(instr) && mem_size_ok(instr),
         _ => false,
     }
 }

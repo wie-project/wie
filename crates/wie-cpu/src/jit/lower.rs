@@ -1351,6 +1351,59 @@ pub(super) extern "C" fn wie_f64_binop(op: u64, a: u64, b: u64) -> u64 {
     r.to_bits()
 }
 
+/// Packed integer SSE2 lane op on one u64 half (SIMD-off path + pack/pmul*).
+///
+/// Delegates to the shared [`exec::sse_int_binop_half`] core so the interpreter
+/// and the JIT compute identical lane math.
+pub(super) extern "C" fn wie_sse_int_binop(op: u64, a: u64, b: u64) -> u64 {
+    let Ok(op) = exec::SseIntOp::try_from(op) else {
+        return a;
+    };
+    exec::sse_int_binop_half(op, a, b)
+}
+
+/// Packed SSE2 shift on one u64 half (imm splat or per-lane counts).
+pub(super) extern "C" fn wie_sse_shift(op: u64, a: u64, count: u64) -> u64 {
+    let Ok(op) = exec::SseShiftOp::try_from(op) else {
+        return a;
+    };
+    exec::sse_shift_half(op, a, count)
+}
+
+/// `pshufb` result bytes 0..8 (table = a, mask = b).
+pub(super) extern "C" fn wie_sse_pshufb_lo(a_lo: u64, a_hi: u64, b_lo: u64, b_hi: u64) -> u64 {
+    exec::sse_pshufb_lo(a_lo, a_hi, b_lo, b_hi)
+}
+
+/// `pshufb` result bytes 8..16.
+pub(super) extern "C" fn wie_sse_pshufb_hi(a_lo: u64, a_hi: u64, b_lo: u64, b_hi: u64) -> u64 {
+    exec::sse_pshufb_hi(a_lo, a_hi, b_lo, b_hi)
+}
+
+/// FP unary (sqrt family) on one u64 half.
+pub(super) extern "C" fn wie_sse_fp_unop(op: u64, a: u64) -> u64 {
+    let Ok(op) = exec::SseFpUnOp::try_from(op) else {
+        return a;
+    };
+    exec::sse_fp_unop(op, a)
+}
+
+/// FP min/max on one u64 half.
+pub(super) extern "C" fn wie_sse_fp_binop(op: u64, a: u64, b: u64) -> u64 {
+    let Ok(op) = exec::SseFpBinOp::try_from(op) else {
+        return a;
+    };
+    exec::sse_fp_binop(op, a, b)
+}
+
+/// Integer↔FP convert on one u64 half.
+pub(super) extern "C" fn wie_sse_cvt(op: u64, a: u64) -> u64 {
+    let Ok(op) = exec::SseCvtOp::try_from(op) else {
+        return a;
+    };
+    exec::sse_cvt(op, a)
+}
+
 pub(super) fn compile_block(
     eng: &mut JitEngine,
     start_rip: u64,
@@ -1470,6 +1523,55 @@ pub(super) fn compile_block(
         };
         let f64_ref = if need_fp_helpers {
             Some(eng.module.declare_func_in_func(eng.f64_id, bcx.func))
+        } else {
+            None
+        };
+        // Packed-integer / FP / convert helpers: declared whenever the block
+        // touches XMM state (unused imports are never materialized by Cranelift).
+        let sse_int_ref = if has_sse {
+            Some(eng.module.declare_func_in_func(eng.sse_int_id, bcx.func))
+        } else {
+            None
+        };
+        let sse_shift_ref = if has_sse {
+            Some(eng.module.declare_func_in_func(eng.sse_shift_id, bcx.func))
+        } else {
+            None
+        };
+        let sse_pshufb_lo_ref = if has_sse {
+            Some(
+                eng.module
+                    .declare_func_in_func(eng.sse_pshufb_lo_id, bcx.func),
+            )
+        } else {
+            None
+        };
+        let sse_pshufb_hi_ref = if has_sse {
+            Some(
+                eng.module
+                    .declare_func_in_func(eng.sse_pshufb_hi_id, bcx.func),
+            )
+        } else {
+            None
+        };
+        let sse_fp_unop_ref = if has_sse {
+            Some(
+                eng.module
+                    .declare_func_in_func(eng.sse_fp_unop_id, bcx.func),
+            )
+        } else {
+            None
+        };
+        let sse_fp_binop_ref = if has_sse {
+            Some(
+                eng.module
+                    .declare_func_in_func(eng.sse_fp_binop_id, bcx.func),
+            )
+        } else {
+            None
+        };
+        let sse_cvt_ref = if has_sse {
+            Some(eng.module.declare_func_in_func(eng.sse_cvt_id, bcx.func))
         } else {
             None
         };
@@ -1669,6 +1771,13 @@ pub(super) fn compile_block(
                     host_span_ref,
                     f32_ref,
                     f64_ref,
+                    sse_int_ref,
+                    sse_shift_ref,
+                    sse_pshufb_lo_ref,
+                    sse_pshufb_hi_ref,
+                    sse_fp_unop_ref,
+                    sse_fp_binop_ref,
+                    sse_cvt_ref,
                     flags,
                     guest_flags,
                     exit,
@@ -1790,6 +1899,13 @@ pub(super) fn compile_block(
                 host_span_ref,
                 f32_ref,
                 f64_ref,
+                sse_int_ref,
+                sse_shift_ref,
+                sse_pshufb_lo_ref,
+                sse_pshufb_hi_ref,
+                sse_fp_unop_ref,
+                sse_fp_binop_ref,
+                sse_cvt_ref,
                 flags,
                 guest_flags,
                 exit,
@@ -2423,6 +2539,18 @@ struct MemEnv {
     guest_flags: MemFlagsData,
     exit: Block,
     ucrt_refs: [Option<FuncRef>; 7],
+    /// Packed integer SSE2 lane op helper (`wie_sse_int_binop`).
+    sse_int_ref: Option<FuncRef>,
+    /// Packed SSE2 shift helper (`wie_sse_shift`).
+    sse_shift_ref: Option<FuncRef>,
+    /// `pshufb` result low/high half helpers.
+    sse_pshufb_lo_ref: Option<FuncRef>,
+    sse_pshufb_hi_ref: Option<FuncRef>,
+    /// FP unary / min-max helpers.
+    sse_fp_unop_ref: Option<FuncRef>,
+    sse_fp_binop_ref: Option<FuncRef>,
+    /// Integer↔FP convert helper.
+    sse_cvt_ref: Option<FuncRef>,
     /// Stack region pin (slot 0), hoisted at block entry when inline mem is on.
     stack_pin: Option<HoistedPin>,
     /// Data pins (slots 1..): process heap + VirtualAlloc spans, after sticky.
@@ -2879,17 +3007,1157 @@ fn lower_sse_punpck(
     Ok(())
 }
 
-/// `PSHUFD` — shuffle 32-bit lanes (SSE2).
+/// `PUNPCKL/H{bw,wd,dq}` — byte/word/dword unpack.
+///
+/// NEON path: a single byte-granular `shuffle` with a fixed mask. Helper path
+/// (`WIE_JIT_SIMD=0`): the L-family is half-aligned (low sub-lanes of each
+/// half); the H-family reuses the L-op over the high halves plus a
+/// high-sub-lane variant for the result's high half.
+fn lower_sse_punpck_lanes(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
+) -> Result<(), String> {
+    let dst = instr.op_register(0);
+    let di = xmm_index(dst)?;
+    let (a_lo, a_hi) = read_xmm_pair(xmm, dst)?;
+    let (b_lo, b_hi) = match instr.op1_kind() {
+        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
+        OpKind::Memory => {
+            let addr = effective_addr(bcx, instr, gpr)?;
+            load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
+        }
+        _ => return Err("punpck lanes src".into()),
+    };
+    let (lo, hi) = if jit_simd_enabled() {
+        let a8 = pair_to_i8x16(bcx, mem.flags, a_lo, a_hi);
+        let b8 = pair_to_i8x16(bcx, mem.flags, b_lo, b_hi);
+        let mask = sse_punpck_shuffle_mask(instr.mnemonic());
+        let imm = shuffle_imm(bcx, mask);
+        let r = bcx.ins().shuffle(a8, b8, imm);
+        i8x16_to_pair(bcx, mem.flags, r)
+    } else {
+        // Both result halves come from the same source half (a_lo/b_lo for the
+        // L-family, a_hi/b_hi for the H-family); the low half interleaves the
+        // low sub-lanes, the high half the high sub-lanes.
+        let (l_op, h_op) = match instr.mnemonic() {
+            Mnemonic::Punpcklbw | Mnemonic::Punpckhbw => {
+                (exec::SseIntOp::Punpcklbw, exec::SseIntOp::PunpckHiBw)
+            }
+            Mnemonic::Punpcklwd | Mnemonic::Punpckhwd => {
+                (exec::SseIntOp::Punpcklwd, exec::SseIntOp::PunpckHiWd)
+            }
+            Mnemonic::Punpckldq | Mnemonic::Punpckhdq => {
+                (exec::SseIntOp::Punpckldq, exec::SseIntOp::PunpckHiDq)
+            }
+            _ => return Err("punpck lanes op".into()),
+        };
+        let h_family = matches!(
+            instr.mnemonic(),
+            Mnemonic::Punpckhbw | Mnemonic::Punpckhwd | Mnemonic::Punpckhdq
+        );
+        let (x_lo, x_hi) = if h_family { (a_hi, b_hi) } else { (a_lo, b_lo) };
+        let sref = mem.sse_int_ref.ok_or("sse int helper missing")?;
+        let l_op_v = iconst_u64(bcx, l_op.to_abi());
+        let h_op_v = iconst_u64(bcx, h_op.to_abi());
+        let call_lo = bcx.ins().call(sref, &[l_op_v, x_lo, x_hi]);
+        let lo = bcx.inst_results(call_lo)[0];
+        let call_hi = bcx.ins().call(sref, &[h_op_v, x_lo, x_hi]);
+        let hi = bcx.inst_results(call_hi)[0];
+        (lo, hi)
+    };
+    store_xmm_pair(bcx, mem, xmm, di, lo, hi);
+    Ok(())
+}
+
+/// Store a 16-byte shuffle mask as a Cranelift `Immediate` handle.
+fn shuffle_imm(bcx: &mut FunctionBuilder<'_>, mask: u128) -> cranelift::codegen::ir::Immediate {
+    let bytes = mask.to_le_bytes();
+    bcx.func
+        .dfg
+        .immediates
+        .push(cranelift::codegen::ir::ConstantData::from(&bytes[..]))
+}
+
+/// Byte-shuffle mask for a byte/word/dword unpack.
+fn sse_punpck_shuffle_mask(m: Mnemonic) -> u128 {
+    let mut out = 0_u128;
+    let set_byte = |out: &mut u128, idx: usize, val: u32| {
+        *out |= u128::from(val) << (idx * 8);
+    };
+    match m {
+        Mnemonic::Punpcklbw => {
+            for k in 0..8 {
+                set_byte(&mut out, 2 * k, k as u32);
+                set_byte(&mut out, 2 * k + 1, 16 + k as u32);
+            }
+        }
+        Mnemonic::Punpckhbw => {
+            for k in 0..8 {
+                set_byte(&mut out, 2 * k, (8 + k) as u32);
+                set_byte(&mut out, 2 * k + 1, (24 + k) as u32);
+            }
+        }
+        Mnemonic::Punpcklwd => {
+            for k in 0..4 {
+                set_byte(&mut out, 4 * k, 2 * k as u32);
+                set_byte(&mut out, 4 * k + 1, 2 * k as u32 + 1);
+                set_byte(&mut out, 4 * k + 2, 16 + 2 * k as u32);
+                set_byte(&mut out, 4 * k + 3, 17 + 2 * k as u32);
+            }
+        }
+        Mnemonic::Punpckhwd => {
+            for k in 0..4 {
+                set_byte(&mut out, 4 * k, (8 + 2 * k) as u32);
+                set_byte(&mut out, 4 * k + 1, (9 + 2 * k) as u32);
+                set_byte(&mut out, 4 * k + 2, (24 + 2 * k) as u32);
+                set_byte(&mut out, 4 * k + 3, (25 + 2 * k) as u32);
+            }
+        }
+        Mnemonic::Punpckldq => {
+            for k in 0..2 {
+                for b in 0..4 {
+                    set_byte(&mut out, 8 * k + b, (4 * k + b) as u32);
+                    set_byte(&mut out, 8 * k + 4 + b, (16 + 4 * k + b) as u32);
+                }
+            }
+        }
+        Mnemonic::Punpckhdq => {
+            for k in 0..2 {
+                for b in 0..4 {
+                    set_byte(&mut out, 8 * k + b, (8 + 4 * k + b) as u32);
+                    set_byte(&mut out, 8 * k + 4 + b, (24 + 4 * k + b) as u32);
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// `PSHUFD` — shuffle dword lanes (imm8 control).
 fn lower_sse_pshufd(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
-    xmm: &mut [Value; 32],
+    gpr: &mut [Value; 16],
+    rflags: Value,
     mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
 ) -> Result<(), String> {
-    let r0 = instr.op_register(0);
-    // Read source as 4 × i32 lanes. For now: identity (most callers do identity shuffle).
-    let (lo, hi) = read_xmm_pair(xmm, instr.op_register(1))?;
-    store_xmm_pair(bcx, mem, xmm, xmm_index(r0)?, lo, hi);
+    let dst = instr.op_register(0);
+    let di = xmm_index(dst)?;
+    let (s_lo, s_hi) = match instr.op1_kind() {
+        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
+        OpKind::Memory => {
+            let addr = effective_addr(bcx, instr, gpr)?;
+            load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
+        }
+        _ => return Err("pshufd src".into()),
+    };
+    let imm = instr.immediate(2) & 0xff;
+    let (lo, hi) = if jit_simd_enabled() {
+        let a8 = pair_to_i8x16(bcx, mem.flags, s_lo, s_hi);
+        let mask = sse_pshufd_mask(imm);
+        let imm_h = shuffle_imm(bcx, mask);
+        let r = bcx.ins().shuffle(a8, a8, imm_h);
+        i8x16_to_pair(bcx, mem.flags, r)
+    } else {
+        let l0 = u32::try_from(imm & 3).unwrap_or(0);
+        let l1 = u32::try_from((imm >> 2) & 3).unwrap_or(0);
+        let l2 = u32::try_from((imm >> 4) & 3).unwrap_or(0);
+        let l3 = u32::try_from((imm >> 6) & 3).unwrap_or(0);
+        let d0 = sse_dword_lane(bcx, s_lo, s_hi, l0);
+        let d1 = sse_dword_lane(bcx, s_lo, s_hi, l1);
+        let d2 = sse_dword_lane(bcx, s_lo, s_hi, l2);
+        let d3 = sse_dword_lane(bcx, s_lo, s_hi, l3);
+        let d1s = bcx.ins().ishl_imm(d1, 32);
+        let d3s = bcx.ins().ishl_imm(d3, 32);
+        let lo = bcx.ins().bor(d0, d1s);
+        let hi = bcx.ins().bor(d2, d3s);
+        (lo, hi)
+    };
+    store_xmm_pair(bcx, mem, xmm, di, lo, hi);
+    Ok(())
+}
+
+/// `PSHUFLW` / `PSHUFHW` — shuffle low/high 16-bit lanes.
+fn lower_sse_pshuflw_hw(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
+) -> Result<(), String> {
+    let dst = instr.op_register(0);
+    let di = xmm_index(dst)?;
+    let (s_lo, s_hi) = match instr.op1_kind() {
+        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
+        OpKind::Memory => {
+            let addr = effective_addr(bcx, instr, gpr)?;
+            load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
+        }
+        _ => return Err("pshuflw/hw src".into()),
+    };
+    let imm = instr.immediate(2) & 0xff;
+    let low = instr.mnemonic() == Mnemonic::Pshuflw;
+    let (lo, hi) = if jit_simd_enabled() {
+        let a8 = pair_to_i8x16(bcx, mem.flags, s_lo, s_hi);
+        let mask = sse_pshuflw_hw_mask(imm, low);
+        let imm_h = shuffle_imm(bcx, mask);
+        let r = bcx.ins().shuffle(a8, a8, imm_h);
+        i8x16_to_pair(bcx, mem.flags, r)
+    } else {
+        let i0 = u32::try_from(imm & 3).unwrap_or(0);
+        let i1 = u32::try_from((imm >> 2) & 3).unwrap_or(0);
+        let i2 = u32::try_from((imm >> 4) & 3).unwrap_or(0);
+        let i3 = u32::try_from((imm >> 6) & 3).unwrap_or(0);
+        let w = |bcx: &mut FunctionBuilder<'_>, src: Value, lane: u32| -> Value {
+            let v = if lane == 0 {
+                src
+            } else {
+                bcx.ins().ushr_imm(src, i64::from(lane) * 16)
+            };
+            let mask16 = iconst_u64(bcx, 0xffff);
+            bcx.ins().band(v, mask16)
+        };
+        if low {
+            // Low 4 words shuffled from src words 0-3 (all in s_lo); high copied.
+            let w0 = w(bcx, s_lo, i0);
+            let w1 = w(bcx, s_lo, i1);
+            let w2 = w(bcx, s_lo, i2);
+            let w3 = w(bcx, s_lo, i3);
+            let b1 = bcx.ins().ishl_imm(w1, 16);
+            let b2 = bcx.ins().ishl_imm(w2, 32);
+            let b3 = bcx.ins().ishl_imm(w3, 48);
+            let bc_ = bcx.ins().bor(b1, b2);
+            let bc_ = bcx.ins().bor(bc_, b3);
+            let lo = bcx.ins().bor(w0, bc_);
+            (lo, s_hi)
+        } else {
+            // Low words copied; high 4 words shuffled from src words 4-7 (s_hi).
+            let w4 = w(bcx, s_hi, i0);
+            let w5 = w(bcx, s_hi, i1);
+            let w6 = w(bcx, s_hi, i2);
+            let w7 = w(bcx, s_hi, i3);
+            let b1 = bcx.ins().ishl_imm(w5, 16);
+            let b2 = bcx.ins().ishl_imm(w6, 32);
+            let b3 = bcx.ins().ishl_imm(w7, 48);
+            let bc_ = bcx.ins().bor(b1, b2);
+            let bc_ = bcx.ins().bor(bc_, b3);
+            let hi = bcx.ins().bor(w4, bc_);
+            (s_lo, hi)
+        }
+    };
+    store_xmm_pair(bcx, mem, xmm, di, lo, hi);
+    Ok(())
+}
+
+/// dword-lane select from (s_lo, s_hi) for the SIMD-off pshufd path.
+fn sse_dword_lane(bcx: &mut FunctionBuilder<'_>, s_lo: Value, s_hi: Value, lane: u32) -> Value {
+    let base = if lane < 2 { s_lo } else { s_hi };
+    let v = if lane.is_multiple_of(2) {
+        base
+    } else {
+        bcx.ins().ushr_imm(base, 32)
+    };
+    let mask = iconst_u64(bcx, 0xffff_ffff);
+    bcx.ins().band(v, mask)
+}
+
+/// Byte-shuffle mask for pshufd (single-source).
+fn sse_pshufd_mask(imm: u64) -> u128 {
+    let mut out = 0_u128;
+    for i in 0..4 {
+        let src_lane = (imm >> (2 * i)) & 3;
+        for b in 0..4 {
+            out |= u128::from((src_lane * 4 + b) as u32) << ((i * 4 + b) * 8);
+        }
+    }
+    out
+}
+
+/// Byte-shuffle mask for pshuflw (`low`) / pshufhw.
+fn sse_pshuflw_hw_mask(imm: u64, low: bool) -> u128 {
+    let mut out = 0_u128;
+    let set_word = |out: &mut u128, dst_idx: usize, src_lane: u32| {
+        let base = u64::from(src_lane) * 2;
+        for b in 0_u64..2 {
+            *out |= u128::from(base + b) << ((dst_idx * 2 + usize::try_from(b).unwrap_or(0)) * 8);
+        }
+    };
+    if low {
+        for i in 0..4 {
+            let src_lane = u32::try_from((imm >> (2 * i)) & 3).unwrap_or(0);
+            set_word(&mut out, i, src_lane);
+        }
+        // High words copied unchanged.
+        for i in 4..8 {
+            set_word(&mut out, i, u32::try_from(i).unwrap_or(0));
+        }
+    } else {
+        for i in 0..4 {
+            set_word(&mut out, i, u32::try_from(i).unwrap_or(0));
+        }
+        for i in 0..4 {
+            let src_lane = 4 + u32::try_from((imm >> (2 * i)) & 3).unwrap_or(0);
+            set_word(&mut out, i + 4, src_lane);
+        }
+    }
+    out
+}
+
+/// Map a packed-integer mnemonic to its ABI opcode (arithmetic/compare/pack only).
+fn sse_int_op(m: Mnemonic) -> Option<exec::SseIntOp> {
+    Some(match m {
+        Mnemonic::Paddb => exec::SseIntOp::Paddb,
+        Mnemonic::Paddw => exec::SseIntOp::Paddw,
+        Mnemonic::Paddd => exec::SseIntOp::Paddd,
+        Mnemonic::Paddq => exec::SseIntOp::Paddq,
+        Mnemonic::Psubb => exec::SseIntOp::Psubb,
+        Mnemonic::Psubw => exec::SseIntOp::Psubw,
+        Mnemonic::Psubd => exec::SseIntOp::Psubd,
+        Mnemonic::Psubq => exec::SseIntOp::Psubq,
+        Mnemonic::Paddsb => exec::SseIntOp::Paddsb,
+        Mnemonic::Paddsw => exec::SseIntOp::Paddsw,
+        Mnemonic::Paddusb => exec::SseIntOp::Paddusb,
+        Mnemonic::Paddusw => exec::SseIntOp::Paddusw,
+        Mnemonic::Psubsb => exec::SseIntOp::Psubsb,
+        Mnemonic::Psubsw => exec::SseIntOp::Psubsw,
+        Mnemonic::Psubusb => exec::SseIntOp::Psubusb,
+        Mnemonic::Psubusw => exec::SseIntOp::Psubusw,
+        Mnemonic::Pmullw => exec::SseIntOp::Pmullw,
+        Mnemonic::Pmulhw => exec::SseIntOp::Pmulhw,
+        Mnemonic::Pmulhuw => exec::SseIntOp::Pmulhuw,
+        Mnemonic::Pmuludq => exec::SseIntOp::Pmuludq,
+        Mnemonic::Pmaddwd => exec::SseIntOp::Pmaddwd,
+        Mnemonic::Pcmpeqb => exec::SseIntOp::Pcmpeqb,
+        Mnemonic::Pcmpeqw => exec::SseIntOp::Pcmpeqw,
+        Mnemonic::Pcmpeqd => exec::SseIntOp::Pcmpeqd,
+        Mnemonic::Pcmpgtb => exec::SseIntOp::Pcmpgtb,
+        Mnemonic::Pcmpgtw => exec::SseIntOp::Pcmpgtw,
+        Mnemonic::Pcmpgtd => exec::SseIntOp::Pcmpgtd,
+        Mnemonic::Packsswb => exec::SseIntOp::Packsswb,
+        Mnemonic::Packssdw => exec::SseIntOp::Packssdw,
+        Mnemonic::Packuswb => exec::SseIntOp::Packuswb,
+        _ => return None,
+    })
+}
+
+/// Map a packed-shift mnemonic to its ABI opcode.
+fn sse_shift_op(m: Mnemonic) -> Option<exec::SseShiftOp> {
+    Some(match m {
+        Mnemonic::Psllw => exec::SseShiftOp::Psllw,
+        Mnemonic::Pslld => exec::SseShiftOp::Pslld,
+        Mnemonic::Psllq => exec::SseShiftOp::Psllq,
+        Mnemonic::Psrlw => exec::SseShiftOp::Psrlw,
+        Mnemonic::Psrld => exec::SseShiftOp::Psrld,
+        Mnemonic::Psrlq => exec::SseShiftOp::Psrlq,
+        Mnemonic::Psraw => exec::SseShiftOp::Psraw,
+        Mnemonic::Psrad => exec::SseShiftOp::Psrad,
+        _ => return None,
+    })
+}
+
+/// Bitcast a lo/hi u64 pair to a 128-bit vector lane type.
+fn pair_to_vec(
+    bcx: &mut FunctionBuilder<'_>,
+    flags: MemFlagsData,
+    lo: Value,
+    hi: Value,
+    ty: Type,
+) -> Value {
+    let v = pair_to_i8x16(bcx, flags, lo, hi);
+    bcx.ins().bitcast(ty, flags, v)
+}
+
+/// Bitcast a 128-bit vector back to a lo/hi u64 pair.
+fn vec_to_pair(bcx: &mut FunctionBuilder<'_>, flags: MemFlagsData, v: Value) -> (Value, Value) {
+    let as_i8 = bcx.ins().bitcast(types::I8X16, flags, v);
+    i8x16_to_pair(bcx, flags, as_i8)
+}
+
+/// Apply a lane-wise vector binary op to a lo/hi pair.
+fn vec_binop(
+    bcx: &mut FunctionBuilder<'_>,
+    flags: MemFlagsData,
+    a_lo: Value,
+    a_hi: Value,
+    b_lo: Value,
+    b_hi: Value,
+    ty: Type,
+    op: fn(&mut FunctionBuilder<'_>, Value, Value) -> Value,
+) -> (Value, Value) {
+    let a = pair_to_vec(bcx, flags, a_lo, a_hi, ty);
+    let b = pair_to_vec(bcx, flags, b_lo, b_hi, ty);
+    let r = op(bcx, a, b);
+    vec_to_pair(bcx, flags, r)
+}
+
+/// Host-helper fallback for a packed integer op (SIMD-off + pack/pmul*).
+fn sse_int_binop_helper(
+    bcx: &mut FunctionBuilder<'_>,
+    mem: &MemEnv,
+    op: exec::SseIntOp,
+    a_lo: Value,
+    a_hi: Value,
+    b_lo: Value,
+    b_hi: Value,
+) -> Result<(Value, Value), String> {
+    let sref = mem.sse_int_ref.ok_or("sse int helper missing")?;
+    let op_v = iconst_u64(bcx, op.to_abi());
+    let c1 = bcx.ins().call(sref, &[op_v, a_lo, b_lo]);
+    let lo = bcx.inst_results(c1)[0];
+    let c2 = bcx.ins().call(sref, &[op_v, a_hi, b_hi]);
+    let hi = bcx.inst_results(c2)[0];
+    Ok((lo, hi))
+}
+
+/// Packed integer binary op: dst xmm, src xmm/m128.
+fn lower_sse_int_binop(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
+    op: exec::SseIntOp,
+) -> Result<(), String> {
+    let dst = instr.op_register(0);
+    let di = xmm_index(dst)?;
+    let (a_lo, a_hi) = read_xmm_pair(xmm, dst)?;
+    let (b_lo, b_hi) = match instr.op1_kind() {
+        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
+        OpKind::Memory => {
+            let addr = effective_addr(bcx, instr, gpr)?;
+            load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
+        }
+        _ => return Err("sse int binop src".into()),
+    };
+    let (lo, hi) = if jit_simd_enabled() {
+        match op {
+            exec::SseIntOp::Paddb => vec_binop(
+                bcx,
+                mem.flags,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+                types::I8X16,
+                |b, x, y| b.ins().iadd(x, y),
+            ),
+            exec::SseIntOp::Paddw => vec_binop(
+                bcx,
+                mem.flags,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+                types::I16X8,
+                |b, x, y| b.ins().iadd(x, y),
+            ),
+            exec::SseIntOp::Paddd => vec_binop(
+                bcx,
+                mem.flags,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+                types::I32X4,
+                |b, x, y| b.ins().iadd(x, y),
+            ),
+            exec::SseIntOp::Paddq => vec_binop(
+                bcx,
+                mem.flags,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+                types::I64X2,
+                |b, x, y| b.ins().iadd(x, y),
+            ),
+            exec::SseIntOp::Psubb => vec_binop(
+                bcx,
+                mem.flags,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+                types::I8X16,
+                |b, x, y| b.ins().isub(x, y),
+            ),
+            exec::SseIntOp::Psubw => vec_binop(
+                bcx,
+                mem.flags,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+                types::I16X8,
+                |b, x, y| b.ins().isub(x, y),
+            ),
+            exec::SseIntOp::Psubd => vec_binop(
+                bcx,
+                mem.flags,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+                types::I32X4,
+                |b, x, y| b.ins().isub(x, y),
+            ),
+            exec::SseIntOp::Psubq => vec_binop(
+                bcx,
+                mem.flags,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+                types::I64X2,
+                |b, x, y| b.ins().isub(x, y),
+            ),
+            exec::SseIntOp::Paddsb => vec_binop(
+                bcx,
+                mem.flags,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+                types::I8X16,
+                |b, x, y| b.ins().sadd_sat(x, y),
+            ),
+            exec::SseIntOp::Paddsw => vec_binop(
+                bcx,
+                mem.flags,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+                types::I16X8,
+                |b, x, y| b.ins().sadd_sat(x, y),
+            ),
+            exec::SseIntOp::Paddusb => vec_binop(
+                bcx,
+                mem.flags,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+                types::I8X16,
+                |b, x, y| b.ins().uadd_sat(x, y),
+            ),
+            exec::SseIntOp::Paddusw => vec_binop(
+                bcx,
+                mem.flags,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+                types::I16X8,
+                |b, x, y| b.ins().uadd_sat(x, y),
+            ),
+            exec::SseIntOp::Psubsb => vec_binop(
+                bcx,
+                mem.flags,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+                types::I8X16,
+                |b, x, y| b.ins().ssub_sat(x, y),
+            ),
+            exec::SseIntOp::Psubsw => vec_binop(
+                bcx,
+                mem.flags,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+                types::I16X8,
+                |b, x, y| b.ins().ssub_sat(x, y),
+            ),
+            exec::SseIntOp::Psubusb => vec_binop(
+                bcx,
+                mem.flags,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+                types::I8X16,
+                |b, x, y| b.ins().usub_sat(x, y),
+            ),
+            exec::SseIntOp::Psubusw => vec_binop(
+                bcx,
+                mem.flags,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+                types::I16X8,
+                |b, x, y| b.ins().usub_sat(x, y),
+            ),
+            exec::SseIntOp::Pmullw => vec_binop(
+                bcx,
+                mem.flags,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+                types::I16X8,
+                |b, x, y| b.ins().imul(x, y),
+            ),
+            exec::SseIntOp::Pcmpeqb => vec_binop(
+                bcx,
+                mem.flags,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+                types::I8X16,
+                |b, x, y| b.ins().icmp(IntCC::Equal, x, y),
+            ),
+            exec::SseIntOp::Pcmpeqw => vec_binop(
+                bcx,
+                mem.flags,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+                types::I16X8,
+                |b, x, y| b.ins().icmp(IntCC::Equal, x, y),
+            ),
+            exec::SseIntOp::Pcmpeqd => vec_binop(
+                bcx,
+                mem.flags,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+                types::I32X4,
+                |b, x, y| b.ins().icmp(IntCC::Equal, x, y),
+            ),
+            exec::SseIntOp::Pcmpgtb => vec_binop(
+                bcx,
+                mem.flags,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+                types::I8X16,
+                |b, x, y| b.ins().icmp(IntCC::SignedGreaterThan, x, y),
+            ),
+            exec::SseIntOp::Pcmpgtw => vec_binop(
+                bcx,
+                mem.flags,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+                types::I16X8,
+                |b, x, y| b.ins().icmp(IntCC::SignedGreaterThan, x, y),
+            ),
+            exec::SseIntOp::Pcmpgtd => vec_binop(
+                bcx,
+                mem.flags,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+                types::I32X4,
+                |b, x, y| b.ins().icmp(IntCC::SignedGreaterThan, x, y),
+            ),
+            // No NEON lowering: host helper in both modes. (Punpck variants
+            // are routed to `lower_sse_punpck_lanes`; kept here for
+            // exhaustiveness.)
+            exec::SseIntOp::Pmulhw
+            | exec::SseIntOp::Pmulhuw
+            | exec::SseIntOp::Pmuludq
+            | exec::SseIntOp::Pmaddwd
+            | exec::SseIntOp::Packsswb
+            | exec::SseIntOp::Packssdw
+            | exec::SseIntOp::Packuswb
+            | exec::SseIntOp::Punpcklbw
+            | exec::SseIntOp::Punpcklwd
+            | exec::SseIntOp::Punpckldq
+            | exec::SseIntOp::PunpckHiBw
+            | exec::SseIntOp::PunpckHiWd
+            | exec::SseIntOp::PunpckHiDq => {
+                sse_int_binop_helper(bcx, mem, op, a_lo, a_hi, b_lo, b_hi)?
+            }
+        }
+    } else {
+        sse_int_binop_helper(bcx, mem, op, a_lo, a_hi, b_lo, b_hi)?
+    };
+    store_xmm_pair(bcx, mem, xmm, di, lo, hi);
+    Ok(())
+}
+
+/// Packed shift: `dst xmm, imm8` or `dst xmm, xmm/m128` (variable count).
+fn lower_sse_shift(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
+    op: exec::SseShiftOp,
+) -> Result<(), String> {
+    let dst = instr.op_register(0);
+    let di = xmm_index(dst)?;
+    let (a_lo, a_hi) = read_xmm_pair(xmm, dst)?;
+    let (lane_ty, width) = match op {
+        exec::SseShiftOp::Psllw | exec::SseShiftOp::Psrlw | exec::SseShiftOp::Psraw => {
+            (types::I16X8, 16_u32)
+        }
+        exec::SseShiftOp::Pslld | exec::SseShiftOp::Psrld | exec::SseShiftOp::Psrad => {
+            (types::I32X4, 32_u32)
+        }
+        exec::SseShiftOp::Psllq | exec::SseShiftOp::Psrlq => (types::I64X2, 64_u32),
+    };
+    let imm = match instr.op1_kind() {
+        k if is_imm_kind(k) => Some(instr.immediate(1) & 0xff),
+        _ => None,
+    };
+    let (count_lo, count_hi) = if imm.is_none() {
+        match instr.op1_kind() {
+            OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
+            OpKind::Memory => {
+                let addr = effective_addr(bcx, instr, gpr)?;
+                load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
+            }
+            _ => return Err("sse shift src".into()),
+        }
+    } else {
+        (iconst_u64(bcx, 0), iconst_u64(bcx, 0))
+    };
+    let (lo, hi) = if jit_simd_enabled() {
+        if let Some(c) = imm {
+            if c >= u64::from(width) {
+                // x86: count >= element width → all zeroes.
+                (iconst_u64(bcx, 0), iconst_u64(bcx, 0))
+            } else {
+                // The AArch64 lowering of vector ishl/ushr/sshr only handles a
+                // scalar count (it vec_dup's it), so pass the count as a scalar.
+                let a_vec = pair_to_vec(bcx, mem.flags, a_lo, a_hi, lane_ty);
+                let c_v = iconst_u64(bcx, c);
+                let c_n = bcx.ins().ireduce(types::I32, c_v);
+                let r = shift_vec(bcx, op, a_vec, c_n);
+                vec_to_pair(bcx, mem.flags, r)
+            }
+        } else {
+            // Per-lane variable counts are not supported by the AArch64 vector
+            // shift rules → per-lane host helper in both modes.
+            let sref = mem.sse_shift_ref.ok_or("sse shift helper missing")?;
+            let op_v = iconst_u64(bcx, op.to_abi());
+            let c1 = bcx.ins().call(sref, &[op_v, a_lo, count_lo]);
+            let lo = bcx.inst_results(c1)[0];
+            let c2 = bcx.ins().call(sref, &[op_v, a_hi, count_hi]);
+            let hi = bcx.inst_results(c2)[0];
+            (lo, hi)
+        }
+    } else {
+        let sref = mem.sse_shift_ref.ok_or("sse shift helper missing")?;
+        let op_v = iconst_u64(bcx, op.to_abi());
+        let (c_lo, c_hi) = match imm {
+            Some(c) => {
+                let splat = splat_count(c, width);
+                (iconst_u64(bcx, splat), iconst_u64(bcx, splat))
+            }
+            None => (count_lo, count_hi),
+        };
+        let c1 = bcx.ins().call(sref, &[op_v, a_lo, c_lo]);
+        let lo = bcx.inst_results(c1)[0];
+        let c2 = bcx.ins().call(sref, &[op_v, a_hi, c_hi]);
+        let hi = bcx.inst_results(c2)[0];
+        (lo, hi)
+    };
+    store_xmm_pair(bcx, mem, xmm, di, lo, hi);
+    Ok(())
+}
+
+/// Vector shift by (compile-time or per-lane) count.
+fn shift_vec(bcx: &mut FunctionBuilder<'_>, op: exec::SseShiftOp, a: Value, c: Value) -> Value {
+    match op {
+        exec::SseShiftOp::Psllw | exec::SseShiftOp::Pslld | exec::SseShiftOp::Psllq => {
+            bcx.ins().ishl(a, c)
+        }
+        exec::SseShiftOp::Psrlw | exec::SseShiftOp::Psrld | exec::SseShiftOp::Psrlq => {
+            bcx.ins().ushr(a, c)
+        }
+        exec::SseShiftOp::Psraw | exec::SseShiftOp::Psrad => bcx.ins().sshr(a, c),
+    }
+}
+
+/// Splat an imm8 shift count into every lane of a u64 half.
+fn splat_count(imm: u64, width: u32) -> u64 {
+    match width {
+        16 => {
+            let c = imm & 0xffff;
+            c * 0x0001_0001_0001_0001
+        }
+        32 => {
+            let c = imm & 0xffff_ffff;
+            c * 0x0000_0001_0000_0001
+        }
+        _ => imm,
+    }
+}
+
+/// `PSHUFB` — byte-wise table lookup (real semantics; the old no-op silently
+/// corrupted any guest that used it).
+fn lower_sse_pshufb(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
+) -> Result<(), String> {
+    let dst = instr.op_register(0);
+    let di = xmm_index(dst)?;
+    // table = op0 (dst), mask = op1 (src).
+    let (a_lo, a_hi) = read_xmm_pair(xmm, dst)?;
+    let (b_lo, b_hi) = match instr.op1_kind() {
+        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
+        OpKind::Memory => {
+            let addr = effective_addr(bcx, instr, gpr)?;
+            load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
+        }
+        _ => return Err("pshufb src".into()),
+    };
+    let lo_ref = mem.sse_pshufb_lo_ref.ok_or("pshufb helper missing")?;
+    let hi_ref = mem.sse_pshufb_hi_ref.ok_or("pshufb helper missing")?;
+    let c1 = bcx.ins().call(lo_ref, &[a_lo, a_hi, b_lo, b_hi]);
+    let lo = bcx.inst_results(c1)[0];
+    let c2 = bcx.ins().call(hi_ref, &[a_lo, a_hi, b_lo, b_hi]);
+    let hi = bcx.inst_results(c2)[0];
+    store_xmm_pair(bcx, mem, xmm, di, lo, hi);
+    Ok(())
+}
+
+/// Scalar FP unary (sqrtss/sqrtsd): dst low lane = f(op1 low lane), upper preserved.
+fn lower_sse_fp_unop_scalar(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
+    op: exec::SseFpUnOp,
+) -> Result<(), String> {
+    let is_double = matches!(op, exec::SseFpUnOp::Sqrtsd);
+    let dst = instr.op_register(0);
+    let di = xmm_index(dst)?;
+    let (old_lo, old_hi) = read_xmm_pair(xmm, dst)?;
+    let (src_lo, _) = match instr.op1_kind() {
+        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
+        OpKind::Memory => {
+            let addr = effective_addr(bcx, instr, gpr)?;
+            let w = if is_double { 8 } else { 4 };
+            load_sse_mem(bcx, mem, gpr, rflags, addr, w, instr.ip())?
+        }
+        _ => return Err("fp unop scalar src".into()),
+    };
+    let uref = mem.sse_fp_unop_ref.ok_or("fp unop helper missing")?;
+    let op_v = iconst_u64(bcx, op.to_abi());
+    let call = bcx.ins().call(uref, &[op_v, src_lo]);
+    let r = bcx.inst_results(call)[0];
+    let (lo, hi) = if is_double {
+        (r, old_hi)
+    } else {
+        let mask = iconst_u64(bcx, 0xffff_ffff);
+        let hi32 = iconst_u64(bcx, 0xffff_ffff_0000_0000);
+        let cleared = bcx.ins().band(old_lo, hi32);
+        let low = bcx.ins().band(r, mask);
+        (bcx.ins().bor(cleared, low), old_hi)
+    };
+    store_xmm_pair(bcx, mem, xmm, di, lo, hi);
+    Ok(())
+}
+
+/// Packed FP unary (sqrtps/sqrtpd): reads op1 only, writes op0.
+fn lower_sse_fp_unop_packed(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
+    op: exec::SseFpUnOp,
+) -> Result<(), String> {
+    let dst = instr.op_register(0);
+    let di = xmm_index(dst)?;
+    let (s_lo, s_hi) = match instr.op1_kind() {
+        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
+        OpKind::Memory => {
+            let addr = effective_addr(bcx, instr, gpr)?;
+            load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
+        }
+        _ => return Err("fp unop packed src".into()),
+    };
+    let uref = mem.sse_fp_unop_ref.ok_or("fp unop helper missing")?;
+    let op_v = iconst_u64(bcx, op.to_abi());
+    let c1 = bcx.ins().call(uref, &[op_v, s_lo]);
+    let lo = bcx.inst_results(c1)[0];
+    let c2 = bcx.ins().call(uref, &[op_v, s_hi]);
+    let hi = bcx.inst_results(c2)[0];
+    store_xmm_pair(bcx, mem, xmm, di, lo, hi);
+    Ok(())
+}
+
+/// Scalar FP min/max: dst low lane = min/max(dst, src), upper preserved.
+fn lower_sse_fp_binop_scalar(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
+    op: exec::SseFpBinOp,
+) -> Result<(), String> {
+    let is_double = matches!(op, exec::SseFpBinOp::Minsd | exec::SseFpBinOp::Maxsd);
+    let dst = instr.op_register(0);
+    let di = xmm_index(dst)?;
+    let (old_lo, old_hi) = read_xmm_pair(xmm, dst)?;
+    let (b_lo, _) = match instr.op1_kind() {
+        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
+        OpKind::Memory => {
+            let addr = effective_addr(bcx, instr, gpr)?;
+            let w = if is_double { 8 } else { 4 };
+            load_sse_mem(bcx, mem, gpr, rflags, addr, w, instr.ip())?
+        }
+        _ => return Err("fp binop scalar src".into()),
+    };
+    let bref = mem.sse_fp_binop_ref.ok_or("fp binop helper missing")?;
+    let op_v = iconst_u64(bcx, op.to_abi());
+    let call = bcx.ins().call(bref, &[op_v, old_lo, b_lo]);
+    let r = bcx.inst_results(call)[0];
+    let (lo, hi) = if is_double {
+        (r, old_hi)
+    } else {
+        let mask = iconst_u64(bcx, 0xffff_ffff);
+        let hi32 = iconst_u64(bcx, 0xffff_ffff_0000_0000);
+        let cleared = bcx.ins().band(old_lo, hi32);
+        let low = bcx.ins().band(r, mask);
+        (bcx.ins().bor(cleared, low), old_hi)
+    };
+    store_xmm_pair(bcx, mem, xmm, di, lo, hi);
+    Ok(())
+}
+
+/// Packed FP min/max: reads op0 and op1.
+fn lower_sse_fp_binop_packed(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
+    op: exec::SseFpBinOp,
+) -> Result<(), String> {
+    let dst = instr.op_register(0);
+    let di = xmm_index(dst)?;
+    let (a_lo, a_hi) = read_xmm_pair(xmm, dst)?;
+    let (b_lo, b_hi) = match instr.op1_kind() {
+        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
+        OpKind::Memory => {
+            let addr = effective_addr(bcx, instr, gpr)?;
+            load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
+        }
+        _ => return Err("fp binop packed src".into()),
+    };
+    let bref = mem.sse_fp_binop_ref.ok_or("fp binop helper missing")?;
+    let op_v = iconst_u64(bcx, op.to_abi());
+    let c1 = bcx.ins().call(bref, &[op_v, a_lo, b_lo]);
+    let lo = bcx.inst_results(c1)[0];
+    let c2 = bcx.ins().call(bref, &[op_v, a_hi, b_hi]);
+    let hi = bcx.inst_results(c2)[0];
+    store_xmm_pair(bcx, mem, xmm, di, lo, hi);
+    Ok(())
+}
+
+/// `Comiss/Comisd/Ucomiss/Ucomisd`: compare FP, set ZF/PF/CF, clear OF/AF/SF.
+///
+/// COMISS and UCOMISS produce identical flag results (they differ only in
+/// #IA exception behavior, which we do not model).
+fn lower_sse_comis(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    rflags: &mut Value,
+    mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
+    is_double: bool,
+) -> Result<(), String> {
+    let ip = instr.ip();
+    let (a_lo, _) = read_xmm_pair(xmm, instr.op_register(0))?;
+    let (b_lo, _) = match instr.op1_kind() {
+        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
+        OpKind::Memory => {
+            let addr = effective_addr(bcx, instr, gpr)?;
+            let w = if is_double { 8 } else { 4 };
+            load_sse_mem(bcx, mem, gpr, *rflags, addr, w, ip)?
+        }
+        _ => return Err("comis src".into()),
+    };
+    let (fa, fb) = if is_double {
+        (
+            bcx.ins().bitcast(types::F64, mem.flags, a_lo),
+            bcx.ins().bitcast(types::F64, mem.flags, b_lo),
+        )
+    } else {
+        let a32 = bcx.ins().ireduce(types::I32, a_lo);
+        let b32 = bcx.ins().ireduce(types::I32, b_lo);
+        (
+            bcx.ins().bitcast(types::F32, mem.flags, a32),
+            bcx.ins().bitcast(types::F32, mem.flags, b32),
+        )
+    };
+    let eq = bcx.ins().fcmp(FloatCC::Equal, fa, fb);
+    let lt = bcx.ins().fcmp(FloatCC::LessThan, fa, fb);
+    let un = bcx.ins().fcmp(FloatCC::Unordered, fa, fb);
+    let cf_c = bcx.ins().bor(lt, un);
+    let zf_c = bcx.ins().bor(eq, un);
+    let cf1 = bool_to_i64(bcx, cf_c);
+    let pf1 = bool_to_i64(bcx, un);
+    let zf1 = bool_to_i64(bcx, zf_c);
+    let pf_b = bcx.ins().ishl_imm(pf1, 2);
+    let zf_b = bcx.ins().ishl_imm(zf1, 6);
+    let pz = bcx.ins().bor(pf_b, zf_b);
+    let bits = bcx.ins().bor(cf1, pz);
+    let clear = iconst_u64(
+        bcx,
+        rflags::CF | rflags::PF | rflags::ZF | rflags::OF | rflags::AF | rflags::SF,
+    );
+    let not_clear = bcx.ins().bnot(clear);
+    let base = bcx.ins().band(*rflags, not_clear);
+    *rflags = bcx.ins().bor(base, bits);
+    Ok(())
+}
+
+/// `Cvtsi2ss/Cvtsi2sd`: signed int → scalar FP, merged into dst low lane.
+fn lower_sse_cvt_gpr_to_fp(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
+    is_double: bool,
+) -> Result<(), String> {
+    let _ = dirty;
+    let ip = instr.ip();
+    let is64 = match instr.op1_kind() {
+        OpKind::Register => instr.op_register(1).size() == 8,
+        OpKind::Memory => mem_width_bytes(instr)? == 8,
+        _ => return Err("cvt gpr src".into()),
+    };
+    let src = match instr.op1_kind() {
+        OpKind::Register => read_gpr(gpr, instr.op_register(1))?,
+        OpKind::Memory => {
+            let addr = effective_addr(bcx, instr, gpr)?;
+            let w = mem_width_bytes(instr)?;
+            call_load(bcx, mem, gpr, rflags, addr, w, ip)?
+        }
+        _ => return Err("cvt gpr src".into()),
+    };
+    let op = match (is_double, is64) {
+        (false, false) => exec::SseCvtOp::Cvtsi2ss32,
+        (false, true) => exec::SseCvtOp::Cvtsi2ss64,
+        (true, false) => exec::SseCvtOp::Cvtsi2sd32,
+        (true, true) => exec::SseCvtOp::Cvtsi2sd64,
+    };
+    let cref = mem.sse_cvt_ref.ok_or("cvt helper missing")?;
+    let op_v = iconst_u64(bcx, op.to_abi());
+    let call = bcx.ins().call(cref, &[op_v, src]);
+    let bits = bcx.inst_results(call)[0];
+    let dst = instr.op_register(0);
+    let di = xmm_index(dst)?;
+    let (old_lo, old_hi) = read_xmm_pair(xmm, dst)?;
+    let (lo, hi) = if is_double {
+        (bits, old_hi)
+    } else {
+        let mask = iconst_u64(bcx, 0xffff_ffff);
+        let hi32 = iconst_u64(bcx, 0xffff_ffff_0000_0000);
+        let cleared = bcx.ins().band(old_lo, hi32);
+        let low = bcx.ins().band(bits, mask);
+        (bcx.ins().bor(cleared, low), old_hi)
+    };
+    store_xmm_pair(bcx, mem, xmm, di, lo, hi);
+    Ok(())
+}
+
+/// `Cvttss2si/Cvtss2si/Cvttsd2si/Cvtsd2si`: scalar FP → signed integer.
+fn lower_sse_cvt_fp_to_gpr(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
+    is_double: bool,
+    trunc: bool,
+) -> Result<(), String> {
+    let ip = instr.ip();
+    let is64 = instr.op_register(0).size() == 8;
+    let (lo, _) = match instr.op1_kind() {
+        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
+        OpKind::Memory => {
+            let addr = effective_addr(bcx, instr, gpr)?;
+            let w = if is_double { 8 } else { 4 };
+            load_sse_mem(bcx, mem, gpr, rflags, addr, w, ip)?
+        }
+        _ => return Err("cvt fp src".into()),
+    };
+    let op = match (is_double, is64, trunc) {
+        (false, false, true) => exec::SseCvtOp::Cvttss2si32,
+        (false, false, false) => exec::SseCvtOp::Cvtss2si32,
+        (false, true, true) => exec::SseCvtOp::Cvttss2si64,
+        (false, true, false) => exec::SseCvtOp::Cvtss2si64,
+        (true, false, true) => exec::SseCvtOp::Cvttsd2si32,
+        (true, false, false) => exec::SseCvtOp::Cvtsd2si32,
+        (true, true, true) => exec::SseCvtOp::Cvttsd2si64,
+        (true, true, false) => exec::SseCvtOp::Cvtsd2si64,
+    };
+    let cref = mem.sse_cvt_ref.ok_or("cvt helper missing")?;
+    let op_v = iconst_u64(bcx, op.to_abi());
+    let call = bcx.ins().call(cref, &[op_v, lo]);
+    let v = bcx.inst_results(call)[0];
+    write_gpr(bcx, gpr, dirty, instr.op_register(0), v)
+}
+
+/// `Cvtps2dq/Cvtdq2ps/Cvttps2dq`: packed FP ↔ int, reads op1 only.
+fn lower_sse_cvt_packed(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
+    op: exec::SseCvtOp,
+) -> Result<(), String> {
+    let dst = instr.op_register(0);
+    let di = xmm_index(dst)?;
+    let (s_lo, s_hi) = match instr.op1_kind() {
+        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
+        OpKind::Memory => {
+            let addr = effective_addr(bcx, instr, gpr)?;
+            load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
+        }
+        _ => return Err("cvt packed src".into()),
+    };
+    let cref = mem.sse_cvt_ref.ok_or("cvt helper missing")?;
+    let op_v = iconst_u64(bcx, op.to_abi());
+    let c1 = bcx.ins().call(cref, &[op_v, s_lo]);
+    let lo = bcx.inst_results(c1)[0];
+    let c2 = bcx.ins().call(cref, &[op_v, s_hi]);
+    let hi = bcx.inst_results(c2)[0];
+    store_xmm_pair(bcx, mem, xmm, di, lo, hi);
     Ok(())
 }
 
@@ -3166,6 +4434,10 @@ fn block_needs_flags(insns: &[DecodedInsn], term: Option<BlockTerm>) -> bool {
                 | Mnemonic::Setns
                 | Mnemonic::Setp
                 | Mnemonic::Setnp
+                | Mnemonic::Comiss
+                | Mnemonic::Comisd
+                | Mnemonic::Ucomiss
+                | Mnemonic::Ucomisd
         )
     })
 }
@@ -3617,6 +4889,10 @@ fn lower_insn(
             flush_pending(bcx, rflags, pending);
             lower_imul(bcx, instr, gpr, dirty, rflags, mem)
         }
+        Mnemonic::Div | Mnemonic::Idiv => {
+            flush_pending(bcx, rflags, pending);
+            lower_div(bcx, instr, gpr, dirty, rflags, mem)
+        }
         // Shift/rotate: compute result now; defer flag packing (unless count_mod==0).
         Mnemonic::Shl | Mnemonic::Sal => {
             lower_shift_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, ShiftKind::Shl)
@@ -3861,18 +5137,124 @@ fn lower_insn(
             FloatBinOp::Div,
             FloatWidth::F64,
         ),
-        Mnemonic::Punpcklqdq | Mnemonic::Punpckhqdq => {
-            flush_pending(bcx, rflags, pending);
-            lower_sse_punpck(bcx, instr, xmm, mem)
+        Mnemonic::Punpcklqdq | Mnemonic::Punpckhqdq => lower_sse_punpck(bcx, instr, xmm, mem),
+        Mnemonic::Punpcklbw
+        | Mnemonic::Punpcklwd
+        | Mnemonic::Punpckldq
+        | Mnemonic::Punpckhbw
+        | Mnemonic::Punpckhwd
+        | Mnemonic::Punpckhdq => lower_sse_punpck_lanes(bcx, instr, gpr, *rflags, mem, xmm),
+        Mnemonic::Pshufd => lower_sse_pshufd(bcx, instr, gpr, *rflags, mem, xmm),
+        Mnemonic::Pshuflw | Mnemonic::Pshufhw => {
+            lower_sse_pshuflw_hw(bcx, instr, gpr, *rflags, mem, xmm)
         }
-        Mnemonic::Pshufd => {
-            flush_pending(bcx, rflags, pending);
-            lower_sse_pshufd(bcx, instr, xmm, mem)
+        Mnemonic::Pshufb => lower_sse_pshufb(bcx, instr, gpr, *rflags, mem, xmm),
+        // Packed integer arithmetic / compare / pack.
+        Mnemonic::Paddb
+        | Mnemonic::Paddw
+        | Mnemonic::Paddd
+        | Mnemonic::Paddq
+        | Mnemonic::Psubb
+        | Mnemonic::Psubw
+        | Mnemonic::Psubd
+        | Mnemonic::Psubq
+        | Mnemonic::Paddsb
+        | Mnemonic::Paddsw
+        | Mnemonic::Paddusb
+        | Mnemonic::Paddusw
+        | Mnemonic::Psubsb
+        | Mnemonic::Psubsw
+        | Mnemonic::Psubusb
+        | Mnemonic::Psubusw
+        | Mnemonic::Pmullw
+        | Mnemonic::Pmulhw
+        | Mnemonic::Pmulhuw
+        | Mnemonic::Pmuludq
+        | Mnemonic::Pmaddwd
+        | Mnemonic::Pcmpeqb
+        | Mnemonic::Pcmpeqw
+        | Mnemonic::Pcmpeqd
+        | Mnemonic::Pcmpgtb
+        | Mnemonic::Pcmpgtw
+        | Mnemonic::Pcmpgtd
+        | Mnemonic::Packsswb
+        | Mnemonic::Packssdw
+        | Mnemonic::Packuswb => {
+            let op = sse_int_op(instr.mnemonic()).ok_or("sse int op")?;
+            lower_sse_int_binop(bcx, instr, gpr, *rflags, mem, xmm, op)
         }
-        Mnemonic::Pshufb => {
+        // Packed shifts (imm8 or variable XMM count).
+        Mnemonic::Psllw
+        | Mnemonic::Pslld
+        | Mnemonic::Psllq
+        | Mnemonic::Psrlw
+        | Mnemonic::Psrld
+        | Mnemonic::Psrlq
+        | Mnemonic::Psraw
+        | Mnemonic::Psrad => {
+            let op = sse_shift_op(instr.mnemonic()).ok_or("sse shift op")?;
+            lower_sse_shift(bcx, instr, gpr, *rflags, mem, xmm, op)
+        }
+        // Scalar FP sqrt / min / max.
+        Mnemonic::Sqrtss => {
+            lower_sse_fp_unop_scalar(bcx, instr, gpr, *rflags, mem, xmm, exec::SseFpUnOp::Sqrtss)
+        }
+        Mnemonic::Sqrtsd => {
+            lower_sse_fp_unop_scalar(bcx, instr, gpr, *rflags, mem, xmm, exec::SseFpUnOp::Sqrtsd)
+        }
+        Mnemonic::Sqrtps => {
+            lower_sse_fp_unop_packed(bcx, instr, gpr, *rflags, mem, xmm, exec::SseFpUnOp::Sqrtps)
+        }
+        Mnemonic::Sqrtpd => {
+            lower_sse_fp_unop_packed(bcx, instr, gpr, *rflags, mem, xmm, exec::SseFpUnOp::Sqrtpd)
+        }
+        Mnemonic::Minss => {
+            lower_sse_fp_binop_scalar(bcx, instr, gpr, *rflags, mem, xmm, exec::SseFpBinOp::Minss)
+        }
+        Mnemonic::Maxss => {
+            lower_sse_fp_binop_scalar(bcx, instr, gpr, *rflags, mem, xmm, exec::SseFpBinOp::Maxss)
+        }
+        Mnemonic::Minsd => {
+            lower_sse_fp_binop_scalar(bcx, instr, gpr, *rflags, mem, xmm, exec::SseFpBinOp::Minsd)
+        }
+        Mnemonic::Maxsd => {
+            lower_sse_fp_binop_scalar(bcx, instr, gpr, *rflags, mem, xmm, exec::SseFpBinOp::Maxsd)
+        }
+        Mnemonic::Minps => {
+            lower_sse_fp_binop_packed(bcx, instr, gpr, *rflags, mem, xmm, exec::SseFpBinOp::Minps)
+        }
+        Mnemonic::Maxps => {
+            lower_sse_fp_binop_packed(bcx, instr, gpr, *rflags, mem, xmm, exec::SseFpBinOp::Maxps)
+        }
+        Mnemonic::Minpd => {
+            lower_sse_fp_binop_packed(bcx, instr, gpr, *rflags, mem, xmm, exec::SseFpBinOp::Minpd)
+        }
+        Mnemonic::Maxpd => {
+            lower_sse_fp_binop_packed(bcx, instr, gpr, *rflags, mem, xmm, exec::SseFpBinOp::Maxpd)
+        }
+        // FP compare → RFLAGS (flush deferred ALU flags first).
+        Mnemonic::Comiss | Mnemonic::Ucomiss | Mnemonic::Comisd | Mnemonic::Ucomisd => {
             flush_pending(bcx, rflags, pending);
-            // SSSE3 byte shuffle: no-op for CI (callers fall back to scalar).
-            Ok(())
+            let is_double = matches!(instr.mnemonic(), Mnemonic::Comisd | Mnemonic::Ucomisd);
+            lower_sse_comis(bcx, instr, gpr, rflags, mem, xmm, is_double)
+        }
+        // Integer ↔ FP converts.
+        Mnemonic::Cvtsi2ss | Mnemonic::Cvtsi2sd => {
+            let is_double = instr.mnemonic() == Mnemonic::Cvtsi2sd;
+            lower_sse_cvt_gpr_to_fp(bcx, instr, gpr, dirty, *rflags, mem, xmm, is_double)
+        }
+        Mnemonic::Cvttss2si | Mnemonic::Cvtss2si | Mnemonic::Cvttsd2si | Mnemonic::Cvtsd2si => {
+            let is_double = matches!(instr.mnemonic(), Mnemonic::Cvttsd2si | Mnemonic::Cvtsd2si);
+            let trunc = matches!(instr.mnemonic(), Mnemonic::Cvttss2si | Mnemonic::Cvttsd2si);
+            lower_sse_cvt_fp_to_gpr(bcx, instr, gpr, dirty, *rflags, mem, xmm, is_double, trunc)
+        }
+        Mnemonic::Cvtps2dq | Mnemonic::Cvtdq2ps | Mnemonic::Cvttps2dq => {
+            let op = match instr.mnemonic() {
+                Mnemonic::Cvtps2dq => exec::SseCvtOp::Cvtps2dq,
+                Mnemonic::Cvtdq2ps => exec::SseCvtOp::Cvtdq2ps,
+                _ => exec::SseCvtOp::Cvttps2dq,
+            };
+            lower_sse_cvt_packed(bcx, instr, gpr, *rflags, mem, xmm, op)
         }
         other => Err(format!("not lowerable {other:?}")),
     }
@@ -4697,6 +6079,22 @@ fn write_gpr(
 #[inline]
 fn mark_dirty(dirty: &mut [bool; 16], idx: usize) {
     dirty[idx] = true;
+}
+
+/// Whether `k` is any immediate operand kind (for `imm8`-style SSE immediates).
+fn is_imm_kind(k: OpKind) -> bool {
+    matches!(
+        k,
+        OpKind::Immediate8
+            | OpKind::Immediate8_2nd
+            | OpKind::Immediate16
+            | OpKind::Immediate32
+            | OpKind::Immediate64
+            | OpKind::Immediate8to16
+            | OpKind::Immediate8to32
+            | OpKind::Immediate8to64
+            | OpKind::Immediate32to64
+    )
 }
 
 fn read_imm(bcx: &mut FunctionBuilder<'_>, instr: &Instruction, op: u32) -> Value {
@@ -6035,6 +7433,84 @@ fn lower_imul(
     let of_on = select_flag(bcx, overflow, rflags::OF);
     let f = replace_flag(bcx, *rflags, rflags::CF, cf_on);
     *rflags = replace_flag(bcx, f, rflags::OF, of_on);
+    Ok(())
+}
+
+/// Lower `div`/`idiv` (32-bit only in v1).
+///
+/// x86 32-bit division: dividend = EDX:EAX (64-bit), divisor = r/m32,
+/// quotient → EAX, remainder → EDX.  `div` is unsigned, `idiv` signed.
+///
+/// Zero divisor: the iced interpreter raises `DivideByZero`.  Cranelift's
+/// `udiv`/`sdiv` trap on zero, which would abort the host process, so the
+/// divisor is guarded (clamped to 1) and the result forced to 0 when the
+/// original divisor was zero — matching AArch64 hardware `udiv`/`sdiv`
+/// semantics.  Only affects buggy guests that divide by zero.
+fn lower_div(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
+    rflags: &mut Value,
+    mem: &mut MemEnv,
+) -> Result<(), String> {
+    let signed = instr.mnemonic() == Mnemonic::Idiv;
+    let bits = op_width_bits(instr, 0)?;
+    if bits != 32 {
+        return Err(format!("div: only 32-bit lowered in v1 (got {bits} bits)"));
+    }
+
+    // Dividend = EDX:EAX as 64-bit (signed for idiv, unsigned for div).
+    let eax = mask_width(bcx, read_gpr(gpr, Register::EAX)?, 32);
+    let edx = mask_width(bcx, read_gpr(gpr, Register::EDX)?, 32);
+    let eax32 = bcx.ins().ireduce(types::I32, eax);
+    let eax64 = bcx.ins().uextend(types::I64, eax32);
+    let edx64 = if signed {
+        let edx32 = bcx.ins().ireduce(types::I32, edx);
+        bcx.ins().sextend(types::I64, edx32)
+    } else {
+        let edx32 = bcx.ins().ireduce(types::I32, edx);
+        bcx.ins().uextend(types::I64, edx32)
+    };
+    let sh = iconst_u64(bcx, 32);
+    let hi = bcx.ins().ishl(edx64, sh);
+    let dividend = bcx.ins().bor(hi, eax64);
+
+    // Divisor = operand 0, sign/zero-extended to 64.
+    let divisor_operand = read_op_mem(bcx, instr, 0, gpr, *rflags, mem)?;
+    let div_raw = mask_width(bcx, divisor_operand, 32);
+    let divisor = if signed {
+        let d32 = bcx.ins().ireduce(types::I32, div_raw);
+        bcx.ins().sextend(types::I64, d32)
+    } else {
+        let d32 = bcx.ins().ireduce(types::I32, div_raw);
+        bcx.ins().uextend(types::I64, d32)
+    };
+
+    // Zero-divisor guard: clamp to 1 for the division, then force q=r=0 when
+    // the original divisor was zero (Cranelift traps on zero divisor).
+    let zero = iconst_u64(bcx, 0);
+    let one = iconst_u64(bcx, 1);
+    let is_zero = bcx.ins().icmp(IntCC::Equal, divisor, zero);
+    let divisor_safe = bcx.ins().select(is_zero, one, divisor);
+
+    let (q, r) = if signed {
+        (
+            bcx.ins().sdiv(dividend, divisor_safe),
+            bcx.ins().srem(dividend, divisor_safe),
+        )
+    } else {
+        (
+            bcx.ins().udiv(dividend, divisor_safe),
+            bcx.ins().urem(dividend, divisor_safe),
+        )
+    };
+    let q = bcx.ins().select(is_zero, zero, q);
+    let r = bcx.ins().select(is_zero, zero, r);
+
+    // EAX = low 32 of quotient, EDX = low 32 of remainder.
+    write_gpr(bcx, gpr, dirty, Register::EAX, q)?;
+    write_gpr(bcx, gpr, dirty, Register::EDX, r)?;
     Ok(())
 }
 

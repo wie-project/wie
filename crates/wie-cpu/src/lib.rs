@@ -14,6 +14,7 @@ mod iced_cpu;
 mod jit;
 mod mem;
 mod regs;
+mod simd;
 
 /// Dump residual iced-interpreter mnemonic histogram (`WIE_EXEC_TRACE=1`).
 pub use exec::{dump_iced_counters, reset_iced_counters};
@@ -32,6 +33,8 @@ pub use mem::{
     RegionTable, VadNode, VadTable, align_down, align_up, win32_from_cpu_error,
 };
 pub use regs::{RegFile, ThreadContext};
+/// SIMD pixel helpers for the GUI present path (NEON on aarch64).
+pub use simd::{mask_bgra_to_0rgb, stretch_nearest};
 
 /// Guest GS segment base — points to the Thread Environment Block (TEB).
 /// Shared with `wie_runtime::DEFAULT_LAYOUT.teb_low_base`.

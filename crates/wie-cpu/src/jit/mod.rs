@@ -43,10 +43,14 @@ use lower::{
     TLB_SETS, TlbBucket, TlbBucketAux, XmmSlot, chain_table_clear, chain_table_insert,
     compile_block, empty_tlb_aux, empty_tlb_bucket, wie_f32_binop, wie_f64_binop,
     wie_jit_chain_lookup, wie_jit_host_span, wie_jit_load, wie_jit_store, wie_jit_string,
+    wie_sse_cvt, wie_sse_fp_binop, wie_sse_fp_unop, wie_sse_int_binop, wie_sse_pshufb_hi,
+    wie_sse_pshufb_lo, wie_sse_shift,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
+use std::time::{Duration, Instant};
 use trampolines::match_micro_stub;
 
 /// Compile after this many visits to the same guest entry (skip cold code).
@@ -191,6 +195,97 @@ fn jit_chain_enabled() -> bool {
     })
 }
 
+/// Background compiler worker (`WIE_JIT_BG=0` disables).
+///
+/// Default: **on** for real runs, **off** under `cfg(test)` so the unit-test
+/// suite keeps the deterministic inline-compile path (hotness is 0 there, so
+/// every block is eager). Dedicated worker tests force it on per-`JitShared`
+/// via [`JitShared::bg_force`].
+fn bg_jit_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("WIE_JIT_BG") {
+        Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("false") => {
+            false
+        }
+        Ok(v) if v == "1" || v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true") => true,
+        _ => !cfg!(test),
+    })
+}
+
+/// Max guest-wait for a background compile before falling back to inline
+/// compilation. A single compile is ~50–500 µs, so 10 ms is ~20× headroom;
+/// the fallback only triggers on queue backlog or a dead worker.
+/// Override: `WIE_JIT_BG_TIMEOUT_US=N`.
+fn bg_wait_timeout() -> Duration {
+    use std::sync::OnceLock;
+    static D: OnceLock<Duration> = OnceLock::new();
+    *D.get_or_init(|| {
+        let us = match std::env::var("WIE_JIT_BG_TIMEOUT_US") {
+            Ok(v) => v.parse::<u64>().unwrap_or(10_000),
+            Err(_) => 10_000,
+        };
+        Duration::from_micros(us)
+    })
+}
+
+/// Max queued background compile requests. Bounds worker memory (each entry
+/// holds a decoded block) and keeps guest wait budgets meaningful: beyond this,
+/// the guest falls back to inline compilation instead of queueing behind an
+/// unbounded backlog.
+const BG_QUEUE_CAP: usize = 1024;
+
+/// Per-entry wait cell for background compiles.
+///
+/// A mutex + condvar pair lets a guest thread block **only** on the entry it
+/// is about to execute (the worker calls [`Self::notify_all`] when it resolves
+/// that entry), instead of waiting on the whole queue. `notify_all` needs no
+/// lock; the mutex exists solely so `wait_timeout` is well-defined.
+struct BgWaitCell {
+    lock: Mutex<()>,
+    cv: Condvar,
+}
+
+impl BgWaitCell {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            lock: Mutex::new(()),
+            cv: Condvar::new(),
+        })
+    }
+
+    /// Wake all waiters for this entry (worker install/fail/drop paths).
+    fn notify_all(&self) {
+        self.cv.notify_all();
+    }
+
+    /// Block until woken or `timeout` elapses. Spurious wakeups return early —
+    /// callers must re-check the cache state.
+    fn wait_timeout(&self, timeout: Duration) {
+        let guard = self.lock.lock().unwrap();
+        let (guard, _timed_out) = self.cv.wait_timeout(guard, timeout).unwrap();
+        drop(guard);
+    }
+}
+
+/// Result of handing a block to the background worker.
+enum BgEnqueueOutcome {
+    /// Entry transitioned to `Queued`; the caller may wait on this cell
+    /// for the worker's Ready entry.
+    Queued(Arc<BgWaitCell>),
+    /// Already `Ready` in the cache (worker beat us); caller re-reads.
+    Ready,
+    /// Worker unavailable / queue full / block not compilable: caller falls
+    /// back to inline compilation (or iced for NotPure).
+    Unavailable,
+}
+
+/// Intermediate states observed while waiting on a background compile.
+enum BgWaitState {
+    Ready(CompiledBlock),
+    Never,
+}
+
 /// Shared JIT state: Cranelift module + compilation cache + guest memory.
 /// One instance per process, shared via Arc across all per-thread engines.
 #[doc(hidden)]
@@ -220,6 +315,30 @@ pub struct JitShared {
     pub mem_gen: AtomicU64,
     /// Whether the Cranelift engine was successfully initialized.
     pub engine_ready: AtomicBool,
+    /// Background compiler queue sender. The worker thread owns the receiver
+    /// and dies when this sender drops (i.e. when the last `Arc<JitShared>` goes
+    /// away). `None` when the worker was never spawned or failed to spawn.
+    pub bg_tx: Mutex<Option<SyncSender<(u64, BlockKind)>>>,
+    /// Set once the worker thread has been spawned (spawn-once latch).
+    pub bg_spawned: AtomicBool,
+    /// Whether the background compiler is currently alive (set true on spawn,
+    /// cleared when the worker exits). Guest threads fall back to inline
+    /// compilation when this is false.
+    pub bg_alive: Arc<AtomicBool>,
+    /// Bumped on every background cache install. Per-thread engines re-sync
+    /// their late-bound chain tables when they observe a new epoch.
+    pub cache_epoch: AtomicU64,
+    /// Total background compiles installed (shared across threads; surfaced in
+    /// per-thread [`JitStats`] snapshots).
+    pub bg_compiles: AtomicU64,
+    /// UCRT fast-API pairs mirrored from each engine's `configure_fast_path` so
+    /// the worker lowers calls exactly like the inline path would.
+    pub bg_fast_api: Mutex<Vec<(u64, FastApiKind)>>,
+    /// Test-only latch forcing the background path on for this instance
+    /// (env-independent, and per-`JitShared` so parallel unit tests cannot
+    /// interfere with each other).
+    #[cfg(test)]
+    bg_force: AtomicBool,
 }
 
 impl JitShared {
@@ -245,6 +364,324 @@ impl JitShared {
             pending_code_overflow: AtomicBool::new(false),
             mem_gen: AtomicU64::new(0),
             engine_ready: AtomicBool::new(engine_ready),
+            bg_tx: Mutex::new(None),
+            bg_spawned: AtomicBool::new(false),
+            bg_alive: Arc::new(AtomicBool::new(false)),
+            cache_epoch: AtomicU64::new(0),
+            bg_compiles: AtomicU64::new(0),
+            bg_fast_api: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            bg_force: AtomicBool::new(false),
+        }
+    }
+
+    /// Whether the background path is enabled for this instance: env default
+    /// (on for real runs, off under `cfg(test)`) or the test latch.
+    fn bg_enabled_here(&self) -> bool {
+        bg_jit_enabled() || self.bg_force_test()
+    }
+
+    #[cfg(test)]
+    fn bg_force_test(&self) -> bool {
+        self.bg_force.load(Ordering::Relaxed)
+    }
+
+    #[cfg(not(test))]
+    fn bg_force_test(&self) -> bool {
+        let _ = self;
+        false
+    }
+
+    /// Install a compiled block into the shared cache (inline-path entry point).
+    ///
+    /// Shared-only bookkeeping: drops any replaced Ready entry from `chain_ids`
+    /// and `code_pages`, registers the new block for direct chaining + SMC
+    /// tracking, and inserts the Ready entry. No per-thread side effects.
+    pub(crate) fn insert_ready(&self, rip: u64, compiled: CompiledBlock) {
+        let removed = {
+            let mut cache = self.cache.write().unwrap();
+            let old = cache.remove(&rip);
+            if let Some(CacheEntry::Ready(ref old)) = old {
+                self.chain_ids.write().unwrap().remove(&rip);
+                Some((old.guest_start, old.guest_end))
+            } else {
+                None
+            }
+        };
+        if let Some((gs, ge)) = removed {
+            self.code_pages_remove_range(gs, ge);
+        }
+        if jit_chain_enabled()
+            && let Some(fid) = compiled.func_id
+        {
+            self.chain_ids.write().unwrap().insert(rip, fid);
+        }
+        self.code_pages_add_range(compiled.guest_start, compiled.guest_end);
+        self.cache
+            .write()
+            .unwrap()
+            .insert(rip, CacheEntry::Ready(compiled));
+    }
+
+    /// Spawn the background compiler thread exactly once.
+    ///
+    /// The thread is detached (no stored join handle): it holds a `Weak` to
+    /// this shared state and dies when the last `Arc` drops (the sender in
+    /// `bg_tx` disconnects, so `recv` errors). This avoids a self-join if the
+    /// worker happens to hold the final strong reference while a job runs.
+    pub(crate) fn ensure_bg_worker(self: &Arc<Self>) {
+        if self.bg_spawned.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let (tx, rx) = mpsc::sync_channel::<(u64, BlockKind)>(BG_QUEUE_CAP);
+        *self.bg_tx.lock().unwrap() = Some(tx);
+        let weak = Arc::downgrade(self);
+        let alive = Arc::clone(&self.bg_alive);
+        let spawned = std::thread::Builder::new()
+            .name("wie-jit-bg-compiler".into())
+            .spawn(move || {
+                Self::bg_worker_main(&weak, &rx);
+                alive.store(false, Ordering::Release);
+            });
+        if spawned.is_ok() {
+            // The worker is up (it can only exit after this sender drops,
+            // which requires the shared state to be gone — impossible while
+            // we hold `self`). Guests may enqueue immediately.
+            self.bg_alive.store(true, Ordering::Release);
+        } else {
+            // Spawn failed (resource limits): revert so callers fall back
+            // to inline compilation and a later call can retry.
+            self.bg_spawned.store(false, Ordering::Release);
+            self.bg_tx.lock().unwrap().take();
+        }
+    }
+
+    /// Worker main loop: compile queued blocks, install Ready entries, wake
+    /// waiters. Exits when the channel disconnects (shared state dropped).
+    fn bg_worker_main(shared: &Weak<Self>, rx: &Receiver<(u64, BlockKind)>) {
+        while let Ok((rip, kind)) = rx.recv() {
+            let Some(shared) = shared.upgrade() else {
+                break;
+            };
+            let mem_gen_before = shared.mem_gen.load(Ordering::Acquire);
+            let fast_api = shared.bg_fast_api.lock().unwrap().clone();
+            let compiled = shared.compile_from_kind_shared(&fast_api, rip, kind);
+            // If guest memory was remapped (map/protect/free) or a code page
+            // write is pending while we compiled, the cached bytes may be
+            // stale — drop the result and let the guest re-request.
+            let stale = shared.mem_gen.load(Ordering::Acquire) != mem_gen_before
+                || compiled.as_ref().is_some_and(|c| {
+                    let len =
+                        usize::try_from(c.guest_end.saturating_sub(c.guest_start)).unwrap_or(0);
+                    shared.pending_code_write_overlaps(c.guest_start, len)
+                });
+            if stale {
+                shared.bg_install_drop(rip);
+            } else {
+                match compiled {
+                    Some(c) => shared.bg_install_ready(rip, c),
+                    None => shared.bg_install_never(rip),
+                }
+            }
+        }
+    }
+
+    /// Compile a decoded block without any per-thread state.
+    ///
+    /// Identical to the inline path's lowering (same `compile_block`, same
+    /// `chain_ids` snapshot for direct chaining, same `call_fast` resolution)
+    /// so background output is byte-for-byte the same code — only the *when*
+    /// differs.
+    fn compile_from_kind_shared(
+        &self,
+        fast_api: &[(u64, FastApiKind)],
+        rip: u64,
+        result: BlockKind,
+    ) -> Option<CompiledBlock> {
+        match result {
+            BlockKind::Pure {
+                insns,
+                end_rip,
+                bytes_len,
+                term,
+            } => {
+                // 1–3 insn guest stubs: hand-written host trampoline (no Cranelift).
+                if let Some(micro) = match_micro_stub(&insns, term) {
+                    let guest_end = rip.saturating_add(u64::from(bytes_len));
+                    return Some(CompiledBlock {
+                        func: micro.func(),
+                        func_id: None,
+                        insn_count: micro.insn_count(),
+                        uses_sse: false,
+                        xmm_live_mask: 0,
+                        xmm_may_def_mask: 0,
+                        guest_start: rip,
+                        guest_end,
+                    });
+                }
+
+                // Resolve import thunks before mutably borrowing the JIT engine.
+                let call_fast = match term {
+                    Some(block::BlockTerm::Call { target, .. }) => {
+                        let mem = self.mem.read().unwrap();
+                        let final_va = resolve_thunk_va(&mem, target);
+                        drop(mem);
+                        fast_api
+                            .iter()
+                            .find_map(|&(k, kind)| (k == final_va).then_some(kind))
+                    }
+                    _ => None,
+                };
+                let chain_on = jit_chain_enabled();
+                let empty_chain = HashMap::new();
+                let mut eng_guard = self.engine.lock().unwrap();
+                let eng = eng_guard.as_mut()?;
+                let chain_ids = &*self.chain_ids.read().unwrap();
+                let chain_map = if chain_on { chain_ids } else { &empty_chain };
+                compile_block(
+                    eng, rip, &insns, end_rip, term, call_fast, chain_map, bytes_len,
+                )
+                .ok()
+            }
+            BlockKind::NotPure => None,
+        }
+    }
+
+    /// Worker-side install of a successfully compiled block: cache + chaining +
+    /// SMC bookkeeping + epoch bump + waiter notification.
+    fn bg_install_ready(&self, rip: u64, compiled: CompiledBlock) {
+        let notify = {
+            let mut cache = self.cache.write().unwrap();
+            let old = cache.remove(&rip);
+            let notify = match &old {
+                Some(CacheEntry::Queued(n)) => Some(Arc::clone(n)),
+                _ => None, // resolved elsewhere (guest inline fallback): skip
+            };
+            if let Some(CacheEntry::Ready(ref old)) = old {
+                self.chain_ids.write().unwrap().remove(&rip);
+                self.code_pages_remove_range(old.guest_start, old.guest_end);
+            }
+            if jit_chain_enabled()
+                && let Some(fid) = compiled.func_id
+            {
+                self.chain_ids.write().unwrap().insert(rip, fid);
+            }
+            self.code_pages_add_range(compiled.guest_start, compiled.guest_end);
+            cache.insert(rip, CacheEntry::Ready(compiled));
+            notify
+        };
+        self.cache_epoch.fetch_add(1, Ordering::Relaxed);
+        self.bg_compiles.fetch_add(1, Ordering::Relaxed);
+        if let Some(n) = notify {
+            n.notify_all();
+        }
+    }
+
+    /// Worker-side resolution when the block failed to compile: mark Never and
+    /// wake waiters (they fall through to iced, no inline re-attempt needed).
+    fn bg_install_never(&self, rip: u64) {
+        let notify = {
+            let mut cache = self.cache.write().unwrap();
+            match cache.remove(&rip) {
+                Some(CacheEntry::Queued(n)) => {
+                    cache.insert(rip, CacheEntry::Never);
+                    Some(n)
+                }
+                _ => None,
+            }
+        };
+        if let Some(n) = notify {
+            n.notify_all();
+        }
+    }
+
+    /// Worker-side resolution when the result was stale (guest memory changed
+    /// while compiling): drop the Queued entry entirely so the guest re-decodes
+    /// fresh, and wake waiters so they fall back immediately instead of burning
+    /// their full wait budget.
+    fn bg_install_drop(&self, rip: u64) {
+        let notify = {
+            let mut cache = self.cache.write().unwrap();
+            match cache.remove(&rip) {
+                Some(CacheEntry::Queued(n)) => Some(n),
+                _ => None,
+            }
+        };
+        if let Some(n) = notify {
+            n.notify_all();
+        }
+    }
+
+    /// Whether any guest code page write is currently pending over `[addr, addr+len)`.
+    fn pending_code_write_overlaps(&self, addr: u64, len: usize) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let end = addr.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
+        let pending = self.pending_code_writes.lock().unwrap();
+        let mut page = addr >> 12;
+        let last = end.saturating_sub(1) >> 12;
+        while page <= last {
+            if pending.contains(&page) {
+                return true;
+            }
+            page = page.saturating_add(1);
+        }
+        false
+    }
+
+    fn code_pages_overlap(&self, addr: u64, len: usize) -> bool {
+        let code_pages = self.code_pages.lock().unwrap();
+        if len == 0 || code_pages.is_empty() {
+            return false;
+        }
+        let end = addr.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
+        if end <= addr {
+            return !code_pages.is_empty();
+        }
+        let mut page = addr >> 12;
+        let last = end.saturating_sub(1) >> 12;
+        while page <= last {
+            if code_pages.contains_key(&page) {
+                return true;
+            }
+            page = page.saturating_add(1);
+        }
+        false
+    }
+
+    fn code_pages_add_range(&self, guest_start: u64, guest_end: u64) {
+        if guest_end <= guest_start {
+            return;
+        }
+        let mut code_pages = self.code_pages.lock().unwrap();
+        let mut page = guest_start >> 12;
+        let last = guest_end.saturating_sub(1) >> 12;
+        while page <= last {
+            code_pages
+                .entry(page)
+                .and_modify(|c| *c = c.saturating_add(1))
+                .or_insert(1);
+            page = page.saturating_add(1);
+        }
+    }
+
+    fn code_pages_remove_range(&self, guest_start: u64, guest_end: u64) {
+        if guest_end <= guest_start {
+            return;
+        }
+        let mut code_pages = self.code_pages.lock().unwrap();
+        let mut page = guest_start >> 12;
+        let last = guest_end.saturating_sub(1) >> 12;
+        while page <= last {
+            match code_pages.get_mut(&page) {
+                Some(c) if *c > 1 => *c = c.saturating_sub(1),
+                Some(_) => {
+                    code_pages.remove(&page);
+                }
+                None => {}
+            }
+            page = page.saturating_add(1);
         }
     }
 }
@@ -355,6 +792,10 @@ pub struct JitCpu {
     pub(crate) stats: JitStats,
     /// Previous `GuestMemory::generation` at last `run_compiled` (diag).
     pub(crate) last_mem_gen: u64,
+    /// Last `JitShared::cache_epoch` this thread re-synced its chain table at.
+    /// `u64::MAX` means "dirty — resync on next dispatch" (set after the table
+    /// is cleared).
+    pub(crate) chain_sync_epoch: u64,
 }
 
 // SAFETY: Arc<JitShared> is Send + Sync (via unsafe impl above).
@@ -372,6 +813,10 @@ pub enum CacheEntry {
     /// Visit counter + compile threshold (threshold fixed on first sight so we
     /// do not re-decode for UCRT peek on every warmup visit).
     Hot { visits: u32, thr: u32 },
+    /// Enqueued for background compilation. The [`BgWaitCell`] wakes guest
+    /// threads waiting specifically for this entry (the worker calls
+    /// `notify_all` when it installs the Ready block or gives up).
+    Queued(Arc<BgWaitCell>),
 }
 
 pub(crate) struct JitEngine {
@@ -393,6 +838,20 @@ pub(crate) struct JitEngine {
     f32_id: cranelift_module::FuncId,
     /// Scalar f64 binop helper.
     f64_id: cranelift_module::FuncId,
+    /// Packed integer SSE2 lane op helper (SIMD-off path + pack/pmul*).
+    sse_int_id: cranelift_module::FuncId,
+    /// Packed SSE2 shift helper (imm + variable count).
+    sse_shift_id: cranelift_module::FuncId,
+    /// `pshufb` result low half (full 16-byte table + mask).
+    sse_pshufb_lo_id: cranelift_module::FuncId,
+    /// `pshufb` result high half.
+    sse_pshufb_hi_id: cranelift_module::FuncId,
+    /// FP unary (sqrt) helper.
+    sse_fp_unop_id: cranelift_module::FuncId,
+    /// FP min/max helper.
+    sse_fp_binop_id: cranelift_module::FuncId,
+    /// Integer↔FP convert helper.
+    sse_cvt_id: cranelift_module::FuncId,
     /// Host chain-table lookup (`wie_jit_chain_lookup`).
     lookup_id: cranelift_module::FuncId,
     /// UCRT fast-path imports (malloc, free, memcpy, …).
@@ -484,6 +943,16 @@ pub struct JitStats {
     pub compiles: u64,
     /// Block decode declined or cold skip.
     pub compile_skip: u64,
+    /// Blocks compiled on the background worker (shared counter; merged into
+    /// per-thread snapshots by [`JitCpu::stats`]).
+    pub bg_compiles: u64,
+    /// Times this thread waited for a background compile (any resolution).
+    pub compile_stalls: u64,
+    /// Total wall µs this thread spent waiting on background compiles.
+    pub compile_stall_us: u64,
+    /// Background waits that missed the deadline and fell back to inline
+    /// compilation (worker backlog / dead worker visibility, roadmap B9).
+    pub compile_stall_fallback: u64,
     /// Cache hits (native run).
     pub cache_hits: u64,
     /// Calls into host `wie_jit_load` (TLB hit or miss).
@@ -541,6 +1010,7 @@ impl JitCpu {
             fast_api: Vec::new(),
             stats: JitStats::default(),
             last_mem_gen: 0,
+            chain_sync_epoch: 0,
         }
     }
 
@@ -559,19 +1029,31 @@ impl JitCpu {
             fast_api: Vec::new(),
             stats: JitStats::default(),
             last_mem_gen: 0,
+            chain_sync_epoch: 0,
         }
     }
 
     /// Snapshot of JIT diagnostics counters (Phase 0 baselines).
+    ///
+    /// Merges the shared background-compile counter into the per-thread
+    /// snapshot so `WIE_RUNTIME_PROFILE` sees background work.
     #[must_use]
     pub fn stats(&self) -> JitStats {
-        self.stats
+        let mut s = self.stats;
+        s.bg_compiles = s
+            .bg_compiles
+            .saturating_add(self.shared.bg_compiles.load(Ordering::Relaxed));
+        s
     }
 
     /// Install UCRT/heap fast-path config (called once after fake-API table build).
     pub fn configure_fast_path(&mut self, cfg: JitFastPathConfig) {
         install_heap_layout(cfg.heap);
+        let pairs = cfg.pairs.clone();
         self.fast_api = cfg.pairs;
+        // Mirror the pairs so the background worker lowers UCRT calls exactly
+        // like the inline path (same `call_fast` → same emitted code).
+        *self.shared.bg_fast_api.lock().unwrap() = pairs;
         self.clear_compiled();
         self.invalidate_chain_and_shadow();
     }
@@ -588,30 +1070,7 @@ impl JitCpu {
     }
 
     fn insert_ready(&mut self, rip: u64, compiled: CompiledBlock) {
-        let removed = {
-            let mut cache = self.shared.cache.write().unwrap();
-            let old = cache.remove(&rip);
-            if let Some(CacheEntry::Ready(ref old)) = old {
-                self.shared.chain_ids.write().unwrap().remove(&rip);
-                Some((old.guest_start, old.guest_end))
-            } else {
-                None
-            }
-        };
-        if let Some((gs, ge)) = removed {
-            self.code_pages_remove_range(gs, ge);
-        }
-        if jit_chain_enabled()
-            && let Some(fid) = compiled.func_id
-        {
-            self.shared.chain_ids.write().unwrap().insert(rip, fid);
-        }
-        self.code_pages_add_range(compiled.guest_start, compiled.guest_end);
-        self.shared
-            .cache
-            .write()
-            .unwrap()
-            .insert(rip, CacheEntry::Ready(compiled));
+        self.shared.insert_ready(rip, compiled);
     }
 
     fn clear_compiled(&mut self) {
@@ -652,7 +1111,8 @@ impl JitCpu {
             let mut cache = self.shared.cache.write().unwrap();
             if let Some(CacheEntry::Ready(c)) = cache.remove(va) {
                 drop(cache);
-                self.code_pages_remove_range(c.guest_start, c.guest_end);
+                self.shared
+                    .code_pages_remove_range(c.guest_start, c.guest_end);
             }
             self.shared.chain_ids.write().unwrap().remove(va);
         }
@@ -671,58 +1131,7 @@ impl JitCpu {
 
     #[inline]
     fn code_pages_overlap(&self, addr: u64, len: usize) -> bool {
-        let code_pages = self.shared.code_pages.lock().unwrap();
-        if len == 0 || code_pages.is_empty() {
-            return false;
-        }
-        let end = addr.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
-        if end <= addr {
-            return !code_pages.is_empty();
-        }
-        let mut page = addr >> 12;
-        let last = end.saturating_sub(1) >> 12;
-        while page <= last {
-            if code_pages.contains_key(&page) {
-                return true;
-            }
-            page = page.saturating_add(1);
-        }
-        false
-    }
-
-    fn code_pages_add_range(&mut self, guest_start: u64, guest_end: u64) {
-        if guest_end <= guest_start {
-            return;
-        }
-        let mut code_pages = self.shared.code_pages.lock().unwrap();
-        let mut page = guest_start >> 12;
-        let last = guest_end.saturating_sub(1) >> 12;
-        while page <= last {
-            code_pages
-                .entry(page)
-                .and_modify(|c| *c = c.saturating_add(1))
-                .or_insert(1);
-            page = page.saturating_add(1);
-        }
-    }
-
-    fn code_pages_remove_range(&mut self, guest_start: u64, guest_end: u64) {
-        if guest_end <= guest_start {
-            return;
-        }
-        let mut code_pages = self.shared.code_pages.lock().unwrap();
-        let mut page = guest_start >> 12;
-        let last = guest_end.saturating_sub(1) >> 12;
-        while page <= last {
-            match code_pages.get_mut(&page) {
-                Some(c) if *c > 1 => *c = c.saturating_sub(1),
-                Some(_) => {
-                    code_pages.remove(&page);
-                }
-                None => {}
-            }
-            page = page.saturating_add(1);
-        }
+        self.shared.code_pages_overlap(addr, len)
     }
 
     fn drain_pending_code_writes(&mut self) {
@@ -848,6 +1257,25 @@ impl JitCpu {
                         return Ok(self.finish_compiled(rip, meta));
                     }
                     CacheEntry::Never => { /* fall through to iced */ }
+                    CacheEntry::Queued(notify) => {
+                        // About to execute the entry the worker is compiling:
+                        // block only for this entry, and only briefly. On timeout
+                        // (queue backlog / dead worker) fall back to inline.
+                        if let Some(compiled) = self.wait_bg_ready(rip, &notify) {
+                            let meta = CompiledRunMeta::from(&compiled);
+                            return Ok(self.finish_compiled(rip, meta));
+                        }
+                        if let Some(compiled) = self.try_compile(rip) {
+                            let meta = CompiledRunMeta::from(&compiled);
+                            self.insert_ready(rip, compiled);
+                            return Ok(self.finish_compiled(rip, meta));
+                        }
+                        self.shared
+                            .cache
+                            .write()
+                            .unwrap()
+                            .insert(rip, CacheEntry::Never);
+                    }
                     CacheEntry::Hot { visits, thr } => {
                         let next = visits.saturating_add(1);
                         if thr > 0 && next < thr {
@@ -856,16 +1284,32 @@ impl JitCpu {
                                 .write()
                                 .unwrap()
                                 .insert(rip, CacheEntry::Hot { visits: next, thr });
-                        } else if let Some(compiled) = self.try_compile(rip) {
-                            let meta = CompiledRunMeta::from(&compiled);
-                            self.insert_ready(rip, compiled);
-                            return Ok(self.finish_compiled(rip, meta));
                         } else {
-                            self.shared
-                                .cache
-                                .write()
-                                .unwrap()
-                                .insert(rip, CacheEntry::Never);
+                            // Threshold crossed. Prefer the background worker:
+                            // enqueue and keep executing on iced this visit; the
+                            // compiled block lands in the cache for the next one.
+                            // Inline compilation is only the fallback.
+                            let kind = {
+                                let mem = self.shared.mem.read().unwrap();
+                                block::decode_pure_gpr_block(&mem, self.thread.hooks.as_ref(), rip)
+                            };
+                            match self.enqueue_bg(rip, &kind) {
+                                BgEnqueueOutcome::Queued(_) | BgEnqueueOutcome::Ready => {
+                                    // Continue on iced this visit.
+                                }
+                                BgEnqueueOutcome::Unavailable => {
+                                    if let Some(compiled) = self.try_compile_from_kind(rip, kind) {
+                                        let meta = CompiledRunMeta::from(&compiled);
+                                        self.insert_ready(rip, compiled);
+                                        return Ok(self.finish_compiled(rip, meta));
+                                    }
+                                    self.shared
+                                        .cache
+                                        .write()
+                                        .unwrap()
+                                        .insert(rip, CacheEntry::Never);
+                                }
+                            }
                         }
                     }
                 }
@@ -887,16 +1331,55 @@ impl JitCpu {
                     hotness_threshold()
                 };
                 if thr == 0 || is_ucrt {
-                    if let Some(compiled) = self.try_compile_from_kind(rip, kind) {
-                        let meta = CompiledRunMeta::from(&compiled);
-                        self.insert_ready(rip, compiled);
-                        return Ok(self.finish_compiled(rip, meta));
+                    // Eager compile: the entry is required NOW (there may be no
+                    // revisit). Prefer the background worker and block briefly
+                    // on this entry only; inline compile is the fallback.
+                    match self.enqueue_bg(rip, &kind) {
+                        BgEnqueueOutcome::Queued(notify) => {
+                            if let Some(compiled) = self.wait_bg_ready(rip, &notify) {
+                                let meta = CompiledRunMeta::from(&compiled);
+                                return Ok(self.finish_compiled(rip, meta));
+                            }
+                            // Deadline missed — compile inline (replaces Queued).
+                            if let Some(compiled) = self.try_compile_from_kind(rip, kind) {
+                                let meta = CompiledRunMeta::from(&compiled);
+                                self.insert_ready(rip, compiled);
+                                return Ok(self.finish_compiled(rip, meta));
+                            }
+                            self.shared
+                                .cache
+                                .write()
+                                .unwrap()
+                                .insert(rip, CacheEntry::Never);
+                        }
+                        BgEnqueueOutcome::Ready => {
+                            // Worker beat us: the cache already holds Ready.
+                            let compiled = {
+                                let cache = self.shared.cache.read().unwrap();
+                                cache.get(&rip).and_then(|e| match e {
+                                    CacheEntry::Ready(c) => Some(*c),
+                                    _ => None,
+                                })
+                            };
+                            if let Some(compiled) = compiled {
+                                let meta = CompiledRunMeta::from(&compiled);
+                                return Ok(self.finish_compiled(rip, meta));
+                            }
+                            // Vanished (invalidated mid-flight) — fall through to iced.
+                        }
+                        BgEnqueueOutcome::Unavailable => {
+                            if let Some(compiled) = self.try_compile_from_kind(rip, kind) {
+                                let meta = CompiledRunMeta::from(&compiled);
+                                self.insert_ready(rip, compiled);
+                                return Ok(self.finish_compiled(rip, meta));
+                            }
+                            self.shared
+                                .cache
+                                .write()
+                                .unwrap()
+                                .insert(rip, CacheEntry::Never);
+                        }
                     }
-                    self.shared
-                        .cache
-                        .write()
-                        .unwrap()
-                        .insert(rip, CacheEntry::Never);
                 } else {
                     self.shared
                         .cache
@@ -957,6 +1440,118 @@ impl JitCpu {
         pure_is_self_loop(&kind, rip)
     }
 
+    /// Hand a block to the background compiler.
+    ///
+    /// Queues the exact decoded block so the worker compiles the same bytes the
+    /// guest classified. The cache entry transitions to `Queued` only after the
+    /// queue slot is reserved (a full queue must never strand a Queued entry).
+    fn enqueue_bg(&mut self, rip: u64, kind: &BlockKind) -> BgEnqueueOutcome {
+        if !self.shared.bg_enabled_here() || !self.shared.engine_ready.load(Ordering::Relaxed) {
+            return BgEnqueueOutcome::Unavailable;
+        }
+        self.shared.ensure_bg_worker();
+        if !self.shared.bg_alive.load(Ordering::Relaxed) {
+            return BgEnqueueOutcome::Unavailable;
+        }
+        if matches!(kind, BlockKind::NotPure) {
+            self.shared
+                .cache
+                .write()
+                .unwrap()
+                .insert(rip, CacheEntry::Never);
+            return BgEnqueueOutcome::Unavailable;
+        }
+        let tx_guard = self.shared.bg_tx.lock().unwrap();
+        let Some(tx) = tx_guard.as_ref() else {
+            return BgEnqueueOutcome::Unavailable;
+        };
+        if tx.try_send((rip, kind.clone())).is_err() {
+            return BgEnqueueOutcome::Unavailable;
+        }
+        // Transition the entry (only from Hot/absent; never clobber Ready/Never).
+        let mut cache = self.shared.cache.write().unwrap();
+        match cache.get(&rip) {
+            None | Some(CacheEntry::Hot { .. }) => {
+                let cell = BgWaitCell::new();
+                cache.insert(rip, CacheEntry::Queued(Arc::clone(&cell)));
+                BgEnqueueOutcome::Queued(cell)
+            }
+            Some(CacheEntry::Queued(_) | CacheEntry::Never) => BgEnqueueOutcome::Unavailable,
+            Some(CacheEntry::Ready(_)) => BgEnqueueOutcome::Ready,
+        }
+    }
+
+    /// Wait (bounded) for the background worker to resolve `rip`.
+    ///
+    /// The guest only reaches this when it is about to execute the entry. The
+    /// wait is per-entry (the cell from the Queued entry, not the whole queue)
+    /// and time-boxed by [`bg_wait_timeout`]; on timeout the caller falls back
+    /// to inline compilation so a worker stall can never deadlock the guest.
+    /// Returns the Ready block once installed.
+    fn wait_bg_ready(&mut self, rip: u64, cell: &BgWaitCell) -> Option<CompiledBlock> {
+        if !self.shared.bg_alive.load(Ordering::Relaxed) {
+            return None; // worker gone: inline fallback
+        }
+        let budget = bg_wait_timeout();
+        let start = Instant::now();
+        loop {
+            let state = {
+                let cache = self.shared.cache.read().unwrap();
+                match cache.get(&rip) {
+                    Some(CacheEntry::Ready(c)) => Some(BgWaitState::Ready(*c)),
+                    Some(CacheEntry::Never) => Some(BgWaitState::Never),
+                    Some(CacheEntry::Queued(_)) => None,
+                    // Re-decided or invalidated while we waited: inline fallback.
+                    Some(CacheEntry::Hot { .. }) | None => return None,
+                }
+            };
+            match state {
+                Some(BgWaitState::Ready(c)) => {
+                    self.stats.compile_stalls = self.stats.compile_stalls.saturating_add(1);
+                    self.stats.compile_stall_us = self.stats.compile_stall_us.saturating_add(
+                        u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    );
+                    return Some(c);
+                }
+                Some(BgWaitState::Never) => return None, // worker failed → iced
+                None => {}
+            }
+            let elapsed = start.elapsed();
+            if elapsed >= budget {
+                self.stats.compile_stalls = self.stats.compile_stalls.saturating_add(1);
+                self.stats.compile_stall_us = self
+                    .stats
+                    .compile_stall_us
+                    .saturating_add(u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX));
+                self.stats.compile_stall_fallback =
+                    self.stats.compile_stall_fallback.saturating_add(1);
+                return None;
+            }
+            // Chunked wait: a notification that races with our re-check (or a
+            // spurious wakeup) costs at most one 1 ms chunk, never the whole
+            // budget. The loop re-checks the cache after each wake.
+            cell.wait_timeout(budget.saturating_sub(elapsed).min(Duration::from_millis(1)));
+        }
+    }
+
+    /// Re-insert every Ready block into this thread's late-bound chain table.
+    ///
+    /// Runs only when the shared `cache_epoch` advanced (background installs),
+    /// so worker-compiled blocks chain from compiled code exactly like inline
+    /// compiles would have.
+    fn resync_chain_table(&mut self) {
+        if !jit_chain_enabled() {
+            return;
+        }
+        let cache = self.shared.cache.read().unwrap();
+        for (va, entry) in &*cache {
+            if let CacheEntry::Ready(c) = entry {
+                let fn_ptr = c.func as usize as u64;
+                chain_table_insert(self.thread.chain_slots.as_mut(), *va, fn_ptr);
+            }
+        }
+    }
+
     fn try_compile(&mut self, rip: u64) -> Option<CompiledBlock> {
         let kind = {
             let mem_guard = self.shared.mem.read().unwrap();
@@ -967,91 +1562,29 @@ impl JitCpu {
 
     /// Compile a block from an already-decoded [`BlockKind`], skipping the
     /// full iced-decode pass that would otherwise repeat previous work.
+    ///
+    /// Shares the lowering with the background worker ([`JitShared::compile_from_kind_shared`]);
+    /// this wrapper adds the per-thread side effects: compile stats and the
+    /// thread-local chain-table entry.
     fn try_compile_from_kind(&mut self, rip: u64, result: BlockKind) -> Option<CompiledBlock> {
-        match result {
-            BlockKind::Pure {
-                insns,
-                end_rip,
-                bytes_len,
-                term,
-            } => {
-                // 1–3 insn guest stubs: hand-written host trampoline (no Cranelift).
-                if let Some(micro) = match_micro_stub(&insns, term) {
-                    let guest_end = rip.saturating_add(u64::from(bytes_len));
-                    let compiled = CompiledBlock {
-                        func: micro.func(),
-                        func_id: None,
-                        insn_count: micro.insn_count(),
-                        uses_sse: false,
-                        xmm_live_mask: 0,
-                        xmm_may_def_mask: 0,
-                        guest_start: rip,
-                        guest_end,
-                    };
-                    self.stats.compiles = self.stats.compiles.saturating_add(1);
-                    if jit_chain_enabled() {
-                        let fn_ptr = compiled.func as usize as u64;
-                        chain_table_insert(self.thread.chain_slots.as_mut(), rip, fn_ptr);
-                    }
-                    tracing::debug!(
-                        start = format_args!("{rip:#x}"),
-                        insns = compiled.insn_count,
-                        "jit micro-stub trampoline"
-                    );
-                    return Some(compiled);
-                }
-
-                // Resolve import thunks before mutably borrowing the JIT engine.
-                let call_fast = match term {
-                    Some(block::BlockTerm::Call { target, .. }) => {
-                        let mem = self.shared.mem.read().unwrap();
-                        let final_va = resolve_thunk_va(&mem, target);
-                        drop(mem);
-                        self.fast_api
-                            .iter()
-                            .find_map(|&(k, kind)| (k == final_va).then_some(kind))
-                    }
-                    _ => None,
-                };
-                // Split borrows: `chain_ids` (Ready FuncIds) + `engine` mutably.
-                let chain_on = jit_chain_enabled();
-                let empty_chain = HashMap::new();
-                let mut eng_guard = self.shared.engine.lock().unwrap();
-                let eng = eng_guard.as_mut()?;
-                let chain_ids = &*self.shared.chain_ids.read().unwrap();
-                let chain_map = if chain_on { chain_ids } else { &empty_chain };
-                match compile_block(
-                    eng, rip, &insns, end_rip, term, call_fast, chain_map, bytes_len,
-                ) {
-                    Ok(compiled) => {
-                        self.stats.compiles = self.stats.compiles.saturating_add(1);
-                        if chain_on {
-                            let fn_ptr = compiled.func as usize as u64;
-                            chain_table_insert(self.thread.chain_slots.as_mut(), rip, fn_ptr);
-                        }
-                        tracing::debug!(
-                            start = format_args!("{rip:#x}"),
-                            end = format_args!("{end_rip:#x}"),
-                            insns = compiled.insn_count,
-                            bytes = bytes_len,
-                            has_term = term.is_some(),
-                            fast = call_fast.is_some(),
-                            "jit compiled block"
-                        );
-                        Some(compiled)
-                    }
-                    Err(e) => {
-                        self.stats.compile_skip = self.stats.compile_skip.saturating_add(1);
-                        tracing::debug!(start = format_args!("{rip:#x}"), error = %e, "jit lower failed");
-                        None
-                    }
-                }
-            }
-            BlockKind::NotPure => {
-                self.stats.compile_skip = self.stats.compile_skip.saturating_add(1);
-                None
-            }
+        let compiled = self
+            .shared
+            .compile_from_kind_shared(&self.fast_api, rip, result);
+        let Some(compiled) = compiled else {
+            self.stats.compile_skip = self.stats.compile_skip.saturating_add(1);
+            return None;
+        };
+        self.stats.compiles = self.stats.compiles.saturating_add(1);
+        if jit_chain_enabled() {
+            let fn_ptr = compiled.func as usize as u64;
+            chain_table_insert(self.thread.chain_slots.as_mut(), rip, fn_ptr);
         }
+        tracing::debug!(
+            start = format_args!("{rip:#x}"),
+            insns = compiled.insn_count,
+            "jit compiled block"
+        );
+        Some(compiled)
     }
 
     fn finish_compiled(&mut self, entry_rip: u64, meta: CompiledRunMeta) -> (StepResult, usize) {
@@ -1322,6 +1855,9 @@ impl JitCpu {
         self.thread.edge_ic_rr = 0;
         self.thread.shadow_sp = 0;
         self.thread.shadow_ret = [0; lower::SHADOW_DEPTH];
+        // The table is empty now; force a full re-sync from the cache on the
+        // next dispatch (picks up worker-installed Ready blocks too).
+        self.chain_sync_epoch = u64::MAX;
     }
 }
 
@@ -1523,6 +2059,13 @@ impl JitEngine {
         builder.symbol("wie_jit_host_span", wie_jit_host_span as *const u8);
         builder.symbol("wie_f32_binop", wie_f32_binop as *const u8);
         builder.symbol("wie_f64_binop", wie_f64_binop as *const u8);
+        builder.symbol("wie_sse_int_binop", wie_sse_int_binop as *const u8);
+        builder.symbol("wie_sse_shift", wie_sse_shift as *const u8);
+        builder.symbol("wie_sse_pshufb_lo", wie_sse_pshufb_lo as *const u8);
+        builder.symbol("wie_sse_pshufb_hi", wie_sse_pshufb_hi as *const u8);
+        builder.symbol("wie_sse_fp_unop", wie_sse_fp_unop as *const u8);
+        builder.symbol("wie_sse_fp_binop", wie_sse_fp_binop as *const u8);
+        builder.symbol("wie_sse_cvt", wie_sse_cvt as *const u8);
         builder.symbol("wie_jit_chain_lookup", wie_jit_chain_lookup as *const u8);
         builder.symbol("wie_ucrt_malloc", wie_ucrt_malloc as *const u8);
         builder.symbol("wie_ucrt_free", wie_ucrt_free as *const u8);
@@ -1595,6 +2138,42 @@ impl JitEngine {
             .declare_function("wie_f64_binop", Linkage::Import, &f_sig)
             .map_err(|e| e.to_string())?;
 
+        // sse int/shift/fp-minmax binop: (op, a, b) -> r — same shape as f_sig.
+        let sse_int_id = module
+            .declare_function("wie_sse_int_binop", Linkage::Import, &f_sig)
+            .map_err(|e| e.to_string())?;
+        let sse_shift_id = module
+            .declare_function("wie_sse_shift", Linkage::Import, &f_sig)
+            .map_err(|e| e.to_string())?;
+        let sse_fp_binop_id = module
+            .declare_function("wie_sse_fp_binop", Linkage::Import, &f_sig)
+            .map_err(|e| e.to_string())?;
+
+        // fp unop / cvt: (op, a) -> r.
+        let mut sse2_sig = module.make_signature();
+        sse2_sig.params.push(AbiParam::new(types::I64));
+        sse2_sig.params.push(AbiParam::new(types::I64));
+        sse2_sig.returns.push(AbiParam::new(types::I64));
+        let sse_fp_unop_id = module
+            .declare_function("wie_sse_fp_unop", Linkage::Import, &sse2_sig)
+            .map_err(|e| e.to_string())?;
+        let sse_cvt_id = module
+            .declare_function("wie_sse_cvt", Linkage::Import, &sse2_sig)
+            .map_err(|e| e.to_string())?;
+
+        // pshufb halves: (a_lo, a_hi, b_lo, b_hi) -> r.
+        let mut sse4_sig = module.make_signature();
+        for _ in 0..4 {
+            sse4_sig.params.push(AbiParam::new(types::I64));
+        }
+        sse4_sig.returns.push(AbiParam::new(types::I64));
+        let sse_pshufb_lo_id = module
+            .declare_function("wie_sse_pshufb_lo", Linkage::Import, &sse4_sig)
+            .map_err(|e| e.to_string())?;
+        let sse_pshufb_hi_id = module
+            .declare_function("wie_sse_pshufb_hi", Linkage::Import, &sse4_sig)
+            .map_err(|e| e.to_string())?;
+
         // chain lookup: (ctx, va) -> fn_ptr
         let mut lookup_sig = module.make_signature();
         lookup_sig.params.push(AbiParam::new(types::I64));
@@ -1662,6 +2241,13 @@ impl JitEngine {
             host_span_id,
             f32_id,
             f64_id,
+            sse_int_id,
+            sse_shift_id,
+            sse_pshufb_lo_id,
+            sse_pshufb_hi_id,
+            sse_fp_unop_id,
+            sse_fp_binop_id,
+            sse_cvt_id,
             lookup_id,
             ucrt: UcrtImportIds {
                 malloc,
@@ -1842,7 +2428,7 @@ impl CpuEngine for JitCpu {
     }
 
     fn cpu_stats(&self) -> Option<crate::JitStats> {
-        Some(self.stats)
+        Some(self.stats())
     }
 
     fn mem_backend_name(&self) -> &'static str {
@@ -1943,6 +2529,13 @@ impl CpuEngine for JitCpu {
                         value: 0,
                     },
                 });
+            }
+            // Pick up background-installed Ready blocks into this thread's
+            // chain table (cheap relaxed load; resync only after an install).
+            let epoch = self.shared.cache_epoch.load(Ordering::Relaxed);
+            if epoch != self.chain_sync_epoch {
+                self.chain_sync_epoch = epoch;
+                self.resync_chain_table();
             }
             // Hot chain: run consecutive Ready blocks without re-entering step_one.
             let mut chain_result = None;
@@ -2423,5 +3016,689 @@ mod tests {
         assert!(!cpu.has_ready_at(a));
         assert!(!cpu.has_ready_at(b));
         assert!(cpu.shared.code_pages.lock().unwrap().is_empty());
+    }
+
+    // --- Background compiler (B10) ---
+
+    #[test]
+    fn bg_worker_end_to_end_step() {
+        // Force the background path on for this engine only (parallel tests
+        // keep their own inline default).
+        let mut cpu = JitCpu::open_x86_64();
+        cpu.shared.bg_force.store(true, Ordering::Relaxed);
+        let base = 0x1020_0000_u64;
+        cpu.virtual_alloc(
+            base,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT,
+            protect::PAGE_EXECUTE_READWRITE,
+        )
+        .expect("alloc");
+        // `mov eax, 0x2a; nop` then `ud2` — a 2-insn pure fallthrough block.
+        // The trailing `ud2` stops the linear decode (zero-filled pages would
+        // otherwise decode as `add [rax],al` for the full 96-insn budget).
+        cpu.mem_write(base, &[0xb8, 0x2a, 0x00, 0x00, 0x00, 0x90, 0x0f, 0x0b])
+            .expect("write");
+        cpu.write_rip(base).expect("rip");
+
+        // Eager first visit (hotness 0 in tests): enqueue + wait + run compiled.
+        // The block may run via the worker's Ready install OR the inline
+        // fallback if the worker misses the wait budget — both produce the same
+        // executed code, so only the outcomes are asserted.
+        let (result, _retired) = cpu.step_one().expect("step");
+        assert!(matches!(result, StepResult::Continue));
+        assert_eq!(cpu.thread.regs.rax(), 0x2a);
+        assert!(cpu.has_ready_at(base), "a Ready block must be installed");
+        // The worker processes the queued job regardless of who won the race;
+        // poll (bounded) for its install so the shared counters are settled.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while cpu.stats().bg_compiles < 1 {
+            assert!(Instant::now() < deadline, "worker install timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(cpu.shared.chain_ids.read().unwrap().contains_key(&base));
+        assert!(
+            cpu.shared.cache_epoch.load(Ordering::Relaxed) >= 1,
+            "worker install must bump the chain-sync epoch"
+        );
+        assert!(
+            cpu.shared
+                .pending_code_writes
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|page| *page != base >> 12),
+            "a fresh compile must not leave a pending SMC page"
+        );
+        // Chain-table re-sync picks the worker-installed block up.
+        cpu.chain_sync_epoch = 0;
+        cpu.resync_chain_table();
+        assert!(
+            cpu.thread
+                .chain_slots
+                .iter()
+                .any(|s| s.va == base && s.fn_ptr != 0),
+            "resync must chain worker-installed blocks"
+        );
+    }
+
+    #[test]
+    fn bg_worker_notpure_becomes_never() {
+        let mut cpu = JitCpu::open_x86_64();
+        cpu.shared.bg_force.store(true, Ordering::Relaxed);
+        let base = 0x1021_0000_u64;
+        let outcome = cpu.enqueue_bg(base, &BlockKind::NotPure);
+        assert!(matches!(outcome, BgEnqueueOutcome::Unavailable));
+        assert!(matches!(
+            cpu.shared.cache.read().unwrap().get(&base),
+            Some(CacheEntry::Never)
+        ));
+    }
+
+    #[test]
+    fn bg_wait_returns_none_without_worker() {
+        // No worker spawned (fresh engine, nothing enqueued): waiting must
+        // return immediately so the caller falls back to inline compilation.
+        let mut cpu = JitCpu::open_x86_64();
+        let cell = BgWaitCell::new();
+        let r = cpu.wait_bg_ready(0x1022_0000_u64, &cell);
+        assert!(r.is_none());
+        assert_eq!(cpu.stats().compile_stall_fallback, 0);
+    }
+
+    #[test]
+    fn bg_worker_dedups_queued_entry() {
+        let mut cpu = JitCpu::open_x86_64();
+        cpu.shared.bg_force.store(true, Ordering::Relaxed);
+        let base = 0x1023_0000_u64;
+        cpu.virtual_alloc(
+            base,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT,
+            protect::PAGE_EXECUTE_READWRITE,
+        )
+        .expect("alloc");
+        cpu.mem_write(base, &[0xb8, 0x2a, 0x00, 0x00, 0x00, 0x90, 0x0f, 0x0b])
+            .expect("write");
+        let kind = {
+            let mem = cpu.shared.mem.read().unwrap();
+            block::decode_pure_gpr_block(&mem, cpu.thread.hooks.as_ref(), base)
+        };
+        assert!(matches!(kind, BlockKind::Pure { .. }));
+        let first = cpu.enqueue_bg(base, &kind);
+        assert!(matches!(first, BgEnqueueOutcome::Queued(_)));
+        // A second enqueue of the same rip must not re-queue: either the entry
+        // is still Queued (dedup → Unavailable) or the worker already won
+        // (Ready). Never a fresh Queued cell.
+        let second = cpu.enqueue_bg(base, &kind);
+        assert!(
+            matches!(
+                second,
+                BgEnqueueOutcome::Unavailable | BgEnqueueOutcome::Ready
+            ),
+            "re-enqueue of a queued rip must not re-queue"
+        );
+    }
+
+    // --- B4: integer-SIMD JIT family — iced vs JIT dual-path gates ---
+    //
+    // Every newly-lowered SSE2 mnemonic runs once on the iced interpreter
+    // (reference) and once through a compiled JIT block with identical guest
+    // state; the two register files must match exactly (GPRs, XMMs, RFLAGS,
+    // RIP). The `has_ready_at` assertion guarantees the block actually went
+    // through Cranelift rather than silently falling back to iced.
+
+    use crate::IcedCpu;
+    use crate::exec::StepResult;
+    use crate::regs::rflags;
+    use iced_x86::{Decoder, DecoderOptions, Register};
+
+    const SIMD_BASE: u64 = 0x2000_0000;
+    const SIMD_DATA: u64 = SIMD_BASE + 0x1000;
+
+    /// Number of instructions `bytes` decodes to, stopping at the trailing
+    /// `ud2` terminator (test-encoding sanity).
+    fn decode_count(bytes: &[u8]) -> usize {
+        let mut dec = Decoder::with_ip(64, bytes, 0, DecoderOptions::NONE);
+        let mut n = 0;
+        while dec.position() < bytes.len() {
+            let insn = dec.decode();
+            assert!(
+                !insn.is_invalid(),
+                "invalid test encoding at {n}: {bytes:02x?}"
+            );
+            if insn.mnemonic() == iced_x86::Mnemonic::Ud2 {
+                break;
+            }
+            n += 1;
+        }
+        n
+    }
+
+    /// Run `code` (a single op; a trailing `nop; ud2` is appended to reach the
+    /// 2-insn compile minimum and to stop linear decode past our bytes — the
+    /// zero-filled tail would otherwise decode as `add [rax], al` and extend
+    /// the block, faulting on the unmapped address) on iced and the JIT with
+    /// identical guest state.
+    fn simd_dual(code: &[u8], data: &[u8], setup: impl Fn(&mut RegFile)) -> (RegFile, RegFile) {
+        let mut full = Vec::with_capacity(code.len() + 3);
+        full.extend_from_slice(code);
+        full.extend_from_slice(&[0x90, 0x0f, 0x0b]); // nop filler + ud2 terminator
+        let n_insns = decode_count(&full);
+
+        // --- iced reference ---
+        // The iced decode cache is thread-local and keyed by (rip, mem_gen);
+        // fresh test CPUs all share mem_gen 0, so flush or a later case at the
+        // same base would decode the previous case's instruction.
+        crate::exec::iced_decode_cache_flush();
+        let mut iced = IcedCpu::open_x86_64();
+        iced.virtual_alloc(
+            SIMD_BASE,
+            0x2000,
+            MEM_RESERVE | MEM_COMMIT,
+            protect::PAGE_EXECUTE_READWRITE,
+        )
+        .expect("iced alloc");
+        iced.mem_write(SIMD_BASE, &full).expect("iced code");
+        iced.mem_write(SIMD_DATA, data).expect("iced data");
+        setup(iced.regs_mut());
+        iced.write_rip(SIMD_BASE).expect("iced rip");
+        for _ in 0..n_insns {
+            iced.step_once().expect("iced step");
+        }
+
+        // --- JIT (eager compile: hotness is 0 under cfg(test)) ---
+        let mut cpu = JitCpu::open_x86_64();
+        cpu.virtual_alloc(
+            SIMD_BASE,
+            0x2000,
+            MEM_RESERVE | MEM_COMMIT,
+            protect::PAGE_EXECUTE_READWRITE,
+        )
+        .expect("jit alloc");
+        cpu.mem_write(SIMD_BASE, &full).expect("jit code");
+        cpu.mem_write(SIMD_DATA, data).expect("jit data");
+        setup(&mut cpu.thread.regs);
+        cpu.write_rip(SIMD_BASE).expect("jit rip");
+        let (result, _retired) = cpu.step_one().expect("jit step");
+        assert!(
+            matches!(result, StepResult::Continue),
+            "jit result {result:?}"
+        );
+        assert!(
+            cpu.has_ready_at(SIMD_BASE),
+            "block must compile, not run iced"
+        );
+        assert_eq!(
+            cpu.stats().iced_insns,
+            0,
+            "block ran on iced instead of JIT"
+        );
+
+        (iced.regs().clone(), cpu.thread.regs.clone())
+    }
+
+    fn assert_same_regs(iced: &RegFile, jit: &RegFile, what: &str) {
+        for i in 0..16 {
+            assert_eq!(iced.gpr(i), jit.gpr(i), "{what}: gpr[{i}]");
+            assert_eq!(iced.xmm_at(i), jit.xmm_at(i), "{what}: xmm[{i}]");
+        }
+        assert_eq!(iced.rflags, jit.rflags, "{what}: rflags");
+        assert_eq!(iced.rip, jit.rip, "{what}: rip");
+    }
+
+    fn set_pair(regs: &mut RegFile, x0: u128, x1: u128) {
+        regs.write_xmm(Register::XMM0, x0).expect("xmm0");
+        regs.write_xmm(Register::XMM1, x1).expect("xmm1");
+    }
+
+    #[test]
+    fn simd_packed_arith_matches_iced() {
+        // Carry / borrow / sign patterns across every lane width.
+        let x0 = 0xF1E2_D3C4_B5A6_9788_7766_5544_3322_1100_u128;
+        let x1 = 0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10_u128;
+        for (name, bytes) in [
+            ("paddb", &[0x66, 0x0f, 0xfc, 0xc1][..]),
+            ("paddw", &[0x66, 0x0f, 0xfd, 0xc1][..]),
+            ("paddd", &[0x66, 0x0f, 0xfe, 0xc1][..]),
+            ("paddq", &[0x66, 0x0f, 0xd4, 0xc1][..]),
+            ("psubb", &[0x66, 0x0f, 0xf8, 0xc1][..]),
+            ("psubw", &[0x66, 0x0f, 0xf9, 0xc1][..]),
+            ("psubd", &[0x66, 0x0f, 0xfa, 0xc1][..]),
+            ("psubq", &[0x66, 0x0f, 0xfb, 0xc1][..]),
+        ] {
+            let (iced, jit) = simd_dual(bytes, &[], |r| set_pair(r, x0, x1));
+            assert_same_regs(&iced, &jit, name);
+        }
+        // Hand-check PADDD (lane-wise 32-bit adds).
+        let a = 0x0000_0002_0000_0001_0000_0002_0000_0001_u128;
+        let b = 0x0000_0004_0000_0003_0000_0004_0000_0003_u128;
+        let (iced, jit) = simd_dual(&[0x66, 0x0f, 0xfe, 0xc1], &[], |r| set_pair(r, a, b));
+        let want = 0x0000_0006_0000_0004_0000_0006_0000_0004_u128;
+        assert_eq!(iced.xmm_at(0), want, "iced paddd");
+        assert_eq!(jit.xmm_at(0), want, "jit paddd");
+    }
+
+    #[test]
+    fn simd_saturating_arith_matches_iced() {
+        // Signed/unsigned saturation edges: 0x7F+1, 0x80+0x80, 0x00-1, 0xFFFF+1.
+        let x0 = 0x0000_0000_0000_0000_7F7F_7F80_0100_807F_u128;
+        let x1 = 0x0000_0000_0000_0000_0101_0101_FFFF_8080_u128;
+        for (name, bytes) in [
+            ("paddsb", &[0x66, 0x0f, 0xec, 0xc1][..]),
+            ("paddsw", &[0x66, 0x0f, 0xed, 0xc1][..]),
+            ("paddusb", &[0x66, 0x0f, 0xdc, 0xc1][..]),
+            ("paddusw", &[0x66, 0x0f, 0xdd, 0xc1][..]),
+            ("psubsb", &[0x66, 0x0f, 0xe8, 0xc1][..]),
+            ("psubsw", &[0x66, 0x0f, 0xe9, 0xc1][..]),
+            ("psubusb", &[0x66, 0x0f, 0xd8, 0xc1][..]),
+            ("psubusw", &[0x66, 0x0f, 0xd9, 0xc1][..]),
+        ] {
+            let (iced, jit) = simd_dual(bytes, &[], |r| set_pair(r, x0, x1));
+            assert_same_regs(&iced, &jit, name);
+        }
+        // Hand-check PADDSB low byte: 0x7F + 0x01 → 0x7F (signed sat).
+        let a = 0x0000_0000_0000_0000_0000_0000_0000_007F_u128;
+        let b = 0x0000_0000_0000_0000_0000_0000_0000_0001_u128;
+        let (iced, jit) = simd_dual(&[0x66, 0x0f, 0xec, 0xc1], &[], |r| set_pair(r, a, b));
+        assert_eq!(iced.xmm_at(0) & 0xff, 0x7f, "iced paddsb sat");
+        assert_eq!(jit.xmm_at(0) & 0xff, 0x7f, "jit paddsb sat");
+        // PADDUSB: 0xFF + 0x01 → 0xFF (unsigned sat).
+        let a = 0x0000_0000_0000_0000_0000_0000_0000_00FF_u128;
+        let (iced, jit) = simd_dual(&[0x66, 0x0f, 0xdc, 0xc1], &[], |r| set_pair(r, a, b));
+        assert_eq!(iced.xmm_at(0) & 0xff, 0xff, "iced paddusb sat");
+        assert_eq!(jit.xmm_at(0) & 0xff, 0xff, "jit paddusb sat");
+    }
+
+    #[test]
+    fn simd_multiply_matches_iced() {
+        let x0 = 0x0001_0002_0003_0004_0005_0006_0007_0008_u128;
+        let x1 = 0x8000_7FFF_0100_0200_1000_2000_4000_8000_u128;
+        for (name, bytes) in [
+            ("pmullw", &[0x66, 0x0f, 0xd5, 0xc1][..]),
+            ("pmulhw", &[0x66, 0x0f, 0xe5, 0xc1][..]),
+            ("pmulhuw", &[0x66, 0x0f, 0xe4, 0xc1][..]),
+            ("pmuludq", &[0x66, 0x0f, 0xf4, 0xc1][..]),
+            ("pmaddwd", &[0x66, 0x0f, 0xf5, 0xc1][..]),
+        ] {
+            let (iced, jit) = simd_dual(bytes, &[], |r| set_pair(r, x0, x1));
+            assert_same_regs(&iced, &jit, name);
+        }
+        // Hand-check PMULUDQ: qword0 = dword0(a)*dword0(b), qword1 = dword2.
+        let a = 0x0000_0000_0000_0002_0000_0000_0000_0003_u128;
+        let b = 0x0000_0000_0000_0004_0000_0000_0000_0005_u128;
+        let (iced, jit) = simd_dual(&[0x66, 0x0f, 0xf4, 0xc1], &[], |r| set_pair(r, a, b));
+        let want = 0x0000_0000_0000_0008_0000_0000_0000_000F_u128;
+        assert_eq!(iced.xmm_at(0), want, "iced pmuludq");
+        assert_eq!(jit.xmm_at(0), want, "jit pmuludq");
+    }
+
+    #[test]
+    fn simd_compare_matches_iced() {
+        let x0 = 0x8180_7F00_0100_FFFF_807F_0001_8000_7FFF_u128;
+        let x1 = 0x7F7F_7F7F_0101_FFFF_8080_0000_7FFF_8000_u128;
+        for (name, bytes) in [
+            ("pcmpeqb", &[0x66, 0x0f, 0x74, 0xc1][..]),
+            ("pcmpeqw", &[0x66, 0x0f, 0x75, 0xc1][..]),
+            ("pcmpeqd", &[0x66, 0x0f, 0x76, 0xc1][..]),
+            ("pcmpgtb", &[0x66, 0x0f, 0x64, 0xc1][..]),
+            ("pcmpgtw", &[0x66, 0x0f, 0x65, 0xc1][..]),
+            ("pcmpgtd", &[0x66, 0x0f, 0x66, 0xc1][..]),
+        ] {
+            let (iced, jit) = simd_dual(bytes, &[], |r| set_pair(r, x0, x1));
+            assert_same_regs(&iced, &jit, name);
+        }
+        // Hand-check PCMPGTD: 0x8000_0000 > 0x7FFF_FFFF is false (signed).
+        let a = 0x0000_0000_0000_0000_0000_0000_8000_0000_u128;
+        let b = 0x0000_0000_0000_0000_0000_0000_7FFF_FFFF_u128;
+        let (iced, jit) = simd_dual(&[0x66, 0x0f, 0x66, 0xc1], &[], |r| set_pair(r, a, b));
+        assert_eq!(iced.xmm_at(0) & 0xffff_ffff, 0, "iced pcmpgtd signed");
+        assert_eq!(jit.xmm_at(0) & 0xffff_ffff, 0, "jit pcmpgtd signed");
+    }
+
+    #[test]
+    fn simd_shifts_matches_iced() {
+        let x0 = 0xF0E0_D0C0_B0A0_9080_7060_5040_3020_1000_u128;
+        // imm forms: dst xmm0, imm8 = 5.
+        for (name, bytes) in [
+            ("psllw imm", &[0x66, 0x0f, 0x71, 0xf0, 0x05][..]),
+            ("pslld imm", &[0x66, 0x0f, 0x72, 0xf0, 0x05][..]),
+            ("psllq imm", &[0x66, 0x0f, 0x73, 0xf0, 0x05][..]),
+            ("psrlw imm", &[0x66, 0x0f, 0x71, 0xd0, 0x05][..]),
+            ("psrld imm", &[0x66, 0x0f, 0x72, 0xd0, 0x05][..]),
+            ("psrlq imm", &[0x66, 0x0f, 0x73, 0xd0, 0x05][..]),
+            ("psraw imm", &[0x66, 0x0f, 0x71, 0xe0, 0x05][..]),
+            ("psrad imm", &[0x66, 0x0f, 0x72, 0xe0, 0x05][..]),
+        ] {
+            let (iced, jit) = simd_dual(bytes, &[], |r| set_pair(r, x0, 0));
+            assert_same_regs(&iced, &jit, name);
+        }
+        // variable forms: count lanes in xmm1.
+        let cnt = 0x0000_0000_0000_0000_0004_0000_0010_0010_u128;
+        for (name, bytes) in [
+            ("psllw var", &[0x66, 0x0f, 0xf1, 0xc1][..]),
+            ("pslld var", &[0x66, 0x0f, 0xf2, 0xc1][..]),
+            ("psllq var", &[0x66, 0x0f, 0xf3, 0xc1][..]),
+            ("psrlw var", &[0x66, 0x0f, 0xd1, 0xc1][..]),
+            ("psrld var", &[0x66, 0x0f, 0xd2, 0xc1][..]),
+            ("psrlq var", &[0x66, 0x0f, 0xd3, 0xc1][..]),
+            ("psraw var", &[0x66, 0x0f, 0xe1, 0xc1][..]),
+            ("psrad var", &[0x66, 0x0f, 0xe2, 0xc1][..]),
+        ] {
+            let (iced, jit) = simd_dual(bytes, &[], |r| set_pair(r, x0, cnt));
+            assert_same_regs(&iced, &jit, name);
+        }
+        // Hand-check PSRLD imm 4: 0x0000_0000_1000_0000 → 0x0000_0000_0100_0000.
+        let a = 0x0000_0000_0000_0000_0000_0000_1000_0000_u128;
+        let (iced, jit) = simd_dual(&[0x66, 0x0f, 0x72, 0xd0, 0x04], &[], |r| set_pair(r, a, 0));
+        assert_eq!(iced.xmm_at(0) & 0xffff_ffff, 0x0100_0000, "iced psrld");
+        assert_eq!(jit.xmm_at(0) & 0xffff_ffff, 0x0100_0000, "jit psrld");
+        // Oversized count (32 ≥ 32) → 0 per x86.
+        let big = 0x0020_0020_0020_0020_0020_0020_0020_0020_u128;
+        let (iced, jit) = simd_dual(&[0x66, 0x0f, 0xf2, 0xc1], &[], |r| set_pair(r, x0, big));
+        assert_eq!(iced.xmm_at(0), 0, "iced pslld big-count zeroes");
+        assert_eq!(jit.xmm_at(0), 0, "jit pslld big-count zeroes");
+    }
+
+    #[test]
+    fn simd_pack_unpack_matches_iced() {
+        let x0 = 0x807F_FF00_1234_5678_0001_FFFF_8000_7FFF_u128;
+        let x1 = 0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10_u128;
+        for (name, bytes) in [
+            ("packsswb", &[0x66, 0x0f, 0x63, 0xc1][..]),
+            ("packssdw", &[0x66, 0x0f, 0x6b, 0xc1][..]),
+            ("packuswb", &[0x66, 0x0f, 0x67, 0xc1][..]),
+            ("punpcklbw", &[0x66, 0x0f, 0x60, 0xc1][..]),
+            ("punpcklwd", &[0x66, 0x0f, 0x61, 0xc1][..]),
+            ("punpckldq", &[0x66, 0x0f, 0x62, 0xc1][..]),
+            ("punpcklqdq", &[0x66, 0x0f, 0x6c, 0xc1][..]),
+            ("punpckhbw", &[0x66, 0x0f, 0x68, 0xc1][..]),
+            ("punpckhwd", &[0x66, 0x0f, 0x69, 0xc1][..]),
+            ("punpckhdq", &[0x66, 0x0f, 0x6a, 0xc1][..]),
+            ("punpckhqdq", &[0x66, 0x0f, 0x6d, 0xc1][..]),
+        ] {
+            let (iced, jit) = simd_dual(bytes, &[], |r| set_pair(r, x0, x1));
+            assert_same_regs(&iced, &jit, name);
+        }
+        // Hand-check PUNPCKLBW low bytes: [a0,b0,a1,b1,a2,b2,a3,b3].
+        let a = 0x0000_0000_0000_0000_0000_0000_0000_0000_u128;
+        let b = 0x0000_0000_0000_0000_0000_0000_0000_0000_u128;
+        let a = a | 0x0000_0000_0000_0000_0000_0000_0403_0201_u128;
+        let b = b | 0x0000_0000_0000_0000_0000_0000_0807_0605_u128;
+        let (iced, jit) = simd_dual(&[0x66, 0x0f, 0x60, 0xc1], &[], |r| set_pair(r, a, b));
+        let want = 0x0000_0000_0000_0000_0804_0703_0602_0501_u128;
+        assert_eq!(iced.xmm_at(0), want, "iced punpcklbw");
+        assert_eq!(jit.xmm_at(0), want, "jit punpcklbw");
+        // Hand-check PACKSSWB: word 0x8000 saturates to byte 0x80.
+        let a = 0x0000_0000_0000_0000_0000_0000_0000_8000_u128;
+        let (iced, jit) = simd_dual(&[0x66, 0x0f, 0x63, 0xc1], &[], |r| set_pair(r, a, 0));
+        assert_eq!(iced.xmm_at(0) & 0xff, 0x80, "iced packsswb");
+        assert_eq!(jit.xmm_at(0) & 0xff, 0x80, "jit packsswb");
+    }
+
+    #[test]
+    fn simd_shuffles_match_iced() {
+        let x0 = 0x1122_3344_5566_7788_99AA_BBCC_DDEE_FF00_u128;
+        let x1 = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF_u128;
+        for (name, bytes) in [
+            ("pshufd", &[0x66, 0x0f, 0x70, 0xc1, 0x1b][..]),
+            ("pshuflw", &[0xf2, 0x0f, 0x70, 0xc1, 0x1b][..]),
+            ("pshufhw", &[0xf3, 0x0f, 0x70, 0xc1, 0x1b][..]),
+        ] {
+            let (iced, jit) = simd_dual(bytes, &[], |r| set_pair(r, x0, x1));
+            assert_same_regs(&iced, &jit, name);
+        }
+        // Hand-check PSHUFD imm 0x1B = [3,2,1,0] (reverse dwords).
+        let a = 0x0000_0001_0000_0002_0000_0003_0000_0004_u128;
+        let (iced, jit) = simd_dual(&[0x66, 0x0f, 0x70, 0xc1, 0x1b], &[], |r| set_pair(r, 0, a));
+        let want = 0x0000_0004_0000_0003_0000_0002_0000_0001_u128;
+        assert_eq!(iced.xmm_at(0), want, "iced pshufd");
+        assert_eq!(jit.xmm_at(0), want, "jit pshufd");
+        // Hand-check PSHUFB with mask 0x10 repeated → table[0] per byte.
+        let table = 0x0100_0000_0000_0000_0000_0000_0000_0042_u128;
+        let mask = 0x1010_1010_1010_1010_1010_1010_1010_1010_u128;
+        let (iced, jit) = simd_dual(&[0x66, 0x0f, 0x38, 0x00, 0xc1], &[], |r| {
+            set_pair(r, table, mask);
+        });
+        assert_eq!(
+            iced.xmm_at(0),
+            0x4242_4242_4242_4242_4242_4242_4242_4242,
+            "iced pshufb"
+        );
+        assert_eq!(
+            jit.xmm_at(0),
+            0x4242_4242_4242_4242_4242_4242_4242_4242,
+            "jit pshufb"
+        );
+        // Bit-7 in the mask → 0 for that byte.
+        let mask = 0x8080_8080_8080_8080_8080_8080_8080_8080_u128;
+        let (iced, jit) = simd_dual(&[0x66, 0x0f, 0x38, 0x00, 0xc1], &[], |r| {
+            set_pair(r, table, mask);
+        });
+        assert_eq!(iced.xmm_at(0), 0, "iced pshufb bit7 zeroes");
+        assert_eq!(jit.xmm_at(0), 0, "jit pshufb bit7 zeroes");
+    }
+
+    #[test]
+    fn simd_converts_match_iced() {
+        // cvtsi2ss/cvtsi2sd from r32/r64.
+        for (name, bytes) in [
+            ("cvtsi2ss r32", &[0xf3, 0x0f, 0x2a, 0xc1][..]),
+            ("cvtsi2ss r64", &[0xf3, 0x48, 0x0f, 0x2a, 0xc1][..]),
+            ("cvtsi2sd r32", &[0xf2, 0x0f, 0x2a, 0xc1][..]),
+            ("cvtsi2sd r64", &[0xf2, 0x48, 0x0f, 0x2a, 0xc1][..]),
+        ] {
+            let (iced, jit) = simd_dual(bytes, &[], |r| {
+                set_pair(r, 0, 0);
+                r.set_gpr_public(1, 0x0000_0000_0000_00FF); // RCX = 255
+            });
+            assert_same_regs(&iced, &jit, name);
+        }
+        // FP → int (both widths, truncating and rounding).
+        for (name, bytes) in [
+            ("cvttss2si r32", &[0xf3, 0x0f, 0x2c, 0xc0][..]),
+            ("cvttss2si r64", &[0xf3, 0x48, 0x0f, 0x2c, 0xc0][..]),
+            ("cvtss2si r32", &[0xf3, 0x0f, 0x2d, 0xc0][..]),
+            ("cvttsd2si r64", &[0xf2, 0x48, 0x0f, 0x2c, 0xc0][..]),
+            ("cvtsd2si r32", &[0xf2, 0x0f, 0x2d, 0xc0][..]),
+        ] {
+            let (iced, jit) = simd_dual(bytes, &[], |r| {
+                let bits = 42.75_f32.to_bits();
+                set_pair(r, u128::from(bits), 0);
+                r.set_gpr_public(0, 0);
+            });
+            assert_same_regs(&iced, &jit, name);
+        }
+        // Hand-check CVTTSS2SI: 42.75 → 42 (truncate).
+        let (iced, jit) = simd_dual(&[0xf3, 0x0f, 0x2c, 0xc0], &[], |r| {
+            set_pair(r, u128::from(42.75_f32.to_bits()), 0);
+            r.set_gpr_public(0, 0xdead_beef);
+        });
+        assert_eq!(iced.gpr(0), 42, "iced cvttss2si");
+        assert_eq!(jit.gpr(0), 42, "jit cvttss2si");
+        // Hand-check CVTTSS2SI on NaN → INT_MIN (0x80000000), 32-bit write zero-extends.
+        let (iced, jit) = simd_dual(&[0xf3, 0x0f, 0x2c, 0xc0], &[], |r| {
+            set_pair(r, u128::from(f32::NAN.to_bits()), 0);
+            r.set_gpr_public(0, 0);
+        });
+        assert_eq!(iced.gpr(0), 0x8000_0000, "iced cvttss2si nan");
+        assert_eq!(jit.gpr(0), 0x8000_0000, "jit cvttss2si nan");
+        // Packed converts.
+        for (name, bytes) in [
+            ("cvtps2dq", &[0x66, 0x0f, 0x5b, 0xc1][..]),
+            ("cvtdq2ps", &[0x0f, 0x5b, 0xc1][..]),
+            ("cvttps2dq", &[0xf3, 0x0f, 0x5b, 0xc1][..]),
+        ] {
+            let (iced, jit) = simd_dual(bytes, &[], |r| {
+                // four f32 lanes: 1.5, -2.5, 3.0, 4.25
+                let f0 = 1.5_f32.to_bits();
+                let f1 = (-2.5_f32).to_bits();
+                let f2 = 3.0_f32.to_bits();
+                let f3 = 4.25_f32.to_bits();
+                let v = u128::from(f0)
+                    | (u128::from(f1) << 32)
+                    | (u128::from(f2) << 64)
+                    | (u128::from(f3) << 96);
+                set_pair(r, v, 0);
+            });
+            assert_same_regs(&iced, &jit, name);
+        }
+    }
+
+    #[test]
+    fn simd_fp_minmax_sqrt_match_iced() {
+        let x0 = 0x3FF0_0000_0000_0000_3FE0_0000_3FC0_0000_u128;
+        let x1 = 0x4000_0000_0000_0000_4000_0000_3F80_0000_u128;
+        for (name, bytes) in [
+            ("sqrtss", &[0xf3, 0x0f, 0x51, 0xc1][..]),
+            ("sqrtsd", &[0xf2, 0x0f, 0x51, 0xc1][..]),
+            ("sqrtps", &[0x0f, 0x51, 0xc1][..]),
+            ("sqrtpd", &[0x66, 0x0f, 0x51, 0xc1][..]),
+            ("minss", &[0xf3, 0x0f, 0x5d, 0xc1][..]),
+            ("minsd", &[0xf2, 0x0f, 0x5d, 0xc1][..]),
+            ("minps", &[0x0f, 0x5d, 0xc1][..]),
+            ("minpd", &[0x66, 0x0f, 0x5d, 0xc1][..]),
+            ("maxss", &[0xf3, 0x0f, 0x5f, 0xc1][..]),
+            ("maxsd", &[0xf2, 0x0f, 0x5f, 0xc1][..]),
+            ("maxps", &[0x0f, 0x5f, 0xc1][..]),
+            ("maxpd", &[0x66, 0x0f, 0x5f, 0xc1][..]),
+        ] {
+            let (iced, jit) = simd_dual(bytes, &[], |r| set_pair(r, x0, x1));
+            assert_same_regs(&iced, &jit, name);
+        }
+        // Hand-check SQRTSS of 4.0 → 2.0.
+        let a = 0x0000_0000_0000_0000_0000_0000_0000_0000_u128;
+        let b = 0x0000_0000_0000_0000_0000_0000_0000_0000_u128;
+        let a = a | u128::from(123.456_f32.to_bits());
+        let b = b | u128::from(4.0_f32.to_bits());
+        let (iced, jit) = simd_dual(&[0xf3, 0x0f, 0x51, 0xc1], &[], |r| set_pair(r, a, b));
+        let want = u64::from(2.0_f32.to_bits());
+        assert_eq!(
+            iced.xmm_at(0) & 0xffff_ffff,
+            u128::from(want),
+            "iced sqrtss"
+        );
+        assert_eq!(jit.xmm_at(0) & 0xffff_ffff, u128::from(want), "jit sqrtss");
+        // MINSS with a NaN operand returns the source (x86 semantics).
+        let nan = u128::from(f32::NAN.to_bits());
+        let (iced, jit) = simd_dual(&[0xf3, 0x0f, 0x5d, 0xc1], &[], |r| set_pair(r, a | nan, b));
+        let lo = iced.xmm_at(0) & 0xffff_ffff;
+        assert_eq!(lo, b & 0xffff_ffff, "iced minss nan→src");
+        let lo = jit.xmm_at(0) & 0xffff_ffff;
+        assert_eq!(lo, b & 0xffff_ffff, "jit minss nan→src");
+    }
+
+    #[test]
+    fn simd_comis_sets_flags_like_iced() {
+        let a32 = u128::from(1.0_f32.to_bits());
+        let b32 = u128::from(2.0_f32.to_bits());
+        for (name, bytes) in [
+            ("comiss", &[0x0f, 0x2f, 0xc1][..]),
+            ("ucomiss", &[0x0f, 0x2e, 0xc1][..]),
+            ("comisd", &[0x66, 0x0f, 0x2f, 0xc1][..]),
+            ("ucomisd", &[0x66, 0x0f, 0x2e, 0xc1][..]),
+        ] {
+            // Pre-set CF so we can see it being cleared.
+            let (iced, jit) = simd_dual(bytes, &[], |r| {
+                set_pair(r, a32, b32);
+                r.rflags = rflags::ALWAYS1 | rflags::CF;
+            });
+            assert_same_regs(&iced, &jit, name);
+            // a < b → CF=1, ZF=0, PF=0, OF/AF/SF=0.
+            assert!(iced.flag(rflags::CF), "{name} iced CF");
+            assert!(!iced.flag(rflags::ZF), "{name} iced ZF");
+            assert!(!iced.flag(rflags::OF), "{name} iced OF");
+            assert!(jit.flag(rflags::CF), "{name} jit CF");
+            assert!(!jit.flag(rflags::ZF), "{name} jit ZF");
+            assert!(!jit.flag(rflags::OF), "{name} jit OF");
+        }
+        // a == b → ZF=1, CF=0, PF=0.
+        let (iced, jit) = simd_dual(&[0x0f, 0x2f, 0xc1], &[], |r| set_pair(r, b32, b32));
+        assert!(iced.flag(rflags::ZF), "iced eq ZF");
+        assert!(!iced.flag(rflags::CF), "iced eq CF");
+        assert!(jit.flag(rflags::ZF), "jit eq ZF");
+        assert!(!jit.flag(rflags::CF), "jit eq CF");
+        // NaN → unordered: ZF=PF=CF=1.
+        let (iced, jit) = simd_dual(&[0x0f, 0x2f, 0xc1], &[], |r| {
+            set_pair(r, u128::from(f32::NAN.to_bits()), b32);
+        });
+        assert!(iced.flag(rflags::PF), "iced nan PF");
+        assert!(iced.flag(rflags::CF), "iced nan CF");
+        assert!(jit.flag(rflags::PF), "jit nan PF");
+        assert!(jit.flag(rflags::CF), "jit nan CF");
+    }
+
+    #[test]
+    fn simd_movq_movd_gpr_bridge_matches_iced() {
+        let x = 0x8899_AABB_CCDD_EEFF_0011_2233_4455_6677_u128;
+        for (name, bytes) in [
+            ("movq xmm,r64", &[0x66, 0x48, 0x0f, 0x6e, 0xc1][..]),
+            ("movq r64,xmm", &[0x66, 0x48, 0x0f, 0x7e, 0xc1][..]),
+            ("movd xmm,r32", &[0x66, 0x0f, 0x6e, 0xc1][..]),
+            ("movd r32,xmm", &[0x66, 0x0f, 0x7e, 0xc1][..]),
+        ] {
+            let (iced, jit) = simd_dual(bytes, &[], |r| {
+                set_pair(r, x, 0);
+                r.set_gpr_public(1, 0x1234_5678_9ABC_DEF0); // RCX
+            });
+            assert_same_regs(&iced, &jit, name);
+        }
+        // Hand-check MOVQ xmm,r64: low qword moved, high 64 zeroed.
+        let (iced, jit) = simd_dual(&[0x66, 0x48, 0x0f, 0x6e, 0xc1], &[], |r| {
+            set_pair(r, u128::MAX, 0);
+            r.set_gpr_public(1, 0x0011_2233_4455_6677);
+        });
+        let want = 0x0000_0000_0000_0000_0011_2233_4455_6677_u128;
+        assert_eq!(iced.xmm_at(0), want, "iced movq zeroes hi");
+        assert_eq!(jit.xmm_at(0), want, "jit movq zeroes hi");
+        // Hand-check MOVQ r64,xmm: low qword extracted.
+        let (iced, jit) = simd_dual(&[0x66, 0x48, 0x0f, 0x7e, 0xc1], &[], |r| {
+            set_pair(r, 0x8899_AABB_CCDD_EEFF_0011_2233_4455_6677, 0);
+            r.set_gpr_public(1, 0);
+        });
+        assert_eq!(iced.gpr(1), 0x0011_2233_4455_6677, "iced movq extract");
+        assert_eq!(jit.gpr(1), 0x0011_2233_4455_6677, "jit movq extract");
+        // MOVD zero-extends 32 bits.
+        let (iced, jit) = simd_dual(&[0x66, 0x0f, 0x6e, 0xc1], &[], |r| {
+            set_pair(r, u128::MAX, 0);
+            r.set_gpr_public(1, 0x1234_5678_9ABC_DEF0);
+        });
+        let want = 0x0000_0000_0000_0000_0000_0000_9ABC_DEF0_u128;
+        assert_eq!(iced.xmm_at(0), want, "iced movd zero-extends");
+        assert_eq!(jit.xmm_at(0), want, "jit movd zero-extends");
+    }
+
+    #[test]
+    fn simd_memory_operands_match_iced() {
+        let data = 0x0001_0002_0003_0004_0005_0006_0007_0008_u128.to_le_bytes();
+        for (name, bytes) in [
+            ("paddd [rax]", &[0x66, 0x0f, 0xfe, 0x00][..]),
+            ("pshufb [rax]", &[0x66, 0x0f, 0x38, 0x00, 0x00][..]),
+            ("comiss [rax]", &[0x0f, 0x2f, 0x00][..]),
+            ("cvtsi2ss [rax]", &[0xf3, 0x0f, 0x2a, 0x00][..]),
+        ] {
+            let (iced, jit) = simd_dual(bytes, &data, |r| {
+                set_pair(r, 0x0000_0004_0000_0003_0000_0002_0000_0001, 0);
+                r.set_gpr_public(0, SIMD_DATA); // RAX = data base
+            });
+            assert_same_regs(&iced, &jit, name);
+        }
+        // Hand-check PADDD xmm0, [rax]: add dword0 of memory (0x00000001).
+        let a = 0x0000_0000_0000_0000_0000_0000_0000_0005_u128;
+        let data = 0x0000_0000_0000_0000_0000_0000_0000_0001_u128.to_le_bytes();
+        let (iced, jit) = simd_dual(&[0x66, 0x0f, 0xfe, 0x00], &data, |r| {
+            set_pair(r, a, 0);
+            r.set_gpr_public(0, SIMD_DATA);
+        });
+        assert_eq!(
+            iced.xmm_at(0),
+            0x0000_0000_0000_0000_0000_0000_0000_0006,
+            "iced paddd mem"
+        );
+        assert_eq!(
+            jit.xmm_at(0),
+            0x0000_0000_0000_0000_0000_0000_0000_0006,
+            "jit paddd mem"
+        );
     }
 }
