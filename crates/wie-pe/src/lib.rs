@@ -5,6 +5,9 @@ pub use goblin::pe::PE;
 use serde::Serialize;
 use std::path::Path;
 
+pub mod resources;
+pub use resources::{DialogItemTemplate, DialogTemplate, ItemClass, PixelRect};
+
 /// Loader identity of a PE64 image: fields the runtime must take from the file,
 /// not from Lunar Magic constants.
 ///
