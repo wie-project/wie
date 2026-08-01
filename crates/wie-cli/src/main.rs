@@ -1,6 +1,8 @@
 //! `wie-cli` — WIE PE64 userspace emulator CLI.
 
+mod bmp;
 mod commands;
+mod gui;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
@@ -81,6 +83,14 @@ enum Command {
         #[arg(long)]
         persistent: bool,
 
+        /// Show GUI window (requires `gui` feature).
+        #[arg(long)]
+        gui: bool,
+
+        /// Write screenshot to this file instead of showing a window.
+        #[arg(long)]
+        screenshot: Option<PathBuf>,
+
         /// Guest argv after the module name (`wie-cli run pe -- -n 3 -m hi`).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         guest_args: Vec<String>,
@@ -150,8 +160,29 @@ fn main() -> Result<()> {
             drive_d,
             stdin,
             persistent,
+            gui,
+            screenshot,
             guest_args,
         } => {
+            // GUI/screenshot mode takes precedence over persistent/micro.
+            if gui || screenshot.is_some() {
+                #[cfg(feature = "gui")]
+                {
+                    if gui {
+                        return gui::app::run_gui_windowed(&path);
+                    }
+                    if let Some(out_path) = screenshot {
+                        return gui::headless::run_screenshot(&path, &out_path);
+                    }
+                }
+                #[cfg(not(feature = "gui"))]
+                {
+                    bail!(
+                        "--gui/--screenshot require the `gui` feature: build with --features gui or --all-features"
+                    );
+                }
+            }
+
             if persistent {
                 let max = max_api.unwrap_or(3400);
                 if !guest_args.is_empty() {

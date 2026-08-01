@@ -5,6 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = ["gui"]
+gui = [
+    "dep:winit",
+    "dep:softbuffer",
+]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
@@ -16,3 +23,22 @@ wie-pe = { path = "../wie-pe" }
 wie-runtime = { path = "../wie-runtime" }
 wie-winapi = { path = "../wie-winapi" }
 wie-cpu = { path = "../wie-cpu" }
+
+# macOS-only policy: winit's default features enable the X11/Wayland backends
+# (Linux-only), which pull x11-dl, wayland-*, sctk, calloop, etc. into the
+# feature graph and lockfile. The macOS backend compiles unconditionally —
+# the only feature it needs is rwh_06 (raw-window-handle 0.6), which softbuffer
+# requires to construct its surface from winit's Window.
+winit = { version = "0.30", optional = true, default-features = false, features = ["rwh_06"] }
+# softbuffer's default features (kms/x11/x11-dlopen/wayland/wayland-dlopen) are
+# likewise Linux-only; the Apple backend is an unconditional target-gated dep.
+softbuffer = { version = "0.4", optional = true, default-features = false }
+
+# macOS application menu bar (guest window menu -> top bar). muda is a safe
+# wrapper over AppKit — no hand-written objc2 lives in this crate anymore.
+# macOS-only dep: muda 0.19.3 with default-features disabled has no Linux
+# backend (the gtk feature is required there, and it needs GTK3 system libs),
+# so gating keeps non-macOS builds clean. Its internal objc2 0.6.x line is
+# separate from winit's 0.5.2 and muda does not re-export objc2 types.
+[target.'cfg(target_os = "macos")'.dependencies]
+muda = { version = "0.19.3", default-features = false, features = [] }
