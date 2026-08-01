@@ -1,11 +1,17 @@
 use super::{
-    Context, FAKE_DESKTOP_WINDOW_HANDLE, FAKE_PROCESS_ID, FAKE_SYSTEM_COLOR_BRUSH_BASE,
-    FAKE_THREAD_ID, FAKE_WINDOW_HANDLE, HandlerContext, Result, WinApiHandlerResult, WinApiState,
-    WindowRecord, checked_field_address, get_window_long_ptr_value, is_known_window, low_i32,
-    read_guest_ansi_lossy, read_guest_i32, read_guest_u64, read_guest_utf16_lossy,
-    set_window_long_ptr_value, window_client_size, write_ansi_window_text, write_guest_i32,
-    write_guest_u32, write_wide_window_text, write_window_rect,
+    Context, CreateWindowRequest, FAKE_DESKTOP_WINDOW_HANDLE, FAKE_PROCESS_ID,
+    FAKE_SYSTEM_COLOR_BRUSH_BASE, FAKE_THREAD_ID, FAKE_WINDOW_HANDLE, GuestCallbackRequest,
+    HandlerContext, Result, WM_CREATE, WM_DESTROY, WM_KILLFOCUS, WM_PAINT, WM_SETFOCUS,
+    WinApiControlSignal, WinApiHandlerResult, WinApiState, WindowRecord, checked_field_address,
+    create_window_record, dispatch_control_proc, get_window_long_ptr_value, is_known_window,
+    low_i32, read_guest_ansi_lossy, read_guest_i32, read_guest_u64, read_guest_utf16_lossy,
+    read_window_class_identifier_a, read_window_class_identifier_w, set_window_long_ptr_value,
+    window_client_size, window_long_ptr_index, write_ansi_window_text, write_guest_ansi_c_string,
+    write_guest_i32, write_guest_u32, write_guest_u64, write_guest_utf16_c_string,
+    write_wide_window_text, write_window_rect,
 };
+use crate::OuterReturn;
+use crate::gdi32::{IRect, ancestor_offset};
 
 /// Handles `USER32.dll!GetWindowRect`.
 pub fn handle_get_window_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -170,11 +176,14 @@ pub fn handle_set_window_long_ptr_w(ctx: &mut HandlerContext<'_>) -> Result<WinA
 /// Handles `USER32.dll!IsWindow`.
 pub fn handle_is_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for IsWindow")?;
 
-    let return_value = u64::from(window_handle == FAKE_WINDOW_HANDLE);
+    // Any runtime-known window is a valid window — including child controls,
+    // not just the legacy fake top-level handle.
+    let return_value = u64::from(is_known_window(state, window_handle));
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -188,11 +197,16 @@ pub fn handle_is_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 /// Handles `USER32.dll!IsWindowVisible`.
 pub fn handle_is_window_visible(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for IsWindowVisible")?;
 
-    let return_value = u64::from(window_handle == FAKE_WINDOW_HANDLE);
+    let return_value = u64::from(if window_handle == FAKE_WINDOW_HANDLE {
+        state.window_state().window_visible
+    } else {
+        find_window(state, window_handle).is_some_and(|window| window.visible)
+    });
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -206,11 +220,16 @@ pub fn handle_is_window_visible(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 /// Handles `USER32.dll!IsWindowEnabled`.
 pub fn handle_is_window_enabled(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for IsWindowEnabled")?;
 
-    let return_value = u64::from(window_handle == FAKE_WINDOW_HANDLE);
+    let return_value = u64::from(if window_handle == FAKE_WINDOW_HANDLE {
+        state.window_state().window_enabled
+    } else {
+        find_window(state, window_handle).is_some_and(|window| window.enabled)
+    });
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -224,12 +243,12 @@ pub fn handle_is_window_enabled(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 /// Handles `USER32.dll!GetParent`.
 pub fn handle_get_parent(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _window_handle = engine
+    let state = &mut *ctx.state;
+    let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for GetParent")?;
 
-    // The current fake top-level window has no parent.
-    let return_value = 0;
+    let return_value = find_window(state, window_handle).map_or(0, |window| window.parent_handle);
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -288,6 +307,10 @@ pub fn handle_show_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         // SW_HIDE is zero. Other commands make the window visible in the
         // current single-window model.
         state.window_state().window_visible = show_command != 0;
+    } else if let Some(window) = find_window_mut(state, window_handle) {
+        // Real window records track their own visibility (used by the host
+        // mouse hit-test in `GuestHandle::window_at`).
+        window.visible = show_command != 0;
     }
 
     let return_value = u64::from(previously_visible);
@@ -389,9 +412,26 @@ pub fn handle_set_focus(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
         .context("failed to read RCX for SetFocus")?;
 
     let previous_window = state.window_state().focus_window_handle;
+    let accepted = window_handle == 0 || is_known_window(state, window_handle);
 
-    if window_handle == 0 || window_handle == FAKE_WINDOW_HANDLE {
+    if accepted {
         state.window_state().focus_window_handle = window_handle;
+    }
+
+    // Windows sends WM_KILLFOCUS(old, new) then WM_SETFOCUS(new, old) when
+    // the focus actually moves. Bridge synchronously (guest WndProcs) or
+    // host-side (controls) — see deliver_focus_change.
+    if accepted
+        && window_handle != previous_window
+        && let Some(signal) = deliver_focus_change(
+            state,
+            engine,
+            previous_window,
+            window_handle,
+            OuterReturn::Fixed(previous_window),
+        )?
+    {
+        return Err(signal.into());
     }
 
     let return_address = engine
@@ -402,6 +442,105 @@ pub fn handle_set_focus(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
         return_address,
         return_value: previous_window,
     })
+}
+
+/// Deliver the focus-change message pair (`WM_KILLFOCUS` to `old_focus`, then
+/// `WM_SETFOCUS` to `new_focus`) when the focus actually moved.
+///
+/// Control targets (host-side WndProc) are dispatched directly; a target with
+/// a guest WndProc or dialog proc must be bridged through the
+/// `GuestCallbackRequested` mechanism. The bridge is one-shot per API stop, so
+/// at most one of the two is bridged — the other is dispatched host-side or
+/// posted to the guest's queue (correct order, delivered before any input).
+///
+/// Returns the bridge signal when one is required (the caller returns it as
+/// `Err(..)`); `Ok(None)` means both were delivered and the caller completes
+/// normally.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn deliver_focus_change(
+    state: &mut WinApiState,
+    engine: &mut dyn wie_cpu::CpuEngine,
+    old_focus: u64,
+    new_focus: u64,
+    outer_return: OuterReturn,
+) -> Result<Option<WinApiControlSignal>> {
+    if old_focus == new_focus {
+        return Ok(None);
+    }
+
+    // WM_KILLFOCUS first (Windows order), then WM_SETFOCUS. KILLFOCUS gets the
+    // bridge slot when it needs one; a guest-WndProc SETFOCUS is then queued.
+    let mut bridged = None;
+    for (hwnd, message, wparam) in [
+        (old_focus, WM_KILLFOCUS, new_focus),
+        (new_focus, WM_SETFOCUS, old_focus),
+    ] {
+        if hwnd == 0 || !is_known_window(state, hwnd) {
+            continue;
+        }
+        let (window_proc, dialog_proc, dialog_unicode, unicode, is_control) = state
+            .window_state()
+            .windows
+            .iter()
+            .find(|w| w.handle == hwnd)
+            .map_or((0, 0, false, false, false), |w| {
+                (
+                    w.window_proc,
+                    w.dialog_proc,
+                    w.dialog_unicode,
+                    w.unicode,
+                    w.control_kind.is_some(),
+                )
+            });
+        if is_control {
+            // Host-side WndProc: update the control's focus state directly.
+            let _ = dispatch_control_proc(engine, state, hwnd, message, wparam, 0)?;
+            continue;
+        }
+        if window_proc == 0 && dialog_proc == 0 {
+            continue;
+        }
+        let callback_address = if window_proc != 0 {
+            window_proc
+        } else {
+            dialog_proc
+        };
+        let callback_unicode = if window_proc != 0 {
+            unicode
+        } else {
+            dialog_unicode
+        };
+        let request = GuestCallbackRequest {
+            callback_address,
+            window_handle: hwnd,
+            message,
+            word_parameter: wparam,
+            long_parameter: 0,
+            unicode: callback_unicode,
+            outer_return,
+        };
+        if bridged.is_none() {
+            bridged = Some(WinApiControlSignal::GuestCallbackRequested { request });
+        } else {
+            // The bridge is one-shot: post the second message so it arrives
+            // after the bridged one (queue order).
+            let mut queue = state.lock_message_queue();
+            let time = queue.next_message_time;
+            queue.next_message_time = time
+                .checked_add(1)
+                .context("focus-change message timestamp overflow")?;
+            queue.messages.push(super::QueuedWindowMessage {
+                window_handle: hwnd,
+                message,
+                word_parameter: wparam,
+                long_parameter: 0,
+                time,
+                point_x: 0,
+                point_y: 0,
+            });
+        }
+    }
+    Ok(bridged)
 }
 /// Handles `USER32.dll!GetFocus`.
 pub fn handle_get_focus(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -428,7 +567,9 @@ pub fn handle_set_capture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 
     let previous_window = state.window_state().capture_window_handle;
 
-    if window_handle == FAKE_WINDOW_HANDLE {
+    // SetCapture(NULL) releases; real windows (including child controls, whose
+    // WndProc captures implicitly while pressed) become the capture owner.
+    if window_handle == 0 || is_known_window(state, window_handle) {
         state.window_state().capture_window_handle = window_handle;
     }
 
@@ -481,13 +622,47 @@ pub fn handle_update_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         .read_rcx()
         .context("failed to read RCX for UpdateWindow")?;
 
-    let success = is_known_window(state, window_handle);
+    let (window_proc, unicode) = {
+        let windows = &state.window_state().windows;
+        windows
+            .iter()
+            .find(|window| window.handle == window_handle)
+            .map_or((0, false), |window| (window.window_proc, window.unicode))
+    };
 
-    if success {
-        state.window_state().window_invalidated = false;
+    if let Some(window) = find_window_mut(state, window_handle)
+        && window.invalidated
+    {
+        window.invalidated = false;
+
+        // UpdateWindow paints synchronously: erase the background first when
+        // the invalidation requested it and a class brush exists (the
+        // message-loop path synthesizes WM_ERASEBKGND ahead of WM_PAINT; here
+        // the erase runs inline, DefWindowProc semantics).
+        if window.erase_background {
+            super::message::erase_window_background(state, window_handle);
+        }
+
+        // Synchronous WM_PAINT: the runtime bridges into the guest WndProc
+        // and completes UpdateWindow with a fixed TRUE once it returns.
+        if window_proc != 0 {
+            return Err(WinApiControlSignal::GuestCallbackRequested {
+                request: GuestCallbackRequest {
+                    callback_address: window_proc,
+                    window_handle,
+                    message: WM_PAINT,
+                    word_parameter: 0,
+                    long_parameter: 0,
+                    unicode,
+                    outer_return: OuterReturn::Fixed(1),
+                },
+            }
+            .into());
+        }
     }
 
-    let return_value = u64::from(success);
+    // No update region or no guest WndProc: succeed without painting.
+    let return_value = 1;
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -506,18 +681,74 @@ pub fn handle_invalidate_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         .read_rcx()
         .context("failed to read RCX for InvalidateRect")?;
 
-    let _rect_ptr = engine
+    let rect_ptr = engine
         .read_rdx()
         .context("failed to read RDX for InvalidateRect")?;
 
-    let _erase_background = engine
+    let erase_background = engine
         .read_r8()
         .context("failed to read R8 for InvalidateRect")?;
 
     let success = window_handle == 0 || is_known_window(state, window_handle);
 
-    if success {
-        state.window_state().window_invalidated = true;
+    if let Some(window) = find_window_mut(state, window_handle) {
+        window.invalidated = true;
+        // bErase: OR so a TRUE erase request survives a later FALSE invalidation
+        // of a different region (the update region accumulates, matching Windows).
+        if erase_background != 0 {
+            window.erase_background = true;
+        }
+    }
+
+    // B3: accumulate the invalidation into the window's present-surface dirty
+    // region (publish side only — WM_PAINT synthesis keeps using `invalidated`).
+    // A NULL rect = the whole client area. Children translate to the ancestor
+    // surface via the parent-chain offset so their region lands where their
+    // pixels actually live. An unreadable RECT falls back to a full-surface
+    // mark (conservative: a partial publish can never go stale).
+    if success
+        && window_handle != 0
+        && let Some((top_hwnd, offset_x, offset_y)) =
+            ancestor_offset(&state.window_state().windows, window_handle)
+    {
+        let local_rect = if rect_ptr == 0 {
+            let (cw, ch) = window_client_size(state, window_handle);
+            Some(IRect {
+                left: 0,
+                top: 0,
+                right: cw,
+                bottom: ch,
+            })
+        } else {
+            match (
+                read_guest_i32(engine, rect_ptr),
+                read_guest_i32(engine, checked_field_address(rect_ptr, 4, "RECT.top")),
+                read_guest_i32(engine, checked_field_address(rect_ptr, 8, "RECT.right")),
+                read_guest_i32(engine, checked_field_address(rect_ptr, 12, "RECT.bottom")),
+            ) {
+                (Ok(left), Ok(top), Ok(right), Ok(bottom)) => Some(IRect {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                }),
+                // Unreadable RECT: cannot prove the invalidated region.
+                _ => None,
+            }
+        };
+        match local_rect {
+            Some(rect) => state.present().mark_dirty(
+                top_hwnd,
+                IRect {
+                    left: rect.left.saturating_add(offset_x),
+                    top: rect.top.saturating_add(offset_y),
+                    right: rect.right.saturating_add(offset_x),
+                    bottom: rect.bottom.saturating_add(offset_y),
+                },
+            ),
+            // Conservative fallback: force a full publish.
+            None => state.present().mark_dirty_full(top_hwnd),
+        }
     }
 
     let return_value = u64::from(success);
@@ -551,10 +782,10 @@ pub fn handle_redraw_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         .read_r9()
         .context("failed to read R9 for RedrawWindow")?;
 
-    let success = window_handle == 0 || window_handle == FAKE_WINDOW_HANDLE;
+    let success = window_handle == 0 || is_known_window(state, window_handle);
 
-    if success {
-        state.window_state().window_invalidated = false;
+    if let Some(window) = find_window_mut(state, window_handle) {
+        window.invalidated = false;
     }
 
     let return_value = u64::from(success);
@@ -580,11 +811,24 @@ pub fn handle_set_window_text_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .read_rdx()
         .context("failed to read RDX for SetWindowTextA")?;
 
-    let success = window_handle == FAKE_WINDOW_HANDLE && text_ptr != 0;
+    let known = window_handle == FAKE_WINDOW_HANDLE || is_known_window(state, window_handle);
+    let success = known && text_ptr != 0;
 
     if success {
-        state.window_state().window_title = read_guest_ansi_lossy(engine, text_ptr, 32_768)
+        let text = read_guest_ansi_lossy(engine, text_ptr, 32_768)
             .context("failed to read SetWindowTextA text")?;
+        if window_handle == FAKE_WINDOW_HANDLE {
+            state.window_state().window_title = text;
+        } else if let Some(window) = find_window_mut(state, window_handle) {
+            // Controls repaint with their new caption; other windows get the
+            // title updated.
+            if window.control_kind.is_some() {
+                window.control_text = text;
+                window.invalidated = true;
+            } else {
+                window.title = text;
+            }
+        }
     }
 
     let return_value = u64::from(success);
@@ -610,11 +854,22 @@ pub fn handle_set_window_text_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .read_rdx()
         .context("failed to read RDX for SetWindowTextW")?;
 
-    let success = window_handle == FAKE_WINDOW_HANDLE && text_ptr != 0;
+    let known = window_handle == FAKE_WINDOW_HANDLE || is_known_window(state, window_handle);
+    let success = known && text_ptr != 0;
 
     if success {
-        state.window_state().window_title = read_guest_utf16_lossy(engine, text_ptr, 32_768)
+        let text = read_guest_utf16_lossy(engine, text_ptr, 32_768)
             .context("failed to read SetWindowTextW text")?;
+        if window_handle == FAKE_WINDOW_HANDLE {
+            state.window_state().window_title = text;
+        } else if let Some(window) = find_window_mut(state, window_handle) {
+            if window.control_kind.is_some() {
+                window.control_text = text;
+                window.invalidated = true;
+            } else {
+                window.title = text;
+            }
+        }
     }
 
     let return_value = u64::from(success);
@@ -644,15 +899,12 @@ pub fn handle_get_window_text_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .read_r8()
         .context("failed to read R8 for GetWindowTextA")?;
 
-    let return_value = if window_handle == FAKE_WINDOW_HANDLE {
-        write_ansi_window_text(
-            engine,
-            buffer_ptr,
-            max_characters,
-            &state.window_state().window_title,
-        )?
-    } else {
+    let text = resolve_window_text(state, window_handle);
+
+    let return_value = if text.is_empty() {
         0
+    } else {
+        write_ansi_window_text(engine, buffer_ptr, max_characters, &text)?
     };
 
     let return_address = engine
@@ -680,15 +932,12 @@ pub fn handle_get_window_text_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .read_r8()
         .context("failed to read R8 for GetWindowTextW")?;
 
-    let return_value = if window_handle == FAKE_WINDOW_HANDLE {
-        write_wide_window_text(
-            engine,
-            buffer_ptr,
-            max_characters,
-            &state.window_state().window_title,
-        )?
-    } else {
+    let text = resolve_window_text(state, window_handle);
+
+    let return_value = if text.is_empty() {
         0
+    } else {
+        write_wide_window_text(engine, buffer_ptr, max_characters, &text)?
     };
 
     let return_address = engine
@@ -698,6 +947,22 @@ pub fn handle_get_window_text_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     Ok(WinApiHandlerResult {
         return_address,
         return_value,
+    })
+}
+
+/// The text GetWindowTextA/W reports for a window: the control buffer for
+/// built-in controls, the title otherwise (the legacy fake window's title
+/// lives in `WindowState.window_title`).
+fn resolve_window_text(state: &mut WinApiState, window_handle: u64) -> String {
+    if window_handle == FAKE_WINDOW_HANDLE {
+        return state.window_state().window_title.clone();
+    }
+    find_window(state, window_handle).map_or_else(String::new, |window| {
+        if window.control_kind.is_some() {
+            window.control_text.clone()
+        } else {
+            window.title.clone()
+        }
     })
 }
 /// Handles `USER32.dll!GetClientRect`.
@@ -773,8 +1038,10 @@ pub fn handle_move_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         state.window_state().window_width = low_i32(width_raw, "MoveWindow width")?;
         state.window_state().window_height = low_i32(height_raw, "MoveWindow height")?;
 
-        if repaint_raw != 0 {
-            state.window_state().window_invalidated = false;
+        if repaint_raw != 0
+            && let Some(window) = find_window_mut(state, window_handle)
+        {
+            window.invalidated = false;
         }
     }
 
@@ -896,7 +1163,25 @@ pub fn handle_get_sys_color(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         .read_rcx()
         .context("failed to read RCX for GetSysColor")?;
 
-    let return_value = match color_index {
+    let return_value = u64::from(sys_color(u32::try_from(color_index).unwrap_or(u32::MAX)));
+
+    let return_address = engine
+        .return_from_win64_api(return_value)
+        .context("failed to return from GetSysColor")?;
+
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// The classic Windows system-color table, as 0RGB.
+///
+/// Shared by `GetSysColor` and the WM_ERASEBKGND class-brush fill (a
+/// `WNDCLASS.hbrBackground` of `COLOR_x + 1` resolves through the same table).
+#[must_use]
+pub(crate) fn sys_color(color_index: u32) -> u32 {
+    match color_index {
         // Black-like colors:
         // COLOR_BACKGROUND, COLOR_WINDOWFRAME,
         // COLOR_MENUTEXT, COLOR_WINDOWTEXT,
@@ -905,14 +1190,17 @@ pub fn handle_get_sys_color(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 
         // Accent colors:
         // COLOR_ACTIVECAPTION, COLOR_HIGHLIGHT.
-        2 | 13 => 0x00d7_7830,
+        // #0078D7 as 0RGB (the previous 0xD77830 was the B/R-swapped value and
+        // rendered orange).
+        2 | 13 => 0x0000_78D7,
 
         // COLOR_INACTIVECAPTION.
         3 => 0x00bf_bfbf,
 
         // White-like colors:
-        // COLOR_WINDOW, COLOR_HIGHLIGHTTEXT.
-        5 | 14 => 0x00ff_ffff,
+        // COLOR_WINDOW, COLOR_HIGHLIGHTTEXT, COLOR_BTNHIGHLIGHT (the 3D
+        // edge highlight).
+        5 | 14 | 20 => 0x00ff_ffff,
 
         // COLOR_ACTIVEBORDER, COLOR_INACTIVEBORDER.
         10 | 11 => 0x00b4_b4b4,
@@ -923,6 +1211,9 @@ pub fn handle_get_sys_color(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         // COLOR_BTNSHADOW.
         16 => 0x00a0_a0a0,
 
+        // COLOR_3DDKSHADOW (the darkest 3D edge).
+        21 => 0x0069_6969,
+
         // COLOR_GRAYTEXT.
         17 => 0x006d_6d6d,
 
@@ -931,16 +1222,7 @@ pub fn handle_get_sys_color(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 
         // COLOR_MENU, COLOR_BTNFACE and neutral fallback.
         _ => 0x00f0_f0f0,
-    };
-
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetSysColor")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    }
 }
 /// Handles `USER32.dll!GetSysColorBrush`.
 pub fn handle_get_sys_color_brush(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -1081,15 +1363,17 @@ pub fn handle_get_window_thread_process_id(
 /// Handles `USER32.dll!GetDlgCtrlID`.
 pub fn handle_get_dlg_ctrl_id(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for GetDlgCtrlID")?;
 
-    // The current single-window model has no child-control identifier.
+    // A child window's control identifier is its menu handle (CreateWindowEx
+    // stores the ID there). Unknown windows report -1 like real Windows.
     let return_value = if window_handle == FAKE_WINDOW_HANDLE {
         0
     } else {
-        u64::from(u32::MAX)
+        find_window(state, window_handle).map_or(u64::from(u32::MAX), |window| window.menu_handle)
     };
 
     let return_address = engine
@@ -1104,15 +1388,16 @@ pub fn handle_get_dlg_ctrl_id(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 /// Handles `USER32.dll!IsChild`.
 pub fn handle_is_child(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _parent_handle = engine
+    let state = &mut *ctx.state;
+    let parent_handle = engine
         .read_rcx()
         .context("failed to read RCX for IsChild")?;
 
-    let _child_handle = engine
+    let child_handle = engine
         .read_rdx()
         .context("failed to read RDX for IsChild")?;
 
-    let return_value = 0;
+    let return_value = u64::from(descends_from(state, child_handle, parent_handle));
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -1122,6 +1407,26 @@ pub fn handle_is_child(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
         return_address,
         return_value,
     })
+}
+
+/// Whether `child` is `parent` or a descendant of `parent` (parent-chain walk).
+fn descends_from(state: &mut WinApiState, child: u64, parent: u64) -> bool {
+    if child == parent {
+        return true;
+    }
+    let mut current = child;
+    loop {
+        let Some(window) = find_window(state, current) else {
+            return false;
+        };
+        if window.parent_handle == parent {
+            return true;
+        }
+        if window.parent_handle == 0 || window.parent_handle == current {
+            return false;
+        }
+        current = window.parent_handle;
+    }
 }
 /// Handles `USER32.dll!GetWindow`.
 pub fn handle_get_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -1322,4 +1627,581 @@ pub(crate) fn find_window(state: &mut WinApiState, handle: u64) -> Option<&Windo
         .windows
         .iter()
         .find(|window| window.handle == handle)
+}
+
+pub(crate) fn find_window_mut(state: &mut WinApiState, handle: u64) -> Option<&mut WindowRecord> {
+    state
+        .window_state()
+        .windows
+        .iter_mut()
+        .find(|window| window.handle == handle)
+}
+
+/// Handles `USER32.dll!CreateWindowExA`.
+pub fn handle_create_window_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+
+    // Read 4 register args
+    let ex_style = engine
+        .read_rcx()
+        .context("failed to read RCX for CreateWindowExA")?;
+    let class_value = engine
+        .read_rdx()
+        .context("failed to read RDX for CreateWindowExA")?;
+    let window_title = engine
+        .read_r8()
+        .context("failed to read R8 for CreateWindowExA")?;
+    let style_raw = engine
+        .read_r9()
+        .context("failed to read R9 for CreateWindowExA")?;
+
+    // Read 8 stack args
+    let rsp = engine
+        .read_rsp()
+        .context("failed to read RSP for CreateWindowExA")?;
+
+    let stack_arg = |offset: u64, name: &str| -> Result<u64> {
+        rsp.checked_add(offset)
+            .with_context(|| format!("CreateWindowExA: {name} address overflow"))
+    };
+
+    let x_raw = read_guest_i32(engine, stack_arg(0x28, "X")?)?;
+    let y_raw = read_guest_i32(engine, stack_arg(0x30, "Y")?)?;
+    let width_raw = read_guest_i32(engine, stack_arg(0x38, "nWidth")?)?;
+    let height_raw = read_guest_i32(engine, stack_arg(0x40, "nHeight")?)?;
+    let parent_handle = read_guest_u64(engine, stack_arg(0x48, "hWndParent")?)?;
+    let menu_handle = read_guest_u64(engine, stack_arg(0x50, "hMenu")?)?;
+    let instance_handle = read_guest_u64(engine, stack_arg(0x58, "hInstance")?)?;
+    let create_params = read_guest_u64(engine, stack_arg(0x60, "lpParam")?)?;
+
+    // Read window title if present
+    let title = if window_title == 0 {
+        String::new()
+    } else {
+        read_guest_ansi_lossy(engine, window_title, 512)
+            .context("failed to read CreateWindowExA window title")?
+    };
+
+    // Convert style/ex_style to u32 once (avoids repeated `as` conversions).
+    let style = u32::try_from(style_raw).context("CreateWindowExA: style does not fit u32")?;
+    let ex_style = u32::try_from(ex_style).context("CreateWindowExA: ex_style does not fit u32")?;
+
+    // Handle CW_USEDEFAULT (0x8000_0000 stored as i32 = i32::MIN on the stack).
+    let x = if x_raw == i32::MIN { 100 } else { x_raw };
+    let y = if y_raw == i32::MIN { 100 } else { y_raw };
+    let width = if width_raw == i32::MIN {
+        640
+    } else {
+        width_raw
+    };
+    let height = if height_raw == i32::MIN {
+        480
+    } else {
+        height_raw
+    };
+
+    let class_identifier = read_window_class_identifier_a(engine, class_value)
+        .context("failed to read window class identifier for CreateWindowExA")?;
+
+    let (hwnd, window_proc, class_unicode) = create_window_record(
+        state,
+        CreateWindowRequest {
+            class_identifier,
+            title,
+            style,
+            extended_style: ex_style,
+            parent_handle,
+            menu_handle,
+            instance_handle,
+            x,
+            y,
+            width,
+            height,
+        },
+        false,
+    )
+    .context("failed to create window record for CreateWindowExA")?;
+
+    if hwnd == 0 {
+        let ra = engine
+            .return_from_win64_api(0)
+            .context("failed to return from CreateWindowExA")?;
+        return Ok(WinApiHandlerResult {
+            return_address: ra,
+            return_value: 0,
+        });
+    }
+
+    // Update the window record with client rect
+    if let Some(window) = find_window_mut(state, hwnd) {
+        window.client_rect = (0, 0, width, height);
+    }
+
+    // If there is a window procedure, send WM_CREATE via guest callback
+    if window_proc != 0 {
+        // Allocate CREATESTRUCT in guest memory (0x50 bytes)
+        let cs_va = state.heap_state.heap.alloc_coherent(engine, 0x50);
+        if cs_va == 0 {
+            // Allocation failed — return HWND without WM_CREATE
+            let ra = engine
+                .return_from_win64_api(hwnd)
+                .context("failed to return from CreateWindowExA")?;
+            return Ok(WinApiHandlerResult {
+                return_address: ra,
+                return_value: hwnd,
+            });
+        }
+
+        // CREATESTRUCT on Win64 layout:
+        //  +0x00 lpCreateParams (u64)
+        //  +0x08 hInstance (u64)
+        //  +0x10 hMenu (u64)
+        //  +0x18 hwndParent (u64)
+        //  +0x20 cy (i32)
+        //  +0x24 cx (i32)
+        //  +0x28 y (i32)
+        //  +0x2C x (i32)
+        //  +0x30 style (u32)
+        //  +0x38 lpszName (u64)
+        //  +0x40 lpszClass (u64)
+        //  +0x48 dwExStyle (u32)
+
+        write_guest_u64(engine, cs_va.wrapping_add(0x00), create_params)?;
+        write_guest_u64(engine, cs_va.wrapping_add(0x08), instance_handle)?;
+        write_guest_u64(engine, cs_va.wrapping_add(0x10), menu_handle)?;
+        write_guest_u64(engine, cs_va.wrapping_add(0x18), parent_handle)?;
+        write_guest_i32(engine, cs_va.wrapping_add(0x20), height)?;
+        write_guest_i32(engine, cs_va.wrapping_add(0x24), width)?;
+        write_guest_i32(engine, cs_va.wrapping_add(0x28), y)?;
+        write_guest_i32(engine, cs_va.wrapping_add(0x2C), x)?;
+        write_guest_u32(engine, cs_va.wrapping_add(0x30), style)?;
+        write_guest_u64(engine, cs_va.wrapping_add(0x38), window_title)?;
+        write_guest_u64(engine, cs_va.wrapping_add(0x40), class_value)?;
+        write_guest_u32(engine, cs_va.wrapping_add(0x48), ex_style)?;
+
+        return Err(WinApiControlSignal::GuestCallbackRequested {
+            request: GuestCallbackRequest {
+                callback_address: window_proc,
+                window_handle: hwnd,
+                message: WM_CREATE,
+                word_parameter: 0,
+                long_parameter: cs_va,
+                unicode: class_unicode,
+                outer_return: OuterReturn::CreateWindow(hwnd),
+            },
+        }
+        .into());
+    }
+
+    // No window procedure — return the HWND directly
+    let ra = engine
+        .return_from_win64_api(hwnd)
+        .context("failed to return from CreateWindowExA")?;
+    Ok(WinApiHandlerResult {
+        return_address: ra,
+        return_value: hwnd,
+    })
+}
+
+/// Handles `USER32.dll!CreateWindowExW`.
+pub fn handle_create_window_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+
+    // Read 4 register args
+    let ex_style = engine
+        .read_rcx()
+        .context("failed to read RCX for CreateWindowExW")?;
+    let class_value = engine
+        .read_rdx()
+        .context("failed to read RDX for CreateWindowExW")?;
+    let window_title = engine
+        .read_r8()
+        .context("failed to read R8 for CreateWindowExW")?;
+    let style_raw = engine
+        .read_r9()
+        .context("failed to read R9 for CreateWindowExW")?;
+
+    // Read 8 stack args
+    let rsp = engine
+        .read_rsp()
+        .context("failed to read RSP for CreateWindowExW")?;
+
+    let stack_arg = |offset: u64, name: &str| -> Result<u64> {
+        rsp.checked_add(offset)
+            .with_context(|| format!("CreateWindowExW: {name} address overflow"))
+    };
+
+    let x_raw = read_guest_i32(engine, stack_arg(0x28, "X")?)?;
+    let y_raw = read_guest_i32(engine, stack_arg(0x30, "Y")?)?;
+    let width_raw = read_guest_i32(engine, stack_arg(0x38, "nWidth")?)?;
+    let height_raw = read_guest_i32(engine, stack_arg(0x40, "nHeight")?)?;
+    let parent_handle = read_guest_u64(engine, stack_arg(0x48, "hWndParent")?)?;
+    let menu_handle = read_guest_u64(engine, stack_arg(0x50, "hMenu")?)?;
+    let instance_handle = read_guest_u64(engine, stack_arg(0x58, "hInstance")?)?;
+    let create_params = read_guest_u64(engine, stack_arg(0x60, "lpParam")?)?;
+
+    // Read window title if present (UTF-16 for the W variant)
+    let title = if window_title == 0 {
+        String::new()
+    } else {
+        read_guest_utf16_lossy(engine, window_title, 512)
+            .context("failed to read CreateWindowExW window title")?
+    };
+
+    // Handle CW_USEDEFAULT (0x8000_0000) — stored as a 32-bit DWORD in the
+    // stack slot, so it reads back as i32::MIN through read_guest_i32.
+    let x = if x_raw == i32::MIN { 100 } else { x_raw };
+    let y = if y_raw == i32::MIN { 100 } else { y_raw };
+    let width = if width_raw == i32::MIN {
+        640
+    } else {
+        width_raw
+    };
+    let height = if height_raw == i32::MIN {
+        480
+    } else {
+        height_raw
+    };
+
+    // Convert style/ex_style to u32 once (avoids repeated `as` conversions).
+    let style = u32::try_from(style_raw).context("CreateWindowExW: style does not fit u32")?;
+    let ex_style = u32::try_from(ex_style).context("CreateWindowExW: ex_style does not fit u32")?;
+
+    let class_identifier = read_window_class_identifier_w(engine, class_value)
+        .context("failed to read window class identifier for CreateWindowExW")?;
+
+    let (hwnd, window_proc, class_unicode) = create_window_record(
+        state,
+        CreateWindowRequest {
+            class_identifier,
+            title,
+            style,
+            extended_style: ex_style,
+            parent_handle,
+            menu_handle,
+            instance_handle,
+            x,
+            y,
+            width,
+            height,
+        },
+        true,
+    )
+    .context("failed to create window record for CreateWindowExW")?;
+
+    if hwnd == 0 {
+        let ra = engine
+            .return_from_win64_api(0)
+            .context("failed to return from CreateWindowExW")?;
+        return Ok(WinApiHandlerResult {
+            return_address: ra,
+            return_value: 0,
+        });
+    }
+
+    // Update the window record with client rect
+    if let Some(window) = find_window_mut(state, hwnd) {
+        window.client_rect = (0, 0, width, height);
+    }
+
+    // If there is a window procedure, send WM_CREATE via guest callback
+    if window_proc != 0 {
+        // Allocate CREATESTRUCT in guest memory (0x50 bytes)
+        let cs_va = state.heap_state.heap.alloc_coherent(engine, 0x50);
+        if cs_va == 0 {
+            let ra = engine
+                .return_from_win64_api(hwnd)
+                .context("failed to return from CreateWindowExW")?;
+            return Ok(WinApiHandlerResult {
+                return_address: ra,
+                return_value: hwnd,
+            });
+        }
+
+        // CREATESTRUCT on Win64 layout (same as CreateWindowExA)
+        write_guest_u64(engine, cs_va.wrapping_add(0x00), create_params)?;
+        write_guest_u64(engine, cs_va.wrapping_add(0x08), instance_handle)?;
+        write_guest_u64(engine, cs_va.wrapping_add(0x10), menu_handle)?;
+        write_guest_u64(engine, cs_va.wrapping_add(0x18), parent_handle)?;
+        write_guest_i32(engine, cs_va.wrapping_add(0x20), height)?;
+        write_guest_i32(engine, cs_va.wrapping_add(0x24), width)?;
+        write_guest_i32(engine, cs_va.wrapping_add(0x28), y)?;
+        write_guest_i32(engine, cs_va.wrapping_add(0x2C), x)?;
+        write_guest_u32(engine, cs_va.wrapping_add(0x30), style)?;
+        write_guest_u64(engine, cs_va.wrapping_add(0x38), window_title)?;
+        write_guest_u64(engine, cs_va.wrapping_add(0x40), class_value)?;
+        write_guest_u32(engine, cs_va.wrapping_add(0x48), ex_style)?;
+
+        return Err(WinApiControlSignal::GuestCallbackRequested {
+            request: GuestCallbackRequest {
+                callback_address: window_proc,
+                window_handle: hwnd,
+                message: WM_CREATE,
+                word_parameter: 0,
+                long_parameter: cs_va,
+                unicode: class_unicode,
+                outer_return: OuterReturn::CreateWindow(hwnd),
+            },
+        }
+        .into());
+    }
+
+    // No window procedure — return the HWND directly
+    let ra = engine
+        .return_from_win64_api(hwnd)
+        .context("failed to return from CreateWindowExW")?;
+    Ok(WinApiHandlerResult {
+        return_address: ra,
+        return_value: hwnd,
+    })
+}
+
+/// Handles `USER32.dll!DestroyWindow`.
+pub fn handle_destroy_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let window_handle = engine
+        .read_rcx()
+        .context("failed to read RCX for DestroyWindow")?;
+
+    // Extract window info before any mutation.
+    let window_info = find_window(state, window_handle).map(|w| (w.window_proc, w.unicode));
+
+    let Some((window_proc, unicode)) = window_info else {
+        let ra = engine
+            .return_from_win64_api(0)
+            .context("failed to return from DestroyWindow")?;
+        return Ok(WinApiHandlerResult {
+            return_address: ra,
+            return_value: 0,
+        });
+    };
+
+    tracing::debug!(target: "wiegui", hwnd = window_handle, "DestroyWindow");
+
+    if window_proc == 0 {
+        // No WndProc — remove the window and return success.
+        state
+            .window_state()
+            .windows
+            .retain(|w| w.handle != window_handle);
+        let ra = engine
+            .return_from_win64_api(1)
+            .context("failed to return from DestroyWindow")?;
+        return Ok(WinApiHandlerResult {
+            return_address: ra,
+            return_value: 1,
+        });
+    }
+
+    // Send WM_DESTROY to the window procedure.
+    Err(WinApiControlSignal::GuestCallbackRequested {
+        request: GuestCallbackRequest {
+            callback_address: window_proc,
+            window_handle,
+            message: WM_DESTROY,
+            word_parameter: 0,
+            long_parameter: 0,
+            unicode,
+            outer_return: OuterReturn::Fixed(1),
+        },
+    }
+    .into())
+}
+
+/// Handles `USER32.dll!GetClassNameA`.
+pub fn handle_get_class_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_get_class_name(ctx, "GetClassNameA", false)
+}
+
+/// Handles `USER32.dll!GetClassNameW`.
+pub fn handle_get_class_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_get_class_name(ctx, "GetClassNameW", true)
+}
+
+pub(crate) fn handle_get_class_name(
+    ctx: &mut HandlerContext<'_>,
+    api_name: &str,
+    unicode: bool,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let window_handle = engine
+        .read_rcx()
+        .with_context(|| format!("failed to read RCX for {api_name}"))?;
+
+    let buffer_ptr = engine
+        .read_rdx()
+        .with_context(|| format!("failed to read RDX for {api_name}"))?;
+
+    let max_count = engine
+        .read_r8()
+        .with_context(|| format!("failed to read R8 for {api_name}"))?;
+
+    let class_name = state
+        .window_state()
+        .windows
+        .iter()
+        .find(|window| window.handle == window_handle)
+        .map_or(String::new(), |window| window.class_name.clone());
+
+    let capacity = usize::try_from(max_count)
+        .with_context(|| format!("{api_name} buffer capacity does not fit usize"))?;
+
+    // GetClassName returns the character count copied (excluding the NUL), or
+    // zero on failure — both writers already report that.
+    let copied = if class_name.is_empty() {
+        0
+    } else if unicode {
+        write_guest_utf16_c_string(engine, buffer_ptr, capacity, &class_name)
+            .with_context(|| format!("failed to write class name for {api_name}"))?
+    } else {
+        write_guest_ansi_c_string(engine, buffer_ptr, capacity, &class_name)
+            .with_context(|| format!("failed to write class name for {api_name}"))?
+    };
+
+    let return_value =
+        u64::try_from(copied).with_context(|| format!("{api_name} length does not fit u64"))?;
+
+    let return_address = engine
+        .return_from_win64_api(return_value)
+        .with_context(|| format!("failed to return from {api_name}"))?;
+
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `USER32.dll!GetClassLongPtrA`.
+pub fn handle_get_class_long_ptr_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_get_class_long_ptr(ctx, "GetClassLongPtrA")
+}
+
+/// Handles `USER32.dll!GetClassLongPtrW`.
+pub fn handle_get_class_long_ptr_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_get_class_long_ptr(ctx, "GetClassLongPtrW")
+}
+
+fn handle_get_class_long_ptr(
+    ctx: &mut HandlerContext<'_>,
+    api_name: &str,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let window_handle = engine
+        .read_rcx()
+        .with_context(|| format!("failed to read RCX for {api_name}"))?;
+
+    let index_raw = engine
+        .read_rdx()
+        .with_context(|| format!("failed to read RDX for {api_name}"))?;
+
+    let atom = window_class_atom(state, window_handle);
+
+    let return_value = if atom == 0 {
+        0
+    } else {
+        let index = window_long_ptr_index(index_raw, api_name)?;
+        state
+            .window_state()
+            .class_long_ptr_values
+            .iter()
+            .find(|(stored_atom, stored_index, _)| *stored_atom == atom && *stored_index == index)
+            .map_or(0, |(_, _, value)| *value)
+    };
+
+    let return_address = engine
+        .return_from_win64_api(return_value)
+        .with_context(|| format!("failed to return from {api_name}"))?;
+
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `USER32.dll!SetClassLongPtrA`.
+pub fn handle_set_class_long_ptr_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_set_class_long_ptr(ctx, "SetClassLongPtrA")
+}
+
+/// Handles `USER32.dll!SetClassLongPtrW`.
+pub fn handle_set_class_long_ptr_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_set_class_long_ptr(ctx, "SetClassLongPtrW")
+}
+
+fn handle_set_class_long_ptr(
+    ctx: &mut HandlerContext<'_>,
+    api_name: &str,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let window_handle = engine
+        .read_rcx()
+        .with_context(|| format!("failed to read RCX for {api_name}"))?;
+
+    let index_raw = engine
+        .read_rdx()
+        .with_context(|| format!("failed to read RDX for {api_name}"))?;
+
+    let new_value = engine
+        .read_r8()
+        .with_context(|| format!("failed to read R8 for {api_name}"))?;
+
+    let atom = window_class_atom(state, window_handle);
+
+    let return_value = if atom == 0 {
+        0
+    } else {
+        let index = window_long_ptr_index(index_raw, api_name)?;
+        set_class_long_ptr_value(state, atom, index, new_value)
+    };
+
+    let return_address = engine
+        .return_from_win64_api(return_value)
+        .with_context(|| format!("failed to return from {api_name}"))?;
+
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Resolve a window handle to its registered class atom (0 when unregistered).
+fn window_class_atom(state: &mut WinApiState, window_handle: u64) -> u16 {
+    state
+        .window_state()
+        .windows
+        .iter()
+        .find(|window| window.handle == window_handle)
+        .map_or(0, |window| window.class_atom)
+}
+
+/// Store a class-long value; returns the previous value.
+fn set_class_long_ptr_value(state: &mut WinApiState, atom: u16, index: i64, new_value: u64) -> u64 {
+    let previous_value = state
+        .window_state()
+        .class_long_ptr_values
+        .iter()
+        .find(|(stored_atom, stored_index, _)| *stored_atom == atom && *stored_index == index)
+        .map_or(0, |(_, _, value)| *value);
+
+    if let Some(entry) = state
+        .window_state()
+        .class_long_ptr_values
+        .iter_mut()
+        .find(|(stored_atom, stored_index, _)| *stored_atom == atom && *stored_index == index)
+    {
+        entry.2 = new_value;
+    } else {
+        state
+            .window_state()
+            .class_long_ptr_values
+            .push((atom, index, new_value));
+    }
+
+    previous_value
 }

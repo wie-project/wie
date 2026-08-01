@@ -78,6 +78,16 @@ pub(crate) fn read_u16(engine: &mut dyn wie_cpu::CpuEngine, address: u64) -> Res
     Ok(u16::from_le_bytes(bytes))
 }
 
+pub(crate) fn read_u8(engine: &mut dyn wie_cpu::CpuEngine, address: u64) -> Result<u8> {
+    let mut bytes = [0_u8; 1];
+
+    engine
+        .mem_read(address, &mut bytes)
+        .context("failed to read u8 from guest memory")?;
+
+    Ok(bytes[0])
+}
+
 pub(crate) fn write_u16(
     engine: &mut dyn wie_cpu::CpuEngine,
     address: u64,

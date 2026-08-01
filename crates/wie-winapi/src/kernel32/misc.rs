@@ -1211,7 +1211,7 @@ pub fn handle_sleep(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult>
     let milliseconds = engine.read_rcx().context("failed to read RCX for Sleep")?;
     let low32 = milliseconds & u64::from(u32::MAX);
 
-    let policy = crate::idle::IdlePolicy::from_env();
+    let policy = crate::idle::IdlePolicy::from_env_for(crate::idle::IdleContext::Persistent);
     crate::idle::apply_sleep(policy, low32);
 
     let return_value = 0;

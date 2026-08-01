@@ -1,6 +1,7 @@
 use super::{
-    Context, HandlerContext, Result, WinApiHandlerResult, checked_field_address, read_guest_bytes,
-    write_guest_bytes, write_guest_i32,
+    Context, HandlerContext, Result, TME_CANCEL, TME_HOVER, TME_LEAVE, WinApiHandlerResult,
+    checked_field_address, read_guest_bytes, read_guest_u32, read_guest_u64, write_guest_bytes,
+    write_guest_i32,
 };
 
 /// Handles `USER32.dll!GetAsyncKeyState`.
@@ -35,19 +36,61 @@ pub fn handle_get_async_key_state(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     })
 }
 /// Handles dynamic `USER32.dll!TrackMouseEvent`.
+///
+/// Records the tracking request on the target window; the host forwards
+/// `WM_MOUSEHOVER` / `WM_MOUSELEAVE` only for tracked windows (Windows sends
+/// neither without a `TrackMouseEvent` request).
 pub fn handle_track_mouse_event(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _track_mouse_event_ptr = engine
+    let state = &mut *ctx.state;
+    let track_mouse_event_ptr = engine
         .read_rcx()
         .context("failed to read RCX for TrackMouseEvent")?;
 
+    let mut tracking = false;
+    if track_mouse_event_ptr != 0 {
+        // TRACKMOUSEEVENT (Win64):
+        //  +0x00 cbSize (u32)
+        //  +0x04 dwFlags (u32)
+        //  +0x08 hwndTrack (u64)
+        //  +0x10 dwHoverTime (u32)
+        let flags = read_guest_u32(
+            engine,
+            checked_field_address(track_mouse_event_ptr, 4, "TRACKMOUSEEVENT.dwFlags"),
+        )
+        .ok()
+        .unwrap_or(0);
+        let hwnd_track = read_guest_u64(
+            engine,
+            checked_field_address(track_mouse_event_ptr, 8, "TRACKMOUSEEVENT.hwndTrack"),
+        )
+        .ok()
+        .unwrap_or(0);
+
+        if hwnd_track != 0 && super::is_known_window(state, hwnd_track) {
+            if flags & TME_CANCEL != 0 {
+                // Cancel tracking (TME_CANCEL with no TME_* arm is a release).
+                if let Some(window) = super::find_window_mut(state, hwnd_track) {
+                    window.mouse_tracking = false;
+                }
+            } else if flags & (TME_HOVER | TME_LEAVE) != 0
+                && let Some(window) = super::find_window_mut(state, hwnd_track)
+            {
+                window.mouse_tracking = true;
+            }
+            tracking = true;
+        }
+    }
+
+    let return_value = u64::from(tracking);
+
     let return_address = engine
-        .return_from_win64_api(1)
+        .return_from_win64_api(return_value)
         .context("failed to return from TrackMouseEvent")?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: 1,
+        return_value,
     })
 }
 /// Handles `USER32.dll!GetCursorPos`.

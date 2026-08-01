@@ -330,9 +330,67 @@ pub enum WinApiId {
     Kernel32Gettickcount64 = 317,
     Kernel32Getenvironmentvariablew = 318,
     Kernel32Setenvironmentvariablew = 319,
+    User32Createwindowexa = 320,
+    User32Createwindowexw = 321,
+    User32Destroywindow = 322,
+    User32Postquitmessage = 323,
+    User32Getmessagew = 324,
+    User32Peekmessagew = 325,
+    User32Dispatchmessagew = 326,
+    User32Postmessagew = 327,
+    User32Registerclassa = 328,
+    User32Registerclassw = 329,
+    User32Unregisterclassa = 330,
+    User32Unregisterclassw = 331,
+    User32Validateirect = 332,
+    User32Setwindowlonga = 333,
+    User32Setwindowlongw = 334,
+    User32Getwindowdc = 335,
+    User32Getclassnamea = 336,
+    User32Getclassnamew = 337,
+    User32Getclasslongptra = 338,
+    User32Getclasslongptrw = 339,
+    User32Setclasslongptra = 340,
+    User32Setclasslongptrw = 341,
+    User32Drawmenubar = 342,
+    User32Getmenustate = 343,
+    Gdi32Createsolidbrush = 344,
+    User32Fillrect = 345,
+    Gdi32Createpen = 346,
+    Gdi32Textoutw = 347,
+    Gdi32Drawtexta = 348,
+    Gdi32Drawtextw = 349,
+    User32Createdialogparama = 350,
+    User32Createdialogparamw = 351,
+    User32Isdialogmessagea = 352,
+    User32Isdialogmessagew = 353,
+    User32Enddialog = 354,
+    User32Getdlgitema = 355,
+    User32Getdlgitemw = 356,
+    User32Getdlgitemtexta = 357,
+    User32Getdlgitemtextw = 358,
+    User32Setdlgitemtexta = 359,
+    User32Setdlgitemtextw = 360,
+    User32Defdlgproca = 361,
+    User32Defdlgprocw = 362,
+    D3d9Idirect3ddevice9Present = 363,
+    D3d9Idirect3ddevice9Beginscene = 364,
+    D3d9Idirect3ddevice9Endscene = 365,
+    D3d9Idirect3ddevice9Clear = 366,
+    D3d9Idirect3ddevice9Settransform = 367,
+    D3d9Idirect3ddevice9Setviewport = 368,
+    D3d9Idirect3ddevice9Getviewport = 369,
+    D3d9Idirect3ddevice9Drawprimitive = 370,
+    D3d9Idirect3ddevice9Drawindexedprimitive = 371,
+    D3d9Idirect3ddevice9Drawprimitiveup = 372,
+    D3d9Idirect3ddevice9Drawindexedprimitiveup = 373,
+    D3d9Idirect3ddevice9Setstreamsource = 374,
+    D3d9Idirect3ddevice9Setindices = 375,
+    D3d9Idirect3ddevice9Createvertexbuffer = 376,
+    D3d9Idirect3ddevice9Createindexbuffer = 377,
 }
 
-pub const WINAPI_ID_COUNT: usize = 320;
+pub const WINAPI_ID_COUNT: usize = 378;
 
 impl WinApiId {
     /// Discriminant as `u16` (`#[repr(u16)]`).
@@ -372,7 +430,7 @@ const _: () = assert!(
 );
 
 /// Highest-numbered [`WinApiId`]; update alongside the enum's final variant.
-const LAST_WINAPI_ID: WinApiId = WinApiId::Kernel32Setenvironmentvariablew;
+const LAST_WINAPI_ID: WinApiId = WinApiId::D3d9Idirect3ddevice9Createindexbuffer;
 
 /// Static (library, name, id) rows for one-time resolution.
 static WINAPI_NAME_ROWS: &[(&str, &str, WinApiId)] = &[
@@ -1435,6 +1493,81 @@ static WINAPI_NAME_ROWS: &[(&str, &str, WinApiId)] = &[
         "idirect3d9::release",
         WinApiId::D3d9Idirect3d9Release,
     ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::present",
+        WinApiId::D3d9Idirect3ddevice9Present,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::beginscene",
+        WinApiId::D3d9Idirect3ddevice9Beginscene,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::endscene",
+        WinApiId::D3d9Idirect3ddevice9Endscene,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::clear",
+        WinApiId::D3d9Idirect3ddevice9Clear,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::settransform",
+        WinApiId::D3d9Idirect3ddevice9Settransform,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::setviewport",
+        WinApiId::D3d9Idirect3ddevice9Setviewport,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::getviewport",
+        WinApiId::D3d9Idirect3ddevice9Getviewport,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::drawprimitive",
+        WinApiId::D3d9Idirect3ddevice9Drawprimitive,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::drawindexedprimitive",
+        WinApiId::D3d9Idirect3ddevice9Drawindexedprimitive,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::drawprimitiveup",
+        WinApiId::D3d9Idirect3ddevice9Drawprimitiveup,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::drawindexedprimitiveup",
+        WinApiId::D3d9Idirect3ddevice9Drawindexedprimitiveup,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::setstreamsource",
+        WinApiId::D3d9Idirect3ddevice9Setstreamsource,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::setindices",
+        WinApiId::D3d9Idirect3ddevice9Setindices,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::createvertexbuffer",
+        WinApiId::D3d9Idirect3ddevice9Createvertexbuffer,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::createindexbuffer",
+        WinApiId::D3d9Idirect3ddevice9Createindexbuffer,
+    ),
     ("user32.dll", "getmenu", WinApiId::User32Getmenu),
     ("gdi32.dll", "getstockobject", WinApiId::Gdi32Getstockobject),
     (
@@ -1502,6 +1635,141 @@ static WINAPI_NAME_ROWS: &[(&str, &str, WinApiId)] = &[
         "setenvironmentvariablew",
         WinApiId::Kernel32Setenvironmentvariablew,
     ),
+    (
+        "user32.dll",
+        "createwindowexa",
+        WinApiId::User32Createwindowexa,
+    ),
+    (
+        "user32.dll",
+        "createwindowexw",
+        WinApiId::User32Createwindowexw,
+    ),
+    ("user32.dll", "destroywindow", WinApiId::User32Destroywindow),
+    (
+        "user32.dll",
+        "postquitmessage",
+        WinApiId::User32Postquitmessage,
+    ),
+    ("user32.dll", "getmessagew", WinApiId::User32Getmessagew),
+    ("user32.dll", "peekmessagew", WinApiId::User32Peekmessagew),
+    (
+        "user32.dll",
+        "dispatchmessagew",
+        WinApiId::User32Dispatchmessagew,
+    ),
+    ("user32.dll", "postmessagew", WinApiId::User32Postmessagew),
+    (
+        "user32.dll",
+        "registerclassa",
+        WinApiId::User32Registerclassa,
+    ),
+    (
+        "user32.dll",
+        "registerclassw",
+        WinApiId::User32Registerclassw,
+    ),
+    (
+        "user32.dll",
+        "unregisterclassa",
+        WinApiId::User32Unregisterclassa,
+    ),
+    (
+        "user32.dll",
+        "unregisterclassw",
+        WinApiId::User32Unregisterclassw,
+    ),
+    ("user32.dll", "validaterect", WinApiId::User32Validateirect),
+    (
+        "user32.dll",
+        "setwindowlonga",
+        WinApiId::User32Setwindowlonga,
+    ),
+    (
+        "user32.dll",
+        "setwindowlongw",
+        WinApiId::User32Setwindowlongw,
+    ),
+    ("user32.dll", "getwindowdc", WinApiId::User32Getwindowdc),
+    ("user32.dll", "getclassnamea", WinApiId::User32Getclassnamea),
+    ("user32.dll", "getclassnamew", WinApiId::User32Getclassnamew),
+    (
+        "user32.dll",
+        "getclasslongptra",
+        WinApiId::User32Getclasslongptra,
+    ),
+    (
+        "user32.dll",
+        "getclasslongptrw",
+        WinApiId::User32Getclasslongptrw,
+    ),
+    (
+        "user32.dll",
+        "setclasslongptra",
+        WinApiId::User32Setclasslongptra,
+    ),
+    (
+        "user32.dll",
+        "setclasslongptrw",
+        WinApiId::User32Setclasslongptrw,
+    ),
+    ("user32.dll", "drawmenubar", WinApiId::User32Drawmenubar),
+    ("user32.dll", "getmenustate", WinApiId::User32Getmenustate),
+    (
+        "gdi32.dll",
+        "createsolidbrush",
+        WinApiId::Gdi32Createsolidbrush,
+    ),
+    ("user32.dll", "fillrect", WinApiId::User32Fillrect),
+    ("gdi32.dll", "createpen", WinApiId::Gdi32Createpen),
+    ("gdi32.dll", "textoutw", WinApiId::Gdi32Textoutw),
+    ("user32.dll", "drawtexta", WinApiId::Gdi32Drawtexta),
+    ("user32.dll", "drawtextw", WinApiId::Gdi32Drawtextw),
+    (
+        "user32.dll",
+        "createdialogparama",
+        WinApiId::User32Createdialogparama,
+    ),
+    (
+        "user32.dll",
+        "createdialogparamw",
+        WinApiId::User32Createdialogparamw,
+    ),
+    (
+        "user32.dll",
+        "isdialogmessagea",
+        WinApiId::User32Isdialogmessagea,
+    ),
+    (
+        "user32.dll",
+        "isdialogmessagew",
+        WinApiId::User32Isdialogmessagew,
+    ),
+    ("user32.dll", "enddialog", WinApiId::User32Enddialog),
+    ("user32.dll", "getdlgitema", WinApiId::User32Getdlgitema),
+    ("user32.dll", "getdlgitemw", WinApiId::User32Getdlgitemw),
+    (
+        "user32.dll",
+        "getdlgitemtexta",
+        WinApiId::User32Getdlgitemtexta,
+    ),
+    (
+        "user32.dll",
+        "getdlgitemtextw",
+        WinApiId::User32Getdlgitemtextw,
+    ),
+    (
+        "user32.dll",
+        "setdlgitemtexta",
+        WinApiId::User32Setdlgitemtexta,
+    ),
+    (
+        "user32.dll",
+        "setdlgitemtextw",
+        WinApiId::User32Setdlgitemtextw,
+    ),
+    ("user32.dll", "defdlgproca", WinApiId::User32Defdlgproca),
+    ("user32.dll", "defdlgprocw", WinApiId::User32Defdlgprocw),
 ];
 
 /// Resolve library/export to id. Case-insensitive, allocation-free.
@@ -2046,6 +2314,25 @@ pub fn dispatch_winapi_id(
             d3d9::handle_set_texture_stage_state(ctx)
         }
         WinApiId::D3d9Idirect3ddevice9Setsamplerstate => d3d9::handle_set_sampler_state(ctx),
+        WinApiId::D3d9Idirect3ddevice9Present => d3d9::handle_present(ctx),
+        WinApiId::D3d9Idirect3ddevice9Beginscene => d3d9::handle_begin_scene(ctx),
+        WinApiId::D3d9Idirect3ddevice9Endscene => d3d9::handle_end_scene(ctx),
+        WinApiId::D3d9Idirect3ddevice9Clear => d3d9::handle_clear(ctx),
+        WinApiId::D3d9Idirect3ddevice9Settransform => d3d9::handle_set_transform(ctx),
+        WinApiId::D3d9Idirect3ddevice9Setviewport => d3d9::handle_set_viewport(ctx),
+        WinApiId::D3d9Idirect3ddevice9Getviewport => d3d9::handle_get_viewport(ctx),
+        WinApiId::D3d9Idirect3ddevice9Drawprimitive => d3d9::handle_draw_primitive(ctx),
+        WinApiId::D3d9Idirect3ddevice9Drawindexedprimitive => {
+            d3d9::handle_draw_indexed_primitive(ctx)
+        }
+        WinApiId::D3d9Idirect3ddevice9Drawprimitiveup => d3d9::handle_draw_primitive_up(ctx),
+        WinApiId::D3d9Idirect3ddevice9Drawindexedprimitiveup => {
+            d3d9::handle_draw_indexed_primitive_up(ctx)
+        }
+        WinApiId::D3d9Idirect3ddevice9Setstreamsource => d3d9::handle_set_stream_source(ctx),
+        WinApiId::D3d9Idirect3ddevice9Setindices => d3d9::handle_set_indices(ctx),
+        WinApiId::D3d9Idirect3ddevice9Createvertexbuffer => d3d9::handle_create_vertex_buffer(ctx),
+        WinApiId::D3d9Idirect3ddevice9Createindexbuffer => d3d9::handle_create_index_buffer(ctx),
         WinApiId::User32Enablemenuitem => user32::handle_enable_menu_item(ctx),
         WinApiId::User32Checkmenuitem => user32::handle_check_menu_item(ctx),
         WinApiId::User32Getmessagea => user32::handle_get_message_a(ctx),
@@ -2103,6 +2390,49 @@ pub fn dispatch_winapi_id(
         WinApiId::Kernel32Setenvironmentvariablew => {
             kernel32::environment::handle_set_environment_variable_w(ctx)
         }
+        WinApiId::User32Createwindowexa => user32::handle_create_window_ex_a(ctx),
+        WinApiId::User32Createwindowexw => user32::handle_create_window_ex_w(ctx),
+        WinApiId::User32Destroywindow => user32::handle_destroy_window(ctx),
+        WinApiId::User32Postquitmessage => user32::handle_post_quit_message(ctx),
+        WinApiId::User32Getmessagew => user32::handle_get_message_w(ctx),
+        WinApiId::User32Peekmessagew => user32::handle_peek_message_w(ctx),
+        WinApiId::User32Dispatchmessagew => user32::handle_dispatch_message_w(ctx),
+        WinApiId::User32Postmessagew => user32::handle_post_message_w(ctx),
+        WinApiId::User32Registerclassa => user32::handle_register_class_a(ctx),
+        WinApiId::User32Registerclassw => user32::handle_register_class_w(ctx),
+        WinApiId::User32Unregisterclassa => user32::handle_unregister_class_a(ctx),
+        WinApiId::User32Unregisterclassw => user32::handle_unregister_class_w(ctx),
+        WinApiId::User32Validateirect => user32::handle_validate_rect(ctx),
+        WinApiId::User32Setwindowlonga => user32::handle_set_window_long_a(ctx),
+        WinApiId::User32Setwindowlongw => user32::handle_set_window_long_w(ctx),
+        WinApiId::User32Getwindowdc => user32::handle_get_window_dc(ctx),
+        WinApiId::User32Getclassnamea => user32::handle_get_class_name_a(ctx),
+        WinApiId::User32Getclassnamew => user32::handle_get_class_name_w(ctx),
+        WinApiId::User32Getclasslongptra => user32::handle_get_class_long_ptr_a(ctx),
+        WinApiId::User32Getclasslongptrw => user32::handle_get_class_long_ptr_w(ctx),
+        WinApiId::User32Setclasslongptra => user32::handle_set_class_long_ptr_a(ctx),
+        WinApiId::User32Setclasslongptrw => user32::handle_set_class_long_ptr_w(ctx),
+        WinApiId::User32Drawmenubar => user32::handle_draw_menu_bar(ctx),
+        WinApiId::User32Getmenustate => user32::handle_get_menu_state(ctx),
+        WinApiId::Gdi32Createsolidbrush => gdi32::handle_create_solid_brush(ctx),
+        WinApiId::User32Fillrect => gdi32::handle_fill_rect(ctx),
+        WinApiId::Gdi32Createpen => gdi32::handle_create_pen(ctx),
+        WinApiId::Gdi32Textoutw => gdi32::handle_text_out_w(ctx),
+        WinApiId::Gdi32Drawtexta => gdi32::handle_draw_text_a(ctx),
+        WinApiId::Gdi32Drawtextw => gdi32::handle_draw_text_w(ctx),
+        WinApiId::User32Createdialogparama => user32::handle_create_dialog_param_a(ctx),
+        WinApiId::User32Createdialogparamw => user32::handle_create_dialog_param_w(ctx),
+        WinApiId::User32Isdialogmessagea => user32::handle_is_dialog_message_a(ctx),
+        WinApiId::User32Isdialogmessagew => user32::handle_is_dialog_message_w(ctx),
+        WinApiId::User32Enddialog => user32::handle_end_dialog(ctx),
+        WinApiId::User32Getdlgitema => user32::handle_get_dlg_item_a(ctx),
+        WinApiId::User32Getdlgitemw => user32::handle_get_dlg_item_w(ctx),
+        WinApiId::User32Getdlgitemtexta => user32::handle_get_dlg_item_text_a(ctx),
+        WinApiId::User32Getdlgitemtextw => user32::handle_get_dlg_item_text_w(ctx),
+        WinApiId::User32Setdlgitemtexta => user32::handle_set_dlg_item_text_a(ctx),
+        WinApiId::User32Setdlgitemtextw => user32::handle_set_dlg_item_text_w(ctx),
+        WinApiId::User32Defdlgproca => user32::handle_def_dlg_proc_a(ctx),
+        WinApiId::User32Defdlgprocw => user32::handle_def_dlg_proc_w(ctx),
     }
 }
 
@@ -2255,6 +2585,11 @@ static WINAPI_TRAITS: [WinApiTraits; WINAPI_ID_COUNT] = {
     t[WinApiId::Kernel32Encodepointer as u16 as usize] = guest_stub;
     t[WinApiId::Kernel32Decodepointer as u16 as usize] = guest_stub;
     t[WinApiId::Kernel32Gettickcount as u16 as usize] = guest_stub;
+    // B5: clock APIs read the host-written guest clock table in-guest.
+    t[WinApiId::Kernel32Gettickcount64 as u16 as usize] = guest_stub;
+    t[WinApiId::Kernel32Getsystemtimeasfiletime as u16 as usize] = guest_stub;
+    t[WinApiId::Kernel32Queryperformancecounter as u16 as usize] = guest_stub;
+    t[WinApiId::WinmmTimegettime as u16 as usize] = guest_stub;
     t[WinApiId::Kernel32Getcurrentprocessid as u16 as usize] = guest_stub;
     t[WinApiId::Kernel32Getcurrentthreadid as u16 as usize] = guest_stub;
     t[WinApiId::Kernel32Sleep as u16 as usize] = guest_stub;

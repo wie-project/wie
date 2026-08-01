@@ -1,9 +1,8 @@
 use super::{
     Context, DIALOG_BASE_UNIT_X, DIALOG_BASE_UNIT_Y, FAKE_CURSOR_HANDLE, FAKE_ICON_HANDLE,
-    FAKE_IMAGE_HANDLE, FAKE_WINDOW_HANDLE, HandlerContext, IDOK, Result, TimerRecord,
-    WinApiHandlerResult, WinApiState, WindowClassRecord, WindowsHookRecord, checked_field_address,
-    low_i32, read_guest_ansi_lossy, read_guest_i32, read_guest_u32, read_guest_u64,
-    read_guest_utf16_lossy, register_window_class,
+    FAKE_IMAGE_HANDLE, HandlerContext, IDOK, Result, TimerRecord, WinApiHandlerResult, WinApiState,
+    WindowClassRecord, WindowsHookRecord, checked_field_address, low_i32, read_guest_ansi_lossy,
+    read_guest_i32, read_guest_u32, read_guest_u64, read_guest_utf16_lossy, register_window_class,
 };
 
 /// Handles `USER32.dll!LoadIconA`.
@@ -412,7 +411,8 @@ pub fn handle_set_timer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 
     let callback_address = engine.read_r9().context("failed to read R9 for SetTimer")?;
 
-    let valid_window = window_handle == 0 || window_handle == FAKE_WINDOW_HANDLE;
+    // Thread timers (hwnd == 0) and any known window are accepted.
+    let valid_window = window_handle == 0 || super::is_known_window(state, window_handle);
 
     let interval_low = interval_raw & u64::from(u32::MAX);
 
@@ -441,14 +441,24 @@ pub fn handle_set_timer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
         {
             timer.interval_ms = interval_ms;
             timer.callback_address = callback_address;
+            timer.next_fire = timer_deadline(interval_ms);
         } else {
             state.window_state().timers.push(TimerRecord {
                 window_handle,
                 timer_id,
                 interval_ms,
                 callback_address,
+                next_fire: timer_deadline(interval_ms),
             });
         }
+
+        tracing::debug!(
+            target: "wiegui",
+            hwnd = window_handle,
+            timer_id,
+            interval_ms,
+            "SetTimer"
+        );
 
         timer_id
     } else {
@@ -481,6 +491,14 @@ pub fn handle_kill_timer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
         .timers
         .iter()
         .any(|timer| timer.window_handle == window_handle && timer.timer_id == timer_id);
+
+    tracing::debug!(
+        target: "wiegui",
+        hwnd = window_handle,
+        timer_id,
+        existed,
+        "KillTimer"
+    );
 
     if existed {
         state
@@ -665,4 +683,18 @@ pub(crate) fn window_client_size(state: &mut WinApiState, handle: u64) -> (i32, 
         state.window_state().window_width.max(1),
         state.window_state().window_height.max(1),
     )
+}
+
+/// Host-clock deadline for the next timer fire, `interval_ms` from now.
+///
+/// A zero interval is floored to 1 ms so a pathological `SetTimer(…, 0, …)`
+/// cannot busy-loop the message pump.
+#[must_use]
+pub(crate) fn timer_deadline(interval_ms: u32) -> std::time::Instant {
+    let delay = std::time::Duration::from_millis(u64::from(interval_ms.max(1)));
+    let now = std::time::Instant::now();
+    now.checked_add(delay).unwrap_or_else(|| {
+        now.checked_add(std::time::Duration::from_secs(1))
+            .unwrap_or(now)
+    })
 }

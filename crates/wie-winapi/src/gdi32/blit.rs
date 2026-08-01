@@ -1,0 +1,888 @@
+use anyhow::{Context, Result};
+
+use crate::guest_memory::{
+    checked_field_address, read_i32 as read_guest_i32, read_u64 as read_guest_u64,
+};
+use crate::user32::WS_CLIPCHILDREN;
+use crate::{
+    HandlerContext, WinApiHandlerResult, WinApiState, WindowRecord, gdi32::DcKind,
+    gdi32::pixel::clip_blit_rect, gdi32::state::brush_color, user32::low_i32,
+};
+use wie_cpu::mask_bgra_to_0rgb;
+
+/// ROP codes.
+const SRCCOPY: u32 = 0x00CC_0020;
+const BLACKNESS: u32 = 0x0000_0042;
+const WHITENESS: u32 = 0x00FF_0062;
+
+/// Axis-aligned integer rect with an exclusive right/bottom edge.
+///
+/// Also carried by [`crate::present::SurfaceFrame::region`] and
+/// [`crate::present::WindowSurface::dirty`] as the B3 partial-repaint region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IRect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+impl IRect {
+    /// Degenerate (empty) rect — "nothing dirty" in a [`crate::present`]
+    /// dirty accumulator (the inverse of `None`, which means "full surface").
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        }
+    }
+
+    /// Width (may be zero/negative for degenerate rects).
+    #[must_use]
+    pub fn width(self) -> i32 {
+        self.right.saturating_sub(self.left)
+    }
+
+    /// Height (may be zero/negative for degenerate rects).
+    #[must_use]
+    pub fn height(self) -> i32 {
+        self.bottom.saturating_sub(self.top)
+    }
+
+    /// Whether this rect overlaps `other` (strict, exclusive edges).
+    #[must_use]
+    fn intersects(self, other: Self) -> bool {
+        self.left < other.right
+            && other.left < self.right
+            && self.top < other.bottom
+            && other.top < self.bottom
+    }
+}
+
+/// Subtract one child rect from a set of rects (exact decomposition).
+///
+/// Every input rect that overlaps `child` is replaced by the up-to-four
+/// disjoint pieces outside it (left / right / above / below). Applying this
+/// once per child, with non-overlapping children, leaves a set whose union is
+/// exactly the destination minus the children — the WS_CLIPCHILDREN clip.
+pub(crate) fn subtract_rect(rects: Vec<IRect>, child: IRect) -> Vec<IRect> {
+    let mut out = Vec::new();
+    for rect in rects {
+        if !rect.intersects(child) {
+            out.push(rect);
+            continue;
+        }
+        // Left of the child, spanning the rect's full height.
+        if rect.left < child.left {
+            out.push(IRect {
+                left: rect.left,
+                top: rect.top,
+                right: child.left.min(rect.right),
+                bottom: rect.bottom,
+            });
+        }
+        // Right of the child, spanning the rect's full height.
+        if rect.right > child.right {
+            out.push(IRect {
+                left: child.right.max(rect.left),
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.bottom,
+            });
+        }
+        // Band above the child, clipped to the child's horizontal span.
+        if rect.top < child.top {
+            out.push(IRect {
+                left: child.left.max(rect.left),
+                top: rect.top,
+                right: child.right.min(rect.right),
+                bottom: child.top.min(rect.bottom),
+            });
+        }
+        // Band below the child, clipped to the child's horizontal span.
+        if rect.bottom > child.bottom {
+            out.push(IRect {
+                left: child.left.max(rect.left),
+                top: child.bottom.max(rect.top),
+                right: child.right.min(rect.right),
+                bottom: rect.bottom,
+            });
+        }
+    }
+    out
+}
+
+/// Walk `windows` from `hwnd` to its top-level ancestor, accumulating the
+/// starting window's position in the ancestor's client coordinate space.
+///
+/// A broken parent chain (parent not in `windows`) falls back to `hwnd` itself
+/// with offset (0, 0), preserving the pre-child-model behavior for orphans.
+/// Returns `None` when `hwnd` itself is unknown.
+#[must_use]
+pub(crate) fn ancestor_offset(windows: &[WindowRecord], hwnd: u64) -> Option<(u64, i32, i32)> {
+    let mut current = hwnd;
+    let mut offset_x = 0_i32;
+    let mut offset_y = 0_i32;
+    loop {
+        let window = windows.iter().find(|w| w.handle == current)?;
+        let parent = window.parent_handle;
+        if parent == 0 || parent == current {
+            return Some((current, offset_x, offset_y));
+        }
+        if !windows.iter().any(|w| w.handle == parent) {
+            return Some((current, offset_x, offset_y));
+        }
+        offset_x = offset_x.saturating_add(window.x);
+        offset_y = offset_y.saturating_add(window.y);
+        current = parent;
+    }
+}
+
+/// Destination surface info for a window DC or a control paint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResolvedWindow {
+    /// Top-level ancestor whose present surface receives the pixels.
+    pub hwnd: u64,
+    /// Ancestor client size — the surface dimensions.
+    pub width: u32,
+    /// Ancestor client size — the surface dimensions.
+    pub height: u32,
+    /// Position of the DC's window within the ancestor client space.
+    pub offset_x: i32,
+    /// Position of the DC's window within the ancestor client space.
+    pub offset_y: i32,
+    /// The DC's own window handle (for the WS_CLIPCHILDREN child lookup).
+    pub dc_window: u64,
+    /// The DC window's own client size — the destination clip bounds.
+    pub dc_w: u32,
+    /// The DC window's own client size — the destination clip bounds.
+    pub dc_h: u32,
+}
+
+/// Resolve a window to its top-level ancestor surface + relative offset.
+///
+/// Children composite into the ancestor's surface at the accumulated
+/// parent-relative offset, so a child's `BitBlt(0,0,…)` lands where the child
+/// sits inside the top-level window.
+pub(crate) fn resolve_window_ancestor(
+    state: &mut WinApiState,
+    hwnd: u64,
+) -> Option<ResolvedWindow> {
+    let (top_hwnd, offset_x, offset_y) = ancestor_offset(&state.window_state().windows, hwnd)?;
+    let (w, h) = crate::user32::window_client_size(state, top_hwnd);
+    let (dc_w, dc_h) = crate::user32::window_client_size(state, hwnd);
+    Some(ResolvedWindow {
+        hwnd: top_hwnd,
+        width: u32::try_from(w.max(1)).unwrap_or(1),
+        height: u32::try_from(h.max(1)).unwrap_or(1),
+        offset_x,
+        offset_y,
+        dc_window: hwnd,
+        dc_w: u32::try_from(dc_w.max(1)).unwrap_or(1),
+        dc_h: u32::try_from(dc_h.max(1)).unwrap_or(1),
+    })
+}
+
+/// Resolve a DC handle to the destination surface it paints into.
+///
+/// `DcKind::Window` surfaces live on the top-level ancestor (children
+/// composite at their offset); memory and screen DCs have no writable
+/// destination and resolve to `None`.
+pub(crate) fn resolve_dest_info(state: &mut WinApiState, dc_handle: u64) -> Option<ResolvedWindow> {
+    let dc = state.gdi_state().find_dc(dc_handle)?.clone();
+    match dc.kind {
+        DcKind::Window(hwnd) => resolve_window_ancestor(state, hwnd),
+        DcKind::Memory | DcKind::Screen => None,
+    }
+}
+
+/// Destination fill/blit rects for a BitBlt-style operation, in the DC
+/// window's local coordinates.
+///
+/// The requested rect is clipped to the DC window's client area, then — when
+/// the window has `WS_CLIPCHILDREN` — each visible child's rect is subtracted
+/// so a parent repaint cannot erase its children.
+fn dest_rects(
+    state: &mut WinApiState,
+    info: &ResolvedWindow,
+    x: i32,
+    y: i32,
+    cx: i32,
+    cy: i32,
+) -> Vec<IRect> {
+    let dest_w = i32::try_from(info.dc_w).unwrap_or(i32::MAX);
+    let dest_h = i32::try_from(info.dc_h).unwrap_or(i32::MAX);
+    let Some((dx, dy, _sx, _sy, cw, ch)) =
+        clip_blit_rect(dest_w, dest_h, i32::MAX, i32::MAX, x, y, x, y, cx, cy)
+    else {
+        return Vec::new();
+    };
+    let mut rects = vec![IRect {
+        left: dx,
+        top: dy,
+        right: dx.saturating_add(cw),
+        bottom: dy.saturating_add(ch),
+    }];
+    let dc_style = state
+        .window_state()
+        .windows
+        .iter()
+        .find(|w| w.handle == info.dc_window)
+        .map_or(0, |w| w.style);
+    if dc_style & WS_CLIPCHILDREN != 0 {
+        let children: Vec<IRect> = state
+            .window_state()
+            .windows
+            .iter()
+            .filter(|w| w.parent_handle == info.dc_window && w.visible)
+            .map(|w| IRect {
+                left: w.x,
+                top: w.y,
+                right: w.x.saturating_add(w.width),
+                bottom: w.y.saturating_add(w.height),
+            })
+            .collect();
+        for child in children {
+            rects = subtract_rect(rects, child);
+        }
+    }
+    rects
+}
+
+/// Resolve a source DC to (bits_va, stride, src_w, src_h, top_down).
+fn resolve_src_info(
+    state: &mut crate::WinApiState,
+    dc_handle: u64,
+) -> Option<(u64, i32, i32, i32, bool)> {
+    let dc = state.gdi_state().find_dc(dc_handle)?.clone();
+    let dib_handle = dc.selected_bitmap?;
+    let dib = state.gdi_state().find_dib(dib_handle)?.clone();
+    if dib.bit_count != 32 {
+        return None;
+    }
+    // Saturate at i32::MAX: the old `as` wrapped i32::MIN's magnitude negative.
+    let w = i32::try_from(dib.width.unsigned_abs()).unwrap_or(i32::MAX);
+    let h = i32::try_from(dib.height.unsigned_abs()).unwrap_or(i32::MAX);
+    Some((dib.bits_va, dib.stride, w, h, dib.height < 0))
+}
+
+/// Copy 32-bpp pixels from guest memory into a destination surface row buffer.
+#[allow(clippy::too_many_arguments)]
+fn blit_row(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    src_va: u64,
+    src_stride: i32,
+    src_x: i32,
+    src_y: i32,
+    src_h: i32,
+    top_down: bool,
+    dest: &mut [u32],
+    dest_w: u32,
+    dest_x: i32,
+    dest_y: i32,
+    width: i32,
+    height: i32,
+) {
+    let row_bytes = usize::try_from(width).unwrap_or(0).saturating_mul(4);
+    if row_bytes == 0 {
+        return;
+    }
+
+    let ch = usize::try_from(height).unwrap_or(0);
+    let stride = usize::try_from(src_stride).unwrap_or(0);
+    if ch == 0 || row_bytes > stride {
+        return; // malformed source; skip rather than over-read
+    }
+
+    let src_x_us = usize::try_from(src_x).unwrap_or(0);
+    let src_y_us = usize::try_from(src_y).unwrap_or(0);
+    let src_h_us = usize::try_from(src_h).unwrap_or(0);
+    let dest_w_us = usize::try_from(dest_w).unwrap_or(0);
+    let dest_x_us = usize::try_from(dest_x).unwrap_or(0);
+    let dest_y_us = usize::try_from(dest_y).unwrap_or(0);
+    let width_us = usize::try_from(width).unwrap_or(0);
+
+    // First guest row covered by the span (guest row coordinates).
+    let span_first = if top_down {
+        src_y_us
+    } else {
+        src_h_us
+            .saturating_sub(1)
+            .saturating_sub(src_y_us)
+            .saturating_sub(ch.saturating_sub(1))
+    };
+    let span_va = src_va
+        .saturating_add(u64::try_from(span_first.saturating_mul(stride)).unwrap_or(0))
+        .saturating_add(u64::try_from(src_x_us.saturating_mul(4)).unwrap_or(0));
+    let span_len = ch.saturating_mul(stride);
+
+    // ONE mem_read for the entire blit span — a single translation and
+    // bounds check instead of one per row (the old per-row loop dominated
+    // the blit cost for large windows).
+    let mut scratch = vec![0u8; span_len];
+    if engine.mem_read(span_va, &mut scratch).is_err() {
+        return;
+    }
+
+    for row in 0..ch {
+        // Row index within the span (reversed for bottom-up DIBs).
+        let span_row = if top_down {
+            row
+        } else {
+            ch.saturating_sub(1).saturating_sub(row)
+        };
+        // `span_va` already advanced by `src_x * 4`, so the row read is a
+        // plain stride offset — re-adding `src_x` would double the column.
+        let src_off = span_row.saturating_mul(stride);
+        let Some(row_slice) = scratch.get(src_off..src_off.saturating_add(row_bytes)) else {
+            return;
+        };
+
+        let dst_row = dest_y_us.saturating_add(row);
+        let dst_offset = dst_row.saturating_mul(dest_w_us).saturating_add(dest_x_us);
+        let dst_end = dst_offset.saturating_add(width_us).min(dest.len());
+        let Some(dst_slice) = dest.get_mut(dst_offset..dst_end) else {
+            return;
+        };
+
+        // BGRA → 0RGB: DIB pixel is 0xAARRGGBB in LE, mask alpha.
+        // NEON-vectorized (4 px/op) so the conversion is fast even in debug.
+        mask_bgra_to_0rgb(dst_slice, row_slice);
+    }
+}
+
+/// Fill a rectangular region of a surface with a constant color.
+///
+/// `publish == false` is used by control painting: the control's WM_PAINT
+/// draws into the ancestor surface without publishing — the ancestor's own
+/// WM_PAINT BitBlt publishes the composite frame.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fill_rect_surface(
+    state: &mut crate::WinApiState,
+    hwnd: u64,
+    dest_w: u32,
+    dest_h: u32,
+    x: i32,
+    y: i32,
+    cx: i32,
+    cy: i32,
+    color: u32,
+    publish: bool,
+) {
+    state.present().ensure_surface(hwnd, dest_w, dest_h);
+    // B3: accumulate the fill rect into the surface's dirty region so a
+    // partial publish can copy only what changed. Covers PatBlt, FillRect,
+    // BitBlt BLACKNESS/WHITENESS, control faces, dialog faces and window
+    // background erases — every fill-based surface writer.
+    state.present().mark_dirty(
+        hwnd,
+        IRect {
+            left: x,
+            top: y,
+            right: x.saturating_add(cx),
+            bottom: y.saturating_add(cy),
+        },
+    );
+    if let Some(surf) = state.present().surfaces.get_mut(&hwnd) {
+        let dest_w_u = usize::try_from(surf.width).unwrap_or(0);
+        let row_bytes = usize::try_from(cx.max(0)).unwrap_or(0);
+        let dest_y_s = usize::try_from(y.max(0)).unwrap_or(0);
+        let dest_x_s = usize::try_from(x.max(0)).unwrap_or(0);
+        let h = usize::try_from(cy.max(0)).unwrap_or(0);
+        let surf_height = usize::try_from(surf.height).unwrap_or(0);
+        for row in dest_y_s..dest_y_s.saturating_add(h).min(surf_height) {
+            let start = row.saturating_mul(dest_w_u).saturating_add(dest_x_s);
+            let end = start.saturating_add(row_bytes).min(surf.pixels.len());
+            if let Some(pixels) = surf.pixels.get_mut(start..end) {
+                for px in pixels {
+                    *px = color;
+                }
+            }
+        }
+    }
+    if publish {
+        state.present().publish(hwnd);
+    }
+}
+
+/// Handles `GDI32.dll!BitBlt` — real 32-bpp SRCCOPY blit to window surfaces.
+pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let hdc_dst = engine.read_rcx().context("failed to read RCX for BitBlt")?;
+    let x = low_i32(
+        engine.read_rdx().context("failed to read RDX for BitBlt")?,
+        "BitBlt x",
+    )?;
+    let y = low_i32(
+        engine.read_r8().context("failed to read R8 for BitBlt")?,
+        "BitBlt y",
+    )?;
+    let cx = low_i32(
+        engine.read_r9().context("failed to read R9 for BitBlt")?,
+        "BitBlt cx",
+    )?;
+    let rsp = engine.read_rsp().context("failed to read RSP for BitBlt")?;
+    let cy = read_guest_i32(engine, checked_field_address(rsp, 0x28, "BitBlt cy"))
+        .context("failed to read BitBlt cy")?;
+    let hdc_src = read_guest_u64(engine, checked_field_address(rsp, 0x30, "BitBlt hdcSrc"))
+        .context("failed to read BitBlt hdcSrc")?;
+    let x1 = read_guest_i32(engine, checked_field_address(rsp, 0x38, "BitBlt x1"))
+        .context("failed to read BitBlt x1")?;
+    let y1 = read_guest_i32(engine, checked_field_address(rsp, 0x40, "BitBlt y1"))
+        .context("failed to read BitBlt y1")?;
+    let rop_raw = read_guest_i32(engine, checked_field_address(rsp, 0x48, "BitBlt rop"))
+        .context("failed to read BitBlt rop")?;
+    // ROP is a DWORD; a negative value is an unsupported code either way.
+    let rop = u32::try_from(rop_raw).unwrap_or(0);
+
+    tracing::trace!(target: "wiegui", x, y, cx, cy, rop, "BitBlt");
+
+    if rop != SRCCOPY && rop != BLACKNESS && rop != WHITENESS {
+        tracing::debug!(rop, "BitBlt unsupported ROP, returning success");
+        let ra = engine
+            .return_from_win64_api(1)
+            .context("failed to return from BitBlt")?;
+        return Ok(WinApiHandlerResult {
+            return_address: ra,
+            return_value: 1,
+        });
+    }
+
+    // BLACKNESS / WHITENESS: solid fill, no source needed.
+    if rop == BLACKNESS || rop == WHITENESS {
+        let color = if rop == BLACKNESS { 0 } else { 0x00FF_FFFF };
+        if let Some(info) = resolve_dest_info(state, hdc_dst) {
+            for rect in dest_rects(state, &info, x, y, cx, cy) {
+                fill_rect_surface(
+                    state,
+                    info.hwnd,
+                    info.width,
+                    info.height,
+                    rect.left.saturating_add(info.offset_x),
+                    rect.top.saturating_add(info.offset_y),
+                    rect.width(),
+                    rect.height(),
+                    color,
+                    true,
+                );
+            }
+        }
+        let ra = engine
+            .return_from_win64_api(1)
+            .context("failed to return from BitBlt")?;
+        return Ok(WinApiHandlerResult {
+            return_address: ra,
+            return_value: 1,
+        });
+    }
+
+    // SRCCOPY path: read from source DIB, write to destination surface.
+    let Some((src_va, src_stride, src_w, src_h, top_down)) = resolve_src_info(state, hdc_src)
+    else {
+        tracing::debug!("BitBlt: invalid source");
+        let ra = engine
+            .return_from_win64_api(1)
+            .context("failed to return from BitBlt")?;
+        return Ok(WinApiHandlerResult {
+            return_address: ra,
+            return_value: 1,
+        });
+    };
+    let Some(info) = resolve_dest_info(state, hdc_dst) else {
+        let ra = engine
+            .return_from_win64_api(1)
+            .context("failed to return from BitBlt")?;
+        return Ok(WinApiHandlerResult {
+            return_address: ra,
+            return_value: 1,
+        });
+    };
+
+    // Clip. Window sizes beyond i32::MAX (unreachable for real screens)
+    // saturate positive instead of wrapping negative like the old `as`.
+    let dest_w_i = i32::try_from(info.dc_w).unwrap_or(i32::MAX);
+    let dest_h_i = i32::try_from(info.dc_h).unwrap_or(i32::MAX);
+    let Some((dx, dy, sx, sy, cw, ch)) =
+        clip_blit_rect(dest_w_i, dest_h_i, src_w, src_h, x, y, x1, y1, cx, cy)
+    else {
+        let ra = engine
+            .return_from_win64_api(1)
+            .context("failed to return from BitBlt")?;
+        return Ok(WinApiHandlerResult {
+            return_address: ra,
+            return_value: 1,
+        });
+    };
+
+    // WS_CLIPCHILDREN: decompose the dest rect around visible children so a
+    // parent repaint cannot erase its controls.
+    let mut rects = vec![IRect {
+        left: dx,
+        top: dy,
+        right: dx.saturating_add(cw),
+        bottom: dy.saturating_add(ch),
+    }];
+    let dc_style = state
+        .window_state()
+        .windows
+        .iter()
+        .find(|w| w.handle == info.dc_window)
+        .map_or(0, |w| w.style);
+    if dc_style & WS_CLIPCHILDREN != 0 {
+        let children: Vec<IRect> = state
+            .window_state()
+            .windows
+            .iter()
+            .filter(|w| w.parent_handle == info.dc_window && w.visible)
+            .map(|w| IRect {
+                left: w.x,
+                top: w.y,
+                right: w.x.saturating_add(w.width),
+                bottom: w.y.saturating_add(w.height),
+            })
+            .collect();
+        for child in children {
+            rects = subtract_rect(rects, child);
+        }
+    }
+
+    // Ensure destination surface.
+    state
+        .present()
+        .ensure_surface(info.hwnd, info.width, info.height);
+
+    // B3: accumulate the clipped destination rects (in surface coords) into
+    // the dirty region so the publish can carry a partial region. Done before
+    // the dest borrow below — the blit loop then only writes pixels.
+    for rect in &rects {
+        if rect.width() <= 0 || rect.height() <= 0 {
+            continue;
+        }
+        let surface_x = rect.left.saturating_add(info.offset_x);
+        let surface_y = rect.top.saturating_add(info.offset_y);
+        state.present().mark_dirty(
+            info.hwnd,
+            IRect {
+                left: surface_x,
+                top: surface_y,
+                right: surface_x.saturating_add(rect.width()),
+                bottom: surface_y.saturating_add(rect.height()),
+            },
+        );
+    }
+
+    // B9(c): time the mask copy (copy ①) — only when frame timing is enabled.
+    let blit_t0 = crate::present::frame_timing_enabled().then(std::time::Instant::now);
+
+    // Blit rows: scope the dest borrow so we can re-borrow state for publish.
+    {
+        let dest = state
+            .present()
+            .surfaces
+            .get_mut(&info.hwnd)
+            .map(|s| &mut s.pixels[..]);
+        let Some(dest) = dest else {
+            let ra = engine
+                .return_from_win64_api(1)
+                .context("failed to return from BitBlt")?;
+            return Ok(WinApiHandlerResult {
+                return_address: ra,
+                return_value: 1,
+            });
+        };
+        for rect in rects {
+            let rect_w = rect.width();
+            let rect_h = rect.height();
+            if rect_w <= 0 || rect_h <= 0 {
+                continue;
+            }
+
+            // Each piece keeps its alignment to the source DIB.
+            let piece_src_x = sx.saturating_add(rect.left.saturating_sub(dx));
+            let piece_src_y = sy.saturating_add(rect.top.saturating_sub(dy));
+            let surface_x = rect.left.saturating_add(info.offset_x);
+            let surface_y = rect.top.saturating_add(info.offset_y);
+            blit_row(
+                engine,
+                src_va,
+                src_stride,
+                piece_src_x,
+                piece_src_y,
+                src_h,
+                top_down,
+                dest,
+                info.width,
+                surface_x,
+                surface_y,
+                rect_w,
+                rect_h,
+            );
+        }
+    }
+
+    if let Some(t0) = blit_t0 {
+        state.present().record_blit_copy(t0.elapsed().as_nanos());
+    }
+
+    state.present().publish(info.hwnd);
+
+    let ra = engine
+        .return_from_win64_api(1)
+        .context("failed to return from BitBlt")?;
+    Ok(WinApiHandlerResult {
+        return_address: ra,
+        return_value: 1,
+    })
+}
+
+/// Handles `GDI32.dll!StretchBlt` (stub).
+pub fn handle_stretch_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let _hdc_dst = engine
+        .read_rcx()
+        .context("failed to read RCX for StretchBlt")?;
+    let _x = engine
+        .read_rdx()
+        .context("failed to read RDX for StretchBlt")?;
+    let _y = engine
+        .read_r8()
+        .context("failed to read R8 for StretchBlt")?;
+    let _cx = engine
+        .read_r9()
+        .context("failed to read R9 for StretchBlt")?;
+    let ra = engine
+        .return_from_win64_api(1)
+        .context("failed to return from StretchBlt")?;
+    Ok(WinApiHandlerResult {
+        return_address: ra,
+        return_value: 1,
+    })
+}
+
+/// Handles `GDI32.dll!PatBlt` — fills the rectangle with the DC's current
+/// brush color.
+pub fn handle_pat_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let hdc = engine.read_rcx().context("failed to read RCX for PatBlt")?;
+    let x = low_i32(
+        engine.read_rdx().context("failed to read RDX for PatBlt")?,
+        "PatBlt x",
+    )?;
+    let y = low_i32(
+        engine.read_r8().context("failed to read R8 for PatBlt")?,
+        "PatBlt y",
+    )?;
+    let cx = low_i32(
+        engine.read_r9().context("failed to read R9 for PatBlt")?,
+        "PatBlt cx",
+    )?;
+    let rsp = engine.read_rsp().context("failed to read RSP for PatBlt")?;
+    let cy = read_guest_i32(engine, checked_field_address(rsp, 0x28, "PatBlt cy"))
+        .context("failed to read PatBlt cy")?;
+    let _rop = read_guest_i32(engine, checked_field_address(rsp, 0x30, "PatBlt rop"))
+        .context("failed to read PatBlt rop")?;
+
+    // A DC's default brush is WHITE_BRUSH, mirroring real GDI.
+    let selected_brush = state
+        .gdi_state()
+        .find_dc(hdc)
+        .and_then(|dc| dc.selected_brush)
+        .unwrap_or(crate::gdi32::state::STOCK_WHITE_BRUSH_HANDLE);
+
+    if let Some(color) = brush_color(state, selected_brush)
+        && let Some(info) = resolve_dest_info(state, hdc)
+    {
+        for rect in dest_rects(state, &info, x, y, cx, cy) {
+            fill_rect_surface(
+                state,
+                info.hwnd,
+                info.width,
+                info.height,
+                rect.left.saturating_add(info.offset_x),
+                rect.top.saturating_add(info.offset_y),
+                rect.width(),
+                rect.height(),
+                color,
+                true,
+            );
+        }
+    }
+
+    // NULL_BRUSH / unknown DC: no pixels change, but PatBlt still succeeds.
+    let ra = engine
+        .return_from_win64_api(1)
+        .context("failed to return from PatBlt")?;
+    Ok(WinApiHandlerResult {
+        return_address: ra,
+        return_value: 1,
+    })
+}
+
+/// Handles `GDI32.dll!FillRect` — fills the RECT with the given brush.
+pub fn handle_fill_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let hdc = engine
+        .read_rcx()
+        .context("failed to read RCX for FillRect")?;
+    let rect_ptr = engine
+        .read_rdx()
+        .context("failed to read RDX for FillRect")?;
+    let brush = engine.read_r8().context("failed to read R8 for FillRect")?;
+
+    let mut filled = false;
+    if rect_ptr != 0 {
+        let left = read_guest_i32(engine, rect_ptr).context("failed to read RECT.left")?;
+        let top = read_guest_i32(engine, checked_field_address(rect_ptr, 4, "RECT.top"))
+            .context("failed to read RECT.top")?;
+        let right = read_guest_i32(engine, checked_field_address(rect_ptr, 8, "RECT.right"))
+            .context("failed to read RECT.right")?;
+        let bottom = read_guest_i32(engine, checked_field_address(rect_ptr, 12, "RECT.bottom"))
+            .context("failed to read RECT.bottom")?;
+
+        if let Some(color) = brush_color(state, brush)
+            && let Some(info) = resolve_dest_info(state, hdc)
+        {
+            for rect in dest_rects(
+                state,
+                &info,
+                left,
+                top,
+                right.saturating_sub(left),
+                bottom.saturating_sub(top),
+            ) {
+                fill_rect_surface(
+                    state,
+                    info.hwnd,
+                    info.width,
+                    info.height,
+                    rect.left.saturating_add(info.offset_x),
+                    rect.top.saturating_add(info.offset_y),
+                    rect.width(),
+                    rect.height(),
+                    color,
+                    true,
+                );
+            }
+            filled = true;
+        }
+    }
+
+    let return_value = u64::from(filled);
+    let ra = engine
+        .return_from_win64_api(return_value)
+        .context("failed to return from FillRect")?;
+    Ok(WinApiHandlerResult {
+        return_address: ra,
+        return_value,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IRect, ancestor_offset, subtract_rect};
+    use crate::WindowRecord;
+
+    fn rect(left: i32, top: i32, right: i32, bottom: i32) -> IRect {
+        IRect {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn ancestor_offset_top_level_is_identity() {
+        let windows = vec![WindowRecord {
+            handle: 1,
+            ..Default::default()
+        }];
+        assert_eq!(ancestor_offset(&windows, 1), Some((1, 0, 0)));
+    }
+
+    #[test]
+    fn ancestor_offset_sums_child_positions() {
+        let windows = vec![
+            WindowRecord {
+                handle: 1,
+                ..Default::default()
+            },
+            WindowRecord {
+                handle: 2,
+                parent_handle: 1,
+                x: 20,
+                y: 30,
+                ..Default::default()
+            },
+            WindowRecord {
+                handle: 3,
+                parent_handle: 2,
+                x: 5,
+                y: 7,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(ancestor_offset(&windows, 3), Some((1, 25, 37)));
+    }
+
+    #[test]
+    fn ancestor_offset_broken_parent_chain_falls_back() {
+        let windows = vec![WindowRecord {
+            handle: 2,
+            parent_handle: 99,
+            x: 20,
+            y: 30,
+            ..Default::default()
+        }];
+        assert_eq!(ancestor_offset(&windows, 2), Some((2, 0, 0)));
+    }
+
+    #[test]
+    fn ancestor_offset_unknown_hwnd_is_none() {
+        let windows = vec![WindowRecord {
+            handle: 1,
+            ..Default::default()
+        }];
+        assert_eq!(ancestor_offset(&windows, 42), None);
+    }
+
+    #[test]
+    fn subtract_rect_keeps_dest_when_child_outside() {
+        let result = subtract_rect(vec![rect(0, 0, 100, 100)], rect(200, 200, 300, 300));
+        assert_eq!(result, vec![rect(0, 0, 100, 100)]);
+    }
+
+    #[test]
+    fn subtract_rect_centered_child_splits_into_four() {
+        let result = subtract_rect(vec![rect(0, 0, 100, 100)], rect(20, 20, 80, 80));
+        let total: i64 = result
+            .iter()
+            .map(|r| i64::from(r.width()).saturating_mul(i64::from(r.height())))
+            .sum();
+        assert_eq!(total, 6400); // 100×100 − 60×60
+    }
+
+    #[test]
+    fn subtract_rect_covering_child_empties() {
+        let result = subtract_rect(vec![rect(0, 0, 100, 100)], rect(0, 0, 100, 100));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn subtract_rect_multiple_children_keeps_exact_area() {
+        let first = subtract_rect(vec![rect(0, 0, 320, 240)], rect(20, 20, 120, 50));
+        let second = subtract_rect(first, rect(20, 60, 220, 90));
+        let total: i64 = second
+            .iter()
+            .map(|r| i64::from(r.width()).saturating_mul(i64::from(r.height())))
+            .sum();
+        // 320×240 minus button (100×30) minus static (200×30).
+        assert_eq!(total, 67_800);
+    }
+}

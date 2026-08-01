@@ -60,10 +60,12 @@ pub fn handle_get_system_time_as_file_time(
         let low_address = checked_field_address(filetime_ptr, 0, "dwLowDateTime");
         let high_address = checked_field_address(filetime_ptr, 4, "dwHighDateTime");
 
-        let low = u32::try_from(FIXED_SYSTEM_FILETIME & 0xffff_ffff)
-            .context("FILETIME low part does not fit u32")?;
-        let high = u32::try_from(FIXED_SYSTEM_FILETIME >> 32)
-            .context("FILETIME high part does not fit u32")?;
+        // B5: matches the wall-clock FILETIME the host publishes into the guest
+        // clock table (slot 3), which the in-guest stub copies verbatim.
+        let filetime = super::clock::system_time_filetime();
+        let low =
+            u32::try_from(filetime & 0xffff_ffff).context("FILETIME low part does not fit u32")?;
+        let high = u32::try_from(filetime >> 32).context("FILETIME high part does not fit u32")?;
 
         write_guest_u32(engine, low_address, low)?;
         write_guest_u32(engine, high_address, high)?;

@@ -19,6 +19,7 @@ pub(crate) use anyhow::{Context, Result};
 pub(crate) const FAKE_ICON_HANDLE: u64 = 0x0000_0000_6600_0001;
 pub(crate) const FAKE_CURSOR_HANDLE: u64 = 0x0000_0000_6600_0002;
 pub(crate) const IDOK: u64 = 1;
+pub(crate) const IDCANCEL: u64 = 2;
 
 pub(crate) const WM_MDICREATE: u32 = 0x0220;
 pub(crate) const FAKE_MONITOR_HANDLE: u64 = 0x0000_0000_6600_0010;
@@ -35,7 +36,28 @@ pub(crate) const FAKE_THREAD_ID: u64 = 1;
 pub(crate) const DIALOG_BASE_UNIT_X: u32 = 8;
 pub(crate) const DIALOG_BASE_UNIT_Y: u32 = 16;
 
+// Standard window styles (winuser.h).
+pub(crate) const WS_CHILD: u32 = 0x4000_0000;
+pub(crate) const WS_VISIBLE: u32 = 0x1000_0000;
+pub(crate) const WS_CLIPCHILDREN: u32 = 0x0200_0000;
+/// Control style: the control can receive keyboard focus via Tab navigation.
+pub(crate) const WS_TABSTOP: u32 = 0x0001_0000;
+
 pub(crate) const WM_QUIT: u32 = 0x0012;
+
+pub(crate) const WM_INITDIALOG: u32 = 0x0110;
+
+// Virtual-key codes used by IsDialogMessage navigation (winuser.h).
+pub(crate) const VK_TAB: u64 = 0x09;
+pub(crate) const VK_RETURN: u64 = 0x0D;
+pub(crate) const VK_ESCAPE: u64 = 0x1B;
+pub(crate) const VK_SHIFT: u64 = 0x10;
+pub(crate) const VK_SPACE: u64 = 0x20;
+pub(crate) const VK_END: u64 = 0x23;
+pub(crate) const VK_HOME: u64 = 0x24;
+pub(crate) const VK_LEFT: u64 = 0x25;
+pub(crate) const VK_RIGHT: u64 = 0x27;
+pub(crate) const VK_DELETE: u64 = 0x2E;
 
 pub(crate) const WM_KEYDOWN: u32 = 0x0100;
 pub(crate) const WM_KEYUP: u32 = 0x0101;
@@ -45,15 +67,114 @@ pub(crate) const WM_SYSKEYDOWN: u32 = 0x0104;
 pub(crate) const WM_SYSKEYUP: u32 = 0x0105;
 pub(crate) const WM_SYSCHAR: u32 = 0x0106;
 pub(crate) const WM_SYSDEADCHAR: u32 = 0x0107;
+pub(crate) const WM_CREATE: u32 = 0x0001;
+pub(crate) const WM_DESTROY: u32 = 0x0002;
+#[expect(dead_code)]
+pub(crate) const WM_MOVE: u32 = 0x0003;
+#[expect(dead_code)]
+pub(crate) const WM_SIZE: u32 = 0x0005;
+#[expect(dead_code)]
+pub(crate) const WM_ACTIVATE: u32 = 0x0006;
+pub(crate) const WM_SETFOCUS: u32 = 0x0007;
+pub(crate) const WM_KILLFOCUS: u32 = 0x0008;
+pub(crate) const WM_SETTEXT: u32 = 0x000C;
+pub(crate) const WM_GETTEXT: u32 = 0x000D;
+pub(crate) const WM_GETTEXTLENGTH: u32 = 0x000E;
+pub(crate) const WM_PAINT: u32 = 0x000F;
+pub(crate) const WM_CLOSE: u32 = 0x0010;
+pub(crate) const WM_ERASEBKGND: u32 = 0x0014;
+#[expect(dead_code)]
+pub(crate) const WM_SHOWWINDOW: u32 = 0x0018;
+pub(crate) const WM_SETCURSOR: u32 = 0x0020;
+#[expect(dead_code)]
+pub(crate) const WM_GETMINMAXINFO: u32 = 0x0024;
+pub(crate) const WM_CONTEXTMENU: u32 = 0x007B;
+#[expect(dead_code)]
+pub(crate) const WM_NCCREATE: u32 = 0x0081;
+#[expect(dead_code)]
+pub(crate) const WM_NCDESTROY: u32 = 0x0082;
+#[expect(dead_code)]
+pub(crate) const WM_NCCALCSIZE: u32 = 0x0083;
+pub(crate) const WM_GETDLGCODE: u32 = 0x0087;
+pub(crate) const WM_SYSCOMMAND: u32 = 0x0112;
+pub(crate) const WM_COMMAND: u32 = 0x0111;
+pub(crate) const WM_TIMER: u32 = 0x0113;
+#[expect(dead_code)]
+pub(crate) const WM_MOUSEMOVE: u32 = 0x0200;
+pub(crate) const WM_LBUTTONDOWN: u32 = 0x0201;
+pub(crate) const WM_LBUTTONUP: u32 = 0x0202;
+#[expect(dead_code)]
+pub(crate) const WM_RBUTTONDOWN: u32 = 0x0204;
+#[expect(dead_code)]
+pub(crate) const WM_RBUTTONUP: u32 = 0x0205;
+#[expect(dead_code)]
+pub(crate) const WM_MBUTTONDOWN: u32 = 0x0207;
+#[expect(dead_code)]
+pub(crate) const WM_MBUTTONUP: u32 = 0x0208;
+#[expect(dead_code)]
+pub(crate) const WM_MOUSEWHEEL: u32 = 0x020A;
+#[expect(dead_code)]
+pub(crate) const SIZE_RESTORED: u64 = 0;
+pub(crate) const SC_CLOSE: u64 = 0xF060;
+#[expect(dead_code)]
+pub(crate) const SW_SHOW: u64 = 5;
 
+// List-box messages (winuser.h).
+pub(crate) const LB_ADDSTRING: u32 = 0x0180;
+pub(crate) const LB_SETCURSEL: u32 = 0x0186;
+pub(crate) const LB_GETCURSEL: u32 = 0x0187;
+pub(crate) const LB_GETTEXT: u32 = 0x0189;
+pub(crate) const LB_GETCOUNT: u32 = 0x018B;
+
+// Edit-control messages (winuser.h).
+pub(crate) const EM_GETSEL: u32 = 0x00B0;
+pub(crate) const EM_SETSEL: u32 = 0x00B1;
+
+// Control notification codes / DLGC_* dialog codes (winuser.h).
+pub(crate) const BN_CLICKED: u64 = 0;
+/// EDIT notification code: the text changed.
+pub(crate) const EN_CHANGE: u64 = 1;
+/// LISTBOX notification code: the selection changed.
+pub(crate) const LBN_SELCHANGE: u64 = 1;
+/// `WM_GETDLGCODE` for an EDIT: wants character input. (WinUser.h: 0x0080;
+/// the previous 0x2000 was actually DLGC_BUTTON's value.)
+pub(crate) const DLGC_WANTCHARS: u64 = 0x0080;
+/// `WM_GETDLGCODE` for a push button.
+pub(crate) const DLGC_BUTTON: u64 = 0x2000;
+/// `WM_GETDLGCODE` when the button carries `BS_DEFPUSHBUTTON` (Enter default).
+pub(crate) const DLGC_DEFPUSHBUTTON: u64 = 0x0010;
+/// `WM_GETDLGCODE` when the button is a plain (non-default) push button.
+pub(crate) const DLGC_UNDEFPUSHBUTTON: u64 = 0x0020;
+/// Button style: the dialog default button (Enter activates it).
+pub(crate) const BS_DEFPUSHBUTTON: u32 = 0x0000_0001;
+/// Button state bit reported by `BM_GETSTATE`: the button is pressed.
+pub(crate) const BST_PUSHED: u64 = 0x0004;
+/// Button state bit reported by `BM_GETSTATE`: the button has keyboard focus.
+pub(crate) const BST_FOCUS: u64 = 0x0008;
+/// Button messages: `BM_GETSTATE` (read pressed/focus state).
+pub(crate) const BM_GETSTATE: u32 = 0x00F2;
+/// Button messages: `BM_SETSTATE` (write the pressed state, no click).
+pub(crate) const BM_SETSTATE: u32 = 0x00F3;
+/// Button messages: `BM_CLICK` (programmatic activation → `BN_CLICKED`).
+pub(crate) const BM_CLICK: u32 = 0x00F5;
+
+// TrackMouseEvent flags (winuser.h).
+pub(crate) const TME_HOVER: u32 = 0x0000_0001;
+pub(crate) const TME_LEAVE: u32 = 0x0000_0002;
+pub(crate) const TME_CANCEL: u32 = 0x8000_0000;
+
+pub mod controls;
 pub mod dc;
+pub mod dialog;
 pub mod display;
 pub mod input;
 pub mod menu;
 pub mod message;
 pub mod misc;
 pub mod window;
+pub use controls::*;
 pub use dc::*;
+pub use dialog::*;
 pub use display::*;
 pub use input::*;
 pub use menu::*;
@@ -408,6 +529,10 @@ pub(crate) fn create_window_record(
         .checked_add(1)
         .context("fake window handle overflow")?;
 
+    // Built-in control classes (BUTTON/STATIC/EDIT/LISTBOX/COMBOBOX) resolve
+    // by ordinal or name and get a host-side WndProc (dispatch_control_proc).
+    let control_kind = controls::ControlClassKind::from_identifier(&request.class_identifier);
+
     let (class_atom, class_name, window_proc, class_unicode) =
         if let Some(window_class) = registered_class {
             (
@@ -417,12 +542,10 @@ pub(crate) fn create_window_record(
                 window_class.unicode,
             )
         } else {
-            let class_name = match request.class_identifier {
-                WindowClassIdentifier::Atom(atom) => {
-                    format!("#{atom}")
-                }
+            let class_name = match &request.class_identifier {
+                WindowClassIdentifier::Atom(atom) => format!("#{atom}"),
 
-                WindowClassIdentifier::Name(name) => name,
+                WindowClassIdentifier::Name(name) => name.clone(),
             };
 
             /*
@@ -434,13 +557,45 @@ pub(crate) fn create_window_record(
             (0, class_name, 0, unicode)
         };
 
+    // WS_VISIBLE children are immediately visible; controls marked visible at
+    // creation also start invalidated so the first empty GetMessage paints
+    // them (mirrors Windows painting a shown control).
+    let visible = request.style & WS_VISIBLE != 0;
+
+    if let Some(kind) = control_kind {
+        tracing::debug!(
+            target: "wiegui",
+            kind = ?kind,
+            hwnd = handle,
+            class = %class_name,
+            title = %request.title,
+            x = request.x,
+            y = request.y,
+            width = request.width,
+            height = request.height,
+            "control created"
+        );
+    } else {
+        tracing::info!(
+            target: "wiegui",
+            hwnd = handle,
+            class = %class_name,
+            title = %request.title,
+            x = request.x,
+            y = request.y,
+            width = request.width,
+            height = request.height,
+            "window created"
+        );
+    }
+
     state.window_state().windows.push(WindowRecord {
         handle,
         class_atom,
         class_name,
         window_proc,
         unicode: class_unicode,
-        title: request.title,
+        title: request.title.clone(),
         style: request.style,
         extended_style: request.extended_style,
         parent_handle: request.parent_handle,
@@ -450,8 +605,16 @@ pub(crate) fn create_window_record(
         y: request.y,
         width: request.width,
         height: request.height,
-        visible: false,
+        visible,
         enabled: true,
+        invalidated: control_kind.is_some() && visible,
+        erase_background: false,
+        mouse_tracking: false,
+        client_rect: (0, 0, 0, 0),
+        control_kind,
+        control_text: request.title,
+        dialog_proc: 0,
+        dialog_unicode: false,
     });
 
     Ok((handle, window_proc, class_unicode))

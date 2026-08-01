@@ -21,7 +21,9 @@ pub(crate) fn write_fake_monitor_info(
     // MONITORINFOEXA/W has the same prefix plus device name after offset 40.
     write_guest_u32(engine, monitor_info_ptr, 40)?;
 
-    // rcMonitor = { left: 0, top: 0, right: 1024, bottom: 768 }
+    // rcMonitor = { left: 0, top: 0, right: 1920, bottom: 1080 }
+    // Matches GetDeviceCaps HORZRES/VERTRES and GetSystemMetrics SM_CXSCREEN/
+    // SM_CYSCREEN (all report a 1920×1080 fake display).
     write_guest_i32(
         engine,
         checked_field_address(monitor_info_ptr, 4, "rcMonitor.left"),
@@ -35,15 +37,15 @@ pub(crate) fn write_fake_monitor_info(
     write_guest_i32(
         engine,
         checked_field_address(monitor_info_ptr, 12, "rcMonitor.right"),
-        1024,
+        1920,
     )?;
     write_guest_i32(
         engine,
         checked_field_address(monitor_info_ptr, 16, "rcMonitor.bottom"),
-        768,
+        1080,
     )?;
 
-    // rcWork = { left: 0, top: 0, right: 1024, bottom: 728 }
+    // rcWork = { left: 0, top: 0, right: 1920, bottom: 1040 } (1080 - 40 taskbar)
     write_guest_i32(
         engine,
         checked_field_address(monitor_info_ptr, 20, "rcWork.left"),
@@ -57,12 +59,12 @@ pub(crate) fn write_fake_monitor_info(
     write_guest_i32(
         engine,
         checked_field_address(monitor_info_ptr, 28, "rcWork.right"),
-        1024,
+        1920,
     )?;
     write_guest_i32(
         engine,
         checked_field_address(monitor_info_ptr, 32, "rcWork.bottom"),
-        728,
+        1040,
     )?;
 
     // MONITORINFOF_PRIMARY
@@ -75,25 +77,37 @@ pub(crate) fn write_fake_monitor_info(
     Ok(())
 }
 pub(crate) fn fake_system_metric(metric_index: u64) -> u64 {
+    // Standard SM_* values for a 1920×1080 32-bpp desktop (matches
+    // GetDeviceCaps HORZRES/VERTRES). Identical return values are merged into
+    // one arm (clippy match_same_arms); every metric whose real value is 0
+    // (SM_DEBUG, SM_SWAPBUTTON, SM_CYKANJIWINDOW, SM_PENWINDOWS, SM_DBCSENABLED,
+    // SM_SECURE, SM_CLEANBOOT, SM_SHOWSOUNDS, SM_SLOWMACHINE, SM_MIDEASTENABLED,
+    // SM_MENUDROPALIGNMENT, SM_ARRANGE, SM_NETWORK, SM_XIMSCREEN, …) falls
+    // through to `_ => 0`, matching Windows' behavior for invalid SM_* too.
     match metric_index {
-        // SM_CXSCREEN / SM_CXFULLSCREEN
-        0 | 16 => 1024,
+        // SM_CXSCREEN / SM_CXFULLSCREEN / SM_CXMAXTRACK / SM_CYMAXTRACK /
+        // SM_CXMAXIMIZED / SM_CXVIRTUALSCREEN / SM_CYVIRTUALSCREEN
+        0 | 16 | 59 | 60 | 61 | 78 | 79 => 1920,
 
         // SM_CYSCREEN
-        1 => 768,
+        1 => 1080,
 
-        // SM_CXVSCROLL / SM_CYHSCROLL
-        2 | 3 => 17,
+        // SM_CXVSCROLL / SM_CYHSCROLL / SM_CYVTHUMB / SM_CXHTHUMB /
+        // SM_CYVSCROLL / SM_CXHSCROLL
+        2 | 3 | 9 | 10 | 20 | 21 => 17,
 
         // SM_CYCAPTION
         4 => 23,
 
-        // SM_CXBORDER / SM_CYBORDER / SM_MOUSEPRESENT / SM_CMONITORS
-        5 | 6 | 19 | 80 => 1,
+        // SM_CXBORDER / SM_CYBORDER / SM_MOUSEPRESENT / SM_MOUSEWHEELPRESENT /
+        // SM_CMONITORS / SM_SAMEDISPLAYFORMAT
+        5 | 6 | 19 | 75 | 80 | 81 => 1,
 
-        // SM_CXDLGFRAME / SM_CYDLGFRAME / SM_CXFRAME / SM_CYFRAME /
-        // SM_CXDOUBLECLK / SM_CYDOUBLECLK
-        7 | 8 | 32 | 33 | 36 | 37 => 4,
+        // SM_CXDLGFRAME / SM_CYDLGFRAME (aliases SM_CXFIXEDFRAME /
+        // SM_CYFIXEDFRAME) / SM_CXFRAME / SM_CYFRAME (aliases SM_CXSIZEFRAME /
+        // SM_CYSIZEFRAME) / SM_CXDOUBLECLK / SM_CYDOUBLECLK / SM_CXDRAG /
+        // SM_CYDRAG
+        7 | 8 | 32 | 33 | 36 | 37 | 68 | 69 => 4,
 
         // SM_CXICON / SM_CYICON / SM_CXCURSOR / SM_CYCURSOR
         11..=14 => 32,
@@ -101,22 +115,40 @@ pub(crate) fn fake_system_metric(metric_index: u64) -> u64 {
         // SM_CYMENU
         15 => 20,
 
-        // SM_CYFULLSCREEN
-        17 => 728,
+        // SM_CYFULLSCREEN / SM_CYMAXIMIZED (1080 − 40 px taskbar)
+        17 | 62 => 1040,
 
         // SM_CXMIN / SM_CXMINTRACK
         28 | 34 => 112,
 
-        // SM_CYMIN / SM_CYMINTRACK
-        29 | 35 => 27,
+        // SM_CYMIN / SM_CYMINTRACK / SM_CYMINIMIZED
+        29 | 35 | 58 => 27,
 
-        // SM_CXSIZE / SM_CYSIZE
-        30 | 31 => 18,
+        // SM_CXSIZE / SM_CYSIZE / SM_CYSMCAPTION / SM_CXMENUSIZE / SM_CYMENUSIZE
+        30 | 31 | 51 | 54 | 55 => 18,
 
         // SM_CXICONSPACING / SM_CYICONSPACING
         38 | 39 => 75,
 
-        // Unknown and zero-valued metrics.
+        // SM_CMOUSEBUTTONS (typical 5-button mouse)
+        43 => 5,
+
+        // SM_CXEDGE / SM_CYEDGE
+        45 | 46 => 2,
+
+        // SM_CXSMICON / SM_CYSMICON
+        49 | 50 => 16,
+
+        // SM_CXSMSIZE / SM_CYSMSIZE
+        52 | 53 => 12,
+
+        // SM_CXMENUCHECK / SM_CYMENUCHECK
+        71 | 72 => 13,
+
+        // SM_CXMINIMIZED
+        57 => 160,
+
+        // Zero-valued and unknown metrics.
         _ => 0,
     }
 }

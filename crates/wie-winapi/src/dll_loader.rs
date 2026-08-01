@@ -56,6 +56,10 @@ pub struct LoadedModule {
     pub ordinal_base: u16,
     /// Number of export entries.
     pub export_count: u16,
+    /// Parsed `RT_DIALOG` templates from the module's `.rsrc` section
+    /// (best-effort; empty when the module has none). Dialog machinery
+    /// (DialogBoxParam) resolves an `hInstance`+id against this list.
+    pub dialogs: Vec<wie_pe::resources::DialogTemplate>,
 }
 
 impl LoadedModule {
@@ -798,6 +802,7 @@ pub fn load_dll(
         exports_by_ordinal: exports.by_ordinal,
         ordinal_base: exports.ordinal_base,
         export_count: exports.export_count,
+        dialogs: wie_pe::resources::parse_dialogs(&pe_bytes, &map_plan.sections),
     };
 
     state
