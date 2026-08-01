@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use wie_cpu::CpuEngine;
-use wie_winapi::GuestCallbackRequest;
+use wie_winapi::{GuestCallbackRequest, OuterReturn};
 
 /// Set up Win64 frame + args and transfer control to a guest WndProc.
 ///
@@ -66,14 +66,15 @@ pub(crate) fn install_guest_callback_frame(
 
 /// CreateWindowEx returns the HWND unless WM_CREATE returned -1.
 #[must_use]
-pub(crate) fn create_window_return_value(lresult: u64, create_window_hwnd: Option<u64>) -> u64 {
-    if let Some(hwnd) = create_window_hwnd {
-        // Truncate to 32-bit signed LRESULT for WM_CREATE convention.
-        let low = u32::try_from(lresult & 0xffff_ffff).unwrap_or(0);
-        let create_status = i32::from_ne_bytes(low.to_ne_bytes());
-        if create_status == -1 { 0 } else { hwnd }
-    } else {
-        lresult
+pub(crate) fn create_window_return_value(lresult: u64, outer_return: OuterReturn) -> u64 {
+    match outer_return {
+        OuterReturn::CreateWindow(hwnd) => {
+            let low = u32::try_from(lresult & 0xffff_ffff).unwrap_or(0);
+            let create_status = i32::from_ne_bytes(low.to_ne_bytes());
+            if create_status == -1 { 0 } else { hwnd }
+        }
+        OuterReturn::Fixed(value) => value,
+        OuterReturn::Passthrough => lresult,
     }
 }
 
@@ -83,12 +84,12 @@ pub(crate) fn create_window_return_value(lresult: u64, create_window_hwnd: Optio
 pub(crate) fn finish_guest_callback(
     engine: &mut dyn CpuEngine,
     dispatch_rsp: u64,
-    create_window_hwnd: Option<u64>,
+    outer_return: OuterReturn,
 ) -> Result<(u64, u64)> {
     let lresult = engine
         .read_rax()
         .context("failed to read LRESULT from guest callback")?;
-    let return_value = create_window_return_value(lresult, create_window_hwnd);
+    let return_value = create_window_return_value(lresult, outer_return);
 
     engine
         .write_rsp(dispatch_rsp)
@@ -99,16 +100,4 @@ pub(crate) fn finish_guest_callback(
         .context("failed to return from outer API after guest callback")?;
 
     Ok((return_value, return_address))
-}
-
-/// Whether the outer API is CreateWindowEx* (return HWND after callback).
-#[must_use]
-pub(crate) fn create_window_hwnd_for_outer(outer_name: &str, window_handle: u64) -> Option<u64> {
-    if outer_name.eq_ignore_ascii_case("CreateWindowExA")
-        || outer_name.eq_ignore_ascii_case("CreateWindowExW")
-    {
-        Some(window_handle)
-    } else {
-        None
-    }
 }

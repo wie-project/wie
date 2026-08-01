@@ -77,6 +77,10 @@ pub struct RuntimeMemoryLayout {
     /// Guest-visible tables for Phase 5 stubs (metrics, colors, cwd wide path).
     pub guest_stub_data_base: u64,
     pub guest_stub_data_size: usize,
+    /// Host-written guest clock table (6 × u64; B5 — refreshed each host stop).
+    pub clock_table_va: u64,
+    /// Size of the guest clock table mapping.
+    pub clock_table_size: usize,
 }
 
 impl RuntimeMemoryLayout {
@@ -131,6 +135,9 @@ impl RuntimeMemoryLayout {
             // Metrics[256×u32] + colors[32×u32] + cwd wide blob.
             guest_stub_data_base: 0x0000_7000_0040_9000,
             guest_stub_data_size: 0x2000,
+            // B5: host-refreshed 6×u64 clock table (GetTickCount/timeGetTime/QPC/…).
+            clock_table_va: 0x0000_7000_0040_B000,
+            clock_table_size: 0x1000,
         }
     }
 
@@ -254,6 +261,9 @@ pub(crate) fn default_winapi_state(
             error_mode: 0,
             suspended_threads: std::collections::HashMap::new(),
             environment: Vec::new(),
+            // The main module's RT_DIALOG templates are parsed in session init
+            // (the section map is not available here).
+            main_module_dialogs: Vec::new(),
         },
         kernel: wie_winapi::KernelState {
             threads: wie_winapi::ThreadState::primary(),
@@ -292,6 +302,9 @@ pub(crate) fn default_winapi_state(
             cached_streams: std::collections::HashMap::new(),
         },
         dll_states: wie_winapi::DllStateMap::new(),
+        message_queue: std::sync::Arc::new(std::sync::Mutex::new(
+            wie_winapi::present::MessageQueue::default(),
+        )),
         module_state: wie_winapi::ModuleState {
             loaded_modules: std::collections::HashMap::new(),
             import_resolver: None,

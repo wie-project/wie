@@ -8,12 +8,14 @@ mod guest_io;
 mod guest_mbwc;
 mod guest_rewire;
 mod guest_stubs;
+mod gui_loop;
 mod hooks;
 mod memory;
 mod mt_runtime;
 mod session;
 mod trace;
 
+pub use gui_loop::{GuiControl, GuiOutcome, run_windowed};
 pub use hooks::RuntimeFakeApiEntry;
 pub use memory::{
     CALLBACK_RETURN_TRAMPOLINE_VA, DEFAULT_LAYOUT, ENTRY_TRACE_INSTRUCTION_BUDGET,
@@ -22,7 +24,7 @@ pub use memory::{
     FAST_API_STUB_SIZE, FAST_VOID_RETURN_STUB_VA, PROCESS_HEAP_BASE, PROCESS_HEAP_HANDLE,
     PROCESS_HEAP_SHADOW_BASE, PROCESS_HEAP_SHADOW_DELTA, PROCESS_HEAP_SIZE, RuntimeMemoryLayout,
 };
-pub use session::{RuntimeProfile, RuntimeSession, SessionOptions};
+pub use session::{GuestHandle, MenuNode, RuntimeProfile, RuntimeSession, SessionOptions};
 pub use trace::{
     EntryTraceEvent, EntryTraceSummary, EntryTraceTermination, MicroRunOptions, MicroRunSummary,
     RuntimeRunSummary, entry_trace, run_micro_exe, run_micro_exe_with_options,

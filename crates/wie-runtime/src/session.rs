@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
+use wie_winapi::{MenuItemRecord, OuterReturn};
 
 /// Bootstrap options for a new guest session (argv / stdin injection).
 #[derive(Debug, Clone, Default)]
@@ -114,9 +115,8 @@ struct PendingGuestCallback {
     outer_name: Arc<str>,
     /// Fake VA of the outer host API entry.
     outer_fake_va: u64,
-    /// When set, outer API is `CreateWindowEx*` and must return this HWND
-    /// (unless the WndProc returns `-1` from `WM_CREATE`).
-    create_window_hwnd: Option<u64>,
+    /// Controls what the outer API returns after the WndProc completes.
+    outer_return: OuterReturn,
 }
 
 /// Host-side timing breakdown for one session (enabled via `WIE_RUNTIME_PROFILE=1`).
@@ -154,6 +154,26 @@ pub struct RuntimeProfile {
     pub idle_parks: u64,
     /// Wall nanoseconds spent in host idle parks (message quanta).
     pub idle_park_ns: u128,
+    /// B9: number of published frames (frame timing enabled only).
+    pub frames_published: u64,
+    /// B9: accumulated publish wall time (ns).
+    pub publish_ns: u128,
+    /// B9: duration of the most recent publish (ns).
+    pub publish_ns_last: u128,
+    /// B9: accumulated BitBlt mask-copy (`mask_bgra_to_0rgb`) wall time (ns).
+    pub blit_copy_ns: u128,
+    /// B9: duration of the most recent mask copy (ns).
+    pub blit_copy_ns_last: u128,
+    /// B9: accumulated host present (softbuffer copy + upload) wall time (ns).
+    pub present_ns: u128,
+    /// B9: duration of the most recent host present (ns).
+    pub present_ns_last: u128,
+    /// B9: host stops between the last two published frames.
+    pub last_frame_host_stops: u64,
+    /// B9: iced-retired instructions between the last two published frames.
+    pub last_frame_iced_insns: u64,
+    /// B9: jit-retired instructions between the last two published frames.
+    pub last_frame_jit_insns: u64,
 }
 
 impl RuntimeProfile {
@@ -219,14 +239,46 @@ impl RuntimeProfile {
         ));
         if let Some(j) = self.jit {
             lines.push(format!(
-                "jit: insns={} iced={} compiles={} skip={} cache_hits={} load={} store={}",
+                "jit: insns={} iced={} compiles={} skip={} bg_compiles={} bg_stalls={} bg_stall_us={} bg_fallback={} cache_hits={} load={} store={}",
                 j.jit_insns,
                 j.iced_insns,
                 j.compiles,
                 j.compile_skip,
+                j.bg_compiles,
+                j.compile_stalls,
+                j.compile_stall_us,
+                j.compile_stall_fallback,
                 j.cache_hits,
                 j.load_calls,
                 j.store_calls
+            ));
+        }
+        if self.frames_published > 0 || self.publish_ns_last > 0 {
+            lines.push(format!(
+                "frames_published={} publish_ms={:.3} publish_ms_last={:.3} \
+                 blit_copy_ms={:.3} blit_copy_ms_last={:.3} \
+                 present_ms={:.3} present_ms_last={:.3}",
+                self.frames_published,
+                self.publish_ns as f64 / 1e6,
+                self.publish_ns_last as f64 / 1e6,
+                self.blit_copy_ns as f64 / 1e6,
+                self.blit_copy_ns_last as f64 / 1e6,
+                self.present_ns as f64 / 1e6,
+                self.present_ns_last as f64 / 1e6,
+            ));
+            let frame_total = self
+                .last_frame_iced_insns
+                .saturating_add(self.last_frame_jit_insns);
+            lines.push(format!(
+                "last_frame: host_stops={} iced_insns={} jit_insns={} iced_ratio={:.3}",
+                self.last_frame_host_stops,
+                self.last_frame_iced_insns,
+                self.last_frame_jit_insns,
+                if frame_total == 0 {
+                    0.0
+                } else {
+                    self.last_frame_iced_insns as f64 / frame_total as f64
+                }
             ));
         }
         let mut ranked: Vec<_> = self.by_export.iter().collect();
@@ -363,7 +415,7 @@ fn register_layout_regions(
     // denied on executable pages; stack/heap must stay non-X for pin super path.
     let data_rw = wie_cpu::RwxPerms::READ_WRITE;
     let code_rwx = wie_cpu::RwxPerms::ALL;
-    let regs: [GuestRegion; 15] = [
+    let regs: [GuestRegion; 16] = [
         GuestRegion::new(
             "stack",
             RegionKind::Stack,
@@ -469,6 +521,13 @@ fn register_layout_regions(
             layout.fast_api_stub_size,
             code_rwx,
         ),
+        GuestRegion::new(
+            "clock_table",
+            RegionKind::Other,
+            layout.clock_table_va,
+            layout.clock_table_size,
+            data_rw,
+        ),
     ];
     for region in regs {
         engine.register_region(region);
@@ -492,6 +551,19 @@ pub struct RuntimeSession {
     profile: RuntimeProfile,
     /// Last value written to guest TEB.LastErrorValue (skip redundant mem_write).
     last_published_last_error: Option<u32>,
+    /// Whether the guest entry point has been reached (set on the first run).
+    entry_reached: bool,
+    /// Whether the previous `run_until_stop` returned `WaitingForMessage`;
+    /// gates the idle-transition log so it fires on transitions only.
+    was_waiting_for_message: bool,
+    /// B9: last observed present generation (frame-boundary sampling).
+    frame_last_gen: u64,
+    /// B9: `host_stops` baseline at the last frame boundary.
+    frame_last_stops: u64,
+    /// B9: iced-instruction baseline at the last frame boundary.
+    frame_last_iced: u64,
+    /// B9: jit-instruction baseline at the last frame boundary.
+    frame_last_jit: u64,
 }
 
 /// Bundle of fields produced by session initialization (avoids 8-arg constructors).
@@ -511,6 +583,9 @@ struct SessionInit {
 impl RuntimeSession {
     fn from_init(init: SessionInit) -> Self {
         let profile_enabled = std::env::var_os("WIE_RUNTIME_PROFILE").is_some();
+        if profile_enabled {
+            wie_winapi::present::set_frame_timing_enabled(true);
+        }
         let entry_point_va = init.entry_point_va;
         let initial_rsp = init.initial_rsp;
         let process = Self::build_process(init);
@@ -524,6 +599,12 @@ impl RuntimeSession {
             profile_enabled,
             profile: RuntimeProfile::default(),
             last_published_last_error: None,
+            entry_reached: false,
+            was_waiting_for_message: false,
+            frame_last_gen: 0,
+            frame_last_stops: 0,
+            frame_last_iced: 0,
+            frame_last_jit: 0,
         }
     }
 
@@ -547,6 +628,12 @@ impl RuntimeSession {
             primary_tid: wie_winapi::PRIMARY_THREAD_ID,
         };
         let shared_winapi = Arc::new(Mutex::new(winapi_state));
+        // Clone the message-queue Arc so the host can post input without ever
+        // locking the big WinApiState mutex.
+        let shared_message_queue = {
+            let guard = crate::mt_runtime::lock(&shared_winapi);
+            guard.message_queue.clone()
+        };
 
         ProcessResources {
             config,
@@ -554,6 +641,7 @@ impl RuntimeSession {
             shared_jit,
             guest_mem,
             shared_winapi,
+            shared_message_queue,
             worker_joins: Vec::new(),
         }
     }
@@ -574,6 +662,16 @@ impl RuntimeSession {
         if ok {
             self.last_published_last_error = Some(err);
         }
+    }
+
+    /// B5: publish the current clock snapshot into the guest clock table.
+    ///
+    /// Uses the primary engine directly (no WinAPI lock): the table lives in
+    /// guest memory and the host is between quanta here, so no worker runs on
+    /// this engine concurrently.
+    fn refresh_clock_table(&mut self) {
+        let clock_table_va = self.process.layout().clock_table_va;
+        let _ = crate::guest_stubs::refresh_clock_table(&mut *self.process.engine, clock_table_va);
     }
 
     /// Accumulated host-side profile (empty unless `WIE_RUNTIME_PROFILE` is set).
@@ -779,6 +877,15 @@ impl RuntimeSession {
         engine
             .mem_write(layout.guest_stub_data_base, &stub_page)
             .context("failed to write guest stub data page")?;
+
+        // B5: host-written guest clock table. Written once here (frozen values
+        // under `WIE_FIXED_CLOCK=1`), then refreshed every host stop so the
+        // in-guest clock stubs advance without stopping the host.
+        engine
+            .mem_map(layout.clock_table_va, layout.clock_table_size, data_rw)
+            .context("failed to map guest clock table")?;
+        crate::guest_stubs::refresh_clock_table(engine.as_mut(), layout.clock_table_va)
+            .context("failed to initialize guest clock table")?;
 
         let stub_cfg = crate::guest_stubs::GuestStubConfig::from_layout(&layout);
 
@@ -1101,6 +1208,17 @@ impl RuntimeSession {
         }
 
         winapi_state.window_state().message_queue_idle_policy = idle_policy;
+        // Main-module dialogs: the EXE does not go through `load_dll`, so its
+        // RT_DIALOG templates are parsed here (mirroring the LoadedModule
+        // construction site in dll_loader.rs). DialogBoxParam resolves
+        // `hInstance == image base` against this list.
+        winapi_state.process.main_module_dialogs =
+            wie_pe::resources::parse_dialogs(&pe_bytes, &pe_map_plan.sections);
+        // Modal-dialog result slot: EndDialog writes, the in-guest stub reads.
+        winapi_state.window_state().dialog_result_va = stub_cfg.dialog_result_va;
+        engine
+            .mem_write(stub_cfg.dialog_result_va, &0_u32.to_le_bytes())
+            .context("failed to zero the guest dialog result slot")?;
         winapi_state.file_io.guest_io = Some(wie_winapi::GuestIoRuntimeConfig {
             table_va: guest_io_config.table_va,
             file_data_base: guest_io_config.file_data_base,
@@ -1164,6 +1282,12 @@ impl RuntimeSession {
                     .to_owned();
             session.profile.jit = session.process.with_mut(|e, _| e.cpu_stats());
         }
+        tracing::info!(
+            target: "wiegui",
+            path = %path.display(),
+            entry = session.entry_point_va,
+            "guest session started"
+        );
         Ok(session)
     }
 
@@ -1172,6 +1296,7 @@ impl RuntimeSession {
     /// Called by micro runners after `run_until_stop` when profiling is enabled.
     pub fn finalize_profile(&mut self, wall_ns: u128, cpu_user_us: u64, cpu_sys_us: u64) {
         if self.profile_enabled {
+            self.sample_frame_timing();
             self.profile.wall_ns = wall_ns;
             self.profile.cpu_user_us = cpu_user_us;
             self.profile.cpu_sys_us = cpu_sys_us;
@@ -1188,6 +1313,96 @@ impl RuntimeSession {
         } else if let Some(j) = self.process.with_mut(|e, _| e.cpu_stats()) {
             wie_cpu::dump_mem_path_stats(&j);
         }
+    }
+
+    /// Enable B9 frame timing (publish / blit-copy / present instrumentation)
+    /// without the `WIE_RUNTIME_PROFILE` env var. Used by the micro-suite
+    /// frame-time budget gate.
+    pub fn enable_frame_timing(&mut self) {
+        self.profile_enabled = true;
+        wie_winapi::present::set_frame_timing_enabled(true);
+    }
+
+    /// B9: publish duration of the most recent frame (ns; 0 when timing disabled).
+    #[must_use]
+    pub fn present_publish_ns_last(&self) -> u128 {
+        self.process
+            .with_winapi_ref(|st| st.try_present().map_or(0, |p| p.publish_ns_last))
+    }
+
+    /// B9: per-frame timing — copy the present-side accumulators (publish,
+    /// blit-copy, host present) into the profile and log per-frame host-stop /
+    /// iced-vs-jit deltas whenever a new frame was published since the last
+    /// sample. Runs once per host-stop quantum when profiling is enabled.
+    fn sample_frame_timing(&mut self) {
+        let present = self.process.with_winapi_ref(|st| {
+            st.try_present().map(|p| {
+                (
+                    p.frames_published,
+                    p.publish_ns,
+                    p.publish_ns_last,
+                    p.blit_copy_ns,
+                    p.blit_copy_ns_last,
+                    p.present_ns,
+                    p.present_ns_last,
+                    p.generation,
+                )
+            })
+        });
+        let Some((
+            frames_published,
+            publish_ns,
+            publish_ns_last,
+            blit_copy_ns,
+            blit_copy_ns_last,
+            present_ns,
+            present_ns_last,
+            generation,
+        )) = present
+        else {
+            return;
+        };
+        self.profile.frames_published = frames_published;
+        self.profile.publish_ns = publish_ns;
+        self.profile.publish_ns_last = publish_ns_last;
+        self.profile.blit_copy_ns = blit_copy_ns;
+        self.profile.blit_copy_ns_last = blit_copy_ns_last;
+        self.profile.present_ns = present_ns;
+        self.profile.present_ns_last = present_ns_last;
+
+        if generation == self.frame_last_gen {
+            return;
+        }
+        let (iced, jit) = self
+            .process
+            .with_mut(|e, _| e.cpu_stats())
+            .map_or((0, 0), |s| (s.iced_insns, s.jit_insns));
+        let iced_delta = iced.saturating_sub(self.frame_last_iced);
+        let jit_delta = jit.saturating_sub(self.frame_last_jit);
+        self.profile.last_frame_host_stops = self
+            .profile
+            .host_stops
+            .saturating_sub(self.frame_last_stops);
+        self.profile.last_frame_iced_insns = iced_delta;
+        self.profile.last_frame_jit_insns = jit_delta;
+        let frame_total = iced_delta.saturating_add(jit_delta);
+        tracing::debug!(
+            target: "wiegui",
+            generation,
+            host_stops = self.profile.last_frame_host_stops,
+            iced_insns = iced_delta,
+            jit_insns = jit_delta,
+            iced_ratio = if frame_total == 0 {
+                0.0
+            } else {
+                iced_delta as f64 / frame_total as f64
+            },
+            "frame timing"
+        );
+        self.frame_last_gen = generation;
+        self.frame_last_stops = self.profile.host_stops;
+        self.frame_last_iced = iced;
+        self.frame_last_jit = jit;
     }
 
     /// Returns the PE entry-point address associated with this session.
@@ -1231,6 +1446,35 @@ impl RuntimeSession {
         });
     }
 
+    /// Upserts a guest-visible environment variable for `GetEnvironmentVariable`.
+    ///
+    /// Names match case-insensitively, exactly as Windows does; inserting a
+    /// new name appends in insertion order so guest-visible ordering stays
+    /// stable. Rejects empty names and names containing `=`, mirroring
+    /// `SetEnvironmentVariableA`'s validation. The `GetEnvironmentStringsW`
+    /// snapshot block is intentionally untouched — the Vec is authoritative
+    /// for the per-variable APIs.
+    pub fn set_guest_env(&self, name: &str, value: &str) -> Result<()> {
+        if name.is_empty() || name.contains('=') {
+            anyhow::bail!("invalid guest environment variable name: {name:?}");
+        }
+        let shared_winapi = self.process.winapi_arc();
+        let mut state = crate::mt_runtime::lock(&shared_winapi);
+        let environment = &mut state.process.environment;
+        match environment
+            .iter()
+            .position(|(key, _)| key.eq_ignore_ascii_case(name))
+        {
+            Some(index) => {
+                if let Some(slot) = environment.get_mut(index) {
+                    slot.1 = String::from(value);
+                }
+            }
+            None => environment.push((name.to_owned(), value.to_owned())),
+        }
+        Ok(())
+    }
+
     /// Returns the original stack pointer used to start the guest.
     #[must_use]
     pub fn initial_rsp(&self) -> u64 {
@@ -1252,7 +1496,11 @@ impl RuntimeSession {
     /// Adds one message to the persistent guest message queue.
     pub fn post_message(&mut self, message: wie_winapi::QueuedWindowMessage) {
         self.process
-            .with_mut(|_, s| s.window_state().message_queue.push(message));
+            .message_queue_arc()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .messages
+            .push(message);
     }
 
     /// Runs the guest until it yields, terminates, reaches an unsupported API,
@@ -1293,7 +1541,6 @@ impl RuntimeSession {
 
             // MT.2: start any CreateThread workers before the next quantum.
             self.process.drain_spawns()?;
-
             let index = self.next_api_index;
             self.next_api_index = self
                 .next_api_index
@@ -1332,11 +1579,28 @@ impl RuntimeSession {
                     .read_rip()
                     .context("failed to read RIP before runtime step")?;
                 if current_rip == 0 {
+                    if !self.entry_reached {
+                        self.entry_reached = true;
+                        tracing::info!(
+                            target: "wiegui",
+                            entry = self.entry_point_va,
+                            "guest entry reached"
+                        );
+                    }
                     self.entry_point_va
                 } else {
                     current_rip
                 }
             };
+
+            // B5: refresh the host-written guest clock table ahead of this
+            // quantum so the in-guest clock stubs (GetTickCount / timeGetTime
+            // / QPC / …) observe advancing values with no host stop. Frozen
+            // under `WIE_FIXED_CLOCK=1` — the table was written once at
+            // session init, so a guest busy-waiting on a constant never spins.
+            if !wie_winapi::kernel32::clock::clock_is_fixed() {
+                self.refresh_clock_table();
+            }
 
             let emu_t0 = self.profile_enabled.then(Instant::now);
             let hook_result = self.process.engine.run_until_stop(
@@ -1576,6 +1840,15 @@ impl RuntimeSession {
                     }
 
                     if let Some(resolved) = resolved_opt {
+                        tracing::trace!(
+                            api_index = index,
+                            api = %format!(
+                                "{}!{}",
+                                resolved.library.as_ref(),
+                                resolved.name.as_ref()
+                            ),
+                            "host API stop"
+                        );
                         if let Some(t0) = resolve_t0 {
                             self.profile.resolve_ns = self
                                 .profile
@@ -2031,9 +2304,38 @@ impl RuntimeSession {
             }
         }
 
+        // B9: per-frame timing sample — sync present accumulators into the
+        // profile and log host-stop / iced-vs-jit deltas on publish. Locks are
+        // dropped; only active when `WIE_RUNTIME_PROFILE` (or
+        // `enable_frame_timing`) is set.
+        if self.profile_enabled {
+            self.sample_frame_timing();
+        }
+
         // Join workers if process exited.
         if matches!(termination, EntryTraceTermination::ExitProcess { .. }) {
             self.process.join_workers();
+        }
+
+        match &termination {
+            EntryTraceTermination::ExitProcess { code } => {
+                tracing::info!(target: "wiegui", code = *code, "guest exited");
+            }
+            EntryTraceTermination::ApiLimit => {
+                tracing::warn!(target: "wiegui", "API stop limit hit");
+            }
+            EntryTraceTermination::WaitingForMessage => {
+                // Log only meaningful idle transitions: the first idle, or a
+                // re-idle after the guest ran (charged API stops) — not the
+                // 50 ms poll-loop re-entry with an empty queue.
+                if !self.was_waiting_for_message || charged_api > 0 {
+                    tracing::debug!(target: "wiegui", "guest went idle waiting for messages");
+                }
+                self.was_waiting_for_message = true;
+            }
+            _ => {
+                self.was_waiting_for_message = false;
+            }
         }
 
         let (final_rip, final_rsp) = self.process.with_mut(|eng, _| {
@@ -2059,26 +2361,23 @@ impl RuntimeSession {
         word_parameter: u64,
         long_parameter: u64,
     ) -> Result<()> {
-        self.process.with_mut(|_, st| {
-            let time = st.window_state().next_message_time;
-            st.window_state().next_message_time = st
-                .window_state()
-                .next_message_time
-                .checked_add(1)
-                .context("runtime message timestamp overflow")?;
-            st.window_state()
-                .message_queue
-                .push(wie_winapi::QueuedWindowMessage {
-                    window_handle,
-                    message,
-                    word_parameter,
-                    long_parameter,
-                    time,
-                    point_x: 0,
-                    point_y: 0,
-                });
-            Ok(())
-        })
+        let queue_arc = self.process.message_queue_arc();
+        let mut queue = queue_arc.lock().unwrap_or_else(|e| e.into_inner());
+        let time = queue.next_message_time;
+        queue.next_message_time = queue
+            .next_message_time
+            .checked_add(1)
+            .context("runtime message timestamp overflow")?;
+        queue.messages.push(wie_winapi::QueuedWindowMessage {
+            window_handle,
+            message,
+            word_parameter,
+            long_parameter,
+            time,
+            point_x: 0,
+            point_y: 0,
+        });
+        Ok(())
     }
 
     /// Returns the first window backed by a guest WndProc.
@@ -2092,6 +2391,22 @@ impl RuntimeSession {
                     .map(|window| window.handle)
             })
         })
+    }
+
+    /// Return a cloneable handle for cross-thread WinAPI access.
+    #[must_use]
+    pub fn guest_handle(&self) -> GuestHandle {
+        GuestHandle {
+            state: self.process.winapi_arc(),
+            queue: self.process.message_queue_arc(),
+        }
+    }
+
+    /// Take the latest published frame for `hwnd`, if any.
+    #[must_use]
+    pub fn take_frame(&self, hwnd: u64) -> Option<wie_winapi::present::SurfaceFrame> {
+        self.process
+            .with_winapi_ref(|state| state.try_present()?.published.get(&hwnd).cloned())
     }
 
     /// Snapshot of runtime-owned windows (handle, class, title, has WndProc).
@@ -2221,8 +2536,6 @@ impl RuntimeSession {
         let dispatch_rsp = self.process.with_mut(|engine, _| {
             crate::guest_callback::install_guest_callback_frame(engine, &request, trampoline)
         })?;
-        let create_window_hwnd =
-            crate::guest_callback::create_window_hwnd_for_outer(outer_name, request.window_handle);
 
         self.pending_callbacks.push(PendingGuestCallback {
             dispatch_rsp,
@@ -2230,7 +2543,7 @@ impl RuntimeSession {
             outer_library: outer_library.into(),
             outer_name: outer_name.into(),
             outer_fake_va,
-            create_window_hwnd,
+            outer_return: request.outer_return,
         });
 
         Ok(())
@@ -2247,7 +2560,7 @@ impl RuntimeSession {
             crate::guest_callback::finish_guest_callback(
                 engine,
                 pending.dispatch_rsp,
-                pending.create_window_hwnd,
+                pending.outer_return,
             )
         })?;
 
@@ -2350,6 +2663,351 @@ fn invalid_memory_diagnostic(
 }
 
 /// Append one journal line when `WIE_API_JOURNAL` is set (backend A/B diffs).
+/// Host-side handle to the WinAPI state for cross-thread access.
+///
+/// The presenter calls methods on this handle to post messages and read
+/// frames.  Posting locks ONLY the dedicated message-queue mutex — never the
+/// big `WinApiState` mutex the guest thread holds during API-handler
+/// execution — so input events never block on guest work.
+#[derive(Clone)]
+pub struct GuestHandle {
+    state: std::sync::Arc<std::sync::Mutex<wie_winapi::WinApiState>>,
+    queue: std::sync::Arc<std::sync::Mutex<wie_winapi::present::MessageQueue>>,
+}
+
+impl GuestHandle {
+    /// Take the latest published frame for `hwnd`, if any.
+    #[must_use]
+    pub fn take_frame(&self, hwnd: u64) -> Option<wie_winapi::present::SurfaceFrame> {
+        let state = self.state.lock().ok()?;
+        state.try_present()?.published.get(&hwnd).cloned()
+    }
+
+    /// B9: whether frame timing instrumentation is active (lock-free gate).
+    #[must_use]
+    pub fn frame_timing_enabled(&self) -> bool {
+        wie_winapi::present::frame_timing_enabled()
+    }
+
+    /// B2: the current present generation (bumped by every publish). Used by
+    /// the host to skip redundant presents of an unchanged frame.
+    #[must_use]
+    pub fn present_generation(&self) -> u64 {
+        let Ok(state) = self.state.lock() else {
+            return 0;
+        };
+        state.try_present().map_or(0, |p| p.generation)
+    }
+
+    /// B9: record one host present (softbuffer copy + upload) wall time (ns).
+    /// The internal gate makes this a no-op (no lock) when timing is disabled.
+    pub fn record_present_time(&self, ns: u128) {
+        if !wie_winapi::present::frame_timing_enabled() {
+            return;
+        }
+        if let Ok(mut state) = self.state.lock() {
+            state.present().record_present(ns);
+        }
+    }
+
+    /// B9: publish duration of the most recent frame (ns; 0 when timing disabled).
+    #[must_use]
+    pub fn present_publish_ns_last(&self) -> u128 {
+        let Ok(state) = self.state.lock() else {
+            return 0;
+        };
+        state.try_present().map_or(0, |p| p.publish_ns_last)
+    }
+
+    /// Return the first (and typically only) guest-created window handle.
+    #[must_use]
+    pub fn first_guest_window_handle(&self) -> Option<u64> {
+        let state = self.state.lock().ok()?;
+        state.try_window_state()?.windows.first().map(|w| w.handle)
+    }
+
+    /// Hit-test a point in the top-level window's client area.
+    ///
+    /// Returns `(hwnd, rel_x, rel_y)` for the topmost visible child containing
+    /// the point, or the top-level window itself (with client-relative
+    /// coordinates) when no child is hit. `None` when no top-level window
+    /// exists. The top-level window is the first parentless record (the main
+    /// guest window); children are tested in reverse creation order, matching
+    /// Windows' z-order hit-testing.
+    #[must_use]
+    pub fn window_at(&self, x: i32, y: i32) -> Option<(u64, u32, u32)> {
+        let state = self.state.lock().ok()?;
+        let windows = &state.try_window_state()?.windows;
+        let top = windows.iter().find(|w| w.parent_handle == 0)?.handle;
+        for child in windows.iter().rev() {
+            if child.parent_handle != top || !child.visible {
+                continue;
+            }
+            let (rel_x, rel_y) = (x - child.x, y - child.y);
+            if rel_x >= 0 && rel_y >= 0 && rel_x < child.width && rel_y < child.height {
+                return Some((child.handle, rel_x as u32, rel_y as u32));
+            }
+        }
+        Some((top, x as u32, y as u32))
+    }
+
+    /// Resolve the destination for a mouse message under active capture.
+    ///
+    /// Returns `(hwnd, rel_x, rel_y)` for the window holding the mouse capture
+    /// (SetCapture — a pressed BUTTON captures until its `WM_LBUTTONUP`), with
+    /// coordinates relative to that window, or `None` when no window captures
+    /// (the caller falls back to hit-testing via [`Self::window_at`]).
+    #[must_use]
+    pub fn capture_target(&self, x: i32, y: i32) -> Option<(u64, u32, u32)> {
+        let state = self.state.lock().ok()?;
+        let ws = state.try_window_state()?;
+        let capture = ws.capture_window_handle;
+        if capture == 0 {
+            return None;
+        }
+        let top = ws.windows.iter().find(|w| w.parent_handle == 0)?.handle;
+        let window = ws.windows.iter().find(|w| w.handle == capture)?;
+        if capture == top {
+            Some((capture, x.max(0) as u32, y.max(0) as u32))
+        } else {
+            Some((
+                capture,
+                x.saturating_sub(window.x) as u32,
+                y.saturating_sub(window.y) as u32,
+            ))
+        }
+    }
+
+    /// The window currently holding the mouse capture, if any.
+    #[must_use]
+    pub fn capture_window(&self) -> Option<u64> {
+        let state = self.state.lock().ok()?;
+        let capture = state.try_window_state()?.capture_window_handle;
+        (capture != 0).then_some(capture)
+    }
+
+    /// The window with keyboard focus (what `GetFocus` returns in-guest).
+    #[must_use]
+    pub fn focus_window(&self) -> Option<u64> {
+        let state = self.state.lock().ok()?;
+        let focus = state.try_window_state()?.focus_window_handle;
+        (focus != 0).then_some(focus)
+    }
+
+    /// Whether `TrackMouseEvent` armed hover/leave tracking for `hwnd`.
+    ///
+    /// The host forwards `WM_MOUSEHOVER` / `WM_MOUSELEAVE` only for tracked
+    /// windows — without a `TrackMouseEvent` call Windows sends neither.
+    #[must_use]
+    pub fn mouse_tracking(&self, hwnd: u64) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        state.try_window_state().is_some_and(|ws| {
+            ws.windows
+                .iter()
+                .any(|w| w.handle == hwnd && w.mouse_tracking)
+        })
+    }
+
+    /// Update one virtual key's pressed state in the guest keyboard-state
+    /// array (the 256-byte table `GetKeyState` / `GetAsyncKeyState` /
+    /// `IsDialogMessage`'s Shift+Tab read).
+    ///
+    /// `pressed` sets or clears bit 0x80 (the "key is down" flag) for `vk`.
+    pub fn set_key_state(&self, vk: u16, pressed: bool) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let ws = state.window_state();
+        if let Some(key) = ws.keyboard_state.get_mut(usize::from(vk)) {
+            if pressed {
+                *key |= 0x80;
+            } else {
+                *key &= !0x80;
+            }
+        }
+    }
+
+    /// Return info for the first guest window: (hwnd, title, width, height).
+    #[must_use]
+    pub fn first_guest_window_info(&self) -> Option<(u64, String, i32, i32)> {
+        let state = self.state.lock().ok()?;
+        let w = state.try_window_state()?.windows.first()?;
+        Some((w.handle, w.title.clone(), w.width, w.height))
+    }
+
+    /// Snapshot of the first menu-bearing window's menu as a tree, for the
+    /// host menu bar.
+    ///
+    /// Reconstructs the hierarchy from the flat `AppendMenuA/W` record list:
+    /// top-level items belong to the window's menu handle; an item carrying
+    /// `MF_POPUP` names a submenu (its `id` is that submenu's handle), whose
+    /// items are the records with that `menu_handle`. Separators (empty text)
+    /// are skipped. Empty when no window has a menu yet.
+    #[must_use]
+    pub fn window_menu_items(&self) -> Vec<MenuNode> {
+        let Ok(state) = self.state.lock() else {
+            return Vec::new();
+        };
+        let Some(ws) = state.try_window_state() else {
+            return Vec::new();
+        };
+        let Some(menu_handle) = ws
+            .windows
+            .iter()
+            .find_map(|w| (w.menu_handle != 0).then_some(w.menu_handle))
+        else {
+            return Vec::new();
+        };
+        build_menu_tree(&ws.menu_items, menu_handle)
+    }
+
+    /// Set the wake callback — called when a new frame is published.
+    pub fn set_wake(&self, cb: Box<dyn Fn() + Send>) {
+        if let Ok(mut state) = self.state.lock() {
+            state.present().wake = Some(cb);
+        }
+    }
+
+    /// Update the guest-visible window size (host window was resized).
+    ///
+    /// Updates the `WindowRecord` only — three `i32` writes, no allocation.
+    /// Uses `try_lock` so the per-`Resized`-event hot path NEVER blocks on the
+    /// guest thread mid-API-call: if the record can't be locked right now,
+    /// the settled `WM_SIZE` carries the final size anyway (and the guest's
+    /// own `recreate_dib` reads `lParam`, not the record).
+    pub fn resize_window(&self, hwnd: u64, width: u32, height: u32) {
+        let Ok(mut state) = self.state.try_lock() else {
+            return;
+        };
+        let ws = state.window_state();
+        if let Some(window) = ws.windows.iter_mut().find(|w| w.handle == hwnd) {
+            window.width = i32::try_from(width).unwrap_or(0);
+            window.height = i32::try_from(height).unwrap_or(0);
+            window.client_rect = (0, 0, window.width, window.height);
+        }
+        // Invalidate the whole descendant subtree (children, grandchildren —
+        // e.g. a dialog's buttons).  A WS_CLIPCHILDREN parent's own repaint is
+        // deliberately clipped around its children, so their regions in the
+        // reallocated ancestor surface keep stale/zero-padded pixels unless
+        // they repaint themselves — in real Windows those pixels persist in
+        // the framebuffer; here the surface is rebuilt on resize, so the
+        // children must be explicitly repainted via WM_PAINT synthesis.
+        let mut descendants: Vec<u64> = Vec::new();
+        let mut frontier = vec![hwnd];
+        while let Some(parent) = frontier.pop() {
+            for w in &ws.windows {
+                if w.parent_handle == parent {
+                    descendants.push(w.handle);
+                    frontier.push(w.handle);
+                }
+            }
+        }
+        for w in ws.windows.iter_mut() {
+            if descendants.contains(&w.handle) {
+                w.invalidated = true;
+            }
+        }
+    }
+
+    /// Post a message to the guest message queue.
+    ///
+    /// Locks ONLY the dedicated queue mutex and notifies the condvar, so a
+    /// waiting guest loop wakes immediately (no 50 ms poll tick) and the host
+    /// never blocks on guest API execution.
+    pub fn post_message(&self, hwnd: u64, msg: u32, wparam: u64, lparam: u64) {
+        self.post_message_at(hwnd, msg, wparam, lparam, 0, 0);
+    }
+
+    /// Post a message with a cursor position (fills `MSG.pt`).
+    ///
+    /// Mouse messages carry the cursor position at post time, matching the
+    /// `MSG` layout Windows fills; keyboard/window messages use `(0, 0)`.
+    pub fn post_message_at(
+        &self,
+        hwnd: u64,
+        msg: u32,
+        wparam: u64,
+        lparam: u64,
+        point_x: i32,
+        point_y: i32,
+    ) {
+        if let Ok(mut queue) = self.queue.lock() {
+            let time = queue.next_message_time;
+            queue.next_message_time = time.wrapping_add(1);
+            queue.messages.push(wie_winapi::QueuedWindowMessage {
+                window_handle: hwnd,
+                message: msg,
+                word_parameter: wparam,
+                long_parameter: lparam,
+                time,
+                point_x,
+                point_y,
+            });
+            // Wake a guest blocked in run_windowed's condvar wait.
+            {
+                let mut triggered = queue
+                    .signal
+                    .triggered
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                *triggered = true;
+            }
+            queue.signal.cvar.notify_one();
+        }
+    }
+
+    /// Return the message signal, if the queue slot exists.
+    ///
+    /// The GUI loop waits on this condvar so posted messages (keyboard,
+    /// mouse, close, WM_SIZE) wake the guest immediately instead of on a
+    /// fixed poll interval.
+    #[must_use]
+    pub fn message_signal(&self) -> Option<std::sync::Arc<wie_winapi::present::MessageSignal>> {
+        self.queue.lock().ok().map(|q| q.signal.clone())
+    }
+}
+
+/// One node of the guest window's menu tree, as mirrored into the macOS bar.
+///
+/// A leaf item (`MF_STRING`) has empty `children`; a popup item (`MF_POPUP`)
+/// carries its submenu handle in `id` and its submenu's items in `children`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuNode {
+    /// `MF_STRING` command id, or submenu handle for `MF_POPUP`.
+    pub id: u32,
+    /// Item text (empty for separators).
+    pub title: String,
+    /// Submenu items (non-empty only for `MF_POPUP` items).
+    pub children: Vec<MenuNode>,
+}
+
+/// `MF_POPUP`: the item id is a submenu handle, not a command id.
+const MF_POPUP: u32 = 0x0010;
+
+/// Build the menu tree rooted at `menu_handle` from the flat AppendMenu
+/// records: popup items recurse into the submenu their id names. Separators
+/// (empty text) are skipped at every level.
+fn build_menu_tree(items: &[MenuItemRecord], menu_handle: u64) -> Vec<MenuNode> {
+    items
+        .iter()
+        .filter(|item| item.menu_handle == menu_handle && !item.text.is_empty())
+        .map(|item| {
+            let children = if item.flags & MF_POPUP != 0 {
+                build_menu_tree(items, u64::from(item.id))
+            } else {
+                Vec::new()
+            };
+            MenuNode {
+                id: item.id,
+                title: item.text.clone(),
+                children,
+            }
+        })
+        .collect()
+}
+
 fn journal_api_return(
     index: usize,
     library: &str,

@@ -33,7 +33,44 @@ pub(crate) struct GuestStubConfig {
     pub command_line_a_va: u64,
     /// `GetCommandLineW` buffer (UTF-16, NUL-terminated) in env data page.
     pub command_line_w_va: u64,
+    /// Fake-VA of `CreateDialogParamA` (modal-dialog stub callee).
+    pub create_dialog_param_a_va: u64,
+    /// Fake-VA of `CreateDialogParamW` (modal-dialog stub callee).
+    pub create_dialog_param_w_va: u64,
+    /// Fake-VA of `GetMessageA` (modal-dialog stub callee).
+    pub get_message_a_va: u64,
+    /// Fake-VA of `IsDialogMessageA` (modal-dialog stub callee).
+    pub is_dialog_message_a_va: u64,
+    /// Fake-VA of `DispatchMessageA` (modal-dialog stub callee).
+    pub dispatch_message_a_va: u64,
+    /// Guest VA of the `u32` dialog-result slot (`EndDialog` writes, the
+    /// `DialogBoxParam` stub reads after `WM_QUIT`).
+    pub dialog_result_va: u64,
+    /// Guest VA of the host-written clock table (B5): 6 × u64 slots refreshed
+    /// on every host stop; in-guest clock stubs read it with no host stop.
+    pub clock_table_va: u64,
 }
+
+/// Offset of the dialog-result slot inside the guest stub data page.
+pub(crate) const DIALOG_RESULT_OFFSET: u64 = 0x1000;
+
+/// Slot offsets into the 6×u64 guest clock table (B5).
+///
+/// Must match `wie_winapi::kernel32::clock::clock_table_values` slot order:
+/// - `[0]` tick_count u32 — `GetTickCount`
+/// - `[1]` tick_count_64 — `GetTickCount64`
+/// - `[2]` time_get_time u32 — `timeGetTime`
+/// - `[3]` system_time_as_filetime — `GetSystemTimeAsFileTime`
+/// - `[4]` qpc_counter — `QueryPerformanceCounter`
+/// - `[5]` qpc_frequency — `QueryPerformanceFrequency`
+pub(crate) const CLOCK_TABLE_SLOT_TICK: u64 = 0;
+pub(crate) const CLOCK_TABLE_SLOT_TICK64: u64 = 8;
+pub(crate) const CLOCK_TABLE_SLOT_TIME: u64 = 16;
+pub(crate) const CLOCK_TABLE_SLOT_FILETIME: u64 = 24;
+pub(crate) const CLOCK_TABLE_SLOT_QPC: u64 = 32;
+pub(crate) const CLOCK_TABLE_SLOT_QPC_FREQ: u64 = 40;
+/// Total clock-table size in bytes (6 × u64).
+pub(crate) const CLOCK_TABLE_SIZE: usize = 48;
 
 impl GuestStubConfig {
     /// Placeholder VAs for trait classification only (`is_some()`).
@@ -44,6 +81,13 @@ impl GuestStubConfig {
         cwd_blob_va: 0,
         command_line_a_va: 0,
         command_line_w_va: 0,
+        create_dialog_param_a_va: 0,
+        create_dialog_param_w_va: 0,
+        get_message_a_va: 0,
+        is_dialog_message_a_va: 0,
+        dispatch_message_a_va: 0,
+        dialog_result_va: 0,
+        clock_table_va: 0,
     };
 
     #[must_use]
@@ -56,6 +100,24 @@ impl GuestStubConfig {
             cwd_blob_va: base + OFFSET_CWD,
             command_line_a_va: layout.env_data_base + 0x100,
             command_line_w_va: layout.env_data_base + 0x200,
+            // The modal-loop callees are WinApiIds with deterministic dense
+            // fake VAs; they resolve even when the guest never imported them
+            // (the stop bitmap defaults to host-stop everywhere).
+            create_dialog_param_a_va: wie_winapi::encode_export(
+                wie_winapi::WinApiId::User32Createdialogparama,
+            ),
+            create_dialog_param_w_va: wie_winapi::encode_export(
+                wie_winapi::WinApiId::User32Createdialogparamw,
+            ),
+            get_message_a_va: wie_winapi::encode_export(wie_winapi::WinApiId::User32Getmessagea),
+            is_dialog_message_a_va: wie_winapi::encode_export(
+                wie_winapi::WinApiId::User32Isdialogmessagea,
+            ),
+            dispatch_message_a_va: wie_winapi::encode_export(
+                wie_winapi::WinApiId::User32Dispatchmessagea,
+            ),
+            dialog_result_va: base + DIALOG_RESULT_OFFSET,
+            clock_table_va: layout.clock_table_va,
         }
     }
 }
@@ -80,7 +142,7 @@ const FAKE_DESKTOP_WINDOW: u64 = 0x0000_0000_6600_0110;
 const FAKE_SYSCOLOR_BRUSH_BASE: u64 = 0x0000_0000_6601_0000;
 
 /// Kind of in-guest stub to plant at a fake API VA.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum GuestStubKind {
     /// `ret` — void stdcall/win64 return.
     VoidRet,
@@ -94,8 +156,16 @@ pub(crate) enum GuestStubKind {
     ReturnImm64(u64),
     /// `mov rax, imm64; mov eax, [rax]; ret` — load DWORD from fixed guest VA.
     LoadZx32FromVa(u64),
-    /// `mov rax, imm64; mov [rax], ecx; ret` — store DWORD to fixed guest VA.
+    /// `mov rax, imm64; mov rax, [rax]; ret` — load QWORD from fixed guest VA.
+    LoadZx64FromVa(u64),
+    /// `mov [rax], ecx; ret` — store DWORD to fixed guest VA.
     StoreEcxToVa(u64),
+    /// `*rcx = qword[slot_va]` — copy one u64 table slot through a guest
+    /// pointer (`GetSystemTimeAsFileTime`; NULL pointer skipped, void return).
+    CopyU64FromVaToRcxPtr { slot_va: u64 },
+    /// `*rcx = qword[slot_va]; return 1` (`QueryPerformanceCounter` /
+    /// `QueryPerformanceFrequency` — Microsoft returns BOOL TRUE).
+    CopyU64FromVaToRcxPtrRetOne { slot_va: u64 },
     /// `FlsGetValue`: index in RCX, table of u64 values at fixed VA.
     FlsGetValue { table_va: u64, max_slots: u32 },
     /// `FlsSetValue`: RCX=index, RDX=value; returns TRUE. OOR → FALSE.
@@ -112,6 +182,24 @@ pub(crate) enum GuestStubKind {
     Initterm,
     /// `_initterm_e(first, last)` — call each non-null `int (*)()`; stop on non-zero.
     InittermE,
+    /// `DialogBoxParamA/W` — the modal dialog loop, run entirely in-guest.
+    ///
+    /// Calls `CreateDialogParamA/W` (host builds the dialog + controls and
+    /// sends `WM_INITDIALOG`), then loops `GetMessageA` → `IsDialogMessageA`
+    /// → `DispatchMessageA` until `WM_QUIT`, then returns the value stored in
+    /// the fixed dialog-result slot. All callees are fake-VA host stops.
+    DialogBoxParam {
+        /// Fake-VA of `CreateDialogParamA` or `CreateDialogParamW`.
+        create_dialog_param_va: u64,
+        /// Fake-VA of `GetMessageA`.
+        get_message_va: u64,
+        /// Fake-VA of `IsDialogMessageA`.
+        is_dialog_message_va: u64,
+        /// Fake-VA of `DispatchMessageA`.
+        dispatch_message_va: u64,
+        /// Guest VA of the `u32` dialog-result slot.
+        dialog_result_va: u64,
+    },
 }
 
 impl GuestStubKind {
@@ -138,11 +226,19 @@ impl GuestStubKind {
                 buf[2..10].copy_from_slice(&va.to_le_bytes());
                 buf
             }
+            Self::LoadZx64FromVa(va) => {
+                // mov rax, imm64 ; mov rax, [rax] ; ret (14 bytes — fits IAT stride)
+                let mut buf = vec![0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0x48, 0x8b, 0x00, 0xc3];
+                buf[2..10].copy_from_slice(&va.to_le_bytes());
+                buf
+            }
             Self::StoreEcxToVa(va) => {
                 let mut buf = vec![0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0x89, 0x08, 0xc3];
                 buf[2..10].copy_from_slice(&va.to_le_bytes());
                 buf
             }
+            Self::CopyU64FromVaToRcxPtr { slot_va } => encode_copy_u64_to_ptr(slot_va, false),
+            Self::CopyU64FromVaToRcxPtrRetOne { slot_va } => encode_copy_u64_to_ptr(slot_va, true),
             Self::FlsGetValue {
                 table_va,
                 max_slots,
@@ -175,6 +271,19 @@ impl GuestStubKind {
             }
             Self::Initterm => encode_initterm(false),
             Self::InittermE => encode_initterm(true),
+            Self::DialogBoxParam {
+                create_dialog_param_va,
+                get_message_va,
+                is_dialog_message_va,
+                dispatch_message_va,
+                dialog_result_va,
+            } => encode_dialog_box_param(
+                create_dialog_param_va,
+                get_message_va,
+                is_dialog_message_va,
+                dispatch_message_va,
+                dialog_result_va,
+            ),
         }
     }
 
@@ -193,7 +302,10 @@ impl GuestStubKind {
             Self::ReturnImm32(_) => false,
             Self::ReturnImm64(_) => false,
             Self::LoadZx32FromVa(_) => false,
+            Self::LoadZx64FromVa(_) => false,
             Self::StoreEcxToVa(_) => false,
+            Self::CopyU64FromVaToRcxPtr { .. } => true,
+            Self::CopyU64FromVaToRcxPtrRetOne { .. } => true,
             Self::FlsGetValue { .. } => true,
             Self::FlsSetValue { .. } => true,
             Self::AcrtIobFunc => false,
@@ -202,6 +314,7 @@ impl GuestStubKind {
             Self::GetCurrentDirectoryW { .. } => true,
             Self::Initterm => true,
             Self::InittermE => true,
+            Self::DialogBoxParam { .. } => true,
         }
     }
 
@@ -226,7 +339,10 @@ impl GuestStubKind {
             Self::ReturnImm32(_) => false,
             Self::ReturnImm64(_) => true, // GetCommandLineA/W, GetProcessHeap, GetDesktopWindow
             Self::LoadZx32FromVa(_) => true, // TEB_LAST_ERROR_VA (constant, but safe to re-classify)
+            Self::LoadZx64FromVa(_) => true, // clock-table slot VA (config-derived)
             Self::StoreEcxToVa(_) => true,   // TEB_LAST_ERROR_VA (same)
+            Self::CopyU64FromVaToRcxPtr { .. } => true, // clock-table slot VA
+            Self::CopyU64FromVaToRcxPtrRetOne { .. } => true, // clock-table slot VA
             Self::FlsGetValue { .. } => true,
             Self::FlsSetValue { .. } => true,
             Self::AcrtIobFunc => false,
@@ -235,6 +351,7 @@ impl GuestStubKind {
             Self::GetCurrentDirectoryW { .. } => true,
             Self::Initterm => false,
             Self::InittermE => false,
+            Self::DialogBoxParam { .. } => true,
         }
     }
 }
@@ -311,6 +428,127 @@ fn encode_initterm(check_status: bool) -> Vec<u8> {
     buf
 }
 
+/// `DialogBoxParamA/W` modal-loop body (out-of-line helper).
+///
+/// Win64 entry: `RCX=hInstance, RDX=lpTemplateName, R8=hWndParent,
+/// R9=lpDialogFunc, [rsp+0x28]=dwInitParam`.
+///
+/// ```text
+/// push rbx; sub rsp, 0x60     ; rbx = alignment pad (preserved)
+/// mov rax, [rsp+0x90]        ; dwInitParam (caller's 5th arg)
+/// mov [rsp+0x28], rax        ; 5th arg slot for CreateDialogParam
+/// call CreateDialogParamA/W  ; host: build dialog, WM_INITDIALOG bridge
+/// test rax, rax; jnz .created
+///   mov rax, -1; jmp .done   ; creation failed → DialogBoxParam returns -1
+/// .created:
+/// mov [rsp+0x20], rax        ; hwnd lives in OUR frame — the WM_INITDIALOG
+///                            ; guest callback clobbers every register, and
+///                            ; its frame sits BELOW ours, so the stack slot
+///                            ; survives
+/// .loop:
+///   lea rcx, [rsp+0x28]      ; lpMsg
+///   xor edx, edx             ; hWnd = NULL — real modal loops pull every
+///                            ; thread message (the owner's WM_TIMER must
+///                            ; still be dispatched inside the dialog)
+///   xor r8d, r8d; xor r9d, r9d
+///   call GetMessageA
+///   test eax, eax; jz .quit
+///   mov rcx, [rsp+0x20]; lea rdx, [rsp+0x28]
+///   call IsDialogMessageA
+///   test eax, eax; jnz .loop ; consumed (Tab/Enter/Esc) → keep going
+///   lea rcx, [rsp+0x28]
+///   call DispatchMessageA
+///   jmp .loop
+/// .quit:
+/// mov rax, dialog_result_va  ; EndDialog wrote the result here
+/// mov eax, [rax]
+/// .done:
+/// add rsp, 0x60; pop rbx; ret
+/// ```
+///
+/// `[rsp+0x90]` = the caller's 5th arg: entry `rsp` = R0, after `push rbx`
+/// (8) + `sub rsp, 0x60` the frame is at R0-0x68, and the caller's stack arg
+/// sits at `[R0+0x28]` = `[rsp+0x68+0x28]` = `[rsp+0x90]`.
+fn encode_dialog_box_param(
+    create_dialog_param_va: u64,
+    get_message_va: u64,
+    is_dialog_message_va: u64,
+    dispatch_message_va: u64,
+    dialog_result_va: u64,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(180);
+    // push rbx ; sub rsp, 0x60
+    buf.extend_from_slice(&[0x53]);
+    buf.extend_from_slice(&[0x48, 0x83, 0xec, 0x60]);
+    // mov rax, [rsp+0x90] ; mov [rsp+0x28], rax
+    buf.extend_from_slice(&[0x48, 0x8b, 0x84, 0x24, 0x90, 0x00, 0x00, 0x00]);
+    buf.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x28]);
+    // call CreateDialogParamA/W
+    buf.extend_from_slice(&[0x48, 0xb8]);
+    buf.extend_from_slice(&create_dialog_param_va.to_le_bytes());
+    buf.extend_from_slice(&[0xff, 0xd0]);
+    // test rax, rax ; jnz .created
+    buf.extend_from_slice(&[0x48, 0x85, 0xc0]);
+    let jnz_created = buf.len() + 1;
+    buf.extend_from_slice(&[0x75, 0x00]);
+    // mov rax, -1 ; jmp .done
+    buf.extend_from_slice(&[0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff]);
+    let jmp_done = buf.len() + 1;
+    buf.extend_from_slice(&[0xeb, 0x00]);
+    // .created: mov [rsp+0x20], rax  (hwnd slot)
+    let created_at = buf.len();
+    buf.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x20]);
+    // .loop:
+    let loop_at = buf.len();
+    // lea rcx, [rsp+0x28] ; xor edx, edx ; xor r8d, r8d ; xor r9d, r9d
+    buf.extend_from_slice(&[0x48, 0x8d, 0x4c, 0x24, 0x28]);
+    buf.extend_from_slice(&[0x31, 0xd2]);
+    buf.extend_from_slice(&[0x45, 0x31, 0xc0]);
+    buf.extend_from_slice(&[0x45, 0x31, 0xc9]);
+    // call GetMessageA
+    buf.extend_from_slice(&[0x48, 0xb8]);
+    buf.extend_from_slice(&get_message_va.to_le_bytes());
+    buf.extend_from_slice(&[0xff, 0xd0]);
+    // test eax, eax ; jz .quit
+    buf.extend_from_slice(&[0x85, 0xc0]);
+    let jz_quit = buf.len() + 1;
+    buf.extend_from_slice(&[0x74, 0x00]);
+    // mov rcx, [rsp+0x20] ; lea rdx, [rsp+0x28] ; call IsDialogMessageA
+    buf.extend_from_slice(&[0x48, 0x8b, 0x4c, 0x24, 0x20]);
+    buf.extend_from_slice(&[0x48, 0x8d, 0x54, 0x24, 0x28]);
+    buf.extend_from_slice(&[0x48, 0xb8]);
+    buf.extend_from_slice(&is_dialog_message_va.to_le_bytes());
+    buf.extend_from_slice(&[0xff, 0xd0]);
+    // test eax, eax ; jnz .loop (consumed)
+    buf.extend_from_slice(&[0x85, 0xc0]);
+    let jnz_loop = buf.len() + 1;
+    buf.extend_from_slice(&[0x75, 0x00]);
+    // lea rcx, [rsp+0x28] ; call DispatchMessageA ; jmp .loop
+    buf.extend_from_slice(&[0x48, 0x8d, 0x4c, 0x24, 0x28]);
+    buf.extend_from_slice(&[0x48, 0xb8]);
+    buf.extend_from_slice(&dispatch_message_va.to_le_bytes());
+    buf.extend_from_slice(&[0xff, 0xd0]);
+    let jmp_loop = buf.len() + 1;
+    buf.extend_from_slice(&[0xeb, 0x00]);
+    // .quit: mov rax, dialog_result_va ; mov eax, [rax]
+    let quit_at = buf.len();
+    buf.extend_from_slice(&[0x48, 0xb8]);
+    buf.extend_from_slice(&dialog_result_va.to_le_bytes());
+    buf.extend_from_slice(&[0x8b, 0x00]);
+    // .done: add rsp, 0x60 ; pop rbx ; ret
+    let done_at = buf.len();
+    buf.extend_from_slice(&[0x48, 0x83, 0xc4, 0x60]);
+    buf.push(0x5b);
+    buf.push(0xc3);
+
+    patch_rel8(&mut buf, jnz_created, created_at);
+    patch_rel8(&mut buf, jmp_done, done_at);
+    patch_rel8(&mut buf, jz_quit, quit_at);
+    patch_rel8(&mut buf, jnz_loop, loop_at);
+    patch_rel8(&mut buf, jmp_loop, loop_at);
+    buf
+}
+
 fn encode_fls_get(table_va: u64, max_slots: u32) -> Vec<u8> {
     let mut buf = Vec::with_capacity(32);
     buf.extend_from_slice(&[0x48, 0x81, 0xf9]);
@@ -360,6 +598,34 @@ fn encode_load_u32_table(table_va: u64, max_index: u32) -> Vec<u8> {
     let zero_at = buf.len();
     buf.extend_from_slice(&[0x31, 0xc0, 0xc3]);
     patch_rel8(&mut buf, jae_imm, zero_at);
+    buf
+}
+
+/// `GetSystemTimeAsFileTime` / `QueryPerformanceCounter` body: copy one u64
+/// clock-table slot through the guest pointer in RCX (out-of-line helper).
+///
+/// ```text
+/// mov rax, slot_va       ; mov rdx, [rax]  ; load the table slot
+/// test rcx, rcx          ; NULL pointer → skip the store (host semantics)
+/// jz  .skip
+/// mov [rcx], rdx
+/// .skip: (mov eax, 1 ;) ret     ; ret_one → QPC/QPF returns TRUE
+/// ```
+fn encode_copy_u64_to_ptr(slot_va: u64, ret_one: bool) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(32);
+    buf.extend_from_slice(&[0x48, 0xb8]); // mov rax, imm64
+    buf.extend_from_slice(&slot_va.to_le_bytes());
+    buf.extend_from_slice(&[0x48, 0x8b, 0x10]); // mov rdx, [rax]
+    buf.extend_from_slice(&[0x48, 0x85, 0xc9]); // test rcx, rcx
+    let jz_imm = buf.len() + 1;
+    buf.extend_from_slice(&[0x74, 0x00]); // jz .skip (patched)
+    buf.extend_from_slice(&[0x48, 0x89, 0x11]); // mov [rcx], rdx
+    let skip_at = buf.len();
+    if ret_one {
+        buf.extend_from_slice(&[0xb8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1
+    }
+    buf.push(0xc3);
+    patch_rel8(&mut buf, jz_imm, skip_at);
     buf
 }
 
@@ -524,6 +790,34 @@ pub(crate) fn classify_guest_stub(
             // Microsoft: handle to the desktop window — single fake desktop HWND.
             return Some(GuestStubKind::ReturnImm64(FAKE_DESKTOP_WINDOW));
         }
+        if n.eq_ignore_ascii_case("DialogBoxParamA") {
+            return Some(GuestStubKind::DialogBoxParam {
+                create_dialog_param_va: cfg.create_dialog_param_a_va,
+                get_message_va: cfg.get_message_a_va,
+                is_dialog_message_va: cfg.is_dialog_message_a_va,
+                dispatch_message_va: cfg.dispatch_message_a_va,
+                dialog_result_va: cfg.dialog_result_va,
+            });
+        }
+        if n.eq_ignore_ascii_case("DialogBoxParamW") {
+            return Some(GuestStubKind::DialogBoxParam {
+                create_dialog_param_va: cfg.create_dialog_param_w_va,
+                get_message_va: cfg.get_message_a_va,
+                is_dialog_message_va: cfg.is_dialog_message_a_va,
+                dispatch_message_va: cfg.dispatch_message_a_va,
+                dialog_result_va: cfg.dialog_result_va,
+            });
+        }
+        return None;
+    }
+
+    if library.eq_ignore_ascii_case("WINMM.dll") {
+        // B5: timeGetTime reads the host-written guest clock table (slot 2).
+        if n.eq_ignore_ascii_case("timeGetTime") {
+            return Some(GuestStubKind::LoadZx32FromVa(
+                cfg.clock_table_va.saturating_add(CLOCK_TABLE_SLOT_TIME),
+            ));
+        }
         return None;
     }
 
@@ -561,10 +855,38 @@ pub(crate) fn classify_guest_stub(
     {
         return Some(GuestStubKind::VoidRet);
     }
-    // GetTickCount deliberately has no in-guest stub: it must reach the host so
-    // the monotonic clock advances. A planted constant made every frame loop
-    // see dt == 0 forever. `WIE_FIXED_CLOCK=1` restores the frozen value for
-    // deterministic traces, but it does so on the host side.
+    // B5: the host refreshes a guest clock table on every stop; these in-guest
+    // stubs read it with no host stop. A constant stub is deliberately NOT
+    // planted — a guest frame loop computing `dt = now - last` would busy-wait
+    // on `dt == 0` forever (the frozen-clock trap documented below). The table
+    // advances monotonically because the refresh derives from one monotonic
+    // session epoch; `WIE_FIXED_CLOCK=1` freezes it (write-once at session
+    // init), preserving the deterministic-trace kill switch.
+    if n.eq_ignore_ascii_case("GetTickCount") {
+        return Some(GuestStubKind::LoadZx32FromVa(
+            cfg.clock_table_va.saturating_add(CLOCK_TABLE_SLOT_TICK),
+        ));
+    }
+    if n.eq_ignore_ascii_case("GetTickCount64") {
+        return Some(GuestStubKind::LoadZx64FromVa(
+            cfg.clock_table_va.saturating_add(CLOCK_TABLE_SLOT_TICK64),
+        ));
+    }
+    if n.eq_ignore_ascii_case("GetSystemTimeAsFileTime") {
+        return Some(GuestStubKind::CopyU64FromVaToRcxPtr {
+            slot_va: cfg.clock_table_va.saturating_add(CLOCK_TABLE_SLOT_FILETIME),
+        });
+    }
+    if n.eq_ignore_ascii_case("QueryPerformanceCounter") {
+        return Some(GuestStubKind::CopyU64FromVaToRcxPtrRetOne {
+            slot_va: cfg.clock_table_va.saturating_add(CLOCK_TABLE_SLOT_QPC),
+        });
+    }
+    if n.eq_ignore_ascii_case("QueryPerformanceFrequency") {
+        return Some(GuestStubKind::CopyU64FromVaToRcxPtrRetOne {
+            slot_va: cfg.clock_table_va.saturating_add(CLOCK_TABLE_SLOT_QPC_FREQ),
+        });
+    }
     if n.eq_ignore_ascii_case("GetCurrentProcessId") {
         return Some(GuestStubKind::ReturnImm32(0x1234));
     }
@@ -664,6 +986,29 @@ pub(crate) fn publish_cwd_wide(
     Ok(())
 }
 
+/// Publish the current clock snapshot into the host-written guest clock table (B5).
+///
+/// Slot layout must match the classify offsets above and
+/// `wie_winapi::kernel32::clock::clock_table_values`. The host refreshes this
+/// table on every API stop (and once at session init) so the in-guest clock
+/// stubs observe advancing values with no host stop.
+pub(crate) fn refresh_clock_table(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    clock_table_va: u64,
+) -> Result<()> {
+    let mut table = [0_u8; CLOCK_TABLE_SIZE];
+    let values = wie_winapi::kernel32::clock::clock_table_values();
+    for (slot, value) in values.iter().enumerate() {
+        let off = slot.saturating_mul(8);
+        if let Some(dst) = table.get_mut(off..off.saturating_add(8)) {
+            dst.copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    engine
+        .mem_write(clock_table_va, &table)
+        .context("failed to refresh guest clock table")
+}
+
 /// Must match `wie_winapi::user32::fake_system_metric`.
 fn fake_system_metric(metric_index: u64) -> u64 {
     match metric_index {
@@ -722,6 +1067,7 @@ pub(crate) fn plant_guest_stubs(
     let mut planted = 0_usize;
     let mut helper_cursor = helper_code_base;
     let helper_end = helper_code_base.saturating_add(helper_code_size as u64);
+    let mut seen_kinds: std::collections::HashSet<GuestStubKind> = std::collections::HashSet::new();
 
     for entry in entries {
         let kind = match &entry.stub_kind {
@@ -737,6 +1083,9 @@ pub(crate) fn plant_guest_stubs(
             Some(kind) => *kind,
             None => continue,
         };
+        if seen_kinds.insert(kind) {
+            tracing::debug!(name = %entry.name, kind = ?kind, "planted new guest stub kind");
+        }
         let body = kind.encode();
         let va = entry.fake_target_va;
         if va < fake_api_base {
@@ -821,6 +1170,86 @@ mod tests {
     }
 
     #[test]
+    fn dialog_box_stub_encodes_modal_loop() {
+        let body = GuestStubKind::DialogBoxParam {
+            create_dialog_param_va: 0x0000_7000_0000_2c00,
+            get_message_va: 0x0000_7000_0000_1f60,
+            is_dialog_message_va: 0x0000_7000_0000_2c10,
+            dispatch_message_va: 0x0000_7000_0000_22c0,
+            dialog_result_va: 0x0000_7000_0040_a000,
+        }
+        .encode();
+        // ~120 bytes of modal loop; must end in `ret`.
+        assert!(body.len() > 80, "dialog stub too short: {}", body.len());
+        assert!(body.len() < 200, "dialog stub too long: {}", body.len());
+        assert_eq!(*body.last().unwrap(), 0xc3);
+        // The failure path (CreateDialogParam → 0) must return -1 in RAX
+        // (0x48 0xc7 0xc0 0xff.. = `mov rax, -1`) and skip the result load.
+        let neg1 = [0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff];
+        assert!(
+            body.windows(neg1.len()).any(|w| w == neg1),
+            "dialog stub must materialize -1 on CreateDialogParam failure"
+        );
+        // The result must be loaded via `mov eax, [rax]` after a `mov rax, imm`.
+        let load = [0x8b, 0x00, 0xc3];
+        assert!(
+            body.windows(load.len()).any(|w| w == load)
+                || body.windows(2).any(|w| w == [0x8b, 0x00]),
+            "dialog stub must end with the dialog-result load"
+        );
+    }
+
+    #[test]
+    fn dialog_callee_vas_resolve_without_imports() {
+        // A guest that imports ONLY DialogBoxParamA never imports the modal
+        // loop's callees; their fake VAs must still decode to the right
+        // WinApiIds (deterministic encode_export, stop-bit default host-stop).
+        let cfg = GuestStubConfig::from_layout(&crate::memory::DEFAULT_LAYOUT);
+        let expect_export = |va: u64, id: wie_winapi::WinApiId| {
+            assert!(
+                va >= wie_winapi::FAKE_API_BASE,
+                "callee VA {va:#x} outside fake-API window"
+            );
+            assert_eq!(
+                wie_winapi::decode_fake_va(va),
+                Some(wie_winapi::FakeVa::Export(id)),
+                "callee VA {va:#x} does not decode to {id:?}"
+            );
+        };
+        expect_export(
+            cfg.create_dialog_param_a_va,
+            wie_winapi::WinApiId::User32Createdialogparama,
+        );
+        expect_export(
+            cfg.create_dialog_param_w_va,
+            wie_winapi::WinApiId::User32Createdialogparamw,
+        );
+        expect_export(
+            cfg.get_message_a_va,
+            wie_winapi::WinApiId::User32Getmessagea,
+        );
+        expect_export(
+            cfg.is_dialog_message_a_va,
+            wie_winapi::WinApiId::User32Isdialogmessagea,
+        );
+        expect_export(
+            cfg.dispatch_message_a_va,
+            wie_winapi::WinApiId::User32Dispatchmessagea,
+        );
+        // The dialog-result slot lives inside the mapped stub data page.
+        assert!(
+            cfg.dialog_result_va >= crate::memory::DEFAULT_LAYOUT.guest_stub_data_base
+                && cfg.dialog_result_va
+                    < crate::memory::DEFAULT_LAYOUT.guest_stub_data_base
+                        + crate::memory::DEFAULT_LAYOUT.guest_stub_data_size as u64
+        );
+        // CLASSIFY_ONLY must differ from the real config (forces the
+        // needs_real_guest_addresses re-classification path).
+        let classify_only = GuestStubConfig::CLASSIFY_ONLY;
+        assert_ne!(classify_only.dialog_result_va, cfg.dialog_result_va);
+    }
+
+    #[test]
     fn metrics_table_matches_known_sm() {
         let page = build_stub_data_page();
         // SM_CXSCREEN = 0 → 1024
@@ -843,6 +1272,120 @@ mod tests {
         assert!(classify_guest_stub("KERNEL32.dll", "EnterCriticalSection", &cfg).is_none());
         assert!(classify_guest_stub("KERNEL32.dll", "LeaveCriticalSection", &cfg).is_none());
         assert!(classify_guest_stub("KERNEL32.dll", "DeleteCriticalSection", &cfg).is_none());
+    }
+
+    /// Every B5 clock API classifies to a table-reading stub at the matching
+    /// slot offset, and every such stub embeds the table VA (so it is
+    /// re-derived with the real config at plant time).
+    #[test]
+    fn clock_stubs_classify_to_table_slots() {
+        let cfg = GuestStubConfig::from_layout(&crate::memory::DEFAULT_LAYOUT);
+        let base = cfg.clock_table_va;
+        assert_ne!(base, 0, "clock table must live at a real guest VA");
+
+        let tick = classify_guest_stub("KERNEL32.dll", "GetTickCount", &cfg)
+            .expect("GetTickCount classifies");
+        assert_eq!(tick, GuestStubKind::LoadZx32FromVa(base));
+
+        let tick64 = classify_guest_stub("KERNEL32.dll", "GetTickCount64", &cfg)
+            .expect("GetTickCount64 classifies");
+        assert_eq!(
+            tick64,
+            GuestStubKind::LoadZx64FromVa(base.saturating_add(CLOCK_TABLE_SLOT_TICK64))
+        );
+
+        let time =
+            classify_guest_stub("winmm.dll", "timeGetTime", &cfg).expect("timeGetTime classifies");
+        assert_eq!(
+            time,
+            GuestStubKind::LoadZx32FromVa(base.saturating_add(CLOCK_TABLE_SLOT_TIME))
+        );
+
+        let ft = classify_guest_stub("KERNEL32.dll", "GetSystemTimeAsFileTime", &cfg)
+            .expect("GetSystemTimeAsFileTime classifies");
+        assert_eq!(
+            ft,
+            GuestStubKind::CopyU64FromVaToRcxPtr {
+                slot_va: base.saturating_add(CLOCK_TABLE_SLOT_FILETIME),
+            }
+        );
+
+        let qpc = classify_guest_stub("KERNEL32.dll", "QueryPerformanceCounter", &cfg)
+            .expect("QueryPerformanceCounter classifies");
+        assert_eq!(
+            qpc,
+            GuestStubKind::CopyU64FromVaToRcxPtrRetOne {
+                slot_va: base.saturating_add(CLOCK_TABLE_SLOT_QPC),
+            }
+        );
+
+        let qpf = classify_guest_stub("KERNEL32.dll", "QueryPerformanceFrequency", &cfg)
+            .expect("QueryPerformanceFrequency classifies");
+        assert_eq!(
+            qpf,
+            GuestStubKind::CopyU64FromVaToRcxPtrRetOne {
+                slot_va: base.saturating_add(CLOCK_TABLE_SLOT_QPC_FREQ),
+            }
+        );
+
+        for kind in [tick, tick64, time, ft, qpc, qpf] {
+            assert!(
+                kind.needs_real_guest_addresses(),
+                "{kind:?} embeds the table VA and must be re-derived at plant time"
+            );
+            // Encoded bodies are self-contained machine code ending in `ret`.
+            let body = kind.encode();
+            assert_eq!(body.last(), Some(&0xc3), "{kind:?} must end in ret");
+        }
+    }
+
+    /// End-to-end refresh: the 6×u64 table lands in guest memory at the layout
+    /// VA, advances across a 10 ms sleep, and never moves backwards.
+    #[test]
+    fn refresh_clock_table_writes_advancing_slots() {
+        use wie_cpu::CpuBackend;
+        let backend = wie_cpu::open_cpu().expect("cpu backend opens");
+        let (mut engine, _shared, _guest_mem) = match backend {
+            CpuBackend::Jit { engine, shared } => (engine, Some(shared), None),
+            CpuBackend::Iced { engine, guest_mem } => (engine, None, Some(guest_mem)),
+        };
+        let layout = crate::memory::DEFAULT_LAYOUT;
+        engine
+            .mem_map(
+                layout.clock_table_va,
+                layout.clock_table_size,
+                wie_cpu::RwxPerms::READ_WRITE,
+            )
+            .expect("map clock table");
+
+        let read_slot = |engine: &mut dyn wie_cpu::CpuEngine, slot: u64| -> u64 {
+            let mut buf = [0_u8; 8];
+            let _ = engine.mem_read(layout.clock_table_va.saturating_add(slot), &mut buf);
+            u64::from_le_bytes(buf)
+        };
+
+        refresh_clock_table(&mut *engine, layout.clock_table_va).expect("first refresh");
+        let first_tick = read_slot(&mut *engine, CLOCK_TABLE_SLOT_TICK64);
+        let first_qpc = read_slot(&mut *engine, CLOCK_TABLE_SLOT_QPC);
+        assert_eq!(
+            read_slot(&mut *engine, CLOCK_TABLE_SLOT_QPC_FREQ),
+            10_000_000,
+            "QPC frequency slot must be the fixed 10 MHz base"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        refresh_clock_table(&mut *engine, layout.clock_table_va).expect("second refresh");
+        let second_tick = read_slot(&mut *engine, CLOCK_TABLE_SLOT_TICK64);
+        let second_qpc = read_slot(&mut *engine, CLOCK_TABLE_SLOT_QPC);
+
+        assert!(
+            second_tick >= first_tick.saturating_add(8),
+            "tick_count_64 slot did not advance: {first_tick} -> {second_tick}"
+        );
+        assert!(
+            second_qpc >= first_qpc,
+            "qpc slot went backwards: {second_qpc} < {first_qpc}"
+        );
     }
 
     /// Every known guest-stub classification: if the `CLASSIFY_ONLY` body differs
@@ -894,6 +1437,8 @@ mod tests {
             ("USER32.dll", "GetSysColor"),
             ("USER32.dll", "GetSysColorBrush"),
             ("USER32.dll", "GetDesktopWindow"),
+            ("USER32.dll", "DialogBoxParamA"),
+            ("USER32.dll", "DialogBoxParamW"),
             // KERNEL32 / ntdll
             ("KERNEL32.dll", "EncodePointer"),
             ("KERNEL32.dll", "DecodePointer"),
@@ -916,6 +1461,13 @@ mod tests {
             ("KERNEL32.dll", "GetCommandLineA"),
             ("KERNEL32.dll", "GetCommandLineW"),
             ("KERNEL32.dll", "GetCurrentDirectoryW"),
+            // B5: clock stubs read the host-written guest clock table.
+            ("KERNEL32.dll", "GetTickCount"),
+            ("KERNEL32.dll", "GetTickCount64"),
+            ("KERNEL32.dll", "GetSystemTimeAsFileTime"),
+            ("KERNEL32.dll", "QueryPerformanceCounter"),
+            ("KERNEL32.dll", "QueryPerformanceFrequency"),
+            ("winmm.dll", "timeGetTime"),
         ];
 
         let real_cfg = GuestStubConfig::from_layout(&crate::memory::DEFAULT_LAYOUT);

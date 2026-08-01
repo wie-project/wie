@@ -16,7 +16,7 @@ use wie_winapi::{HandlerContext, HostParkReason, PendingSpawn, WinApiControlSign
 
 // ── Lock helpers ───────────────────────────────────────────────────────
 
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
@@ -51,6 +51,9 @@ pub(crate) struct ProcessResources {
     /// guest memory (mmap arenas + page tables). `None` for JIT.
     pub guest_mem: Option<Arc<RwLock<GuestMemory>>>,
     pub shared_winapi: Arc<Mutex<WinApiState>>,
+    /// Guest message queue behind its own mutex — host input posts through
+    /// this without ever locking `shared_winapi`.
+    pub shared_message_queue: Arc<Mutex<wie_winapi::present::MessageQueue>>,
     pub worker_joins: Vec<JoinHandle<()>>,
 }
 
@@ -100,6 +103,16 @@ impl ProcessResources {
         self.config.primary_tid
     }
 
+    pub(crate) fn winapi_arc(&self) -> Arc<Mutex<WinApiState>> {
+        Arc::clone(&self.shared_winapi)
+    }
+
+    /// Clone of the guest message-queue Arc — host posts without locking the
+    /// big WinApiState mutex.
+    pub(crate) fn message_queue_arc(&self) -> Arc<Mutex<wie_winapi::present::MessageQueue>> {
+        Arc::clone(&self.shared_message_queue)
+    }
+
     pub(crate) fn join_workers(&mut self) {
         join_workers_impl(&self.shared_winapi, &mut self.worker_joins);
     }
@@ -143,6 +156,7 @@ impl ProcessResources {
                 .stack_size(STACK)
                 .spawn(move || worker_main(engine, winapi, cfg, spawn.tid))
                 .context("failed to spawn guest worker")?;
+            tracing::debug!(target: "wiegui", tid = spawn.tid, "guest worker thread started");
             self.worker_joins.push(handle);
         }
         Ok(())
