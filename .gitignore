@@ -2,8 +2,5 @@
 .DS_Store
 real_exes/
 # micro-exes/out/ -- tracked for test reproducibility
-
-# deepwork session state
 .slim/deepwork/
-CLAUDE.md
-snake
+

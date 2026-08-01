@@ -1,0 +1,15 @@
+// Modal-dialog RT_DIALOG fixture for gui_dialog.exe.
+// Compile: x86_64-w64-mingw32-windres gui_dialog/dialog.rc -o out/gui_dialog_res.o
+// Uses plain DIALOG (not DIALOGEX) — windres emits the standard DLGTEMPLATE
+// (DLGTEMPLATEEX is a deferred follow-up in WIE's parser).
+// Template id 100; two push buttons (IDOK=1, IDCANCEL=2) + one LTEXT (1001).
+
+100 DIALOG 10, 20, 160, 60
+STYLE 0x00000040 | 0x80000000 | 0x00C00000
+CAPTION "WIE Dialog Test"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    PUSHBUTTON "OK", 1, 10, 10, 60, 20
+    PUSHBUTTON "Cancel", 2, 80, 10, 60, 20
+    LTEXT "Dialog static", 1001, 10, 36, 120, 10
+END
