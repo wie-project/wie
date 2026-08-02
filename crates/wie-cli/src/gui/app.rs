@@ -143,10 +143,6 @@ struct WindowRuntime {
 /// [`WindowState::Uncreated`] and moves to [`WindowState::Active`] exactly
 /// once, for the rest of the session. A thin [`Option`]-equivalent so call
 /// sites keep the `as_ref()` / `as_mut()` / `is_none()` shape.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "one live window per session; Uncreated is transient until the first frame — boxing Active would add a heap hop to every present"
-)]
 enum WindowState {
     /// The winit window has not been created yet.
     Uncreated,
@@ -180,10 +176,6 @@ impl WindowState {
 
 /// The present backend for a window. At most one variant is set — the two
 /// backends are mutually exclusive per window.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "one instance per window, constructed once; the softbuffer surface's size is irrelevant"
-)]
 enum PresentBackend {
     /// P4a: wgpu (Metal) present backend, used by default on macOS. When set,
     /// `Softbuffer` stays unset. Falls back to softbuffer if wgpu init fails

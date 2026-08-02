@@ -672,7 +672,7 @@ fn read_i16_at(bytes: &[u8], pos: usize) -> Option<i16> {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

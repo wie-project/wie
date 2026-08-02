@@ -369,7 +369,7 @@ impl GuestHandle {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::GuestHandle;
     use crate::memory::DEFAULT_LAYOUT;

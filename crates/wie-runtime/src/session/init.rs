@@ -262,7 +262,6 @@ pub(crate) struct SessionInit {
 
 impl SessionInit {
     /// Assemble an init bundle from the fully-constructed pieces.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         engine: Box<dyn wie_cpu::CpuEngine>,
         environment: wie_winapi::WinApiEnvironment,
