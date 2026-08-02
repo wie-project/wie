@@ -194,26 +194,26 @@ pub fn parse_dll_exports(pe: &goblin::pe::PE<'_>, pe_bytes: &[u8]) -> Result<Dll
 
     // Build the address table in host memory by reading 4-byte RVA entries
     // from the file (each entry is an RVA or 0 for unused/forwarder).
-    let mut address_table: Vec<u64> = Vec::with_capacity(num_functions);
-    for i in 0..num_functions {
-        let i_u32 = u32::try_from(i).unwrap_or(0);
-        let entry_file_off =
-            rva_to_file_offset(pe, address_table_rva.wrapping_add(i_u32.wrapping_mul(4))).ok();
-        let rva = match entry_file_off {
-            Some(off) if off.saturating_add(4) <= pe_bytes.len() => {
-                u64::from(read_u32_le(pe_bytes, off))
+    let address_table: Vec<u64> = (0..num_functions)
+        .map(|i| {
+            let i_u32 = u32::try_from(i).unwrap_or(0);
+            let entry_file_off =
+                rva_to_file_offset(pe, address_table_rva.wrapping_add(i_u32.wrapping_mul(4))).ok();
+            let rva = match entry_file_off {
+                Some(off) if off.saturating_add(4) <= pe_bytes.len() => {
+                    u64::from(read_u32_le(pe_bytes, off))
+                }
+                _ => 0,
+            };
+            // If the RVA falls within the export directory, it's a forwarder
+            // string, not a real export address.
+            if rva != 0 && rva >= u64::from(export_rva) && rva < export_dir_end {
+                0
+            } else {
+                rva
             }
-            _ => 0,
-        };
-        // If the RVA falls within the export directory, it's a forwarder
-        // string, not a real export address.
-        let rva = if rva != 0 && rva >= u64::from(export_rva) && rva < export_dir_end {
-            0
-        } else {
-            rva
-        };
-        address_table.push(rva);
-    }
+        })
+        .collect();
 
     // Read name-pointer table entries.
     for i in 0..num_names {
@@ -480,13 +480,27 @@ pub fn apply_relocations(
         let entry_count = (block_size_usize - 8) / 2;
         let entries_base = offset.wrapping_add(8);
 
-        for i in 0..entry_count {
-            let entry_off = entries_base.wrapping_add(i.wrapping_mul(2));
-            if entry_off.saturating_add(2) > reloc_data.len() {
-                bail!("relocation entry at offset {entry_off} exceeds block data");
+        let entries = reloc_data.get(entries_base..).unwrap_or(&[]);
+        // The old loop bailed when the first entry could not even start within
+        // the data (a block declared exactly at the end). An empty tail must
+        // keep bailing — not silently skip the block.
+        if entries.is_empty() && entry_count > 0 {
+            bail!("relocation entry at offset {entries_base:#x} exceeds block data");
+        }
+        for (i, chunk) in entries.chunks(2).take(entry_count).enumerate() {
+            // A short chunk means the block's last entry overruns the
+            // relocation data — the same condition the old per-entry bounds
+            // check `entry_off + 2 > len` bailed on.
+            if chunk.len() != 2 {
+                bail!(
+                    "relocation entry at offset {:#x} exceeds block data",
+                    entries_base.wrapping_add(i.wrapping_mul(2))
+                );
             }
-
-            let entry = read_u16_le(reloc_data, entry_off);
+            let entry = u16::from_le_bytes([
+                chunk.first().copied().unwrap_or(0),
+                chunk.get(1).copied().unwrap_or(0),
+            ]);
             let type_ = entry >> 12;
             let rva_offset = u32::from(entry & 0x0fff);
             let target_rva = page_rva.wrapping_add(rva_offset);
@@ -656,12 +670,15 @@ pub fn load_dll(
     let entry_rva = identity.entry_rva;
 
     // Step 2: Allocate a module handle.
-    let handle = state.module_state.next_module_handle;
-    state.module_state.next_module_handle = state
-        .module_state
-        .next_module_handle
-        .checked_add(0x1000)
-        .context("module handle overflow")?;
+    let handle = state.module_state.next_module_handle.as_u64();
+    state.module_state.next_module_handle = crate::ModuleHandle::from(
+        state
+            .module_state
+            .next_module_handle
+            .as_u64()
+            .checked_add(0x1000)
+            .context("module handle overflow")?,
+    );
 
     // Step 3: Map guest memory. Try preferred base first.
     let load_base = preferred_base;

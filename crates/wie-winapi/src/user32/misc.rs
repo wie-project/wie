@@ -544,13 +544,16 @@ pub fn handle_set_windows_hook_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinA
     let return_value = if callback_address == 0 {
         0
     } else {
-        let handle = state.window_state().next_windows_hook_handle;
+        let handle = state.window_state().next_windows_hook_handle.as_u64();
 
-        state.window_state().next_windows_hook_handle = state
-            .window_state()
-            .next_windows_hook_handle
-            .checked_add(1)
-            .context("SetWindowsHookExW handle overflow")?;
+        state.window_state().next_windows_hook_handle = crate::handles::HookHandle::from(
+            state
+                .window_state()
+                .next_windows_hook_handle
+                .as_u64()
+                .checked_add(1)
+                .context("SetWindowsHookExW handle overflow")?,
+        );
 
         state.window_state().windows_hooks.push(WindowsHookRecord {
             handle,

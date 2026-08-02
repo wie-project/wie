@@ -207,3 +207,31 @@ impl From<Hbitmap> for u64 {
         value.0
     }
 }
+
+/// A `HHOOK` — fake Windows hook handle (`SetWindowsHookEx`).
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct HookHandle(u64);
+
+impl HookHandle {
+    /// The `NULL` hook handle (`0`).
+    pub const NULL: Self = Self(0);
+
+    /// Escape point: the raw handle value (return values, …).
+    #[must_use]
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for HookHandle {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+impl From<HookHandle> for u64 {
+    fn from(value: HookHandle) -> Self {
+        value.0
+    }
+}

@@ -264,7 +264,7 @@ pub fn handle_device_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
             state.d3d9().d3d9_backbuffer_width = 0;
             state.d3d9().d3d9_backbuffer_height = 0;
             state.d3d9().d3d9_present_hwnd = crate::handles::Hwnd::NULL;
-            state.d3d9().d3d9_scene_active = false;
+            state.d3d9().d3d9_scene_active = crate::state::SceneState::Inactive;
             state.d3d9().d3d9_dirty = None;
         }
 
@@ -448,29 +448,28 @@ pub fn handle_clear(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult>
             if rects_ptr != 0 && rect_count > 0 {
                 let mut rect_bytes = vec![0_u8; rect_count.saturating_mul(16)];
                 if engine.mem_read(rects_ptr, &mut rect_bytes).is_ok() {
-                    for i in 0..rect_count {
-                        let off = i.saturating_mul(16);
+                    for chunk in rect_bytes.chunks(16).take(rect_count) {
                         let left = i32::from_le_bytes(
-                            rect_bytes
-                                .get(off..off.saturating_add(4))
+                            chunk
+                                .get(0..4)
                                 .and_then(|s| s.try_into().ok())
                                 .unwrap_or([0; 4]),
                         );
                         let top = i32::from_le_bytes(
-                            rect_bytes
-                                .get(off.saturating_add(4)..off.saturating_add(8))
+                            chunk
+                                .get(4..8)
                                 .and_then(|s| s.try_into().ok())
                                 .unwrap_or([0; 4]),
                         );
                         let right = i32::from_le_bytes(
-                            rect_bytes
-                                .get(off.saturating_add(8)..off.saturating_add(12))
+                            chunk
+                                .get(8..12)
                                 .and_then(|s| s.try_into().ok())
                                 .unwrap_or([0; 4]),
                         );
                         let bottom = i32::from_le_bytes(
-                            rect_bytes
-                                .get(off.saturating_add(12)..off.saturating_add(16))
+                            chunk
+                                .get(12..16)
                                 .and_then(|s| s.try_into().ok())
                                 .unwrap_or([0; 4]),
                         );
@@ -513,10 +512,10 @@ pub fn handle_begin_scene(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         .read_rcx()
         .context("failed to read RCX for IDirect3DDevice9::BeginScene")?;
 
-    let return_value = if state.d3d9().d3d9_scene_active {
+    let return_value = if state.d3d9().d3d9_scene_active == crate::state::SceneState::Active {
         D3DERR_INVALIDCALL
     } else {
-        state.d3d9().d3d9_scene_active = true;
+        state.d3d9().d3d9_scene_active = crate::state::SceneState::Active;
         D3D_OK
     };
 
@@ -540,8 +539,8 @@ pub fn handle_end_scene(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
         .read_rcx()
         .context("failed to read RCX for IDirect3DDevice9::EndScene")?;
 
-    let return_value = if state.d3d9().d3d9_scene_active {
-        state.d3d9().d3d9_scene_active = false;
+    let return_value = if state.d3d9().d3d9_scene_active == crate::state::SceneState::Active {
+        state.d3d9().d3d9_scene_active = crate::state::SceneState::Inactive;
         D3D_OK
     } else {
         D3DERR_INVALIDCALL
@@ -687,36 +686,37 @@ fn handle_draw_up_common(
     vertex_count: usize,
     index_count: usize,
 ) -> Result<u64> {
-    let return_value = if state.d3d9().d3d9_scene_active && data_ptr != 0 {
-        match parse_fvf(state.d3d9().d3d9_current_fvf) {
-            Some(layout) => {
-                let stride = usize::try_from(stride_raw & u64::from(u32::MAX))
-                    .context("DrawPrimitiveUP stride does not fit usize")?;
-                let layout_stride = usize::try_from(layout.stride).unwrap_or(usize::MAX);
-                if stride < layout_stride || (index_count > 0 && index_ptr == 0) {
-                    D3DERR_INVALIDCALL
-                } else {
-                    draw_vertex_stream(
-                        engine,
-                        state,
-                        data_ptr,
-                        &layout,
-                        stride,
-                        vertex_count,
-                        primitive_type,
-                        primitive_count,
-                        index_ptr,
-                        index_format,
-                        index_count,
-                    )?;
-                    D3D_OK
+    let return_value =
+        if state.d3d9().d3d9_scene_active == crate::state::SceneState::Active && data_ptr != 0 {
+            match parse_fvf(state.d3d9().d3d9_current_fvf) {
+                Some(layout) => {
+                    let stride = usize::try_from(stride_raw & u64::from(u32::MAX))
+                        .context("DrawPrimitiveUP stride does not fit usize")?;
+                    let layout_stride = usize::try_from(layout.stride).unwrap_or(usize::MAX);
+                    if stride < layout_stride || (index_count > 0 && index_ptr == 0) {
+                        D3DERR_INVALIDCALL
+                    } else {
+                        draw_vertex_stream(
+                            engine,
+                            state,
+                            data_ptr,
+                            &layout,
+                            stride,
+                            vertex_count,
+                            primitive_type,
+                            primitive_count,
+                            index_ptr,
+                            index_format,
+                            index_count,
+                        )?;
+                        D3D_OK
+                    }
                 }
+                None => D3DERR_INVALIDCALL,
             }
-            None => D3DERR_INVALIDCALL,
-        }
-    } else {
-        D3DERR_INVALIDCALL
-    };
+        } else {
+            D3DERR_INVALIDCALL
+        };
     Ok(return_value)
 }
 

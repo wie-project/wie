@@ -21,8 +21,8 @@ use crate::{WinApiHandlerResult, WinApiState};
 use anyhow::Result;
 use wie_cpu::ThreadContext;
 
-/// Guest memory reader: `fn(guest_va, buffer) -> Result<(), ()>`.
-type MemRead<'a> = dyn FnMut(u64, &mut [u8]) -> Result<(), ()> + 'a;
+/// Guest memory reader: `fn(guest_va, buffer) -> Result<(), ReadError>`.
+type MemRead<'a> = dyn FnMut(u64, &mut [u8]) -> Result<(), exception::ReadError> + 'a;
 
 const MAX_FRAMES: usize = 64;
 
@@ -397,7 +397,11 @@ pub fn forced_unwind_to(
         if target_frame_rsp.is_some_and(|r| frame.rsp == r) {
             break;
         }
-        let mut read = |va: u64, buf: &mut [u8]| engine.mem_read(va, buf).map_err(|_e| ());
+        let mut read = |va: u64, buf: &mut [u8]| {
+            engine
+                .mem_read(va, buf)
+                .map_err(|_e| exception::ReadError::Unmapped)
+        };
         let (unwound, _) = unwind_one(&mut read, state, &frame)?;
         if unwound.ctx.rip == 0 {
             break;
@@ -448,7 +452,11 @@ fn search_and_plan(
     throw_rsp: u64,
     payload: ThrowPayload,
 ) -> Result<(HandlerFound, Vec<SehStep>)> {
-    let mut read = |va: u64, buf: &mut [u8]| engine.mem_read(va, buf).map_err(|_e| ());
+    let mut read = |va: u64, buf: &mut [u8]| {
+        engine
+            .mem_read(va, buf)
+            .map_err(|_e| exception::ReadError::Unmapped)
+    };
     let mut frame = new_ctx(throw_rip, throw_rsp, tctx);
     let mut action_steps: Vec<SehStep> = Vec::new();
     let thrown_typeinfo = if payload.gcc_throw {
@@ -831,7 +839,11 @@ fn place_msvc_catch_object(
         return Ok(());
     }
 
-    let mut read = |va: u64, buf: &mut [u8]| engine.mem_read(va, buf).map_err(|_e| ());
+    let mut read = |va: u64, buf: &mut [u8]| {
+        engine
+            .mem_read(va, buf)
+            .map_err(|_e| exception::ReadError::Unmapped)
+    };
     let size = msvc_eh::throw_object_size(&mut read, image_base, throw_info).unwrap_or(0);
     let copy_len = usize::try_from(size).unwrap_or(0);
     let copy_len = if copy_len > 0 && copy_len <= 256 {
@@ -874,8 +886,12 @@ fn unwind_one(
 ) -> Result<(Unwound, Option<u32>)> {
     let Some(entry) = exception::lookup_function_entry(&state.kernel.sync, current.rip) else {
         let mut buf = [0u8; 8];
-        read_mem(current.rsp, &mut buf)
-            .map_err(|()| anyhow::anyhow!("leaf unwind: stack unreadable at {:#x}", current.rsp))?;
+        read_mem(current.rsp, &mut buf).map_err(|e| {
+            anyhow::anyhow!(
+                "leaf unwind: stack unreadable at {:#x} ({e:?})",
+                current.rsp
+            )
+        })?;
         let caller = UnwindContext {
             rip: u64::from_le_bytes(buf),
             rsp: current.rsp.saturating_add(8),
@@ -897,7 +913,7 @@ fn unwind_one(
         .image_base
         .saturating_add(u64::from(entry.entry.unwind_data));
     let result = exception::virtual_unwind(read_mem, entry.image_base, entry.entry, *current)
-        .map_err(|()| anyhow::anyhow!("virtual_unwind failed at rip={:#x}", current.rip))?;
+        .map_err(|e| anyhow::anyhow!("virtual_unwind failed at rip={:#x} ({e:?})", current.rip))?;
     Ok((
         Unwound {
             ctx: result.ctx,

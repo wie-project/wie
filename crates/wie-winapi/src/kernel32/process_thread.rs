@@ -273,8 +273,9 @@ pub fn handle_create_job_object_w(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     let state = &mut *ctx.state;
     let _sec = engine.read_rcx()?;
     let _name = engine.read_rdx()?;
-    let handle = state.kernel.sync.next_handle;
-    state.kernel.sync.next_handle = state.kernel.sync.next_handle.wrapping_add(4);
+    let handle = state.kernel.sync.next_handle.as_u64();
+    state.kernel.sync.next_handle =
+        crate::KernelHandle::from(state.kernel.sync.next_handle.as_u64().wrapping_add(4));
     state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(handle)?;
     Ok(WinApiHandlerResult {
@@ -288,8 +289,9 @@ pub fn handle_create_job_object_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     let state = &mut *ctx.state;
     let _sec = engine.read_rcx()?;
     let _name = engine.read_rdx()?;
-    let handle = state.kernel.sync.next_handle;
-    state.kernel.sync.next_handle = state.kernel.sync.next_handle.wrapping_add(4);
+    let handle = state.kernel.sync.next_handle.as_u64();
+    state.kernel.sync.next_handle =
+        crate::KernelHandle::from(state.kernel.sync.next_handle.as_u64().wrapping_add(4));
     state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(handle)?;
     Ok(WinApiHandlerResult {
@@ -334,7 +336,12 @@ pub fn handle_terminate_thread(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     let code_raw = engine.read_rdx()?;
     let code = u32::try_from(code_raw & 0xffff_ffff).unwrap_or(0);
     // Find the thread and mark it finished.
-    if let Some(crate::KernelObject::Thread(t)) = state.kernel.sync.objects.get(&handle) {
+    if let Some(crate::KernelObject::Thread(t)) = state
+        .kernel
+        .sync
+        .objects
+        .get(&crate::KernelHandle::from(handle))
+    {
         t.finish(code);
         state.process.last_error = 0;
         let return_address = engine.return_from_win64_api(1)?;
@@ -622,7 +629,12 @@ pub(crate) fn handle_get_thread_priority(
     let h_thread = engine.read_rcx()?;
 
     // Pseudohandle CURRENT_THREAD (-2), or a real kernel handle.
-    let valid = h_thread == u64::MAX - 1 || state.kernel.sync.objects.contains_key(&h_thread);
+    let valid = h_thread == u64::MAX - 1
+        || state
+            .kernel
+            .sync
+            .objects
+            .contains_key(&crate::KernelHandle::from(h_thread));
 
     if !valid {
         state.process.last_error = ERROR_INVALID_HANDLE;

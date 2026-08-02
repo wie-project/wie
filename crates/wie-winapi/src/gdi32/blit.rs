@@ -52,6 +52,21 @@ impl IRect {
         self.bottom.saturating_sub(self.top)
     }
 
+    /// Build a rect from an origin + extent — the `x + width` right/bottom
+    /// math shared by the window-rect and WS_CLIPCHILDREN child-clip
+    /// constructions (`gdi32/blit.rs`, `user32/message/synth.rs`,
+    /// `user32/dialog.rs`). Saturating: the clip-construction inputs come from
+    /// bounded guest window geometry.
+    #[must_use]
+    pub const fn from_xywh(left: i32, top: i32, width: i32, height: i32) -> Self {
+        Self {
+            left,
+            top,
+            right: left.saturating_add(width),
+            bottom: top.saturating_add(height),
+        }
+    }
+
     /// Whether this rect overlaps `other` (strict, exclusive edges).
     #[must_use]
     fn intersects(self, other: Self) -> bool {
@@ -244,12 +259,7 @@ fn dest_rects(
             .windows
             .iter()
             .filter(|w| w.parent_handle == info.dc_window && w.visible)
-            .map(|w| IRect {
-                left: w.x,
-                top: w.y,
-                right: w.x.saturating_add(w.width),
-                bottom: w.y.saturating_add(w.height),
-            })
+            .map(|w| IRect::from_xywh(w.x, w.y, w.width, w.height))
             .collect();
         for child in children {
             rects = subtract_rect(rects, child);
@@ -534,12 +544,7 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
             .windows
             .iter()
             .filter(|w| w.parent_handle == info.dc_window && w.visible)
-            .map(|w| IRect {
-                left: w.x,
-                top: w.y,
-                right: w.x.saturating_add(w.width),
-                bottom: w.y.saturating_add(w.height),
-            })
+            .map(|w| IRect::from_xywh(w.x, w.y, w.width, w.height))
             .collect();
         for child in children {
             rects = subtract_rect(rects, child);

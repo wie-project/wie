@@ -237,6 +237,7 @@ pub fn handle_set_file_pointer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
             }
 
             state.process.last_error = 0;
+            // Best-effort teardown: failure to sync is not fatal.
             let _ = crate::guest_io_host::sync_slot_from_host(engine, state, handle).ok();
             new_cursor & 0xffff_ffff
         } else {

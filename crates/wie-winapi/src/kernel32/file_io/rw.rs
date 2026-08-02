@@ -124,6 +124,7 @@ pub fn handle_read_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
     let success = is_open_file_handle(state, handle);
 
     if success {
+        // Best-effort teardown: failure to sync is not fatal.
         let _ = crate::guest_io_host::sync_host_cursor_from_guest(engine, state, handle).ok();
         let requested =
             usize::try_from(bytes_to_read).context("ReadFile byte count does not fit usize")?;
@@ -230,6 +231,7 @@ pub fn handle_read_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
             }
 
             state.process.last_error = 0;
+            // Best-effort teardown: failure to sync is not fatal.
             let _ = crate::guest_io_host::sync_slot_from_host(engine, state, handle).ok();
         }
     } else {

@@ -7,7 +7,41 @@ use crate::dll_loader;
 use crate::guest_heap::GuestHeap;
 use crate::vfs::{self, VolumeConfig};
 
+use super::handle_newtype;
 use super::window::{FindHandle, ResourceRecord};
+
+// ── Fake-handle newtypes (ADR-003) ─────────────────────────────────────
+//
+// Zero-cost wrappers over the guest-visible `u64` handle values. They exist so
+// the *host-side* allocator counters and lookups cannot mix handle namespaces —
+// passing a `ModuleHandle` where a `FileHandle` belongs is a compile error.
+// Conversions happen exactly where a `u64` meets the typed store; the guest
+// never sees these types (handlers keep raw `u64` registers).
+
+handle_newtype! {
+    /// A fake find-file handle (`FindFirstFile` / `FindNextFile`).
+    FindFileHandle
+}
+
+handle_newtype! {
+    /// A fake open-file handle (`CreateFile` / `OpenFile`).
+    FileHandle
+}
+
+handle_newtype! {
+    /// A fake resource handle (`FindResource` / `LoadResource`).
+    ResourceHandle
+}
+
+handle_newtype! {
+    /// A fake module handle (`LoadLibrary` / `GetModuleHandle`).
+    ModuleHandle
+}
+
+handle_newtype! {
+    /// A fake registry-key handle (`RegOpenKey` / `RegCreateKey`).
+    RegistryKeyHandle
+}
 
 /// Runtime environment values visible to WinAPI handlers.
 #[derive(Debug, Clone, Copy)]
@@ -53,13 +87,13 @@ pub struct FileIoState {
     pub executable_file_size: u64,
     pub executable_file_bytes: Vec<u8>,
     pub executable_file_cursor: u64,
-    pub next_find_handle: u64,
+    pub next_find_handle: FindFileHandle,
     pub find_handles: Vec<FindHandle>,
     pub host_file_mounts: Vec<HostFileMount>,
     pub virtual_files: Vec<VirtualGuestFile>,
     pub open_files: HashMap<u64, OpenGuestFile>,
-    pub next_file_handle: u64,
-    pub next_resource_handle: u64,
+    pub next_file_handle: FileHandle,
+    pub next_resource_handle: ResourceHandle,
     pub resources: Vec<ResourceRecord>,
     pub current_directory_wide: Vec<u16>,
     pub bottle_root: Option<std::path::PathBuf>,
@@ -120,13 +154,13 @@ pub struct ModuleState {
     pub loaded_modules: HashMap<String, dll_loader::LoadedModule>,
     pub import_resolver: Option<ImportResolver>,
     pub get_proc_address_cache: std::collections::HashMap<String, GetProcAddressCacheEntry>,
-    pub next_module_handle: u64,
+    pub next_module_handle: ModuleHandle,
 }
 
 #[derive(Debug, Clone)]
 pub struct ProcessState {
     pub last_error: u32,
-    pub next_registry_key_handle: u64,
+    pub next_registry_key_handle: RegistryKeyHandle,
     pub registry_keys: Vec<RegistryKey>,
     pub main_module_file_name: String,
     pub main_module_path: String,

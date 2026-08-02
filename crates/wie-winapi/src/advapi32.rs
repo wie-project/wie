@@ -484,12 +484,15 @@ fn open_or_create_registry_key(
         return Ok((existing.handle, REG_OPENED_EXISTING_KEY));
     }
 
-    let handle = state.process.next_registry_key_handle;
-    state.process.next_registry_key_handle = state
-        .process
-        .next_registry_key_handle
-        .checked_add(1)
-        .context("registry key handle overflow")?;
+    let handle = state.process.next_registry_key_handle.as_u64();
+    state.process.next_registry_key_handle = crate::RegistryKeyHandle::from(
+        state
+            .process
+            .next_registry_key_handle
+            .as_u64()
+            .checked_add(1)
+            .context("registry key handle overflow")?,
+    );
 
     state.process.registry_keys.push(RegistryKey {
         handle,

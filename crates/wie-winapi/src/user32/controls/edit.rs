@@ -291,9 +291,9 @@ pub(super) fn edit_notify_change(state: &mut WinApiState, hwnd: u64) -> Result<O
 fn shift_is_down(state: &WinApiState) -> bool {
     state.try_window_state().is_some_and(|ws| {
         ws.keyboard_state
-            .0
             .get(usize::try_from(VK_SHIFT).unwrap_or(0))
-            .is_some_and(|&key| key & 0x80 != 0)
+            & 0x80
+            != 0
     })
 }
 

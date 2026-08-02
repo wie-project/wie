@@ -667,42 +667,70 @@ pub enum FakeVa {
     Special(u16),
 }
 
-/// Pack `kind` + `payload` into a guest fake VA.
+/// Pack `kind` + `payload` into a guest fake VA (the single encoding
+/// implementation; every public entry point below delegates to it).
 #[must_use]
 #[allow(clippy::as_conversions)] // const fn — From is not const-stable yet
-pub const fn encode(kind: u8, payload: u16) -> u64 {
+const fn encode_parts(kind: u8, payload: u16) -> u64 {
     FAKE_API_BASE | ((kind as u64) << KIND_SHIFT) | ((payload as u64) << ALIGN_SHIFT)
+}
+
+impl FakeVa {
+    /// Encode this decoded fake-API address back into its guest VA.
+    ///
+    /// The single `FakeVa` ↔ `u64` encoder: the kind-specific free functions
+    /// (`encode_export`, …) are thin wrappers over this method so every kind
+    /// shares one packing implementation.
+    #[must_use]
+    #[allow(clippy::as_conversions)] // const fn — From is not const-stable yet
+    pub const fn encode(self) -> u64 {
+        match self {
+            Self::Export(id) => encode_parts(KIND_EXPORT, id.to_u16()),
+            Self::Alias(id) => encode_parts(KIND_SOFT, id.to_u16()),
+            Self::Unresolved(index) => {
+                encode_parts(KIND_SOFT, SOFT_UNRESOLVED_BASE | (index & 0x7fff))
+            }
+            Self::Com { iface, method } => encode_parts(
+                KIND_COM,
+                ((iface.as_u8() as u16) << 8) | (method.slot() as u16),
+            ),
+            Self::Special(id) => encode_parts(KIND_SPECIAL, id),
+        }
+    }
 }
 
 /// Encode a primary export address for `id`.
 #[must_use]
 pub const fn encode_export(id: WinApiId) -> u64 {
-    encode(KIND_EXPORT, id.to_u16())
+    FakeVa::Export(id).encode()
 }
 
 /// Encode a host-fallback alias that dispatches the same `id`.
 #[must_use]
 pub const fn encode_alias(id: WinApiId) -> u64 {
-    encode(KIND_SOFT, id.to_u16())
+    FakeVa::Alias(id).encode()
 }
 
 /// Encode a soft/unresolved slot (`index` must be `< 0x8000`).
 #[must_use]
 pub const fn encode_unresolved(index: u16) -> u64 {
-    encode(KIND_SOFT, SOFT_UNRESOLVED_BASE | (index & 0x7fff))
+    FakeVa::Unresolved(index).encode()
 }
 
 /// Encode a COM method address.
 #[must_use]
-#[allow(clippy::as_conversions)] // const fn — From is not const-stable yet
 pub const fn encode_com(iface: D3d9Iface, method: u8) -> u64 {
-    encode(KIND_COM, ((iface.as_u8() as u16) << 8) | (method as u16))
+    FakeVa::Com {
+        iface,
+        method: ComMethod::decode(iface, method),
+    }
+    .encode()
 }
 
 /// Encode a runtime special address.
 #[must_use]
 pub const fn encode_special(id: u16) -> u64 {
-    encode(KIND_SPECIAL, id)
+    FakeVa::Special(id).encode()
 }
 
 /// Callback-return trampoline VA (inside the fake-API window).

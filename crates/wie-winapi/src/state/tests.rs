@@ -91,13 +91,13 @@ fn winapi_state_default() -> WinApiState {
             executable_file_size: 0,
             executable_file_bytes: Vec::new(),
             executable_file_cursor: 0,
-            next_find_handle: 0,
+            next_find_handle: crate::FindFileHandle::from(0),
             find_handles: Vec::new(),
             host_file_mounts: Vec::new(),
             virtual_files: Vec::new(),
             open_files: HashMap::new(),
-            next_file_handle: 0,
-            next_resource_handle: 0,
+            next_file_handle: crate::FileHandle::from(0),
+            next_resource_handle: crate::ResourceHandle::from(0),
             resources: Vec::new(),
             current_directory_wide: Vec::new(),
             bottle_root: None,
@@ -113,7 +113,7 @@ fn winapi_state_default() -> WinApiState {
         },
         process: ProcessState {
             last_error: 0,
-            next_registry_key_handle: 0,
+            next_registry_key_handle: crate::RegistryKeyHandle::from(0),
             registry_keys: Vec::new(),
             main_module_file_name: String::new(),
             main_module_path: String::new(),
@@ -137,7 +137,7 @@ fn winapi_state_default() -> WinApiState {
             loaded_modules: HashMap::new(),
             import_resolver: None,
             get_proc_address_cache: HashMap::new(),
-            next_module_handle: dll_loader::REAL_MODULE_HANDLE_BASE,
+            next_module_handle: crate::ModuleHandle::from(dll_loader::REAL_MODULE_HANDLE_BASE),
         },
     }
 }
@@ -397,7 +397,7 @@ fn test_get_async_key_state_down() {
     let mut engine = test_engine();
     let mut state = default_winapi_state();
     // VK_RETURN high bit set — index is a compile-time constant in bounds.
-    state.window_state().keyboard_state.0[0x0D] = 0x80;
+    state.window_state().keyboard_state.set(0x0D, 0x80);
     write_regs(&mut engine, 0x0D, 0, 0, 0, 0);
     assert_return_value!(
         user32::handle_get_async_key_state(&mut HandlerContext::new(
@@ -419,7 +419,8 @@ fn test_keyboard_state_shift_update_path() {
     let mut state = default_winapi_state();
 
     // Press: app.rs set_key_state(0x10, true).
-    state.window_state().keyboard_state.0[0x10] |= 0x80;
+    let held = state.window_state().keyboard_state.get(0x10) | 0x80;
+    state.window_state().keyboard_state.set(0x10, held);
     write_regs(&mut engine, 0x10, 0, 0, 0, 0);
     assert_return_value!(
         user32::handle_get_async_key_state(&mut HandlerContext::new(
@@ -431,7 +432,8 @@ fn test_keyboard_state_shift_update_path() {
     );
 
     // Release: app.rs set_key_state(0x10, false).
-    state.window_state().keyboard_state.0[0x10] &= !0x80;
+    let released = state.window_state().keyboard_state.get(0x10) & !0x80;
+    state.window_state().keyboard_state.set(0x10, released);
     write_regs(&mut engine, 0x10, 0, 0, 0, 0);
     assert_return_value!(
         user32::handle_get_async_key_state(&mut HandlerContext::new(
@@ -1717,17 +1719,17 @@ fn test_fake_handle_disjointness() {
 
     // USER32 window handle range (0x6610_0000+) must not overlap FAKE range (0x6600_xxxx)
     assert!(
-        ws.next_window_handle >= 0x0000_0000_6610_0000,
+        ws.next_window_handle.as_u64() >= 0x0000_0000_6610_0000,
         "window handle base collides with FAKE range"
     );
 
     // Menu/hook bases
     assert!(
-        ws.next_menu_handle >= 0x0000_0000_6620_0000,
+        ws.next_menu_handle.as_u64() >= 0x0000_0000_6620_0000,
         "menu handle base collides with FAKE range"
     );
     assert!(
-        ws.next_windows_hook_handle >= 0x0000_0000_6630_0000,
+        ws.next_windows_hook_handle.as_u64() >= 0x0000_0000_6630_0000,
         "hook handle base collides with FAKE range"
     );
 
@@ -2861,7 +2863,8 @@ fn test_edit_shift_arrow_extends_selection() {
     .expect("end ok")
     .expect("some result");
     assert_eq!(control_ui(&state, edit).caret, 5);
-    state.window_state().keyboard_state.0[0x10] |= 0x80; // VK_SHIFT held
+    let held = state.window_state().keyboard_state.get(0x10) | 0x80;
+    state.window_state().keyboard_state.set(0x10, held); // VK_SHIFT held
 
     // Shift+Left selects the last char: [4, 5), caret 4.
     crate::user32::controls::dispatch_control_proc(
@@ -2892,7 +2895,8 @@ fn test_edit_shift_arrow_extends_selection() {
     assert_eq!((ui.sel_start, ui.sel_end, ui.caret), (3, 5, 3));
 
     // Release Shift; Right collapses the selection and moves the caret.
-    state.window_state().keyboard_state.0[0x10] &= !0x80;
+    let released = state.window_state().keyboard_state.get(0x10) & !0x80;
+    state.window_state().keyboard_state.set(0x10, released);
     crate::user32::controls::dispatch_control_proc(
         &mut engine,
         &mut state,
@@ -3552,7 +3556,10 @@ fn test_d3d9_begin_end_scene_flags() {
         )),
         0
     );
-    assert!(state.d3d9().d3d9_scene_active);
+    assert_eq!(
+        state.d3d9().d3d9_scene_active,
+        crate::state::SceneState::Active
+    );
     // A second BeginScene inside a scene fails.
     write_regs(&mut engine, 1, 0, 0, 0, 0);
     assert_return_value!(
@@ -3572,7 +3579,10 @@ fn test_d3d9_begin_end_scene_flags() {
         )),
         0
     );
-    assert!(!state.d3d9().d3d9_scene_active);
+    assert_eq!(
+        state.d3d9().d3d9_scene_active,
+        crate::state::SceneState::Inactive
+    );
     // EndScene outside a scene fails.
     write_regs(&mut engine, 1, 0, 0, 0, 0);
     assert_return_value!(

@@ -261,13 +261,16 @@ pub(crate) fn allocate_open_file_ex(
     host_path: Option<std::path::PathBuf>,
     force_stream: bool,
 ) -> Result<u64> {
-    let handle = state.file_io.next_file_handle;
+    let handle = state.file_io.next_file_handle.as_u64();
 
-    state.file_io.next_file_handle = state
-        .file_io
-        .next_file_handle
-        .checked_add(1)
-        .context("guest file handle allocator overflow")?;
+    state.file_io.next_file_handle = crate::FileHandle::from(
+        state
+            .file_io
+            .next_file_handle
+            .as_u64()
+            .checked_add(1)
+            .context("guest file handle allocator overflow")?,
+    );
 
     let size_u64 = if force_stream {
         host_path
@@ -366,6 +369,7 @@ pub(crate) fn maybe_promote_open_file_to_streaming(
         }
     }
     // Drop any guest I/O mirror (streaming stays on host path only).
+    // Best-effort teardown: failure to sync is not fatal.
     let _ = crate::guest_io_host::unregister_open_file(engine, state, handle).ok();
     if let Some(open_file) = find_open_file_mut(state, handle) {
         open_file.bytes.clear();

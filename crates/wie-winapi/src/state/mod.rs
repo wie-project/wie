@@ -30,6 +30,42 @@ pub use input::*;
 pub use process::*;
 pub use window::*;
 
+/// Shared fake-handle newtype template (ADR-003): a zero-cost `u64` wrapper
+/// with the conversion accessors used by the handle allocators. Handlers keep
+/// raw `u64` registers; the typed store converts at the boundary.
+macro_rules! handle_newtype {
+    ($(#[$doc:meta])* $name:ident) => {
+        $(#[$doc])*
+        #[repr(transparent)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+        pub struct $name(u64);
+
+        impl $name {
+            /// The `NULL` handle (`0`).
+            pub const NULL: Self = Self(0);
+
+            /// Escape point: the raw handle value (return values, …).
+            #[must_use]
+            pub const fn as_u64(self) -> u64 {
+                self.0
+            }
+        }
+
+        impl From<u64> for $name {
+            fn from(value: u64) -> Self {
+                Self(value)
+            }
+        }
+
+        impl From<$name> for u64 {
+            fn from(value: $name) -> Self {
+                value.0
+            }
+        }
+    };
+}
+pub(crate) use handle_newtype;
+
 /// Environment every guest process starts with.
 ///
 /// Single source of truth: `wie-runtime` builds the in-guest UTF-16 block from
@@ -215,6 +251,10 @@ pub struct WinApiState {
     /// Kernel execution state (threading, sync, SEH).
     pub kernel: KernelState,
     /// On-demand state for optional WIE-hosted DLLs.
+    ///
+    /// External crates construct this once (empty map) and then reach slots
+    /// only through the typed accessors below (`console()`, `window_state()`,
+    /// `d3d9()`, …).
     pub dll_states: DllStateMap,
     /// Guest message queue behind its OWN mutex.
     ///

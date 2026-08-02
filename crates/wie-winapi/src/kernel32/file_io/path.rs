@@ -227,15 +227,26 @@ pub(crate) fn handle_duplicate_handle(ctx: &mut HandlerContext<'_>) -> Result<Wi
         state.kernel.threads.current_tid()
     } else {
         // Real kernel handle — skip resolution, lookup directly below.
-        let obj = state.kernel.sync.objects.get(&source_handle).cloned();
+        let obj = state
+            .kernel
+            .sync
+            .objects
+            .get(&crate::KernelHandle::from(source_handle))
+            .cloned();
         if let Some(obj) = obj {
             let new_handle = state.kernel.sync.next_handle;
-            state.kernel.sync.next_handle = state.kernel.sync.next_handle.wrapping_add(4);
+            state.kernel.sync.next_handle =
+                crate::KernelHandle::from(state.kernel.sync.next_handle.as_u64().wrapping_add(4));
+            let new_handle_u64 = new_handle.as_u64();
             state.kernel.sync.objects.insert(new_handle, obj.clone());
             if close_source {
-                state.kernel.sync.objects.remove(&source_handle);
+                state
+                    .kernel
+                    .sync
+                    .objects
+                    .remove(&crate::KernelHandle::from(source_handle));
             }
-            engine.mem_write(target_handle_ptr, &new_handle.to_le_bytes())?;
+            engine.mem_write(target_handle_ptr, &new_handle_u64.to_le_bytes())?;
             state.process.last_error = 0;
             let return_address = engine.return_from_win64_api(1)?;
             return Ok(WinApiHandlerResult {
@@ -270,15 +281,21 @@ pub(crate) fn handle_duplicate_handle(ctx: &mut HandlerContext<'_>) -> Result<Wi
         });
 
     let new_handle = state.kernel.sync.next_handle;
-    state.kernel.sync.next_handle = state.kernel.sync.next_handle.wrapping_add(4);
+    state.kernel.sync.next_handle =
+        crate::KernelHandle::from(state.kernel.sync.next_handle.as_u64().wrapping_add(4));
+    let new_handle_u64 = new_handle.as_u64();
     state.kernel.sync.objects.insert(new_handle, source_obj);
 
     // Honour DUPLICATE_CLOSE_SOURCE: close the source handle after duplication.
     if close_source && source_handle != u64::MAX && source_handle != u64::MAX - 1 {
-        state.kernel.sync.objects.remove(&source_handle);
+        state
+            .kernel
+            .sync
+            .objects
+            .remove(&crate::KernelHandle::from(source_handle));
     }
 
-    engine.mem_write(target_handle_ptr, &new_handle.to_le_bytes())?;
+    engine.mem_write(target_handle_ptr, &new_handle_u64.to_le_bytes())?;
     state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?; // TRUE
     Ok(WinApiHandlerResult {

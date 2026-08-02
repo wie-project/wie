@@ -336,13 +336,20 @@ pub fn handle_close_handle(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
             sync_open_bytes_to_virtual(state, &path, handle);
         }
         persist_open_file_to_host(state, handle);
+        // Best-effort teardown: failure to sync is not fatal.
         let _ = crate::guest_io_host::unregister_open_file(engine, state, handle).ok();
         state.file_io.open_files.remove(&handle);
         // Drop the cached streaming `File` (if any) so the host fd is released.
         state.file_io.cached_streams.remove(&handle);
         state.process.last_error = 0;
         1
-    } else if state.kernel.sync.objects.remove(&handle).is_some() {
+    } else if state
+        .kernel
+        .sync
+        .objects
+        .remove(&crate::KernelHandle::from(handle))
+        .is_some()
+    {
         // Thread / event kernel handles (object may still be live via Arc).
         state.process.last_error = 0;
         1
@@ -773,12 +780,15 @@ pub(crate) fn finish_find_first(
         )?;
     }
 
-    let handle = state.file_io.next_find_handle;
-    state.file_io.next_find_handle = state
-        .file_io
-        .next_find_handle
-        .checked_add(1)
-        .context("find handle overflow")?;
+    let handle = state.file_io.next_find_handle.as_u64();
+    state.file_io.next_find_handle = crate::FindFileHandle::from(
+        state
+            .file_io
+            .next_find_handle
+            .as_u64()
+            .checked_add(1)
+            .context("find handle overflow")?,
+    );
 
     state.file_io.find_handles.push(FindHandle {
         handle,
@@ -881,6 +891,8 @@ pub(crate) fn finish_create_file(
             handle = return_value,
             "{api_name}"
         );
+        // Best-effort teardown: failure to register the mirror is not fatal —
+        // the guest I/O accelerator simply falls back to the host path.
         let _ = crate::guest_io_host::register_open_file(engine, state, return_value).ok();
     }
 

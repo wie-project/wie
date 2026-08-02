@@ -210,12 +210,15 @@ pub(crate) fn create_fake_resource_record(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
 ) -> Result<ResourceRecord> {
-    let handle = state.file_io.next_resource_handle;
-    state.file_io.next_resource_handle = state
-        .file_io
-        .next_resource_handle
-        .checked_add(1)
-        .context("resource handle overflow")?;
+    let handle = state.file_io.next_resource_handle.as_u64();
+    state.file_io.next_resource_handle = crate::ResourceHandle::from(
+        state
+            .file_io
+            .next_resource_handle
+            .as_u64()
+            .checked_add(1)
+            .context("resource handle overflow")?,
+    );
 
     let index =
         u64::try_from(state.file_io.resources.len()).context("resource index does not fit u64")?;

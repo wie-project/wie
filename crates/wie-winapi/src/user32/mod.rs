@@ -388,12 +388,15 @@ pub(crate) fn write_message_structure(
 
 /// Neutral default message handler used by several USER32 `Def*Proc` APIs.
 pub(crate) fn allocate_menu_handle(state: &mut WinApiState) -> Result<u64> {
-    let handle = state.window_state().next_menu_handle;
-    state.window_state().next_menu_handle = state
-        .window_state()
-        .next_menu_handle
-        .checked_add(1)
-        .context("menu handle allocator overflow")?;
+    let handle = state.window_state().next_menu_handle.as_u64();
+    state.window_state().next_menu_handle = crate::handles::Hmenu::from(
+        state
+            .window_state()
+            .next_menu_handle
+            .as_u64()
+            .checked_add(1)
+            .context("menu handle allocator overflow")?,
+    );
     Ok(handle)
 }
 
@@ -526,17 +529,20 @@ pub(crate) fn create_window_record(
 ) -> Result<(u64, u64, bool)> {
     let registered_class = find_window_class(state, &request.class_identifier, unicode).cloned();
 
-    let handle = state.window_state().next_window_handle;
+    let handle = state.window_state().next_window_handle.as_u64();
 
     if handle == 0 {
         return Ok((0, 0, unicode));
     }
 
-    state.window_state().next_window_handle = state
-        .window_state()
-        .next_window_handle
-        .checked_add(1)
-        .context("fake window handle overflow")?;
+    state.window_state().next_window_handle = crate::handles::Hwnd::from(
+        state
+            .window_state()
+            .next_window_handle
+            .as_u64()
+            .checked_add(1)
+            .context("fake window handle overflow")?,
+    );
 
     // Built-in control classes (BUTTON/STATIC/EDIT/LISTBOX/COMBOBOX) resolve
     // by ordinal or name and get a host-side WndProc (dispatch_control_proc).

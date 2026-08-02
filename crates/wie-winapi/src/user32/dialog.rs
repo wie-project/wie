@@ -436,12 +436,7 @@ pub(crate) fn paint_dialog(state: &mut WinApiState, hwnd: u64) {
         .windows
         .iter()
         .filter(|w| w.parent_handle == crate::handles::Hwnd::from(hwnd) && w.visible)
-        .map(|w| IRect {
-            left: w.x,
-            top: w.y,
-            right: w.x.saturating_add(w.width),
-            bottom: w.y.saturating_add(w.height),
-        })
+        .map(|w| IRect::from_xywh(w.x, w.y, w.width, w.height))
         .collect();
     let mut rects = vec![IRect {
         left: 0,
@@ -886,9 +881,9 @@ fn focused_dialog_button(state: &WinApiState, dialog_hwnd: u64) -> Option<u64> {
 fn vk_is_shift_down(state: &WinApiState) -> bool {
     state.try_window_state().is_some_and(|ws| {
         ws.keyboard_state
-            .0
             .get(usize::try_from(VK_SHIFT).unwrap_or(0))
-            .is_some_and(|&key| key & 0x80 != 0)
+            & 0x80
+            != 0
     })
 }
 

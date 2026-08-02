@@ -1,12 +1,45 @@
 use crate::WinApiState;
 use crate::gdi32::font_system::FontEngine;
 use crate::handles::{Hbitmap, Hbrush, Hdc, Hfont, Hpen, Hwnd};
+use crate::state::handle_newtype;
 
 use super::{
     BITMAP_HANDLE_BASE, BITMAP_HANDLE_STRIDE, BRUSH_HANDLE_BASE, BRUSH_HANDLE_STRIDE,
     DC_HANDLE_BASE, DC_HANDLE_STRIDE, FONT_HANDLE_BASE, FONT_HANDLE_STRIDE, PEN_HANDLE_BASE,
     PEN_HANDLE_STRIDE, STOCK_BLACK_BRUSH_HANDLE, STOCK_WHITE_BRUSH_HANDLE,
 };
+
+// ── Allocator-counter newtypes (ADR-003) ───────────────────────────────
+//
+// The `next_*_handle` counters are typed separately from the guest-visible
+// handle newtypes (`handles.rs`) so one allocator cannot be fed another's
+// counter. They are internal to the GDI state; the alloc functions convert to
+// the typed handles (`Hdc::from`, …) at the store boundary.
+
+handle_newtype! {
+    /// Allocator counter for device-context handles.
+    DcHandle
+}
+
+handle_newtype! {
+    /// Allocator counter for bitmap/DIB handles.
+    BitmapHandle
+}
+
+handle_newtype! {
+    /// Allocator counter for brush handles.
+    BrushHandle
+}
+
+handle_newtype! {
+    /// Allocator counter for pen handles.
+    PenHandle
+}
+
+handle_newtype! {
+    /// Allocator counter for font handles.
+    FontHandle
+}
 
 /// Allocates `size` bytes from the guest process heap for GDI object backing
 /// buffers. `pub(super)` keeps it internal to the `state` module tree while
@@ -125,15 +158,15 @@ pub struct GdiState {
     /// The system-font engine (face + metrics caches for text rendering).
     pub font_engine: FontEngine,
     /// Next handle for DC allocation.
-    pub next_dc_handle: u64,
+    pub next_dc_handle: DcHandle,
     /// Next handle for bitmap allocation.
-    pub next_bitmap_handle: u64,
+    pub next_bitmap_handle: BitmapHandle,
     /// Next handle for brush allocation.
-    pub next_brush_handle: u64,
+    pub next_brush_handle: BrushHandle,
     /// Next handle for pen allocation.
-    pub next_pen_handle: u64,
+    pub next_pen_handle: PenHandle,
     /// Next handle for font allocation.
-    pub next_font_handle: u64,
+    pub next_font_handle: FontHandle,
 }
 
 impl Default for GdiState {
@@ -145,11 +178,11 @@ impl Default for GdiState {
             pens: Vec::new(),
             fonts: Vec::new(),
             font_engine: FontEngine::default(),
-            next_dc_handle: DC_HANDLE_BASE,
-            next_bitmap_handle: BITMAP_HANDLE_BASE,
-            next_brush_handle: BRUSH_HANDLE_BASE,
-            next_pen_handle: PEN_HANDLE_BASE,
-            next_font_handle: FONT_HANDLE_BASE,
+            next_dc_handle: DcHandle::from(DC_HANDLE_BASE),
+            next_bitmap_handle: BitmapHandle::from(BITMAP_HANDLE_BASE),
+            next_brush_handle: BrushHandle::from(BRUSH_HANDLE_BASE),
+            next_pen_handle: PenHandle::from(PEN_HANDLE_BASE),
+            next_font_handle: FontHandle::from(FONT_HANDLE_BASE),
         }
     }
 }
@@ -157,8 +190,9 @@ impl Default for GdiState {
 impl GdiState {
     /// Allocate a new DC handle and record.
     pub fn alloc_dc(&mut self, kind: DcKind) -> Hdc {
-        let handle = Hdc::from(self.next_dc_handle);
-        self.next_dc_handle = self.next_dc_handle.wrapping_add(DC_HANDLE_STRIDE);
+        let handle = Hdc::from(self.next_dc_handle.as_u64());
+        self.next_dc_handle =
+            DcHandle::from(self.next_dc_handle.as_u64().wrapping_add(DC_HANDLE_STRIDE));
         self.dcs.push(DcRecord {
             handle,
             kind,
@@ -175,23 +209,35 @@ impl GdiState {
 
     /// Allocate a new bitmap/DIB handle.
     pub fn alloc_bitmap_handle(&mut self) -> Hbitmap {
-        let handle = Hbitmap::from(self.next_bitmap_handle);
-        self.next_bitmap_handle = self.next_bitmap_handle.wrapping_add(BITMAP_HANDLE_STRIDE);
+        let handle = Hbitmap::from(self.next_bitmap_handle.as_u64());
+        self.next_bitmap_handle = BitmapHandle::from(
+            self.next_bitmap_handle
+                .as_u64()
+                .wrapping_add(BITMAP_HANDLE_STRIDE),
+        );
         handle
     }
 
     /// Allocate a new brush handle and record.
     pub fn alloc_brush(&mut self, color: u32) -> Hbrush {
-        let handle = Hbrush::from(self.next_brush_handle);
-        self.next_brush_handle = self.next_brush_handle.wrapping_add(BRUSH_HANDLE_STRIDE);
+        let handle = Hbrush::from(self.next_brush_handle.as_u64());
+        self.next_brush_handle = BrushHandle::from(
+            self.next_brush_handle
+                .as_u64()
+                .wrapping_add(BRUSH_HANDLE_STRIDE),
+        );
         self.brushes.push(BrushRecord { handle, color });
         handle
     }
 
     /// Allocate a new pen handle and record.
     pub fn alloc_pen(&mut self, color: u32) -> Hpen {
-        let handle = Hpen::from(self.next_pen_handle);
-        self.next_pen_handle = self.next_pen_handle.wrapping_add(PEN_HANDLE_STRIDE);
+        let handle = Hpen::from(self.next_pen_handle.as_u64());
+        self.next_pen_handle = PenHandle::from(
+            self.next_pen_handle
+                .as_u64()
+                .wrapping_add(PEN_HANDLE_STRIDE),
+        );
         self.pens.push(PenRecord { handle, color });
         handle
     }
@@ -205,8 +251,12 @@ impl GdiState {
         italic: bool,
         charset: u8,
     ) -> Hfont {
-        let handle = Hfont::from(self.next_font_handle);
-        self.next_font_handle = self.next_font_handle.wrapping_add(FONT_HANDLE_STRIDE);
+        let handle = Hfont::from(self.next_font_handle.as_u64());
+        self.next_font_handle = FontHandle::from(
+            self.next_font_handle
+                .as_u64()
+                .wrapping_add(FONT_HANDLE_STRIDE),
+        );
         self.fonts.push(FontRecord {
             handle,
             family,

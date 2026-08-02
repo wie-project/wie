@@ -643,7 +643,7 @@ pub(crate) fn handle_rtl_capture_context(
     }
     // Rflags at +0x44
     if let Some(slot) = cbuf.get_mut(0x44..0x4C) {
-        slot.copy_from_slice(&tctx.rflags.to_le_bytes());
+        slot.copy_from_slice(&u64::from(tctx.rflags).to_le_bytes());
     }
     // XMM0..XMM15 at +0x100
     for i in 0_usize..16 {

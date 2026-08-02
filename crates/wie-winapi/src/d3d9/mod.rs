@@ -610,7 +610,7 @@ fn init_device_state(
     d3d.d3d9_backbuffer_width = width;
     d3d.d3d9_backbuffer_height = height;
     d3d.d3d9_present_hwnd = crate::handles::Hwnd::from(present_hwnd);
-    d3d.d3d9_scene_active = false;
+    d3d.d3d9_scene_active = crate::state::SceneState::Inactive;
     d3d.d3d9_world_matrix = crate::d3d9_render::IDENTITY;
     d3d.d3d9_view_matrix = crate::d3d9_render::IDENTITY;
     d3d.d3d9_projection_matrix = crate::d3d9_render::IDENTITY;

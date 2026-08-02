@@ -159,8 +159,9 @@ impl MemSim {
         }
     }
 
-    /// Read from the simulated memory.  Returns `Err(())` if VA is unmapped.
-    pub fn read(&self, va: u64, buf: &mut [u8]) -> Result<(), ()> {
+    /// Read from the simulated memory.  Returns `Err(ReadError::Unmapped)` if
+    /// the VA lies outside every mapped region.
+    pub fn read(&self, va: u64, buf: &mut [u8]) -> Result<(), crate::exception::ReadError> {
         for (base, data) in &self.regions {
             if va >= *base && va + buf.len() as u64 <= *base + data.len() as u64 {
                 let off = (va - *base) as usize;
@@ -168,11 +169,13 @@ impl MemSim {
                 return Ok(());
             }
         }
-        Err(())
+        Err(crate::exception::ReadError::Unmapped)
     }
 
     /// Create a `MemRead` closure for use with `virtual_unwind`.
-    pub fn reader(&self) -> impl FnMut(u64, &mut [u8]) -> Result<(), ()> + '_ {
+    pub fn reader(
+        &self,
+    ) -> impl FnMut(u64, &mut [u8]) -> Result<(), crate::exception::ReadError> + '_ {
         |va, buf| self.read(va, buf)
     }
 }

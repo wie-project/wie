@@ -106,20 +106,16 @@ fn triangle_index_triples(
     let mut triples = Vec::new();
     match u32::try_from(primitive_type & u64::from(u32::MAX)).unwrap_or(u32::MAX) {
         D3DPT_TRIANGLELIST => {
-            for i in 0..count {
+            triples.extend((0..count).map(|i| {
                 let base = i.saturating_mul(3);
-                triples.push((base, base.saturating_add(1), base.saturating_add(2)));
-            }
+                (base, base.saturating_add(1), base.saturating_add(2))
+            }));
         }
         D3DPT_TRIANGLESTRIP => {
-            for i in 0..count {
-                triples.push((i, i.saturating_add(1), i.saturating_add(2)));
-            }
+            triples.extend((0..count).map(|i| (i, i.saturating_add(1), i.saturating_add(2))));
         }
         D3DPT_TRIANGLEFAN => {
-            for i in 0..count {
-                triples.push((0, i.saturating_add(1), i.saturating_add(2)));
-            }
+            triples.extend((0..count).map(|i| (0, i.saturating_add(1), i.saturating_add(2))));
         }
         // Point/line primitives are unsupported in slice 1 — no triangles.
         _ => {}

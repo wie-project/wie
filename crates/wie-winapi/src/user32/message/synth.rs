@@ -417,12 +417,7 @@ pub(crate) fn erase_window_background(state: &mut WinApiState, hwnd: u64) -> boo
             .filter(|window| {
                 window.parent_handle == crate::handles::Hwnd::from(hwnd) && window.visible
             })
-            .map(|window| IRect {
-                left: window.x,
-                top: window.y,
-                right: window.x.saturating_add(window.width),
-                bottom: window.y.saturating_add(window.height),
-            })
+            .map(|window| IRect::from_xywh(window.x, window.y, window.width, window.height))
             .collect();
         for child in children {
             rects = subtract_rect(rects, child);

@@ -101,7 +101,10 @@ pub struct WindowSurface {
 /// Manages per-window compositing surfaces and frame publishing.
 pub struct PresentState {
     /// Persistent composite surface per HWND (scratch buffer for accumulating blits).
-    pub surfaces: std::collections::HashMap<crate::handles::Hwnd, WindowSurface>,
+    ///
+    /// `pub(crate)`: the host reads published frames (`published`) and wake
+    /// hooks; the scratch surfaces are internal to the blit pipeline.
+    pub(crate) surfaces: std::collections::HashMap<crate::handles::Hwnd, WindowSurface>,
     /// Last published snapshot per HWND.
     pub published: std::collections::HashMap<crate::handles::Hwnd, SurfaceFrame>,
     /// Monotonically increasing generation counter.
@@ -109,7 +112,7 @@ pub struct PresentState {
     /// Optional wake callback for the host presenter.
     pub wake: Option<Box<dyn Fn() + Send>>,
     /// Signal for headless mode.
-    pub record: Option<Box<SurfaceFrame>>,
+    pub(crate) record: Option<Box<SurfaceFrame>>,
     /// B9: number of published frames (frame timing enabled only).
     pub frames_published: u64,
     /// B9: accumulated publish wall time (ns).
@@ -134,7 +137,7 @@ pub struct PresentState {
     /// already unions every write, and the pixel buffer stays in the surface
     /// until the drain, so the published frame is byte-identical to the
     /// per-call publishes it replaces.
-    pub pending_publishes: std::collections::HashSet<crate::handles::Hwnd>,
+    pub(crate) pending_publishes: std::collections::HashSet<crate::handles::Hwnd>,
 }
 
 impl std::fmt::Debug for PresentState {

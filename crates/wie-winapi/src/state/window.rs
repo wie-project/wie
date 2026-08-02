@@ -6,51 +6,55 @@ use super::input::KeyboardState;
 use super::process::FileDialogPolicy;
 
 /// Window, UI, and input state.
+///
+/// Fields are `pub(crate)` except the ones the runtime reads directly through
+/// `WinApiState::window_state()` (windows, capture/focus handles, menus,
+/// dialog/file-dialog plumbing, keyboard state).
 #[derive(Debug, Clone)]
 pub struct WindowState {
-    pub window_long_ptr_values: Vec<(u64, i64, u64)>,
-    pub image_list_counts: Vec<(u64, u64)>,
-    pub image_list_background_colors: Vec<(u64, u32)>,
-    pub window_visible: bool,
-    pub window_enabled: bool,
-    pub active_window_handle: crate::handles::Hwnd,
-    pub foreground_window_handle: crate::handles::Hwnd,
+    pub(crate) window_long_ptr_values: Vec<(u64, i64, u64)>,
+    pub(crate) image_list_counts: Vec<(u64, u64)>,
+    pub(crate) image_list_background_colors: Vec<(u64, u32)>,
+    pub(crate) window_visible: bool,
+    pub(crate) window_enabled: bool,
+    pub(crate) active_window_handle: crate::handles::Hwnd,
+    pub(crate) foreground_window_handle: crate::handles::Hwnd,
     pub focus_window_handle: crate::handles::Hwnd,
     pub capture_window_handle: crate::handles::Hwnd,
-    pub cursor_handle: u64,
-    pub window_title: String,
-    pub window_x: i32,
-    pub window_y: i32,
-    pub window_width: i32,
-    pub window_height: i32,
-    pub tick_count: u64,
+    pub(crate) cursor_handle: u64,
+    pub(crate) window_title: String,
+    pub(crate) window_x: i32,
+    pub(crate) window_y: i32,
+    pub(crate) window_width: i32,
+    pub(crate) window_height: i32,
+    pub(crate) tick_count: u64,
     pub keyboard_state: KeyboardState,
-    pub next_timer_id: u64,
-    pub timers: Vec<TimerRecord>,
-    pub next_global_atom: u16,
-    pub global_atoms: Vec<GlobalAtomRecord>,
-    pub next_windows_hook_handle: u64,
-    pub windows_hooks: Vec<WindowsHookRecord>,
+    pub(crate) next_timer_id: u64,
+    pub(crate) timers: Vec<TimerRecord>,
+    pub(crate) next_global_atom: u16,
+    pub(crate) global_atoms: Vec<GlobalAtomRecord>,
+    pub(crate) next_windows_hook_handle: crate::handles::HookHandle,
+    pub(crate) windows_hooks: Vec<WindowsHookRecord>,
     /// All fake USER32 menus; each owns its items as a tree via `Popup`
-    /// submenu links (`menu.rs`).
+    /// submenu links (`menu.rs`). Read by the runtime for the host menu bar.
     pub menus: Vec<crate::user32::menu::MenuRecord>,
     /// Set by any menu mutation so the host menu-bar sync rebuilds its cached
-    /// tree instead of reconstructing it every frame.
+    /// tree instead of reconstructing it every frame. Read by the runtime.
     pub menu_dirty: bool,
     /// Class-level `SetClassLongPtr` values keyed by (class atom, signed index).
-    pub class_long_ptr_values: Vec<(u16, i64, u64)>,
+    pub(crate) class_long_ptr_values: Vec<(u16, i64, u64)>,
     pub message_queue_idle_policy: MessageQueueIdlePolicy,
-    pub next_window_class_atom: u16,
-    pub window_classes: Vec<WindowClassRecord>,
-    pub next_window_handle: u64,
+    pub(crate) next_window_class_atom: u16,
+    pub(crate) window_classes: Vec<WindowClassRecord>,
+    pub(crate) next_window_handle: crate::handles::Hwnd,
     pub windows: Vec<WindowRecord>,
     /// Per-window UI state for built-in controls (pressed/focus/items).
-    pub control_states:
+    pub(crate) control_states:
         std::collections::HashMap<crate::handles::Hwnd, crate::user32::controls::ControlState>,
     pub file_dialog_policy: FileDialogPolicy,
     pub last_file_dialog_path: Option<String>,
-    pub comm_dlg_extended_error: u32,
-    pub next_menu_handle: u64,
+    pub(crate) comm_dlg_extended_error: u32,
+    pub(crate) next_menu_handle: crate::handles::Hmenu,
     /// Guest VA of the modal-dialog result slot (`u32`), set by session init.
     ///
     /// `EndDialog` writes the result here; the in-guest `DialogBoxParam` stub
@@ -63,9 +67,9 @@ impl Default for WindowState {
         Self {
             dialog_result_va: 0,
             next_window_class_atom: 0xC000,
-            next_window_handle: 0x0000_0000_6610_0000,
-            next_menu_handle: 0x0000_0000_6620_0000,
-            next_windows_hook_handle: 0x0000_0000_6630_0000,
+            next_window_handle: crate::handles::Hwnd::from(0x0000_0000_6610_0000),
+            next_menu_handle: crate::handles::Hmenu::from(0x0000_0000_6620_0000),
+            next_windows_hook_handle: crate::handles::HookHandle::from(0x0000_0000_6630_0000),
             next_global_atom: 0xC000,
             next_timer_id: 1,
             window_long_ptr_values: Vec::new(),

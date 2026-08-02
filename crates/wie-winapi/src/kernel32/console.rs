@@ -922,15 +922,14 @@ mod tests {
     fn escape_2j_clears_entire_screen() {
         let mut state = test_state();
         // Write some content first.
-        for i in 0..10_usize {
-            if let Some(cell) = state
-                .buffer_mut(PRIMARY_BUFFER_HANDLE)
-                .unwrap()
-                .cells
-                .get_mut(i)
-            {
-                cell.unit = u16::from(b'X');
-            }
+        for cell in state
+            .buffer_mut(PRIMARY_BUFFER_HANDLE)
+            .unwrap()
+            .cells
+            .iter_mut()
+            .take(10)
+        {
+            cell.unit = u16::from(b'X');
         }
         fold_text_into_grid(
             &mut state,
@@ -978,10 +977,7 @@ mod tests {
     fn text_wrapping_at_eol_moves_to_next_row() {
         let mut state = test_state();
         // Buffer is 10 wide. Write 10 chars to fill row 0.
-        let mut input = Vec::new();
-        for i in 0..10_u16 {
-            input.push(u16::from(b'A') + i);
-        }
+        let input: Vec<u16> = (0..10_u16).map(|i| u16::from(b'A') + i).collect();
         fold_text_into_grid(&mut state, PRIMARY_BUFFER_HANDLE, &input);
         // After writing char at column 9, cursor.x is 10, which triggers wrap
         let cursor = state.buffer(PRIMARY_BUFFER_HANDLE).unwrap().cursor;

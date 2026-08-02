@@ -41,9 +41,9 @@ pub mod winmm;
 pub use bottle::{bottle_root_from_env, drive_d_from_env, guest_path_to_host};
 pub use exception::{RuntimeFunction, lookup_function_entry};
 pub use sync_obj::{
-    CsWaitQueue, INFINITE, KernelObject, MAXIMUM_WAIT_OBJECTS, MultiWaitRequest, PendingSpawn,
-    STILL_ACTIVE, SemaphoreObject, SyncState, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT, WaitTarget,
-    wait_multiple,
+    CsWaitQueue, INFINITE, KernelHandle, KernelObject, MAXIMUM_WAIT_OBJECTS, MultiWaitRequest,
+    PendingSpawn, STILL_ACTIVE, SemaphoreObject, SyncState, WAIT_FAILED, WAIT_OBJECT_0,
+    WAIT_TIMEOUT, WaitTarget, wait_multiple,
 };
 pub use vfs::{VolumeConfig, ensure_bottle_skeleton};
 #[cfg(test)]
@@ -63,12 +63,13 @@ pub use thread::{FIRST_WORKER_TID, GuestThread, PRIMARY_THREAD_ID, ThreadState};
 
 mod state;
 pub use state::{
-    D3D9State, DEFAULT_ENVIRONMENT, DllId, DllStateMap, FileDialogPolicy, FileIoState, FindHandle,
-    FlsSlot, GetProcAddressCacheEntry, GlobalAtomRecord, GuestCallbackRequest,
-    GuestIoRuntimeConfig, GuestStdinMode, HandlerContext, HeapAllocation, HeapState, HostFileMount,
-    HostParkReason, ImportResolver, KernelState, KeyboardState, MessageQueueIdlePolicy,
-    ModuleState, OpenGuestFile, OuterReturn, PTHREAD_RETURN_TRAMPOLINE_VA, ProcessState,
-    QueuedWindowMessage, RegistryKey, ResourceRecord, TimerRecord, VirtualGuestFile,
+    D3D9State, DEFAULT_ENVIRONMENT, DllId, DllStateMap, FileDialogPolicy, FileHandle, FileIoState,
+    FindFileHandle, FindHandle, FlsSlot, GetProcAddressCacheEntry, GlobalAtomRecord,
+    GuestCallbackRequest, GuestIoRuntimeConfig, GuestStdinMode, HandlerContext, HeapAllocation,
+    HeapState, HostFileMount, HostParkReason, ImportResolver, KernelState, KeyboardState,
+    MessageQueueIdlePolicy, ModuleHandle, ModuleState, OpenGuestFile, OuterReturn,
+    PTHREAD_RETURN_TRAMPOLINE_VA, ProcessState, QueuedWindowMessage, RegistryKey,
+    RegistryKeyHandle, ResourceHandle, ResourceRecord, TimerRecord, VirtualGuestFile,
     WinApiControlSignal, WinApiEnvironment, WinApiState, WindowClassRecord, WindowRecord,
     WindowState, WindowsHookRecord, pthread_return_trampoline_va,
 };

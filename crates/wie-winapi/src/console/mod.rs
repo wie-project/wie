@@ -320,6 +320,15 @@ impl ScreenBuffer {
     }
 }
 
+use crate::state::handle_newtype;
+
+// ── Console buffer-handle newtype (ADR-003) ────────────────────────────
+
+handle_newtype! {
+    /// A fake console screen-buffer handle (`CreateConsoleScreenBuffer`).
+    ConsoleBufferHandle
+}
+
 /// All console state for the emulated process.
 #[derive(Debug, Clone)]
 pub struct ConsoleState {
@@ -335,7 +344,7 @@ pub struct ConsoleState {
     /// Handle whose buffer is currently displayed.
     pub active_buffer: u64,
     /// Next handle value handed out by `CreateConsoleScreenBuffer`.
-    pub next_buffer_handle: u64,
+    pub next_buffer_handle: ConsoleBufferHandle,
     /// Decoded records not yet consumed by `ReadConsoleInput`.
     pub pending_input: VecDeque<InputRecord>,
     /// Undecoded bytes from the host terminal.
@@ -368,7 +377,7 @@ impl Default for ConsoleState {
             buffers: vec![(PRIMARY_BUFFER_HANDLE, ScreenBuffer::new(columns, rows))],
             output_modes: vec![(PRIMARY_BUFFER_HANDLE, DEFAULT_OUTPUT_MODE)],
             active_buffer: PRIMARY_BUFFER_HANDLE,
-            next_buffer_handle: FIRST_ALT_BUFFER_HANDLE,
+            next_buffer_handle: ConsoleBufferHandle::from(FIRST_ALT_BUFFER_HANDLE),
             pending_input: VecDeque::new(),
             input_bytes: Vec::new(),
             rendered: None,
@@ -464,8 +473,9 @@ impl ConsoleState {
     /// Allocate a screen buffer and return its handle.
     pub fn create_buffer(&mut self) -> u64 {
         let (columns, rows) = host_term::window_size();
-        let handle = self.next_buffer_handle;
-        self.next_buffer_handle = self.next_buffer_handle.saturating_add(1);
+        let handle = self.next_buffer_handle.as_u64();
+        self.next_buffer_handle =
+            ConsoleBufferHandle::from(self.next_buffer_handle.as_u64().saturating_add(1));
         self.buffers
             .push((handle, ScreenBuffer::new(columns, rows)));
         self.output_modes.push((handle, DEFAULT_OUTPUT_MODE));
