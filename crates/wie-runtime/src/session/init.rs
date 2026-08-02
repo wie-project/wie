@@ -397,8 +397,13 @@ impl super::RuntimeSession {
                 })?;
         }
         // Read the PE file once; parse once and reuse the parsed representation.
-        let pe_bytes = std::fs::read(path)
-            .with_context(|| format!("failed to read PE file: {}", path.display()))?;
+        // The bytes are shared (Arc) so the WinAPI state's main-module file
+        // reader and the session's own .pdata/dialog parsing never copy the
+        // whole image.
+        let pe_bytes = Arc::new(
+            std::fs::read(path)
+                .with_context(|| format!("failed to read PE file: {}", path.display()))?,
+        );
         // Parse PE once (avoids double-parse: pe_identity_from_bytes and
         // load_pe_direct_from_bytes both used to call PE::parse independently).
         let pe = wie_pe::PE::parse(&pe_bytes).context("failed to parse PE image")?;
@@ -837,7 +842,6 @@ impl super::RuntimeSession {
         let executable_file_bytes = pe_bytes.clone();
 
         let mut winapi_state = default_winapi_state(&layout, executable_file_bytes, &process)?;
-
         // Register the primary thread kernel object so DuplicateHandle
         // can resolve GetCurrentThread/GetCurrentProcess pseudohandles.
         {

@@ -1,4 +1,5 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
+use wie_winapi::handles::Hmenu;
 use wie_winapi::user32::menu::{MenuEntry, MenuRecord};
 
 /// One node of the guest window's menu tree, as mirrored into the macOS bar.
@@ -17,7 +18,10 @@ pub struct MenuNode {
 
 /// Cached menu-bar tree for [`GuestHandle::window_menu_items`]: the tree plus
 /// the menu handle it was built from.
-pub(super) type MenuTreeCache = Arc<Mutex<Option<(u64, Vec<MenuNode>)>>>;
+///
+/// `RwLock`: the host frame loop is the sole reader (read lock on the GUI
+/// path); only a `menu_dirty` rebuild takes the write lock.
+pub(super) type MenuTreeCache = Arc<RwLock<Option<(Hmenu, Vec<MenuNode>)>>>;
 
 /// Build the menu tree rooted at `menu_handle` from the native menu records:
 /// `Item` entries become leaves, `Popup` entries recurse into their submenu,

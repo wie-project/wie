@@ -43,12 +43,12 @@ pub struct RuntimeFakeApiEntry {
 #[derive(Debug, Default, Clone)]
 pub struct SoftApiTable {
     entries: Vec<RuntimeFakeApiEntry>,
-    /// Lowercase key `"library\0name"` → index into `entries`.
+    /// Lowercase `(library, name)` → index into `entries`.
     ///
     /// Only used by [`Self::intern`]; the enum-of-callers path reads through
     /// [`Self::get`] by dense index, so lookups on the hot handler path stay
     /// O(1) without touching this map.
-    lookup: HashMap<String, u16>,
+    lookup: HashMap<SoftApiKey, u16>,
 }
 
 impl SoftApiTable {
@@ -69,7 +69,7 @@ impl SoftApiTable {
         name: &str,
         iat_slot_va: u64,
     ) -> Result<(u64, RuntimeFakeApiEntry)> {
-        let key = intern_key(library, name);
+        let key = SoftApiKey::new(library, name);
         if let Some(&idx) = self.lookup.get(&key)
             && let Some(existing) = self.entries.get(usize::from(idx))
         {
@@ -90,20 +90,33 @@ impl SoftApiTable {
     }
 }
 
-/// Build the case-insensitive lookup key: lowercase(lib) + '\0' + lowercase(name).
+/// Case-insensitive `(library, name)` lookup key for [`SoftApiTable::intern`].
 ///
-/// NUL separator keeps `("a", "bc")` distinct from `("ab", "c")` without needing
-/// a real tuple key (which would require Hash impl on borrowed pairs).
-fn intern_key(library: &str, name: &str) -> String {
-    let mut s = String::with_capacity(library.len().saturating_add(name.len()).saturating_add(1));
-    for c in library.chars() {
-        s.push(c.to_ascii_lowercase());
+/// Both parts are ASCII-lowercased exactly like the old NUL-joined
+/// `"library\0name"` string key: `("a", "bc")` stays distinct from
+/// `("ab", "c")`, and mixed-case imports still hit the same slot.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SoftApiKey {
+    library: String,
+    name: String,
+}
+
+impl SoftApiKey {
+    fn new(library: &str, name: &str) -> Self {
+        Self {
+            library: lowercase_ascii(library),
+            name: lowercase_ascii(name),
+        }
     }
-    s.push('\0');
-    for c in name.chars() {
-        s.push(c.to_ascii_lowercase());
+}
+
+/// ASCII-lowercase `s` (byte-preserving for non-ASCII, as before).
+fn lowercase_ascii(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        out.push(c.to_ascii_lowercase());
     }
-    s
+    out
 }
 
 /// Resolved stop target after bit-decode (no HashMap).

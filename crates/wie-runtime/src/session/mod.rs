@@ -18,7 +18,7 @@ use crate::memory::RuntimeMemoryLayout;
 use crate::mt_runtime::ProcessResources;
 use crate::trace::EntryTraceTermination;
 use anyhow::{Context, Result};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use self::callback::PendingGuestCallback;
 
@@ -291,7 +291,7 @@ impl RuntimeSession {
         GuestHandle {
             state: self.process.winapi_arc(),
             queue: self.process.message_queue_arc(),
-            menu_tree_cache: Arc::new(Mutex::new(None)),
+            menu_tree_cache: Arc::new(RwLock::new(None)),
         }
     }
 

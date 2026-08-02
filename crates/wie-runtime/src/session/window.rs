@@ -1,4 +1,5 @@
 use super::menu::{MenuNode, MenuTreeCache, build_menu_tree};
+use wie_winapi::handles::Hmenu;
 
 /// Append one journal line when `WIE_API_JOURNAL` is set (backend A/B diffs).
 /// Host-side handle to the WinAPI state for cross-thread access.
@@ -240,8 +241,12 @@ impl GuestHandle {
         else {
             return Vec::new();
         };
+        // The window record stores the raw u64 handle; the cache is keyed by
+        // the typed menu handle so a stale build (different handle) is a
+        // compile-time type mismatch, not a silent u64 aliasing.
+        let menu_handle = Hmenu::from(menu_handle);
         if !ws.menu_dirty {
-            let cached = self.menu_tree_cache.lock().ok();
+            let cached = self.menu_tree_cache.read().ok();
             if let Some(cached) = cached
                 && let Some((cached_handle, tree)) = cached.as_ref()
                 && *cached_handle == menu_handle
@@ -249,8 +254,8 @@ impl GuestHandle {
                 return tree.clone();
             }
         }
-        let tree = build_menu_tree(&ws.menus, menu_handle);
-        if let Ok(mut cache) = self.menu_tree_cache.lock() {
+        let tree = build_menu_tree(&ws.menus, menu_handle.as_u64());
+        if let Ok(mut cache) = self.menu_tree_cache.write() {
             *cache = Some((menu_handle, tree.clone()));
         }
         tree
@@ -368,7 +373,7 @@ impl GuestHandle {
 mod tests {
     use super::GuestHandle;
     use crate::memory::DEFAULT_LAYOUT;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, RwLock};
     use wie_winapi::user32::menu::{MenuEntry, MenuRecord};
 
     /// `window_menu_items` returns the cached tree while `menu_dirty` is
@@ -382,7 +387,7 @@ mod tests {
             command_line: "menu.exe".to_owned(),
         };
         let mut winapi_state =
-            crate::memory::default_winapi_state(&DEFAULT_LAYOUT, Vec::new(), &process)
+            crate::memory::default_winapi_state(&DEFAULT_LAYOUT, Arc::new(Vec::new()), &process)
                 .expect("winapi state");
         let menu_handle = 0x0000_0000_6620_0000_u64;
         let submenu = 0x0000_0000_6620_0001_u64;
@@ -413,7 +418,7 @@ mod tests {
         let handle = GuestHandle {
             state: Arc::new(Mutex::new(winapi_state)),
             queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
-            menu_tree_cache: Arc::new(Mutex::new(None)),
+            menu_tree_cache: Arc::new(RwLock::new(None)),
         };
 
         let first = handle.window_menu_items();

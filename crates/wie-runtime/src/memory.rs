@@ -231,7 +231,7 @@ pub const CALLBACK_RETURN_TRAMPOLINE_VA: u64 = DEFAULT_LAYOUT.callback_return_tr
 
 pub(crate) fn default_winapi_state(
     layout: &RuntimeMemoryLayout,
-    executable_file_bytes: Vec<u8>,
+    executable_file_bytes: std::sync::Arc<Vec<u8>>,
     process: &wie_pe::ProcessIdentity,
 ) -> Result<wie_winapi::WinApiState> {
     let heap_size_u64 =
