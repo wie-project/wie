@@ -2,7 +2,6 @@
 //!
 //! Every blocking entry point is written as a *retry loop across re-entries*:
 
-#![allow(clippy::match_same_arms, clippy::range_plus_one)]
 //! it re-reads the object, and either completes or queues a park and returns
 //! [`crate::WinApiControlSignal::HostPark`]. The runtime sleeps with no process
 //! locks held and then re-enters the handler at the same RIP.
@@ -27,7 +26,6 @@ use crate::{WinApiHandlerResult, WinApiState};
 use cond::{DeadlineSource, cond_id, cond_wait, cond_wake};
 
 /// Dispatch the synchronisation exports. `None` if unrecognised.
-#[expect(clippy::too_many_lines, reason = "flat export table; one arm per name")]
 pub(super) fn dispatch(
     engine: &mut dyn CpuEngine,
     state: &mut WinApiState,

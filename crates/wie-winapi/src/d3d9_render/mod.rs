@@ -18,7 +18,7 @@ mod sample;
 mod vertex;
 
 #[cfg(test)]
-#[expect(
+#[allow(
     clippy::expect_used,
     clippy::as_conversions,
     clippy::float_cmp,
@@ -328,13 +328,6 @@ impl Default for TextureStageState {
 /// `#[expect(casts)]`: pixel coordinates are `i32`/`u32` but the edge
 /// functions run in float — `std` has no lossless int↔float `From`, and the
 /// bounds are clamped to the backbuffer before any narrowing.
-#[allow(clippy::too_many_arguments)]
-#[expect(
-    clippy::as_conversions,
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::many_single_char_names
-)]
 pub fn rasterize_triangle(
     backbuffer: &mut [u32],
     width: u32,
@@ -558,7 +551,6 @@ pub fn rasterize_triangle(
 /// SRCALPHA/INVSRCALPHA/ADD, or `flat_fill` = constant color, no blend) does
 /// the kernel write all four at once; otherwise each pixel takes the scalar
 /// path (`blend_fragment` when blending, plain write otherwise).
-#[allow(clippy::too_many_arguments)]
 fn flush_pixel_batch(
     backbuffer: &mut [u32],
     rgb: &[u32; 4],
@@ -626,7 +618,6 @@ fn flush_pixel_batch(
 /// `pre_transformed` (`XYZRHW`) vertices bypass the matrix/viewport and use
 /// their X/Y as screen pixels directly. Any vertex at/behind the near plane
 /// rejects the whole triangle (slice 1 limitation — no near-plane clipping).
-#[allow(clippy::too_many_arguments)]
 pub fn draw_triangle(
     backbuffer: &mut [u32],
     width: u32,

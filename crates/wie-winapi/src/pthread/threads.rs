@@ -1,8 +1,6 @@
 //! Thread lifecycle, attributes, thread-specific data, once-control, and
 //! cancellation.
 
-#![allow(clippy::match_same_arms, clippy::single_match_else)]
-
 use anyhow::{Context, Result};
 use wie_cpu::CpuEngine;
 
@@ -41,7 +39,6 @@ const DESTRUCTOR_PASSES: u32 = 8;
 const CALL_FRAME_GAP: u64 = 0x200;
 
 /// Dispatch the thread / TSD / once / cancel exports. `None` if unrecognised.
-#[expect(clippy::too_many_lines, reason = "flat export table; one arm per name")]
 pub(super) fn dispatch(
     engine: &mut dyn CpuEngine,
     state: &mut WinApiState,

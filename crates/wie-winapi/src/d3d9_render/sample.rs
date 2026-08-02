@@ -63,7 +63,6 @@ pub struct FragmentState<'a> {
 /// `WRAP` mirrors the coordinate modulo the size; `CLAMP` (and any unknown
 /// mode) saturates into `[0, size-1]`. `size` is at least 1.
 #[must_use]
-#[expect(clippy::arithmetic_side_effects)] // mod/saturate on a bounded index
 fn address_index(index: i32, size: u32, address: u32) -> i32 {
     let size_i = i32::try_from(size).unwrap_or(0).max(1);
     if address == D3DTADDRESS_WRAP {
@@ -76,11 +75,6 @@ fn address_index(index: i32, size: u32, address: u32) -> i32 {
 ///
 /// `floor(u * size)` so the last texel (`u` just under 1.0) is reachable.
 #[must_use]
-#[expect(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss
-)]
 fn point_index(coord: f32, size: u32, address: u32) -> i32 {
     let size_f = size as f32;
     let raw = (coord * size_f.max(1.0)).floor() as i32;
@@ -101,14 +95,6 @@ fn texel_at(stage: &TextureStage<'_>, x: i32, y: i32) -> u32 {
 /// `#[expect(casts)]`: the bilinear weights are float math over `u8` channels
 /// — `std` has no lossless float↔int `From`; results are clamped to 0..255.
 #[must_use]
-#[expect(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    clippy::arithmetic_side_effects,
-    clippy::many_single_char_names
-)]
 pub(super) fn sample_texture(stage: &TextureStage<'_>, u: f32, v: f32) -> u32 {
     if stage.mag_filter == D3DTEXF_LINEAR {
         let x = u * stage.width as f32 - 0.5;

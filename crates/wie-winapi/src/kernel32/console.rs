@@ -390,13 +390,6 @@ fn advance_tracked_cursor(state: &mut ConsoleState, buffer_handle: u64, units: &
 /// Fold decoded text into the grid, interpreting CSI cursor positioning
 /// and clear-screen escapes so programs using Ansi via WriteConsole
 /// (like the snake game's `\033[H\033[2JScore:...`) render correctly.
-#[allow(
-    clippy::arithmetic_side_effects,
-    clippy::indexing_slicing,
-    clippy::cast_possible_truncation,
-    clippy::as_conversions,
-    clippy::explicit_iter_loop
-)]
 pub(crate) fn fold_text_into_grid(state: &mut ConsoleState, buffer_handle: u64, units: &[u16]) {
     let Some(buffer) = state.buffer_mut(buffer_handle) else {
         return;

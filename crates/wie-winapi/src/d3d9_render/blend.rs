@@ -224,7 +224,6 @@ impl D3dBlendOp {
 /// `#[expect(float_cmp)]`: the exact `==`/`!=` compares are the D3D9 EQUAL /
 /// NOTEQUAL semantics on the unquantized software depth values.
 #[must_use]
-#[expect(clippy::float_cmp)]
 pub(super) fn depth_test(z: f32, existing: f32, func: u32) -> bool {
     match func {
         D3DCMP_NEVER => false,
@@ -323,11 +322,6 @@ pub(super) fn edge_inside(e: f32, dx: f32, dy: f32) -> bool {
 /// `.round()` results are clamped to 0..255 before narrowing, so truncation
 /// and sign-loss are impossible.
 #[must_use]
-#[expect(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
 pub(super) fn blend_colors(wa: f32, ca: u32, wb: f32, cb: u32, wc: f32, cc: u32) -> u32 {
     let ra = f32::from(u8::try_from((ca >> 16) & 0xFF).unwrap_or(0));
     let ga = f32::from(u8::try_from((ca >> 8) & 0xFF).unwrap_or(0));

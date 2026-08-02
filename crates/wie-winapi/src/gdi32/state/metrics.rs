@@ -7,7 +7,6 @@ use crate::{HandlerContext, WinApiHandlerResult};
 use super::objects::dc_resolved_font;
 
 /// Round an `f32` px metric to an `i32`.
-#[expect(clippy::as_conversions, clippy::cast_possible_truncation)]
 fn round_i32(value: f32) -> i32 {
     value.round() as i32
 }

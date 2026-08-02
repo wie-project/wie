@@ -250,7 +250,6 @@ fn bgra_bytes(color: u32) -> [u8; 4] {
 }
 
 /// Round an `f32` px metric to an `i32`.
-#[expect(clippy::as_conversions, clippy::cast_possible_truncation)]
 fn round_i32(value: f32) -> i32 {
     value.round() as i32
 }
@@ -307,7 +306,6 @@ fn clip_run_band(
 /// Returns the clipped band actually written (`None` when nothing was drawn):
 /// window-DC callers mark it as the surface's dirty rect, so the next publish
 /// copies only the repainted line instead of the whole surface.
-#[allow(clippy::too_many_arguments)]
 fn render_run(
     engine: &mut dyn wie_cpu::CpuEngine,
     font_engine: &mut FontEngine,
@@ -395,7 +393,6 @@ fn render_run(
 }
 
 /// Blend one glyph's coverage for `row` into the row's pixel accumulator.
-#[allow(clippy::too_many_arguments)]
 fn blend_glyph_row(
     row_pixels: &mut [Option<(u32, u8)>],
     glyph: &RasterizedGlyph,
@@ -860,7 +857,6 @@ pub fn handle_draw_text_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 /// The caller supplies the resolved default font (sans-serif 16 px) — the
 /// same rasterizer the text APIs use, exposed for the host-side control
 /// WndProcs which have no DC to resolve.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_text_into_surface(
     engine: &mut dyn wie_cpu::CpuEngine,
     font_engine: &mut FontEngine,
@@ -905,7 +901,7 @@ pub(crate) fn render_text_into_surface(
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::clip_run_band;
     use crate::gdi32::IRect;

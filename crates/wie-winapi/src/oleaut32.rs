@@ -218,7 +218,6 @@ const VARIANT_DATA_OFF: u64 = 8;
 
 /// Read the numeric value from a VARIANT at data offset 8 as i64 (sign-extended
 /// for integers, bitcast for floats).
-#[expect(clippy::as_conversions, clippy::cast_possible_truncation)]
 fn read_variant_num(engine: &mut dyn wie_cpu::CpuEngine, pvar: u64) -> Result<(u16, i64)> {
     let vt = read_vt(engine, pvar)?;
     let mut raw = [0_u8; 8];
@@ -244,13 +243,6 @@ fn read_variant_num(engine: &mut dyn wie_cpu::CpuEngine, pvar: u64) -> Result<(u
 }
 
 /// Write a numeric value back into a VARIANT, setting the appropriate vt.
-#[expect(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss,
-    clippy::cast_lossless
-)]
 fn write_variant_num(
     engine: &mut dyn wie_cpu::CpuEngine,
     pvar: u64,
@@ -395,7 +387,6 @@ fn handle_variant_copy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
 /// Shared handler for VarAdd / VarSub / VarMul / VarDiv / VarMod.
 ///
 /// Win64: RCX = result VARIANT*, RDX = lhs VARIANT*, R8 = rhs VARIANT*.
-#[expect(clippy::integer_division, clippy::arithmetic_side_effects)]
 fn handle_var_math(ctx: &mut HandlerContext<'_>, op: &str) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let presult = engine.read_rcx()?;
@@ -439,7 +430,6 @@ fn handle_var_math(ctx: &mut HandlerContext<'_>, op: &str) -> Result<WinApiHandl
 /// Converts a numeric VARIANT to a BSTR VARIANT (VarBstrFromI4, etc.).
 ///
 /// Win64: RCX = result VARIANT*, RDX = input number (as VT argument variant).
-#[expect(clippy::cast_possible_truncation, clippy::as_conversions)]
 fn handle_var_bstr_from_num(
     ctx: &mut HandlerContext<'_>,
     src_vt: u16,
@@ -474,7 +464,6 @@ fn handle_var_bstr_from_num(
 /// Parses a BSTR VARIANT into a numeric VARIANT (VarI4FromBstr, etc.).
 ///
 /// Win64: RCX = result VARIANT*, RDX = source VARIANT*.
-#[expect(clippy::cast_possible_truncation, clippy::as_conversions)]
 fn handle_var_num_from_bstr(
     ctx: &mut HandlerContext<'_>,
     out_vt: u16,

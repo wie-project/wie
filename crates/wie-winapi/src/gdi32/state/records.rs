@@ -400,7 +400,7 @@ pub fn brush_color(state: &mut WinApiState, brush_handle: Hbrush) -> Option<u32>
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
+#[allow(clippy::expect_used)]
 mod tests {
     use crate::gdi32::height_px_from_lf;
 

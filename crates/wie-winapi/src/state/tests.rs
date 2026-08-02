@@ -3,7 +3,7 @@
 //! Moved wholesale from `lib.rs` when the state definitions were extracted
 //! into this module. `use super::*` resolves the state types; the crate-root
 //! re-exports keep every `crate::X` path inside the tests unchanged.
-#![expect(clippy::expect_used)]
+#![allow(clippy::expect_used)]
 
 use super::*;
 use wie_cpu::{CpuEngine, IcedCpu};

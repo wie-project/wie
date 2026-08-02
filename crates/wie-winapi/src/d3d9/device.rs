@@ -673,7 +673,6 @@ pub fn handle_get_viewport(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
 /// `vertex_count` is the vertex pool size (derived from the primitive for the
 /// non-indexed form, `NumVertices` for the indexed form); `index_count` is 0
 /// for the non-indexed form.
-#[allow(clippy::too_many_arguments)]
 fn handle_draw_up_common(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,

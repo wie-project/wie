@@ -35,17 +35,6 @@
 
 // Most of these modules are consumed by the dispatch layer. Until every
 // function is wired the `dead_code` and `unreachable_pub` lints are noise.
-#![allow(
-    clippy::as_conversions,
-    clippy::integer_division,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap,
-    clippy::items_after_statements,
-    clippy::format_push_string,
-    clippy::cast_lossless,
-    clippy::arithmetic_side_effects
-)]
 
 pub(crate) mod codepage;
 pub(crate) mod host_term;
@@ -151,11 +140,9 @@ impl Coord {
     /// Decode the packed `COORD` the Win64 ABI passes by value in a register.
     #[must_use]
     pub const fn from_packed(packed: u64) -> Self {
-        #[allow(clippy::cast_possible_truncation, clippy::as_conversions)]
         // COORD is two i16 fields packed into the low 32 bits; the truncation
         // to u16 then reinterpretation as i16 is exactly the ABI's layout.
         let x = (packed & 0xffff) as u16;
-        #[allow(clippy::cast_possible_truncation, clippy::as_conversions)]
         let y = ((packed >> 16) & 0xffff) as u16;
         Self {
             x: i16::from_ne_bytes(x.to_ne_bytes()),

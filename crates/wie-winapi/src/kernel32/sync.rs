@@ -419,7 +419,7 @@ pub(crate) fn interlocked_i32(
         // SAFETY: host_span checked SPC+arena; guest VA alignment implies host
         // alignment for soft-translate (offset preserved). Pointer lives while
         // GuestMemory (engine) is borrowed exclusively here.
-        #[expect(unsafe_code, clippy::cast_ptr_alignment)]
+        #[expect(unsafe_code)]
         let atom = unsafe { &*(host.cast::<std::sync::atomic::AtomicI32>()) };
         return Ok(op(atom));
     }
@@ -447,7 +447,7 @@ pub(crate) fn interlocked_i32_prev(
     if addr.is_multiple_of(4)
         && let Some(host) = engine.host_span(addr, 4, true)
     {
-        #[expect(unsafe_code, clippy::cast_ptr_alignment)]
+        #[expect(unsafe_code)]
         let atom = unsafe { &*(host.cast::<std::sync::atomic::AtomicI32>()) };
         return Ok(op(atom));
     }
@@ -474,7 +474,7 @@ pub(crate) fn interlocked_i64(
     if addr.is_multiple_of(8)
         && let Some(host) = engine.host_span(addr, 8, true)
     {
-        #[expect(unsafe_code, clippy::cast_ptr_alignment)]
+        #[expect(unsafe_code)]
         let atom = unsafe { &*(host.cast::<std::sync::atomic::AtomicI64>()) };
         return Ok(op(atom));
     }
@@ -501,7 +501,7 @@ pub(crate) fn interlocked_i64_prev(
     if addr.is_multiple_of(8)
         && let Some(host) = engine.host_span(addr, 8, true)
     {
-        #[expect(unsafe_code, clippy::cast_ptr_alignment)]
+        #[expect(unsafe_code)]
         let atom = unsafe { &*(host.cast::<std::sync::atomic::AtomicI64>()) };
         return Ok(op(atom));
     }

@@ -191,7 +191,7 @@ pub fn logical_drives_mask(volumes: &VolumeConfig) -> u32 {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

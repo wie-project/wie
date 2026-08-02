@@ -458,7 +458,6 @@ pub fn handle_set_focus(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 /// Returns the bridge signal when one is required (the caller returns it as
 /// `Err(..)`); `Ok(None)` means both were delivered and the caller completes
 /// normally.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn deliver_focus_change(
     state: &mut WinApiState,
     engine: &mut dyn wie_cpu::CpuEngine,

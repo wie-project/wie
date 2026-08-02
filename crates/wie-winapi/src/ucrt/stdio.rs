@@ -1,18 +1,6 @@
 //! UCRT stdio surface: `FILE` cookie streams, printf/scanf format engines, and
 //! the single host console-write path shared across the crate.
 
-#![allow(
-    clippy::arithmetic_side_effects,
-    clippy::indexing_slicing,
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::integer_division,
-    clippy::cast_sign_loss,
-    clippy::items_after_statements,
-    clippy::cast_possible_wrap,
-    clippy::unnecessary_wraps
-)]
-
 use crate::guest_memory::read_u64 as read_guest_u64;
 use crate::{GuestStdinMode, HandlerContext, WinApiHandlerResult};
 use anyhow::{Context, Result};

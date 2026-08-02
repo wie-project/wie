@@ -348,7 +348,7 @@ impl Default for PresentState {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::PresentState;
     use crate::handles::Hwnd;

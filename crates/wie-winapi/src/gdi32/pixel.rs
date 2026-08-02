@@ -24,7 +24,6 @@ pub(super) fn bgr24_to_0rgb(r: u8, g: u8, b: u8) -> u32 {
 ///
 /// Returns `None` if the rect is completely out of bounds.  Otherwise returns
 /// adjusted `(dest_x, dest_y, src_x, src_y, width, height)`.
-#[allow(clippy::too_many_arguments)]
 #[must_use]
 pub(super) fn clip_blit_rect(
     dest_w: i32,

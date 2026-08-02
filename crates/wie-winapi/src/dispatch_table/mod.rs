@@ -437,7 +437,7 @@ impl WinApiId {
 
     /// Reconstruct from the dense discriminant (`0 .. WINAPI_ID_COUNT`).
     #[must_use]
-    #[allow(clippy::as_conversions, unsafe_code)] // const fn; From is not const-stable
+    #[allow(unsafe_code)] // const fn; From is not const-stable
     pub const fn from_u16(raw: u16) -> Option<Self> {
         if (raw as usize) >= WINAPI_ID_COUNT {
             return None;
@@ -455,7 +455,6 @@ impl WinApiId {
 // the last discriminant. Both are edited by hand when an API is added, so pin
 // the relationship: if they ever disagree, this fails to compile.
 // `as usize` is infallible widening; TryFrom / From are not const-stable yet.
-#[allow(clippy::as_conversions)]
 const _: () = assert!(
     (LAST_WINAPI_ID.to_u16() as usize) + 1 == WINAPI_ID_COUNT,
     "WINAPI_ID_COUNT must equal the last WinApiId discriminant + 1 — \
@@ -1076,7 +1075,6 @@ impl WinApiTraits {
 }
 
 /// Per-API trait flags indexed by [`WinApiId`] discriminant (zero-cost lookup).
-#[allow(clippy::indexing_slicing, clippy::as_conversions)]
 static WINAPI_TRAITS: [WinApiTraits; WINAPI_ID_COUNT] = {
     let mut t = [WinApiTraits::EMPTY; WINAPI_ID_COUNT];
 
@@ -1134,7 +1132,6 @@ static WINAPI_TRAITS: [WinApiTraits; WINAPI_ID_COUNT] = {
 impl WinApiId {
     /// Lookup the trait flags for this API (constant-time array access).
     #[must_use]
-    #[allow(clippy::indexing_slicing)]
     pub fn traits(self) -> WinApiTraits {
         WINAPI_TRAITS[usize::from(self.to_u16())]
     }

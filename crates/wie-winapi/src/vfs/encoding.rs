@@ -133,7 +133,7 @@ pub fn wide_to_multibyte(code_page: u32, units: &[u16]) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

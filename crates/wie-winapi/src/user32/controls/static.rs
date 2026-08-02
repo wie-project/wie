@@ -10,7 +10,6 @@ use crate::user32::WinApiState;
 /// Draw a single line of control text, vertically centered, black on the
 /// control's face. `tx` is the caller-computed left edge (centered or padded);
 /// the glyphs are clipped to the control's rect.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn paint_label(
     state: &mut WinApiState,
     engine: &mut dyn wie_cpu::CpuEngine,

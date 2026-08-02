@@ -9,19 +9,7 @@
 //! with its own CPU engine.
 
 #![expect(dead_code)]
-#![allow(
-    unreachable_pub,
-    clippy::module_name_repetitions,
-    clippy::match_same_arms,
-    clippy::single_match_else,
-    clippy::struct_excessive_bools,
-    clippy::arithmetic_side_effects,
-    clippy::range_plus_one,
-    clippy::nonminimal_bool,
-    clippy::or_fun_call,
-    clippy::manual_range_contains,
-    clippy::default_trait_access
-)]
+#![allow(unreachable_pub)]
 //!
 //! # Guest ABI
 //!
@@ -594,7 +582,6 @@ pub fn dispatch(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiHandle
 }
 
 /// Scheduling, clocks, and the `_np` extensions.
-#[expect(clippy::too_many_lines, reason = "flat export table; one arm per name")]
 fn dispatch_misc(
     engine: &mut dyn CpuEngine,
     state: &mut WinApiState,

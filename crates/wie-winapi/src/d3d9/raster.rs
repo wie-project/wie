@@ -46,7 +46,6 @@ pub(crate) fn parse_mat4(bytes: &[u8; 64]) -> Mat4 {
 }
 
 /// Fill one clipped rect of the backbuffer with `color` (0RGB).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn fill_backbuffer_rect(
     backbuffer: &mut [u32],
     width: u32,
@@ -260,7 +259,6 @@ fn resolve_ps_samplers<'a>(
 /// the world × view × projection transform and viewport from device state,
 /// rejects triangles behind the near plane, and accumulates the dirty region.
 /// When a stage-0 texture is bound and enabled, the fragment stage samples it.
-#[allow(clippy::too_many_arguments)]
 fn rasterize_vertex_stream(
     state: &mut WinApiState,
     data: &[u8],
@@ -371,7 +369,6 @@ fn rasterize_vertex_stream(
 /// span pattern), then parsed host-side by FVF layout. Unreadable/malformed
 /// buffers are skipped (return `Ok(())`) — a bad pointer must not crash the
 /// guest; the draw simply produces no pixels.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_vertex_stream(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,

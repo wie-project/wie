@@ -110,7 +110,6 @@ mod imp {
 
     /// `signal(2)` takes the handler as an integer-typed `sighandler_t`, so the
     /// function pointer has to be laundered through a data pointer first.
-    #[expect(clippy::as_conversions)]
     fn sighandler_addr(handler: extern "C" fn(libc::c_int)) -> libc::sighandler_t {
         handler as *const () as libc::sighandler_t
     }

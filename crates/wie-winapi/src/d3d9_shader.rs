@@ -657,7 +657,7 @@ pub fn parse_shader(bytecode: &[u32]) -> Result<ParsedShader> {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

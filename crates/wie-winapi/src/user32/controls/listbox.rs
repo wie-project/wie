@@ -13,7 +13,6 @@ use crate::user32::{LBN_SELCHANGE, WinApiState, find_window, make_command_wparam
 /// Draw the first visible LISTBOX items (one line each), filling the
 /// selected item's row with COLOR_HIGHLIGHT and rendering its glyphs in
 /// COLOR_HIGHLIGHTTEXT (Windows' selected-listbox look).
-#[allow(clippy::too_many_arguments)]
 pub(super) fn paint_item_lines(
     state: &mut WinApiState,
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -70,7 +69,6 @@ pub(super) fn paint_item_lines(
 }
 
 /// Render control text into the ancestor surface (TRANSPARENT background).
-#[allow(clippy::too_many_arguments)]
 pub(super) fn render_control_text(
     state: &mut WinApiState,
     engine: &mut dyn wie_cpu::CpuEngine,

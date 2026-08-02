@@ -11,19 +11,6 @@
 // PE / UWOP interpreters use fixed field strides and guest-buffer indexes; saturating
 // every intermediate offset would obscure the PE layout. Bounds are checked via
 // `get` / `read_mem` failure, not panic-free arithmetic at every step.
-#![allow(
-    clippy::arithmetic_side_effects,
-    clippy::indexing_slicing,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::as_conversions,
-    clippy::integer_division,
-    clippy::match_same_arms,
-    clippy::result_unit_err,
-    clippy::needless_range_loop,
-    clippy::too_many_arguments
-)]
 
 /// One entry in the `.pdata` section.  12 bytes.  4-byte aligned.
 #[derive(Debug, Clone, Copy)]

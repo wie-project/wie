@@ -21,12 +21,7 @@
 //! through — [`ansi_colour_index`] is where that happens.
 
 #![expect(dead_code)]
-#![allow(
-    unreachable_pub,
-    clippy::format_push_string,
-    clippy::cast_possible_truncation,
-    clippy::arithmetic_side_effects
-)]
+#![allow(unreachable_pub)]
 
 use super::{CharInfo, ScreenBuffer, host_term};
 

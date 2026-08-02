@@ -2,17 +2,6 @@
 //!
 //! The UCRT emulation handles printf/scanf-style format parsing, locale helpers,
 //! and ctype operations with intentional integer arithmetic, indexing, and casts.
-#![allow(
-    clippy::arithmetic_side_effects,
-    clippy::indexing_slicing,
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::integer_division,
-    clippy::cast_sign_loss,
-    clippy::items_after_statements,
-    clippy::cast_possible_wrap,
-    clippy::unnecessary_wraps
-)]
 //!
 //! Clean room: implement enough of the Universal CRT surface that a normal
 //! mingw/MSVC CRT startup + `main` can run. Not a port of Wine/ReactOS UCRT.

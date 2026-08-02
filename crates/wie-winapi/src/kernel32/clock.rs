@@ -16,13 +16,6 @@
 //! session init and never refreshed, so the diff between two runs is
 //! instruction flow, not wall time.
 
-#![allow(
-    clippy::integer_division,
-    clippy::map_unwrap_or,
-    clippy::checked_conversions,
-    clippy::arithmetic_side_effects
-)]
-
 use std::sync::OnceLock;
 use std::time::Instant;
 

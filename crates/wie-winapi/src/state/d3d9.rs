@@ -21,10 +21,6 @@ pub(crate) enum SceneState {
 
 /// Direct3D 9 rendering state.
 #[derive(Debug, Clone)]
-#[expect(
-    clippy::struct_field_names,
-    reason = "every field carries the legacy `d3d9_` prefix from the pre-state-module struct; renaming would churn ~80 handler sites for no behavior"
-)]
 pub struct D3D9State {
     pub(crate) d3d9_current_vertex_shader: u64,
     pub(crate) d3d9_current_fvf: u32,

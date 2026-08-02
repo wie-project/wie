@@ -90,28 +90,24 @@ impl LoadedModule {
 
 /// Read a u32 from a slice at a given offset (little-endian).
 /// Caller MUST verify `off + 4 <= buf.len()`.
-#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 fn read_u32_le(buf: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
 }
 
 /// Read a u16 from a slice at a given offset (little-endian).
 /// Caller MUST verify `off + 2 <= buf.len()`.
-#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 fn read_u16_le(buf: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([buf[off], buf[off + 1]])
 }
 
 /// Read an i32 from a slice at a given offset (little-endian).
 /// Caller MUST verify `off + 4 <= buf.len()`.
-#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 fn read_i32_le(buf: &[u8], off: usize) -> i32 {
     i32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
 }
 
 /// Read an i64 from a slice at a given offset (little-endian).
 /// Caller MUST verify `off + 8 <= buf.len()`.
-#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 fn read_i64_le(buf: &[u8], off: usize) -> i64 {
     i64::from_le_bytes([
         buf[off],
@@ -131,7 +127,6 @@ fn read_i64_le(buf: &[u8], off: usize) -> i64 {
 /// Export names are lowercased for case-insensitive lookup.
 ///
 /// `pe_bytes` must be the raw file bytes (not the mapped image).
-#[allow(clippy::arithmetic_side_effects)]
 pub fn parse_dll_exports(pe: &goblin::pe::PE<'_>, pe_bytes: &[u8]) -> Result<DllExports> {
     let header = pe
         .header
@@ -423,7 +418,6 @@ pub fn resolve_dll_path(
 /// - `IMAGE_REL_BASED_DIR64` (10): 8-byte delta (x64 native)
 ///
 /// All other types return an error (unsupported).
-#[allow(clippy::arithmetic_side_effects)]
 pub fn apply_relocations(
     pe: &goblin::pe::PE<'_>,
     pe_bytes: &[u8],
@@ -464,7 +458,6 @@ pub fn apply_relocations(
             break;
         }
 
-        #[allow(clippy::integer_division)]
         let page_rva = read_u32_le(reloc_data, offset);
         let block_size = read_u32_le(reloc_data, offset.wrapping_add(4));
         let block_size_usize = usize::try_from(block_size).unwrap_or(0);
@@ -476,7 +469,6 @@ pub fn apply_relocations(
             bail!("invalid relocation block size: {block_size_usize}");
         }
 
-        #[allow(clippy::integer_division)]
         let entry_count = (block_size_usize - 8) / 2;
         let entries_base = offset.wrapping_add(8);
 
@@ -505,7 +497,6 @@ pub fn apply_relocations(
             let rva_offset = u32::from(entry & 0x0fff);
             let target_rva = page_rva.wrapping_add(rva_offset);
 
-            #[allow(clippy::cast_possible_truncation, clippy::as_conversions)]
             match type_ {
                 0 => {
                     // IMAGE_REL_BASED_ABSOLUTE — no-op alignment padding.
@@ -699,11 +690,6 @@ pub fn load_dll(
 
     // Delta is intentionally wrapping: image_base and preferred_base are
     // close in address space; the signed difference fits in i64 for real PEs.
-    #[allow(
-        clippy::cast_possible_wrap,
-        clippy::as_conversions,
-        clippy::arithmetic_side_effects
-    )]
     let delta = image_base as i64 - preferred_base as i64;
 
     // Step 4: Build the map plan for section protections.

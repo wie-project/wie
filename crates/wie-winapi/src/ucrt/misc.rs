@@ -1,18 +1,6 @@
 //! UCRT miscellany: time, errno/IO, rand, locale, thread creation, and the
 //! MSVC C++ EH dispatch entry points.
 
-#![allow(
-    clippy::arithmetic_side_effects,
-    clippy::indexing_slicing,
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::integer_division,
-    clippy::cast_sign_loss,
-    clippy::items_after_statements,
-    clippy::cast_possible_wrap,
-    clippy::unnecessary_wraps
-)]
-
 use crate::kernel32::create_guest_thread;
 use crate::seh::{self, ThrowPayload};
 use crate::sync_obj::KernelObject;

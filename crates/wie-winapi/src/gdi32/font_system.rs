@@ -172,7 +172,6 @@ fn load_face(id: fontdb::ID) -> Option<FontArc> {
 }
 
 /// Round a px advance to an integer (the unit all metric APIs report).
-#[expect(clippy::as_conversions, clippy::cast_possible_truncation)]
 fn round_px(value: f32) -> i32 {
     value.round() as i32
 }
@@ -214,11 +213,6 @@ impl RasterizedGlyph {
 /// `#[expect(casts)]`: the glyph bbox is float-px; the coverage buffer is
 /// indexed by the integer pixel bounds (clamped to the bbox, so truncation is
 /// bounded and sign is preserved by the clamp).
-#[expect(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
 fn outline_glyph(scaled: &PxScaleFont<&FontArc>, gid: GlyphId) -> Option<RasterizedGlyph> {
     let positioned = scaled.outline_glyph(Glyph {
         id: gid,
@@ -310,7 +304,6 @@ impl ResolvedFont {
 
 /// Per-session font engine: caches only (the database is process-global).
 #[derive(Debug, Clone, Default)]
-#[expect(clippy::struct_field_names)]
 pub struct FontEngine {
     /// Loaded face + fallback flags per [`FontKey`].
     font_cache: HashMap<FontKey, (FontArc, bool, bool)>,
@@ -471,7 +464,6 @@ impl FontEngine {
 
 /// Build a [`ResolvedFont`]: scale so the line height equals `height_px`,
 /// then compute the px metrics the metric APIs report.
-#[expect(clippy::as_conversions, clippy::cast_precision_loss)]
 fn build_resolved(
     font: &FontArc,
     height_px: i32,

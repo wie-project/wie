@@ -188,10 +188,6 @@ impl WindowFlags {
 
 /// USER32 window created inside the compatibility runtime.
 #[derive(Debug, Clone, Default)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "the remaining bools (visible, invalidated, mouse_tracking, unicode contracts) are read/written directly by the runtime crate or are class-contract booleans, not window-state flags"
-)]
 pub struct WindowRecord {
     /// Runtime-owned fake HWND.
     pub handle: crate::handles::Hwnd,

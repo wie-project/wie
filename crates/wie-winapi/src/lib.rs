@@ -1,7 +1,5 @@
 //! WinAPI dispatcher model for WIE (generic PE64 userspace).
 
-#![allow(clippy::type_complexity)]
-
 pub mod advapi32;
 pub mod bottle;
 pub mod comctl32;

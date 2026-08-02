@@ -1,5 +1,3 @@
-#![allow(clippy::empty_line_after_doc_comments)]
-
 pub(crate) use crate::guest_memory::{
     checked_address, checked_field_address, read_u16 as read_guest_u16, read_u32 as read_guest_u32,
     read_u64 as read_guest_u64, write_u16 as write_guest_u16, write_u32 as write_guest_u32,

@@ -289,7 +289,6 @@ fn strip_mnemonics(text: &str) -> String {
 }
 
 /// X origin for a horizontally centered single-line control caption.
-#[allow(clippy::too_many_arguments)]
 fn centered_text_x(
     info: &ResolvedWindow,
     width: i32,

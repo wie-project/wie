@@ -440,11 +440,6 @@ fn read_three(regs: &PsRegisters, srcs: &[Operand]) -> [[f32; 4]; 3] {
 /// Convert the shader's `oC0` float4 to an `0RGB` backbuffer color
 /// (`round(v * 255)` per channel, clamped to 0..255).
 #[must_use]
-#[expect(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)] // float→u8 narrowing: clamped to [0,255] before the cast
 pub fn pixel_shader_color_to_0rgb(oc0: [f32; 4]) -> u32 {
     let channel = |v: f32| {
         let rounded = (v * 255.0).round().clamp(0.0, 255.0);
@@ -454,11 +449,6 @@ pub fn pixel_shader_color_to_0rgb(oc0: [f32; 4]) -> u32 {
 }
 /// Convert the shader's `oC0` alpha (0..1) to the blend-stage alpha byte.
 #[must_use]
-#[expect(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)] // float→u8 narrowing: clamped to [0,255] before the cast
 pub fn pixel_shader_alpha_to_u8(oc0: [f32; 4]) -> u8 {
     let a = (comp(oc0, 3) * 255.0).round().clamp(0.0, 255.0);
     a as u8

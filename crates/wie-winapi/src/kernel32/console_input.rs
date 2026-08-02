@@ -34,7 +34,6 @@ fn ret_invalid_handle(ctx: &mut HandlerContext<'_>, api: &str) -> Result<WinApiH
 /// `Read` removes the records it returns; `Peek` leaves them queued. Both block
 /// only in the `Read` case, and only when the queue is empty — that is the
 /// documented difference and what a poll loop depends on.
-#[allow(clippy::integer_division)] // deliberate truncation — bytes.len() is always a multiple
 fn read_or_peek(
     ctx: &mut HandlerContext<'_>,
     api: &str,

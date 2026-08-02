@@ -98,7 +98,6 @@ pub(super) fn edit_char(state: &mut WinApiState, hwnd: u64, char_code: u64) -> b
 /// Replace the character range `[start, end)` (clamped to the text) with
 /// `replacement`; the caret lands after the inserted text and the selection is
 /// cleared.
-#[allow(clippy::too_many_arguments)]
 fn replace_range(
     text: &mut String,
     caret: &mut usize,
@@ -306,7 +305,6 @@ fn shift_is_down(state: &WinApiState) -> bool {
 /// COLOR_WINDOWTEXT, then the selected run re-rendered in
 /// COLOR_HIGHLIGHTTEXT over its COLOR_HIGHLIGHT cells. The caret bar (1 px,
 /// full line height) is only drawn while the control has focus.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn paint_edit(
     state: &mut WinApiState,
     engine: &mut dyn wie_cpu::CpuEngine,

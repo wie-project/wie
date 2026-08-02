@@ -19,7 +19,6 @@ pub const IDENTITY: Mat4 = [
 /// bits a stream can carry — folding them into one bitfield would obscure the
 /// layout math for no size win.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[expect(clippy::struct_excessive_bools)]
 pub struct FvfLayout {
     /// Bytes consumed by the position (12 for XYZ, 16 for XYZRHW).
     pub position_bytes: u32,
@@ -118,7 +117,6 @@ fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
 /// Decode one vertex at `offset` in a batched vertex buffer (`data` holds the
 /// whole stream, `fvf` describes the per-vertex layout).
 #[must_use]
-#[expect(clippy::many_single_char_names)] // position/uv floats x/y/z/w/u/v
 pub fn parse_vertex(data: &[u8], offset: usize, fvf: &FvfLayout) -> Option<GuestVertex> {
     let mut off = offset;
     let x = read_f32(data, off)?;
@@ -176,7 +174,6 @@ pub fn parse_vertex(data: &[u8], offset: usize, fvf: &FvfLayout) -> Option<Guest
 /// `#[expect(arithmetic_side_effects)]`: the index arithmetic is bounded by
 /// the 0..4 loop ranges (max `3*4+3 = 15`), so it cannot overflow.
 #[must_use]
-#[expect(clippy::arithmetic_side_effects)]
 pub fn mat4_mul(a: &Mat4, b: &Mat4) -> Mat4 {
     let mut out = [0.0_f32; 16];
     for i in 0..4 {
@@ -198,7 +195,6 @@ pub fn mat4_mul(a: &Mat4, b: &Mat4) -> Mat4 {
 ///
 /// `#[expect(arithmetic_side_effects)]`: index arithmetic bounded by 0..4.
 #[must_use]
-#[expect(clippy::arithmetic_side_effects)]
 pub fn transform_point(v: [f32; 4], m: &Mat4) -> [f32; 4] {
     let mut out = [0.0_f32; 4];
     for (j, out_j) in out.iter_mut().enumerate() {
@@ -247,7 +243,6 @@ impl Default for Viewport {
 /// math — `f32: From<u32>` does not exist in `std`, and a 32-bit viewport
 /// coordinate (≤ ~2^24 px) cannot lose precision in `f32`'s 23-bit mantissa.
 #[must_use]
-#[expect(clippy::as_conversions, clippy::cast_precision_loss)]
 pub fn clip_to_screen(c: [f32; 4], vp: &Viewport) -> Option<(f32, f32)> {
     let [_x, _y, _z, w] = c;
     if w <= 0.0 {

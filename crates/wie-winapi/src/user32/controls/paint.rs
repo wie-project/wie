@@ -10,7 +10,6 @@ use crate::user32::{WinApiState, write_guest_ansi_c_string, write_guest_utf16_c_
 /// Fill a rect with `color`, clipped to the control's own bounds so a
 /// selection or caret running past the right edge cannot bleed into the
 /// ancestor surface.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn fill_rect_clipped(
     state: &mut WinApiState,
     info: &ResolvedWindow,

@@ -12,8 +12,6 @@
 //! - **Mingw / Itanium LSDA** (host parse of call-site table)
 //! - **MSVC FuncInfo** (host parse for `_CxxThrowException` / 7za path)
 
-#![allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
-
 use crate::exception::{self, UnwindContext};
 use crate::fake_va::seh_continue_trampoline_va;
 use crate::msvc_eh::{self, MsvcCatch};

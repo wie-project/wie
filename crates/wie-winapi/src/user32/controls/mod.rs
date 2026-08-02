@@ -202,7 +202,6 @@ impl ControlState {
 /// result is `value`. `Ok(None)` means unhandled — callers fall back to their
 /// neutral zero. `Err(..)` carries a [`WinApiControlSignal`] (a nested guest
 /// WndProc bridge for `WM_COMMAND`) or a real handler error.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_control_proc(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -221,7 +220,6 @@ impl ControlClassKind {
     /// The typed per-kind dispatch: matches `(self, WinMsg::from(message))` so
     /// each arm reads only its own variant's fields (reading `caret` on a
     /// `Button` state is a compile error).
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch(
         self,
         engine: &mut dyn wie_cpu::CpuEngine,

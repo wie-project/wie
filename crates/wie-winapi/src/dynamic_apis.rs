@@ -217,7 +217,7 @@ pub fn resolve_get_proc_address(proc_name: &str) -> Option<u64> {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::fake_va::decode;

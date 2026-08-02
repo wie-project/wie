@@ -1,18 +1,6 @@
 //! UCRT CRT startup/teardown: `_initterm`, env/argv slot exports, app type,
 //! and the exit family.
 
-#![allow(
-    clippy::arithmetic_side_effects,
-    clippy::indexing_slicing,
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::integer_division,
-    clippy::cast_sign_loss,
-    clippy::items_after_statements,
-    clippy::cast_possible_wrap,
-    clippy::unnecessary_wraps
-)]
-
 use crate::{HandlerContext, WinApiHandlerResult};
 use anyhow::{Context, Result};
 

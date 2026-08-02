@@ -171,7 +171,6 @@ impl Direct3D9Method {
     /// The raw vtable slot byte (`#[repr(u8)]` — the discriminant IS the
     /// slot, so this cannot drift from the explicit discriminants).
     #[must_use]
-    #[allow(clippy::as_conversions)] // repr(u8) discriminant is the ABI slot
     pub const fn slot(self) -> u8 {
         self as u8
     }
@@ -306,7 +305,6 @@ impl Device9Method {
     /// The raw vtable slot byte (`#[repr(u8)]` — the discriminant IS the
     /// slot, so this cannot drift from the explicit discriminants).
     #[must_use]
-    #[allow(clippy::as_conversions)] // repr(u8) discriminant is the ABI slot
     pub const fn slot(self) -> u8 {
         self as u8
     }
@@ -408,7 +406,6 @@ impl Texture9Method {
     /// The raw vtable slot byte (`#[repr(u8)]` — the discriminant IS the
     /// slot, so this cannot drift from the explicit discriminants).
     #[must_use]
-    #[allow(clippy::as_conversions)] // repr(u8) discriminant is the ABI slot
     pub const fn slot(self) -> u8 {
         self as u8
     }
@@ -457,7 +454,6 @@ impl Surface9Method {
     /// The raw vtable slot byte (`#[repr(u8)]` — the discriminant IS the
     /// slot, so this cannot drift from the explicit discriminants).
     #[must_use]
-    #[allow(clippy::as_conversions)] // repr(u8) discriminant is the ABI slot
     pub const fn slot(self) -> u8 {
         self as u8
     }
@@ -502,7 +498,6 @@ impl PixelShader9Method {
     /// The raw vtable slot byte (`#[repr(u8)]` — the discriminant IS the
     /// slot, so this cannot drift from the explicit discriminants).
     #[must_use]
-    #[allow(clippy::as_conversions)] // repr(u8) discriminant is the ABI slot
     pub const fn slot(self) -> u8 {
         self as u8
     }
@@ -546,7 +541,6 @@ impl VertexShader9Method {
     /// The raw vtable slot byte (`#[repr(u8)]` — the discriminant IS the
     /// slot, so this cannot drift from the explicit discriminants).
     #[must_use]
-    #[allow(clippy::as_conversions)] // repr(u8) discriminant is the ABI slot
     pub const fn slot(self) -> u8 {
         self as u8
     }
@@ -670,7 +664,6 @@ pub enum FakeVa {
 /// Pack `kind` + `payload` into a guest fake VA (the single encoding
 /// implementation; every public entry point below delegates to it).
 #[must_use]
-#[allow(clippy::as_conversions)] // const fn — From is not const-stable yet
 const fn encode_parts(kind: u8, payload: u16) -> u64 {
     FAKE_API_BASE | ((kind as u64) << KIND_SHIFT) | ((payload as u64) << ALIGN_SHIFT)
 }
@@ -682,7 +675,6 @@ impl FakeVa {
     /// (`encode_export`, …) are thin wrappers over this method so every kind
     /// shares one packing implementation.
     #[must_use]
-    #[allow(clippy::as_conversions)] // const fn — From is not const-stable yet
     pub const fn encode(self) -> u64 {
         match self {
             Self::Export(id) => encode_parts(KIND_EXPORT, id.to_u16()),
@@ -747,11 +739,6 @@ pub const fn seh_continue_trampoline_va() -> u64 {
 
 /// Decode a guest VA into a [`FakeVa`], if it lies in the fake-API window.
 #[must_use]
-#[allow(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::arithmetic_side_effects
-)] // bitfield decode: checked window, then truncating payload/kind extracts
 pub fn decode(va: u64) -> Option<FakeVa> {
     if va < FAKE_API_BASE {
         return None;
