@@ -16,6 +16,8 @@ If you want to help this project and offer your own improvements, corrections or
 
 6. **Lint opt-in** - Only `wie-cpu` and `wie-winapi` opt into the workspace lints (`lints.workspace = true`); the other crates do not inherit them. The rustc denies (`unsafe_code`, unused imports, …) still apply to the crates that opted in. `.expect()` in tests is legal everywhere.
 
+7. **Doc comments** - Every `pub` item gets a `///` doc; noun-phrase fragments carry no trailing period, complete sentences do. Pick one verb style per file (imperative "Return the…" or declarative "Returns the…") and stay consistent. Every file gets a `//!` module doc (1–3 sentences: what the module is and why it exists separately) — no "extracted from" boilerplate. Backtick identifiers in prose; "guest VA" is the canonical term for guest virtual addresses. No lane/ticket tokens (P4c, B9, "this lane") in doc comments. Every `unsafe` block requires a `// SAFETY:` comment stating the invariants the caller must uphold.
+
 After all the stages have been completed, you can safely send your pull request.
 
 ### Using AI in PR:
