@@ -125,7 +125,7 @@ const ERRNO_VA: u64 = 0x7EFD_0070;
 /// Tag in the high 16 bits of every guest-visible pthread object id.
 ///
 /// Chosen so the value is a positive `intptr_t` (never mistaken for one of the
-/// negative static initialisers) and never a plausible guest pointer.
+/// negative static initialisers) and never a plausible guest VA.
 pub const PT_TAG: u64 = 0x5054_0000_0000_0000;
 const PT_TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
 

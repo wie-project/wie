@@ -536,7 +536,7 @@ fn handle_text_out_impl(
             let rendered: Result<()> = if let Some((key, resolved)) = resolved {
                 match resolve_text_target(state, hdc) {
                     Some(ResolvedTextTarget { mut target, .. }) => {
-                        // Publish-model rework (ora-5): window-DC text no
+                        // Window-DC text no
                         // longer marks a dirty rect — every publish is a full
                         // frame, so the exact band is irrelevant.
                         let _band = render_run(

@@ -363,7 +363,7 @@ fn clip_to_screen_maps_ndc() {
     // NDC (1, -1) → bottom-right corner.
     let (sx, sy) = clip_to_screen([1.0, -1.0, 0.0, 1.0], &vp).expect("in front");
     assert_eq!((sx, sy), (110.0, 70.0));
-    // w=0 (on the near plane) → rejected.
+    // w=0 (on the near-plane) → rejected.
     assert!(clip_to_screen([0.0, 0.0, 0.0, 0.0], &vp).is_none());
     // w<0 (behind the camera) → rejected.
     assert!(clip_to_screen([0.0, 0.0, 0.0, -1.0], &vp).is_none());
@@ -698,7 +698,7 @@ fn texture_stage_state_defaults() {
     assert!(stage.other_sampler.is_empty());
 }
 
-// ── P5a: pixel-shader interpreter tests ────────────────────────────
+// ── pixel-shader interpreter tests ─────────────────────────────────
 
 /// Build a one-constant program with the given instructions.
 fn program(instructions: Vec<PsInstruction>, constants: &[[f32; 4]; 32]) -> PsProgram<'static> {

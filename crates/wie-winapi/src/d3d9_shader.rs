@@ -1,4 +1,4 @@
-//! P5a: D3D9 shader bytecode tokenizer + parsed shader model.
+//! D3D9 shader bytecode tokenizer + parsed shader model.
 //!
 //! Parses the ps_2_0 / vs_2_0 DWORD token stream at `Create*Shader` time into a
 //! typed instruction list the pixel-shader interpreter (`d3d9_render.rs`)
@@ -6,8 +6,8 @@
 //! below is transcribed from the Windows SDK `d3d9shader.h` /
 //! `d3d9types.h` definitions (verified against the mingw-w64 shipped copies of
 //! `d3d9.h` / `d3d9types.h` on this machine), which is also the format Wine's
-//! d3d9 shader reader consumes. Do not "fix" these from memory — the P4c lane
-//! proved slot values drift; the authoritative header values are the ones here.
+//! d3d9 shader reader consumes. Do not "fix" these from memory — slot values
+//! drift across D3D9 header versions; the authoritative values are the ones here.
 //!
 //! Token layout (D3D9, from d3d9shader.h):
 //! - Version token: `0xFFFF0000 | (major << 8) | minor` for pixel shaders
@@ -225,9 +225,9 @@ pub const VS_CONST_COUNT: usize = 256;
 /// Which programmable stage a shader targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShaderKind {
-    /// Pixel shader (`ps_2_x`; executed by the fragment stage this lane).
+    /// Pixel shader (`ps_2_x`; executed by the fragment stage).
     Pixel,
-    /// Vertex shader (`vs_2_x`; stored/bound, execution deferred to P5a-2).
+    /// Vertex shader (`vs_2_x`; stored/bound, execution not yet implemented).
     Vertex,
 }
 
@@ -341,7 +341,7 @@ pub enum PsOp {
     Dcl,
     /// `end`.
     End,
-    /// Structurally valid but not executable this lane (`P5a-2`).
+    /// Structurally valid but not executable (not yet implemented).
     Unsupported(u32),
 }
 
@@ -374,13 +374,13 @@ pub struct ParsedShader {
 }
 
 impl ParsedShader {
-    /// Whether every instruction is in the P5a-1 executable subset.
+    /// Whether every instruction is in the executable subset.
     ///
     /// The interpreter implements the arithmetic core (`NOP`/`MOV`/`ADD`/
     /// `SUB`/`MAD`/`MUL`/`DP3`/`DP4`/`MIN`/`MAX`/`SLT`/`SGE`/`EXP`/`LOG`/
     /// `LRP`/`FRC`/`CMP`/`RCP`/`RSQ`/`TEX`/`TEXKILL` + `DEF`/`DCL`/`END`);
     /// everything else (`LIT`, `POW`, `ABS`, flow control, …) parses but is
-    /// rejected at `Create*Shader` with `D3DERR_INVALIDCALL` (P5a-2).
+    /// rejected at `Create*Shader` with `D3DERR_INVALIDCALL` (not yet implemented).
     #[must_use]
     pub fn is_fully_executable(&self) -> bool {
         self.instructions
@@ -820,7 +820,7 @@ mod tests {
     #[test]
     fn tokenizer_rejects_unsupported_version() {
         let mut bytecode = micro_exe_shader();
-        *bytecode.first_mut().expect("bytecode has a version token") = 0xFFFF_0300; // ps_3_0 — not this lane
+        *bytecode.first_mut().expect("bytecode has a version token") = 0xFFFF_0300; // ps_3_0 — unsupported
         assert!(parse_shader(&bytecode).is_err());
     }
 

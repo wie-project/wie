@@ -49,7 +49,7 @@ pub struct TextureRecord {
 ///
 /// Depth values are `f32` in `0.0 = near` .. `1.0 = far` (D3D9's cleared
 /// default). `D3DFMT_D24S8` stores depth only — the stencil bits are unused
-/// (documented; stencil ops are out of P4c scope).
+/// (documented; stencil operations are not modeled).
 #[derive(Debug, Clone)]
 pub struct DepthStencilRecord {
     /// The surface object's guest VA (also the `IDirect3DSurface9` pointer).

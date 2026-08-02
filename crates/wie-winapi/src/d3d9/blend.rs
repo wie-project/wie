@@ -11,7 +11,7 @@ use crate::d3d9_render::{
 use crate::guest_memory::{write_u32 as write_guest_u32, write_u64 as write_guest_u64};
 use crate::{HandlerContext, WinApiHandlerResult};
 
-// ── P4c blend + depth handlers ──────────────────────────────────────────
+// ── blend + depth handlers ──────────────────────────────────────────────
 
 /// Handles `IDirect3DDevice9::GetRenderState` (vtable slot 58).
 pub fn handle_get_render_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {

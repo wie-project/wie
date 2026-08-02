@@ -50,9 +50,9 @@ pub(crate) fn write_u64(
         .context("failed to write u64 to guest memory")
 }
 
-/// Compute a guest address with wrapping arithmetic.
+/// Compute a guest VA with wrapping arithmetic.
 ///
-/// Guest addresses are checked at allocation time (bounded to <48-bit VA), so
+/// Guest VAs are checked at allocation time (bounded to <48-bit VA), so
 /// overflow on field-offset computation is a programming error.  Using
 /// `wrapping_add` avoids the checked-branch on every handler memory access.
 #[must_use]
@@ -60,7 +60,7 @@ pub(crate) fn checked_field_address(base: u64, offset: u64, _field_name: &str) -
     base.wrapping_add(offset)
 }
 
-/// Compute a guest address with wrapping arithmetic.
+/// Compute a guest VA with wrapping arithmetic.
 ///
 /// See [`checked_field_address`] for rationale.
 #[must_use]

@@ -41,7 +41,7 @@ pub const KIND_SPECIAL: u8 = 2;
 /// Alias of a `WinApiId` (host fallback) or soft/unresolved slot.
 pub const KIND_SOFT: u8 = 3;
 
-/// Soft payloads below this are `WinApiId` aliases; at/above are unresolved indices.
+/// Soft payloads below this: `WinApiId` aliases; at/above: unresolved indices.
 pub const SOFT_UNRESOLVED_BASE: u16 = 0x8000;
 
 /// `kind=Special` payload: USER32 guest WndProc return trampoline.
@@ -236,7 +236,7 @@ pub enum Device9Method {
     DrawPrimitiveUp = 83,
     DrawIndexedPrimitiveUp = 84,
     SetFvf = 89,
-    // ── P5a shader methods (slots verified against d3d9.h) ──────────────
+    // ── shader methods (slots verified against d3d9.h) ─────────────────
     CreateVertexShader = 91,
     SetVertexShader = 92,
     GetVertexShader = 93,
@@ -471,7 +471,7 @@ impl Surface9Method {
 }
 
 /// `IDirect3DPixelShader9` vtable method. The interface is IUnknown-only, so
-/// the vtable is the 3-slot COM trio (P5a: only Release has a handler).
+/// the vtable is the 3-slot COM trio (only Release has a handler).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelShader9Method {
@@ -514,7 +514,7 @@ impl PixelShader9Method {
 }
 
 /// `IDirect3DVertexShader9` vtable method. IUnknown-only, like the pixel
-/// shader (P5a: only Release has a handler).
+/// shader (only Release has a handler).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VertexShader9Method {
@@ -884,7 +884,7 @@ mod tests {
             assert_eq!(method.slot(), slot);
         }
         assert_eq!(D3d9Iface::Unknown(9).as_u8(), 9);
-        // P5a iface bytes 4 and 5 decode to the shader interfaces.
+        // Iface bytes 4 and 5 decode to the shader interfaces.
         assert_eq!(D3d9Iface::from_u8(4), D3d9Iface::PixelShader9);
         assert_eq!(D3d9Iface::from_u8(5), D3d9Iface::VertexShader9);
     }
@@ -924,7 +924,7 @@ mod tests {
         assert_eq!(Device9Method::Present.slot(), 17);
         assert_eq!(Device9Method::SetRenderState.slot(), 57);
         assert_eq!(Device9Method::SetIndices.slot(), 104);
-        // P5a device shader methods (slots verified against d3d9.h).
+        // Device shader methods (slots verified against d3d9.h).
         assert_eq!(
             Device9Method::from_u8(91),
             Some(Device9Method::CreateVertexShader)

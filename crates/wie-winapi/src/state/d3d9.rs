@@ -73,12 +73,12 @@ pub struct D3D9State {
     pub(crate) d3d9_surface_textures: HashMap<u64, u64>,
     /// Per-stage (0..8) texture binding (0 = none).
     pub(crate) d3d9_texture_bindings: [u64; 8],
-    // ── P4c depth-stencil state ─────────────────────────────────────────
+    // ── depth-stencil state ────────────────────────────────────────────
     /// Depth-stencil surfaces keyed by the surface object's guest VA.
     pub(crate) d3d9_depth_surfaces: HashMap<u64, crate::d3d9::DepthStencilRecord>,
     /// Bound depth-stencil surface VA (0 = none).
     pub(crate) d3d9_depth_stencil: u64,
-    // ── P5a shader state ────────────────────────────────────────────────
+    // ── shader state ───────────────────────────────────────────────────
     /// Pixel/vertex shader records keyed by the shader object's guest VA.
     pub(crate) d3d9_shaders: HashMap<u64, crate::d3d9_shader::ShaderRecord>,
     /// Bound pixel shader VA (0 = none — the FFP path runs).
@@ -87,7 +87,7 @@ pub struct D3D9State {
     /// `SetPixelShaderConstantF`; `def` at Create* time writes these too).
     pub(crate) d3d9_ps_constants: [[f32; 4]; crate::d3d9_shader::PS_CONST_COUNT],
     /// Vertex-shader constant registers `c0..c255` (stored; the vertex stage
-    /// stays FFP until P5a-2 executes vertex shaders).
+    /// stays FFP until vertex shaders execute).
     pub(crate) d3d9_vs_constants: [[f32; 4]; crate::d3d9_shader::VS_CONST_COUNT],
 }
 

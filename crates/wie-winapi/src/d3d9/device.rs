@@ -418,7 +418,7 @@ pub fn handle_clear(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult>
     let clear_depth = flags & D3DCLEAR_ZBUFFER != 0;
     let z_value = f32::from_bits(u32::try_from(z_raw & u64::from(u32::MAX)).unwrap_or(0));
     if clear_depth {
-        // P4c: clear the bound depth buffer (0.0 = near). No depth surface
+        // Clear the bound depth buffer (0.0 = near). No depth surface
         // bound → a no-op (documented), matching D3D9's behavior.
         let depth_stencil = state.d3d9().d3d9_depth_stencil;
         if let Some(record) = state.d3d9().d3d9_depth_surfaces.get_mut(&depth_stencil) {

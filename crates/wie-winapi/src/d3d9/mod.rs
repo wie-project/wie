@@ -108,7 +108,7 @@ pub(crate) const D3DFMT_INDEX32: u32 = 102;
 /// `D3DFMT_A8R8G8B8` — 32-bpp with alpha (texels stored `0xAARRGGBB`).
 pub(crate) const D3DFMT_A8R8G8B8: u32 = 21;
 
-/// `D3DFMT_D24S8` — 32-bpp depth+stencil (75; stencil bits unused in P4c).
+/// `D3DFMT_D24S8` — 32-bpp depth+stencil (75; stencil bits unused).
 pub(crate) const D3DFMT_D24S8: u32 = 75;
 /// `D3DFMT_D16` — 16-bpp depth (80).
 pub(crate) const D3DFMT_D16: u32 = 80;
@@ -362,16 +362,16 @@ pub fn handle_get_device_caps(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         // MaxStreamStride
         write_caps_u32(engine, caps_address, 192, 255, "MaxStreamStride")?;
 
-        // VertexShaderVersion — P5a caps honesty: the vertex stage is still
-        // the FFP Gouraud path (vs execution is P5a-2), so this stays 0 —
-        // games branching on `VertexShaderVersion != 0` take the FFP path
-        // they actually get.
+        // VertexShaderVersion — caps honesty: the vertex stage is still the
+        // FFP Gouraud path (vertex shader execution is not yet implemented),
+        // so this stays 0 — games branching on `VertexShaderVersion != 0`
+        // take the FFP path they actually get.
 
         // MaxVertexShaderConst — the vs_2_0 constant file is implemented
-        // (256 float4s; used when P5a-2 executes vertex shaders).
+        // (256 float4s; the size the caps report).
         write_caps_u32(engine, caps_address, 200, 256, "MaxVertexShaderConst")?;
 
-        // PixelShaderVersion — P5a: the ps_2_0 interpreter runs in the
+        // PixelShaderVersion — the ps_2_0 interpreter runs in the
         // fragment stage, so the caps honestly report D3DPS_VERSION(2,0) =
         // 0xFFFF0200. (PS20Caps stays zeroed — games gate on the version.)
         write_caps_u32(

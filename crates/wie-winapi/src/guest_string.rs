@@ -1,3 +1,7 @@
+//! Guest string helpers: page-safe guest reads plus UTF-16 / ANSI / UTF-8
+//! conversions at the guest–host boundary. Reads stop at 4 KiB page
+//! boundaries so an unmapped tail page cannot fail a valid prefix.
+
 use anyhow::{Context, Result};
 
 /// 4 KiB — the guest page size. Bulk reads stop at the page boundary so an

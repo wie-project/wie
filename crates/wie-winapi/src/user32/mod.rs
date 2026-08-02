@@ -1,3 +1,7 @@
+//! USER32 handlers: window management, messages, dialogs, controls, input,
+//! menus, and display. Submodules split handlers by concern; this file
+//! re-exports the shared guest-memory/string helpers and fake handles.
+
 pub(crate) use crate::guest_memory::{
     checked_field_address, read_bytes as read_guest_bytes, read_i32 as read_guest_i32,
     read_u32 as read_guest_u32, read_u64 as read_guest_u64, write_bytes as write_guest_bytes,
@@ -257,8 +261,8 @@ pub(crate) fn write_wide_window_text(
     u64::try_from(copied).context("wide window text length does not fit u64")
 }
 
-///
-/// Fills `PAINTSTRUCT` with a fake HDC and client rect; real painting is stubbed.
+/// Reinterpret a raw `GetWindowLongPtr*` index (a zero-extended `i32`) as
+/// the signed `i64` slot it denotes.
 pub(crate) fn window_long_ptr_index(index_raw: u64, api_name: &str) -> Result<i64> {
     let index_low = u32::try_from(index_raw)
         .with_context(|| format!("{api_name} index does not fit in u32"))?;
@@ -266,6 +270,7 @@ pub(crate) fn window_long_ptr_index(index_raw: u64, api_name: &str) -> Result<i6
     Ok(i64::from(i32::from_ne_bytes(index_low.to_ne_bytes())))
 }
 
+/// Read the stored value for `(window_handle, index)`, or 0 if never set.
 pub(crate) fn get_window_long_ptr_value(
     window_handle: u64,
     index_raw: u64,
@@ -284,6 +289,7 @@ pub(crate) fn get_window_long_ptr_value(
         .map_or(0, |(_, _, value)| *value))
 }
 
+/// Store `new_value` for `(window_handle, index)`; returns the previous value.
 pub(crate) fn set_window_long_ptr_value(
     window_handle: u64,
     index_raw: u64,

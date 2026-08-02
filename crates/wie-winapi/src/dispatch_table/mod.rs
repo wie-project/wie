@@ -464,7 +464,8 @@ const _: () = assert!(
 /// Highest-numbered [`WinApiId`]; update alongside the enum's final variant.
 const LAST_WINAPI_ID: WinApiId = WinApiId::D3d9Idirect3dvertexshader9Release;
 
-/// Hot-path dispatch: integer match (LLVM jump table), no string work.
+/// Hot-path dispatch: dense `u16` match over the `WinApiId` discriminant
+/// (LLVM jump table) with no string comparison — runs once per host API stop.
 pub fn dispatch_winapi_id(
     ctx: &mut HandlerContext<'_>,
     id: WinApiId,

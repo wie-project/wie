@@ -3323,7 +3323,7 @@ fn test_invalidate_rect_partial_publish_region() {
         .expect("full frame");
     assert_eq!((frame.width, frame.height), (200, 100));
     assert_eq!(frame.pixels.len(), 200 * 100);
-    // Publish-model rework (ora-5): every publish is full — no region.
+    // Every publish is full — no region.
     // Partial InvalidateRect(hwnd, {10,20,40,60}): the WM_PAINT synthesis
     // flag is set AND the publish-side dirty rect accumulates the rect.
     write_regs(&mut engine, hwnd, 0x2000, 1, 0, 0);
@@ -3369,7 +3369,7 @@ fn test_invalidate_rect_partial_publish_region() {
         .published
         .get(&crate::handles::Hwnd::from(hwnd))
         .expect("partial frame");
-    // Publish-model rework (ora-5): every publish is full — no region.
+    // Every publish is full — no region.
     assert_eq!((frame.width, frame.height), (200, 100));
     assert_eq!(frame.pixels.len(), 200 * 100);
 
@@ -3427,10 +3427,11 @@ fn test_d3d9_caps_declare_pixel_shader_pipeline() {
             .expect("read caps field");
         u32::from_le_bytes(bytes)
     };
-    // P5a caps honesty: the ps_2_0 interpreter is implemented, so the caps
+    // Caps honesty: the ps_2_0 interpreter is implemented, so the caps
     // report D3DPS_VERSION(2,0) and PixelShader1xMaxValue 1.0; the vertex
-    // stage is still FFP (vs_2_0 execution is P5a-2), so VertexShaderVersion
-    // stays 0 and MaxVertexShaderConst reports the vs_2_0 constant file.
+    // stage is still FFP (vertex shader execution is not yet implemented),
+    // so VertexShaderVersion stays 0 and MaxVertexShaderConst reports the
+    // vs_2_0 constant file.
     assert_eq!(read_u32_at(196), 0, "VertexShaderVersion must be 0.0");
     assert_eq!(
         read_u32_at(200),

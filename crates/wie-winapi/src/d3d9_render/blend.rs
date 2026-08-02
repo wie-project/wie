@@ -315,7 +315,7 @@ pub(super) fn edge_inside(e: f32, dx: f32, dy: f32) -> bool {
     e > 0.0 || (e == 0.0 && is_top_or_left_edge(dx, dy))
 }
 /// Blend three `0xAARRGGBB` colors by barycentric weights → `0xAARRGGBB`
-/// (the alpha feeds the P4c blend factors; the backbuffer masks it).
+/// (the alpha feeds the blend factors; the backbuffer masks it).
 ///
 /// `#[expect(casts)]`: channel bytes widen to `f32` for the weighted sum and
 /// the result narrows back — `std` has no lossless float↔int `From`. The

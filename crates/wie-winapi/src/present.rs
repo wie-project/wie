@@ -211,7 +211,7 @@ impl PresentState {
         // (matches the pre-B1 semantics — the recycled buffer may carry the
         // previous frame's size after a resize).
         if entry.width != width || entry.height != height {
-            // Publish-model rework (ora-5): the surface size changed — the old
+            // The surface size changed — the old
             // row-major buffer does not map onto the new dimensions. Reusing
             // it (a plain `resize` keeps the first N elements) would surface
             // misaligned stale pixels in the WS_CLIPCHILDREN-clipped child
@@ -254,7 +254,7 @@ impl PresentState {
             let pixels: Arc<Vec<u32>> = Arc::from(std::mem::take(&mut surface.pixels));
             (surface.width, surface.height, pixels)
         };
-        // Publish-model rework (ora-5): ALWAYS a full frame. The region-delta
+        // ALWAYS a full frame. The region-delta
         // contract ("changes since the last guest publish") cannot survive B2
         // present skipping — a publish that loses the event-loop race has its
         // delta permanently absent from the wgpu staging texture, which holds
@@ -376,7 +376,7 @@ mod tests {
         assert!(state.pending_publishes.is_empty());
 
         let _frame = state.published.get(&hwnd).expect("frame published");
-        // Publish-model rework (ora-5): every frame is full — no region.
+        // Every frame is full — no region.
         // The publish moved the painted buffer into the Arc; the surface is
         // empty and will be handed back by the next ensure_surface (B1).
         assert!(

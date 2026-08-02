@@ -195,7 +195,7 @@ pub(crate) fn handle_duplicate_handle(ctx: &mut HandlerContext<'_>) -> Result<Wi
     // RCX = hSourceProcessHandle
     // RDX = hSourceHandle
     // R8  = hTargetProcessHandle
-    // R9  = lpTargetHandle (guest pointer for the duplicated handle)
+    // R9  = lpTargetHandle (guest VA for the duplicated handle)
     // [RSP+0x28] = dwDesiredAccess
     // [RSP+0x30] = bInheritHandle
     // [RSP+0x38] = dwOptions

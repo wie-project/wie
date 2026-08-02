@@ -406,7 +406,7 @@ pub(crate) fn fill_rect_surface(
             }
         }
     }
-    // Publish-model rework (ora-5): always defer — the runtime drains pending
+    // Always defer — the runtime drains pending
     // publishes once per repaint cycle at the empty-queue quiescence point,
     // so a WM_PAINT cycle's erase + BitBlt + control paints + captions emit a
     // single complete frame.

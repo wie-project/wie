@@ -257,7 +257,7 @@ fn resolve_ps_samplers<'a>(
 /// `data` is the full vertex pool; `triples` names each triangle; `indices`
 /// (when present) resolves triangle corners through an index buffer. Reads
 /// the world × view × projection transform and viewport from device state,
-/// rejects triangles behind the near plane, and accumulates the dirty region.
+/// rejects triangles behind the near-plane, and accumulates the dirty region.
 /// When a stage-0 texture is bound and enabled, the fragment stage samples it.
 fn rasterize_vertex_stream(
     state: &mut WinApiState,

@@ -1,4 +1,4 @@
-//! P5a: the PS 2.0 fragment interpreter.
+//! The PS 2.0 pixel-shader interpreter.
 
 use super::sample::{TextureStage, sample_texture};
 use crate::d3d9_shader::{
@@ -7,7 +7,7 @@ use crate::d3d9_shader::{
     PS_INPUT_COUNT, PS_SAMPLER_COUNT, PS_TEMP_COUNT, PsInstruction, PsOp, RegType,
 };
 
-// ── P5a: PS 2.0 interpreter (fragment stage) ───────────────────────────
+// ── PS 2.0 interpreter (fragment stage) ────────────────────────────────
 
 /// Executable pixel-shader program for one draw: the tokenized instructions
 /// plus the constant and sampler state resolved at the draw boundary.
@@ -54,7 +54,7 @@ fn comp(value: [f32; 4], i: usize) -> f32 {
 ///
 /// `DZ`/`DW` (texcoord-depth modifiers) and `NOT` (boolean registers) are
 /// unmodeled and read as identity — they do not occur in the ps_2_0 subset
-/// this lane executes (documented).
+/// the interpreter executes.
 #[must_use]
 fn apply_src_mod(value: [f32; 4], src_mod: u8) -> [f32; 4] {
     let [x, y, z, w] = value;
@@ -126,7 +126,7 @@ fn read_operand(regs: &PsRegisters, op: &Operand) -> [f32; 4] {
 ///
 /// `_sat` clamps the written components to `[0, 1]`; `_pp` (partial
 /// precision) is ignored (full f32 precision, documented). `oDepth` writes
-/// are stored nowhere this lane — the fragment depth is still the interpolated
+/// are stored nowhere — the fragment depth is still the interpolated
 /// z (documented; deferred with the vertex stage).
 fn write_operand(regs: &mut PsRegisters, op: &Operand, value: [f32; 4]) {
     let mut result = value;
@@ -138,7 +138,7 @@ fn write_operand(regs: &mut PsRegisters, op: &Operand, value: [f32; 4]) {
     let target = match op.reg_type {
         RegType::Temp => regs.temp.get_mut(usize::from(op.reg_num)),
         RegType::ColorOut => Some(&mut regs.output),
-        _ => None, // oDepth etc. not applied this lane
+        _ => None, // oDepth etc. not applied
     };
     let Some(target) = target else { return };
     let [x, y, z, w] = result;

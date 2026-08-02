@@ -302,6 +302,7 @@ impl WinApiState {
         self.dll_states
             .get_or_init::<console::ConsoleState>(DllId::Console)
     }
+    /// Mutable access to window state (windows, focus/capture, menus).
     pub fn window_state(&mut self) -> &mut WindowState {
         self.dll_states.get_or_init::<WindowState>(DllId::Window)
     }
@@ -312,9 +313,11 @@ impl WinApiState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+    /// Mutable access to D3D9 state (devices, textures, surfaces).
     pub fn d3d9(&mut self) -> &mut D3D9State {
         self.dll_states.get_or_init::<D3D9State>(DllId::D3D9)
     }
+    /// Mutable access to pthread state (condvars, wait queues).
     pub fn pthread(&mut self) -> &mut pthread::PthreadState {
         self.dll_states
             .get_or_init::<pthread::PthreadState>(DllId::Pthread)
@@ -336,18 +339,23 @@ impl WinApiState {
     pub fn try_console(&self) -> Option<&console::ConsoleState> {
         self.dll_states.get::<console::ConsoleState>(DllId::Console)
     }
+    /// Read-only access — returns `None` if the state was never initialised.
     pub fn try_window_state(&self) -> Option<&WindowState> {
         self.dll_states.get::<WindowState>(DllId::Window)
     }
+    /// Read-only access — returns `None` if the state was never initialised.
     pub fn try_d3d9(&self) -> Option<&D3D9State> {
         self.dll_states.get::<D3D9State>(DllId::D3D9)
     }
+    /// Read-only access — returns `None` if the state was never initialised.
     pub fn try_pthread(&self) -> Option<&pthread::PthreadState> {
         self.dll_states.get::<pthread::PthreadState>(DllId::Pthread)
     }
+    /// Read-only access — returns `None` if the state was never initialised.
     pub fn try_gdi_state(&self) -> Option<&gdi32::GdiState> {
         self.dll_states.get::<gdi32::GdiState>(DllId::Gdi)
     }
+    /// Read-only access — returns `None` if the state was never initialised.
     pub fn try_present(&self) -> Option<&present::PresentState> {
         self.dll_states.get::<present::PresentState>(DllId::Present)
     }

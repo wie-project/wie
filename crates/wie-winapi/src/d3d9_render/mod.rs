@@ -6,7 +6,7 @@
 //! flat-vertex diffuse colors, a fixed-function world × view × projection
 //! transform, near-plane rejection, and a top-left-rule fill with barycentric
 //! color interpolation. No textures, lighting, or z-buffer (draw order).
-//! P5a adds the PS 2.0 interpreter in the fragment stage.
+//! The PS 2.0 interpreter runs in the fragment stage.
 //!
 //! Submodules: [`vertex`] (FVF layout + transform), [`sample`] (texture-stage
 //! sampling + FFP color ops), [`blend`] (typed render-state enums, depth test,
@@ -312,7 +312,7 @@ impl Default for TextureStageState {
 /// When `ps` is present (a pixel shader is bound), the fragment stage runs the
 /// PS 2.0 interpreter instead of the FFP color/alpha ops: `oC0` feeds the
 /// blend stage exactly where the FFP result would. `texkill` discards the
-/// fragment (no color write, no depth write). Blend + depth from P4c apply
+/// fragment (no color write, no depth write). Blend + depth apply
 /// identically after the shader output is resolved.
 ///
 /// `frag` carries the blend + depth configuration: the depth is affine-
@@ -616,7 +616,7 @@ fn flush_pixel_batch(
 /// Rasterize one triangle of already-transformed [`GuestVertex`]s.
 ///
 /// `pre_transformed` (`XYZRHW`) vertices bypass the matrix/viewport and use
-/// their X/Y as screen pixels directly. Any vertex at/behind the near plane
+/// their X/Y as screen pixels directly. Any vertex at/behind the near-plane
 /// rejects the whole triangle (slice 1 limitation — no near-plane clipping).
 pub fn draw_triangle(
     backbuffer: &mut [u32],

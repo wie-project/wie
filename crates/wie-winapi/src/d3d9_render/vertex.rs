@@ -237,7 +237,7 @@ impl Default for Viewport {
     }
 }
 /// Map a clip-space vertex to screen pixels; `None` when the vertex is at or
-/// behind the near plane (`w <= 0`) — slice 1 rejects the whole triangle.
+/// behind the near-plane (`w <= 0`) — slice 1 rejects the whole triangle.
 ///
 /// `#[expect(casts)]`: viewport fields are `u32` but the mapping is float
 /// math — `f32: From<u32>` does not exist in `std`, and a 32-bit viewport

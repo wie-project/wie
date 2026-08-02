@@ -8,7 +8,7 @@ use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 
 use super::texture::fill_com_vtable;
 
-// ── P5a shader objects ─────────────────────────────────────────────────
+// ── shader objects ─────────────────────────────────────────────────────
 //
 // Shader objects are fake COM allocations (vtable + object) like textures;
 // the guest holds the object pointer and calls the IUnknown trio through the
@@ -23,12 +23,12 @@ const IDIRECT3DSHADER9_ALLOCATION_SIZE: u64 = 0x40;
 /// Offset of the COM object after the 3-entry vtable.
 const IDIRECT3DSHADER9_OBJECT_OFFSET: u64 = 0x20;
 
-/// Walk the guest bytecode pointer and copy it host-side.
+/// Walk the guest bytecode and copy it host-side.
 ///
-/// Reads DWORD tokens one at a time (never holds a guest pointer); stops at
-/// the `end` opcode. The instruction-length walk uses the same per-opcode
-/// operand counts as the tokenizer, so malformed streams fail here with
-/// `D3DERR_INVALIDCALL` rather than reading past the buffer.
+/// Reads DWORD tokens one at a time through the engine (no raw pointer
+/// retained); stops at the `end` opcode. The instruction-length walk uses the
+/// same per-opcode operand counts as the tokenizer, so malformed streams fail
+/// here with `D3DERR_INVALIDCALL` rather than reading past the buffer.
 fn read_shader_bytecode(
     engine: &mut dyn wie_cpu::CpuEngine,
     bytecode_ptr: u64,
@@ -115,8 +115,8 @@ fn allocate_shader_object(
 /// Handles `IDirect3DDevice9::CreatePixelShader` (vtable slot 106).
 ///
 /// Copies the guest bytecode (ps_2_0 family only), tokenizes it, and rejects
-/// malformed bytecode or shaders whose opcodes the P5a-1 interpreter cannot
-/// execute (`D3DERR_INVALIDCALL` — the full instruction set is P5a-2).
+/// malformed bytecode or shaders whose opcodes the interpreter cannot
+/// execute (`D3DERR_INVALIDCALL` — the full instruction set is not yet implemented).
 pub fn handle_create_pixel_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
@@ -192,8 +192,8 @@ pub fn handle_create_pixel_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 /// Handles `IDirect3DDevice9::CreateVertexShader` (vtable slot 91).
 ///
 /// Accepts vs_2_0 bytecode and stores the object (it must round-trip and
-/// bind); the vertex stage keeps the FFP Gouraud path until P5a-2 executes
-/// vertex shaders.
+/// bind); the vertex stage keeps the FFP Gouraud path until vertex shaders
+/// execute.
 pub fn handle_create_vertex_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
@@ -509,7 +509,7 @@ pub fn handle_get_pixel_shader_constant_f(
 /// Handles `IDirect3DDevice9::SetVertexShaderConstantF` (vtable slot 94).
 ///
 /// Stores into the vs_2_0 constant file (256 float4s); the values are used
-/// when P5a-2 executes vertex shaders.
+/// when vertex shaders execute.
 pub fn handle_set_vertex_shader_constant_f(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
