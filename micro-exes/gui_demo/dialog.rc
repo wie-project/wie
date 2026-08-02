@@ -1,0 +1,15 @@
+// Modal-dialog RT_DIALOG fixture for gui_demo.exe.
+// Compile: x86_64-w64-mingw32-windres gui_demo/dialog.rc -o out/gui_demo_res.o
+// Uses plain DIALOG (not DIALOGEX) — windres emits the standard DLGTEMPLATE.
+// Template id 100: an EDIT (1003) + OK/Cancel push buttons.
+
+100 DIALOG 10, 20, 180, 70
+STYLE 0x00000040 | 0x80000000 | 0x00C00000
+CAPTION "WIE Demo Dialog"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    LTEXT "Enter text:", 1002, 10, 10, 60, 10
+    EDITTEXT 1003, 10, 24, 160, 14
+    DEFPUSHBUTTON "OK", 1, 20, 44, 60, 20
+    PUSHBUTTON "Cancel", 2, 100, 44, 60, 20
+END

@@ -9,7 +9,8 @@
 //   - GetClassNameA round-trip
 //   - SetClassLongPtrA / GetClassLongPtrA storage
 //   - GetSystemMetrics full table
-//   - CreateSolidBrush / FillRect / PatBlt in WM_PAINT
+//   - WM_PAINT draws a hint pointing at the menu bar (the window body
+//     itself stays empty — the menus live in the macOS top bar)
 //   - WM_PAINT synthesis from InvalidateRect
 //
 // The guest only calls PostQuitMessage after TIMER_TICKS WM_TIMER messages,
@@ -73,15 +74,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
 
-        RECT rc = { 0, 0, 100, 100 };
-        HBRUSH brush = CreateSolidBrush(0x0000FF00); // green
-        if (brush) {
-            FillRect(hdc, &rc, brush);
-            DeleteObject(brush);
-        }
-
-        // PatBlt uses the DC's current brush (default WHITE_BRUSH).
-        PatBlt(hdc, 120, 20, 60, 60, PATCOPY);
+        // The window body is deliberately empty: the menu lives in the
+        // macOS top bar, mirrored from the guest's File/Help menus.
+        // Just point the user at it.
+        SetBkMode(hdc, TRANSPARENT);
+        RECT rc = { 20, 20, 1260, 200 };
+        DrawTextA(hdc, "Use the File and Help menus in the menu bar above.",
+                  -1, &rc, DT_LEFT | DT_SINGLELINE);
+        rc.top = 44;
+        DrawTextA(hdc, "File > Exit closes the window.", -1, &rc,
+                  DT_LEFT | DT_SINGLELINE);
 
         EndPaint(hwnd, &ps);
         return 0;

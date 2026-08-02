@@ -270,7 +270,7 @@ $(OUT)/ucrt_coverage.exe: ucrt_coverage/main.c | $(OUT)
 	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $<
 	@echo "built $@"
 
-gui_exes: $(OUT)/gui_blit.exe $(OUT)/gui_menu.exe $(OUT)/gui_text.exe $(OUT)/gui_control.exe $(OUT)/gui_dialog.exe $(OUT)/gui_d3d9.exe
+gui_exes: $(OUT)/gui_blit.exe $(OUT)/gui_menu.exe $(OUT)/gui_text.exe $(OUT)/gui_control.exe $(OUT)/gui_dialog.exe $(OUT)/gui_d3d9.exe $(OUT)/gui_demo.exe
 
 GUI_CFLAGS   := -O1 -ffreestanding -fno-stack-protector -fno-asynchronous-unwind-tables
 GUI_LDFLAGS  := -nostdlib -Wl,--subsystem,windows -Wl,--entry,entry
@@ -302,6 +302,14 @@ $(OUT)/gui_dialog_res.o: gui_dialog/dialog.rc | $(OUT)
 
 $(OUT)/gui_dialog.exe: gui_dialog/main.c $(OUT)/gui_dialog_res.o | $(OUT)
 	$(MINGW_CC) $(GUI_CFLAGS) $(GUI_LDFLAGS) -o $@ gui_dialog/main.c $(OUT)/gui_dialog_res.o $(GUI_LIBS)
+	@echo "built $@"
+
+$(OUT)/gui_demo_res.o: gui_demo/dialog.rc | $(OUT)
+	$(WINDRES) gui_demo/dialog.rc -o $@
+	@echo "built $@"
+
+$(OUT)/gui_demo.exe: gui_demo/main.c $(OUT)/gui_demo_res.o | $(OUT)
+	$(MINGW_CC) $(GUI_CFLAGS) $(GUI_LDFLAGS) -o $@ gui_demo/main.c $(OUT)/gui_demo_res.o $(GUI_LIBS)
 	@echo "built $@"
 
 $(OUT)/gui_d3d9.exe: gui_d3d9/main.c | $(OUT)

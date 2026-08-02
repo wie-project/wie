@@ -1,22 +1,26 @@
-// P3 D3D9 software-render micro-test for WIE.
+// P3/P4b/P5a D3D9 software-render micro-test for WIE.
 //
-// Exercises the software-render slice 1 (roadmap B6): Direct3DCreate9 →
-// GetDeviceCaps (must honestly report NO vertex/pixel shaders) → CreateDevice
+// Exercises the software-render slice (roadmap B6 + P4b + P5a caps):
+// Direct3DCreate9 → GetDeviceCaps (honest P5a caps: ps_2_0 reported, the
+// vertex stage still 0) → CreateDevice
 // → Clear → BeginScene → DrawPrimitiveUP (XYZ|DIFFUSE gradient triangle) →
-// DrawIndexedPrimitiveUP (solid indexed triangle) → EndScene → Present.
-// The frame is rendered from WM_PAINT; Present publishes it through the same
-// PresentState surface pipeline GDI BitBlt uses.
+// DrawIndexedPrimitiveUP (solid indexed triangle) → a TEXTURED quad
+// (CreateTexture → GetSurfaceLevel → LockRect → UnlockRect → SetTexture →
+// DrawPrimitiveUP with XYZ|DIFFUSE|TEX1) → EndScene → Present. The frame is
+// rendered from WM_PAINT; Present publishes it through the same PresentState
+// surface pipeline GDI BitBlt uses.
 //
 // Self-test (WIE_SELFTEST=1): every D3D9 call's HRESULT is checked, a
 // SetViewport/GetViewport round-trip is verified, and after TIMER_TICKS
 // WM_TIMER ticks (each invalidating → repaint → represent) the window quits
-// with 0. Distinct non-zero codes (101-121) report the first stage that did
+// with 0. Distinct non-zero codes (101-136) report the first stage that did
 // not run. Interactive runs (no WIE_SELFTEST) keep the window open — the
 // timer drives nothing and the window quits only on 'q' / close.
 //
-// The resting frame is deterministic: red clear + two triangles. The CI test
-// samples pixels (clear red outside the triangles, blended/diffuse colors
-// inside) and asserts the exit code.
+// The resting frame is deterministic: red clear + two triangles + a textured
+// quad whose 2x2 checkerboard (red/green/blue/white) fills the screen region
+// x∈[240,310], y∈[10,110]. The CI test samples pixels (clear red outside the
+// geometry, triangle colors, quad texels) and gates a resting-frame hash.
 
 #define COBJMACROS
 #include <windows.h>
@@ -32,6 +36,8 @@ static HINSTANCE g_inst;
 static HWND      g_hwnd;
 static IDirect3D9       *g_d3d;
 static IDirect3DDevice9 *g_device;
+static IDirect3DTexture9 *g_tex;
+static IDirect3DSurface9 *g_depth;
 static int g_selftest;
 static int g_timer_count;
 
@@ -41,12 +47,61 @@ static int selftest_enabled(void) {
     return n == 1 && buf[0] == '1';
 }
 
+// Create the 2x2 checkerboard texture (red/green/blue/white) and bind it to
+// stage 0. Returns 0 on success, else the exit code naming the failed stage.
+static int setup_texture(void) {
+    HRESULT hr = IDirect3DDevice9_CreateTexture(
+        g_device, 2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &g_tex, NULL);
+    if (FAILED(hr) || g_tex == NULL) {
+        return 130;
+    }
+    IDirect3DSurface9 *surf = NULL;
+    hr = IDirect3DTexture9_GetSurfaceLevel(g_tex, 0, &surf);
+    if (FAILED(hr) || surf == NULL) {
+        return 131;
+    }
+    D3DLOCKED_RECT lr;
+    hr = IDirect3DSurface9_LockRect(surf, &lr, NULL, 0);
+    if (FAILED(hr) || lr.pBits == NULL || lr.Pitch < 8) {
+        return 132;
+    }
+    DWORD *bits = (DWORD *)lr.pBits;
+    bits[0] = D3DCOLOR_XRGB(255, 0, 0);   // red    (top-left)
+    bits[1] = D3DCOLOR_XRGB(0, 255, 0);   // green  (top-right)
+    bits[2] = D3DCOLOR_XRGB(0, 0, 255);   // blue   (bottom-left)
+    bits[3] = D3DCOLOR_XRGB(255, 255, 255); // white (bottom-right)
+    hr = IDirect3DSurface9_UnlockRect(surf);
+    if (FAILED(hr)) {
+        return 133;
+    }
+    IDirect3DSurface9_Release(surf);
+    // SetTexture takes an IDirect3DBaseTexture9* — the concrete texture is a
+    // distinct C struct in the mingw headers, so cast to the base type.
+    hr = IDirect3DDevice9_SetTexture(g_device, 0, (IDirect3DBaseTexture9 *)g_tex);
+    if (FAILED(hr)) {
+        return 134;
+    }
+    return 0;
+}
+
 // Render one deterministic frame into the D3D9 backbuffer and present it.
 // Returns 0 on success, else the exit code naming the failed stage.
 static int render_frame(void) {
-    // D3DCOLOR_XRGB(200, 0, 0) — pure red clear, no alpha.
+    // Start untextured — setup_texture may have left stage 0 bound, and the
+    // triangles below have no TEX1 (a bound stage would modulate them with
+    // the uv (0,0) texel).
+    if (FAILED(IDirect3DDevice9_SetTexture(g_device, 0, NULL))) {
+        return 134;
+    }
+    // Deterministic blend/depth baseline for the P4c quads.
+    if (FAILED(IDirect3DDevice9_SetRenderState(g_device, D3DRS_ALPHABLENDENABLE, FALSE)) ||
+        FAILED(IDirect3DDevice9_SetRenderState(g_device, D3DRS_ZENABLE, FALSE))) {
+        return 137;
+    }
+    // D3DCOLOR_XRGB(200, 0, 0) — pure red clear, no alpha. Clear the depth
+    // buffer to the far plane (z=1.0) so the P4c depth quads test against it.
     if (FAILED(IDirect3DDevice9_Clear(g_device, 0, NULL,
-                                      D3DCLEAR_TARGET,
+                                      D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
                                       D3DCOLOR_XRGB(200, 0, 0), 1.0f, 0))) {
         return 106;
     }
@@ -85,6 +140,151 @@ static int render_frame(void) {
                        g_device, D3DPT_TRIANGLELIST, 0, 3, 1, indices,
                        D3DFMT_INDEX16, indexed, (UINT)sizeof(indexed[0])))) {
             return 111;
+        }
+    }
+    // Textured quad (XYZ|DIFFUSE|TEX1, 24-byte vertices) covering the screen
+    // region x∈[240,310], y∈[10,110] with the full uv range. World coords:
+    // screen (240,10) = world (80,110), screen (310,110) = world (150,10).
+    // The texture is bound only for this draw so the triangles above stay
+    // untextured (a bound stage samples uv (0,0) for TEX1-less vertices).
+    if (FAILED(IDirect3DDevice9_SetTexture(g_device, 0, (IDirect3DBaseTexture9 *)g_tex))) {
+        return 134;
+    }
+    if (FAILED(IDirect3DDevice9_SetFVF(g_device,
+                                       D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1))) {
+        return 135;
+    }
+    struct TexVertex { float x, y, z; DWORD color; float u, v; };
+    struct TexVertex quad[4];
+    quad[0].x = 80.0f;  quad[0].y = 110.0f; quad[0].z = 0.0f;
+    quad[0].color = D3DCOLOR_XRGB(255, 255, 255);
+    quad[0].u = 0.0f; quad[0].v = 0.0f;
+    quad[1].x = 150.0f; quad[1].y = 110.0f; quad[1].z = 0.0f;
+    quad[1].color = D3DCOLOR_XRGB(255, 255, 255);
+    quad[1].u = 1.0f; quad[1].v = 0.0f;
+    quad[2].x = 80.0f; quad[2].y = 10.0f; quad[2].z = 0.0f;
+    quad[2].color = D3DCOLOR_XRGB(255, 255, 255);
+    quad[2].u = 0.0f; quad[2].v = 1.0f;
+    quad[3].x = 150.0f; quad[3].y = 10.0f; quad[3].z = 0.0f;
+    quad[3].color = D3DCOLOR_XRGB(255, 255, 255);
+    quad[3].u = 1.0f; quad[3].v = 1.0f;
+    {
+        struct TexVertex verts[6];
+        verts[0] = quad[0]; verts[1] = quad[1]; verts[2] = quad[2];
+        verts[3] = quad[1]; verts[4] = quad[3]; verts[5] = quad[2];
+        if (FAILED(IDirect3DDevice9_DrawPrimitiveUP(
+                       g_device, D3DPT_TRIANGLELIST, 2, verts,
+                       (UINT)sizeof(verts[0])))) {
+            return 136;
+        }
+    }
+    // Unbind so the next frame's triangles start untextured.
+    if (FAILED(IDirect3DDevice9_SetTexture(g_device, 0, NULL))) {
+        return 134;
+    }
+    // ── P4c blend: an opaque red quad, then a half-alpha blue quad over its
+    // left half. Blend factors SRCALPHA/INVSRCALPHA, ADD.
+    // Screen region: x∈[10,90], y∈[10,60]; the blue half is x∈[10,50].
+    if (FAILED(IDirect3DDevice9_SetFVF(g_device, D3DFVF_XYZ | D3DFVF_DIFFUSE))) {
+        return 138;
+    }
+    {
+        struct Vertex red_q[4];
+        red_q[0].x = -150.0f; red_q[0].y = 110.0f; red_q[0].z = 0.0f;
+        red_q[0].color = D3DCOLOR_ARGB(255, 255, 0, 0);
+        red_q[1].x = -70.0f;  red_q[1].y = 110.0f; red_q[1].z = 0.0f;
+        red_q[1].color = D3DCOLOR_ARGB(255, 255, 0, 0);
+        red_q[2].x = -150.0f; red_q[2].y = 60.0f; red_q[2].z = 0.0f;
+        red_q[2].color = D3DCOLOR_ARGB(255, 255, 0, 0);
+        red_q[3].x = -70.0f;  red_q[3].y = 60.0f; red_q[3].z = 0.0f;
+        red_q[3].color = D3DCOLOR_ARGB(255, 255, 0, 0);
+        struct Vertex verts[6];
+        verts[0] = red_q[0]; verts[1] = red_q[1]; verts[2] = red_q[2];
+        verts[3] = red_q[1]; verts[4] = red_q[3]; verts[5] = red_q[2];
+        if (FAILED(IDirect3DDevice9_DrawPrimitiveUP(
+                       g_device, D3DPT_TRIANGLELIST, 2, verts,
+                       (UINT)sizeof(verts[0])))) {
+            return 138;
+        }
+    }
+    if (FAILED(IDirect3DDevice9_SetRenderState(g_device, D3DRS_ALPHABLENDENABLE, TRUE)) ||
+        FAILED(IDirect3DDevice9_SetRenderState(g_device, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA)) ||
+        FAILED(IDirect3DDevice9_SetRenderState(g_device, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA)) ||
+        FAILED(IDirect3DDevice9_SetRenderState(g_device, D3DRS_BLENDOP, D3DBLENDOP_ADD))) {
+        return 139;
+    }
+    {
+        struct Vertex blue_q[4];
+        blue_q[0].x = -150.0f; blue_q[0].y = 110.0f; blue_q[0].z = 0.0f;
+        blue_q[0].color = D3DCOLOR_ARGB(128, 0, 0, 255);   // alpha 0x80 blue
+        blue_q[1].x = -110.0f; blue_q[1].y = 110.0f; blue_q[1].z = 0.0f;
+        blue_q[1].color = D3DCOLOR_ARGB(128, 0, 0, 255);
+        blue_q[2].x = -150.0f; blue_q[2].y = 60.0f; blue_q[2].z = 0.0f;
+        blue_q[2].color = D3DCOLOR_ARGB(128, 0, 0, 255);
+        blue_q[3].x = -110.0f; blue_q[3].y = 60.0f; blue_q[3].z = 0.0f;
+        blue_q[3].color = D3DCOLOR_ARGB(128, 0, 0, 255);
+        struct Vertex verts[6];
+        verts[0] = blue_q[0]; verts[1] = blue_q[1]; verts[2] = blue_q[2];
+        verts[3] = blue_q[1]; verts[4] = blue_q[3]; verts[5] = blue_q[2];
+        if (FAILED(IDirect3DDevice9_DrawPrimitiveUP(
+                       g_device, D3DPT_TRIANGLELIST, 2, verts,
+                       (UINT)sizeof(verts[0])))) {
+            return 140;
+        }
+    }
+    // ── P4c depth: two overlapping XYZRHW quads (near z=0.1 white, far
+    // z=0.9 magenta). ZENABLE TRUE + LESSEQUAL + ZWRITEENABLE. Screen region
+    // x∈[10,90], y∈[90,150]; the far quad's left half (x∈[10,50]) is covered
+    // by the near quad and must lose the depth test there.
+    if (FAILED(IDirect3DDevice9_SetRenderState(g_device, D3DRS_ALPHABLENDENABLE, FALSE)) ||
+        FAILED(IDirect3DDevice9_SetRenderState(g_device, D3DRS_ZENABLE, D3DZB_TRUE)) ||
+        FAILED(IDirect3DDevice9_SetRenderState(g_device, D3DRS_ZFUNC, D3DCMP_LESSEQUAL)) ||
+        FAILED(IDirect3DDevice9_SetRenderState(g_device, D3DRS_ZWRITEENABLE, TRUE))) {
+        return 141;
+    }
+    if (FAILED(IDirect3DDevice9_SetFVF(g_device,
+                                       D3DFVF_XYZRHW | D3DFVF_DIFFUSE))) {
+        return 142;
+    }
+    struct RhwVertex { float x, y, z, rhw; DWORD color; };
+    {
+        // Near quad: right half only, white — wins the overlap with the far.
+        struct RhwVertex near_q[4];
+        near_q[0].x = 50.0f;  near_q[0].y = 90.0f;  near_q[0].z = 0.1f; near_q[0].rhw = 1.0f;
+        near_q[0].color = D3DCOLOR_XRGB(255, 255, 255);
+        near_q[1].x = 90.0f;  near_q[1].y = 90.0f;  near_q[1].z = 0.1f; near_q[1].rhw = 1.0f;
+        near_q[1].color = D3DCOLOR_XRGB(255, 255, 255);
+        near_q[2].x = 50.0f;  near_q[2].y = 150.0f; near_q[2].z = 0.1f; near_q[2].rhw = 1.0f;
+        near_q[2].color = D3DCOLOR_XRGB(255, 255, 255);
+        near_q[3].x = 90.0f;  near_q[3].y = 150.0f; near_q[3].z = 0.1f; near_q[3].rhw = 1.0f;
+        near_q[3].color = D3DCOLOR_XRGB(255, 255, 255);
+        struct RhwVertex verts[6];
+        verts[0] = near_q[0]; verts[1] = near_q[1]; verts[2] = near_q[2];
+        verts[3] = near_q[1]; verts[4] = near_q[3]; verts[5] = near_q[2];
+        if (FAILED(IDirect3DDevice9_DrawPrimitiveUP(
+                       g_device, D3DPT_TRIANGLELIST, 2, verts,
+                       (UINT)sizeof(verts[0])))) {
+            return 143;
+        }
+    }
+    {
+        // Far quad: full region, magenta — must lose the near overlap.
+        struct RhwVertex far_q[4];
+        far_q[0].x = 10.0f;  far_q[0].y = 90.0f;  far_q[0].z = 0.9f; far_q[0].rhw = 1.0f;
+        far_q[0].color = D3DCOLOR_XRGB(255, 0, 255);
+        far_q[1].x = 90.0f;  far_q[1].y = 90.0f;  far_q[1].z = 0.9f; far_q[1].rhw = 1.0f;
+        far_q[1].color = D3DCOLOR_XRGB(255, 0, 255);
+        far_q[2].x = 10.0f;  far_q[2].y = 150.0f; far_q[2].z = 0.9f; far_q[2].rhw = 1.0f;
+        far_q[2].color = D3DCOLOR_XRGB(255, 0, 255);
+        far_q[3].x = 90.0f;  far_q[3].y = 150.0f; far_q[3].z = 0.9f; far_q[3].rhw = 1.0f;
+        far_q[3].color = D3DCOLOR_XRGB(255, 0, 255);
+        struct RhwVertex verts[6];
+        verts[0] = far_q[0]; verts[1] = far_q[1]; verts[2] = far_q[2];
+        verts[3] = far_q[1]; verts[4] = far_q[3]; verts[5] = far_q[2];
+        if (FAILED(IDirect3DDevice9_DrawPrimitiveUP(
+                       g_device, D3DPT_TRIANGLELIST, 2, verts,
+                       (UINT)sizeof(verts[0])))) {
+            return 144;
         }
     }
     if (FAILED(IDirect3DDevice9_EndScene(g_device))) {
@@ -138,6 +338,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             IDirect3D9_Release(g_d3d);
             g_d3d = NULL;
         }
+        if (g_tex) {
+            IDirect3DTexture9_Release(g_tex);
+            g_tex = NULL;
+        }
+        if (g_depth) {
+            IDirect3DSurface9_Release(g_depth);
+            g_depth = NULL;
+        }
         if (g_timer_count < TIMER_TICKS_MIN) {
             PostQuitMessage(120);
         }
@@ -184,17 +392,25 @@ void entry(void) {
         ExitProcess(102);
     }
     {
-        // P3 caps honesty (B6c): no vertex shader, no pixel shader — the
-        // game must take the fixed-function path we actually implement.
+        // P5a caps honesty: the ps_2_0 interpreter is implemented, so the
+        // caps report D3DPS_VERSION(2,0) and PixelShader1xMaxValue 1.0; the
+        // vertex stage is still the FFP Gouraud path (vs_2_0 execution is
+        // P5a-2), so VertexShaderVersion stays 0. MaxVertexShaderConst
+        // reports the implemented vs_2_0 constant file (256 float4s).
         D3DCAPS9 caps;
         if (FAILED(IDirect3D9_GetDeviceCaps(g_d3d, 0, D3DDEVTYPE_HAL, &caps))) {
             ExitProcess(103);
         }
-        if (caps.VertexShaderVersion != 0 || caps.PixelShaderVersion != 0) {
+        if (caps.VertexShaderVersion != 0) {
             ExitProcess(104);
         }
-        // MaxVertexShaderConst / PixelShader1xMaxValue must also be zero.
-        if (caps.MaxVertexShaderConst != 0 || caps.PixelShader1xMaxValue != 0.0f) {
+        if (caps.PixelShaderVersion != D3DPS_VERSION(2, 0)) {
+            ExitProcess(104);
+        }
+        if (caps.MaxVertexShaderConst != 256) {
+            ExitProcess(104);
+        }
+        if (caps.PixelShader1xMaxValue != 1.0f) {
             ExitProcess(104);
         }
     }
@@ -238,6 +454,27 @@ void entry(void) {
         if (vp.X != 0 || vp.Y != 0 || vp.Width != BACKBUFFER_W ||
             vp.Height != BACKBUFFER_H || vp.MinZ != 0.0f || vp.MaxZ != 1.0f) {
             ExitProcess(121);
+        }
+    }
+    {
+        // P4b: the 2x2 checkerboard texture + stage-0 binding.
+        int rc = setup_texture();
+        if (rc != 0) {
+            ExitProcess(rc);
+        }
+    }
+    {
+        // P4c: a backbuffer-sized depth-stencil surface, bound and cleared to
+        // the far plane each frame (D3DCLEAR_ZBUFFER in render_frame).
+        HRESULT hr = IDirect3DDevice9_CreateDepthStencilSurface(
+            g_device, BACKBUFFER_W, BACKBUFFER_H, D3DFMT_D16,
+            D3DMULTISAMPLE_NONE, 0, FALSE, &g_depth, NULL);
+        if (FAILED(hr) || g_depth == NULL) {
+            ExitProcess(145);
+        }
+        hr = IDirect3DDevice9_SetDepthStencilSurface(g_device, g_depth);
+        if (FAILED(hr)) {
+            ExitProcess(146);
         }
     }
 
