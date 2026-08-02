@@ -12,19 +12,19 @@ use wie_winapi::{
 /// Runtime fake API dispatch entry (IAT soft slots + trace metadata).
 #[derive(Debug, Clone)]
 pub struct RuntimeFakeApiEntry {
-    /// Fake API target virtual address.
+    /// Dense encoded stop VA in the fake range that lands control here.
     pub fake_target_va: u64,
 
-    /// Imported library name.
+    /// Library the import came from (ASCII, case preserved).
     pub library: Arc<str>,
 
-    /// Imported function name.
+    /// Imported export name.
     pub name: Arc<str>,
 
-    /// Runtime `IAT` slot virtual address (0 if not from IAT).
+    /// Guest VA of the backing IAT slot (0 when not IAT-resolved).
     pub iat_slot_va: u64,
 
-    /// Pre-resolved dense handler id (None = soft / string dispatch).
+    /// Pre-resolved dense handler id; `None` for soft/string dispatch.
     pub winapi_id: Option<WinApiId>,
 
     /// Hot-path classification resolved once at table build.
@@ -52,6 +52,7 @@ pub struct SoftApiTable {
 }
 
 impl SoftApiTable {
+    /// Look up a soft entry by dense index (O(1) on the handler path).
     #[must_use]
     pub fn get(&self, index: u16) -> Option<&RuntimeFakeApiEntry> {
         self.entries.get(index as usize)
@@ -192,9 +193,9 @@ pub fn resolve_import_fake_va(
 
 /// O(1) decode of a host-stop address into dispatch metadata.
 ///
-/// Traits (guest_stub, noisy, exit_process, …) are pre-computed by `make_entry`
-/// and embedded in `WinApiId::traits()` for Export entries — no need to
-/// re-classify guest stubs on the hot path.
+/// Hot-path classification (guest stub, noisy, exit process, …) is
+/// pre-computed by `make_entry` and embedded in `WinApiId::traits()` for Export
+/// entries — no need to re-classify guest stubs on the hot path.
 ///
 /// `library` and `name` borrow from [`winapi_id_export`]'s static strings for
 /// the Export/Alias path — zero allocation on every stop.  The Unresolved path

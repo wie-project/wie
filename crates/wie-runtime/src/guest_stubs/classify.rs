@@ -134,7 +134,7 @@ static CLASSIFY_TABLE: &[(&str, &str, StubKindBuilder)] = &[
         }
     }),
     // ── WINMM ──
-    // B5: timeGetTime reads the host-written guest clock table (slot 2).
+    // timeGetTime reads the host-written guest clock table (slot 2).
     ("WINMM.dll", "timeGetTime", |cfg| {
         GuestStubKind::LoadZx32FromVa(cfg.clock_table_va.saturating_add(CLOCK_TABLE_SLOT_TIME))
     }),
@@ -145,7 +145,7 @@ static CLASSIFY_TABLE: &[(&str, &str, StubKindBuilder)] = &[
     (NT_LIBRARY, "DecodePointer", |_| {
         GuestStubKind::IdentityRcxToRax
     }),
-    // Enter/Leave/DeleteCriticalSection stay on host (MT.1 real owner/
+    // Enter/Leave/DeleteCriticalSection stay on host (real owner/
     // recursion); InitializeCriticalSection* writes RTL_CRITICAL_SECTION.
     (NT_LIBRARY, "GetLastError", |_| {
         GuestStubKind::LoadZx32FromVa(TEB_LAST_ERROR_VA)
@@ -168,7 +168,7 @@ static CLASSIFY_TABLE: &[(&str, &str, StubKindBuilder)] = &[
     (NT_LIBRARY, "SetHandleCount", |_| GuestStubKind::VoidRet),
     (NT_LIBRARY, "OutputDebugStringA", |_| GuestStubKind::VoidRet),
     (NT_LIBRARY, "OutputDebugStringW", |_| GuestStubKind::VoidRet),
-    // B5: the host refreshes a guest clock table on every stop; these in-guest
+    // The host refreshes a guest clock table on every stop; these in-guest
     // stubs read it with no host stop. A constant stub is deliberately NOT
     // planted — a guest frame loop computing `dt = now - last` would busy-wait
     // on `dt == 0` forever (the frozen-clock trap). The table advances
@@ -199,14 +199,14 @@ static CLASSIFY_TABLE: &[(&str, &str, StubKindBuilder)] = &[
         GuestStubKind::ReturnImm32(0x1234)
     }),
     // Primary TID is fixed (`PRIMARY_THREAD_ID` / 0x5678). Host path reads
-    // ThreadState when the stub is not planted (workers in MT.2).
+    // ThreadState when the stub is not planted (spawned workers).
     (NT_LIBRARY, "GetCurrentThreadId", |_| {
         GuestStubKind::ReturnImm32(wie_winapi::PRIMARY_THREAD_ID)
     }),
     (NT_LIBRARY, "IsDebuggerPresent", |_| {
         GuestStubKind::ReturnZero
     }),
-    // Sleep is never planted: host idle policy (Phase 6) must see every call.
+    // Sleep is never planted: the host idle policy must see every call.
     (NT_LIBRARY, "GetACP", |_| GuestStubKind::ReturnImm32(1252)),
     (NT_LIBRARY, "GetOEMCP", |_| GuestStubKind::ReturnImm32(437)),
     // Microsoft Learn: LANGID en-US = 0x0409 for both when guest is fixed en-US.
@@ -263,7 +263,7 @@ pub(crate) fn classify_guest_stub(
     }
 
     // Intentionally NOT stubbed (would damage apps if simplified):
-    // - VirtualProtect: NULL lpflOldProtect must fail (Learn); real protect later Phase 3
+    // - VirtualProtect: NULL lpflOldProtect must fail (Learn); real protect stays host-side
     // - VirtualQuery: must describe real VA regions (RegionTable)
     // - LocalAlloc/GlobalAlloc: LMEM_MOVEABLE / lock / size-0 discard semantics
     // - SetUnhandledExceptionFilter: must return previous filter for chaining

@@ -1,4 +1,6 @@
-/// Guest-visible layout for Phase 5 data-backed stubs.
+//! Guest-visible layout and offsets for the data-backed in-guest stubs.
+
+/// Guest-visible layout for the data-backed in-guest stubs.
 ///
 /// Offsets within `data_base` (must match session init):
 /// - `0x000`: metrics `u32[METRICS_COUNT]`
@@ -27,7 +29,7 @@ pub(crate) struct GuestStubConfig {
     /// Guest VA of the `u32` dialog-result slot (`EndDialog` writes, the
     /// `DialogBoxParam` stub reads after `WM_QUIT`).
     pub dialog_result_va: u64,
-    /// Guest VA of the host-written clock table (B5): 6 × u64 slots refreshed
+    /// Guest VA of the host-written clock table: 6 × u64 slots refreshed
     /// on every host stop; in-guest clock stubs read it with no host stop.
     pub clock_table_va: u64,
 }
@@ -35,7 +37,7 @@ pub(crate) struct GuestStubConfig {
 /// Offset of the dialog-result slot inside the guest stub data page.
 pub(crate) const DIALOG_RESULT_OFFSET: u64 = 0x1000;
 
-/// Slot offsets into the 6×u64 guest clock table (B5).
+/// Slot offsets into the 6×u64 guest clock table.
 ///
 /// Must match `wie_winapi::kernel32::clock::clock_table_values` slot order:
 /// - `[0]` tick_count u32 — `GetTickCount`

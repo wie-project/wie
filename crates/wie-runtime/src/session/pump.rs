@@ -1,3 +1,5 @@
+//! `run_until_stop` quantum loop and quiescent drain for the session.
+
 use super::{invalid_memory_diagnostic, journal_api_return};
 use crate::hooks::resolve_fake_api_at;
 use crate::trace::{EntryTraceEvent, EntryTraceTermination, RuntimeRunSummary};
@@ -24,7 +26,7 @@ impl super::RuntimeSession {
         }
     }
 
-    /// B5: publish the current clock snapshot into the guest clock table.
+    /// Publish the current clock snapshot into the guest clock table.
     ///
     /// Uses the primary engine directly (no WinAPI lock): the table lives in
     /// guest memory and the host is between quanta here, so no worker runs on
@@ -70,7 +72,7 @@ impl super::RuntimeSession {
                 break;
             }
 
-            // MT.2: start any CreateThread workers before the next quantum.
+            // Start any CreateThread workers before the next quantum.
             self.process.drain_spawns()?;
             let index = self.next_api_index;
             self.next_api_index = self
@@ -124,7 +126,7 @@ impl super::RuntimeSession {
                 }
             };
 
-            // B5: refresh the host-written guest clock table ahead of this
+            // Refresh the host-written guest clock table ahead of this
             // quantum so the in-guest clock stubs (GetTickCount / timeGetTime
             // / QPC / …) observe advancing values with no host stop. Frozen
             // under `WIE_FIXED_CLOCK=1` — the table was written once at
@@ -306,7 +308,7 @@ impl super::RuntimeSession {
                                     return_address: Some(completion.return_address),
                                 });
                                 self.publish_last_error_to_guest();
-                                // B3.6: do NOT publish here. A guest WndProc
+                                // Do NOT publish here. A guest WndProc
                                 // is one message of a repaint cycle (parent
                                 // BitBlt → child control paints across several
                                 // messages); publishing mid-cycle would emit a
@@ -641,7 +643,7 @@ impl super::RuntimeSession {
                                             .context(
                                                 "runtime API index underflow after message yield",
                                             )?;
-                                        // B3.6: the message queue is empty and no
+                                        // The message queue is empty and no
                                         // idle messages (timers / paints) remain to
                                         // synthesize — every WM_PAINT of this repaint
                                         // cycle has been dispatched, so the coalesced
@@ -706,7 +708,7 @@ impl super::RuntimeSession {
                                         // Per-thread engine: primary regs are already in `engine`;
                                         // only persist thread bookkeeping for TLS tracking.
                                         winapi_state.kernel.threads.save_active();
-                                        // B3.6: the guest is about to block on a
+                                        // The guest is about to block on a
                                         // wait — flush any coalesced publishes so
                                         // the frame reaches the host before the
                                         // park. Skipped while a guest callback is
@@ -718,7 +720,7 @@ impl super::RuntimeSession {
                                         quantum = Quantum::Park(*reason);
                                     }
                                     Some(wie_winapi::WinApiControlSignal::ExitThread { code }) => {
-                                        // B3.6: flush pending publishes before the
+                                        // Flush pending publishes before the
                                         // thread exits so the last painted frame is
                                         // not lost.
                                         if self.pending_callbacks.is_empty() {
@@ -897,7 +899,7 @@ impl super::RuntimeSession {
             }
         }
 
-        // B9: per-frame timing sample — sync present accumulators into the
+        // Per-frame timing sample — sync present accumulators into the
         // profile and log host-stop / iced-vs-jit deltas on publish. Locks are
         // dropped; only active when `WIE_RUNTIME_PROFILE` (or
         // `enable_frame_timing`) is set.

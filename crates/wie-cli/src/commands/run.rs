@@ -151,6 +151,10 @@ pub(crate) fn run_until_yield(path: &Path, max_api: usize) -> Result<()> {
     // Ensure Sleep(n>0) actually sleeps and the idle loop parks the host
     // thread when waiting for messages. Otherwise every Sleep is a no-op
     // and interactive programs render all frames instantly.
+    // SAFETY: `set_var` is unsafe only because concurrent reads from other
+    // threads could observe a torn environment. This runs on the main thread
+    // before any guest/worker threads spawn and before the runtime reads
+    // `WIE_IDLE`, so no other thread accesses the environment concurrently.
     #[expect(unsafe_code)]
     unsafe {
         std::env::set_var("WIE_IDLE", "park");

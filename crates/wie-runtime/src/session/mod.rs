@@ -130,13 +130,13 @@ pub struct RuntimeSession {
     /// Whether the previous `run_until_stop` returned `WaitingForMessage`;
     /// gates the idle-transition log so it fires on transitions only.
     was_waiting_for_message: bool,
-    /// B9: last observed present generation (frame-boundary sampling).
+    /// Last observed present generation (frame-boundary sampling).
     frame_last_gen: u64,
-    /// B9: `host_stops` baseline at the last frame boundary.
+    /// `host_stops` baseline at the last frame boundary.
     frame_last_stops: u64,
-    /// B9: iced-instruction baseline at the last frame boundary.
+    /// Iced-instruction baseline at the last frame boundary.
     frame_last_iced: u64,
-    /// B9: jit-instruction baseline at the last frame boundary.
+    /// JIT-instruction baseline at the last frame boundary.
     frame_last_jit: u64,
 }
 

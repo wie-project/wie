@@ -15,11 +15,10 @@
 //! `LocalAlloc` / `GlobalAlloc` with `LMEM_MOVEABLE` / lock semantics also stay
 //! on the host — a thin `HeapAlloc` wrapper would break real apps.
 //!
-//! Module layout (structural split of the former single file — zero behaviour
-//! change): `config` (guest VA layout + offsets) · `kind` (stub kinds and their
-//! classification metadata) · `encode` (machine-code bodies) · `classify`
-//! (library/name → kind) · `data` (data-page builders) · `plant` (fake-API
-//! planting).
+//! Module layout: `config` (guest VA layout + offsets) · `kind` (stub kinds
+//! and their classification metadata) · `encode` (machine-code bodies) ·
+//! `classify` (library/name → kind) · `data` (data-page builders) · `plant`
+//! (fake-API planting).
 
 mod classify;
 mod config;

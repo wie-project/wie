@@ -112,7 +112,7 @@ fn classify_langid_and_not_virtual_protect() {
     assert!(classify_guest_stub("KERNEL32.dll", "VirtualProtect", &cfg).is_none());
     assert!(classify_guest_stub("KERNEL32.dll", "VirtualQuery", &cfg).is_none());
     assert!(classify_guest_stub("KERNEL32.dll", "LocalAlloc", &cfg).is_none());
-    // MT.1: CS must not be VoidRet guest stubs.
+    // Critical sections must not be VoidRet guest stubs.
     assert!(classify_guest_stub("KERNEL32.dll", "EnterCriticalSection", &cfg).is_none());
     assert!(classify_guest_stub("KERNEL32.dll", "LeaveCriticalSection", &cfg).is_none());
     assert!(classify_guest_stub("KERNEL32.dll", "DeleteCriticalSection", &cfg).is_none());
@@ -305,7 +305,7 @@ fn every_stub_needing_real_addresses_is_listed() {
         ("KERNEL32.dll", "GetCommandLineA"),
         ("KERNEL32.dll", "GetCommandLineW"),
         ("KERNEL32.dll", "GetCurrentDirectoryW"),
-        // B5: clock stubs read the host-written guest clock table.
+        // Clock stubs read the host-written guest clock table.
         ("KERNEL32.dll", "GetTickCount"),
         ("KERNEL32.dll", "GetTickCount64"),
         ("KERNEL32.dll", "GetSystemTimeAsFileTime"),

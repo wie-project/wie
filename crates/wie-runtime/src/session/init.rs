@@ -1,3 +1,5 @@
+//! PE load and region-layout setup for a `RuntimeSession`.
+
 use super::SessionOptions;
 use super::materialize_crt_argv;
 use super::types::{GuestStackPtr, GuestTid, GuestVa};
@@ -15,7 +17,7 @@ use std::time::Instant;
 
 use super::profile::RuntimeProfile;
 
-/// Apply final PE section / header protects after image copy (Phase 3.3).
+/// Apply final PE section and header page protects after image copy.
 ///
 /// Sequence: whole image → `PAGE_NOACCESS` (gap pages), headers → RO, each
 /// section → characteristics-derived protect. IAT must already be patched in
@@ -70,7 +72,7 @@ fn apply_pe_section_protects(
     Ok(())
 }
 
-/// Register default layout ranges into the CPU region table (Phase 1.2 / 3.3).
+/// Register default layout ranges into the CPU region table.
 fn register_layout_regions(
     engine: &mut dyn wie_cpu::CpuEngine,
     layout: &RuntimeMemoryLayout,
@@ -80,7 +82,7 @@ fn register_layout_regions(
 ) {
     use wie_cpu::{GuestRegion, RegionKind};
 
-    // Whole image + optional per-section named regions for diagnostics / Phase 4.
+    // Whole image + optional per-section named regions for diagnostics.
     engine.register_region(GuestRegion::new(
         "image",
         RegionKind::Image,
@@ -123,8 +125,8 @@ fn register_layout_regions(
         }
     }
 
-    // Phase 4.x: pure data regions are RW (not RWX). Soft-translate W is
-    // denied on executable pages; stack/heap must stay non-X for pin super path.
+    // Pure data regions are RW (not RWX). Soft-translate W is denied on
+    // executable pages; stack/heap must stay non-X for the pin super path.
     let data_rw = wie_cpu::RwxPerms::READ_WRITE;
     let code_rwx = wie_cpu::RwxPerms::ALL;
     let regs: [GuestRegion; 16] = [
@@ -386,8 +388,8 @@ impl super::RuntimeSession {
         // after `with_env_overrides`, or clear the env var.
         let layout = layout.with_env_overrides();
         let mut soft_apis = SoftApiTable::default();
-        // MT.4: plant Interlocked* (and other soft-only GPA targets) at fixed
-        // soft indices 0..N so GetProcAddress encode_unresolved matches.
+        // Plant Interlocked* (and other soft-only GPA targets) at fixed soft
+        // indices 0..N so GetProcAddress encode_unresolved matches.
         for entry in wie_winapi::PREPLANTED_SOFT_APIS {
             soft_apis
                 .intern(entry.library, entry.name, 0)
@@ -418,8 +420,8 @@ impl super::RuntimeSession {
             wie_cpu::CpuBackend::Iced { engine, guest_mem } => (engine, None, Some(guest_mem)),
         };
 
-        // Phase 3.3: one MEM_IMAGE arena, temporary RWX — headers/sections/IAT
-        // are written directly into guest memory (no intermediate Vec<u8> buffer).
+        // One MEM_IMAGE arena, temporary RWX — headers/sections/IAT are written
+        // directly into guest memory (no intermediate Vec<u8> buffer).
         engine
             .mem_map_image(identity.image_base, image_size, wie_cpu::RwxPerms::ALL)
             .context("failed to map PE image memory")?;
@@ -534,7 +536,7 @@ impl super::RuntimeSession {
             )
             .context("failed to zero guest FLS table")?;
 
-        // Phase 5 stub data: metrics / syscolors / cwd blob (cwd filled after identity).
+        // Stub data: metrics / syscolors / cwd blob (cwd filled after identity).
         engine
             .mem_map(
                 layout.guest_stub_data_base,
@@ -547,7 +549,7 @@ impl super::RuntimeSession {
             .mem_write(layout.guest_stub_data_base, &stub_page)
             .context("failed to write guest stub data page")?;
 
-        // B5: host-written guest clock table. Written once here (frozen values
+        // Host-written guest clock table. Written once here (frozen values
         // under `WIE_FIXED_CLOCK=1`), then refreshed every host stop so the
         // in-guest clock stubs advance without stopping the host.
         engine
@@ -819,7 +821,7 @@ impl super::RuntimeSession {
             )
             .context("failed to map fake resource memory")?;
 
-        // Phase 1.2 / 3.3: register named layout + PE section ranges.
+        // Register named layout and PE section ranges.
         register_layout_regions(
             engine.as_mut(),
             &layout,

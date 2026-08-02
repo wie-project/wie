@@ -52,7 +52,7 @@ pub(crate) fn publish_cwd_wide(
     Ok(())
 }
 
-/// Publish the current clock snapshot into the host-written guest clock table (B5).
+/// Publish the current clock snapshot into the host-written guest clock table.
 ///
 /// Slot layout must match the classify offsets above and
 /// `wie_winapi::kernel32::clock::clock_table_values`. The host refreshes this

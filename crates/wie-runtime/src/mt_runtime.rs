@@ -1,9 +1,8 @@
-//! Process execution state: single `ProcessResources` for both JIT and Iced.
+//! Process execution state: per-thread engine spawn/join and shared resources.
 //!
-//! Per-thread engines: each guest thread runs on its own `CpuEngine` instance.
-//! JIT workers share `Arc<JitShared>` (compilation cache). Iced workers share
-//! `Arc<RwLock<GuestMemory>>` extracted from the primary `IcedCpu` and passed to
-//! workers at spawn time. WinAPI is always behind `Arc<Mutex<>>`.
+//! Each guest thread runs on its own `CpuEngine` instance. JIT workers share
+//! `Arc<JitShared>` (compilation cache); Iced workers share
+//! `Arc<RwLock<GuestMemory>>`. WinAPI is always behind `Arc<Mutex<>>`.
 
 use crate::hooks::{SoftApiTable, resolve_fake_api_at};
 use crate::memory::RuntimeMemoryLayout;
@@ -33,17 +32,24 @@ pub(crate) fn mt_debug() -> bool {
 
 #[derive(Clone)]
 pub(crate) struct ProcessConfig {
+    /// Hook table the fake-API stop range resolves through.
     pub soft_apis: SoftApiTable,
+    /// Process-wide environment (paths, command line) served to WinAPI.
     pub environment: wie_winapi::WinApiEnvironment,
+    /// Fixed guest memory layout (stack, heaps, fake-API range, stub pages).
     pub layout: RuntimeMemoryLayout,
+    /// Bitmap marking which fake-API VAs stop the host vs pass through.
     pub stop_bitmap: Arc<[u8]>,
+    /// Guest thread id of the primary (entry-point) thread.
     pub primary_tid: GuestTid,
 }
 
 // ── ProcessResources: single struct for both JIT and Iced ──────────────
 
+/// Shared process state: config, primary engine, backend caches, WinAPI.
 pub(crate) struct ProcessResources {
     pub config: ProcessConfig,
+    /// Primary (guest-entry) engine; workers get their own engine at spawn.
     pub engine: Box<dyn CpuEngine>,
     /// `Some` when the JIT backend is active; workers clone this to share
     /// the compilation cache. `None` for the Iced interpreter backend.
@@ -55,6 +61,7 @@ pub(crate) struct ProcessResources {
     /// Guest message queue behind its own mutex — host input posts through
     /// this without ever locking `shared_winapi`.
     pub shared_message_queue: Arc<Mutex<wie_winapi::present::MessageQueue>>,
+    /// Join handles for spawned guest worker threads.
     pub worker_joins: Vec<JoinHandle<()>>,
 }
 
@@ -385,7 +392,7 @@ fn worker_main(
                     }
                 }
             }
-            // B3.6: flush coalesced publishes only when the worker is about to
+            // Flush coalesced publishes only when the worker is about to
             // block (park) — a repaint cycle's BitBlt + control paints across
             // dispatches publish once at the park boundary instead of once per
             // dispatch (which emitted child-less intermediate frames). Workers

@@ -2,8 +2,8 @@
 //!
 //! Every guest accelerator (guest I/O, MBWC, heap) emits a code buffer with
 //! placeholder branch immediates and patches them once the layout is known.
-//! The helpers were triplicated across those modules and merged here
-//! (Idiom Phase I). `clear_bit` is shared with the stop-bitmap planters.
+//! These helpers are shared across those modules; `clear_bit` is shared with
+//! the stop-bitmap planters.
 
 /// Write a 32-bit relative displacement (`E8`/`E9`/`0F 8x` imm32) at `imm_at`.
 ///

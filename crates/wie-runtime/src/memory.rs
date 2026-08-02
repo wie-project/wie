@@ -74,10 +74,10 @@ pub struct RuntimeMemoryLayout {
     /// Guest MultiByteToWideChar helper code.
     pub guest_mbwc_code_base: u64,
     pub guest_mbwc_code_size: usize,
-    /// Guest-visible tables for Phase 5 stubs (metrics, colors, cwd wide path).
+    /// Guest-visible tables for the data-backed stubs (metrics, colors, cwd wide path).
     pub guest_stub_data_base: u64,
     pub guest_stub_data_size: usize,
-    /// Host-written guest clock table (6 × u64; B5 — refreshed each host stop).
+    /// Host-written guest clock table (6 × u64 — refreshed each host stop).
     pub clock_table_va: u64,
     /// Size of the guest clock table mapping.
     pub clock_table_size: usize,
@@ -135,7 +135,7 @@ impl RuntimeMemoryLayout {
             // Metrics[256×u32] + colors[32×u32] + cwd wide blob.
             guest_stub_data_base: 0x0000_7000_0040_9000,
             guest_stub_data_size: 0x2000,
-            // B5: host-refreshed 6×u64 clock table (GetTickCount/timeGetTime/QPC/…).
+            // Host-refreshed 6×u64 clock table (GetTickCount/timeGetTime/QPC/…).
             clock_table_va: 0x0000_7000_0040_B000,
             clock_table_size: 0x1000,
         }

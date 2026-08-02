@@ -1,4 +1,4 @@
-//! wgpu (Metal) present backend — P4a.
+//! wgpu (Metal) present backend.
 //!
 //! Replaces the softbuffer CPU path for getting guest frames on screen. The
 //! guest thread keeps publishing [`SurfaceFrame`]s (0RGB u32, top-down); this
@@ -9,7 +9,7 @@
 //! Guest pixels are 0RGB with the alpha byte ALWAYS 0. wgpu honors alpha, so a
 //! direct upload would present a fully transparent window (softbuffer's AppKit
 //! backend masked it via `CGImageAlphaInfo::NoneSkipFirst`). The blit forces
-//! `alpha = 1.0` and gives the B3 region uploads real savings: the staging
+//! `alpha = 1.0` and gives dirty-region uploads real savings: the staging
 //! texture persists across frames (unlike softbuffer's fresh-zeroed-buffer-per
 //! `buffer_mut()`), so only the dirty region is re-uploaded.
 //!
@@ -302,10 +302,10 @@ impl WgpuPresenter {
         let frame_h = frame.height.max(1);
 
         // Recreate the staging texture when the guest frame size changed.
-        // Publish-model rework (ora-5): every publish is a FULL frame, so the
+        // Publish-model rework: every publish is a FULL frame, so the
         // staging texture always equals the last published frame — the
         // region-delta contract ("changes since the last guest publish")
-        // cannot survive B2 present skipping, which would leave a losing
+        // cannot survive present skipping, which would leave a losing
         // publish's delta permanently absent from the persistent staging.
         if self
             .staging

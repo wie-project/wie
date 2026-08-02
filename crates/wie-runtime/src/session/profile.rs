@@ -1,3 +1,5 @@
+//! `RuntimeProfile` collection, getters, and report formatting.
+
 use std::collections::HashMap;
 
 /// Host-side timing breakdown for one session (enabled via `WIE_RUNTIME_PROFILE=1`).
@@ -13,6 +15,9 @@ pub struct RuntimeProfile {
     host_stops: u64,
     noisy_calls: u64,
     charged_calls: u64,
+    /// Per-export counts and handler time (`library!name` → (count, ns));
+    /// exposed as the plural getter [`Self::by_exports`] because the value is
+    /// a whole map, not one export.
     by_export: HashMap<String, (u64, u128)>,
     wall_ns: u128,
     cpu_user_us: u64,
@@ -100,7 +105,7 @@ impl RuntimeProfile {
     pub fn mem_backend(&self) -> &str {
         &self.mem_backend
     }
-    /// Host idle policy name (`busy` / `yield` / `park`, Phase 6).
+    /// Host idle policy name (`busy` / `yield` / `park`).
     #[must_use]
     pub fn idle_policy(&self) -> &str {
         &self.idle_policy
@@ -115,52 +120,52 @@ impl RuntimeProfile {
     pub fn idle_park_ns(&self) -> u128 {
         self.idle_park_ns
     }
-    /// B9: number of published frames (frame timing enabled only).
+    /// Number of published frames (frame timing enabled only).
     #[must_use]
     pub fn frames_published(&self) -> u64 {
         self.frames_published
     }
-    /// B9: accumulated publish wall time (ns).
+    /// Accumulated publish wall time (ns).
     #[must_use]
     pub fn publish_ns(&self) -> u128 {
         self.publish_ns
     }
-    /// B9: duration of the most recent publish (ns).
+    /// Duration of the most recent publish (ns).
     #[must_use]
     pub fn publish_ns_last(&self) -> u128 {
         self.publish_ns_last
     }
-    /// B9: accumulated BitBlt mask-copy (`mask_bgra_to_0rgb`) wall time (ns).
+    /// Accumulated BitBlt mask-copy (`mask_bgra_to_0rgb`) wall time (ns).
     #[must_use]
     pub fn blit_copy_ns(&self) -> u128 {
         self.blit_copy_ns
     }
-    /// B9: duration of the most recent mask copy (ns).
+    /// Duration of the most recent mask copy (ns).
     #[must_use]
     pub fn blit_copy_ns_last(&self) -> u128 {
         self.blit_copy_ns_last
     }
-    /// B9: accumulated host present (softbuffer copy + upload) wall time (ns).
+    /// Accumulated host present (softbuffer copy + upload) wall time (ns).
     #[must_use]
     pub fn present_ns(&self) -> u128 {
         self.present_ns
     }
-    /// B9: duration of the most recent host present (ns).
+    /// Duration of the most recent host present (ns).
     #[must_use]
     pub fn present_ns_last(&self) -> u128 {
         self.present_ns_last
     }
-    /// B9: host stops between the last two published frames.
+    /// Host stops between the last two published frames.
     #[must_use]
     pub fn last_frame_host_stops(&self) -> u64 {
         self.last_frame_host_stops
     }
-    /// B9: iced-retired instructions between the last two published frames.
+    /// Iced-retired instructions between the last two published frames.
     #[must_use]
     pub fn last_frame_iced_insns(&self) -> u64 {
         self.last_frame_iced_insns
     }
-    /// B9: jit-retired instructions between the last two published frames.
+    /// JIT-retired instructions between the last two published frames.
     #[must_use]
     pub fn last_frame_jit_insns(&self) -> u64 {
         self.last_frame_jit_insns
@@ -393,7 +398,7 @@ impl super::RuntimeSession {
         }
     }
 
-    /// Enable B9 frame timing (publish / blit-copy / present instrumentation)
+    /// Enable frame timing (publish / blit-copy / present instrumentation)
     /// without the `WIE_RUNTIME_PROFILE` env var. Used by the micro-suite
     /// frame-time budget gate.
     pub fn enable_frame_timing(&mut self) {
@@ -401,14 +406,14 @@ impl super::RuntimeSession {
         wie_winapi::present::set_frame_timing_enabled(true);
     }
 
-    /// B9: publish duration of the most recent frame (ns; 0 when timing disabled).
+    /// Publish duration of the most recent frame (ns; 0 when timing disabled).
     #[must_use]
     pub fn present_publish_ns_last(&self) -> u128 {
         self.process
             .with_winapi_ref(|st| st.try_present().map_or(0, |p| p.publish_ns_last))
     }
 
-    /// B9: per-frame timing — copy the present-side accumulators (publish,
+    /// Per-frame timing — copy the present-side accumulators (publish,
     /// blit-copy, host present) into the profile and log per-frame host-stop /
     /// iced-vs-jit deltas whenever a new frame was published since the last
     /// sample. Runs once per host-stop quantum when profiling is enabled.

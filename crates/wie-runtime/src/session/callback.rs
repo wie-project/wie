@@ -1,3 +1,5 @@
+//! Guest WndProc bridging: host API entry → Win64-convention guest callback.
+
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use wie_winapi::OuterReturn;

@@ -243,7 +243,7 @@ pub fn run_micro_exe_with_options(
 
 /// Runs until the runtime yields waiting for a message or another terminal condition.
 ///
-/// Phase 6: under [`wie_winapi::IdlePolicy::Park`] (default for persistent when
+/// Under [`wie_winapi::IdlePolicy::Park`] (default for persistent when
 /// `WIE_IDLE` is unset), empty `GetMessage` parks the host for short quanta and
 /// re-enters until a message arrives or `WIE_IDLE_MAX_PARKS` is hit (then yields).
 pub fn run_persistent_until_yield(

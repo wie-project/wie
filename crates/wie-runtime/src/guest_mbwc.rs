@@ -13,9 +13,12 @@ use crate::memory::RuntimeMemoryLayout;
 use anyhow::{Context, Result};
 use wie_winapi::{WinApiId, encode_alias};
 
+/// Guest `MultiByteToWideChar` helper placement for the single-byte path.
 #[derive(Debug, Clone)]
 pub struct GuestMbwcConfig {
+    /// Guest VA of the in-guest expand helper body.
     pub impl_va: u64,
+    /// Hooked fake VA the helper jumps to for multi-byte pages.
     pub fallback_va: u64,
 }
 

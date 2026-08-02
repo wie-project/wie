@@ -21,7 +21,7 @@ pub fn run_screenshot(path: &Path, out_path: &Path) -> Result<()> {
 
     let outcome = run_windowed(&mut session, &control)?;
 
-    // B9: finalize and print the runtime profile (publish / blit-copy frame
+    // Finalize and print the runtime profile (publish / blit-copy frame
     // timing) so `WIE_RUNTIME_PROFILE=1 wie-cli run --screenshot …` reports
     // the new frame-time fields.
     if session.profile_enabled() {

@@ -121,10 +121,10 @@ struct WindowRuntime {
     window: Arc<Window>,
     /// At-most-one present backend (wgpu XOR softbuffer), by construction.
     surface: Option<PresentBackend>,
-    /// B2: present generation of the last frame actually presented; frames
+    /// Present generation of the last frame actually presented; frames
     /// with an unchanged generation AND unchanged window size are skipped.
     last_presented_generation: Option<u64>,
-    /// B2: window size at the last present (drag-stretch must not be skipped).
+    /// Window size at the last present (drag-stretch must not be skipped).
     last_presented_size: Option<(u32, u32)>,
     /// Latest window size from winit during a resize drag.
     pending_size: Option<(u32, u32)>,
@@ -177,7 +177,7 @@ impl WindowState {
 /// The present backend for a window. At most one variant is set — the two
 /// backends are mutually exclusive per window.
 enum PresentBackend {
-    /// P4a: wgpu (Metal) present backend, used by default on macOS. When set,
+    /// wgpu (Metal) present backend, used by default on macOS. When set,
     /// `Softbuffer` stays unset. Falls back to softbuffer if wgpu init fails
     /// or `WIE_PRESENT` names softbuffer.
     #[cfg(target_os = "macos")]
@@ -247,12 +247,13 @@ fn init_softbuffer(window: &Arc<Window>) -> Option<PresentBackend> {
         .map(PresentBackend::Softbuffer)
 }
 
+/// winit application state: bridges the guest window to the present backend.
 struct WieApp {
     handle: Option<GuestHandle>,
     /// Window-bound state; [`WindowState::Uncreated`] until the first frame
     /// creates the winit window, then [`WindowState::Active`] for the session.
     runtime: WindowState,
-    /// B2: wake-coalescing flag, shared with the guest-thread wake callback.
+    /// Wake-coalescing flag, shared with the guest-thread wake callback.
     /// Set on every publish; the first `Frame` event after a publish group
     /// swaps it and requests a redraw, duplicates skip.
     pending_frame: Arc<std::sync::atomic::AtomicBool>,
@@ -362,7 +363,7 @@ impl ApplicationHandler<WieEvent> for WieApp {
                         let s = rt.window.inner_size();
                         (s.width.max(1), s.height.max(1))
                     };
-                    // B2: skip redundant presents. When neither the
+                    // Skip redundant presents. When neither the
                     // present generation (nothing repainted) nor the
                     // window size (drag-stretch) changed since the last
                     // present, the published frame is byte-identical —
@@ -387,7 +388,7 @@ impl ApplicationHandler<WieEvent> for WieApp {
                     );
                     let src_w = frame.width.max(1);
                     let src_h = frame.height.max(1);
-                    // B9(d): time copy ③ (write_texture + present, or
+                    // Time copy ③ (write_texture + present, or
                     // copy_from_slice / stretch_nearest + softbuffer present)
                     // — only when frame timing is on.
                     let present_t0 = if handle.frame_timing_enabled() {
@@ -399,7 +400,7 @@ impl ApplicationHandler<WieEvent> for WieApp {
                         match backend {
                             #[cfg(target_os = "macos")]
                             PresentBackend::Wgpu(presenter) => {
-                                // P4a: wgpu path — no CPU copy; the blit pass
+                                // wgpu path — no CPU copy; the blit pass
                                 // nearest-scales via the sampler when the window
                                 // size differs from the frame size (identical
                                 // nearest semantics to stretch_nearest).
@@ -632,7 +633,7 @@ impl ApplicationHandler<WieEvent> for WieApp {
                 let Some(rt) = self.runtime.as_mut() else {
                     return;
                 };
-                // P4a: keep the wgpu swapchain matching the window's physical
+                // Keep the wgpu swapchain matching the window's physical
                 // size. This is purely the host surface — the guest-visible
                 // WM_SIZE bookkeeping below is untouched.
                 #[cfg(target_os = "macos")]
@@ -707,7 +708,7 @@ impl ApplicationHandler<WieEvent> for WieApp {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WieEvent) {
         match event {
             WieEvent::Frame { published_at } => {
-                // B9(b): wake → event-loop latency.
+                // Wake → event-loop latency.
                 tracing::debug!(
                     target: "wiegui",
                     wake_to_user_us = u64::try_from(published_at.elapsed().as_micros())
@@ -743,7 +744,7 @@ impl ApplicationHandler<WieEvent> for WieApp {
                         }
                     }
                 } else if let Some(rt) = self.runtime.as_ref() {
-                    // B2: coalesce wake storms. Every publish sets the flag;
+                    // Coalesce wake storms. Every publish sets the flag;
                     // the first Frame event after a publish group requests the
                     // redraw and later duplicates (which see the flag cleared)
                     // skip. A real new frame is never dropped: any new publish
@@ -789,7 +790,7 @@ pub fn run_gui_windowed(path: &std::path::Path) -> Result<()> {
         .build()
         .context("build event loop")?;
     let proxy = event_loop.create_proxy();
-    // B2: wake-coalescing flag, shared between the guest-thread wake callback
+    // Wake-coalescing flag, shared between the guest-thread wake callback
     // and the host event loop. Cloned for the guest thread; the original moves
     // into `WieApp`.
     let pending_frame = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -814,7 +815,7 @@ pub fn run_gui_windowed(path: &std::path::Path) -> Result<()> {
                             let proxy = proxy.clone();
                             let pending = pending_frame_guest.clone();
                             handle.set_wake(Box::new(move || {
-                                // B2: mark the pending frame BEFORE sending so
+                                // Mark the pending frame BEFORE sending so
                                 // the first Frame event always does the work.
                                 pending.store(true, std::sync::atomic::Ordering::SeqCst);
                                 let _ = proxy.send_event(WieEvent::Frame {

@@ -50,15 +50,25 @@ pub const GUEST_IO_SLOT_SIZE: usize = 40;
 /// Guest-side I/O services configuration (also stored on `WinApiState` via layout).
 #[derive(Debug, Clone)]
 pub struct GuestIoConfig {
+    /// Guest VA of the handle table (fixed-layout slots).
     pub table_va: u64,
+    /// First byte of the guest helper code region.
     pub code_base: u64,
+    /// Guest VA where mirrored file bytes are stored.
     pub file_data_base: u64,
+    /// Size of the mirrored file-data arena.
     pub file_data_size: usize,
+    /// Guest VA of the in-guest `ReadFile` helper body.
     pub readfile_impl_va: u64,
+    /// Guest VA of the in-guest `SetFilePointer` helper body.
     pub setfp_impl_va: u64,
+    /// Guest VA of the in-guest `GetFileSize` helper body.
     pub getfs_impl_va: u64,
+    /// Hooked fake VA the read helper jumps to for unregistered handles.
     pub readfile_fallback_va: u64,
+    /// Hooked fake VA the seek helper jumps to for unregistered handles.
     pub setfp_fallback_va: u64,
+    /// Hooked fake VA the size helper jumps to for unregistered handles.
     pub getfs_fallback_va: u64,
 }
 

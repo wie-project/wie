@@ -1,7 +1,8 @@
+//! `GuestHandle` window-tree access: hit-testing, capture, and message posting.
+
 use super::menu::{MenuNode, MenuTreeCache, build_menu_tree};
 use wie_winapi::handles::Hmenu;
 
-/// Append one journal line when `WIE_API_JOURNAL` is set (backend A/B diffs).
 /// Host-side handle to the WinAPI state for cross-thread access.
 ///
 /// The presenter calls methods on this handle to post messages and read
@@ -33,13 +34,13 @@ impl GuestHandle {
             .cloned()
     }
 
-    /// B9: whether frame timing instrumentation is active (lock-free gate).
+    /// Whether frame timing instrumentation is active (lock-free gate).
     #[must_use]
     pub fn frame_timing_enabled(&self) -> bool {
         wie_winapi::present::frame_timing_enabled()
     }
 
-    /// B2: the current present generation (bumped by every publish). Used by
+    /// The current present generation (bumped by every publish). Used by
     /// the host to skip redundant presents of an unchanged frame.
     #[must_use]
     pub fn present_generation(&self) -> u64 {
@@ -49,7 +50,7 @@ impl GuestHandle {
         state.try_present().map_or(0, |p| p.generation)
     }
 
-    /// B9: record one host present (softbuffer copy + upload) wall time (ns).
+    /// Record one host present (softbuffer copy + upload) wall time (ns).
     /// The internal gate makes this a no-op (no lock) when timing is disabled.
     pub fn record_present_time(&self, ns: u128) {
         if !wie_winapi::present::frame_timing_enabled() {
@@ -60,7 +61,7 @@ impl GuestHandle {
         }
     }
 
-    /// B9: publish duration of the most recent frame (ns; 0 when timing disabled).
+    /// Publish duration of the most recent frame (ns; 0 when timing disabled).
     #[must_use]
     pub fn present_publish_ns_last(&self) -> u128 {
         let Ok(state) = self.state.lock() else {

@@ -1,3 +1,5 @@
+//! Menu-tree building for the macOS bar (`MenuNode` + build/cache logic).
+
 use std::sync::{Arc, RwLock};
 use wie_winapi::handles::Hmenu;
 use wie_winapi::user32::menu::{MenuEntry, MenuRecord};

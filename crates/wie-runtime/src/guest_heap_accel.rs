@@ -31,15 +31,24 @@ const LARGE_THRESHOLD: u64 = 65_536;
 /// Control block: bump (u64) + freelist heads (24 × u64).
 pub const HEAP_CTRL_SIZE: usize = 8 + HEAP_SIZE_CLASS_COUNT * 8;
 
+/// Layout of the in-guest heap control block and helper code region.
 #[derive(Debug, Clone)]
 pub struct GuestHeapAccelConfig {
+    /// Guest VA of the control block (bump cursor + freelist heads).
     pub ctrl_va: u64,
+    /// First byte of the guest process-heap arena.
     pub heap_base: u64,
+    /// One past the last byte of the guest process-heap arena.
     pub heap_end: u64,
+    /// The process-heap handle `HeapAlloc` receives in RCX.
     pub process_heap_handle: u64,
+    /// Guest VA of the in-guest `HeapAlloc` helper body.
     pub alloc_impl_va: u64,
+    /// Guest VA of the in-guest `HeapFree` helper body.
     pub free_impl_va: u64,
+    /// Hooked fake VA the alloc helper jumps to for large/exotic requests.
     pub alloc_fallback_va: u64,
+    /// Hooked fake VA the free helper jumps to for unhandled pointers.
     pub free_fallback_va: u64,
 }
 
