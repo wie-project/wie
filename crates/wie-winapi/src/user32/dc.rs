@@ -3,6 +3,7 @@ use super::{
     checked_field_address, write_guest_i32, write_guest_u32, write_guest_u64,
 };
 use crate::gdi32::DcKind;
+use crate::state::WindowFlags;
 
 /// Handles `USER32.dll!GetDC`.
 pub fn handle_get_dc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -82,8 +83,8 @@ pub fn handle_begin_paint(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         // fErase: nonzero when the background still needs erasing — i.e. the
         // invalidation asked for an erase and no WM_ERASEBKGND consumed it
         // (a class brush that erased it clears the flag on dispatch).
-        let f_erase =
-            super::find_window(state, window_handle).is_some_and(|window| window.erase_background);
+        let f_erase = super::find_window(state, window_handle)
+            .is_some_and(|window| window.flags.contains(WindowFlags::ERASE_BACKGROUND));
         write_guest_u32(
             engine,
             checked_field_address(paint_ptr, 8, "fErase"),
@@ -150,7 +151,7 @@ pub fn handle_end_paint(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
         window.invalidated = false;
         // The paint cycle is over: a pending erase either ran (WM_ERASEBKGND)
         // or was seen by the WndProc via fErase and handled by the app.
-        window.erase_background = false;
+        window.flags.remove(WindowFlags::ERASE_BACKGROUND);
     }
 
     let return_value = u64::from(success);

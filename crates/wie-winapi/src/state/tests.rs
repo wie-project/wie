@@ -89,7 +89,7 @@ fn winapi_state_default() -> WinApiState {
         },
         file_io: FileIoState {
             executable_file_size: 0,
-            executable_file_bytes: Vec::new(),
+            executable_file_bytes: Arc::new(Vec::new()),
             executable_file_cursor: 0,
             next_find_handle: crate::FindFileHandle::from(0),
             find_handles: Vec::new(),
@@ -1834,7 +1834,7 @@ fn test_space_keyboard_activates_focused_button() {
             .windows
             .iter()
             .find(|w| w.handle == crate::handles::Hwnd::from(button))
-            .is_some_and(|w| w.pressed),
+            .is_some_and(|w| w.flags.contains(WindowFlags::PRESSED)),
         "space keydown must press the focused button"
     );
 
@@ -2061,7 +2061,7 @@ fn test_erase_background_fills_class_brush_and_clears_flag() {
         width: 64,
         height: 32,
         invalidated: true,
-        erase_background: true,
+        flags: WindowFlags::ERASE_BACKGROUND,
         ..Default::default()
     });
 
@@ -2076,7 +2076,8 @@ fn test_erase_background_fills_class_brush_and_clears_flag() {
             .iter()
             .find(|w| w.handle == crate::handles::Hwnd::from(win))
             .expect("erased window exists")
-            .erase_background,
+            .flags
+            .contains(WindowFlags::ERASE_BACKGROUND),
         "the erase must consume the pending-erase flag"
     );
     let surf = state
@@ -2118,7 +2119,7 @@ fn test_is_window_recognizes_real_windows() {
         width: 100,
         height: 100,
         visible: true,
-        enabled: true,
+        flags: WindowFlags::ENABLED,
         ..Default::default()
     });
     ws.windows.push(WindowRecord {
@@ -2127,7 +2128,6 @@ fn test_is_window_recognizes_real_windows() {
         control_kind: Some(crate::user32::controls::ControlClassKind::Button),
         title: "Child".to_owned(),
         visible: false,
-        enabled: false,
         width: 40,
         height: 20,
         ..Default::default()
@@ -2406,8 +2406,8 @@ impl ControlUiSnapshot {
                 .iter()
                 .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
             {
-                snap.pressed = window.pressed;
-                snap.focused = window.focused;
+                snap.pressed = window.flags.contains(WindowFlags::PRESSED);
+                snap.focused = window.flags.contains(WindowFlags::FOCUSED);
             }
             match ws.control_states.get(&crate::handles::Hwnd::from(hwnd)) {
                 Some(ControlState::Button { default_push }) => {

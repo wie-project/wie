@@ -14,6 +14,7 @@ use super::{
     read_guest_u32, read_guest_u64, write_message_structure,
 };
 use crate::OuterReturn;
+use crate::state::WindowFlags;
 
 mod class;
 mod synth;
@@ -692,7 +693,7 @@ pub(crate) fn handle_default_window_procedure(
             if let Some(window) = find_window_mut(state, hwnd) {
                 window.invalidated = false;
                 // No BeginPaint ran: the pending erase has no consumer.
-                window.erase_background = false;
+                window.flags.remove(WindowFlags::ERASE_BACKGROUND);
             }
             0
         }

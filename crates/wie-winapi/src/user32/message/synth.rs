@@ -6,6 +6,7 @@ use crate::gdi32::brush_color;
 use crate::gdi32::fill_rect_surface;
 use crate::gdi32::resolve_window_ancestor;
 use crate::gdi32::subtract_rect;
+use crate::state::WindowFlags;
 use crate::user32::misc::timer_deadline;
 use crate::user32::window::sys_color;
 use crate::user32::{
@@ -289,7 +290,7 @@ fn synthesize_wm_paint(
         windows
             .iter()
             .find(|window| window.handle == hwnd)
-            .is_some_and(|window| window.erase_background)
+            .is_some_and(|window| window.flags.contains(WindowFlags::ERASE_BACKGROUND))
     } && class_brush_color(state, hwnd.as_u64()).is_some();
 
     if let Some(window) = find_window_mut(state, hwnd.as_u64()) {
@@ -391,7 +392,7 @@ pub(crate) fn erase_window_background(state: &mut WinApiState, hwnd: u64) -> boo
         return false;
     };
     if let Some(window) = find_window_mut(state, hwnd) {
-        window.erase_background = false;
+        window.flags.remove(WindowFlags::ERASE_BACKGROUND);
     }
     let Some(info) = resolve_window_ancestor(state, hwnd) else {
         return true;

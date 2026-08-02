@@ -20,6 +20,7 @@ use super::{
 };
 use crate::OuterReturn;
 use crate::gdi32::resolve_window_ancestor;
+use crate::state::WindowFlags;
 
 mod button;
 mod edit;
@@ -249,9 +250,9 @@ impl ControlClassKind {
             }
             (_, WinMsg::WM_LBUTTONDOWN) => {
                 if let Some(window) = find_window_mut(state, hwnd) {
-                    window.pressed = true;
+                    window.flags.insert(WindowFlags::PRESSED);
                     if self != ControlClassKind::Static {
-                        window.focused = true;
+                        window.flags.insert(WindowFlags::FOCUSED);
                     }
                 }
                 if self != ControlClassKind::Static {
@@ -291,8 +292,8 @@ impl ControlClassKind {
             }
             (_, WinMsg::WM_LBUTTONUP) => {
                 let was_pressed = find_window_mut(state, hwnd).is_some_and(|window| {
-                    if window.pressed {
-                        window.pressed = false;
+                    if window.flags.contains(WindowFlags::PRESSED) {
+                        window.flags.remove(WindowFlags::PRESSED);
                         true
                     } else {
                         false
@@ -315,7 +316,7 @@ impl ControlClassKind {
             (ControlClassKind::Button, WinMsg::WM_KEYDOWN) if word_parameter & 0xFF == VK_SPACE => {
                 if state.window_state().focus_window_handle == crate::handles::Hwnd::from(hwnd) {
                     if let Some(window) = find_window_mut(state, hwnd) {
-                        window.pressed = true;
+                        window.flags.insert(WindowFlags::PRESSED);
                     }
                     invalidate(state, hwnd);
                     Ok(Some(0))
@@ -324,9 +325,10 @@ impl ControlClassKind {
                 }
             }
             (ControlClassKind::Button, WinMsg::WM_KEYUP) if word_parameter & 0xFF == VK_SPACE => {
-                if find_window(state, hwnd).is_some_and(|w| w.pressed) {
+                if find_window(state, hwnd).is_some_and(|w| w.flags.contains(WindowFlags::PRESSED))
+                {
                     if let Some(window) = find_window_mut(state, hwnd) {
-                        window.pressed = false;
+                        window.flags.remove(WindowFlags::PRESSED);
                     }
                     invalidate(state, hwnd);
                     let id = find_window(state, hwnd).map_or(0, |w| w.menu_handle);
@@ -339,7 +341,7 @@ impl ControlClassKind {
             // BN_CLICKED to the parent exactly like a mouse release.
             (ControlClassKind::Button, WinMsg::BM_CLICK) => {
                 if let Some(window) = find_window_mut(state, hwnd) {
-                    window.pressed = false;
+                    window.flags.remove(WindowFlags::PRESSED);
                 }
                 let id = find_window(state, hwnd).map_or(0, |w| w.menu_handle);
                 let command_wparam = make_command_wparam(id, BN_CLICKED);
@@ -349,10 +351,10 @@ impl ControlClassKind {
             (ControlClassKind::Button, WinMsg::BM_GETSTATE) => {
                 let window = find_window(state, hwnd);
                 let mut bits = 0;
-                if window.is_some_and(|w| w.pressed) {
+                if window.is_some_and(|w| w.flags.contains(WindowFlags::PRESSED)) {
                     bits |= BST_PUSHED;
                 }
-                if window.is_some_and(|w| w.focused) {
+                if window.is_some_and(|w| w.flags.contains(WindowFlags::FOCUSED)) {
                     bits |= BST_FOCUS;
                 }
                 Ok(Some(bits))
@@ -360,8 +362,12 @@ impl ControlClassKind {
             // BM_SETSTATE: set the pressed visual state (no click delivered).
             (ControlClassKind::Button, WinMsg::BM_SETSTATE) => {
                 let previous = find_window_mut(state, hwnd).is_some_and(|window| {
-                    let prev = window.pressed;
-                    window.pressed = word_parameter != 0;
+                    let prev = window.flags.contains(WindowFlags::PRESSED);
+                    if word_parameter != 0 {
+                        window.flags.insert(WindowFlags::PRESSED);
+                    } else {
+                        window.flags.remove(WindowFlags::PRESSED);
+                    }
                     prev
                 });
                 let previous = u64::from(previous);
@@ -370,13 +376,13 @@ impl ControlClassKind {
             }
             (_, WinMsg::WM_SETFOCUS) => {
                 if let Some(window) = find_window_mut(state, hwnd) {
-                    window.focused = true;
+                    window.flags.insert(WindowFlags::FOCUSED);
                 }
                 Ok(Some(0))
             }
             (_, WinMsg::WM_KILLFOCUS) => {
                 if let Some(window) = find_window_mut(state, hwnd) {
-                    window.focused = false;
+                    window.flags.remove(WindowFlags::FOCUSED);
                 }
                 Ok(Some(0))
             }

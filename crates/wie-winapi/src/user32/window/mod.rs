@@ -15,6 +15,7 @@ use super::{
     write_guest_utf16_c_string, write_wide_window_text, write_window_rect,
 };
 use crate::OuterReturn;
+use crate::state::WindowFlags;
 
 mod class;
 mod geom;
@@ -218,7 +219,8 @@ pub fn handle_is_window_enabled(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let return_value = u64::from(if window_handle == FAKE_WINDOW_HANDLE {
         state.window_state().window_enabled
     } else {
-        find_window(state, window_handle).is_some_and(|window| window.enabled)
+        find_window(state, window_handle)
+            .is_some_and(|window| window.flags.contains(WindowFlags::ENABLED))
     });
 
     let return_address = engine
@@ -309,7 +311,7 @@ pub fn handle_show_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         // dialog close, which then visibly "changes the background color".
         if show_command != 0 {
             window.invalidated = true;
-            window.erase_background = true;
+            window.flags.insert(WindowFlags::ERASE_BACKGROUND);
         }
     }
 
@@ -582,7 +584,7 @@ pub fn handle_update_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         // the invalidation requested it and a class brush exists (the
         // message-loop path synthesizes WM_ERASEBKGND ahead of WM_PAINT; here
         // the erase runs inline, DefWindowProc semantics).
-        if window.erase_background {
+        if window.flags.contains(WindowFlags::ERASE_BACKGROUND) {
             super::message::erase_window_background(state, window_handle);
         }
 
@@ -635,7 +637,7 @@ pub fn handle_invalidate_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         // bErase: OR so a TRUE erase request survives a later FALSE invalidation
         // of a different region (the update region accumulates, matching Windows).
         if erase_background != 0 {
-            window.erase_background = true;
+            window.flags.insert(WindowFlags::ERASE_BACKGROUND);
         }
     }
 

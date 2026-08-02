@@ -9,6 +9,7 @@ pub(crate) use crate::guest_string::{
     write_fixed_utf16 as write_guest_fixed_utf16,
     write_utf16_c_string as write_guest_utf16_c_string,
 };
+pub(crate) use crate::state::WindowFlags;
 pub(crate) use crate::{
     GuestCallbackRequest, HandlerContext, MessageQueueIdlePolicy, QueuedWindowMessage, TimerRecord,
     WinApiControlSignal, WinApiHandlerResult, WinApiState, WindowClassRecord, WindowRecord,
@@ -621,12 +622,9 @@ pub(crate) fn create_window_record(
         width: request.width,
         height: request.height,
         visible,
-        enabled: true,
+        flags: WindowFlags::ENABLED,
         invalidated: control_kind.is_some() && visible,
-        erase_background: false,
         mouse_tracking: false,
-        pressed: false,
-        focused: false,
         client_rect: (0, 0, 0, 0),
         control_kind,
         control_text: request.title,

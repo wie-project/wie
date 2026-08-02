@@ -85,7 +85,8 @@ pub struct HeapState {
 #[derive(Debug, Clone)]
 pub struct FileIoState {
     pub executable_file_size: u64,
-    pub executable_file_bytes: Vec<u8>,
+    /// Raw main-module file bytes, shared (Arc) — readers only slice them.
+    pub executable_file_bytes: Arc<Vec<u8>>,
     pub executable_file_cursor: u64,
     pub next_find_handle: FindFileHandle,
     pub find_handles: Vec<FindHandle>,

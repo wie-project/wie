@@ -140,11 +140,57 @@ pub struct WindowClassRecord {
     pub unicode: bool,
 }
 
+/// Packed window-state flags for [`WindowRecord`].
+///
+/// The bits that the runtime crate does not read through `WinApiState`
+/// (`visible`, `invalidated`, `mouse_tracking` stay plain bools there) live in
+/// one `u16` so `WindowRecord` keeps a handful of independently documented
+/// fields rather than a bool per flag.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct WindowFlags(u16);
+
+impl WindowFlags {
+    /// The window is shown.
+    pub const VISIBLE: Self = Self(1 << 0);
+    /// The window is enabled for mouse/keyboard input.
+    pub const ENABLED: Self = Self(1 << 1);
+    /// The window has been invalidated and needs a repaint.
+    pub const INVALIDATED: Self = Self(1 << 2);
+    /// The pending repaint cycle must erase the background first.
+    pub const ERASE_BACKGROUND: Self = Self(1 << 3);
+    /// `TrackMouseEvent` armed hover/leave tracking for this window.
+    pub const MOUSE_TRACKING: Self = Self(1 << 4);
+    /// Mouse press tracking shared by every control kind.
+    pub const PRESSED: Self = Self(1 << 5);
+    /// Keyboard focus tracking shared by every control kind.
+    pub const FOCUSED: Self = Self(1 << 6);
+
+    /// Whether `flag` is set.
+    pub const fn contains(self, flag: Self) -> bool {
+        self.0 & flag.0 != 0
+    }
+
+    /// Set `flag`.
+    pub const fn insert(&mut self, flag: Self) {
+        self.0 |= flag.0;
+    }
+
+    /// Clear `flag`.
+    pub const fn remove(&mut self, flag: Self) {
+        self.0 &= !flag.0;
+    }
+
+    /// The raw `u16` bit pattern.
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
+}
+
 /// USER32 window created inside the compatibility runtime.
 #[derive(Debug, Clone, Default)]
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "each window flag is an independently documented, directly-read USER32 state bit"
+    reason = "the remaining bools (visible, invalidated, mouse_tracking, unicode contracts) are read/written directly by the runtime crate or are class-contract booleans, not window-state flags"
 )]
 pub struct WindowRecord {
     /// Runtime-owned fake HWND.
@@ -193,43 +239,22 @@ pub struct WindowRecord {
     pub height: i32,
 
     /// Current visibility state.
+    ///
+    /// Kept as a plain bool because the runtime crate reads it directly.
     pub visible: bool,
 
-    /// Current enabled state.
-    pub enabled: bool,
+    /// Packed window-state flags (enabled / erase-background / press / focus).
+    pub flags: WindowFlags,
 
     /// Whether the window has been invalidated and needs a repaint.
-    pub invalidated: bool,
-
-    /// Whether the pending repaint cycle must erase the background first.
     ///
-    /// Set by `InvalidateRect(hwnd, rect, TRUE)` (OR'd — once a region asks
-    /// for an erase, a later `FALSE` cannot un-ask it, matching Windows). The
-    /// WM_PAINT synthesis queues a `WM_ERASEBKGND` ahead of the paint when a
-    /// class background brush exists; the erase dispatch clears the flag.
-    /// `BeginPaint`'s `fErase` reports the still-pending flag.
-    pub erase_background: bool,
+    /// Kept as a plain bool because the runtime crate writes it directly.
+    pub invalidated: bool,
 
     /// Whether `TrackMouseEvent` armed hover/leave tracking for this window.
     ///
-    /// With no tracking request Windows sends no `WM_MOUSEHOVER` /
-    /// `WM_MOUSELEAVE`; the host forwards those only for tracked windows.
+    /// Kept as a plain bool because the runtime crate reads it directly.
     pub mouse_tracking: bool,
-
-    /// Mouse press tracking shared by every control kind.
-    ///
-    /// The `WM_LBUTTONDOWN` / `WM_LBUTTONUP` dispatch arms press and release
-    /// every control (a release delivers `BN_CLICKED`); only BUTTONs render or
-    /// report the bit (`BM_GETSTATE` / `BM_SETSTATE`), so it lives on the
-    /// window record rather than in a per-kind variant.
-    pub pressed: bool,
-
-    /// Keyboard focus tracking shared by every control kind.
-    ///
-    /// Set by `WM_SETFOCUS` / `WM_KILLFOCUS` (and a click on a non-STATIC
-    /// control) for any kind; only BUTTON (`BM_GETSTATE`'s `BST_FOCUS`) and
-    /// EDIT (caret visibility) read it back.
-    pub focused: bool,
 
     /// Client rectangle (left, top, right, bottom).
     pub client_rect: (i32, i32, i32, i32),

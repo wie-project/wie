@@ -37,6 +37,7 @@ use crate::gdi32::IRect;
 use crate::gdi32::fill_rect_surface;
 use crate::gdi32::resolve_window_ancestor;
 use crate::gdi32::subtract_rect;
+use crate::state::WindowFlags;
 use wie_pe::resources::{DialogItemTemplate, DialogTemplate, ItemClass};
 
 /// `GetSysColor(COLOR_BTNFACE)` — the classic dialog face color.
@@ -544,7 +545,7 @@ pub fn handle_end_dialog(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
         let owner = remove_dialog_subtree(state, dialog_hwnd);
         if let Some(window) = find_window_mut(state, owner) {
             window.invalidated = true;
-            window.erase_background = true;
+            window.flags.insert(WindowFlags::ERASE_BACKGROUND);
         }
         invalidate_subtree(state, crate::handles::Hwnd::from(owner));
 

@@ -180,7 +180,7 @@ pub(crate) fn ensure_virtual_file(state: &mut WinApiState, guest_path: &str) {
 }
 pub(crate) fn resolve_guest_file_bytes(state: &WinApiState, guest_path: &str) -> Result<Vec<u8>> {
     if is_main_module_path(state, guest_path) {
-        return Ok(state.file_io.executable_file_bytes.clone());
+        return Ok((*state.file_io.executable_file_bytes).clone());
     }
 
     if let Some(mount) = state

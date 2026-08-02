@@ -11,6 +11,7 @@ use super::{
 };
 use crate::gdi32::ResolvedWindow;
 use crate::gdi32::{FontEngine, FontKey, ResolvedFont};
+use crate::state::WindowFlags;
 use crate::user32::{
     EN_CHANGE, VK_END, VK_HOME, VK_LEFT, VK_RIGHT, VK_SHIFT, WinApiState, find_window,
     make_command_wparam,
@@ -319,7 +320,8 @@ pub(super) fn paint_edit(
     key: &FontKey,
 ) -> Result<()> {
     let len = text.chars().count();
-    let focused = find_window(state, info.dc_window.as_u64()).is_some_and(|w| w.focused);
+    let focused = find_window(state, info.dc_window.as_u64())
+        .is_some_and(|w| w.flags.contains(WindowFlags::FOCUSED));
     let (sel_start, sel_end, caret) = match control_state(state, info.dc_window.as_u64()) {
         Some(ControlState::Edit {
             caret,

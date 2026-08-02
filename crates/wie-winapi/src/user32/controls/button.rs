@@ -14,6 +14,7 @@ use crate::gdi32::ResolvedWindow;
 use crate::gdi32::fill_rect_surface;
 use crate::gdi32::resolve_window_ancestor;
 use crate::gdi32::{FontEngine, FontKey, ResolvedFont};
+use crate::state::WindowFlags;
 use crate::user32::{WinApiState, find_window};
 
 /// Paint a control into its ancestor's surface at its parent-relative offset.
@@ -29,7 +30,7 @@ pub(super) fn paint_control(
     };
     let text = find_window(state, hwnd).map_or_else(String::new, |w| w.control_text.clone());
     let (width, height) = find_window(state, hwnd).map_or((0, 0), |w| (w.width, w.height));
-    let pressed = find_window(state, hwnd).is_some_and(|w| w.pressed);
+    let pressed = find_window(state, hwnd).is_some_and(|w| w.flags.contains(WindowFlags::PRESSED));
     let items = control_items(state, hwnd).to_vec();
     let sel_index = control_sel_index(state, hwnd);
 
