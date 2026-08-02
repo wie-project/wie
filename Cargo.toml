@@ -49,41 +49,9 @@ explicit_outlives_requirements = "warn"
 rust_2018_idioms = { level = "deny", priority = -1 }
 rust_2021_prelude_collisions = "deny"
 
-[workspace.lints.clippy]
-all = { level = "deny", priority = -1 }
-pedantic = { level = "deny", priority = -1 }
-
-unwrap_used = "deny"
-expect_used = "deny"
-panic = "deny"
-unreachable = "deny"
-todo = "deny"
-unimplemented = "deny"
-
-indexing_slicing = "deny"
-integer_division = "warn"
-arithmetic_side_effects = "warn"
-
-as_conversions = "deny"
-cast_possible_truncation = "deny"
-cast_possible_wrap = "deny"
-cast_precision_loss = "deny"
-cast_sign_loss = "deny"
-
-dbg_macro = "deny"
-print_stdout = "allow"
-print_stderr = "allow"
-
-doc_markdown = "allow"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
-module_name_repetitions = "allow"
-must_use_candidate = "allow"
-similar_names = "allow"
-too_many_lines = "allow"
-large_enum_variant = "warn"
-large_stack_arrays = "warn"
-needless_pass_by_value = "warn"
+# No clippy lints are denied here: clippy runs at its defaults and is advisory
+# in CI (`scripts/check.sh` invokes it without `-D warnings`). `#[allow]` /
+# `#[expect]` leniency belongs in test code only.
 
 [profile.release]
 lto = true

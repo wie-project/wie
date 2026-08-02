@@ -1,7 +1,4 @@
 [build]
-rustflags = [
-    "-Dwarnings",
-]
 
 [env]
 RUST_BACKTRACE = "1"
