@@ -14,7 +14,8 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
-use wie_winapi::{MenuItemRecord, OuterReturn};
+use wie_winapi::OuterReturn;
+use wie_winapi::user32::menu::{MenuEntry, MenuRecord};
 
 /// Bootstrap options for a new guest session (argv / stdin injection).
 #[derive(Debug, Clone, Default)]
@@ -1775,6 +1776,14 @@ impl RuntimeSession {
                                     return_address: Some(completion.return_address),
                                 });
                                 self.publish_last_error_to_guest();
+                                // B3.6: do NOT publish here. A guest WndProc
+                                // is one message of a repaint cycle (parent
+                                // BitBlt → child control paints across several
+                                // messages); publishing mid-cycle would emit a
+                                // frame with the children still missing. The
+                                // drain happens once at the empty-queue idle
+                                // boundary (WaitingForMessage) — one frame per
+                                // full cycle.
                                 continue 'outer;
                             }
                             Err(error) => {
@@ -2087,6 +2096,30 @@ impl RuntimeSession {
                                             .context(
                                                 "runtime API index underflow after message yield",
                                             )?;
+                                        // B3.6: the message queue is empty and no
+                                        // idle messages (timers / paints) remain to
+                                        // synthesize — every WM_PAINT of this repaint
+                                        // cycle has been dispatched, so the coalesced
+                                        // publishes are complete. Emit one frame per
+                                        // full cycle (parent + children) instead of
+                                        // one per dispatch, which published
+                                        // child-less intermediate frames during a
+                                        // resize.
+                                        //
+                                        // Drain unconditionally — also while a guest
+                                        // callback is in flight. A modal dialog
+                                        // opened from a bridged WM_COMMAND (button
+                                        // click → guest WndProc → DialogBoxParam)
+                                        // runs its in-guest modal GetMessage loop
+                                        // INSIDE that callback; skipping the drain
+                                        // here leaves the dialog's painted frame (and
+                                        // the button's unpressed repaint) unpublished
+                                        // until the callback pops — the dialog never
+                                        // appears. The empty-queue quiescence IS the
+                                        // cycle-complete point regardless of callback
+                                        // nesting, and full-frame publishes make the
+                                        // emitted snapshot always coherent.
+                                        winapi_state.present().drain_pending_publishes();
                                         break_term =
                                             Some(EntryTraceTermination::WaitingForMessage);
                                         quantum = Quantum::Break;
@@ -2128,9 +2161,24 @@ impl RuntimeSession {
                                         // Per-thread engine: primary regs are already in `engine`;
                                         // only persist thread bookkeeping for TLS tracking.
                                         winapi_state.kernel.threads.save_active();
+                                        // B3.6: the guest is about to block on a
+                                        // wait — flush any coalesced publishes so
+                                        // the frame reaches the host before the
+                                        // park. Skipped while a guest callback is
+                                        // in flight (the callback owns the paint
+                                        // cycle).
+                                        if self.pending_callbacks.is_empty() {
+                                            winapi_state.present().drain_pending_publishes();
+                                        }
                                         quantum = Quantum::Park(*reason);
                                     }
                                     Some(wie_winapi::WinApiControlSignal::ExitThread { code }) => {
+                                        // B3.6: flush pending publishes before the
+                                        // thread exits so the last painted frame is
+                                        // not lost.
+                                        if self.pending_callbacks.is_empty() {
+                                            winapi_state.present().drain_pending_publishes();
+                                        }
                                         quantum = Quantum::ExitThread(*code);
                                     }
                                     None => {
@@ -2369,7 +2417,7 @@ impl RuntimeSession {
             .checked_add(1)
             .context("runtime message timestamp overflow")?;
         queue.messages.push(wie_winapi::QueuedWindowMessage {
-            window_handle,
+            window_handle: wie_winapi::handles::Hwnd::from(window_handle),
             message,
             word_parameter,
             long_parameter,
@@ -2388,7 +2436,7 @@ impl RuntimeSession {
                 ws.windows
                     .iter()
                     .find(|window| window.window_proc != 0)
-                    .map(|window| window.handle)
+                    .map(|window| window.handle.as_u64())
             })
         })
     }
@@ -2399,14 +2447,20 @@ impl RuntimeSession {
         GuestHandle {
             state: self.process.winapi_arc(),
             queue: self.process.message_queue_arc(),
+            menu_tree_cache: Arc::new(Mutex::new(None)),
         }
     }
 
     /// Take the latest published frame for `hwnd`, if any.
     #[must_use]
     pub fn take_frame(&self, hwnd: u64) -> Option<wie_winapi::present::SurfaceFrame> {
-        self.process
-            .with_winapi_ref(|state| state.try_present()?.published.get(&hwnd).cloned())
+        self.process.with_winapi_ref(|state| {
+            state
+                .try_present()?
+                .published
+                .get(&wie_winapi::handles::Hwnd::from(hwnd))
+                .cloned()
+        })
     }
 
     /// Snapshot of runtime-owned windows (handle, class, title, has WndProc).
@@ -2419,7 +2473,7 @@ impl RuntimeSession {
                         .iter()
                         .map(|window| {
                             (
-                                window.handle,
+                                window.handle.as_u64(),
                                 window.class_name.clone(),
                                 window.title.clone(),
                                 window.window_proc != 0,
@@ -2673,14 +2727,29 @@ fn invalid_memory_diagnostic(
 pub struct GuestHandle {
     state: std::sync::Arc<std::sync::Mutex<wie_winapi::WinApiState>>,
     queue: std::sync::Arc<std::sync::Mutex<wie_winapi::present::MessageQueue>>,
+    /// Cached menu-bar tree, keyed by the menu handle it was built for.
+    ///
+    /// `window_menu_items` rebuilds only when `WindowState.menu_dirty` flips
+    /// or the first menu-bearing window's handle changes, so the host frame
+    /// loop stops reconstructing the tree (and locking the big mutex) on
+    /// every frame.
+    menu_tree_cache: MenuTreeCache,
 }
+
+/// Cached menu-bar tree for [`GuestHandle::window_menu_items`]: the tree plus
+/// the menu handle it was built from.
+type MenuTreeCache = Arc<Mutex<Option<(u64, Vec<MenuNode>)>>>;
 
 impl GuestHandle {
     /// Take the latest published frame for `hwnd`, if any.
     #[must_use]
     pub fn take_frame(&self, hwnd: u64) -> Option<wie_winapi::present::SurfaceFrame> {
         let state = self.state.lock().ok()?;
-        state.try_present()?.published.get(&hwnd).cloned()
+        state
+            .try_present()?
+            .published
+            .get(&wie_winapi::handles::Hwnd::from(hwnd))
+            .cloned()
     }
 
     /// B9: whether frame timing instrumentation is active (lock-free gate).
@@ -2723,7 +2792,11 @@ impl GuestHandle {
     #[must_use]
     pub fn first_guest_window_handle(&self) -> Option<u64> {
         let state = self.state.lock().ok()?;
-        state.try_window_state()?.windows.first().map(|w| w.handle)
+        state
+            .try_window_state()?
+            .windows
+            .first()
+            .map(|w| w.handle.as_u64())
     }
 
     /// Hit-test a point in the top-level window's client area.
@@ -2733,22 +2806,40 @@ impl GuestHandle {
     /// coordinates) when no child is hit. `None` when no top-level window
     /// exists. The top-level window is the first parentless record (the main
     /// guest window); children are tested in reverse creation order, matching
-    /// Windows' z-order hit-testing.
+    /// Windows' z-order hit-testing, and the descent recurses through the
+    /// whole child hierarchy — a modal dialog's own controls (buttons, edits)
+    /// are children of the dialog, not of the top-level window, so a click on
+    /// a dialog button must resolve to the button, not the dialog.
     #[must_use]
     pub fn window_at(&self, x: i32, y: i32) -> Option<(u64, u32, u32)> {
         let state = self.state.lock().ok()?;
         let windows = &state.try_window_state()?.windows;
-        let top = windows.iter().find(|w| w.parent_handle == 0)?.handle;
-        for child in windows.iter().rev() {
-            if child.parent_handle != top || !child.visible {
-                continue;
-            }
-            let (rel_x, rel_y) = (x - child.x, y - child.y);
-            if rel_x >= 0 && rel_y >= 0 && rel_x < child.width && rel_y < child.height {
-                return Some((child.handle, rel_x as u32, rel_y as u32));
-            }
+        let top = windows
+            .iter()
+            .find(|w| w.parent_handle == wie_winapi::handles::Hwnd::NULL)?
+            .handle;
+        // Descend z-order: at each level pick the topmost visible child that
+        // contains the point, then recurse into it. Coordinates stay
+        // child-relative at every step.
+        let mut current = top;
+        let mut rel_x = x;
+        let mut rel_y = y;
+        loop {
+            let hit = windows.iter().rev().find(|w| {
+                w.parent_handle == current
+                    && w.visible
+                    && rel_x >= w.x
+                    && rel_y >= w.y
+                    && rel_x < w.x.saturating_add(w.width)
+                    && rel_y < w.y.saturating_add(w.height)
+            });
+            let Some(child) = hit else {
+                return Some((current.as_u64(), rel_x.max(0) as u32, rel_y.max(0) as u32));
+            };
+            current = child.handle;
+            rel_x -= child.x;
+            rel_y -= child.y;
         }
-        Some((top, x as u32, y as u32))
     }
 
     /// Resolve the destination for a mouse message under active capture.
@@ -2757,25 +2848,34 @@ impl GuestHandle {
     /// (SetCapture — a pressed BUTTON captures until its `WM_LBUTTONUP`), with
     /// coordinates relative to that window, or `None` when no window captures
     /// (the caller falls back to hit-testing via [`Self::window_at`]).
+    ///
+    /// The relative coordinates accumulate the whole ancestor chain — a
+    /// button inside a modal dialog sits at `dialog.x + button.x` in the
+    /// top-level client space, not just `button.x`.
     #[must_use]
     pub fn capture_target(&self, x: i32, y: i32) -> Option<(u64, u32, u32)> {
         let state = self.state.lock().ok()?;
         let ws = state.try_window_state()?;
         let capture = ws.capture_window_handle;
-        if capture == 0 {
+        if capture == wie_winapi::handles::Hwnd::NULL {
             return None;
         }
-        let top = ws.windows.iter().find(|w| w.parent_handle == 0)?.handle;
-        let window = ws.windows.iter().find(|w| w.handle == capture)?;
-        if capture == top {
-            Some((capture, x.max(0) as u32, y.max(0) as u32))
-        } else {
-            Some((
-                capture,
-                x.saturating_sub(window.x) as u32,
-                y.saturating_sub(window.y) as u32,
-            ))
+        ws.windows.iter().find(|w| w.handle == capture)?;
+        let (mut offset_x, mut offset_y) = (0_i32, 0_i32);
+        let mut current = capture;
+        while let Some(w) = ws.windows.iter().find(|w| w.handle == current) {
+            if w.parent_handle == wie_winapi::handles::Hwnd::NULL {
+                break;
+            }
+            offset_x = offset_x.saturating_add(w.x);
+            offset_y = offset_y.saturating_add(w.y);
+            current = w.parent_handle;
         }
+        Some((
+            capture.as_u64(),
+            x.saturating_sub(offset_x).max(0) as u32,
+            y.saturating_sub(offset_y).max(0) as u32,
+        ))
     }
 
     /// The window currently holding the mouse capture, if any.
@@ -2783,7 +2883,7 @@ impl GuestHandle {
     pub fn capture_window(&self) -> Option<u64> {
         let state = self.state.lock().ok()?;
         let capture = state.try_window_state()?.capture_window_handle;
-        (capture != 0).then_some(capture)
+        (capture != wie_winapi::handles::Hwnd::NULL).then_some(capture.as_u64())
     }
 
     /// The window with keyboard focus (what `GetFocus` returns in-guest).
@@ -2791,7 +2891,7 @@ impl GuestHandle {
     pub fn focus_window(&self) -> Option<u64> {
         let state = self.state.lock().ok()?;
         let focus = state.try_window_state()?.focus_window_handle;
-        (focus != 0).then_some(focus)
+        (focus != wie_winapi::handles::Hwnd::NULL).then_some(focus.as_u64())
     }
 
     /// Whether `TrackMouseEvent` armed hover/leave tracking for `hwnd`.
@@ -2806,7 +2906,7 @@ impl GuestHandle {
         state.try_window_state().is_some_and(|ws| {
             ws.windows
                 .iter()
-                .any(|w| w.handle == hwnd && w.mouse_tracking)
+                .any(|w| w.handle == wie_winapi::handles::Hwnd::from(hwnd) && w.mouse_tracking)
         })
     }
 
@@ -2834,17 +2934,17 @@ impl GuestHandle {
     pub fn first_guest_window_info(&self) -> Option<(u64, String, i32, i32)> {
         let state = self.state.lock().ok()?;
         let w = state.try_window_state()?.windows.first()?;
-        Some((w.handle, w.title.clone(), w.width, w.height))
+        Some((w.handle.as_u64(), w.title.clone(), w.width, w.height))
     }
 
     /// Snapshot of the first menu-bearing window's menu as a tree, for the
     /// host menu bar.
     ///
-    /// Reconstructs the hierarchy from the flat `AppendMenuA/W` record list:
-    /// top-level items belong to the window's menu handle; an item carrying
-    /// `MF_POPUP` names a submenu (its `id` is that submenu's handle), whose
-    /// items are the records with that `menu_handle`. Separators (empty text)
-    /// are skipped. Empty when no window has a menu yet.
+    /// Walks the native `MenuRecord` tree once and caches the result: while
+    /// `WindowState.menu_dirty` is false the cache is returned without
+    /// touching the menu records (the big-mutex lock is still taken, but the
+    /// per-frame tree reconstruction is gone). Empty when no window has a
+    /// menu yet.
     #[must_use]
     pub fn window_menu_items(&self) -> Vec<MenuNode> {
         let Ok(state) = self.state.lock() else {
@@ -2860,7 +2960,20 @@ impl GuestHandle {
         else {
             return Vec::new();
         };
-        build_menu_tree(&ws.menu_items, menu_handle)
+        if !ws.menu_dirty {
+            let cached = self.menu_tree_cache.lock().ok();
+            if let Some(cached) = cached
+                && let Some((cached_handle, tree)) = cached.as_ref()
+                && *cached_handle == menu_handle
+            {
+                return tree.clone();
+            }
+        }
+        let tree = build_menu_tree(&ws.menus, menu_handle);
+        if let Ok(mut cache) = self.menu_tree_cache.lock() {
+            *cache = Some((menu_handle, tree.clone()));
+        }
+        tree
     }
 
     /// Set the wake callback — called when a new frame is published.
@@ -2882,6 +2995,7 @@ impl GuestHandle {
             return;
         };
         let ws = state.window_state();
+        let hwnd = wie_winapi::handles::Hwnd::from(hwnd);
         if let Some(window) = ws.windows.iter_mut().find(|w| w.handle == hwnd) {
             window.width = i32::try_from(width).unwrap_or(0);
             window.height = i32::try_from(height).unwrap_or(0);
@@ -2894,7 +3008,7 @@ impl GuestHandle {
         // they repaint themselves — in real Windows those pixels persist in
         // the framebuffer; here the surface is rebuilt on resize, so the
         // children must be explicitly repainted via WM_PAINT synthesis.
-        let mut descendants: Vec<u64> = Vec::new();
+        let mut descendants: Vec<wie_winapi::handles::Hwnd> = Vec::new();
         let mut frontier = vec![hwnd];
         while let Some(parent) = frontier.pop() {
             for w in &ws.windows {
@@ -2937,7 +3051,7 @@ impl GuestHandle {
             let time = queue.next_message_time;
             queue.next_message_time = time.wrapping_add(1);
             queue.messages.push(wie_winapi::QueuedWindowMessage {
-                window_handle: hwnd,
+                window_handle: wie_winapi::handles::Hwnd::from(hwnd),
                 message: msg,
                 word_parameter: wparam,
                 long_parameter: lparam,
@@ -2983,27 +3097,29 @@ pub struct MenuNode {
     pub children: Vec<MenuNode>,
 }
 
-/// `MF_POPUP`: the item id is a submenu handle, not a command id.
-const MF_POPUP: u32 = 0x0010;
-
-/// Build the menu tree rooted at `menu_handle` from the flat AppendMenu
-/// records: popup items recurse into the submenu their id names. Separators
-/// (empty text) are skipped at every level.
-fn build_menu_tree(items: &[MenuItemRecord], menu_handle: u64) -> Vec<MenuNode> {
-    items
+/// Build the menu tree rooted at `menu_handle` from the native menu records:
+/// `Item` entries become leaves, `Popup` entries recurse into their submenu,
+/// `Separator` entries are skipped.
+fn build_menu_tree(menus: &[MenuRecord], menu_handle: u64) -> Vec<MenuNode> {
+    let menu_handle = wie_winapi::handles::Hmenu::from(menu_handle);
+    let Some(record) = menus.iter().find(|m| m.handle == menu_handle) else {
+        return Vec::new();
+    };
+    record
+        .items
         .iter()
-        .filter(|item| item.menu_handle == menu_handle && !item.text.is_empty())
-        .map(|item| {
-            let children = if item.flags & MF_POPUP != 0 {
-                build_menu_tree(items, u64::from(item.id))
-            } else {
-                Vec::new()
-            };
-            MenuNode {
-                id: item.id,
-                title: item.text.clone(),
-                children,
-            }
+        .filter_map(|entry| match entry {
+            MenuEntry::Item { id, text, .. } => Some(MenuNode {
+                id: *id,
+                title: text.clone(),
+                children: Vec::new(),
+            }),
+            MenuEntry::Popup { text, submenu } => Some(MenuNode {
+                id: u32::try_from(submenu.as_u64()).unwrap_or(0),
+                title: text.clone(),
+                children: build_menu_tree(menus, submenu.as_u64()),
+            }),
+            MenuEntry::Separator => None,
         })
         .collect()
 }
@@ -3054,5 +3170,91 @@ fn journal_api_return(
     {
         use std::io::Write;
         let _ = f.write_all(line.as_bytes());
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// `window_menu_items` returns the cached tree while `menu_dirty` is
+    /// false and rebuilds (seeing new items) once a mutation dirties it.
+    #[test]
+    fn window_menu_items_cache_invalidates_on_dirty() {
+        let process = wie_pe::ProcessIdentity {
+            module_file_name: "menu.exe".to_owned(),
+            module_path: r"C:\App\menu.exe".to_owned(),
+            current_directory: r"C:\App".to_owned(),
+            command_line: "menu.exe".to_owned(),
+        };
+        let mut winapi_state =
+            crate::memory::default_winapi_state(&DEFAULT_LAYOUT, Vec::new(), &process)
+                .expect("winapi state");
+        let menu_handle = 0x0000_0000_6620_0000_u64;
+        let submenu = 0x0000_0000_6620_0001_u64;
+        {
+            let ws = winapi_state.window_state();
+            ws.menus.push(MenuRecord {
+                handle: wie_winapi::handles::Hmenu::from(menu_handle),
+                items: vec![MenuEntry::Popup {
+                    text: "File".to_owned(),
+                    submenu: wie_winapi::handles::Hmenu::from(submenu),
+                }],
+            });
+            ws.menus.push(MenuRecord {
+                handle: wie_winapi::handles::Hmenu::from(submenu),
+                items: vec![MenuEntry::Item {
+                    id: 100,
+                    text: "Exit".to_owned(),
+                    enabled: true,
+                    checked: false,
+                }],
+            });
+            ws.windows.push(wie_winapi::WindowRecord {
+                handle: wie_winapi::handles::Hwnd::from(0x100),
+                menu_handle,
+                ..Default::default()
+            });
+        }
+        let handle = GuestHandle {
+            state: Arc::new(Mutex::new(winapi_state)),
+            queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+            menu_tree_cache: Arc::new(Mutex::new(None)),
+        };
+
+        let first = handle.window_menu_items();
+        assert_eq!(first.len(), 1, "File popup at the top level");
+        assert_eq!(
+            first.first().expect("popup").children.len(),
+            1,
+            "Exit inside File"
+        );
+        // Same tree from the cache (dirty is false — no rebuild).
+        assert_eq!(handle.window_menu_items(), first);
+
+        // Mutate through the guest-facing state and dirty the tree.
+        {
+            let mut state = handle.state.lock().expect("lock state");
+            let ws = state.window_state();
+            let submenu_record = ws
+                .menus
+                .iter_mut()
+                .find(|m| m.handle == wie_winapi::handles::Hmenu::from(submenu))
+                .expect("submenu record");
+            submenu_record.items.push(MenuEntry::Item {
+                id: 200,
+                text: "About".to_owned(),
+                enabled: true,
+                checked: false,
+            });
+            ws.menu_dirty = true;
+        }
+        let second = handle.window_menu_items();
+        assert_eq!(
+            second.first().expect("popup").children.len(),
+            2,
+            "rebuild must reflect the appended item"
+        );
     }
 }

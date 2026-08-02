@@ -384,6 +384,16 @@ fn worker_main(
                     }
                 }
             }
+            // B3.6: flush coalesced publishes only when the worker is about to
+            // block (park) — a repaint cycle's BitBlt + control paints across
+            // dispatches publish once at the park boundary instead of once per
+            // dispatch (which emitted child-less intermediate frames). Workers
+            // have no guest callbacks. While the worker keeps dispatching, the
+            // pending publishes accumulate in the shared set; the primary's
+            // idle drain publishes them whenever it reaches an empty queue.
+            if park_reason.is_some() {
+                st.present().drain_pending_publishes();
+            }
         } // drop WinAPI lock before host park
 
         if let Some(reason) = park_reason {

@@ -5,8 +5,8 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use wie_winapi::{
-    FakeVa, WinApiId, WinApiTraits, decode_fake_va, encode_export, encode_unresolved,
-    resolve_winapi_id, winapi_id_export,
+    ComMethod, D3d9Iface, FakeVa, WinApiId, WinApiTraits, decode_fake_va, encode_export,
+    encode_unresolved, resolve_winapi_id, winapi_id_export,
 };
 
 /// Runtime fake API dispatch entry (IAT soft slots + trace metadata).
@@ -213,29 +213,14 @@ pub(crate) fn resolve_fake_api_at(address: u64, soft: &SoftApiTable) -> Option<R
     }
 }
 
-fn resolve_com(iface: u8, method: u8) -> Option<ResolvedFakeApi> {
-    use wie_winapi::{COM_IFACE_IDIRECT3D9, COM_IFACE_IDIRECT3DDEVICE9};
-
-    let name = match iface {
-        COM_IFACE_IDIRECT3D9 => {
-            let names = wie_winapi::d3d9::IDIRECT3D9_METHOD_NAMES;
-            names
-                .get(usize::from(method))
-                .copied()
-                .map(|s| s.to_owned())
-                .unwrap_or_else(|| format!("IDirect3D9::Slot{method:03}"))
-        }
-        COM_IFACE_IDIRECT3DDEVICE9 => {
-            wie_winapi::d3d9::idirect3ddevice9_method_name(usize::from(method))
-        }
-        _ => format!("Com{iface}::Method{method}"),
-    };
+fn resolve_com(iface: D3d9Iface, method: ComMethod) -> Option<ResolvedFakeApi> {
+    let name = method.name(iface);
     let library = "D3D9.dll";
-    let winapi_id = resolve_winapi_id(library, &name);
+    let winapi_id = resolve_winapi_id(library, name.as_ref());
     let traits = winapi_id.map(WinApiId::traits).unwrap_or_default();
     Some(ResolvedFakeApi {
         library: Cow::Borrowed(library),
-        name: Cow::Owned(name),
+        name,
         winapi_id,
         traits,
     })

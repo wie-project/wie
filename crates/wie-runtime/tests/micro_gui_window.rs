@@ -13,6 +13,33 @@ fn micro_exe(name: &str) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
+/// Serializes the 7 GUI micro-tests so they run one at a time.
+///
+/// Each test drives its guest synchronously on its own test thread, and the
+/// guest's 50 ms WM_TIMER advances only while `run_until_stop` executes. Under
+/// the harness's default parallel schedule the CPU-heavy tests (gui_blit
+/// JIT-compiles its 1280x800 session for ~11 s in debug) starve the other test
+/// threads' 50 ms sleep quanta, so their guests catch up in multi-tick bursts
+/// the next time the thread runs — racing shift-tab's focus transitions
+/// against the dialog's timer-driven auto-close and landing gui_blit's
+/// resting-frame capture after the dialog has composited over the owner.
+/// Both flakes reproduce only under that parallel load and pass in isolation,
+/// so the suite takes a process-wide lock and runs one test at a time. The
+/// wall-time cost is small: the suite is dominated by gui_blit's ~11 s either
+/// way.
+static GUI_SUITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire the suite-wide serialization lock (see [`GUI_SUITE_LOCK`]).
+///
+/// Held for the whole test; the guard's `Drop` runs on unwinding too, so a
+/// panicking test cannot deadlock its successors (the next `lock()` sees a
+/// poisoned mutex and recovers via `PoisonError::into_inner`).
+fn gui_suite_serialize() -> std::sync::MutexGuard<'static, ()> {
+    GUI_SUITE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Drives a YieldOnIdle GUI session like the persistent GUI loop, sleeping a
 /// short quantum between empty-queue yields so the host clock advances and
 /// WM_TIMER / synthesized WM_PAINT actually fire.
@@ -102,6 +129,33 @@ const D3D9_CLEAR_RED_0RGB: u32 = 0x00C8_0000;
 /// D3D9 solid cyan from gui_d3d9's indexed triangle
 /// (`D3DCOLOR_XRGB(0,255,255)` → 0RGB).
 const D3D9_CYAN_0RGB: u32 = 0x0000_FFFF;
+/// D3D9 textured-quad texel colors as rendered: MODULATE with an opaque white
+/// diffuse multiplies `(255*255)>>8 = 254`, so the 2x2 checkerboard texels
+/// land as 0xFE-red / 0xFE-green / 0xFE-blue / 0xFE-white.
+const D3D9_QUAD_RED_0RGB: u32 = 0x00FE_0000;
+const D3D9_QUAD_GREEN_0RGB: u32 = 0x0000_FE00;
+const D3D9_QUAD_BLUE_0RGB: u32 = 0x0000_00FE;
+const D3D9_QUAD_WHITE_0RGB: u32 = 0x00FE_FEFE;
+/// P4c alpha-blend result at (30,35): blue (alpha 0x80) over red with
+/// SRCALPHA/INVSRCALPHA ADD → ((src*128 + dst*127) >> 8) per channel.
+const D3D9_BLEND_0RGB: u32 = 0x007E_007F;
+/// P4c opaque red quad (no blending) at (80,35).
+const D3D9_RED_QUAD_0RGB: u32 = 0x00FF_0000;
+/// P4c far depth quad (magenta, z=0.9) where the near quad does not cover.
+const D3D9_FAR_DEPTH_0RGB: u32 = 0x00FF_00FF;
+/// P4c near depth quad (white, z=0.1) — wins the depth test in the overlap.
+const D3D9_NEAR_DEPTH_0RGB: u32 = 0x00FF_FFFF;
+
+/// CI-gated hash of gui_d3d9's deterministic resting frame (320×240).
+///
+/// The frame is the clear-red backbuffer with the gradient triangle, the cyan
+/// indexed triangle, the 2x2 textured quad, the P4c alpha-blended quads, and
+/// the P4c depth-tested quads (rows 200..800 of the GDI hash do not apply —
+/// the D3D9 frame is fully deterministic CPU output). Recompute with
+/// `./target/debug/wie-cli run --screenshot /tmp/d.bmp \
+/// micro-exes/out/gui_d3d9.exe` then FNV-1a 64 over the full 0RGB pixel bytes.
+/// Recomputed when P4c added the blend + depth quads.
+const D3D9_RESTING_FRAME_HASH: u64 = 0x28C1_AE13_5D5C_D9D0;
 
 /// Run gui_d3d9 end-to-end and prove the P3 D3D9 software-render slice:
 /// CreateDevice → Clear(red) → BeginScene → DrawPrimitiveUP (gradient
@@ -109,16 +163,18 @@ const D3D9_CYAN_0RGB: u32 = 0x0000_FFFF;
 /// Present publishes a SurfaceFrame through the GDI-shared pipeline.
 ///
 /// The exe exits 0 only if every D3D9 call's HRESULT succeeded AND
-/// GetDeviceCaps honestly reported no vertex/pixel shaders AND the
-/// SetViewport/GetViewport round-trip matched. Pixel checks pin the rendered
-/// frame: clear red outside the triangles, the blended gradient triangle, and
-/// the solid cyan indexed triangle.
+/// GetDeviceCaps honestly reported the P5a caps (ps_2_0, vs stage still 0)
+/// AND the SetViewport/GetViewport round-trip matched. Pixel checks pin the
+/// rendered frame: clear red outside the triangles, the blended gradient
+/// triangle, and the solid cyan indexed triangle.
 #[test]
 fn gui_d3d9_renders_clear_and_triangle() {
     let Some(path) = micro_exe("gui_d3d9.exe") else {
         eprintln!("skip: micro-exes/out/gui_d3d9.exe not built (run make -C micro-exes gui_exes)");
         return;
     };
+    // Serialized suite: see GUI_SUITE_LOCK.
+    let _suite = gui_suite_serialize();
 
     use std::time::Duration;
     use wie_runtime::EntryTraceTermination;
@@ -145,7 +201,7 @@ fn gui_d3d9_renders_clear_and_triangle() {
         // Presentation-model check: Present must publish the backbuffer as a
         // SurfaceFrame on the device window (320x240). The first frame is
         // deterministic: red clear + gradient triangle + cyan indexed
-        // triangle.
+        // triangle + a 2x2 textured quad (red/green/blue/white checkerboard).
         if let Some(owner) = session.first_guest_window_handle()
             && let Some(frame) = session.take_frame(owner)
         {
@@ -165,6 +221,22 @@ fn gui_d3d9_renders_clear_and_triangle() {
                 && ((frame.pixels.get(idx(50, 190)).copied().unwrap_or(0) >> 16) & 0xFF) > 0xD0
                 // Solid cyan indexed triangle interior.
                 && frame.pixels.get(idx(160, 45)).copied() == Some(D3D9_CYAN_0RGB)
+                // Textured quad: the 2x2 checkerboard fills x∈[240,310],
+                // y∈[10,110]; sample each quadrant's center.
+                && frame.pixels.get(idx(250, 25)).copied() == Some(D3D9_QUAD_RED_0RGB)
+                && frame.pixels.get(idx(295, 25)).copied() == Some(D3D9_QUAD_GREEN_0RGB)
+                && frame.pixels.get(idx(250, 85)).copied() == Some(D3D9_QUAD_BLUE_0RGB)
+                && frame.pixels.get(idx(295, 85)).copied() == Some(D3D9_QUAD_WHITE_0RGB)
+                // P4c alpha blend: half-alpha blue over red (x∈[10,50] region).
+                && frame.pixels.get(idx(30, 35)).copied() == Some(D3D9_BLEND_0RGB)
+                // P4c opaque red quad (outside the blue half).
+                && frame.pixels.get(idx(80, 35)).copied() == Some(D3D9_RED_QUAD_0RGB)
+                // P4c depth: far (z=0.9) magenta shows where the near quad
+                // does not cover; the near (z=0.1) white wins the overlap.
+                && frame.pixels.get(idx(30, 120)).copied() == Some(D3D9_FAR_DEPTH_0RGB)
+                && frame.pixels.get(idx(80, 120)).copied() == Some(D3D9_NEAR_DEPTH_0RGB)
+                // The whole 320x240 frame is deterministic CPU output — gate it.
+                && frame_hash(&frame, 0, frame.height) == D3D9_RESTING_FRAME_HASH
             {
                 saw_d3d9_frame = true;
             }
@@ -185,13 +257,15 @@ fn gui_d3d9_renders_clear_and_triangle() {
         exit_code,
         Some(0),
         "gui_d3d9.exe must exit 0 (proves CreateDevice → Clear → BeginScene → \
-         DrawPrimitiveUP → DrawIndexedPrimitiveUP → EndScene → Present all \
-         succeeded and caps honesty held); got {exit_code:?}"
+         DrawPrimitiveUP → DrawIndexedPrimitiveUP → CreateTexture → LockRect → \
+         UnlockRect → SetTexture → textured DrawPrimitiveUP → EndScene → Present \
+         all succeeded and caps honesty held); got {exit_code:?}"
     );
     assert!(
         saw_d3d9_frame,
         "the D3D9 frame (clear red + gradient triangle + cyan indexed \
-         triangle) was never observed in the device window's published surface"
+         triangle + textured quad) was never observed in the device window's \
+         published surface"
     );
 }
 
@@ -211,6 +285,8 @@ fn gui_blit_comprehensive_regression() {
         eprintln!("skip: micro-exes/out/gui_blit.exe not built (run make -C micro-exes gui_exes)");
         return;
     };
+    // Serialized suite: see GUI_SUITE_LOCK.
+    let _suite = gui_suite_serialize();
 
     use std::time::Duration;
     use wie_runtime::EntryTraceTermination;
@@ -272,7 +348,13 @@ fn gui_blit_comprehensive_regression() {
         match summary.termination {
             EntryTraceTermination::ExitProcess { code } => break Some(code),
             EntryTraceTermination::WaitingForMessage => {
-                std::thread::sleep(Duration::from_millis(50));
+                // Poll every 10 ms so the resting frame is captured well
+                // inside the pre-dialog window: the guest opens its modal
+                // dialog on timer tick 4 (~200 ms), and that dialog's frame
+                // composites over the owner, replacing the gradient frame
+                // the hash gate needs. 50 ms polls leave only ~4 chances;
+                // 10 ms gives ~20 within the same window.
+                std::thread::sleep(Duration::from_millis(10));
             }
             other => {
                 panic!("GUI session stopped unexpectedly: {other:?}");
@@ -354,6 +436,8 @@ fn gui_menu_timer_commands_and_paint() {
         eprintln!("skip: micro-exes/out/gui_menu.exe not built (run make -C micro-exes gui_exes)");
         return;
     };
+    // Serialized suite: see GUI_SUITE_LOCK.
+    let _suite = gui_suite_serialize();
 
     // The exe only calls PostQuitMessage after TIMER_TICKS WM_TIMER messages
     // (each tick also invalidates, exercising WM_PAINT synthesis), so exit
@@ -373,6 +457,8 @@ fn gui_text_renders_and_self_checks() {
         eprintln!("skip: micro-exes/out/gui_text.exe not built (run make -C micro-exes gui_exes)");
         return;
     };
+    // Serialized suite: see GUI_SUITE_LOCK.
+    let _suite = gui_suite_serialize();
 
     // The exe draws text into a DIB (TextOutA/W, DrawTextA, ExtTextOut-free)
     // and self-checks the results before entering the timer loop; any failed
@@ -395,6 +481,8 @@ fn gui_control_child_windows_and_command() {
         );
         return;
     };
+    // Serialized suite: see GUI_SUITE_LOCK.
+    let _suite = gui_suite_serialize();
 
     // The exe creates a BUTTON + STATIC child, self-checks the child model
     // (GetParent/GetDlgCtrlID/IsChild, SetWindowText round-trip), then after
@@ -424,6 +512,8 @@ fn gui_dialog_modal_loop_and_end_dialog() {
         );
         return;
     };
+    // Serialized suite: see GUI_SUITE_LOCK.
+    let _suite = gui_suite_serialize();
 
     use std::time::Duration;
     use wie_runtime::EntryTraceTermination;
@@ -506,6 +596,8 @@ fn gui_dialog_shift_tab_moves_focus() {
         );
         return;
     };
+    // Serialized suite: see GUI_SUITE_LOCK.
+    let _suite = gui_suite_serialize();
 
     use std::time::Duration;
     use wie_runtime::EntryTraceTermination;
@@ -571,7 +663,14 @@ fn gui_dialog_shift_tab_moves_focus() {
                     }
                     _ => {}
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                // Poll fast (2 ms, not 50 ms): the guest auto-closes the
+                // dialog on its 5th WM_TIMER (~250 ms after open), and the
+                // test must drive three focus transitions inside that
+                // window. A 50 ms quantum leaves only ~2 iterations of
+                // margin; 2 ms turns each tick into ~25 polls, so even a
+                // test thread delayed by a couple of ticks still finishes
+                // before the dialog's timer-driven VK_RETURN closes it.
+                std::thread::sleep(Duration::from_millis(2));
             }
             other => {
                 panic!("GUI session stopped unexpectedly: {other:?}");
@@ -596,4 +695,239 @@ fn gui_dialog_shift_tab_moves_focus() {
         stage, 3,
         "plain Tab must wrap focus back to the first tab stop"
     );
+}
+
+/// gui_demo's selftest opens its modal dialog through the REAL click path —
+/// `BM_CLICK` on the Dialog button → host control WndProc → bridged
+/// `WM_COMMAND` into the guest WndProc → `on_dialog()` → `DialogBoxParam`.
+///
+/// The modal loop therefore runs INSIDE a guest callback. Regression
+/// (publish-model rework): the dialog's frame must be published at the
+/// first message quiescence even with a guest callback in flight — pre-fix
+/// the quiescent drain was skipped (`pending_callbacks` non-empty) and the
+/// dialog never appeared until the callback popped (the reported "click
+/// Dialog… → nothing; click Exit → dialog suddenly appears" behavior).
+#[test]
+fn gui_demo_dialog_opens_on_click() {
+    let Some(path) = micro_exe("gui_demo.exe") else {
+        eprintln!("skip: micro-exes/out/gui_demo.exe not built (run make -C micro-exes gui_exes)");
+        return;
+    };
+    // Serialized suite: see GUI_SUITE_LOCK.
+    let _suite = gui_suite_serialize();
+
+    use std::time::Duration;
+    use wie_runtime::EntryTraceTermination;
+
+    // Dialog template 100 ("100 DIALOG 10,20,180,70", DLU→px ×2) is
+    // 360×140 px centered in the 640×420 owner → (140,140)-(500,280).
+    // (490,150) is dialog face (DIALOG_BG = BTNFACE 0xF0F0F0), clear of
+    // every dialog control; the owner behind it is plain COLOR_WINDOW
+    // white, so 0xF0F0F0 there proves the dialog composited into the
+    // owner's published surface.
+    const DIALOG_FACE_SAMPLE: (u32, u32) = (490, 150);
+
+    let mut session =
+        wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
+            .expect("GUI session starts");
+    // CI mode: run the scripted self-test (see drive_gui_session).
+    session
+        .set_guest_env("WIE_SELFTEST", "1")
+        .expect("inject WIE_SELFTEST");
+
+    let mut iterations = 0;
+    let mut saw_dialog_face = false;
+    let mut saw_button_hit_test = false;
+    let handle = session.guest_handle();
+    let exit_code = loop {
+        let summary = session
+            .run_until_stop(1_000_000)
+            .expect("GUI session run_until_stop");
+        iterations += 1;
+        assert!(
+            iterations < 300,
+            "gui_demo.exe did not exit within 300 iterations"
+        );
+
+        // Presentation-model check: the dialog composites into the owner's
+        // published surface while it is open (click path).
+        if let Some(owner) = session.first_guest_window_handle()
+            && let Some(frame) = session.take_frame(owner)
+        {
+            let (x, y) = DIALOG_FACE_SAMPLE;
+            if x < frame.width && y < frame.height {
+                let idx = usize::try_from(y).unwrap_or(0) * frame.width as usize
+                    + usize::try_from(x).unwrap_or(0);
+                if frame.pixels.get(idx).copied() == Some(BTNFACE_0RGB) {
+                    saw_dialog_face = true;
+                }
+            }
+        }
+
+        // Host hit-testing (the click-routing regression): while the dialog
+        // is open, a point inside the OK (180,228)-(300,268) or Cancel
+        // (340,228)-(460,268) button must resolve to the BUTTON — its
+        // 120×40 client rect — not to the 360×140 dialog. Pre-fix
+        // `window_at` only tested the top-level's direct children, so a
+        // dialog-button click resolved to the dialog and no BN_CLICKED fired.
+        for (hx, hy) in [(240_i32, 248_i32), (400_i32, 248_i32)] {
+            if let Some((hwnd, rx, ry)) = handle.window_at(hx, hy)
+                && hwnd != 0
+                && rx < 120
+                && ry < 40
+            {
+                saw_button_hit_test = true;
+            }
+        }
+
+        match summary.termination {
+            EntryTraceTermination::ExitProcess { code } => break Some(code),
+            EntryTraceTermination::WaitingForMessage => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            other => {
+                panic!("GUI session stopped unexpectedly: {other:?}");
+            }
+        }
+    };
+
+    assert_eq!(
+        exit_code,
+        Some(0),
+        "gui_demo.exe selftest must exit 0 (click-path dialog + UTF-8 round-trip); got {exit_code:?}"
+    );
+    assert!(
+        saw_dialog_face,
+        "the dialog's face (0xF0F0F0) was never observed in the owner's published \
+         surface while the dialog was open from the click path"
+    );
+    assert!(
+        saw_button_hit_test,
+        "host hit-testing never resolved a dialog-button coordinate to the button \
+         (window_at must descend into the dialog's children)"
+    );
+}
+
+/// gui_demo in INTERACTIVE mode (no selftest): the host drives both clicks
+/// through the real host→guest posting path — `window_at` hit-test +
+/// `post_message_at`, exactly what app.rs does for winit mouse events.
+///
+/// Regression: clicking the dialog's OK button must close the dialog. The
+/// selftest covers the guest-posted click (`PostMessageA`); this covers the
+/// host-posted one, which is what a real user produces. Pre-fix the host
+/// hit-test only looked at the top-level's direct children, so the OK button
+/// (child of the dialog) never received the mouse messages and BN_CLICKED
+/// never fired.
+#[test]
+fn gui_demo_dialog_ok_click_closes_dialog() {
+    let Some(path) = micro_exe("gui_demo.exe") else {
+        eprintln!("skip: micro-exes/out/gui_demo.exe not built (run make -C micro-exes gui_exes)");
+        return;
+    };
+    // Serialized suite: see GUI_SUITE_LOCK.
+    let _suite = gui_suite_serialize();
+
+    use std::time::Duration;
+    use wie_runtime::EntryTraceTermination;
+
+    const WM_LBUTTONDOWN: u32 = 0x0201;
+    const WM_LBUTTONUP: u32 = 0x0202;
+    const MK_LBUTTON: u64 = 0x0001;
+
+    let mut session =
+        wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
+            .expect("GUI session starts");
+
+    // "Dialog…" button: (256,72,90,22) in the 640×420 owner → center (301,83).
+    // Dialog buttons (dialog at (140,140), DLU→px ×2): Cancel at
+    // (340,228)-(460,268) → center (400,248); OK at (180,228)-(300,268) →
+    // center (240,248). Both must close the dialog via host-posted clicks.
+    let handle = session.guest_handle();
+    for (label, bx, by) in [("Cancel", 400_i32, 248_i32), ("OK", 240_i32, 248_i32)] {
+        let mut stage = 0_u8; // 0=open dialog, 1=click button, 2=assert closed
+        let mut iterations = 0;
+        let mut saw_face_gone = false;
+        loop {
+            let summary = session
+                .run_until_stop(1_000_000)
+                .expect("GUI session run_until_stop");
+            iterations += 1;
+            assert!(
+                iterations < 400,
+                "gui_demo.exe interactive drive stalled at {label} stage {stage}"
+            );
+            match summary.termination {
+                EntryTraceTermination::WaitingForMessage => {}
+                other => {
+                    panic!("GUI session stopped unexpectedly: {other:?}");
+                }
+            }
+
+            // The dialog face (DIALOG_BG 0xF0F0F0) at (490,150) must
+            // disappear from the OWNER SURFACE once the dialog closes — not
+            // just from the window records. EndDialog must erase the owner so
+            // the class brush covers the dialog region.
+            if stage == 2
+                && let Some(owner) = session.first_guest_window_handle()
+                && let Some(frame) = session.take_frame(owner)
+            {
+                let idx = 150_usize * frame.width as usize + 490_usize;
+                if frame.pixels.get(idx).copied() != Some(BTNFACE_0RGB) {
+                    saw_face_gone = true;
+                }
+            }
+
+            match stage {
+                0 => {
+                    // Click the "Dialog…" button through the host path.
+                    if let Some((hwnd, rx, ry)) = handle.window_at(301, 83)
+                        && hwnd != 0
+                        && rx < 90
+                        && ry < 22
+                    {
+                        let lparam = u64::from(ry << 16 | rx);
+                        handle.post_message_at(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lparam, 301, 83);
+                        handle.post_message_at(hwnd, WM_LBUTTONUP, 0, lparam, 301, 83);
+                        stage = 1;
+                    }
+                }
+                1 => {
+                    // The dialog should be open now: the target button is
+                    // hit-testable. Click it (host path).
+                    if let Some((hwnd, rx, ry)) = handle.window_at(bx, by)
+                        && hwnd != 0
+                        && rx < 120
+                        && ry < 40
+                    {
+                        let lparam = u64::from(ry << 16 | rx);
+                        handle.post_message_at(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lparam, bx, by);
+                        handle.post_message_at(hwnd, WM_LBUTTONUP, 0, lparam, bx, by);
+                        stage = 2;
+                    }
+                }
+                _ => {
+                    // The dialog must be gone: the button no longer resolves
+                    // (EndDialog removed the subtree) AND the face pixels are
+                    // gone from the owner surface.
+                    let still_button = matches!(
+                        handle.window_at(bx, by),
+                        Some((hwnd, rx, ry)) if hwnd != 0 && rx < 120 && ry < 40
+                    );
+                    if !still_button && saw_face_gone {
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            stage, 2,
+            "the dialog never closed after the host-posted {label} click"
+        );
+        assert!(
+            saw_face_gone,
+            "the dialog face (0xF0F0F0) stayed in the owner surface after the {label} \
+             click — EndDialog must erase the owner"
+        );
+    }
 }
