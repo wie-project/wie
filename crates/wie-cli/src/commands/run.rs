@@ -10,11 +10,14 @@ use std::path::Path;
 /// injecting pre-loaded bytes (LiveHost mode).
 fn is_interactive_stdin(path: &Path) -> bool {
     // `/dev/stdin`, `/dev/tty`, or `-` are the common interactive markers.
-    let s = path.to_string_lossy();
-    s == "/dev/stdin"
-        || s == "/dev/tty"
-        || s == "-"
-        || path.file_name().is_some_and(|n| n == "stdin")
+    // OsStr/Path compares avoid the lossy-UTF-8 round trip; byte-level
+    // semantics are identical (all three names are pure ASCII).
+    path == Path::new("/dev/stdin")
+        || path == Path::new("/dev/tty")
+        || path == Path::new("-")
+        || path
+            .file_name()
+            .is_some_and(|n| n == std::ffi::OsStr::new("stdin"))
 }
 /// Runs a freestanding / micro PE until `ExitProcess` and checks the exit code.
 pub(crate) fn run_micro(

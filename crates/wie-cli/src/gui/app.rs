@@ -112,8 +112,9 @@ impl WieApp {
 /// macOS's trailing `Resized` events so the guest reallocates its DIB once.
 const RESIZE_SETTLE_MS: u64 = 50;
 
-/// Per-window host state. `Some` iff the winit window exists — the "window
-/// exists iff hwnd known" invariant is now a type instead of per-arm checks.
+/// Per-window host state for an active winit window — the payload of
+/// [`WindowState::Active`]. The "window exists iff hwnd known" invariant is
+/// now a type instead of per-arm checks.
 struct WindowRuntime {
     /// Guest HWND this window mirrors.
     hwnd: Hwnd,
@@ -137,6 +138,46 @@ struct WindowRuntime {
     last_sent_size: Option<(u32, u32)>,
 }
 
+/// Window-bound state. The winit window is created lazily on the first
+/// published frame (the guest provides the title/size), so a session starts
+/// [`WindowState::Uncreated`] and moves to [`WindowState::Active`] exactly
+/// once, for the rest of the session. A thin [`Option`]-equivalent so call
+/// sites keep the `as_ref()` / `as_mut()` / `is_none()` shape.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one live window per session; Uncreated is transient until the first frame — boxing Active would add a heap hop to every present"
+)]
+enum WindowState {
+    /// The winit window has not been created yet.
+    Uncreated,
+    /// A winit window exists and mirrors the guest window.
+    Active(WindowRuntime),
+}
+
+impl WindowState {
+    fn as_ref(&self) -> Option<&WindowRuntime> {
+        match self {
+            WindowState::Uncreated => None,
+            WindowState::Active(rt) => Some(rt),
+        }
+    }
+
+    fn as_mut(&mut self) -> Option<&mut WindowRuntime> {
+        match self {
+            WindowState::Uncreated => None,
+            WindowState::Active(rt) => Some(rt),
+        }
+    }
+
+    fn is_none(&self) -> bool {
+        matches!(self, WindowState::Uncreated)
+    }
+
+    fn is_some(&self) -> bool {
+        matches!(self, WindowState::Active(_))
+    }
+}
+
 /// The present backend for a window. At most one variant is set — the two
 /// backends are mutually exclusive per window.
 #[expect(
@@ -153,29 +194,52 @@ enum PresentBackend {
     Softbuffer(softbuffer::Surface<Arc<Window>, Arc<Window>>),
 }
 
-/// Initialize the present backend per `WIE_PRESENT`: "softbuffer" keeps the
-/// CPU path, anything else (default) uses wgpu on macOS. On wgpu init failure
-/// we fall back to softbuffer rather than showing a black window.
+/// Parsed `WIE_PRESENT` value, read once at window creation. Only the exact
+/// value "softbuffer" keeps the CPU path; anything else (including unset)
+/// uses wgpu on macOS.
+#[cfg(target_os = "macos")]
+enum PresentBackendName {
+    Wgpu,
+    Softbuffer,
+}
+
+#[cfg(target_os = "macos")]
+impl PresentBackendName {
+    fn from_env() -> Self {
+        // Exact match preserved from the historical inline compare: any
+        // value other than "softbuffer" (or an unset var) means wgpu.
+        if matches!(
+            std::env::var("WIE_PRESENT").ok().as_deref(),
+            Some("softbuffer")
+        ) {
+            Self::Softbuffer
+        } else {
+            Self::Wgpu
+        }
+    }
+}
+
+/// Initialize the present backend per [`PresentBackendName::from_env`]:
+/// "softbuffer" keeps the CPU path, anything else (default) uses wgpu on
+/// macOS. On wgpu init failure we fall back to softbuffer rather than showing
+/// a black window.
 #[cfg(target_os = "macos")]
 fn init_present_backend(window: &Arc<Window>) -> Option<PresentBackend> {
-    let use_wgpu = !matches!(
-        std::env::var("WIE_PRESENT").ok().as_deref(),
-        Some("softbuffer")
-    );
-    if use_wgpu {
-        match crate::gui::present_wgpu::WgpuPresenter::init(window.clone()) {
-            Ok(presenter) => Some(PresentBackend::Wgpu(presenter)),
-            Err(e) => {
-                tracing::error!(
-                    target: "wiegui",
-                    error = %e,
-                    "wgpu init failed; falling back to softbuffer"
-                );
-                init_softbuffer(window)
+    match PresentBackendName::from_env() {
+        PresentBackendName::Softbuffer => init_softbuffer(window),
+        PresentBackendName::Wgpu => {
+            match crate::gui::present_wgpu::WgpuPresenter::init(window.clone()) {
+                Ok(presenter) => Some(PresentBackend::Wgpu(presenter)),
+                Err(e) => {
+                    tracing::error!(
+                        target: "wiegui",
+                        error = %e,
+                        "wgpu init failed; falling back to softbuffer"
+                    );
+                    init_softbuffer(window)
+                }
             }
         }
-    } else {
-        init_softbuffer(window)
     }
 }
 
@@ -193,8 +257,9 @@ fn init_softbuffer(window: &Arc<Window>) -> Option<PresentBackend> {
 
 struct WieApp {
     handle: Option<GuestHandle>,
-    /// Window-bound state; `Some` iff the winit window exists.
-    runtime: Option<WindowRuntime>,
+    /// Window-bound state; [`WindowState::Uncreated`] until the first frame
+    /// creates the winit window, then [`WindowState::Active`] for the session.
+    runtime: WindowState,
     /// B2: wake-coalescing flag, shared with the guest-thread wake callback.
     /// Set on every publish; the first `Frame` event after a publish group
     /// swaps it and requests a redraw, duplicates skip.
@@ -609,7 +674,7 @@ impl ApplicationHandler<WieEvent> for WieApp {
         // Debounced resize: when no Resized event arrived for the settle
         // window, the drag has ended — post the final WM_SIZE (and a WM_PAINT
         // so the guest reallocates its DIB exactly once, at the final size).
-        let Some(rt) = &mut self.runtime else {
+        let Some(rt) = self.runtime.as_mut() else {
             return;
         };
         if let Some(start) = rt.last_resize
@@ -673,7 +738,7 @@ impl ApplicationHandler<WieEvent> for WieApp {
                         if let Ok(window) = event_loop.create_window(attrs) {
                             let window = Arc::new(window);
                             window.focus_window();
-                            self.runtime = Some(WindowRuntime {
+                            self.runtime = WindowState::Active(WindowRuntime {
                                 hwnd: Hwnd::from(hwnd),
                                 window: window.clone(),
                                 surface: init_present_backend(&window),
@@ -786,7 +851,7 @@ pub fn run_gui_windowed(path: &std::path::Path) -> Result<()> {
     // Window is created lazily when the first frame arrives (in user_event).
     let mut app = WieApp {
         handle: Some(handle),
-        runtime: None,
+        runtime: WindowState::Uncreated,
         pending_frame,
         mouse_buttons: 0,
         cursor_pos: (0.0, 0.0),
