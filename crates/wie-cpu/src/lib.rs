@@ -195,7 +195,7 @@ pub struct RunUntilHook {
 ///
 /// Object-safe so the session can hold `Box<dyn CpuEngine>`.
 ///
-/// `Send` is required so MT.2 can move a shared engine behind `Mutex` onto
+/// `Send` is required so a shared engine can move behind a `Mutex` onto
 /// worker host threads (access is still serialized by that mutex).
 pub trait CpuEngine: Send {
     /// Map a guest VA range.
@@ -428,14 +428,14 @@ pub trait CpuEngine: Send {
     /// # Errors
     fn read_r12(&mut self) -> Result<u64, CpuError>;
 
-    /// Snapshot GPRs + XMM + RIP + RFLAGS for guest thread switch (MT.2).
+    /// Snapshot GPRs + XMM + RIP + RFLAGS for guest thread switch.
     ///
     /// Default: empty context (backends that own a [`RegFile`] override).
     fn snapshot_thread_context(&mut self) -> ThreadContext {
         ThreadContext::new()
     }
 
-    /// Restore a prior [`Self::snapshot_thread_context`] (MT.2).
+    /// Restore a prior [`Self::snapshot_thread_context`].
     fn restore_thread_context(&mut self, ctx: &ThreadContext) {
         let _ = ctx;
     }

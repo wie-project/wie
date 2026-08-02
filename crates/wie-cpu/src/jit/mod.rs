@@ -63,6 +63,7 @@ unsafe impl Send for JitCpu {}
 
 #[doc(hidden)]
 #[derive(Clone)]
+/// Shared cache entry for one guest entry VA (`Ready` / `Never` / `Hot` / `Queued`).
 pub enum CacheEntry {
     /// Native block ready to run.
     Ready(CompiledBlock),
@@ -150,7 +151,7 @@ pub fn dump_mem_path_stats(s: &JitStats) {
     }
 }
 
-/// Lightweight counters for `WIE_CPU=jit` diagnostics / baselines.
+/// Lightweight counters for `WIE_CPU=jit` diagnostics.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct JitStats {
     /// Instructions retired via native blocks.
@@ -169,7 +170,7 @@ pub struct JitStats {
     /// Total wall µs this thread spent waiting on background compiles.
     pub compile_stall_us: u64,
     /// Background waits that missed the deadline and fell back to inline
-    /// compilation (worker backlog / dead worker visibility, roadmap B9).
+    /// compilation (worker backlog / dead worker visibility).
     pub compile_stall_fallback: u64,
     /// Cache hits (native run).
     pub cache_hits: u64,

@@ -1,5 +1,5 @@
 //! Per-instruction lowering (`lower_insn`) with lazy-flag machinery and the
-//! //! deferred-shift/flag state.
+//! deferred-shift/flag state.
 
 use super::emit::MemEnv;
 use super::flags::{

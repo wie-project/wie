@@ -1,5 +1,5 @@
 //! Bulk string lowering: inline Neon copy for small REP MOVS/STOS, `stos` splat,
-//! //! and `lower_string`.
+//! and `lower_string`.
 
 use super::super::config::JitConfig;
 use super::emit::{MemEnv, exit_args};

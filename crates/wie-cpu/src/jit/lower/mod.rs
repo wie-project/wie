@@ -1,6 +1,7 @@
 //! Lower pure-GPR (+ simple mem / jcc) blocks to Cranelift IR and finalize host code.
 //!
-//! Cast/index/arithmetic allows shared with other JIT modules live on `jit/mod.rs`.
+//! The TLB/pin/sticky constants, `JitCtx` layout, and the per-block compile
+//! entry point (`compile_block`) live here.
 
 use super::JitEngine;
 use super::block::{BlockTerm, DecodedInsn, analyze_block_stack_pin};
@@ -316,7 +317,7 @@ pub(super) struct JitCtx {
     pub fault_size: u64,
     /// 0 = read, 1 = write (matches iced ACCESS_*).
     pub fault_access: u64,
-    /// Set-associative multi-way page TLB (Track B).
+    /// Set-associative multi-way page TLB.
     pub tlb_sets: [TlbBucket; TLB_SETS],
     /// Parallel gen/prot/rr for [`Self::tlb_sets`].
     pub tlb_aux: [TlbBucketAux; TLB_SETS],

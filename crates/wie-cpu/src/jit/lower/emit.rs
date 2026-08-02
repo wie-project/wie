@@ -1,5 +1,5 @@
 //! Block emission: `emit_body_and_term`, the block-wide stack guard, and the
-//! //! terminator helpers (chaining, shadow stack, self-loops, fast UCRT inline ops).
+//! terminator helpers (chaining, shadow stack, self-loops, fast UCRT inline ops).
 
 use super::analysis::{ensure_gprs_loaded, ensure_xmm_loaded};
 use super::flags::iconst_u64;

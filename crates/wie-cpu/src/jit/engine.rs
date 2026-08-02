@@ -1,8 +1,7 @@
-//! Cranelift `JITModule` wrapper: import declarations + engine construction.
+//! `JitEngine` construction: the Cranelift `JITModule` plus import declarations.
 //!
-//! Extracted verbatim from `jit/mod.rs`. `lower.rs`
-//! mutates `JitEngine` fields directly, so every field is `pub(super)`
-//! (visible across `crate::jit`, matching the old private-in-`mod.rs` scope).
+//! Fields are `pub(super)` because `lower.rs` mutates `JitEngine` fields
+//! directly during block compilation (visible across `crate::jit`).
 
 #![allow(
     unsafe_code, // Cranelift finalized fn pointers + host mem helpers
@@ -67,7 +66,7 @@ impl JitEngine {
         use cranelift_module::{Linkage, Module, default_libcall_names};
 
         let mut flag_builder = settings::builder();
-        // Track D: prefer speed of host code for hot translated blocks.
+        // Prefer speed of host code for hot translated blocks.
         flag_builder
             .set("opt_level", JitConfig::get().opt_level())
             .map_err(|e| e.to_string())?;

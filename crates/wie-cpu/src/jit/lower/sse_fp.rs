@@ -1,5 +1,5 @@
 //! SSE floating-point lowering: scalar/packed FP binops, compare, converts,
-//! //! bitwise ops, `pshufb`/shifts via host helpers, and the float ABI (FloatBinOp).
+//! bitwise ops, `pshufb`/shifts via host helpers, and the float ABI (`FloatBinOp`).
 
 use super::super::config::JitConfig;
 use super::SseBit;

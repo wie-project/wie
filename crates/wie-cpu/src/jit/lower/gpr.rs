@@ -1,5 +1,5 @@
 //! GPR operand helpers (read/write, effective-address, sticky-TLB probe) and the
-//! //! mov/ALU/shift/push/pop/imul/div/cmpxchg lowering family.
+//! mov/ALU/shift/push/pop/imul/div/cmpxchg lowering family.
 
 use super::emit::MemEnv;
 use super::flags::{

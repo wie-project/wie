@@ -34,6 +34,7 @@ pub struct IcedCpu {
 }
 
 impl IcedCpu {
+    /// Open a fresh iced interpreter with its own guest memory.
     #[must_use]
     pub fn open_x86_64() -> Self {
         Self {
@@ -47,6 +48,7 @@ impl IcedCpu {
         }
     }
 
+    /// Open a per-thread iced interpreter sharing `source`'s guest memory.
     #[must_use]
     pub fn new_shared(source: &Self) -> Self {
         Self {
@@ -75,11 +77,13 @@ impl IcedCpu {
         }
     }
 
+    /// Borrow the shared guest memory handle.
     #[must_use]
     pub fn guest_mem_arc(&self) -> &Arc<RwLock<GuestMemory>> {
         &self.mem
     }
 
+    /// Total interpreter steps retired.
     #[must_use]
     pub fn iced_steps(&self) -> u64 {
         self.iced_steps
@@ -110,11 +114,13 @@ impl IcedCpu {
         out
     }
 
+    /// Borrow the register file.
     #[must_use]
     pub fn regs(&self) -> &RegFile {
         &self.regs
     }
 
+    /// Borrow the register file mutably.
     pub fn regs_mut(&mut self) -> &mut RegFile {
         &mut self.regs
     }

@@ -1,5 +1,5 @@
 //! SSE/SSE2 lowering: mov/pack family, `punpck`/`pshufd` shuffles, packed-integer
-//! //! binops/shifts (Neon-accelerated), and the packed-integer host ABI helpers.
+//! binops/shifts (Neon-accelerated), and the packed-integer host ABI helpers.
 
 use super::super::config::JitConfig;
 use super::analysis::{i8x16_to_pair, pair_to_i8x16, read_xmm_pair, store_xmm_pair, xmm_index};

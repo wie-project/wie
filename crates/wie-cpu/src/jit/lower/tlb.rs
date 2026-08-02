@@ -1,5 +1,5 @@
-//! TLB hot-path helpers: software-permission checks, pin resolution, multi-way
-//! //! set-associative lookups, and the single-page host-pointer resolver (`tlb_page_ptr`).
+//! TLB hot-path lookup helpers: software-permission checks, pin resolution,
+//! multi-way set-associative lookups, and the single-page host-pointer resolver (`tlb_page_ptr`).
 
 use super::super::config::JitConfig;
 use super::{

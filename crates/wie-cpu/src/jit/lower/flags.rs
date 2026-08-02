@@ -1,5 +1,5 @@
 //! Lazy flag computation: ZS/PF/logic/add/sub/inc-dec/not/neg and flag-bit
-//! //! select/replace helpers.
+//! select/replace helpers.
 
 use super::emit::MemEnv;
 use super::gpr::{op_width_bits, read_op_mem, write_op_mem};

@@ -1,7 +1,6 @@
 //! `CpuEngine` trait implementation for `JitCpu` (host-call interface).
 //!
-//! Extracted verbatim from `jit/mod.rs`. As a
-//! submodule it may `impl crate::CpuEngine for super::JitCpu`; the impl
+//! As a submodule it may `impl crate::CpuEngine for super::JitCpu`; the impl
 //! accesses `JitCpu`'s pipeline methods via their `pub(super)` bumps.
 
 #![allow(

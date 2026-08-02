@@ -1,5 +1,5 @@
-//! Guest-memory access: host-callable `wie_jit_*` helpers (registered as JIT symbols)
-//! //! and the IR-emitting load/store/pin helpers used by block emission.
+//! Guest-memory access: host-callable `wie_jit_*` helpers (registered as JIT
+//! symbols) and the IR-emitting load/store/pin helpers used by block emission.
 
 use super::emit::{HoistedPin, MemEnv, exit_args};
 use super::flags::iconst_u64;

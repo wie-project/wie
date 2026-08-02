@@ -1,9 +1,8 @@
 //! Per-thread JIT execution pipeline: dispatch, compile, run, invalidate.
 //!
-//! Extracted verbatim from `jit/mod.rs`. The hot path
-//! (`step_one`, `try_compile`, `finish_compiled`, `run_compiled`,
-//! `invalidate_code_range`) moves byte-for-byte. Methods called from
-//! `cpu_engine.rs` or `mod.rs` tests are `pub(super)`.
+//! The hot path (`step_one`, `try_compile`, `finish_compiled`, `run_compiled`,
+//! `invalidate_code_range`) runs here; methods called from `cpu_engine.rs` or
+//! `mod.rs` tests are `pub(super)`.
 
 #![allow(
     unsafe_code, // Cranelift finalized fn pointers + host mem helpers
@@ -62,7 +61,7 @@ impl JitCpu {
         }
     }
 
-    /// Snapshot of JIT diagnostics counters (baselines).
+    /// Snapshot of JIT diagnostic counters.
     ///
     /// Merges the shared background-compile counter into the per-thread
     /// snapshot so `WIE_RUNTIME_PROFILE` sees background work.
@@ -613,6 +612,20 @@ impl JitCpu {
         }
     }
 
+    /// Run a compiled block against per-thread JIT state.
+    ///
+    /// Contract:
+    /// - Entry: `meta` snapshots the Ready block, so no shared-cache borrow is
+    ///   held while the native frame runs.
+    /// - Pins refresh first when `GuestMemory` generation changed; TLB/pins
+    ///   then resolve to stable mmap pointers for the whole call.
+    /// - The `GuestMemory` read guard drops before native execution — the block
+    ///   runs on the per-thread TLB/pins and `JitCtx` pointers only.
+    /// - Chain-table slots and the shadow return stack are per-thread owned
+    ///   (`chain_slots` / `shadow_ret`), live for the call, and persist back
+    ///   into `self.thread` from `JitCtx` on return; pending code writes are
+    ///   drained (SMC invalidation) before returning.
+    ///
     /// Returns `Some(InvalidMem)` when a host mem helper faulted.
     fn run_compiled(&mut self, entry_rip: u64, meta: CompiledRunMeta) -> Option<exec::InvalidMem> {
         // Refresh pins only when GuestMemory generation changes (map/protect/free).
@@ -671,7 +684,7 @@ impl JitCpu {
             *slot = regs.gpr(i);
         }
         // Pure GPR blocks skip the XMM bank copy on both sides of the call.
-        // SSE blocks load only live XMMs (Track A live mask).
+        // SSE blocks load only live XMMs (live-mask selective entry load).
         let mut xmm = [XmmSlot::ZERO; 16];
         if meta.uses_sse {
             let mut m = meta.xmm_live_mask;

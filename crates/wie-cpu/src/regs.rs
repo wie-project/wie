@@ -83,7 +83,7 @@ impl Not for Rflags {
     }
 }
 
-/// Portable snapshot of architectural CPU state for guest thread switch (MT.2).
+/// Portable snapshot of architectural CPU state for guest thread switch.
 ///
 /// Used when multiple host threads serialize on one shared [`crate::CpuEngine`]:
 /// each guest thread parks its regs here while another runs.
@@ -141,12 +141,13 @@ impl Default for RegFile {
 }
 
 impl RegFile {
+    /// Create a fresh all-zero register file with default RFLAGS.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Export a full architectural snapshot (MT thread switch).
+    /// Export a full architectural snapshot for a guest thread switch.
     #[must_use]
     pub fn snapshot(&self) -> ThreadContext {
         ThreadContext {
@@ -157,7 +158,7 @@ impl RegFile {
         }
     }
 
-    /// Restore a full architectural snapshot (MT thread switch).
+    /// Restore a full architectural snapshot after a guest thread switch.
     pub fn restore(&mut self, ctx: &ThreadContext) {
         self.gpr = ctx.gpr;
         self.xmm = ctx.xmm;
@@ -165,86 +166,107 @@ impl RegFile {
         self.set_rflags_checked(ctx.rflags);
     }
 
+    /// Read GPR `idx` (RAX=0 … R15=15); out-of-range reads yield 0.
     #[must_use]
     pub fn gpr(&self, idx: usize) -> u64 {
         self.gpr.get(idx).copied().unwrap_or(0)
     }
 
+    /// Write GPR `idx`; out-of-range writes are ignored.
     pub(crate) fn set_gpr(&mut self, idx: usize, value: u64) {
         if let Some(slot) = self.gpr.get_mut(idx) {
             *slot = value;
         }
     }
 
-    /// Public GPR write for MT bootstrap (thread start RCX/RSP/…).
+    /// Public GPR write for guest thread bootstrap (thread start RCX/RSP/…).
     pub fn set_gpr_public(&mut self, idx: usize, value: u64) {
         self.set_gpr(idx, value);
     }
 
+    /// Read RAX.
     #[must_use]
     pub fn rax(&self) -> u64 {
         self.gpr(0)
     }
+    /// Write RAX.
     pub(crate) fn set_rax(&mut self, v: u64) {
         self.set_gpr(0, v);
     }
+    /// Read RCX.
     #[must_use]
     pub fn rcx(&self) -> u64 {
         self.gpr(1)
     }
+    /// Write RCX.
     pub(crate) fn set_rcx(&mut self, v: u64) {
         self.set_gpr(1, v);
     }
+    /// Read RDX.
     #[must_use]
     pub fn rdx(&self) -> u64 {
         self.gpr(2)
     }
+    /// Write RDX.
     pub(crate) fn set_rdx(&mut self, v: u64) {
         self.set_gpr(2, v);
     }
+    /// Read RBX.
     #[must_use]
     pub fn rbx(&self) -> u64 {
         self.gpr(3)
     }
+    /// Read RSP.
     #[must_use]
     pub fn rsp(&self) -> u64 {
         self.gpr(4)
     }
+    /// Write RSP.
     pub(crate) fn set_rsp(&mut self, v: u64) {
         self.set_gpr(4, v);
     }
+    /// Read RBP.
     #[must_use]
     pub fn rbp(&self) -> u64 {
         self.gpr(5)
     }
+    /// Write RBP.
     pub(crate) fn set_rbp(&mut self, v: u64) {
         self.set_gpr(5, v);
     }
+    /// Read RSI.
     #[must_use]
     pub fn rsi(&self) -> u64 {
         self.gpr(6)
     }
+    /// Write RSI.
     pub(crate) fn set_rsi(&mut self, v: u64) {
         self.set_gpr(6, v);
     }
+    /// Read RDI.
     #[must_use]
     pub fn rdi(&self) -> u64 {
         self.gpr(7)
     }
+    /// Write RDI.
     pub(crate) fn set_rdi(&mut self, v: u64) {
         self.set_gpr(7, v);
     }
+    /// Read R8.
     #[must_use]
     pub fn r8(&self) -> u64 {
         self.gpr(8)
     }
+    /// Write R8.
     pub(crate) fn set_r8(&mut self, v: u64) {
         self.set_gpr(8, v);
     }
+    /// Read R9.
     #[must_use]
     pub fn r9(&self) -> u64 {
         self.gpr(9)
     }
+    /// Write R9.
     pub(crate) fn set_r9(&mut self, v: u64) {
         self.set_gpr(9, v);
     }
@@ -346,6 +368,7 @@ impl RegFile {
         Ok(())
     }
 
+    /// Test whether any bit of `mask` is set in RFLAGS.
     #[must_use]
     pub fn flag(&self, mask: Rflags) -> bool {
         u64::from(self.rflags & mask) != 0
@@ -390,6 +413,7 @@ impl RegFile {
         }
     }
 
+    /// Set or clear the flags in `mask`.
     pub(crate) fn set_flag(&mut self, mask: Rflags, on: bool) {
         // No `|= ALWAYS1` here: bit 1 does not overlap any flag mask defined on
         // `Rflags`, so a per-flag re-assert is pure overhead (6 redundant

@@ -199,11 +199,16 @@ impl JitConfig {
         }
     }
 
+    /// Compile after this many visits to the same guest entry (skip cold code).
+    /// Default 100: lower values cut residual iced but thrash short non-loop
+    /// blocks on 7za and increase wall. Tests use 0.
     #[must_use]
     pub(super) fn hotness_threshold(&self) -> u32 {
         self.hotness_threshold
     }
 
+    /// Known pure self-loops: compile sooner (one Cranelift pass vs iced
+    /// warmup). Default 8; tests 0.
     #[must_use]
     pub(super) fn pure_loop_hotness(&self) -> u32 {
         self.pure_loop_hotness
@@ -238,41 +243,55 @@ impl JitConfig {
         }
     }
 
+    /// Late-bound + direct block chaining (`WIE_JIT_CHAIN=0` disables).
     #[must_use]
     pub(super) fn chain_enabled(&self) -> bool {
         self.chain_enabled
     }
 
+    /// Background compiler worker. Default: on for real runs, off under
+    /// `cfg(test)` (hotness is 0 there, so every block is eager; the
+    /// deterministic inline-compile path keeps the unit suite stable).
     #[must_use]
     pub(super) fn bg_enabled(&self) -> bool {
         self.bg_enabled
     }
 
+    /// Max guest-wait for a background compile before falling back to inline
+    /// compilation. A single compile is ~50–500 µs, so 10 ms is ~20× headroom;
+    /// the fallback only triggers on queue backlog or a dead worker.
     #[must_use]
     pub(super) fn bg_wait_timeout(&self) -> Duration {
         self.bg_wait_timeout
     }
 
+    /// Cranelift `opt_level`: `speed` | `speed_and_size` | `none`.
+    /// Default `speed` (hot guest blocks over code size).
     #[must_use]
     pub(super) fn opt_level(&self) -> &'static str {
         self.opt_level
     }
 
+    /// Run the Cranelift IR verifier only when `WIE_JIT_VERIFY=1`.
     #[must_use]
     pub(super) fn verifier_enabled(&self) -> bool {
         self.verifier_enabled
     }
 
+    /// Emit Cranelift SIMD types for SSE (`WIE_JIT_SIMD=0` disables).
     #[must_use]
     pub(super) fn simd_enabled(&self) -> bool {
         self.simd_enabled
     }
 
+    /// Neon software-TLB tag compare (`WIE_TLB_NEON=0` → scalar 4-way scan).
     #[must_use]
     pub(super) fn tlb_neon_enabled(&self) -> bool {
         self.tlb_neon_enabled
     }
 
+    /// Inline REP MOVS/STOS for 16–64 byte const counts
+    /// (`WIE_STRING_INLINE=0` disables).
     #[must_use]
     pub(super) fn string_inline_enabled(&self) -> bool {
         self.string_inline_enabled

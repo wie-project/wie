@@ -1,8 +1,8 @@
-//! Shared JIT state: compilation cache + guest memory + background worker.
+//! Process-wide compiled-code cache, guest memory, and the background compiler worker.
 //!
-//! Extracted verbatim from `jit/mod.rs`. Visibility
-//! bumps: wait cells / enqueue outcomes / `JitShared::new` / worker helpers
-//! used from `pipeline.rs` or `mod.rs` tests are `pub(super)`.
+//! One [`JitShared`] per process, shared via `Arc` across all per-thread
+//! engines. Wait cells / enqueue outcomes / worker helpers used from
+//! `pipeline.rs` or `mod.rs` tests are `pub(super)`.
 
 #![allow(
     unsafe_code, // Cranelift finalized fn pointers + host mem helpers
@@ -86,7 +86,7 @@ pub(super) enum BgWaitState {
     Never,
 }
 
-/// Shared JIT state: Cranelift module + compilation cache + guest memory.
+/// Process-wide JIT compilation cache and guest memory, shared across threads.
 /// One instance per process, shared via Arc across all per-thread engines.
 #[doc(hidden)]
 pub struct JitShared {
@@ -509,7 +509,7 @@ pub struct PerThreadJitState {
     pub rip_trace: [u64; 32],
     pub rip_trace_i: usize,
     pub rip_trace_n: usize,
-    /// Instructions retired via interpreter (baselines).
+    /// Instructions retired via the iced interpreter (diagnostic counter).
     pub iced_steps: u64,
     /// Persistent set-associative page TLB across chained blocks.
     pub tlb_sets: [TlbBucket; TLB_SETS],
