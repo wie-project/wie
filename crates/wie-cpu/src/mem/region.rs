@@ -1,7 +1,7 @@
-//! Software region registry for named guest VA ranges (Phase 1.2).
+//! Software region registry for named guest VA ranges.
 //!
 //! Tracks stack, heap, image, fake API, TEB, etc. with permissions and an
-//! optional host base (filled once an mmap arena is attached in Phase 2).
+//! optional host base (filled once an mmap arena is attached).
 
 use crate::RwxPerms;
 
@@ -142,7 +142,7 @@ impl RegionTable {
 
     /// Set `host_base` on every region that contains `va` when still unset.
     ///
-    /// Used after an mmap arena is attached so Phase 4 can pin host pointers.
+    /// Used after an mmap arena is attached so host pointers can be pinned.
     pub fn set_host_base_if_covers(&mut self, va: u64, host_base: u64) {
         for r in &mut self.regions {
             if r.contains(va) && r.host_base.is_none() {
@@ -153,7 +153,7 @@ impl RegionTable {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

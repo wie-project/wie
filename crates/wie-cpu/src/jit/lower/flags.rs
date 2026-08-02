@@ -1,12 +1,6 @@
 //! Lazy flag computation: ZS/PF/logic/add/sub/inc-dec/not/neg and flag-bit
 //! //! select/replace helpers.
 
-#![allow(
-    clippy::cast_possible_wrap, // mem width / offset → i32 for Cranelift
-    clippy::many_single_char_names, // flag temps d/s/r in flags_* helpers
-    clippy::too_many_arguments
-)]
-
 use super::emit::MemEnv;
 use super::gpr::{op_width_bits, read_op_mem, write_op_mem};
 use super::insn::PendingFlags;

@@ -1,12 +1,6 @@
 //! GPR operand helpers (read/write, effective-address, sticky-TLB probe) and the
 //! //! mov/ALU/shift/push/pop/imul/div/cmpxchg lowering family.
 
-#![allow(
-    clippy::cast_possible_wrap, // mem width / offset → i32 for Cranelift
-    clippy::many_single_char_names, // flag temps d/s/r in flags_* helpers
-    clippy::too_many_arguments
-)]
-
 use super::emit::MemEnv;
 use super::flags::{
     clear_flags, flag_bit, flags_add, flags_logic, flags_sub, iconst_u64, mask_width, replace_flag,

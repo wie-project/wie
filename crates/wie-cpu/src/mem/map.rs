@@ -1,5 +1,5 @@
 //! GuestMemory mapping + region + JIT pin operations: `map` / `map_image`,
-//! the region registry (`register_region` / `find_region`), and the Phase 4.1
+//! the region registry (`register_region` / `find_region`), and the
 //! soft-translate pins (`span_pin` / `region_pin` / `jit_region_pins`).
 
 use super::{
@@ -24,7 +24,7 @@ impl super::GuestMemory {
         self.regions.find(va)
     }
 
-    /// Build a Phase 4.1 region pin for JIT: soft-translated host base + bounds +
+    /// Build a region pin for JIT: soft-translated host base + bounds +
     /// **conservative** software R/W (intersection over every committed page).
     ///
     /// Returns `None` when:
@@ -64,7 +64,6 @@ impl super::GuestMemory {
         let host_u = host_arena_u.checked_add(off)?;
         // SAFETY: host is arena soft-translate of guest_base; pin is non-owning
         // and invalidated via generation / invalidate_tlb on unmap.
-        #[allow(clippy::as_conversions)] // required: u64 → non-owning *mut u8 (int-to-ptr)
         let host_base = host_u as *mut u8;
         if host_base.is_null() {
             return None;
@@ -86,7 +85,7 @@ impl super::GuestMemory {
                 return None;
             }
             allow_r &= run.protect.allows_read();
-            // Phase 4.x: never soft-translate writes onto executable pages so
+            // Never soft-translate writes onto executable pages so
             // SMC always hits `GuestMemory::write` + code-invalidate drain.
             allow_w &= run.protect.allows_write() && !run.protect.allows_execute();
             saw = true;

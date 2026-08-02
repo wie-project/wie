@@ -8,20 +8,6 @@
 //! Low-level CPU arithmetic intentionally uses wrapping ops, truncating casts,
 //! and direct indexing of fixed-size buffers — clippy pedantic is not useful here.
 
-#![allow(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_precision_loss, // cvtsi2ss/sd: Intel-defined rounding, not a bug
-    clippy::cast_sign_loss,
-    clippy::arithmetic_side_effects,
-    clippy::indexing_slicing,
-    clippy::integer_division,
-    clippy::many_single_char_names, // lane helpers (a/b/x/y/mask)
-    clippy::float_cmp, // COMISS equality: IEEE == is the architectural result
-    clippy::manual_range_contains // f >= hi || f < lo reads clearer than !range
-)]
-
 mod cache;
 mod gpr;
 mod ops;
@@ -848,7 +834,7 @@ fn atomic_fetch_add(mem: &GuestMemory, addr: u64, size: usize, addend: u64) -> O
         4 if addr.is_multiple_of(4) => {
             let host = mem.host_span(addr, 4, true)?;
             // SAFETY: host_span checked SPC+arena; alignment preserved by soft-translate.
-            #[expect(unsafe_code, clippy::cast_ptr_alignment)]
+            #[expect(unsafe_code)]
             let atom = unsafe { &*(host.cast::<AtomicI32>()) };
             let add = i32::from_le_bytes((addend as u32).to_le_bytes());
             let old = atom.fetch_add(add, Ordering::SeqCst);
@@ -856,7 +842,7 @@ fn atomic_fetch_add(mem: &GuestMemory, addr: u64, size: usize, addend: u64) -> O
         }
         8 if addr.is_multiple_of(8) => {
             let host = mem.host_span(addr, 8, true)?;
-            #[expect(unsafe_code, clippy::cast_ptr_alignment)]
+            #[expect(unsafe_code)]
             let atom = unsafe { &*(host.cast::<AtomicI64>()) };
             let add = i64::from_le_bytes(addend.to_le_bytes());
             let old = atom.fetch_add(add, Ordering::SeqCst);

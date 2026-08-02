@@ -7,12 +7,7 @@
 
 #![allow(
     unsafe_code, // Cranelift finalized fn pointers + host mem helpers
-    private_interfaces, // JitShared/PerThreadJitState expose crate-private types
-    clippy::indexing_slicing, // fixed gpr[0..16]
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::arithmetic_side_effects,
-    clippy::unwrap_used // Mutex/RwLock poison recovery is hard-coded (never occurs in practice)
+    private_interfaces // JitShared/PerThreadJitState expose crate-private types
 )]
 
 use std::sync::OnceLock;
@@ -49,7 +44,6 @@ enum SuperMode {
 ///
 /// The flat bool surface mirrors the one-knob-per-env-var contract (`WIE_JIT_*`);
 /// folding the toggles into enums would obscure that mapping for no benefit.
-#[expect(clippy::struct_excessive_bools)]
 pub(super) struct JitConfig {
     hotness_threshold: u32,
     pure_loop_hotness: u32,

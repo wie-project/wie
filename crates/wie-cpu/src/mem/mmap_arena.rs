@@ -101,7 +101,7 @@ impl MmapArenaBackend {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used, clippy::as_conversions, unsafe_code)]
+#[allow(clippy::expect_used, clippy::as_conversions, unsafe_code)]
 mod tests {
     use super::super::backend::PAGE_SIZE_USIZE;
     use super::*;

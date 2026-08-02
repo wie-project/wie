@@ -1,11 +1,5 @@
 //! Live-variable analysis and XMM/GPR load tracking for one decoded block.
 
-#![allow(
-    clippy::cast_possible_wrap, // mem width / offset → i32 for Cranelift
-    clippy::many_single_char_names, // flag temps d/s/r in flags_* helpers
-    clippy::too_many_arguments
-)]
-
 use super::super::config::JitConfig;
 use super::OFF_XMM;
 use super::emit::MemEnv;

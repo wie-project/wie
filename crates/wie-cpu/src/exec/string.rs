@@ -1,20 +1,6 @@
 //! REP-prefixed string operations for the iced interpreter and the JIT host
 //! bridge (`wie_jit_string`).
 
-#![allow(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_precision_loss, // cvtsi2ss/sd: Intel-defined rounding, not a bug
-    clippy::cast_sign_loss,
-    clippy::arithmetic_side_effects,
-    clippy::indexing_slicing,
-    clippy::integer_division,
-    clippy::many_single_char_names, // lane helpers (a/b/x/y/mask)
-    clippy::float_cmp, // COMISS equality: IEEE == is the architectural result
-    clippy::manual_range_contains // f >= hi || f < lo reads clearer than !range
-)]
-
 use crate::mem::GuestMemory;
 use crate::regs::{self, RegFile, Rflags};
 use iced_x86::{Instruction, Mnemonic, Register};
@@ -178,7 +164,7 @@ pub(crate) fn run_string_op(
 /// Max elements processed in one bulk REP string step (faults still leave partial state).
 const REP_BULK_MAX: u64 = 1 << 20;
 
-/// Minimum byte length for host-span `memcpy`/`memset` (Phase 4.3).
+/// Minimum byte length for host-span `memcpy`/`memset`.
 ///
 /// Smaller REPs stay on the existing page-chunked `GuestMemory::{read,write}` path.
 const REP_HOST_BULK_MIN_BYTES: usize = 16;
@@ -257,7 +243,7 @@ fn string_stos(
         let mut count = regs.rcx().min(REP_BULK_MAX);
         let mut rdi = regs.rdi();
         let size_u = u64::try_from(size).unwrap_or(1);
-        // Phase 4.3: soft-translated host span → memset-like fill (DF=0 or DF=1).
+        // Soft-translated host span → memset-like fill (DF=0 or DF=1).
         if count > 1 && string_host_bulk_enabled() {
             let byte_len_u = count.saturating_mul(size_u);
             let byte_len = usize::try_from(byte_len_u).unwrap_or(0);
@@ -378,7 +364,7 @@ fn string_movs(
             (rsi.wrapping_sub(last_off), rdi.wrapping_sub(last_off))
         };
         let overlap = ranges_overlap(src_lo, dst_lo, byte_len_u);
-        // Phase 4.3: non-overlapping guest ranges + soft-translated host spans
+        // Non-overlapping guest ranges + soft-translated host spans
         // → `copy_nonoverlapping`. Guest-overlapping REP MOVS stays on the
         // element loop (x86 directional copy ≠ host `memmove`).
         if count > 1

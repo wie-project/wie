@@ -1,17 +1,12 @@
 //! `CpuEngine` trait implementation for `JitCpu` (host-call interface).
 //!
-//! Extracted verbatim from `jit/mod.rs` (Phase 4 split, lane 2). As a
+//! Extracted verbatim from `jit/mod.rs`. As a
 //! submodule it may `impl crate::CpuEngine for super::JitCpu`; the impl
 //! accesses `JitCpu`'s pipeline methods via their `pub(super)` bumps.
 
 #![allow(
     unsafe_code, // Cranelift finalized fn pointers + host mem helpers
-    private_interfaces, // JitShared/PerThreadJitState expose crate-private types
-    clippy::indexing_slicing, // fixed gpr[0..16]
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::arithmetic_side_effects,
-    clippy::unwrap_used // Mutex/RwLock poison recovery is hard-coded (never occurs in practice)
+    private_interfaces // JitShared/PerThreadJitState expose crate-private types
 )]
 
 use super::fast_api::JitFastPathConfig;

@@ -1,12 +1,6 @@
 //! Per-instruction lowering (`lower_insn`) with lazy-flag machinery and the
 //! //! deferred-shift/flag state.
 
-#![allow(
-    clippy::cast_possible_wrap, // mem width / offset → i32 for Cranelift
-    clippy::many_single_char_names, // flag temps d/s/r in flags_* helpers
-    clippy::too_many_arguments
-)]
-
 use super::emit::MemEnv;
 use super::flags::{
     clear_flags, flag_bit, flags_add, flags_logic, flags_sub, flags_zs_pf, iconst_u64,

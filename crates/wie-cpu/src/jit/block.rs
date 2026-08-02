@@ -214,7 +214,6 @@ fn is_near_branch(instr: &Instruction) -> bool {
 
 // The SSE classification groups intentionally share helper bodies (e.g. all
 // packed-integer ops are `xmm, xmm/m128`); keep the groups readable by mnemonic.
-#[expect(clippy::match_same_arms)]
 fn is_lowerable(instr: &Instruction) -> bool {
     match instr.mnemonic() {
         // Nop, endbranch, sign-extension / DF / rflags stack: always lowerable.
@@ -899,7 +898,7 @@ fn mem_size_ok(instr: &Instruction) -> bool {
 
 /// Pre-compile plan: every memop in the block is `base+disp` on one stack
 /// register, base is not mutated, so a **single** entry guard can cover the
-/// whole block (Phase 4.1b super-fast path).
+/// whole block (super-fast path).
 #[derive(Debug, Clone, Copy)]
 pub(super) struct BlockStackPinPlan {
     /// GPR index of the stack base (4 = RSP, 5 = RBP).

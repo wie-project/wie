@@ -68,7 +68,7 @@ impl super::GuestMemory {
 
     /// Soft-translate a **contiguous** guest range to a host pointer for bulk copy.
     ///
-    /// Phase 4.3: used by REP MOVS/STOS after SPC. Never returns guest VAs.
+    /// Used by REP MOVS/STOS after SPC. Never returns guest VAs.
     ///
     /// Returns `None` when:
     /// - `len == 0` or the range wraps,
@@ -134,7 +134,7 @@ impl super::GuestMemory {
         };
         self.pages.check_access(address, len, kind).ok()?;
 
-        // Phase 4.x: never host-span *write* onto executable pages (SMC must
+        // Never host-span *write* onto executable pages (SMC must
         // go through `write` + code-invalidate). Reads of RX code are fine.
         if write && self.range_allows_execute(address, len) {
             return None;
@@ -177,7 +177,7 @@ impl super::GuestMemory {
             return None;
         }
         // SAFETY: SPC passed; start and last byte share one arena; soft translate.
-        #[expect(unsafe_code, clippy::as_conversions)] // host base address → data pointer
+        #[expect(unsafe_code)] // host base address → data pointer
         Some(unsafe { (host_base_u as *mut u8).add(off_usize) })
     }
 
@@ -268,7 +268,7 @@ impl super::GuestMemory {
         }
         let allow_r = run.protect.allows_read();
         let allow_x = run.protect.allows_execute();
-        // Phase 4.x: W soft-translate is denied on executable pages so stores
+        // W soft-translate is denied on executable pages so stores
         // cannot silently SMC under sticky/pin/TLB without `GuestMemory::write`.
         let allow_w = run.protect.allows_write() && !allow_x;
         // NOACCESS / no usable rights → no TLB entry.

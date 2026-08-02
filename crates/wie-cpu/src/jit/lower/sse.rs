@@ -1,12 +1,6 @@
 //! SSE/SSE2 lowering: mov/pack family, `punpck`/`pshufd` shuffles, packed-integer
 //! //! binops/shifts (Neon-accelerated), and the packed-integer host ABI helpers.
 
-#![allow(
-    clippy::cast_possible_wrap, // mem width / offset → i32 for Cranelift
-    clippy::many_single_char_names, // flag temps d/s/r in flags_* helpers
-    clippy::too_many_arguments
-)]
-
 use super::super::config::JitConfig;
 use super::analysis::{i8x16_to_pair, pair_to_i8x16, read_xmm_pair, store_xmm_pair, xmm_index};
 use super::emit::MemEnv;

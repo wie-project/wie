@@ -1,4 +1,4 @@
-//! Phase 2: hybrid Cranelift block JIT + iced interpreter fallback.
+//! Hybrid Cranelift block JIT + iced interpreter fallback.
 //!
 //! **Strategy:** decode a lowerable block at RIP (GPR, mem, ALU, shift, call/ret,
 //! jcc, SSE, bulk string); if hot enough, compile once and cache by guest entry VA.
@@ -13,12 +13,7 @@
 
 #![allow(
     unsafe_code, // Cranelift finalized fn pointers + host mem helpers
-    private_interfaces, // JitShared/PerThreadJitState expose crate-private types
-    clippy::indexing_slicing, // fixed gpr[0..16]
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::arithmetic_side_effects,
-    clippy::unwrap_used // Mutex/RwLock poison recovery is hard-coded (never occurs in practice)
+    private_interfaces // JitShared/PerThreadJitState expose crate-private types
 )]
 
 mod block;
@@ -155,7 +150,7 @@ pub fn dump_mem_path_stats(s: &JitStats) {
     }
 }
 
-/// Lightweight counters for `WIE_CPU=jit` diagnostics / Phase 0 baselines.
+/// Lightweight counters for `WIE_CPU=jit` diagnostics / baselines.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct JitStats {
     /// Instructions retired via native blocks.
@@ -182,7 +177,7 @@ pub struct JitStats {
     pub load_calls: u64,
     /// Calls into host `wie_jit_store` (TLB hit or miss).
     pub store_calls: u64,
-    /// Phase 4.x: selective code-cache invalidations (SMC / X-loss / unmap).
+    /// Selective code-cache invalidations (SMC / X-loss / unmap).
     pub code_invs: u64,
     /// Helper sticky hit after IR miss.
     pub mem_sticky_hit: u64,
@@ -222,7 +217,7 @@ pub struct JitStats {
     pub pin_allow_bits: u64,
 }
 #[cfg(test)]
-#[expect(clippy::expect_used)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::exec::StepResult;
@@ -417,7 +412,7 @@ mod tests {
         let _ = RwxPerms::ALL; // silence if unused in some cfgs
     }
 
-    // --- Phase 7 stress residual (invalidation multi-region / FIC) ---
+    // --- Stress residual (invalidation multi-region / FIC) ---
 
     #[test]
     fn code_inv_smc_across_page_boundary() {

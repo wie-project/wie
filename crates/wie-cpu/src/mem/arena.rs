@@ -1,4 +1,4 @@
-//! Contiguous anonymous `mmap` arenas for guest VA ranges (Phase 2).
+//! Contiguous anonymous `mmap` arenas for guest VA ranges.
 //!
 //! Soft translation only: host VA is OS-chosen (`mmap` with null hint). Guest VA
 //! never equals host VA by design.
@@ -23,7 +23,7 @@ pub(super) struct MmapArena {
     size: usize,
     /// Host mapping base from `mmap` (null after drop).
     host: *mut u8,
-    /// Software permission bits (Phase 3 may apply `mprotect`).
+    /// Software permission bits (may apply `mprotect`).
     perms: u32,
 }
 
@@ -591,7 +591,7 @@ impl ArenaSet {
         // range fits inside the arena's mmap region (checked above); madvise
         // is documented to be safe on any subrange of a live mmap. Errors are
         // intentionally ignored (best-effort hint).
-        #[allow(unsafe_code, clippy::as_conversions)]
+        #[allow(unsafe_code)]
         unsafe {
             let host = host_base.add(offset_usize).cast::<libc::c_void>();
             #[cfg(target_os = "macos")]
@@ -613,7 +613,7 @@ impl ArenaSet {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used, clippy::as_conversions)]
+#[allow(clippy::expect_used, clippy::as_conversions)]
 mod tests {
     use super::super::backend::check_map_args;
     use super::*;

@@ -85,9 +85,9 @@ pub struct GuestMemory {
     regions: RegionTable,
     pages: PageMap,
     vad: VadTable,
-    /// Bumped when protect/commit/release change; JIT flushes TLB on change (Phase 3+).
+    /// Bumped when protect/commit/release change; JIT flushes TLB on change.
     ///
-    /// `AtomicU64` so concurrent readers (MT.4 prep) can observe generation with
+    /// `AtomicU64` so concurrent readers can observe generation with
     /// acquire loads while structural writers bump under the process map lock.
     generation: AtomicU64,
 }
@@ -127,7 +127,7 @@ impl GuestMemory {
         self.backend.name()
     }
 
-    /// Monotonic generation for TLB / pin invalidation (Phase 4 / MT.4).
+    /// Monotonic generation for TLB / pin invalidation.
     ///
     /// Bumped on map / protect / commit / decommit / release. JIT TLB and
     /// region pins store this value at install time and miss when it diverges.
@@ -138,7 +138,7 @@ impl GuestMemory {
         self.generation.load(Ordering::Acquire)
     }
 
-    /// Bump the memory generation (release store for MT.4 visibility).
+    /// Bump the memory generation (release store for visibility).
     #[inline]
     fn bump_generation(&self) {
         // Saturating add without wrapping forever in pathological cases.
@@ -181,10 +181,10 @@ pub(crate) struct PageTlbEntry {
 /// Number of soft-translate pin slots filled for JIT (`JitCtx.pins`).
 ///
 /// Layout: `[0]=stack`, `[1]=primary process heap`, `[2..]=largest private
-/// VirtualAlloc / committed spans` (Phase 4.1 + VA pin expansion).
+/// VirtualAlloc / committed spans` (VA pin expansion).
 pub(crate) const JIT_REGION_PIN_SLOTS: usize = 8;
 
-/// Soft-translated region pin for Phase 4.1 JIT (stack / heap / VA arenas).
+/// Soft-translated region pin for JIT (stack / heap / VA arenas).
 ///
 /// `allow_*` is the **intersection** of software rights over the whole range —
 /// never more permissive than the slow path for any byte in the pin.

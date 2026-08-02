@@ -1,18 +1,12 @@
 //! Shared JIT state: compilation cache + guest memory + background worker.
 //!
-//! Extracted verbatim from `jit/mod.rs` (Phase 4 split, lane 2). Visibility
+//! Extracted verbatim from `jit/mod.rs`. Visibility
 //! bumps: wait cells / enqueue outcomes / `JitShared::new` / worker helpers
 //! used from `pipeline.rs` or `mod.rs` tests are `pub(super)`.
 
 #![allow(
     unsafe_code, // Cranelift finalized fn pointers + host mem helpers
-    private_interfaces, // JitShared/PerThreadJitState expose crate-private types
-    clippy::indexing_slicing, // fixed gpr[0..16]
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::arithmetic_side_effects,
-    clippy::unwrap_used, // Mutex/RwLock poison recovery is hard-coded (never occurs in practice)
-    clippy::expect_used // BgWaitCell waits a documented-invariant lock; see `wait_timeout`
+    private_interfaces // JitShared/PerThreadJitState expose crate-private types
 )]
 
 use super::CacheEntry;
@@ -515,7 +509,7 @@ pub struct PerThreadJitState {
     pub rip_trace: [u64; 32],
     pub rip_trace_i: usize,
     pub rip_trace_n: usize,
-    /// Instructions retired via interpreter (Phase 0 baselines).
+    /// Instructions retired via interpreter (baselines).
     pub iced_steps: u64,
     /// Persistent set-associative page TLB across chained blocks.
     pub tlb_sets: [TlbBucket; TLB_SETS],
@@ -537,7 +531,7 @@ pub struct PerThreadJitState {
     pub pins_gen: u64,
     /// Open-addressing guest VA → host block fn (late-bound block chaining).
     pub chain_slots: Box<[lower::ChainSlot; CHAIN_SLOTS]>,
-    /// Phase 4.2 monomorphic edge IC.
+    /// Monomorphic edge IC.
     pub edge_ic_va: [u64; lower::EDGE_IC_SLOTS],
     pub edge_ic_fn: [u64; lower::EDGE_IC_SLOTS],
     pub edge_ic_rr: u64,

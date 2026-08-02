@@ -23,7 +23,7 @@ pub use jit::{
     FastApiKind, JitCpu, JitFastPathConfig, JitHeapLayout, JitShared, JitStats, PerThreadJitState,
     dump_mem_path_stats,
 };
-/// Windows `PAGE_*` constants and software access checks (Phase 3).
+/// Windows `PAGE_*` constants and software access checks.
 pub use mem::protect;
 pub use mem::{
     ERROR_INVALID_ADDRESS, ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY,
@@ -216,7 +216,7 @@ pub trait CpuEngine: Send {
     /// Unmapped / backend read failure.
     fn mem_read(&mut self, address: u64, bytes: &mut [u8]) -> Result<(), CpuError>;
 
-    /// Soft-translate a contiguous guest range to a host data pointer (MT.4).
+    /// Soft-translate a contiguous guest range to a host data pointer.
     ///
     /// Used by `Interlocked*` (aligned host atomics) and bulk helpers. Returns
     /// `None` when the range is unmapped, SPC denies the access, multi-arena,
@@ -288,7 +288,7 @@ pub trait CpuEngine: Send {
     }
 
     /// Register a named guest VA region (stack, heap, image, …).
-    /// Used by the region table (Phase 1); no-op if the backend ignores it.
+    /// Used by the region table; no-op if the backend ignores it.
     fn register_region(&mut self, _region: mem::GuestRegion) {}
 
     /// Look up the named region containing `va`, if any.

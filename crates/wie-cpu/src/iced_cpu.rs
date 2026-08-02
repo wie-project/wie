@@ -1,4 +1,4 @@
-//! iced-x86 interpreter backend (WIE Phase 1). x86-64 only.
+//! iced-x86 interpreter backend. x86-64 only.
 
 use crate::exec::{self, HookWindow, StepResult};
 use crate::mem::{GuestMemory, GuestRegion};

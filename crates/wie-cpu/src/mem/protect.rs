@@ -1,4 +1,4 @@
-//! Windows `PAGE_*` protection constants and software access checks (Phase 3).
+//! Windows `PAGE_*` protection constants and software access checks.
 //!
 //! Guest correctness uses these constants at 4 KiB granularity. Host `mprotect`
 //! is optional defense-in-depth and must never be the sole permission oracle
@@ -171,7 +171,7 @@ pub fn rwx_from_page_protect(protect: u32) -> u32 {
     PageProtect::from_win32(protect).map_or(0, |p| p.to_rwx().bits())
 }
 
-/// True if `value` is one of the Phase 3 primary protect constants.
+/// True if `value` is one of the primary protect constants.
 #[must_use]
 pub fn is_supported_protect(value: u32) -> bool {
     PageProtect::from_win32(value).is_some()

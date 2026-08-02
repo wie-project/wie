@@ -1,12 +1,6 @@
 //! TLB hot-path helpers: software-permission checks, pin resolution, multi-way
 //! //! set-associative lookups, and the single-page host-pointer resolver (`tlb_page_ptr`).
 
-#![allow(
-    clippy::cast_possible_wrap, // mem width / offset → i32 for Cranelift
-    clippy::many_single_char_names, // flag temps d/s/r in flags_* helpers
-    clippy::too_many_arguments
-)]
-
 use super::super::config::JitConfig;
 use super::{
     GuestVa, JitCtx, MemPin, STICKY_WAYS, TLB_EMPTY, TLB_PROT_R, TLB_PROT_W, TLB_WAYS_PER_SET,
@@ -188,7 +182,7 @@ pub(super) fn pack_tlb_prot(allow_r: bool, allow_w: bool) -> u8 {
     p
 }
 
-/// Soft-translate via region pin when gen / bounds / R|W match (Phase 4.1).
+/// Soft-translate via region pin when gen / bounds / R|W match.
 ///
 /// On hit, also warms sticky + multi-way TLB so subsequent sticky IR can fire.
 pub(super) fn pin_resolve(

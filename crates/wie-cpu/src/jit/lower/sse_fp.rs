@@ -1,12 +1,6 @@
 //! SSE floating-point lowering: scalar/packed FP binops, compare, converts,
 //! //! bitwise ops, `pshufb`/shifts via host helpers, and the float ABI (FloatBinOp).
 
-#![allow(
-    clippy::cast_possible_wrap, // mem width / offset → i32 for Cranelift
-    clippy::many_single_char_names, // flag temps d/s/r in flags_* helpers
-    clippy::too_many_arguments
-)]
-
 use super::super::config::JitConfig;
 use super::SseBit;
 use super::analysis::{i8x16_to_pair, pair_to_i8x16, read_xmm_pair, store_xmm_pair, xmm_index};

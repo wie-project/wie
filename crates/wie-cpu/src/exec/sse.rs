@@ -4,20 +4,6 @@
 //! The ABI-stable opcode enums (`SseIntOp` / `SseShiftOp` / `SseFpUnOp` /
 //! `SseFpBinOp` / `SseCvtOp`) live in [`super::sse_types`].
 
-#![allow(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_precision_loss, // cvtsi2ss/sd: Intel-defined rounding, not a bug
-    clippy::cast_sign_loss,
-    clippy::arithmetic_side_effects,
-    clippy::indexing_slicing,
-    clippy::integer_division,
-    clippy::many_single_char_names, // lane helpers (a/b/x/y/mask)
-    clippy::float_cmp, // COMISS equality: IEEE == is the architectural result
-    clippy::manual_range_contains // f >= hi || f < lo reads clearer than !range
-)]
-
 use crate::CpuError;
 use crate::mem::GuestMemory;
 use crate::regs::{RegFile, Rflags};

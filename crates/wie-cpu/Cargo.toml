@@ -14,7 +14,7 @@ libc = "0.2"
 # no_xop / no_d3now: unused on PE64 MSVC paths (saves a little table RAM).
 # Keep VEX/EVEX — CRT and many PE64s need them at decode time.
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info", "no_xop", "no_d3now"] }
-# Phase 2: host-native block JIT (Apple Silicon = ARM64)
+# Host-native block JIT (Apple Silicon = ARM64)
 cranelift = "0.133"
 cranelift-codegen = "0.133"
 cranelift-jit = "0.133"

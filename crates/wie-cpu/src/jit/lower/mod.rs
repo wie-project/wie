@@ -2,12 +2,6 @@
 //!
 //! Cast/index/arithmetic allows shared with other JIT modules live on `jit/mod.rs`.
 
-#![allow(
-    clippy::cast_possible_wrap, // mem width / offset → i32 for Cranelift
-    clippy::many_single_char_names, // flag temps d/s/r in flags_* helpers
-    clippy::too_many_arguments
-)]
-
 use super::JitEngine;
 use super::block::{BlockTerm, DecodedInsn, analyze_block_stack_pin};
 use super::config::JitConfig;
@@ -136,7 +130,7 @@ pub(super) fn tlb_set_index(page_key: u64) -> usize {
 pub(super) const CHAIN_SLOTS: usize = 512;
 /// Shadow return-stack depth (power of two; modular index).
 pub(super) const SHADOW_DEPTH: usize = 32;
-/// Region-direct pin slots (stack + primary heap). Phase 4.1.
+/// Region-direct pin slots (stack + primary heap).
 /// Must match [`crate::mem::JIT_REGION_PIN_SLOTS`] (stack + heap + VA pins).
 pub(super) const PIN_SLOTS: usize = crate::mem::JIT_REGION_PIN_SLOTS;
 /// Multi sticky ways for inline IR (last-N pages before helper / multi-way TLB).
@@ -146,7 +140,7 @@ pub(super) const PIN_SLOTS: usize = crate::mem::JIT_REGION_PIN_SLOTS;
 pub(super) const STICKY_WAYS: usize = 2;
 /// Bytes per [`MemPin`] (`repr(C)`: 5×u64).
 pub(super) const PIN_STRIDE: i32 = 40;
-/// Monomorphic edge inline-cache slots (Phase 4.2 data-plane chaining).
+/// Monomorphic edge inline-cache slots (data-plane chaining).
 pub(super) const EDGE_IC_SLOTS: usize = 4;
 
 /// A guest virtual address.
@@ -191,7 +185,6 @@ impl HostAddr {
     pub(super) const NULL: Self = Self(0);
 
     #[inline]
-    #[expect(clippy::as_conversions)] // pointer → integer for the repr(C) slot
     pub(super) fn from_ptr(p: *mut u8) -> Self {
         Self(p as u64)
     }
@@ -206,13 +199,12 @@ impl HostAddr {
     /// # Safety
     /// `off` must stay within the mapped arena this address came from.
     #[inline]
-    #[expect(clippy::as_conversions)] // integer → pointer, inverse of `from_ptr`
     pub(super) unsafe fn add(self, off: usize) -> *mut u8 {
         unsafe { (self.0 as *mut u8).add(off) }
     }
 }
 
-/// Soft-translated region pin (stack / heap / VirtualAlloc) for Phase 4.1 JIT.
+/// Soft-translated region pin (stack / heap / VirtualAlloc) for JIT.
 ///
 /// Empty pin: `host_base` null. Filled at each `run_compiled` from
 /// [`crate::mem::GuestMemory::jit_region_pins`]; gen must match `mem_gen`.
@@ -324,7 +316,7 @@ pub(super) struct JitCtx {
     pub fault_size: u64,
     /// 0 = read, 1 = write (matches iced ACCESS_*).
     pub fault_access: u64,
-    /// Set-associative multi-way page TLB (Phase 5.5 Track B).
+    /// Set-associative multi-way page TLB (Track B).
     pub tlb_sets: [TlbBucket; TLB_SETS],
     /// Parallel gen/prot/rr for [`Self::tlb_sets`].
     pub tlb_aux: [TlbBucketAux; TLB_SETS],
@@ -347,9 +339,9 @@ pub(super) struct JitCtx {
     /// Hand-written trampolines OR their bits; Cranelift leaves 0 → host syncs all 16.
     /// Set to `0xffff` before late-bound chain so a subsequent Cranelift block is covered.
     pub gpr_dirty_bits: u64,
-    /// Phase 0: host load helper invocations during this `run_compiled` (appended; IR-stable).
+    /// Host load helper invocations during this `run_compiled` (appended; IR-stable).
     pub load_calls: u64,
-    /// Phase 0: host store helper invocations during this `run_compiled`.
+    /// Host store helper invocations during this `run_compiled`.
     pub store_calls: u64,
     /// Software R/W bits for sticky page (`TLB_PROT_R` / `TLB_PROT_W`).
     pub tlb_hot_prot: u64,
@@ -359,7 +351,7 @@ pub(super) struct JitCtx {
     pub tlb_hot_gen: u64,
     /// Region-direct pins (stack / heap / VA); empty when `host_base == 0`.
     pub pins: [MemPin; PIN_SLOTS],
-    /// Phase 4.2 monomorphic edge IC: guest target VA (0 = empty).
+    /// Monomorphic edge IC: guest target VA (0 = empty).
     ///
     /// Data-plane only — never patches finalized host code. Speeds late-bound
     /// chain hits when a block repeatedly transfers to the same successor.

@@ -368,7 +368,7 @@ impl super::GuestMemory {
                 "VirtualAlloc size/type invalid",
             ));
         }
-        // Reject unknown type bits beyond RESERVE|COMMIT for Phase 3.
+        // Reject unknown type bits beyond RESERVE|COMMIT.
         let known = MEM_RESERVE | MEM_COMMIT;
         if alloc_type & !known != 0 {
             return Err(va_error(
@@ -483,7 +483,7 @@ impl super::GuestMemory {
         protect: protect::PageProtect,
     ) -> Result<u64, crate::CpuError> {
         if addr == 0 {
-            // COMMIT with NULL address is not supported without RESERVE in Phase 3.
+            // COMMIT with NULL address is not supported without RESERVE.
             return Err(va_error(
                 ERROR_INVALID_PARAMETER,
                 "VirtualAlloc COMMIT requires address or RESERVE",

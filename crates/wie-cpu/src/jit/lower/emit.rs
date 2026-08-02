@@ -1,12 +1,6 @@
 //! Block emission: `emit_body_and_term`, the block-wide stack guard, and the
 //! //! terminator helpers (chaining, shadow stack, self-loops, fast UCRT inline ops).
 
-#![allow(
-    clippy::cast_possible_wrap, // mem width / offset → i32 for Cranelift
-    clippy::many_single_char_names, // flag temps d/s/r in flags_* helpers
-    clippy::too_many_arguments
-)]
-
 use super::analysis::{ensure_gprs_loaded, ensure_xmm_loaded};
 use super::flags::iconst_u64;
 use super::gpr::mark_dirty;
@@ -212,7 +206,7 @@ pub(super) fn emit_chain_or_exit(
         bcx.ins().return_(&[]);
         return;
     }
-    // Phase 4.2: monomorphic edge IC (data plane) before full chain-table helper.
+    // Monomorphic edge IC (data plane) before full chain-table helper.
     // On hit: call_indirect without `wie_jit_chain_lookup`. Miss → helper (which
     // also consults IC + table and may install a new IC entry).
     let mut ic_ok = bcx.ins().iconst(types::I8, 0);
@@ -530,7 +524,7 @@ pub(super) fn check_fault_after_ucrt(
 
 /// Pin fields loaded once per block (loop-invariant for the `run_compiled` lifetime).
 ///
-/// Phase 4.1b perf: reloading `MemPin` from `JitCtx` on every guest load/store
+/// Perf: reloading `MemPin` from `JitCtx` on every guest load/store
 /// doubled `long_loop` wall time. Hoist once; per-access only does bounds math.
 #[derive(Clone, Copy)]
 pub(super) struct HoistedPin {

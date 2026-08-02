@@ -5,20 +5,6 @@
 //! discriminants are a JIT ABI contract (encoded into `iconst` immediates and
 //! passed through `extern "C"` u64 params) — never renumber.
 
-#![allow(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_precision_loss, // cvtsi2ss/sd: Intel-defined rounding, not a bug
-    clippy::cast_sign_loss,
-    clippy::arithmetic_side_effects,
-    clippy::indexing_slicing,
-    clippy::integer_division,
-    clippy::many_single_char_names, // lane helpers (a/b/x/y/mask)
-    clippy::float_cmp, // COMISS equality: IEEE == is the architectural result
-    clippy::manual_range_contains // f >= hi || f < lo reads clearer than !range
-)]
-
 #[derive(Clone, Copy)]
 pub(super) enum SseBitOp {
     Xor,

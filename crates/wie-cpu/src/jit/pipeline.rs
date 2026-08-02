@@ -1,18 +1,13 @@
 //! Per-thread JIT execution pipeline: dispatch, compile, run, invalidate.
 //!
-//! Extracted verbatim from `jit/mod.rs` (Phase 4 split, lane 2). The hot path
+//! Extracted verbatim from `jit/mod.rs`. The hot path
 //! (`step_one`, `try_compile`, `finish_compiled`, `run_compiled`,
 //! `invalidate_code_range`) moves byte-for-byte. Methods called from
 //! `cpu_engine.rs` or `mod.rs` tests are `pub(super)`.
 
 #![allow(
     unsafe_code, // Cranelift finalized fn pointers + host mem helpers
-    private_interfaces, // JitShared/PerThreadJitState expose crate-private types
-    clippy::indexing_slicing, // fixed gpr[0..16]
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::arithmetic_side_effects,
-    clippy::unwrap_used // Mutex/RwLock poison recovery is hard-coded (never occurs in practice)
+    private_interfaces // JitShared/PerThreadJitState expose crate-private types
 )]
 
 use super::JitStats;
@@ -67,7 +62,7 @@ impl JitCpu {
         }
     }
 
-    /// Snapshot of JIT diagnostics counters (Phase 0 baselines).
+    /// Snapshot of JIT diagnostics counters (baselines).
     ///
     /// Merges the shared background-compile counter into the per-thread
     /// snapshot so `WIE_RUNTIME_PROFILE` sees background work.
@@ -676,7 +671,7 @@ impl JitCpu {
             *slot = regs.gpr(i);
         }
         // Pure GPR blocks skip the XMM bank copy on both sides of the call.
-        // SSE blocks load only live XMMs (Phase 5.5 Track A live mask).
+        // SSE blocks load only live XMMs (Track A live mask).
         let mut xmm = [XmmSlot::ZERO; 16];
         if meta.uses_sse {
             let mut m = meta.xmm_live_mask;
@@ -759,7 +754,7 @@ impl JitCpu {
             s.mem_addr_heap_pin = s.mem_addr_heap_pin.saturating_add(m.addr_in_heap_pin);
             s.mem_addr_outside = s.mem_addr_outside.saturating_add(m.addr_outside_pins);
         }
-        // Phase 4.x: guest stores via `GuestMemory::write` leave a pending range;
+        // Guest stores via `GuestMemory::write` leave a pending range;
         // apply selective code invalidation only after the native frame returns.
         // Persist per-thread execution state from JitCtx.
         self.thread.tlb_sets = ctx.tlb_sets;

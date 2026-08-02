@@ -1,12 +1,6 @@
 //! Guest-memory access: host-callable `wie_jit_*` helpers (registered as JIT symbols)
 //! //! and the IR-emitting load/store/pin helpers used by block emission.
 
-#![allow(
-    clippy::cast_possible_wrap, // mem width / offset → i32 for Cranelift
-    clippy::many_single_char_names, // flag temps d/s/r in flags_* helpers
-    clippy::too_many_arguments
-)]
-
 use super::emit::{HoistedPin, MemEnv, exit_args};
 use super::flags::iconst_u64;
 use super::gpr::sticky_tlb_probe;
@@ -56,7 +50,7 @@ pub(crate) unsafe extern "C" fn wie_jit_host_span(
 
 /// Lookup host block pointer for `va` (0 = miss). Used for late-bound chaining.
 ///
-/// Checks monomorphic edge IC first (Phase 4.2), then the open-addressing chain
+/// Checks monomorphic edge IC first, then the open-addressing chain
 /// table. On a table hit, installs into an edge-IC slot for the next transfer.
 ///
 /// `extern "C" fn(ctx, va) -> fn_ptr`

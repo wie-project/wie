@@ -1,7 +1,7 @@
 //! Unit tests for `crate::mem`: `GuestMemory` facade, mmap backend, VAD,
 //! SPC checks, region pins and generation guards.
 
-#![expect(clippy::expect_used)]
+#![allow(clippy::expect_used)]
 
 use super::*;
 use super::{
@@ -158,7 +158,7 @@ fn page_tlb_entry_tags_ro_and_bumps_gen_on_protect() {
         .expect("map RWX");
     let k = page_key(0x50_0000);
     let e0 = mem.page_tlb_entry(k).expect("tlb entry");
-    // Phase 4.x: RWX → soft-translate R only (no W on X).
+    // RWX → soft-translate R only (no W on X).
     assert!(e0.allow_r && !e0.allow_w);
     let g0 = e0.generation;
     assert!(g0 >= 1);
@@ -213,7 +213,7 @@ fn region_pin_requires_host_base_and_intersects_protect() {
         crate::RwxPerms::ALL,
     ));
     let r = mem.find_region(0x2000_0800).expect("region").clone();
-    // Map used ALL (RWX) — Phase 4.x: pin is R-only when any page is X.
+    // Map used ALL (RWX) — pin is R-only when any page is X.
     let pin = mem.region_pin(&r).expect("pin");
     assert_eq!(pin.guest_base, 0x2000_0000);
     assert_eq!(pin.guest_end, 0x2001_0000);
@@ -308,7 +308,7 @@ fn host_span_write_denied_on_executable() {
     let mut mem = GuestMemory::new();
     mem.map(0x61_0000, 0x1000, crate::RwxPerms::ALL)
         .expect("map RWX");
-    // Phase 4.x: no host-span write onto X pages (SMC via write + invalidate).
+    // No host-span write onto X pages (SMC via write + invalidate).
     assert!(mem.host_span(0x61_0000, 16, true).is_none());
     assert!(mem.host_span(0x61_0000, 16, false).is_some());
 }
@@ -614,7 +614,7 @@ fn checkerboard_spc_no_host_crash() {
     mem.read(base, &mut b).expect("ro read");
 }
 
-// --- Phase 7 stress / anti-Wine ---
+// --- Stress / anti-Wine ---
 
 #[test]
 fn phase7_high_va_mmap_roundtrip() {

@@ -1,12 +1,6 @@
 //! Bulk string lowering: inline Neon copy for small REP MOVS/STOS, `stos` splat,
 //! //! and `lower_string`.
 
-#![allow(
-    clippy::cast_possible_wrap, // mem width / offset → i32 for Cranelift
-    clippy::many_single_char_names, // flag temps d/s/r in flags_* helpers
-    clippy::too_many_arguments
-)]
-
 use super::super::config::JitConfig;
 use super::emit::{MemEnv, exit_args};
 use super::flags::iconst_u64;
@@ -424,7 +418,7 @@ pub(super) fn lower_string(
     let (kind, size) = StringOpKind::from_mnemonic(mnemonic, raw_size)
         .ok_or_else(|| format!("string op {mnemonic:?}"))?;
 
-    // Phase 5.5: dual-path inline for small REP MOVS/STOS when helpers available.
+    // Dual-path inline for small REP MOVS/STOS when helpers available.
     if matches!(kind, StringOpKind::Stos | StringOpKind::Movs)
         && JitConfig::get().string_inline_enabled()
         && mem.host_span_ref.is_some()

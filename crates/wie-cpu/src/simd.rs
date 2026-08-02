@@ -14,12 +14,6 @@
 /// scalar tail's `read_unaligned` both accept unaligned addresses), and the
 /// loop counters are bounded by `n <= src.len() / 4` so they cannot
 /// overflow.
-#[expect(
-    clippy::cast_ptr_alignment,
-    clippy::arithmetic_side_effects,
-    clippy::integer_division,
-    reason = "unaligned-safe loads; counters bounded by the slice lengths"
-)]
 pub fn mask_bgra_to_0rgb(dst: &mut [u32], src: &[u8]) {
     let n = dst.len().min(src.len() / 4);
     if n == 0 {
@@ -96,11 +90,6 @@ pub fn mask_bgra_to_0rgb(dst: &mut [u32], src: &[u8]) {
 /// The arithmetic is provably overflow-free: every product is bounded by
 /// `dst * src < 2^32`-sized dimensions × index, and the unchecked gathers
 /// are in-range by construction (see SAFETY on the inner block).
-#[expect(
-    clippy::arithmetic_side_effects,
-    clippy::integer_division,
-    reason = "index-map math is provably in-range; u32 dims × usize indices cannot overflow"
-)]
 pub fn stretch_nearest(
     buf: &mut [u32],
     src: &[u32],
