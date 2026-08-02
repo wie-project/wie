@@ -166,20 +166,11 @@ fn main() -> Result<()> {
         } => {
             // GUI/screenshot mode takes precedence over persistent/micro.
             if gui || screenshot.is_some() {
-                #[cfg(feature = "gui")]
-                {
-                    if gui {
-                        return gui::app::run_gui_windowed(&path);
-                    }
-                    if let Some(out_path) = screenshot {
-                        return gui::headless::run_screenshot(&path, &out_path);
-                    }
+                if gui {
+                    return gui::app::run_gui_windowed(&path);
                 }
-                #[cfg(not(feature = "gui"))]
-                {
-                    bail!(
-                        "--gui/--screenshot require the `gui` feature: build with --features gui or --all-features"
-                    );
+                if let Some(out_path) = screenshot {
+                    return gui::headless::run_screenshot(&path, &out_path);
                 }
             }
 

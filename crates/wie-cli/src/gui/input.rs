@@ -5,37 +5,45 @@
 
 // ---------------------------------------------------------------------------
 // Win32 message constants
+//
+// Single source of truth: the values live in `wie-winapi::user32::wm`; these
+// `pub(crate) const` aliases keep the host-side type `u32` (the
+// `post_message` boundary) while referencing the same constants the emulator
+// core dispatches on.
 // ---------------------------------------------------------------------------
 
-pub(crate) const WM_KEYDOWN: u32 = 0x0100;
-pub(crate) const WM_KEYUP: u32 = 0x0101;
-pub(crate) const WM_CHAR: u32 = 0x0102;
-pub(crate) const WM_SYSKEYDOWN: u32 = 0x0104;
-pub(crate) const WM_SYSKEYUP: u32 = 0x0105;
+use wie_winapi::user32::wm::WinMsg;
+
+pub(crate) const WM_KEYDOWN: u32 = WinMsg::WM_KEYDOWN.as_u32();
+pub(crate) const WM_KEYUP: u32 = WinMsg::WM_KEYUP.as_u32();
+pub(crate) const WM_CHAR: u32 = WinMsg::WM_CHAR.as_u32();
+pub(crate) const WM_SYSKEYDOWN: u32 = WinMsg::WM_SYSKEYDOWN.as_u32();
+pub(crate) const WM_SYSKEYUP: u32 = WinMsg::WM_SYSKEYUP.as_u32();
 #[allow(dead_code)]
-pub(crate) const WM_SYSCHAR: u32 = 0x0106;
+pub(crate) const WM_SYSCHAR: u32 = WinMsg::WM_SYSCHAR.as_u32();
 
 /// Posted by the host menu bar (and control activation) with
 /// `wParam = MAKEWPARAM(item_id, 0)`.
-pub(crate) const WM_COMMAND: u32 = 0x0111;
+pub(crate) const WM_COMMAND: u32 = WinMsg::WM_COMMAND.as_u32();
 
-pub(crate) const WM_MOUSEMOVE: u32 = 0x0200;
-pub(crate) const WM_LBUTTONDOWN: u32 = 0x0201;
-pub(crate) const WM_LBUTTONUP: u32 = 0x0202;
-pub(crate) const WM_RBUTTONDOWN: u32 = 0x0204;
-pub(crate) const WM_RBUTTONUP: u32 = 0x0205;
-pub(crate) const WM_MBUTTONDOWN: u32 = 0x0207;
-pub(crate) const WM_MBUTTONUP: u32 = 0x0208;
-pub(crate) const WM_MOUSEWHEEL: u32 = 0x020A;
-pub(crate) const WM_MOUSEHWHEEL: u32 = 0x020E;
+pub(crate) const WM_MOUSEMOVE: u32 = WinMsg::WM_MOUSEMOVE.as_u32();
+pub(crate) const WM_LBUTTONDOWN: u32 = WinMsg::WM_LBUTTONDOWN.as_u32();
+pub(crate) const WM_LBUTTONUP: u32 = WinMsg::WM_LBUTTONUP.as_u32();
+pub(crate) const WM_RBUTTONDOWN: u32 = WinMsg::WM_RBUTTONDOWN.as_u32();
+pub(crate) const WM_RBUTTONUP: u32 = WinMsg::WM_RBUTTONUP.as_u32();
+pub(crate) const WM_MBUTTONDOWN: u32 = WinMsg::WM_MBUTTONDOWN.as_u32();
+pub(crate) const WM_MBUTTONUP: u32 = WinMsg::WM_MBUTTONUP.as_u32();
+pub(crate) const WM_MOUSEWHEEL: u32 = WinMsg::WM_MOUSEWHEEL.as_u32();
+pub(crate) const WM_MOUSEHWHEEL: u32 = WinMsg::WM_MOUSEHWHEEL.as_u32();
 
-pub(crate) const WM_SIZE: u32 = 0x0005;
-pub(crate) const WM_MOVE: u32 = 0x0003;
-pub(crate) const WM_PAINT: u32 = 0x000F;
-pub(crate) const WM_SETFOCUS: u32 = 0x0007;
-pub(crate) const WM_KILLFOCUS: u32 = 0x0008;
-pub(crate) const WM_MOUSEHOVER: u32 = 0x02A1;
-pub(crate) const WM_MOUSELEAVE: u32 = 0x02A3;
+pub(crate) const WM_SIZE: u32 = WinMsg::WM_SIZE.as_u32();
+pub(crate) const WM_MOVE: u32 = WinMsg::WM_MOVE.as_u32();
+pub(crate) const WM_PAINT: u32 = WinMsg::WM_PAINT.as_u32();
+pub(crate) const WM_CLOSE: u32 = WinMsg::WM_CLOSE.as_u32();
+pub(crate) const WM_SETFOCUS: u32 = WinMsg::WM_SETFOCUS.as_u32();
+pub(crate) const WM_KILLFOCUS: u32 = WinMsg::WM_KILLFOCUS.as_u32();
+pub(crate) const WM_MOUSEHOVER: u32 = WinMsg::WM_MOUSEHOVER.as_u32();
+pub(crate) const WM_MOUSELEAVE: u32 = WinMsg::WM_MOUSELEAVE.as_u32();
 
 /// Mouse-key state flags (wParam of mouse messages).
 pub(crate) const MK_LBUTTON: u16 = 0x0001;
