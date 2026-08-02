@@ -16,12 +16,12 @@
 
 use crate::CpuError;
 use crate::mem::GuestMemory;
-use crate::regs::{self, RegFile, rflags};
+use crate::regs::{self, RegFile, Rflags};
 use iced_x86::{Instruction, OpKind, Register};
 
 use super::{
-    ACCESS_READ, ArithOp, BitOp, InvalidMem, StepExecError, effective_address, op_size_bytes,
-    pop_n, push_n, read_op, write_mem_value, write_op, write_op_sized,
+    AccessType, ArithOp, BitOp, InvalidMem, StepExecError, effective_address, op_size_bytes, pop_n,
+    push_n, read_op, write_mem_value, write_op, write_op_sized,
 };
 
 pub(super) fn exec_mov(
@@ -104,7 +104,7 @@ pub(super) fn exec_arith(
     let mask = regs::size_mask(size);
     let d = dst & mask;
     let s = src & mask;
-    let cf = u64::from(regs.flag(rflags::CF));
+    let cf = u64::from(regs.flag(Rflags::CF));
     let result = match op {
         ArithOp::Add => d.wrapping_add(s),
         ArithOp::Adc => d.wrapping_add(s).wrapping_add(cf),
@@ -125,7 +125,7 @@ pub(super) fn exec_arith(
                 .wrapping_add(u128::from(s))
                 .wrapping_add(u128::from(cf));
             regs::set_add_flags(regs, d, s.wrapping_add(cf), result, size);
-            regs.set_flag(rflags::CF, wide > u128::from(mask));
+            regs.set_flag(Rflags::CF, wide > u128::from(mask));
             write_op(mem, regs, instr, 0, result & mask)?;
         }
         ArithOp::Sub => {
@@ -139,12 +139,12 @@ pub(super) fn exec_arith(
             let wide_src = u128::from(s).wrapping_add(u128::from(cf));
             let r = result & mask;
             regs::set_sub_flags(regs, d, s, result, size);
-            regs.set_flag(rflags::CF, u128::from(d) < wide_src);
+            regs.set_flag(Rflags::CF, u128::from(d) < wide_src);
             let d_s = i128::from(sign_extend(d, size));
             let s_s = i128::from(sign_extend(s, size));
             let expected = d_s.wrapping_sub(s_s).wrapping_sub(i128::from(cf != 0));
             let got = i128::from(sign_extend(r, size));
-            regs.set_flag(rflags::OF, expected != got);
+            regs.set_flag(Rflags::OF, expected != got);
             write_op(mem, regs, instr, 0, r)?;
         }
         ArithOp::Cmp => {
@@ -213,29 +213,29 @@ pub(super) fn exec_mul(
         1 => {
             regs.write_reg(Register::AX, product as u64 & 0xffff)?;
             let hi = (product >> 8) != 0;
-            regs.set_flag(rflags::CF, hi);
-            regs.set_flag(rflags::OF, hi);
+            regs.set_flag(Rflags::CF, hi);
+            regs.set_flag(Rflags::OF, hi);
         }
         2 => {
             regs.write_reg(Register::AX, product as u64 & 0xffff)?;
             regs.write_reg(Register::DX, ((product >> 16) as u64) & 0xffff)?;
             let hi = (product >> 16) != 0;
-            regs.set_flag(rflags::CF, hi);
-            regs.set_flag(rflags::OF, hi);
+            regs.set_flag(Rflags::CF, hi);
+            regs.set_flag(Rflags::OF, hi);
         }
         4 => {
             regs.write_reg(Register::EAX, product as u64 & 0xffff_ffff)?;
             regs.write_reg(Register::EDX, ((product >> 32) as u64) & 0xffff_ffff)?;
             let hi = (product >> 32) != 0;
-            regs.set_flag(rflags::CF, hi);
-            regs.set_flag(rflags::OF, hi);
+            regs.set_flag(Rflags::CF, hi);
+            regs.set_flag(Rflags::OF, hi);
         }
         _ => {
             regs.set_rax(product as u64);
             regs.set_rdx((product >> 64) as u64);
             let hi = (product >> 64) != 0;
-            regs.set_flag(rflags::CF, hi);
-            regs.set_flag(rflags::OF, hi);
+            regs.set_flag(Rflags::CF, hi);
+            regs.set_flag(Rflags::OF, hi);
         }
     }
     Ok(())
@@ -300,8 +300,8 @@ fn set_imul_flags(regs: &mut RegFile, product: i128, size: usize) {
     };
     let overflow = product < min || product > max;
     let _ = sign_ext;
-    regs.set_flag(rflags::CF, overflow);
-    regs.set_flag(rflags::OF, overflow);
+    regs.set_flag(Rflags::CF, overflow);
+    regs.set_flag(Rflags::OF, overflow);
 }
 
 fn sign_extend(value: u64, size: usize) -> i64 {
@@ -487,7 +487,7 @@ pub(super) fn exec_bit(
             let val = read_op(mem, regs, instr, 0)? & regs::size_mask(size);
             let mask = 1_u64 << idx;
             let cf = (val & mask) != 0;
-            regs.set_flag(rflags::CF, cf);
+            regs.set_flag(Rflags::CF, cf);
             let new = match op {
                 BitOp::Bt => val,
                 BitOp::Bts => val | mask,
@@ -511,7 +511,7 @@ pub(super) fn exec_bit(
                 Err(e) => {
                     drop(e);
                     return Err(StepExecError::InvalidMemory(InvalidMem {
-                        access_type: ACCESS_READ,
+                        access_type: AccessType::Read,
                         address: addr,
                         size: 1,
                         value: 0,
@@ -521,7 +521,7 @@ pub(super) fn exec_bit(
             let val = u64::from(b[0]);
             let mask = 1_u64 << bit;
             let cf = (val & mask) != 0;
-            regs.set_flag(rflags::CF, cf);
+            regs.set_flag(Rflags::CF, cf);
             if !matches!(op, BitOp::Bt) {
                 let new = match op {
                     BitOp::Bt => val,

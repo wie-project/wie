@@ -31,7 +31,7 @@ mod string;
 
 use crate::CpuError;
 use crate::mem::GuestMemory;
-use crate::regs::{self, RegFile, rflags};
+use crate::regs::{self, RegFile, Rflags};
 use iced_x86::{Instruction, MemorySize, Mnemonic, OpKind, Register};
 use std::sync::atomic::Ordering;
 
@@ -65,14 +65,32 @@ pub(crate) use sse::{
 pub(crate) use sse_types::{SseCvtOp, SseFpBinOp, SseFpUnOp, SseIntOp, SseShiftOp};
 pub(crate) use string::{RepPrefix, StringOpKind, run_string_op};
 
-/// Access type codes matching Unicorn-ish invalid-memory reporting (0=read,1=write,2=fetch).
-pub(crate) const ACCESS_READ: i32 = 0;
-pub(crate) const ACCESS_WRITE: i32 = 1;
-pub(crate) const ACCESS_FETCH: i32 = 16;
+/// Access kind for invalid-memory reporting.
+///
+/// Encodes to the Unicorn-ish numeric codes consumed by the host
+/// ([`crate::InvalidMemoryAccess::access_type`]): 0 = read, 1 = write, 16 = fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AccessType {
+    Read,
+    Write,
+    Fetch,
+}
+
+impl AccessType {
+    /// Numeric code passed to host memory checks (must match Unicorn encoding).
+    #[must_use]
+    pub(crate) const fn as_i32(self) -> i32 {
+        match self {
+            Self::Read => 0,
+            Self::Write => 1,
+            Self::Fetch => 16,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct InvalidMem {
-    pub access_type: i32,
+    pub access_type: AccessType,
     pub address: u64,
     pub size: i32,
     pub value: i64,
@@ -116,7 +134,7 @@ pub(crate) fn step(
         let mut probe = [0_u8; 1];
         if mem.fetch_into(rip, &mut probe).is_err() {
             return Ok(StepResult::InvalidMemory(InvalidMem {
-                access_type: ACCESS_FETCH,
+                access_type: AccessType::Fetch,
                 address: rip,
                 size: 1,
                 value: 0,
@@ -362,33 +380,33 @@ fn execute_one(
             Ok(())
         }
         Mnemonic::Cld => {
-            regs.set_flag(rflags::DF, false);
+            regs.set_flag(Rflags::DF, false);
             Ok(())
         }
         Mnemonic::Std => {
-            regs.set_flag(rflags::DF, true);
+            regs.set_flag(Rflags::DF, true);
             Ok(())
         }
         Mnemonic::Clc => {
-            regs.set_flag(rflags::CF, false);
+            regs.set_flag(Rflags::CF, false);
             Ok(())
         }
         Mnemonic::Stc => {
-            regs.set_flag(rflags::CF, true);
+            regs.set_flag(Rflags::CF, true);
             Ok(())
         }
         Mnemonic::Cmc => {
-            regs.set_flag(rflags::CF, !regs.flag(rflags::CF));
+            regs.set_flag(Rflags::CF, !regs.flag(Rflags::CF));
             Ok(())
         }
         Mnemonic::Pushfq => {
-            push_n(mem, regs, regs.rflags, 8)?;
+            push_n(mem, regs, u64::from(regs.rflags), 8)?;
             Ok(())
         }
         Mnemonic::Popfq => {
             let v = pop_n(mem, regs, 8)?;
             // Keep reserved bit 1 set.
-            regs.rflags = (v & !rflags::ALWAYS1) | rflags::ALWAYS1;
+            regs.rflags = Rflags::from((v & !u64::from(Rflags::ALWAYS1)) | u64::from(Rflags::ALWAYS1));
             Ok(())
         }
         Mnemonic::Leave => {
@@ -610,13 +628,13 @@ fn exec_inc_dec(
     } else {
         dst.wrapping_sub(src)
     };
-    let cf = regs.flag(rflags::CF); // INC/DEC do not modify CF
+    let cf = regs.flag(Rflags::CF); // INC/DEC do not modify CF
     if inc {
         regs::set_add_flags(regs, dst, src, result, size);
     } else {
         regs::set_sub_flags(regs, dst, src, result, size);
     }
-    regs.set_flag(rflags::CF, cf);
+    regs.set_flag(Rflags::CF, cf);
     write_op(mem, regs, instr, 0, result & regs::size_mask(size))?;
     Ok(())
 }
@@ -631,7 +649,7 @@ fn exec_neg(
     let result = 0_u64.wrapping_sub(dst);
     regs::set_sub_flags(regs, 0, dst, result, size);
     // NEG sets CF if operand was non-zero.
-    regs.set_flag(rflags::CF, dst != 0);
+    regs.set_flag(Rflags::CF, dst != 0);
     write_op(mem, regs, instr, 0, result & regs::size_mask(size))?;
     Ok(())
 }
@@ -704,13 +722,13 @@ fn exec_shift(
             (r, cf_bit != 0)
         }
     };
-    regs.set_flag(rflags::CF, cf);
+    regs.set_flag(Rflags::CF, cf);
     // ROL/ROR do not update ZF/SF/PF; SHL/SHR/SAR do.
     if matches!(kind, ShiftKind::Shl | ShiftKind::Shr | ShiftKind::Sar) {
-        regs.set_flag(rflags::ZF, result == 0);
+        regs.set_flag(Rflags::ZF, result == 0);
         let sign = 1_u64 << bits.saturating_sub(1);
-        regs.set_flag(rflags::SF, (result & sign) != 0);
-        regs.set_flag(rflags::PF, (result as u8).count_ones().is_multiple_of(2));
+        regs.set_flag(Rflags::SF, (result & sign) != 0);
+        regs.set_flag(Rflags::PF, (result as u8).count_ones().is_multiple_of(2));
     }
     if count_mod == 1 {
         let sign = 1_u64 << bits.saturating_sub(1);
@@ -725,7 +743,7 @@ fn exec_shift(
                 b1 != b2
             }
         };
-        regs.set_flag(rflags::OF, of);
+        regs.set_flag(Rflags::OF, of);
     }
     write_op(mem, regs, instr, 0, result)?;
     Ok(())
@@ -867,7 +885,7 @@ fn exec_cmpxchg(
     let result = acc.wrapping_sub(dest);
     regs::set_sub_flags(regs, acc, dest, result, size);
 
-    if regs.flag(rflags::ZF) {
+    if regs.flag(Rflags::ZF) {
         write_op(mem, regs, instr, 0, src)?;
     } else {
         write_accumulator(regs, size, dest)?;
@@ -1128,7 +1146,7 @@ fn read_mem_value(mem: &GuestMemory, addr: u64, size: usize) -> Result<u64, Step
     if let Err(e) = mem.read(addr, slice) {
         drop(e);
         return Err(StepExecError::InvalidMemory(InvalidMem {
-            access_type: ACCESS_READ,
+            access_type: AccessType::Read,
             address: addr,
             size: i32::try_from(size).unwrap_or(0),
             value: 0,
@@ -1161,7 +1179,7 @@ fn write_mem_value(
     if let Err(e) = mem.write(addr, slice) {
         drop(e);
         return Err(StepExecError::InvalidMemory(InvalidMem {
-            access_type: ACCESS_WRITE,
+            access_type: AccessType::Write,
             address: addr,
             size: i32::try_from(size).unwrap_or(0),
             value: i64::try_from(value).unwrap_or(0),

@@ -17,7 +17,8 @@ use super::{
 };
 
 use crate::exec::{self, StringOpKind};
-use crate::regs::RegFile;
+use crate::jit::config::JitConfig;
+use crate::regs::{RegFile, Rflags};
 use cranelift::codegen::ir::{BlockArg, FuncRef};
 use cranelift::prelude::*;
 use cranelift_codegen::ir::MemFlagsData;
@@ -222,7 +223,7 @@ pub(crate) unsafe extern "C" fn wie_jit_string(
     for i in 0..16 {
         regs.set_gpr(i, ctx.gpr[i]);
     }
-    regs.set_rflags_checked(ctx.rflags);
+    regs.set_rflags_checked(Rflags::from(ctx.rflags));
     regs.rip = insn_ip;
 
     // SAFETY: mem pointer set by run_compiled.
@@ -232,20 +233,20 @@ pub(crate) unsafe extern "C" fn wie_jit_string(
             for i in 0..16 {
                 ctx.gpr[i] = regs.gpr(i);
             }
-            ctx.rflags = regs.rflags;
+            ctx.rflags = u64::from(regs.rflags);
             u64::from(stay)
         }
         Err(exec::StepExecError::InvalidMemory(inv)) => {
             for i in 0..16 {
                 ctx.gpr[i] = regs.gpr(i);
             }
-            ctx.rflags = regs.rflags;
+            ctx.rflags = u64::from(regs.rflags);
             set_fault(
                 ctx,
                 insn_ip,
                 inv.address,
                 u64::try_from(inv.size).unwrap_or(0),
-                u64::try_from(inv.access_type).unwrap_or(0),
+                u64::try_from(inv.access_type.as_i32()).unwrap_or(0),
             );
             0
         }
@@ -389,7 +390,7 @@ pub(super) fn call_load(
 ) -> Result<Value, String> {
     let load_ref = mem.load_ref.ok_or("load helper missing")?;
     // `WIE_JIT_MEM=slow`: helper only (oracle / bisect).
-    if !super::jit_mem_inline_enabled() {
+    if !JitConfig::get().mem_inline_enabled() {
         return Ok(emit_load_helper(
             bcx, mem, gpr, rflags, addr, size, insn_ip, load_ref,
         ));
@@ -492,7 +493,7 @@ pub(super) fn call_store(
     insn_ip: u64,
 ) -> Result<(), String> {
     let store_ref = mem.store_ref.ok_or("store helper missing")?;
-    if !super::jit_mem_inline_enabled() {
+    if !JitConfig::get().mem_inline_enabled() {
         emit_store_helper(bcx, mem, gpr, rflags, addr, size, value, insn_ip, store_ref);
         return Ok(());
     }

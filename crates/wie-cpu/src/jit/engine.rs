@@ -15,6 +15,7 @@
 )]
 
 use super::UcrtImportIds;
+use super::config::JitConfig;
 use super::fast_api::{
     wie_ucrt_fflush, wie_ucrt_free, wie_ucrt_fwrite, wie_ucrt_iob, wie_ucrt_malloc,
     wie_ucrt_memcpy, wie_ucrt_strlen,
@@ -24,7 +25,6 @@ use super::lower::{
     wie_jit_store, wie_jit_string, wie_sse_cvt, wie_sse_fp_binop, wie_sse_fp_unop,
     wie_sse_int_binop, wie_sse_pshufb_hi, wie_sse_pshufb_lo, wie_sse_shift,
 };
-use super::pipeline::{jit_opt_level, jit_verifier_enabled};
 
 pub(crate) struct JitEngine {
     pub(super) module: cranelift_jit::JITModule,
@@ -74,9 +74,9 @@ impl JitEngine {
         let mut flag_builder = settings::builder();
         // Phase 5.5 Track D: prefer speed of host code for hot translated blocks.
         flag_builder
-            .set("opt_level", jit_opt_level())
+            .set("opt_level", JitConfig::get().opt_level())
             .map_err(|e| e.to_string())?;
-        let verify = if jit_verifier_enabled() {
+        let verify = if JitConfig::get().verifier_enabled() {
             "true"
         } else {
             "false"

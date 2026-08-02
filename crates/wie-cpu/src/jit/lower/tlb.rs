@@ -7,9 +7,10 @@
     clippy::too_many_arguments
 )]
 
+use super::super::config::JitConfig;
 use super::{
     GuestVa, JitCtx, MemPin, STICKY_WAYS, TLB_EMPTY, TLB_PROT_R, TLB_PROT_W, TLB_WAYS_PER_SET,
-    TlbBucket, TlbBucketAux, tlb_neon_enabled, tlb_set_index,
+    TlbBucket, TlbBucketAux, tlb_set_index,
 };
 
 use crate::mem::PAGE_SIZE;
@@ -318,7 +319,7 @@ pub(super) fn tlb_bucket_lookup(
     write: bool,
     cur_gen: u64,
 ) -> Option<(*mut u8, u8)> {
-    if !tlb_neon_enabled() {
+    if !JitConfig::get().tlb_neon_enabled() {
         return tlb_bucket_lookup_scalar(bucket, aux, page_key, write, cur_gen);
     }
     #[cfg(target_arch = "aarch64")]

@@ -266,19 +266,27 @@ pub const ERROR_INVALID_PARAMETER: u32 = 87;
 /// Win32 `ERROR_NOT_ENOUGH_MEMORY`
 pub const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
 
-/// Build a `CpuError` carrying a Win32 code in a stable string form.
+/// Build a `CpuError` carrying a Win32 code in the typed [`CpuError::Win32`] form.
 #[must_use]
-pub(crate) fn va_error(win32: u32, msg: impl Into<String>) -> CpuError {
-    CpuError::Message(format!("win32({win32}): {}", msg.into()))
+pub(crate) fn va_error(win32: u32, msg: &'static str) -> CpuError {
+    CpuError::Win32(win32, msg)
 }
 
-/// Parse `win32(N):` prefix from a [`CpuError`] message, if present.
+/// Extract the Win32 code from a [`CpuError`], if present.
+///
+/// Fast path for the typed [`CpuError::Win32`] variant; falls back to parsing
+/// the legacy `win32(N):` string prefix for [`CpuError::Message`].
 #[must_use]
 pub fn win32_from_cpu_error(err: &CpuError) -> Option<u32> {
-    let s = err.to_string();
-    let rest = s.strip_prefix("win32(")?;
-    let (num, _) = rest.split_once(')')?;
-    num.parse().ok()
+    match err {
+        CpuError::Win32(code, _) => Some(*code),
+        other => {
+            let s = other.to_string();
+            let rest = s.strip_prefix("win32(")?;
+            let (num, _) = rest.split_once(')')?;
+            num.parse().ok()
+        }
+    }
 }
 
 #[cfg(test)]

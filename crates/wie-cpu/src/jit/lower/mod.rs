@@ -10,9 +10,10 @@
 
 use super::JitEngine;
 use super::block::{BlockTerm, DecodedInsn, analyze_block_stack_pin};
+use super::config::JitConfig;
 use super::fast_api::FastApiKind;
 use crate::mem::GuestMemory;
-use crate::regs::rflags;
+use crate::regs::Rflags;
 use cranelift::codegen::ir::{BlockArg, FuncRef, SigRef, UserFuncName};
 use cranelift::prelude::*;
 use cranelift_codegen::ir::{AliasRegionData, MemFlagsData};
@@ -117,42 +118,6 @@ impl XmmSlot {
     pub(super) fn to_u128(self) -> u128 {
         u128::from(self.lo) | (u128::from(self.hi) << 64)
     }
-}
-
-/// Phase 5.5: emit Cranelift SIMD types for SSE (`WIE_JIT_SIMD=0` disables).
-pub(super) fn jit_simd_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        !matches!(
-            std::env::var("WIE_JIT_SIMD"),
-            Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
-        )
-    })
-}
-
-/// Neon software-TLB tag compare (`WIE_TLB_NEON=0` → scalar 4-way scan).
-pub(super) fn tlb_neon_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        !matches!(
-            std::env::var("WIE_TLB_NEON"),
-            Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
-        )
-    })
-}
-
-/// Inline REP MOVS/STOS for 16–64 byte const counts (`WIE_STRING_INLINE=0` disables).
-pub(super) fn string_inline_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        !matches!(
-            std::env::var("WIE_STRING_INLINE"),
-            Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
-        )
-    })
 }
 
 /// Set index for the 4-way TLB: XOR-fold high `page_key` bits into the low
@@ -609,7 +574,6 @@ use gpr::{
 use insn::{PendingFlags, ShiftKind, flush_pending};
 use mem::{call_load, call_store, hoist_pin_slot};
 
-pub(crate) use super::jit_mem_inline_enabled;
 pub(super) use mem::{
     wie_jit_chain_lookup, wie_jit_host_span, wie_jit_load, wie_jit_store, wie_jit_string,
 };
@@ -641,8 +605,8 @@ pub(super) fn compile_block(
     let has_sse = live_xmm.iter().any(|&x| x);
     let has_string = block_has_string(insns);
     let has_fp = block_has_fp(insns);
-    let need_fp_helpers = has_fp && !jit_simd_enabled();
-    let need_host_span = has_string && string_inline_enabled();
+    let need_fp_helpers = has_fp && !JitConfig::get().simd_enabled();
+    let need_host_span = has_string && JitConfig::get().string_inline_enabled();
 
     // Self-loop if jcc/jmp targets this block's entry (stay in native code).
     let self_loop = match term {
@@ -853,12 +817,12 @@ pub(super) fn compile_block(
         // sticky keeps stack + sticky only; helpers still `pin_resolve` all 8
         // slots (VA/heaps) so walks collapse without IR cascade tax on 7za.
         // Set `WIE_JIT_MEM=pin` to also probe top-2 data pins after sticky.
-        let (stack_pin, data_pins) = if super::jit_mem_inline_enabled() {
+        let (stack_pin, data_pins) = if JitConfig::get().mem_inline_enabled() {
             let stack = Some(hoist_pin_slot(&mut bcx, ctx_ptr, flags, 0));
             // Default sticky: no data-pin IR (helpers cover VA via pin_resolve).
             // `WIE_JIT_MEM=pin`: top-2 size-ranked data pins after sticky.
             let mut data = Vec::new();
-            if super::jit_mem_pin_enabled() {
+            if JitConfig::get().mem_pin_enabled() {
                 const IR_DATA_PIN_SLOTS: usize = 2;
                 let end = 1_usize.saturating_add(IR_DATA_PIN_SLOTS).min(PIN_SLOTS);
                 data.reserve(IR_DATA_PIN_SLOTS);
@@ -872,7 +836,7 @@ pub(super) fn compile_block(
         };
 
         // Pre-compile scan: displacement range for block-wide stack pin guard.
-        let stack_plan = if super::jit_mem_inline_enabled() {
+        let stack_plan = if JitConfig::get().mem_inline_enabled() {
             analyze_block_stack_pin(body, term_insn)
         } else {
             None
@@ -906,7 +870,7 @@ pub(super) fn compile_block(
             && stack_pin.is_some()
             && !has_string
             && call_fast.is_none()
-            && super::jit_super_enabled(self_loop);
+            && JitConfig::get().super_enabled(self_loop);
 
         let mut headers_to_seal: Vec<Block> = Vec::new();
         // Tracks gpr_loaded for the exit store mask (union of paths; full when dual).
@@ -1273,11 +1237,11 @@ pub(super) fn flag_cond(
     rflags: Value,
     m: Mnemonic,
 ) -> Result<Value, String> {
-    let zf = flag_set(bcx, rflags, rflags::ZF);
-    let cf = flag_set(bcx, rflags, rflags::CF);
-    let sf = flag_set(bcx, rflags, rflags::SF);
-    let of = flag_set(bcx, rflags, rflags::OF);
-    let pf = flag_set(bcx, rflags, rflags::PF);
+    let zf = flag_set(bcx, rflags, Rflags::ZF);
+    let cf = flag_set(bcx, rflags, Rflags::CF);
+    let sf = flag_set(bcx, rflags, Rflags::SF);
+    let of = flag_set(bcx, rflags, Rflags::OF);
+    let pf = flag_set(bcx, rflags, Rflags::PF);
     let zf1 = bool_to_i64(bcx, zf);
     let cf1 = bool_to_i64(bcx, cf);
     let sf1 = bool_to_i64(bcx, sf);
@@ -1423,7 +1387,7 @@ pub(super) fn lower_shift_lazy(
         }
         ShiftKind::Rcl => {
             // Rcl: CF into LSB, shift left by count, MSB into CF
-            let cf_val = flag_bit(bcx, *rflags, rflags::CF);
+            let cf_val = flag_bit(bcx, *rflags, Rflags::CF);
             let left = bcx.ins().ishl(dst, count_mod);
             let right_amt = bcx.ins().isub(bits_v, count_mod);
             let right = bcx.ins().ushr(dst, right_amt);
@@ -1433,7 +1397,7 @@ pub(super) fn lower_shift_lazy(
         }
         ShiftKind::Rcr => {
             // Rcr: CF into MSB, shift right by count
-            let cf_val = flag_bit(bcx, *rflags, rflags::CF);
+            let cf_val = flag_bit(bcx, *rflags, Rflags::CF);
             let right = bcx.ins().ushr(dst, count_mod);
             let left_amt = bcx.ins().isub(bits_v, count_mod);
             let left = bcx.ins().ishl(dst, left_amt);

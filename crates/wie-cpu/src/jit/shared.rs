@@ -11,12 +11,13 @@
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     clippy::arithmetic_side_effects,
-    clippy::unwrap_used // Mutex/RwLock poison recovery is hard-coded (never occurs in practice)
+    clippy::unwrap_used, // Mutex/RwLock poison recovery is hard-coded (never occurs in practice)
+    clippy::expect_used // BgWaitCell waits a documented-invariant lock; see `wait_timeout`
 )]
 
 use super::CacheEntry;
 use super::block::{self, BlockKind};
-use super::config::{BG_QUEUE_CAP, bg_jit_enabled, jit_chain_enabled};
+use super::config::{BG_QUEUE_CAP, JitConfig};
 use super::engine::JitEngine;
 use super::fast_api::FastApiKind;
 use super::lower::{
@@ -61,8 +62,14 @@ impl BgWaitCell {
     /// Block until woken or `timeout` elapses. Spurious wakeups return early —
     /// callers must re-check the cache state.
     pub(super) fn wait_timeout(&self, timeout: Duration) {
-        let guard = self.lock.lock().unwrap();
-        let (guard, _timed_out) = self.cv.wait_timeout(guard, timeout).unwrap();
+        // The lock guards only the condvar wait (no panic-capable work is done
+        // while holding it), so a poison would mean a hard invariant violation
+        // we cannot recover from — treat it as an unrecoverable fault.
+        let guard = self.lock.lock().expect("bg wait lock poisoned");
+        let (guard, _timed_out) = self
+            .cv
+            .wait_timeout(guard, timeout)
+            .expect("condvar wait_timeout");
         drop(guard);
     }
 }
@@ -177,7 +184,7 @@ impl JitShared {
     /// Whether the background path is enabled for this instance: env default
     /// (on for real runs, off under `cfg(test)`) or the test latch.
     pub(super) fn bg_enabled_here(&self) -> bool {
-        bg_jit_enabled() || self.bg_force_test()
+        JitConfig::get().bg_enabled() || self.bg_force_test()
     }
 
     #[cfg(test)]
@@ -210,7 +217,7 @@ impl JitShared {
         if let Some((gs, ge)) = removed {
             self.code_pages_remove_range(gs, ge);
         }
-        if jit_chain_enabled()
+        if JitConfig::get().chain_enabled()
             && let Some(fid) = compiled.func_id
         {
             self.chain_ids.write().unwrap().insert(rip, fid);
@@ -331,7 +338,7 @@ impl JitShared {
                     }
                     _ => None,
                 };
-                let chain_on = jit_chain_enabled();
+                let chain_on = JitConfig::get().chain_enabled();
                 let empty_chain = HashMap::new();
                 let mut eng_guard = self.engine.lock().unwrap();
                 let eng = eng_guard.as_mut()?;
@@ -360,7 +367,7 @@ impl JitShared {
                 self.chain_ids.write().unwrap().remove(&rip);
                 self.code_pages_remove_range(old.guest_start, old.guest_end);
             }
-            if jit_chain_enabled()
+            if JitConfig::get().chain_enabled()
                 && let Some(fid) = compiled.func_id
             {
                 self.chain_ids.write().unwrap().insert(rip, fid);

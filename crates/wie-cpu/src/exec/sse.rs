@@ -20,12 +20,12 @@
 
 use crate::CpuError;
 use crate::mem::GuestMemory;
-use crate::regs::{RegFile, rflags};
+use crate::regs::{RegFile, Rflags};
 use iced_x86::{Instruction, Mnemonic, OpKind};
 
 use super::{
-    ACCESS_READ, ACCESS_WRITE, FpOp, InvalidMem, SseBitOp, SseCvtOp, SseFpBinOp, SseFpUnOp,
-    SseIntOp, SseShiftOp, StepExecError, effective_address, read_mem_value, write_mem_value,
+    AccessType, FpOp, InvalidMem, SseBitOp, SseCvtOp, SseFpBinOp, SseFpUnOp, SseIntOp, SseShiftOp,
+    StepExecError, effective_address, read_mem_value, write_mem_value,
 };
 
 pub(super) fn is_sse_movsd(instr: &Instruction) -> bool {
@@ -573,12 +573,12 @@ pub(super) fn exec_sse_comis(
         let fb = f32::from_bits(b as u32);
         (fa.is_nan() || fb.is_nan(), fa == fb, fa < fb)
     };
-    regs.set_flag(rflags::CF, lt || unordered);
-    regs.set_flag(rflags::PF, unordered);
-    regs.set_flag(rflags::ZF, eq || unordered);
-    regs.set_flag(rflags::OF, false);
-    regs.set_flag(rflags::AF, false);
-    regs.set_flag(rflags::SF, false);
+    regs.set_flag(Rflags::CF, lt || unordered);
+    regs.set_flag(Rflags::PF, unordered);
+    regs.set_flag(Rflags::ZF, eq || unordered);
+    regs.set_flag(Rflags::OF, false);
+    regs.set_flag(Rflags::AF, false);
+    regs.set_flag(Rflags::SF, false);
     Ok(())
 }
 
@@ -1193,7 +1193,7 @@ fn read_sse_op(
             if let Err(e) = mem.read(addr, slice) {
                 drop(e);
                 return Err(StepExecError::InvalidMemory(InvalidMem {
-                    access_type: ACCESS_READ,
+                    access_type: AccessType::Read,
                     address: addr,
                     size: i32::try_from(nbytes).unwrap_or(0),
                     value: 0,
@@ -1263,7 +1263,7 @@ fn write_sse_op(
             if let Err(e) = mem.write(addr, slice) {
                 drop(e);
                 return Err(StepExecError::InvalidMemory(InvalidMem {
-                    access_type: ACCESS_WRITE,
+                    access_type: AccessType::Write,
                     address: addr,
                     size: i32::try_from(nbytes).unwrap_or(0),
                     value: 0,

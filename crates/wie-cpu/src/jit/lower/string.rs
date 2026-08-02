@@ -7,14 +7,15 @@
     clippy::too_many_arguments
 )]
 
+use super::super::config::JitConfig;
 use super::emit::{MemEnv, exit_args};
 use super::flags::iconst_u64;
-use super::{OFF_FAULT, OFF_RFLAGS, jit_simd_enabled, string_inline_enabled};
+use super::{OFF_FAULT, OFF_RFLAGS};
 
 use super::super::block::string_op_size;
 
 use crate::exec::{self, StringOpKind};
-use crate::regs::rflags;
+use crate::regs::Rflags;
 use cranelift::codegen::ir::BlockArg;
 use cranelift::prelude::*;
 use iced_x86::Instruction;
@@ -33,7 +34,7 @@ pub(super) fn try_lower_inline_rep(
     kind: StringOpKind,
     size: u32,
 ) -> Option<Value> {
-    if !string_inline_enabled() || !jit_simd_enabled() {
+    if !JitConfig::get().string_inline_enabled() || !JitConfig::get().simd_enabled() {
         return None;
     }
     // Only the two block-copyable kinds; SCAS/CMPS/LODS need element semantics.
@@ -64,7 +65,7 @@ pub(super) fn try_lower_inline_rep(
     // DF clear + byte_len in [8, 64]. Lengths are handled exactly (including
     // non-multiples of 16) by `emit_inline_copy_chunks`; the floor is 8 because
     // that is the smallest unit the overlapping-tail scheme covers.
-    let df_mask = iconst_u64(bcx, rflags::DF);
+    let df_mask = iconst_u64(bcx, u64::from(Rflags::DF));
     let df_bits = bcx.ins().band(*rflags, df_mask);
     let df_clear = bcx.ins().icmp_imm(IntCC::Equal, df_bits, 0);
     let rcx = gpr[1];
@@ -425,7 +426,7 @@ pub(super) fn lower_string(
 
     // Phase 5.5: dual-path inline for small REP MOVS/STOS when helpers available.
     if matches!(kind, StringOpKind::Stos | StringOpKind::Movs)
-        && string_inline_enabled()
+        && JitConfig::get().string_inline_enabled()
         && mem.host_span_ref.is_some()
         && let Some(rip) =
             try_lower_inline_rep(bcx, instr, gpr, rflags, gpr_loaded, mem, kind, size)

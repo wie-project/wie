@@ -17,7 +17,7 @@
     clippy::manual_range_contains // f >= hi || f < lo reads clearer than !range
 )]
 
-use crate::regs::{RegFile, rflags};
+use crate::regs::{RegFile, Rflags};
 use iced_x86::Mnemonic;
 
 #[derive(Clone, Copy)]
@@ -51,66 +51,66 @@ pub(super) enum ShiftKind {
 
 pub(super) fn cond_from_jcc(m: Mnemonic, regs: &RegFile) -> bool {
     match m {
-        Mnemonic::Je => regs.flag(rflags::ZF),
-        Mnemonic::Jne => !regs.flag(rflags::ZF),
-        Mnemonic::Ja => !regs.flag(rflags::CF) && !regs.flag(rflags::ZF),
-        Mnemonic::Jae => !regs.flag(rflags::CF),
-        Mnemonic::Jb => regs.flag(rflags::CF),
-        Mnemonic::Jbe => regs.flag(rflags::CF) || regs.flag(rflags::ZF),
-        Mnemonic::Jg => !regs.flag(rflags::ZF) && regs.flag(rflags::SF) == regs.flag(rflags::OF),
-        Mnemonic::Jge => regs.flag(rflags::SF) == regs.flag(rflags::OF),
-        Mnemonic::Jl => regs.flag(rflags::SF) != regs.flag(rflags::OF),
-        Mnemonic::Jle => regs.flag(rflags::ZF) || regs.flag(rflags::SF) != regs.flag(rflags::OF),
-        Mnemonic::Jo => regs.flag(rflags::OF),
-        Mnemonic::Jno => !regs.flag(rflags::OF),
-        Mnemonic::Js => regs.flag(rflags::SF),
-        Mnemonic::Jns => !regs.flag(rflags::SF),
-        Mnemonic::Jp => regs.flag(rflags::PF),
-        Mnemonic::Jnp => !regs.flag(rflags::PF),
+        Mnemonic::Je => regs.flag(Rflags::ZF),
+        Mnemonic::Jne => !regs.flag(Rflags::ZF),
+        Mnemonic::Ja => !regs.flag(Rflags::CF) && !regs.flag(Rflags::ZF),
+        Mnemonic::Jae => !regs.flag(Rflags::CF),
+        Mnemonic::Jb => regs.flag(Rflags::CF),
+        Mnemonic::Jbe => regs.flag(Rflags::CF) || regs.flag(Rflags::ZF),
+        Mnemonic::Jg => !regs.flag(Rflags::ZF) && regs.flag(Rflags::SF) == regs.flag(Rflags::OF),
+        Mnemonic::Jge => regs.flag(Rflags::SF) == regs.flag(Rflags::OF),
+        Mnemonic::Jl => regs.flag(Rflags::SF) != regs.flag(Rflags::OF),
+        Mnemonic::Jle => regs.flag(Rflags::ZF) || regs.flag(Rflags::SF) != regs.flag(Rflags::OF),
+        Mnemonic::Jo => regs.flag(Rflags::OF),
+        Mnemonic::Jno => !regs.flag(Rflags::OF),
+        Mnemonic::Js => regs.flag(Rflags::SF),
+        Mnemonic::Jns => !regs.flag(Rflags::SF),
+        Mnemonic::Jp => regs.flag(Rflags::PF),
+        Mnemonic::Jnp => !regs.flag(Rflags::PF),
         _ => false,
     }
 }
 
 pub(super) fn cond_from_cmov(m: Mnemonic, regs: &RegFile) -> bool {
     match m {
-        Mnemonic::Cmove => regs.flag(rflags::ZF),
-        Mnemonic::Cmovne => !regs.flag(rflags::ZF),
-        Mnemonic::Cmova => !regs.flag(rflags::CF) && !regs.flag(rflags::ZF),
-        Mnemonic::Cmovae => !regs.flag(rflags::CF),
-        Mnemonic::Cmovb => regs.flag(rflags::CF),
-        Mnemonic::Cmovbe => regs.flag(rflags::CF) || regs.flag(rflags::ZF),
-        Mnemonic::Cmovg => !regs.flag(rflags::ZF) && regs.flag(rflags::SF) == regs.flag(rflags::OF),
-        Mnemonic::Cmovge => regs.flag(rflags::SF) == regs.flag(rflags::OF),
-        Mnemonic::Cmovl => regs.flag(rflags::SF) != regs.flag(rflags::OF),
-        Mnemonic::Cmovle => regs.flag(rflags::ZF) || regs.flag(rflags::SF) != regs.flag(rflags::OF),
-        Mnemonic::Cmovo => regs.flag(rflags::OF),
-        Mnemonic::Cmovno => !regs.flag(rflags::OF),
-        Mnemonic::Cmovs => regs.flag(rflags::SF),
-        Mnemonic::Cmovns => !regs.flag(rflags::SF),
-        Mnemonic::Cmovp => regs.flag(rflags::PF),
-        Mnemonic::Cmovnp => !regs.flag(rflags::PF),
+        Mnemonic::Cmove => regs.flag(Rflags::ZF),
+        Mnemonic::Cmovne => !regs.flag(Rflags::ZF),
+        Mnemonic::Cmova => !regs.flag(Rflags::CF) && !regs.flag(Rflags::ZF),
+        Mnemonic::Cmovae => !regs.flag(Rflags::CF),
+        Mnemonic::Cmovb => regs.flag(Rflags::CF),
+        Mnemonic::Cmovbe => regs.flag(Rflags::CF) || regs.flag(Rflags::ZF),
+        Mnemonic::Cmovg => !regs.flag(Rflags::ZF) && regs.flag(Rflags::SF) == regs.flag(Rflags::OF),
+        Mnemonic::Cmovge => regs.flag(Rflags::SF) == regs.flag(Rflags::OF),
+        Mnemonic::Cmovl => regs.flag(Rflags::SF) != regs.flag(Rflags::OF),
+        Mnemonic::Cmovle => regs.flag(Rflags::ZF) || regs.flag(Rflags::SF) != regs.flag(Rflags::OF),
+        Mnemonic::Cmovo => regs.flag(Rflags::OF),
+        Mnemonic::Cmovno => !regs.flag(Rflags::OF),
+        Mnemonic::Cmovs => regs.flag(Rflags::SF),
+        Mnemonic::Cmovns => !regs.flag(Rflags::SF),
+        Mnemonic::Cmovp => regs.flag(Rflags::PF),
+        Mnemonic::Cmovnp => !regs.flag(Rflags::PF),
         _ => false,
     }
 }
 
 pub(super) fn cond_from_setcc(m: Mnemonic, regs: &RegFile) -> bool {
     match m {
-        Mnemonic::Sete => regs.flag(rflags::ZF),
-        Mnemonic::Setne => !regs.flag(rflags::ZF),
-        Mnemonic::Seta => !regs.flag(rflags::CF) && !regs.flag(rflags::ZF),
-        Mnemonic::Setae => !regs.flag(rflags::CF),
-        Mnemonic::Setb => regs.flag(rflags::CF),
-        Mnemonic::Setbe => regs.flag(rflags::CF) || regs.flag(rflags::ZF),
-        Mnemonic::Setg => !regs.flag(rflags::ZF) && regs.flag(rflags::SF) == regs.flag(rflags::OF),
-        Mnemonic::Setge => regs.flag(rflags::SF) == regs.flag(rflags::OF),
-        Mnemonic::Setl => regs.flag(rflags::SF) != regs.flag(rflags::OF),
-        Mnemonic::Setle => regs.flag(rflags::ZF) || regs.flag(rflags::SF) != regs.flag(rflags::OF),
-        Mnemonic::Seto => regs.flag(rflags::OF),
-        Mnemonic::Setno => !regs.flag(rflags::OF),
-        Mnemonic::Sets => regs.flag(rflags::SF),
-        Mnemonic::Setns => !regs.flag(rflags::SF),
-        Mnemonic::Setp => regs.flag(rflags::PF),
-        Mnemonic::Setnp => !regs.flag(rflags::PF),
+        Mnemonic::Sete => regs.flag(Rflags::ZF),
+        Mnemonic::Setne => !regs.flag(Rflags::ZF),
+        Mnemonic::Seta => !regs.flag(Rflags::CF) && !regs.flag(Rflags::ZF),
+        Mnemonic::Setae => !regs.flag(Rflags::CF),
+        Mnemonic::Setb => regs.flag(Rflags::CF),
+        Mnemonic::Setbe => regs.flag(Rflags::CF) || regs.flag(Rflags::ZF),
+        Mnemonic::Setg => !regs.flag(Rflags::ZF) && regs.flag(Rflags::SF) == regs.flag(Rflags::OF),
+        Mnemonic::Setge => regs.flag(Rflags::SF) == regs.flag(Rflags::OF),
+        Mnemonic::Setl => regs.flag(Rflags::SF) != regs.flag(Rflags::OF),
+        Mnemonic::Setle => regs.flag(Rflags::ZF) || regs.flag(Rflags::SF) != regs.flag(Rflags::OF),
+        Mnemonic::Seto => regs.flag(Rflags::OF),
+        Mnemonic::Setno => !regs.flag(Rflags::OF),
+        Mnemonic::Sets => regs.flag(Rflags::SF),
+        Mnemonic::Setns => !regs.flag(Rflags::SF),
+        Mnemonic::Setp => regs.flag(Rflags::PF),
+        Mnemonic::Setnp => !regs.flag(Rflags::PF),
         _ => false,
     }
 }

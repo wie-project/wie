@@ -346,7 +346,7 @@ impl CpuEngine for JitCpu {
                         invalid_memory: InvalidMemoryAccess {
                             hit: true,
                             exception_code: crate::exception_code::ACCESS_VIOLATION,
-                            access_type: inv.access_type,
+                            access_type: inv.access_type.as_i32(),
                             address: inv.address,
                             size: inv.size,
                             value: inv.value,
@@ -389,7 +389,7 @@ impl CpuEngine for JitCpu {
                         invalid_memory: InvalidMemoryAccess {
                             hit: true,
                             exception_code: crate::exception_code::ACCESS_VIOLATION,
-                            access_type: inv.access_type,
+                            access_type: inv.access_type.as_i32(),
                             address: inv.address,
                             size: inv.size,
                             value: inv.value,

@@ -16,7 +16,7 @@
 )]
 
 use crate::mem::GuestMemory;
-use crate::regs::{self, RegFile, rflags};
+use crate::regs::{self, RegFile, Rflags};
 use iced_x86::{Instruction, Mnemonic, Register};
 
 use super::{StepExecError, read_mem_value, write_mem_value};
@@ -28,7 +28,7 @@ fn has_any_rep(instr: &Instruction) -> bool {
 
 fn df_step(regs: &RegFile, size: usize) -> i64 {
     let s = i64::try_from(size).unwrap_or(1);
-    if regs.flag(rflags::DF) { -s } else { s }
+    if regs.flag(Rflags::DF) { -s } else { s }
 }
 
 /// Keep RIP on a REP-prefixed string insn (Unicorn `count=1` micro-step).
@@ -584,7 +584,7 @@ fn string_scas(
             count = count.saturating_sub(1);
             regs.set_rdi(rdi);
             regs.set_rcx(regs.rcx().saturating_sub(1));
-            let zf = regs.flag(rflags::ZF);
+            let zf = regs.flag(Rflags::ZF);
             zf_stop = (repe && !zf) || (repne && zf);
             if zf_stop {
                 break;
@@ -647,7 +647,7 @@ fn string_cmps(
             regs.set_rsi(rsi);
             regs.set_rdi(rdi);
             regs.set_rcx(regs.rcx().saturating_sub(1));
-            let zf = regs.flag(rflags::ZF);
+            let zf = regs.flag(Rflags::ZF);
             zf_stop = (repe && !zf) || (repne && zf);
             if zf_stop {
                 break;

@@ -17,7 +17,7 @@
 
 use super::JitStats;
 use super::block::{self, BlockKind, decode_pure_gpr_block, pure_is_self_loop};
-use super::config::{bg_wait_timeout, hotness_threshold, jit_chain_enabled, pure_loop_hotness};
+use super::config::JitConfig;
 use super::fast_api::{FastApiKind, JitFastPathConfig, install_heap_layout};
 use super::lower::{
     self, CompiledBlock, JitCtx, MemPathSlice, MemPin, PIN_SLOTS, STICKY_WAYS, TLB_EMPTY, TLB_SETS,
@@ -28,6 +28,7 @@ use super::{CacheEntry, JitCpu};
 use crate::CpuError;
 use crate::exec::{self, StepResult};
 use crate::mem::{self, GuestMemory, PAGE_SIZE, PAGE_SIZE_USIZE};
+use crate::regs::Rflags;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -151,7 +152,7 @@ impl JitCpu {
         }
         self.stats.code_invs = self.stats.code_invs.saturating_add(1);
         self.invalidate_chain_and_shadow();
-        if jit_chain_enabled() {
+        if JitConfig::get().chain_enabled() {
             let cache = self.shared.cache.read().unwrap();
             for (va, entry) in &*cache {
                 if let CacheEntry::Ready(c) = entry {
@@ -359,9 +360,9 @@ impl JitCpu {
                 let thr = if is_ucrt {
                     2
                 } else if is_loop {
-                    pure_loop_hotness()
+                    JitConfig::get().pure_loop_hotness()
                 } else {
-                    hotness_threshold()
+                    JitConfig::get().hotness_threshold()
                 };
                 if thr == 0 || is_ucrt {
                     // Eager compile: the entry is required NOW (there may be no
@@ -451,28 +452,6 @@ impl JitCpu {
         Ok((result, 1))
     }
 
-    /// True when a Pure block at `rip` ends in a near-call to a registered UCRT fast API.
-    ///
-    /// Kept for callers that don't already have a decoded [`BlockKind`] in hand
-    /// (currently none — the miss path pre-decodes and calls the helper below).
-    #[allow(dead_code)]
-    fn peek_fast_ucrt_call(&self, rip: u64) -> bool {
-        if self.fast_api.is_empty() {
-            return false;
-        }
-        let mem = self.shared.mem.read().unwrap();
-        let kind = decode_pure_gpr_block(&mem, self.thread.hooks.as_ref(), rip);
-        drop(mem);
-        block_kind_ends_in_fast_ucrt(&self.shared, &self.fast_api, &kind)
-    }
-
-    #[allow(dead_code)]
-    fn peek_self_loop(&self, rip: u64) -> bool {
-        let mem = self.shared.mem.read().unwrap();
-        let kind = decode_pure_gpr_block(&mem, self.thread.hooks.as_ref(), rip);
-        pure_is_self_loop(&kind, rip)
-    }
-
     /// Hand a block to the background compiler.
     ///
     /// Queues the exact decoded block so the worker compiles the same bytes the
@@ -518,14 +497,14 @@ impl JitCpu {
     ///
     /// The guest only reaches this when it is about to execute the entry. The
     /// wait is per-entry (the cell from the Queued entry, not the whole queue)
-    /// and time-boxed by [`bg_wait_timeout`]; on timeout the caller falls back
+    /// and time-boxed by [`JitConfig::bg_wait_timeout`]; on timeout the caller falls back
     /// to inline compilation so a worker stall can never deadlock the guest.
     /// Returns the Ready block once installed.
     pub(super) fn wait_bg_ready(&mut self, rip: u64, cell: &BgWaitCell) -> Option<CompiledBlock> {
         if !self.shared.bg_alive.load(Ordering::Relaxed) {
             return None; // worker gone: inline fallback
         }
-        let budget = bg_wait_timeout();
+        let budget = JitConfig::get().bg_wait_timeout();
         let start = Instant::now();
         loop {
             let state = {
@@ -573,7 +552,7 @@ impl JitCpu {
     /// so worker-compiled blocks chain from compiled code exactly like inline
     /// compiles would have.
     pub(super) fn resync_chain_table(&mut self) {
-        if !jit_chain_enabled() {
+        if !JitConfig::get().chain_enabled() {
             return;
         }
         let cache = self.shared.cache.read().unwrap();
@@ -608,7 +587,7 @@ impl JitCpu {
             return None;
         };
         self.stats.compiles = self.stats.compiles.saturating_add(1);
-        if jit_chain_enabled() {
+        if JitConfig::get().chain_enabled() {
             let fn_ptr = compiled.func as usize as u64;
             chain_table_insert(self.thread.chain_slots.as_mut(), rip, fn_ptr);
         }
@@ -719,7 +698,7 @@ impl JitCpu {
         }
         let mut ctx = JitCtx {
             gpr,
-            rflags: regs.rflags,
+            rflags: u64::from(regs.rflags),
             rip: entry_rip,
             mem: mem_ptr,
             fault: 0,
@@ -852,11 +831,17 @@ impl JitCpu {
                 i = i.saturating_add(1);
             }
         }
-        regs.set_rflags_checked(ctx.rflags);
+        regs.set_rflags_checked(Rflags::from(ctx.rflags));
         regs.rip = ctx.rip;
         let fault = if ctx.fault != 0 {
             Some(exec::InvalidMem {
-                access_type: i32::try_from(ctx.fault_access).unwrap_or(0),
+                // `fault_access` holds the Unicorn-style code the fault path
+                // reported (0 = read, 1 = write, 16 = fetch).
+                access_type: match i32::try_from(ctx.fault_access).unwrap_or(0) {
+                    1 => exec::AccessType::Write,
+                    16 => exec::AccessType::Fetch,
+                    _ => exec::AccessType::Read,
+                },
                 address: ctx.fault_addr,
                 size: i32::try_from(ctx.fault_size).unwrap_or(0),
                 value: 0,
@@ -993,41 +978,4 @@ pub(super) fn resolve_thunk_va(mem: &GuestMemory, mut va: u64) -> u64 {
         return va;
     }
     va
-}
-
-/// Cranelift `opt_level` from `WIE_JIT_OPT` (`speed` | `speed_and_size` | `none`).
-/// Default: `speed` (Phase 5.5 — hot guest blocks over code size).
-pub(super) fn jit_opt_level() -> &'static str {
-    use std::sync::OnceLock;
-    static LVL: OnceLock<&'static str> = OnceLock::new();
-    LVL.get_or_init(|| match std::env::var("WIE_JIT_OPT") {
-        Ok(v) if v.eq_ignore_ascii_case("none") || v == "0" => "none",
-        Ok(v)
-            if v.eq_ignore_ascii_case("speed_and_size")
-                || v.eq_ignore_ascii_case("size")
-                || v.eq_ignore_ascii_case("speed-and-size") =>
-        {
-            "speed_and_size"
-        }
-        Ok(v) if v.eq_ignore_ascii_case("speed") || v.eq_ignore_ascii_case("fast") => "speed",
-        _ => "speed",
-    })
-}
-
-/// Run Cranelift IR verifier only when `WIE_JIT_VERIFY=1`.
-///
-/// Previously enabled under `cfg(test)` unconditionally — every test-driven
-/// perf run (release-mode `cargo test`) paid the verifier tax on every
-/// compile. Tests that need verifier coverage should set `WIE_JIT_VERIFY=1`
-/// explicitly. The oracle tests already exercise the lowering paths without
-/// requiring an always-on verifier.
-pub(super) fn jit_verifier_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        matches!(
-            std::env::var("WIE_JIT_VERIFY"),
-            Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
-        )
-    })
 }

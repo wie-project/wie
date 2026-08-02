@@ -6,10 +6,11 @@
     clippy::too_many_arguments
 )]
 
+use super::super::config::JitConfig;
+use super::OFF_XMM;
 use super::emit::MemEnv;
 use super::flags::iconst_u64;
 use super::gpr::reg_index;
-use super::{OFF_XMM, jit_simd_enabled};
 
 use super::super::block::{BlockTerm, DecodedInsn, is_string_op};
 
@@ -87,7 +88,7 @@ pub(super) fn load_xmm_pair(
     }
     let base = i64::from(OFF_XMM) + i64::try_from(idx.saturating_mul(16)).unwrap_or(0);
     let p = bcx.ins().iadd_imm(ctx_ptr, base);
-    if jit_simd_enabled() {
+    if JitConfig::get().simd_enabled() {
         // Single 128-bit load → Neon Q reg; split for lo/hi SSA compatibility.
         let v = bcx.ins().load(types::I8X16, flags, p, 0);
         let as_i64x2 = bcx.ins().bitcast(types::I64X2, flags, v);
@@ -163,7 +164,7 @@ pub(super) fn store_xmm_pair(
     xmm[idx * 2 + 1] = hi;
     let base = i64::from(OFF_XMM) + i64::try_from(idx.saturating_mul(16)).unwrap_or(0);
     let p = bcx.ins().iadd_imm(mem.ctx_ptr, base);
-    if jit_simd_enabled() {
+    if JitConfig::get().simd_enabled() {
         let v = pair_to_i8x16(bcx, mem.flags, lo, hi);
         bcx.ins().store(mem.flags, v, p, 0);
     } else {

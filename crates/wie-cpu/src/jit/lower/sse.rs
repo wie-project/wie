@@ -7,11 +7,11 @@
     clippy::too_many_arguments
 )]
 
+use super::super::config::JitConfig;
 use super::analysis::{i8x16_to_pair, pair_to_i8x16, read_xmm_pair, store_xmm_pair, xmm_index};
 use super::emit::MemEnv;
 use super::flags::iconst_u64;
 use super::gpr::{effective_addr, read_gpr, write_gpr};
-use super::jit_simd_enabled;
 use super::mem::{call_load, call_store};
 
 use crate::exec::{self};
@@ -336,7 +336,7 @@ pub(super) fn lower_sse_punpck_lanes(
         }
         _ => return Err("punpck lanes src".into()),
     };
-    let (lo, hi) = if jit_simd_enabled() {
+    let (lo, hi) = if JitConfig::get().simd_enabled() {
         let a8 = pair_to_i8x16(bcx, mem.flags, a_lo, a_hi);
         let b8 = pair_to_i8x16(bcx, mem.flags, b_lo, b_hi);
         let mask = sse_punpck_shuffle_mask(instr.mnemonic());
@@ -465,7 +465,7 @@ pub(super) fn lower_sse_pshufd(
         _ => return Err("pshufd src".into()),
     };
     let imm = instr.immediate(2) & 0xff;
-    let (lo, hi) = if jit_simd_enabled() {
+    let (lo, hi) = if JitConfig::get().simd_enabled() {
         let a8 = pair_to_i8x16(bcx, mem.flags, s_lo, s_hi);
         let mask = sse_pshufd_mask(imm);
         let imm_h = shuffle_imm(bcx, mask);
@@ -511,7 +511,7 @@ pub(super) fn lower_sse_pshuflw_hw(
     };
     let imm = instr.immediate(2) & 0xff;
     let low = instr.mnemonic() == Mnemonic::Pshuflw;
-    let (lo, hi) = if jit_simd_enabled() {
+    let (lo, hi) = if JitConfig::get().simd_enabled() {
         let a8 = pair_to_i8x16(bcx, mem.flags, s_lo, s_hi);
         let mask = sse_pshuflw_hw_mask(imm, low);
         let imm_h = shuffle_imm(bcx, mask);
@@ -753,7 +753,7 @@ pub(super) fn lower_sse_int_binop(
         }
         _ => return Err("sse int binop src".into()),
     };
-    let (lo, hi) = if jit_simd_enabled() {
+    let (lo, hi) = if JitConfig::get().simd_enabled() {
         match op {
             exec::SseIntOp::Paddb => vec_binop(
                 bcx,

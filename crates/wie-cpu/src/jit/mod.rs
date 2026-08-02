@@ -31,12 +31,11 @@ mod pipeline;
 mod shared;
 mod trampolines;
 
-pub(crate) use config::{jit_mem_inline_enabled, jit_mem_pin_enabled, jit_super_enabled};
 pub(crate) use engine::JitEngine;
 pub use fast_api::{FastApiKind, JitFastPathConfig, JitHeapLayout};
 pub use shared::{JitShared, PerThreadJitState};
 
-use config::mem_path_trace_enabled;
+use config::JitConfig;
 use lower::CompiledBlock;
 use shared::BgWaitCell;
 use std::sync::Arc;
@@ -110,7 +109,7 @@ impl UcrtImportIds {
 
 /// Dump helper mem-path histogram when `WIE_JIT_MEM_TRACE=1` or `WIE_EXEC_TRACE=1`.
 pub fn dump_mem_path_stats(s: &JitStats) {
-    if !mem_path_trace_enabled() {
+    if !JitConfig::get().mem_path_trace_enabled() {
         return;
     }
     let helpers = s.load_calls.saturating_add(s.store_calls);
@@ -232,7 +231,7 @@ mod tests {
     use crate::regs::RegFile;
     use crate::{CpuEngine, RwxPerms};
     use block::BlockKind;
-    use config::jit_chain_enabled;
+    use config::JitConfig;
     use lower::{JitCtx, chain_table_insert};
     use pipeline::ranges_overlap;
     use shared::{BgEnqueueOutcome, BgWaitCell};
@@ -257,7 +256,7 @@ mod tests {
                     guest_end,
                 },
             );
-            if jit_chain_enabled() {
+            if JitConfig::get().chain_enabled() {
                 let fn_ptr = dummy_block as *const () as usize as u64;
                 chain_table_insert(self.thread.chain_slots.as_mut(), rip, fn_ptr);
             }
@@ -638,7 +637,7 @@ mod tests {
     // through Cranelift rather than silently falling back to iced.
 
     use crate::IcedCpu;
-    use crate::regs::rflags;
+    use crate::regs::Rflags;
     use iced_x86::{Decoder, DecoderOptions, Register};
 
     const SIMD_BASE: u64 = 0x2000_0000;
@@ -1089,31 +1088,31 @@ mod tests {
             // Pre-set CF so we can see it being cleared.
             let (iced, jit) = simd_dual(bytes, &[], |r| {
                 set_pair(r, a32, b32);
-                r.rflags = rflags::ALWAYS1 | rflags::CF;
+                r.rflags = Rflags::ALWAYS1 | Rflags::CF;
             });
             assert_same_regs(&iced, &jit, name);
             // a < b → CF=1, ZF=0, PF=0, OF/AF/SF=0.
-            assert!(iced.flag(rflags::CF), "{name} iced CF");
-            assert!(!iced.flag(rflags::ZF), "{name} iced ZF");
-            assert!(!iced.flag(rflags::OF), "{name} iced OF");
-            assert!(jit.flag(rflags::CF), "{name} jit CF");
-            assert!(!jit.flag(rflags::ZF), "{name} jit ZF");
-            assert!(!jit.flag(rflags::OF), "{name} jit OF");
+            assert!(iced.flag(Rflags::CF), "{name} iced CF");
+            assert!(!iced.flag(Rflags::ZF), "{name} iced ZF");
+            assert!(!iced.flag(Rflags::OF), "{name} iced OF");
+            assert!(jit.flag(Rflags::CF), "{name} jit CF");
+            assert!(!jit.flag(Rflags::ZF), "{name} jit ZF");
+            assert!(!jit.flag(Rflags::OF), "{name} jit OF");
         }
         // a == b → ZF=1, CF=0, PF=0.
         let (iced, jit) = simd_dual(&[0x0f, 0x2f, 0xc1], &[], |r| set_pair(r, b32, b32));
-        assert!(iced.flag(rflags::ZF), "iced eq ZF");
-        assert!(!iced.flag(rflags::CF), "iced eq CF");
-        assert!(jit.flag(rflags::ZF), "jit eq ZF");
-        assert!(!jit.flag(rflags::CF), "jit eq CF");
+        assert!(iced.flag(Rflags::ZF), "iced eq ZF");
+        assert!(!iced.flag(Rflags::CF), "iced eq CF");
+        assert!(jit.flag(Rflags::ZF), "jit eq ZF");
+        assert!(!jit.flag(Rflags::CF), "jit eq CF");
         // NaN → unordered: ZF=PF=CF=1.
         let (iced, jit) = simd_dual(&[0x0f, 0x2f, 0xc1], &[], |r| {
             set_pair(r, u128::from(f32::NAN.to_bits()), b32);
         });
-        assert!(iced.flag(rflags::PF), "iced nan PF");
-        assert!(iced.flag(rflags::CF), "iced nan CF");
-        assert!(jit.flag(rflags::PF), "jit nan PF");
-        assert!(jit.flag(rflags::CF), "jit nan CF");
+        assert!(iced.flag(Rflags::PF), "iced nan PF");
+        assert!(iced.flag(Rflags::CF), "iced nan CF");
+        assert!(jit.flag(Rflags::PF), "jit nan PF");
+        assert!(jit.flag(Rflags::CF), "jit nan CF");
     }
 
     #[test]

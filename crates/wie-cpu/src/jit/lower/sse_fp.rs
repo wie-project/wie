@@ -7,18 +7,19 @@
     clippy::too_many_arguments
 )]
 
+use super::super::config::JitConfig;
+use super::SseBit;
 use super::analysis::{i8x16_to_pair, pair_to_i8x16, read_xmm_pair, store_xmm_pair, xmm_index};
 use super::emit::MemEnv;
 use super::flags::iconst_u64;
 use super::gpr::{bool_to_i64, effective_addr, is_imm_kind, read_gpr, write_gpr};
 use super::mem::call_load;
 use super::sse::{load_sse_mem, pair_to_vec, vec_to_pair};
-use super::{SseBit, jit_simd_enabled};
 
 use super::super::block::mem_width_bytes;
 
 use crate::exec::{self};
-use crate::regs::rflags;
+use crate::regs::Rflags;
 use cranelift::prelude::*;
 use iced_x86::{Instruction, OpKind};
 
@@ -168,7 +169,7 @@ pub(super) fn lower_sse_shift(
     } else {
         (iconst_u64(bcx, 0), iconst_u64(bcx, 0))
     };
-    let (lo, hi) = if jit_simd_enabled() {
+    let (lo, hi) = if JitConfig::get().simd_enabled() {
         if let Some(c) = imm {
             if c >= u64::from(width) {
                 // x86: count >= element width → all zeroes.
@@ -470,7 +471,7 @@ pub(super) fn lower_sse_comis(
     let bits = bcx.ins().bor(cf1, pz);
     let clear = iconst_u64(
         bcx,
-        rflags::CF | rflags::PF | rflags::ZF | rflags::OF | rflags::AF | rflags::SF,
+        u64::from(Rflags::CF | Rflags::PF | Rflags::ZF | Rflags::OF | Rflags::AF | Rflags::SF),
     );
     let not_clear = bcx.ins().bnot(clear);
     let base = bcx.ins().band(*rflags, not_clear);
@@ -621,7 +622,7 @@ pub(super) fn lower_sse_bitwise(
         }
         _ => return Err("sse bitwise src".into()),
     };
-    let (lo, hi) = if jit_simd_enabled() {
+    let (lo, hi) = if JitConfig::get().simd_enabled() {
         let a = pair_to_i8x16(bcx, mem.flags, a_lo, a_hi);
         let b = pair_to_i8x16(bcx, mem.flags, b_lo, b_hi);
         let c = match op {
@@ -693,7 +694,7 @@ pub(super) fn lower_sse_scalar_fp(
         _ => return Err("sse scalar fp src".into()),
     };
     let _ = b_hi;
-    let (new_lo, new_hi) = if jit_simd_enabled() {
+    let (new_lo, new_hi) = if JitConfig::get().simd_enabled() {
         if width == FloatWidth::F64 {
             let fa = bcx.ins().bitcast(types::F64, mem.flags, a_lo);
             let fb = bcx.ins().bitcast(types::F64, mem.flags, b_lo);
@@ -757,7 +758,7 @@ pub(super) fn lower_sse_packed_fp(
         }
         _ => return Err("sse packed fp src".into()),
     };
-    if jit_simd_enabled() {
+    if JitConfig::get().simd_enabled() {
         let a8 = pair_to_i8x16(bcx, mem.flags, a_lo, a_hi);
         let b8 = pair_to_i8x16(bcx, mem.flags, b_lo, b_hi);
         let (lo, hi) = if width == FloatWidth::F64 {

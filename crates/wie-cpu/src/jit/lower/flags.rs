@@ -11,7 +11,7 @@ use super::emit::MemEnv;
 use super::gpr::{op_width_bits, read_op_mem, write_op_mem};
 use super::insn::PendingFlags;
 
-use crate::regs::rflags;
+use crate::regs::Rflags;
 use cranelift::prelude::*;
 use iced_x86::Instruction;
 
@@ -112,24 +112,24 @@ pub(super) fn sign_bit(bits: u32) -> u64 {
     1_u64 << bits.saturating_sub(1).min(63)
 }
 
-pub(super) fn flag_bit(bcx: &mut FunctionBuilder<'_>, flags: Value, bit: u64) -> Value {
-    let m = iconst_u64(bcx, bit);
+pub(super) fn flag_bit(bcx: &mut FunctionBuilder<'_>, flags: Value, bit: Rflags) -> Value {
+    let m = iconst_u64(bcx, u64::from(bit));
     bcx.ins().band(flags, m)
 }
 
 pub(super) fn replace_flag(
     bcx: &mut FunctionBuilder<'_>,
     flags: Value,
-    bit: u64,
+    bit: Rflags,
     on: Value,
 ) -> Value {
-    let clear = iconst_u64(bcx, !bit);
+    let clear = iconst_u64(bcx, !u64::from(bit));
     let base = bcx.ins().band(flags, clear);
     bcx.ins().bor(base, on)
 }
 
-pub(super) fn select_flag(bcx: &mut FunctionBuilder<'_>, cond: Value, bit: u64) -> Value {
-    let bit_v = iconst_u64(bcx, bit);
+pub(super) fn select_flag(bcx: &mut FunctionBuilder<'_>, cond: Value, bit: Rflags) -> Value {
+    let bit_v = iconst_u64(bcx, u64::from(bit));
     let zero = iconst_u64(bcx, 0);
     bcx.ins().select(cond, bit_v, zero)
 }
@@ -145,11 +145,11 @@ pub(super) fn pf_flag(bcx: &mut FunctionBuilder<'_>, result: Value) -> Value {
     let one = iconst_u64(bcx, 1);
     let odd = bcx.ins().band(x, one);
     let is_even = bcx.ins().icmp_imm(IntCC::Equal, odd, 0);
-    select_flag(bcx, is_even, rflags::PF)
+    select_flag(bcx, is_even, Rflags::PF)
 }
 
-pub(super) fn clear_flags(bcx: &mut FunctionBuilder<'_>, old: Value, bits: u64) -> Value {
-    let m = iconst_u64(bcx, !bits);
+pub(super) fn clear_flags(bcx: &mut FunctionBuilder<'_>, old: Value, bits: Rflags) -> Value {
+    let m = iconst_u64(bcx, !u64::from(bits));
     bcx.ins().band(old, m)
 }
 
@@ -160,13 +160,13 @@ pub(super) fn flags_zs_pf(
     bits: u32,
 ) -> Value {
     let r = mask_width(bcx, result, bits);
-    let f = clear_flags(bcx, old, rflags::ZF | rflags::SF | rflags::PF);
+    let f = clear_flags(bcx, old, Rflags::ZF | Rflags::SF | Rflags::PF);
     let is_z = bcx.ins().icmp_imm(IntCC::Equal, r, 0);
-    let zf = select_flag(bcx, is_z, rflags::ZF);
+    let zf = select_flag(bcx, is_z, Rflags::ZF);
     let sb = iconst_u64(bcx, sign_bit(bits));
     let sign = bcx.ins().band(r, sb);
     let is_s = bcx.ins().icmp_imm(IntCC::NotEqual, sign, 0);
-    let sf = select_flag(bcx, is_s, rflags::SF);
+    let sf = select_flag(bcx, is_s, Rflags::SF);
     let pf = pf_flag(bcx, r);
     let f = bcx.ins().bor(f, zf);
     let f = bcx.ins().bor(f, sf);
@@ -182,7 +182,7 @@ pub(super) fn flags_logic(
     let f = clear_flags(
         bcx,
         old,
-        rflags::ZF | rflags::SF | rflags::PF | rflags::CF | rflags::OF,
+        Rflags::ZF | Rflags::SF | Rflags::PF | Rflags::CF | Rflags::OF,
     );
     flags_zs_pf(bcx, f, result, bits)
 }
@@ -201,10 +201,10 @@ pub(super) fn flags_add(
     let f = clear_flags(
         bcx,
         old,
-        rflags::CF | rflags::ZF | rflags::SF | rflags::PF | rflags::OF | rflags::AF,
+        Rflags::CF | Rflags::ZF | Rflags::SF | Rflags::PF | Rflags::OF | Rflags::AF,
     );
     let cf_cond = bcx.ins().icmp(IntCC::UnsignedLessThan, r, d);
-    let cf = select_flag(bcx, cf_cond, rflags::CF);
+    let cf = select_flag(bcx, cf_cond, Rflags::CF);
     let f = bcx.ins().bor(f, cf);
     let f = flags_zs_pf(bcx, f, r, bits);
     let sb = iconst_u64(bcx, sign_bit(bits));
@@ -213,14 +213,14 @@ pub(super) fn flags_add(
     let both = bcx.ins().band(dr, sr);
     let of_bits = bcx.ins().band(both, sb);
     let of_cond = bcx.ins().icmp_imm(IntCC::NotEqual, of_bits, 0);
-    let of = select_flag(bcx, of_cond, rflags::OF);
+    let of = select_flag(bcx, of_cond, Rflags::OF);
     let f = bcx.ins().bor(f, of);
     let x = bcx.ins().bxor(d, s);
     let y = bcx.ins().bxor(x, r);
     let ten = iconst_u64(bcx, 0x10);
     let af_b = bcx.ins().band(y, ten);
     let af_cond = bcx.ins().icmp_imm(IntCC::NotEqual, af_b, 0);
-    let af = select_flag(bcx, af_cond, rflags::AF);
+    let af = select_flag(bcx, af_cond, Rflags::AF);
     bcx.ins().bor(f, af)
 }
 
@@ -238,10 +238,10 @@ pub(super) fn flags_sub(
     let f = clear_flags(
         bcx,
         old,
-        rflags::CF | rflags::ZF | rflags::SF | rflags::PF | rflags::OF | rflags::AF,
+        Rflags::CF | Rflags::ZF | Rflags::SF | Rflags::PF | Rflags::OF | Rflags::AF,
     );
     let cf_cond = bcx.ins().icmp(IntCC::UnsignedLessThan, d, s);
-    let cf = select_flag(bcx, cf_cond, rflags::CF);
+    let cf = select_flag(bcx, cf_cond, Rflags::CF);
     let f = bcx.ins().bor(f, cf);
     let f = flags_zs_pf(bcx, f, r, bits);
     let sb = iconst_u64(bcx, sign_bit(bits));
@@ -250,13 +250,13 @@ pub(super) fn flags_sub(
     let both = bcx.ins().band(ds, dr);
     let of_bits = bcx.ins().band(both, sb);
     let of_cond = bcx.ins().icmp_imm(IntCC::NotEqual, of_bits, 0);
-    let of = select_flag(bcx, of_cond, rflags::OF);
+    let of = select_flag(bcx, of_cond, Rflags::OF);
     let f = bcx.ins().bor(f, of);
     let x = bcx.ins().bxor(d, s);
     let y = bcx.ins().bxor(x, r);
     let ten = iconst_u64(bcx, 0x10);
     let af_b = bcx.ins().band(y, ten);
     let af_cond = bcx.ins().icmp_imm(IntCC::NotEqual, af_b, 0);
-    let af = select_flag(bcx, af_cond, rflags::AF);
+    let af = select_flag(bcx, af_cond, Rflags::AF);
     bcx.ins().bor(f, af)
 }

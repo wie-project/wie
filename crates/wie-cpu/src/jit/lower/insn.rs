@@ -32,7 +32,7 @@ use super::sse_fp::{
 use super::{SseBit, lower_cmov, lower_setcc, lower_shift_lazy};
 
 use crate::exec::{self};
-use crate::regs::rflags;
+use crate::regs::Rflags;
 use cranelift::prelude::*;
 use iced_x86::{Instruction, Mnemonic};
 
@@ -108,15 +108,15 @@ pub(super) fn flush_pending(
         }
         PendingFlags::Inc { a, res, bits } => {
             let one = iconst_u64(bcx, 1);
-            let cf = flag_bit(bcx, *rflags, rflags::CF);
+            let cf = flag_bit(bcx, *rflags, Rflags::CF);
             let with = flags_add(bcx, *rflags, a, one, res, bits);
-            *rflags = replace_flag(bcx, with, rflags::CF, cf);
+            *rflags = replace_flag(bcx, with, Rflags::CF, cf);
         }
         PendingFlags::Dec { a, res, bits } => {
             let one = iconst_u64(bcx, 1);
-            let cf = flag_bit(bcx, *rflags, rflags::CF);
+            let cf = flag_bit(bcx, *rflags, Rflags::CF);
             let with = flags_sub(bcx, *rflags, a, one, res, bits);
-            *rflags = replace_flag(bcx, with, rflags::CF, cf);
+            *rflags = replace_flag(bcx, with, Rflags::CF, cf);
         }
         PendingFlags::Shift {
             kind,
@@ -148,7 +148,7 @@ pub(super) fn materialize_shift_flags(
     let sign = iconst_u64(bcx, 1_u64 << bits.saturating_sub(1).min(63));
     let sb = iconst_u64(bcx, u64::from(bits.saturating_sub(1)));
     // Capture old CF before the match (needed by Rcl/Rcr).
-    let old_cf = flag_bit(bcx, old_rflags, rflags::CF);
+    let old_cf = flag_bit(bcx, old_rflags, Rflags::CF);
 
     let cf_bit = match kind {
         ShiftKind::Shl => {
@@ -218,15 +218,15 @@ pub(super) fn materialize_shift_flags(
             bcx.ins().icmp(IntCC::NotEqual, cf_bit, hi_bit)
         }
     };
-    let of_new = select_flag(bcx, of_cond, rflags::OF);
-    let old_of = flag_bit(bcx, old_rflags, rflags::OF);
+    let of_new = select_flag(bcx, of_cond, Rflags::OF);
+    let old_of = flag_bit(bcx, old_rflags, Rflags::OF);
     let of_merged = bcx.ins().select(is_one, of_new, old_of);
 
     let mut new_flags = old_rflags;
     let cf_set = bcx.ins().icmp_imm(IntCC::NotEqual, cf_bit, 0);
-    let cf_on = select_flag(bcx, cf_set, rflags::CF);
-    new_flags = replace_flag(bcx, new_flags, rflags::CF, cf_on);
-    new_flags = replace_flag(bcx, new_flags, rflags::OF, of_merged);
+    let cf_on = select_flag(bcx, cf_set, Rflags::CF);
+    new_flags = replace_flag(bcx, new_flags, Rflags::CF, cf_on);
+    new_flags = replace_flag(bcx, new_flags, Rflags::OF, of_merged);
     if matches!(
         kind,
         ShiftKind::Shl | ShiftKind::Shr | ShiftKind::Sar | ShiftKind::Rcl | ShiftKind::Rcr
@@ -275,13 +275,13 @@ pub(super) fn lower_insn(
         Mnemonic::Leave => lower_leave(bcx, gpr, dirty, *rflags, mem, instr.ip()),
         Mnemonic::Cld => {
             // DF only; pending ALU flags stay deferred.
-            *rflags = clear_flags(bcx, *rflags, rflags::DF);
+            *rflags = clear_flags(bcx, *rflags, Rflags::DF);
             Ok(())
         }
         Mnemonic::Std => {
             // Set DF; preserve all other flags (including deferred pending).
-            let bit = iconst_u64(bcx, rflags::DF);
-            let cleared = clear_flags(bcx, *rflags, rflags::DF);
+            let bit = iconst_u64(bcx, u64::from(Rflags::DF));
+            let cleared = clear_flags(bcx, *rflags, Rflags::DF);
             *rflags = bcx.ins().bor(cleared, bit);
             Ok(())
         }

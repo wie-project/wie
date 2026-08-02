@@ -32,7 +32,7 @@ pub use mem::{
     MmapArenaBackend, PAGE_SIZE, PAGE_SIZE_USIZE, PageMap, PageRun, PageState, RegionKind,
     RegionTable, VadNode, VadTable, align_down, align_up, win32_from_cpu_error,
 };
-pub use regs::{RegFile, ThreadContext};
+pub use regs::{RegFile, Rflags, ThreadContext};
 /// SIMD pixel helpers for the GUI present path (NEON on aarch64).
 pub use simd::{blend_0rgb_4x, fill_0rgb_4x, mask_bgra_to_0rgb, mul_0rgb_4x, stretch_nearest};
 
@@ -173,6 +173,13 @@ pub enum CpuError {
     /// Integer divide-by-zero at the given instruction pointer.
     #[error("integer divide by zero at rip={0:#x}")]
     DivideByZero(u64),
+    /// Win32 failure: `GetLastError` code plus a static context message.
+    ///
+    /// The typed counterpart to the legacy `win32(N): …` string form that
+    /// [`mem::win32_from_cpu_error`] parses — extraction is a direct field
+    /// read instead of a string scan.
+    #[error("win32({0}): {1}")]
+    Win32(u32, &'static str),
 }
 
 /// Outcome of running until a code hook or stop condition.
@@ -292,7 +299,8 @@ pub trait CpuEngine: Send {
     /// `VirtualAlloc` — reserve and/or commit private guest pages.
     ///
     /// # Errors
-    /// Invalid flags/address or out of guest VA (`CpuError` carries `win32(N):` prefix).
+    /// Invalid flags/address or out of guest VA (`CpuError::Win32` carries the
+    /// `GetLastError` code).
     fn virtual_alloc(
         &mut self,
         _addr: u64,
@@ -300,9 +308,7 @@ pub trait CpuEngine: Send {
         _alloc_type: u32,
         _protect: u32,
     ) -> Result<u64, CpuError> {
-        Err(CpuError::Message(
-            "win32(120): VirtualAlloc not implemented".into(),
-        ))
+        Err(CpuError::Win32(120, "VirtualAlloc not implemented"))
     }
 
     /// `VirtualFree` — decommit or release.
@@ -310,9 +316,7 @@ pub trait CpuEngine: Send {
     /// # Errors
     /// Invalid free type / address.
     fn virtual_free(&mut self, _addr: u64, _size: usize, _free_type: u32) -> Result<(), CpuError> {
-        Err(CpuError::Message(
-            "win32(120): VirtualFree not implemented".into(),
-        ))
+        Err(CpuError::Win32(120, "VirtualFree not implemented"))
     }
 
     /// `VirtualProtect` — change page protect; returns previous protect of the first page.
@@ -325,9 +329,7 @@ pub trait CpuEngine: Send {
         _size: usize,
         _new_protect: u32,
     ) -> Result<u32, CpuError> {
-        Err(CpuError::Message(
-            "win32(120): VirtualProtect not implemented".into(),
-        ))
+        Err(CpuError::Win32(120, "VirtualProtect not implemented"))
     }
 
     /// `VirtualQuery` — describe the page state at `addr`.

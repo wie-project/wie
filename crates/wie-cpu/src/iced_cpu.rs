@@ -160,7 +160,9 @@ impl IcedCpu {
             }
             StepResult::InvalidMemory(inv) => Err(CpuError::Message(format!(
                 "invalid memory {} at {:#x} size={}",
-                inv.access_type, inv.address, inv.size
+                inv.access_type.as_i32(),
+                inv.address,
+                inv.size
             ))),
         }
     }
@@ -342,7 +344,7 @@ impl CpuEngine for IcedCpu {
                         invalid_memory: InvalidMemoryAccess {
                             hit: true,
                             exception_code: crate::exception_code::ACCESS_VIOLATION,
-                            access_type: inv.access_type,
+                            access_type: inv.access_type.as_i32(),
                             address: inv.address,
                             size: inv.size,
                             value: inv.value,

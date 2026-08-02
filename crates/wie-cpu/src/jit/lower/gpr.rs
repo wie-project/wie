@@ -22,7 +22,7 @@ use super::{
 use super::super::block::mem_width_bytes;
 
 use crate::mem::PAGE_SIZE;
-use crate::regs::rflags;
+use crate::regs::Rflags;
 use cranelift::codegen::ir::BlockArg;
 use cranelift::prelude::*;
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
@@ -51,8 +51,8 @@ pub(super) fn bool_to_i64(bcx: &mut FunctionBuilder<'_>, b: Value) -> Value {
     bcx.ins().select(b, one, zero)
 }
 
-pub(super) fn flag_set(bcx: &mut FunctionBuilder<'_>, rflags: Value, bit: u64) -> Value {
-    let m = iconst_u64(bcx, bit);
+pub(super) fn flag_set(bcx: &mut FunctionBuilder<'_>, rflags: Value, bit: Rflags) -> Value {
+    let m = iconst_u64(bcx, u64::from(bit));
     let v = bcx.ins().band(rflags, m);
     bcx.ins().icmp_imm(IntCC::NotEqual, v, 0)
 }
@@ -598,8 +598,8 @@ pub(super) fn lower_popfq(
     gpr[4] = new_rsp;
     mark_dirty(dirty, 4);
     // Keep ALWAYS1 set; clear it first then OR so the bit is definite.
-    let cleared = clear_flags(bcx, val, rflags::ALWAYS1);
-    let always1 = iconst_u64(bcx, rflags::ALWAYS1);
+    let cleared = clear_flags(bcx, val, Rflags::ALWAYS1);
+    let always1 = iconst_u64(bcx, u64::from(Rflags::ALWAYS1));
     *rflags = bcx.ins().bor(cleared, always1);
     Ok(())
 }
@@ -755,7 +755,7 @@ pub(super) fn lower_arith(
     let b_raw = read_op_mem(bcx, instr, 1, gpr, *rflags, mem)?;
     let a = mask_width(bcx, a_raw, bits);
     let b = mask_width(bcx, b_raw, bits);
-    let cf_val = flag_bit(bcx, *rflags, rflags::CF);
+    let cf_val = flag_bit(bcx, *rflags, Rflags::CF);
     let res = match op {
         Arith::Add => bcx.ins().iadd(a, b),
         Arith::Adc => {
@@ -812,8 +812,8 @@ pub(super) fn flags_sbb(
     };
     // For bits < 64, s_plus_cf may have bits above `bits` set (when s=mask and cf=1).
     // `d` is masked so d < s_plus_cf is correct when s_plus_cf > mask.
-    let cf_on = select_flag(bcx, cf_b, rflags::CF);
-    f = replace_flag(bcx, f, rflags::CF, cf_on);
+    let cf_on = select_flag(bcx, cf_b, Rflags::CF);
+    f = replace_flag(bcx, f, Rflags::CF, cf_on);
     f
 }
 
@@ -840,8 +840,8 @@ pub(super) fn flags_adc(
         let any = bcx.ins().bor(c1i, c2i);
         let zero = iconst_u64(bcx, 0);
         let any_b = bcx.ins().icmp(IntCC::NotEqual, any, zero);
-        let cf_on = select_flag(bcx, any_b, rflags::CF);
-        f = replace_flag(bcx, f, rflags::CF, cf_on);
+        let cf_on = select_flag(bcx, any_b, Rflags::CF);
+        f = replace_flag(bcx, f, Rflags::CF, cf_on);
     } else {
         let t = bcx.ins().iadd(d, s);
         let sum = bcx.ins().iadd(t, cf);
@@ -849,8 +849,8 @@ pub(super) fn flags_adc(
         let shifted = bcx.ins().ushr(sum, sh);
         let zero = iconst_u64(bcx, 0);
         let cf_b = bcx.ins().icmp(IntCC::NotEqual, shifted, zero);
-        let cf_on = select_flag(bcx, cf_b, rflags::CF);
-        f = replace_flag(bcx, f, rflags::CF, cf_on);
+        let cf_on = select_flag(bcx, cf_b, Rflags::CF);
+        f = replace_flag(bcx, f, Rflags::CF, cf_on);
     }
     f
 }
@@ -895,10 +895,10 @@ pub(super) fn lower_imul(
         (lo, ov)
     };
     write_op_mem(bcx, instr, 0, gpr, dirty, *rflags, mem, lo, bits)?;
-    let cf_on = select_flag(bcx, overflow, rflags::CF);
-    let of_on = select_flag(bcx, overflow, rflags::OF);
-    let f = replace_flag(bcx, *rflags, rflags::CF, cf_on);
-    *rflags = replace_flag(bcx, f, rflags::OF, of_on);
+    let cf_on = select_flag(bcx, overflow, Rflags::CF);
+    let of_on = select_flag(bcx, overflow, Rflags::OF);
+    let f = replace_flag(bcx, *rflags, Rflags::CF, cf_on);
+    *rflags = replace_flag(bcx, f, Rflags::OF, of_on);
     Ok(())
 }
 
@@ -1021,8 +1021,8 @@ pub(super) fn lower_bit_test_op(
     let one = iconst_u64(bcx, 1);
     let bit_val = bcx.ins().band(shifted, one);
     let is_set = bcx.ins().icmp_imm(IntCC::NotEqual, bit_val, 0);
-    let cf_on = select_flag(bcx, is_set, rflags::CF);
-    *rflags = replace_flag(bcx, *rflags, rflags::CF, cf_on);
+    let cf_on = select_flag(bcx, is_set, Rflags::CF);
+    *rflags = replace_flag(bcx, *rflags, Rflags::CF, cf_on);
 
     // For Bts/Btr/Btc, write back the modified value.
     let mnemonic = instr.mnemonic();
@@ -1124,8 +1124,8 @@ pub(super) fn lower_cmpxchg(
     write_gpr(bcx, gpr, dirty, Register::RAX, new_rax)?;
 
     // Set ZF based on comparison
-    let zf_on = select_flag(bcx, eq, rflags::ZF);
-    *rflags = replace_flag(bcx, *rflags, rflags::ZF, zf_on);
+    let zf_on = select_flag(bcx, eq, Rflags::ZF);
+    *rflags = replace_flag(bcx, *rflags, Rflags::ZF, zf_on);
     // Architectural: CF, OF, SF, AF, PF may be set based on the comparison but
     // Intel docs mark them as undefined for CmpXchg.
     Ok(())
@@ -1173,8 +1173,8 @@ pub(super) fn lower_bsr(
     write_gpr(bcx, gpr, dirty, instr.op_register(0), result)?;
 
     // Set ZF flag
-    let zf_on = select_flag(bcx, is_zero, rflags::ZF);
-    *rflags = replace_flag(bcx, *rflags, rflags::ZF, zf_on);
+    let zf_on = select_flag(bcx, is_zero, Rflags::ZF);
+    *rflags = replace_flag(bcx, *rflags, Rflags::ZF, zf_on);
     Ok(())
 }
 
