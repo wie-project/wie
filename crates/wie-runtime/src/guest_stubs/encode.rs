@@ -1,3 +1,5 @@
+use crate::asm_utils::patch_rel8;
+
 /// `_initterm` / `_initterm_e` body — iterate function-pointer range and call.
 ///
 /// Win64: `RCX=first`, `RDX=last` (half-open). Each entry is `void (*)()` or
@@ -52,10 +54,10 @@ pub(super) fn encode_initterm(check_status: bool) -> Vec<u8> {
         buf.extend_from_slice(&[0x5e, 0x5b, 0xc3]); // pop rsi; pop rbx; ret
         let fail_at = buf.len();
         buf.extend_from_slice(&[0x5e, 0x5b, 0xc3]); // pop rsi; pop rbx; ret (keep eax)
-        patch_rel8(&mut buf, jae_imm, done_at);
-        patch_rel8(&mut buf, jz_imm, loop_at);
-        patch_rel8(&mut buf, jnz_imm, fail_at);
-        patch_rel8(&mut buf, jmp_imm, loop_at);
+        patch_rel8(&mut buf, jae_imm, jae_imm + 1, done_at);
+        patch_rel8(&mut buf, jz_imm, jz_imm + 1, loop_at);
+        patch_rel8(&mut buf, jnz_imm, jnz_imm + 1, fail_at);
+        patch_rel8(&mut buf, jmp_imm, jmp_imm + 1, loop_at);
     } else {
         // jmp .loop
         let jmp_imm = buf.len() + 1;
@@ -63,9 +65,9 @@ pub(super) fn encode_initterm(check_status: bool) -> Vec<u8> {
         let done_at = buf.len();
         buf.extend_from_slice(&[0x31, 0xc0]); // xor eax, eax
         buf.extend_from_slice(&[0x5e, 0x5b, 0xc3]); // pop rsi; pop rbx; ret
-        patch_rel8(&mut buf, jae_imm, done_at);
-        patch_rel8(&mut buf, jz_imm, loop_at);
-        patch_rel8(&mut buf, jmp_imm, loop_at);
+        patch_rel8(&mut buf, jae_imm, jae_imm + 1, done_at);
+        patch_rel8(&mut buf, jz_imm, jz_imm + 1, loop_at);
+        patch_rel8(&mut buf, jmp_imm, jmp_imm + 1, loop_at);
     }
     buf
 }
@@ -183,11 +185,11 @@ pub(super) fn encode_dialog_box_param(
     buf.push(0x5b);
     buf.push(0xc3);
 
-    patch_rel8(&mut buf, jnz_created, created_at);
-    patch_rel8(&mut buf, jmp_done, done_at);
-    patch_rel8(&mut buf, jz_quit, quit_at);
-    patch_rel8(&mut buf, jnz_loop, loop_at);
-    patch_rel8(&mut buf, jmp_loop, loop_at);
+    patch_rel8(&mut buf, jnz_created, jnz_created + 1, created_at);
+    patch_rel8(&mut buf, jmp_done, jmp_done + 1, done_at);
+    patch_rel8(&mut buf, jz_quit, jz_quit + 1, quit_at);
+    patch_rel8(&mut buf, jnz_loop, jnz_loop + 1, loop_at);
+    patch_rel8(&mut buf, jmp_loop, jmp_loop + 1, loop_at);
     buf
 }
 
@@ -203,7 +205,7 @@ pub(super) fn encode_fls_get(table_va: u64, max_slots: u32) -> Vec<u8> {
     buf.push(0xc3);
     let zero_at = buf.len();
     buf.extend_from_slice(&[0x31, 0xc0, 0xc3]);
-    patch_rel8(&mut buf, jae_imm, zero_at);
+    patch_rel8(&mut buf, jae_imm, jae_imm + 1, zero_at);
     buf
 }
 
@@ -220,7 +222,7 @@ pub(super) fn encode_fls_set(table_va: u64, max_slots: u32) -> Vec<u8> {
     buf.push(0xc3);
     let fail_at = buf.len();
     buf.extend_from_slice(&[0x31, 0xc0, 0xc3]);
-    patch_rel8(&mut buf, jae_imm, fail_at);
+    patch_rel8(&mut buf, jae_imm, jae_imm + 1, fail_at);
     buf
 }
 
@@ -239,7 +241,7 @@ pub(super) fn encode_load_u32_table(table_va: u64, max_index: u32) -> Vec<u8> {
     buf.push(0xc3);
     let zero_at = buf.len();
     buf.extend_from_slice(&[0x31, 0xc0, 0xc3]);
-    patch_rel8(&mut buf, jae_imm, zero_at);
+    patch_rel8(&mut buf, jae_imm, jae_imm + 1, zero_at);
     buf
 }
 
@@ -267,7 +269,7 @@ pub(super) fn encode_copy_u64_to_ptr(slot_va: u64, ret_one: bool) -> Vec<u8> {
         buf.extend_from_slice(&[0xb8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1
     }
     buf.push(0xc3);
-    patch_rel8(&mut buf, jz_imm, skip_at);
+    patch_rel8(&mut buf, jz_imm, jz_imm + 1, skip_at);
     buf
 }
 
@@ -325,17 +327,8 @@ pub(super) fn encode_get_current_directory_w(cwd_blob_va: u64) -> Vec<u8> {
     let need_size = buf.len();
     buf.extend_from_slice(&[0x44, 0x89, 0xc8]); // mov eax, r9d
     buf.push(0xc3);
-    patch_rel8(&mut buf, jz1, need_size);
-    patch_rel8(&mut buf, jz2, need_size);
-    patch_rel8(&mut buf, jbe, need_size);
+    patch_rel8(&mut buf, jz1, jz1 + 1, need_size);
+    patch_rel8(&mut buf, jz2, jz2 + 1, need_size);
+    patch_rel8(&mut buf, jbe, jbe + 1, need_size);
     buf
-}
-
-fn patch_rel8(buf: &mut [u8], imm_at: usize, target: usize) {
-    let next_ip = imm_at + 1;
-    let rel = target as isize - next_ip as isize;
-    debug_assert!((-128..128).contains(&rel), "rel8 out of range: {rel}");
-    if let Some(slot) = buf.get_mut(imm_at) {
-        *slot = rel as i8 as u8;
-    }
 }

@@ -14,6 +14,7 @@
 //!    GDI/D3D allocations cannot collide with guest-side ones.
 //! 5. Large sizes / wrong heap handle / exotic flags fall back to the hooked host path.
 
+use crate::asm_utils::patch_rel32;
 use crate::hooks::RuntimeFakeApiEntry;
 use crate::memory::RuntimeMemoryLayout;
 use anyhow::{Context, Result};
@@ -105,11 +106,6 @@ pub(crate) fn install_guest_heap_accel(
         "installed guest heap acceleration"
     );
     Ok(config)
-}
-
-fn patch_rel32(code: &mut [u8], imm_at: usize, next_ip: usize, target: usize) {
-    let rel = target as i32 - next_ip as i32;
-    code[imm_at..imm_at + 4].copy_from_slice(&rel.to_le_bytes());
 }
 
 // --- HeapAlloc guest implementation ------------------------------------------------

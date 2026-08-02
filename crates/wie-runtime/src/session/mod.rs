@@ -5,11 +5,14 @@ mod init;
 mod menu;
 mod profile;
 mod pump;
+mod types;
 mod window;
 
 pub use self::menu::MenuNode;
 pub use self::profile::RuntimeProfile;
 pub use self::window::GuestHandle;
+
+pub(crate) use self::types::{GuestHwnd, GuestStackPtr, GuestTid, GuestVa};
 
 use crate::memory::RuntimeMemoryLayout;
 use crate::mt_runtime::ProcessResources;
@@ -112,8 +115,8 @@ fn materialize_crt_argv(
 pub struct RuntimeSession {
     /// CPU + WinAPI (single struct for both JIT and Iced).
     process: ProcessResources,
-    entry_point_va: u64,
-    initial_rsp: u64,
+    entry_point_va: GuestVa,
+    initial_rsp: GuestStackPtr,
     next_api_index: usize,
     no_hook_slices: usize,
     pending_callbacks: Vec<PendingGuestCallback>,
@@ -141,7 +144,7 @@ impl RuntimeSession {
     /// Returns the PE entry-point address associated with this session.
     #[must_use]
     pub fn entry_point_va(&self) -> u64 {
-        self.entry_point_va
+        self.entry_point_va.0
     }
 
     /// Sets the bottle root for guest `C:\…` → host `{root}/drive_c/…` mapping.
@@ -211,7 +214,7 @@ impl RuntimeSession {
     /// Returns the original stack pointer used to start the guest.
     #[must_use]
     pub fn initial_rsp(&self) -> u64 {
-        self.initial_rsp
+        self.initial_rsp.0
     }
 
     /// Returns the guest memory layout used by this session.
@@ -237,9 +240,15 @@ impl RuntimeSession {
     }
 
     /// Queues one deterministic USER32 message for the guest.
-    pub fn post_window_message(
+    ///
+    /// Internal seam for tests and future host automation; the interactive
+    /// presenter posts through [`GuestHandle::post_message`] instead.
+    /// No caller exists yet, so the newtyped signature is kept as the
+    /// reserved API (dead code under `-Dwarnings` until a caller lands).
+    #[allow(dead_code)]
+    pub(crate) fn post_window_message(
         &mut self,
-        window_handle: u64,
+        window_handle: GuestHwnd,
         message: u32,
         word_parameter: u64,
         long_parameter: u64,
@@ -252,7 +261,7 @@ impl RuntimeSession {
             .checked_add(1)
             .context("runtime message timestamp overflow")?;
         queue.messages.push(wie_winapi::QueuedWindowMessage {
-            window_handle: wie_winapi::handles::Hwnd::from(window_handle),
+            window_handle: wie_winapi::handles::Hwnd::from(window_handle.0),
             message,
             word_parameter,
             long_parameter,

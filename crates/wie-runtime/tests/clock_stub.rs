@@ -47,7 +47,9 @@ fn get_tick_count_is_a_guest_stub_not_a_host_stop() {
 
     let profile = session.profile();
     assert!(
-        !profile.by_export.contains_key("KERNEL32.dll!GetTickCount"),
+        !profile
+            .by_exports()
+            .contains_key("KERNEL32.dll!GetTickCount"),
         "GetTickCount caused a host stop — the in-guest table stub should absorb it"
     );
 }

@@ -3,6 +3,7 @@
 //! Used by guest I/O / heap / MBWC accelerators so each module does not
 //! reimplement the same rewire dance.
 
+use crate::asm_utils::clear_bit;
 use crate::hooks::RuntimeFakeApiEntry;
 use anyhow::{Context, Result};
 use wie_winapi::{encode_export, resolve_winapi_id};
@@ -81,10 +82,6 @@ pub(crate) fn clear_stop_bits(
         if bit_index >= fake_api_size {
             break;
         }
-        let byte = bit_index >> 3;
-        let bit = bit_index & 7;
-        if let Some(slot) = stop_bitmap.get_mut(byte) {
-            *slot &= !(1_u8 << bit);
-        }
+        clear_bit(stop_bitmap, bit_index);
     }
 }

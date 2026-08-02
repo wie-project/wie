@@ -7,6 +7,7 @@
 
 use crate::hooks::{SoftApiTable, resolve_fake_api_at};
 use crate::memory::RuntimeMemoryLayout;
+use crate::session::GuestTid;
 use anyhow::{Context, Result};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::thread::JoinHandle;
@@ -36,7 +37,7 @@ pub(crate) struct ProcessConfig {
     pub environment: wie_winapi::WinApiEnvironment,
     pub layout: RuntimeMemoryLayout,
     pub stop_bitmap: Arc<[u8]>,
-    pub primary_tid: u32,
+    pub primary_tid: GuestTid,
 }
 
 // ── ProcessResources: single struct for both JIT and Iced ──────────────
@@ -100,7 +101,7 @@ impl ProcessResources {
         &self.config.soft_apis
     }
     pub(crate) fn primary_tid(&self) -> u32 {
-        self.config.primary_tid
+        self.config.primary_tid.0
     }
 
     pub(crate) fn winapi_arc(&self) -> Arc<Mutex<WinApiState>> {

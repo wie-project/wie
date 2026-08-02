@@ -114,11 +114,11 @@ impl super::RuntimeSession {
                         self.entry_reached = true;
                         tracing::info!(
                             target: "wiegui",
-                            entry = self.entry_point_va,
+                            entry = self.entry_point_va.0,
                             "guest entry reached"
                         );
                     }
-                    self.entry_point_va
+                    self.entry_point_va.0
                 } else {
                     current_rip
                 }
@@ -143,7 +143,7 @@ impl super::RuntimeSession {
                 fake_api_end,
             );
             if let Some(t0) = emu_t0 {
-                self.profile.emu_ns = self.profile.emu_ns.saturating_add(t0.elapsed().as_nanos());
+                self.profile.add_emu_ns(t0.elapsed().as_nanos());
             }
 
             {
@@ -389,14 +389,11 @@ impl super::RuntimeSession {
                             "host API stop"
                         );
                         if let Some(t0) = resolve_t0 {
-                            self.profile.resolve_ns = self
-                                .profile
-                                .resolve_ns
-                                .saturating_add(t0.elapsed().as_nanos());
+                            self.profile.add_resolve_ns(t0.elapsed().as_nanos());
                         }
 
                         if self.profile_enabled {
-                            self.profile.host_stops = self.profile.host_stops.saturating_add(1);
+                            self.profile.inc_host_stops();
                         }
 
                         let export_key = if self.profile_enabled {
@@ -419,26 +416,6 @@ impl super::RuntimeSession {
                             }
                         }
 
-                        let mut record_handler = |ns: u128, noisy: bool| {
-                            if !self.profile_enabled {
-                                return;
-                            }
-                            self.profile.handler_ns = self.profile.handler_ns.saturating_add(ns);
-                            if noisy {
-                                self.profile.noisy_calls =
-                                    self.profile.noisy_calls.saturating_add(1);
-                            } else {
-                                self.profile.charged_calls =
-                                    self.profile.charged_calls.saturating_add(1);
-                            }
-                            if let Some(key) = export_key.as_ref() {
-                                let entry =
-                                    self.profile.by_export.entry(key.clone()).or_insert((0, 0));
-                                entry.0 = entry.0.saturating_add(1);
-                                entry.1 = entry.1.saturating_add(ns);
-                            }
-                        };
-
                         if resolved.traits.exit_process() {
                             let handler_t0 = self.profile_enabled.then(Instant::now);
                             let exit_code_raw = engine
@@ -456,7 +433,11 @@ impl super::RuntimeSession {
                                 return_address: None,
                             });
                             if let Some(t0) = handler_t0 {
-                                record_handler(t0.elapsed().as_nanos(), false);
+                                self.profile.record_handler(
+                                    t0.elapsed().as_nanos(),
+                                    false,
+                                    export_key.as_deref(),
+                                );
                             }
                             winapi_state.kernel.sync.process_dying = true;
                             break_term =
@@ -468,7 +449,11 @@ impl super::RuntimeSession {
                                 .return_from_win64_api(0)
                                 .context("failed to return from fast synchronization API")?;
                             if let Some(t0) = handler_t0 {
-                                record_handler(t0.elapsed().as_nanos(), true);
+                                self.profile.record_handler(
+                                    t0.elapsed().as_nanos(),
+                                    true,
+                                    export_key.as_deref(),
+                                );
                             }
                             noisy_api = noisy_api.saturating_add(1);
                             // publish last error
@@ -497,7 +482,11 @@ impl super::RuntimeSession {
                                 wie_winapi::kernel32::handle_heap_alloc(&mut ctx)?;
                             }
                             if let Some(t0) = handler_t0 {
-                                record_handler(t0.elapsed().as_nanos(), true);
+                                self.profile.record_handler(
+                                    t0.elapsed().as_nanos(),
+                                    true,
+                                    export_key.as_deref(),
+                                );
                             }
                             noisy_api = noisy_api.saturating_add(1);
                             let err = winapi_state.process.last_error;
@@ -525,7 +514,11 @@ impl super::RuntimeSession {
                                 wie_winapi::kernel32::handle_heap_free(&mut ctx)?;
                             }
                             if let Some(t0) = handler_t0 {
-                                record_handler(t0.elapsed().as_nanos(), true);
+                                self.profile.record_handler(
+                                    t0.elapsed().as_nanos(),
+                                    true,
+                                    export_key.as_deref(),
+                                );
                             }
                             noisy_api = noisy_api.saturating_add(1);
                             let err = winapi_state.process.last_error;
@@ -553,7 +546,11 @@ impl super::RuntimeSession {
                                 wie_winapi::kernel32::handle_multi_byte_to_wide_char(&mut ctx)?;
                             }
                             if let Some(t0) = handler_t0 {
-                                record_handler(t0.elapsed().as_nanos(), true);
+                                self.profile.record_handler(
+                                    t0.elapsed().as_nanos(),
+                                    true,
+                                    export_key.as_deref(),
+                                );
                             }
                             noisy_api = noisy_api.saturating_add(1);
                             quantum = Quantum::Continue;
@@ -576,10 +573,22 @@ impl super::RuntimeSession {
                             match dispatch_result {
                                 Ok(handler_result) => {
                                     if resolved.traits.noisy() {
-                                        record_handler(handler_ns, true);
+                                        if self.profile_enabled {
+                                            self.profile.record_handler(
+                                                handler_ns,
+                                                true,
+                                                export_key.as_deref(),
+                                            );
+                                        }
                                         noisy_api = noisy_api.saturating_add(1);
                                     } else {
-                                        record_handler(handler_ns, false);
+                                        if self.profile_enabled {
+                                            self.profile.record_handler(
+                                                handler_ns,
+                                                false,
+                                                export_key.as_deref(),
+                                            );
+                                        }
                                         charged_api = charged_api.saturating_add(1);
                                         events.push(EntryTraceEvent {
                                             index,
@@ -615,7 +624,13 @@ impl super::RuntimeSession {
                                     quantum = Quantum::Continue;
                                 }
                                 Err(error) => {
-                                    record_handler(handler_ns, false);
+                                    if self.profile_enabled {
+                                        self.profile.record_handler(
+                                            handler_ns,
+                                            false,
+                                            export_key.as_deref(),
+                                        );
+                                    }
                                     let control_signal =
                                         error.downcast_ref::<wie_winapi::WinApiControlSignal>();
                                     match control_signal {

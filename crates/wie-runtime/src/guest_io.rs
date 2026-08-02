@@ -34,6 +34,7 @@
 //! **ReadFile host**, **Seek+GetFileSize guest**. `WIE_GUEST_IO=all` enables guest
 //! Read too (large ≥64 B still hybrid→host). `WIE_GUEST_IO=0` → all host.
 
+use crate::asm_utils::{patch_rel8, patch_rel32};
 use crate::hooks::RuntimeFakeApiEntry;
 use crate::memory::RuntimeMemoryLayout;
 use anyhow::{Context, Result};
@@ -343,17 +344,6 @@ fn build_readfile_bytes(table: u64, fallback: u64, max_slots: u64, slot_size: u6
     patch_rel32(&mut c, jmp_loop + 1, jmp_loop + 5, loop_pos);
 
     c
-}
-
-fn patch_rel32(code: &mut [u8], imm_at: usize, next_ip: usize, target: usize) {
-    let rel = target as i32 - next_ip as i32;
-    code[imm_at..imm_at + 4].copy_from_slice(&rel.to_le_bytes());
-}
-
-fn patch_rel8(code: &mut [u8], imm_at: usize, next_ip: usize, target: usize) {
-    let rel = target as isize - next_ip as isize;
-    assert!((-128..128).contains(&rel), "rel8 out of range {rel}");
-    code[imm_at] = rel as i8 as u8;
 }
 
 fn write_setfilepointer_impl(

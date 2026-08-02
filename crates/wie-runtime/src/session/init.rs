@@ -1,5 +1,6 @@
 use super::SessionOptions;
 use super::materialize_crt_argv;
+use super::types::{GuestStackPtr, GuestTid, GuestVa};
 use crate::hooks::{
     RuntimeFakeApiEntry, SoftApiTable, collect_stub_entries, resolve_import_fake_va,
 };
@@ -246,17 +247,47 @@ fn register_layout_regions(
 }
 
 /// Bundle of fields produced by session initialization (avoids 8-arg constructors).
-struct SessionInit {
-    engine: Box<dyn wie_cpu::CpuEngine>,
-    environment: wie_winapi::WinApiEnvironment,
-    winapi_state: wie_winapi::WinApiState,
-    soft_apis: SoftApiTable,
-    layout: RuntimeMemoryLayout,
-    stop_bitmap: Arc<[u8]>,
-    shared_jit: Option<Arc<wie_cpu::JitShared>>,
-    guest_mem: Option<Arc<RwLock<wie_cpu::GuestMemory>>>,
-    entry_point_va: u64,
-    initial_rsp: u64,
+pub(crate) struct SessionInit {
+    pub(crate) engine: Box<dyn wie_cpu::CpuEngine>,
+    pub(crate) environment: wie_winapi::WinApiEnvironment,
+    pub(crate) winapi_state: wie_winapi::WinApiState,
+    pub(crate) soft_apis: SoftApiTable,
+    pub(crate) layout: RuntimeMemoryLayout,
+    pub(crate) stop_bitmap: Arc<[u8]>,
+    pub(crate) shared_jit: Option<Arc<wie_cpu::JitShared>>,
+    pub(crate) guest_mem: Option<Arc<RwLock<wie_cpu::GuestMemory>>>,
+    pub(crate) entry_point_va: GuestVa,
+    pub(crate) initial_rsp: GuestStackPtr,
+}
+
+impl SessionInit {
+    /// Assemble an init bundle from the fully-constructed pieces.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        engine: Box<dyn wie_cpu::CpuEngine>,
+        environment: wie_winapi::WinApiEnvironment,
+        winapi_state: wie_winapi::WinApiState,
+        soft_apis: SoftApiTable,
+        layout: RuntimeMemoryLayout,
+        stop_bitmap: Arc<[u8]>,
+        shared_jit: Option<Arc<wie_cpu::JitShared>>,
+        guest_mem: Option<Arc<RwLock<wie_cpu::GuestMemory>>>,
+        entry_point_va: GuestVa,
+        initial_rsp: GuestStackPtr,
+    ) -> Self {
+        Self {
+            engine,
+            environment,
+            winapi_state,
+            soft_apis,
+            layout,
+            stop_bitmap,
+            shared_jit,
+            guest_mem,
+            entry_point_va,
+            initial_rsp,
+        }
+    }
 }
 
 impl super::RuntimeSession {
@@ -304,7 +335,7 @@ impl super::RuntimeSession {
             environment,
             layout,
             stop_bitmap,
-            primary_tid: wie_winapi::PRIMARY_THREAD_ID,
+            primary_tid: GuestTid::PRIMARY,
         };
         let shared_winapi = Arc::new(Mutex::new(winapi_state));
         // Clone the message-queue Arc so the host can post input without ever
@@ -892,7 +923,7 @@ impl super::RuntimeSession {
             winapi_state.process.main_module_host_dir = Some(parent.to_owned());
         }
 
-        let mut session = Self::from_init(SessionInit {
+        let mut session = Self::from_init(SessionInit::new(
             engine,
             environment,
             winapi_state,
@@ -901,25 +932,30 @@ impl super::RuntimeSession {
             stop_bitmap,
             shared_jit,
             guest_mem,
-            entry_point_va: image_summary.entry_point_va,
-            initial_rsp,
-        });
+            GuestVa(image_summary.entry_point_va),
+            GuestStackPtr(initial_rsp),
+        ));
         if session.profile_enabled {
-            session.profile.init_ns = t_init.elapsed().as_nanos();
-            session.profile.mem_backend = session
-                .process
-                .with_mut(|e, _| e.mem_backend_name().to_owned());
+            session.profile.set_init_ns(t_init.elapsed().as_nanos());
+            session.profile.set_mem_backend(
+                session
+                    .process
+                    .with_mut(|e, _| e.mem_backend_name().to_owned()),
+            );
             // Micro / default sessions: idle from env with Micro default (Yield).
-            session.profile.idle_policy =
+            session.profile.set_idle_policy(
                 wie_winapi::IdlePolicy::from_env_for(wie_winapi::IdleContext::Micro)
                     .as_str()
-                    .to_owned();
-            session.profile.jit = session.process.with_mut(|e, _| e.cpu_stats());
+                    .to_owned(),
+            );
+            session
+                .profile
+                .set_jit(session.process.with_mut(|e, _| e.cpu_stats()));
         }
         tracing::info!(
             target: "wiegui",
             path = %path.display(),
-            entry = session.entry_point_va,
+            entry = session.entry_point_va.0,
             "guest session started"
         );
         Ok(session)

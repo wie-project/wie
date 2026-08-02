@@ -253,7 +253,7 @@ pub(crate) fn default_winapi_state(
         },
         process: wie_winapi::ProcessState {
             last_error: 0,
-            next_registry_key_handle: 0x0000_0000_7000_0000,
+            next_registry_key_handle: wie_winapi::RegistryKeyHandle::from(0x0000_0000_7000_0000),
             registry_keys: Vec::new(),
             main_module_file_name: process.module_file_name.clone(),
             main_module_path: process.module_path.clone(),
@@ -274,13 +274,13 @@ pub(crate) fn default_winapi_state(
             executable_file_size,
             executable_file_bytes,
             executable_file_cursor: 0,
-            next_find_handle: 0x0000_0000_6200_0000,
+            next_find_handle: wie_winapi::FindFileHandle::from(0x0000_0000_6200_0000),
             find_handles: Vec::new(),
             host_file_mounts: Vec::new(),
             virtual_files: Vec::new(),
             open_files: std::collections::HashMap::new(),
-            next_file_handle: 0x0000_0000_6700_0001,
-            next_resource_handle: 0x0000_0000_6300_0000,
+            next_file_handle: wie_winapi::FileHandle::from(0x0000_0000_6700_0001),
+            next_resource_handle: wie_winapi::ResourceHandle::from(0x0000_0000_6300_0000),
             resources: Vec::new(),
             current_directory_wide: process.current_directory.encode_utf16().collect(),
             bottle_root: wie_winapi::bottle_root_from_env(),
@@ -309,7 +309,9 @@ pub(crate) fn default_winapi_state(
             loaded_modules: std::collections::HashMap::new(),
             import_resolver: None,
             get_proc_address_cache: std::collections::HashMap::with_capacity(64),
-            next_module_handle: wie_winapi::dll_loader::REAL_MODULE_HANDLE_BASE,
+            next_module_handle: wie_winapi::ModuleHandle::from(
+                wie_winapi::dll_loader::REAL_MODULE_HANDLE_BASE,
+            ),
         },
     })
 }

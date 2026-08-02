@@ -21,7 +21,10 @@ pub struct GuiControl {
     /// initial paint so a headless caller (e.g. `--screenshot`) can capture
     /// the frame.  When `true` (interactive GUI), it keeps waiting on the
     /// message signal until the guest exits.
-    pub wait_for_input: bool,
+    ///
+    /// Atomic: the host presenter may flip it from another thread; the GUI
+    /// loop only loads it (Relaxed — a control flag, ordering irrelevant).
+    pub wait_for_input: AtomicBool,
 }
 
 impl GuiControl {
@@ -30,7 +33,7 @@ impl GuiControl {
         Self {
             finished: AtomicBool::new(false),
             exit_code: AtomicI32::new(0),
-            wait_for_input: true,
+            wait_for_input: AtomicBool::new(true),
         }
     }
 }
@@ -83,7 +86,10 @@ pub fn run_windowed(session: &mut RuntimeSession, control: &GuiControl) -> Resul
                         continue;
                     }
                 }
-                if !control.wait_for_input {
+                if !control
+                    .wait_for_input
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
                     // Headless capture mode: the guest has painted its
                     // initial frame and gone idle; return so the caller can
                     // take the frame.

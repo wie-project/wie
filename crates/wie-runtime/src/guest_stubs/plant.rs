@@ -1,5 +1,6 @@
 //! Plants guest stub bodies into the fake-API mapping and builds the stop-bit mask.
 
+use crate::asm_utils::clear_bit;
 use anyhow::{Context, Result};
 
 use super::classify::classify_guest_stub;
@@ -106,12 +107,4 @@ pub(crate) fn plant_guest_stubs(
 
     tracing::debug!(planted, "planted in-guest WinAPI stubs");
     Ok(stop_bitmap)
-}
-
-fn clear_bit(bitmap: &mut [u8], bit_index: usize) {
-    let byte = bit_index / 8;
-    let bit = bit_index % 8;
-    if let Some(slot) = bitmap.get_mut(byte) {
-        *slot &= !(1_u8 << bit);
-    }
 }

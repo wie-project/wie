@@ -2,6 +2,7 @@
 //!
 //! CPU backends: see [`wie_cpu`] and `docs/WIE.md` (Cranelift JIT default; iced interpreter).
 
+mod asm_utils;
 mod guest_callback;
 mod guest_heap_accel;
 mod guest_io;
