@@ -12,6 +12,8 @@ If you want to help this project and offer your own improvements, corrections or
 
 4. **allow elements** (for example, too-many-arguments) should be minimal. In most cases, you can do without them.
 
+5. **File size** - Source files must stay under 1500 lines (target: 1000). Split by cohesion along existing seams — a file that needs to grow past the cap should become a module directory instead. Exceptions: test files and pure data tables (see docs/restructure-plan.md, ADR-002). Enforced by `scripts/check-file-sizes.sh` in the pre-PR checklist.
+
 After all the stages have been completed, you can safely send your pull request.
 
 ### Using AI in PR:

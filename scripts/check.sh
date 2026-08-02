@@ -5,6 +5,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+echo "=== file sizes ==="
+"$ROOT/scripts/check-file-sizes.sh"
+
 echo "=== cargo fmt ==="
 cargo fmt --all --check --manifest-path "$ROOT/Cargo.toml"
 
