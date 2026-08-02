@@ -54,13 +54,10 @@ WIE_JIT_MEM_TRACE=1 WIE_RUNTIME_PROFILE=1 ./target/release/wie-cli run real_exes
 
 | Topic | Doc |
 | ----- | --- |
-| Idle park | [`phase6-idle.md`](phase6-idle.md) |
-| Hardening / cutover | [`phase7-hardening.md`](phase7-hardening.md) |
-| Code invalidation | [`phase4-code-invalidation.md`](phase4-code-invalidation.md) |
-| Region pins / multi sticky | [`phase4-region-pins.md`](phase4-region-pins.md) |
-| Memory backends (historical) | [`phase2-mmap-backend.md`](phase2-mmap-backend.md) |
-| Full roadmap | [`../Optimization ROADMAP.md`](../Optimization%20ROADMAP.md) |
+| GUI program design | [`phase-gui.md`](phase-gui.md) |
+| Metal / D3D9 plan | [`gpu-rendering-plan.md`](gpu-rendering-plan.md) |
 | Multithreading | [`mt-threads.md`](mt-threads.md) |
+| Live progress log | [`../.slim/deepwork/gui-implementation.md`](../.slim/deepwork/gui-implementation.md) |
 
 ## Non-goals of this sheet
 
