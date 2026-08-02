@@ -55,6 +55,13 @@ mod imp {
     /// When `ENABLE_PROCESSED_INPUT` is off the byte `0x03` arrives through
     /// the normal `read` path anyway, so this handler is the fallback that
     /// catches the signal when `ISIG` is on.
+    ///
+    /// This handler must stay async-signal-safe, so it only does an atomic
+    /// store. In particular it must not call [`restore_now`]: that function
+    /// locks `SAVED_TERMIOS`, and taking a `std::sync::Mutex` inside a signal
+    /// handler can deadlock if the handler interrupts the thread holding the
+    /// lock. Restoring the terminal is deferred to [`drain_ctrlc`], which runs
+    /// in normal context on the guest thread.
     extern "C" fn on_sigint(_signal: libc::c_int) {
         CTRLC_PENDING.store(true, Ordering::Release);
     }
@@ -309,8 +316,20 @@ pub(crate) fn resize_pending() -> bool {
 ///
 /// Called from the input pump before reading terminal bytes, so even when a
 /// signal arrives between reads it is not lost.
+///
+/// The terminal is restored here, in normal context, the moment a Ctrl+C is
+/// recognized — before the guest ever sees the event. The `SIGINT` handler
+/// cannot do this (see [`on_sigint`] for the async-signal-safety argument),
+/// and leaving the host in cbreak mode after the guest exits would break the
+/// user's shell: echo disabled, no CR conversion. [`restore_now`] is
+/// idempotent and no-ops when raw mode was never entered, so this is safe on
+/// every drain.
 pub(crate) fn drain_ctrlc() -> bool {
-    CTRLC_PENDING.swap(false, Ordering::Acquire)
+    let pending = CTRLC_PENDING.swap(false, Ordering::Acquire);
+    if pending {
+        restore_now();
+    }
+    pending
 }
 
 /// True while the terminal is in cbreak mode.
