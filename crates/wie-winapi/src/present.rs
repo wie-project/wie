@@ -7,8 +7,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
-use crate::gdi32::IRect;
-
 /// Global gate for B9 frame-timing instrumentation (publish / blit-copy /
 /// host-present wall times). Set by `RuntimeSession` when `WIE_RUNTIME_PROFILE`
 /// is on (or via `enable_frame_timing`). A relaxed atomic load per frame is the
@@ -84,14 +82,6 @@ pub struct SurfaceFrame {
     pub height: u32,
     /// 0RGB pixel data, top-down.
     pub pixels: Arc<Vec<u32>>,
-    /// B3: optional dirty-rect (frame pixel coords, exclusive right/bottom).
-    ///
-    /// `None` = the whole frame changed (the consumer must copy everything).
-    /// `Some(rect)` = only `rect` is fresh; pixels outside it are stale in the
-    /// consumer's buffer from the previous present and must be left alone. The
-    /// buffer content is always the full composite — the region only tells the
-    /// consumer which part to re-copy.
-    pub region: Option<IRect>,
 }
 
 /// Per-window surface: pixel buffer + dimensions.
@@ -106,21 +96,14 @@ pub struct WindowSurface {
     /// paint hands the published buffer back (see [`PresentState::ensure_surface`]),
     /// so the composite always accumulates across publishes.
     pub pixels: Vec<u32>,
-    /// B3: accumulated update region (surface coords, exclusive edges) written
-    /// since the last publish. `None` = the whole surface is dirty (fresh or
-    /// reallocated buffer — a partial publish would show stale pixels outside
-    /// the region). `Some(rect)` = only `rect` is dirty; a degenerate (empty)
-    /// rect = nothing dirty since the last publish (the buffer is fully
-    /// up-to-date, so a partial publish can copy nothing).
-    pub dirty: Option<IRect>,
 }
 
 /// Manages per-window compositing surfaces and frame publishing.
 pub struct PresentState {
     /// Persistent composite surface per HWND (scratch buffer for accumulating blits).
-    pub surfaces: std::collections::HashMap<u64, WindowSurface>,
+    pub surfaces: std::collections::HashMap<crate::handles::Hwnd, WindowSurface>,
     /// Last published snapshot per HWND.
-    pub published: std::collections::HashMap<u64, SurfaceFrame>,
+    pub published: std::collections::HashMap<crate::handles::Hwnd, SurfaceFrame>,
     /// Monotonically increasing generation counter.
     pub generation: u64,
     /// Optional wake callback for the host presenter.
@@ -141,6 +124,17 @@ pub struct PresentState {
     pub present_ns: u128,
     /// B9: duration of the most recent host present (ns).
     pub present_ns_last: u128,
+    /// B3.6: HWNDs with deferred (coalesced) publishes pending since the last
+    /// drain. Handlers call [`Self::publish_deferred`] instead of
+    /// [`Self::publish`]; the runtime drains the set once per repaint cycle at
+    /// the empty-queue idle boundary (WaitingForMessage), so one WM_PAINT
+    /// cycle (BitBlt + control paints + captions) emits a single frame with
+    /// the union dirty region instead of one vsync-blocked present per paint
+    /// call. The set is deduplicated — the surface's `dirty` accumulator
+    /// already unions every write, and the pixel buffer stays in the surface
+    /// until the drain, so the published frame is byte-identical to the
+    /// per-call publishes it replaces.
+    pub pending_publishes: std::collections::HashSet<crate::handles::Hwnd>,
 }
 
 impl std::fmt::Debug for PresentState {
@@ -158,6 +152,7 @@ impl std::fmt::Debug for PresentState {
             .field("blit_copy_ns_last", &self.blit_copy_ns_last)
             .field("present_ns", &self.present_ns)
             .field("present_ns_last", &self.present_ns_last)
+            .field("pending_publishes", &self.pending_publishes.len())
             .finish()
     }
 }
@@ -179,12 +174,13 @@ impl PresentState {
             blit_copy_ns_last: 0,
             present_ns: 0,
             present_ns_last: 0,
+            pending_publishes: std::collections::HashSet::new(),
         }
     }
 
     /// Ensure a surface exists for `hwnd` with the given dimensions.
     /// Resizes or reallocates if dimensions changed; never shrinks.
-    pub fn ensure_surface(&mut self, hwnd: u64, width: u32, height: u32) {
+    pub fn ensure_surface(&mut self, hwnd: crate::handles::Hwnd, width: u32, height: u32) {
         let needed = usize::try_from(width.checked_mul(height).unwrap_or(0)).unwrap_or(0);
         // B1 double-buffer hand-back: a prior publish moved the painted buffer
         // into the published Arc, leaving the surface empty. Hand the buffer
@@ -207,69 +203,38 @@ impl PresentState {
             width,
             height,
             pixels: vec![0u32; needed],
-            // A brand-new buffer is blank — the whole surface must be published
-            // before any partial-region publish is allowed.
-            dirty: None,
         });
         // If dimensions changed, reallocate; grow when the buffer is too small
         // (matches the pre-B1 semantics — the recycled buffer may carry the
         // previous frame's size after a resize).
-        if entry.width != width || entry.height != height || entry.pixels.len() < needed {
+        if entry.width != width || entry.height != height {
+            // Publish-model rework (ora-5): the surface size changed — the old
+            // row-major buffer does not map onto the new dimensions. Reusing
+            // it (a plain `resize` keeps the first N elements) would surface
+            // misaligned stale pixels in the WS_CLIPCHILDREN-clipped child
+            // areas — vertical bands/lines through controls after a resize.
+            // Reallocate zeroed; the caller repaints the whole window, and
+            // every publish is full anyway.
             entry.width = width;
             entry.height = height;
+            entry.pixels = vec![0u32; needed];
+        } else if entry.pixels.len() < needed {
+            // Same dimensions but the buffer is too small (length normally
+            // tracks width*height); grow zeroed.
             entry.pixels.resize(needed, 0);
-            // B3 conservative fallback: after a realloc the buffer is not
-            // fully up-to-date — force a full publish so the consumer never
-            // shows stale pixels outside whatever the guest repaints.
-            entry.dirty = None;
-        }
-    }
-
-    /// B3: accumulate `rect` (surface coords, exclusive edges) into `hwnd`'s
-    /// pending update region. Unions with the existing region; a full-dirty
-    /// surface (`None`) stays full (a rect can never un-dirty it). The rect is
-    /// clipped to the surface bounds and degenerate rects are ignored.
-    pub fn mark_dirty(&mut self, hwnd: u64, rect: IRect) {
-        let Some(surface) = self.surfaces.get_mut(&hwnd) else {
-            return;
-        };
-        let (w, h) = (
-            i32::try_from(surface.width).unwrap_or(i32::MAX),
-            i32::try_from(surface.height).unwrap_or(i32::MAX),
-        );
-        let clipped = IRect {
-            left: rect.left.max(0),
-            top: rect.top.max(0),
-            right: rect.right.min(w),
-            bottom: rect.bottom.min(h),
-        };
-        if clipped.left >= clipped.right || clipped.top >= clipped.bottom {
-            return;
-        }
-        surface.dirty = match surface.dirty {
-            None => None,
-            // Degenerate (empty) rect = "nothing dirty yet" — start fresh.
-            Some(prev) if prev.width() <= 0 || prev.height() <= 0 => Some(clipped),
-            Some(prev) => Some(IRect {
-                left: prev.left.min(clipped.left),
-                top: prev.top.min(clipped.top),
-                right: prev.right.max(clipped.right),
-                bottom: prev.bottom.max(clipped.bottom),
-            }),
-        };
-    }
-
-    /// B3: conservative fallback — mark the whole `hwnd` surface dirty so the
-    /// next publish is full. Used by writers that cannot name their exact
-    /// region (e.g. text rendered straight into a window DC's surface).
-    pub fn mark_dirty_full(&mut self, hwnd: u64) {
-        if let Some(surface) = self.surfaces.get_mut(&hwnd) {
-            surface.dirty = None;
         }
     }
 
     /// Publish the current surface for `hwnd` as a snapshot.
-    pub fn publish(&mut self, hwnd: u64) {
+    ///
+    /// This is the immediate-publish escape hatch (`publish_now`): it moves
+    /// the surface buffer into the published Arc right away and fires the wake
+    /// callback synchronously. Paint handlers should prefer
+    /// [`Self::publish_deferred`] so the runtime emits at most one frame per
+    /// repaint cycle via [`Self::drain_pending_publishes`]; keep this
+    /// immediate path only where a frame must reach the host before the
+    /// dispatch ends (the D3D9 Present handler uses it directly).
+    pub fn publish(&mut self, hwnd: crate::handles::Hwnd) {
         let timing = frame_timing_enabled();
         let t0 = timing.then(Instant::now);
         let Some(surface) = self.surfaces.get_mut(&hwnd) else {
@@ -286,28 +251,14 @@ impl PresentState {
             let pixels: Arc<Vec<u32>> = Arc::from(std::mem::take(&mut surface.pixels));
             (surface.width, surface.height, pixels)
         };
-        // B3: derive the partial-update region from the accumulated dirty rect
-        // (the union of every write since the last publish). `None` = the whole
-        // surface changed → full frame. A rect covering >= 50% of the surface
-        // is not worth a partial copy (the consumer would copy most of the
-        // frame anyway) → full frame. A degenerate rect = nothing changed →
-        // copy nothing. The accumulator resets here so the next publish starts
-        // clean; the P0 hand-back restores the buffer, whose content is the
-        // full composite, so pixels outside the region stay up-to-date.
-        let region = match surface.dirty {
-            None => None,
-            Some(rect) if rect.width() <= 0 || rect.height() <= 0 => Some(rect),
-            Some(rect) => {
-                let area = i64::from(rect.width()).saturating_mul(i64::from(rect.height()));
-                let total = i64::from(surface.width).saturating_mul(i64::from(surface.height));
-                if area.saturating_mul(2) >= total {
-                    None
-                } else {
-                    Some(rect)
-                }
-            }
-        };
-        surface.dirty = Some(IRect::empty());
+        // Publish-model rework (ora-5): ALWAYS a full frame. The region-delta
+        // contract ("changes since the last guest publish") cannot survive B2
+        // present skipping — a publish that loses the event-loop race has its
+        // delta permanently absent from the wgpu staging texture, which holds
+        // the host's last present. Full publishes against the persistent
+        // staging (~4 MB at 1280×800, dwarfed by the vsync budget) make the
+        // staging invariant trivial: it always equals the last published
+        // frame.
         if let Some(t0) = t0 {
             let ns = t0.elapsed().as_nanos();
             self.publish_ns = self.publish_ns.saturating_add(ns);
@@ -317,10 +268,9 @@ impl PresentState {
         self.generation = self.generation.wrapping_add(1);
         tracing::debug!(
             target: "wiegui",
-            hwnd,
+            hwnd = hwnd.as_u64(),
             width,
             height,
-            region = ?region,
             generation = self.generation,
             publish_us = match t0 {
                 Some(t) => u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX),
@@ -335,7 +285,6 @@ impl PresentState {
                 width,
                 height,
                 pixels: Arc::new(pixels.to_vec()),
-                region,
             };
         }
         self.published.insert(
@@ -344,7 +293,6 @@ impl PresentState {
                 width,
                 height,
                 pixels,
-                region,
             },
         );
         if let Some(wake) = &self.wake {
@@ -363,10 +311,90 @@ impl PresentState {
         self.present_ns = self.present_ns.saturating_add(ns);
         self.present_ns_last = ns;
     }
+
+    /// B3.6: defer a publish for `hwnd` to the next
+    /// [`Self::drain_pending_publishes`] (one frame per repaint cycle).
+    ///
+    /// The surface keeps its pixel buffer and the `dirty` accumulator keeps
+    /// unioning writes until the drain, so a WM_PAINT cycle that paints in
+    /// several calls (BitBlt, window-DC text, child control paints) publishes
+    /// exactly once, with the union region and the fully-painted surface. The
+    /// HWND is deduplicated — repeated calls in one cycle are a no-op.
+    pub fn publish_deferred(&mut self, hwnd: crate::handles::Hwnd) {
+        self.pending_publishes.insert(hwnd);
+    }
+
+    /// B3.6: publish every HWND that deferred a frame since the last drain.
+    ///
+    /// Each pending HWND is published once, in insertion order; the dirty
+    /// accumulator carries the union of every write since the last publish, so
+    /// the emitted region is correct. Returns how many frames were published.
+    pub fn drain_pending_publishes(&mut self) -> usize {
+        let pending: Vec<crate::handles::Hwnd> = self.pending_publishes.drain().collect();
+        for hwnd in &pending {
+            self.publish(*hwnd);
+        }
+        pending.len()
+    }
 }
 
 impl Default for PresentState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used)]
+mod tests {
+    use super::PresentState;
+    use crate::handles::Hwnd;
+
+    #[test]
+    fn deferred_publishes_coalesce_per_dispatch() {
+        let mut state = PresentState::new();
+        let hwnd = Hwnd::from(7);
+        state.ensure_surface(hwnd, 200, 100);
+
+        // Two writes in one dispatch (e.g. BitBlt + window-DC TextOut) each
+        // defer a publish for the same HWND.
+        state.publish_deferred(hwnd);
+        state.publish_deferred(hwnd);
+
+        // Nothing is published until the drain.
+        assert!(state.published.is_empty());
+        assert_eq!(state.pending_publishes.len(), 1);
+
+        let published = state.drain_pending_publishes();
+        assert_eq!(
+            published, 1,
+            "N deferred writes in one dispatch → 1 publish"
+        );
+        assert!(state.pending_publishes.is_empty());
+
+        let _frame = state.published.get(&hwnd).expect("frame published");
+        // Publish-model rework (ora-5): every frame is full — no region.
+        // The publish moved the painted buffer into the Arc; the surface is
+        // empty and will be handed back by the next ensure_surface (B1).
+        assert!(
+            state
+                .surfaces
+                .get(&hwnd)
+                .is_some_and(|s| s.pixels.is_empty())
+        );
+    }
+
+    #[test]
+    fn deferred_publish_of_two_hwnds_emits_one_frame_each() {
+        let mut state = PresentState::new();
+        let a = Hwnd::from(1);
+        let b = Hwnd::from(2);
+        state.ensure_surface(a, 100, 100);
+        state.ensure_surface(b, 100, 100);
+        state.publish_deferred(a);
+        state.publish_deferred(b);
+        assert_eq!(state.drain_pending_publishes(), 2);
+        assert!(state.published.contains_key(&a));
+        assert!(state.published.contains_key(&b));
     }
 }

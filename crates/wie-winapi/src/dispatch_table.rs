@@ -388,9 +388,37 @@ pub enum WinApiId {
     D3d9Idirect3ddevice9Setindices = 375,
     D3d9Idirect3ddevice9Createvertexbuffer = 376,
     D3d9Idirect3ddevice9Createindexbuffer = 377,
+    D3d9Idirect3ddevice9Createtexture = 378,
+    D3d9Idirect3ddevice9Settexture = 379,
+    D3d9Idirect3ddevice9Gettexture = 380,
+    D3d9Idirect3ddevice9Gettexturestagestate = 381,
+    D3d9Idirect3ddevice9Getsamplerstate = 382,
+    D3d9Idirect3dtexture9Getlevelcount = 383,
+    D3d9Idirect3dtexture9Getsurfacelevel = 384,
+    D3d9Idirect3dtexture9Lockrect = 385,
+    D3d9Idirect3dtexture9Unlockrect = 386,
+    D3d9Idirect3dtexture9Release = 387,
+    D3d9Idirect3dsurface9Lockrect = 388,
+    D3d9Idirect3dsurface9Unlockrect = 389,
+    D3d9Idirect3dsurface9Release = 390,
+    D3d9Idirect3ddevice9Createdepthstencilsurface = 391,
+    D3d9Idirect3ddevice9Setdepthstencilsurface = 392,
+    D3d9Idirect3ddevice9Getdepthstencilsurface = 393,
+    D3d9Idirect3ddevice9Getrenderstate = 394,
+    D3d9Idirect3ddevice9Createvertexshader = 395,
+    D3d9Idirect3ddevice9Getvertexshader = 396,
+    D3d9Idirect3ddevice9Setvertexshaderconstantf = 397,
+    D3d9Idirect3ddevice9Getvertexshaderconstantf = 398,
+    D3d9Idirect3ddevice9Createpixelshader = 399,
+    D3d9Idirect3ddevice9Setpixelshader = 400,
+    D3d9Idirect3ddevice9Getpixelshader = 401,
+    D3d9Idirect3ddevice9Setpixelshaderconstantf = 402,
+    D3d9Idirect3ddevice9Getpixelshaderconstantf = 403,
+    D3d9Idirect3dpixelshader9Release = 404,
+    D3d9Idirect3dvertexshader9Release = 405,
 }
 
-pub const WINAPI_ID_COUNT: usize = 378;
+pub const WINAPI_ID_COUNT: usize = 406;
 
 impl WinApiId {
     /// Discriminant as `u16` (`#[repr(u16)]`).
@@ -430,7 +458,7 @@ const _: () = assert!(
 );
 
 /// Highest-numbered [`WinApiId`]; update alongside the enum's final variant.
-const LAST_WINAPI_ID: WinApiId = WinApiId::D3d9Idirect3ddevice9Createindexbuffer;
+const LAST_WINAPI_ID: WinApiId = WinApiId::D3d9Idirect3dvertexshader9Release;
 
 /// Static (library, name, id) rows for one-time resolution.
 static WINAPI_NAME_ROWS: &[(&str, &str, WinApiId)] = &[
@@ -1568,6 +1596,146 @@ static WINAPI_NAME_ROWS: &[(&str, &str, WinApiId)] = &[
         "idirect3ddevice9::createindexbuffer",
         WinApiId::D3d9Idirect3ddevice9Createindexbuffer,
     ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::createtexture",
+        WinApiId::D3d9Idirect3ddevice9Createtexture,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::settexture",
+        WinApiId::D3d9Idirect3ddevice9Settexture,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::gettexture",
+        WinApiId::D3d9Idirect3ddevice9Gettexture,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::gettexturestagestate",
+        WinApiId::D3d9Idirect3ddevice9Gettexturestagestate,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::getsamplerstate",
+        WinApiId::D3d9Idirect3ddevice9Getsamplerstate,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3dtexture9::getlevelcount",
+        WinApiId::D3d9Idirect3dtexture9Getlevelcount,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3dtexture9::getsurfacelevel",
+        WinApiId::D3d9Idirect3dtexture9Getsurfacelevel,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3dtexture9::lockrect",
+        WinApiId::D3d9Idirect3dtexture9Lockrect,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3dtexture9::unlockrect",
+        WinApiId::D3d9Idirect3dtexture9Unlockrect,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3dtexture9::release",
+        WinApiId::D3d9Idirect3dtexture9Release,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3dsurface9::lockrect",
+        WinApiId::D3d9Idirect3dsurface9Lockrect,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3dsurface9::unlockrect",
+        WinApiId::D3d9Idirect3dsurface9Unlockrect,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3dsurface9::release",
+        WinApiId::D3d9Idirect3dsurface9Release,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::createdepthstencilsurface",
+        WinApiId::D3d9Idirect3ddevice9Createdepthstencilsurface,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::setdepthstencilsurface",
+        WinApiId::D3d9Idirect3ddevice9Setdepthstencilsurface,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::getdepthstencilsurface",
+        WinApiId::D3d9Idirect3ddevice9Getdepthstencilsurface,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::getrenderstate",
+        WinApiId::D3d9Idirect3ddevice9Getrenderstate,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::createvertexshader",
+        WinApiId::D3d9Idirect3ddevice9Createvertexshader,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::getvertexshader",
+        WinApiId::D3d9Idirect3ddevice9Getvertexshader,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::setvertexshaderconstantf",
+        WinApiId::D3d9Idirect3ddevice9Setvertexshaderconstantf,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::getvertexshaderconstantf",
+        WinApiId::D3d9Idirect3ddevice9Getvertexshaderconstantf,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::createpixelshader",
+        WinApiId::D3d9Idirect3ddevice9Createpixelshader,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::setpixelshader",
+        WinApiId::D3d9Idirect3ddevice9Setpixelshader,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::getpixelshader",
+        WinApiId::D3d9Idirect3ddevice9Getpixelshader,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::setpixelshaderconstantf",
+        WinApiId::D3d9Idirect3ddevice9Setpixelshaderconstantf,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::getpixelshaderconstantf",
+        WinApiId::D3d9Idirect3ddevice9Getpixelshaderconstantf,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3dpixelshader9::release",
+        WinApiId::D3d9Idirect3dpixelshader9Release,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3dvertexshader9::release",
+        WinApiId::D3d9Idirect3dvertexshader9Release,
+    ),
     ("user32.dll", "getmenu", WinApiId::User32Getmenu),
     ("gdi32.dll", "getstockobject", WinApiId::Gdi32Getstockobject),
     (
@@ -1746,6 +1914,10 @@ static WINAPI_NAME_ROWS: &[(&str, &str, WinApiId)] = &[
         WinApiId::User32Isdialogmessagew,
     ),
     ("user32.dll", "enddialog", WinApiId::User32Enddialog),
+    // mingw's import lib provides the bare `GetDlgItem` alias (no A/W
+    // suffix) — the demo PE imports it as-is, so resolve it to the ANSI
+    // handler like real Windows does for the macro-less name.
+    ("user32.dll", "getdlgitem", WinApiId::User32Getdlgitema),
     ("user32.dll", "getdlgitema", WinApiId::User32Getdlgitema),
     ("user32.dll", "getdlgitemw", WinApiId::User32Getdlgitemw),
     (
@@ -2333,6 +2505,52 @@ pub fn dispatch_winapi_id(
         WinApiId::D3d9Idirect3ddevice9Setindices => d3d9::handle_set_indices(ctx),
         WinApiId::D3d9Idirect3ddevice9Createvertexbuffer => d3d9::handle_create_vertex_buffer(ctx),
         WinApiId::D3d9Idirect3ddevice9Createindexbuffer => d3d9::handle_create_index_buffer(ctx),
+        WinApiId::D3d9Idirect3ddevice9Createtexture => d3d9::handle_create_texture(ctx),
+        WinApiId::D3d9Idirect3ddevice9Settexture => d3d9::handle_set_texture(ctx),
+        WinApiId::D3d9Idirect3ddevice9Gettexture => d3d9::handle_get_texture(ctx),
+        WinApiId::D3d9Idirect3ddevice9Gettexturestagestate => {
+            d3d9::handle_get_texture_stage_state(ctx)
+        }
+        WinApiId::D3d9Idirect3ddevice9Getsamplerstate => d3d9::handle_get_sampler_state(ctx),
+        WinApiId::D3d9Idirect3dtexture9Getlevelcount => d3d9::handle_texture_get_level_count(ctx),
+        WinApiId::D3d9Idirect3dtexture9Getsurfacelevel => {
+            d3d9::handle_texture_get_surface_level(ctx)
+        }
+        WinApiId::D3d9Idirect3dtexture9Lockrect => d3d9::handle_texture_lock_rect(ctx),
+        WinApiId::D3d9Idirect3dtexture9Unlockrect => d3d9::handle_texture_unlock_rect(ctx),
+        WinApiId::D3d9Idirect3dtexture9Release => d3d9::handle_texture_release(ctx),
+        WinApiId::D3d9Idirect3dsurface9Lockrect => d3d9::handle_surface_lock_rect(ctx),
+        WinApiId::D3d9Idirect3dsurface9Unlockrect => d3d9::handle_surface_unlock_rect(ctx),
+        WinApiId::D3d9Idirect3dsurface9Release => d3d9::handle_surface_release(ctx),
+        WinApiId::D3d9Idirect3ddevice9Createdepthstencilsurface => {
+            d3d9::handle_create_depth_stencil_surface(ctx)
+        }
+        WinApiId::D3d9Idirect3ddevice9Setdepthstencilsurface => {
+            d3d9::handle_set_depth_stencil_surface(ctx)
+        }
+        WinApiId::D3d9Idirect3ddevice9Getdepthstencilsurface => {
+            d3d9::handle_get_depth_stencil_surface(ctx)
+        }
+        WinApiId::D3d9Idirect3ddevice9Getrenderstate => d3d9::handle_get_render_state(ctx),
+        WinApiId::D3d9Idirect3ddevice9Createvertexshader => d3d9::handle_create_vertex_shader(ctx),
+        WinApiId::D3d9Idirect3ddevice9Getvertexshader => d3d9::handle_get_vertex_shader(ctx),
+        WinApiId::D3d9Idirect3ddevice9Setvertexshaderconstantf => {
+            d3d9::handle_set_vertex_shader_constant_f(ctx)
+        }
+        WinApiId::D3d9Idirect3ddevice9Getvertexshaderconstantf => {
+            d3d9::handle_get_vertex_shader_constant_f(ctx)
+        }
+        WinApiId::D3d9Idirect3ddevice9Createpixelshader => d3d9::handle_create_pixel_shader(ctx),
+        WinApiId::D3d9Idirect3ddevice9Setpixelshader => d3d9::handle_set_pixel_shader(ctx),
+        WinApiId::D3d9Idirect3ddevice9Getpixelshader => d3d9::handle_get_pixel_shader(ctx),
+        WinApiId::D3d9Idirect3ddevice9Setpixelshaderconstantf => {
+            d3d9::handle_set_pixel_shader_constant_f(ctx)
+        }
+        WinApiId::D3d9Idirect3ddevice9Getpixelshaderconstantf => {
+            d3d9::handle_get_pixel_shader_constant_f(ctx)
+        }
+        WinApiId::D3d9Idirect3dpixelshader9Release => d3d9::handle_pixel_shader_release(ctx),
+        WinApiId::D3d9Idirect3dvertexshader9Release => d3d9::handle_vertex_shader_release(ctx),
         WinApiId::User32Enablemenuitem => user32::handle_enable_menu_item(ctx),
         WinApiId::User32Checkmenuitem => user32::handle_check_menu_item(ctx),
         WinApiId::User32Getmessagea => user32::handle_get_message_a(ctx),

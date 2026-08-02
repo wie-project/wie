@@ -21,7 +21,7 @@ pub(crate) const FAKE_CURSOR_HANDLE: u64 = 0x0000_0000_6600_0002;
 pub(crate) const IDOK: u64 = 1;
 pub(crate) const IDCANCEL: u64 = 2;
 
-pub(crate) const WM_MDICREATE: u32 = 0x0220;
+pub(crate) const WM_MDICREATE: u32 = wm::WinMsg::WM_MDICREATE.as_u32();
 pub(crate) const FAKE_MONITOR_HANDLE: u64 = 0x0000_0000_6600_0010;
 pub(crate) const DISPLAY_DEVICE_ATTACHED_TO_DESKTOP: u32 = 0x0000_0001;
 pub(crate) const DISPLAY_DEVICE_PRIMARY_DEVICE: u32 = 0x0000_0004;
@@ -43,9 +43,9 @@ pub(crate) const WS_CLIPCHILDREN: u32 = 0x0200_0000;
 /// Control style: the control can receive keyboard focus via Tab navigation.
 pub(crate) const WS_TABSTOP: u32 = 0x0001_0000;
 
-pub(crate) const WM_QUIT: u32 = 0x0012;
+pub(crate) const WM_QUIT: u32 = wm::WinMsg::WM_QUIT.as_u32();
 
-pub(crate) const WM_INITDIALOG: u32 = 0x0110;
+pub(crate) const WM_INITDIALOG: u32 = wm::WinMsg::WM_INITDIALOG.as_u32();
 
 // Virtual-key codes used by IsDialogMessage navigation (winuser.h).
 pub(crate) const VK_TAB: u64 = 0x09;
@@ -59,76 +59,79 @@ pub(crate) const VK_LEFT: u64 = 0x25;
 pub(crate) const VK_RIGHT: u64 = 0x27;
 pub(crate) const VK_DELETE: u64 = 0x2E;
 
-pub(crate) const WM_KEYDOWN: u32 = 0x0100;
-pub(crate) const WM_KEYUP: u32 = 0x0101;
-pub(crate) const WM_CHAR: u32 = 0x0102;
-pub(crate) const WM_DEADCHAR: u32 = 0x0103;
-pub(crate) const WM_SYSKEYDOWN: u32 = 0x0104;
-pub(crate) const WM_SYSKEYUP: u32 = 0x0105;
-pub(crate) const WM_SYSCHAR: u32 = 0x0106;
-pub(crate) const WM_SYSDEADCHAR: u32 = 0x0107;
-pub(crate) const WM_CREATE: u32 = 0x0001;
-pub(crate) const WM_DESTROY: u32 = 0x0002;
+pub(crate) const WM_KEYDOWN: u32 = wm::WinMsg::WM_KEYDOWN.as_u32();
+pub(crate) const WM_KEYUP: u32 = wm::WinMsg::WM_KEYUP.as_u32();
+pub(crate) const WM_CHAR: u32 = wm::WinMsg::WM_CHAR.as_u32();
+pub(crate) const WM_DEADCHAR: u32 = wm::WinMsg::WM_DEADCHAR.as_u32();
+pub(crate) const WM_SYSKEYDOWN: u32 = wm::WinMsg::WM_SYSKEYDOWN.as_u32();
+pub(crate) const WM_SYSKEYUP: u32 = wm::WinMsg::WM_SYSKEYUP.as_u32();
+pub(crate) const WM_SYSCHAR: u32 = wm::WinMsg::WM_SYSCHAR.as_u32();
+pub(crate) const WM_SYSDEADCHAR: u32 = wm::WinMsg::WM_SYSDEADCHAR.as_u32();
+pub(crate) const WM_CREATE: u32 = wm::WinMsg::WM_CREATE.as_u32();
+pub(crate) const WM_DESTROY: u32 = wm::WinMsg::WM_DESTROY.as_u32();
 #[expect(dead_code)]
-pub(crate) const WM_MOVE: u32 = 0x0003;
+pub(crate) const WM_MOVE: u32 = wm::WinMsg::WM_MOVE.as_u32();
 #[expect(dead_code)]
-pub(crate) const WM_SIZE: u32 = 0x0005;
+pub(crate) const WM_SIZE: u32 = wm::WinMsg::WM_SIZE.as_u32();
 #[expect(dead_code)]
-pub(crate) const WM_ACTIVATE: u32 = 0x0006;
-pub(crate) const WM_SETFOCUS: u32 = 0x0007;
-pub(crate) const WM_KILLFOCUS: u32 = 0x0008;
-pub(crate) const WM_SETTEXT: u32 = 0x000C;
-pub(crate) const WM_GETTEXT: u32 = 0x000D;
-pub(crate) const WM_GETTEXTLENGTH: u32 = 0x000E;
-pub(crate) const WM_PAINT: u32 = 0x000F;
-pub(crate) const WM_CLOSE: u32 = 0x0010;
-pub(crate) const WM_ERASEBKGND: u32 = 0x0014;
+pub(crate) const WM_ACTIVATE: u32 = wm::WinMsg::WM_ACTIVATE.as_u32();
+pub(crate) const WM_SETFOCUS: u32 = wm::WinMsg::WM_SETFOCUS.as_u32();
+pub(crate) const WM_KILLFOCUS: u32 = wm::WinMsg::WM_KILLFOCUS.as_u32();
+pub(crate) const WM_PAINT: u32 = wm::WinMsg::WM_PAINT.as_u32();
+pub(crate) const WM_CLOSE: u32 = wm::WinMsg::WM_CLOSE.as_u32();
+pub(crate) const WM_ERASEBKGND: u32 = wm::WinMsg::WM_ERASEBKGND.as_u32();
 #[expect(dead_code)]
-pub(crate) const WM_SHOWWINDOW: u32 = 0x0018;
-pub(crate) const WM_SETCURSOR: u32 = 0x0020;
+pub(crate) const WM_SHOWWINDOW: u32 = wm::WinMsg::WM_SHOWWINDOW.as_u32();
+#[expect(dead_code)] // alias kept for crate users; dispatch uses WinMsg::WM_SETCURSOR
+pub(crate) const WM_SETCURSOR: u32 = wm::WinMsg::WM_SETCURSOR.as_u32();
 #[expect(dead_code)]
-pub(crate) const WM_GETMINMAXINFO: u32 = 0x0024;
-pub(crate) const WM_CONTEXTMENU: u32 = 0x007B;
+pub(crate) const WM_GETMINMAXINFO: u32 = wm::WinMsg::WM_GETMINMAXINFO.as_u32();
+pub(crate) const WM_CONTEXTMENU: u32 = wm::WinMsg::WM_CONTEXTMENU.as_u32();
 #[expect(dead_code)]
-pub(crate) const WM_NCCREATE: u32 = 0x0081;
+pub(crate) const WM_NCCREATE: u32 = wm::WinMsg::WM_NCCREATE.as_u32();
 #[expect(dead_code)]
-pub(crate) const WM_NCDESTROY: u32 = 0x0082;
+pub(crate) const WM_NCDESTROY: u32 = wm::WinMsg::WM_NCDESTROY.as_u32();
 #[expect(dead_code)]
-pub(crate) const WM_NCCALCSIZE: u32 = 0x0083;
-pub(crate) const WM_GETDLGCODE: u32 = 0x0087;
-pub(crate) const WM_SYSCOMMAND: u32 = 0x0112;
-pub(crate) const WM_COMMAND: u32 = 0x0111;
-pub(crate) const WM_TIMER: u32 = 0x0113;
+pub(crate) const WM_NCCALCSIZE: u32 = wm::WinMsg::WM_NCCALCSIZE.as_u32();
+#[expect(dead_code)] // alias kept for crate users; dispatch uses WinMsg::WM_SYSCOMMAND
+pub(crate) const WM_SYSCOMMAND: u32 = wm::WinMsg::WM_SYSCOMMAND.as_u32();
+pub(crate) const WM_COMMAND: u32 = wm::WinMsg::WM_COMMAND.as_u32();
+pub(crate) const WM_TIMER: u32 = wm::WinMsg::WM_TIMER.as_u32();
 #[expect(dead_code)]
-pub(crate) const WM_MOUSEMOVE: u32 = 0x0200;
-pub(crate) const WM_LBUTTONDOWN: u32 = 0x0201;
-pub(crate) const WM_LBUTTONUP: u32 = 0x0202;
+pub(crate) const WM_MOUSEMOVE: u32 = wm::WinMsg::WM_MOUSEMOVE.as_u32();
+#[cfg(test)]
+pub(crate) const WM_LBUTTONDOWN: u32 = wm::WinMsg::WM_LBUTTONDOWN.as_u32();
 #[expect(dead_code)]
-pub(crate) const WM_RBUTTONDOWN: u32 = 0x0204;
+pub(crate) const WM_RBUTTONDOWN: u32 = wm::WinMsg::WM_RBUTTONDOWN.as_u32();
 #[expect(dead_code)]
-pub(crate) const WM_RBUTTONUP: u32 = 0x0205;
+pub(crate) const WM_RBUTTONUP: u32 = wm::WinMsg::WM_RBUTTONUP.as_u32();
 #[expect(dead_code)]
-pub(crate) const WM_MBUTTONDOWN: u32 = 0x0207;
+pub(crate) const WM_MBUTTONDOWN: u32 = wm::WinMsg::WM_MBUTTONDOWN.as_u32();
 #[expect(dead_code)]
-pub(crate) const WM_MBUTTONUP: u32 = 0x0208;
+pub(crate) const WM_MBUTTONUP: u32 = wm::WinMsg::WM_MBUTTONUP.as_u32();
 #[expect(dead_code)]
-pub(crate) const WM_MOUSEWHEEL: u32 = 0x020A;
+pub(crate) const WM_MOUSEWHEEL: u32 = wm::WinMsg::WM_MOUSEWHEEL.as_u32();
 #[expect(dead_code)]
 pub(crate) const SIZE_RESTORED: u64 = 0;
 pub(crate) const SC_CLOSE: u64 = 0xF060;
 #[expect(dead_code)]
 pub(crate) const SW_SHOW: u64 = 5;
 
-// List-box messages (winuser.h).
-pub(crate) const LB_ADDSTRING: u32 = 0x0180;
-pub(crate) const LB_SETCURSEL: u32 = 0x0186;
-pub(crate) const LB_GETCURSEL: u32 = 0x0187;
-pub(crate) const LB_GETTEXT: u32 = 0x0189;
-pub(crate) const LB_GETCOUNT: u32 = 0x018B;
+// List-box messages (winuser.h); the LISTBOX/COMBOBOX dispatch matches these
+// via `WinMsg` — the `u32` aliases survive only for the lib tests.
+#[cfg(test)]
+pub(crate) const LB_ADDSTRING: u32 = wm::WinMsg::LB_ADDSTRING.as_u32();
+#[cfg(test)]
+pub(crate) const LB_SETCURSEL: u32 = wm::WinMsg::LB_SETCURSEL.as_u32();
+#[cfg(test)]
+pub(crate) const LB_GETCURSEL: u32 = wm::WinMsg::LB_GETCURSEL.as_u32();
 
-// Edit-control messages (winuser.h).
-pub(crate) const EM_GETSEL: u32 = 0x00B0;
-pub(crate) const EM_SETSEL: u32 = 0x00B1;
+// Edit-control messages (winuser.h); `u32` aliases survive only for the lib
+// tests — the dispatch matches these via `WinMsg`.
+#[cfg(test)]
+pub(crate) const EM_GETSEL: u32 = wm::WinMsg::EM_GETSEL.as_u32();
+#[cfg(test)]
+pub(crate) const EM_SETSEL: u32 = wm::WinMsg::EM_SETSEL.as_u32();
 
 // Control notification codes / DLGC_* dialog codes (winuser.h).
 pub(crate) const BN_CLICKED: u64 = 0;
@@ -151,12 +154,16 @@ pub(crate) const BS_DEFPUSHBUTTON: u32 = 0x0000_0001;
 pub(crate) const BST_PUSHED: u64 = 0x0004;
 /// Button state bit reported by `BM_GETSTATE`: the button has keyboard focus.
 pub(crate) const BST_FOCUS: u64 = 0x0008;
-/// Button messages: `BM_GETSTATE` (read pressed/focus state).
-pub(crate) const BM_GETSTATE: u32 = 0x00F2;
+/// Button messages: `BM_GETSTATE` (read pressed/focus state); `u32` aliases
+/// survive only for the lib tests — the dispatch matches these via `WinMsg`.
+#[cfg(test)]
+pub(crate) const BM_GETSTATE: u32 = wm::WinMsg::BM_GETSTATE.as_u32();
 /// Button messages: `BM_SETSTATE` (write the pressed state, no click).
-pub(crate) const BM_SETSTATE: u32 = 0x00F3;
+#[cfg(test)]
+pub(crate) const BM_SETSTATE: u32 = wm::WinMsg::BM_SETSTATE.as_u32();
 /// Button messages: `BM_CLICK` (programmatic activation → `BN_CLICKED`).
-pub(crate) const BM_CLICK: u32 = 0x00F5;
+#[cfg(test)]
+pub(crate) const BM_CLICK: u32 = wm::WinMsg::BM_CLICK.as_u32();
 
 // TrackMouseEvent flags (winuser.h).
 pub(crate) const TME_HOVER: u32 = 0x0000_0001;
@@ -172,6 +179,7 @@ pub mod menu;
 pub mod message;
 pub mod misc;
 pub mod window;
+pub mod wm;
 pub use controls::*;
 pub use dc::*;
 pub use dialog::*;
@@ -181,6 +189,7 @@ pub use menu::*;
 pub use message::*;
 pub use misc::*;
 pub use window::*;
+pub use wm::*;
 
 pub(crate) fn low_i32(value: u64, name: &str) -> Result<i32> {
     let low_value = value & u64::from(u32::MAX);
@@ -313,7 +322,7 @@ pub(crate) fn write_message_structure(
     message_address: u64,
     message: &QueuedWindowMessage,
 ) -> Result<()> {
-    write_guest_u64(engine, message_address, message.window_handle)
+    write_guest_u64(engine, message_address, message.window_handle.as_u64())
         .context("failed to write MSG.hwnd")?;
 
     write_guest_u32(
@@ -590,7 +599,7 @@ pub(crate) fn create_window_record(
     }
 
     state.window_state().windows.push(WindowRecord {
-        handle,
+        handle: crate::handles::Hwnd::from(handle),
         class_atom,
         class_name,
         window_proc,
@@ -598,7 +607,7 @@ pub(crate) fn create_window_record(
         title: request.title.clone(),
         style: request.style,
         extended_style: request.extended_style,
-        parent_handle: request.parent_handle,
+        parent_handle: crate::handles::Hwnd::from(request.parent_handle),
         menu_handle: request.menu_handle,
         instance_handle: request.instance_handle,
         x: request.x,
@@ -610,6 +619,8 @@ pub(crate) fn create_window_record(
         invalidated: control_kind.is_some() && visible,
         erase_background: false,
         mouse_tracking: false,
+        pressed: false,
+        focused: false,
         client_rect: (0, 0, 0, 0),
         control_kind,
         control_text: request.title,
@@ -713,6 +724,6 @@ pub(crate) fn is_known_window(state: &mut WinApiState, handle: u64) -> bool {
     handle == FAKE_WINDOW_HANDLE
         || handle == FAKE_DESKTOP_WINDOW_HANDLE
         || find_window(state, handle).is_some()
-        || state.window_state().active_window_handle == handle
-        || state.window_state().foreground_window_handle == handle
+        || state.window_state().active_window_handle == crate::handles::Hwnd::from(handle)
+        || state.window_state().foreground_window_handle == crate::handles::Hwnd::from(handle)
 }

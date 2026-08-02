@@ -11,7 +11,6 @@ use super::{
     write_wide_window_text, write_window_rect,
 };
 use crate::OuterReturn;
-use crate::gdi32::{IRect, ancestor_offset};
 
 /// Handles `USER32.dll!GetWindowRect`.
 pub fn handle_get_window_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -248,7 +247,8 @@ pub fn handle_get_parent(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
         .read_rcx()
         .context("failed to read RCX for GetParent")?;
 
-    let return_value = find_window(state, window_handle).map_or(0, |window| window.parent_handle);
+    let return_value =
+        find_window(state, window_handle).map_or(0, |window| window.parent_handle.as_u64());
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -263,7 +263,7 @@ pub fn handle_get_parent(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 pub fn handle_get_active_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let return_value = state.window_state().active_window_handle;
+    let return_value = state.window_state().active_window_handle.as_u64();
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -278,7 +278,7 @@ pub fn handle_get_active_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 pub fn handle_get_foreground_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let return_value = state.window_state().foreground_window_handle;
+    let return_value = state.window_state().foreground_window_handle.as_u64();
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -311,6 +311,15 @@ pub fn handle_show_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         // Real window records track their own visibility (used by the host
         // mouse hit-test in `GuestHandle::window_at`).
         window.visible = show_command != 0;
+        // Showing a window invalidates it with erase (real Windows): the
+        // first paint cycle fills the client with the class-brush background
+        // before the guest paints. Without this the owner surface stays
+        // zeroed (black) until something else triggers an erase — a modal
+        // dialog close, which then visibly "changes the background color".
+        if show_command != 0 {
+            window.invalidated = true;
+            window.erase_background = true;
+        }
     }
 
     let return_value = u64::from(previously_visible);
@@ -365,8 +374,8 @@ pub fn handle_set_foreground_window(ctx: &mut HandlerContext<'_>) -> Result<WinA
     let success = window_handle == FAKE_WINDOW_HANDLE;
 
     if success {
-        state.window_state().foreground_window_handle = window_handle;
-        state.window_state().active_window_handle = window_handle;
+        state.window_state().foreground_window_handle = crate::handles::Hwnd::from(window_handle);
+        state.window_state().active_window_handle = crate::handles::Hwnd::from(window_handle);
     }
 
     let return_value = u64::from(success);
@@ -391,16 +400,16 @@ pub fn handle_set_active_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let previous_window = state.window_state().active_window_handle;
 
     if window_handle == 0 || window_handle == FAKE_WINDOW_HANDLE {
-        state.window_state().active_window_handle = window_handle;
+        state.window_state().active_window_handle = crate::handles::Hwnd::from(window_handle);
     }
 
     let return_address = engine
-        .return_from_win64_api(previous_window)
+        .return_from_win64_api(previous_window.as_u64())
         .context("failed to return from SetActiveWindow")?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: previous_window,
+        return_value: previous_window.as_u64(),
     })
 }
 /// Handles `USER32.dll!SetFocus`.
@@ -415,32 +424,32 @@ pub fn handle_set_focus(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
     let accepted = window_handle == 0 || is_known_window(state, window_handle);
 
     if accepted {
-        state.window_state().focus_window_handle = window_handle;
+        state.window_state().focus_window_handle = crate::handles::Hwnd::from(window_handle);
     }
 
     // Windows sends WM_KILLFOCUS(old, new) then WM_SETFOCUS(new, old) when
     // the focus actually moves. Bridge synchronously (guest WndProcs) or
     // host-side (controls) — see deliver_focus_change.
     if accepted
-        && window_handle != previous_window
+        && crate::handles::Hwnd::from(window_handle) != previous_window
         && let Some(signal) = deliver_focus_change(
             state,
             engine,
-            previous_window,
+            previous_window.as_u64(),
             window_handle,
-            OuterReturn::Fixed(previous_window),
+            OuterReturn::Fixed(previous_window.as_u64()),
         )?
     {
         return Err(signal.into());
     }
 
     let return_address = engine
-        .return_from_win64_api(previous_window)
+        .return_from_win64_api(previous_window.as_u64())
         .context("failed to return from SetFocus")?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: previous_window,
+        return_value: previous_window.as_u64(),
     })
 }
 
@@ -482,7 +491,7 @@ pub(crate) fn deliver_focus_change(
             .window_state()
             .windows
             .iter()
-            .find(|w| w.handle == hwnd)
+            .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
             .map_or((0, 0, false, false, false), |w| {
                 (
                     w.window_proc,
@@ -530,7 +539,7 @@ pub(crate) fn deliver_focus_change(
                 .checked_add(1)
                 .context("focus-change message timestamp overflow")?;
             queue.messages.push(super::QueuedWindowMessage {
-                window_handle: hwnd,
+                window_handle: crate::handles::Hwnd::from(hwnd),
                 message,
                 word_parameter: wparam,
                 long_parameter: 0,
@@ -546,7 +555,7 @@ pub(crate) fn deliver_focus_change(
 pub fn handle_get_focus(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let return_value = state.window_state().focus_window_handle;
+    let return_value = state.window_state().focus_window_handle.as_u64();
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -570,23 +579,23 @@ pub fn handle_set_capture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     // SetCapture(NULL) releases; real windows (including child controls, whose
     // WndProc captures implicitly while pressed) become the capture owner.
     if window_handle == 0 || is_known_window(state, window_handle) {
-        state.window_state().capture_window_handle = window_handle;
+        state.window_state().capture_window_handle = crate::handles::Hwnd::from(window_handle);
     }
 
     let return_address = engine
-        .return_from_win64_api(previous_window)
+        .return_from_win64_api(previous_window.as_u64())
         .context("failed to return from SetCapture")?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: previous_window,
+        return_value: previous_window.as_u64(),
     })
 }
 /// Handles `USER32.dll!GetCapture`.
 pub fn handle_get_capture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let return_value = state.window_state().capture_window_handle;
+    let return_value = state.window_state().capture_window_handle.as_u64();
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -601,7 +610,7 @@ pub fn handle_get_capture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 pub fn handle_release_capture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    state.window_state().capture_window_handle = 0;
+    state.window_state().capture_window_handle = crate::handles::Hwnd::NULL;
 
     let return_value = 1;
 
@@ -626,7 +635,7 @@ pub fn handle_update_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         let windows = &state.window_state().windows;
         windows
             .iter()
-            .find(|window| window.handle == window_handle)
+            .find(|window| window.handle == crate::handles::Hwnd::from(window_handle))
             .map_or((0, false), |window| (window.window_proc, window.unicode))
     };
 
@@ -681,10 +690,6 @@ pub fn handle_invalidate_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         .read_rcx()
         .context("failed to read RCX for InvalidateRect")?;
 
-    let rect_ptr = engine
-        .read_rdx()
-        .context("failed to read RDX for InvalidateRect")?;
-
     let erase_background = engine
         .read_r8()
         .context("failed to read R8 for InvalidateRect")?;
@@ -697,57 +702,6 @@ pub fn handle_invalidate_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         // of a different region (the update region accumulates, matching Windows).
         if erase_background != 0 {
             window.erase_background = true;
-        }
-    }
-
-    // B3: accumulate the invalidation into the window's present-surface dirty
-    // region (publish side only — WM_PAINT synthesis keeps using `invalidated`).
-    // A NULL rect = the whole client area. Children translate to the ancestor
-    // surface via the parent-chain offset so their region lands where their
-    // pixels actually live. An unreadable RECT falls back to a full-surface
-    // mark (conservative: a partial publish can never go stale).
-    if success
-        && window_handle != 0
-        && let Some((top_hwnd, offset_x, offset_y)) =
-            ancestor_offset(&state.window_state().windows, window_handle)
-    {
-        let local_rect = if rect_ptr == 0 {
-            let (cw, ch) = window_client_size(state, window_handle);
-            Some(IRect {
-                left: 0,
-                top: 0,
-                right: cw,
-                bottom: ch,
-            })
-        } else {
-            match (
-                read_guest_i32(engine, rect_ptr),
-                read_guest_i32(engine, checked_field_address(rect_ptr, 4, "RECT.top")),
-                read_guest_i32(engine, checked_field_address(rect_ptr, 8, "RECT.right")),
-                read_guest_i32(engine, checked_field_address(rect_ptr, 12, "RECT.bottom")),
-            ) {
-                (Ok(left), Ok(top), Ok(right), Ok(bottom)) => Some(IRect {
-                    left,
-                    top,
-                    right,
-                    bottom,
-                }),
-                // Unreadable RECT: cannot prove the invalidated region.
-                _ => None,
-            }
-        };
-        match local_rect {
-            Some(rect) => state.present().mark_dirty(
-                top_hwnd,
-                IRect {
-                    left: rect.left.saturating_add(offset_x),
-                    top: rect.top.saturating_add(offset_y),
-                    right: rect.right.saturating_add(offset_x),
-                    bottom: rect.bottom.saturating_add(offset_y),
-                },
-            ),
-            // Conservative fallback: force a full publish.
-            None => state.present().mark_dirty_full(top_hwnd),
         }
     }
 
@@ -1419,13 +1373,15 @@ fn descends_from(state: &mut WinApiState, child: u64, parent: u64) -> bool {
         let Some(window) = find_window(state, current) else {
             return false;
         };
-        if window.parent_handle == parent {
+        if window.parent_handle == crate::handles::Hwnd::from(parent) {
             return true;
         }
-        if window.parent_handle == 0 || window.parent_handle == current {
+        if window.parent_handle == crate::handles::Hwnd::NULL
+            || window.parent_handle == crate::handles::Hwnd::from(current)
+        {
             return false;
         }
-        current = window.parent_handle;
+        current = window.parent_handle.as_u64();
     }
 }
 /// Handles `USER32.dll!GetWindow`.
@@ -1626,7 +1582,7 @@ pub(crate) fn find_window(state: &mut WinApiState, handle: u64) -> Option<&Windo
         .window_state()
         .windows
         .iter()
-        .find(|window| window.handle == handle)
+        .find(|window| window.handle == crate::handles::Hwnd::from(handle))
 }
 
 pub(crate) fn find_window_mut(state: &mut WinApiState, handle: u64) -> Option<&mut WindowRecord> {
@@ -1634,7 +1590,7 @@ pub(crate) fn find_window_mut(state: &mut WinApiState, handle: u64) -> Option<&m
         .window_state()
         .windows
         .iter_mut()
-        .find(|window| window.handle == handle)
+        .find(|window| window.handle == crate::handles::Hwnd::from(handle))
 }
 
 /// Handles `USER32.dll!CreateWindowExA`.
@@ -1986,7 +1942,7 @@ pub fn handle_destroy_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         state
             .window_state()
             .windows
-            .retain(|w| w.handle != window_handle);
+            .retain(|w| w.handle != crate::handles::Hwnd::from(window_handle));
         let ra = engine
             .return_from_win64_api(1)
             .context("failed to return from DestroyWindow")?;
@@ -2044,7 +2000,7 @@ pub(crate) fn handle_get_class_name(
         .window_state()
         .windows
         .iter()
-        .find(|window| window.handle == window_handle)
+        .find(|window| window.handle == crate::handles::Hwnd::from(window_handle))
         .map_or(String::new(), |window| window.class_name.clone());
 
     let capacity = usize::try_from(max_count)
@@ -2176,7 +2132,7 @@ fn window_class_atom(state: &mut WinApiState, window_handle: u64) -> u16 {
         .window_state()
         .windows
         .iter()
-        .find(|window| window.handle == window_handle)
+        .find(|window| window.handle == crate::handles::Hwnd::from(window_handle))
         .map_or(0, |window| window.class_atom)
 }
 

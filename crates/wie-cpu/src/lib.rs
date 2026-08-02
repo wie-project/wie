@@ -34,7 +34,7 @@ pub use mem::{
 };
 pub use regs::{RegFile, ThreadContext};
 /// SIMD pixel helpers for the GUI present path (NEON on aarch64).
-pub use simd::{mask_bgra_to_0rgb, stretch_nearest};
+pub use simd::{blend_0rgb_4x, fill_0rgb_4x, mask_bgra_to_0rgb, mul_0rgb_4x, stretch_nearest};
 
 /// Guest GS segment base — points to the Thread Environment Block (TEB).
 /// Shared with `wie_runtime::DEFAULT_LAYOUT.teb_low_base`.

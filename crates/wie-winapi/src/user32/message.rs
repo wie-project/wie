@@ -3,8 +3,8 @@ use super::{
     Context, FAKE_SYSTEM_COLOR_BRUSH_BASE, GuestCallbackRequest, HandlerContext,
     MessageQueueIdlePolicy, QueuedWindowMessage, Result, WM_CHAR, WM_CLOSE, WM_CONTEXTMENU,
     WM_DEADCHAR, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_MDICREATE, WM_PAINT, WM_QUIT,
-    WM_SETCURSOR, WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
-    WS_CLIPCHILDREN, WinApiControlSignal, WinApiHandlerResult, WinApiState, WindowClassRecord,
+    WM_SYSCHAR, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WS_CLIPCHILDREN,
+    WinApiControlSignal, WinApiHandlerResult, WinApiState, WinMsg, WindowClassRecord,
     checked_field_address, create_mdi_child_from_struct, dispatch_control_proc, find_window,
     find_window_mut, is_known_window, read_guest_ansi_lossy, read_guest_u32, read_guest_u64,
     read_guest_utf16_lossy, register_window_class, write_message_structure,
@@ -32,11 +32,15 @@ fn message_range_matches(minimum: u32, maximum: u32, message: u32) -> bool {
 /// matches any of its descendants (the modal loop pulls messages for the
 /// focused control inside the dialog).
 #[must_use]
-fn window_matches_filter(state: &WinApiState, window_filter: u64, window_handle: u64) -> bool {
+fn window_matches_filter(
+    state: &WinApiState,
+    window_filter: u64,
+    window_handle: crate::handles::Hwnd,
+) -> bool {
     window_filter == 0
-        || window_handle == window_filter
+        || window_handle == crate::handles::Hwnd::from(window_filter)
         || (is_dialog_window(state, window_filter)
-            && descends_from_window(state, window_handle, window_filter))
+            && descends_from_window(state, window_handle.as_u64(), window_filter))
 }
 
 /// Whether a queued message passes a GetMessage/PeekMessage filter.
@@ -66,7 +70,11 @@ fn message_matches_filter(
 fn is_dialog_window(state: &WinApiState, handle: u64) -> bool {
     state
         .try_window_state()
-        .and_then(|ws| ws.windows.iter().find(|w| w.handle == handle))
+        .and_then(|ws| {
+            ws.windows
+                .iter()
+                .find(|w| w.handle == crate::handles::Hwnd::from(handle))
+        })
         .is_some_and(|w| w.dialog_proc != 0)
 }
 
@@ -78,19 +86,22 @@ fn descends_from_window(state: &WinApiState, child: u64, parent: u64) -> bool {
     }
     let mut current = child;
     loop {
-        let Some(window) = state
-            .try_window_state()
-            .and_then(|ws| ws.windows.iter().find(|w| w.handle == current))
-        else {
+        let Some(window) = state.try_window_state().and_then(|ws| {
+            ws.windows
+                .iter()
+                .find(|w| w.handle == crate::handles::Hwnd::from(current))
+        }) else {
             return false;
         };
-        if window.parent_handle == parent {
+        if window.parent_handle == crate::handles::Hwnd::from(parent) {
             return true;
         }
-        if window.parent_handle == 0 || window.parent_handle == current {
+        if window.parent_handle == crate::handles::Hwnd::NULL
+            || window.parent_handle == crate::handles::Hwnd::from(current)
+        {
             return false;
         }
-        current = window.parent_handle;
+        current = window.parent_handle.as_u64();
     }
 }
 
@@ -117,14 +128,14 @@ fn note_wm_quit_consumed(state: &mut WinApiState) {
 /// Precomputed with only immutable borrows so the message-synthesis paths can
 /// query it while holding a mutable borrow of a disjoint `WindowState` field.
 #[must_use]
-fn dialog_filter_descendants(state: &WinApiState, window_filter: u64) -> Vec<u64> {
+fn dialog_filter_descendants(state: &WinApiState, window_filter: u64) -> Vec<crate::handles::Hwnd> {
     if !is_dialog_window(state, window_filter) {
         return Vec::new();
     }
     state.try_window_state().map_or_else(Vec::new, |ws| {
         ws.windows
             .iter()
-            .filter(|window| descends_from_window(state, window.handle, window_filter))
+            .filter(|window| descends_from_window(state, window.handle.as_u64(), window_filter))
             .map(|window| window.handle)
             .collect()
     })
@@ -159,7 +170,7 @@ fn is_keyboard_message(message: u32) -> bool {
 /// window; with no focus the queue is untouched (existing behavior).
 fn retarget_keyboard_messages(state: &mut WinApiState) {
     let focus = state.window_state().focus_window_handle;
-    if focus == 0 || !is_known_window(state, focus) {
+    if focus == crate::handles::Hwnd::NULL || !is_known_window(state, focus.as_u64()) {
         return;
     }
     let mut queue = state.lock_message_queue();
@@ -188,7 +199,7 @@ fn synthesize_wm_timer(
     // Precompute the dialog-filter descendant set so the timer loop can keep
     // its mutable borrow of the timer list without aliasing `state`.
     let dialog_matches = dialog_filter_descendants(state, window_filter);
-    let mut fired: Vec<(u64, u64)> = Vec::new();
+    let mut fired: Vec<(crate::handles::Hwnd, u64)> = Vec::new();
     {
         let timers = &mut state.window_state().timers;
         for timer in timers.iter_mut() {
@@ -196,7 +207,7 @@ fn synthesize_wm_timer(
                 continue;
             }
             let filter_matches = window_filter == 0
-                || timer.window_handle == window_filter
+                || timer.window_handle == crate::handles::Hwnd::from(window_filter)
                 || dialog_matches.contains(&timer.window_handle);
             if range_matches && filter_matches {
                 fired.push((timer.window_handle, timer.timer_id));
@@ -213,7 +224,7 @@ fn synthesize_wm_timer(
         tracing::debug!(
             target: "wiegui",
             timer_id,
-            hwnd = window_handle,
+            hwnd = window_handle.as_u64(),
             "WM_TIMER fired"
         );
         let time = queue.next_message_time;
@@ -264,7 +275,7 @@ fn synthesize_wm_paint(
             .find(|window| {
                 window.invalidated
                     && (window_filter == 0
-                        || window.handle == window_filter
+                        || window.handle == crate::handles::Hwnd::from(window_filter)
                         || dialog_matches.contains(&window.handle))
             })
             .map(|window| window.handle)
@@ -282,9 +293,9 @@ fn synthesize_wm_paint(
             .iter()
             .find(|window| window.handle == hwnd)
             .is_some_and(|window| window.erase_background)
-    } && class_brush_color(state, hwnd).is_some();
+    } && class_brush_color(state, hwnd.as_u64()).is_some();
 
-    if let Some(window) = find_window_mut(state, hwnd) {
+    if let Some(window) = find_window_mut(state, hwnd.as_u64()) {
         window.invalidated = false;
     }
 
@@ -340,7 +351,10 @@ fn synthesize_idle_messages(
 fn class_brush_color(state: &mut WinApiState, hwnd: u64) -> Option<u32> {
     let brush = {
         let ws = state.try_window_state()?;
-        let window = ws.windows.iter().find(|window| window.handle == hwnd)?;
+        let window = ws
+            .windows
+            .iter()
+            .find(|window| window.handle == crate::handles::Hwnd::from(hwnd))?;
         ws.window_classes
             .iter()
             .find(|class| {
@@ -364,7 +378,7 @@ fn class_brush_color(state: &mut WinApiState, hwnd: u64) -> Option<u32> {
     {
         return Some(sys_color(u32::try_from(index).unwrap_or(0)));
     }
-    brush_color(state, brush)
+    brush_color(state, crate::handles::Hbrush::from(brush))
 }
 
 /// Handle `WM_ERASEBKGND` host-side (DefWindowProc semantics): fill the
@@ -403,7 +417,9 @@ pub(crate) fn erase_window_background(state: &mut WinApiState, hwnd: u64) -> boo
             .window_state()
             .windows
             .iter()
-            .filter(|window| window.parent_handle == hwnd && window.visible)
+            .filter(|window| {
+                window.parent_handle == crate::handles::Hwnd::from(hwnd) && window.visible
+            })
             .map(|window| IRect {
                 left: window.x,
                 top: window.y,
@@ -429,7 +445,6 @@ pub(crate) fn erase_window_background(state: &mut WinApiState, hwnd: u64) -> boo
             rect.width(),
             rect.height(),
             color,
-            false,
         );
     }
     true
@@ -504,7 +519,7 @@ pub fn handle_peek_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         tracing::debug!(
             target: "wiegui",
             message = queued.message,
-            hwnd = queued.window_handle,
+            hwnd = queued.window_handle.as_u64(),
             "PeekMessage: returning message"
         );
         write_message_structure(engine, message_address, &queued)?;
@@ -548,7 +563,7 @@ pub fn handle_peek_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         tracing::debug!(
             target: "wiegui",
             message = queued.message,
-            hwnd = queued.window_handle,
+            hwnd = queued.window_handle.as_u64(),
             "PeekMessage: returning synthesized message"
         );
         write_message_structure(engine, message_address, &queued)?;
@@ -626,7 +641,7 @@ pub fn handle_post_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
             .checked_add(1)
             .context("PostMessageA timestamp overflow")?;
         queue.messages.push(QueuedWindowMessage {
-            window_handle,
+            window_handle: crate::handles::Hwnd::from(window_handle),
             message,
             word_parameter,
             long_parameter,
@@ -850,7 +865,7 @@ fn empty_queue_result(
              */
             let mut queue = state.lock_message_queue();
             let quit_message = QueuedWindowMessage {
-                window_handle: 0,
+                window_handle: crate::handles::Hwnd::NULL,
                 message: WM_QUIT,
                 word_parameter: 0,
                 long_parameter: 0,
@@ -942,7 +957,7 @@ pub fn handle_get_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         tracing::debug!(
             target: "wiegui",
             message = queued.message,
-            hwnd = queued.window_handle,
+            hwnd = queued.window_handle.as_u64(),
             "GetMessage: returning message"
         );
         write_message_structure(engine, message_address, &queued)?;
@@ -973,7 +988,7 @@ pub fn handle_get_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         tracing::debug!(
             target: "wiegui",
             message = queued.message,
-            hwnd = queued.window_handle,
+            hwnd = queued.window_handle.as_u64(),
             "GetMessage: returning synthesized message"
         );
         write_message_structure(engine, message_address, &queued)?;
@@ -1060,8 +1075,8 @@ pub(crate) fn handle_default_window_procedure(
         "DefWindowProc fallthrough"
     );
 
-    let return_value: u64 = match msg {
-        WM_CLOSE => {
+    let return_value: u64 = match WinMsg::from(msg) {
+        WinMsg::WM_CLOSE => {
             // Post WM_DESTROY to self
             tracing::debug!(
                 target: "wiegui",
@@ -1074,7 +1089,7 @@ pub(crate) fn handle_default_window_procedure(
                 .checked_add(1)
                 .context("DefWindowProc: message time overflow")?;
             queue.messages.push(QueuedWindowMessage {
-                window_handle: hwnd,
+                window_handle: crate::handles::Hwnd::from(hwnd),
                 message: WM_DESTROY,
                 word_parameter: 0,
                 long_parameter: 0,
@@ -1084,16 +1099,16 @@ pub(crate) fn handle_default_window_procedure(
             });
             0
         }
-        WM_ERASEBKGND => {
+        WinMsg::WM_ERASEBKGND => {
             // DefWindowProc fills the class-brush background and returns
             // nonzero when a brush erased it (host-side, no guest callback).
             u64::from(erase_window_background(state, hwnd))
         }
-        WM_SETCURSOR => {
+        WinMsg::WM_SETCURSOR => {
             // Cursor handled: unconditional success.
             1
         }
-        WM_PAINT => {
+        WinMsg::WM_PAINT => {
             // Validate the window to prevent livelock
             if let Some(window) = find_window_mut(state, hwnd) {
                 window.invalidated = false;
@@ -1102,7 +1117,7 @@ pub(crate) fn handle_default_window_procedure(
             }
             0
         }
-        WM_SYSCOMMAND if wparam == SC_CLOSE => {
+        WinMsg::WM_SYSCOMMAND if wparam == SC_CLOSE => {
             // Same as WM_CLOSE
             let mut queue = state.lock_message_queue();
             let time = queue.next_message_time;
@@ -1110,7 +1125,7 @@ pub(crate) fn handle_default_window_procedure(
                 .checked_add(1)
                 .context("DefWindowProc: message time overflow")?;
             queue.messages.push(QueuedWindowMessage {
-                window_handle: hwnd,
+                window_handle: crate::handles::Hwnd::from(hwnd),
                 message: WM_CLOSE,
                 word_parameter: 0,
                 long_parameter: 0,
@@ -1224,7 +1239,7 @@ pub fn handle_dispatch_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         .window_state()
         .windows
         .iter()
-        .find(|window| window.handle == window_handle);
+        .find(|window| window.handle == crate::handles::Hwnd::from(window_handle));
 
     /*
      * Thread messages have hwnd == NULL and therefore no target WndProc.
@@ -1363,7 +1378,7 @@ pub fn handle_post_quit_message(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .context("PostQuitMessage: message time overflow")?;
 
     queue.messages.push(QueuedWindowMessage {
-        window_handle: 0,
+        window_handle: crate::handles::Hwnd::NULL,
         message: WM_QUIT,
         word_parameter: exit_code,
         long_parameter: 0,

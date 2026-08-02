@@ -17,7 +17,8 @@ pub use backend::{
     read_all_host, remove_dir_host, remove_file_host, rename_host, stat_path,
 };
 pub use encoding::{
-    CP_ACP, CP_OEMCP, CP_UTF8, decode_acp, encode_acp, multibyte_to_wide, wide_to_multibyte,
+    CP_ACP, CP_OEMCP, CP_UTF8, decode_acp, decode_ansi_utf8_first, encode_acp, multibyte_to_wide,
+    wide_to_multibyte,
 };
 pub use path::{
     guest_basename, guest_parent, is_windows_absolute_path, normalize_windows_path_components,

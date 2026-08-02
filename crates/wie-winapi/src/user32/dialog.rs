@@ -27,7 +27,7 @@ use super::{
     IDCANCEL, QueuedWindowMessage, VK_ESCAPE, VK_RETURN, VK_SHIFT, VK_TAB, WM_COMMAND,
     WM_INITDIALOG, WM_KEYDOWN, WM_QUIT, WS_CHILD, WS_CLIPCHILDREN, WS_TABSTOP, WS_VISIBLE,
     WinApiControlSignal, WinApiHandlerResult, WinApiState, WindowClassIdentifier, WindowRecord,
-    checked_field_address, create_window_record, find_window, find_window_mut,
+    checked_field_address, create_window_record, find_window, find_window_mut, make_command_wparam,
     message::handle_default_window_procedure, read_guest_ansi_lossy, read_guest_u32,
     read_guest_u64, read_guest_utf16_lossy, window::deliver_focus_change, window_client_size,
     write_guest_ansi_c_string, write_guest_utf16_c_string,
@@ -134,6 +134,10 @@ fn handle_create_dialog_param(
         );
     }
 
+    // A modal dialog takes activation (real Windows): GetActiveWindow must
+    // return the dialog while it is open — guests post Enter/keys to it.
+    state.window_state().active_window_handle = crate::handles::Hwnd::from(dialog_hwnd);
+
     // Dialogs paint on open: mark the dialog and its controls invalidated so
     // the first empty GetMessage synthesizes their WM_PAINTs.
     for hwnd in subtree {
@@ -148,7 +152,7 @@ fn handle_create_dialog_param(
     // reads a control.
     let first_tabstop = first_tabstop_child(state, dialog_hwnd);
     if first_tabstop != 0 {
-        state.window_state().focus_window_handle = first_tabstop;
+        state.window_state().focus_window_handle = crate::handles::Hwnd::from(first_tabstop);
         // The focused control receives WM_SETFOCUS (host-side — controls have
         // no guest WndProc, so no bridge signal).
         let _ = deliver_focus_change(
@@ -349,9 +353,9 @@ fn build_dialog_item(
             state
                 .window_state()
                 .control_states
-                .entry(hwnd)
-                .or_default()
-                .default_push = true;
+                .entry(crate::handles::Hwnd::from(hwnd))
+                .or_insert_with(|| super::controls::ControlClassKind::Button.new_state())
+                .set_default_push(true);
         }
     }
     Ok((hwnd != 0).then_some(hwnd))
@@ -379,8 +383,12 @@ fn first_tabstop_child(state: &WinApiState, dialog_hwnd: u64) -> u64 {
     state.try_window_state().map_or(0, |ws| {
         ws.windows
             .iter()
-            .find(|w| w.parent_handle == dialog_hwnd && w.visible && w.style & WS_TABSTOP != 0)
-            .map_or(0, |w| w.handle)
+            .find(|w| {
+                w.parent_handle == crate::handles::Hwnd::from(dialog_hwnd)
+                    && w.visible
+                    && w.style & WS_TABSTOP != 0
+            })
+            .map_or(0, |w| w.handle.as_u64())
     })
 }
 
@@ -427,7 +435,7 @@ pub(crate) fn paint_dialog(state: &mut WinApiState, hwnd: u64) {
         .window_state()
         .windows
         .iter()
-        .filter(|w| w.parent_handle == hwnd && w.visible)
+        .filter(|w| w.parent_handle == crate::handles::Hwnd::from(hwnd) && w.visible)
         .map(|w| IRect {
             left: w.x,
             top: w.y,
@@ -458,7 +466,6 @@ pub(crate) fn paint_dialog(state: &mut WinApiState, hwnd: u64) {
             rect.width(),
             rect.height(),
             DIALOG_BG,
-            false,
         );
     }
     // 1 px border around the dialog (classic 3D shadow gray).
@@ -481,13 +488,14 @@ pub(crate) fn paint_dialog(state: &mut WinApiState, hwnd: u64) {
                 rect.2,
                 rect.3,
                 DIALOG_BORDER,
-                false,
             );
         }
     }
     // One publish for the whole face + border (per-piece publishes would fire
-    // the wake callback once per decomposed rect).
-    state.present().publish(info.hwnd);
+    // the wake callback once per decomposed rect). B3.6: deferred — the
+    // runtime drains pending publishes once per repaint cycle, so the
+    // dialog face and the control paints that follow it emit one frame.
+    state.present().publish_deferred(info.hwnd);
 }
 
 /// Handles `USER32.dll!EndDialog`.
@@ -523,7 +531,7 @@ pub fn handle_end_dialog(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
             let time = queue.next_message_time;
             queue.next_message_time = time.wrapping_add(1);
             queue.messages.push(QueuedWindowMessage {
-                window_handle: 0,
+                window_handle: crate::handles::Hwnd::NULL,
                 message: WM_QUIT,
                 word_parameter: result,
                 long_parameter: 0,
@@ -533,12 +541,17 @@ pub fn handle_end_dialog(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
             });
         }
 
-        // Remove the dialog subtree so the owner's next repaint erases the
-        // region (the presentation model composites the dialog into the owner).
+        // Remove the dialog subtree, then rerender the WHOLE window in one
+        // cycle: invalidate the owner (with erase, so the class brush
+        // repaints its background over the dialog region) and every remaining
+        // descendant (so controls repaint over the dialog face too — no
+        // piecemeal per-control disappearance, no patchy background).
         let owner = remove_dialog_subtree(state, dialog_hwnd);
         if let Some(window) = find_window_mut(state, owner) {
             window.invalidated = true;
+            window.erase_background = true;
         }
+        invalidate_subtree(state, crate::handles::Hwnd::from(owner));
 
         1
     } else {
@@ -559,8 +572,8 @@ pub fn handle_end_dialog(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 /// Returns the dialog's owner handle (0 when unknown) so the caller can
 /// invalidate it.
 fn remove_dialog_subtree(state: &mut WinApiState, dialog_hwnd: u64) -> u64 {
-    let owner = find_window(state, dialog_hwnd).map_or(0, |w| w.parent_handle);
-    let mut doomed = vec![dialog_hwnd];
+    let owner = find_window(state, dialog_hwnd).map_or(0, |w| w.parent_handle.as_u64());
+    let mut doomed: Vec<crate::handles::Hwnd> = vec![crate::handles::Hwnd::from(dialog_hwnd)];
     loop {
         let before = doomed.len();
         for window in &state.window_state().windows {
@@ -580,6 +593,27 @@ fn remove_dialog_subtree(state: &mut WinApiState, dialog_hwnd: u64) -> u64 {
         state.window_state().control_states.remove(&hwnd);
     }
     owner
+}
+
+/// Mark `hwnd` and every descendant invalidated so the next paint cycle
+/// repaints the whole subtree in one pass — the full-window rerender after a
+/// modal dialog closes (the dialog composited into the owner surface, so the
+/// owner background and all remaining controls must repaint over its region).
+fn invalidate_subtree(state: &mut WinApiState, hwnd: crate::handles::Hwnd) {
+    if let Some(window) = find_window_mut(state, hwnd.as_u64()) {
+        window.invalidated = true;
+    }
+    let mut frontier: Vec<crate::handles::Hwnd> = vec![hwnd];
+    while !frontier.is_empty() {
+        let mut next: Vec<crate::handles::Hwnd> = Vec::new();
+        for window in &mut state.window_state().windows {
+            if frontier.contains(&window.parent_handle) {
+                window.invalidated = true;
+                next.push(window.handle);
+            }
+        }
+        frontier = next;
+    }
 }
 
 /// Outcome of an `IsDialogMessage` keyboard translation.
@@ -709,7 +743,7 @@ fn handle_is_dialog_message(
                     callback_address: dialog_proc,
                     window_handle: dialog_hwnd,
                     message: WM_COMMAND,
-                    word_parameter: id.wrapping_add(BN_CLICKED << 16),
+                    word_parameter: make_command_wparam(id, BN_CLICKED),
                     long_parameter: 0,
                     unicode: dialog_unicode,
                     outer_return: OuterReturn::Fixed(1),
@@ -732,7 +766,7 @@ fn handle_is_dialog_message(
                     callback_address: dialog_proc,
                     window_handle: dialog_hwnd,
                     message: WM_COMMAND,
-                    word_parameter: id.wrapping_add(BN_CLICKED << 16),
+                    word_parameter: make_command_wparam(id, BN_CLICKED),
                     long_parameter: 0,
                     unicode: dialog_unicode,
                     outer_return: OuterReturn::Fixed(1),
@@ -755,11 +789,15 @@ fn advance_dialog_focus(
     dialog_hwnd: u64,
     reverse: bool,
 ) -> Result<Option<WinApiControlSignal>> {
-    let tabstop: Vec<u64> = state
+    let tabstop: Vec<crate::handles::Hwnd> = state
         .window_state()
         .windows
         .iter()
-        .filter(|w| w.parent_handle == dialog_hwnd && w.visible && w.style & WS_TABSTOP != 0)
+        .filter(|w| {
+            w.parent_handle == crate::handles::Hwnd::from(dialog_hwnd)
+                && w.visible
+                && w.style & WS_TABSTOP != 0
+        })
         .map(|w| w.handle)
         .collect();
     if tabstop.is_empty() {
@@ -786,9 +824,18 @@ fn advance_dialog_focus(
         (None, false) => 0,
         (None, true) => len.saturating_sub(1),
     };
-    let next = tabstop.get(next_index).copied().unwrap_or(0);
+    let next = tabstop
+        .get(next_index)
+        .copied()
+        .unwrap_or(crate::handles::Hwnd::NULL);
     state.window_state().focus_window_handle = next;
-    deliver_focus_change(state, engine, current, next, OuterReturn::Fixed(1))
+    deliver_focus_change(
+        state,
+        engine,
+        current.as_u64(),
+        next.as_u64(),
+        OuterReturn::Fixed(1),
+    )
 }
 
 /// The dialog's default push button (`BS_DEFPUSHBUTTON`), in creation order.
@@ -798,22 +845,22 @@ fn advance_dialog_focus(
 #[must_use]
 fn default_push_button(state: &WinApiState, dialog_hwnd: u64) -> Option<u64> {
     let ws = state.try_window_state()?;
-    let default: Vec<u64> = ws
+    let default: Vec<crate::handles::Hwnd> = ws
         .windows
         .iter()
         .filter(|w| {
-            w.parent_handle == dialog_hwnd
+            w.parent_handle == crate::handles::Hwnd::from(dialog_hwnd)
                 && w.visible
                 && w.control_kind == Some(super::controls::ControlClassKind::Button)
         })
         .filter(|w| {
             ws.control_states
                 .get(&w.handle)
-                .is_some_and(|ui| ui.default_push)
+                .is_some_and(super::controls::ControlState::is_default_push)
         })
         .map(|w| w.handle)
         .collect();
-    default.first().copied()
+    default.first().copied().map(crate::handles::Hwnd::as_u64)
 }
 
 /// The focused push button of a dialog, when the focus is one of its buttons.
@@ -829,10 +876,10 @@ fn focused_dialog_button(state: &WinApiState, dialog_hwnd: u64) -> Option<u64> {
         .iter()
         .find(|w| {
             w.handle == focus
-                && w.parent_handle == dialog_hwnd
+                && w.parent_handle == crate::handles::Hwnd::from(dialog_hwnd)
                 && w.control_kind == Some(super::controls::ControlClassKind::Button)
         })
-        .map(|w| w.handle)
+        .map(|w| w.handle.as_u64())
 }
 
 /// Whether the Shift key is held (per the guest keyboard state).
@@ -884,11 +931,12 @@ fn get_dlg_item(state: &WinApiState, dialog_hwnd: u64, id: u16) -> u64 {
     state
         .try_window_state()
         .and_then(|ws| {
-            ws.windows
-                .iter()
-                .find(|w| w.parent_handle == dialog_hwnd && w.menu_handle == u64::from(id))
+            ws.windows.iter().find(|w| {
+                w.parent_handle == crate::handles::Hwnd::from(dialog_hwnd)
+                    && w.menu_handle == u64::from(id)
+            })
         })
-        .map_or(0, |w| w.handle)
+        .map_or(0, |w| w.handle.as_u64())
 }
 
 /// Handles `USER32.dll!GetDlgItemTextA`.
@@ -1017,7 +1065,9 @@ pub fn handle_def_dlg_proc_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
 
 /// Read-only window lookup (for helpers holding `&WinApiState`).
 fn find_window_ref(state: &WinApiState, handle: u64) -> Option<&WindowRecord> {
-    state
-        .try_window_state()
-        .and_then(|ws| ws.windows.iter().find(|window| window.handle == handle))
+    state.try_window_state().and_then(|ws| {
+        ws.windows
+            .iter()
+            .find(|window| window.handle == crate::handles::Hwnd::from(handle))
+    })
 }

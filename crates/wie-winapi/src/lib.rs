@@ -13,6 +13,7 @@ pub mod comdlg32;
 pub mod console;
 pub mod d3d9;
 pub mod d3d9_render;
+pub mod d3d9_shader;
 pub mod dll_loader;
 pub mod dynamic_apis;
 pub mod pthread;
@@ -24,6 +25,7 @@ pub mod guest_heap;
 pub mod guest_io_host;
 mod guest_memory;
 mod guest_string;
+pub mod handles;
 pub mod idle;
 pub mod kernel32;
 pub mod mingw_dispatch;
@@ -54,10 +56,10 @@ mod exception_helpers;
 mod exception_tests;
 // HostParkReason is defined with WinApiControlSignal below.
 pub use fake_va::{
-    COM_IFACE_IDIRECT3D9, COM_IFACE_IDIRECT3DDEVICE9, FAKE_API_BASE, FAKE_API_SIZE, FakeVa,
-    SPECIAL_CALLBACK_RETURN, SPECIAL_SEH_CONTINUE, callback_return_trampoline_va,
-    decode as decode_fake_va, encode_alias, encode_com, encode_export, encode_unresolved,
-    seh_continue_trampoline_va,
+    ComMethod, D3d9Iface, Device9Method, Direct3D9Method, FAKE_API_BASE, FAKE_API_SIZE, FakeVa,
+    PixelShader9Method, SPECIAL_CALLBACK_RETURN, SPECIAL_SEH_CONTINUE, Surface9Method,
+    Texture9Method, VertexShader9Method, callback_return_trampoline_va, decode as decode_fake_va,
+    encode_alias, encode_com, encode_export, encode_unresolved, seh_continue_trampoline_va,
 };
 pub use guest_heap::GuestHeap;
 pub use idle::{IdleContext, IdlePolicy};
@@ -183,9 +185,11 @@ pub struct ModuleState {
 pub struct D3D9State {
     pub d3d9_current_vertex_shader: u64,
     pub d3d9_current_fvf: u32,
-    pub d3d9_render_states: Vec<(u32, u32)>,
-    pub d3d9_texture_stage_states: Vec<(u32, u32, u32)>,
-    pub d3d9_sampler_states: Vec<(u32, u32, u32)>,
+    /// Typed device render state (`D3DRS_*`), decoded at the Set/GetRenderState
+    /// register boundary.
+    pub d3d9_render_state: crate::d3d9_render::RenderState,
+    /// Per-stage texture state (TSS + sampler), indexed by stage (0..8).
+    pub d3d9_stage_states: [crate::d3d9_render::TextureStageState; 8],
     pub d3d9_device_object_address: u64,
     pub d3d9_device_ref_count: u32,
     pub d3d9_object_address: u64,
@@ -202,7 +206,7 @@ pub struct D3D9State {
     /// memory directly and the rasterizer owns the buffer outright.
     pub d3d9_backbuffer: Vec<u32>,
     /// Window handle that receives Present frames (hDeviceWindow).
-    pub d3d9_present_hwnd: u64,
+    pub d3d9_present_hwnd: crate::handles::Hwnd,
     /// Whether BeginScene has been called (and EndScene has not).
     pub d3d9_scene_active: bool,
     /// Fixed-function world matrix (`D3DTS_WORLD`).
@@ -223,6 +227,29 @@ pub struct D3D9State {
     pub d3d9_stream_stride: u32,
     /// `SetIndices` index pointer (buffer form; unused in slice 1).
     pub d3d9_index_buffer_va: u64,
+    // ── P4b texture state ───────────────────────────────────────────────
+    /// Texture records keyed by the texture object's guest VA.
+    pub d3d9_textures: HashMap<u64, crate::d3d9::TextureRecord>,
+    /// Surface object VA → texture object VA (`GetSurfaceLevel` views).
+    pub d3d9_surface_textures: HashMap<u64, u64>,
+    /// Per-stage (0..8) texture binding (0 = none).
+    pub d3d9_texture_bindings: [u64; 8],
+    // ── P4c depth-stencil state ─────────────────────────────────────────
+    /// Depth-stencil surfaces keyed by the surface object's guest VA.
+    pub d3d9_depth_surfaces: HashMap<u64, crate::d3d9::DepthStencilRecord>,
+    /// Bound depth-stencil surface VA (0 = none).
+    pub d3d9_depth_stencil: u64,
+    // ── P5a shader state ────────────────────────────────────────────────
+    /// Pixel/vertex shader records keyed by the shader object's guest VA.
+    pub d3d9_shaders: HashMap<u64, crate::d3d9_shader::ShaderRecord>,
+    /// Bound pixel shader VA (0 = none — the FFP path runs).
+    pub d3d9_pixel_shader: u64,
+    /// Pixel-shader constant registers `c0..c31` (float4, set via
+    /// `SetPixelShaderConstantF`; `def` at Create* time writes these too).
+    pub d3d9_ps_constants: [[f32; 4]; crate::d3d9_shader::PS_CONST_COUNT],
+    /// Vertex-shader constant registers `c0..c255` (stored; the vertex stage
+    /// stays FFP until P5a-2 executes vertex shaders).
+    pub d3d9_vs_constants: [[f32; 4]; crate::d3d9_shader::VS_CONST_COUNT],
 }
 
 impl Default for D3D9State {
@@ -230,9 +257,10 @@ impl Default for D3D9State {
         Self {
             d3d9_current_vertex_shader: 0,
             d3d9_current_fvf: 0,
-            d3d9_render_states: Vec::new(),
-            d3d9_texture_stage_states: Vec::new(),
-            d3d9_sampler_states: Vec::new(),
+            d3d9_render_state: crate::d3d9_render::RenderState::default(),
+            d3d9_stage_states: std::array::from_fn(|_| {
+                crate::d3d9_render::TextureStageState::default()
+            }),
             d3d9_device_object_address: 0,
             d3d9_device_ref_count: 0,
             d3d9_object_address: 0,
@@ -240,7 +268,7 @@ impl Default for D3D9State {
             d3d9_backbuffer_width: 0,
             d3d9_backbuffer_height: 0,
             d3d9_backbuffer: Vec::new(),
-            d3d9_present_hwnd: 0,
+            d3d9_present_hwnd: crate::handles::Hwnd::NULL,
             d3d9_scene_active: false,
             // D3D9's default transform state is the identity matrix (a zero
             // matrix would map every vertex to w=0 and reject all draws).
@@ -252,6 +280,15 @@ impl Default for D3D9State {
             d3d9_stream_source_va: 0,
             d3d9_stream_stride: 0,
             d3d9_index_buffer_va: 0,
+            d3d9_textures: HashMap::new(),
+            d3d9_surface_textures: HashMap::new(),
+            d3d9_texture_bindings: [0; 8],
+            d3d9_depth_surfaces: HashMap::new(),
+            d3d9_depth_stencil: 0,
+            d3d9_shaders: HashMap::new(),
+            d3d9_pixel_shader: 0,
+            d3d9_ps_constants: [[0.0; 4]; crate::d3d9_shader::PS_CONST_COUNT],
+            d3d9_vs_constants: [[0.0; 4]; crate::d3d9_shader::VS_CONST_COUNT],
         }
     }
 }
@@ -288,10 +325,10 @@ pub struct WindowState {
     pub image_list_background_colors: Vec<(u64, u32)>,
     pub window_visible: bool,
     pub window_enabled: bool,
-    pub active_window_handle: u64,
-    pub foreground_window_handle: u64,
-    pub focus_window_handle: u64,
-    pub capture_window_handle: u64,
+    pub active_window_handle: crate::handles::Hwnd,
+    pub foreground_window_handle: crate::handles::Hwnd,
+    pub focus_window_handle: crate::handles::Hwnd,
+    pub capture_window_handle: crate::handles::Hwnd,
     pub cursor_handle: u64,
     pub window_title: String,
     pub window_x: i32,
@@ -306,9 +343,12 @@ pub struct WindowState {
     pub global_atoms: Vec<GlobalAtomRecord>,
     pub next_windows_hook_handle: u64,
     pub windows_hooks: Vec<WindowsHookRecord>,
-    pub menu_item_states: Vec<(u64, u32, u32)>,
-    pub menu_item_check_states: Vec<(u64, u32, u32)>,
-    pub menu_items: Vec<MenuItemRecord>,
+    /// All fake USER32 menus; each owns its items as a tree via `Popup`
+    /// submenu links (`menu.rs`).
+    pub menus: Vec<crate::user32::menu::MenuRecord>,
+    /// Set by any menu mutation so the host menu-bar sync rebuilds its cached
+    /// tree instead of reconstructing it every frame.
+    pub menu_dirty: bool,
     /// Class-level `SetClassLongPtr` values keyed by (class atom, signed index).
     pub class_long_ptr_values: Vec<(u16, i64, u64)>,
     pub message_queue_idle_policy: MessageQueueIdlePolicy,
@@ -317,7 +357,8 @@ pub struct WindowState {
     pub next_window_handle: u64,
     pub windows: Vec<WindowRecord>,
     /// Per-window UI state for built-in controls (pressed/focus/items).
-    pub control_states: std::collections::HashMap<u64, crate::user32::controls::ControlUiState>,
+    pub control_states:
+        std::collections::HashMap<crate::handles::Hwnd, crate::user32::controls::ControlState>,
     pub file_dialog_policy: FileDialogPolicy,
     pub last_file_dialog_path: Option<String>,
     pub comm_dlg_extended_error: u32,
@@ -344,10 +385,10 @@ impl Default for WindowState {
             image_list_background_colors: Vec::new(),
             window_visible: false,
             window_enabled: false,
-            active_window_handle: 0,
-            foreground_window_handle: 0,
-            focus_window_handle: 0,
-            capture_window_handle: 0,
+            active_window_handle: crate::handles::Hwnd::NULL,
+            foreground_window_handle: crate::handles::Hwnd::NULL,
+            focus_window_handle: crate::handles::Hwnd::NULL,
+            capture_window_handle: crate::handles::Hwnd::NULL,
             cursor_handle: 0,
             window_title: String::new(),
             window_x: 0,
@@ -359,9 +400,6 @@ impl Default for WindowState {
             timers: Vec::new(),
             global_atoms: Vec::new(),
             windows_hooks: Vec::new(),
-            menu_item_states: Vec::new(),
-            menu_item_check_states: Vec::new(),
-            menu_items: Vec::new(),
             class_long_ptr_values: Vec::new(),
             message_queue_idle_policy: MessageQueueIdlePolicy::default(),
             window_classes: Vec::new(),
@@ -370,9 +408,12 @@ impl Default for WindowState {
             file_dialog_policy: FileDialogPolicy::default(),
             last_file_dialog_path: None,
             comm_dlg_extended_error: 0,
+            menus: Vec::new(),
+            menu_dirty: false,
         }
     }
 }
+
 #[derive(Debug, Clone)]
 pub struct ProcessState {
     pub last_error: u32,
@@ -877,7 +918,7 @@ pub struct WindowClassRecord {
 )]
 pub struct WindowRecord {
     /// Runtime-owned fake HWND.
-    pub handle: u64,
+    pub handle: crate::handles::Hwnd,
 
     /// Registered class atom.
     pub class_atom: u16,
@@ -901,7 +942,7 @@ pub struct WindowRecord {
     pub extended_style: u32,
 
     /// Parent or owner window.
-    pub parent_handle: u64,
+    pub parent_handle: crate::handles::Hwnd,
 
     /// Menu handle or child-window identifier.
     pub menu_handle: u64,
@@ -944,6 +985,21 @@ pub struct WindowRecord {
     /// With no tracking request Windows sends no `WM_MOUSEHOVER` /
     /// `WM_MOUSELEAVE`; the host forwards those only for tracked windows.
     pub mouse_tracking: bool,
+
+    /// Mouse press tracking shared by every control kind.
+    ///
+    /// The `WM_LBUTTONDOWN` / `WM_LBUTTONUP` dispatch arms press and release
+    /// every control (a release delivers `BN_CLICKED`); only BUTTONs render or
+    /// report the bit (`BM_GETSTATE` / `BM_SETSTATE`), so it lives on the
+    /// window record rather than in a per-kind variant.
+    pub pressed: bool,
+
+    /// Keyboard focus tracking shared by every control kind.
+    ///
+    /// Set by `WM_SETFOCUS` / `WM_KILLFOCUS` (and a click on a non-STATIC
+    /// control) for any kind; only BUTTON (`BM_GETSTATE`'s `BST_FOCUS`) and
+    /// EDIT (caret visibility) read it back.
+    pub focused: bool,
 
     /// Client rectangle (left, top, right, bottom).
     pub client_rect: (i32, i32, i32, i32),
@@ -1005,7 +1061,7 @@ pub struct GuestCallbackRequest {
 #[derive(Debug, Clone)]
 pub struct QueuedWindowMessage {
     /// Target window handle.
-    pub window_handle: u64,
+    pub window_handle: crate::handles::Hwnd,
 
     /// Numeric Windows message identifier.
     pub message: u32,
@@ -1059,7 +1115,7 @@ pub struct GlobalAtomRecord {
 #[derive(Debug, Clone)]
 pub struct TimerRecord {
     /// Window associated with the timer, or zero for a thread timer.
-    pub window_handle: u64,
+    pub window_handle: crate::handles::Hwnd,
 
     /// Timer identifier.
     pub timer_id: u64,
@@ -1076,22 +1132,6 @@ pub struct TimerRecord {
     /// the deterministic fake `next_message_time` scheme — real Windows timers
     /// are clock-driven too.
     pub next_fire: std::time::Instant,
-}
-
-/// One item appended to a fake USER32 menu.
-#[derive(Debug, Clone)]
-pub struct MenuItemRecord {
-    /// Menu handle the item belongs to.
-    pub menu_handle: u64,
-
-    /// Item identifier (`MF_STRING` id or submenu handle for `MF_POPUP`).
-    pub id: u32,
-
-    /// `MF_*` flags supplied by `AppendMenuA/W`.
-    pub flags: u32,
-
-    /// Item text (empty for separators / submenus without text).
-    pub text: String,
 }
 
 /// Fake resource record.
@@ -1737,7 +1777,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .messages
             .push(QueuedWindowMessage {
-                window_handle: 0x100,
+                window_handle: crate::handles::Hwnd::from(0x100),
                 message: 15, // WM_PAINT
                 word_parameter: 0,
                 long_parameter: 0,
@@ -1785,7 +1825,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .messages
             .push(QueuedWindowMessage {
-                window_handle: 0x100,
+                window_handle: crate::handles::Hwnd::from(0x100),
                 message: 15,
                 word_parameter: 0,
                 long_parameter: 0,
@@ -1832,7 +1872,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .messages
             .push(QueuedWindowMessage {
-                window_handle: 0x1234,
+                window_handle: crate::handles::Hwnd::from(0x1234),
                 message: 0x12, // WM_QUIT
                 word_parameter: 7,
                 long_parameter: 0,
@@ -1878,15 +1918,15 @@ mod tests {
         let child = 0x6610_0003_u64;
         let ws = state.window_state();
         ws.windows.push(WindowRecord {
-            handle: owner,
+            handle: crate::handles::Hwnd::from(owner),
             title: "Owner".to_owned(),
             width: 100,
             height: 100,
             ..Default::default()
         });
         ws.windows.push(WindowRecord {
-            handle: dialog,
-            parent_handle: owner,
+            handle: crate::handles::Hwnd::from(dialog),
+            parent_handle: crate::handles::Hwnd::from(owner),
             title: "Dialog".to_owned(),
             dialog_proc: 0x7000_0001,
             width: 80,
@@ -1894,8 +1934,8 @@ mod tests {
             ..Default::default()
         });
         ws.windows.push(WindowRecord {
-            handle: child,
-            parent_handle: dialog,
+            handle: crate::handles::Hwnd::from(child),
+            parent_handle: crate::handles::Hwnd::from(dialog),
             control_kind: Some(crate::user32::controls::ControlClassKind::Button),
             control_text: "OK".to_owned(),
             menu_handle: 1,
@@ -1911,7 +1951,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .messages
             .push(QueuedWindowMessage {
-                window_handle: child,
+                window_handle: crate::handles::Hwnd::from(child),
                 message: 0x0100, // WM_KEYDOWN
                 word_parameter: 0x09,
                 long_parameter: 0,
@@ -2530,7 +2570,7 @@ mod tests {
         let hwnd = 0x100;
         let hmenu = 0x200;
         state.window_state().windows.push(crate::WindowRecord {
-            handle: hwnd,
+            handle: crate::handles::Hwnd::from(hwnd),
             menu_handle: hmenu,
             ..Default::default()
         });
@@ -2542,6 +2582,331 @@ mod tests {
         ))
         .expect("GetMenu");
         assert_eq!(r.return_value, hmenu);
+    }
+
+    // ── USER32 menu tree (P1): MenuRecord / MenuEntry / menu_dirty ─────
+
+    /// Invoke `CreateMenu` and return the allocated handle.
+    fn create_menu(state: &mut WinApiState) -> u64 {
+        let mut engine = test_engine();
+        write_regs(&mut engine, 0, 0, 0, 0, STACK_TOP);
+        let r = user32::handle_create_menu(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            state,
+        ))
+        .expect("CreateMenu");
+        r.return_value
+    }
+
+    /// Invoke `AppendMenuA(menu, flags, item_id, text_ptr)`, writing `text`
+    /// into guest memory first (empty text uses a null pointer).
+    fn append_menu_a(
+        engine: &mut IcedCpu,
+        state: &mut WinApiState,
+        menu: u64,
+        flags: u32,
+        item_id: u32,
+        text: &str,
+    ) {
+        let text_ptr = if text.is_empty() {
+            0
+        } else {
+            engine
+                .mem_write(0x2000, text.as_bytes())
+                .expect("write menu text");
+            0x2000
+        };
+        write_regs(
+            engine,
+            menu,
+            u64::from(flags),
+            u64::from(item_id),
+            text_ptr,
+            0,
+        );
+        assert_return_value!(
+            user32::handle_append_menu_a(&mut HandlerContext::new(
+                engine,
+                test_environment(),
+                state,
+            )),
+            1
+        );
+    }
+
+    /// A menu with `Item(100, "Exit")`, a `Separator`, and `Item(200, "About")`.
+    fn push_two_item_menu(state: &mut WinApiState) -> u64 {
+        let menu = create_menu(state);
+        let mut engine = test_engine();
+        append_menu_a(&mut engine, state, menu, 0x0000, 100, "Exit");
+        append_menu_a(&mut engine, state, menu, 0x0800, 0, ""); // MF_SEPARATOR
+        append_menu_a(&mut engine, state, menu, 0x0000, 200, "About");
+        menu
+    }
+
+    #[test]
+    fn test_append_menu_builds_native_tree() {
+        let mut state = default_winapi_state();
+        let menu = create_menu(&mut state);
+        assert!(
+            !state.window_state().menu_dirty,
+            "CreateMenu alone must not dirty the tree (empty menu changes nothing)"
+        );
+        let popup = create_menu(&mut state);
+        let mut engine = test_engine();
+        append_menu_a(&mut engine, &mut state, menu, 0x0000, 100, "Exit");
+        append_menu_a(&mut engine, &mut state, menu, 0x0800, 0, "");
+        append_menu_a(
+            &mut engine,
+            &mut state,
+            menu,
+            0x0010,
+            u32::try_from(popup).expect("popup handle"),
+            "File",
+        ); // MF_POPUP
+
+        assert!(state.window_state().menu_dirty, "AppendMenu must dirty");
+        let record = state
+            .window_state()
+            .menus
+            .iter()
+            .find(|m| m.handle == crate::handles::Hmenu::from(menu))
+            .expect("menu record exists");
+        assert_eq!(record.items.len(), 3);
+        assert!(
+            matches!(
+                record.items.first(),
+                Some(crate::user32::menu::MenuEntry::Item { id, text, enabled: true, checked: false })
+                    if *id == 100 && text == "Exit"
+            ),
+            "first entry must be the Exit item"
+        );
+        assert!(
+            matches!(
+                record.items.get(1),
+                Some(crate::user32::menu::MenuEntry::Separator)
+            ),
+            "second entry must be a separator"
+        );
+        assert!(
+            matches!(
+                record.items.get(2),
+                Some(crate::user32::menu::MenuEntry::Popup { text, submenu })
+                    if text == "File" && submenu.as_u64() == popup
+            ),
+            "third entry must be the File popup linking the submenu handle"
+        );
+    }
+
+    #[test]
+    fn test_get_menu_state_by_command_and_position() {
+        let mut state = default_winapi_state();
+        let menu = push_two_item_menu(&mut state);
+        let mut engine = test_engine();
+
+        // By command: an enabled, unchecked item reports flag 0.
+        write_regs(&mut engine, menu, 100, 0, 0, 0);
+        assert_return_value!(
+            user32::handle_get_menu_state(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            0
+        );
+
+        // By position: index 1 is the separator.
+        write_regs(&mut engine, menu, 1, 0x0400, 0, 0); // MF_BYPOSITION
+        assert_return_value!(
+            user32::handle_get_menu_state(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            0x0800
+        );
+
+        // Unknown command id returns -1.
+        write_regs(&mut engine, menu, 999, 0, 0, 0);
+        assert_return_value!(
+            user32::handle_get_menu_state(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            u64::from(u32::MAX)
+        );
+    }
+
+    #[test]
+    fn test_enable_menu_item_mutates_item_state() {
+        let mut state = default_winapi_state();
+        let menu = push_two_item_menu(&mut state);
+        let mut engine = test_engine();
+
+        // First enable returns the previous state (0 = enabled) and grays it.
+        write_regs(&mut engine, menu, 100, 0x0001, 0, 0); // MF_GRAYED
+        assert_return_value!(
+            user32::handle_enable_menu_item(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            0
+        );
+        assert!(
+            matches!(
+                state
+                    .window_state()
+                    .menus
+                    .iter()
+                    .find(|m| m.handle == crate::handles::Hmenu::from(menu))
+                    .expect("record")
+                    .items
+                    .first(),
+                Some(crate::user32::menu::MenuEntry::Item { enabled: false, .. })
+            ),
+            "MF_GRAYED must disable the item in the tree"
+        );
+
+        // GetMenuState now reports MF_GRAYED.
+        write_regs(&mut engine, menu, 100, 0, 0, 0);
+        assert_return_value!(
+            user32::handle_get_menu_state(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            0x0001
+        );
+
+        // Re-enabling returns the previous MF_GRAYED state.
+        write_regs(&mut engine, menu, 100, 0x0000, 0, 0); // MF_ENABLED
+        assert_return_value!(
+            user32::handle_enable_menu_item(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            0x0001
+        );
+
+        // A missing item returns -1 and does not mutate.
+        let dirty_before = state.window_state().menu_dirty;
+        write_regs(&mut engine, menu, 999, 0x0001, 0, 0);
+        assert_return_value!(
+            user32::handle_enable_menu_item(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            u64::from(u32::MAX)
+        );
+        assert_eq!(state.window_state().menu_dirty, dirty_before);
+    }
+
+    #[test]
+    fn test_check_menu_item_mutates_item_state() {
+        let mut state = default_winapi_state();
+        let menu = push_two_item_menu(&mut state);
+        let mut engine = test_engine();
+
+        write_regs(&mut engine, menu, 200, 0x0008, 0, 0); // MF_CHECKED
+        assert_return_value!(
+            user32::handle_check_menu_item(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            0
+        );
+        write_regs(&mut engine, menu, 200, 0, 0, 0);
+        assert_return_value!(
+            user32::handle_get_menu_state(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            0x0008
+        );
+
+        // Unchecking returns the previous MF_CHECKED state.
+        write_regs(&mut engine, menu, 200, 0x0000, 0, 0);
+        assert_return_value!(
+            user32::handle_check_menu_item(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            0x0008
+        );
+        write_regs(&mut engine, menu, 200, 0, 0, 0);
+        assert_return_value!(
+            user32::handle_get_menu_state(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            0
+        );
+    }
+
+    #[test]
+    fn test_menu_dirty_flag_semantics() {
+        let mut state = default_winapi_state();
+        assert!(!state.window_state().menu_dirty);
+
+        // SetMenu to a new menu handle dirties (the window's menu changed).
+        let menu = create_menu(&mut state);
+        state.window_state().windows.push(crate::WindowRecord {
+            handle: crate::handles::Hwnd::from(0x100),
+            ..Default::default()
+        });
+        state.window_state().menu_dirty = false;
+        let mut engine = test_engine();
+        write_regs(&mut engine, 0x100, menu, 0, 0, 0);
+        assert_return_value!(
+            user32::handle_set_menu(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            1
+        );
+        assert!(state.window_state().menu_dirty, "SetMenu must dirty");
+
+        // DestroyMenu removes the record and dirties.
+        state.window_state().menu_dirty = false;
+        write_regs(&mut engine, menu, 0, 0, 0, 0);
+        assert_return_value!(
+            user32::handle_destroy_menu(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            1
+        );
+        assert!(state.window_state().menu_dirty, "DestroyMenu must dirty");
+        assert!(
+            state
+                .window_state()
+                .menus
+                .iter()
+                .all(|m| m.handle != crate::handles::Hmenu::from(menu)),
+            "DestroyMenu must drop the record"
+        );
+
+        // GetMenuState on the destroyed menu now returns -1.
+        write_regs(&mut engine, menu, 100, 0, 0, 0);
+        assert_return_value!(
+            user32::handle_get_menu_state(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            u64::from(u32::MAX)
+        );
     }
 
     // ── GDI32 ─────────────────────────────────────────────────────────
@@ -2653,7 +3018,7 @@ mod tests {
         let button = 0x6610_0002_u64;
         let ws = state.window_state();
         ws.windows.push(WindowRecord {
-            handle: parent,
+            handle: crate::handles::Hwnd::from(parent),
             window_proc: 0x7000_0000,
             title: "Parent".to_owned(),
             width: 200,
@@ -2661,8 +3026,8 @@ mod tests {
             ..Default::default()
         });
         ws.windows.push(WindowRecord {
-            handle: button,
-            parent_handle: parent,
+            handle: crate::handles::Hwnd::from(button),
+            parent_handle: crate::handles::Hwnd::from(parent),
             control_kind: Some(crate::user32::controls::ControlClassKind::Button),
             control_text: "OK".to_owned(),
             menu_handle: 7,
@@ -2712,7 +3077,7 @@ mod tests {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
         let (parent, button) = push_button_pair(&mut state);
-        state.window_state().focus_window_handle = button;
+        state.window_state().focus_window_handle = crate::handles::Hwnd::from(button);
 
         // WM_KEYDOWN VK_SPACE on the focused button presses it.
         let r = crate::user32::controls::dispatch_control_proc(
@@ -2729,10 +3094,10 @@ mod tests {
         assert!(
             state
                 .window_state()
-                .control_states
-                .get(&button)
-                .expect("button control state exists")
-                .pressed,
+                .windows
+                .iter()
+                .find(|w| w.handle == crate::handles::Hwnd::from(button))
+                .is_some_and(|w| w.pressed),
             "space keydown must press the focused button"
         );
 
@@ -2759,7 +3124,7 @@ mod tests {
         );
 
         // Space on a NON-focused button is ignored (no press, no click).
-        state.window_state().focus_window_handle = 0;
+        state.window_state().focus_window_handle = crate::handles::Hwnd::NULL;
         let r = crate::user32::controls::dispatch_control_proc(
             &mut engine,
             &mut state,
@@ -2830,12 +3195,43 @@ mod tests {
     }
 
     #[test]
+    fn edit_message_on_a_button_does_not_touch_edit_state() {
+        use crate::user32::controls::ControlState;
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        let (_, button) = push_button_pair(&mut state);
+
+        // EM_SETSEL is an EDIT-only message: a BUTTON must not handle it...
+        let r = crate::user32::controls::dispatch_control_proc(
+            &mut engine,
+            &mut state,
+            button,
+            crate::user32::wm::WinMsg::EM_SETSEL.as_u32(),
+            2,
+            4,
+        )
+        .expect("dispatch");
+        assert!(r.is_none(), "a Button must not handle EM_SETSEL");
+
+        // ... and no EDIT-typed state may exist for the button (reading
+        // `caret` on the entry would be a compile error anyway).
+        let entry = state
+            .window_state()
+            .control_states
+            .get(&crate::handles::Hwnd::from(button));
+        assert!(
+            matches!(entry, None | Some(ControlState::Button { .. })),
+            "EM_SETSEL on a Button must not create EDIT state, got {entry:?}"
+        );
+    }
+
+    #[test]
     fn test_track_mouse_event_arms_and_cancels() {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
         let win = 0x6610_0001_u64;
         state.window_state().windows.push(WindowRecord {
-            handle: win,
+            handle: crate::handles::Hwnd::from(win),
             title: "Tracked".to_owned(),
             width: 100,
             height: 100,
@@ -2869,7 +3265,7 @@ mod tests {
                 .window_state()
                 .windows
                 .iter()
-                .find(|w| w.handle == win)
+                .find(|w| w.handle == crate::handles::Hwnd::from(win))
                 .expect("tracked window exists")
                 .mouse_tracking,
             "TME must arm tracking on the target window"
@@ -2892,7 +3288,7 @@ mod tests {
                 .window_state()
                 .windows
                 .iter()
-                .find(|w| w.handle == win)
+                .find(|w| w.handle == crate::handles::Hwnd::from(win))
                 .expect("tracked window exists")
                 .mouse_tracking,
             "TME_CANCEL must clear tracking"
@@ -2922,7 +3318,7 @@ mod tests {
         .expect("register class");
         let win = 0x6610_0001_u64;
         state.window_state().windows.push(WindowRecord {
-            handle: win,
+            handle: crate::handles::Hwnd::from(win),
             class_atom: u16::try_from(atom).unwrap_or(0),
             title: "Erase".to_owned(),
             width: 64,
@@ -2941,7 +3337,7 @@ mod tests {
                 .window_state()
                 .windows
                 .iter()
-                .find(|w| w.handle == win)
+                .find(|w| w.handle == crate::handles::Hwnd::from(win))
                 .expect("erased window exists")
                 .erase_background,
             "the erase must consume the pending-erase flag"
@@ -2949,7 +3345,7 @@ mod tests {
         let surf = state
             .present()
             .surfaces
-            .get(&win)
+            .get(&crate::handles::Hwnd::from(win))
             .expect("erase surface exists");
         assert_eq!(surf.pixels.len(), 64 * 32);
         assert!(
@@ -2960,7 +3356,7 @@ mod tests {
         // No class brush → no erase possible.
         let win2 = 0x6610_0002_u64;
         state.window_state().windows.push(WindowRecord {
-            handle: win2,
+            handle: crate::handles::Hwnd::from(win2),
             title: "NoBrush".to_owned(),
             width: 8,
             height: 8,
@@ -2980,7 +3376,7 @@ mod tests {
         let child = 0x6610_0002_u64;
         let ws = state.window_state();
         ws.windows.push(WindowRecord {
-            handle: parent,
+            handle: crate::handles::Hwnd::from(parent),
             title: "Parent".to_owned(),
             width: 100,
             height: 100,
@@ -2989,8 +3385,8 @@ mod tests {
             ..Default::default()
         });
         ws.windows.push(WindowRecord {
-            handle: child,
-            parent_handle: parent,
+            handle: crate::handles::Hwnd::from(child),
+            parent_handle: crate::handles::Hwnd::from(parent),
             control_kind: Some(crate::user32::controls::ControlClassKind::Button),
             title: "Child".to_owned(),
             visible: false,
@@ -3068,7 +3464,7 @@ mod tests {
         {
             let ws = state.window_state();
             ws.windows.push(WindowRecord {
-                handle: dialog,
+                handle: crate::handles::Hwnd::from(dialog),
                 dialog_proc: 0x7000_0001,
                 title: "Dlg".to_owned(),
                 width: 160,
@@ -3077,8 +3473,8 @@ mod tests {
                 ..Default::default()
             });
             ws.windows.push(WindowRecord {
-                handle: ok_button,
-                parent_handle: dialog,
+                handle: crate::handles::Hwnd::from(ok_button),
+                parent_handle: crate::handles::Hwnd::from(dialog),
                 control_kind: Some(crate::user32::controls::ControlClassKind::Button),
                 control_text: "OK".to_owned(),
                 menu_handle: 1,
@@ -3088,8 +3484,8 @@ mod tests {
                 ..Default::default()
             });
             ws.windows.push(WindowRecord {
-                handle: cancel_button,
-                parent_handle: dialog,
+                handle: crate::handles::Hwnd::from(cancel_button),
+                parent_handle: crate::handles::Hwnd::from(dialog),
                 control_kind: Some(crate::user32::controls::ControlClassKind::Button),
                 control_text: "Cancel".to_owned(),
                 menu_handle: 2,
@@ -3103,10 +3499,10 @@ mod tests {
         state
             .window_state()
             .control_states
-            .entry(ok_button)
-            .or_default()
-            .default_push = true;
-        state.window_state().focus_window_handle = cancel_button;
+            .entry(crate::handles::Hwnd::from(ok_button))
+            .or_insert_with(|| crate::user32::controls::ControlClassKind::Button.new_state())
+            .set_default_push(true);
+        state.window_state().focus_window_handle = crate::handles::Hwnd::from(cancel_button);
 
         let msg_va = 0x4000;
         engine
@@ -3147,10 +3543,10 @@ mod tests {
         state
             .window_state()
             .control_states
-            .get_mut(&ok_button)
+            .get_mut(&crate::handles::Hwnd::from(ok_button))
             .expect("ok state")
-            .default_push = false;
-        state.window_state().focus_window_handle = cancel_button;
+            .set_default_push(false);
+        state.window_state().focus_window_handle = crate::handles::Hwnd::from(cancel_button);
         let signal = dispatch(&mut engine, &mut state);
         assert!(
             matches!(
@@ -3163,7 +3559,7 @@ mod tests {
 
         // Neither a default nor a focused button: Enter is NOT consumed
         // (IsDialogMessage returns FALSE, caller dispatches normally).
-        state.window_state().focus_window_handle = 0;
+        state.window_state().focus_window_handle = crate::handles::Hwnd::NULL;
         engine
             .mem_write(msg_va + 8, &WM_KEYDOWN.to_le_bytes())
             .expect("message");
@@ -3200,7 +3596,7 @@ mod tests {
         let edit = 0x6610_0012_u64;
         let ws = state.window_state();
         ws.windows.push(WindowRecord {
-            handle: parent,
+            handle: crate::handles::Hwnd::from(parent),
             window_proc: 0x7000_0000,
             title: "Parent".to_owned(),
             width: 200,
@@ -3208,8 +3604,8 @@ mod tests {
             ..Default::default()
         });
         ws.windows.push(WindowRecord {
-            handle: edit,
-            parent_handle: parent,
+            handle: crate::handles::Hwnd::from(edit),
+            parent_handle: crate::handles::Hwnd::from(parent),
             control_kind: Some(crate::user32::controls::ControlClassKind::Edit),
             control_text: "hello".to_owned(),
             menu_handle: 12,
@@ -3227,7 +3623,7 @@ mod tests {
         let listbox = 0x6610_0014_u64;
         let ws = state.window_state();
         ws.windows.push(WindowRecord {
-            handle: parent,
+            handle: crate::handles::Hwnd::from(parent),
             window_proc: 0x7000_0000,
             title: "Parent".to_owned(),
             width: 200,
@@ -3235,8 +3631,8 @@ mod tests {
             ..Default::default()
         });
         ws.windows.push(WindowRecord {
-            handle: listbox,
-            parent_handle: parent,
+            handle: crate::handles::Hwnd::from(listbox),
+            parent_handle: crate::handles::Hwnd::from(parent),
             control_kind: Some(crate::user32::controls::ControlClassKind::ListBox),
             control_text: String::new(),
             menu_handle: 1,
@@ -3248,13 +3644,64 @@ mod tests {
         (parent, listbox)
     }
 
-    /// Cloned ControlUiState for a window (default when never touched).
-    fn control_ui(state: &WinApiState, hwnd: u64) -> crate::user32::controls::ControlUiState {
-        state
-            .try_window_state()
-            .and_then(|ws| ws.control_states.get(&hwnd))
-            .cloned()
-            .unwrap_or_default()
+    /// Test-only projection of a control's editable bits (window record
+    /// interaction flags + per-kind state), so assertions can read `caret` /
+    /// `sel_index` / … without matching on the variant.
+    #[derive(Debug, Clone, Default)]
+    struct ControlUiSnapshot {
+        pressed: bool,
+        focused: bool,
+        default_push: bool,
+        items: Vec<String>,
+        caret: usize,
+        sel_start: usize,
+        sel_end: usize,
+        sel_index: i32,
+    }
+
+    impl ControlUiSnapshot {
+        fn of(state: &WinApiState, hwnd: u64) -> Self {
+            use crate::user32::controls::ControlState;
+            let mut snap = Self::default();
+            if let Some(ws) = state.try_window_state() {
+                if let Some(window) = ws
+                    .windows
+                    .iter()
+                    .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
+                {
+                    snap.pressed = window.pressed;
+                    snap.focused = window.focused;
+                }
+                match ws.control_states.get(&crate::handles::Hwnd::from(hwnd)) {
+                    Some(ControlState::Button { default_push }) => {
+                        snap.default_push = *default_push;
+                    }
+                    Some(ControlState::Edit {
+                        caret,
+                        sel_start,
+                        sel_end,
+                    }) => {
+                        snap.caret = *caret;
+                        snap.sel_start = *sel_start;
+                        snap.sel_end = *sel_end;
+                    }
+                    Some(ControlState::ListBox { items, sel_index }) => {
+                        snap.items = items.clone();
+                        snap.sel_index = *sel_index;
+                    }
+                    Some(ControlState::ComboBox { items, .. }) => {
+                        snap.items = items.clone();
+                    }
+                    Some(ControlState::Static) | None => {}
+                }
+            }
+            snap
+        }
+    }
+
+    /// The projected control UI state for a window (defaults when never touched).
+    fn control_ui(state: &WinApiState, hwnd: u64) -> ControlUiSnapshot {
+        ControlUiSnapshot::of(state, hwnd)
     }
 
     /// The control text of a window (EM_GETTEXT-side read for assertions).
@@ -3264,7 +3711,7 @@ mod tests {
             .expect("window state")
             .windows
             .iter()
-            .find(|w| w.handle == hwnd)
+            .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
             .map_or_else(String::new, |w| w.control_text.clone())
     }
 
@@ -3904,7 +4351,7 @@ mod tests {
         let edit = 0x6610_0022_u64;
         let ws = state.window_state();
         ws.windows.push(WindowRecord {
-            handle: top,
+            handle: crate::handles::Hwnd::from(top),
             title: "Top".to_owned(),
             visible: true,
             width: 200,
@@ -3912,8 +4359,8 @@ mod tests {
             ..Default::default()
         });
         ws.windows.push(WindowRecord {
-            handle: edit,
-            parent_handle: top,
+            handle: crate::handles::Hwnd::from(edit),
+            parent_handle: crate::handles::Hwnd::from(top),
             x: 10,
             y: 10,
             width: 60,
@@ -3963,11 +4410,14 @@ mod tests {
         )
         .expect("paint ok")
         .expect("some result");
+        // B3.5: the paint deferred its publish; flush it (the runtime drains
+        // pending publishes once per message dispatch).
+        state.present().drain_pending_publishes();
 
         let frame = state
             .present()
             .published
-            .get(&top)
+            .get(&crate::handles::Hwnd::from(top))
             .expect("published frame");
         assert_eq!((frame.width, frame.height), (200, 100));
         // Font-dependent pixels: assert qualitatively instead of at fixed
@@ -4001,10 +4451,11 @@ mod tests {
         )
         .expect("paint2 ok")
         .expect("some result");
+        state.present().drain_pending_publishes();
         let frame = state
             .present()
             .published
-            .get(&top)
+            .get(&crate::handles::Hwnd::from(top))
             .expect("published frame");
         let highlight_count = frame.pixels.iter().filter(|&&p| p == 0x0000_78D7).count();
         assert_eq!(highlight_count, 0, "no highlight without focus");
@@ -4031,7 +4482,7 @@ mod tests {
         // ancestor surface exists at a known size.
         let top = 0x6610_0023_u64;
         state.window_state().windows.push(WindowRecord {
-            handle: top,
+            handle: crate::handles::Hwnd::from(top),
             title: "Top".to_owned(),
             window_proc: 0x7000_0000,
             visible: true,
@@ -4043,16 +4494,16 @@ mod tests {
             .window_state()
             .windows
             .iter_mut()
-            .find(|w| w.handle == listbox)
+            .find(|w| w.handle == crate::handles::Hwnd::from(listbox))
             .expect("listbox record")
-            .parent_handle = top;
+            .parent_handle = crate::handles::Hwnd::from(top);
         // Position the listbox at (10, 10) so the item rows land on known
         // surface coordinates (push_listbox leaves x/y at their defaults).
         let listbox_record = state
             .window_state()
             .windows
             .iter_mut()
-            .find(|w| w.handle == listbox)
+            .find(|w| w.handle == crate::handles::Hwnd::from(listbox))
             .expect("listbox record");
         listbox_record.x = 10;
         listbox_record.y = 10;
@@ -4076,11 +4527,12 @@ mod tests {
         )
         .expect("paint ok")
         .expect("some result");
+        state.present().drain_pending_publishes();
 
         let frame = state
             .present()
             .published
-            .get(&top)
+            .get(&crate::handles::Hwnd::from(top))
             .expect("published frame");
         // Font-dependent rows (line height varies by system font): assert the
         // selection fill exists somewhere in the top rows and the unselected
@@ -4101,7 +4553,7 @@ mod tests {
         // Top-level 200×100 window (parentless → its own surface).
         let hwnd = 0x6610_00AA_u64;
         state.window_state().windows.push(WindowRecord {
-            handle: hwnd,
+            handle: crate::handles::Hwnd::from(hwnd),
             window_proc: 0x7000_0000,
             width: 200,
             height: 100,
@@ -4111,13 +4563,28 @@ mod tests {
 
         // First paint: full-window fill on a fresh surface must publish a FULL
         // frame (region None) — a fresh buffer has no up-to-date pixels.
-        gdi32::fill_rect_surface(&mut state, hwnd, 200, 100, 0, 0, 200, 100, 0, true);
-        let frame = state.present().published.get(&hwnd).expect("full frame");
-        assert_eq!(
-            frame.region, None,
-            "first publish of a fresh surface must be full (region None)"
+        gdi32::fill_rect_surface(
+            &mut state,
+            crate::handles::Hwnd::from(hwnd),
+            200,
+            100,
+            0,
+            0,
+            200,
+            100,
+            0,
         );
-
+        // B3.5: the fill deferred its publish; flush it (the runtime drains
+        // pending publishes once per message dispatch).
+        state.present().drain_pending_publishes();
+        let frame = state
+            .present()
+            .published
+            .get(&crate::handles::Hwnd::from(hwnd))
+            .expect("full frame");
+        assert_eq!((frame.width, frame.height), (200, 100));
+        assert_eq!(frame.pixels.len(), 200 * 100);
+        // Publish-model rework (ora-5): every publish is full — no region.
         // Partial InvalidateRect(hwnd, {10,20,40,60}): the WM_PAINT synthesis
         // flag is set AND the publish-side dirty rect accumulates the rect.
         write_regs(&mut engine, hwnd, 0x2000, 1, 0, 0);
@@ -4137,7 +4604,7 @@ mod tests {
                 .window_state()
                 .windows
                 .iter()
-                .find(|w| w.handle == hwnd)
+                .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
                 .is_some_and(|w| w.invalidated),
             "InvalidateRect must still set the WM_PAINT synthesis flag"
         );
@@ -4148,7 +4615,7 @@ mod tests {
         // composite (B1 hand-back keeps accumulation intact across publishes).
         gdi32::fill_rect_surface(
             &mut state,
-            hwnd,
+            crate::handles::Hwnd::from(hwnd),
             200,
             100,
             10,
@@ -4156,27 +4623,22 @@ mod tests {
             30,
             40,
             0x00FF_0000,
-            true,
         );
-        let frame = state.present().published.get(&hwnd).expect("partial frame");
-        assert_eq!(
-            frame.region,
-            Some(crate::gdi32::IRect {
-                left: 10,
-                top: 20,
-                right: 40,
-                bottom: 60,
-            }),
-            "partial repaint must publish SurfaceFrame.region == the dirty rect"
-        );
+        state.present().drain_pending_publishes();
+        let frame = state
+            .present()
+            .published
+            .get(&crate::handles::Hwnd::from(hwnd))
+            .expect("partial frame");
+        // Publish-model rework (ora-5): every publish is full — no region.
         assert_eq!((frame.width, frame.height), (200, 100));
         assert_eq!(frame.pixels.len(), 200 * 100);
 
-        // A subsequent full-window repaint reverts to a full (region None)
-        // publish — the >= 50% surface threshold forces the full frame.
+        // A subsequent full-window repaint also publishes full — every
+        // publish is full under the rework, regardless of coverage.
         gdi32::fill_rect_surface(
             &mut state,
-            hwnd,
+            crate::handles::Hwnd::from(hwnd),
             200,
             100,
             0,
@@ -4184,13 +4646,15 @@ mod tests {
             200,
             100,
             0x0000_00FF,
-            true,
         );
-        let frame = state.present().published.get(&hwnd).expect("full frame 2");
-        assert_eq!(
-            frame.region, None,
-            "full-window repaint must publish full (region None)"
-        );
+        state.present().drain_pending_publishes();
+        let frame = state
+            .present()
+            .published
+            .get(&crate::handles::Hwnd::from(hwnd))
+            .expect("full frame 2");
+        assert_eq!((frame.width, frame.height), (200, 100));
+        assert_eq!(frame.pixels.len(), 200 * 100);
     }
 
     // ── P3 D3D9 software-render handlers ────────────────────────────────
@@ -4203,7 +4667,7 @@ mod tests {
     const D3DPT_TRIANGLELIST: u32 = 4;
 
     #[test]
-    fn test_d3d9_caps_declare_no_shader_pipeline() {
+    fn test_d3d9_caps_declare_pixel_shader_pipeline() {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
         let caps_va = 0x5000_u64;
@@ -4224,11 +4688,26 @@ mod tests {
                 .expect("read caps field");
             u32::from_le_bytes(bytes)
         };
-        // P3 caps honesty (B6c): no vertex shader, no pixel shader.
+        // P5a caps honesty: the ps_2_0 interpreter is implemented, so the caps
+        // report D3DPS_VERSION(2,0) and PixelShader1xMaxValue 1.0; the vertex
+        // stage is still FFP (vs_2_0 execution is P5a-2), so VertexShaderVersion
+        // stays 0 and MaxVertexShaderConst reports the vs_2_0 constant file.
         assert_eq!(read_u32_at(196), 0, "VertexShaderVersion must be 0.0");
-        assert_eq!(read_u32_at(200), 0, "MaxVertexShaderConst must be 0");
-        assert_eq!(read_u32_at(204), 0, "PixelShaderVersion must be 0.0");
-        assert_eq!(read_u32_at(208), 0, "PixelShader1xMaxValue must be 0.0");
+        assert_eq!(
+            read_u32_at(200),
+            256,
+            "MaxVertexShaderConst must be 256 (vs_2_0 constant file)"
+        );
+        assert_eq!(
+            read_u32_at(204),
+            0xFFFF_0200,
+            "PixelShaderVersion must be D3DPS_VERSION(2,0)"
+        );
+        assert_eq!(
+            read_u32_at(208),
+            1.0_f32.to_bits(),
+            "PixelShader1xMaxValue must be 1.0"
+        );
     }
 
     #[test]
@@ -4582,7 +5061,7 @@ mod tests {
             d3d.d3d9_backbuffer_width = 4;
             d3d.d3d9_backbuffer_height = 3;
             d3d.d3d9_backbuffer = (0_u32..12).collect();
-            d3d.d3d9_present_hwnd = 0x7777;
+            d3d.d3d9_present_hwnd = crate::handles::Hwnd::from(0x7777);
             d3d.d3d9_dirty = None;
         }
         // Unknown hwnd → window_client_size falls back to WindowState.
@@ -4601,10 +5080,743 @@ mod tests {
         let frame = state
             .present()
             .published
-            .get(&0x7777)
+            .get(&crate::handles::Hwnd::from(0x7777))
             .expect("Present must publish a SurfaceFrame");
         assert_eq!((frame.width, frame.height), (4, 3));
         assert_eq!(&frame.pixels[..], &(0_u32..12).collect::<Vec<u32>>()[..]);
-        assert_eq!(frame.region, None, "full-backbuffer present publishes full");
+    }
+
+    // ── P4b texture handlers ───────────────────────────────────────────
+
+    /// D3DFMT_A8R8G8B8.
+    const D3DFMT_A8R8G8B8: u32 = 21;
+
+    #[test]
+    fn test_d3d9_texture_lock_unlock_round_trip() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        // The runtime seeds the guest heap bump cursor at session init; the
+        // test heap control block starts zeroed, so seed it before allocating.
+        engine
+            .mem_write(0x2000, &0x2000_u64.to_le_bytes())
+            .expect("seed bump cursor");
+
+        // CreateTexture(2x2, levels=1, format=A8R8G8B8) → texture at 0x7000.
+        let pp_texture = 0x7000_u64;
+        write_regs(&mut engine, 1, 2, 2, 1, 0);
+        engine
+            .mem_write(STACK_TOP + 0x30, &D3DFMT_A8R8G8B8.to_le_bytes())
+            .expect("write format");
+        engine
+            .mem_write(STACK_TOP + 0x40, &pp_texture.to_le_bytes())
+            .expect("write ppTexture");
+        assert_return_value!(
+            d3d9::handle_create_texture(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            0
+        );
+        let mut tex_bytes = [0_u8; 8];
+        engine
+            .mem_read(pp_texture, &mut tex_bytes)
+            .expect("read texture ptr");
+        let texture_va = u64::from_le_bytes(tex_bytes);
+        assert_ne!(texture_va, 0, "CreateTexture must return an object");
+
+        // GetSurfaceLevel(0) → surface at 0x7100.
+        let pp_surface = 0x7100_u64;
+        write_regs(&mut engine, texture_va, 0, pp_surface, 0, 0);
+        assert_return_value!(
+            d3d9::handle_texture_get_surface_level(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            0
+        );
+        let mut surf_bytes = [0_u8; 8];
+        engine
+            .mem_read(pp_surface, &mut surf_bytes)
+            .expect("read surface ptr");
+        let surface_va = u64::from_le_bytes(surf_bytes);
+        assert_ne!(surface_va, 0, "GetSurfaceLevel must return a surface");
+
+        // LockRect → D3DLOCKED_RECT { Pitch, pBits } at 0x7200; write texels.
+        let locked_rect = 0x7200_u64;
+        write_regs(&mut engine, surface_va, locked_rect, 0, 0, 0);
+        assert_return_value!(
+            d3d9::handle_surface_lock_rect(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            0
+        );
+        let mut pitch_bytes = [0_u8; 4];
+        engine
+            .mem_read(locked_rect, &mut pitch_bytes)
+            .expect("read pitch");
+        assert_eq!(u32::from_le_bytes(pitch_bytes), 8, "2x2 pitch must be 8");
+        let mut bits_bytes = [0_u8; 8];
+        engine
+            .mem_read(locked_rect + 8, &mut bits_bytes)
+            .expect("read pBits");
+        let p_bits = u64::from_le_bytes(bits_bytes);
+        assert_ne!(p_bits, 0, "LockRect must hand out a guest block");
+
+        // 2x2 texels: red / green / blue / white (D3DCOLOR).
+        let texels = [0xFFFF_0000_u32, 0xFF00_FF00, 0xFF00_00FF, 0xFFFF_FFFF];
+        for (i, texel) in texels.iter().enumerate() {
+            engine
+                .mem_write(
+                    p_bits + u64::try_from(i).unwrap_or(0) * 4,
+                    &texel.to_le_bytes(),
+                )
+                .expect("write texel");
+        }
+
+        // UnlockRect → texels land in the host record.
+        write_regs(&mut engine, surface_va, 0, 0, 0, 0);
+        assert_return_value!(
+            d3d9::handle_surface_unlock_rect(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            0
+        );
+        let record = state
+            .d3d9()
+            .d3d9_textures
+            .get(&texture_va)
+            .expect("record exists");
+        assert_eq!(record.width, 2);
+        assert_eq!(record.height, 2);
+        assert_eq!(
+            record.pixels,
+            texels.to_vec(),
+            "unlock must copy the texels back"
+        );
+        assert_eq!(record.locked_va, 0, "lock state cleared");
+
+        // SetTexture(0, tex) → GetTexture(0) round-trip.
+        write_regs(&mut engine, 1, 0, texture_va, 0, 0);
+        assert_return_value!(
+            d3d9::handle_set_texture(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            0
+        );
+        let out_texture = 0x7300_u64;
+        write_regs(&mut engine, 1, 0, out_texture, 0, 0);
+        assert_return_value!(
+            d3d9::handle_get_texture(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            0
+        );
+        let mut out_bytes = [0_u8; 8];
+        engine
+            .mem_read(out_texture, &mut out_bytes)
+            .expect("read texture out");
+        assert_eq!(u64::from_le_bytes(out_bytes), texture_va);
+
+        // Release the texture: record gone, bindings cleared.
+        write_regs(&mut engine, texture_va, 0, 0, 0, 0);
+        assert_return_value!(
+            d3d9::handle_texture_release(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            1
+        );
+        assert!(!state.d3d9().d3d9_textures.contains_key(&texture_va));
+        assert_eq!(state.d3d9().d3d9_texture_bindings[0], 0);
+    }
+
+    #[test]
+    fn test_d3d9_texture_unlock_with_rect() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        // Seed the guest heap bump cursor (see the round-trip test).
+        engine
+            .mem_write(0x2000, &0x2000_u64.to_le_bytes())
+            .expect("seed bump cursor");
+
+        let pp_texture = 0x7000_u64;
+        write_regs(&mut engine, 1, 2, 2, 1, 0);
+        engine
+            .mem_write(STACK_TOP + 0x30, &D3DFMT_A8R8G8B8.to_le_bytes())
+            .expect("write format");
+        engine
+            .mem_write(STACK_TOP + 0x40, &pp_texture.to_le_bytes())
+            .expect("write ppTexture");
+        assert_return_value!(
+            d3d9::handle_create_texture(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            0
+        );
+        let mut tex_bytes = [0_u8; 8];
+        engine
+            .mem_read(pp_texture, &mut tex_bytes)
+            .expect("read texture ptr");
+        let texture_va = u64::from_le_bytes(tex_bytes);
+
+        let pp_surface = 0x7100_u64;
+        write_regs(&mut engine, texture_va, 0, pp_surface, 0, 0);
+        assert_return_value!(
+            d3d9::handle_texture_get_surface_level(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            0
+        );
+        let mut surf_bytes = [0_u8; 8];
+        engine
+            .mem_read(pp_surface, &mut surf_bytes)
+            .expect("read surface ptr");
+        let surface_va = u64::from_le_bytes(surf_bytes);
+
+        // Lock only the top-left texel: RECT {0,0,1,1} at 0x7400.
+        let rect_ptr = 0x7400_u64;
+        for (i, v) in [0_i32, 0, 1, 1].iter().enumerate() {
+            engine
+                .mem_write(
+                    rect_ptr + u64::try_from(i).unwrap_or(0) * 4,
+                    &v.to_le_bytes(),
+                )
+                .expect("write rect field");
+        }
+        let locked_rect = 0x7200_u64;
+        write_regs(&mut engine, surface_va, locked_rect, rect_ptr, 0, 0);
+        assert_return_value!(
+            d3d9::handle_surface_lock_rect(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            0
+        );
+        let mut bits_bytes = [0_u8; 8];
+        engine
+            .mem_read(locked_rect + 8, &mut bits_bytes)
+            .expect("read pBits");
+        let p_bits = u64::from_le_bytes(bits_bytes);
+        // The rect's pBits points at the rect top-left (the block start).
+        assert_ne!(p_bits, 0);
+
+        // Write the top-left texel (red); leave the rest of the block zero.
+        engine
+            .mem_write(p_bits, &0xFFFF_0000_u32.to_le_bytes())
+            .expect("write texel");
+
+        write_regs(&mut engine, surface_va, 0, 0, 0, 0);
+        assert_return_value!(
+            d3d9::handle_surface_unlock_rect(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            0
+        );
+        let record = state
+            .d3d9()
+            .d3d9_textures
+            .get(&texture_va)
+            .expect("record exists");
+        assert_eq!(
+            record.pixels.first().copied(),
+            Some(0xFFFF_0000),
+            "rect region texel copied back"
+        );
+        assert_eq!(
+            record.pixels.get(1).copied(),
+            Some(0),
+            "outside the rect stays zero"
+        );
+        assert_eq!(record.pixels.get(2).copied(), Some(0));
+        assert_eq!(record.pixels.get(3).copied(), Some(0));
+    }
+
+    #[test]
+    fn test_d3d9_depth_surface_create_bind_and_clear() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        // Seed the guest heap bump cursor (see the texture round-trip test).
+        engine
+            .mem_write(0x2000, &0x2000_u64.to_le_bytes())
+            .expect("seed bump cursor");
+
+        // CreateDepthStencilSurface(2x2, D16) → surface at 0x7000.
+        let pp_surface = 0x7000_u64;
+        write_regs(&mut engine, 1, 2, 2, 80, 0); // r9 = D3DFMT_D16 = 80
+        engine
+            .mem_write(STACK_TOP + 0x40, &pp_surface.to_le_bytes())
+            .expect("write ppSurface");
+        assert_return_value!(
+            d3d9::handle_create_depth_stencil_surface(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            0
+        );
+        let mut surf_bytes = [0_u8; 8];
+        engine
+            .mem_read(pp_surface, &mut surf_bytes)
+            .expect("read surface ptr");
+        let surface_va = u64::from_le_bytes(surf_bytes);
+        assert_ne!(
+            surface_va, 0,
+            "CreateDepthStencilSurface must return an object"
+        );
+
+        // Unsupported format fails honestly.
+        write_regs(&mut engine, 1, 2, 2, 99, 0); // unknown format
+        engine
+            .mem_write(STACK_TOP + 0x40, &pp_surface.to_le_bytes())
+            .expect("write ppSurface");
+        assert_return_value!(
+            d3d9::handle_create_depth_stencil_surface(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            0x8876_086c // D3DERR_INVALIDCALL
+        );
+
+        // Bind it and clear the depth buffer to 0.25 (near is 0.0).
+        write_regs(&mut engine, 1, surface_va, 0, 0, 0);
+        assert_return_value!(
+            d3d9::handle_set_depth_stencil_surface(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            0
+        );
+        // Clear(D3DCLEAR_ZBUFFER, z=0.25) — the Z arg is a f32 at [rsp+0x30].
+        write_regs(&mut engine, 1, 0, 0, 2, 0); // flags = D3DCLEAR_ZBUFFER
+        engine
+            .mem_write(STACK_TOP + 0x30, &0.25_f32.to_bits().to_le_bytes())
+            .expect("write clear z");
+        assert_return_value!(
+            d3d9::handle_clear(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            0
+        );
+        let record = state
+            .d3d9()
+            .d3d9_depth_surfaces
+            .get(&surface_va)
+            .expect("depth record exists");
+        assert_eq!(record.width, 2);
+        assert_eq!(record.height, 2);
+        assert_eq!(record.format, 80);
+        assert_eq!(
+            record.depth,
+            vec![0.25; 4],
+            "Clear(ZBUFFER) must fill the depth"
+        );
+
+        // GetDepthStencilSurface returns the binding.
+        let out_surface = 0x7100_u64;
+        write_regs(&mut engine, 1, out_surface, 0, 0, 0);
+        assert_return_value!(
+            d3d9::handle_get_depth_stencil_surface(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            0
+        );
+        let mut out_bytes = [0_u8; 8];
+        engine
+            .mem_read(out_surface, &mut out_bytes)
+            .expect("read out");
+        assert_eq!(u64::from_le_bytes(out_bytes), surface_va);
+
+        // Release the depth surface: record gone + binding cleared.
+        write_regs(&mut engine, surface_va, 0, 0, 0, 0);
+        assert_return_value!(
+            d3d9::handle_surface_release(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            1
+        );
+        assert!(!state.d3d9().d3d9_depth_surfaces.contains_key(&surface_va));
+        assert_eq!(state.d3d9().d3d9_depth_stencil, 0, "release must unbind");
+    }
+
+    #[test]
+    fn test_d3d9_render_state_typed_round_trip() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        // SetRenderState(this, state, value) through the register ABI.
+        let set = |engine: &mut IcedCpu, state: &mut WinApiState, state_id: u32, value: u32| {
+            write_regs(engine, 1, u64::from(state_id), u64::from(value), 0, 0);
+            assert_return_value!(
+                d3d9::handle_set_render_state(&mut HandlerContext::new(
+                    engine,
+                    test_environment(),
+                    state,
+                )),
+                0
+            );
+        };
+        // GetRenderState(this, state, &out) returns the typed value.
+        let get = |engine: &mut IcedCpu, state: &mut WinApiState, state_id: u32| -> u32 {
+            let out = 0x7400_u64;
+            write_regs(engine, 1, u64::from(state_id), out, 0, 0);
+            assert_return_value!(
+                d3d9::handle_get_render_state(&mut HandlerContext::new(
+                    engine,
+                    test_environment(),
+                    state,
+                )),
+                0
+            );
+            let mut bytes = [0_u8; 4];
+            engine
+                .mem_read(out, &mut bytes)
+                .expect("read GetRenderState output");
+            u32::from_le_bytes(bytes)
+        };
+
+        // The D3D9 fixed-function defaults match the fragment-stage fallbacks.
+        let rs = state.d3d9();
+        assert!(!rs.d3d9_render_state.alpha_blend_enable);
+        assert!(rs.d3d9_render_state.z_write_enable);
+        assert_eq!(rs.d3d9_render_state.z_enable.as_u32(), 0);
+        assert_eq!(rs.d3d9_render_state.z_func.as_u32(), 4);
+        assert_eq!(rs.d3d9_render_state.src_blend.as_u32(), 2);
+        assert_eq!(rs.d3d9_render_state.dest_blend.as_u32(), 1);
+        assert_eq!(rs.d3d9_render_state.blend_op.as_u32(), 1);
+
+        // Set + struct check for every supported D3DRS_*.
+        set(
+            &mut engine,
+            &mut state,
+            crate::d3d9_render::D3DRS_ALPHABLENDENABLE,
+            1,
+        );
+        set(
+            &mut engine,
+            &mut state,
+            crate::d3d9_render::D3DRS_ZENABLE,
+            1,
+        );
+        set(&mut engine, &mut state, crate::d3d9_render::D3DRS_ZFUNC, 4);
+        set(
+            &mut engine,
+            &mut state,
+            crate::d3d9_render::D3DRS_SRCBLEND,
+            5,
+        );
+        set(
+            &mut engine,
+            &mut state,
+            crate::d3d9_render::D3DRS_DESTBLEND,
+            6,
+        );
+        set(
+            &mut engine,
+            &mut state,
+            crate::d3d9_render::D3DRS_BLENDOP,
+            1,
+        );
+        set(
+            &mut engine,
+            &mut state,
+            crate::d3d9_render::D3DRS_ZWRITEENABLE,
+            0,
+        );
+        let rs = state.d3d9();
+        assert!(rs.d3d9_render_state.alpha_blend_enable);
+        assert!(!rs.d3d9_render_state.z_write_enable);
+        assert_eq!(rs.d3d9_render_state.z_enable.as_u32(), 1);
+        assert_eq!(rs.d3d9_render_state.z_func.as_u32(), 4);
+        assert_eq!(rs.d3d9_render_state.src_blend.as_u32(), 5);
+        assert_eq!(rs.d3d9_render_state.dest_blend.as_u32(), 6);
+        assert_eq!(rs.d3d9_render_state.blend_op.as_u32(), 1);
+
+        // GetRenderState round-trips each supported state.
+        assert_eq!(
+            get(
+                &mut engine,
+                &mut state,
+                crate::d3d9_render::D3DRS_ALPHABLENDENABLE
+            ),
+            1
+        );
+        assert_eq!(
+            get(&mut engine, &mut state, crate::d3d9_render::D3DRS_ZENABLE),
+            1
+        );
+        assert_eq!(
+            get(&mut engine, &mut state, crate::d3d9_render::D3DRS_ZFUNC),
+            4
+        );
+        assert_eq!(
+            get(&mut engine, &mut state, crate::d3d9_render::D3DRS_SRCBLEND),
+            5
+        );
+        assert_eq!(
+            get(&mut engine, &mut state, crate::d3d9_render::D3DRS_DESTBLEND),
+            6
+        );
+        assert_eq!(
+            get(&mut engine, &mut state, crate::d3d9_render::D3DRS_BLENDOP),
+            1
+        );
+        assert_eq!(
+            get(
+                &mut engine,
+                &mut state,
+                crate::d3d9_render::D3DRS_ZWRITEENABLE
+            ),
+            0
+        );
+
+        // Unmodeled D3DRS_* are inert: setting them is a no-op and the read
+        // falls back to 0 (D3D9's default for unused states).
+        set(&mut engine, &mut state, 0x1FF, 7);
+        assert_eq!(get(&mut engine, &mut state, 0x1FF), 0);
+        // Unknown enum values round-trip through the raw register value.
+        set(
+            &mut engine,
+            &mut state,
+            crate::d3d9_render::D3DRS_SRCBLEND,
+            0xDEAD,
+        );
+        assert_eq!(
+            get(&mut engine, &mut state, crate::d3d9_render::D3DRS_SRCBLEND),
+            0xDEAD
+        );
+    }
+
+    #[test]
+    fn test_d3d9_stage_state_typed_round_trip() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        // SetTextureStageState(this, stage=0, slot, value) via the register ABI.
+        let set_tss = |engine: &mut IcedCpu, state: &mut WinApiState, slot: u32, value: u32| {
+            write_regs(engine, 1, 0, u64::from(slot), u64::from(value), 0);
+            assert_return_value!(
+                d3d9::handle_set_texture_stage_state(&mut HandlerContext::new(
+                    engine,
+                    test_environment(),
+                    state,
+                )),
+                0
+            );
+        };
+        // SetSamplerState(this, sampler=0, slot, value) via the register ABI.
+        let set_samp = |engine: &mut IcedCpu, state: &mut WinApiState, slot: u32, value: u32| {
+            write_regs(engine, 1, 0, u64::from(slot), u64::from(value), 0);
+            assert_return_value!(
+                d3d9::handle_set_sampler_state(&mut HandlerContext::new(
+                    engine,
+                    test_environment(),
+                    state,
+                )),
+                0
+            );
+        };
+        let get_tss = |engine: &mut IcedCpu, state: &mut WinApiState, slot: u32| -> u32 {
+            let out = 0x7400_u64;
+            write_regs(engine, 1, 0, u64::from(slot), out, 0);
+            assert_return_value!(
+                d3d9::handle_get_texture_stage_state(&mut HandlerContext::new(
+                    engine,
+                    test_environment(),
+                    state,
+                )),
+                0
+            );
+            let mut bytes = [0_u8; 4];
+            engine
+                .mem_read(out, &mut bytes)
+                .expect("read GetTextureStageState output");
+            u32::from_le_bytes(bytes)
+        };
+        let get_samp = |engine: &mut IcedCpu, state: &mut WinApiState, slot: u32| -> u32 {
+            let out = 0x7400_u64;
+            write_regs(engine, 1, 0, u64::from(slot), out, 0);
+            assert_return_value!(
+                d3d9::handle_get_sampler_state(&mut HandlerContext::new(
+                    engine,
+                    test_environment(),
+                    state,
+                )),
+                0
+            );
+            let mut bytes = [0_u8; 4];
+            engine
+                .mem_read(out, &mut bytes)
+                .expect("read GetSamplerState output");
+            u32::from_le_bytes(bytes)
+        };
+
+        // The stage-0 defaults match the legacy resolve fallbacks.
+        let stage = state
+            .d3d9()
+            .d3d9_stage_states
+            .first()
+            .expect("stage 0 exists");
+        assert_eq!(stage.color_op, crate::d3d9_render::D3DTOP_MODULATE);
+        assert_eq!(stage.mag_filter, crate::d3d9_render::D3DTEXF_POINT);
+        assert_eq!(stage.address_u, crate::d3d9_render::D3DTADDRESS_WRAP);
+
+        // Set TSS slots → typed fields.
+        set_tss(
+            &mut engine,
+            &mut state,
+            crate::d3d9_render::D3DTSS_COLOROP,
+            crate::d3d9_render::D3DTOP_SELECTARG1,
+        );
+        set_tss(
+            &mut engine,
+            &mut state,
+            crate::d3d9_render::D3DTSS_COLORARG1,
+            crate::d3d9_render::D3DTA_TEXTURE,
+        );
+        set_tss(
+            &mut engine,
+            &mut state,
+            crate::d3d9_render::D3DTSS_COLORARG2,
+            crate::d3d9_render::D3DTA_DIFFUSE,
+        );
+        set_tss(
+            &mut engine,
+            &mut state,
+            crate::d3d9_render::D3DTSS_ALPHAOP,
+            crate::d3d9_render::D3DTOP_MODULATE,
+        );
+        set_tss(
+            &mut engine,
+            &mut state,
+            crate::d3d9_render::D3DTSS_ALPHAARG1,
+            crate::d3d9_render::D3DTA_TEXTURE,
+        );
+        set_tss(
+            &mut engine,
+            &mut state,
+            crate::d3d9_render::D3DTSS_ALPHAARG2,
+            crate::d3d9_render::D3DTA_DIFFUSE,
+        );
+        set_tss(
+            &mut engine,
+            &mut state,
+            crate::d3d9_render::D3DTSS_TEXCOORDINDEX,
+            3,
+        );
+        let stage = state
+            .d3d9()
+            .d3d9_stage_states
+            .first()
+            .expect("stage 0 exists");
+        assert_eq!(stage.color_op, crate::d3d9_render::D3DTOP_SELECTARG1);
+        assert_eq!(stage.color_arg1, crate::d3d9_render::D3DTA_TEXTURE);
+        assert_eq!(stage.color_arg2, crate::d3d9_render::D3DTA_DIFFUSE);
+        assert_eq!(stage.alpha_op, crate::d3d9_render::D3DTOP_MODULATE);
+        assert_eq!(stage.alpha_arg1, crate::d3d9_render::D3DTA_TEXTURE);
+        assert_eq!(stage.alpha_arg2, crate::d3d9_render::D3DTA_DIFFUSE);
+        assert_eq!(stage.tex_coord_index, 3);
+
+        // Set sampler slots → typed fields (D3DSAMP_* namespace).
+        set_samp(
+            &mut engine,
+            &mut state,
+            crate::d3d9_render::D3DSAMP_MAGFILTER,
+            crate::d3d9_render::D3DTEXF_LINEAR,
+        );
+        set_samp(
+            &mut engine,
+            &mut state,
+            crate::d3d9_render::D3DSAMP_ADDRESSU,
+            crate::d3d9_render::D3DTADDRESS_CLAMP,
+        );
+        set_samp(
+            &mut engine,
+            &mut state,
+            crate::d3d9_render::D3DSAMP_ADDRESSV,
+            crate::d3d9_render::D3DTADDRESS_CLAMP,
+        );
+        let stage = state
+            .d3d9()
+            .d3d9_stage_states
+            .first()
+            .expect("stage 0 exists");
+        assert_eq!(stage.mag_filter, crate::d3d9_render::D3DTEXF_LINEAR);
+        assert_eq!(stage.address_u, crate::d3d9_render::D3DTADDRESS_CLAMP);
+        assert_eq!(stage.address_v, crate::d3d9_render::D3DTADDRESS_CLAMP);
+
+        // Get* round-trips the typed slots.
+        assert_eq!(
+            get_tss(&mut engine, &mut state, crate::d3d9_render::D3DTSS_COLOROP),
+            crate::d3d9_render::D3DTOP_SELECTARG1
+        );
+        assert_eq!(
+            get_tss(
+                &mut engine,
+                &mut state,
+                crate::d3d9_render::D3DTSS_COLORARG2
+            ),
+            crate::d3d9_render::D3DTA_DIFFUSE
+        );
+        assert_eq!(
+            get_samp(
+                &mut engine,
+                &mut state,
+                crate::d3d9_render::D3DSAMP_MAGFILTER
+            ),
+            crate::d3d9_render::D3DTEXF_LINEAR
+        );
+        assert_eq!(
+            get_samp(
+                &mut engine,
+                &mut state,
+                crate::d3d9_render::D3DSAMP_ADDRESSU
+            ),
+            crate::d3d9_render::D3DTADDRESS_CLAMP
+        );
+
+        // Unmodeled slots are preserved verbatim for the Get* round-trips.
+        set_tss(&mut engine, &mut state, 99, 0xAB);
+        set_samp(&mut engine, &mut state, 88, 0xCD);
+        assert_eq!(get_tss(&mut engine, &mut state, 99), 0xAB);
+        assert_eq!(get_samp(&mut engine, &mut state, 88), 0xCD);
+        // The two namespaces stay separate despite the colliding constants:
+        // TSS slot 1 is COLOROP (set to SELECTARG1 above), sampler slot 1 is
+        // ADDRESSU (set to CLAMP above).
+        assert_eq!(
+            get_tss(
+                &mut engine,
+                &mut state,
+                crate::d3d9_render::D3DSAMP_ADDRESSU
+            ),
+            crate::d3d9_render::D3DTOP_SELECTARG1
+        );
+        assert_eq!(
+            get_samp(&mut engine, &mut state, crate::d3d9_render::D3DTSS_COLOROP),
+            crate::d3d9_render::D3DTADDRESS_CLAMP
+        );
     }
 }

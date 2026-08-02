@@ -3,11 +3,52 @@ use super::{
     read_guest_ansi_lossy, read_guest_u32, read_guest_u64, read_guest_utf16_lossy,
     write_guest_ansi_c_string, write_guest_u32, write_guest_utf16_c_string,
 };
-use crate::{HandlerContext, MenuItemRecord};
+use crate::HandlerContext;
+use crate::handles::{Hmenu, Hwnd};
+
+/// One fake USER32 menu: its handle and the ordered item list. A `Popup`
+/// entry references another menu by handle, so the flat `Vec<MenuRecord>`
+/// actually forms a tree.
+#[derive(Debug, Clone)]
+pub struct MenuRecord {
+    /// Fake menu handle.
+    pub handle: Hmenu,
+    /// Items in append order; a `Vec` index is the `MF_BYPOSITION` position.
+    pub items: Vec<MenuEntry>,
+}
+
+/// One item of a fake menu.
+#[derive(Debug, Clone)]
+pub enum MenuEntry {
+    /// `MF_STRING` command item.
+    Item {
+        /// Command id (`wID`).
+        id: u32,
+        /// Item text.
+        text: String,
+        /// Whether the item is enabled (`MF_GRAYED`/`MF_DISABLED` clear it).
+        enabled: bool,
+        /// Whether the item is checked (`MF_CHECKED`).
+        checked: bool,
+    },
+    /// `MF_POPUP` item — a structural link to another menu.
+    Popup {
+        /// Popup label text.
+        text: String,
+        /// Handle of the submenu this entry opens.
+        submenu: Hmenu,
+    },
+    /// `MF_SEPARATOR`.
+    Separator,
+}
 
 /// `MF_*` flags relevant to the mechanical menu tier.
 const MF_SEPARATOR: u32 = 0x0800;
 const MF_BYPOSITION: u32 = 0x0400;
+const MF_POPUP: u32 = 0x0010;
+const MF_CHECKED: u32 = 0x0008;
+const MF_DISABLED: u32 = 0x0002;
+const MF_GRAYED: u32 = 0x0001;
 
 /// `MENUITEMINFO` `fMask` bits.
 const MIIM_STATE: u32 = 0x0001;
@@ -21,9 +62,11 @@ const MFT_STRING: u32 = 0x0000;
 pub fn handle_enable_menu_item(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let menu_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for EnableMenuItem")?;
+    let menu_handle = Hmenu::from(
+        engine
+            .read_rcx()
+            .context("failed to read RCX for EnableMenuItem")?,
+    );
 
     let item_raw = engine
         .read_rdx()
@@ -39,28 +82,28 @@ pub fn handle_enable_menu_item(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     let flags = u32::try_from(flags_raw & u64::from(u32::MAX))
         .context("EnableMenuItem flags do not fit u32")?;
 
-    let previous_flags = state
-        .window_state()
-        .menu_item_states
-        .iter()
-        .find(|(stored_menu, stored_item, _)| *stored_menu == menu_handle && *stored_item == item)
-        .map_or(u32::MAX, |(_, _, stored_flags)| *stored_flags);
+    let new_enabled = flags & (MF_GRAYED | MF_DISABLED) == 0;
+    let (previous_flags, mutated) = mutate_item(
+        state,
+        menu_handle,
+        item,
+        flags & MF_BYPOSITION != 0,
+        |entry| {
+            if let MenuEntry::Item { enabled, .. } = entry {
+                *enabled = new_enabled;
+                true
+            } else {
+                false
+            }
+        },
+    );
 
-    if let Some(entry) = state
-        .window_state()
-        .menu_item_states
-        .iter_mut()
-        .find(|(stored_menu, stored_item, _)| *stored_menu == menu_handle && *stored_item == item)
-    {
-        entry.2 = flags;
-    } else {
-        state
-            .window_state()
-            .menu_item_states
-            .push((menu_handle, item, flags));
+    if mutated {
+        state.window_state().menu_dirty = true;
     }
 
-    let return_value = u64::from(previous_flags);
+    // Windows returns -1 when no item matches; otherwise the previous state.
+    let return_value = u64::from(if mutated { previous_flags } else { u32::MAX });
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -75,9 +118,11 @@ pub fn handle_enable_menu_item(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
 pub fn handle_check_menu_item(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let menu_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for CheckMenuItem")?;
+    let menu_handle = Hmenu::from(
+        engine
+            .read_rcx()
+            .context("failed to read RCX for CheckMenuItem")?,
+    );
 
     let item_raw = engine
         .read_rdx()
@@ -93,27 +138,27 @@ pub fn handle_check_menu_item(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     let flags = u32::try_from(flags_raw & u64::from(u32::MAX))
         .context("CheckMenuItem flags do not fit u32")?;
 
-    let previous_flags = state
-        .window_state()
-        .menu_item_check_states
-        .iter()
-        .find(|(stored_menu, stored_item, _)| *stored_menu == menu_handle && *stored_item == item)
-        .map_or(u32::MAX, |(_, _, stored_flags)| *stored_flags);
+    let new_checked = flags & MF_CHECKED != 0;
+    let (previous_flags, mutated) = mutate_item(
+        state,
+        menu_handle,
+        item,
+        flags & MF_BYPOSITION != 0,
+        |entry| {
+            if let MenuEntry::Item { checked, .. } = entry {
+                *checked = new_checked;
+                true
+            } else {
+                false
+            }
+        },
+    );
 
-    if let Some(entry) =
-        state.window_state().menu_item_check_states.iter_mut().find(
-            |(stored_menu, stored_item, _)| *stored_menu == menu_handle && *stored_item == item,
-        )
-    {
-        entry.2 = flags;
-    } else {
-        state
-            .window_state()
-            .menu_item_check_states
-            .push((menu_handle, item, flags));
+    if mutated {
+        state.window_state().menu_dirty = true;
     }
 
-    let return_value = u64::from(previous_flags);
+    let return_value = u64::from(if mutated { previous_flags } else { u32::MAX });
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -142,7 +187,7 @@ pub(crate) fn handle_menu_success(
 pub fn handle_get_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hwnd = engine.read_rcx()?;
+    let hwnd = Hwnd::from(engine.read_rcx()?);
     let menu_handle = state
         .window_state()
         .windows
@@ -160,6 +205,10 @@ pub fn handle_create_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let handle = allocate_menu_handle(state)?;
+    state.window_state().menus.push(MenuRecord {
+        handle: Hmenu::from(handle),
+        items: Vec::new(),
+    });
     let return_address = engine
         .return_from_win64_api(handle)
         .context("failed to return from CreateMenu")?;
@@ -173,6 +222,10 @@ pub fn handle_create_popup_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let handle = allocate_menu_handle(state)?;
+    state.window_state().menus.push(MenuRecord {
+        handle: Hmenu::from(handle),
+        items: Vec::new(),
+    });
     let return_address = engine
         .return_from_win64_api(handle)
         .context("failed to return from CreatePopupMenu")?;
@@ -196,9 +249,11 @@ fn handle_append_menu(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let menu_handle = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
+    let menu_handle = Hmenu::from(
+        engine
+            .read_rcx()
+            .with_context(|| format!("failed to read RCX for {api_name}"))?,
+    );
 
     let flags_raw = engine
         .read_rdx()
@@ -228,12 +283,42 @@ fn handle_append_menu(
             .with_context(|| format!("failed to read {api_name} item text"))?
     };
 
-    state.window_state().menu_items.push(MenuItemRecord {
-        menu_handle,
-        id: item_id,
-        flags,
-        text,
-    });
+    let ws = state.window_state();
+    if !ws.menus.iter().any(|m| m.handle == menu_handle) {
+        // Lazily create the record for handles that bypassed CreateMenu /
+        // CreatePopupMenu (e.g. GetSystemMenu).
+        ws.menus.push(MenuRecord {
+            handle: menu_handle,
+            items: Vec::new(),
+        });
+    }
+    let entry = if flags & MF_SEPARATOR != 0 {
+        MenuEntry::Separator
+    } else if flags & MF_POPUP != 0 {
+        MenuEntry::Popup {
+            text,
+            submenu: Hmenu::from(u64::from(item_id)),
+        }
+    } else {
+        MenuEntry::Item {
+            id: item_id,
+            text,
+            enabled: flags & (MF_GRAYED | MF_DISABLED) == 0,
+            checked: flags & MF_CHECKED != 0,
+        }
+    };
+    let record = ws
+        .menus
+        .iter_mut()
+        .find(|m| m.handle == menu_handle)
+        .with_context(|| {
+            format!(
+                "{api_name}: menu {:#x} record missing",
+                menu_handle.as_u64()
+            )
+        })?;
+    record.items.push(entry);
+    ws.menu_dirty = true;
 
     let return_address = engine
         .return_from_win64_api(1)
@@ -252,19 +337,18 @@ fn handle_append_menu(
 pub fn handle_set_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hwnd = engine
-        .read_rcx()
-        .context("failed to read RCX for SetMenu")?;
+    let hwnd = Hwnd::from(
+        engine
+            .read_rcx()
+            .context("failed to read RCX for SetMenu")?,
+    );
     let menu_handle = engine
         .read_rdx()
         .context("failed to read RDX for SetMenu")?;
-    if let Some(window) = state
-        .window_state()
-        .windows
-        .iter_mut()
-        .find(|w| w.handle == hwnd)
-    {
+    let ws = state.window_state();
+    if let Some(window) = ws.windows.iter_mut().find(|w| w.handle == hwnd) {
         window.menu_handle = menu_handle;
+        ws.menu_dirty = true;
     }
     let return_address = engine
         .return_from_win64_api(1)
@@ -276,6 +360,19 @@ pub fn handle_set_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
 }
 /// Handles `USER32.dll!DestroyMenu`.
 pub fn handle_destroy_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let menu_handle = Hmenu::from(
+        engine
+            .read_rcx()
+            .context("failed to read RCX for DestroyMenu")?,
+    );
+    let ws = state.window_state();
+    let before = ws.menus.len();
+    ws.menus.retain(|m| m.handle != menu_handle);
+    if ws.menus.len() != before {
+        ws.menu_dirty = true;
+    }
     handle_menu_success(ctx, "DestroyMenu")
 }
 /// Handles `USER32.dll!RemoveMenu`.
@@ -334,9 +431,11 @@ fn handle_get_menu_item_info(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let menu_handle = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
+    let menu_handle = Hmenu::from(
+        engine
+            .read_rcx()
+            .with_context(|| format!("failed to read RCX for {api_name}"))?,
+    );
 
     let item_value = engine
         .read_rdx()
@@ -375,35 +474,185 @@ fn handle_get_menu_item_info(
     })
 }
 
-/// Locate a menu item by id (or position when `by_position`).
-fn find_menu_item(
-    state: &mut WinApiState,
-    menu_handle: u64,
+/// Reconstructed `MF_*` state flags for an entry, as reported by
+/// `GetMenuState` and `MENUITEMINFO.fState`.
+fn entry_flags(entry: &MenuEntry) -> u32 {
+    match entry {
+        MenuEntry::Item {
+            enabled, checked, ..
+        } => {
+            let mut flags = 0;
+            if !*enabled {
+                flags |= MF_GRAYED;
+            }
+            if *checked {
+                flags |= MF_CHECKED;
+            }
+            flags
+        }
+        MenuEntry::Popup { .. } => MF_POPUP,
+        MenuEntry::Separator => MF_SEPARATOR,
+    }
+}
+
+/// `wID` a menu entry reports; popups report their submenu handle, matching
+/// the `(UINT_PTR)` id AppendMenu stored.
+fn entry_id(entry: &MenuEntry) -> u32 {
+    match entry {
+        MenuEntry::Item { id, .. } => *id,
+        MenuEntry::Popup { submenu, .. } => u32::try_from(submenu.as_u64()).unwrap_or(u32::MAX),
+        MenuEntry::Separator => 0,
+    }
+}
+
+/// Position of an entry within the menus tree.
+struct EntryPos {
+    record: usize,
+    item: usize,
+}
+
+/// Depth-first search for the first entry with command id `item_id`, starting
+/// at the menu `menu_handle` and descending into popup submenus.
+fn find_entry_pos(menus: &[MenuRecord], menu_handle: Hmenu, item_id: u32) -> Option<EntryPos> {
+    let record_index = menus.iter().position(|m| m.handle == menu_handle)?;
+    let mut visited = vec![record_index];
+    find_in_record(menus, record_index, item_id, &mut visited)
+}
+
+fn find_in_record(
+    menus: &[MenuRecord],
+    record_index: usize,
+    item_id: u32,
+    visited: &mut Vec<usize>,
+) -> Option<EntryPos> {
+    let record = menus.get(record_index)?;
+    for (index, entry) in record.items.iter().enumerate() {
+        match entry {
+            MenuEntry::Item { id, .. } if *id == item_id => {
+                return Some(EntryPos {
+                    record: record_index,
+                    item: index,
+                });
+            }
+            MenuEntry::Popup { submenu, .. } => {
+                let Some(sub_index) = menus.iter().position(|m| m.handle == *submenu) else {
+                    continue;
+                };
+                if visited.contains(&sub_index) {
+                    continue; // cycle guard
+                }
+                visited.push(sub_index);
+                if let Some(pos) = find_in_record(menus, sub_index, item_id, visited) {
+                    return Some(pos);
+                }
+                visited.pop();
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Resolve `(menu_handle, item_value, by_position)` to an entry position:
+/// by position the value is a `Vec` index of that menu's items; otherwise a
+/// depth-first command-id search.
+fn resolve_entry_pos(
+    menus: &[MenuRecord],
+    menu_handle: Hmenu,
     item_value: u64,
     by_position: bool,
-) -> Option<MenuItemRecord> {
-    let items = &state.window_state().menu_items;
-    let mut menu_items = items.iter().filter(|item| item.menu_handle == menu_handle);
+) -> Option<EntryPos> {
+    let record_index = menus.iter().position(|m| m.handle == menu_handle)?;
     if by_position {
-        let position = usize::try_from(item_value).unwrap_or(usize::MAX);
-        menu_items.nth(position).cloned()
+        let position = usize::try_from(item_value).ok()?;
+        menus.get(record_index)?.items.get(position)?;
+        Some(EntryPos {
+            record: record_index,
+            item: position,
+        })
     } else {
-        let item_id = u32::try_from(item_value & u64::from(u32::MAX)).unwrap_or(u32::MAX);
-        menu_items.find(|item| item.id == item_id).cloned()
+        let item_id = u32::try_from(item_value & u64::from(u32::MAX)).ok()?;
+        find_entry_pos(menus, menu_handle, item_id)
     }
+}
+
+/// Apply `mutate` to the item found by `(menu_handle, item_value, by_position)`.
+/// Returns the previous reconstructed flags and whether the item was mutated.
+fn mutate_item(
+    state: &mut WinApiState,
+    menu_handle: Hmenu,
+    item_value: u32,
+    by_position: bool,
+    mutate: impl FnOnce(&mut MenuEntry) -> bool,
+) -> (u32, bool) {
+    let ws = state.window_state();
+    let Some(pos) = resolve_entry_pos(&ws.menus, menu_handle, u64::from(item_value), by_position)
+    else {
+        return (u32::MAX, false);
+    };
+    let Some(entry) = ws
+        .menus
+        .get_mut(pos.record)
+        .and_then(|m| m.items.get_mut(pos.item))
+    else {
+        return (u32::MAX, false);
+    };
+    let previous = entry_flags(entry);
+    (previous, mutate(entry))
+}
+
+/// Data a guest-visible menu query needs (`GetMenuState`, `GetMenuItemInfo`).
+struct ResolvedMenuEntry {
+    /// `wID` reported to the guest (submenu handle for popups).
+    id: u32,
+    /// Item text (empty for separators).
+    text: String,
+    /// Reconstructed `MF_*` state flags.
+    flags: u32,
+}
+
+/// Look up a menu entry by id (recursive) or by position.
+fn find_menu_entry(
+    menus: &[MenuRecord],
+    menu_handle: Hmenu,
+    item_value: u64,
+    by_position: bool,
+) -> Option<ResolvedMenuEntry> {
+    let record_index = menus.iter().position(|m| m.handle == menu_handle)?;
+    let entry = if by_position {
+        let position = usize::try_from(item_value).ok()?;
+        menus.get(record_index)?.items.get(position)?
+    } else {
+        let item_id = u32::try_from(item_value & u64::from(u32::MAX)).ok()?;
+        let pos = find_entry_pos(menus, menu_handle, item_id)?;
+        menus.get(pos.record)?.items.get(pos.item)?
+    };
+    Some(ResolvedMenuEntry {
+        id: entry_id(entry),
+        text: match entry {
+            MenuEntry::Item { text, .. } | MenuEntry::Popup { text, .. } => text.clone(),
+            MenuEntry::Separator => String::new(),
+        },
+        flags: entry_flags(entry),
+    })
 }
 
 /// Fill the guest `MENUITEMINFO` for the requested `fMask` bits.
 fn fill_menu_item_info(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
-    menu_handle: u64,
+    menu_handle: Hmenu,
     item_value: u64,
     by_position: bool,
     info_ptr: u64,
     unicode: bool,
 ) -> Result<bool> {
-    let Some(item) = find_menu_item(state, menu_handle, item_value, by_position) else {
+    let Some(item) = find_menu_entry(
+        &state.window_state().menus,
+        menu_handle,
+        item_value,
+        by_position,
+    ) else {
         return Ok(false);
     };
 
@@ -481,9 +730,11 @@ fn fill_menu_item_info(
 pub fn handle_get_menu_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let menu_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for GetMenuState")?;
+    let menu_handle = Hmenu::from(
+        engine
+            .read_rcx()
+            .context("failed to read RCX for GetMenuState")?,
+    );
 
     let item_value = engine
         .read_rdx()
@@ -498,8 +749,13 @@ pub fn handle_get_menu_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
 
     let by_position = flags & MF_BYPOSITION != 0;
 
-    let return_value = find_menu_item(state, menu_handle, item_value, by_position)
-        .map_or(u64::from(u32::MAX), |item| u64::from(item.flags));
+    let return_value = find_menu_entry(
+        &state.window_state().menus,
+        menu_handle,
+        item_value,
+        by_position,
+    )
+    .map_or(u64::from(u32::MAX), |item| u64::from(item.flags));
 
     let return_address = engine
         .return_from_win64_api(return_value)

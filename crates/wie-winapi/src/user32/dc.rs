@@ -11,18 +11,20 @@ pub fn handle_get_dc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult
     let window_handle = engine.read_rcx().context("failed to read RCX for GetDC")?;
 
     let dc_handle = if super::is_known_window(state, window_handle) {
-        state.gdi_state().alloc_dc(DcKind::Window(window_handle))
+        state
+            .gdi_state()
+            .alloc_dc(DcKind::Window(crate::handles::Hwnd::from(window_handle)))
     } else {
-        FAKE_DEVICE_CONTEXT_HANDLE
+        crate::handles::Hdc::from(FAKE_DEVICE_CONTEXT_HANDLE)
     };
 
     let return_address = engine
-        .return_from_win64_api(dc_handle)
+        .return_from_win64_api(dc_handle.as_u64())
         .context("failed to return from GetDC")?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: dc_handle,
+        return_value: dc_handle.as_u64(),
     })
 }
 /// Handles `USER32.dll!ReleaseDC`.
@@ -37,7 +39,9 @@ pub fn handle_release_dc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
         .read_rdx()
         .context("failed to read RDX for ReleaseDC")?;
 
-    state.gdi_state().remove_dc(dc_handle);
+    state
+        .gdi_state()
+        .remove_dc(crate::handles::Hdc::from(dc_handle));
 
     let return_address = engine
         .return_from_win64_api(1)
@@ -71,8 +75,10 @@ pub fn handle_begin_paint(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         // BOOL fRestore;      28
         // BOOL fIncUpdate;    32
         // BYTE rgbReserved[32]; 36
-        let begin_dc = state.gdi_state().alloc_dc(DcKind::Window(window_handle));
-        write_guest_u64(engine, paint_ptr, begin_dc)?;
+        let begin_dc = state
+            .gdi_state()
+            .alloc_dc(DcKind::Window(crate::handles::Hwnd::from(window_handle)));
+        write_guest_u64(engine, paint_ptr, begin_dc.as_u64())?;
         // fErase: nonzero when the background still needs erasing — i.e. the
         // invalidation asked for an erase and no WM_ERASEBKGND consumed it
         // (a class brush that erased it clears the flag on dispatch).
@@ -112,7 +118,7 @@ pub fn handle_begin_paint(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         // rgbReserved left zeroed by guest or ignored.
 
         tracing::debug!(window_handle, width, height, "BeginPaint");
-        begin_dc
+        begin_dc.as_u64()
     } else {
         tracing::debug!(window_handle, paint_ptr, known, "BeginPaint rejected");
         0

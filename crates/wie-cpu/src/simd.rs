@@ -136,9 +136,284 @@ pub fn stretch_nearest(
     }
 }
 
+/// Write one `0RGB` color to 4 consecutive pixels.
+///
+/// The scalar tail / fallback is a plain store loop; on aarch64 a single
+/// `vst1q` stores the duplicated vector. `dst.len()` must be ≥ 4 (callers
+/// gate on runs of 4).
+pub fn fill_0rgb_4x(dst: &mut [u32], color: u32) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: `dst.len() >= 4` is the caller contract; 4 words are within
+        // `dst` and unaligned `vst1q` stores are accepted by the ISA.
+        #[expect(unsafe_code)]
+        unsafe {
+            use std::arch::aarch64::{vdupq_n_u32, vst1q_u32};
+            let v = vdupq_n_u32(color);
+            vst1q_u32(dst.as_mut_ptr(), v);
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        for px in dst.iter_mut().take(4) {
+            *px = color;
+        }
+    }
+}
+
+/// 4-pixel SRCALPHA/INVSRCALPHA/ADD blend, byte-identical to the D3D9 FFP
+/// fragment math in `d3d9_render.rs::blend_fragment` for
+/// `SRCBLEND=SRCALPHA, DESTBLEND=INVSRCALPHA, BLENDOP=ADD`:
+/// `out = (src * a + dst * (255 - a)) >> 8`, clamped to 0..255 per channel.
+///
+/// `src`/`dst` are 4 independent `0RGB` pixels (gather/scatter — the accepted
+/// pixels need not be contiguous in the backbuffer); `src_alpha` the four
+/// alpha bytes. Products are ≤ 255·255 = 65025 and sums ≤ 130050, so the
+/// u32 lanes cannot overflow and the result equals the scalar `>>8` exactly.
+pub fn blend_0rgb_4x(dst: &mut [u32; 4], src: &[u32; 4], src_alpha: &[u8; 4]) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: all loads/stores are 16-byte aligned to the stack arrays or
+        // caller-provided 4-word arrays (unaligned-safe); every lane is
+        // masked to 8 bits before the fixed-point math, so no lane can
+        // overflow u32.
+        #[expect(unsafe_code)]
+        unsafe {
+            use std::arch::aarch64::{
+                vaddq_u32, vandq_u32, vdupq_n_u32, vld1q_u32, vminq_u32, vmulq_u32, vorrq_u32,
+                vshlq_n_u32, vshrq_n_u32, vst1q_u32, vsubq_u32,
+            };
+            let ff = vdupq_n_u32(0xFF);
+            let src_v = vld1q_u32(src.as_ptr());
+            let dst_v = vld1q_u32(dst.as_ptr());
+            // Build the alpha vector from the 4 bytes (no OOB: vld1q_u32 on
+            // a 4-byte array would read 16 bytes).
+            let [a0, a1, a2, a3] = *src_alpha;
+            let alpha_arr = [u32::from(a0), u32::from(a1), u32::from(a2), u32::from(a3)];
+            let alpha_v = vld1q_u32(alpha_arr.as_ptr());
+            let inv_alpha_v = vsubq_u32(vdupq_n_u32(255), alpha_v);
+
+            // Per-channel: (src_ch * a + dst_ch * (255 - a)) >> 8, clamped.
+            let src_r = vandq_u32(vshrq_n_u32(src_v, 16), ff);
+            let dst_r = vandq_u32(vshrq_n_u32(dst_v, 16), ff);
+            let r = vminq_u32(
+                vshrq_n_u32(
+                    vaddq_u32(vmulq_u32(src_r, alpha_v), vmulq_u32(dst_r, inv_alpha_v)),
+                    8,
+                ),
+                ff,
+            );
+            let src_g = vandq_u32(vshrq_n_u32(src_v, 8), ff);
+            let dst_g = vandq_u32(vshrq_n_u32(dst_v, 8), ff);
+            let g = vminq_u32(
+                vshrq_n_u32(
+                    vaddq_u32(vmulq_u32(src_g, alpha_v), vmulq_u32(dst_g, inv_alpha_v)),
+                    8,
+                ),
+                ff,
+            );
+            let src_b = vandq_u32(src_v, ff);
+            let dst_b = vandq_u32(dst_v, ff);
+            let b = vminq_u32(
+                vshrq_n_u32(
+                    vaddq_u32(vmulq_u32(src_b, alpha_v), vmulq_u32(dst_b, inv_alpha_v)),
+                    8,
+                ),
+                ff,
+            );
+
+            let out = vorrq_u32(vshlq_n_u32(r, 16), vorrq_u32(vshlq_n_u32(g, 8), b));
+            vst1q_u32(dst.as_mut_ptr(), out);
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let [mut d0, mut d1, mut d2, mut d3] = *dst;
+        let [s0, s1, s2, s3] = *src;
+        let [a0, a1, a2, a3] = *src_alpha;
+        let blend = |s: u32, d: &mut u32, a: u8| {
+            let a = u32::from(a);
+            let inv = 255_u32.saturating_sub(a);
+            let ch = |sc: u32, dc: u32| {
+                (sc.saturating_mul(a).saturating_add(dc.saturating_mul(inv)) >> 8).min(255)
+            };
+            *d = (ch((s >> 16) & 0xFF, (*d >> 16) & 0xFF) << 16)
+                | (ch((s >> 8) & 0xFF, (*d >> 8) & 0xFF) << 8)
+                | ch(s & 0xFF, *d & 0xFF);
+        };
+        blend(s0, &mut d0, a0);
+        blend(s1, &mut d1, a1);
+        blend(s2, &mut d2, a2);
+        blend(s3, &mut d3, a3);
+        *dst = [d0, d1, d2, d3];
+    }
+}
+
+/// 4-pixel MODULATE color-op multiply, byte-identical to
+/// `d3d9_render.rs::eval_color_op` for `D3DTOP_MODULATE`:
+/// `out = (a * b) >> 8` per channel, clamped to 0..255.
+pub fn mul_0rgb_4x(dst: &mut [u32; 4], src: &[u32; 4]) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: as `blend_0rgb_4x` — 16-byte loads/stores over 4-word
+        // arrays, lanes masked to 8 bits, products ≤ 65025 fit u32.
+        #[expect(unsafe_code)]
+        unsafe {
+            use std::arch::aarch64::{
+                vandq_u32, vdupq_n_u32, vld1q_u32, vminq_u32, vmulq_u32, vorrq_u32, vshlq_n_u32,
+                vshrq_n_u32, vst1q_u32,
+            };
+            let ff = vdupq_n_u32(0xFF);
+            let src_v = vld1q_u32(src.as_ptr());
+            let dst_v = vld1q_u32(dst.as_ptr());
+            let r = vminq_u32(
+                vshrq_n_u32(
+                    vmulq_u32(
+                        vandq_u32(vshrq_n_u32(src_v, 16), ff),
+                        vandq_u32(vshrq_n_u32(dst_v, 16), ff),
+                    ),
+                    8,
+                ),
+                ff,
+            );
+            let g = vminq_u32(
+                vshrq_n_u32(
+                    vmulq_u32(
+                        vandq_u32(vshrq_n_u32(src_v, 8), ff),
+                        vandq_u32(vshrq_n_u32(dst_v, 8), ff),
+                    ),
+                    8,
+                ),
+                ff,
+            );
+            let b = vminq_u32(
+                vshrq_n_u32(vmulq_u32(vandq_u32(src_v, ff), vandq_u32(dst_v, ff)), 8),
+                ff,
+            );
+            let out = vorrq_u32(vshlq_n_u32(r, 16), vorrq_u32(vshlq_n_u32(g, 8), b));
+            vst1q_u32(dst.as_mut_ptr(), out);
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let [mut d0, mut d1, mut d2, mut d3] = *dst;
+        let [s0, s1, s2, s3] = *src;
+        let mul = |s: u32, d: &mut u32| {
+            let ch = |sc: u32, dc: u32| (sc.saturating_mul(dc) >> 8).min(255);
+            *d = (ch((s >> 16) & 0xFF, (*d >> 16) & 0xFF) << 16)
+                | (ch((s >> 8) & 0xFF, (*d >> 8) & 0xFF) << 8)
+                | ch(s & 0xFF, *d & 0xFF);
+        };
+        mul(s0, &mut d0);
+        mul(s1, &mut d1);
+        mul(s2, &mut d2);
+        mul(s3, &mut d3);
+        *dst = [d0, d1, d2, d3];
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{mask_bgra_to_0rgb, stretch_nearest};
+    use super::{blend_0rgb_4x, fill_0rgb_4x, mask_bgra_to_0rgb, mul_0rgb_4x, stretch_nearest};
+
+    /// Deterministic 32-bit LCG (no external dep in tests).
+    fn lcg(state: &mut u32) -> u32 {
+        *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *state
+    }
+
+    /// Reference SRCALPHA/INVSRCALPHA/ADD blend — the exact scalar formula
+    /// `d3d9_render.rs::blend_fragment` uses for these factors.
+    fn blend_ref(s: u32, d: u32, a: u8) -> u32 {
+        let a = u32::from(a);
+        let inv = 255_u32.saturating_sub(a);
+        let ch = |sc: u32, dc: u32| {
+            (sc.saturating_mul(a).saturating_add(dc.saturating_mul(inv)) >> 8).min(255)
+        };
+        (ch((s >> 16) & 0xFF, (d >> 16) & 0xFF) << 16)
+            | (ch((s >> 8) & 0xFF, (d >> 8) & 0xFF) << 8)
+            | ch(s & 0xFF, d & 0xFF)
+    }
+
+    /// Reference MODULATE `(a*b)>>8` per channel.
+    fn mul_ref(s: u32, d: u32) -> u32 {
+        let ch = |sc: u32, dc: u32| (sc.saturating_mul(dc) >> 8).min(255);
+        (ch((s >> 16) & 0xFF, (d >> 16) & 0xFF) << 16)
+            | (ch((s >> 8) & 0xFF, (d >> 8) & 0xFF) << 8)
+            | ch(s & 0xFF, d & 0xFF)
+    }
+
+    #[test]
+    fn blend_4x_matches_reference_formula() {
+        let mut state = 0x00C0_FFEE_u32;
+        for _ in 0..500 {
+            let src = [
+                lcg(&mut state) & 0x00FF_FFFF,
+                lcg(&mut state) & 0x00FF_FFFF,
+                lcg(&mut state) & 0x00FF_FFFF,
+                lcg(&mut state) & 0x00FF_FFFF,
+            ];
+            let dst = [
+                lcg(&mut state) & 0x00FF_FFFF,
+                lcg(&mut state) & 0x00FF_FFFF,
+                lcg(&mut state) & 0x00FF_FFFF,
+                lcg(&mut state) & 0x00FF_FFFF,
+            ];
+            let alpha = [
+                u8::try_from(lcg(&mut state) & 0xFF).unwrap_or(0),
+                u8::try_from(lcg(&mut state) & 0xFF).unwrap_or(0),
+                u8::try_from(lcg(&mut state) & 0xFF).unwrap_or(0),
+                u8::try_from(lcg(&mut state) & 0xFF).unwrap_or(0),
+            ];
+            let mut got = dst;
+            blend_0rgb_4x(&mut got, &src, &alpha);
+            for i in 0..4 {
+                let want = blend_ref(
+                    src.get(i).copied().unwrap_or(0),
+                    dst.get(i).copied().unwrap_or(0),
+                    alpha.get(i).copied().unwrap_or(0),
+                );
+                let g = got.get(i).copied().unwrap_or(0);
+                assert_eq!(g, want, "blend mismatch: px {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn mul_4x_matches_reference_formula() {
+        let mut state = 0x0000_F00D_u32;
+        for _ in 0..500 {
+            let src = [
+                lcg(&mut state) & 0x00FF_FFFF,
+                lcg(&mut state) & 0x00FF_FFFF,
+                lcg(&mut state) & 0x00FF_FFFF,
+                lcg(&mut state) & 0x00FF_FFFF,
+            ];
+            let dst = [
+                lcg(&mut state) & 0x00FF_FFFF,
+                lcg(&mut state) & 0x00FF_FFFF,
+                lcg(&mut state) & 0x00FF_FFFF,
+                lcg(&mut state) & 0x00FF_FFFF,
+            ];
+            let mut got = dst;
+            mul_0rgb_4x(&mut got, &src);
+            for i in 0..4 {
+                let want = mul_ref(
+                    src.get(i).copied().unwrap_or(0),
+                    dst.get(i).copied().unwrap_or(0),
+                );
+                let g = got.get(i).copied().unwrap_or(0);
+                assert_eq!(g, want, "mul mismatch: px {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn fill_4x_writes_all_four() {
+        let mut buf = [0x0011_2233u32, 0x0044_5566, 0x0077_8899, 0x00AA_BBCC];
+        fill_0rgb_4x(&mut buf, 0x00DE_ADBE);
+        assert_eq!(buf, [0x00DE_ADBE; 4]);
+    }
 
     #[test]
     fn mask_zeroes_alpha_byte() {

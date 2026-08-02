@@ -433,18 +433,16 @@ pub fn handle_set_timer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
             requested_timer_id
         };
 
-        if let Some(timer) = state
-            .window_state()
-            .timers
-            .iter_mut()
-            .find(|timer| timer.window_handle == window_handle && timer.timer_id == timer_id)
-        {
+        if let Some(timer) = state.window_state().timers.iter_mut().find(|timer| {
+            timer.window_handle == crate::handles::Hwnd::from(window_handle)
+                && timer.timer_id == timer_id
+        }) {
             timer.interval_ms = interval_ms;
             timer.callback_address = callback_address;
             timer.next_fire = timer_deadline(interval_ms);
         } else {
             state.window_state().timers.push(TimerRecord {
-                window_handle,
+                window_handle: crate::handles::Hwnd::from(window_handle),
                 timer_id,
                 interval_ms,
                 callback_address,
@@ -486,11 +484,10 @@ pub fn handle_kill_timer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
         .read_rdx()
         .context("failed to read RDX for KillTimer")?;
 
-    let existed = state
-        .window_state()
-        .timers
-        .iter()
-        .any(|timer| timer.window_handle == window_handle && timer.timer_id == timer_id);
+    let existed = state.window_state().timers.iter().any(|timer| {
+        timer.window_handle == crate::handles::Hwnd::from(window_handle)
+            && timer.timer_id == timer_id
+    });
 
     tracing::debug!(
         target: "wiegui",
@@ -501,10 +498,10 @@ pub fn handle_kill_timer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
     );
 
     if existed {
-        state
-            .window_state()
-            .timers
-            .retain(|timer| timer.window_handle != window_handle || timer.timer_id != timer_id);
+        state.window_state().timers.retain(|timer| {
+            timer.window_handle != crate::handles::Hwnd::from(window_handle)
+                || timer.timer_id != timer_id
+        });
     }
 
     let return_value = u64::from(existed);

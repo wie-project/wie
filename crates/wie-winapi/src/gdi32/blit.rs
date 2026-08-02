@@ -122,14 +122,17 @@ pub(crate) fn subtract_rect(rects: Vec<IRect>, child: IRect) -> Vec<IRect> {
 /// with offset (0, 0), preserving the pre-child-model behavior for orphans.
 /// Returns `None` when `hwnd` itself is unknown.
 #[must_use]
-pub(crate) fn ancestor_offset(windows: &[WindowRecord], hwnd: u64) -> Option<(u64, i32, i32)> {
-    let mut current = hwnd;
+pub(crate) fn ancestor_offset(
+    windows: &[WindowRecord],
+    hwnd: u64,
+) -> Option<(crate::handles::Hwnd, i32, i32)> {
+    let mut current = crate::handles::Hwnd::from(hwnd);
     let mut offset_x = 0_i32;
     let mut offset_y = 0_i32;
     loop {
         let window = windows.iter().find(|w| w.handle == current)?;
         let parent = window.parent_handle;
-        if parent == 0 || parent == current {
+        if parent == crate::handles::Hwnd::NULL || parent == current {
             return Some((current, offset_x, offset_y));
         }
         if !windows.iter().any(|w| w.handle == parent) {
@@ -145,7 +148,7 @@ pub(crate) fn ancestor_offset(windows: &[WindowRecord], hwnd: u64) -> Option<(u6
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ResolvedWindow {
     /// Top-level ancestor whose present surface receives the pixels.
-    pub hwnd: u64,
+    pub hwnd: crate::handles::Hwnd,
     /// Ancestor client size — the surface dimensions.
     pub width: u32,
     /// Ancestor client size — the surface dimensions.
@@ -155,7 +158,7 @@ pub(crate) struct ResolvedWindow {
     /// Position of the DC's window within the ancestor client space.
     pub offset_y: i32,
     /// The DC's own window handle (for the WS_CLIPCHILDREN child lookup).
-    pub dc_window: u64,
+    pub dc_window: crate::handles::Hwnd,
     /// The DC window's own client size — the destination clip bounds.
     pub dc_w: u32,
     /// The DC window's own client size — the destination clip bounds.
@@ -172,7 +175,7 @@ pub(crate) fn resolve_window_ancestor(
     hwnd: u64,
 ) -> Option<ResolvedWindow> {
     let (top_hwnd, offset_x, offset_y) = ancestor_offset(&state.window_state().windows, hwnd)?;
-    let (w, h) = crate::user32::window_client_size(state, top_hwnd);
+    let (w, h) = crate::user32::window_client_size(state, top_hwnd.as_u64());
     let (dc_w, dc_h) = crate::user32::window_client_size(state, hwnd);
     Some(ResolvedWindow {
         hwnd: top_hwnd,
@@ -180,7 +183,7 @@ pub(crate) fn resolve_window_ancestor(
         height: u32::try_from(h.max(1)).unwrap_or(1),
         offset_x,
         offset_y,
-        dc_window: hwnd,
+        dc_window: crate::handles::Hwnd::from(hwnd),
         dc_w: u32::try_from(dc_w.max(1)).unwrap_or(1),
         dc_h: u32::try_from(dc_h.max(1)).unwrap_or(1),
     })
@@ -192,9 +195,12 @@ pub(crate) fn resolve_window_ancestor(
 /// composite at their offset); memory and screen DCs have no writable
 /// destination and resolve to `None`.
 pub(crate) fn resolve_dest_info(state: &mut WinApiState, dc_handle: u64) -> Option<ResolvedWindow> {
-    let dc = state.gdi_state().find_dc(dc_handle)?.clone();
+    let dc = state
+        .gdi_state()
+        .find_dc(crate::handles::Hdc::from(dc_handle))?
+        .clone();
     match dc.kind {
-        DcKind::Window(hwnd) => resolve_window_ancestor(state, hwnd),
+        DcKind::Window(hwnd) => resolve_window_ancestor(state, hwnd.as_u64()),
         DcKind::Memory | DcKind::Screen => None,
     }
 }
@@ -257,7 +263,10 @@ fn resolve_src_info(
     state: &mut crate::WinApiState,
     dc_handle: u64,
 ) -> Option<(u64, i32, i32, i32, bool)> {
-    let dc = state.gdi_state().find_dc(dc_handle)?.clone();
+    let dc = state
+        .gdi_state()
+        .find_dc(crate::handles::Hdc::from(dc_handle))?
+        .clone();
     let dib_handle = dc.selected_bitmap?;
     let dib = state.gdi_state().find_dib(dib_handle)?.clone();
     if dib.bit_count != 32 {
@@ -362,7 +371,7 @@ fn blit_row(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fill_rect_surface(
     state: &mut crate::WinApiState,
-    hwnd: u64,
+    hwnd: crate::handles::Hwnd,
     dest_w: u32,
     dest_h: u32,
     x: i32,
@@ -370,22 +379,8 @@ pub(crate) fn fill_rect_surface(
     cx: i32,
     cy: i32,
     color: u32,
-    publish: bool,
 ) {
     state.present().ensure_surface(hwnd, dest_w, dest_h);
-    // B3: accumulate the fill rect into the surface's dirty region so a
-    // partial publish can copy only what changed. Covers PatBlt, FillRect,
-    // BitBlt BLACKNESS/WHITENESS, control faces, dialog faces and window
-    // background erases — every fill-based surface writer.
-    state.present().mark_dirty(
-        hwnd,
-        IRect {
-            left: x,
-            top: y,
-            right: x.saturating_add(cx),
-            bottom: y.saturating_add(cy),
-        },
-    );
     if let Some(surf) = state.present().surfaces.get_mut(&hwnd) {
         let dest_w_u = usize::try_from(surf.width).unwrap_or(0);
         let row_bytes = usize::try_from(cx.max(0)).unwrap_or(0);
@@ -403,9 +398,11 @@ pub(crate) fn fill_rect_surface(
             }
         }
     }
-    if publish {
-        state.present().publish(hwnd);
-    }
+    // Publish-model rework (ora-5): always defer — the runtime drains pending
+    // publishes once per repaint cycle at the empty-queue quiescence point,
+    // so a WM_PAINT cycle's erase + BitBlt + control paints + captions emit a
+    // single complete frame.
+    state.present().publish_deferred(hwnd);
 }
 
 /// Handles `GDI32.dll!BitBlt` — real 32-bpp SRCCOPY blit to window surfaces.
@@ -467,7 +464,6 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
                     rect.width(),
                     rect.height(),
                     color,
-                    true,
                 );
             }
         }
@@ -555,26 +551,6 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
         .present()
         .ensure_surface(info.hwnd, info.width, info.height);
 
-    // B3: accumulate the clipped destination rects (in surface coords) into
-    // the dirty region so the publish can carry a partial region. Done before
-    // the dest borrow below — the blit loop then only writes pixels.
-    for rect in &rects {
-        if rect.width() <= 0 || rect.height() <= 0 {
-            continue;
-        }
-        let surface_x = rect.left.saturating_add(info.offset_x);
-        let surface_y = rect.top.saturating_add(info.offset_y);
-        state.present().mark_dirty(
-            info.hwnd,
-            IRect {
-                left: surface_x,
-                top: surface_y,
-                right: surface_x.saturating_add(rect.width()),
-                bottom: surface_y.saturating_add(rect.height()),
-            },
-        );
-    }
-
     // B9(c): time the mask copy (copy ①) — only when frame timing is enabled.
     let blit_t0 = crate::present::frame_timing_enabled().then(std::time::Instant::now);
 
@@ -628,7 +604,11 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
         state.present().record_blit_copy(t0.elapsed().as_nanos());
     }
 
-    state.present().publish(info.hwnd);
+    // B3.6: defer the publish to the repaint-cycle boundary (one frame per
+    // full cycle). The surface buffer stays put and the dirty accumulator
+    // keeps unioning until the drain, so the published frame is the
+    // fully-painted composite with the union region.
+    state.present().publish_deferred(info.hwnd);
 
     let ra = engine
         .return_from_win64_api(1)
@@ -690,9 +670,11 @@ pub fn handle_pat_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
     // A DC's default brush is WHITE_BRUSH, mirroring real GDI.
     let selected_brush = state
         .gdi_state()
-        .find_dc(hdc)
+        .find_dc(crate::handles::Hdc::from(hdc))
         .and_then(|dc| dc.selected_brush)
-        .unwrap_or(crate::gdi32::state::STOCK_WHITE_BRUSH_HANDLE);
+        .unwrap_or(crate::handles::Hbrush::from(
+            crate::gdi32::state::STOCK_WHITE_BRUSH_HANDLE,
+        ));
 
     if let Some(color) = brush_color(state, selected_brush)
         && let Some(info) = resolve_dest_info(state, hdc)
@@ -708,7 +690,6 @@ pub fn handle_pat_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
                 rect.width(),
                 rect.height(),
                 color,
-                true,
             );
         }
     }
@@ -745,7 +726,7 @@ pub fn handle_fill_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
         let bottom = read_guest_i32(engine, checked_field_address(rect_ptr, 12, "RECT.bottom"))
             .context("failed to read RECT.bottom")?;
 
-        if let Some(color) = brush_color(state, brush)
+        if let Some(color) = brush_color(state, crate::handles::Hbrush::from(brush))
             && let Some(info) = resolve_dest_info(state, hdc)
         {
             for rect in dest_rects(
@@ -766,7 +747,6 @@ pub fn handle_fill_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
                     rect.width(),
                     rect.height(),
                     color,
-                    true,
                 );
             }
             filled = true;
@@ -787,6 +767,7 @@ pub fn handle_fill_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 mod tests {
     use super::{IRect, ancestor_offset, subtract_rect};
     use crate::WindowRecord;
+    use crate::handles::Hwnd;
 
     fn rect(left: i32, top: i32, right: i32, bottom: i32) -> IRect {
         IRect {
@@ -800,53 +781,53 @@ mod tests {
     #[test]
     fn ancestor_offset_top_level_is_identity() {
         let windows = vec![WindowRecord {
-            handle: 1,
+            handle: Hwnd::from(1),
             ..Default::default()
         }];
-        assert_eq!(ancestor_offset(&windows, 1), Some((1, 0, 0)));
+        assert_eq!(ancestor_offset(&windows, 1), Some((Hwnd::from(1), 0, 0)));
     }
 
     #[test]
     fn ancestor_offset_sums_child_positions() {
         let windows = vec![
             WindowRecord {
-                handle: 1,
+                handle: Hwnd::from(1),
                 ..Default::default()
             },
             WindowRecord {
-                handle: 2,
-                parent_handle: 1,
+                handle: Hwnd::from(2),
+                parent_handle: Hwnd::from(1),
                 x: 20,
                 y: 30,
                 ..Default::default()
             },
             WindowRecord {
-                handle: 3,
-                parent_handle: 2,
+                handle: Hwnd::from(3),
+                parent_handle: Hwnd::from(2),
                 x: 5,
                 y: 7,
                 ..Default::default()
             },
         ];
-        assert_eq!(ancestor_offset(&windows, 3), Some((1, 25, 37)));
+        assert_eq!(ancestor_offset(&windows, 3), Some((Hwnd::from(1), 25, 37)));
     }
 
     #[test]
     fn ancestor_offset_broken_parent_chain_falls_back() {
         let windows = vec![WindowRecord {
-            handle: 2,
-            parent_handle: 99,
+            handle: Hwnd::from(2),
+            parent_handle: Hwnd::from(99),
             x: 20,
             y: 30,
             ..Default::default()
         }];
-        assert_eq!(ancestor_offset(&windows, 2), Some((2, 0, 0)));
+        assert_eq!(ancestor_offset(&windows, 2), Some((Hwnd::from(2), 0, 0)));
     }
 
     #[test]
     fn ancestor_offset_unknown_hwnd_is_none() {
         let windows = vec![WindowRecord {
-            handle: 1,
+            handle: Hwnd::from(1),
             ..Default::default()
         }];
         assert_eq!(ancestor_offset(&windows, 42), None);

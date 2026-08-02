@@ -10,6 +10,7 @@ use crate::guest_memory::{
 use crate::guest_string::{
     read_ansi_lossy as read_guest_ansi_lossy, read_utf16_lossy as read_guest_utf16_lossy,
 };
+use crate::handles::{Hbitmap, Hbrush, Hdc, Hfont, Hpen, Hwnd};
 use crate::user32::low_i32;
 use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 
@@ -163,39 +164,26 @@ pub fn handle_select_object(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         .context("failed to read RDX for SelectObject")?;
 
     // Scope the object-kind checks so the mutable borrow ends before find_dc_mut.
-    let object_kind = {
-        let gdi = state.gdi_state();
-        if gdi.find_dib(object_handle).is_some() {
-            SelectedObjectKind::Bitmap
-        } else if gdi.find_brush(object_handle).is_some() {
-            SelectedObjectKind::Brush
-        } else if gdi.find_pen(object_handle).is_some() {
-            SelectedObjectKind::Pen
-        } else if gdi.find_font(object_handle).is_some() {
-            SelectedObjectKind::Font
-        } else {
-            SelectedObjectKind::Other
-        }
-    };
+    let object_kind = GdiObject::classify(object_handle, state.gdi_state());
 
     let replaced = match object_kind {
-        SelectedObjectKind::Bitmap => state
+        Some(GdiObject::Dib(bitmap)) => state
             .gdi_state()
-            .find_dc_mut(dc_handle)
-            .map(|dc| dc.selected_bitmap.replace(object_handle)),
-        SelectedObjectKind::Brush => state
+            .find_dc_mut(Hdc::from(dc_handle))
+            .map(|dc| dc.selected_bitmap.replace(bitmap).map(Hbitmap::as_u64)),
+        Some(GdiObject::Brush(brush)) => state
             .gdi_state()
-            .find_dc_mut(dc_handle)
-            .map(|dc| dc.selected_brush.replace(object_handle)),
-        SelectedObjectKind::Pen => state
+            .find_dc_mut(Hdc::from(dc_handle))
+            .map(|dc| dc.selected_brush.replace(brush).map(Hbrush::as_u64)),
+        Some(GdiObject::Pen(pen)) => state
             .gdi_state()
-            .find_dc_mut(dc_handle)
-            .map(|dc| dc.selected_pen.replace(object_handle)),
-        SelectedObjectKind::Font => state
+            .find_dc_mut(Hdc::from(dc_handle))
+            .map(|dc| dc.selected_pen.replace(pen).map(Hpen::as_u64)),
+        Some(GdiObject::Font(font)) => state
             .gdi_state()
-            .find_dc_mut(dc_handle)
-            .map(|dc| dc.selected_font.replace(object_handle)),
-        SelectedObjectKind::Other => None,
+            .find_dc_mut(Hdc::from(dc_handle))
+            .map(|dc| dc.selected_font.replace(font).map(Hfont::as_u64)),
+        None => None,
     };
 
     if let Some(replaced) = replaced {
@@ -218,15 +206,6 @@ pub fn handle_select_object(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         return_address,
         return_value: FAKE_PREVIOUS_GDI_OBJECT_HANDLE,
     })
-}
-
-/// What kind of GDI object `SelectObject` is selecting into a DC.
-enum SelectedObjectKind {
-    Bitmap,
-    Brush,
-    Pen,
-    Font,
-    Other,
 }
 
 /// Handles `GDI32.dll!GetTextExtentPoint32A`.
@@ -333,12 +312,12 @@ pub fn handle_create_compatible_dc(ctx: &mut HandlerContext<'_>) -> Result<WinAp
     let dc_handle = state.gdi_state().alloc_dc(DcKind::Memory);
 
     let return_address = engine
-        .return_from_win64_api(dc_handle)
+        .return_from_win64_api(dc_handle.as_u64())
         .context("failed to return from CreateCompatibleDC")?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: dc_handle,
+        return_value: dc_handle.as_u64(),
     })
 }
 
@@ -452,20 +431,17 @@ pub fn handle_delete_object(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 
     // Free known GDI objects; the return value preserves the historical
     // "any non-zero handle succeeds" behavior for unknown handles.
-    let existed = {
-        let gdi = state.gdi_state();
-        gdi.find_dib(object_handle).is_some()
-            || gdi.find_brush(object_handle).is_some()
-            || gdi.find_pen(object_handle).is_some()
-            || gdi.find_font(object_handle).is_some()
-    };
-
+    let object = GdiObject::classify(object_handle, state.gdi_state());
+    let existed = object.is_some();
     if existed {
         let gdi = state.gdi_state();
-        gdi.remove_dib(object_handle);
-        gdi.remove_brush(object_handle);
-        gdi.remove_pen(object_handle);
-        gdi.remove_font(object_handle);
+        match object {
+            Some(GdiObject::Dib(bitmap)) => gdi.remove_dib(bitmap),
+            Some(GdiObject::Brush(brush)) => gdi.remove_brush(brush),
+            Some(GdiObject::Pen(pen)) => gdi.remove_pen(pen),
+            Some(GdiObject::Font(font)) => gdi.remove_font(font),
+            None => {}
+        }
     }
 
     let return_value = u64::from(existed || object_handle != 0);
@@ -493,15 +469,15 @@ pub fn handle_create_solid_brush(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 
     let handle = state.gdi_state().alloc_brush(color);
 
-    tracing::debug!(handle, color, "CreateSolidBrush");
+    tracing::debug!(handle = handle.as_u64(), color, "CreateSolidBrush");
 
     let return_address = engine
-        .return_from_win64_api(handle)
+        .return_from_win64_api(handle.as_u64())
         .context("failed to return from CreateSolidBrush")?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: handle,
+        return_value: handle.as_u64(),
     })
 }
 
@@ -524,15 +500,15 @@ pub fn handle_create_pen(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 
     let handle = state.gdi_state().alloc_pen(color);
 
-    tracing::debug!(handle, color, "CreatePen");
+    tracing::debug!(handle = handle.as_u64(), color, "CreatePen");
 
     let return_address = engine
-        .return_from_win64_api(handle)
+        .return_from_win64_api(handle.as_u64())
         .context("failed to return from CreatePen")?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: handle,
+        return_value: handle.as_u64(),
     })
 }
 
@@ -646,7 +622,7 @@ pub fn handle_create_dib_section(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     });
 
     tracing::debug!(
-        dib_handle,
+        dib_handle = dib_handle.as_u64(),
         bits_ptr,
         width_abs,
         height_signed,
@@ -656,12 +632,12 @@ pub fn handle_create_dib_section(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     );
 
     let return_address = engine
-        .return_from_win64_api(dib_handle)
+        .return_from_win64_api(dib_handle.as_u64())
         .context("failed to return from CreateDIBSection")?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: dib_handle,
+        return_value: dib_handle.as_u64(),
     })
 }
 
@@ -767,15 +743,23 @@ fn handle_create_font_impl(
         .gdi_state()
         .alloc_font(face_name.clone(), height, weight, italic, charset);
 
-    tracing::debug!(handle, height, weight, italic, charset, face_name, api_name);
+    tracing::debug!(
+        handle = handle.as_u64(),
+        height,
+        weight,
+        italic,
+        charset,
+        face_name,
+        api_name
+    );
 
     let return_address = engine
-        .return_from_win64_api(handle)
+        .return_from_win64_api(handle.as_u64())
         .with_context(|| format!("failed to return from {api_name}"))?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: handle,
+        return_value: handle.as_u64(),
     })
 }
 
@@ -831,7 +815,7 @@ pub fn handle_create_font_indirect_a(ctx: &mut HandlerContext<'_>) -> Result<Win
         .alloc_font(face_name.clone(), height, weight, italic, charset);
 
     tracing::debug!(
-        handle,
+        handle = handle.as_u64(),
         height,
         weight,
         italic,
@@ -841,12 +825,12 @@ pub fn handle_create_font_indirect_a(ctx: &mut HandlerContext<'_>) -> Result<Win
     );
 
     let return_address = engine
-        .return_from_win64_api(handle)
+        .return_from_win64_api(handle.as_u64())
         .context("failed to return from CreateFontIndirectA")?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: handle,
+        return_value: handle.as_u64(),
     })
 }
 
@@ -862,7 +846,7 @@ pub(crate) fn dc_resolved_font(
     font_engine: &mut FontEngine,
 ) -> Option<(FontKey, ResolvedFont)> {
     let gdi = state.try_gdi_state()?;
-    let dc = gdi.find_dc(dc_handle)?;
+    let dc = gdi.find_dc(Hdc::from(dc_handle))?;
     let (family, height, weight, italic) = match dc.selected_font {
         Some(font_handle) => {
             let font = gdi.find_font(font_handle)?;
@@ -907,7 +891,7 @@ pub fn handle_get_text_metrics_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
             Some((key, resolved)) => {
                 let charset = state
                     .try_gdi_state()
-                    .and_then(|gdi| gdi.find_dc(hdc))
+                    .and_then(|gdi| gdi.find_dc(Hdc::from(hdc)))
                     .and_then(|dc| dc.selected_font)
                     .and_then(|font_handle| {
                         state
@@ -1062,7 +1046,7 @@ pub fn handle_set_text_color(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
 
     let previous = state
         .gdi_state()
-        .find_dc_mut(hdc)
+        .find_dc_mut(Hdc::from(hdc))
         .map_or(0, |dc| std::mem::replace(&mut dc.text_color, color));
 
     let return_address = engine
@@ -1091,7 +1075,7 @@ pub fn handle_set_bk_color(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
 
     let previous = state
         .gdi_state()
-        .find_dc_mut(hdc)
+        .find_dc_mut(Hdc::from(hdc))
         .map_or(0x00ff_ffff, |dc| std::mem::replace(&mut dc.bk_color, color));
 
     let return_address = engine
@@ -1122,7 +1106,7 @@ pub fn handle_set_bk_mode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 
     let previous = state
         .gdi_state()
-        .find_dc_mut(hdc)
+        .find_dc_mut(Hdc::from(hdc))
         .map_or(2, |dc| std::mem::replace(&mut dc.bk_mode, mode));
 
     let return_address = engine
@@ -1165,7 +1149,7 @@ const FONT_HANDLE_STRIDE: u64 = 0x10;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DcKind {
     /// DC obtained via GetDC(hwnd) or BeginPaint.
-    Window(u64),
+    Window(Hwnd),
     /// DC created via CreateCompatibleDC.
     Memory,
     /// DC obtained via GetDC(NULL) — the screen.
@@ -1176,17 +1160,17 @@ pub enum DcKind {
 #[derive(Debug, Clone)]
 pub struct DcRecord {
     /// Fake handle for this DC.
-    pub handle: u64,
+    pub handle: Hdc,
     /// What this DC represents.
     pub kind: DcKind,
     /// Handle of the bitmap currently selected into this DC (if any).
-    pub selected_bitmap: Option<u64>,
+    pub selected_bitmap: Option<Hbitmap>,
     /// Handle of the brush currently selected into this DC (if any).
-    pub selected_brush: Option<u64>,
+    pub selected_brush: Option<Hbrush>,
     /// Handle of the pen currently selected into this DC (if any).
-    pub selected_pen: Option<u64>,
+    pub selected_pen: Option<Hpen>,
     /// Handle of the font currently selected into this DC (if any).
-    pub selected_font: Option<u64>,
+    pub selected_font: Option<Hfont>,
     pub text_color: u32,
     pub bk_color: u32,
     pub bk_mode: u32,
@@ -1196,7 +1180,7 @@ pub struct DcRecord {
 #[derive(Debug, Clone)]
 pub struct DibSection {
     /// Fake handle.
-    pub handle: u64,
+    pub handle: Hbitmap,
     /// Pixel width (always positive; stored from the absolute value).
     pub width: i32,
     /// **Signed** height: negative = top-down DIB.
@@ -1215,7 +1199,7 @@ pub struct DibSection {
 #[derive(Debug, Clone)]
 pub struct BrushRecord {
     /// Fake HBRUSH handle.
-    pub handle: u64,
+    pub handle: Hbrush,
     /// 0RGB color (COLORREF-compatible).
     pub color: u32,
 }
@@ -1224,7 +1208,7 @@ pub struct BrushRecord {
 #[derive(Debug, Clone)]
 pub struct PenRecord {
     /// Fake HPEN handle.
-    pub handle: u64,
+    pub handle: Hpen,
     /// 0RGB color (COLORREF-compatible).
     pub color: u32,
 }
@@ -1238,7 +1222,7 @@ pub struct PenRecord {
 #[derive(Debug, Clone)]
 pub struct FontRecord {
     /// HFONT handle.
-    pub handle: u64,
+    pub handle: Hfont,
     /// Raw `lfFaceName` ("" = system default / sans-serif).
     pub family: String,
     /// Raw `lfHeight` (px semantics applied at resolve time).
@@ -1298,8 +1282,8 @@ impl Default for GdiState {
 
 impl GdiState {
     /// Allocate a new DC handle and record.
-    pub fn alloc_dc(&mut self, kind: DcKind) -> u64 {
-        let handle = self.next_dc_handle;
+    pub fn alloc_dc(&mut self, kind: DcKind) -> Hdc {
+        let handle = Hdc::from(self.next_dc_handle);
         self.next_dc_handle = self.next_dc_handle.wrapping_add(DC_HANDLE_STRIDE);
         self.dcs.push(DcRecord {
             handle,
@@ -1316,23 +1300,23 @@ impl GdiState {
     }
 
     /// Allocate a new bitmap/DIB handle.
-    pub fn alloc_bitmap_handle(&mut self) -> u64 {
-        let handle = self.next_bitmap_handle;
+    pub fn alloc_bitmap_handle(&mut self) -> Hbitmap {
+        let handle = Hbitmap::from(self.next_bitmap_handle);
         self.next_bitmap_handle = self.next_bitmap_handle.wrapping_add(BITMAP_HANDLE_STRIDE);
         handle
     }
 
     /// Allocate a new brush handle and record.
-    pub fn alloc_brush(&mut self, color: u32) -> u64 {
-        let handle = self.next_brush_handle;
+    pub fn alloc_brush(&mut self, color: u32) -> Hbrush {
+        let handle = Hbrush::from(self.next_brush_handle);
         self.next_brush_handle = self.next_brush_handle.wrapping_add(BRUSH_HANDLE_STRIDE);
         self.brushes.push(BrushRecord { handle, color });
         handle
     }
 
     /// Allocate a new pen handle and record.
-    pub fn alloc_pen(&mut self, color: u32) -> u64 {
-        let handle = self.next_pen_handle;
+    pub fn alloc_pen(&mut self, color: u32) -> Hpen {
+        let handle = Hpen::from(self.next_pen_handle);
         self.next_pen_handle = self.next_pen_handle.wrapping_add(PEN_HANDLE_STRIDE);
         self.pens.push(PenRecord { handle, color });
         handle
@@ -1346,8 +1330,8 @@ impl GdiState {
         weight: u16,
         italic: bool,
         charset: u8,
-    ) -> u64 {
-        let handle = self.next_font_handle;
+    ) -> Hfont {
+        let handle = Hfont::from(self.next_font_handle);
         self.next_font_handle = self.next_font_handle.wrapping_add(FONT_HANDLE_STRIDE);
         self.fonts.push(FontRecord {
             handle,
@@ -1361,58 +1345,114 @@ impl GdiState {
     }
 
     /// Find a DC by handle.
-    pub fn find_dc(&self, handle: u64) -> Option<&DcRecord> {
+    pub fn find_dc(&self, handle: Hdc) -> Option<&DcRecord> {
         self.dcs.iter().find(|dc| dc.handle == handle)
     }
 
     /// Find a mutable DC by handle.
-    pub fn find_dc_mut(&mut self, handle: u64) -> Option<&mut DcRecord> {
+    pub fn find_dc_mut(&mut self, handle: Hdc) -> Option<&mut DcRecord> {
         self.dcs.iter_mut().find(|dc| dc.handle == handle)
     }
 
     /// Find a DIB section by handle.
-    pub fn find_dib(&self, handle: u64) -> Option<&DibSection> {
+    pub fn find_dib(&self, handle: Hbitmap) -> Option<&DibSection> {
         self.dibs.iter().find(|dib| dib.handle == handle)
     }
 
     /// Find a brush record by handle.
-    pub fn find_brush(&self, handle: u64) -> Option<&BrushRecord> {
+    pub fn find_brush(&self, handle: Hbrush) -> Option<&BrushRecord> {
         self.brushes.iter().find(|brush| brush.handle == handle)
     }
 
     /// Find a pen record by handle.
-    pub fn find_pen(&self, handle: u64) -> Option<&PenRecord> {
+    pub fn find_pen(&self, handle: Hpen) -> Option<&PenRecord> {
         self.pens.iter().find(|pen| pen.handle == handle)
     }
 
     /// Find a font record by handle.
-    pub fn find_font(&self, handle: u64) -> Option<&FontRecord> {
+    pub fn find_font(&self, handle: Hfont) -> Option<&FontRecord> {
         self.fonts.iter().find(|font| font.handle == handle)
     }
 
     /// Remove a DC by handle.
-    pub fn remove_dc(&mut self, handle: u64) {
+    pub fn remove_dc(&mut self, handle: Hdc) {
         self.dcs.retain(|dc| dc.handle != handle);
     }
 
     /// Remove a DIB section by handle.
-    pub fn remove_dib(&mut self, handle: u64) {
+    pub fn remove_dib(&mut self, handle: Hbitmap) {
         self.dibs.retain(|dib| dib.handle != handle);
     }
 
     /// Remove a brush by handle.
-    pub fn remove_brush(&mut self, handle: u64) {
+    pub fn remove_brush(&mut self, handle: Hbrush) {
         self.brushes.retain(|brush| brush.handle != handle);
     }
 
     /// Remove a pen by handle.
-    pub fn remove_pen(&mut self, handle: u64) {
+    pub fn remove_pen(&mut self, handle: Hpen) {
         self.pens.retain(|pen| pen.handle != handle);
     }
 
     /// Remove a font by handle.
-    pub fn remove_font(&mut self, handle: u64) {
+    pub fn remove_font(&mut self, handle: Hfont) {
         self.fonts.retain(|font| font.handle != handle);
+    }
+}
+
+/// A GDI object classified from its handle's disjoint base range.
+///
+/// The four object ranges (`0x6820` bitmaps, `0x6830` brushes, `0x6840` pens,
+/// `0x6850` fonts) are the namespace the handle value already lives in — this
+/// decodes it into a typed [`GdiObject`] so `SelectObject` / `DeleteObject`
+/// need a single match instead of probing every record table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GdiObject {
+    /// `HBITMAP` — a bitmap/DIB handle.
+    Dib(Hbitmap),
+    /// `HBRUSH` — a brush handle.
+    Brush(Hbrush),
+    /// `HPEN` — a pen handle.
+    Pen(Hpen),
+    /// `HFONT` — a font handle.
+    Font(Hfont),
+}
+
+impl GdiObject {
+    /// Decode `handle` from its disjoint base range (the `*_HANDLE_BASE`
+    /// constants above). DC handles and FAKE-range values classify to `None`.
+    ///
+    /// Debug-asserts the cross-kind collision invariant: a handle must never
+    /// live in two GDI record tables at once — the ranges are disjoint, so a
+    /// collision would mean an allocator reused a value across kinds.
+    #[must_use]
+    pub fn classify(handle: u64, state: &GdiState) -> Option<Self> {
+        let classified = match handle & 0xFFFF_0000 {
+            BITMAP_HANDLE_BASE => Some(Self::Dib(Hbitmap::from(handle))),
+            BRUSH_HANDLE_BASE => Some(Self::Brush(Hbrush::from(handle))),
+            PEN_HANDLE_BASE => Some(Self::Pen(Hpen::from(handle))),
+            FONT_HANDLE_BASE => Some(Self::Font(Hfont::from(handle))),
+            _ => None,
+        };
+        debug_assert!(
+            {
+                let dib = u8::from(state.dibs.iter().any(|d| d.handle == Hbitmap::from(handle)));
+                let brush = u8::from(
+                    state
+                        .brushes
+                        .iter()
+                        .any(|b| b.handle == Hbrush::from(handle)),
+                );
+                let pen = u8::from(state.pens.iter().any(|p| p.handle == Hpen::from(handle)));
+                let font = u8::from(state.fonts.iter().any(|f| f.handle == Hfont::from(handle)));
+                dib.saturating_add(brush)
+                    .saturating_add(pen)
+                    .saturating_add(font)
+                    <= 1
+            },
+            "GDI handle {handle:#x} collides across record tables"
+        );
+        classified
     }
 }
 
@@ -1422,8 +1462,8 @@ impl GdiState {
 /// must be a live [`BrushRecord`]. Returns `None` for the NULL_BRUSH (no
 /// pixels change) and for unknown handles.
 #[must_use]
-pub fn brush_color(state: &mut WinApiState, brush_handle: u64) -> Option<u32> {
-    match brush_handle {
+pub fn brush_color(state: &mut WinApiState, brush_handle: Hbrush) -> Option<u32> {
+    match brush_handle.as_u64() {
         STOCK_WHITE_BRUSH_HANDLE => Some(0x00FF_FFFF),
         STOCK_BLACK_BRUSH_HANDLE => Some(0),
         0x0000_0000_6800_5003 => Some(0x0080_8080), // GRAY_BRUSH
@@ -1464,8 +1504,8 @@ mod tests {
         assert_ne!(a, b);
         // Font handles live in 0x6850_0000; DC/bitmap/brush/pen bases are
         // 0x6810/0x6820/0x6830/0x6840 — disjoint by construction.
-        assert_eq!(a & 0xFFFF_0000, 0x6850_0000);
-        assert_eq!(b & 0xFFFF_0000, 0x6850_0000);
+        assert_eq!(a.as_u64() & 0xFFFF_0000, 0x6850_0000);
+        assert_eq!(b.as_u64() & 0xFFFF_0000, 0x6850_0000);
         assert_eq!(gdi.fonts.len(), 2);
         assert!(gdi.find_font(a).is_some());
         assert!(gdi.find_font(b).is_some());
@@ -1476,5 +1516,42 @@ mod tests {
         gdi.remove_font(a);
         assert!(gdi.find_font(a).is_none());
         assert!(gdi.find_font(b).is_some());
+    }
+
+    #[test]
+    fn classify_decodes_each_gdi_kind_from_its_base_range() {
+        use crate::gdi32::{DcKind, GdiObject};
+
+        let mut gdi = crate::gdi32::GdiState::default();
+        // Allocate one object of every kind so the collision assert in
+        // `classify` has real tables to check against.
+        let bitmap = gdi.alloc_bitmap_handle();
+        let brush = gdi.alloc_brush(0x00ff_0000);
+        let pen = gdi.alloc_pen(0x0000_ff00);
+        let font = gdi.alloc_font("arial".to_owned(), 16, 400, false, 0);
+
+        assert_eq!(
+            GdiObject::classify(bitmap.as_u64(), &gdi),
+            Some(GdiObject::Dib(bitmap)),
+        );
+        assert_eq!(
+            GdiObject::classify(brush.as_u64(), &gdi),
+            Some(GdiObject::Brush(brush)),
+        );
+        assert_eq!(
+            GdiObject::classify(pen.as_u64(), &gdi),
+            Some(GdiObject::Pen(pen)),
+        );
+        assert_eq!(
+            GdiObject::classify(font.as_u64(), &gdi),
+            Some(GdiObject::Font(font)),
+        );
+
+        // A DC handle, the NULL handle, and a FAKE-range stock handle
+        // classify to None.
+        let dc = gdi.alloc_dc(DcKind::Memory);
+        assert_eq!(GdiObject::classify(dc.as_u64(), &gdi), None);
+        assert_eq!(GdiObject::classify(0, &gdi), None);
+        assert_eq!(GdiObject::classify(0x0000_0000_6800_5001, &gdi), None);
     }
 }

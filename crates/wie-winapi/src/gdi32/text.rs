@@ -9,7 +9,7 @@
 use anyhow::{Context, Result};
 
 use crate::gdi32::state::dc_resolved_font;
-use crate::gdi32::{FontEngine, FontKey, RasterizedGlyph, ResolvedFont};
+use crate::gdi32::{FontEngine, FontKey, IRect, RasterizedGlyph, ResolvedFont};
 use crate::guest_memory::{
     checked_field_address, read_i32 as read_guest_i32, read_u32 as read_guest_u32,
     read_u64 as read_guest_u64, write_i32 as write_guest_i32,
@@ -177,7 +177,9 @@ fn blend_pixel(dst: u32, fg: u32, alpha: u8) -> u32 {
 
 /// Resolve the DC's text colors and background mode.
 fn dc_text_attrs(state: &WinApiState, dc_handle: u64) -> TextAttrs {
-    let dc = state.try_gdi_state().and_then(|gdi| gdi.find_dc(dc_handle));
+    let dc = state
+        .try_gdi_state()
+        .and_then(|gdi| gdi.find_dc(crate::handles::Hdc::from(dc_handle)));
     TextAttrs {
         text_color: dc.map_or(0, |d| d.text_color),
         bk_color: dc.map_or(0x00FF_FFFF, |d| d.bk_color),
@@ -185,43 +187,50 @@ fn dc_text_attrs(state: &WinApiState, dc_handle: u64) -> TextAttrs {
     }
 }
 
+/// A resolved text target: the pixel buffer the run renders into.
+struct ResolvedTextTarget<'a> {
+    /// The pixel target the run renders into.
+    target: TextTarget<'a>,
+}
+
 /// Resolve a DC handle to a writable pixel target.
 ///
 /// Memory DCs target the selected 32-bpp DIB; window DCs target the hwnd's
 /// present surface (created on demand). Screen DCs resolve to `None`.
-fn resolve_text_target(state: &mut WinApiState, dc_handle: u64) -> Option<TextTarget<'_>> {
-    let kind = state.try_gdi_state()?.find_dc(dc_handle)?.kind;
+fn resolve_text_target(state: &mut WinApiState, dc_handle: u64) -> Option<ResolvedTextTarget<'_>> {
+    let kind = state
+        .try_gdi_state()?
+        .find_dc(crate::handles::Hdc::from(dc_handle))?
+        .kind;
     match kind {
         DcKind::Memory => {
             let gdi = state.try_gdi_state()?;
-            let dc = gdi.find_dc(dc_handle)?;
+            let dc = gdi.find_dc(crate::handles::Hdc::from(dc_handle))?;
             let dib = gdi.find_dib(dc.selected_bitmap?)?;
             if dib.bit_count != 32 || dib.bits_va == 0 {
                 return None;
             }
-            Some(TextTarget::Dib {
-                bits_va: dib.bits_va,
-                stride: u32::try_from(dib.stride).ok()?,
-                width: dib.width.unsigned_abs(),
-                height: dib.height.unsigned_abs(),
-                top_down: dib.height < 0,
+            Some(ResolvedTextTarget {
+                target: TextTarget::Dib {
+                    bits_va: dib.bits_va,
+                    stride: u32::try_from(dib.stride).ok()?,
+                    width: dib.width.unsigned_abs(),
+                    height: dib.height.unsigned_abs(),
+                    top_down: dib.height < 0,
+                },
             })
         }
         DcKind::Window(hwnd) => {
-            let (w, h) = window_client_size(state, hwnd);
+            let (w, h) = window_client_size(state, hwnd.as_u64());
             let (w, h) = (u32::try_from(w.max(1)).ok()?, u32::try_from(h.max(1)).ok()?);
             state.present().ensure_surface(hwnd, w, h);
-            // B3 conservative fallback: window-DC text writes glyph pixels
-            // directly into the surface without a per-rect dirty marker (the
-            // write path has no state access). Mark the whole surface dirty so
-            // the next publish is full — a partial region could otherwise go
-            // stale under a later TRANSPARENT text pass.
-            state.present().mark_dirty_full(hwnd);
             let surface = state.present().surfaces.get_mut(&hwnd)?;
-            Some(TextTarget::Surface {
-                pixels: &mut surface.pixels[..],
-                width: surface.width,
-                height: surface.height,
+            Some(ResolvedTextTarget {
+                target: TextTarget::Surface {
+                    pixels: &mut surface.pixels[..],
+                    width: surface.width,
+                    height: surface.height,
+                },
             })
         }
         DcKind::Screen => None,
@@ -246,6 +255,45 @@ fn round_i32(value: f32) -> i32 {
     value.round() as i32
 }
 
+/// Clip a text run's line band to the target bounds and (optionally) to the
+/// caller's clip rect.
+///
+/// The unclipped band is `(x, y, x + total_advance, y + line_height)` — the
+/// full line the run occupies (`line_height` is ascent + descent, the same
+/// height `GetTextExtentPoint32` reports). `OPAQUE` bk_mode fills exactly this
+/// band with the background color, so the band is also the correct dirty rect
+/// for a window-DC text pass: it covers the whole repainted line, not just the
+/// glyph ink. Returns `None` when the band is empty or entirely off-target.
+fn clip_run_band(
+    x: i32,
+    y: i32,
+    total_advance: i32,
+    line_height: i32,
+    target_w: i32,
+    target_h: i32,
+    clip: Option<(i32, i32, i32, i32)>,
+) -> Option<IRect> {
+    let mut x0 = x.max(0);
+    let mut y0 = y.max(0);
+    let mut x1 = x.saturating_add(total_advance).min(target_w);
+    let mut y1 = y.saturating_add(line_height).min(target_h);
+    if let Some((cl, ct, cr, cb)) = clip {
+        x0 = x0.max(cl);
+        y0 = y0.max(ct);
+        x1 = x1.min(cr);
+        y1 = y1.min(cb);
+    }
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some(IRect {
+        left: x0,
+        top: y0,
+        right: x1,
+        bottom: y1,
+    })
+}
+
 /// Rasterize a run of characters at (`x`, `y`) into `target`.
 ///
 /// Glyphs are proportional: each is rasterized through the font engine (with
@@ -255,6 +303,10 @@ fn round_i32(value: f32) -> i32 {
 /// glyph coverage over it; `TRANSPARENT` blends glyph pixels only. Fake bold
 /// (no real bold face) draws each glyph twice, shifted +1 px. The band is
 /// clipped to the target bounds and, when `clip` is given, to that rect.
+///
+/// Returns the clipped band actually written (`None` when nothing was drawn):
+/// window-DC callers mark it as the surface's dirty rect, so the next publish
+/// copies only the repainted line instead of the whole surface.
 #[allow(clippy::too_many_arguments)]
 fn render_run(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -267,9 +319,9 @@ fn render_run(
     chars: &[u32],
     attrs: &TextAttrs,
     clip: Option<(i32, i32, i32, i32)>,
-) -> Result<()> {
+) -> Result<Option<IRect>> {
     if chars.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let line_height = resolved.line_height().max(1);
     let baseline = y.saturating_add(round_i32(resolved.ascent));
@@ -285,7 +337,7 @@ fn render_run(
         glyphs.push((glyph, ch));
     }
     if total_advance <= 0 {
-        return Ok(());
+        return Ok(None);
     }
 
     let (tw, th) = target.dimensions();
@@ -293,19 +345,10 @@ fn render_run(
     let th_i = i32::try_from(th).unwrap_or(i32::MAX);
 
     // Clip the band to the target and (optionally) to the caller's rect.
-    let mut x0 = x.max(0);
-    let mut y0 = y.max(0);
-    let mut x1 = x.saturating_add(total_advance).min(tw_i);
-    let mut y1 = y.saturating_add(line_height).min(th_i);
-    if let Some((cl, ct, cr, cb)) = clip {
-        x0 = x0.max(cl);
-        y0 = y0.max(ct);
-        x1 = x1.min(cr);
-        y1 = y1.min(cb);
-    }
-    if x1 <= x0 || y1 <= y0 {
-        return Ok(());
-    }
+    let Some(band) = clip_run_band(x, y, total_advance, line_height, tw_i, th_i, clip) else {
+        return Ok(None);
+    };
+    let (x0, y0, x1, y1) = (band.left, band.top, band.right, band.bottom);
 
     // OPAQUE background: fill the line band (clipped to the visible band
     // computed above, so ETO_CLIPPED / DrawText rects bound the fill) before
@@ -348,7 +391,7 @@ fn render_run(
         }
         target.write_row(engine, row, x0, x1, &row_pixels)?;
     }
-    Ok(())
+    Ok(Some(band))
 }
 
 /// Blend one glyph's coverage for `row` into the row's pixel accumulator.
@@ -439,7 +482,13 @@ pub(crate) fn read_text_chars(
         Ok(text.chars().map(u32::from).collect())
     } else {
         let bytes = read_guest_ansi_bytes(engine, ptr, count_us)?;
-        Ok(bytes.iter().map(|&b| u32::from(b)).collect())
+        // UTF-8-first like the other A-string readers, so a multi-byte
+        // UTF-8 literal rasterizes as one glyph per char, not one glyph
+        // per byte (which rendered `—` as `â€"`).
+        Ok(crate::vfs::decode_ansi_utf8_first(&bytes)
+            .chars()
+            .map(u32::from)
+            .collect())
     }
 }
 
@@ -487,21 +536,28 @@ fn handle_text_out_impl(
             // below can coexist; put it back when the render is done.
             let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
             let resolved = dc_resolved_font(state, hdc, &mut font_engine);
-            let rendered = if let Some((key, resolved)) = resolved
-                && let Some(mut target) = resolve_text_target(state, hdc)
-            {
-                render_run(
-                    engine,
-                    &mut font_engine,
-                    &resolved,
-                    &key,
-                    &mut target,
-                    x,
-                    y,
-                    &chars,
-                    &attrs,
-                    None,
-                )
+            let rendered: Result<()> = if let Some((key, resolved)) = resolved {
+                match resolve_text_target(state, hdc) {
+                    Some(ResolvedTextTarget { mut target, .. }) => {
+                        // Publish-model rework (ora-5): window-DC text no
+                        // longer marks a dirty rect — every publish is a full
+                        // frame, so the exact band is irrelevant.
+                        let _band = render_run(
+                            engine,
+                            &mut font_engine,
+                            &resolved,
+                            &key,
+                            &mut target,
+                            x,
+                            y,
+                            &chars,
+                            &attrs,
+                            None,
+                        )?;
+                        Ok(())
+                    }
+                    None => Ok(()),
+                }
             } else {
                 Ok(())
             };
@@ -579,7 +635,7 @@ pub fn handle_ext_text_out_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
             .context("failed to read RECT.bottom")?;
         if options & ETO_OPAQUE != 0 {
             let attrs = dc_text_attrs(state, hdc);
-            if let Some(mut target) = resolve_text_target(state, hdc) {
+            if let Some(ResolvedTextTarget { mut target, .. }) = resolve_text_target(state, hdc) {
                 fill_rect(
                     engine,
                     &mut target,
@@ -602,21 +658,25 @@ pub fn handle_ext_text_out_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         if !chars.is_empty() {
             let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
             let resolved = dc_resolved_font(state, hdc, &mut font_engine);
-            let rendered = if let Some((key, resolved)) = resolved
-                && let Some(mut target) = resolve_text_target(state, hdc)
-            {
-                render_run(
-                    engine,
-                    &mut font_engine,
-                    &resolved,
-                    &key,
-                    &mut target,
-                    x,
-                    y,
-                    &chars,
-                    &attrs,
-                    clip,
-                )
+            let rendered: Result<()> = if let Some((key, resolved)) = resolved {
+                match resolve_text_target(state, hdc) {
+                    Some(ResolvedTextTarget { mut target, .. }) => {
+                        let _band = render_run(
+                            engine,
+                            &mut font_engine,
+                            &resolved,
+                            &key,
+                            &mut target,
+                            x,
+                            y,
+                            &chars,
+                            &attrs,
+                            clip,
+                        )?;
+                        Ok(())
+                    }
+                    None => Ok(()),
+                }
             } else {
                 Ok(())
             };
@@ -740,25 +800,29 @@ fn handle_draw_text_impl(
             };
             if !chars.is_empty() {
                 let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
-                let rendered = if let Some((key, resolved)) =
-                    dc_resolved_font(state, hdc, &mut font_engine)
-                    && let Some(mut target) = resolve_text_target(state, hdc)
-                {
-                    render_run(
-                        engine,
-                        &mut font_engine,
-                        &resolved,
-                        &key,
-                        &mut target,
-                        x,
-                        y,
-                        &chars,
-                        &attrs,
-                        clip,
-                    )
-                } else {
-                    Ok(())
-                };
+                let rendered: Result<()> =
+                    if let Some((key, resolved)) = dc_resolved_font(state, hdc, &mut font_engine) {
+                        match resolve_text_target(state, hdc) {
+                            Some(ResolvedTextTarget { mut target, .. }) => {
+                                let _band = render_run(
+                                    engine,
+                                    &mut font_engine,
+                                    &resolved,
+                                    &key,
+                                    &mut target,
+                                    x,
+                                    y,
+                                    &chars,
+                                    &attrs,
+                                    clip,
+                                )?;
+                                Ok(())
+                            }
+                            None => Ok(()),
+                        }
+                    } else {
+                        Ok(())
+                    };
                 state.gdi_state().font_engine = font_engine;
                 rendered?;
             }
@@ -837,4 +901,72 @@ pub(crate) fn render_text_into_surface(
         &attrs,
         clip,
     )
+    .map(|_| ())
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used)]
+mod tests {
+    use super::clip_run_band;
+    use crate::gdi32::IRect;
+
+    /// The dirty rect for a window-DC text run must equal the run's clipped
+    /// line band: `left = run x`, `top = baseline − ascent = y`,
+    /// `right = x + summed advance`, `bottom = y + line_height` — the same
+    /// extents `GetTextExtentPoint32` reports (ascent + descent).
+    #[test]
+    fn text_run_dirty_rect_equals_run_extents() {
+        let band = clip_run_band(8, 8, 90, 30, 200, 100, None).expect("band on-surface");
+        assert_eq!(
+            band,
+            IRect {
+                left: 8,
+                top: 8,
+                right: 98,
+                bottom: 38,
+            }
+        );
+    }
+
+    #[test]
+    fn text_run_dirty_rect_clips_to_bounds_and_guest_clip() {
+        // Partially off the right/bottom edge of a 100×40 target.
+        let band = clip_run_band(60, 20, 90, 30, 100, 40, None).expect("band on-surface");
+        assert_eq!(
+            band,
+            IRect {
+                left: 60,
+                top: 20,
+                right: 100,
+                bottom: 40,
+            }
+        );
+        // ETO_CLIPPED / DrawText rect narrows the band.
+        let clipped =
+            clip_run_band(8, 8, 90, 30, 200, 100, Some((50, 0, 80, 20))).expect("band inside clip");
+        assert_eq!(
+            clipped,
+            IRect {
+                left: 50,
+                top: 8,
+                right: 80,
+                bottom: 20,
+            }
+        );
+    }
+
+    #[test]
+    fn text_run_dirty_rect_degenerate_or_off_surface_is_none() {
+        // Zero advance → nothing to repaint.
+        assert_eq!(clip_run_band(8, 8, 0, 30, 200, 100, None), None);
+        // Entirely below the target.
+        assert_eq!(clip_run_band(8, 200, 90, 30, 100, 100, None), None);
+        // Entirely right of the target.
+        assert_eq!(clip_run_band(200, 8, 90, 30, 100, 100, None), None);
+        // Clip rect disjoint from the band.
+        assert_eq!(
+            clip_run_band(8, 8, 90, 30, 200, 100, Some((0, 100, 50, 150))),
+            None
+        );
+    }
 }

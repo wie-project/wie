@@ -38,6 +38,17 @@ const FALLBACK_FAMILIES: &[&str] = &[
     "Menlo",
 ];
 
+/// Cap on the rasterized-glyph bitmap cache (entries per
+/// (font key, pixel height, codepoint)).
+///
+/// A text-heavy guest (file lists, logs, dialogs) re-draws the same glyphs
+/// every frame, so the coverage bitmaps are worth caching — but a hostile or
+/// odd guest could cycle an unbounded number of codepoints × heights. On
+/// overflow the WHOLE glyph cache is dropped (the face and resolved-metric
+/// caches stay warm; the next render re-rasterizes each glyph once). At ~1 KB
+/// per 24 px glyph the cap bounds the cache to a few MB.
+const GLYPH_CACHE_CAP: usize = 4096;
+
 /// A font identity for caching: lowercase family + weight + italic.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FontKey {
@@ -260,6 +271,8 @@ fn outline_glyph(scaled: &PxScaleFont<&FontArc>, gid: GlyphId) -> Option<Rasteri
 #[derive(Debug, Clone)]
 pub struct ResolvedFont {
     font: FontArc,
+    /// The pixel height this font was resolved at (the glyph-cache key part).
+    pub height_px: i32,
     /// Px per em — the scale that makes the line height (`ascent+descent`)
     /// equal the requested height. Also used for `tmInternalLeading`.
     pub scale: f32,
@@ -305,6 +318,10 @@ pub struct FontEngine {
     resolved_cache: HashMap<(FontKey, i32), ResolvedFont>,
     /// Per-(key, codepoint) fallback face (`None` = no fallback has it).
     fallback_cache: HashMap<(FontKey, char), Option<FontArc>>,
+    /// Rasterized glyph bitmaps per (key, pixel height, codepoint), capped at
+    /// [`GLYPH_CACHE_CAP`]. Keyed like `resolved_cache` plus the codepoint so
+    /// repeated characters in text-heavy apps blit instead of re-rasterizing.
+    glyph_cache: HashMap<(FontKey, i32, char), RasterizedGlyph>,
 }
 
 impl FontEngine {
@@ -333,7 +350,16 @@ impl FontEngine {
 
     /// Per-char advance with the same fallback resolution the rasterizer
     /// uses — the metric APIs must agree with the drawn pixels exactly.
+    ///
+    /// Reads the cached glyph's advance when the bitmap is already cached
+    /// (never rasterizes just to measure); otherwise computes the advance
+    /// directly from the face's h_advance — byte-identical to what
+    /// [`FontEngine::rasterize`] stores.
     pub(crate) fn char_advance(&mut self, resolved: &ResolvedFont, key: &FontKey, ch: char) -> i32 {
+        let cache_key = (key.clone(), resolved.height_px, ch);
+        if let Some(glyph) = self.glyph_cache.get(&cache_key) {
+            return glyph.advance;
+        }
         let scaled = resolved.scaled();
         let gid = scaled.glyph_id(ch);
         if gid.0 != 0 {
@@ -365,8 +391,38 @@ impl FontEngine {
         total
     }
 
-    /// Rasterize `ch` (with fallback) into a coverage buffer.
+    /// Rasterize `ch` (with fallback) into a coverage buffer, served from the
+    /// per-(font, height, codepoint) glyph cache on repeat characters.
     pub(crate) fn rasterize(
+        &mut self,
+        resolved: &ResolvedFont,
+        key: &FontKey,
+        ch: char,
+    ) -> RasterizedGlyph {
+        let cache_key = (key.clone(), resolved.height_px, ch);
+        if let Some(glyph) = self.glyph_cache.get(&cache_key) {
+            return glyph.clone();
+        }
+        let glyph = self.rasterize_uncached(resolved, key, ch);
+        self.insert_glyph(cache_key, glyph.clone());
+        glyph
+    }
+
+    /// Insert a rasterized glyph into the bounded cache.
+    ///
+    /// On overflow the WHOLE glyph bitmap cache is dropped (faces and
+    /// resolved metrics stay warm; the next render re-rasterizes each glyph
+    /// once). See [`GLYPH_CACHE_CAP`].
+    fn insert_glyph(&mut self, key: (FontKey, i32, char), glyph: RasterizedGlyph) {
+        if self.glyph_cache.len() >= GLYPH_CACHE_CAP {
+            self.glyph_cache.clear();
+        }
+        self.glyph_cache.insert(key, glyph);
+    }
+
+    /// Rasterize `ch` unconditionally (the cache-miss path of
+    /// [`FontEngine::rasterize`]).
+    fn rasterize_uncached(
         &mut self,
         resolved: &ResolvedFont,
         key: &FontKey,
@@ -443,6 +499,7 @@ fn build_resolved(
         .fold(0_i32, i32::max);
     ResolvedFont {
         font: font.clone(),
+        height_px,
         scale,
         ascent,
         descent,
@@ -456,8 +513,109 @@ fn build_resolved(
 
 #[cfg(test)]
 mod tests {
-    use super::{family_selection_for, fontdb_weight_for, height_px_from_lf};
+    use super::{FontEngine, FontKey, family_selection_for, fontdb_weight_for, height_px_from_lf};
     use fontdb::Family;
+
+    /// Resolve the default 16 px font (skips when system fonts are absent).
+    fn default_resolved(engine: &mut FontEngine) -> Option<(FontKey, super::ResolvedFont)> {
+        let key = FontKey::default();
+        let resolved = engine.resolve(&key, 16)?;
+        Some((key, resolved))
+    }
+
+    #[test]
+    fn glyph_cache_reuses_rasterized_bitmaps() {
+        let mut engine = FontEngine::default();
+        let Some((key, resolved)) = default_resolved(&mut engine) else {
+            return; // no system fonts — nothing to cache
+        };
+        let first = engine.rasterize(&resolved, &key, 'A');
+        let second = engine.rasterize(&resolved, &key, 'A');
+        // Byte-identical result (advance + coverage + placement).
+        assert_eq!(first.advance, second.advance);
+        assert_eq!(first.coverage, second.coverage);
+        assert_eq!((first.left, first.top), (second.left, second.top));
+        // A second distinct codepoint adds one entry; 'A' stays cached.
+        assert_eq!(engine.glyph_cache.len(), 1);
+        drop(engine.rasterize(&resolved, &key, 'B'));
+        assert_eq!(engine.glyph_cache.len(), 2);
+        // char_advance reads the cached advance (no re-rasterization).
+        let advance = engine.char_advance(&resolved, &key, 'A');
+        assert_eq!(advance, first.advance);
+    }
+
+    #[test]
+    fn glyph_cache_is_bounded_and_clears_on_overflow() {
+        let mut engine = FontEngine::default();
+        let key = FontKey::default();
+        // Fill past the cap through the shared insert path (cheap empty
+        // glyphs — no system fonts or rasterization needed).
+        for code in 0..(super::GLYPH_CACHE_CAP + 64) {
+            let ch = char::from_u32(u32::try_from(code).unwrap_or(0).saturating_add(0x100))
+                .unwrap_or('x');
+            engine.insert_glyph((key.clone(), 16, ch), super::RasterizedGlyph::empty(1));
+        }
+        assert!(
+            engine.glyph_cache.len() <= super::GLYPH_CACHE_CAP,
+            "glyph cache must stay bounded (len {})",
+            engine.glyph_cache.len()
+        );
+        // After the overflow clear the cache still serves new entries.
+        engine.insert_glyph((key.clone(), 16, 'Z'), super::RasterizedGlyph::empty(1));
+        assert!(engine.glyph_cache.contains_key(&(key.clone(), 16, 'Z')));
+        assert!(engine.glyph_cache.len() <= super::GLYPH_CACHE_CAP);
+        // Real rasterization also recovers: a repeat char returns a cached
+        // identical bitmap (system fonts optional — skip when absent).
+        let Some((key, resolved)) = default_resolved(&mut engine) else {
+            return;
+        };
+        let a = engine.rasterize(&resolved, &key, 'A');
+        let b = engine.rasterize(&resolved, &key, 'A');
+        assert_eq!(a.advance, b.advance);
+        assert_eq!(a.coverage, b.coverage);
+    }
+
+    #[test]
+    fn rasterize_serves_pre_cached_glyphs() {
+        let mut engine = FontEngine::default();
+        let key = FontKey::default();
+        // Pre-seed the cache with a distinguishable fake glyph. `rasterize`
+        // must return it unchanged (a cache hit) — a re-rasterized 'Q' could
+        // never produce advance 7 with all-9 coverage.
+        let fake = super::RasterizedGlyph {
+            advance: 7,
+            left: -1,
+            top: 2,
+            width: 3,
+            height: 4,
+            coverage: vec![9; 12],
+        };
+        engine.insert_glyph((key.clone(), 16, 'Q'), fake);
+        let Some((key, resolved)) = default_resolved(&mut engine) else {
+            return; // no system fonts — the seed alone still proves nothing
+        };
+        let hit = engine.rasterize(&resolved, &key, 'Q');
+        assert_eq!(hit.advance, 7, "cached advance must be served");
+        assert_eq!(hit.coverage, vec![9; 12], "cached coverage must be served");
+        assert_eq!(engine.glyph_cache.len(), 1);
+    }
+
+    #[test]
+    fn glyph_cache_key_includes_height() {
+        let mut engine = FontEngine::default();
+        let key = FontKey::default();
+        let Some(resolved_16) = engine.resolve(&key, 16) else {
+            return; // no system fonts
+        };
+        let Some(resolved_24) = engine.resolve(&key, 24) else {
+            return;
+        };
+        // Same codepoint at two heights caches two separate bitmaps (the
+        // coverage differs — 16 px vs 24 px).
+        drop(engine.rasterize(&resolved_16, &key, 'A'));
+        drop(engine.rasterize(&resolved_24, &key, 'A'));
+        assert_eq!(engine.glyph_cache.len(), 2);
+    }
 
     #[test]
     fn height_px_mapping() {

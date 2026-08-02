@@ -39,8 +39,11 @@ pub(crate) fn read_ansi_lossy(
     max_bytes: usize,
 ) -> Result<String> {
     let bytes = read_ansi_bytes(engine, address, max_bytes)?;
-    // Prefer ACP-1252 for path/ANSI APIs (GetACP); UTF-8 lossy was too aggressive.
-    Ok(crate::vfs::decode_acp(&bytes))
+    // A-strings are UTF-8 in WIE (the write side emits UTF-8 and
+    // mingw-cross-compiled guests produce UTF-8 literals); fall back to
+    // ACP-1252 for byte sequences that are not valid UTF-8 (real Windows
+    // binaries pass ACP-encoded strings).
+    Ok(crate::vfs::decode_ansi_utf8_first(&bytes))
 }
 
 /// Read raw ANSI bytes (NUL-terminated), excluding the terminator.
