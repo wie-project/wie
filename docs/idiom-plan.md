@@ -1,6 +1,6 @@
 # Idiom Plan: Rust-idiomatic types, per the Rust Book
 
-Status: Proposed. Applies to all five crates. Built on four idiom audits (exp-7 winapi, exp-8 cpu, exp-9 runtime+cli, exp-10 pe+cross-cutting) that inventoried raw-int handles, stringly types, semantic bools, error handling, encapsulation, duplication, unsafe discipline, and typestate candidates with file:line evidence.
+Status: Completed (2026-08-02). Phases I and II executed with full gates; Phase III verify-only findings below. Built on four idiom audits (exp-7 winapi, exp-8 cpu, exp-9 runtime+cli, exp-10 pe+cross-cutting) that inventoried raw-int handles, stringly types, semantic bools, error handling, encapsulation, duplication, unsafe discipline, and typestate candidates with file:line evidence.
 
 ## What the audits found is ALREADY idiomatic (do not touch)
 
@@ -43,6 +43,11 @@ Status: Proposed. Applies to all five crates. Built on four idiom audits (exp-7 
 - Confirm whether wie-runtime tests inherit `unwrap_used`/`expect_used` denies (they pass clippy today; if there is an allow mechanism, document it in CONTRIBUTING)
 - `is_pe64: bool` redundancy with `Machine` — confirm and remove only if the audit's reading holds
 - `GdiState`/`PresentState` remaining pub after I-2 — sweep for stragglers
+
+## Phase III — verify-only findings (no code change)
+
+1. **Test `.expect()` usage is legal, not a lint violation**: the audit flagged 81 `.expect()` sites in wie-runtime tests against the workspace `expect_used = "deny"`. Verified: `crates/wie-runtime/Cargo.toml` has no `[lints]` section, so the crate never opts into `lints.workspace = true` and the clippy denies never reach its test targets (proof: `clippy -p wie-runtime --test clock_stub` passes silently; forcing `-W clippy::expect_used` fires the lint). The lib code is still unwrap-free by convention. Recommendation: optionally opt the crate into workspace lints and convert tests to `#![expect]`-annotated modules — deferred, not worth the churn now.
+2. **`is_pe64: bool` is verified redundant but kept**: it is set to `true` unconditionally at every construction site (lib.rs:186, 479) and copied through at 524 — never derived from `machine`, can never be false in this PE64-only emulator. Removing it would change the public `Serialize` struct shape (PeIdentity/PeImageSummary) for zero behavior gain; the audit's alternatives (Option<Machine>, caller checks) also churn cli. Kept as-is, documented here.
 
 ## Verification per phase
 
