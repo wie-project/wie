@@ -8,6 +8,29 @@ use std::path::Path;
 pub mod resources;
 pub use resources::{DialogItemTemplate, DialogTemplate, ItemClass, PixelRect};
 
+/// COFF `Machine` type (Microsoft PE format, `IMAGE_FILE_MACHINE_*`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Machine(u16);
+
+impl Machine {
+    /// `IMAGE_FILE_MACHINE_AMD64` (x86-64).
+    pub const X64: Self = Self(0x8664);
+    /// `IMAGE_FILE_MACHINE_ARM64`.
+    pub const ARM64: Self = Self(0xAA64);
+
+    /// Raw COFF `Machine` field value.
+    #[must_use]
+    pub const fn into_u16(self) -> u16 {
+        self.0
+    }
+}
+
+impl From<u16> for Machine {
+    fn from(value: u16) -> Self {
+        Self(value)
+    }
+}
+
 /// Loader identity of a PE64 image: fields the runtime must take from the file,
 /// not from Lunar Magic constants.
 ///
@@ -33,7 +56,7 @@ pub struct PeIdentity {
     pub size_of_headers: u32,
 
     /// COFF `Machine`.
-    pub machine: u16,
+    pub machine: Machine,
 
     /// Always true for images accepted by this crate (PE32+ only).
     pub is_pe64: bool,
@@ -159,7 +182,7 @@ pub fn pe_identity_from_parsed(pe: &PE, path: &Path, _bytes: &[u8]) -> Result<Pe
         entry_va,
         size_of_image,
         size_of_headers,
-        machine: pe.header.coff_header.machine,
+        machine: Machine::from(pe.header.coff_header.machine),
         is_pe64: true,
         section_count: pe.sections.len(),
     })
@@ -182,7 +205,7 @@ pub struct PeImageSummary {
     pub is_pe64: bool,
 
     /// `COFF` machine field.
-    pub machine: u16,
+    pub machine: Machine,
 
     /// Preferred image base.
     pub image_base: u64,
@@ -225,13 +248,30 @@ pub struct PeSectionSummary {
     pub virtual_address_va: u64,
 }
 
-// COFF section characteristics (Microsoft PE format / Learn).
-/// `IMAGE_SCN_MEM_EXECUTE`
-pub const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
-/// `IMAGE_SCN_MEM_READ`
-pub const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
-/// `IMAGE_SCN_MEM_WRITE`
-pub const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
+/// COFF section characteristics (`IMAGE_SCN_*`, Microsoft PE format).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SectionCharacteristics(u32);
+
+impl SectionCharacteristics {
+    /// `IMAGE_SCN_MEM_EXECUTE`.
+    pub const EXECUTE: Self = Self(0x2000_0000);
+    /// `IMAGE_SCN_MEM_READ`.
+    pub const READ: Self = Self(0x4000_0000);
+    /// `IMAGE_SCN_MEM_WRITE`.
+    pub const WRITE: Self = Self(0x8000_0000);
+
+    /// Raw `IMAGE_SCN_*` bitmask.
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// Whether all bits of `flag` are set.
+    #[must_use]
+    pub const fn contains(self, flag: Self) -> bool {
+        self.0 & flag.0 == flag.0
+    }
+}
 
 // Windows PAGE_* (subset used for PE final protects; matches `wie_cpu::protect`).
 const PAGE_NOACCESS: u32 = 0x01;
@@ -280,10 +320,17 @@ impl PeMapPlan {
     }
 
     /// Absolute VA of section `i`, if present.
-    #[must_use]
-    pub fn section_va(&self, i: usize) -> Option<u64> {
-        let s = self.sections.get(i)?;
-        self.image_base.checked_add(u64::from(s.va))
+    pub fn section_va(&self, i: usize) -> Result<u64, PeMapError> {
+        let s = self
+            .sections
+            .get(i)
+            .ok_or(PeMapError::InvalidSectionIndex {
+                index: i,
+                count: self.sections.len(),
+            })?;
+        self.image_base
+            .checked_add(u64::from(s.va))
+            .ok_or(PeMapError::Overflow { what: "section VA" })
     }
 }
 
@@ -292,9 +339,10 @@ impl PeMapPlan {
 /// Uses only documented `IMAGE_SCN_MEM_{EXECUTE,READ,WRITE}` bits.
 #[must_use]
 pub fn protect_from_section_characteristics(characteristics: u32) -> u32 {
-    let x = (characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
-    let r = (characteristics & IMAGE_SCN_MEM_READ) != 0;
-    let w = (characteristics & IMAGE_SCN_MEM_WRITE) != 0;
+    let chars = SectionCharacteristics(characteristics);
+    let x = chars.contains(SectionCharacteristics::EXECUTE);
+    let r = chars.contains(SectionCharacteristics::READ);
+    let w = chars.contains(SectionCharacteristics::WRITE);
     match (r, w, x) {
         (_, true, true) => PAGE_EXECUTE_READWRITE,
         (true, false, true) => PAGE_EXECUTE_READ,
@@ -427,7 +475,7 @@ impl PeLoadedImageSummary {
             entry_va: self.entry_point_va,
             size_of_image: u64::try_from(self.image_size).unwrap_or(u64::MAX),
             size_of_headers: u32::try_from(self.header_size).unwrap_or(u32::MAX),
-            machine: 0,
+            machine: Machine::from(0),
             is_pe64: true,
             section_count: self.section_count,
         }
@@ -688,7 +736,7 @@ pub fn rva_to_file_offset(pe: &PE<'_>, rva: u32) -> Result<usize> {
     rva_to_file_offset_u64(pe, u64::from(rva))
 }
 
-pub fn rva_to_file_offset_u64(pe: &PE<'_>, rva: u64) -> Result<usize> {
+pub(crate) fn rva_to_file_offset_u64(pe: &PE<'_>, rva: u64) -> Result<usize> {
     for section in &pe.sections {
         let section_rva = u64::from(section.virtual_address);
         let virtual_size = u64::from(section.virtual_size);
@@ -736,28 +784,68 @@ fn read_c_string_at_offset(bytes: &[u8], offset: usize) -> Result<String> {
     Ok(value.to_owned())
 }
 
-fn read_u16(bytes: &[u8], offset: usize) -> Result<u16> {
-    let raw = read_array::<2>(bytes, offset)?;
-    Ok(u16::from_le_bytes(raw))
+/// Errors mapping PE offsets/ranges while reading image structures.
+#[derive(Debug, thiserror::Error)]
+pub enum PeMapError {
+    /// A section index is outside the section table.
+    #[error("section index {index} is out of range ({count} sections)")]
+    InvalidSectionIndex { index: usize, count: usize },
+    /// A checked arithmetic overflow (e.g. RVA + len).
+    #[error("{what} overflow")]
+    Overflow { what: &'static str },
+    /// A byte read runs past the end of the image.
+    #[error("read of {len} bytes at offset {offset:#x} is outside the image")]
+    OutOfBounds { offset: usize, len: usize },
+    /// A widened integer does not fit the requested type (unreachable with the
+    /// const-generic read width, but kept total).
+    #[error("value {value:#x} does not fit into {target}")]
+    ValueTooLarge { value: u64, target: &'static str },
 }
 
-fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
-    let raw = read_array::<4>(bytes, offset)?;
-    Ok(u32::from_le_bytes(raw))
+fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, PeMapError> {
+    let value = read_uint_at::<2>(bytes, offset)?;
+    u16::try_from(value).map_err(|_| PeMapError::ValueTooLarge {
+        value,
+        target: "u16",
+    })
 }
 
-fn read_u64(bytes: &[u8], offset: usize) -> Result<u64> {
-    let raw = read_array::<8>(bytes, offset)?;
-    Ok(u64::from_le_bytes(raw))
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, PeMapError> {
+    let value = read_uint_at::<4>(bytes, offset)?;
+    u32::try_from(value).map_err(|_| PeMapError::ValueTooLarge {
+        value,
+        target: "u32",
+    })
 }
 
-fn read_array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N]> {
-    let end = offset.checked_add(N).context("read range overflow")?;
+fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, PeMapError> {
+    read_uint_at::<8>(bytes, offset)
+}
+
+/// Read a little-endian unsigned integer of `N` bytes (2, 4, or 8) at `offset`.
+fn read_uint_at<const N: usize>(bytes: &[u8], offset: usize) -> Result<u64, PeMapError> {
+    let raw = read_array::<N>(bytes, offset)?;
+    let mut buf = [0_u8; 8];
+    if let Some(dst) = buf.get_mut(..N) {
+        dst.copy_from_slice(&raw);
+    }
+    Ok(u64::from_le_bytes(buf))
+}
+
+/// Read `N` raw little-endian bytes at `offset` (shared with `resources`).
+pub(crate) fn read_array<const N: usize>(
+    bytes: &[u8],
+    offset: usize,
+) -> Result<[u8; N], PeMapError> {
+    let end = offset
+        .checked_add(N)
+        .ok_or(PeMapError::Overflow { what: "read range" })?;
     let slice = bytes
         .get(offset..end)
-        .context("read range is outside file")?;
-
-    <[u8; N]>::try_from(slice).context("failed to convert slice into fixed-size array")
+        .ok_or(PeMapError::OutOfBounds { offset, len: N })?;
+    slice
+        .try_into()
+        .map_err(|_| PeMapError::OutOfBounds { offset, len: N })
 }
 
 fn checked_add_usize(left: usize, right: usize) -> Result<usize> {
@@ -1166,15 +1254,19 @@ mod tests {
     #[test]
     fn section_characteristics_to_protect() {
         assert_eq!(
-            protect_from_section_characteristics(IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ),
+            protect_from_section_characteristics(
+                SectionCharacteristics::EXECUTE.bits() | SectionCharacteristics::READ.bits()
+            ),
             PAGE_EXECUTE_READ
         );
         assert_eq!(
-            protect_from_section_characteristics(IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE),
+            protect_from_section_characteristics(
+                SectionCharacteristics::READ.bits() | SectionCharacteristics::WRITE.bits()
+            ),
             PAGE_READWRITE
         );
         assert_eq!(
-            protect_from_section_characteristics(IMAGE_SCN_MEM_READ),
+            protect_from_section_characteristics(SectionCharacteristics::READ.bits()),
             PAGE_READONLY
         );
         assert_eq!(protect_from_section_characteristics(0), PAGE_NOACCESS);

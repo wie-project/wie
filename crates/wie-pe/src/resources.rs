@@ -30,8 +30,41 @@ use crate::PeSectionMap;
 /// `MAKEINTRESOURCE(5)`; 16 is `RT_VERSION`).
 const RT_DIALOG: u16 = 5;
 
-/// `DS_SETFONT` style bit: the template carries a font point size and face.
-const DS_SETFONT: u32 = 0x40;
+/// Window style bits (`WS_*`/`DS_*`, winuser.h) used while parsing dialog
+/// templates. Converted to the raw `u32` on [`DialogTemplate`] because the
+/// user32 consumer combines them with its own `WS_*` constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WindowStyle(u32);
+
+impl WindowStyle {
+    /// `DS_SETFONT`: the template carries a font point size and face.
+    pub(crate) const DS_SETFONT: Self = Self(0x40);
+
+    /// Raw style bits.
+    #[must_use]
+    pub(crate) const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// Whether all bits of `flag` are set.
+    #[must_use]
+    pub(crate) const fn contains(self, flag: Self) -> bool {
+        self.0 & flag.0 == flag.0
+    }
+}
+
+/// Extended window style bits (`WS_EX_*`, winuser.h) used while parsing dialog
+/// templates. Passed through uninterpreted to the raw `u32` field today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WindowExStyle(u32);
+
+impl WindowExStyle {
+    /// Raw extended style bits.
+    #[must_use]
+    pub(crate) const fn bits(self) -> u32 {
+        self.0
+    }
+}
 
 /// `IMAGE_SCN_CNT_INITIALIZED_DATA` (used to spot a resource-like section).
 const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x0000_0040;
@@ -342,9 +375,10 @@ fn resource_section_rva(sections: &[PeSectionMap]) -> Option<u32> {
         }
     }
     for sec in sections {
-        const INIT_READ: u32 = IMAGE_SCN_CNT_INITIALIZED_DATA | crate::IMAGE_SCN_MEM_READ;
+        const INIT_READ: u32 =
+            IMAGE_SCN_CNT_INITIALIZED_DATA | crate::SectionCharacteristics::READ.bits();
         let matches = sec.characteristics & INIT_READ == INIT_READ
-            && sec.characteristics & crate::IMAGE_SCN_MEM_WRITE == 0;
+            && sec.characteristics & crate::SectionCharacteristics::WRITE.bits() == 0;
         if matches {
             return Some(sec.va);
         }
@@ -431,12 +465,12 @@ fn parse_dialog_template(template_id: u16, bytes: &[u8]) -> Option<DialogTemplat
     // first, 18 bytes); the MSDN-documented variant prefixes
     // dlgVer/signature/helpID (28 bytes).
     let (style, ex_style, pos) = if word0 == 1 && word1 == 0 {
-        let ex_style = read_u32_at(bytes, 8)?;
-        let style = read_u32_at(bytes, 12)?;
+        let ex_style = WindowExStyle(read_u32_at(bytes, 8)?);
+        let style = WindowStyle(read_u32_at(bytes, 12)?);
         (style, ex_style, 16)
     } else {
-        let style = read_u32_at(bytes, 0)?;
-        let ex_style = read_u32_at(bytes, 4)?;
+        let style = WindowStyle(read_u32_at(bytes, 0)?);
+        let ex_style = WindowExStyle(read_u32_at(bytes, 4)?);
         (style, ex_style, 8)
     };
 
@@ -459,7 +493,7 @@ fn parse_dialog_template(template_id: u16, bytes: &[u8]) -> Option<DialogTemplat
     // standard template — that exists only in DLGTEMPLATEEX).
     let mut font_point = None;
     let mut font_face = None;
-    if (style & DS_SETFONT) != 0 {
+    if style.contains(WindowStyle::DS_SETFONT) {
         font_point = Some(read_u16_at(bytes, p)?);
         let (face, next) = read_utf16_string(bytes, p.checked_add(2)?, None)?;
         font_face = Some(face);
@@ -478,8 +512,8 @@ fn parse_dialog_template(template_id: u16, bytes: &[u8]) -> Option<DialogTemplat
 
     Some(DialogTemplate {
         name: template_id,
-        style,
-        ex_style,
+        style: style.bits(),
+        ex_style: ex_style.bits(),
         x,
         y,
         cx,
@@ -495,8 +529,8 @@ fn parse_dialog_template(template_id: u16, bytes: &[u8]) -> Option<DialogTemplat
 /// Parse one `DLGITEMTEMPLATE`, returning the item and the offset just past
 /// its creation data.
 fn parse_dialog_item(bytes: &[u8], pos: usize) -> Option<(DialogItemTemplate, usize)> {
-    let style = read_u32_at(bytes, pos)?;
-    let ex_style = read_u32_at(bytes, pos.checked_add(4)?)?;
+    let style = WindowStyle(read_u32_at(bytes, pos)?);
+    let ex_style = WindowExStyle(read_u32_at(bytes, pos.checked_add(4)?)?);
     let x = read_i16_at(bytes, pos.checked_add(8)?)?;
     let y = read_i16_at(bytes, pos.checked_add(10)?)?;
     let cx = read_i16_at(bytes, pos.checked_add(12)?)?;
@@ -516,8 +550,8 @@ fn parse_dialog_item(bytes: &[u8], pos: usize) -> Option<(DialogItemTemplate, us
     Some((
         DialogItemTemplate {
             id,
-            style,
-            ex_style,
+            style: style.bits(),
+            ex_style: ex_style.bits(),
             x,
             y,
             cx,
@@ -623,20 +657,17 @@ fn align4(pos: usize) -> Option<usize> {
 }
 
 fn read_u16_at(bytes: &[u8], pos: usize) -> Option<u16> {
-    let end = pos.checked_add(2)?;
-    let raw: [u8; 2] = bytes.get(pos..end)?.try_into().ok()?;
+    let raw = crate::read_array::<2>(bytes, pos).ok()?;
     Some(u16::from_le_bytes(raw))
 }
 
 fn read_u32_at(bytes: &[u8], pos: usize) -> Option<u32> {
-    let end = pos.checked_add(4)?;
-    let raw: [u8; 4] = bytes.get(pos..end)?.try_into().ok()?;
+    let raw = crate::read_array::<4>(bytes, pos).ok()?;
     Some(u32::from_le_bytes(raw))
 }
 
 fn read_i16_at(bytes: &[u8], pos: usize) -> Option<i16> {
-    let end = pos.checked_add(2)?;
-    let raw: [u8; 2] = bytes.get(pos..end)?.try_into().ok()?;
+    let raw = crate::read_array::<2>(bytes, pos).ok()?;
     Some(i16::from_le_bytes(raw))
 }
 
