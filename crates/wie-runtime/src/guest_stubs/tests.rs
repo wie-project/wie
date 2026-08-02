@@ -1,0 +1,348 @@
+use super::config::{
+    CLOCK_TABLE_SLOT_FILETIME, CLOCK_TABLE_SLOT_QPC, CLOCK_TABLE_SLOT_QPC_FREQ,
+    CLOCK_TABLE_SLOT_TICK64, CLOCK_TABLE_SLOT_TIME,
+};
+use super::*;
+
+#[test]
+fn get_cwd_stub_encodes_and_patches_rel8() {
+    let body = GuestStubKind::GetCurrentDirectoryW {
+        cwd_blob_va: 0x7000_0004_3500,
+    }
+    .encode();
+    assert!(body.len() > 20);
+    assert_eq!(*body.last().unwrap(), 0xc3);
+}
+
+#[test]
+fn dialog_box_stub_encodes_modal_loop() {
+    let body = GuestStubKind::DialogBoxParam {
+        create_dialog_param_va: 0x0000_7000_0000_2c00,
+        get_message_va: 0x0000_7000_0000_1f60,
+        is_dialog_message_va: 0x0000_7000_0000_2c10,
+        dispatch_message_va: 0x0000_7000_0000_22c0,
+        dialog_result_va: 0x0000_7000_0040_a000,
+    }
+    .encode();
+    // ~120 bytes of modal loop; must end in `ret`.
+    assert!(body.len() > 80, "dialog stub too short: {}", body.len());
+    assert!(body.len() < 200, "dialog stub too long: {}", body.len());
+    assert_eq!(*body.last().unwrap(), 0xc3);
+    // The failure path (CreateDialogParam → 0) must return -1 in RAX
+    // (0x48 0xc7 0xc0 0xff.. = `mov rax, -1`) and skip the result load.
+    let neg1 = [0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff];
+    assert!(
+        body.windows(neg1.len()).any(|w| w == neg1),
+        "dialog stub must materialize -1 on CreateDialogParam failure"
+    );
+    // The result must be loaded via `mov eax, [rax]` after a `mov rax, imm`.
+    let load = [0x8b, 0x00, 0xc3];
+    assert!(
+        body.windows(load.len()).any(|w| w == load) || body.windows(2).any(|w| w == [0x8b, 0x00]),
+        "dialog stub must end with the dialog-result load"
+    );
+}
+
+#[test]
+fn dialog_callee_vas_resolve_without_imports() {
+    // A guest that imports ONLY DialogBoxParamA never imports the modal
+    // loop's callees; their fake VAs must still decode to the right
+    // WinApiIds (deterministic encode_export, stop-bit default host-stop).
+    let cfg = GuestStubConfig::from_layout(&crate::memory::DEFAULT_LAYOUT);
+    let expect_export = |va: u64, id: wie_winapi::WinApiId| {
+        assert!(
+            va >= wie_winapi::FAKE_API_BASE,
+            "callee VA {va:#x} outside fake-API window"
+        );
+        assert_eq!(
+            wie_winapi::decode_fake_va(va),
+            Some(wie_winapi::FakeVa::Export(id)),
+            "callee VA {va:#x} does not decode to {id:?}"
+        );
+    };
+    expect_export(
+        cfg.create_dialog_param_a_va,
+        wie_winapi::WinApiId::User32Createdialogparama,
+    );
+    expect_export(
+        cfg.create_dialog_param_w_va,
+        wie_winapi::WinApiId::User32Createdialogparamw,
+    );
+    expect_export(
+        cfg.get_message_a_va,
+        wie_winapi::WinApiId::User32Getmessagea,
+    );
+    expect_export(
+        cfg.is_dialog_message_a_va,
+        wie_winapi::WinApiId::User32Isdialogmessagea,
+    );
+    expect_export(
+        cfg.dispatch_message_a_va,
+        wie_winapi::WinApiId::User32Dispatchmessagea,
+    );
+    // The dialog-result slot lives inside the mapped stub data page.
+    assert!(
+        cfg.dialog_result_va >= crate::memory::DEFAULT_LAYOUT.guest_stub_data_base
+            && cfg.dialog_result_va
+                < crate::memory::DEFAULT_LAYOUT.guest_stub_data_base
+                    + crate::memory::DEFAULT_LAYOUT.guest_stub_data_size as u64
+    );
+    // CLASSIFY_ONLY must differ from the real config (forces the
+    // needs_real_guest_addresses re-classification path).
+    let classify_only = GuestStubConfig::CLASSIFY_ONLY;
+    assert_ne!(classify_only.dialog_result_va, cfg.dialog_result_va);
+}
+
+#[test]
+fn metrics_table_matches_known_sm() {
+    let page = build_stub_data_page();
+    // SM_CXSCREEN = 0 → 1024
+    assert_eq!(&page[0..4], &1024_u32.to_le_bytes());
+    // SM_CYSCREEN = 1 → 768
+    assert_eq!(&page[4..8], &768_u32.to_le_bytes());
+}
+
+#[test]
+fn classify_langid_and_not_virtual_protect() {
+    let cfg = GuestStubConfig::CLASSIFY_ONLY;
+    assert!(matches!(
+        classify_guest_stub("KERNEL32.dll", "GetSystemDefaultLangID", &cfg),
+        Some(GuestStubKind::ReturnImm32(0x0409))
+    ));
+    assert!(classify_guest_stub("KERNEL32.dll", "VirtualProtect", &cfg).is_none());
+    assert!(classify_guest_stub("KERNEL32.dll", "VirtualQuery", &cfg).is_none());
+    assert!(classify_guest_stub("KERNEL32.dll", "LocalAlloc", &cfg).is_none());
+    // MT.1: CS must not be VoidRet guest stubs.
+    assert!(classify_guest_stub("KERNEL32.dll", "EnterCriticalSection", &cfg).is_none());
+    assert!(classify_guest_stub("KERNEL32.dll", "LeaveCriticalSection", &cfg).is_none());
+    assert!(classify_guest_stub("KERNEL32.dll", "DeleteCriticalSection", &cfg).is_none());
+}
+
+/// Every B5 clock API classifies to a table-reading stub at the matching
+/// slot offset, and every such stub embeds the table VA (so it is
+/// re-derived with the real config at plant time).
+#[test]
+fn clock_stubs_classify_to_table_slots() {
+    let cfg = GuestStubConfig::from_layout(&crate::memory::DEFAULT_LAYOUT);
+    let base = cfg.clock_table_va;
+    assert_ne!(base, 0, "clock table must live at a real guest VA");
+
+    let tick =
+        classify_guest_stub("KERNEL32.dll", "GetTickCount", &cfg).expect("GetTickCount classifies");
+    assert_eq!(tick, GuestStubKind::LoadZx32FromVa(base));
+
+    let tick64 = classify_guest_stub("KERNEL32.dll", "GetTickCount64", &cfg)
+        .expect("GetTickCount64 classifies");
+    assert_eq!(
+        tick64,
+        GuestStubKind::LoadZx64FromVa(base.saturating_add(CLOCK_TABLE_SLOT_TICK64))
+    );
+
+    let time =
+        classify_guest_stub("winmm.dll", "timeGetTime", &cfg).expect("timeGetTime classifies");
+    assert_eq!(
+        time,
+        GuestStubKind::LoadZx32FromVa(base.saturating_add(CLOCK_TABLE_SLOT_TIME))
+    );
+
+    let ft = classify_guest_stub("KERNEL32.dll", "GetSystemTimeAsFileTime", &cfg)
+        .expect("GetSystemTimeAsFileTime classifies");
+    assert_eq!(
+        ft,
+        GuestStubKind::CopyU64FromVaToRcxPtr {
+            slot_va: base.saturating_add(CLOCK_TABLE_SLOT_FILETIME),
+        }
+    );
+
+    let qpc = classify_guest_stub("KERNEL32.dll", "QueryPerformanceCounter", &cfg)
+        .expect("QueryPerformanceCounter classifies");
+    assert_eq!(
+        qpc,
+        GuestStubKind::CopyU64FromVaToRcxPtrRetOne {
+            slot_va: base.saturating_add(CLOCK_TABLE_SLOT_QPC),
+        }
+    );
+
+    let qpf = classify_guest_stub("KERNEL32.dll", "QueryPerformanceFrequency", &cfg)
+        .expect("QueryPerformanceFrequency classifies");
+    assert_eq!(
+        qpf,
+        GuestStubKind::CopyU64FromVaToRcxPtrRetOne {
+            slot_va: base.saturating_add(CLOCK_TABLE_SLOT_QPC_FREQ),
+        }
+    );
+
+    for kind in [tick, tick64, time, ft, qpc, qpf] {
+        assert!(
+            kind.needs_real_guest_addresses(),
+            "{kind:?} embeds the table VA and must be re-derived at plant time"
+        );
+        // Encoded bodies are self-contained machine code ending in `ret`.
+        let body = kind.encode();
+        assert_eq!(body.last(), Some(&0xc3), "{kind:?} must end in ret");
+    }
+}
+
+/// End-to-end refresh: the 6×u64 table lands in guest memory at the layout
+/// VA, advances across a 10 ms sleep, and never moves backwards.
+#[test]
+fn refresh_clock_table_writes_advancing_slots() {
+    use wie_cpu::CpuBackend;
+    let backend = wie_cpu::open_cpu().expect("cpu backend opens");
+    let (mut engine, _shared, _guest_mem) = match backend {
+        CpuBackend::Jit { engine, shared } => (engine, Some(shared), None),
+        CpuBackend::Iced { engine, guest_mem } => (engine, None, Some(guest_mem)),
+    };
+    let layout = crate::memory::DEFAULT_LAYOUT;
+    engine
+        .mem_map(
+            layout.clock_table_va,
+            layout.clock_table_size,
+            wie_cpu::RwxPerms::READ_WRITE,
+        )
+        .expect("map clock table");
+
+    let read_slot = |engine: &mut dyn wie_cpu::CpuEngine, slot: u64| -> u64 {
+        let mut buf = [0_u8; 8];
+        let _ = engine.mem_read(layout.clock_table_va.saturating_add(slot), &mut buf);
+        u64::from_le_bytes(buf)
+    };
+
+    refresh_clock_table(&mut *engine, layout.clock_table_va).expect("first refresh");
+    let first_tick = read_slot(&mut *engine, CLOCK_TABLE_SLOT_TICK64);
+    let first_qpc = read_slot(&mut *engine, CLOCK_TABLE_SLOT_QPC);
+    assert_eq!(
+        read_slot(&mut *engine, CLOCK_TABLE_SLOT_QPC_FREQ),
+        10_000_000,
+        "QPC frequency slot must be the fixed 10 MHz base"
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    refresh_clock_table(&mut *engine, layout.clock_table_va).expect("second refresh");
+    let second_tick = read_slot(&mut *engine, CLOCK_TABLE_SLOT_TICK64);
+    let second_qpc = read_slot(&mut *engine, CLOCK_TABLE_SLOT_QPC);
+
+    assert!(
+        second_tick >= first_tick.saturating_add(8),
+        "tick_count_64 slot did not advance: {first_tick} -> {second_tick}"
+    );
+    assert!(
+        second_qpc >= first_qpc,
+        "qpc slot went backwards: {second_qpc} < {first_qpc}"
+    );
+}
+
+/// Every known guest-stub classification: if the `CLASSIFY_ONLY` body differs
+/// from the real-config body, the kind **must** declare that it needs
+/// re-classification via [`GuestStubKind::needs_real_guest_addresses`].
+///
+/// This catches cases where a new stub kind embeds a config-dependent guest
+/// address but the author forgets to add the variant to the `matches!` list
+/// in `needs_real_guest_addresses`. Without this guard the stub would be
+/// planted with address zero for all cfg-derived addresses.
+#[test]
+fn every_stub_needing_real_addresses_is_listed() {
+    // Every (library, name) pair that `classify_guest_stub` can return `Some` for.
+    // When a new stub is added to `classify_guest_stub`, add it here too.
+    let stubs: &[(&str, &str)] = &[
+        // UCRT / CRT
+        ("api-ms-win-crt-runtime-l1-1-0.dll", "__acrt_iob_func"),
+        ("api-ms-win-crt-runtime-l1-1-0.dll", "_initterm"),
+        ("api-ms-win-crt-runtime-l1-1-0.dll", "_initterm_e"),
+        ("api-ms-win-crt-runtime-l1-1-0.dll", "fflush"),
+        ("api-ms-win-crt-runtime-l1-1-0.dll", "setvbuf"),
+        ("api-ms-win-crt-runtime-l1-1-0.dll", "_crt_atexit"),
+        (
+            "api-ms-win-crt-runtime-l1-1-0.dll",
+            "_set_invalid_parameter_handler",
+        ),
+        ("api-ms-win-crt-runtime-l1-1-0.dll", "_set_app_type"),
+        ("api-ms-win-crt-runtime-l1-1-0.dll", "_set_new_mode"),
+        (
+            "api-ms-win-crt-runtime-l1-1-0.dll",
+            "_configure_narrow_argv",
+        ),
+        (
+            "api-ms-win-crt-runtime-l1-1-0.dll",
+            "_initialize_narrow_environment",
+        ),
+        ("api-ms-win-crt-runtime-l1-1-0.dll", "__setusermatherr"),
+        ("api-ms-win-crt-runtime-l1-1-0.dll", "_configthreadlocale"),
+        ("api-ms-win-crt-runtime-l1-1-0.dll", "_cexit"),
+        ("api-ms-win-crt-runtime-l1-1-0.dll", "signal"),
+        ("api-ms-win-crt-runtime-l1-1-0.dll", "__p__environ"),
+        ("api-ms-win-crt-runtime-l1-1-0.dll", "__p___argv"),
+        ("api-ms-win-crt-runtime-l1-1-0.dll", "__p___argc"),
+        ("api-ms-win-crt-runtime-l1-1-0.dll", "__p__commode"),
+        ("api-ms-win-crt-runtime-l1-1-0.dll", "__p__fmode"),
+        ("api-ms-win-crt-runtime-l1-1-0.dll", "__p__acmdln"),
+        // USER32
+        ("USER32.dll", "GetSystemMetrics"),
+        ("USER32.dll", "GetSysColor"),
+        ("USER32.dll", "GetSysColorBrush"),
+        ("USER32.dll", "GetDesktopWindow"),
+        ("USER32.dll", "DialogBoxParamA"),
+        ("USER32.dll", "DialogBoxParamW"),
+        // KERNEL32 / ntdll
+        ("KERNEL32.dll", "EncodePointer"),
+        ("KERNEL32.dll", "DecodePointer"),
+        ("KERNEL32.dll", "GetLastError"),
+        ("KERNEL32.dll", "SetLastError"),
+        ("KERNEL32.dll", "FlsGetValue"),
+        ("KERNEL32.dll", "FlsSetValue"),
+        ("KERNEL32.dll", "SetHandleCount"),
+        ("KERNEL32.dll", "OutputDebugStringA"),
+        ("KERNEL32.dll", "OutputDebugStringW"),
+        ("KERNEL32.dll", "GetCurrentProcessId"),
+        ("KERNEL32.dll", "GetCurrentThreadId"),
+        ("KERNEL32.dll", "IsDebuggerPresent"),
+        ("KERNEL32.dll", "GetACP"),
+        ("KERNEL32.dll", "GetOEMCP"),
+        ("KERNEL32.dll", "GetSystemDefaultLangID"),
+        ("KERNEL32.dll", "GetUserDefaultLangID"),
+        ("KERNEL32.dll", "GetCurrentProcess"),
+        ("KERNEL32.dll", "GetProcessHeap"),
+        ("KERNEL32.dll", "GetCommandLineA"),
+        ("KERNEL32.dll", "GetCommandLineW"),
+        ("KERNEL32.dll", "GetCurrentDirectoryW"),
+        // B5: clock stubs read the host-written guest clock table.
+        ("KERNEL32.dll", "GetTickCount"),
+        ("KERNEL32.dll", "GetTickCount64"),
+        ("KERNEL32.dll", "GetSystemTimeAsFileTime"),
+        ("KERNEL32.dll", "QueryPerformanceCounter"),
+        ("KERNEL32.dll", "QueryPerformanceFrequency"),
+        ("winmm.dll", "timeGetTime"),
+    ];
+
+    let real_cfg = GuestStubConfig::from_layout(&crate::memory::DEFAULT_LAYOUT);
+
+    for &(library, name) in stubs {
+        let kind0 = classify_guest_stub(library, name, &GuestStubConfig::CLASSIFY_ONLY);
+        let kind1 = classify_guest_stub(library, name, &real_cfg);
+
+        match (kind0, kind1) {
+            (Some(k0), Some(k1)) => {
+                let body0 = k0.encode();
+                let body1 = k1.encode();
+                if body0 != body1 {
+                    assert!(
+                        k0.needs_real_guest_addresses(),
+                        "GuestStubKind variant for {library}!{name} produces \
+                         different machine code with CLASSIFY_ONLY vs real config \
+                         (k0={k0:?}, k1={k1:?}). \
+                         Add this variant to `needs_real_guest_addresses()`.",
+                    );
+                }
+            }
+            (Some(_), None) => {
+                panic!("{library}!{name}: classifies with CLASSIFY_ONLY but not with real cfg");
+            }
+            (None, Some(_)) => {
+                panic!("{library}!{name}: classifies with real cfg but not with CLASSIFY_ONLY");
+            }
+            (None, None) => {
+                panic!("{library}!{name}: no longer classifies as a guest stub; remove from test");
+            }
+        }
+    }
+}
