@@ -14,8 +14,10 @@ pub fn run_screenshot(path: &Path, out_path: &Path) -> Result<()> {
     let run_t0 = std::time::Instant::now();
     let mut session = RuntimeSession::new(path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)?;
     let handle = session.guest_handle();
-    let mut control = GuiControl::new();
-    control.wait_for_input = false;
+    let control = GuiControl::new();
+    control
+        .wait_for_input
+        .store(false, std::sync::atomic::Ordering::Relaxed);
 
     let outcome = run_windowed(&mut session, &control)?;
 
