@@ -677,30 +677,30 @@ For the MVP, option 3 is sufficient. C++ exceptions are rare enough that the int
 
 ## 11. Implementation Plan
 
-### Phase 1: Metadata foundation
+### Metadata foundation
 - `RUNTIME_FUNCTION`, `UNWIND_INFO`, `UNWIND_CODE` structs in `wie-winapi`.
 - `pdata.rs` in `wie-pe`: find `.pdata` section during PE load, count entries, store guest VA.
 - `FunctionTableRegistry` in `WinApiState.sync`: map guest VA range → sorted `RUNTIME_FUNCTION` slice.
 - `RtlLookupFunctionEntry(ControlPc)` → `Option<&RUNTIME_FUNCTION>`. Binary search by address.
 
-### Phase 2: Virtual unwinding
+### Virtual unwinding
 - `RtlVirtualUnwind` in `wie-winapi/src/exception.rs`. Interpret UWOP codes, update CONTEXT.
 - Handle leaf functions, chained unwind info, epilogue detection.
 - `CONTEXT64` struct + `RegFile` ↔ `CONTEXT64` conversions.
 
-### Phase 3: Exception dispatch
+### Exception dispatch
 - `RaiseException` handler: build EXCEPTION_RECORD, enter dispatch loop.
 - `RtlDispatchException`: save register context, walk frames, call handlers.
 - Handler invocation bridge: push arguments onto guest stack, switch to guest RIP, read result.
 - `RtlRestoreContext`: write CONTEXT registers back into the CpuEngine.
 
-### Phase 4: C++ integration
+### C++ integration
 - Rewrite `handle_cxx_throw_exception`: instead of `bail!()`, construct the C++ exception record and dispatch.
 - Test with Mingw-w64 micro-exe (`throw int; catch(int)`).
 - Test destructor cleanup (stack object with destructor between throw and catch).
 - Add MSVC `__CxxFrameHandler3` support (parse `FuncInfo`/`TryBlockMap`) or delegate to guest.
 
-### Phase 5: JIT unwind metadata
+### JIT unwind metadata
 - Enable Cranelift unwind info emission or add `RtlInstallFunctionTableCallback`.
 - Verify: exception thrown inside JIT-compiled code unwinds correctly.
 

@@ -1,6 +1,6 @@
 # Idiom Plan: Rust-idiomatic types, per the Rust Book
 
-Status: Completed (2026-08-02). Phases I and II executed with full gates; Phase III verify-only findings below. Built on four idiom audits (exp-7 winapi, exp-8 cpu, exp-9 runtime+cli, exp-10 pe+cross-cutting) that inventoried raw-int handles, stringly types, semantic bools, error handling, encapsulation, duplication, unsafe discipline, and typestate candidates with file:line evidence.
+Status: Completed (2026-08-02). Stages I and II executed with full gates; Stage III verify-only findings below. Built on four idiom audits (exp-7 winapi, exp-8 cpu, exp-9 runtime+cli, exp-10 pe+cross-cutting) that inventoried raw-int handles, stringly types, semantic bools, error handling, encapsulation, duplication, unsafe discipline, and typestate candidates with file:line evidence.
 
 ## What the audits found is ALREADY idiomatic (do not touch)
 
@@ -19,7 +19,7 @@ Status: Completed (2026-08-02). Phases I and II executed with full gates; Phase 
 5. **`JitCtx`/`RegFile` pub fields**: C-ABI/FFI-required. Skip.
 6. **Test-file `.expect()` usage** (81 sites in wie-runtime tests): verify whether tests actually inherit the workspace denies (they pass clippy today) — investigate only, no test churn (tests were exempted in the restructure policy).
 
-## Phase I — zero-risk mechanical (gate: fmt + clippy + workspace tests after each lane)
+## Zero-risk mechanical (gate: fmt + clippy + workspace tests after each lane)
 
 | Lane | Change | Evidence |
 | --- | --- | --- |
@@ -30,7 +30,7 @@ Status: Completed (2026-08-02). Phases I and II executed with full gates; Phase 
 | **I-5 small enums + atomics** | `AccessType { Read, Write, Fetch }` replacing `i32` consts (exec); `Rflags(u64)` associated-const newtype (regs); `SceneState { Inactive, Active }` for `d3d9_scene_active`; `ProcessLifecycle { Alive, Exiting }` for `process_dying`; `wait_for_input: bool` → `AtomicBool` (real cross-thread fix in gui_loop); 10+ `OnceLock` config accessors → one `JitConfig` struct (cpu) | exp-8 #5,6; exp-7 #8,12; exp-9 #6 |
 | **I-6 hygiene** | Add `// SAFETY:` comment to dispatch_table `mem::transmute` (the only bare unsafe); remove dead `peek_fast_ucrt_call`/`peek_self_loop` and `BgWaitState::Ready` dead-variant cleanup; drop noise `#[expect(clippy::large_enum_variant)]` on 2-variant `PresentBackend`; ~22 `for i in 0..N` loops → iterators where index semantics aren't required (dll_loader, unwind, ucrt, console, d3d9 raster) | exp-7 #8,13; exp-10 #8; exp-8 #13,15 |
 
-## Phase II — moderate risk, GUI/runtime-centric (gate: full gate + micro-suite + gui_demo sanity after each lane)
+## Moderate risk, GUI/runtime-centric (gate: full gate + micro-suite + gui_demo sanity after each lane)
 
 | Lane | Change | Evidence |
 | --- | --- | --- |
@@ -38,22 +38,22 @@ Status: Completed (2026-08-02). Phases I and II executed with full gates; Phase 
 | **II-2 cache/table types** | `MenuTreeCache` `Arc<Mutex<Option<(u64, Vec<MenuNode>)>>>` → `RwLock<Option<(Hmenu, Vec<MenuNode>)>>`; `SoftApiTable` `HashMap<String, u16>` stringy key → typed `(Library, Name)` key or `LibraryName` struct; `classify_guest_stub` 250-line string chain → static lookup table | exp-9 #11,8; exp-7 #2 |
 | **II-3 cli state** | `WindowRuntime` `Option<...>` → `enum WindowState { Uncreated, Active(WindowRuntime) }`; `WIE_PRESENT` string compare → parsed `PresentBackendName` enum at startup; `is_interactive_stdin` `to_string_lossy()` → OsStr compare; `executable_file_bytes.clone()` → `Arc<Vec<u8>>` | exp-9 #10,15,14 |
 
-## Phase III — verify-only (no code change)
+## Verify-only (no code change)
 
 - Confirm whether wie-runtime tests inherit `unwrap_used`/`expect_used` denies (they pass clippy today; if there is an allow mechanism, document it in CONTRIBUTING)
 - `is_pe64: bool` redundancy with `Machine` — confirm and remove only if the audit's reading holds
 - `GdiState`/`PresentState` remaining pub after I-2 — sweep for stragglers
 
-## Phase III — verify-only findings (no code change)
+## Verify-only findings (no code change)
 
 1. **Test `.expect()` usage is legal, not a lint violation**: the audit flagged 81 `.expect()` sites in wie-runtime tests against the workspace `expect_used = "deny"`. Verified: `crates/wie-runtime/Cargo.toml` has no `[lints]` section, so the crate never opts into `lints.workspace = true` and the clippy denies never reach its test targets (proof: `clippy -p wie-runtime --test clock_stub` passes silently; forcing `-W clippy::expect_used` fires the lint). The lib code is still unwrap-free by convention. Recommendation: optionally opt the crate into workspace lints and convert tests to `#![expect]`-annotated modules — deferred, not worth the churn now.
 2. **`is_pe64: bool` is verified redundant but kept**: it is set to `true` unconditionally at every construction site (lib.rs:186, 479) and copied through at 524 — never derived from `machine`, can never be false in this PE64-only emulator. Removing it would change the public `Serialize` struct shape (PeIdentity/PeImageSummary) for zero behavior gain; the audit's alternatives (Option<Machine>, caller checks) also churn cli. Kept as-is, documented here.
 
-## Verification per phase
+## Verification per stage
 
-- Phase I lanes: `cargo fmt --all` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace`; **long_loop A/B vs previous commit** after I-5 (cpu-touching); micro-suite after any winapi-touching lane
-- Phase II lanes: full gate + micro-suite + `gui_demo` selftest (exit codes 100-103) + interactive sanity
-- Phase III: report only, no commits
+- Stage I lanes: `cargo fmt --all` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace`; **long_loop A/B vs previous commit** after I-5 (cpu-touching); micro-suite after any winapi-touching lane
+- Stage II lanes: full gate + micro-suite + `gui_demo` selftest (exit codes 100-103) + interactive sanity
+- Stage III: report only, no commits
 - Perf invariant: long_loop ≈ 0.28–0.32 s release (A/B under identical load, per the restructure's established method)
 
 ## ADR-003: Handle and flag types

@@ -1,7 +1,7 @@
-# GPU / Metal Support Plan (P4 + P5)
+# GPU / Metal Support Plan
 
 Status: proposed — awaiting review (Aug 1, 2026).
-Companion: `docs/phase-gui.md` (GUI program, P0–P3 done); live progress in `.slim/deepwork/gui-implementation.md`.
+Companion: `docs/gui-design.md`; live progress in `.slim/deepwork/gui-implementation.md`.
 
 ## Principles (unchanged, hard constraints)
 
@@ -24,7 +24,7 @@ Companion: `docs/phase-gui.md` (GUI program, P0–P3 done); live progress in `.s
 ### Rejected
 
 - **Scoped `unsafe` objc2-metal module in wie-cli** — rejected by user decision: breaks the zero-unsafe policy; direct CAMetalLayer control is not worth it when wgpu covers present + compute offload safely.
-- **Keep softbuffer + persistent host buffer** — rejected: the fresh-buffer problem stays; P4's core win ("kill the per-frame full copy") is not achieved.
+- **Keep softbuffer + persistent host buffer** — rejected: the fresh-buffer problem stays; the present redesign's core win ("kill the per-frame full copy") is not achieved.
 
 ### What changes
 
@@ -114,7 +114,7 @@ Order matters: P4a first (present is the bottleneck for everything on screen), t
 
 ## Immediate follow-up from the roadmap cleanup
 
-- `README.md` (lines 20, 223–236), `CLAUDE.md` (line 77), `docs/RUNBOOK.md` (docs map) still link the removed `Optimization ROADMAP.md` / `docs/phase*.md`. Fix references; the live roadmap is now `.slim/deepwork/gui-implementation.md`.
+- `README.md` (lines 20, 223–236), `CLAUDE.md` (line 77), `docs/RUNBOOK.md` (docs map) still link the removed `Optimization ROADMAP.md` / the old roadmap docs. Fix references; the live roadmap is now `.slim/deepwork/gui-implementation.md`.
 
 ## P5b status: DONE (implemented directly by orchestrator, Aug 2, 2026)
 

@@ -1,6 +1,6 @@
 # WIE Runbook (quick mitigations)
 
-One-page playbook for regressions after Phases 0–7 and the **great cleanup** (mmap-only memory, compressed CLI). Prefer kill-switches over deep debug first.
+One-page playbook for regressions after the foundational work and the **great cleanup** (mmap-only memory, compressed CLI). Prefer kill-switches over deep debug first.
 
 ## Identity
 
@@ -8,7 +8,7 @@ One-page playbook for regressions after Phases 0–7 and the **great cleanup** (
 | ----- | -------------- |
 | Active CPU | `WIE_CPU` unset → **jit**; `WIE_CPU=iced` for interpreter |
 | Active mem | Always **mmap** arenas (`WIE_RUNTIME_PROFILE=1` → `mem_backend=mmap`) |
-| Active idle | profile line `idle_policy=…` (Phase 6) |
+| Active idle | profile line `idle_policy=…` |
 | CLI | `inspect` / `run` / `trace` (`run-micro` and `entry-trace` are aliases) |
 
 ## Symptoms → actions
@@ -17,7 +17,7 @@ One-page playbook for regressions after Phases 0–7 and the **great cleanup** (
 | ------- | --- |
 | Crash / wrong reads after `VirtualProtect` / free | `WIE_MPROTECT=0`; bisect with `WIE_JIT_MEM=slow` / `WIE_CPU=iced` |
 | Suspected JIT miscompile | `WIE_CPU=iced` or `WIE_JIT_MEM=slow` |
-| Stale code after patch / protect | Expect `FlushInstructionCache` / X-loss inv (Phase 4.x + 7); bisect with `WIE_JIT_CHAIN=0` |
+| Stale code after patch / protect | Expect `FlushInstructionCache` / X-loss inv; bisect with `WIE_JIT_CHAIN=0` |
 | Idle guest burns 100% CPU (message wait) | `WIE_IDLE=park` (interactive `run --persistent` defaults to park) |
 | `Sleep(n)` ignored / too fast | Ensure not forced busy: `WIE_IDLE=park` or legacy `WIE_HOST_SLEEP=1` |
 | Micros suddenly slow | Avoid `WIE_IDLE=park` on suite; default micro idle is **yield** |
@@ -54,8 +54,6 @@ WIE_JIT_MEM_TRACE=1 WIE_RUNTIME_PROFILE=1 ./target/release/wie-cli run real_exes
 
 | Topic | Doc |
 | ----- | --- |
-| GUI program design | [`phase-gui.md`](phase-gui.md) |
-| Metal / D3D9 plan | [`gpu-rendering-plan.md`](gpu-rendering-plan.md) |
 | Multithreading | [`mt-threads.md`](mt-threads.md) |
 | Live progress log | [`../.slim/deepwork/gui-implementation.md`](../.slim/deepwork/gui-implementation.md) |
 

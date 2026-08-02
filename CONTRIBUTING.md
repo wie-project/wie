@@ -10,11 +10,11 @@ If you want to help this project and offer your own improvements, corrections or
 
 3. **unsafe** are allowed only in critical places (for example, wie-cpu). You should make sure that after your changes the code was the minimum number of unsafe code.
 
-4. **allow elements** (for example, too-many-arguments) should be minimal. In most cases, you can do without them.
+4. **Clippy is advisory, not a gate** - No clippy lint is denied in the workspace config; `scripts/check.sh` runs clippy without `-D warnings`. Write natural Rust, and prefer fixing code over silencing lints. `#[allow]` / `#[expect]` leniency belongs in test code only - production code should not carry clippy escapes.
 
-5. **File size** - Source files must stay under 1500 lines (target: 1000). Split by cohesion along existing seams — a file that needs to grow past the cap should become a module directory instead. Exceptions: test files and pure data tables (see docs/restructure-plan.md, ADR-002). Enforced by `scripts/check-file-sizes.sh` in the pre-PR checklist.
+5. **File size** - Source files must stay under 1500 lines (target: 1000). Split by cohesion along existing seams — a file that needs to grow past the cap should become a module directory instead. Exceptions: test files and pure data tables. Enforced by `scripts/check-file-sizes.sh` in the pre-PR checklist.
 
-6. **Lint inheritance** - `crates/wie-runtime/Cargo.toml` does not opt into `lints.workspace = true`, so its targets (including tests) do not inherit the workspace clippy denies (`unwrap_used`, `expect_used`, indexing, casts, …). Keep lib code unwrap-free by convention anyway; `.expect()` in runtime tests is legal today. If the crate is ever opted into workspace lints, annotate test modules with `#![expect(clippy::expect_used)]` instead of converting asserts. See docs/idiom-plan.md, Phase III.
+6. **Lint opt-in** - Only `wie-cpu` and `wie-winapi` opt into the workspace lints (`lints.workspace = true`); the other crates do not inherit them. The rustc denies (`unsafe_code`, unused imports, …) still apply to the crates that opted in. `.expect()` in tests is legal everywhere.
 
 After all the stages have been completed, you can safely send your pull request.
 

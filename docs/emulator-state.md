@@ -81,9 +81,9 @@
 
 ---
 
-## Phase Roadmap (all completed ✅)
+## Roadmap (all completed ✅)
 
-| Phase | Topic |
+| Stage | Topic |
 |-------|-------|
 | 0 | Baseline measurement |
 | 1 | Memory abstraction (GuestMemBackend trait, RegionTable) |
@@ -119,6 +119,6 @@
 - Bottlenecks for real-world use:
   1. **Missing WinAPI handlers** that real apps call beyond the micro-suite surface
   2. **I/O path hardening** — bottle filesystem works for micro-tests but real workloads stress it
-  3. **Performance tuning** — JIT/memory optimizations are phase-complete but real workloads expose new bottlenecks
+  3. **Performance tuning** — JIT/memory optimizations are complete but real workloads expose new bottlenecks
 
 **Bottom line**: Skeleton is solid (mmap, JIT, threading, SEH). The WinAPI surface is the long tail — the emulator is not yet a general Windows app runner.

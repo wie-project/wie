@@ -84,7 +84,7 @@ Suite: `scripts/run-micro-suite.sh` runs MT micros; `mt_stress` is skipped when 
 
 ## ARM notes
 
-- No patch of finalized JIT host code for chaining (see `phase4-jit-coherency.md`).  
+- No patch of finalized JIT host code for chaining.  
 - Thread switch flushes JIT TLB / pins / shadow (`on_thread_switch`).  
 - Interlocked uses host LDXR/STXR through soft-translated pointers (SeqCst).  
 - Arena **data** may race only if concurrent execute is opened later; today the process engine mutex serializes guest steps. Structural map/unmap/protect still exclusive.  

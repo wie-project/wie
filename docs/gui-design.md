@@ -26,12 +26,12 @@ Rationale for `wie-cli`-only: winit requires thread 0 on macOS, and only a binar
 - **Lints are enforced in only two crates.** Only `crates/wie-cpu/Cargo.toml` and `crates/wie-winapi/Cargo.toml` carry `[lints] workspace = true`. `wie-cli`/`wie-runtime`/`wie-pe` get only `clippy::all -D warnings` from `scripts/check.sh`. The strict `as_conversions`/`cast_*`/`indexing_slicing` regime therefore applies to the GDI blit code but not the presenter. Follow house style in both anyway — `wie-runtime/src` has zero `as` casts despite not being linted.
 - **`WinApiState` is deliberately not `Clone`** (`crates/wie-winapi/src/lib.rs:460`). But `DllStateMap::get_or_init<T: Default + Send + 'static>` (`lib.rs:423`) has **no `Debug` or `Clone` bound** — slots are `Box<dyn Any + Send>`. A framebuffer and a `Box<dyn Fn() + Send>` wake callback can both live there.
 - **`RuntimeSession::run_until_stop` takes `&mut self`**, so the host thread cannot call `post_window_message` while the guest runs. But the WinAPI mutex is explicitly not held across guest execution (`session.rs:1330`). **The cross-thread seam is `Arc<Mutex<WinApiState>>`, not `RuntimeSession`.**
-- **The callback bridge is one-shot.** `finish_guest_callback` (`guest_callback.rs:83`) completes the outer API immediately after one WndProc returns, passing RAX through unless `create_window_hwnd` is `Some`. This blocks both `WM_NCCREATE`-then-`WM_CREATE` and `DefWindowProc(WM_CLOSE) → send WM_DESTROY → return 0`. Phase 1 generalizes the return rule; `WM_NCCREATE` chaining is deferred.
+- **The callback bridge is one-shot.** `finish_guest_callback` (`guest_callback.rs:83`) completes the outer API immediately after one WndProc returns, passing RAX through unless `create_window_hwnd` is `Some`. This blocks both `WM_NCCREATE`-then-`WM_CREATE` and `DefWindowProc(WM_CLOSE) → send WM_DESTROY → return 0`. Stage 1 generalizes the return rule; `WM_NCCREATE` chaining is deferred.
 - The PE `subsystem` field is never read (zero grep hits), so GUI-subsystem binaries already load. Unknown imports fail at call time, not load time.
 
 ---
 
-## Phase 0 — Resurrect the window model
+## Stage 0 — Resurrect the window model
 
 No new dependencies. Worth landing alone: it fixes a bug that silently disables all existing USER32 window code.
 
@@ -46,9 +46,9 @@ Also move `invalidated: bool` from the process-global `WindowState` (`lib.rs:233
 
 **`crates/wie-winapi/src/user32/message.rs:133`** — `handle_post_message_a` gates on `window_handle == 0 || window_handle == FAKE_WINDOW_HANDLE`, silently **dropping** messages posted to a real HWND. Replace with `is_known_window(state, window_handle)` (`user32/mod.rs:546`). `handle_redraw_window` (`user32/window.rs:535`) has the identical bug.
 
-**Verify**: new unit test in `wie-winapi` — `RegisterClassExA` returns a nonzero atom; `create_window_record` returns a handle in `0x6610_0000..`; a `debug_assert`-style test asserts the allocator bases (including the Phase 2b GDI DC base `0x6810_0000` and bitmap base `0x6820_0000`) are disjoint from every `FAKE_*` constant and from each other; `PostMessage` to a created HWND is retrievable via `GetMessageA`.
+**Verify**: new unit test in `wie-winapi` — `RegisterClassExA` returns a nonzero atom; `create_window_record` returns a handle in `0x6610_0000..`; a `debug_assert`-style test asserts the allocator bases (including the Stage 2b GDI DC base `0x6810_0000` and bitmap base `0x6820_0000`) are disjoint from every `FAKE_*` constant and from each other; `PostMessage` to a created HWND is retrievable via `GetMessageA`.
 
-## Phase 1 — Window lifecycle
+## Stage 1 — Window lifecycle
 
 **Generalize the callback return rule.** Replace `create_window_hwnd: Option<u64>` threading with a field on `GuestCallbackRequest` (`lib.rs:767`, currently `Copy + Eq`, so use an enum):
 
@@ -70,7 +70,7 @@ pub enum OuterReturn { Passthrough, CreateWindow(u64), Fixed(u64) }
 | `GetClientRect` | Return `WindowRecord.client_rect` stored at creation; window rect equals client rect (no non-client area). Most WndProcs call this on every `WM_PAINT`. |
 | `GetWindowRect` | Calculate screen-relative coordinates from client rect + window origin in `WindowRecord`. |
 | `AdjustWindowRectEx` | Return the input rect unchanged — no non-client area exists, so desired client size equals window size. |
-| `ValidateRect`, `GetWindowDC`, `SetWindowLongA/W`, `FillRect` | Thin; `FillRect` lands with Phase 2's fill helper. |
+| `ValidateRect`, `GetWindowDC`, `SetWindowLongA/W`, `FillRect` | Thin; `FillRect` lands with Stage 2's fill helper. |
 
 **`CREATESTRUCT` memory**: 0x50 bytes on Win64 — `lpCreateParams@0`, `hInstance@8`, `hMenu@0x10`, `hwndParent@0x18`, `cy@0x20`, `cx@0x24`, `y@0x28`, `x@0x2C`, `style@0x30`, `lpszName@0x38`, `lpszClass@0x40`, `dwExStyle@0x48`. Allocate from the process heap via `alloc_coherent`, exactly as `handle_create_dib_section` does at `gdi32.rs:432` (`allocate_gdi_heap_block`). **Reuse the guest's own `lpClassName`/`lpWindowName` pointers verbatim** — they are valid for the call's duration, so no string duplication. Store the VA in `WindowRecord` and `free_coherent` it in `DestroyWindow`.
 
@@ -86,23 +86,23 @@ pub enum OuterReturn { Passthrough, CreateWindow(u64), Fixed(u64) }
 | `WM_SETCURSOR` 0x0020 | — | 1 |
 | everything else | No-op | 0 |
 
-If Phase 1 should carry zero bridge risk, the fallback for `WM_CLOSE` is to **post** rather than send `WM_DESTROY` — identical behaviour for any app whose `WM_DESTROY` calls `PostQuitMessage`.
+If this stage should carry zero bridge risk, the fallback for `WM_CLOSE` is to **post** rather than send `WM_DESTROY` — identical behaviour for any app whose `WM_DESTROY` calls `PostQuitMessage`.
 
 **`WM_*` constants** to add to the block at `user32/mod.rs:38-47`: `WM_CREATE 0x0001`, `WM_DESTROY 0x0002`, `WM_MOVE 0x0003`, `WM_SIZE 0x0005`, `WM_ACTIVATE 0x0006`, `WM_SETFOCUS 0x0007`, `WM_KILLFOCUS 0x0008`, `WM_PAINT 0x000F`, `WM_CLOSE 0x0010`, `WM_ERASEBKGND 0x0014`, `WM_SHOWWINDOW 0x0018`, `WM_SETCURSOR 0x0020`, `WM_GETMINMAXINFO 0x0024`, `WM_NCCREATE 0x0081`, `WM_NCDESTROY 0x0082`, `WM_NCCALCSIZE 0x0083`, `WM_SYSCOMMAND 0x0112`, `WM_TIMER 0x0113`, `WM_MOUSEMOVE 0x0200`, `WM_LBUTTONDOWN/UP 0x0201/0x0202`, `WM_RBUTTONDOWN/UP 0x0204/0x0205`, `WM_MBUTTONDOWN/UP 0x0207/0x0208`, `WM_MOUSEWHEEL 0x020A`, plus `SIZE_RESTORED 0`, `SC_CLOSE 0xF060`, `CW_USEDEFAULT 0x8000_0000`, `SW_SHOW 5`.
 
-**Phase 1 sends only `WM_CREATE`** — the one-shot bridge cannot express `WM_NCCREATE` first. Every hand-written WndProc tolerates this; ATL/MFC do not, which is the main thing to revisit before a real-world app.
+**This stage sends only `WM_CREATE`** — the one-shot bridge cannot express `WM_NCCREATE` first. Every hand-written WndProc tolerates this; ATL/MFC do not, which is the main thing to revisit before a real-world app.
 
 **Verify**: headless `wie-runtime` test — create a window, assert the WndProc received `WM_CREATE` with a well-formed `CREATESTRUCT` in guest memory; guest calls `GetClientRect` and receives the correct dimensions; post `WM_CLOSE`, observe `ExitProcess(0)`. No pixels yet.
 
-## Phase 2a — Refactor: split gdi32.rs into a module directory
+## Stage 2a — Refactor: split gdi32.rs into a module directory
 
-Before adding the GDI real record tables and blit logic, split the existing `crates/wie-winapi/src/gdi32.rs` (888 lines) into `gdi32/{state.rs, blit.rs, pixel.rs}` as a standalone refactoring commit. Pure code motion — no behavior changes, no new exports. This keeps the Phase 2b functional diff clean and reviewable.
+Before adding the GDI real record tables and blit logic, split the existing `crates/wie-winapi/src/gdi32.rs` (888 lines) into `gdi32/{state.rs, blit.rs, pixel.rs}` as a standalone refactoring commit. Pure code motion — no behavior changes, no new exports. This keeps the Stage 2b functional diff clean and reviewable.
 
-**Why separate**: the split touches every line of GDI code (import paths, visibility, module declaration in `lib.rs`). Mixing that with functional changes means a diff that is ~70% renames and hard to review. Landing the refactor first means the real GDI work in Phase 2b shows only new logic.
+**Why separate**: the split touches every line of GDI code (import paths, visibility, module declaration in `lib.rs`). Mixing that with functional changes means a diff that is ~70% renames and hard to review. Landing the refactor first means the real GDI work in Stage 2b shows only new logic.
 
 **Verify**: `cargo test -p wie-winapi` green with zero test changes; `cargo fmt --check` passes.
 
-## Phase 2b — GDI blit and the present surface
+## Stage 2b — GDI blit and the present surface
 
 Still zero new dependencies. This is where it becomes real.
 
@@ -163,9 +163,9 @@ u32::from_le_bytes([b, g, r, a]) & 0x00FF_FFFF
 
 **Lint strategy** (this crate *is* linted): put every numeric conversion in `gdi32/pixel.rs` (~40 lines) — `u32::from_le_bytes`, `u32::from`, `to_le_bytes`, no `as`. Do all `i32→u32→usize` work once in `fn clip(...) -> Option<Clipped>` using `try_from(..).ok()?` + `checked_mul`; everything downstream is `usize`/`u32`. Never index — the row copy is `dst_row.iter_mut().zip(src_bytes.chunks_exact(4))`, which is zero `[i]`, zero casts, and self-documenting about stride. Budget: **zero `#[expect]` in `wie-winapi`**.
 
-**Verify**: this is the phase that earns the hash gate (below), and it is still 100% headless.
+**Verify**: this is the stage that earns the hash gate (below), and it is still 100% headless.
 
-## Phase 3 — Headless driver, micro exe, CI
+## Stage 3 — Headless driver, micro exe, CI
 
 **`crates/wie-runtime/src/gui_loop.rs`** — `run_windowed(session, control: &GuiControl) -> Result<GuiOutcome>`. Do **not** reuse `run_persistent_until_yield` (`trace.rs:249`); it has three disqualifying properties for a GUI session:
 
@@ -185,15 +185,15 @@ LIBS    = -lkernel32 -luser32 -lgdi32
 
 `RegisterClassExA` → `CreateWindowExA(320×240)` → `CreateCompatibleDC` + `CreateDIBSection(320, -240, 32bpp)` → `SelectObject` → write a deterministic pattern into `*ppvBits` → `ShowWindow` → pump with `BitBlt` on `WM_PAINT` → `WM_DESTROY: PostQuitMessage(0)` → `ExitProcess(0)`. Add `WM_CHAR == 'q'` → `DestroyWindow` so the interactive window is keyboard-closable. New `gui_exes` target in `micro-exes/Makefile`, added to `all` and `.PHONY`.
 
-**Gate 1 — `crates/wie-runtime/tests/micro_gui_window.rs`**, zero GUI deps, following the skip-if-missing pattern at `micro_n1_suite.rs:7-29`. Drive a bounded scripted run (paint, one frame, close), then assert: a window exists (a regression guard on the Phase 0 fix), `frame.width/height == (320, 240)`, `fnv1a64(&frame.pixels) == <constant>`, `exit_code == Some(0)`. The hash is the primary assertion — deterministic, no file IO, no encoder.
+**Gate 1 — `crates/wie-runtime/tests/micro_gui_window.rs`**, zero GUI deps, following the skip-if-missing pattern at `micro_n1_suite.rs:7-29`. Drive a bounded scripted run (paint, one frame, close), then assert: a window exists (a regression guard on the Stage 0 fix), `frame.width/height == (320, 240)`, `fnv1a64(&frame.pixels) == <constant>`, `exit_code == Some(0)`. The hash is the primary assertion — deterministic, no file IO, no encoder.
 
 **Gate 2 — `scripts/run-micro-suite.sh`** gains a `gui_exes` category (the script passes `$CATEGORY` straight to `make`, so the names must match) running `wie-cli run out/gui_blit.exe --screenshot $TMPDIR/gui_blit.bmp`. `--screenshot` takes the headless path and never calls `EventLoop::new()`, so `scripts/check.sh` stays headless even with the `gui` feature compiled in.
 
 **BMP, not PNG**, as `crates/wie-cli/src/bmp.rs` (unconditionally compiled, not behind the `gui` feature — `--screenshot` needs no winit): a 14-byte `BITMAPFILEHEADER` + 40-byte `BITMAPINFOHEADER` + raw bottom-up BGRA rows is ~35 lines and zero dependencies, and Preview.app opens it (PPM does not). PNG would mean `png` + `miniz_oxide` for a debugging aid. The hash is the gate; the BMP is the human escape hatch.
 
-**Phase 3 ends with the full GUI capability working and CI-gated, still at zero new workspace dependencies.** That ordering is deliberate — real rendered pixels are provable before committing to the winit tree.
+**Stage 3 ends with the full GUI capability working and CI-gated, still at zero new workspace dependencies.** That ordering is deliberate — real rendered pixels are provable before committing to the winit tree.
 
-## Phase 4 — winit + softbuffer
+## Stage 4 — winit + softbuffer
 
 `crates/wie-cli/Cargo.toml`:
 
@@ -228,7 +228,7 @@ Frames ship as a **proxy ping, not pixels** — `send_event` → `request_redraw
 
 **Verify**: manual — a real macOS window showing the gradient, closable by the red button and by 'q'; `--no-default-features` still builds; `scripts/check.sh` green.
 
-## Phase 5 — Input, resize, polish
+## Stage 5 — Input, resize, polish
 
 `crates/wie-cli/src/gui/input.rs` maps winit events to Win32 messages via `GuestHandle::post_message`:
 
@@ -244,22 +244,22 @@ Frames ship as a **proxy ping, not pixels** — `send_event` → `request_redraw
 
 Extend `gui_blit.c` to move a square with the arrow keys. Verify manually plus a headless scripted-input test that posts synthetic `WM_KEYDOWN` and hashes the resulting frame.
 
-## Phase 6 — Documentation
+## Stage 6 — Documentation
 
-`docs/phase-gui.md` matching the existing `docs/phase*.md` series (including the written rationale for taking the winit dependency, since this repo hand-rolls termios rather than take crossterm). `README.md` knob table for `WIE_GUI_*`. `docs/RUNBOOK.md` entries for "window is blank" / "input does not reach the guest" / "process hangs after close". Update the `CLAUDE.md` architecture table and `docs/emulator-state.md:105`.
+This document records the design (including the written rationale for taking the winit dependency, since this repo hand-rolls termios rather than take crossterm). `README.md` knob table for `WIE_GUI_*`. `docs/RUNBOOK.md` entries for "window is blank" / "input does not reach the guest" / "process hangs after close". Update the `CLAUDE.md` architecture table and `docs/emulator-state.md:105`.
 
 ### Implementation status (July 31, 2026)
 
-All 6 phases are implemented and the workspace builds clean with `cargo build --workspace --features gui`:
+All stages are implemented and the workspace builds clean with `cargo build --workspace --features gui`:
 
-- **Phase 0** — Window model resurrected: WindowState seeding with disjoint handle bases, per-window `invalidated` flag, `is_known_window` gate for PostMessage. (wie-winapi)
-- **Phase 2a** — gdi32.rs (888 lines) split into `gdi32/{mod,state,blit,pixel}.rs` directory. Pure code motion. (wie-winapi)
-- **Phase 1** — Window lifecycle: 18 new WinAPI handlers (CreateWindowExA/W with CREATESTRUCT, DestroyWindow, GetClientRect, GetWindowRect, AdjustWindowRectEx, RegisterClassA/W, etc.), `OuterReturn` enum replacing the old `Option<u64>` callback bridge, DefWindowProc message-switching, 28 WM_* constants. (wie-winapi + wie-runtime)
-- **Phase 2b** — GDI blit pipeline: `PresentState` (per-window compositing surfaces, frame publishing, wake callback), `GdiState` (DcRecord, DibSection, real handle allocation), `handle_select_object` DIB binding, `handle_bit_blt` with 32-bpp SRCCOPY, pixel helpers (bgra_to_0rgb, clip_blit_rect). (wie-winapi)
-- **Phase 3** — Headless driver + CI: `gui_loop.rs` (`run_windowed` headless driver), `GuestHandle` (`take_frame`, `set_wake`, `post_message`), `micro_gui_window.rs` headless test (322 tests pass), BMP writer (`--screenshot`). (wie-runtime + wie-cli)
-- **Phase 4** — Winit window: optional `gui` feature with winit 0.30 + softbuffer 0.4, lazy window creation on first published frame, cross-thread guest thread with 8 MiB stack, `WieEvent` proxy-ping rendering. (wie-cli)
-- **Phase 5** — Input mapping: winit → Win32 message dispatch (WM_KEYDOWN/UP, WM_CHAR, WM_MOUSEMOVE, WM_LBUTTONDOWN/UP, WM_RBUTTONDOWN/UP, WM_MBUTTONDOWN/UP, WM_MOUSEWHEEL, WM_MOUSEHWHEEL, WM_SIZE, WM_SETFOCUS, WM_KILLFOCUS), VK_* mapping table. (wie-cli)
-- **Phase 6** — Documentation: this section.
+- Window model resurrected: WindowState seeding with disjoint handle bases, per-window `invalidated` flag, `is_known_window` gate for PostMessage. (wie-winapi)
+- gdi32.rs (888 lines) split into `gdi32/{mod,state,blit,pixel}.rs` directory. Pure code motion. (wie-winapi)
+- Window lifecycle: 18 new WinAPI handlers (CreateWindowExA/W with CREATESTRUCT, DestroyWindow, GetClientRect, GetWindowRect, AdjustWindowRectEx, RegisterClassA/W, etc.), `OuterReturn` enum replacing the old `Option<u64>` callback bridge, DefWindowProc message-switching, 28 WM_* constants. (wie-winapi + wie-runtime)
+- GDI blit pipeline: `PresentState` (per-window compositing surfaces, frame publishing, wake callback), `GdiState` (DcRecord, DibSection, real handle allocation), `handle_select_object` DIB binding, `handle_bit_blt` with 32-bpp SRCCOPY, pixel helpers (bgra_to_0rgb, clip_blit_rect). (wie-winapi)
+- Headless driver + CI: `gui_loop.rs` (`run_windowed` headless driver), `GuestHandle` (`take_frame`, `set_wake`, `post_message`), `micro_gui_window.rs` headless test (322 tests pass), BMP writer (`--screenshot`). (wie-runtime + wie-cli)
+- Winit window: optional `gui` feature with winit 0.30 + softbuffer 0.4, lazy window creation on first published frame, cross-thread guest thread with 8 MiB stack, `WieEvent` proxy-ping rendering. (wie-cli)
+- Input mapping: winit → Win32 message dispatch (WM_KEYDOWN/UP, WM_CHAR, WM_MOUSEMOVE, WM_LBUTTONDOWN/UP, WM_RBUTTONDOWN/UP, WM_MBUTTONDOWN/UP, WM_MOUSEWHEEL, WM_MOUSEHWHEEL, WM_SIZE, WM_SETFOCUS, WM_KILLFOCUS), VK_* mapping table. (wie-cli)
+- Documentation: this section.
 
 ### CLI usage
 
@@ -295,28 +295,28 @@ cargo build -p wie-cli --features gui
 
 1. **winit's main-thread requirement × `panic = "abort"`.** Any panic inside a winit callback kills the process — including the guest thread mid-JIT — with no unwinding and no exit code, and this will not show up in `cargo test` (debug unwinds). Mitigations, all mandatory: write the presenter panic-free by construction even though `wie-cli` is unlinted; give the **guest thread** ownership of the exit code via `control.exit_code: AtomicI32` + `control.finished: AtomicBool`, then `proxy.send_event(GuestExited)` and `std::process::exit(code)` from the main thread rather than relying on returning from `main`; and make the host notice a dead guest thread (`JoinHandle::is_finished()` on the 50 ms tick), or the window hangs forever in front of a corpse.
 2. **winit 0.30 API churn and tree size** — ~40–60 transitive crates on macOS (the `objc2` family, `raw-window-handle`, `dpi`). Mitigated by exact pins and confining winit to one file.
-3. **Dependency philosophy.** This repo hand-rolls termios rather than take crossterm, with an explicit rationale comment. Adding ~50 crates is a values call. Mitigated by the feature gate, by the emulator crates gaining zero dependencies, and by phases 0–3 delivering the whole capability with zero new deps first.
+3. **Dependency philosophy.** This repo hand-rolls termios rather than take crossterm, with an explicit rationale comment. Adding ~50 crates is a values call. Mitigated by the feature gate, by the emulator crates gaining zero dependencies, and by stages 0–3 delivering the whole capability with zero new deps first.
 4. **HiDPI.** softbuffer surfaces are in *physical* pixels, so a 640×480 guest window renders as a 320×240-looking stamp on Retina. Recommend reporting **physical** client size to `GetClientRect`/`WM_SIZE` so the guest allocates a matching DIB — zero scaling code, crisp output, at the cost of the guest seeing a 2×-larger monitor. `pixels` is the drop-in upgrade if vsync or smooth scaling is later needed, and the `PresentState` seam does not change.
-5. **Present cost.** One guest→host copy of `w*h*4` (1.2 MB at 640×480) per present, inside the WinAPI mutex, which stalls guest workers. Must be under the lock (`HandlerContext` holds engine and state together), so mitigate by cost: composite only the blit rect, hand off as `Arc<[u32]>` (refcount bump, not a copy). The condvar replaces `thread::sleep(25 ms)`, so idle wakeups go *down*. Re-check `long_loop` ≈ 0.28–0.32 s release JIT after Phase 2 — the GDI changes touch no hot path, so a regression there means something structural broke.
-6. **Handle-base collision in the Phase 0 fix.** If a seeded handle collides with a `0x6600_xxxx` constant, `is_known_window` returns true for the wrong entity and `BeginPaint`/`GetDC` silently target the wrong surface — presenting as "the window is blank," indistinguishable from ten other failure modes. Hence the disjointness unit test.
+5. **Present cost.** One guest→host copy of `w*h*4` (1.2 MB at 640×480) per present, inside the WinAPI mutex, which stalls guest workers. Must be under the lock (`HandlerContext` holds engine and state together), so mitigate by cost: composite only the blit rect, hand off as `Arc<[u32]>` (refcount bump, not a copy). The condvar replaces `thread::sleep(25 ms)`, so idle wakeups go *down*. Re-check `long_loop` ≈ 0.28–0.32 s release JIT after Stage 2 — the GDI changes touch no hot path, so a regression there means something structural broke.
+6. **Handle-base collision in the Stage 0 fix.** If a seeded handle collides with a `0x6600_xxxx` constant, `is_known_window` returns true for the wrong entity and `BeginPaint`/`GetDC` silently target the wrong surface — presenting as "the window is blank," indistinguishable from ten other failure modes. Hence the disjointness unit test.
 7. **The one-shot callback bridge.** `WM_NCCREATE` is not expressible without a `follow_up: Option<GuestCallbackRequest>` on `PendingGuestCallback` (`session.rs:489`). Harmless for the micro exe; ATL installs its window thunk in `WM_NCCREATE`, so this is the most likely blocker for the first real-world app.
 
 ## Verification summary
 
 ```bash
-# Phase 0-1 (no new deps)
+# Stages 0–1 (no new deps)
 cargo test -p wie-winapi                       # allocator seeding + disjointness
 cargo test -p wie-runtime micro_gui_window     # WM_CREATE/CREATESTRUCT, then frame hash
 
-# Phase 2a (refactor only)
+# Stage 2a (refactor only)
 cargo test -p wie-winapi                       # green with zero test changes
 
-# Phase 2b-3 (no new deps)
+# Stages 2b–3 (no new deps)
 make -C micro-exes gui_exes
 ./scripts/run-micro-suite.sh gui_exes
 ./scripts/check.sh                             # must stay headless and green
 
-# Phase 4+
+# Stage 4+
 cargo build -p wie-cli --no-default-features   # headless config still builds
 ./target/release/wie-cli run micro-exes/out/gui_blit.exe --gui
 ./target/release/wie-cli run micro-exes/out/gui_blit.exe --screenshot /tmp/f.bmp && open /tmp/f.bmp

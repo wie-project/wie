@@ -41,9 +41,9 @@ Modern apps don't fall off the map — they are the destination:
 
 1. **Complete the D3D9 pipeline** — Vertex-Shader 2.0, remaining shader opcodes and flow control, full fixed-function coverage. (P5, in progress)
 2. **Take rendering to the GPU** — the wgpu/Metal present path already uploads dirty regions; the next step is offloading rasterization to Metal compute, keeping the software renderer as the correctness oracle. (P5b–P5d)
-3. **Widen the API surface** — newer graphics APIs, broader Win32 coverage, and the DLL ecosystem real apps link. See [`docs/gpu-rendering-plan.md`](docs/gpu-rendering-plan.md) and [`docs/missing-winapi-handlers.md`](docs/missing-winapi-handlers.md).
+3. **Widen the API surface** — newer graphics APIs, broader Win32 coverage, and the DLL ecosystem real apps link. See [`docs/missing-winapi-handlers.md`](docs/missing-winapi-handlers.md) for the gap list.
 
-Progress is tracked in [`docs/gpu-rendering-plan.md`](docs/gpu-rendering-plan.md) and the live log at `.slim/deepwork/gui-implementation.md`.
+Progress is tracked in the live log at `.slim/deepwork/gui-implementation.md`.
 
 ---
 
@@ -217,8 +217,6 @@ What actually burns CPU today:
 | Doc | Topic |
 | --- | --- |
 | [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | Symptom → kill-switch playbook |
-| [`docs/phase-gui.md`](docs/phase-gui.md) | GUI program design (P0–P3 done) |
-| [`docs/gpu-rendering-plan.md`](docs/gpu-rendering-plan.md) | Metal / D3D9 textures-blend-depth-shaders plan (P4–P5) |
 | [`docs/missing-winapi-handlers.md`](docs/missing-winapi-handlers.md) | WinAPI surface gaps |
 | [`docs/mt-threads.md`](docs/mt-threads.md) | Multithreading internals |
 | [`docs/7zip.md`](docs/7zip.md) / [`docs/2048.md`](docs/2048.md) / [`docs/snake.md`](docs/snake.md) | Real-app runbooks |

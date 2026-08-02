@@ -707,7 +707,7 @@ Expected: all micros pass (slower, but deterministic).
 
 Run mt_contention benchmark manually to confirm no regression from the PemPin GuestAddr/HostAddr type split:
 ```bash
-./target/release/wie-cli run micro-exes/out/mt_contention.exe -- --phase private --threads 2 --iterations 1000000
+./target/release/wie-cli run micro-exes/out/mt_contention.exe 2 1000000 01
 ```
 Expected: runs without error.
 

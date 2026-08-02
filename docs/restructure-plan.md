@@ -1,6 +1,6 @@
 # Restructure Plan: SoC + KISS, no 3000-line files
 
-Status: Completed (2026-08-02). All phases executed; the 1500-line hard cap is enforced by `scripts/check-file-sizes.sh` in `check.sh`. Applies to all five crates (`wie-pe` → `wie-cpu` → `wie-winapi` → `wie-runtime` → `wie-cli`).
+Status: Completed (2026-08-02). All steps executed; the 1500-line hard cap is enforced by `scripts/check-file-sizes.sh` in `check.sh`. Applies to all five crates (`wie-pe` → `wie-cpu` → `wie-winapi` → `wie-runtime` → `wie-cli`).
 
 ## Context
 
@@ -46,7 +46,7 @@ All other files are <1000 lines. Tests: `micro_gui_window.rs` (933) is the large
 | **B — split everything >~1200 along mapped seams** | Every module becomes one coherent concern; ~10 files stay 800–1200 | Most commits; touches cpu crate where perf risk is highest |
 | C — aggressive (also dedupe helpers, new shared utils, redesign boundaries) | Cleanest end state | Violates KISS; high churn; unverifiable in one pass |
 
-**Recommendation: B**, executed as pure structural moves. Each split follows a verified seam; no new traits, no new abstractions, no cross-cutting rewrites. Reversibility: every step is a file move + `impl`-block relocation, so any phase can be reverted independently.
+**Recommendation: B**, executed as pure structural moves. Each split follows a verified seam; no new traits, no new abstractions, no cross-cutting rewrites. Reversibility: every step is a file move + `impl`-block relocation, so any step can be reverted independently.
 
 ## File-size policy (new, enforced)
 
@@ -94,7 +94,7 @@ Keep as-is (<1500, cohesive): `seh.rs` (1091), `user32/dialog.rs` (1073), `conso
 - `guest_stubs.rs` (1507) → `guest_stubs/` split by table family.
 - Tests stay in `tests/`; `micro_gui_window.rs` (933) untouched.
 
-### wie-cpu (highest perf risk — gate every phase with timings)
+### wie-cpu (highest perf risk — gate every step with timings)
 
 - `jit/lower/` — `mod.rs` (JitCtx + orchestration ~1407–2006), `tlb.rs` (~32–942), `analysis.rs` (liveness ~2006–2680), `sse.rs` (mov/pack/binop ~2688–3650), `string.rs` (~5491–5726), `gpr.rs` (operands + ALU ~5800–6291, 6898–7600), `emit.rs` (IR emission ~6291–6577), `mem.rs` (guest-memory helpers ~6577–6898), `flags.rs` (~7786–8085). Implementation note: helpers that are methods on `JitCtx` keep working via `impl super::JitCtx` blocks in submodule files; `#[inline]` and `unsafe` annotations move verbatim.
 - `exec/` — `mod.rs` (step + `execute_one` ~161–667), `cache.rs` (decode cache ~52–245), `gpr.rs` (~764–1933), `sse.rs` (exec + type enums + JIT-facing helpers ~1281–2643), `string.rs` (REP + host bridge ~2803+).
@@ -106,11 +106,11 @@ Keep as-is (<1500, cohesive): `seh.rs` (1091), `user32/dialog.rs` (1073), `conso
 
 - `lib.rs` (1221) — optional split into `parse.rs`/`map.rs`/`identity.rs`; deferred (below cap).
 
-## Execution phases (each = one or more commits, gated)
+## Execution steps (each = one or more commits, gated)
 
-1. **Phase 0 — baseline**: full gate (`./scripts/check.sh` + micro-suite + `long_loop` timing recorded). No code change.
-2. **Phase 1 — winapi `lib.rs` state extraction** (serial; lib.rs is shared): move state types to `state/`, keep `pub use` surface identical. Gate: build + clippy + workspace tests.
-3. **Phase 2 — winapi module dirs** (parallel lanes, disjoint ownership):
+1. **Baseline**: full gate (`./scripts/check.sh` + micro-suite + `long_loop` timing recorded). No code change.
+2. **winapi `lib.rs` state extraction** (serial; lib.rs is shared): move state types to `state/`, keep `pub use` surface identical. Gate: build + clippy + workspace tests.
+3. **winapi module dirs** (parallel lanes, disjoint ownership):
    - L2a: `dispatch_table/` (names + per-DLL arms)
    - L2b: `d3d9/` + `d3d9_render/`
    - L2c: `kernel32/` (file_io/, misc/)
@@ -118,17 +118,17 @@ Keep as-is (<1500, cohesive): `seh.rs` (1091), `user32/dialog.rs` (1073), `conso
    - L2e: `user32/` (window/, message/, controls/)
    - L2f: `gdi32/state/` + `exception/` + `pthread/locks/` + `guest_stubs/`
    Gate: full workspace gate + micro-suite (gui_exes, dll_tests) + `WIE_RUNTIME_PROFILE` sanity.
-4. **Phase 3 — runtime `session/`** (single lane): splits above. Gate: workspace + micro-suite + `gui_demo` interactive sanity.
-5. **Phase 4 — wie-cpu** (serial lanes, perf-gated after each): `exec/` → `jit/` (config/shared/pipeline) → `jit/lower/` → `mem/` impl-split. Gate per lane: build + clippy + cpu tests + `long_loop` timing; full gate + `check-jit-matrix.sh` after all.
-6. **Phase 5 — guard + docs**: `scripts/check-file-sizes.sh` wired into `check.sh`; CONTRIBUTING.md size policy; README architecture notes updated.
-7. **Phase 6 — final gate**: full `check.sh` + micro-suite + timings; all green.
+4. **runtime `session/`** (single lane): splits above. Gate: workspace + micro-suite + `gui_demo` interactive sanity.
+5. **wie-cpu** (serial lanes, perf-gated after each): `exec/` → `jit/` (config/shared/pipeline) → `jit/lower/` → `mem/` impl-split. Gate per lane: build + clippy + cpu tests + `long_loop` timing; full gate + `check-jit-matrix.sh` after all.
+6. **guard + docs**: `scripts/check-file-sizes.sh` wired into `check.sh`; CONTRIBUTING.md size policy; README architecture notes updated.
+7. **final gate**: full `check.sh` + micro-suite + timings; all green.
 
-## Verification (per phase)
+## Verification (per step)
 
 - `cargo fmt --all` + `cargo clippy --workspace --all-targets -- -D warnings` (lint policy unchanged)
 - `cargo test --workspace` (507 tests must stay green)
-- `make -C micro-exes && ./scripts/run-micro-suite.sh` for phases touching winapi/runtime
-- `long_loop` ≈0.28–0.32 s (release JIT) for any wie-cpu phase; `check-jit-matrix.sh` once after Phase 4
+- `make -C micro-exes && ./scripts/run-micro-suite.sh` for steps touching winapi/runtime
+- `long_loop` ≈0.28–0.32 s (release JIT) for any wie-cpu step; `check-jit-matrix.sh` once after the wie-cpu step
 - No new `#[allow]`, no new `unsafe`, no new `pub` surface (all splits stay `pub(crate)` where the original was)
 
 ## ADR-001: Split by cohesion, not by line count
