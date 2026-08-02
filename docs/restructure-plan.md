@@ -1,6 +1,6 @@
 # Restructure Plan: SoC + KISS, no 3000-line files
 
-Status: Proposed. Applies to all five crates (`wie-pe` → `wie-cpu` → `wie-winapi` → `wie-runtime` → `wie-cli`).
+Status: Completed (2026-08-02). All phases executed; the 1500-line hard cap is enforced by `scripts/check-file-sizes.sh` in `check.sh`. Applies to all five crates (`wie-pe` → `wie-cpu` → `wie-winapi` → `wie-runtime` → `wie-cli`).
 
 ## Context
 
