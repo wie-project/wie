@@ -31,57 +31,56 @@ impl From<u16> for Machine {
     }
 }
 
-/// Loader identity of a PE64 image: fields the runtime must take from the file,
-/// not from Lunar Magic constants.
+/// Loader identity of a parsed PE64 image.
 ///
 /// Entry VA is `image_base + entry_rva` (`AddressOfEntryPoint` in the optional header).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct PeIdentity {
-    /// Host path used when the image was opened (display / diagnostics).
+    /// Host path used when the image was opened (display / diagnostics)
     pub path: String,
 
-    /// Preferred `ImageBase` from the optional header.
+    /// Preferred `ImageBase` from the optional header
     pub image_base: u64,
 
-    /// `AddressOfEntryPoint` RVA.
+    /// `AddressOfEntryPoint` RVA
     pub entry_rva: u64,
 
-    /// Absolute entry VA: `image_base + entry_rva`.
+    /// Absolute entry VA: `image_base + entry_rva`
     pub entry_va: u64,
 
-    /// `SizeOfImage`.
+    /// `SizeOfImage`
     pub size_of_image: u64,
 
-    /// `SizeOfHeaders`.
+    /// `SizeOfHeaders`
     pub size_of_headers: u32,
 
-    /// COFF `Machine`.
+    /// COFF `Machine`
     pub machine: Machine,
 
-    /// Always true for images accepted by this crate (PE32+ only).
+    /// Always true for images accepted by this crate (PE32+ only)
     pub is_pe64: bool,
 
-    /// Number of sections.
+    /// Number of sections
     pub section_count: usize,
 }
 
 /// Guest-visible process identity derived from the host PE path.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProcessIdentity {
-    /// Basename used for command line / module file name (e.g. `heap_alloc.exe`).
+    /// Basename used for command line / module file name (e.g. `heap_alloc.exe`)
     pub module_file_name: String,
 
-    /// Guest full path of the main module (e.g. `C:\App\heap_alloc.exe`).
+    /// Guest full path of the main module (e.g. `C:\App\heap_alloc.exe`)
     pub module_path: String,
 
-    /// Guest current directory (parent of `module_path`, e.g. `C:\App`).
+    /// Guest current directory (parent of `module_path`, e.g. `C:\App`)
     pub current_directory: String,
 
-    /// Default command line (module basename, Windows-style).
+    /// Default command line (module basename, Windows-style)
     pub command_line: String,
 }
 
-/// Builds guest process identity from a host PE path (no PE parsing).
+/// Build guest process identity from a host PE path (no PE parsing).
 #[must_use]
 pub fn process_identity_from_host_path(host_path: &Path) -> ProcessIdentity {
     process_identity_from_host_path_with_args(host_path, &[])
@@ -114,7 +113,7 @@ pub fn process_identity_from_host_path_with_args(
     }
 }
 
-/// Builds a Windows-style process command line from argv[0] and extra args.
+/// Build a Windows-style process command line from argv[0] and extra args.
 ///
 /// Clean-room subset of CommandLineToArgvW / CreateProcess quoting (Microsoft Learn):
 /// wrap in double quotes when empty or when the token contains space/tab/`"`;
@@ -148,13 +147,13 @@ pub fn quote_windows_arg(arg: &str) -> String {
     quoted
 }
 
-/// Parses PE64 bytes and returns loader identity (image base + entry).
+/// Parse PE64 bytes and return loader identity (image base + entry).
 pub fn pe_identity_from_bytes(path: &Path, bytes: &[u8]) -> Result<PeIdentity> {
     let pe = PE::parse(bytes).context("failed to parse PE image")?;
     pe_identity_from_parsed(&pe, path, bytes)
 }
 
-/// Private: extract identity from a pre-parsed PE (no re-parse).
+/// Extract loader identity from a pre-parsed PE without re-parsing.
 pub fn pe_identity_from_parsed(pe: &PE, path: &Path, _bytes: &[u8]) -> Result<PeIdentity> {
     if !pe.is_64 {
         bail!("expected PE64 image, got PE32");
@@ -188,7 +187,7 @@ pub fn pe_identity_from_parsed(pe: &PE, path: &Path, _bytes: &[u8]) -> Result<Pe
     })
 }
 
-/// Reads a PE64 file and returns loader identity.
+/// Read a PE64 file and return loader identity.
 pub fn pe_identity_from_file(path: &Path) -> Result<PeIdentity> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("failed to read PE file: {}", path.display()))?;
@@ -198,53 +197,53 @@ pub fn pe_identity_from_file(path: &Path) -> Result<PeIdentity> {
 /// Basic `PE` image information needed before loading the executable.
 #[derive(Debug, Clone, Serialize)]
 pub struct PeImageSummary {
-    /// Input file path.
+    /// Input file path
     pub path: String,
 
-    /// Whether the image is `PE64`.
+    /// Whether the image is `PE64`
     pub is_pe64: bool,
 
-    /// `COFF` machine field.
+    /// `COFF` machine field
     pub machine: Machine,
 
-    /// Preferred image base.
+    /// Preferred image base
     pub image_base: u64,
 
-    /// `AddressOfEntryPoint` RVA.
+    /// `AddressOfEntryPoint` RVA
     pub entry_rva: u64,
 
-    /// Absolute entry point virtual address (`image_base + entry_rva`).
+    /// Absolute entry point virtual address (`image_base + entry_rva`; see [`PeIdentity::entry_va`])
     pub entry_point_va: u64,
 
-    /// Number of sections.
+    /// Number of sections
     pub section_count: usize,
 
-    /// Number of imported libraries.
+    /// Number of imported libraries
     pub library_count: usize,
 
-    /// Number of imported functions.
+    /// Number of imported functions
     pub import_count: usize,
 }
 
 /// `PE` section metadata needed for image mapping.
 #[derive(Debug, Clone, Serialize)]
 pub struct PeSectionSummary {
-    /// Section name.
+    /// Section name
     pub name: String,
 
-    /// Section virtual address relative to image base.
+    /// Section virtual address relative to image base
     pub virtual_address: u32,
 
-    /// Section virtual size.
+    /// Section virtual size
     pub virtual_size: u32,
 
-    /// Section raw file offset.
+    /// Section raw file offset
     pub pointer_to_raw_data: u32,
 
-    /// Section raw file size.
+    /// Section raw file size
     pub size_of_raw_data: u32,
 
-    /// Absolute section virtual address.
+    /// Absolute section virtual address
     pub virtual_address_va: u64,
 }
 
@@ -283,32 +282,32 @@ const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 /// One section in a [`PeMapPlan`] with final guest protect.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct PeSectionMap {
-    /// Section name (e.g. `.text`).
+    /// Section name (e.g. `.text`)
     pub name: String,
-    /// Section RVA (`VirtualAddress`).
+    /// Section RVA (`VirtualAddress`)
     pub va: u32,
-    /// `VirtualSize` (bytes).
+    /// `VirtualSize` (bytes)
     pub virtual_size: u32,
-    /// Raw file offset.
+    /// Raw file offset
     pub pointer_to_raw_data: u32,
-    /// Raw size on disk.
+    /// Raw size on disk
     pub size_of_raw_data: u32,
-    /// COFF `Characteristics`.
+    /// COFF `Characteristics`
     pub characteristics: u32,
-    /// Derived Windows `PAGE_*` for post-load protect.
+    /// Derived Windows `PAGE_*` for post-load protect
     pub final_protect: u32,
 }
 
-/// Structured PE load plan: one host image arena + differentiated page protects.
+/// Plan for mapping a PE image into guest memory: section layout and page protects.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct PeMapPlan {
-    /// Preferred image base.
+    /// Preferred image base
     pub image_base: u64,
-    /// `SizeOfImage`.
+    /// `SizeOfImage`
     pub size_of_image: u64,
-    /// `SizeOfHeaders`.
+    /// `SizeOfHeaders`
     pub header_size: u32,
-    /// Section map entries with final protects.
+    /// Section map entries with final protects
     pub sections: Vec<PeSectionMap>,
 }
 
@@ -423,44 +422,44 @@ pub fn page_align_image_range(rva: u64, len: u64, size_of_image: u64) -> Option<
 /// Imported `PE` function metadata.
 #[derive(Debug, Clone, Serialize)]
 pub struct PeImportSummary {
-    /// Imported library name.
+    /// Imported library name
     pub library: String,
 
-    /// Imported function name.
+    /// Imported function name
     pub name: String,
 
-    /// Imported ordinal. Zero usually means name import.
+    /// Imported ordinal. Zero usually means name import
     pub ordinal: u16,
 
-    /// Import address table slot virtual address.
+    /// Import address table slot virtual address
     pub iat_slot_va: u64,
 
-    /// Import address table slot relative virtual address.
+    /// Import address table slot relative virtual address
     pub iat_slot_rva: u64,
 
-    /// Hint/name table relative virtual address.
+    /// Hint/name table relative virtual address
     pub hint_name_rva: Option<u64>,
 }
 
 /// Loaded `PE` image layout prepared for runtime mapping.
 #[derive(Debug, Clone, Serialize)]
 pub struct PeLoadedImageSummary {
-    /// Preferred image base (from PE optional header).
+    /// Preferred image base (from PE optional header)
     pub image_base: u64,
 
-    /// `AddressOfEntryPoint` RVA (from PE optional header).
+    /// `AddressOfEntryPoint` RVA (from PE optional header)
     pub entry_rva: u64,
 
-    /// Absolute entry point virtual address (`image_base + entry_rva`).
+    /// Absolute entry point virtual address (`image_base + entry_rva`; see [`PeIdentity::entry_va`])
     pub entry_point_va: u64,
 
-    /// Total image size in memory.
+    /// Total image size in memory
     pub image_size: usize,
 
-    /// Number of copied header bytes.
+    /// Number of copied header bytes
     pub header_size: usize,
 
-    /// Number of sections copied into the memory image.
+    /// Number of sections copied into the memory image
     pub section_count: usize,
 }
 
@@ -485,23 +484,23 @@ impl PeLoadedImageSummary {
 /// Patched fake import entry.
 #[derive(Debug, Clone, Serialize)]
 pub struct PePatchedImport {
-    /// Imported library name.
+    /// Imported library name
     pub library: String,
 
-    /// Imported function name, or an `ORDINAL` label.
+    /// Imported function name, or an `ORDINAL` label
     pub name: String,
 
-    /// Runtime `IAT` slot virtual address.
+    /// Runtime `IAT` slot virtual address
     pub iat_slot_va: u64,
 
-    /// Runtime `IAT` slot relative virtual address.
+    /// Runtime `IAT` slot relative virtual address
     pub iat_slot_rva: u64,
 
-    /// Fake API target virtual address written into the `IAT` slot.
+    /// Fake API target virtual address written into the `IAT` slot
     pub fake_target_va: u64,
 }
 
-/// Reads and inspects a `PE` image from disk.
+/// Read and inspect a `PE` image from disk.
 pub fn inspect_pe_file(path: &Path) -> Result<PeImageSummary> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("failed to read PE file: {}", path.display()))?;
@@ -509,7 +508,7 @@ pub fn inspect_pe_file(path: &Path) -> Result<PeImageSummary> {
     inspect_pe_bytes(path, &bytes)
 }
 
-/// Inspects a `PE` image from bytes.
+/// Inspect a `PE` image from bytes.
 pub fn inspect_pe_bytes(path: &Path, bytes: &[u8]) -> Result<PeImageSummary> {
     let pe = PE::parse(bytes).context("failed to parse PE image")?;
 
@@ -532,7 +531,7 @@ pub fn inspect_pe_bytes(path: &Path, bytes: &[u8]) -> Result<PeImageSummary> {
     })
 }
 
-/// Reads section metadata from a `PE` image on disk.
+/// Read section metadata from a `PE` image on disk.
 pub fn inspect_pe_sections(path: &Path) -> Result<Vec<PeSectionSummary>> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("failed to read PE file: {}", path.display()))?;
@@ -540,7 +539,7 @@ pub fn inspect_pe_sections(path: &Path) -> Result<Vec<PeSectionSummary>> {
     inspect_pe_sections_bytes(&bytes)
 }
 
-/// Reads section metadata from `PE` bytes.
+/// Read section metadata from `PE` bytes.
 pub fn inspect_pe_sections_bytes(bytes: &[u8]) -> Result<Vec<PeSectionSummary>> {
     let pe = PE::parse(bytes).context("failed to parse PE image")?;
 
@@ -575,7 +574,7 @@ pub fn inspect_pe_sections_bytes(bytes: &[u8]) -> Result<Vec<PeSectionSummary>> 
     Ok(sections)
 }
 
-/// Reads import metadata from a `PE` image on disk.
+/// Read import metadata from a `PE` image on disk.
 pub fn inspect_pe_imports(path: &Path) -> Result<Vec<PeImportSummary>> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("failed to read PE file: {}", path.display()))?;
@@ -583,7 +582,7 @@ pub fn inspect_pe_imports(path: &Path) -> Result<Vec<PeImportSummary>> {
     inspect_pe_imports_bytes(&bytes)
 }
 
-/// Reads import metadata from `PE` bytes.
+/// Read import metadata from `PE` bytes.
 pub fn inspect_pe_imports_bytes(bytes: &[u8]) -> Result<Vec<PeImportSummary>> {
     let pe = PE::parse(bytes).context("failed to parse PE image")?;
     inspect_pe_imports_from_parsed(&pe, bytes)
@@ -732,6 +731,7 @@ fn read_import_thunks(
     Ok(())
 }
 
+/// Map an RVA to a raw file offset via the section table.
 pub fn rva_to_file_offset(pe: &PE<'_>, rva: u32) -> Result<usize> {
     rva_to_file_offset_u64(pe, u64::from(rva))
 }
@@ -852,7 +852,7 @@ fn checked_add_usize(left: usize, right: usize) -> Result<usize> {
     left.checked_add(right).context("usize addition overflow")
 }
 
-/// Builds a Windows-loader-like memory image from a `PE64` file.
+/// Build a Windows-loader-like memory image from a `PE64` file.
 pub fn build_loaded_image(path: &Path) -> Result<(Vec<u8>, PeLoadedImageSummary)> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("failed to read PE file: {}", path.display()))?;
@@ -860,7 +860,7 @@ pub fn build_loaded_image(path: &Path) -> Result<(Vec<u8>, PeLoadedImageSummary)
     build_loaded_image_bytes(&bytes)
 }
 
-/// Builds a Windows-loader-like memory image from `PE64` bytes.
+/// Build a Windows-loader-like memory image from `PE64` bytes.
 pub fn build_loaded_image_bytes(bytes: &[u8]) -> Result<(Vec<u8>, PeLoadedImageSummary)> {
     let pe = PE::parse(bytes).context("failed to parse PE image")?;
     build_loaded_image_from_parsed(&pe, bytes)
@@ -952,12 +952,12 @@ fn copy_section(
     Ok(())
 }
 
-/// Builds a loaded image and patches `IAT` slots with caller-provided fake VAs.
+/// Build a loaded image and patch `IAT` slots with caller-provided fake VAs.
 ///
 /// `fake_target` maps each import to a dense-encoded fake API address (see
 /// `wie_winapi::fake_va`). The resolver is invoked once per IAT slot.
 ///
-/// Reads the file once and passes bytes through to avoid a double read.
+/// Read the file once and pass bytes through to avoid a double read.
 pub fn build_loaded_image_with_fake_imports_with<F>(
     path: &Path,
     mut fake_target: F,
@@ -976,7 +976,7 @@ where
     Ok((image, summary, patched))
 }
 
-/// Loads a PE64 image directly into guest memory through a writer callback.
+/// Load a PE64 image directly into guest memory through a writer callback.
 ///
 /// Single file read, single PE parse. Returns the loaded image summary, section
 /// map plan (no re-read needed), and patched import info. No intermediate
@@ -1005,7 +1005,7 @@ where
     load_pe_direct_from_bytes(&bytes, image_base, image_size, mem_write, fake_target)
 }
 
-/// Like [`load_pe_direct_from_bytes`] but takes a pre-parsed [`PE`] reference,
+/// Like [`load_pe_direct_from_bytes`] but take a pre-parsed [`PE`] reference,
 /// avoiding a redundant parse when the caller already parsed the PE bytes
 /// (e.g., to extract identity before mapping guest memory).
 pub fn load_pe_direct_from_parsed<F, W>(
@@ -1088,7 +1088,7 @@ where
     Ok((summary, map_plan, patched))
 }
 
-/// Like [`load_pe_direct`] but takes pre-read PE bytes instead of a path,
+/// Like [`load_pe_direct`] but take pre-read PE bytes instead of a path,
 /// allowing the caller to parse the identity *and* load with a single file read.
 pub fn load_pe_direct_from_bytes<F, W>(
     bytes: &[u8],
@@ -1147,7 +1147,7 @@ where
     Ok(patched)
 }
 
-/// Patches `IAT` slots using a dense fake-VA resolver.
+/// Patch `IAT` slots using a dense fake-VA resolver.
 pub fn patch_loaded_image_imports_with<F>(
     image: &mut [u8],
     imports: &[PeImportSummary],

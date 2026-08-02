@@ -17,7 +17,7 @@
 //!   `dlgVer = 1, signature = 0, helpID` (28 bytes).
 //!
 //! Both are detected and parsed. `DLGTEMPLATEEX` (`dlgVer = 1`,
-//! `signature = 0xFFFF`) is deferred — it is skipped with a comment.
+//! `signature = 0xFFFF`) is not parsed — it is skipped with a comment.
 //!
 //! Dialog units (DLUs) convert to pixels at the standard `GetDialogBaseUnits`
 //! 8×16 font: `px = dlu * base / 4` on the x axis and `dlu * base / 8` on the
@@ -75,72 +75,72 @@ const MAX_STRING_WORDS: usize = 4096;
 /// Axis pixel size derived from dialog units.
 ///
 /// `x`, `y` are the dialog origin; `cx`, `cy` the size. Stored in pixels
-/// because dialog construction (Step 2) works in pixels.
+/// because dialog construction works in pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PixelRect {
-    /// Left edge, pixels.
+    /// Left edge, pixels
     pub x: i32,
-    /// Top edge, pixels.
+    /// Top edge, pixels
     pub y: i32,
-    /// Width, pixels.
+    /// Width, pixels
     pub cx: i32,
-    /// Height, pixels.
+    /// Height, pixels
     pub cy: i32,
 }
 
 /// One parsed `RT_DIALOG` template (standard `DLGTEMPLATE`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DialogTemplate {
-    /// Template id (the resource name at the second directory level). Named
-    /// resources have no numeric id and come back as `0`; they are not
-    /// addressable by `DialogBoxParam`, which resolves ids only.
+    /// Template id (the resource name at the second directory level); named
+    /// resources have no numeric id and come back as `0` (unaddressable by
+    /// `DialogBoxParam`, which resolves ids only)
     pub name: u16,
-    /// Template style (`DS_*`/`WS_*` bits).
+    /// Template style (`DS_*`/`WS_*` bits)
     pub style: u32,
-    /// Template extended style.
+    /// Template extended style
     pub ex_style: u32,
-    /// Origin x, dialog units.
+    /// Origin x, dialog units
     pub x: i16,
-    /// Origin y, dialog units.
+    /// Origin y, dialog units
     pub y: i16,
-    /// Width, dialog units.
+    /// Width, dialog units
     pub cx: i16,
-    /// Height, dialog units.
+    /// Height, dialog units
     pub cy: i16,
-    /// Caption text (ordinal captions referencing the string table are empty).
+    /// Caption text (ordinal captions referencing the string table are empty)
     pub title: String,
-    /// `DS_SETFONT` point size, when present.
+    /// `DS_SETFONT` point size, when present
     pub font_point: Option<u16>,
-    /// `DS_SETFONT` typeface name, when present.
+    /// `DS_SETFONT` typeface name, when present
     pub font_face: Option<String>,
-    /// Origin/size converted to pixels at 2 px per DLU.
+    /// Origin/size converted to pixels at 2 px per DLU
     pub pixel_rect: PixelRect,
-    /// Controls in template order.
+    /// Controls in template order
     pub items: Vec<DialogItemTemplate>,
 }
 
 /// One parsed `DLGITEMTEMPLATE` (dialog control).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DialogItemTemplate {
-    /// Control id (the `WM_COMMAND`/`GetDlgItem` handle).
+    /// Control id (the `WM_COMMAND`/`GetDlgItem` handle)
     pub id: u16,
-    /// Control style bits.
+    /// Control style bits
     pub style: u32,
-    /// Control extended style.
+    /// Control extended style
     pub ex_style: u32,
-    /// Origin x relative to the dialog, dialog units.
+    /// Origin x relative to the dialog, dialog units
     pub x: i16,
-    /// Origin y relative to the dialog, dialog units.
+    /// Origin y relative to the dialog, dialog units
     pub y: i16,
-    /// Width, dialog units.
+    /// Width, dialog units
     pub cx: i16,
-    /// Height, dialog units.
+    /// Height, dialog units
     pub cy: i16,
-    /// Control class (ordinal or name).
+    /// Control class (ordinal or name)
     pub class: ItemClass,
-    /// Control text (ordinal titles referencing the string table are empty).
+    /// Control text (ordinal titles referencing the string table are empty)
     pub title: String,
-    /// Origin/size converted to pixels at 2 px per DLU.
+    /// Origin/size converted to pixels at 2 px per DLU
     pub pixel_rect: PixelRect,
 }
 
@@ -450,13 +450,13 @@ fn rva_to_file(image: &[u8], sections: &[PeSectionMap], rva: u32) -> Option<usiz
 
 /// Parse one dialog template from its resource bytes.
 ///
-/// Skips `DLGTEMPLATEEX` (deferred) and any template whose items run past the
+/// Skips `DLGTEMPLATEEX` and any template whose items run past the
 /// byte slice (malformed → treated as absent).
 fn parse_dialog_template(template_id: u16, bytes: &[u8]) -> Option<DialogTemplate> {
     let word0 = read_u16_at(bytes, 0)?;
     let word1 = read_u16_at(bytes, 2)?;
 
-    // DLGTEMPLATEEX (dlgVer=1, signature=0xFFFF): deferred follow-up.
+    // DLGTEMPLATEEX (dlgVer=1, signature=0xFFFF): not parsed.
     if word0 == 1 && word1 == 0xFFFF {
         return None;
     }
@@ -875,7 +875,7 @@ mod tests {
 
     #[test]
     fn dlg_template_ex_is_deferred() {
-        // dlgVer=1, signature=0xFFFF → skipped until the follow-up lane.
+        // dlgVer=1, signature=0xFFFF → skipped (unsupported).
         let bytes = [1_u8, 0, 0xFF, 0xFF];
         assert!(parse_dialog_template(1, &bytes).is_none());
     }
