@@ -415,6 +415,22 @@ impl RuntimeSession {
     }
 }
 
+impl Drop for RuntimeSession {
+    fn drop(&mut self) {
+        // Reap guest worker threads when the explicit ExitProcess path
+        // (session/pump.rs) never ran: early CLI abort, headless idle exit,
+        // budget exhaustion, or test teardown. Without this the JoinHandles
+        // go out of scope unjoined and workers leak as detached daemons.
+        //
+        // Idempotency: `join_workers_impl` drains `worker_joins` to empty, so
+        // after ExitProcess (or with zero spawned workers) this is a no-op.
+        // Guarding on emptiness also skips re-running the wake/finish pass.
+        if !self.process.worker_joins.is_empty() {
+            self.process.join_workers();
+        }
+    }
+}
+
 /// [`Cold`] diagnostic for invalid memory access — 32 stack slot reads + object
 /// dump + vtable dump.  Kept out of line so the normal `run_until_stop` hot path
 /// does not pay the I-cache cost of this heavyweight crash instrumentation.
