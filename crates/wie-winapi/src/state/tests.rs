@@ -2297,6 +2297,456 @@ fn test_create_status_window_a_mirrors_with_ansi_text() {
     );
 }
 
+// ── Task 3.1: STATUSCLASSNAMEW status bar + SB_* messages ───────────────
+
+/// A top-level window with a STATUSCLASSNAMEW status-bar child, for the SB_*
+/// message and paint tests. The bar sits at the bottom strip (y 76..100) of
+/// the 200x100 top window — the classic notepad layout.
+fn push_status_bar_pair(state: &mut WinApiState) -> (u64, u64) {
+    let top = 0x6610_0031_u64;
+    let bar = 0x6610_0032_u64;
+    let ws = state.window_state();
+    ws.windows.push(WindowRecord {
+        handle: crate::handles::Hwnd::from(top),
+        title: "Top".to_owned(),
+        visible: true,
+        width: 200,
+        height: 100,
+        ..Default::default()
+    });
+    ws.windows.push(WindowRecord {
+        handle: crate::handles::Hwnd::from(bar),
+        parent_handle: crate::handles::Hwnd::from(top),
+        control_kind: Some(crate::user32::controls::ControlClassKind::StatusBar),
+        control_text: String::new(),
+        menu_handle: 0x151,
+        visible: true,
+        x: 0,
+        y: 76,
+        width: 200,
+        height: 24,
+        ..Default::default()
+    });
+    (top, bar)
+}
+
+#[test]
+fn test_status_bar_class_name_resolves_to_host_class() {
+    use crate::user32::WindowClassIdentifier;
+    use crate::user32::controls::ControlClassKind;
+    assert_eq!(
+        ControlClassKind::from_identifier(&WindowClassIdentifier::Name(
+            "msctls_statusbar32".to_owned()
+        )),
+        Some(ControlClassKind::StatusBar),
+        "STATUSCLASSNAMEW must resolve to the built-in StatusBar class"
+    );
+    // Class-name lookup is case-insensitive like the other built-ins.
+    assert_eq!(
+        ControlClassKind::from_identifier(&WindowClassIdentifier::Name(
+            "MSCTLS_STATUSBAR32".to_owned()
+        )),
+        Some(ControlClassKind::StatusBar)
+    );
+}
+
+/// Write `parts` as a guest int array at `addr` (the SB_SETPARTS lParam).
+fn write_guest_int_array(engine: &mut IcedCpu, addr: u64, parts: &[i32], addr_name: &str) {
+    for (index, part) in parts.iter().enumerate() {
+        let off = u64::try_from(index.saturating_mul(4)).unwrap_or(0);
+        engine
+            .mem_write(addr.saturating_add(off), &part.to_le_bytes())
+            .expect(addr_name);
+    }
+}
+
+/// Read a guest int array of `count` entries at `addr`.
+fn read_guest_int_array(engine: &mut IcedCpu, addr: u64, count: usize) -> Vec<i32> {
+    let mut out = Vec::with_capacity(count);
+    for index in 0..count {
+        let off = u64::try_from(index.saturating_mul(4)).unwrap_or(0);
+        let mut bytes = [0_u8; 4];
+        engine
+            .mem_read(addr.saturating_add(off), &mut bytes)
+            .expect("read guest int array");
+        out.push(i32::from_le_bytes(bytes));
+    }
+    out
+}
+
+#[test]
+fn test_status_bar_sb_setparts_stores_widths_and_getparts_returns_count() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (_top, bar) = push_status_bar_pair(&mut state);
+
+    // SB_SETPARTS(3, [80, 160, -1]): -1 = extend to the right edge.
+    let parts_addr = 0x6000;
+    write_guest_int_array(&mut engine, parts_addr, &[80, 160, -1], "write parts");
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        bar,
+        crate::user32::controls::SB_SETPARTS,
+        3,
+        parts_addr,
+    )
+    .expect("setparts handled")
+    .expect("some result");
+    assert_eq!(r, 1, "SB_SETPARTS must return TRUE");
+
+    let ui = control_ui(&state, bar);
+    assert_eq!(
+        ui.part_rights,
+        vec![80, 160, -1],
+        "SB_SETPARTS must store the part right-edge widths"
+    );
+
+    // SB_GETPARTS(4, buffer): copies the stored widths and returns the count.
+    let get_addr = 0x6100;
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        bar,
+        crate::user32::controls::SB_GETPARTS,
+        4,
+        get_addr,
+    )
+    .expect("getparts handled")
+    .expect("some result");
+    assert_eq!(r, 3, "SB_GETPARTS must return the part count");
+    assert_eq!(
+        read_guest_int_array(&mut engine, get_addr, 3),
+        vec![80, 160, -1],
+        "SB_GETPARTS must copy the stored widths"
+    );
+}
+
+#[test]
+fn test_status_bar_sb_settextw_stores_part_text_and_ignores_flags() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (_top, bar) = push_status_bar_pair(&mut state);
+
+    let text_addr = 0x6000;
+    write_guest_utf16(&mut engine, text_addr, "Ln 1, Col 1");
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        bar,
+        crate::user32::controls::SB_SETTEXTW,
+        0,
+        text_addr,
+    )
+    .expect("settext ok")
+    .expect("some result");
+    assert_eq!(r, 1, "SB_SETTEXTW must return TRUE");
+
+    write_guest_utf16(&mut engine, text_addr, "CRLF");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        bar,
+        crate::user32::controls::SB_SETTEXTW,
+        1,
+        text_addr,
+    )
+    .expect("settext1 ok")
+    .expect("some result");
+
+    // SBT_NOBORDERS (0x100) OR'd into the part index is ignored — the part
+    // index is the low byte, so 0x100 | 2 still targets part 2.
+    write_guest_utf16(&mut engine, text_addr, "UTF-8");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        bar,
+        crate::user32::controls::SB_SETTEXTW,
+        u64::from(crate::user32::controls::SBT_NOBORDERS | 2),
+        text_addr,
+    )
+    .expect("settext2 ok")
+    .expect("some result");
+
+    let ui = control_ui(&state, bar);
+    assert_eq!(
+        ui.part_texts,
+        vec!["Ln 1, Col 1", "CRLF", "UTF-8"],
+        "SB_SETTEXTW must store one text per part"
+    );
+}
+
+#[test]
+fn test_status_bar_sb_gettextw_and_gettextlengthw_round_trip() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (_top, bar) = push_status_bar_pair(&mut state);
+
+    let text_addr = 0x6000;
+    write_guest_utf16(&mut engine, text_addr, "Ln 1, Col 1");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        bar,
+        crate::user32::controls::SB_SETTEXTW,
+        0,
+        text_addr,
+    )
+    .expect("settext ok")
+    .expect("some result");
+
+    // SB_GETTEXTLENGTHW(0): the length in WCHARs (excluding the NUL).
+    let len = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        bar,
+        crate::user32::controls::SB_GETTEXTLENGTHW,
+        0,
+        0,
+    )
+    .expect("getlen ok")
+    .expect("some result");
+    assert_eq!(len, 11, "SB_GETTEXTLENGTHW must return the char count");
+
+    // SB_GETTEXTW(0, buffer): copies the text, returns the char count.
+    let get_addr = 0x6100;
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        bar,
+        crate::user32::controls::SB_GETTEXTW,
+        0,
+        get_addr,
+    )
+    .expect("gettext ok")
+    .expect("some result");
+    assert_eq!(r, 11, "SB_GETTEXTW must return the char count");
+    assert_eq!(
+        read_guest_utf16_raw(&mut engine, get_addr, 64),
+        "Ln 1, Col 1",
+        "SB_GETTEXTW must round-trip the stored text"
+    );
+}
+
+#[test]
+fn test_status_bar_paint_draws_parts_with_client_edge_and_text() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (top, bar) = push_status_bar_pair(&mut state);
+
+    // 3 parts [80, 160, -1]; part 0 stays empty, parts 1/2 get text.
+    let parts_addr = 0x6000;
+    write_guest_int_array(&mut engine, parts_addr, &[80, 160, -1], "write parts");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        bar,
+        crate::user32::controls::SB_SETPARTS,
+        3,
+        parts_addr,
+    )
+    .expect("setparts ok")
+    .expect("some result");
+    let text_addr = 0x6100;
+    write_guest_utf16(&mut engine, text_addr, "EOLN");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        bar,
+        crate::user32::controls::SB_SETTEXTW,
+        1,
+        text_addr,
+    )
+    .expect("settext1 ok")
+    .expect("some result");
+    write_guest_utf16(&mut engine, text_addr, "UTF-8");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        bar,
+        crate::user32::controls::SB_SETTEXTW,
+        2,
+        text_addr,
+    )
+    .expect("settext2 ok")
+    .expect("some result");
+
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        bar,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint ok")
+    .expect("some result");
+    // The paint deferred its publish; flush it like the runtime does.
+    state.present().drain_pending_publishes();
+
+    let frame = state
+        .present()
+        .published
+        .get(&crate::handles::Hwnd::from(top))
+        .expect("published frame")
+        .clone();
+    assert_eq!((frame.width, frame.height), (200, 100));
+    let px = |col: i32, row: i32| -> u32 {
+        let idx = (usize::try_from(row).unwrap_or(0) * usize::try_from(frame.width).unwrap_or(0))
+            .saturating_add(usize::try_from(col).unwrap_or(0));
+        frame.pixels.get(idx).copied().unwrap_or(0)
+    };
+
+    // The strip sits at the bottom (y 76..100): BTNFACE fill with a light
+    // client edge on top and the shadow edge at the bottom.
+    assert_eq!(px(10, 77), 0x00F0_F0F0, "BTNFACE inside the strip");
+    assert_eq!(px(10, 76), 0x00FF_FFFF, "light client edge on the top");
+    assert_eq!(px(10, 99), 0x00A0_A0A0, "shadow edge at the bottom");
+
+    // The text is inset below the border: no ink on the edge rows.
+    assert_eq!(px(180, 76), 0x00FF_FFFF, "no text ink on the top edge");
+
+    // Non-face ink in the strip interior (rows 78..98), per part cell.
+    let ink_in = |range: std::ops::Range<i32>| -> usize {
+        range
+            .filter(|col| (78..98).any(|row| px(*col, row) != 0x00F0_F0F0))
+            .count()
+    };
+    assert_eq!(ink_in(10..80), 0, "an empty part stays the plain strip");
+    assert!(ink_in(81..160) > 0, "part 1 text (EOLN) must render ink");
+    assert!(ink_in(161..200) > 0, "part 2 text (UTF-8) must render ink");
+}
+
+#[test]
+fn test_status_bar_wm_size_sizes_and_positions_bar_in_parent() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let top = 0x6610_0041_u64;
+    let bar = 0x6610_0042_u64;
+    let ws = state.window_state();
+    ws.windows.push(WindowRecord {
+        handle: crate::handles::Hwnd::from(top),
+        title: "Top".to_owned(),
+        visible: true,
+        width: 200,
+        height: 100,
+        ..Default::default()
+    });
+    ws.windows.push(WindowRecord {
+        handle: crate::handles::Hwnd::from(bar),
+        parent_handle: crate::handles::Hwnd::from(top),
+        control_kind: Some(crate::user32::controls::ControlClassKind::StatusBar),
+        style: crate::user32::WS_CHILD | crate::user32::controls::CCS_BOTTOM,
+        visible: true,
+        ..Default::default()
+    });
+
+    // The default height is the control font's line height plus the two
+    // client-edge border rows — the same formula the WM_SIZE handler uses.
+    let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
+    let default_key = crate::gdi32::FontKey::default();
+    let resolved = font_engine.resolve(&default_key, 16).expect("default font");
+    let line_h = resolved.line_height();
+    state.gdi_state().font_engine = font_engine;
+    let expected_height = line_h.saturating_add(4);
+
+    // notepad sends SendMessageW(hStatusBar, WM_SIZE, 0, 0) after creating
+    // the bar; the bar must size itself to the parent client and sit flush
+    // at the parent's bottom edge (CCS_BOTTOM).
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        bar,
+        crate::user32::WM_SIZE,
+        0,
+        0,
+    )
+    .expect("wmsize handled")
+    .expect("some result");
+
+    let window = state
+        .window_state()
+        .windows
+        .iter()
+        .find(|w| w.handle == crate::handles::Hwnd::from(bar))
+        .expect("bar record");
+    assert_eq!(window.width, 200, "the bar spans the parent width");
+    assert_eq!(
+        window.height, expected_height,
+        "the default height is font-derived"
+    );
+    assert_eq!(window.x, 0);
+    assert_eq!(
+        window.y,
+        100 - expected_height,
+        "CCS_BOTTOM: the bar sits flush at the parent bottom"
+    );
+}
+
+#[test]
+fn test_edit_wm_vscroll_delivers_en_vscroll_to_parent() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (parent, edit) = push_multiline_edit(&mut state, "line1\nline2\nline3\nline4\nline5");
+
+    // SB_LINEDOWN (1) scrolls the multiline EDIT (only 1 visible row in a
+    // 20 px client) → the parent gets WM_COMMAND(MAKEWPARAM(12, EN_VSCROLL)).
+    let result = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::wm::WinMsg::WM_VSCROLL.as_u32(),
+        1, // SB_LINEDOWN
+        0,
+    );
+    let error = result.expect_err("WM_VSCROLL must deliver EN_VSCROLL");
+    let signal = error
+        .downcast_ref::<WinApiControlSignal>()
+        .expect("control signal");
+    assert!(
+        matches!(
+            signal,
+            WinApiControlSignal::GuestCallbackRequested { request }
+                if request.window_handle == parent
+                    && request.message == 0x0111
+                    && request.word_parameter == 0x0602_000C
+        ),
+        "WM_VSCROLL must deliver WM_COMMAND(MAKEWPARAM(12, EN_VSCROLL)), \
+         got {signal:?}"
+    );
+}
+
+#[test]
+fn test_edit_wm_hscroll_delivers_en_hscroll_to_parent() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (parent, edit) = push_multiline_edit(&mut state, "line1\nline2");
+
+    let result = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::wm::WinMsg::WM_HSCROLL.as_u32(),
+        0,
+        0,
+    );
+    let error = result.expect_err("WM_HSCROLL must deliver EN_HSCROLL");
+    let signal = error
+        .downcast_ref::<WinApiControlSignal>()
+        .expect("control signal");
+    assert!(
+        matches!(
+            signal,
+            WinApiControlSignal::GuestCallbackRequested { request }
+                if request.window_handle == parent
+                    && request.message == 0x0111
+                    && request.word_parameter == 0x0601_000C
+        ),
+        "WM_HSCROLL must deliver WM_COMMAND(MAKEWPARAM(12, EN_HSCROLL)), \
+         got {signal:?}"
+    );
+}
+
 // --- Comdlg32 ---
 
 /// Read a NUL-terminated UTF-16LE guest string at `addr` (up to `max_units`).
@@ -4922,6 +5372,8 @@ struct ControlUiSnapshot {
     modified: bool,
     first_visible_line: usize,
     tab_stops: Vec<u16>,
+    part_rights: Vec<i32>,
+    part_texts: Vec<String>,
 }
 
 impl ControlUiSnapshot {
@@ -4970,7 +5422,14 @@ impl ControlUiSnapshot {
                 Some(ControlState::ComboBox { items, .. }) => {
                     snap.items = items.clone();
                 }
-                Some(ControlState::Static) | Some(ControlState::StatusBar) | None => {}
+                Some(ControlState::StatusBar {
+                    part_rights,
+                    part_texts,
+                }) => {
+                    snap.part_rights = part_rights.clone();
+                    snap.part_texts = part_texts.clone();
+                }
+                Some(ControlState::Static) | None => {}
             }
         }
         snap
@@ -5210,7 +5669,7 @@ fn test_edit_char_replaces_selection_and_delivers_en_change() {
             WinApiControlSignal::GuestCallbackRequested { request }
                 if request.window_handle == parent
                     && request.message == 0x0111
-                    && request.word_parameter == 0x0001_000C
+                    && request.word_parameter == 0x0300_000C
         ),
         "WM_CHAR must deliver WM_COMMAND(MAKEWPARAM(12, EN_CHANGE)), got {signal:?}"
     );
@@ -6015,7 +6474,7 @@ fn test_edit_em_replacesel_replaces_selection_and_fires_en_change() {
             WinApiControlSignal::GuestCallbackRequested { request }
                 if request.window_handle == parent
                     && request.message == 0x0111
-                    && request.word_parameter == 0x0001_000C
+                    && request.word_parameter == 0x0300_000C
         ),
         "EM_REPLACESEL must deliver WM_COMMAND(MAKEWPARAM(12, EN_CHANGE)), got {signal:?}"
     );
@@ -6116,16 +6575,25 @@ fn vscroll_offset(
     thumb: u16,
 ) -> usize {
     let wparam = u64::from(code) | (u64::from(thumb) << 16);
-    crate::user32::controls::dispatch_control_proc(
+    let result = crate::user32::controls::dispatch_control_proc(
         engine,
         state,
         edit,
         crate::user32::wm::WinMsg::WM_VSCROLL.as_u32(),
         wparam,
         0,
-    )
-    .expect("vscroll ok")
-    .expect("some result");
+    );
+    match result {
+        // The scroll did not move the offset (no notification).
+        Ok(_) => {}
+        // A real scroll delivers EN_VSCROLL to the parent (Task 3.1), which
+        // surfaces as a GuestCallbackRequested signal — still a success.
+        Err(error) => {
+            let _ = error
+                .downcast_ref::<WinApiControlSignal>()
+                .expect("vscroll ok");
+        }
+    }
     control_ui(state, edit).first_visible_line
 }
 

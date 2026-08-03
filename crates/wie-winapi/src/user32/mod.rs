@@ -206,7 +206,15 @@ pub(crate) const EM_SELECTIONTYPE: u32 = wm::WinMsg::EM_SELECTIONTYPE.as_u32();
 // Control notification codes / DLGC_* dialog codes (winuser.h).
 pub(crate) const BN_CLICKED: u64 = 0;
 /// EDIT notification code: the text changed.
-pub(crate) const EN_CHANGE: u64 = 1;
+///
+/// winuser.h value 0x0300 (the EN_* codes live in the 0x0100..0x0602 range,
+/// NOT the small LBN_*/BN_* numbers — the previous 1 never matched a guest's
+/// `HIWORD(wParam) == EN_CHANGE` check, e.g. notepad's status-bar update).
+pub(crate) const EN_CHANGE: u64 = 0x0300;
+/// EDIT notification code: the user scrolled horizontally (winuser.h 0x0601).
+pub(crate) const EN_HSCROLL: u64 = 0x0601;
+/// EDIT notification code: the user scrolled vertically (winuser.h 0x0602).
+pub(crate) const EN_VSCROLL: u64 = 0x0602;
 /// LISTBOX notification code: the selection changed.
 pub(crate) const LBN_SELCHANGE: u64 = 1;
 /// `WM_GETDLGCODE` for an EDIT: wants character input. (WinUser.h: 0x0080;

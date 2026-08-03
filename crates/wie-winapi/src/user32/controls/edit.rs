@@ -1880,6 +1880,19 @@ pub(super) fn edit_notify_change(state: &mut WinApiState, hwnd: u64) -> Result<O
     deliver_command(state, hwnd, command_wparam)
 }
 
+/// Send an `EN_*` scroll notification (`EN_VSCROLL` / `EN_HSCROLL`) as
+/// WM_COMMAND(MAKEWPARAM(id, notify)) to the parent — the EDIT scrolled, so
+/// notepad re-reads the caret position into its status bar.
+pub(super) fn edit_notify_scroll(
+    state: &mut WinApiState,
+    hwnd: u64,
+    notify: u64,
+) -> Result<Option<u64>> {
+    let id = find_window(state, hwnd).map_or(0, |w| w.menu_handle);
+    let command_wparam = make_command_wparam(id, notify);
+    deliver_command(state, hwnd, command_wparam)
+}
+
 /// Whether the Shift key is held, per the guest keyboard state.
 #[must_use]
 fn shift_is_down(state: &WinApiState) -> bool {

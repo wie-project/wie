@@ -477,9 +477,35 @@ pub enum WinApiId {
     User32Loadmenuw = 432,
     /// Appended here (not adjacent to User32Loadmenuw) to avoid renumbering the entire enum.
     User32Isclipboardformatavailable = 433,
+    /// Appended here (not adjacent to Shell32Dragacceptfiles) to avoid renumbering the entire enum.
+    Shell32Dragqueryfilew = 434,
+    /// Appended here (not adjacent to Shell32Dragqueryfilew) to avoid renumbering the entire enum.
+    Shell32Dragqueryfilea = 435,
+    /// Appended here (not adjacent to Shell32Dragqueryfilea) to avoid renumbering the entire enum.
+    Shell32Dragquerypoint = 436,
+    /// Appended here (not adjacent to Shell32Dragquerypoint) to avoid renumbering the entire enum.
+    Shell32Dragfinish = 437,
+    /// Appended here (not adjacent to Kernel32Localfree) to avoid renumbering the entire enum.
+    Kernel32Locallock = 438,
+    /// Appended here (not adjacent to Kernel32Locallock) to avoid renumbering the entire enum.
+    Kernel32Localunlock = 439,
+    /// Appended here (not adjacent to Kernel32Gettimezoneinformation) to avoid renumbering the entire enum.
+    Kernel32Gettimeformatw = 440,
+    /// Appended here (not adjacent to Kernel32Gettimeformatw) to avoid renumbering the entire enum.
+    Kernel32Getdateformatw = 441,
+    /// Appended here (not adjacent to User32Setdlgitemtextw) to avoid renumbering the entire enum.
+    User32Getdlgitemint = 442,
+    /// Appended here (not adjacent to User32Getdlgitemint) to avoid renumbering the entire enum.
+    User32Setdlgitemint = 443,
+    /// Appended here (not adjacent to User32Sendmessagew) to avoid renumbering the entire enum.
+    User32Senddlgitemmessagew = 444,
+    /// Appended here (not adjacent to Shell32Dragacceptfiles) to avoid renumbering the entire enum.
+    Shell32Shellaboutw = 445,
+    /// Appended here (not adjacent to Shell32Shellaboutw) to avoid renumbering the entire enum.
+    Shell32Shellexecutew = 446,
 }
 
-pub const WINAPI_ID_COUNT: usize = 434;
+pub const WINAPI_ID_COUNT: usize = 447;
 
 impl WinApiId {
     /// Discriminant as `u16` (`#[repr(u16)]`).
@@ -518,7 +544,7 @@ const _: () = assert!(
 );
 
 /// Highest-numbered [`WinApiId`]; update alongside the enum's final variant.
-const LAST_WINAPI_ID: WinApiId = WinApiId::User32Isclipboardformatavailable;
+const LAST_WINAPI_ID: WinApiId = WinApiId::Shell32Shellexecutew;
 
 /// Hot-path dispatch: dense `u16` match over the `WinApiId` discriminant
 /// (LLVM jump table) with no string comparison — runs once per host API stop.
@@ -1025,6 +1051,19 @@ pub fn dispatch_winapi_id(
         WinApiId::User32Isclipboardformatavailable => {
             crate::clipboard::handle_is_clipboard_format_available(ctx)
         }
+        WinApiId::Shell32Dragqueryfilew => user32::handle_drag_query_file_w(ctx),
+        WinApiId::Shell32Dragqueryfilea => user32::handle_drag_query_file_a(ctx),
+        WinApiId::Shell32Dragquerypoint => user32::handle_drag_query_point(ctx),
+        WinApiId::Shell32Dragfinish => user32::handle_drag_finish(ctx),
+        WinApiId::Kernel32Locallock => kernel32::handle_local_lock(ctx),
+        WinApiId::Kernel32Localunlock => kernel32::handle_local_unlock(ctx),
+        WinApiId::Kernel32Gettimeformatw => kernel32::handle_get_time_format_w(ctx),
+        WinApiId::Kernel32Getdateformatw => kernel32::handle_get_date_format_w(ctx),
+        WinApiId::User32Getdlgitemint => user32::handle_get_dlg_item_int(ctx),
+        WinApiId::User32Setdlgitemint => user32::handle_set_dlg_item_int(ctx),
+        WinApiId::User32Senddlgitemmessagew => user32::handle_send_dlg_item_message_w(ctx),
+        WinApiId::Shell32Shellaboutw => shell32::handle_shell_about_w(ctx),
+        WinApiId::Shell32Shellexecutew => shell32::handle_shell_execute_w(ctx),
     }
 }
 

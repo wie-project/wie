@@ -5,10 +5,11 @@ use anyhow::Result;
 
 use super::edit::paint_edit;
 use super::listbox::paint_item_lines;
+use super::listbox::render_control_text;
 use super::r#static::paint_label;
 use super::{
-    COLOR_BTNFACE, COLOR_BTNFACE_PRESSED, COLOR_BTNSHADOW, COLOR_WINDOW, ControlClassKind,
-    control_items, control_sel_index,
+    COLOR_BTNFACE, COLOR_BTNFACE_PRESSED, COLOR_BTNHIGHLIGHT, COLOR_BTNSHADOW, COLOR_WINDOW,
+    ControlClassKind, ControlState, control_items, control_sel_index, control_state,
 };
 use crate::gdi32::ResolvedWindow;
 use crate::gdi32::fill_rect_surface;
@@ -31,21 +32,12 @@ pub(super) fn paint_control(
     let text = find_window(state, hwnd).map_or_else(String::new, |w| w.control_text.clone());
     let (width, height) = find_window(state, hwnd).map_or((0, 0), |w| (w.width, w.height));
 
+    // The status bar's raised strip (BTNFACE face + the light/dark client
+    // edges) renders WITHOUT a font, so the strip is visible even before any
+    // text is set; the per-part text is drawn after the font resolution in
+    // the match below (Task 3.1).
     if kind == ControlClassKind::StatusBar {
-        // Task 0.12: status bars render as an empty face-colored child rect;
-        // parts, per-part text, and the grip are plan Task 3.1.
-        fill_rect_surface(
-            state,
-            info.hwnd,
-            info.width,
-            info.height,
-            info.offset_x,
-            info.offset_y,
-            width,
-            height,
-            COLOR_BTNFACE,
-        );
-        return Ok(());
+        paint_status_bar_strip(state, &info, width, height);
     }
 
     let pressed = find_window(state, hwnd).is_some_and(|w| w.flags.contains(WindowFlags::PRESSED));
@@ -198,14 +190,137 @@ pub(super) fn paint_control(
                     key,
                 )?;
             }
-            // Handled by the early return above (no font needed for the empty
-            // face rect); kept only to keep the match exhaustive.
-            ControlClassKind::StatusBar => {}
+            // The strip face/edges were painted before the font resolution;
+            // this arm only draws each part's text clipped to its cell.
+            ControlClassKind::StatusBar => {
+                paint_status_bar_parts(
+                    state,
+                    engine,
+                    &info,
+                    hwnd,
+                    &mut font_engine,
+                    resolved,
+                    key,
+                )?;
+            }
         }
         Ok(())
     })();
     state.gdi_state().font_engine = font_engine;
     result
+}
+
+/// Paint a STATUSCLASSNAMEW strip: the BTNFACE face plus the classic raised
+/// client edge — a light (COLOR_BTNHIGHLIGHT) line along the top and the
+/// shadow (COLOR_BTNSHADOW) line along the bottom (Task 3.1).
+fn paint_status_bar_strip(state: &mut WinApiState, info: &ResolvedWindow, width: i32, height: i32) {
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    fill_rect_surface(
+        state,
+        info.hwnd,
+        info.width,
+        info.height,
+        info.offset_x,
+        info.offset_y,
+        width,
+        height,
+        COLOR_BTNFACE,
+    );
+    fill_rect_surface(
+        state,
+        info.hwnd,
+        info.width,
+        info.height,
+        info.offset_x,
+        info.offset_y,
+        width,
+        1,
+        COLOR_BTNHIGHLIGHT,
+    );
+    fill_rect_surface(
+        state,
+        info.hwnd,
+        info.width,
+        info.height,
+        info.offset_x,
+        info.offset_y.saturating_add(height).saturating_sub(1),
+        width,
+        1,
+        COLOR_BTNSHADOW,
+    );
+}
+
+/// Draw each status-bar part's text, left-aligned in its cell with a small
+/// horizontal inset and vertically centered, CLIPPED to the cell so a long
+/// text cannot bleed into the next part. The last part always extends to the
+/// right edge; with no `SB_SETPARTS` the whole strip is one part.
+fn paint_status_bar_parts(
+    state: &mut WinApiState,
+    engine: &mut dyn wie_cpu::CpuEngine,
+    info: &ResolvedWindow,
+    hwnd: u64,
+    font_engine: &mut FontEngine,
+    resolved: &ResolvedFont,
+    key: &FontKey,
+) -> Result<()> {
+    // The control's own client size (the part cells are laid out inside it).
+    let (width, height) = find_window(state, hwnd).map_or((0, 0), |w| (w.width, w.height));
+    let part_rights = match control_state(state, hwnd) {
+        Some(ControlState::StatusBar { part_rights, .. }) => part_rights.clone(),
+        _ => Vec::new(),
+    };
+    let parts = if part_rights.is_empty() {
+        1
+    } else {
+        part_rights.len()
+    };
+    let line_h = resolved.line_height();
+    // Vertically centered between the strip's edges, at least one row below
+    // the top border so the ink never touches the client edge.
+    let ty = info
+        .offset_y
+        .saturating_add(height.saturating_sub(line_h).saturating_div(2))
+        .max(info.offset_y.saturating_add(1));
+    let strip_bottom = info.offset_y.saturating_add(height);
+    let mut left = 0_i32;
+    for index in 0..parts {
+        let right = if part_rights.is_empty() {
+            width
+        } else {
+            let value = part_rights.get(index).copied().unwrap_or(width);
+            if value < 0 { width } else { value }
+        };
+        let cell_left = left;
+        left = right;
+        let text = crate::comctl32::status_part_text(state, hwnd, index);
+        if text.is_empty() {
+            continue;
+        }
+        let tx = info.offset_x.saturating_add(cell_left).saturating_add(3);
+        render_control_text(
+            state,
+            engine,
+            info.hwnd,
+            info.width,
+            info.height,
+            tx,
+            ty,
+            &text,
+            0, // COLOR_BTNTEXT / COLOR_WINDOWTEXT: black
+            Some((
+                info.offset_x.saturating_add(cell_left),
+                info.offset_y,
+                info.offset_x.saturating_add(right),
+                strip_bottom,
+            )),
+            font_engine,
+            resolved,
+            key,
+        )?;
+    }
+    Ok(())
 }
 
 /// Fill a control's face (COLOR_BTNFACE) and draw its 1 px BTNSHADOW border.

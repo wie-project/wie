@@ -13,11 +13,11 @@ use anyhow::Result;
 
 use super::{
     BN_CLICKED, BS_DEFPUSHBUTTON, BST_FOCUS, BST_PUSHED, CommandPayload, DLGC_BUTTON,
-    DLGC_DEFPUSHBUTTON, DLGC_UNDEFPUSHBUTTON, DLGC_WANTCHARS, GuestCallbackRequest, VK_DELETE,
-    VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SPACE, VK_UP, WM_COMMAND,
-    WinApiControlSignal, WinApiState, WinMsg, WindowClassIdentifier, find_window, find_window_mut,
-    high_word, low_i32, low_word, make_command_wparam, read_guest_ansi_lossy,
-    read_guest_utf16_lossy, write_guest_u32,
+    DLGC_DEFPUSHBUTTON, DLGC_UNDEFPUSHBUTTON, DLGC_WANTCHARS, EN_HSCROLL, EN_VSCROLL,
+    GuestCallbackRequest, VK_DELETE, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR,
+    VK_RIGHT, VK_SPACE, VK_UP, WM_COMMAND, WinApiControlSignal, WinApiState, WinMsg,
+    WindowClassIdentifier, find_window, find_window_mut, high_word, low_i32, low_word,
+    make_command_wparam, read_guest_ansi_lossy, read_guest_utf16_lossy, write_guest_u32,
 };
 use crate::OuterReturn;
 use crate::gdi32::resolve_window_ancestor;
@@ -39,9 +39,9 @@ use edit::{
     edit_get_line, edit_get_modify, edit_get_selection, edit_invalidate_text_buffer,
     edit_line_count, edit_line_from_char, edit_line_index, edit_line_length, edit_mouse_dblclk,
     edit_mouse_down, edit_mouse_move, edit_mouse_up, edit_mouse_wheel, edit_move_caret,
-    edit_notify_change, edit_paste, edit_pos_from_char, edit_replace_selection, edit_scroll_caret,
-    edit_scroll_vertical, edit_selection_type, edit_set_handle, edit_set_limit, edit_set_modify,
-    edit_set_selection, edit_set_tab_stops, edit_undo,
+    edit_notify_change, edit_notify_scroll, edit_paste, edit_pos_from_char, edit_replace_selection,
+    edit_scroll_caret, edit_scroll_vertical, edit_selection_type, edit_set_handle, edit_set_limit,
+    edit_set_modify, edit_set_selection, edit_set_tab_stops, edit_undo,
 };
 use listbox::{listbox_hit_item, listbox_notify_change};
 use paint::write_control_text;
@@ -61,6 +61,9 @@ pub(crate) use edit::edit_clear_undo_buffer;
 const COLOR_BTNFACE: u32 = 0x00F0_F0F0;
 /// `GetSysColor(COLOR_BTNSHADOW)` — the standard button border gray.
 const COLOR_BTNSHADOW: u32 = 0x00A0_A0A0;
+/// `GetSysColor(COLOR_BTNHIGHLIGHT)` — the classic light edge of a raised
+/// 3D border (the status bar's top client edge).
+const COLOR_BTNHIGHLIGHT: u32 = 0x00FF_FFFF;
 /// `GetSysColor(COLOR_WINDOW)` — the standard EDIT / LISTBOX background.
 const COLOR_WINDOW: u32 = 0x00FF_FFFF;
 /// Slightly darker face while a button is pressed (matches the classic 3D
@@ -79,6 +82,40 @@ const COLOR_HIGHLIGHTTEXT: u32 = 0x00FF_FFFF;
 /// wholesale into `ControlState::Edit::style_bits` at seed time; only the bits
 /// a task reads get a named constant here.
 pub(crate) const ES_MULTILINE: u32 = 0x1000;
+
+// ── Status-bar (SB_*) messages (commctrl.h) ─────────────────────────────
+//
+// The status bar is a comctl32 control, so its messages are WM_USER+ offsets
+// rather than `WinMsg` variants, and the dispatch matches them on the raw
+// value. Modern comctl32 SPLITS SB_SETTEXT into A (WM_USER+1) and W
+// (WM_USER+11) variants — notepad's `SendMessageW(hStatusBar, SB_SETTEXTW, …)`
+// sends 0x040B, NOT the plan's legacy single-variant 0x0401 (verified against
+// the mingw-w64 14 commctrl.h the guest toolchain builds against).
+pub(crate) const SB_SETTEXTA: u32 = 0x0401; // WM_USER+1
+pub(crate) const SB_GETTEXTA: u32 = 0x0402; // WM_USER+2
+pub(crate) const SB_GETTEXTLENGTHA: u32 = 0x0403; // WM_USER+3
+pub(crate) const SB_SETPARTS: u32 = 0x0404; // WM_USER+4
+pub(crate) const SB_GETPARTS: u32 = 0x0406; // WM_USER+6
+pub(crate) const SB_GETTEXTLENGTHW: u32 = 0x040C; // WM_USER+12
+pub(crate) const SB_SETTEXTW: u32 = 0x040B; // WM_USER+11
+pub(crate) const SB_GETTEXTW: u32 = 0x040D; // WM_USER+13
+
+/// `SBT_NOBORDERS` — an SB_SETTEXT flag OR'd into the part index (ignored).
+pub(crate) const SBT_NOBORDERS: u32 = 0x0100;
+/// `SBT_POPOUT` — an SB_SETTEXT flag OR'd into the part index (ignored).
+pub(crate) const SBT_POPOUT: u32 = 0x0200;
+/// `SBT_OWNERDRAW` — an SB_SETTEXT flag OR'd into the part index (ignored).
+pub(crate) const SBT_OWNERDRAW: u32 = 0x1000;
+
+// ── Common-control styles (commctrl.h) for the status bar ───────────────
+/// `CCS_BOTTOM` — the control aligns to the bottom of its parent (the
+/// notepad status bar's alignment); any other alignment value aligns to the
+/// top edge (CCS_TOP = 0x1 is the classic top-alignment constant).
+pub(crate) const CCS_BOTTOM: u32 = 0x0000_0003;
+/// `CCS_NORESIZE` — WM_SIZE must not change the control's width.
+pub(crate) const CCS_NORESIZE: u32 = 0x0000_0004;
+/// `CCS_NOPARENTALIGN` — WM_SIZE must not move the control inside its parent.
+pub(crate) const CCS_NOPARENTALIGN: u32 = 0x0000_0008;
 
 // `EM_SELECTIONTYPE` return bits (winuser.h). SEL_ATTRIBUTE (0x2) and
 // SEL_RECHANGE (0x4) are rich-edit-only and never set by a plain EDIT.
@@ -107,9 +144,9 @@ pub enum ControlClassKind {
     ComboBox,
     /// `msctls_statusbar32` (STATUSCLASSNAME) — COMCTL32 status bar.
     ///
-    /// Task 0.12 scope: CreateStatusWindowA/W create the child window with
-    /// text; the SB_* messages, parts layout, and full painting are plan
-    /// Task 3.1. The window renders as an empty face-colored child rect.
+    /// Task 3.1: the SB_* messages and full painting (per-part text on a
+    /// raised BTNFACE strip) are implemented; the paint and message state
+    /// live in `ControlState::StatusBar` + `comctl32.rs`.
     StatusBar,
 }
 
@@ -172,7 +209,10 @@ impl ControlClassKind {
                 items: Vec::new(),
                 sel_index: -1,
             },
-            Self::StatusBar => ControlState::StatusBar,
+            Self::StatusBar => ControlState::StatusBar {
+                part_rights: Vec::new(),
+                part_texts: Vec::new(),
+            },
             Self::Static => ControlState::Static,
         }
     }
@@ -277,11 +317,24 @@ pub enum ControlState {
     },
     /// STATIC (labels; text-only painting).
     Static,
-    /// STATUSCLASSNAMEW (status bar; no SB_* state yet — plan Task 3.1).
+    /// STATUSCLASSNAMEW (status bar): the SB_* parts and per-part texts.
     ///
-    /// The initial text set by `CreateStatusWindowA/W` lives on the window
-    /// record (`control_text`); parts and per-part text are Task 3.1.
-    StatusBar,
+    /// The bar renders as a BTNFACE strip at the bottom (or top) of its
+    /// parent with one text cell per part; the part list and texts arrive
+    /// through `SB_SETPARTS` / `SB_SETTEXTW` (handled in `comctl32.rs`).
+    StatusBar {
+        /// Right-edge x of each part in the bar's client coords (the
+        /// `SB_SETPARTS` array; a -1 entry means "extend to the right
+        /// edge"). Empty = never configured — one part spans the whole
+        /// width (and part 0 shows the `CreateStatusWindowA/W` text, which
+        /// real comctl32 applies as `SB_SETTEXT(0, …)` internally).
+        part_rights: Vec<i32>,
+        /// Per-part text (`SB_SETTEXTW`), indexed by part; a part past the
+        /// end of the vec renders empty. Part 0 falls back to the window's
+        /// `control_text` (the creation text) until `SB_SETTEXTW(0, …)`
+        /// overwrites it.
+        part_texts: Vec<String>,
+    },
 }
 
 impl ControlState {
@@ -714,19 +767,26 @@ impl ControlClassKind {
             // WM_VSCROLL: the wParam low word is the SB_* scroll code, the
             // high word the thumb position (SB_THUMBTRACK/POSITION). The
             // offset is clamped to the wrap-aware viewport and the control is
-            // invalidated so the paint re-renders from the new top row.
+            // invalidated so the paint re-renders from the new top row. A
+            // real scroll delivers EN_VSCROLL to the parent (notepad updates
+            // its status-bar caret position on it).
             (ControlClassKind::Edit, WinMsg::WM_VSCROLL) => {
                 let code = low_word(word_parameter);
                 let thumb = high_word(word_parameter);
                 if edit_scroll_vertical(state, hwnd, code, thumb) {
                     invalidate(state, hwnd);
+                    return edit_notify_scroll(state, hwnd, EN_VSCROLL);
                 }
                 Ok(Some(0))
             }
             // WM_HSCROLL: the horizontal scroll offset (ES_AUTOHSCROLL state)
             // is not implemented yet — swallow the message so a no-wrap EDIT
-            // does not fall through to a default scroll.
-            (ControlClassKind::Edit, WinMsg::WM_HSCROLL) => Ok(Some(0)),
+            // does not fall through to a default scroll, and deliver
+            // EN_HSCROLL like a real edit control (notepad re-reads the
+            // caret position on it).
+            (ControlClassKind::Edit, WinMsg::WM_HSCROLL) => {
+                edit_notify_scroll(state, hwnd, EN_HSCROLL)
+            }
             // WM_MOUSEWHEEL: the signed delta in the wParam high word scrolls
             // the multiline EDIT (3 lines per notch). The gui layer routes the
             // wheel to the FOCUS window, matching Windows.
@@ -911,6 +971,21 @@ impl ControlClassKind {
                 Ok(Some(count))
             }
             (_, WinMsg::WM_COMMAND) => deliver_command(state, hwnd, word_parameter),
+            // Status-bar messages are WM_USER+ offsets (commctrl.h) that
+            // `WinMsg` cannot name, so the whole StatusBar kind dispatches
+            // here on the raw value. The generic arms above (WM_PAINT,
+            // WM_GETTEXT, WM_SETTEXT, WM_SETFONT, …) still run first — the
+            // status bar inherits the shared control behaviors — and this
+            // arm only sees what falls through (the SB_* messages plus
+            // WM_SIZE, which repositions the bar in its parent).
+            (ControlClassKind::StatusBar, _) => crate::comctl32::dispatch_status_bar_message(
+                engine,
+                state,
+                hwnd,
+                message,
+                word_parameter,
+                long_parameter,
+            ),
             _ => Ok(None),
         }
     }
@@ -1109,7 +1184,7 @@ mod tests {
         ));
         assert!(matches!(
             ControlClassKind::StatusBar.new_state(),
-            ControlState::StatusBar
+            ControlState::StatusBar { .. }
         ));
     }
 }

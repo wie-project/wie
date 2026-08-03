@@ -262,6 +262,9 @@ pub(crate) fn sys_color(color_index: u32) -> u32 {
         // COLOR_GRAYTEXT.
         17 => 0x006d_6d6d,
 
+        // COLOR_INFOBK (24) — the tooltip background (#FFFFE1, Windows 2000+).
+        24 => 0x00ff_ffe1,
+
         // COLOR_SCROLLBAR.
         0 => 0x00c8_c8c8,
 
@@ -845,4 +848,16 @@ pub fn handle_set_window_placement(ctx: &mut HandlerContext<'_>) -> Result<WinAp
         return_address,
         return_value,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sys_color;
+
+    /// COLOR_INFOBK (24) is the tooltip background — pinned so a future edit
+    /// to the system-color table cannot silently drop the fidelity fix.
+    #[test]
+    fn sys_color_infobk_is_tooltip_yellow() {
+        assert_eq!(sys_color(24), 0x00ff_ffe1);
+    }
 }

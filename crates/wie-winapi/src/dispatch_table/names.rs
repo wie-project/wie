@@ -1646,6 +1646,69 @@ static WINAPI_NAME_ROWS: &[(&str, &str, WinApiId)] = &[
         "isclipboardformatavailable",
         WinApiId::User32Isclipboardformatavailable,
     ),
+    (
+        // Rows placed at the table end with the appended variants (434-437),
+        // so the id table and the name rows stay in the same order.
+        "shell32.dll",
+        "dragqueryfilew",
+        WinApiId::Shell32Dragqueryfilew,
+    ),
+    (
+        "shell32.dll",
+        "dragqueryfilea",
+        WinApiId::Shell32Dragqueryfilea,
+    ),
+    (
+        "shell32.dll",
+        "dragquerypoint",
+        WinApiId::Shell32Dragquerypoint,
+    ),
+    ("shell32.dll", "dragfinish", WinApiId::Shell32Dragfinish),
+    (
+        // Rows placed at the table end with the appended variants (438/439),
+        // so the id table and the name rows stay in the same order.
+        "kernel32.dll",
+        "locallock",
+        WinApiId::Kernel32Locallock,
+    ),
+    ("kernel32.dll", "localunlock", WinApiId::Kernel32Localunlock),
+    (
+        // Rows placed at the table end with the appended variants (440/441),
+        // so the id table and the name rows stay in the same order.
+        "kernel32.dll",
+        "gettimeformatw",
+        WinApiId::Kernel32Gettimeformatw,
+    ),
+    (
+        "kernel32.dll",
+        "getdateformatw",
+        WinApiId::Kernel32Getdateformatw,
+    ),
+    (
+        // Rows placed at the table end with the appended variants (442-444),
+        // so the id table and the name rows stay in the same order.
+        "user32.dll",
+        "getdlgitemint",
+        WinApiId::User32Getdlgitemint,
+    ),
+    ("user32.dll", "setdlgitemint", WinApiId::User32Setdlgitemint),
+    (
+        "user32.dll",
+        "senddlgitemmessagew",
+        WinApiId::User32Senddlgitemmessagew,
+    ),
+    (
+        // Rows placed at the table end with the appended variants (445/446),
+        // so the id table and the name rows stay in the same order.
+        "shell32.dll",
+        "shellaboutw",
+        WinApiId::Shell32Shellaboutw,
+    ),
+    (
+        "shell32.dll",
+        "shellexecutew",
+        WinApiId::Shell32Shellexecutew,
+    ),
 ];
 
 /// Resolve library/export to id. Case-insensitive, allocation-free.
