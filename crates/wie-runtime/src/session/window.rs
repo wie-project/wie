@@ -1,6 +1,7 @@
 //! `GuestHandle` window-tree access: hit-testing, capture, and message posting.
 
 use super::menu::{MenuNode, MenuTreeCache, build_menu_tree};
+use std::sync::Arc;
 use wie_winapi::handles::Hmenu;
 
 /// Host-side handle to the WinAPI state for cross-thread access.
@@ -228,19 +229,19 @@ impl GuestHandle {
     /// per-frame tree reconstruction is gone). Empty when no window has a
     /// menu yet.
     #[must_use]
-    pub fn window_menu_items(&self) -> Vec<MenuNode> {
+    pub fn window_menu_items(&self) -> Arc<Vec<MenuNode>> {
         let Ok(state) = self.state.lock() else {
-            return Vec::new();
+            return Arc::new(Vec::new());
         };
         let Some(ws) = state.try_window_state() else {
-            return Vec::new();
+            return Arc::new(Vec::new());
         };
         let Some(menu_handle) = ws
             .windows
             .iter()
             .find_map(|w| (w.menu_handle != 0).then_some(w.menu_handle))
         else {
-            return Vec::new();
+            return Arc::new(Vec::new());
         };
         // The window record stores the raw u64 handle; the cache is keyed by
         // the typed menu handle so a stale build (different handle) is a
@@ -252,12 +253,13 @@ impl GuestHandle {
                 && let Some((cached_handle, tree)) = cached.as_ref()
                 && *cached_handle == menu_handle
             {
-                return tree.clone();
+                // Cache hit: refcount bump — no per-frame tree deep clone.
+                return Arc::clone(tree);
             }
         }
-        let tree = build_menu_tree(&ws.menus, menu_handle.as_u64());
+        let tree = Arc::new(build_menu_tree(&ws.menus, menu_handle.as_u64()));
         if let Ok(mut cache) = self.menu_tree_cache.write() {
-            *cache = Some((menu_handle, tree.clone()));
+            *cache = Some((menu_handle, Arc::clone(&tree)));
         }
         tree
     }

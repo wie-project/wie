@@ -12,6 +12,7 @@ use crate::memory::{
 };
 use crate::mt_runtime::{ProcessConfig, ProcessResources};
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
@@ -307,6 +308,7 @@ impl super::RuntimeSession {
             next_api_index: 0,
             no_hook_slices: 0,
             pending_callbacks: Vec::new(),
+            outer_api_names: HashMap::new(),
             profile_enabled,
             profile: RuntimeProfile::default(),
             last_published_last_error: None,

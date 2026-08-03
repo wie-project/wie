@@ -676,25 +676,30 @@ impl super::RuntimeSession {
                                             request,
                                         },
                                     ) => {
-                                        let outer_library: Arc<str> = resolved.library.clone().into();
-                                        let outer_name: Arc<str> = resolved.name.clone().into();
                                         let request = *request;
                                         charged_api = charged_api.saturating_add(1);
+                                        // begin_guest_callback needs full self — mark and handle after drop
+                                        drop(pair);
+                                        // Intern once per unique outer API name; every
+                                        // subsequent bridged message clones the cached
+                                        // Arc (refcount bump) instead of allocating a
+                                        // fresh Arc box + string copy per message.
+                                        let outer_library =
+                                            self.intern_outer_api_name(resolved.library);
+                                        let outer_name = self.intern_outer_api_name(resolved.name);
                                         events.push(EntryTraceEvent {
                                             index,
-                                            library: outer_library.clone(),
-                                            name: outer_name.clone(),
+                                            library: Arc::clone(&outer_library),
+                                            name: Arc::clone(&outer_name),
                                             fake_target_va: hook.address,
                                             handled: true,
                                             return_value: None,
                                             return_address: None,
                                         });
-                                        // begin_guest_callback needs full self — mark and handle after drop
-                                        drop(pair);
                                         if let Err(error) = self.begin_guest_callback(
                                             request,
-                                            &outer_library,
-                                            &outer_name,
+                                            outer_library,
+                                            outer_name,
                                             hook.address,
                                         ) {
                                             termination = EntryTraceTermination::RuntimeStop(

@@ -18,6 +18,7 @@ use crate::memory::RuntimeMemoryLayout;
 use crate::mt_runtime::ProcessResources;
 use crate::trace::EntryTraceTermination;
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use self::callback::PendingGuestCallback;
@@ -120,6 +121,10 @@ pub struct RuntimeSession {
     next_api_index: usize,
     no_hook_slices: usize,
     pending_callbacks: Vec<PendingGuestCallback>,
+    /// Cache of `Arc<str>` copies of callback-outer API names, so every
+    /// bridged window message clones a refcounted string instead of
+    /// allocating a fresh `Arc` box + copy per message.
+    outer_api_names: HashMap<String, Arc<str>>,
     /// When true, accumulate [`RuntimeProfile`] across `run_until_stop` calls.
     profile_enabled: bool,
     profile: RuntimeProfile,

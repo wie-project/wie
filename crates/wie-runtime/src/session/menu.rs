@@ -22,8 +22,11 @@ pub struct MenuNode {
 /// the menu handle it was built from.
 ///
 /// `RwLock`: the host frame loop is the sole reader (read lock on the GUI
-/// path); only a `menu_dirty` rebuild takes the write lock.
-pub(super) type MenuTreeCache = Arc<RwLock<Option<(Hmenu, Vec<MenuNode>)>>>;
+/// path); only a `menu_dirty` rebuild takes the write lock. The tree is
+/// shared as an `Arc` so the per-frame cache-hit path clones a refcounted
+/// pointer instead of deep-cloning every `MenuNode` (String titles + child
+/// Vecs) once per frame.
+pub(super) type MenuTreeCache = Arc<RwLock<Option<(Hmenu, Arc<Vec<MenuNode>>)>>>;
 
 /// Build the menu tree rooted at `menu_handle` from the native menu records:
 /// `Item` entries become leaves, `Popup` entries recurse into their submenu,

@@ -1,6 +1,7 @@
 //! Guest WndProc bridging: host API entry → Win64-convention guest callback.
 
 use anyhow::{Context, Result};
+use std::borrow::Cow;
 use std::sync::Arc;
 use wie_winapi::OuterReturn;
 
@@ -34,8 +35,8 @@ impl super::RuntimeSession {
     pub(super) fn begin_guest_callback(
         &mut self,
         request: wie_winapi::GuestCallbackRequest,
-        outer_library: &str,
-        outer_name: &str,
+        outer_library: Arc<str>,
+        outer_name: Arc<str>,
         outer_fake_va: u64,
     ) -> Result<()> {
         let trampoline = self.process.layout().callback_return_trampoline_va;
@@ -46,13 +47,31 @@ impl super::RuntimeSession {
         self.pending_callbacks.push(PendingGuestCallback {
             dispatch_rsp,
             request,
-            outer_library: outer_library.into(),
-            outer_name: outer_name.into(),
+            outer_library,
+            outer_name,
             outer_fake_va,
             outer_return: request.outer_return,
         });
 
         Ok(())
+    }
+
+    /// Returns a shareable `Arc<str>` for a callback-outer API name, caching
+    /// the first conversion so every subsequent bridged window message clones
+    /// a refcounted string (refcount bump) instead of allocating a fresh
+    /// `Arc` box + string copy per message.
+    ///
+    /// `Cow::Owned` (the rare soft-table path) is adopted with its `String`
+    /// buffer reused by `Arc::from(String)`; the result is still cached by
+    /// content for repeat callers.
+    pub(super) fn intern_outer_api_name(&mut self, name: Cow<'static, str>) -> Arc<str> {
+        if let Some(arc) = self.outer_api_names.get(name.as_ref()) {
+            return Arc::clone(arc);
+        }
+        let arc: Arc<str> = Arc::from(name);
+        self.outer_api_names
+            .insert(arc.to_string(), Arc::clone(&arc));
+        arc
     }
 
     /// Completes the most recent guest WndProc and returns from the outer host API.

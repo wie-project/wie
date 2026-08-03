@@ -28,6 +28,10 @@ pub struct RuntimeProfile {
     idle_parks: u64,
     idle_park_ns: u128,
     frames_published: u64,
+    /// Zero-copy hand-backs of the published buffer (`Arc::try_unwrap` hit).
+    hand_back_unwrap: u64,
+    /// Clone-fallback hand-backs (host still held the previous frame's Arc).
+    hand_back_clone: u64,
     publish_ns: u128,
     publish_ns_last: u128,
     blit_copy_ns: u128,
@@ -124,6 +128,16 @@ impl RuntimeProfile {
     #[must_use]
     pub fn frames_published(&self) -> u64 {
         self.frames_published
+    }
+    /// Number of zero-copy published-buffer hand-backs (`Arc::try_unwrap` hit).
+    #[must_use]
+    pub fn hand_back_unwrap(&self) -> u64 {
+        self.hand_back_unwrap
+    }
+    /// Number of clone-fallback hand-backs (host still held the previous Arc).
+    #[must_use]
+    pub fn hand_back_clone(&self) -> u64 {
+        self.hand_back_clone
     }
     /// Accumulated publish wall time (ns).
     #[must_use]
@@ -319,6 +333,8 @@ impl RuntimeProfile {
                 self.present_ns() as f64 / 1e6,
                 self.present_ns_last() as f64 / 1e6,
             ));
+            lines.push(format!("hand_back_unwrap={}", self.hand_back_unwrap()));
+            lines.push(format!("hand_back_clone={}", self.hand_back_clone()));
             let frame_total = self
                 .last_frame_iced_insns()
                 .saturating_add(self.last_frame_jit_insns());
@@ -428,6 +444,8 @@ impl super::RuntimeSession {
                     p.blit_copy_ns_last,
                     p.present_ns,
                     p.present_ns_last,
+                    p.hand_back_unwrap,
+                    p.hand_back_clone,
                     p.generation,
                 )
             })
@@ -440,6 +458,8 @@ impl super::RuntimeSession {
             blit_copy_ns_last,
             present_ns,
             present_ns_last,
+            hand_back_unwrap,
+            hand_back_clone,
             generation,
         )) = present
         else {
@@ -452,6 +472,8 @@ impl super::RuntimeSession {
         self.profile.blit_copy_ns_last = blit_copy_ns_last;
         self.profile.present_ns = present_ns;
         self.profile.present_ns_last = present_ns_last;
+        self.profile.hand_back_unwrap = hand_back_unwrap;
+        self.profile.hand_back_clone = hand_back_clone;
 
         if generation == self.frame_last_gen {
             return;
