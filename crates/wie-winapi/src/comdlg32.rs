@@ -121,15 +121,20 @@ fn handle_get_file_title(
         let basename = path.get(file_start..).unwrap_or("");
 
         if basename.is_empty() {
-            // A path ending in a separator ("C:\foo\") or a genuinely empty
-            // string has no basename; the real API reports an invalid file
-            // name. Still NUL-terminate the buffer.
+            // No basename: a genuinely empty path or a path ending in a
+            // separator. Real GetFileTitle only treats the trailing-separator
+            // form as an invalid file name; an empty path succeeds with an
+            // empty title. The buffer is NUL-terminated either way.
             if unicode {
                 write_utf16_c_string(engine, title_ptr, cch_title, "")?;
             } else {
                 write_ansi_c_string(engine, title_ptr, cch_title, "")?;
             }
-            GET_FILE_TITLE_ERR_INVALID
+            if path.is_empty() {
+                0
+            } else {
+                GET_FILE_TITLE_ERR_INVALID
+            }
         } else {
             write_get_file_title(engine, title_ptr, cch_title, basename, unicode)?
         }

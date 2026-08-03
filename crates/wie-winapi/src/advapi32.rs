@@ -169,6 +169,10 @@ pub fn handle_reg_open_key_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
 }
 
 /// Handles `ADVAPI32.dll!RegOpenKeyW` (legacy; ≡ RegOpenKeyExW with `KEY_READ`).
+///
+/// Legacy `RegOpenKey` does not create a missing key: it returns
+/// `ERROR_FILE_NOT_FOUND` and leaves `*phkResult` as 0, matching the
+/// open-only semantics of the Ex pair.
 pub fn handle_reg_open_key_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;

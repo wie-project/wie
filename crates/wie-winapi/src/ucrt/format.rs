@@ -12,6 +12,12 @@
 //! Real Windows callers rely on this: notepad's `StringCchVPrintfW` wrapper
 //! branches on a negative return as "insufficient buffer".
 //!
+//! Note: NUL-terminating on truncation is a deliberate safe-direction
+//! deviation from the MSDN contract, which documents the truncated buffer
+//! as *not* NUL-terminated. A caller that consumes the -1 return still gets
+//! a usable C string (notepad's `StringCchVPrintfW` path), so the deviation
+//! is kept.
+//!
 //! Supported conversions: `d i u x X p s c` plus the `%%` escape, field
 //! width (digits or `*`), precision (digits or `*`, applied to strings and
 //! as minimum digits for numerics), and the `-` / `0` flags. The `+`, ` `,

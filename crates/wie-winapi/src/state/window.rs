@@ -28,6 +28,16 @@ pub struct WindowState {
     pub(crate) window_y: i32,
     pub(crate) window_width: i32,
     pub(crate) window_height: i32,
+    /// Pending guest-requested host-window geometry change, for the winit
+    /// window.
+    ///
+    /// `(x, y, width, height)` in screen coordinates (rcNormalPosition
+    /// semantics). Set by the `SetWindowPlacement` handler when the applied
+    /// rect differs from the current one; consumed and cleared by
+    /// `GuestHandle::take_host_geometry_request` (the wie-runtime session
+    /// window layer) so the host presenter can move the real window. `None`
+    /// when no geometry change is pending.
+    pub host_geometry_request: Option<(i32, i32, i32, i32)>,
     pub(crate) tick_count: u64,
     pub keyboard_state: KeyboardState,
     pub(crate) next_timer_id: u64,
@@ -112,6 +122,7 @@ impl Default for WindowState {
             window_y: 0,
             window_width: 0,
             window_height: 0,
+            host_geometry_request: None,
             tick_count: 0,
             keyboard_state: KeyboardState::default(),
             timers: Vec::new(),

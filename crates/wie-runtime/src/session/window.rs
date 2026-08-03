@@ -313,6 +313,22 @@ impl GuestHandle {
         }
     }
 
+    /// Consume a pending guest-requested host-window geometry change, if any.
+    ///
+    /// `SetWindowPlacement` (guest thread) records `(x, y, width, height)` in
+    /// screen coordinates here when the applied rcNormalPosition differs from
+    /// the current rect. The host presenter applies it to the winit window and
+    /// calls this to clear the slot; `None` when no move is pending. Mirrors
+    /// the [`Self::resize_window`] seam — geometry flows guest → host through
+    /// the shared `WinApiState`, applied on the event-loop thread.
+    #[must_use]
+    pub fn take_host_geometry_request(&self) -> Option<(i32, i32, i32, i32)> {
+        let Ok(mut state) = self.state.lock() else {
+            return None;
+        };
+        state.window_state().host_geometry_request.take()
+    }
+
     /// Post a message to the guest message queue.
     ///
     /// Locks ONLY the dedicated queue mutex and notifies the condvar, so a
@@ -456,6 +472,38 @@ mod tests {
             second.first().expect("popup").children.len(),
             2,
             "rebuild must reflect the appended item"
+        );
+    }
+
+    /// `take_host_geometry_request` reads the guest-set pending geometry and
+    /// clears the slot (the SetWindowPlacement host-forwarding seam).
+    #[test]
+    fn take_host_geometry_request_reads_and_clears_the_pending_slot() {
+        let process = wie_pe::ProcessIdentity {
+            module_file_name: "placement.exe".to_owned(),
+            module_path: r"C:\App\placement.exe".to_owned(),
+            current_directory: r"C:\App".to_owned(),
+            command_line: "placement.exe".to_owned(),
+        };
+        let mut winapi_state =
+            crate::memory::default_winapi_state(&DEFAULT_LAYOUT, Arc::new(Vec::new()), &process)
+                .expect("winapi state");
+        winapi_state.window_state().host_geometry_request = Some((20, 30, 200, 100));
+        let handle = GuestHandle {
+            state: Arc::new(Mutex::new(winapi_state)),
+            queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+            menu_tree_cache: Arc::new(RwLock::new(None)),
+        };
+
+        assert_eq!(
+            handle.take_host_geometry_request(),
+            Some((20, 30, 200, 100)),
+            "the pending geometry must be handed to the host presenter"
+        );
+        assert_eq!(
+            handle.take_host_geometry_request(),
+            None,
+            "take clears the slot so a stale move is never re-applied"
         );
     }
 }

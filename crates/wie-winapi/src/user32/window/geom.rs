@@ -778,8 +778,17 @@ pub fn handle_set_window_placement(ctx: &mut HandlerContext<'_>) -> Result<WinAp
         // restored afterwards.
         let visible = show_cmd != 0;
 
+        // Whether the applied rect differs from the current record. An
+        // unchanged rect skips the host-forwarding step (a no-op move); the
+        // record update below still runs, matching the pre-existing behavior.
+        let mut geometry_changed = false;
+
         if window_handle == FAKE_WINDOW_HANDLE {
             let window = state.window_state();
+            geometry_changed = window.window_x != left
+                || window.window_y != top
+                || window.window_width != width
+                || window.window_height != height;
             window.window_x = left;
             window.window_y = top;
             window.window_width = width;
@@ -787,6 +796,10 @@ pub fn handle_set_window_placement(ctx: &mut HandlerContext<'_>) -> Result<WinAp
             window.window_visible = visible;
         } else if let Some(window) = find_window_mut(state, window_handle) {
             // Reposition the window record (the MoveWindow geometry update).
+            geometry_changed = window.x != left
+                || window.y != top
+                || window.width != width
+                || window.height != height;
             window.x = left;
             window.y = top;
             window.width = width;
@@ -795,6 +808,18 @@ pub fn handle_set_window_placement(ctx: &mut HandlerContext<'_>) -> Result<WinAp
             // rcNormalPosition is the outer window rect; the client rect
             // keeps its window-relative origin and tracks the new size.
             window.client_rect = (0, 0, width, height);
+        }
+
+        // Host-forwarding: record the new geometry for the winit window and
+        // wake the host presenter so it applies the move without waiting for
+        // the next frame publish. The consumer seam is
+        // `GuestHandle::take_host_geometry_request` (wie-runtime session
+        // window layer).
+        if geometry_changed {
+            state.window_state().host_geometry_request = Some((left, top, width, height));
+            if let Some(wake) = state.present().wake.as_ref() {
+                wake();
+            }
         }
     }
 

@@ -13,7 +13,7 @@ use wie_runtime::{GuiControl, run_windowed};
 use wie_winapi::handles::Hwnd;
 
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalSize;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
@@ -100,6 +100,38 @@ impl WieApp {
         tracing::debug!("menu items: {:?}", items);
         self.menu_bar.rebuild(items.as_slice());
         self.last_menu_items = items;
+    }
+    /// Apply a guest-requested host-window move/resize (`SetWindowPlacement`)
+    /// to the winit window.
+    ///
+    /// The winapi handler records the pending `(x, y, width, height)` on the
+    /// shared state and wakes the presenter; this consumes it on the
+    /// event-loop thread where winit calls must run. Guest coordinates are
+    /// treated as physical pixels, matching how `first_guest_window_info`
+    /// sizes the window at creation (the same `max(100)` clamp guards against
+    /// a degenerate or negative rect). When no window exists yet (the move
+    /// arrived before the first published frame) the request stays pending
+    /// and applies once the window is created.
+    fn apply_host_geometry(&self) {
+        let Some(rt) = self.runtime.as_ref() else {
+            return;
+        };
+        let Some(handle) = self.handle.as_ref() else {
+            return;
+        };
+        let Some((x, y, width, height)) = handle.take_host_geometry_request() else {
+            return;
+        };
+        rt.window
+            .set_outer_position(PhysicalPosition::new(x as f64, y as f64));
+        // winit 0.30 removed set_inner_size; request_inner_size is its
+        // replacement (same Into<Size> contract as with_inner_size at
+        // creation, so guest pixels stay physical). The returned actual size
+        // is informational — the winit Resized event carries the settle.
+        let _ = rt.window.request_inner_size(PhysicalSize::new(
+            width.max(100) as u32,
+            height.max(100) as u32,
+        ));
     }
 }
 
@@ -651,6 +683,13 @@ impl ApplicationHandler<WieEvent> for WieApp {
                         tracing::debug!(target: "wiegui", "coalesced duplicate Frame event");
                     }
                 }
+                // Apply any guest-requested geometry (SetWindowPlacement) to
+                // the host window. The winapi handler set a pending request
+                // and woke the presenter, so the move lands even without a
+                // repaint; a cheap no-op when nothing is pending. Runs on the
+                // first frame too — the window was just created above, so a
+                // startup restore is applied immediately.
+                self.apply_host_geometry();
                 #[cfg(target_os = "macos")]
                 self.sync_menu_bar();
             }

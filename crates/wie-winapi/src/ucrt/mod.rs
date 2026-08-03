@@ -75,7 +75,7 @@ const COMMODE_SLOT: u64 = CRT_GUEST_BASE + 0x318;
 const FMODE_SLOT: u64 = CRT_GUEST_BASE + 0x320;
 /// Slot holding `wchar_t**` (wide argv table) for `__p___wargv`.
 const WARGV_PTR_SLOT: u64 = CRT_GUEST_BASE + 0x330;
-/// Slot holding `wchar_t**` (NULL — empty wide environment) for `__p__wenviron`.
+/// Slot holding `wchar_t**` (wide environment table) for `__p__wenviron`.
 const WENVIRON_PTR_SLOT: u64 = CRT_GUEST_BASE + 0x338;
 /// Narrow `char* argv[]` pointer table materialized by the runtime session
 /// (see `crates/wie-runtime/src/session/mod.rs` `CRT_ARGV_TABLE`).

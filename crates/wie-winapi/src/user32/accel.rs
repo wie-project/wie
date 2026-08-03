@@ -16,8 +16,8 @@
 
 use super::{
     Context, QueuedWindowMessage, Result, WM_CHAR, WM_COMMAND, WM_KEYDOWN, WM_SYSCHAR,
-    WM_SYSKEYDOWN, WinApiHandlerResult, WinApiState, checked_field_address, read_guest_u32,
-    read_guest_u64,
+    WM_SYSKEYDOWN, WinApiHandlerResult, WinApiState, checked_field_address, make_command_wparam,
+    read_guest_u32, read_guest_u64,
 };
 use crate::HandlerContext;
 use crate::handles::{Haccel, Hwnd};
@@ -127,15 +127,8 @@ fn handle_load_accelerators(
 /// An id that does not match any parsed table resolves to `NULL`; a repeat
 /// load of the same pair returns the previously allocated handle.
 fn load_accel_handle(state: &mut WinApiState, instance_handle: u64, table_id: u16) -> Result<u64> {
-    let parsed = state
-        .process
-        .main_module_accelerators
-        .iter()
-        .any(|table| table.id == u32::from(table_id));
-    if !parsed {
-        return Ok(0);
-    }
-
+    // A cached record proves the id validated at load time, so the cache
+    // lookup runs first and a repeat load skips the parsed-table scan.
     if let Some(record) = state
         .window_state()
         .accel_tables
@@ -144,6 +137,17 @@ fn load_accel_handle(state: &mut WinApiState, instance_handle: u64, table_id: u1
     {
         return Ok(record.handle);
     }
+
+    // Single `find` over the parsed tables doubles as the existence check:
+    // an id matching no table resolves to NULL and is never cached.
+    let Some(_) = state
+        .process
+        .main_module_accelerators
+        .iter()
+        .find(|table| table.id == u32::from(table_id))
+    else {
+        return Ok(0);
+    };
 
     let handle = allocate_accel_handle(state)?;
     state.window_state().accel_tables.push(AccelRecord {
@@ -158,7 +162,9 @@ fn load_accel_handle(state: &mut WinApiState, instance_handle: u64, table_id: u1
 ///
 /// Win64 ABI: `rcx` = haccel. The matching `AccelRecord` is removed so a
 /// subsequent `LoadAcceleratorsA/W` of the same (module, id) pair allocates a
-/// fresh handle; `TRUE` is returned, or `FALSE` for an unknown handle.
+/// fresh handle. `TRUE` is returned only when a record was actually removed —
+/// an unknown handle yields `FALSE`, matching the Windows API spec. This
+/// intentionally contrasts with `DestroyMenu`, which always succeeds here.
 pub fn handle_destroy_accelerator_table(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
@@ -215,7 +221,8 @@ fn handle_translate_accelerator(
         .read_r8()
         .with_context(|| format!("failed to read R8 for {api_name}"))?;
 
-    // MSG (Win64): hwnd @0, message @8, wParam @16, lParam @24.
+    // MSG (Win64): hwnd @0, message @8, wParam @16, lParam @24 — note the
+    // 4 pad bytes at +12 (message is a u32, wParam is 8-aligned).
     let message = read_guest_u32(engine, checked_field_address(message_ptr, 8, "MSG.message"))
         .with_context(|| format!("failed to read {api_name} MSG.message"))?;
     let word_parameter =
@@ -229,14 +236,18 @@ fn handle_translate_accelerator(
         .iter()
         .find(|record| record.handle == accel_handle)
         .map(|record| record.table_id);
-    let keyboard = state.window_state().keyboard_state.clone();
+    // Borrow the keyboard state rather than clone 256 bytes per keystroke:
+    // `try_window_state` takes `&self`, so the reference coexists with the
+    // read of `state.process` below. The slot is guaranteed initialised by
+    // the accel_tables lookup above, so the `?` None arm is unreachable.
+    let keyboard: Option<&KeyboardState> = state.try_window_state().map(|ws| &ws.keyboard_state);
     let command_id: Option<u16> = state
         .process
         .main_module_accelerators
         .iter()
         .find(|table| table_id.map_or(false, |id| table.id == u32::from(id)))
         .and_then(|table| {
-            find_matching_command(&table.entries, message, word_parameter, &keyboard)
+            find_matching_command(&table.entries, message, word_parameter, keyboard?)
         });
 
     let return_value = if let Some(command_id) = command_id {
@@ -249,7 +260,9 @@ fn handle_translate_accelerator(
         queue.messages.push(QueuedWindowMessage {
             window_handle: Hwnd::from(window_handle),
             message: WM_COMMAND,
-            word_parameter: u64::from(command_id),
+            // MAKEWPARAM(id, 0): accelerator command ids are u16, so the
+            // high word of wParam is 0 (no notification code).
+            word_parameter: make_command_wparam(u64::from(command_id), 0),
             long_parameter: 0,
             time,
             point_x: 0,

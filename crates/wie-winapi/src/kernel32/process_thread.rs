@@ -15,14 +15,31 @@ pub fn handle_get_startup_info_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         .context("failed to read RCX for GetStartupInfoA")?;
 
     if startup_info_ptr != 0 {
+        // STARTUPINFOA on Win64 is 104 bytes. Windows zero-fills the whole
+        // struct before setting the three fields, so caller garbage never
+        // leaks into the reserved/stdio-handle region between cb and the
+        // last written field.
         let cb_address = checked_field_address(startup_info_ptr, 0, "cb");
         let flags_address = checked_field_address(startup_info_ptr, 60, "dwFlags");
         let show_window_address = checked_field_address(startup_info_ptr, 64, "wShowWindow");
 
-        // STARTUPINFOA on Win64 is 104 bytes.
         write_guest_u32(engine, cb_address, 104)?;
+        // Zero the reserved region between cb and dwFlags (offset 4..60).
+        engine
+            .mem_write(
+                checked_field_address(startup_info_ptr, 4, "reserved fields"),
+                &[0_u8; 56],
+            )
+            .context("GetStartupInfoA zero reserved fields")?;
         write_guest_u32(engine, flags_address, 0)?;
         write_guest_u16(engine, show_window_address, 1)?;
+        // Zero the tail after wShowWindow (offset 66..104).
+        engine
+            .mem_write(
+                checked_field_address(startup_info_ptr, 66, "tail fields"),
+                &[0_u8; 38],
+            )
+            .context("GetStartupInfoA zero tail fields")?;
     }
 
     let return_address = engine
@@ -42,14 +59,31 @@ pub fn handle_get_startup_info_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         .context("failed to read RCX for GetStartupInfoW")?;
 
     if startup_info_ptr != 0 {
+        // STARTUPINFOW on Win64 is 104 bytes. Windows zero-fills the whole
+        // struct before setting the three fields, so caller garbage never
+        // leaks into the reserved/stdio-handle region between cb and the
+        // last written field.
         let cb_address = checked_field_address(startup_info_ptr, 0, "cb");
         let flags_address = checked_field_address(startup_info_ptr, 60, "dwFlags");
         let show_window_address = checked_field_address(startup_info_ptr, 64, "wShowWindow");
 
-        // STARTUPINFOW on Win64 is 104 bytes.
         write_guest_u32(engine, cb_address, 104)?;
+        // Zero the reserved region between cb and dwFlags (offset 4..60).
+        engine
+            .mem_write(
+                checked_field_address(startup_info_ptr, 4, "reserved fields"),
+                &[0_u8; 56],
+            )
+            .context("GetStartupInfoW zero reserved fields")?;
         write_guest_u32(engine, flags_address, 0)?;
         write_guest_u16(engine, show_window_address, 1)?;
+        // Zero the tail after wShowWindow (offset 66..104).
+        engine
+            .mem_write(
+                checked_field_address(startup_info_ptr, 66, "tail fields"),
+                &[0_u8; 38],
+            )
+            .context("GetStartupInfoW zero tail fields")?;
     }
 
     let return_address = engine

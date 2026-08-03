@@ -393,6 +393,25 @@ fn test_get_startup_info_w_writes_startupinfow() {
         .mem_read(info_ptr + 64, &mut show_window)
         .expect("read wShowWindow");
     assert_eq!(u16::from_le_bytes(show_window), 1);
+    // Windows zero-fills the whole struct: the caller's 0xAA pre-fill must
+    // not leak into the untouched fields. Only the cb low byte (offset 0,
+    // cb = 104 = 0x68 LE) and the wShowWindow low byte (offset 64, value 1)
+    // may be nonzero; dwFlags (60..64) is written as 0.
+    let mut full = [0_u8; 104];
+    engine
+        .mem_read(info_ptr, &mut full)
+        .expect("read full STARTUPINFOW");
+    let mut nonzero_offsets: Vec<usize> = Vec::new();
+    for (offset, &byte) in full.iter().enumerate() {
+        if byte != 0 {
+            nonzero_offsets.push(offset);
+        }
+    }
+    assert_eq!(
+        nonzero_offsets,
+        vec![0, 64],
+        "only cb and wShowWindow may be nonzero; the rest must be zeroed"
+    );
 }
 
 #[test]
@@ -1361,6 +1380,27 @@ fn test_get_window_text_length_a_matches_ascii() {
     );
 }
 
+#[test]
+fn test_get_window_text_length_a_counts_cp1252_chars() {
+    // Windows ANSI length counts CP1252 characters, not UTF-8 bytes:
+    // "café" is 5 UTF-8 bytes but 4 CP1252 chars (é encodes to one byte).
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    state.window_state().window_title = "café".to_string();
+    write_regs(&mut engine, user32::FAKE_WINDOW_HANDLE, 0, 0, 0, 0);
+    let id = crate::resolve_winapi_id("user32.dll", "GetWindowTextLengthA")
+        .expect("GetWindowTextLengthA must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("GetWindowTextLengthA must dispatch");
+    assert_eq!(
+        r.return_value, 4,
+        "\"café\" is 4 CP1252 chars, not 5 UTF-8 bytes"
+    );
+}
+
 // --- GetWindowPlacement / SetWindowPlacement ---
 
 /// Push a known window record with placement geometry and return its handle.
@@ -1384,6 +1424,55 @@ fn read_test_u32(engine: &mut IcedCpu, addr: u64) -> u32 {
     let mut bytes = [0_u8; 4];
     engine.mem_read(addr, &mut bytes).expect("read guest u32");
     u32::from_le_bytes(bytes)
+}
+
+/// Write a full WINDOWPLACEMENT struct for `SetWindowPlacement` tests.
+fn write_placement_struct(
+    engine: &mut IcedCpu,
+    ptr: u64,
+    show_cmd: u32,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+) {
+    engine
+        .mem_write(ptr, &user32::WINDOWPLACEMENT_LENGTH.to_le_bytes())
+        .expect("placement length");
+    engine
+        .mem_write(ptr + 4, &0_u32.to_le_bytes())
+        .expect("placement flags");
+    engine
+        .mem_write(ptr + 8, &show_cmd.to_le_bytes())
+        .expect("placement showCmd");
+    for offset in [12, 16, 20, 24] {
+        engine
+            .mem_write(ptr + offset, &0_i32.to_le_bytes())
+            .expect("placement point");
+    }
+    for (offset, value) in [(28, left), (32, top), (36, right), (40, bottom)] {
+        engine
+            .mem_write(ptr + offset, &value.to_le_bytes())
+            .expect("placement rect field");
+    }
+}
+
+/// Dispatch `SetWindowPlacement` through the full name→id→handler path.
+fn dispatch_set_window_placement(
+    engine: &mut IcedCpu,
+    state: &mut WinApiState,
+    hwnd: u64,
+    placement_ptr: u64,
+) -> u64 {
+    write_regs(engine, hwnd, placement_ptr, 0, 0, 0);
+    let id = crate::resolve_winapi_id("user32.dll", "SetWindowPlacement")
+        .expect("SetWindowPlacement must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(engine, test_environment(), state),
+        id,
+    )
+    .expect("SetWindowPlacement must dispatch");
+    r.return_value
 }
 
 /// Read a guest i32 at `addr` (test helper mirroring `read_guest_i32`).
@@ -1655,6 +1744,108 @@ fn test_set_window_placement_unknown_hwnd_is_false() {
     )
     .expect("SetWindowPlacement must dispatch");
     assert_eq!(r.return_value, 0, "unknown hwnd must return FALSE");
+}
+
+#[test]
+fn test_set_window_placement_requests_host_geometry_on_change() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let hwnd = push_geometry_window(&mut state);
+    let placement_ptr = 0x4000_u64;
+    write_placement_struct(&mut engine, placement_ptr, 2, 20, 30, 220, 130);
+    assert_eq!(
+        dispatch_set_window_placement(&mut engine, &mut state, hwnd, placement_ptr),
+        1,
+        "known hwnd must return TRUE"
+    );
+    assert_eq!(
+        state.window_state().host_geometry_request,
+        Some((20, 30, 200, 100)),
+        "a changed rcNormalPosition must be forwarded to the host window"
+    );
+}
+
+#[test]
+fn test_set_window_placement_unchanged_rect_skips_host_sync() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // push_geometry_window's record is already at (40, 50, 600, 400).
+    let hwnd = push_geometry_window(&mut state);
+    let placement_ptr = 0x4000_u64;
+    write_placement_struct(&mut engine, placement_ptr, 1, 40, 50, 640, 450);
+    assert_eq!(
+        dispatch_set_window_placement(&mut engine, &mut state, hwnd, placement_ptr),
+        1,
+        "known hwnd must return TRUE"
+    );
+    assert_eq!(
+        state.window_state().host_geometry_request,
+        None,
+        "an unchanged rect must not move the host window"
+    );
+}
+
+#[test]
+fn test_set_window_placement_fake_window_forwards_host_geometry() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let placement_ptr = 0x4000_u64;
+    write_placement_struct(&mut engine, placement_ptr, 1, 100, 200, 300, 300);
+    assert_eq!(
+        dispatch_set_window_placement(
+            &mut engine,
+            &mut state,
+            user32::FAKE_WINDOW_HANDLE,
+            placement_ptr,
+        ),
+        1,
+        "the fake window is a known hwnd"
+    );
+    assert_eq!(
+        state.window_state().host_geometry_request,
+        Some((100, 200, 200, 100)),
+        "the fake-window branch must forward the new geometry too"
+    );
+}
+
+#[test]
+fn test_set_window_placement_changed_rect_wakes_host_presenter() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let wake_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&wake_flag);
+    state.present().wake = Some(Box::new(move || {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    }));
+    let hwnd = push_geometry_window(&mut state);
+    let placement_ptr = 0x4000_u64;
+
+    write_placement_struct(&mut engine, placement_ptr, 1, 20, 30, 220, 130);
+    assert_eq!(
+        dispatch_set_window_placement(&mut engine, &mut state, hwnd, placement_ptr),
+        1
+    );
+    assert!(
+        wake_flag.load(std::sync::atomic::Ordering::SeqCst),
+        "a changed rect must wake the host presenter"
+    );
+
+    // The same rect again: no new wake, and the pending request survives.
+    wake_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+    write_placement_struct(&mut engine, placement_ptr, 1, 20, 30, 220, 130);
+    assert_eq!(
+        dispatch_set_window_placement(&mut engine, &mut state, hwnd, placement_ptr),
+        1
+    );
+    assert!(
+        !wake_flag.load(std::sync::atomic::Ordering::SeqCst),
+        "an unchanged rect must not wake the host presenter"
+    );
+    assert_eq!(
+        state.window_state().host_geometry_request,
+        Some((20, 30, 200, 100)),
+        "a pending request survives an unchanged follow-up call"
+    );
 }
 
 // --- Comctl32 ---
@@ -2001,6 +2192,36 @@ fn test_get_file_title_w_trailing_separator_is_invalid() {
         read_guest_utf16_raw(&mut engine, title_addr, 64),
         "",
         "buffer must be NUL-terminated"
+    );
+}
+
+#[test]
+fn test_get_file_title_w_empty_path_is_success() {
+    // A genuinely empty path has no basename, but real GetFileTitle treats
+    // it as success: 0 return with an empty NUL-terminated title (only a
+    // trailing-separator path is an invalid file name).
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let path_addr = 0x5000;
+    let title_addr = 0x6000;
+    write_guest_utf16(&mut engine, path_addr, "");
+    // Pre-fill so the handler's NUL write is observable.
+    engine
+        .mem_write(title_addr, &[0xAA_u8; 64])
+        .expect("prefill title buffer");
+    write_regs(&mut engine, path_addr, title_addr, 64, 0, 0);
+    let id = crate::resolve_winapi_id("comdlg32.dll", "GetFileTitleW")
+        .expect("GetFileTitleW must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("GetFileTitleW must dispatch");
+    assert_eq!(r.return_value, 0, "empty path must succeed with 0");
+    assert_eq!(
+        read_guest_utf16_raw(&mut engine, title_addr, 64),
+        "",
+        "title buffer must be NUL-terminated"
     );
 }
 
@@ -7863,7 +8084,7 @@ fn test_translate_accelerator_a_mirrors_w() {
     write_regs(&mut engine, image_base, 0x100, 0, 0, 0);
     let haccel = dispatch_user32(&mut engine, &mut state, "LoadAcceleratorsA");
 
-    // Shift+O (0x05 = FVIRTKEY|FSHIFT, VK_O) via the A variant.
+    // Shift+O (0x05 = FVIRTKEY|FSHIFT = 0x01|0x04, VK_O) via the A variant.
     state.window_state().keyboard_state.set(0x10, 0x80); // VK_SHIFT
     let msg_ptr = 0x4000_u64;
     engine

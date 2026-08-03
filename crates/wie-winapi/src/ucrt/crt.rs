@@ -163,9 +163,82 @@ pub(crate) fn handle_fpreset(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
 
 pub(crate) fn handle_p_wenviron(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    // wchar_t*** — point at a slot holding NULL (empty wide environment block).
-    engine.mem_write(WENVIRON_PTR_SLOT, &0_u64.to_le_bytes())?;
+    let state = &mut *ctx.state;
+    // Materialize the wide env table once; later calls return the same stable
+    // address (real UCRT keeps a static `__wenviron`).
+    let mut slot = [0_u8; 8];
+    engine
+        .mem_read(WENVIRON_PTR_SLOT, &mut slot)
+        .context("__p__wenviron read slot")?;
+    if u64::from_le_bytes(slot) == 0 {
+        materialize_wide_env(engine, state)?;
+    }
     ret(engine, WENVIRON_PTR_SLOT)
+}
+
+/// Build the guest `wchar_t**` table behind `__p__wenviron` from the host
+/// environment (`std::env::vars_os()`), mirroring the `__p___wargv`
+/// materialization: one guest-heap block holds `(n+1)` pointer entries
+/// followed by the UTF-16 string bodies, NULL-terminated.
+///
+/// The table pointer cannot live in a process-global `OnceLock`: the
+/// allocation needs the per-session guest heap (`&mut WinApiState`), so a
+/// static cannot reach it. The guest slot (`WENVIRON_PTR_SLOT`) is the
+/// per-session once-guard instead — it starts zeroed and is filled exactly
+/// once, keeping the cross-cutting rule that immutable process-global
+/// config does not live in `WinApiState`. Heap exhaustion degrades to an
+/// empty environment rather than failing the CRT call.
+fn materialize_wide_env(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut crate::WinApiState,
+) -> Result<()> {
+    // Host env vars → L"KEY=VALUE" strings (lossy for non-UTF-8 hosts).
+    let vars: Vec<String> = std::env::vars_os()
+        .map(|(key, value)| format!("{}={}", key.to_string_lossy(), value.to_string_lossy()))
+        .take(4096)
+        .collect();
+
+    let table_len = (vars.len() + 1).saturating_mul(8); // entries + NULL terminator
+    let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(vars.len());
+    let mut body_total: usize = 0;
+    for var in &vars {
+        let mut bytes = Vec::with_capacity(
+            var.encode_utf16()
+                .count()
+                .saturating_mul(2)
+                .saturating_add(2),
+        );
+        for unit in var.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        body_total = body_total.saturating_add(bytes.len());
+        bodies.push(bytes);
+    }
+    // Even an empty host env yields the 8-byte NULL terminator, so the
+    // block is never zero-sized.
+    let total = u64::try_from(table_len.saturating_add(body_total)).unwrap_or(0);
+    let base = state.heap_state.heap.alloc_coherent(engine, total);
+    if base == 0 {
+        return Ok(()); // OOM — slot stays NULL; guest sees an empty env.
+    }
+    let mut cursor = base.wrapping_add(u64::try_from(table_len).unwrap_or(0));
+    let mut entries: Vec<u64> = Vec::with_capacity(bodies.len());
+    for body in &bodies {
+        entries.push(cursor);
+        engine.mem_write(cursor, body)?;
+        cursor = cursor.wrapping_add(u64::try_from(body.len()).unwrap_or(0));
+    }
+    let mut table = Vec::with_capacity(table_len);
+    for e in &entries {
+        table.extend_from_slice(&e.to_le_bytes());
+    }
+    table.extend_from_slice(&0_u64.to_le_bytes());
+    engine.mem_write(base, &table)?;
+    engine
+        .mem_write(WENVIRON_PTR_SLOT, &base.to_le_bytes())
+        .context("__p__wenviron write slot")?;
+    Ok(())
 }
 
 pub(crate) fn handle_p_wargv(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {

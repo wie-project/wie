@@ -220,9 +220,16 @@ fn fpreset_succeeds() {
 }
 
 #[test]
-fn p_wenviron_returns_slot_holding_null_table() {
+fn p_wenviron_materializes_wide_env_from_host() {
     let mut engine = test_engine();
     let mut state = test_state();
+    // Initialise the guest heap control block bump cursor (0x2000 was
+    // attached as ctrl in `test_state`), otherwise `alloc_coherent` sees
+    // bump=0 < base.
+    engine
+        .mem_write(0x2000, &0x2000_u64.to_le_bytes())
+        .expect("write heap bump cursor");
+
     let r = dispatch(
         "api-ms-win-crt-environment-l1-1-0.dll",
         "__p__wenviron",
@@ -230,11 +237,48 @@ fn p_wenviron_returns_slot_holding_null_table() {
         &mut state,
     );
     assert_eq!(r.return_value, WENVIRON_PTR_SLOT);
+    // *slot → wchar_t** table materialized from the host env.
     let mut slot = [0_u8; 8];
     engine
         .mem_read(WENVIRON_PTR_SLOT, &mut slot)
         .expect("read slot");
-    assert_eq!(u64::from_le_bytes(slot), 0, "wide environment is empty");
+    let table = u64::from_le_bytes(slot);
+    assert_ne!(table, 0, "wide env table must be materialized");
+
+    // Walk the NULL-terminated table; every entry must parse as KEY=VALUE.
+    let mut entries: Vec<String> = Vec::new();
+    for i in 0_u64..4096 {
+        let mut entry_ptr = [0_u8; 8];
+        engine
+            .mem_read(table.wrapping_add(i.wrapping_mul(8)), &mut entry_ptr)
+            .expect("read entry pointer");
+        let ptr = u64::from_le_bytes(entry_ptr);
+        if ptr == 0 {
+            break; // NULL terminator ends the table.
+        }
+        let entry = read_wide(&mut engine, ptr);
+        let (key, _value) = entry
+            .split_once('=')
+            .expect("env entry must parse as KEY=VALUE");
+        assert!(!key.is_empty(), "env key must be non-empty");
+        entries.push(entry);
+    }
+    assert!(
+        !entries.is_empty(),
+        "host env must yield at least one variable"
+    );
+    // The materialized keys must mirror the host environment exactly.
+    let host_keys: std::collections::HashSet<String> =
+        std::env::vars().map(|(key, _)| key).collect();
+    let guest_keys: std::collections::HashSet<&str> = entries
+        .iter()
+        .map(|entry| entry.split_once('=').map_or("", |(key, _)| key))
+        .collect();
+    let expected: std::collections::HashSet<&str> = host_keys.iter().map(String::as_str).collect();
+    assert_eq!(
+        guest_keys, expected,
+        "wide env keys must mirror the host env"
+    );
 }
 
 #[test]

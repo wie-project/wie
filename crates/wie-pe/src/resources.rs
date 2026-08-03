@@ -84,7 +84,11 @@ impl WindowExStyle {
 /// `IMAGE_SCN_CNT_INITIALIZED_DATA` (used to spot a resource-like section).
 const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x0000_0040;
 
-/// Safety cap for UTF-16 field strings (matches the 4096-char guest string cap).
+/// Safety cap: dialog/menu/string-table strings arrive as length-prefixed
+/// bytes from a possibly hostile PE, and a corrupt prefix or a missing NUL
+/// terminator must not force unbounded parse-time allocation. 4096 UTF-16
+/// words (8 KiB) bounds the scan while sitting far above any realistic field
+/// string.
 const MAX_STRING_WORDS: usize = 4096;
 
 /// Axis pixel size derived from dialog units.

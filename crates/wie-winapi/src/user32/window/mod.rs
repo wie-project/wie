@@ -858,7 +858,8 @@ pub fn handle_get_window_text_length_w(
     let text = resolve_window_text(state, window_handle);
 
     // Count of UTF-16 units — exactly what GetWindowTextW would copy,
-    // excluding the terminating NUL. Empty/unknown text resolves to "" → 0.
+    // excluding the terminating NUL (mirrors write_guest_utf16_c_string's
+    // length semantics). Empty/unknown text resolves to "" → 0.
     let length = u64::try_from(text.encode_utf16().count())
         .context("window text length does not fit u64")?;
 
@@ -871,6 +872,7 @@ pub fn handle_get_window_text_length_w(
         return_value: length,
     })
 }
+
 /// Handles `USER32.dll!GetWindowTextLengthA`.
 pub fn handle_get_window_text_length_a(
     ctx: &mut HandlerContext<'_>,
@@ -883,11 +885,14 @@ pub fn handle_get_window_text_length_a(
 
     let text = resolve_window_text(state, window_handle);
 
-    // Count of ANSI characters — what GetWindowTextA would copy, excluding
-    // the terminating NUL. ANSI output is one byte per char here, so the
-    // byte count is the character count. Empty/unknown text resolves to
-    // "" → 0.
-    let length = u64::try_from(text.len()).context("window text length does not fit u64")?;
+    // Count of CP1252 characters — what Windows GetWindowTextLengthA reports
+    // (the ACP is 1252, one byte per char). `encode_acp` maps each char to a
+    // single CP1252 byte (unmappable chars fall back to '?', matching the
+    // A write path), so the encoded length is the ANSI character count
+    // (mirrors write_guest_ansi_c_string's length semantics).
+    // Empty/unknown text resolves to "" → 0.
+    let length = u64::try_from(crate::vfs::encode_acp(&text).len())
+        .context("window text length does not fit u64")?;
 
     let return_address = engine
         .return_from_win64_api(length)

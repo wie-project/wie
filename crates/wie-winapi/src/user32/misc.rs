@@ -882,7 +882,8 @@ fn handle_load_string(ctx: &mut HandlerContext<'_>, api_name: &str) -> Result<Wi
         .read_r9()
         .with_context(|| format!("failed to read R9 for {api_name}"))?;
 
-    // String ids are u16; anything wider cannot address a parsed block.
+    // API contract: LoadString string ids are u16 (anything wider cannot
+    // address a parsed block).
     let string_id = u16::try_from(string_id_raw & u64::from(u16::MAX)).unwrap_or(0);
     let max_characters = usize::try_from(max_characters_raw)
         .with_context(|| format!("{api_name} cchMax does not fit usize"))?;

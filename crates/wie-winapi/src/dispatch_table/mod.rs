@@ -429,11 +429,11 @@ pub enum WinApiId {
     User32Registerwindowmessagea = 408,
     /// Appended here (not adjacent to User32Registerwindowmessagea) to avoid renumbering the entire enum.
     User32Registerwindowmessagew = 409,
-    /// Appended here (not adjacent to User32Getdlgitemw) to avoid renumbering the entire enum.
+    /// Appended here (not adjacent to User32Registerwindowmessagew) to avoid renumbering the entire enum.
     User32Loadstringa = 410,
     /// Appended here (not adjacent to User32Loadstringa) to avoid renumbering the entire enum.
     User32Loadstringw = 411,
-    /// Appended here (not adjacent to Advapi32Regopenkeyexa) to avoid renumbering the entire enum.
+    /// Appended here (not adjacent to the Ex variants) to avoid renumbering the entire enum.
     Advapi32Regopenkeya = 412,
     /// Appended here (not adjacent to Advapi32Regopenkeya) to avoid renumbering the entire enum.
     Advapi32Regopenkeyw = 413,
