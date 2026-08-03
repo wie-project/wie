@@ -52,9 +52,13 @@ pub(super) fn paint_control(
     let items = control_items(state, hwnd).to_vec();
     let sel_index = control_sel_index(state, hwnd);
 
-    // Controls use the system default font (sans-serif 16 px). Take the font
-    // engine out of gdi state so it can be passed down with the surface
-    // borrows; put it back when the paint is done.
+    // Controls use the system default font (sans-serif 16 px). The engine is
+    // taken out of gdi state so the paint can pass `&mut state` and
+    // `&mut font_engine` side by side (a plain field cannot be split-borrowed
+    // alongside `state`); it is put back unconditionally after the body. This
+    // is safe under the single shared WinApiState mutex: every API handler —
+    // this WM_PAINT and any concurrent one on another host thread — runs
+    // while holding it, so the take and the put cannot interleave.
     let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
     let default_key = FontKey::default();
     let resolved = font_engine.resolve(&default_key, 16);

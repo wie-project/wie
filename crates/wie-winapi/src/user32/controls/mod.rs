@@ -30,11 +30,20 @@ mod r#static;
 
 use button::paint_control;
 use edit::{
-    edit_char, edit_delete_at_caret, edit_get_selection, edit_move_caret, edit_notify_change,
-    edit_set_selection,
+    edit_char, edit_delete_at_caret, edit_first_visible_line, edit_get_handle, edit_get_limit,
+    edit_get_line, edit_get_modify, edit_get_selection, edit_invalidate_text_buffer,
+    edit_line_count, edit_line_from_char, edit_line_index, edit_line_length, edit_move_caret,
+    edit_notify_change, edit_pos_from_char, edit_replace_selection, edit_scroll_caret,
+    edit_selection_type, edit_set_handle, edit_set_limit, edit_set_modify, edit_set_selection,
+    edit_set_tab_stops,
 };
 use listbox::{listbox_hit_item, listbox_notify_change};
 use paint::write_control_text;
+// Re-exported for the host unit tests in `state/tests.rs` (the `edit` module
+// itself stays private to `controls`); test-only so the lib build has no
+// unused import.
+#[cfg(test)]
+pub(crate) use edit::{VisibleSegment, layout_visible_lines};
 
 /// `GetSysColor(COLOR_BTNFACE)` — the standard push-button face.
 const COLOR_BTNFACE: u32 = 0x00F0_F0F0;
@@ -49,6 +58,22 @@ const COLOR_BTNFACE_PRESSED: u32 = 0x00D8_D8D8;
 const COLOR_HIGHLIGHT: u32 = 0x0000_78D7;
 /// `GetSysColor(COLOR_HIGHLIGHTTEXT)` — text drawn over the selection.
 const COLOR_HIGHLIGHTTEXT: u32 = 0x00FF_FFFF;
+
+/// `ES_MULTILINE` — the EDIT accepts `\n` and answers the EM_* line metrics.
+///
+/// The full ES_* style set (ES_WANTRETURN 0x4, ES_AUTOVSCROLL 0x40,
+/// ES_AUTOHSCROLL 0x80, ES_NOHIDESEL 0x100, ES_READONLY 0x800, ES_MULTILINE
+/// 0x1000, plus the ES_LEFT/CENTER/RIGHT 0x3 alignment mask) is captured
+/// wholesale into `ControlState::Edit::style_bits` at seed time; only the bits
+/// a task reads get a named constant here.
+pub(crate) const ES_MULTILINE: u32 = 0x1000;
+
+// `EM_SELECTIONTYPE` return bits (winuser.h). SEL_ATTRIBUTE (0x2) and
+// SEL_RECHANGE (0x4) are rich-edit-only and never set by a plain EDIT.
+pub(crate) const SEL_EMPTY: u64 = 0x0000;
+pub(crate) const SEL_TEXT: u64 = 0x0001;
+pub(crate) const SEL_MULTICHAR: u64 = 0x0008;
+pub(crate) const SEL_MULTILINE: u64 = 0x0010;
 
 /// A built-in USER32 control class, resolved at `CreateWindowEx` time.
 ///
@@ -124,11 +149,9 @@ impl ControlClassKind {
             Self::Button => ControlState::Button {
                 default_push: false,
             },
-            Self::Edit => ControlState::Edit {
-                caret: 0,
-                sel_start: 0,
-                sel_end: 0,
-            },
+            // No window context here, so the style bits seed to zero; the
+            // EDIT's own seeder (`edit_state_mut`) captures the real dwStyle.
+            Self::Edit => Self::new_edit_state(0),
             Self::ListBox => ControlState::ListBox {
                 items: Vec::new(),
                 sel_index: -1,
@@ -139,6 +162,25 @@ impl ControlClassKind {
             },
             Self::StatusBar => ControlState::StatusBar,
             Self::Static => ControlState::Static,
+        }
+    }
+
+    /// The initial EDIT state with the window's creation style captured into
+    /// `style_bits` (the ES_* bits live in dwStyle's low word; the WS_* bits
+    /// ride along harmlessly).
+    #[must_use]
+    pub(crate) fn new_edit_state(style: u32) -> ControlState {
+        ControlState::Edit {
+            caret: 0,
+            sel_start: 0,
+            sel_end: 0,
+            style_bits: style,
+            limit: 0,
+            modified: false,
+            handle_buffer: 0,
+            undo_buffer: Vec::new(),
+            first_visible_line: 0,
+            tab_stops: Vec::new(),
         }
     }
 }
@@ -165,6 +207,33 @@ pub enum ControlState {
         sel_start: usize,
         /// Selection end (exclusive character index).
         sel_end: usize,
+        /// The window's creation `dwStyle` captured at first use. The ES_*
+        /// bits (ES_MULTILINE 0x1000, ES_WANTRETURN 0x4, ES_AUTOVSCROLL 0x40,
+        /// ES_AUTOHSCROLL 0x80, ES_NOHIDESEL 0x100, ES_READONLY 0x800, the
+        /// ES_LEFT/CENTER/RIGHT 0x3 alignment mask) sit in the low word;
+        /// WS_* bits ride along harmlessly.
+        style_bits: u32,
+        /// `EM_LIMITTEXT` cap in characters (0 = unlimited).
+        limit: usize,
+        /// `EM_GETMODIFY`/`EM_SETMODIFY` flag; set on any text mutation.
+        modified: bool,
+        /// The cached `EM_GETHANDLE` buffer (a guest VA the guest owns and
+        /// LocalFree's). Reused on repeat GETHANDLE calls while the text is
+        /// unchanged; any text mutation clears it so the next GETHANDLE
+        /// allocates a fresh copy.
+        handle_buffer: u64,
+        /// Undo snapshot stack — placeholder storage until Task 2.6 owns the
+        /// EM_CANUNDO/EM_UNDO semantics and starts reading it.
+        undo_buffer: Vec<String>,
+        /// First visible line (`EM_GETFIRSTVISIBLELINE`; `EM_SCROLLCARET`
+        /// updates it). Task 2.2's paint reads it as the visual-row start
+        /// (`layout_visible_lines`' `first_visible`); Task 2.4: it currently
+        /// also serves as the vertical scroll offset.
+        first_visible_line: usize,
+        /// Tab stop positions in dialog units (`EM_SETTABSTOPS`). Only the
+        /// tests read the stored stops today; the typing/tab-expansion path
+        /// consumes them in Task 2.3.
+        tab_stops: Vec<u16>,
     },
     /// LISTBOX (item list, no scrollbar yet).
     ListBox {
@@ -424,6 +493,9 @@ impl ControlClassKind {
                     window.control_text = text;
                     window.invalidated = true;
                 }
+                // The text changed: an EDIT's cached EM_GETHANDLE buffer is
+                // stale (the old handle is the guest's to LocalFree).
+                edit_invalidate_text_buffer(state, hwnd);
                 Ok(Some(1))
             }
             (ControlClassKind::Edit, WinMsg::WM_GETDLGCODE) => Ok(Some(DLGC_WANTCHARS)),
@@ -484,6 +556,100 @@ impl ControlClassKind {
                 let start_lo = u32::try_from(start).unwrap_or(0) & 0xFFFF;
                 let end_hi = (u32::try_from(end).unwrap_or(0) & 0xFFFF) << 16;
                 Ok(Some(u64::from(start_lo | end_hi)))
+            }
+            // EM_LIMITTEXT: wParam = max chars the user can type (0 = none).
+            (ControlClassKind::Edit, WinMsg::EM_LIMITTEXT) => {
+                edit_set_limit(state, hwnd, word_parameter);
+                Ok(Some(1)) // TRUE
+            }
+            (ControlClassKind::Edit, WinMsg::EM_GETLIMITTEXT) => {
+                Ok(Some(edit_get_limit(state, hwnd)))
+            }
+            // EM_GETLINECOUNT: the '\n'-separated line count (1 for empty).
+            (ControlClassKind::Edit, WinMsg::EM_GETLINECOUNT) => {
+                Ok(Some(edit_line_count(state, hwnd)))
+            }
+            // EM_LINEFROMCHAR: the line containing the char index (-1 = the
+            // caret's line). wParam is a 32-bit index; the low-word decode
+            // treats 0xFFFF_FFFF as -1 like the other control messages.
+            (ControlClassKind::Edit, WinMsg::EM_LINEFROMCHAR) => {
+                let index = low_i32(word_parameter, "EM_LINEFROMCHAR index")?;
+                Ok(Some(edit_line_from_char(state, hwnd, index)))
+            }
+            // EM_LINEINDEX: char index of the line's first char (-1 if the
+            // line is out of range).
+            (ControlClassKind::Edit, WinMsg::EM_LINEINDEX) => {
+                let line = low_i32(word_parameter, "EM_LINEINDEX line")?;
+                Ok(Some(edit_line_index(state, hwnd, line)))
+            }
+            // EM_LINELENGTH: chars in the line holding the char index,
+            // excluding its EOL (-1 = the caret's line, minus its selection).
+            (ControlClassKind::Edit, WinMsg::EM_LINELENGTH) => {
+                let index = low_i32(word_parameter, "EM_LINELENGTH index")?;
+                Ok(Some(edit_line_length(state, hwnd, index)))
+            }
+            // EM_GETLINE: wParam = line, lParam = buffer whose first WORD is
+            // the capacity (including the NUL). Copies the line without its
+            // EOL; returns the char count (0 for an out-of-range line).
+            (ControlClassKind::Edit, WinMsg::EM_GETLINE) => {
+                let line = low_i32(word_parameter, "EM_GETLINE line")?;
+                let copied = edit_get_line(engine, unicode, state, hwnd, line, long_parameter)?;
+                Ok(Some(copied))
+            }
+            // EM_REPLACESEL: replace the selection with the string at lParam;
+            // a real change delivers EN_CHANGE like a keystroke.
+            (ControlClassKind::Edit, WinMsg::EM_REPLACESEL) => {
+                let changed = edit_replace_selection(engine, unicode, state, hwnd, long_parameter)?;
+                if changed {
+                    invalidate(state, hwnd);
+                    return edit_notify_change(state, hwnd);
+                }
+                Ok(Some(0))
+            }
+            // EM_SCROLLCARET: bring the caret's line into view (updates the
+            // first-visible-line state; viewport-aware clamping is Task 2.4).
+            (ControlClassKind::Edit, WinMsg::EM_SCROLLCARET) => {
+                edit_scroll_caret(state, hwnd);
+                Ok(Some(1)) // TRUE
+            }
+            (ControlClassKind::Edit, WinMsg::EM_GETMODIFY) => {
+                Ok(Some(edit_get_modify(state, hwnd)))
+            }
+            (ControlClassKind::Edit, WinMsg::EM_SETMODIFY) => {
+                edit_set_modify(state, hwnd, word_parameter);
+                Ok(Some(1))
+            }
+            // EM_GETHANDLE: a LocalAlloc'd guest copy of the text (a fresh
+            // buffer per call; the guest owns it and LocalFree's it).
+            (ControlClassKind::Edit, WinMsg::EM_GETHANDLE) => {
+                let handle = edit_get_handle(engine, unicode, state, hwnd)?;
+                Ok(Some(handle))
+            }
+            // EM_SETHANDLE: adopt the guest buffer as the text (the caller
+            // relinquishes ownership; caret/selection reset).
+            (ControlClassKind::Edit, WinMsg::EM_SETHANDLE) => {
+                let ok = edit_set_handle(engine, unicode, state, hwnd, long_parameter)?;
+                Ok(Some(u64::from(ok)))
+            }
+            // EM_SETTABSTOPS: wParam = stop count, lParam = u16 array in
+            // dialog units (0 = default stops).
+            (ControlClassKind::Edit, WinMsg::EM_SETTABSTOPS) => {
+                let ok = edit_set_tab_stops(engine, state, hwnd, word_parameter, long_parameter)?;
+                Ok(Some(u64::from(ok)))
+            }
+            // EM_POSFROMCHAR: wParam = char index, lParam = POINT* (client
+            // coords). Basic answer — Task 2.2 refines with font metrics.
+            (ControlClassKind::Edit, WinMsg::EM_POSFROMCHAR) => {
+                let index = low_i32(word_parameter, "EM_POSFROMCHAR index")?;
+                let ok = edit_pos_from_char(engine, state, hwnd, index, long_parameter)?;
+                Ok(Some(u64::from(ok)))
+            }
+            // EM_SELECTIONTYPE: the SEL_* bitmask of the current selection.
+            (ControlClassKind::Edit, WinMsg::EM_SELECTIONTYPE) => {
+                Ok(Some(edit_selection_type(state, hwnd)))
+            }
+            (ControlClassKind::Edit, WinMsg::EM_GETFIRSTVISIBLELINE) => {
+                Ok(Some(edit_first_visible_line(state, hwnd)))
             }
             // LB_SETCURSEL / CB_SETCURSEL: wParam = item index (-1 clears);
             // out-of-range is LB_ERR. A changed selection delivers
@@ -731,7 +897,8 @@ mod tests {
             ControlState::Edit {
                 caret: 0,
                 sel_start: 0,
-                sel_end: 0
+                sel_end: 0,
+                ..
             }
         ));
         assert!(matches!(

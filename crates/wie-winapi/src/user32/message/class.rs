@@ -28,6 +28,7 @@ pub fn handle_register_class_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
 
     // WNDCLASSA on Win64:
     //  +0x00 style (u32)
+    //  +0x04 (padding — lpfnWndProc must be 8-byte aligned)
     //  +0x08 lpfnWndProc (u64)
     //  +0x10 cbClsExtra (i32)
     //  +0x14 cbWndExtra (i32)
@@ -132,6 +133,7 @@ pub fn handle_register_class_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     // WNDCLASSW on Win64 (same layout as WNDCLASSA, but lpszClassName
     // and lpszMenuName point to UTF-16 strings):
     //  +0x00 style (u32)
+    //  +0x04 (padding — lpfnWndProc must be 8-byte aligned)
     //  +0x08 lpfnWndProc (u64)
     //  +0x10 cbClsExtra (i32)
     //  +0x14 cbWndExtra (i32)

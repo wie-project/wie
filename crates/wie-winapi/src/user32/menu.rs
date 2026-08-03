@@ -43,10 +43,12 @@ pub enum MenuEntry {
     Separator,
 }
 
-/// `MF_*` flags relevant to the mechanical menu tier.
-const MF_SEPARATOR: u32 = 0x0800;
+/// `MF_*` flags relevant to the mechanical menu tier. `MF_POPUP` and
+/// `MF_SEPARATOR` are `pub(crate)` so the lib tests name the flags instead of
+/// hardcoding the values.
+pub(crate) const MF_SEPARATOR: u32 = 0x0800;
 const MF_BYPOSITION: u32 = 0x0400;
-const MF_POPUP: u32 = 0x0010;
+pub(crate) const MF_POPUP: u32 = 0x0010;
 const MF_CHECKED: u32 = 0x0008;
 const MF_DISABLED: u32 = 0x0002;
 const MF_GRAYED: u32 = 0x0001;
@@ -570,6 +572,9 @@ pub fn handle_destroy_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
             .context("failed to read RCX for DestroyMenu")?,
     );
     let ws = state.window_state();
+    // YAGNI: DestroyMenu does not tear down resource_menus entries — a
+    // resource menu is a (module, id)-keyed cache shared by repeated
+    // LoadMenu calls, not a per-destroy handle.
     let before = ws.menus.len();
     ws.menus.retain(|m| m.handle != menu_handle);
     if ws.menus.len() != before {

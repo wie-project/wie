@@ -137,6 +137,40 @@ pub(crate) const LB_GETCURSEL: u32 = wm::WinMsg::LB_GETCURSEL.as_u32();
 pub(crate) const EM_GETSEL: u32 = wm::WinMsg::EM_GETSEL.as_u32();
 #[cfg(test)]
 pub(crate) const EM_SETSEL: u32 = wm::WinMsg::EM_SETSEL.as_u32();
+#[cfg(test)]
+pub(crate) const EM_SCROLLCARET: u32 = wm::WinMsg::EM_SCROLLCARET.as_u32();
+#[cfg(test)]
+pub(crate) const EM_GETMODIFY: u32 = wm::WinMsg::EM_GETMODIFY.as_u32();
+#[cfg(test)]
+pub(crate) const EM_SETMODIFY: u32 = wm::WinMsg::EM_SETMODIFY.as_u32();
+#[cfg(test)]
+pub(crate) const EM_GETLINECOUNT: u32 = wm::WinMsg::EM_GETLINECOUNT.as_u32();
+#[cfg(test)]
+pub(crate) const EM_LINEINDEX: u32 = wm::WinMsg::EM_LINEINDEX.as_u32();
+#[cfg(test)]
+pub(crate) const EM_SETHANDLE: u32 = wm::WinMsg::EM_SETHANDLE.as_u32();
+#[cfg(test)]
+pub(crate) const EM_GETHANDLE: u32 = wm::WinMsg::EM_GETHANDLE.as_u32();
+#[cfg(test)]
+pub(crate) const EM_LINELENGTH: u32 = wm::WinMsg::EM_LINELENGTH.as_u32();
+#[cfg(test)]
+pub(crate) const EM_REPLACESEL: u32 = wm::WinMsg::EM_REPLACESEL.as_u32();
+#[cfg(test)]
+pub(crate) const EM_GETLINE: u32 = wm::WinMsg::EM_GETLINE.as_u32();
+#[cfg(test)]
+pub(crate) const EM_LIMITTEXT: u32 = wm::WinMsg::EM_LIMITTEXT.as_u32();
+#[cfg(test)]
+pub(crate) const EM_LINEFROMCHAR: u32 = wm::WinMsg::EM_LINEFROMCHAR.as_u32();
+#[cfg(test)]
+pub(crate) const EM_SETTABSTOPS: u32 = wm::WinMsg::EM_SETTABSTOPS.as_u32();
+#[cfg(test)]
+pub(crate) const EM_GETFIRSTVISIBLELINE: u32 = wm::WinMsg::EM_GETFIRSTVISIBLELINE.as_u32();
+#[cfg(test)]
+pub(crate) const EM_GETLIMITTEXT: u32 = wm::WinMsg::EM_GETLIMITTEXT.as_u32();
+#[cfg(test)]
+pub(crate) const EM_POSFROMCHAR: u32 = wm::WinMsg::EM_POSFROMCHAR.as_u32();
+#[cfg(test)]
+pub(crate) const EM_SELECTIONTYPE: u32 = wm::WinMsg::EM_SELECTIONTYPE.as_u32();
 
 // Control notification codes / DLGC_* dialog codes (winuser.h).
 pub(crate) const BN_CLICKED: u64 = 0;

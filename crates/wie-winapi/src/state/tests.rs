@@ -2658,7 +2658,7 @@ fn push_two_item_menu(state: &mut WinApiState) -> u64 {
     let menu = create_menu(state);
     let mut engine = test_engine();
     append_menu_a(&mut engine, state, menu, 0x0000, 100, "Exit");
-    append_menu_a(&mut engine, state, menu, 0x0800, 0, ""); // MF_SEPARATOR
+    append_menu_a(&mut engine, state, menu, crate::user32::MF_SEPARATOR, 0, "");
     append_menu_a(&mut engine, state, menu, 0x0000, 200, "About");
     menu
 }
@@ -2674,15 +2674,22 @@ fn test_append_menu_builds_native_tree() {
     let popup = create_menu(&mut state);
     let mut engine = test_engine();
     append_menu_a(&mut engine, &mut state, menu, 0x0000, 100, "Exit");
-    append_menu_a(&mut engine, &mut state, menu, 0x0800, 0, "");
     append_menu_a(
         &mut engine,
         &mut state,
         menu,
-        0x0010,
+        crate::user32::MF_SEPARATOR,
+        0,
+        "",
+    );
+    append_menu_a(
+        &mut engine,
+        &mut state,
+        menu,
+        crate::user32::MF_POPUP,
         u32::try_from(popup).expect("popup handle"),
         "File",
-    ); // MF_POPUP
+    );
 
     assert!(state.window_state().menu_dirty, "AppendMenu must dirty");
     let record = state
@@ -2742,7 +2749,7 @@ fn test_get_menu_state_by_command_and_position() {
             test_environment(),
             &mut state,
         )),
-        0x0800
+        u64::from(crate::user32::MF_SEPARATOR)
     );
 
     // Unknown command id returns -1.
@@ -2938,7 +2945,7 @@ fn push_menu_templates(state: &mut WinApiState) {
         id: 0x201,
         items: vec![
             MenuItemTemplate {
-                flags: 0x10, // MF_POPUP
+                flags: crate::user32::MF_POPUP,
                 id: 0,
                 text: Some("File".to_owned()),
                 sub: vec![
@@ -2949,7 +2956,7 @@ fn push_menu_templates(state: &mut WinApiState) {
                         sub: Vec::new(),
                     },
                     MenuItemTemplate {
-                        flags: 0x0800, // MF_SEPARATOR
+                        flags: crate::user32::MF_SEPARATOR,
                         id: 0,
                         text: None,
                         sub: Vec::new(),
@@ -2963,7 +2970,7 @@ fn push_menu_templates(state: &mut WinApiState) {
                 ],
             },
             MenuItemTemplate {
-                flags: 0x10, // MF_POPUP
+                flags: crate::user32::MF_POPUP,
                 id: 0,
                 text: Some("Edit".to_owned()),
                 sub: vec![MenuItemTemplate {
@@ -3100,6 +3107,130 @@ fn test_create_window_inherits_class_menu_name() {
         true,
     )
     .expect("create window");
+    assert_ne!(hwnd, 0);
+
+    let window = state
+        .window_state()
+        .windows
+        .iter()
+        .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
+        .expect("window record exists");
+    assert_ne!(
+        window.menu_handle, 0,
+        "a window without an explicit hMenu must inherit the class menu"
+    );
+    assert!(
+        state.window_state().menu_dirty,
+        "attaching a menu must dirty"
+    );
+}
+
+#[test]
+fn test_register_class_ex_w_class_menu_end_to_end() {
+    // The full guest path: a WNDCLASSEXW struct in guest memory whose
+    // lpszMenuName is MAKEINTRESOURCEW(0x201) is read by RegisterClassExW,
+    // and a CreateWindowExW with hMenu = NULL inherits the class menu.
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    push_menu_templates(&mut state);
+    let image_base = default_env().image_base;
+    // Prime the guest heap control block so CreateWindowExW's CREATESTRUCT
+    // allocation (a coherent LocalAlloc-style block) succeeds.
+    engine
+        .mem_write(0x2000, &0x2000_u64.to_le_bytes())
+        .expect("guest heap bump cursor");
+
+    // WNDCLASSEXW at 0x4000 (misc.rs layout: cbSize@0, style@4, lpfnWndProc@8,
+    // cbClsExtra@0x10, cbWndExtra@0x14, hInstance@0x18, hIcon@0x20,
+    // hCursor@0x28, hbrBackground@0x30, lpszMenuName@0x38, lpszClassName@0x40,
+    // hIconSm@0x48).
+    let wc = 0x4000_u64;
+    engine
+        .mem_write(wc, &80_u32.to_le_bytes())
+        .expect("WNDCLASSEXW.cbSize");
+    engine
+        .mem_write(wc + 4, &0_u32.to_le_bytes())
+        .expect("WNDCLASSEXW.style");
+    engine
+        .mem_write(wc + 8, &0x7000_0000_u64.to_le_bytes())
+        .expect("WNDCLASSEXW.lpfnWndProc");
+    engine
+        .mem_write(wc + 0x10, &0_i32.to_le_bytes())
+        .expect("WNDCLASSEXW.cbClsExtra");
+    engine
+        .mem_write(wc + 0x14, &0_i32.to_le_bytes())
+        .expect("WNDCLASSEXW.cbWndExtra");
+    engine
+        .mem_write(wc + 0x18, &image_base.to_le_bytes())
+        .expect("WNDCLASSEXW.hInstance");
+    engine
+        .mem_write(wc + 0x20, &0_u64.to_le_bytes())
+        .expect("WNDCLASSEXW.hIcon");
+    engine
+        .mem_write(wc + 0x28, &0_u64.to_le_bytes())
+        .expect("WNDCLASSEXW.hCursor");
+    engine
+        .mem_write(wc + 0x30, &0_u64.to_le_bytes())
+        .expect("WNDCLASSEXW.hbrBackground");
+    engine
+        .mem_write(wc + 0x38, &0x201_u64.to_le_bytes())
+        .expect("WNDCLASSEXW.lpszMenuName");
+    write_guest_utf16(&mut engine, 0x5000, "NotepadClass");
+    engine
+        .mem_write(wc + 0x40, &0x5000_u64.to_le_bytes())
+        .expect("WNDCLASSEXW.lpszClassName");
+    engine
+        .mem_write(wc + 0x48, &0_u64.to_le_bytes())
+        .expect("WNDCLASSEXW.hIconSm");
+
+    // RegisterClassExW through the full dispatch path (names.rs → dense id).
+    write_regs(&mut engine, wc, 0, 0, 0, 0);
+    let atom = dispatch_user32(&mut engine, &mut state, "RegisterClassExW");
+    assert_ne!(atom, 0, "the class must register");
+
+    // CreateWindowExW(0, <class atom>, L"Untitled", 0, ..., hMenu = NULL).
+    // The class has a guest WndProc, so the handler returns the WM_CREATE
+    // bridge; the hwnd arrives in the callback's OuterReturn.
+    write_guest_utf16(&mut engine, 0x6000, "Untitled - Notepad");
+    write_regs(&mut engine, 0, atom, 0x6000, 0, 0x3000);
+    for (slot, bytes) in [
+        (0x3028_u64, 0_i32.to_le_bytes()), // X
+        (0x3030, 0_i32.to_le_bytes()),     // Y
+        (0x3038, 640_i32.to_le_bytes()),   // nWidth
+        (0x3040, 480_i32.to_le_bytes()),   // nHeight
+    ] {
+        engine
+            .mem_write(slot, &bytes)
+            .expect("CreateWindowExW int arg");
+    }
+    engine
+        .mem_write(0x3048, &0_u64.to_le_bytes())
+        .expect("hWndParent");
+    engine
+        .mem_write(0x3050, &0_u64.to_le_bytes())
+        .expect("hMenu NULL");
+    engine
+        .mem_write(0x3058, &image_base.to_le_bytes())
+        .expect("hInstance");
+    engine
+        .mem_write(0x3060, &0_u64.to_le_bytes())
+        .expect("lpParam");
+    let id = crate::resolve_winapi_id("user32.dll", "CreateWindowExW")
+        .expect("CreateWindowExW must resolve to a WinApiId");
+    let result = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, default_env(), &mut state),
+        id,
+    );
+    let error = result.expect_err("CreateWindowExW with a guest WndProc requests WM_CREATE");
+    let signal = error
+        .downcast_ref::<WinApiControlSignal>()
+        .expect("control signal");
+    let WinApiControlSignal::GuestCallbackRequested { request } = signal else {
+        panic!("expected the WM_CREATE callback, got {signal:?}");
+    };
+    let OuterReturn::CreateWindow(hwnd) = request.outer_return else {
+        panic!("expected OuterReturn::CreateWindow");
+    };
     assert_ne!(hwnd, 0);
 
     let window = state
@@ -3827,7 +3958,35 @@ fn push_edit_pair(state: &mut WinApiState) -> (u64, u64) {
     (parent, edit)
 }
 
-/// A LISTBOX child of a parent with a guest WndProc, for control tests.
+/// A multiline EDIT child (creation style carries `ES_MULTILINE`) holding the
+/// given text — the Task 2.1 line-model fixture. Uses its own handle range so
+/// a test can pair it with a `push_edit_pair` single-line EDIT.
+fn push_multiline_edit(state: &mut WinApiState, text: &str) -> (u64, u64) {
+    let parent = 0x6610_0015_u64;
+    let edit = 0x6610_0016_u64;
+    let ws = state.window_state();
+    ws.windows.push(WindowRecord {
+        handle: crate::handles::Hwnd::from(parent),
+        window_proc: 0x7000_0000,
+        title: "Parent".to_owned(),
+        width: 200,
+        height: 100,
+        ..Default::default()
+    });
+    ws.windows.push(WindowRecord {
+        handle: crate::handles::Hwnd::from(edit),
+        parent_handle: crate::handles::Hwnd::from(parent),
+        control_kind: Some(crate::user32::controls::ControlClassKind::Edit),
+        control_text: text.to_owned(),
+        style: crate::user32::controls::ES_MULTILINE,
+        menu_handle: 12,
+        visible: true,
+        width: 120,
+        height: 20,
+        ..Default::default()
+    });
+    (parent, edit)
+}
 fn push_listbox(state: &mut WinApiState) -> (u64, u64) {
     let parent = 0x6610_0013_u64;
     let listbox = 0x6610_0014_u64;
@@ -3867,6 +4026,11 @@ struct ControlUiSnapshot {
     sel_start: usize,
     sel_end: usize,
     sel_index: i32,
+    style_bits: u32,
+    limit: usize,
+    modified: bool,
+    first_visible_line: usize,
+    tab_stops: Vec<u16>,
 }
 
 impl ControlUiSnapshot {
@@ -3890,10 +4054,21 @@ impl ControlUiSnapshot {
                     caret,
                     sel_start,
                     sel_end,
+                    style_bits,
+                    limit,
+                    modified,
+                    first_visible_line,
+                    tab_stops,
+                    ..
                 }) => {
                     snap.caret = *caret;
                     snap.sel_start = *sel_start;
                     snap.sel_end = *sel_end;
+                    snap.style_bits = *style_bits;
+                    snap.limit = *limit;
+                    snap.modified = *modified;
+                    snap.first_visible_line = *first_visible_line;
+                    snap.tab_stops = tab_stops.clone();
                 }
                 Some(ControlState::ListBox { items, sel_index }) => {
                     snap.items = items.clone();
@@ -4384,6 +4559,1080 @@ fn test_edit_shift_arrow_extends_selection() {
     assert_eq!((ui.sel_start, ui.sel_end, ui.caret), (4, 4, 4));
 }
 
+// ── Task 2.1: multiline EDIT text model + EM_* state messages ──
+
+#[test]
+fn test_edit_wm_char_enter_multiline_inserts_newline() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (_, edit) = push_multiline_edit(&mut state, "ab");
+
+    // End + WM_CHAR 0x0D on a multiline EDIT appends '\n'.
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_KEYDOWN,
+        crate::user32::VK_END,
+        0,
+    )
+    .expect("end ok")
+    .expect("some result");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_CHAR,
+        0x0D,
+        0,
+    )
+    .expect_err("multiline Enter inserts '\n' and delivers EN_CHANGE");
+    assert_eq!(control_text(&state, edit), "ab\n");
+    assert_eq!(control_ui(&state, edit).caret, 3);
+
+    // The single-line EDIT keeps the historical no-op.
+    let (_, single) = push_edit_pair(&mut state);
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        single,
+        crate::user32::WM_CHAR,
+        0x0D,
+        0,
+    )
+    .expect("single-line enter ok")
+    .expect("some result");
+    assert_eq!(r, 0);
+    assert_eq!(control_text(&state, single), "hello");
+}
+
+#[test]
+fn test_edit_em_limitext_caps_insertion() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (_, edit) = push_edit_pair(&mut state); // "hello", len 5
+
+    // EM_LIMITTEXT(5) == the current length: typing at the cap is a no-op.
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_LIMITTEXT,
+        5,
+        0,
+    )
+    .expect("limitext ok")
+    .expect("some result");
+    assert_eq!(r, 1, "EM_LIMITTEXT returns TRUE");
+    assert_eq!(control_ui(&state, edit).limit, 5);
+    assert_eq!(
+        crate::user32::controls::dispatch_control_proc(
+            &mut engine,
+            &mut state,
+            edit,
+            crate::user32::EM_GETLIMITTEXT,
+            0,
+            0,
+        )
+        .expect("getlimitext ok")
+        .expect("some result"),
+        5
+    );
+
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_KEYDOWN,
+        crate::user32::VK_END,
+        0,
+    )
+    .expect("end ok")
+    .expect("some result");
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_CHAR,
+        u64::from(u32::from('X')),
+        0,
+    )
+    .expect("at-cap typing ok")
+    .expect("some result");
+    assert_eq!(r, 0, "insertion beyond the limit must be ignored");
+    assert_eq!(control_text(&state, edit), "hello");
+    assert!(
+        !control_ui(&state, edit).modified,
+        "a blocked insert must not dirty the modify flag"
+    );
+
+    // Deletion is never capped: backspace removes a char.
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_CHAR,
+        0x08,
+        0,
+    )
+    .expect_err("backspace delivers EN_CHANGE");
+    assert_eq!(control_text(&state, edit), "hell");
+    assert!(
+        control_ui(&state, edit).modified,
+        "a real deletion must dirty the modify flag"
+    );
+
+    // EM_REPLACESEL truncates a too-long replacement to the remaining room
+    // (limit 5, selecting 'h' leaves room for 5 - 3 = 2 chars).
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_SETSEL,
+        0,
+        1,
+    )
+    .expect("setsel ok")
+    .expect("some result");
+    write_guest_ansi(&mut engine, 0x4000, "PQRST");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_REPLACESEL,
+        0,
+        0x4000,
+    )
+    .expect_err("EM_REPLACESEL delivers EN_CHANGE");
+    assert_eq!(control_text(&state, edit), "PQell");
+}
+
+#[test]
+fn test_edit_em_line_messages_on_multiline_text() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (_, edit) = push_multiline_edit(&mut state, "ab\ncd");
+
+    // EM_GETLINECOUNT: '\n' separates lines; "ab\ncd" has 2.
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_GETLINECOUNT,
+        0,
+        0,
+    )
+    .expect("linecount ok")
+    .expect("some result");
+    assert_eq!(r, 2);
+
+    // Windows semantics: an empty multiline edit still reports 1 line. Uses a
+    // push_edit_pair edit (0x6610_0012) so it does not collide with the
+    // fixture's fixed multiline handle.
+    let (_, empty_edit) = push_edit_pair(&mut state);
+    {
+        let ws = state.window_state();
+        let window = ws
+            .windows
+            .iter_mut()
+            .find(|w| w.handle == crate::handles::Hwnd::from(empty_edit))
+            .expect("empty edit window");
+        window.style |= crate::user32::controls::ES_MULTILINE;
+        window.control_text = "".to_owned();
+    }
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        empty_edit,
+        crate::user32::EM_GETLINECOUNT,
+        0,
+        0,
+    )
+    .expect("empty linecount ok")
+    .expect("some result");
+    assert_eq!(r, 1, "an empty multiline edit has one (empty) line");
+
+    // EM_LINEFROMCHAR: '\n' belongs to the line it terminates.
+    for (index, expected) in [(0_u64, 0_u64), (2, 0), (3, 1), (4, 1)] {
+        let r = crate::user32::controls::dispatch_control_proc(
+            &mut engine,
+            &mut state,
+            edit,
+            crate::user32::EM_LINEFROMCHAR,
+            index,
+            0,
+        )
+        .expect("linefromchar ok")
+        .expect("some result");
+        assert_eq!(r, expected, "LINEFROMCHAR({index})");
+    }
+
+    // EM_LINEINDEX: the char index of each line start; -1 out of range.
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_LINEINDEX,
+        0,
+        0,
+    )
+    .expect("lineindex0 ok")
+    .expect("some result");
+    assert_eq!(r, 0);
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_LINEINDEX,
+        1,
+        0,
+    )
+    .expect("lineindex1 ok")
+    .expect("some result");
+    assert_eq!(r, 3, "line 1 starts after \"ab\" + the '\n'");
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_LINEINDEX,
+        2,
+        0,
+    )
+    .expect("lineindex2 ok")
+    .expect("some result");
+    assert_eq!(r, u64::MAX, "out-of-range line returns -1");
+
+    // EM_LINELENGTH: chars in the line, excluding its '\n'.
+    for (index, expected) in [(0_u64, 2_u64), (3, 2)] {
+        let r = crate::user32::controls::dispatch_control_proc(
+            &mut engine,
+            &mut state,
+            edit,
+            crate::user32::EM_LINELENGTH,
+            index,
+            0,
+        )
+        .expect("linelength ok")
+        .expect("some result");
+        assert_eq!(r, expected, "LINELENGTH({index})");
+    }
+    // wParam == -1: the length of the caret's line (caret starts at 0).
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_LINELENGTH,
+        u64::from(u32::MAX),
+        0,
+    )
+    .expect("linelength caret ok")
+    .expect("some result");
+    assert_eq!(r, 2, "LINELENGTH(-1) uses the caret's line");
+
+    // EM_GETLINE: the buffer's first WORD is the capacity (incl. the NUL);
+    // the copy strips the line's '\n' and NUL-terminates.
+    engine
+        .mem_write(0x4000, &64_u16.to_le_bytes())
+        .expect("line buffer capacity");
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_GETLINE,
+        0,
+        0x4000,
+    )
+    .expect("getline0 ok")
+    .expect("some result");
+    assert_eq!(r, 2, "EM_GETLINE returns the char count");
+    let mut line0 = [0_u8; 4];
+    engine.mem_read(0x4000, &mut line0).expect("read line 0");
+    assert_eq!(line0, *b"ab\0\0", "line 0 copies \"ab\" without the EOL");
+    engine
+        .mem_write(0x4000, &64_u16.to_le_bytes())
+        .expect("line buffer capacity");
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_GETLINE,
+        1,
+        0x4000,
+    )
+    .expect("getline1 ok")
+    .expect("some result");
+    assert_eq!(r, 2);
+    let mut line1 = [0_u8; 4];
+    engine.mem_read(0x4000, &mut line1).expect("read line 1");
+    assert_eq!(line1, *b"cd\0\0", "line 1 copies \"cd\" without the EOL");
+    // Out-of-range line → 0.
+    engine
+        .mem_write(0x4000, &64_u16.to_le_bytes())
+        .expect("line buffer capacity");
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_GETLINE,
+        7,
+        0x4000,
+    )
+    .expect("getline7 ok")
+    .expect("some result");
+    assert_eq!(r, 0, "out-of-range line copies nothing");
+}
+
+#[test]
+fn test_edit_em_replacesel_replaces_selection_and_fires_en_change() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (parent, edit) = push_edit_pair(&mut state); // "hello"
+
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_SETSEL,
+        1,
+        4,
+    )
+    .expect("setsel ok")
+    .expect("some result");
+    write_guest_ansi(&mut engine, 0x4000, "XY");
+    let result = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_REPLACESEL,
+        0,
+        0x4000,
+    );
+    let error = result.expect_err("EM_REPLACESEL must deliver EN_CHANGE");
+    let signal = error
+        .downcast_ref::<WinApiControlSignal>()
+        .expect("control signal");
+    assert!(
+        matches!(
+            signal,
+            WinApiControlSignal::GuestCallbackRequested { request }
+                if request.window_handle == parent
+                    && request.message == 0x0111
+                    && request.word_parameter == 0x0001_000C
+        ),
+        "EM_REPLACESEL must deliver WM_COMMAND(MAKEWPARAM(12, EN_CHANGE)), got {signal:?}"
+    );
+
+    assert_eq!(control_text(&state, edit), "hXYo");
+    let ui = control_ui(&state, edit);
+    assert_eq!((ui.caret, ui.sel_start, ui.sel_end), (3, 3, 3));
+}
+
+#[test]
+fn test_edit_em_scrollcaret_updates_first_visible_line() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (_, edit) = push_multiline_edit(&mut state, "ab\ncd\nef");
+
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_GETFIRSTVISIBLELINE,
+        0,
+        0,
+    )
+    .expect("firstvisible ok")
+    .expect("some result");
+    assert_eq!(r, 0, "fresh edit starts at the first line");
+
+    // Caret to line 2 ('e', char index 6), then EM_SCROLLCARET brings that
+    // line into view.
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_SETSEL,
+        6,
+        6,
+    )
+    .expect("setsel ok")
+    .expect("some result");
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_SCROLLCARET,
+        0,
+        0,
+    )
+    .expect("scrollcaret ok")
+    .expect("some result");
+    assert_eq!(r, 1, "EM_SCROLLCARET returns TRUE");
+    assert_eq!(control_ui(&state, edit).first_visible_line, 2);
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_GETFIRSTVISIBLELINE,
+        0,
+        0,
+    )
+    .expect("firstvisible ok")
+    .expect("some result");
+    assert_eq!(r, 2);
+}
+
+// ── Task 2.2: pure multiline-EDIT layout helper (`layout_visible_lines`).
+
+/// A row's (text, y) as a plain pair for compact assertions.
+fn row_pair(row: &crate::user32::controls::VisibleSegment) -> (&str, i32) {
+    (row.text.as_str(), row.y)
+}
+
+#[test]
+fn test_edit_layout_wrap_off_one_row_per_logical_line() {
+    // "ab\ncd\nef" without wrap: 3 logical lines, one row each, at
+    // y = line × line_height, carrying the whole-text char offsets the
+    // selection/caret math needs.
+    let rows = crate::user32::controls::layout_visible_lines(
+        "ab\ncd\nef",
+        80,
+        16,
+        0,
+        false,
+        0,
+        &mut |_ch: char| 8_i32,
+    );
+    let shown: Vec<(&str, i32)> = rows.iter().map(row_pair).collect();
+    assert_eq!(shown, [("ab", 0), ("cd", 16), ("ef", 32)]);
+    assert_eq!((rows[0].char_start, rows[0].char_end), (0, 2));
+    assert_eq!((rows[1].char_start, rows[1].char_end), (3, 5));
+    assert_eq!((rows[2].char_start, rows[2].char_end), (6, 8));
+    assert!(
+        rows.iter().all(|r| r.x == 0),
+        "left-aligned rows start at 0"
+    );
+}
+
+#[test]
+fn test_edit_layout_wrap_splits_long_line_at_width() {
+    // Wrap on, 8 px/char, 32 px column → 4 chars per visual row: "abcdef"
+    // becomes "abcd" at y=0 and "ef" at y=16, with contiguous char offsets.
+    let rows = crate::user32::controls::layout_visible_lines(
+        "abcdef",
+        32,
+        16,
+        0,
+        true,
+        0,
+        &mut |_ch: char| 8_i32,
+    );
+    let shown: Vec<(&str, i32)> = rows.iter().map(row_pair).collect();
+    assert_eq!(shown, [("abcd", 0), ("ef", 16)]);
+    assert_eq!((rows[0].char_start, rows[0].char_end), (0, 4));
+    assert_eq!((rows[1].char_start, rows[1].char_end), (4, 6));
+}
+
+#[test]
+fn test_edit_layout_wrap_applies_per_logical_line() {
+    // The wrap column resets between logical lines: "ab" fits untouched and
+    // "cdef" wraps to 3 chars + 1 in the same 24 px (8 px/char) column.
+    let rows = crate::user32::controls::layout_visible_lines(
+        "ab\ncdef",
+        24,
+        16,
+        0,
+        true,
+        0,
+        &mut |_ch: char| 8_i32,
+    );
+    let shown: Vec<(&str, i32)> = rows.iter().map(row_pair).collect();
+    assert_eq!(shown, [("ab", 0), ("cde", 16), ("f", 32)]);
+    assert_eq!((rows[1].char_start, rows[1].char_end), (3, 6));
+    assert_eq!((rows[2].char_start, rows[2].char_end), (6, 7));
+}
+
+#[test]
+fn test_edit_layout_blank_line_occupies_a_row() {
+    // "ab\n\ncd" splits into 3 logical lines; the empty middle line still
+    // occupies its vertical slot so the following text lands at y=32.
+    let rows = crate::user32::controls::layout_visible_lines(
+        "ab\n\ncd",
+        80,
+        16,
+        0,
+        false,
+        0,
+        &mut |_ch: char| 8_i32,
+    );
+    let shown: Vec<(&str, i32)> = rows.iter().map(row_pair).collect();
+    assert_eq!(shown, [("ab", 0), ("", 16), ("cd", 32)]);
+}
+
+#[test]
+fn test_edit_layout_first_visible_skips_rows_and_rebases_y() {
+    let rows = crate::user32::controls::layout_visible_lines(
+        "ab\ncd\nef",
+        80,
+        16,
+        1,
+        false,
+        0,
+        &mut |_ch: char| 8_i32,
+    );
+    let shown: Vec<(&str, i32)> = rows.iter().map(row_pair).collect();
+    assert_eq!(shown, [("cd", 0), ("ef", 16)]);
+}
+
+#[test]
+fn test_edit_layout_scroll_clamps_past_last_row() {
+    // first_visible beyond the last row clamps to the last row: only "ef"
+    // remains, at the top.
+    let rows = crate::user32::controls::layout_visible_lines(
+        "ab\ncd\nef",
+        80,
+        16,
+        5,
+        false,
+        0,
+        &mut |_ch: char| 8_i32,
+    );
+    let shown: Vec<(&str, i32)> = rows.iter().map(row_pair).collect();
+    assert_eq!(shown, [("ef", 0)]);
+
+    // The clamp counts VISUAL rows: wrapped lines make the last visual row
+    // later than the last logical line.
+    let wrapped = crate::user32::controls::layout_visible_lines(
+        "abcdef",
+        32,
+        16,
+        9,
+        true,
+        0,
+        &mut |_ch: char| 8_i32,
+    );
+    let wrapped_shown: Vec<(&str, i32)> = wrapped.iter().map(row_pair).collect();
+    assert_eq!(wrapped_shown, [("ef", 0)]);
+}
+
+#[test]
+fn test_edit_layout_alignment_offsets_row_x() {
+    // "ab" = 16 px in a 40 px column: ES_CENTER → x=12, ES_RIGHT → x=24.
+    let centered = crate::user32::controls::layout_visible_lines(
+        "ab",
+        40,
+        16,
+        0,
+        false,
+        0x1,
+        &mut |_ch: char| 8_i32,
+    );
+    assert_eq!(centered[0].x, 12);
+    let right = crate::user32::controls::layout_visible_lines(
+        "ab",
+        40,
+        16,
+        0,
+        false,
+        0x2,
+        &mut |_ch: char| 8_i32,
+    );
+    assert_eq!(right[0].x, 24);
+    // A row wider than the column still starts at the left edge.
+    let overwide = crate::user32::controls::layout_visible_lines(
+        "abcdefgh",
+        40,
+        16,
+        0,
+        false,
+        0x2,
+        &mut |_ch: char| 8_i32,
+    );
+    assert_eq!(overwide[0].x, 0);
+}
+
+#[test]
+fn test_edit_layout_empty_text_single_empty_row() {
+    let rows =
+        crate::user32::controls::layout_visible_lines("", 80, 16, 0, true, 0, &mut |_ch: char| {
+            8_i32
+        });
+    assert_eq!(rows.len(), 1);
+    assert_eq!(row_pair(&rows[0]), ("", 0));
+}
+
+#[test]
+fn test_edit_em_pos_from_char_uses_font_line_height() {
+    // EM_POSFROMCHAR answers y = line × the REAL resolved font line height
+    // (the 16 px default control font), not the DIALOG_BASE_UNIT_Y constant.
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (_, edit) = push_multiline_edit(&mut state, "ab\ncd");
+
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_SETSEL,
+        3, // 'c', line 1
+        3,
+    )
+    .expect("setsel ok")
+    .expect("some result");
+    let ok = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_POSFROMCHAR,
+        3,
+        0x4000,
+    )
+    .expect("posfromchar ok")
+    .expect("some result");
+    assert_eq!(ok, 1, "EM_POSFROMCHAR returns TRUE for a valid index");
+    let mut bytes = [0_u8; 8];
+    engine.mem_read(0x4000, &mut bytes).expect("read point");
+    let x = i32::from_le_bytes(bytes[0..4].try_into().expect("x"));
+    let y = i32::from_le_bytes(bytes[4..8].try_into().expect("y"));
+    assert_eq!(x, 0, "x stays 0 (per-glyph x is Task 2.5)");
+    // The same 16 px default font the paint path resolves.
+    let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
+    let line_h = font_engine
+        .resolve(&crate::gdi32::FontKey::default(), 16)
+        .expect("resolve default font")
+        .line_height();
+    state.gdi_state().font_engine = font_engine;
+    assert_eq!(y, line_h, "line 1's y is one real line height");
+}
+
+#[test]
+fn test_edit_em_modify_flags_round_trip() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (_, edit) = push_edit_pair(&mut state);
+
+    // Fresh edit is unmodified.
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_GETMODIFY,
+        0,
+        0,
+    )
+    .expect("getmodify ok")
+    .expect("some result");
+    assert_eq!(r, 0);
+
+    // EM_SETMODIFY(1) → GETMODIFY 1; EM_SETMODIFY(0) → GETMODIFY 0.
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_SETMODIFY,
+        1,
+        0,
+    )
+    .expect("setmodify1 ok")
+    .expect("some result");
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_GETMODIFY,
+        0,
+        0,
+    )
+    .expect("getmodify ok")
+    .expect("some result");
+    assert_eq!(r, 1);
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_SETMODIFY,
+        0,
+        0,
+    )
+    .expect("setmodify0 ok")
+    .expect("some result");
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_GETMODIFY,
+        0,
+        0,
+    )
+    .expect("getmodify ok")
+    .expect("some result");
+    assert_eq!(r, 0);
+
+    // Typing sets the flag again.
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_CHAR,
+        u64::from(u32::from('X')),
+        0,
+    )
+    .expect_err("typing delivers EN_CHANGE");
+    assert!(
+        control_ui(&state, edit).modified,
+        "typing must set the modify flag"
+    );
+}
+
+#[test]
+fn test_edit_em_get_handle_caches_and_invalidates() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (_, edit) = push_edit_pair(&mut state); // "hello"
+
+    // Prime the guest heap control block (bump cursor at 0x2000; the freelist
+    // heads stay zeroed) so the LocalAlloc-style coherent allocation works —
+    // the runtime seeds this block at session init.
+    engine
+        .mem_write(0x2000, &0x2000_u64.to_le_bytes())
+        .expect("guest heap bump cursor");
+
+    let first = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_GETHANDLE,
+        0,
+        0,
+    )
+    .expect("gethandle ok")
+    .expect("some result");
+    assert_ne!(first, 0, "EM_GETHANDLE returns a guest buffer");
+    // ANSI: the handle points at "hello" + NUL.
+    let mut head = [0_u8; 6];
+    engine
+        .mem_read(first, &mut head)
+        .expect("read handle buffer");
+    assert_eq!(head, *b"hello\0", "handle buffer holds a copy of the text");
+
+    // A second GETHANDLE with no intervening mutation reuses the cached
+    // buffer instead of leaking a fresh allocation per call.
+    let again = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_GETHANDLE,
+        0,
+        0,
+    )
+    .expect("gethandle again ok")
+    .expect("some result");
+    assert_eq!(
+        again, first,
+        "repeat GETHANDLE without a text change must return the cached handle"
+    );
+
+    // A keystroke mutates the text → the cache clears and the next GETHANDLE
+    // allocates a fresh buffer holding the new text.
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_KEYDOWN,
+        crate::user32::VK_END,
+        0,
+    )
+    .expect("end ok")
+    .expect("some result");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_CHAR,
+        u64::from(u32::from('X')),
+        0,
+    )
+    .expect_err("typing delivers EN_CHANGE");
+    let fresh = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_GETHANDLE,
+        0,
+        0,
+    )
+    .expect("gethandle after mutation ok")
+    .expect("some result");
+    assert_ne!(fresh, first, "a mutation must invalidate the cached handle");
+    let mut head = [0_u8; 7];
+    engine
+        .mem_read(fresh, &mut head)
+        .expect("read fresh buffer");
+    assert_eq!(head, *b"helloX\0", "the fresh buffer holds the new text");
+
+    // WM_SETTEXT also changes the text: the next GETHANDLE is fresh again.
+    write_guest_ansi(&mut engine, 0x4000, "set");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::wm::WinMsg::WM_SETTEXT.as_u32(),
+        0,
+        0x4000,
+    )
+    .expect("settext ok")
+    .expect("some result");
+    let after_settext = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_GETHANDLE,
+        0,
+        0,
+    )
+    .expect("gethandle after settext ok")
+    .expect("some result");
+    assert_ne!(
+        after_settext, fresh,
+        "WM_SETTEXT must invalidate the cached handle"
+    );
+    let mut head = [0_u8; 4];
+    engine
+        .mem_read(after_settext, &mut head)
+        .expect("read settext buffer");
+    assert_eq!(head, *b"set\0", "the buffer holds the WM_SETTEXT text");
+}
+
+#[test]
+fn test_edit_em_set_handle_adopts_guest_text() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (_, edit) = push_edit_pair(&mut state); // "hello"
+
+    // Leave a selection behind so SETHANDLE's reset is observable.
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_SETSEL,
+        2,
+        4,
+    )
+    .expect("setsel ok")
+    .expect("some result");
+    write_guest_ansi(&mut engine, 0x4000, "adopted");
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_SETHANDLE,
+        0,
+        0x4000,
+    )
+    .expect("sethandle ok")
+    .expect("some result");
+    assert_eq!(r, 1, "EM_SETHANDLE returns TRUE");
+    assert_eq!(control_text(&state, edit), "adopted");
+    let ui = control_ui(&state, edit);
+    assert_eq!((ui.caret, ui.sel_start, ui.sel_end), (0, 0, 0));
+
+    // The adopted buffer becomes the cached GETHANDLE result (the text is
+    // unchanged since the adoption, so no fresh allocation happens).
+    let handle = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_GETHANDLE,
+        0,
+        0,
+    )
+    .expect("gethandle ok")
+    .expect("some result");
+    assert_eq!(handle, 0x4000, "GETHANDLE returns the adopted buffer");
+}
+
+#[test]
+fn test_edit_em_settabstops_stores_stops() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (_, edit) = push_multiline_edit(&mut state, "ab\ncd");
+
+    // Two explicit stops at 4 and 8 dialog units.
+    engine
+        .mem_write(0x4000, &4_u16.to_le_bytes())
+        .expect("stop 0");
+    engine
+        .mem_write(0x4002, &8_u16.to_le_bytes())
+        .expect("stop 1");
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_SETTABSTOPS,
+        2,
+        0x4000,
+    )
+    .expect("settabstops ok")
+    .expect("some result");
+    assert_eq!(r, 1, "EM_SETTABSTOPS returns TRUE");
+    assert_eq!(control_ui(&state, edit).tab_stops, vec![4, 8]);
+
+    // wParam 0 resets to the default tab stops (the stored list clears).
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_SETTABSTOPS,
+        0,
+        0,
+    )
+    .expect("settabstops reset ok")
+    .expect("some result");
+    assert_eq!(r, 1);
+    assert_eq!(
+        control_ui(&state, edit).tab_stops,
+        Vec::<u16>::new(),
+        "wParam 0 restores default stops"
+    );
+}
+
+#[test]
+fn test_edit_em_posfromchar_basic_answer() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (_, edit) = push_multiline_edit(&mut state, "ab\ncd");
+
+    // Char 3 ('c') sits on line 1 → y = one REAL resolved-font line height
+    // (the same 16 px default control font the paint path uses), x = 0.
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_POSFROMCHAR,
+        3,
+        0x4000,
+    )
+    .expect("posfromchar ok")
+    .expect("some result");
+    assert_eq!(r, 1, "valid char returns TRUE");
+    assert_eq!(read_test_i32(&mut engine, 0x4000), 0, "x is 0");
+    let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
+    let line_h = font_engine
+        .resolve(&crate::gdi32::FontKey::default(), 16)
+        .expect("resolve the default control font")
+        .line_height();
+    state.gdi_state().font_engine = font_engine;
+    assert_eq!(
+        read_test_i32(&mut engine, 0x4004),
+        line_h,
+        "y = line × the font's line height"
+    );
+
+    // Out-of-range char → FALSE.
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_POSFROMCHAR,
+        100,
+        0x4000,
+    )
+    .expect("posfromchar oob ok")
+    .expect("some result");
+    assert_eq!(r, 0, "invalid char returns FALSE");
+}
+
+#[test]
+fn test_edit_em_selectiontype_basic_answers() {
+    use crate::user32::controls::{SEL_EMPTY, SEL_MULTICHAR, SEL_MULTILINE, SEL_TEXT};
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (_, edit) = push_multiline_edit(&mut state, "ab\ncd");
+
+    // No selection → SEL_EMPTY.
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_SELECTIONTYPE,
+        0,
+        0,
+    )
+    .expect("selectiontype ok")
+    .expect("some result");
+    assert_eq!(r, SEL_EMPTY);
+
+    // One char → SEL_TEXT.
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_SETSEL,
+        0,
+        1,
+    )
+    .expect("setsel ok")
+    .expect("some result");
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_SELECTIONTYPE,
+        0,
+        0,
+    )
+    .expect("selectiontype ok")
+    .expect("some result");
+    assert_eq!(r, SEL_TEXT);
+
+    // Two chars on one line → SEL_TEXT | SEL_MULTICHAR.
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_SETSEL,
+        0,
+        2,
+    )
+    .expect("setsel ok")
+    .expect("some result");
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_SELECTIONTYPE,
+        0,
+        0,
+    )
+    .expect("selectiontype ok")
+    .expect("some result");
+    assert_eq!(r, SEL_TEXT | SEL_MULTICHAR);
+
+    // "\nc" spans two lines' characters → SEL_TEXT | SEL_MULTICHAR |
+    // SEL_MULTILINE (a selection ending exactly at a '\n' stays on that line).
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_SETSEL,
+        2,
+        4,
+    )
+    .expect("setsel ok")
+    .expect("some result");
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_SELECTIONTYPE,
+        0,
+        0,
+    )
+    .expect("selectiontype ok")
+    .expect("some result");
+    assert_eq!(r, SEL_TEXT | SEL_MULTICHAR | SEL_MULTILINE);
+}
+
 #[test]
 fn test_listbox_setcursel_getcursel_and_lbn_selchange() {
     let mut engine = test_engine();
@@ -4630,7 +5879,8 @@ fn test_edit_paint_draws_caret_and_selection_in_ancestor_surface() {
         .present()
         .published
         .get(&crate::handles::Hwnd::from(top))
-        .expect("published frame");
+        .expect("published frame")
+        .clone();
     assert_eq!((frame.width, frame.height), (200, 100));
     // Font-dependent pixels: assert qualitatively instead of at fixed
     // monospace positions. The selection fill (COLOR_HIGHLIGHT) must be
@@ -4682,6 +5932,63 @@ fn test_edit_paint_draws_caret_and_selection_in_ancestor_surface() {
         .filter(|(u, f)| *u != *f)
         .count();
     assert!(diffs > 0, "losing focus must change the painted pixels");
+}
+
+#[test]
+fn test_edit_paint_empty_text_draws_caret_at_start() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (top, edit) = push_edit_paint_pair(&mut state);
+    // Empty the control's text: the paint must render no glyphs, just the
+    // caret bar at the start of the first row.
+    state
+        .window_state()
+        .windows
+        .iter_mut()
+        .find(|w| w.handle == crate::handles::Hwnd::from(edit))
+        .expect("edit record")
+        .control_text
+        .clear();
+
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_SETFOCUS,
+        0,
+        0,
+    )
+    .expect("focus ok")
+    .expect("some result");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint ok")
+    .expect("some result");
+    state.present().drain_pending_publishes();
+
+    let frame = state
+        .present()
+        .published
+        .get(&crate::handles::Hwnd::from(top))
+        .expect("published frame")
+        .clone();
+    // The edit sits at (10, 10), 60x20 in the 200x100 surface; text starts
+    // at offset_x + 2 = 12. The caret is the 1 px black bar at column 12;
+    // column 13 must stay the COLOR_WINDOW fill — no glyphs.
+    let px = |col: i32, row: i32| {
+        let idx = (usize::try_from(row).unwrap_or(0) * frame.width as usize)
+            .saturating_add(usize::try_from(col).unwrap_or(0));
+        frame.pixels[idx]
+    };
+    let mid = 10_i32.saturating_add(20 / 2); // vertical middle of the edit
+    assert_eq!(px(12, mid), 0x0000_0000, "caret bar at the text start");
+    assert_eq!(px(13, mid), 0x00FF_FFFF, "no glyphs next to the caret");
 }
 
 #[test]

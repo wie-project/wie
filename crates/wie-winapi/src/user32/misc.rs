@@ -244,6 +244,22 @@ pub fn handle_register_class_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     let return_value = if window_class_ptr == 0 {
         0
     } else {
+        /*
+         * WNDCLASSEXA on Win64 (same layout as WNDCLASSEXW, but lpszMenuName
+         * and lpszClassName point to ANSI strings):
+         * +0x00 UINT      cbSize
+         * +0x04 UINT      style
+         * +0x08 WNDPROC   lpfnWndProc
+         * +0x10 INT       cbClsExtra
+         * +0x14 INT       cbWndExtra
+         * +0x18 HINSTANCE hInstance
+         * +0x20 HICON     hIcon
+         * +0x28 HCURSOR   hCursor
+         * +0x30 HBRUSH    hbrBackground
+         * +0x38 LPCSTR    lpszMenuName
+         * +0x40 LPCSTR    lpszClassName
+         * +0x48 HICON     hIconSm
+         */
         let style = read_guest_u32(
             engine,
             checked_field_address(window_class_ptr, 4, "WNDCLASSEXA.style"),

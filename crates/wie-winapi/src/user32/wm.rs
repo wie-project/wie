@@ -75,6 +75,25 @@ impl WinMsg {
     // ── Control messages (winuser.h): EDIT / BUTTON / LISTBOX ──────────
     pub const EM_GETSEL: Self = Self(0x00B0);
     pub const EM_SETSEL: Self = Self(0x00B1);
+    // Multiline EDIT messages (Task 2.1). The line-metric messages operate on
+    // the host `String` with `\n` as the internal separator.
+    pub const EM_SCROLLCARET: Self = Self(0x00B7);
+    pub const EM_GETMODIFY: Self = Self(0x00B8);
+    pub const EM_SETMODIFY: Self = Self(0x00B9);
+    pub const EM_GETLINECOUNT: Self = Self(0x00BA);
+    pub const EM_LINEINDEX: Self = Self(0x00BB);
+    pub const EM_SETHANDLE: Self = Self(0x00BC);
+    pub const EM_GETHANDLE: Self = Self(0x00BD);
+    pub const EM_LINELENGTH: Self = Self(0x00C1);
+    pub const EM_REPLACESEL: Self = Self(0x00C2);
+    pub const EM_GETLINE: Self = Self(0x00C4);
+    pub const EM_LIMITTEXT: Self = Self(0x00C5);
+    pub const EM_LINEFROMCHAR: Self = Self(0x00C9);
+    pub const EM_SETTABSTOPS: Self = Self(0x00CB);
+    pub const EM_GETFIRSTVISIBLELINE: Self = Self(0x00CE);
+    pub const EM_GETLIMITTEXT: Self = Self(0x00D5);
+    pub const EM_POSFROMCHAR: Self = Self(0x00D6);
+    pub const EM_SELECTIONTYPE: Self = Self(0x00E1);
     pub const BM_GETSTATE: Self = Self(0x00F2);
     pub const BM_SETSTATE: Self = Self(0x00F3);
     pub const BM_CLICK: Self = Self(0x00F5);
