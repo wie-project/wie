@@ -1709,6 +1709,18 @@ static WINAPI_NAME_ROWS: &[(&str, &str, WinApiId)] = &[
         "shellexecutew",
         WinApiId::Shell32Shellexecutew,
     ),
+    (
+        // Rows placed at the table end with the appended variants (447/448),
+        // so the id table and the name rows stay in the same order.
+        "user32.dll",
+        "callwindowproca",
+        WinApiId::User32Callwindowproca,
+    ),
+    (
+        "user32.dll",
+        "callwindowprocw",
+        WinApiId::User32Callwindowprocw,
+    ),
 ];
 
 /// Resolve library/export to id. Case-insensitive, allocation-free.

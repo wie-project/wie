@@ -130,6 +130,19 @@ pub(crate) fn height_px_from_lf(lf_height: i32) -> i32 {
     }
 }
 
+/// The exact-case spelling of `name` present in the database, if any.
+///
+/// fontdb matches `Family::Name` with an exact string compare
+/// (`face.families.any(|f| f.0 == name)`), and the engine lowercases every
+/// face name — so a query like `"helvetica"` can never hit a capitalized
+/// macOS face ("Helvetica") without this canonicalization step.
+fn canonical_family_name<'a>(db: &'a fontdb::Database, name: &str) -> Option<&'a str> {
+    db.faces()
+        .flat_map(|face| &face.families)
+        .map(|(family, _)| family.as_str())
+        .find(|family| family.eq_ignore_ascii_case(name))
+}
+
 /// Find the best face id for a selection, tracking which requested attributes
 /// had to fall back (so the rasterizer can emulate bold/italic).
 ///
@@ -147,14 +160,23 @@ fn face_id_for(
     let families: Vec<Family<'_>> = match selection {
         FamilySelection::Generic(family) => vec![*family],
         FamilySelection::Named(name) => {
-            // Exact name first; a generic family is the last resort. A
+            // Exact name first; then the same face under its canonical
+            // (database) spelling, so a lowercased query still resolves to a
+            // capitalized face; a generic family is the last resort. A
             // FIXED_PITCH request falls back to monospace, not sans-serif.
             let fallback = if fixed_pitch {
                 Family::Monospace
             } else {
                 Family::SansSerif
             };
-            vec![Family::Name(name), fallback]
+            let mut families = vec![Family::Name(name)];
+            if let Some(canonical) = canonical_family_name(db, name)
+                && canonical != name
+            {
+                families.push(Family::Name(canonical));
+            }
+            families.push(fallback);
+            families
         }
     };
     let weights: &[u16] = if weight >= 600 { &[700, 400] } else { &[400] };
@@ -734,13 +756,15 @@ mod tests {
     fn fixed_pitch_keeps_resolvable_named_faces() {
         // FIXED_PITCH must NOT force the generic monospace fallback when the
         // requested named face actually resolves — the exact face wins and
-        // the fallback only kicks in on a miss. Tested at the face query
-        // level with the canonical (capitalized) name: the engine's `Named`
-        // branch lowercases, and fontdb matches family names case-sensitively
-        // (pre-existing behavior), so the engine path always misses.
-        let named = super::FamilySelection::Named("Helvetica".to_owned());
+        // the fallback only kicks in on a miss. The family is picked from the
+        // host font database (any machine), so the property is proven without
+        // depending on a specific installed face.
+        let Some(name) = any_system_family() else {
+            return; // no fonts at all — nothing to prove
+        };
+        let named = super::FamilySelection::Named(name);
         let Some((with, _, _)) = face_id_for(&named, 400, false, true) else {
-            return; // Helvetica not installed — nothing to prove
+            return;
         };
         let Some((without, _, _)) = face_id_for(&named, 400, false, false) else {
             return;
@@ -748,6 +772,83 @@ mod tests {
         assert_eq!(
             with, without,
             "a resolvable named face must resolve identically with FIXED_PITCH"
+        );
+    }
+
+    /// A real family name from the system font database, for tests that need
+    /// a resolvable named face on ANY host. Prefers a mixed-case name so the
+    /// lowercase-vs-canonical distinction is meaningful; `None` only when the
+    /// database has no faces at all.
+    fn any_system_family() -> Option<String> {
+        let db = super::system_font_db();
+        let mut names: Vec<&str> = db
+            .faces()
+            .filter_map(|face| face.families.first().map(|(name, _)| name.as_str()))
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+            .iter()
+            .find(|name| name.chars().any(char::is_uppercase))
+            .or_else(|| names.first())
+            .map(|name| (*name).to_owned())
+    }
+
+    /// Whether the resolved face carries `family` anywhere in its family
+    /// list (case-insensitively) — a face can match a query on a non-first
+    /// alias, so checking only the first family is not reliable.
+    fn face_has_family(db: &fontdb::Database, id: fontdb::ID, family: &str) -> bool {
+        db.face(id).is_some_and(|info| {
+            info.families
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case(family))
+        })
+    }
+
+    #[test]
+    fn canonical_case_named_face_resolves_to_the_named_family() {
+        // The canonical spelling of a real system face must resolve to that
+        // face — never collapse to the generic sans-serif fallback. The
+        // family is picked from the host database, so any machine works.
+        let Some(name) = any_system_family() else {
+            return;
+        };
+        let named = super::FamilySelection::Named(name.clone());
+        let Some((id, _, _)) = face_id_for(&named, 400, false, false) else {
+            return;
+        };
+        assert!(
+            face_has_family(super::system_font_db(), id, &name),
+            "the canonical query must resolve to the {name} family, got face {id:?}"
+        );
+    }
+
+    #[test]
+    fn lowercase_named_face_resolves_to_the_same_family() {
+        // The engine lowercases every face name (family_selection_for), so a
+        // guest requesting a canonical face yields Named(<lowercased>). That
+        // query must resolve to the SAME face as the canonical spelling —
+        // not fall through to the generic fallback (the pre-fix behavior:
+        // fontdb matches Family::Name case-sensitively).
+        let Some(name) = any_system_family() else {
+            return;
+        };
+        let lower = super::FamilySelection::Named(name.to_lowercase());
+        let canonical = super::FamilySelection::Named(name.clone());
+        let Some((lower_id, _, _)) = face_id_for(&lower, 400, false, false) else {
+            return;
+        };
+        let Some((canonical_id, _, _)) = face_id_for(&canonical, 400, false, false) else {
+            return;
+        };
+        assert_eq!(
+            lower_id, canonical_id,
+            "a lowercase query must resolve to the same face as the canonical spelling"
+        );
+        // And that face is the named family, not the generic fallback.
+        assert!(
+            face_has_family(super::system_font_db(), lower_id, &name),
+            "the lowercase query must resolve to the {name} family, got face {lower_id:?}"
         );
     }
 

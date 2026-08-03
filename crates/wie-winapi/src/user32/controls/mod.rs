@@ -363,8 +363,89 @@ impl ControlState {
 /// `Ok(Some(value))` means the control handled `message` and the guest-visible
 /// result is `value`. `Ok(None)` means unhandled — callers fall back to their
 /// neutral zero. `Err(..)` carries a [`WinApiControlSignal`] (a nested guest
-/// WndProc bridge for `WM_COMMAND`) or a real handler error.
+/// WndProc bridge for `WM_COMMAND`, or — for a guest-subclassed control — the
+/// bridge to the subclass proc) or a real handler error.
 pub(crate) fn dispatch_control_proc(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+    hwnd: u64,
+    message: u32,
+    word_parameter: u64,
+    long_parameter: u64,
+) -> Result<Option<u64>> {
+    dispatch_control_proc_with_outer(
+        engine,
+        state,
+        hwnd,
+        message,
+        word_parameter,
+        long_parameter,
+        OuterReturn::Passthrough,
+    )
+}
+
+/// [`dispatch_control_proc`] with an explicit [`OuterReturn`] for the outer
+/// host API that triggered the dispatch.
+///
+/// The focus-change pair (`deliver_focus_change`) passes its fixed
+/// [`OuterReturn`] so a bridged subclass's LRESULT never replaces the outer
+/// API's own result (SetFocus must report the previous focus window).
+pub(crate) fn dispatch_control_proc_with_outer(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+    hwnd: u64,
+    message: u32,
+    word_parameter: u64,
+    long_parameter: u64,
+    outer_return: OuterReturn,
+) -> Result<Option<u64>> {
+    if find_window(state, hwnd)
+        .and_then(|w| w.control_kind)
+        .is_none()
+    {
+        return Ok(None);
+    }
+
+    // Guest-subclass bridge: a control whose GWLP_WNDPROC the guest replaced
+    // (notepad's EDIT_WndProc via SetWindowLongPtrW) sees EVERY message
+    // through the subclass proc first. The subclass updates the title
+    // star / status-bar caret and forwards what it does not handle through
+    // CallWindowProcW(hwnd, <original marker>, …), which re-enters the host
+    // default dispatch (see `dispatch_control_proc_host_default`). Without
+    // this the subclass never runs and the star / Ln-Col behavior silently
+    // disappears.
+    let subclass = super::get_window_long_ptr_value(
+        hwnd,
+        super::GWLP_WNDPROC_RAW,
+        state,
+        "control subclass dispatch",
+    )?;
+    if subclass != 0 {
+        let unicode = find_window(state, hwnd).is_some_and(|w| w.unicode);
+        return Err(WinApiControlSignal::GuestCallbackRequested {
+            request: GuestCallbackRequest {
+                callback_address: subclass,
+                window_handle: hwnd,
+                message,
+                word_parameter,
+                long_parameter,
+                unicode,
+                outer_return,
+            },
+        }
+        .into());
+    }
+
+    dispatch_control_proc_host_default(engine, state, hwnd, message, word_parameter, long_parameter)
+}
+
+/// The host's DEFAULT control dispatch, ignoring any guest subclass.
+///
+/// This is what `CallWindowProcW(hwnd, <the original marker>, …)` runs when a
+/// guest subclass forwards a message it does not handle: the subclass must
+/// NOT intercept its own forwarded message, or the notepad flow would loop
+/// subclass → CallWindowProc → subclass forever.
+pub(crate) fn dispatch_control_proc_host_default(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
     hwnd: u64,

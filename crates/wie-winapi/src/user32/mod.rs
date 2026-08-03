@@ -340,10 +340,19 @@ pub(crate) fn write_wide_window_text(
     u64::try_from(copied).context("wide window text length does not fit u64")
 }
 
+/// `GWLP_WNDPROC` (-4) as the zero-extended `u64` a Win64
+/// `Get/SetWindowLongPtr*` index register carries it (MSVC emits
+/// `mov edx, -4`, writing `0xFFFF_FFFC`).
+pub(crate) const GWLP_WNDPROC_RAW: u64 = 0xFFFF_FFFC;
+
 /// Reinterpret a raw `GetWindowLongPtr*` index (a zero-extended `i32`) as
 /// the signed `i64` slot it denotes.
+///
+/// Only the low 32 bits carry the index; the upper bits of the Win64 index
+/// register are unspecified (MSVC zero-extends, but sign-extension also
+/// occurs in practice), so they are masked off rather than rejected.
 pub(crate) fn window_long_ptr_index(index_raw: u64, api_name: &str) -> Result<i64> {
-    let index_low = u32::try_from(index_raw)
+    let index_low = u32::try_from(index_raw & u64::from(u32::MAX))
         .with_context(|| format!("{api_name} index does not fit in u32"))?;
 
     Ok(i64::from(i32::from_ne_bytes(index_low.to_ne_bytes())))
@@ -725,6 +734,7 @@ pub(crate) fn create_window_record(
         font_handle: crate::handles::Hfont::NULL,
         dialog_proc: 0,
         dialog_unicode: false,
+        subclass_original_wndproc: 0,
     });
 
     Ok((handle, window_proc, class_unicode))

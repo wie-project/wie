@@ -123,18 +123,39 @@ pub fn guest_path_to_host_bottle(bottle_root: &Path, guest_path: &str) -> Option
 /// a guest path).
 #[must_use]
 pub fn host_path_to_guest(volumes: &VolumeConfig, host_path: &Path) -> Option<String> {
+    // macOS firmlinks: AppKit can deliver a drop path through
+    // /System/Volumes/Data/Users/… while the bottle root is /Users/….
+    // realpath does NOT resolve firmlinks, so canonicalize alone cannot
+    // align the two forms — strip the prefix explicitly (see
+    // normalize_host_path).
+    let host_path = normalize_host_path(host_path);
     if let Some(bottle) = volumes.bottle_root.as_ref() {
-        let drive_c = bottle.join("drive_c");
+        let drive_c = normalize_host_path(&bottle.join("drive_c"));
         if let Ok(relative) = host_path.strip_prefix(&drive_c) {
             return Some(guest_from_relative('C', relative));
         }
     }
-    if let Some(drive_d) = volumes.drive_d_root.as_ref()
-        && let Ok(relative) = host_path.strip_prefix(drive_d)
-    {
-        return Some(guest_from_relative('D', relative));
+    if let Some(drive_d) = volumes.drive_d_root.as_ref() {
+        let drive_d = normalize_host_path(drive_d);
+        if let Ok(relative) = host_path.strip_prefix(&drive_d) {
+            return Some(guest_from_relative('D', relative));
+        }
     }
     None
+}
+
+/// Normalize a host path for volume mapping: canonicalize (resolves
+/// symlinks such as /tmp → /private/tmp), then strip the macOS firmlink
+/// prefix (`/System/Volumes/Data`) that AppKit path delivery can carry —
+/// realpath leaves firmlinks untouched, so the two forms of the same file
+/// (`/System/Volumes/Data/Users/…` vs `/Users/…`) only compare equal after
+/// the prefix is removed. Nonexistent paths fall back to the raw form.
+fn normalize_host_path(path: &Path) -> PathBuf {
+    const FIRMLINK_PREFIX: &str = "/System/Volumes/Data";
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    path.strip_prefix(FIRMLINK_PREFIX)
+        .map(|rest| PathBuf::from("/").join(rest))
+        .unwrap_or(path)
 }
 
 /// Build `{drive}:\<rel>` with backslash separators, collapsing the empty
@@ -294,6 +315,63 @@ mod tests {
         assert_eq!(
             host_path_to_guest(&no_bottle, Path::new("/tmp/bottle/drive_c/x.txt")),
             None
+        );
+    }
+
+    #[test]
+    fn host_path_to_guest_resolves_symlink_prefixes() {
+        // A real file under a real temp root: std::fs::canonicalize resolves
+        // symlinks (on macOS /var → /private/var, /tmp → /private/tmp), so
+        // the drop path AppKit delivers can carry a different prefix than
+        // the bottle root — both sides must canonicalize to match (the
+        // reported bug: drops under the bottle were skipped as "no guest
+        // volume maps the host path").
+        let root = std::env::temp_dir().join(format!("wie-firmlink-test-{}", std::process::id()));
+        let drive_c = root.join("drive_c");
+        std::fs::create_dir_all(&drive_c).expect("create test drive_c");
+        let file = drive_c.join("sample.txt");
+        std::fs::write(&file, b"x").expect("write test file");
+
+        let volumes = VolumeConfig {
+            bottle_root: Some(root.clone()),
+            drive_d_root: None,
+        };
+        let canonical = std::fs::canonicalize(&file).expect("canonicalize test file");
+        // The canonicalized form is what winit/AppKit hands the drop handler.
+        assert_eq!(
+            host_path_to_guest(&volumes, &canonical),
+            Some(r"C:\sample.txt".to_owned())
+        );
+        // The raw form still works too.
+        assert_eq!(
+            host_path_to_guest(&volumes, &file),
+            Some(r"C:\sample.txt".to_owned())
+        );
+
+        let _unused = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn host_path_to_guest_strips_macos_firmlink_prefix() {
+        // AppKit can deliver drop paths through the /System/Volumes/Data
+        // firmlink prefix while the bottle root is the plain /Users/… form.
+        // realpath does NOT resolve firmlinks, so the prefix must be
+        // stripped explicitly for the two forms to compare equal.
+        let v = VolumeConfig {
+            bottle_root: Some(PathBuf::from("/Users/me/wie-bottle")),
+            drive_d_root: None,
+        };
+        assert_eq!(
+            host_path_to_guest(
+                &v,
+                Path::new("/System/Volumes/Data/Users/me/wie-bottle/drive_c/sample.txt")
+            ),
+            Some(r"C:\sample.txt".to_owned())
+        );
+        // The plain form still maps.
+        assert_eq!(
+            host_path_to_guest(&v, Path::new("/Users/me/wie-bottle/drive_c/sample.txt")),
+            Some(r"C:\sample.txt".to_owned())
         );
     }
 }

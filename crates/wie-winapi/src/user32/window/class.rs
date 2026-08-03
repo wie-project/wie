@@ -8,36 +8,72 @@ use crate::user32::{
 
 /// Handles `USER32.dll!SetWindowLongPtrW`.
 pub fn handle_set_window_long_ptr_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_set_window_long_ptr_impl(ctx, "SetWindowLongPtrW")
+}
+
+/// Handles `USER32.dll!SetWindowLongPtrA`.
+pub fn handle_set_window_long_ptr_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_set_window_long_ptr_impl(ctx, "SetWindowLongPtrA")
+}
+
+/// Shared `SetWindowLongPtrA/W` implementation.
+///
+/// `GWLP_WNDPROC` additionally records the replaced value as the window's
+/// `subclass_original_wndproc` (on the FIRST subclass) — for a built-in
+/// control that is WIE's default-control-proc marker (0), which
+/// `CallWindowProcW(hwnd, <marker>, …)` recognizes to run the host default
+/// control dispatch when the guest subclass forwards a message it does not
+/// handle (notepad's `EDIT_WndProc` pattern).
+fn handle_set_window_long_ptr_impl(
+    ctx: &mut HandlerContext<'_>,
+    api_name: &str,
+) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
-        .context("failed to read RCX for SetWindowLongPtrW")?;
+        .with_context(|| format!("failed to read RCX for {api_name}"))?;
 
     let index_raw = engine
         .read_rdx()
-        .context("failed to read RDX for SetWindowLongPtrW")?;
+        .with_context(|| format!("failed to read RDX for {api_name}"))?;
 
     let new_value = engine
         .read_r8()
-        .context("failed to read R8 for SetWindowLongPtrW")?;
+        .with_context(|| format!("failed to read R8 for {api_name}"))?;
 
-    let previous_value = set_window_long_ptr_value(
-        window_handle,
-        index_raw,
-        new_value,
-        state,
-        "SetWindowLongPtrW",
-    )?;
+    let previous_value =
+        set_window_long_ptr_value(window_handle, index_raw, new_value, state, api_name)?;
+
+    remember_subclass_original(state, window_handle, index_raw, previous_value);
 
     let return_address = engine
         .return_from_win64_api(previous_value)
-        .context("failed to return from SetWindowLongPtrW")?;
+        .with_context(|| format!("failed to return from {api_name}"))?;
 
     Ok(WinApiHandlerResult {
         return_address,
         return_value: previous_value,
     })
+}
+
+/// When a guest replaces `GWLP_WNDPROC`, remember the proc it displaced the
+/// first time (see the handler doc above). Re-subclassing and restoring keep
+/// the original class default unchanged.
+fn remember_subclass_original(
+    state: &mut WinApiState,
+    window_handle: u64,
+    index_raw: u64,
+    previous_value: u64,
+) {
+    if window_long_ptr_index(index_raw, "SetWindowLongPtr").ok() != Some(-4) {
+        return;
+    }
+    if let Some(window) = find_window_mut(state, window_handle)
+        && window.subclass_original_wndproc == 0
+    {
+        window.subclass_original_wndproc = previous_value;
+    }
 }
 
 /// Handles `USER32.dll!SetCapture`.
@@ -142,39 +178,6 @@ pub fn handle_get_window_long_ptr_w(ctx: &mut HandlerContext<'_>) -> Result<WinA
     Ok(WinApiHandlerResult {
         return_address,
         return_value: value,
-    })
-}
-/// Handles `USER32.dll!SetWindowLongPtrA`.
-pub fn handle_set_window_long_ptr_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for SetWindowLongPtrA")?;
-
-    let index_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for SetWindowLongPtrA")?;
-
-    let new_value = engine
-        .read_r8()
-        .context("failed to read R8 for SetWindowLongPtrA")?;
-
-    let previous_value = set_window_long_ptr_value(
-        window_handle,
-        index_raw,
-        new_value,
-        state,
-        "SetWindowLongPtrA",
-    )?;
-
-    let return_address = engine
-        .return_from_win64_api(previous_value)
-        .context("failed to return from SetWindowLongPtrA")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: previous_value,
     })
 }
 

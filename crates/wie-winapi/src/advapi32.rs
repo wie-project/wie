@@ -450,8 +450,8 @@ pub fn handle_reg_query_value_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 /// Semantics follow real Windows: the stored type is returned regardless of
 /// what the caller requested; `*lpcbData` is the buffer size in and the actual
 /// byte count out; a buffer that is too small returns `ERROR_MORE_DATA` with
-/// the required size and the partial prefix that fits; a `NULL` `lpData` is a
-/// size probe that returns `ERROR_SUCCESS`.
+/// the required size and `*lpData` untouched; a `NULL` `lpData` is a size
+/// probe that returns `ERROR_SUCCESS`.
 fn query_registry_value(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -489,11 +489,9 @@ fn query_registry_value(
         // Size probe: the caller wants the required size, not the data.
         return return_status(engine, ERROR_SUCCESS);
     }
-    let copy_len = usize::try_from(required.min(capacity)).unwrap_or(0);
-    if copy_len < value.data.len() {
-        if let Some(prefix) = value.data.get(..copy_len).filter(|slice| !slice.is_empty()) {
-            engine.mem_write(data_ptr, prefix)?;
-        }
+    if required > capacity {
+        // Real Windows leaves *lpData untouched on ERROR_MORE_DATA; the caller
+        // is expected to retry with a buffer of the reported size.
         return return_status(engine, ERROR_MORE_DATA);
     }
     if !value.data.is_empty() {
@@ -1172,11 +1170,16 @@ mod tests {
         engine
             .mem_write(cb_ptr, &2_u32.to_le_bytes())
             .expect("write small capacity");
+        // Sentinel the guest buffer; real Windows must leave it untouched on
+        // ERROR_MORE_DATA (it only reports the required size in *lpcbData).
+        let sentinel = [0xAA, 0xBB, 0xCC, 0xDD];
+        engine
+            .mem_write(query_buf, &sentinel)
+            .expect("write sentinel into query buffer");
         let status = run_query_value_w(&mut engine, &mut state, name_ptr, 0, query_buf, cb_ptr);
         assert_eq!(status, 234); // ERROR_MORE_DATA
         assert_eq!(read_u32_at(&mut engine, cb_ptr), 3); // required size
-        // The 2-byte prefix is written so the caller can use partial data.
-        assert_eq!(read_bytes_at(&mut engine, query_buf, 2), b"&f");
+        assert_eq!(read_bytes_at(&mut engine, query_buf, 4), sentinel); // buffer untouched
     }
 
     #[test]

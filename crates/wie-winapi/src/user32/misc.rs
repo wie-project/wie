@@ -1,10 +1,12 @@
 use super::{
     Context, DIALOG_BASE_UNIT_X, DIALOG_BASE_UNIT_Y, FAKE_CURSOR_HANDLE, FAKE_ICON_HANDLE,
     FAKE_IMAGE_HANDLE, HandlerContext, IDOK, Result, TimerRecord, WinApiHandlerResult, WinApiState,
-    WindowClassRecord, WindowsHookRecord, checked_field_address, low_i32, read_guest_ansi_lossy,
-    read_guest_i32, read_guest_u32, read_guest_u64, read_guest_utf16_lossy, register_window_class,
+    WindowClassRecord, WindowsHookRecord, checked_field_address,
+    dispatch_control_proc_host_default, low_i32, read_guest_ansi_lossy, read_guest_i32,
+    read_guest_u32, read_guest_u64, read_guest_utf16_lossy, register_window_class,
     write_guest_ansi_c_string, write_guest_utf16_c_string,
 };
+use crate::{GuestCallbackRequest, OuterReturn, WinApiControlSignal};
 
 /// Handles `USER32.dll!LoadIconA`.
 pub fn handle_load_icon_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -1046,5 +1048,137 @@ pub(crate) fn timer_deadline(interval_ms: u32) -> std::time::Instant {
     now.checked_add(delay).unwrap_or_else(|| {
         now.checked_add(std::time::Duration::from_secs(1))
             .unwrap_or(now)
+    })
+}
+
+/// Handles `USER32.dll!CallWindowProcW`.
+pub fn handle_call_window_proc_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_call_window_proc(ctx, "CallWindowProcW")
+}
+/// Handles `USER32.dll!CallWindowProcA`.
+pub fn handle_call_window_proc_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_call_window_proc(ctx, "CallWindowProcA")
+}
+
+/// Shared `CallWindowProcA/W` implementation.
+///
+/// Win64 ABI: `rcx` = prevWndFunc, `rdx` = hWnd, `r8` = Msg, `r9` = wParam,
+/// `[rsp+0x28]` = lParam.
+///
+/// The notepad subclass pattern is `SetWindowLongPtrW(hEdit, GWLP_WNDPROC,
+/// EDIT_WndProc)`, which hands the guest WIE's default-control-proc marker
+/// (0) as the "original" proc; `EDIT_WndProc` then forwards everything it
+/// does not handle through `CallWindowProcW(hEdit, <that marker>, …)`.
+/// So:
+/// - `prevWndFunc == the window's subclass_original_wndproc` (0 for a fresh
+///   control): run the host default control dispatch and return its LRESULT
+///   to the guest subclass (the notepad flow, made exact).
+/// - `prevWndFunc != 0`: call that proc, exactly like real Windows — bridged
+///   through the same [`WinApiControlSignal::GuestCallbackRequested`]
+///   machinery the host uses for guest WndProcs (this also covers chained
+///   subclassing, where the displaced proc is another guest callback).
+/// - `prevWndFunc == 0` on a window whose original is a non-zero value:
+///   conservative 0 — real Windows would fault calling a NULL proc.
+fn handle_call_window_proc(
+    ctx: &mut HandlerContext<'_>,
+    api_name: &str,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let prev_wndfunc = engine
+        .read_rcx()
+        .with_context(|| format!("failed to read RCX for {api_name}"))?;
+    let window_handle = engine
+        .read_rdx()
+        .with_context(|| format!("failed to read RDX for {api_name}"))?;
+    let message_raw = engine
+        .read_r8()
+        .with_context(|| format!("failed to read R8 for {api_name}"))?;
+    let word_parameter = engine
+        .read_r9()
+        .with_context(|| format!("failed to read R9 for {api_name}"))?;
+    let rsp = engine
+        .read_rsp()
+        .with_context(|| format!("failed to read RSP for {api_name}"))?;
+    let long_parameter = read_guest_u64(
+        engine,
+        rsp.checked_add(0x28)
+            .with_context(|| format!("{api_name}: lParam address overflow"))?,
+    )
+    .with_context(|| format!("failed to read {api_name} lParam"))?;
+
+    // Only the low 32 bits carry the message id.
+    let message = u32::try_from(message_raw & u64::from(u32::MAX))
+        .context("CallWindowProc message does not fit u32")?;
+
+    let (original, unicode, is_control) =
+        super::find_window(state, window_handle).map_or((0, false, false), |window| {
+            (
+                window.subclass_original_wndproc,
+                window.unicode,
+                window.control_kind.is_some(),
+            )
+        });
+
+    // The original-marker path: run the host default control dispatch and
+    // return its LRESULT to the guest subclass. The host-default variant is
+    // used deliberately — the forwarded message must NOT re-enter the
+    // subclass (that would loop subclass → CallWindowProc → subclass). A
+    // nested signal (e.g. the default dispatch delivering EN_CHANGE to the
+    // parent) propagates as a bridged guest callback whose completion
+    // restores this very frame.
+    if prev_wndfunc == original {
+        if is_control
+            && let Some(result) = dispatch_control_proc_host_default(
+                engine,
+                state,
+                window_handle,
+                message,
+                word_parameter,
+                long_parameter,
+            )?
+        {
+            let return_address = engine
+                .return_from_win64_api(result)
+                .with_context(|| format!("failed to return from {api_name}"))?;
+            return Ok(WinApiHandlerResult {
+                return_address,
+                return_value: result,
+            });
+        }
+        // Non-control window (or an unhandled message): DefWindowProc-ish 0.
+        let return_address = engine
+            .return_from_win64_api(0)
+            .with_context(|| format!("failed to return from {api_name}"))?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+
+    // A foreign (non-marker) proc: call it, as real Windows does.
+    if prev_wndfunc != 0 {
+        return Err(WinApiControlSignal::GuestCallbackRequested {
+            request: GuestCallbackRequest {
+                callback_address: prev_wndfunc,
+                window_handle,
+                message,
+                word_parameter,
+                long_parameter,
+                unicode,
+                outer_return: OuterReturn::Passthrough,
+            },
+        }
+        .into());
+    }
+
+    // prev_wndfunc == 0 but the window recorded a non-zero original:
+    // conservative zero rather than calling a NULL proc (documented).
+    let return_address = engine
+        .return_from_win64_api(0)
+        .with_context(|| format!("failed to return from {api_name}"))?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 0,
     })
 }

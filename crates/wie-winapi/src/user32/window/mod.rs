@@ -500,8 +500,50 @@ pub(crate) fn deliver_focus_change(
                 )
             });
         if is_control {
-            // Host-side WndProc: update the control's focus state directly.
-            let _ = dispatch_control_proc(engine, state, hwnd, message, wparam, 0)?;
+            // A guest-subclassed control (GWLP_WNDPROC replaced by the guest)
+            // must see the focus message through its subclass proc, exactly
+            // like a guest WndProc window — the subclass forwards it through
+            // CallWindowProcW back into the host default. Plain controls
+            // update their focus state host-side.
+            let subclass = super::get_window_long_ptr_value(
+                hwnd,
+                super::GWLP_WNDPROC_RAW,
+                state,
+                "deliver_focus_change",
+            )?;
+            if subclass == 0 {
+                let _ = dispatch_control_proc(engine, state, hwnd, message, wparam, 0)?;
+                continue;
+            }
+            let request = GuestCallbackRequest {
+                callback_address: subclass,
+                window_handle: hwnd,
+                message,
+                word_parameter: wparam,
+                long_parameter: 0,
+                unicode,
+                outer_return,
+            };
+            if bridged.is_none() {
+                bridged = Some(WinApiControlSignal::GuestCallbackRequested { request });
+            } else {
+                // The bridge is one-shot: post the second message so it
+                // arrives after the bridged one (queue order).
+                let mut queue = state.lock_message_queue();
+                let time = queue.next_message_time;
+                queue.next_message_time = time
+                    .checked_add(1)
+                    .context("focus-change message timestamp overflow")?;
+                queue.messages.push(super::QueuedWindowMessage {
+                    window_handle: crate::handles::Hwnd::from(hwnd),
+                    message,
+                    word_parameter: wparam,
+                    long_parameter: 0,
+                    time,
+                    point_x: 0,
+                    point_y: 0,
+                });
+            }
             continue;
         }
         if window_proc == 0 && dialog_proc == 0 {

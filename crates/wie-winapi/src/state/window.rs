@@ -6,6 +6,39 @@ use ahash::HashMapExt;
 use super::input::KeyboardState;
 use super::process::FileDialogPolicy;
 
+/// One in-flight interactive file dialog (`GetOpenFileName` / `GetSaveFileName`).
+///
+/// Created by the comdlg32 handler when [`FileDialogPolicy::Interactive`] is
+/// set: it builds the file-dialog window + controls and stores everything the
+/// write-back needs here. Consumed by the `EndDialog` handler when the dialog
+/// closes — the chosen path is written into the guest's `OPENFILENAME` buffer
+/// there, before the modal loop returns to the caller. `None` when no file
+/// dialog is open.
+#[derive(Debug, Clone)]
+pub struct FileDialogSession {
+    /// The file-dialog window handle (a "FileDialog"-class window carrying the
+    /// file-dialog proc stub as its `dialog_proc`).
+    pub dialog_hwnd: u64,
+    /// The single-line EDIT child holding the typed path.
+    pub edit_hwnd: u64,
+    /// Guest VA of the `OPENFILENAME` structure.
+    pub ofn_ptr: u64,
+    /// `OPENFILENAME.lpstrFile` buffer VA.
+    pub file_buffer_ptr: u64,
+    /// `OPENFILENAME.nMaxFile` (buffer capacity in TCHARs).
+    pub max_file: u32,
+    /// `OPENFILENAME.lpstrFileTitle` buffer VA (0 = none).
+    pub file_title_ptr: u64,
+    /// `OPENFILENAME.nMaxFileTitle`.
+    pub max_file_title: u32,
+    /// Whether the W (UTF-16) variant is in use.
+    pub unicode: bool,
+    /// Guest directory the dialog lists (Windows style, e.g. `C:\work`).
+    pub initial_dir: String,
+    /// `OPENFILENAME.lpstrDefExt`, appended when the typed name has no dot.
+    pub default_extension: Option<String>,
+}
+
 /// Window, UI, and input state.
 ///
 /// Fields are `pub(crate)` except the ones the runtime reads directly through
@@ -72,6 +105,17 @@ pub struct WindowState {
         ahash::HashMap<crate::handles::Hwnd, crate::user32::controls::ControlState>,
     pub file_dialog_policy: FileDialogPolicy,
     pub last_file_dialog_path: Option<String>,
+    /// In-flight interactive file dialog, when [`FileDialogPolicy::Interactive`]
+    /// is set and a dialog is open. See [`FileDialogSession`].
+    pub file_dialog: Option<FileDialogSession>,
+    /// Guest VA of the planted file-dialog modal-loop body (set by session
+    /// init alongside `dialog_result_va`). Zero when the dialog machinery is
+    /// absent, in which case `Interactive` falls back to `Cancel`.
+    pub file_dialog_loop_va: u64,
+    /// Guest VA of the planted file-dialog proc stub — the window's
+    /// `dialog_proc`, which turns `WM_COMMAND(IDOK/IDCANCEL)` / `WM_CLOSE`
+    /// into an `EndDialog` call.
+    pub file_dialog_proc_va: u64,
     pub(crate) comm_dlg_extended_error: u32,
     pub(crate) next_menu_handle: crate::handles::Hmenu,
     /// All fake USER32 accelerator tables loaded by `LoadAcceleratorsA/W`;
@@ -135,6 +179,9 @@ impl Default for WindowState {
             control_states: ahash::HashMap::new(),
             file_dialog_policy: FileDialogPolicy::default(),
             last_file_dialog_path: None,
+            file_dialog: None,
+            file_dialog_loop_va: 0,
+            file_dialog_proc_va: 0,
             comm_dlg_extended_error: 0,
             menus: Vec::new(),
             menu_dirty: false,
@@ -328,6 +375,18 @@ pub struct WindowRecord {
 
     /// Whether the dialog procedure uses the Unicode contract.
     pub dialog_unicode: bool,
+
+    /// The `GWLP_WNDPROC` value that existed when the guest FIRST subclassed
+    /// this window (`SetWindowLongPtrW(GWLP_WNDPROC, …)`).
+    ///
+    /// For built-in controls that original is WIE's default-control-proc
+    /// marker (0 — WIE stores nothing for an un-subclassed control's
+    /// `GWLP_WNDPROC`): `CallWindowProcW(hwnd, <this value>, …)` runs the
+    /// host default control dispatch instead of invoking a guest proc, which
+    /// is exactly how notepad's `EDIT_WndProc` forwards what it does not
+    /// handle. Re-subclassing never changes it (the class default stays the
+    /// host marker), and it is not cleared when a subclass is removed.
+    pub subclass_original_wndproc: u64,
 }
 
 /// Controls what value the outer API returns after a guest WndProc completes.
