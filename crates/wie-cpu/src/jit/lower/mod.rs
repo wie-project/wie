@@ -7,6 +7,7 @@ use super::JitEngine;
 use super::block::{BlockTerm, DecodedInsn, analyze_block_stack_pin};
 use super::config::JitConfig;
 use super::fast_api::FastApiKind;
+use super::gen_tlb::GenTlb;
 use crate::mem::GuestMemory;
 use crate::regs::Rflags;
 use ahash::HashMap;
@@ -36,25 +37,16 @@ pub(super) const TLB_EMPTY: u64 = u64::MAX;
 pub(super) const TLB_PROT_R: u64 = 1;
 pub(super) const TLB_PROT_W: u64 = 2;
 
-/// 4-way tag+host line (16-byte aligned for Neon loads).
-#[repr(C, align(16))]
-#[derive(Clone, Copy)]
-pub(super) struct TlbBucket {
-    /// Guest page keys (`va >> 12`) for 4 ways.
-    pub tags: [u64; TLB_WAYS_PER_SET],
-    /// Host page bases (non-owning soft-translate pointers).
-    pub host: [*mut u8; TLB_WAYS_PER_SET],
-}
-
-/// Per-set generation, prot bits, and RR victim.
-#[repr(C, align(16))]
-#[derive(Clone, Copy)]
-pub(super) struct TlbBucketAux {
-    pub generation: [u64; TLB_WAYS_PER_SET],
-    pub prot: [u8; TLB_WAYS_PER_SET],
-    /// Next victim way within the set (0..3).
-    pub rr: u8,
-    pub _pad: [u8; 11],
+/// Stored TLB value: host page base + software R/W prot bits.
+///
+/// Bundled so [`GenTlb`] stays value-agnostic; `prot` mirrors the old
+/// per-way `TlbBucketAux::prot`, and `host == null` marks a cold way. Not
+/// touched by emitted IR — the multi-way TLB is host-helper-side only.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(super) struct TlbValue {
+    pub(super) host: *mut u8,
+    pub(super) prot: u8,
 }
 
 /// Chain-table slot: guest VA → host fn ptr (0 = empty). AoS pair so that
@@ -70,25 +62,6 @@ impl ChainSlot {
     #[inline]
     pub(super) const fn empty() -> Self {
         Self { va: 0, fn_ptr: 0 }
-    }
-}
-
-/// Empty bucket constructor (const-friendly for array init).
-#[must_use]
-pub(super) const fn empty_tlb_bucket() -> TlbBucket {
-    TlbBucket {
-        tags: [TLB_EMPTY; TLB_WAYS_PER_SET],
-        host: [std::ptr::null_mut(); TLB_WAYS_PER_SET],
-    }
-}
-
-#[must_use]
-pub(super) const fn empty_tlb_aux() -> TlbBucketAux {
-    TlbBucketAux {
-        generation: [0; TLB_WAYS_PER_SET],
-        prot: [0; TLB_WAYS_PER_SET],
-        rr: 0,
-        _pad: [0; 11],
     }
 }
 
@@ -115,18 +88,6 @@ impl XmmSlot {
     pub(super) fn to_u128(self) -> u128 {
         u128::from(self.lo) | (u128::from(self.hi) << 64)
     }
-}
-
-/// Set index for the 4-way TLB: XOR-fold high `page_key` bits into the low
-/// `log2(TLB_SETS)` bits so allocations whose base VAs share the same low
-/// bits (e.g. 64 KiB-aligned arenas — stack, heap, VirtualAlloc reserves) do
-/// not all collide on the same set. `page_key = va >> 12`, so bits 0..3 of
-/// `page_key` are va bits 12..15; a 64 KiB-aligned base has those zero and
-/// would land in set 0 without folding.
-#[inline]
-pub(super) fn tlb_set_index(page_key: u64) -> usize {
-    let mixed = page_key ^ (page_key >> 4) ^ (page_key >> 8) ^ (page_key >> 12);
-    (mixed as usize) & (TLB_SETS - 1)
 }
 
 /// Open-addressing slots for guest-VA → host block fn (block chaining).
@@ -319,10 +280,12 @@ pub(super) struct JitCtx {
     pub fault_size: u64,
     /// 0 = read, 1 = write (matches iced ACCESS_*).
     pub fault_access: u64,
-    /// Set-associative multi-way page TLB.
-    pub tlb_sets: [TlbBucket; TLB_SETS],
-    /// Parallel gen/prot/rr for [`Self::tlb_sets`].
-    pub tlb_aux: [TlbBucketAux; TLB_SETS],
+    /// Generation-validated set-associative page TLB.
+    ///
+    /// Host-helper-side only: emitted IR never reads it (the sticky and
+    /// hot-slot fields carry the inline IR fast path), so it is free to live
+    /// inside a generic cache type. `offset_of!` constants auto-derive.
+    pub tlb: GenTlb<u64, TlbValue, TLB_SETS, TLB_WAYS_PER_SET>,
     /// XMM0..XMM15 as 16-byte aligned slots (lo/hi layout for IR offsets).
     pub xmm: [XmmSlot; 16],
     /// Shadow return stack: push count (modular index via `sp & (SHADOW_DEPTH-1)`).
@@ -479,8 +442,7 @@ const _: () = {
     assert!(std::mem::size_of::<MemPin>() == PIN_STRIDE as usize);
     assert!(std::mem::size_of::<XmmSlot>() == 16);
     assert!(std::mem::align_of::<XmmSlot>() >= 16);
-    assert!(std::mem::align_of::<TlbBucket>() >= 16);
-    assert!(std::mem::size_of::<TlbBucket>() == 64);
+    assert!(std::mem::align_of::<GenTlb<u64, TlbValue, TLB_SETS, TLB_WAYS_PER_SET>>() >= 16);
     assert!(TLB_SETS.is_power_of_two());
     assert!(SHADOW_DEPTH.is_power_of_two());
     assert!(CHAIN_SLOTS.is_power_of_two());

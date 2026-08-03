@@ -2,9 +2,10 @@
 //! multi-way set-associative lookups, and the single-page host-pointer resolver (`tlb_page_ptr`).
 
 use super::super::config::JitConfig;
+use super::super::gen_tlb::GenTlb;
 use super::{
-    GuestVa, JitCtx, MemPin, STICKY_WAYS, TLB_EMPTY, TLB_PROT_R, TLB_PROT_W, TLB_WAYS_PER_SET,
-    TlbBucket, TlbBucketAux, tlb_set_index,
+    GuestVa, JitCtx, MemPin, STICKY_WAYS, TLB_EMPTY, TLB_PROT_R, TLB_PROT_W, TLB_SETS,
+    TLB_WAYS_PER_SET, TlbValue,
 };
 
 use crate::mem::PAGE_SIZE;
@@ -237,117 +238,62 @@ pub(super) fn tlb_install(
     prot: u8,
     generation: u64,
 ) {
-    let set = tlb_set_index(page_key);
-    let Some(bucket) = ctx.tlb_sets.get_mut(set) else {
-        return;
-    };
-    let Some(aux) = ctx.tlb_aux.get_mut(set) else {
-        return;
-    };
-    // Prefer empty / matching tag way.
-    let mut way = None;
-    for w in 0..TLB_WAYS_PER_SET {
-        if bucket.tags.get(w).copied() == Some(page_key)
-            || bucket.tags.get(w).copied() == Some(TLB_EMPTY)
-        {
-            way = Some(w);
-            break;
-        }
-    }
-    let way = way.unwrap_or_else(|| {
-        let w = usize::from(aux.rr) & (TLB_WAYS_PER_SET - 1);
-        aux.rr = aux.rr.wrapping_add(1);
-        w
-    });
-    if let Some(t) = bucket.tags.get_mut(way) {
-        *t = page_key;
-    }
-    if let Some(h) = bucket.host.get_mut(way) {
-        *h = page_base;
-    }
-    if let Some(g) = aux.generation.get_mut(way) {
-        *g = generation;
-    }
-    if let Some(p) = aux.prot.get_mut(way) {
-        *p = prot;
-    }
+    ctx.tlb.insert(
+        page_key,
+        TlbValue {
+            host: page_base,
+            prot,
+        },
+        generation,
+    );
 }
 
-/// Scalar 4-way tag scan within a set.
-pub(super) fn tlb_bucket_lookup_scalar(
-    bucket: &TlbBucket,
-    aux: &TlbBucketAux,
-    page_key: u64,
-    write: bool,
-    cur_gen: u64,
-) -> Option<(*mut u8, u8)> {
-    for way in 0..TLB_WAYS_PER_SET {
-        if bucket.tags.get(way).copied() != Some(page_key) {
-            continue;
-        }
-        let host = bucket
-            .host
-            .get(way)
-            .copied()
-            .unwrap_or(std::ptr::null_mut());
-        if host.is_null() {
-            continue;
-        }
-        if aux.generation.get(way).copied() != Some(cur_gen) {
-            continue;
-        }
-        let prot = aux.prot.get(way).copied().unwrap_or(0);
-        if !tlb_prot_allows(prot, write) {
-            continue;
-        }
-        return Some((host, prot));
-    }
-    None
-}
-
-/// Neon / portable vector tag compare for one 4-way bucket.
+/// Multi-way TLB lookup: scalar way scan (or Neon compare on aarch64).
 pub(super) fn tlb_bucket_lookup(
-    bucket: &TlbBucket,
-    aux: &TlbBucketAux,
+    tlb: &GenTlb<u64, TlbValue, TLB_SETS, TLB_WAYS_PER_SET>,
     page_key: u64,
     write: bool,
     cur_gen: u64,
 ) -> Option<(*mut u8, u8)> {
     if !JitConfig::get().tlb_neon_enabled() {
-        return tlb_bucket_lookup_scalar(bucket, aux, page_key, write, cur_gen);
+        return tlb
+            .lookup(page_key, cur_gen, |v| {
+                !v.host.is_null() && tlb_prot_allows(v.prot, write)
+            })
+            .map(|v| (v.host, v.prot));
     }
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: `TlbBucket` is `align(16)`; tags are 4×u64 contiguous.
-        let bits = unsafe { tlb_neon_tag_mask(bucket.tags.as_ptr(), page_key) };
+        let s = tlb.set(tlb.set_index(page_key))?;
+        // SAFETY: `GenSet` is `align(16)` with `tags` as its first field and
+        // `K = u64` here, so `tags` is `WAYS` contiguous 16-byte-aligned u64s.
+        let bits = unsafe { tlb_neon_tag_mask(s.tags.as_ptr(), page_key) };
         if bits == 0 {
             return None;
         }
         // First matching way (branchless prefer low index).
-        let way = bits.trailing_zeros() as usize;
+        let way = usize::try_from(bits.trailing_zeros()).unwrap_or(0);
         if way >= TLB_WAYS_PER_SET {
             return None;
         }
-        let host = bucket
-            .host
-            .get(way)
-            .copied()
-            .unwrap_or(std::ptr::null_mut());
-        if host.is_null() {
+        let v = s.values.get(way).copied()?;
+        if v.host.is_null() {
             return None;
         }
-        if aux.generation.get(way).copied() != Some(cur_gen) {
+        if s.gens.get(way).copied() != Some(cur_gen) {
             return None;
         }
-        let prot = aux.prot.get(way).copied().unwrap_or(0);
-        if !tlb_prot_allows(prot, write) {
+        if !tlb_prot_allows(v.prot, write) {
             return None;
         }
-        Some((host, prot))
+        Some((v.host, v.prot))
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
-        tlb_bucket_lookup_scalar(bucket, aux, page_key, write, cur_gen)
+        tlb.lookup(page_key, cur_gen, |v| {
+            !v.host.is_null() && tlb_prot_allows(v.prot, write)
+        })
+        .map(|v| (v.host, v.prot))
     }
 }
 
@@ -436,12 +382,7 @@ pub(super) unsafe fn tlb_page_ptr(
         return Some(unsafe { host.add(page_off) });
     }
     classify_sticky_miss(ctx, page_key, write);
-    let set = tlb_set_index(page_key);
-    let hit = ctx
-        .tlb_sets
-        .get(set)
-        .zip(ctx.tlb_aux.get(set))
-        .and_then(|(bucket, aux)| tlb_bucket_lookup(bucket, aux, page_key, write, cur_gen));
+    let hit = tlb_bucket_lookup(&ctx.tlb, page_key, write, cur_gen);
     if let Some((page_base, prot)) = hit {
         ctx.mem_path.multi_hit = ctx.mem_path.multi_hit.saturating_add(1);
         tlb_set_hot(ctx, page_key, page_base, prot, cur_gen);

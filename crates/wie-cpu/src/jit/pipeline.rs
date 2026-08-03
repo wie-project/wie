@@ -13,9 +13,10 @@ use super::JitStats;
 use super::block::{self, BlockKind, decode_pure_gpr_block, pure_is_self_loop};
 use super::config::JitConfig;
 use super::fast_api::{FastApiKind, JitFastPathConfig, install_heap_layout};
+use super::gen_tlb::GenTlb;
 use super::lower::{
-    self, CompiledBlock, JitCtx, MemPathSlice, MemPin, PIN_SLOTS, STICKY_WAYS, TLB_EMPTY, TLB_SETS,
-    XmmSlot, chain_table_clear, chain_table_insert, empty_tlb_aux, empty_tlb_bucket,
+    self, CompiledBlock, JitCtx, MemPathSlice, MemPin, PIN_SLOTS, STICKY_WAYS, TLB_EMPTY, XmmSlot,
+    chain_table_clear, chain_table_insert,
 };
 use super::shared::{BgEnqueueOutcome, BgWaitCell, BgWaitState, JitShared, PerThreadJitState};
 use super::{CacheEntry, JitCpu};
@@ -692,8 +693,7 @@ impl JitCpu {
             fault_addr: 0,
             fault_size: 0,
             fault_access: 0,
-            tlb_sets: self.thread.tlb_sets,
-            tlb_aux: self.thread.tlb_aux,
+            tlb: self.thread.tlb,
             xmm,
             shadow_sp: self.thread.shadow_sp,
             shadow_ret: self.thread.shadow_ret,
@@ -749,8 +749,7 @@ impl JitCpu {
         // Guest stores via `GuestMemory::write` leave a pending range;
         // apply selective code invalidation only after the native frame returns.
         // Persist per-thread execution state from JitCtx.
-        self.thread.tlb_sets = ctx.tlb_sets;
-        self.thread.tlb_aux = ctx.tlb_aux;
+        self.thread.tlb = ctx.tlb;
         self.thread.tlb_hot_page = ctx.tlb_hot_page;
         self.thread.tlb_hot_ptr = ctx.tlb_hot_ptr;
         self.thread.tlb_hot_prot = ctx.tlb_hot_prot;
@@ -842,8 +841,7 @@ impl JitCpu {
     }
 
     pub(super) fn invalidate_tlb(&mut self) {
-        self.thread.tlb_sets = [empty_tlb_bucket(); TLB_SETS];
-        self.thread.tlb_aux = [empty_tlb_aux(); TLB_SETS];
+        self.thread.tlb = GenTlb::new();
         self.thread.tlb_hot_page = TLB_EMPTY;
         self.thread.tlb_hot_ptr = std::ptr::null_mut();
         self.thread.tlb_hot_prot = 0;

@@ -21,6 +21,7 @@ mod config;
 mod cpu_engine;
 mod engine;
 mod fast_api;
+mod gen_tlb;
 mod lower;
 mod pipeline;
 mod shared;

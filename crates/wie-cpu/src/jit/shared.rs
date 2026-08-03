@@ -14,9 +14,10 @@ use super::block::{self, BlockKind};
 use super::config::{BG_QUEUE_CAP, JitConfig};
 use super::engine::JitEngine;
 use super::fast_api::FastApiKind;
+use super::gen_tlb::GenTlb;
 use super::lower::{
     self, CHAIN_SLOTS, CompiledBlock, MemPin, PIN_SLOTS, STICKY_WAYS, TLB_EMPTY, TLB_SETS,
-    TlbBucket, TlbBucketAux, compile_block, empty_tlb_aux, empty_tlb_bucket,
+    TLB_WAYS_PER_SET, TlbValue, compile_block,
 };
 use super::pipeline::resolve_thunk_va;
 use super::trampolines::match_micro_stub;
@@ -519,8 +520,7 @@ pub struct PerThreadJitState {
     /// Instructions retired via the iced interpreter (diagnostic counter).
     pub iced_steps: u64,
     /// Persistent set-associative page TLB across chained blocks.
-    pub tlb_sets: [TlbBucket; TLB_SETS],
-    pub tlb_aux: [TlbBucketAux; TLB_SETS],
+    pub tlb: GenTlb<u64, TlbValue, TLB_SETS, TLB_WAYS_PER_SET>,
     /// Sticky last-hit page for inline IR mem path.
     pub tlb_hot_page: u64,
     pub tlb_hot_ptr: *mut u8,
@@ -561,8 +561,7 @@ impl PerThreadJitState {
             rip_trace_i: 0,
             rip_trace_n: 0,
             iced_steps: 0,
-            tlb_sets: [empty_tlb_bucket(); TLB_SETS],
-            tlb_aux: [empty_tlb_aux(); TLB_SETS],
+            tlb: GenTlb::new(),
             tlb_hot_page: TLB_EMPTY,
             tlb_hot_ptr: std::ptr::null_mut(),
             tlb_hot_prot: 0,
