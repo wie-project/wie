@@ -3,6 +3,7 @@
 //! Manages per-window compositing surfaces and frame publishing so
 //! CreateDIBSection → SelectObject → BitBlt actually renders pixels.
 
+use ahash::HashMapExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
@@ -117,9 +118,9 @@ pub struct PresentState {
     ///
     /// `pub(crate)`: the host reads published frames (`published`) and wake
     /// hooks; the scratch surfaces are internal to the blit pipeline.
-    pub(crate) surfaces: std::collections::HashMap<crate::handles::Hwnd, WindowSurface>,
+    pub(crate) surfaces: ahash::HashMap<crate::handles::Hwnd, WindowSurface>,
     /// Last published snapshot per HWND.
-    pub published: std::collections::HashMap<crate::handles::Hwnd, SurfaceFrame>,
+    pub published: ahash::HashMap<crate::handles::Hwnd, SurfaceFrame>,
     /// Monotonically increasing generation counter.
     pub generation: u64,
     /// Optional wake callback for the host presenter.
@@ -187,8 +188,8 @@ impl PresentState {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            surfaces: std::collections::HashMap::new(),
-            published: std::collections::HashMap::new(),
+            surfaces: ahash::HashMap::new(),
+            published: ahash::HashMap::new(),
             generation: 0,
             wake: None,
             record: None,

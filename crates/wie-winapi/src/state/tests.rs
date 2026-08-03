@@ -8,7 +8,8 @@
 use super::*;
 use wie_cpu::{CpuEngine, IcedCpu};
 
-use std::collections::HashMap;
+use ahash::HashMap;
+use ahash::HashMapExt;
 use std::sync::{Arc, Mutex};
 
 use crate::guest_heap::GuestHeap;

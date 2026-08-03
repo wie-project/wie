@@ -11,7 +11,8 @@
 //! - TEB last-error is still mirrored at a fixed low VA for the primary
 //!   thread until multi-TEB / GS-base (later phase).
 
-use std::collections::HashMap;
+use ahash::HashMap;
+use ahash::HashMapExt;
 
 /// Documented primary (bootstrap) guest thread id.
 ///

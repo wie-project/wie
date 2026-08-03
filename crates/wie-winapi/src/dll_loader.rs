@@ -7,7 +7,9 @@
 //! (above the fake handle range `0x6100_xxxx`). Fake modules (kernel32,
 //! user32, etc.) keep their existing handles — the loader skips them.
 
-use std::collections::{HashMap, HashSet};
+use ahash::HashMap;
+use ahash::HashMapExt;
+use std::collections::HashSet;
 
 use anyhow::{Context, Result, bail};
 use wie_cpu::CpuEngine;

@@ -161,7 +161,7 @@ fn indexed_vertex(
 fn build_fragment_state<'a>(
     render_state: &RenderState,
     depth_stencil: u64,
-    depth_surfaces: &'a mut std::collections::HashMap<u64, DepthStencilRecord>,
+    depth_surfaces: &'a mut ahash::HashMap<u64, DepthStencilRecord>,
 ) -> FragmentState<'a> {
     let depth = if depth_stencil != 0 {
         depth_surfaces
@@ -193,7 +193,7 @@ fn resolve_sampler_stage<'a>(
     stage_idx: usize,
     stages: &[TextureStageState; 8],
     bindings: &[u64; 8],
-    textures: &'a std::collections::HashMap<u64, TextureRecord>,
+    textures: &'a ahash::HashMap<u64, TextureRecord>,
 ) -> Option<TextureStage<'a>> {
     let binding = bindings.get(stage_idx).copied().unwrap_or(0);
     if binding == 0 {
@@ -225,7 +225,7 @@ fn resolve_sampler_stage<'a>(
 fn resolve_texture_stage<'a>(
     stages: &[TextureStageState; 8],
     bindings: &[u64; 8],
-    textures: &'a std::collections::HashMap<u64, TextureRecord>,
+    textures: &'a ahash::HashMap<u64, TextureRecord>,
 ) -> Option<TextureStage<'a>> {
     let stage = resolve_sampler_stage(0, stages, bindings, textures)?;
     // The per-stage struct carries D3D9's stage-0 FFP defaults, so unset
@@ -243,7 +243,7 @@ fn resolve_texture_stage<'a>(
 fn resolve_ps_samplers<'a>(
     stages: &[TextureStageState; 8],
     bindings: &[u64; 8],
-    textures: &'a std::collections::HashMap<u64, TextureRecord>,
+    textures: &'a ahash::HashMap<u64, TextureRecord>,
 ) -> [Option<TextureStage<'a>>; PS_SAMPLER_COUNT] {
     let mut samplers = [None; PS_SAMPLER_COUNT];
     for (index, slot) in samplers.iter_mut().enumerate() {

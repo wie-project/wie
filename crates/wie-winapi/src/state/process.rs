@@ -1,6 +1,6 @@
 //! Process, heap, file-I/O, module, and environment state types.
 
-use std::collections::HashMap;
+use ahash::HashMap;
 use std::sync::Arc;
 
 use crate::dll_loader;
@@ -154,7 +154,7 @@ impl ImportResolver {
 pub struct ModuleState {
     pub loaded_modules: HashMap<String, dll_loader::LoadedModule>,
     pub import_resolver: Option<ImportResolver>,
-    pub get_proc_address_cache: std::collections::HashMap<String, GetProcAddressCacheEntry>,
+    pub get_proc_address_cache: ahash::HashMap<String, GetProcAddressCacheEntry>,
     pub next_module_handle: ModuleHandle,
 }
 

@@ -5,7 +5,8 @@
 //! - **Fast path O(1)**: alloc/free for class-sized blocks are stack pop/push + HashMap.
 //! - Large blocks use a separate free list with best-fit scan (rare for WIE).
 
-use std::collections::HashMap;
+use ahash::HashMap;
+use ahash::HashMapExt;
 
 /// Number of fixed size classes (powers-of-two-ish ladder).
 pub const HEAP_SIZE_CLASS_COUNT: usize = 24;

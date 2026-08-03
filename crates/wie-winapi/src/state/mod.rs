@@ -104,7 +104,7 @@ pub struct KernelState {
     /// shared WinAPI mutex second overwrote the first thread's payload, and
     /// the second thread later found nothing in the slot and unwound past its
     /// own catch (see `cpp_threads` micro). Per-TID storage isolates them.
-    pub seh_pending: std::collections::HashMap<u32, seh::SehPending>,
+    pub seh_pending: ahash::HashMap<u32, seh::SehPending>,
 }
 
 /// Identifies a slot in [`DllStateMap`]. One variant per emulated DLL

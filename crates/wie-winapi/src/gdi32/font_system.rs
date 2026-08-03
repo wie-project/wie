@@ -12,7 +12,7 @@
 //! faces, resolved metrics, per-codepoint fallbacks) stay in the session-owned
 //! [`FontEngine`] on `GdiState`, matching the codebase's session-state style.
 
-use std::collections::HashMap;
+use ahash::HashMap;
 use std::sync::OnceLock;
 
 use ab_glyph::{Font, FontArc, FontVec, Glyph, GlyphId, Point, PxScale, PxScaleFont, ScaleFont};

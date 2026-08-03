@@ -3,7 +3,8 @@
 //! All fields are `pub(crate)`: D3D9 state is reachable from handlers through
 //! `WinApiState::d3d9()`, and no external crate reads these fields directly.
 
-use std::collections::HashMap;
+use ahash::HashMap;
+use ahash::HashMapExt;
 
 /// Whether a D3D9 scene is in progress (`BeginScene` … `EndScene`).
 ///

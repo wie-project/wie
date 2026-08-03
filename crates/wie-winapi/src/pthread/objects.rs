@@ -11,7 +11,8 @@
 //! one exception is [`WakeQueue`], which is the host primitive a guest thread
 //! parks on *after* dropping that mutex.
 
-use std::collections::HashMap;
+use ahash::HashMap;
+use ahash::HashMapExt;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 

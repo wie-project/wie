@@ -4,7 +4,8 @@
 //! the shared CPU engine. Guest data races are still the application's problem;
 //! engine metadata is serialized by the runtime process lock.
 
-use std::collections::HashMap;
+use ahash::HashMap;
+use ahash::HashMapExt;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 

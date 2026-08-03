@@ -55,7 +55,8 @@ mod locks;
 mod objects;
 mod threads;
 
-use std::collections::HashMap;
+use ahash::HashMap;
+use ahash::HashMapExt;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};

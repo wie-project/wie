@@ -1,6 +1,7 @@
 //! Window, UI, hook, timer, resource, and control-signal state types.
 
 use crate::vfs;
+use ahash::HashMapExt;
 
 use super::input::KeyboardState;
 use super::process::FileDialogPolicy;
@@ -50,7 +51,7 @@ pub struct WindowState {
     pub windows: Vec<WindowRecord>,
     /// Per-window UI state for built-in controls (pressed/focus/items).
     pub(crate) control_states:
-        std::collections::HashMap<crate::handles::Hwnd, crate::user32::controls::ControlState>,
+        ahash::HashMap<crate::handles::Hwnd, crate::user32::controls::ControlState>,
     pub file_dialog_policy: FileDialogPolicy,
     pub last_file_dialog_path: Option<String>,
     pub(crate) comm_dlg_extended_error: u32,
@@ -96,7 +97,7 @@ impl Default for WindowState {
             message_queue_idle_policy: MessageQueueIdlePolicy::default(),
             window_classes: Vec::new(),
             windows: Vec::new(),
-            control_states: std::collections::HashMap::new(),
+            control_states: ahash::HashMap::new(),
             file_dialog_policy: FileDialogPolicy::default(),
             last_file_dialog_path: None,
             comm_dlg_extended_error: 0,

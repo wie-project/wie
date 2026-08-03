@@ -2,6 +2,7 @@
 
 use super::path::{guest_basename, paths_equal_ci, wildcard_match};
 use super::volume::{VolumeConfig, guest_path_to_host};
+use ahash::HashMapExt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -52,8 +53,8 @@ struct StatCacheEntry {
 }
 
 thread_local! {
-    static STAT_CACHE: std::cell::RefCell<std::collections::HashMap<PathBuf, StatCacheEntry>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+    static STAT_CACHE: std::cell::RefCell<ahash::HashMap<PathBuf, StatCacheEntry>> =
+        std::cell::RefCell::new(ahash::HashMap::new());
 }
 
 /// Invalidate every cached stat. Called by mutating entry points.

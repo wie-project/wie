@@ -22,7 +22,7 @@ use crate::user32::{
 /// `control_states` field (not the whole `WindowState`) so callers can hold a
 /// `window` borrow from `ws.windows` at the same time (disjoint fields).
 fn edit_state_mut(
-    control_states: &mut std::collections::HashMap<crate::handles::Hwnd, ControlState>,
+    control_states: &mut ahash::HashMap<crate::handles::Hwnd, ControlState>,
     hwnd: u64,
 ) -> &mut ControlState {
     control_states
