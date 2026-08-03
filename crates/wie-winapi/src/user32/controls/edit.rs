@@ -2036,11 +2036,25 @@ pub(super) fn paint_edit(
         };
     let (sel_start, sel_end, caret) = (sel_start.min(len), sel_end.min(len), caret.min(len));
     let line_h = resolved.line_height();
-    let multiline = style_bits & ES_MULTILINE != 0;
+    // The multiline/wrap decisions read the LIVE creation style from the
+    // window record, not `style_bits`: the read-only `control_state` accessor
+    // never refreshes `style_bits`, whose lazy seed starts at 0 — so the very
+    // FIRST paint (WM_PAINT right after creation, before any keyboard/input
+    // message ran a mutating accessor) would otherwise render a multiline
+    // EDIT as single-line: one row, vertically centered. The caret/selection
+    // fields and the ES_ALIGN_MASK bits are correctly maintained (messages
+    // update them) and stay on the control state.
+    let edit_style = state
+        .window_state()
+        .windows
+        .iter()
+        .find(|w| w.handle == info.dc_window)
+        .map_or(0, |w| w.style);
+    let multiline = edit_style & ES_MULTILINE != 0;
     // Wrap is on when the multiline EDIT has no horizontal scrollbar (notepad
     // toggles word wrap by dropping the horizontal styles); long lines are
-    // horizontally clipped otherwise — the scrollbar itself is Task 2.4.
-    let wrap = multiline && style_bits & WS_HSCROLL == 0;
+    // horizontally clipped otherwise.
+    let wrap = multiline && edit_style & WS_HSCROLL == 0;
     // Single-line edits keep their vertical centering; multiline rows start
     // at the top of the client rect.
     let base_y = if multiline {

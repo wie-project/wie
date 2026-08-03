@@ -9,7 +9,8 @@
 
 use std::thread::ThreadId;
 
-use muda::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, Submenu};
+use muda::accelerator::Accelerator;
+use muda::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use wie_runtime::MenuNode;
 use winit::event_loop::EventLoopProxy;
 
@@ -26,6 +27,44 @@ fn guest_id_to_menu_id(id: u32) -> MenuId {
 /// Non-numeric ids (defensive — we only ever create numeric ones) decode to 0.
 pub fn menu_id_to_guest_id(id: &MenuId) -> u32 {
     id.0.parse::<u32>().unwrap_or(0)
+}
+
+/// Parse a Windows-style menu shortcut suffix — the exact forms RNotepad's
+/// resources use (`"Ctrl+N"`, `"Ctrl+Shift+N"`, `"F5"`, `"Del"`, plus the
+/// German `"Strg+…"`/`"Umschalt"` and Turkish `"Sil"` spellings) — into a
+/// muda [`Accelerator`].
+///
+/// Windows menu strings label the primary shortcut "Ctrl" while modern macOS
+/// apps use Command, so `Ctrl`/`Strg` normalize to muda's `CmdOrCtrl` token
+/// (Command on macOS, Control elsewhere — the
+/// [`muda::accelerator::CMD_OR_CTRL`] convention). Localized delete labels
+/// (`Del`/`Entf`/`Sil`) map to the Delete key. Anything outside that grammar
+/// — or muda cannot parse — falls back to `None`, and the native item is
+/// simply left without a key equivalent.
+fn parse_menu_accelerator(suffix: &str) -> Option<Accelerator> {
+    let normalized = normalize_accelerator_tokens(suffix)?;
+    normalized.parse::<Accelerator>().ok()
+}
+
+/// Rewrite a guest shortcut suffix into the token spelling muda understands.
+fn normalize_accelerator_tokens(suffix: &str) -> Option<String> {
+    let tokens: Vec<&str> = suffix.split('+').collect();
+    let (key, modifiers) = tokens.split_last()?;
+    let mut normalized: Vec<String> = Vec::new();
+    for token in modifiers {
+        match token.to_ascii_uppercase().as_str() {
+            "CTRL" | "STRG" => normalized.push("CmdOrCtrl".to_owned()),
+            "SHIFT" | "UMSCHALT" => normalized.push("Shift".to_owned()),
+            "ALT" => normalized.push("Alt".to_owned()),
+            _ => return None, // unknown modifier — do not guess
+        }
+    }
+    let key = match key.to_ascii_uppercase().as_str() {
+        "DEL" | "ENTF" | "SIL" => "Delete".to_owned(),
+        other => other.to_owned(),
+    };
+    normalized.push(key);
+    Some(normalized.join("+"))
 }
 
 /// The muda state one leaf menu item must reflect: its guest command id plus
@@ -56,9 +95,13 @@ pub fn menu_item_states(nodes: &[MenuNode]) -> Vec<MenuItemState> {
 }
 
 /// Depth-first leaf walk shared by [`menu_item_states`] and the bar build,
-/// so the state list always lines up with the append order.
+/// so the state list always lines up with the append order. Separator nodes
+/// contribute no state — the bar renders them as lines, not items.
 fn collect_item_states(nodes: &[MenuNode], out: &mut Vec<MenuItemState>) {
     for node in nodes {
+        if node.separator {
+            continue;
+        }
         if node.children.is_empty() {
             out.push(MenuItemState {
                 id: node.id,
@@ -89,12 +132,23 @@ enum LeafItem {
 impl LeafItem {
     /// Create the leaf in a default enabled/unchecked state; the real state
     /// is stamped afterwards by [`apply_item_states`] from the pure mapping.
+    /// The accelerator is applied at creation (it never changes for a built
+    /// item) — the `\t` suffix was already split off `title` by the tree
+    /// build and lands here as the muda key equivalent, so AppKit renders
+    /// the standard grey right-aligned shortcut instead of white inline text.
     fn new(node: &MenuNode) -> Self {
         let id = guest_id_to_menu_id(node.id);
+        let accelerator = node.accelerator.as_deref().and_then(parse_menu_accelerator);
         if node.checked {
-            Self::Checkable(CheckMenuItem::with_id(id, &node.title, true, false, None))
+            Self::Checkable(CheckMenuItem::with_id(
+                id,
+                &node.title,
+                true,
+                false,
+                accelerator,
+            ))
         } else {
-            Self::Plain(MenuItem::with_id(id, &node.title, true, None))
+            Self::Plain(MenuItem::with_id(id, &node.title, true, accelerator))
         }
     }
 
@@ -216,7 +270,13 @@ impl MacMenuBar {
         // unit tests pin (no live bar needed for the mapping itself).
         let mut leaves = Vec::new();
         for node in items {
-            if node.children.is_empty() {
+            if node.separator {
+                // A real macOS separator line (the guest's MF_SEPARATOR
+                // group), replacing the spurious vertical gap.
+                if let Err(error) = menu.append(&PredefinedMenuItem::separator()) {
+                    tracing::warn!(error = %error, "muda: failed to append separator");
+                }
+            } else if node.children.is_empty() {
                 // Leaf: a top-level command item.
                 let item = LeafItem::new(node);
                 if let Err(error) = menu.append(item.as_item()) {
@@ -240,12 +300,17 @@ impl MacMenuBar {
     }
 }
 
-/// Recursively append `nodes` into `submenu` (leaf items and nested popups),
-/// retaining every leaf so [`apply_item_states`] can stamp its state after
-/// the build — the same depth-first order `menu_item_states` walks.
+/// Recursively append `nodes` into `submenu` (leaf items, nested popups and
+/// separators), retaining every leaf so [`apply_item_states`] can stamp its
+/// state after the build — the same depth-first order `menu_item_states`
+/// walks (which likewise skips separator nodes).
 fn append_children(submenu: &Submenu, nodes: &[MenuNode], leaves: &mut Vec<LeafItem>) {
     for node in nodes {
-        if node.children.is_empty() {
+        if node.separator {
+            if let Err(error) = submenu.append(&PredefinedMenuItem::separator()) {
+                tracing::warn!(error = %error, "muda: failed to append separator");
+            }
+        } else if node.children.is_empty() {
             let item = LeafItem::new(node);
             if let Err(error) = submenu.append(item.as_item()) {
                 tracing::warn!(error = %error, "muda: failed to append menu item");
@@ -272,16 +337,29 @@ mod tests {
             title: title.to_owned(),
             enabled,
             checked,
+            separator: false,
+            accelerator: None,
+            children: Vec::new(),
+        }
+    }
+
+    fn separator() -> MenuNode {
+        MenuNode {
+            id: 0,
+            title: String::new(),
+            enabled: true,
+            checked: false,
+            separator: true,
+            accelerator: None,
             children: Vec::new(),
         }
     }
 
     /// `menu_item_states` walks the tree depth-first — the same order the bar
     /// appends items — emitting one state per leaf with the flags from the
-    /// node. This is the pure mapping that turns guest `EnableMenuItem` /
-    /// `CheckMenuItem` calls (via the `MenuNode` flags) into the native
-    /// `set_enabled` / `set_checked` states, so it pins the host-side half of
-    /// the F4 round trip without any live muda bar.
+    /// node, skipping separator nodes (the bar renders them as lines, so
+    /// they carry no state to stamp). This pins the host-side half of the
+    /// F4 round trip without any live muda bar.
     #[test]
     fn menu_item_states_maps_leaves_in_bar_order() {
         let nodes = vec![
@@ -290,10 +368,13 @@ mod tests {
                 title: "File".to_owned(),
                 enabled: true,
                 checked: false,
+                separator: false,
+                accelerator: None,
                 children: vec![
                     // Greys out, like notepad's Paste when the clipboard is
                     // empty (EnableMenuItem MF_GRAYED|MF_BYCOMMAND).
                     leaf(100, "Paste", false, false),
+                    separator(),
                     leaf(101, "Exit", true, false),
                 ],
             },
@@ -302,6 +383,8 @@ mod tests {
                 title: "Format".to_owned(),
                 enabled: true,
                 checked: false,
+                separator: false,
+                accelerator: None,
                 children: vec![
                     // Checked, like notepad's Word Wrap (CheckMenuItem
                     // MF_CHECKED|MF_BYCOMMAND).
@@ -334,7 +417,8 @@ mod tests {
                     enabled: true,
                     checked: false
                 },
-            ]
+            ],
+            "separator nodes contribute no state"
         );
     }
 
@@ -348,6 +432,8 @@ mod tests {
                 title: "Edit".to_owned(),
                 enabled: true,
                 checked: false,
+                separator: false,
+                accelerator: None,
                 children: vec![leaf(10, "Undo", false, false)],
             },
             MenuNode {
@@ -355,6 +441,8 @@ mod tests {
                 title: "View".to_owned(),
                 enabled: true,
                 checked: false,
+                separator: false,
+                accelerator: None,
                 children: vec![
                     leaf(20, "Status Bar", true, true),
                     MenuNode {
@@ -362,6 +450,8 @@ mod tests {
                         title: "Zoom".to_owned(),
                         enabled: true,
                         checked: false,
+                        separator: false,
+                        accelerator: None,
                         children: vec![leaf(30, "Zoom In", true, false)],
                     },
                 ],
@@ -385,5 +475,84 @@ mod tests {
                 "the bar stamps each item with its guest command id"
             );
         }
+    }
+
+    /// The guest's Windows-style shortcut suffixes — the exact set found in
+    /// RNotepad's resources — parse into muda accelerators, with "Ctrl"
+    /// normalized to the platform's primary command modifier.
+    #[test]
+    fn parse_menu_accelerator_handles_rnotepad_suffixes() {
+        use muda::accelerator::Modifiers;
+
+        let cases = [
+            "Ctrl+N",
+            "Ctrl+O",
+            "Ctrl+Shift+N",
+            "F3",
+            "F5",
+            "Del",
+            "Strg+Umschalt+N", // German
+            "Entf",            // German delete
+            "Sil",             // Turkish delete
+            "Ctrl+Shift+S",
+        ];
+        for suffix in cases {
+            let parsed = parse_menu_accelerator(suffix);
+            assert!(
+                parsed.is_some(),
+                "suffix {suffix:?} must parse to an accelerator"
+            );
+        }
+
+        // Ctrl/Strg map to Command on macOS (muda's CMD_OR_CTRL), matching
+        // how modern macOS apps present the primary shortcut.
+        let ctrl_n = parse_menu_accelerator("Ctrl+N").expect("Ctrl+N");
+        let strg_n = parse_menu_accelerator("Strg+N").expect("Strg+N");
+        assert_eq!(ctrl_n, strg_n, "Ctrl and Strg are the same modifier");
+        assert!(
+            ctrl_n.modifiers().contains(Modifiers::SUPER),
+            "Ctrl → Command"
+        );
+        // F5 keeps its bare function key.
+        let f5 = parse_menu_accelerator("F5").expect("F5");
+        assert!(f5.modifiers().is_empty(), "bare F5 has no modifiers");
+        assert_eq!(
+            f5,
+            "F5".parse::<Accelerator>().expect("muda parses F5"),
+            "F5 passes through to muda unchanged"
+        );
+
+        // Garbage falls back to None — the item renders without a shortcut.
+        assert_eq!(parse_menu_accelerator("Ctrl+MouseClick"), None);
+        assert_eq!(parse_menu_accelerator(""), None);
+    }
+
+    /// A separator node contributes no state, so the state list stays
+    /// aligned with the retained leaves when a menu groups its items with
+    /// separators — `append_children` skips separator nodes with the same
+    /// walk, so both sides of the zip line up by construction.
+    #[test]
+    fn separators_do_not_shift_state_alignment() {
+        let nodes = vec![MenuNode {
+            id: 1,
+            title: "Edit".to_owned(),
+            enabled: true,
+            checked: false,
+            separator: false,
+            accelerator: None,
+            children: vec![
+                leaf(10, "Cut", true, false),
+                separator(),
+                leaf(11, "Find", true, false),
+                separator(),
+                leaf(12, "Select All", true, false),
+            ],
+        }];
+        let states = menu_item_states(&nodes);
+        assert_eq!(
+            states.iter().map(|s| s.id).collect::<Vec<u32>>(),
+            vec![10, 11, 12],
+            "separators are transparent to the state walk"
+        );
     }
 }

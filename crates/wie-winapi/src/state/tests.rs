@@ -8729,6 +8729,116 @@ fn test_edit_paint_empty_text_draws_caret_at_start() {
     assert_eq!(px(13, mid), 0x00FF_FFFF, "no glyphs next to the caret");
 }
 
+#[test]
+fn test_edit_multiline_first_paint_renders_rows_from_the_top() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+
+    // Real CreateWindowExW-style records: a plain top-level window and a
+    // multiline EDIT child. The creation style (ES_MULTILINE) lands on the
+    // window record; the control state is NOT seeded until a message first
+    // touches it — so the FIRST WM_PAINT runs against a style-less seed and
+    // must still render multiline (exp-61: the stale `style_bits == 0` made
+    // the first paint draw a vertically centered block instead of
+    // top-aligned rows).
+    let top = crate::user32::create_window_record(
+        &mut state,
+        crate::user32::CreateWindowRequest {
+            class_identifier: crate::user32::WindowClassIdentifier::Name("GuiClass".to_owned()),
+            title: String::new(),
+            style: crate::user32::WS_VISIBLE,
+            extended_style: 0,
+            parent_handle: 0,
+            menu_handle: 0,
+            instance_handle: 0,
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 100,
+        },
+        true,
+    )
+    .expect("create top")
+    .0;
+    let edit = crate::user32::create_window_record(
+        &mut state,
+        crate::user32::CreateWindowRequest {
+            class_identifier: crate::user32::WindowClassIdentifier::Name("EDIT".to_owned()),
+            title: String::new(),
+            style: crate::user32::WS_CHILD
+                | crate::user32::WS_VISIBLE
+                | crate::user32::controls::ES_MULTILINE,
+            extended_style: 0,
+            parent_handle: top,
+            menu_handle: 0,
+            instance_handle: 0,
+            x: 10,
+            y: 10,
+            width: 120,
+            height: 60,
+        },
+        true,
+    )
+    .expect("create edit")
+    .0;
+    for w in &mut state.window_state().windows {
+        if w.handle == crate::handles::Hwnd::from(edit) {
+            w.control_text = "first line\nsecond line".to_owned();
+        }
+    }
+
+    // The FIRST paint — no keyboard/input message ran before it — must draw
+    // both lines as TOP-aligned rows (the multiline base_y is the edit's top
+    // edge, not the single-line vertical centering).
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint ok")
+    .expect("some result");
+    state.present().drain_pending_publishes();
+    let frame = state
+        .present()
+        .published
+        .get(&crate::handles::Hwnd::from(top))
+        .expect("published frame")
+        .clone();
+
+    // Text rows = black glyph ink on the white COLOR_WINDOW fill (the paint
+    // erases the edit rect white before rendering). Scan the edit interior —
+    // clear of the 1 px black border — for rows that hold ink.
+    let frame_width = usize::try_from(frame.width).unwrap_or(0);
+    let mut ink_rows: Vec<i32> = Vec::new();
+    for y in 12_i32..68_i32 {
+        let mut ink = 0_u32;
+        for x in 12_i32..128_i32 {
+            let idx = (usize::try_from(y).unwrap_or(0))
+                .saturating_mul(frame_width)
+                .saturating_add(usize::try_from(x).unwrap_or(0));
+            if frame.pixels.get(idx).copied() == Some(0x0000_0000) {
+                ink = ink.saturating_add(1);
+            }
+        }
+        if ink > 0 {
+            ink_rows.push(y);
+        }
+    }
+    assert!(
+        ink_rows.len() >= 2,
+        "two lines must render as at least two distinct rows, got {ink_rows:?}"
+    );
+    let topmost = ink_rows.first().copied().unwrap_or(0);
+    assert!(
+        topmost < 20,
+        "the first text row must start at the edit's top edge (y 10), got topmost \
+         ink row {topmost} (the stale single-line paint vertically centered it)"
+    );
+}
+
 // ── Task 2.5: EDIT mouse caret placement, drag selection, double-click ──
 
 /// A client point packed into an lParam (x = low word, y = high word).

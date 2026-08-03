@@ -385,6 +385,10 @@ fn build_template_menu_records(
 
 /// Convert one parsed `MenuItemTemplate` into the native `MenuEntry` the
 /// programmatic path uses, building child records for popup submenus.
+///
+/// A separator is recognized two ways: the explicit `MF_SEPARATOR` bit, or
+/// `text: None` — `windres` emits a `MENUITEM SEPARATOR` as a zero option
+/// word + empty string, which the parser keeps as `flags: 0, text: None`.
 fn build_template_menu_entry(
     state: &mut WinApiState,
     item: &MenuItemTemplate,
@@ -403,7 +407,7 @@ fn build_template_menu_entry(
             text: item.text.clone().unwrap_or_default(),
             submenu: Hmenu::from(submenu_handle),
         })
-    } else if item.flags & MF_SEPARATOR != 0 {
+    } else if item.flags & MF_SEPARATOR != 0 || item.text.is_none() {
         Ok(MenuEntry::Separator)
     } else {
         Ok(MenuEntry::Item {

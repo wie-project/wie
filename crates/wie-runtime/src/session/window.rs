@@ -483,12 +483,21 @@ mod tests {
             });
             ws.menus.push(MenuRecord {
                 handle: wie_winapi::handles::Hmenu::from(submenu),
-                items: vec![MenuEntry::Item {
-                    id: 100,
-                    text: "Exit".to_owned(),
-                    enabled: true,
-                    checked: false,
-                }],
+                items: vec![
+                    MenuEntry::Item {
+                        id: 100,
+                        text: "Exit".to_owned(),
+                        enabled: true,
+                        checked: false,
+                    },
+                    MenuEntry::Separator,
+                    MenuEntry::Item {
+                        id: 200,
+                        text: "About".to_owned(),
+                        enabled: true,
+                        checked: false,
+                    },
+                ],
             });
             ws.windows.push(wie_winapi::WindowRecord {
                 handle: wie_winapi::handles::Hwnd::from(0x100),
@@ -504,10 +513,16 @@ mod tests {
 
         let first = handle.window_menu_items();
         assert_eq!(first.len(), 1, "File popup at the top level");
+        let file = first.first().expect("popup");
+        // The RNotepad File shape: Exit / separator / About.
         assert_eq!(
-            first.first().expect("popup").children.len(),
-            1,
-            "Exit inside File"
+            file.children.len(),
+            3,
+            "Exit / separator / About inside File"
+        );
+        assert!(
+            file.children.get(1).expect("separator").separator,
+            "the MF_SEPARATOR between Exit and About renders as a separator node"
         );
         // Same tree from the cache (dirty is false — no rebuild).
         assert_eq!(handle.window_menu_items(), first);
@@ -522,8 +537,8 @@ mod tests {
                 .find(|m| m.handle == wie_winapi::handles::Hmenu::from(submenu))
                 .expect("submenu record");
             submenu_record.items.push(MenuEntry::Item {
-                id: 200,
-                text: "About".to_owned(),
+                id: 300,
+                text: "Open".to_owned(),
                 enabled: true,
                 checked: false,
             });
@@ -532,7 +547,7 @@ mod tests {
         let second = handle.window_menu_items();
         assert_eq!(
             second.first().expect("popup").children.len(),
-            2,
+            4,
             "rebuild must reflect the appended item"
         );
     }
