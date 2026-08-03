@@ -35,5 +35,6 @@ pub use classify::TEB_LAST_ERROR_VA;
 pub(crate) use classify::classify_guest_stub;
 pub(crate) use config::GuestStubConfig;
 pub(crate) use data::{build_stub_data_page, publish_cwd_wide, refresh_clock_table};
+pub(crate) use encode::{encode_file_dialog_loop, encode_file_dialog_proc};
 pub(crate) use kind::GuestStubKind;
 pub(crate) use plant::plant_guest_stubs;

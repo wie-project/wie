@@ -597,7 +597,7 @@ impl ControlClassKind {
                     if self == ControlClassKind::Button {
                         let id = find_window(state, hwnd).map_or(0, |w| w.menu_handle);
                         let command_wparam = make_command_wparam(id, BN_CLICKED);
-                        return deliver_command(state, hwnd, command_wparam);
+                        return deliver_button_command(engine, state, hwnd, command_wparam);
                     }
                 }
                 // An EDIT's drag session ends on the button-up whether or not
@@ -631,7 +631,7 @@ impl ControlClassKind {
                     invalidate(state, hwnd);
                     let id = find_window(state, hwnd).map_or(0, |w| w.menu_handle);
                     let command_wparam = make_command_wparam(id, BN_CLICKED);
-                    return deliver_command(state, hwnd, command_wparam);
+                    return deliver_button_command(engine, state, hwnd, command_wparam);
                 }
                 Ok(Some(0))
             }
@@ -643,7 +643,7 @@ impl ControlClassKind {
                 }
                 let id = find_window(state, hwnd).map_or(0, |w| w.menu_handle);
                 let command_wparam = make_command_wparam(id, BN_CLICKED);
-                deliver_command(state, hwnd, command_wparam)
+                deliver_button_command(engine, state, hwnd, command_wparam)
             }
             // BM_GETSTATE: BST_PUSHED | BST_FOCUS (winuser.h state bits).
             (ControlClassKind::Button, WinMsg::BM_GETSTATE) => {
@@ -752,8 +752,19 @@ impl ControlClassKind {
                     VK_LEFT | VK_RIGHT | VK_HOME | VK_END | VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT
                 ) =>
             {
-                if edit_move_caret(state, hwnd, word_parameter & 0xFF) {
+                let vk = word_parameter & 0xFF;
+                if edit_move_caret(state, hwnd, vk) {
                     invalidate(state, hwnd);
+                    // PgUp/PgDn move the caret by a page — the same vertical
+                    // content scroll the WM_VSCROLL path notifies on, so
+                    // notepad re-reads the caret position into its status bar.
+                    // The notification fires only when the caret actually
+                    // moved: a page key at the first/last line is a no-op and
+                    // stays silent (pragmatic choice — real Windows sends
+                    // EN_VSCROLL per scroll operation regardless).
+                    if matches!(vk, VK_PRIOR | VK_NEXT) {
+                        return edit_notify_scroll(state, hwnd, EN_VSCROLL);
+                    }
                 }
                 Ok(Some(0))
             }
@@ -1051,7 +1062,7 @@ impl ControlClassKind {
                 let count = write_control_text(engine, unicode, long_parameter, 4096, item)?;
                 Ok(Some(count))
             }
-            (_, WinMsg::WM_COMMAND) => deliver_command(state, hwnd, word_parameter),
+            (_, WinMsg::WM_COMMAND) => deliver_button_command(engine, state, hwnd, word_parameter),
             // Status-bar messages are WM_USER+ offsets (commctrl.h) that
             // `WinMsg` cannot name, so the whole StatusBar kind dispatches
             // here on the raw value. The generic arms above (WM_PAINT,
@@ -1138,6 +1149,34 @@ fn deliver_command(
         }
         current = parent.parent_handle.as_u64();
     }
+}
+
+/// Deliver a push-button `BN_CLICKED` command — or, when the button belongs
+/// to a host-owned modeless dialog (comdlg32 Find/Replace), hand the command
+/// to the host dialog instead of the guest: the handler writes the
+/// `FINDREPLACE` struct back and posts `FINDMSGSTRING`.
+///
+/// Split from [`deliver_command`] because the host dialog needs the engine
+/// for its guest-memory write-back, and `deliver_command` is also called from
+/// engine-less sites (the EDIT `EN_*` notifications in `edit.rs`). The find
+/// dialog's buttons are direct children, so only the direct parent is tested.
+fn deliver_button_command(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+    child_hwnd: u64,
+    word_parameter: u64,
+) -> Result<Option<u64>> {
+    let parent_hwnd = find_window(state, child_hwnd).map_or(0, |w| w.parent_handle.as_u64());
+    if parent_hwnd != 0 && crate::comdlg32::is_find_dialog_window(state, parent_hwnd) {
+        return crate::comdlg32::handle_find_dialog_command(
+            engine,
+            state,
+            parent_hwnd,
+            word_parameter,
+            child_hwnd,
+        );
+    }
+    deliver_command(state, child_hwnd, word_parameter)
 }
 
 /// WM_GETTEXTLENGTH: the text length in TCHARs.

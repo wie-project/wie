@@ -850,6 +850,15 @@ pub fn run_gui_windowed(
             .spawn(move || {
                 match RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle) {
                     Ok(mut session) => {
+                        // Interactive file dialogs: GetOpenFileNameW /
+                        // GetSaveFileNameW build the host dialog (path EDIT +
+                        // directory LISTBOX + OK/Cancel) and run its in-guest
+                        // modal loop instead of returning a scripted answer.
+                        crate::gui::file_dialog::enable_interactive_file_dialogs(&mut session);
+                        // FindTextW / ReplaceTextW are modeless and always
+                        // enabled (see gui/find_dialog.rs); this call pins the
+                        // wiring point next to the file dialog's.
+                        crate::gui::find_dialog::enable_interactive_find_dialogs(&mut session);
                         let handle = session.guest_handle();
 
                         // Register wake callback.

@@ -32,10 +32,20 @@ pub(crate) struct GuestStubConfig {
     /// Guest VA of the host-written clock table: 6 × u64 slots refreshed
     /// on every host stop; in-guest clock stubs read it with no host stop.
     pub clock_table_va: u64,
+    /// Guest VA of the planted file-dialog modal-loop body (see
+    /// [`super::encode::encode_file_dialog_loop`]).
+    pub file_dialog_loop_va: u64,
+    /// Guest VA of the planted file-dialog proc stub (see
+    /// [`super::encode::encode_file_dialog_proc`]).
+    pub file_dialog_proc_va: u64,
 }
 
 /// Offset of the dialog-result slot inside the guest stub data page.
 pub(crate) const DIALOG_RESULT_OFFSET: u64 = 0x1000;
+/// Offset of the file-dialog modal-loop body inside the guest stub data page.
+pub(crate) const FILE_DIALOG_LOOP_OFFSET: u64 = 0x1100;
+/// Offset of the file-dialog proc stub body inside the guest stub data page.
+pub(crate) const FILE_DIALOG_PROC_OFFSET: u64 = 0x1180;
 
 /// Slot offsets into the 6×u64 guest clock table.
 ///
@@ -71,6 +81,8 @@ impl GuestStubConfig {
         dispatch_message_a_va: 0,
         dialog_result_va: 0,
         clock_table_va: 0,
+        file_dialog_loop_va: 0,
+        file_dialog_proc_va: 0,
     };
 
     #[must_use]
@@ -101,6 +113,8 @@ impl GuestStubConfig {
             ),
             dialog_result_va: base + DIALOG_RESULT_OFFSET,
             clock_table_va: layout.clock_table_va,
+            file_dialog_loop_va: base + FILE_DIALOG_LOOP_OFFSET,
+            file_dialog_proc_va: base + FILE_DIALOG_PROC_OFFSET,
         }
     }
 }

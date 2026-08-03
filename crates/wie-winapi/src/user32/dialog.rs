@@ -521,10 +521,18 @@ pub fn handle_end_dialog(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 
     let is_dialog = find_window(state, dialog_hwnd).is_some_and(|w| w.dialog_proc != 0);
     let return_value = if is_dialog {
+        // A closing interactive file dialog writes its chosen path back into
+        // the guest's OPENFILENAME buffer before the modal loop returns
+        // (GetOpenFileNameW's TRUE/FALSE is the EndDialog result). The
+        // effective result (0 when the edit held no path) is what the loop
+        // returns to the guest.
+        let result = crate::comdlg32::complete_file_dialog(engine, state, dialog_hwnd, result)
+            .context("EndDialog: file-dialog write-back failed")?;
+        let result = u64::from(u32::try_from(result & u64::from(u32::MAX)).unwrap_or(0));
         tracing::info!(
             target: "wiegui",
             hwnd = dialog_hwnd,
-            result = result & u64::from(u32::MAX),
+            result,
             "EndDialog"
         );
         // Write the result where the in-guest stub reads it after WM_QUIT.
@@ -666,7 +674,12 @@ fn handle_is_dialog_message(
         .filter(|w| w.dialog_proc != 0)
         .map_or((0, false), |w| (w.dialog_proc, w.dialog_unicode));
 
-    if dialog_proc == 0 || message_address == 0 {
+    // Host-owned modeless dialogs (comdlg32 Find/Replace) have no guest
+    // dialog proc, but their buttons still answer Enter/Escape — the command
+    // is handled host-side instead of bridged.
+    let host_find_dialog = crate::comdlg32::is_find_dialog_window(state, dialog_hwnd);
+
+    if (dialog_proc == 0 && !host_find_dialog) || message_address == 0 {
         // Not a dialog (or no message): caller continues normal dispatch.
         let return_address = engine
             .return_from_win64_api(0)
@@ -745,6 +758,26 @@ fn handle_is_dialog_message(
             // The button's control id (stored in its menu_handle) is the
             // WM_COMMAND id the dialog proc sees — identical to a click.
             let id = find_window(state, button_hwnd).map_or(0, |w| w.menu_handle) & 0xFFFF;
+            if host_find_dialog {
+                // A host find-dialog button commands the host dialog (which
+                // posts FINDMSGSTRING), not the guest; the message is
+                // consumed and IsDialogMessage completes with TRUE.
+                crate::comdlg32::handle_find_dialog_command(
+                    engine,
+                    state,
+                    dialog_hwnd,
+                    make_command_wparam(id, BN_CLICKED),
+                    button_hwnd,
+                )
+                .context("host find dialog Enter command failed")?;
+                let return_address = engine
+                    .return_from_win64_api(1)
+                    .with_context(|| format!("failed to return from {api_name}"))?;
+                return Ok(WinApiHandlerResult {
+                    return_address,
+                    return_value: 1,
+                });
+            }
             // Consumed: the caller's DispatchMessage must not see the message.
             // The guest dialog proc runs synchronously (WM_COMMAND may call
             // EndDialog), then IsDialogMessage completes with TRUE.
@@ -768,6 +801,25 @@ fn handle_is_dialog_message(
                 id,
                 "IsDialogMessage: Enter/Esc command"
             );
+            if host_find_dialog {
+                // Escape on a host find dialog is its Cancel button: the host
+                // dialog posts FR_DIALOGTERM and tears itself down.
+                crate::comdlg32::handle_find_dialog_command(
+                    engine,
+                    state,
+                    dialog_hwnd,
+                    make_command_wparam(id, BN_CLICKED),
+                    0,
+                )
+                .context("host find dialog Escape command failed")?;
+                let return_address = engine
+                    .return_from_win64_api(1)
+                    .with_context(|| format!("failed to return from {api_name}"))?;
+                return Ok(WinApiHandlerResult {
+                    return_address,
+                    return_value: 1,
+                });
+            }
             // Consumed: the caller's DispatchMessage must not see the message.
             // The guest dialog proc runs synchronously (WM_COMMAND may call
             // EndDialog), then IsDialogMessage completes with TRUE.

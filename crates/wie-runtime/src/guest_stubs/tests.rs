@@ -346,3 +346,53 @@ fn every_stub_needing_real_addresses_is_listed() {
         }
     }
 }
+
+#[test]
+fn file_dialog_loop_stub_encodes_modal_loop() {
+    let body = encode_file_dialog_loop(
+        0x0000_7000_0000_1f60, // GetMessageA
+        0x0000_7000_0000_2c10, // IsDialogMessageA
+        0x0000_7000_0000_22c0, // DispatchMessageA
+        0x0000_7000_0040_a000, // dialog-result slot
+    );
+    assert!(body.len() > 80, "loop too short: {}", body.len());
+    assert!(body.len() < 200, "loop too long: {}", body.len());
+    assert_eq!(*body.last().unwrap(), 0xc3, "ends in ret");
+    // The loop must preserve the callback's dialog HWND (rcx → [rsp+0x20]).
+    let save_hwnd = [0x48, 0x89, 0x4c, 0x24, 0x20];
+    assert!(
+        body.windows(save_hwnd.len()).any(|w| w == save_hwnd),
+        "loop must save the callback dialog hwnd"
+    );
+    // It must load the result via `mov eax, [rax]` after `mov rax, imm64`.
+    let load = [0x8b, 0x00];
+    assert!(
+        body.windows(load.len()).any(|w| w == load),
+        "loop must return the dialog-result slot"
+    );
+}
+
+#[test]
+fn file_dialog_proc_stub_encodes_end_dialog_decision() {
+    let end_dialog_va = 0x0000_7000_0000_2d80;
+    let body = encode_file_dialog_proc(end_dialog_va);
+    assert!(body.len() > 30, "proc stub too short: {}", body.len());
+    assert_eq!(*body.last().unwrap(), 0xc3);
+    // The stub must embed the EndDialog fake VA (`mov rax, imm64`).
+    let mut needle = Vec::new();
+    needle.extend_from_slice(&[0x48, 0xb8]);
+    needle.extend_from_slice(&end_dialog_va.to_le_bytes());
+    assert!(
+        body.windows(needle.len()).any(|w| w == needle.as_slice()),
+        "proc stub must call EndDialog"
+    );
+    // WM_COMMAND low-word compare for IDOK (cmp eax, 1) and IDCANCEL (cmp eax, 2).
+    assert!(
+        body.windows(3).any(|w| w == [0x83, 0xf8, 0x01]),
+        "proc stub must recognize IDOK"
+    );
+    assert!(
+        body.windows(3).any(|w| w == [0x83, 0xf8, 0x02]),
+        "proc stub must recognize IDCANCEL"
+    );
+}

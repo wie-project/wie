@@ -237,6 +237,16 @@ pub enum FileDialogPolicy {
         /// Absolute or relative Windows-style path written into the dialog buffer.
         path: String,
     },
+
+    /// No scripted decision: show the host file dialog.
+    ///
+    /// `GetOpenFileName` / `GetSaveFileName` build the file-dialog window from
+    /// the existing EDIT / LISTBOX / BUTTON controls and run its modal message
+    /// loop in-guest (the same mechanism `DialogBoxParam` uses), so the guest
+    /// stays responsive while the user picks a path. Registered by the GUI
+    /// presenter at session start; headless runs keep [`Self::Cancel`] so a
+    /// guest can never hang on a dialog nobody can click.
+    Interactive,
 }
 
 /// One host file exposed to the guest under one or more Windows paths.

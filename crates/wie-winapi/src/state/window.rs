@@ -39,6 +39,48 @@ pub struct FileDialogSession {
     pub default_extension: Option<String>,
 }
 
+/// One in-flight host-owned modeless Find/Replace dialog
+/// (`FindTextW` / `ReplaceTextW`, comdlg32).
+///
+/// Unlike the modal file dialog, the find dialog never runs an in-guest loop:
+/// the guest's main loop keeps pumping (modeless), so the dialog is just a
+/// window whose controls dispatch host-side — button clicks are handled in
+/// `comdlg32::handle_find_dialog_command`, which writes the user's choices
+/// back into the guest `FINDREPLACE` struct and posts `FINDMSGSTRING` to the
+/// owner window. `None`-free: `WindowState::find_dialogs` is a `Vec` because
+/// a guest may hold a Find and a Replace dialog open at once.
+#[derive(Debug, Clone)]
+pub struct FindDialogSession {
+    /// The find-dialog window handle (a "FindDialog"-class window).
+    pub dialog_hwnd: u64,
+    /// Guest VA of the `FINDREPLACE` structure — the `FINDMSGSTRING` lParam.
+    pub fr_ptr: u64,
+    /// `FINDREPLACE.hwndOwner` — the window `FINDMSGSTRING` is posted to.
+    pub owner_hwnd: u64,
+    /// Guest VA of `FINDREPLACE.lpstrFindWhat` (the search-string buffer).
+    pub find_what_ptr: u64,
+    /// `FINDREPLACE.wFindWhatLen` (buffer capacity in UTF-16 units).
+    pub find_what_len: u32,
+    /// Guest VA of `FINDREPLACE.lpstrReplaceWith` (0 in find mode).
+    pub replace_with_ptr: u64,
+    /// `FINDREPLACE.wReplaceWithLen`.
+    pub replace_with_len: u32,
+    /// The find-what EDIT control (seeded from `lpstrFindWhat`).
+    pub find_edit_hwnd: u64,
+    /// The replace-with EDIT control (0 in find mode).
+    pub replace_edit_hwnd: u64,
+    /// The "Match case" checkbox button.
+    pub match_case_hwnd: u64,
+    /// The "Match whole word" checkbox button.
+    pub whole_word_hwnd: u64,
+    /// Host-side checkbox state, mirrored into `FINDREPLACE.Flags` on submit.
+    pub match_case_checked: bool,
+    /// Host-side checkbox state, mirrored into `FINDREPLACE.Flags` on submit.
+    pub whole_word_checked: bool,
+    /// Whether this is a Replace dialog (`ReplaceTextW`) vs a Find dialog.
+    pub replace_mode: bool,
+}
+
 /// Window, UI, and input state.
 ///
 /// Fields are `pub(crate)` except the ones the runtime reads directly through
@@ -108,6 +150,10 @@ pub struct WindowState {
     /// In-flight interactive file dialog, when [`FileDialogPolicy::Interactive`]
     /// is set and a dialog is open. See [`FileDialogSession`].
     pub file_dialog: Option<FileDialogSession>,
+    /// All in-flight host-owned modeless Find/Replace dialogs (FindTextW /
+    /// ReplaceTextW). See [`FindDialogSession`]. Multiple dialogs can be open
+    /// at once (a guest may show Find and Replace together).
+    pub find_dialogs: Vec<FindDialogSession>,
     /// Guest VA of the planted file-dialog modal-loop body (set by session
     /// init alongside `dialog_result_va`). Zero when the dialog machinery is
     /// absent, in which case `Interactive` falls back to `Cancel`.
@@ -180,6 +226,7 @@ impl Default for WindowState {
             file_dialog_policy: FileDialogPolicy::default(),
             last_file_dialog_path: None,
             file_dialog: None,
+            find_dialogs: Vec::new(),
             file_dialog_loop_va: 0,
             file_dialog_proc_va: 0,
             comm_dlg_extended_error: 0,

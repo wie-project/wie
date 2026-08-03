@@ -916,11 +916,16 @@ pub fn handle_dispatch_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 
         // Modal dialogs have no guest WndProc but a dialog proc. WM_PAINT
         // paints the dialog face into the owner surface; everything else
-        // (WM_COMMAND, WM_CLOSE, ...) bridges to the dialog proc.
-        if dialog_proc != 0 {
+        // (WM_COMMAND, WM_CLOSE, ...) bridges to the dialog proc. Host-owned
+        // modeless dialogs (comdlg32 Find/Replace) have no dialog proc — they
+        // paint their face the same way, and their buttons are handled at the
+        // control level (`deliver_button_command`), so other messages fall
+        // through to the neutral zero below.
+        let is_host_find_dialog = crate::comdlg32::is_find_dialog_window(state, window_handle);
+        if dialog_proc != 0 || is_host_find_dialog {
             if message == WM_PAINT {
                 super::dialog::paint_dialog(state, window_handle);
-            } else {
+            } else if dialog_proc != 0 {
                 return Err(WinApiControlSignal::GuestCallbackRequested {
                     request: GuestCallbackRequest {
                         callback_address: dialog_proc,

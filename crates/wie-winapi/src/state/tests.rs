@@ -2747,6 +2747,88 @@ fn test_edit_wm_hscroll_delivers_en_hscroll_to_parent() {
     );
 }
 
+#[test]
+fn test_edit_pgup_pgdn_keydown_delivers_en_vscroll_to_parent() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (parent, edit) = push_multiline_edit(&mut state, "0\n1\n2\n3\n4\n5\n6\n7\n8\n9");
+    // An 80 px tall control gives a 5-line page (the 16 px default line
+    // height) — the same fixture as the PgUp/PgDn caret-movement test.
+    for w in &mut state.window_state().windows {
+        if w.handle == crate::handles::Hwnd::from(edit) {
+            w.height = 80;
+        }
+    }
+
+    // PgDn moves the caret a page (line 0 → 5): the parent gets the same
+    // WM_COMMAND(MAKEWPARAM(12, EN_VSCROLL)) a real vertical scroll delivers,
+    // so notepad re-reads the caret position into its status bar.
+    let pgdn_result = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_KEYDOWN,
+        crate::user32::VK_NEXT,
+        0,
+    );
+    let error = pgdn_result.expect_err("PgDn must deliver EN_VSCROLL");
+    let signal = error
+        .downcast_ref::<WinApiControlSignal>()
+        .expect("control signal");
+    assert!(
+        matches!(
+            signal,
+            WinApiControlSignal::GuestCallbackRequested { request }
+                if request.window_handle == parent
+                    && request.message == 0x0111
+                    && request.word_parameter == 0x0602_000C
+        ),
+        "PgDn must deliver WM_COMMAND(MAKEWPARAM(12, EN_VSCROLL)), got {signal:?}"
+    );
+
+    // PgUp likewise (line 5 → 0).
+    let pgup_result = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_KEYDOWN,
+        crate::user32::VK_PRIOR,
+        0,
+    );
+    let error = pgup_result.expect_err("PgUp must deliver EN_VSCROLL");
+    let signal = error
+        .downcast_ref::<WinApiControlSignal>()
+        .expect("control signal");
+    assert!(
+        matches!(
+            signal,
+            WinApiControlSignal::GuestCallbackRequested { request }
+                if request.window_handle == parent
+                    && request.message == 0x0111
+                    && request.word_parameter == 0x0602_000C
+        ),
+        "PgUp must deliver WM_COMMAND(MAKEWPARAM(12, EN_VSCROLL)), got {signal:?}"
+    );
+
+    // PgUp at the first line: the caret cannot move up a page, so the key is
+    // a no-op — no EN_VSCROLL fires (the pragmatic no-move semantic).
+    let noop_result = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_KEYDOWN,
+        crate::user32::VK_PRIOR,
+        0,
+    );
+    let value = noop_result.expect("no-op PgUp at the top must not notify");
+    assert_eq!(value, Some(0), "a no-op page key answers 0 silently");
+    assert_eq!(
+        control_ui(&state, edit).caret,
+        0,
+        "the caret stays at line 0"
+    );
+}
+
 // --- Comdlg32 ---
 
 /// Read a NUL-terminated UTF-16LE guest string at `addr` (up to `max_units`).
@@ -5929,6 +6011,39 @@ fn press_key(engine: &mut IcedCpu, state: &mut WinApiState, hwnd: u64, vk: u64) 
     .expect("some result");
 }
 
+/// Press a vertical page key (`VK_PRIOR`/`VK_NEXT`) on `hwnd`, accepting the
+/// EN_VSCROLL control signal a moved page key delivers (the caret mutation
+/// already happened before the notification was raised).
+fn press_page_key(engine: &mut IcedCpu, state: &mut WinApiState, hwnd: u64, vk: u64) {
+    let result = crate::user32::controls::dispatch_control_proc(
+        engine,
+        state,
+        hwnd,
+        crate::user32::WM_KEYDOWN,
+        vk,
+        0,
+    );
+    match result {
+        Err(error) => {
+            assert!(
+                error
+                    .downcast_ref::<WinApiControlSignal>()
+                    .is_some_and(|signal| {
+                        matches!(
+                            signal,
+                            WinApiControlSignal::GuestCallbackRequested { request }
+                                if request.message == 0x0111
+                                    && request.word_parameter >> 16 == 0x0602
+                        )
+                    }),
+                "a moved page key must deliver EN_VSCROLL, got {error:?}"
+            );
+        }
+        // A page key at the top/bottom edge is a no-op: it answers 0 silently.
+        Ok(value) => assert_eq!(value, Some(0), "a no-op page key answers 0"),
+    }
+}
+
 #[test]
 fn test_edit_multiline_up_down_moves_between_lines() {
     let mut engine = test_engine();
@@ -6033,17 +6148,17 @@ fn test_edit_multiline_pgup_pgdn_move_a_page() {
     }
     // PgDn from line 0 → line 5 (char index 10); PgDn again clamps to the
     // last line 9 (index 18).
-    press_key(&mut engine, &mut state, edit, crate::user32::VK_NEXT);
+    press_page_key(&mut engine, &mut state, edit, crate::user32::VK_NEXT);
     assert_eq!(control_ui(&state, edit).caret, 10);
-    press_key(&mut engine, &mut state, edit, crate::user32::VK_NEXT);
+    press_page_key(&mut engine, &mut state, edit, crate::user32::VK_NEXT);
     assert_eq!(control_ui(&state, edit).caret, 18);
     // PgUp steps back a page → line 4 (index 8), then line 0; past the top
     // is a no-op.
-    press_key(&mut engine, &mut state, edit, crate::user32::VK_PRIOR);
+    press_page_key(&mut engine, &mut state, edit, crate::user32::VK_PRIOR);
     assert_eq!(control_ui(&state, edit).caret, 8);
-    press_key(&mut engine, &mut state, edit, crate::user32::VK_PRIOR);
+    press_page_key(&mut engine, &mut state, edit, crate::user32::VK_PRIOR);
     assert_eq!(control_ui(&state, edit).caret, 0);
-    press_key(&mut engine, &mut state, edit, crate::user32::VK_PRIOR);
+    press_page_key(&mut engine, &mut state, edit, crate::user32::VK_PRIOR);
     assert_eq!(control_ui(&state, edit).caret, 0);
 }
 
@@ -11097,7 +11212,7 @@ fn test_wm_setfont_stored_font_drives_edit_measurements() {
     )
     .expect("setsel ok")
     .expect("some result");
-    press_key(&mut engine, &mut state, edit, crate::user32::VK_NEXT);
+    press_page_key(&mut engine, &mut state, edit, crate::user32::VK_NEXT);
     assert_eq!(
         control_ui(&state, edit).caret,
         6, // line 3 ('3')

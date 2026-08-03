@@ -538,18 +538,43 @@ impl super::RuntimeSession {
             )
             .context("failed to zero guest FLS table")?;
 
-        // Stub data: metrics / syscolors / cwd blob (cwd filled after identity).
+        // Stub data: metrics / syscolors / cwd blob (cwd filled after identity)
+        // plus the planted file-dialog modal-loop + proc stub bodies, so the
+        // page must be executable (RWX like the code regions above).
         engine
             .mem_map(
                 layout.guest_stub_data_base,
                 layout.guest_stub_data_size,
-                data_rw,
+                wie_cpu::RwxPerms::ALL,
             )
             .context("failed to map guest stub data page")?;
         let stub_page = crate::guest_stubs::build_stub_data_page();
         engine
             .mem_write(layout.guest_stub_data_base, &stub_page)
             .context("failed to write guest stub data page")?;
+
+        let stub_cfg = crate::guest_stubs::GuestStubConfig::from_layout(&layout);
+
+        // Plant the file-dialog modal-loop + dialog-proc stub bodies into the
+        // (now executable) stub data page. The comdlg32 `GetOpenFileName` /
+        // `GetSaveFileName` handler runs the modal loop via a guest callback
+        // and bridges WM_COMMAND/WM_CLOSE to the proc stub, which ends the
+        // dialog; both are pure guest code with fixed fake-VA callees.
+        let file_dialog_loop = crate::guest_stubs::encode_file_dialog_loop(
+            stub_cfg.get_message_a_va,
+            stub_cfg.is_dialog_message_a_va,
+            stub_cfg.dispatch_message_a_va,
+            stub_cfg.dialog_result_va,
+        );
+        engine
+            .mem_write(stub_cfg.file_dialog_loop_va, &file_dialog_loop)
+            .context("failed to write file-dialog modal-loop body")?;
+        let file_dialog_proc = crate::guest_stubs::encode_file_dialog_proc(
+            wie_winapi::encode_export(wie_winapi::WinApiId::User32Enddialog),
+        );
+        engine
+            .mem_write(stub_cfg.file_dialog_proc_va, &file_dialog_proc)
+            .context("failed to write file-dialog proc stub")?;
 
         // Host-written guest clock table. Written once here (frozen values
         // under `WIE_FIXED_CLOCK=1`), then refreshed every host stop so the
@@ -904,6 +929,12 @@ impl super::RuntimeSession {
         engine
             .mem_write(stub_cfg.dialog_result_va, &0_u32.to_le_bytes())
             .context("failed to zero the guest dialog result slot")?;
+        // Interactive file-dialog machinery: the planted modal-loop + proc stub
+        // bodies. `GetOpenFileName`/`GetSaveFileName` under
+        // `FileDialogPolicy::Interactive` run the loop via a guest callback and
+        // the EndDialog write-back; zero when the runtime did not plant them.
+        winapi_state.window_state().file_dialog_loop_va = stub_cfg.file_dialog_loop_va;
+        winapi_state.window_state().file_dialog_proc_va = stub_cfg.file_dialog_proc_va;
         winapi_state.file_io.guest_io = Some(wie_winapi::GuestIoRuntimeConfig {
             table_va: guest_io_config.table_va,
             file_data_base: guest_io_config.file_data_base,

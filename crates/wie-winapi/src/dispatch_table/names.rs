@@ -1721,6 +1721,18 @@ static WINAPI_NAME_ROWS: &[(&str, &str, WinApiId)] = &[
         "callwindowprocw",
         WinApiId::User32Callwindowprocw,
     ),
+    (
+        // Rows placed at the table end with the appended variants (449/450),
+        // so the id table and the name rows stay in the same order.
+        "comdlg32.dll",
+        "findtextw",
+        WinApiId::Comdlg32Findtextw,
+    ),
+    (
+        "comdlg32.dll",
+        "replacetextw",
+        WinApiId::Comdlg32Replacetextw,
+    ),
 ];
 
 /// Resolve library/export to id. Case-insensitive, allocation-free.

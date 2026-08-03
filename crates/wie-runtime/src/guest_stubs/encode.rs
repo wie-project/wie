@@ -193,6 +193,167 @@ pub(super) fn encode_dialog_box_param(
     buf
 }
 
+/// `GetOpenFileName`/`GetSaveFileName` modal-loop body (out-of-line helper).
+///
+/// The comdlg32 handler builds the file dialog and stores its HWND in the
+/// callback-entry `RCX`; the body runs the same modal message loop as
+/// [`encode_dialog_box_param`] — `GetMessageA` → `IsDialogMessageA` →
+/// `DispatchMessageA` until `WM_QUIT` (posted by `EndDialog`), then returns
+/// the dialog-result slot (the `GetOpenFileName` TRUE/FALSE the guest sees).
+///
+/// ```text
+/// push rbx; sub rsp, 0x60
+/// mov [rsp+0x20], rcx        ; dialog hwnd from the callback frame
+/// .loop:
+///   lea rcx, [rsp+0x28]      ; lpMsg
+///   xor edx, edx; xor r8d, r8d; xor r9d, r9d
+///   call GetMessageA
+///   test eax, eax; jz .quit
+///   mov rcx, [rsp+0x20]; lea rdx, [rsp+0x28]
+///   call IsDialogMessageA
+///   test eax, eax; jnz .loop ; consumed (Tab/Enter/Esc) → keep going
+///   lea rcx, [rsp+0x28]
+///   call DispatchMessageA
+///   jmp .loop
+/// .quit:
+/// mov rax, dialog_result_va  ; EndDialog wrote the result here
+/// mov eax, [rax]
+/// .done:
+/// add rsp, 0x60; pop rbx; ret
+/// ```
+pub(crate) fn encode_file_dialog_loop(
+    get_message_va: u64,
+    is_dialog_message_va: u64,
+    dispatch_message_va: u64,
+    dialog_result_va: u64,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(170);
+    // push rbx ; sub rsp, 0x60
+    buf.extend_from_slice(&[0x53]);
+    buf.extend_from_slice(&[0x48, 0x83, 0xec, 0x60]);
+    // mov [rsp+0x20], rcx (dialog hwnd from the callback frame)
+    buf.extend_from_slice(&[0x48, 0x89, 0x4c, 0x24, 0x20]);
+    // .loop:
+    let loop_at = buf.len();
+    // lea rcx, [rsp+0x28] ; xor edx, edx ; xor r8d, r8d ; xor r9d, r9d
+    buf.extend_from_slice(&[0x48, 0x8d, 0x4c, 0x24, 0x28]);
+    buf.extend_from_slice(&[0x31, 0xd2]);
+    buf.extend_from_slice(&[0x45, 0x31, 0xc0]);
+    buf.extend_from_slice(&[0x45, 0x31, 0xc9]);
+    // call GetMessageA
+    buf.extend_from_slice(&[0x48, 0xb8]);
+    buf.extend_from_slice(&get_message_va.to_le_bytes());
+    buf.extend_from_slice(&[0xff, 0xd0]);
+    // test eax, eax ; jz .quit
+    buf.extend_from_slice(&[0x85, 0xc0]);
+    let jz_quit = buf.len() + 1;
+    buf.extend_from_slice(&[0x74, 0x00]);
+    // mov rcx, [rsp+0x20] ; lea rdx, [rsp+0x28] ; call IsDialogMessageA
+    buf.extend_from_slice(&[0x48, 0x8b, 0x4c, 0x24, 0x20]);
+    buf.extend_from_slice(&[0x48, 0x8d, 0x54, 0x24, 0x28]);
+    buf.extend_from_slice(&[0x48, 0xb8]);
+    buf.extend_from_slice(&is_dialog_message_va.to_le_bytes());
+    buf.extend_from_slice(&[0xff, 0xd0]);
+    // test eax, eax ; jnz .loop (consumed)
+    buf.extend_from_slice(&[0x85, 0xc0]);
+    let jnz_loop = buf.len() + 1;
+    buf.extend_from_slice(&[0x75, 0x00]);
+    // lea rcx, [rsp+0x28] ; call DispatchMessageA ; jmp .loop
+    buf.extend_from_slice(&[0x48, 0x8d, 0x4c, 0x24, 0x28]);
+    buf.extend_from_slice(&[0x48, 0xb8]);
+    buf.extend_from_slice(&dispatch_message_va.to_le_bytes());
+    buf.extend_from_slice(&[0xff, 0xd0]);
+    let jmp_loop = buf.len() + 1;
+    buf.extend_from_slice(&[0xeb, 0x00]);
+    // .quit: mov rax, dialog_result_va ; mov eax, [rax]
+    let quit_at = buf.len();
+    buf.extend_from_slice(&[0x48, 0xb8]);
+    buf.extend_from_slice(&dialog_result_va.to_le_bytes());
+    buf.extend_from_slice(&[0x8b, 0x00]);
+    // .done: add rsp, 0x60 ; pop rbx ; ret (fall-through after .quit)
+    buf.extend_from_slice(&[0x48, 0x83, 0xc4, 0x60]);
+    buf.push(0x5b);
+    buf.push(0xc3);
+
+    patch_rel8(&mut buf, jz_quit, jz_quit + 1, quit_at);
+    patch_rel8(&mut buf, jnz_loop, jnz_loop + 1, loop_at);
+    patch_rel8(&mut buf, jmp_loop, jmp_loop + 1, loop_at);
+    buf
+}
+
+/// File-dialog proc stub body (out-of-line helper).
+///
+/// The comdlg32 handler builds the file-dialog window with this address as its
+/// `dialog_proc`, so every non-`WM_PAINT` message bridges here with the WndProc
+/// convention (`rcx`=hwnd, `rdx`=message, `r8`=wParam, `r9`=lParam):
+///
+/// ```text
+/// mov eax, edx               ; message
+/// cmp eax, 0x0010 (WM_CLOSE); je .cancel
+/// cmp eax, 0x0111 (WM_COMMAND); jne .zero
+/// mov eax, r8d; and eax, 0xFFFF   ; control id (low word of wParam)
+/// cmp eax, 1 (IDOK); je .ok
+/// cmp eax, 2 (IDCANCEL); jne .zero
+/// .cancel: xor edx, edx; jmp .close
+/// .ok: mov edx, 1
+/// .close: sub rsp, 0x28; call EndDialog(hwnd=rcx, result=rdx); add rsp, 0x28
+/// .zero: xor eax, eax; ret
+/// ```
+///
+/// The `EndDialog` handler performs the `OPENFILENAME` write-back and posts the
+/// `WM_QUIT` the modal loop exits on. Any other message (or unknown id) is
+/// ignored (`0`), matching DefDlgProc's pass-through.
+pub(crate) fn encode_file_dialog_proc(end_dialog_va: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(90);
+    // mov eax, edx (message)
+    buf.extend_from_slice(&[0x89, 0xd0]);
+    // cmp eax, 0x0010 (WM_CLOSE); je .cancel
+    buf.extend_from_slice(&[0x3d, 0x10, 0x00, 0x00, 0x00]);
+    let je_cancel = buf.len() + 1;
+    buf.extend_from_slice(&[0x74, 0x00]);
+    // cmp eax, 0x0111 (WM_COMMAND); jne .zero
+    buf.extend_from_slice(&[0x3d, 0x11, 0x01, 0x00, 0x00]);
+    let jne_zero = buf.len() + 1;
+    buf.extend_from_slice(&[0x75, 0x00]);
+    // mov eax, r8d ; and eax, 0xFFFF (control id)
+    buf.extend_from_slice(&[0x44, 0x89, 0xc0]);
+    buf.extend_from_slice(&[0x25, 0xff, 0xff, 0x00, 0x00]);
+    // cmp eax, 1 (IDOK); je .ok
+    buf.extend_from_slice(&[0x83, 0xf8, 0x01]);
+    let je_ok = buf.len() + 1;
+    buf.extend_from_slice(&[0x74, 0x00]);
+    // cmp eax, 2 (IDCANCEL); jne .zero
+    buf.extend_from_slice(&[0x83, 0xf8, 0x02]);
+    let jne_zero2 = buf.len() + 1;
+    buf.extend_from_slice(&[0x75, 0x00]);
+    // .cancel: xor edx, edx ; jmp .close
+    let cancel_at = buf.len();
+    buf.extend_from_slice(&[0x31, 0xd2]);
+    let jmp_close = buf.len() + 1;
+    buf.extend_from_slice(&[0xeb, 0x00]);
+    // .ok: mov edx, 1
+    let ok_at = buf.len();
+    buf.extend_from_slice(&[0xba, 0x01, 0x00, 0x00, 0x00]);
+    // .close: sub rsp, 0x28 ; mov rax, end_dialog_va ; call rax ; add rsp, 0x28
+    let close_at = buf.len();
+    buf.extend_from_slice(&[0x48, 0x83, 0xec, 0x28]);
+    buf.extend_from_slice(&[0x48, 0xb8]);
+    buf.extend_from_slice(&end_dialog_va.to_le_bytes());
+    buf.extend_from_slice(&[0xff, 0xd0]);
+    buf.extend_from_slice(&[0x48, 0x83, 0xc4, 0x28]);
+    // .zero: xor eax, eax ; ret
+    let zero_at = buf.len();
+    buf.extend_from_slice(&[0x31, 0xc0]);
+    buf.push(0xc3);
+
+    patch_rel8(&mut buf, je_cancel, je_cancel + 1, cancel_at);
+    patch_rel8(&mut buf, jne_zero, jne_zero + 1, zero_at);
+    patch_rel8(&mut buf, je_ok, je_ok + 1, ok_at);
+    patch_rel8(&mut buf, jne_zero2, jne_zero2 + 1, zero_at);
+    patch_rel8(&mut buf, jmp_close, jmp_close + 1, close_at);
+    buf
+}
+
 pub(super) fn encode_fls_get(table_va: u64, max_slots: u32) -> Vec<u8> {
     let mut buf = Vec::with_capacity(32);
     buf.extend_from_slice(&[0x48, 0x81, 0xf9]);

@@ -507,9 +507,13 @@ pub enum WinApiId {
     User32Callwindowproca = 447,
     /// Appended here (not adjacent to User32Callwindowproca) to avoid renumbering the entire enum.
     User32Callwindowprocw = 448,
+    /// Appended here (not adjacent to Comdlg32Getfiletitlew) to avoid renumbering the entire enum.
+    Comdlg32Findtextw = 449,
+    /// Appended here (not adjacent to Comdlg32Findtextw) to avoid renumbering the entire enum.
+    Comdlg32Replacetextw = 450,
 }
 
-pub const WINAPI_ID_COUNT: usize = 449;
+pub const WINAPI_ID_COUNT: usize = 451;
 
 impl WinApiId {
     /// Discriminant as `u16` (`#[repr(u16)]`).
@@ -548,7 +552,7 @@ const _: () = assert!(
 );
 
 /// Highest-numbered [`WinApiId`]; update alongside the enum's final variant.
-const LAST_WINAPI_ID: WinApiId = WinApiId::User32Callwindowprocw;
+const LAST_WINAPI_ID: WinApiId = WinApiId::Comdlg32Replacetextw;
 
 /// Hot-path dispatch: dense `u16` match over the `WinApiId` discriminant
 /// (LLVM jump table) with no string comparison — runs once per host API stop.
@@ -1070,6 +1074,8 @@ pub fn dispatch_winapi_id(
         WinApiId::Shell32Shellexecutew => shell32::handle_shell_execute_w(ctx),
         WinApiId::User32Callwindowproca => user32::handle_call_window_proc_a(ctx),
         WinApiId::User32Callwindowprocw => user32::handle_call_window_proc_w(ctx),
+        WinApiId::Comdlg32Findtextw => comdlg32::handle_find_text_w(ctx),
+        WinApiId::Comdlg32Replacetextw => comdlg32::handle_replace_text_w(ctx),
     }
 }
 
