@@ -12,16 +12,16 @@
 use anyhow::Result;
 
 use super::{
-    BN_CLICKED, BS_DEFPUSHBUTTON, BST_FOCUS, BST_PUSHED, CommandPayload, DLGC_BUTTON,
-    DLGC_DEFPUSHBUTTON, DLGC_UNDEFPUSHBUTTON, DLGC_WANTCHARS, EN_HSCROLL, EN_VSCROLL,
-    GuestCallbackRequest, VK_DELETE, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR,
-    VK_RIGHT, VK_SPACE, VK_UP, WM_COMMAND, WinApiControlSignal, WinApiState, WinMsg,
-    WindowClassIdentifier, find_window, find_window_mut, high_word, low_i32, low_word,
-    make_command_wparam, read_guest_ansi_lossy, read_guest_utf16_lossy, write_guest_u32,
+    find_window, find_window_mut, high_word, low_i32, low_word, make_command_wparam,
+    read_guest_ansi_lossy, read_guest_utf16_lossy, write_guest_u32, CommandPayload,
+    GuestCallbackRequest, WinApiControlSignal, WinApiState, WinMsg, WindowClassIdentifier,
+    BN_CLICKED, BST_FOCUS, BST_PUSHED, BS_DEFPUSHBUTTON, DLGC_BUTTON, DLGC_DEFPUSHBUTTON,
+    DLGC_UNDEFPUSHBUTTON, DLGC_WANTCHARS, EN_HSCROLL, EN_VSCROLL, VK_DELETE, VK_DOWN, VK_END,
+    VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SPACE, VK_UP, WM_COMMAND,
 };
-use crate::OuterReturn;
 use crate::gdi32::resolve_window_ancestor;
 use crate::state::WindowFlags;
+use crate::OuterReturn;
 
 mod button;
 mod edit;
@@ -34,14 +34,15 @@ use button::paint_control;
 /// field, so it must be reachable at the same visibility as the enum.
 pub use edit::UndoSnapshot;
 use edit::{
-    edit_can_undo, edit_char, edit_clear, edit_copy, edit_cut, edit_delete_at_caret,
-    edit_empty_undo_buffer, edit_first_visible_line, edit_get_handle, edit_get_limit,
-    edit_get_line, edit_get_modify, edit_get_selection, edit_invalidate_text_buffer,
-    edit_line_count, edit_line_from_char, edit_line_index, edit_line_length, edit_mouse_dblclk,
-    edit_mouse_down, edit_mouse_move, edit_mouse_up, edit_mouse_wheel, edit_move_caret,
-    edit_notify_change, edit_notify_scroll, edit_paste, edit_pos_from_char, edit_replace_selection,
-    edit_scroll_caret, edit_scroll_vertical, edit_selection_type, edit_set_handle, edit_set_limit,
-    edit_set_modify, edit_set_selection, edit_set_tab_stops, edit_undo,
+    ctrl_is_down, edit_can_undo, edit_caret_tick, edit_char, edit_clear, edit_copy, edit_cut,
+    edit_delete_at_caret, edit_empty_undo_buffer, edit_first_visible_line, edit_focus_gained,
+    edit_focus_lost, edit_get_handle, edit_get_limit, edit_get_line, edit_get_modify,
+    edit_get_selection, edit_invalidate_text_buffer, edit_line_count, edit_line_from_char,
+    edit_line_index, edit_line_length, edit_mouse_dblclk, edit_mouse_down, edit_mouse_move,
+    edit_mouse_up, edit_mouse_wheel, edit_move_caret, edit_notify_change, edit_notify_scroll,
+    edit_paste, edit_pos_from_char, edit_replace_selection, edit_scroll_caret,
+    edit_scroll_vertical, edit_selection_type, edit_set_handle, edit_set_limit, edit_set_modify,
+    edit_set_selection, edit_set_tab_stops, edit_undo, CARET_TIMER_ID,
 };
 use listbox::{listbox_hit_item, listbox_notify_change};
 use paint::write_control_text;
@@ -50,8 +51,8 @@ use paint::write_control_text;
 // unused import.
 #[cfg(test)]
 pub(crate) use edit::{
-    VisibleSegment, clamp_scroll_offset, edit_char_index_at_point, layout_visible_lines,
-    visible_line_count,
+    clamp_scroll_offset, edit_char_index_at_point, layout_visible_lines, visible_line_count,
+    VisibleSegment,
 };
 // The no-create undo-buffer clear is called from the SetWindowText handlers
 // in `user32::window` (they write control text outside the control dispatch).
@@ -234,6 +235,7 @@ impl ControlClassKind {
             undo_snapshot: None,
             first_visible_line: 0,
             tab_stops: Vec::new(),
+            caret_on: true,
         }
     }
 }
@@ -293,6 +295,11 @@ pub enum ControlState {
         /// (`layout_visible_lines`' `first_visible`); Task 2.4: it currently
         /// also serves as the vertical scroll offset.
         first_visible_line: usize,
+        /// Caret blink phase: `true` draws the caret bar, `false` hides it.
+        /// The focused EDIT toggles it on its internal WM_TIMER (F5 caret
+        /// blink, ~530 ms — SPI_GETCARETTIMEOUT's default); paint draws the
+        /// caret only in the on phase.
+        caret_on: bool,
         /// Tab stop positions in dialog units (`EM_SETTABSTOPS`). Only the
         /// tests read the stored stops today; the typing/tab-expansion path
         /// consumes them in Task 2.3.
@@ -605,6 +612,14 @@ impl ControlClassKind {
                 // not strand the mouse capture.
                 if self == ControlClassKind::Edit {
                     edit_mouse_up(state, hwnd);
+                    // A completed click navigation refreshes the parent's
+                    // status-bar caret — the same EN_VSCROLL a caret move by
+                    // keys delivers (RNotepad's EDIT subclass re-reads Ln/Col
+                    // on it). Gated on a real press so a stray release stays
+                    // silent.
+                    if was_pressed {
+                        return edit_notify_scroll(state, hwnd, EN_VSCROLL);
+                    }
                 }
                 Ok(Some(0))
             }
@@ -672,15 +687,35 @@ impl ControlClassKind {
                 invalidate(state, hwnd);
                 Ok(Some(previous))
             }
+            // EDIT focus: show the caret (blink phase reset to on) and arm
+            // the internal ~530 ms blink timer — the same SetTimer mechanism
+            // a real Windows EDIT runs internally. The message pump
+            // synthesizes the guest-visible WM_TIMER while the thread idles.
+            (ControlClassKind::Edit, WinMsg::WM_SETFOCUS) => {
+                edit_focus_gained(state, hwnd);
+                Ok(Some(0))
+            }
             (_, WinMsg::WM_SETFOCUS) => {
                 if let Some(window) = find_window_mut(state, hwnd) {
                     window.flags.insert(WindowFlags::FOCUSED);
                 }
                 Ok(Some(0))
             }
+            (ControlClassKind::Edit, WinMsg::WM_KILLFOCUS) => {
+                edit_focus_lost(state, hwnd);
+                Ok(Some(0))
+            }
             (_, WinMsg::WM_KILLFOCUS) => {
                 if let Some(window) = find_window_mut(state, hwnd) {
                     window.flags.remove(WindowFlags::FOCUSED);
+                }
+                Ok(Some(0))
+            }
+            // The EDIT's internal caret-blink timer: flip the caret phase and
+            // repaint (the caret bar is drawn only in the on phase).
+            (ControlClassKind::Edit, WinMsg::WM_TIMER) if word_parameter == CARET_TIMER_ID => {
+                if edit_caret_tick(state, hwnd) {
+                    invalidate(state, hwnd);
                 }
                 Ok(Some(0))
             }
@@ -738,6 +773,10 @@ impl ControlClassKind {
             (ControlClassKind::Edit, WinMsg::WM_CHAR) => {
                 let changed = edit_char(state, hwnd, word_parameter);
                 if changed {
+                    // Typing past the last visible row auto-scrolls the caret
+                    // into view — the same minimal scroll EM_SCROLLCARET
+                    // applies (F5: typing-at-bottom auto-scroll).
+                    edit_scroll_caret(state, hwnd);
                     invalidate(state, hwnd);
                     return edit_notify_change(state, hwnd);
                 }
@@ -754,17 +793,23 @@ impl ControlClassKind {
             {
                 let vk = word_parameter & 0xFF;
                 if edit_move_caret(state, hwnd, vk) {
+                    // Any caret move keeps the caret in view (the same
+                    // minimal scroll EM_SCROLLCARET applies).
+                    edit_scroll_caret(state, hwnd);
                     invalidate(state, hwnd);
-                    // PgUp/PgDn move the caret by a page — the same vertical
-                    // content scroll the WM_VSCROLL path notifies on, so
-                    // notepad re-reads the caret position into its status bar.
-                    // The notification fires only when the caret actually
-                    // moved: a page key at the first/last line is a no-op and
-                    // stays silent (pragmatic choice — real Windows sends
-                    // EN_VSCROLL per scroll operation regardless).
-                    if matches!(vk, VK_PRIOR | VK_NEXT) {
-                        return edit_notify_scroll(state, hwnd, EN_VSCROLL);
-                    }
+                    // A caret move refreshes the parent's status-bar Ln/Col:
+                    // vertical moves deliver EN_VSCROLL, horizontal moves
+                    // EN_HSCROLL (Ctrl+Home/End are document-wide vertical
+                    // jumps). The notification fires only when the caret
+                    // actually moved — a key at the document edge is a no-op
+                    // and stays silent (the same pragmatic choice as PgUp/PgDn;
+                    // real Windows sends per scroll operation regardless).
+                    let notify = match vk {
+                        VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT => EN_VSCROLL,
+                        VK_HOME | VK_END if ctrl_is_down(state) => EN_VSCROLL,
+                        _ => EN_HSCROLL,
+                    };
+                    return edit_notify_scroll(state, hwnd, notify);
                 }
                 Ok(Some(0))
             }

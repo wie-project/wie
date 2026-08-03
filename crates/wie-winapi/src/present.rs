@@ -87,6 +87,11 @@ impl Default for MessageQueue {
     }
 }
 
+/// The default frame background: `COLOR_WINDOW`-white (0RGB). Used when the
+/// erase machinery has not yet recorded the owning window's class-brush
+/// color — notepad's client and the common case.
+const DEFAULT_BACKGROUND_COLOR: u32 = 0x00FF_FFFF;
+
 /// A frame of 0RGB pixels ready for display.
 #[derive(Clone)]
 pub struct SurfaceFrame {
@@ -96,6 +101,14 @@ pub struct SurfaceFrame {
     pub height: u32,
     /// 0RGB pixel data, top-down.
     pub pixels: Arc<Vec<u32>>,
+    /// 0RGB background color of the owning window, recorded by the erase
+    /// machinery (the class-brush color; `COLOR_WINDOW`-white by default).
+    ///
+    /// The host presenter clears its surface with this color before blitting
+    /// the frame, so any region the frame's pixels do not cover (resize
+    /// seams, the window smaller than the swapchain, pre-first-paint) reads
+    /// as the window background instead of the presenter's default black.
+    pub background_color: u32,
 }
 
 /// Per-window surface: pixel buffer + dimensions.
@@ -131,6 +144,11 @@ pub struct PresentState {
     pub generation: u64,
     /// Optional wake callback for the host presenter.
     pub wake: Option<Box<dyn Fn() + Send>>,
+    /// 0RGB background color per published HWND — the owning window's
+    /// class-brush color, recorded by the erase machinery so the presenter
+    /// can clear its surface with it (see [`SurfaceFrame::background_color`]).
+    /// Absent HWNDs default to [`DEFAULT_BACKGROUND_COLOR`].
+    pub(crate) background_colors: ahash::HashMap<crate::handles::Hwnd, u32>,
     /// Optional host MessageBox bridge, registered by the GUI presenter.
     ///
     /// When set, the `MessageBoxA/W` handlers call it with
@@ -182,6 +200,7 @@ impl std::fmt::Debug for PresentState {
         f.debug_struct("PresentState")
             .field("surface_count", &self.surfaces.len())
             .field("published_count", &self.published.len())
+            .field("background_color_count", &self.background_colors.len())
             .field("generation", &self.generation)
             .field("wake_is_set", &self.wake.is_some())
             .field(
@@ -212,6 +231,7 @@ impl PresentState {
             published: ahash::HashMap::new(),
             generation: 0,
             wake: None,
+            background_colors: ahash::HashMap::new(),
             message_box_bridge: None,
             record: None,
             frames_published: 0,
@@ -288,6 +308,16 @@ impl PresentState {
         }
     }
 
+    /// Record the 0RGB background color of `hwnd`'s surface — the owning
+    /// window's class-brush color, resolved by the erase machinery.
+    ///
+    /// The next published frame for `hwnd` carries it (see
+    /// [`SurfaceFrame::background_color`]); the host presenter clears its
+    /// surface with it so regions the frame does not cover never read black.
+    pub(crate) fn set_background_color(&mut self, hwnd: crate::handles::Hwnd, color: u32) {
+        self.background_colors.insert(hwnd, color);
+    }
+
     /// Publish the current surface for `hwnd` as a snapshot.
     ///
     /// This is the immediate-publish escape hatch (`publish_now`): it moves
@@ -306,6 +336,14 @@ impl PresentState {
         if surface.pixels.is_empty() || surface.width == 0 || surface.height == 0 {
             return;
         }
+        // The presenter clears its surface with the owning window's
+        // background color; the erase machinery records it per HWND, and the
+        // default is COLOR_WINDOW-white.
+        let background_color = self
+            .background_colors
+            .get(&hwnd)
+            .copied()
+            .unwrap_or(DEFAULT_BACKGROUND_COLOR);
         let (width, height, pixels) = {
             // B1: publish WITHOUT a pixel clone — a pointer move of the painted
             // buffer into the Arc (no 4 MB copy under the WinAPI mutex). The
@@ -353,6 +391,7 @@ impl PresentState {
                 width,
                 height,
                 pixels: Arc::clone(&pixels),
+                background_color,
             };
         }
         self.published.insert(
@@ -361,6 +400,7 @@ impl PresentState {
                 width,
                 height,
                 pixels,
+                background_color,
             },
         );
         if let Some(wake) = &self.wake {
@@ -415,8 +455,9 @@ impl Default for PresentState {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::PresentState;
+    use super::{DEFAULT_BACKGROUND_COLOR, PresentState, SurfaceFrame};
     use crate::handles::Hwnd;
+    use std::sync::Arc;
 
     #[test]
     fn deferred_publishes_coalesce_per_dispatch() {
@@ -464,5 +505,99 @@ mod tests {
         assert_eq!(state.drain_pending_publishes(), 2);
         assert!(state.published.contains_key(&a));
         assert!(state.published.contains_key(&b));
+    }
+
+    /// An empty frame for the headless record slot.
+    fn empty_frame() -> SurfaceFrame {
+        SurfaceFrame {
+            width: 0,
+            height: 0,
+            pixels: Arc::new(Vec::new()),
+            background_color: DEFAULT_BACKGROUND_COLOR,
+        }
+    }
+
+    #[test]
+    fn published_frame_carries_recorded_background_color() {
+        let mut state = PresentState::new();
+        let hwnd = Hwnd::from(9);
+        state.set_background_color(hwnd, 0x00F0_F0F0); // COLOR_BTNFACE
+        state.record = Some(Box::new(empty_frame()));
+        state.ensure_surface(hwnd, 16, 16);
+        state.publish(hwnd);
+
+        let frame = state.published.get(&hwnd).expect("published frame");
+        assert_eq!(
+            frame.background_color, 0x00F0_F0F0,
+            "the frame must carry the owning window's background color"
+        );
+        let recorded = state.record.as_ref().expect("recorded frame");
+        assert_eq!(
+            recorded.background_color, 0x00F0_F0F0,
+            "the headless record slot carries the background too"
+        );
+    }
+
+    #[test]
+    fn published_frame_defaults_to_white_background() {
+        // No erase ever recorded a color: the presenter falls back to
+        // COLOR_WINDOW-white (notepad's client, and the headless default).
+        let mut state = PresentState::new();
+        let hwnd = Hwnd::from(10);
+        state.ensure_surface(hwnd, 8, 8);
+        state.publish(hwnd);
+        let frame = state.published.get(&hwnd).expect("published frame");
+        assert_eq!(frame.background_color, 0x00FF_FFFF);
+    }
+
+    #[test]
+    fn background_filled_frame_has_no_black_pixels() {
+        // F2 invariant at the present level: a frame whose surface was
+        // erased with its recorded background color (the erase-before-clear
+        // guarantee) publishes zero 0x000000 pixels.
+        let mut state = PresentState::new();
+        let hwnd = Hwnd::from(11);
+        let background = 0x00FF_FFFF;
+        state.set_background_color(hwnd, background);
+        state.ensure_surface(hwnd, 32, 24);
+        if let Some(surf) = state.surfaces.get_mut(&hwnd) {
+            for px in &mut surf.pixels {
+                *px = background;
+            }
+        }
+        state.record = Some(Box::new(empty_frame()));
+        state.publish(hwnd);
+
+        let recorded = state.record.as_ref().expect("recorded frame");
+        assert!(
+            !recorded.pixels.contains(&0x0000_0000),
+            "a background-erased frame must contain no unpainted black pixels"
+        );
+        assert!(
+            recorded.pixels.iter().all(|&px| px == 0x00FF_FFFF),
+            "every pixel is the erased background"
+        );
+    }
+
+    #[test]
+    fn black_background_is_legitimate_and_recorded() {
+        // A window whose class brush is genuinely black (COLOR_WINDOWTEXT)
+        // erases to black — that content is legitimate, and the invariant's
+        // "outside legitimately black content" clause excludes it. The frame
+        // must still record the black background so the presenter clears
+        // with it (never the default white-on-black mismatch).
+        let mut state = PresentState::new();
+        let hwnd = Hwnd::from(12);
+        let black = 0x0000_0000;
+        state.set_background_color(hwnd, black);
+        state.ensure_surface(hwnd, 8, 8);
+        if let Some(surf) = state.surfaces.get_mut(&hwnd) {
+            for px in &mut surf.pixels {
+                *px = black;
+            }
+        }
+        state.publish(hwnd);
+        let frame = state.published.get(&hwnd).expect("published frame");
+        assert_eq!(frame.background_color, 0x0000_0000);
     }
 }

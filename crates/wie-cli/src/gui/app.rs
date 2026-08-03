@@ -1,6 +1,7 @@
 //! Winit application handler — displays the guest window and forwards input.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -13,7 +14,7 @@ use wie_runtime::{GuiControl, run_windowed};
 use wie_winapi::handles::Hwnd;
 
 use winit::application::ApplicationHandler;
-use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
@@ -63,8 +64,14 @@ impl WieApp {
     /// yet). Mouse messages go to the topmost child containing the cursor,
     /// with child-relative lParam coords.
     fn mouse_target(&self, handle: &GuestHandle) -> (u64, u16, u16) {
+        let sf = self.scale_factor();
         let (cx, cy) = self.cursor_pos;
-        let (x, y) = (cx.max(0.0) as i32, cy.max(0.0) as i32);
+        // winit reports PHYSICAL pixels; the guest hit-test (window_at /
+        // capture_target rects) expects LOGICAL 96-DPI client pixels.
+        let (x, y) = (
+            input::physical_to_logical(cx.max(0.0), sf) as i32,
+            input::physical_to_logical(cy.max(0.0), sf) as i32,
+        );
         if let Some((hwnd, rx, ry)) = handle.capture_target(x, y) {
             return (hwnd, rx as u16, ry as u16);
         }
@@ -74,11 +81,13 @@ impl WieApp {
         )
     }
 
-    /// The last cursor position as integer client coordinates (for MSG.pt).
+    /// The last cursor position as integer client coordinates in LOGICAL
+    /// 96-DPI pixels (for MSG.pt).
     fn cursor_pos_i32(&self) -> (i32, i32) {
+        let sf = self.scale_factor();
         (
-            self.cursor_pos.0.max(0.0) as i32,
-            self.cursor_pos.1.max(0.0) as i32,
+            input::physical_to_logical(self.cursor_pos.0.max(0.0), sf) as i32,
+            input::physical_to_logical(self.cursor_pos.1.max(0.0), sf) as i32,
         )
     }
 
@@ -107,9 +116,10 @@ impl WieApp {
     /// The winapi handler records the pending `(x, y, width, height)` on the
     /// shared state and wakes the presenter; this consumes it on the
     /// event-loop thread where winit calls must run. Guest coordinates are
-    /// treated as physical pixels, matching how `first_guest_window_info`
-    /// sizes the window at creation (the same `max(100)` clamp guards against
-    /// a degenerate or negative rect). When no window exists yet (the move
+    /// LOGICAL 96-DPI pixels, so each value is multiplied by the window's
+    /// device scale factor ([`input::logical_to_physical`]) to reach winit's
+    /// physical space — the same `max(100)` clamp guards against a
+    /// degenerate or negative rect. When no window exists yet (the move
     /// arrived before the first published frame) the request stays pending
     /// and applies once the window is created.
     fn apply_host_geometry(&self) {
@@ -122,16 +132,27 @@ impl WieApp {
         let Some((x, y, width, height)) = handle.take_host_geometry_request() else {
             return;
         };
-        rt.window
-            .set_outer_position(PhysicalPosition::new(x as f64, y as f64));
+        let sf = rt.scale_factor;
+        rt.window.set_outer_position(PhysicalPosition::new(
+            input::logical_to_physical(x as f64, sf),
+            input::logical_to_physical(y as f64, sf),
+        ));
         // winit 0.30 removed set_inner_size; request_inner_size is its
         // replacement (same Into<Size> contract as with_inner_size at
-        // creation, so guest pixels stay physical). The returned actual size
-        // is informational — the winit Resized event carries the settle.
+        // creation, so the guest's logical size must be scaled to physical
+        // here). The returned actual size is informational — the winit
+        // Resized event carries the settle.
         let _ = rt.window.request_inner_size(PhysicalSize::new(
-            width.max(100) as u32,
-            height.max(100) as u32,
+            input::logical_to_physical(width.max(100) as f64, sf) as u32,
+            input::logical_to_physical(height.max(100) as f64, sf) as u32,
         ));
+    }
+
+    /// The window's device scale factor (physical px per logical 96-DPI px),
+    /// defaulting to 1.0 before the winit window exists (no scaling has
+    /// happened yet).
+    fn scale_factor(&self) -> f64 {
+        self.runtime.as_ref().map_or(1.0, |rt| rt.scale_factor)
     }
 }
 
@@ -165,8 +186,14 @@ struct WindowRuntime {
     /// duplicate settles (macOS fires trailing `Resized` events after the
     /// drag, each would otherwise re-trigger the guest's expensive DIB
     /// recreation at the same size — and the guest thread being busy with
-    /// that recreation delays close/quit handling).
+    /// that recreation delays close/quit handling).  Guest sizes are
+    /// LOGICAL 96-DPI pixels.
     last_sent_size: Option<(u32, u32)>,
+    /// The window's device scale factor (physical pixels per logical
+    /// 96-DPI pixel), read at creation and refreshed on
+    /// `ScaleFactorChanged`.  The guest space is logical; every winit
+    /// physical value crossing the window boundary divides by this.
+    scale_factor: f64,
 }
 
 /// Window-bound state. The winit window is created lazily on the first
@@ -217,17 +244,43 @@ fn init_present_backend(window: &Arc<Window>) -> Option<PresentBackend> {
     crate::gui::present_wgpu::WgpuPresenter::init(window.clone()).ok()
 }
 
+/// Build the winit window attributes for the guest's first window.
+///
+/// The guest reports LOGICAL 96-DPI pixels; winit multiplies the
+/// `LogicalSize` by the display's device scale factor, so on a Retina (2×)
+/// display the guest's 640×480 window becomes a 1280×960 physical surface.
+fn window_attributes(title: &str, width: u32, height: u32) -> winit::window::WindowAttributes {
+    Window::default_attributes()
+        .with_title(title)
+        .with_inner_size(LogicalSize::new(width, height))
+}
+
+/// The guest-LOGICAL size a physical winit `inner_size` corresponds to at
+/// `scale_factor`: physical ÷ sf with the crate's standard rounding (see
+/// [`input::physical_to_logical`]). This is the size posted as WM_SIZE and
+/// written to the guest-visible window record.
+fn guest_size_from_physical(width: u32, height: u32, scale_factor: f64) -> (u32, u32) {
+    (
+        input::physical_to_logical(f64::from(width), scale_factor) as u32,
+        input::physical_to_logical(f64::from(height), scale_factor) as u32,
+    )
+}
+
 /// The message for a left-button press: WM_LBUTTONDBLCLK when it lands on the
 /// SAME target window within the double-click time window AND the double-click
 /// slop rectangle of the previous press (`last`), WM_LBUTTONDOWN otherwise.
 /// Every press refreshes `last`, so the host re-creates the message Windows
 /// itself synthesizes from `GetDoubleClickTime` / `SM_CXDOUBLECLK` (Windows
-/// tracks double-clicks per window). A free function (not a method) so the
-/// MouseInput arm can call it while `self.handle` is borrowed.
+/// tracks double-clicks per window). `slop` is the [`input::DOUBLE_CLICK_SLOP_PX`]
+/// distance scaled to the window's PHYSICAL pixels — winit reports cursor
+/// positions physically, and both presses are compared in that space. A free
+/// function (not a method) so the MouseInput arm can call it while
+/// `self.handle` is borrowed.
 fn left_press_message(
     last: &mut Option<(Instant, f64, f64, u64)>,
     cursor: (f64, f64),
     hwnd: u64,
+    slop: f64,
 ) -> u32 {
     let now = Instant::now();
     let (x, y) = cursor;
@@ -235,8 +288,8 @@ fn left_press_message(
         last_hwnd == hwnd
             && now.saturating_duration_since(t)
                 <= Duration::from_millis(input::DOUBLE_CLICK_TIME_MS)
-            && (x - lx).abs() <= input::DOUBLE_CLICK_SLOP_PX
-            && (y - ly).abs() <= input::DOUBLE_CLICK_SLOP_PX
+            && (x - lx).abs() <= slop
+            && (y - ly).abs() <= slop
     });
     *last = Some((now, x, y, hwnd));
     if dbl {
@@ -256,6 +309,10 @@ struct WieApp {
     /// Set on every publish; the first `Frame` event after a publish group
     /// swaps it and requests a redraw, duplicates skip.
     pending_frame: Arc<std::sync::atomic::AtomicBool>,
+    /// Shared slot for the winit window Arc, filled once at window creation
+    /// (on the event-loop thread) and read by the guest-thread MessageBox
+    /// bridge to parent its rfd dialog to the window.
+    window_slot: Arc<Mutex<Option<Arc<Window>>>>,
     /// Currently pressed mouse buttons (MK_* bits) — from MouseInput events.
     mouse_buttons: u16,
     /// Last reported cursor position in client coords (x, y).
@@ -446,8 +503,21 @@ impl ApplicationHandler<WieEvent> for WieApp {
                 // Route to the topmost child under the cursor, if any.
                 let (target, rx, ry) = self.mouse_target(handle);
                 let lparam = input::make_lparam(rx, ry);
-                let (px, py) = self.cursor_pos_i32();
-                handle.post_message_at(target, input::WM_MOUSEMOVE, u64::from(mk), lparam, px, py);
+                // MSG.pt must share lParam's CHILD-relative space: a guest
+                // reading MSG.pt (e.g. the wndproc's own hit-testing) would
+                // otherwise mix child-relative lParam with top-level-relative
+                // pt in one message and mis-map clicks on child windows (the
+                // EDIT caret landing on a huge char index). WM_DROPFILES is
+                // the exception: it targets the top-level window, where
+                // top-level-relative pt is the same space.
+                handle.post_message_at(
+                    target,
+                    input::WM_MOUSEMOVE,
+                    u64::from(mk),
+                    lparam,
+                    i32::from(rx),
+                    i32::from(ry),
+                );
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = matches!(state, winit::event::ElementState::Pressed);
@@ -470,7 +540,16 @@ impl ApplicationHandler<WieEvent> for WieApp {
                 let msg = match button {
                     winit::event::MouseButton::Left => {
                         if pressed {
-                            left_press_message(&mut self.last_left_press, self.cursor_pos, target)
+                            // The slop is computed first: left_press_message
+                            // borrows `last` mutably, and scale_factor reads
+                            // the runtime.
+                            let slop = input::double_click_slop(self.scale_factor());
+                            left_press_message(
+                                &mut self.last_left_press,
+                                self.cursor_pos,
+                                target,
+                                slop,
+                            )
                         } else {
                             input::WM_LBUTTONUP
                         }
@@ -493,8 +572,15 @@ impl ApplicationHandler<WieEvent> for WieApp {
                 };
                 let mk = self.mk_flags();
                 let lparam = input::make_lparam(rx, ry);
-                let (px, py) = self.cursor_pos_i32();
-                handle.post_message_at(target, msg, u64::from(mk), lparam, px, py);
+                // MSG.pt in lParam's child-relative space (see CursorMoved).
+                handle.post_message_at(
+                    target,
+                    msg,
+                    u64::from(mk),
+                    lparam,
+                    i32::from(rx),
+                    i32::from(ry),
+                );
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let (delta_x, delta_y) = match delta {
@@ -504,7 +590,6 @@ impl ApplicationHandler<WieEvent> for WieApp {
                     winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.x as i32, pos.y as i32),
                 };
                 let mk = self.mk_flags();
-                let (px, py) = self.cursor_pos_i32();
                 // WM_MOUSEWHEEL/HWHEEL go to the FOCUS window, not the window
                 // under the cursor (DefWindowProc then bubbles them up the
                 // parent chain) — a multiline EDIT keeps scrolling while the
@@ -521,8 +606,8 @@ impl ApplicationHandler<WieEvent> for WieApp {
                         input::WM_MOUSEWHEEL,
                         wparam,
                         input::make_lparam(rx, ry),
-                        px,
-                        py,
+                        i32::from(rx),
+                        i32::from(ry),
                     );
                 }
                 if delta_x != 0 {
@@ -532,14 +617,21 @@ impl ApplicationHandler<WieEvent> for WieApp {
                         input::WM_MOUSEHWHEEL,
                         wparam,
                         input::make_lparam(rx, ry),
-                        px,
-                        py,
+                        i32::from(rx),
+                        i32::from(ry),
                     );
                 }
             }
             WindowEvent::Moved(position) => {
-                // WM_MOVE: lParam = MAKELPARAM(x, y) screen coords.
-                let lparam = input::make_lparam(position.x.max(0) as u16, position.y.max(0) as u16);
+                // WM_MOVE: lParam = MAKELPARAM(x, y) screen coords — guest
+                // LOGICAL 96-DPI pixels, so divide winit's physical position
+                // by the device scale factor.
+                let sf = self.scale_factor();
+                let (px, py) = (
+                    input::physical_to_logical(f64::from(position.x.max(0)), sf) as u16,
+                    input::physical_to_logical(f64::from(position.y.max(0)), sf) as u16,
+                );
+                let lparam = input::make_lparam(px, py);
                 handle.post_message(hwnd.as_u64(), input::WM_MOVE, 0, lparam);
             }
             WindowEvent::CursorEntered { .. } => {
@@ -555,11 +647,14 @@ impl ApplicationHandler<WieEvent> for WieApp {
                     handle.post_message(hwnd.as_u64(), input::WM_MOUSELEAVE, 0, 0);
                 }
             }
-            WindowEvent::ScaleFactorChanged { .. } => {
-                // Physical pixel size changed under us; the guest sees the
-                // same logical size, but we need a fresh render at the new
-                // scale.  Request a redraw; the next frame covers it.
-                if let Some(rt) = self.runtime.as_ref() {
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                // The window moved to a display (or setting) with a different
+                // device scale factor. The guest sees the same LOGICAL size,
+                // so refresh the factor the input and resize paths divide by,
+                // then request a fresh render at the new scale — the next
+                // frame covers it.
+                if let Some(rt) = self.runtime.as_mut() {
+                    rt.scale_factor = scale_factor;
                     rt.window.request_redraw();
                 }
             }
@@ -662,10 +757,15 @@ impl ApplicationHandler<WieEvent> for WieApp {
         {
             rt.last_resize = None;
             if let Some((w, h)) = rt.pending_size.take() {
+                // The guest DIB is LOGICAL 96-DPI: post the PHYSICAL inner
+                // size divided by the device scale factor.
+                let (lw, lh) = guest_size_from_physical(w, h, rt.scale_factor);
                 tracing::debug!(
-                    "settle: pending={}x{} last_sent={:?}",
+                    "settle: pending={}x{} guest={}x{} last_sent={:?}",
                     w,
                     h,
+                    lw,
+                    lh,
                     rt.last_sent_size
                 );
                 // Skip if the size hasn't changed since the last posted
@@ -673,19 +773,19 @@ impl ApplicationHandler<WieEvent> for WieApp {
                 // drag, and re-posting the same size would re-trigger the
                 // guest's expensive DIB recreation (which also delays
                 // close/quit handling).
-                if rt.last_sent_size != Some((w, h)) {
+                if rt.last_sent_size != Some((lw, lh)) {
                     let hwnd = rt.hwnd;
                     if let Some(handle) = self.handle.as_ref() {
                         // Update the guest-visible record now — together with
                         // the WM_SIZE post — so GetClientRect matches the size
                         // the guest is about to recreate its DIB at.
-                        handle.resize_window(hwnd.as_u64(), w, h);
-                        let lparam = input::make_lparam(w as u16, h as u16);
+                        handle.resize_window(hwnd.as_u64(), lw, lh);
+                        let lparam = input::make_lparam(lw as u16, lh as u16);
                         handle.post_message(hwnd.as_u64(), input::WM_SIZE, 0, lparam);
                         handle.post_message(hwnd.as_u64(), input::WM_PAINT, 0, 0);
-                        tracing::debug!("resize settled: WM_SIZE {}x{}", w, h);
+                        tracing::debug!("resize settled: WM_SIZE {}x{}", lw, lh);
                     }
-                    rt.last_sent_size = Some((w, h));
+                    rt.last_sent_size = Some((lw, lh));
                 }
             }
             event_loop.set_control_flow(ControlFlow::Wait);
@@ -712,11 +812,21 @@ impl ApplicationHandler<WieEvent> for WieApp {
                         let title: &str = &title;
                         let w = w.max(100) as u32;
                         let h = h.max(100) as u32;
-                        let attrs = Window::default_attributes()
-                            .with_title(title)
-                            .with_inner_size(PhysicalSize::new(w, h));
+                        let attrs = window_attributes(title, w, h);
                         if let Ok(window) = event_loop.create_window(attrs) {
                             let window = Arc::new(window);
+                            // Publish the window to the MessageBox bridge so
+                            // its rfd dialog can parent to it (the NSAlert
+                            // path instead of the legacy CFUserNotification
+                            // fallback). A poisoned mutex leaves the bridge
+                            // unparented — harmless, the fallback still works.
+                            if let Ok(mut slot) = self.window_slot.lock() {
+                                *slot = Some(window.clone());
+                            }
+                            // winit reports the device scale factor (physical
+                            // px per logical px); the input and resize paths
+                            // divide winit's physical coordinates by it.
+                            let scale_factor = window.scale_factor();
                             window.focus_window();
                             self.runtime = WindowState::Active(WindowRuntime {
                                 hwnd: Hwnd::from(hwnd),
@@ -727,6 +837,7 @@ impl ApplicationHandler<WieEvent> for WieApp {
                                 pending_size: None,
                                 last_resize: None,
                                 last_sent_size: None,
+                                scale_factor,
                             });
                         }
                     }
@@ -837,6 +948,12 @@ pub fn run_gui_windowed(
     // into `WieApp`.
     let pending_frame = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let pending_frame_guest = pending_frame.clone();
+    // Shared slot for the winit window Arc: the MessageBox bridge (registered
+    // on the guest thread BEFORE the window exists) reads it to parent its
+    // rfd dialog; WieApp fills it once the window is created. Clone for the
+    // guest thread; the original moves into `WieApp`.
+    let window_slot: Arc<Mutex<Option<Arc<Window>>>> = Arc::new(Mutex::new(None));
+    let window_slot_guest = window_slot.clone();
 
     let handle_rx = {
         let (tx, rx) = mpsc::channel::<GuestHandle>();
@@ -875,24 +992,43 @@ pub fn run_gui_windowed(
                             }));
                         }
 
-                        // Register the native-alert MessageBox bridge. rfd shows
-                        // an NSAlert (dispatched to the main thread; the guest
-                        // thread blocks until the user clicks — MessageBox
+                        // Register the native-alert MessageBox bridge. rfd's
+                        // parented dialog uses the modern NSAlert API
+                        // (dispatched to the main thread; the guest thread
+                        // blocks until the user clicks — MessageBox
                         // semantics) and maps the result to the Win32 id.
+                        // With no parent, rfd falls back to the legacy
+                        // CFUserNotificationDisplayAlert path, which prints
+                        // "will block waiting for a response" on the main
+                        // thread — the window slot below switches to NSAlert
+                        // once the winit window exists.
                         #[cfg(target_os = "macos")]
-                        handle.set_message_box_bridge(Box::new(|caption, text, mb_type| {
-                            tracing::info!(
-                                target: "wiegui",
-                                "MessageBox: {caption}: {text} (type 0x{mb_type:x})"
-                            );
-                            let (buttons, level) = map_message_box_buttons(mb_type);
-                            let result = rfd::MessageDialog::new()
-                                .set_title(caption.to_owned())
-                                .set_description(text.to_owned())
-                                .set_level(level)
-                                .set_buttons(buttons)
-                                .show();
-                            map_alert_result(result)
+                        handle.set_message_box_bridge(Box::new({
+                            let window_slot = window_slot_guest.clone();
+                            move |caption, text, mb_type| {
+                                tracing::info!(
+                                    target: "wiegui",
+                                    "MessageBox: {caption}: {text} (type 0x{mb_type:x})"
+                                );
+                                let (buttons, level) = map_message_box_buttons(mb_type);
+                                // Parent to the winit window when it exists
+                                // (it always does by the time a MessageBox
+                                // fires — the bridge is just registered
+                                // earlier). set_parent consumes the builder,
+                                // so apply it before the chain.
+                                let parent = window_slot.lock().ok().and_then(|slot| slot.clone());
+                                let mut dialog = rfd::MessageDialog::new();
+                                if let Some(parent) = &parent {
+                                    dialog = dialog.set_parent(parent.as_ref());
+                                }
+                                let result = dialog
+                                    .set_title(caption.to_owned())
+                                    .set_description(text.to_owned())
+                                    .set_level(level)
+                                    .set_buttons(buttons)
+                                    .show();
+                                map_alert_result(result)
+                            }
                         }));
 
                         let _ = tx.send(handle);
@@ -923,6 +1059,7 @@ pub fn run_gui_windowed(
         handle: Some(handle),
         runtime: WindowState::Uncreated,
         pending_frame,
+        window_slot,
         mouse_buttons: 0,
         cursor_pos: (0.0, 0.0),
         last_left_press: None,
@@ -940,7 +1077,9 @@ pub fn run_gui_windowed(
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use super::{map_alert_result, map_message_box_buttons};
+    use super::{
+        guest_size_from_physical, map_alert_result, map_message_box_buttons, window_attributes,
+    };
 
     /// `MB_*` button bits select the rfd button set; the bridge receives the
     /// raw flag word, so this mapping is the winapi crate's documented seam.
@@ -1017,5 +1156,44 @@ mod tests {
             2,
             "an unknown custom result cancels"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // F1 scale plumbing (fidelity lane 1): the guest space is LOGICAL 96-DPI
+    // pixels; winit reports PHYSICAL. These pin the window-boundary
+    // conversions the input/resize/geometry paths share.
+    // -----------------------------------------------------------------------
+
+    /// The guest's first window is created at its LOGICAL 96-DPI size —
+    /// winit multiplies by the device scale factor itself.
+    #[test]
+    fn window_attributes_use_logical_size() {
+        let attrs = window_attributes("notepad", 640, 480);
+        assert_eq!(
+            attrs.inner_size,
+            Some(winit::dpi::Size::Logical(winit::dpi::LogicalSize::new(
+                640.0, 480.0
+            )))
+        );
+        let attrs = window_attributes("t", 100, 100);
+        assert_eq!(
+            attrs.inner_size,
+            Some(winit::dpi::Size::Logical(winit::dpi::LogicalSize::new(
+                100.0, 100.0
+            )))
+        );
+    }
+
+    /// The WM_SIZE settle posts the guest LOGICAL size: physical inner_size
+    /// ÷ sf with the crate's rounding.
+    #[test]
+    fn settle_posts_logical_size() {
+        // Retina 2×: a 1280×960 physical window is a 640×480 logical window.
+        assert_eq!(guest_size_from_physical(1280, 960, 2.0), (640, 480));
+        // Non-integer division rounds half away from zero (320.5 → 321).
+        assert_eq!(guest_size_from_physical(641, 481, 2.0), (321, 241));
+        // Scale factor 1.0 reproduces today's physical-as-logical posting.
+        assert_eq!(guest_size_from_physical(640, 480, 1.0), (640, 480));
+        assert_eq!(guest_size_from_physical(886, 776, 1.0), (886, 776));
     }
 }

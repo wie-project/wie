@@ -6,21 +6,32 @@ use anyhow::Result;
 use super::listbox::render_control_text;
 use super::paint::fill_rect_clipped;
 use super::{
-    COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, ControlClassKind, ControlState, ES_MULTILINE, SEL_EMPTY,
-    SEL_MULTICHAR, SEL_MULTILINE, SEL_TEXT, control_state, deliver_command,
+    control_state, deliver_command, ControlClassKind, ControlState, COLOR_HIGHLIGHT,
+    COLOR_HIGHLIGHTTEXT, ES_MULTILINE, SEL_EMPTY, SEL_MULTICHAR, SEL_MULTILINE, SEL_TEXT,
 };
 use crate::gdi32::ResolvedWindow;
 use crate::gdi32::{FontEngine, FontKey, ResolvedFont};
 use crate::guest_memory::read_u16 as read_guest_u16;
-use crate::state::WindowFlags;
+use crate::state::{TimerRecord, WindowFlags};
 use crate::user32::{
-    EN_CHANGE, VK_CONTROL, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT,
-    VK_SHIFT, VK_UP, WinApiState, find_window, make_command_wparam, read_guest_ansi_lossy,
+    find_window, find_window_mut, make_command_wparam, read_guest_ansi_lossy,
     read_guest_utf16_lossy, write_guest_ansi_c_string, write_guest_i32, write_guest_utf16_c_string,
+    WinApiState, EN_CHANGE, VK_CONTROL, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR,
+    VK_RIGHT, VK_SHIFT, VK_UP,
 };
 
 /// Cap for guest buffer reads (EM_SETHANDLE / EM_REPLACESEL adoption).
 const MAX_GUEST_TEXT: usize = 1 << 20;
+
+/// The EDIT's internal caret-blink timer id — the id a real Windows EDIT
+/// control uses for its caret timer, so a guest SetTimer on the same
+/// window/id replaces it exactly like Windows (the timer is a plain record in
+/// the thread's timer list).
+pub(super) const CARET_TIMER_ID: u64 = 1;
+
+/// Caret blink half-period in ms — `SPI_GETCARETTIMEOUT`'s 530 ms default
+/// (the spec's ~530 ms).
+pub(super) const CARET_BLINK_MS: u32 = 530;
 
 /// `WS_HSCROLL` — a multiline EDIT with a horizontal scrollbar does NOT word
 /// wrap (notepad toggles wrap by dropping the horizontal scroll style).
@@ -1893,6 +1904,59 @@ pub(super) fn edit_notify_scroll(
     deliver_command(state, hwnd, command_wparam)
 }
 
+/// EDIT: WM_SETFOCUS — show the caret (blink phase reset to on) and arm the
+/// internal blink timer. The timer is a real `TimerRecord` on the edit's
+/// window: the message pump synthesizes the guest-visible `WM_TIMER` while
+/// the thread idles in `GetMessage`, exactly like the SetTimer a Windows EDIT
+/// control runs internally.
+pub(super) fn edit_focus_gained(state: &mut WinApiState, hwnd: u64) {
+    if let Some(window) = find_window_mut(state, hwnd) {
+        window.flags.insert(WindowFlags::FOCUSED);
+    }
+    if let ControlState::Edit { caret_on, .. } = edit_state_for_window(state, hwnd) {
+        *caret_on = true;
+    }
+    let window_handle = crate::handles::Hwnd::from(hwnd);
+    let timers = &mut state.window_state().timers;
+    if !timers
+        .iter()
+        .any(|timer| timer.window_handle == window_handle && timer.timer_id == CARET_TIMER_ID)
+    {
+        timers.push(TimerRecord {
+            window_handle,
+            timer_id: CARET_TIMER_ID,
+            interval_ms: CARET_BLINK_MS,
+            callback_address: 0,
+            next_fire: crate::user32::misc::timer_deadline(CARET_BLINK_MS),
+        });
+    }
+}
+
+/// EDIT: WM_KILLFOCUS — hide the caret and disarm the blink timer. Paint
+/// already skips the caret while unfocused; the phase resets on the next
+/// focus so the caret returns solid.
+pub(super) fn edit_focus_lost(state: &mut WinApiState, hwnd: u64) {
+    if let Some(window) = find_window_mut(state, hwnd) {
+        window.flags.remove(WindowFlags::FOCUSED);
+    }
+    let window_handle = crate::handles::Hwnd::from(hwnd);
+    state
+        .window_state()
+        .timers
+        .retain(|timer| timer.window_handle != window_handle || timer.timer_id != CARET_TIMER_ID);
+}
+
+/// EDIT: one caret-blink `WM_TIMER` tick — flip the caret phase. Returns
+/// whether the phase changed (always true while the state exists), so the
+/// caller repaints exactly on real ticks.
+pub(super) fn edit_caret_tick(state: &mut WinApiState, hwnd: u64) -> bool {
+    if let ControlState::Edit { caret_on, .. } = edit_state_for_window(state, hwnd) {
+        *caret_on = !*caret_on;
+        return true;
+    }
+    false
+}
+
 /// Whether the Shift key is held, per the guest keyboard state.
 #[must_use]
 fn shift_is_down(state: &WinApiState) -> bool {
@@ -1906,7 +1970,7 @@ fn shift_is_down(state: &WinApiState) -> bool {
 
 /// Whether the Ctrl key is held, per the guest keyboard state.
 #[must_use]
-fn ctrl_is_down(state: &WinApiState) -> bool {
+pub(super) fn ctrl_is_down(state: &WinApiState) -> bool {
     state.try_window_state().is_some_and(|ws| {
         ws.keyboard_state
             .get(usize::try_from(VK_CONTROL).unwrap_or(0))
@@ -1950,7 +2014,7 @@ pub(super) fn paint_edit(
     let len = text.chars().count();
     let focused = find_window(state, info.dc_window.as_u64())
         .is_some_and(|w| w.flags.contains(WindowFlags::FOCUSED));
-    let (sel_start, sel_end, caret, style_bits, first_visible_line) =
+    let (sel_start, sel_end, caret, style_bits, first_visible_line, caret_on) =
         match control_state(state, info.dc_window.as_u64()) {
             Some(ControlState::Edit {
                 caret,
@@ -1958,6 +2022,7 @@ pub(super) fn paint_edit(
                 sel_end,
                 style_bits,
                 first_visible_line,
+                caret_on,
                 ..
             }) => (
                 (*sel_start).min(*sel_end),
@@ -1965,8 +2030,9 @@ pub(super) fn paint_edit(
                 *caret,
                 *style_bits,
                 *first_visible_line,
+                *caret_on,
             ),
-            _ => (0, 0, 0, 0, 0),
+            _ => (0, 0, 0, 0, 0, true),
         };
     let (sel_start, sel_end, caret) = (sel_start.min(len), sel_end.min(len), caret.min(len));
     let line_h = resolved.line_height();
@@ -2075,8 +2141,9 @@ pub(super) fn paint_edit(
         }
         // Pass 4: the 1 px caret bar at the caret's glyph cell. The caret
         // belongs to the first row ending at or past it — a wrap-boundary
-        // caret lands at the END of the row before the break.
-        if focused && !caret_drawn && caret >= row.char_start && caret <= row.char_end {
+        // caret lands at the END of the row before the break. It draws only
+        // in the blink ON phase (the focus timer toggles `caret_on`).
+        if focused && caret_on && !caret_drawn && caret >= row.char_start && caret <= row.char_end {
             let local = caret.saturating_sub(row.char_start);
             let caret_x =
                 x.saturating_add(font_engine.text_advance(resolved, key, &row.text, local));

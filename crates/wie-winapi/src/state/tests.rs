@@ -2829,6 +2829,295 @@ fn test_edit_pgup_pgdn_keydown_delivers_en_vscroll_to_parent() {
     );
 }
 
+#[test]
+fn test_edit_caret_blink_timer_toggles_caret_phase() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (_, edit) = push_multiline_edit(&mut state, "line1\nline2\nline3");
+
+    // Focus arms the internal blink timer and resets the caret to the on
+    // phase (the caret bar shows solid until the first tick).
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_SETFOCUS,
+        0,
+        0,
+    )
+    .expect("focus ok")
+    .expect("some result");
+    let caret_timer = state
+        .window_state()
+        .timers
+        .iter()
+        .find(|t| t.window_handle == crate::handles::Hwnd::from(edit) && t.timer_id == 1)
+        .expect("focus must arm the caret timer");
+    assert_eq!(
+        caret_timer.interval_ms, 530,
+        "the blink half-period is the SPI_GETCARETTIMEOUT default"
+    );
+    assert!(
+        control_ui(&state, edit).caret_on,
+        "the caret starts in the on phase"
+    );
+
+    // Each WM_TIMER tick flips the phase, so the caret bar alternates
+    // between drawn and hidden (the paint draws it only in the on phase).
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_TIMER,
+        1,
+        0,
+    )
+    .expect("timer ok")
+    .expect("some result");
+    assert!(
+        !control_ui(&state, edit).caret_on,
+        "the first tick hides the caret"
+    );
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_TIMER,
+        1,
+        0,
+    )
+    .expect("timer ok")
+    .expect("some result");
+    assert!(
+        control_ui(&state, edit).caret_on,
+        "the second tick shows it again"
+    );
+
+    // A WM_TIMER with a different id is not the caret timer: not the edit's
+    // business (falls through, no state change).
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_TIMER,
+        99,
+        0,
+    )
+    .expect("other timer ok");
+    assert_eq!(r, None, "an unknown timer id must not touch the edit");
+
+    // Losing focus disarms the timer and clears the focus flag (the paint
+    // already skips the caret while unfocused).
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_KILLFOCUS,
+        0,
+        0,
+    )
+    .expect("killfocus ok")
+    .expect("some result");
+    assert!(
+        !state
+            .window_state()
+            .timers
+            .iter()
+            .any(|t| t.window_handle == crate::handles::Hwnd::from(edit)),
+        "kill focus must disarm the caret timer"
+    );
+    assert!(
+        !control_ui(&state, edit).focused,
+        "kill focus clears the flag"
+    );
+}
+
+#[test]
+fn test_edit_typing_at_bottom_autoscrolls_caret_into_view() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (_, edit) = push_multiline_edit(&mut state, "0\n1\n2\n3\n4\n5\n6\n7\n8\n9");
+    // 5 visible rows in an 80 px client (the 16 px default line height):
+    // typing on line 9 (char 18) must bring the caret into view instead of
+    // leaving it off-screen below the last visible row.
+    for w in &mut state.window_state().windows {
+        if w.handle == crate::handles::Hwnd::from(edit) {
+            w.height = 80;
+        }
+    }
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_SETSEL,
+        18,
+        18,
+    )
+    .expect("setsel ok")
+    .expect("some result");
+    assert_eq!(
+        control_ui(&state, edit).first_visible_line,
+        0,
+        "the fixture starts at the top"
+    );
+
+    let error = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_CHAR,
+        u64::from(b'x'),
+        0,
+    )
+    .expect_err("typing must deliver EN_CHANGE");
+    let signal = error
+        .downcast_ref::<WinApiControlSignal>()
+        .expect("control signal");
+    assert!(
+        matches!(
+            signal,
+            WinApiControlSignal::GuestCallbackRequested { request }
+                if request.message == 0x0111 && request.word_parameter == 0x0300_000C
+        ),
+        "typing must deliver WM_COMMAND(MAKEWPARAM(12, EN_CHANGE)), got {signal:?}"
+    );
+    assert_eq!(
+        control_ui(&state, edit).first_visible_line,
+        5,
+        "typing past the last visible row scrolls the caret into view"
+    );
+    assert_eq!(
+        control_ui(&state, edit).caret,
+        19,
+        "the typed char lands after the caret"
+    );
+}
+
+#[test]
+fn test_edit_arrow_keys_deliver_en_hscroll_and_en_vscroll() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (parent, edit) = push_multiline_edit(&mut state, "ab\ncd\nefgh");
+
+    // A horizontal move (VK_RIGHT) delivers EN_HSCROLL — the status-bar
+    // caret refresh for column changes.
+    let error = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_KEYDOWN,
+        crate::user32::VK_RIGHT,
+        0,
+    )
+    .expect_err("VK_RIGHT must deliver EN_HSCROLL");
+    let signal = error
+        .downcast_ref::<WinApiControlSignal>()
+        .expect("control signal");
+    assert!(
+        matches!(
+            signal,
+            WinApiControlSignal::GuestCallbackRequested { request }
+                if request.window_handle == parent
+                    && request.message == 0x0111
+                    && request.word_parameter == 0x0601_000C
+        ),
+        "VK_RIGHT must deliver WM_COMMAND(MAKEWPARAM(12, EN_HSCROLL)), got {signal:?}"
+    );
+
+    // A vertical move (VK_DOWN) delivers EN_VSCROLL (caret 1 → line 1).
+    let error = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_KEYDOWN,
+        crate::user32::VK_DOWN,
+        0,
+    )
+    .expect_err("VK_DOWN must deliver EN_VSCROLL");
+    let signal = error
+        .downcast_ref::<WinApiControlSignal>()
+        .expect("control signal");
+    assert!(
+        matches!(
+            signal,
+            WinApiControlSignal::GuestCallbackRequested { request }
+                if request.window_handle == parent
+                    && request.message == 0x0111
+                    && request.word_parameter == 0x0602_000C
+        ),
+        "VK_DOWN must deliver WM_COMMAND(MAKEWPARAM(12, EN_VSCROLL)), got {signal:?}"
+    );
+
+    // Ctrl+End is a document-wide vertical jump → EN_VSCROLL (the line-aware
+    // plain End would be EN_HSCROLL).
+    state.window_state().keyboard_state.set(0x11, 0x80); // VK_CONTROL held
+    let error = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_KEYDOWN,
+        crate::user32::VK_END,
+        0,
+    )
+    .expect_err("Ctrl+End must deliver EN_VSCROLL");
+    state.window_state().keyboard_state.set(0x11, 0);
+    let signal = error
+        .downcast_ref::<WinApiControlSignal>()
+        .expect("control signal");
+    assert!(
+        matches!(
+            signal,
+            WinApiControlSignal::GuestCallbackRequested { request }
+                if request.window_handle == parent
+                    && request.message == 0x0111
+                    && request.word_parameter == 0x0602_000C
+        ),
+        "Ctrl+End must deliver WM_COMMAND(MAKEWPARAM(12, EN_VSCROLL)), got {signal:?}"
+    );
+}
+
+#[test]
+fn test_edit_click_release_delivers_en_vscroll_to_parent() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (parent, edit) = push_multiline_edit(&mut state, "ab\ncd");
+
+    // A completed click navigation (down then up) delivers EN_VSCROLL to the
+    // parent — the status-bar caret refresh for click navigation.
+    let (x, y) = (20_u16, 10_u16);
+    dispatch_mouse(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::wm::WinMsg::WM_LBUTTONDOWN.as_u32(),
+        x,
+        y,
+    );
+    let result = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::wm::WinMsg::WM_LBUTTONUP.as_u32(),
+        0,
+        mouse_lparam(x, y),
+    );
+    let error = result.expect_err("a completed click must deliver EN_VSCROLL");
+    let signal = error
+        .downcast_ref::<WinApiControlSignal>()
+        .expect("control signal");
+    assert!(
+        matches!(
+            signal,
+            WinApiControlSignal::GuestCallbackRequested { request }
+                if request.window_handle == parent
+                    && request.message == 0x0111
+                    && request.word_parameter == 0x0602_000C
+        ),
+        "a completed click must deliver WM_COMMAND(MAKEWPARAM(12, EN_VSCROLL)), \
+         got {signal:?}"
+    );
+}
+
 // --- Comdlg32 ---
 
 /// Read a NUL-terminated UTF-16LE guest string at `addr` (up to `max_units`).
@@ -5454,6 +5743,7 @@ struct ControlUiSnapshot {
     modified: bool,
     first_visible_line: usize,
     tab_stops: Vec<u16>,
+    caret_on: bool,
     part_rights: Vec<i32>,
     part_texts: Vec<String>,
 }
@@ -5485,6 +5775,7 @@ impl ControlUiSnapshot {
                     modified,
                     first_visible_line,
                     tab_stops,
+                    caret_on,
                     ..
                 }) => {
                     snap.caret = *caret;
@@ -5496,6 +5787,7 @@ impl ControlUiSnapshot {
                     snap.modified = *modified;
                     snap.first_visible_line = *first_visible_line;
                     snap.tab_stops = tab_stops.clone();
+                    snap.caret_on = *caret_on;
                 }
                 Some(ControlState::ListBox { items, sel_index }) => {
                     snap.items = items.clone();
@@ -5677,16 +5969,7 @@ fn test_edit_wm_char_inserts_at_caret() {
     assert_eq!(control_ui(&state, edit).caret, 1);
 
     // Home + End, then 'Y' appends at the end → "XhelloY".
-    crate::user32::controls::dispatch_control_proc(
-        &mut engine,
-        &mut state,
-        edit,
-        crate::user32::WM_KEYDOWN,
-        crate::user32::VK_END,
-        0,
-    )
-    .expect("end ok")
-    .expect("some result");
+    press_key(&mut engine, &mut state, edit, crate::user32::VK_END);
     crate::user32::controls::dispatch_control_proc(
         &mut engine,
         &mut state,
@@ -5769,36 +6052,9 @@ fn test_edit_backspace_and_delete_at_caret() {
 
     // Home + Right + Right (caret 2), Backspace → deletes the char before
     // the caret ('e', index 1) → "hllo", caret back at 1.
-    crate::user32::controls::dispatch_control_proc(
-        &mut engine,
-        &mut state,
-        edit,
-        crate::user32::WM_KEYDOWN,
-        crate::user32::VK_HOME,
-        0,
-    )
-    .expect("home ok")
-    .expect("some result");
-    crate::user32::controls::dispatch_control_proc(
-        &mut engine,
-        &mut state,
-        edit,
-        crate::user32::WM_KEYDOWN,
-        crate::user32::VK_RIGHT,
-        0,
-    )
-    .expect("right ok")
-    .expect("some result");
-    crate::user32::controls::dispatch_control_proc(
-        &mut engine,
-        &mut state,
-        edit,
-        crate::user32::WM_KEYDOWN,
-        crate::user32::VK_RIGHT,
-        0,
-    )
-    .expect("right2 ok")
-    .expect("some result");
+    press_key(&mut engine, &mut state, edit, crate::user32::VK_HOME);
+    press_key(&mut engine, &mut state, edit, crate::user32::VK_RIGHT);
+    press_key(&mut engine, &mut state, edit, crate::user32::VK_RIGHT);
     assert_eq!(control_ui(&state, edit).caret, 2);
     crate::user32::controls::dispatch_control_proc(
         &mut engine,
@@ -5825,16 +6081,7 @@ fn test_edit_backspace_and_delete_at_caret() {
     assert_eq!(control_text(&state, edit), "hlo");
 
     // Delete past the end: no text change, no notification.
-    crate::user32::controls::dispatch_control_proc(
-        &mut engine,
-        &mut state,
-        edit,
-        crate::user32::WM_KEYDOWN,
-        crate::user32::VK_END,
-        0,
-    )
-    .expect("end ok")
-    .expect("some result");
+    press_key(&mut engine, &mut state, edit, crate::user32::VK_END);
     let r = crate::user32::controls::dispatch_control_proc(
         &mut engine,
         &mut state,
@@ -5856,74 +6103,20 @@ fn test_edit_arrow_keys_move_caret() {
     let (_, edit) = push_edit_pair(&mut state);
 
     // Home → caret 0.
-    crate::user32::controls::dispatch_control_proc(
-        &mut engine,
-        &mut state,
-        edit,
-        crate::user32::WM_KEYDOWN,
-        crate::user32::VK_HOME,
-        0,
-    )
-    .expect("home ok")
-    .expect("some result");
+    press_key(&mut engine, &mut state, edit, crate::user32::VK_HOME);
     assert_eq!(control_ui(&state, edit).caret, 0);
 
     // Right → caret 1; End → caret 5 (len of "hello"); Left → 4.
-    crate::user32::controls::dispatch_control_proc(
-        &mut engine,
-        &mut state,
-        edit,
-        crate::user32::WM_KEYDOWN,
-        crate::user32::VK_RIGHT,
-        0,
-    )
-    .expect("right ok")
-    .expect("some result");
+    press_key(&mut engine, &mut state, edit, crate::user32::VK_RIGHT);
     assert_eq!(control_ui(&state, edit).caret, 1);
-    crate::user32::controls::dispatch_control_proc(
-        &mut engine,
-        &mut state,
-        edit,
-        crate::user32::WM_KEYDOWN,
-        crate::user32::VK_END,
-        0,
-    )
-    .expect("end ok")
-    .expect("some result");
+    press_key(&mut engine, &mut state, edit, crate::user32::VK_END);
     assert_eq!(control_ui(&state, edit).caret, 5);
-    crate::user32::controls::dispatch_control_proc(
-        &mut engine,
-        &mut state,
-        edit,
-        crate::user32::WM_KEYDOWN,
-        crate::user32::VK_LEFT,
-        0,
-    )
-    .expect("left ok")
-    .expect("some result");
+    press_key(&mut engine, &mut state, edit, crate::user32::VK_LEFT);
     assert_eq!(control_ui(&state, edit).caret, 4);
 
     // Left at the start is a no-op (stays 0 after Home).
-    crate::user32::controls::dispatch_control_proc(
-        &mut engine,
-        &mut state,
-        edit,
-        crate::user32::WM_KEYDOWN,
-        crate::user32::VK_HOME,
-        0,
-    )
-    .expect("home ok")
-    .expect("some result");
-    crate::user32::controls::dispatch_control_proc(
-        &mut engine,
-        &mut state,
-        edit,
-        crate::user32::WM_KEYDOWN,
-        crate::user32::VK_LEFT,
-        0,
-    )
-    .expect("left at start ok")
-    .expect("some result");
+    press_key(&mut engine, &mut state, edit, crate::user32::VK_HOME);
+    press_key(&mut engine, &mut state, edit, crate::user32::VK_LEFT);
     assert_eq!(control_ui(&state, edit).caret, 0);
 }
 
@@ -5934,61 +6127,25 @@ fn test_edit_shift_arrow_extends_selection() {
     let (_, edit) = push_edit_pair(&mut state);
 
     // End (no shift) → caret 5, no selection; then hold Shift.
-    crate::user32::controls::dispatch_control_proc(
-        &mut engine,
-        &mut state,
-        edit,
-        crate::user32::WM_KEYDOWN,
-        crate::user32::VK_END,
-        0,
-    )
-    .expect("end ok")
-    .expect("some result");
+    press_key(&mut engine, &mut state, edit, crate::user32::VK_END);
     assert_eq!(control_ui(&state, edit).caret, 5);
     let held = state.window_state().keyboard_state.get(0x10) | 0x80;
     state.window_state().keyboard_state.set(0x10, held); // VK_SHIFT held
 
     // Shift+Left selects the last char: [4, 5), caret 4.
-    crate::user32::controls::dispatch_control_proc(
-        &mut engine,
-        &mut state,
-        edit,
-        crate::user32::WM_KEYDOWN,
-        crate::user32::VK_LEFT,
-        0,
-    )
-    .expect("shift-left ok")
-    .expect("some result");
+    press_key(&mut engine, &mut state, edit, crate::user32::VK_LEFT);
     let ui = control_ui(&state, edit);
     assert_eq!((ui.sel_start, ui.sel_end, ui.caret), (4, 5, 4));
 
     // Shift+Left again extends: [3, 5), caret 3.
-    crate::user32::controls::dispatch_control_proc(
-        &mut engine,
-        &mut state,
-        edit,
-        crate::user32::WM_KEYDOWN,
-        crate::user32::VK_LEFT,
-        0,
-    )
-    .expect("shift-left2 ok")
-    .expect("some result");
+    press_key(&mut engine, &mut state, edit, crate::user32::VK_LEFT);
     let ui = control_ui(&state, edit);
     assert_eq!((ui.sel_start, ui.sel_end, ui.caret), (3, 5, 3));
 
     // Release Shift; Right collapses the selection and moves the caret.
     let released = state.window_state().keyboard_state.get(0x10) & !0x80;
     state.window_state().keyboard_state.set(0x10, released);
-    crate::user32::controls::dispatch_control_proc(
-        &mut engine,
-        &mut state,
-        edit,
-        crate::user32::WM_KEYDOWN,
-        crate::user32::VK_RIGHT,
-        0,
-    )
-    .expect("right ok")
-    .expect("some result");
+    press_key(&mut engine, &mut state, edit, crate::user32::VK_RIGHT);
     let ui = control_ui(&state, edit);
     assert_eq!((ui.sel_start, ui.sel_end, ui.caret), (4, 4, 4));
 }
@@ -5996,25 +6153,12 @@ fn test_edit_shift_arrow_extends_selection() {
 // ── Task 2.3: multiline EDIT keyboard navigation (vertical moves, line-aware
 // Home/End, goal-column memory, page keys) ──
 
-/// Press `vk` on `hwnd` via the control dispatch (the EDIT caret-movement arm
-/// always answers `Some(0)`).
+/// Press `vk` on `hwnd` via the control dispatch. A caret-movement key that
+/// actually moved the caret answers with the EN_HSCROLL/EN_VSCROLL control
+/// signal (the F5 status-bar refresh — the caret mutation already happened
+/// before the notification was raised); a key at the document edge is a no-op
+/// and answers `Some(0)`.
 fn press_key(engine: &mut IcedCpu, state: &mut WinApiState, hwnd: u64, vk: u64) {
-    crate::user32::controls::dispatch_control_proc(
-        engine,
-        state,
-        hwnd,
-        crate::user32::WM_KEYDOWN,
-        vk,
-        0,
-    )
-    .expect("keydown ok")
-    .expect("some result");
-}
-
-/// Press a vertical page key (`VK_PRIOR`/`VK_NEXT`) on `hwnd`, accepting the
-/// EN_VSCROLL control signal a moved page key delivers (the caret mutation
-/// already happened before the notification was raised).
-fn press_page_key(engine: &mut IcedCpu, state: &mut WinApiState, hwnd: u64, vk: u64) {
     let result = crate::user32::controls::dispatch_control_proc(
         engine,
         state,
@@ -6033,14 +6177,15 @@ fn press_page_key(engine: &mut IcedCpu, state: &mut WinApiState, hwnd: u64, vk: 
                             signal,
                             WinApiControlSignal::GuestCallbackRequested { request }
                                 if request.message == 0x0111
-                                    && request.word_parameter >> 16 == 0x0602
+                                    && (request.word_parameter >> 16 == 0x0601
+                                        || request.word_parameter >> 16 == 0x0602)
                         )
                     }),
-                "a moved page key must deliver EN_VSCROLL, got {error:?}"
+                "a moved navigation key must deliver EN_HSCROLL or EN_VSCROLL, \
+                 got {error:?}"
             );
         }
-        // A page key at the top/bottom edge is a no-op: it answers 0 silently.
-        Ok(value) => assert_eq!(value, Some(0), "a no-op page key answers 0"),
+        Ok(value) => assert_eq!(value, Some(0), "a no-op key answers 0"),
     }
 }
 
@@ -6148,17 +6293,17 @@ fn test_edit_multiline_pgup_pgdn_move_a_page() {
     }
     // PgDn from line 0 → line 5 (char index 10); PgDn again clamps to the
     // last line 9 (index 18).
-    press_page_key(&mut engine, &mut state, edit, crate::user32::VK_NEXT);
+    press_key(&mut engine, &mut state, edit, crate::user32::VK_NEXT);
     assert_eq!(control_ui(&state, edit).caret, 10);
-    press_page_key(&mut engine, &mut state, edit, crate::user32::VK_NEXT);
+    press_key(&mut engine, &mut state, edit, crate::user32::VK_NEXT);
     assert_eq!(control_ui(&state, edit).caret, 18);
     // PgUp steps back a page → line 4 (index 8), then line 0; past the top
     // is a no-op.
-    press_page_key(&mut engine, &mut state, edit, crate::user32::VK_PRIOR);
+    press_key(&mut engine, &mut state, edit, crate::user32::VK_PRIOR);
     assert_eq!(control_ui(&state, edit).caret, 8);
-    press_page_key(&mut engine, &mut state, edit, crate::user32::VK_PRIOR);
+    press_key(&mut engine, &mut state, edit, crate::user32::VK_PRIOR);
     assert_eq!(control_ui(&state, edit).caret, 0);
-    press_page_key(&mut engine, &mut state, edit, crate::user32::VK_PRIOR);
+    press_key(&mut engine, &mut state, edit, crate::user32::VK_PRIOR);
     assert_eq!(control_ui(&state, edit).caret, 0);
 }
 
@@ -6240,16 +6385,7 @@ fn test_edit_wm_char_enter_multiline_inserts_newline() {
     let (_, edit) = push_multiline_edit(&mut state, "ab");
 
     // End + WM_CHAR 0x0D on a multiline EDIT appends '\n'.
-    crate::user32::controls::dispatch_control_proc(
-        &mut engine,
-        &mut state,
-        edit,
-        crate::user32::WM_KEYDOWN,
-        crate::user32::VK_END,
-        0,
-    )
-    .expect("end ok")
-    .expect("some result");
+    press_key(&mut engine, &mut state, edit, crate::user32::VK_END);
     crate::user32::controls::dispatch_control_proc(
         &mut engine,
         &mut state,
@@ -6311,16 +6447,7 @@ fn test_edit_em_limitext_caps_insertion() {
         5
     );
 
-    crate::user32::controls::dispatch_control_proc(
-        &mut engine,
-        &mut state,
-        edit,
-        crate::user32::WM_KEYDOWN,
-        crate::user32::VK_END,
-        0,
-    )
-    .expect("end ok")
-    .expect("some result");
+    press_key(&mut engine, &mut state, edit, crate::user32::VK_END);
     let r = crate::user32::controls::dispatch_control_proc(
         &mut engine,
         &mut state,
@@ -7315,16 +7442,7 @@ fn test_edit_em_get_handle_caches_and_invalidates() {
 
     // A keystroke mutates the text → the cache clears and the next GETHANDLE
     // allocates a fresh buffer holding the new text.
-    crate::user32::controls::dispatch_control_proc(
-        &mut engine,
-        &mut state,
-        edit,
-        crate::user32::WM_KEYDOWN,
-        crate::user32::VK_END,
-        0,
-    )
-    .expect("end ok")
-    .expect("some result");
+    press_key(&mut engine, &mut state, edit, crate::user32::VK_END);
     crate::user32::controls::dispatch_control_proc(
         &mut engine,
         &mut state,
@@ -7676,16 +7794,7 @@ fn test_edit_em_canundo_tracks_insert_delete_replace() {
     let mut engine = test_engine();
     let mut state = default_winapi_state();
     let (_, edit) = push_edit_pair(&mut state);
-    crate::user32::controls::dispatch_control_proc(
-        &mut engine,
-        &mut state,
-        edit,
-        crate::user32::WM_KEYDOWN,
-        crate::user32::VK_RIGHT,
-        0,
-    )
-    .expect("right ok")
-    .expect("some result");
+    press_key(&mut engine, &mut state, edit, crate::user32::VK_RIGHT);
     crate::user32::controls::dispatch_control_proc(
         &mut engine,
         &mut state,
@@ -8032,16 +8141,7 @@ fn test_edit_wm_paste_inserts_clipboard_text_replacing_selection() {
     )
     .expect("copy ok")
     .expect("some result");
-    crate::user32::controls::dispatch_control_proc(
-        &mut engine,
-        &mut state,
-        edit,
-        crate::user32::WM_KEYDOWN,
-        crate::user32::VK_HOME,
-        0,
-    )
-    .expect("home ok")
-    .expect("some result");
+    press_key(&mut engine, &mut state, edit, crate::user32::VK_HOME);
 
     // Paste at the caret (no selection) inserts the clipboard text.
     crate::user32::controls::dispatch_control_proc(
@@ -8706,6 +8806,38 @@ fn dispatch_mouse(
     .expect("some result")
 }
 
+/// Release the button over an EDIT after a press, accepting the EN_VSCROLL
+/// control signal a completed click navigation delivers (the F5 status-bar
+/// caret refresh — the caret/selection already settled before it fired).
+fn release_mouse(engine: &mut IcedCpu, state: &mut WinApiState, hwnd: u64, x: u16, y: u16) {
+    let result = crate::user32::controls::dispatch_control_proc(
+        engine,
+        state,
+        hwnd,
+        crate::user32::wm::WinMsg::WM_LBUTTONUP.as_u32(),
+        0,
+        mouse_lparam(x, y),
+    );
+    match result {
+        Err(error) => {
+            assert!(
+                error
+                    .downcast_ref::<WinApiControlSignal>()
+                    .is_some_and(|signal| {
+                        matches!(
+                            signal,
+                            WinApiControlSignal::GuestCallbackRequested { request }
+                                if request.message == 0x0111
+                                    && request.word_parameter >> 16 == 0x0602
+                        )
+                    }),
+                "a completed click must deliver EN_VSCROLL, got {error:?}"
+            );
+        }
+        Ok(value) => assert_eq!(value, Some(0), "a click release answers 0"),
+    }
+}
+
 #[test]
 fn test_edit_char_index_at_point_maps_x_to_char_cells() {
     use crate::user32::controls::edit_char_index_at_point;
@@ -8839,15 +8971,9 @@ fn test_edit_mouse_drag_extends_selection_from_anchor() {
     let ui = control_ui(&state, edit);
     assert_eq!((ui.sel_start, ui.sel_end, ui.caret), (2, 4, 4));
 
-    // Release: the capture drops and the selection stays finalized.
-    dispatch_mouse(
-        &mut engine,
-        &mut state,
-        edit,
-        crate::user32::wm::WinMsg::WM_LBUTTONUP.as_u32(),
-        x4,
-        y,
-    );
+    // Release: the capture drops, the selection stays finalized, and the
+    // completed click delivers EN_VSCROLL to the parent.
+    release_mouse(&mut engine, &mut state, edit, x4, y);
     assert_eq!(
         state.window_state().capture_window_handle,
         crate::handles::Hwnd::NULL,
@@ -9069,9 +9195,10 @@ fn test_edit_mouse_selection_fires_no_en_change() {
     let y = 10_u16;
     let x_a = u16::try_from(char_cell_left(&mut state, edit, 1)).unwrap_or(0);
     let x_b = u16::try_from(char_cell_left(&mut state, edit, 4)).unwrap_or(0);
-    // A full click-drag-release cycle returns plain handled results (no
-    // WM_COMMAND bridged to the parent) and leaves the text and modify flag
-    // untouched — EN_CHANGE fires only for text mutations.
+    // A full click-drag-release cycle leaves the text and modify flag
+    // untouched — EN_CHANGE fires only for text mutations. The release does
+    // bridge EN_VSCROLL (the F5 status-bar caret refresh), which is a
+    // navigation notification, not a text change.
     dispatch_mouse(
         &mut engine,
         &mut state,
@@ -9088,14 +9215,7 @@ fn test_edit_mouse_selection_fires_no_en_change() {
         x_b,
         y,
     );
-    dispatch_mouse(
-        &mut engine,
-        &mut state,
-        edit,
-        crate::user32::wm::WinMsg::WM_LBUTTONUP.as_u32(),
-        x_b,
-        y,
-    );
+    release_mouse(&mut engine, &mut state, edit, x_b, y);
     dispatch_mouse(
         &mut engine,
         &mut state,
@@ -11212,19 +11332,102 @@ fn test_wm_setfont_stored_font_drives_edit_measurements() {
     )
     .expect("setsel ok")
     .expect("some result");
-    press_page_key(&mut engine, &mut state, edit, crate::user32::VK_NEXT);
+    press_key(&mut engine, &mut state, edit, crate::user32::VK_NEXT);
     assert_eq!(
         control_ui(&state, edit).caret,
         6, // line 3 ('3')
         "PgDn must page by the stored font's line height"
     );
-
-    // WM_VSCROLL SB_PAGEDOWN: the visible-row count from the stored font (3
-    // rows fit at 3×line_h) — the 16 px default would page ~6.
+    // The keydown auto-scrolled the caret into view (F5: caret moves scroll),
+    // so the SB_PAGEDOWN delta — not the absolute offset — proves the page
+    // size: 3 rows fit at 3×line_h (the 16 px default would page ~6).
     const SB_PAGEDOWN: u16 = 3;
+    let before_scroll = control_ui(&state, edit).first_visible_line;
     assert_eq!(
         vscroll_offset(&mut engine, &mut state, edit, SB_PAGEDOWN, 0),
-        3
+        before_scroll + 3,
+        "SB_PAGEDOWN must page by the stored font's visible row count"
+    );
+}
+
+/// F3 regression: RNotepad requests "Lucida Console" with FIXED_PITCH|FF_MODERN
+/// (settings.c) and WM_SETFONTs the resulting HFONT onto the EDIT. The full
+/// path — CreateFontIndirectA → GDI font table → WM_SETFONT →
+/// window_font_resolution → FontKey → face_id_for — must land on a MONOSPACE
+/// face. A proportional face (the pre-L8 sans-serif fallback) would break the
+/// monospace tell `avg == max`. Host-independent: the tell is a property of
+/// any fixed-pitch face, no specific installed family is assumed.
+#[test]
+fn test_lucida_console_fixed_pitch_resolves_to_monospace_through_edit() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (_, edit) = push_edit_pair(&mut state);
+
+    // LOGFONTA: lfHeight=0 lfWeight=16 lfCharSet=23 lfPitchAndFamily=27
+    // lfFaceName char[32] at 28. FIXED_PITCH(0x01)|FF_MODERN(0x30) = 0x31.
+    let logfont_ptr = 0x5000_u64;
+    engine
+        .mem_write(logfont_ptr, &(-16_i32).to_le_bytes())
+        .expect("write LOGFONTA.lfHeight");
+    engine
+        .mem_write(logfont_ptr + 16, &(400_i32).to_le_bytes())
+        .expect("write LOGFONTA.lfWeight");
+    engine
+        .mem_write(logfont_ptr + 23, &[1_u8])
+        .expect("write LOGFONTA.lfCharSet");
+    engine
+        .mem_write(logfont_ptr + 27, &[0x31_u8])
+        .expect("write LOGFONTA.lfPitchAndFamily");
+    engine
+        .mem_write(logfont_ptr + 28, b"Lucida Console\0")
+        .expect("write LOGFONTA.lfFaceName");
+    write_regs(&mut engine, logfont_ptr, 0, 0, 0, 0);
+    let id = crate::resolve_winapi_id("gdi32.dll", "CreateFontIndirectA")
+        .expect("CreateFontIndirectA must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("CreateFontIndirectA must dispatch");
+    let font = crate::handles::Hfont::from(r.return_value);
+    assert_ne!(
+        font,
+        crate::handles::Hfont::NULL,
+        "CreateFontIndirectA must return an HFONT"
+    );
+
+    // The pitch hint must land on the font record (FIXED_PITCH bit set).
+    let record = state
+        .gdi_state()
+        .find_font(font)
+        .expect("the returned HFONT must resolve to a font record");
+    assert_ne!(record.pitch & 0x01, 0, "FIXED_PITCH must be recorded");
+
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_SETFONT,
+        font.as_u64(),
+        0,
+    )
+    .expect("setfont handled")
+    .expect("some result");
+
+    // The EDIT's stored-font resolution must land on a monospace face: for a
+    // proportional face (the pre-L8 fallback) max_advance > avg_advance.
+    let mut font_engine = crate::gdi32::FontEngine::default();
+    let (key, resolved) = crate::gdi32::window_font_resolution(&state, edit, &mut font_engine)
+        .expect("the stored Lucida Console font must resolve");
+    assert_eq!(key.family, "lucida console");
+    assert!(
+        key.fixed_pitch,
+        "the FIXED_PITCH bit must reach the FontKey"
+    );
+    assert_eq!(
+        resolved.avg_advance, resolved.max_advance,
+        "Lucida Console+FIXED_PITCH must resolve to a monospace face (avg {} max {})",
+        resolved.avg_advance, resolved.max_advance
     );
 }
 

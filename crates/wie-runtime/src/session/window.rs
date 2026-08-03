@@ -537,6 +537,96 @@ mod tests {
         );
     }
 
+    /// The node-side half of the F4 menu-state round trip: a guest
+    /// `EnableMenuItem` / `CheckMenuItem` mutation dirties the tree, and the
+    /// rebuilt `MenuNode` carries the new enabled/checked flags — the state
+    /// the host bar (`menu_item_states` in wie-cli) turns into muda
+    /// `set_enabled` / `set_checked` calls.
+    #[test]
+    fn menu_node_state_reflects_guest_enable_check_mutations() {
+        let process = wie_pe::ProcessIdentity {
+            module_file_name: "state.exe".to_owned(),
+            module_path: r"C:\App\state.exe".to_owned(),
+            current_directory: r"C:\App".to_owned(),
+            command_line: "state.exe".to_owned(),
+        };
+        let mut winapi_state =
+            crate::memory::default_winapi_state(&DEFAULT_LAYOUT, Arc::new(Vec::new()), &process)
+                .expect("winapi state");
+        let menu_handle = 0x0000_0000_6620_0000_u64;
+        {
+            let ws = winapi_state.window_state();
+            ws.menus.push(MenuRecord {
+                handle: wie_winapi::handles::Hmenu::from(menu_handle),
+                items: vec![MenuEntry::Item {
+                    id: 100,
+                    text: "Paste".to_owned(),
+                    enabled: true,
+                    checked: false,
+                }],
+            });
+            ws.windows.push(wie_winapi::WindowRecord {
+                handle: wie_winapi::handles::Hwnd::from(0x100),
+                menu_handle,
+                ..Default::default()
+            });
+        }
+        let handle = GuestHandle {
+            state: Arc::new(Mutex::new(winapi_state)),
+            queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+            menu_tree_cache: Arc::new(RwLock::new(None)),
+        };
+
+        let first = handle.window_menu_items();
+        let paste = first.first().expect("item");
+        assert!(paste.enabled, "fresh items start enabled");
+        assert!(!paste.checked, "fresh items start unchecked");
+
+        // EnableMenuItem(MF_GRAYED|MF_BYCOMMAND) — greys the item in the
+        // native tree, exactly what the user32 handler's mutate_item does.
+        {
+            let mut state = handle.state.lock().expect("lock state");
+            let ws = state.window_state();
+            let record = ws
+                .menus
+                .iter_mut()
+                .find(|m| m.handle == wie_winapi::handles::Hmenu::from(menu_handle))
+                .expect("menu record");
+            if let Some(MenuEntry::Item { enabled, .. }) = record.items.first_mut() {
+                *enabled = false;
+            }
+            ws.menu_dirty = true;
+        }
+        let greyed = handle.window_menu_items();
+        assert!(
+            !greyed.first().expect("item").enabled,
+            "rebuild must surface the greyed state"
+        );
+
+        // CheckMenuItem(MF_CHECKED|MF_BYCOMMAND) — checks the item.
+        {
+            let mut state = handle.state.lock().expect("lock state");
+            let ws = state.window_state();
+            let record = ws
+                .menus
+                .iter_mut()
+                .find(|m| m.handle == wie_winapi::handles::Hmenu::from(menu_handle))
+                .expect("menu record");
+            if let Some(MenuEntry::Item {
+                enabled, checked, ..
+            }) = record.items.first_mut()
+            {
+                *enabled = false;
+                *checked = true;
+            }
+            ws.menu_dirty = true;
+        }
+        let checked = handle.window_menu_items();
+        let item = checked.first().expect("item");
+        assert!(!item.enabled, "greyed state survives the check mutation");
+        assert!(item.checked, "rebuild must surface the checked state");
+    }
+
     /// `take_host_geometry_request` reads the guest-set pending geometry and
     /// clears the slot (the SetWindowPlacement host-forwarding seam).
     #[test]

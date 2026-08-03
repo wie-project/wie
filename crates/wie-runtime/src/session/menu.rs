@@ -14,6 +14,10 @@ pub struct MenuNode {
     pub id: u32,
     /// Item text (empty for separators).
     pub title: String,
+    /// Whether the item is enabled (`MF_GRAYED`/`MF_DISABLED` clear it).
+    pub enabled: bool,
+    /// Whether the item is checked (`MF_CHECKED`).
+    pub checked: bool,
     /// Submenu items (non-empty only for `MF_POPUP` items).
     pub children: Vec<MenuNode>,
 }
@@ -40,14 +44,26 @@ pub(super) fn build_menu_tree(menus: &[MenuRecord], menu_handle: u64) -> Vec<Men
         .items
         .iter()
         .filter_map(|entry| match entry {
-            MenuEntry::Item { id, text, .. } => Some(MenuNode {
+            MenuEntry::Item {
+                id,
+                text,
+                enabled,
+                checked,
+                ..
+            } => Some(MenuNode {
                 id: *id,
                 title: text.clone(),
+                enabled: *enabled,
+                checked: *checked,
                 children: Vec::new(),
             }),
             MenuEntry::Popup { text, submenu } => Some(MenuNode {
                 id: u32::try_from(submenu.as_u64()).unwrap_or(0),
                 title: text.clone(),
+                // Popups carry no state in the native model (only leaves are
+                // enableable/checkable), so the mirror defaults them.
+                enabled: true,
+                checked: false,
                 children: build_menu_tree(menus, submenu.as_u64()),
             }),
             MenuEntry::Separator => None,

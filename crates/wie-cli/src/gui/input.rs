@@ -61,9 +61,11 @@ pub(crate) const MK_MBUTTON: u16 = 0x0010;
 /// `GetDoubleClickTime` default.
 pub(crate) const DOUBLE_CLICK_TIME_MS: u64 = 500;
 
-/// The double-click slop: the second press must land within this many px of
-/// the first press (the Windows `SM_CXDOUBLECLK` / `SM_CYDOUBLECLK` default
-/// is 4 px).
+/// The double-click slop: the second press must land within this many LOGICAL
+/// 96-DPI pixels of the first press (the Windows `SM_CXDOUBLECLK` /
+/// `SM_CYDOUBLECLK` default is 4 px). Winit reports cursor positions in
+/// PHYSICAL pixels, so the comparison scales this by the window's device
+/// scale factor via [`double_click_slop`].
 pub(crate) const DOUBLE_CLICK_SLOP_PX: f64 = 4.0;
 
 // ---------------------------------------------------------------------------
@@ -81,6 +83,39 @@ pub(crate) fn make_lparam(x: u16, y: u16) -> u64 {
 #[must_use]
 pub(crate) fn make_wparam(lo: u16, hi: u16) -> u64 {
     u64::from(lo) | (u64::from(hi) << 16)
+}
+
+// ---------------------------------------------------------------------------
+// Device-scale-factor conversion
+//
+// The guest window is a LOGICAL 96-DPI surface (the DIB the guest paints);
+// winit reports PHYSICAL pixels. One rounding rule — round half away from
+// zero, `f64::round` — is applied at every physical↔logical boundary so a
+// round-trip never drifts between call sites. At scale factor 1.0 every
+// conversion is the identity for integer input, i.e. byte-identical to the
+// pre-scale-factor behavior.
+// ---------------------------------------------------------------------------
+
+/// Convert a winit PHYSICAL pixel value to a guest LOGICAL (96-DPI) pixel
+/// value: `physical ÷ scale_factor`, rounded half away from zero.
+#[must_use]
+pub(crate) fn physical_to_logical(physical: f64, scale_factor: f64) -> f64 {
+    (physical / scale_factor).round()
+}
+
+/// Convert a guest LOGICAL (96-DPI) pixel value to winit PHYSICAL pixels:
+/// `logical × scale_factor`, rounded half away from zero.
+#[must_use]
+pub(crate) fn logical_to_physical(logical: f64, scale_factor: f64) -> f64 {
+    (logical * scale_factor).round()
+}
+
+/// The double-click slop in PHYSICAL pixels at `scale_factor`: winit cursor
+/// positions are physical, while [`DOUBLE_CLICK_SLOP_PX`] is a logical
+/// 96-DPI distance.
+#[must_use]
+pub(crate) fn double_click_slop(scale_factor: f64) -> f64 {
+    DOUBLE_CLICK_SLOP_PX * scale_factor
 }
 
 // ---------------------------------------------------------------------------
@@ -193,5 +228,59 @@ pub(crate) fn virt_key_from_physical(key: winit::keyboard::PhysicalKey) -> u16 {
         BracketRight => 0xDD,
         Quote => 0xDE,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DOUBLE_CLICK_SLOP_PX, double_click_slop, logical_to_physical, physical_to_logical,
+    };
+
+    /// At scale factor 1.0 the conversions are the identity — the
+    /// pre-scale-factor behavior — for the integer values real input
+    /// produces.
+    #[test]
+    fn unit_scale_factor_is_identity() {
+        for p in [0.0, 1.0, 4.0, 100.0, 480.0, 640.0, 1280.0] {
+            assert_eq!(physical_to_logical(p, 1.0), p);
+            assert_eq!(logical_to_physical(p, 1.0), p);
+        }
+        assert_eq!(double_click_slop(1.0), DOUBLE_CLICK_SLOP_PX);
+    }
+
+    /// logical == physical ÷ sf for exact divisions.
+    #[test]
+    fn logical_is_physical_divided_by_scale() {
+        assert_eq!(physical_to_logical(1280.0, 2.0), 640.0);
+        assert_eq!(physical_to_logical(960.0, 2.0), 480.0);
+        assert_eq!(physical_to_logical(300.0, 1.5), 200.0);
+        assert_eq!(logical_to_physical(640.0, 2.0), 1280.0);
+        assert_eq!(logical_to_physical(480.0, 2.0), 960.0);
+    }
+
+    /// Ties round half away from zero (320.5 → 321, not 320).
+    #[test]
+    fn rounding_is_half_away_from_zero() {
+        assert_eq!(physical_to_logical(641.0, 2.0), 321.0);
+        assert_eq!(physical_to_logical(643.0, 2.0), 322.0);
+        assert_eq!(physical_to_logical(5.0, 2.0), 3.0);
+    }
+
+    /// Round-tripping logical → physical → logical at a 2× factor restores
+    /// the original value.
+    #[test]
+    fn round_trip_at_retina_scale() {
+        for l in [0.0, 1.0, 100.0, 479.0, 480.0, 640.0] {
+            let physical = logical_to_physical(l, 2.0);
+            assert_eq!(physical_to_logical(physical, 2.0), l);
+        }
+    }
+
+    /// The slop scales linearly with the device scale factor.
+    #[test]
+    fn double_click_slop_scales_with_factor() {
+        assert_eq!(double_click_slop(2.0), 8.0);
+        assert_eq!(double_click_slop(1.5), 6.0);
     }
 }

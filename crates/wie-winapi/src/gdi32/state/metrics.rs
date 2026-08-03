@@ -53,12 +53,17 @@ pub fn handle_get_text_metrics_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         let (height, ascent, descent, internal_leading, external_leading, avg_width, max_width) =
             match resolved {
                 Some(resolved) => {
-                    let height = resolved.line_height();
                     let ascent = round_i32(resolved.ascent);
                     // ab_glyph's descent is negative (below the baseline); GDI
                     // reports the positive magnitude.
                     let descent = 0_i32.saturating_sub(round_i32(resolved.descent));
                     let external = round_i32(resolved.line_gap);
+                    // tmHeight = tmAscent + tmDescent (the Windows invariant).
+                    // The external leading is NOT folded in here — line
+                    // spacing is tmHeight + tmExternalLeading, which equals
+                    // the font engine's line_height() (ascent + |descent| +
+                    // gap), the value every line-based API uses.
+                    let height = ascent.saturating_add(descent);
                     // Internal leading: the part of the line height above the
                     // em square (zero for fonts whose typo span fits the em).
                     let internal =

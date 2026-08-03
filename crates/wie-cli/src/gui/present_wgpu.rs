@@ -306,6 +306,7 @@ impl WgpuPresenter {
             width: frame_w_raw,
             height: frame_h_raw,
             pixels,
+            background_color,
         } = frame;
         let frame_w = frame_w_raw.max(1);
         let frame_h = frame_h_raw.max(1);
@@ -377,17 +378,21 @@ impl WgpuPresenter {
                             depth_slice: None,
                             resolve_target: None,
                             ops: wgpu::Operations {
-                                // Clear to white: untouched areas of the
-                                // window (e.g. behind an unmaximized guest
-                                // frame) read as a fresh white surface rather
-                                // than black. The whole surface is redrawn
-                                // every frame and the swapchain target is
-                                // transient, so a clear is cheaper than
-                                // loading the previous frame's contents.
+                                // Clear to the owning window's background
+                                // color (recorded on the frame by the erase
+                                // machinery; falls back to COLOR_WINDOW-white):
+                                // untouched areas of the window (e.g. behind
+                                // an unmaximized guest frame, or resize seams
+                                // the frame does not yet cover) read as the
+                                // window background rather than black. The
+                                // whole surface is redrawn every frame and the
+                                // swapchain target is transient, so a clear is
+                                // cheaper than loading the previous frame's
+                                // contents.
                                 load: wgpu::LoadOp::Clear(wgpu::Color {
-                                    r: 1.0,
-                                    g: 1.0,
-                                    b: 1.0,
+                                    r: color_channel(background_color, 16),
+                                    g: color_channel(background_color, 8),
+                                    b: color_channel(background_color, 0),
                                     a: 1.0,
                                 }),
                                 store: wgpu::StoreOp::Store,
@@ -467,4 +472,12 @@ impl WgpuPresenter {
             bind_group,
         })
     }
+}
+
+/// Extract one 0RGB channel (bits `shift..shift+8` of an `0x00RRGGBB` u32)
+/// as a normalized `f64` for the wgpu clear color.
+#[must_use]
+fn color_channel(background_color: u32, shift: u32) -> f64 {
+    let byte = u8::try_from((background_color >> shift) & 0xFF).unwrap_or(u8::MAX);
+    f64::from(byte) / 255.0
 }

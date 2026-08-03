@@ -10,8 +10,8 @@ use super::{
     Result, WM_CHAR, WM_CLOSE, WM_DEADCHAR, WM_DESTROY, WM_ERASEBKGND, WM_GETFONT, WM_KEYDOWN,
     WM_KEYUP, WM_MDICREATE, WM_PAINT, WM_QUIT, WM_SETFONT, WM_SYSCHAR, WM_SYSDEADCHAR,
     WM_SYSKEYDOWN, WM_SYSKEYUP, WinApiControlSignal, WinApiHandlerResult, WinApiState, WinMsg,
-    checked_field_address, create_mdi_child_from_struct, dispatch_control_proc, find_window_mut,
-    is_known_window, read_guest_u32, read_guest_u64, write_message_structure,
+    checked_field_address, create_mdi_child_from_struct, dispatch_control_proc, find_window,
+    find_window_mut, is_known_window, read_guest_u32, read_guest_u64, write_message_structure,
 };
 use crate::OuterReturn;
 use crate::state::WindowFlags;
@@ -720,10 +720,23 @@ pub(crate) fn handle_default_window_procedure(
         }
         WinMsg::WM_GETFONT => super::window::window_font(state, hwnd),
         WinMsg::WM_PAINT => {
-            // Validate the window to prevent livelock
+            // F2 no-black: DefWindowProc validates the window, but it must
+            // also honor the pending erase — real Windows runs WM_ERASEBKGND
+            // before WM_PAINT, and when the guest swallowed the erase
+            // (RNotepad returns 1 from WM_ERASEBKGND without erasing) the
+            // class brush never fired. Without this, a zero-initialized DIB
+            // publishes unpainted black. The erase fills the client with the
+            // class-brush color (or the system background color when the
+            // class has no brush); a later guest repaint overwrites it.
+            let erase_pending = find_window(state, hwnd)
+                .is_some_and(|window| window.flags.contains(WindowFlags::ERASE_BACKGROUND));
+            if erase_pending && !erase_window_background(state, hwnd) {
+                erase_with_system_background(state, hwnd);
+            }
             if let Some(window) = find_window_mut(state, hwnd) {
                 window.invalidated = false;
-                // No BeginPaint ran: the pending erase has no consumer.
+                // `erase_window_background` consumes the flag when it filled;
+                // clear it here for the no-brush fallback (nothing to erase).
                 window.flags.remove(WindowFlags::ERASE_BACKGROUND);
             }
             0
@@ -759,6 +772,40 @@ pub(crate) fn handle_default_window_procedure(
         return_value,
     })
 }
+
+/// F2 no-black fallback: fill `hwnd`'s background with the system default
+/// (`COLOR_WINDOW`) when its class has no brush.
+///
+/// `erase_window_background` no-ops for brush-less classes (it returns
+/// `false`, matching DefWindowProc's WM_ERASEBKGND result of 0), but the
+/// WM_PAINT path must still prevent a zero-initialized DIB from publishing
+/// unpainted black. The fill covers the window's rect inside the owning
+/// surface; like the class-brush erase, the color is recorded as the
+/// surface's background so the presenter clears with it.
+fn erase_with_system_background(state: &mut WinApiState, hwnd: u64) {
+    let Some(info) = crate::gdi32::resolve_window_ancestor(state, hwnd) else {
+        return;
+    };
+    let (width, height) =
+        find_window(state, hwnd).map_or((0, 0), |window| (window.width, window.height));
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    let color = crate::user32::sys_color(5); // COLOR_WINDOW — white
+    crate::gdi32::fill_rect_surface(
+        state,
+        info.hwnd,
+        info.width,
+        info.height,
+        info.offset_x,
+        info.offset_y,
+        width,
+        height,
+        color,
+    );
+    state.present().set_background_color(info.hwnd, color);
+}
+
 /// Handles `USER32.dll!DefWindowProcA`.
 pub fn handle_def_window_proc_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     handle_default_window_procedure(ctx, "DefWindowProcA")
@@ -1030,4 +1077,374 @@ pub fn handle_dispatch_message_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 /// Handles `USER32.dll!PostMessageW`.
 pub fn handle_post_message_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     handle_post_message_a(ctx)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::handle_default_window_procedure;
+    use crate::guest_heap::GuestHeap;
+    use crate::handles::Hwnd;
+    use crate::present::MessageQueue;
+    use crate::state::{
+        FileIoState, HeapState, KernelState as KernelStateT, ModuleState, ProcessState,
+        WinApiEnvironment, WindowClassRecord, WindowFlags,
+    };
+    use crate::sync_obj::SyncState;
+    use crate::thread::ThreadState;
+    use crate::user32::{CreateWindowRequest, WindowClassIdentifier, find_window_mut};
+    use crate::vfs::VolumeConfig;
+    use crate::{DEFAULT_ENVIRONMENT, DllStateMap, HandlerContext, WinApiState, present};
+    use ahash::HashMap;
+    use ahash::HashMapExt;
+    use std::sync::{Arc, Mutex};
+    use wie_cpu::{CpuEngine, IcedCpu};
+
+    const STACK_VA: u64 = 0x100_0000;
+    const STACK_SIZE: usize = 0x1_0000;
+    const STACK_TOP: u64 = 0x100_FF00;
+
+    /// Minimal engine for handler tests: guest pages + a return address.
+    fn test_engine() -> IcedCpu {
+        let mut cpu = IcedCpu::open_x86_64();
+        cpu.mem_map(0x1000, 0x10_0000, wie_cpu::RwxPerms::ALL)
+            .expect("map test memory");
+        cpu.mem_map(STACK_VA, STACK_SIZE, wie_cpu::RwxPerms::ALL)
+            .expect("map test stack");
+        cpu.mem_write(STACK_TOP, &0_u64.to_le_bytes())
+            .expect("write return address");
+        cpu.write_rsp(STACK_TOP).ok();
+        cpu
+    }
+
+    fn write_regs(cpu: &mut IcedCpu, rcx: u64, rdx: u64, r8: u64, r9: u64) {
+        cpu.write_rcx(rcx).ok();
+        cpu.write_rdx(rdx).ok();
+        cpu.write_r8(r8).ok();
+        cpu.write_r9(r9).ok();
+        cpu.write_rsp(STACK_TOP).ok();
+    }
+
+    fn test_env() -> WinApiEnvironment {
+        WinApiEnvironment {
+            image_base: 0,
+            command_line_a_ptr: 0,
+            command_line_w_ptr: 0,
+            environment_strings_w_ptr: 0,
+            module_file_name_a_ptr: 0,
+            module_file_name_w_ptr: 0,
+            process_heap_handle: 0,
+        }
+    }
+
+    fn test_state() -> WinApiState {
+        WinApiState {
+            heap_state: HeapState {
+                heap: GuestHeap::new(0x2000, 0x10000),
+                next_fls_index: 0,
+                fls_slots: Vec::new(),
+                guest_fls_table_va: 0,
+            },
+            file_io: FileIoState {
+                executable_file_size: 0,
+                executable_file_bytes: Arc::new(Vec::new()),
+                executable_file_cursor: 0,
+                next_find_handle: crate::FindFileHandle::from(0),
+                find_handles: Vec::new(),
+                host_file_mounts: Vec::new(),
+                virtual_files: Vec::new(),
+                open_files: HashMap::new(),
+                next_file_handle: crate::FileHandle::from(0),
+                next_resource_handle: crate::ResourceHandle::from(0),
+                resources: Vec::new(),
+                current_directory_wide: Vec::new(),
+                bottle_root: None,
+                volumes: VolumeConfig::default(),
+                guest_file_data_next: 0,
+                guest_io: None,
+                stdin_bytes: Vec::new(),
+                stdin_cursor: 0,
+                stdin_mode: crate::GuestStdinMode::InjectOnly,
+                ucrt_files: HashMap::new(),
+                ucrt_next_file_va: 0x0000_0000_6900_0000,
+                cached_streams: HashMap::new(),
+            },
+            process: ProcessState {
+                last_error: 0,
+                next_registry_key_handle: crate::RegistryKeyHandle::from(0),
+                registry_keys: Vec::new(),
+                main_module_file_name: String::new(),
+                main_module_path: String::new(),
+                main_module_host_dir: None,
+                error_mode: 0,
+                suspended_threads: HashMap::new(),
+                environment: DEFAULT_ENVIRONMENT
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .collect(),
+                main_module_dialogs: Vec::new(),
+                main_module_menus: Vec::new(),
+                main_module_strings: Vec::new(),
+                main_module_accelerators: Vec::new(),
+            },
+            kernel: KernelStateT {
+                threads: ThreadState::primary(),
+                sync: SyncState::new(),
+                seh_pending: HashMap::new(),
+            },
+            dll_states: DllStateMap::new(),
+            message_queue: Arc::new(Mutex::new(MessageQueue::default())),
+            module_state: ModuleState {
+                loaded_modules: HashMap::new(),
+                import_resolver: None,
+                get_proc_address_cache: HashMap::new(),
+                next_module_handle: crate::ModuleHandle::from(
+                    crate::dll_loader::REAL_MODULE_HANDLE_BASE,
+                ),
+            },
+        }
+    }
+
+    /// Register a class with the classic `(HBRUSH)(COLOR_x + 1)` stock brush
+    /// (`brush`; 6 = COLOR_WINDOW white, 7 = COLOR_WINDOWTEXT black) and
+    /// create a shown top-level window from it — notepad's main-window
+    /// pattern. Returns the HWND.
+    fn push_brush_window(
+        state: &mut WinApiState,
+        class_name: &str,
+        brush: u64,
+        width: i32,
+        height: i32,
+    ) -> u64 {
+        let atom = crate::user32::register_window_class(
+            state,
+            WindowClassRecord {
+                atom: 0,
+                class_name: class_name.to_owned(),
+                window_proc: 0x7000_0000,
+                style: 0,
+                instance_handle: 0,
+                icon_handle: 0,
+                cursor_handle: 0,
+                background_brush: brush,
+                small_icon_handle: 0,
+                menu_name: 0,
+                unicode: true,
+            },
+        )
+        .expect("register class");
+        let (hwnd, _, _) = crate::user32::create_window_record(
+            state,
+            CreateWindowRequest {
+                class_identifier: WindowClassIdentifier::Name(class_name.to_owned()),
+                title: "Test".to_owned(),
+                style: 0,
+                extended_style: 0,
+                parent_handle: 0,
+                menu_handle: 0,
+                instance_handle: 0,
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+            true,
+        )
+        .expect("create window");
+        assert_ne!(atom, 0, "class registration must succeed");
+        if let Some(window) = find_window_mut(state, hwnd) {
+            window.visible = true;
+        }
+        hwnd
+    }
+
+    /// Mark `hwnd` invalidated with a pending erase — what a resize
+    /// (`InvalidateRect` bErase, `SetWindowPlacement`, ...) leaves behind.
+    fn mark_erase_pending(state: &mut WinApiState, hwnd: u64) {
+        if let Some(window) = find_window_mut(state, hwnd) {
+            window.invalidated = true;
+            window.flags.insert(WindowFlags::ERASE_BACKGROUND);
+        }
+    }
+
+    /// Drive DefWindowProc with `WM_PAINT` exactly like the guest's dispatch
+    /// would after a WndProc fall-through.
+    fn dispatch_wm_paint(engine: &mut IcedCpu, state: &mut WinApiState, hwnd: u64) {
+        let message = u64::from(crate::user32::WinMsg::WM_PAINT.as_u32());
+        write_regs(engine, hwnd, message, 0, 0);
+        handle_default_window_procedure(
+            &mut HandlerContext::new(engine, test_env(), state),
+            "DefWindowProcW",
+        )
+        .expect("DefWindowProc WM_PAINT");
+    }
+
+    /// An empty frame for the headless record slot.
+    fn empty_record() -> present::SurfaceFrame {
+        present::SurfaceFrame {
+            width: 0,
+            height: 0,
+            pixels: Arc::new(Vec::new()),
+            background_color: 0x00FF_FFFF,
+        }
+    }
+
+    fn published_frame(state: &mut WinApiState, hwnd: u64) -> present::SurfaceFrame {
+        state
+            .present()
+            .published
+            .get(&Hwnd::from(hwnd))
+            .cloned()
+            .expect("published frame")
+    }
+
+    #[test]
+    fn def_window_proc_paint_erases_pending_class_brush_background() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        let hwnd = push_brush_window(&mut state, "WhiteBrush", 6, 64, 32);
+        mark_erase_pending(&mut state, hwnd);
+        state.present().record = Some(Box::new(empty_record()));
+
+        dispatch_wm_paint(&mut engine, &mut state, hwnd);
+        state.present().drain_pending_publishes();
+
+        // F2: the erase filled the whole client with COLOR_WINDOW-white —
+        // zero unpainted-black pixels in the published frame.
+        let frame = published_frame(&mut state, hwnd);
+        assert_eq!((frame.width, frame.height), (64, 32));
+        assert_eq!(frame.background_color, 0x00FF_FFFF);
+        assert!(
+            !frame.pixels.contains(&0x0000_0000),
+            "idle frame must contain no black pixels"
+        );
+        assert!(
+            frame.pixels.iter().all(|&px| px == 0x00FF_FFFF),
+            "the class-brush erase fills every pixel white"
+        );
+        let recorded = state.present().record.as_ref().expect("recorded frame");
+        assert!(
+            !recorded.pixels.contains(&0x0000_0000),
+            "the headless record slot carries the same no-black frame"
+        );
+        // The erase consumed the pending-erase flag; a second WM_PAINT must
+        // not re-erase (no double fill).
+        let window = state
+            .window_state()
+            .windows
+            .iter()
+            .find(|w| w.handle == Hwnd::from(hwnd))
+            .expect("window record");
+        assert!(!window.flags.contains(WindowFlags::ERASE_BACKGROUND));
+    }
+
+    #[test]
+    fn def_window_proc_paint_without_pending_erase_skips_fill() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        let hwnd = push_brush_window(&mut state, "NoEraseClass", 6, 64, 32);
+        // No ERASE_BACKGROUND: the window was already erased or never
+        // invalidated — DefWindowProc must only validate, not fill.
+        dispatch_wm_paint(&mut engine, &mut state, hwnd);
+        assert_eq!(state.present().drain_pending_publishes(), 0);
+        assert!(state.present().surfaces.is_empty(), "no erase, no surface");
+    }
+
+    #[test]
+    fn def_window_proc_paint_erases_brushless_window_with_system_background() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        // An unregistered class name → no class brush (class_atom 0).
+        let (hwnd, _, _) = crate::user32::create_window_record(
+            &mut state,
+            CreateWindowRequest {
+                class_identifier: WindowClassIdentifier::Name("Brushless".to_owned()),
+                title: "Brushless".to_owned(),
+                style: 0,
+                extended_style: 0,
+                parent_handle: 0,
+                menu_handle: 0,
+                instance_handle: 0,
+                x: 0,
+                y: 0,
+                width: 48,
+                height: 24,
+            },
+            true,
+        )
+        .expect("create window");
+        mark_erase_pending(&mut state, hwnd);
+
+        dispatch_wm_paint(&mut engine, &mut state, hwnd);
+        state.present().drain_pending_publishes();
+
+        // F2 fallback: no class brush → fill with the system background
+        // (COLOR_WINDOW white) so the DIB still never publishes black.
+        let frame = published_frame(&mut state, hwnd);
+        assert_eq!(frame.background_color, 0x00FF_FFFF);
+        assert!(
+            !frame.pixels.contains(&0x0000_0000),
+            "brush-less windows still erase to the system background"
+        );
+    }
+
+    #[test]
+    fn resize_then_idle_frame_is_fully_painted() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        let hwnd = push_brush_window(&mut state, "ResizeClass", 6, 64, 32);
+        mark_erase_pending(&mut state, hwnd);
+        dispatch_wm_paint(&mut engine, &mut state, hwnd);
+        state.present().drain_pending_publishes();
+        let first = published_frame(&mut state, hwnd);
+        assert_eq!((first.width, first.height), (64, 32));
+        assert!(!first.pixels.contains(&0x0000_0000));
+
+        // Resize: the window grows, the DIB reallocates zeroed (black until
+        // repainted), and the geometry path leaves an erase pending.
+        if let Some(window) = find_window_mut(&mut state, hwnd) {
+            window.width = 128;
+            window.height = 64;
+            window.invalidated = true;
+            window.flags.insert(WindowFlags::ERASE_BACKGROUND);
+        }
+
+        dispatch_wm_paint(&mut engine, &mut state, hwnd);
+        state.present().drain_pending_publishes();
+
+        // The resize-then-idle frame is fully painted at the new size — no
+        // black seams from the zeroed realloc.
+        let resized = published_frame(&mut state, hwnd);
+        assert_eq!((resized.width, resized.height), (128, 64));
+        assert!(
+            !resized.pixels.contains(&0x0000_0000),
+            "resize-then-idle frame must be fully painted"
+        );
+        assert!(
+            resized.pixels.iter().all(|&px| px == 0x00FF_FFFF),
+            "every pixel is the erased background after the resize"
+        );
+    }
+
+    #[test]
+    fn black_class_brush_erases_black_and_records_it() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        // brush 7 = (HBRUSH)(COLOR_WINDOWTEXT + 1) → genuinely black.
+        let hwnd = push_brush_window(&mut state, "BlackClass", 7, 16, 16);
+        mark_erase_pending(&mut state, hwnd);
+
+        dispatch_wm_paint(&mut engine, &mut state, hwnd);
+        state.present().drain_pending_publishes();
+
+        // This is the invariant's "legitimately black content" case: the
+        // erase honors the window's own brush, and the frame records the
+        // black background so the presenter clears with it (not white).
+        let frame = published_frame(&mut state, hwnd);
+        assert_eq!(frame.background_color, 0x0000_0000);
+        assert!(
+            frame.pixels.iter().all(|&px| px == 0x0000_0000),
+            "a black-brush window is legitimately black"
+        );
+    }
 }

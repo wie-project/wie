@@ -149,7 +149,10 @@ fn canonical_family_name<'a>(db: &'a fontdb::Database, name: &str) -> Option<&'a
 /// Returns `(face_id, fake_bold, fake_italic)`. Weight falls back 700 → 400;
 /// style falls back Italic → Oblique → Normal. A named face that the database
 /// resolves keeps its exact resolution; on a miss it falls back to sans-serif
-/// — or monospace when the LOGFONT carried FIXED_PITCH.
+/// — or monospace when the LOGFONT carried FIXED_PITCH. FIXED_PITCH also
+/// rejects proportional faces: Windows substitutes a fixed-pitch font rather
+/// than honor a proportional face with the requested name, so a hit whose
+/// face is not monospaced is skipped for the monospace fallback.
 fn face_id_for(
     selection: &FamilySelection,
     weight: u16,
@@ -157,48 +160,62 @@ fn face_id_for(
     fixed_pitch: bool,
 ) -> Option<(fontdb::ID, bool, bool)> {
     let db = system_font_db();
-    let families: Vec<Family<'_>> = match selection {
-        FamilySelection::Generic(family) => vec![*family],
-        FamilySelection::Named(name) => {
-            // Exact name first; then the same face under its canonical
-            // (database) spelling, so a lowercased query still resolves to a
-            // capitalized face; a generic family is the last resort. A
-            // FIXED_PITCH request falls back to monospace, not sans-serif.
-            let fallback = if fixed_pitch {
-                Family::Monospace
-            } else {
-                Family::SansSerif
-            };
-            let mut families = vec![Family::Name(name)];
-            if let Some(canonical) = canonical_family_name(db, name)
-                && canonical != name
-            {
-                families.push(Family::Name(canonical));
-            }
-            families.push(fallback);
-            families
-        }
-    };
     let weights: &[u16] = if weight >= 600 { &[700, 400] } else { &[400] };
     let styles: &[Style] = if italic {
         &[Style::Italic, Style::Oblique, Style::Normal]
     } else {
         &[Style::Normal]
     };
-    for &w in weights {
-        for &style in styles {
-            let query = Query {
-                families: &families,
-                weight: Weight(w),
-                stretch: Stretch::Normal,
-                style,
-            };
-            if let Some(id) = db.query(&query) {
-                return Some((id, w != weight, italic && style == Style::Normal));
+    // Query `families` in order, returning the first hit that satisfies the
+    // requested weight/style — and, under FIXED_PITCH, is an actual monospaced
+    // face. A proportional hit (e.g. "Helvetica" on macOS answering a
+    // FIXED_PITCH "helvetica") is skipped so the request can fall through to
+    // the generic monospace, matching Windows' pitch-substitution behavior.
+    let first_hit = |families: &[Family<'_>]| -> Option<(fontdb::ID, bool, bool)> {
+        for &w in weights {
+            for &style in styles {
+                let query = Query {
+                    families,
+                    weight: Weight(w),
+                    stretch: Stretch::Normal,
+                    style,
+                };
+                if let Some(id) = db.query(&query) {
+                    let monospaced = db.face(id).is_some_and(|info| info.monospaced);
+                    if fixed_pitch && !monospaced {
+                        continue;
+                    }
+                    return Some((id, w != weight, italic && style == Style::Normal));
+                }
             }
         }
+        None
+    };
+    match selection {
+        FamilySelection::Generic(family) => first_hit(std::slice::from_ref(family)),
+        FamilySelection::Named(name) => {
+            // Exact name first; then the same face under its canonical
+            // (database) spelling, so a lowercased query still resolves to a
+            // capitalized face; the generic family is the last resort. A
+            // FIXED_PITCH request falls back to monospace, not sans-serif.
+            let mut families = Vec::with_capacity(3);
+            families.push(Family::Name(name));
+            if let Some(canonical) = canonical_family_name(db, name)
+                && canonical != name
+            {
+                families.push(Family::Name(canonical));
+            }
+            if let Some(hit) = first_hit(&families) {
+                return Some(hit);
+            }
+            let fallback = if fixed_pitch {
+                Family::Monospace
+            } else {
+                Family::SansSerif
+            };
+            first_hit(std::slice::from_ref(&fallback))
+        }
     }
-    None
 }
 
 /// Load a face into an owned `FontArc` (honoring the face index for `.ttc`).
@@ -315,7 +332,8 @@ pub struct ResolvedFont {
     pub ascent: f32,
     /// Descent in px.
     pub descent: f32,
-    /// Line gap in px (exposed as `tmExternalLeading`).
+    /// Line gap in px (added into [`ResolvedFont::line_height`] and exposed
+    /// as `tmExternalLeading`).
     pub line_gap: f32,
     /// Average advance (px) of `x` and `m`.
     pub avg_advance: i32,
@@ -335,11 +353,18 @@ impl ResolvedFont {
         self.font.as_scaled(PxScale::from(self.scale))
     }
 
-    /// Line height in px: ascent + |descent| (ab_glyph's descent is negative
-    /// — below the baseline). One value used by every line based API;
-    /// `line_gap` is exposed separately as external leading.
+    /// Line height in px: ascent + |descent| + external leading.
+    ///
+    /// This is GDI's line pitch, `tmHeight + tmExternalLeading`: ab_glyph's
+    /// descent is negative (below the baseline) so its magnitude is
+    /// subtracted, and the line gap is ADDED (not merely exposed separately
+    /// — the pre-fix height measured only the ascent/descent span, tighter
+    /// than Windows). One value used by every line-based API (EDIT rows,
+    /// DT_CALCRECT, control paint).
     pub(crate) fn line_height(&self) -> i32 {
-        round_px(self.ascent).saturating_sub(round_px(self.descent))
+        round_px(self.ascent)
+            .saturating_sub(round_px(self.descent))
+            .saturating_add(round_px(self.line_gap))
     }
 }
 
@@ -752,29 +777,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fixed_pitch_keeps_resolvable_named_faces() {
-        // FIXED_PITCH must NOT force the generic monospace fallback when the
-        // requested named face actually resolves — the exact face wins and
-        // the fallback only kicks in on a miss. The family is picked from the
-        // host font database (any machine), so the property is proven without
-        // depending on a specific installed face.
-        let Some(name) = any_system_family() else {
-            return; // no fonts at all — nothing to prove
-        };
-        let named = super::FamilySelection::Named(name);
-        let Some((with, _, _)) = face_id_for(&named, 400, false, true) else {
-            return;
-        };
-        let Some((without, _, _)) = face_id_for(&named, 400, false, false) else {
-            return;
-        };
-        assert_eq!(
-            with, without,
-            "a resolvable named face must resolve identically with FIXED_PITCH"
-        );
-    }
-
     /// A real family name from the system font database, for tests that need
     /// a resolvable named face on ANY host. Prefers a mixed-case name so the
     /// lowercase-vs-canonical distinction is meaningful; `None` only when the
@@ -925,6 +927,65 @@ mod tests {
     }
 
     #[test]
+    fn line_height_includes_external_leading() {
+        // F3: the EDIT line pitch is GDI's tmHeight + tmExternalLeading — the
+        // ascent/descent span PLUS the line gap. Before the fix the gap was
+        // parsed and exposed separately but never added, so every line-based
+        // measure was tighter than Windows'. Any resolvable face with a
+        // non-zero (rounded) gap demonstrates the property on any host; hosts
+        // whose faces all have zero leading (console faces) skip.
+        let mut engine = FontEngine::default();
+        let db = super::system_font_db();
+        let gap_family = db.faces().find_map(|face| {
+            let family = face
+                .families
+                .first()
+                .map(|(name, _)| name.to_ascii_lowercase())
+                .unwrap_or_default();
+            let key = FontKey {
+                family,
+                weight: 400,
+                italic: false,
+                fixed_pitch: false,
+            };
+            if super::round_px(engine.resolve(&key, 16)?.line_gap) != 0 {
+                Some(key.family)
+            } else {
+                None
+            }
+        });
+        let Some(family) = gap_family else {
+            return; // every face's leading rounds to zero — nothing to prove
+        };
+        let key = FontKey {
+            family,
+            weight: 400,
+            italic: false,
+            fixed_pitch: false,
+        };
+        let Some(resolved) = engine.resolve(&key, 16) else {
+            return;
+        };
+        // tmHeight = round(ascent) + round(|descent|); tmExternalLeading =
+        // round(line_gap). Their sum is the Windows line pitch and must equal
+        // line_height() exactly.
+        let span =
+            super::round_px(resolved.ascent).saturating_sub(super::round_px(resolved.descent));
+        let with_leading = span.saturating_add(super::round_px(resolved.line_gap));
+        assert_eq!(
+            resolved.line_height(),
+            with_leading,
+            "line height must equal tmHeight + tmExternalLeading (gap {:.2})",
+            resolved.line_gap
+        );
+        assert_ne!(
+            resolved.line_height(),
+            span,
+            "the pre-fix height omitted the external leading"
+        );
+    }
+
+    #[test]
     fn weight_threshold() {
         assert_eq!(fontdb_weight_for(0), 400);
         assert_eq!(fontdb_weight_for(400), 400);
@@ -933,5 +994,86 @@ mod tests {
         assert_eq!(fontdb_weight_for(700), 700);
         assert_eq!(fontdb_weight_for(1000), 700);
         assert_eq!(fontdb_weight_for(i32::MIN), 400);
+    }
+
+    #[test]
+    fn fixed_pitch_named_proportional_face_falls_back_to_monospace() {
+        // F3: Windows never returns a proportional face for a FIXED_PITCH
+        // request — GDI substitutes a fixed-pitch font instead. A named
+        // proportional family that IS present on the host (e.g. "Helvetica"
+        // on macOS) must therefore fall back to the generic monospace, never
+        // resolve to itself. The family is picked from the host database, so
+        // any machine works; the test skips when no proportional or no
+        // monospace face exists.
+        let db = super::system_font_db();
+        let Some(prop_name) = db
+            .faces()
+            .find(|face| !face.monospaced)
+            .and_then(|face| face.families.first().map(|(name, _)| name.clone()))
+        else {
+            return; // no proportional face on this system
+        };
+        let Some((mono_id, _, _)) = face_id_for(
+            &super::FamilySelection::Generic(Family::Monospace),
+            400,
+            false,
+            false,
+        ) else {
+            return; // no monospace face on this system
+        };
+        let named = super::FamilySelection::Named(prop_name);
+        // The family must really be present AND proportional, or the test
+        // proves nothing: without FIXED_PITCH the plain request resolves to
+        // that same (proportional) face.
+        let Some((plain_id, _, _)) = face_id_for(&named, 400, false, false) else {
+            return;
+        };
+        assert_ne!(
+            plain_id, mono_id,
+            "the chosen family must be proportional for this test to bite"
+        );
+        // FIXED_PITCH must skip the proportional face and land on the generic
+        // monospace (the pre-fix behavior returned the proportional face).
+        let Some((with, _, _)) = face_id_for(&named, 400, false, true) else {
+            return;
+        };
+        assert_eq!(
+            with, mono_id,
+            "a FIXED_PITCH request for a proportional named face must fall back to monospace"
+        );
+    }
+
+    #[test]
+    fn fixed_pitch_keeps_resolvable_monospace_named_faces() {
+        // FIXED_PITCH must NOT force the generic monospace fallback when the
+        // requested named face actually resolves AND is monospaced — the exact
+        // face wins; only proportional faces fall back. The family is picked
+        // from the host font database (any machine), so the property is proven
+        // without depending on a specific installed face.
+        let db = super::system_font_db();
+        let Some(name) = db
+            .faces()
+            .find(|face| face.monospaced)
+            .and_then(|face| face.families.first().map(|(name, _)| name.clone()))
+        else {
+            return; // no monospace face on this system
+        };
+        let named = super::FamilySelection::Named(name);
+        let Some((with, _, _)) = face_id_for(&named, 400, false, true) else {
+            return;
+        };
+        let Some((without, _, _)) = face_id_for(&named, 400, false, false) else {
+            return;
+        };
+        assert_eq!(
+            with, without,
+            "a resolvable monospace named face must resolve identically with FIXED_PITCH"
+        );
+        assert!(
+            super::system_font_db()
+                .face(with)
+                .is_some_and(|info| info.monospaced),
+            "the resolved face must actually be monospaced"
+        );
     }
 }

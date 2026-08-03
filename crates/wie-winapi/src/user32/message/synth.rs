@@ -397,6 +397,10 @@ pub(crate) fn erase_window_background(state: &mut WinApiState, hwnd: u64) -> boo
     let Some(info) = resolve_window_ancestor(state, hwnd) else {
         return true;
     };
+    // F2 no-black: record the erase color as the owning surface's background
+    // so the presenter clears its surface with it — regions the frame does
+    // not cover (resize seams, pre-first-paint) never read black.
+    state.present().set_background_color(info.hwnd, color);
     let (width, height) =
         find_window(state, hwnd).map_or((0, 0), |window| (window.width, window.height));
     if width <= 0 || height <= 0 {
