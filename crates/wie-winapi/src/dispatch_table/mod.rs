@@ -423,9 +423,19 @@ pub enum WinApiId {
     D3d9Idirect3dvertexshader9Release = 405,
     /// Appended here (not adjacent to Kernel32Getstartupinfoa) to avoid renumbering the entire enum.
     Kernel32Getstartupinfow = 406,
+    /// Appended here (not adjacent to Kernel32Getuserdefaultlangid) to avoid renumbering the entire enum.
+    Kernel32Getuserdefaultuilanguage = 407,
+    /// Appended here (not adjacent to User32Getdlgitemw) to avoid renumbering the entire enum.
+    User32Registerwindowmessagea = 408,
+    /// Appended here (not adjacent to User32Registerwindowmessagea) to avoid renumbering the entire enum.
+    User32Registerwindowmessagew = 409,
+    /// Appended here (not adjacent to User32Getdlgitemw) to avoid renumbering the entire enum.
+    User32Loadstringa = 410,
+    /// Appended here (not adjacent to User32Loadstringa) to avoid renumbering the entire enum.
+    User32Loadstringw = 411,
 }
 
-pub const WINAPI_ID_COUNT: usize = 407;
+pub const WINAPI_ID_COUNT: usize = 412;
 
 impl WinApiId {
     /// Discriminant as `u16` (`#[repr(u16)]`).
@@ -464,7 +474,7 @@ const _: () = assert!(
 );
 
 /// Highest-numbered [`WinApiId`]; update alongside the enum's final variant.
-const LAST_WINAPI_ID: WinApiId = WinApiId::Kernel32Getstartupinfow;
+const LAST_WINAPI_ID: WinApiId = WinApiId::User32Loadstringw;
 
 /// Hot-path dispatch: dense `u16` match over the `WinApiId` discriminant
 /// (LLVM jump table) with no string comparison — runs once per host API stop.
@@ -479,6 +489,9 @@ pub fn dispatch_winapi_id(
         WinApiId::Kernel32Getcommandlinew => kernel32::handle_get_command_line_w(ctx),
         WinApiId::Kernel32Getstartupinfoa => kernel32::handle_get_startup_info_a(ctx),
         WinApiId::Kernel32Getstartupinfow => kernel32::handle_get_startup_info_w(ctx),
+        WinApiId::Kernel32Getuserdefaultuilanguage => {
+            kernel32::handle_get_user_default_ui_language(ctx)
+        }
         WinApiId::Kernel32Getprocessheap => kernel32::handle_get_process_heap(ctx),
         WinApiId::Kernel32Getsystemtimeasfiletime => {
             kernel32::handle_get_system_time_as_file_time(ctx)
@@ -940,6 +953,10 @@ pub fn dispatch_winapi_id(
         WinApiId::User32Setdlgitemtextw => user32::handle_set_dlg_item_text_w(ctx),
         WinApiId::User32Defdlgproca => user32::handle_def_dlg_proc_a(ctx),
         WinApiId::User32Defdlgprocw => user32::handle_def_dlg_proc_w(ctx),
+        WinApiId::User32Registerwindowmessagea => user32::handle_register_window_message_a(ctx),
+        WinApiId::User32Registerwindowmessagew => user32::handle_register_window_message_w(ctx),
+        WinApiId::User32Loadstringa => user32::handle_load_string_a(ctx),
+        WinApiId::User32Loadstringw => user32::handle_load_string_w(ctx),
     }
 }
 

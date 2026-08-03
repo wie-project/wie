@@ -127,6 +127,7 @@ fn winapi_state_default() -> WinApiState {
                 .collect(),
             main_module_dialogs: Vec::new(),
             main_module_menus: Vec::new(),
+            main_module_strings: Vec::new(),
         },
         kernel: KernelState {
             threads: ThreadState::primary(),
@@ -391,6 +392,186 @@ fn test_get_startup_info_w_writes_startupinfow() {
         .mem_read(info_ptr + 64, &mut show_window)
         .expect("read wShowWindow");
     assert_eq!(u16::from_le_bytes(show_window), 1);
+}
+
+#[test]
+fn test_get_user_default_ui_language_returns_lang_id() {
+    // Full dispatch path: name resolution (names.rs) → dense id → handler arm.
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // GetUserDefaultUILanguage takes no arguments.
+    write_regs(&mut engine, 0, 0, 0, 0, 0);
+    // Sentinel return address so the handler's pop is observable (test_engine
+    // defaults to 0).
+    engine
+        .mem_write(STACK_TOP, &0x1234_5678_u64.to_le_bytes())
+        .expect("write sentinel return address");
+    let id = crate::resolve_winapi_id("kernel32.dll", "GetUserDefaultUILanguage")
+        .expect("GetUserDefaultUILanguage must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("GetUserDefaultUILanguage must dispatch");
+    assert_eq!(
+        r.return_address, 0x1234_5678,
+        "handler must return past the call"
+    );
+    // UI language LANGID matches GetUserDefaultLangID (fixed en-US guest): 0x0409.
+    assert_eq!(r.return_value, 0x0409, "UI language must be LANG_EN_US");
+}
+
+/// Write a NUL-terminated UTF-16LE guest string at `addr`.
+fn write_guest_utf16(engine: &mut IcedCpu, addr: u64, s: &str) {
+    let mut bytes: Vec<u8> = Vec::new();
+    for unit in s.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    engine
+        .mem_write(addr, &bytes)
+        .expect("write guest UTF-16 string");
+}
+
+/// Write a NUL-terminated ANSI/UTF-8 guest string at `addr`.
+fn write_guest_ansi(engine: &mut IcedCpu, addr: u64, s: &str) {
+    let mut bytes = s.as_bytes().to_vec();
+    bytes.push(0);
+    engine
+        .mem_write(addr, &bytes)
+        .expect("write guest ANSI string");
+}
+
+/// Run `RegisterWindowMessageA/W` through the full dispatch path and return
+/// the handler's return value.
+fn register_window_message(
+    library: &str,
+    name: &str,
+    state: &mut WinApiState,
+    engine: &mut IcedCpu,
+) -> u64 {
+    let id = crate::resolve_winapi_id(library, name).expect("must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(engine, test_environment(), state),
+        id,
+    )
+    .expect("RegisterWindowMessage must dispatch");
+    r.return_value
+}
+
+#[test]
+fn test_register_window_message_w_first_id_is_c000() {
+    // Full dispatch path: name resolution (names.rs) → dense id → handler arm.
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let name_addr = 0x5000;
+    write_guest_utf16(&mut engine, name_addr, "FINDMSGSTRING");
+    write_regs(&mut engine, name_addr, 0, 0, 0, 0);
+    let value = register_window_message(
+        "user32.dll",
+        "RegisterWindowMessageW",
+        &mut state,
+        &mut engine,
+    );
+    // First registration allocates 0xC000, the start of the reserved range.
+    assert_eq!(value, 0xC000);
+    assert!(
+        (0xC000..=0xFFFF).contains(&value),
+        "registered-message id must be in the 0xC000–0xFFFF range, got {value:#x}"
+    );
+}
+
+#[test]
+fn test_register_window_message_same_name_stable_id() {
+    // A second call with the same name returns the SAME id (stable per
+    // session), including across case variants (Windows matches case-insensitively).
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let name_addr = 0x5000;
+    write_guest_utf16(&mut engine, name_addr, "FINDMSGSTRING");
+    write_regs(&mut engine, name_addr, 0, 0, 0, 0);
+    let first = register_window_message(
+        "user32.dll",
+        "RegisterWindowMessageW",
+        &mut state,
+        &mut engine,
+    );
+    write_guest_utf16(&mut engine, name_addr, "findmsgstring");
+    write_regs(&mut engine, name_addr, 0, 0, 0, 0);
+    let second = register_window_message(
+        "user32.dll",
+        "RegisterWindowMessageW",
+        &mut state,
+        &mut engine,
+    );
+    assert_eq!(second, first, "same name must map to the same id");
+    // A third name must NOT collide with the registered one.
+    write_guest_utf16(&mut engine, name_addr, "MY_PRIVATE_MSG");
+    write_regs(&mut engine, name_addr, 0, 0, 0, 0);
+    let other = register_window_message(
+        "user32.dll",
+        "RegisterWindowMessageW",
+        &mut state,
+        &mut engine,
+    );
+    assert_ne!(other, first, "different names must map to different ids");
+}
+
+#[test]
+fn test_register_window_message_ids_allocate_sequentially() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let name_addr = 0x5000;
+    for (index, name) in ["MSG_A", "MSG_B", "MSG_C"].iter().enumerate() {
+        write_guest_utf16(&mut engine, name_addr, name);
+        write_regs(&mut engine, name_addr, 0, 0, 0, 0);
+        let value = register_window_message(
+            "user32.dll",
+            "RegisterWindowMessageW",
+            &mut state,
+            &mut engine,
+        );
+        let expected = 0xC000 + index as u64;
+        assert_eq!(value, expected, "sequential id allocation");
+    }
+}
+
+#[test]
+fn test_register_window_message_a_and_w_share_cache() {
+    // RegisterWindowMessageA and RegisterWindowMessageW with the same name
+    // return the SAME id (shared per-session cache).
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let name_addr = 0x5000;
+    write_guest_utf16(&mut engine, name_addr, "FINDMSGSTRING");
+    write_regs(&mut engine, name_addr, 0, 0, 0, 0);
+    let wide = register_window_message(
+        "user32.dll",
+        "RegisterWindowMessageW",
+        &mut state,
+        &mut engine,
+    );
+    // A fresh address holds the ANSI copy of the same name.
+    write_guest_ansi(&mut engine, name_addr, "FINDMSGSTRING");
+    write_regs(&mut engine, name_addr, 0, 0, 0, 0);
+    let ansi = register_window_message(
+        "user32.dll",
+        "RegisterWindowMessageA",
+        &mut state,
+        &mut engine,
+    );
+    assert_eq!(ansi, wide, "A and W with the same name must share one id");
+    // A distinct name still gets the next sequential id — the shared cache
+    // must not have consumed an extra slot for the A call.
+    write_guest_ansi(&mut engine, name_addr, "OTHER_MSG");
+    write_regs(&mut engine, name_addr, 0, 0, 0, 0);
+    let other = register_window_message(
+        "user32.dll",
+        "RegisterWindowMessageA",
+        &mut state,
+        &mut engine,
+    );
+    assert_eq!(other, 0xC001, "next distinct name allocates 0xC001");
 }
 
 #[test]

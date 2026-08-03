@@ -314,6 +314,13 @@ static WINAPI_NAME_ROWS: &[(&str, &str, WinApiId)] = &[
         WinApiId::Kernel32Getuserdefaultlangid,
     ),
     (
+        // Row placed with the appended variant (407) next to its family sibling,
+        // not at the table end, so id table and name rows stay in the same order.
+        "kernel32.dll",
+        "getuserdefaultuilanguage",
+        WinApiId::Kernel32Getuserdefaultuilanguage,
+    ),
+    (
         "kernel32.dll",
         "globalmemorystatus",
         WinApiId::Kernel32Globalmemorystatus,
@@ -1491,6 +1498,26 @@ static WINAPI_NAME_ROWS: &[(&str, &str, WinApiId)] = &[
     ),
     ("user32.dll", "defdlgproca", WinApiId::User32Defdlgproca),
     ("user32.dll", "defdlgprocw", WinApiId::User32Defdlgprocw),
+    (
+        // Rows placed at the table end with the appended variants (408/409),
+        // so the id table and the name rows stay in the same order.
+        "user32.dll",
+        "registerwindowmessagea",
+        WinApiId::User32Registerwindowmessagea,
+    ),
+    (
+        "user32.dll",
+        "registerwindowmessagew",
+        WinApiId::User32Registerwindowmessagew,
+    ),
+    (
+        // Rows placed at the table end with the appended variants (410/411),
+        // so the id table and the name rows stay in the same order.
+        "user32.dll",
+        "loadstringa",
+        WinApiId::User32Loadstringa,
+    ),
+    ("user32.dll", "loadstringw", WinApiId::User32Loadstringw),
 ];
 
 /// Resolve library/export to id. Case-insensitive, allocation-free.

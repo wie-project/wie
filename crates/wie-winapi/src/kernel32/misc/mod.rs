@@ -413,6 +413,20 @@ pub fn handle_get_user_default_lang_id(
         return_value: LANG_EN_US,
     })
 }
+/// Handles `KERNEL32.dll!GetUserDefaultUILanguage`.
+pub fn handle_get_user_default_ui_language(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let return_address = engine
+        .return_from_win64_api(LANG_EN_US)
+        .context("failed to return from GetUserDefaultUILanguage")?;
+
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: LANG_EN_US,
+    })
+}
 /// Handles dynamic `KERNEL32.dll!EncodePointer`.
 pub fn handle_encode_pointer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;

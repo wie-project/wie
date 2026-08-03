@@ -34,6 +34,14 @@ pub struct WindowState {
     pub(crate) timers: Vec<TimerRecord>,
     pub(crate) next_global_atom: u16,
     pub(crate) global_atoms: Vec<GlobalAtomRecord>,
+    /// Next id to hand out for `RegisterWindowMessageA/W` (starts at 0xC000,
+    /// the first id of the Windows-reserved range).
+    pub(crate) next_registered_message: u32,
+    /// Per-session registered-message cache: lowercased name → message id.
+    ///
+    /// Ids are stable for the lifetime of the session and shared across the A
+    /// and W variants of the same name (mirrors real Windows).
+    pub(crate) registered_messages: ahash::HashMap<String, u32>,
     pub(crate) next_windows_hook_handle: crate::handles::HookHandle,
     pub(crate) windows_hooks: Vec<WindowsHookRecord>,
     /// All fake USER32 menus; each owns its items as a tree via `Popup`
@@ -72,6 +80,8 @@ impl Default for WindowState {
             next_menu_handle: crate::handles::Hmenu::from(0x0000_0000_6620_0000),
             next_windows_hook_handle: crate::handles::HookHandle::from(0x0000_0000_6630_0000),
             next_global_atom: 0xC000,
+            next_registered_message: 0xC000,
+            registered_messages: ahash::HashMap::new(),
             next_timer_id: 1,
             window_long_ptr_values: Vec::new(),
             image_list_counts: Vec::new(),

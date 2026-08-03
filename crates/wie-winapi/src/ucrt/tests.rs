@@ -98,6 +98,7 @@ fn test_state() -> WinApiState {
             environment: Vec::new(),
             main_module_dialogs: Vec::new(),
             main_module_menus: Vec::new(),
+            main_module_strings: Vec::new(),
         },
         kernel: KernelState {
             threads: ThreadState::primary(),

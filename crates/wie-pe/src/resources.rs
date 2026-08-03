@@ -1,9 +1,10 @@
-//! RT_DIALOG and RT_MENU resource parsing for PE images.
+//! RT_DIALOG, RT_MENU, and RT_STRING resource parsing for PE images.
 //!
 //! Walks the `IMAGE_RESOURCE_DIRECTORY` tree in the `.rsrc` section (PE
 //! resource format, Microsoft Learn) and parses each `RT_DIALOG` template
-//! (type **5** — note: 16 is `RT_VERSION`) into a [`DialogTemplate`] and each
-//! `RT_MENU` template (type **4**) into a [`MenuTemplate`].
+//! (type **5** — note: 16 is `RT_VERSION`) into a [`DialogTemplate`], each
+//! `RT_MENU` template (type **4**) into a [`MenuTemplate`], and each
+//! `RT_STRING` block (type **6**) into a [`StringBlock`].
 //! Parsing is best-effort: malformed or out-of-bounds structures skip that
 //! entry, and a missing/malformed resource tree yields an empty `Vec` — a
 //! broken resource section never fails the module load.
@@ -35,6 +36,10 @@ const RT_DIALOG: u16 = 5;
 /// (`MAKEINTRESOURCE(4)`). `RT_MENUEX` (11) is the extended variant and is
 /// not parsed.
 const RT_MENU: u16 = 4;
+
+/// Type id of `RT_STRING` resources in the resource directory
+/// (`MAKEINTRESOURCE(6)`).
+const RT_STRING: u16 = 6;
 
 /// Window style bits (`WS_*`/`DS_*`, winuser.h) used while parsing dialog
 /// templates. Converted to the raw `u32` on [`DialogTemplate`] because the
@@ -194,6 +199,25 @@ pub struct MenuItemTemplate {
     pub sub: Vec<MenuItemTemplate>,
 }
 
+/// One parsed `RT_STRING` block: 16 length-prefixed UTF-16 strings.
+///
+/// A string table stores its entries in blocks of 16 (Microsoft Learn,
+/// "String Table"). The resource name at the second directory level is the
+/// block id, and a string's id maps as `block = (id >> 4) + 1`,
+/// `slot = id & 0xF`. Block names are **1-based** because `rc.exe` never emits
+/// a block named 0 (`MAKEINTRESOURCE(0)` is the null resource) — verified
+/// against notepad.exe, where "Untitled" lives in the block named 24 at
+/// slot 4 and is loaded by id 0x174. Each slot is a `u16` length prefix
+/// followed by that many UTF-16LE units with **no** NUL terminator; a zero
+/// length is the empty string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StringBlock {
+    /// Block id — equal to `(string_id >> 4) + 1` for every string in it.
+    pub block: u16,
+    /// The 16 strings of the block, indexed by slot (`string_id & 0xF`).
+    pub strings: [String; 16],
+}
+
 /// `MF_*` menu option flags (winuser.h) kept on [`MenuItemTemplate::flags`].
 ///
 /// Only the bits this parser understands are named; unknown bits pass through
@@ -333,6 +357,11 @@ pub fn parse_dialogs(image: &[u8], sections: &[PeSectionMap]) -> Vec<DialogTempl
 /// Parse every `RT_MENU` template in `image`.
 pub fn parse_menus(image: &[u8], sections: &[PeSectionMap]) -> Vec<MenuTemplate> {
     parse_resource_type(image, sections, RT_MENU, parse_menu_template)
+}
+
+/// Parse every `RT_STRING` block in `image`.
+pub fn parse_strings(image: &[u8], sections: &[PeSectionMap]) -> Vec<StringBlock> {
+    parse_resource_type(image, sections, RT_STRING, parse_string_block)
 }
 
 /// Resolve a directory entry to a file offset.
@@ -756,6 +785,50 @@ fn parse_menu_entry(bytes: &[u8], pos: &mut usize) -> Option<MenuItemTemplate> {
         id,
         text,
         sub,
+    })
+}
+
+/// Parse one `RT_STRING` block from its resource bytes.
+///
+/// Layout (Microsoft Learn): 16 slots, each a `u16` length prefix followed by
+/// that many UTF-16LE units and **no** NUL terminator. A zero length is the
+/// empty string. Parsing is lenient like the other resource parsers: a block
+/// truncated mid-string yields empty strings for the slots that do not fit
+/// (never fails the caller).
+fn parse_string_block(block_id: u16, bytes: &[u8]) -> Option<StringBlock> {
+    if bytes.len() < 2 {
+        // Not even one length prefix: treat the block as absent.
+        return None;
+    }
+    let mut strings: [String; 16] = std::array::from_fn(|_| String::new());
+    let mut pos = 0usize;
+    for slot in &mut strings {
+        let Some(len) = read_u16_at(bytes, pos) else {
+            break;
+        };
+        let len = usize::from(len);
+        if len > MAX_STRING_WORDS {
+            break;
+        }
+        let body_start = pos.checked_add(2)?;
+        let body_end = body_start.checked_add(len.checked_mul(2)?)?;
+        // Bounds-check the whole string body; every unit read below then fits.
+        if bytes.get(body_start..body_end).is_none() {
+            break;
+        }
+        let mut units = Vec::with_capacity(len);
+        let mut p = body_start;
+        for _ in 0..len {
+            // `body_end` is bounds-checked above, so every unit read succeeds.
+            units.push(read_u16_at(bytes, p)?);
+            p = p.checked_add(2)?;
+        }
+        *slot = String::from_utf16_lossy(&units);
+        pos = body_end;
+    }
+    Some(StringBlock {
+        block: block_id,
+        strings,
     })
 }
 
@@ -1396,5 +1469,179 @@ mod tests {
     fn no_menu_resource_yields_empty() {
         assert!(parse_menus(&[], &[]).is_empty());
         assert!(parse_menus(&[0_u8; 64], &[]).is_empty());
+    }
+
+    /// Build the body of an `RT_STRING` block: 16 length-prefixed strings.
+    ///
+    /// `strings` fills slots from the start; the remaining slots get a zero
+    /// length prefix (the empty string).
+    fn string_block_body(strings: &[&str]) -> Vec<u8> {
+        let mut b = Vec::new();
+        for s in strings {
+            let units: Vec<u16> = s.encode_utf16().collect();
+            put_u16(
+                &mut b,
+                u16::try_from(units.len()).expect("string length fits"),
+            );
+            for unit in units {
+                put_u16(&mut b, unit);
+            }
+        }
+        for _ in strings.len()..16 {
+            put_u16(&mut b, 0);
+        }
+        b
+    }
+
+    /// Emit an `IMAGE_RESOURCE_DIRECTORY` header with a single id entry.
+    fn push_dir_entry(buf: &mut Vec<u8>, id: u32, offset: u32) {
+        put_u32(buf, 0); // characteristics
+        put_u32(buf, 0); // timestamp
+        put_u16(buf, 0); // major version
+        put_u16(buf, 0); // minor version
+        put_u16(buf, 0); // named entries
+        put_u16(buf, 1); // id entries
+        put_u32(buf, id);
+        put_u32(buf, offset);
+    }
+
+    #[test]
+    fn parses_string_block_slots() {
+        let b = string_block_body(&["Untitled", "", "café — ✓"]);
+        let block = parse_string_block(0x2A, &b).expect("block");
+        assert_eq!(block.block, 0x2A);
+        assert_eq!(block.strings[0], "Untitled");
+        assert_eq!(block.strings[1], "");
+        assert_eq!(block.strings[2], "café — ✓");
+        for slot in 3..16 {
+            assert_eq!(block.strings[slot], "");
+        }
+    }
+
+    #[test]
+    fn empty_string_block_yields_empty_strings() {
+        let b = string_block_body(&[]);
+        let block = parse_string_block(7, &b).expect("block");
+        assert_eq!(block.block, 7);
+        assert!(block.strings.iter().all(|s| s.is_empty()));
+    }
+
+    #[test]
+    fn truncated_string_block_is_lenient() {
+        // Length prefix claims 5 units but only 2 are present: the partial
+        // slot and everything after it stay empty; the block still parses.
+        let mut b = Vec::new();
+        put_u16(&mut b, 5);
+        put_u16(&mut b, 0x0041); // 'A'
+        put_u16(&mut b, 0x0042); // 'B'
+        let block = parse_string_block(0, &b).expect("block");
+        assert!(block.strings.iter().all(|s| s.is_empty()));
+        // A block with no length prefix at all is treated as absent.
+        assert!(parse_string_block(0, &[]).is_none());
+    }
+
+    #[test]
+    fn string_id_maps_to_block_and_slot() {
+        let sections = vec![fake_rsrc_section()];
+        let mut image = vec![0_u8; 0x1400];
+
+        // Root dir @0x200: type RT_STRING → type dir @0x218.
+        let mut root = Vec::new();
+        push_dir_entry(&mut root, u32::from(RT_STRING), 0x8000_0018);
+        copy_into(&mut image, 0x200, &root);
+
+        // Type dir @0x218: three blocks (1, 2, 3 — block names are 1-based in
+        // real rc.exe output) → lang dirs @0x240/0x258/0x270.
+        let mut type_dir = Vec::new();
+        put_u32(&mut type_dir, 0); // characteristics
+        put_u32(&mut type_dir, 0); // timestamp
+        put_u16(&mut type_dir, 0); // major version
+        put_u16(&mut type_dir, 0); // minor version
+        put_u16(&mut type_dir, 0); // named entries
+        put_u16(&mut type_dir, 3); // three block ids
+        put_u32(&mut type_dir, 1);
+        put_u32(&mut type_dir, 0x8000_0040);
+        put_u32(&mut type_dir, 2);
+        put_u32(&mut type_dir, 0x8000_0058);
+        put_u32(&mut type_dir, 3);
+        put_u32(&mut type_dir, 0x8000_0070);
+        copy_into(&mut image, 0x218, &type_dir);
+
+        // Language dirs @0x240/0x258/0x270 → data entries @0x288/0x298/0x2A8.
+        let mut lang0 = Vec::new();
+        push_dir_entry(&mut lang0, 0x0409, 0x88);
+        copy_into(&mut image, 0x240, &lang0);
+        let mut lang1 = Vec::new();
+        push_dir_entry(&mut lang1, 0x0409, 0x98);
+        copy_into(&mut image, 0x258, &lang1);
+        let mut lang2 = Vec::new();
+        push_dir_entry(&mut lang2, 0x0409, 0xA8);
+        copy_into(&mut image, 0x270, &lang2);
+
+        // Data entries: block bodies at rva 0x1200/0x1300/0x1400
+        // (file 0x400/0x500/0x600).
+        for (entry_off, rva) in [(0x288_usize, 0x1200_u32), (0x298, 0x1300), (0x2A8, 0x1400)] {
+            let mut data = Vec::new();
+            put_u32(&mut data, rva);
+            put_u32(&mut data, 0); // patched to the real size below
+            put_u32(&mut data, 0); // code page
+            put_u32(&mut data, 0); // reserved
+            copy_into(&mut image, entry_off, &data);
+        }
+
+        // Block bodies with their size fields patched into the data entries.
+        let body0 = string_block_body(&["Untitled", "", "Save As..."]);
+        copy_into(&mut image, 0x400, &body0);
+        copy_into(
+            &mut image,
+            0x28C,
+            &u32::try_from(body0.len()).expect("size fits").to_le_bytes(),
+        );
+        let body1 = string_block_body(&["first of block 1", "second"]);
+        copy_into(&mut image, 0x500, &body1);
+        copy_into(
+            &mut image,
+            0x29C,
+            &u32::try_from(body1.len()).expect("size fits").to_le_bytes(),
+        );
+        let body2 = string_block_body(&["third block"]);
+        copy_into(&mut image, 0x600, &body2);
+        copy_into(
+            &mut image,
+            0x2AC,
+            &u32::try_from(body2.len()).expect("size fits").to_le_bytes(),
+        );
+
+        let blocks = parse_strings(&image, &sections);
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].block, 1);
+        assert_eq!(blocks[1].block, 2);
+        assert_eq!(blocks[2].block, 3);
+
+        // Resolve the way LoadString does: block = (id >> 4) + 1, slot = id & 0xF.
+        let lookup = |id: u16| -> String {
+            blocks
+                .iter()
+                .find(|b| b.block == (id >> 4) + 1)
+                .and_then(|b| b.strings.get(usize::from(id & 0xF)))
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert_eq!(lookup(0x00), "Untitled");
+        assert_eq!(lookup(0x01), "");
+        assert_eq!(lookup(0x02), "Save As...");
+        assert_eq!(lookup(0x10), "first of block 1");
+        assert_eq!(lookup(0x11), "second");
+        assert_eq!(lookup(0x20), "third block");
+        // A slot that has no string (block 3 only fills slot 0).
+        assert_eq!(lookup(0x21), "");
+        // A block that was never parsed resolves to empty.
+        assert_eq!(lookup(0x40), "");
+    }
+
+    #[test]
+    fn no_string_resource_yields_empty() {
+        assert!(parse_strings(&[], &[]).is_empty());
+        assert!(parse_strings(&[0_u8; 64], &[]).is_empty());
     }
 }

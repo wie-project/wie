@@ -3,6 +3,7 @@ use super::{
     FAKE_IMAGE_HANDLE, HandlerContext, IDOK, Result, TimerRecord, WinApiHandlerResult, WinApiState,
     WindowClassRecord, WindowsHookRecord, checked_field_address, low_i32, read_guest_ansi_lossy,
     read_guest_i32, read_guest_u32, read_guest_u64, read_guest_utf16_lossy, register_window_class,
+    write_guest_ansi_c_string, write_guest_utf16_c_string,
 };
 
 /// Handles `USER32.dll!LoadIconA`.
@@ -664,6 +665,187 @@ pub fn handle_set_scroll_info(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         return_value,
     })
 }
+/// One past the last id `RegisterWindowMessageA/W` may return (0xFFFF).
+///
+/// The first id handed out is 0xC000 (the start of the Windows-reserved
+/// range); that seed lives in `WindowState::default` as
+/// `next_registered_message`.
+const REGISTERED_MESSAGE_LIMIT: u32 = 0x1_0000;
+
+/// Handles `USER32.dll!RegisterWindowMessageW`.
+pub fn handle_register_window_message_w(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    handle_register_window_message(ctx, "RegisterWindowMessageW")
+}
+/// Handles `USER32.dll!RegisterWindowMessageA`.
+pub fn handle_register_window_message_a(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    handle_register_window_message(ctx, "RegisterWindowMessageA")
+}
+
+fn handle_register_window_message(
+    ctx: &mut HandlerContext<'_>,
+    api_name: &str,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let name_ptr = engine
+        .read_rcx()
+        .with_context(|| format!("failed to read RCX for {api_name}"))?;
+
+    let name = if api_name.ends_with('W') {
+        read_guest_utf16_lossy(engine, name_ptr, 256)
+            .with_context(|| format!("failed to read {api_name} message name"))?
+    } else {
+        read_guest_ansi_lossy(engine, name_ptr, 256)
+            .with_context(|| format!("failed to read {api_name} message name"))?
+    };
+
+    // Windows matches registered-message names case-insensitively, so the
+    // cache key is the lowercased name — the A and W variants share one entry.
+    let key = name.to_ascii_lowercase();
+
+    let return_value = if let Some(id) = state.window_state().registered_messages.get(&key) {
+        u64::from(*id)
+    } else if state.window_state().next_registered_message >= REGISTERED_MESSAGE_LIMIT {
+        // The reserved range is exhausted; Windows returns zero on failure.
+        0
+    } else {
+        let id = state.window_state().next_registered_message;
+
+        state.window_state().next_registered_message = state
+            .window_state()
+            .next_registered_message
+            .checked_add(1)
+            .context("registered-message id overflow")?;
+
+        state.window_state().registered_messages.insert(key, id);
+
+        u64::from(id)
+    };
+
+    tracing::debug!(
+        target: "wiegui",
+        name = %name,
+        message_id = return_value,
+        "{api_name}"
+    );
+
+    let return_address = engine
+        .return_from_win64_api(return_value)
+        .with_context(|| format!("failed to return from {api_name}"))?;
+
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `USER32.dll!LoadStringW`.
+pub fn handle_load_string_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_load_string(ctx, "LoadStringW")
+}
+/// Handles `USER32.dll!LoadStringA`.
+pub fn handle_load_string_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_load_string(ctx, "LoadStringA")
+}
+
+/// Shared `LoadStringA/W` implementation.
+///
+/// Win64 ABI: `rcx` = hinst, `rdx` = string id, `r8` = output buffer,
+/// `r9` = `cchMax`. Copies the module string into the guest buffer (UTF-16 as
+/// stored in the resource for W; the ANSI/UTF-8 convention for A), truncates
+/// to `cchMax - 1` chars, NUL-terminates, and returns the number of characters
+/// copied excluding the NUL — 0 when the id is not found or the module is not
+/// the main EXE (loaded-DLL string tables are not parsed yet).
+fn handle_load_string(ctx: &mut HandlerContext<'_>, api_name: &str) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let instance_handle = engine
+        .read_rcx()
+        .with_context(|| format!("failed to read RCX for {api_name}"))?;
+    let string_id_raw = engine
+        .read_rdx()
+        .with_context(|| format!("failed to read RDX for {api_name}"))?;
+    let buffer_ptr = engine
+        .read_r8()
+        .with_context(|| format!("failed to read R8 for {api_name}"))?;
+    let max_characters_raw = engine
+        .read_r9()
+        .with_context(|| format!("failed to read R9 for {api_name}"))?;
+
+    // String ids are u16; anything wider cannot address a parsed block.
+    let string_id = u16::try_from(string_id_raw & u64::from(u16::MAX)).unwrap_or(0);
+    let max_characters = usize::try_from(max_characters_raw)
+        .with_context(|| format!("{api_name} cchMax does not fit usize"))?;
+
+    let text = resolve_string_text(
+        state,
+        ctx.environment.image_base,
+        instance_handle,
+        string_id,
+    );
+
+    let return_value = if text.is_empty() {
+        // Not found (or empty string): Windows returns 0 either way.
+        0
+    } else if api_name.ends_with('W') {
+        let copied = write_guest_utf16_c_string(engine, buffer_ptr, max_characters, &text)?;
+        u64::try_from(copied).unwrap_or(0)
+    } else {
+        // A-strings follow the codebase UTF-8 convention; the byte count
+        // equals the character count for the ASCII strings real apps load.
+        let copied = write_guest_ansi_c_string(engine, buffer_ptr, max_characters, &text)?;
+        u64::try_from(copied).unwrap_or(0)
+    };
+
+    tracing::debug!(
+        target: "wiegui",
+        instance_handle,
+        string_id,
+        text = %text,
+        copied = return_value,
+        "{api_name}"
+    );
+
+    let return_address = engine
+        .return_from_win64_api(return_value)
+        .with_context(|| format!("failed to return from {api_name}"))?;
+
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Look up a string-table entry by id for `hinst`.
+///
+/// Only the main EXE module's table is parsed (mirrors the dialog/menu
+/// lifecycle); any other `hinst` resolves to not-found. Block names are
+/// 1-based in real rc.exe output, so the block id is `(id >> 4) + 1`.
+fn resolve_string_text(
+    state: &WinApiState,
+    image_base: u64,
+    instance_handle: u64,
+    string_id: u16,
+) -> String {
+    if instance_handle != image_base {
+        return String::new();
+    }
+    let block_id = (string_id >> 4).saturating_add(1);
+    let slot = usize::from(string_id & 0xF);
+    state
+        .process
+        .main_module_strings
+        .iter()
+        .find(|block| block.block == block_id)
+        .and_then(|block| block.strings.get(slot))
+        .cloned()
+        .unwrap_or_default()
+}
+
 pub(crate) fn window_client_size(state: &mut WinApiState, handle: u64) -> (i32, i32) {
     // Extract window dimensions before any other mutable access.
     if let Some(window) = super::find_window(state, handle) {
