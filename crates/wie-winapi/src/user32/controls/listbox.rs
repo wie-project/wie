@@ -4,11 +4,11 @@
 use anyhow::Result;
 
 use super::paint::fill_rect_clipped;
-use super::{COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, control_items, deliver_command};
-use crate::gdi32::ResolvedWindow;
+use super::{control_items, deliver_command, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT};
 use crate::gdi32::render_text_into_surface;
+use crate::gdi32::ResolvedWindow;
 use crate::gdi32::{FontEngine, FontKey, ResolvedFont};
-use crate::user32::{LBN_SELCHANGE, WinApiState, find_window, make_command_wparam};
+use crate::user32::{find_window, make_command_wparam, WinApiState, LBN_SELCHANGE};
 
 /// Draw the first visible LISTBOX items (one line each), filling the
 /// selected item's row with COLOR_HIGHLIGHT and rendering its glyphs in

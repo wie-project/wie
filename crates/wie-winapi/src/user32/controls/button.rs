@@ -8,15 +8,15 @@ use super::listbox::paint_item_lines;
 use super::listbox::render_control_text;
 use super::r#static::paint_label;
 use super::{
-    COLOR_BTNFACE, COLOR_BTNFACE_PRESSED, COLOR_BTNHIGHLIGHT, COLOR_BTNSHADOW, COLOR_WINDOW,
-    ControlClassKind, ControlState, control_items, control_sel_index, control_state,
+    control_items, control_sel_index, control_state, ControlClassKind, ControlState, COLOR_BTNFACE,
+    COLOR_BTNFACE_PRESSED, COLOR_BTNHIGHLIGHT, COLOR_BTNSHADOW, COLOR_WINDOW,
 };
-use crate::gdi32::ResolvedWindow;
 use crate::gdi32::fill_rect_surface;
 use crate::gdi32::resolve_window_ancestor;
+use crate::gdi32::ResolvedWindow;
 use crate::gdi32::{FontEngine, FontKey, ResolvedFont};
 use crate::state::WindowFlags;
-use crate::user32::{WinApiState, find_window};
+use crate::user32::{find_window, WinApiState};
 
 /// Paint a control into its ancestor's surface at its parent-relative offset.
 pub(super) fn paint_control(
@@ -290,7 +290,11 @@ fn paint_status_bar_parts(
             width
         } else {
             let value = part_rights.get(index).copied().unwrap_or(width);
-            if value < 0 { width } else { value }
+            if value < 0 {
+                width
+            } else {
+                value
+            }
         };
         let cell_left = left;
         left = right;
