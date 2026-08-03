@@ -21,6 +21,9 @@ mod misc;
 mod stdio;
 mod string;
 
+#[cfg(test)]
+mod tests;
+
 // Keep `crate::ucrt::pad_or_trim` resolving for the vsprintf handler in `stdio`.
 use stdio::pad_or_trim;
 
@@ -28,10 +31,12 @@ use stdio::pad_or_trim;
 pub(crate) use stdio::write_all_fd;
 
 use crt::{
-    handle_abort, handle_cexit, handle_configure_narrow_argv, handle_crt_atexit, handle_exit_like,
-    handle_getenv, handle_getmainargs, handle_initialize_narrow_environment, handle_initterm,
+    handle_abort, handle_cexit, handle_configure_narrow_argv, handle_configure_wide_argv,
+    handle_crt_atexit, handle_exit_like, handle_fpreset, handle_getenv, handle_getmainargs,
+    handle_initialize_narrow_environment, handle_initialize_wide_environment, handle_initterm,
     handle_initterm_e, handle_onexit, handle_p_acmdln, handle_p_argc, handle_p_argv,
-    handle_p_commode, handle_p_environ, handle_p_fmode, handle_set_app_type, handle_set_new_mode,
+    handle_p_commode, handle_p_environ, handle_p_fmode, handle_p_wargv, handle_p_wenviron,
+    handle_set_app_type, handle_set_new_mode,
 };
 use misc::{
     handle_atoi, handle_atol, handle_begin_thread_ex, handle_c_specific_handler,
@@ -51,7 +56,8 @@ use string::{
     handle_isalnum, handle_isalpha, handle_isdigit, handle_islower, handle_isspace, handle_isupper,
     handle_memcmp, handle_memcpy, handle_memset, handle_strcmp, handle_strlen, handle_strncmp,
     handle_strncpy, handle_strtod, handle_strtok, handle_strtol, handle_strtoul, handle_tolower,
-    handle_toupper, handle_wcscmp, handle_wcsstr,
+    handle_toupper, handle_towupper, handle_wcscat, handle_wcscmp, handle_wcscpy, handle_wcslen,
+    handle_wcsncmp, handle_wcsncpy, handle_wcsnicmp, handle_wcsrchr, handle_wcsstr,
 };
 /// Guest VA base for synthetic CRT objects (FILE cookies, env pointers, etc.).
 const ACMDLN_PTR_SLOT: u64 = CRT_GUEST_BASE + 0x328;
@@ -64,6 +70,13 @@ const ARGV_PTR_SLOT: u64 = CRT_GUEST_BASE + 0x308;
 const ARGC_SLOT: u64 = CRT_GUEST_BASE + 0x310;
 const COMMODE_SLOT: u64 = CRT_GUEST_BASE + 0x318;
 const FMODE_SLOT: u64 = CRT_GUEST_BASE + 0x320;
+/// Slot holding `wchar_t**` (wide argv table) for `__p___wargv`.
+const WARGV_PTR_SLOT: u64 = CRT_GUEST_BASE + 0x330;
+/// Slot holding `wchar_t**` (NULL — empty wide environment) for `__p__wenviron`.
+const WENVIRON_PTR_SLOT: u64 = CRT_GUEST_BASE + 0x338;
+/// Narrow `char* argv[]` pointer table materialized by the runtime session
+/// (see `crates/wie-runtime/src/session/mod.rs` `CRT_ARGV_TABLE`).
+const NARROW_ARGV_TABLE: u64 = CRT_GUEST_BASE + 0x400;
 /// Return an ASCII-lowercased view of `name` without allocating when possible.
 ///
 /// The vast majority of UCRT / msvcrt exports arrive already lowercase from PE
@@ -165,6 +178,11 @@ pub fn dispatch_ucrt(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiH
         "_initterm_e" => handle_initterm_e(ctx),
         "_configure_narrow_argv" => handle_configure_narrow_argv(ctx),
         "_initialize_narrow_environment" => handle_initialize_narrow_environment(ctx),
+        "_configure_wide_argv" => handle_configure_wide_argv(ctx),
+        "_initialize_wide_environment" => handle_initialize_wide_environment(ctx),
+        "__p___wargv" => handle_p_wargv(ctx),
+        "__p__wenviron" => handle_p_wenviron(ctx),
+        "_fpreset" => handle_fpreset(ctx),
         "_crt_atexit" => handle_crt_atexit(ctx),
         // UCRT: `_set_app_type`; legacy msvcrt: `__set_app_type`.
         "_set_app_type" | "__set_app_type" => handle_set_app_type(ctx),
@@ -216,6 +234,14 @@ pub fn dispatch_ucrt(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiH
         "tolower" => handle_tolower(ctx),
         "wcscmp" => handle_wcscmp(ctx),
         "wcsstr" => handle_wcsstr(ctx),
+        "wcslen" => handle_wcslen(ctx),
+        "wcscat" => handle_wcscat(ctx),
+        "wcscpy" => handle_wcscpy(ctx),
+        "wcsncmp" => handle_wcsncmp(ctx),
+        "wcsncpy" => handle_wcsncpy(ctx),
+        "_wcsnicmp" => handle_wcsnicmp(ctx),
+        "towupper" => handle_towupper(ctx),
+        "wcsrchr" => handle_wcsrchr(ctx),
         "_onexit" | "__dllonexit" => handle_onexit(ctx),
         "_beginthreadex" => handle_begin_thread_ex(ctx),
         "_endthreadex" => handle_end_thread_ex(ctx),

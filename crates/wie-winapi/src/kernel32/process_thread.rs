@@ -34,6 +34,33 @@ pub fn handle_get_startup_info_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         return_value: 0,
     })
 }
+/// Handles `KERNEL32.dll!GetStartupInfoW`.
+pub fn handle_get_startup_info_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let startup_info_ptr = engine
+        .read_rcx()
+        .context("failed to read RCX for GetStartupInfoW")?;
+
+    if startup_info_ptr != 0 {
+        let cb_address = checked_field_address(startup_info_ptr, 0, "cb");
+        let flags_address = checked_field_address(startup_info_ptr, 60, "dwFlags");
+        let show_window_address = checked_field_address(startup_info_ptr, 64, "wShowWindow");
+
+        // STARTUPINFOW on Win64 is 104 bytes.
+        write_guest_u32(engine, cb_address, 104)?;
+        write_guest_u32(engine, flags_address, 0)?;
+        write_guest_u16(engine, show_window_address, 1)?;
+    }
+
+    let return_address = engine
+        .return_from_win64_api(0)
+        .context("failed to return from GetStartupInfoW")?;
+
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 0,
+    })
+}
 /// Handles `KERNEL32.dll!GetProcessHeap`.
 pub fn handle_get_process_heap(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let process_heap_handle = ctx.environment.process_heap_handle;

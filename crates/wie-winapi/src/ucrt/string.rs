@@ -474,3 +474,247 @@ pub(crate) fn handle_wcsstr(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     }
     ret(engine, 0)
 }
+/// `wcslen(s)` — number of wide units before the NUL.
+pub(crate) fn handle_wcslen(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let s = engine.read_rcx()?;
+    if s == 0 {
+        return ret(engine, 0);
+    }
+    let mut i = 0_u64;
+    loop {
+        let mut b = [0_u8; 2];
+        if engine
+            .mem_read(s.wrapping_add(i.wrapping_mul(2)), &mut b)
+            .is_err()
+        {
+            break;
+        }
+        if u16::from_le_bytes(b) == 0 {
+            break;
+        }
+        i = i.saturating_add(1);
+        if i > 1_000_000 {
+            break;
+        }
+    }
+    ret(engine, i)
+}
+/// `wcscpy(dest, src)` — copy the wide string including its NUL; returns `dest`.
+pub(crate) fn handle_wcscpy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let dest = engine.read_rcx()?;
+    let src = engine.read_rdx()?;
+    if dest == 0 || src == 0 {
+        return ret(engine, dest);
+    }
+    let mut i = 0_u64;
+    loop {
+        let mut b = [0_u8; 2];
+        if engine
+            .mem_read(src.wrapping_add(i.wrapping_mul(2)), &mut b)
+            .is_err()
+        {
+            break;
+        }
+        drop(engine.mem_write(dest.wrapping_add(i.wrapping_mul(2)), &b));
+        if u16::from_le_bytes(b) == 0 {
+            break;
+        }
+        i = i.saturating_add(1);
+        if i > 1_000_000 {
+            break;
+        }
+    }
+    ret(engine, dest)
+}
+/// `wcscat(dest, src)` — append `src` over `dest`'s terminator; returns `dest`.
+pub(crate) fn handle_wcscat(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let dest = engine.read_rcx()?;
+    let src = engine.read_rdx()?;
+    if dest == 0 || src == 0 {
+        return ret(engine, dest);
+    }
+    // Locate the end of dest.
+    let mut i = 0_u64;
+    loop {
+        let mut b = [0_u8; 2];
+        if engine
+            .mem_read(dest.wrapping_add(i.wrapping_mul(2)), &mut b)
+            .is_err()
+        {
+            break;
+        }
+        if u16::from_le_bytes(b) == 0 {
+            break;
+        }
+        i = i.saturating_add(1);
+        if i > 1_000_000 {
+            break;
+        }
+    }
+    // Copy src over the terminator.
+    let mut j = 0_u64;
+    loop {
+        let mut b = [0_u8; 2];
+        if engine
+            .mem_read(src.wrapping_add(j.wrapping_mul(2)), &mut b)
+            .is_err()
+        {
+            break;
+        }
+        drop(engine.mem_write(dest.wrapping_add(i.wrapping_add(j).wrapping_mul(2)), &b));
+        if u16::from_le_bytes(b) == 0 {
+            break;
+        }
+        j = j.saturating_add(1);
+        if j > 1_000_000 {
+            break;
+        }
+    }
+    ret(engine, dest)
+}
+/// `wcsncmp(a, b, n)` — compare up to `n` wide units.
+pub(crate) fn handle_wcsncmp(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let a = engine.read_rcx()?;
+    let b = engine.read_rdx()?;
+    let n = engine.read_r8()?;
+    let count = n.min(1_000_000);
+    if count == 0 {
+        return ret(engine, 0);
+    }
+    for i in 0..count {
+        let mut ba = [0_u8; 2];
+        let mut bb = [0_u8; 2];
+        let off = i.wrapping_mul(2);
+        if engine.mem_read(a.wrapping_add(off), &mut ba).is_err()
+            || engine.mem_read(b.wrapping_add(off), &mut bb).is_err()
+        {
+            break;
+        }
+        let wa = u16::from_le_bytes(ba);
+        let wb = u16::from_le_bytes(bb);
+        if wa != wb {
+            let r = i32::from(wa).wrapping_sub(i32::from(wb));
+            return ret(engine, i32_status_to_u64(r));
+        }
+        if wa == 0 {
+            break;
+        }
+    }
+    ret(engine, 0)
+}
+/// `wcsncpy(dest, src, n)` — copy up to `n` wide units, padding with NULs.
+pub(crate) fn handle_wcsncpy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let dest = engine.read_rcx()?;
+    let src = engine.read_rdx()?;
+    let n = engine.read_r8()?;
+    let count = n.min(4096);
+    if dest == 0 || src == 0 || count == 0 {
+        return ret(engine, dest);
+    }
+    for i in 0..count {
+        let mut b = [0_u8; 2];
+        let mut unit = 0_u16;
+        if engine
+            .mem_read(src.wrapping_add(i.wrapping_mul(2)), &mut b)
+            .is_ok()
+        {
+            unit = u16::from_le_bytes(b);
+        }
+        drop(engine.mem_write(dest.wrapping_add(i.wrapping_mul(2)), &b));
+        if unit == 0 {
+            // Real wcsncpy pads the remainder of the destination with NULs.
+            let pad = [0_u8; 2];
+            for j in (i + 1)..count {
+                drop(engine.mem_write(dest.wrapping_add(j.wrapping_mul(2)), &pad));
+            }
+            break;
+        }
+    }
+    ret(engine, dest)
+}
+/// `_wcsnicmp(a, b, n)` — case-insensitive `wcsncmp` (ASCII fold, like the
+/// ctype helpers; non-ASCII maps to itself).
+pub(crate) fn handle_wcsnicmp(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let a = engine.read_rcx()?;
+    let b = engine.read_rdx()?;
+    let n = engine.read_r8()?;
+    let count = n.min(1_000_000);
+    if count == 0 {
+        return ret(engine, 0);
+    }
+    for i in 0..count {
+        let mut ba = [0_u8; 2];
+        let mut bb = [0_u8; 2];
+        let off = i.wrapping_mul(2);
+        if engine.mem_read(a.wrapping_add(off), &mut ba).is_err()
+            || engine.mem_read(b.wrapping_add(off), &mut bb).is_err()
+        {
+            break;
+        }
+        let wa = u16::from_le_bytes(ba);
+        let wb = u16::from_le_bytes(bb);
+        // ASCII fold only (matches the ctype helpers); non-ASCII maps to itself.
+        let la = u8::try_from(wa)
+            .map(|b| u16::from(b.to_ascii_lowercase()))
+            .unwrap_or(wa);
+        let lb = u8::try_from(wb)
+            .map(|b| u16::from(b.to_ascii_lowercase()))
+            .unwrap_or(wb);
+        if la != lb {
+            let r = i32::from(la).wrapping_sub(i32::from(lb));
+            return ret(engine, i32_status_to_u64(r));
+        }
+        if wa == 0 {
+            break;
+        }
+    }
+    ret(engine, 0)
+}
+/// `towupper(c)` — uppercase a wide character (ASCII subset, like `toupper`).
+pub(crate) fn handle_towupper(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let c = engine.read_rcx()?;
+    let w = u16::try_from(c & 0xffff).unwrap_or(0);
+    let upper = u8::try_from(w)
+        .map(|b| u16::from(b.to_ascii_uppercase()))
+        .unwrap_or(w);
+    ret(engine, u64::from(upper))
+}
+/// `wcsrchr(s, c)` — pointer to the LAST occurrence of wide char `c`, or NULL.
+pub(crate) fn handle_wcsrchr(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let s = engine.read_rcx()?;
+    let c = u16::try_from(engine.read_rdx()? & 0xffff).unwrap_or(0);
+    if s == 0 {
+        return ret(engine, 0);
+    }
+    let mut last: u64 = 0;
+    let mut i = 0_u64;
+    loop {
+        let mut b = [0_u8; 2];
+        if engine
+            .mem_read(s.wrapping_add(i.wrapping_mul(2)), &mut b)
+            .is_err()
+        {
+            break;
+        }
+        let w = u16::from_le_bytes(b);
+        if w == c {
+            last = s.wrapping_add(i.wrapping_mul(2));
+        }
+        if w == 0 {
+            break;
+        }
+        i = i.saturating_add(1);
+        if i > 1_000_000 {
+            break;
+        }
+    }
+    ret(engine, last)
+}

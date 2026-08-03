@@ -30,6 +30,13 @@ static WINAPI_NAME_ROWS: &[(&str, &str, WinApiId)] = &[
         WinApiId::Kernel32Getstartupinfoa,
     ),
     (
+        // Row placed with the appended variant (406), not after getstartupinfoa,
+        // so the id table and the name rows stay in the same order.
+        "kernel32.dll",
+        "getstartupinfow",
+        WinApiId::Kernel32Getstartupinfow,
+    ),
+    (
         "kernel32.dll",
         "getprocessheap",
         WinApiId::Kernel32Getprocessheap,
@@ -1538,6 +1545,8 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
                 | "__p__acmdln"
                 | "__p___argc"
                 | "__p___argv"
+                | "__p___wargv"
+                | "__p__wenviron"
                 | "__p__commode"
                 | "__p__fmode"
                 | "_configthreadlocale"
@@ -1553,6 +1562,9 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
                 | "_initterm_e"
                 | "_configure_narrow_argv"
                 | "_initialize_narrow_environment"
+                | "_configure_wide_argv"
+                | "_initialize_wide_environment"
+                | "_fpreset"
                 | "_crt_atexit"
                 | "_set_app_type"
                 | "__set_app_type"
@@ -1577,6 +1589,14 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
                 | "strncpy"
                 | "wcscmp"
                 | "wcsstr"
+                | "wcslen"
+                | "wcscat"
+                | "wcscpy"
+                | "wcsncmp"
+                | "wcsncpy"
+                | "_wcsnicmp"
+                | "towupper"
+                | "wcsrchr"
                 | "_onexit"
                 | "__dllonexit"
                 | "_beginthreadex"

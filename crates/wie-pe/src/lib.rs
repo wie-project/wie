@@ -6,7 +6,9 @@ use serde::Serialize;
 use std::path::Path;
 
 pub mod resources;
-pub use resources::{DialogItemTemplate, DialogTemplate, ItemClass, PixelRect};
+pub use resources::{
+    DialogItemTemplate, DialogTemplate, ItemClass, MenuItemTemplate, MenuTemplate, PixelRect,
+};
 
 /// COFF `Machine` type (Microsoft PE format, `IMAGE_FILE_MACHINE_*`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

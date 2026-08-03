@@ -262,9 +262,10 @@ pub(crate) fn default_winapi_state(
             error_mode: 0,
             suspended_threads: ahash::HashMap::new(),
             environment: Vec::new(),
-            // The main module's RT_DIALOG templates are parsed in session init
-            // (the section map is not available here).
+            // The main module's RT_DIALOG/RT_MENU templates are parsed in
+            // session init (the section map is not available here).
             main_module_dialogs: Vec::new(),
+            main_module_menus: Vec::new(),
         },
         kernel: wie_winapi::KernelState {
             threads: wie_winapi::ThreadState::primary(),

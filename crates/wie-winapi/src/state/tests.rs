@@ -126,6 +126,7 @@ fn winapi_state_default() -> WinApiState {
                 .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
                 .collect(),
             main_module_dialogs: Vec::new(),
+            main_module_menus: Vec::new(),
         },
         kernel: KernelState {
             threads: ThreadState::primary(),
@@ -345,6 +346,51 @@ fn test_set_last_error() {
     ))
     .expect("SetLastError");
     assert_eq!(state.process.last_error, 456);
+}
+
+#[test]
+fn test_get_startup_info_w_writes_startupinfow() {
+    // Full dispatch path: name resolution (names.rs) → dense id → handler arm.
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let info_ptr = 0x5000;
+    // Pre-fill so field writes are observable (STARTUPINFOW is 104 bytes).
+    engine
+        .mem_write(info_ptr, &[0xAA_u8; 104])
+        .expect("prefill STARTUPINFOW");
+    write_regs(&mut engine, info_ptr, 0, 0, 0, 0);
+    // Sentinel return address so the handler's pop is observable (test_engine
+    // defaults to 0).
+    engine
+        .mem_write(STACK_TOP, &0x1234_5678_u64.to_le_bytes())
+        .expect("write sentinel return address");
+    let id = crate::resolve_winapi_id("kernel32.dll", "GetStartupInfoW")
+        .expect("GetStartupInfoW must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("GetStartupInfoW must dispatch");
+    assert_eq!(
+        r.return_address, 0x1234_5678,
+        "handler must return past the call"
+    );
+    // GetStartupInfoW is VOID; RAX mirrors the A variant (unspecified, 0).
+    assert_eq!(r.return_value, 0);
+    // Mirror of GetStartupInfoA: cb = 104, dwFlags = 0, wShowWindow = 1.
+    let mut cb = [0_u8; 4];
+    engine.mem_read(info_ptr, &mut cb).expect("read cb");
+    assert_eq!(u32::from_le_bytes(cb), 104);
+    let mut flags = [0_u8; 4];
+    engine
+        .mem_read(info_ptr + 60, &mut flags)
+        .expect("read dwFlags");
+    assert_eq!(u32::from_le_bytes(flags), 0);
+    let mut show_window = [0_u8; 2];
+    engine
+        .mem_read(info_ptr + 64, &mut show_window)
+        .expect("read wShowWindow");
+    assert_eq!(u16::from_le_bytes(show_window), 1);
 }
 
 #[test]

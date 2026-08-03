@@ -886,6 +886,10 @@ impl super::RuntimeSession {
         // `hInstance == image base` against this list.
         winapi_state.process.main_module_dialogs =
             wie_pe::resources::parse_dialogs(&pe_bytes, &pe_map_plan.sections);
+        // Main-module menus: same lifecycle as the dialogs above; LoadMenuW
+        // resolves `hInstance == image base` against this list.
+        winapi_state.process.main_module_menus =
+            wie_pe::resources::parse_menus(&pe_bytes, &pe_map_plan.sections);
         // Modal-dialog result slot: EndDialog writes, the in-guest stub reads.
         winapi_state.window_state().dialog_result_va = stub_cfg.dialog_result_va;
         engine

@@ -183,6 +183,11 @@ pub struct ProcessState {
     /// construction site). `DialogBoxParam` resolves `hInstance == image base`
     /// against this list.
     pub main_module_dialogs: Vec<wie_pe::resources::DialogTemplate>,
+    /// Parsed `RT_MENU` templates of the main EXE module.
+    ///
+    /// Same lifecycle as [`Self::main_module_dialogs`]; `LoadMenuW` resolves
+    /// `hInstance == image base` against this list by resource id.
+    pub main_module_menus: Vec<wie_pe::resources::MenuTemplate>,
 }
 
 /// Source policy for console `ReadFile(STD_INPUT_HANDLE)`.

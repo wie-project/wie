@@ -676,7 +676,19 @@ impl ApplicationHandler<WieEvent> for WieApp {
 }
 
 /// Run the guest with a winit window.
-pub fn run_gui_windowed(path: &std::path::Path) -> Result<()> {
+///
+/// `input_script` is a parsed input-script path (see
+/// [`crate::gui::input_script`]); `None` runs without scripted input. The
+/// script is read and parsed up front so a bad path or syntax fails before
+/// the guest thread and event loop start.
+pub fn run_gui_windowed(
+    path: &std::path::Path,
+    input_script: Option<std::path::PathBuf>,
+) -> Result<()> {
+    let script_steps = match &input_script {
+        Some(script_path) => Some(crate::gui::input_script::read_script(script_path)?),
+        None => None,
+    };
     let event_loop = EventLoop::<WieEvent>::with_user_event()
         .build()
         .context("build event loop")?;
@@ -731,6 +743,12 @@ pub fn run_gui_windowed(path: &std::path::Path) -> Result<()> {
     };
 
     let handle = handle_rx.recv().context("recv handle")?;
+
+    // Scripted input driver: posts WM_KEYDOWN/WM_CHAR/WM_COMMAND to the guest
+    // on its own schedule once the guest window exists.
+    if let Some(steps) = script_steps {
+        crate::gui::input_script::spawn(handle.clone(), steps)?;
+    }
 
     // Window is created lazily when the first frame arrives (in user_event).
     let mut app = WieApp {

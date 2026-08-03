@@ -421,9 +421,11 @@ pub enum WinApiId {
     D3d9Idirect3ddevice9Getpixelshaderconstantf = 403,
     D3d9Idirect3dpixelshader9Release = 404,
     D3d9Idirect3dvertexshader9Release = 405,
+    /// Appended here (not adjacent to Kernel32Getstartupinfoa) to avoid renumbering the entire enum.
+    Kernel32Getstartupinfow = 406,
 }
 
-pub const WINAPI_ID_COUNT: usize = 406;
+pub const WINAPI_ID_COUNT: usize = 407;
 
 impl WinApiId {
     /// Discriminant as `u16` (`#[repr(u16)]`).
@@ -462,7 +464,7 @@ const _: () = assert!(
 );
 
 /// Highest-numbered [`WinApiId`]; update alongside the enum's final variant.
-const LAST_WINAPI_ID: WinApiId = WinApiId::D3d9Idirect3dvertexshader9Release;
+const LAST_WINAPI_ID: WinApiId = WinApiId::Kernel32Getstartupinfow;
 
 /// Hot-path dispatch: dense `u16` match over the `WinApiId` discriminant
 /// (LLVM jump table) with no string comparison — runs once per host API stop.
@@ -476,6 +478,7 @@ pub fn dispatch_winapi_id(
         WinApiId::Kernel32Getcommandlinea => kernel32::handle_get_command_line_a(ctx),
         WinApiId::Kernel32Getcommandlinew => kernel32::handle_get_command_line_w(ctx),
         WinApiId::Kernel32Getstartupinfoa => kernel32::handle_get_startup_info_a(ctx),
+        WinApiId::Kernel32Getstartupinfow => kernel32::handle_get_startup_info_w(ctx),
         WinApiId::Kernel32Getprocessheap => kernel32::handle_get_process_heap(ctx),
         WinApiId::Kernel32Getsystemtimeasfiletime => {
             kernel32::handle_get_system_time_as_file_time(ctx)

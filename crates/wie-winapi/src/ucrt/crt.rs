@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 
 use super::{
     ACMDLN_PTR_SLOT, ARGC_SLOT, ARGV_PTR_SLOT, COMMODE_SLOT, CRT_GUEST_BASE, ENVIRON_PTR_SLOT,
-    FMODE_SLOT, ret,
+    FMODE_SLOT, NARROW_ARGV_TABLE, WARGV_PTR_SLOT, WENVIRON_PTR_SLOT, read_guest_str, ret,
 };
 pub(crate) fn handle_set_new_mode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -128,6 +128,134 @@ pub(crate) fn handle_initialize_narrow_environment(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     ret(engine, 0)
+}
+
+/// UCRT `_initialize_wide_environment` — sets up the wide environment.
+///
+/// WIE serves `GetEnvironmentStringsW` from host state, so the guest-visible
+/// wide environment stays empty; the no-op keeps UCRT startup moving.
+pub(crate) fn handle_initialize_wide_environment(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    ret(engine, 0)
+}
+
+/// UCRT `_configure_wide_argv(mode)` — selects argv parsing mode.
+///
+/// Argument vectors are materialized host-side; mode is accepted and ignored,
+/// matching the narrow-argv twin.
+pub(crate) fn handle_configure_wide_argv(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let _mode = engine.read_rcx()?;
+    ret(engine, 0)
+}
+
+/// UCRT `_fpreset` — restore the FPU control word to its default.
+///
+/// The guest x87 state is not exposed to hosts, so there is nothing to reset.
+pub(crate) fn handle_fpreset(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    ret(engine, 0)
+}
+
+pub(crate) fn handle_p_wenviron(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    // wchar_t*** — point at a slot holding NULL (empty wide environment block).
+    engine.mem_write(WENVIRON_PTR_SLOT, &0_u64.to_le_bytes())?;
+    ret(engine, WENVIRON_PTR_SLOT)
+}
+
+pub(crate) fn handle_p_wargv(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    // Materialize the wide argv table once; later calls return the same stable
+    // address (real UCRT keeps a static `__wargv`).
+    let mut slot = [0_u8; 8];
+    engine
+        .mem_read(WARGV_PTR_SLOT, &mut slot)
+        .context("__p___wargv read slot")?;
+    if u64::from_le_bytes(slot) == 0 {
+        materialize_wide_argv(engine, state)?;
+    }
+    ret(engine, WARGV_PTR_SLOT)
+}
+
+/// Build the guest `wchar_t**` table behind `__p___wargv` from the narrow argv
+/// the runtime session materialized on the CRT page.
+///
+/// One guest-heap block holds `(n+1)` pointer entries followed by the UTF-16
+/// string bodies. Heap exhaustion degrades to an empty argv rather than failing
+/// the CRT startup call.
+fn materialize_wide_argv(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut crate::WinApiState,
+) -> Result<()> {
+    let mut argc_bytes = [0_u8; 4];
+    engine
+        .mem_read(ARGC_SLOT, &mut argc_bytes)
+        .context("__p___wargv read argc")?;
+    let argc = u32::from_le_bytes(argc_bytes);
+    let count = usize::try_from(argc).unwrap_or(0).min(4096);
+
+    let mut args: Vec<String> = Vec::with_capacity(count.min(64));
+    for i in 0..count {
+        let mut ptr_bytes = [0_u8; 8];
+        let slot = NARROW_ARGV_TABLE.wrapping_add(u64::try_from(i).unwrap_or(0).wrapping_mul(8));
+        engine
+            .mem_read(slot, &mut ptr_bytes)
+            .context("__p___wargv read argv pointer")?;
+        let ptr = u64::from_le_bytes(ptr_bytes);
+        if ptr == 0 {
+            break;
+        }
+        args.push(read_guest_str(engine, ptr, 4096)?);
+    }
+
+    let table_len = (args.len() + 1).saturating_mul(8); // entries + NULL terminator
+    let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(args.len());
+    let mut body_total: usize = 0;
+    for arg in &args {
+        let mut bytes = Vec::with_capacity(
+            arg.encode_utf16()
+                .count()
+                .saturating_mul(2)
+                .saturating_add(2),
+        );
+        for unit in arg.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        body_total = body_total.saturating_add(bytes.len());
+        bodies.push(bytes);
+    }
+    let total = u64::try_from(table_len.saturating_add(body_total)).unwrap_or(0);
+    if total == 0 {
+        return Ok(());
+    }
+    let base = state.heap_state.heap.alloc_coherent(engine, total);
+    if base == 0 {
+        return Ok(()); // OOM — slot stays NULL; guest sees an empty argv.
+    }
+    let mut cursor = base.wrapping_add(u64::try_from(table_len).unwrap_or(0));
+    let mut entries: Vec<u64> = Vec::with_capacity(bodies.len());
+    for body in &bodies {
+        entries.push(cursor);
+        engine.mem_write(cursor, body)?;
+        cursor = cursor.wrapping_add(u64::try_from(body.len()).unwrap_or(0));
+    }
+    let mut table = Vec::with_capacity(table_len);
+    for e in &entries {
+        table.extend_from_slice(&e.to_le_bytes());
+    }
+    table.extend_from_slice(&0_u64.to_le_bytes());
+    engine.mem_write(base, &table)?;
+    engine
+        .mem_write(WARGV_PTR_SLOT, &base.to_le_bytes())
+        .context("__p___wargv write slot")?;
+    Ok(())
 }
 
 pub(crate) fn handle_crt_atexit(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {

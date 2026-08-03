@@ -1,8 +1,9 @@
-//! RT_DIALOG resource parsing for PE images.
+//! RT_DIALOG and RT_MENU resource parsing for PE images.
 //!
 //! Walks the `IMAGE_RESOURCE_DIRECTORY` tree in the `.rsrc` section (PE
 //! resource format, Microsoft Learn) and parses each `RT_DIALOG` template
-//! (type **5** — note: 16 is `RT_VERSION`) into a [`DialogTemplate`].
+//! (type **5** — note: 16 is `RT_VERSION`) into a [`DialogTemplate`] and each
+//! `RT_MENU` template (type **4**) into a [`MenuTemplate`].
 //! Parsing is best-effort: malformed or out-of-bounds structures skip that
 //! entry, and a missing/malformed resource tree yields an empty `Vec` — a
 //! broken resource section never fails the module load.
@@ -29,6 +30,11 @@ use crate::PeSectionMap;
 /// Type id of `RT_DIALOG` resources in the resource directory (`winuser.h`:
 /// `MAKEINTRESOURCE(5)`; 16 is `RT_VERSION`).
 const RT_DIALOG: u16 = 5;
+
+/// Type id of `RT_MENU` resources in the resource directory
+/// (`MAKEINTRESOURCE(4)`). `RT_MENUEX` (11) is the extended variant and is
+/// not parsed.
+const RT_MENU: u16 = 4;
 
 /// Window style bits (`WS_*`/`DS_*`, winuser.h) used while parsing dialog
 /// templates. Converted to the raw `u32` on [`DialogTemplate`] because the
@@ -162,6 +168,64 @@ pub enum ItemClass {
     Other(u16),
 }
 
+/// One parsed `RT_MENU` template (classic `MENUITEMTEMPLATE` list).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuTemplate {
+    /// Template id (the resource name at the second directory level); named
+    /// resources have no numeric id and come back as `0` (unaddressable by
+    /// `LoadMenuW`, which resolves ids only)
+    pub id: u32,
+    /// Top-level items in template order (always popups on a menu bar)
+    pub items: Vec<MenuItemTemplate>,
+}
+
+/// One parsed `MENUITEMTEMPLATE` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuItemTemplate {
+    /// Raw `mtOption` flags (`MF_*`), including `MF_POPUP`, `MF_SEPARATOR`,
+    /// and `MF_END`.
+    pub flags: u32,
+    /// Command id (`mtID`); `0` for popups and separators.
+    pub id: u32,
+    /// Item text: the popup title for `MF_POPUP` items, the label otherwise.
+    /// Separators have no text (`None`).
+    pub text: Option<String>,
+    /// Popup entries (popups only, in template order).
+    pub sub: Vec<MenuItemTemplate>,
+}
+
+/// `MF_*` menu option flags (winuser.h) kept on [`MenuItemTemplate::flags`].
+///
+/// Only the bits this parser understands are named; unknown bits pass through
+/// unchanged so consumers can inspect the raw resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MenuFlags(u32);
+
+impl MenuFlags {
+    /// `MF_POPUP`: the entry opens a submenu; its string is the popup title
+    /// and the entries that follow belong to the popup.
+    pub(crate) const POPUP: Self = Self(0x10);
+
+    /// `MF_END`: the last entry of its level. Terminates the current popup's
+    /// entry list (or the top-level bar) during parsing.
+    pub(crate) const END: Self = Self(0x80);
+
+    /// `MF_SEPARATOR`: a separator line, no id or text.
+    pub(crate) const SEPARATOR: Self = Self(0x800);
+
+    /// Raw flag bits.
+    #[must_use]
+    pub(crate) const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// Whether all bits of `flag` are set.
+    #[must_use]
+    pub(crate) const fn contains(self, flag: Self) -> bool {
+        self.0 & flag.0 == flag.0
+    }
+}
+
 impl PixelRect {
     /// Convert a DLU rect to pixels at the standard 8×16 base font.
     #[must_use]
@@ -201,27 +265,33 @@ struct ResourceDir {
     entries: Vec<(u32, u32)>,
 }
 
-/// Parse every `RT_DIALOG` template in `image`.
+/// Parse every resource of `type_id` in `image`, applying `parse_template` to
+/// each data leaf.
 ///
 /// `sections` is the section map (see [`crate::PeMapPlan::sections`]).
 /// Missing or malformed resource data yields an empty `Vec`; this function
 /// never fails the caller.
-pub fn parse_dialogs(image: &[u8], sections: &[PeSectionMap]) -> Vec<DialogTemplate> {
-    let mut dialogs = Vec::new();
+fn parse_resource_type<T>(
+    image: &[u8],
+    sections: &[PeSectionMap],
+    type_id: u16,
+    parse_template: fn(u16, &[u8]) -> Option<T>,
+) -> Vec<T> {
+    let mut out = Vec::new();
     let Some(root_rva) = resource_root_rva(image, sections) else {
-        return dialogs;
+        return out;
     };
     let Some(root_off) = rva_to_file(image, sections, root_rva) else {
-        return dialogs;
+        return out;
     };
     let Some(root) = read_resource_dir(image, root_off) else {
-        return dialogs;
+        return out;
     };
 
     for (type_name, type_off) in root.entries {
         if !matches!(
             resource_name(image, sections, root_rva, type_name),
-            Some(ResourceName::Id(RT_DIALOG))
+            Some(ResourceName::Id(id)) if id == type_id
         ) {
             continue;
         }
@@ -238,13 +308,31 @@ pub fn parse_dialogs(image: &[u8], sections: &[PeSectionMap]) -> Vec<DialogTempl
         for (id_name, id_off) in type_dir.entries {
             let template_id = match resource_name(image, sections, root_rva, id_name) {
                 Some(ResourceName::Id(id)) => id,
-                // A named template has no id addressable by DialogBoxParam.
+                // A named template has no id addressable by id-lookup APIs.
                 _ => 0,
             };
-            collect_language_leaves(image, sections, root_rva, template_id, id_off, &mut dialogs);
+            collect_language_leaves(
+                image,
+                sections,
+                root_rva,
+                template_id,
+                id_off,
+                parse_template,
+                &mut out,
+            );
         }
     }
-    dialogs
+    out
+}
+
+/// Parse every `RT_DIALOG` template in `image`.
+pub fn parse_dialogs(image: &[u8], sections: &[PeSectionMap]) -> Vec<DialogTemplate> {
+    parse_resource_type(image, sections, RT_DIALOG, parse_dialog_template)
+}
+
+/// Parse every `RT_MENU` template in `image`.
+pub fn parse_menus(image: &[u8], sections: &[PeSectionMap]) -> Vec<MenuTemplate> {
+    parse_resource_type(image, sections, RT_MENU, parse_menu_template)
 }
 
 /// Resolve a directory entry to a file offset.
@@ -262,17 +350,18 @@ fn entry_target(
     rva_to_file(image, sections, rva)
 }
 
-/// Collect dialog templates from a template-id level entry.
+/// Collect templates from a template-id level entry.
 ///
 /// The entry either points directly at an `IMAGE_RESOURCE_DATA_ENTRY` (single
 /// language) or at a language subdirectory whose leaves are data entries.
-fn collect_language_leaves(
+fn collect_language_leaves<T>(
     image: &[u8],
     sections: &[PeSectionMap],
     root_rva: u32,
     template_id: u16,
     entry_off: u32,
-    out: &mut Vec<DialogTemplate>,
+    parse_template: fn(u16, &[u8]) -> Option<T>,
+    out: &mut Vec<T>,
 ) {
     if (entry_off & 0x8000_0000) != 0 {
         let Some(dir_off) = entry_target(image, sections, root_rva, entry_off) else {
@@ -282,21 +371,38 @@ fn collect_language_leaves(
             return;
         };
         for (_, leaf_off) in dir.entries {
-            push_dialog_from_leaf(image, sections, root_rva, template_id, leaf_off, out);
+            push_template_from_leaf(
+                image,
+                sections,
+                root_rva,
+                template_id,
+                leaf_off,
+                parse_template,
+                out,
+            );
         }
     } else {
-        push_dialog_from_leaf(image, sections, root_rva, template_id, entry_off, out);
+        push_template_from_leaf(
+            image,
+            sections,
+            root_rva,
+            template_id,
+            entry_off,
+            parse_template,
+            out,
+        );
     }
 }
 
 /// Read one `IMAGE_RESOURCE_DATA_ENTRY` leaf and parse its template.
-fn push_dialog_from_leaf(
+fn push_template_from_leaf<T>(
     image: &[u8],
     sections: &[PeSectionMap],
     root_rva: u32,
     template_id: u16,
     leaf_off: u32,
-    out: &mut Vec<DialogTemplate>,
+    parse_template: fn(u16, &[u8]) -> Option<T>,
+    out: &mut Vec<T>,
 ) {
     let Some((data_rva, data_size)) = read_data_entry(image, sections, root_rva, leaf_off) else {
         return;
@@ -313,8 +419,8 @@ fn push_dialog_from_leaf(
     let Some(tpl_bytes) = image.get(tpl_off..end) else {
         return;
     };
-    if let Some(dialog) = parse_dialog_template(template_id, tpl_bytes) {
-        out.push(dialog);
+    if let Some(template) = parse_template(template_id, tpl_bytes) {
+        out.push(template);
     }
 }
 
@@ -562,6 +668,95 @@ fn parse_dialog_item(bytes: &[u8], pos: usize) -> Option<(DialogItemTemplate, us
         },
         p,
     ))
+}
+
+/// Parse one classic `RT_MENU` template from its resource bytes.
+///
+/// Layout (winuser.h `MENUITEMTEMPLATE`, as emitted by `windres`): a leading
+/// zero DWORD header, then packed entries. Each entry is `WORD mtOption`,
+/// then — for `MF_POPUP` entries — the null-terminated title string directly
+/// (no `mtID`), or — otherwise — `WORD mtID` followed by the null-terminated
+/// text. Popup entries are followed by their sub-entries; an entry whose
+/// option carries `MF_END` (0x80) is the last of its level. Entries are NOT
+/// DWORD-aligned in this format (unlike dialog items): each entry starts
+/// immediately after the previous string's terminator.
+fn parse_menu_template(template_id: u16, bytes: &[u8]) -> Option<MenuTemplate> {
+    // `windres` prefixes the entry list with a zero version/header DWORD.
+    let header = u32::from(read_u16_at(bytes, 0)?) | (u32::from(read_u16_at(bytes, 2)?) << 16);
+    let mut pos = if header == 0 { 4 } else { 0 };
+    let items = parse_menu_entries(bytes, &mut pos, true)?;
+    Some(MenuTemplate {
+        id: u32::from(template_id),
+        items,
+    })
+}
+
+/// Parse the entries of one menu level.
+///
+/// Reads entries until an `MF_END` entry (the last of its level, per
+/// `MENUITEMTEMPLATE`). A nested level that runs past `bytes` fails (the
+/// whole template is treated as absent, like malformed dialog data); the top
+/// level tolerates a missing terminator by accepting what parsed.
+fn parse_menu_entries(
+    bytes: &[u8],
+    pos: &mut usize,
+    top_level: bool,
+) -> Option<Vec<MenuItemTemplate>> {
+    let mut items = Vec::new();
+    loop {
+        let entry = parse_menu_entry(bytes, pos)?;
+        let is_last = entry.flags & MenuFlags::END.bits() != 0;
+        items.push(entry);
+        if is_last {
+            break;
+        }
+        if *pos >= bytes.len() {
+            // Unterminated level. Accept the partial list only at the top
+            // level; a popup body must close with MF_END.
+            if top_level {
+                break;
+            }
+            return None;
+        }
+    }
+    Some(items)
+}
+
+/// Parse one `MENUITEMTEMPLATE` entry, consuming its sub-entries when it is a
+/// popup.
+fn parse_menu_entry(bytes: &[u8], pos: &mut usize) -> Option<MenuItemTemplate> {
+    let option = u32::from(read_u16_at(bytes, *pos)?);
+    *pos = pos.checked_add(2)?;
+    let flags = MenuFlags(option);
+    let (id, text) = if flags.contains(MenuFlags::POPUP) {
+        // Popup: no mtID; the title string follows the option word.
+        let (title, next) = read_utf16_string(bytes, *pos, None)?;
+        *pos = next;
+        (0, Some(title))
+    } else {
+        let id = u32::from(read_u16_at(bytes, *pos)?);
+        *pos = pos.checked_add(2)?;
+        let (text, next) = read_utf16_string(bytes, *pos, None)?;
+        *pos = next;
+        // A separator is an empty-string entry; `windres` emits it with a
+        // zero option word (id 0, no text), not with the MF_SEPARATOR bit.
+        let text = if flags.contains(MenuFlags::SEPARATOR) || text.is_empty() {
+            None
+        } else {
+            Some(text)
+        };
+        (id, text)
+    };
+    let mut sub = Vec::new();
+    if flags.contains(MenuFlags::POPUP) {
+        sub = parse_menu_entries(bytes, pos, false)?;
+    }
+    Some(MenuItemTemplate {
+        flags: option,
+        id,
+        text,
+        sub,
+    })
 }
 
 /// Parse the class field of a dialog item.
@@ -1018,5 +1213,188 @@ mod tests {
         put_u16(&mut image, 0); // named
         put_u16(&mut image, 16); // 16 id entries
         assert!(parse_dialogs(&image, &sections).is_empty());
+    }
+
+    /// Build the classic `MENUITEMTEMPLATE` bytes for one entry.
+    ///
+    /// `popup` selects the no-`mtID` layout (`option`, then title string);
+    /// otherwise the entry is `option`, `id`, then text.
+    fn menu_entry(popup: bool, option: u16, id: u16, text: &str) -> Vec<u8> {
+        let mut b = Vec::new();
+        put_u16(&mut b, option);
+        if !popup {
+            put_u16(&mut b, id);
+        }
+        put_utf16(&mut b, text);
+        b
+    }
+
+    #[test]
+    fn parses_classic_menu_template() {
+        // windres layout: zero DWORD header, then packed entries.
+        let mut b = Vec::new();
+        put_u32(&mut b, 0); // header
+        // "&File" popup (MF_POPUP, no MF_END — more popups follow).
+        b.extend(menu_entry(true, 0x0010, 0, "&File"));
+        b.extend(menu_entry(false, 0x0000, 0x0100, "&New\tCtrl+N"));
+        b.extend(menu_entry(false, 0x0000, 0x0103, "Save &As..."));
+        // Separator: windres emits option 0 + empty string, no MF_SEPARATOR.
+        b.extend(menu_entry(false, 0x0000, 0x0000, ""));
+        // Last File entry: MF_END (0x80) terminates the popup body.
+        b.extend(menu_entry(false, 0x0080, 0x0108, "E&xit"));
+        // "&Edit" popup with MF_END: the bar's last entry.
+        b.extend(menu_entry(true, 0x0090, 0, "&Edit"));
+        b.extend(menu_entry(false, 0x0000, 0x0110, "&Undo\tCtrl+Z"));
+        b.extend(menu_entry(false, 0x0080, 0x0117, "Time/&Date\tF5"));
+
+        let m = parse_menu_template(0x201, &b).expect("template");
+        assert_eq!(m.id, 0x201);
+        assert_eq!(m.items.len(), 2);
+
+        let file = &m.items[0];
+        assert_eq!(
+            file.flags & MenuFlags::POPUP.bits(),
+            MenuFlags::POPUP.bits()
+        );
+        assert_eq!(file.text.as_deref(), Some("&File"));
+        assert_eq!(file.id, 0);
+        assert_eq!(file.sub.len(), 4);
+        assert_eq!(file.sub[0].id, 0x0100);
+        assert_eq!(file.sub[0].text.as_deref(), Some("&New\tCtrl+N"));
+        assert_eq!(file.sub[0].flags & MenuFlags::END.bits(), 0);
+        assert_eq!(file.sub[1].id, 0x0103);
+        assert_eq!(file.sub[1].text.as_deref(), Some("Save &As..."));
+        // Separator: no text, id 0.
+        assert_eq!(file.sub[2].id, 0);
+        assert_eq!(file.sub[2].text, None);
+        // MF_END entry is included in the popup body.
+        assert_eq!(file.sub[3].id, 0x0108);
+        assert_eq!(file.sub[3].text.as_deref(), Some("E&xit"));
+        assert_ne!(file.sub[3].flags & MenuFlags::END.bits(), 0);
+
+        let edit = &m.items[1];
+        assert_ne!(edit.flags & MenuFlags::END.bits(), 0);
+        assert_eq!(edit.text.as_deref(), Some("&Edit"));
+        assert_eq!(edit.sub.len(), 2);
+        assert_eq!(edit.sub[1].id, 0x0117);
+        assert_ne!(edit.sub[1].flags & MenuFlags::END.bits(), 0);
+    }
+
+    #[test]
+    fn parses_menu_separator_with_flag() {
+        // Some toolchains emit MF_SEPARATOR (0x800) explicitly.
+        let mut b = Vec::new();
+        put_u32(&mut b, 0); // header
+        b.extend(menu_entry(true, 0x0090, 0, "&File"));
+        b.extend(menu_entry(false, 0x0800, 0, ""));
+        b.extend(menu_entry(false, 0x0080, 7, "Item"));
+
+        let m = parse_menu_template(9, &b).expect("template");
+        let file = &m.items[0];
+        assert_eq!(file.sub.len(), 2);
+        assert_eq!(file.sub[0].text, None);
+        assert_ne!(file.sub[0].flags & MenuFlags::SEPARATOR.bits(), 0);
+        assert_eq!(file.sub[1].id, 7);
+        assert_eq!(file.sub[1].text.as_deref(), Some("Item"));
+    }
+
+    #[test]
+    fn menu_without_header_is_accepted() {
+        // No leading zero DWORD: entries start immediately.
+        let mut b = Vec::new();
+        b.extend(menu_entry(true, 0x0010, 0, "&File"));
+        b.extend(menu_entry(false, 0x0080, 3, "E&xit"));
+
+        let m = parse_menu_template(1, &b).expect("template");
+        assert_eq!(m.items.len(), 1);
+        assert_eq!(m.items[0].sub.len(), 1);
+        assert_eq!(m.items[0].sub[0].id, 3);
+    }
+
+    #[test]
+    fn truncated_menu_template_is_not_fatal() {
+        // Popup body never closes (no MF_END, bytes end inside it).
+        let mut b = Vec::new();
+        put_u32(&mut b, 0);
+        b.extend(menu_entry(true, 0x0090, 0, "&File"));
+        b.extend(menu_entry(false, 0x0000, 1, "A"));
+        assert!(parse_menu_template(1, &b).is_none());
+        // Missing bytes entirely.
+        assert!(parse_menu_template(1, &[]).is_none());
+    }
+
+    #[test]
+    fn parses_menu_from_synthetic_resource_tree() {
+        let sections = vec![fake_rsrc_section()];
+        let mut image = vec![0_u8; 0x1200];
+
+        // Root dir @0x200: type RT_MENU → subdir 0x210.
+        let mut root = Vec::new();
+        put_u32(&mut root, 0);
+        put_u32(&mut root, 0);
+        put_u16(&mut root, 0);
+        put_u16(&mut root, 0);
+        put_u16(&mut root, 0);
+        put_u16(&mut root, 1);
+        put_u32(&mut root, u32::from(RT_MENU));
+        put_u32(&mut root, 0x8000_0018);
+        copy_into(&mut image, 0x200, &root);
+
+        // Type dir @0x218: menu id 0x201 → subdir 0x230.
+        let mut type_dir = Vec::new();
+        put_u32(&mut type_dir, 0);
+        put_u32(&mut type_dir, 0);
+        put_u16(&mut type_dir, 0);
+        put_u16(&mut type_dir, 0);
+        put_u16(&mut type_dir, 0);
+        put_u16(&mut type_dir, 1);
+        put_u32(&mut type_dir, 0x0201);
+        put_u32(&mut type_dir, 0x8000_0030);
+        copy_into(&mut image, 0x218, &type_dir);
+
+        // Language dir @0x230: language 0x409 → data entry 0x248.
+        let mut lang = Vec::new();
+        put_u32(&mut lang, 0);
+        put_u32(&mut lang, 0);
+        put_u16(&mut lang, 0);
+        put_u16(&mut lang, 0);
+        put_u16(&mut lang, 0);
+        put_u16(&mut lang, 1);
+        put_u32(&mut lang, 0x0409);
+        put_u32(&mut lang, 0x48);
+        copy_into(&mut image, 0x230, &lang);
+
+        // Data entry @0x248: template at rva 0x1200 → file 0x400.
+        let mut data = Vec::new();
+        put_u32(&mut data, 0x1200);
+        put_u32(&mut data, 0);
+        put_u32(&mut data, 0);
+        put_u32(&mut data, 0);
+        copy_into(&mut image, 0x248, &data);
+
+        // Template @0x400: bar with one popup and one item.
+        let mut tpl = Vec::new();
+        put_u32(&mut tpl, 0); // header
+        tpl.extend(menu_entry(true, 0x0010, 0, "&File"));
+        tpl.extend(menu_entry(false, 0x0080, 0x0123, "&Go To...\tCtrl+G"));
+        copy_into(&mut image, 0x400, &tpl);
+        let size_bytes = u32::try_from(tpl.len()).expect("size fits");
+        copy_into(&mut image, 0x24C, &size_bytes.to_le_bytes());
+
+        let menus = parse_menus(&image, &sections);
+        assert_eq!(menus.len(), 1);
+        let m = &menus[0];
+        assert_eq!(m.id, 0x201);
+        assert_eq!(m.items.len(), 1);
+        assert_eq!(m.items[0].text.as_deref(), Some("&File"));
+        assert_eq!(m.items[0].sub.len(), 1);
+        assert_eq!(m.items[0].sub[0].id, 0x0123);
+        assert_eq!(m.items[0].sub[0].text.as_deref(), Some("&Go To...\tCtrl+G"));
+    }
+
+    #[test]
+    fn no_menu_resource_yields_empty() {
+        assert!(parse_menus(&[], &[]).is_empty());
+        assert!(parse_menus(&[0_u8; 64], &[]).is_empty());
     }
 }

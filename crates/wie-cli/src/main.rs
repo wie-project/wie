@@ -91,6 +91,12 @@ enum Command {
         #[arg(long)]
         screenshot: Option<PathBuf>,
 
+        /// Drive the GUI guest with a scripted input file (lines: sleep <ms>
+        /// | key <vk> [shift|ctrl] | type <text> | menu <id>). Requires
+        /// --gui. The `WIE_INPUT_SCRIPT` env var names a script too.
+        #[arg(long)]
+        input_script: Option<PathBuf>,
+
         /// Guest argv after the module name (`wie-cli run pe -- -n 3 -m hi`).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         guest_args: Vec<String>,
@@ -162,16 +168,26 @@ fn main() -> Result<()> {
             persistent,
             gui,
             screenshot,
+            input_script,
             guest_args,
         } => {
             // GUI/screenshot mode takes precedence over persistent/micro.
             if gui || screenshot.is_some() {
                 if gui {
-                    return gui::app::run_gui_windowed(&path);
+                    if let Some(script) = input_script.as_ref()
+                        && !script.is_file()
+                    {
+                        bail!("input script not found: {}", script.display());
+                    }
+                    let script = gui::input_script::script_path(input_script.as_deref());
+                    return gui::app::run_gui_windowed(&path, script);
                 }
                 if let Some(out_path) = screenshot {
                     return gui::headless::run_screenshot(&path, &out_path);
                 }
+            }
+            if input_script.is_some() {
+                bail!("--input-script requires --gui");
             }
 
             if persistent {
