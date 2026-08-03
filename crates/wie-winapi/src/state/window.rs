@@ -64,6 +64,19 @@ pub struct WindowState {
     pub last_file_dialog_path: Option<String>,
     pub(crate) comm_dlg_extended_error: u32,
     pub(crate) next_menu_handle: crate::handles::Hmenu,
+    /// All fake USER32 accelerator tables loaded by `LoadAcceleratorsA/W`;
+    /// keyed by handle. The parsed entries live on
+    /// `ProcessState::main_module_accelerators`, so each record only carries
+    /// the (module, resource id) pair needed to resolve them.
+    pub(crate) accel_tables: Vec<crate::user32::accel::AccelRecord>,
+    /// All fake USER32 resource menus loaded by `LoadMenuA/W` (and by a
+    /// class's `lpszMenuName` at window creation); keyed by handle. The
+    /// parsed items live on `ProcessState::main_module_menus`, so each record
+    /// only carries the (module, resource id) pair needed to resolve them —
+    /// and that pair is the cache key, so repeated loads return the same
+    /// `HMENU`.
+    pub(crate) resource_menus: Vec<crate::user32::menu::ResourceMenuRecord>,
+    pub(crate) next_accel_handle: crate::handles::Haccel,
     /// Guest VA of the modal-dialog result slot (`u32`), set by session init.
     ///
     /// `EndDialog` writes the result here; the in-guest `DialogBoxParam` stub
@@ -78,6 +91,7 @@ impl Default for WindowState {
             next_window_class_atom: 0xC000,
             next_window_handle: crate::handles::Hwnd::from(0x0000_0000_6610_0000),
             next_menu_handle: crate::handles::Hmenu::from(0x0000_0000_6620_0000),
+            next_accel_handle: crate::handles::Haccel::from(0x0000_0000_6640_0000),
             next_windows_hook_handle: crate::handles::HookHandle::from(0x0000_0000_6630_0000),
             next_global_atom: 0xC000,
             next_registered_message: 0xC000,
@@ -113,6 +127,8 @@ impl Default for WindowState {
             comm_dlg_extended_error: 0,
             menus: Vec::new(),
             menu_dirty: false,
+            accel_tables: Vec::new(),
+            resource_menus: Vec::new(),
         }
     }
 }
@@ -146,6 +162,14 @@ pub struct WindowClassRecord {
 
     /// Small icon handle.
     pub small_icon_handle: u64,
+
+    /// `lpszMenuName` from the `WNDCLASS(EX)` struct: a `MAKEINTRESOURCE`
+    /// menu resource id (value < 0x10000) or a string-name pointer.
+    ///
+    /// Resolved to a fake `HMENU` at `CreateWindowEx` time when the window is
+    /// created without an explicit `hMenu` argument (the class-menu path
+    /// Windows applies to top-level windows).
+    pub menu_name: u64,
 
     /// Whether the class was registered through the Unicode API.
     pub unicode: bool,

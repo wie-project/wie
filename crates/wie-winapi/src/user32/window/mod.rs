@@ -27,13 +27,19 @@ pub use class::{
     handle_set_capture, handle_set_class_long_ptr_a, handle_set_class_long_ptr_w,
     handle_set_window_long_ptr_a, handle_set_window_long_ptr_w,
 };
+// Test-only: the placement tests assert against the same 44-byte struct size
+// the handlers write/validate. The lib build does not reference it through
+// this path (geom.rs uses the const directly), so gate the re-export.
+#[cfg(test)]
+pub(crate) use geom::WINDOWPLACEMENT_LENGTH;
 pub(crate) use geom::sys_color;
 pub use geom::{
     handle_adjust_window_rect_ex, handle_client_to_screen, handle_get_client_rect,
     handle_get_desktop_window, handle_get_dlg_ctrl_id, handle_get_sys_color,
-    handle_get_sys_color_brush, handle_get_window, handle_get_window_thread_process_id,
-    handle_is_child, handle_is_iconic, handle_is_zoomed, handle_move_window,
-    handle_screen_to_client, handle_scroll_window_ex, handle_set_rect,
+    handle_get_sys_color_brush, handle_get_window, handle_get_window_placement,
+    handle_get_window_thread_process_id, handle_is_child, handle_is_iconic, handle_is_zoomed,
+    handle_move_window, handle_screen_to_client, handle_scroll_window_ex, handle_set_rect,
+    handle_set_window_placement,
 };
 
 /// Handles `USER32.dll!GetWindowRect`.
@@ -836,6 +842,60 @@ pub fn handle_get_window_text_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     Ok(WinApiHandlerResult {
         return_address,
         return_value,
+    })
+}
+
+/// Handles `USER32.dll!GetWindowTextLengthW`.
+pub fn handle_get_window_text_length_w(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let window_handle = engine
+        .read_rcx()
+        .context("failed to read RCX for GetWindowTextLengthW")?;
+
+    let text = resolve_window_text(state, window_handle);
+
+    // Count of UTF-16 units — exactly what GetWindowTextW would copy,
+    // excluding the terminating NUL. Empty/unknown text resolves to "" → 0.
+    let length = u64::try_from(text.encode_utf16().count())
+        .context("window text length does not fit u64")?;
+
+    let return_address = engine
+        .return_from_win64_api(length)
+        .context("failed to return from GetWindowTextLengthW")?;
+
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: length,
+    })
+}
+/// Handles `USER32.dll!GetWindowTextLengthA`.
+pub fn handle_get_window_text_length_a(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let window_handle = engine
+        .read_rcx()
+        .context("failed to read RCX for GetWindowTextLengthA")?;
+
+    let text = resolve_window_text(state, window_handle);
+
+    // Count of ANSI characters — what GetWindowTextA would copy, excluding
+    // the terminating NUL. ANSI output is one byte per char here, so the
+    // byte count is the character count. Empty/unknown text resolves to
+    // "" → 0.
+    let length = u64::try_from(text.len()).context("window text length does not fit u64")?;
+
+    let return_address = engine
+        .return_from_win64_api(length)
+        .context("failed to return from GetWindowTextLengthA")?;
+
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: length,
     })
 }
 

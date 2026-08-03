@@ -4,7 +4,9 @@ use crate::guest_memory::{
     checked_field_address, read_u32 as read_guest_u32, read_u64 as read_guest_u64,
     write_u16 as write_guest_u16,
 };
-use crate::guest_string::{write_ansi_c_string, write_utf16_c_string};
+use crate::guest_string::{
+    read_ansi_lossy, read_utf16_lossy, write_ansi_c_string, write_utf16_c_string,
+};
 use crate::{FileDialogPolicy, HandlerContext, WinApiHandlerResult};
 use anyhow::{Context, Result};
 
@@ -54,6 +56,140 @@ pub fn handle_comm_dlg_extended_error(ctx: &mut HandlerContext<'_>) -> Result<Wi
         return_address,
         return_value,
     })
+}
+
+/// Handles `comdlg32.dll!GetFileTitleA`.
+pub fn handle_get_file_title_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_get_file_title(ctx, false, "GetFileTitleA")
+}
+
+/// Handles `comdlg32.dll!GetFileTitleW`.
+pub fn handle_get_file_title_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_get_file_title(ctx, true, "GetFileTitleW")
+}
+
+/// GetFileTitle's documented return for an invalid file name / title buffer.
+const GET_FILE_TITLE_ERR_INVALID: u64 = 1;
+
+/// Upper bound for the path scan; real paths never approach this, and the
+/// page-safe readers stop at the NUL far earlier.
+const GET_FILE_TITLE_MAX_PATH: usize = 0x8000;
+
+/// Handles `comdlg32.dll!GetFileTitleA/W` — copies the basename of a path
+/// (everything after the last `\` or `/`) into a fixed-size guest buffer.
+///
+/// Return contract (MSDN): 0 = success, 1 = invalid file name, negative =
+/// buffer too small (the absolute value is the required size in characters
+/// including the terminating NUL).
+fn handle_get_file_title(
+    ctx: &mut HandlerContext<'_>,
+    unicode: bool,
+    api_name: &str,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let file_ptr = engine
+        .read_rcx()
+        .with_context(|| format!("failed to read RCX for {api_name}"))?;
+    let title_ptr = engine
+        .read_rdx()
+        .with_context(|| format!("failed to read RDX for {api_name}"))?;
+    let cch_raw = engine
+        .read_r8()
+        .with_context(|| format!("failed to read R8 for {api_name}"))?;
+    // cchTitle is a WORD (u16); clamp oversized guest values defensively.
+    let cch_title = usize::from(u16::try_from(cch_raw).unwrap_or(u16::MAX));
+
+    let return_value = if title_ptr == 0 {
+        // Real GetFileTitle treats a NULL title buffer as an invalid parameter.
+        tracing::warn!(api = api_name, "GetFileTitle called with NULL title buffer");
+        GET_FILE_TITLE_ERR_INVALID
+    } else {
+        let path = if unicode {
+            read_utf16_lossy(engine, file_ptr, GET_FILE_TITLE_MAX_PATH)
+                .with_context(|| format!("failed to read {api_name} path"))?
+        } else {
+            read_ansi_lossy(engine, file_ptr, GET_FILE_TITLE_MAX_PATH)
+                .with_context(|| format!("failed to read {api_name} path"))?
+        };
+
+        // Basename: everything after the last `\` or `/` (the unwrap_or
+        // guards the empty-string case: no separator leaves file_start at 0,
+        // and `get(0..)` on an empty string is None).
+        let file_start = path
+            .rfind(['\\', '/'])
+            .map_or(0, |index| index.saturating_add(1));
+        let basename = path.get(file_start..).unwrap_or("");
+
+        if basename.is_empty() {
+            // A path ending in a separator ("C:\foo\") or a genuinely empty
+            // string has no basename; the real API reports an invalid file
+            // name. Still NUL-terminate the buffer.
+            if unicode {
+                write_utf16_c_string(engine, title_ptr, cch_title, "")?;
+            } else {
+                write_ansi_c_string(engine, title_ptr, cch_title, "")?;
+            }
+            GET_FILE_TITLE_ERR_INVALID
+        } else {
+            write_get_file_title(engine, title_ptr, cch_title, basename, unicode)?
+        }
+    };
+
+    let return_address = engine
+        .return_from_win64_api(return_value)
+        .with_context(|| format!("failed to return from {api_name}"))?;
+
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Copies `basename` into the guest title buffer, returning the GetFileTitle
+/// result code (0 on success, the negated required size on truncation).
+///
+/// The capacity accounting matches the character width: UTF-16 units for the
+/// W variant, bytes for the A variant (A buffers are byte-counted).
+fn write_get_file_title(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    title_ptr: u64,
+    cch_title: usize,
+    basename: &str,
+    unicode: bool,
+) -> Result<u64> {
+    let content_chars = if unicode {
+        basename.encode_utf16().count()
+    } else {
+        basename.len()
+    };
+    let required = content_chars
+        .checked_add(1)
+        .context("GetFileTitle required size overflow")?;
+
+    if cch_title == 0 || content_chars >= cch_title {
+        // Buffer too small: write cch_title-1 characters plus NUL (the c-string
+        // writers enforce the cap), and return -(required incl. NUL) as the
+        // documented negative int. The write functions never overflow the
+        // buffer even when the char-aligned prefix is longer than the cap.
+        let truncated: String = basename.chars().take(cch_title.saturating_sub(1)).collect();
+        if unicode {
+            write_utf16_c_string(engine, title_ptr, cch_title, &truncated)?;
+        } else {
+            write_ansi_c_string(engine, title_ptr, cch_title, &truncated)?;
+        }
+        // Two's-complement of the required size in the low 32 bits (EAX) so
+        // the guest sees the negative int return.
+        let required_u32 =
+            u32::try_from(required).context("GetFileTitle required size exceeds u32")?;
+        Ok(u64::from(0_u32.wrapping_sub(required_u32)))
+    } else {
+        if unicode {
+            write_utf16_c_string(engine, title_ptr, cch_title, basename)?;
+        } else {
+            write_ansi_c_string(engine, title_ptr, cch_title, basename)?;
+        }
+        Ok(0)
+    }
 }
 
 /// Handles `comdlg32.dll!ChooseColorA` (simulates accept with black color).

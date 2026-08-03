@@ -1,10 +1,11 @@
 use super::{
-    Context, Result, WinApiHandlerResult, WinApiState, allocate_menu_handle, checked_field_address,
-    read_guest_ansi_lossy, read_guest_u32, read_guest_u64, read_guest_utf16_lossy,
-    write_guest_ansi_c_string, write_guest_u32, write_guest_utf16_c_string,
+    Context, Result, WinApiHandlerResult, WinApiState, WindowClassRecord, allocate_menu_handle,
+    checked_field_address, read_guest_ansi_lossy, read_guest_u32, read_guest_u64,
+    read_guest_utf16_lossy, write_guest_ansi_c_string, write_guest_u32, write_guest_utf16_c_string,
 };
 use crate::HandlerContext;
 use crate::handles::{Hmenu, Hwnd};
+use wie_pe::resources::{MenuItemTemplate, MenuTemplate};
 
 /// One fake USER32 menu: its handle and the ordered item list. A `Popup`
 /// entry references another menu by handle, so the flat `Vec<MenuRecord>`
@@ -233,6 +234,207 @@ pub fn handle_create_popup_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         return_address,
         return_value: handle,
     })
+}
+/// One loaded fake resource menu (`LoadMenuA/W` or a class `lpszMenuName`).
+///
+/// The parsed items live on `ProcessState::main_module_menus`, so the record
+/// only carries the (module, resource id) pair needed to resolve them — and
+/// that pair doubles as the cache key, so repeated loads return the same
+/// `HMENU` (mirrors `AccelRecord`).
+#[derive(Debug, Clone)]
+pub struct ResourceMenuRecord {
+    /// Fake `HMENU` returned to the guest.
+    pub handle: Hmenu,
+    /// Module instance the menu was loaded from.
+    pub instance_handle: u64,
+    /// Resource id the menu was loaded under.
+    pub menu_id: u16,
+}
+
+/// Handles `USER32.dll!LoadMenuW`.
+pub fn handle_load_menu_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_load_menu(ctx, "LoadMenuW")
+}
+/// Handles `USER32.dll!LoadMenuA`.
+pub fn handle_load_menu_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_load_menu(ctx, "LoadMenuA")
+}
+
+/// Shared `LoadMenuA/W` implementation.
+///
+/// Win64 ABI: `rcx` = hinst, `rdx` = `lpMenuName`. Only `MAKEINTRESOURCE`
+/// ids are resolvable — a string-named menu has no parsed name→template
+/// mapping and returns `NULL`, mirroring how `LoadStringA/W` and
+/// `LoadAcceleratorsA/W` resolve ids only. The resource is only parsed for
+/// the main EXE module, so any other `hinst` also resolves to `NULL`.
+fn handle_load_menu(ctx: &mut HandlerContext<'_>, api_name: &str) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let instance_handle = engine
+        .read_rcx()
+        .with_context(|| format!("failed to read RCX for {api_name}"))?;
+    let menu_name_raw = engine
+        .read_rdx()
+        .with_context(|| format!("failed to read RDX for {api_name}"))?;
+
+    let menu_id = if menu_name_raw >> 16 == 0 {
+        u16::try_from(menu_name_raw & u64::from(u16::MAX)).unwrap_or(0)
+    } else {
+        0
+    };
+
+    let return_value = if menu_id == 0 || instance_handle != ctx.environment.image_base {
+        // Not the main EXE (or a named menu): no parsed template to resolve.
+        0
+    } else {
+        load_resource_menu(state, instance_handle, menu_id)?
+    };
+
+    tracing::debug!(
+        target: "wiegui",
+        instance_handle,
+        menu_id,
+        hmenu = return_value,
+        "{api_name}"
+    );
+
+    let return_address = engine
+        .return_from_win64_api(return_value)
+        .with_context(|| format!("failed to return from {api_name}"))?;
+
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Resolve `(instance_handle, menu_id)` to a fake `HMENU`, caching it.
+///
+/// The template is converted into the same flat `MenuRecord` tree the
+/// programmatic `CreateMenu`/`AppendMenu` path builds, so `GetMenuState`,
+/// `GetMenuItemInfo` and the host `MacMenuBar` mirror work unchanged. An id
+/// that does not match any parsed template resolves to `NULL`; a repeat load
+/// of the same pair returns the previously allocated handle.
+pub(crate) fn load_resource_menu(
+    state: &mut WinApiState,
+    instance_handle: u64,
+    menu_id: u16,
+) -> Result<u64> {
+    let template = state
+        .process
+        .main_module_menus
+        .iter()
+        .find(|template| template.id == u32::from(menu_id))
+        .cloned();
+    let Some(template) = template else {
+        return Ok(0);
+    };
+
+    if let Some(record) = state
+        .window_state()
+        .resource_menus
+        .iter()
+        .find(|record| record.instance_handle == instance_handle && record.menu_id == menu_id)
+    {
+        return Ok(record.handle.as_u64());
+    }
+
+    let handle = allocate_menu_handle(state)?;
+    build_template_menu_records(state, &template, handle)?;
+    state
+        .window_state()
+        .resource_menus
+        .push(ResourceMenuRecord {
+            handle: Hmenu::from(handle),
+            instance_handle,
+            menu_id,
+        });
+    state.window_state().menu_dirty = true;
+    Ok(handle)
+}
+
+/// Build the `MenuRecord` tree for a parsed `MenuTemplate`.
+///
+/// The top-level record gets `handle`; `MF_POPUP` items get fresh child
+/// records (allocated before their parent entry references them), and
+/// `MF_STRING`/`MF_SEPARATOR` items map 1:1 onto `MenuEntry`.
+fn build_template_menu_records(
+    state: &mut WinApiState,
+    template: &MenuTemplate,
+    handle: u64,
+) -> Result<()> {
+    let mut items = Vec::new();
+    for item in &template.items {
+        items.push(build_template_menu_entry(state, item)?);
+    }
+    state.window_state().menus.push(MenuRecord {
+        handle: Hmenu::from(handle),
+        items,
+    });
+    Ok(())
+}
+
+/// Convert one parsed `MenuItemTemplate` into the native `MenuEntry` the
+/// programmatic path uses, building child records for popup submenus.
+fn build_template_menu_entry(
+    state: &mut WinApiState,
+    item: &MenuItemTemplate,
+) -> Result<MenuEntry> {
+    if item.flags & MF_POPUP != 0 {
+        let submenu_handle = allocate_menu_handle(state)?;
+        let mut sub_items = Vec::new();
+        for sub in &item.sub {
+            sub_items.push(build_template_menu_entry(state, sub)?);
+        }
+        state.window_state().menus.push(MenuRecord {
+            handle: Hmenu::from(submenu_handle),
+            items: sub_items,
+        });
+        Ok(MenuEntry::Popup {
+            text: item.text.clone().unwrap_or_default(),
+            submenu: Hmenu::from(submenu_handle),
+        })
+    } else if item.flags & MF_SEPARATOR != 0 {
+        Ok(MenuEntry::Separator)
+    } else {
+        Ok(MenuEntry::Item {
+            id: item.id,
+            text: item.text.clone().unwrap_or_default(),
+            enabled: item.flags & (MF_GRAYED | MF_DISABLED) == 0,
+            checked: item.flags & MF_CHECKED != 0,
+        })
+    }
+}
+
+/// Resolve the `HMENU` a new window record carries.
+///
+/// An explicit `hMenu` argument wins; otherwise a registered class's
+/// `lpszMenuName` — a `MAKEINTRESOURCE` menu resource of the class's
+/// module — is loaded (Windows applies the class menu to top-level windows
+/// created without a menu). String-named class menus and unknown ids resolve
+/// to no menu.
+pub(crate) fn resolve_class_menu(
+    state: &mut WinApiState,
+    explicit_menu: u64,
+    class: Option<&WindowClassRecord>,
+) -> Result<u64> {
+    if explicit_menu != 0 {
+        return Ok(explicit_menu);
+    }
+    let Some(class) = class else {
+        return Ok(0);
+    };
+    if class.instance_handle == 0 || class.menu_name == 0 {
+        return Ok(0);
+    }
+    if class.menu_name >> 16 != 0 {
+        return Ok(0); // string-named class menu: no parsed name→template mapping
+    }
+    let menu_id = u16::try_from(class.menu_name & u64::from(u16::MAX)).unwrap_or(0);
+    if menu_id == 0 {
+        return Ok(0);
+    }
+    load_resource_menu(state, class.instance_handle, menu_id)
 }
 /// Handles `USER32.dll!AppendMenuA`.
 pub fn handle_append_menu_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {

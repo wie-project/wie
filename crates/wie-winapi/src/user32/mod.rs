@@ -175,6 +175,7 @@ pub(crate) const TME_HOVER: u32 = 0x0000_0001;
 pub(crate) const TME_LEAVE: u32 = 0x0000_0002;
 pub(crate) const TME_CANCEL: u32 = 0x8000_0000;
 
+pub mod accel;
 pub mod controls;
 pub mod dc;
 pub mod dialog;
@@ -185,6 +186,7 @@ pub mod message;
 pub mod misc;
 pub mod window;
 pub mod wm;
+pub use accel::*;
 pub use controls::*;
 pub use dc::*;
 pub use dialog::*;
@@ -556,10 +558,10 @@ pub(crate) fn create_window_record(
     let control_kind = controls::ControlClassKind::from_identifier(&request.class_identifier);
 
     let (class_atom, class_name, window_proc, class_unicode) =
-        if let Some(window_class) = registered_class {
+        if let Some(window_class) = registered_class.as_ref() {
             (
                 window_class.atom,
-                window_class.class_name,
+                window_class.class_name.clone(),
                 window_class.window_proc,
                 window_class.unicode,
             )
@@ -611,6 +613,15 @@ pub(crate) fn create_window_record(
         );
     }
 
+    // A top-level window created without an explicit hMenu inherits its
+    // registered class's lpszMenuName menu (notepad's pattern); child
+    // windows never carry a menu.
+    let menu_handle = if request.style & WS_CHILD != 0 {
+        request.menu_handle
+    } else {
+        menu::resolve_class_menu(state, request.menu_handle, registered_class.as_ref())?
+    };
+
     state.window_state().windows.push(WindowRecord {
         handle: crate::handles::Hwnd::from(handle),
         class_atom,
@@ -621,7 +632,7 @@ pub(crate) fn create_window_record(
         style: request.style,
         extended_style: request.extended_style,
         parent_handle: crate::handles::Hwnd::from(request.parent_handle),
-        menu_handle: request.menu_handle,
+        menu_handle,
         instance_handle: request.instance_handle,
         x: request.x,
         y: request.y,

@@ -194,6 +194,11 @@ pub struct ProcessState {
     /// resolves `hInstance == image base` against this list by string id
     /// (`block = (id >> 4) + 1`, `slot = id & 0xF` — block names are 1-based).
     pub main_module_strings: Vec<wie_pe::resources::StringBlock>,
+    /// Parsed `RT_ACCELERATOR` tables of the main EXE module.
+    ///
+    /// Same lifecycle as [`Self::main_module_dialogs`]; `LoadAcceleratorsA/W`
+    /// resolves `hInstance == image base` against this list by table id.
+    pub main_module_accelerators: Vec<wie_pe::resources::AccelTemplate>,
 }
 
 /// Source policy for console `ReadFile(STD_INPUT_HANDLE)`.

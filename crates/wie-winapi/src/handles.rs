@@ -235,3 +235,31 @@ impl From<HookHandle> for u64 {
         value.0
     }
 }
+
+/// A `HACCEL` — fake accelerator-table handle (`LoadAcceleratorsA/W`).
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct Haccel(u64);
+
+impl Haccel {
+    /// The `NULL` accelerator handle (`0`).
+    pub const NULL: Self = Self(0);
+
+    /// Escape point: the raw handle value (return values, …).
+    #[must_use]
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for Haccel {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+impl From<Haccel> for u64 {
+    fn from(value: Haccel) -> Self {
+        value.0
+    }
+}

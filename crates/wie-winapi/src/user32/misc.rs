@@ -185,6 +185,12 @@ pub fn handle_register_class_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApi
         )
         .context("failed to read WNDCLASSEXW.hbrBackground")?;
 
+        let menu_name = read_guest_u64(
+            engine,
+            checked_field_address(window_class_ptr, 56, "WNDCLASSEXW.lpszMenuName"),
+        )
+        .context("failed to read WNDCLASSEXW.lpszMenuName")?;
+
         let class_name_ptr = read_guest_u64(
             engine,
             checked_field_address(window_class_ptr, 64, "WNDCLASSEXW.lpszClassName"),
@@ -212,6 +218,7 @@ pub fn handle_register_class_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApi
                 cursor_handle,
                 background_brush,
                 small_icon_handle,
+                menu_name,
                 unicode: true,
             },
         )?
@@ -273,6 +280,12 @@ pub fn handle_register_class_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
         )
         .context("failed to read WNDCLASSEXA.hbrBackground")?;
 
+        let menu_name = read_guest_u64(
+            engine,
+            checked_field_address(window_class_ptr, 56, "WNDCLASSEXA.lpszMenuName"),
+        )
+        .context("failed to read WNDCLASSEXA.lpszMenuName")?;
+
         let class_name_ptr = read_guest_u64(
             engine,
             checked_field_address(window_class_ptr, 64, "WNDCLASSEXA.lpszClassName"),
@@ -300,6 +313,7 @@ pub fn handle_register_class_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
                 cursor_handle,
                 background_brush,
                 small_icon_handle,
+                menu_name,
                 unicode: false,
             },
         )?

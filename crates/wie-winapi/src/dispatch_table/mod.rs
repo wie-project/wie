@@ -449,9 +449,35 @@ pub enum WinApiId {
     Comctl32Createstatuswindowa = 418,
     /// Appended here (not adjacent to Comctl32Createstatuswindowa) to avoid renumbering the entire enum.
     Comctl32Createstatuswindoww = 419,
+    /// Appended here (not adjacent to Comdlg32Choosecolora) to avoid renumbering the entire enum.
+    Comdlg32Getfiletitlea = 420,
+    /// Appended here (not adjacent to Comdlg32Getfiletitlea) to avoid renumbering the entire enum.
+    Comdlg32Getfiletitlew = 421,
+    /// Appended here (not adjacent to User32Getwindowtextw) to avoid renumbering the entire enum.
+    User32Getwindowtextlengtha = 422,
+    /// Appended here (not adjacent to User32Getwindowtextlengtha) to avoid renumbering the entire enum.
+    User32Getwindowtextlengthw = 423,
+    /// Appended here (not adjacent to User32Getwindowtextlengthw) to avoid renumbering the entire enum.
+    User32Getwindowplacement = 424,
+    /// Appended here (not adjacent to User32Getwindowplacement) to avoid renumbering the entire enum.
+    User32Setwindowplacement = 425,
+    /// Appended here (not adjacent to User32Setwindowplacement) to avoid renumbering the entire enum.
+    User32Loadacceleratorsa = 426,
+    /// Appended here (not adjacent to User32Loadacceleratorsa) to avoid renumbering the entire enum.
+    User32Loadacceleratorsw = 427,
+    /// Appended here (not adjacent to User32Loadacceleratorsw) to avoid renumbering the entire enum.
+    User32Translateacceleratora = 428,
+    /// Appended here (not adjacent to User32Translateacceleratora) to avoid renumbering the entire enum.
+    User32Translateacceleratorw = 429,
+    /// Appended here (not adjacent to User32Translateacceleratorw) to avoid renumbering the entire enum.
+    User32Destroyacceleratortable = 430,
+    /// Appended here (not adjacent to User32Destroyacceleratortable) to avoid renumbering the entire enum.
+    User32Loadmenua = 431,
+    /// Appended here (not adjacent to User32Loadmenua) to avoid renumbering the entire enum.
+    User32Loadmenuw = 432,
 }
 
-pub const WINAPI_ID_COUNT: usize = 420;
+pub const WINAPI_ID_COUNT: usize = 433;
 
 impl WinApiId {
     /// Discriminant as `u16` (`#[repr(u16)]`).
@@ -490,7 +516,7 @@ const _: () = assert!(
 );
 
 /// Highest-numbered [`WinApiId`]; update alongside the enum's final variant.
-const LAST_WINAPI_ID: WinApiId = WinApiId::Comctl32Createstatuswindoww;
+const LAST_WINAPI_ID: WinApiId = WinApiId::User32Loadmenuw;
 
 /// Hot-path dispatch: dense `u16` match over the `WinApiId` discriminant
 /// (LLVM jump table) with no string comparison — runs once per host API stop.
@@ -981,6 +1007,19 @@ pub fn dispatch_winapi_id(
         WinApiId::Shell32Dragacceptfiles => shell32::handle_drag_accept_files(ctx),
         WinApiId::Comctl32Createstatuswindowa => comctl32::handle_create_status_window_a(ctx),
         WinApiId::Comctl32Createstatuswindoww => comctl32::handle_create_status_window_w(ctx),
+        WinApiId::Comdlg32Getfiletitlea => comdlg32::handle_get_file_title_a(ctx),
+        WinApiId::Comdlg32Getfiletitlew => comdlg32::handle_get_file_title_w(ctx),
+        WinApiId::User32Getwindowtextlengtha => user32::handle_get_window_text_length_a(ctx),
+        WinApiId::User32Getwindowtextlengthw => user32::handle_get_window_text_length_w(ctx),
+        WinApiId::User32Getwindowplacement => user32::handle_get_window_placement(ctx),
+        WinApiId::User32Setwindowplacement => user32::handle_set_window_placement(ctx),
+        WinApiId::User32Loadacceleratorsa => user32::handle_load_accelerators_a(ctx),
+        WinApiId::User32Loadacceleratorsw => user32::handle_load_accelerators_w(ctx),
+        WinApiId::User32Translateacceleratora => user32::handle_translate_accelerator_a(ctx),
+        WinApiId::User32Translateacceleratorw => user32::handle_translate_accelerator_w(ctx),
+        WinApiId::User32Destroyacceleratortable => user32::handle_destroy_accelerator_table(ctx),
+        WinApiId::User32Loadmenua => user32::handle_load_menu_a(ctx),
+        WinApiId::User32Loadmenuw => user32::handle_load_menu_w(ctx),
     }
 }
 

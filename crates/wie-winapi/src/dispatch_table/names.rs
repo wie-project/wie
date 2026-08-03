@@ -1566,6 +1566,79 @@ static WINAPI_NAME_ROWS: &[(&str, &str, WinApiId)] = &[
         "createstatuswindoww",
         WinApiId::Comctl32Createstatuswindoww,
     ),
+    (
+        // Rows placed at the table end with the appended variants (420/421),
+        // so the id table and the name rows stay in the same order.
+        "comdlg32.dll",
+        "getfiletitlea",
+        WinApiId::Comdlg32Getfiletitlea,
+    ),
+    (
+        "comdlg32.dll",
+        "getfiletitlew",
+        WinApiId::Comdlg32Getfiletitlew,
+    ),
+    (
+        // Rows placed at the table end with the appended variants (422/423),
+        // so the id table and the name rows stay in the same order.
+        "user32.dll",
+        "getwindowtextlengtha",
+        WinApiId::User32Getwindowtextlengtha,
+    ),
+    (
+        "user32.dll",
+        "getwindowtextlengthw",
+        WinApiId::User32Getwindowtextlengthw,
+    ),
+    (
+        // Rows placed at the table end with the appended variants (424/425),
+        // so the id table and the name rows stay in the same order.
+        "user32.dll",
+        "getwindowplacement",
+        WinApiId::User32Getwindowplacement,
+    ),
+    (
+        "user32.dll",
+        "setwindowplacement",
+        WinApiId::User32Setwindowplacement,
+    ),
+    (
+        // Rows placed at the table end with the appended variants (426-429),
+        // so the id table and the name rows stay in the same order.
+        "user32.dll",
+        "loadacceleratorsa",
+        WinApiId::User32Loadacceleratorsa,
+    ),
+    (
+        "user32.dll",
+        "loadacceleratorsw",
+        WinApiId::User32Loadacceleratorsw,
+    ),
+    (
+        "user32.dll",
+        "translateacceleratora",
+        WinApiId::User32Translateacceleratora,
+    ),
+    (
+        "user32.dll",
+        "translateacceleratorw",
+        WinApiId::User32Translateacceleratorw,
+    ),
+    (
+        // Row placed at the table end with the appended variant (430), so
+        // the id table and the name rows stay in the same order.
+        "user32.dll",
+        "destroyacceleratortable",
+        WinApiId::User32Destroyacceleratortable,
+    ),
+    (
+        // Rows placed at the table end with the appended variants (431/432),
+        // so the id table and the name rows stay in the same order.
+        "user32.dll",
+        "loadmenua",
+        WinApiId::User32Loadmenua,
+    ),
+    ("user32.dll", "loadmenuw", WinApiId::User32Loadmenuw),
 ];
 
 /// Resolve library/export to id. Case-insensitive, allocation-free.

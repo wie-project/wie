@@ -894,6 +894,11 @@ impl super::RuntimeSession {
         // LoadStringA/W resolves `hInstance == image base` against this list.
         winapi_state.process.main_module_strings =
             wie_pe::resources::parse_strings(&pe_bytes, &pe_map_plan.sections);
+        // Main-module accelerator tables: same lifecycle as the strings above;
+        // LoadAcceleratorsA/W resolves `hInstance == image base` against this
+        // list by table id.
+        winapi_state.process.main_module_accelerators =
+            wie_pe::resources::parse_accelerators(&pe_bytes, &pe_map_plan.sections);
         // Modal-dialog result slot: EndDialog writes, the in-guest stub reads.
         winapi_state.window_state().dialog_result_va = stub_cfg.dialog_result_va;
         engine

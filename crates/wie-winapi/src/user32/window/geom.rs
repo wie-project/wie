@@ -5,8 +5,8 @@ use super::class::{find_window, find_window_mut};
 use crate::user32::{
     Context, FAKE_DESKTOP_WINDOW_HANDLE, FAKE_PROCESS_ID, FAKE_SYSTEM_COLOR_BRUSH_BASE,
     FAKE_THREAD_ID, FAKE_WINDOW_HANDLE, HandlerContext, Result, WinApiHandlerResult, WinApiState,
-    checked_field_address, is_known_window, low_i32, read_guest_i32, read_guest_u64,
-    window_client_size, write_guest_i32, write_guest_u32, write_window_rect,
+    checked_field_address, is_known_window, low_i32, read_guest_i32, read_guest_u32,
+    read_guest_u64, window_client_size, write_guest_i32, write_guest_u32, write_window_rect,
 };
 
 /// Handles `USER32.dll!GetClientRect`.
@@ -586,5 +586,226 @@ pub fn handle_scroll_window_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     Ok(WinApiHandlerResult {
         return_address,
         return_value: 1,
+    })
+}
+/// Size of the x64 `WINDOWPLACEMENT` struct in bytes: `UINT length` @0,
+/// `UINT flags` @4, `UINT showCmd` @8, `POINT ptMinPosition` @12, `POINT
+/// ptMaxPosition` @20, `RECT rcNormalPosition` @28 (44 bytes total).
+///
+/// Both placement handlers and their tests agree on this value: `Get` writes
+/// it back as `length`, `Set` rejects structs below it.
+pub(crate) const WINDOWPLACEMENT_LENGTH: u32 = 44;
+
+/// Handles `USER32.dll!GetWindowPlacement`.
+pub fn handle_get_window_placement(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let window_handle = engine
+        .read_rcx()
+        .context("failed to read RCX for GetWindowPlacement")?;
+
+    let placement_ptr = engine
+        .read_rdx()
+        .context("failed to read RDX for GetWindowPlacement")?;
+
+    // Geometry comes from the window record when one exists; the legacy fake
+    // window reads the single-window state fields (like MoveWindow).
+    let placement = if window_handle == FAKE_WINDOW_HANDLE {
+        let window = state.window_state();
+        Some((
+            window.window_x,
+            window.window_y,
+            window.window_width,
+            window.window_height,
+            window.window_visible,
+        ))
+    } else {
+        find_window(state, window_handle).map(|window| {
+            (
+                window.x,
+                window.y,
+                window.width,
+                window.height,
+                window.visible,
+            )
+        })
+    };
+
+    // `success` must mirror the `filter(|_| placement_ptr != 0)` gate on the
+    // write path below: a known window with a NULL placement pointer fails in
+    // both places, so no branch can ever write through the NULL pointer. Keep
+    // the two pointer checks in lockstep if this is refactored.
+    let success = placement.is_some() && placement_ptr != 0;
+
+    if let Some((x, y, width, height, visible)) = placement.filter(|_| placement_ptr != 0) {
+        // rcNormalPosition is the outer window rect in screen coordinates
+        // (GetWindowRect semantics).
+        let right = x
+            .checked_add(width)
+            .context("GetWindowPlacement right coordinate overflow")?;
+
+        let bottom = y
+            .checked_add(height)
+            .context("GetWindowPlacement bottom coordinate overflow")?;
+
+        // showCmd: a visible window reports SW_SHOWNORMAL (1), a hidden one
+        // SW_HIDE (0). Minimized/maximized placement is not tracked (IsIconic
+        // /IsZoomed always report false), so SW_SHOWNORMAL is the only
+        // restored state we can express.
+        let show_cmd = u32::from(visible);
+
+        write_guest_u32(engine, placement_ptr, WINDOWPLACEMENT_LENGTH)
+            .context("failed to write WINDOWPLACEMENT.length")?;
+
+        write_guest_u32(
+            engine,
+            checked_field_address(placement_ptr, 4, "WINDOWPLACEMENT.flags"),
+            0,
+        )
+        .context("failed to write WINDOWPLACEMENT.flags")?;
+
+        write_guest_u32(
+            engine,
+            checked_field_address(placement_ptr, 8, "WINDOWPLACEMENT.showCmd"),
+            show_cmd,
+        )
+        .context("failed to write WINDOWPLACEMENT.showCmd")?;
+
+        // ptMinPosition / ptMaxPosition: zero without minimized/maximized
+        // tracking.
+        for (offset, name) in [
+            (12, "WINDOWPLACEMENT.ptMinPosition.x"),
+            (16, "WINDOWPLACEMENT.ptMinPosition.y"),
+            (20, "WINDOWPLACEMENT.ptMaxPosition.x"),
+            (24, "WINDOWPLACEMENT.ptMaxPosition.y"),
+        ] {
+            write_guest_i32(
+                engine,
+                checked_field_address(placement_ptr, offset, name),
+                0,
+            )
+            .with_context(|| format!("failed to write {name}"))?;
+        }
+
+        write_window_rect(
+            engine,
+            checked_field_address(placement_ptr, 28, "WINDOWPLACEMENT.rcNormalPosition"),
+            x,
+            y,
+            right,
+            bottom,
+        )
+        .context("failed to write WINDOWPLACEMENT.rcNormalPosition")?;
+    }
+
+    let return_value = u64::from(success);
+
+    let return_address = engine
+        .return_from_win64_api(return_value)
+        .context("failed to return from GetWindowPlacement")?;
+
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+/// Handles `USER32.dll!SetWindowPlacement`.
+pub fn handle_set_window_placement(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let window_handle = engine
+        .read_rcx()
+        .context("failed to read RCX for SetWindowPlacement")?;
+
+    let placement_ptr = engine
+        .read_rdx()
+        .context("failed to read RDX for SetWindowPlacement")?;
+
+    let known = window_handle == FAKE_WINDOW_HANDLE || find_window(state, window_handle).is_some();
+    let mut success = known && placement_ptr != 0;
+
+    if success {
+        let length = read_guest_u32(engine, placement_ptr)
+            .context("failed to read WINDOWPLACEMENT.length")?;
+
+        // A length below the x64 WINDOWPLACEMENT size (a 32-bit struct) is
+        // rejected, mirroring real Windows.
+        success = length >= WINDOWPLACEMENT_LENGTH;
+    }
+
+    if success {
+        let show_cmd = read_guest_u32(
+            engine,
+            checked_field_address(placement_ptr, 8, "WINDOWPLACEMENT.showCmd"),
+        )
+        .context("failed to read WINDOWPLACEMENT.showCmd")?;
+
+        let left = read_guest_i32(
+            engine,
+            checked_field_address(placement_ptr, 28, "WINDOWPLACEMENT.rcNormalPosition.left"),
+        )
+        .context("failed to read WINDOWPLACEMENT.rcNormalPosition.left")?;
+
+        let top = read_guest_i32(
+            engine,
+            checked_field_address(placement_ptr, 32, "WINDOWPLACEMENT.rcNormalPosition.top"),
+        )
+        .context("failed to read WINDOWPLACEMENT.rcNormalPosition.top")?;
+
+        let right = read_guest_i32(
+            engine,
+            checked_field_address(placement_ptr, 36, "WINDOWPLACEMENT.rcNormalPosition.right"),
+        )
+        .context("failed to read WINDOWPLACEMENT.rcNormalPosition.right")?;
+
+        let bottom = read_guest_i32(
+            engine,
+            checked_field_address(placement_ptr, 40, "WINDOWPLACEMENT.rcNormalPosition.bottom"),
+        )
+        .context("failed to read WINDOWPLACEMENT.rcNormalPosition.bottom")?;
+
+        let width = right
+            .checked_sub(left)
+            .context("SetWindowPlacement width overflow")?;
+
+        let height = bottom
+            .checked_sub(top)
+            .context("SetWindowPlacement height overflow")?;
+
+        // Any nonzero showCmd (SW_SHOWNORMAL / SW_SHOWMINIMIZED /
+        // SW_SHOWMAXIMIZED) shows the window; SW_HIDE hides it. Minimized and
+        // maximized placement are not tracked, so the window reports as
+        // restored afterwards.
+        let visible = show_cmd != 0;
+
+        if window_handle == FAKE_WINDOW_HANDLE {
+            let window = state.window_state();
+            window.window_x = left;
+            window.window_y = top;
+            window.window_width = width;
+            window.window_height = height;
+            window.window_visible = visible;
+        } else if let Some(window) = find_window_mut(state, window_handle) {
+            // Reposition the window record (the MoveWindow geometry update).
+            window.x = left;
+            window.y = top;
+            window.width = width;
+            window.height = height;
+            window.visible = visible;
+            // rcNormalPosition is the outer window rect; the client rect
+            // keeps its window-relative origin and tracks the new size.
+            window.client_rect = (0, 0, width, height);
+        }
+    }
+
+    let return_value = u64::from(success);
+
+    let return_address = engine
+        .return_from_win64_api(return_value)
+        .context("failed to return from SetWindowPlacement")?;
+
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
     })
 }

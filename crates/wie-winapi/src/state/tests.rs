@@ -128,6 +128,7 @@ fn winapi_state_default() -> WinApiState {
             main_module_dialogs: Vec::new(),
             main_module_menus: Vec::new(),
             main_module_strings: Vec::new(),
+            main_module_accelerators: Vec::new(),
         },
         kernel: KernelState {
             threads: ThreadState::primary(),
@@ -1167,6 +1168,372 @@ fn test_empty_queue_yields_while_dialog_open_under_exit_on_idle() {
     assert_eq!(r.return_value, 0);
 }
 
+#[test]
+fn test_get_window_text_length_w_reports_text_length() {
+    // Full dispatch path: name resolution (names.rs) → dense id → handler arm.
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    state.window_state().window_title = "Hello".to_string();
+    write_regs(&mut engine, user32::FAKE_WINDOW_HANDLE, 0, 0, 0, 0);
+    let id = crate::resolve_winapi_id("user32.dll", "GetWindowTextLengthW")
+        .expect("GetWindowTextLengthW must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("GetWindowTextLengthW must dispatch");
+    assert_eq!(
+        r.return_value, 5,
+        "\"Hello\" is 5 UTF-16 units excluding the NUL"
+    );
+}
+
+#[test]
+fn test_get_window_text_length_w_empty_is_zero() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    write_regs(&mut engine, user32::FAKE_WINDOW_HANDLE, 0, 0, 0, 0);
+    let id = crate::resolve_winapi_id("user32.dll", "GetWindowTextLengthW")
+        .expect("GetWindowTextLengthW must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("GetWindowTextLengthW must dispatch");
+    assert_eq!(r.return_value, 0, "empty title must report length 0");
+}
+
+#[test]
+fn test_get_window_text_length_w_unknown_hwnd_is_zero() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    write_regs(&mut engine, 0x1234, 0, 0, 0, 0);
+    let id = crate::resolve_winapi_id("user32.dll", "GetWindowTextLengthW")
+        .expect("GetWindowTextLengthW must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("GetWindowTextLengthW must dispatch");
+    assert_eq!(r.return_value, 0, "unknown hwnd must report length 0");
+}
+
+#[test]
+fn test_get_window_text_length_a_matches_ascii() {
+    // ANSI mirror: for ASCII text the byte count equals the UTF-16 unit count.
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    state.window_state().window_title = "Hello".to_string();
+    write_regs(&mut engine, user32::FAKE_WINDOW_HANDLE, 0, 0, 0, 0);
+    let id = crate::resolve_winapi_id("user32.dll", "GetWindowTextLengthA")
+        .expect("GetWindowTextLengthA must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("GetWindowTextLengthA must dispatch");
+    assert_eq!(
+        r.return_value, 5,
+        "ASCII \"Hello\" is 5 ANSI chars excluding the NUL"
+    );
+}
+
+// --- GetWindowPlacement / SetWindowPlacement ---
+
+/// Push a known window record with placement geometry and return its handle.
+fn push_geometry_window(state: &mut WinApiState) -> u64 {
+    let handle = 0x6610_1000_u64;
+    state.window_state().windows.push(crate::WindowRecord {
+        handle: crate::handles::Hwnd::from(handle),
+        title: "Placement".to_owned(),
+        x: 40,
+        y: 50,
+        width: 600,
+        height: 400,
+        visible: true,
+        ..Default::default()
+    });
+    handle
+}
+
+/// Read a guest u32 at `addr` (test helper mirroring `read_guest_u32`).
+fn read_test_u32(engine: &mut IcedCpu, addr: u64) -> u32 {
+    let mut bytes = [0_u8; 4];
+    engine.mem_read(addr, &mut bytes).expect("read guest u32");
+    u32::from_le_bytes(bytes)
+}
+
+/// Read a guest i32 at `addr` (test helper mirroring `read_guest_i32`).
+fn read_test_i32(engine: &mut IcedCpu, addr: u64) -> i32 {
+    let mut bytes = [0_u8; 4];
+    engine.mem_read(addr, &mut bytes).expect("read guest i32");
+    i32::from_le_bytes(bytes)
+}
+
+#[test]
+fn test_get_window_placement_fills_struct() {
+    // Full dispatch path: name resolution (names.rs) → dense id → handler arm.
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let hwnd = push_geometry_window(&mut state);
+    let placement_ptr = 0x4000_u64;
+    write_regs(&mut engine, hwnd, placement_ptr, 0, 0, 0);
+    let id = crate::resolve_winapi_id("user32.dll", "GetWindowPlacement")
+        .expect("GetWindowPlacement must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("GetWindowPlacement must dispatch");
+    assert_eq!(r.return_value, 1, "known hwnd must return TRUE");
+
+    // WINDOWPLACEMENT (x64): UINT length @0, UINT flags @4, UINT showCmd @8,
+    // POINT ptMinPosition @12, POINT ptMaxPosition @20, RECT rcNormalPosition @28.
+    assert_eq!(
+        read_test_u32(&mut engine, placement_ptr),
+        user32::WINDOWPLACEMENT_LENGTH,
+        "length must be sizeof(WINDOWPLACEMENT)"
+    );
+    assert_eq!(
+        read_test_u32(&mut engine, placement_ptr + 4),
+        0,
+        "flags must be 0"
+    );
+    assert_eq!(
+        read_test_u32(&mut engine, placement_ptr + 8),
+        1,
+        "visible window reports SW_SHOWNORMAL"
+    );
+    assert_eq!(
+        read_test_i32(&mut engine, placement_ptr + 28),
+        40,
+        "rcNormalPosition.left comes from the window rect"
+    );
+    assert_eq!(
+        read_test_i32(&mut engine, placement_ptr + 32),
+        50,
+        "rcNormalPosition.top comes from the window rect"
+    );
+    assert_eq!(
+        read_test_i32(&mut engine, placement_ptr + 36),
+        640,
+        "rcNormalPosition.right = x + width"
+    );
+    assert_eq!(
+        read_test_i32(&mut engine, placement_ptr + 40),
+        450,
+        "rcNormalPosition.bottom = y + height"
+    );
+}
+
+#[test]
+fn test_get_window_placement_hidden_window_reports_sw_hide() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let handle = 0x6610_1000_u64;
+    state.window_state().windows.push(crate::WindowRecord {
+        handle: crate::handles::Hwnd::from(handle),
+        visible: false,
+        ..Default::default()
+    });
+    let placement_ptr = 0x4000_u64;
+    write_regs(&mut engine, handle, placement_ptr, 0, 0, 0);
+    let id = crate::resolve_winapi_id("user32.dll", "GetWindowPlacement")
+        .expect("GetWindowPlacement must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("GetWindowPlacement must dispatch");
+    assert_eq!(r.return_value, 1, "known hwnd must return TRUE");
+    assert_eq!(
+        read_test_u32(&mut engine, placement_ptr + 8),
+        0,
+        "hidden window reports SW_HIDE"
+    );
+}
+
+#[test]
+fn test_get_window_placement_unknown_hwnd_is_false() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    write_regs(&mut engine, 0x1234, 0x4000, 0, 0, 0);
+    let id = crate::resolve_winapi_id("user32.dll", "GetWindowPlacement")
+        .expect("GetWindowPlacement must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("GetWindowPlacement must dispatch");
+    assert_eq!(r.return_value, 0, "unknown hwnd must return FALSE");
+}
+
+#[test]
+fn test_get_window_placement_null_ptr_is_false() {
+    // The other cell of the {NULL ptr, unknown hwnd, valid} × {Get, Set}
+    // matrix: a known hwnd with a NULL placement pointer must return FALSE
+    // and must not write through the NULL pointer.
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let hwnd = push_geometry_window(&mut state);
+    write_regs(&mut engine, hwnd, 0, 0, 0, 0);
+    let id = crate::resolve_winapi_id("user32.dll", "GetWindowPlacement")
+        .expect("GetWindowPlacement must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("GetWindowPlacement must dispatch");
+    assert_eq!(
+        r.return_value, 0,
+        "NULL placement pointer must return FALSE"
+    );
+}
+
+#[test]
+fn test_set_window_placement_stores_placement() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let hwnd = push_geometry_window(&mut state);
+    let placement_ptr = 0x4000_u64;
+    // length, flags, showCmd=SW_SHOWMINIMIZED, ptMinPosition, ptMaxPosition,
+    // then rcNormalPosition (20, 30, 220, 130).
+    engine
+        .mem_write(placement_ptr, &user32::WINDOWPLACEMENT_LENGTH.to_le_bytes())
+        .expect("placement length");
+    engine
+        .mem_write(placement_ptr + 4, &0_u32.to_le_bytes())
+        .expect("placement flags");
+    engine
+        .mem_write(placement_ptr + 8, &2_u32.to_le_bytes())
+        .expect("placement showCmd");
+    for offset in [12, 16, 20, 24] {
+        engine
+            .mem_write(placement_ptr + offset, &0_i32.to_le_bytes())
+            .expect("placement point");
+    }
+    engine
+        .mem_write(placement_ptr + 28, &20_i32.to_le_bytes())
+        .expect("placement left");
+    engine
+        .mem_write(placement_ptr + 32, &30_i32.to_le_bytes())
+        .expect("placement top");
+    engine
+        .mem_write(placement_ptr + 36, &220_i32.to_le_bytes())
+        .expect("placement right");
+    engine
+        .mem_write(placement_ptr + 40, &130_i32.to_le_bytes())
+        .expect("placement bottom");
+
+    write_regs(&mut engine, hwnd, placement_ptr, 0, 0, 0);
+    let id = crate::resolve_winapi_id("user32.dll", "SetWindowPlacement")
+        .expect("SetWindowPlacement must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("SetWindowPlacement must dispatch");
+    assert_eq!(r.return_value, 1, "known hwnd must return TRUE");
+
+    let window = state
+        .window_state()
+        .windows
+        .iter()
+        .find(|window| window.handle == crate::handles::Hwnd::from(hwnd))
+        .expect("window record must still exist");
+    assert_eq!(window.x, 20, "rcNormalPosition.left must be stored");
+    assert_eq!(window.y, 30, "rcNormalPosition.top must be stored");
+    assert_eq!(window.width, 200, "width = right - left");
+    assert_eq!(window.height, 100, "height = bottom - top");
+    assert!(window.visible, "nonzero showCmd shows the window");
+}
+
+#[test]
+fn test_set_window_placement_sw_hide_hides_window() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let hwnd = push_geometry_window(&mut state);
+    let placement_ptr = 0x4000_u64;
+    engine
+        .mem_write(placement_ptr, &user32::WINDOWPLACEMENT_LENGTH.to_le_bytes())
+        .expect("placement length");
+    engine
+        .mem_write(placement_ptr + 4, &0_u32.to_le_bytes())
+        .expect("placement flags");
+    // SW_HIDE (0): keep the previous rect, hide the window.
+    engine
+        .mem_write(placement_ptr + 8, &0_u32.to_le_bytes())
+        .expect("placement showCmd");
+    for offset in [12, 16, 20, 24, 28, 32, 36, 40] {
+        engine
+            .mem_write(placement_ptr + offset, &0_i32.to_le_bytes())
+            .expect("placement field");
+    }
+    write_regs(&mut engine, hwnd, placement_ptr, 0, 0, 0);
+    let id = crate::resolve_winapi_id("user32.dll", "SetWindowPlacement")
+        .expect("SetWindowPlacement must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("SetWindowPlacement must dispatch");
+    assert_eq!(r.return_value, 1, "known hwnd must return TRUE");
+    let window = state
+        .window_state()
+        .windows
+        .iter()
+        .find(|window| window.handle == crate::handles::Hwnd::from(hwnd))
+        .expect("window record must still exist");
+    assert!(!window.visible, "SW_HIDE must hide the window");
+}
+
+#[test]
+fn test_set_window_placement_short_length_is_false() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let hwnd = push_geometry_window(&mut state);
+    let placement_ptr = 0x4000_u64;
+    // Pre-44 length (a 32-bit WINDOWPLACEMENT); the record must be untouched.
+    engine
+        .mem_write(placement_ptr, &40_u32.to_le_bytes())
+        .expect("placement length");
+    write_regs(&mut engine, hwnd, placement_ptr, 0, 0, 0);
+    let id = crate::resolve_winapi_id("user32.dll", "SetWindowPlacement")
+        .expect("SetWindowPlacement must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("SetWindowPlacement must dispatch");
+    assert_eq!(r.return_value, 0, "length < 44 must return FALSE");
+    let window = state
+        .window_state()
+        .windows
+        .iter()
+        .find(|window| window.handle == crate::handles::Hwnd::from(hwnd))
+        .expect("window record must still exist");
+    assert_eq!(window.x, 40, "short length must not move the window");
+}
+
+#[test]
+fn test_set_window_placement_unknown_hwnd_is_false() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let placement_ptr = 0x4000_u64;
+    engine
+        .mem_write(placement_ptr, &44_u32.to_le_bytes())
+        .expect("placement length");
+    write_regs(&mut engine, 0x1234, placement_ptr, 0, 0, 0);
+    let id = crate::resolve_winapi_id("user32.dll", "SetWindowPlacement")
+        .expect("SetWindowPlacement must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("SetWindowPlacement must dispatch");
+    assert_eq!(r.return_value, 0, "unknown hwnd must return FALSE");
+}
+
 // --- Comctl32 ---
 
 #[test]
@@ -1356,6 +1723,187 @@ fn test_create_status_window_a_mirrors_with_ansi_text() {
 }
 
 // --- Comdlg32 ---
+
+/// Read a NUL-terminated UTF-16LE guest string at `addr` (up to `max_units`).
+///
+/// The `_raw` suffix distinguishes this test-side buffer reader from the
+/// `pub(crate)` `read_utf16_lossy` guest-string helper of the same shape.
+fn read_guest_utf16_raw(engine: &mut IcedCpu, addr: u64, max_units: usize) -> String {
+    let byte_len = max_units
+        .checked_mul(2)
+        .expect("UTF-16 byte length overflow");
+    let mut bytes = vec![0_u8; byte_len];
+    engine
+        .mem_read(addr, &mut bytes)
+        .expect("read guest UTF-16 buffer");
+    let mut units: Vec<u16> = Vec::new();
+    for pair in bytes.chunks_exact(2) {
+        let lo = pair.first().copied().expect("two-byte chunk lo");
+        let hi = pair.get(1).copied().expect("two-byte chunk hi");
+        let unit = u16::from_le_bytes([lo, hi]);
+        if unit == 0 {
+            break;
+        }
+        units.push(unit);
+    }
+    String::from_utf16_lossy(&units)
+}
+
+/// Read a NUL-terminated ANSI/UTF-8 guest string at `addr` (up to `max_bytes`).
+///
+/// The `_raw` suffix distinguishes this test-side buffer reader from the
+/// `pub(crate)` `read_ansi_lossy` guest-string helper of the same shape.
+fn read_guest_ansi_raw(engine: &mut IcedCpu, addr: u64, max_bytes: usize) -> String {
+    let mut bytes = vec![0_u8; max_bytes];
+    engine
+        .mem_read(addr, &mut bytes)
+        .expect("read guest ANSI buffer");
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(max_bytes);
+    let head = bytes.get(..end).expect("ANSI head range");
+    String::from_utf8_lossy(head).into_owned()
+}
+
+#[test]
+fn test_get_file_title_w_basename() {
+    // Full dispatch path: name resolution (names.rs) → dense id → handler arm.
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let path_addr = 0x5000;
+    let title_addr = 0x6000;
+    write_guest_utf16(&mut engine, path_addr, r"C:\foo\bar.txt");
+    // Pre-fill so the handler's write is observable.
+    engine
+        .mem_write(title_addr, &[0xAA_u8; 128])
+        .expect("prefill title buffer");
+    write_regs(&mut engine, path_addr, title_addr, 64, 0, 0);
+    engine
+        .mem_write(STACK_TOP, &0x1234_5678_u64.to_le_bytes())
+        .expect("write sentinel return address");
+    let id = crate::resolve_winapi_id("comdlg32.dll", "GetFileTitleW")
+        .expect("GetFileTitleW must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("GetFileTitleW must dispatch");
+    assert_eq!(
+        r.return_address, 0x1234_5678,
+        "handler must return past the call"
+    );
+    assert_eq!(r.return_value, 0, "GetFileTitleW must succeed");
+    assert_eq!(
+        read_guest_utf16_raw(&mut engine, title_addr, 64),
+        "bar.txt",
+        "basename after the last separator must be copied"
+    );
+}
+
+#[test]
+fn test_get_file_title_w_buffer_too_small() {
+    // Truncated copy plus the MSDN negative return: abs = required size
+    // including the terminating NUL ("bar.txt" is 7 chars → 8, returned -8).
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let path_addr = 0x5000;
+    let title_addr = 0x6000;
+    write_guest_utf16(&mut engine, path_addr, r"C:\foo\bar.txt");
+    engine
+        .mem_write(title_addr, &[0xAA_u8; 32])
+        .expect("prefill title buffer");
+    write_regs(&mut engine, path_addr, title_addr, 4, 0, 0);
+    engine
+        .mem_write(STACK_TOP, &0x1234_5678_u64.to_le_bytes())
+        .expect("write sentinel return address");
+    let id = crate::resolve_winapi_id("comdlg32.dll", "GetFileTitleW")
+        .expect("GetFileTitleW must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("GetFileTitleW must dispatch");
+    assert_eq!(
+        r.return_value, 0xFFFF_FFF8,
+        "too-small buffer must return -(required size incl. NUL)"
+    );
+    assert_eq!(
+        read_guest_utf16_raw(&mut engine, title_addr, 4),
+        "bar",
+        "buffer must hold a truncated NUL-terminated copy"
+    );
+}
+
+#[test]
+fn test_get_file_title_w_no_separators() {
+    // No `\` or `/` in the path → the whole string is the title.
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let path_addr = 0x5000;
+    let title_addr = 0x6000;
+    write_guest_utf16(&mut engine, path_addr, "report.md");
+    write_regs(&mut engine, path_addr, title_addr, 64, 0, 0);
+    let id = crate::resolve_winapi_id("comdlg32.dll", "GetFileTitleW")
+        .expect("GetFileTitleW must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("GetFileTitleW must dispatch");
+    assert_eq!(r.return_value, 0, "GetFileTitleW must succeed");
+    assert_eq!(
+        read_guest_utf16_raw(&mut engine, title_addr, 64),
+        "report.md",
+        "a separator-free path must be copied whole"
+    );
+}
+
+#[test]
+fn test_get_file_title_w_trailing_separator_is_invalid() {
+    // "C:\foo\" has no basename; GetFileTitle reports an invalid file name
+    // (1) and the buffer still comes back NUL-terminated.
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let path_addr = 0x5000;
+    let title_addr = 0x6000;
+    write_guest_utf16(&mut engine, path_addr, r"C:\foo\");
+    write_regs(&mut engine, path_addr, title_addr, 64, 0, 0);
+    let id = crate::resolve_winapi_id("comdlg32.dll", "GetFileTitleW")
+        .expect("GetFileTitleW must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("GetFileTitleW must dispatch");
+    assert_eq!(r.return_value, 1, "trailing separator must be invalid");
+    assert_eq!(
+        read_guest_utf16_raw(&mut engine, title_addr, 64),
+        "",
+        "buffer must be NUL-terminated"
+    );
+}
+
+#[test]
+fn test_get_file_title_a_basename_ansi() {
+    // ANSI mirror: reads an A-string path and writes an A-string title.
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let path_addr = 0x5000;
+    let title_addr = 0x6000;
+    write_guest_ansi(&mut engine, path_addr, r"C:\foo\bar.txt");
+    write_regs(&mut engine, path_addr, title_addr, 64, 0, 0);
+    let id = crate::resolve_winapi_id("comdlg32.dll", "GetFileTitleA")
+        .expect("GetFileTitleA must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("GetFileTitleA must dispatch");
+    assert_eq!(r.return_value, 0, "GetFileTitleA must succeed");
+    assert_eq!(
+        read_guest_ansi_raw(&mut engine, title_addr, 64),
+        "bar.txt",
+        "ANSI basename must be copied"
+    );
+}
 
 #[test]
 fn test_choose_color_a_writes_color() {
@@ -2379,6 +2927,197 @@ fn test_menu_dirty_flag_semantics() {
     );
 }
 
+// ── LoadMenuA/W from RT_MENU resources ─────────────────────────────
+
+/// Seed the main-module menu templates with notepad-like entries: menu id
+/// 0x201 (the resource notepad's window class names via `lpszMenuName`), a
+/// File popup with Exit/separator/About and an Edit popup with Paste.
+fn push_menu_templates(state: &mut WinApiState) {
+    use wie_pe::resources::{MenuItemTemplate, MenuTemplate};
+    state.process.main_module_menus.push(MenuTemplate {
+        id: 0x201,
+        items: vec![
+            MenuItemTemplate {
+                flags: 0x10, // MF_POPUP
+                id: 0,
+                text: Some("File".to_owned()),
+                sub: vec![
+                    MenuItemTemplate {
+                        flags: 0x00,
+                        id: 0x0100,
+                        text: Some("Exit".to_owned()),
+                        sub: Vec::new(),
+                    },
+                    MenuItemTemplate {
+                        flags: 0x0800, // MF_SEPARATOR
+                        id: 0,
+                        text: None,
+                        sub: Vec::new(),
+                    },
+                    MenuItemTemplate {
+                        flags: 0x00,
+                        id: 0x0101,
+                        text: Some("About".to_owned()),
+                        sub: Vec::new(),
+                    },
+                ],
+            },
+            MenuItemTemplate {
+                flags: 0x10, // MF_POPUP
+                id: 0,
+                text: Some("Edit".to_owned()),
+                sub: vec![MenuItemTemplate {
+                    flags: 0x00,
+                    id: 0x0110,
+                    text: Some("Paste".to_owned()),
+                    sub: Vec::new(),
+                }],
+            },
+        ],
+    });
+}
+
+#[test]
+fn test_load_menu_w_returns_handle_for_known_resource() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    push_menu_templates(&mut state);
+    let image_base = default_env().image_base;
+    // MAKEINTRESOURCEW(0x201): hinst = image base, low word = menu id.
+    write_regs(&mut engine, image_base, 0x201, 0, 0, 0);
+    let first = dispatch_user32(&mut engine, &mut state, "LoadMenuW");
+    assert_ne!(first, 0, "known menu id must return a nonzero HMENU");
+
+    // Repeated loads of the same id cache to the same handle.
+    write_regs(&mut engine, image_base, 0x201, 0, 0, 0);
+    let second = dispatch_user32(&mut engine, &mut state, "LoadMenuW");
+    assert_eq!(first, second, "the same menu id must return the same HMENU");
+
+    // The bar records the two top-level popups, each with a submenu.
+    let record = state
+        .window_state()
+        .menus
+        .iter()
+        .find(|m| m.handle == crate::handles::Hmenu::from(first))
+        .expect("menu record exists");
+    assert_eq!(record.items.len(), 2, "File + Edit top-level popups");
+    assert!(
+        matches!(
+            record.items.first(),
+            Some(crate::user32::menu::MenuEntry::Popup { text, submenu })
+                if text == "File" && submenu.as_u64() != 0
+        ),
+        "first top-level entry must be the File popup with a submenu"
+    );
+
+    // GetMenuState answers by command for an item nested in the File popup.
+    write_regs(&mut engine, first, 0x0100, 0, 0, 0); // MF_BYCOMMAND
+    let flags = dispatch_user32(&mut engine, &mut state, "GetMenuState");
+    assert_eq!(flags, 0, "Exit is enabled + unchecked → flag 0");
+}
+
+#[test]
+fn test_load_menu_w_unknown_id_returns_zero() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    push_menu_templates(&mut state);
+    let image_base = default_env().image_base;
+    // Menu id 0x999 is not in the parsed set.
+    write_regs(&mut engine, image_base, 0x999, 0, 0, 0);
+    let handle = dispatch_user32(&mut engine, &mut state, "LoadMenuW");
+    assert_eq!(handle, 0, "unknown menu id must return NULL");
+}
+
+#[test]
+fn test_load_menu_w_named_menu_returns_zero() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    push_menu_templates(&mut state);
+    let image_base = default_env().image_base;
+    // A string-named menu (high word set) has no parsed name→template
+    // mapping yet; WIE returns NULL just like an unknown id.
+    write_regs(&mut engine, image_base, 0x0000_0000_4000_0000, 0, 0, 0);
+    let handle = dispatch_user32(&mut engine, &mut state, "LoadMenuW");
+    assert_eq!(handle, 0, "string-named menus must return NULL");
+}
+
+#[test]
+fn test_load_menu_a_mirrors_w() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    push_menu_templates(&mut state);
+    let image_base = default_env().image_base;
+    write_regs(&mut engine, image_base, 0x201, 0, 0, 0);
+    let handle = dispatch_user32(&mut engine, &mut state, "LoadMenuA");
+    assert_ne!(handle, 0, "known menu id must return a nonzero HMENU via A");
+    write_regs(&mut engine, handle, 0x0110, 0, 0, 0); // Edit → Paste
+    let flags = dispatch_user32(&mut engine, &mut state, "GetMenuState");
+    assert_eq!(flags, 0, "Paste is enabled + unchecked → flag 0");
+}
+
+#[test]
+fn test_create_window_inherits_class_menu_name() {
+    let mut state = default_winapi_state();
+    push_menu_templates(&mut state);
+    let image_base = default_env().image_base;
+    // A class whose lpszMenuName is MAKEINTRESOURCE(0x201), registered by the
+    // main module (notepad's pattern: RegisterClassExW + CreateWindowExW with
+    // hMenu = NULL).
+    let atom = crate::user32::register_window_class(
+        &mut state,
+        WindowClassRecord {
+            atom: 0,
+            class_name: "NotepadClass".to_owned(),
+            window_proc: 0x7000_0000,
+            style: 0,
+            instance_handle: image_base,
+            icon_handle: 0,
+            cursor_handle: 0,
+            background_brush: 0,
+            small_icon_handle: 0,
+            unicode: true,
+            menu_name: 0x201,
+        },
+    )
+    .expect("register class");
+    assert_ne!(atom, 0);
+
+    let (hwnd, _, _) = crate::user32::create_window_record(
+        &mut state,
+        crate::user32::CreateWindowRequest {
+            class_identifier: crate::user32::WindowClassIdentifier::Name("NotepadClass".to_owned()),
+            title: "Untitled - Notepad".to_owned(),
+            style: 0,
+            extended_style: 0,
+            parent_handle: 0,
+            menu_handle: 0, // NULL → the class menu must be used
+            instance_handle: image_base,
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 480,
+        },
+        true,
+    )
+    .expect("create window");
+    assert_ne!(hwnd, 0);
+
+    let window = state
+        .window_state()
+        .windows
+        .iter()
+        .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
+        .expect("window record exists");
+    assert_ne!(
+        window.menu_handle, 0,
+        "a window without an explicit hMenu must inherit the class menu"
+    );
+    assert!(
+        state.window_state().menu_dirty,
+        "attaching a menu must dirty"
+    );
+}
+
 // ── GDI32 ─────────────────────────────────────────────────────────
 
 #[test]
@@ -2782,6 +3521,7 @@ fn test_erase_background_fills_class_brush_and_clears_flag() {
             cursor_handle: 0,
             background_brush: 6,
             small_icon_handle: 0,
+            menu_name: 0,
             unicode: false,
         },
     )
@@ -5297,4 +6037,303 @@ fn test_d3d9_stage_state_typed_round_trip() {
         get_samp(&mut engine, &mut state, crate::d3d9_render::D3DTSS_COLOROP),
         crate::d3d9_render::D3DTADDRESS_CLAMP
     );
+}
+
+// --- LoadAcceleratorsW / TranslateAcceleratorW ---
+
+/// Seed the main-module accelerator tables with notepad-like entries.
+fn push_accel_tables(state: &mut WinApiState) {
+    use wie_pe::resources::{AccelEntry, AccelTemplate};
+    state.process.main_module_accelerators.push(AccelTemplate {
+        id: 0x0100,
+        entries: vec![
+            // FVIRTKEY|FCONTROL, VK_N → File New (0x0100).
+            AccelEntry {
+                flags: 0x09,
+                key: 0x4E,
+                command_id: 0x0100,
+            },
+            // FVIRTKEY|FSHIFT, VK_O → Save As (0x0103).
+            AccelEntry {
+                flags: 0x05,
+                key: 0x4F,
+                command_id: 0x0103,
+            },
+            // Plain char 'a' (no VIRTKEY) → 0x0111.
+            AccelEntry {
+                flags: 0x00,
+                key: 0x61,
+                command_id: 0x0111,
+            },
+        ],
+    });
+}
+
+/// Run one user32 API through the full dispatch path (names.rs → dense id).
+fn dispatch_user32(engine: &mut IcedCpu, state: &mut WinApiState, name: &str) -> u64 {
+    let id = crate::resolve_winapi_id("user32.dll", name)
+        .unwrap_or_else(|| panic!("{name} must resolve to a WinApiId"));
+    let r = crate::dispatch_winapi_id(&mut HandlerContext::new(engine, default_env(), state), id)
+        .expect("handler must dispatch");
+    r.return_value
+}
+
+#[test]
+fn test_load_accelerators_w_returns_cached_handle() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    push_accel_tables(&mut state);
+    // MAKEINTRESOURCEW(0x100): hinst = image base, low word = table id.
+    let image_base = default_env().image_base;
+    write_regs(&mut engine, image_base, 0x100, 0, 0, 0);
+    let first = dispatch_user32(&mut engine, &mut state, "LoadAcceleratorsW");
+    assert_ne!(first, 0, "known table id must return a nonzero HACCEL");
+    write_regs(&mut engine, image_base, 0x100, 0, 0, 0);
+    let second = dispatch_user32(&mut engine, &mut state, "LoadAcceleratorsW");
+    assert_eq!(
+        first, second,
+        "the same table id must return the same HACCEL"
+    );
+}
+
+#[test]
+fn test_load_accelerators_w_unknown_table_returns_zero() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    push_accel_tables(&mut state);
+    let image_base = default_env().image_base;
+    // Table id 0x200 is not in the parsed set.
+    write_regs(&mut engine, image_base, 0x200, 0, 0, 0);
+    let handle = dispatch_user32(&mut engine, &mut state, "LoadAcceleratorsW");
+    assert_eq!(handle, 0, "unknown table id must return NULL");
+}
+
+#[test]
+fn test_translate_accelerator_w_posts_wm_command() {
+    use crate::QueuedWindowMessage;
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    push_accel_tables(&mut state);
+    let image_base = default_env().image_base;
+    let hwnd = 0x6610_1000_u64;
+    state.window_state().windows.push(crate::WindowRecord {
+        handle: crate::handles::Hwnd::from(hwnd),
+        ..Default::default()
+    });
+    // Load the table and note the cached HACCEL.
+    write_regs(&mut engine, image_base, 0x100, 0, 0, 0);
+    let haccel = dispatch_user32(&mut engine, &mut state, "LoadAcceleratorsW");
+    assert_ne!(haccel, 0);
+
+    // MSG struct at 0x4000: message = WM_KEYDOWN, wParam = VK_N (0x4E).
+    let msg_ptr = 0x4000_u64;
+    engine
+        .mem_map(msg_ptr, 0x1000, wie_cpu::RwxPerms::ALL)
+        .expect("map msg struct");
+    let mut msg = hwnd.to_le_bytes().to_vec();
+    msg.extend_from_slice(&crate::user32::WM_KEYDOWN.to_le_bytes());
+    msg.extend_from_slice(&[0_u8; 4]); // alignment padding
+    msg.extend_from_slice(&0x4E_u64.to_le_bytes());
+    msg.extend_from_slice(&0_u64.to_le_bytes()); // lParam
+    engine.mem_write(msg_ptr, &msg).expect("write MSG struct");
+    // Ctrl is down (the table entry requires FCONTROL).
+    state.window_state().keyboard_state.set(0x11, 0x80);
+
+    write_regs(&mut engine, hwnd, haccel, msg_ptr, 0, 0);
+    let translated = dispatch_user32(&mut engine, &mut state, "TranslateAcceleratorW");
+    assert_eq!(translated, 1, "matching VK + Ctrl must translate");
+
+    let queue = state
+        .message_queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let posted = queue
+        .messages
+        .iter()
+        .find(|m: &&QueuedWindowMessage| m.message == crate::user32::WM_COMMAND)
+        .expect("WM_COMMAND must be posted");
+    assert_eq!(posted.window_handle.as_u64(), hwnd);
+    assert_eq!(
+        posted.word_parameter, 0x0100,
+        "WM_COMMAND wParam = table id"
+    );
+    assert_eq!(posted.long_parameter, 0);
+}
+
+#[test]
+fn test_translate_accelerator_w_no_match_posts_nothing() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    push_accel_tables(&mut state);
+    let image_base = default_env().image_base;
+    let hwnd = 0x6610_1000_u64;
+    state.window_state().windows.push(crate::WindowRecord {
+        handle: crate::handles::Hwnd::from(hwnd),
+        ..Default::default()
+    });
+    write_regs(&mut engine, image_base, 0x100, 0, 0, 0);
+    let haccel = dispatch_user32(&mut engine, &mut state, "LoadAcceleratorsW");
+
+    let msg_ptr = 0x4000_u64;
+    engine
+        .mem_map(msg_ptr, 0x1000, wie_cpu::RwxPerms::ALL)
+        .expect("map msg struct");
+    // WM_KEYDOWN with VK_N but Ctrl NOT down: the FCONTROL entry must not match.
+    let mut msg = hwnd.to_le_bytes().to_vec();
+    msg.extend_from_slice(&crate::user32::WM_KEYDOWN.to_le_bytes());
+    msg.extend_from_slice(&[0_u8; 4]);
+    msg.extend_from_slice(&0x4E_u64.to_le_bytes());
+    msg.extend_from_slice(&0_u64.to_le_bytes());
+    engine.mem_write(msg_ptr, &msg).expect("write MSG struct");
+
+    write_regs(&mut engine, hwnd, haccel, msg_ptr, 0, 0);
+    let translated = dispatch_user32(&mut engine, &mut state, "TranslateAcceleratorW");
+    assert_eq!(translated, 0, "Ctrl-up must not translate");
+    assert_eq!(
+        state
+            .message_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .messages
+            .len(),
+        0,
+        "no WM_COMMAND may be posted"
+    );
+}
+
+#[test]
+fn test_translate_accelerator_w_plain_char() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    push_accel_tables(&mut state);
+    let image_base = default_env().image_base;
+    let hwnd = 0x6610_1000_u64;
+    state.window_state().windows.push(crate::WindowRecord {
+        handle: crate::handles::Hwnd::from(hwnd),
+        ..Default::default()
+    });
+    write_regs(&mut engine, image_base, 0x100, 0, 0, 0);
+    let haccel = dispatch_user32(&mut engine, &mut state, "LoadAcceleratorsW");
+
+    // A non-VIRTKEY entry matches a WM_CHAR whose wParam is the ANSI char.
+    let msg_ptr = 0x4000_u64;
+    engine
+        .mem_map(msg_ptr, 0x1000, wie_cpu::RwxPerms::ALL)
+        .expect("map msg struct");
+    let mut msg = hwnd.to_le_bytes().to_vec();
+    msg.extend_from_slice(&crate::user32::WM_CHAR.to_le_bytes());
+    msg.extend_from_slice(&[0_u8; 4]);
+    msg.extend_from_slice(&0x61_u64.to_le_bytes()); // 'a'
+    msg.extend_from_slice(&0_u64.to_le_bytes());
+    engine.mem_write(msg_ptr, &msg).expect("write MSG struct");
+
+    write_regs(&mut engine, hwnd, haccel, msg_ptr, 0, 0);
+    let translated = dispatch_user32(&mut engine, &mut state, "TranslateAcceleratorW");
+    assert_eq!(translated, 1, "plain-char match must translate");
+    let queue = state
+        .message_queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let posted = queue
+        .messages
+        .iter()
+        .find(|m: &&QueuedWindowMessage| m.message == crate::user32::WM_COMMAND)
+        .expect("WM_COMMAND must be posted");
+    assert_eq!(posted.word_parameter, 0x0111);
+}
+
+#[test]
+fn test_translate_accelerator_a_mirrors_w() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    push_accel_tables(&mut state);
+    let image_base = default_env().image_base;
+    let hwnd = 0x6610_1000_u64;
+    state.window_state().windows.push(crate::WindowRecord {
+        handle: crate::handles::Hwnd::from(hwnd),
+        ..Default::default()
+    });
+    write_regs(&mut engine, image_base, 0x100, 0, 0, 0);
+    let haccel = dispatch_user32(&mut engine, &mut state, "LoadAcceleratorsA");
+
+    // Shift+O (0x05 = FVIRTKEY|FSHIFT, VK_O) via the A variant.
+    state.window_state().keyboard_state.set(0x10, 0x80); // VK_SHIFT
+    let msg_ptr = 0x4000_u64;
+    engine
+        .mem_map(msg_ptr, 0x1000, wie_cpu::RwxPerms::ALL)
+        .expect("map msg struct");
+    let mut msg = hwnd.to_le_bytes().to_vec();
+    msg.extend_from_slice(&crate::user32::WM_KEYDOWN.to_le_bytes());
+    msg.extend_from_slice(&[0_u8; 4]);
+    msg.extend_from_slice(&0x4F_u64.to_le_bytes()); // VK_O
+    msg.extend_from_slice(&0_u64.to_le_bytes());
+    engine.mem_write(msg_ptr, &msg).expect("write MSG struct");
+
+    write_regs(&mut engine, hwnd, haccel, msg_ptr, 0, 0);
+    let translated = dispatch_user32(&mut engine, &mut state, "TranslateAcceleratorA");
+    assert_eq!(translated, 1, "Shift+O must translate via the A variant");
+    let queue = state
+        .message_queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let posted = queue
+        .messages
+        .iter()
+        .find(|m: &&QueuedWindowMessage| m.message == crate::user32::WM_COMMAND)
+        .expect("WM_COMMAND must be posted");
+    assert_eq!(posted.word_parameter, 0x0103);
+}
+
+#[test]
+fn test_translate_accelerator_w_unknown_haccel_is_false() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let msg_ptr = 0x4000_u64;
+    engine
+        .mem_map(msg_ptr, 0x1000, wie_cpu::RwxPerms::ALL)
+        .expect("map msg struct");
+    write_regs(
+        &mut engine,
+        0x6610_1000,
+        0x0000_0000_6640_0005,
+        msg_ptr,
+        0,
+        0,
+    );
+    let translated = dispatch_user32(&mut engine, &mut state, "TranslateAcceleratorW");
+    assert_eq!(translated, 0, "an unallocated HACCEL must not translate");
+}
+
+#[test]
+fn test_destroy_accelerator_table_frees_and_reloads_fresh() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    push_accel_tables(&mut state);
+    let image_base = default_env().image_base;
+    write_regs(&mut engine, image_base, 0x100, 0, 0, 0);
+    let first = dispatch_user32(&mut engine, &mut state, "LoadAcceleratorsW");
+    assert_ne!(first, 0, "known table id must return a nonzero HACCEL");
+
+    write_regs(&mut engine, first, 0, 0, 0, 0);
+    let destroyed = dispatch_user32(&mut engine, &mut state, "DestroyAcceleratorTable");
+    assert_eq!(destroyed, 1, "a loaded HACCEL must destroy successfully");
+
+    // The freed (module, id) pair must allocate a fresh handle on reload.
+    write_regs(&mut engine, image_base, 0x100, 0, 0, 0);
+    let reloaded = dispatch_user32(&mut engine, &mut state, "LoadAcceleratorsW");
+    assert_ne!(reloaded, 0, "reload of a freed table must still succeed");
+    assert_ne!(
+        reloaded, first,
+        "a destroyed table must not return the stale HACCEL"
+    );
+}
+
+#[test]
+fn test_destroy_accelerator_table_unknown_handle_is_false() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // No table was ever loaded, so any handle is unknown.
+    write_regs(&mut engine, 0x0000_0000_6640_00FF, 0, 0, 0, 0);
+    let destroyed = dispatch_user32(&mut engine, &mut state, "DestroyAcceleratorTable");
+    assert_eq!(destroyed, 0, "an unallocated HACCEL must not destroy");
 }

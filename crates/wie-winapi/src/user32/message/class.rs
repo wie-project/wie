@@ -67,7 +67,7 @@ pub fn handle_register_class_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         engine,
         checked_field_address(class_ptr, 0x30, "WNDCLASS.hbrBackground"),
     )?;
-    let _menu_name_ptr = read_guest_u64(
+    let menu_name = read_guest_u64(
         engine,
         checked_field_address(class_ptr, 0x38, "WNDCLASS.lpszMenuName"),
     )?;
@@ -95,6 +95,7 @@ pub fn handle_register_class_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
             cursor_handle: cursor,
             background_brush,
             small_icon_handle: 0,
+            menu_name,
             unicode: false,
         },
     )
@@ -170,7 +171,7 @@ pub fn handle_register_class_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         engine,
         checked_field_address(class_ptr, 0x30, "WNDCLASSW.hbrBackground"),
     )?;
-    let _menu_name_ptr = read_guest_u64(
+    let menu_name = read_guest_u64(
         engine,
         checked_field_address(class_ptr, 0x38, "WNDCLASSW.lpszMenuName"),
     )?;
@@ -198,6 +199,7 @@ pub fn handle_register_class_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
             cursor_handle: cursor,
             background_brush,
             small_icon_handle: 0,
+            menu_name,
             unicode: true,
         },
     )
