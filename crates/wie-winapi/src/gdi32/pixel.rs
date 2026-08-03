@@ -1,9 +1,9 @@
 // Pixel format conversion helpers and blit clipping.
 
-/// 32-bit BGRA (native endian) → 0RGB (softbuffer format).
+/// 32-bit BGRA (native endian) → 0RGB (present format).
 ///
 /// A DIB pixel loaded as `u32` from 4 bytes `[B, G, R, A]` (little-endian)
-/// produces `0xAARRGGBB`.  softbuffer wants `0RGB` — alpha masked off, no
+/// produces `0xAARRGGBB`.  The present path wants `0RGB` — alpha masked off, no
 /// channel swizzle.
 #[inline]
 #[must_use]

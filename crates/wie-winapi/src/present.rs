@@ -56,7 +56,7 @@ impl Default for MessageSignal {
 /// input messages without ever locking the big `WinApiState` mutex that the
 /// guest thread holds during API-handler execution.  Input events therefore
 /// never block on guest work.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MessageQueue {
     /// Queued messages in FIFO order.
     pub messages: Vec<crate::QueuedWindowMessage>,
@@ -71,6 +71,19 @@ pub struct MessageQueue {
     /// `GetMessage` must yield instead of synthesizing the regression-mode
     /// `WM_QUIT` — otherwise a dialog would close the instant it opens.
     pub dialog_depth: u32,
+}
+
+impl Default for MessageQueue {
+    fn default() -> Self {
+        Self {
+            // Reserve the common burst up-front so PostMessage/SendMessage
+            // pushes do not reallocate from an empty Vec on every burst.
+            messages: Vec::with_capacity(64),
+            next_message_time: 0,
+            signal: Arc::new(MessageSignal::new()),
+            dialog_depth: 0,
+        }
+    }
 }
 
 /// A frame of 0RGB pixels ready for display.
@@ -115,6 +128,13 @@ pub struct PresentState {
     pub(crate) record: Option<Box<SurfaceFrame>>,
     /// B9: number of published frames (frame timing enabled only).
     pub frames_published: u64,
+    /// Number of zero-copy hand-backs of the published buffer in
+    /// `ensure_surface` (`Arc::try_unwrap` succeeded — the host was not
+    /// holding the previous frame's Arc).
+    pub hand_back_unwrap: u64,
+    /// Number of clone-fallback hand-backs in `ensure_surface` (the host
+    /// still held the previous frame's Arc, so the buffer had to be copied).
+    pub hand_back_clone: u64,
     /// B9: accumulated publish wall time (ns).
     pub publish_ns: u128,
     /// B9: duration of the most recent publish (ns).
@@ -123,7 +143,7 @@ pub struct PresentState {
     pub blit_copy_ns: u128,
     /// B9: duration of the most recent mask copy (ns).
     pub blit_copy_ns_last: u128,
-    /// B9: accumulated host present (softbuffer copy + upload) wall time (ns).
+    /// B9: accumulated host present (frame upload + present) wall time (ns).
     pub present_ns: u128,
     /// B9: duration of the most recent host present (ns).
     pub present_ns_last: u128,
@@ -149,6 +169,8 @@ impl std::fmt::Debug for PresentState {
             .field("wake_is_set", &self.wake.is_some())
             .field("record_is_set", &self.record.is_some())
             .field("frames_published", &self.frames_published)
+            .field("hand_back_unwrap", &self.hand_back_unwrap)
+            .field("hand_back_clone", &self.hand_back_clone)
             .field("publish_ns", &self.publish_ns)
             .field("publish_ns_last", &self.publish_ns_last)
             .field("blit_copy_ns", &self.blit_copy_ns)
@@ -171,6 +193,8 @@ impl PresentState {
             wake: None,
             record: None,
             frames_published: 0,
+            hand_back_unwrap: 0,
+            hand_back_clone: 0,
             publish_ns: 0,
             publish_ns_last: 0,
             blit_copy_ns: 0,
@@ -197,10 +221,24 @@ impl PresentState {
             && let Some(frame) = self.published.remove(&hwnd)
         {
             // Zero-copy when the host is not holding the previous frame; clone
-            // otherwise (the host only briefly holds it). `dirty` is left
+            // otherwise (the host only briefly holds it). The clone is
+            // deliberate, not a missed zero-copy opportunity: the surface
+            // buffer must carry the previous frame's pixels so the composite
+            // keeps accumulating across publishes (see the struct doc on
+            // `WindowSurface::pixels`), and allocating a fresh zeroed buffer
+            // here would blank that base on the next paint. `dirty` is left
             // untouched: writes between this publish and the hand-back must
             // keep accumulating for the next region computation.
-            surface.pixels = Arc::try_unwrap(frame.pixels).unwrap_or_else(|shared| shared.to_vec());
+            surface.pixels = match Arc::try_unwrap(frame.pixels) {
+                Ok(pixels) => {
+                    self.hand_back_unwrap = self.hand_back_unwrap.saturating_add(1);
+                    pixels
+                }
+                Err(shared) => {
+                    self.hand_back_clone = self.hand_back_clone.saturating_add(1);
+                    shared.to_vec()
+                }
+            };
         }
         let entry = self.surfaces.entry(hwnd).or_insert_with(|| WindowSurface {
             width,
@@ -282,12 +320,17 @@ impl PresentState {
             "frame published"
         );
         if let Some(record) = self.record.as_mut() {
-            // Headless record keeps its OWN pixel copy — never move the same
-            // buffer into both the published map and the record slot.
+            // The record slot holds the most recent frame only and is
+            // overwritten on every publish; it is never mutated or read by the
+            // host in a way that needs a private copy, so share the published
+            // Arc instead of cloning up to 4 MB per recorded frame. The
+            // `ensure_surface` hand-back below will see the shared Arc and
+            // clone once for the next paint base — one copy per cycle either
+            // way, but no extra allocation + memcpy here.
             **record = SurfaceFrame {
                 width,
                 height,
-                pixels: Arc::new(pixels.to_vec()),
+                pixels: Arc::clone(&pixels),
             };
         }
         self.published.insert(

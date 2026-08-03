@@ -44,11 +44,17 @@ pub(crate) fn handle_fwrite(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         }
     }
     let capped = total_usize.min(MAX_FWRITE_OUTPUT);
-    let mut bytes = vec![0_u8; capped];
+    // Short writes use a stack buffer; only large writes hit the heap.
+    let mut stack_buf = [0_u8; 256];
+    let mut heap_buf = Vec::new();
+    let bytes: &mut [u8] = if capped <= stack_buf.len() {
+        &mut stack_buf[..capped]
+    } else {
+        heap_buf.resize(capped, 0);
+        &mut heap_buf
+    };
     if capped > 0 && buf != 0 {
-        engine
-            .mem_read(buf, &mut bytes)
-            .context("fwrite guest buffer")?;
+        engine.mem_read(buf, bytes).context("fwrite guest buffer")?;
     }
 
     // Host stdout/stderr for console programs (independent CRT expects console I/O).

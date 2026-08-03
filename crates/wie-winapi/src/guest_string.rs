@@ -64,7 +64,8 @@ pub(crate) fn read_ansi_bytes(
         return Ok(Vec::new());
     }
 
-    let mut bytes: Vec<u8> = Vec::new();
+    // Preallocate the common short-string size; long paths grow geometrically.
+    let mut bytes: Vec<u8> = Vec::with_capacity(128);
     let mut scratch = [0_u8; 4096];
     let mut remaining = max_bytes;
     let mut cursor = address;
@@ -99,7 +100,9 @@ pub(crate) fn read_utf16_lossy(
         return Ok(String::new());
     }
 
-    let mut units: Vec<u16> = Vec::new();
+    // Text-rendering hot path: preallocate the common short-string size so
+    // per-call Vec::new growth reallocations disappear for typical UI text.
+    let mut units: Vec<u16> = Vec::with_capacity(128);
     let mut scratch = [0_u8; 4096];
     let mut remaining_units = max_units;
     let mut cursor = address;

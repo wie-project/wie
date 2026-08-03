@@ -139,7 +139,9 @@ pub(crate) fn read_null_terminated_utf16_units(
 ) -> Result<Vec<u16>> {
     const MAX_UNITS: usize = 32_768;
 
-    let mut units = Vec::new();
+    // Geometric growth from a small preallocated capacity: long strings
+    // (up to 32_768 units) avoid the Vec::new reallocation chain.
+    let mut units = Vec::with_capacity(32);
 
     for index in 0..MAX_UNITS {
         let offset = u64::try_from(index)
