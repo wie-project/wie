@@ -5,7 +5,7 @@
 //! so the per-pixel conversion stays fast regardless of the host profile.
 
 /// Mask the alpha byte of little-endian BGRA pixels (`0xAARRGGBB`) into
-/// softbuffer 0RGB (`0x00RRGGBB`).
+/// present-format 0RGB (`0x00RRGGBB`).
 ///
 /// `src` is a byte view of BGRA pixels (a 32-bpp DIB); `dst` receives the
 /// masked 0RGB values.  Copies `min(dst.len(), src.len() / 4)` pixels.
@@ -84,7 +84,7 @@ pub fn mask_bgra_to_0rgb(dst: &mut [u32], src: &[u8]) {
 /// Precomputes the source row/column index maps once (w+h divisions total)
 /// so the inner loop has ZERO divisions, then gathers with unchecked
 /// indexing — the indices are provably in range, so the bounds checks would
-/// only cost time, not correctness.  Dimensions are `u32` (winit/softbuffer
+/// only cost time, not correctness.  Dimensions are `u32` (winit window
 /// sizes); converted to `usize` internally.
 ///
 /// The arithmetic is provably overflow-free: every product is bounded by

@@ -80,8 +80,9 @@ impl JitCpu {
         let pairs = cfg.pairs.clone();
         self.fast_api = cfg.pairs;
         // Mirror the pairs so the background worker lowers UCRT calls exactly
-        // like the inline path (same `call_fast` → same emitted code).
-        *self.shared.bg_fast_api.lock().unwrap() = pairs;
+        // like the inline path (same `call_fast` → same emitted code). The Arc
+        // hands the worker a shared immutable table (no per-job Vec clone).
+        *self.shared.bg_fast_api.lock().unwrap() = Arc::from(pairs);
         self.clear_compiled();
         self.invalidate_chain_and_shadow();
     }

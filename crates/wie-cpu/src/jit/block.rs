@@ -64,7 +64,11 @@ pub(super) fn decode_pure_gpr_block(
     hooks: Option<&HookWindow>,
     start: u64,
 ) -> BlockKind {
-    let mut insns = Vec::with_capacity(MAX_BLOCK_INSNS);
+    // Small initial capacity: typical blocks are 2–10 insns, so reserving
+    // `MAX_BLOCK_INSNS` (96) slots per compile wastes a 96-element allocation.
+    // Growth is geometric when a block really is long; the loop bound below
+    // still enforces `MAX_BLOCK_INSNS` exactly.
+    let mut insns = Vec::with_capacity(16);
     let mut rip = start;
     let mut bytes_len = 0_u32;
     let mut term: Option<BlockTerm> = None;

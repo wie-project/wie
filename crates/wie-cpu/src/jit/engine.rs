@@ -24,7 +24,6 @@ pub(crate) struct JitEngine {
     pub(super) module: cranelift_jit::JITModule,
     pub(super) ctx: cranelift_codegen::Context,
     pub(super) func_ctx: cranelift::prelude::FunctionBuilderContext,
-    pub(super) next_name: u32,
     /// Shared signature: `(i64 ctx_ptr)` — host C ABI (callable from Rust).
     pub(super) block_sig: cranelift::codegen::ir::Signature,
     /// Host `wie_jit_load` import.
@@ -296,7 +295,6 @@ impl JitEngine {
             module,
             ctx: cranelift_codegen::Context::new(),
             func_ctx: FunctionBuilderContext::new(),
-            next_name: 0,
             block_sig,
             load_id,
             store_id,

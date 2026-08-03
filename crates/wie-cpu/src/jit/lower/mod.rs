@@ -12,10 +12,11 @@ use crate::regs::Rflags;
 use cranelift::codegen::ir::{BlockArg, FuncRef, SigRef, UserFuncName};
 use cranelift::prelude::*;
 use cranelift_codegen::ir::{AliasRegionData, MemFlagsData};
-use cranelift_module::{FuncId, Linkage, Module};
+use cranelift_module::{FuncId, Module};
 use iced_x86::{Instruction, Mnemonic, OpKind};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 /// User-id for the "guest_data" alias region we install on every compiled function.
 ///
@@ -575,6 +576,13 @@ pub(super) use sse_fp::{
     wie_f32_binop, wie_f64_binop, wie_sse_cvt, wie_sse_fp_binop, wie_sse_fp_unop,
 };
 
+/// Process-wide empty chain table, so blocks with no chainable successor avoid
+/// building a `HashMap` (RandomState init) on every compile.
+fn empty_chain_refs() -> &'static HashMap<u64, FuncRef> {
+    static EMPTY: OnceLock<HashMap<u64, FuncRef>> = OnceLock::new();
+    EMPTY.get_or_init(HashMap::new)
+}
+
 pub(super) fn compile_block(
     eng: &mut JitEngine,
     start_rip: u64,
@@ -623,13 +631,15 @@ pub(super) fn compile_block(
         term_insn = None;
     }
 
-    let name_id = eng.next_name;
-    eng.next_name = eng.next_name.saturating_add(1);
-    let name = format!("b{name_id}");
-
+    // Anonymous declaration: Cranelift's `declare_function` retains the name
+    // (two `to_owned()` copies in `ModuleDeclarations::declare_function`), so a
+    // reusable buffer cannot help. Anonymous functions skip the name table
+    // entirely and still finalize/link by FuncId (blocks are only ever reached
+    // via `FuncId`, never by symbol). This saves the `format!("b{id}")` String
+    // plus both of Cranelift's copies on every block compile.
     let func_id = eng
         .module
-        .declare_function(&name, Linkage::Local, &eng.block_sig)
+        .declare_anonymous_function(&eng.block_sig)
         .map_err(|e| e.to_string())?;
 
     eng.ctx.func.signature = eng.block_sig.clone();
@@ -756,14 +766,18 @@ pub(super) fn compile_block(
             ucrt_refs[kind as usize] = Some(eng.module.declare_func_in_func(id, bcx.func));
         }
         // Chain successors (already compiled blocks) — direct call when known.
-        let mut chain_refs: HashMap<u64, FuncRef> = HashMap::new();
+        // Lazy: most blocks have no chainable successor, so skip the HashMap
+        // (and its RandomState init) unless a chain target is actually found.
+        let mut chain_refs: Option<HashMap<u64, FuncRef>> = None;
         if let Some(t) = term {
             for va in term_chain_targets(t) {
                 if va == start_rip {
                     continue; // self-loop uses IR jump
                 }
                 if let Some(&fid) = chain.get(&va) {
-                    chain_refs.insert(va, eng.module.declare_func_in_func(fid, bcx.func));
+                    chain_refs
+                        .get_or_insert_with(HashMap::new)
+                        .insert(va, eng.module.declare_func_in_func(fid, bcx.func));
                 }
             }
             // Also pre-declare return_ip for Call (common after callee returns).
@@ -771,15 +785,25 @@ pub(super) fn compile_block(
                 && return_ip != start_rip
                 && let Some(&fid) = chain.get(&return_ip)
             {
-                chain_refs.insert(return_ip, eng.module.declare_func_in_func(fid, bcx.func));
+                chain_refs
+                    .get_or_insert_with(HashMap::new)
+                    .insert(return_ip, eng.module.declare_func_in_func(fid, bcx.func));
             }
         }
         // Fallthrough chain.
         if term.is_none()
             && let Some(&fid) = chain.get(&end_rip)
         {
-            chain_refs.insert(end_rip, eng.module.declare_func_in_func(fid, bcx.func));
+            chain_refs
+                .get_or_insert_with(HashMap::new)
+                .insert(end_rip, eng.module.declare_func_in_func(fid, bcx.func));
         }
+        // Downstream code only reads the table; keep the no-chain majority free
+        // of HashMap construction by pointing at a process-wide empty table.
+        let chain_refs: &HashMap<u64, FuncRef> = match &chain_refs {
+            Some(m) => m,
+            None => empty_chain_refs(),
+        };
 
         // Live GPRs: only load what the block uses. Self-loops keep a full set in
         // block params so back-edges pass SSA values (no JitCtx store/reload).
@@ -810,7 +834,7 @@ pub(super) fn compile_block(
         // sticky keeps stack + sticky only; helpers still `pin_resolve` all 8
         // slots (VA/heaps) so walks collapse without IR cascade tax on 7za.
         // Set `WIE_JIT_MEM=pin` to also probe top-2 data pins after sticky.
-        let (stack_pin, data_pins) = if JitConfig::get().mem_inline_enabled() {
+        let (stack_pin, mut data_pins) = if JitConfig::get().mem_inline_enabled() {
             let stack = Some(hoist_pin_slot(&mut bcx, ctx_ptr, flags, 0));
             // Default sticky: no data-pin IR (helpers cover VA via pin_resolve).
             // `WIE_JIT_MEM=pin`: top-2 size-ranked data pins after sticky.
@@ -865,7 +889,9 @@ pub(super) fn compile_block(
             && call_fast.is_none()
             && JitConfig::get().super_enabled(self_loop);
 
-        let mut headers_to_seal: Vec<Block> = Vec::new();
+        // Only self-loop blocks create a header needing a later seal; keep the
+        // Vec lazy so the common case allocates nothing.
+        let mut headers_to_seal: Option<Vec<Block>> = None;
         // Tracks gpr_loaded for the exit store mask (union of paths; full when dual).
         let mut exit_gpr_loaded = entry_loaded;
 
@@ -920,7 +946,7 @@ pub(super) fn compile_block(
                     if pass_flags {
                         path_rflags = params[params.len() - 1];
                     }
-                    headers_to_seal.push(h);
+                    headers_to_seal.get_or_insert_with(Vec::new).push(h);
                     h
                 } else {
                     start_blk
@@ -954,11 +980,13 @@ pub(super) fn compile_block(
                     exit,
                     ucrt_refs,
                     // Super path: no per-access probes. Normal: hoisted pins.
+                    // `take` moves the 0–2 pin values instead of cloning them;
+                    // the loop iterates super first, so this is the last use.
                     stack_pin: if is_super { None } else { Some(spin) },
                     data_pins: if is_super {
                         Vec::new()
                     } else {
-                        data_pins.clone()
+                        std::mem::take(&mut data_pins)
                     },
                     super_stack: if is_super {
                         Some(SuperStack { bias })
@@ -984,7 +1012,7 @@ pub(super) fn compile_block(
                     flags,
                     rflags_ptr,
                     exit,
-                    &chain_refs,
+                    chain_refs,
                     lookup_ref,
                     block_sig_ref,
                     &mut path_gpr,
@@ -1033,7 +1061,7 @@ pub(super) fn compile_block(
                         pi = pi.saturating_add(1);
                     }
                 }
-                headers_to_seal.push(h);
+                headers_to_seal.get_or_insert_with(Vec::new).push(h);
                 h
             } else {
                 for i in 0..16 {
@@ -1103,7 +1131,7 @@ pub(super) fn compile_block(
                 flags,
                 rflags_ptr,
                 exit,
-                &chain_refs,
+                chain_refs,
                 lookup_ref,
                 block_sig_ref,
                 &mut gpr_vals,
@@ -1143,8 +1171,10 @@ pub(super) fn compile_block(
             bcx.ins().store(flags, exit_rflags, rflags_ptr, 0);
         }
         bcx.ins().return_(&[]);
-        for h in headers_to_seal {
-            bcx.seal_block(h);
+        if let Some(headers) = headers_to_seal {
+            for h in headers {
+                bcx.seal_block(h);
+            }
         }
         bcx.seal_all_blocks();
         bcx.finalize();

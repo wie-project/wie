@@ -132,8 +132,9 @@ pub struct JitShared {
     /// per-thread [`JitStats`] snapshots).
     pub bg_compiles: AtomicU64,
     /// UCRT fast-API pairs mirrored from each engine's `configure_fast_path` so
-    /// the worker lowers calls exactly like the inline path would.
-    pub bg_fast_api: Mutex<Vec<(u64, FastApiKind)>>,
+    /// the worker lowers calls exactly like the inline path would. Shared as an
+    /// `Arc<[_]>` so each background job pays a refcount bump, not a Vec clone.
+    pub bg_fast_api: Mutex<Arc<[(u64, FastApiKind)]>>,
     /// Test-only latch forcing the background path on for this instance
     /// (env-independent, and per-`JitShared` so parallel unit tests cannot
     /// interfere with each other).
@@ -169,7 +170,7 @@ impl JitShared {
             bg_alive: Arc::new(AtomicBool::new(false)),
             cache_epoch: AtomicU64::new(0),
             bg_compiles: AtomicU64::new(0),
-            bg_fast_api: Mutex::new(Vec::new()),
+            bg_fast_api: Mutex::new(Arc::from(Vec::new())),
             #[cfg(test)]
             bg_force: AtomicBool::new(false),
         }
@@ -264,8 +265,9 @@ impl JitShared {
                 break;
             };
             let mem_gen_before = shared.mem_gen.load(Ordering::Acquire);
+            // Arc clone: refcount bump only (table is built once per engine).
             let fast_api = shared.bg_fast_api.lock().unwrap().clone();
-            let compiled = shared.compile_from_kind_shared(&fast_api, rip, kind);
+            let compiled = shared.compile_from_kind_shared(fast_api.as_ref(), rip, kind);
             // If guest memory was remapped (map/protect/free) or a code page
             // write is pending while we compiled, the cached bytes may be
             // stale — drop the result and let the guest re-request.
