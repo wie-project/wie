@@ -38,7 +38,9 @@ pub fn handle_reg_create_key_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 
     let subkey = read_optional_ansi_string(engine, subkey_ptr)?;
 
-    let (handle, disposition) = open_or_create_registry_key(state, parent_key, subkey)?;
+    // RegCreateKeyEx is the only entry point permitted to create a key.
+    let (handle, disposition) = open_or_create_registry_key(state, parent_key, subkey, true)?
+        .context("RegCreateKeyExA: allow_create is set, key must be created")?;
 
     if phk_result != 0 {
         write_guest_u64(engine, phk_result, handle)?;
@@ -71,7 +73,16 @@ pub fn handle_reg_open_key_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let phk_result = read_guest_u64(engine, phk_result_address)?;
 
     let subkey = read_optional_ansi_string(engine, subkey_ptr)?;
-    let (handle, _disposition) = open_or_create_registry_key(state, parent_key, subkey)?;
+    // RegOpenKeyEx opens only: a missing key is ERROR_FILE_NOT_FOUND and
+    // must not be materialized (that is RegCreateKeyEx's job).
+    let Some((handle, _disposition)) =
+        open_or_create_registry_key(state, parent_key, subkey, false)?
+    else {
+        if phk_result != 0 {
+            write_guest_u64(engine, phk_result, 0)?;
+        }
+        return return_status(engine, ERROR_FILE_NOT_FOUND);
+    };
 
     if phk_result != 0 {
         write_guest_u64(engine, phk_result, handle)?;
@@ -100,7 +111,16 @@ pub fn handle_reg_open_key_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let phk_result = read_guest_u64(engine, phk_result_address)?;
 
     let subkey = read_optional_utf16_string(engine, subkey_ptr)?;
-    let (handle, _disposition) = open_or_create_registry_key(state, parent_key, subkey)?;
+    // RegOpenKeyEx opens only: a missing key is ERROR_FILE_NOT_FOUND and
+    // must not be materialized (that is RegCreateKeyEx's job).
+    let Some((handle, _disposition)) =
+        open_or_create_registry_key(state, parent_key, subkey, false)?
+    else {
+        if phk_result != 0 {
+            write_guest_u64(engine, phk_result, 0)?;
+        }
+        return return_status(engine, ERROR_FILE_NOT_FOUND);
+    };
 
     if phk_result != 0 {
         write_guest_u64(engine, phk_result, handle)?;
@@ -112,8 +132,8 @@ pub fn handle_reg_open_key_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 /// Handles `ADVAPI32.dll!RegOpenKeyA` (legacy; ≡ RegOpenKeyExA with `KEY_READ`).
 ///
 /// Legacy `RegOpenKey` does not create a missing key: it returns
-/// `ERROR_FILE_NOT_FOUND` and leaves `*phkResult` as 0, unlike the Ex pair
-/// whose shared core opens-or-creates.
+/// `ERROR_FILE_NOT_FOUND` and leaves `*phkResult` as 0, matching the
+/// open-only semantics of the Ex pair.
 pub fn handle_reg_open_key_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
@@ -132,20 +152,20 @@ pub fn handle_reg_open_key_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         .context("failed to read R8 for RegOpenKeyA")?;
 
     let subkey = read_optional_ansi_string(engine, subkey_ptr)?;
-    match find_registry_key(state, parent_key, &subkey) {
-        Some(handle) => {
-            if phk_result != 0 {
-                write_guest_u64(engine, phk_result, handle)?;
-            }
-            return_status(engine, ERROR_SUCCESS)
+    // Legacy RegOpenKey is open-only, same as RegOpenKeyEx: a missing key is
+    // ERROR_FILE_NOT_FOUND and is not materialized.
+    let Some((handle, _disposition)) =
+        open_or_create_registry_key(state, parent_key, subkey, false)?
+    else {
+        if phk_result != 0 {
+            write_guest_u64(engine, phk_result, 0)?;
         }
-        None => {
-            if phk_result != 0 {
-                write_guest_u64(engine, phk_result, 0)?;
-            }
-            return_status(engine, ERROR_FILE_NOT_FOUND)
-        }
+        return return_status(engine, ERROR_FILE_NOT_FOUND);
+    };
+    if phk_result != 0 {
+        write_guest_u64(engine, phk_result, handle)?;
     }
+    return_status(engine, ERROR_SUCCESS)
 }
 
 /// Handles `ADVAPI32.dll!RegOpenKeyW` (legacy; ≡ RegOpenKeyExW with `KEY_READ`).
@@ -165,20 +185,20 @@ pub fn handle_reg_open_key_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         .context("failed to read R8 for RegOpenKeyW")?;
 
     let subkey = read_optional_utf16_string(engine, subkey_ptr)?;
-    match find_registry_key(state, parent_key, &subkey) {
-        Some(handle) => {
-            if phk_result != 0 {
-                write_guest_u64(engine, phk_result, handle)?;
-            }
-            return_status(engine, ERROR_SUCCESS)
+    // Legacy RegOpenKey is open-only, same as RegOpenKeyEx: a missing key is
+    // ERROR_FILE_NOT_FOUND and is not materialized.
+    let Some((handle, _disposition)) =
+        open_or_create_registry_key(state, parent_key, subkey, false)?
+    else {
+        if phk_result != 0 {
+            write_guest_u64(engine, phk_result, 0)?;
         }
-        None => {
-            if phk_result != 0 {
-                write_guest_u64(engine, phk_result, 0)?;
-            }
-            return_status(engine, ERROR_FILE_NOT_FOUND)
-        }
+        return return_status(engine, ERROR_FILE_NOT_FOUND);
+    };
+    if phk_result != 0 {
+        write_guest_u64(engine, phk_result, handle)?;
     }
+    return_status(engine, ERROR_SUCCESS)
 }
 
 /// Handles `ADVAPI32.dll!RegCreateKeyExW`.
@@ -204,7 +224,10 @@ pub fn handle_reg_create_key_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     let disposition_ptr = read_guest_u64(engine, disposition_address)?;
 
     let subkey = read_optional_utf16_string(engine, subkey_ptr)?;
-    let (handle, disposition) = open_or_create_registry_key(state, parent_key, subkey)?;
+
+    // RegCreateKeyEx is the only entry point permitted to create a key.
+    let (handle, disposition) = open_or_create_registry_key(state, parent_key, subkey, true)?
+        .context("RegCreateKeyExW: allow_create is set, key must be created")?;
 
     if phk_result != 0 {
         write_guest_u64(engine, phk_result, handle)?;
@@ -543,8 +566,8 @@ fn handle_reg_enum_value(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 }
 
 /// Look up an existing registry key handle; `None` when the key is absent.
-/// Shared by the open-only (`RegOpenKey*`) and open-or-create (`RegOpenKeyEx*`)
-/// paths so both agree on how a (parent, subkey) pair resolves.
+/// Shared by every registry-key entry point so they all agree on how a
+/// (parent, subkey) pair resolves.
 fn find_registry_key(state: &WinApiState, parent: u64, subkey: &str) -> Option<u64> {
     state
         .process
@@ -554,13 +577,25 @@ fn find_registry_key(state: &WinApiState, parent: u64, subkey: &str) -> Option<u
         .map(|key| key.handle)
 }
 
+/// Resolve a registry key, creating it when absent only if `allow_create` is set.
+///
+/// Only `RegCreateKeyEx*` may materialize a key: `RegOpenKeyEx*` and the
+/// legacy `RegOpenKey*` must report the key as missing instead. Returns
+/// `Ok(None)` when the key is absent and creation is not permitted; the
+/// disposition follows the real REG_CREATED_NEW_KEY / REG_OPENED_EXISTING_KEY
+/// constants otherwise.
 fn open_or_create_registry_key(
     state: &mut WinApiState,
     parent: u64,
     subkey: String,
-) -> Result<(u64, u32)> {
+    allow_create: bool,
+) -> Result<Option<(u64, u32)>> {
     if let Some(handle) = find_registry_key(state, parent, &subkey) {
-        return Ok((handle, REG_OPENED_EXISTING_KEY));
+        return Ok(Some((handle, REG_OPENED_EXISTING_KEY)));
+    }
+
+    if !allow_create {
+        return Ok(None);
     }
 
     let handle = state.process.next_registry_key_handle.as_u64();
@@ -579,7 +614,7 @@ fn open_or_create_registry_key(
         subkey,
     });
 
-    Ok((handle, REG_CREATED_NEW_KEY))
+    Ok(Some((handle, REG_CREATED_NEW_KEY)))
 }
 
 fn return_status(engine: &mut dyn wie_cpu::CpuEngine, status: u64) -> Result<WinApiHandlerResult> {

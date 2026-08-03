@@ -6,6 +6,7 @@ use super::{
     read_guest_utf16_lossy, ret_bool_true, ret_u64, write_guest_u16, write_guest_u32,
     write_guest_u64, write_mock_string_a, write_mock_string_w,
 };
+use crate::user32::lang::ui_language;
 
 pub use identity::*;
 pub use time::*;
@@ -418,13 +419,16 @@ pub fn handle_get_user_default_ui_language(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
+    // Reads the process-wide UI language (OnceLock, host-derived) so the
+    // reported language always agrees with locale-aware resource resolution.
+    let return_value = u64::from(ui_language());
     let return_address = engine
-        .return_from_win64_api(LANG_EN_US)
+        .return_from_win64_api(return_value)
         .context("failed to return from GetUserDefaultUILanguage")?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: LANG_EN_US,
+        return_value,
     })
 }
 /// Handles dynamic `KERNEL32.dll!EncodePointer`.

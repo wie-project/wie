@@ -418,8 +418,131 @@ fn test_get_user_default_ui_language_returns_lang_id() {
         r.return_address, 0x1234_5678,
         "handler must return past the call"
     );
-    // UI language LANGID matches GetUserDefaultLangID (fixed en-US guest): 0x0409.
-    assert_eq!(r.return_value, 0x0409, "UI language must be LANG_EN_US");
+    // UI language LANGID comes from the process-wide OnceLock, derived from
+    // the host locale (whatever it is on the test machine). The handler reads
+    // the same value the locale-aware resolvers use.
+    assert_eq!(
+        r.return_value,
+        u64::from(crate::user32::lang::ui_language()),
+        "UI language must be the process-wide host-derived LANGID"
+    );
+}
+
+// ── Locale-aware resource resolution ────────────────────────────────
+
+/// Push one parsed `RT_STRING` block of `lang` into the main-module table.
+fn push_string_block(state: &mut WinApiState, lang: u16, block: u16, strings: &[&str]) {
+    use wie_pe::resources::StringBlock;
+    let mut slots: [String; 16] = std::array::from_fn(|_| String::new());
+    for (i, s) in strings.iter().enumerate() {
+        slots[i] = (*s).to_owned();
+    }
+    state.process.main_module_strings.push(StringBlock {
+        block,
+        lang,
+        strings: slots,
+    });
+}
+
+/// Seed a notepad-like string block in two locales: German 0x0007 first
+/// (resource-directory order — notepad lists 39 locales ascending) and en-US
+/// 0x0409 second. "Untitled" lives at id 0x174 (block 24, slot 4) and the
+/// file-type filter at id 0x176 (block 24, slot 6).
+fn push_locale_string_blocks(state: &mut WinApiState) {
+    push_string_block(
+        state,
+        0x0007,
+        24,
+        &["", "", "", "", "Unbenannt", "", "Textdateien (*.txt)"],
+    );
+    push_string_block(
+        state,
+        0x0409,
+        24,
+        &["", "", "", "", "Untitled", "", "Text files (*.txt)"],
+    );
+}
+
+/// Dispatch `LoadStringW` for `id` and return the copied guest buffer.
+fn load_string_w(engine: &mut IcedCpu, state: &mut WinApiState, id: u16) -> String {
+    let image_base = default_env().image_base;
+    let buf = 0x3000;
+    write_regs(engine, image_base, u64::from(id), buf, 64, 0);
+    dispatch_user32(engine, state, "LoadStringW");
+    read_guest_utf16_raw(engine, buf, 64)
+}
+
+/// The `(title, filter)` texts the resolution chain must pick for the process
+/// UI language: the German block when its primary language is German (exact
+/// LANGID or neutral), the en-US block otherwise (exact 0x0409 or the en-US
+/// fallback). Keeps the handler-path assertions host-independent.
+fn expected_locale_text() -> (&'static str, &'static str) {
+    if crate::user32::lang::ui_language() & 0xFF == 0x0007 {
+        ("Unbenannt", "Textdateien (*.txt)")
+    } else {
+        ("Untitled", "Text files (*.txt)")
+    }
+}
+
+#[test]
+fn test_load_string_w_picks_ui_language_locale() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    push_locale_string_blocks(&mut state);
+
+    // The handler resolves through the process-wide UI language (OnceLock,
+    // host-derived), so the en-US block beats the German first block on any
+    // non-German host — and the German block on a German host.
+    let (title, filter) = expected_locale_text();
+    assert_eq!(load_string_w(&mut engine, &mut state, 0x174), title);
+    assert_eq!(load_string_w(&mut engine, &mut state, 0x176), filter);
+}
+
+#[test]
+fn test_load_menu_w_picks_ui_language_locale() {
+    use wie_pe::resources::{MenuItemTemplate, MenuTemplate};
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // Same menu id in two locales: German first, en-US second.
+    let template = |lang: u16, text: &str| MenuTemplate {
+        id: 0x201,
+        lang,
+        items: vec![MenuItemTemplate {
+            flags: 0x00,
+            id: 0x0100,
+            text: Some(text.to_owned()),
+            sub: Vec::new(),
+        }],
+    };
+    state
+        .process
+        .main_module_menus
+        .push(template(0x0007, "Unbenannt"));
+    state
+        .process
+        .main_module_menus
+        .push(template(0x0409, "Untitled"));
+
+    // The 0x0409 template wins over the first (German) block for any
+    // non-German UI language; the German one wins on a German host.
+    let (title, _) = expected_locale_text();
+    let image_base = default_env().image_base;
+    write_regs(&mut engine, image_base, 0x201, 0, 0, 0);
+    let handle = dispatch_user32(&mut engine, &mut state, "LoadMenuW");
+    assert_ne!(handle, 0, "known menu id must return a nonzero HMENU");
+    let record = state
+        .window_state()
+        .menus
+        .iter()
+        .find(|m| m.handle == crate::handles::Hmenu::from(handle))
+        .expect("menu record exists");
+    assert!(
+        matches!(
+            record.items.first(),
+            Some(crate::user32::menu::MenuEntry::Item { text, .. }) if text == title
+        ),
+        "UI language must resolve the locale-matching menu template"
+    );
 }
 
 #[test]
@@ -2526,6 +2649,8 @@ fn test_reg_open_key_w_missing_returns_file_not_found() {
     let status = reg_open_key("advapi32.dll", "RegOpenKeyW", &mut state, &mut engine);
     assert_eq!(status, 2); // ERROR_FILE_NOT_FOUND
     assert_eq!(read_guest_handle(&mut engine, phk_ptr), 0);
+    // Open-only: the missing key must not be materialized by the legacy pair.
+    assert!(state.process.registry_keys.is_empty());
 }
 
 #[test]
@@ -2566,6 +2691,179 @@ fn test_reg_open_key_a_matches_w() {
     let status = reg_open_key("advapi32.dll", "RegOpenKeyA", &mut state, &mut engine);
     assert_eq!(status, 2); // ERROR_FILE_NOT_FOUND
     assert_eq!(read_guest_handle(&mut engine, missing_phk), 0);
+}
+
+/// `RegOpenKeyExA` is open-only: a missing key must report
+/// `ERROR_FILE_NOT_FOUND` and write 0 to `*phkResult` WITHOUT creating the
+/// key — only `RegCreateKeyEx*` may materialize a key.
+#[test]
+fn test_reg_open_key_ex_a_missing_returns_file_not_found_and_does_not_create() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let subkey_ptr = 0x5000;
+    let phk_ptr = 0x3000;
+    write_guest_ansi(&mut engine, subkey_ptr, "Software\\Missing\\Key");
+    // RegOpenKeyExA passes phkResult in the 5th stack slot: [rsp+0x30].
+    engine
+        .mem_write(STACK_TOP + 0x30, &u64::to_le_bytes(phk_ptr))
+        .expect("write phkResult arg");
+    engine
+        .mem_write(phk_ptr, &0xDEAD_BEEF_u64.to_le_bytes())
+        .expect("write sentinel phkResult");
+    // RegOpenKeyExA(hKey=HKCU, lpSubKey=subkey_ptr, ulOptions=0, samDesired=0, phkResult=[rsp+0x30])
+    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_ptr, 0, 0, 0);
+    let status = reg_open_key("advapi32.dll", "RegOpenKeyExA", &mut state, &mut engine);
+    assert_eq!(status, 2); // ERROR_FILE_NOT_FOUND
+    assert_eq!(read_guest_handle(&mut engine, phk_ptr), 0);
+    // The key must not be materialized: a second open on the same path fails
+    // identically (and again zeroes the output handle).
+    assert!(state.process.registry_keys.is_empty());
+    engine
+        .mem_write(phk_ptr, &0xDEAD_BEEF_u64.to_le_bytes())
+        .expect("write sentinel phkResult");
+    // Re-arm the registers: the first dispatch clobbers them on return.
+    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_ptr, 0, 0, 0);
+    let status = reg_open_key("advapi32.dll", "RegOpenKeyExA", &mut state, &mut engine);
+    assert_eq!(status, 2); // ERROR_FILE_NOT_FOUND
+    assert_eq!(read_guest_handle(&mut engine, phk_ptr), 0);
+    assert!(state.process.registry_keys.is_empty());
+}
+
+/// The W variant (soft-dispatch path) must match the A variant's open-only
+/// semantics: ERROR_FILE_NOT_FOUND, *phkResult = 0, no creation.
+#[test]
+fn test_reg_open_key_ex_w_missing_returns_file_not_found() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let subkey_ptr = 0x5000;
+    let phk_ptr = 0x3000;
+    write_guest_utf16(&mut engine, subkey_ptr, "Software\\Missing\\Key");
+    engine
+        .mem_write(STACK_TOP + 0x30, &u64::to_le_bytes(phk_ptr))
+        .expect("write phkResult arg");
+    engine
+        .mem_write(phk_ptr, &0xDEAD_BEEF_u64.to_le_bytes())
+        .expect("write sentinel phkResult");
+    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_ptr, 0, 0, 0);
+    let r = {
+        let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
+        advapi32::dispatch_advapi32_extra(&mut ctx, "RegOpenKeyExW")
+    }
+    .expect("dispatch")
+    .expect("handled");
+    assert_eq!(r.return_value, 2); // ERROR_FILE_NOT_FOUND
+    assert_eq!(read_guest_handle(&mut engine, phk_ptr), 0);
+    assert!(state.process.registry_keys.is_empty());
+}
+
+/// `RegOpenKeyExA` on an EXISTING key still returns the stored handle.
+#[test]
+fn test_reg_open_key_ex_a_opens_existing_key() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    state.process.registry_keys.push(crate::RegistryKey {
+        handle: 0x100,
+        parent: HKEY_CURRENT_USER,
+        subkey: "Software\\Microsoft\\Notepad".into(),
+    });
+    let subkey_ptr = 0x5000;
+    let phk_ptr = 0x3000;
+    write_guest_ansi(&mut engine, subkey_ptr, "Software\\Microsoft\\Notepad");
+    engine
+        .mem_write(STACK_TOP + 0x30, &u64::to_le_bytes(phk_ptr))
+        .expect("write phkResult arg");
+    engine
+        .mem_write(phk_ptr, &0xDEAD_BEEF_u64.to_le_bytes())
+        .expect("write sentinel phkResult");
+    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_ptr, 0, 0, 0);
+    let status = reg_open_key("advapi32.dll", "RegOpenKeyExA", &mut state, &mut engine);
+    assert_eq!(status, 0); // ERROR_SUCCESS
+    assert_eq!(read_guest_handle(&mut engine, phk_ptr), 0x100);
+}
+
+/// `RegCreateKeyExA` is the ONLY entry point allowed to create: the same
+/// missing path that failed to open is materialized here, and a subsequent
+/// open then succeeds with the created handle.
+#[test]
+fn test_reg_create_key_ex_a_creates_missing_key() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // Pre-existing key so the created handle is nonzero and distinguishable.
+    state.process.registry_keys.push(crate::RegistryKey {
+        handle: 0x100,
+        parent: HKEY_CURRENT_USER,
+        subkey: "Software\\Existing".into(),
+    });
+    state.process.next_registry_key_handle = crate::RegistryKeyHandle::from(0x101);
+    let subkey_ptr = 0x5000;
+    let phk_ptr = 0x3000;
+    let disposition_ptr = 0x3100;
+    write_guest_ansi(&mut engine, subkey_ptr, "Software\\Missing\\Key");
+    // RegCreateKeyExA passes phkResult at [rsp+0x40] and lpdwDisposition at [rsp+0x48].
+    engine
+        .mem_write(STACK_TOP + 0x40, &u64::to_le_bytes(phk_ptr))
+        .expect("write phkResult arg");
+    engine
+        .mem_write(STACK_TOP + 0x48, &u64::to_le_bytes(disposition_ptr))
+        .expect("write lpdwDisposition arg");
+    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_ptr, 0, 0, 0);
+    let status = reg_open_key("advapi32.dll", "RegCreateKeyExA", &mut state, &mut engine);
+    assert_eq!(status, 0); // ERROR_SUCCESS
+    assert_eq!(read_guest_handle(&mut engine, phk_ptr), 0x101);
+    let mut disp = [0_u8; 4];
+    engine
+        .mem_read(disposition_ptr, &mut disp)
+        .expect("read disposition");
+    assert_eq!(u32::from_le_bytes(disp), 1); // REG_CREATED_NEW_KEY
+    // The previously-missing path now opens with the created handle.
+    let open_phk = 0x3200;
+    engine
+        .mem_write(STACK_TOP + 0x30, &u64::to_le_bytes(open_phk))
+        .expect("write phkResult arg");
+    engine
+        .mem_write(open_phk, &0xDEAD_BEEF_u64.to_le_bytes())
+        .expect("write sentinel phkResult");
+    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_ptr, 0, 0, 0);
+    let status = reg_open_key("advapi32.dll", "RegOpenKeyExA", &mut state, &mut engine);
+    assert_eq!(status, 0); // ERROR_SUCCESS
+    assert_eq!(read_guest_handle(&mut engine, open_phk), 0x101);
+}
+
+/// W-variant parity for the create path (soft dispatch, what notepad uses).
+#[test]
+fn test_reg_create_key_ex_w_creates_missing_key() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    state.process.registry_keys.push(crate::RegistryKey {
+        handle: 0x100,
+        parent: HKEY_CURRENT_USER,
+        subkey: "Software\\Existing".into(),
+    });
+    state.process.next_registry_key_handle = crate::RegistryKeyHandle::from(0x101);
+    let subkey_ptr = 0x5000;
+    let phk_ptr = 0x3000;
+    let disposition_ptr = 0x3100;
+    write_guest_utf16(&mut engine, subkey_ptr, "Software\\Missing\\Key");
+    engine
+        .mem_write(STACK_TOP + 0x40, &u64::to_le_bytes(phk_ptr))
+        .expect("write phkResult arg");
+    engine
+        .mem_write(STACK_TOP + 0x48, &u64::to_le_bytes(disposition_ptr))
+        .expect("write lpdwDisposition arg");
+    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_ptr, 0, 0, 0);
+    let r = {
+        let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
+        advapi32::dispatch_advapi32_extra(&mut ctx, "RegCreateKeyExW")
+    }
+    .expect("dispatch")
+    .expect("handled");
+    assert_eq!(r.return_value, 0); // ERROR_SUCCESS
+    assert_eq!(read_guest_handle(&mut engine, phk_ptr), 0x101);
+    let mut disp = [0_u8; 4];
+    engine
+        .mem_read(disposition_ptr, &mut disp)
+        .expect("read disposition");
+    assert_eq!(u32::from_le_bytes(disp), 1); // REG_CREATED_NEW_KEY
 }
 
 // ── USER32 ────────────────────────────────────────────────────────
@@ -2943,6 +3241,7 @@ fn push_menu_templates(state: &mut WinApiState) {
     use wie_pe::resources::{MenuItemTemplate, MenuTemplate};
     state.process.main_module_menus.push(MenuTemplate {
         id: 0x201,
+        lang: 0x0409,
         items: vec![
             MenuItemTemplate {
                 flags: crate::user32::MF_POPUP,
@@ -7353,6 +7652,7 @@ fn push_accel_tables(state: &mut WinApiState) {
     use wie_pe::resources::{AccelEntry, AccelTemplate};
     state.process.main_module_accelerators.push(AccelTemplate {
         id: 0x0100,
+        lang: 0x0409,
         entries: vec![
             // FVIRTKEY|FCONTROL, VK_N → File New (0x0100).
             AccelEntry {

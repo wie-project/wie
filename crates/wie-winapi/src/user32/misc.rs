@@ -930,7 +930,9 @@ fn handle_load_string(ctx: &mut HandlerContext<'_>, api_name: &str) -> Result<Wi
 ///
 /// Only the main EXE module's table is parsed (mirrors the dialog/menu
 /// lifecycle); any other `hinst` resolves to not-found. Block names are
-/// 1-based in real rc.exe output, so the block id is `(id >> 4) + 1`.
+/// 1-based in real rc.exe output, so the block id is `(id >> 4) + 1`. When a
+/// block exists in several locales the UI language picks the block (exact
+/// LANGID → neutral → en-US → first in directory order).
 fn resolve_string_text(
     state: &WinApiState,
     image_base: u64,
@@ -942,11 +944,17 @@ fn resolve_string_text(
     }
     let block_id = (string_id >> 4).saturating_add(1);
     let slot = usize::from(string_id & 0xF);
-    state
-        .process
-        .main_module_strings
-        .iter()
-        .find(|block| block.block == block_id)
+    let ui_language = super::lang::ui_language();
+    let block = super::lang::resolve_block(
+        state
+            .process
+            .main_module_strings
+            .iter()
+            .filter(|block| block.block == block_id)
+            .map(|block| (u32::from(block.lang), block)),
+        ui_language,
+    );
+    block
         .and_then(|block| block.strings.get(slot))
         .cloned()
         .unwrap_or_default()

@@ -110,6 +110,10 @@ pub struct DialogTemplate {
     /// resources have no numeric id and come back as `0` (unaddressable by
     /// `DialogBoxParam`, which resolves ids only)
     pub name: u16,
+    /// Language id of the block this template came from (the language-level
+    /// directory entry key, e.g. `0x0409` en-US); `0` when the resource tree
+    /// has no language level.
+    pub lang: u16,
     /// Template style (`DS_*`/`WS_*` bits)
     pub style: u32,
     /// Template extended style
@@ -184,6 +188,10 @@ pub struct MenuTemplate {
     /// resources have no numeric id and come back as `0` (unaddressable by
     /// `LoadMenuW`, which resolves ids only)
     pub id: u32,
+    /// Language id of the block this template came from (the language-level
+    /// directory entry key, e.g. `0x0409` en-US); `0` when the resource tree
+    /// has no language level.
+    pub lang: u16,
     /// Top-level items in template order (always popups on a menu bar)
     pub items: Vec<MenuItemTemplate>,
 }
@@ -218,6 +226,9 @@ pub struct MenuItemTemplate {
 pub struct StringBlock {
     /// Block id — equal to `(string_id >> 4) + 1` for every string in it.
     pub block: u16,
+    /// Language id of the block (the language-level directory entry key,
+    /// e.g. `0x0409` en-US); `0` when the resource tree has no language level.
+    pub lang: u16,
     /// The 16 strings of the block, indexed by slot (`string_id & 0xF`).
     pub strings: [String; 16],
 }
@@ -234,6 +245,9 @@ pub struct AccelTemplate {
     /// resources have no numeric id and come back as `0` (unaddressable by
     /// `LoadAcceleratorsW`, which resolves ids only)
     pub id: u32,
+    /// Language id of the table (the language-level directory entry key,
+    /// e.g. `0x0409` en-US); `0` when the resource tree has no language level.
+    pub lang: u16,
     /// Entries in resource order.
     pub entries: Vec<AccelEntry>,
 }
@@ -320,6 +334,18 @@ struct ResourceDir {
     entries: Vec<(u32, u32)>,
 }
 
+/// Walk context for the resource-tree descent.
+///
+/// Bundles the image bytes, the section map, and the root-directory RVA —
+/// every RVA→file-offset translation in the walk needs all three. Carrying
+/// them as one value keeps the descent helpers below the `too_many_arguments`
+/// lint threshold as the language id threads through.
+struct ResourceWalk<'a> {
+    image: &'a [u8],
+    sections: &'a [PeSectionMap],
+    root_rva: u32,
+}
+
 /// Parse every resource of `type_id` in `image`, applying `parse_template` to
 /// each data leaf.
 ///
@@ -330,22 +356,27 @@ fn parse_resource_type<T>(
     image: &[u8],
     sections: &[PeSectionMap],
     type_id: u16,
-    parse_template: fn(u16, &[u8]) -> Option<T>,
+    parse_template: fn(u16, u16, &[u8]) -> Option<T>,
 ) -> Vec<T> {
     let mut out = Vec::new();
     let Some(root_rva) = resource_root_rva(image, sections) else {
         return out;
     };
-    let Some(root_off) = rva_to_file(image, sections, root_rva) else {
+    let walk = ResourceWalk {
+        image,
+        sections,
+        root_rva,
+    };
+    let Some(root_off) = rva_to_file(walk.image, walk.sections, walk.root_rva) else {
         return out;
     };
-    let Some(root) = read_resource_dir(image, root_off) else {
+    let Some(root) = read_resource_dir(walk.image, root_off) else {
         return out;
     };
 
     for (type_name, type_off) in root.entries {
         if !matches!(
-            resource_name(image, sections, root_rva, type_name),
+            resource_name(&walk, type_name),
             Some(ResourceName::Id(id)) if id == type_id
         ) {
             continue;
@@ -354,27 +385,19 @@ fn parse_resource_type<T>(
         if (type_off & 0x8000_0000) == 0 {
             continue;
         }
-        let Some(type_dir_off) = entry_target(image, sections, root_rva, type_off) else {
+        let Some(type_dir_off) = entry_target(&walk, type_off) else {
             continue;
         };
-        let Some(type_dir) = read_resource_dir(image, type_dir_off) else {
+        let Some(type_dir) = read_resource_dir(walk.image, type_dir_off) else {
             continue;
         };
         for (id_name, id_off) in type_dir.entries {
-            let template_id = match resource_name(image, sections, root_rva, id_name) {
+            let template_id = match resource_name(&walk, id_name) {
                 Some(ResourceName::Id(id)) => id,
                 // A named template has no id addressable by id-lookup APIs.
                 _ => 0,
             };
-            collect_language_leaves(
-                image,
-                sections,
-                root_rva,
-                template_id,
-                id_off,
-                parse_template,
-                &mut out,
-            );
+            collect_language_leaves(&walk, template_id, id_off, parse_template, &mut out);
         }
     }
     out
@@ -403,76 +426,61 @@ pub fn parse_accelerators(image: &[u8], sections: &[PeSectionMap]) -> Vec<AccelT
 /// Resolve a directory entry to a file offset.
 ///
 /// Entry offsets are relative to the root resource directory (PE spec), so
-/// they are rebased onto `root_rva` and re-mapped through the section map.
-fn entry_target(
-    image: &[u8],
-    sections: &[PeSectionMap],
-    root_rva: u32,
-    entry_off: u32,
-) -> Option<usize> {
+/// they are rebased onto the walk's `root_rva` and re-mapped through the
+/// section map.
+fn entry_target(walk: &ResourceWalk<'_>, entry_off: u32) -> Option<usize> {
     let rel = entry_off & 0x7FFF_FFFF;
-    let rva = root_rva.checked_add(rel)?;
-    rva_to_file(image, sections, rva)
+    let rva = walk.root_rva.checked_add(rel)?;
+    rva_to_file(walk.image, walk.sections, rva)
 }
 
 /// Collect templates from a template-id level entry.
 ///
 /// The entry either points directly at an `IMAGE_RESOURCE_DATA_ENTRY` (single
-/// language) or at a language subdirectory whose leaves are data entries.
+/// language) or at a language subdirectory whose leaves are data entries. The
+/// language-level directory entry's **key** is the LANGID (e.g. `0x0007`
+/// German, `0x0409` en-US); it becomes the template's `lang` field.
 fn collect_language_leaves<T>(
-    image: &[u8],
-    sections: &[PeSectionMap],
-    root_rva: u32,
+    walk: &ResourceWalk<'_>,
     template_id: u16,
     entry_off: u32,
-    parse_template: fn(u16, &[u8]) -> Option<T>,
+    parse_template: fn(u16, u16, &[u8]) -> Option<T>,
     out: &mut Vec<T>,
 ) {
     if (entry_off & 0x8000_0000) != 0 {
-        let Some(dir_off) = entry_target(image, sections, root_rva, entry_off) else {
+        let Some(dir_off) = entry_target(walk, entry_off) else {
             return;
         };
-        let Some(dir) = read_resource_dir(image, dir_off) else {
+        let Some(dir) = read_resource_dir(walk.image, dir_off) else {
             return;
         };
-        for (_, leaf_off) in dir.entries {
-            push_template_from_leaf(
-                image,
-                sections,
-                root_rva,
-                template_id,
-                leaf_off,
-                parse_template,
-                out,
-            );
+        for (lang_name, leaf_off) in dir.entries {
+            // A named key has no numeric language id; treat it as unknown.
+            let lang = match resource_name(walk, lang_name) {
+                Some(ResourceName::Id(id)) => id,
+                _ => 0,
+            };
+            push_template_from_leaf(walk, template_id, lang, leaf_off, parse_template, out);
         }
     } else {
-        push_template_from_leaf(
-            image,
-            sections,
-            root_rva,
-            template_id,
-            entry_off,
-            parse_template,
-            out,
-        );
+        // No language directory: a single data entry with unknown language.
+        push_template_from_leaf(walk, template_id, 0, entry_off, parse_template, out);
     }
 }
 
 /// Read one `IMAGE_RESOURCE_DATA_ENTRY` leaf and parse its template.
 fn push_template_from_leaf<T>(
-    image: &[u8],
-    sections: &[PeSectionMap],
-    root_rva: u32,
+    walk: &ResourceWalk<'_>,
     template_id: u16,
+    lang: u16,
     leaf_off: u32,
-    parse_template: fn(u16, &[u8]) -> Option<T>,
+    parse_template: fn(u16, u16, &[u8]) -> Option<T>,
     out: &mut Vec<T>,
 ) {
-    let Some((data_rva, data_size)) = read_data_entry(image, sections, root_rva, leaf_off) else {
+    let Some((data_rva, data_size)) = read_data_entry(walk, leaf_off) else {
         return;
     };
-    let Some(tpl_off) = rva_to_file(image, sections, data_rva) else {
+    let Some(tpl_off) = rva_to_file(walk.image, walk.sections, data_rva) else {
         return;
     };
     let Some(len) = usize::try_from(data_size).ok() else {
@@ -481,24 +489,19 @@ fn push_template_from_leaf<T>(
     let Some(end) = tpl_off.checked_add(len) else {
         return;
     };
-    let Some(tpl_bytes) = image.get(tpl_off..end) else {
+    let Some(tpl_bytes) = walk.image.get(tpl_off..end) else {
         return;
     };
-    if let Some(template) = parse_template(template_id, tpl_bytes) {
+    if let Some(template) = parse_template(template_id, lang, tpl_bytes) {
         out.push(template);
     }
 }
 
 /// Read the `(data RVA, size)` pair of an `IMAGE_RESOURCE_DATA_ENTRY`.
-fn read_data_entry(
-    image: &[u8],
-    sections: &[PeSectionMap],
-    root_rva: u32,
-    entry_off: u32,
-) -> Option<(u32, u32)> {
-    let off = entry_target(image, sections, root_rva, entry_off)?;
-    let data_rva = read_u32_at(image, off)?;
-    let size = read_u32_at(image, off.checked_add(4)?)?;
+fn read_data_entry(walk: &ResourceWalk<'_>, entry_off: u32) -> Option<(u32, u32)> {
+    let off = entry_target(walk, entry_off)?;
+    let data_rva = read_u32_at(walk.image, off)?;
+    let size = read_u32_at(walk.image, off.checked_add(4)?)?;
     Some((data_rva, size))
 }
 
@@ -583,16 +586,11 @@ fn read_resource_dir(image: &[u8], off: usize) -> Option<ResourceDir> {
 /// Classify a directory entry's `Name` field. Named resources carry a
 /// `IMAGE_RESOURCE_DIR_STRING_U` (WORD length + UTF-16 chars) whose offset is
 /// relative to the root directory.
-fn resource_name(
-    image: &[u8],
-    sections: &[PeSectionMap],
-    root_rva: u32,
-    name: u32,
-) -> Option<ResourceName> {
+fn resource_name(walk: &ResourceWalk<'_>, name: u32) -> Option<ResourceName> {
     if (name & 0x8000_0000) != 0 {
         // Bounds-check the name string without building it (only ids matter).
-        let off = entry_target(image, sections, root_rva, name)?;
-        let len = read_u16_at(image, off)?;
+        let off = entry_target(walk, name)?;
+        let len = read_u16_at(walk.image, off)?;
         off.checked_add(2)?
             .checked_add(usize::from(len).checked_mul(2)?)?;
         Some(ResourceName::Named)
@@ -623,7 +621,7 @@ fn rva_to_file(image: &[u8], sections: &[PeSectionMap], rva: u32) -> Option<usiz
 ///
 /// Skips `DLGTEMPLATEEX` and any template whose items run past the
 /// byte slice (malformed → treated as absent).
-fn parse_dialog_template(template_id: u16, bytes: &[u8]) -> Option<DialogTemplate> {
+fn parse_dialog_template(template_id: u16, lang: u16, bytes: &[u8]) -> Option<DialogTemplate> {
     let word0 = read_u16_at(bytes, 0)?;
     let word1 = read_u16_at(bytes, 2)?;
 
@@ -683,6 +681,7 @@ fn parse_dialog_template(template_id: u16, bytes: &[u8]) -> Option<DialogTemplat
 
     Some(DialogTemplate {
         name: template_id,
+        lang,
         style: style.bits(),
         ex_style: ex_style.bits(),
         x,
@@ -745,13 +744,14 @@ fn parse_dialog_item(bytes: &[u8], pos: usize) -> Option<(DialogItemTemplate, us
 /// option carries `MF_END` (0x80) is the last of its level. Entries are NOT
 /// DWORD-aligned in this format (unlike dialog items): each entry starts
 /// immediately after the previous string's terminator.
-fn parse_menu_template(template_id: u16, bytes: &[u8]) -> Option<MenuTemplate> {
+fn parse_menu_template(template_id: u16, lang: u16, bytes: &[u8]) -> Option<MenuTemplate> {
     // `windres` prefixes the entry list with a zero version/header DWORD.
     let header = u32::from(read_u16_at(bytes, 0)?) | (u32::from(read_u16_at(bytes, 2)?) << 16);
     let mut pos = if header == 0 { 4 } else { 0 };
     let items = parse_menu_entries(bytes, &mut pos, true)?;
     Some(MenuTemplate {
         id: u32::from(template_id),
+        lang,
         items,
     })
 }
@@ -831,7 +831,7 @@ fn parse_menu_entry(bytes: &[u8], pos: &mut usize) -> Option<MenuItemTemplate> {
 /// empty string. Parsing is lenient like the other resource parsers: a block
 /// truncated mid-string yields empty strings for the slots that do not fit
 /// (never fails the caller).
-fn parse_string_block(block_id: u16, bytes: &[u8]) -> Option<StringBlock> {
+fn parse_string_block(block_id: u16, lang: u16, bytes: &[u8]) -> Option<StringBlock> {
     if bytes.len() < 2 {
         // Not even one length prefix: treat the block as absent.
         return None;
@@ -864,6 +864,7 @@ fn parse_string_block(block_id: u16, bytes: &[u8]) -> Option<StringBlock> {
     }
     Some(StringBlock {
         block: block_id,
+        lang,
         strings,
     })
 }
@@ -874,7 +875,7 @@ fn parse_string_block(block_id: u16, bytes: &[u8]) -> Option<StringBlock> {
 /// count and no terminator. A trailing partial entry (fewer than 6 bytes) is
 /// dropped; a table with no full entry at all is treated as absent — the same
 /// lenient contract as the other resource parsers.
-fn parse_accel_table(table_id: u16, bytes: &[u8]) -> Option<AccelTemplate> {
+fn parse_accel_table(table_id: u16, lang: u16, bytes: &[u8]) -> Option<AccelTemplate> {
     let mut entries = Vec::new();
     let mut pos = 0usize;
     // A partial trailing entry (fewer than 6 bytes) ends the walk; the table
@@ -897,6 +898,7 @@ fn parse_accel_table(table_id: u16, bytes: &[u8]) -> Option<AccelTemplate> {
     }
     Some(AccelTemplate {
         id: u32::from(table_id),
+        lang,
         entries,
     })
 }
@@ -1165,7 +1167,7 @@ mod tests {
         put_utf16(&mut b, "OK");
         put_u16(&mut b, 0); // creation data size
 
-        let t = parse_dialog_template(42, &b).expect("template");
+        let t = parse_dialog_template(42, 0x0409, &b).expect("template");
         assert_eq!(t.name, 42);
         assert_eq!(t.style, 0x80C0_0040);
         assert_eq!((t.x, t.y, t.cx, t.cy), (10, 20, 100, 40));
@@ -1202,7 +1204,7 @@ mod tests {
         put_u16(&mut b, 8); // point
         put_utf16(&mut b, "A");
 
-        let t = parse_dialog_template(7, &b).expect("msdn variant");
+        let t = parse_dialog_template(7, 0x0409, &b).expect("msdn variant");
         assert_eq!(t.name, 7);
         assert_eq!(t.title, "T");
         assert_eq!(t.font_point, Some(8));
@@ -1214,7 +1216,7 @@ mod tests {
     fn dlg_template_ex_is_deferred() {
         // dlgVer=1, signature=0xFFFF → skipped (unsupported).
         let bytes = [1_u8, 0, 0xFF, 0xFF];
-        assert!(parse_dialog_template(1, &bytes).is_none());
+        assert!(parse_dialog_template(1, 0x0409, &bytes).is_none());
     }
 
     #[test]
@@ -1228,7 +1230,7 @@ mod tests {
         put_u16(&mut b, 0);
         put_u16(&mut b, 0);
         put_u16(&mut b, 0);
-        assert!(parse_dialog_template(1, &b).is_none());
+        assert!(parse_dialog_template(1, 0x0409, &b).is_none());
     }
 
     /// Copy `bytes` into `image` at `start` (bounds-checked).
@@ -1389,7 +1391,7 @@ mod tests {
         b.extend(menu_entry(false, 0x0000, 0x0110, "&Undo\tCtrl+Z"));
         b.extend(menu_entry(false, 0x0080, 0x0117, "Time/&Date\tF5"));
 
-        let m = parse_menu_template(0x201, &b).expect("template");
+        let m = parse_menu_template(0x201, 0x0409, &b).expect("template");
         assert_eq!(m.id, 0x201);
         assert_eq!(m.items.len(), 2);
 
@@ -1431,7 +1433,7 @@ mod tests {
         b.extend(menu_entry(false, 0x0800, 0, ""));
         b.extend(menu_entry(false, 0x0080, 7, "Item"));
 
-        let m = parse_menu_template(9, &b).expect("template");
+        let m = parse_menu_template(9, 0x0409, &b).expect("template");
         let file = &m.items[0];
         assert_eq!(file.sub.len(), 2);
         assert_eq!(file.sub[0].text, None);
@@ -1447,7 +1449,7 @@ mod tests {
         b.extend(menu_entry(true, 0x0010, 0, "&File"));
         b.extend(menu_entry(false, 0x0080, 3, "E&xit"));
 
-        let m = parse_menu_template(1, &b).expect("template");
+        let m = parse_menu_template(1, 0x0409, &b).expect("template");
         assert_eq!(m.items.len(), 1);
         assert_eq!(m.items[0].sub.len(), 1);
         assert_eq!(m.items[0].sub[0].id, 3);
@@ -1460,9 +1462,9 @@ mod tests {
         put_u32(&mut b, 0);
         b.extend(menu_entry(true, 0x0090, 0, "&File"));
         b.extend(menu_entry(false, 0x0000, 1, "A"));
-        assert!(parse_menu_template(1, &b).is_none());
+        assert!(parse_menu_template(1, 0x0409, &b).is_none());
         // Missing bytes entirely.
-        assert!(parse_menu_template(1, &[]).is_none());
+        assert!(parse_menu_template(1, 0x0409, &[]).is_none());
     }
 
     #[test]
@@ -1577,7 +1579,7 @@ mod tests {
     #[test]
     fn parses_string_block_slots() {
         let b = string_block_body(&["Untitled", "", "café — ✓"]);
-        let block = parse_string_block(0x2A, &b).expect("block");
+        let block = parse_string_block(0x2A, 0x0409, &b).expect("block");
         assert_eq!(block.block, 0x2A);
         assert_eq!(block.strings[0], "Untitled");
         assert_eq!(block.strings[1], "");
@@ -1590,7 +1592,7 @@ mod tests {
     #[test]
     fn empty_string_block_yields_empty_strings() {
         let b = string_block_body(&[]);
-        let block = parse_string_block(7, &b).expect("block");
+        let block = parse_string_block(7, 0x0409, &b).expect("block");
         assert_eq!(block.block, 7);
         assert!(block.strings.iter().all(|s| s.is_empty()));
     }
@@ -1603,10 +1605,10 @@ mod tests {
         put_u16(&mut b, 5);
         put_u16(&mut b, 0x0041); // 'A'
         put_u16(&mut b, 0x0042); // 'B'
-        let block = parse_string_block(0, &b).expect("block");
+        let block = parse_string_block(0, 0x0409, &b).expect("block");
         assert!(block.strings.iter().all(|s| s.is_empty()));
         // A block with no length prefix at all is treated as absent.
-        assert!(parse_string_block(0, &[]).is_none());
+        assert!(parse_string_block(0, 0x0409, &[]).is_none());
     }
 
     #[test]
@@ -1714,6 +1716,84 @@ mod tests {
         assert!(parse_strings(&[0_u8; 64], &[]).is_empty());
     }
 
+    /// One string block id with two language blocks: German 0x0007 first and
+    /// en-US 0x0409 second (notepad.exe's resource-directory order). Both
+    /// parsed blocks must carry their language id.
+    #[test]
+    fn language_leaves_carry_their_lang_id() {
+        let sections = vec![fake_rsrc_section()];
+        let mut image = vec![0_u8; 0x1400];
+
+        // Root dir @0x200: type RT_STRING → type dir @0x218.
+        let mut root = Vec::new();
+        push_dir_entry(&mut root, u32::from(RT_STRING), 0x8000_0018);
+        copy_into(&mut image, 0x200, &root);
+
+        // Type dir @0x218: block id 1 → lang dir @0x240.
+        let mut type_dir = Vec::new();
+        push_dir_entry(&mut type_dir, 1, 0x8000_0040);
+        copy_into(&mut image, 0x218, &type_dir);
+
+        // Lang dir @0x240: two entries — 0x0007 German first (ascending
+        // LANGID order, like rc.exe), then 0x0409 en-US. Entry offsets are
+        // relative to the root dir @0x200, so 0x68/0x78 → data @0x268/0x278
+        // (clear of the entries at 0x250..0x25F).
+        let mut lang = Vec::new();
+        put_u32(&mut lang, 0); // characteristics
+        put_u32(&mut lang, 0); // timestamp
+        put_u16(&mut lang, 0); // major version
+        put_u16(&mut lang, 0); // minor version
+        put_u16(&mut lang, 0); // named entries
+        put_u16(&mut lang, 2); // two id entries
+        put_u32(&mut lang, 0x0007);
+        put_u32(&mut lang, 0x68);
+        put_u32(&mut lang, 0x0409);
+        put_u32(&mut lang, 0x78);
+        copy_into(&mut image, 0x240, &lang);
+
+        // Data entries @0x268 (German) and @0x278 (en-US); block bodies at
+        // rva 0x1200 (file 0x400) and 0x1300 (file 0x500).
+        for (entry_off, rva) in [(0x268_usize, 0x1200_u32), (0x278, 0x1300)] {
+            let mut data = Vec::new();
+            put_u32(&mut data, rva);
+            put_u32(&mut data, 0); // patched to the real size below
+            put_u32(&mut data, 0); // code page
+            put_u32(&mut data, 0); // reserved
+            copy_into(&mut image, entry_off, &data);
+        }
+
+        // Notepad-like bodies: the "Untitled" title at slot 4, the file-type
+        // filter at slot 6 (ids 0x174 / 0x176 → block 24).
+        let german = string_block_body(&["", "", "", "", "Unbenannt", "", "Textdateien (*.txt)"]);
+        copy_into(&mut image, 0x400, &german);
+        copy_into(
+            &mut image,
+            0x26C,
+            &u32::try_from(german.len())
+                .expect("size fits")
+                .to_le_bytes(),
+        );
+        let english = string_block_body(&["", "", "", "", "Untitled", "", "Text files (*.txt)"]);
+        copy_into(&mut image, 0x500, &english);
+        copy_into(
+            &mut image,
+            0x27C,
+            &u32::try_from(english.len())
+                .expect("size fits")
+                .to_le_bytes(),
+        );
+
+        let blocks = parse_strings(&image, &sections);
+        assert_eq!(blocks.len(), 2, "both locale blocks must parse");
+        // Directory order is preserved: German first.
+        assert_eq!(blocks[0].lang, 0x0007, "first block is the German locale");
+        assert_eq!(blocks[0].strings[4], "Unbenannt");
+        assert_eq!(blocks[0].strings[6], "Textdateien (*.txt)");
+        assert_eq!(blocks[1].lang, 0x0409, "second block is en-US");
+        assert_eq!(blocks[1].strings[4], "Untitled");
+        assert_eq!(blocks[1].strings[6], "Text files (*.txt)");
+    }
+
     /// Emit one `ACCEL` resource entry: `WORD fFlags`, `WORD wAnsi`, `WORD wId`.
     fn accel_entry(flags: u16, key: u16, id: u16) -> Vec<u8> {
         let mut b = Vec::new();
@@ -1734,7 +1814,7 @@ mod tests {
         b.extend(accel_entry(0x0000, 0x61, 0x0111)); // plain char 'a'
         b.extend(accel_entry(0x0001, 0x70, 0x0120)); // FVIRTKEY, VK_F1
 
-        let t = parse_accel_table(0x100, &b).expect("table");
+        let t = parse_accel_table(0x100, 0x0409, &b).expect("table");
         assert_eq!(t.id, 0x100);
         assert_eq!(t.entries.len(), 5);
         assert_eq!(t.entries[0].flags, 0x0009);
@@ -1760,10 +1840,10 @@ mod tests {
         b.extend(accel_entry(0x0001, 0x4E, 0x0100));
         put_u16(&mut b, 0x0009);
         put_u16(&mut b, 0x4E);
-        let t = parse_accel_table(1, &b).expect("table");
+        let t = parse_accel_table(1, 0x0409, &b).expect("table");
         assert_eq!(t.entries.len(), 1);
         // No bytes at all: the table is treated as absent.
-        assert!(parse_accel_table(1, &[]).is_none());
+        assert!(parse_accel_table(1, 0x0409, &[]).is_none());
     }
 
     #[test]

@@ -322,12 +322,19 @@ pub(crate) fn load_resource_menu(
     instance_handle: u64,
     menu_id: u16,
 ) -> Result<u64> {
-    let template = state
-        .process
-        .main_module_menus
-        .iter()
-        .find(|template| template.id == u32::from(menu_id))
-        .cloned();
+    // When the id exists in several locales, the UI language picks the
+    // template (exact LANGID → neutral → en-US → first in directory order).
+    let ui_language = super::lang::ui_language();
+    let template = super::lang::resolve_block(
+        state
+            .process
+            .main_module_menus
+            .iter()
+            .filter(|template| template.id == u32::from(menu_id))
+            .map(|template| (u32::from(template.lang), template)),
+        ui_language,
+    )
+    .cloned();
     let Some(template) = template else {
         return Ok(0);
     };
