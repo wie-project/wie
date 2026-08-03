@@ -8,6 +8,7 @@ description = "WIE CPU engine trait and backends (Cranelift JIT default; iced in
 
 [dependencies]
 thiserror.workspace = true
+ahash.workspace = true
 tracing.workspace = true
 libc = "0.2"
 # Slim iced: decoder + Register helpers; drop encoder/formatters.
