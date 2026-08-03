@@ -1639,6 +1639,13 @@ static WINAPI_NAME_ROWS: &[(&str, &str, WinApiId)] = &[
         WinApiId::User32Loadmenua,
     ),
     ("user32.dll", "loadmenuw", WinApiId::User32Loadmenuw),
+    (
+        // Row placed at the table end with the appended variant (433), so
+        // the id table and the name rows stay in the same order.
+        "user32.dll",
+        "isclipboardformatavailable",
+        WinApiId::User32Isclipboardformatavailable,
+    ),
 ];
 
 /// Resolve library/export to id. Case-insensitive, allocation-free.

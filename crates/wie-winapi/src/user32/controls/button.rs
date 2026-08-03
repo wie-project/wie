@@ -52,18 +52,27 @@ pub(super) fn paint_control(
     let items = control_items(state, hwnd).to_vec();
     let sel_index = control_sel_index(state, hwnd);
 
-    // Controls use the system default font (sans-serif 16 px). The engine is
-    // taken out of gdi state so the paint can pass `&mut state` and
-    // `&mut font_engine` side by side (a plain field cannot be split-borrowed
-    // alongside `state`); it is put back unconditionally after the body. This
-    // is safe under the single shared WinApiState mutex: every API handler —
-    // this WM_PAINT and any concurrent one on another host thread — runs
-    // while holding it, so the take and the put cannot interleave.
+    // Controls draw with the font a WM_SETFONT stored on the window (notepad
+    // sends one to its EDIT right after creation); a window without one — or
+    // with an unknown HFONT — falls back to the system default (sans-serif
+    // 16 px). Both resolve through the same engine cache. The engine is taken
+    // out of gdi state so the paint can pass `&mut state` and `&mut font_engine`
+    // side by side (a plain field cannot be split-borrowed alongside `state`);
+    // it is put back unconditionally after the body. This is safe under the
+    // single shared WinApiState mutex: every API handler — this WM_PAINT and
+    // any concurrent one on another host thread — runs while holding it, so
+    // the take and the put cannot interleave.
     let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
     let default_key = FontKey::default();
-    let resolved = font_engine.resolve(&default_key, 16);
+    let key_and_resolved = match crate::gdi32::window_font_resolution(state, hwnd, &mut font_engine)
+    {
+        Some(key_and_resolved) => Some(key_and_resolved),
+        None => font_engine
+            .resolve(&default_key, 16)
+            .map(|resolved| (default_key, resolved)),
+    };
     let result = (|| -> Result<()> {
-        let Some(resolved) = &resolved else {
+        let Some((key, resolved)) = &key_and_resolved else {
             // No system font: paint faces/borders but skip the text.
             return Ok(());
         };
@@ -72,14 +81,7 @@ pub(super) fn paint_control(
                 paint_face_and_border(state, &info, width, height, pressed);
                 // The ampersand is a mnemonic marker, not caption glyph.
                 let caption = strip_mnemonics(&text);
-                let tx = centered_text_x(
-                    &info,
-                    width,
-                    &caption,
-                    &mut font_engine,
-                    resolved,
-                    &default_key,
-                );
+                let tx = centered_text_x(&info, width, &caption, &mut font_engine, resolved, key);
                 paint_label(
                     state,
                     engine,
@@ -91,7 +93,7 @@ pub(super) fn paint_control(
                     pressed,
                     &mut font_engine,
                     resolved,
-                    &default_key,
+                    key,
                 )?;
             }
             ControlClassKind::Static => {
@@ -122,7 +124,7 @@ pub(super) fn paint_control(
                     false,
                     &mut font_engine,
                     resolved,
-                    &default_key,
+                    key,
                 )?;
             }
             ControlClassKind::Edit => {
@@ -149,7 +151,7 @@ pub(super) fn paint_control(
                     height,
                     &mut font_engine,
                     resolved,
-                    &default_key,
+                    key,
                 )?;
             }
             ControlClassKind::ListBox => {
@@ -175,7 +177,7 @@ pub(super) fn paint_control(
                     sel_index,
                     &mut font_engine,
                     resolved,
-                    &default_key,
+                    key,
                 )?;
             }
             ControlClassKind::ComboBox => {
@@ -193,7 +195,7 @@ pub(super) fn paint_control(
                     false,
                     &mut font_engine,
                     resolved,
-                    &default_key,
+                    key,
                 )?;
             }
             // Handled by the early return above (no font needed for the empty

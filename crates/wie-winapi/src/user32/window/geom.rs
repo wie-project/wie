@@ -2,6 +2,7 @@
 //! (split from the former `window.rs`).
 
 use super::class::{find_window, find_window_mut};
+use crate::state::WindowFlags;
 use crate::user32::{
     Context, FAKE_DESKTOP_WINDOW_HANDLE, FAKE_PROCESS_ID, FAKE_SYSTEM_COLOR_BRUSH_BASE,
     FAKE_THREAD_ID, FAKE_WINDOW_HANDLE, HandlerContext, Result, WinApiHandlerResult, WinApiState,
@@ -805,6 +806,17 @@ pub fn handle_set_window_placement(ctx: &mut HandlerContext<'_>) -> Result<WinAp
             window.width = width;
             window.height = height;
             window.visible = visible;
+            // Showing the window invalidates it with erase (real Windows),
+            // mirroring ShowWindow(SW_SHOW): the first paint cycle fills the
+            // client with the class-brush background before the guest paints.
+            // SetWindowPlacement is how notepad-style apps show their main
+            // window (instead of ShowWindow), so without this the top-level
+            // frame stays zeroed (black) until something else triggers an
+            // erase. Hidden windows never paint.
+            if visible {
+                window.invalidated = true;
+                window.flags.insert(WindowFlags::ERASE_BACKGROUND);
+            }
             // rcNormalPosition is the outer window rect; the client rect
             // keeps its window-relative origin and tracks the new size.
             window.client_rect = (0, 0, width, height);

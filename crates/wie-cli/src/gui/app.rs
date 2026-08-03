@@ -217,6 +217,35 @@ fn init_present_backend(window: &Arc<Window>) -> Option<PresentBackend> {
     crate::gui::present_wgpu::WgpuPresenter::init(window.clone()).ok()
 }
 
+/// The message for a left-button press: WM_LBUTTONDBLCLK when it lands on the
+/// SAME target window within the double-click time window AND the double-click
+/// slop rectangle of the previous press (`last`), WM_LBUTTONDOWN otherwise.
+/// Every press refreshes `last`, so the host re-creates the message Windows
+/// itself synthesizes from `GetDoubleClickTime` / `SM_CXDOUBLECLK` (Windows
+/// tracks double-clicks per window). A free function (not a method) so the
+/// MouseInput arm can call it while `self.handle` is borrowed.
+fn left_press_message(
+    last: &mut Option<(Instant, f64, f64, u64)>,
+    cursor: (f64, f64),
+    hwnd: u64,
+) -> u32 {
+    let now = Instant::now();
+    let (x, y) = cursor;
+    let dbl = last.is_some_and(|(t, lx, ly, last_hwnd)| {
+        last_hwnd == hwnd
+            && now.saturating_duration_since(t)
+                <= Duration::from_millis(input::DOUBLE_CLICK_TIME_MS)
+            && (x - lx).abs() <= input::DOUBLE_CLICK_SLOP_PX
+            && (y - ly).abs() <= input::DOUBLE_CLICK_SLOP_PX
+    });
+    *last = Some((now, x, y, hwnd));
+    if dbl {
+        input::WM_LBUTTONDBLCLK
+    } else {
+        input::WM_LBUTTONDOWN
+    }
+}
+
 /// winit application state: bridges the guest window to the present backend.
 struct WieApp {
     handle: Option<GuestHandle>,
@@ -231,6 +260,11 @@ struct WieApp {
     mouse_buttons: u16,
     /// Last reported cursor position in client coords (x, y).
     cursor_pos: (f64, f64),
+    /// The last left-button press (time, position, target window), for
+    /// double-click detection — a second press on the same window within the
+    /// time window and slop rectangle posts WM_LBUTTONDBLCLK instead of
+    /// WM_LBUTTONDOWN (the message Windows itself would synthesize).
+    last_left_press: Option<(Instant, f64, f64, u64)>,
     /// Currently held modifier keys (shift/ctrl/alt) — from ModifiersChanged.
     modifiers: winit::keyboard::ModifiersState,
     /// macOS application menu bar mirroring the guest window's menu.
@@ -410,10 +444,14 @@ impl ApplicationHandler<WieEvent> for WieApp {
                 } else {
                     self.mouse_buttons &= !bit;
                 }
+                // The target is resolved first so the double-click detection
+                // can require both presses on the same window (Windows tracks
+                // double-clicks per window).
+                let (target, rx, ry) = self.mouse_target(handle);
                 let msg = match button {
                     winit::event::MouseButton::Left => {
                         if pressed {
-                            input::WM_LBUTTONDOWN
+                            left_press_message(&mut self.last_left_press, self.cursor_pos, target)
                         } else {
                             input::WM_LBUTTONUP
                         }
@@ -435,7 +473,6 @@ impl ApplicationHandler<WieEvent> for WieApp {
                     _ => return,
                 };
                 let mk = self.mk_flags();
-                let (target, rx, ry) = self.mouse_target(handle);
                 let lparam = input::make_lparam(rx, ry);
                 let (px, py) = self.cursor_pos_i32();
                 handle.post_message_at(target, msg, u64::from(mk), lparam, px, py);
@@ -448,8 +485,16 @@ impl ApplicationHandler<WieEvent> for WieApp {
                     winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.x as i32, pos.y as i32),
                 };
                 let mk = self.mk_flags();
-                let (target, rx, ry) = self.mouse_target(handle);
                 let (px, py) = self.cursor_pos_i32();
+                // WM_MOUSEWHEEL/HWHEEL go to the FOCUS window, not the window
+                // under the cursor (DefWindowProc then bubbles them up the
+                // parent chain) — a multiline EDIT keeps scrolling while the
+                // pointer is elsewhere. Fall back to the hit-tested window
+                // when nothing has keyboard focus.
+                let (target, rx, ry) = match handle.focus_window() {
+                    Some(focus) => (focus, 0, 0),
+                    None => self.mouse_target(handle),
+                };
                 if delta_y != 0 {
                     let wparam = input::make_wparam(mk, delta_y as u16);
                     handle.post_message_at(
@@ -796,6 +841,7 @@ pub fn run_gui_windowed(
         pending_frame,
         mouse_buttons: 0,
         cursor_pos: (0.0, 0.0),
+        last_left_press: None,
         modifiers: winit::keyboard::ModifiersState::default(),
         #[cfg(target_os = "macos")]
         menu_bar: crate::gui::menu_bar::MacMenuBar::new(proxy.clone()),

@@ -475,9 +475,11 @@ pub enum WinApiId {
     User32Loadmenua = 431,
     /// Appended here (not adjacent to User32Loadmenua) to avoid renumbering the entire enum.
     User32Loadmenuw = 432,
+    /// Appended here (not adjacent to User32Loadmenuw) to avoid renumbering the entire enum.
+    User32Isclipboardformatavailable = 433,
 }
 
-pub const WINAPI_ID_COUNT: usize = 433;
+pub const WINAPI_ID_COUNT: usize = 434;
 
 impl WinApiId {
     /// Discriminant as `u16` (`#[repr(u16)]`).
@@ -516,7 +518,7 @@ const _: () = assert!(
 );
 
 /// Highest-numbered [`WinApiId`]; update alongside the enum's final variant.
-const LAST_WINAPI_ID: WinApiId = WinApiId::User32Loadmenuw;
+const LAST_WINAPI_ID: WinApiId = WinApiId::User32Isclipboardformatavailable;
 
 /// Hot-path dispatch: dense `u16` match over the `WinApiId` discriminant
 /// (LLVM jump table) with no string comparison — runs once per host API stop.
@@ -1020,6 +1022,9 @@ pub fn dispatch_winapi_id(
         WinApiId::User32Destroyacceleratortable => user32::handle_destroy_accelerator_table(ctx),
         WinApiId::User32Loadmenua => user32::handle_load_menu_a(ctx),
         WinApiId::User32Loadmenuw => user32::handle_load_menu_w(ctx),
+        WinApiId::User32Isclipboardformatavailable => {
+            crate::clipboard::handle_is_clipboard_format_available(ctx)
+        }
     }
 }
 

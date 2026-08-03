@@ -29,6 +29,7 @@ pub(crate) const WM_COMMAND: u32 = WinMsg::WM_COMMAND.as_u32();
 pub(crate) const WM_MOUSEMOVE: u32 = WinMsg::WM_MOUSEMOVE.as_u32();
 pub(crate) const WM_LBUTTONDOWN: u32 = WinMsg::WM_LBUTTONDOWN.as_u32();
 pub(crate) const WM_LBUTTONUP: u32 = WinMsg::WM_LBUTTONUP.as_u32();
+pub(crate) const WM_LBUTTONDBLCLK: u32 = WinMsg::WM_LBUTTONDBLCLK.as_u32();
 pub(crate) const WM_RBUTTONDOWN: u32 = WinMsg::WM_RBUTTONDOWN.as_u32();
 pub(crate) const WM_RBUTTONUP: u32 = WinMsg::WM_RBUTTONUP.as_u32();
 pub(crate) const WM_MBUTTONDOWN: u32 = WinMsg::WM_MBUTTONDOWN.as_u32();
@@ -51,6 +52,16 @@ pub(crate) const MK_RBUTTON: u16 = 0x0002;
 pub(crate) const MK_SHIFT: u16 = 0x0004;
 pub(crate) const MK_CONTROL: u16 = 0x0008;
 pub(crate) const MK_MBUTTON: u16 = 0x0010;
+
+/// The double-click time window (ms) the host uses to synthesize
+/// `WM_LBUTTONDBLCLK` from two rapid presses — the Windows
+/// `GetDoubleClickTime` default.
+pub(crate) const DOUBLE_CLICK_TIME_MS: u64 = 500;
+
+/// The double-click slop: the second press must land within this many px of
+/// the first press (the Windows `SM_CXDOUBLECLK` / `SM_CYDOUBLECLK` default
+/// is 4 px).
+pub(crate) const DOUBLE_CLICK_SLOP_PX: f64 = 4.0;
 
 // ---------------------------------------------------------------------------
 // Helper functions

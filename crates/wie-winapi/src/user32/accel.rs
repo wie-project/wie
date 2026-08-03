@@ -236,10 +236,13 @@ fn handle_translate_accelerator(
         .iter()
         .find(|record| record.handle == accel_handle)
         .map(|record| record.table_id);
-    // Borrow the keyboard state rather than clone 256 bytes per keystroke:
-    // `try_window_state` takes `&self`, so the reference coexists with the
-    // read of `state.process` below. The slot is guaranteed initialised by
-    // the accel_tables lookup above, so the `?` None arm is unreachable.
+    // Borrow the keyboard state rather than clone 256 bytes per keystroke.
+    // All borrows in this span are shared — `try_window_state` takes `&self`
+    // and `.iter()` reborrows `state.process` immutably — so the reference
+    // coexists with the iterator, and NLL ends `keyboard`'s borrow at
+    // `keyboard?`, before any `&mut state` access. The `?` None arm is
+    // unreachable: the window-state slot exists by the dispatch model's
+    // runtime invariant (`window_state()` get_or_init's it on demand).
     let keyboard: Option<&KeyboardState> = state.try_window_state().map(|ws| &ws.keyboard_state);
     let command_id: Option<u16> = state
         .process

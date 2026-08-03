@@ -314,6 +314,13 @@ pub struct WindowRecord {
     /// Text buffer for built-in controls (WM_GETTEXT / WM_SETTEXT / painting).
     pub control_text: String,
 
+    /// The HFONT a `WM_SETFONT` stored for this window, used by the control
+    /// paint paths (and any future window-paint path) to draw the window's
+    /// text with the guest-selected font. `Hfont::NULL` (0) means never set —
+    /// Windows returns 0 from `WM_GETFONT` until a font is stored, and the
+    /// paint paths fall back to the system default in that case.
+    pub font_handle: crate::handles::Hfont,
+
     /// Guest dialog procedure (`DialogBoxParam` `lpDialogFunc`); 0 for normal
     /// windows. Dialog windows have no guest WndProc — the runtime bridges
     /// `WM_INITDIALOG` / `WM_COMMAND` to this address instead.

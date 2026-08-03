@@ -429,8 +429,59 @@ pub(crate) fn dc_resolved_font(
     font_engine: &mut FontEngine,
 ) -> Option<(FontKey, ResolvedFont)> {
     let gdi = state.try_gdi_state()?;
-    let dc = gdi.find_dc(Hdc::from(dc_handle))?;
-    let (family, height, weight, italic) = match dc.selected_font {
+    let font_handle = gdi.find_dc(Hdc::from(dc_handle))?.selected_font;
+    resolve_stored_font(state, font_handle, font_engine)
+}
+
+/// Resolve the HFONT a window's `WM_SETFONT` stored (task 2.7) through the
+/// font engine, returning the [`FontKey`] and the resolved px metrics.
+///
+/// A window with no stored font — or with an HFONT that is not in the GDI
+/// font table — resolves the system default (sans-serif, 16 px, regular),
+/// matching what the control paint paths drew before `WM_SETFONT` existed.
+/// Returns `None` only when the system font lookup itself fails.
+pub(crate) fn window_font_resolution(
+    state: &WinApiState,
+    hwnd: u64,
+    font_engine: &mut FontEngine,
+) -> Option<(FontKey, ResolvedFont)> {
+    let stored = state
+        .try_window_state()?
+        .windows
+        .iter()
+        .find(|window| window.handle == crate::handles::Hwnd::from(hwnd))
+        .map_or(crate::handles::Hfont::NULL, |window| window.font_handle);
+    // A window with no stored font — or with an HFONT that is not in the GDI
+    // font table (NULL / never set / stale / foreign) — resolves the system
+    // default: sans-serif, 16 px, regular. A bad handle must never fail the
+    // whole control paint.
+    let (family, height, weight, italic) = state
+        .try_gdi_state()
+        .and_then(|gdi| gdi.find_font(stored))
+        .map_or((String::new(), 0, 400, false), |font| {
+            (font.family.clone(), font.height, font.weight, font.italic)
+        });
+    let key = FontKey {
+        family: family.to_ascii_lowercase(),
+        weight,
+        italic,
+    };
+    let resolved = font_engine.resolve(&key, height_px_from_lf(height))?;
+    Some((key, resolved))
+}
+
+/// Resolve an optional stored HFONT (or the system default when `None`) into
+/// a [`FontKey`] + resolved px metrics. An HFONT absent from the GDI font
+/// table fails the lookup (`None`) — the per-window path turns that into the
+/// default fallback; the DC path surfaces it as an unresolved font. Shared by
+/// the DC selected-font path and the per-window `WM_SETFONT` path.
+fn resolve_stored_font(
+    state: &WinApiState,
+    font_handle: Option<crate::handles::Hfont>,
+    font_engine: &mut FontEngine,
+) -> Option<(FontKey, ResolvedFont)> {
+    let gdi = state.try_gdi_state()?;
+    let (family, height, weight, italic) = match font_handle {
         Some(font_handle) => {
             let font = gdi.find_font(font_handle)?;
             (font.family.clone(), font.height, font.weight, font.italic)

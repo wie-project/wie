@@ -129,12 +129,14 @@ pub enum DllId {
     Pthread,
     Gdi,
     Present,
+    /// The process clipboard (CF_TEXT only; Task 2.6).
+    Clipboard,
 }
 
 impl DllId {
     /// Number of variants. The assertion at [`DLL_ID_SLOT_COUNT`] ensures
     /// it stays in sync with the slot array in [`DllStateMap::new`].
-    pub const COUNT: usize = 6;
+    pub const COUNT: usize = 7;
 }
 
 /// Lazy DLL state storage. Fixed-size array, zero per-call overhead.
@@ -174,6 +176,7 @@ const fn dll_index(id: DllId) -> usize {
         DllId::Pthread => 3,
         DllId::Gdi => 4,
         DllId::Present => 5,
+        DllId::Clipboard => 6,
     }
 }
 
@@ -200,6 +203,7 @@ const fn slot_of(i: usize) -> &'static str {
         3 => "pthread",
         4 => "gdi",
         5 => "present",
+        6 => "clipboard",
         _ => "?",
     }
 }
@@ -208,7 +212,7 @@ impl DllStateMap {
     /// All slots start unloaded. Add a `None` per new [`DllId`] variant.
     pub fn new() -> Self {
         Self {
-            slots: [None, None, None, None, None, None],
+            slots: [None, None, None, None, None, None, None],
         }
     }
 
@@ -236,6 +240,44 @@ impl DllStateMap {
     pub fn get<T: 'static>(&self, id: DllId) -> Option<&T> {
         let boxed = self.slots.get(dll_index(id))?.as_ref()?;
         boxed.as_ref().downcast_ref::<T>()
+    }
+}
+
+/// The process clipboard (CF_TEXT only for this milestone; Task 2.6).
+///
+/// The clipboard is process-global but MUTABLE (`WM_COPY`/`WM_CUT` write it,
+/// `WM_CLEAR` empties it), so it lives in a shared state slot — the
+/// [`DllStateMap`] — behind [`WinApiState::clipboard`], not an immutable
+/// process-wide `OnceLock`. macOS NSPasteboard integration is explicitly
+/// YAGNI for the notepad milestone: the host `String` satisfies the
+/// guest-visible contract (WM_COPY → WM_PASTE / `IsClipboardFormatAvailable`
+/// within the process) and cross-app paste can follow.
+#[derive(Debug, Clone, Default)]
+pub struct ClipboardState {
+    text: Option<String>,
+}
+
+impl ClipboardState {
+    /// The clipboard text, when the clipboard holds any (CF_TEXT-available).
+    #[must_use]
+    pub fn text(&self) -> Option<&str> {
+        self.text.as_deref()
+    }
+
+    /// Whether the clipboard holds text (`IsClipboardFormatAvailable`).
+    #[must_use]
+    pub fn has_text(&self) -> bool {
+        self.text.is_some()
+    }
+
+    /// Store text on the clipboard (`WM_CUT` / `WM_COPY`).
+    pub fn set_text(&mut self, text: String) {
+        self.text = Some(text);
+    }
+
+    /// Empty the clipboard (`WM_CLEAR` empties it like Windows' edit control).
+    pub fn clear(&mut self) {
+        self.text = None;
     }
 }
 
@@ -332,6 +374,12 @@ impl WinApiState {
     pub fn present(&mut self) -> &mut present::PresentState {
         self.dll_states
             .get_or_init::<present::PresentState>(DllId::Present)
+    }
+
+    /// Mutable access to the process clipboard (CF_TEXT only).
+    pub fn clipboard(&mut self) -> &mut ClipboardState {
+        self.dll_states
+            .get_or_init::<ClipboardState>(DllId::Clipboard)
     }
 
     /// Read-only access — returns `None` if the state was never initialised.

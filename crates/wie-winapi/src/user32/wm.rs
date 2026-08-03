@@ -42,6 +42,10 @@ impl WinMsg {
     pub const WM_SHOWWINDOW: Self = Self(0x0018);
     pub const WM_SETCURSOR: Self = Self(0x0020);
     pub const WM_GETMINMAXINFO: Self = Self(0x0024);
+    /// WM_SETFONT — store the HFONT a window/control draws its text with.
+    pub const WM_SETFONT: Self = Self(0x0030);
+    /// WM_GETFONT — the stored HFONT (0 when never set).
+    pub const WM_GETFONT: Self = Self(0x0031);
     pub const WM_CONTEXTMENU: Self = Self(0x007B);
     pub const WM_NCCREATE: Self = Self(0x0081);
     pub const WM_NCDESTROY: Self = Self(0x0082);
@@ -59,9 +63,15 @@ impl WinMsg {
     pub const WM_COMMAND: Self = Self(0x0111);
     pub const WM_SYSCOMMAND: Self = Self(0x0112);
     pub const WM_TIMER: Self = Self(0x0113);
+    /// Horizontal scroll-bar notification (wParam = SB_* code in the low word).
+    pub const WM_HSCROLL: Self = Self(0x0114);
+    /// Vertical scroll-bar notification (wParam = SB_* code in the low word,
+    /// thumb position in the high word).
+    pub const WM_VSCROLL: Self = Self(0x0115);
     pub const WM_MOUSEMOVE: Self = Self(0x0200);
     pub const WM_LBUTTONDOWN: Self = Self(0x0201);
     pub const WM_LBUTTONUP: Self = Self(0x0202);
+    pub const WM_LBUTTONDBLCLK: Self = Self(0x0203);
     pub const WM_RBUTTONDOWN: Self = Self(0x0204);
     pub const WM_RBUTTONUP: Self = Self(0x0205);
     pub const WM_MBUTTONDOWN: Self = Self(0x0207);
@@ -72,9 +82,19 @@ impl WinMsg {
     pub const WM_MOUSEHOVER: Self = Self(0x02A1);
     pub const WM_MOUSELEAVE: Self = Self(0x02A3);
 
+    // ── Clipboard edit messages (winuser.h) — sent by the Edit menu's
+    // Cut/Copy/Paste/Clear/Undo commands to the focused edit control.
+    pub const WM_CUT: Self = Self(0x0300);
+    pub const WM_COPY: Self = Self(0x0301);
+    pub const WM_PASTE: Self = Self(0x0302);
+    pub const WM_CLEAR: Self = Self(0x0303);
+    pub const WM_UNDO: Self = Self(0x0304);
+
     // ── Control messages (winuser.h): EDIT / BUTTON / LISTBOX ──────────
     pub const EM_GETSEL: Self = Self(0x00B0);
     pub const EM_SETSEL: Self = Self(0x00B1);
+    /// Undo state (Task 2.6): EM_CANUNDO — whether a snapshot is pending.
+    pub const EM_CANUNDO: Self = Self(0x00A6);
     // Multiline EDIT messages (Task 2.1). The line-metric messages operate on
     // the host `String` with `\n` as the internal separator.
     pub const EM_SCROLLCARET: Self = Self(0x00B7);
@@ -88,8 +108,10 @@ impl WinMsg {
     pub const EM_REPLACESEL: Self = Self(0x00C2);
     pub const EM_GETLINE: Self = Self(0x00C4);
     pub const EM_LIMITTEXT: Self = Self(0x00C5);
+    pub const EM_UNDO: Self = Self(0x00C7);
     pub const EM_LINEFROMCHAR: Self = Self(0x00C9);
     pub const EM_SETTABSTOPS: Self = Self(0x00CB);
+    pub const EM_EMPTYUNDOBUFFER: Self = Self(0x00CD);
     pub const EM_GETFIRSTVISIBLELINE: Self = Self(0x00CE);
     pub const EM_GETLIMITTEXT: Self = Self(0x00D5);
     pub const EM_POSFROMCHAR: Self = Self(0x00D6);
@@ -126,15 +148,17 @@ impl From<WinMsg> for u32 {
     }
 }
 
-/// Low 16 bits of a `u64` (a `WORD`), for the `wParam`/`lParam` decoders.
+/// Low 16 bits of a `u64` (a `WORD`), for the `wParam`/`lParam` decoders —
+/// also used by the WM_VSCROLL dispatch to decode the SB_* code.
 #[must_use]
-fn low_word(value: u64) -> u16 {
+pub(crate) fn low_word(value: u64) -> u16 {
     u16::try_from(value & 0xFFFF).unwrap_or(0)
 }
 
-/// High 16 bits of a `u64` (a `WORD`), for the `wParam`/`lParam` decoders.
+/// High 16 bits of a `u64` (a `WORD`), for the `wParam`/`lParam` decoders —
+/// also used by the WM_VSCROLL dispatch to decode the thumb position.
 #[must_use]
-fn high_word(value: u64) -> u16 {
+pub(crate) fn high_word(value: u64) -> u16 {
     u16::try_from((value >> 16) & 0xFFFF).unwrap_or(0)
 }
 

@@ -52,16 +52,22 @@ pub(crate) const WM_QUIT: u32 = wm::WinMsg::WM_QUIT.as_u32();
 
 pub(crate) const WM_INITDIALOG: u32 = wm::WinMsg::WM_INITDIALOG.as_u32();
 
-// Virtual-key codes used by IsDialogMessage navigation (winuser.h).
+// Virtual-key codes used by IsDialogMessage navigation and EDIT caret
+// movement (winuser.h).
 pub(crate) const VK_TAB: u64 = 0x09;
 pub(crate) const VK_RETURN: u64 = 0x0D;
-pub(crate) const VK_ESCAPE: u64 = 0x1B;
 pub(crate) const VK_SHIFT: u64 = 0x10;
+pub(crate) const VK_CONTROL: u64 = 0x11;
+pub(crate) const VK_ESCAPE: u64 = 0x1B;
 pub(crate) const VK_SPACE: u64 = 0x20;
+pub(crate) const VK_PRIOR: u64 = 0x21; // Page Up
+pub(crate) const VK_NEXT: u64 = 0x22; // Page Down
 pub(crate) const VK_END: u64 = 0x23;
 pub(crate) const VK_HOME: u64 = 0x24;
 pub(crate) const VK_LEFT: u64 = 0x25;
+pub(crate) const VK_UP: u64 = 0x26;
 pub(crate) const VK_RIGHT: u64 = 0x27;
+pub(crate) const VK_DOWN: u64 = 0x28;
 pub(crate) const VK_DELETE: u64 = 0x2E;
 
 pub(crate) const WM_KEYDOWN: u32 = wm::WinMsg::WM_KEYDOWN.as_u32();
@@ -85,6 +91,11 @@ pub(crate) const WM_KILLFOCUS: u32 = wm::WinMsg::WM_KILLFOCUS.as_u32();
 pub(crate) const WM_PAINT: u32 = wm::WinMsg::WM_PAINT.as_u32();
 pub(crate) const WM_CLOSE: u32 = wm::WinMsg::WM_CLOSE.as_u32();
 pub(crate) const WM_ERASEBKGND: u32 = wm::WinMsg::WM_ERASEBKGND.as_u32();
+/// WM_SETFONT — store the HFONT a window/control draws its text with
+/// (DefWindowProc semantics; notepad sends this to its EDIT after creation).
+pub(crate) const WM_SETFONT: u32 = wm::WinMsg::WM_SETFONT.as_u32();
+/// WM_GETFONT — the stored HFONT (0 when never set).
+pub(crate) const WM_GETFONT: u32 = wm::WinMsg::WM_GETFONT.as_u32();
 #[expect(dead_code)]
 pub(crate) const WM_SHOWWINDOW: u32 = wm::WinMsg::WM_SHOWWINDOW.as_u32();
 #[expect(dead_code)] // alias kept for crate users; dispatch uses WinMsg::WM_SETCURSOR
@@ -116,6 +127,18 @@ pub(crate) const WM_MBUTTONDOWN: u32 = wm::WinMsg::WM_MBUTTONDOWN.as_u32();
 pub(crate) const WM_MBUTTONUP: u32 = wm::WinMsg::WM_MBUTTONUP.as_u32();
 #[expect(dead_code)]
 pub(crate) const WM_MOUSEWHEEL: u32 = wm::WinMsg::WM_MOUSEWHEEL.as_u32();
+// Clipboard edit messages (Task 2.6): `u32` aliases survive only for the lib
+// tests — the control dispatch matches these via `WinMsg`.
+#[cfg(test)]
+pub(crate) const WM_CUT: u32 = wm::WinMsg::WM_CUT.as_u32();
+#[cfg(test)]
+pub(crate) const WM_COPY: u32 = wm::WinMsg::WM_COPY.as_u32();
+#[cfg(test)]
+pub(crate) const WM_PASTE: u32 = wm::WinMsg::WM_PASTE.as_u32();
+#[cfg(test)]
+pub(crate) const WM_CLEAR: u32 = wm::WinMsg::WM_CLEAR.as_u32();
+#[cfg(test)]
+pub(crate) const WM_UNDO: u32 = wm::WinMsg::WM_UNDO.as_u32();
 #[expect(dead_code)]
 pub(crate) const SIZE_RESTORED: u64 = 0;
 pub(crate) const SC_CLOSE: u64 = 0xF060;
@@ -137,6 +160,8 @@ pub(crate) const LB_GETCURSEL: u32 = wm::WinMsg::LB_GETCURSEL.as_u32();
 pub(crate) const EM_GETSEL: u32 = wm::WinMsg::EM_GETSEL.as_u32();
 #[cfg(test)]
 pub(crate) const EM_SETSEL: u32 = wm::WinMsg::EM_SETSEL.as_u32();
+#[cfg(test)]
+pub(crate) const EM_CANUNDO: u32 = wm::WinMsg::EM_CANUNDO.as_u32();
 #[cfg(test)]
 pub(crate) const EM_SCROLLCARET: u32 = wm::WinMsg::EM_SCROLLCARET.as_u32();
 #[cfg(test)]
@@ -160,9 +185,13 @@ pub(crate) const EM_GETLINE: u32 = wm::WinMsg::EM_GETLINE.as_u32();
 #[cfg(test)]
 pub(crate) const EM_LIMITTEXT: u32 = wm::WinMsg::EM_LIMITTEXT.as_u32();
 #[cfg(test)]
+pub(crate) const EM_UNDO: u32 = wm::WinMsg::EM_UNDO.as_u32();
+#[cfg(test)]
 pub(crate) const EM_LINEFROMCHAR: u32 = wm::WinMsg::EM_LINEFROMCHAR.as_u32();
 #[cfg(test)]
 pub(crate) const EM_SETTABSTOPS: u32 = wm::WinMsg::EM_SETTABSTOPS.as_u32();
+#[cfg(test)]
+pub(crate) const EM_EMPTYUNDOBUFFER: u32 = wm::WinMsg::EM_EMPTYUNDOBUFFER.as_u32();
 #[cfg(test)]
 pub(crate) const EM_GETFIRSTVISIBLELINE: u32 = wm::WinMsg::EM_GETFIRSTVISIBLELINE.as_u32();
 #[cfg(test)]
@@ -681,6 +710,7 @@ pub(crate) fn create_window_record(
         client_rect: (0, 0, 0, 0),
         control_kind,
         control_text: request.title,
+        font_handle: crate::handles::Hfont::NULL,
         dialog_proc: 0,
         dialog_unicode: false,
     });

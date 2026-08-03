@@ -14,9 +14,10 @@ use anyhow::Result;
 use super::{
     BN_CLICKED, BS_DEFPUSHBUTTON, BST_FOCUS, BST_PUSHED, CommandPayload, DLGC_BUTTON,
     DLGC_DEFPUSHBUTTON, DLGC_UNDEFPUSHBUTTON, DLGC_WANTCHARS, GuestCallbackRequest, VK_DELETE,
-    VK_END, VK_HOME, VK_LEFT, VK_RIGHT, VK_SPACE, WM_COMMAND, WinApiControlSignal, WinApiState,
-    WinMsg, WindowClassIdentifier, find_window, find_window_mut, low_i32, make_command_wparam,
-    read_guest_ansi_lossy, read_guest_utf16_lossy, write_guest_u32,
+    VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SPACE, VK_UP, WM_COMMAND,
+    WinApiControlSignal, WinApiState, WinMsg, WindowClassIdentifier, find_window, find_window_mut,
+    high_word, low_i32, low_word, make_command_wparam, read_guest_ansi_lossy,
+    read_guest_utf16_lossy, write_guest_u32,
 };
 use crate::OuterReturn;
 use crate::gdi32::resolve_window_ancestor;
@@ -29,13 +30,18 @@ mod paint;
 mod r#static;
 
 use button::paint_control;
+/// `UndoSnapshot` is the type of the public `ControlState::Edit::undo_snapshot`
+/// field, so it must be reachable at the same visibility as the enum.
+pub use edit::UndoSnapshot;
 use edit::{
-    edit_char, edit_delete_at_caret, edit_first_visible_line, edit_get_handle, edit_get_limit,
+    edit_can_undo, edit_char, edit_clear, edit_copy, edit_cut, edit_delete_at_caret,
+    edit_empty_undo_buffer, edit_first_visible_line, edit_get_handle, edit_get_limit,
     edit_get_line, edit_get_modify, edit_get_selection, edit_invalidate_text_buffer,
-    edit_line_count, edit_line_from_char, edit_line_index, edit_line_length, edit_move_caret,
-    edit_notify_change, edit_pos_from_char, edit_replace_selection, edit_scroll_caret,
-    edit_selection_type, edit_set_handle, edit_set_limit, edit_set_modify, edit_set_selection,
-    edit_set_tab_stops,
+    edit_line_count, edit_line_from_char, edit_line_index, edit_line_length, edit_mouse_dblclk,
+    edit_mouse_down, edit_mouse_move, edit_mouse_up, edit_mouse_wheel, edit_move_caret,
+    edit_notify_change, edit_paste, edit_pos_from_char, edit_replace_selection, edit_scroll_caret,
+    edit_scroll_vertical, edit_selection_type, edit_set_handle, edit_set_limit, edit_set_modify,
+    edit_set_selection, edit_set_tab_stops, edit_undo,
 };
 use listbox::{listbox_hit_item, listbox_notify_change};
 use paint::write_control_text;
@@ -43,7 +49,10 @@ use paint::write_control_text;
 // itself stays private to `controls`); test-only so the lib build has no
 // unused import.
 #[cfg(test)]
-pub(crate) use edit::{VisibleSegment, layout_visible_lines};
+pub(crate) use edit::{
+    VisibleSegment, clamp_scroll_offset, edit_char_index_at_point, layout_visible_lines,
+    visible_line_count,
+};
 
 /// `GetSysColor(COLOR_BTNFACE)` — the standard push-button face.
 const COLOR_BTNFACE: u32 = 0x00F0_F0F0;
@@ -174,11 +183,12 @@ impl ControlClassKind {
             caret: 0,
             sel_start: 0,
             sel_end: 0,
+            goal_column: None,
             style_bits: style,
             limit: 0,
             modified: false,
             handle_buffer: 0,
-            undo_buffer: Vec::new(),
+            undo_snapshot: None,
             first_visible_line: 0,
             tab_stops: Vec::new(),
         }
@@ -207,6 +217,13 @@ pub enum ControlState {
         sel_start: usize,
         /// Selection end (exclusive character index).
         sel_end: usize,
+        /// The vertical-movement goal column (character offset within a line).
+        /// `Some` while a VK_UP/DOWN/PgUp/PgDn sequence is in progress, so a
+        /// later press returns to the remembered column once a longer line is
+        /// reached (Windows column-memory semantics); `None` means "use the
+        /// caret's current column". Set on vertical keys, cleared by horizontal
+        /// movement and any text mutation.
+        goal_column: Option<usize>,
         /// The window's creation `dwStyle` captured at first use. The ES_*
         /// bits (ES_MULTILINE 0x1000, ES_WANTRETURN 0x4, ES_AUTOVSCROLL 0x40,
         /// ES_AUTOHSCROLL 0x80, ES_NOHIDESEL 0x100, ES_READONLY 0x800, the
@@ -222,9 +239,12 @@ pub enum ControlState {
         /// unchanged; any text mutation clears it so the next GETHANDLE
         /// allocates a fresh copy.
         handle_buffer: u64,
-        /// Undo snapshot stack — placeholder storage until Task 2.6 owns the
-        /// EM_CANUNDO/EM_UNDO semantics and starts reading it.
-        undo_buffer: Vec<String>,
+        /// The single-level undo snapshot (Task 2.6): the text, caret, and
+        /// selection captured before the last mutation. `EM_UNDO`/`WM_UNDO`
+        /// restore it and clear the buffer; `EM_CANUNDO` reports whether one
+        /// is pending; `EM_EMPTYUNDOBUFFER` discards it. `None` = nothing to
+        /// undo (fresh control, or after an undo/empty).
+        undo_snapshot: Option<UndoSnapshot>,
         /// First visible line (`EM_GETFIRSTVISIBLELINE`; `EM_SCROLLCARET`
         /// updates it). Task 2.2's paint reads it as the visual-row start
         /// (`layout_visible_lines`' `first_visible`); Task 2.4: it currently
@@ -332,6 +352,53 @@ impl ControlClassKind {
                 }
                 Ok(Some(0))
             }
+            // A left-click on an EDIT places the caret at the click and
+            // begins a drag selection: the click becomes the anchor, the edit
+            // captures the mouse so dragging off the control still extends the
+            // selection, and focus moves to the edit (the same focus behavior
+            // as the generic arm below).
+            (ControlClassKind::Edit, WinMsg::WM_LBUTTONDOWN) => {
+                let x = i32::from(low_word(long_parameter));
+                let y = i32::from(high_word(long_parameter));
+                edit_mouse_down(state, hwnd, x, y);
+                if let Some(window) = find_window_mut(state, hwnd) {
+                    window.flags.insert(WindowFlags::PRESSED);
+                    window.flags.insert(WindowFlags::FOCUSED);
+                }
+                state.window_state().focus_window_handle = crate::handles::Hwnd::from(hwnd);
+                state.window_state().capture_window_handle = crate::handles::Hwnd::from(hwnd);
+                invalidate(state, hwnd);
+                Ok(Some(0))
+            }
+            // A second press within the double-click time/slop — the host
+            // synthesizes WM_LBUTTONDBLCLK from it, matching Windows — selects
+            // the whitespace-delimited word under the click and starts a drag
+            // from it, like the single-click press above.
+            (ControlClassKind::Edit, WinMsg::WM_LBUTTONDBLCLK) => {
+                let x = i32::from(low_word(long_parameter));
+                let y = i32::from(high_word(long_parameter));
+                edit_mouse_dblclk(state, hwnd, x, y);
+                if let Some(window) = find_window_mut(state, hwnd) {
+                    window.flags.insert(WindowFlags::PRESSED);
+                    window.flags.insert(WindowFlags::FOCUSED);
+                }
+                state.window_state().focus_window_handle = crate::handles::Hwnd::from(hwnd);
+                state.window_state().capture_window_handle = crate::handles::Hwnd::from(hwnd);
+                invalidate(state, hwnd);
+                Ok(Some(0))
+            }
+            // While the edit holds the mouse capture, a move extends the drag
+            // selection from the click anchor to the current position (the
+            // caret tracks the pointer). Hover moves without capture are
+            // no-ops.
+            (ControlClassKind::Edit, WinMsg::WM_MOUSEMOVE) => {
+                let x = i32::from(low_word(long_parameter));
+                let y = i32::from(high_word(long_parameter));
+                if edit_mouse_move(state, hwnd, x, y) {
+                    invalidate(state, hwnd);
+                }
+                Ok(Some(0))
+            }
             (_, WinMsg::WM_LBUTTONDOWN) => {
                 if let Some(window) = find_window_mut(state, hwnd) {
                     window.flags.insert(WindowFlags::PRESSED);
@@ -388,9 +455,19 @@ impl ControlClassKind {
                         state.window_state().capture_window_handle = crate::handles::Hwnd::NULL;
                     }
                     invalidate(state, hwnd);
-                    let id = find_window(state, hwnd).map_or(0, |w| w.menu_handle);
-                    let command_wparam = make_command_wparam(id, BN_CLICKED);
-                    return deliver_command(state, hwnd, command_wparam);
+                    // BN_CLICKED is a BUTTON notification; other pressed
+                    // controls (an EDIT mid-drag) must not command the parent.
+                    if self == ControlClassKind::Button {
+                        let id = find_window(state, hwnd).map_or(0, |w| w.menu_handle);
+                        let command_wparam = make_command_wparam(id, BN_CLICKED);
+                        return deliver_command(state, hwnd, command_wparam);
+                    }
+                }
+                // An EDIT's drag session ends on the button-up whether or not
+                // the press was recorded on this window — a stray release must
+                // not strand the mouse capture.
+                if self == ControlClassKind::Edit {
+                    edit_mouse_up(state, hwnd);
                 }
                 Ok(Some(0))
             }
@@ -480,6 +557,16 @@ impl ControlClassKind {
                 let text = window_text(state, hwnd);
                 Ok(Some(control_text_length(&text, unicode)))
             }
+            // WM_SETFONT / WM_GETFONT: DefWindowProc semantics shared by every
+            // window kind — the font the control draws its text with is a
+            // window property, not a per-kind control message. The stored
+            // HFONT feeds the paint-path font resolution (task 2.7); notepad
+            // sends WM_SETFONT to its EDIT right after creation.
+            (_, WinMsg::WM_SETFONT) => {
+                super::window::set_window_font(state, hwnd, word_parameter, long_parameter);
+                Ok(Some(0))
+            }
+            (_, WinMsg::WM_GETFONT) => Ok(Some(super::window::window_font(state, hwnd))),
             (_, WinMsg::WM_SETTEXT) => {
                 if long_parameter == 0 {
                     return Ok(Some(0));
@@ -517,9 +604,13 @@ impl ControlClassKind {
                 Ok(Some(0))
             }
             // Caret navigation keys on a focused EDIT (Shift extends the
-            // selection). VK_DELETE has no WM_CHAR, so it is handled below.
+            // selection; Ctrl+Home/End are document-wide in a multiline
+            // EDIT). VK_DELETE has no WM_CHAR, so it is handled below.
             (ControlClassKind::Edit, WinMsg::WM_KEYDOWN)
-                if matches!(word_parameter & 0xFF, VK_LEFT | VK_RIGHT | VK_HOME | VK_END) =>
+                if matches!(
+                    word_parameter & 0xFF,
+                    VK_LEFT | VK_RIGHT | VK_HOME | VK_END | VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT
+                ) =>
             {
                 if edit_move_caret(state, hwnd, word_parameter & 0xFF) {
                     invalidate(state, hwnd);
@@ -606,11 +697,38 @@ impl ControlClassKind {
                 }
                 Ok(Some(0))
             }
-            // EM_SCROLLCARET: bring the caret's line into view (updates the
-            // first-visible-line state; viewport-aware clamping is Task 2.4).
+            // EM_SCROLLCARET: bring the caret's row into view by the smallest
+            // scroll (Task 2.4 minimal-scroll; viewport-aware).
             (ControlClassKind::Edit, WinMsg::EM_SCROLLCARET) => {
-                edit_scroll_caret(state, hwnd);
+                if edit_scroll_caret(state, hwnd) {
+                    invalidate(state, hwnd);
+                }
                 Ok(Some(1)) // TRUE
+            }
+            // WM_VSCROLL: the wParam low word is the SB_* scroll code, the
+            // high word the thumb position (SB_THUMBTRACK/POSITION). The
+            // offset is clamped to the wrap-aware viewport and the control is
+            // invalidated so the paint re-renders from the new top row.
+            (ControlClassKind::Edit, WinMsg::WM_VSCROLL) => {
+                let code = low_word(word_parameter);
+                let thumb = high_word(word_parameter);
+                if edit_scroll_vertical(state, hwnd, code, thumb) {
+                    invalidate(state, hwnd);
+                }
+                Ok(Some(0))
+            }
+            // WM_HSCROLL: the horizontal scroll offset (ES_AUTOHSCROLL state)
+            // is not implemented yet — swallow the message so a no-wrap EDIT
+            // does not fall through to a default scroll.
+            (ControlClassKind::Edit, WinMsg::WM_HSCROLL) => Ok(Some(0)),
+            // WM_MOUSEWHEEL: the signed delta in the wParam high word scrolls
+            // the multiline EDIT (3 lines per notch). The gui layer routes the
+            // wheel to the FOCUS window, matching Windows.
+            (ControlClassKind::Edit, WinMsg::WM_MOUSEWHEEL) => {
+                if edit_mouse_wheel(state, hwnd, word_parameter) {
+                    invalidate(state, hwnd);
+                }
+                Ok(Some(0))
             }
             (ControlClassKind::Edit, WinMsg::EM_GETMODIFY) => {
                 Ok(Some(edit_get_modify(state, hwnd)))
@@ -650,6 +768,60 @@ impl ControlClassKind {
             }
             (ControlClassKind::Edit, WinMsg::EM_GETFIRSTVISIBLELINE) => {
                 Ok(Some(edit_first_visible_line(state, hwnd)))
+            }
+            // Task 2.6: EM_CANUNDO — TRUE when the single-level undo buffer
+            // holds a snapshot (an edit since the last undo/empty).
+            (ControlClassKind::Edit, WinMsg::EM_CANUNDO) => {
+                Ok(Some(u64::from(edit_can_undo(state, hwnd))))
+            }
+            // EM_UNDO / WM_UNDO (the Edit menu's Undo command sends WM_UNDO
+            // to the focused edit): restore the last mutation and clear the
+            // buffer. A real restore delivers EN_CHANGE like any text change.
+            (ControlClassKind::Edit, WinMsg::EM_UNDO | WinMsg::WM_UNDO) => {
+                if edit_undo(state, hwnd) {
+                    invalidate(state, hwnd);
+                    return edit_notify_change(state, hwnd);
+                }
+                Ok(Some(0))
+            }
+            // EM_EMPTYUNDOBUFFER: discard any pending undo snapshot.
+            (ControlClassKind::Edit, WinMsg::EM_EMPTYUNDOBUFFER) => {
+                edit_empty_undo_buffer(state, hwnd);
+                Ok(Some(0))
+            }
+            // WM_COPY: store the selected text on the host clipboard (no
+            // text change, so no EN_CHANGE).
+            (ControlClassKind::Edit, WinMsg::WM_COPY) => {
+                edit_copy(state, hwnd);
+                Ok(Some(0))
+            }
+            // WM_CUT: copy the selection to the clipboard, then delete it
+            // (the delete delivers EN_CHANGE like any text change).
+            (ControlClassKind::Edit, WinMsg::WM_CUT) => {
+                if edit_cut(state, hwnd) {
+                    invalidate(state, hwnd);
+                    return edit_notify_change(state, hwnd);
+                }
+                Ok(Some(0))
+            }
+            // WM_PASTE: insert the clipboard text at the caret, replacing
+            // the selection; an empty clipboard is a no-op.
+            (ControlClassKind::Edit, WinMsg::WM_PASTE) => {
+                if edit_paste(state, hwnd) {
+                    invalidate(state, hwnd);
+                    return edit_notify_change(state, hwnd);
+                }
+                Ok(Some(0))
+            }
+            // WM_CLEAR: delete the selection WITHOUT copying it — the
+            // clipboard is emptied (Windows' edit control calls
+            // EmptyClipboard), so IsClipboardFormatAvailable goes false.
+            (ControlClassKind::Edit, WinMsg::WM_CLEAR) => {
+                if edit_clear(state, hwnd) {
+                    invalidate(state, hwnd);
+                    return edit_notify_change(state, hwnd);
+                }
+                Ok(Some(0))
             }
             // LB_SETCURSEL / CB_SETCURSEL: wParam = item index (-1 clears);
             // out-of-range is LB_ERR. A changed selection delivers
@@ -837,15 +1009,31 @@ fn window_text(state: &WinApiState, hwnd: u64) -> String {
 /// Mutable per-window control UI state, seeded with the window's kind (the
 /// kind is always `Some` at the call sites — the dispatch returns early when a
 /// window has no `control_kind`).
+///
+/// `kind.new_state()` seeds an EDIT with `style_bits = 0` (no window context
+/// at the call site); re-capture the window's real creation style whenever
+/// this path touches an EDIT so the ES_* flags survive whichever seeder runs
+/// first (`edit_state_mut` refreshes the same field on its side).
 fn control_state_mut(state: &mut WinApiState, hwnd: u64) -> &mut ControlState {
     let kind = find_window(state, hwnd)
         .and_then(|w| w.control_kind)
         .unwrap_or(ControlClassKind::Static);
-    state
+    // Read the creation style before the entry borrow: the window record and
+    // the control state live under the same `WindowState`.
+    let style = if kind == ControlClassKind::Edit {
+        find_window(state, hwnd).map_or(0, |w| w.style)
+    } else {
+        0
+    };
+    let control = state
         .window_state()
         .control_states
         .entry(crate::handles::Hwnd::from(hwnd))
-        .or_insert_with(|| kind.new_state())
+        .or_insert_with(|| kind.new_state());
+    if let ControlState::Edit { style_bits, .. } = control {
+        *style_bits = style;
+    }
+    control
 }
 /// Read-only per-window control UI state.
 fn control_state(state: &WinApiState, hwnd: u64) -> Option<&ControlState> {

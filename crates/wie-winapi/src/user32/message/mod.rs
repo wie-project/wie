@@ -7,11 +7,11 @@
 use super::SC_CLOSE;
 use super::{
     Context, GuestCallbackRequest, HandlerContext, MessageQueueIdlePolicy, QueuedWindowMessage,
-    Result, WM_CHAR, WM_CLOSE, WM_DEADCHAR, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP,
-    WM_MDICREATE, WM_PAINT, WM_QUIT, WM_SYSCHAR, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WinApiControlSignal, WinApiHandlerResult, WinApiState, WinMsg, checked_field_address,
-    create_mdi_child_from_struct, dispatch_control_proc, find_window_mut, is_known_window,
-    read_guest_u32, read_guest_u64, write_message_structure,
+    Result, WM_CHAR, WM_CLOSE, WM_DEADCHAR, WM_DESTROY, WM_ERASEBKGND, WM_GETFONT, WM_KEYDOWN,
+    WM_KEYUP, WM_MDICREATE, WM_PAINT, WM_QUIT, WM_SETFONT, WM_SYSCHAR, WM_SYSDEADCHAR,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WinApiControlSignal, WinApiHandlerResult, WinApiState, WinMsg,
+    checked_field_address, create_mdi_child_from_struct, dispatch_control_proc, find_window_mut,
+    is_known_window, read_guest_u32, read_guest_u64, write_message_structure,
 };
 use crate::OuterReturn;
 use crate::state::WindowFlags;
@@ -380,6 +380,30 @@ pub(crate) fn handle_send_message(
         .into());
     }
 
+    // A window with no WndProc at all (no guest proc, not a control, not a
+    // dialog): DefWindowProc semantics for the font messages so WM_SETFONT
+    // still stores the font and WM_GETFONT still returns it.
+    if message == WM_SETFONT {
+        super::window::set_window_font(state, window_handle, word_parameter, long_parameter);
+        let return_address = engine
+            .return_from_win64_api(0)
+            .with_context(|| format!("failed to return from {api_name}"))?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+    if message == WM_GETFONT {
+        let font = super::window::window_font(state, window_handle);
+        let return_address = engine
+            .return_from_win64_api(font)
+            .with_context(|| format!("failed to return from {api_name}"))?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: font,
+        });
+    }
+
     let return_address = engine
         .return_from_win64_api(0)
         .with_context(|| format!("failed to return from {api_name}"))?;
@@ -644,7 +668,7 @@ pub(crate) fn handle_default_window_procedure(
     let wparam = engine
         .read_r8()
         .context("failed to read R8 for DefWindowProc")?;
-    let _lparam = engine
+    let lparam = engine
         .read_r9()
         .context("failed to read R9 for DefWindowProc")?;
 
@@ -688,6 +712,13 @@ pub(crate) fn handle_default_window_procedure(
             // Cursor handled: unconditional success.
             1
         }
+        WinMsg::WM_SETFONT => {
+            // Store the HFONT on the window; a non-zero redraw flag (lparam)
+            // invalidates it so the next repaint uses the new font.
+            super::window::set_window_font(state, hwnd, wparam, lparam);
+            0
+        }
+        WinMsg::WM_GETFONT => super::window::window_font(state, hwnd),
         WinMsg::WM_PAINT => {
             // Validate the window to prevent livelock
             if let Some(window) = find_window_mut(state, hwnd) {

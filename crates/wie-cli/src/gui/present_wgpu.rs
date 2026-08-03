@@ -377,14 +377,17 @@ impl WgpuPresenter {
                             depth_slice: None,
                             resolve_target: None,
                             ops: wgpu::Operations {
-                                // Clear to black: the whole surface is
-                                // redrawn every frame and the swapchain target
-                                // is transient, so a clear is cheaper than
+                                // Clear to white: untouched areas of the
+                                // window (e.g. behind an unmaximized guest
+                                // frame) read as a fresh white surface rather
+                                // than black. The whole surface is redrawn
+                                // every frame and the swapchain target is
+                                // transient, so a clear is cheaper than
                                 // loading the previous frame's contents.
                                 load: wgpu::LoadOp::Clear(wgpu::Color {
-                                    r: 0.0,
-                                    g: 0.0,
-                                    b: 0.0,
+                                    r: 1.0,
+                                    g: 1.0,
+                                    b: 1.0,
                                     a: 1.0,
                                 }),
                                 store: wgpu::StoreOp::Store,

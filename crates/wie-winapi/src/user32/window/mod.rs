@@ -920,6 +920,30 @@ fn resolve_window_text(state: &mut WinApiState, window_handle: u64) -> String {
     })
 }
 
+/// WM_SETFONT (DefWindowProc semantics): store `font_handle` on the window so
+/// the paint paths draw its text with the guest-selected font, and mark the
+/// window invalidated when `redraw` is non-zero (the next repaint cycle then
+/// re-renders with the new font). Callers return the WM_SETFONT result (0).
+///
+/// Shared by the control dispatch (`dispatch_control_proc`), `DefWindowProc`,
+/// and the no-WndProc `SendMessage` fallthrough so ANY window — control or
+/// not — stores the font it is told to use.
+pub(crate) fn set_window_font(state: &mut WinApiState, hwnd: u64, font_handle: u64, redraw: u64) {
+    if let Some(window) = find_window_mut(state, hwnd) {
+        window.font_handle = crate::handles::Hfont::from(font_handle);
+        if redraw != 0 {
+            window.invalidated = true;
+        }
+    }
+}
+
+/// WM_GETFONT (DefWindowProc semantics): the HFONT stored on the window, or 0
+/// when never set (or the window is unknown).
+#[must_use]
+pub(crate) fn window_font(state: &mut WinApiState, hwnd: u64) -> u64 {
+    find_window(state, hwnd).map_or(0, |window| window.font_handle.as_u64())
+}
+
 /// Handles `USER32.dll!CreateWindowExA`.
 pub fn handle_create_window_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;

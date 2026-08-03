@@ -2,6 +2,7 @@
 
 pub mod advapi32;
 pub mod bottle;
+pub mod clipboard;
 pub mod comctl32;
 pub mod comdlg32;
 pub mod console;
@@ -61,11 +62,11 @@ pub use thread::{FIRST_WORKER_TID, GuestThread, PRIMARY_THREAD_ID, ThreadState};
 
 mod state;
 pub use state::{
-    D3D9State, DEFAULT_ENVIRONMENT, DllId, DllStateMap, FileDialogPolicy, FileHandle, FileIoState,
-    FindFileHandle, FindHandle, FlsSlot, GetProcAddressCacheEntry, GlobalAtomRecord,
-    GuestCallbackRequest, GuestIoRuntimeConfig, GuestStdinMode, HandlerContext, HeapAllocation,
-    HeapState, HostFileMount, HostParkReason, ImportResolver, KernelState, KeyboardState,
-    MessageQueueIdlePolicy, ModuleHandle, ModuleState, OpenGuestFile, OuterReturn,
+    ClipboardState, D3D9State, DEFAULT_ENVIRONMENT, DllId, DllStateMap, FileDialogPolicy,
+    FileHandle, FileIoState, FindFileHandle, FindHandle, FlsSlot, GetProcAddressCacheEntry,
+    GlobalAtomRecord, GuestCallbackRequest, GuestIoRuntimeConfig, GuestStdinMode, HandlerContext,
+    HeapAllocation, HeapState, HostFileMount, HostParkReason, ImportResolver, KernelState,
+    KeyboardState, MessageQueueIdlePolicy, ModuleHandle, ModuleState, OpenGuestFile, OuterReturn,
     PTHREAD_RETURN_TRAMPOLINE_VA, ProcessState, QueuedWindowMessage, RegistryKey,
     RegistryKeyHandle, ResourceHandle, ResourceRecord, TimerRecord, VirtualGuestFile,
     WinApiControlSignal, WinApiEnvironment, WinApiState, WindowClassRecord, WindowRecord,

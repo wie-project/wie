@@ -14,9 +14,9 @@ use crate::gdi32::{FontEngine, FontKey, ResolvedFont};
 use crate::guest_memory::read_u16 as read_guest_u16;
 use crate::state::WindowFlags;
 use crate::user32::{
-    EN_CHANGE, VK_END, VK_HOME, VK_LEFT, VK_RIGHT, VK_SHIFT, WinApiState, find_window,
-    make_command_wparam, read_guest_ansi_lossy, read_guest_utf16_lossy, write_guest_ansi_c_string,
-    write_guest_i32, write_guest_utf16_c_string,
+    EN_CHANGE, VK_CONTROL, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT,
+    VK_SHIFT, VK_UP, WinApiState, find_window, make_command_wparam, read_guest_ansi_lossy,
+    read_guest_utf16_lossy, write_guest_ansi_c_string, write_guest_i32, write_guest_utf16_c_string,
 };
 
 /// Cap for guest buffer reads (EM_SETHANDLE / EM_REPLACESEL adoption).
@@ -26,6 +26,19 @@ const MAX_GUEST_TEXT: usize = 1 << 20;
 /// wrap (notepad toggles wrap by dropping the horizontal scroll style).
 const WS_HSCROLL: u32 = 0x0010_0000;
 
+/// `WM_VSCROLL` / `WM_HSCROLL` scroll-bar request codes (winuser.h) — the
+/// wParam LOW word. THUMBTRACK/POSITION carry the thumb position in the high
+/// word.
+const SB_LINEUP: u16 = 0;
+const SB_LINEDOWN: u16 = 1;
+const SB_PAGEUP: u16 = 2;
+const SB_PAGEDOWN: u16 = 3;
+const SB_THUMBPOSITION: u16 = 4;
+const SB_THUMBTRACK: u16 = 5;
+const SB_TOP: u16 = 6;
+const SB_BOTTOM: u16 = 7;
+const SB_ENDSCROLL: u16 = 8;
+
 /// The ES_LEFT/CENTER/RIGHT alignment bits (the low 2 style bits).
 const ES_ALIGN_MASK: u32 = 0x0003;
 
@@ -33,15 +46,23 @@ const ES_ALIGN_MASK: u32 = 0x0003;
 /// `(Edit, _)` dispatch arms, so the seed kind is always `Edit`. Takes the
 /// `control_states` field (not the whole `WindowState`) so callers can hold a
 /// `window` borrow from `ws.windows` at the same time (disjoint fields). The
-/// seed captures the window's creation style into `style_bits`.
+/// seed captures the window's creation style into `style_bits` — and RE-captures
+/// it on every touch, because a window's creation style never changes, so the
+/// refresh is a no-op for a correct seed while healing a state that was first
+/// seeded with style 0 by a different seeder (`control_state_mut`'s
+/// `kind.new_state()` runs before this path saw the window record).
 fn edit_state_mut(
     control_states: &mut ahash::HashMap<crate::handles::Hwnd, ControlState>,
     hwnd: u64,
     style: u32,
 ) -> &mut ControlState {
-    control_states
+    let state = control_states
         .entry(crate::handles::Hwnd::from(hwnd))
-        .or_insert_with(|| ControlClassKind::new_edit_state(style))
+        .or_insert_with(|| ControlClassKind::new_edit_state(style));
+    if let ControlState::Edit { style_bits, .. } = state {
+        *style_bits = style;
+    }
+    state
 }
 
 /// The EDIT state for `hwnd`, seeded with the window's creation style when
@@ -76,10 +97,12 @@ pub(super) fn edit_char(state: &mut WinApiState, hwnd: u64, char_code: u64) -> b
         caret,
         sel_start,
         sel_end,
+        goal_column,
         limit,
         style_bits,
         modified,
         handle_buffer,
+        undo_snapshot,
         ..
     } = edit_state_mut(&mut ws.control_states, hwnd, style)
     else {
@@ -98,8 +121,10 @@ pub(super) fn edit_char(state: &mut WinApiState, hwnd: u64, char_code: u64) -> b
                         caret,
                         sel_start,
                         sel_end,
+                        goal_column,
                         modified,
                         handle_buffer,
+                        undo_snapshot,
                     },
                     start,
                     end,
@@ -117,8 +142,10 @@ pub(super) fn edit_char(state: &mut WinApiState, hwnd: u64, char_code: u64) -> b
                     caret,
                     sel_start,
                     sel_end,
+                    goal_column,
                     modified,
                     handle_buffer,
+                    undo_snapshot,
                 },
                 caret_pos.saturating_sub(1),
                 caret_pos,
@@ -137,8 +164,10 @@ pub(super) fn edit_char(state: &mut WinApiState, hwnd: u64, char_code: u64) -> b
                         caret,
                         sel_start,
                         sel_end,
+                        goal_column,
                         modified,
                         handle_buffer,
+                        undo_snapshot,
                     },
                     start,
                     end,
@@ -165,8 +194,10 @@ pub(super) fn edit_char(state: &mut WinApiState, hwnd: u64, char_code: u64) -> b
                     caret,
                     sel_start,
                     sel_end,
+                    goal_column,
                     modified,
                     handle_buffer,
+                    undo_snapshot,
                 },
                 start,
                 end,
@@ -179,14 +210,27 @@ pub(super) fn edit_char(state: &mut WinApiState, hwnd: u64, char_code: u64) -> b
 }
 
 /// The mutable caret/selection/modify slice of an EDIT state, plus the cached
-/// EM_GETHANDLE buffer. Bundled so the shared mutation helper stays under the
-/// `too_many_arguments` lint bar.
+/// EM_GETHANDLE buffer and the undo snapshot. Bundled so the shared mutation
+/// helper stays under the `too_many_arguments` lint bar.
 struct EditMutation<'a> {
     caret: &'a mut usize,
     sel_start: &'a mut usize,
     sel_end: &'a mut usize,
+    goal_column: &'a mut Option<usize>,
     modified: &'a mut bool,
     handle_buffer: &'a mut u64,
+    undo_snapshot: &'a mut Option<UndoSnapshot>,
+}
+
+/// A single-level undo snapshot: the full text plus the caret and selection
+/// captured BEFORE a mutation (Task 2.6). `EM_UNDO`/`WM_UNDO` restore it and
+/// clear the buffer — Windows undo is single-level, there is no redo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoSnapshot {
+    text: String,
+    caret: usize,
+    sel_start: usize,
+    sel_end: usize,
 }
 
 /// Replace the character range `[start, end)` (clamped to the text) with
@@ -219,14 +263,25 @@ fn replace_range(
     let end_byte = byte_index_of_char(text, end);
     if start_byte == end_byte && replacement.is_empty() {
         // No-op (e.g. an empty EM_REPLACESEL with no selection): the text is
-        // unchanged, so neither the modify flag nor the cached GETHANDLE
-        // buffer move.
+        // unchanged, so neither the modify flag, the cached GETHANDLE buffer,
+        // nor the undo snapshot move.
         return false;
     }
+    // A real mutation replaces the single-level undo snapshot with the
+    // pre-mutation state — EM_UNDO restores text + caret + selection.
+    *edits.undo_snapshot = Some(UndoSnapshot {
+        text: text.clone(),
+        caret: *edits.caret,
+        sel_start: *edits.sel_start,
+        sel_end: *edits.sel_end,
+    });
     text.replace_range(start_byte..end_byte, &replacement);
     *edits.caret = start.saturating_add(replacement.chars().count());
     *edits.sel_start = *edits.caret;
     *edits.sel_end = *edits.caret;
+    // Any text mutation also drops the vertical-movement goal column — the
+    // caret moved horizontally, so the remembered column is stale.
+    *edits.goal_column = None;
     // A real mutation invalidates the cached EM_GETHANDLE buffer — the old
     // handle is the guest's to LocalFree (Windows frees it on the control's
     // next buffer reallocation) — and dirties the modify flag.
@@ -427,11 +482,23 @@ fn edit_text(state: &WinApiState, hwnd: u64) -> Option<&str> {
     })
 }
 
-/// EDIT: arrow/Home/End caret movement. Shift extends the selection (the
-/// anchor stays at the edge the caret moved away from); without Shift the
-/// selection collapses. Returns whether the caret/selection moved.
+/// The default control font's line height in px — the PgUp/PgDn page heuristic
+/// divides the client height by it (the same 16 px EM_POSFROMCHAR's y uses, so
+/// the page and the painted rows agree). The SCROLL handlers use the resolved
+/// font's real line height via [`edit_scroll_context`], which lands within a
+/// px of this constant for the default font.
+const EDIT_DEFAULT_LINE_HEIGHT: usize = 16;
+
+/// EDIT: arrow/Home/End/PgUp/PgDn caret movement. Shift extends the selection
+/// (the anchor stays at the edge the caret moved away from); without Shift the
+/// selection collapses. Vertical keys are multiline-only: they move to the
+/// same column on the adjacent line (or a page for PgUp/PgDn), clamping to the
+/// target line's length while remembering the goal column. Home/End are
+/// line-aware in a multiline EDIT (Ctrl makes them document-wide). Returns
+/// whether the caret/selection moved.
 pub(super) fn edit_move_caret(state: &mut WinApiState, hwnd: u64, vk: u64) -> bool {
     let extend = shift_is_down(state);
+    let ctrl = ctrl_is_down(state);
     let ws = state.window_state();
     let Some(window) = ws
         .windows
@@ -441,24 +508,45 @@ pub(super) fn edit_move_caret(state: &mut WinApiState, hwnd: u64, vk: u64) -> bo
         return false;
     };
     let style = window.style;
+    let page_lines = usize::try_from(window.height)
+        .unwrap_or(0)
+        .saturating_div(EDIT_DEFAULT_LINE_HEIGHT);
     let ControlState::Edit {
         caret,
         sel_start,
         sel_end,
+        style_bits,
+        goal_column,
         ..
     } = edit_state_mut(&mut ws.control_states, hwnd, style)
     else {
         return false;
     };
-    let len = window.control_text.chars().count();
+    let text = &window.control_text;
+    let len = text.chars().count();
     let old_caret = (*caret).min(len);
-    let new_caret = match vk {
-        VK_LEFT => old_caret.saturating_sub(1),
-        VK_RIGHT => old_caret.saturating_add(1).min(len),
-        VK_HOME => 0,
-        VK_END => len,
-        _ => old_caret,
-    };
+    let multiline = *style_bits & ES_MULTILINE != 0;
+    let vertical = multiline && matches!(vk, VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT);
+    if vertical {
+        // The goal column is the column of the first press of a vertical run;
+        // later presses keep it so the caret returns once a longer line shows
+        // up (clamping only ever applies to the SHORT lines in between).
+        let line_start = line_index_of(text, line_from_char(text, old_caret)).unwrap_or(0);
+        if goal_column.is_none() {
+            *goal_column = Some(old_caret.saturating_sub(line_start));
+        }
+    } else if matches!(vk, VK_LEFT | VK_RIGHT | VK_HOME | VK_END) {
+        *goal_column = None;
+    }
+    let new_caret = caret_navigation_target(
+        text,
+        old_caret,
+        vk,
+        ctrl,
+        multiline,
+        *goal_column,
+        page_lines.max(1),
+    );
     if new_caret == old_caret && *sel_start == *sel_end {
         return false;
     }
@@ -484,6 +572,62 @@ pub(super) fn edit_move_caret(state: &mut WinApiState, hwnd: u64, vk: u64) -> bo
     true
 }
 
+/// The caret target for one navigation keypress: vertical moves step to the
+/// adjacent line (or `page_lines` for PgUp/PgDn) at the goal column clamped to
+/// the target line's length; Home/End are line-aware in a multiline EDIT and
+/// document-wide with Ctrl held (and always document-wide on a single line).
+#[must_use]
+fn caret_navigation_target(
+    text: &str,
+    old_caret: usize,
+    vk: u64,
+    ctrl: bool,
+    multiline: bool,
+    goal_column: Option<usize>,
+    page_lines: usize,
+) -> usize {
+    let len = text.chars().count();
+    match vk {
+        VK_LEFT => old_caret.saturating_sub(1),
+        VK_RIGHT => old_caret.saturating_add(1).min(len),
+        VK_HOME if ctrl => 0,
+        VK_END if ctrl => len,
+        VK_HOME | VK_END if !multiline => {
+            if vk == VK_HOME {
+                0
+            } else {
+                len
+            }
+        }
+        VK_HOME => line_index_of(text, line_from_char(text, old_caret)).unwrap_or(0),
+        VK_END => {
+            let line = line_from_char(text, old_caret);
+            let start = line_index_of(text, line).unwrap_or(0);
+            start.saturating_add(line_char_len(text, line).unwrap_or(0))
+        }
+        VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT => {
+            let line = line_from_char(text, old_caret);
+            let line_start = line_index_of(text, line).unwrap_or(0);
+            let column = old_caret.saturating_sub(line_start);
+            let goal = goal_column.unwrap_or(column);
+            // The last line is the one before the final `\n` (or the only
+            // line), so the split count is the valid line range end.
+            let last_line = text.split('\n').count().saturating_sub(1);
+            let target_line = match vk {
+                VK_UP => line.saturating_sub(1),
+                VK_DOWN => line.saturating_add(1).min(last_line),
+                VK_PRIOR => line.saturating_sub(page_lines),
+                _ => line.saturating_add(page_lines).min(last_line),
+            };
+            let target_len = line_char_len(text, target_line).unwrap_or(0);
+            line_index_of(text, target_line)
+                .unwrap_or(old_caret)
+                .saturating_add(goal.min(target_len))
+        }
+        _ => old_caret,
+    }
+}
+
 /// EDIT: VK_DELETE — delete the selection, or the character at the caret.
 /// Returns whether the text changed.
 pub(super) fn edit_delete_at_caret(state: &mut WinApiState, hwnd: u64) -> bool {
@@ -500,9 +644,11 @@ pub(super) fn edit_delete_at_caret(state: &mut WinApiState, hwnd: u64) -> bool {
         caret,
         sel_start,
         sel_end,
+        goal_column,
         limit,
         modified,
         handle_buffer,
+        undo_snapshot,
         ..
     } = edit_state_mut(&mut ws.control_states, hwnd, style)
     else {
@@ -518,8 +664,10 @@ pub(super) fn edit_delete_at_caret(state: &mut WinApiState, hwnd: u64) -> bool {
                 caret,
                 sel_start,
                 sel_end,
+                goal_column,
                 modified,
                 handle_buffer,
+                undo_snapshot,
             },
             start,
             end,
@@ -537,8 +685,10 @@ pub(super) fn edit_delete_at_caret(state: &mut WinApiState, hwnd: u64) -> bool {
             caret,
             sel_start,
             sel_end,
+            goal_column,
             modified,
             handle_buffer,
+            undo_snapshot,
         },
         caret_pos,
         caret_pos.saturating_add(1),
@@ -735,50 +885,76 @@ pub(super) fn edit_replace_selection(
     } else {
         read_guest_ansi_lossy(engine, text_ptr, MAX_GUEST_TEXT)?
     };
+    Ok(edit_replace_selection_with(state, hwnd, &replacement))
+}
+
+/// Replace the selection with a host-side string — the shared core of
+/// `EM_REPLACESEL` and `WM_PASTE` (both splice through the same
+/// [`replace_range`] path, capturing an undo snapshot). Returns whether the
+/// text changed.
+fn edit_replace_selection_with(state: &mut WinApiState, hwnd: u64, replacement: &str) -> bool {
     let ws = state.window_state();
     let Some(window) = ws
         .windows
         .iter_mut()
         .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
     else {
-        return Ok(false);
+        return false;
     };
     let style = window.style;
     let ControlState::Edit {
         caret,
         sel_start,
         sel_end,
+        goal_column,
         limit,
         modified,
         handle_buffer,
+        undo_snapshot,
         ..
     } = edit_state_mut(&mut ws.control_states, hwnd, style)
     else {
-        return Ok(false);
+        return false;
     };
     let text = &mut window.control_text;
     let len = text.chars().count();
     let (start, end) = normalized_selection(*sel_start, *sel_end, len);
-    Ok(replace_range(
+    replace_range(
         text,
         EditMutation {
             caret,
             sel_start,
             sel_end,
+            goal_column,
             modified,
             handle_buffer,
+            undo_snapshot,
         },
         start,
         end,
-        &replacement,
+        replacement,
         *limit,
-    ))
+    )
 }
 
-/// EDIT: EM_SCROLLCARET — bring the caret's line into view by making it the
-/// first visible line. Viewport-aware clamping lands with Task 2.4's scroll
-/// state; today the caret line becomes the top line.
-pub(super) fn edit_scroll_caret(state: &mut WinApiState, hwnd: u64) -> bool {
+/// EDIT: EM_CANUNDO — whether the single-level undo buffer holds a snapshot
+/// (typing, pasting, cutting, or clearing since the last undo/empty).
+#[must_use]
+pub(super) fn edit_can_undo(state: &WinApiState, hwnd: u64) -> bool {
+    matches!(
+        control_state(state, hwnd),
+        Some(ControlState::Edit {
+            undo_snapshot: Some(_),
+            ..
+        })
+    )
+}
+
+/// EDIT: EM_UNDO / WM_UNDO — restore the single-level undo snapshot (the
+/// text, caret, and selection captured before the last mutation) and clear
+/// the buffer. Returns whether an undo happened (FALSE when the buffer is
+/// empty — there is no redo).
+pub(super) fn edit_undo(state: &mut WinApiState, hwnd: u64) -> bool {
     let ws = state.window_state();
     let Some(window) = ws
         .windows
@@ -790,14 +966,636 @@ pub(super) fn edit_scroll_caret(state: &mut WinApiState, hwnd: u64) -> bool {
     let style = window.style;
     let ControlState::Edit {
         caret,
-        first_visible_line,
+        sel_start,
+        sel_end,
+        goal_column,
+        modified,
+        handle_buffer,
+        undo_snapshot,
         ..
     } = edit_state_mut(&mut ws.control_states, hwnd, style)
     else {
         return false;
     };
-    *first_visible_line = line_from_char(&window.control_text, *caret);
+    let Some(snapshot) = undo_snapshot.take() else {
+        return false;
+    };
+    // Restore the pre-mutation text, caret, and selection. The take above
+    // cleared the buffer — single-level undo, so a second EM_UNDO is a no-op.
+    window.control_text = snapshot.text;
+    *caret = snapshot.caret;
+    *sel_start = snapshot.sel_start;
+    *sel_end = snapshot.sel_end;
+    // Undo is a text mutation: it dirties the modify flag, invalidates the
+    // cached EM_GETHANDLE buffer, and drops the vertical-movement goal column
+    // (the caret moved horizontally).
+    *modified = true;
+    *handle_buffer = 0;
+    *goal_column = None;
     true
+}
+
+/// EDIT: EM_EMPTYUNDOBUFFER — discard any pending undo snapshot.
+pub(super) fn edit_empty_undo_buffer(state: &mut WinApiState, hwnd: u64) {
+    if let ControlState::Edit { undo_snapshot, .. } = edit_state_for_window(state, hwnd) {
+        *undo_snapshot = None;
+    }
+}
+
+/// The selected text of an EDIT as a host `String` (empty when nothing is
+/// selected or the window is gone).
+#[must_use]
+fn selected_text(state: &WinApiState, hwnd: u64) -> String {
+    let (sel_start, sel_end) = edit_get_selection(state, hwnd);
+    edit_text(state, hwnd).map_or_else(String::new, |text| {
+        let start = byte_index_of_char(text, sel_start);
+        let end = byte_index_of_char(text, sel_end);
+        text.get(start..end).unwrap_or("").to_owned()
+    })
+}
+
+/// EDIT: WM_COPY — store the selected text on the host clipboard. No-op with
+/// an empty selection (the clipboard is untouched, matching Windows' edit
+/// control). Returns whether anything was copied.
+pub(super) fn edit_copy(state: &mut WinApiState, hwnd: u64) -> bool {
+    let selected = selected_text(state, hwnd);
+    if selected.is_empty() {
+        return false;
+    }
+    state.clipboard().set_text(selected);
+    true
+}
+
+/// EDIT: WM_CUT — copy the selection to the clipboard, then delete it (the
+/// deletion captures an undo snapshot like any mutation). No-op with an empty
+/// selection.
+pub(super) fn edit_cut(state: &mut WinApiState, hwnd: u64) -> bool {
+    if !edit_copy(state, hwnd) {
+        return false;
+    }
+    edit_delete_at_caret(state, hwnd)
+}
+
+/// EDIT: WM_PASTE — insert the clipboard text at the caret, replacing the
+/// selection (honoring the limit). An empty clipboard is a no-op.
+pub(super) fn edit_paste(state: &mut WinApiState, hwnd: u64) -> bool {
+    let Some(clipboard_text) = state.clipboard().text().map(str::to_owned) else {
+        return false;
+    };
+    if clipboard_text.is_empty() {
+        return false;
+    }
+    edit_replace_selection_with(state, hwnd, &clipboard_text)
+}
+
+/// EDIT: WM_CLEAR — delete the selection WITHOUT writing it to the clipboard.
+///
+/// Like Windows' edit control, the clipboard is EMPTIED (the deleted text is
+/// never placed on it — that is what distinguishes CLEAR from CUT), so
+/// `IsClipboardFormatAvailable(CF_TEXT)` goes false. No-op with an empty
+/// selection (the clipboard is untouched then).
+pub(super) fn edit_clear(state: &mut WinApiState, hwnd: u64) -> bool {
+    let (sel_start, sel_end) = edit_get_selection(state, hwnd);
+    if sel_start == sel_end {
+        return false;
+    }
+    state.clipboard().clear();
+    edit_delete_at_caret(state, hwnd)
+}
+
+/// The number of visual rows that fit in a client of `client_height` px at
+/// `line_height` px per row. Floor division — a partial row at the bottom is
+/// clipped. A degenerate (zero-height) client still reports one row so the
+/// caret row stays reachable and the clamp never goes below the last row.
+#[must_use]
+pub(crate) fn visible_line_count(client_height: i32, line_height: i32) -> usize {
+    if line_height <= 0 {
+        return 1;
+    }
+    usize::try_from(client_height.saturating_div(line_height))
+        .unwrap_or(0)
+        .max(1)
+}
+
+/// Clamp a scroll offset so the viewport stays inside the text: `first` must
+/// be at most `total − visible` (0 when the text fits entirely). The upper
+/// bound keeps the LAST visual row on screen — scrolling past it would leave
+/// a gap at the bottom.
+#[must_use]
+pub(crate) fn clamp_scroll_offset(
+    first: usize,
+    total_visual_lines: usize,
+    visible_lines: usize,
+) -> usize {
+    first.min(total_visual_lines.saturating_sub(visible_lines))
+}
+
+/// One pass over the EDIT text producing the wrap-aware visual-row bookkeeping
+/// the scroll math needs: the TOTAL row count and the row holding
+/// `char_index`. Walks the same greedy width rule as `layout_visible_lines`
+/// (so the scroll clamp and the painted rows always agree); a caret exactly at
+/// a wrap boundary belongs to the row that ENDS at it — the row `paint_edit`
+/// draws the caret bar on.
+#[must_use]
+fn visual_rows<F>(
+    text: &str,
+    width: i32,
+    wrap: bool,
+    char_index: usize,
+    advance: &mut F,
+) -> (usize, usize)
+where
+    F: FnMut(char) -> i32,
+{
+    let mut rows = 0_usize;
+    let mut caret_row = 0_usize;
+    let mut caret_found = false;
+    let mut line_start_char = 0_usize;
+    for line_text in text.split('\n') {
+        let mut x = 0_i32;
+        for (i, ch) in line_text.chars().enumerate() {
+            let w = advance(ch);
+            if wrap && x > 0 && x.saturating_add(w) > width {
+                let seg_end = line_start_char.saturating_add(i);
+                if !caret_found && char_index <= seg_end {
+                    caret_row = rows;
+                    caret_found = true;
+                }
+                rows = rows.saturating_add(1);
+                x = 0;
+            }
+            x = x.saturating_add(w);
+        }
+        let row_end = line_start_char.saturating_add(line_text.chars().count());
+        if !caret_found && char_index <= row_end {
+            caret_row = rows;
+            caret_found = true;
+        }
+        rows = rows.saturating_add(1);
+        line_start_char = row_end.saturating_add(1);
+    }
+    if !caret_found {
+        // A caret past every row end (a corrupted index) lands on the last row.
+        caret_row = rows.saturating_sub(1);
+    }
+    (rows, caret_row)
+}
+
+/// The wrap-aware vertical scroll context of a multiline EDIT: how many visual
+/// rows fit in the client (`visible`), the full row count (`total`), and the
+/// visual row holding the caret (`caret_row`). All three derive from the same
+/// greedy width walk `paint_edit`'s layout runs, so the scroll math and the
+/// painted rows always agree. `None` when the window is gone.
+struct EditScrollContext {
+    visible: usize,
+    total: usize,
+    caret_row: usize,
+}
+
+/// Resolve an EDIT's [`EditScrollContext`] from its client height, the
+/// resolved default font's line height, and the wrap-aware visual row count.
+fn edit_scroll_context(state: &mut WinApiState, hwnd: u64) -> Option<EditScrollContext> {
+    let (client_height, text, style, width, caret) = {
+        let ws = state.window_state();
+        let w = ws
+            .windows
+            .iter()
+            .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))?;
+        let caret = match ws.control_states.get(&crate::handles::Hwnd::from(hwnd)) {
+            Some(ControlState::Edit { caret, .. }) => *caret,
+            _ => 0,
+        };
+        (w.height, w.control_text.clone(), w.style, w.width, caret)
+    };
+    let multiline = style & ES_MULTILINE != 0;
+    // Wrap is on when the multiline EDIT has no horizontal scrollbar — the
+    // same condition paint_edit uses, so row counts and painted rows agree.
+    let wrap = multiline && style & WS_HSCROLL == 0;
+    let wrap_width = width.saturating_sub(4);
+    // The font engine is taken out of gdi state so the advance closure can
+    // run next to it (the paint path does the same); it is put back
+    // unconditionally. Safe under the single shared WinApiState mutex — the
+    // take and the put cannot interleave with another handler's.
+    let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
+    let default_key = FontKey::default();
+    let resolved = font_engine.resolve(&default_key, 16);
+    let (line_h, rows) = match &resolved {
+        Some(resolved) => {
+            let line_h = resolved.line_height();
+            let advance = &mut |ch: char| font_engine.char_advance(resolved, &default_key, ch);
+            (line_h, visual_rows(&text, wrap_width, wrap, caret, advance))
+        }
+        // No system font: the 16 px default the EM_* line APIs assume, with
+        // a fixed 8 px/char advance for the wrap walk.
+        None => (
+            16,
+            visual_rows(&text, wrap_width, wrap, caret, &mut |_| 8_i32),
+        ),
+    };
+    state.gdi_state().font_engine = font_engine;
+    Some(EditScrollContext {
+        visible: visible_line_count(client_height, line_h),
+        total: rows.0,
+        caret_row: rows.1,
+    })
+}
+
+/// EDIT: WM_VSCROLL — apply one vertical scroll-bar request. `code` is the
+/// SB_* code in the wParam low word; `thumb` is the high-word thumb position
+/// used by SB_THUMBTRACK/SB_THUMBPOSITION. A page is the number of visible
+/// rows (the same amount PgUp/PgDn move the caret). Returns whether the offset
+/// moved.
+pub(super) fn edit_scroll_vertical(
+    state: &mut WinApiState,
+    hwnd: u64,
+    code: u16,
+    thumb: u16,
+) -> bool {
+    let Some(context) = edit_scroll_context(state, hwnd) else {
+        return false;
+    };
+    let ControlState::Edit {
+        first_visible_line, ..
+    } = edit_state_for_window(state, hwnd)
+    else {
+        return false;
+    };
+    let old = *first_visible_line;
+    let target = match code {
+        SB_LINEUP => old.saturating_sub(1),
+        SB_LINEDOWN => old.saturating_add(1),
+        SB_PAGEUP => old.saturating_sub(context.visible),
+        SB_PAGEDOWN => old.saturating_add(context.visible),
+        SB_THUMBPOSITION | SB_THUMBTRACK => usize::from(thumb),
+        SB_TOP => 0,
+        SB_BOTTOM => context.total.saturating_sub(context.visible),
+        SB_ENDSCROLL => old, // end of a scroll-bar interaction: no-op
+        _ => old,            // unknown codes: no-op
+    };
+    *first_visible_line = clamp_scroll_offset(target, context.total, context.visible);
+    *first_visible_line != old
+}
+
+/// EDIT: WM_MOUSEWHEEL — scroll the multiline EDIT vertically. `wparam`'s
+/// high word is the signed wheel delta (a wheel notch = 120 delta units); one
+/// notch scrolls 3 lines — the Windows default (`SPI_GETWHEELSCROLLLINES`) —
+/// and smaller trackpad deltas scroll proportionally. A positive delta (wheel
+/// away from the user) scrolls UP. Returns whether the offset moved.
+pub(super) fn edit_mouse_wheel(state: &mut WinApiState, hwnd: u64, wparam: u64) -> bool {
+    let hi = u16::try_from((wparam >> 16) & 0xFFFF).unwrap_or(0);
+    let delta = i32::from(i16::from_le_bytes(hi.to_le_bytes()));
+    // Truncating division drops partial notches: a 60-unit trackpad flick is
+    // a no-op while a 120-unit notch scrolls a full 3 lines.
+    let lines = i64::from(delta.saturating_div(120).saturating_mul(3));
+    let Some(context) = edit_scroll_context(state, hwnd) else {
+        return false;
+    };
+    let ControlState::Edit {
+        first_visible_line, ..
+    } = edit_state_for_window(state, hwnd)
+    else {
+        return false;
+    };
+    let old = *first_visible_line;
+    // Positive delta = wheel away from the user = scroll UP (earlier rows);
+    // negative = toward the user = scroll DOWN (later rows).
+    let target = if lines > 0 {
+        old.saturating_sub(usize::try_from(lines).unwrap_or(0))
+    } else {
+        old.saturating_add(usize::try_from(lines.saturating_neg()).unwrap_or(0))
+    };
+    *first_visible_line = clamp_scroll_offset(target, context.total, context.visible);
+    *first_visible_line != old
+}
+
+// ── Task 2.5: mouse caret placement, drag selection, double-click ──────────
+
+/// The char index whose glyph cell contains the client point (x, y) — the
+/// inverse of the advance-summed caret x `paint_edit` draws.
+///
+/// `wrap_width` is the client width minus the 2 px side margins (the same
+/// column `layout_visible_lines` lays out against); the row for y is picked
+/// from that same visual-row layout, so a click in wrapped text lands on the
+/// glyph the paint shows there. A click left of the text clamps to the row
+/// start, past the last glyph to the row end; a single-line EDIT (wrap off,
+/// one row at y=0) picks its only row for any y.
+#[must_use]
+pub(crate) fn edit_char_index_at_point<F>(
+    text: &str,
+    x: i32,
+    y: i32,
+    wrap_width: i32,
+    line_height: i32,
+    first_visible: usize,
+    wrap: bool,
+    alignment: u32,
+    advance: &mut F,
+) -> usize
+where
+    F: FnMut(char) -> i32,
+{
+    let rows = layout_visible_lines(
+        text,
+        wrap_width,
+        line_height,
+        first_visible,
+        wrap,
+        alignment,
+        advance,
+    );
+    // The last row at or above the click (rows are y-rebased to 0 at the
+    // first visible row); a click above the first row falls back to it.
+    let Some(row) = rows
+        .iter()
+        .rev()
+        .find(|r| r.y <= y)
+        .or_else(|| rows.first())
+    else {
+        return 0;
+    };
+    // The paint starts text at the 2 px left margin plus the row's alignment
+    // offset (`tx = offset + 2`, then `x = tx + row.x`).
+    let row_x = x.saturating_sub(2).saturating_sub(row.x);
+    if row_x <= 0 {
+        return row.char_start;
+    }
+    let mut acc = 0_i32;
+    let mut local = 0_usize;
+    for ch in row.text.chars() {
+        let w = advance(ch);
+        let cell_right = acc.saturating_add(w);
+        if row_x < cell_right {
+            // The click is in this glyph's cell; the half-advance boundary
+            // decides whether the caret lands before or after the char.
+            let before = row_x < acc.saturating_add(w.saturating_div(2));
+            return row.char_start.saturating_add(if before {
+                local
+            } else {
+                local.saturating_add(1)
+            });
+        }
+        acc = cell_right;
+        local = local.saturating_add(1);
+    }
+    row.char_end
+}
+
+/// The char index at the client point (x, y) for an EDIT window, resolving
+/// the default font exactly like the paint path (`None` when the window is
+/// gone). The wrap flag and wrap column derive from the window's style and
+/// width the same way `paint_edit` derives them, so the caret lands on the
+/// glyph that is drawn at the click.
+fn edit_char_at_point(state: &mut WinApiState, hwnd: u64, x: i32, y: i32) -> Option<usize> {
+    let (text, style, width, first_visible_line) = {
+        let ws = state.window_state();
+        let w = ws
+            .windows
+            .iter()
+            .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))?;
+        let first_visible_line = match ws.control_states.get(&crate::handles::Hwnd::from(hwnd)) {
+            Some(ControlState::Edit {
+                first_visible_line, ..
+            }) => *first_visible_line,
+            _ => 0,
+        };
+        (w.control_text.clone(), w.style, w.width, first_visible_line)
+    };
+    let multiline = style & ES_MULTILINE != 0;
+    let wrap = multiline && style & WS_HSCROLL == 0;
+    let wrap_width = width.saturating_sub(4);
+    let alignment = style & ES_ALIGN_MASK;
+    // The font engine is taken out of gdi state so the advance closure can
+    // run next to it (the paint path does the same); it is put back
+    // unconditionally. Safe under the single shared WinApiState mutex.
+    let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
+    let default_key = FontKey::default();
+    let resolved = font_engine.resolve(&default_key, 16);
+    let result = match &resolved {
+        Some(resolved) => {
+            let line_h = resolved.line_height();
+            let advance = &mut |ch: char| font_engine.char_advance(resolved, &default_key, ch);
+            edit_char_index_at_point(
+                &text,
+                x,
+                y,
+                wrap_width,
+                line_h,
+                first_visible_line,
+                wrap,
+                alignment,
+                advance,
+            )
+        }
+        // No system font: the 16 px default the EM_* line APIs assume, with
+        // a fixed 8 px/char advance for the hit test.
+        None => edit_char_index_at_point(
+            &text,
+            x,
+            y,
+            wrap_width,
+            16,
+            first_visible_line,
+            wrap,
+            alignment,
+            &mut |_| 8_i32,
+        ),
+    };
+    state.gdi_state().font_engine = font_engine;
+    Some(result)
+}
+
+/// EDIT: WM_LBUTTONDOWN — place the caret at the click and collapse the
+/// selection; the click becomes the drag anchor (the selection edge later
+/// mouse moves extend from). The dispatch arm sets the mouse capture.
+pub(super) fn edit_mouse_down(state: &mut WinApiState, hwnd: u64, x: i32, y: i32) {
+    let Some(index) = edit_char_at_point(state, hwnd, x, y) else {
+        return;
+    };
+    let ws = state.window_state();
+    let style = ws
+        .windows
+        .iter()
+        .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
+        .map_or(0, |w| w.style);
+    let ControlState::Edit {
+        caret,
+        sel_start,
+        sel_end,
+        goal_column,
+        ..
+    } = edit_state_mut(&mut ws.control_states, hwnd, style)
+    else {
+        return;
+    };
+    *caret = index;
+    *sel_start = index;
+    *sel_end = index;
+    // A click is horizontal movement: the vertical-movement goal column is
+    // stale (the same clearing horizontal keys apply).
+    *goal_column = None;
+    // Task 2.4 handoff: a click in the partial strip below the last full
+    // visible row (or any off-viewport hit) must bring the caret row into
+    // view. The dispatch arm invalidates unconditionally after the handler
+    // runs, so the repaint is covered whether or not the viewport moved.
+    edit_scroll_caret(state, hwnd);
+}
+
+/// EDIT: WM_MOUSEMOVE while the edit holds the capture — extend the drag
+/// selection from the anchor (the click position) to the current position.
+///
+/// The anchor is the selection edge the caret is not at, since the caret
+/// tracks the pointer (the same anchor model `edit_move_caret` uses for
+/// Shift-arrows); crossing the anchor flips the selection edge. Hover moves
+/// without capture are no-ops. Returns whether the selection changed.
+pub(super) fn edit_mouse_move(state: &mut WinApiState, hwnd: u64, x: i32, y: i32) -> bool {
+    if state.window_state().capture_window_handle != crate::handles::Hwnd::from(hwnd) {
+        return false;
+    }
+    let Some(index) = edit_char_at_point(state, hwnd, x, y) else {
+        return false;
+    };
+    let ws = state.window_state();
+    let style = ws
+        .windows
+        .iter()
+        .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
+        .map_or(0, |w| w.style);
+    let ControlState::Edit {
+        caret,
+        sel_start,
+        sel_end,
+        goal_column,
+        ..
+    } = edit_state_mut(&mut ws.control_states, hwnd, style)
+    else {
+        return false;
+    };
+    if index == *caret {
+        return false;
+    }
+    let anchor = if *caret == *sel_start {
+        *sel_end
+    } else {
+        *sel_start
+    };
+    *sel_start = anchor.min(index);
+    *sel_end = anchor.max(index);
+    *caret = index;
+    // Horizontal movement drops the vertical-movement goal column like any
+    // horizontal key.
+    *goal_column = None;
+    true
+}
+
+/// EDIT: WM_LBUTTONUP — end the drag session: release the mouse capture (the
+/// selection stays as-is; Windows finalizes the drag on release).
+pub(super) fn edit_mouse_up(state: &mut WinApiState, hwnd: u64) {
+    if state.window_state().capture_window_handle == crate::handles::Hwnd::from(hwnd) {
+        state.window_state().capture_window_handle = crate::handles::Hwnd::NULL;
+    }
+}
+
+/// The whitespace-delimited word `[start, end)` containing `char_index`; a
+/// click on whitespace (or past the end of the text) yields an empty selection
+/// at the index. `char::is_whitespace` splits words, matching the Win32
+/// `IsCharAlphaNumeric`-style word breaking closely enough for an EDIT.
+#[must_use]
+fn word_bounds(text: &str, char_index: usize) -> (usize, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let index = char_index.min(len);
+    if index >= len || chars.get(index).is_none_or(|c| c.is_whitespace()) {
+        return (index, index);
+    }
+    let mut start = index;
+    while start > 0
+        && !chars
+            .get(start.saturating_sub(1))
+            .is_some_and(|c| c.is_whitespace())
+    {
+        start = start.saturating_sub(1);
+    }
+    let mut end = index;
+    while end < len && !chars.get(end).is_some_and(|c| c.is_whitespace()) {
+        end = end.saturating_add(1);
+    }
+    (start, end)
+}
+
+/// EDIT: WM_LBUTTONDBLCLK — select the whitespace-delimited word under the
+/// click (empty when the click lands on whitespace); the click becomes the
+/// drag anchor so a subsequent drag extends from the word. The dispatch arm
+/// sets the capture and focus like a single-click press.
+pub(super) fn edit_mouse_dblclk(state: &mut WinApiState, hwnd: u64, x: i32, y: i32) {
+    let Some(index) = edit_char_at_point(state, hwnd, x, y) else {
+        return;
+    };
+    let ws = state.window_state();
+    let Some(window) = ws
+        .windows
+        .iter_mut()
+        .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
+    else {
+        return;
+    };
+    let style = window.style;
+    let len = window.control_text.chars().count();
+    let (word_start, word_end) = word_bounds(&window.control_text, index);
+    let ControlState::Edit {
+        caret,
+        sel_start,
+        sel_end,
+        goal_column,
+        ..
+    } = edit_state_mut(&mut ws.control_states, hwnd, style)
+    else {
+        return;
+    };
+    *caret = word_end.min(len);
+    *sel_start = word_start.min(len);
+    *sel_end = word_end.min(len);
+    // The caret moved horizontally (to the word end); drop any remembered
+    // vertical-movement goal column.
+    *goal_column = None;
+    // Same Task 2.4 handoff as a single click: a double-click on a row below
+    // the last full visible row must scroll the selected word into view (the
+    // dispatch arm's unconditional invalidate covers the repaint).
+    edit_scroll_caret(state, hwnd);
+}
+
+/// EDIT: EM_SCROLLCARET — bring the caret's visual row into the viewport by
+/// the SMALLEST scroll: a caret below the bottom edge advances
+/// `first_visible_line` just enough to show it on the LAST visible row; a
+/// caret above the top edge jumps the viewport up to it; a caret already
+/// visible leaves the offset untouched. Windows scrolls minimally — it does
+/// NOT snap the caret line to the top (the pre-Task-2.4 behavior). Returns
+/// whether the offset moved.
+pub(super) fn edit_scroll_caret(state: &mut WinApiState, hwnd: u64) -> bool {
+    let Some(context) = edit_scroll_context(state, hwnd) else {
+        return false;
+    };
+    let ControlState::Edit {
+        first_visible_line, ..
+    } = edit_state_for_window(state, hwnd)
+    else {
+        return false;
+    };
+    let old = *first_visible_line;
+    if context.caret_row < old {
+        // Above the viewport: reveal the caret at the top edge.
+        *first_visible_line = context.caret_row;
+    } else if context.caret_row >= old.saturating_add(context.visible) {
+        // Below the viewport: pull it up to the bottom edge only.
+        *first_visible_line = clamp_scroll_offset(
+            context
+                .caret_row
+                .saturating_sub(context.visible)
+                .saturating_add(1),
+            context.total,
+            context.visible,
+        );
+    }
+    *first_visible_line != old
 }
 
 /// EDIT: EM_GETMODIFY — the modified flag (0 when the state was never seeded).
@@ -908,6 +1706,7 @@ pub(super) fn edit_set_handle(
         caret,
         sel_start,
         sel_end,
+        goal_column,
         handle_buffer,
         ..
     } = edit_state_mut(&mut ws.control_states, hwnd, style)
@@ -918,6 +1717,7 @@ pub(super) fn edit_set_handle(
     *caret = 0;
     *sel_start = 0;
     *sel_end = 0;
+    *goal_column = None;
     // The adopted buffer becomes the cached EM_GETHANDLE result; any older
     // cached handle is the guest's to LocalFree (Windows frees it on the
     // control's next buffer reallocation).
@@ -1033,6 +1833,17 @@ fn shift_is_down(state: &WinApiState) -> bool {
     state.try_window_state().is_some_and(|ws| {
         ws.keyboard_state
             .get(usize::try_from(VK_SHIFT).unwrap_or(0))
+            & 0x80
+            != 0
+    })
+}
+
+/// Whether the Ctrl key is held, per the guest keyboard state.
+#[must_use]
+fn ctrl_is_down(state: &WinApiState) -> bool {
+    state.try_window_state().is_some_and(|ws| {
+        ws.keyboard_state
+            .get(usize::try_from(VK_CONTROL).unwrap_or(0))
             & 0x80
             != 0
     })
