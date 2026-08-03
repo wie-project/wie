@@ -140,6 +140,10 @@ pub struct FontRecord {
     pub italic: bool,
     /// `lfCharSet` (reported by `GetTextMetricsA.tmCharSet`).
     pub charset: u8,
+    /// Raw `lfPitchAndFamily` byte (low bits: pitch, high nibble: family).
+    /// The FIXED_PITCH bit (0x01) steers the monospace fallback at resolve
+    /// time; recorded verbatim because `alloc_font` predates it.
+    pub pitch: u8,
 }
 
 /// Per-slot GDI state stored in `DllId::Gdi`.
@@ -264,8 +268,18 @@ impl GdiState {
             weight,
             italic,
             charset,
+            pitch: 0,
         });
         handle
+    }
+
+    /// Record the `lfPitchAndFamily` byte on a font (the pitch hint drives
+    /// the monospace fallback at resolution time). A no-op for an unknown
+    /// handle — the caller allocates the font first, so a miss is a bug.
+    pub fn set_font_pitch(&mut self, handle: Hfont, pitch: u8) {
+        if let Some(font) = self.fonts.iter_mut().find(|font| font.handle == handle) {
+            font.pitch = pitch;
+        }
     }
 
     /// Find a DC by handle.

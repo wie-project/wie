@@ -482,13 +482,6 @@ fn edit_text(state: &WinApiState, hwnd: u64) -> Option<&str> {
     })
 }
 
-/// The default control font's line height in px — the PgUp/PgDn page heuristic
-/// divides the client height by it (the same 16 px EM_POSFROMCHAR's y uses, so
-/// the page and the painted rows agree). The SCROLL handlers use the resolved
-/// font's real line height via [`edit_scroll_context`], which lands within a
-/// px of this constant for the default font.
-const EDIT_DEFAULT_LINE_HEIGHT: usize = 16;
-
 /// EDIT: arrow/Home/End/PgUp/PgDn caret movement. Shift extends the selection
 /// (the anchor stays at the edge the caret moved away from); without Shift the
 /// selection collapses. Vertical keys are multiline-only: they move to the
@@ -499,77 +492,102 @@ const EDIT_DEFAULT_LINE_HEIGHT: usize = 16;
 pub(super) fn edit_move_caret(state: &mut WinApiState, hwnd: u64, vk: u64) -> bool {
     let extend = shift_is_down(state);
     let ctrl = ctrl_is_down(state);
-    let ws = state.window_state();
-    let Some(window) = ws
-        .windows
-        .iter_mut()
-        .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
-    else {
-        return false;
+    // The font engine is taken out of gdi state so the stored-font resolution
+    // can run next to `state` (the same take/put the paint path uses); it is
+    // put back on every path below. Safe under the single shared WinApiState
+    // mutex — the take and the put cannot interleave with another handler's.
+    let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
+    let default_key = FontKey::default();
+    let key_and_resolved = match crate::gdi32::window_font_resolution(state, hwnd, &mut font_engine)
+    {
+        Some(key_and_resolved) => Some(key_and_resolved),
+        None => font_engine
+            .resolve(&default_key, 16)
+            .map(|resolved| (default_key, resolved)),
     };
-    let style = window.style;
-    let page_lines = usize::try_from(window.height)
-        .unwrap_or(0)
-        .saturating_div(EDIT_DEFAULT_LINE_HEIGHT);
-    let ControlState::Edit {
-        caret,
-        sel_start,
-        sel_end,
-        style_bits,
-        goal_column,
-        ..
-    } = edit_state_mut(&mut ws.control_states, hwnd, style)
-    else {
-        return false;
-    };
-    let text = &window.control_text;
-    let len = text.chars().count();
-    let old_caret = (*caret).min(len);
-    let multiline = *style_bits & ES_MULTILINE != 0;
-    let vertical = multiline && matches!(vk, VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT);
-    if vertical {
-        // The goal column is the column of the first press of a vertical run;
-        // later presses keep it so the caret returns once a longer line shows
-        // up (clamping only ever applies to the SHORT lines in between).
-        let line_start = line_index_of(text, line_from_char(text, old_caret)).unwrap_or(0);
-        if goal_column.is_none() {
-            *goal_column = Some(old_caret.saturating_sub(line_start));
-        }
-    } else if matches!(vk, VK_LEFT | VK_RIGHT | VK_HOME | VK_END) {
-        *goal_column = None;
-    }
-    let new_caret = caret_navigation_target(
-        text,
-        old_caret,
-        vk,
-        ctrl,
-        multiline,
-        *goal_column,
-        page_lines.max(1),
-    );
-    if new_caret == old_caret && *sel_start == *sel_end {
-        return false;
-    }
-    if extend {
-        // The anchor is the selection edge the caret is not at (or the old
-        // caret when the selection was empty).
-        let anchor = if *sel_start == *sel_end {
-            old_caret
-        } else if old_caret == (*sel_start).min(*sel_end) {
-            (*sel_start).max(*sel_end)
-        } else {
-            (*sel_start).min(*sel_end)
+    let moved = (|| {
+        let ws = state.window_state();
+        let Some(window) = ws
+            .windows
+            .iter_mut()
+            .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
+        else {
+            return false;
         };
-        let (lo, hi) = (anchor.min(new_caret), anchor.max(new_caret));
-        *sel_start = lo;
-        *sel_end = hi;
-        *caret = new_caret;
-    } else {
-        *caret = new_caret;
-        *sel_start = new_caret;
-        *sel_end = new_caret;
-    }
-    true
+        let style = window.style;
+        // The PgUp/PgDn page size: the client height divided by the STORED
+        // font's line height (the same resolution the paint path uses), so a
+        // page matches the painted rows once a WM_SETFONT changed the font.
+        // A degenerate (zero) line height keeps a 1-line page.
+        let line_h = key_and_resolved
+            .as_ref()
+            .map_or(16, |(_key, resolved)| resolved.line_height())
+            .max(1);
+        let page_lines = usize::try_from(window.height)
+            .unwrap_or(0)
+            .saturating_div(usize::try_from(line_h).unwrap_or(1));
+        let ControlState::Edit {
+            caret,
+            sel_start,
+            sel_end,
+            style_bits,
+            goal_column,
+            ..
+        } = edit_state_mut(&mut ws.control_states, hwnd, style)
+        else {
+            return false;
+        };
+        let text = &window.control_text;
+        let len = text.chars().count();
+        let old_caret = (*caret).min(len);
+        let multiline = *style_bits & ES_MULTILINE != 0;
+        let vertical = multiline && matches!(vk, VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT);
+        if vertical {
+            // The goal column is the column of the first press of a vertical run;
+            // later presses keep it so the caret returns once a longer line shows
+            // up (clamping only ever applies to the SHORT lines in between).
+            let line_start = line_index_of(text, line_from_char(text, old_caret)).unwrap_or(0);
+            if goal_column.is_none() {
+                *goal_column = Some(old_caret.saturating_sub(line_start));
+            }
+        } else if matches!(vk, VK_LEFT | VK_RIGHT | VK_HOME | VK_END) {
+            *goal_column = None;
+        }
+        let new_caret = caret_navigation_target(
+            text,
+            old_caret,
+            vk,
+            ctrl,
+            multiline,
+            *goal_column,
+            page_lines.max(1),
+        );
+        if new_caret == old_caret && *sel_start == *sel_end {
+            return false;
+        }
+        if extend {
+            // The anchor is the selection edge the caret is not at (or the old
+            // caret when the selection was empty).
+            let anchor = if *sel_start == *sel_end {
+                old_caret
+            } else if old_caret == (*sel_start).min(*sel_end) {
+                (*sel_start).max(*sel_end)
+            } else {
+                (*sel_start).min(*sel_end)
+            };
+            let (lo, hi) = (anchor.min(new_caret), anchor.max(new_caret));
+            *sel_start = lo;
+            *sel_end = hi;
+            *caret = new_caret;
+        } else {
+            *caret = new_caret;
+            *sel_start = new_caret;
+            *sel_end = new_caret;
+        }
+        true
+    })();
+    state.gdi_state().font_engine = font_engine;
+    moved
 }
 
 /// The caret target for one navigation keypress: vertical moves step to the
@@ -1002,6 +1020,21 @@ pub(super) fn edit_empty_undo_buffer(state: &mut WinApiState, hwnd: u64) {
     }
 }
 
+/// EDIT: discard any pending undo snapshot WITHOUT seeding a control state —
+/// the no-create variant of [`edit_empty_undo_buffer`], for text replacements
+/// that bypass the control dispatch (SetWindowText, WM_SETTEXT on any control
+/// kind). Real Windows clears an EDIT's undo buffer when the program sets the
+/// text, so WM_UNDO never reverts past program-set text. No-op when no Edit
+/// state exists yet (a fresh control has no snapshot to drop).
+pub(crate) fn edit_clear_undo_buffer(state: &mut WinApiState, hwnd: u64) {
+    let ws = state.window_state();
+    if let Some(ControlState::Edit { undo_snapshot, .. }) =
+        ws.control_states.get_mut(&crate::handles::Hwnd::from(hwnd))
+    {
+        *undo_snapshot = None;
+    }
+}
+
 /// The selected text of an EDIT as a host `String` (empty when nothing is
 /// selected or the window is gone).
 #[must_use]
@@ -1153,7 +1186,8 @@ struct EditScrollContext {
 }
 
 /// Resolve an EDIT's [`EditScrollContext`] from its client height, the
-/// resolved default font's line height, and the wrap-aware visual row count.
+/// stored control font's line height (the system default when none is set),
+/// and the wrap-aware visual row count.
 fn edit_scroll_context(state: &mut WinApiState, hwnd: u64) -> Option<EditScrollContext> {
     let (client_height, text, style, width, caret) = {
         let ws = state.window_state();
@@ -1178,11 +1212,20 @@ fn edit_scroll_context(state: &mut WinApiState, hwnd: u64) -> Option<EditScrollC
     // take and the put cannot interleave with another handler's.
     let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
     let default_key = FontKey::default();
-    let resolved = font_engine.resolve(&default_key, 16);
-    let (line_h, rows) = match &resolved {
-        Some(resolved) => {
+    // The STORED font (falling back to the system default) drives the line
+    // height — the same resolution the paint path uses, so the scroll math
+    // and the painted rows agree even after a WM_SETFONT.
+    let key_and_resolved = match crate::gdi32::window_font_resolution(state, hwnd, &mut font_engine)
+    {
+        Some(key_and_resolved) => Some(key_and_resolved),
+        None => font_engine
+            .resolve(&default_key, 16)
+            .map(|resolved| (default_key, resolved)),
+    };
+    let (line_h, rows) = match &key_and_resolved {
+        Some((key, resolved)) => {
             let line_h = resolved.line_height();
-            let advance = &mut |ch: char| font_engine.char_advance(resolved, &default_key, ch);
+            let advance = &mut |ch: char| font_engine.char_advance(resolved, key, ch);
             (line_h, visual_rows(&text, wrap_width, wrap, caret, advance))
         }
         // No system font: the 16 px default the EM_* line APIs assume, with
@@ -1341,7 +1384,7 @@ where
 }
 
 /// The char index at the client point (x, y) for an EDIT window, resolving
-/// the default font exactly like the paint path (`None` when the window is
+/// the stored font exactly like the paint path (`None` when the window is
 /// gone). The wrap flag and wrap column derive from the window's style and
 /// width the same way `paint_edit` derives them, so the caret lands on the
 /// glyph that is drawn at the click.
@@ -1369,11 +1412,20 @@ fn edit_char_at_point(state: &mut WinApiState, hwnd: u64, x: i32, y: i32) -> Opt
     // unconditionally. Safe under the single shared WinApiState mutex.
     let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
     let default_key = FontKey::default();
-    let resolved = font_engine.resolve(&default_key, 16);
-    let result = match &resolved {
-        Some(resolved) => {
+    // The STORED font (falling back to the system default) drives the line
+    // height and the per-glyph advances — the same resolution the paint path
+    // uses, so the click-to-caret mapping and the drawn glyphs agree.
+    let key_and_resolved = match crate::gdi32::window_font_resolution(state, hwnd, &mut font_engine)
+    {
+        Some(key_and_resolved) => Some(key_and_resolved),
+        None => font_engine
+            .resolve(&default_key, 16)
+            .map(|resolved| (default_key, resolved)),
+    };
+    let result = match &key_and_resolved {
+        Some((key, resolved)) => {
             let line_h = resolved.line_height();
-            let advance = &mut |ch: char| font_engine.char_advance(resolved, &default_key, ch);
+            let advance = &mut |ch: char| font_engine.char_advance(resolved, key, ch);
             edit_char_index_at_point(
                 &text,
                 x,
@@ -1754,9 +1806,9 @@ pub(super) fn edit_set_tab_stops(
 
 /// EDIT: EM_POSFROMCHAR — TRUE with `POINT(x = 0, y = line × the resolved
 /// font's line height)` at `point` for a valid char index, FALSE otherwise.
-/// The y uses the SAME 16 px default control font the paint path resolves, so
-/// EM_POSFROMCHAR and the rendered rows agree; per-glyph x lands with Task
-/// 2.5's hit-test.
+/// The y uses the SAME stored control font the paint path resolves (falling
+/// back to the system default), so EM_POSFROMCHAR and the rendered rows
+/// agree; per-glyph x lands with Task 2.5's hit-test.
 pub(super) fn edit_pos_from_char(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -1773,16 +1825,17 @@ pub(super) fn edit_pos_from_char(
     }
     if point != 0 {
         write_guest_i32(engine, point, 0)?;
-        // Resolve the line height directly on the field — no take/put window.
-        // `font_engine` is a plain field under the single shared WinApiState
-        // mutex (every API handler, WM_PAINT included, runs while holding
-        // it), so the resolve cannot race a concurrent WM_PAINT on another
-        // host thread.
-        let line_h = state
-            .gdi_state()
-            .font_engine
-            .resolve(&FontKey::default(), 16)
-            .map_or(0, |f| f.line_height());
+        // The STORED font (falling back to the system default) drives the
+        // line height — the same resolution the paint path uses, so
+        // EM_POSFROMCHAR and the rendered rows agree. The engine is taken
+        // out of gdi state so the resolution helper can run next to `state`;
+        // it is put back unconditionally. Safe under the single shared
+        // WinApiState mutex — the take and the put cannot interleave with
+        // another handler's.
+        let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
+        let line_h = crate::gdi32::window_font_resolution(state, hwnd, &mut font_engine)
+            .map_or(0, |(_key, resolved)| resolved.line_height());
+        state.gdi_state().font_engine = font_engine;
         let line = line_from_char(&text, usize::try_from(char_index).unwrap_or(0));
         let y = i32::try_from(line).unwrap_or(0).saturating_mul(line_h);
         write_guest_i32(engine, point.wrapping_add(4), y)?;

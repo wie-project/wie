@@ -499,6 +499,32 @@ fn gui_control_child_windows_and_command() {
     );
 }
 
+#[test]
+fn gui_edit_multiline_edit_messages() {
+    let Some(path) = micro_exe("gui_edit.exe") else {
+        eprintln!("skip: micro-exes/out/gui_edit.exe not built (run make -C micro-exes gui_exes)");
+        return;
+    };
+    // Serialized suite: see GUI_SUITE_LOCK.
+    let _suite = gui_suite_serialize();
+
+    // The exe's selftest drives eight assertion groups against a multiline
+    // EDIT (SetWindowText + EM_GETLINECOUNT, EM_LINEFROMCHAR, EM_SETSEL/
+    // EM_GETSEL, EM_REPLACESEL, EM_GETMODIFY, WM_COPY →
+    // IsClipboardFormatAvailable, EM_UNDO, WM_SETTEXT line-count reset). The
+    // first failed group exits with 300..307 (group code + 200) so CI
+    // pinpoints the broken message; exit 0 only happens when every group
+    // passed, so it proves the EDIT message core end-to-end.
+    let exit_code = drive_gui_session(&path, 200);
+
+    assert_eq!(
+        exit_code,
+        Some(0),
+        "gui_edit.exe must exit 0 (proves the multiline EDIT selftest groups passed); \
+         got {exit_code:?}"
+    );
+}
+
 /// Owner-client coordinates of the gui_dialog OK-button face (template id 100:
 /// "100 DIALOG 10,20,160,60", OK at DLU (10,10,60,20) → px (20,20,120,40),
 /// dialog centered in the 1280×800 owner at (480,340) → button at (500,360)).

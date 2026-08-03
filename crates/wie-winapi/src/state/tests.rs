@@ -1963,6 +1963,152 @@ fn test_set_window_placement_changed_rect_wakes_host_presenter() {
     );
 }
 
+// --- MessageBox (host bridge) ---
+
+/// Register a test MessageBox bridge that records every `(caption, text,
+/// mb_type)` call and answers with the canned Win32 id.
+fn register_message_box_bridge(
+    state: &mut WinApiState,
+    canned: i32,
+    captured: Arc<Mutex<Vec<(String, String, u32)>>>,
+) {
+    state.present().message_box_bridge = Some(Box::new(move |caption, text, mb_type| {
+        captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((caption.to_owned(), text.to_owned(), mb_type));
+        canned
+    }));
+}
+
+/// `MessageBoxW` decodes UTF-16 args, forwards them to the registered bridge
+/// verbatim (mb_type included), and returns the bridge's id to the guest.
+#[test]
+fn test_message_box_w_calls_registered_bridge_with_decoded_args() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let captured = Arc::new(Mutex::new(Vec::<(String, String, u32)>::new()));
+    register_message_box_bridge(&mut state, 6, Arc::clone(&captured)); // IDYES
+    write_guest_utf16(&mut engine, 0x6000, "Save changes?");
+    write_guest_utf16(&mut engine, 0x7000, "notepad");
+    // MB_YESNO | MB_ICONQUESTION = 0x4 | 0x20.
+    write_regs(&mut engine, 0, 0x6000, 0x7000, 0x24, 0);
+
+    let r = user32::handle_message_box_w(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("MessageBoxW must dispatch");
+
+    assert_eq!(r.return_value, 6, "the bridge's id must reach the guest");
+    let calls = captured.lock().expect("bridge capture lock");
+    assert_eq!(calls.len(), 1, "the bridge must be called exactly once");
+    assert_eq!(calls[0].0, "notepad", "caption decoded from UTF-16");
+    assert_eq!(calls[0].1, "Save changes?", "text decoded from UTF-16");
+    assert_eq!(
+        calls[0].2, 0x24,
+        "MB_* flag bits must pass through to the bridge verbatim"
+    );
+}
+
+/// `MessageBoxA` decodes ANSI/UTF-8 args and reaches the bridge the same way
+/// the wide variant does.
+#[test]
+fn test_message_box_a_decodes_ansi_and_calls_bridge() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let captured = Arc::new(Mutex::new(Vec::<(String, String, u32)>::new()));
+    register_message_box_bridge(&mut state, 2, Arc::clone(&captured)); // IDCANCEL
+    write_guest_ansi(&mut engine, 0x6000, "Unsaved changes");
+    write_guest_ansi(&mut engine, 0x7000, "editor");
+    write_regs(&mut engine, 0, 0x6000, 0x7000, 0x1, 0); // MB_OKCANCEL
+
+    let r = user32::handle_message_box_a(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("MessageBoxA must dispatch");
+
+    assert_eq!(r.return_value, 2, "the bridge's id must reach the guest");
+    let calls = captured.lock().expect("bridge capture lock");
+    assert_eq!(calls.len(), 1, "the bridge must be called exactly once");
+    assert_eq!(calls[0].0, "editor", "caption decoded from ANSI");
+    assert_eq!(calls[0].1, "Unsaved changes", "text decoded from ANSI");
+    assert_eq!(calls[0].2, 0x1, "MB_OKCANCEL must pass through");
+}
+
+/// Every MB_* button/icon set reaches the bridge unchanged and the bridge's
+/// canned result (Ok/Cancel/Yes/No → the Win32 id) is what the guest sees.
+#[test]
+fn test_message_box_flag_sets_pass_through_and_results_map_to_ids() {
+    // (mb_type, canned bridge answer, expected guest return value).
+    let cases: &[(u32, i32, u64)] = &[
+        (0x00, 1, user32::IDOK),     // MB_OK → bridge answers Ok → IDOK
+        (0x01, 2, user32::IDCANCEL), // MB_OKCANCEL → Cancel → IDCANCEL
+        (0x04, 6, user32::IDYES),    // MB_YESNO → Yes → IDYES
+        (0x04, 7, user32::IDNO),     // MB_YESNO → No → IDNO
+        (0x03, 6, user32::IDYES),    // MB_YESNOCANCEL → Yes → IDYES
+        (0x03, 2, user32::IDCANCEL), // MB_YESNOCANCEL → Cancel → IDCANCEL
+        (0x10, 1, user32::IDOK),     // MB_ICONERROR
+        (0x20, 1, user32::IDOK),     // MB_ICONQUESTION
+        (0x30, 1, user32::IDOK),     // MB_ICONWARNING
+        (0x40, 1, user32::IDOK),     // MB_ICONINFORMATION
+    ];
+    for &(mb_type, canned, expected) in cases {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        let captured = Arc::new(Mutex::new(Vec::<(String, String, u32)>::new()));
+        register_message_box_bridge(&mut state, canned, Arc::clone(&captured));
+        write_guest_utf16(&mut engine, 0x6000, "text");
+        write_guest_utf16(&mut engine, 0x7000, "caption");
+        write_regs(&mut engine, 0, 0x6000, 0x7000, u64::from(mb_type), 0);
+
+        let r = user32::handle_message_box_w(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("MessageBoxW must dispatch");
+
+        assert_eq!(
+            r.return_value, expected,
+            "mb_type {mb_type:#06x} must surface the bridge's id"
+        );
+        let calls = captured.lock().expect("bridge capture lock");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].2, mb_type,
+            "mb_type {mb_type:#06x} must reach the bridge verbatim"
+        );
+    }
+}
+
+/// No bridge registered (headless runs, `trace`): the handler echoes to the
+/// host console and auto-returns IDOK so the guest never hangs.
+#[test]
+fn test_message_box_without_bridge_falls_back_to_idok() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    write_guest_utf16(&mut engine, 0x6000, "text");
+    write_guest_utf16(&mut engine, 0x7000, "caption");
+    write_regs(&mut engine, 0, 0x6000, 0x7000, 0x4, 0);
+
+    let r = user32::handle_message_box_w(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("MessageBoxW must dispatch without a bridge");
+
+    assert_eq!(
+        r.return_value,
+        user32::IDOK,
+        "headless fallback returns IDOK"
+    );
+}
+
 // --- Comctl32 ---
 
 #[test]
@@ -7131,6 +7277,98 @@ fn test_edit_em_emptyundobuffer_clears() {
     );
 }
 
+/// EM_CANUNDO parity through the real dispatch path, sending the RAW guest
+/// values (winuser.h): the host used to declare EM_CANUNDO as 0x00A6, so a
+/// guest's 0x00C6 never matched a dispatch arm and fell through to an
+/// unhandled zero. SetWindowText must also clear the undo buffer (Windows
+/// clears it on any program-set text).
+#[test]
+fn test_edit_em_canundo_parity_and_settext_clears_undo() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (_, edit) = push_edit_pair(&mut state);
+
+    // The raw 0x00C6 must reach the EM_CANUNDO arm (a fresh edit has nothing
+    // to undo). Pre-fix this fell through: dispatch returned None.
+    assert_eq!(
+        crate::user32::controls::dispatch_control_proc(&mut engine, &mut state, edit, 0x00C6, 0, 0)
+            .expect("dispatch ok")
+            .expect("0x00C6 must hit the EM_CANUNDO arm"),
+        0,
+        "a fresh edit has nothing to undo"
+    );
+
+    // An editable change (typing) captures a snapshot → TRUE.
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_CHAR,
+        u64::from(u32::from('X')),
+        0,
+    )
+    .expect_err("char delivers EN_CHANGE");
+    assert_eq!(
+        crate::user32::controls::dispatch_control_proc(&mut engine, &mut state, edit, 0x00C6, 0, 0)
+            .expect("dispatch ok")
+            .expect("0x00C6 must hit the EM_CANUNDO arm"),
+        1,
+        "an insert is undoable"
+    );
+
+    // EM_UNDO restores the text and consumes the snapshot → FALSE.
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_UNDO,
+        0,
+        0,
+    )
+    .expect_err("undo delivers EN_CHANGE");
+    assert_eq!(control_text(&state, edit), "hello");
+    assert_eq!(
+        crate::user32::controls::dispatch_control_proc(&mut engine, &mut state, edit, 0x00C6, 0, 0)
+            .expect("dispatch ok")
+            .expect("0x00C6 must hit the EM_CANUNDO arm"),
+        0,
+        "undo consumed the snapshot"
+    );
+
+    // SetWindowText (the raw WM_SETTEXT = 0x000C a SendMessage carries) must
+    // clear the undo buffer: edit again so a snapshot is pending, then set
+    // the text — EM_CANUNDO goes false.
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_CHAR,
+        u64::from(u32::from('Y')),
+        0,
+    )
+    .expect_err("char delivers EN_CHANGE");
+    assert_eq!(control_text(&state, edit), "Yhello");
+    write_guest_ansi(&mut engine, 0x4000, "fresh");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        0x000C,
+        0,
+        0x4000,
+    )
+    .expect("settext ok")
+    .expect("some result");
+    assert_eq!(control_text(&state, edit), "fresh");
+    assert_eq!(
+        crate::user32::controls::dispatch_control_proc(&mut engine, &mut state, edit, 0x00C6, 0, 0)
+            .expect("dispatch ok")
+            .expect("0x00C6 must hit the EM_CANUNDO arm"),
+        0,
+        "SetWindowText clears the undo buffer"
+    );
+}
+
 #[test]
 fn test_edit_wm_copy_stores_selection_on_clipboard() {
     let mut engine = test_engine();
@@ -10253,5 +10491,224 @@ fn test_send_message_setfont_on_wndproc_less_window_stores_font() {
         get.return_value,
         font.as_u64(),
         "SendMessage(WM_GETFONT) must return the stored HFONT"
+    );
+}
+
+/// A 32 px font created through the real CreateFontIndirectA dispatch — the
+/// fixture for the stored-font measurement tests (32 px vs the 16 px default
+/// makes the line-height math measurably different).
+fn push_32px_font(engine: &mut IcedCpu, state: &mut WinApiState) -> crate::handles::Hfont {
+    // LOGFONTA header fields at their Win64 offsets (lfHeight at 0, lfWeight
+    // at 16, lfCharSet at 23), face name char[32] at offset 28; |lfHeight|
+    // becomes the px height.
+    let logfont_ptr = 0x5000_u64;
+    engine
+        .mem_write(logfont_ptr, &(-32_i32).to_le_bytes())
+        .expect("write LOGFONTA.lfHeight");
+    engine
+        .mem_write(logfont_ptr + 16, &(400_i32).to_le_bytes())
+        .expect("write LOGFONTA.lfWeight");
+    engine
+        .mem_write(logfont_ptr + 23, &[1_u8])
+        .expect("write LOGFONTA.lfCharSet");
+    engine
+        .mem_write(logfont_ptr + 28, b"Segoe UI\0")
+        .expect("write LOGFONTA.lfFaceName");
+    write_regs(engine, logfont_ptr, 0, 0, 0, 0);
+    let id = crate::resolve_winapi_id("gdi32.dll", "CreateFontIndirectA")
+        .expect("CreateFontIndirectA must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(engine, test_environment(), state),
+        id,
+    )
+    .expect("CreateFontIndirectA must dispatch");
+    let font = crate::handles::Hfont::from(r.return_value);
+    assert_ne!(
+        font,
+        crate::handles::Hfont::NULL,
+        "CreateFontIndirectA must return an HFONT"
+    );
+    font
+}
+
+/// A WM_SETFONT'd 32 px font must drive the EDIT measurement paths — the
+/// scroll context (visible rows / WM_VSCROLL page), the click-to-caret hit
+/// test, EM_POSFROMCHAR's y, and the PgUp/PgDn page size — through the SAME
+/// stored-font resolution the paint path uses. Before the fix those four
+/// paths hardcoded the 16 px default, so a non-default font made the scroll
+/// math, the caret, and EM_POSFROMCHAR disagree with the painted text.
+#[test]
+fn test_wm_setfont_stored_font_drives_edit_measurements() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (_, edit) = push_multiline_edit(&mut state, "0\n1\n2\n3\n4\n5\n6\n7\n8\n9");
+    let font = push_32px_font(&mut engine, &mut state);
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_SETFONT,
+        font.as_u64(),
+        0,
+    )
+    .expect("setfont handled")
+    .expect("some result");
+
+    // The stored font's real line height — the metric the measurement paths
+    // must now resolve (the same helper the paint path uses).
+    let mut font_engine = crate::gdi32::FontEngine::default();
+    let (key, resolved) = crate::gdi32::window_font_resolution(&state, edit, &mut font_engine)
+        .expect("the stored font must resolve");
+    assert_eq!(key.family, "segoe ui", "the stored face name must resolve");
+    let line_h = resolved.line_height();
+    let default_line_h = font_engine
+        .resolve(&crate::gdi32::FontKey::default(), 16)
+        .expect("default font")
+        .line_height();
+    assert_ne!(
+        line_h, default_line_h,
+        "the 32 px fixture must measure differently from the 16 px default"
+    );
+
+    // A 3-line-tall client (3 × the STORED line height): 3 rows fit at 32 px
+    // where ~6 would fit at the 16 px default.
+    let ws = state.window_state();
+    if let Some(w) = ws
+        .windows
+        .iter_mut()
+        .find(|w| w.handle == crate::handles::Hwnd::from(edit))
+    {
+        w.height = line_h.saturating_mul(3);
+    }
+
+    // EM_POSFROMCHAR: line 1's y is one STORED-font line height, not 16.
+    let r = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_POSFROMCHAR,
+        2, // '1', line 1
+        0x4000,
+    )
+    .expect("posfromchar ok")
+    .expect("some result");
+    assert_eq!(r, 1, "EM_POSFROMCHAR returns TRUE for a valid index");
+    let mut bytes = [0_u8; 8];
+    engine.mem_read(0x4000, &mut bytes).expect("read point");
+    let y = i32::from_le_bytes(bytes[4..8].try_into().expect("y"));
+    assert_eq!(
+        y, line_h,
+        "EM_POSFROMCHAR y must use the stored line height"
+    );
+
+    // Click-to-caret: a y in the middle of row 1 (line '1') must land on that
+    // row's first char — with the 16 px default the same y lands a row lower.
+    dispatch_mouse(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::wm::WinMsg::WM_LBUTTONDOWN.as_u32(),
+        u16::try_from(2).unwrap_or(0),
+        u16::try_from(line_h + line_h / 2).unwrap_or(0),
+    );
+    assert_eq!(
+        control_ui(&state, edit).caret,
+        2,
+        "the click at row 1 must land on '1' (char 2) with the stored font"
+    );
+
+    // PgDn page size: client height / stored line height = 3 rows (the 16 px
+    // default would page ~6).
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_SETSEL,
+        0,
+        0,
+    )
+    .expect("setsel ok")
+    .expect("some result");
+    press_key(&mut engine, &mut state, edit, crate::user32::VK_NEXT);
+    assert_eq!(
+        control_ui(&state, edit).caret,
+        6, // line 3 ('3')
+        "PgDn must page by the stored font's line height"
+    );
+
+    // WM_VSCROLL SB_PAGEDOWN: the visible-row count from the stored font (3
+    // rows fit at 3×line_h) — the 16 px default would page ~6.
+    const SB_PAGEDOWN: u16 = 3;
+    assert_eq!(
+        vscroll_offset(&mut engine, &mut state, edit, SB_PAGEDOWN, 0),
+        3
+    );
+}
+
+/// WM_SETFONT with a non-zero redraw flag must enter the erase/paint cycle
+/// exactly like SetWindowPlacement and the resize path: invalidated AND a
+/// pending WM_ERASEBKGND (real Windows erases the background before the
+/// repaint). redraw=0 stores the font without requesting either.
+#[test]
+fn test_wm_setfont_redraw_erases_background() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (_, edit) = push_edit_pair(&mut state);
+    let font = state
+        .gdi_state()
+        .alloc_font("Segoe UI".to_owned(), -16, 400, false, 0);
+
+    // redraw=0: store the font, request no repaint at all.
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_SETFONT,
+        font.as_u64(),
+        0,
+    )
+    .expect("setfont handled")
+    .expect("some result");
+    let window = state
+        .window_state()
+        .windows
+        .iter()
+        .find(|w| w.handle == crate::handles::Hwnd::from(edit))
+        .expect("edit window must exist");
+    assert_eq!(window.font_handle, font);
+    assert!(
+        !window.invalidated,
+        "WM_SETFONT with redraw=0 must not invalidate"
+    );
+    assert!(
+        !window.flags.contains(WindowFlags::ERASE_BACKGROUND),
+        "WM_SETFONT with redraw=0 must not request an erase"
+    );
+
+    // redraw=1: real Windows sends WM_ERASEBKGND before the repaint, so the
+    // window must invalidate AND carry a pending erase.
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_SETFONT,
+        font.as_u64(),
+        1,
+    )
+    .expect("setfont handled")
+    .expect("some result");
+    let window = state
+        .window_state()
+        .windows
+        .iter()
+        .find(|w| w.handle == crate::handles::Hwnd::from(edit))
+        .expect("edit window must exist");
+    assert!(
+        window.invalidated,
+        "WM_SETFONT with redraw=1 must invalidate"
+    );
+    assert!(
+        window.flags.contains(WindowFlags::ERASE_BACKGROUND),
+        "WM_SETFONT with redraw=1 must request an erase like real Windows"
     );
 }

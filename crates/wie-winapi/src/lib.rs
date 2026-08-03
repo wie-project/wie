@@ -69,8 +69,8 @@ pub use state::{
     KeyboardState, MessageQueueIdlePolicy, ModuleHandle, ModuleState, OpenGuestFile, OuterReturn,
     PTHREAD_RETURN_TRAMPOLINE_VA, ProcessState, QueuedWindowMessage, RegistryKey,
     RegistryKeyHandle, ResourceHandle, ResourceRecord, TimerRecord, VirtualGuestFile,
-    WinApiControlSignal, WinApiEnvironment, WinApiState, WindowClassRecord, WindowRecord,
-    WindowState, WindowsHookRecord, pthread_return_trampoline_va,
+    WinApiControlSignal, WinApiEnvironment, WinApiState, WindowClassRecord, WindowFlags,
+    WindowRecord, WindowState, WindowsHookRecord, pthread_return_trampoline_va,
 };
 
 mod dispatch_table;

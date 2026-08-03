@@ -25,6 +25,8 @@ pub(crate) const FAKE_ICON_HANDLE: u64 = 0x0000_0000_6600_0001;
 pub(crate) const FAKE_CURSOR_HANDLE: u64 = 0x0000_0000_6600_0002;
 pub(crate) const IDOK: u64 = 1;
 pub(crate) const IDCANCEL: u64 = 2;
+pub(crate) const IDYES: u64 = 6;
+pub(crate) const IDNO: u64 = 7;
 
 pub(crate) const WM_MDICREATE: u32 = wm::WinMsg::WM_MDICREATE.as_u32();
 pub(crate) const FAKE_MONITOR_HANDLE: u64 = 0x0000_0000_6600_0010;

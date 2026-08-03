@@ -2,6 +2,7 @@
 
 use super::menu::{MenuNode, MenuTreeCache, build_menu_tree};
 use std::sync::Arc;
+use wie_winapi::WindowFlags;
 use wie_winapi::handles::Hmenu;
 
 /// Host-side handle to the WinAPI state for cross-thread access.
@@ -271,13 +272,29 @@ impl GuestHandle {
         }
     }
 
+    /// Set the host MessageBox bridge — called by the `MessageBoxA/W`
+    /// handlers with `(caption, text, mb_type)`; the returned Win32 id
+    /// (IDOK/IDCANCEL/IDYES/IDNO) is returned to the guest.
+    ///
+    /// Mirrors [`Self::set_wake`]: the GUI presenter registers the native-alert
+    /// callback here once at startup, and the guest thread invokes it from the
+    /// handler. The callback blocks until the user dismisses the alert (the
+    /// guest thread parks inside the handler), which is MessageBox semantics.
+    /// When no bridge is registered the handlers keep the console-echo + IDOK
+    /// fallback, so headless runs and `trace` never hang.
+    pub fn set_message_box_bridge(&self, cb: wie_winapi::present::MessageBoxBridge) {
+        if let Ok(mut state) = self.state.lock() {
+            state.present().message_box_bridge = Some(cb);
+        }
+    }
+
     /// Update the guest-visible window size (host window was resized).
     ///
-    /// Updates the `WindowRecord` only — three `i32` writes, no allocation.
-    /// Uses `try_lock` so the per-`Resized`-event hot path NEVER blocks on the
-    /// guest thread mid-API-call: if the record can't be locked right now,
-    /// the settled `WM_SIZE` carries the final size anyway (and the guest's
-    /// own `recreate_dib` reads `lParam`, not the record).
+    /// Updates the `WindowRecord` in place — no allocation.  Uses `try_lock`
+    /// so the per-`Resized`-event hot path NEVER blocks on the guest thread
+    /// mid-API-call: if the record can't be locked right now, the settled
+    /// `WM_SIZE` carries the final size anyway (and the guest's own
+    /// `recreate_dib` reads `lParam`, not the record).
     pub fn resize_window(&self, hwnd: u64, width: u32, height: u32) {
         let Ok(mut state) = self.state.try_lock() else {
             return;
@@ -288,6 +305,13 @@ impl GuestHandle {
             window.width = i32::try_from(width).unwrap_or(0);
             window.height = i32::try_from(height).unwrap_or(0);
             window.client_rect = (0, 0, window.width, window.height);
+            // The guest DIB is reallocated ZEROED on resize, so the resized
+            // window itself must enter the erase/paint cycle: the class-brush
+            // erase fills the reallocated surface before the guest paints.
+            // Mirrors the SetWindowPlacement show path (both flags, cb38299) —
+            // a bare WM_PAINT leaves the unpainted area black.
+            window.invalidated = true;
+            window.flags.insert(WindowFlags::ERASE_BACKGROUND);
         }
         // Invalidate the whole descendant subtree (children, grandchildren —
         // e.g. a dialog's buttons).  A WS_CLIPCHILDREN parent's own repaint is
@@ -504,6 +528,89 @@ mod tests {
             handle.take_host_geometry_request(),
             None,
             "take clears the slot so a stale move is never re-applied"
+        );
+    }
+
+    /// `resize_window` must put the RESIZED window itself into the
+    /// erase/paint cycle — the exact bug pattern behind the black-background
+    /// regression (gui_edit, notepad): the guest DIB is reallocated ZEROED on
+    /// resize, so any unpainted area uploads as black unless the class-brush
+    /// erase fills it first. The erase runs only when `ERASE_BACKGROUND` is
+    /// set; the SetWindowPlacement show path sets it (cb38299) but the resize
+    /// path only marked the subtree `invalidated`. Descendants keep
+    /// `invalidated` WITHOUT erase — the EDIT paints its own white background.
+    #[test]
+    fn resize_window_erases_background_of_the_resized_window() {
+        let process = wie_pe::ProcessIdentity {
+            module_file_name: "resize.exe".to_owned(),
+            module_path: r"C:\App\resize.exe".to_owned(),
+            current_directory: r"C:\App".to_owned(),
+            command_line: "resize.exe".to_owned(),
+        };
+        let mut winapi_state =
+            crate::memory::default_winapi_state(&DEFAULT_LAYOUT, Arc::new(Vec::new()), &process)
+                .expect("winapi state");
+        let top = 0x100_u64;
+        let child = 0x101_u64;
+        {
+            let ws = winapi_state.window_state();
+            ws.windows.push(wie_winapi::WindowRecord {
+                handle: wie_winapi::handles::Hwnd::from(top),
+                width: 640,
+                height: 420,
+                ..Default::default()
+            });
+            ws.windows.push(wie_winapi::WindowRecord {
+                handle: wie_winapi::handles::Hwnd::from(child),
+                parent_handle: wie_winapi::handles::Hwnd::from(top),
+                ..Default::default()
+            });
+        }
+        let handle = GuestHandle {
+            state: Arc::new(Mutex::new(winapi_state)),
+            queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+            menu_tree_cache: Arc::new(RwLock::new(None)),
+        };
+
+        handle.resize_window(top, 800, 600);
+
+        let mut state = handle.state.lock().expect("lock state");
+        let ws = state.window_state();
+        let top_record = ws
+            .windows
+            .iter()
+            .find(|w| w.handle == wie_winapi::handles::Hwnd::from(top))
+            .expect("top window record exists");
+        assert_eq!(
+            (top_record.width, top_record.height),
+            (800, 600),
+            "the resized window record must carry the new size"
+        );
+        assert!(
+            top_record.invalidated,
+            "the resized window itself must enter the repaint cycle"
+        );
+        assert!(
+            top_record
+                .flags
+                .contains(wie_winapi::WindowFlags::ERASE_BACKGROUND),
+            "the resized window must request a class-brush erase (the DIB was \
+             reallocated zeroed — without the erase the background stays black)"
+        );
+        let child_record = ws
+            .windows
+            .iter()
+            .find(|w| w.handle == wie_winapi::handles::Hwnd::from(child))
+            .expect("child window record exists");
+        assert!(
+            child_record.invalidated,
+            "a descendant must repaint itself after the ancestor surface grew"
+        );
+        assert!(
+            !child_record
+                .flags
+                .contains(wie_winapi::WindowFlags::ERASE_BACKGROUND),
+            "descendants paint their own background — no erase flag on the child"
         );
     }
 }

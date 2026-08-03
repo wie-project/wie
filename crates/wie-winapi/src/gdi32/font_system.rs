@@ -58,6 +58,9 @@ pub struct FontKey {
     pub weight: u16,
     /// Italic requested.
     pub italic: bool,
+    /// `lfPitchAndFamily` carries the FIXED_PITCH bit (0x01): prefer a
+    /// monospace face when the requested face is unavailable.
+    pub fixed_pitch: bool,
 }
 
 impl Default for FontKey {
@@ -66,6 +69,7 @@ impl Default for FontKey {
             family: String::new(),
             weight: 400,
             italic: false,
+            fixed_pitch: false,
         }
     }
 }
@@ -77,19 +81,25 @@ enum FamilySelection {
     Named(String),
 }
 
-/// Map a Win32 `lfFaceName` to a fontdb family selection.
+/// Map a Win32 `lfFaceName` + pitch hint to a fontdb family selection.
 ///
 /// Win32 "system" faces and the classic dialog fonts map to the generic
-/// sans-serif family; the legacy terminal faces to monospace; Times to serif.
-/// Anything else is tried as an exact face name (with a sans-serif fallback
-/// at query time).
+/// sans-serif family; the console faces (including Lucida Console, the
+/// notepad EDIT default) to monospace; Times to serif. Anything else is tried
+/// as an exact face name (with a sans-serif fallback at query time). When the
+/// LOGFONT's `lfPitchAndFamily` carries FIXED_PITCH (0x01) the fallback
+/// becomes monospace instead of the generic sans-serif.
 #[must_use]
-fn family_selection_for(face_name: &str) -> FamilySelection {
+fn family_selection_for(face_name: &str, fixed_pitch: bool) -> FamilySelection {
     match face_name.to_ascii_lowercase().as_str() {
         "" | "ms shell dlg" | "ms shell dlg 2" | "tahoma" | "segoe ui" | "system" => {
-            FamilySelection::Generic(Family::SansSerif)
+            FamilySelection::Generic(if fixed_pitch {
+                Family::Monospace
+            } else {
+                Family::SansSerif
+            })
         }
-        "courier new" | "terminal" | "fixedsys" | "consolas" => {
+        "lucida console" | "courier new" | "terminal" | "fixedsys" | "consolas" => {
             FamilySelection::Generic(Family::Monospace)
         }
         "times new roman" | "times" => FamilySelection::Generic(Family::Serif),
@@ -124,18 +134,27 @@ pub(crate) fn height_px_from_lf(lf_height: i32) -> i32 {
 /// had to fall back (so the rasterizer can emulate bold/italic).
 ///
 /// Returns `(face_id, fake_bold, fake_italic)`. Weight falls back 700 → 400;
-/// style falls back Italic → Oblique → Normal.
+/// style falls back Italic → Oblique → Normal. A named face that the database
+/// resolves keeps its exact resolution; on a miss it falls back to sans-serif
+/// — or monospace when the LOGFONT carried FIXED_PITCH.
 fn face_id_for(
     selection: &FamilySelection,
     weight: u16,
     italic: bool,
+    fixed_pitch: bool,
 ) -> Option<(fontdb::ID, bool, bool)> {
     let db = system_font_db();
     let families: Vec<Family<'_>> = match selection {
         FamilySelection::Generic(family) => vec![*family],
         FamilySelection::Named(name) => {
-            // Exact name first; a generic sans-serif is the last resort.
-            vec![Family::Name(name), Family::SansSerif]
+            // Exact name first; a generic family is the last resort. A
+            // FIXED_PITCH request falls back to monospace, not sans-serif.
+            let fallback = if fixed_pitch {
+                Family::Monospace
+            } else {
+                Family::SansSerif
+            };
+            vec![Family::Name(name), fallback]
         }
     };
     let weights: &[u16] = if weight >= 600 { &[700, 400] } else { &[400] };
@@ -331,8 +350,9 @@ impl FontEngine {
             self.resolved_cache.insert(cache_key, resolved.clone());
             return Some(resolved);
         }
-        let selection = family_selection_for(&key.family);
-        let (id, fake_bold, fake_italic) = face_id_for(&selection, key.weight, key.italic)?;
+        let selection = family_selection_for(&key.family, key.fixed_pitch);
+        let (id, fake_bold, fake_italic) =
+            face_id_for(&selection, key.weight, key.italic, key.fixed_pitch)?;
         let font = load_face(id)?;
         self.font_cache
             .insert(key.clone(), (font.clone(), fake_bold, fake_italic));
@@ -449,7 +469,7 @@ impl FontEngine {
         let mut result = None;
         for family in FALLBACK_FAMILIES {
             let selection = FamilySelection::Named((*family).to_owned());
-            if let Some((id, _, _)) = face_id_for(&selection, 400, false)
+            if let Some((id, _, _)) = face_id_for(&selection, 400, false, false)
                 && let Some(font) = load_face(id)
                 && font.as_scaled(PxScale::from(16.0)).glyph_id(ch).0 != 0
             {
@@ -505,7 +525,10 @@ fn build_resolved(
 
 #[cfg(test)]
 mod tests {
-    use super::{FontEngine, FontKey, family_selection_for, fontdb_weight_for, height_px_from_lf};
+    use super::{
+        FontEngine, FontKey, face_id_for, family_selection_for, fontdb_weight_for,
+        height_px_from_lf,
+    };
     use fontdb::Family;
 
     /// Resolve the default 16 px font (skips when system fonts are absent).
@@ -637,15 +660,22 @@ mod tests {
             "System",
         ] {
             assert_eq!(
-                family_selection_for(name),
+                family_selection_for(name, false),
                 super::FamilySelection::Generic(Family::SansSerif),
                 "face {name:?} must map to the generic sans-serif"
             );
         }
-        // Legacy terminal faces → monospace.
-        for name in ["Courier New", "Terminal", "Fixedsys", "Consolas"] {
+        // Console faces → monospace (Lucida Console is the notepad EDIT
+        // default — audit finding #6).
+        for name in [
+            "Lucida Console",
+            "Courier New",
+            "Terminal",
+            "Fixedsys",
+            "Consolas",
+        ] {
             assert_eq!(
-                family_selection_for(name),
+                family_selection_for(name, false),
                 super::FamilySelection::Generic(Family::Monospace),
                 "face {name:?} must map to the generic monospace"
             );
@@ -653,19 +683,143 @@ mod tests {
         // Times → serif.
         for name in ["Times New Roman", "Times"] {
             assert_eq!(
-                family_selection_for(name),
+                family_selection_for(name, false),
                 super::FamilySelection::Generic(Family::Serif),
                 "face {name:?} must map to the generic serif"
             );
         }
         // Anything else is an exact (lowercased) face name.
         assert_eq!(
-            family_selection_for("Arial"),
+            family_selection_for("Arial", false),
             super::FamilySelection::Named("arial".to_owned())
         );
         assert_eq!(
-            family_selection_for("PingFang SC"),
+            family_selection_for("PingFang SC", false),
             super::FamilySelection::Named("pingfang sc".to_owned())
+        );
+    }
+
+    #[test]
+    fn fixed_pitch_faces_fall_back_to_monospace() {
+        // A known console face with FIXED_PITCH → monospace (not the
+        // sans-serif fallback the engine used before the fix).
+        for name in ["Lucida Console", "Consolas"] {
+            assert_eq!(
+                family_selection_for(name, true),
+                super::FamilySelection::Generic(Family::Monospace),
+                "console face {name:?} with FIXED_PITCH must map to monospace"
+            );
+        }
+        // The FIXED_PITCH bit on a system face selects the monospace default.
+        for name in ["", "MS Shell Dlg", "Segoe UI"] {
+            assert_eq!(
+                family_selection_for(name, true),
+                super::FamilySelection::Generic(Family::Monospace),
+                "system face {name:?} with FIXED_PITCH must fall back to monospace"
+            );
+        }
+    }
+
+    #[test]
+    fn ms_shell_dlg_default_remains_sans_serif() {
+        // The default dialog font path is untouched: no pitch hint keeps the
+        // generic sans-serif mapping.
+        assert_eq!(
+            family_selection_for("MS Shell Dlg", false),
+            super::FamilySelection::Generic(Family::SansSerif)
+        );
+    }
+
+    #[test]
+    fn fixed_pitch_keeps_resolvable_named_faces() {
+        // FIXED_PITCH must NOT force the generic monospace fallback when the
+        // requested named face actually resolves — the exact face wins and
+        // the fallback only kicks in on a miss. Tested at the face query
+        // level with the canonical (capitalized) name: the engine's `Named`
+        // branch lowercases, and fontdb matches family names case-sensitively
+        // (pre-existing behavior), so the engine path always misses.
+        let named = super::FamilySelection::Named("Helvetica".to_owned());
+        let Some((with, _, _)) = face_id_for(&named, 400, false, true) else {
+            return; // Helvetica not installed — nothing to prove
+        };
+        let Some((without, _, _)) = face_id_for(&named, 400, false, false) else {
+            return;
+        };
+        assert_eq!(
+            with, without,
+            "a resolvable named face must resolve identically with FIXED_PITCH"
+        );
+    }
+
+    #[test]
+    fn fixed_pitch_named_miss_falls_back_to_monospace() {
+        // A named face that misses the database falls back to the generic
+        // monospace with FIXED_PITCH — and to sans-serif without it.
+        let unknown = super::FamilySelection::Named("definitely-not-a-face".to_owned());
+        let Some((mono_id, _, _)) = face_id_for(
+            &super::FamilySelection::Generic(Family::Monospace),
+            400,
+            false,
+            false,
+        ) else {
+            return; // no monospace font on this system
+        };
+        let Some((sans_id, _, _)) = face_id_for(
+            &super::FamilySelection::Generic(Family::SansSerif),
+            400,
+            false,
+            false,
+        ) else {
+            return;
+        };
+        let Some((with, _, _)) = face_id_for(&unknown, 400, false, true) else {
+            return;
+        };
+        let Some((without, _, _)) = face_id_for(&unknown, 400, false, false) else {
+            return;
+        };
+        assert_eq!(
+            with, mono_id,
+            "a FIXED_PITCH miss must fall back to the generic monospace"
+        );
+        assert_eq!(
+            without, sans_id,
+            "a plain miss keeps the generic sans-serif fallback"
+        );
+    }
+
+    #[test]
+    fn lucida_console_maps_to_monospace() {
+        // Audit finding #6: notepad's EDIT uses Lucida Console (the default
+        // face in every RNotepad language file) with FIXED_PITCH. Before the
+        // fix this fell through to a `Named` lookup → fontdb miss → the
+        // generic sans-serif fallback (proportional text in the EDIT).
+        assert_eq!(
+            family_selection_for("Lucida Console", true),
+            super::FamilySelection::Generic(Family::Monospace),
+            "Lucida Console must map to the generic monospace"
+        );
+    }
+
+    #[test]
+    fn lucida_console_resolves_to_a_monospace_face() {
+        let mut engine = FontEngine::default();
+        let key = FontKey {
+            family: "lucida console".to_owned(),
+            weight: 400,
+            italic: false,
+            fixed_pitch: true,
+        };
+        let Some(resolved) = engine.resolve(&key, 16) else {
+            return; // no system fonts — nothing to resolve
+        };
+        // A monospace face advances every printable ASCII glyph equally: the
+        // average of 'x'/'m' equals the widest advance. A proportional
+        // sans-serif fallback (the pre-fix behavior) has max > avg.
+        assert_eq!(
+            resolved.avg_advance, resolved.max_advance,
+            "Lucida Console must resolve to a monospace face (avg {} max {})",
+            resolved.avg_advance, resolved.max_advance
         );
     }
 

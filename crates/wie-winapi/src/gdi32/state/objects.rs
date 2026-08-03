@@ -284,6 +284,10 @@ fn handle_create_font_impl(
     // arg 9 (`iCharSet`) at [rsp+0x48].
     let charset_raw = read_guest_u32(engine, checked_field_address(rsp, 0x48, "iCharSet"))
         .with_context(|| format!("failed to read {api_name} iCharSet"))?;
+    // arg 13 (`iPitchAndFamily`) at [rsp+0x68]; low byte is the pitch hint.
+    let pitch_and_family =
+        read_guest_u32(engine, checked_field_address(rsp, 0x68, "iPitchAndFamily"))
+            .with_context(|| format!("failed to read {api_name} iPitchAndFamily"))?;
     let face_name_ptr = read_guest_u64(engine, checked_field_address(rsp, 0x70, "pszFaceName"))
         .with_context(|| format!("failed to read {api_name} pszFaceName"))?;
 
@@ -298,10 +302,12 @@ fn handle_create_font_impl(
     let weight = fontdb_weight_for(i32::from_le_bytes(weight_raw.to_le_bytes()));
     let italic = italic_raw != 0;
     let charset = u8::try_from(charset_raw & 0xFF).unwrap_or(0);
+    let pitch = u8::try_from(pitch_and_family & 0xFF).unwrap_or(0);
 
     let handle = state
         .gdi_state()
         .alloc_font(face_name.clone(), height, weight, italic, charset);
+    state.gdi_state().set_font_pitch(handle, pitch);
 
     tracing::debug!(
         handle = handle.as_u64(),
@@ -309,6 +315,7 @@ fn handle_create_font_impl(
         weight,
         italic,
         charset,
+        pitch,
         face_name,
         api_name
     );
@@ -383,6 +390,13 @@ fn handle_create_font_indirect_impl(
             .with_context(|| format!("failed to read {api_name}.lfItalic"))?;
     let charset = read_guest_u8(engine, checked_field_address(logfont_ptr, 23, "lfCharSet"))
         .with_context(|| format!("failed to read {api_name}.lfCharSet"))?;
+    // BYTE lfPitchAndFamily; offset 27 — the pitch hint steers the monospace
+    // fallback for faces the font engine cannot resolve exactly.
+    let pitch = read_guest_u8(
+        engine,
+        checked_field_address(logfont_ptr, 27, "lfPitchAndFamily"),
+    )
+    .with_context(|| format!("failed to read {api_name}.lfPitchAndFamily"))?;
     let face_name_ptr = checked_field_address(logfont_ptr, 28, "lfFaceName");
     let face_name = if wide {
         read_guest_utf16_lossy(engine, face_name_ptr, 32)
@@ -396,6 +410,7 @@ fn handle_create_font_indirect_impl(
     let handle = state
         .gdi_state()
         .alloc_font(face_name.clone(), height, weight, italic, charset);
+    state.gdi_state().set_font_pitch(handle, pitch);
 
     tracing::debug!(
         handle = handle.as_u64(),
@@ -403,6 +418,7 @@ fn handle_create_font_indirect_impl(
         weight,
         italic,
         charset,
+        pitch,
         face_name,
         api_name
     );
@@ -455,16 +471,23 @@ pub(crate) fn window_font_resolution(
     // font table (NULL / never set / stale / foreign) — resolves the system
     // default: sans-serif, 16 px, regular. A bad handle must never fail the
     // whole control paint.
-    let (family, height, weight, italic) = state
+    let (family, height, weight, italic, fixed_pitch) = state
         .try_gdi_state()
         .and_then(|gdi| gdi.find_font(stored))
-        .map_or((String::new(), 0, 400, false), |font| {
-            (font.family.clone(), font.height, font.weight, font.italic)
+        .map_or((String::new(), 0, 400, false, false), |font| {
+            (
+                font.family.clone(),
+                font.height,
+                font.weight,
+                font.italic,
+                font.pitch & 0x01 != 0,
+            )
         });
     let key = FontKey {
         family: family.to_ascii_lowercase(),
         weight,
         italic,
+        fixed_pitch,
     };
     let resolved = font_engine.resolve(&key, height_px_from_lf(height))?;
     Some((key, resolved))
@@ -481,17 +504,24 @@ fn resolve_stored_font(
     font_engine: &mut FontEngine,
 ) -> Option<(FontKey, ResolvedFont)> {
     let gdi = state.try_gdi_state()?;
-    let (family, height, weight, italic) = match font_handle {
+    let (family, height, weight, italic, fixed_pitch) = match font_handle {
         Some(font_handle) => {
             let font = gdi.find_font(font_handle)?;
-            (font.family.clone(), font.height, font.weight, font.italic)
+            (
+                font.family.clone(),
+                font.height,
+                font.weight,
+                font.italic,
+                font.pitch & 0x01 != 0,
+            )
         }
-        None => (String::new(), 0, 400, false),
+        None => (String::new(), 0, 400, false, false),
     };
     let key = FontKey {
         family: family.to_ascii_lowercase(),
         weight,
         italic,
+        fixed_pitch,
     };
     let resolved = font_engine.resolve(&key, height_px_from_lf(height))?;
     Some((key, resolved))

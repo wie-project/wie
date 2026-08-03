@@ -720,6 +720,10 @@ pub fn handle_set_window_text_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
             if window.control_kind.is_some() {
                 window.control_text = text;
                 window.invalidated = true;
+                // Real Windows clears an EDIT's undo buffer when the program
+                // sets the text — WM_UNDO must not revert past it (the
+                // WM_SETTEXT dispatch arm does the same).
+                crate::user32::controls::edit_clear_undo_buffer(state, window_handle);
             } else {
                 window.title = text;
             }
@@ -761,6 +765,9 @@ pub fn handle_set_window_text_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
             if window.control_kind.is_some() {
                 window.control_text = text;
                 window.invalidated = true;
+                // SetWindowText clears an EDIT's undo buffer (see the ANSI
+                // variant above).
+                crate::user32::controls::edit_clear_undo_buffer(state, window_handle);
             } else {
                 window.title = text;
             }
@@ -923,7 +930,10 @@ fn resolve_window_text(state: &mut WinApiState, window_handle: u64) -> String {
 /// WM_SETFONT (DefWindowProc semantics): store `font_handle` on the window so
 /// the paint paths draw its text with the guest-selected font, and mark the
 /// window invalidated when `redraw` is non-zero (the next repaint cycle then
-/// re-renders with the new font). Callers return the WM_SETFONT result (0).
+/// re-renders with the new font). Real Windows sends WM_ERASEBKGND before that
+/// repaint, so a redraw also requests the pending erase — the same idiom
+/// SetWindowPlacement and the resize path use. Callers return the WM_SETFONT
+/// result (0).
 ///
 /// Shared by the control dispatch (`dispatch_control_proc`), `DefWindowProc`,
 /// and the no-WndProc `SendMessage` fallthrough so ANY window — control or
@@ -933,6 +943,7 @@ pub(crate) fn set_window_font(state: &mut WinApiState, hwnd: u64, font_handle: u
         window.font_handle = crate::handles::Hfont::from(font_handle);
         if redraw != 0 {
             window.invalidated = true;
+            window.flags.insert(WindowFlags::ERASE_BACKGROUND);
         }
     }
 }

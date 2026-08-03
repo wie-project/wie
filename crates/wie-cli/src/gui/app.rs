@@ -759,6 +759,42 @@ impl ApplicationHandler<WieEvent> for WieApp {
     }
 }
 
+/// Map Win32 `MB_*` flag bits to rfd's dialog shape.
+///
+/// The low nibble selects the button set, the next nibble the icon. rfd has no
+/// `Question` level, so `MB_ICONQUESTION` falls back to `Info`. Unknown bits
+/// fall back to the MB_OK / no-icon defaults, matching real MessageBox.
+#[cfg(target_os = "macos")]
+fn map_message_box_buttons(mb_type: u32) -> (rfd::MessageButtons, rfd::MessageLevel) {
+    let buttons = match mb_type & 0x0F {
+        0x1 => rfd::MessageButtons::OkCancel,
+        0x3 => rfd::MessageButtons::YesNoCancel,
+        0x4 => rfd::MessageButtons::YesNo,
+        _ => rfd::MessageButtons::Ok, // 0x0 = MB_OK
+    };
+    let level = match mb_type & 0xF0 {
+        0x10 => rfd::MessageLevel::Error,
+        0x30 => rfd::MessageLevel::Warning,
+        0x40 => rfd::MessageLevel::Info,
+        // 0x20 = MB_ICONQUESTION and 0x00 = no icon both read as Info.
+        _ => rfd::MessageLevel::Info,
+    };
+    (buttons, level)
+}
+
+/// Map an rfd alert result to the Win32 id the guest expects
+/// (IDOK=1, IDCANCEL=2, IDYES=6, IDNO=7).
+#[cfg(target_os = "macos")]
+fn map_alert_result(result: rfd::MessageDialogResult) -> i32 {
+    match result {
+        rfd::MessageDialogResult::Ok => 1,
+        rfd::MessageDialogResult::Cancel => 2,
+        rfd::MessageDialogResult::Yes => 6,
+        rfd::MessageDialogResult::No => 7,
+        rfd::MessageDialogResult::Custom(_) => 2,
+    }
+}
+
 /// Run the guest with a winit window.
 ///
 /// `input_script` is a parsed input-script path (see
@@ -811,6 +847,26 @@ pub fn run_gui_windowed(
                             }));
                         }
 
+                        // Register the native-alert MessageBox bridge. rfd shows
+                        // an NSAlert (dispatched to the main thread; the guest
+                        // thread blocks until the user clicks — MessageBox
+                        // semantics) and maps the result to the Win32 id.
+                        #[cfg(target_os = "macos")]
+                        handle.set_message_box_bridge(Box::new(|caption, text, mb_type| {
+                            tracing::info!(
+                                target: "wiegui",
+                                "MessageBox: {caption}: {text} (type 0x{mb_type:x})"
+                            );
+                            let (buttons, level) = map_message_box_buttons(mb_type);
+                            let result = rfd::MessageDialog::new()
+                                .set_title(caption.to_owned())
+                                .set_description(text.to_owned())
+                                .set_level(level)
+                                .set_buttons(buttons)
+                                .show();
+                            map_alert_result(result)
+                        }));
+
                         let _ = tx.send(handle);
 
                         // Run the guest.
@@ -852,4 +908,86 @@ pub fn run_gui_windowed(
     event_loop
         .run_app(&mut app)
         .map_err(|e| anyhow::anyhow!("event loop: {e}"))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::{map_alert_result, map_message_box_buttons};
+
+    /// `MB_*` button bits select the rfd button set; the bridge receives the
+    /// raw flag word, so this mapping is the winapi crate's documented seam.
+    #[test]
+    fn map_message_box_buttons_selects_button_set() {
+        assert!(matches!(
+            map_message_box_buttons(0x00).0,
+            rfd::MessageButtons::Ok
+        ));
+        assert!(matches!(
+            map_message_box_buttons(0x01).0,
+            rfd::MessageButtons::OkCancel
+        ));
+        assert!(matches!(
+            map_message_box_buttons(0x04).0,
+            rfd::MessageButtons::YesNo
+        ));
+        assert!(matches!(
+            map_message_box_buttons(0x03).0,
+            rfd::MessageButtons::YesNoCancel
+        ));
+        // Icon bits must not disturb the button set.
+        assert!(matches!(
+            map_message_box_buttons(0x04 | 0x20).0,
+            rfd::MessageButtons::YesNo
+        ));
+        // Unknown button bits fall back to Ok.
+        assert!(matches!(
+            map_message_box_buttons(0x02).0,
+            rfd::MessageButtons::Ok
+        ));
+    }
+
+    /// `MB_ICON*` bits select the rfd level. rfd has no Question level, so
+    /// MB_ICONQUESTION reads as Info.
+    #[test]
+    fn map_message_box_buttons_selects_level() {
+        assert!(matches!(
+            map_message_box_buttons(0x10).1,
+            rfd::MessageLevel::Error
+        ));
+        assert!(matches!(
+            map_message_box_buttons(0x30).1,
+            rfd::MessageLevel::Warning
+        ));
+        assert!(matches!(
+            map_message_box_buttons(0x40).1,
+            rfd::MessageLevel::Info
+        ));
+        assert!(matches!(
+            map_message_box_buttons(0x20).1,
+            rfd::MessageLevel::Info
+        ));
+        // No icon bits (plain MB_OK) also reads as Info.
+        assert!(matches!(
+            map_message_box_buttons(0x00).1,
+            rfd::MessageLevel::Info
+        ));
+    }
+
+    /// The user's alert choice maps to the Win32 id the guest sees.
+    #[test]
+    fn map_alert_result_maps_to_win32_ids() {
+        assert_eq!(map_alert_result(rfd::MessageDialogResult::Ok), 1, "IDOK");
+        assert_eq!(
+            map_alert_result(rfd::MessageDialogResult::Cancel),
+            2,
+            "IDCANCEL"
+        );
+        assert_eq!(map_alert_result(rfd::MessageDialogResult::Yes), 6, "IDYES");
+        assert_eq!(map_alert_result(rfd::MessageDialogResult::No), 7, "IDNO");
+        assert_eq!(
+            map_alert_result(rfd::MessageDialogResult::Custom("x".to_owned())),
+            2,
+            "an unknown custom result cancels"
+        );
+    }
 }

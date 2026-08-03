@@ -40,6 +40,10 @@ winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 # tree as a wgpu dependency).
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = { version = "0.19.3", default-features = false, features = [] }
+# Native alerts for MessageBoxA/W. default-features off: the defaults are
+# Linux-only extras (wayland + xdg-portal) that only pollute the lockfile and
+# feature graph; the macOS backend (objc2-app-kit + block2) is unconditional.
+rfd = { version = "0.17", default-features = false }
 wgpu = { version = "30", default-features = false, features = ["metal", "wgsl"] }
 pollster = { version = "1.0" }
 bytemuck = { version = "1" }

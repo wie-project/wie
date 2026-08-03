@@ -345,78 +345,131 @@ pub fn handle_register_class_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     })
 }
 /// Handles `USER32.dll!MessageBoxW`.
+///
+/// A host-registered bridge (`GuestHandle::set_message_box_bridge`, the GUI
+/// presenter's rfd native alert) shows the message and returns the Win32 id
+/// the user chose; the guest thread blocks until then, which is correct
+/// MessageBox semantics. Without a bridge (headless runs, `trace`) the message
+/// echoes to the host console and the handler returns IDOK so no guest ever
+/// hangs on a missing host.
 pub fn handle_message_box_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let _window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for MessageBoxW")?;
+    let (caption, text, message_box_type) = {
+        let engine = &mut *ctx.engine;
+        let _window_handle = engine
+            .read_rcx()
+            .context("failed to read RCX for MessageBoxW")?;
 
-    let text_ptr = engine
-        .read_rdx()
-        .context("failed to read RDX for MessageBoxW")?;
+        let text_ptr = engine
+            .read_rdx()
+            .context("failed to read RDX for MessageBoxW")?;
 
-    let caption_ptr = engine
-        .read_r8()
-        .context("failed to read R8 for MessageBoxW")?;
+        let caption_ptr = engine
+            .read_r8()
+            .context("failed to read R8 for MessageBoxW")?;
 
-    let _message_box_type = engine
-        .read_r9()
-        .context("failed to read R9 for MessageBoxW")?;
+        let message_box_type_raw = engine
+            .read_r9()
+            .context("failed to read R9 for MessageBoxW")?;
 
-    let text = read_guest_utf16_lossy(engine, text_ptr, 1024)
-        .context("failed to read MessageBoxW text")?;
+        let text = read_guest_utf16_lossy(engine, text_ptr, 1024)
+            .context("failed to read MessageBoxW text")?;
 
-    let caption = read_guest_utf16_lossy(engine, caption_ptr, 256)
-        .context("failed to read MessageBoxW caption")?;
+        let caption = read_guest_utf16_lossy(engine, caption_ptr, 256)
+            .context("failed to read MessageBoxW caption")?;
 
-    tracing::info!(caption = %caption, text = %text, "MessageBoxW");
-    // Always surface guest error UI on host console (7z bring-up).
-    eprintln!("[MessageBoxW] {caption}: {text}");
+        (
+            caption,
+            text,
+            u32::try_from(message_box_type_raw).unwrap_or(0),
+        )
+    };
 
-    let return_address = engine
-        .return_from_win64_api(IDOK)
+    tracing::info!(caption = %caption, text = %text, message_box_type, "MessageBoxW");
+    let win32_id = message_box_result(ctx, &caption, &text, message_box_type, "MessageBoxW");
+
+    let return_address = ctx
+        .engine
+        .return_from_win64_api(win32_id)
         .context("failed to return from MessageBoxW")?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: IDOK,
+        return_value: win32_id,
     })
 }
 /// Handles `USER32.dll!MessageBoxA`.
 pub fn handle_message_box_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let _window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for MessageBoxA")?;
+    let (caption, text, message_box_type) = {
+        let engine = &mut *ctx.engine;
+        let _window_handle = engine
+            .read_rcx()
+            .context("failed to read RCX for MessageBoxA")?;
 
-    let text_ptr = engine
-        .read_rdx()
-        .context("failed to read RDX for MessageBoxA")?;
+        let text_ptr = engine
+            .read_rdx()
+            .context("failed to read RDX for MessageBoxA")?;
 
-    let caption_ptr = engine
-        .read_r8()
-        .context("failed to read R8 for MessageBoxA")?;
+        let caption_ptr = engine
+            .read_r8()
+            .context("failed to read R8 for MessageBoxA")?;
 
-    let _message_box_type = engine
-        .read_r9()
-        .context("failed to read R9 for MessageBoxA")?;
+        let message_box_type_raw = engine
+            .read_r9()
+            .context("failed to read R9 for MessageBoxA")?;
 
-    let text =
-        read_guest_ansi_lossy(engine, text_ptr, 1024).context("failed to read MessageBoxA text")?;
+        let text = read_guest_ansi_lossy(engine, text_ptr, 1024)
+            .context("failed to read MessageBoxA text")?;
 
-    let caption = read_guest_ansi_lossy(engine, caption_ptr, 256)
-        .context("failed to read MessageBoxA caption")?;
+        let caption = read_guest_ansi_lossy(engine, caption_ptr, 256)
+            .context("failed to read MessageBoxA caption")?;
 
-    tracing::info!(caption = %caption, text = %text, "MessageBoxA");
+        (
+            caption,
+            text,
+            u32::try_from(message_box_type_raw).unwrap_or(0),
+        )
+    };
 
-    let return_address = engine
-        .return_from_win64_api(IDOK)
+    tracing::info!(caption = %caption, text = %text, message_box_type, "MessageBoxA");
+    let win32_id = message_box_result(ctx, &caption, &text, message_box_type, "MessageBoxA");
+
+    let return_address = ctx
+        .engine
+        .return_from_win64_api(win32_id)
         .context("failed to return from MessageBoxA")?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: IDOK,
+        return_value: win32_id,
     })
+}
+
+/// Route a decoded MessageBox to the host bridge, or the console-echo fallback.
+///
+/// The `mb_type` argument passes through verbatim — the host bridge (wie-cli,
+/// where rfd lives) maps MB_* flag bits to its button/level sets, keeping rfd
+/// types out of this crate. The bridge's returned Win32 id (already the id the
+/// guest expects) is handed back; without a bridge the message echoes to the
+/// host console (7z bring-up behavior) and the handler auto-answers IDOK.
+fn message_box_result(
+    ctx: &mut HandlerContext<'_>,
+    caption: &str,
+    text: &str,
+    message_box_type: u32,
+    api_name: &str,
+) -> u64 {
+    if let Some(bridge) = ctx
+        .state
+        .try_present()
+        .and_then(|present| present.message_box_bridge.as_ref())
+    {
+        let win32_id = bridge(caption, text, message_box_type);
+        return u64::try_from(i64::from(win32_id)).unwrap_or(IDOK);
+    }
+    // Always surface guest error UI on host console (7z bring-up); no bridge
+    // means headless/trace — auto-OK so the guest never hangs.
+    eprintln!("[{api_name}] {caption}: {text}");
+    IDOK
 }
 /// Handles dynamic `USER32.dll!SetProcessDPIAware`.
 pub fn handle_set_process_dpi_aware(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {

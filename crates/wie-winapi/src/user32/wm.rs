@@ -94,7 +94,9 @@ impl WinMsg {
     pub const EM_GETSEL: Self = Self(0x00B0);
     pub const EM_SETSEL: Self = Self(0x00B1);
     /// Undo state (Task 2.6): EM_CANUNDO — whether a snapshot is pending.
-    pub const EM_CANUNDO: Self = Self(0x00A6);
+    /// winuser.h value 0x00C6 (was mistakenly declared 0x00A6, so a guest's
+    /// EM_CANUNDO never matched a dispatch arm and fell through to 0).
+    pub const EM_CANUNDO: Self = Self(0x00C6);
     // Multiline EDIT messages (Task 2.1). The line-metric messages operate on
     // the host `String` with `\n` as the internal separator.
     pub const EM_SCROLLCARET: Self = Self(0x00B7);

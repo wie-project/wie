@@ -112,6 +112,12 @@ pub struct WindowSurface {
     pub pixels: Vec<u32>,
 }
 
+/// Host MessageBox callback: `(caption, text, mb_type)` → Win32 id.
+///
+/// Registered by the GUI presenter via `GuestHandle::set_message_box_bridge`;
+/// invoked by the `MessageBoxA/W` handlers on the guest thread.
+pub type MessageBoxBridge = Box<dyn Fn(&str, &str, u32) -> i32 + Send>;
+
 /// Manages per-window compositing surfaces and frame publishing.
 pub struct PresentState {
     /// Persistent composite surface per HWND (scratch buffer for accumulating blits).
@@ -125,6 +131,16 @@ pub struct PresentState {
     pub generation: u64,
     /// Optional wake callback for the host presenter.
     pub wake: Option<Box<dyn Fn() + Send>>,
+    /// Optional host MessageBox bridge, registered by the GUI presenter.
+    ///
+    /// When set, the `MessageBoxA/W` handlers call it with
+    /// `(caption, text, mb_type)` and return its Win32 id (IDOK/IDCANCEL/
+    /// IDYES/IDNO) to the guest. The bridge runs on the guest thread and
+    /// blocks until the host alert is dismissed — correct MessageBox
+    /// semantics. When unset (headless runs, `trace`) the handlers keep the
+    /// console-echo + IDOK fallback so no guest ever hangs. Mirrors `wake`:
+    /// the host stores the callback here and the winapi layer invokes it.
+    pub message_box_bridge: Option<MessageBoxBridge>,
     /// Signal for headless mode.
     pub(crate) record: Option<Box<SurfaceFrame>>,
     /// B9: number of published frames (frame timing enabled only).
@@ -168,6 +184,10 @@ impl std::fmt::Debug for PresentState {
             .field("published_count", &self.published.len())
             .field("generation", &self.generation)
             .field("wake_is_set", &self.wake.is_some())
+            .field(
+                "message_box_bridge_is_set",
+                &self.message_box_bridge.is_some(),
+            )
             .field("record_is_set", &self.record.is_some())
             .field("frames_published", &self.frames_published)
             .field("hand_back_unwrap", &self.hand_back_unwrap)
@@ -192,6 +212,7 @@ impl PresentState {
             published: ahash::HashMap::new(),
             generation: 0,
             wake: None,
+            message_box_bridge: None,
             record: None,
             frames_published: 0,
             hand_back_unwrap: 0,

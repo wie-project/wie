@@ -53,6 +53,9 @@ pub(crate) use edit::{
     VisibleSegment, clamp_scroll_offset, edit_char_index_at_point, layout_visible_lines,
     visible_line_count,
 };
+// The no-create undo-buffer clear is called from the SetWindowText handlers
+// in `user32::window` (they write control text outside the control dispatch).
+pub(crate) use edit::edit_clear_undo_buffer;
 
 /// `GetSysColor(COLOR_BTNFACE)` — the standard push-button face.
 const COLOR_BTNFACE: u32 = 0x00F0_F0F0;
@@ -581,8 +584,11 @@ impl ControlClassKind {
                     window.invalidated = true;
                 }
                 // The text changed: an EDIT's cached EM_GETHANDLE buffer is
-                // stale (the old handle is the guest's to LocalFree).
+                // stale (the old handle is the guest's to LocalFree), and the
+                // undo buffer is dropped — real Windows never lets WM_UNDO
+                // revert past program-set text.
                 edit_invalidate_text_buffer(state, hwnd);
+                edit_clear_undo_buffer(state, hwnd);
                 Ok(Some(1))
             }
             (ControlClassKind::Edit, WinMsg::WM_GETDLGCODE) => Ok(Some(DLGC_WANTCHARS)),
