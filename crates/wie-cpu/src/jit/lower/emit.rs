@@ -16,11 +16,11 @@ use super::{
 use super::super::block::{BlockStackPinPlan, BlockTerm, DecodedInsn, is_string_op};
 use super::super::fast_api::{self, FastApiKind};
 
+use ahash::HashMap;
 use cranelift::codegen::ir::{BlockArg, FuncRef, SigRef};
 use cranelift::prelude::*;
 use cranelift_codegen::ir::MemFlagsData;
 use iced_x86::Mnemonic;
-use std::collections::HashMap;
 
 pub(super) fn term_chain_targets(t: BlockTerm) -> Vec<u64> {
     match t {

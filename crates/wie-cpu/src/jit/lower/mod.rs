@@ -9,13 +9,14 @@ use super::config::JitConfig;
 use super::fast_api::FastApiKind;
 use crate::mem::GuestMemory;
 use crate::regs::Rflags;
+use ahash::HashMap;
+use ahash::HashMapExt;
 use cranelift::codegen::ir::{BlockArg, FuncRef, SigRef, UserFuncName};
 use cranelift::prelude::*;
 use cranelift_codegen::ir::{AliasRegionData, MemFlagsData};
 use cranelift_module::{FuncId, Module};
 use iced_x86::{Instruction, Mnemonic, OpKind};
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::sync::OnceLock;
 
 /// User-id for the "guest_data" alias region we install on every compiled function.
