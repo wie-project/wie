@@ -1,6 +1,6 @@
 //! `RuntimeProfile` collection, getters, and report formatting.
 
-use std::collections::HashMap;
+use ahash::HashMap;
 
 /// Host-side timing breakdown for one session (enabled via `WIE_RUNTIME_PROFILE=1`).
 ///

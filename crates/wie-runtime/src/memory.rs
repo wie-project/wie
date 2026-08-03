@@ -1,5 +1,6 @@
 //! Guest memory layout and WinAPI environment bootstrap helpers.
 
+use ahash::HashMapExt;
 use anyhow::{Context, Result};
 
 /// Guest virtual-memory layout used by the WIE runtime.
@@ -259,7 +260,7 @@ pub(crate) fn default_winapi_state(
             main_module_path: process.module_path.clone(),
             main_module_host_dir: None,
             error_mode: 0,
-            suspended_threads: std::collections::HashMap::new(),
+            suspended_threads: ahash::HashMap::new(),
             environment: Vec::new(),
             // The main module's RT_DIALOG templates are parsed in session init
             // (the section map is not available here).
@@ -268,7 +269,7 @@ pub(crate) fn default_winapi_state(
         kernel: wie_winapi::KernelState {
             threads: wie_winapi::ThreadState::primary(),
             sync: wie_winapi::SyncState::new(),
-            seh_pending: std::collections::HashMap::new(),
+            seh_pending: ahash::HashMap::new(),
         },
         file_io: wie_winapi::FileIoState {
             executable_file_size,
@@ -278,7 +279,7 @@ pub(crate) fn default_winapi_state(
             find_handles: Vec::new(),
             host_file_mounts: Vec::new(),
             virtual_files: Vec::new(),
-            open_files: std::collections::HashMap::new(),
+            open_files: ahash::HashMap::new(),
             next_file_handle: wie_winapi::FileHandle::from(0x0000_0000_6700_0001),
             next_resource_handle: wie_winapi::ResourceHandle::from(0x0000_0000_6300_0000),
             resources: Vec::new(),
@@ -297,18 +298,18 @@ pub(crate) fn default_winapi_state(
             stdin_bytes: Vec::new(),
             stdin_cursor: 0,
             stdin_mode: wie_winapi::GuestStdinMode::InjectOnly,
-            ucrt_files: std::collections::HashMap::new(),
+            ucrt_files: ahash::HashMap::new(),
             ucrt_next_file_va: 0x0000_0000_6900_0000,
-            cached_streams: std::collections::HashMap::new(),
+            cached_streams: ahash::HashMap::new(),
         },
         dll_states: wie_winapi::DllStateMap::new(),
         message_queue: std::sync::Arc::new(std::sync::Mutex::new(
             wie_winapi::present::MessageQueue::default(),
         )),
         module_state: wie_winapi::ModuleState {
-            loaded_modules: std::collections::HashMap::new(),
+            loaded_modules: ahash::HashMap::new(),
             import_resolver: None,
-            get_proc_address_cache: std::collections::HashMap::with_capacity(64),
+            get_proc_address_cache: ahash::HashMap::with_capacity(64),
             next_module_handle: wie_winapi::ModuleHandle::from(
                 wie_winapi::dll_loader::REAL_MODULE_HANDLE_BASE,
             ),

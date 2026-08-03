@@ -1,8 +1,9 @@
 //! Fake API registration and dense VA decode for the runtime hook range.
 
+use ahash::HashMap;
 use anyhow::Result;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use wie_winapi::{
     ComMethod, D3d9Iface, FakeVa, WinApiId, WinApiTraits, decode_fake_va, encode_export,

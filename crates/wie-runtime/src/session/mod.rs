@@ -17,8 +17,8 @@ pub(crate) use self::types::{GuestHwnd, GuestStackPtr, GuestTid, GuestVa};
 use crate::memory::RuntimeMemoryLayout;
 use crate::mt_runtime::ProcessResources;
 use crate::trace::EntryTraceTermination;
+use ahash::HashMap;
 use anyhow::{Context, Result};
-use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use self::callback::PendingGuestCallback;

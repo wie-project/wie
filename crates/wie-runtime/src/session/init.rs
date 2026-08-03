@@ -11,8 +11,8 @@ use crate::memory::{
     default_winapi_environment, default_winapi_state, write_process_identity_strings,
 };
 use crate::mt_runtime::{ProcessConfig, ProcessResources};
+use ahash::{HashMap, HashMapExt};
 use anyhow::{Context, Result};
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
