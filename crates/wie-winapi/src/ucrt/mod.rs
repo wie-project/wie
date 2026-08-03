@@ -9,14 +9,16 @@
 //! API set DLLs (`api-ms-win-crt-stdio-l1-1-0.dll`, …) are Windows forwarders to
 //! `ucrtbase.dll`; we treat them as one dispatch namespace by export name.
 //!
-//! Split into `stdio`, `crt`, `string`, and `misc` submodules. This file keeps
-//! the dense dispatch table and the shared helpers (guest-VA constants, `ret`,
-//! the string reader, status bitcasts) plus the small heap-handler group.
+//! Split into `stdio`, `crt`, `string`, `format`, and `misc` submodules. This
+//! file keeps the dense dispatch table and the shared helpers (guest-VA
+//! constants, `ret`, the string reader, status bitcasts) plus the small
+//! heap-handler group.
 
 use crate::{HandlerContext, WinApiHandlerResult};
 use anyhow::Result;
 
 mod crt;
+mod format;
 mod misc;
 mod stdio;
 mod string;
@@ -38,6 +40,7 @@ use crt::{
     handle_p_commode, handle_p_environ, handle_p_fmode, handle_p_wargv, handle_p_wenviron,
     handle_set_app_type, handle_set_new_mode,
 };
+use format::{handle_vsnprintf, handle_vsnwprintf};
 use misc::{
     handle_atoi, handle_atol, handle_begin_thread_ex, handle_c_specific_handler,
     handle_config_thread_locale, handle_cxx_throw_exception, handle_end_thread_ex, handle_errno,
@@ -152,6 +155,8 @@ pub fn dispatch_ucrt(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiH
         "fwrite" => handle_fwrite(ctx),
         "fflush" => handle_fflush(ctx),
         "setvbuf" => handle_setvbuf(ctx),
+        "_vsnwprintf" => handle_vsnwprintf(ctx),
+        "_vsnprintf" => handle_vsnprintf(ctx),
         "__stdio_common_vfprintf" => handle_stdio_common_vfprintf(ctx),
         "__stdio_common_vsprintf" => handle_stdio_common_vsprintf(ctx),
         "__stdio_common_vsscanf" => handle_stdio_common_vsscanf(ctx),

@@ -421,6 +421,186 @@ fn test_get_user_default_ui_language_returns_lang_id() {
     assert_eq!(r.return_value, 0x0409, "UI language must be LANG_EN_US");
 }
 
+#[test]
+fn test_create_font_indirect_w_resolves_logfontw() {
+    // Full dispatch path: name resolution (names.rs) → dense id → handler arm.
+    // W mirror of CreateFontIndirectA: the LOGFONTW face name is UTF-16LE and
+    // must survive the round trip through the font record table.
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let logfont_ptr = 0x5000;
+    // LOGFONTW header fields (layout shared with LOGFONTA until lfFaceName).
+    let height = 16_i32.to_le_bytes();
+    engine
+        .mem_write(logfont_ptr, &height)
+        .expect("write LOGFONTW.lfHeight");
+    let weight = 700_i32.to_le_bytes();
+    engine
+        .mem_write(logfont_ptr + 16, &weight)
+        .expect("write LOGFONTW.lfWeight");
+    let italic_byte = [1_u8];
+    engine
+        .mem_write(logfont_ptr + 20, &italic_byte)
+        .expect("write LOGFONTW.lfItalic");
+    let charset_byte = [1_u8]; // DEFAULT_CHARSET
+    engine
+        .mem_write(logfont_ptr + 23, &charset_byte)
+        .expect("write LOGFONTW.lfCharSet");
+    // lfFaceName is wchar_t[32] at offset 28 (64 bytes, UTF-16LE).
+    write_guest_utf16(&mut engine, logfont_ptr + 28, "Segoe UI");
+    write_regs(&mut engine, logfont_ptr, 0, 0, 0, 0);
+    // Sentinel return address so the handler's pop is observable (test_engine
+    // defaults to 0).
+    engine
+        .mem_write(STACK_TOP, &0x1234_5678_u64.to_le_bytes())
+        .expect("write sentinel return address");
+    let id = crate::resolve_winapi_id("gdi32.dll", "CreateFontIndirectW")
+        .expect("CreateFontIndirectW must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("CreateFontIndirectW must dispatch");
+    assert_eq!(
+        r.return_address, 0x1234_5678,
+        "handler must return past the call"
+    );
+    // Nonzero HFONT that resolves through the font record table.
+    assert_ne!(
+        r.return_value, 0,
+        "CreateFontIndirectW must return an HFONT"
+    );
+    let font = state
+        .gdi_state()
+        .find_font(crate::handles::Hfont::from(r.return_value))
+        .expect("returned HFONT must resolve to a font record");
+    assert_eq!(font.family, "Segoe UI", "UTF-16 face name round trip");
+    assert_eq!(font.height, 16);
+    assert_eq!(font.weight, 700);
+    assert!(font.italic);
+    assert_eq!(font.charset, 1);
+}
+
+#[test]
+fn test_load_icon_w_make_int_resource_returns_icon() {
+    // Full dispatch path: name resolution (names.rs) → dense id → handler arm.
+    // MAKEINTRESOURCEW(id) is a pointer whose high 16 bits are zero; the low
+    // word is the resource id. Icons are not parsed yet, so any request
+    // resolves to the shared fake icon handle.
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // rcx = hinst, rdx = MAKEINTRESOURCEW(0x7F00) → raw value 0x7F00.
+    write_regs(&mut engine, 0x1400_0000, 0x7F00, 0, 0, 0);
+    // Sentinel return address so the handler's pop is observable (test_engine
+    // defaults to 0).
+    engine
+        .mem_write(STACK_TOP, &0x1234_5678_u64.to_le_bytes())
+        .expect("write sentinel return address");
+    let id = crate::resolve_winapi_id("user32.dll", "LoadIconW")
+        .expect("LoadIconW must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("LoadIconW must dispatch");
+    assert_eq!(
+        r.return_address, 0x1234_5678,
+        "handler must return past the call"
+    );
+    assert_eq!(
+        r.return_value,
+        user32::FAKE_ICON_HANDLE,
+        "LoadIconW(MAKEINTRESOURCEW) must return the shared fake icon handle"
+    );
+}
+
+#[test]
+fn test_load_cursor_w_make_int_resource_returns_cursor() {
+    // Full dispatch path: name resolution (names.rs) → dense id → handler arm.
+    // MAKEINTRESOURCEW(id) is a pointer whose high 16 bits are zero; the low
+    // word is the resource id. Cursors are not parsed yet, so any request
+    // resolves to the shared fake cursor handle.
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // rcx = hinst, rdx = MAKEINTRESOURCEW(0x7F00) → raw value 0x7F00.
+    write_regs(&mut engine, 0x1400_0000, 0x7F00, 0, 0, 0);
+    // Sentinel return address so the handler's pop is observable (test_engine
+    // defaults to 0).
+    engine
+        .mem_write(STACK_TOP, &0x1234_5678_u64.to_le_bytes())
+        .expect("write sentinel return address");
+    let id = crate::resolve_winapi_id("user32.dll", "LoadCursorW")
+        .expect("LoadCursorW must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("LoadCursorW must dispatch");
+    assert_eq!(
+        r.return_address, 0x1234_5678,
+        "handler must return past the call"
+    );
+    assert_eq!(
+        r.return_value,
+        user32::FAKE_CURSOR_HANDLE,
+        "LoadCursorW(MAKEINTRESOURCEW) must return the shared fake cursor handle"
+    );
+}
+
+#[test]
+fn test_load_cursor_w_string_name_decodes_utf16() {
+    // Full dispatch path for a name-based cursor: rdx points at a UTF-16LE
+    // string (not a MAKEINTRESOURCE — the address must have nonzero high 16
+    // bits), which the W handler must decode before resolving the cursor.
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let name_addr = 0x1_0000; // high 16 bits nonzero → string, not a resource id
+    write_guest_utf16(&mut engine, name_addr, "IDC_ARROW");
+    write_regs(&mut engine, 0x1400_0000, name_addr, 0, 0, 0);
+    engine
+        .mem_write(STACK_TOP, &0x1234_5678_u64.to_le_bytes())
+        .expect("write sentinel return address");
+    let id = crate::resolve_winapi_id("user32.dll", "LoadCursorW")
+        .expect("LoadCursorW must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("LoadCursorW must dispatch");
+    assert_eq!(
+        r.return_value,
+        user32::FAKE_CURSOR_HANDLE,
+        "name-based LoadCursorW must resolve to the shared fake cursor handle"
+    );
+}
+
+#[test]
+fn test_load_icon_w_string_name_decodes_utf16() {
+    // Full dispatch path for a name-based icon: rdx points at a UTF-16LE
+    // string (not a MAKEINTRESOURCE — the address must have nonzero high 16
+    // bits), which the W handler must decode before resolving the icon.
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let name_addr = 0x1_0000; // high 16 bits nonzero → string, not a resource id
+    write_guest_utf16(&mut engine, name_addr, "IDI_MAIN");
+    write_regs(&mut engine, 0x1400_0000, name_addr, 0, 0, 0);
+    engine
+        .mem_write(STACK_TOP, &0x1234_5678_u64.to_le_bytes())
+        .expect("write sentinel return address");
+    let id = crate::resolve_winapi_id("user32.dll", "LoadIconW")
+        .expect("LoadIconW must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("LoadIconW must dispatch");
+    assert_eq!(
+        r.return_value,
+        user32::FAKE_ICON_HANDLE,
+        "name-based LoadIconW must resolve to the shared fake icon handle"
+    );
+}
+
 /// Write a NUL-terminated UTF-16LE guest string at `addr`.
 fn write_guest_utf16(engine: &mut IcedCpu, addr: u64, s: &str) {
     let mut bytes: Vec<u8> = Vec::new();
@@ -1003,6 +1183,178 @@ fn test_init_common_controls() {
     );
 }
 
+/// Push a pre-existing parent window record (the child created by
+/// `CreateStatusWindowA/W` must link to it through `parent_handle`).
+fn push_status_parent(state: &mut WinApiState) -> u64 {
+    let parent = 0x6610_0001_u64;
+    state.window_state().windows.push(crate::WindowRecord {
+        handle: crate::handles::Hwnd::from(parent),
+        title: "Parent".to_owned(),
+        ..Default::default()
+    });
+    parent
+}
+
+#[test]
+fn test_create_status_window_w_creates_status_bar_child() {
+    // Full dispatch path: name resolution (names.rs) → dense id → handler arm.
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let parent = push_status_parent(&mut state);
+    let text_addr = 0x5000;
+    write_guest_utf16(&mut engine, text_addr, "Ready");
+    // rcx = style, rdx = LPCWSTR text, r8 = hwndParent, r9 = wID.
+    write_regs(
+        &mut engine,
+        u64::from(user32::WS_CHILD | user32::WS_VISIBLE),
+        text_addr,
+        parent,
+        1,
+        STACK_TOP,
+    );
+    engine
+        .mem_write(STACK_TOP, &0x1234_5678_u64.to_le_bytes())
+        .expect("write sentinel return address");
+    let id = crate::resolve_winapi_id("comctl32.dll", "CreateStatusWindowW")
+        .expect("CreateStatusWindowW must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("CreateStatusWindowW must dispatch");
+    assert_eq!(
+        r.return_address, 0x1234_5678,
+        "handler must return past the call"
+    );
+    assert_ne!(
+        r.return_value, 0,
+        "CreateStatusWindowW must return a nonzero HWND"
+    );
+    let window = state
+        .window_state()
+        .windows
+        .iter()
+        .find(|w| w.handle == crate::handles::Hwnd::from(r.return_value))
+        .expect("created status bar must have a window record");
+    assert_eq!(
+        window.class_name, "msctls_statusbar32",
+        "STATUSCLASSNAMEW must be the window class"
+    );
+    assert_eq!(
+        window.control_kind,
+        Some(crate::user32::controls::ControlClassKind::StatusBar),
+        "status bar must be a recognized built-in control class"
+    );
+    assert_eq!(window.control_text, "Ready", "text must round trip");
+    assert_ne!(
+        window.style & user32::WS_CHILD,
+        0,
+        "CreateStatusWindowW must force WS_CHILD"
+    );
+    assert_eq!(window.menu_handle, 1, "wID becomes the child-window id");
+}
+
+#[test]
+fn test_create_status_window_w_parents_to_hwnd_parent() {
+    // The parent link must resolve through the window-state machinery: the
+    // created status bar's parent_handle identifies the hwndParent record.
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let parent = push_status_parent(&mut state);
+    let text_addr = 0x5000;
+    write_guest_utf16(&mut engine, text_addr, "Ready");
+    write_regs(
+        &mut engine,
+        u64::from(user32::WS_CHILD | user32::WS_VISIBLE),
+        text_addr,
+        parent,
+        2,
+        STACK_TOP,
+    );
+    let id = crate::resolve_winapi_id("comctl32.dll", "CreateStatusWindowW")
+        .expect("CreateStatusWindowW must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("CreateStatusWindowW must dispatch");
+    let window = state
+        .window_state()
+        .windows
+        .iter()
+        .find(|w| w.handle == crate::handles::Hwnd::from(r.return_value))
+        .expect("created status bar must have a window record");
+    let parent_handle = window.parent_handle;
+    assert_eq!(
+        parent_handle,
+        crate::handles::Hwnd::from(parent),
+        "status bar must be parented to hwndParent"
+    );
+    // The parent link resolves back to the parent's window record.
+    assert!(
+        state
+            .window_state()
+            .windows
+            .iter()
+            .any(|w| w.handle == parent_handle),
+        "parent_handle must name an existing window record"
+    );
+}
+
+#[test]
+fn test_create_status_window_a_mirrors_with_ansi_text() {
+    // ANSI variant: same create path, text read as a byte string.
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let parent = push_status_parent(&mut state);
+    let text_addr = 0x5000;
+    write_guest_ansi(&mut engine, text_addr, "Ready");
+    write_regs(
+        &mut engine,
+        u64::from(user32::WS_CHILD | user32::WS_VISIBLE),
+        text_addr,
+        parent,
+        3,
+        STACK_TOP,
+    );
+    engine
+        .mem_write(STACK_TOP, &0x1234_5678_u64.to_le_bytes())
+        .expect("write sentinel return address");
+    let id = crate::resolve_winapi_id("comctl32.dll", "CreateStatusWindowA")
+        .expect("CreateStatusWindowA must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("CreateStatusWindowA must dispatch");
+    assert_eq!(
+        r.return_address, 0x1234_5678,
+        "handler must return past the call"
+    );
+    assert_ne!(
+        r.return_value, 0,
+        "CreateStatusWindowA must return a nonzero HWND"
+    );
+    let window = state
+        .window_state()
+        .windows
+        .iter()
+        .find(|w| w.handle == crate::handles::Hwnd::from(r.return_value))
+        .expect("created status bar must have a window record");
+    assert_eq!(window.class_name, "msctls_statusbar32");
+    assert_eq!(window.control_text, "Ready", "ANSI text must round trip");
+    assert_eq!(
+        window.parent_handle,
+        crate::handles::Hwnd::from(parent),
+        "ANSI variant must parent to hwndParent"
+    );
+    assert_ne!(
+        window.style & user32::WS_CHILD,
+        0,
+        "CreateStatusWindowA must force WS_CHILD"
+    );
+}
+
 // --- Comdlg32 ---
 
 #[test]
@@ -1409,6 +1761,59 @@ fn test_command_line_to_argv_w() {
     assert_eq!(u32::from_le_bytes(argc_buf), 1);
 }
 
+#[test]
+fn test_drag_accept_files_sets_and_clears_accepts_drops_flag() {
+    // Full dispatch path: name resolution (names.rs) → dense id → handler arm.
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let hwnd = 0x6610_0001_u64;
+    state.window_state().windows.push(WindowRecord {
+        handle: crate::handles::Hwnd::from(hwnd),
+        ..Default::default()
+    });
+    // DragAcceptFiles(hwnd, TRUE) — must set the drop-accept flag.
+    write_regs(&mut engine, hwnd, 1, 0, 0, 0);
+    let id = crate::resolve_winapi_id("shell32.dll", "DragAcceptFiles")
+        .expect("DragAcceptFiles must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("DragAcceptFiles must dispatch");
+    assert_eq!(
+        r.return_value, 1,
+        "DragAcceptFiles returns void; non-zero mirrors the void-handler convention"
+    );
+    let ws = state.window_state();
+    let window = ws
+        .windows
+        .iter()
+        .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
+        .expect("window must exist");
+    assert!(
+        window.flags.contains(WindowFlags::DROP_ACCEPTED),
+        "TRUE must set the drop-accept flag"
+    );
+    // DragAcceptFiles(hwnd, FALSE) — must clear the flag.
+    write_regs(&mut engine, hwnd, 0, 0, 0, 0);
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("DragAcceptFiles must dispatch again");
+    assert_eq!(r.return_value, 1, "FALSE call must still return non-zero");
+    let ws = state.window_state();
+    let window = ws
+        .windows
+        .iter()
+        .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
+        .expect("window must exist");
+    assert!(
+        !window.flags.contains(WindowFlags::DROP_ACCEPTED),
+        "FALSE must clear the drop-accept flag"
+    );
+}
+
 // ── OLEAUT32 ──────────────────────────────────────────────────────
 
 #[test]
@@ -1513,6 +1918,106 @@ fn test_reg_enum_value_returns_no_more() {
     .expect("dispatch")
     .expect("handled");
     assert_eq!(r.return_value, 259); // ERROR_NO_MORE_ITEMS
+}
+
+/// The real `HKEY_CURRENT_USER` constant the guest bakes into its call site.
+const HKEY_CURRENT_USER: u64 = 0x8000_0001;
+
+/// Run `RegOpenKeyA/W` through the full dispatch path (names.rs → dense id → arm).
+fn reg_open_key(library: &str, name: &str, state: &mut WinApiState, engine: &mut IcedCpu) -> u64 {
+    let id = crate::resolve_winapi_id(library, name).expect("must resolve to a WinApiId");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(engine, test_environment(), state),
+        id,
+    )
+    .expect("RegOpenKey must dispatch");
+    r.return_value
+}
+
+/// Read an 8-byte guest value (the `phkResult` handle output).
+fn read_guest_handle(engine: &mut IcedCpu, addr: u64) -> u64 {
+    let mut buf = [0_u8; 8];
+    engine.mem_read(addr, &mut buf).expect("read guest handle");
+    u64::from_le_bytes(buf)
+}
+
+#[test]
+fn test_reg_open_key_w_opens_existing_key() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    state.process.registry_keys.push(crate::RegistryKey {
+        handle: 0x100,
+        parent: HKEY_CURRENT_USER,
+        subkey: "Software\\Microsoft\\Notepad".into(),
+    });
+    let subkey_ptr = 0x5000;
+    let phk_ptr = 0x3000;
+    write_guest_utf16(&mut engine, subkey_ptr, "Software\\Microsoft\\Notepad");
+    // Sentinel: a failed open must not leave stale data behind.
+    engine
+        .mem_write(phk_ptr, &0xDEAD_BEEF_u64.to_le_bytes())
+        .expect("write sentinel phkResult");
+    // RegOpenKeyW(hKey=HKCU, lpSubKey=subkey_ptr, phkResult=phk_ptr)
+    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_ptr, phk_ptr, 0, 0);
+    let status = reg_open_key("advapi32.dll", "RegOpenKeyW", &mut state, &mut engine);
+    assert_eq!(status, 0); // ERROR_SUCCESS
+    assert_eq!(read_guest_handle(&mut engine, phk_ptr), 0x100);
+}
+
+#[test]
+fn test_reg_open_key_w_missing_returns_file_not_found() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let subkey_ptr = 0x5000;
+    let phk_ptr = 0x3000;
+    write_guest_utf16(&mut engine, subkey_ptr, "Software\\Microsoft\\Notepad");
+    engine
+        .mem_write(phk_ptr, &0xDEAD_BEEF_u64.to_le_bytes())
+        .expect("write sentinel phkResult");
+    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_ptr, phk_ptr, 0, 0);
+    let status = reg_open_key("advapi32.dll", "RegOpenKeyW", &mut state, &mut engine);
+    assert_eq!(status, 2); // ERROR_FILE_NOT_FOUND
+    assert_eq!(read_guest_handle(&mut engine, phk_ptr), 0);
+}
+
+#[test]
+fn test_reg_open_key_a_matches_w() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    state.process.registry_keys.push(crate::RegistryKey {
+        handle: 0x100,
+        parent: HKEY_CURRENT_USER,
+        subkey: "Software\\Microsoft\\Notepad".into(),
+    });
+    let subkey_ptr = 0x5000;
+    let phk_ptr = 0x3000;
+    write_guest_ansi(&mut engine, subkey_ptr, "Software\\Microsoft\\Notepad");
+    engine
+        .mem_write(phk_ptr, &0xDEAD_BEEF_u64.to_le_bytes())
+        .expect("write sentinel phkResult");
+    // RegOpenKeyA(hKey=HKCU, lpSubKey=subkey_ptr, phkResult=phk_ptr)
+    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_ptr, phk_ptr, 0, 0);
+    let status = reg_open_key("advapi32.dll", "RegOpenKeyA", &mut state, &mut engine);
+    assert_eq!(status, 0); // ERROR_SUCCESS
+    assert_eq!(read_guest_handle(&mut engine, phk_ptr), 0x100);
+    // ANSI missing path mirrors the W variant.
+    let missing_ptr = 0x5000;
+    let missing_phk = 0x3100;
+    write_guest_ansi(&mut engine, missing_ptr, "Software\\Missing");
+    engine
+        .mem_write(missing_phk, &0xDEAD_BEEF_u64.to_le_bytes())
+        .expect("write sentinel phkResult");
+    write_regs(
+        &mut engine,
+        HKEY_CURRENT_USER,
+        missing_ptr,
+        missing_phk,
+        0,
+        0,
+    );
+    let status = reg_open_key("advapi32.dll", "RegOpenKeyA", &mut state, &mut engine);
+    assert_eq!(status, 2); // ERROR_FILE_NOT_FOUND
+    assert_eq!(read_guest_handle(&mut engine, missing_phk), 0);
 }
 
 // ── USER32 ────────────────────────────────────────────────────────
@@ -2657,7 +3162,7 @@ impl ControlUiSnapshot {
                 Some(ControlState::ComboBox { items, .. }) => {
                     snap.items = items.clone();
                 }
-                Some(ControlState::Static) | None => {}
+                Some(ControlState::Static) | Some(ControlState::StatusBar) | None => {}
             }
         }
         snap

@@ -8,18 +8,56 @@ use super::{
 
 /// Handles `USER32.dll!LoadIconA`.
 pub fn handle_load_icon_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let _instance_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for LoadIconA")?;
+    handle_load_icon_impl(ctx, "LoadIconA", false)
+}
+/// Handles `USER32.dll!LoadIconW`.
+pub fn handle_load_icon_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_load_icon_impl(ctx, "LoadIconW", true)
+}
 
-    let _icon_name = engine
+/// Shared `LoadIconA/W` implementation.
+///
+/// Win64 ABI: `rcx` = hinst, `rdx` = icon name. The name is either a
+/// MAKEINTRESOURCE (high 16 bits zero → the low word is the resource id) or a
+/// string pointer (UTF-8/CP1252 for A, UTF-16LE for W). Icons are not parsed
+/// yet, so every request resolves to the shared fake icon handle; the decode
+/// exists to consume the argument faithfully and log what real apps ask for.
+fn handle_load_icon_impl(
+    ctx: &mut HandlerContext<'_>,
+    api_name: &str,
+    wide: bool,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let instance_handle = engine
+        .read_rcx()
+        .with_context(|| format!("failed to read RCX for {api_name}"))?;
+    let icon_name_raw = engine
         .read_rdx()
-        .context("failed to read RDX for LoadIconA")?;
+        .with_context(|| format!("failed to read RDX for {api_name}"))?;
+
+    let (icon_id, icon_name) = if icon_name_raw >> 16 == 0 {
+        // MAKEINTRESOURCE: only the low word carries the resource id.
+        let resource_id = u16::try_from(icon_name_raw & 0xFFFF).unwrap_or(0);
+        (resource_id, String::new())
+    } else if wide {
+        let name = read_guest_utf16_lossy(engine, icon_name_raw, 64)?;
+        (0, name)
+    } else {
+        let name = read_guest_ansi_lossy(engine, icon_name_raw, 64)?;
+        (0, name)
+    };
+
+    tracing::debug!(
+        target: "wiegui",
+        instance_handle,
+        icon_id,
+        icon_name = %icon_name,
+        "{api_name}"
+    );
 
     let return_address = engine
         .return_from_win64_api(FAKE_ICON_HANDLE)
-        .context("failed to return from LoadIconA")?;
+        .with_context(|| format!("failed to return from {api_name}"))?;
 
     Ok(WinApiHandlerResult {
         return_address,
@@ -28,18 +66,56 @@ pub fn handle_load_icon_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 }
 /// Handles `USER32.dll!LoadCursorA`.
 pub fn handle_load_cursor_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let _instance_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for LoadCursorA")?;
+    handle_load_cursor_impl(ctx, "LoadCursorA", false)
+}
+/// Handles `USER32.dll!LoadCursorW`.
+pub fn handle_load_cursor_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_load_cursor_impl(ctx, "LoadCursorW", true)
+}
 
-    let _cursor_name = engine
+/// Shared `LoadCursorA/W` implementation.
+///
+/// Win64 ABI: `rcx` = hinst, `rdx` = cursor name. The name is either a
+/// MAKEINTRESOURCE (high 16 bits zero → the low word is the resource id) or a
+/// string pointer (UTF-8/CP1252 for A, UTF-16LE for W). Cursors are not parsed
+/// yet, so every request resolves to the shared fake cursor handle; the decode
+/// exists to consume the argument faithfully and log what real apps ask for.
+fn handle_load_cursor_impl(
+    ctx: &mut HandlerContext<'_>,
+    api_name: &str,
+    wide: bool,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let instance_handle = engine
+        .read_rcx()
+        .with_context(|| format!("failed to read RCX for {api_name}"))?;
+    let cursor_name_raw = engine
         .read_rdx()
-        .context("failed to read RDX for LoadCursorA")?;
+        .with_context(|| format!("failed to read RDX for {api_name}"))?;
+
+    let (cursor_id, cursor_name) = if cursor_name_raw >> 16 == 0 {
+        // MAKEINTRESOURCE: only the low word carries the resource id.
+        let resource_id = u16::try_from(cursor_name_raw & 0xFFFF).unwrap_or(0);
+        (resource_id, String::new())
+    } else if wide {
+        let name = read_guest_utf16_lossy(engine, cursor_name_raw, 64)?;
+        (0, name)
+    } else {
+        let name = read_guest_ansi_lossy(engine, cursor_name_raw, 64)?;
+        (0, name)
+    };
+
+    tracing::debug!(
+        target: "wiegui",
+        instance_handle,
+        cursor_id,
+        cursor_name = %cursor_name,
+        "{api_name}"
+    );
 
     let return_address = engine
         .return_from_win64_api(FAKE_CURSOR_HANDLE)
-        .context("failed to return from LoadCursorA")?;
+        .with_context(|| format!("failed to return from {api_name}"))?;
 
     Ok(WinApiHandlerResult {
         return_address,

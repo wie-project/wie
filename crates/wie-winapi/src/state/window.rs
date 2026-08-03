@@ -175,6 +175,11 @@ impl WindowFlags {
     pub const PRESSED: Self = Self(1 << 5);
     /// Keyboard focus tracking shared by every control kind.
     pub const FOCUSED: Self = Self(1 << 6);
+    /// The window registered as a drop target via `DragAcceptFiles`.
+    ///
+    /// Only the registration flag is stored here; the actual drop path
+    /// (`WM_DROPFILES` + `DragQueryFileA/W`) is not wired yet.
+    pub const DROP_ACCEPTED: Self = Self(1 << 7);
 
     /// Whether `flag` is set.
     pub const fn contains(self, flag: Self) -> bool {

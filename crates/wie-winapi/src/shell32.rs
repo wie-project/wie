@@ -2,6 +2,8 @@
 
 use crate::guest_memory::write_u32 as write_guest_u32;
 use crate::guest_string::write_utf16_c_string;
+use crate::state::WindowFlags;
+use crate::user32::find_window_mut;
 use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 use anyhow::{Context, Result};
 
@@ -189,4 +191,29 @@ fn handle_sh_browse_for_folder_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let _lpbi = engine.read_rcx()?;
     let _ = E_FAIL;
     ret(engine, 0)
+}
+
+/// `void DragAcceptFiles(HWND hWnd, BOOL fAccept)`.
+///
+/// Only the registration is handled here: mark the window as a drop target on
+/// its window record and return. The drop path itself (`WM_DROPFILES` +
+/// `DragQueryFileA/W`) is plan Task 5.2. Returns non-zero like the other void
+/// handlers in this module.
+pub fn handle_drag_accept_files(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let hwnd = engine
+        .read_rcx()
+        .context("failed to read RCX for DragAcceptFiles")?;
+    let f_accept = engine
+        .read_rdx()
+        .context("failed to read RDX for DragAcceptFiles")?;
+    if let Some(window) = find_window_mut(state, hwnd) {
+        if f_accept != 0 {
+            window.flags.insert(WindowFlags::DROP_ACCEPTED);
+        } else {
+            window.flags.remove(WindowFlags::DROP_ACCEPTED);
+        }
+    }
+    ret(engine, 1)
 }

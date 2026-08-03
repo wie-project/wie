@@ -30,6 +30,24 @@ pub(super) fn paint_control(
     };
     let text = find_window(state, hwnd).map_or_else(String::new, |w| w.control_text.clone());
     let (width, height) = find_window(state, hwnd).map_or((0, 0), |w| (w.width, w.height));
+
+    if kind == ControlClassKind::StatusBar {
+        // Task 0.12: status bars render as an empty face-colored child rect;
+        // parts, per-part text, and the grip are plan Task 3.1.
+        fill_rect_surface(
+            state,
+            info.hwnd,
+            info.width,
+            info.height,
+            info.offset_x,
+            info.offset_y,
+            width,
+            height,
+            COLOR_BTNFACE,
+        );
+        return Ok(());
+    }
+
     let pressed = find_window(state, hwnd).is_some_and(|w| w.flags.contains(WindowFlags::PRESSED));
     let items = control_items(state, hwnd).to_vec();
     let sel_index = control_sel_index(state, hwnd);
@@ -174,6 +192,9 @@ pub(super) fn paint_control(
                     &default_key,
                 )?;
             }
+            // Handled by the early return above (no font needed for the empty
+            // face rect); kept only to keep the match exhaustive.
+            ControlClassKind::StatusBar => {}
         }
         Ok(())
     })();

@@ -445,17 +445,17 @@ pub(crate) fn register_window_class(
 
 #[derive(Debug)]
 pub(crate) struct CreateWindowRequest {
-    class_identifier: WindowClassIdentifier,
-    title: String,
-    style: u32,
-    extended_style: u32,
-    parent_handle: u64,
-    menu_handle: u64,
-    instance_handle: u64,
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
+    pub(crate) class_identifier: WindowClassIdentifier,
+    pub(crate) title: String,
+    pub(crate) style: u32,
+    pub(crate) extended_style: u32,
+    pub(crate) parent_handle: u64,
+    pub(crate) menu_handle: u64,
+    pub(crate) instance_handle: u64,
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) width: i32,
+    pub(crate) height: i32,
 }
 
 #[derive(Debug)]

@@ -9,7 +9,7 @@ pub use names::{is_winapi_implemented, resolve_winapi_id, winapi_id_export};
 
 use crate::{
     HandlerContext, WinApiHandlerResult, advapi32, comctl32, comdlg32, d3d9, gdi32, kernel32,
-    user32, uxtheme, winmm,
+    shell32, user32, uxtheme, winmm,
 };
 use anyhow::{Result, bail};
 
@@ -433,9 +433,25 @@ pub enum WinApiId {
     User32Loadstringa = 410,
     /// Appended here (not adjacent to User32Loadstringa) to avoid renumbering the entire enum.
     User32Loadstringw = 411,
+    /// Appended here (not adjacent to Advapi32Regopenkeyexa) to avoid renumbering the entire enum.
+    Advapi32Regopenkeya = 412,
+    /// Appended here (not adjacent to Advapi32Regopenkeya) to avoid renumbering the entire enum.
+    Advapi32Regopenkeyw = 413,
+    /// Appended here (not adjacent to Gdi32Createfontindirecta) to avoid renumbering the entire enum.
+    Gdi32Createfontindirectw = 414,
+    /// Appended here (not adjacent to User32Loadicona) to avoid renumbering the entire enum.
+    User32Loadiconw = 415,
+    /// Appended here (not adjacent to User32Loadcursora) to avoid renumbering the entire enum.
+    User32Loadcursorw = 416,
+    /// Appended here (no adjacent shell32 variants exist) to avoid renumbering the entire enum.
+    Shell32Dragacceptfiles = 417,
+    /// Appended here (not adjacent to Comctl32Imagelistdestroy) to avoid renumbering the entire enum.
+    Comctl32Createstatuswindowa = 418,
+    /// Appended here (not adjacent to Comctl32Createstatuswindowa) to avoid renumbering the entire enum.
+    Comctl32Createstatuswindoww = 419,
 }
 
-pub const WINAPI_ID_COUNT: usize = 412;
+pub const WINAPI_ID_COUNT: usize = 420;
 
 impl WinApiId {
     /// Discriminant as `u16` (`#[repr(u16)]`).
@@ -474,7 +490,7 @@ const _: () = assert!(
 );
 
 /// Highest-numbered [`WinApiId`]; update alongside the enum's final variant.
-const LAST_WINAPI_ID: WinApiId = WinApiId::User32Loadstringw;
+const LAST_WINAPI_ID: WinApiId = WinApiId::Comctl32Createstatuswindoww;
 
 /// Hot-path dispatch: dense `u16` match over the `WinApiId` discriminant
 /// (LLVM jump table) with no string comparison — runs once per host API stop.
@@ -957,6 +973,14 @@ pub fn dispatch_winapi_id(
         WinApiId::User32Registerwindowmessagew => user32::handle_register_window_message_w(ctx),
         WinApiId::User32Loadstringa => user32::handle_load_string_a(ctx),
         WinApiId::User32Loadstringw => user32::handle_load_string_w(ctx),
+        WinApiId::Advapi32Regopenkeya => advapi32::handle_reg_open_key_a(ctx),
+        WinApiId::Advapi32Regopenkeyw => advapi32::handle_reg_open_key_w(ctx),
+        WinApiId::Gdi32Createfontindirectw => gdi32::handle_create_font_indirect_w(ctx),
+        WinApiId::User32Loadiconw => user32::handle_load_icon_w(ctx),
+        WinApiId::User32Loadcursorw => user32::handle_load_cursor_w(ctx),
+        WinApiId::Shell32Dragacceptfiles => shell32::handle_drag_accept_files(ctx),
+        WinApiId::Comctl32Createstatuswindowa => comctl32::handle_create_status_window_a(ctx),
+        WinApiId::Comctl32Createstatuswindoww => comctl32::handle_create_status_window_w(ctx),
     }
 }
 

@@ -325,23 +325,41 @@ fn handle_create_font_impl(
 
 /// Handles `GDI32.dll!CreateFontIndirectA`.
 pub fn handle_create_font_indirect_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_create_font_indirect_impl(ctx, "CreateFontIndirectA", false)
+}
+
+/// Handles `GDI32.dll!CreateFontIndirectW`.
+pub fn handle_create_font_indirect_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_create_font_indirect_impl(ctx, "CreateFontIndirectW", true)
+}
+
+/// Shared `CreateFontIndirectA/W` implementation.
+///
+/// Reads the guest LOGFONT (identical layout for both variants; only
+/// `lfFaceName` differs — `char[32]` for A, `wchar_t[32]` for W, both at
+/// offset 28). The A/W split mirrors `CreateFontA/W`.
+fn handle_create_font_indirect_impl(
+    ctx: &mut HandlerContext<'_>,
+    api_name: &str,
+    wide: bool,
+) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let logfont_ptr = engine
         .read_rcx()
-        .context("failed to read RCX for CreateFontIndirectA")?;
+        .with_context(|| format!("failed to read RCX for {api_name}"))?;
 
     if logfont_ptr == 0 {
         let return_address = engine
             .return_from_win64_api(0)
-            .context("failed to return from CreateFontIndirectA")?;
+            .with_context(|| format!("failed to return from {api_name}"))?;
         return Ok(WinApiHandlerResult {
             return_address,
             return_value: 0,
         });
     }
 
-    // LOGFONTA layout (Win64):
+    // LOGFONT layout (Win64):
     // LONG  lfHeight;         offset 0
     // LONG  lfWidth;          offset 4
     // LONG  lfEscapement;     offset 8
@@ -355,18 +373,23 @@ pub fn handle_create_font_indirect_a(ctx: &mut HandlerContext<'_>) -> Result<Win
     // BYTE  lfClipPrecision;  offset 25
     // BYTE  lfQuality;        offset 26
     // BYTE  lfPitchAndFamily; offset 27
-    // TCHAR lfFaceName[32];   offset 28
-    let height = read_guest_i32(engine, logfont_ptr).context("failed to read LOGFONTA.lfHeight")?;
+    // TCHAR lfFaceName[32];   offset 28 (char[32] for A, wchar_t[32] for W)
+    let height = read_guest_i32(engine, logfont_ptr)
+        .with_context(|| format!("failed to read {api_name}.lfHeight"))?;
     let weight = read_guest_i32(engine, checked_field_address(logfont_ptr, 16, "lfWeight"))
-        .context("failed to read LOGFONTA.lfWeight")?;
+        .with_context(|| format!("failed to read {api_name}.lfWeight"))?;
     let italic_and_underline =
         read_guest_u16(engine, checked_field_address(logfont_ptr, 20, "lfItalic"))
-            .context("failed to read LOGFONTA.lfItalic")?;
+            .with_context(|| format!("failed to read {api_name}.lfItalic"))?;
     let charset = read_guest_u8(engine, checked_field_address(logfont_ptr, 23, "lfCharSet"))
-        .context("failed to read LOGFONTA.lfCharSet")?;
+        .with_context(|| format!("failed to read {api_name}.lfCharSet"))?;
     let face_name_ptr = checked_field_address(logfont_ptr, 28, "lfFaceName");
-    let face_name = read_guest_ansi_lossy(engine, face_name_ptr, 64)
-        .context("failed to read LOGFONTA.lfFaceName")?;
+    let face_name = if wide {
+        read_guest_utf16_lossy(engine, face_name_ptr, 32)
+    } else {
+        read_guest_ansi_lossy(engine, face_name_ptr, 64)
+    }
+    .with_context(|| format!("failed to read {api_name}.lfFaceName"))?;
 
     let weight = fontdb_weight_for(weight);
     let italic = italic_and_underline & 0x1 != 0;
@@ -381,12 +404,12 @@ pub fn handle_create_font_indirect_a(ctx: &mut HandlerContext<'_>) -> Result<Win
         italic,
         charset,
         face_name,
-        "CreateFontIndirectA"
+        api_name
     );
 
     let return_address = engine
         .return_from_win64_api(handle.as_u64())
-        .context("failed to return from CreateFontIndirectA")?;
+        .with_context(|| format!("failed to return from {api_name}"))?;
 
     Ok(WinApiHandlerResult {
         return_address,

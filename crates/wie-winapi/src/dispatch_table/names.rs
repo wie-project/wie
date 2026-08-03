@@ -1518,6 +1518,54 @@ static WINAPI_NAME_ROWS: &[(&str, &str, WinApiId)] = &[
         WinApiId::User32Loadstringa,
     ),
     ("user32.dll", "loadstringw", WinApiId::User32Loadstringw),
+    (
+        // Rows placed at the table end with the appended variants (412/413),
+        // so the id table and the name rows stay in the same order.
+        "advapi32.dll",
+        "regopenkeya",
+        WinApiId::Advapi32Regopenkeya,
+    ),
+    ("advapi32.dll", "regopenkeyw", WinApiId::Advapi32Regopenkeyw),
+    (
+        // Row placed at the table end with the appended variant (414),
+        // so the id table and the name rows stay in the same order.
+        "gdi32.dll",
+        "createfontindirectw",
+        WinApiId::Gdi32Createfontindirectw,
+    ),
+    (
+        // Row placed at the table end with the appended variant (415),
+        // so the id table and the name rows stay in the same order.
+        "user32.dll",
+        "loadiconw",
+        WinApiId::User32Loadiconw,
+    ),
+    (
+        // Row placed at the table end with the appended variant (416),
+        // so the id table and the name rows stay in the same order.
+        "user32.dll",
+        "loadcursorw",
+        WinApiId::User32Loadcursorw,
+    ),
+    (
+        // Row placed at the table end with the appended variant (417),
+        // so the id table and the name rows stay in the same order.
+        "shell32.dll",
+        "dragacceptfiles",
+        WinApiId::Shell32Dragacceptfiles,
+    ),
+    (
+        // Rows placed at the table end with the appended variants (418/419),
+        // so the id table and the name rows stay in the same order.
+        "comctl32.dll",
+        "createstatuswindowa",
+        WinApiId::Comctl32Createstatuswindowa,
+    ),
+    (
+        "comctl32.dll",
+        "createstatuswindoww",
+        WinApiId::Comctl32Createstatuswindoww,
+    ),
 ];
 
 /// Resolve library/export to id. Case-insensitive, allocation-free.
@@ -1563,6 +1611,8 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
                 | "fwrite"
                 | "fflush"
                 | "setvbuf"
+                | "_vsnwprintf"
+                | "_vsnprintf"
                 | "__stdio_common_vfprintf"
                 | "malloc"
                 | "calloc"

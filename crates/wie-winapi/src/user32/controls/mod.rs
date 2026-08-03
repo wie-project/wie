@@ -68,6 +68,12 @@ pub enum ControlClassKind {
     ListBox,
     /// `COMBOBOX` (edit+list; no dropdown yet).
     ComboBox,
+    /// `msctls_statusbar32` (STATUSCLASSNAME) — COMCTL32 status bar.
+    ///
+    /// Task 0.12 scope: CreateStatusWindowA/W create the child window with
+    /// text; the SB_* messages, parts layout, and full painting are plan
+    /// Task 3.1. The window renders as an empty face-colored child rect.
+    StatusBar,
 }
 
 impl ControlClassKind {
@@ -99,6 +105,11 @@ impl ControlClassKind {
                     "STATIC" => Some(Self::Static),
                     "LISTBOX" => Some(Self::ListBox),
                     "COMBOBOX" => Some(Self::ComboBox),
+                    // STATUSCLASSNAMEW — comctl32's built-in status bar class.
+                    // CreateStatusWindowA/W always pass it by name; ordinal
+                    // resolution is deferred until a guest is seen passing a
+                    // MAKEINTRESOURCE atom for it.
+                    "MSCTLS_STATUSBAR32" => Some(Self::StatusBar),
                     _ => None,
                 }
             }
@@ -126,6 +137,7 @@ impl ControlClassKind {
                 items: Vec::new(),
                 sel_index: -1,
             },
+            Self::StatusBar => ControlState::StatusBar,
             Self::Static => ControlState::Static,
         }
     }
@@ -173,6 +185,11 @@ pub enum ControlState {
     },
     /// STATIC (labels; text-only painting).
     Static,
+    /// STATUSCLASSNAMEW (status bar; no SB_* state yet — plan Task 3.1).
+    ///
+    /// The initial text set by `CreateStatusWindowA/W` lives on the window
+    /// record (`control_text`); parts and per-part text are Task 3.1.
+    StatusBar,
 }
 
 impl ControlState {
@@ -728,6 +745,10 @@ mod tests {
         assert!(matches!(
             ControlClassKind::Static.new_state(),
             ControlState::Static
+        ));
+        assert!(matches!(
+            ControlClassKind::StatusBar.new_state(),
+            ControlState::StatusBar
         ));
     }
 }
