@@ -357,6 +357,25 @@ impl ApplicationHandler<WieEvent> for WieApp {
         };
 
         match event {
+            WindowEvent::DroppedFile(path) => {
+                // A host file dropped on the window: store it as the guest
+                // drop list and post WM_DROPFILES with the fake HDROP. The
+                // guest's handler (notepad's WM_DROPFILES) reads the path via
+                // DragQueryFileW, mapped to a guest C:\ path by
+                // GuestHandle::set_drop_files (drops outside the bottle/D:
+                // bridge are skipped, so hdrop stays 0 and nothing is posted).
+                let (px, py) = self.cursor_pos_i32();
+                let hdrop = handle.set_drop_files(vec![path.clone()], (px, py));
+                tracing::info!(
+                    target: "wiegui",
+                    host_path = %path.display(),
+                    "drop: mapped to hdrop=0x{hdrop:x}"
+                );
+                if hdrop != 0 {
+                    let lparam = input::make_lparam(px.max(0) as u16, py.max(0) as u16);
+                    handle.post_message(hwnd.as_u64(), input::WM_DROPFILES, hdrop, lparam);
+                }
+            }
             WindowEvent::RedrawRequested => {
                 let Some(rt) = self.runtime.as_mut() else {
                     return;

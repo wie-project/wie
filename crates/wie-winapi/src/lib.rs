@@ -28,6 +28,7 @@ pub mod msvc_eh;
 pub mod ole32;
 pub mod oleaut32;
 pub mod present;
+mod registry;
 pub mod seh;
 pub mod shell32;
 pub mod sync_obj;
@@ -44,7 +45,7 @@ pub use sync_obj::{
     PendingSpawn, STILL_ACTIVE, SemaphoreObject, SyncState, WAIT_FAILED, WAIT_OBJECT_0,
     WAIT_TIMEOUT, WaitTarget, wait_multiple,
 };
-pub use vfs::{VolumeConfig, ensure_bottle_skeleton};
+pub use vfs::{VolumeConfig, ensure_bottle_skeleton, host_path_to_guest};
 #[cfg(test)]
 mod exception_helpers;
 #[cfg(test)]

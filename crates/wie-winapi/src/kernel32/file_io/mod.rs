@@ -871,7 +871,7 @@ pub(crate) fn finish_create_file(
                 handle
             }
             Err(win_error) => {
-                tracing::debug!(
+                tracing::error!(
                     path = %file_name,
                     desired_access,
                     creation_disposition,
@@ -884,7 +884,7 @@ pub(crate) fn finish_create_file(
         };
 
     if return_value != INVALID_HANDLE_VALUE {
-        tracing::debug!(
+        tracing::info!(
             path = %file_name,
             desired_access,
             creation_disposition,

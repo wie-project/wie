@@ -16,6 +16,7 @@ use crate::pthread;
 use crate::seh;
 use crate::sync_obj::SyncState;
 use crate::thread::ThreadState;
+use crate::user32::dragdrop::DragDropState;
 
 mod d3d9;
 mod input;
@@ -131,12 +132,16 @@ pub enum DllId {
     Present,
     /// The process clipboard (CF_TEXT only; Task 2.6).
     Clipboard,
+    /// The host-side registry hive (HKCU value storage; Task 5.1).
+    Registry,
+    /// The shell drag-drop list behind `WM_DROPFILES` (Task 5.2).
+    DragDrop,
 }
 
 impl DllId {
     /// Number of variants. The assertion at [`DLL_ID_SLOT_COUNT`] ensures
     /// it stays in sync with the slot array in [`DllStateMap::new`].
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 9;
 }
 
 /// Lazy DLL state storage. Fixed-size array, zero per-call overhead.
@@ -177,6 +182,8 @@ const fn dll_index(id: DllId) -> usize {
         DllId::Gdi => 4,
         DllId::Present => 5,
         DllId::Clipboard => 6,
+        DllId::Registry => 7,
+        DllId::DragDrop => 8,
     }
 }
 
@@ -204,6 +211,8 @@ const fn slot_of(i: usize) -> &'static str {
         4 => "gdi",
         5 => "present",
         6 => "clipboard",
+        7 => "registry",
+        8 => "dragdrop",
         _ => "?",
     }
 }
@@ -212,7 +221,7 @@ impl DllStateMap {
     /// All slots start unloaded. Add a `None` per new [`DllId`] variant.
     pub fn new() -> Self {
         Self {
-            slots: [None, None, None, None, None, None, None],
+            slots: [None, None, None, None, None, None, None, None, None],
         }
     }
 
@@ -380,6 +389,22 @@ impl WinApiState {
     pub fn clipboard(&mut self) -> &mut ClipboardState {
         self.dll_states
             .get_or_init::<ClipboardState>(DllId::Clipboard)
+    }
+
+    /// Mutable access to the registry hive state (values + persistence).
+    pub fn registry(&mut self) -> &mut crate::registry::RegistryState {
+        self.dll_states
+            .get_or_init::<crate::registry::RegistryState>(DllId::Registry)
+    }
+
+    /// Mutable access to the shell drag-drop list (`WM_DROPFILES`).
+    ///
+    /// The host winit thread stores dropped paths here; the guest's
+    /// `DragQueryFileA/W` / `DragQueryPoint` / `DragFinish` handlers read and
+    /// clear it.
+    pub fn drag_drop(&mut self) -> &mut DragDropState {
+        self.dll_states
+            .get_or_init::<DragDropState>(DllId::DragDrop)
     }
 
     /// Read-only access — returns `None` if the state was never initialised.

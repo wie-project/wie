@@ -79,6 +79,8 @@ impl WinMsg {
     pub const WM_MOUSEWHEEL: Self = Self(0x020A);
     pub const WM_MOUSEHWHEEL: Self = Self(0x020E);
     pub const WM_MDICREATE: Self = Self(0x0220);
+    /// WM_DROPFILES — wParam is the HDROP; lParam is the drop point.
+    pub const WM_DROPFILES: Self = Self(0x0233);
     pub const WM_MOUSEHOVER: Self = Self(0x02A1);
     pub const WM_MOUSELEAVE: Self = Self(0x02A3);
 

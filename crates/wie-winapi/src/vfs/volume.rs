@@ -113,6 +113,50 @@ pub fn guest_path_to_host_bottle(bottle_root: &Path, guest_path: &str) -> Option
     guest_path_to_host(&volumes, guest_path).map(|m| m.host)
 }
 
+/// Map a host path to the guest-visible Windows path (`C:\…` / `D:\…`).
+///
+/// Inverse of [`guest_path_to_host`]: a host path under the bottle's
+/// `drive_c` becomes `C:\<rel>`; a host path under the optional D: bridge
+/// root becomes `D:\<rel>`. Returns `None` when the host path is outside both
+/// volumes — no drive mapping exists, so the guest filesystem cannot see it
+/// (used by the winit file-drop path, which must present the dropped file as
+/// a guest path).
+#[must_use]
+pub fn host_path_to_guest(volumes: &VolumeConfig, host_path: &Path) -> Option<String> {
+    if let Some(bottle) = volumes.bottle_root.as_ref() {
+        let drive_c = bottle.join("drive_c");
+        if let Ok(relative) = host_path.strip_prefix(&drive_c) {
+            return Some(guest_from_relative('C', relative));
+        }
+    }
+    if let Some(drive_d) = volumes.drive_d_root.as_ref()
+        && let Ok(relative) = host_path.strip_prefix(drive_d)
+    {
+        return Some(guest_from_relative('D', relative));
+    }
+    None
+}
+
+/// Build `{drive}:\<rel>` with backslash separators, collapsing the empty
+/// relative path to the drive root (`C:\`).
+fn guest_from_relative(drive: char, relative: &Path) -> String {
+    let mut out = String::new();
+    out.push(drive);
+    out.push_str(":\\");
+    for component in relative.components() {
+        if let std::path::Component::Normal(part) = component {
+            out.push_str(&part.to_string_lossy());
+            out.push('\\');
+        }
+    }
+    // Strip the trailing separator so `C:\dir` (not `C:\dir\`); the drive
+    // root `C:\` (length 3) keeps it.
+    if out.len() > 3 && out.ends_with('\\') {
+        out.pop();
+    }
+    out
+}
+
 /// Resolve bottle root from `WIE_ROOT`.
 #[must_use]
 pub fn bottle_root_from_env() -> Option<PathBuf> {
@@ -217,5 +261,39 @@ mod tests {
         assert_eq!(m.host, PathBuf::from("/Users/me/data/archive/a.7z"));
         assert_eq!(logical_drives_mask(&v), (1 << 2) | (1 << 3));
         assert_eq!(get_drive_type(&v, r"D:\"), DRIVE_FIXED);
+    }
+
+    #[test]
+    fn host_path_to_guest_maps_bottle_and_drive_d() {
+        let v = VolumeConfig {
+            bottle_root: Some(PathBuf::from("/tmp/bottle")),
+            drive_d_root: Some(PathBuf::from("/Users/me/data")),
+        };
+        // Bottle path → C:\.
+        assert_eq!(
+            host_path_to_guest(&v, Path::new("/tmp/bottle/drive_c/App/out.txt")),
+            Some(r"C:\App\out.txt".to_owned())
+        );
+        // Drive-D bridge → D:\.
+        assert_eq!(
+            host_path_to_guest(&v, Path::new("/Users/me/data/archive/a.7z")),
+            Some(r"D:\archive\a.7z".to_owned())
+        );
+        // The bottle root itself maps to the drive root.
+        assert_eq!(
+            host_path_to_guest(&v, Path::new("/tmp/bottle/drive_c")),
+            Some(r"C:\".to_owned())
+        );
+        // Outside both volumes → no drive mapping exists.
+        assert_eq!(host_path_to_guest(&v, Path::new("/etc/passwd")), None);
+        // Drive-C path with no bottle configured → None.
+        let no_bottle = VolumeConfig {
+            bottle_root: None,
+            drive_d_root: None,
+        };
+        assert_eq!(
+            host_path_to_guest(&no_bottle, Path::new("/tmp/bottle/drive_c/x.txt")),
+            None
+        );
     }
 }

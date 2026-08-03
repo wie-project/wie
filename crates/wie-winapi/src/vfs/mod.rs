@@ -29,5 +29,5 @@ pub use volume::{
     BOTTLE_SKELETON_DIRS, DRIVE_FIXED, DRIVE_NO_ROOT_DIR, GUEST_SYSTEM_DIR, GUEST_TEMP_PATH,
     GUEST_WINDOWS_DIR, HostMap, VolumeConfig, bottle_root_from_env, drive_d_from_env,
     ensure_bottle_skeleton, get_drive_type, guest_path_to_host, guest_path_to_host_bottle,
-    logical_drives_mask,
+    host_path_to_guest, logical_drives_mask,
 };

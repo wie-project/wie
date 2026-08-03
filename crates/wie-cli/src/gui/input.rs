@@ -46,6 +46,9 @@ pub(crate) const WM_KILLFOCUS: u32 = WinMsg::WM_KILLFOCUS.as_u32();
 pub(crate) const WM_MOUSEHOVER: u32 = WinMsg::WM_MOUSEHOVER.as_u32();
 pub(crate) const WM_MOUSELEAVE: u32 = WinMsg::WM_MOUSELEAVE.as_u32();
 
+/// `WM_DROPFILES` — wParam is the fake HDROP; lParam is the drop point.
+pub(crate) const WM_DROPFILES: u32 = WinMsg::WM_DROPFILES.as_u32();
+
 /// Mouse-key state flags (wParam of mouse messages).
 pub(crate) const MK_LBUTTON: u16 = 0x0001;
 pub(crate) const MK_RBUTTON: u16 = 0x0002;

@@ -288,6 +288,42 @@ impl GuestHandle {
         }
     }
 
+    /// Store a host-side file drop (winit `DroppedFile`) as the guest drop
+    /// list and return the fake `HDROP` the caller posts as the `WM_DROPFILES`
+    /// `wParam`.
+    ///
+    /// Host paths are translated to guest-visible `C:\…` / `D:\…` paths
+    /// through the session's volume config ([`wie_winapi::host_path_to_guest`]
+    /// — the inverse of the guest → host bottle mapping); a dropped file
+    /// outside both volumes is skipped, because the guest filesystem cannot
+    /// see it. When NO path maps into a volume the whole drop is skipped —
+    /// the function returns 0 and the caller posts no `WM_DROPFILES` (a fake
+    /// HDROP over an empty list would make the guest open an empty path).
+    /// `point` is the drop point in client coordinates, which the guest
+    /// reads back via `DragQueryPoint`.
+    #[must_use]
+    pub fn set_drop_files(&self, paths: Vec<std::path::PathBuf>, point: (i32, i32)) -> u64 {
+        let Ok(mut state) = self.state.lock() else {
+            return 0;
+        };
+        let volumes = state.file_io.volumes.clone();
+        let guest_paths: Vec<String> = paths
+            .iter()
+            .filter_map(|p| wie_winapi::host_path_to_guest(&volumes, p))
+            .collect();
+        if guest_paths.is_empty() {
+            tracing::info!(
+                target: "wiegui",
+                host_path = %paths.first().map_or("", |p| p.to_str().unwrap_or("<non-utf8>")),
+                "drop skipped: no guest volume maps the host path"
+            );
+            return 0;
+        }
+        tracing::info!(target: "wiegui", guest_paths = ?guest_paths, "drop stored for WM_DROPFILES");
+        state.drag_drop().set_drop(guest_paths, point);
+        wie_winapi::user32::dragdrop::FAKE_HDROP
+    }
+
     /// Update the guest-visible window size (host window was resized).
     ///
     /// Updates the `WindowRecord` in place — no allocation.  Uses `try_lock`
@@ -416,8 +452,10 @@ impl GuestHandle {
 mod tests {
     use super::GuestHandle;
     use crate::memory::DEFAULT_LAYOUT;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex, RwLock};
     use wie_winapi::user32::menu::{MenuEntry, MenuRecord};
+    use wie_winapi::vfs::VolumeConfig;
 
     /// `window_menu_items` returns the cached tree while `menu_dirty` is
     /// false and rebuilds (seeing new items) once a mutation dirties it.
@@ -611,6 +649,98 @@ mod tests {
                 .flags
                 .contains(wie_winapi::WindowFlags::ERASE_BACKGROUND),
             "descendants paint their own background — no erase flag on the child"
+        );
+    }
+
+    /// `set_drop_files` maps host drop paths into guest `C:\…` / `D:\…` paths
+    /// through the session's volume config, skips unmapped files, stores the
+    /// point, and returns the fake HDROP for the WM_DROPFILES wParam.
+    #[test]
+    fn set_drop_files_maps_host_paths_to_guest_paths() {
+        let process = wie_pe::ProcessIdentity {
+            module_file_name: "drop.exe".to_owned(),
+            module_path: r"C:\App\drop.exe".to_owned(),
+            current_directory: r"C:\App".to_owned(),
+            command_line: "drop.exe".to_owned(),
+        };
+        let mut winapi_state =
+            crate::memory::default_winapi_state(&DEFAULT_LAYOUT, Arc::new(Vec::new()), &process)
+                .expect("winapi state");
+        winapi_state.file_io.volumes = VolumeConfig {
+            bottle_root: Some(PathBuf::from("/tmp/bottle")),
+            drive_d_root: Some(PathBuf::from("/Users/me/data")),
+        };
+        let handle = GuestHandle {
+            state: Arc::new(Mutex::new(winapi_state)),
+            queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+            menu_tree_cache: Arc::new(RwLock::new(None)),
+        };
+
+        let hdrop = handle.set_drop_files(
+            vec![
+                PathBuf::from("/tmp/bottle/drive_c/App/out.txt"),
+                PathBuf::from("/Users/me/data/archive/a.7z"),
+                // Outside both volumes — the guest filesystem cannot see it.
+                PathBuf::from("/etc/passwd"),
+            ],
+            (5, 6),
+        );
+        assert_eq!(
+            hdrop,
+            wie_winapi::user32::dragdrop::FAKE_HDROP,
+            "set_drop_files returns the fake HDROP"
+        );
+
+        let mut state = handle.state.lock().expect("lock state");
+        let drop = state.drag_drop();
+        assert_eq!(
+            drop.files(),
+            &[r"C:\App\out.txt".to_owned(), r"D:\archive\a.7z".to_owned()],
+            "unmapped host paths are skipped"
+        );
+        assert_eq!(drop.point(), (5, 6));
+    }
+
+    /// A drop in which NO host path maps into a guest volume must be skipped
+    /// entirely: return 0 (the caller posts no WM_DROPFILES) rather than a
+    /// fake HDROP over an empty list — the guest would otherwise open an
+    /// empty path (notepad: CreateFileW("") → ERROR_PATH_NOT_FOUND → error
+    /// dialog).
+    #[test]
+    fn set_drop_files_returns_zero_when_nothing_maps() {
+        let process = wie_pe::ProcessIdentity {
+            module_file_name: "drop.exe".to_owned(),
+            module_path: r"C:\App\drop.exe".to_owned(),
+            current_directory: r"C:\App".to_owned(),
+            command_line: "drop.exe".to_owned(),
+        };
+        let mut winapi_state =
+            crate::memory::default_winapi_state(&DEFAULT_LAYOUT, Arc::new(Vec::new()), &process)
+                .expect("winapi state");
+        winapi_state.file_io.volumes = VolumeConfig {
+            bottle_root: Some(PathBuf::from("/tmp/bottle")),
+            drive_d_root: Some(PathBuf::from("/Users/me/data")),
+        };
+        let handle = GuestHandle {
+            state: Arc::new(Mutex::new(winapi_state)),
+            queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+            menu_tree_cache: Arc::new(RwLock::new(None)),
+        };
+
+        let hdrop = handle.set_drop_files(
+            vec![
+                // Outside both volumes — the guest filesystem cannot see it.
+                PathBuf::from("/etc/passwd"),
+                PathBuf::from("/tmp/elsewhere/file.txt"),
+            ],
+            (5, 6),
+        );
+        assert_eq!(hdrop, 0, "no mappable path → the drop is skipped");
+
+        let mut state = handle.state.lock().expect("lock state");
+        assert!(
+            state.drag_drop().files().is_empty(),
+            "the drop list must stay empty"
         );
     }
 }
