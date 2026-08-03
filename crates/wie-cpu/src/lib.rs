@@ -16,6 +16,13 @@ mod mem;
 mod regs;
 mod simd;
 
+/// Concurrent hash map for cross-thread JIT state.
+///
+/// Backed by `papaya` (hazard-pointer epoch reclamation); readers and writers
+/// proceed without a global lock, which is what the shared block cache and
+/// chain-id table need under the multithreaded runtime.
+pub type ConcurrentHashMap<K, V> = papaya::HashMap<K, V>;
+
 /// Dump residual iced-interpreter mnemonic histogram (`WIE_EXEC_TRACE=1`).
 pub use exec::{dump_iced_counters, reset_iced_counters};
 pub use iced_cpu::IcedCpu;

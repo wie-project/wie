@@ -103,14 +103,14 @@ impl JitCpu {
     }
 
     pub(super) fn clear_compiled(&mut self) {
-        self.shared.cache.write().unwrap().clear();
-        self.shared.chain_ids.write().unwrap().clear();
+        self.shared.cache.pin().clear();
+        self.shared.chain_ids.pin().clear();
         self.shared.code_pages.lock().unwrap().clear();
     }
 
     pub(super) fn invalidate_code_range(&mut self, addr: u64, len: usize) {
         {
-            let cache = self.shared.cache.read().unwrap();
+            let cache = self.shared.cache.pin();
             if cache.is_empty() || len == 0 {
                 return;
             }
@@ -120,7 +120,7 @@ impl JitCpu {
         }
         let write_end = addr.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
         let to_drop: Vec<u64> = {
-            let cache = self.shared.cache.read().unwrap();
+            let cache = self.shared.cache.pin();
             cache
                 .iter()
                 .filter_map(|(va, entry)| match entry {
@@ -137,19 +137,19 @@ impl JitCpu {
             return;
         }
         for va in &to_drop {
-            let mut cache = self.shared.cache.write().unwrap();
-            if let Some(CacheEntry::Ready(c)) = cache.remove(va) {
+            let cache = self.shared.cache.pin();
+            if let Some(CacheEntry::Ready(c)) = cache.remove(va).cloned() {
                 drop(cache);
                 self.shared
                     .code_pages_remove_range(c.guest_start, c.guest_end);
             }
-            self.shared.chain_ids.write().unwrap().remove(va);
+            self.shared.chain_ids.pin().remove(va);
         }
         self.stats.code_invs = self.stats.code_invs.saturating_add(1);
         self.invalidate_chain_and_shadow();
         if JitConfig::get().chain_enabled() {
-            let cache = self.shared.cache.read().unwrap();
-            for (va, entry) in &*cache {
+            let cache = self.shared.cache.pin();
+            for (va, entry) in cache.iter() {
                 if let CacheEntry::Ready(c) = entry {
                     let fn_ptr = c.func as usize as u64;
                     chain_table_insert(self.thread.chain_slots.as_mut(), *va, fn_ptr);
@@ -170,7 +170,7 @@ impl JitCpu {
             .swap(false, Ordering::Relaxed);
         let pages = std::mem::take(&mut *self.shared.pending_code_writes.lock().unwrap());
         if overflow {
-            if !self.shared.cache.read().unwrap().is_empty() {
+            if !self.shared.cache.pin().is_empty() {
                 self.clear_compiled();
                 self.invalidate_chain_and_shadow();
                 self.stats.code_invs = self.stats.code_invs.saturating_add(1);
@@ -252,7 +252,7 @@ impl JitCpu {
     #[must_use]
     pub(super) fn has_ready_at(&self, rip: u64) -> bool {
         matches!(
-            self.shared.cache.read().unwrap().get(&rip),
+            self.shared.cache.pin().get(&rip),
             Some(CacheEntry::Ready(_))
         )
     }
@@ -273,9 +273,9 @@ impl JitCpu {
         }
 
         if self.shared.engine_ready.load(Ordering::Relaxed) {
-            // Read-first pattern: acquire read lock, clone entry, drop lock, then act.
+            // Read-first pattern: acquire a pin, clone entry, drop pin, then act.
             let entry = {
-                let cache = self.shared.cache.read().unwrap();
+                let cache = self.shared.cache.pin();
                 cache.get(&rip).cloned()
             };
             if let Some(entry) = entry {
@@ -299,19 +299,14 @@ impl JitCpu {
                             self.insert_ready(rip, compiled);
                             return Ok(self.finish_compiled(rip, meta));
                         }
-                        self.shared
-                            .cache
-                            .write()
-                            .unwrap()
-                            .insert(rip, CacheEntry::Never);
+                        self.shared.cache.pin().insert(rip, CacheEntry::Never);
                     }
                     CacheEntry::Hot { visits, thr } => {
                         let next = visits.saturating_add(1);
                         if thr > 0 && next < thr {
                             self.shared
                                 .cache
-                                .write()
-                                .unwrap()
+                                .pin()
                                 .insert(rip, CacheEntry::Hot { visits: next, thr });
                         } else {
                             // Threshold crossed. Prefer the background worker:
@@ -332,11 +327,7 @@ impl JitCpu {
                                         self.insert_ready(rip, compiled);
                                         return Ok(self.finish_compiled(rip, meta));
                                     }
-                                    self.shared
-                                        .cache
-                                        .write()
-                                        .unwrap()
-                                        .insert(rip, CacheEntry::Never);
+                                    self.shared.cache.pin().insert(rip, CacheEntry::Never);
                                 }
                             }
                         }
@@ -375,16 +366,12 @@ impl JitCpu {
                                 self.insert_ready(rip, compiled);
                                 return Ok(self.finish_compiled(rip, meta));
                             }
-                            self.shared
-                                .cache
-                                .write()
-                                .unwrap()
-                                .insert(rip, CacheEntry::Never);
+                            self.shared.cache.pin().insert(rip, CacheEntry::Never);
                         }
                         BgEnqueueOutcome::Ready => {
                             // Worker beat us: the cache already holds Ready.
                             let compiled = {
-                                let cache = self.shared.cache.read().unwrap();
+                                let cache = self.shared.cache.pin();
                                 cache.get(&rip).and_then(|e| match e {
                                     CacheEntry::Ready(c) => Some(*c),
                                     _ => None,
@@ -402,18 +389,13 @@ impl JitCpu {
                                 self.insert_ready(rip, compiled);
                                 return Ok(self.finish_compiled(rip, meta));
                             }
-                            self.shared
-                                .cache
-                                .write()
-                                .unwrap()
-                                .insert(rip, CacheEntry::Never);
+                            self.shared.cache.pin().insert(rip, CacheEntry::Never);
                         }
                     }
                 } else {
                     self.shared
                         .cache
-                        .write()
-                        .unwrap()
+                        .pin()
                         .insert(rip, CacheEntry::Hot { visits: 1, thr });
                 }
             }
@@ -461,11 +443,7 @@ impl JitCpu {
             return BgEnqueueOutcome::Unavailable;
         }
         if matches!(kind, BlockKind::NotPure) {
-            self.shared
-                .cache
-                .write()
-                .unwrap()
-                .insert(rip, CacheEntry::Never);
+            self.shared.cache.pin().insert(rip, CacheEntry::Never);
             return BgEnqueueOutcome::Unavailable;
         }
         let tx_guard = self.shared.bg_tx.lock().unwrap();
@@ -476,7 +454,7 @@ impl JitCpu {
             return BgEnqueueOutcome::Unavailable;
         }
         // Transition the entry (only from Hot/absent; never clobber Ready/Never).
-        let mut cache = self.shared.cache.write().unwrap();
+        let cache = self.shared.cache.pin();
         match cache.get(&rip) {
             None | Some(CacheEntry::Hot { .. }) => {
                 let cell = BgWaitCell::new();
@@ -503,7 +481,7 @@ impl JitCpu {
         let start = Instant::now();
         loop {
             let state = {
-                let cache = self.shared.cache.read().unwrap();
+                let cache = self.shared.cache.pin();
                 match cache.get(&rip) {
                     Some(CacheEntry::Ready(c)) => Some(BgWaitState::Ready(*c)),
                     Some(CacheEntry::Never) => Some(BgWaitState::Never),
@@ -550,8 +528,8 @@ impl JitCpu {
         if !JitConfig::get().chain_enabled() {
             return;
         }
-        let cache = self.shared.cache.read().unwrap();
-        for (va, entry) in &*cache {
+        let cache = self.shared.cache.pin();
+        for (va, entry) in cache.iter() {
             if let CacheEntry::Ready(c) = entry {
                 let fn_ptr = c.func as usize as u64;
                 chain_table_insert(self.thread.chain_slots.as_mut(), *va, fn_ptr);

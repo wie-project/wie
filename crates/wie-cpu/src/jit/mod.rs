@@ -540,7 +540,7 @@ mod tests {
             assert!(Instant::now() < deadline, "worker install timed out");
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(cpu.shared.chain_ids.read().unwrap().contains_key(&base));
+        assert!(cpu.shared.chain_ids.pin().contains_key(&base));
         assert!(
             cpu.shared.cache_epoch.load(Ordering::Relaxed) >= 1,
             "worker install must bump the chain-sync epoch"
@@ -574,7 +574,7 @@ mod tests {
         let outcome = cpu.enqueue_bg(base, &BlockKind::NotPure);
         assert!(matches!(outcome, BgEnqueueOutcome::Unavailable));
         assert!(matches!(
-            cpu.shared.cache.read().unwrap().get(&base),
+            cpu.shared.cache.pin().get(&base),
             Some(CacheEntry::Never)
         ));
     }

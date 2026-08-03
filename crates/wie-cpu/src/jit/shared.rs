@@ -20,6 +20,7 @@ use super::lower::{
 };
 use super::pipeline::resolve_thunk_va;
 use super::trampolines::match_micro_stub;
+use crate::ConcurrentHashMap;
 use crate::exec::HookWindow;
 use crate::mem::GuestMemory;
 use crate::regs::RegFile;
@@ -100,10 +101,10 @@ pub struct JitShared {
     pub mem: RwLock<GuestMemory>,
     /// Guest entry VA → CacheEntry.
     #[doc(hidden)]
-    pub cache: RwLock<HashMap<u64, CacheEntry>>,
+    pub cache: ConcurrentHashMap<u64, CacheEntry>,
     /// Ready-block FuncIds for chaining.
     #[doc(hidden)]
-    pub chain_ids: RwLock<HashMap<u64, cranelift_module::FuncId>>,
+    pub chain_ids: ConcurrentHashMap<u64, cranelift_module::FuncId>,
     /// Guest page keys covered by Ready blocks (SMC tracking).
     #[doc(hidden)]
     pub code_pages: Mutex<HashMap<u64, u32>>,
@@ -159,8 +160,8 @@ impl JitShared {
         Self {
             engine: Mutex::new(has_engine),
             mem: RwLock::new(GuestMemory::new()),
-            cache: RwLock::new(HashMap::new()),
-            chain_ids: RwLock::new(HashMap::new()),
+            cache: ConcurrentHashMap::new(),
+            chain_ids: ConcurrentHashMap::new(),
             code_pages: Mutex::new(HashMap::new()),
             pending_code_writes: Mutex::new(Vec::new()),
             pending_code_overflow: AtomicBool::new(false),
@@ -201,10 +202,10 @@ impl JitShared {
     /// tracking, and inserts the Ready entry. No per-thread side effects.
     pub(crate) fn insert_ready(&self, rip: u64, compiled: CompiledBlock) {
         let removed = {
-            let mut cache = self.cache.write().unwrap();
-            let old = cache.remove(&rip);
-            if let Some(CacheEntry::Ready(ref old)) = old {
-                self.chain_ids.write().unwrap().remove(&rip);
+            let cache = self.cache.pin();
+            let old = cache.remove(&rip).cloned();
+            if let Some(CacheEntry::Ready(old)) = old {
+                self.chain_ids.pin().remove(&rip);
                 Some((old.guest_start, old.guest_end))
             } else {
                 None
@@ -216,13 +217,10 @@ impl JitShared {
         if JitConfig::get().chain_enabled()
             && let Some(fid) = compiled.func_id
         {
-            self.chain_ids.write().unwrap().insert(rip, fid);
+            self.chain_ids.pin().insert(rip, fid);
         }
         self.code_pages_add_range(compiled.guest_start, compiled.guest_end);
-        self.cache
-            .write()
-            .unwrap()
-            .insert(rip, CacheEntry::Ready(compiled));
+        self.cache.pin().insert(rip, CacheEntry::Ready(compiled));
     }
 
     /// Spawn the background compiler thread exactly once.
@@ -336,13 +334,19 @@ impl JitShared {
                     _ => None,
                 };
                 let chain_on = JitConfig::get().chain_enabled();
-                let empty_chain = HashMap::new();
+                // Snapshot the chain-id table for this compile (pin guard must
+                // not outlive the snapshot — the engine lock and `compile_block`
+                // run after it drops).
+                let chain_map: HashMap<u64, cranelift_module::FuncId> = if chain_on {
+                    let guard = self.chain_ids.pin();
+                    guard.iter().map(|(&va, &fid)| (va, fid)).collect()
+                } else {
+                    HashMap::new()
+                };
                 let mut eng_guard = self.engine.lock().unwrap();
                 let eng = eng_guard.as_mut()?;
-                let chain_ids = &*self.chain_ids.read().unwrap();
-                let chain_map = if chain_on { chain_ids } else { &empty_chain };
                 compile_block(
-                    eng, rip, &insns, end_rip, term, call_fast, chain_map, bytes_len,
+                    eng, rip, &insns, end_rip, term, call_fast, &chain_map, bytes_len,
                 )
                 .ok()
             }
@@ -354,20 +358,20 @@ impl JitShared {
     /// SMC bookkeeping + epoch bump + waiter notification.
     fn bg_install_ready(&self, rip: u64, compiled: CompiledBlock) {
         let notify = {
-            let mut cache = self.cache.write().unwrap();
-            let old = cache.remove(&rip);
+            let cache = self.cache.pin();
+            let old = cache.remove(&rip).cloned();
             let notify = match &old {
                 Some(CacheEntry::Queued(n)) => Some(Arc::clone(n)),
                 _ => None, // resolved elsewhere (guest inline fallback): skip
             };
-            if let Some(CacheEntry::Ready(ref old)) = old {
-                self.chain_ids.write().unwrap().remove(&rip);
+            if let Some(CacheEntry::Ready(old)) = old {
+                self.chain_ids.pin().remove(&rip);
                 self.code_pages_remove_range(old.guest_start, old.guest_end);
             }
             if JitConfig::get().chain_enabled()
                 && let Some(fid) = compiled.func_id
             {
-                self.chain_ids.write().unwrap().insert(rip, fid);
+                self.chain_ids.pin().insert(rip, fid);
             }
             self.code_pages_add_range(compiled.guest_start, compiled.guest_end);
             cache.insert(rip, CacheEntry::Ready(compiled));
@@ -384,8 +388,8 @@ impl JitShared {
     /// wake waiters (they fall through to iced, no inline re-attempt needed).
     fn bg_install_never(&self, rip: u64) {
         let notify = {
-            let mut cache = self.cache.write().unwrap();
-            match cache.remove(&rip) {
+            let cache = self.cache.pin();
+            match cache.remove(&rip).cloned() {
                 Some(CacheEntry::Queued(n)) => {
                     cache.insert(rip, CacheEntry::Never);
                     Some(n)
@@ -404,8 +408,8 @@ impl JitShared {
     /// their full wait budget.
     fn bg_install_drop(&self, rip: u64) {
         let notify = {
-            let mut cache = self.cache.write().unwrap();
-            match cache.remove(&rip) {
+            let cache = self.cache.pin();
+            match cache.remove(&rip).cloned() {
                 Some(CacheEntry::Queued(n)) => Some(n),
                 _ => None,
             }

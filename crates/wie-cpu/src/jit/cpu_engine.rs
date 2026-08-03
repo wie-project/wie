@@ -149,7 +149,7 @@ impl CpuEngine for JitCpu {
 
     fn flush_instruction_cache(&mut self, addr: u64, size: usize) -> Result<(), CpuError> {
         if size == 0 {
-            if !self.shared.cache.read().unwrap().is_empty() {
+            if !self.shared.cache.pin().is_empty() {
                 self.clear_compiled();
                 self.invalidate_chain_and_shadow();
                 self.stats.code_invs = self.stats.code_invs.saturating_add(1);
@@ -240,10 +240,8 @@ impl CpuEngine for JitCpu {
         } else {
             self.shared
                 .cache
-                .write()
-                .unwrap()
-                .entry(address)
-                .or_insert(CacheEntry::Never);
+                .pin()
+                .get_or_insert(address, CacheEntry::Never);
         }
     }
 
@@ -294,7 +292,7 @@ impl CpuEngine for JitCpu {
             let mut chain_result = None;
             if self.shared.engine_ready.load(Ordering::Relaxed) {
                 let meta = {
-                    let cache = self.shared.cache.read().unwrap();
+                    let cache = self.shared.cache.pin();
                     cache.get(&rip).and_then(|e| match e {
                         CacheEntry::Ready(c) => Some(CompiledRunMeta::from(c)),
                         _ => None,
