@@ -1,17 +1,15 @@
 //! wgpu (Metal) present backend.
 //!
-//! Replaces the softbuffer CPU path for getting guest frames on screen. The
-//! guest thread keeps publishing [`SurfaceFrame`]s (0RGB u32, top-down); this
+//! The guest thread publishes [`SurfaceFrame`]s (0RGB u32, top-down); this
 //! module uploads them to a persistent staging texture and blits to the
 //! window's CAMetalLayer-backed surface.
 //!
 //! Why a blit pass instead of `write_texture` straight into the surface?
 //! Guest pixels are 0RGB with the alpha byte ALWAYS 0. wgpu honors alpha, so a
-//! direct upload would present a fully transparent window (softbuffer's AppKit
-//! backend masked it via `CGImageAlphaInfo::NoneSkipFirst`). The blit forces
-//! `alpha = 1.0` and gives dirty-region uploads real savings: the staging
-//! texture persists across frames (unlike softbuffer's fresh-zeroed-buffer-per
-//! `buffer_mut()`), so only the dirty region is re-uploaded.
+//! direct upload would present a fully transparent window (the AppKit path
+//! must force alpha opaque). The blit forces `alpha = 1.0` and gives
+//! dirty-region uploads real savings: the staging texture persists across
+//! frames, so only the dirty region is re-uploaded.
 //!
 //! All wgpu calls are safe — no `unsafe` lives outside wie-cpu.
 
@@ -26,8 +24,8 @@ use winit::window::Window;
 ///
 /// The fragment output must force alpha to 1.0 — guest pixels carry alpha=0
 /// (0RGB), and without the override the window would be fully transparent.
-/// Nearest sampling gives the same scaling semantics as the softbuffer path's
-/// CPU `stretch_nearest` when the window size differs from the frame size.
+/// Nearest sampling gives the same scaling semantics as the CPU
+/// `stretch_nearest` when the window size differs from the frame size.
 const BLIT_SHADER: &str = r#"
 @group(0) @binding(0) var frame_tex: texture_2d<f32>;
 @group(0) @binding(1) var frame_sampler: sampler;
@@ -171,7 +169,7 @@ impl WgpuPresenter {
             // fail validation on an absurd window size.
             width: window.inner_size().width.max(1).min(max_tex_dim),
             height: window.inner_size().height.max(1).min(max_tex_dim),
-            // Fifo = vsync, matching softbuffer's blocking present.
+            // Fifo = vsync, the blocking-present equivalent.
             present_mode: wgpu::PresentMode::Fifo,
             desired_maximum_frame_latency: 2,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
@@ -211,8 +209,8 @@ impl WgpuPresenter {
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("wie present nearest sampler"),
-            // Nearest = identical scaling semantics to the softbuffer path's
-            // CPU `stretch_nearest`. Clamp-to-edge: sampling past the last
+            // Nearest = identical scaling semantics to the CPU `stretch_nearest`.
+            // Clamp-to-edge: sampling past the last
             // pixel row/column repeats the edge, matching a clamped blit.
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
@@ -294,12 +292,23 @@ impl WgpuPresenter {
     /// surface must be reconfigured (`Outdated`) or recreated (`Lost`).
     pub(crate) fn present(
         &mut self,
-        frame: &SurfaceFrame,
+        frame: SurfaceFrame,
         window_w: u32,
         window_h: u32,
     ) -> Result<()> {
-        let frame_w = frame.width.max(1);
-        let frame_h = frame.height.max(1);
+        // Consume the frame up front: the pixel Arc is only needed for the
+        // staging upload below, and `write_texture` copies it synchronously.
+        // Taking ownership (instead of borrowing) lets us drop the Arc right
+        // after the upload — before the render pass — shrinking the host hold
+        // window so the guest's next `ensure_surface` hand-back can
+        // `Arc::try_unwrap` the published buffer zero-copy instead of cloning.
+        let SurfaceFrame {
+            width: frame_w_raw,
+            height: frame_h_raw,
+            pixels,
+        } = frame;
+        let frame_w = frame_w_raw.max(1);
+        let frame_h = frame_h_raw.max(1);
 
         // Recreate the staging texture when the guest frame size changed.
         // Publish-model rework: every publish is a FULL frame, so the
@@ -319,7 +328,7 @@ impl WgpuPresenter {
         // Full-frame upload: zero-copy u32 → u8 view of the 0RGB buffer (LE
         // on all supported hosts). `bytemuck::cast_slice` is safe: u32 → u8
         // is any-bit-pattern.
-        let bytes = bytemuck::cast_slice(&frame.pixels);
+        let bytes = bytemuck::cast_slice(&pixels);
         let pitch = usize::try_from(frame_w)
             .context("frame width")?
             .saturating_mul(4);
@@ -346,6 +355,10 @@ impl WgpuPresenter {
                 depth_or_array_layers: 1,
             },
         );
+        // wgpu copied the pixels into the staging buffer synchronously; the
+        // render pass below only samples the staging texture. Release the
+        // guest Arc now instead of holding it across the render + present.
+        drop(pixels);
 
         match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(stex)

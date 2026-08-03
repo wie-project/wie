@@ -6,7 +6,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use wie_cpu::stretch_nearest;
 use wie_runtime::GuestHandle;
 use wie_runtime::MenuNode;
 use wie_runtime::RuntimeSession;
@@ -99,7 +98,7 @@ impl WieApp {
             return;
         }
         tracing::debug!("menu items: {:?}", items);
-        self.menu_bar.rebuild(&items);
+        self.menu_bar.rebuild(items.as_slice());
         self.last_menu_items = items;
     }
 }
@@ -119,7 +118,7 @@ struct WindowRuntime {
     /// Guest HWND this window mirrors.
     hwnd: Hwnd,
     window: Arc<Window>,
-    /// At-most-one present backend (wgpu XOR softbuffer), by construction.
+    /// The wgpu (Metal) present backend, created at window construction.
     surface: Option<PresentBackend>,
     /// Present generation of the last frame actually presented; frames
     /// with an unchanged generation AND unchanged window size are skipped.
@@ -174,77 +173,16 @@ impl WindowState {
     }
 }
 
-/// The present backend for a window. At most one variant is set — the two
-/// backends are mutually exclusive per window.
-enum PresentBackend {
-    /// wgpu (Metal) present backend, used by default on macOS. When set,
-    /// `Softbuffer` stays unset. Falls back to softbuffer if wgpu init fails
-    /// or `WIE_PRESENT` names softbuffer.
-    #[cfg(target_os = "macos")]
-    Wgpu(crate::gui::present_wgpu::WgpuPresenter),
-    /// softbuffer (CPU copy) — the fallback and the non-macOS path.
-    Softbuffer(softbuffer::Surface<Arc<Window>, Arc<Window>>),
-}
+/// The wgpu (Metal) present backend for a window, created at window
+/// construction. The guest frame is uploaded to a staging texture and blitted
+/// to the swapchain; the pixel Arc is dropped right after the upload so the
+/// guest can hand the surface buffer back zero-copy on the next paint.
+type PresentBackend = crate::gui::present_wgpu::WgpuPresenter;
 
-/// Parsed `WIE_PRESENT` value, read once at window creation. Only the exact
-/// value "softbuffer" keeps the CPU path; anything else (including unset)
-/// uses wgpu on macOS.
-#[cfg(target_os = "macos")]
-enum PresentBackendName {
-    Wgpu,
-    Softbuffer,
-}
-
-#[cfg(target_os = "macos")]
-impl PresentBackendName {
-    fn from_env() -> Self {
-        // Exact match preserved from the historical inline compare: any
-        // value other than "softbuffer" (or an unset var) means wgpu.
-        if matches!(
-            std::env::var("WIE_PRESENT").ok().as_deref(),
-            Some("softbuffer")
-        ) {
-            Self::Softbuffer
-        } else {
-            Self::Wgpu
-        }
-    }
-}
-
-/// Initialize the present backend per [`PresentBackendName::from_env`]:
-/// "softbuffer" keeps the CPU path, anything else (default) uses wgpu on
-/// macOS. On wgpu init failure we fall back to softbuffer rather than showing
-/// a black window.
-#[cfg(target_os = "macos")]
+/// Initialize the wgpu present backend. wgpu init is expected to succeed on
+/// macOS (Metal backend); a failure here means the host cannot present at all.
 fn init_present_backend(window: &Arc<Window>) -> Option<PresentBackend> {
-    match PresentBackendName::from_env() {
-        PresentBackendName::Softbuffer => init_softbuffer(window),
-        PresentBackendName::Wgpu => {
-            match crate::gui::present_wgpu::WgpuPresenter::init(window.clone()) {
-                Ok(presenter) => Some(PresentBackend::Wgpu(presenter)),
-                Err(e) => {
-                    tracing::error!(
-                        target: "wiegui",
-                        error = %e,
-                        "wgpu init failed; falling back to softbuffer"
-                    );
-                    init_softbuffer(window)
-                }
-            }
-        }
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn init_present_backend(window: &Arc<Window>) -> Option<PresentBackend> {
-    init_softbuffer(window)
-}
-
-fn init_softbuffer(window: &Arc<Window>) -> Option<PresentBackend> {
-    let ctx = softbuffer::Context::new(window.clone()).ok()?;
-    softbuffer::Surface::new(&ctx, window.clone())
-        .ok()
-        .map(PresentBackend::Softbuffer)
+    crate::gui::present_wgpu::WgpuPresenter::init(window.clone()).ok()
 }
 
 /// winit application state: bridges the guest window to the present backend.
@@ -268,7 +206,7 @@ struct WieApp {
     menu_bar: crate::gui::menu_bar::MacMenuBar,
     /// Menu items the menu bar was last rebuilt with (cheap change check).
     #[cfg(target_os = "macos")]
-    last_menu_items: Vec<MenuNode>,
+    last_menu_items: Arc<Vec<MenuNode>>,
 }
 
 impl ApplicationHandler<WieEvent> for WieApp {
@@ -386,65 +324,19 @@ impl ApplicationHandler<WieEvent> for WieApp {
                         dst_w,
                         dst_h,
                     );
-                    let src_w = frame.width.max(1);
-                    let src_h = frame.height.max(1);
-                    // Time copy ③ (write_texture + present, or
-                    // copy_from_slice / stretch_nearest + softbuffer present)
-                    // — only when frame timing is on.
                     let present_t0 = if handle.frame_timing_enabled() {
                         Some(Instant::now())
                     } else {
                         None
                     };
-                    if let Some(backend) = rt.surface.as_mut() {
-                        match backend {
-                            #[cfg(target_os = "macos")]
-                            PresentBackend::Wgpu(presenter) => {
-                                // wgpu path — no CPU copy; the blit pass
-                                // nearest-scales via the sampler when the window
-                                // size differs from the frame size (identical
-                                // nearest semantics to stretch_nearest).
-                                if let Err(e) = presenter.present(&frame, dst_w, dst_h) {
-                                    tracing::error!(target: "wiegui", error = %e, "wgpu present failed");
-                                }
-                            }
-                            PresentBackend::Softbuffer(surface) => {
-                                let nzw = std::num::NonZeroU32::new(dst_w)
-                                    .unwrap_or(std::num::NonZeroU32::MIN);
-                                let nzh = std::num::NonZeroU32::new(dst_h)
-                                    .unwrap_or(std::num::NonZeroU32::MIN);
-                                let _ = surface.resize(nzw, nzh);
-                                if let Ok(mut buf) = surface.buffer_mut() {
-                                    if src_w == dst_w && src_h == dst_h {
-                                        // Full copy only. softbuffer's AppKit
-                                        // backend (cg.rs) allocates a fresh
-                                        // zeroed buffer on every `buffer_mut()`
-                                        // call — the previous frame's pixels
-                                        // are never retained — so a
-                                        // region-only copy would black out
-                                        // everything outside the region
-                                        // (visible as a black flash after
-                                        // resize and as element-shaped bands
-                                        // on partial control repaints). The
-                                        // frame's `region` field remains for
-                                        // guest-side bookkeeping and tests,
-                                        // but the presented buffer is always
-                                        // fully rewritten.
-                                        let n = buf.len().min(frame.pixels.len());
-                                        buf[..n].copy_from_slice(&frame.pixels[..n]);
-                                    } else {
-                                        stretch_nearest(
-                                            &mut buf,
-                                            &frame.pixels,
-                                            src_w,
-                                            src_h,
-                                            dst_w,
-                                            dst_h,
-                                        );
-                                    }
-                                    let _ = buf.present();
-                                }
-                            }
+                    // wgpu path — no CPU copy; the blit pass nearest-scales via
+                    // the sampler when the window size differs from the frame
+                    // size (identical nearest semantics to stretch_nearest).
+                    // The frame is moved so the present backend can drop the
+                    // pixel Arc right after the staging upload.
+                    if let Some(presenter) = rt.surface.as_mut() {
+                        if let Err(e) = presenter.present(frame, dst_w, dst_h) {
+                            tracing::error!(target: "wiegui", error = %e, "wgpu present failed");
                         }
                     }
                     if let Some(t0) = present_t0 {
@@ -636,8 +528,7 @@ impl ApplicationHandler<WieEvent> for WieApp {
                 // Keep the wgpu swapchain matching the window's physical
                 // size. This is purely the host surface — the guest-visible
                 // WM_SIZE bookkeeping below is untouched.
-                #[cfg(target_os = "macos")]
-                if let Some(PresentBackend::Wgpu(presenter)) = rt.surface.as_mut() {
+                if let Some(presenter) = rt.surface.as_mut() {
                     presenter.resize(size.width.max(1), size.height.max(1));
                 }
                 let w = size.width.max(1);
@@ -852,7 +743,7 @@ pub fn run_gui_windowed(path: &std::path::Path) -> Result<()> {
         #[cfg(target_os = "macos")]
         menu_bar: crate::gui::menu_bar::MacMenuBar::new(proxy.clone()),
         #[cfg(target_os = "macos")]
-        last_menu_items: Vec::new(),
+        last_menu_items: Arc::new(Vec::new()),
     };
 
     event_loop

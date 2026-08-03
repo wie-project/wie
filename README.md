@@ -31,7 +31,7 @@ WIE (_Wie Is Emulator_) runs **Windows PE64 user-mode binaries** on **macOS Appl
 | **Menus** | ✅ | Guest menu bars mirrored into the **macOS top bar** |
 | **Text** | ✅ | Real macOS system fonts (Unicode, proportional, bold/italic, glyph cache) |
 | **Graphics (D3D9)** | 🟡 | Software renderer: Clear, DrawPrimitive(UP)/Indexed, **textures, alpha blend, depth, PS 2.0**; VS 2.0 in flight |
-| **Present** | ✅ | wgpu (Metal) with dirty-region uploads; softbuffer fallback |
+| **Present** | ✅ | wgpu (Metal) with dirty-region uploads |
 
 The WinAPI surface is intentionally incomplete — many handlers are stubs sufficient for the micro-suite and engine bring-up. See [`docs/missing-winapi-handlers.md`](docs/missing-winapi-handlers.md) for the gap list.
 
@@ -183,7 +183,6 @@ What actually burns CPU today:
 | Variable | Effect |
 | --- | --- |
 | `WIE_CPU=jit` \| `iced` | CPU backend (default **jit**) |
-| `WIE_PRESENT=wgpu` \| `softbuffer` | GUI present backend (default **wgpu**/Metal; softbuffer fallback) |
 | `WIE_MPROTECT=0` | Disable optional host `mprotect` dual-protection (SPC remains on) |
 | `WIE_JIT_MEM=sticky` \| `pin` \| `slow` | JIT mem lower (default **sticky** = 2-way multi sticky + stack pin) |
 | `WIE_JIT_MEM_TRACE=1` | Dump helper mem-path histogram on finalize |
