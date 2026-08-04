@@ -242,10 +242,14 @@ pub enum FileDialogPolicy {
 
     /// No scripted decision: show the host file dialog.
     ///
+    /// When the GUI presenter also registers a native file-dialog bridge
+    /// (`GuestHandle::set_file_dialog_bridge`), the dialog is the OS panel
+    /// (macOS NSOpenPanel/NSSavePanel via rfd) and the handler writes the
+    /// pick straight back into the `OPENFILENAME` buffer. Without a bridge,
     /// `GetOpenFileName` / `GetSaveFileName` build the file-dialog window from
     /// the existing EDIT / LISTBOX / BUTTON controls and run its modal message
     /// loop in-guest (the same mechanism `DialogBoxParam` uses), so the guest
-    /// stays responsive while the user picks a path. Registered by the GUI
+    /// stays responsive while a user picks a path. Registered by the GUI
     /// presenter at session start; headless runs keep [`Self::Cancel`] so a
     /// guest can never hang on a dialog nobody can click.
     Interactive,

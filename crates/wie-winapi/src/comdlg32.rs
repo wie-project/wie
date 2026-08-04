@@ -8,7 +8,9 @@ use crate::guest_string::{
     read_ansi_lossy, read_utf16_lossy, write_ansi_c_string, write_utf16_c_string,
 };
 use crate::handles::Hwnd;
-use crate::state::{FileDialogSession, FindDialogSession, FontDialogSession};
+use crate::state::{
+    FileDialogFilter, FileDialogRequest, FileDialogSession, FindDialogSession, FontDialogSession,
+};
 use crate::user32::controls::{ControlClassKind, ControlState};
 use crate::user32::{
     BS_DEFPUSHBUTTON, CommandPayload, CreateWindowRequest, GuestCallbackRequest, IDCANCEL, IDOK,
@@ -33,6 +35,8 @@ const OFN_NFILE_OFFSET: u64 = 100;
 const OFN_NFILE_EXTENSION: u64 = 102;
 /// `OPENFILENAME.hwndOwner` — the dialog's owner window.
 const OFN_HWND_OWNER: u64 = 8;
+/// `OPENFILENAME.lpstrFilter` — the double-NUL-terminated `name\0pattern\0` pairs.
+const OFN_LPSTR_FILTER: u64 = 24;
 /// `OPENFILENAME.lpstrInitialDir` — the directory the dialog lists.
 const OFN_LPSTR_INITIAL_DIR: u64 = 80;
 /// `OPENFILENAME.lpstrDefExt` — appended when the typed name has no extension.
@@ -533,11 +537,19 @@ fn handle_get_file_name(
             }
         }
 
-        // No scripted decision: build the host file dialog and run its modal
-        // message loop in-guest (the DialogBoxParam pattern), so the guest
-        // stays responsive while the user picks a path. Returns a
-        // `GuestCallbackRequested` signal to the runtime.
+        // No scripted decision: show the host file dialog. When the GUI
+        // presenter registered a native file-dialog bridge (macOS panel via
+        // rfd), use it — the guest thread blocks inside the bridge until the
+        // user picks, exactly like the MessageBox bridge. Without a bridge
+        // (headless/trace sessions), build the in-app "FileDialog" window and
+        // run its modal message loop in-guest (the DialogBoxParam pattern).
         FileDialogPolicy::Interactive => {
+            let bridge_registered = state
+                .try_window_state()
+                .is_some_and(|window_state| window_state.file_dialog_bridge.is_some());
+            if bridge_registered {
+                return open_host_file_dialog_via_bridge(ctx, api_name, unicode, &buffer);
+            }
             return open_host_file_dialog(ctx, api_name, unicode, &buffer);
         }
     };
@@ -1097,6 +1109,330 @@ fn open_host_file_dialog(
         },
     }
     .into())
+}
+
+/// `FileDialogPolicy::Interactive` with a host bridge registered: show the
+/// native panel (macOS NSOpenPanel/NSSavePanel via rfd, behind the
+/// `GuestHandle::set_file_dialog_bridge` seam) and return its pick.
+///
+/// The guest thread blocks inside the bridge until the panel closes — the
+/// native panel runs on the main thread (rfd's own dispatch), so the guest
+/// semantics match the MessageBox bridge. The picked HOST path is confined to
+/// a guest volume at accept: a pick the guest filesystem cannot see (the user
+/// browsed outside the bottle via the panel's sidebar) cancels like a user
+/// pressing Cancel — FALSE, `lpstrFile` untouched, with a `tracing::warn`.
+fn open_host_file_dialog_via_bridge(
+    ctx: &mut HandlerContext<'_>,
+    api_name: &str,
+    unicode: bool,
+    buffer: &OfnBuffer,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+
+    let initial_file = read_ofn_string(engine, buffer.file_buffer_ptr, unicode, api_name)?;
+    let initial_dir_ptr = read_guest_u64(
+        engine,
+        checked_field_address(
+            buffer.ofn_ptr,
+            OFN_LPSTR_INITIAL_DIR,
+            "OPENFILENAME.lpstrInitialDir",
+        ),
+    )
+    .with_context(|| format!("failed to read lpstrInitialDir for {api_name}"))?;
+    let caller_initial_dir = if initial_dir_ptr != 0 {
+        read_ofn_string(engine, initial_dir_ptr, unicode, api_name)?
+    } else {
+        String::new()
+    };
+    let filter_ptr = read_guest_u64(
+        engine,
+        checked_field_address(buffer.ofn_ptr, OFN_LPSTR_FILTER, "OPENFILENAME.lpstrFilter"),
+    )
+    .with_context(|| format!("failed to read lpstrFilter for {api_name}"))?;
+
+    // Confined resolution (the same precedence the in-app dialog uses):
+    // lpstrInitialDir when guest-visible, then the lpstrFile directory, then
+    // the guest cwd, else the bottle root. The panel starts there — mapped to
+    // a host directory (the bottle root's drive_c when nothing maps).
+    let initial_dir = resolve_initial_dir(
+        &state.file_io.volumes,
+        &current_guest_directory(state),
+        &caller_initial_dir,
+        directory_of(&initial_file),
+    );
+    let initial_host_dir = crate::vfs::guest_path_to_host(&state.file_io.volumes, &initial_dir)
+        .map(|mapping| mapping.host)
+        .or_else(|| {
+            state
+                .file_io
+                .volumes
+                .bottle_root
+                .as_ref()
+                .map(|root| root.join("drive_c"))
+        });
+    let default_file_name = {
+        let basename = basename_of(&initial_file);
+        (!basename.is_empty()).then(|| basename.to_owned())
+    };
+    let is_save = api_name.contains("Save");
+    let filters = if filter_ptr != 0 {
+        let components = read_ofn_filter_components(engine, filter_ptr, unicode)?;
+        parse_ofn_filter(&components)
+    } else {
+        Vec::new()
+    };
+
+    let request = FileDialogRequest {
+        initial_host_dir,
+        default_file_name,
+        is_save,
+        filters,
+    };
+
+    // Invoke the host bridge; the borrow stays scoped to this statement so the
+    // write-back below can mutate `state`. `None` is the user cancelling (the
+    // `and_then` flattens the bridge's own `Option` — a `map` would nest it).
+    let picked = state
+        .try_window_state()
+        .and_then(|window_state| window_state.file_dialog_bridge.as_ref())
+        .and_then(|bridge| bridge(&request));
+
+    let Some(pick) = picked else {
+        // User cancelled the panel (or the bridge vanished mid-call — a
+        // racing teardown must not hang the guest).
+        state.window_state().comm_dlg_extended_error = CDERR_NONE;
+        tracing::info!(api = api_name, "native file dialog cancelled");
+        return file_dialog_return(engine, api_name, 0);
+    };
+
+    // Confinement at accept: the picked HOST path must map into a guest volume
+    // (the C: bottle or the optional D: bridge). `host_path_to_guest` IS the
+    // confinement — it returns None for anything outside both volumes, so an
+    // out-of-bottle pick is refused like a cancel (FALSE, buffer untouched).
+    let Some(guest_path) = crate::vfs::host_path_to_guest(&state.file_io.volumes, &pick.host_path)
+    else {
+        state.window_state().comm_dlg_extended_error = CDERR_NONE;
+        tracing::warn!(
+            api = api_name,
+            host = %pick.host_path.display(),
+            "native file dialog pick outside the bottle; cancelling"
+        );
+        return file_dialog_return(engine, api_name, 0);
+    };
+
+    if buffer.file_buffer_ptr == 0 || buffer.max_file == 0 {
+        state.window_state().comm_dlg_extended_error = CDERR_NONE;
+        tracing::warn!(
+            api = api_name,
+            "file dialog bridge accepted but lpstrFile/nMaxFile invalid"
+        );
+        return file_dialog_return(engine, api_name, 0);
+    }
+
+    // The shared write-back (`write_selected_path` — the same machinery the
+    // policy + EndDialog flows use): copy the guest path into `lpstrFile` (+
+    // `lpstrFileTitle`) and store `nFileOffset` / `nFileExtension`.
+    write_selected_path(
+        engine,
+        &SelectedPathWrite {
+            ofn_ptr: buffer.ofn_ptr,
+            file_buffer_ptr: buffer.file_buffer_ptr,
+            max_file: buffer.max_file,
+            file_title_ptr: buffer.file_title_ptr,
+            max_file_title: buffer.max_file_title,
+            path: &guest_path,
+            unicode,
+        },
+    )
+    .with_context(|| format!("failed to write selected path for {api_name}"))?;
+
+    state.window_state().comm_dlg_extended_error = CDERR_NONE;
+    state.window_state().last_file_dialog_path = Some(guest_path.clone());
+    tracing::info!(api = api_name, %guest_path, unicode, "native file dialog accepted");
+    file_dialog_return(engine, api_name, 1)
+}
+
+/// Build a `WinApiHandlerResult` that returns `value` from the API.
+fn file_dialog_return(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    api_name: &str,
+    value: u64,
+) -> Result<WinApiHandlerResult> {
+    let return_address = engine
+        .return_from_win64_api(value)
+        .with_context(|| format!("failed to return from {api_name}"))?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: value,
+    })
+}
+
+/// Cap for a guest `lpstrFilter` multi-string scan (in characters/units).
+/// Real filters are a few dozen characters; this bounds a hostile guest.
+const OFN_FILTER_MAX_CHARS: usize = 256;
+
+/// Read the payload of a double-NUL-terminated guest multi-string — the
+/// `lpstrFilter` shape (`name\0pattern\0…\0\0`) — as the NUL-separated
+/// components before the final double NUL. `wide` reads UTF-16 units (W
+/// variants), else bytes (A variants).
+///
+/// Page-safe like the `guest_string` readers: each bulk read stops at the
+/// 4 KiB page boundary so an unmapped tail page cannot fail a valid prefix.
+fn read_ofn_filter_components(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    ptr: u64,
+    wide: bool,
+) -> Result<Vec<String>> {
+    if ptr == 0 {
+        return Ok(Vec::new());
+    }
+    // Accumulate raw units/bytes, stopping at TWO consecutive NULs.
+    let mut payload: Vec<u8> = Vec::with_capacity(64);
+    let mut scratch = [0_u8; 4096];
+    let mut cursor = ptr;
+    let mut remaining = OFN_FILTER_MAX_CHARS;
+    let mut end = false;
+    // Carried across page reads so a terminator straddling a 4 KiB boundary
+    // (a NUL as the last unit of one page, a NUL as the first of the next)
+    // is still detected.
+    let mut prev_zero = false;
+    while remaining > 0 && !end {
+        let byte_budget = if wide {
+            // Keep the budget even so a UTF-16 unit is never split.
+            remaining.saturating_mul(2).min(scratch.len() & !1)
+        } else {
+            remaining.min(scratch.len())
+        };
+        if byte_budget == 0 {
+            break;
+        }
+        // Stay inside the current 4 KiB page (`mem_read` needs a valid range).
+        let page_end = (cursor | 4095).wrapping_add(1);
+        let in_page = page_end
+            .saturating_sub(cursor)
+            .min(u64::try_from(byte_budget).unwrap_or(u64::MAX));
+        let mut take = usize::try_from(in_page)
+            .unwrap_or(byte_budget)
+            .min(byte_budget);
+        if wide {
+            take &= !1;
+        }
+        if take == 0 {
+            break;
+        }
+        let slice = scratch.get_mut(..take).context("lpstrFilter read slice")?;
+        engine
+            .mem_read(cursor, slice)
+            .context("failed to read lpstrFilter")?;
+
+        if wide {
+            for pair in slice.as_chunks::<2>().0 {
+                let lo = *pair.first().unwrap_or(&0);
+                let hi = *pair.get(1).unwrap_or(&0);
+                let unit = u16::from_le_bytes([lo, hi]);
+                if unit == 0 {
+                    if prev_zero {
+                        // Two consecutive NUL units = the multi-string end.
+                        end = true;
+                        break;
+                    }
+                    prev_zero = true;
+                    // Keep the single-NUL component separator in the payload.
+                    payload.extend_from_slice(&[0, 0]);
+                } else {
+                    prev_zero = false;
+                    payload.extend_from_slice(pair);
+                }
+            }
+        } else {
+            for &byte in slice.iter() {
+                if byte == 0 {
+                    if prev_zero {
+                        end = true;
+                        break;
+                    }
+                    prev_zero = true;
+                    // Keep the single-NUL component separator in the payload.
+                    payload.push(0);
+                } else {
+                    prev_zero = false;
+                    payload.push(byte);
+                }
+            }
+        }
+        let consumed = if wide { take / 2 } else { take };
+        remaining = remaining.saturating_sub(consumed);
+        cursor = cursor.wrapping_add(u64::try_from(take).unwrap_or(0));
+    }
+
+    if wide {
+        let units: Vec<u16> = payload
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| {
+                let lo = *pair.first().unwrap_or(&0);
+                let hi = *pair.get(1).unwrap_or(&0);
+                u16::from_le_bytes([lo, hi])
+            })
+            .collect();
+        Ok(String::from_utf16_lossy(&units)
+            .split('\0')
+            .filter(|component| !component.is_empty())
+            .map(str::to_owned)
+            .collect())
+    } else {
+        Ok(crate::vfs::decode_ansi_utf8_first(&payload)
+            .split('\0')
+            .filter(|component| !component.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+}
+
+/// Parse `lpstrFilter` components into native filters (best-effort).
+///
+/// A filter group survives only when every pattern in it is a simple `*.ext`
+/// glob (`*.*` catch-alls, wildcard names, and empty names are dropped) — a
+/// wrong native filter grays out every file on macOS, which is worse than
+/// showing all files. Semicolon-separated simple globs (`*.rs;*.toml`) stay
+/// one group. Returns an empty list when nothing survives (the panel shows
+/// everything).
+fn parse_ofn_filter(components: &[String]) -> Vec<FileDialogFilter> {
+    let mut filters = Vec::new();
+    // Components arrive as `name, patterns` pairs.
+    for pair in components.chunks(2) {
+        let [name, patterns] = pair else {
+            // A trailing odd component (the multi-string ended mid-pair).
+            break;
+        };
+        let patterns: Vec<String> = patterns
+            .split(';')
+            .map(str::trim)
+            .filter(|pattern| is_simple_filter_glob(pattern))
+            .map(str::to_owned)
+            .collect();
+        if name.is_empty() || patterns.is_empty() {
+            continue;
+        }
+        filters.push(FileDialogFilter {
+            name: name.clone(),
+            patterns,
+        });
+    }
+    filters
+}
+
+/// Whether `pattern` is a plain `*.ext` glob (`*.txt`): exactly one leading
+/// `*.` and a non-empty extension of word characters. Anything else — `*.*`,
+/// `*.tar.gz`, bare names, wildcards in the extension — is not a safe native
+/// filter and is dropped.
+fn is_simple_filter_glob(pattern: &str) -> bool {
+    let Some(extension) = pattern.strip_prefix("*.") else {
+        return false;
+    };
+    !extension.is_empty() && extension.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
 /// `GetOpenFileName`/`GetSaveFileName` shared write-back (policy + interactive
@@ -2562,9 +2898,10 @@ mod tests {
     use super::{
         apply_default_extension, basename_of, complete_file_dialog, dialog_family_names,
         directory_of, finalize_guest_path, handle_choose_font_w, handle_find_dialog_command,
-        handle_find_text_w, handle_get_open_file_name_w, handle_page_setup_dlg_w,
-        handle_print_dlg_w, handle_replace_text_w, is_absolute_windows_path, is_find_dialog_window,
-        list_directory, resolve_initial_dir, split_path_components,
+        handle_find_text_w, handle_get_open_file_name_w, handle_get_save_file_name_w,
+        handle_page_setup_dlg_w, handle_print_dlg_w, handle_replace_text_w,
+        is_absolute_windows_path, is_find_dialog_window, is_simple_filter_glob, list_directory,
+        parse_ofn_filter, resolve_initial_dir, split_path_components,
     };
     use crate::guest_heap::GuestHeap;
     use crate::handles::Hwnd;
@@ -2583,8 +2920,9 @@ mod tests {
     };
     use crate::vfs::VolumeConfig;
     use crate::{
-        DEFAULT_ENVIRONMENT, DllStateMap, FileDialogPolicy, FontDialogPolicy, HandlerContext,
-        KernelState, ModuleState, WinApiHandlerResult, WinApiState,
+        DEFAULT_ENVIRONMENT, DllStateMap, FileDialogBridge, FileDialogPick, FileDialogPolicy,
+        FontDialogPolicy, HandlerContext, KernelState, ModuleState, WinApiHandlerResult,
+        WinApiState,
     };
     use ahash::HashMap;
     use ahash::HashMapExt;
@@ -3289,6 +3627,244 @@ mod tests {
             "within-bottle `..` collapses and the canonical path is written back"
         );
         assert!(state.window_state().file_dialog.is_none());
+    }
+
+    // ── Native file-dialog bridge (macOS panels via rfd) ──────────────────
+
+    /// Drive the W handler with a scripted native bridge (Interactive policy).
+    fn dispatch_open_with_bridge(
+        engine: &mut IcedCpu,
+        state: &mut WinApiState,
+        bridge: FileDialogBridge,
+    ) -> anyhow::Result<WinApiHandlerResult> {
+        state.window_state().file_dialog_policy = FileDialogPolicy::Interactive;
+        state.window_state().file_dialog_bridge = Some(bridge);
+        write_regs(engine, 0x5000, 0, 0, 0);
+        handle_get_open_file_name_w(&mut HandlerContext::new(engine, test_environment(), state))
+    }
+
+    /// A scripted bridge standing in for the native panel: the pick is a host
+    /// path inside the bottle, so the write-back must succeed and return TRUE.
+    #[test]
+    fn bridge_pick_inside_bottle_writes_guest_path_and_returns_true() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        state.file_io.volumes = VolumeConfig {
+            bottle_root: Some(PathBuf::from("/tmp/bottle")),
+            drive_d_root: None,
+        };
+        let file_buf = 0x6000;
+        engine.mem_write(file_buf, &utf16_bytes("notes.txt")).ok();
+        write_ofn(&mut engine, 0x5000, file_buf, 260, 0);
+
+        let bridge: FileDialogBridge = Box::new(|request| {
+            // The panel starts in the guest cwd (C:\ fallback) mapped to the
+            // host bottle directory.
+            assert_eq!(
+                request.initial_host_dir.as_deref(),
+                Some(std::path::Path::new("/tmp/bottle/drive_c")),
+                "initial dir = the confined guest dir mapped into the bottle"
+            );
+            assert_eq!(request.default_file_name.as_deref(), Some("notes.txt"));
+            assert!(!request.is_save, "GetOpenFileName is an open panel");
+            Some(FileDialogPick {
+                host_path: PathBuf::from("/tmp/bottle/drive_c/App/notes.txt"),
+            })
+        });
+
+        let result = dispatch_open_with_bridge(&mut engine, &mut state, bridge)
+            .expect("bridge accept must succeed");
+        assert_eq!(result.return_value, 1, "an in-bottle pick → TRUE");
+        assert_eq!(
+            read_guest_utf16(&mut engine, file_buf, 64),
+            r"C:\App\notes.txt",
+            "the host pick maps back to the guest path in lpstrFile"
+        );
+        assert_eq!(
+            state.window_state().last_file_dialog_path.as_deref(),
+            Some(r"C:\App\notes.txt")
+        );
+        assert!(
+            state.window_state().file_dialog.is_none(),
+            "the bridge path builds no in-app dialog session"
+        );
+    }
+
+    /// The picked host path lands OUTSIDE both guest volumes (the user
+    /// browsed away via the panel's sidebar): the confinement at accept must
+    /// refuse it like a cancel — FALSE, `lpstrFile` untouched.
+    #[test]
+    fn bridge_pick_outside_bottle_cancels_without_touching_buffer() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        state.file_io.volumes = VolumeConfig {
+            bottle_root: Some(PathBuf::from("/tmp/bottle")),
+            drive_d_root: None,
+        };
+        let file_buf = 0x6000;
+        engine.mem_write(file_buf, &utf16_bytes("notes.txt")).ok();
+        write_ofn(&mut engine, 0x5000, file_buf, 260, 0);
+
+        let bridge: FileDialogBridge = Box::new(|_| {
+            Some(FileDialogPick {
+                host_path: PathBuf::from("/etc/passwd"),
+            })
+        });
+        let result = dispatch_open_with_bridge(&mut engine, &mut state, bridge)
+            .expect("bridge accept must succeed");
+        assert_eq!(result.return_value, 0, "an out-of-bottle pick → FALSE");
+        assert_eq!(
+            read_guest_utf16(&mut engine, file_buf, 64),
+            "notes.txt",
+            "lpstrFile stays untouched"
+        );
+        assert!(state.window_state().last_file_dialog_path.is_none());
+        assert_eq!(state.window_state().comm_dlg_extended_error, 0);
+    }
+
+    /// The bridge returning `None` is the user pressing Cancel in the native
+    /// panel: FALSE, no write-back.
+    #[test]
+    fn bridge_cancel_returns_false_without_touching_buffer() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        let file_buf = 0x6000;
+        engine.mem_write(file_buf, &utf16_bytes("notes.txt")).ok();
+        write_ofn(&mut engine, 0x5000, file_buf, 260, 0);
+
+        let bridge: FileDialogBridge = Box::new(|_| None);
+        let result = dispatch_open_with_bridge(&mut engine, &mut state, bridge)
+            .expect("bridge cancel must succeed");
+        assert_eq!(result.return_value, 0, "cancel → FALSE");
+        assert_eq!(read_guest_utf16(&mut engine, file_buf, 64), "notes.txt");
+        assert!(state.window_state().last_file_dialog_path.is_none());
+    }
+
+    /// The request must carry the save flag and the best-effort filter parse:
+    /// the simple "*.txt" group survives, the "*.*" catch-all is dropped.
+    #[test]
+    fn bridge_save_receives_save_flag_and_parsed_filter() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        state.file_io.volumes = VolumeConfig {
+            bottle_root: Some(PathBuf::from("/tmp/bottle")),
+            drive_d_root: None,
+        };
+        let file_buf = 0x6000;
+        engine.mem_write(file_buf, &utf16_bytes("report.txt")).ok();
+        write_ofn(&mut engine, 0x5000, file_buf, 260, 0);
+        // lpstrFilter: "Text Documents\0*.txt\0All Files\0*.*\0\0".
+        let filter_buf = 0x6200;
+        engine
+            .mem_write(
+                filter_buf,
+                &utf16_bytes("Text Documents\0*.txt\0All Files\0*.*\0\0"),
+            )
+            .ok();
+        engine
+            .mem_write(0x5000 + 24, &filter_buf.to_le_bytes())
+            .ok();
+
+        let bridge: FileDialogBridge = Box::new(|request| {
+            assert!(request.is_save, "GetSaveFileName is a save panel");
+            assert_eq!(request.default_file_name.as_deref(), Some("report.txt"));
+            assert_eq!(request.filters.len(), 1, "the *.* catch-all is dropped");
+            assert_eq!(request.filters[0].name, "Text Documents");
+            assert_eq!(request.filters[0].patterns, vec!["*.txt".to_owned()]);
+            Some(FileDialogPick {
+                host_path: PathBuf::from("/tmp/bottle/drive_c/report.txt"),
+            })
+        });
+
+        state.window_state().file_dialog_policy = FileDialogPolicy::Interactive;
+        state.window_state().file_dialog_bridge = Some(bridge);
+        write_regs(&mut engine, 0x5000, 0, 0, 0);
+        let result = handle_get_save_file_name_w(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("bridge save must succeed");
+        assert_eq!(result.return_value, 1);
+        assert_eq!(
+            read_guest_utf16(&mut engine, file_buf, 64),
+            r"C:\report.txt",
+            "the save pick maps back into the bottle"
+        );
+    }
+
+    /// A drive-D bridge pick maps to a `D:\…` guest path (the D: volume is
+    /// guest-visible when the bridge root is configured).
+    #[test]
+    fn bridge_pick_in_drive_d_maps_to_guest_d_path() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        state.file_io.volumes = VolumeConfig {
+            bottle_root: Some(PathBuf::from("/tmp/bottle")),
+            drive_d_root: Some(PathBuf::from("/Users/me/data")),
+        };
+        let file_buf = 0x6000;
+        engine.mem_write(file_buf, &utf16_bytes("a.7z")).ok();
+        write_ofn(&mut engine, 0x5000, file_buf, 260, 0);
+
+        let bridge: FileDialogBridge = Box::new(|_| {
+            Some(FileDialogPick {
+                host_path: PathBuf::from("/Users/me/data/archive/a.7z"),
+            })
+        });
+        let result = dispatch_open_with_bridge(&mut engine, &mut state, bridge)
+            .expect("bridge accept must succeed");
+        assert_eq!(result.return_value, 1);
+        assert_eq!(
+            read_guest_utf16(&mut engine, file_buf, 64),
+            r"D:\archive\a.7z"
+        );
+    }
+
+    /// `parse_ofn_filter` keeps only simple `*.ext` glob groups; complex or
+    /// catch-all patterns drop the group (a wrong native filter grays out
+    /// every file on macOS, which is worse than showing all files).
+    #[test]
+    fn parse_ofn_filter_keeps_simple_globs_only() {
+        // A `*.*` catch-all pair is dropped; the simple pair survives.
+        let filters = parse_ofn_filter(&[
+            "Text Documents".to_owned(),
+            "*.txt".to_owned(),
+            "All Files".to_owned(),
+            "*.*".to_owned(),
+        ]);
+        assert_eq!(filters.len(), 1, "All Files (*.*) is dropped");
+        assert_eq!(filters[0].name, "Text Documents");
+        assert_eq!(filters[0].patterns, vec!["*.txt".to_owned()]);
+
+        // Semicolon-separated simple globs survive as one filter group.
+        let filters = parse_ofn_filter(&["Code".to_owned(), "*.rs;*.toml".to_owned()]);
+        assert_eq!(filters.len(), 1);
+        assert_eq!(
+            filters[0].patterns,
+            vec!["*.rs".to_owned(), "*.toml".to_owned()]
+        );
+
+        // Complex patterns drop the whole group (nothing to show → no filter).
+        assert!(parse_ofn_filter(&["Any".to_owned(), "*".to_owned()]).is_empty());
+        assert!(parse_ofn_filter(&["All".to_owned(), "*.*".to_owned()]).is_empty());
+        assert!(parse_ofn_filter(&["Multi".to_owned(), "*.tar.gz".to_owned()]).is_empty());
+        assert!(parse_ofn_filter(&["Bare".to_owned(), "readme.txt".to_owned()]).is_empty());
+        assert!(parse_ofn_filter(&["Empty".to_owned(), String::new()]).is_empty());
+        // No filter at all → empty.
+        assert!(parse_ofn_filter(&[]).is_empty());
+    }
+
+    #[test]
+    fn simple_filter_glob_rejects_catchalls_and_complex_patterns() {
+        assert!(is_simple_filter_glob("*.txt"));
+        assert!(is_simple_filter_glob("*.TXT"));
+        assert!(!is_simple_filter_glob("*.*"));
+        assert!(!is_simple_filter_glob("*"));
+        assert!(!is_simple_filter_glob("*.tar.gz"));
+        assert!(!is_simple_filter_glob("*.doc;*.txt"));
+        assert!(!is_simple_filter_glob("readme.txt"));
+        assert!(!is_simple_filter_glob(""));
     }
 
     // ── ChooseFontW (L6) ──────────────────────────────────────────────────

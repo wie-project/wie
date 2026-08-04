@@ -9,16 +9,16 @@ use super::listbox::paint_item_lines;
 use super::listbox::render_control_text;
 use super::r#static::paint_label;
 use super::{
-    COLOR_BTNFACE, COLOR_BTNFACE_PRESSED, COLOR_BTNHIGHLIGHT, COLOR_BTNSHADOW, COLOR_WINDOW,
-    ControlClassKind, ControlState, PaintCtx, PaintFont, Rect, TextGeom, control_items,
-    control_sel_index, control_state,
+    control_items, control_sel_index, control_state, ControlClassKind, ControlState, Dimension,
+    PaintCtx, PaintFont, TextGeom, COLOR_BTNFACE, COLOR_BTNFACE_PRESSED, COLOR_BTNHIGHLIGHT,
+    COLOR_BTNSHADOW, COLOR_WINDOW,
 };
-use crate::gdi32::ResolvedWindow;
 use crate::gdi32::fill_rect_surface;
 use crate::gdi32::resolve_window_ancestor;
 use crate::gdi32::{FontEngine, FontKey, ResolvedFont};
+use crate::gdi32::{IRect, ResolvedWindow};
 use crate::state::WindowFlags;
-use crate::user32::{WinApiState, find_window};
+use crate::user32::{find_window, WinApiState};
 
 /// Paint a control into its ancestor's surface at its parent-relative offset.
 pub(super) fn paint_control(
@@ -32,21 +32,30 @@ pub(super) fn paint_control(
         return Ok(());
     };
     let text = find_window(state, hwnd).map_or_else(String::new, |w| w.control_text.clone());
-    let (width, height) = find_window(state, hwnd).map_or((0, 0), |w| (w.width, w.height));
+    let size = find_window(state, hwnd).map_or(
+        Dimension {
+            width: 0,
+            height: 0,
+        },
+        |w| Dimension {
+            width: w.width,
+            height: w.height,
+        },
+    );
 
     // The status bar's raised strip (BTNFACE face + the light/dark client
     // edges + the part grooves) renders WITHOUT a font, so the strip is
     // visible even before any text is set; the per-part text is drawn after
     // the font resolution in the match below (Task 3.1).
     if kind == ControlClassKind::StatusBar {
-        paint_status_bar_strip(state, &info, width, height);
+        paint_status_bar_strip(state, &info, size);
         // The grooves follow the SB_SETPARTS layout, which is font-free too;
         // the part_rights clone here mirrors the one in paint_status_bar_parts.
         let part_rights = match control_state(state, hwnd) {
             Some(ControlState::StatusBar { part_rights, .. }) => part_rights.clone(),
             _ => Vec::new(),
         };
-        paint_status_bar_separators(state, &info, width, height, &part_rights);
+        paint_status_bar_separators(state, &info, size, &part_rights);
     }
 
     let pressed = find_window(state, hwnd).is_some_and(|w| w.flags.contains(WindowFlags::PRESSED));
@@ -79,15 +88,20 @@ pub(super) fn paint_control(
         };
         match kind {
             ControlClassKind::Button => {
-                paint_face_and_border(state, &info, width, height, pressed);
+                paint_face_and_border(state, &info, size, pressed);
                 // The ampersand is a mnemonic marker, not caption glyph.
                 let caption = strip_mnemonics(&text);
-                let tx = centered_text_x(&info, width, &caption, &mut font_engine, resolved, key);
+                let tx =
+                    centered_text_x(&info, size.width, &caption, &mut font_engine, resolved, key);
                 paint_label(
                     &mut PaintCtx { state, engine },
                     &info,
                     &caption,
-                    TextGeom { tx, width, height },
+                    TextGeom {
+                        tx,
+                        width: size.width,
+                        height: size.height,
+                    },
                     pressed,
                     &mut PaintFont {
                         engine: &mut font_engine,
@@ -107,8 +121,8 @@ pub(super) fn paint_control(
                     info.height,
                     info.offset_x,
                     info.offset_y,
-                    width,
-                    height,
+                    size.width,
+                    size.height,
                     COLOR_BTNFACE,
                 );
                 let caption = strip_mnemonics(&text);
@@ -117,7 +131,11 @@ pub(super) fn paint_control(
                     &mut PaintCtx { state, engine },
                     &info,
                     &caption,
-                    TextGeom { tx, width, height },
+                    TextGeom {
+                        tx,
+                        width: size.width,
+                        height: size.height,
+                    },
                     false,
                     &mut PaintFont {
                         engine: &mut font_engine,
@@ -140,7 +158,7 @@ pub(super) fn paint_control(
                         state,
                         hwnd,
                         &text,
-                        (width, height),
+                        size,
                         resolved.line_height(),
                         edit_style,
                         &mut advance,
@@ -154,18 +172,22 @@ pub(super) fn paint_control(
                         info.height,
                         info.offset_x,
                         info.offset_y.saturating_add(band_top),
-                        width,
+                        size.width,
                         band_bottom.saturating_sub(band_top),
                         COLOR_WINDOW,
                     );
                 }
-                stroke_border(state, &info, width, height, 0x0000_0000);
+                stroke_border(state, &info, size, 0x0000_0000);
                 let tx = info.offset_x.saturating_add(2);
                 paint_edit(
                     &mut PaintCtx { state, engine },
                     &info,
                     &text,
-                    TextGeom { tx, width, height },
+                    TextGeom {
+                        tx,
+                        width: size.width,
+                        height: size.height,
+                    },
                     &mut PaintFont {
                         engine: &mut font_engine,
                         resolved,
@@ -181,17 +203,16 @@ pub(super) fn paint_control(
                     info.height,
                     info.offset_x,
                     info.offset_y,
-                    width,
-                    height,
+                    size.width,
+                    size.height,
                     COLOR_WINDOW,
                 );
-                stroke_border(state, &info, width, height, 0x0000_0000);
+                stroke_border(state, &info, size, 0x0000_0000);
                 paint_item_lines(
                     &mut PaintCtx { state, engine },
                     &info,
                     &items,
-                    width,
-                    height,
+                    size,
                     sel_index,
                     &mut PaintFont {
                         engine: &mut font_engine,
@@ -201,14 +222,18 @@ pub(super) fn paint_control(
                 )?;
             }
             ControlClassKind::ComboBox => {
-                paint_face_and_border(state, &info, width, height, false);
+                paint_face_and_border(state, &info, size, false);
                 let first = items.first().map_or("", String::as_str);
                 let tx = info.offset_x.saturating_add(4);
                 paint_label(
                     &mut PaintCtx { state, engine },
                     &info,
                     first,
-                    TextGeom { tx, width, height },
+                    TextGeom {
+                        tx,
+                        width: size.width,
+                        height: size.height,
+                    },
                     false,
                     &mut PaintFont {
                         engine: &mut font_engine,
@@ -220,14 +245,18 @@ pub(super) fn paint_control(
             // The strip face/edges were painted before the font resolution;
             // this arm only draws each part's text clipped to its cell.
             ControlClassKind::StatusBar => {
+                let (status_key, status_resolved) =
+                    status_bar_part_font(state, hwnd, &mut font_engine, key, resolved);
                 paint_status_bar_parts(
                     state,
                     engine,
                     &info,
                     hwnd,
-                    &mut font_engine,
-                    resolved,
-                    key,
+                    &mut PaintFont {
+                        engine: &mut font_engine,
+                        resolved: &status_resolved,
+                        key: &status_key,
+                    },
                 )?;
             }
         }
@@ -240,8 +269,8 @@ pub(super) fn paint_control(
 /// Paint a STATUSCLASSNAMEW strip: the BTNFACE face plus the classic raised
 /// client edge — a light (COLOR_BTNHIGHLIGHT) line along the top and the
 /// shadow (COLOR_BTNSHADOW) line along the bottom (Task 3.1).
-fn paint_status_bar_strip(state: &mut WinApiState, info: &ResolvedWindow, width: i32, height: i32) {
-    if width <= 0 || height <= 0 {
+fn paint_status_bar_strip(state: &mut WinApiState, info: &ResolvedWindow, size: Dimension) {
+    if size.width <= 0 || size.height <= 0 {
         return;
     }
     fill_rect_surface(
@@ -251,8 +280,8 @@ fn paint_status_bar_strip(state: &mut WinApiState, info: &ResolvedWindow, width:
         info.height,
         info.offset_x,
         info.offset_y,
-        width,
-        height,
+        size.width,
+        size.height,
         COLOR_BTNFACE,
     );
     fill_rect_surface(
@@ -262,7 +291,7 @@ fn paint_status_bar_strip(state: &mut WinApiState, info: &ResolvedWindow, width:
         info.height,
         info.offset_x,
         info.offset_y,
-        width,
+        size.width,
         1,
         COLOR_BTNHIGHLIGHT,
     );
@@ -272,8 +301,8 @@ fn paint_status_bar_strip(state: &mut WinApiState, info: &ResolvedWindow, width:
         info.width,
         info.height,
         info.offset_x,
-        info.offset_y.saturating_add(height).saturating_sub(1),
-        width,
+        info.offset_y.saturating_add(size.height).saturating_sub(1),
+        size.width,
         1,
         COLOR_BTNSHADOW,
     );
@@ -292,20 +321,19 @@ fn paint_status_bar_strip(state: &mut WinApiState, info: &ResolvedWindow, width:
 fn paint_status_bar_separators(
     state: &mut WinApiState,
     info: &ResolvedWindow,
-    width: i32,
-    height: i32,
+    size: Dimension,
     part_rights: &[i32],
 ) {
-    if part_rights.is_empty() || height < 3 {
+    if part_rights.is_empty() || size.height < 3 {
         return;
     }
     let top = info.offset_y.saturating_add(1);
-    let rows = height.saturating_sub(2);
+    let rows = size.height.saturating_sub(2);
     let interior = part_rights.len().saturating_sub(1);
     for right in part_rights.iter().take(interior) {
         // -1 (SB_SETPARTS) means "extend to the right edge".
-        let boundary = if *right < 0 { width } else { *right };
-        if boundary >= width {
+        let boundary = if *right < 0 { size.width } else { *right };
+        if boundary >= size.width {
             continue;
         }
         let bx = info.offset_x.saturating_add(boundary);
@@ -334,6 +362,51 @@ fn paint_status_bar_separators(
     }
 }
 
+/// Horizontal inset (px) on each side of a status-bar part's text cell, so
+/// the ink never touches the cell boundary or the next part's groove.
+const STATUS_BAR_TEXT_INSET: i32 = 3;
+
+/// The px size a status bar with NO `WM_SETFONT` draws its part text at.
+///
+/// Real Windows defaults such a bar to the DEFAULT_GUI_FONT (~12 px); WIE's
+/// 16 px system default is ~25% wider, and RNotepad lays its parts out for
+/// the smaller font WITHOUT measuring the text: `DIALOG_StatusBarAlignParts`
+/// sets the EOL cell ("Windows (CR + LF)") to a FIXED 120 px box
+/// (`max(client_w - 120, 240)` right edge, part 0 at `max(client_w - 240,
+/// 120)`). At 16 px that text is ~125 px and the last glyph clips at the 120
+/// px boundary — the ")" lands under the next part. Resolving the no-font
+/// bar at the same 13 px the guest uses for its own UI font keeps the fixed
+/// geometry working, exactly like real Windows' default-GUI-font behavior.
+const STATUS_BAR_DEFAULT_FONT_PX: i32 = 13;
+
+/// The font the status-bar part text renders with.
+///
+/// A bar with a `WM_SETFONT` stored font keeps the paint's normal resolution
+/// (the stored font or the 16 px system default fallback). A bar without one
+/// — RNotepad never sends WM_SETFONT to its status bar — drops to
+/// [`STATUS_BAR_DEFAULT_FONT_PX`] instead of the 16 px default (see the
+/// constant's doc). The caller's `key`/`resolved` are owned so the override
+/// can return a freshly resolved pair.
+fn status_bar_part_font(
+    state: &mut WinApiState,
+    hwnd: u64,
+    font_engine: &mut FontEngine,
+    key: &FontKey,
+    resolved: &ResolvedFont,
+) -> (FontKey, ResolvedFont) {
+    let stored = find_window(state, hwnd)
+        .map(|w| w.font_handle)
+        .unwrap_or(crate::handles::Hfont::NULL);
+    if stored != crate::handles::Hfont::NULL {
+        return (key.clone(), resolved.clone());
+    }
+    font_engine
+        .resolve(key, STATUS_BAR_DEFAULT_FONT_PX)
+        .map_or((key.clone(), resolved.clone()), |smaller| {
+            (key.clone(), smaller)
+        })
+}
+
 /// Draw each status-bar part's text, left-aligned in its cell with a small
 /// horizontal inset and vertically centered, CLIPPED to the cell so a long
 /// text cannot bleed into the next part. The last part always extends to the
@@ -343,12 +416,19 @@ fn paint_status_bar_parts(
     engine: &mut dyn wie_cpu::CpuEngine,
     info: &ResolvedWindow,
     hwnd: u64,
-    font_engine: &mut FontEngine,
-    resolved: &ResolvedFont,
-    key: &FontKey,
+    font: &mut PaintFont<'_>,
 ) -> Result<()> {
     // The control's own client size (the part cells are laid out inside it).
-    let (width, height) = find_window(state, hwnd).map_or((0, 0), |w| (w.width, w.height));
+    let size = find_window(state, hwnd).map_or(
+        Dimension {
+            width: 0,
+            height: 0,
+        },
+        |w| Dimension {
+            width: w.width,
+            height: w.height,
+        },
+    );
     let part_rights = match control_state(state, hwnd) {
         Some(ControlState::StatusBar { part_rights, .. }) => part_rights.clone(),
         _ => Vec::new(),
@@ -358,21 +438,25 @@ fn paint_status_bar_parts(
     } else {
         part_rights.len()
     };
-    let line_h = resolved.line_height();
+    let line_h = font.resolved.line_height();
     // Vertically centered between the strip's edges, at least one row below
     // the top border so the ink never touches the client edge.
     let ty = info
         .offset_y
-        .saturating_add(height.saturating_sub(line_h).saturating_div(2))
+        .saturating_add(size.height.saturating_sub(line_h).saturating_div(2))
         .max(info.offset_y.saturating_add(1));
-    let strip_bottom = info.offset_y.saturating_add(height);
+    let strip_bottom = info.offset_y.saturating_add(size.height);
     let mut left = 0_i32;
     for index in 0..parts {
         let right = if part_rights.is_empty() {
-            width
+            size.width
         } else {
-            let value = part_rights.get(index).copied().unwrap_or(width);
-            if value < 0 { width } else { value }
+            let value = part_rights.get(index).copied().unwrap_or(size.width);
+            if value < 0 {
+                size.width
+            } else {
+                value
+            }
         };
         let cell_left = left;
         left = right;
@@ -380,29 +464,33 @@ fn paint_status_bar_parts(
         if text.is_empty() {
             continue;
         }
-        let tx = info.offset_x.saturating_add(cell_left).saturating_add(3);
+        let tx = info
+            .offset_x
+            .saturating_add(cell_left)
+            .saturating_add(STATUS_BAR_TEXT_INSET);
+        // The clip mirrors the left inset on the right: text stops
+        // `STATUS_BAR_TEXT_INSET` px before the cell edge (real Windows
+        // status-bar cells carry the same margin), so the last glyph never
+        // touches the boundary or the next part's groove.
+        let clip_right = right.saturating_sub(STATUS_BAR_TEXT_INSET);
         render_control_text(
             &mut PaintCtx { state, engine },
             info.hwnd,
-            Rect {
-                x: tx,
-                y: ty,
-                cx: i32::try_from(info.width).unwrap_or(0),
-                cy: i32::try_from(info.height).unwrap_or(0),
-            },
+            IRect::from_xywh(
+                tx,
+                ty,
+                i32::try_from(info.width).unwrap_or(0),
+                i32::try_from(info.height).unwrap_or(0),
+            ),
             &text,
             0, // COLOR_BTNTEXT / COLOR_WINDOWTEXT: black
-            Some((
-                info.offset_x.saturating_add(cell_left),
-                info.offset_y,
-                info.offset_x.saturating_add(right),
-                strip_bottom,
-            )),
-            &mut PaintFont {
-                engine: font_engine,
-                resolved,
-                key,
-            },
+            Some(IRect {
+                left: info.offset_x.saturating_add(cell_left),
+                top: info.offset_y,
+                right: info.offset_x.saturating_add(clip_right),
+                bottom: strip_bottom,
+            }),
+            font,
         )?;
     }
     Ok(())
@@ -412,8 +500,7 @@ fn paint_status_bar_parts(
 fn paint_face_and_border(
     state: &mut WinApiState,
     info: &ResolvedWindow,
-    width: i32,
-    height: i32,
+    size: Dimension,
     pressed: bool,
 ) {
     let face = if pressed {
@@ -428,27 +515,21 @@ fn paint_face_and_border(
         info.height,
         info.offset_x,
         info.offset_y,
-        width,
-        height,
+        size.width,
+        size.height,
         face,
     );
-    stroke_border(state, info, width, height, COLOR_BTNSHADOW);
+    stroke_border(state, info, size, COLOR_BTNSHADOW);
 }
 
 /// Draw a 1 px border around a control's rect.
-fn stroke_border(
-    state: &mut WinApiState,
-    info: &ResolvedWindow,
-    width: i32,
-    height: i32,
-    color: u32,
-) {
-    if width <= 0 || height <= 0 {
+fn stroke_border(state: &mut WinApiState, info: &ResolvedWindow, size: Dimension, color: u32) {
+    if size.width <= 0 || size.height <= 0 {
         return;
     }
     let (x, y) = (info.offset_x, info.offset_y);
-    let right = x.saturating_add(width).saturating_sub(1);
-    let bottom = y.saturating_add(height).saturating_sub(1);
+    let right = x.saturating_add(size.width).saturating_sub(1);
+    let bottom = y.saturating_add(size.height).saturating_sub(1);
     fill_rect_surface(
         state,
         info.hwnd,
@@ -456,7 +537,7 @@ fn stroke_border(
         info.height,
         x,
         y,
-        width,
+        size.width,
         1,
         color,
     );
@@ -467,7 +548,7 @@ fn stroke_border(
         info.height,
         x,
         bottom,
-        width,
+        size.width,
         1,
         color,
     );
@@ -479,7 +560,7 @@ fn stroke_border(
         x,
         y,
         1,
-        height,
+        size.height,
         color,
     );
     fill_rect_surface(
@@ -490,7 +571,7 @@ fn stroke_border(
         right,
         y,
         1,
-        height,
+        size.height,
         color,
     );
 }

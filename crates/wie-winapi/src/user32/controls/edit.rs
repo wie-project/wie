@@ -6,20 +6,19 @@ use anyhow::Result;
 use super::listbox::render_control_text;
 use super::paint::fill_rect_clipped;
 use super::{
-    COLOR_BTNFACE, COLOR_BTNHIGHLIGHT, COLOR_BTNSHADOW, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT,
-    ControlClassKind, ControlState, ES_MULTILINE, EditInvalidRows, EditInvalidation, HitTestLayout,
-    PaintCtx, PaintFont, Rect, SEL_EMPTY, SEL_MULTICHAR, SEL_MULTILINE, SEL_TEXT, TextGeom,
-    control_state, deliver_command,
+    control_state, deliver_command, ControlClassKind, ControlState, Dimension, EditInvalidRows,
+    EditInvalidation, HitTestLayout, PaintCtx, PaintFont, TextGeom, COLOR_BTNFACE,
+    COLOR_BTNHIGHLIGHT, COLOR_BTNSHADOW, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, ES_MULTILINE,
+    SEL_EMPTY, SEL_MULTICHAR, SEL_MULTILINE, SEL_TEXT,
 };
-use crate::gdi32::FontKey;
-use crate::gdi32::ResolvedWindow;
+use crate::gdi32::{FontKey, IRect, ResolvedWindow};
 use crate::guest_memory::read_u16 as read_guest_u16;
 use crate::state::{TimerRecord, WindowFlags};
 use crate::user32::{
-    EN_CHANGE, VK_CONTROL, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT,
-    VK_SHIFT, VK_UP, WinApiState, find_window, find_window_mut, make_command_wparam,
-    read_guest_ansi_lossy, read_guest_utf16_lossy, write_guest_ansi_c_string, write_guest_i32,
-    write_guest_utf16_c_string,
+    find_window, find_window_mut, make_command_wparam, read_guest_ansi_lossy,
+    read_guest_utf16_lossy, write_guest_ansi_c_string, write_guest_i32, write_guest_utf16_c_string,
+    WinApiState, EN_CHANGE, VK_CONTROL, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR,
+    VK_RIGHT, VK_SHIFT, VK_UP,
 };
 
 /// Cap for guest buffer reads (EM_SETHANDLE / EM_REPLACESEL adoption).
@@ -2668,7 +2667,7 @@ pub(super) fn edit_dirty_band<F>(
     state: &WinApiState,
     hwnd: u64,
     text: &str,
-    client: (i32, i32),
+    client: Dimension,
     line_h: i32,
     style: u32,
     advance: &mut F,
@@ -2686,7 +2685,7 @@ where
         }) => (*invalid_rows, *first_visible_line, *caret, *last_paint_rows),
         _ => (EditInvalidation::Full, 0, 0, 0),
     };
-    let (width, height) = client;
+    let (width, height) = (client.width, client.height);
     let area = edit_text_area(text, width, height, line_h, style, caret, advance);
     let Some(band) = band_is_current(invalid, area.wrap_width, last_paint_rows > 0) else {
         return (0, height);
@@ -2945,16 +2944,15 @@ fn scrollbar_thumb(track: i32, position: usize, span: usize, visible: usize) -> 
 fn paint_vertical_scrollbar(
     state: &mut WinApiState,
     info: &ResolvedWindow,
-    width: i32,
-    height: i32,
+    size: Dimension,
     first_visible_line: usize,
     total: usize,
     visible: usize,
 ) {
     let gutter_x = info
         .offset_x
-        .saturating_add(width.saturating_sub(SCROLLBAR_WIDTH));
-    let track = height;
+        .saturating_add(size.width.saturating_sub(SCROLLBAR_WIDTH));
+    let track = size.height;
     let (thumb, thumb_pos) = scrollbar_thumb(
         track,
         first_visible_line,
@@ -2965,40 +2963,27 @@ fn paint_vertical_scrollbar(
     fill_rect_clipped(
         state,
         info,
-        width,
-        height,
-        Rect {
-            x: gutter_x,
-            y: info.offset_y,
-            cx: SCROLLBAR_WIDTH,
-            cy: track,
-        },
+        size,
+        IRect::from_xywh(gutter_x, info.offset_y, SCROLLBAR_WIDTH, track),
         COLOR_BTNFACE,
     );
     fill_rect_clipped(
         state,
         info,
-        width,
-        height,
-        Rect {
-            x: gutter_x,
-            y: info.offset_y,
-            cx: 1,
-            cy: track,
-        },
+        size,
+        IRect::from_xywh(gutter_x, info.offset_y, 1, track),
         COLOR_BTNHIGHLIGHT,
     );
     fill_rect_clipped(
         state,
         info,
-        width,
-        height,
-        Rect {
-            x: gutter_x.saturating_add(SCROLLBAR_WIDTH.saturating_sub(1)),
-            y: info.offset_y,
-            cx: 1,
-            cy: track,
-        },
+        size,
+        IRect::from_xywh(
+            gutter_x.saturating_add(SCROLLBAR_WIDTH.saturating_sub(1)),
+            info.offset_y,
+            1,
+            track,
+        ),
         COLOR_BTNSHADOW,
     );
     // The raised thumb: BTNFACE with light top/left and shadow bottom/right.
@@ -3006,66 +2991,46 @@ fn paint_vertical_scrollbar(
     fill_rect_clipped(
         state,
         info,
-        width,
-        height,
-        Rect {
-            x: gutter_x,
-            y: thumb_y,
-            cx: SCROLLBAR_WIDTH,
-            cy: thumb,
-        },
+        size,
+        IRect::from_xywh(gutter_x, thumb_y, SCROLLBAR_WIDTH, thumb),
         COLOR_BTNFACE,
     );
     fill_rect_clipped(
         state,
         info,
-        width,
-        height,
-        Rect {
-            x: gutter_x,
-            y: thumb_y,
-            cx: SCROLLBAR_WIDTH,
-            cy: 1,
-        },
+        size,
+        IRect::from_xywh(gutter_x, thumb_y, SCROLLBAR_WIDTH, 1),
         COLOR_BTNHIGHLIGHT,
     );
     fill_rect_clipped(
         state,
         info,
-        width,
-        height,
-        Rect {
-            x: gutter_x,
-            y: thumb_y.saturating_add(thumb.saturating_sub(1)),
-            cx: SCROLLBAR_WIDTH,
-            cy: 1,
-        },
+        size,
+        IRect::from_xywh(
+            gutter_x,
+            thumb_y.saturating_add(thumb.saturating_sub(1)),
+            SCROLLBAR_WIDTH,
+            1,
+        ),
         COLOR_BTNSHADOW,
     );
     fill_rect_clipped(
         state,
         info,
-        width,
-        height,
-        Rect {
-            x: gutter_x,
-            y: thumb_y,
-            cx: 1,
-            cy: thumb,
-        },
+        size,
+        IRect::from_xywh(gutter_x, thumb_y, 1, thumb),
         COLOR_BTNHIGHLIGHT,
     );
     fill_rect_clipped(
         state,
         info,
-        width,
-        height,
-        Rect {
-            x: gutter_x.saturating_add(SCROLLBAR_WIDTH.saturating_sub(1)),
-            y: thumb_y,
-            cx: 1,
-            cy: thumb,
-        },
+        size,
+        IRect::from_xywh(
+            gutter_x.saturating_add(SCROLLBAR_WIDTH.saturating_sub(1)),
+            thumb_y,
+            1,
+            thumb,
+        ),
         COLOR_BTNSHADOW,
     );
 }
@@ -3076,18 +3041,17 @@ fn paint_vertical_scrollbar(
 fn paint_horizontal_scrollbar(
     state: &mut WinApiState,
     info: &ResolvedWindow,
-    width: i32,
-    height: i32,
+    size: Dimension,
     first_visible_column: usize,
     max_line_width: i32,
     wrap_width: i32,
 ) {
     let strip_y = info
         .offset_y
-        .saturating_add(height.saturating_sub(SCROLLBAR_WIDTH));
+        .saturating_add(size.height.saturating_sub(SCROLLBAR_WIDTH));
     let span = max_line_width.saturating_sub(wrap_width).max(0);
     let (thumb, thumb_pos) = scrollbar_thumb(
-        width,
+        size.width,
         first_visible_column,
         usize::try_from(span).unwrap_or(0),
         usize::try_from(wrap_width.max(0)).unwrap_or(0),
@@ -3095,106 +3059,73 @@ fn paint_horizontal_scrollbar(
     fill_rect_clipped(
         state,
         info,
-        width,
-        height,
-        Rect {
-            x: info.offset_x,
-            y: strip_y,
-            cx: width,
-            cy: SCROLLBAR_WIDTH,
-        },
+        size,
+        IRect::from_xywh(info.offset_x, strip_y, size.width, SCROLLBAR_WIDTH),
         COLOR_BTNFACE,
     );
     fill_rect_clipped(
         state,
         info,
-        width,
-        height,
-        Rect {
-            x: info.offset_x,
-            y: strip_y,
-            cx: width,
-            cy: 1,
-        },
+        size,
+        IRect::from_xywh(info.offset_x, strip_y, size.width, 1),
         COLOR_BTNHIGHLIGHT,
     );
     fill_rect_clipped(
         state,
         info,
-        width,
-        height,
-        Rect {
-            x: info.offset_x,
-            y: strip_y.saturating_add(SCROLLBAR_WIDTH.saturating_sub(1)),
-            cx: width,
-            cy: 1,
-        },
+        size,
+        IRect::from_xywh(
+            info.offset_x,
+            strip_y.saturating_add(SCROLLBAR_WIDTH.saturating_sub(1)),
+            size.width,
+            1,
+        ),
         COLOR_BTNSHADOW,
     );
     let thumb_x = info.offset_x.saturating_add(thumb_pos);
     fill_rect_clipped(
         state,
         info,
-        width,
-        height,
-        Rect {
-            x: thumb_x,
-            y: strip_y,
-            cx: thumb,
-            cy: SCROLLBAR_WIDTH,
-        },
+        size,
+        IRect::from_xywh(thumb_x, strip_y, thumb, SCROLLBAR_WIDTH),
         COLOR_BTNFACE,
     );
     fill_rect_clipped(
         state,
         info,
-        width,
-        height,
-        Rect {
-            x: thumb_x,
-            y: strip_y,
-            cx: 1,
-            cy: SCROLLBAR_WIDTH,
-        },
+        size,
+        IRect::from_xywh(thumb_x, strip_y, 1, SCROLLBAR_WIDTH),
         COLOR_BTNHIGHLIGHT,
     );
     fill_rect_clipped(
         state,
         info,
-        width,
-        height,
-        Rect {
-            x: thumb_x.saturating_add(thumb.saturating_sub(1)),
-            y: strip_y,
-            cx: 1,
-            cy: SCROLLBAR_WIDTH,
-        },
+        size,
+        IRect::from_xywh(
+            thumb_x.saturating_add(thumb.saturating_sub(1)),
+            strip_y,
+            1,
+            SCROLLBAR_WIDTH,
+        ),
         COLOR_BTNSHADOW,
     );
     fill_rect_clipped(
         state,
         info,
-        width,
-        height,
-        Rect {
-            x: thumb_x,
-            y: strip_y,
-            cx: thumb,
-            cy: 1,
-        },
+        size,
+        IRect::from_xywh(thumb_x, strip_y, thumb, 1),
         COLOR_BTNHIGHLIGHT,
     );
     fill_rect_clipped(
         state,
         info,
-        width,
-        height,
-        Rect {
-            x: thumb_x,
-            y: strip_y.saturating_add(SCROLLBAR_WIDTH.saturating_sub(1)),
-            cx: thumb,
-            cy: 1,
-        },
+        size,
+        IRect::from_xywh(
+            thumb_x,
+            strip_y.saturating_add(SCROLLBAR_WIDTH.saturating_sub(1)),
+            thumb,
+            1,
+        ),
         COLOR_BTNSHADOW,
     );
 }
@@ -3254,6 +3185,12 @@ pub(super) fn paint_edit(
     };
     let (sel_start, sel_end, caret) = (sel_start.min(len), sel_end.min(len), caret.min(len));
     let line_h = font.resolved.line_height();
+    // The control's client extent — the width/height pair every paint helper
+    // below shares (the scrollbars, the clipped fills).
+    let control = Dimension {
+        width: geom.width,
+        height: geom.height,
+    };
     // The multiline/wrap/alignment decisions read the LIVE creation style
     // from the window record, not `style_bits`: the read-only `control_state`
     // accessor never refreshes `style_bits`, whose lazy seed starts at 0 — so
@@ -3320,7 +3257,12 @@ pub(super) fn paint_edit(
         .offset_y
         .saturating_add(geom.height)
         .saturating_sub(h_strip);
-    let clip = Some((info.offset_x, info.offset_y, text_right, text_bottom));
+    let clip = Some(IRect {
+        left: info.offset_x,
+        top: info.offset_y,
+        right: text_right,
+        bottom: text_bottom,
+    });
     let has_selection = focused && sel_start != sel_end;
     // The row band to repaint: the pending invalid rows (when still valid
     // against the current layout), or every visible row — a full repaint, a
@@ -3400,14 +3342,8 @@ pub(super) fn paint_edit(
             fill_rect_clipped(
                 ctx.state,
                 info,
-                geom.width,
-                geom.height,
-                Rect {
-                    x: lo_x,
-                    y,
-                    cx: hi_x.saturating_sub(lo_x),
-                    cy: line_h,
-                },
+                control,
+                IRect::from_xywh(lo_x, y, hi_x.saturating_sub(lo_x), line_h),
                 COLOR_HIGHLIGHT,
             );
             Some((lo_x, sel_lo, sel_hi))
@@ -3419,12 +3355,12 @@ pub(super) fn paint_edit(
             render_control_text(
                 ctx,
                 info.hwnd,
-                Rect {
+                IRect::from_xywh(
                     x,
                     y,
-                    cx: i32::try_from(info.width).unwrap_or(0),
-                    cy: i32::try_from(info.height).unwrap_or(0),
-                },
+                    i32::try_from(info.width).unwrap_or(0),
+                    i32::try_from(info.height).unwrap_or(0),
+                ),
                 &row.text,
                 0,
                 clip,
@@ -3442,12 +3378,12 @@ pub(super) fn paint_edit(
             render_control_text(
                 ctx,
                 info.hwnd,
-                Rect {
-                    x: sel_x,
+                IRect::from_xywh(
+                    sel_x,
                     y,
-                    cx: i32::try_from(info.width).unwrap_or(0),
-                    cy: i32::try_from(info.height).unwrap_or(0),
-                },
+                    i32::try_from(info.width).unwrap_or(0),
+                    i32::try_from(info.height).unwrap_or(0),
+                ),
                 &selected,
                 COLOR_HIGHLIGHTTEXT,
                 clip,
@@ -3469,14 +3405,8 @@ pub(super) fn paint_edit(
             fill_rect_clipped(
                 ctx.state,
                 info,
-                geom.width,
-                geom.height,
-                Rect {
-                    x: caret_x,
-                    y,
-                    cx: 1,
-                    cy: line_h,
-                },
+                control,
+                IRect::from_xywh(caret_x, y, 1, line_h),
                 0x0000_0000,
             );
             caret_drawn = true;
@@ -3488,8 +3418,7 @@ pub(super) fn paint_edit(
         paint_vertical_scrollbar(
             ctx.state,
             info,
-            geom.width,
-            geom.height,
+            control,
             first_visible_line,
             area.total,
             area.visible,
@@ -3499,8 +3428,7 @@ pub(super) fn paint_edit(
         paint_horizontal_scrollbar(
             ctx.state,
             info,
-            geom.width,
-            geom.height,
+            control,
             first_visible_column,
             area.max_line_width,
             area.wrap_width,

@@ -3,10 +3,10 @@
 
 use anyhow::Result;
 
-use super::Rect;
-use crate::gdi32::ResolvedWindow;
+use super::Dimension;
 use crate::gdi32::fill_rect_surface;
-use crate::user32::{WinApiState, write_guest_ansi_c_string, write_guest_utf16_c_string};
+use crate::gdi32::{IRect, ResolvedWindow};
+use crate::user32::{write_guest_ansi_c_string, write_guest_utf16_c_string, WinApiState};
 
 /// Fill a rect with `color`, clipped to the control's own bounds so a
 /// selection or caret running past the right edge cannot bleed into the
@@ -14,21 +14,16 @@ use crate::user32::{WinApiState, write_guest_ansi_c_string, write_guest_utf16_c_
 pub(super) fn fill_rect_clipped(
     state: &mut WinApiState,
     info: &ResolvedWindow,
-    control_width: i32,
-    control_height: i32,
-    rect: Rect,
+    control: Dimension,
+    rect: IRect,
     color: u32,
 ) {
-    let x0 = rect.x.max(info.offset_x);
-    let y0 = rect.y.max(info.offset_y);
-    let x1 = rect
-        .x
-        .saturating_add(rect.cx)
-        .min(info.offset_x.saturating_add(control_width));
+    let x0 = rect.left.max(info.offset_x);
+    let y0 = rect.top.max(info.offset_y);
+    let x1 = rect.right.min(info.offset_x.saturating_add(control.width));
     let y1 = rect
-        .y
-        .saturating_add(rect.cy)
-        .min(info.offset_y.saturating_add(control_height));
+        .bottom
+        .min(info.offset_y.saturating_add(control.height));
     if x1 <= x0 || y1 <= y0 {
         return;
     }

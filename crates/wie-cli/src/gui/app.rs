@@ -1186,6 +1186,18 @@ pub fn run_gui_windowed(
                             }));
                         }
 
+                        // Native file dialogs: GetOpenFileName / GetSaveFileName
+                        // show the real macOS Open/Save panel (rfd NSOpenPanel/
+                        // NSSavePanel) instead of the in-app emulated dialog —
+                        // the OS-equivalent of Windows' common dialogs. The
+                        // guest thread blocks in the bridge until the user
+                        // picks; a pick outside the bottle cancels at accept.
+                        #[cfg(target_os = "macos")]
+                        crate::gui::file_dialog::register_native_file_dialog_bridge(
+                            &handle,
+                            window_slot_guest.clone(),
+                        );
+
                         // Register the native-alert MessageBox bridge. rfd's
                         // parented dialog uses the modern NSAlert API
                         // (dispatched to the main thread; the guest thread

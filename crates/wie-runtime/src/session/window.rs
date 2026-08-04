@@ -341,6 +341,25 @@ impl GuestHandle {
         tree
     }
 
+    /// Set the host file-dialog bridge — called by the `GetOpenFileNameA/W`
+    /// / `GetSaveFileNameA/W` handlers (under [`wie_winapi::FileDialogPolicy::Interactive`])
+    /// with the request built from the guest's `OPENFILENAME`; the returned
+    /// pick's HOST path is written back into the guest buffer.
+    ///
+    /// Mirrors [`Self::set_message_box_bridge`]: the GUI presenter registers
+    /// the native-panel callback (rfd NSOpenPanel/NSSavePanel) here once at
+    /// startup, and the guest thread invokes it from the handler. The callback
+    /// blocks until the user picks (the guest thread parks inside the
+    /// handler), which is dialog semantics. The handler confines the returned
+    /// host path to a guest volume at accept — a pick outside the bottle
+    /// cancels. When no bridge is registered the handlers keep the in-app
+    /// emulated dialog, so headless runs and `trace` never hang.
+    pub fn set_file_dialog_bridge(&self, cb: wie_winapi::FileDialogBridge) {
+        if let Ok(mut state) = self.state.lock() {
+            state.window_state().file_dialog_bridge = Some(cb);
+        }
+    }
+
     /// Set the wake callback — called when a new frame is published.
     pub fn set_wake(&self, cb: Box<dyn Fn() + Send>) {
         if let Ok(mut state) = self.state.lock() {

@@ -284,6 +284,23 @@ impl PresentState {
         // not holding the previous frame, a clone otherwise. This is what
         // keeps gui_blit's multi-publish paint cycle (parent BitBlt → child
         // control paints, each publishing) byte-identical.
+        //
+        // Lock serialization: this runs on the guest thread while it holds the
+        // `WinApiState` lock (paint handlers call `ensure_surface`), and the
+        // presenter's `take_frame` takes the SAME lock — the remove below and a
+        // presenter take can never interleave. The remove does open a window
+        // where a take sees no entry for `hwnd` (between here and the next
+        // `publish`): it returns `None` and the presenter skips — correct,
+        // because the old content is being replaced — and `publish` re-adds
+        // its entry BEFORE firing the wake, so a take after a publish always
+        // sees the fresh frame and no frame is lost.
+        //
+        // Refcount math for the zero-copy path: the published Arc sits at
+        // refcount 1 when no `record` slot shares it and neither the
+        // presenter's take nor the app's `last_presented_pixels` keep-alive
+        // pins THIS frame's Arc (the keep-alive pins the last frame the
+        // presenter actually presented, which may be one or more publishes
+        // behind). `try_unwrap` then moves the Vec out with no copy.
         if let Some(surface) = self.surfaces.get_mut(&hwnd)
             && surface.pixels.is_empty()
             && let Some(frame) = self.published.remove(&hwnd)
@@ -890,6 +907,141 @@ mod tests {
             state.surfaces.get(&hwnd).expect("surface").dirty,
             None,
             "a freshly created surface is fully dirty"
+        );
+    }
+
+    /// The B1 hand-back MOVES the published buffer back into the scratch
+    /// surface (zero-copy) when the host holds no extra Arc reference: the
+    /// published frame's allocation reappears as the surface's buffer, and the
+    /// composite keeps accumulating (the painted pixels survive the
+    /// round-trip).
+    #[test]
+    fn hand_back_moves_the_published_buffer_zero_copy() {
+        let mut state = PresentState::new();
+        let hwnd = Hwnd::from(30);
+        state.ensure_surface(hwnd, 64, 32);
+        // Paint a recognizable pattern, then publish: the buffer leaves the
+        // surface and lands in the published Arc as the only reference.
+        if let Some(surf) = state.surfaces.get_mut(&hwnd) {
+            for (i, px) in surf.pixels.iter_mut().enumerate() {
+                *px = u32::try_from(i % 7 + 1).unwrap_or(0);
+            }
+        }
+        state.publish(hwnd);
+        let published_ptr = state
+            .published
+            .get(&hwnd)
+            .expect("published frame")
+            .pixels
+            .as_ptr();
+
+        // Next paint cycle: the scratch buffer is empty and a published frame
+        // exists, so ensure_surface reclaims it. `try_unwrap` succeeds (no
+        // record slot, no presenter take, no keep-alive) and the Vec moves
+        // back — the surface buffer IS the published allocation.
+        state.ensure_surface(hwnd, 64, 32);
+        assert_eq!(state.hand_back_unwrap, 1);
+        assert_eq!(state.hand_back_clone, 0);
+        let surface = state.surfaces.get(&hwnd).expect("surface");
+        assert_eq!(
+            surface.pixels.as_ptr(),
+            published_ptr,
+            "the zero-copy hand-back reuses the published allocation"
+        );
+        assert!(
+            surface.pixels.iter().any(|&px| px != 0),
+            "the reclaimed buffer carries the previously painted content"
+        );
+        // The published map is empty until the repaint republishes: a
+        // presenter take in this window sees None and skips (the old content
+        // is being replaced); the next publish re-adds before waking it.
+        assert!(
+            !state.published.contains_key(&hwnd),
+            "the reclaimed entry is gone until the repaint republishes"
+        );
+
+        // Republish: the same Vec flows through again (a move, never a copy or
+        // a realloc), so the frame still points at the original allocation.
+        state.publish(hwnd);
+        let republished = state.published.get(&hwnd).expect("republished frame");
+        assert_eq!(
+            republished.pixels.as_ptr(),
+            published_ptr,
+            "the republish moves the reclaimed buffer back into a fresh Arc"
+        );
+    }
+
+    /// Every publish wraps its buffer in a FRESH Arc allocation: the
+    /// presenter's `Arc::ptr_eq` present-skip compares consecutive takes, and
+    /// a repaint must never be mistaken for an unchanged frame. Both Arcs are
+    /// kept alive here so the comparison is deterministic (a freed Arc's
+    /// address can be reused by the allocator, so comparing against one would
+    /// be flaky).
+    #[test]
+    fn each_publish_wraps_the_buffer_in_a_fresh_arc() {
+        let mut state = PresentState::new();
+        let hwnd = Hwnd::from(32);
+        state.ensure_surface(hwnd, 64, 32);
+        state.publish(hwnd);
+        // The presenter's take_frame clone: holds the first frame's Arc alive
+        // while the second publish runs (it also forces the clone fallback on
+        // the reclaim below, which this test does not assert on).
+        let first: Arc<Vec<u32>> =
+            Arc::clone(&state.published.get(&hwnd).expect("first frame").pixels);
+
+        state.ensure_surface(hwnd, 64, 32);
+        state.publish(hwnd);
+        let second = state
+            .published
+            .get(&hwnd)
+            .expect("second frame")
+            .pixels
+            .clone();
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a republish always allocates a new Arc — the ptr_eq present-skip never misfires"
+        );
+    }
+
+    /// The fallback CLONES when the host still holds the published Arc (the
+    /// presenter's take_frame clone, or the app's last-presented keep-alive):
+    /// the scratch buffer is a fresh allocation carrying the same pixels, so
+    /// the composite still accumulates — at the cost of one copy.
+    #[test]
+    fn hand_back_clones_when_the_host_still_holds_the_frame() {
+        let mut state = PresentState::new();
+        let hwnd = Hwnd::from(31);
+        state.ensure_surface(hwnd, 64, 32);
+        if let Some(surf) = state.surfaces.get_mut(&hwnd) {
+            for (i, px) in surf.pixels.iter_mut().enumerate() {
+                *px = u32::try_from(i % 7 + 1).unwrap_or(0);
+            }
+        }
+        state.publish(hwnd);
+        // The presenter's take_frame clones the SurfaceFrame, bumping the
+        // pixel Arc's refcount — that clone (or the keep-alive) is exactly the
+        // documented blocker that forces the fallback.
+        let held: Arc<Vec<u32>> =
+            Arc::clone(&state.published.get(&hwnd).expect("published").pixels);
+        let published_ptr = state
+            .published
+            .get(&hwnd)
+            .expect("published")
+            .pixels
+            .as_ptr();
+
+        state.ensure_surface(hwnd, 64, 32);
+        assert_eq!(state.hand_back_unwrap, 0);
+        assert_eq!(state.hand_back_clone, 1);
+        let surface = state.surfaces.get(&hwnd).expect("surface");
+        assert_ne!(
+            surface.pixels.as_ptr(),
+            published_ptr,
+            "the clone fallback allocates a fresh buffer"
+        );
+        assert_eq!(
+            surface.pixels, *held,
+            "the cloned buffer carries the same pixels (the composite keeps accumulating)"
         );
     }
 }

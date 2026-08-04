@@ -3,8 +3,8 @@
 use anyhow::Result;
 
 use super::listbox::render_control_text;
-use super::{PaintCtx, PaintFont, Rect, TextGeom};
-use crate::gdi32::ResolvedWindow;
+use super::{PaintCtx, PaintFont, TextGeom};
+use crate::gdi32::{IRect, ResolvedWindow};
 
 /// Draw a single line of control text, vertically centered, black on the
 /// control's face. `geom.tx` is the caller-computed left edge (centered or
@@ -36,15 +36,20 @@ pub(super) fn paint_label(
     render_control_text(
         ctx,
         info.hwnd,
-        Rect {
-            x: tx,
-            y: ty,
-            cx: i32::try_from(info.width).unwrap_or(0),
-            cy: i32::try_from(info.height).unwrap_or(0),
-        },
+        IRect::from_xywh(
+            tx,
+            ty,
+            i32::try_from(info.width).unwrap_or(0),
+            i32::try_from(info.height).unwrap_or(0),
+        ),
         text,
         0, // COLOR_BTNTEXT / COLOR_WINDOWTEXT: black
-        Some((info.offset_x, info.offset_y, right, bottom)),
+        Some(IRect {
+            left: info.offset_x,
+            top: info.offset_y,
+            right,
+            bottom,
+        }),
         font,
     )
 }

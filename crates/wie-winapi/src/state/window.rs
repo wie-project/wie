@@ -6,6 +6,60 @@ use ahash::HashMapExt;
 use super::input::KeyboardState;
 use super::process::{FileDialogPolicy, FontDialogPolicy};
 
+/// A parsed `OPENFILENAME.lpstrFilter` group: a display name and its extension
+/// globs (`"Text Documents"` → `["*.txt"]`).
+///
+/// Only simple `*.ext` globs survive the comdlg32 parse — a wrong native
+/// filter grays out every file on macOS, which is worse than showing all
+/// files, so anything complex is dropped wholesale.
+#[derive(Debug, Clone)]
+pub struct FileDialogFilter {
+    /// The filter's display name (rfd shows it on Windows/Linux only).
+    pub name: String,
+    /// Simple `*.ext` globs, e.g. `*.txt`.
+    pub patterns: Vec<String>,
+}
+
+/// One host file-dialog invocation: everything the native panel starts from.
+///
+/// Built by the comdlg32 handler from the guest's `OPENFILENAME`; consumed by
+/// the host bridge registered via `GuestHandle::set_file_dialog_bridge`.
+#[derive(Debug, Clone)]
+pub struct FileDialogRequest {
+    /// Host directory the panel starts in — the guest's initial directory
+    /// mapped into the bottle (`C:\…` → `{root}/drive_c/…`). `None` when no
+    /// guest-visible directory maps (the panel picks its own default).
+    pub initial_host_dir: Option<std::path::PathBuf>,
+    /// The `lpstrFile` basename, seeding the panel's name field (a save panel
+    /// proposes it as the default file name).
+    pub default_file_name: Option<String>,
+    /// Whether this is a Save panel (`GetSaveFileName`): the host shows an
+    /// NSSavePanel, whose overwrite confirmation is native.
+    pub is_save: bool,
+    /// Best-effort parse of the guest's `lpstrFilter` (empty when complex or
+    /// absent — the panel then shows every file).
+    pub filters: Vec<FileDialogFilter>,
+}
+
+/// A successful native file-dialog pick: the selected HOST path.
+///
+/// The comdlg32 handler maps it back into a guest-visible path at accept and
+/// refuses (cancel) any pick outside the bottle — the guest filesystem cannot
+/// see the file otherwise.
+#[derive(Debug, Clone)]
+pub struct FileDialogPick {
+    /// The host path the user picked in the native panel.
+    pub host_path: std::path::PathBuf,
+}
+
+/// Host file-dialog callback: `(request) → pick, or `None` (user cancelled)`.
+///
+/// Registered by the GUI presenter via `GuestHandle::set_file_dialog_bridge`;
+/// invoked by the `GetOpenFileNameA/W` / `GetSaveFileNameA/W` handlers on the
+/// guest thread, which blocks until the native panel closes (dialog
+/// semantics — the same seam as the MessageBox bridge).
+pub type FileDialogBridge = Box<dyn Fn(&FileDialogRequest) -> Option<FileDialogPick> + Send>;
+
 /// One in-flight interactive file dialog (`GetOpenFileName` / `GetSaveFileName`).
 ///
 /// Created by the comdlg32 handler when [`FileDialogPolicy::Interactive`] is
@@ -127,7 +181,10 @@ pub struct FontDialogSession {
 /// Fields are `pub(crate)` except the ones the runtime reads directly through
 /// `WinApiState::window_state()` (windows, capture/focus handles, menus,
 /// dialog/file-dialog plumbing, keyboard state).
-#[derive(Debug, Clone)]
+///
+/// Deliberately NOT `Debug`/`Clone`: the host file-dialog bridge
+/// ([`FileDialogBridge`]) is a `Box<dyn Fn …>`, which is neither — and no
+/// caller snapshots the whole window state.
 pub struct WindowState {
     pub(crate) window_long_ptr_values: Vec<(u64, i64, u64)>,
     pub(crate) image_list_counts: Vec<(u64, u64)>,
@@ -199,6 +256,16 @@ pub struct WindowState {
     /// In-flight interactive file dialog, when [`FileDialogPolicy::Interactive`]
     /// is set and a dialog is open. See [`FileDialogSession`].
     pub file_dialog: Option<FileDialogSession>,
+    /// Optional host native file-dialog bridge, registered by the GUI
+    /// presenter via `GuestHandle::set_file_dialog_bridge`.
+    ///
+    /// When set, `GetOpenFileName`/`GetSaveFileName` under
+    /// [`FileDialogPolicy::Interactive`] call it with the request and write
+    /// its pick back into the `OPENFILENAME` buffer (a pick outside the
+    /// bottle cancels). When unset the handlers keep the in-app emulated
+    /// dialog, so headless runs and `trace` never see a native panel.
+    /// Mirrors the MessageBox bridge seam (`present::message_box_bridge`).
+    pub file_dialog_bridge: Option<FileDialogBridge>,
     /// Host-side decision for `ChooseFontW` (Interactive shows the host font
     /// dialog; Cancel returns FALSE without one).
     pub font_dialog_policy: FontDialogPolicy,
@@ -282,6 +349,7 @@ impl Default for WindowState {
             file_dialog_policy: FileDialogPolicy::default(),
             last_file_dialog_path: None,
             file_dialog: None,
+            file_dialog_bridge: None,
             font_dialog_policy: FontDialogPolicy::default(),
             font_dialog: None,
             find_dialogs: Vec::new(),

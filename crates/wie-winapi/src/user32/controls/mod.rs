@@ -12,17 +12,17 @@
 use anyhow::Result;
 
 use super::{
-    BN_CLICKED, BS_DEFPUSHBUTTON, BST_FOCUS, BST_PUSHED, CommandPayload, DLGC_BUTTON,
-    DLGC_DEFPUSHBUTTON, DLGC_UNDEFPUSHBUTTON, DLGC_WANTCHARS, EN_HSCROLL, EN_VSCROLL,
-    GuestCallbackRequest, VK_DELETE, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR,
-    VK_RIGHT, VK_SPACE, VK_UP, WM_COMMAND, WinApiControlSignal, WinApiState, WinMsg,
-    WindowClassIdentifier, find_window, find_window_mut, high_word, low_i32, low_word,
-    make_command_wparam, read_guest_ansi_lossy, read_guest_utf16_lossy, write_guest_u32,
+    find_window, find_window_mut, high_word, low_i32, low_word, make_command_wparam,
+    read_guest_ansi_lossy, read_guest_utf16_lossy, write_guest_u32, CommandPayload,
+    GuestCallbackRequest, WinApiControlSignal, WinApiState, WinMsg, WindowClassIdentifier,
+    BN_CLICKED, BST_FOCUS, BST_PUSHED, BS_DEFPUSHBUTTON, DLGC_BUTTON, DLGC_DEFPUSHBUTTON,
+    DLGC_UNDEFPUSHBUTTON, DLGC_WANTCHARS, EN_HSCROLL, EN_VSCROLL, VK_DELETE, VK_DOWN, VK_END,
+    VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SPACE, VK_UP, WM_COMMAND,
 };
-use crate::OuterReturn;
 use crate::gdi32::resolve_window_ancestor;
 use crate::gdi32::{FontEngine, FontKey, ResolvedFont};
 use crate::state::WindowFlags;
+use crate::OuterReturn;
 
 mod button;
 mod edit;
@@ -50,12 +50,12 @@ pub(super) struct PaintFont<'a> {
     pub key: &'a FontKey,
 }
 
-/// An integer rect (`x`, `y`, width, height).
-pub(super) struct Rect {
-    pub x: i32,
-    pub y: i32,
-    pub cx: i32,
-    pub cy: i32,
+/// A control's client extent — the width/height pair every paint path
+/// resolves from the window record (bundle for the paint signatures).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Dimension {
+    pub width: i32,
+    pub height: i32,
 }
 
 /// The text-layout geometry a paint call draws into.
@@ -83,16 +83,16 @@ use button::paint_control;
 /// field, so it must be reachable at the same visibility as the enum.
 pub use edit::UndoSnapshot;
 use edit::{
-    CARET_TIMER_ID, ctrl_is_down, edit_can_undo, edit_caret_tick, edit_char, edit_clear, edit_copy,
-    edit_cut, edit_delete_at_caret, edit_empty_undo_buffer, edit_first_visible_line,
-    edit_focus_gained, edit_focus_lost, edit_get_handle, edit_get_limit, edit_get_line,
-    edit_get_modify, edit_get_selection, edit_invalidate_caret, edit_invalidate_text_buffer,
-    edit_line_count, edit_line_from_char, edit_line_index, edit_line_length, edit_mouse_dblclk,
-    edit_mouse_down, edit_mouse_move, edit_mouse_up, edit_mouse_wheel, edit_move_caret,
-    edit_notify_change, edit_notify_scroll, edit_paste, edit_pos_from_char, edit_replace_selection,
+    ctrl_is_down, edit_can_undo, edit_caret_tick, edit_char, edit_clear, edit_copy, edit_cut,
+    edit_delete_at_caret, edit_empty_undo_buffer, edit_first_visible_line, edit_focus_gained,
+    edit_focus_lost, edit_get_handle, edit_get_limit, edit_get_line, edit_get_modify,
+    edit_get_selection, edit_invalidate_caret, edit_invalidate_text_buffer, edit_line_count,
+    edit_line_from_char, edit_line_index, edit_line_length, edit_mouse_dblclk, edit_mouse_down,
+    edit_mouse_move, edit_mouse_up, edit_mouse_wheel, edit_move_caret, edit_notify_change,
+    edit_notify_scroll, edit_paste, edit_pos_from_char, edit_replace_selection,
     edit_reset_invalid_rows, edit_scroll_caret, edit_scroll_horizontal, edit_scroll_vertical,
     edit_selection_type, edit_set_handle, edit_set_limit, edit_set_modify, edit_set_selection,
-    edit_set_tab_stops, edit_undo,
+    edit_set_tab_stops, edit_undo, CARET_TIMER_ID,
 };
 use listbox::{listbox_hit_item, listbox_notify_change};
 use paint::write_control_text;
@@ -101,8 +101,8 @@ use paint::write_control_text;
 // unused import.
 #[cfg(test)]
 pub(crate) use edit::{
-    VisibleSegment, clamp_scroll_offset, edit_char_index_at_point, edit_text_area,
-    layout_visible_lines, scrollbar_visible, visible_line_count, visual_rows,
+    clamp_scroll_offset, edit_char_index_at_point, edit_text_area, layout_visible_lines,
+    scrollbar_visible, visible_line_count, visual_rows, VisibleSegment,
 };
 // The no-create undo-buffer clear is called from the SetWindowText handlers
 // in `user32::window` (they write control text outside the control dispatch).

@@ -2690,6 +2690,219 @@ fn test_status_bar_paint_draws_part_separator_grooves() {
     assert_eq!(px(120, 90), 0x00F0_F0F0, "part 1 interior stays BTNFACE");
 }
 
+/// Red-green regression for the real RNotepad status-bar geometry.
+///
+/// `DIALOG_StatusBarAlignParts` does NOT measure the part text: it computes
+/// the parts from the bar's client width alone (`parts = [W-240, W-120, -1]`,
+/// clamped), so the EOL cell ("Windows (CR + LF)") is a FIXED 120 px box
+/// sized for the ~13 px default GUI font real Windows draws a font-less
+/// status bar with. WIE's 16 px system default renders the text ~125 px wide
+/// — wider than the 120 px cell — and the last glyph clips at the boundary.
+/// The paint must draw a font-less status bar at the guest-UI font size so
+/// the fixed geometry fits, with the right inset keeping the ink off the edge.
+#[test]
+fn test_status_bar_no_font_fixed_cell_fits_full_part_text() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (top, bar) = push_status_bar_pair(&mut state);
+    // Widen to a real notepad default; the bar keeps the fixture's 24 px
+    // height and bottom-strip placement.
+    for w in &mut state.window_state().windows {
+        if w.handle == crate::handles::Hwnd::from(top)
+            || w.handle == crate::handles::Hwnd::from(bar)
+        {
+            w.width = 640;
+        }
+    }
+    // The guest's DIALOG_StatusBarAlignParts output for W = 640: part 1's
+    // right edge is W - 120 = 520, so its cell is the fixed [400, 520] box.
+    let parts_addr = 0x6000;
+    write_guest_int_array(&mut engine, parts_addr, &[400, 520, -1], "write parts");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        bar,
+        crate::user32::controls::SB_SETPARTS,
+        3,
+        parts_addr,
+    )
+    .expect("setparts ok")
+    .expect("some result");
+    let text_addr = 0x6100;
+    write_guest_utf16(&mut engine, text_addr, "Windows (CR + LF)");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        bar,
+        crate::user32::controls::SB_SETTEXTW,
+        1,
+        text_addr,
+    )
+    .expect("settext1 ok")
+    .expect("some result");
+    write_guest_utf16(&mut engine, text_addr, "UTF-8");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        bar,
+        crate::user32::controls::SB_SETTEXTW,
+        2,
+        text_addr,
+    )
+    .expect("settext2 ok")
+    .expect("some result");
+
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        bar,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint ok")
+    .expect("some result");
+    state.present().drain_pending_publishes();
+
+    let frame = state
+        .present()
+        .published
+        .get(&crate::handles::Hwnd::from(top))
+        .expect("published frame")
+        .clone();
+    assert_eq!((frame.width, frame.height), (640, 100));
+    let ink_in = |range: std::ops::Range<i32>| -> usize {
+        let mut count = 0_usize;
+        for col in range {
+            for row in 78..98 {
+                let idx = (usize::try_from(row).unwrap_or(0)
+                    * usize::try_from(frame.width).unwrap_or(0))
+                .saturating_add(usize::try_from(col).unwrap_or(0));
+                if frame.pixels.get(idx).copied().unwrap_or(0) != 0x00F0_F0F0 {
+                    count = count.saturating_add(1);
+                }
+            }
+        }
+        count
+    };
+    // The EOL text renders inside the fixed cell (its first half is inked)…
+    assert!(
+        ink_in(403..480) > 0,
+        "Windows (CR + LF) must render inside its fixed 120 px cell"
+    );
+    // …and the last glyph is FULLY visible: nothing in the final 8 px before
+    // the cell boundary (the 16 px default font reaches past it; the ~13 px
+    // part font plus the 3 px right inset keeps it clear).
+    assert_eq!(
+        ink_in(512..520),
+        0,
+        "the EOL text must not clip at the cell edge"
+    );
+    // Part 2 still renders after the boundary.
+    assert!(ink_in(523..637) > 0, "UTF-8 must render in the last part");
+}
+
+/// Verdict pin: `GetTextExtentPoint32` and the status-bar paint resolve the
+/// SAME font at the SAME size when the guest selects the bar's font into the
+/// measurement DC (the real-app flow: `GetDC` → `SelectObject(WM_GETFONT)` →
+/// `GetTextExtentPoint32`). Both paths sum `char_advance` over the same
+/// resolved font, so a cell sized to the measured width holds the rendered
+/// text — the recon's suspected measurement/render font divergence does not
+/// exist on this path (both agree at the stored `WM_SETFONT` font).
+#[test]
+fn test_status_bar_measurement_matches_paint_font_when_selected() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (_top, bar) = push_status_bar_pair(&mut state);
+
+    // A 13 px "MS Shell Dlg" font through the real dispatch path (the guest's
+    // own UI font; the HFONT lands in the GDI font table).
+    let logfont_ptr = 0x5000_u64;
+    engine
+        .mem_write(logfont_ptr, &(-13_i32).to_le_bytes())
+        .expect("write LOGFONTA.lfHeight");
+    engine
+        .mem_write(logfont_ptr + 16, &(400_i32).to_le_bytes())
+        .expect("write LOGFONTA.lfWeight");
+    engine
+        .mem_write(logfont_ptr + 23, &[1_u8])
+        .expect("write LOGFONTA.lfCharSet");
+    engine
+        .mem_write(logfont_ptr + 28, b"MS Shell Dlg\0")
+        .expect("write LOGFONTA.lfFaceName");
+    write_regs(&mut engine, logfont_ptr, 0, 0, 0, 0);
+    let id = crate::resolve_winapi_id("gdi32.dll", "CreateFontIndirectA")
+        .expect("CreateFontIndirectA must resolve");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("CreateFontIndirectA must dispatch");
+    let font = r.return_value;
+    assert_ne!(font, 0, "CreateFontIndirectA must return an HFONT");
+
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        bar,
+        crate::user32::WM_SETFONT,
+        font,
+        0,
+    )
+    .expect("setfont handled")
+    .expect("some result");
+
+    // The guest's measurement DC: GetDC(statusbar), then select the bar's
+    // font into it the way a real app does.
+    write_regs(&mut engine, bar, 0, 0, 0, 0);
+    let id = crate::resolve_winapi_id("user32.dll", "GetDC").expect("GetDC must resolve");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("GetDC must dispatch");
+    let dc = r.return_value;
+    assert_ne!(dc, 0, "GetDC must return an HDC");
+    write_regs(&mut engine, dc, font, 0, 0, 0);
+    let id =
+        crate::resolve_winapi_id("gdi32.dll", "SelectObject").expect("SelectObject must resolve");
+    crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("SelectObject must dispatch");
+
+    // Measure the widest part text the way the guest does.
+    let text = "Windows (CR + LF)";
+    let text_addr = 0x6000_u64;
+    write_guest_utf16(&mut engine, text_addr, text);
+    let size_addr = 0x6200_u64;
+    let count = u64::try_from(text.encode_utf16().count()).unwrap_or(0);
+    write_regs(&mut engine, dc, text_addr, count, size_addr, 0);
+    let id = crate::resolve_winapi_id("gdi32.dll", "GetTextExtentPoint32W")
+        .expect("GetTextExtentPoint32W must resolve");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("GetTextExtentPoint32W must dispatch");
+    assert_ne!(r.return_value, 0, "extent must succeed");
+    let mut bytes = [0_u8; 8];
+    engine.mem_read(size_addr, &mut bytes).expect("read size");
+    let measured_w = i32::from_le_bytes(bytes[0..4].try_into().expect("cx"));
+
+    // Paint-side width: the advance sum at the font the paint resolves.
+    let mut font_engine = crate::gdi32::FontEngine::default();
+    let (key, resolved) = crate::gdi32::window_font_resolution(&state, bar, &mut font_engine)
+        .expect("paint font must resolve");
+    let paint_w = font_engine.text_advance(&resolved, &key, text, text.len());
+    assert_eq!(
+        measured_w, paint_w,
+        "GetTextExtentPoint32 must agree with the paint's advance sum at the \
+         stored font"
+    );
+}
+
 #[test]
 fn test_status_bar_wm_size_sizes_and_positions_bar_in_parent() {
     let mut engine = test_engine();
