@@ -311,7 +311,7 @@ fn decode_csi(bytes: &[u8]) -> Step {
         .get(1)
         .copied()
         .flatten()
-        .map_or(0, |value| xterm_modifier_mask(value));
+        .map_or(0, xterm_modifier_mask);
 
     let virtual_key = match final_byte {
         b'A' => VK_UP,

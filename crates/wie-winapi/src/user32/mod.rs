@@ -25,7 +25,11 @@ pub(crate) const FAKE_ICON_HANDLE: u64 = 0x0000_0000_6600_0001;
 pub(crate) const FAKE_CURSOR_HANDLE: u64 = 0x0000_0000_6600_0002;
 pub(crate) const IDOK: u64 = 1;
 pub(crate) const IDCANCEL: u64 = 2;
+// MessageBox return constants used only by the cfg(test) MB_YESNO bridge tests
+// (state/tests.rs); kept for the MessageBox return-value surface.
+#[allow(dead_code)]
 pub(crate) const IDYES: u64 = 6;
+#[allow(dead_code)]
 pub(crate) const IDNO: u64 = 7;
 
 pub(crate) const WM_MDICREATE: u32 = wm::WinMsg::WM_MDICREATE.as_u32();
@@ -84,7 +88,7 @@ pub(crate) const WM_CREATE: u32 = wm::WinMsg::WM_CREATE.as_u32();
 pub(crate) const WM_DESTROY: u32 = wm::WinMsg::WM_DESTROY.as_u32();
 #[expect(dead_code)]
 pub(crate) const WM_MOVE: u32 = wm::WinMsg::WM_MOVE.as_u32();
-#[expect(dead_code)]
+#[allow(dead_code)] // used only from cfg(test) state/tests.rs (status-bar WM_SIZE)
 pub(crate) const WM_SIZE: u32 = wm::WinMsg::WM_SIZE.as_u32();
 #[expect(dead_code)]
 pub(crate) const WM_ACTIVATE: u32 = wm::WinMsg::WM_ACTIVATE.as_u32();

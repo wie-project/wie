@@ -278,6 +278,36 @@ pub(super) fn exec_sse_pshufd(
     Ok(())
 }
 
+/// `SHUFPD` — shuffle packed double-precision values from two sources (SSE2).
+///
+/// Each of the two 64-bit destination lanes independently selects the low or
+/// high lane of the first source (the destination register, `imm8` bit 0) or
+/// of the second source (register/memory, `imm8` bit 1). The compiler emits
+/// this for 128-bit string/struct copies (e.g. the UCRT `wcscpy` fast path),
+/// so a guest reaching it must not die with "unimplemented mnemonic".
+pub(super) fn exec_sse_shufpd(
+    mem: &GuestMemory,
+    regs: &mut RegFile,
+    instr: &Instruction,
+) -> Result<(), StepExecError> {
+    let dst = instr.op_register(0);
+    let src1 = regs.read_xmm(dst)?;
+    let src2 = read_sse_op(mem, regs, instr, 1, 16)?;
+    let imm8 = instr.immediate(2) as u8;
+    let low = if imm8 & 1 == 0 {
+        src1 & u128::from(u64::MAX)
+    } else {
+        src2 & u128::from(u64::MAX)
+    };
+    let high = if imm8 & 2 == 0 {
+        src1 & !u128::from(u64::MAX)
+    } else {
+        src2 & !u128::from(u64::MAX)
+    };
+    regs.write_xmm(dst, low | high)?;
+    Ok(())
+}
+
 /// `PSHUFLW` / `PSHUFHW` — shuffle the low/high 16-bit lanes of an XMM register.
 pub(super) fn exec_sse_pshuflw_hw(
     mem: &GuestMemory,
@@ -1051,56 +1081,56 @@ pub(crate) fn sse_fp_binop(op: SseFpBinOp, a: u64, b: u64) -> u64 {
 }
 
 fn f32_to_i32_trunc(f: f32) -> i32 {
-    if f.is_nan() || f >= 2_147_483_648.0 || f < -2_147_483_648.0 {
+    if f.is_nan() || !(-2_147_483_648.0..2_147_483_648.0).contains(&f) {
         return i32::MIN;
     }
     f.trunc() as i32
 }
 
 fn f32_to_i32_round(f: f32) -> i32 {
-    if f.is_nan() || f >= 2_147_483_648.0 || f < -2_147_483_648.0 {
+    if f.is_nan() || !(-2_147_483_648.0..2_147_483_648.0).contains(&f) {
         return i32::MIN;
     }
     f.round_ties_even() as i32
 }
 
 fn f32_to_i64_trunc(f: f32) -> i64 {
-    if f.is_nan() || f >= 9_223_372_036_854_775_808.0 || f < -9_223_372_036_854_775_808.0 {
+    if f.is_nan() || !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&f) {
         return i64::MIN;
     }
     f.trunc() as i64
 }
 
 fn f32_to_i64_round(f: f32) -> i64 {
-    if f.is_nan() || f >= 9_223_372_036_854_775_808.0 || f < -9_223_372_036_854_775_808.0 {
+    if f.is_nan() || !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&f) {
         return i64::MIN;
     }
     f.round_ties_even() as i64
 }
 
 fn f64_to_i32_trunc(f: f64) -> i32 {
-    if f.is_nan() || f >= 2_147_483_648.0 || f < -2_147_483_648.0 {
+    if f.is_nan() || !(-2_147_483_648.0..2_147_483_648.0).contains(&f) {
         return i32::MIN;
     }
     f.trunc() as i32
 }
 
 fn f64_to_i32_round(f: f64) -> i32 {
-    if f.is_nan() || f >= 2_147_483_648.0 || f < -2_147_483_648.0 {
+    if f.is_nan() || !(-2_147_483_648.0..2_147_483_648.0).contains(&f) {
         return i32::MIN;
     }
     f.round_ties_even() as i32
 }
 
 fn f64_to_i64_trunc(f: f64) -> i64 {
-    if f.is_nan() || f >= 9_223_372_036_854_775_808.0 || f < -9_223_372_036_854_775_808.0 {
+    if f.is_nan() || !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&f) {
         return i64::MIN;
     }
     f.trunc() as i64
 }
 
 fn f64_to_i64_round(f: f64) -> i64 {
-    if f.is_nan() || f >= 9_223_372_036_854_775_808.0 || f < -9_223_372_036_854_775_808.0 {
+    if f.is_nan() || !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&f) {
         return i64::MIN;
     }
     f.round_ties_even() as i64

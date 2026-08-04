@@ -46,6 +46,8 @@ pub(crate) fn parse_mat4(bytes: &[u8; 64]) -> Mat4 {
 }
 
 /// Fill one clipped rect of the backbuffer with `color` (0RGB).
+// Wide signature: one rect = 4 coords + dims + color is the natural rasterizer call.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fill_backbuffer_rect(
     backbuffer: &mut [u32],
     width: u32,
@@ -369,6 +371,8 @@ fn rasterize_vertex_stream(
 /// span pattern), then parsed host-side by FVF layout. Unreadable/malformed
 /// buffers are skipped (return `Ok(())`) — a bad pointer must not crash the
 /// guest; the draw simply produces no pixels.
+// Wide signature: one full draw command (stream + FVF + primitive + indices).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_vertex_stream(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,

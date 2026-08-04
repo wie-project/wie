@@ -32,7 +32,7 @@ use sse::{
     exec_sse_cvt_packed, exec_sse_int_binop, exec_sse_minmax_packed, exec_sse_minmax_scalar,
     exec_sse_mov, exec_sse_movd, exec_sse_movhlps, exec_sse_movhps, exec_sse_movq,
     exec_sse_packed_fp, exec_sse_psadbw, exec_sse_pshufb, exec_sse_pshufd, exec_sse_pshuflw_hw,
-    exec_sse_punpck, exec_sse_punpck_lanes, exec_sse_scalar_fp, exec_sse_shift,
+    exec_sse_punpck, exec_sse_punpck_lanes, exec_sse_scalar_fp, exec_sse_shift, exec_sse_shufpd,
     exec_sse_sqrt_packed, exec_sse_sqrt_scalar, exec_sse_unpcklpd, is_sse_movsd, sse_int_op,
     sse_shift_op,
 };
@@ -465,6 +465,9 @@ fn execute_one(
         Mnemonic::Pshufd => exec_sse_pshufd(mem, regs, instr),
         Mnemonic::Pshuflw | Mnemonic::Pshufhw => exec_sse_pshuflw_hw(mem, regs, instr),
         Mnemonic::Pshufb => exec_sse_pshufb(mem, regs, instr),
+        // SHUFPD shuffles 64-bit lanes between two sources (the UCRT wcscpy
+        // fast path and similar 128-bit copies use it).
+        Mnemonic::Shufpd => exec_sse_shufpd(mem, regs, instr),
         // Packed integer arithmetic / compare / pack (SSE2 integer family).
         Mnemonic::Paddb
         | Mnemonic::Paddw

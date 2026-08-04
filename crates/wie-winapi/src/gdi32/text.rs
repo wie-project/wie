@@ -306,6 +306,8 @@ fn clip_run_band(
 /// Returns the clipped band actually written (`None` when nothing was drawn):
 /// window-DC callers mark it as the surface's dirty rect, so the next publish
 /// copies only the repainted line instead of the whole surface.
+// Wide signature: one text run needs font + target + position + attrs + clip.
+#[allow(clippy::too_many_arguments)]
 fn render_run(
     engine: &mut dyn wie_cpu::CpuEngine,
     font_engine: &mut FontEngine,
@@ -393,6 +395,8 @@ fn render_run(
 }
 
 /// Blend one glyph's coverage for `row` into the row's pixel accumulator.
+// Wide signature: one row of one glyph needs pen position + row bounds + fg.
+#[allow(clippy::too_many_arguments)]
 fn blend_glyph_row(
     row_pixels: &mut [Option<(u32, u8)>],
     glyph: &RasterizedGlyph,
@@ -857,6 +861,8 @@ pub fn handle_draw_text_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 /// The caller supplies the resolved default font (sans-serif 16 px) — the
 /// same rasterizer the text APIs use, exposed for the host-side control
 /// WndProcs which have no DC to resolve.
+// Wide signature: text-into-surface carries target + position + text + color + clip.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_text_into_surface(
     engine: &mut dyn wie_cpu::CpuEngine,
     font_engine: &mut FontEngine,

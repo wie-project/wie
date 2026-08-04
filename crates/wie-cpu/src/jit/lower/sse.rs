@@ -68,6 +68,8 @@ pub(super) fn load_sse_mem(
     }
 }
 
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn store_sse_mem(
     bcx: &mut FunctionBuilder<'_>,
     mem: &MemEnv,
@@ -91,6 +93,8 @@ pub(super) fn store_sse_mem(
 }
 
 /// movaps/movups/movdqa/movdqu/movss/movsd.
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lower_sse_mov(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
@@ -484,6 +488,40 @@ pub(super) fn lower_sse_pshufd(
     Ok(())
 }
 
+/// `SHUFPD` — shuffle the two 64-bit lanes between two sources.
+///
+/// Each destination lane independently selects the matching lane of the first
+/// source (the destination register itself) or of the second source
+/// (register/memory): `imm8` bit 0 picks the low lane's source, bit 1 the
+/// high lane's. The UCRT `wcscpy` fast path uses it, so a guest reaching it
+/// must not fall back to iced (the File menus were dying on it).
+pub(super) fn lower_sse_shufpd(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
+) -> Result<(), String> {
+    let dst = instr.op_register(0);
+    let di = xmm_index(dst)?;
+    // The first source is the destination register (read before the store).
+    let (s1_lo, s1_hi) = read_xmm_pair(xmm, dst)?;
+    let (s2_lo, s2_hi) = match instr.op1_kind() {
+        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
+        OpKind::Memory => {
+            let addr = effective_addr(bcx, instr, gpr)?;
+            load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
+        }
+        _ => return Err("shufpd src".into()),
+    };
+    let imm = instr.immediate(2) & 0xff;
+    let lo = if imm & 1 == 0 { s1_lo } else { s2_lo };
+    let hi = if imm & 2 == 0 { s1_hi } else { s2_hi };
+    store_xmm_pair(bcx, mem, xmm, di, lo, hi);
+    Ok(())
+}
+
 /// `PSHUFLW` / `PSHUFHW` — shuffle low/high 16-bit lanes.
 pub(super) fn lower_sse_pshuflw_hw(
     bcx: &mut FunctionBuilder<'_>,
@@ -691,6 +729,8 @@ pub(super) fn vec_to_pair(
 }
 
 /// Apply a lane-wise vector binary op to a lo/hi pair.
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn vec_binop(
     bcx: &mut FunctionBuilder<'_>,
     flags: MemFlagsData,

@@ -289,6 +289,8 @@ fn resolve_src_info(
 }
 
 /// Copy 32-bpp pixels from guest memory into a destination surface row buffer.
+// Wide signature: one blit row needs source geometry + dest surface + clip.
+#[allow(clippy::too_many_arguments)]
 fn blit_row(
     engine: &mut dyn wie_cpu::CpuEngine,
     src_va: u64,
@@ -377,6 +379,8 @@ fn blit_row(
 /// `publish == false` is used by control painting: the control's WM_PAINT
 /// draws into the ancestor surface without publishing — the ancestor's own
 /// WM_PAINT BitBlt publishes the composite frame.
+// Wide signature: one rect fill carries the surface dims + rect + color.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fill_rect_surface(
     state: &mut crate::WinApiState,
     hwnd: crate::handles::Hwnd,

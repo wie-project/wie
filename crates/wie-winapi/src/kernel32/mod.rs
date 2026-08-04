@@ -294,28 +294,28 @@ pub(crate) enum EnterCsResult {
     NeedPark,
 }
 
-/// Try enter (or re-enter) a guest critical section for `owner_tid`.
+// Try enter (or re-enter) a guest critical section for `owner_tid`.
 
-/// Leave a guest critical section owned by `owner_tid`.
-///
-/// Returns `true` if the CS became fully unlocked (wake one waiter).
+// Leave a guest critical section owned by `owner_tid`.
+//
+// Returns `true` if the CS became fully unlocked (wake one waiter).
 
-/// Publish one FLS slot into the guest table used by in-guest `FlsGetValue`.
+// Publish one FLS slot into the guest table used by in-guest `FlsGetValue`.
 
-///
-/// Lean host path (also fallback for guest SBCS helper). Single-byte code pages
-/// use zero-extend (matches guest accelerator); others use UTF-8 lossy.
+//
+// Lean host path (also fallback for guest SBCS helper). Single-byte code pages
+// use zero-extend (matches guest accelerator); others use UTF-8 lossy.
 
-/// Zero-extend each byte to UTF-16 (SBCS / Latin-1 identity).
+// Zero-extend each byte to UTF-16 (SBCS / Latin-1 identity).
 
-///
-/// Microsoft Learn: returns character count excluding NUL. If the buffer is too
-/// small, the path is truncated (NUL-terminated), the return value is `nSize`,
-/// and last-error is `ERROR_INSUFFICIENT_BUFFER`.
+//
+// Microsoft Learn: returns character count excluding NUL. If the buffer is too
+// small, the path is truncated (NUL-terminated), the return value is `nSize`,
+// and last-error is `ERROR_INSUFFICIENT_BUFFER`.
 
-///
-/// Microsoft Learn: returns the export address, or `NULL` if not found
-/// (`GetLastError` → `ERROR_PROC_NOT_FOUND`). Does **not** abort the process.
+//
+// Microsoft Learn: returns the export address, or `NULL` if not found
+// (`GetLastError` → `ERROR_PROC_NOT_FOUND`). Does **not** abort the process.
 
 // ─── Soft console / process helpers for real CLI tools (7za) ────────────────
 

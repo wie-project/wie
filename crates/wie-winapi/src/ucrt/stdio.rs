@@ -59,7 +59,7 @@ pub(crate) fn handle_fwrite(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 
     // Host stdout/stderr for console programs (independent CRT expects console I/O).
     if stream == FILE_STDOUT || stream == FILE_STDERR {
-        write_host_console(stream, &bytes);
+        write_host_console(stream, bytes);
     }
 
     ret(engine, count)

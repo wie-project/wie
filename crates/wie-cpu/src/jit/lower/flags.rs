@@ -9,6 +9,8 @@ use crate::regs::Rflags;
 use cranelift::prelude::*;
 use iced_x86::Instruction;
 
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lower_inc_dec_lazy(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,

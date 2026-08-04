@@ -451,6 +451,8 @@ pub(super) fn call_load(
     Ok(bcx.block_params(merge)[0])
 }
 
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_load_helper(
     bcx: &mut FunctionBuilder<'_>,
     mem: &MemEnv,
@@ -476,6 +478,8 @@ pub(super) fn emit_load_helper(
     slow_val
 }
 
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn call_store(
     bcx: &mut FunctionBuilder<'_>,
     mem: &MemEnv,
@@ -549,6 +553,8 @@ pub(super) fn call_store(
     Ok(())
 }
 
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_store_helper(
     bcx: &mut FunctionBuilder<'_>,
     mem: &MemEnv,

@@ -428,7 +428,9 @@ fn is_lowerable(instr: &Instruction) -> bool {
             sse_comis_is_lowerable(instr)
         }
         // Shuffles.
-        Mnemonic::Pshufd | Mnemonic::Pshuflw | Mnemonic::Pshufhw => sse_pshuf_is_lowerable(instr),
+        Mnemonic::Pshufd | Mnemonic::Pshuflw | Mnemonic::Pshufhw | Mnemonic::Shufpd => {
+            sse_pshuf_is_lowerable(instr)
+        }
         Mnemonic::Pshufb => sse_bitwise_is_lowerable(instr),
         // String ops (REP bulk via JIT host helper); ends block in decoder.
         Mnemonic::Stosb

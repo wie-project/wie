@@ -546,6 +546,8 @@ fn empty_chain_refs() -> &'static HashMap<u64, FuncRef> {
     EMPTY.get_or_init(HashMap::new)
 }
 
+// The wide signature is a load-bearing JIT lowering entry point carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn compile_block(
     eng: &mut JitEngine,
     start_rip: u64,
@@ -1324,6 +1326,8 @@ pub(super) fn lower_setcc(
 }
 
 /// Compute shift result now; pack flags lazily via [`PendingFlags::Shift`].
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lower_shift_lazy(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,

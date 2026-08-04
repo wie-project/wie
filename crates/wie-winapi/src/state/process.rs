@@ -116,12 +116,14 @@ pub struct FileIoState {
     pub cached_streams: HashMap<u64, std::sync::Arc<std::sync::Mutex<std::fs::File>>>,
 }
 
+/// Guest IAT resolver callback: (module name, import name, IAT slot) → fake VA.
+type ResolveFn = Box<dyn FnMut(&str, &str, u64) -> anyhow::Result<u64> + Send>;
+
 /// Thread-safe resolver for dynamic DLL imports.
 ///
 /// Wraps a closure behind `Arc<Mutex<…>>` so [`ModuleState`] can derive
 /// `Clone` and `Debug` without losing the closure's captured state.
-type ImportResolverInner =
-    std::sync::Arc<std::sync::Mutex<Box<dyn FnMut(&str, &str, u64) -> anyhow::Result<u64> + Send>>>;
+type ImportResolverInner = std::sync::Arc<std::sync::Mutex<ResolveFn>>;
 
 #[derive(Clone)]
 pub struct ImportResolver {
@@ -135,7 +137,7 @@ impl std::fmt::Debug for ImportResolver {
 }
 
 impl ImportResolver {
-    pub fn new(f: Box<dyn FnMut(&str, &str, u64) -> anyhow::Result<u64> + Send>) -> Self {
+    pub fn new(f: ResolveFn) -> Self {
         Self {
             inner: std::sync::Arc::new(std::sync::Mutex::new(f)),
         }

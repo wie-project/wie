@@ -36,6 +36,8 @@ pub(super) fn term_chain_targets(t: BlockTerm) -> Vec<u64> {
 ///
 /// When `gpr_dirty` is `Some`, only dirty+loaded regs are stored (reg-mapping opt).
 /// When `None`, every loaded reg is stored (safe default for host helpers / unknown).
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn writeback_gprs(
     bcx: &mut FunctionBuilder<'_>,
     ctx_ptr: Value,
@@ -148,6 +150,8 @@ pub(super) fn shadow_pop_check(
 /// Uses host C ABI `call`/`call_indirect` (not Tail/`return_call`) so blocks stay
 /// callable from Rust as `extern "C"`. Nesting is capped by [`MAX_CHAIN_DEPTH`]:
 /// past the limit we return to the Rust dispatcher with RIP already advanced.
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_chain_or_exit(
     bcx: &mut FunctionBuilder<'_>,
     ctx_ptr: Value,
@@ -263,6 +267,8 @@ pub(super) fn emit_chain_or_exit(
 ///
 /// `loop_header` must **not** be the function entry block — Cranelift rejects
 /// edges into entry (`remove_constant_phis` / `edge.block != entry_block`).
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lower_self_loop_term(
     bcx: &mut FunctionBuilder<'_>,
     term: BlockTerm,
@@ -332,6 +338,8 @@ pub(super) fn lower_self_loop_term(
     }
 }
 
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lower_jcc_chain(
     bcx: &mut FunctionBuilder<'_>,
     mnemonic: Mnemonic,
@@ -602,6 +610,8 @@ pub(super) fn exit_args(gpr: &[Value; 16], rflags: Value) -> [BlockArg; 17] {
     args
 }
 
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_body_and_term(
     bcx: &mut FunctionBuilder<'_>,
     body: &[DecodedInsn],

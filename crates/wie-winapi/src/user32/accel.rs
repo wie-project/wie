@@ -248,7 +248,7 @@ fn handle_translate_accelerator(
         .process
         .main_module_accelerators
         .iter()
-        .find(|table| table_id.map_or(false, |id| table.id == u32::from(id)))
+        .find(|table| table_id.is_some_and(|id| table.id == u32::from(id)))
         .and_then(|table| {
             find_matching_command(&table.entries, message, word_parameter, keyboard?)
         });

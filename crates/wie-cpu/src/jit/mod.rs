@@ -928,10 +928,20 @@ mod tests {
             ("pshufd", &[0x66, 0x0f, 0x70, 0xc1, 0x1b][..]),
             ("pshuflw", &[0xf2, 0x0f, 0x70, 0xc1, 0x1b][..]),
             ("pshufhw", &[0xf3, 0x0f, 0x70, 0xc1, 0x1b][..]),
+            ("shufpd", &[0x66, 0x0f, 0xc6, 0xc1, 0x01][..]),
         ] {
             let (iced, jit) = simd_dual(bytes, &[], |r| set_pair(r, x0, x1));
             assert_same_regs(&iced, &jit, name);
         }
+        // Hand-check SHUFPD imm 0x01: low lane from src2, high lane from src1
+        // (the UCRT wcscpy fast path uses this — the guest File menus died on
+        // it before the iced implementation landed).
+        let a = 0x1111_2222_3333_4444_5555_6666_7777_8888_u128;
+        let b = 0xAAAA_BBBB_CCCC_DDDD_EEEE_FFFF_0000_1111_u128;
+        let (iced, jit) = simd_dual(&[0x66, 0x0f, 0xc6, 0xc1, 0x01], &[], |r| set_pair(r, a, b));
+        let want = 0x1111_2222_3333_4444_EEEE_FFFF_0000_1111_u128;
+        assert_eq!(iced.xmm_at(0), want, "iced shufpd");
+        assert_eq!(jit.xmm_at(0), want, "jit shufpd");
         // Hand-check PSHUFD imm 0x1B = [3,2,1,0] (reverse dwords).
         let a = 0x0000_0001_0000_0002_0000_0003_0000_0004_u128;
         let (iced, jit) = simd_dual(&[0x66, 0x0f, 0x70, 0xc1, 0x1b], &[], |r| set_pair(r, 0, a));

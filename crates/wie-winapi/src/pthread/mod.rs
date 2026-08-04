@@ -747,7 +747,7 @@ fn nanosleep(
     let Some((secs, nsecs)) = read_timespec(engine, req, bits64) else {
         return ret_errno(engine, EINVAL);
     };
-    if nsecs < 0 || nsecs > 999_999_999 || secs < 0 {
+    if !(0..=999_999_999).contains(&nsecs) || secs < 0 {
         return ret_errno(engine, EINVAL);
     }
     std::thread::sleep(timespec_to_duration(secs, nsecs));

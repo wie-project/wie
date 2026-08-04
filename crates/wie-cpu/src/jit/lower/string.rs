@@ -18,6 +18,8 @@ use iced_x86::Instruction;
 ///
 /// Fast path: soft-translate spans + unrolled `I8X16` stores. Slow path: `wie_jit_string`.
 /// Returns exit RIP SSA value, or `None` if preconditions fail (no IR emitted).
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn try_lower_inline_rep(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,

@@ -664,6 +664,8 @@ pub(super) fn lower_pop(
 }
 
 /// Lazy ALU: defer flag packing; overwrite previous pending (last writer wins).
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lower_arith_lazy(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
@@ -1215,6 +1217,8 @@ pub(super) fn lower_xchg(
     }
 }
 
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn write_op_mem(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,

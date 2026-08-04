@@ -15,7 +15,7 @@ use super::gpr::{
 use super::sse::{
     lower_sse_int_binop, lower_sse_mov, lower_sse_movd, lower_sse_movhlps, lower_sse_movhps,
     lower_sse_movq, lower_sse_pshufd, lower_sse_pshuflw_hw, lower_sse_punpck,
-    lower_sse_punpck_lanes, sse_int_op, sse_shift_op,
+    lower_sse_punpck_lanes, lower_sse_shufpd, sse_int_op, sse_shift_op,
 };
 use super::sse_fp::{
     FloatBinOp, FloatWidth, lower_sse_bitwise, lower_sse_comis, lower_sse_cvt_fp_to_gpr,
@@ -231,6 +231,8 @@ pub(super) fn materialize_shift_flags(
     bcx.ins().select(is_zero, old_rflags, new_flags)
 }
 
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lower_insn(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
@@ -594,6 +596,7 @@ pub(super) fn lower_insn(
         | Mnemonic::Punpckhwd
         | Mnemonic::Punpckhdq => lower_sse_punpck_lanes(bcx, instr, gpr, *rflags, mem, xmm),
         Mnemonic::Pshufd => lower_sse_pshufd(bcx, instr, gpr, *rflags, mem, xmm),
+        Mnemonic::Shufpd => lower_sse_shufpd(bcx, instr, gpr, *rflags, mem, xmm),
         Mnemonic::Pshuflw | Mnemonic::Pshufhw => {
             lower_sse_pshuflw_hw(bcx, instr, gpr, *rflags, mem, xmm)
         }

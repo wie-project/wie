@@ -57,7 +57,6 @@ fn gui_suite_serialize() -> std::sync::MutexGuard<'static, ()> {
 /// short quantum between empty-queue yields so the host clock advances and
 /// WM_TIMER / synthesized WM_PAINT actually fire.
 fn drive_gui_session(path: &Path, iterations_budget: usize) -> Option<u32> {
-    use std::time::Duration;
     use wie_runtime::EntryTraceTermination;
     use wie_winapi::MessageQueueIdlePolicy;
 
@@ -83,7 +82,7 @@ fn drive_gui_session(path: &Path, iterations_budget: usize) -> Option<u32> {
             EntryTraceTermination::ExitProcess { code } => return Some(code),
             EntryTraceTermination::WaitingForMessage => {
                 // Sleep a quantum so timers advance, then re-enter GetMessage.
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
             other => {
                 panic!("GUI session stopped unexpectedly: {other:?}");
@@ -189,7 +188,6 @@ fn gui_d3d9_renders_clear_and_triangle() {
     // Serialized suite: see GUI_SUITE_LOCK.
     let _suite = gui_suite_serialize();
 
-    use std::time::Duration;
     use wie_runtime::EntryTraceTermination;
 
     let mut session =
@@ -258,7 +256,7 @@ fn gui_d3d9_renders_clear_and_triangle() {
         match summary.termination {
             EntryTraceTermination::ExitProcess { code } => break Some(code),
             EntryTraceTermination::WaitingForMessage => {
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
             other => {
                 panic!("GUI session stopped unexpectedly: {other:?}");
@@ -301,7 +299,6 @@ fn gui_blit_comprehensive_regression() {
     // Serialized suite: see GUI_SUITE_LOCK.
     let _suite = gui_suite_serialize();
 
-    use std::time::Duration;
     use wie_runtime::EntryTraceTermination;
 
     let mut session =
@@ -367,7 +364,7 @@ fn gui_blit_comprehensive_regression() {
                 // composites over the owner, replacing the gradient frame
                 // the hash gate needs. 50 ms polls leave only ~4 chances;
                 // 10 ms gives ~20 within the same window.
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
             other => {
                 panic!("GUI session stopped unexpectedly: {other:?}");
@@ -554,7 +551,6 @@ fn gui_dialog_modal_loop_and_end_dialog() {
     // Serialized suite: see GUI_SUITE_LOCK.
     let _suite = gui_suite_serialize();
 
-    use std::time::Duration;
     use wie_runtime::EntryTraceTermination;
 
     // Drive like the persistent GUI loop (YieldOnIdle + host-clock sleeps).
@@ -602,7 +598,7 @@ fn gui_dialog_modal_loop_and_end_dialog() {
         match summary.termination {
             EntryTraceTermination::ExitProcess { code } => break Some(code),
             EntryTraceTermination::WaitingForMessage => {
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
             other => {
                 panic!("GUI session stopped unexpectedly: {other:?}");
@@ -638,7 +634,6 @@ fn gui_dialog_shift_tab_moves_focus() {
     // Serialized suite: see GUI_SUITE_LOCK.
     let _suite = gui_suite_serialize();
 
-    use std::time::Duration;
     use wie_runtime::EntryTraceTermination;
 
     let mut session =
@@ -709,7 +704,7 @@ fn gui_dialog_shift_tab_moves_focus() {
                 // margin; 2 ms turns each tick into ~25 polls, so even a
                 // test thread delayed by a couple of ticks still finishes
                 // before the dialog's timer-driven VK_RETURN closes it.
-                std::thread::sleep(Duration::from_millis(2));
+                std::thread::sleep(std::time::Duration::from_millis(2));
             }
             other => {
                 panic!("GUI session stopped unexpectedly: {other:?}");
@@ -755,7 +750,6 @@ fn gui_demo_dialog_opens_on_click() {
     // Serialized suite: see GUI_SUITE_LOCK.
     let _suite = gui_suite_serialize();
 
-    use std::time::Duration;
     use wie_runtime::EntryTraceTermination;
 
     // Dialog template 100 ("100 DIALOG 10,20,180,70", DLU→px ×2) is
@@ -822,7 +816,7 @@ fn gui_demo_dialog_opens_on_click() {
         match summary.termination {
             EntryTraceTermination::ExitProcess { code } => break Some(code),
             EntryTraceTermination::WaitingForMessage => {
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
             other => {
                 panic!("GUI session stopped unexpectedly: {other:?}");
@@ -866,7 +860,6 @@ fn gui_demo_dialog_ok_click_closes_dialog() {
     // Serialized suite: see GUI_SUITE_LOCK.
     let _suite = gui_suite_serialize();
 
-    use std::time::Duration;
     use wie_runtime::EntryTraceTermination;
 
     const WM_LBUTTONDOWN: u32 = 0x0201;
@@ -957,7 +950,7 @@ fn gui_demo_dialog_ok_click_closes_dialog() {
                     }
                 }
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(
             stage, 2,
@@ -990,7 +983,6 @@ fn notepad_menu_command_reaches_the_guest_wndproc() {
     // Serialized suite: see GUI_SUITE_LOCK.
     let _suite = gui_suite_serialize();
 
-    use std::time::Duration;
     use wie_runtime::EntryTraceTermination;
 
     const WM_COMMAND: u32 = 0x0111;
@@ -1018,7 +1010,7 @@ fn notepad_menu_command_reaches_the_guest_wndproc() {
                 panic!("notepad exited (code {code}) before its menu was ready");
             }
             EntryTraceTermination::WaitingForMessage => {
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
             other => panic!("notepad stopped unexpectedly: {other:?}"),
         }
@@ -1059,7 +1051,7 @@ fn notepad_menu_command_reaches_the_guest_wndproc() {
             break;
         }
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
     assert!(
@@ -1079,7 +1071,6 @@ fn notepad_ignores_unknown_command_ids() {
         return;
     };
     let _suite = gui_suite_serialize();
-    use std::time::Duration;
     use wie_runtime::EntryTraceTermination;
 
     const WM_COMMAND: u32 = 0x0111;
@@ -1094,7 +1085,7 @@ fn notepad_ignores_unknown_command_ids() {
         if session.first_guest_window_handle().is_some() {
             break;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
     let main = session.first_guest_window_handle().unwrap_or(0);
@@ -1110,7 +1101,7 @@ fn notepad_ignores_unknown_command_ids() {
                 "notepad exited on an unknown WM_COMMAND id — the Exit test is a false positive"
             );
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 
@@ -1126,7 +1117,6 @@ fn notepad_menu_tree_is_stable_across_calls() {
         return;
     };
     let _suite = gui_suite_serialize();
-    use std::time::Duration;
     use wie_runtime::EntryTraceTermination;
 
     let mut session =
@@ -1144,7 +1134,7 @@ fn notepad_menu_tree_is_stable_across_calls() {
                 panic!("notepad exited (code {code}) before its menu was ready");
             }
             EntryTraceTermination::WaitingForMessage => {
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
             other => panic!("notepad stopped unexpectedly: {other:?}"),
         }
@@ -1154,7 +1144,7 @@ fn notepad_menu_tree_is_stable_across_calls() {
     let mut saw_cache_hit = false;
     let mut saw_content_change = false;
     for _ in 0..20 {
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(std::time::Duration::from_millis(10));
         let _ = session.run_until_stop(1_000_000).expect("run");
         let next = handle.window_menu_items();
         if Arc::ptr_eq(&first, &next) {
@@ -1190,7 +1180,6 @@ fn notepad_does_not_exit_while_idle() {
         return;
     };
     let _suite = gui_suite_serialize();
-    use std::time::Duration;
     use wie_runtime::EntryTraceTermination;
 
     let mut session =
@@ -1208,7 +1197,7 @@ fn notepad_does_not_exit_while_idle() {
                 panic!("notepad exited (code {code}) before its menu was ready");
             }
             EntryTraceTermination::WaitingForMessage => {
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
             other => panic!("notepad stopped unexpectedly: {other:?}"),
         }
@@ -1223,6 +1212,335 @@ fn notepad_does_not_exit_while_idle() {
         ) {
             panic!("notepad exited while idle — the WM_COMMAND repro is a false positive");
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
+}
+
+// ---------------------------------------------------------------------------
+// File-menu action repros (real_exes/notepad.exe): the interactive host
+// delivery is proven (MenuEvent → WM_COMMAND works, Exit reacts); these pin
+// whether the guest ACTIONS complete. CMD ids verified against the RT_MENU
+// 0x201 template: New=256, New Window=257, Open=258, Save=259, Save As=260.
+// ---------------------------------------------------------------------------
+
+/// Drive one of notepad's File commands on a live session and return the
+/// window records after the action settles (so the caller can assert on the
+/// resulting state: a FileDialog window for Open/SaveAs, the save prompt for
+/// New on a dirty doc, etc.).
+fn pump_until_windows_ready(session: &mut wie_runtime::RuntimeSession) {
+    use wie_runtime::EntryTraceTermination;
+    let handle = session.guest_handle();
+    for _ in 0..300 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        if session.first_guest_window_handle().is_some() && !handle.window_menu_items().is_empty() {
+            break;
+        }
+        match summary.termination {
+            EntryTraceTermination::ExitProcess { code } => {
+                panic!("notepad exited (code {code}) before its window was ready");
+            }
+            EntryTraceTermination::WaitingForMessage => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            other => panic!("notepad stopped unexpectedly: {other:?}"),
+        }
+    }
+}
+
+/// Wait up to ~7.5 s for a window whose class equals `class` to appear.
+fn wait_for_window_class(
+    session: &mut wie_runtime::RuntimeSession,
+    handle: &wie_runtime::GuestHandle,
+    class: &str,
+) -> bool {
+    use wie_runtime::EntryTraceTermination;
+    for _ in 0..150 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        if matches!(
+            summary.termination,
+            EntryTraceTermination::ExitProcess { .. }
+        ) {
+            return false;
+        }
+        if session
+            .guest_windows_snapshot()
+            .iter()
+            .any(|(_, cls, ..)| cls == class)
+        {
+            return true;
+        }
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = handle;
+    }
+    false
+}
+
+/// WM_COMMAND(CMD_OPEN) with the interactive file dialog enabled must make
+/// the guest call GetOpenFileNameW and BUILD the host dialog (a
+/// "FileDialog"-class window appears). If the dialog fails to build live
+/// (the bottle-confinement suspect), no such window ever appears.
+#[test]
+fn notepad_file_open_builds_interactive_dialog() {
+    let Some(path) = real_exe("notepad.exe") else {
+        eprintln!("skip: real_exes/notepad.exe not present");
+        return;
+    };
+    let _suite = gui_suite_serialize();
+    use wie_runtime::EntryTraceTermination;
+
+    const WM_COMMAND: u32 = 0x0111;
+    const CMD_OPEN: u32 = 258;
+
+    let mut session =
+        wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
+            .expect("notepad session starts");
+    session.set_file_dialog_policy(wie_winapi::FileDialogPolicy::Interactive);
+    let handle = session.guest_handle();
+    pump_until_windows_ready(&mut session);
+
+    let main = session.first_guest_window_handle().unwrap_or(0);
+    handle.post_message(main, WM_COMMAND, u64::from(CMD_OPEN), 0);
+
+    let opened = wait_for_window_class(&mut session, &handle, "FileDialog");
+    // Dismiss the dialog if it appeared (IDCANCEL) so the session can end.
+    if let Some(dialog) = session
+        .guest_windows_snapshot()
+        .iter()
+        .find(|(_, cls, ..)| cls == "FileDialog")
+        .map(|(hwnd, ..)| *hwnd)
+    {
+        handle.post_message(dialog, WM_COMMAND, 2, 0); // IDCANCEL
+        for _ in 0..50 {
+            let _ = session.run_until_stop(1_000_000).expect("run");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    assert!(
+        opened,
+        "CMD_OPEN must build the interactive file dialog (a FileDialog window) — \
+         the action does not complete if no dialog appears"
+    );
+    let _ = EntryTraceTermination::WaitingForMessage;
+}
+
+/// WM_COMMAND(CMD_SAVE_AS) with the interactive policy must build the dialog
+/// too (Save As always prompts).
+#[test]
+fn notepad_file_save_as_builds_interactive_dialog() {
+    let Some(path) = real_exe("notepad.exe") else {
+        eprintln!("skip: real_exes/notepad.exe not present");
+        return;
+    };
+    let _suite = gui_suite_serialize();
+
+    const WM_COMMAND: u32 = 0x0111;
+    const CMD_SAVE_AS: u32 = 260;
+
+    let mut session =
+        wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
+            .expect("notepad session starts");
+    session.set_file_dialog_policy(wie_winapi::FileDialogPolicy::Interactive);
+    let handle = session.guest_handle();
+    pump_until_windows_ready(&mut session);
+
+    let main = session.first_guest_window_handle().unwrap_or(0);
+    handle.post_message(main, WM_COMMAND, u64::from(CMD_SAVE_AS), 0);
+
+    let opened = wait_for_window_class(&mut session, &handle, "FileDialog");
+    if let Some(dialog) = session
+        .guest_windows_snapshot()
+        .iter()
+        .find(|(_, cls, ..)| cls == "FileDialog")
+        .map(|(hwnd, ..)| *hwnd)
+    {
+        handle.post_message(dialog, WM_COMMAND, 2, 0); // IDCANCEL
+        for _ in 0..50 {
+            let _ = session.run_until_stop(1_000_000).expect("run");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    assert!(
+        opened,
+        "CMD_SAVE_AS must build the interactive file dialog — the action does \
+         not complete if no dialog appears"
+    );
+}
+
+/// WM_COMMAND(CMD_NEW) must not kill the session (no emulation error), even
+/// on a doc with typed text — the save-prompt path must fire without the
+/// guest stopping. On a clean doc FileNew is a no-op; the assertion here is
+/// that the session survives the command.
+#[test]
+fn notepad_file_new_survives_with_typed_text() {
+    let Some(path) = real_exe("notepad.exe") else {
+        eprintln!("skip: real_exes/notepad.exe not present");
+        return;
+    };
+    let _suite = gui_suite_serialize();
+    use wie_runtime::EntryTraceTermination;
+
+    const WM_COMMAND: u32 = 0x0111;
+    const WM_CHAR: u32 = 0x0102;
+    const CMD_NEW: u32 = 256;
+
+    let mut session =
+        wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
+            .expect("notepad session starts");
+    let handle = session.guest_handle();
+    // Record the save-prompt MessageBox instead of answering it: FileNew on a
+    // dirty doc must call MessageBoxW (the prompt). The bridge returns IDNO
+    // (discard) so the action completes.
+    let prompt_fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let prompt = std::sync::Arc::clone(&prompt_fired);
+    handle.set_message_box_bridge(Box::new(move |_, _, _| {
+        prompt.store(true, std::sync::atomic::Ordering::SeqCst);
+        7 // IDNO — discard the changes
+    }));
+    pump_until_windows_ready(&mut session);
+
+    let main = session.first_guest_window_handle().unwrap_or(0);
+    // Type into the EDIT so the doc is dirty (FileNew must offer to save).
+    let edit = session
+        .guest_windows_snapshot()
+        .iter()
+        .find(|(_, cls, ..)| cls == "EDIT")
+        .map(|(h, ..)| *h)
+        .unwrap_or(main);
+    for c in "hello".chars() {
+        handle.post_message(edit, WM_CHAR, u64::from(c as u32), 0);
+    }
+
+    // Drain the typed text, then trigger FileNew.
+    for _ in 0..30 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    handle.post_message(main, WM_COMMAND, u64::from(CMD_NEW), 0);
+
+    // The session must keep running (the save prompt / FileNew completes);
+    // an emulation error (the missing SHUFPD bug) stops it with RuntimeStop.
+    let mut kept_running = true;
+    for _ in 0..60 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        match summary.termination {
+            EntryTraceTermination::ExitProcess { .. } => break,
+            EntryTraceTermination::WaitingForMessage => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            EntryTraceTermination::RuntimeStop(msg) => {
+                kept_running = false;
+                eprintln!("DIAG NEW RuntimeStop: {msg}");
+                break;
+            }
+            other => {
+                eprintln!("DIAG NEW other: {other:?}");
+            }
+        }
+    }
+    assert!(
+        kept_running,
+        "CMD_NEW on a dirty doc must not stop the session (the save-prompt \
+         path runs) — an emulation error here is the missing-instruction bug"
+    );
+    assert!(
+        prompt_fired.load(std::sync::atomic::Ordering::SeqCst),
+        "FileNew on a dirty doc must invoke the save-prompt MessageBox bridge — \
+         if the prompt never fires, the action does not complete"
+    );
+}
+
+/// WM_COMMAND(CMD_NEW_WINDOW) must fire ShellExecuteW without stopping the
+/// session. ShellExecuteW is a shell32 stub; the command must at least not
+/// crash the guest.
+#[test]
+fn notepad_file_new_window_does_not_stop_the_session() {
+    let Some(path) = real_exe("notepad.exe") else {
+        eprintln!("skip: real_exes/notepad.exe not present");
+        return;
+    };
+    let _suite = gui_suite_serialize();
+    use wie_runtime::EntryTraceTermination;
+
+    const WM_COMMAND: u32 = 0x0111;
+    const CMD_NEW_WINDOW: u32 = 257;
+
+    let mut session =
+        wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
+            .expect("notepad session starts");
+    let handle = session.guest_handle();
+    pump_until_windows_ready(&mut session);
+
+    let main = session.first_guest_window_handle().unwrap_or(0);
+    handle.post_message(main, WM_COMMAND, u64::from(CMD_NEW_WINDOW), 0);
+
+    let mut kept_running = true;
+    for _ in 0..60 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        match summary.termination {
+            EntryTraceTermination::ExitProcess { .. } => break,
+            EntryTraceTermination::WaitingForMessage => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            EntryTraceTermination::RuntimeStop(msg) => {
+                kept_running = false;
+                eprintln!("DIAG NEW_WINDOW RuntimeStop: {msg}");
+                break;
+            }
+            other => {
+                eprintln!("DIAG NEW_WINDOW other: {other:?}");
+            }
+        }
+    }
+    assert!(
+        kept_running,
+        "CMD_NEW_WINDOW must not stop the session (ShellExecuteW runs) — an \
+         emulation error here is the missing-instruction bug"
+    );
+}
+
+/// WM_COMMAND(CMD_SAVE) on an untitled doc must build the Save As dialog
+/// (the guest has no filename yet, so Save routes to GetSaveFileName).
+#[test]
+fn notepad_file_save_builds_interactive_dialog() {
+    let Some(path) = real_exe("notepad.exe") else {
+        eprintln!("skip: real_exes/notepad.exe not present");
+        return;
+    };
+    let _suite = gui_suite_serialize();
+
+    const WM_COMMAND: u32 = 0x0111;
+    const CMD_SAVE: u32 = 259;
+
+    let mut session =
+        wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
+            .expect("notepad session starts");
+    session.set_file_dialog_policy(wie_winapi::FileDialogPolicy::Interactive);
+    let handle = session.guest_handle();
+    pump_until_windows_ready(&mut session);
+
+    let main = session.first_guest_window_handle().unwrap_or(0);
+    handle.post_message(main, WM_COMMAND, u64::from(CMD_SAVE), 0);
+
+    let opened = wait_for_window_class(&mut session, &handle, "FileDialog");
+    if let Some(dialog) = session
+        .guest_windows_snapshot()
+        .iter()
+        .find(|(_, cls, ..)| cls == "FileDialog")
+        .map(|(hwnd, ..)| *hwnd)
+    {
+        handle.post_message(dialog, WM_COMMAND, 2, 0); // IDCANCEL
+        for _ in 0..50 {
+            let _ = session.run_until_stop(1_000_000).expect("run");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    assert!(
+        opened,
+        "CMD_SAVE on an untitled doc must build the interactive Save As dialog \
+         — the action does not complete if no dialog appears"
+    );
 }

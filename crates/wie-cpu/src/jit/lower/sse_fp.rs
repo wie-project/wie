@@ -474,6 +474,8 @@ pub(super) fn lower_sse_comis(
 }
 
 /// `Cvtsi2ss/Cvtsi2sd`: signed int → scalar FP, merged into dst low lane.
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lower_sse_cvt_gpr_to_fp(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
@@ -527,6 +529,8 @@ pub(super) fn lower_sse_cvt_gpr_to_fp(
 }
 
 /// `Cvttss2si/Cvtss2si/Cvttsd2si/Cvtsd2si`: scalar FP → signed integer.
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lower_sse_cvt_fp_to_gpr(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
@@ -665,6 +669,8 @@ pub(super) fn clif_fbinop(
 }
 
 /// Scalar SSE FP: ss (f32 merge) or sd (f64 merge). `op`: 0=add 1=sub 2=mul 3=div.
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lower_sse_scalar_fp(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
@@ -731,6 +737,8 @@ pub(super) fn lower_sse_scalar_fp(
 }
 
 /// Packed SSE FP: ps (4×f32) or pd (2×f64).
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lower_sse_packed_fp(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,

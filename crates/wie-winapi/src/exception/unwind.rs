@@ -666,6 +666,8 @@ pub fn find_cleanup_landing_pad(
 /// 2. Otherwise accept catch-all (`filter == 0` or null typeinfo entry)
 ///
 /// Returns the handler switch value for RDX (`filter` for typed, `0` for `...`).
+// Wide signature: one LSDA action match needs the whole unwind-table context.
+#[allow(clippy::too_many_arguments)]
 fn match_action(
     read_mem: &mut MemRead<'_>,
     action_table: u64,
