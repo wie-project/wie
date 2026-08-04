@@ -11,8 +11,16 @@ use wie_runtime::{GuiControl, GuiOutcome, run_windowed};
 
 /// Run the guest headlessly and write a screenshot to `out_path`.
 pub fn run_screenshot(path: &Path, out_path: &Path) -> Result<()> {
+    // FS policy: an exe outside the bottle runs from a drive_c copy first
+    // (the guest identity's `C:\{name}` label then maps to a real bottle file).
+    let run_path = crate::commands::ensure_exe_in_bottle(
+        path,
+        wie_winapi::bottle_root_from_env().as_deref(),
+        wie_winapi::drive_d_from_env().as_deref(),
+    )?;
     let run_t0 = std::time::Instant::now();
-    let mut session = RuntimeSession::new(path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)?;
+    let mut session =
+        RuntimeSession::new(&run_path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)?;
     let handle = session.guest_handle();
     let control = GuiControl::new();
     control

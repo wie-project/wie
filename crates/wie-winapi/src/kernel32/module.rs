@@ -208,7 +208,7 @@ pub(crate) fn resolve_windows_dll_path(
     if name.contains('\\') || name.contains('/') || name.contains(':') {
         return name.to_owned();
     }
-    if let Some(dir) = guest_dir_of(main_module_path) {
+    if let Some(dir) = crate::vfs::guest_dir_of(main_module_path) {
         return format!("{dir}\\{name}");
     }
     let cwd = current_directory
@@ -220,28 +220,6 @@ pub(crate) fn resolve_windows_dll_path(
     format!("{cwd}\\{name}")
 }
 
-/// Directory component of a guest Windows path, host-OS agnostic.
-///
-/// `Path::parent` is wrong here: on a Unix host backslashes are ordinary
-/// characters, so `C:\App\main.exe` would read as a single component. Split on
-/// both separators by hand; a bare drive letter (`C:`) maps to the drive root
-/// `C:\`.
-fn guest_dir_of(path: &str) -> Option<String> {
-    let trimmed = path.trim_end_matches(['\\', '/']);
-    if trimmed.is_empty() {
-        return None;
-    }
-    let idx = trimmed.rfind(['\\', '/'])?;
-    if idx == 0 {
-        return None; // root-relative like `\foo.exe`: no usable directory
-    }
-    let dir = trimmed.get(..idx)?.replace('/', "\\");
-    if dir.ends_with(':') {
-        Some(format!("{dir}\\"))
-    } else {
-        Some(dir)
-    }
-}
 /// Handles `KERNEL32.dll!GetModuleFileNameA`.
 pub fn handle_get_module_file_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let module_file_name_a_ptr = ctx.environment.module_file_name_a_ptr;
@@ -701,7 +679,7 @@ pub fn handle_sizeof_resource(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 
 #[cfg(test)]
 mod tests {
-    use super::{guest_dir_of, resolve_windows_dll_path};
+    use super::resolve_windows_dll_path;
 
     #[test]
     fn dll_path_derives_from_main_module_dir() {
@@ -753,16 +731,26 @@ mod tests {
 
     #[test]
     fn guest_dir_of_splits_windows_paths_host_agnostically() {
-        assert_eq!(guest_dir_of(r"C:\App\main.exe"), Some(r"C:\App".to_owned()));
+        // Delegates to the canonical vfs/path.rs module (crate::vfs::guest_dir_of).
         assert_eq!(
-            guest_dir_of(r"C:\Program Files\MyApp\main.exe"),
+            crate::vfs::guest_dir_of(r"C:\App\main.exe"),
+            Some(r"C:\App".to_owned())
+        );
+        assert_eq!(
+            crate::vfs::guest_dir_of(r"C:\Program Files\MyApp\main.exe"),
             Some(r"C:\Program Files\MyApp".to_owned())
         );
         // A bare drive letter maps to the drive root.
-        assert_eq!(guest_dir_of(r"C:\main.exe"), Some(r"C:\".to_owned()));
-        assert_eq!(guest_dir_of("main.exe"), None);
-        assert_eq!(guest_dir_of(""), None);
+        assert_eq!(
+            crate::vfs::guest_dir_of(r"C:\main.exe"),
+            Some(r"C:\".to_owned())
+        );
+        assert_eq!(crate::vfs::guest_dir_of("main.exe"), None);
+        assert_eq!(crate::vfs::guest_dir_of(""), None);
         // Forward slashes are normalized to backslashes.
-        assert_eq!(guest_dir_of(r"C:/App/main.exe"), Some(r"C:\App".to_owned()));
+        assert_eq!(
+            crate::vfs::guest_dir_of(r"C:/App/main.exe"),
+            Some(r"C:\App".to_owned())
+        );
     }
 }

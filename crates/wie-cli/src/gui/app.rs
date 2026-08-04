@@ -119,6 +119,37 @@ impl WieApp {
         self.menu_bar.rebuild(items.as_slice());
         self.last_menu_items = items;
     }
+
+    /// Mirror the guest's top-level z-order into the host NSWindows.
+    ///
+    /// Gated on the guest z-order revision ([`GuestHandle::z_rev`]): a change
+    /// (top-level create/destroy, `SetWindowPos` HWND_TOP/HWND_BOTTOM)
+    /// re-applies the stacking; idle frames skip the AppKit work. The
+    /// revision is stored BEFORE the reorder so a partially-applied pass is
+    /// not retried — the next z-change re-applies the full order anyway.
+    #[cfg(target_os = "macos")]
+    fn sync_window_z_order(&mut self) {
+        let Some(handle) = self.handle.as_ref() else {
+            return;
+        };
+        let rev = handle.z_rev();
+        if self.last_z_rev == Some(rev) {
+            return;
+        }
+        self.last_z_rev = Some(rev);
+        // orderFront brings each window to the FRONT, so applying it in
+        // back-to-front order stacks them exactly like the guest (the last
+        // element ends up topmost). Windows without a host entry (top-levels
+        // created through the dialog-template path, which the reconcile
+        // creates but this list does not carry) are skipped — a documented
+        // limitation of the minimal z-order model.
+        for hwnd in handle.top_level_z_order() {
+            let Some(rt) = self.windows.values().find(|rt| rt.hwnd.as_u64() == hwnd) else {
+                continue;
+            };
+            order_window_front(&rt.window);
+        }
+    }
     /// Apply a guest-requested host-window move/resize (`SetWindowPlacement`)
     /// to the winit window.
     ///
@@ -192,11 +223,14 @@ impl WieApp {
     /// windows: create a winit window for each top-level that has none, and
     /// destroy the winit windows of top-levels the guest no longer has.
     ///
-    /// Runs on every `Frame` event; a cheap no-op when the guest window set
-    /// is unchanged (the top-level snapshot is a filter over the window
-    /// records). The first-window-on-first-publish behavior is preserved: the
-    /// first published frame still creates the first host window on this
-    /// exact event, from the guest's own title/size.
+    /// The Frame handler calls this ONLY when the guest window-set revision
+    /// changed (the reconcile-on-change latch) — an idle repaint of an
+    /// unchanged window set skips the enumerate+diff entirely. On the first
+    /// frame this creates the first window from the guest's own title/size
+    /// (identical to the pre-registry first-window path); later revision
+    /// bumps create windows for newly opened top-levels (dialogs) and
+    /// destroy the winit windows of closed ones. Each created window fills
+    /// its own parent slot in [`ParentWindowSlots`].
     fn reconcile_windows(&mut self, event_loop: &ActiveEventLoop) {
         let Some(handle) = self.handle.as_ref() else {
             return;
@@ -215,6 +249,12 @@ impl WieApp {
             .collect();
         for id in stale {
             if let Some(rt) = self.windows.remove(&id) {
+                // Drain the window's parent slot too — a stale entry would
+                // otherwise keep a dead NSWindow alive and hand it to the
+                // next native dialog bridge.
+                if let Ok(mut slots) = self.window_slots.lock() {
+                    slots.remove(&rt.hwnd.as_u64());
+                }
                 tracing::debug!(
                     target: "wiegui",
                     hwnd = rt.hwnd.as_u64(),
@@ -241,15 +281,12 @@ impl WieApp {
                 continue;
             };
             let window = Arc::new(window);
-            if is_first {
-                // Publish the first window to the MessageBox bridge so its
-                // rfd dialog can parent to it (the NSAlert path instead of
-                // the legacy CFUserNotification fallback). A poisoned mutex
-                // leaves the bridge unparented — harmless, the fallback still
-                // works.
-                if let Ok(mut slot) = self.window_slot.lock() {
-                    *slot = Some(window.clone());
-                }
+            // Fill THIS window's parent slot (keyed by its guest HWND) — the
+            // native dialog bridges parent their rfd dialogs to the
+            // focused/primary window's slot, so every top-level gets one,
+            // not just the first.
+            if let Ok(mut slots) = self.window_slots.lock() {
+                slots.insert(hwnd, window.clone());
             }
             // winit reports the device scale factor (physical px per logical
             // px); the input and resize paths divide winit's physical
@@ -342,6 +379,17 @@ struct WindowRuntime {
 /// exists until the first frame — and entries are created/destroyed as the
 /// guest opens and closes top-level windows.
 type WindowRegistry = HashMap<WindowId, WindowRuntime>;
+
+/// Shared per-top-level parent slot: guest HWND → winit window `Arc`.
+///
+/// Each `WindowRuntime` entry fills ITS OWN slot (keyed by its guest HWND)
+/// at creation; the native dialog bridges (MessageBox, the file panel) read
+/// the FOCUSED (or primary) window's entry to parent their rfd dialogs. This
+/// kills the first-window specialness — a dialog raised from a second
+/// top-level parents to THAT window, not the first one. The map is shared
+/// with the guest thread (the bridges run there) but only ever WRITTEN on
+/// the event-loop thread, so the mutex is a read-mostly lock.
+pub(crate) type ParentWindowSlots = Arc<Mutex<HashMap<u64, Arc<Window>>>>;
 
 /// The wgpu (Metal) present backend for a window, created at window
 /// construction. The guest frame is uploaded to a staging texture and blitted
@@ -477,10 +525,21 @@ struct WieApp {
     /// Set on every publish; the first `Frame` event after a publish group
     /// swaps it and requests a redraw, duplicates skip.
     pending_frame: Arc<std::sync::atomic::AtomicBool>,
-    /// Shared slot for the winit window Arc, filled once at the first window
-    /// creation (on the event-loop thread) and read by the guest-thread
-    /// MessageBox bridge to parent its rfd dialog to the window.
-    window_slot: Arc<Mutex<Option<Arc<Window>>>>,
+    /// Per-top-level parent slots for the native dialog bridges (see
+    /// [`ParentWindowSlots`]); filled at window creation, drained on destroy.
+    window_slots: ParentWindowSlots,
+    /// Cached guest top-level window-SET revision ([`GuestHandle::windows_rev`]).
+    ///
+    /// The reconcile-on-change latch: the Frame handler reconciles the winit
+    /// window registry ONLY when this changes, so an idle repaint of an
+    /// unchanged window set skips the enumerate+diff entirely. `None` before
+    /// the first reconcile — the first frame always reconciles (that is the
+    /// window-creation event).
+    last_windows_rev: Option<u64>,
+    /// Cached guest z-order revision ([`GuestHandle::z_rev`]): a change
+    /// re-orders the host NSWindows to mirror the guest stacking.
+    #[cfg(target_os = "macos")]
+    last_z_rev: Option<u64>,
     /// Currently pressed mouse buttons (MK_* bits) — from MouseInput events.
     mouse_buttons: u16,
     /// Last reported cursor position in client coords (x, y).
@@ -1095,12 +1154,23 @@ impl ApplicationHandler<WieEvent> for WieApp {
                     "Frame event"
                 );
                 // Reconcile the host window registry against the guest's
-                // top-level windows. On the first frame this creates the
-                // first window from the guest's own title/size (identical to
-                // the pre-registry first-window path); later frames create
-                // windows for newly opened top-levels (dialogs) and destroy
-                // the winit windows of closed ones.
-                self.reconcile_windows(event_loop);
+                // top-level windows — but ONLY when the guest window SET
+                // changed (the reconcile-on-change latch). The create/destroy
+                // handlers bump the revision, so an idle repaint of an
+                // unchanged window set skips the enumerate+diff entirely. The
+                // first frame always reconciles (the `None` cache) — that is
+                // the first-window creation event. The cached value is the
+                // rev we COMPARED against, so a create landing between the
+                // read and the store is caught by the next frame.
+                if let Some(handle) = self.handle.as_ref() {
+                    let rev = handle.windows_rev();
+                    if self.last_windows_rev != Some(rev) {
+                        self.reconcile_windows(event_loop);
+                        self.last_windows_rev = Some(rev);
+                    }
+                } else {
+                    self.reconcile_windows(event_loop);
+                }
                 // Coalesce wake storms. Every publish sets the flag; the
                 // first Frame event after a publish group requests the
                 // redraws and later duplicates (which see the flag cleared)
@@ -1126,7 +1196,13 @@ impl ApplicationHandler<WieEvent> for WieApp {
                 // startup restore is applied immediately.
                 self.apply_host_geometry();
                 #[cfg(target_os = "macos")]
-                self.sync_menu_bar();
+                {
+                    // Mirror the guest's z-order (gated on its revision) and
+                    // the focused window's menu bar — both cheap no-ops on an
+                    // unchanged state.
+                    self.sync_window_z_order();
+                    self.sync_menu_bar();
+                }
             }
             #[cfg(target_os = "macos")]
             WieEvent::MenuEvent(menu_event) => {
@@ -1193,6 +1269,75 @@ fn map_alert_result(result: rfd::MessageDialogResult) -> i32 {
     }
 }
 
+/// Resolve the winit window a native dialog (MessageBox, file panel) should
+/// parent to.
+///
+/// The FOCUSED window's top-level is the natural parent — a MessageBox raised
+/// while a second top-level is active parents to THAT window, not the first
+/// one (the per-window-slot fix). Falls back to the primary window (the
+/// first guest window), then to any live host window. `None` when no host
+/// window exists yet (the bridge runs before the first frame — rfd then uses
+/// its unparented fallback).
+#[cfg(target_os = "macos")]
+pub(crate) fn resolve_dialog_parent(
+    handle: &GuestHandle,
+    slots: &ParentWindowSlots,
+) -> Option<Arc<Window>> {
+    let preferred = handle
+        .focused_top_level()
+        .or_else(|| handle.first_guest_window_handle());
+    let Ok(map) = slots.lock() else {
+        return None;
+    };
+    preferred
+        .and_then(|hwnd| map.get(&hwnd).cloned())
+        .or_else(|| map.values().next().cloned())
+}
+
+/// Bring `window`'s NSWindow to the front of its window level.
+///
+/// winit 0.30 exposes no window-ordering API, so the guest z-order is
+/// mirrored through AppKit directly: winit's raw window handle exposes the
+/// backing NSView, whose owning NSWindow answers `orderFront`. Best-effort —
+/// a window whose raw handle is not AppKit, or whose view is not yet in a
+/// window, is skipped. Runs on the main (event-loop) thread, where AppKit
+/// ordering is valid.
+#[cfg(target_os = "macos")]
+#[expect(unsafe_code)]
+fn order_window_front(window: &Arc<Window>) {
+    use objc2_app_kit::NSView;
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Ok(handle) = window.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        return;
+    };
+    // SAFETY: `ns_view` is the live NSView backing this winit window — winit
+    // retains it for the window's lifetime, and this runs on the main thread
+    // where the AppKit view hierarchy is valid.
+    let view: &NSView = unsafe { &*appkit.ns_view.as_ptr().cast::<NSView>() };
+    if let Some(ns_window) = view.window() {
+        ns_window.orderFront(None);
+    }
+}
+
+/// Resolve the run source for the windowed GUI entry under the FS bottle
+/// policy: an exe outside the bottle runs from a `drive_c` copy (see
+/// [`crate::commands::ensure_exe_in_bottle`]), so the guest identity's
+/// `C:\{name}` label maps back to a real bottle file. The roots are threaded
+/// the same way the other run entries thread them — `run_gui_windowed` fills
+/// them from `WIE_ROOT`/`WIE_DRIVE_D`, because the CLI's `--root`/`--drive-d`
+/// args are micro-mode-only and never reach the GUI entry. Explicit roots
+/// keep the wiring testable without mutating the process environment.
+fn resolve_gui_run_source(
+    path: &std::path::Path,
+    bottle_root: Option<&std::path::Path>,
+    drive_d_root: Option<&std::path::Path>,
+) -> Result<std::path::PathBuf> {
+    crate::commands::ensure_exe_in_bottle(path, bottle_root, drive_d_root)
+}
+
 /// Run the guest with a winit window.
 ///
 /// `input_script` is a parsed input-script path (see
@@ -1216,24 +1361,37 @@ pub fn run_gui_windowed(
     // into `WieApp`.
     let pending_frame = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let pending_frame_guest = pending_frame.clone();
-    // Shared slot for the winit window Arc: the MessageBox bridge (registered
-    // on the guest thread BEFORE the window exists) reads it to parent its
-    // rfd dialog; WieApp fills it once the window is created. Clone for the
-    // guest thread; the original moves into `WieApp`.
-    let window_slot: Arc<Mutex<Option<Arc<Window>>>> = Arc::new(Mutex::new(None));
-    let window_slot_guest = window_slot.clone();
+    // Per-top-level parent slots for the native dialog bridges: the bridges
+    // (registered on the guest thread BEFORE any window exists) read the
+    // focused/primary window's slot to parent their rfd dialogs; `WieApp`
+    // fills each slot when its window is created. Clone for the guest
+    // thread; the original moves into `WieApp`.
+    let window_slots: ParentWindowSlots = Arc::new(Mutex::new(HashMap::new()));
+    let window_slots_guest = window_slots.clone();
+
+    // FS policy: an exe outside the bottle runs from a drive_c copy so the
+    // guest identity's `C:\{name}` label maps back to a real bottle file
+    // (the non-GUI run entries wire `ensure_exe_in_bottle` at the same
+    // point, before the session build).
+    let run_path = resolve_gui_run_source(
+        path,
+        wie_winapi::bottle_root_from_env().as_deref(),
+        wie_winapi::drive_d_from_env().as_deref(),
+    )?;
 
     let handle_rx = {
         let (tx, rx) = mpsc::channel::<GuestHandle>();
         let proxy = proxy.clone();
         let control = Arc::new(GuiControl::new());
-        let path = path.to_owned();
 
         thread::Builder::new()
             .name("wie-guest-primary".into())
             .stack_size(8 * 1024 * 1024)
             .spawn(move || {
-                match RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle) {
+                match RuntimeSession::new(
+                    &run_path,
+                    wie_winapi::MessageQueueIdlePolicy::YieldOnIdle,
+                ) {
                     Ok(mut session) => {
                         // Interactive file dialogs: GetOpenFileNameW /
                         // GetSaveFileNameW build the host dialog (path EDIT +
@@ -1273,7 +1431,7 @@ pub fn run_gui_windowed(
                         #[cfg(target_os = "macos")]
                         crate::gui::file_dialog::register_native_file_dialog_bridge(
                             &handle,
-                            window_slot_guest.clone(),
+                            window_slots_guest.clone(),
                         );
 
                         // Register the native-alert MessageBox bridge. rfd's
@@ -1284,23 +1442,25 @@ pub fn run_gui_windowed(
                         // With no parent, rfd falls back to the legacy
                         // CFUserNotificationDisplayAlert path, which prints
                         // "will block waiting for a response" on the main
-                        // thread — the window slot below switches to NSAlert
-                        // once the winit window exists.
+                        // thread — the window slots below switch to NSAlert
+                        // once a winit window exists.
                         #[cfg(target_os = "macos")]
                         handle.set_message_box_bridge(Box::new({
-                            let window_slot = window_slot_guest.clone();
+                            let handle = handle.clone();
+                            let window_slots = window_slots_guest.clone();
                             move |caption, text, mb_type| {
                                 tracing::info!(
                                     target: "wiegui",
                                     "MessageBox: {caption}: {text} (type 0x{mb_type:x})"
                                 );
                                 let (buttons, level) = map_message_box_buttons(mb_type);
-                                // Parent to the winit window when it exists
-                                // (it always does by the time a MessageBox
-                                // fires — the bridge is just registered
-                                // earlier). set_parent consumes the builder,
-                                // so apply it before the chain.
-                                let parent = window_slot.lock().ok().and_then(|slot| slot.clone());
+                                // Parent to the FOCUSED (or primary) window's
+                                // slot — a MessageBox raised while a second
+                                // top-level is active parents to THAT window,
+                                // not the first one (the per-window slot fix).
+                                // set_parent consumes the builder, so apply it
+                                // before the chain.
+                                let parent = resolve_dialog_parent(&handle, &window_slots);
                                 let mut dialog = rfd::MessageDialog::new();
                                 if let Some(parent) = &parent {
                                     dialog = dialog.set_parent(parent.as_ref());
@@ -1345,7 +1505,10 @@ pub fn run_gui_windowed(
         windows: WindowRegistry::new(),
         primary_hwnd: None,
         pending_frame,
-        window_slot,
+        window_slots,
+        last_windows_rev: None,
+        #[cfg(target_os = "macos")]
+        last_z_rev: None,
         mouse_buttons: 0,
         cursor_pos: (0.0, 0.0),
         last_left_press: None,
@@ -1362,12 +1525,14 @@ pub fn run_gui_windowed(
 }
 
 #[cfg(all(test, target_os = "macos"))]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
     use super::{
         RetryBudget, guest_size_from_physical, map_alert_result, map_message_box_buttons,
-        window_attributes,
+        resolve_gui_run_source, window_attributes,
     };
 
     /// `MB_*` button bits select the rfd button set; the bridge receives the
@@ -1513,5 +1678,82 @@ mod tests {
         assert!(budget.should_retry(&f1));
         // An empty budget is exactly the default state (no frame retried yet).
         assert!(budget.should_retry(&Arc::new(vec![3_u32])));
+    }
+
+    // -----------------------------------------------------------------------
+    // FS bottle-policy wiring (`resolve_gui_run_source`): the windowed GUI
+    // entry's copy happens before the session build, same as the other run
+    // entries. `run_gui_windowed` itself opens a real winit window, so these
+    // pin the copy + identity half of that wiring headlessly.
+    // -----------------------------------------------------------------------
+
+    /// Unique temp dir under the system temp dir; removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("wie-gui-bottle-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A real file `ensure_exe_in_bottle` can copy.
+    fn fake_exe(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, b"MZ\x90\x00").expect("write fake exe");
+        path
+    }
+
+    /// The GUI entry's copy + identity wiring, mirroring
+    /// `run_micro_runs_outside_exe_from_bottle_copy`: an exe outside the
+    /// bottle resolves to a `drive_c` copy, and that copy's identity is the
+    /// guest label `C:\{name}` — the reason the copy must happen before the
+    /// session build.
+    #[test]
+    fn gui_run_source_copies_outside_exe_into_bottle() {
+        let outside = TempDir::new("copy-src");
+        let src_exe = fake_exe(outside.path(), "app.exe");
+        let bottle = TempDir::new("copy-bottle");
+
+        let resolved = resolve_gui_run_source(&src_exe, Some(bottle.path()), None)
+            .expect("copy into the bottle should succeed");
+        let expected = bottle.path().join("drive_c").join("app.exe");
+        assert_eq!(resolved, expected, "the GUI run source is the drive_c copy");
+        assert!(expected.is_file(), "bottle copy must exist");
+        assert!(
+            src_exe.is_file(),
+            "the copy is non-destructive: the source stays"
+        );
+
+        let identity = wie_pe::process_identity_from_host_path_with_args(&resolved, &[]);
+        assert_eq!(identity.module_file_name, "app.exe");
+        assert_eq!(identity.module_path, r"C:\app.exe");
+        assert_eq!(identity.current_directory, r"C:\");
+    }
+
+    /// An in-bottle GUI source passes through unchanged (no re-copy).
+    #[test]
+    fn gui_run_source_passes_in_bottle_exe_through() {
+        let bottle = TempDir::new("inside-bottle");
+        let drive_c = bottle.path().join("drive_c");
+        std::fs::create_dir_all(&drive_c).expect("create drive_c");
+        let exe = fake_exe(&drive_c, "app.exe");
+
+        let resolved = resolve_gui_run_source(&exe, Some(bottle.path()), None)
+            .expect("in-bottle exe passes through");
+        assert_eq!(resolved, exe, "the in-bottle exe is its own run source");
     }
 }

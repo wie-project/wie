@@ -910,6 +910,7 @@ mod tests {
     use crate::thread::ThreadState;
     use crate::user32::{
         CreateWindowRequest, WS_CHILD, WindowClassIdentifier, controls, create_window_record,
+        handle_create_window_ex_a, handle_destroy_window, handle_set_window_pos,
     };
     use crate::vfs::VolumeConfig;
     use crate::{
@@ -1080,6 +1081,93 @@ mod tests {
         handle_move_window(&mut HandlerContext::new(engine, test_environment(), state))
             .expect("MoveWindow handler")
             .return_value
+    }
+
+    /// Seed `CreateWindowExA`'s register + stack args (the Win64 ABI: four
+    /// register args, then x/y/width/height/hWndParent/hMenu/hInstance/
+    /// lpParam in the first eight stack slots). An unresolved class atom
+    /// yields a window with NO guest WndProc, so the handler completes
+    /// synchronously (returns the HWND without a WM_CREATE bridge).
+    fn write_create_window_ex_args(
+        cpu: &mut IcedCpu,
+        parent: u64,
+        style: u64,
+    ) -> Result<(), &'static str> {
+        cpu.write_rcx(0).map_err(|_| "ex_style")?;
+        cpu.write_rdx(5).map_err(|_| "class atom")?;
+        cpu.write_r8(0).map_err(|_| "title")?;
+        cpu.write_r9(style).map_err(|_| "style")?;
+        cpu.write_rsp(STACK_TOP).map_err(|_| "rsp")?;
+        for (offset, value) in [
+            (0x28, 10_u64),  // X
+            (0x30, 20_u64),  // Y
+            (0x38, 200_u64), // nWidth
+            (0x40, 100_u64), // nHeight
+            (0x48, parent),  // hWndParent
+            (0x50, 0_u64),   // hMenu
+            (0x58, 0_u64),   // hInstance
+            (0x60, 0_u64),   // lpParam
+        ] {
+            cpu.mem_write(STACK_TOP + offset, &value.to_le_bytes())
+                .map_err(|_| "stack arg")?;
+        }
+        Ok(())
+    }
+
+    /// Create a window through the real `CreateWindowExA` handler (not the
+    /// bare `create_window_record`) so the host-visible window-set and
+    /// z-order registrations run. Returns the new HWND.
+    fn create_window_via_handler(
+        engine: &mut IcedCpu,
+        state: &mut WinApiState,
+        parent: u64,
+    ) -> u64 {
+        write_create_window_ex_args(engine, parent, 0).expect("write CreateWindowExA args");
+        handle_create_window_ex_a(&mut HandlerContext::new(engine, test_environment(), state))
+            .expect("CreateWindowExA handler")
+            .return_value
+    }
+
+    /// Seed `SetWindowPos`'s register + stack args (rcx=hwnd, rdx=insertAfter,
+    /// r8=X, r9=Y, then cx/cy/uFlags in the first three stack slots).
+    fn write_set_window_pos_args(cpu: &mut IcedCpu, hwnd: u64, insert_after: u64, flags: u32) {
+        cpu.write_rcx(hwnd).ok();
+        cpu.write_rdx(insert_after).ok();
+        cpu.write_r8(0).ok();
+        cpu.write_r9(0).ok();
+        cpu.write_rsp(STACK_TOP).ok();
+        for (offset, value) in [
+            (0x28, 200_u64), // cx
+            (0x30, 100_u64), // cy
+            (0x38, u64::from(flags)),
+        ] {
+            cpu.mem_write(STACK_TOP + offset, &value.to_le_bytes())
+                .expect("write SetWindowPos stack arg");
+        }
+    }
+
+    /// Drive `SetWindowPos` end to end and return its return value.
+    fn run_set_window_pos(
+        engine: &mut IcedCpu,
+        state: &mut WinApiState,
+        hwnd: u64,
+        insert_after: u64,
+        flags: u32,
+    ) -> u64 {
+        write_set_window_pos_args(engine, hwnd, insert_after, flags);
+        handle_set_window_pos(&mut HandlerContext::new(engine, test_environment(), state))
+            .expect("SetWindowPos handler")
+            .return_value
+    }
+
+    /// The current guest z-order (back-to-front) as raw u64s.
+    fn z_order(state: &mut WinApiState) -> Vec<u64> {
+        state
+            .present()
+            .z_order
+            .iter()
+            .map(|hwnd| hwnd.as_u64())
+            .collect()
     }
 
     fn record(state: &WinApiState, hwnd: u64) -> &crate::WindowRecord {
@@ -1277,6 +1365,173 @@ mod tests {
                 window.window_height,
             ),
             (10, 20, 640, 480)
+        );
+    }
+
+    /// The reconcile-on-change latch, create side: creating a top-level
+    /// (parentless) window through the real handler bumps the window-set
+    /// revision and stacks it at the TOP of the z-order; a CHILD window
+    /// (parented) must not — it composites into its parent's surface and
+    /// owns no host window.
+    #[test]
+    fn create_window_ex_top_level_bumps_rev_and_z_order() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        let set_rev_before = state.present().windows_rev;
+
+        let main = create_window_via_handler(&mut engine, &mut state, 0);
+        assert_ne!(main, 0, "CreateWindowExA returns a handle");
+        let rev_after_main = state.present().windows_rev;
+        assert_eq!(
+            rev_after_main,
+            set_rev_before + 1,
+            "a top-level create must bump the window-set revision"
+        );
+
+        let second = create_window_via_handler(&mut engine, &mut state, 0);
+        assert_eq!(
+            state.present().windows_rev,
+            rev_after_main + 1,
+            "each top-level create bumps the revision"
+        );
+
+        // A child of the second top-level: no host window, no revision.
+        let child = create_window_via_handler(&mut engine, &mut state, second);
+        assert_ne!(child, 0);
+        assert_eq!(
+            state.present().windows_rev,
+            rev_after_main + 1,
+            "a CHILD create must not bump the window-set revision"
+        );
+
+        // Z-order: creation order, newest topmost.
+        assert_eq!(
+            z_order(&mut state),
+            vec![main, second],
+            "the z-order tracks top-level creation order, back-to-front"
+        );
+    }
+
+    /// The reconcile-on-change latch, destroy side: DestroyWindow of a
+    /// top-level unregisters it (the host drops the stale winit window on
+    /// the wake) and bumps the window-set revision; a child destroy leaves
+    /// the set untouched.
+    #[test]
+    fn destroy_window_top_level_unregisters_and_bumps_rev() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        let main = create_window_via_handler(&mut engine, &mut state, 0);
+        let second = create_window_via_handler(&mut engine, &mut state, 0);
+        let set_rev_before = state.present().windows_rev;
+
+        // Destroy the topmost (second) window through the handler.
+        engine.write_rcx(second).ok();
+        engine.write_rsp(STACK_TOP).ok();
+        let ret = handle_destroy_window(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("DestroyWindow handler")
+        .return_value;
+        assert_eq!(ret, 1, "DestroyWindow of a known window returns TRUE");
+
+        assert_eq!(
+            state.present().windows_rev,
+            set_rev_before + 1,
+            "a top-level destroy must bump the window-set revision"
+        );
+        assert_eq!(
+            z_order(&mut state),
+            vec![main],
+            "the destroyed top-level leaves the z-order"
+        );
+
+        // Destroy a CHILD: the window set is untouched (children own no
+        // host window), so the revision must not move.
+        let child = create_window_via_handler(&mut engine, &mut state, main);
+        let set_rev_after_child = state.present().windows_rev;
+        engine.write_rcx(child).ok();
+        engine.write_rsp(STACK_TOP).ok();
+        handle_destroy_window(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("DestroyWindow of a child");
+        assert_eq!(
+            state.present().windows_rev,
+            set_rev_after_child,
+            "a child destroy never changes the top-level set"
+        );
+    }
+
+    /// The z-order testable core: `SetWindowPos` HWND_TOP / HWND_BOTTOM
+    /// reorder the guest's top-level list (the host presenter mirrors it),
+    /// while SWP_NOZORDER leaves it alone. The revision bumps only on a real
+    /// z-change.
+    #[test]
+    fn set_window_pos_reorders_the_guest_z_order() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        let a = create_window_via_handler(&mut engine, &mut state, 0);
+        let b = create_window_via_handler(&mut engine, &mut state, 0);
+        let c = create_window_via_handler(&mut engine, &mut state, 0);
+        assert_eq!(z_order(&mut state), vec![a, b, c]);
+        let z_rev_before = state.present().z_rev;
+
+        // HWND_TOP (0): bring the backmost window to the front.
+        assert_eq!(
+            run_set_window_pos(&mut engine, &mut state, a, 0, 0),
+            1,
+            "SetWindowPos returns TRUE"
+        );
+        assert_eq!(
+            z_order(&mut state),
+            vec![b, c, a],
+            "HWND_TOP moves the window to the top of the z-order"
+        );
+        assert_eq!(
+            state.present().z_rev,
+            z_rev_before + 1,
+            "a real z-change bumps the z-order revision"
+        );
+
+        // HWND_BOTTOM (1): send the topmost window to the back.
+        run_set_window_pos(&mut engine, &mut state, a, 1, 0);
+        assert_eq!(
+            z_order(&mut state),
+            vec![a, b, c],
+            "HWND_BOTTOM moves the window to the back of the z-order"
+        );
+
+        // SWP_NOZORDER (0x0004): the caller said "do not change z-order".
+        let rev = state.present().z_rev;
+        run_set_window_pos(&mut engine, &mut state, b, 0, 0x0004);
+        assert_eq!(
+            z_order(&mut state),
+            vec![a, b, c],
+            "SWP_NOZORDER leaves the z-order untouched"
+        );
+        assert_eq!(
+            state.present().z_rev,
+            rev,
+            "a no-zorder SetWindowPos must not bump the revision"
+        );
+
+        // HWND_TOPMOST (-1) / HWND_NOTOPMOST (-2) map to top / bottom
+        // (topmost style is not tracked — minimal model).
+        run_set_window_pos(&mut engine, &mut state, c, 0xFFFF_FFFF_FFFF_FFFF, 0);
+        assert_eq!(
+            z_order(&mut state),
+            vec![a, b, c],
+            "HWND_TOPMOST reads as top"
+        );
+        run_set_window_pos(&mut engine, &mut state, c, 0xFFFF_FFFF_FFFF_FFFE, 0);
+        assert_eq!(
+            z_order(&mut state),
+            vec![c, a, b],
+            "HWND_NOTOPMOST reads as bottom"
         );
     }
 }

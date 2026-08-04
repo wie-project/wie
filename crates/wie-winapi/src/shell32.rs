@@ -666,6 +666,31 @@ mod tests {
         let _cleanup = std::fs::remove_dir_all(&bottle);
     }
 
+    /// The FS-policy bottle copy (`C:\{name}` → `{root}/drive_c/{name}`): when
+    /// the main module lives in the bottle, its relaunch resolves through the
+    /// volume mapping — never through the temp-file spill.
+    #[test]
+    fn resolve_launch_host_path_prefers_bottle_copy_over_spill() {
+        let mut state = test_state();
+        let bottle = std::env::temp_dir().join("wie-shell-execute-copy");
+        let copy = bottle.join("drive_c").join("notepad.exe");
+        std::fs::create_dir_all(copy.parent().expect("parent dir")).expect("create dirs");
+        std::fs::write(&copy, b"MZ").expect("write bottle copy");
+        state.file_io.volumes = VolumeConfig {
+            bottle_root: Some(bottle.clone()),
+            drive_d_root: None,
+        };
+        // The guest relaunches its own module path (the identity label).
+        state.process.main_module_file_name = "notepad.exe".to_owned();
+        state.process.main_module_path = r"C:\notepad.exe".to_owned();
+        state.file_io.executable_file_bytes = Arc::new(b"MZ".to_vec());
+
+        let resolved = resolve_launch_host_path(&state, r"C:\notepad.exe")
+            .expect("main module resolves via the bottle mapping");
+        assert_eq!(resolved, copy, "the in-bottle copy wins, no temp spill");
+        let _cleanup = std::fs::remove_dir_all(&bottle);
+    }
+
     #[test]
     fn resolve_launch_host_path_spills_main_module() {
         let mut state = test_state();

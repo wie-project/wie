@@ -37,7 +37,10 @@
 //! depends on, so "run with `--root`" is the answer even for D:-only data.
 //! Without a D: bridge either, `D:\` paths stay unmapped (`None`), unchanged.
 
-use super::path::{drive_letter, normalize_windows_path_separators};
+use super::path::{
+    canonicalize_host_target, collapse_windows_components, drive_letter, guest_path_from_relative,
+    normalize_host_path, normalize_windows_path_separators, relative_after_drive,
+};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -158,6 +161,29 @@ pub struct HostMap {
 ///
 /// Rejects raw `..` components (fail-closed, no bottle escape) and unmapped drives.
 /// Case of components preserved.
+///
+/// # Symlink-escape prevention
+///
+/// A bottle may contain symlinks planted on the host side (a drop, a user
+/// `drive_c`). A direct file op through one pointing outside the bottle would
+/// otherwise follow it on the host — `CreateFileW(r"C:\link\file")` where
+/// `link` → a host dir outside the root. So the resolved host target is
+/// canonicalized (its deepest existing ancestor for create-cases, where the
+/// final component may not exist yet) and re-verified to stay within the
+/// allowed roots: the bottle `drive_c` and the optional D: bridge. An escaping
+/// target resolves to `None` and the file operation fails — real Windows
+/// semantics for a symlink/junction resolving outside the volume.
+///
+/// The canonicalize is a few syscalls per mapping. That is acceptable because
+/// file ops are syscall-heavy, and the one hot path — directory listing —
+/// maps the directory once per listing (not per entry; the per-entry filter
+/// is `host_path_to_guest`, the reverse direction). Hence the re-verify lives
+/// at the mapping level, protecting every caller (CreateFile, stat probes,
+/// FindFirstFile, dialog listings, DLL search) through one funnel.
+///
+/// The returned host path stays the joined (non-canonical) form: callers and
+/// tests build on the raw `{root}/drive_c/…` layout, and the host resolves
+/// symlinks itself on open — the re-verify only gates *which* mappings exist.
 #[must_use]
 pub fn guest_path_to_host(volumes: &VolumeConfig, guest_path: &str) -> Option<HostMap> {
     let trimmed = guest_path.trim().trim_matches('"');
@@ -190,20 +216,34 @@ pub fn guest_path_to_host(volumes: &VolumeConfig, guest_path: &str) -> Option<Ho
         }
         host.push(component);
     }
+
+    if !host_resolves_within_roots(volumes, &host) {
+        return None;
+    }
     Some(HostMap { host, drive })
 }
 
-fn relative_after_drive(normalized: &str, drive: char) -> Option<&str> {
-    let lower = normalized.to_ascii_lowercase();
-    let prefix = format!("{}:\\", drive.to_ascii_lowercase());
-    if lower.starts_with(&prefix) {
-        return normalized.get(3..);
+/// Whether the canonical host target stays within the allowed volume roots.
+///
+/// The allowed roots are the bottle `drive_c` and the optional D: bridge — the
+/// two volumes the guest filesystem can legitimately reach. Both the target
+/// and each root go through the same pipeline ([`canonicalize_host_target`]
+/// then [`normalize_host_path`]) so symlinked roots (e.g. `/tmp` →
+/// `/private/tmp`, or a `/System/Volumes/Data` root) compare consistently even
+/// when the bottle does not exist yet.
+fn host_resolves_within_roots(volumes: &VolumeConfig, host: &Path) -> bool {
+    let canonical = normalize_host_path(&canonicalize_host_target(host));
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(bottle) = volumes.bottle_root.as_ref() {
+        roots.push(bottle.join("drive_c"));
     }
-    let bare = format!("{}:", drive.to_ascii_lowercase());
-    if lower == bare {
-        return Some("");
+    if let Some(drive_d) = volumes.drive_d_root.as_ref() {
+        roots.push(drive_d.clone());
     }
-    None
+    roots.iter().any(|root| {
+        let root = normalize_host_path(&canonicalize_host_target(root));
+        canonical.starts_with(&root)
+    })
 }
 
 /// Legacy helper: C: only under bottle root (kept for bottle.rs compatibility).
@@ -245,31 +285,16 @@ pub fn confine_guest_path(volumes: &VolumeConfig, guest_path: &str) -> Option<St
         _ => return None,
     }
 
-    let mut components: Vec<&str> = Vec::new();
-    for component in relative.split('\\') {
-        match component {
-            "" | "." => {}
-            ".." => {
-                // `..` with nothing left to pop would ascend above the
-                // volume root — escaping the bottle. `?` propagates that
-                // rejection as `None`.
-                components.pop()?;
-            }
-            _ => {
-                if component.contains('\\') || component.contains('/') {
-                    return None;
-                }
-                components.push(component);
-            }
-        }
-    }
+    // Strict collapse: a `..` that would ascend above the volume root is an
+    // escape and rejects the path (fail-closed) instead of clamping.
+    let components = collapse_windows_components(relative, true)?;
 
     let mut out = String::with_capacity(relative.len() + 3);
     out.push(drive);
     out.push(':');
     out.push('\\');
     for component in components {
-        out.push_str(component);
+        out.push_str(&component);
         out.push('\\');
     }
     // The drive root `C:\` (length 3) keeps its trailing separator.
@@ -298,7 +323,7 @@ pub fn host_path_to_guest(volumes: &VolumeConfig, host_path: &Path) -> Option<St
     if let Some(bottle) = volumes.bottle_root.as_ref() {
         let drive_c = normalize_host_path(&bottle.join("drive_c"));
         if let Ok(relative) = host_path.strip_prefix(&drive_c) {
-            return Some(guest_from_relative('C', relative));
+            return Some(guest_path_from_relative('C', relative));
         }
     } else {
         // Without a bottle no host path can be a guest C: path; record the
@@ -308,44 +333,10 @@ pub fn host_path_to_guest(volumes: &VolumeConfig, host_path: &Path) -> Option<St
     if let Some(drive_d) = volumes.drive_d_root.as_ref() {
         let drive_d = normalize_host_path(drive_d);
         if let Ok(relative) = host_path.strip_prefix(&drive_d) {
-            return Some(guest_from_relative('D', relative));
+            return Some(guest_path_from_relative('D', relative));
         }
     }
     None
-}
-
-/// Normalize a host path for volume mapping: canonicalize (resolves
-/// symlinks such as /tmp → /private/tmp), then strip the macOS firmlink
-/// prefix (`/System/Volumes/Data`) that AppKit path delivery can carry —
-/// realpath leaves firmlinks untouched, so the two forms of the same file
-/// (`/System/Volumes/Data/Users/…` vs `/Users/…`) only compare equal after
-/// the prefix is removed. Nonexistent paths fall back to the raw form.
-fn normalize_host_path(path: &Path) -> PathBuf {
-    const FIRMLINK_PREFIX: &str = "/System/Volumes/Data";
-    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    path.strip_prefix(FIRMLINK_PREFIX)
-        .map(|rest| PathBuf::from("/").join(rest))
-        .unwrap_or(path)
-}
-
-/// Build `{drive}:\<rel>` with backslash separators, collapsing the empty
-/// relative path to the drive root (`C:\`).
-fn guest_from_relative(drive: char, relative: &Path) -> String {
-    let mut out = String::new();
-    out.push(drive);
-    out.push_str(":\\");
-    for component in relative.components() {
-        if let std::path::Component::Normal(part) = component {
-            out.push_str(&part.to_string_lossy());
-            out.push('\\');
-        }
-    }
-    // Strip the trailing separator so `C:\dir` (not `C:\dir\`); the drive
-    // root `C:\` (length 3) keeps it.
-    if out.len() > 3 && out.ends_with('\\') {
-        out.pop();
-    }
-    out
 }
 
 /// Resolve bottle root from `WIE_ROOT`.
@@ -665,5 +656,160 @@ mod tests {
         // But the handler-level policy is unconditional: any file operation
         // without a C: bottle stops, even a D: one.
         assert_eq!(enforce_bottle(&d_only), Err(BottleMissingError));
+    }
+
+    /// A real bottle on disk with a small `drive_c` layout for mapping tests.
+    fn temp_bottle(tag: &str) -> (PathBuf, VolumeConfig) {
+        let root = std::env::temp_dir().join(format!("wie-{tag}-{}", std::process::id()));
+        // A crashed earlier run (same pid reused) may have left this dir; a
+        // stale symlink/`drive_c` would make the fixture setup fail.
+        let _unused = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("drive_c").join("App")).expect("create drive_c/App");
+        let volumes = VolumeConfig {
+            bottle_root: Some(root.clone()),
+            drive_d_root: None,
+        };
+        (root, volumes)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guest_path_to_host_rejects_symlink_escape() {
+        // A bottle symlink pointing at a host dir outside the root: the
+        // mapping must fail (None) so a direct file op cannot follow it on
+        // the host — real Windows semantics for a junction resolving outside
+        // the volume.
+        let (root, volumes) = temp_bottle("escape");
+        let outside = root.join("outside-secret");
+        std::fs::create_dir_all(&outside).expect("create outside dir");
+        std::os::unix::fs::symlink(&outside, root.join("drive_c").join("App").join("leak"))
+            .expect("create escape symlink");
+
+        // An existing file through the symlink → the resolved target escapes.
+        assert!(guest_path_to_host(&volumes, r"C:\App\leak\secret.txt").is_none());
+        // The symlink itself resolves outside → the op on it fails too.
+        assert!(guest_path_to_host(&volumes, r"C:\App\leak").is_none());
+        // A normal in-bottle path still maps.
+        let m = guest_path_to_host(&volumes, r"C:\App\ok.txt").expect("in-bottle maps");
+        assert_eq!(m.host, root.join("drive_c").join("App").join("ok.txt"));
+
+        let _unused = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guest_path_to_host_maps_in_bottle_symlinks_to_in_bottle_targets() {
+        // A symlink that stays inside the bottle is not an escape: the
+        // resolved target keeps the mapping (the raw path is returned; the
+        // host resolves the link on open, landing in-bottle).
+        let (root, volumes) = temp_bottle("symlink-ok");
+        std::os::unix::fs::symlink(
+            root.join("drive_c").join("App"),
+            root.join("drive_c").join("alias"),
+        )
+        .expect("create in-bottle symlink");
+        let m = guest_path_to_host(&volumes, r"C:\alias\file.txt").expect("in-bottle link maps");
+        assert_eq!(m.host, root.join("drive_c").join("alias").join("file.txt"));
+
+        let _unused = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn guest_path_to_host_maps_create_case_nonexistent_target() {
+        // Create-case: neither the target nor its parent exists yet. The
+        // deepest existing ancestor canonicalizes in-bottle and the final
+        // components append verbatim, so the mapping succeeds.
+        let (root, volumes) = temp_bottle("create-case");
+        let m =
+            guest_path_to_host(&volumes, r"C:\App\new\deep\file.txt").expect("create-case maps");
+        assert_eq!(
+            m.host,
+            root.join("drive_c")
+                .join("App")
+                .join("new")
+                .join("deep")
+                .join("file.txt")
+        );
+
+        // A brand-new bottle (nothing under it exists) maps its drive root.
+        let fresh = std::env::temp_dir().join(format!("wie-fresh-{}", std::process::id()));
+        let _unused = std::fs::remove_dir_all(&fresh);
+        let fresh_volumes = VolumeConfig {
+            bottle_root: Some(fresh.clone()),
+            drive_d_root: None,
+        };
+        let m = guest_path_to_host(&fresh_volumes, r"C:\x.txt").expect("fresh bottle maps");
+        assert_eq!(m.host, fresh.join("drive_c").join("x.txt"));
+
+        let _unused = std::fs::remove_dir_all(&root);
+        let _unused = std::fs::remove_dir_all(&fresh);
+    }
+
+    #[test]
+    fn property_round_trip_guest_host_guest_preserves_path() {
+        // guest → host → guest must recover the original guest path for every
+        // sampled in-bottle path, whether or not the mapped file exists on the
+        // host (create-cases go through the same pipeline).
+        let (root, volumes) = temp_bottle("roundtrip");
+        for guest in [
+            r"C:\App\out.txt",
+            r"C:\App\sub\deep\file.bin",
+            r"C:\App\new\not-there.txt", // create-case: does not exist on host
+            r"C:\root.txt",
+            r"C:\",
+        ] {
+            let Some(map) = guest_path_to_host(&volumes, guest) else {
+                panic!("in-bottle path must map: {guest}");
+            };
+            let back = host_path_to_guest(&volumes, &map.host).unwrap_or_else(|| {
+                panic!("host must map back for {guest}: {}", map.host.display())
+            });
+            assert_eq!(back, guest, "round-trip must preserve the path");
+        }
+        let _unused = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn property_confinement_holds_across_case_and_separator_variants() {
+        // The confinement is invariant under guest-side case and separator
+        // variants: every spelling of an in-bottle path maps to the same
+        // host location, and none of them escapes the root.
+        let (root, volumes) = temp_bottle("confinement");
+        for guest in [
+            r"C:\App\out.txt",
+            r"c:\app\out.txt",
+            r"C:/App/out.txt",
+            r"C:\App\.\out.txt",
+            r"C:\App\.\.\out.txt",
+        ] {
+            let Some(map) = guest_path_to_host(&volumes, guest) else {
+                panic!("variant must map: {guest}");
+            };
+            // Component case is preserved verbatim (documented), so compare
+            // the normalized target — same underlying in-bottle file.
+            let canonical = normalize_host_path(&map.host)
+                .to_string_lossy()
+                .to_ascii_lowercase();
+            let expected = normalize_host_path(&root.join("drive_c").join("App").join("out.txt"))
+                .to_string_lossy()
+                .to_ascii_lowercase();
+            assert_eq!(
+                canonical, expected,
+                "variant must land on the same host target: {guest}"
+            );
+        }
+        // And no escape probe maps (raw `..` is rejected before mapping).
+        for escape in [
+            r"C:\..\..\etc\passwd",
+            r"C:\App\..\..\..\etc\passwd",
+            r"C:\App\sub\..\..\..\etc\passwd",
+            r"D:\anything",
+        ] {
+            assert!(
+                guest_path_to_host(&volumes, escape).is_none(),
+                "escape must not map: {escape}"
+            );
+        }
+        let _unused = std::fs::remove_dir_all(&root);
     }
 }

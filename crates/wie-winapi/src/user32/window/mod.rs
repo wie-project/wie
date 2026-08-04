@@ -9,7 +9,7 @@ use super::{
     Context, CreateWindowRequest, FAKE_WINDOW_HANDLE, GuestCallbackRequest, HandlerContext, Result,
     WM_CREATE, WM_DESTROY, WM_KILLFOCUS, WM_PAINT, WM_SETFOCUS, WinApiControlSignal,
     WinApiHandlerResult, WinApiState, create_window_record, dispatch_control_proc, is_known_window,
-    read_guest_ansi_lossy, read_guest_i32, read_guest_u64, read_guest_utf16_lossy,
+    read_guest_ansi_lossy, read_guest_i32, read_guest_u32, read_guest_u64, read_guest_utf16_lossy,
     read_window_class_identifier_a, read_window_class_identifier_w, write_ansi_window_text,
     write_guest_ansi_c_string, write_guest_i32, write_guest_u32, write_guest_u64,
     write_guest_utf16_c_string, write_wide_window_text, write_window_rect,
@@ -137,38 +137,76 @@ pub fn handle_adjust_window_rect_ex_for_dpi(
     })
 }
 /// Handles `USER32.dll!SetWindowPos`.
+///
+/// Only the z-order (`hWndInsertAfter`) is tracked here: HWND_TOP /
+/// HWND_BOTTOM reorder the guest's top-level list (the host presenter
+/// mirrors that list into its NSWindows). The geometry (x/y/cx/cy) moves are
+/// handled by `SetWindowPlacement` / `MoveWindow`, so they are ignored —
+/// matching the pre-lane stub, which accepted the placement without
+/// maintaining a full window manager.
 pub fn handle_set_window_pos(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _window_handle = engine
+    let state = &mut *ctx.state;
+    let window_handle = engine
         .read_rcx()
         .context("failed to read RCX for SetWindowPos")?;
-
-    let _insert_after = engine
+    let insert_after = engine
         .read_rdx()
         .context("failed to read RDX for SetWindowPos")?;
-
     let _x = engine
         .read_r8()
         .context("failed to read R8 for SetWindowPos")?;
-
     let _y = engine
         .read_r9()
         .context("failed to read R9 for SetWindowPos")?;
 
-    // Remaining Win64 arguments are width, height and flags on the stack.
-    // For now the compatibility harness accepts the requested placement
-    // without maintaining a full window manager.
-    let return_value = 1;
+    // Remaining Win64 arguments are cx, cy and flags on the stack.
+    let rsp = engine
+        .read_rsp()
+        .context("failed to read RSP for SetWindowPos")?;
+    let flags_address = rsp
+        .checked_add(0x38)
+        .context("SetWindowPos flags address overflow")?;
+    let flags =
+        read_guest_u32(engine, flags_address).context("failed to read SetWindowPos flags")?;
+
+    // SWP_NOZORDER (0x0004): the caller explicitly leaves the z-order alone.
+    if flags & SWP_NOZORDER == 0 {
+        let hwnd = crate::handles::Hwnd::from(window_handle);
+        // hWndInsertAfter read as its SIGNED sentinel values: HWND_TOP = 0,
+        // HWND_BOTTOM = 1, HWND_TOPMOST = -1, HWND_NOTOPMOST = -2. Any other
+        // value is a window handle (place the window below that window) —
+        // not tracked here, keeping the minimal z-order model.
+        match insert_after {
+            0 | HWND_TOPMOST => {
+                state.present().z_order_to_top(hwnd);
+            }
+            1 | HWND_NOTOPMOST => {
+                state.present().z_order_to_bottom(hwnd);
+            }
+            _ => {}
+        }
+    }
 
     let return_address = engine
-        .return_from_win64_api(return_value)
+        .return_from_win64_api(1)
         .context("failed to return from SetWindowPos")?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value,
+        return_value: 1,
     })
 }
+
+/// `SetWindowPos` flag bit that leaves the z-order untouched.
+const SWP_NOZORDER: u32 = 0x0004;
+
+/// `hWndInsertAfter` sentinel: place the window above all non-topmost
+/// windows (`(HWND)-1` as u64).
+const HWND_TOPMOST: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+
+/// `hWndInsertAfter` sentinel: remove the topmost style (`(HWND)-2` as u64).
+const HWND_NOTOPMOST: u64 = 0xFFFF_FFFF_FFFF_FFFE;
 
 /// Handles `USER32.dll!IsWindow`.
 pub fn handle_is_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -1103,6 +1141,18 @@ pub fn handle_create_window_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         });
     }
 
+    // A new top-level window (no parent) enters the host-visible window set
+    // and the top of the guest z-order. The revision fingerprint makes the
+    // presenter's Frame handler reconcile exactly on this create — and on no
+    // other frame (the reconcile-on-change latch). Children composite into
+    // their parent's surface and own no host window, so only parentless
+    // windows register.
+    if parent_handle == 0 {
+        state
+            .present()
+            .register_top_level(crate::handles::Hwnd::from(hwnd));
+    }
+
     // Update the window record with client rect
     if let Some(window) = find_window_mut(state, hwnd) {
         window.client_rect = (0, 0, width, height);
@@ -1282,6 +1332,14 @@ pub fn handle_create_window_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         });
     }
 
+    // A new top-level window registers with the host-visible window set and
+    // the z-order (see the ANSI variant for the full rationale).
+    if parent_handle == 0 {
+        state
+            .present()
+            .register_top_level(crate::handles::Hwnd::from(hwnd));
+    }
+
     // Update the window record with client rect
     if let Some(window) = find_window_mut(state, hwnd) {
         window.client_rect = (0, 0, width, height);
@@ -1367,6 +1425,13 @@ pub fn handle_destroy_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     // inside their parent's surface and have no host window of their own.
     if parent_handle == crate::handles::Hwnd::NULL {
         state.present().request_host_sync();
+        // The top-level also leaves the host-visible window set and z-order.
+        // The window-set revision bumps so the presenter's Frame handler
+        // reconciles the stale host window away on the wake above — the
+        // destroy side of the reconcile-on-change latch.
+        state
+            .present()
+            .unregister_top_level(crate::handles::Hwnd::from(window_handle));
     }
 
     tracing::debug!(target: "wiegui", hwnd = window_handle, "DestroyWindow");

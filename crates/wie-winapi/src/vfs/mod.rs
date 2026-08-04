@@ -21,9 +21,10 @@ pub use encoding::{
     wide_to_multibyte,
 };
 pub use path::{
-    guest_basename, guest_parent, is_windows_absolute_path, normalize_windows_path_components,
-    normalize_windows_path_separators, paths_equal_ci, resolve_full_windows_path,
-    split_find_pattern, strip_extended_prefix, wildcard_match,
+    canonicalize_host_target, guest_basename, guest_dir_of, guest_parent, is_windows_absolute_path,
+    normalize_host_path, normalize_windows_path_components, normalize_windows_path_separators,
+    paths_equal_ci, resolve_full_windows_path, split_find_pattern, strip_extended_prefix,
+    wildcard_match,
 };
 pub use volume::{
     BOTTLE_SKELETON_DIRS, BottleMissingError, DRIVE_FIXED, DRIVE_NO_ROOT_DIR, GUEST_SYSTEM_DIR,

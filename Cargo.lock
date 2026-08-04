@@ -2565,6 +2565,7 @@ dependencies = [
  "bytemuck",
  "clap",
  "muda",
+ "objc2-app-kit 0.2.2",
  "pollster",
  "rfd",
  "serde_json",

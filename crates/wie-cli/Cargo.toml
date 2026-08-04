@@ -44,6 +44,13 @@ muda = { version = "0.19.3", default-features = false, features = [] }
 # Linux-only extras (wayland + xdg-portal) that only pollute the lockfile and
 # feature graph; the macOS backend (objc2-app-kit + block2) is unconditional.
 rfd = { version = "0.17", default-features = false }
+# Guest z-order mirroring: winit 0.30 exposes no window-ordering API, so the
+# Frame handler calls AppKit's NSWindow orderFront directly on the winit
+# window's NSView (see `order_window_front` in gui/app.rs). Already a
+# transitive dep via winit 0.30 (same 0.2 line + NSWindow feature — no new
+# lockfile version); the direct edge makes the use explicit. The one unsafe
+# pointer cast lives in app.rs under the crate's scoped-unsafe precedent.
+objc2-app-kit = { version = "0.2", features = ["NSView", "NSWindow"] }
 wgpu = { version = "30", default-features = false, features = ["metal", "wgsl"] }
 pollster = { version = "1.0" }
 bytemuck = { version = "1" }

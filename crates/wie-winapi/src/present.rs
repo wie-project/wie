@@ -219,6 +219,30 @@ pub struct PresentState {
     /// until the drain, so the published frame is byte-identical to the
     /// per-call publishes it replaces.
     pub(crate) pending_publishes: std::collections::HashSet<crate::handles::Hwnd>,
+    /// Monotonic fingerprint of the guest's top-level window SET: bumped on
+    /// every create/destroy of a parentless window (see
+    /// [`Self::register_top_level`] / [`Self::unregister_top_level`]).
+    ///
+    /// The host presenter's Frame handler reconciles its winit window
+    /// registry ONLY when this revision changes (the reconcile-on-change
+    /// latch) — an idle repaint of an unchanged window set skips the
+    /// enumerate+diff entirely. The guest-side window records stay the
+    /// source of truth; this counter is a cheap change detector, monotonic
+    /// and never reused. Read via `GuestHandle::windows_rev`.
+    pub windows_rev: u64,
+    /// Top-level guest window handles in back-to-front z-order: index 0 is
+    /// the backmost window, the last element the topmost. Starts as the
+    /// guest creation order ([`Self::register_top_level`] stacks each new
+    /// top-level on top); `SetWindowPos` HWND_TOP / HWND_BOTTOM reorder it
+    /// via [`Self::z_order_to_top`] / [`Self::z_order_to_bottom`].
+    ///
+    /// The host presenter mirrors this ordering into its NSWindows when
+    /// [`Self::z_rev`] changes. Read via `GuestHandle::top_level_z_order`.
+    pub z_order: Vec<crate::handles::Hwnd>,
+    /// Monotonic fingerprint of the guest's top-level z-order: bumped on
+    /// every create/destroy of a parentless window AND every `SetWindowPos`
+    /// HWND_TOP/HWND_BOTTOM z-change. Read via `GuestHandle::z_rev`.
+    pub z_rev: u64,
 }
 
 impl std::fmt::Debug for PresentState {
@@ -244,6 +268,9 @@ impl std::fmt::Debug for PresentState {
             .field("present_ns", &self.present_ns)
             .field("present_ns_last", &self.present_ns_last)
             .field("pending_publishes", &self.pending_publishes.len())
+            .field("windows_rev", &self.windows_rev)
+            .field("z_order_count", &self.z_order.len())
+            .field("z_rev", &self.z_rev)
             .finish()
     }
 }
@@ -270,6 +297,9 @@ impl PresentState {
             present_ns: 0,
             present_ns_last: 0,
             pending_publishes: std::collections::HashSet::new(),
+            windows_rev: 0,
+            z_order: Vec::new(),
+            z_rev: 0,
         }
     }
 
@@ -534,6 +564,69 @@ impl PresentState {
         }
     }
 
+    /// Register a newly created top-level window at the TOP of the z-order.
+    ///
+    /// Bumps BOTH revisions: the window-set revision (the presenter
+    /// reconciles its host window registry on this create) and the z-order
+    /// revision (a new topmost window re-stacks the whole set). The guest
+    /// `CreateWindowExA/W` handlers call this for `parent_handle == 0`
+    /// windows only — children composite into their parent's surface and
+    /// have no host window.
+    pub fn register_top_level(&mut self, hwnd: crate::handles::Hwnd) {
+        self.z_order.push(hwnd);
+        self.z_rev = self.z_rev.wrapping_add(1);
+        self.windows_rev = self.windows_rev.wrapping_add(1);
+    }
+
+    /// Unregister a destroyed top-level window.
+    ///
+    /// Always bumps the window-set revision (the presenter drops the stale
+    /// host window); the z-order revision bumps only when the window was
+    /// actually tracked. The guest `DestroyWindow` handler calls this for
+    /// parentless windows at the same site it wakes the presenter.
+    pub fn unregister_top_level(&mut self, hwnd: crate::handles::Hwnd) {
+        let len = self.z_order.len();
+        self.z_order.retain(|h| *h != hwnd);
+        if self.z_order.len() != len {
+            self.z_rev = self.z_rev.wrapping_add(1);
+        }
+        self.windows_rev = self.windows_rev.wrapping_add(1);
+    }
+
+    /// Move `hwnd` to the TOP of the z-order (`SetWindowPos` HWND_TOP).
+    ///
+    /// Returns whether the order changed — a window already on top (or not
+    /// tracked at all) is a no-op that must NOT bump [`Self::z_rev`] (a
+    /// spurious bump would re-trigger the host reorder for no change).
+    pub fn z_order_to_top(&mut self, hwnd: crate::handles::Hwnd) -> bool {
+        if self.z_order.last() == Some(&hwnd) {
+            return false;
+        }
+        let Some(pos) = self.z_order.iter().position(|h| *h == hwnd) else {
+            return false;
+        };
+        self.z_order.remove(pos);
+        self.z_order.push(hwnd);
+        self.z_rev = self.z_rev.wrapping_add(1);
+        true
+    }
+
+    /// Move `hwnd` to the BOTTOM of the z-order (`SetWindowPos` HWND_BOTTOM).
+    ///
+    /// Returns whether the order changed (see [`Self::z_order_to_top`]).
+    pub fn z_order_to_bottom(&mut self, hwnd: crate::handles::Hwnd) -> bool {
+        if self.z_order.first() == Some(&hwnd) {
+            return false;
+        }
+        let Some(pos) = self.z_order.iter().position(|h| *h == hwnd) else {
+            return false;
+        };
+        self.z_order.remove(pos);
+        self.z_order.insert(0, hwnd);
+        self.z_rev = self.z_rev.wrapping_add(1);
+        true
+    }
+
     /// B9: record one BitBlt mask-copy (`mask_bgra_to_0rgb`) duration (ns).
     pub fn record_blit_copy(&mut self, ns: u128) {
         self.blit_copy_ns = self.blit_copy_ns.saturating_add(ns);
@@ -655,6 +748,146 @@ mod tests {
     fn request_host_sync_without_wake_is_a_no_op() {
         // No wake installed (headless runs): the call must be a silent no-op.
         PresentState::new().request_host_sync();
+    }
+
+    /// Registering a top-level stacks it on TOP of the z-order (the last
+    /// element) and bumps BOTH revisions — the window-set fingerprint the
+    /// presenter's reconcile keys on, and the z-order fingerprint.
+    #[test]
+    fn register_top_level_stacks_top_and_bumps_both_revs() {
+        let mut state = PresentState::new();
+        let a = Hwnd::from(1);
+        let b = Hwnd::from(2);
+
+        state.register_top_level(a);
+        assert_eq!(state.windows_rev, 1);
+        assert_eq!(state.z_rev, 1);
+        assert_eq!(
+            state.z_order,
+            vec![a],
+            "the first top-level is the only row"
+        );
+
+        state.register_top_level(b);
+        assert_eq!(state.windows_rev, 2);
+        assert_eq!(state.z_rev, 2);
+        assert_eq!(
+            state.z_order,
+            vec![a, b],
+            "creation order, newest on top (back-to-front)"
+        );
+    }
+
+    /// Unregistering a top-level removes it from the z-order and bumps the
+    /// window-set revision unconditionally (the host must drop the stale
+    /// window even if the destroy raced a create that never registered).
+    #[test]
+    fn unregister_top_level_removes_from_z_order() {
+        let mut state = PresentState::new();
+        let a = Hwnd::from(1);
+        let b = Hwnd::from(2);
+        let c = Hwnd::from(3);
+        state.register_top_level(a);
+        state.register_top_level(b);
+        state.register_top_level(c);
+        let rev_before = state.z_rev;
+
+        state.unregister_top_level(b);
+
+        assert_eq!(state.z_order, vec![a, c], "the destroyed window is gone");
+        assert_eq!(state.windows_rev, 4);
+        assert_eq!(
+            state.z_rev,
+            rev_before + 1,
+            "a tracked top-level destroy bumps the z-order revision"
+        );
+    }
+
+    /// Unregistering a window never registered still bumps the window-set
+    /// revision (the host reconcile must run) but leaves the z-order
+    /// revision alone (nothing re-stacked).
+    #[test]
+    fn unregister_unknown_window_bumps_set_rev_only() {
+        let mut state = PresentState::new();
+        state.register_top_level(Hwnd::from(1));
+        let z_rev_before = state.z_rev;
+
+        state.unregister_top_level(Hwnd::from(99));
+
+        assert_eq!(state.windows_rev, 2, "the set rev always bumps");
+        assert_eq!(
+            state.z_rev, z_rev_before,
+            "an untracked destroy cannot re-stack the z-order"
+        );
+    }
+
+    /// SetWindowPos HWND_TOP moves a window to the top of the z-order; a
+    /// window already on top is a no-op that must NOT bump the revision (a
+    /// spurious bump would re-trigger the host reorder for no change).
+    #[test]
+    fn z_order_top_moves_window_to_the_top() {
+        let mut state = PresentState::new();
+        let a = Hwnd::from(1);
+        let b = Hwnd::from(2);
+        let c = Hwnd::from(3);
+        state.register_top_level(a);
+        state.register_top_level(b);
+        state.register_top_level(c);
+        let rev_before = state.z_rev;
+
+        assert!(state.z_order_to_top(a));
+        assert_eq!(state.z_order, vec![b, c, a]);
+        assert_eq!(state.z_rev, rev_before + 1);
+
+        // Repeating the same move changes nothing.
+        assert!(
+            !state.z_order_to_top(a),
+            "a window already on top must not bump z_rev"
+        );
+        assert_eq!(state.z_rev, rev_before + 1);
+        assert_eq!(state.z_order, vec![b, c, a]);
+    }
+
+    /// SetWindowPos HWND_BOTTOM moves a window to the back of the z-order.
+    #[test]
+    fn z_order_bottom_moves_window_to_the_back() {
+        let mut state = PresentState::new();
+        let a = Hwnd::from(1);
+        let b = Hwnd::from(2);
+        let c = Hwnd::from(3);
+        state.register_top_level(a);
+        state.register_top_level(b);
+        state.register_top_level(c);
+        let rev_before = state.z_rev;
+
+        assert!(state.z_order_to_bottom(c));
+        assert_eq!(state.z_order, vec![c, a, b]);
+        assert_eq!(state.z_rev, rev_before + 1);
+
+        // A window already at the back is a no-op.
+        assert!(!state.z_order_to_bottom(c));
+        assert_eq!(state.z_rev, rev_before + 1);
+    }
+
+    /// Z-order operations never touch the window-SET revision: they reorder
+    /// existing host windows but change no membership, so the reconcile
+    /// latch must not fire.
+    #[test]
+    fn z_reorder_leaves_windows_rev_untouched() {
+        let mut state = PresentState::new();
+        let a = Hwnd::from(1);
+        let b = Hwnd::from(2);
+        state.register_top_level(a);
+        state.register_top_level(b);
+        let set_rev = state.windows_rev;
+
+        state.z_order_to_top(a);
+        state.z_order_to_bottom(b);
+
+        assert_eq!(
+            state.windows_rev, set_rev,
+            "a SetWindowPos z-change never changes the window SET"
+        );
     }
 
     /// An empty frame for the headless record slot.

@@ -30,11 +30,12 @@ pub fn enable_interactive_file_dialogs(session: &mut RuntimeSession) {
     session.set_file_dialog_policy(FileDialogPolicy::Interactive);
 }
 
-/// Shared slot for the winit window Arc: the native-panel bridge (registered
-/// on the guest thread BEFORE the window exists) reads it to parent its rfd
-/// panel; `WieApp` fills it once the window is created.
+/// Shared per-top-level parent slots: the native-panel bridge (registered on
+/// the guest thread BEFORE any window exists) reads the FOCUSED (or primary)
+/// window's slot to parent its rfd panel; `WieApp` fills each slot when its
+/// window is created.
 #[cfg(target_os = "macos")]
-type WindowSlot = std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<winit::window::Window>>>>;
+type WindowSlot = super::app::ParentWindowSlots;
 
 /// Register the native macOS file-panel bridge (rfd) on a GUI session.
 ///
@@ -45,15 +46,17 @@ type WindowSlot = std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<winit::w
 /// writes the pick back into the `OPENFILENAME` buffer — confining it to a
 /// guest volume at accept, so a pick outside the bottle cancels. The panel
 /// starts in the guest directory mapped into the bottle and is parented to
-/// the winit window once it exists (`window_slot`). Sessions that never
-/// register a bridge keep the in-app emulated dialog (headless runs, `trace`).
+/// the focused/primary winit window once it exists (`window_slots`). Sessions
+/// that never register a bridge keep the in-app emulated dialog (headless
+/// runs, `trace`).
 #[cfg(target_os = "macos")]
 pub fn register_native_file_dialog_bridge(
     handle: &wie_runtime::GuestHandle,
-    window_slot: WindowSlot,
+    window_slots: WindowSlot,
 ) {
-    handle.set_file_dialog_bridge(Box::new(move |request| {
-        show_native_file_dialog(request, &window_slot)
+    handle.set_file_dialog_bridge(Box::new({
+        let handle = handle.clone();
+        move |request| show_native_file_dialog(request, &handle, &window_slots)
     }));
 }
 
@@ -65,10 +68,11 @@ pub fn register_native_file_dialog_bridge(
 #[cfg(target_os = "macos")]
 fn show_native_file_dialog(
     request: &wie_winapi::FileDialogRequest,
-    window_slot: &WindowSlot,
+    handle: &wie_runtime::GuestHandle,
+    window_slots: &WindowSlot,
 ) -> Option<wie_winapi::FileDialogPick> {
     let mut dialog = rfd::FileDialog::new();
-    if let Some(parent) = window_slot.lock().ok().and_then(|slot| slot.clone()) {
+    if let Some(parent) = super::app::resolve_dialog_parent(handle, window_slots) {
         dialog = dialog.set_parent(parent.as_ref());
     }
     if let Some(directory) = &request.initial_host_dir {

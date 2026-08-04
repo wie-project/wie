@@ -200,6 +200,72 @@ impl GuestHandle {
         (capture != wie_winapi::handles::Hwnd::NULL).then_some(capture.as_u64())
     }
 
+    /// The guest's top-level window-SET revision — bumped by every top-level
+    /// create/destroy (see [`wie_winapi::present::PresentState::windows_rev`]).
+    ///
+    /// The Frame handler's reconcile-on-change latch: the winit window
+    /// registry is reconciled only when this changes, so an idle repaint of
+    /// an unchanged window set skips the enumerate+diff entirely.
+    #[must_use]
+    pub fn windows_rev(&self) -> u64 {
+        let Ok(state) = self.state.lock() else {
+            return 0;
+        };
+        state.try_present().map_or(0, |p| p.windows_rev)
+    }
+
+    /// The guest's top-level z-order revision — bumped by every top-level
+    /// create/destroy AND `SetWindowPos` HWND_TOP/HWND_BOTTOM z-change (see
+    /// [`wie_winapi::present::PresentState::z_rev`]).
+    ///
+    /// The Frame handler re-orders its NSWindows only when this changes.
+    #[must_use]
+    pub fn z_rev(&self) -> u64 {
+        let Ok(state) = self.state.lock() else {
+            return 0;
+        };
+        state.try_present().map_or(0, |p| p.z_rev)
+    }
+
+    /// Snapshot of the guest's top-level z-order, back-to-front: index 0 is
+    /// the backmost window, the last element the topmost.
+    ///
+    /// The host presenter mirrors this ordering into its NSWindows (AppKit
+    /// `orderFront` per window, in this order). `SetWindowPos` HWND_TOP /
+    /// HWND_BOTTOM reorder it; creation stacks each new top-level on top.
+    #[must_use]
+    pub fn top_level_z_order(&self) -> Vec<u64> {
+        let Ok(state) = self.state.lock() else {
+            return Vec::new();
+        };
+        state.try_present().map_or_else(Vec::new, |p| {
+            p.z_order.iter().map(|hwnd| hwnd.as_u64()).collect()
+        })
+    }
+
+    /// The top-level (parentless) ancestor of the focused window.
+    ///
+    /// The window a modal host dialog (the MessageBox bridge) should parent
+    /// to: a MessageBox opened while a dialog is focused parents to that
+    /// dialog's owner top-level. `None` when nothing is focused — the caller
+    /// falls back to the primary window.
+    #[must_use]
+    pub fn focused_top_level(&self) -> Option<u64> {
+        let state = self.state.lock().ok()?;
+        let ws = state.try_window_state()?;
+        let mut current = ws.focus_window_handle;
+        if current == wie_winapi::handles::Hwnd::NULL {
+            return None;
+        }
+        loop {
+            let window = ws.windows.iter().find(|w| w.handle == current)?;
+            if window.parent_handle == wie_winapi::handles::Hwnd::NULL {
+                return Some(current.as_u64());
+            }
+            current = window.parent_handle;
+        }
+    }
+
     /// The window with keyboard focus (what `GetFocus` returns in-guest).
     #[must_use]
     pub fn focus_window(&self) -> Option<u64> {
@@ -1037,6 +1103,80 @@ mod tests {
             handle.focus_window(),
             None,
             "no focus → the caller falls back to the event window"
+        );
+    }
+
+    /// `focused_top_level` ascends a focused CHILD to its parentless
+    /// top-level — the window a modal MessageBox should parent to (a dialog
+    /// is a child of its owner here, so its focused controls resolve to the
+    /// owner top-level). `None` when nothing is focused.
+    #[test]
+    fn focused_top_level_ascends_to_the_parentless_ancestor() {
+        let process = wie_pe::ProcessIdentity {
+            module_file_name: "focus-top.exe".to_owned(),
+            module_path: r"C:\App\focus-top.exe".to_owned(),
+            current_directory: r"C:\App".to_owned(),
+            command_line: "focus-top.exe".to_owned(),
+        };
+        let mut winapi_state =
+            crate::memory::default_winapi_state(&DEFAULT_LAYOUT, Arc::new(Vec::new()), &process)
+                .expect("winapi state");
+        let main = 0x100_u64;
+        let dialog = 0x200_u64;
+        let dialog_button = 0x201_u64;
+        {
+            let ws = winapi_state.window_state();
+            ws.windows.push(wie_winapi::WindowRecord {
+                handle: wie_winapi::handles::Hwnd::from(main),
+                ..Default::default()
+            });
+            // The modal dialog is a CHILD of the owner (it composites into
+            // the owner's surface), and the button is a child of the dialog.
+            ws.windows.push(wie_winapi::WindowRecord {
+                handle: wie_winapi::handles::Hwnd::from(dialog),
+                parent_handle: wie_winapi::handles::Hwnd::from(main),
+                ..Default::default()
+            });
+            ws.windows.push(wie_winapi::WindowRecord {
+                handle: wie_winapi::handles::Hwnd::from(dialog_button),
+                parent_handle: wie_winapi::handles::Hwnd::from(dialog),
+                ..Default::default()
+            });
+        }
+        let handle = GuestHandle {
+            state: Arc::new(Mutex::new(winapi_state)),
+            queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+            menu_tree_cache: Arc::new(RwLock::new(None)),
+        };
+
+        // Focus on the dialog's button → the owner top-level (main).
+        {
+            let mut state = handle.state.lock().expect("lock state");
+            state.window_state().focus_window_handle =
+                wie_winapi::handles::Hwnd::from(dialog_button);
+        }
+        assert_eq!(
+            handle.focused_top_level(),
+            Some(main),
+            "a focused dialog control ascends to the owner top-level"
+        );
+
+        // Focus on a top-level directly → itself.
+        {
+            let mut state = handle.state.lock().expect("lock state");
+            state.window_state().focus_window_handle = wie_winapi::handles::Hwnd::from(main);
+        }
+        assert_eq!(handle.focused_top_level(), Some(main));
+
+        // No focus → None (the caller falls back to the primary window).
+        {
+            let mut state = handle.state.lock().expect("lock state");
+            state.window_state().focus_window_handle = wie_winapi::handles::Hwnd::NULL;
+        }
+        assert_eq!(
+            handle.focused_top_level(),
+            None,
+            "no focus yields None so the bridge falls back to the primary window"
         );
     }
 
