@@ -3,6 +3,7 @@
 
 use anyhow::Result;
 
+use super::edit::edit_dirty_band;
 use super::edit::paint_edit;
 use super::listbox::paint_item_lines;
 use super::listbox::render_control_text;
@@ -126,17 +127,38 @@ pub(super) fn paint_control(
                 )?;
             }
             ControlClassKind::Edit => {
-                fill_rect_surface(
-                    state,
-                    info.hwnd,
-                    info.width,
-                    info.height,
-                    info.offset_x,
-                    info.offset_y,
-                    width,
-                    height,
-                    COLOR_WINDOW,
-                );
+                // Erase only the dirty rows — the pending invalid row band,
+                // or the whole client for a full repaint — so a caret blink
+                // or a typed character does not wipe the untouched rows
+                // (`paint_edit` redraws exactly the same band). The border is
+                // stroked after the erase exactly like the full fill was, so
+                // the edge pixels are preserved.
+                let edit_style = find_window(state, hwnd).map_or(0, |w| w.style);
+                let (band_top, band_bottom) = {
+                    let mut advance = |ch: char| font_engine.char_advance(resolved, key, ch);
+                    edit_dirty_band(
+                        state,
+                        hwnd,
+                        &text,
+                        (width, height),
+                        resolved.line_height(),
+                        edit_style,
+                        &mut advance,
+                    )
+                };
+                if band_bottom > band_top {
+                    fill_rect_surface(
+                        state,
+                        info.hwnd,
+                        info.width,
+                        info.height,
+                        info.offset_x,
+                        info.offset_y.saturating_add(band_top),
+                        width,
+                        band_bottom.saturating_sub(band_top),
+                        COLOR_WINDOW,
+                    );
+                }
                 stroke_border(state, &info, width, height, 0x0000_0000);
                 let tx = info.offset_x.saturating_add(2);
                 paint_edit(

@@ -344,6 +344,11 @@ type WindowRegistry = HashMap<WindowId, WindowRuntime>;
 /// guest can hand the surface buffer back zero-copy on the next paint.
 type PresentBackend = crate::gui::present_wgpu::WgpuPresenter;
 
+/// Whether a present actually drew its frame — the RedrawRequested handler
+/// records the frame as presented ONLY when it reached the screen (a skipped
+/// present must stay retryable).
+use crate::gui::present_wgpu::PresentOutcome;
+
 /// Initialize the wgpu present backend. wgpu init is expected to succeed on
 /// macOS (Metal backend); a failure here means the host cannot present at all.
 fn init_present_backend(window: &Arc<Window>) -> Option<PresentBackend> {
@@ -618,11 +623,20 @@ impl ApplicationHandler<WieEvent> for WieApp {
                     // pixel Arc right after the staging upload; snapshot the
                     // pixels Arc for the per-window skip BEFORE the move.
                     let presented_pixels = Arc::clone(&frame.pixels);
-                    if let Some(presenter) = rt.surface.as_mut()
-                        && let Err(e) = presenter.present(frame, dst_w, dst_h)
-                    {
-                        tracing::error!(target: "wiegui", error = %e, "wgpu present failed");
-                    }
+                    let outcome = if let Some(presenter) = rt.surface.as_mut() {
+                        match presenter.present(frame, dst_w, dst_h) {
+                            Ok(outcome) => outcome,
+                            Err(e) => {
+                                tracing::error!(target: "wiegui", error = %e, "wgpu present failed");
+                                PresentOutcome::NotDrawn { retry: false }
+                            }
+                        }
+                    } else {
+                        // No present backend (init failed): nothing was drawn.
+                        // Leave the frame un-presented so a later retry can
+                        // still draw it.
+                        PresentOutcome::NotDrawn { retry: false }
+                    };
                     if let Some(t0) = present_t0 {
                         handle.record_present_time(t0.elapsed().as_nanos());
                         tracing::debug!(
@@ -632,8 +646,30 @@ impl ApplicationHandler<WieEvent> for WieApp {
                             "host present"
                         );
                     }
-                    rt.last_presented_pixels = Some(presented_pixels);
-                    rt.last_presented_size = Some((dst_w, dst_h));
+                    match outcome {
+                        PresentOutcome::Drawn => {
+                            rt.last_presented_pixels = Some(presented_pixels);
+                            rt.last_presented_size = Some((dst_w, dst_h));
+                        }
+                        PresentOutcome::NotDrawn { retry } => {
+                            // The frame never reached the screen. Keep
+                            // last_presented_* stale — the ptr_eq skip above
+                            // would otherwise reject the retry of this same
+                            // frame — and re-request the redraw when the skip
+                            // is transient (occluded/out-of-date surface). This
+                            // is what makes a modal dialog's FIRST composite
+                            // frame appear: the dialog publishes once (into the
+                            // owner surface) and then the guest parks in its
+                            // in-guest modal loop, so a lost present has no
+                            // follow-up publish to re-arm the redraw — the
+                            // dialog stays invisible until a mouse event
+                            // repaints it. The backend skips the redundant
+                            // staging re-upload on the retry, so this is cheap.
+                            if retry {
+                                rt.window.request_redraw();
+                            }
+                        }
+                    }
                 }
             }
             WindowEvent::ModifiersChanged(mods) => {

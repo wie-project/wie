@@ -417,6 +417,10 @@ fn blit_row(
 /// `publish == false` is used by control painting: the control's WM_PAINT
 /// draws into the ancestor surface without publishing — the ancestor's own
 /// WM_PAINT BitBlt publishes the composite frame.
+///
+/// The written rect (clipped to the surface) is unioned into the surface's
+/// dirty accumulator, so the next publish reports exactly the repainted
+/// region.
 // Wide signature: one rect fill carries the surface dims + rect + color.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fill_rect_surface(
@@ -446,6 +450,22 @@ pub(crate) fn fill_rect_surface(
                     *px = color;
                 }
             }
+        }
+        // The effective written rect — the loop above clips x to the row end
+        // and y to the surface height, so mirror that clip here.
+        let x1 = dest_x_s
+            .saturating_add(row_bytes)
+            .min(surf.pixels.len())
+            .min(dest_w_u);
+        let y1 = dest_y_s.saturating_add(h).min(surf_height);
+        if x1 > dest_x_s && y1 > dest_y_s {
+            let written = IRect {
+                left: i32::try_from(dest_x_s).unwrap_or(0),
+                top: i32::try_from(dest_y_s).unwrap_or(0),
+                right: i32::try_from(x1).unwrap_or(0),
+                bottom: i32::try_from(y1).unwrap_or(0),
+            };
+            state.present().mark_dirty(hwnd, written);
         }
     }
     // Always defer — the runtime drains pending
@@ -615,7 +635,7 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
                 return_value: 1,
             });
         };
-        for rect in rects {
+        for rect in &rects {
             let rect_w = rect.width();
             let rect_h = rect.height();
             if rect_w <= 0 || rect_h <= 0 {
@@ -642,6 +662,35 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
                 rect_w,
                 rect_h,
             );
+        }
+    }
+    // The blit wrote the union of the (WS_CLIPCHILDREN-clipped) dest pieces
+    // into the ancestor surface — report it as the repainted region so the
+    // next publish uploads only it. Over-marking a row `blit_row` skipped is
+    // safe; under-marking is what would corrupt the GPU staging.
+    {
+        let dirty = rects.iter().fold(None::<IRect>, |acc, r| {
+            if r.width() <= 0 || r.height() <= 0 {
+                return acc;
+            }
+            let piece = IRect {
+                left: r.left.saturating_add(info.offset_x),
+                top: r.top.saturating_add(info.offset_y),
+                right: r.right.saturating_add(info.offset_x),
+                bottom: r.bottom.saturating_add(info.offset_y),
+            };
+            Some(match acc {
+                None => piece,
+                Some(union) => IRect {
+                    left: union.left.min(piece.left),
+                    top: union.top.min(piece.top),
+                    right: union.right.max(piece.right),
+                    bottom: union.bottom.max(piece.bottom),
+                },
+            })
+        });
+        if let Some(dirty) = dirty {
+            state.present().mark_dirty(info.hwnd, dirty);
         }
     }
 

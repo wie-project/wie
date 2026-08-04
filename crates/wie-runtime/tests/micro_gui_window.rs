@@ -1502,6 +1502,109 @@ fn notepad_file_new_window_does_not_stop_the_session() {
     );
 }
 
+/// The interactive File→Open dialog's first paint must reach the OWNER's
+/// published surface while the dialog is open.
+///
+/// The FileDialog (like the FontDialog) is PARENTED to its owner — it has no
+/// winit window of its own and composites into the owner's surface — so its
+/// face pixels appear in `published[owner]`, never in a frame keyed by the
+/// dialog hwnd. This pins the paint → publish seam of the "dialog invisible
+/// until hover/click" report: the dialog's frame reliably reaches the owner's
+/// published surface, so the reported loss is in the host present path (a
+/// surface-acquire skip marking a frame presented without drawing it), not in
+/// the guest paint path.
+#[test]
+fn notepad_file_dialog_paints_into_the_owner_surface() {
+    let Some(path) = real_exe("notepad.exe") else {
+        eprintln!("skip: real_exes/notepad.exe not present");
+        return;
+    };
+    let _suite = gui_suite_serialize();
+
+    const WM_COMMAND: u32 = 0x0111;
+    const CMD_OPEN: u32 = 258;
+    // The file dialog is 360×200 (comdlg32 FILE_DLG_CX/CY), centered in the
+    // owner's client. The sample is dialog-local (3,33) — the BTNFACE face
+    // margin clear of the 1 px border, the EDIT (8,8,344,22) and the LISTBOX
+    // (8,36,344,116) — resolved to owner coordinates from the frame size.
+    const FILE_DLG_CX: i32 = 360;
+    const FILE_DLG_CY: i32 = 200;
+
+    let mut session =
+        wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
+            .expect("notepad session starts");
+    session.set_file_dialog_policy(wie_winapi::FileDialogPolicy::Interactive);
+    let handle = session.guest_handle();
+    pump_until_windows_ready(&mut session);
+
+    let main = session.first_guest_window_handle().unwrap_or(0);
+    handle.post_message(main, WM_COMMAND, u64::from(CMD_OPEN), 0);
+
+    let mut saw_dialog_record = false;
+    let mut saw_dialog_face_in_owner = false;
+    let mut dialog_hwnd = 0_u64;
+    for _ in 0..150 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        if let Some((dhwnd, ..)) = session
+            .guest_windows_snapshot()
+            .iter()
+            .find(|(_, cls, ..)| cls == "FileDialog")
+        {
+            dialog_hwnd = *dhwnd;
+            saw_dialog_record = true;
+        }
+        if let Some(frame) = session.take_frame(main) {
+            // The dialog is centered in the owner: (owner - 360x200) / 2.
+            let dx = (i32::try_from(frame.width).unwrap_or(0) - FILE_DLG_CX).max(0) / 2;
+            let dy = (i32::try_from(frame.height).unwrap_or(0) - FILE_DLG_CY).max(0) / 2;
+            let (sx, sy) = (
+                u32::try_from(dx.saturating_add(3)).unwrap_or(0),
+                u32::try_from(dy.saturating_add(33)).unwrap_or(0),
+            );
+            if sx < frame.width && sy < frame.height {
+                let idx = usize::try_from(sy).unwrap_or(0) * frame.width as usize
+                    + usize::try_from(sx).unwrap_or(0);
+                if frame.pixels.get(idx).copied() == Some(BTNFACE_0RGB) {
+                    saw_dialog_face_in_owner = true;
+                }
+            }
+        }
+        match summary.termination {
+            wie_runtime::EntryTraceTermination::ExitProcess { code } => {
+                panic!("notepad exited (code {code}) while the file dialog should be open");
+            }
+            wie_runtime::EntryTraceTermination::WaitingForMessage => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            _ => {}
+        }
+        if saw_dialog_record && saw_dialog_face_in_owner {
+            break;
+        }
+    }
+
+    // Dismiss the dialog so the session can wind down (the assertion ran
+    // while it was open).
+    if dialog_hwnd != 0 {
+        handle.post_message(dialog_hwnd, WM_COMMAND, 2, 0); // IDCANCEL
+        for _ in 0..50 {
+            let _ = session.run_until_stop(1_000_000).expect("run");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    assert!(
+        saw_dialog_record,
+        "CMD_OPEN must build the interactive file dialog (a FileDialog window record)"
+    );
+    assert!(
+        saw_dialog_face_in_owner,
+        "the file dialog's BTNFACE must appear in the OWNER's published frame \
+         while the dialog is open — the dialog composites into the owner surface, \
+         so an invisible dialog means a lost host present, not a missing paint"
+    );
+}
+
 /// WM_COMMAND(CMD_SAVE) on an untitled doc must build the Save As dialog
 /// (the guest has no filename yet, so Save routes to GetSaveFileName).
 #[test]

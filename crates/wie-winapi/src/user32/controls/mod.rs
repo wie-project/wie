@@ -86,12 +86,13 @@ use edit::{
     CARET_TIMER_ID, ctrl_is_down, edit_can_undo, edit_caret_tick, edit_char, edit_clear, edit_copy,
     edit_cut, edit_delete_at_caret, edit_empty_undo_buffer, edit_first_visible_line,
     edit_focus_gained, edit_focus_lost, edit_get_handle, edit_get_limit, edit_get_line,
-    edit_get_modify, edit_get_selection, edit_invalidate_text_buffer, edit_line_count,
-    edit_line_from_char, edit_line_index, edit_line_length, edit_mouse_dblclk, edit_mouse_down,
-    edit_mouse_move, edit_mouse_up, edit_mouse_wheel, edit_move_caret, edit_notify_change,
-    edit_notify_scroll, edit_paste, edit_pos_from_char, edit_replace_selection, edit_scroll_caret,
-    edit_scroll_horizontal, edit_scroll_vertical, edit_selection_type, edit_set_handle,
-    edit_set_limit, edit_set_modify, edit_set_selection, edit_set_tab_stops, edit_undo,
+    edit_get_modify, edit_get_selection, edit_invalidate_caret, edit_invalidate_text_buffer,
+    edit_line_count, edit_line_from_char, edit_line_index, edit_line_length, edit_mouse_dblclk,
+    edit_mouse_down, edit_mouse_move, edit_mouse_up, edit_mouse_wheel, edit_move_caret,
+    edit_notify_change, edit_notify_scroll, edit_paste, edit_pos_from_char, edit_replace_selection,
+    edit_reset_invalid_rows, edit_scroll_caret, edit_scroll_horizontal, edit_scroll_vertical,
+    edit_selection_type, edit_set_handle, edit_set_limit, edit_set_modify, edit_set_selection,
+    edit_set_tab_stops, edit_undo,
 };
 use listbox::{listbox_hit_item, listbox_notify_change};
 use paint::write_control_text;
@@ -293,6 +294,8 @@ impl ControlClassKind {
             scrollbar_drag: None,
             tab_stops: Vec::new(),
             caret_on: true,
+            invalid_rows: EditInvalidation::Clean,
+            last_paint_rows: 0,
         }
     }
 }
@@ -370,6 +373,18 @@ pub enum ControlState {
         /// tests read the stored stops today; the typing/tab-expansion path
         /// consumes them in Task 2.3.
         tab_stops: Vec<u16>,
+        /// The repaint scope for the next paint (see [`EditInvalidation`]):
+        /// `Clean`/`Full` repaint every visible row, `Band` repaints only the
+        /// dirty rows. Set by the mutating ops for the rows they touch,
+        /// reset to `Full` by structural changes, and consumed (back to
+        /// `Clean`) by `paint_edit`.
+        invalid_rows: EditInvalidation,
+        /// How many visual rows the last paint actually rendered (the
+        /// row-level invalidation coverage counter; 0 before the first
+        /// paint). Test-only observability: typing one char must paint ≤ the
+        /// rows it changed, while a structural change still paints every
+        /// visible row.
+        last_paint_rows: usize,
     },
     /// LISTBOX (item list, no scrollbar yet).
     ListBox {
@@ -418,6 +433,44 @@ pub enum ControlState {
 pub struct ScrollDrag {
     pub vertical: bool,
     pub grab_offset: i32,
+}
+
+/// The repaint scope of an EDIT between paints — what `paint_edit` must
+/// redraw on the next `WM_PAINT` (the row-level invalidation: a caret blink
+/// or a typed character repaints only the rows it touches instead of the
+/// whole control).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EditInvalidation {
+    /// Nothing is pending — the control is clean since its last paint. The
+    /// window's own `invalidated` flag still drives the next paint (which
+    /// covers every visible row), but the next mutation band starts fresh.
+    #[default]
+    Clean,
+    /// Exactly the visual rows `lo..=hi` are dirty — a caret blink, typing,
+    /// or a selection change. `wrap_width` is the wrap column the range was
+    /// computed against: a resize reflows the wrap, so a band computed at a
+    /// different width is stale and the paint falls back to a full repaint.
+    Band(EditInvalidRows),
+    /// The whole client is dirty — the initial state and every structural
+    /// change (a scroll move, `WM_SETFONT`, a whole-text replacement, a
+    /// resize reflow). Sticky: a later mutation band must not narrow it.
+    Full,
+}
+
+/// The visual-row band an EDIT must repaint (see [`EditInvalidation::Band`]).
+/// Rows use the same global visual-row numbering `visual_rows` /
+/// `layout_visible_lines` produce, so the clipped row loop and the scroll
+/// math always agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditInvalidRows {
+    /// First dirty visual row (inclusive).
+    pub lo: usize,
+    /// Last dirty visual row (inclusive).
+    pub hi: usize,
+    /// The wrap column the range was computed against — the staleness check:
+    /// a pending band whose wrap width no longer matches the layout is
+    /// ignored in favor of a full repaint (the rows reflowed underneath it).
+    pub wrap_width: i32,
 }
 
 impl ControlState {
@@ -788,10 +841,12 @@ impl ControlClassKind {
                 Ok(Some(0))
             }
             // The EDIT's internal caret-blink timer: flip the caret phase and
-            // repaint (the caret bar is drawn only in the on phase).
+            // repaint (the caret bar is drawn only in the on phase). The
+            // repaint is narrowed to the caret's row — the blink only toggles
+            // a 1 px × line-height bar, so the whole EDIT need not redraw.
             (ControlClassKind::Edit, WinMsg::WM_TIMER) if word_parameter == CARET_TIMER_ID => {
                 if edit_caret_tick(state, hwnd) {
-                    invalidate(state, hwnd);
+                    edit_invalidate_caret(state, hwnd);
                 }
                 Ok(Some(0))
             }
@@ -811,6 +866,14 @@ impl ControlClassKind {
             // HFONT feeds the paint-path font resolution (task 2.7); notepad
             // sends WM_SETFONT to its EDIT right after creation.
             (_, WinMsg::WM_SETFONT) => {
+                // A font change reflows every row: an EDIT's pending row band
+                // is stale. The reset stays even when `redraw` is 0 — the next
+                // paint, whenever it comes, must re-render with the new font.
+                if find_window(state, hwnd)
+                    .is_some_and(|w| w.control_kind == Some(ControlClassKind::Edit))
+                {
+                    edit_reset_invalid_rows(state, hwnd);
+                }
                 super::window::set_window_font(state, hwnd, word_parameter, long_parameter);
                 Ok(Some(0))
             }
@@ -834,6 +897,13 @@ impl ControlClassKind {
                 // revert past program-set text.
                 edit_invalidate_text_buffer(state, hwnd);
                 edit_clear_undo_buffer(state, hwnd);
+                // A whole-text replacement rewrites every row: reset any
+                // pending row band so the next paint covers the whole EDIT.
+                if find_window(state, hwnd)
+                    .is_some_and(|w| w.control_kind == Some(ControlClassKind::Edit))
+                {
+                    edit_reset_invalid_rows(state, hwnd);
+                }
                 Ok(Some(1))
             }
             (ControlClassKind::Edit, WinMsg::WM_GETDLGCODE) => Ok(Some(DLGC_WANTCHARS)),

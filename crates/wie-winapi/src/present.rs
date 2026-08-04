@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
+use crate::gdi32::IRect;
+
 /// Global gate for B9 frame-timing instrumentation (publish / blit-copy /
 /// host-present wall times). Set by `RuntimeSession` when `WIE_RUNTIME_PROFILE`
 /// is on (or via `enable_frame_timing`). A relaxed atomic load per frame is the
@@ -109,6 +111,16 @@ pub struct SurfaceFrame {
     /// seams, the window smaller than the swapchain, pre-first-paint) reads
     /// as the window background instead of the presenter's default black.
     pub background_color: u32,
+    /// The region of `pixels` that changed since the previous publish, in
+    /// surface coordinates. `None` = the whole surface changed (the presenter
+    /// must upload the full frame); `Some(rect)` = only that rect changed.
+    ///
+    /// This is a GPU-side HINT: the pixel bytes always carry the FULL frame,
+    /// so headless readers (tests, the record slot) are unaffected. A
+    /// degenerate (empty) rect is never emitted — `publish` treats
+    /// "nothing recorded" as full, because a direct full-surface writer (the
+    /// D3D9 Present handler) cannot be distinguished from a no-op cycle.
+    pub region: Option<IRect>,
 }
 
 /// Per-window surface: pixel buffer + dimensions.
@@ -123,6 +135,20 @@ pub struct WindowSurface {
     /// paint hands the published buffer back (see [`PresentState::ensure_surface`]),
     /// so the composite always accumulates across publishes.
     pub pixels: Vec<u32>,
+    /// Union of every write rect since the last publish, in surface
+    /// coordinates. `None` = the whole surface changed (full upload); this is
+    /// the initial state of a new surface and the state after any resize.
+    /// `Some(IRect::empty())` = nothing written yet this cycle; `Some(rect)` =
+    /// the union of the partial writes. `publish` snapshots it into
+    /// [`SurfaceFrame::region`] and resets it to `Some(IRect::empty())`.
+    ///
+    /// The write primitives (`fill_rect_surface`, the BitBlt row copy, the
+    /// window-DC text band) union their exact bounds into this accumulator via
+    /// [`PresentState::mark_dirty`]; the control-text writes are covered by
+    /// the control's full-face fill, and the D3D9 Present handler writes the
+    /// whole surface without marking, which `publish` conservatively treats
+    /// as full.
+    pub dirty: Option<IRect>,
 }
 
 /// Host MessageBox callback: `(caption, text, mb_type)` → Win32 id.
@@ -285,26 +311,37 @@ impl PresentState {
         let entry = self.surfaces.entry(hwnd).or_insert_with(|| WindowSurface {
             width,
             height,
+            // Zero-initialized: the only safe way to size a fresh Vec, and a
+            // new surface has no previous frame to hand back. The F2
+            // erase-before-clear machinery repaints it before the first
+            // publish, so the zeros never reach the host.
             pixels: vec![0u32; needed],
+            // A new surface's content is unknown — the whole frame uploads.
+            dirty: None,
         });
         // If dimensions changed, reallocate; grow when the buffer is too small
         // (matches the pre-B1 semantics — the recycled buffer may carry the
         // previous frame's size after a resize).
         if entry.width != width || entry.height != height {
-            // The surface size changed — the old
-            // row-major buffer does not map onto the new dimensions. Reusing
-            // it (a plain `resize` keeps the first N elements) would surface
-            // misaligned stale pixels in the WS_CLIPCHILDREN-clipped child
-            // areas — vertical bands/lines through controls after a resize.
-            // Reallocate zeroed; the caller repaints the whole window, and
-            // every publish is full anyway.
+            // The surface size changed — the old row-major buffer no longer
+            // maps onto the new dimensions, but REUSING it (resize in place,
+            // zeroing only the new tail) is safe: the F2 erase-before-clear
+            // machinery repaints the whole window before the next publish
+            // (resize paths set ERASE_BACKGROUND), so the stale head can never
+            // reach the host. A fresh zeroed realloc (`vec![0u32; needed]`)
+            // would memset the whole buffer for content that is erased anyway —
+            // wasted work, and the no-black invariant was never protected by it
+            // (both zeroed and stale heads are garbage that the erase covers).
             entry.width = width;
             entry.height = height;
-            entry.pixels = vec![0u32; needed];
+            entry.pixels.resize(needed, 0);
+            // Content is unknown at the new mapping — full upload.
+            entry.dirty = None;
         } else if entry.pixels.len() < needed {
             // Same dimensions but the buffer is too small (length normally
-            // tracks width*height); grow zeroed.
+            // tracks width*height); grow zeroed — the new tail is unknown.
             entry.pixels.resize(needed, 0);
+            entry.dirty = None;
         }
     }
 
@@ -316,6 +353,44 @@ impl PresentState {
     /// surface with it so regions the frame does not cover never read black.
     pub(crate) fn set_background_color(&mut self, hwnd: crate::handles::Hwnd, color: u32) {
         self.background_colors.insert(hwnd, color);
+    }
+
+    /// Union `rect` (in surface coordinates, already clipped to the surface)
+    /// into the surface's dirty accumulator — the region the next publish
+    /// reports as changed. A rect outside the surface or a degenerate one is a
+    /// no-op. `None` (full surface) stays `None`: a full repaint can never be
+    /// narrowed by a later partial write.
+    ///
+    /// Called by every write primitive that reaches [`PresentState`]: the
+    /// fill paths (`fill_rect_surface`), the BitBlt SRCCOPY row copy, and the
+    /// window-DC text band (all in `gdi32`). The control-text glyphs are
+    /// covered by the control's full-face fill, and the D3D9 Present handler
+    /// writes the whole surface without marking — `publish` conservatively
+    /// treats that as full.
+    pub(crate) fn mark_dirty(&mut self, hwnd: crate::handles::Hwnd, rect: IRect) {
+        let Some(surface) = self.surfaces.get_mut(&hwnd) else {
+            return;
+        };
+        if rect.right <= rect.left || rect.bottom <= rect.top {
+            return;
+        }
+        match &mut surface.dirty {
+            None => {}
+            Some(acc) => {
+                if acc.right <= acc.left || acc.bottom <= acc.top {
+                    // The accumulator is the post-publish "nothing" state
+                    // (`IRect::empty()` is (0,0,0,0), NOT a union identity —
+                    // blending its zero origin into the write would widen the
+                    // region to the surface's top-left). Start from the write.
+                    *acc = rect;
+                } else {
+                    acc.left = acc.left.min(rect.left);
+                    acc.top = acc.top.min(rect.top);
+                    acc.right = acc.right.max(rect.right);
+                    acc.bottom = acc.bottom.max(rect.bottom);
+                }
+            }
+        }
     }
 
     /// Publish the current surface for `hwnd` as a snapshot.
@@ -352,14 +427,33 @@ impl PresentState {
             let pixels: Arc<Vec<u32>> = Arc::from(std::mem::take(&mut surface.pixels));
             (surface.width, surface.height, pixels)
         };
-        // ALWAYS a full frame. The region-delta
-        // contract ("changes since the last guest publish") cannot survive B2
-        // present skipping — a publish that loses the event-loop race has its
-        // delta permanently absent from the wgpu staging texture, which holds
-        // the host's last present. Full publishes against the persistent
-        // staging (~4 MB at 1280×800, dwarfed by the vsync budget) make the
-        // staging invariant trivial: it always equals the last published
-        // frame.
+        // Snapshot the dirty accumulator as the frame's region hint, then
+        // reset it for the next cycle. A degenerate (empty) rect means
+        // "nothing recorded this cycle" — emitted as full: a direct
+        // full-surface writer (the D3D9 Present handler) writes the whole
+        // surface without marking partial rects, so "nothing recorded" cannot
+        // be distinguished from "everything changed". The hint never under-
+        // reports, which is the only direction that corrupts the GPU staging.
+        // A rect covering the whole surface is normalized to `None` (full) so
+        // the presenter keeps its zero-copy full-frame upload instead of
+        // packing a full-size region.
+        let surface_w = i32::try_from(surface.width).unwrap_or(0);
+        let surface_h = i32::try_from(surface.height).unwrap_or(0);
+        let region = match surface.dirty {
+            None => None,
+            Some(rect)
+                if rect.right > rect.left
+                    && rect.bottom > rect.top
+                    && (rect.left > 0
+                        || rect.top > 0
+                        || rect.right < surface_w
+                        || rect.bottom < surface_h) =>
+            {
+                Some(rect)
+            }
+            Some(_) => None,
+        };
+        surface.dirty = Some(IRect::empty());
         if let Some(t0) = t0 {
             let ns = t0.elapsed().as_nanos();
             self.publish_ns = self.publish_ns.saturating_add(ns);
@@ -392,6 +486,7 @@ impl PresentState {
                 height,
                 pixels: Arc::clone(&pixels),
                 background_color,
+                region,
             };
         }
         self.published.insert(
@@ -401,6 +496,7 @@ impl PresentState {
                 height,
                 pixels,
                 background_color,
+                region,
             },
         );
         if let Some(wake) = &self.wake {
@@ -469,6 +565,7 @@ impl Default for PresentState {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{DEFAULT_BACKGROUND_COLOR, PresentState, SurfaceFrame};
+    use crate::gdi32::IRect;
     use crate::handles::Hwnd;
     use std::sync::Arc;
 
@@ -495,7 +592,6 @@ mod tests {
         assert!(state.pending_publishes.is_empty());
 
         let _frame = state.published.get(&hwnd).expect("frame published");
-        // Every frame is full — no region.
         // The publish moved the painted buffer into the Arc; the surface is
         // empty and will be handed back by the next ensure_surface (B1).
         assert!(
@@ -551,6 +647,7 @@ mod tests {
             height: 0,
             pixels: Arc::new(Vec::new()),
             background_color: DEFAULT_BACKGROUND_COLOR,
+            region: None,
         }
     }
 
@@ -636,5 +733,163 @@ mod tests {
         state.publish(hwnd);
         let frame = state.published.get(&hwnd).expect("published frame");
         assert_eq!(frame.background_color, 0x0000_0000);
+    }
+
+    /// A paint that writes two disjoint sub-rects must publish a frame whose
+    /// region is their union — the GPU uploads exactly the repainted area.
+    ///
+    /// The accumulator starts from the post-publish reset: a fresh surface is
+    /// fully dirty (`None`) and a partial write must not narrow it, so the
+    /// scenario seeds one full publish first, then hands the buffer back (the
+    /// next paint cycle's `ensure_surface`) before the partial writes.
+    #[test]
+    fn publish_reports_the_union_of_partial_writes() {
+        let mut state = PresentState::new();
+        let hwnd = Hwnd::from(20);
+        state.ensure_surface(hwnd, 200, 100);
+        state.publish(hwnd);
+        state.ensure_surface(hwnd, 200, 100);
+        // Two writes in one repaint cycle, both via the write-primitive seam
+        // (`mark_dirty` is what fill_rect_surface / the BitBlt / the text
+        // band call).
+        state.mark_dirty(
+            hwnd,
+            IRect {
+                left: 10,
+                top: 20,
+                right: 60,
+                bottom: 50,
+            },
+        );
+        state.mark_dirty(
+            hwnd,
+            IRect {
+                left: 120,
+                top: 70,
+                right: 180,
+                bottom: 90,
+            },
+        );
+        state.publish(hwnd);
+
+        let frame = state.published.get(&hwnd).expect("published frame");
+        assert_eq!(
+            frame.region,
+            Some(IRect {
+                left: 10,
+                top: 20,
+                right: 180,
+                bottom: 90
+            }),
+            "the frame region is the union of the cycle's writes"
+        );
+        assert_eq!(
+            frame.pixels.len(),
+            usize::try_from(200 * 100).unwrap_or(0),
+            "the pixel bytes still carry the FULL frame (region is a hint)"
+        );
+    }
+
+    /// A dirty rect covering the whole surface normalizes to `None` (full):
+    /// a full repaint must take the presenter's zero-copy full-frame upload,
+    /// not a packed full-size region.
+    #[test]
+    fn full_surface_dirty_normalizes_to_none() {
+        let mut state = PresentState::new();
+        let hwnd = Hwnd::from(21);
+        state.ensure_surface(hwnd, 64, 32);
+        state.mark_dirty(
+            hwnd,
+            IRect {
+                left: 0,
+                top: 0,
+                right: 64,
+                bottom: 32,
+            },
+        );
+        state.publish(hwnd);
+        let frame = state.published.get(&hwnd).expect("published frame");
+        assert_eq!(
+            frame.region, None,
+            "a whole-surface repaint is a full frame"
+        );
+    }
+
+    /// A publish with NO recorded writes emits a FULL frame (region None): a
+    /// direct full-surface writer such as the D3D9 Present handler writes the
+    /// whole surface without marking partial rects, so "nothing recorded"
+    /// cannot be distinguished from "everything changed" — the hint must
+    /// never under-report.
+    #[test]
+    fn publish_without_recorded_writes_is_full() {
+        let mut state = PresentState::new();
+        let hwnd = Hwnd::from(22);
+        state.ensure_surface(hwnd, 16, 16);
+        state.publish(hwnd);
+        let first = state.published.get(&hwnd).expect("published frame");
+        assert_eq!(first.region, None, "a fresh surface is full");
+
+        // A second publish with no writes (the D3D9 pattern — the surface was
+        // written directly, no marks recorded) is full too: the buffer is
+        // handed back and published without any `mark_dirty` call.
+        state.ensure_surface(hwnd, 16, 16);
+        state.publish(hwnd);
+        let second = state.published.get(&hwnd).expect("published frame");
+        assert_eq!(
+            second.region, None,
+            "an unmarked publish must fall back to full, never to an empty region"
+        );
+    }
+
+    /// `publish` resets the dirty accumulator: the NEXT cycle's writes start
+    /// a fresh region instead of accumulating the previous one.
+    #[test]
+    fn publish_resets_the_dirty_accumulator() {
+        let mut state = PresentState::new();
+        let hwnd = Hwnd::from(23);
+        state.ensure_surface(hwnd, 100, 100);
+        state.publish(hwnd);
+        assert_eq!(
+            state.surfaces.get(&hwnd).expect("surface").dirty,
+            Some(IRect::empty()),
+            "the dirty accumulator resets to 'nothing' after a publish"
+        );
+        // The next write produces a region that starts from scratch.
+        state.ensure_surface(hwnd, 100, 100);
+        state.mark_dirty(
+            hwnd,
+            IRect {
+                left: 40,
+                top: 40,
+                right: 55,
+                bottom: 55,
+            },
+        );
+        state.publish(hwnd);
+        let frame = state.published.get(&hwnd).expect("published frame");
+        assert_eq!(
+            frame.region,
+            Some(IRect {
+                left: 40,
+                top: 40,
+                right: 55,
+                bottom: 55
+            }),
+            "the second cycle's region carries only its own write"
+        );
+    }
+
+    /// A new surface is dirty `None` (full): its content is unknown until the
+    /// first paint, so the first publish must always upload everything.
+    #[test]
+    fn new_surface_is_dirty_full() {
+        let mut state = PresentState::new();
+        let hwnd = Hwnd::from(24);
+        state.ensure_surface(hwnd, 32, 32);
+        assert_eq!(
+            state.surfaces.get(&hwnd).expect("surface").dirty,
+            None,
+            "a freshly created surface is fully dirty"
+        );
     }
 }

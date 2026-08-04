@@ -1286,6 +1286,7 @@ mod tests {
             height: 0,
             pixels: Arc::new(Vec::new()),
             background_color: 0x00FF_FFFF,
+            region: None,
         }
     }
 

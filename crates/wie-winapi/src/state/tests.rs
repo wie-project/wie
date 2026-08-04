@@ -6314,6 +6314,8 @@ struct ControlUiSnapshot {
     dragging_scrollbar: bool,
     tab_stops: Vec<u16>,
     caret_on: bool,
+    invalid_rows: crate::user32::controls::EditInvalidation,
+    last_paint_rows: usize,
     part_rights: Vec<i32>,
     part_texts: Vec<String>,
 }
@@ -6348,6 +6350,8 @@ impl ControlUiSnapshot {
                     scrollbar_drag,
                     tab_stops,
                     caret_on,
+                    invalid_rows,
+                    last_paint_rows,
                     ..
                 }) => {
                     snap.caret = *caret;
@@ -6362,6 +6366,8 @@ impl ControlUiSnapshot {
                     snap.dragging_scrollbar = scrollbar_drag.is_some();
                     snap.tab_stops = tab_stops.clone();
                     snap.caret_on = *caret_on;
+                    snap.invalid_rows = *invalid_rows;
+                    snap.last_paint_rows = *last_paint_rows;
                 }
                 Some(ControlState::ListBox { items, sel_index }) => {
                     snap.items = items.clone();
@@ -9144,6 +9150,344 @@ fn push_edit_paint_pair(state: &mut WinApiState) -> (u64, u64) {
         ..Default::default()
     });
     (top, edit)
+}
+
+/// A top-level window with a MULTILINE EDIT child (three short non-wrapping
+/// lines in a 120×60 client), for the row-level invalidation tests.
+fn push_multiline_edit_pair(state: &mut WinApiState) -> (u64, u64) {
+    let (top, edit) = push_edit_paint_pair(state);
+    for w in &mut state.window_state().windows {
+        if w.handle == crate::handles::Hwnd::from(edit) {
+            w.style = crate::user32::WS_CHILD
+                | crate::user32::WS_VISIBLE
+                | crate::user32::controls::ES_MULTILINE;
+            w.width = 120;
+            w.height = 60;
+            w.control_text = "alpha\nbeta\ngamma".to_owned();
+        }
+    }
+    (top, edit)
+}
+
+/// The caret-blink repaint must narrow to the caret's row: one `WM_TIMER`
+/// tick (blink off) repaints only the row holding the caret, and the
+/// published frame differs from the previous one ONLY inside that row's
+/// y band — the other rows keep their exact pixels.
+#[test]
+fn test_edit_caret_blink_repaints_only_the_caret_row() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (top, edit) = push_multiline_edit_pair(&mut state);
+
+    // Focus + a full first paint; capture the frame with the caret drawn on
+    // the first row.
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_SETFOCUS,
+        0,
+        0,
+    )
+    .expect("focus ok")
+    .expect("some result");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint ok")
+    .expect("some result");
+    state.present().drain_pending_publishes();
+    let before = state
+        .present()
+        .published
+        .get(&crate::handles::Hwnd::from(top))
+        .expect("published frame")
+        .clone();
+
+    // One blink tick hides the caret and must dirty exactly the caret row.
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_TIMER,
+        1, // CARET_TIMER_ID
+        0,
+    )
+    .expect("blink ok")
+    .expect("some result");
+    assert!(
+        matches!(
+            control_ui(&state, edit).invalid_rows,
+            crate::user32::controls::EditInvalidation::Band(band)
+                if band.lo == 0 && band.hi == 0
+        ),
+        "the blink must dirty only the caret row, got {:?}",
+        control_ui(&state, edit).invalid_rows
+    );
+
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint2 ok")
+    .expect("some result");
+    state.present().drain_pending_publishes();
+    let after = state
+        .present()
+        .published
+        .get(&crate::handles::Hwnd::from(top))
+        .expect("published frame")
+        .clone();
+    assert_eq!(
+        control_ui(&state, edit).last_paint_rows,
+        1,
+        "the blink repaints only the caret row"
+    );
+    // The frames differ ONLY inside the caret row's y band: the edit sits at
+    // (10, 10), the default font's 16 px row 0 spans surface y 10..26.
+    let mut diffs = 0_usize;
+    for y in 0..after.height {
+        for x in 0..after.width {
+            let idx = usize::try_from(y)
+                .unwrap_or(0)
+                .saturating_mul(after.width as usize)
+                .saturating_add(usize::try_from(x).unwrap_or(0));
+            if before.pixels.get(idx) != after.pixels.get(idx) {
+                assert!(
+                    (10..26).contains(&y),
+                    "a pixel diff at ({x},{y}) lies outside the caret row band"
+                );
+                diffs = diffs.saturating_add(1);
+            }
+        }
+    }
+    assert!(diffs > 0, "hiding the caret must change the painted pixels");
+}
+
+/// The row-level invalidation gate: typing one character at the caret paints
+/// only the changed row (the coverage counter), while a font change resets
+/// the pending band so the next paint still covers every visible row.
+#[test]
+fn test_edit_row_level_invalidation_typing_narrows_and_font_resets() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (_top, edit) = push_multiline_edit_pair(&mut state);
+
+    // Focus + a full first paint: a fresh control paints every visible row
+    // (3 rows in a 60 px client at the 16 px default line height).
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_SETFOCUS,
+        0,
+        0,
+    )
+    .expect("focus ok")
+    .expect("some result");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint ok")
+    .expect("some result");
+    state.present().drain_pending_publishes();
+    assert_eq!(
+        control_ui(&state, edit).last_paint_rows,
+        3,
+        "the first paint covers all three rows"
+    );
+    assert_eq!(
+        control_ui(&state, edit).invalid_rows,
+        crate::user32::controls::EditInvalidation::Clean,
+        "the paint consumes the pending band"
+    );
+
+    // Type one character at the caret (row 0): the pending band is exactly
+    // row 0, and the next paint repaints only that row.
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_CHAR,
+        u64::from(u32::from('X')),
+        0,
+    )
+    .expect("char ok")
+    .expect("some result");
+    assert!(
+        matches!(
+            control_ui(&state, edit).invalid_rows,
+            crate::user32::controls::EditInvalidation::Band(band)
+                if band.lo == 0 && band.hi == 0
+        ),
+        "typing at the caret must dirty only row 0, got {:?}",
+        control_ui(&state, edit).invalid_rows
+    );
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint2 ok")
+    .expect("some result");
+    state.present().drain_pending_publishes();
+    assert_eq!(
+        control_ui(&state, edit).last_paint_rows,
+        1,
+        "typing one char repaints only the changed row"
+    );
+
+    // A font change (with redraw) resets any pending band: the next paint is
+    // full again, whatever the new font's line height.
+    let font = state
+        .gdi_state()
+        .alloc_font("Courier New".to_owned(), -16, 700, false, 0);
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_SETFONT,
+        font.as_u64(),
+        1,
+    )
+    .expect("setfont ok")
+    .expect("some result");
+    assert_eq!(
+        control_ui(&state, edit).invalid_rows,
+        crate::user32::controls::EditInvalidation::Full,
+        "WM_SETFONT resets the pending band to full"
+    );
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint3 ok")
+    .expect("some result");
+    state.present().drain_pending_publishes();
+    assert!(
+        control_ui(&state, edit).last_paint_rows > 1,
+        "a font change still full-repaints (got {} rows)",
+        control_ui(&state, edit).last_paint_rows
+    );
+    assert_eq!(
+        control_ui(&state, edit).invalid_rows,
+        crate::user32::controls::EditInvalidation::Clean,
+        "the full repaint consumes the band"
+    );
+}
+
+/// The pixel gate of the row-level invalidation: typing on row 0 and
+/// repainting must leave rows 1–2 BYTE-IDENTICAL — a partial repaint must
+/// never wipe the rows outside the dirty band.
+#[test]
+fn test_edit_partial_repaint_preserves_unpainted_rows() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (top, edit) = push_multiline_edit_pair(&mut state);
+
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_SETFOCUS,
+        0,
+        0,
+    )
+    .expect("focus ok")
+    .expect("some result");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint ok")
+    .expect("some result");
+    state.present().drain_pending_publishes();
+    let before = state
+        .present()
+        .published
+        .get(&crate::handles::Hwnd::from(top))
+        .expect("published frame")
+        .clone();
+
+    // Type at the caret (row 0) and repaint — only row 0 may change.
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_CHAR,
+        u64::from(u32::from('X')),
+        0,
+    )
+    .expect("char ok")
+    .expect("some result");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint2 ok")
+    .expect("some result");
+    state.present().drain_pending_publishes();
+    let after = state
+        .present()
+        .published
+        .get(&crate::handles::Hwnd::from(top))
+        .expect("published frame")
+        .clone();
+
+    // The edit sits at (10, 10); the 16 px rows span surface y 26..58 for
+    // rows 1 and 2 — every pixel there must be identical to the pre-typing
+    // frame (the caret row 0, y 10..26, is allowed to differ).
+    let mut row0_diffs = 0_usize;
+    for y in 10_i32..58_i32 {
+        for x in 10_i32..130_i32 {
+            let idx = usize::try_from(y)
+                .unwrap_or(0)
+                .saturating_mul(after.width as usize)
+                .saturating_add(usize::try_from(x).unwrap_or(0));
+            let before_px = before.pixels.get(idx).copied();
+            let after_px = after.pixels.get(idx).copied();
+            if y < 26 {
+                if before_px != after_px {
+                    row0_diffs = row0_diffs.saturating_add(1);
+                }
+            } else {
+                assert_eq!(
+                    after_px, before_px,
+                    "typing on row 0 must not change a pixel on row {y}"
+                );
+            }
+        }
+    }
+    assert!(row0_diffs > 0, "typing on row 0 must change its own pixels");
 }
 
 #[test]

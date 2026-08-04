@@ -17,6 +17,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use wie_winapi::gdi32::IRect;
 use wie_winapi::present::SurfaceFrame;
 use winit::window::Window;
 
@@ -73,6 +74,18 @@ struct StagingFrame {
     bind_group: wgpu::BindGroup,
 }
 
+/// Whether a [`WgpuPresenter::present`] call actually drew the frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PresentOutcome {
+    /// The frame was uploaded and presented to the swapchain.
+    Drawn,
+    /// The frame was NOT drawn — the surface acquire skipped it. `retry` is
+    /// `true` for transient skips (occluded / out-of-date / timed-out / lost
+    /// surface) that a re-requested redraw can resolve; `false` for persistent
+    /// failures (validation) where re-requesting would spin.
+    NotDrawn { retry: bool },
+}
+
 /// wgpu/Metal present backend for one winit window.
 ///
 /// Owns an [`Arc<Window>`] (alongside the app's copy) so the `Surface` can be
@@ -99,6 +112,25 @@ pub(crate) struct WgpuPresenter {
     max_tex_dim: u32,
     /// Guest-frame staging texture (frame-sized), recreated on size change.
     staging: Option<StagingFrame>,
+    /// The frame content currently staged in `staging` — the pixels Arc plus
+    /// the frame size. A present whose surface acquire skipped the frame is
+    /// retried by the app (it re-requests the redraw) with the SAME pixels
+    /// Arc; the Arc + size compare skips the re-upload on that retry so the
+    /// event-loop thread is not pinned re-copying a frame it already holds.
+    /// The compare is sound because this entry keeps the compared-to
+    /// allocation alive (the same keep-alive contract as the app's
+    /// `last_presented_pixels`) and the size check covers a staging
+    /// recreation.
+    last_uploaded: Option<(Arc<Vec<u32>>, u32, u32)>,
+    /// Generation-gap fallback: `true` when the staging texture may NOT hold
+    /// the full previous frame, so the NEXT upload must be a full-frame copy
+    /// regardless of the frame's region. A frame's region is relative to the
+    /// previous PUBLISH — if that publish's present was skipped (`NotDrawn`)
+    /// or failed, its delta was never staged, and a region-limited upload
+    /// would permanently lose it (the exact bug that killed the old
+    /// region-delta contract). Set by any present that did not draw; cleared
+    /// once a full upload (or a same-frame upload skip) completes.
+    force_full: bool,
 }
 
 impl WgpuPresenter {
@@ -263,6 +295,8 @@ impl WgpuPresenter {
             sampler,
             max_tex_dim,
             staging: None,
+            last_uploaded: None,
+            force_full: false,
         })
     }
 
@@ -290,12 +324,48 @@ impl WgpuPresenter {
     /// Upload `frame` (region or full) to the staging texture and blit it to
     /// the surface. `window_w/h` is the current client size, used only when the
     /// surface must be reconfigured (`Outdated`) or recreated (`Lost`).
+    ///
+    /// Returns whether the frame actually reached the swapchain. A surface
+    /// acquire that skips the draw (`Timeout`/`Occluded`/`Outdated`/`Lost`/
+    /// `Validation`) reports `NotDrawn` instead of pretending the frame was
+    /// presented — the app must NOT record a skipped frame as presented, or
+    /// its per-window `Arc::ptr_eq` skip would reject the retry of that same
+    /// frame (and a modal dialog that publishes exactly once would stay
+    /// invisible until the next repaint).
+    ///
+    /// The upload copies only the frame's `region` hint (a partial repaint,
+    /// e.g. a caret blink) onto the persistent staging texture; the
+    /// fullscreen-triangle blit then samples the whole texture. Any present
+    /// that did NOT draw arms the generation-gap fallback, so the next upload
+    /// is full — the region delta must never be applied to a staging texture
+    /// that missed a skipped frame.
     pub(crate) fn present(
         &mut self,
         frame: SurfaceFrame,
         window_w: u32,
         window_h: u32,
-    ) -> Result<()> {
+    ) -> Result<PresentOutcome> {
+        // Generation-gap fallback: a frame whose present did NOT draw (acquire
+        // skip, or an upload error) leaves the staging possibly missing that
+        // frame's delta. The next frame's region is relative to the previous
+        // PUBLISH, not the last successfully-staged frame, so a region-limited
+        // upload would lose the gap permanently (the exact bug that killed the
+        // old region-delta contract). Force a full upload next.
+        let outcome = self.present_inner(frame, window_w, window_h);
+        if !matches!(outcome, Ok(PresentOutcome::Drawn)) {
+            self.force_full = true;
+        }
+        outcome
+    }
+
+    /// The upload + draw core of [`Self::present`]; the caller arms the
+    /// generation-gap fallback when the draw did not happen.
+    fn present_inner(
+        &mut self,
+        frame: SurfaceFrame,
+        window_w: u32,
+        window_h: u32,
+    ) -> Result<PresentOutcome> {
         // Consume the frame up front: the pixel Arc is only needed for the
         // staging upload below, and `write_texture` copies it synchronously.
         // Taking ownership (instead of borrowing) lets us drop the Arc right
@@ -307,58 +377,72 @@ impl WgpuPresenter {
             height: frame_h_raw,
             pixels,
             background_color,
+            region,
         } = frame;
         let frame_w = frame_w_raw.max(1);
         let frame_h = frame_h_raw.max(1);
 
-        // Recreate the staging texture when the guest frame size changed.
-        // Publish-model rework: every publish is a FULL frame, so the
-        // staging texture always equals the last published frame — the
-        // region-delta contract ("changes since the last guest publish")
-        // cannot survive present skipping, which would leave a losing
-        // publish's delta permanently absent from the persistent staging.
+        // Recreate the staging texture when the guest frame size changed. A
+        // fresh texture is blank — the upload must cover it fully.
         if self
             .staging
             .as_ref()
             .is_none_or(|s| s.width != frame_w || s.height != frame_h)
         {
             self.staging = Some(self.make_staging(frame_w, frame_h)?);
+            self.force_full = true;
         }
         let staging = self.staging.as_ref().context("staging texture")?;
 
-        // Full-frame upload: zero-copy u32 → u8 view of the 0RGB buffer (LE
-        // on all supported hosts). `bytemuck::cast_slice` is safe: u32 → u8
-        // is any-bit-pattern.
-        let bytes = bytemuck::cast_slice(&pixels);
-        let pitch = usize::try_from(frame_w)
-            .context("frame width")?
-            .saturating_mul(4);
-        let needed = usize::try_from(frame_h)
-            .context("frame height")?
-            .saturating_mul(pitch);
-        let src = bytes.get(..needed).context("full frame upload slice")?;
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &staging.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            src,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(u32::try_from(pitch).context("pitch")?),
-                rows_per_image: Some(frame_h),
-            },
-            wgpu::Extent3d {
-                width: frame_w,
-                height: frame_h,
-                depth_or_array_layers: 1,
-            },
-        );
-        // wgpu copied the pixels into the staging buffer synchronously; the
-        // render pass below only samples the staging texture. Release the
-        // guest Arc now instead of holding it across the render + present.
+        // Skip the re-upload when the staging texture already holds this exact
+        // frame: a present whose acquire skipped is retried with the same
+        // pixels Arc, and re-copying ~4 MB per retry would pin the event-loop
+        // thread. The size check covers a staging recreation (the new texture
+        // is blank, so a size change forces the copy). When the staging holds
+        // this frame, a generation-gap flag set by a skipped present is moot.
+        let pixel_arc = Arc::clone(&pixels);
+        let already_staged = self.last_uploaded.as_ref().is_some_and(|(prev, w, h)| {
+            *w == frame_w && *h == frame_h && Arc::ptr_eq(prev, &pixel_arc)
+        });
+        if already_staged {
+            self.force_full = false;
+        } else {
+            // A generation gap forces the whole frame; otherwise upload only
+            // the published region (None region = full frame).
+            let upload_region = if self.force_full { None } else { region };
+            let upload = upload_source(&pixels, frame_w, frame_h, upload_region);
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &staging.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: upload.origin_x,
+                        y: upload.origin_y,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                upload.bytes.as_ref(),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(upload.bytes_per_row),
+                    rows_per_image: Some(upload.rows),
+                },
+                wgpu::Extent3d {
+                    width: upload.width,
+                    height: upload.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            // wgpu copied the pixels into the staging buffer synchronously; the
+            // render pass below only samples the staging texture. Release the
+            // guest Arc now instead of holding it across the render + present.
+            self.last_uploaded = Some((pixel_arc, frame_w, frame_h));
+            if upload_region.is_none() {
+                // A full upload completed — the staging equals the frame.
+                self.force_full = false;
+            }
+        }
         drop(pixels);
 
         match self.surface.get_current_texture() {
@@ -411,25 +495,32 @@ impl WgpuPresenter {
                 // wgpu 30 moved present from `SurfaceTexture::present()` to
                 // `Queue::present(&self, stex)` — same operation.
                 self.queue.present(stex);
+                Ok(PresentOutcome::Drawn)
             }
-            // Nothing to draw — try again on the next redraw.
+            // Nothing to draw — the frame is NOT presented. Report it so the
+            // caller re-requests the redraw and retries this same frame; the
+            // upload-skip above makes the retry cheap.
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
                 tracing::debug!(target: "wiegui", "surface acquire skipped (timeout/occluded)");
+                Ok(PresentOutcome::NotDrawn { retry: true })
             }
-            // The surface geometry changed; reconfigure and let the next
+            // The surface geometry changed; reconfigure and let the retried
             // redraw re-acquire.
             wgpu::CurrentSurfaceTexture::Outdated => {
                 self.resize(window_w, window_h);
+                Ok(PresentOutcome::NotDrawn { retry: true })
             }
             // Lost — recreate the surface from the window and reconfigure.
             wgpu::CurrentSurfaceTexture::Lost => {
                 self.recreate_surface()?;
+                Ok(PresentOutcome::NotDrawn { retry: true })
             }
+            // Persistent misconfiguration: re-requesting would spin forever.
             wgpu::CurrentSurfaceTexture::Validation => {
                 tracing::debug!(target: "wiegui", "surface acquire validation error; skipping frame");
+                Ok(PresentOutcome::NotDrawn { retry: false })
             }
         }
-        Ok(())
     }
 
     /// Create a staging texture at `width`×`height` plus its view and bind
@@ -474,10 +565,257 @@ impl WgpuPresenter {
     }
 }
 
+/// The source bytes + copy layout for one `write_texture` call.
+struct UploadSource<'a> {
+    /// Source bytes. `Cow::Borrowed` for a full frame whose natural pitch is
+    /// already 256-aligned (zero-copy); `Cow::Owned` for a padded row pack
+    /// otherwise (region uploads and unaligned full frames).
+    bytes: Cow<'a, [u8]>,
+    /// Row stride in `bytes` — padded to wgpu's `COPY_BYTES_PER_ROW_ALIGNMENT`
+    /// (256), which `write_texture` requires.
+    bytes_per_row: u32,
+    /// Number of rows in `bytes`.
+    rows: u32,
+    /// Destination origin and extent inside the staging texture.
+    origin_x: u32,
+    origin_y: u32,
+    width: u32,
+    height: u32,
+}
+
+/// Build the source buffer for a `write_texture` of `region` (None = full
+/// frame) out of the frame's `pixels` (0RGB u32, top-down).
+///
+/// Rows are packed into a buffer with the pitch padded to wgpu's 256-byte
+/// alignment — a region narrower than the full frame (e.g. a caret blink)
+/// must not stride by the full frame width, and the pitch must be aligned.
+/// The full-frame case with an already-aligned pitch is zero-copy (the `Cow`
+/// borrows the pixels buffer directly).
+#[must_use]
+fn upload_source<'a>(
+    pixels: &'a [u32],
+    frame_w: u32,
+    frame_h: u32,
+    region: Option<IRect>,
+) -> UploadSource<'a> {
+    let frame_w_u = usize::try_from(frame_w).unwrap_or(0);
+    let frame_w_i = i32::try_from(frame_w).unwrap_or(0);
+    let frame_h_i = i32::try_from(frame_h).unwrap_or(0);
+    let (left, top, right, bottom) = match region {
+        None => (0, 0, frame_w_i, frame_h_i),
+        // Defensive clip: the winapi side clips the dirty rect to the
+        // surface, but a malformed region must not over-read the buffer.
+        Some(r) => (
+            r.left.max(0),
+            r.top.max(0),
+            r.right.min(frame_w_i),
+            r.bottom.min(frame_h_i),
+        ),
+    };
+    let width = right.saturating_sub(left).max(0);
+    let height = bottom.saturating_sub(top).max(0);
+    let width_us = usize::try_from(width).unwrap_or(0);
+    let height_us = usize::try_from(height).unwrap_or(0);
+    let left_us = usize::try_from(left.max(0)).unwrap_or(0);
+    let top_us = usize::try_from(top.max(0)).unwrap_or(0);
+    if width_us == 0 || height_us == 0 {
+        return UploadSource {
+            bytes: Cow::Owned(Vec::new()),
+            bytes_per_row: 0,
+            rows: 0,
+            origin_x: 0,
+            origin_y: 0,
+            width: 0,
+            height: 0,
+        };
+    }
+    let row_bytes = width_us.saturating_mul(4);
+    // wgpu requires `bytes_per_row` to be a multiple of 256 (the
+    // COPY_BYTES_PER_ROW_ALIGNMENT validation in wgpu-core).
+    let padded = row_bytes.div_ceil(256).saturating_mul(256);
+    if region.is_none() && row_bytes == padded {
+        // Full frame with a naturally aligned pitch: zero-copy u32 → u8 view
+        // of the 0RGB buffer (LE on all supported hosts). `bytemuck::cast_slice`
+        // is safe: u32 → u8 is any-bit-pattern.
+        return UploadSource {
+            bytes: Cow::Borrowed(bytemuck::cast_slice(pixels)),
+            bytes_per_row: u32::try_from(padded).unwrap_or(0),
+            rows: u32::try_from(height_us).unwrap_or(0),
+            origin_x: 0,
+            origin_y: 0,
+            width: u32::try_from(width).unwrap_or(0),
+            height: u32::try_from(height).unwrap_or(0),
+        };
+    }
+    // Pack the region rows into a padded buffer (region copies and unaligned
+    // full frames).
+    let mut buf = vec![0_u8; height_us.saturating_mul(padded)];
+    for row in 0..height_us {
+        let src_start = top_us
+            .saturating_add(row)
+            .saturating_mul(frame_w_u)
+            .saturating_add(left_us);
+        let Some(src) = pixels.get(src_start..src_start.saturating_add(width_us)) else {
+            continue;
+        };
+        let dst_start = row.saturating_mul(padded);
+        for (i, px) in src.iter().enumerate() {
+            let offset = dst_start.saturating_add(i.saturating_mul(4));
+            if let Some(slot) = buf.get_mut(offset..offset.saturating_add(4)) {
+                slot.copy_from_slice(&px.to_le_bytes());
+            }
+        }
+    }
+    UploadSource {
+        bytes: Cow::Owned(buf),
+        bytes_per_row: u32::try_from(padded).unwrap_or(0),
+        rows: u32::try_from(height_us).unwrap_or(0),
+        origin_x: u32::try_from(left).unwrap_or(0),
+        origin_y: u32::try_from(top).unwrap_or(0),
+        width: u32::try_from(width).unwrap_or(0),
+        height: u32::try_from(height).unwrap_or(0),
+    }
+}
+
 /// Extract one 0RGB channel (bits `shift..shift+8` of an `0x00RRGGBB` u32)
 /// as a normalized `f64` for the wgpu clear color.
 #[must_use]
 fn color_channel(background_color: u32, shift: u32) -> f64 {
     let byte = u8::try_from((background_color >> shift) & 0xFF).unwrap_or(u8::MAX);
     f64::from(byte) / 255.0
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::upload_source;
+    use std::borrow::Cow;
+    use wie_winapi::gdi32::IRect;
+
+    /// A `w × h` frame filled with one color.
+    fn frame(w: u32, h: u32, fill: u32) -> Vec<u32> {
+        vec![fill; usize::try_from(w.saturating_mul(h)).unwrap_or(0)]
+    }
+
+    /// The region pixel at frame coordinates (col, row) inside a packed
+    /// source, read back as a u32 (0RGB LE).
+    fn packed_pixel(bytes: &[u8], bytes_per_row: usize, col: usize, row: usize) -> u32 {
+        let off = row
+            .saturating_mul(bytes_per_row)
+            .saturating_add(col.saturating_mul(4));
+        let Some(slot) = bytes.get(off..off.saturating_add(4)) else {
+            return u32::MAX;
+        };
+        u32::from_le_bytes([slot[0], slot[1], slot[2], slot[3]])
+    }
+
+    /// The full-frame upload for a naturally 256-aligned pitch is zero-copy:
+    /// `640 × 4 = 2560 = 10 × 256`.
+    #[test]
+    fn full_aligned_pitch_is_zero_copy() {
+        let pixels = frame(640, 480, 0x00FF_FFFF);
+        let src = upload_source(&pixels, 640, 480, None);
+        assert!(
+            matches!(src.bytes, Cow::Borrowed(_)),
+            "an aligned full frame must borrow the pixels, not pack them"
+        );
+        assert_eq!(src.bytes_per_row, 2560);
+        assert_eq!(src.rows, 480);
+        assert_eq!(
+            (src.origin_x, src.origin_y, src.width, src.height),
+            (0, 0, 640, 480)
+        );
+    }
+
+    /// A partial region is packed into a 256-aligned buffer (the alignment
+    /// wgpu requires for `write_texture`) carrying the region's pixels, with
+    /// the region's origin as the copy origin.
+    #[test]
+    fn region_packs_padded_rows_with_origin() {
+        let mut pixels = frame(100, 50, 0x0000_00FF); // blue fill
+        // A distinctive pixel inside the region: frame (30, 10).
+        let idx = 10_usize.saturating_mul(100).saturating_add(30);
+        if let Some(px) = pixels.get_mut(idx) {
+            *px = 0x00FF_0000; // red
+        }
+        let region = IRect {
+            left: 20,
+            top: 5,
+            right: 40,
+            bottom: 15,
+        };
+        let src = upload_source(&pixels, 100, 50, Some(region));
+        assert!(
+            matches!(src.bytes, Cow::Owned(_)),
+            "a region-limited upload must pack rows"
+        );
+        // 20 cols × 4 B = 80 B → padded to the 256-byte alignment.
+        assert_eq!(src.bytes_per_row, 256);
+        assert_eq!(src.rows, 10);
+        assert_eq!(
+            (src.origin_x, src.origin_y, src.width, src.height),
+            (20, 5, 20, 10)
+        );
+        // Frame (30,10) → packed row 5 (10 − 5), col 10 (30 − 20).
+        let px = packed_pixel(src.bytes.as_ref(), 256, 10, 5);
+        assert_eq!(
+            px, 0x00FF_0000,
+            "the packed buffer carries the region pixel"
+        );
+        // A pixel OUTSIDE the region (frame (5,5)) is not in the packed rows.
+        let px = packed_pixel(src.bytes.as_ref(), 256, 0, 0);
+        assert_ne!(px, 0x00FF_0000, "rows outside the region are not copied");
+    }
+
+    /// A full frame whose natural pitch is not 256-aligned must be packed
+    /// into a padded buffer (the latent-unaligned-width case).
+    #[test]
+    fn unaligned_full_frame_is_padded() {
+        let pixels = frame(90, 40, 0x00AB_CDEF);
+        let src = upload_source(&pixels, 90, 40, None);
+        assert!(
+            matches!(src.bytes, Cow::Owned(_)),
+            "an unaligned pitch must be packed, not zero-copy"
+        );
+        assert_eq!(src.bytes_per_row, 512, "90 × 4 = 360 → padded to 512");
+        assert_eq!(src.rows, 40);
+        assert_eq!(
+            (src.origin_x, src.origin_y, src.width, src.height),
+            (0, 0, 90, 40)
+        );
+        // The first pixel survives the pack.
+        let px = packed_pixel(src.bytes.as_ref(), 512, 0, 0);
+        assert_eq!(px, 0x00AB_CDEF);
+    }
+
+    /// A degenerate region copies nothing (an empty extent); the copy layout
+    /// is all zeros so `write_texture` is a no-op-sized call.
+    #[test]
+    fn degenerate_region_produces_no_copy() {
+        let pixels = frame(100, 100, 0);
+        let src = upload_source(&pixels, 100, 100, Some(IRect::empty()));
+        assert_eq!((src.width, src.height), (0, 0));
+        assert_eq!(src.bytes.as_ref().len(), 0);
+    }
+
+    /// A region running past the frame edge is clipped to the frame.
+    #[test]
+    fn region_is_clipped_to_the_frame() {
+        let pixels = frame(50, 50, 0);
+        let src = upload_source(
+            &pixels,
+            50,
+            50,
+            Some(IRect {
+                left: 40,
+                top: 40,
+                right: 200,
+                bottom: 200,
+            }),
+        );
+        assert_eq!(
+            (src.origin_x, src.origin_y, src.width, src.height),
+            (40, 40, 10, 10)
+        );
+    }
 }

@@ -191,6 +191,12 @@ fn dc_text_attrs(state: &WinApiState, dc_handle: u64) -> TextAttrs {
 struct ResolvedTextTarget<'a> {
     /// The pixel target the run renders into.
     target: TextTarget<'a>,
+    /// The surface hwnd for a window-DC target (`None` for DIBs) — the
+    /// rendered band must be marked dirty on this surface so the next
+    /// publish's region covers the text. The surface is keyed by the DC
+    /// window's hwnd (see `resolve_text_target`), so the band's local
+    /// coordinates ARE the surface coordinates.
+    surface_hwnd: Option<crate::handles::Hwnd>,
 }
 
 /// Resolve a DC handle to a writable pixel target.
@@ -218,6 +224,7 @@ fn resolve_text_target(state: &mut WinApiState, dc_handle: u64) -> Option<Resolv
                     height: dib.height.unsigned_abs(),
                     top_down: dib.height < 0,
                 },
+                surface_hwnd: None,
             })
         }
         DcKind::Window(hwnd) => {
@@ -231,9 +238,29 @@ fn resolve_text_target(state: &mut WinApiState, dc_handle: u64) -> Option<Resolv
                     width: surface.width,
                     height: surface.height,
                 },
+                surface_hwnd: Some(hwnd),
             })
         }
         DcKind::Screen => None,
+    }
+}
+
+/// Mark `rect` (already clipped to the surface, in surface coordinates) as
+/// dirty on the surface a window-DC target resolves to. No-op for DIB targets
+/// (memory DCs have no present-surface dirty state) and for degenerate rects.
+///
+/// Called AFTER the target's surface borrow has ended (NLL), so it can take
+/// `&mut state` while the render's `TextTarget` no longer borrows it.
+fn mark_surface_dirty(
+    state: &mut WinApiState,
+    surface_hwnd: Option<crate::handles::Hwnd>,
+    rect: IRect,
+) {
+    if let Some(hwnd) = surface_hwnd
+        && rect.right > rect.left
+        && rect.bottom > rect.top
+    {
+        state.present().mark_dirty(hwnd, rect);
     }
 }
 
@@ -539,11 +566,14 @@ fn handle_text_out_impl(
             let resolved = dc_resolved_font(state, hdc, &mut font_engine);
             let rendered: Result<()> = if let Some((key, resolved)) = resolved {
                 match resolve_text_target(state, hdc) {
-                    Some(ResolvedTextTarget { mut target, .. }) => {
-                        // Window-DC text no
-                        // longer marks a dirty rect — every publish is a full
-                        // frame, so the exact band is irrelevant.
-                        let _band = render_run(
+                    Some(ResolvedTextTarget {
+                        mut target,
+                        surface_hwnd,
+                    }) => {
+                        // Window-DC text marks its clipped line band as the
+                        // surface's dirty rect, so the next publish uploads
+                        // only the repainted line.
+                        let band = render_run(
                             engine,
                             &mut font_engine,
                             &resolved,
@@ -555,6 +585,7 @@ fn handle_text_out_impl(
                             &attrs,
                             None,
                         )?;
+                        mark_surface_dirty(state, surface_hwnd, band.unwrap_or(IRect::empty()));
                         Ok(())
                     }
                     None => Ok(()),
@@ -636,7 +667,21 @@ pub fn handle_ext_text_out_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
             .context("failed to read RECT.bottom")?;
         if options & ETO_OPAQUE != 0 {
             let attrs = dc_text_attrs(state, hdc);
-            if let Some(ResolvedTextTarget { mut target, .. }) = resolve_text_target(state, hdc) {
+            if let Some(ResolvedTextTarget {
+                mut target,
+                surface_hwnd,
+            }) = resolve_text_target(state, hdc)
+            {
+                // The fill is clipped to the surface dims inside `fill_rect`;
+                // mirror that clip so the marked rect is the exact written
+                // region (over-marking is safe, under-marking corrupts).
+                let (tw, th) = target.dimensions();
+                let tw_i = i32::try_from(tw).unwrap_or(i32::MAX);
+                let th_i = i32::try_from(th).unwrap_or(i32::MAX);
+                let x0 = left.max(0);
+                let y0 = top.max(0);
+                let x1 = left.saturating_add(right.saturating_sub(left)).min(tw_i);
+                let y1 = top.saturating_add(bottom.saturating_sub(top)).min(th_i);
                 fill_rect(
                     engine,
                     &mut target,
@@ -646,6 +691,16 @@ pub fn handle_ext_text_out_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
                     bottom.saturating_sub(top),
                     attrs.bk_color,
                 )?;
+                mark_surface_dirty(
+                    state,
+                    surface_hwnd,
+                    IRect {
+                        left: x0,
+                        top: y0,
+                        right: x1,
+                        bottom: y1,
+                    },
+                );
             }
         }
         if options & ETO_CLIPPED != 0 {
@@ -661,8 +716,11 @@ pub fn handle_ext_text_out_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
             let resolved = dc_resolved_font(state, hdc, &mut font_engine);
             let rendered: Result<()> = if let Some((key, resolved)) = resolved {
                 match resolve_text_target(state, hdc) {
-                    Some(ResolvedTextTarget { mut target, .. }) => {
-                        let _band = render_run(
+                    Some(ResolvedTextTarget {
+                        mut target,
+                        surface_hwnd,
+                    }) => {
+                        let band = render_run(
                             engine,
                             &mut font_engine,
                             &resolved,
@@ -674,6 +732,7 @@ pub fn handle_ext_text_out_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
                             &attrs,
                             clip,
                         )?;
+                        mark_surface_dirty(state, surface_hwnd, band.unwrap_or(IRect::empty()));
                         Ok(())
                     }
                     None => Ok(()),
@@ -801,29 +860,34 @@ fn handle_draw_text_impl(
             };
             if !chars.is_empty() {
                 let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
-                let rendered: Result<()> =
-                    if let Some((key, resolved)) = dc_resolved_font(state, hdc, &mut font_engine) {
-                        match resolve_text_target(state, hdc) {
-                            Some(ResolvedTextTarget { mut target, .. }) => {
-                                let _band = render_run(
-                                    engine,
-                                    &mut font_engine,
-                                    &resolved,
-                                    &key,
-                                    &mut target,
-                                    x,
-                                    y,
-                                    &chars,
-                                    &attrs,
-                                    clip,
-                                )?;
-                                Ok(())
-                            }
-                            None => Ok(()),
+                let rendered: Result<()> = if let Some((key, resolved)) =
+                    dc_resolved_font(state, hdc, &mut font_engine)
+                {
+                    match resolve_text_target(state, hdc) {
+                        Some(ResolvedTextTarget {
+                            mut target,
+                            surface_hwnd,
+                        }) => {
+                            let band = render_run(
+                                engine,
+                                &mut font_engine,
+                                &resolved,
+                                &key,
+                                &mut target,
+                                x,
+                                y,
+                                &chars,
+                                &attrs,
+                                clip,
+                            )?;
+                            mark_surface_dirty(state, surface_hwnd, band.unwrap_or(IRect::empty()));
+                            Ok(())
                         }
-                    } else {
-                        Ok(())
-                    };
+                        None => Ok(()),
+                    }
+                } else {
+                    Ok(())
+                };
                 state.gdi_state().font_engine = font_engine;
                 rendered?;
             }

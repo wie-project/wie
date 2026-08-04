@@ -7,8 +7,9 @@ use super::listbox::render_control_text;
 use super::paint::fill_rect_clipped;
 use super::{
     COLOR_BTNFACE, COLOR_BTNHIGHLIGHT, COLOR_BTNSHADOW, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT,
-    ControlClassKind, ControlState, ES_MULTILINE, HitTestLayout, PaintCtx, PaintFont, Rect,
-    SEL_EMPTY, SEL_MULTICHAR, SEL_MULTILINE, SEL_TEXT, TextGeom, control_state, deliver_command,
+    ControlClassKind, ControlState, ES_MULTILINE, EditInvalidRows, EditInvalidation, HitTestLayout,
+    PaintCtx, PaintFont, Rect, SEL_EMPTY, SEL_MULTICHAR, SEL_MULTILINE, SEL_TEXT, TextGeom,
+    control_state, deliver_command,
 };
 use crate::gdi32::FontKey;
 use crate::gdi32::ResolvedWindow;
@@ -137,38 +138,122 @@ fn edit_state_for_window(state: &mut WinApiState, hwnd: u64) -> &mut ControlStat
 /// whether the text changed (callers deliver EN_CHANGE only then).
 pub(super) fn edit_char(state: &mut WinApiState, hwnd: u64, char_code: u64) -> bool {
     let ch = u32::try_from(char_code & 0xFFFF).unwrap_or(0);
-    let ws = state.window_state();
-    let Some(window) = ws
-        .windows
-        .iter_mut()
-        .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
-    else {
-        return false;
-    };
-    let style = window.style;
-    let ControlState::Edit {
-        caret,
-        sel_start,
-        sel_end,
-        goal_column,
-        limit,
-        style_bits,
-        modified,
-        handle_buffer,
-        undo_snapshot,
-        ..
-    } = edit_state_mut(&mut ws.control_states, hwnd, style)
-    else {
-        return false;
-    };
-    let text = &mut window.control_text;
-    let len = text.chars().count();
-    let (start, end) = normalized_selection(*sel_start, *sel_end, len);
-    match ch {
-        0x08 => {
-            // VK_BACK: delete the selection, or the character before the caret.
-            if start != end {
-                return replace_range(
+    // Phase 1: mutate the text (the window/control-state borrows end here).
+    let (changed, edit_start, crossed_lines) = {
+        let ws = state.window_state();
+        let Some(window) = ws
+            .windows
+            .iter_mut()
+            .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
+        else {
+            return false;
+        };
+        let style = window.style;
+        let ControlState::Edit {
+            caret,
+            sel_start,
+            sel_end,
+            goal_column,
+            limit,
+            style_bits,
+            modified,
+            handle_buffer,
+            undo_snapshot,
+            ..
+        } = edit_state_mut(&mut ws.control_states, hwnd, style)
+        else {
+            return false;
+        };
+        let text = &mut window.control_text;
+        let len = text.chars().count();
+        let (start, end) = normalized_selection(*sel_start, *sel_end, len);
+        match ch {
+            0x08 => {
+                // VK_BACK: delete the selection, or the character before the caret.
+                if start != end {
+                    let crossed = replace_crosses_lines(text, start, end, "");
+                    let changed = replace_range(
+                        text,
+                        EditMutation {
+                            caret,
+                            sel_start,
+                            sel_end,
+                            goal_column,
+                            modified,
+                            handle_buffer,
+                            undo_snapshot,
+                        },
+                        start,
+                        end,
+                        "",
+                        *limit,
+                    );
+                    (changed, start, crossed)
+                } else {
+                    let caret_pos = *caret;
+                    if caret_pos == 0 {
+                        (false, 0, false)
+                    } else {
+                        let crossed = text.chars().nth(caret_pos.saturating_sub(1)) == Some('\n');
+                        let changed = replace_range(
+                            text,
+                            EditMutation {
+                                caret,
+                                sel_start,
+                                sel_end,
+                                goal_column,
+                                modified,
+                                handle_buffer,
+                                undo_snapshot,
+                            },
+                            caret_pos.saturating_sub(1),
+                            caret_pos,
+                            "",
+                            *limit,
+                        );
+                        (changed, caret_pos.saturating_sub(1), crossed)
+                    }
+                }
+            }
+            // Enter inserts a line break only in a multiline EDIT; Escape and
+            // 0x7F (DEL) are never inserted as characters (DEL is handled by the
+            // WM_KEYDOWN VK_DELETE path).
+            0x0D => {
+                if *style_bits & ES_MULTILINE != 0 {
+                    let crossed = replace_crosses_lines(text, start, end, "\n");
+                    let changed = replace_range(
+                        text,
+                        EditMutation {
+                            caret,
+                            sel_start,
+                            sel_end,
+                            goal_column,
+                            modified,
+                            handle_buffer,
+                            undo_snapshot,
+                        },
+                        start,
+                        end,
+                        "\n",
+                        *limit,
+                    );
+                    (changed, start, crossed)
+                } else {
+                    (false, 0, false)
+                }
+            }
+            0x1B | 0x7F => (false, 0, false),
+            _ if ch >= 0x20 => {
+                let Some(c) = char::from_u32(ch) else {
+                    return false;
+                };
+                let (start, end) = if start == end {
+                    (*caret, *caret)
+                } else {
+                    (start, end)
+                };
+                let crossed = replace_crosses_lines(text, start, end, &c.to_string());
+                let changed = replace_range(
                     text,
                     EditMutation {
                         caret,
@@ -181,85 +266,20 @@ pub(super) fn edit_char(state: &mut WinApiState, hwnd: u64, char_code: u64) -> b
                     },
                     start,
                     end,
-                    "",
+                    &c.to_string(),
                     *limit,
                 );
+                (changed, start, crossed)
             }
-            let caret_pos = *caret;
-            if caret_pos == 0 {
-                return false;
-            }
-            replace_range(
-                text,
-                EditMutation {
-                    caret,
-                    sel_start,
-                    sel_end,
-                    goal_column,
-                    modified,
-                    handle_buffer,
-                    undo_snapshot,
-                },
-                caret_pos.saturating_sub(1),
-                caret_pos,
-                "",
-                *limit,
-            )
+            _ => (false, 0, false),
         }
-        // Enter inserts a line break only in a multiline EDIT; Escape and
-        // 0x7F (DEL) are never inserted as characters (DEL is handled by the
-        // WM_KEYDOWN VK_DELETE path).
-        0x0D => {
-            if *style_bits & ES_MULTILINE != 0 {
-                replace_range(
-                    text,
-                    EditMutation {
-                        caret,
-                        sel_start,
-                        sel_end,
-                        goal_column,
-                        modified,
-                        handle_buffer,
-                        undo_snapshot,
-                    },
-                    start,
-                    end,
-                    "\n",
-                    *limit,
-                )
-            } else {
-                false
-            }
-        }
-        0x1B | 0x7F => false,
-        _ if ch >= 0x20 => {
-            let Some(c) = char::from_u32(ch) else {
-                return false;
-            };
-            let (start, end) = if start == end {
-                (*caret, *caret)
-            } else {
-                (start, end)
-            };
-            replace_range(
-                text,
-                EditMutation {
-                    caret,
-                    sel_start,
-                    sel_end,
-                    goal_column,
-                    modified,
-                    handle_buffer,
-                    undo_snapshot,
-                },
-                start,
-                end,
-                &c.to_string(),
-                *limit,
-            )
-        }
-        _ => false,
+    };
+    // Phase 2: mark the rows the mutation dirtied for the next paint — a
+    // single-char insert repaints only its line's rows, not the whole EDIT.
+    if changed {
+        edit_invalidate_mutation(state, hwnd, edit_start, crossed_lines);
     }
+    changed
 }
 
 /// The mutable caret/selection/modify slice of an EDIT state, plus the cached
@@ -558,6 +578,7 @@ pub(super) fn edit_move_caret(state: &mut WinApiState, hwnd: u64, vk: u64) -> bo
             .resolve(&default_key, 16)
             .map(|resolved| (default_key, resolved)),
     };
+    let mut dirty_span: Option<(usize, usize)> = None;
     let moved = (|| {
         let ws = state.window_state();
         let Some(window) = ws
@@ -593,6 +614,7 @@ pub(super) fn edit_move_caret(state: &mut WinApiState, hwnd: u64, vk: u64) -> bo
         let text = &window.control_text;
         let len = text.chars().count();
         let old_caret = (*caret).min(len);
+        let (old_sel_start, old_sel_end) = (*sel_start, *sel_end);
         let multiline = *style_bits & ES_MULTILINE != 0;
         let vertical = multiline && matches!(vk, VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT);
         if vertical {
@@ -637,9 +659,27 @@ pub(super) fn edit_move_caret(state: &mut WinApiState, hwnd: u64, vk: u64) -> bo
             *sel_start = new_caret;
             *sel_end = new_caret;
         }
+        // The caret bar moved from the old position to the new one, and the
+        // selection highlight changed: both spans' rows must repaint.
+        let lo = old_sel_start
+            .min(old_sel_end)
+            .min(old_caret)
+            .min(new_caret)
+            .min(*sel_start)
+            .min(*sel_end);
+        let hi = old_sel_start
+            .max(old_sel_end)
+            .max(old_caret)
+            .max(new_caret)
+            .max(*sel_start)
+            .max(*sel_end);
+        dirty_span = Some((lo, hi));
         true
     })();
     state.gdi_state().font_engine = font_engine;
+    if let Some((lo, hi)) = dirty_span {
+        edit_invalidate_span(state, hwnd, lo, hi.saturating_add(1));
+    }
     moved
 }
 
@@ -702,107 +742,137 @@ fn caret_navigation_target(
 /// EDIT: VK_DELETE — delete the selection, or the character at the caret.
 /// Returns whether the text changed.
 pub(super) fn edit_delete_at_caret(state: &mut WinApiState, hwnd: u64) -> bool {
-    let ws = state.window_state();
-    let Some(window) = ws
-        .windows
-        .iter_mut()
-        .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
-    else {
-        return false;
-    };
-    let style = window.style;
-    let ControlState::Edit {
-        caret,
-        sel_start,
-        sel_end,
-        goal_column,
-        limit,
-        modified,
-        handle_buffer,
-        undo_snapshot,
-        ..
-    } = edit_state_mut(&mut ws.control_states, hwnd, style)
-    else {
-        return false;
-    };
-    let text = &mut window.control_text;
-    let len = text.chars().count();
-    let (start, end) = normalized_selection(*sel_start, *sel_end, len);
-    if start != end {
-        return replace_range(
-            text,
-            EditMutation {
-                caret,
-                sel_start,
-                sel_end,
-                goal_column,
-                modified,
-                handle_buffer,
-                undo_snapshot,
-            },
-            start,
-            end,
-            "",
-            *limit,
-        );
-    }
-    let caret_pos = *caret;
-    if caret_pos >= len {
-        return false;
-    }
-    replace_range(
-        text,
-        EditMutation {
+    // Phase 1: mutate the text (the window/control-state borrows end here).
+    let (changed, edit_start, crossed_lines) = {
+        let ws = state.window_state();
+        let Some(window) = ws
+            .windows
+            .iter_mut()
+            .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
+        else {
+            return false;
+        };
+        let style = window.style;
+        let ControlState::Edit {
             caret,
             sel_start,
             sel_end,
             goal_column,
+            limit,
             modified,
             handle_buffer,
             undo_snapshot,
-        },
-        caret_pos,
-        caret_pos.saturating_add(1),
-        "",
-        *limit,
-    )
+            ..
+        } = edit_state_mut(&mut ws.control_states, hwnd, style)
+        else {
+            return false;
+        };
+        let text = &mut window.control_text;
+        let len = text.chars().count();
+        let (start, end) = normalized_selection(*sel_start, *sel_end, len);
+        if start != end {
+            let crossed = replace_crosses_lines(text, start, end, "");
+            let changed = replace_range(
+                text,
+                EditMutation {
+                    caret,
+                    sel_start,
+                    sel_end,
+                    goal_column,
+                    modified,
+                    handle_buffer,
+                    undo_snapshot,
+                },
+                start,
+                end,
+                "",
+                *limit,
+            );
+            (changed, start, crossed)
+        } else {
+            let caret_pos = *caret;
+            if caret_pos >= len {
+                (false, 0, false)
+            } else {
+                let crossed =
+                    replace_crosses_lines(text, caret_pos, caret_pos.saturating_add(1), "");
+                let changed = replace_range(
+                    text,
+                    EditMutation {
+                        caret,
+                        sel_start,
+                        sel_end,
+                        goal_column,
+                        modified,
+                        handle_buffer,
+                        undo_snapshot,
+                    },
+                    caret_pos,
+                    caret_pos.saturating_add(1),
+                    "",
+                    *limit,
+                );
+                (changed, caret_pos, crossed)
+            }
+        }
+    };
+    if changed {
+        edit_invalidate_mutation(state, hwnd, edit_start, crossed_lines);
+    }
+    changed
 }
 
 /// EDIT: EM_SETSEL — set the selection. A negative argument means "end of
 /// text", so `(0, -1)` selects everything; the caret lands at the end edge.
 pub(super) fn edit_set_selection(state: &mut WinApiState, hwnd: u64, start: i32, end: i32) {
-    let ws = state.window_state();
-    let Some(window) = ws
-        .windows
-        .iter_mut()
-        .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
-    else {
-        return;
+    let span = {
+        let ws = state.window_state();
+        let Some(window) = ws
+            .windows
+            .iter_mut()
+            .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
+        else {
+            return;
+        };
+        let style = window.style;
+        let ControlState::Edit {
+            caret,
+            sel_start,
+            sel_end,
+            ..
+        } = edit_state_mut(&mut ws.control_states, hwnd, style)
+        else {
+            return;
+        };
+        let len = window.control_text.chars().count();
+        let start_us = if start < 0 {
+            len
+        } else {
+            usize::try_from(start).unwrap_or(len).min(len)
+        };
+        let end_us = if end < 0 {
+            len
+        } else {
+            usize::try_from(end).unwrap_or(len).min(len)
+        };
+        // The highlight moves from the old selection/caret to the new one:
+        // both spans' rows must repaint.
+        let lo = (*sel_start)
+            .min(*sel_end)
+            .min(*caret)
+            .min(start_us)
+            .min(end_us);
+        let hi = (*sel_start)
+            .max(*sel_end)
+            .max(*caret)
+            .max(start_us)
+            .max(end_us);
+        *sel_start = start_us.min(end_us);
+        *sel_end = start_us.max(end_us);
+        *caret = *sel_end;
+        (lo, hi)
     };
-    let style = window.style;
-    let ControlState::Edit {
-        caret,
-        sel_start,
-        sel_end,
-        ..
-    } = edit_state_mut(&mut ws.control_states, hwnd, style)
-    else {
-        return;
-    };
-    let len = window.control_text.chars().count();
-    let start_us = if start < 0 {
-        len
-    } else {
-        usize::try_from(start).unwrap_or(len).min(len)
-    };
-    let end_us = if end < 0 {
-        len
-    } else {
-        usize::try_from(end).unwrap_or(len).min(len)
-    };
-    *sel_start = start_us.min(end_us);
-    *sel_end = start_us.max(end_us);
-    *caret = *sel_end;
+    edit_invalidate_span(state, hwnd, span.0, span.1.saturating_add(1));
 }
 
 /// EDIT: EM_GETSEL — the current (start, end) character range, normalized.
@@ -988,48 +1058,57 @@ pub(super) fn edit_replace_selection(
 /// [`replace_range`] path, capturing an undo snapshot). Returns whether the
 /// text changed.
 fn edit_replace_selection_with(state: &mut WinApiState, hwnd: u64, replacement: &str) -> bool {
-    let ws = state.window_state();
-    let Some(window) = ws
-        .windows
-        .iter_mut()
-        .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
-    else {
-        return false;
-    };
-    let style = window.style;
-    let ControlState::Edit {
-        caret,
-        sel_start,
-        sel_end,
-        goal_column,
-        limit,
-        modified,
-        handle_buffer,
-        undo_snapshot,
-        ..
-    } = edit_state_mut(&mut ws.control_states, hwnd, style)
-    else {
-        return false;
-    };
-    let text = &mut window.control_text;
-    let len = text.chars().count();
-    let (start, end) = normalized_selection(*sel_start, *sel_end, len);
-    replace_range(
-        text,
-        EditMutation {
+    // Phase 1: mutate the text (the window/control-state borrows end here).
+    let (changed, edit_start, crossed_lines) = {
+        let ws = state.window_state();
+        let Some(window) = ws
+            .windows
+            .iter_mut()
+            .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
+        else {
+            return false;
+        };
+        let style = window.style;
+        let ControlState::Edit {
             caret,
             sel_start,
             sel_end,
             goal_column,
+            limit,
             modified,
             handle_buffer,
             undo_snapshot,
-        },
-        start,
-        end,
-        replacement,
-        *limit,
-    )
+            ..
+        } = edit_state_mut(&mut ws.control_states, hwnd, style)
+        else {
+            return false;
+        };
+        let text = &mut window.control_text;
+        let len = text.chars().count();
+        let (start, end) = normalized_selection(*sel_start, *sel_end, len);
+        let crossed = replace_crosses_lines(text, start, end, replacement);
+        let changed = replace_range(
+            text,
+            EditMutation {
+                caret,
+                sel_start,
+                sel_end,
+                goal_column,
+                modified,
+                handle_buffer,
+                undo_snapshot,
+            },
+            start,
+            end,
+            replacement,
+            *limit,
+        );
+        (changed, start, crossed)
+    };
+    if changed {
+        edit_invalidate_mutation(state, hwnd, edit_start, crossed_lines);
+    }
+    changed
 }
 
 /// EDIT: EM_CANUNDO — whether the single-level undo buffer holds a snapshot
@@ -1050,44 +1129,51 @@ pub(super) fn edit_can_undo(state: &WinApiState, hwnd: u64) -> bool {
 /// the buffer. Returns whether an undo happened (FALSE when the buffer is
 /// empty — there is no redo).
 pub(super) fn edit_undo(state: &mut WinApiState, hwnd: u64) -> bool {
-    let ws = state.window_state();
-    let Some(window) = ws
-        .windows
-        .iter_mut()
-        .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
-    else {
-        return false;
+    let restored = {
+        let ws = state.window_state();
+        let Some(window) = ws
+            .windows
+            .iter_mut()
+            .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
+        else {
+            return false;
+        };
+        let style = window.style;
+        let ControlState::Edit {
+            caret,
+            sel_start,
+            sel_end,
+            goal_column,
+            modified,
+            handle_buffer,
+            undo_snapshot,
+            ..
+        } = edit_state_mut(&mut ws.control_states, hwnd, style)
+        else {
+            return false;
+        };
+        let Some(snapshot) = undo_snapshot.take() else {
+            return false;
+        };
+        // Restore the pre-mutation text, caret, and selection. The take above
+        // cleared the buffer — single-level undo, so a second EM_UNDO is a no-op.
+        window.control_text = snapshot.text;
+        *caret = snapshot.caret;
+        *sel_start = snapshot.sel_start;
+        *sel_end = snapshot.sel_end;
+        // Undo is a text mutation: it dirties the modify flag, invalidates the
+        // cached EM_GETHANDLE buffer, and drops the vertical-movement goal column
+        // (the caret moved horizontally).
+        *modified = true;
+        *handle_buffer = 0;
+        *goal_column = None;
+        true
     };
-    let style = window.style;
-    let ControlState::Edit {
-        caret,
-        sel_start,
-        sel_end,
-        goal_column,
-        modified,
-        handle_buffer,
-        undo_snapshot,
-        ..
-    } = edit_state_mut(&mut ws.control_states, hwnd, style)
-    else {
-        return false;
-    };
-    let Some(snapshot) = undo_snapshot.take() else {
-        return false;
-    };
-    // Restore the pre-mutation text, caret, and selection. The take above
-    // cleared the buffer — single-level undo, so a second EM_UNDO is a no-op.
-    window.control_text = snapshot.text;
-    *caret = snapshot.caret;
-    *sel_start = snapshot.sel_start;
-    *sel_end = snapshot.sel_end;
-    // Undo is a text mutation: it dirties the modify flag, invalidates the
-    // cached EM_GETHANDLE buffer, and drops the vertical-movement goal column
-    // (the caret moved horizontally).
-    *modified = true;
-    *handle_buffer = 0;
-    *goal_column = None;
-    true
+    if restored {
+        // The restore can rewrite any line — a full repaint is the safe band.
+        edit_invalidate_full(state, hwnd);
+    }
+    restored
 }
 
 /// EDIT: EM_EMPTYUNDOBUFFER — discard any pending undo snapshot.
@@ -1350,11 +1436,15 @@ where
 /// rows fit in the client (`visible`), the full row count (`total`), and the
 /// visual row holding the caret (`caret_row`). All three derive from the same
 /// greedy width walk `paint_edit`'s layout runs, so the scroll math and the
-/// painted rows always agree. `None` when the window is gone.
+/// painted rows always agree. `wrap_width` rides along so the caret-blink
+/// invalidation can stamp the band it computes. `None` when the window is gone.
 struct EditScrollContext {
     visible: usize,
     total: usize,
     caret_row: usize,
+    /// The wrap column the context was resolved at (the row-invalidation
+    /// band stamp).
+    wrap_width: i32,
     /// The horizontal scroll range in px (widest line − text area); 0 when
     /// the H scrollbar is hidden (wrap-on or the content fits).
     h_overflow: usize,
@@ -1425,6 +1515,7 @@ fn edit_scroll_context(state: &mut WinApiState, hwnd: u64) -> Option<EditScrollC
         visible: area.visible,
         total: area.total,
         caret_row: area.caret_row,
+        wrap_width: area.wrap_width,
         h_overflow,
         h_page: usize::try_from(area.wrap_width.max(0)).unwrap_or(0),
         v_scroll_visible: area.v_scroll_visible,
@@ -1467,7 +1558,12 @@ pub(super) fn edit_scroll_vertical(
         _ => old,            // unknown codes: no-op
     };
     *first_visible_line = clamp_scroll_offset(target, context.total, context.visible);
-    *first_visible_line != old
+    let moved = *first_visible_line != old;
+    if moved {
+        // A scroll reflows the viewport: any pending row band is stale.
+        edit_invalidate_full(state, hwnd);
+    }
+    moved
 }
 
 /// EDIT: WM_HSCROLL — apply one horizontal scroll-bar request on a wrap-off
@@ -1504,7 +1600,12 @@ pub(super) fn edit_scroll_horizontal(
         _ => old, // unknown codes: no-op
     };
     *first_visible_column = target.min(context.h_overflow);
-    *first_visible_column != old
+    let moved = *first_visible_column != old;
+    if moved {
+        // A scroll reflows the viewport: any pending row band is stale.
+        edit_invalidate_full(state, hwnd);
+    }
+    moved
 }
 
 /// EDIT: WM_MOUSEWHEEL — scroll the multiline EDIT vertically. `wparam`'s
@@ -1536,7 +1637,12 @@ pub(super) fn edit_mouse_wheel(state: &mut WinApiState, hwnd: u64, wparam: u64) 
         old.saturating_add(usize::try_from(lines.saturating_neg()).unwrap_or(0))
     };
     *first_visible_line = clamp_scroll_offset(target, context.total, context.visible);
-    *first_visible_line != old
+    let moved = *first_visible_line != old;
+    if moved {
+        // A scroll reflows the viewport: any pending row band is stale.
+        edit_invalidate_full(state, hwnd);
+    }
+    moved
 }
 
 // ── Task 2.5: mouse caret placement, drag selection, double-click ──────────
@@ -1719,28 +1825,36 @@ pub(super) fn edit_mouse_down(state: &mut WinApiState, hwnd: u64, x: i32, y: i32
     let Some(index) = edit_char_at_point(state, hwnd, x, y) else {
         return;
     };
-    let ws = state.window_state();
-    let style = ws
-        .windows
-        .iter()
-        .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
-        .map_or(0, |w| w.style);
-    let ControlState::Edit {
-        caret,
-        sel_start,
-        sel_end,
-        goal_column,
-        ..
-    } = edit_state_mut(&mut ws.control_states, hwnd, style)
-    else {
-        return;
+    let span = {
+        let ws = state.window_state();
+        let style = ws
+            .windows
+            .iter()
+            .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
+            .map_or(0, |w| w.style);
+        let ControlState::Edit {
+            caret,
+            sel_start,
+            sel_end,
+            goal_column,
+            ..
+        } = edit_state_mut(&mut ws.control_states, hwnd, style)
+        else {
+            return;
+        };
+        // The click moves the caret (and collapses the selection): the rows
+        // holding the old and new caret/selection spans must repaint.
+        let lo = (*sel_start).min(*sel_end).min(*caret).min(index);
+        let hi = (*sel_start).max(*sel_end).max(*caret).max(index);
+        *caret = index;
+        *sel_start = index;
+        *sel_end = index;
+        // A click is horizontal movement: the vertical-movement goal column
+        // is stale (the same clearing horizontal keys apply).
+        *goal_column = None;
+        (lo, hi)
     };
-    *caret = index;
-    *sel_start = index;
-    *sel_end = index;
-    // A click is horizontal movement: the vertical-movement goal column is
-    // stale (the same clearing horizontal keys apply).
-    *goal_column = None;
+    edit_invalidate_span(state, hwnd, span.0, span.1.saturating_add(1));
     // Task 2.4 handoff: a click in the partial strip below the last full
     // visible row (or any off-viewport hit) must bring the caret row into
     // view. The dispatch arm invalidates unconditionally after the handler
@@ -1846,37 +1960,62 @@ pub(super) fn edit_mouse_move(state: &mut WinApiState, hwnd: u64, x: i32, y: i32
     let Some(index) = edit_char_at_point(state, hwnd, x, y) else {
         return false;
     };
-    let ws = state.window_state();
-    let style = ws
-        .windows
-        .iter()
-        .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
-        .map_or(0, |w| w.style);
-    let ControlState::Edit {
-        caret,
-        sel_start,
-        sel_end,
-        goal_column,
-        ..
-    } = edit_state_mut(&mut ws.control_states, hwnd, style)
-    else {
-        return false;
+    let mut dirty_span: Option<(usize, usize)> = None;
+    let changed = {
+        let ws = state.window_state();
+        let style = ws
+            .windows
+            .iter()
+            .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
+            .map_or(0, |w| w.style);
+        let ControlState::Edit {
+            caret,
+            sel_start,
+            sel_end,
+            goal_column,
+            ..
+        } = edit_state_mut(&mut ws.control_states, hwnd, style)
+        else {
+            return false;
+        };
+        if index == *caret {
+            false
+        } else {
+            let (old_sel_start, old_sel_end) = (*sel_start, *sel_end);
+            let old_caret = *caret;
+            let anchor = if *caret == *sel_start {
+                *sel_end
+            } else {
+                *sel_start
+            };
+            *sel_start = anchor.min(index);
+            *sel_end = anchor.max(index);
+            *caret = index;
+            // Horizontal movement drops the vertical-movement goal column like
+            // any horizontal key.
+            *goal_column = None;
+            // The drag extended the selection: the old and new spans' rows
+            // must repaint.
+            let lo = old_sel_start
+                .min(old_sel_end)
+                .min(old_caret)
+                .min(index)
+                .min(*sel_start)
+                .min(*sel_end);
+            let hi = old_sel_start
+                .max(old_sel_end)
+                .max(old_caret)
+                .max(index)
+                .max(*sel_start)
+                .max(*sel_end);
+            dirty_span = Some((lo, hi));
+            true
+        }
     };
-    if index == *caret {
-        return false;
+    if let Some((lo, hi)) = dirty_span {
+        edit_invalidate_span(state, hwnd, lo, hi.saturating_add(1));
     }
-    let anchor = if *caret == *sel_start {
-        *sel_end
-    } else {
-        *sel_start
-    };
-    *sel_start = anchor.min(index);
-    *sel_end = anchor.max(index);
-    *caret = index;
-    // Horizontal movement drops the vertical-movement goal column like any
-    // horizontal key.
-    *goal_column = None;
-    true
+    changed
 }
 
 /// The in-flight thumb drag of `hwnd`, if any.
@@ -1928,7 +2067,12 @@ fn edit_scrollbar_drag(
         };
         let old = *first_visible_line;
         *first_visible_line = offset.min(span);
-        *first_visible_line != old
+        let moved = *first_visible_line != old;
+        if moved {
+            // A scroll reflows the viewport: any pending row band is stale.
+            edit_invalidate_full(state, hwnd);
+        }
+        moved
     } else {
         let ControlState::Edit {
             first_visible_column,
@@ -1939,7 +2083,12 @@ fn edit_scrollbar_drag(
         };
         let old = *first_visible_column;
         *first_visible_column = offset.min(span);
-        *first_visible_column != old
+        let moved = *first_visible_column != old;
+        if moved {
+            // A scroll reflows the viewport: any pending row band is stale.
+            edit_invalidate_full(state, hwnd);
+        }
+        moved
     }
 }
 
@@ -1990,33 +2139,49 @@ pub(super) fn edit_mouse_dblclk(state: &mut WinApiState, hwnd: u64, x: i32, y: i
     let Some(index) = edit_char_at_point(state, hwnd, x, y) else {
         return;
     };
-    let ws = state.window_state();
-    let Some(window) = ws
-        .windows
-        .iter_mut()
-        .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
-    else {
-        return;
+    let span = {
+        let ws = state.window_state();
+        let Some(window) = ws
+            .windows
+            .iter_mut()
+            .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
+        else {
+            return;
+        };
+        let style = window.style;
+        let len = window.control_text.chars().count();
+        let (word_start, word_end) = word_bounds(&window.control_text, index);
+        let ControlState::Edit {
+            caret,
+            sel_start,
+            sel_end,
+            goal_column,
+            ..
+        } = edit_state_mut(&mut ws.control_states, hwnd, style)
+        else {
+            return;
+        };
+        // The word selection replaces the old selection: both spans' rows
+        // must repaint.
+        let lo = (*sel_start)
+            .min(*sel_end)
+            .min(*caret)
+            .min(word_start)
+            .min(word_end);
+        let hi = (*sel_start)
+            .max(*sel_end)
+            .max(*caret)
+            .max(word_start)
+            .max(word_end);
+        *caret = word_end.min(len);
+        *sel_start = word_start.min(len);
+        *sel_end = word_end.min(len);
+        // The caret moved horizontally (to the word end); drop any remembered
+        // vertical-movement goal column.
+        *goal_column = None;
+        (lo, hi)
     };
-    let style = window.style;
-    let len = window.control_text.chars().count();
-    let (word_start, word_end) = word_bounds(&window.control_text, index);
-    let ControlState::Edit {
-        caret,
-        sel_start,
-        sel_end,
-        goal_column,
-        ..
-    } = edit_state_mut(&mut ws.control_states, hwnd, style)
-    else {
-        return;
-    };
-    *caret = word_end.min(len);
-    *sel_start = word_start.min(len);
-    *sel_end = word_end.min(len);
-    // The caret moved horizontally (to the word end); drop any remembered
-    // vertical-movement goal column.
-    *goal_column = None;
+    edit_invalidate_span(state, hwnd, span.0, span.1.saturating_add(1));
     // Same Task 2.4 handoff as a single click: a double-click on a row below
     // the last full visible row must scroll the selected word into view (the
     // dispatch arm's unconditional invalidate covers the repaint).
@@ -2055,7 +2220,12 @@ pub(super) fn edit_scroll_caret(state: &mut WinApiState, hwnd: u64) -> bool {
             context.visible,
         );
     }
-    *first_visible_line != old
+    let moved = *first_visible_line != old;
+    if moved {
+        // A scroll reflows the viewport: any pending row band is stale.
+        edit_invalidate_full(state, hwnd);
+    }
+    moved
 }
 
 /// EDIT: EM_GETMODIFY — the modified flag (0 when the state was never seeded).
@@ -2182,6 +2352,9 @@ pub(super) fn edit_set_handle(
     // cached handle is the guest's to LocalFree (Windows frees it on the
     // control's next buffer reallocation).
     *handle_buffer = buffer;
+    // A whole-text adoption rewrites every row — a full repaint is the safe
+    // band (and the adoption marks the window for the next paint cycle).
+    edit_invalidate_full(state, hwnd);
     Ok(true)
 }
 
@@ -2352,6 +2525,355 @@ pub(super) fn edit_caret_tick(state: &mut WinApiState, hwnd: u64) -> bool {
         return true;
     }
     false
+}
+
+// ── Row-level invalidation (the edit optimization lane) ──────────────────
+//
+// The mutating ops mark the VISUAL rows they touched dirty (a
+// `ControlState::Edit::invalid_rows` band); `paint_edit` clips its row loop
+// to the band and the paint erase covers the same rows, so a caret blink or
+// a typed character repaints only the changed rows instead of the whole
+// EDIT. Structural changes (a scroll move, WM_SETFONT, a whole-text
+// replacement, a resize reflow) reset the band to full. The band's rows are
+// resolved with the stored font through the shared `edit_text_area` seam —
+// the same greedy wrap walk the paint and the scroll math run — so the
+// clipped rows, the erased band, and the painted rows always agree.
+
+/// The window geometry an EDIT's invalidation math needs: its text, client
+/// size, and creation style (`None` when the window is gone).
+fn edit_geometry(state: &WinApiState, hwnd: u64) -> Option<(String, i32, i32, u32)> {
+    state.try_window_state().and_then(|ws| {
+        ws.windows
+            .iter()
+            .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
+            .map(|w| (w.control_text.clone(), w.width, w.height, w.style))
+    })
+}
+
+/// The caret character index of `hwnd`'s EDIT state (0 when never touched).
+#[must_use]
+fn edit_caret_of(state: &WinApiState, hwnd: u64) -> usize {
+    match control_state(state, hwnd) {
+        Some(ControlState::Edit { caret, .. }) => *caret,
+        _ => 0,
+    }
+}
+
+/// Whether replacing the char span [start, end) of `text` with `replacement`
+/// crosses a line boundary — the replacement or the removed span contains a
+/// `\n`. A line structure change shifts every row below the edit, so the
+/// invalidation must cover everything from that line down.
+#[must_use]
+fn replace_crosses_lines(text: &str, start: usize, end: usize, replacement: &str) -> bool {
+    if replacement.contains('\n') {
+        return true;
+    }
+    let start_byte = byte_index_of_char(text, start);
+    let end_byte = byte_index_of_char(text, end);
+    text.get(start_byte..end_byte)
+        .is_some_and(|span| span.contains('\n'))
+}
+
+/// The visual-row span of the char range [lo, hi) of `text` — the first and
+/// last visual rows holding any character of the range (a caret-only range,
+/// lo == hi, spans the single row of that position; a position on a line's
+/// trailing `\n` belongs to that line). Walks the same greedy wrap rule as
+/// `visual_rows`/`layout_visible_lines` at the same wrap column, so the rows
+/// it reports are exactly the rows the paint lays out — the seam that keeps
+/// the clipped row band and the painted rows in agreement.
+#[must_use]
+fn span_row_range<F>(
+    text: &str,
+    wrap_width: i32,
+    wrap: bool,
+    lo: usize,
+    hi: usize,
+    advance: &mut F,
+) -> (usize, usize)
+where
+    F: FnMut(char) -> i32,
+{
+    let mut first_row = usize::MAX;
+    let mut last_row = 0_usize;
+    let mut line_start_char = 0_usize;
+    let mut visual = 0_usize;
+    let mut found = false;
+    for line_text in text.split('\n') {
+        let row_start = visual;
+        let line_end_char = line_start_char.saturating_add(line_text.chars().count());
+        // Count this line's visual rows with the same greedy wrap walk.
+        let mut x = 0_i32;
+        for ch in line_text.chars() {
+            let w = advance(ch);
+            if wrap && x > 0 && x.saturating_add(w) > wrap_width {
+                visual = visual.saturating_add(1);
+                x = 0;
+            }
+            x = x.saturating_add(w);
+        }
+        visual = visual.saturating_add(1);
+        // A line covers the positions [line_start, line_end_char], where
+        // line_end_char is its trailing `\n` (or the text end). The line
+        // overlaps the range when any position of [lo, hi) falls inside that
+        // span (a caret-only range tests its single position).
+        let overlaps = if lo == hi {
+            lo >= line_start_char && lo <= line_end_char
+        } else {
+            lo <= line_end_char && hi > line_start_char
+        };
+        if overlaps {
+            first_row = first_row.min(row_start);
+            last_row = last_row.max(visual.saturating_sub(1));
+            found = true;
+        }
+        line_start_char = line_end_char.saturating_add(1);
+    }
+    if !found {
+        // A position past the text (or empty text) lands on the last row.
+        (visual.saturating_sub(1), visual.saturating_sub(1))
+    } else {
+        (first_row, last_row)
+    }
+}
+
+/// The pending row band of an EDIT when it is still valid against the
+/// CURRENT layout: it must have been computed at the current wrap width AND
+/// the control must have painted before (the first paint covers everything —
+/// the surface behind a never-painted control is undefined, so a partial
+/// repaint would leave holes). `None` = paint every visible row.
+#[must_use]
+fn band_is_current(
+    invalid: EditInvalidation,
+    wrap_width: i32,
+    painted_before: bool,
+) -> Option<EditInvalidRows> {
+    match invalid {
+        EditInvalidation::Band(band) if band.wrap_width == wrap_width && painted_before => {
+            Some(band)
+        }
+        _ => None,
+    }
+}
+
+/// The client-relative y band (top, bottom-exclusive) an EDIT must erase and
+/// repaint on its next paint: the pending row band's rows, or the WHOLE
+/// client for a full repaint (no pending band, a structural change, a stale
+/// band whose wrap width no longer matches the layout — a resize reflowed
+/// it — or the first paint of a never-painted control). `paint_edit` clips
+/// its row loop to the same band, so a partial repaint never leaves stale
+/// pixels and never wipes the untouched rows. `line_h`/`advance` come from
+/// the caller's resolved font (the same resolution the paint uses); the
+/// returned y is client-relative, the caller adds its own offset.
+pub(super) fn edit_dirty_band<F>(
+    state: &WinApiState,
+    hwnd: u64,
+    text: &str,
+    client: (i32, i32),
+    line_h: i32,
+    style: u32,
+    advance: &mut F,
+) -> (i32, i32)
+where
+    F: FnMut(char) -> i32,
+{
+    let (invalid, first_visible, caret, last_paint_rows) = match control_state(state, hwnd) {
+        Some(ControlState::Edit {
+            invalid_rows,
+            first_visible_line,
+            caret,
+            last_paint_rows,
+            ..
+        }) => (*invalid_rows, *first_visible_line, *caret, *last_paint_rows),
+        _ => (EditInvalidation::Full, 0, 0, 0),
+    };
+    let (width, height) = client;
+    let area = edit_text_area(text, width, height, line_h, style, caret, advance);
+    let Some(band) = band_is_current(invalid, area.wrap_width, last_paint_rows > 0) else {
+        return (0, height);
+    };
+    // Clamp the band to the visible text rows; an off-screen band (a stale
+    // range below the last row) is not visible — but a full erase is the
+    // safe fallback and never leaves stale pixels.
+    let first = first_visible.min(area.total.saturating_sub(1));
+    let lo = band.lo.max(first);
+    let hi = band.hi.min(area.total.saturating_sub(1));
+    if lo > hi {
+        return (0, height);
+    }
+    let base_y = if style & ES_MULTILINE != 0 {
+        0
+    } else {
+        height.saturating_sub(line_h).saturating_div(2).max(0)
+    };
+    let top = base_y.saturating_add(
+        i32::try_from(lo.saturating_sub(first))
+            .unwrap_or(0)
+            .saturating_mul(line_h),
+    );
+    let bottom = base_y.saturating_add(
+        i32::try_from(hi.saturating_sub(first))
+            .unwrap_or(0)
+            .saturating_add(1)
+            .saturating_mul(line_h),
+    );
+    (top.max(0).min(height), bottom.max(0).min(height))
+}
+
+/// Mark the visual rows `lo..=hi` dirty for the next paint, unioning with
+/// any pending band (two mutations before one paint both repaint). A pending
+/// full repaint — or a pending band computed at a different wrap width (the
+/// layout reflowed, so the old rows no longer exist as numbered) — stays
+/// full. Marks the window invalidated so the next paint cycle consumes the
+/// band.
+pub(super) fn edit_invalidate_rows(
+    state: &mut WinApiState,
+    hwnd: u64,
+    lo: usize,
+    hi: usize,
+    wrap_width: i32,
+) {
+    let ws = state.window_state();
+    let style = ws
+        .windows
+        .iter()
+        .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
+        .map_or(0, |w| w.style);
+    let ControlState::Edit { invalid_rows, .. } =
+        edit_state_mut(&mut ws.control_states, hwnd, style)
+    else {
+        return;
+    };
+    let next = match *invalid_rows {
+        EditInvalidation::Full => EditInvalidation::Full,
+        EditInvalidation::Band(pending) if pending.wrap_width != wrap_width => {
+            EditInvalidation::Full
+        }
+        EditInvalidation::Band(pending) => EditInvalidation::Band(EditInvalidRows {
+            lo: pending.lo.min(lo),
+            hi: pending.hi.max(hi),
+            wrap_width,
+        }),
+        EditInvalidation::Clean => EditInvalidation::Band(EditInvalidRows { lo, hi, wrap_width }),
+    };
+    *invalid_rows = next;
+    super::invalidate(state, hwnd);
+}
+
+/// Mark the whole EDIT dirty for the next paint — every structural change: a
+/// scroll move, a font change, a whole-text replacement, a resize reflow.
+/// Sticky: a later mutation band cannot narrow a pending full repaint. Marks
+/// the window invalidated.
+pub(super) fn edit_invalidate_full(state: &mut WinApiState, hwnd: u64) {
+    if let Some(ControlState::Edit { invalid_rows, .. }) = state
+        .window_state()
+        .control_states
+        .get_mut(&crate::handles::Hwnd::from(hwnd))
+    {
+        *invalid_rows = EditInvalidation::Full;
+    }
+    super::invalidate(state, hwnd);
+}
+
+/// Reset an EDIT's pending invalidation to [`EditInvalidation::Full`]
+/// WITHOUT marking the window — callers that already invalidate (or must
+/// not, e.g. a `redraw = 0` `WM_SETFONT`) control the window flag
+/// themselves. Non-seeding: a control with no Edit state yet is untouched.
+pub(super) fn edit_reset_invalid_rows(state: &mut WinApiState, hwnd: u64) {
+    if let Some(ControlState::Edit { invalid_rows, .. }) = state
+        .window_state()
+        .control_states
+        .get_mut(&crate::handles::Hwnd::from(hwnd))
+    {
+        *invalid_rows = EditInvalidation::Full;
+    }
+}
+
+/// Mark the visual rows of the char span [lo, hi) of `hwnd`'s text dirty for
+/// the next paint — every row holding any character of the span (a
+/// caret-only span, lo == hi, dirties the single row of that position).
+/// Resolved with the stored control font through the shared
+/// `edit_text_area` seam — the same resolution the paint and the scroll math
+/// use, so the clipped rows and the painted rows always agree. Unions with
+/// any pending band. Marks the window invalidated. No-op when the window (or
+/// its Edit state) is gone.
+pub(super) fn edit_invalidate_span(state: &mut WinApiState, hwnd: u64, lo: usize, hi: usize) {
+    let Some((text, width, height, style)) = edit_geometry(state, hwnd) else {
+        return;
+    };
+    // The font engine is taken out of gdi state so the advance closure can
+    // run next to `state` (the established pattern); it is put back
+    // unconditionally. Safe under the single shared WinApiState mutex — the
+    // take and the put cannot interleave with another handler's.
+    let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
+    let default_key = FontKey::default();
+    let key_and_resolved = match crate::gdi32::window_font_resolution(state, hwnd, &mut font_engine)
+    {
+        Some(key_and_resolved) => Some(key_and_resolved),
+        None => font_engine
+            .resolve(&default_key, 16)
+            .map(|resolved| (default_key, resolved)),
+    };
+    let band = match &key_and_resolved {
+        Some((key, resolved)) => {
+            let line_h = resolved.line_height();
+            let caret = edit_caret_of(state, hwnd);
+            let wrap = edit_wrap_from_style(style);
+            let advance = &mut |ch: char| font_engine.char_advance(resolved, key, ch);
+            let area = edit_text_area(&text, width, height, line_h, style, caret, advance);
+            let (first, last) = span_row_range(&text, area.wrap_width, wrap, lo, hi, advance);
+            Some((first, last, area.wrap_width))
+        }
+        None => None,
+    };
+    state.gdi_state().font_engine = font_engine;
+    let Some((first, last, wrap_width)) = band else {
+        return;
+    };
+    edit_invalidate_rows(state, hwnd, first, last, wrap_width);
+}
+
+/// Mark the rows a text mutation dirtied for the next paint: every visual
+/// row of the logical line holding the edit start (a wrapped line reflows as
+/// a whole), or everything from that line down when the edit crossed a line
+/// boundary (`\n` inserted/removed — the rows below shift position).
+pub(super) fn edit_invalidate_mutation(
+    state: &mut WinApiState,
+    hwnd: u64,
+    char_index: usize,
+    crossed_lines: bool,
+) {
+    let Some((text, _, _, _)) = edit_geometry(state, hwnd) else {
+        return;
+    };
+    let line = line_from_char(&text, char_index);
+    let line_start = line_index_of(&text, line).unwrap_or(0);
+    let line_end = line_start.saturating_add(line_char_len(&text, line).unwrap_or(0));
+    let hi = if crossed_lines {
+        text.chars().count()
+    } else {
+        line_end
+    };
+    edit_invalidate_span(state, hwnd, line_start, hi);
+}
+
+/// Narrow the caret-blink repaint to the caret's row: the blink only toggles
+/// the 1 px × line-height caret bar, so the row holding the caret is all
+/// that is dirty (the row repaint erases the bar and redraws the row's text
+/// under it). Marks the window invalidated like `edit_invalidate_rows`.
+/// Falls back to a plain full-window invalidate when the layout cannot be
+/// resolved.
+pub(super) fn edit_invalidate_caret(state: &mut WinApiState, hwnd: u64) {
+    let Some(context) = edit_scroll_context(state, hwnd) else {
+        super::invalidate(state, hwnd);
+        return;
+    };
+    edit_invalidate_rows(
+        state,
+        hwnd,
+        context.caret_row,
+        context.caret_row,
+        context.wrap_width,
+    );
 }
 
 /// Whether the Shift key is held, per the guest keyboard state.
@@ -2681,10 +3203,13 @@ fn paint_horizontal_scrollbar(
 ///
 /// Glyphs are proportional, so the caret and selection x positions are the
 /// SUMMED advances of the preceding characters (matching the rendered text
-/// exactly). Each visual row is drawn in three passes — the whole row in
-/// COLOR_WINDOWTEXT, then the selected run re-rendered in COLOR_HIGHLIGHTTEXT
-/// over its COLOR_HIGHLIGHT cells — and the caret bar (1 px, full line
-/// height) is only drawn while the control has focus.
+/// exactly). The row loop is clipped to the pending invalid row band
+/// (`ControlState::Edit::invalid_rows`) — a caret blink or a typed character
+/// repaints only the rows it touched, while the paint erase covers the same
+/// band — so the untouched rows keep their pixels. Each row is drawn in the
+/// compositing order below (see the comment in the loop for why the selected
+/// run must be re-rendered rather than drawn once per-glyph), and the caret
+/// bar (1 px, full line height) is only drawn while the control has focus.
 pub(super) fn paint_edit(
     ctx: &mut PaintCtx<'_>,
     info: &ResolvedWindow,
@@ -2695,26 +3220,38 @@ pub(super) fn paint_edit(
     let len = text.chars().count();
     let focused = find_window(ctx.state, info.dc_window.as_u64())
         .is_some_and(|w| w.flags.contains(WindowFlags::FOCUSED));
-    let (sel_start, sel_end, caret, first_visible_line, first_visible_column, caret_on) =
-        match control_state(ctx.state, info.dc_window.as_u64()) {
-            Some(ControlState::Edit {
-                caret,
-                sel_start,
-                sel_end,
-                first_visible_line,
-                first_visible_column,
-                caret_on,
-                ..
-            }) => (
-                (*sel_start).min(*sel_end),
-                (*sel_start).max(*sel_end),
-                *caret,
-                *first_visible_line,
-                *first_visible_column,
-                *caret_on,
-            ),
-            _ => (0, 0, 0, 0, 0, true),
-        };
+    let (
+        sel_start,
+        sel_end,
+        caret,
+        first_visible_line,
+        first_visible_column,
+        caret_on,
+        invalid_rows,
+        last_paint_rows,
+    ) = match control_state(ctx.state, info.dc_window.as_u64()) {
+        Some(ControlState::Edit {
+            caret,
+            sel_start,
+            sel_end,
+            first_visible_line,
+            first_visible_column,
+            caret_on,
+            invalid_rows,
+            last_paint_rows,
+            ..
+        }) => (
+            (*sel_start).min(*sel_end),
+            (*sel_start).max(*sel_end),
+            *caret,
+            *first_visible_line,
+            *first_visible_column,
+            *caret_on,
+            *invalid_rows,
+            *last_paint_rows,
+        ),
+        _ => (0, 0, 0, 0, 0, true, EditInvalidation::Full, 0),
+    };
     let (sel_start, sel_end, caret) = (sel_start.min(len), sel_end.min(len), caret.min(len));
     let line_h = font.resolved.line_height();
     // The multiline/wrap/alignment decisions read the LIVE creation style
@@ -2785,11 +3322,22 @@ pub(super) fn paint_edit(
         .saturating_sub(h_strip);
     let clip = Some((info.offset_x, info.offset_y, text_right, text_bottom));
     let has_selection = focused && sel_start != sel_end;
+    // The row band to repaint: the pending invalid rows (when still valid
+    // against the current layout), or every visible row — a full repaint, a
+    // stale band (the wrap width changed underneath it), or the first paint
+    // (the surface behind a never-painted control is undefined, so a partial
+    // repaint would leave holes). The paint erase covers the same band.
+    let first_row = if multiline { first_visible_line } else { 0 };
+    let (band_lo, band_hi) =
+        match band_is_current(invalid_rows, area.wrap_width, last_paint_rows > 0) {
+            Some(band) => (band.lo, band.hi),
+            None => (0, usize::MAX),
+        };
     let rows = layout_visible_lines(
         text,
         area.wrap_width,
         line_h,
-        if multiline { first_visible_line } else { 0 },
+        first_row,
         wrap,
         edit_style & ES_ALIGN_MASK,
         &mut |ch| font.engine.char_advance(font.resolved, font.key, ch),
@@ -2801,14 +3349,35 @@ pub(super) fn paint_edit(
     } else {
         0
     };
-
+    // `layout_visible_lines` emits rows from `first_row` on, so segment i
+    // holds visual row `first_row + i`; the band maps to segment indices
+    // directly (rows above the viewport saturate to segment 0, which is
+    // merely an over-invalidation and never a stale pixel).
+    let seg_lo = band_lo.saturating_sub(first_row);
+    let seg_hi = band_hi.saturating_sub(first_row);
+    let mut painted_rows = 0_usize;
     let mut caret_drawn = false;
-    for row in &rows {
+    for (i, row) in rows.iter().enumerate() {
+        if i < seg_lo || i > seg_hi {
+            continue;
+        }
         let y = base_y.saturating_add(row.y);
         if y >= text_bottom {
             break;
         }
+        painted_rows = painted_rows.saturating_add(1);
         let x = geom.tx.saturating_sub(h_shift).saturating_add(row.x);
+        // The selected cells are drawn in a FIXED compositing order — the
+        // COLOR_HIGHLIGHT fill, then the whole row in COLOR_WINDOWTEXT, then
+        // the selected run re-rendered in COLOR_HIGHLIGHTTEXT — and that
+        // re-render is load-bearing, NOT a per-glyph single pass. The
+        // rasterizer blends with coverage alpha (`blend_pixel`: source-over),
+        // so a selected glyph's final pixels are
+        // WHITE-over-(COLOR_WINDOWTEXT-over-COLOR_HIGHLIGHT): a single
+        // white-over-HIGHLIGHT pass would compute different anti-aliased edge
+        // pixels, and the micro-suite and the paint pixel tests assert exact
+        // pixels. The two-pass stays; each glyph's rasterize is a font-cache
+        // hit and the extra blend covers only the selected cells.
         // Pass 1: fill the selected cells with COLOR_HIGHLIGHT (behind text).
         let (sel_lo, sel_hi) = if has_selection {
             selection_overlap(row, sel_start, sel_end)
@@ -2936,6 +3505,24 @@ pub(super) fn paint_edit(
             area.max_line_width,
             area.wrap_width,
         );
+    }
+    // Consume the band: the next paint starts clean (the window's own
+    // `invalidated` flag drives the next cycle), and the coverage counter
+    // records how many rows this paint drew — the row-level invalidation
+    // gate (typing one char paints ≤ the rows it changed; a structural
+    // change still paints every visible row).
+    if let Some(ControlState::Edit {
+        invalid_rows,
+        last_paint_rows,
+        ..
+    }) = ctx
+        .state
+        .window_state()
+        .control_states
+        .get_mut(&info.dc_window)
+    {
+        *invalid_rows = EditInvalidation::Clean;
+        *last_paint_rows = painted_rows;
     }
     Ok(())
 }
