@@ -859,7 +859,12 @@ pub fn handle_set_window_placement(ctx: &mut HandlerContext<'_>) -> Result<WinAp
         // `GuestHandle::take_host_geometry_request` (wie-runtime session
         // window layer).
         if geometry_changed {
-            state.window_state().host_geometry_request = Some((left, top, width, height));
+            let ws = state.window_state();
+            ws.host_geometry_request = Some((left, top, width, height));
+            // Tag the request with the hwnd it was applied to, so the host
+            // can route the move to the matching winit window (multi-window
+            // presentation).
+            ws.host_geometry_hwnd = Some(window_handle);
             if let Some(wake) = state.present().wake.as_ref() {
                 wake();
             }

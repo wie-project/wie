@@ -113,6 +113,14 @@ pub struct WindowState {
     /// window layer) so the host presenter can move the real window. `None`
     /// when no geometry change is pending.
     pub host_geometry_request: Option<(i32, i32, i32, i32)>,
+    /// The hwnd the pending [`Self::host_geometry_request`] was applied to.
+    ///
+    /// Kept as a sibling slot (not folded into the tuple) so the winapi
+    /// handler and its tests keep reading `host_geometry_request` unchanged;
+    /// the runtime's `take_host_geometry_request` returns both, letting the
+    /// host apply the move to the matching winit window when the guest has
+    /// more than one top-level.
+    pub host_geometry_hwnd: Option<u64>,
     pub(crate) tick_count: u64,
     pub keyboard_state: KeyboardState,
     pub(crate) next_timer_id: u64,
@@ -213,6 +221,7 @@ impl Default for WindowState {
             window_width: 0,
             window_height: 0,
             host_geometry_request: None,
+            host_geometry_hwnd: None,
             tick_count: 0,
             keyboard_state: KeyboardState::default(),
             timers: Vec::new(),

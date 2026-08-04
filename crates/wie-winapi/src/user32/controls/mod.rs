@@ -12,16 +12,16 @@
 use anyhow::Result;
 
 use super::{
-    find_window, find_window_mut, high_word, low_i32, low_word, make_command_wparam,
-    read_guest_ansi_lossy, read_guest_utf16_lossy, write_guest_u32, CommandPayload,
-    GuestCallbackRequest, WinApiControlSignal, WinApiState, WinMsg, WindowClassIdentifier,
-    BN_CLICKED, BST_FOCUS, BST_PUSHED, BS_DEFPUSHBUTTON, DLGC_BUTTON, DLGC_DEFPUSHBUTTON,
-    DLGC_UNDEFPUSHBUTTON, DLGC_WANTCHARS, EN_HSCROLL, EN_VSCROLL, VK_DELETE, VK_DOWN, VK_END,
-    VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SPACE, VK_UP, WM_COMMAND,
+    BN_CLICKED, BS_DEFPUSHBUTTON, BST_FOCUS, BST_PUSHED, CommandPayload, DLGC_BUTTON,
+    DLGC_DEFPUSHBUTTON, DLGC_UNDEFPUSHBUTTON, DLGC_WANTCHARS, EN_HSCROLL, EN_VSCROLL,
+    GuestCallbackRequest, VK_DELETE, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR,
+    VK_RIGHT, VK_SPACE, VK_UP, WM_COMMAND, WinApiControlSignal, WinApiState, WinMsg,
+    WindowClassIdentifier, find_window, find_window_mut, high_word, low_i32, low_word,
+    make_command_wparam, read_guest_ansi_lossy, read_guest_utf16_lossy, write_guest_u32,
 };
+use crate::OuterReturn;
 use crate::gdi32::resolve_window_ancestor;
 use crate::state::WindowFlags;
-use crate::OuterReturn;
 
 mod button;
 mod edit;
@@ -34,15 +34,15 @@ use button::paint_control;
 /// field, so it must be reachable at the same visibility as the enum.
 pub use edit::UndoSnapshot;
 use edit::{
-    ctrl_is_down, edit_can_undo, edit_caret_tick, edit_char, edit_clear, edit_copy, edit_cut,
-    edit_delete_at_caret, edit_empty_undo_buffer, edit_first_visible_line, edit_focus_gained,
-    edit_focus_lost, edit_get_handle, edit_get_limit, edit_get_line, edit_get_modify,
-    edit_get_selection, edit_invalidate_text_buffer, edit_line_count, edit_line_from_char,
-    edit_line_index, edit_line_length, edit_mouse_dblclk, edit_mouse_down, edit_mouse_move,
-    edit_mouse_up, edit_mouse_wheel, edit_move_caret, edit_notify_change, edit_notify_scroll,
-    edit_paste, edit_pos_from_char, edit_replace_selection, edit_scroll_caret,
+    CARET_TIMER_ID, ctrl_is_down, edit_can_undo, edit_caret_tick, edit_char, edit_clear, edit_copy,
+    edit_cut, edit_delete_at_caret, edit_empty_undo_buffer, edit_first_visible_line,
+    edit_focus_gained, edit_focus_lost, edit_get_handle, edit_get_limit, edit_get_line,
+    edit_get_modify, edit_get_selection, edit_invalidate_text_buffer, edit_line_count,
+    edit_line_from_char, edit_line_index, edit_line_length, edit_mouse_dblclk, edit_mouse_down,
+    edit_mouse_move, edit_mouse_up, edit_mouse_wheel, edit_move_caret, edit_notify_change,
+    edit_notify_scroll, edit_paste, edit_pos_from_char, edit_replace_selection, edit_scroll_caret,
     edit_scroll_vertical, edit_selection_type, edit_set_handle, edit_set_limit, edit_set_modify,
-    edit_set_selection, edit_set_tab_stops, edit_undo, CARET_TIMER_ID,
+    edit_set_selection, edit_set_tab_stops, edit_undo,
 };
 use listbox::{listbox_hit_item, listbox_notify_change};
 use paint::write_control_text;
@@ -51,8 +51,8 @@ use paint::write_control_text;
 // unused import.
 #[cfg(test)]
 pub(crate) use edit::{
-    clamp_scroll_offset, edit_char_index_at_point, layout_visible_lines, visible_line_count,
-    VisibleSegment,
+    VisibleSegment, clamp_scroll_offset, edit_char_index_at_point, layout_visible_lines,
+    visible_line_count,
 };
 // The no-create undo-buffer clear is called from the SetWindowText handlers
 // in `user32::window` (they write control text outside the control dispatch).
@@ -77,12 +77,18 @@ const COLOR_HIGHLIGHTTEXT: u32 = 0x00FF_FFFF;
 
 /// `ES_MULTILINE` — the EDIT accepts `\n` and answers the EM_* line metrics.
 ///
-/// The full ES_* style set (ES_WANTRETURN 0x4, ES_AUTOVSCROLL 0x40,
-/// ES_AUTOHSCROLL 0x80, ES_NOHIDESEL 0x100, ES_READONLY 0x800, ES_MULTILINE
-/// 0x1000, plus the ES_LEFT/CENTER/RIGHT 0x3 alignment mask) is captured
+/// The value is the REAL Windows `ES_MULTILINE` (winuser.h 0x0004) — the
+/// creation `dwStyle` flows through unchanged, so a mingw-compiled guest's
+/// ES_* bits must match. (0x1000 is `ES_WANTRETURN`, the value this constant
+/// was once wrongly set to, which made every real multiline EDIT look
+/// single-line: Enter inserted nothing and the paint vertically centered.)
+///
+/// The full ES_* style set (ES_MULTILINE 0x4, ES_WANTRETURN 0x1000,
+/// ES_AUTOVSCROLL 0x40, ES_AUTOHSCROLL 0x80, ES_NOHIDESEL 0x100, ES_READONLY
+/// 0x800, plus the ES_LEFT/CENTER/RIGHT 0x3 alignment mask) is captured
 /// wholesale into `ControlState::Edit::style_bits` at seed time; only the bits
 /// a task reads get a named constant here.
-pub(crate) const ES_MULTILINE: u32 = 0x1000;
+pub(crate) const ES_MULTILINE: u32 = 0x0004;
 
 // ── Status-bar (SB_*) messages (commctrl.h) ─────────────────────────────
 //
@@ -270,7 +276,7 @@ pub enum ControlState {
         /// movement and any text mutation.
         goal_column: Option<usize>,
         /// The window's creation `dwStyle` captured at first use. The ES_*
-        /// bits (ES_MULTILINE 0x1000, ES_WANTRETURN 0x4, ES_AUTOVSCROLL 0x40,
+        /// bits (ES_MULTILINE 0x4, ES_WANTRETURN 0x1000, ES_AUTOVSCROLL 0x40,
         /// ES_AUTOHSCROLL 0x80, ES_NOHIDESEL 0x100, ES_READONLY 0x800, the
         /// ES_LEFT/CENTER/RIGHT 0x3 alignment mask) sit in the low word;
         /// WS_* bits ride along harmlessly.

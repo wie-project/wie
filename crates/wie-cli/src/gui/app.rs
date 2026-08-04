@@ -56,22 +56,23 @@ impl WieApp {
         mk
     }
 
-    /// The window under the cursor and its client-relative coordinates.
+    /// The window under the cursor and its client-relative coordinates, for a
+    /// mouse event delivered to `event_hwnd` (the guest HWND of the winit
+    /// window the event arrived on).
     ///
     /// A window holding the mouse capture (SetCapture — a pressed BUTTON
     /// captures while down) receives every mouse message instead of the
-    /// hit-tested child, matching Windows. Falls back to the primary window
-    /// at (0, 0) when the hit-test finds nothing (no visible top-level window
-    /// yet). Mouse messages go to the topmost child containing the cursor,
-    /// with child-relative lParam coords. NOTE (L1): the hit-test runs on the
-    /// GUEST window tree, so it already resolves per-window; only the
-    /// no-hit fallback and the `window_at` call itself stay primary-window
-    /// scoped until L2's input-routing lane.
-    fn mouse_target(&self, handle: &GuestHandle) -> (u64, u16, u16) {
-        let sf = self.scale_factor();
+    /// hit-tested child, matching Windows; capture is desktop-global, so the
+    /// capture path runs first regardless of which top-level the event
+    /// arrived on. Without capture, the hit-test descends the EVENT window's
+    /// own subtree via `window_at_in` — a second top-level (a dialog in its
+    /// own winit window) must resolve its own controls, not the main
+    /// window's. Falls back to the primary window at (0, 0) when the guest
+    /// tree yields nothing (no visible window under the cursor). `sf` is the
+    /// event window's device scale factor: winit reports PHYSICAL pixels, the
+    /// guest hit-test expects LOGICAL 96-DPI client pixels.
+    fn mouse_target(&self, handle: &GuestHandle, event_hwnd: u64, sf: f64) -> (u64, u16, u16) {
         let (cx, cy) = self.cursor_pos;
-        // winit reports PHYSICAL pixels; the guest hit-test (window_at /
-        // capture_target rects) expects LOGICAL 96-DPI client pixels.
         let (x, y) = (
             input::physical_to_logical(cx.max(0.0), sf) as i32,
             input::physical_to_logical(cy.max(0.0), sf) as i32,
@@ -79,7 +80,7 @@ impl WieApp {
         if let Some((hwnd, rx, ry)) = handle.capture_target(x, y) {
             return (hwnd, rx as u16, ry as u16);
         }
-        handle.window_at(x, y).map_or(
+        handle.window_at_in(event_hwnd, x, y).map_or(
             (self.primary_hwnd.map_or(0, |h| h.as_u64()), 0, 0),
             |(hwnd, rx, ry)| (hwnd, rx as u16, ry as u16),
         )
@@ -95,12 +96,16 @@ impl WieApp {
         )
     }
 
-    /// Rebuilds the macOS menu bar when the guest window's menu changed.
+    /// Rebuilds the macOS menu bar when the focused guest window's menu
+    /// changed.
     ///
-    /// Runs once per `Frame`; the cheap `Vec` compare skips the AppKit work
-    /// unless the guest actually rebuilt its menu. Clicks are forwarded back
-    /// through the event-loop proxy by [`MacMenuBar`] as [`WieEvent::MenuEvent`]
-    /// so the guest mutation (`WM_COMMAND`) always happens on this thread.
+    /// The bar mirrors the FOCUSED guest window's menu (macOS has one global
+    /// bar; Windows has one per window) — `window_menu_items` resolves the
+    /// focus. Runs once per `Frame` and as a best-effort immediate attempt on
+    /// winit `Focused(true)`; the cheap `Vec` compare skips the AppKit work
+    /// unless the menu actually changed. Clicks are forwarded back through
+    /// the event-loop proxy by [`MacMenuBar`] as [`WieEvent::MenuEvent`] so
+    /// the guest mutation (`WM_COMMAND`) always happens on this thread.
     #[cfg(target_os = "macos")]
     fn sync_menu_bar(&mut self) {
         let Some(handle) = self.handle.as_ref() else {
@@ -117,27 +122,37 @@ impl WieApp {
     /// Apply a guest-requested host-window move/resize (`SetWindowPlacement`)
     /// to the winit window.
     ///
-    /// The winapi handler records the pending `(x, y, width, height)` on the
-    /// shared state and wakes the presenter; this consumes it on the
+    /// The winapi handler records the pending `(hwnd, x, y, width, height)` on
+    /// the shared state and wakes the presenter; this consumes it on the
     /// event-loop thread where winit calls must run. Guest coordinates are
     /// LOGICAL 96-DPI pixels, so each value is multiplied by the window's
     /// device scale factor ([`input::logical_to_physical`]) to reach winit's
     /// physical space — the same `max(100)` clamp guards against a
-    /// degenerate or negative rect. When no window exists yet (the move
-    /// arrived before the first published frame) the request stays pending
-    /// and applies once the window is created.
-    ///
-    /// NOTE (L1): the geometry request slot is global, not per-hwnd, so the
-    /// move is applied to the primary window; per-window placement is a later
-    /// lane (the slot lives in session/window.rs).
+    /// degenerate or negative rect. When no winit window exists yet (the
+    /// move arrived before the first published frame) the request stays
+    /// pending and applies once the window is created.
     fn apply_host_geometry(&self) {
-        let Some(rt) = self.primary_runtime() else {
-            return;
-        };
         let Some(handle) = self.handle.as_ref() else {
             return;
         };
-        let Some((x, y, width, height)) = handle.take_host_geometry_request() else {
+        // No winit window at all: leave the request pending — the frame
+        // handler re-runs this once reconciliation creates one (the startup
+        // restore must not be dropped).
+        if self.windows.is_empty() {
+            return;
+        }
+        let Some((hwnd, x, y, width, height)) = handle.take_host_geometry_request() else {
+            return;
+        };
+        // Apply to the winit window mirroring the request's hwnd; fall back
+        // to the primary window when that hwnd isn't registered (a
+        // SetWindowPlacement on a child/owned window has no host entry).
+        let Some(rt) = self
+            .windows
+            .values()
+            .find(|rt| rt.hwnd.as_u64() == hwnd)
+            .or_else(|| self.primary_runtime())
+        else {
             return;
         };
         let sf = rt.scale_factor;
@@ -158,16 +173,16 @@ impl WieApp {
 
     /// The primary window's device scale factor (physical px per logical
     /// 96-DPI px), defaulting to 1.0 before any winit window exists (no
-    /// scaling has happened yet). Input paths that are not yet per-window
-    /// (mouse, keyboard) read the primary window's factor.
+    /// scaling has happened yet). Mouse/keyboard use the EVENT window's
+    /// factor; this remains for the few paths still in primary space (the
+    /// drop-point conversion).
     fn scale_factor(&self) -> f64 {
         self.primary_runtime().map_or(1.0, |rt| rt.scale_factor)
     }
 
     /// The runtime of the primary host window — the first window created,
-    /// mirroring the guest's main window. Input events that are not yet
-    /// per-window (keyboard, focus, and the mouse fallback — L2's
-    /// input-routing lane) target it.
+    /// mirroring the guest's main window. The fallback target when an event's
+    /// own window isn't registered (geometry, no-hit mouse fallback).
     fn primary_runtime(&self) -> Option<&WindowRuntime> {
         let hwnd = self.primary_hwnd?;
         self.windows.values().find(|rt| rt.hwnd == hwnd)
@@ -456,17 +471,17 @@ impl ApplicationHandler<WieEvent> for WieApp {
                 return;
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                // Keyboard events only fire once a winit window exists, so
-                // the primary window is always present here. NOTE (L1):
-                // keyboard routing stays primary-window until L2's input
-                // routing (the guest focus window is the real target).
+                // The guest's SetFocus state is authoritative: keys go to the
+                // focus window (whatever top-level it lives in), falling back
+                // to the event window's own hwnd when nothing has focus.
                 let Some(handle) = self.handle.as_ref() else {
                     return;
                 };
-                let Some(rt) = self.primary_runtime() else {
+                let Some(event_hwnd) = self.windows.get(&window_id).map(|rt| rt.hwnd.as_u64())
+                else {
                     return;
                 };
-                let hwnd = rt.hwnd.as_u64();
+                let hwnd = handle.focus_window().unwrap_or(event_hwnd);
                 let pressed = matches!(event.state, winit::event::ElementState::Pressed);
                 let vk = input::virt_key_from_physical(event.physical_key);
                 // Feed the guest keyboard-state table so GetKeyState /
@@ -510,11 +525,19 @@ impl ApplicationHandler<WieEvent> for WieApp {
         let Some(ref handle) = self.handle else {
             return;
         };
-        // Input events that are not yet per-window (L2's input-routing lane)
-        // target the primary window's guest HWND.
-        let Some(hwnd) = self.primary_hwnd else {
-            return;
-        };
+        // Event-window context: the guest HWND and device scale factor of the
+        // winit window the event arrived on (per-entry — a second top-level
+        // can sit on a display with a different factor). `None` for a stale
+        // event from a window reconciliation already destroyed; those arms
+        // fall back to the primary window.
+        let event_hwnd = self.windows.get(&window_id).map(|rt| rt.hwnd.as_u64());
+        let event_sf = self
+            .windows
+            .get(&window_id)
+            .map_or(1.0, |rt| rt.scale_factor);
+        // The primary window's guest HWND — the no-hit fallback for mouse
+        // routing.
+        let primary_hwnd = self.primary_hwnd.map_or(0, |h| h.as_u64());
 
         match event {
             WindowEvent::DroppedFile(path) => {
@@ -524,6 +547,9 @@ impl ApplicationHandler<WieEvent> for WieApp {
                 // DragQueryFileW, mapped to a guest C:\ path by
                 // GuestHandle::set_drop_files (drops outside the bottle/D:
                 // bridge are skipped, so hdrop stays 0 and nothing is posted).
+                // WM_DROPFILES targets the top-level window the file was
+                // dropped ON (the event window), where top-level-relative
+                // MSG.pt is the same space as lParam.
                 let (px, py) = self.cursor_pos_i32();
                 let hdrop = handle.set_drop_files(vec![path.clone()], (px, py));
                 tracing::info!(
@@ -533,7 +559,12 @@ impl ApplicationHandler<WieEvent> for WieApp {
                 );
                 if hdrop != 0 {
                     let lparam = input::make_lparam(px.max(0) as u16, py.max(0) as u16);
-                    handle.post_message(hwnd.as_u64(), input::WM_DROPFILES, hdrop, lparam);
+                    handle.post_message(
+                        event_hwnd.unwrap_or(primary_hwnd),
+                        input::WM_DROPFILES,
+                        hdrop,
+                        lparam,
+                    );
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -611,8 +642,10 @@ impl ApplicationHandler<WieEvent> for WieApp {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = (position.x.max(0.0), position.y.max(0.0));
                 let mk = self.mk_flags();
-                // Route to the topmost child under the cursor, if any.
-                let (target, rx, ry) = self.mouse_target(handle);
+                // Route to the topmost child of the EVENT window under the
+                // cursor (window_at_in roots at the event window's hwnd).
+                let (target, rx, ry) =
+                    self.mouse_target(handle, event_hwnd.unwrap_or(primary_hwnd), event_sf);
                 let lparam = input::make_lparam(rx, ry);
                 // MSG.pt must share lParam's CHILD-relative space: a guest
                 // reading MSG.pt (e.g. the wndproc's own hit-testing) would
@@ -646,15 +679,15 @@ impl ApplicationHandler<WieEvent> for WieApp {
                 }
                 // The target is resolved first so the double-click detection
                 // can require both presses on the same window (Windows tracks
-                // double-clicks per window).
-                let (target, rx, ry) = self.mouse_target(handle);
+                // double-clicks per window). The slop is the EVENT window's
+                // physical space (left_press_message borrows `last` mutably,
+                // and event_sf is read before the call).
+                let (target, rx, ry) =
+                    self.mouse_target(handle, event_hwnd.unwrap_or(primary_hwnd), event_sf);
                 let msg = match button {
                     winit::event::MouseButton::Left => {
                         if pressed {
-                            // The slop is computed first: left_press_message
-                            // borrows `last` mutably, and scale_factor reads
-                            // the runtime.
-                            let slop = input::double_click_slop(self.scale_factor());
+                            let slop = input::double_click_slop(event_sf);
                             left_press_message(
                                 &mut self.last_left_press,
                                 self.cursor_pos,
@@ -704,11 +737,11 @@ impl ApplicationHandler<WieEvent> for WieApp {
                 // WM_MOUSEWHEEL/HWHEEL go to the FOCUS window, not the window
                 // under the cursor (DefWindowProc then bubbles them up the
                 // parent chain) — a multiline EDIT keeps scrolling while the
-                // pointer is elsewhere. Fall back to the hit-tested window
-                // when nothing has keyboard focus.
+                // pointer is elsewhere. Fall back to the EVENT window's
+                // hit-test when nothing has keyboard focus.
                 let (target, rx, ry) = match handle.focus_window() {
                     Some(focus) => (focus, 0, 0),
-                    None => self.mouse_target(handle),
+                    None => self.mouse_target(handle, event_hwnd.unwrap_or(primary_hwnd), event_sf),
                 };
                 if delta_y != 0 {
                     let wparam = input::make_wparam(mk, delta_y as u16);
@@ -751,16 +784,22 @@ impl ApplicationHandler<WieEvent> for WieApp {
             }
             WindowEvent::CursorEntered { .. } => {
                 // Windows sends WM_MOUSEHOVER only for windows that requested
-                // tracking via TrackMouseEvent. NOTE (L1): hover/leave stay
-                // primary-window until L2's per-window mouse routing.
-                if handle.mouse_tracking(hwnd.as_u64()) {
-                    handle.post_message(hwnd.as_u64(), input::WM_MOUSEHOVER, 0, 0);
+                // tracking via TrackMouseEvent — tracked per window, so check
+                // the EVENT window.
+                let Some(hwnd) = event_hwnd else {
+                    return;
+                };
+                if handle.mouse_tracking(hwnd) {
+                    handle.post_message(hwnd, input::WM_MOUSEHOVER, 0, 0);
                 }
             }
             WindowEvent::CursorLeft { .. } => {
                 // Windows sends WM_MOUSELEAVE only for tracked windows.
-                if handle.mouse_tracking(hwnd.as_u64()) {
-                    handle.post_message(hwnd.as_u64(), input::WM_MOUSELEAVE, 0, 0);
+                let Some(hwnd) = event_hwnd else {
+                    return;
+                };
+                if handle.mouse_tracking(hwnd) {
+                    handle.post_message(hwnd, input::WM_MOUSELEAVE, 0, 0);
                 }
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -775,10 +814,16 @@ impl ApplicationHandler<WieEvent> for WieApp {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                // Dead in practice (the early KeyboardInput arm above returns
+                // first) — kept in sync with it: keys go to the guest focus
+                // window, falling back to the event window.
                 let pressed = matches!(event.state, winit::event::ElementState::Pressed);
                 let vk = input::virt_key_from_physical(event.physical_key);
                 // Keep the guest keyboard-state table in sync with real input.
                 handle.set_key_state(vk, pressed);
+                let hwnd = handle
+                    .focus_window()
+                    .unwrap_or(event_hwnd.unwrap_or(primary_hwnd));
                 let is_alt = matches!(
                     event.physical_key,
                     winit::keyboard::PhysicalKey::Code(
@@ -793,34 +838,44 @@ impl ApplicationHandler<WieEvent> for WieApp {
                     event.text
                 );
                 if pressed {
-                    handle.post_message(hwnd.as_u64(), input::WM_KEYDOWN, u64::from(vk), 0);
+                    handle.post_message(hwnd, input::WM_KEYDOWN, u64::from(vk), 0);
                     // TranslateMessage in WIE doesn't generate WM_CHAR, so
                     // we post it directly from the winit KeyEvent.text field.
                     if let Some(ref text) = event.text {
                         for c in text.chars() {
-                            handle.post_message(
-                                hwnd.as_u64(),
-                                input::WM_CHAR,
-                                u64::from(c as u32),
-                                0,
-                            );
+                            handle.post_message(hwnd, input::WM_CHAR, u64::from(c as u32), 0);
                         }
                     }
                     if is_alt {
-                        handle.post_message(hwnd.as_u64(), input::WM_SYSKEYDOWN, u64::from(vk), 0);
+                        handle.post_message(hwnd, input::WM_SYSKEYDOWN, u64::from(vk), 0);
                     }
                 } else {
-                    handle.post_message(hwnd.as_u64(), input::WM_KEYUP, u64::from(vk), 0);
+                    handle.post_message(hwnd, input::WM_KEYUP, u64::from(vk), 0);
                     if is_alt {
-                        handle.post_message(hwnd.as_u64(), input::WM_SYSKEYUP, u64::from(vk), 0);
+                        handle.post_message(hwnd, input::WM_SYSKEYUP, u64::from(vk), 0);
                     }
                 }
             }
             WindowEvent::Focused(true) => {
-                handle.post_message(hwnd.as_u64(), input::WM_SETFOCUS, 0, 0);
+                // WM_SETFOCUS to the window that gained macOS focus.
+                handle.post_message(event_hwnd.unwrap_or(primary_hwnd), input::WM_SETFOCUS, 0, 0);
+                // macOS has ONE global menu bar: swap it to the newly focused
+                // guest window's menu. Best-effort — the guest may not have
+                // processed WM_SETFOCUS yet (its SetFocus lands
+                // asynchronously), so this may read the previous focus; the
+                // per-Frame sync corrects it as soon as the guest repaints
+                // (focus rect/caret), and the cheap Vec compare makes a stale
+                // read a no-op.
+                #[cfg(target_os = "macos")]
+                self.sync_menu_bar();
             }
             WindowEvent::Focused(false) => {
-                handle.post_message(hwnd.as_u64(), input::WM_KILLFOCUS, 0, 0);
+                handle.post_message(
+                    event_hwnd.unwrap_or(primary_hwnd),
+                    input::WM_KILLFOCUS,
+                    0,
+                    0,
+                );
             }
             WindowEvent::Resized(size) => {
                 tracing::debug!(

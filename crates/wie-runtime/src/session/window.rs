@@ -24,6 +24,35 @@ pub struct GuestHandle {
     pub(super) menu_tree_cache: MenuTreeCache,
 }
 
+/// Descend the child hierarchy of `root` with z-order hit-testing: at each
+/// level pick the topmost visible child containing `(rel_x, rel_y)`, then
+/// recurse into it. Coordinates stay child-relative at every step, so the
+/// returned point is relative to the deepest hit window. Returns the root
+/// itself (with the given coordinates) when no child contains the point.
+fn hit_test_subtree(
+    windows: &[wie_winapi::WindowRecord],
+    mut current: wie_winapi::handles::Hwnd,
+    mut rel_x: i32,
+    mut rel_y: i32,
+) -> Option<(u64, u32, u32)> {
+    loop {
+        let hit = windows.iter().rev().find(|w| {
+            w.parent_handle == current
+                && w.visible
+                && rel_x >= w.x
+                && rel_y >= w.y
+                && rel_x < w.x.saturating_add(w.width)
+                && rel_y < w.y.saturating_add(w.height)
+        });
+        let Some(child) = hit else {
+            return Some((current.as_u64(), rel_x.max(0) as u32, rel_y.max(0) as u32));
+        };
+        current = child.handle;
+        rel_x -= child.x;
+        rel_y -= child.y;
+    }
+}
+
 impl GuestHandle {
     /// Take the latest published frame for `hwnd`, if any.
     #[must_use]
@@ -83,7 +112,7 @@ impl GuestHandle {
             .map(|w| w.handle.as_u64())
     }
 
-    /// Hit-test a point in the top-level window's client area.
+    /// Hit-test a point in the first top-level window's client area.
     ///
     /// Returns `(hwnd, rel_x, rel_y)` for the topmost visible child containing
     /// the point, or the top-level window itself (with client-relative
@@ -94,6 +123,11 @@ impl GuestHandle {
     /// whole child hierarchy — a modal dialog's own controls (buttons, edits)
     /// are children of the dialog, not of the top-level window, so a click on
     /// a dialog button must resolve to the button, not the dialog.
+    ///
+    /// The GUI presenter uses [`Self::window_at_in`] instead — this roots at
+    /// the first parentless record, so it cannot resolve a SECOND top-level's
+    /// controls (a dialog presented in its own winit window). Kept for the
+    /// headless/screenshot callers.
     #[must_use]
     pub fn window_at(&self, x: i32, y: i32) -> Option<(u64, u32, u32)> {
         let state = self.state.lock().ok()?;
@@ -102,28 +136,24 @@ impl GuestHandle {
             .iter()
             .find(|w| w.parent_handle == wie_winapi::handles::Hwnd::NULL)?
             .handle;
-        // Descend z-order: at each level pick the topmost visible child that
-        // contains the point, then recurse into it. Coordinates stay
-        // child-relative at every step.
-        let mut current = top;
-        let mut rel_x = x;
-        let mut rel_y = y;
-        loop {
-            let hit = windows.iter().rev().find(|w| {
-                w.parent_handle == current
-                    && w.visible
-                    && rel_x >= w.x
-                    && rel_y >= w.y
-                    && rel_x < w.x.saturating_add(w.width)
-                    && rel_y < w.y.saturating_add(w.height)
-            });
-            let Some(child) = hit else {
-                return Some((current.as_u64(), rel_x.max(0) as u32, rel_y.max(0) as u32));
-            };
-            current = child.handle;
-            rel_x -= child.x;
-            rel_y -= child.y;
-        }
+        hit_test_subtree(windows, top, x, y)
+    }
+
+    /// Hit-test a point in the subtree rooted at `hwnd` (a top-level window).
+    ///
+    /// Same descent as [`Self::window_at`] (topmost visible child per level,
+    /// child-relative coordinates throughout) but rooted at the caller's
+    /// window, so a mouse event delivered to a SECOND top-level (a dialog in
+    /// its own winit window) resolves that window's own controls instead of
+    /// the main window's. Returns `None` when `hwnd` is not a live guest
+    /// window (a destroyed handle must not hit-test stale children).
+    #[must_use]
+    pub fn window_at_in(&self, hwnd: u64, x: i32, y: i32) -> Option<(u64, u32, u32)> {
+        let state = self.state.lock().ok()?;
+        let windows = &state.try_window_state()?.windows;
+        let root = wie_winapi::handles::Hwnd::from(hwnd);
+        windows.iter().find(|w| w.handle == root)?;
+        hit_test_subtree(windows, root, x, y)
     }
 
     /// Resolve the destination for a mouse message under active capture.
@@ -221,14 +251,24 @@ impl GuestHandle {
         Some((w.handle.as_u64(), w.title.clone(), w.width, w.height))
     }
 
-    /// Snapshot of the first menu-bearing window's menu as a tree, for the
-    /// host menu bar.
+    /// Snapshot of the menu the macOS bar should mirror, as a tree.
+    ///
+    /// macOS has ONE global menu bar; Windows has one menu per window, so the
+    /// bar mirrors the FOCUSED guest window's menu (the dynamic-menu pattern)
+    /// — the guest's `SetFocus` state is authoritative, and focus can sit on
+    /// a child (an EDIT inside the focused top-level), so the selection
+    /// ascends to that child's top-level ancestor, which carries the menu.
+    /// Falls back to the first menu-bearing top-level window when nothing is
+    /// focused or the focused top-level has no menu (the pre-focus behavior,
+    /// e.g. before any window has focus).
     ///
     /// Walks the native `MenuRecord` tree once and caches the result: while
-    /// `WindowState.menu_dirty` is false the cache is returned without
-    /// touching the menu records (the big-mutex lock is still taken, but the
-    /// per-frame tree reconstruction is gone). Empty when no window has a
-    /// menu yet.
+    /// `WindowState.menu_dirty` is false AND the selected menu handle is
+    /// unchanged the cache is returned without touching the menu records
+    /// (the big-mutex lock is still taken, but the per-frame tree
+    /// reconstruction is gone). A focus move to a different menu-bearing
+    /// window changes the handle, so the cache rebuilds exactly then. Empty
+    /// when no window has a menu.
     #[must_use]
     pub fn window_menu_items(&self) -> Arc<Vec<MenuNode>> {
         let Ok(state) = self.state.lock() else {
@@ -237,10 +277,33 @@ impl GuestHandle {
         let Some(ws) = state.try_window_state() else {
             return Arc::new(Vec::new());
         };
+        // The focused window's menu wins; `menu_handle != 0` alone is NOT a
+        // menu — a child window's slot holds its child id — so first ascend
+        // to the focus's parentless top-level, then check ITS handle.
+        let mut focus_top = ws.focus_window_handle;
+        if focus_top != wie_winapi::handles::Hwnd::NULL {
+            loop {
+                let Some(w) = ws.windows.iter().find(|w| w.handle == focus_top) else {
+                    focus_top = wie_winapi::handles::Hwnd::NULL;
+                    break;
+                };
+                if w.parent_handle == wie_winapi::handles::Hwnd::NULL {
+                    break;
+                }
+                focus_top = w.parent_handle;
+            }
+        }
         let Some(menu_handle) = ws
             .windows
             .iter()
-            .find_map(|w| (w.menu_handle != 0).then_some(w.menu_handle))
+            .find(|w| w.handle == focus_top && w.menu_handle != 0)
+            .map(|w| w.menu_handle)
+            .or_else(|| {
+                ws.windows.iter().find_map(|w| {
+                    (w.parent_handle == wie_winapi::handles::Hwnd::NULL && w.menu_handle != 0)
+                        .then_some(w.menu_handle)
+                })
+            })
         else {
             return Arc::new(Vec::new());
         };
@@ -377,16 +440,21 @@ impl GuestHandle {
     ///
     /// `SetWindowPlacement` (guest thread) records `(x, y, width, height)` in
     /// screen coordinates here when the applied rcNormalPosition differs from
-    /// the current rect. The host presenter applies it to the winit window and
+    /// the current rect, along with the hwnd it was applied to — so with
+    /// multiple top-levels the host applies the move to the matching winit
+    /// window, not always the primary one. The host presenter applies it and
     /// calls this to clear the slot; `None` when no move is pending. Mirrors
     /// the [`Self::resize_window`] seam — geometry flows guest → host through
     /// the shared `WinApiState`, applied on the event-loop thread.
     #[must_use]
-    pub fn take_host_geometry_request(&self) -> Option<(i32, i32, i32, i32)> {
+    pub fn take_host_geometry_request(&self) -> Option<(u64, i32, i32, i32, i32)> {
         let Ok(mut state) = self.state.lock() else {
             return None;
         };
-        state.window_state().host_geometry_request.take()
+        let ws = state.window_state();
+        let rect = ws.host_geometry_request.take()?;
+        let hwnd = ws.host_geometry_hwnd.take()?;
+        Some((hwnd, rect.0, rect.1, rect.2, rect.3))
     }
 
     /// Post a message to the guest message queue.
@@ -642,8 +710,129 @@ mod tests {
         assert!(item.checked, "rebuild must surface the checked state");
     }
 
-    /// `take_host_geometry_request` reads the guest-set pending geometry and
-    /// clears the slot (the SetWindowPlacement host-forwarding seam).
+    /// The macOS dynamic-menu pattern: `window_menu_items` mirrors the
+    /// FOCUSED guest window's menu. Focus can sit on a child (an EDIT inside
+    /// the focused top-level), so the selection ascends to the top-level that
+    /// carries the menu; a child's nonzero `menu_handle` slot (its child id)
+    /// must never be mistaken for a menu. With no focus — or a focused window
+    /// without a menu — the bar falls back to the first menu-bearing
+    /// top-level (the pre-focus behavior).
+    #[test]
+    fn window_menu_items_prefers_the_focused_windows_menu() {
+        let process = wie_pe::ProcessIdentity {
+            module_file_name: "focus-menu.exe".to_owned(),
+            module_path: r"C:\App\focus-menu.exe".to_owned(),
+            current_directory: r"C:\App".to_owned(),
+            command_line: "focus-menu.exe".to_owned(),
+        };
+        let mut winapi_state =
+            crate::memory::default_winapi_state(&DEFAULT_LAYOUT, Arc::new(Vec::new()), &process)
+                .expect("winapi state");
+        let menu_a = 0x0000_0000_6620_0001_u64;
+        let menu_b = 0x0000_0000_6620_0002_u64;
+        let a = 0x100_u64;
+        let b = 0x200_u64;
+        let b_edit = 0x201_u64;
+        let c = 0x300_u64;
+        {
+            let ws = winapi_state.window_state();
+            ws.menus.push(MenuRecord {
+                handle: wie_winapi::handles::Hmenu::from(menu_a),
+                items: vec![MenuEntry::Item {
+                    id: 1,
+                    text: "Exit".to_owned(),
+                    enabled: true,
+                    checked: false,
+                }],
+            });
+            ws.menus.push(MenuRecord {
+                handle: wie_winapi::handles::Hmenu::from(menu_b),
+                items: vec![MenuEntry::Item {
+                    id: 2,
+                    text: "Paste".to_owned(),
+                    enabled: true,
+                    checked: false,
+                }],
+            });
+            ws.windows.push(wie_winapi::WindowRecord {
+                handle: wie_winapi::handles::Hwnd::from(a),
+                menu_handle: menu_a,
+                ..Default::default()
+            });
+            ws.windows.push(wie_winapi::WindowRecord {
+                handle: wie_winapi::handles::Hwnd::from(b),
+                menu_handle: menu_b,
+                ..Default::default()
+            });
+            // B's EDIT: its menu_handle slot holds the CHILD ID (5), not a
+            // menu — the selection must not mistake it for one.
+            ws.windows.push(wie_winapi::WindowRecord {
+                handle: wie_winapi::handles::Hwnd::from(b_edit),
+                parent_handle: wie_winapi::handles::Hwnd::from(b),
+                menu_handle: 5,
+                ..Default::default()
+            });
+            // A top-level with no menu at all.
+            ws.windows.push(wie_winapi::WindowRecord {
+                handle: wie_winapi::handles::Hwnd::from(c),
+                ..Default::default()
+            });
+        }
+        let handle = GuestHandle {
+            state: Arc::new(Mutex::new(winapi_state)),
+            queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+            menu_tree_cache: Arc::new(RwLock::new(None)),
+        };
+
+        // Focus sits on B's child EDIT → the bar mirrors B's menu.
+        {
+            let mut state = handle.state.lock().expect("lock state");
+            state.window_state().focus_window_handle = wie_winapi::handles::Hwnd::from(b_edit);
+        }
+        assert_eq!(
+            handle.window_menu_items().first().expect("item").title,
+            "Paste",
+            "a focused child must resolve to its top-level's menu"
+        );
+
+        // Focus on A → A's menu.
+        {
+            let mut state = handle.state.lock().expect("lock state");
+            state.window_state().focus_window_handle = wie_winapi::handles::Hwnd::from(a);
+        }
+        assert_eq!(
+            handle.window_menu_items().first().expect("item").title,
+            "Exit",
+            "focus on A switches the bar to A's menu"
+        );
+
+        // Focus on C (no menu) → fall back to the first menu-bearing
+        // top-level (A).
+        {
+            let mut state = handle.state.lock().expect("lock state");
+            state.window_state().focus_window_handle = wie_winapi::handles::Hwnd::from(c);
+        }
+        assert_eq!(
+            handle.window_menu_items().first().expect("item").title,
+            "Exit",
+            "a focused window without a menu falls back to the first menu-bearing top-level"
+        );
+
+        // No focus at all → same fallback.
+        {
+            let mut state = handle.state.lock().expect("lock state");
+            state.window_state().focus_window_handle = wie_winapi::handles::Hwnd::NULL;
+        }
+        assert_eq!(
+            handle.window_menu_items().first().expect("item").title,
+            "Exit",
+            "no focus → the first menu-bearing top-level (pre-focus behavior)"
+        );
+    }
+
+    /// `take_host_geometry_request` reads the guest-set pending geometry —
+    /// target hwnd + rect — and clears the slot (the SetWindowPlacement
+    /// host-forwarding seam).
     #[test]
     fn take_host_geometry_request_reads_and_clears_the_pending_slot() {
         let process = wie_pe::ProcessIdentity {
@@ -655,7 +844,11 @@ mod tests {
         let mut winapi_state =
             crate::memory::default_winapi_state(&DEFAULT_LAYOUT, Arc::new(Vec::new()), &process)
                 .expect("winapi state");
-        winapi_state.window_state().host_geometry_request = Some((20, 30, 200, 100));
+        {
+            let ws = winapi_state.window_state();
+            ws.host_geometry_request = Some((20, 30, 200, 100));
+            ws.host_geometry_hwnd = Some(0x200);
+        }
         let handle = GuestHandle {
             state: Arc::new(Mutex::new(winapi_state)),
             queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
@@ -664,13 +857,154 @@ mod tests {
 
         assert_eq!(
             handle.take_host_geometry_request(),
-            Some((20, 30, 200, 100)),
-            "the pending geometry must be handed to the host presenter"
+            Some((0x200, 20, 30, 200, 100)),
+            "the pending geometry must be handed to the host presenter, tagged \
+             with the window it targets"
         );
         assert_eq!(
             handle.take_host_geometry_request(),
             None,
             "take clears the slot so a stale move is never re-applied"
+        );
+    }
+
+    /// `window_at_in` roots the hit-test at the CALLER's top-level, so with
+    /// two top-level windows each resolves its own controls: window B's child
+    /// is found through window B, window A's child through window A, and the
+    /// plain `window_at` keeps resolving the first top-level (the headless
+    /// caller).
+    #[test]
+    fn window_at_in_hit_tests_the_named_top_level_subtree() {
+        let process = wie_pe::ProcessIdentity {
+            module_file_name: "two-win.exe".to_owned(),
+            module_path: r"C:\App\two-win.exe".to_owned(),
+            current_directory: r"C:\App".to_owned(),
+            command_line: "two-win.exe".to_owned(),
+        };
+        let mut winapi_state =
+            crate::memory::default_winapi_state(&DEFAULT_LAYOUT, Arc::new(Vec::new()), &process)
+                .expect("winapi state");
+        let a = 0x100_u64;
+        let a_button = 0x101_u64;
+        let b = 0x200_u64;
+        let b_edit = 0x201_u64;
+        {
+            let ws = winapi_state.window_state();
+            // Top-level A (the main window) with a button at (10, 10, 120x40).
+            ws.windows.push(wie_winapi::WindowRecord {
+                handle: wie_winapi::handles::Hwnd::from(a),
+                width: 360,
+                height: 140,
+                ..Default::default()
+            });
+            ws.windows.push(wie_winapi::WindowRecord {
+                handle: wie_winapi::handles::Hwnd::from(a_button),
+                parent_handle: wie_winapi::handles::Hwnd::from(a),
+                x: 10,
+                y: 10,
+                width: 120,
+                height: 40,
+                visible: true,
+                ..Default::default()
+            });
+            // Top-level B (a dialog) with an edit at (5, 5, 50x50).
+            ws.windows.push(wie_winapi::WindowRecord {
+                handle: wie_winapi::handles::Hwnd::from(b),
+                width: 200,
+                height: 200,
+                ..Default::default()
+            });
+            ws.windows.push(wie_winapi::WindowRecord {
+                handle: wie_winapi::handles::Hwnd::from(b_edit),
+                parent_handle: wie_winapi::handles::Hwnd::from(b),
+                x: 5,
+                y: 5,
+                width: 50,
+                height: 50,
+                visible: true,
+                ..Default::default()
+            });
+        }
+        let handle = GuestHandle {
+            state: Arc::new(Mutex::new(winapi_state)),
+            queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+            menu_tree_cache: Arc::new(RwLock::new(None)),
+        };
+
+        // A click at (20, 20) in window B's space hits B's edit, NOT A's
+        // button — the pre-L2 window_at would have resolved A's button here.
+        assert_eq!(
+            handle.window_at_in(b, 20, 20),
+            Some((b_edit, 15, 15)),
+            "window_at_in(B) must descend B's subtree with child-relative coords"
+        );
+        // The same point through window A hits A's button.
+        assert_eq!(
+            handle.window_at_in(a, 20, 20),
+            Some((a_button, 10, 10)),
+            "window_at_in(A) must descend A's subtree"
+        );
+        // A point outside B's children resolves to B itself.
+        assert_eq!(
+            handle.window_at_in(b, 150, 150),
+            Some((b, 150, 150)),
+            "no child hit → the root window, client-relative"
+        );
+        // An unknown window yields nothing (a destroyed handle must not
+        // hit-test stale children).
+        assert_eq!(
+            handle.window_at_in(0x999, 20, 20),
+            None,
+            "an unknown root is not a live guest window"
+        );
+        // The thin window_at wrapper still roots at the first top-level (A).
+        assert_eq!(
+            handle.window_at(20, 20),
+            Some((a_button, 10, 10)),
+            "window_at keeps resolving the first parentless record"
+        );
+    }
+
+    /// `focus_window` surfaces the guest's `SetFocus` state — the keyboard
+    /// routing target (`focus_window().unwrap_or(event window)`).
+    #[test]
+    fn focus_window_reflects_the_guest_focus_handle() {
+        let process = wie_pe::ProcessIdentity {
+            module_file_name: "focus.exe".to_owned(),
+            module_path: r"C:\App\focus.exe".to_owned(),
+            current_directory: r"C:\App".to_owned(),
+            command_line: "focus.exe".to_owned(),
+        };
+        let mut winapi_state =
+            crate::memory::default_winapi_state(&DEFAULT_LAYOUT, Arc::new(Vec::new()), &process)
+                .expect("winapi state");
+        {
+            let ws = winapi_state.window_state();
+            ws.windows.push(wie_winapi::WindowRecord {
+                handle: wie_winapi::handles::Hwnd::from(0x201),
+                ..Default::default()
+            });
+            ws.focus_window_handle = wie_winapi::handles::Hwnd::from(0x201);
+        }
+        let handle = GuestHandle {
+            state: Arc::new(Mutex::new(winapi_state)),
+            queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+            menu_tree_cache: Arc::new(RwLock::new(None)),
+        };
+
+        assert_eq!(
+            handle.focus_window(),
+            Some(0x201),
+            "the guest focus handle is the keyboard routing target"
+        );
+        {
+            let mut state = handle.state.lock().expect("lock state");
+            state.window_state().focus_window_handle = wie_winapi::handles::Hwnd::NULL;
+        }
+        assert_eq!(
+            handle.focus_window(),
+            None,
+            "no focus → the caller falls back to the event window"
         );
     }
 

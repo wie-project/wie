@@ -408,6 +408,19 @@ impl PresentState {
         }
     }
 
+    /// Request a host-side registry sync without publishing a frame.
+    ///
+    /// The host reconciles its window registry on every publish wake; a guest
+    /// `DestroyWindow` of a top-level window emits no frame, so the stale
+    /// winit window would linger until some unrelated repaint. This fires the
+    /// same stored wake the publish path uses, so the event-loop thread
+    /// re-runs the Frame diff and drops the dead window (L3 wake-on-destroy).
+    pub fn request_host_sync(&mut self) {
+        if let Some(wake) = &self.wake {
+            wake();
+        }
+    }
+
     /// B9: record one BitBlt mask-copy (`mask_bgra_to_0rgb`) duration (ns).
     pub fn record_blit_copy(&mut self, ns: u128) {
         self.blit_copy_ns = self.blit_copy_ns.saturating_add(ns);
@@ -505,6 +518,30 @@ mod tests {
         assert_eq!(state.drain_pending_publishes(), 2);
         assert!(state.published.contains_key(&a));
         assert!(state.published.contains_key(&b));
+    }
+
+    #[test]
+    fn request_host_sync_fires_the_stored_wake() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut state = PresentState::new();
+        let fired = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&fired);
+        state.wake = Some(Box::new(move || {
+            flag.store(true, Ordering::SeqCst);
+        }));
+
+        state.request_host_sync();
+
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "request_host_sync must fire the same stored wake the publish path fires"
+        );
+    }
+
+    #[test]
+    fn request_host_sync_without_wake_is_a_no_op() {
+        // No wake installed (headless runs): the call must be a silent no-op.
+        PresentState::new().request_host_sync();
     }
 
     /// An empty frame for the headless record slot.

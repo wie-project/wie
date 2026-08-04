@@ -1048,8 +1048,18 @@ pub fn handle_create_window_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let ex_style = u32::try_from(ex_style).context("CreateWindowExA: ex_style does not fit u32")?;
 
     // Handle CW_USEDEFAULT (0x8000_0000 stored as i32 = i32::MIN on the stack).
-    let x = if x_raw == i32::MIN { 100 } else { x_raw };
-    let y = if y_raw == i32::MIN { 100 } else { y_raw };
+    // A CHILD window with CW_USEDEFAULT x/y is placed at (0,0) of the parent's
+    // client area; only a top-level window gets the cascaded (100,100).
+    let x = if x_raw == i32::MIN {
+        if parent_handle != 0 { 0 } else { 100 }
+    } else {
+        x_raw
+    };
+    let y = if y_raw == i32::MIN {
+        if parent_handle != 0 { 0 } else { 100 }
+    } else {
+        y_raw
+    };
     let width = if width_raw == i32::MIN {
         640
     } else {
@@ -1212,8 +1222,19 @@ pub fn handle_create_window_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 
     // Handle CW_USEDEFAULT (0x8000_0000) — stored as a 32-bit DWORD in the
     // stack slot, so it reads back as i32::MIN through read_guest_i32.
-    let x = if x_raw == i32::MIN { 100 } else { x_raw };
-    let y = if y_raw == i32::MIN { 100 } else { y_raw };
+    // A CHILD window with CW_USEDEFAULT x/y is placed at (0,0) of the
+    // parent's client area; only a top-level window gets the cascaded
+    // (100,100).
+    let x = if x_raw == i32::MIN {
+        if parent_handle != 0 { 0 } else { 100 }
+    } else {
+        x_raw
+    };
+    let y = if y_raw == i32::MIN {
+        if parent_handle != 0 { 0 } else { 100 }
+    } else {
+        y_raw
+    };
     let width = if width_raw == i32::MIN {
         640
     } else {
@@ -1327,9 +1348,10 @@ pub fn handle_destroy_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         .context("failed to read RCX for DestroyWindow")?;
 
     // Extract window info before any mutation.
-    let window_info = find_window(state, window_handle).map(|w| (w.window_proc, w.unicode));
+    let window_info =
+        find_window(state, window_handle).map(|w| (w.window_proc, w.unicode, w.parent_handle));
 
-    let Some((window_proc, unicode)) = window_info else {
+    let Some((window_proc, unicode, parent_handle)) = window_info else {
         let ra = engine
             .return_from_win64_api(0)
             .context("failed to return from DestroyWindow")?;
@@ -1338,6 +1360,14 @@ pub fn handle_destroy_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
             return_value: 0,
         });
     };
+
+    // A destroyed top-level window publishes no frame, so the host window
+    // registry would never wake to drop the stale winit window — request the
+    // sync explicitly (the same wake the publish path fires). Children live
+    // inside their parent's surface and have no host window of their own.
+    if parent_handle == crate::handles::Hwnd::NULL {
+        state.present().request_host_sync();
+    }
 
     tracing::debug!(target: "wiegui", hwnd = window_handle, "DestroyWindow");
 
