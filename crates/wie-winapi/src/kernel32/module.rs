@@ -166,8 +166,10 @@ pub(crate) fn resolve_or_load_dll(
         return 0;
     };
 
-    // Build a guest-style path from the host path for the module descriptor.
-    let guest_path = resolve_windows_dll_path(name, &state.process.main_module_path);
+    // Synthesize a guest-style path for the module descriptor, derived from
+    // the process identity (main module dir → guest cwd → drive root).
+    let guest_cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
+    let guest_path = resolve_windows_dll_path(name, &state.process.main_module_path, &guest_cwd);
 
     match crate::dll_loader::load_dll(engine, state, host, &guest_path, &mut |lib, name, slot| {
         resolver.resolve(lib, name, slot)
@@ -192,15 +194,52 @@ pub(crate) fn resolve_or_load_dll(
         }
     }
 }
-pub(crate) fn resolve_windows_dll_path(name: &str, main_module_path: &str) -> String {
+/// Synthesize a guest-style absolute DLL path from a bare module name.
+///
+/// The directory comes from the process identity, never a literal default:
+/// the main module's guest directory first, then the guest current directory,
+/// then the `C:\` drive root. A `name` that is already a path (separator or
+/// drive letter present) is returned unchanged.
+pub(crate) fn resolve_windows_dll_path(
+    name: &str,
+    main_module_path: &str,
+    current_directory: &str,
+) -> String {
     if name.contains('\\') || name.contains('/') || name.contains(':') {
         return name.to_owned();
     }
-    if let Some(parent) = std::path::Path::new(main_module_path).parent() {
-        let dir = parent.to_string_lossy().replace('/', "\\");
-        format!("{dir}\\{name}")
+    if let Some(dir) = guest_dir_of(main_module_path) {
+        return format!("{dir}\\{name}");
+    }
+    let cwd = current_directory
+        .trim_end_matches(['\\', '/'])
+        .replace('/', "\\");
+    if cwd.is_empty() {
+        return format!("C:\\{name}");
+    }
+    format!("{cwd}\\{name}")
+}
+
+/// Directory component of a guest Windows path, host-OS agnostic.
+///
+/// `Path::parent` is wrong here: on a Unix host backslashes are ordinary
+/// characters, so `C:\App\main.exe` would read as a single component. Split on
+/// both separators by hand; a bare drive letter (`C:`) maps to the drive root
+/// `C:\`.
+fn guest_dir_of(path: &str) -> Option<String> {
+    let trimmed = path.trim_end_matches(['\\', '/']);
+    if trimmed.is_empty() {
+        return None;
+    }
+    let idx = trimmed.rfind(['\\', '/'])?;
+    if idx == 0 {
+        return None; // root-relative like `\foo.exe`: no usable directory
+    }
+    let dir = trimmed.get(..idx)?.replace('/', "\\");
+    if dir.ends_with(':') {
+        Some(format!("{dir}\\"))
     } else {
-        format!("C:\\App\\{name}")
+        Some(dir)
     }
 }
 /// Handles `KERNEL32.dll!GetModuleFileNameA`.
@@ -658,4 +697,72 @@ pub fn handle_sizeof_resource(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         return_address,
         return_value,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{guest_dir_of, resolve_windows_dll_path};
+
+    #[test]
+    fn dll_path_derives_from_main_module_dir() {
+        // A non-C:\App main module: the synthesized path follows its directory.
+        assert_eq!(
+            resolve_windows_dll_path("x.dll", r"C:\Program Files\MyApp\main.exe", ""),
+            r"C:\Program Files\MyApp\x.dll"
+        );
+    }
+
+    #[test]
+    fn dll_path_keeps_app_dir_when_main_module_is_under_it() {
+        // Main module under C:\App: the derived (not literal) dir is C:\App.
+        assert_eq!(
+            resolve_windows_dll_path("x.dll", r"C:\App\myapp.exe", r"C:\App"),
+            r"C:\App\x.dll"
+        );
+    }
+
+    #[test]
+    fn dll_path_falls_back_to_guest_cwd() {
+        assert_eq!(
+            resolve_windows_dll_path("x.dll", "", r"C:\work"),
+            r"C:\work\x.dll"
+        );
+        // A bare file name has no directory component either.
+        assert_eq!(
+            resolve_windows_dll_path("x.dll", "main.exe", r"C:\work"),
+            r"C:\work\x.dll"
+        );
+    }
+
+    #[test]
+    fn dll_path_last_resort_is_drive_root_not_literal_app() {
+        assert_eq!(resolve_windows_dll_path("x.dll", "", ""), r"C:\x.dll");
+    }
+
+    #[test]
+    fn dll_path_passes_qualified_names_through() {
+        assert_eq!(
+            resolve_windows_dll_path(r"C:\sys\x.dll", "", ""),
+            r"C:\sys\x.dll"
+        );
+        assert_eq!(
+            resolve_windows_dll_path("x.dll", r"C:\App\main.exe", ""),
+            r"C:\App\x.dll"
+        );
+    }
+
+    #[test]
+    fn guest_dir_of_splits_windows_paths_host_agnostically() {
+        assert_eq!(guest_dir_of(r"C:\App\main.exe"), Some(r"C:\App".to_owned()));
+        assert_eq!(
+            guest_dir_of(r"C:\Program Files\MyApp\main.exe"),
+            Some(r"C:\Program Files\MyApp".to_owned())
+        );
+        // A bare drive letter maps to the drive root.
+        assert_eq!(guest_dir_of(r"C:\main.exe"), Some(r"C:\".to_owned()));
+        assert_eq!(guest_dir_of("main.exe"), None);
+        assert_eq!(guest_dir_of(""), None);
+        // Forward slashes are normalized to backslashes.
+        assert_eq!(guest_dir_of(r"C:/App/main.exe"), Some(r"C:\App".to_owned()));
+    }
 }

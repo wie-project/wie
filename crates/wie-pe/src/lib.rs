@@ -72,10 +72,10 @@ pub struct ProcessIdentity {
     /// Basename used for command line / module file name (e.g. `heap_alloc.exe`)
     pub module_file_name: String,
 
-    /// Guest full path of the main module (e.g. `C:\App\heap_alloc.exe`)
+    /// Guest full path of the main module (e.g. `C:\heap_alloc.exe`)
     pub module_path: String,
 
-    /// Guest current directory (parent of `module_path`, e.g. `C:\App`)
+    /// Guest current directory (drive root by default, e.g. `C:\`)
     pub current_directory: String,
 
     /// Default command line (module basename, Windows-style)
@@ -93,6 +93,12 @@ pub fn process_identity_from_host_path(host_path: &Path) -> ProcessIdentity {
 /// `extra_args` are arguments after argv[0] (the module basename). The resulting
 /// `command_line` is suitable for `GetCommandLineA/W` (Microsoft Learn: process
 /// command-line string, space-separated, quoted when needed).
+///
+/// The guest module path and current directory default to the `C:` drive root
+/// (`C:\{name}` / `C:\`) — app-generic, not tied to any app directory. This
+/// crate is the loader and has no bottle/volume knowledge, so it cannot derive
+/// the guest path from the host path; a future refinement would map it through
+/// the volume config in the runtime crate.
 #[must_use]
 pub fn process_identity_from_host_path_with_args(
     host_path: &Path,
@@ -104,8 +110,8 @@ pub fn process_identity_from_host_path_with_args(
         .filter(|name| !name.is_empty())
         .unwrap_or("app.exe")
         .to_owned();
-    let module_path = format!(r"C:\App\{module_file_name}");
-    let current_directory = r"C:\App".to_owned();
+    let module_path = format!(r"C:\{module_file_name}");
+    let current_directory = r"C:\".to_owned();
     let command_line = build_windows_command_line(&module_file_name, extra_args);
     ProcessIdentity {
         module_file_name,
@@ -1205,9 +1211,21 @@ mod tests {
         let path = Path::new(r"/tmp/games/heap_alloc.exe");
         let id = process_identity_from_host_path(path);
         assert_eq!(id.module_file_name, "heap_alloc.exe");
-        assert_eq!(id.module_path, r"C:\App\heap_alloc.exe");
-        assert_eq!(id.current_directory, r"C:\App");
+        assert_eq!(id.module_path, r"C:\heap_alloc.exe");
+        assert_eq!(id.current_directory, r"C:\");
         assert_eq!(id.command_line, "heap_alloc.exe");
+    }
+
+    #[test]
+    fn process_identity_defaults_to_drive_root() {
+        // The defaults are app-generic: any exe lands at the C: drive root,
+        // not an app-specific directory.
+        let path = Path::new(r"/opt/tools/myapp.exe");
+        let id = process_identity_from_host_path(path);
+        assert_eq!(id.module_file_name, "myapp.exe");
+        assert_eq!(id.module_path, r"C:\myapp.exe");
+        assert_eq!(id.current_directory, r"C:\");
+        assert_eq!(id.command_line, "myapp.exe");
     }
 
     #[test]
