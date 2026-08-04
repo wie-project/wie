@@ -97,7 +97,12 @@ use edit::{
     edit_selection_type, edit_set_handle, edit_set_limit, edit_set_modify, edit_set_selection,
     edit_set_tab_stops, edit_undo,
 };
-use listbox::{listbox_hit_item, listbox_notify_change};
+use listbox::{
+    listbox_hit_item, listbox_key_move_selection, listbox_notify_change, listbox_scroll_wheel,
+};
+// Re-exported for the comdlg32 dialog build (`open_host_font_dialog` seeds
+// the font-dialog listboxes by scrolling the initial selection into view).
+pub(crate) use listbox::listbox_scroll_selection_into_view;
 use paint::write_control_text;
 // Re-exported for the host unit tests in `state/tests.rs` (the `edit` module
 // itself stays private to `controls`); test-only so the lib build has no
@@ -268,6 +273,7 @@ impl ControlClassKind {
             Self::ListBox => ControlState::ListBox {
                 items: Vec::new(),
                 sel_index: -1,
+                first_visible: 0,
             },
             Self::ComboBox => ControlState::ComboBox {
                 items: Vec::new(),
@@ -413,12 +419,19 @@ pub enum ControlState {
         /// visible row.
         last_paint_rows: usize,
     },
-    /// LISTBOX (item list, no scrollbar yet).
+    /// LISTBOX (item list; the wheel and arrow keys scroll it).
     ListBox {
         /// List items, in insertion order.
         items: Vec<String>,
         /// Selected item index (-1 = no selection).
         sel_index: i32,
+        /// First visible item index — the LISTBOX scroll offset. The mouse
+        /// wheel moves it (3 rows per notch, the Windows default), the arrow
+        /// keys keep the selection inside the viewport (scroll-into-view),
+        /// and the paint renders the item rows from here. Scrollbar CHROME is
+        /// deliberately deferred (the EDIT's precedent): the viewport scrolls
+        /// with no visible scrollbar thumb until a later task.
+        first_visible: usize,
     },
     /// COMBOBOX (edit+list; no dropdown yet).
     ComboBox {
@@ -786,7 +799,9 @@ impl ControlClassKind {
                     }
                 }
                 if self == ControlClassKind::ListBox {
-                    // A click on an item row selects it and notifies the parent.
+                    // A click on an item row selects it and notifies the
+                    // parent; the selection is kept visible (a click on a row
+                    // below the fold scrolls it into view).
                     let clicked = listbox_hit_item(state, hwnd, long_parameter);
                     let changed = clicked.is_some_and(|index| {
                         let ControlState::ListBox { sel_index, .. } =
@@ -800,6 +815,7 @@ impl ControlClassKind {
                         *sel_index = index;
                         true
                     });
+                    listbox_scroll_selection_into_view(state, hwnd);
                     invalidate(state, hwnd);
                     if changed {
                         return listbox_notify_change(state, hwnd);
@@ -1212,6 +1228,15 @@ impl ControlClassKind {
                 }
                 Ok(Some(0))
             }
+            // WM_MOUSEWHEEL: the signed delta in the wParam high word scrolls
+            // the LISTBOX item viewport (3 rows per notch — the Windows
+            // default). Same focus routing as the EDIT.
+            (ControlClassKind::ListBox, WinMsg::WM_MOUSEWHEEL) => {
+                if listbox_scroll_wheel(state, hwnd, word_parameter) {
+                    invalidate(state, hwnd);
+                }
+                Ok(Some(0))
+            }
             (ControlClassKind::Edit, WinMsg::EM_GETMODIFY) => {
                 Ok(Some(edit_get_modify(state, hwnd)))
             }
@@ -1305,6 +1330,22 @@ impl ControlClassKind {
                 }
                 Ok(Some(0))
             }
+            // Arrow keys on a focused LISTBOX move the selection one row and
+            // keep it visible (scroll-into-view); a changed selection
+            // notifies the parent like a click. The focus gate mirrors the
+            // push-button space handling — keys only steer the focused
+            // control.
+            (ControlClassKind::ListBox, WinMsg::WM_KEYDOWN)
+                if matches!(word_parameter & 0xFF, VK_UP | VK_DOWN) =>
+            {
+                if state.window_state().focus_window_handle == crate::handles::Hwnd::from(hwnd)
+                    && listbox_key_move_selection(state, hwnd, word_parameter)
+                {
+                    invalidate(state, hwnd);
+                    return listbox_notify_change(state, hwnd);
+                }
+                Ok(Some(0))
+            }
             // LB_SETCURSEL / CB_SETCURSEL: wParam = item index (-1 clears);
             // out-of-range is LB_ERR. A changed selection delivers
             // LBN_SELCHANGE to the parent.
@@ -1327,6 +1368,9 @@ impl ControlClassKind {
                     _ => -1,
                 };
                 invalidate(state, hwnd);
+                // A programmatic selection lands on a possibly-scrolled
+                // viewport: bring it into view like a click would.
+                listbox_scroll_selection_into_view(state, hwnd);
                 if previous != index {
                     return listbox_notify_change(state, hwnd);
                 }

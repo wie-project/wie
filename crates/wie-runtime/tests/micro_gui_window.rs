@@ -1368,6 +1368,218 @@ fn notepad_file_save_as_builds_interactive_dialog() {
     );
 }
 
+/// The font dialog (ChooseFontW, comdlg32) must SURVIVE a click on one of
+/// its controls: the click's repaint publishes a frame that still carries the
+/// dialog's pixels in the OWNER surface (the dialog composites into its
+/// owner — it has no winit window of its own).
+///
+/// In-process repro of the reported "the dialog becomes invisible if I click
+/// on it": drive notepad's Format > Font (the REAL menu → WM_COMMAND path),
+/// wait for the dialog face in the owner's published frame, click the family
+/// LISTBOX through the host hit-test + posting path (exactly what app.rs does
+/// for winit mouse events), then require the face to STAY in the owner frame
+/// across the click's repaint cycle. The click must select the listbox row,
+/// not erase the dialog.
+#[test]
+fn notepad_font_dialog_survives_control_click() {
+    let Some(path) = real_exe("notepad.exe") else {
+        eprintln!("skip: real_exes/notepad.exe not present");
+        return;
+    };
+    let _suite = gui_suite_serialize();
+    use wie_runtime::EntryTraceTermination;
+
+    const WM_COMMAND: u32 = 0x0111;
+    const WM_LBUTTONDOWN: u32 = 0x0201;
+    const WM_LBUTTONUP: u32 = 0x0202;
+    const MK_LBUTTON: u64 = 0x0001;
+    // The font dialog's size (comdlg32): the dialog is centered in the owner
+    // and its controls sit at fixed offsets inside it.
+    const FONT_DLG_CX: i32 = 340;
+    const FONT_DLG_CY: i32 = 260;
+
+    let mut session =
+        wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
+            .expect("notepad session starts");
+    session.set_font_dialog_policy(wie_winapi::FontDialogPolicy::Interactive);
+    let handle = session.guest_handle();
+    pump_until_windows_ready(&mut session);
+
+    let main = session.first_guest_window_handle().unwrap_or(0);
+    // The Format > Font command id (the guest's own menu tree, like the bar).
+    let font_id = handle
+        .window_menu_items()
+        .iter()
+        .find_map(|top| {
+            top.children
+                .iter()
+                .find(|child| child.title.to_lowercase().contains("font"))
+                .map(|child| child.id)
+        })
+        .unwrap_or(0);
+    assert_ne!(font_id, 0, "the Format menu must contain a Font command");
+
+    // The font dialog is centered in the owner; its face sample is 5 px in
+    // from the dialog's top-left corner (clear of the 1 px border and the
+    // "Font:" label at x=8).
+    let (_hwnd, _title, owner_w, owner_h) =
+        handle
+            .first_guest_window_info()
+            .unwrap_or((0, String::new(), 0, 0));
+    let dx = owner_w.saturating_sub(FONT_DLG_CX).saturating_div(2);
+    let dy = owner_h.saturating_sub(FONT_DLG_CY).saturating_div(2);
+    let face_px_at = |frame: &wie_winapi::present::SurfaceFrame| {
+        let x = usize::try_from(dx + 5).unwrap_or(0);
+        let y = usize::try_from(dy + 5).unwrap_or(0);
+        frame.pixels.get(y * frame.width as usize + x).copied()
+    };
+
+    handle.post_message(main, WM_COMMAND, u64::from(font_id), 0);
+
+    let opened = wait_for_window_class(&mut session, &handle, "FontDialog");
+    assert!(
+        opened,
+        "Format > Font must build the font dialog (a FontDialog window)"
+    );
+
+    // The family LISTBOX is at dialog (72,8,168,140); click row 2's band.
+    let click_owner_x = dx + 72 + 40;
+    let click_owner_y = dy + 8 + 40;
+
+    let mut saw_face_before_click = false;
+    let mut clicked = false;
+    let mut lost_face_after_click = false;
+    let mut saw_sel_change_effect = false;
+    let mut settle_after_effect = 0;
+    let mut iterations = 0;
+    loop {
+        let summary = session
+            .run_until_stop(1_000_000)
+            .expect("notepad run_until_stop");
+        iterations += 1;
+        if iterations >= 800 {
+            let face_now = session
+                .first_guest_window_handle()
+                .and_then(|owner| session.take_frame(owner))
+                .map(|f| face_px_at(&f));
+            let (fw, fh) = session
+                .first_guest_window_handle()
+                .and_then(|owner| session.take_frame(owner))
+                .map(|f| (f.width, f.height))
+                .unwrap_or((0, 0));
+            // Where is BTNFACE in the frame? The first few rows that contain
+            // it tell us where the dialog actually sits.
+            let rows: Vec<u32> = session
+                .first_guest_window_handle()
+                .and_then(|owner| session.take_frame(owner))
+                .map(|f| {
+                    (0..fh)
+                        .filter(|y| {
+                            f.pixels.get(*y as usize * f.width as usize).copied()
+                                == Some(BTNFACE_0RGB)
+                        })
+                        .take(5)
+                        .collect()
+                })
+                .unwrap_or_default();
+            panic!(
+                "notepad font-dialog click session stalled: \
+                 saw_face={saw_face_before_click} clicked={clicked} \
+                 lost_face={lost_face_after_click} effect={saw_sel_change_effect} \
+                 face_now={face_now:?} frame={fw}x{fh} bfnface_col0_rows={rows:?} \
+                 font_dialog_open={}",
+                session
+                    .guest_windows_snapshot()
+                    .iter()
+                    .any(|(_, cls, ..)| cls == "FontDialog")
+            );
+        }
+        if matches!(
+            summary.termination,
+            EntryTraceTermination::ExitProcess { .. }
+        ) {
+            break;
+        }
+
+        if let Some(owner) = session.first_guest_window_handle()
+            && let Some(frame) = session.take_frame(owner)
+        {
+            let face = face_px_at(&frame);
+            if face == Some(BTNFACE_0RGB) {
+                saw_face_before_click = true;
+            }
+            if clicked && saw_face_before_click && face != Some(BTNFACE_0RGB) {
+                // The dialog's face was in the owner frame and the click's
+                // repaint removed it — the reported click-invisibility.
+                lost_face_after_click = true;
+            }
+            if clicked {
+                // The clicked row must be highlighted in the listbox area
+                // (the selection followed the click through the repaint).
+                let highlight = (dy + 8..dy + 8 + 140).fold(0_u32, |acc, y| {
+                    acc + (dx + 72..dx + 72 + 168).fold(0_u32, |acc, x| {
+                        let idx = usize::try_from(y).unwrap_or(0) * frame.width as usize
+                            + usize::try_from(x).unwrap_or(0);
+                        acc + u32::from(frame.pixels.get(idx).copied() == Some(0x0000_78D7))
+                    })
+                });
+                if highlight > 100 {
+                    saw_sel_change_effect = true;
+                }
+            }
+        }
+
+        if !clicked && saw_face_before_click {
+            // The dialog is visible: click the family LISTBOX (host path).
+            if let Some((hwnd, rx, ry)) = handle.window_at(click_owner_x, click_owner_y)
+                && hwnd != 0
+                && rx < 168
+                && ry < 140
+            {
+                let lparam = u64::from(ry << 16 | rx);
+                handle.post_message_at(
+                    hwnd,
+                    WM_LBUTTONDOWN,
+                    MK_LBUTTON,
+                    lparam,
+                    click_owner_x,
+                    click_owner_y,
+                );
+                handle.post_message_at(hwnd, WM_LBUTTONUP, 0, lparam, click_owner_x, click_owner_y);
+                clicked = true;
+            }
+        }
+
+        // Once the click's repaint published (the highlight is visible), let
+        // a few more frames settle, then verify the dialog face survived.
+        if clicked && saw_sel_change_effect {
+            settle_after_effect += 1;
+            if settle_after_effect >= 5 {
+                break;
+            }
+        }
+
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    assert!(
+        saw_face_before_click,
+        "the font dialog face (0xF0F0F0) never appeared in the owner frame"
+    );
+    assert!(
+        !lost_face_after_click,
+        "the font dialog face disappeared from the owner frame after a click \
+         on the family listbox — the click-invisibility regression"
+    );
+    assert!(
+        saw_sel_change_effect,
+        "the click must select + highlight a listbox row (the selection \
+         followed the click)"
+    );
+}
+
 /// WM_COMMAND(CMD_NEW) must not kill the session (no emulation error), even
 /// on a doc with typed text — the save-prompt path must fire without the
 /// guest stopping. On a clean doc FileNew is a no-op; the assertion here is

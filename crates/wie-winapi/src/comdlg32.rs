@@ -150,8 +150,14 @@ const FONT_DLG_FAMILY_LIST_ID: u64 = 1300;
 const FONT_DLG_SIZE_LIST_ID: u64 = 1301;
 
 /// Font-dialog window size (pixels).
+///
+/// The height leaves the Strikeout/Underline effects row (y=224, 20 px tall)
+/// fully INSIDE the dialog with a bottom margin — the pre-fix 230 clipped
+/// the buttons' bottom 14 px off the dialog (the reported "Strikeout and
+/// Underline are outside the dialog" bug). 260 matches the classic Windows
+/// font dialog's ~320×260 proportions.
 const FONT_DLG_CX: i32 = 340;
-const FONT_DLG_CY: i32 = 230;
+const FONT_DLG_CY: i32 = 260;
 
 /// Handles `comdlg32.dll!GetOpenFileNameA`.
 pub fn handle_get_open_file_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -2643,7 +2649,9 @@ fn open_host_font_dialog(ctx: &mut HandlerContext<'_>, cf_ptr: u64) -> Result<Wi
         .control_states
         .entry(Hwnd::from(size_list_hwnd))
         .or_insert_with(|| ControlClassKind::ListBox.new_state());
-    if let ControlState::ListBox { items, sel_index } = state
+    if let ControlState::ListBox {
+        items, sel_index, ..
+    } = state
         .window_state()
         .control_states
         .get_mut(&Hwnd::from(family_list_hwnd))
@@ -2652,7 +2660,9 @@ fn open_host_font_dialog(ctx: &mut HandlerContext<'_>, cf_ptr: u64) -> Result<Wi
         *items = family_names;
         *sel_index = i32::try_from(seed_family_index).unwrap_or(0);
     }
-    if let ControlState::ListBox { items, sel_index } = state
+    if let ControlState::ListBox {
+        items, sel_index, ..
+    } = state
         .window_state()
         .control_states
         .get_mut(&Hwnd::from(size_list_hwnd))
@@ -2661,6 +2671,13 @@ fn open_host_font_dialog(ctx: &mut HandlerContext<'_>, cf_ptr: u64) -> Result<Wi
         *items = point_sizes;
         *sel_index = seed_size_index;
     }
+    // Bring the seeded selections into view: the guest's current family may
+    // sit far down the host database, and the size seed at 12 pt is near the
+    // top — the viewport opens showing the selected rows (Windows behavior).
+    let _scrolled_family =
+        crate::user32::controls::listbox_scroll_selection_into_view(state, family_list_hwnd);
+    let _scrolled_size =
+        crate::user32::controls::listbox_scroll_selection_into_view(state, size_list_hwnd);
 
     // The dialog is modal: an empty GetMessage must yield, and the dialog
     // takes activation.
@@ -2800,7 +2817,9 @@ pub(crate) fn complete_font_dialog(
             .control_states
             .get(&Hwnd::from(session.family_list_hwnd))
             .and_then(|control_state| match control_state {
-                ControlState::ListBox { items, sel_index } => {
+                ControlState::ListBox {
+                    items, sel_index, ..
+                } => {
                     let index = usize::try_from(*sel_index).ok()?;
                     items.get(index).cloned()
                 }
@@ -2811,7 +2830,9 @@ pub(crate) fn complete_font_dialog(
             .control_states
             .get(&Hwnd::from(session.size_list_hwnd))
             .and_then(|control_state| match control_state {
-                ControlState::ListBox { items, sel_index } => {
+                ControlState::ListBox {
+                    items, sel_index, ..
+                } => {
                     let index = usize::try_from(*sel_index).ok()?;
                     items.get(index).and_then(|text| text.parse::<i32>().ok())
                 }
@@ -4123,7 +4144,9 @@ mod tests {
             session.family_list_hwnd
         );
         // The family list carries the host database families with a selection.
-        let ControlState::ListBox { items, sel_index } = state
+        let ControlState::ListBox {
+            items, sel_index, ..
+        } = state
             .window_state()
             .control_states
             .get(&Hwnd::from(session.family_list_hwnd))
@@ -4137,6 +4160,7 @@ mod tests {
         let ControlState::ListBox {
             items: sizes,
             sel_index: size_sel,
+            ..
         } = state
             .window_state()
             .control_states
@@ -4149,6 +4173,222 @@ mod tests {
         assert_eq!(*size_sel, 4, "lfHeight 0 → 12 pt seed");
     }
 
+    /// Paint the whole font-dialog subtree exactly like the pump's repaint
+    /// cycle: the dialog face first (WM_PAINT → paint_dialog), then each
+    /// visible control's WM_PAINT via the control dispatch.
+    fn paint_font_dialog_subtree(engine: &mut IcedCpu, state: &mut WinApiState, dialog_hwnd: u64) {
+        crate::user32::dialog::paint_dialog(state, dialog_hwnd);
+        let children: Vec<u64> = state
+            .window_state()
+            .windows
+            .iter()
+            .filter(|w| w.parent_handle == Hwnd::from(dialog_hwnd))
+            .map(|w| w.handle.as_u64())
+            .collect();
+        for hwnd in children {
+            crate::user32::dispatch_control_proc(
+                engine,
+                state,
+                hwnd,
+                crate::user32::WinMsg::WM_PAINT.as_u32(),
+                0,
+                0,
+            )
+            .expect("control WM_PAINT");
+        }
+    }
+
+    #[test]
+    fn font_dialog_survives_control_click_in_owner_frame() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        let owner_hwnd = create_owner_window(&mut state);
+
+        // Open the font dialog parented to the owner (hwndOwner → owner).
+        state.window_state().file_dialog_loop_va = 0x7000_0040_B000;
+        state.window_state().file_dialog_proc_va = 0x7000_0040_B100;
+        write_logfont(&mut engine, 0x6000, "", 1);
+        write_choosefont(&mut engine, 0x5000, 0x6000, 0x1 | 0x40, 0x00_30_50);
+        engine.mem_write(0x5008, &owner_hwnd.to_le_bytes()).ok();
+        dispatch_choose_font(&mut engine, &mut state, FontDialogPolicy::Interactive)
+            .expect_err("interactive must request the modal loop");
+        let session = state.window_state().font_dialog.as_ref().unwrap().clone();
+        let dialog_hwnd = session.dialog_hwnd;
+
+        // Open cycle: paint the face + every control, then drain.
+        paint_font_dialog_subtree(&mut engine, &mut state, dialog_hwnd);
+        state.present().drain_pending_publishes();
+
+        let owner = Hwnd::from(owner_hwnd);
+        let sample = |state: &mut WinApiState| -> Option<u32> {
+            let frame = state.present().published.get(&owner)?.clone();
+            let idx = 190_usize * frame.width as usize + 235_usize;
+            frame.pixels.get(idx).copied()
+        };
+        // The dialog face (BTNFACE) must be present in the owner frame.
+        assert_eq!(
+            sample(&mut state),
+            Some(0x00F0_F0F0),
+            "dialog face must appear in the owner frame after the open cycle"
+        );
+
+        // Click the family listbox (dialog-relative (72,8,168,140); click at
+        // child-relative (20,40) → item row 2).
+        let lparam = u64::from(40_u32 << 16 | 20_u32);
+        let click = crate::user32::dispatch_control_proc(
+            &mut engine,
+            &mut state,
+            session.family_list_hwnd,
+            crate::user32::WinMsg::WM_LBUTTONDOWN.as_u32(),
+            1,
+            lparam,
+        );
+        assert!(
+            click.is_err(),
+            "the selection change notifies the dialog proc"
+        );
+
+        // The click invalidated the listbox: repaint it (the next cycle).
+        crate::user32::dispatch_control_proc(
+            &mut engine,
+            &mut state,
+            session.family_list_hwnd,
+            crate::user32::WinMsg::WM_PAINT.as_u32(),
+            0,
+            0,
+        )
+        .expect("listbox WM_PAINT");
+        state.present().drain_pending_publishes();
+
+        assert_eq!(
+            sample(&mut state),
+            Some(0x00F0_F0F0),
+            "dialog face must SURVIVE a click on a listbox control"
+        );
+        // The listbox area itself is white (COLOR_WINDOW) and the clicked row
+        // is highlighted (COLOR_HIGHLIGHT) somewhere in the listbox rect
+        // (302,193)-(470,333) in the owner — the selection followed the click.
+        let frame = state
+            .present()
+            .published
+            .get(&owner)
+            .expect("owner frame after click")
+            .clone();
+        let highlight = (193..333).fold(0_u32, |acc, y| {
+            acc + (302..470).fold(0_u32, |acc, x| {
+                let idx = y as usize * frame.width as usize + x as usize;
+                acc + u32::from(frame.pixels.get(idx).copied() == Some(0x0000_78D7))
+            })
+        });
+        assert!(
+            highlight > 100,
+            "the clicked listbox row must be highlighted (COLOR_HIGHLIGHT); found {highlight} px"
+        );
+    }
+
+    #[test]
+    fn font_dialog_controls_fit_inside_the_dialog_bounds() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        font_dialog_scaffold(&mut engine, &mut state, "", 0x1 | 0x40);
+        let session = state.window_state().font_dialog.as_ref().unwrap().clone();
+        let dialog = find_window(&mut state, session.dialog_hwnd).expect("dialog window");
+        let (dialog_w, dialog_h) = (dialog.width, dialog.height);
+        assert_eq!(
+            (dialog_w, dialog_h),
+            (340, 260),
+            "font dialog is ~320x260-ish"
+        );
+
+        let children: Vec<(i32, i32, i32, i32, String)> = state
+            .window_state()
+            .windows
+            .iter()
+            .filter(|w| w.parent_handle == Hwnd::from(session.dialog_hwnd))
+            .map(|w| (w.x, w.y, w.width, w.height, w.class_name.clone()))
+            .collect();
+        assert_eq!(children.len(), 8, "label + list + label + list + 4 buttons");
+        for (x, y, w, h, class) in children {
+            assert!(x >= 0 && y >= 0, "{class} sits at a negative position");
+            assert!(
+                x.saturating_add(w) <= dialog_w,
+                "{class} overflows the dialog's right edge (x={x} w={w} dialog_w={dialog_w})"
+            );
+            assert!(
+                y.saturating_add(h) <= dialog_h,
+                "{class} overflows the dialog's bottom edge (y={y} h={h} \
+                 dialog_h={dialog_h}) — the Strikeout/Underline buttons were \
+                 outside the dialog before the height fix"
+            );
+        }
+    }
+
+    #[test]
+    fn font_dialog_family_list_scrolls_via_wheel_and_arrows() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        font_dialog_scaffold(&mut engine, &mut state, "", 0x1 | 0x40);
+        let session = state.window_state().font_dialog.as_ref().unwrap().clone();
+
+        // The family list holds the whole host database — far more rows than
+        // the 140 px tall listbox can show, so the wheel must scroll it.
+        let family = session.family_list_hwnd;
+        let list_state = |state: &mut WinApiState| {
+            let ControlState::ListBox {
+                items,
+                sel_index,
+                first_visible,
+            } = state
+                .window_state()
+                .control_states
+                .get(&Hwnd::from(family))
+                .expect("family listbox state")
+            else {
+                panic!("family list is a listbox");
+            };
+            (items.len(), *sel_index, *first_visible)
+        };
+        let (count, sel, first) = list_state(&mut state);
+        assert!(count > 10, "the host db must overflow the listbox viewport");
+        assert_eq!(sel, 0, "default selection is the first family");
+        // The seeded selection (index 0) is already visible — no initial scroll.
+        assert_eq!(first, 0);
+
+        // Wheel down over the listbox: the viewport scrolls 3 rows.
+        let wheel_down = u64::from(u16::MAX - 119) << 16; // delta = -120
+        crate::user32::dispatch_control_proc(
+            &mut engine,
+            &mut state,
+            family,
+            crate::user32::WinMsg::WM_MOUSEWHEEL.as_u32(),
+            wheel_down,
+            0,
+        )
+        .expect("wheel scrolls the family list");
+        let (_, _, first) = list_state(&mut state);
+        assert_eq!(first, 3, "one wheel notch scrolls 3 rows");
+
+        // Arrow keys move the selection and keep it visible (focused).
+        let keydown = crate::user32::dispatch_control_proc(
+            &mut engine,
+            &mut state,
+            family,
+            crate::user32::WinMsg::WM_KEYDOWN.as_u32(),
+            0x28, // VK_DOWN
+            0,
+        );
+        assert!(
+            keydown.is_err(),
+            "a selection change notifies the dialog proc"
+        );
+        let (_, sel, first) = list_state(&mut state);
+        assert_eq!(sel, 1, "VK_DOWN moves the selection one row");
+        assert!(
+            sel >= i32::try_from(first).unwrap_or(0),
+            "the selection stays visible after the key move"
+        );
+    }
+
     #[test]
     fn end_dialog_font_writes_logfont_and_choosefont_back() {
         let mut engine = test_engine();
@@ -4158,7 +4398,9 @@ mod tests {
 
         // The seeded family is whatever the host db lists first; the write-back
         // must mirror exactly that (plus the seeded 12 pt size).
-        let ControlState::ListBox { items, sel_index } = state
+        let ControlState::ListBox {
+            items, sel_index, ..
+        } = state
             .window_state()
             .control_states
             .get(&Hwnd::from(session.family_list_hwnd))

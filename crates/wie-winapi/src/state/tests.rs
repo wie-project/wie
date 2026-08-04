@@ -7271,7 +7271,9 @@ impl ControlUiSnapshot {
                     snap.invalid_rows = *invalid_rows;
                     snap.last_paint_rows = *last_paint_rows;
                 }
-                Some(ControlState::ListBox { items, sel_index }) => {
+                Some(ControlState::ListBox {
+                    items, sel_index, ..
+                }) => {
                     snap.items = items.clone();
                     snap.sel_index = *sel_index;
                 }
