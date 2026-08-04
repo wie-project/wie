@@ -247,20 +247,41 @@ fn format_into<U: FmtUnit>(
                 precision = Some(p.min(MAX_FORMAT_OUTPUT));
             }
         }
-        // Length modifiers (h/hh/l/ll/j/z/t/L/I32/I64): every Win64 vararg
-        // slot is one full register width, so they are consumed without
-        // changing how arguments are read or formatted.
+        // Length modifiers (h/hh/l/ll/j/z/t/L/I32/I64). Every Win64 vararg
+        // occupies one 8-byte slot, but a 32-bit conversion (%d/%u/%x) reads
+        // only the low 32 bits of that slot — callers build va_lists over
+        // their own stack frames, where a 32-bit store leaves the high bytes
+        // stale (RNotepad's StringCchPrintfW va_list read 0x1CD_0000_0001 for
+        // a stored column of 1). `wide_arg` tracks the modifiers that demand
+        // the full 64-bit value (ll, j, z, t, I64); plain `l` is a 32-bit
+        // long on Windows.
+        let mut wide_arg = false;
         while i < fmt.len() {
             let b = fmt[i];
-            if b.is_byte(b'h')
-                || b.is_byte(b'l')
-                || b.is_byte(b'j')
-                || b.is_byte(b'z')
-                || b.is_byte(b't')
-                || b.is_byte(b'L')
-                || b.is_byte(b'I')
-            {
+            if b.is_byte(b'h') || b.is_byte(b'L') {
                 i += 1;
+            } else if b.is_byte(b'l') {
+                // 'l' alone is 32-bit; 'll' is 64-bit.
+                if i + 1 < fmt.len() && fmt[i + 1].is_byte(b'l') {
+                    wide_arg = true;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            } else if b.is_byte(b'j') || b.is_byte(b'z') || b.is_byte(b't') {
+                wide_arg = true;
+                i += 1;
+            } else if b.is_byte(b'I') {
+                // I32 / I64 (UCRT fixed-width prefix); bare 'I' is consumed.
+                if i + 2 < fmt.len() && fmt[i + 1].is_byte(b'6') && fmt[i + 2].is_byte(b'4') {
+                    wide_arg = true;
+                    i += 3;
+                } else if i + 2 < fmt.len() && fmt[i + 1].is_byte(b'3') && fmt[i + 2].is_byte(b'2')
+                {
+                    i += 3;
+                } else {
+                    i += 1;
+                }
             } else {
                 break;
             }
@@ -276,7 +297,14 @@ fn format_into<U: FmtUnit>(
             b'%' => out.push(U::from_byte(b'%')),
             b'd' | b'i' => {
                 let v = read_vararg(engine, va);
-                let signed = i64::from_ne_bytes(v.to_ne_bytes());
+                // %d / %i is a 32-bit int: sign-extend the low slot word so
+                // stale high bytes never leak into the printed value.
+                let signed = if wide_arg {
+                    i64::from_ne_bytes(v.to_ne_bytes())
+                } else {
+                    let low = u32::try_from(v & u64::from(u32::MAX)).unwrap_or(0);
+                    i64::from(i32::from_ne_bytes(low.to_ne_bytes()))
+                };
                 emit_numeric(
                     out,
                     width,
@@ -288,21 +316,31 @@ fn format_into<U: FmtUnit>(
             }
             b'u' => {
                 let v = read_vararg(engine, va);
+                let unsigned = if wide_arg {
+                    v
+                } else {
+                    u64::from(u32::try_from(v & u64::from(u32::MAX)).unwrap_or(0))
+                };
                 emit_numeric(
                     out,
                     width,
                     precision,
                     left_justify,
                     zero_pad,
-                    &v.to_string(),
+                    &unsigned.to_string(),
                 );
             }
             b'x' | b'X' => {
                 let v = read_vararg(engine, va);
-                let s = if spec.to_u8() == b'X' {
-                    format!("{v:X}")
+                let hex = if wide_arg {
+                    v
                 } else {
-                    format!("{v:x}")
+                    u64::from(u32::try_from(v & u64::from(u32::MAX)).unwrap_or(0))
+                };
+                let s = if spec.to_u8() == b'X' {
+                    format!("{hex:X}")
+                } else {
+                    format!("{hex:x}")
                 };
                 emit_numeric(out, width, precision, left_justify, zero_pad, &s);
             }

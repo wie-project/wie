@@ -6,18 +6,18 @@ use anyhow::Result;
 use super::listbox::render_control_text;
 use super::paint::fill_rect_clipped;
 use super::{
-    control_state, deliver_command, ControlClassKind, ControlState, COLOR_HIGHLIGHT,
-    COLOR_HIGHLIGHTTEXT, ES_MULTILINE, SEL_EMPTY, SEL_MULTICHAR, SEL_MULTILINE, SEL_TEXT,
+    COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, ControlClassKind, ControlState, ES_MULTILINE, SEL_EMPTY,
+    SEL_MULTICHAR, SEL_MULTILINE, SEL_TEXT, control_state, deliver_command,
 };
 use crate::gdi32::ResolvedWindow;
 use crate::gdi32::{FontEngine, FontKey, ResolvedFont};
 use crate::guest_memory::read_u16 as read_guest_u16;
 use crate::state::{TimerRecord, WindowFlags};
 use crate::user32::{
-    find_window, find_window_mut, make_command_wparam, read_guest_ansi_lossy,
-    read_guest_utf16_lossy, write_guest_ansi_c_string, write_guest_i32, write_guest_utf16_c_string,
-    WinApiState, EN_CHANGE, VK_CONTROL, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR,
-    VK_RIGHT, VK_SHIFT, VK_UP,
+    EN_CHANGE, VK_CONTROL, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT,
+    VK_SHIFT, VK_UP, WinApiState, find_window, find_window_mut, make_command_wparam,
+    read_guest_ansi_lossy, read_guest_utf16_lossy, write_guest_ansi_c_string, write_guest_i32,
+    write_guest_utf16_c_string,
 };
 
 /// Cap for guest buffer reads (EM_SETHANDLE / EM_REPLACESEL adoption).
@@ -766,12 +766,20 @@ pub(super) fn edit_set_selection(state: &mut WinApiState, hwnd: u64, start: i32,
 /// EDIT: EM_GETSEL — the current (start, end) character range, normalized.
 #[must_use]
 pub(super) fn edit_get_selection(state: &WinApiState, hwnd: u64) -> (usize, usize) {
-    match control_state(state, hwnd) {
+    let sel = match control_state(state, hwnd) {
         Some(ControlState::Edit {
             sel_start, sel_end, ..
         }) => ((*sel_start).min(*sel_end), (*sel_start).max(*sel_end)),
         _ => (0, 0),
-    }
+    };
+    tracing::debug!(
+        target: "wie_winapi",
+        hwnd = format_args!("{hwnd:#x}"),
+        start = sel.0,
+        end = sel.1,
+        "EM_GETSEL"
+    );
+    sel
 }
 
 /// EDIT: EM_LIMITTEXT — the typing cap in characters (0 = unlimited).
@@ -810,6 +818,13 @@ pub(super) fn edit_line_from_char(state: &WinApiState, hwnd: u64, char_index: i3
     } else {
         line_from_char(text, usize::try_from(char_index).unwrap_or(usize::MAX))
     };
+    tracing::debug!(
+        target: "wie_winapi",
+        hwnd = format_args!("{hwnd:#x}"),
+        char_index,
+        line,
+        "EM_LINEFROMCHAR"
+    );
     u64::try_from(line).unwrap_or(0)
 }
 
@@ -817,14 +832,23 @@ pub(super) fn edit_line_from_char(state: &WinApiState, hwnd: u64, char_index: i3
 /// the line is out of range).
 #[must_use]
 pub(super) fn edit_line_index(state: &WinApiState, hwnd: u64, line: i32) -> u64 {
-    if line < 0 {
-        return u64::MAX; // -1
-    }
-    let text = edit_text(state, hwnd).unwrap_or_default();
-    match line_index_of(text, usize::try_from(line).unwrap_or(usize::MAX)) {
-        Some(index) => u64::try_from(index).unwrap_or(0),
-        None => u64::MAX,
-    }
+    let result = if line < 0 {
+        u64::MAX // -1
+    } else {
+        let text = edit_text(state, hwnd).unwrap_or_default();
+        match line_index_of(text, usize::try_from(line).unwrap_or(usize::MAX)) {
+            Some(index) => u64::try_from(index).unwrap_or(0),
+            None => u64::MAX,
+        }
+    };
+    tracing::debug!(
+        target: "wie_winapi",
+        hwnd = format_args!("{hwnd:#x}"),
+        line,
+        result = format_args!("{result:#x}"),
+        "EM_LINEINDEX"
+    );
+    result
 }
 
 /// EDIT: EM_LINELENGTH — characters in the line holding `wparam` (-1 = the

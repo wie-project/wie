@@ -16,6 +16,7 @@ use crate::user32::{
     WindowClassIdentifier, create_window_record, deliver_focus_change, find_window,
     find_window_mut, is_known_window, window_client_size,
 };
+use crate::vfs::VolumeConfig;
 use crate::{FileDialogPolicy, HandlerContext, OuterReturn, WinApiHandlerResult, WinApiState};
 use anyhow::{Context, Result};
 
@@ -500,9 +501,19 @@ fn resolve_dialog_owner(state: &mut WinApiState, owner_raw: u64) -> u64 {
 }
 
 /// Directory entry names (files and directories) of `guest_dir`, resolved
-/// through the host volume mapping. Empty when the directory cannot be listed.
+/// through the host volume mapping and confined to a guest volume.
+///
+/// `..` may ascend within a volume (`C:\App\..` lists the bottle root) but
+/// never above its root (`C:\..`), and only C: (bottle) / D: (bridge, when
+/// configured) are listable. Entries whose host path does not map back into
+/// a guest volume (e.g. a symlink pointing outside the bottle) are hidden.
+/// Empty when the directory is unmapped, escapes the volumes, or unreadable.
 fn list_directory(state: &WinApiState, guest_dir: &str) -> Vec<String> {
-    let Some(map) = crate::vfs::guest_path_to_host(&state.file_io.volumes, guest_dir) else {
+    let volumes = &state.file_io.volumes;
+    let Some(confined) = crate::vfs::confine_guest_path(volumes, guest_dir) else {
+        return Vec::new();
+    };
+    let Some(map) = crate::vfs::guest_path_to_host(volumes, &confined) else {
         return Vec::new();
     };
     let Ok(entries) = std::fs::read_dir(&map.host) else {
@@ -510,12 +521,39 @@ fn list_directory(state: &WinApiState, guest_dir: &str) -> Vec<String> {
     };
     let mut names: Vec<String> = entries
         .filter_map(Result::ok)
+        // A directory entry that maps to no guest path is not selectable
+        // (the guest filesystem cannot see it), so it is not listed.
+        .filter(|entry| crate::vfs::host_path_to_guest(volumes, &entry.path()).is_some())
         .filter_map(|entry| entry.file_name().into_string().ok())
         .collect();
     names.sort();
     // Cap the listing so a huge directory cannot starve the paint cycle.
     names.truncate(1024);
     names
+}
+
+/// The dialog's starting directory, always confined to a guest volume.
+///
+/// Resolution order: `lpstrInitialDir` when it is guest-visible, else the
+/// `lpstrFile` directory, else the guest cwd, else the bottle root (`C:\`).
+/// Any candidate that is not inside a guest volume (an unmapped drive, a
+/// host path, `..` above a volume root) falls through, so the dialog never
+/// opens browsing a directory the guest filesystem cannot see.
+fn resolve_initial_dir(
+    volumes: &VolumeConfig,
+    guest_cwd: &str,
+    caller_dir: &str,
+    file_dir: &str,
+) -> String {
+    for candidate in [caller_dir, file_dir] {
+        if !candidate.is_empty() && crate::vfs::confine_guest_path(volumes, candidate).is_some() {
+            return candidate.to_owned();
+        }
+    }
+    if crate::vfs::confine_guest_path(volumes, guest_cwd).is_some() {
+        return guest_cwd.to_owned();
+    }
+    r"C:\".to_owned()
 }
 
 /// Whether `path` is an absolute Windows path (drive letter or UNC separator).
@@ -589,25 +627,43 @@ pub(crate) fn complete_file_dialog(
         let edit_text = find_window(state, session.edit_hwnd)
             .map_or_else(String::new, |window| window.control_text.clone());
         let path = finalize_guest_path(&session, &edit_text);
-        if path.is_empty() {
-            0
+        // Confinement: the dialog only accepts paths inside a guest volume
+        // (the C: bottle or the optional D: bridge) — the LISTBOX never
+        // lists out-of-volume entries, so an Accept must not return one
+        // either. A typed path that escapes the volumes — `..` above a
+        // volume root, an unmapped drive, any host path — is refused like a
+        // cancel (FALSE, buffer untouched): the guest filesystem cannot see
+        // it, so accepting it would hand back a file that does not exist.
+        // `..` within a volume is collapsed and the canonical path written
+        // back, matching what the guest can actually open.
+        let accepted = if path.is_empty() {
+            None
         } else {
-            write_selected_path(
-                engine,
-                &SelectedPathWrite {
-                    ofn_ptr: session.ofn_ptr,
-                    file_buffer_ptr: session.file_buffer_ptr,
-                    max_file: session.max_file,
-                    file_title_ptr: session.file_title_ptr,
-                    max_file_title: session.max_file_title,
-                    path: &path,
-                    unicode: session.unicode,
-                },
-            )
-            .context("failed to write selected file-dialog path")?;
-            state.window_state().last_file_dialog_path = Some(path.clone());
-            tracing::info!(%path, unicode = session.unicode, "file dialog accepted");
-            1
+            crate::vfs::confine_guest_path(&state.file_io.volumes, &path)
+        };
+        match accepted {
+            None => {
+                tracing::info!(%path, "file dialog refused out-of-bottle selection");
+                0
+            }
+            Some(path) => {
+                write_selected_path(
+                    engine,
+                    &SelectedPathWrite {
+                        ofn_ptr: session.ofn_ptr,
+                        file_buffer_ptr: session.file_buffer_ptr,
+                        max_file: session.max_file,
+                        file_title_ptr: session.file_title_ptr,
+                        max_file_title: session.max_file_title,
+                        path: &path,
+                        unicode: session.unicode,
+                    },
+                )
+                .context("failed to write selected file-dialog path")?;
+                state.window_state().last_file_dialog_path = Some(path.clone());
+                tracing::info!(%path, unicode = session.unicode, "file dialog accepted");
+                1
+            }
         }
     };
     state.window_state().file_dialog = None;
@@ -680,16 +736,19 @@ fn open_host_file_dialog(
     .with_context(|| format!("failed to read lpstrDefExt for {api_name}"))?;
 
     let initial_file = read_ofn_string(engine, file_buffer_ptr, unicode, api_name)?;
-    let initial_dir = if initial_dir_ptr != 0 {
+    let caller_initial_dir = if initial_dir_ptr != 0 {
         read_ofn_string(engine, initial_dir_ptr, unicode, api_name)?
     } else {
-        let file_dir = directory_of(&initial_file);
-        if file_dir.is_empty() {
-            current_guest_directory(state)
-        } else {
-            file_dir.to_owned()
-        }
+        String::new()
     };
+    // Confined resolution: lpstrInitialDir wins when it is guest-visible,
+    // then the lpstrFile directory, then the guest cwd, else the bottle root.
+    let initial_dir = resolve_initial_dir(
+        &state.file_io.volumes,
+        &current_guest_directory(state),
+        &caller_initial_dir,
+        directory_of(&initial_file),
+    );
     let default_extension = if def_ext_ptr != 0 {
         Some(read_ofn_string(engine, def_ext_ptr, unicode, api_name)?)
     } else {
@@ -1751,7 +1810,7 @@ mod tests {
         apply_default_extension, basename_of, complete_file_dialog, directory_of,
         finalize_guest_path, handle_find_dialog_command, handle_find_text_w,
         handle_get_open_file_name_w, handle_replace_text_w, is_absolute_windows_path,
-        is_find_dialog_window, split_path_components,
+        is_find_dialog_window, list_directory, resolve_initial_dir, split_path_components,
     };
     use crate::guest_heap::GuestHeap;
     use crate::handles::Hwnd;
@@ -1774,6 +1833,7 @@ mod tests {
     };
     use ahash::HashMap;
     use ahash::HashMapExt;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use wie_cpu::{CpuEngine, IcedCpu};
 
@@ -2153,6 +2213,12 @@ mod tests {
     fn end_dialog_writes_chosen_path_for_file_dialog() {
         let mut engine = test_engine();
         let mut state = test_state();
+        // A bottle must be configured or the confinement would refuse the
+        // accept: `C:\new-note.txt` has to land inside the guest C: volume.
+        state.file_io.volumes = VolumeConfig {
+            bottle_root: Some(PathBuf::from("/tmp/bottle")),
+            drive_d_root: None,
+        };
         let loop_va = 0x7000_0040_B000;
         let proc_va = 0x7000_0040_B100;
         state.window_state().file_dialog_loop_va = loop_va;
@@ -2263,6 +2329,211 @@ mod tests {
             state.window_state().file_dialog.is_some(),
             "session untouched"
         );
+    }
+
+    // ── Bottle confinement (directory + selection) ────────────────────────
+
+    /// A temporary bottle with a small drive_c layout for listing tests.
+    fn temp_bottle(tag: &str) -> (PathBuf, VolumeConfig) {
+        let root = std::env::temp_dir().join(format!("wie-ofn-{tag}-{}", std::process::id()));
+        let drive_c = root.join("drive_c");
+        std::fs::create_dir_all(drive_c.join("App")).expect("create drive_c/App");
+        std::fs::create_dir_all(drive_c.join("Windows")).expect("create drive_c/Windows");
+        std::fs::write(drive_c.join("root.txt"), b"x").expect("write root file");
+        std::fs::write(drive_c.join("App").join("app.txt"), b"x").expect("write app file");
+        let volumes = VolumeConfig {
+            bottle_root: Some(root.clone()),
+            drive_d_root: None,
+        };
+        (root, volumes)
+    }
+
+    #[test]
+    fn resolve_initial_dir_prefers_confined_caller_dir() {
+        let volumes = VolumeConfig {
+            bottle_root: Some(PathBuf::from("/tmp/bottle")),
+            drive_d_root: None,
+        };
+        // lpstrInitialDir confined to the bottle wins over everything.
+        assert_eq!(
+            resolve_initial_dir(&volumes, r"C:\App", r"C:\work", r"C:\other"),
+            r"C:\work"
+        );
+        // Out-of-bottle lpstrInitialDir (unmapped D:, host path) falls
+        // through to the lpstrFile directory.
+        assert_eq!(
+            resolve_initial_dir(&volumes, r"C:\App", r"D:\x", r"C:\work"),
+            r"C:\work"
+        );
+        assert_eq!(
+            resolve_initial_dir(&volumes, r"C:\App", "/Users/me/x", r"C:\work"),
+            r"C:\work"
+        );
+        // ...then to the guest cwd when it is bottle-mapped.
+        assert_eq!(resolve_initial_dir(&volumes, r"C:\App", "", ""), r"C:\App");
+        // Nothing guest-visible → the bottle root.
+        assert_eq!(
+            resolve_initial_dir(&volumes, r"D:\cwd", r"D:\caller", r"D:\file"),
+            r"C:\"
+        );
+        // No bottle configured → the fallback root (listing will be empty).
+        assert_eq!(
+            resolve_initial_dir(&VolumeConfig::default(), r"C:\App", "", ""),
+            r"C:\"
+        );
+    }
+
+    #[test]
+    fn list_directory_confines_to_bottle_and_blocks_ascent() {
+        let (root, volumes) = temp_bottle("confine-list");
+        let mut state = test_state();
+        state.file_io.volumes = volumes;
+
+        // An in-bottle directory lists its own entries, no parent link.
+        let app = list_directory(&state, r"C:\App");
+        assert!(app.contains(&"app.txt".to_owned()));
+        assert!(!app.contains(&"..".to_owned()));
+
+        // `..` ascends within the volume: C:\App\.. → the bottle root.
+        let root_listing = list_directory(&state, r"C:\App\..");
+        assert!(root_listing.contains(&"App".to_owned()));
+        assert!(root_listing.contains(&"root.txt".to_owned()));
+
+        // Ascent above the bottle root is blocked (empty listing).
+        assert!(list_directory(&state, r"C:\App\..\..").is_empty());
+        assert!(list_directory(&state, r"C:\..").is_empty());
+
+        // Unmapped drives and host paths are not listable at all.
+        assert!(list_directory(&state, r"E:\anything").is_empty());
+        assert!(list_directory(&state, r"D:\x").is_empty());
+        assert!(list_directory(&state, "/Users/me/x").is_empty());
+
+        let _unused = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_directory_hides_symlink_escape_entries() {
+        let (root, volumes) = temp_bottle("confine-symlink");
+        let outside = root.join("outside-secret.txt");
+        std::fs::write(&outside, b"secret").expect("write outside file");
+        std::os::unix::fs::symlink(&outside, root.join("drive_c").join("leak.txt"))
+            .expect("create escape symlink");
+        let mut state = test_state();
+        state.file_io.volumes = volumes;
+
+        // The symlink's host path resolves outside the bottle, so it maps to
+        // no guest path and must not appear in the listing.
+        let listing = list_directory(&state, r"C:\");
+        assert!(!listing.iter().any(|name| name == "leak.txt"));
+
+        let _unused = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn end_dialog_rejects_out_of_bottle_path() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        state.file_io.volumes = VolumeConfig {
+            bottle_root: Some(PathBuf::from("/tmp/bottle")),
+            drive_d_root: None,
+        };
+        state.window_state().file_dialog_loop_va = 0x7000_0040_B000;
+        state.window_state().file_dialog_proc_va = 0x7000_0040_B100;
+        state.window_state().dialog_result_va = 0x4000;
+        engine.mem_write(0x4000, &0_u32.to_le_bytes()).ok();
+        let file_buf = 0x6000;
+        engine.mem_write(file_buf, &utf16_bytes("notes.txt")).ok();
+        write_ofn(&mut engine, 0x5000, file_buf, 260, 0);
+
+        // Each escape gets a fresh dialog (EndDialog tears the subtree down).
+        // `/Users/me/x.txt` is deliberately absent: Windows path rules read a
+        // leading `/` as rooted-on-current-drive, so it resolves to the
+        // confined `C:\Users\me\x.txt` — not an escape.
+        for escape in [
+            r"C:\..\..\etc\passwd",
+            r"E:\elsewhere.txt",
+            r"..\..\..\etc\passwd",
+            r"\\server\share\x",
+        ] {
+            dispatch_open(&mut engine, &mut state, FileDialogPolicy::Interactive)
+                .expect_err("interactive must request the modal loop");
+            let dialog_hwnd = state
+                .window_state()
+                .file_dialog
+                .as_ref()
+                .expect("session recorded")
+                .dialog_hwnd;
+            let edit_hwnd = state.window_state().file_dialog.as_ref().unwrap().edit_hwnd;
+            if let Some(window) = find_window_mut(&mut state, edit_hwnd) {
+                window.control_text = escape.to_owned();
+            }
+            write_regs(&mut engine, dialog_hwnd, IDOK, 0, 0);
+            let result = handle_end_dialog(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            ))
+            .expect("EndDialog succeeds");
+            // Refused like a cancel: the modal-loop result slot holds FALSE,
+            // the buffer is untouched, and the session is cleared so a later
+            // dialog can open.
+            assert_eq!(result.return_value, 1, "EndDialog itself succeeds");
+            assert_eq!(
+                read_guest_u32_at(&mut engine, 0x4000),
+                0,
+                "escape {escape} must be refused (FALSE result)"
+            );
+            assert_eq!(read_guest_utf16(&mut engine, file_buf, 64), "notes.txt");
+            assert!(state.window_state().file_dialog.is_none());
+            assert!(state.window_state().last_file_dialog_path.is_none());
+        }
+    }
+
+    #[test]
+    fn end_dialog_collapses_dotdot_within_bottle() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        state.file_io.volumes = VolumeConfig {
+            bottle_root: Some(PathBuf::from("/tmp/bottle")),
+            drive_d_root: None,
+        };
+        state.window_state().file_dialog_loop_va = 0x7000_0040_B000;
+        state.window_state().file_dialog_proc_va = 0x7000_0040_B100;
+        state.window_state().dialog_result_va = 0x4000;
+        engine.mem_write(0x4000, &0_u32.to_le_bytes()).ok();
+        let file_buf = 0x6000;
+        engine.mem_write(file_buf, &utf16_bytes("notes.txt")).ok();
+        write_ofn(&mut engine, 0x5000, file_buf, 260, 0);
+
+        dispatch_open(&mut engine, &mut state, FileDialogPolicy::Interactive)
+            .expect_err("interactive must request the modal loop");
+        let dialog_hwnd = state
+            .window_state()
+            .file_dialog
+            .as_ref()
+            .expect("session recorded")
+            .dialog_hwnd;
+        let edit_hwnd = state.window_state().file_dialog.as_ref().unwrap().edit_hwnd;
+
+        // `..` inside the volume is collapsed to the canonical guest path.
+        if let Some(window) = find_window_mut(&mut state, edit_hwnd) {
+            window.control_text = r"C:\App\..\readme.txt".to_owned();
+        }
+        write_regs(&mut engine, dialog_hwnd, IDOK, 0, 0);
+        let result = handle_end_dialog(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("EndDialog succeeds");
+        assert_eq!(result.return_value, 1);
+        assert_eq!(
+            read_guest_utf16(&mut engine, file_buf, 64),
+            r"C:\readme.txt",
+            "within-bottle `..` collapses and the canonical path is written back"
+        );
+        assert!(state.window_state().file_dialog.is_none());
     }
 
     // ── FindTextW / ReplaceTextW (Task 4.2) ───────────────────────────────

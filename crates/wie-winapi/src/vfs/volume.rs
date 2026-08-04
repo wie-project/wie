@@ -113,6 +113,62 @@ pub fn guest_path_to_host_bottle(bottle_root: &Path, guest_path: &str) -> Option
     guest_path_to_host(&volumes, guest_path).map(|m| m.host)
 }
 
+/// Confine a guest path to a mapped volume, collapsing `.`/`..` components.
+///
+/// Unlike [`guest_path_to_host`] (which rejects any raw `..` component),
+/// within-volume ascent is allowed: `C:\App\..` resolves to `C:\`. A `..`
+/// at the volume root (`C:\..`) is rejected, so a path can never leave the
+/// bottle or the optional D: bridge. Unmapped drives and host paths return
+/// `None`. The result is the canonical guest path (`C:\App\..\file.txt` →
+/// `C:\file.txt`) — the file dialog's listing + accept confinement uses it.
+#[must_use]
+pub fn confine_guest_path(volumes: &VolumeConfig, guest_path: &str) -> Option<String> {
+    let trimmed = guest_path.trim().trim_matches('"');
+    let sep_norm = normalize_windows_path_separators(trimmed);
+    let drive = drive_letter(&sep_norm)?;
+    let relative = relative_after_drive(&sep_norm, drive)?;
+
+    // The drive must name a configured volume: C: bottle or D: bridge.
+    match drive {
+        'C' => volumes.bottle_root.is_some().then_some(())?,
+        'D' => volumes.drive_d_root.is_some().then_some(())?,
+        _ => return None,
+    }
+
+    let mut components: Vec<&str> = Vec::new();
+    for component in relative.split('\\') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                // `..` with nothing left to pop would ascend above the
+                // volume root — escaping the bottle. `?` propagates that
+                // rejection as `None`.
+                components.pop()?;
+            }
+            _ => {
+                if component.contains('\\') || component.contains('/') {
+                    return None;
+                }
+                components.push(component);
+            }
+        }
+    }
+
+    let mut out = String::with_capacity(relative.len() + 3);
+    out.push(drive);
+    out.push(':');
+    out.push('\\');
+    for component in components {
+        out.push_str(component);
+        out.push('\\');
+    }
+    // The drive root `C:\` (length 3) keeps its trailing separator.
+    if out.len() > 3 && out.ends_with('\\') {
+        out.pop();
+    }
+    Some(out)
+}
+
 /// Map a host path to the guest-visible Windows path (`C:\…` / `D:\…`).
 ///
 /// Inverse of [`guest_path_to_host`]: a host path under the bottle's
@@ -373,5 +429,69 @@ mod tests {
             host_path_to_guest(&v, Path::new("/Users/me/wie-bottle/drive_c/sample.txt")),
             Some(r"C:\sample.txt".to_owned())
         );
+    }
+
+    #[test]
+    fn confine_guest_path_collapses_dotdot_within_volume() {
+        let v = VolumeConfig {
+            bottle_root: Some(PathBuf::from("/tmp/bottle")),
+            drive_d_root: None,
+        };
+        // Within-volume `..` ascent is allowed and collapses to the root.
+        assert_eq!(
+            confine_guest_path(&v, r"C:\App\.."),
+            Some(r"C:\".to_owned())
+        );
+        assert_eq!(
+            confine_guest_path(&v, r"C:\App\..\readme.txt"),
+            Some(r"C:\readme.txt".to_owned())
+        );
+        assert_eq!(
+            confine_guest_path(&v, r"C:\Windows\System32\..\win.ini"),
+            Some(r"C:\Windows\win.ini".to_owned())
+        );
+        // `..` at or above the volume root escapes the bottle → rejected.
+        assert_eq!(confine_guest_path(&v, r"C:\.."), None);
+        assert_eq!(confine_guest_path(&v, r"C:\App\..\..\etc\passwd"), None);
+        // Drive roots and bare drive letters confine to the volume root.
+        assert_eq!(confine_guest_path(&v, r"C:\"), Some(r"C:\".to_owned()));
+        assert_eq!(confine_guest_path(&v, r"C:"), Some(r"C:\".to_owned()));
+        // Unmapped drives and host paths are not guest-visible.
+        assert_eq!(confine_guest_path(&v, r"D:\x"), None);
+        assert_eq!(confine_guest_path(&v, r"E:\x"), None);
+        assert_eq!(confine_guest_path(&v, "/Users/me/x.txt"), None);
+        assert_eq!(confine_guest_path(&v, r"\\server\share\x"), None);
+    }
+
+    #[test]
+    fn confine_guest_path_keeps_drive_d_bridge_as_second_root() {
+        let v = VolumeConfig {
+            bottle_root: Some(PathBuf::from("/tmp/bottle")),
+            drive_d_root: Some(PathBuf::from("/Users/me/data")),
+        };
+        assert_eq!(
+            confine_guest_path(&v, r"D:\archive\a.7z"),
+            Some(r"D:\archive\a.7z".to_owned())
+        );
+        assert_eq!(
+            confine_guest_path(&v, r"D:\archive\.."),
+            Some(r"D:\".to_owned())
+        );
+        // A D: path cannot ascend above the bridge root either.
+        assert_eq!(confine_guest_path(&v, r"D:\archive\..\.."), None);
+        assert_eq!(confine_guest_path(&v, r"D:\.."), None);
+        // With no bridge configured, D: is not guest-visible.
+        let no_bridge = VolumeConfig {
+            bottle_root: Some(PathBuf::from("/tmp/bottle")),
+            drive_d_root: None,
+        };
+        assert_eq!(confine_guest_path(&no_bridge, r"D:\archive\a.7z"), None);
+    }
+
+    #[test]
+    fn confine_guest_path_requires_a_volume() {
+        let no_bottle = VolumeConfig::default();
+        assert_eq!(confine_guest_path(&no_bottle, r"C:\App"), None);
+        assert_eq!(confine_guest_path(&no_bottle, r"C:\"), None);
     }
 }

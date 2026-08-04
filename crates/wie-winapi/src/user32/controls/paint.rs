@@ -3,9 +3,9 @@
 
 use anyhow::Result;
 
-use crate::gdi32::fill_rect_surface;
 use crate::gdi32::ResolvedWindow;
-use crate::user32::{write_guest_ansi_c_string, write_guest_utf16_c_string, WinApiState};
+use crate::gdi32::fill_rect_surface;
+use crate::user32::{WinApiState, write_guest_ansi_c_string, write_guest_utf16_c_string};
 
 /// Fill a rect with `color`, clipped to the control's own bounds so a
 /// selection or caret running past the right edge cannot bleed into the

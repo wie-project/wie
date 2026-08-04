@@ -606,3 +606,49 @@ fn vsnprintf_applies_width_and_precision() {
     engine.mem_read(0x4000, &mut out).expect("read buffer");
     assert_eq!(&out[..18], b"   42|007|abcd|ab\0");
 }
+
+#[test]
+fn vsnwprintf_d_truncates_to_low_32_bits() {
+    // RNotepad's StringCchPrintfW builds its va_list over its own stack
+    // frame, where the guest stores 32-bit varargs (`mov [rsp+0x20], eax`)
+    // and the high slot bytes stay stale. `%d` must read only the low
+    // 32 bits — 0x1CD_0000_0001 is the REAL trace payload for a stored
+    // column value of 1 (the high 0x1CD leaked from a prior frame and made
+    // the status bar print "column 1979979923457").
+    let mut engine = test_engine();
+    let mut state = test_state();
+    write_wide(&mut engine, 0x3000, "%d");
+    write_va_list(&mut engine, 0x5000, &[0x1CD_0000_0001]);
+    write_regs(&mut engine, 0x4000, 64, 0x3000, 0x5000);
+    let r = dispatch("msvcrt.dll", "_vsnwprintf", &mut engine, &mut state);
+    assert_eq!(read_wide(&mut engine, 0x4000), "1");
+    assert_eq!(r.return_value, 1);
+}
+
+#[test]
+fn vsnwprintf_negative_d_sign_extends_low_32_bits() {
+    // A 32-bit negative int with stale high bytes: %d must print -101, not
+    // the full-slot reinterpretation.
+    let mut engine = test_engine();
+    let mut state = test_state();
+    write_wide(&mut engine, 0x3000, "%d");
+    write_va_list(&mut engine, 0x5000, &[0x1_FFFF_FF9B]);
+    write_regs(&mut engine, 0x4000, 64, 0x3000, 0x5000);
+    let r = dispatch("msvcrt.dll", "_vsnwprintf", &mut engine, &mut state);
+    assert_eq!(read_wide(&mut engine, 0x4000), "-101");
+    assert_eq!(r.return_value, 4);
+}
+
+#[test]
+fn vsnwprintf_lld_reads_the_full_64_bit_slot() {
+    // The `ll` modifier demands the whole slot — the low-32 truncation must
+    // not apply to it.
+    let mut engine = test_engine();
+    let mut state = test_state();
+    write_wide(&mut engine, 0x3000, "%lld");
+    write_va_list(&mut engine, 0x5000, &[0x1_0000_0002]);
+    write_regs(&mut engine, 0x4000, 64, 0x3000, 0x5000);
+    let r = dispatch("msvcrt.dll", "_vsnwprintf", &mut engine, &mut state);
+    assert_eq!(read_wide(&mut engine, 0x4000), "4294967298");
+    assert_eq!(r.return_value, 10);
+}

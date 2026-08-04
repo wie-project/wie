@@ -10,6 +10,7 @@ One-page playbook for regressions after the foundational work and the **great cl
 | Active mem | Always **mmap** arenas (`WIE_RUNTIME_PROFILE=1` → `mem_backend=mmap`) |
 | Active idle | profile line `idle_policy=…` |
 | CLI | `inspect` / `run` / `trace` (`run-micro` and `entry-trace` are aliases) |
+| Interactive console | `wie-cli run --console <exe>` — raw-mode run for terminal games (per-key input, no Enter; terminal restored on exit) |
 
 ## Symptoms → actions
 

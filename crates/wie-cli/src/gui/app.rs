@@ -1021,6 +1021,12 @@ impl ApplicationHandler<WieEvent> for WieApp {
                 // bar mirrors the primary window's menu (menu polish is L4's
                 // lane), so the command goes to the primary window's hwnd.
                 let id = menu_bar::menu_id_to_guest_id(menu_event.id());
+                tracing::debug!(
+                    target: "wiegui",
+                    menu_id = menu_event.id().0,
+                    guest_id = id,
+                    "MenuEvent"
+                );
                 if let Some(handle) = self.handle.as_ref()
                     && let Some(hwnd) = self.primary_hwnd.map_or_else(
                         || handle.first_guest_window_handle(),

@@ -271,7 +271,7 @@ impl GuestHandle {
     /// when no window has a menu.
     #[must_use]
     pub fn window_menu_items(&self) -> Arc<Vec<MenuNode>> {
-        let Ok(state) = self.state.lock() else {
+        let Ok(mut state) = self.state.lock() else {
             return Arc::new(Vec::new());
         };
         let Some(ws) = state.try_window_state() else {
@@ -325,6 +325,19 @@ impl GuestHandle {
         if let Ok(mut cache) = self.menu_tree_cache.write() {
             *cache = Some((menu_handle, Arc::clone(&tree)));
         }
+        // Re-arm the cache: `menu_dirty` is set by the winapi menu handlers on
+        // every mutation (LoadMenu, AppendMenu, EnableMenuItem, ...) but is
+        // never cleared there, so WITHOUT this reset every call would bypass
+        // the cache and rebuild the tree. That makes the host bar's
+        // per-Frame `sync_menu_bar` see spurious content differences whenever
+        // the guest touches its menu state (notepad re-enables Find/FindNext
+        // on selection changes), triggering a full native-menu teardown +
+        // reinstall (`remove_for_nsapp` sets the main menu to None) — which
+        // destroys any menu interaction in flight. The tree built here
+        // already reflects every mutation that set the flag, so clearing it
+        // is exactly the "consumed since last mutation" contract; the next
+        // guest mutation re-sets it and the cache correctly invalidates.
+        state.window_state().menu_dirty = false;
         tree
     }
 

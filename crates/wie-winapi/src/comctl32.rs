@@ -500,6 +500,13 @@ pub(crate) fn dispatch_status_bar_message(
                 read_guest_utf16_lossy(engine, long_parameter, 32_768)
                     .context("SB_SETTEXTW text read failed")?
             };
+            tracing::debug!(
+                target: "wie_winapi",
+                hwnd = format_args!("{hwnd:#x}"),
+                part,
+                text = %text,
+                "SB_SETTEXTW"
+            );
             status_bar_set_text(state, hwnd, part, text);
             Ok(Some(1)) // TRUE
         }
@@ -515,6 +522,13 @@ pub(crate) fn dispatch_status_bar_message(
                 read_guest_ansi_lossy(engine, long_parameter, 32_768)
                     .context("SB_SETTEXTA text read failed")?
             };
+            tracing::debug!(
+                target: "wie_winapi",
+                hwnd = format_args!("{hwnd:#x}"),
+                part,
+                text = %text,
+                "SB_SETTEXTA"
+            );
             status_bar_set_text(state, hwnd, part, text);
             Ok(Some(1)) // TRUE
         }
