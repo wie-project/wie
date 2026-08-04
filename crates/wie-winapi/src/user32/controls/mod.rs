@@ -98,7 +98,8 @@ use edit::{
     edit_set_tab_stops, edit_undo,
 };
 use listbox::{
-    listbox_hit_item, listbox_key_move_selection, listbox_notify_change, listbox_scroll_wheel,
+    listbox_hit_item, listbox_invalidate_appended, listbox_invalidate_selection,
+    listbox_key_move_selection, listbox_notify_change, listbox_scroll_wheel,
 };
 // Re-exported for the comdlg32 dialog build (`open_host_font_dialog` seeds
 // the font-dialog listboxes by scrolling the initial selection into view).
@@ -274,6 +275,9 @@ impl ControlClassKind {
                 items: Vec::new(),
                 sel_index: -1,
                 first_visible: 0,
+                // Same undefined-content seed as the Button/Static variants: the
+                // first paint must cover everything.
+                invalidation: LabelInvalidation::Full,
             },
             Self::ComboBox => ControlState::ComboBox {
                 items: Vec::new(),
@@ -432,6 +436,15 @@ pub enum ControlState {
         /// deliberately deferred (the EDIT's precedent): the viewport scrolls
         /// with no visible scrollbar thumb until a later task.
         first_visible: usize,
+        /// The repaint scope for the next paint (see [`LabelInvalidation`]) —
+        /// the row-band equivalent of the BUTTON/STATIC scope: a scroll marks
+        /// the union of the old+new visible bands, a selection change the old+
+        /// new selected rows, an item append the new row. `paint_control`
+        /// erases exactly the pending rect, so the published frame's `region`
+        /// is the true changed area instead of the full control rect. The
+        /// first paint (and every structural change — WM_SETFONT, a resize)
+        /// stays `Full`.
+        invalidation: LabelInvalidation,
     },
     /// COMBOBOX (edit+list; no dropdown yet).
     ComboBox {
@@ -803,6 +816,7 @@ impl ControlClassKind {
                     // parent; the selection is kept visible (a click on a row
                     // below the fold scrolls it into view).
                     let clicked = listbox_hit_item(state, hwnd, long_parameter);
+                    let previous = control_sel_index(state, hwnd);
                     let changed = clicked.is_some_and(|index| {
                         let ControlState::ListBox { sel_index, .. } =
                             control_state_mut(state, hwnd)
@@ -816,6 +830,12 @@ impl ControlClassKind {
                         true
                     });
                     listbox_scroll_selection_into_view(state, hwnd);
+                    if changed {
+                        // The old+new selected rows swap their highlight; a
+                        // click never scrolls (the clicked row is on-screen),
+                        // so the row marks are the whole scope.
+                        listbox_invalidate_selection(state, hwnd, previous, clicked.unwrap_or(-1));
+                    }
                     invalidate(state, hwnd);
                     if changed {
                         return listbox_notify_change(state, hwnd);
@@ -995,9 +1015,13 @@ impl ControlClassKind {
                 // comes, must re-render with the new font.
                 match find_window(state, hwnd).and_then(|w| w.control_kind) {
                     Some(ControlClassKind::Edit) => edit_reset_invalid_rows(state, hwnd),
-                    Some(ControlClassKind::Button | ControlClassKind::Static) => {
-                        label_reset_invalid_full(state, hwnd)
-                    }
+                    // A font change reflows a LISTBOX's row pitch too (the row
+                    // bands shift with the new line height).
+                    Some(
+                        ControlClassKind::Button
+                        | ControlClassKind::Static
+                        | ControlClassKind::ListBox,
+                    ) => label_reset_invalid_full(state, hwnd),
                     _ => {}
                 }
                 super::window::set_window_font(state, hwnd, word_parameter, long_parameter);
@@ -1369,9 +1393,14 @@ impl ControlClassKind {
                 };
                 invalidate(state, hwnd);
                 // A programmatic selection lands on a possibly-scrolled
-                // viewport: bring it into view like a click would.
+                // viewport: bring it into view like a click would (the scroll
+                // marks its own band change when it moves).
                 listbox_scroll_selection_into_view(state, hwnd);
                 if previous != index {
+                    // The old+new selected rows swap their highlight (a LISTBOX
+                    // only; the ComboBox arm shares this dispatch and ignores
+                    // the mark).
+                    listbox_invalidate_selection(state, hwnd, previous, index);
                     return listbox_notify_change(state, hwnd);
                 }
                 Ok(Some(0))
@@ -1401,13 +1430,18 @@ impl ControlClassKind {
                 } else {
                     read_guest_ansi_lossy(engine, long_parameter, 4096)?
                 };
-                let (ControlState::ListBox { items, .. } | ControlState::ComboBox { items, .. }) =
-                    control_state_mut(state, hwnd)
-                else {
-                    return Ok(Some(u64::MAX));
+                let index = {
+                    let (ControlState::ListBox { items, .. }
+                    | ControlState::ComboBox { items, .. }) = control_state_mut(state, hwnd)
+                    else {
+                        return Ok(Some(u64::MAX));
+                    };
+                    items.push(text);
+                    u64::try_from(items.len().saturating_sub(1)).unwrap_or(u64::MAX)
                 };
-                items.push(text);
-                let index = u64::try_from(items.len().saturating_sub(1)).unwrap_or(u64::MAX);
+                // The appended row shows the new item (a LISTBOX only; the
+                // ComboBox arm shares this dispatch and ignores the mark).
+                listbox_invalidate_appended(state, hwnd);
                 invalidate(state, hwnd);
                 Ok(Some(index))
             }

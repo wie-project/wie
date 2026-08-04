@@ -94,7 +94,7 @@ pub(super) fn paint_control(
                 // erase covers exactly the scope, so the published frame's
                 // region is the true changed area (the B3 dirty-region
                 // machinery the EDIT's row band feeds).
-                let dirty = label_dirty_rect(state, hwnd, size);
+                let dirty = control_dirty_rect(state, hwnd, size);
                 if dirty == IRect::from_xywh(0, 0, size.width, size.height) {
                     // Full repaint: face + border + caption (the pre-scope
                     // path, byte-identical).
@@ -148,7 +148,7 @@ pub(super) fn paint_control(
                         key,
                     },
                 )?;
-                label_consume_invalidation(state, hwnd);
+                consume_control_invalidation(state, hwnd);
             }
             ControlClassKind::Static => {
                 // COLOR_BTNFACE, not COLOR_WINDOW: a label sits on the dialog
@@ -156,7 +156,7 @@ pub(super) fn paint_control(
                 // deferred). The erase covers only the pending caption rect
                 // (or the whole client for a full repaint), so the region
                 // reports the true changed area.
-                let dirty = label_dirty_rect(state, hwnd, size);
+                let dirty = control_dirty_rect(state, hwnd, size);
                 fill_rect_surface(
                     state,
                     info.hwnd,
@@ -186,7 +186,7 @@ pub(super) fn paint_control(
                         key,
                     },
                 )?;
-                label_consume_invalidation(state, hwnd);
+                consume_control_invalidation(state, hwnd);
             }
             ControlClassKind::Edit => {
                 // Erase only the dirty rows — the pending invalid row band,
@@ -240,18 +240,33 @@ pub(super) fn paint_control(
                 )?;
             }
             ControlClassKind::ListBox => {
+                // The repaint scope: the pending dirty rect (a scroll's
+                // old+new visible bands, a selection change's rows, an item
+                // append's row), or the whole client — a clean scope, a stale
+                // rect whose size no longer matches, or the first paint. The
+                // erase covers exactly the scope, so the published frame's
+                // region is the true changed area (the same B3 dirty-region
+                // machinery the EDIT/button bands feed). Only the rows inside
+                // the scope render (`paint_item_lines` takes the rect), so a
+                // partial repaint never wipes the untouched rows.
+                let dirty = control_dirty_rect(state, hwnd, size);
                 fill_rect_surface(
                     state,
                     info.hwnd,
                     info.width,
                     info.height,
-                    info.offset_x,
-                    info.offset_y,
-                    size.width,
-                    size.height,
+                    info.offset_x.saturating_add(dirty.left),
+                    info.offset_y.saturating_add(dirty.top),
+                    dirty.width(),
+                    dirty.height(),
                     COLOR_WINDOW,
                 );
-                stroke_border(state, &info, size, 0x0000_0000);
+                // The erase overpainted the 1 px border wherever the band
+                // reaches it — re-stroke only those edges (the row bands span
+                // the client's full width and start at its top edge, so a
+                // mid-client band wipes the left/right edges but not the top
+                // or bottom ones).
+                stroke_border_partial(state, &info, size, dirty, 0x0000_0000);
                 paint_item_lines(
                     &mut PaintCtx { state, engine },
                     &info,
@@ -263,7 +278,9 @@ pub(super) fn paint_control(
                         resolved,
                         key,
                     },
+                    dirty,
                 )?;
+                consume_control_invalidation(state, hwnd);
             }
             ControlClassKind::ComboBox => {
                 paint_face_and_border(state, &info, size, false);
@@ -616,6 +633,81 @@ fn stroke_border(state: &mut WinApiState, info: &ResolvedWindow, size: Dimension
     );
 }
 
+/// Re-stroke ONLY the 1 px border edges a partial repaint overpainted — the
+/// LISTBOX's row bands span the client's full width and start at its top
+/// edge, so a mid-client erase wipes the left/right edges (and the top/bottom
+/// only when the band reaches them) but must not re-draw untouched edges:
+/// the border fill marks the surface dirty, so an over-eager full re-stroke
+/// would widen the published region beyond the true changed band. The edges
+/// are clipped to the dirty rect's vertical extent so the re-stroked pixels
+/// always land inside the erased area.
+fn stroke_border_partial(
+    state: &mut WinApiState,
+    info: &ResolvedWindow,
+    size: Dimension,
+    dirty: IRect,
+    color: u32,
+) {
+    if size.width <= 0 || size.height <= 0 {
+        return;
+    }
+    let (x, y) = (info.offset_x, info.offset_y);
+    let band_top = dirty.top.max(0);
+    let band_bottom = dirty.bottom.min(size.height);
+    if dirty.top <= 0 {
+        fill_rect_surface(
+            state,
+            info.hwnd,
+            info.width,
+            info.height,
+            x,
+            y,
+            size.width,
+            1,
+            color,
+        );
+    }
+    if dirty.bottom >= size.height {
+        fill_rect_surface(
+            state,
+            info.hwnd,
+            info.width,
+            info.height,
+            x,
+            y.saturating_add(size.height).saturating_sub(1),
+            size.width,
+            1,
+            color,
+        );
+    }
+    if dirty.left <= 0 && band_bottom > band_top {
+        fill_rect_surface(
+            state,
+            info.hwnd,
+            info.width,
+            info.height,
+            x,
+            y.saturating_add(band_top),
+            1,
+            band_bottom.saturating_sub(band_top),
+            color,
+        );
+    }
+    if dirty.right >= size.width && band_bottom > band_top {
+        fill_rect_surface(
+            state,
+            info.hwnd,
+            info.width,
+            info.height,
+            x.saturating_add(size.width).saturating_sub(1),
+            y.saturating_add(band_top),
+            1,
+            band_bottom.saturating_sub(band_top),
+            color,
+        );
+    }
+}
+
 /// Remove `&` mnemonic markers from a caption so they are not rendered
 /// literally (the underline + Alt activation are deferred). `&&` is the
 /// escaped form of a literal ampersand, matching Windows.
@@ -652,27 +744,27 @@ fn centered_text_x(
 
 // ── Rect-level invalidation (the label-control optimization lane) ────────
 //
-// The BUTTON/STATIC repaint scopes mirror the EDIT's row bands at rect
-// granularity: the mutating ops mark the sub-rect they changed (a pressed
-// state change marks the face, a caption change the caption rect), and
-// `paint_control` erases exactly that rect — the erase fill is what feeds
-// the B3 dirty-region accumulator, so the published frame's `region`
-// reports the true changed area instead of the full control rect. The first
-// paint (and every structural change — a font change, a resize) stays full:
-// the surface behind a never-painted control is undefined, so a partial
-// repaint would leave holes.
+// The BUTTON/STATIC/LISTBOX repaint scopes mirror the EDIT's row bands at
+// rect granularity: the mutating ops mark the sub-rect they changed (a pressed
+// state change marks the face, a caption change the caption rect, a listbox
+// scroll the old+new visible bands), and `paint_control` erases exactly that
+// rect — the erase fill is what feeds the B3 dirty-region accumulator, so the
+// published frame's `region` reports the true changed area instead of the full
+// control rect. The first paint (and every structural change — a font change,
+// a resize) stays full: the surface behind a never-painted control is
+// undefined, so a partial repaint would leave holes.
 
-/// The client-relative rect a BUTTON/STATIC must erase and repaint on its
-/// next paint: the pending invalidation rect (when still valid against the
-/// CURRENT size), or the WHOLE client — a clean/full scope, a stale rect
-/// whose size stamp no longer matches (a resize reflowed the layout), or
-/// the first paint of a never-painted control. `paint_control` erases
-/// exactly the returned rect. Mirrors `edit_dirty_band` for the label
-/// controls.
-fn label_dirty_rect(state: &WinApiState, hwnd: u64, size: Dimension) -> IRect {
+/// The client-relative rect a BUTTON/STATIC/LISTBOX must erase and repaint on
+/// its next paint: the pending invalidation rect (when still valid against the
+/// CURRENT size), or the WHOLE client — a clean/full scope, a stale rect whose
+/// size stamp no longer matches (a resize reflowed the layout), or the first
+/// paint of a never-painted control. `paint_control` erases exactly the
+/// returned rect. Mirrors `edit_dirty_band` for the rect-scope controls.
+fn control_dirty_rect(state: &WinApiState, hwnd: u64, size: Dimension) -> IRect {
     let pending = match control_state(state, hwnd) {
         Some(ControlState::Button { invalidation, .. }) => Some(*invalidation),
         Some(ControlState::Static { invalidation }) => Some(*invalidation),
+        Some(ControlState::ListBox { invalidation, .. }) => Some(*invalidation),
         _ => None,
     };
     match pending {
@@ -741,16 +833,16 @@ fn rect_touches_border(rect: IRect, size: Dimension) -> bool {
     rect.left <= 0 || rect.top <= 0 || rect.right >= size.width || rect.bottom >= size.height
 }
 
-/// Mark `rect` (client-relative) as dirty on a BUTTON/STATIC control for the
-/// next paint, unioning with any pending scope, and mark the window
+/// Mark `rect` (client-relative) as dirty on a BUTTON/STATIC/LISTBOX control
+/// for the next paint, unioning with any pending scope, and mark the window
 /// invalidated. No-op for other kinds and for a degenerate (empty) rect — a
 /// control with nothing visible to repaint falls back to the window's own
 /// full invalidation.
-pub(super) fn label_invalidate_rect(state: &mut WinApiState, hwnd: u64, rect: IRect) {
+pub(super) fn invalidate_control_rect(state: &mut WinApiState, hwnd: u64, rect: IRect) {
     let kind = find_window(state, hwnd).and_then(|w| w.control_kind);
     if !matches!(
         kind,
-        Some(ControlClassKind::Button | ControlClassKind::Static)
+        Some(ControlClassKind::Button | ControlClassKind::Static | ControlClassKind::ListBox)
     ) {
         return;
     }
@@ -761,7 +853,9 @@ pub(super) fn label_invalidate_rect(state: &mut WinApiState, hwnd: u64, rect: IR
     {
         let control = control_state_mut(state, hwnd);
         match control {
-            ControlState::Button { invalidation, .. } | ControlState::Static { invalidation } => {
+            ControlState::Button { invalidation, .. }
+            | ControlState::Static { invalidation }
+            | ControlState::ListBox { invalidation, .. } => {
                 *invalidation = union_label_invalid(*invalidation, rect, width, height);
             }
             _ => {}
@@ -770,16 +864,20 @@ pub(super) fn label_invalidate_rect(state: &mut WinApiState, hwnd: u64, rect: IR
     super::invalidate(state, hwnd);
 }
 
-/// Reset a label control's pending invalidation to [`LabelInvalidation::Full`]
-/// WITHOUT marking the window — callers that already invalidate (or must not,
-/// e.g. a `redraw = 0` `WM_SETFONT`) control the window flag themselves.
-/// Non-seeding: a control with no state yet is untouched.
+/// Reset a rect-scope control's pending invalidation to
+/// [`LabelInvalidation::Full`] WITHOUT marking the window — callers that
+/// already invalidate (or must not, e.g. a `redraw = 0` `WM_SETFONT`) control
+/// the window flag themselves. Non-seeding: a control with no state yet is
+/// untouched.
 pub(super) fn label_reset_invalid_full(state: &mut WinApiState, hwnd: u64) {
-    if let Some(ControlState::Button { invalidation, .. } | ControlState::Static { invalidation }) =
-        state
-            .window_state()
-            .control_states
-            .get_mut(&crate::handles::Hwnd::from(hwnd))
+    if let Some(
+        ControlState::Button { invalidation, .. }
+        | ControlState::Static { invalidation }
+        | ControlState::ListBox { invalidation, .. },
+    ) = state
+        .window_state()
+        .control_states
+        .get_mut(&crate::handles::Hwnd::from(hwnd))
     {
         *invalidation = LabelInvalidation::Full;
     }
@@ -799,7 +897,7 @@ pub(super) fn button_invalidate_pressed(state: &mut WinApiState, hwnd: u64) {
         width.saturating_sub(2).max(0),
         height.saturating_sub(2).max(0),
     );
-    label_invalidate_rect(state, hwnd, interior);
+    invalidate_control_rect(state, hwnd, interior);
 }
 
 /// Mark the caption rect a WM_SETTEXT change dirties: the union of the OLD
@@ -881,16 +979,18 @@ pub(crate) fn label_invalidate_text_change(
     // Clamp to the control: a caption wider than the control clips at it
     // (the paint's own clip), so the region must not exceed the control.
     let rect = intersect_rect(rect, IRect::from_xywh(0, 0, width, height));
-    label_invalidate_rect(state, hwnd, rect);
+    invalidate_control_rect(state, hwnd, rect);
 }
 
-/// Consume a BUTTON/STATIC paint: the invalidation scope was applied (the
-/// erase covered it), so the next paint starts clean. The window's own
+/// Consume a BUTTON/STATIC/LISTBOX paint: the invalidation scope was applied
+/// (the erase covered it), so the next paint starts clean. The window's own
 /// `invalidated` flag still drives the next cycle.
-fn label_consume_invalidation(state: &mut WinApiState, hwnd: u64) {
+fn consume_control_invalidation(state: &mut WinApiState, hwnd: u64) {
     let control = control_state_mut(state, hwnd);
     match control {
-        ControlState::Button { invalidation, .. } | ControlState::Static { invalidation } => {
+        ControlState::Button { invalidation, .. }
+        | ControlState::Static { invalidation }
+        | ControlState::ListBox { invalidation, .. } => {
             *invalidation = LabelInvalidation::Clean;
         }
         _ => {}

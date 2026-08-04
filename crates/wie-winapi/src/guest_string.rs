@@ -1,6 +1,10 @@
 //! Guest string helpers: page-safe guest reads plus UTF-16 / ANSI / UTF-8
 //! conversions at the guest–host boundary. Reads stop at 4 KiB page
 //! boundaries so an unmapped tail page cannot fail a valid prefix.
+//!
+//! The ANSI paths use the WHATWG windows-1252 codec (`encoding_rs`) — the
+//! single-byte mapping Windows uses for ACP 1252, C1 range (0x80–0x9F)
+//! included.
 
 use anyhow::{Context, Result};
 
@@ -43,11 +47,18 @@ pub(crate) fn read_ansi_lossy(
     max_bytes: usize,
 ) -> Result<String> {
     let bytes = read_ansi_bytes(engine, address, max_bytes)?;
-    // A-strings are UTF-8 in WIE (the write side emits UTF-8 and
-    // mingw-cross-compiled guests produce UTF-8 literals); fall back to
-    // ACP-1252 for byte sequences that are not valid UTF-8 (real Windows
-    // binaries pass ACP-encoded strings).
-    Ok(crate::vfs::decode_ansi_utf8_first(&bytes))
+    // A-strings are UTF-8 in WIE when the guest was compiled with mingw (the
+    // toolchain stores string literals as UTF-8); real Windows binaries pass
+    // ACP-encoded strings. Bytes that are not valid UTF-8 therefore fall back
+    // to a strict Windows-1252 decode — the WHATWG codec, identical to
+    // Windows codepage 1252 including the 0x80–0x9F C1 range.
+    match std::str::from_utf8(&bytes) {
+        Ok(valid_utf8) => Ok(valid_utf8.to_owned()),
+        Err(_) => {
+            let (decoded, _, _) = encoding_rs::WINDOWS_1252.decode(&bytes);
+            Ok(decoded.into_owned())
+        }
+    }
 }
 
 /// Read raw ANSI bytes (NUL-terminated), excluding the terminator.
@@ -234,7 +245,39 @@ pub(crate) fn write_fixed_utf16(
         .context("failed to write fixed UTF-16 string")
 }
 
+/// Encode `text` as Windows-1252 bytes, one byte per char, with Windows'
+/// `?` (0x3F) fallback for chars cp1252 cannot represent.
+///
+/// The WHATWG codec's convenience `encode()` emits a numeric character
+/// reference (e.g. `&#128512;`) for unmappable chars — that is the spec's
+/// encoder behavior, but it is NOT what Windows `WideCharToMultiByte(CP_ACP)`
+/// writes, and the multi-byte expansion would corrupt A-buffer sizes. So the
+/// fast path uses the codec only when every char is mappable (ASCII is a
+/// zero-copy borrow); otherwise each unmappable char is substituted with '?'
+/// first and the codec encodes the result. Output is byte-identical to the
+/// Windows ACP write path.
+pub(crate) fn encode_cp1252(text: &str) -> Vec<u8> {
+    let (encoded, _, had_errors) = encoding_rs::WINDOWS_1252.encode(text);
+    if !had_errors {
+        return encoded.into_owned();
+    }
+
+    let mut scratch = [0_u8; 4];
+    let mut replaced = String::with_capacity(text.len());
+    for ch in text.chars() {
+        let (_, _, char_had_errors) =
+            encoding_rs::WINDOWS_1252.encode(ch.encode_utf8(&mut scratch));
+        replaced.push(if char_had_errors { '?' } else { ch });
+    }
+    encoding_rs::WINDOWS_1252.encode(&replaced).0.into_owned()
+}
+
 /// Writes a NUL-terminated ANSI string and returns the number of content bytes.
+///
+/// The text is encoded as Windows-1252 (the ACP, one byte per char) — the
+/// same bytes Windows `WideCharToMultiByte(CP_ACP)` writes, unmappable chars
+/// becoming `?`. The returned count is therefore the ANSI character count,
+/// exactly what Windows reports for A-API writes.
 pub(crate) fn write_ansi_c_string(
     engine: &mut dyn wie_cpu::CpuEngine,
     address: u64,
@@ -247,12 +290,8 @@ pub(crate) fn write_ansi_c_string(
 
     let content_capacity = max_characters.saturating_sub(1);
 
-    let mut output = text
-        .as_bytes()
-        .iter()
-        .copied()
-        .take(content_capacity)
-        .collect::<Vec<_>>();
+    let mut output = encode_cp1252(text);
+    output.truncate(content_capacity);
 
     let copied = output.len();
     output.push(0);
@@ -287,4 +326,185 @@ pub(crate) fn write_utf16_c_string(
     write_utf16_units(engine, address, &units).context("failed to write UTF-16 C string")?;
 
     Ok(copied)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use wie_cpu::{CpuEngine, IcedCpu, RwxPerms};
+
+    const BUF: u64 = 0x3000;
+
+    fn test_engine() -> IcedCpu {
+        let mut cpu = IcedCpu::open_x86_64();
+        cpu.mem_map(0x1000, 0x10_0000, RwxPerms::ALL)
+            .expect("map test memory");
+        cpu
+    }
+
+    fn read_guest_bytes(engine: &mut IcedCpu, addr: u64, len: usize) -> Vec<u8> {
+        let mut bytes = vec![0_u8; len];
+        engine
+            .mem_read(addr, &mut bytes)
+            .expect("read guest buffer");
+        bytes
+    }
+
+    /// The Windows-1252 bytes `encode_cp1252` writes for `text` (the A-path
+    /// encode: one byte per char, unmappables → '?').
+    fn cp1252_bytes(text: &str) -> Vec<u8> {
+        encode_cp1252(text)
+    }
+
+    // --- WHATWG windows-1252 codec behavior (no engine) ---
+
+    #[test]
+    fn windows_1252_c1_range_maps_to_cp1252_glyphs() {
+        // The famous ISO-8859-1 divergence: byte 0x80 is U+20AC (€), not a
+        // C1 control. The WHATWG windows-1252 codec IS Windows codepage 1252.
+        assert_eq!(cp1252_bytes("€"), [0x80]);
+        // Latin-1 range identity: é → 0xE9.
+        assert_eq!(cp1252_bytes("é"), [0xE9]);
+        // Decode mirrors the table: 0x80 → €, lone 0xE9 → é.
+        let (decoded, _, _) = encoding_rs::WINDOWS_1252.decode(&[0x80]);
+        assert_eq!(decoded, "€");
+        let (decoded, _, _) = encoding_rs::WINDOWS_1252.decode(&[0xE9]);
+        assert_eq!(decoded, "é");
+    }
+
+    #[test]
+    fn windows_1252_unmappable_falls_back_to_question() {
+        // Windows WideCharToMultiByte(CP_ACP) substitutes '?' (0x3F) for
+        // chars absent from cp1252. `encode_cp1252` normalizes the codec's
+        // output to the same byte, so the guest-visible behavior matches
+        // Windows. NOTE: '—' (U+2014) is NOT unmappable — cp1252 maps it to
+        // 0x97, so it keeps its glyph.
+        assert_eq!(cp1252_bytes("€—"), [0x80, 0x97], "em dash is mappable");
+        assert_eq!(cp1252_bytes("€ā"), [0x80, 0x3F], "ā is not in cp1252");
+        assert_eq!(cp1252_bytes("😀"), [0x3F], "astral chars are unmappable");
+        // ASCII is byte-identical.
+        assert_eq!(cp1252_bytes(r"C:\App\x.txt"), *b"C:\\App\\x.txt");
+    }
+
+    #[test]
+    fn whatwg_raw_encode_emits_numeric_reference() {
+        // The verification behind the '?' substitution: encoding_rs's
+        // convenience `encode()` writes the WHATWG numeric character
+        // reference for unmappables — NOT Windows' '?'. That multi-byte
+        // expansion would corrupt A-buffer sizes, so `encode_cp1252` must
+        // substitute. Pinned here so the substitution cannot be "simplified"
+        // back into a bare `encode()`.
+        assert_eq!(
+            encoding_rs::WINDOWS_1252.encode("ā").0.as_ref(),
+            b"&#257;",
+            "WHATWG encoder writes &#257;, Windows writes '?'"
+        );
+        assert_eq!(
+            encoding_rs::WINDOWS_1252.encode("😀").0.as_ref(),
+            b"&#128512;"
+        );
+    }
+
+    #[test]
+    fn windows_1252_count_is_one_byte_per_char() {
+        // Windows GetWindowTextLengthA semantics: the ANSI byte count is the
+        // CP1252 char count — "café" is 4 chars, not 5 UTF-8 bytes, and an
+        // unmappable char still counts as one byte ('?').
+        assert_eq!(cp1252_bytes("café").len(), 4);
+        assert_eq!(cp1252_bytes("caféā").len(), 5);
+        assert_eq!(cp1252_bytes("€—").len(), 2);
+    }
+
+    // --- write_ansi_c_string (the A write path) ---
+
+    #[test]
+    fn write_ansi_c_string_encodes_cp1252_bytes() {
+        // Regression: the write path used to emit raw UTF-8 (C3 A9 for é);
+        // Windows ACP 1252 writes one byte (E9).
+        let mut engine = test_engine();
+        let copied =
+            write_ansi_c_string(&mut engine, BUF, 16, "café").expect("write ANSI C string");
+        assert_eq!(copied, 4, "4 CP1252 chars, not 5 UTF-8 bytes");
+        assert_eq!(
+            read_guest_bytes(&mut engine, BUF, 6),
+            &[0x63, 0x61, 0x66, 0xE9, 0x00, 0x00],
+            "café is one byte per CP1252 char (E9), NUL-terminated"
+        );
+    }
+
+    #[test]
+    fn write_ansi_c_string_c1_range_and_unmappable() {
+        let mut engine = test_engine();
+        // '€' → 0x80 (C1 range); 'ā' (not in cp1252) → Windows' '?' 0x3F.
+        let copied = write_ansi_c_string(&mut engine, BUF, 16, "€ā").expect("write ANSI C string");
+        assert_eq!(copied, 2);
+        assert_eq!(read_guest_bytes(&mut engine, BUF, 3), &[0x80, 0x3F, 0x00]);
+    }
+
+    #[test]
+    fn write_ansi_c_string_truncates_and_nul_terminates() {
+        let mut engine = test_engine();
+        // Capacity 6 → 5 content chars + NUL (ASCII stays byte-identical).
+        let copied =
+            write_ansi_c_string(&mut engine, BUF, 6, "Hello World").expect("write ANSI C string");
+        assert_eq!(copied, 5);
+        assert_eq!(read_guest_bytes(&mut engine, BUF, 6), b"Hello\0");
+    }
+
+    #[test]
+    fn write_ansi_c_string_zero_capacity_writes_nothing() {
+        let mut engine = test_engine();
+        let copied = write_ansi_c_string(&mut engine, BUF, 0, "x").expect("write ANSI C string");
+        assert_eq!(copied, 0);
+        assert_eq!(
+            read_guest_bytes(&mut engine, BUF, 4),
+            &[0, 0, 0, 0],
+            "nothing must be written"
+        );
+    }
+
+    // --- read_ansi_lossy (the A read path) ---
+
+    #[test]
+    fn read_ansi_lossy_decodes_utf8_literals_first() {
+        // mingw-compiled guests store A-string literals as UTF-8; those must
+        // decode to the original chars, not CP1252 mojibake.
+        let mut engine = test_engine();
+        let mut literal = "café".as_bytes().to_vec();
+        literal.push(0);
+        engine
+            .mem_write(BUF, &literal)
+            .expect("write guest literal");
+        let text = read_ansi_lossy(&mut engine, BUF, 64).expect("read ANSI");
+        assert_eq!(text, "café");
+    }
+
+    #[test]
+    fn read_ansi_lossy_falls_back_to_cp1252() {
+        // Bytes that are not valid UTF-8 (real Windows binaries pass ACP
+        // strings) decode via windows-1252, C1 range included.
+        let mut engine = test_engine();
+        engine
+            .mem_write(BUF, &[0x63, 0x61, 0x66, 0xE9, 0x00])
+            .expect("write CP1252 bytes");
+        let text = read_ansi_lossy(&mut engine, BUF, 64).expect("read ANSI");
+        assert_eq!(text, "café");
+
+        engine
+            .mem_write(BUF, &[0x80, 0x00])
+            .expect("write CP1252 C1 byte");
+        let text = read_ansi_lossy(&mut engine, BUF, 64).expect("read ANSI");
+        assert_eq!(text, "€");
+    }
+
+    #[test]
+    fn read_ansi_lossy_stops_at_nul_and_ascii_roundtrips() {
+        let mut engine = test_engine();
+        engine
+            .mem_write(BUF, b"Hello\0World")
+            .expect("write guest bytes");
+        let text = read_ansi_lossy(&mut engine, BUF, 64).expect("read ANSI");
+        assert_eq!(text, "Hello");
+    }
 }

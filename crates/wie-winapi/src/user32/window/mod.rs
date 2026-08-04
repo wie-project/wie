@@ -1023,12 +1023,12 @@ pub fn handle_get_window_text_length_a(
     let text = resolve_window_text(state, window_handle);
 
     // Count of CP1252 characters — what Windows GetWindowTextLengthA reports
-    // (the ACP is 1252, one byte per char). `encode_acp` maps each char to a
-    // single CP1252 byte (unmappable chars fall back to '?', matching the
-    // A write path), so the encoded length is the ANSI character count
-    // (mirrors write_guest_ansi_c_string's length semantics).
+    // (the ACP is 1252, one byte per char). `encode_cp1252` emits one byte
+    // per char with '?' (0x3F) for unmappables — the same bytes
+    // write_guest_ansi_c_string writes, so the ANSI byte count is the CP1252
+    // char count (mirrors the A write path's length semantics).
     // Empty/unknown text resolves to "" → 0.
-    let length = u64::try_from(crate::vfs::encode_acp(&text).len())
+    let length = u64::try_from(crate::guest_string::encode_cp1252(&text).len())
         .context("window text length does not fit u64")?;
 
     let return_address = engine

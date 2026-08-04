@@ -14,6 +14,8 @@ serde.workspace = true
 libc = "0.2"
 ab_glyph = "0.2"
 fontdb = "0.24"
+encoding_rs = "0.8"
+strum = { version = "0.26", features = ["derive"] }
 
 wie-cpu = { path = "../wie-cpu" }
 goblin.workspace = true

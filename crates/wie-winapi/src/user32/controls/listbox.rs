@@ -4,10 +4,11 @@
 
 use anyhow::Result;
 
+use super::button::invalidate_control_rect;
 use super::paint::fill_rect_clipped;
 use super::{
-    COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, ControlState, Dimension, PaintCtx, PaintFont,
-    control_items, control_sel_index, control_state, control_state_mut, deliver_command,
+    COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, ControlClassKind, ControlState, Dimension, PaintCtx,
+    PaintFont, control_items, control_sel_index, control_state, control_state_mut, deliver_command,
 };
 use crate::gdi32::render_text_into_surface;
 use crate::gdi32::{FontKey, IRect, ResolvedWindow};
@@ -19,6 +20,12 @@ use crate::user32::{LBN_SELCHANGE, VK_DOWN, VK_UP, WinApiState, find_window, mak
 /// scroll offset is read from the control state via the DC's own hwnd
 /// (`resolve_window_ancestor` sets `dc_window` to the painting control), so
 /// the caller does not need to slice the item list.
+///
+/// `dirty` is the pending invalidation rect (client-relative): only rows
+/// overlapping it render. The erase covered exactly that band, so the
+/// untouched rows keep their pixels — a partial repaint must not wipe them,
+/// and the glyph bands of the rendered rows all land inside the erased area
+/// (the region the published frame reports stays the true changed band).
 pub(super) fn paint_item_lines(
     ctx: &mut PaintCtx<'_>,
     info: &ResolvedWindow,
@@ -26,11 +33,15 @@ pub(super) fn paint_item_lines(
     area: Dimension,
     sel_index: i32,
     font: &mut PaintFont<'_>,
+    dirty: IRect,
 ) -> Result<()> {
     let (x, y) = (info.offset_x, info.offset_y);
     let right = x.saturating_add(area.width);
     let bottom = y.saturating_add(area.height);
     let line_h = font.resolved.line_height();
+    // The dirty band in surface coords — the row-overlap test against it.
+    let dirty_top = y.saturating_add(dirty.top);
+    let dirty_bottom = y.saturating_add(dirty.bottom);
     let first_visible = control_state(ctx.state, info.dc_window.as_u64())
         .and_then(|state| match state {
             ControlState::ListBox { first_visible, .. } => Some(*first_visible),
@@ -43,6 +54,11 @@ pub(super) fn paint_item_lines(
         let line_y = y.saturating_add(i32::try_from(row).unwrap_or(0).saturating_mul(line_h));
         if line_y >= bottom {
             break;
+        }
+        if line_y.saturating_add(line_h) <= dirty_top || line_y >= dirty_bottom {
+            // Outside the pending band: the row was not erased, so its pixels
+            // are intact and rendering it would widen the region.
+            continue;
         }
         let selected = sel_index >= 0 && i32::try_from(index).unwrap_or(-1) == sel_index;
         if selected {
@@ -237,14 +253,23 @@ pub(crate) fn listbox_scroll_wheel(state: &mut WinApiState, hwnd: u64, wparam: u
         old.saturating_add(usize::try_from(rows.saturating_neg()).unwrap_or(0))
     };
     let clamped = listbox_clamp_first_visible(state, hwnd, target);
-    let ControlState::ListBox { first_visible, .. } = control_state_mut(state, hwnd) else {
-        return false;
+    let moved = {
+        let ControlState::ListBox { first_visible, .. } = control_state_mut(state, hwnd) else {
+            return false;
+        };
+        if *first_visible == clamped {
+            false
+        } else {
+            *first_visible = clamped;
+            true
+        }
     };
-    if *first_visible == clamped {
-        return false;
+    if moved {
+        // The visible row band needs repainting (the scrolled-away rows must
+        // be erased, the newly-exposed rows painted).
+        listbox_invalidate_scroll(state, hwnd);
     }
-    *first_visible = clamped;
-    true
+    moved
 }
 
 /// Adjust the LISTBOX's `first_visible` by the smallest scroll that brings
@@ -257,6 +282,7 @@ pub(crate) fn listbox_scroll_selection_into_view(state: &mut WinApiState, hwnd: 
             items,
             sel_index,
             first_visible,
+            ..
         }) => (*first_visible, *sel_index, items.len()),
         _ => return false,
     };
@@ -275,14 +301,23 @@ pub(crate) fn listbox_scroll_selection_into_view(state: &mut WinApiState, hwnd: 
         first_visible
     };
     let clamped = listbox_clamp_first_visible(state, hwnd, target);
-    let ControlState::ListBox { first_visible, .. } = control_state_mut(state, hwnd) else {
-        return false;
+    let moved = {
+        let ControlState::ListBox { first_visible, .. } = control_state_mut(state, hwnd) else {
+            return false;
+        };
+        if *first_visible == clamped {
+            false
+        } else {
+            *first_visible = clamped;
+            true
+        }
     };
-    if *first_visible == clamped {
-        return false;
+    if moved {
+        // The visible row band needs repainting (the scrolled-away rows must
+        // be erased, the newly-exposed rows painted).
+        listbox_invalidate_scroll(state, hwnd);
     }
-    *first_visible = clamped;
-    true
+    moved
 }
 
 /// LISTBOX: WM_KEYDOWN for the Up/Down arrow keys — move the selection one
@@ -323,22 +358,144 @@ pub(crate) fn listbox_key_move_selection(state: &mut WinApiState, hwnd: u64, vk:
         }
     };
     listbox_scroll_selection_into_view(state, hwnd);
+    if changed {
+        // The old and new selected rows swap their highlight. A scroll (the
+        // call above) marks its own band change when it moved; the row marks
+        // cover the no-scroll case exactly.
+        listbox_invalidate_selection(state, hwnd, old, next);
+    }
     changed
+}
+
+// ── Row-level repaint invalidation (the LISTBOX half of fix-24) ──────────
+//
+// Mirrors the BUTTON/STATIC `LabelInvalidation` scope: the mutating ops mark
+// the sub-band they change (a scroll marks the viewport band, a selection
+// change the old+new selected rows, an item append the new row) and
+// `paint_control` erases exactly the pending rect — the erase fill feeds the
+// B3 dirty-region accumulator, so the published frame's `region` is the true
+// changed area instead of the full control rect. The first paint (and every
+// structural change — WM_SETFONT, a resize) stays full.
+
+/// The client-relative rect of the LISTBOX's visible row band — screen rows
+/// `0..visible` at the resolved line height, spanning the client's full width,
+/// clamped to its height.
+///
+/// The viewport is a FIXED screen rect regardless of the scroll offset
+/// (`first_visible` only selects which items fill it), so a scroll's old and
+/// new bands coincide — the union of the two is this single band. Every
+/// screen row's content shifts on a scroll (item `first_visible + r` replaces
+/// `first_visible_old + r`), so marking this band once covers the whole
+/// changed area.
+fn listbox_band_rect(state: &mut WinApiState, hwnd: u64) -> IRect {
+    let (width, height) = find_window(state, hwnd).map_or((0, 0), |w| (w.width, w.height));
+    let line_h = listbox_line_height(state, hwnd);
+    let visible = listbox_visible_rows(state, hwnd);
+    let band_h = i32::try_from(visible)
+        .unwrap_or(0)
+        .saturating_mul(line_h)
+        .min(height);
+    IRect::from_xywh(0, 0, width.max(0), band_h.max(0))
+}
+
+/// The client-relative rect of item `index`'s on-screen row under the current
+/// scroll offset — `None` when the row lies entirely off the client (a
+/// selection above the viewport or past the bottom edge has no pixels to
+/// repaint, and its visible predecessor is covered by the scroll's band mark).
+fn listbox_row_rect(state: &mut WinApiState, hwnd: u64, index: i32) -> Option<IRect> {
+    let (width, height) = find_window(state, hwnd).map_or((0, 0), |w| (w.width, w.height));
+    let first_visible = match control_state(state, hwnd) {
+        Some(ControlState::ListBox { first_visible, .. }) => *first_visible,
+        _ => return None,
+    };
+    let line_h = listbox_line_height(state, hwnd);
+    if line_h <= 0 {
+        return None;
+    }
+    let row = index.saturating_sub(i32::try_from(first_visible).unwrap_or(0));
+    if row < 0 {
+        return None;
+    }
+    let top = row.saturating_mul(line_h);
+    if top >= height {
+        return None;
+    }
+    Some(IRect::from_xywh(
+        0,
+        top,
+        width.max(0),
+        line_h.min(height.saturating_sub(top)).max(0),
+    ))
+}
+
+/// Mark a viewport scroll's repaint scope: the visible row band (the union of
+/// the old and new screen bands, which coincide — see [`listbox_band_rect`]).
+fn listbox_invalidate_scroll(state: &mut WinApiState, hwnd: u64) {
+    let band = listbox_band_rect(state, hwnd);
+    invalidate_control_rect(state, hwnd, band);
+}
+
+/// Mark a selection change's repaint scope: the old and new selected rows'
+/// rects (their highlight swaps). No-op for a LISTBOX-less window (the
+/// ComboBox shares the SETCURSEL/ADDSTRING dispatch) and for negative indices
+/// (no previous selection to erase / a cleared selection paints nothing).
+pub(super) fn listbox_invalidate_selection(
+    state: &mut WinApiState,
+    hwnd: u64,
+    old_index: i32,
+    new_index: i32,
+) {
+    if find_window(state, hwnd).and_then(|w| w.control_kind) != Some(ControlClassKind::ListBox) {
+        return;
+    }
+    for index in [old_index, new_index] {
+        if let Some(rect) = listbox_row_rect(state, hwnd, index) {
+            invalidate_control_rect(state, hwnd, rect);
+        }
+    }
+}
+
+/// Mark the row an `LB_ADDSTRING` appended item lands on (the new item's
+/// on-screen row now shows text where nothing was painted). No-op when the
+/// row is off the viewport or the window is not a LISTBOX (the ComboBox
+/// shares the ADDSTRING dispatch).
+pub(super) fn listbox_invalidate_appended(state: &mut WinApiState, hwnd: u64) {
+    if find_window(state, hwnd).and_then(|w| w.control_kind) != Some(ControlClassKind::ListBox) {
+        return;
+    }
+    let count = match control_state(state, hwnd) {
+        Some(ControlState::ListBox { items, .. }) => items.len(),
+        _ => return,
+    };
+    if count == 0 {
+        return;
+    }
+    if let Some(rect) = listbox_row_rect(
+        state,
+        hwnd,
+        i32::try_from(count.saturating_sub(1)).unwrap_or(-1),
+    ) {
+        invalidate_control_rect(state, hwnd, rect);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        listbox_hit_item, listbox_key_move_selection, listbox_line_height,
+        listbox_band_rect, listbox_hit_item, listbox_invalidate_appended,
+        listbox_key_move_selection, listbox_line_height, listbox_row_rect,
         listbox_scroll_selection_into_view, listbox_scroll_wheel, listbox_visible_rows,
     };
+    use crate::gdi32::IRect;
     use crate::guest_heap::GuestHeap;
     use crate::handles::Hwnd;
     use crate::present::MessageQueue;
     use crate::state::{FileIoState, HeapState, ProcessState};
     use crate::sync_obj::SyncState;
     use crate::thread::ThreadState;
-    use crate::user32::controls::{ControlClassKind, ControlState};
+    use crate::user32::controls::{
+        ControlClassKind, ControlState, LabelInvalidRect, LabelInvalidation,
+    };
     use crate::user32::{
         CreateWindowRequest, WS_CHILD, WS_VISIBLE, WindowClassIdentifier, create_window_record,
     };
@@ -450,6 +607,8 @@ mod tests {
             items,
             sel_index,
             first_visible,
+            invalidation,
+            ..
         } = state
             .window_state()
             .control_states
@@ -461,6 +620,10 @@ mod tests {
         *items = (0..count).map(|i| format!("item {i}")).collect();
         *sel_index = 0;
         *first_visible = 0;
+        // The seed simulates a painted control: the marks the tests drive
+        // must be observable as a pending rect, not absorbed into the Full
+        // a fresh control starts with.
+        *invalidation = LabelInvalidation::Clean;
     }
 
     fn first_visible(state: &mut crate::WinApiState, hwnd: u64) -> usize {
@@ -611,6 +774,212 @@ mod tests {
         assert_eq!(
             listbox_hit_item(&mut state, hwnd, lparam(line_h * 20)),
             None
+        );
+    }
+
+    fn pending_invalidation(state: &mut crate::WinApiState, hwnd: u64) -> LabelInvalidation {
+        let ControlState::ListBox { invalidation, .. } = state
+            .window_state()
+            .control_states
+            .get(&Hwnd::from(hwnd))
+            .expect("listbox state")
+        else {
+            panic!("listbox state");
+        };
+        *invalidation
+    }
+
+    /// A 100-tall LISTBOX (the resolved line height leaves a partial band — a
+    /// 100 × 100 client with a 16 px row pitch shows 6 rows in 96 px), so a
+    /// scroll's viewport band is a proper sub-rect of the client.
+    fn tall_listbox_window(state: &mut crate::WinApiState) -> u64 {
+        listbox_window(state, 100)
+    }
+
+    /// A wheel scroll marks the viewport band — rows `0..visible` — as the
+    /// pending repaint scope: the scrolled-away rows must be erased and the
+    /// newly-exposed rows painted, and the screen band is the same rect
+    /// before and after the scroll.
+    #[test]
+    fn wheel_scroll_marks_the_viewport_band() {
+        let mut state = test_state();
+        let hwnd = tall_listbox_window(&mut state);
+        seed_listbox(&mut state, hwnd, 10);
+        let line_h = listbox_line_height(&mut state, hwnd);
+        let visible = listbox_visible_rows(&mut state, hwnd);
+
+        assert!(listbox_scroll_wheel(&mut state, hwnd, wheel(-120)));
+        let band_h = i32::try_from(visible)
+            .unwrap_or(0)
+            .saturating_mul(line_h)
+            .min(100);
+        assert_eq!(
+            pending_invalidation(&mut state, hwnd),
+            LabelInvalidation::Rect(LabelInvalidRect {
+                rect: IRect::from_xywh(0, 0, 100, band_h),
+                width: 100,
+                height: 100,
+            }),
+            "a wheel scroll must mark exactly the visible row band"
+        );
+    }
+
+    /// The arrow keys mark the old and new selected rows — the two-row union
+    /// the next paint erases (the highlight swaps between them).
+    #[test]
+    fn key_move_marks_old_and_new_selected_rows() {
+        let mut state = test_state();
+        let hwnd = tall_listbox_window(&mut state);
+        seed_listbox(&mut state, hwnd, 10);
+        let line_h = listbox_line_height(&mut state, hwnd);
+
+        assert!(listbox_key_move_selection(&mut state, hwnd, VK_DOWN));
+        assert_eq!(
+            pending_invalidation(&mut state, hwnd),
+            LabelInvalidation::Rect(LabelInvalidRect {
+                rect: IRect::from_xywh(0, 0, 100, line_h.saturating_mul(2)),
+                width: 100,
+                height: 100,
+            }),
+            "moving the selection one row marks rows 0 and 1 (no scroll)"
+        );
+    }
+
+    /// A scroll mark followed by a selection mark accumulates into ONE pending
+    /// scope — the band contains the rows, so the union stays the band (the
+    /// same union semantics the BUTTON/STATIC marks share).
+    #[test]
+    fn scroll_then_selection_marks_union() {
+        let mut state = test_state();
+        let hwnd = tall_listbox_window(&mut state);
+        seed_listbox(&mut state, hwnd, 10);
+        let line_h = listbox_line_height(&mut state, hwnd);
+        let visible = listbox_visible_rows(&mut state, hwnd);
+
+        assert!(listbox_scroll_wheel(&mut state, hwnd, wheel(-120)));
+        // Selecting a row inside the scrolled viewport (first_visible 3, so
+        // item 4 is screen row 1) marks rows 4 and 5 — inside the band.
+        assert!(listbox_key_move_selection(&mut state, hwnd, VK_DOWN));
+        let band_h = i32::try_from(visible)
+            .unwrap_or(0)
+            .saturating_mul(line_h)
+            .min(100);
+        assert_eq!(
+            pending_invalidation(&mut state, hwnd),
+            LabelInvalidation::Rect(LabelInvalidRect {
+                rect: IRect::from_xywh(0, 0, 100, band_h),
+                width: 100,
+                height: 100,
+            }),
+            "a selection mark inside the scrolled band must not widen it"
+        );
+    }
+
+    /// An LB_ADDSTRING marks the appended item's on-screen row — the row now
+    /// shows text where nothing was painted. An item below the viewport marks
+    /// nothing.
+    #[test]
+    fn appended_item_marks_its_row() {
+        let mut state = test_state();
+        let hwnd = tall_listbox_window(&mut state);
+        seed_listbox(&mut state, hwnd, 4);
+        let line_h = listbox_line_height(&mut state, hwnd);
+
+        {
+            let ControlState::ListBox { items, .. } = state
+                .window_state()
+                .control_states
+                .get_mut(&Hwnd::from(hwnd))
+                .expect("listbox state")
+            else {
+                panic!("listbox state");
+            };
+            items.push("item 4".to_owned());
+        }
+        listbox_invalidate_appended(&mut state, hwnd);
+        assert_eq!(
+            pending_invalidation(&mut state, hwnd),
+            LabelInvalidation::Rect(LabelInvalidRect {
+                rect: IRect::from_xywh(0, line_h.saturating_mul(4), 100, line_h),
+                width: 100,
+                height: 100,
+            }),
+            "the appended item's row (index 4, row 4) is the pending scope"
+        );
+    }
+
+    /// The row rect is the on-screen band of an item under the current scroll
+    /// offset — item 4 sits at screen row 1 with `first_visible` 3, an item
+    /// above the viewport has no on-screen pixels.
+    #[test]
+    fn row_rect_tracks_the_scroll_offset() {
+        let mut state = test_state();
+        let hwnd = tall_listbox_window(&mut state);
+        seed_listbox(&mut state, hwnd, 10);
+        {
+            let ControlState::ListBox { first_visible, .. } = state
+                .window_state()
+                .control_states
+                .get_mut(&Hwnd::from(hwnd))
+                .expect("listbox state")
+            else {
+                panic!("listbox state");
+            };
+            *first_visible = 3;
+        }
+        let line_h = listbox_line_height(&mut state, hwnd);
+        assert_eq!(
+            listbox_row_rect(&mut state, hwnd, 4),
+            Some(IRect::from_xywh(0, line_h, 100, line_h)),
+            "item 4 is screen row 1 under first_visible 3"
+        );
+        assert_eq!(
+            listbox_row_rect(&mut state, hwnd, 2),
+            None,
+            "an item above the viewport has no on-screen row"
+        );
+        assert_eq!(
+            listbox_row_rect(&mut state, hwnd, 99),
+            None,
+            "an item far below the client has no on-screen row"
+        );
+        assert_eq!(
+            listbox_row_rect(&mut state, hwnd, -1),
+            None,
+            "a cleared selection marks nothing"
+        );
+    }
+
+    /// The visible band is the FIXED screen viewport — rows `0..visible` at
+    /// the client top — regardless of the scroll offset.
+    #[test]
+    fn band_rect_is_the_screen_viewport_not_the_item_offset() {
+        let mut state = test_state();
+        let hwnd = tall_listbox_window(&mut state);
+        seed_listbox(&mut state, hwnd, 10);
+        let line_h = listbox_line_height(&mut state, hwnd);
+        let visible = listbox_visible_rows(&mut state, hwnd);
+        let band_h = i32::try_from(visible)
+            .unwrap_or(0)
+            .saturating_mul(line_h)
+            .min(100);
+        let expected = IRect::from_xywh(0, 0, 100, band_h);
+        assert_eq!(listbox_band_rect(&mut state, hwnd), expected);
+        {
+            let ControlState::ListBox { first_visible, .. } = state
+                .window_state()
+                .control_states
+                .get_mut(&Hwnd::from(hwnd))
+                .expect("listbox state")
+            else {
+                panic!("listbox state");
+            };
+            *first_visible = 5;
+        }
+        assert_eq!(
+            listbox_band_rect(&mut state, hwnd),
+            expected,
+            "scrolling changes which items fill the band, not the band itself"
         );
     }
 }

@@ -12,9 +12,14 @@ use crate::{
     shell32, user32, uxtheme, winmm,
 };
 use anyhow::{Result, bail};
+use strum::{EnumCount, FromRepr};
 
 /// Dense handler identifier. Resolved once when building the fake-API table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// `FromRepr` replaces the old hand-checked `u16` → `Self` transmute;
+/// `EnumCount` supplies `COUNT` (the variant count, see `WINAPI_ID_COUNT` for
+/// why that is one less than the discriminant span).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, FromRepr, EnumCount)]
 #[repr(u16)]
 pub enum WinApiId {
     Kernel32Getversionexa = 0,
@@ -539,7 +544,15 @@ pub enum WinApiId {
     User32Inflaterect = 463,
 }
 
-pub const WINAPI_ID_COUNT: usize = 464;
+/// Number of dense [`WinApiId`] discriminants, i.e. one past the highest one.
+///
+/// This is the size every discriminant-indexed array (`WINAPI_TRAITS`) needs,
+/// and it is NOT the same as strum's variant count: the enum has two
+/// discriminant holes (109/110, from APIs removed before the appends began), so
+/// `WinApiId::COUNT` is 462 while the highest discriminant is 463. Deriving
+/// from the final variant keeps the alias correct by construction: appending a
+/// variant with a higher discriminant updates this constant with it.
+pub const WINAPI_ID_COUNT: usize = WinApiId::User32Inflaterect.to_u16() as usize + 1;
 
 impl WinApiId {
     /// Discriminant as `u16` (`#[repr(u16)]`).
@@ -551,34 +564,17 @@ impl WinApiId {
         unsafe { core::mem::transmute::<Self, u16>(self) }
     }
 
-    /// Reconstruct from the dense discriminant (`0 .. WINAPI_ID_COUNT`).
+    /// Reconstruct from the discriminant.
+    ///
+    /// Delegates to strum's generated `from_repr` match. This is strictly
+    /// tighter than the old transmute: the two discriminant holes (109/110)
+    /// now return `None` instead of fabricating a value that has no variant —
+    /// previously latent UB that no name resolution could actually reach.
     #[must_use]
-    #[allow(unsafe_code)] // const fn; From is not const-stable
-    pub const fn from_u16(raw: u16) -> Option<Self> {
-        if (raw as usize) >= WINAPI_ID_COUNT {
-            return None;
-        }
-        // SAFETY: `WinApiId` is `#[repr(u16)]` with contiguous discriminants
-        // `0..WINAPI_ID_COUNT`, and `raw` was just bounds-checked against that
-        // count. The invariant is enforced at compile time by the assertion
-        // below, so adding a variant without updating the count (or the
-        // reverse) is a build error rather than latent UB here.
-        Some(unsafe { core::mem::transmute::<u16, Self>(raw) })
+    pub fn from_u16(raw: u16) -> Option<Self> {
+        WinApiId::from_repr(raw)
     }
 }
-
-// The transmute above is only sound while `WINAPI_ID_COUNT` is exactly one past
-// the last discriminant. Both are edited by hand when an API is added, so pin
-// the relationship: if they ever disagree, this fails to compile.
-// `as usize` is infallible widening; TryFrom / From are not const-stable yet.
-const _: () = assert!(
-    (LAST_WINAPI_ID.to_u16() as usize) + 1 == WINAPI_ID_COUNT,
-    "WINAPI_ID_COUNT must equal the last WinApiId discriminant + 1 — \
-     `WinApiId::from_u16` transmutes based on it"
-);
-
-/// Highest-numbered [`WinApiId`]; update alongside the enum's final variant.
-const LAST_WINAPI_ID: WinApiId = WinApiId::User32Inflaterect;
 
 /// Hot-path dispatch: dense `u16` match over the `WinApiId` discriminant
 /// (LLVM jump table) with no string comparison — runs once per host API stop.
@@ -1313,5 +1309,57 @@ impl WinApiId {
     #[must_use]
     pub fn traits(self) -> WinApiTraits {
         WINAPI_TRAITS[usize::from(self.to_u16())]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reject anything outside the valid discriminant domain: one past the
+    /// highest variant, the `u16` ceiling, and the two holes left by removed
+    /// APIs (which the old transmute would have fabricated into invalid enum
+    /// values).
+    #[test]
+    fn from_u16_out_of_range_returns_none() {
+        let count = u16::try_from(WINAPI_ID_COUNT).expect("count fits u16");
+        assert!(WinApiId::from_u16(count).is_none());
+        assert!(WinApiId::from_u16(u16::MAX).is_none());
+        assert!(WinApiId::from_u16(109).is_none());
+        assert!(WinApiId::from_u16(110).is_none());
+        // The strum derive must agree with the wrapper's bounds semantics.
+        assert!(WinApiId::from_repr(count).is_none());
+        assert!(WinApiId::from_repr(u16::MAX).is_none());
+    }
+
+    /// The alias is one past the highest discriminant (the size every
+    /// discriminant-indexed array needs) — not the strum variant count, which
+    /// is lower because of the two holes. Both quantities are pinned here so
+    /// an append/renumber/backfill shows up as a test diff.
+    #[test]
+    fn count_is_pinned_to_enum() {
+        let last_plus_one = usize::from(WinApiId::User32Inflaterect.to_u16()) + 1;
+        assert_eq!(WINAPI_ID_COUNT, last_plus_one);
+        assert_eq!(WINAPI_ID_COUNT, 464);
+        assert_eq!(WinApiId::COUNT, 462); // 462 variants, two discriminant holes
+    }
+
+    /// Every discriminant is either a round-trippable variant (its `to_u16`
+    /// reproduces it) or one of the two known holes.
+    #[test]
+    fn discriminant_round_trip() {
+        for raw in 0..WINAPI_ID_COUNT {
+            let raw = u16::try_from(raw).expect("WINAPI_ID_COUNT fits u16");
+            match WinApiId::from_u16(raw) {
+                Some(id) => assert_eq!(id.to_u16(), raw),
+                None => assert!(
+                    raw == 109 || raw == 110,
+                    "unexpected hole at discriminant {raw}"
+                ),
+            }
+        }
+        // The final variant is exactly the highest discriminant.
+        let last = u16::try_from(WINAPI_ID_COUNT - 1).expect("count fits u16");
+        assert_eq!(WinApiId::User32Inflaterect.to_u16(), last);
     }
 }

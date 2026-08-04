@@ -4338,6 +4338,7 @@ mod tests {
                 items,
                 sel_index,
                 first_visible,
+                ..
             } = state
                 .window_state()
                 .control_states
