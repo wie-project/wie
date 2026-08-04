@@ -137,8 +137,10 @@ pub(crate) fn fontdb_weight_for(lf_weight: i32) -> u16 {
 
 /// Map a raw `lfHeight` to a target pixel height.
 ///
-/// `lfHeight < 0` is a character height (|lfHeight| px); `lfHeight > 0` is a
-/// cell height (approximated as |lfHeight| px); `lfHeight == 0` uses the
+/// `lfHeight < 0` requests the CHARACTER height (tmHeight = ascent+descent,
+/// which the engine makes exactly equal to the px scale); `lfHeight > 0`
+/// requests the CELL height (the em square, which is the same px scale in
+/// ab_glyph — the two collapse to one number); `lfHeight == 0` uses the
 /// 16 px default.
 #[must_use]
 pub(crate) fn height_px_from_lf(lf_height: i32) -> i32 {
@@ -344,8 +346,10 @@ pub struct ResolvedFont {
     font: FontArc,
     /// The pixel height this font was resolved at (the glyph-cache key part).
     pub height_px: i32,
-    /// Px per em — the scale that makes the line height (`ascent+descent`)
-    /// equal the requested height. Also used for `tmInternalLeading`.
+    /// Px per em — the glyph scale. Because ab_glyph defines the scaled
+    /// height (`ascent + |descent|`) as identically equal to this scale,
+    /// `scale == height_px` and the character height always matches the
+    /// requested height exactly.
     pub scale: f32,
     /// Ascent in px.
     pub ascent: f32,
@@ -548,22 +552,24 @@ impl FontEngine {
     }
 }
 
-/// Build a [`ResolvedFont`]: scale so the line height equals `height_px`,
-/// then compute the px metrics the metric APIs report.
+/// Build a [`ResolvedFont`]: scale so the character height (`ascent+descent`)
+/// equals `height_px`, then compute the px metrics the metric APIs report.
+///
+/// ab_glyph defines `ScaleFont::height() = ascent() - descent() ≡ scale.y`
+/// (both ascent and descent are normalized by `height_unscaled`), so the px
+/// scale IS the character height — there is no separate em-to-character
+/// ratio to correct for. The pre-fix formula `target * units_per_em / span`
+/// assumed `ascent()-descent() = span * scale / units_per_em` and therefore
+/// shrank every face whose typo span exceeds the em box (most fonts) to
+/// ~86-90% of the requested height — the ~15-20% undersized notepad EDIT.
 fn build_resolved(
     font: &FontArc,
     height_px: i32,
     fake_bold: bool,
     fake_italic: bool,
 ) -> ResolvedFont {
-    let units = font.units_per_em().unwrap_or(1000.0);
-    let span = font.ascent_unscaled() - font.descent_unscaled();
     let target = height_px.max(1) as f32;
-    let scale = if span > 0.0 {
-        target * units / span
-    } else {
-        target
-    };
+    let scale = target;
     let scaled = font.as_scaled(PxScale::from(scale));
     let ascent = scaled.ascent();
     let descent = scaled.descent();
@@ -942,6 +948,49 @@ mod tests {
             resolved.avg_advance, resolved.max_advance,
             "Lucida Console must resolve to a monospace face (avg {} max {})",
             resolved.avg_advance, resolved.max_advance
+        );
+    }
+
+    #[test]
+    fn negative_lfheight_maps_to_character_height() {
+        // The notepad EDIT lane: a guest creates its edit font with
+        // lfHeight = -13, which requests the CHARACTER height (tmHeight =
+        // ascent+descent). Because ab_glyph makes the scaled height exactly
+        // equal to the px scale, resolving at 13 px must yield
+        // ascent+descent ≈ 13 — host-independently, for ANY face the
+        // canonical monospace substitution produces. Before the fix the
+        // engine applied a `* units_per_em / span` correction that shrank
+        // the rendered height to ~86-90% of the request (the ~15-20%
+        // undersized EDIT vs real Windows notepad).
+        let mut engine = FontEngine::default();
+        let key = FontKey {
+            family: "lucida console".to_owned(),
+            weight: 400,
+            italic: false,
+            fixed_pitch: true,
+        };
+        let Some(resolved) = engine.resolve(&key, height_px_from_lf(-13)) else {
+            return; // no system fonts — nothing to resolve
+        };
+        let char_h = resolved.ascent - resolved.descent;
+        assert!(
+            (char_h - 13.0).abs() <= 1.0,
+            "ascent+descent must be ≈ |lfHeight| = 13, got {char_h:.2} (scale {:.2})",
+            resolved.scale
+        );
+        // The same key flows out of CreateFontIndirectW("Lucida Console",
+        // -13, FIXED_PITCH): family lowercased, pitch bit 0x01 → fixed_pitch.
+        assert_eq!(key.family, "lucida console");
+        // The positive-lfHeight counterpart (cell height = the em square):
+        // the same px scale, so a +13 request also resolves at 13.
+        let Some(positive) = engine.resolve(&key, height_px_from_lf(13)) else {
+            return;
+        };
+        assert!(
+            (positive.scale - resolved.scale).abs() <= 1.0,
+            "both signs must set the px scale to |lfHeight| ({} vs {})",
+            positive.scale,
+            resolved.scale
         );
     }
 

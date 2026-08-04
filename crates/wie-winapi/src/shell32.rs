@@ -350,6 +350,7 @@ fn shell_execute_open(state: &WinApiState, guest_path: &str) -> u64 {
     };
     if std::process::Command::new(host_exe)
         .arg("run")
+        .arg("--gui")
         .arg(&host_path)
         .spawn()
         .is_ok()

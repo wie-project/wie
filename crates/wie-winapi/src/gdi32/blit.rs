@@ -288,6 +288,41 @@ fn resolve_src_info(
     Some((dib.bits_va, dib.stride, w, h, dib.height < 0))
 }
 
+// Reusable scratch buffer for the one-shot `mem_read` of a blit span.
+//
+// Growth-only: the buffer is resized only when a span needs more bytes and
+// never shrunk, so repeated BitBlt calls in a repaint cycle stop
+// re-allocating after the first, largest blit. The guest paints on a single
+// thread (WM_PAINT cycles run on the GUI thread), so a thread_local needs no
+// state changes. `mem_read` and `mask_bgra_to_0rgb` are leaf operations that
+// never re-enter blit, so the `RefCell` borrow inside the closure cannot
+// alias.
+std::thread_local! {
+    static BLIT_SCRATCH: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `f` with a scratch slice of exactly `span_len` bytes.
+///
+/// Only the span prefix of a reused (larger) buffer is exposed — handing
+/// callers the whole buffer would make `mem_read` read guest bytes past the
+/// blit span.
+fn with_blit_scratch<R>(span_len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    BLIT_SCRATCH.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if guard.len() < span_len {
+            guard.resize(span_len, 0);
+        }
+        // resize-if-needed guarantees len >= span_len; the fallback is for the
+        // impossible case and degrades the blit to a no-op rather than
+        // panicking.
+        let Some(scratch) = guard.get_mut(..span_len) else {
+            return f(&mut []);
+        };
+        f(scratch)
+    })
+}
+
 /// Copy 32-bpp pixels from guest memory into a destination surface row buffer.
 // Wide signature: one blit row needs source geometry + dest surface + clip.
 #[allow(clippy::too_many_arguments)]
@@ -341,37 +376,40 @@ fn blit_row(
 
     // ONE mem_read for the entire blit span — a single translation and
     // bounds check instead of one per row (the old per-row loop dominated
-    // the blit cost for large windows).
-    let mut scratch = vec![0u8; span_len];
-    if engine.mem_read(span_va, &mut scratch).is_err() {
-        return;
-    }
-
-    for row in 0..ch {
-        // Row index within the span (reversed for bottom-up DIBs).
-        let span_row = if top_down {
-            row
-        } else {
-            ch.saturating_sub(1).saturating_sub(row)
-        };
-        // `span_va` already advanced by `src_x * 4`, so the row read is a
-        // plain stride offset — re-adding `src_x` would double the column.
-        let src_off = span_row.saturating_mul(stride);
-        let Some(row_slice) = scratch.get(src_off..src_off.saturating_add(row_bytes)) else {
+    // the blit cost for large windows). The span buffer is a thread_local
+    // scratch (`with_blit_scratch`) that only grows, so repeated BitBlt calls
+    // reuse one allocation instead of re-allocating ~span bytes every call.
+    with_blit_scratch(span_len, |scratch| {
+        if engine.mem_read(span_va, scratch).is_err() {
             return;
-        };
+        }
 
-        let dst_row = dest_y_us.saturating_add(row);
-        let dst_offset = dst_row.saturating_mul(dest_w_us).saturating_add(dest_x_us);
-        let dst_end = dst_offset.saturating_add(width_us).min(dest.len());
-        let Some(dst_slice) = dest.get_mut(dst_offset..dst_end) else {
-            return;
-        };
+        for row in 0..ch {
+            // Row index within the span (reversed for bottom-up DIBs).
+            let span_row = if top_down {
+                row
+            } else {
+                ch.saturating_sub(1).saturating_sub(row)
+            };
+            // `span_va` already advanced by `src_x * 4`, so the row read is a
+            // plain stride offset — re-adding `src_x` would double the column.
+            let src_off = span_row.saturating_mul(stride);
+            let Some(row_slice) = scratch.get(src_off..src_off.saturating_add(row_bytes)) else {
+                return;
+            };
 
-        // BGRA → 0RGB: DIB pixel is 0xAARRGGBB in LE, mask alpha.
-        // NEON-vectorized (4 px/op) so the conversion is fast even in debug.
-        mask_bgra_to_0rgb(dst_slice, row_slice);
-    }
+            let dst_row = dest_y_us.saturating_add(row);
+            let dst_offset = dst_row.saturating_mul(dest_w_us).saturating_add(dest_x_us);
+            let dst_end = dst_offset.saturating_add(width_us).min(dest.len());
+            let Some(dst_slice) = dest.get_mut(dst_offset..dst_end) else {
+                return;
+            };
+
+            // BGRA → 0RGB: DIB pixel is 0xAARRGGBB in LE, mask alpha.
+            // NEON-vectorized (4 px/op) so the conversion is fast even in debug.
+            mask_bgra_to_0rgb(dst_slice, row_slice);
+        }
+    });
 }
 
 /// Fill a rectangular region of a surface with a constant color.
@@ -772,7 +810,7 @@ pub fn handle_fill_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 
 #[cfg(test)]
 mod tests {
-    use super::{IRect, ancestor_offset, subtract_rect};
+    use super::{BLIT_SCRATCH, IRect, ancestor_offset, subtract_rect, with_blit_scratch};
     use crate::WindowRecord;
     use crate::handles::Hwnd;
 
@@ -872,5 +910,25 @@ mod tests {
             .sum();
         // 320×240 minus button (100×30) minus static (200×30).
         assert_eq!(total, 67_800);
+    }
+
+    #[test]
+    fn blit_scratch_reuses_growth_only_buffer() {
+        // Reset the thread-local so the test observes exactly its own history.
+        BLIT_SCRATCH.with(|cell| cell.borrow_mut().clear());
+
+        let mut first_len = 0;
+        with_blit_scratch(1024, |s| first_len = s.len());
+        let mut second_len = 0;
+        with_blit_scratch(64, |s| second_len = s.len());
+        let retained = BLIT_SCRATCH.with(|cell| cell.borrow().len());
+
+        // Each call sees exactly its span — a smaller blit must not expose the
+        // larger retained buffer to mem_read (that would read guest bytes past
+        // the blit span) — and the buffer keeps its peak size instead of
+        // re-allocating per call.
+        assert_eq!(first_len, 1024);
+        assert_eq!(second_len, 64);
+        assert_eq!(retained, 1024);
     }
 }

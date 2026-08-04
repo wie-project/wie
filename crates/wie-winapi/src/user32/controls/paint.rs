@@ -3,6 +3,7 @@
 
 use anyhow::Result;
 
+use super::Rect;
 use crate::gdi32::ResolvedWindow;
 use crate::gdi32::fill_rect_surface;
 use crate::user32::{WinApiState, write_guest_ansi_c_string, write_guest_utf16_c_string};
@@ -15,19 +16,18 @@ pub(super) fn fill_rect_clipped(
     info: &ResolvedWindow,
     control_width: i32,
     control_height: i32,
-    x: i32,
-    y: i32,
-    cx: i32,
-    cy: i32,
+    rect: Rect,
     color: u32,
 ) {
-    let x0 = x.max(info.offset_x);
-    let y0 = y.max(info.offset_y);
-    let x1 = x
-        .saturating_add(cx)
+    let x0 = rect.x.max(info.offset_x);
+    let y0 = rect.y.max(info.offset_y);
+    let x1 = rect
+        .x
+        .saturating_add(rect.cx)
         .min(info.offset_x.saturating_add(control_width));
-    let y1 = y
-        .saturating_add(cy)
+    let y1 = rect
+        .y
+        .saturating_add(rect.cy)
         .min(info.offset_y.saturating_add(control_height));
     if x1 <= x0 || y1 <= y0 {
         return;

@@ -7,11 +7,11 @@ use super::listbox::render_control_text;
 use super::paint::fill_rect_clipped;
 use super::{
     COLOR_BTNFACE, COLOR_BTNHIGHLIGHT, COLOR_BTNSHADOW, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT,
-    ControlClassKind, ControlState, ES_MULTILINE, SEL_EMPTY, SEL_MULTICHAR, SEL_MULTILINE,
-    SEL_TEXT, control_state, deliver_command,
+    ControlClassKind, ControlState, ES_MULTILINE, HitTestLayout, PaintCtx, PaintFont, Rect,
+    SEL_EMPTY, SEL_MULTICHAR, SEL_MULTILINE, SEL_TEXT, TextGeom, control_state, deliver_command,
 };
+use crate::gdi32::FontKey;
 use crate::gdi32::ResolvedWindow;
-use crate::gdi32::{FontEngine, FontKey, ResolvedFont};
 use crate::guest_memory::read_u16 as read_guest_u16;
 use crate::state::{TimerRecord, WindowFlags};
 use crate::user32::{
@@ -1544,22 +1544,18 @@ pub(super) fn edit_mouse_wheel(state: &mut WinApiState, hwnd: u64, wparam: u64) 
 /// The char index whose glyph cell contains the client point (x, y) — the
 /// inverse of the advance-summed caret x `paint_edit` draws.
 ///
-/// `wrap_width` is the client width minus the 2 px side margins (the same
-/// column `layout_visible_lines` lays out against); the row for y is picked
-/// from that same visual-row layout, so a click in wrapped text lands on the
-/// glyph the paint shows there. A click left of the text clamps to the row
-/// start, past the last glyph to the row end; a single-line EDIT (wrap off,
-/// one row at y=0) picks its only row for any y.
+/// `layout.wrap_width` is the client width minus the 2 px side margins (the
+/// same column `layout_visible_lines` lays out against); the row for y is
+/// picked from that same visual-row layout, so a click in wrapped text lands
+/// on the glyph the paint shows there. A click left of the text clamps to the
+/// row start, past the last glyph to the row end; a single-line EDIT (wrap
+/// off, one row at y=0) picks its only row for any y.
 #[must_use]
 pub(crate) fn edit_char_index_at_point<F>(
     text: &str,
     x: i32,
     y: i32,
-    wrap_width: i32,
-    line_height: i32,
-    first_visible: usize,
-    wrap: bool,
-    alignment: u32,
+    layout: &HitTestLayout,
     advance: &mut F,
 ) -> usize
 where
@@ -1567,11 +1563,11 @@ where
 {
     let rows = layout_visible_lines(
         text,
-        wrap_width,
-        line_height,
-        first_visible,
-        wrap,
-        alignment,
+        layout.wrap_width,
+        layout.line_height,
+        layout.first_visible,
+        layout.wrap,
+        layout.alignment,
         advance,
     );
     // The last row at or above the click (rows are y-rebased to 0 at the
@@ -1676,11 +1672,13 @@ fn edit_char_at_point(state: &mut WinApiState, hwnd: u64, x: i32, y: i32) -> Opt
                 &text,
                 x.saturating_add(shift),
                 y,
-                area.wrap_width,
-                line_h,
-                first_visible_line,
-                wrap,
-                alignment,
+                &HitTestLayout {
+                    wrap_width: area.wrap_width,
+                    line_height: line_h,
+                    first_visible: first_visible_line,
+                    wrap,
+                    alignment,
+                },
                 advance,
             )
         }
@@ -1692,11 +1690,13 @@ fn edit_char_at_point(state: &mut WinApiState, hwnd: u64, x: i32, y: i32) -> Opt
                 &text,
                 x,
                 y,
-                area.wrap_width,
-                16,
-                first_visible_line,
-                wrap,
-                alignment,
+                &HitTestLayout {
+                    wrap_width: area.wrap_width,
+                    line_height: 16,
+                    first_visible: first_visible_line,
+                    wrap,
+                    alignment,
+                },
                 &mut |_| 8_i32,
             )
         }
@@ -2445,10 +2445,12 @@ fn paint_vertical_scrollbar(
         info,
         width,
         height,
-        gutter_x,
-        info.offset_y,
-        SCROLLBAR_WIDTH,
-        track,
+        Rect {
+            x: gutter_x,
+            y: info.offset_y,
+            cx: SCROLLBAR_WIDTH,
+            cy: track,
+        },
         COLOR_BTNFACE,
     );
     fill_rect_clipped(
@@ -2456,10 +2458,12 @@ fn paint_vertical_scrollbar(
         info,
         width,
         height,
-        gutter_x,
-        info.offset_y,
-        1,
-        track,
+        Rect {
+            x: gutter_x,
+            y: info.offset_y,
+            cx: 1,
+            cy: track,
+        },
         COLOR_BTNHIGHLIGHT,
     );
     fill_rect_clipped(
@@ -2467,10 +2471,12 @@ fn paint_vertical_scrollbar(
         info,
         width,
         height,
-        gutter_x.saturating_add(SCROLLBAR_WIDTH.saturating_sub(1)),
-        info.offset_y,
-        1,
-        track,
+        Rect {
+            x: gutter_x.saturating_add(SCROLLBAR_WIDTH.saturating_sub(1)),
+            y: info.offset_y,
+            cx: 1,
+            cy: track,
+        },
         COLOR_BTNSHADOW,
     );
     // The raised thumb: BTNFACE with light top/left and shadow bottom/right.
@@ -2480,10 +2486,12 @@ fn paint_vertical_scrollbar(
         info,
         width,
         height,
-        gutter_x,
-        thumb_y,
-        SCROLLBAR_WIDTH,
-        thumb,
+        Rect {
+            x: gutter_x,
+            y: thumb_y,
+            cx: SCROLLBAR_WIDTH,
+            cy: thumb,
+        },
         COLOR_BTNFACE,
     );
     fill_rect_clipped(
@@ -2491,10 +2499,12 @@ fn paint_vertical_scrollbar(
         info,
         width,
         height,
-        gutter_x,
-        thumb_y,
-        SCROLLBAR_WIDTH,
-        1,
+        Rect {
+            x: gutter_x,
+            y: thumb_y,
+            cx: SCROLLBAR_WIDTH,
+            cy: 1,
+        },
         COLOR_BTNHIGHLIGHT,
     );
     fill_rect_clipped(
@@ -2502,10 +2512,12 @@ fn paint_vertical_scrollbar(
         info,
         width,
         height,
-        gutter_x,
-        thumb_y.saturating_add(thumb.saturating_sub(1)),
-        SCROLLBAR_WIDTH,
-        1,
+        Rect {
+            x: gutter_x,
+            y: thumb_y.saturating_add(thumb.saturating_sub(1)),
+            cx: SCROLLBAR_WIDTH,
+            cy: 1,
+        },
         COLOR_BTNSHADOW,
     );
     fill_rect_clipped(
@@ -2513,10 +2525,12 @@ fn paint_vertical_scrollbar(
         info,
         width,
         height,
-        gutter_x,
-        thumb_y,
-        1,
-        thumb,
+        Rect {
+            x: gutter_x,
+            y: thumb_y,
+            cx: 1,
+            cy: thumb,
+        },
         COLOR_BTNHIGHLIGHT,
     );
     fill_rect_clipped(
@@ -2524,10 +2538,12 @@ fn paint_vertical_scrollbar(
         info,
         width,
         height,
-        gutter_x.saturating_add(SCROLLBAR_WIDTH.saturating_sub(1)),
-        thumb_y,
-        1,
-        thumb,
+        Rect {
+            x: gutter_x.saturating_add(SCROLLBAR_WIDTH.saturating_sub(1)),
+            y: thumb_y,
+            cx: 1,
+            cy: thumb,
+        },
         COLOR_BTNSHADOW,
     );
 }
@@ -2559,10 +2575,12 @@ fn paint_horizontal_scrollbar(
         info,
         width,
         height,
-        info.offset_x,
-        strip_y,
-        width,
-        SCROLLBAR_WIDTH,
+        Rect {
+            x: info.offset_x,
+            y: strip_y,
+            cx: width,
+            cy: SCROLLBAR_WIDTH,
+        },
         COLOR_BTNFACE,
     );
     fill_rect_clipped(
@@ -2570,10 +2588,12 @@ fn paint_horizontal_scrollbar(
         info,
         width,
         height,
-        info.offset_x,
-        strip_y,
-        width,
-        1,
+        Rect {
+            x: info.offset_x,
+            y: strip_y,
+            cx: width,
+            cy: 1,
+        },
         COLOR_BTNHIGHLIGHT,
     );
     fill_rect_clipped(
@@ -2581,10 +2601,12 @@ fn paint_horizontal_scrollbar(
         info,
         width,
         height,
-        info.offset_x,
-        strip_y.saturating_add(SCROLLBAR_WIDTH.saturating_sub(1)),
-        width,
-        1,
+        Rect {
+            x: info.offset_x,
+            y: strip_y.saturating_add(SCROLLBAR_WIDTH.saturating_sub(1)),
+            cx: width,
+            cy: 1,
+        },
         COLOR_BTNSHADOW,
     );
     let thumb_x = info.offset_x.saturating_add(thumb_pos);
@@ -2593,10 +2615,12 @@ fn paint_horizontal_scrollbar(
         info,
         width,
         height,
-        thumb_x,
-        strip_y,
-        thumb,
-        SCROLLBAR_WIDTH,
+        Rect {
+            x: thumb_x,
+            y: strip_y,
+            cx: thumb,
+            cy: SCROLLBAR_WIDTH,
+        },
         COLOR_BTNFACE,
     );
     fill_rect_clipped(
@@ -2604,10 +2628,12 @@ fn paint_horizontal_scrollbar(
         info,
         width,
         height,
-        thumb_x,
-        strip_y,
-        1,
-        SCROLLBAR_WIDTH,
+        Rect {
+            x: thumb_x,
+            y: strip_y,
+            cx: 1,
+            cy: SCROLLBAR_WIDTH,
+        },
         COLOR_BTNHIGHLIGHT,
     );
     fill_rect_clipped(
@@ -2615,10 +2641,12 @@ fn paint_horizontal_scrollbar(
         info,
         width,
         height,
-        thumb_x.saturating_add(thumb.saturating_sub(1)),
-        strip_y,
-        1,
-        SCROLLBAR_WIDTH,
+        Rect {
+            x: thumb_x.saturating_add(thumb.saturating_sub(1)),
+            y: strip_y,
+            cx: 1,
+            cy: SCROLLBAR_WIDTH,
+        },
         COLOR_BTNSHADOW,
     );
     fill_rect_clipped(
@@ -2626,10 +2654,12 @@ fn paint_horizontal_scrollbar(
         info,
         width,
         height,
-        thumb_x,
-        strip_y,
-        thumb,
-        1,
+        Rect {
+            x: thumb_x,
+            y: strip_y,
+            cx: thumb,
+            cy: 1,
+        },
         COLOR_BTNHIGHLIGHT,
     );
     fill_rect_clipped(
@@ -2637,10 +2667,12 @@ fn paint_horizontal_scrollbar(
         info,
         width,
         height,
-        thumb_x,
-        strip_y.saturating_add(SCROLLBAR_WIDTH.saturating_sub(1)),
-        thumb,
-        1,
+        Rect {
+            x: thumb_x,
+            y: strip_y.saturating_add(SCROLLBAR_WIDTH.saturating_sub(1)),
+            cx: thumb,
+            cy: 1,
+        },
         COLOR_BTNSHADOW,
     );
 }
@@ -2654,22 +2686,17 @@ fn paint_horizontal_scrollbar(
 /// over its COLOR_HIGHLIGHT cells — and the caret bar (1 px, full line
 /// height) is only drawn while the control has focus.
 pub(super) fn paint_edit(
-    state: &mut WinApiState,
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut PaintCtx<'_>,
     info: &ResolvedWindow,
     text: &str,
-    tx: i32,
-    width: i32,
-    height: i32,
-    font_engine: &mut FontEngine,
-    resolved: &ResolvedFont,
-    key: &FontKey,
+    geom: TextGeom,
+    font: &mut PaintFont<'_>,
 ) -> Result<()> {
     let len = text.chars().count();
-    let focused = find_window(state, info.dc_window.as_u64())
+    let focused = find_window(ctx.state, info.dc_window.as_u64())
         .is_some_and(|w| w.flags.contains(WindowFlags::FOCUSED));
     let (sel_start, sel_end, caret, first_visible_line, first_visible_column, caret_on) =
-        match control_state(state, info.dc_window.as_u64()) {
+        match control_state(ctx.state, info.dc_window.as_u64()) {
             Some(ControlState::Edit {
                 caret,
                 sel_start,
@@ -2689,7 +2716,7 @@ pub(super) fn paint_edit(
             _ => (0, 0, 0, 0, 0, true),
         };
     let (sel_start, sel_end, caret) = (sel_start.min(len), sel_end.min(len), caret.min(len));
-    let line_h = resolved.line_height();
+    let line_h = font.resolved.line_height();
     // The multiline/wrap/alignment decisions read the LIVE creation style
     // from the window record, not `style_bits`: the read-only `control_state`
     // accessor never refreshes `style_bits`, whose lazy seed starts at 0 — so
@@ -2698,7 +2725,8 @@ pub(super) fn paint_edit(
     // a multiline EDIT as single-line (and an ES_CENTER/RIGHT edit as
     // left-aligned). The caret/selection fields are correctly maintained and
     // stay on the control state.
-    let edit_style = state
+    let edit_style = ctx
+        .state
         .window_state()
         .windows
         .iter()
@@ -2715,7 +2743,7 @@ pub(super) fn paint_edit(
         info.offset_y
     } else {
         info.offset_y
-            .saturating_add(height.saturating_sub(line_h).saturating_div(2))
+            .saturating_add(geom.height.saturating_sub(line_h).saturating_div(2))
             .max(info.offset_y)
     };
     // The wrap column and scrollbar visibility come from the SAME shared
@@ -2723,8 +2751,16 @@ pub(super) fn paint_edit(
     // and the scroll offsets always agree — including the V-scrollbar gutter
     // reservation and the H-scrollbar bottom strip.
     let area = {
-        let mut advance = |ch: char| font_engine.char_advance(resolved, key, ch);
-        edit_text_area(text, width, height, line_h, edit_style, caret, &mut advance)
+        let mut advance = |ch: char| font.engine.char_advance(font.resolved, font.key, ch);
+        edit_text_area(
+            text,
+            geom.width,
+            geom.height,
+            line_h,
+            edit_style,
+            caret,
+            &mut advance,
+        )
     };
     // Text is clipped to the text area: the right edge stops before the V
     // gutter (a wrap-off line's tail must not bleed into the scrollbar) and
@@ -2739,8 +2775,14 @@ pub(super) fn paint_edit(
     } else {
         0
     };
-    let text_right = info.offset_x.saturating_add(width).saturating_sub(v_gutter);
-    let text_bottom = info.offset_y.saturating_add(height).saturating_sub(h_strip);
+    let text_right = info
+        .offset_x
+        .saturating_add(geom.width)
+        .saturating_sub(v_gutter);
+    let text_bottom = info
+        .offset_y
+        .saturating_add(geom.height)
+        .saturating_sub(h_strip);
     let clip = Some((info.offset_x, info.offset_y, text_right, text_bottom));
     let has_selection = focused && sel_start != sel_end;
     let rows = layout_visible_lines(
@@ -2750,7 +2792,7 @@ pub(super) fn paint_edit(
         if multiline { first_visible_line } else { 0 },
         wrap,
         edit_style & ES_ALIGN_MASK,
-        &mut |ch| font_engine.char_advance(resolved, key, ch),
+        &mut |ch| font.engine.char_advance(font.resolved, font.key, ch),
     );
     // A wrap-off EDIT scrolled right shifts every row (and its caret/selection
     // x) by the horizontal offset.
@@ -2766,7 +2808,7 @@ pub(super) fn paint_edit(
         if y >= text_bottom {
             break;
         }
-        let x = tx.saturating_sub(h_shift).saturating_add(row.x);
+        let x = geom.tx.saturating_sub(h_shift).saturating_add(row.x);
         // Pass 1: fill the selected cells with COLOR_HIGHLIGHT (behind text).
         let (sel_lo, sel_hi) = if has_selection {
             selection_overlap(row, sel_start, sel_end)
@@ -2774,17 +2816,29 @@ pub(super) fn paint_edit(
             (0, 0)
         };
         let sel_x = if sel_lo < sel_hi {
-            let lo_x = x.saturating_add(font_engine.text_advance(resolved, key, &row.text, sel_lo));
-            let hi_x = x.saturating_add(font_engine.text_advance(resolved, key, &row.text, sel_hi));
+            let lo_x = x.saturating_add(font.engine.text_advance(
+                font.resolved,
+                font.key,
+                &row.text,
+                sel_lo,
+            ));
+            let hi_x = x.saturating_add(font.engine.text_advance(
+                font.resolved,
+                font.key,
+                &row.text,
+                sel_hi,
+            ));
             fill_rect_clipped(
-                state,
+                ctx.state,
                 info,
-                width,
-                height,
-                lo_x,
-                y,
-                hi_x.saturating_sub(lo_x),
-                line_h,
+                geom.width,
+                geom.height,
+                Rect {
+                    x: lo_x,
+                    y,
+                    cx: hi_x.saturating_sub(lo_x),
+                    cy: line_h,
+                },
                 COLOR_HIGHLIGHT,
             );
             Some((lo_x, sel_lo, sel_hi))
@@ -2794,19 +2848,18 @@ pub(super) fn paint_edit(
         // Pass 2: the whole row in the normal text color.
         if !row.text.is_empty() {
             render_control_text(
-                state,
-                engine,
+                ctx,
                 info.hwnd,
-                info.width,
-                info.height,
-                x,
-                y,
+                Rect {
+                    x,
+                    y,
+                    cx: i32::try_from(info.width).unwrap_or(0),
+                    cy: i32::try_from(info.height).unwrap_or(0),
+                },
                 &row.text,
                 0,
                 clip,
-                font_engine,
-                resolved,
-                key,
+                font,
             )?;
         }
         // Pass 3: re-render the selected run in COLOR_HIGHLIGHTTEXT.
@@ -2818,19 +2871,18 @@ pub(super) fn paint_edit(
                 .take(sel_hi.saturating_sub(sel_lo))
                 .collect();
             render_control_text(
-                state,
-                engine,
+                ctx,
                 info.hwnd,
-                info.width,
-                info.height,
-                sel_x,
-                y,
+                Rect {
+                    x: sel_x,
+                    y,
+                    cx: i32::try_from(info.width).unwrap_or(0),
+                    cy: i32::try_from(info.height).unwrap_or(0),
+                },
                 &selected,
                 COLOR_HIGHLIGHTTEXT,
                 clip,
-                font_engine,
-                resolved,
-                key,
+                font,
             )?;
         }
         // Pass 4: the 1 px caret bar at the caret's glyph cell. The caret
@@ -2839,17 +2891,23 @@ pub(super) fn paint_edit(
         // in the blink ON phase (the focus timer toggles `caret_on`).
         if focused && caret_on && !caret_drawn && caret >= row.char_start && caret <= row.char_end {
             let local = caret.saturating_sub(row.char_start);
-            let caret_x =
-                x.saturating_add(font_engine.text_advance(resolved, key, &row.text, local));
+            let caret_x = x.saturating_add(font.engine.text_advance(
+                font.resolved,
+                font.key,
+                &row.text,
+                local,
+            ));
             fill_rect_clipped(
-                state,
+                ctx.state,
                 info,
-                width,
-                height,
-                caret_x,
-                y,
-                1,
-                line_h,
+                geom.width,
+                geom.height,
+                Rect {
+                    x: caret_x,
+                    y,
+                    cx: 1,
+                    cy: line_h,
+                },
                 0x0000_0000,
             );
             caret_drawn = true;
@@ -2859,10 +2917,10 @@ pub(super) fn paint_edit(
     // client edges (the classic scrollbars are window chrome, not text area).
     if area.v_scroll_visible {
         paint_vertical_scrollbar(
-            state,
+            ctx.state,
             info,
-            width,
-            height,
+            geom.width,
+            geom.height,
             first_visible_line,
             area.total,
             area.visible,
@@ -2870,10 +2928,10 @@ pub(super) fn paint_edit(
     }
     if area.h_scroll_visible {
         paint_horizontal_scrollbar(
-            state,
+            ctx.state,
             info,
-            width,
-            height,
+            geom.width,
+            geom.height,
             first_visible_column,
             area.max_line_width,
             area.wrap_width,

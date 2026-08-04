@@ -21,6 +21,7 @@ use super::{
 };
 use crate::OuterReturn;
 use crate::gdi32::resolve_window_ancestor;
+use crate::gdi32::{FontEngine, FontKey, ResolvedFont};
 use crate::state::WindowFlags;
 
 mod button;
@@ -28,6 +29,54 @@ mod edit;
 mod listbox;
 mod paint;
 mod r#static;
+
+// ── Paint-context bundles ───────────────────────────────────────────────
+//
+// The control paint/hit-test signatures bundle their recurring parameter
+// groups so they stay under the clippy `too_many_arguments` limit without
+// splitting the drawing call sites.
+
+/// Bundled engine + state for the control paint/hit-test paths.
+pub(super) struct PaintCtx<'a> {
+    pub state: &'a mut WinApiState,
+    pub engine: &'a mut dyn wie_cpu::CpuEngine,
+}
+
+/// The active font for one paint call — the engine, the resolved face, and
+/// its key always travel together.
+pub(super) struct PaintFont<'a> {
+    pub engine: &'a mut FontEngine,
+    pub resolved: &'a ResolvedFont,
+    pub key: &'a FontKey,
+}
+
+/// An integer rect (`x`, `y`, width, height).
+pub(super) struct Rect {
+    pub x: i32,
+    pub y: i32,
+    pub cx: i32,
+    pub cy: i32,
+}
+
+/// The text-layout geometry a paint call draws into.
+pub(super) struct TextGeom {
+    pub tx: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+/// The wrap-aware layout parameters of one EDIT hit-test call.
+///
+/// `pub(crate)` (not `pub(super)` like the other bundles): the host unit tests
+/// in `state/tests.rs` construct it directly at the `edit_char_index_at_point`
+/// call sites.
+pub(crate) struct HitTestLayout {
+    pub wrap_width: i32,
+    pub line_height: i32,
+    pub first_visible: usize,
+    pub wrap: bool,
+    pub alignment: u32,
+}
 
 use button::paint_control;
 /// `UndoSnapshot` is the type of the public `ControlState::Edit::undo_snapshot`

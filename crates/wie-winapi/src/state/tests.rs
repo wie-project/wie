@@ -9979,6 +9979,7 @@ fn char_cell_left(state: &mut WinApiState, hwnd: u64, index: usize) -> i32 {
 /// the fixture's style (single-line edits: false; the ES_MULTILINE fixture
 /// without WS_HSCROLL wraps).
 fn edit_char_at(state: &mut WinApiState, hwnd: u64, x: i32, y: i32, wrap: bool) -> usize {
+    use crate::user32::controls::HitTestLayout;
     use crate::user32::controls::edit_char_index_at_point;
     let (text, width) = {
         let ws = state.try_window_state().expect("window state");
@@ -9998,11 +9999,13 @@ fn edit_char_at(state: &mut WinApiState, hwnd: u64, x: i32, y: i32, wrap: bool) 
         &text,
         x,
         y,
-        width.saturating_sub(4),
-        line_h,
-        0,
-        wrap,
-        0,
+        &HitTestLayout {
+            wrap_width: width.saturating_sub(4),
+            line_height: line_h,
+            first_visible: 0,
+            wrap,
+            alignment: 0,
+        },
         advance,
     );
     state.gdi_state().font_engine = font_engine;
@@ -10065,13 +10068,27 @@ fn release_mouse(engine: &mut IcedCpu, state: &mut WinApiState, hwnd: u64, x: u1
 
 #[test]
 fn test_edit_char_index_at_point_maps_x_to_char_cells() {
+    use crate::user32::controls::HitTestLayout;
     use crate::user32::controls::edit_char_index_at_point;
     // 8 px/char, no wrap, left-aligned: char i occupies the cell [8i, 8i+8);
     // the half-advance boundary puts the caret before a char when the click
     // is in its left half and after it in the right half (the paint's caret x
     // is the summed advance of the preceding chars — this is the inverse).
-    let idx =
-        |x: i32| edit_char_index_at_point("hello world", x, 0, 80, 16, 0, false, 0, &mut |_| 8_i32);
+    let idx = |x: i32| {
+        edit_char_index_at_point(
+            "hello world",
+            x,
+            0,
+            &HitTestLayout {
+                wrap_width: 80,
+                line_height: 16,
+                first_visible: 0,
+                wrap: false,
+                alignment: 0,
+            },
+            &mut |_| 8_i32,
+        )
+    };
     assert_eq!(idx(0), 0, "left margin → before the first char");
     assert_eq!(idx(6), 1, "right half of 'h' → after 'h'");
     assert_eq!(idx(10), 1, "left half of 'e' → before 'e'");
@@ -10084,11 +10101,24 @@ fn test_edit_char_index_at_point_maps_x_to_char_cells() {
 
 #[test]
 fn test_edit_char_index_at_point_maps_wrapped_visual_rows() {
+    use crate::user32::controls::HitTestLayout;
     use crate::user32::controls::edit_char_index_at_point;
     // 8 px/char in a 32 px column → 4 chars per visual row: "abcdef" wraps to
     // "abcd" at y=0 and "ef" at y=16 (the same layout the paint draws).
     let idx = |x: i32, y: i32| {
-        edit_char_index_at_point("abcdef", x, y, 32, 16, 0, true, 0, &mut |_| 8_i32)
+        edit_char_index_at_point(
+            "abcdef",
+            x,
+            y,
+            &HitTestLayout {
+                wrap_width: 32,
+                line_height: 16,
+                first_visible: 0,
+                wrap: true,
+                alignment: 0,
+            },
+            &mut |_| 8_i32,
+        )
     };
     // Row 0 ("abcd", chars 0..4): the half-advance boundary applies within
     // the row-local cell.

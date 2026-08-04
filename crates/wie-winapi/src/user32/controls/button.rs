@@ -9,7 +9,8 @@ use super::listbox::render_control_text;
 use super::r#static::paint_label;
 use super::{
     COLOR_BTNFACE, COLOR_BTNFACE_PRESSED, COLOR_BTNHIGHLIGHT, COLOR_BTNSHADOW, COLOR_WINDOW,
-    ControlClassKind, ControlState, control_items, control_sel_index, control_state,
+    ControlClassKind, ControlState, PaintCtx, PaintFont, Rect, TextGeom, control_items,
+    control_sel_index, control_state,
 };
 use crate::gdi32::ResolvedWindow;
 use crate::gdi32::fill_rect_surface;
@@ -82,17 +83,16 @@ pub(super) fn paint_control(
                 let caption = strip_mnemonics(&text);
                 let tx = centered_text_x(&info, width, &caption, &mut font_engine, resolved, key);
                 paint_label(
-                    state,
-                    engine,
+                    &mut PaintCtx { state, engine },
                     &info,
                     &caption,
-                    tx,
-                    width,
-                    height,
+                    TextGeom { tx, width, height },
                     pressed,
-                    &mut font_engine,
-                    resolved,
-                    key,
+                    &mut PaintFont {
+                        engine: &mut font_engine,
+                        resolved,
+                        key,
+                    },
                 )?;
             }
             ControlClassKind::Static => {
@@ -113,17 +113,16 @@ pub(super) fn paint_control(
                 let caption = strip_mnemonics(&text);
                 let tx = info.offset_x.saturating_add(2);
                 paint_label(
-                    state,
-                    engine,
+                    &mut PaintCtx { state, engine },
                     &info,
                     &caption,
-                    tx,
-                    width,
-                    height,
+                    TextGeom { tx, width, height },
                     false,
-                    &mut font_engine,
-                    resolved,
-                    key,
+                    &mut PaintFont {
+                        engine: &mut font_engine,
+                        resolved,
+                        key,
+                    },
                 )?;
             }
             ControlClassKind::Edit => {
@@ -141,16 +140,15 @@ pub(super) fn paint_control(
                 stroke_border(state, &info, width, height, 0x0000_0000);
                 let tx = info.offset_x.saturating_add(2);
                 paint_edit(
-                    state,
-                    engine,
+                    &mut PaintCtx { state, engine },
                     &info,
                     &text,
-                    tx,
-                    width,
-                    height,
-                    &mut font_engine,
-                    resolved,
-                    key,
+                    TextGeom { tx, width, height },
+                    &mut PaintFont {
+                        engine: &mut font_engine,
+                        resolved,
+                        key,
+                    },
                 )?;
             }
             ControlClassKind::ListBox => {
@@ -167,16 +165,17 @@ pub(super) fn paint_control(
                 );
                 stroke_border(state, &info, width, height, 0x0000_0000);
                 paint_item_lines(
-                    state,
-                    engine,
+                    &mut PaintCtx { state, engine },
                     &info,
                     &items,
                     width,
                     height,
                     sel_index,
-                    &mut font_engine,
-                    resolved,
-                    key,
+                    &mut PaintFont {
+                        engine: &mut font_engine,
+                        resolved,
+                        key,
+                    },
                 )?;
             }
             ControlClassKind::ComboBox => {
@@ -184,17 +183,16 @@ pub(super) fn paint_control(
                 let first = items.first().map_or("", String::as_str);
                 let tx = info.offset_x.saturating_add(4);
                 paint_label(
-                    state,
-                    engine,
+                    &mut PaintCtx { state, engine },
                     &info,
                     first,
-                    tx,
-                    width,
-                    height,
+                    TextGeom { tx, width, height },
                     false,
-                    &mut font_engine,
-                    resolved,
-                    key,
+                    &mut PaintFont {
+                        engine: &mut font_engine,
+                        resolved,
+                        key,
+                    },
                 )?;
             }
             // The strip face/edges were painted before the font resolution;
@@ -362,13 +360,14 @@ fn paint_status_bar_parts(
         }
         let tx = info.offset_x.saturating_add(cell_left).saturating_add(3);
         render_control_text(
-            state,
-            engine,
+            &mut PaintCtx { state, engine },
             info.hwnd,
-            info.width,
-            info.height,
-            tx,
-            ty,
+            Rect {
+                x: tx,
+                y: ty,
+                cx: i32::try_from(info.width).unwrap_or(0),
+                cy: i32::try_from(info.height).unwrap_or(0),
+            },
             &text,
             0, // COLOR_BTNTEXT / COLOR_WINDOWTEXT: black
             Some((
@@ -377,9 +376,11 @@ fn paint_status_bar_parts(
                 info.offset_x.saturating_add(right),
                 strip_bottom,
             )),
-            font_engine,
-            resolved,
-            key,
+            &mut PaintFont {
+                engine: font_engine,
+                resolved,
+                key,
+            },
         )?;
     }
     Ok(())
