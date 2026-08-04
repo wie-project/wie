@@ -1,10 +1,11 @@
 //! Class-registry handlers: RegisterClass/UnregisterClass, ValidateRect,
 //! SetWindowLong, GetWindowDC (split from `message.rs`).
 
+use crate::guest_layout::WndClass;
 use crate::user32::{
     Context, FAKE_DEVICE_CONTEXT_HANDLE, HandlerContext, Result, WinApiHandlerResult,
-    WindowClassRecord, checked_field_address, read_guest_ansi_lossy, read_guest_u32,
-    read_guest_u64, read_guest_utf16_lossy, register_window_class,
+    WindowClassRecord, read_guest_ansi_lossy, read_guest_utf16_lossy, register_window_class,
+    with_typed_read,
 };
 
 /// Handles `USER32.dll!RegisterClassA`.
@@ -26,56 +27,32 @@ pub fn handle_register_class_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         });
     }
 
-    // WNDCLASSA on Win64:
-    //  +0x00 style (u32)
-    //  +0x04 (padding — lpfnWndProc must be 8-byte aligned)
-    //  +0x08 lpfnWndProc (u64)
-    //  +0x10 cbClsExtra (i32)
-    //  +0x14 cbWndExtra (i32)
-    //  +0x18 hInstance (u64)
-    //  +0x20 hIcon (u64)
-    //  +0x28 hCursor (u64)
-    //  +0x30 hbrBackground (u64)
-    //  +0x38 lpszMenuName (u64)
-    //  +0x40 lpszClassName (u64)
-
-    let style = read_guest_u32(engine, class_ptr)?;
-    let window_proc = read_guest_u64(
-        engine,
-        checked_field_address(class_ptr, 8, "WNDCLASS.lpfnWndProc"),
-    )?;
-    let _cls_extra = read_guest_u32(
-        engine,
-        checked_field_address(class_ptr, 0x10, "WNDCLASS.cbClsExtra"),
-    )?;
-    let _wnd_extra = read_guest_u32(
-        engine,
-        checked_field_address(class_ptr, 0x14, "WNDCLASS.cbWndExtra"),
-    )?;
-    let instance_handle = read_guest_u64(
-        engine,
-        checked_field_address(class_ptr, 0x18, "WNDCLASS.hInstance"),
-    )?;
-    let icon = read_guest_u64(
-        engine,
-        checked_field_address(class_ptr, 0x20, "WNDCLASS.hIcon"),
-    )?;
-    let cursor = read_guest_u64(
-        engine,
-        checked_field_address(class_ptr, 0x28, "WNDCLASS.hCursor"),
-    )?;
-    let background_brush = read_guest_u64(
-        engine,
-        checked_field_address(class_ptr, 0x30, "WNDCLASS.hbrBackground"),
-    )?;
-    let menu_name = read_guest_u64(
-        engine,
-        checked_field_address(class_ptr, 0x38, "WNDCLASS.lpszMenuName"),
-    )?;
-    let class_name_ptr = read_guest_u64(
-        engine,
-        checked_field_address(class_ptr, 0x40, "WNDCLASS.lpszClassName"),
-    )?;
+    // One shared-lock borrow instead of ten per-field reads; the layout and
+    // its pinned offsets live in `crate::guest_layout::WndClass` (Win64
+    // WNDCLASS: `lpszClassName` @0x40 — the 40-byte figure sometimes quoted
+    // is the Win32 size, 4-byte pointers).
+    let (
+        style,
+        window_proc,
+        instance_handle,
+        icon,
+        cursor,
+        background_brush,
+        menu_name,
+        class_name_ptr,
+    ) = with_typed_read::<WndClass, _, _>(engine, class_ptr, |wc| {
+        Ok((
+            wc.style,
+            wc.window_proc,
+            wc.instance_handle,
+            wc.icon_handle,
+            wc.cursor_handle,
+            wc.background_brush,
+            wc.menu_name,
+            wc.class_name_ptr,
+        ))
+    })
+    .context("failed to read WNDCLASSA for RegisterClassA")?;
 
     let class_name = if class_name_ptr == 0 {
         String::new()
@@ -130,57 +107,30 @@ pub fn handle_register_class_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         });
     }
 
-    // WNDCLASSW on Win64 (same layout as WNDCLASSA, but lpszClassName
-    // and lpszMenuName point to UTF-16 strings):
-    //  +0x00 style (u32)
-    //  +0x04 (padding — lpfnWndProc must be 8-byte aligned)
-    //  +0x08 lpfnWndProc (u64)
-    //  +0x10 cbClsExtra (i32)
-    //  +0x14 cbWndExtra (i32)
-    //  +0x18 hInstance (u64)
-    //  +0x20 hIcon (u64)
-    //  +0x28 hCursor (u64)
-    //  +0x30 hbrBackground (u64)
-    //  +0x38 lpszMenuName (u64)
-    //  +0x40 lpszClassName (u64)
-
-    let style = read_guest_u32(engine, class_ptr)?;
-    let window_proc = read_guest_u64(
-        engine,
-        checked_field_address(class_ptr, 8, "WNDCLASSW.lpfnWndProc"),
-    )?;
-    let _cls_extra = read_guest_u32(
-        engine,
-        checked_field_address(class_ptr, 0x10, "WNDCLASSW.cbClsExtra"),
-    )?;
-    let _wnd_extra = read_guest_u32(
-        engine,
-        checked_field_address(class_ptr, 0x14, "WNDCLASSW.cbWndExtra"),
-    )?;
-    let instance_handle = read_guest_u64(
-        engine,
-        checked_field_address(class_ptr, 0x18, "WNDCLASSW.hInstance"),
-    )?;
-    let icon = read_guest_u64(
-        engine,
-        checked_field_address(class_ptr, 0x20, "WNDCLASSW.hIcon"),
-    )?;
-    let cursor = read_guest_u64(
-        engine,
-        checked_field_address(class_ptr, 0x28, "WNDCLASSW.hCursor"),
-    )?;
-    let background_brush = read_guest_u64(
-        engine,
-        checked_field_address(class_ptr, 0x30, "WNDCLASSW.hbrBackground"),
-    )?;
-    let menu_name = read_guest_u64(
-        engine,
-        checked_field_address(class_ptr, 0x38, "WNDCLASSW.lpszMenuName"),
-    )?;
-    let class_name_ptr = read_guest_u64(
-        engine,
-        checked_field_address(class_ptr, 0x40, "WNDCLASSW.lpszClassName"),
-    )?;
+    // WNDCLASSW shares the WNDCLASSA layout (see the A variant above); only
+    // the pointed-to strings are UTF-16.
+    let (
+        style,
+        window_proc,
+        instance_handle,
+        icon,
+        cursor,
+        background_brush,
+        menu_name,
+        class_name_ptr,
+    ) = with_typed_read::<WndClass, _, _>(engine, class_ptr, |wc| {
+        Ok((
+            wc.style,
+            wc.window_proc,
+            wc.instance_handle,
+            wc.icon_handle,
+            wc.cursor_handle,
+            wc.background_brush,
+            wc.menu_name,
+            wc.class_name_ptr,
+        ))
+    })
+    .context("failed to read WNDCLASSW for RegisterClassW")?;
 
     let class_name = if class_name_ptr == 0 {
         String::new()

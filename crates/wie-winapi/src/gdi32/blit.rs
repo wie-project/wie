@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 
+use crate::guest_layout::Rect;
 use crate::guest_memory::{
-    checked_field_address, read_i32 as read_guest_i32, read_u64 as read_guest_u64,
+    checked_field_address, read_i32 as read_guest_i32, read_u64 as read_guest_u64, with_typed_read,
 };
 use crate::user32::WS_CLIPCHILDREN;
 use crate::{
@@ -815,13 +816,10 @@ pub fn handle_fill_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 
     let mut filled = false;
     if rect_ptr != 0 {
-        let left = read_guest_i32(engine, rect_ptr).context("failed to read RECT.left")?;
-        let top = read_guest_i32(engine, checked_field_address(rect_ptr, 4, "RECT.top"))
-            .context("failed to read RECT.top")?;
-        let right = read_guest_i32(engine, checked_field_address(rect_ptr, 8, "RECT.right"))
-            .context("failed to read RECT.right")?;
-        let bottom = read_guest_i32(engine, checked_field_address(rect_ptr, 12, "RECT.bottom"))
-            .context("failed to read RECT.bottom")?;
+        let (left, top, right, bottom) = with_typed_read::<Rect, _, _>(engine, rect_ptr, |rect| {
+            Ok((rect.left, rect.top, rect.right, rect.bottom))
+        })
+        .context("failed to read RECT")?;
 
         if let Some(color) = brush_color(state, crate::handles::Hbrush::from(brush))
             && let Some(info) = resolve_dest_info(state, hdc)

@@ -2,10 +2,8 @@
 
 use anyhow::{Context, Result};
 
-use crate::guest_memory::{
-    checked_field_address, read_i32 as read_guest_i32, write_i32 as write_guest_i32,
-};
-use crate::user32::low_i32;
+use crate::guest_layout::WinRect;
+use crate::user32::{low_i32, with_typed_read, with_typed_write};
 use crate::{HandlerContext, WinApiHandlerResult};
 
 /// Handles `USER32.dll!InflateRect` — grow (positive) or shrink (negative) a
@@ -32,22 +30,22 @@ pub fn handle_inflate_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
 
     let success = rect_ptr != 0;
     if success {
-        // RECT (Win64): LONG left @0, top @4, right @8, bottom @12.
-        for (offset, name, delta) in [
-            (0, "RECT.left", -dx),
-            (4, "RECT.top", -dy),
-            (8, "RECT.right", dx),
-            (12, "RECT.bottom", dy),
-        ] {
-            let value = read_guest_i32(engine, checked_field_address(rect_ptr, offset, name))
-                .with_context(|| format!("failed to read {name} for InflateRect"))?;
-            write_guest_i32(
-                engine,
-                checked_field_address(rect_ptr, offset, name),
-                value.saturating_add(delta),
-            )
-            .with_context(|| format!("failed to write {name} for InflateRect"))?;
-        }
+        // Read-all → compute → write-all (one shared-lock borrow per view);
+        // the RECT layout + pinned offsets live in `crate::guest_layout::WinRect`.
+        let (left, top, right, bottom) =
+            with_typed_read::<WinRect, _, _>(engine, rect_ptr, |rect| {
+                Ok((rect.left, rect.top, rect.right, rect.bottom))
+            })
+            .context("failed to read RECT for InflateRect")?;
+
+        with_typed_write::<WinRect, _, _>(engine, rect_ptr, |rect| {
+            rect.left = left.saturating_add(dx.saturating_neg());
+            rect.top = top.saturating_add(dy.saturating_neg());
+            rect.right = right.saturating_add(dx);
+            rect.bottom = bottom.saturating_add(dy);
+            Ok(())
+        })
+        .context("failed to write RECT for InflateRect")?;
     }
 
     let return_address = engine

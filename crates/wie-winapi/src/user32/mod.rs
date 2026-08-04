@@ -2,10 +2,12 @@
 //! menus, and display. Submodules split handlers by concern; this file
 //! re-exports the shared guest-memory/string helpers and fake handles.
 
+pub(crate) use crate::guest_layout::{Msg, WindowPlacement};
 pub(crate) use crate::guest_memory::{
     checked_field_address, read_bytes as read_guest_bytes, read_i32 as read_guest_i32,
-    read_u32 as read_guest_u32, read_u64 as read_guest_u64, write_bytes as write_guest_bytes,
-    write_i32 as write_guest_i32, write_u32 as write_guest_u32, write_u64 as write_guest_u64,
+    read_u32 as read_guest_u32, read_u64 as read_guest_u64, with_typed_read, with_typed_write,
+    write_bytes as write_guest_bytes, write_i32 as write_guest_i32, write_u32 as write_guest_u32,
+    write_u64 as write_guest_u64,
 };
 pub(crate) use crate::guest_string::{
     read_ansi_lossy as read_guest_ansi_lossy, read_utf16_lossy as read_guest_utf16_lossy,
@@ -423,68 +425,21 @@ pub(crate) fn write_message_structure(
     message_address: u64,
     message: &QueuedWindowMessage,
 ) -> Result<()> {
-    write_guest_u64(engine, message_address, message.window_handle.as_u64())
-        .context("failed to write MSG.hwnd")?;
-
-    write_guest_u32(
-        engine,
-        checked_field_address(message_address, 8, "MSG.message"),
-        message.message,
-    )
-    .context("failed to write MSG.message")?;
-
-    // Bytes 12..16 are alignment padding on Win64.
-    write_guest_u32(
-        engine,
-        checked_field_address(message_address, 12, "MSG alignment padding"),
-        0,
-    )
-    .context("failed to clear MSG alignment padding")?;
-
-    write_guest_u64(
-        engine,
-        checked_field_address(message_address, 16, "MSG.wParam"),
-        message.word_parameter,
-    )
-    .context("failed to write MSG.wParam")?;
-
-    write_guest_u64(
-        engine,
-        checked_field_address(message_address, 24, "MSG.lParam"),
-        message.long_parameter,
-    )
-    .context("failed to write MSG.lParam")?;
-
-    write_guest_u32(
-        engine,
-        checked_field_address(message_address, 32, "MSG.time"),
-        message.time,
-    )
-    .context("failed to write MSG.time")?;
-
-    write_guest_i32(
-        engine,
-        checked_field_address(message_address, 36, "MSG.pt.x"),
-        message.point_x,
-    )
-    .context("failed to write MSG.pt.x")?;
-
-    write_guest_i32(
-        engine,
-        checked_field_address(message_address, 40, "MSG.pt.y"),
-        message.point_y,
-    )
-    .context("failed to write MSG.pt.y")?;
-
-    // MSG.lPrivate on modern Win64 layouts.
-    write_guest_u32(
-        engine,
-        checked_field_address(message_address, 44, "MSG.lPrivate"),
-        0,
-    )
-    .context("failed to clear MSG.lPrivate")?;
-
-    Ok(())
+    // One shared-lock borrow instead of eight per-field exclusive writes. The
+    // view starts zeroed, so the Win64 padding (bytes 12..16) and the private
+    // lPrivate slot (bytes 44..48) read as zero — exactly the bytes the old
+    // per-field path cleared explicitly.
+    with_typed_write::<Msg, _, _>(engine, message_address, |msg| {
+        msg.hwnd = message.window_handle.as_u64();
+        msg.message = message.message;
+        msg.wparam = message.word_parameter;
+        msg.lparam = message.long_parameter;
+        msg.time = message.time;
+        msg.pt_x = message.point_x;
+        msg.pt_y = message.point_y;
+        Ok(())
+    })
+    .context("failed to write MSG structure")
 }
 
 /// Neutral default message handler used by several USER32 `Def*Proc` APIs.

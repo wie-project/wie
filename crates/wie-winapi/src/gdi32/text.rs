@@ -10,9 +10,10 @@ use anyhow::{Context, Result};
 
 use crate::gdi32::state::dc_resolved_font;
 use crate::gdi32::{FontEngine, FontKey, IRect, RasterizedGlyph, ResolvedFont};
+use crate::guest_layout::Rect;
 use crate::guest_memory::{
-    checked_field_address, read_i32 as read_guest_i32, read_u32 as read_guest_u32,
-    read_u64 as read_guest_u64, write_i32 as write_guest_i32,
+    checked_field_address, read_u32 as read_guest_u32, read_u64 as read_guest_u64, with_typed_read,
+    with_typed_write,
 };
 use crate::guest_string::{read_ansi_bytes as read_guest_ansi_bytes, read_utf16_lossy};
 use crate::user32::{low_i32, window_client_size};
@@ -766,13 +767,10 @@ pub fn handle_ext_text_out_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
 
     let mut clip = None;
     if options & (ETO_OPAQUE | ETO_CLIPPED) != 0 && rect_ptr != 0 {
-        let left = read_guest_i32(engine, rect_ptr).context("failed to read RECT.left")?;
-        let top = read_guest_i32(engine, checked_field_address(rect_ptr, 4, "RECT.top"))
-            .context("failed to read RECT.top")?;
-        let right = read_guest_i32(engine, checked_field_address(rect_ptr, 8, "RECT.right"))
-            .context("failed to read RECT.right")?;
-        let bottom = read_guest_i32(engine, checked_field_address(rect_ptr, 12, "RECT.bottom"))
-            .context("failed to read RECT.bottom")?;
+        let (left, top, right, bottom) = with_typed_read::<Rect, _, _>(engine, rect_ptr, |rect| {
+            Ok((rect.left, rect.top, rect.right, rect.bottom))
+        })
+        .context("failed to read ExtTextOutW RECT")?;
         if options & ETO_OPAQUE != 0 {
             let attrs = dc_text_attrs(state, hdc);
             if let Some(ResolvedTextTarget {
@@ -896,14 +894,10 @@ fn handle_draw_text_impl(
         .with_context(|| format!("failed to read {api_name} format"))?;
 
     let return_value = if rect_ptr != 0 {
-        let left = read_guest_i32(engine, rect_ptr)
-            .with_context(|| format!("failed to read {api_name} RECT.left"))?;
-        let top = read_guest_i32(engine, checked_field_address(rect_ptr, 4, "RECT.top"))
-            .with_context(|| format!("failed to read {api_name} RECT.top"))?;
-        let right = read_guest_i32(engine, checked_field_address(rect_ptr, 8, "RECT.right"))
-            .with_context(|| format!("failed to read {api_name} RECT.right"))?;
-        let bottom = read_guest_i32(engine, checked_field_address(rect_ptr, 12, "RECT.bottom"))
-            .with_context(|| format!("failed to read {api_name} RECT.bottom"))?;
+        let (left, top, right, bottom) = with_typed_read::<Rect, _, _>(engine, rect_ptr, |rect| {
+            Ok((rect.left, rect.top, rect.right, rect.bottom))
+        })
+        .with_context(|| format!("failed to read {api_name} RECT"))?;
 
         // `cchText == -1` means the string is NUL-terminated.
         let cch = low_i32(cch_raw, api_name)?;
@@ -945,21 +939,20 @@ fn handle_draw_text_impl(
         let y = top;
 
         if format & DT_CALCRECT != 0 {
-            // Measure only: shrink the rect to the text bounds.
+            // Measure only: shrink the rect to the text bounds. The typed
+            // write restores left/top from the read (real Windows only
+            // modifies right/bottom, and the zero-filled view would clear
+            // left/top otherwise).
             let new_right = x.saturating_add(text_w);
             let new_bottom = y.saturating_add(line_h);
-            write_guest_i32(
-                engine,
-                checked_field_address(rect_ptr, 8, "RECT.right"),
-                new_right,
-            )
-            .with_context(|| format!("failed to write {api_name} RECT.right"))?;
-            write_guest_i32(
-                engine,
-                checked_field_address(rect_ptr, 12, "RECT.bottom"),
-                new_bottom,
-            )
-            .with_context(|| format!("failed to write {api_name} RECT.bottom"))?;
+            with_typed_write::<Rect, _, _>(engine, rect_ptr, |rect| {
+                rect.left = left;
+                rect.top = top;
+                rect.right = new_right;
+                rect.bottom = new_bottom;
+                Ok(())
+            })
+            .with_context(|| format!("failed to write {api_name} RECT"))?;
         } else {
             let clip = if format & DT_NOCLIP != 0 {
                 None

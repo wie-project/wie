@@ -2667,6 +2667,7 @@ dependencies = [
  "tracing",
  "wie-cpu",
  "wie-pe",
+ "zerocopy",
 ]
 
 [[package]]

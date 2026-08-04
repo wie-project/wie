@@ -15,9 +15,8 @@
 //! message's wParam, not from the keyboard layout.
 
 use super::{
-    Context, QueuedWindowMessage, Result, WM_CHAR, WM_COMMAND, WM_KEYDOWN, WM_SYSCHAR,
-    WM_SYSKEYDOWN, WinApiHandlerResult, WinApiState, checked_field_address, make_command_wparam,
-    read_guest_u32, read_guest_u64,
+    Context, Msg, QueuedWindowMessage, Result, WM_CHAR, WM_COMMAND, WM_KEYDOWN, WM_SYSCHAR,
+    WM_SYSKEYDOWN, WinApiHandlerResult, WinApiState, make_command_wparam, with_typed_read,
 };
 use crate::HandlerContext;
 use crate::handles::{Haccel, Hwnd};
@@ -221,13 +220,12 @@ fn handle_translate_accelerator(
         .read_r8()
         .with_context(|| format!("failed to read R8 for {api_name}"))?;
 
-    // MSG (Win64): hwnd @0, message @8, wParam @16, lParam @24 — note the
-    // 4 pad bytes at +12 (message is a u32, wParam is 8-aligned).
-    let message = read_guest_u32(engine, checked_field_address(message_ptr, 8, "MSG.message"))
-        .with_context(|| format!("failed to read {api_name} MSG.message"))?;
-    let word_parameter =
-        read_guest_u64(engine, checked_field_address(message_ptr, 16, "MSG.wParam"))
-            .with_context(|| format!("failed to read {api_name} MSG.wParam"))?;
+    // One shared-lock borrow instead of two per-field reads; the MSG layout
+    // + pinned offsets (message @8, wParam @16) live in
+    // `crate::guest_layout::Msg`.
+    let (message, word_parameter) =
+        with_typed_read::<Msg, _, _>(engine, message_ptr, |msg| Ok((msg.message, msg.wparam)))
+            .with_context(|| format!("failed to read {api_name} MSG"))?;
 
     // Resolve handle → table id → parsed entries, then match.
     let table_id = state

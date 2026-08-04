@@ -1,10 +1,11 @@
 use super::{
     Context, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, FILE_BEGIN, FILE_CURRENT, FILE_END,
     FIXED_SYSTEM_FILETIME, HandlerContext, INVALID_SET_FILE_POINTER, Result, WinApiHandlerResult,
-    checked_field_address, find_open_file, find_open_file_mut, is_main_module_path,
-    is_open_file_handle, read_guest_u64, ret_bool_true, ret_u64, write_guest_u16, write_guest_u32,
-    write_guest_u64,
+    find_open_file, find_open_file_mut, is_main_module_path, is_open_file_handle, read_guest_u64,
+    ret_bool_true, ret_u64, write_guest_u16, write_guest_u32, write_guest_u64,
 };
+use crate::guest_layout::SystemTime;
+use crate::guest_memory::with_typed_write;
 
 /// Handles `KERNEL32.dll!FileTimeToLocalFileTime`.
 pub fn handle_file_time_to_local_file_time(
@@ -66,34 +67,21 @@ pub fn handle_file_time_to_system_time(
     let success = input_file_time_ptr != 0 && system_time_ptr != 0;
 
     if success {
-        // SYSTEMTIME:
-        // WORD wYear;         offset 0
-        // WORD wMonth;        offset 2
-        // WORD wDayOfWeek;    offset 4
-        // WORD wDay;          offset 6
-        // WORD wHour;         offset 8
-        // WORD wMinute;       offset 10
-        // WORD wSecond;       offset 12
-        // WORD wMilliseconds; offset 14
-
-        let year_address = checked_field_address(system_time_ptr, 0, "wYear");
-        let month_address = checked_field_address(system_time_ptr, 2, "wMonth");
-        let day_of_week_address = checked_field_address(system_time_ptr, 4, "wDayOfWeek");
-        let day_address = checked_field_address(system_time_ptr, 6, "wDay");
-        let hour_address = checked_field_address(system_time_ptr, 8, "wHour");
-        let minute_address = checked_field_address(system_time_ptr, 10, "wMinute");
-        let second_address = checked_field_address(system_time_ptr, 12, "wSecond");
-        let milliseconds_address = checked_field_address(system_time_ptr, 14, "wMilliseconds");
-
-        // Deterministic fake converted time.
-        write_guest_u16(engine, year_address, 2026)?;
-        write_guest_u16(engine, month_address, 7)?;
-        write_guest_u16(engine, day_of_week_address, 4)?;
-        write_guest_u16(engine, day_address, 9)?;
-        write_guest_u16(engine, hour_address, 12)?;
-        write_guest_u16(engine, minute_address, 0)?;
-        write_guest_u16(engine, second_address, 0)?;
-        write_guest_u16(engine, milliseconds_address, 0)?;
+        // Deterministic fake converted time — one typed write covers all eight
+        // WORD fields (the view starts zeroed, matching the old per-field
+        // writes that explicitly set every field).
+        with_typed_write::<SystemTime, _, _>(engine, system_time_ptr, |st| {
+            st.w_year = 2026;
+            st.w_month = 7;
+            st.w_day_of_week = 4;
+            st.w_day = 9;
+            st.w_hour = 12;
+            st.w_minute = 0;
+            st.w_second = 0;
+            st.w_milliseconds = 0;
+            Ok(())
+        })
+        .context("failed to write SYSTEMTIME")?;
 
         state.process.last_error = 0;
     } else {

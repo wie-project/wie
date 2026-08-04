@@ -1,13 +1,15 @@
 use super::{
     Context, ERROR_FILE_NOT_FOUND, ERROR_INVALID_HANDLE, FAKE_DISK_CLUSTERS, FAKE_DISK_GIB,
     FAKE_STDIN_HANDLE, FIXED_SYSTEM_FILETIME, HandlerContext, INVALID_FILE_ATTRIBUTES,
-    LOGICAL_DRIVE_TCHARS, Result, WinApiHandlerResult, checked_address, checked_field_address,
+    LOGICAL_DRIVE_TCHARS, Result, WinApiHandlerResult, checked_address,
     finish_create_file_create_only, handle_move_file_w, is_open_file_handle, low_u32,
     read_ansi_string_from_cpu, read_guest_u64, read_wide_string_from_cpu,
     resolve_full_windows_path, ret_bool_true, ret_u64, stat_guest_path, temp_name_id_u32,
     write_fixed_dir_a, write_fixed_dir_w, write_guest_u32, write_guest_u64,
     write_guest_utf16_units, write_mock_string_a, write_mock_string_w,
 };
+use crate::guest_layout::FileAttributeData;
+use crate::guest_memory::with_typed_write;
 
 pub fn handle_get_disk_free_space_ex_w(
     ctx: &mut HandlerContext<'_>,
@@ -376,36 +378,21 @@ pub fn handle_get_file_attributes_ex_w(
         });
     }
     if info_ptr != 0 {
-        write_guest_u32(
-            engine,
-            checked_field_address(info_ptr, 0, "dwFileAttributes"),
-            st.attributes,
-        )?;
-        write_guest_u64(
-            engine,
-            checked_field_address(info_ptr, 4, "ftCreationTime"),
-            FIXED_SYSTEM_FILETIME,
-        )?;
-        write_guest_u64(
-            engine,
-            checked_field_address(info_ptr, 12, "ftLastAccessTime"),
-            FIXED_SYSTEM_FILETIME,
-        )?;
-        write_guest_u64(
-            engine,
-            checked_field_address(info_ptr, 20, "ftLastWriteTime"),
-            FIXED_SYSTEM_FILETIME,
-        )?;
-        write_guest_u32(
-            engine,
-            checked_field_address(info_ptr, 28, "nFileSizeHigh"),
-            u32::try_from(st.size >> 32).unwrap_or(0),
-        )?;
-        write_guest_u32(
-            engine,
-            checked_field_address(info_ptr, 32, "nFileSizeLow"),
-            u32::try_from(st.size & 0xFFFF_FFFF).unwrap_or(0),
-        )?;
+        with_typed_write::<FileAttributeData, _, _>(engine, info_ptr, |data| {
+            data.dw_file_attributes = st.attributes;
+            let ft_low = u32::try_from(FIXED_SYSTEM_FILETIME & 0xffff_ffff).unwrap_or(0);
+            let ft_high = u32::try_from(FIXED_SYSTEM_FILETIME >> 32).unwrap_or(0);
+            data.ft_creation_time_low = ft_low;
+            data.ft_creation_time_high = ft_high;
+            data.ft_last_access_time_low = ft_low;
+            data.ft_last_access_time_high = ft_high;
+            data.ft_last_write_time_low = ft_low;
+            data.ft_last_write_time_high = ft_high;
+            data.n_file_size_high = u32::try_from(st.size >> 32).unwrap_or(0);
+            data.n_file_size_low = u32::try_from(st.size & 0xFFFF_FFFF).unwrap_or(0);
+            Ok(())
+        })
+        .context("failed to write WIN32_FILE_ATTRIBUTE_DATA")?;
     }
     state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?;
@@ -437,36 +424,21 @@ pub fn handle_get_file_attributes_ex_a(
         });
     }
     if info_ptr != 0 {
-        write_guest_u32(
-            engine,
-            checked_field_address(info_ptr, 0, "dwFileAttributes"),
-            st.attributes,
-        )?;
-        write_guest_u64(
-            engine,
-            checked_field_address(info_ptr, 4, "ftCreationTime"),
-            FIXED_SYSTEM_FILETIME,
-        )?;
-        write_guest_u64(
-            engine,
-            checked_field_address(info_ptr, 12, "ftLastAccessTime"),
-            FIXED_SYSTEM_FILETIME,
-        )?;
-        write_guest_u64(
-            engine,
-            checked_field_address(info_ptr, 20, "ftLastWriteTime"),
-            FIXED_SYSTEM_FILETIME,
-        )?;
-        write_guest_u32(
-            engine,
-            checked_field_address(info_ptr, 28, "nFileSizeHigh"),
-            u32::try_from(st.size >> 32).unwrap_or(0),
-        )?;
-        write_guest_u32(
-            engine,
-            checked_field_address(info_ptr, 32, "nFileSizeLow"),
-            u32::try_from(st.size & 0xFFFF_FFFF).unwrap_or(0),
-        )?;
+        with_typed_write::<FileAttributeData, _, _>(engine, info_ptr, |data| {
+            data.dw_file_attributes = st.attributes;
+            let ft_low = u32::try_from(FIXED_SYSTEM_FILETIME & 0xffff_ffff).unwrap_or(0);
+            let ft_high = u32::try_from(FIXED_SYSTEM_FILETIME >> 32).unwrap_or(0);
+            data.ft_creation_time_low = ft_low;
+            data.ft_creation_time_high = ft_high;
+            data.ft_last_access_time_low = ft_low;
+            data.ft_last_access_time_high = ft_high;
+            data.ft_last_write_time_low = ft_low;
+            data.ft_last_write_time_high = ft_high;
+            data.n_file_size_high = u32::try_from(st.size >> 32).unwrap_or(0);
+            data.n_file_size_low = u32::try_from(st.size & 0xFFFF_FFFF).unwrap_or(0);
+            Ok(())
+        })
+        .context("failed to write WIN32_FILE_ATTRIBUTE_DATA")?;
     }
     state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?;

@@ -204,6 +204,18 @@ impl CpuEngine for IcedCpu {
         Some(unsafe { std::slice::from_raw_parts(ptr, len) })
     }
 
+    fn host_slice_mut(&self, address: u64, len: usize) -> Option<&mut [u8]> {
+        if len == 0 {
+            return Some(&mut []);
+        }
+        let ptr = lock_rd(&self.mem).host_span(address, len, true)?;
+        // SAFETY: as `host_slice` above, with `host_span(.., write=true)`
+        // additionally denying executable spans, so the slice can never alias
+        // JIT-compiled code and needs no SMC invalidation.
+        #[expect(unsafe_code)]
+        Some(unsafe { std::slice::from_raw_parts_mut(ptr, len) })
+    }
+
     fn mem_copy(&mut self, dst: u64, src: u64, len: usize) -> bool {
         lock_rd(&self.mem).mem_copy(dst, src, len)
     }

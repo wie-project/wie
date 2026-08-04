@@ -3,9 +3,10 @@ use super::{
     FAKE_IMAGE_HANDLE, HandlerContext, IDCANCEL, IDOK, Result, TimerRecord, WinApiHandlerResult,
     WinApiState, WindowClassRecord, WindowsHookRecord, checked_field_address,
     dispatch_control_proc_host_default, low_i32, read_guest_ansi_lossy, read_guest_i32,
-    read_guest_u32, read_guest_u64, read_guest_utf16_lossy, register_window_class,
+    read_guest_u64, read_guest_utf16_lossy, register_window_class, with_typed_read,
     write_guest_ansi_c_string, write_guest_utf16_c_string,
 };
+use crate::guest_layout::WndClassEx;
 use crate::state::{MessageBoxRequest, PendingNativeMessageBox};
 use crate::{GuestCallbackRequest, OuterReturn, WinApiControlSignal};
 
@@ -136,75 +137,33 @@ pub fn handle_register_class_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     let return_value = if window_class_ptr == 0 {
         0
     } else {
-        /*
-         * WNDCLASSEXW on Win64:
-         * +0x00 UINT      cbSize
-         * +0x04 UINT      style
-         * +0x08 WNDPROC   lpfnWndProc
-         * +0x10 INT       cbClsExtra
-         * +0x14 INT       cbWndExtra
-         * +0x18 HINSTANCE hInstance
-         * +0x20 HICON     hIcon
-         * +0x28 HCURSOR   hCursor
-         * +0x30 HBRUSH    hbrBackground
-         * +0x38 LPCWSTR   lpszMenuName
-         * +0x40 LPCWSTR   lpszClassName
-         * +0x48 HICON     hIconSm
-         */
-
-        let style = read_guest_u32(
-            engine,
-            checked_field_address(window_class_ptr, 4, "WNDCLASSEXW.style"),
-        )
-        .context("failed to read WNDCLASSEXW.style")?;
-
-        let window_proc = read_guest_u64(
-            engine,
-            checked_field_address(window_class_ptr, 8, "WNDCLASSEXW.lpfnWndProc"),
-        )
-        .context("failed to read WNDCLASSEXW.lpfnWndProc")?;
-
-        let instance_handle = read_guest_u64(
-            engine,
-            checked_field_address(window_class_ptr, 24, "WNDCLASSEXW.hInstance"),
-        )
-        .context("failed to read WNDCLASSEXW.hInstance")?;
-
-        let icon_handle = read_guest_u64(
-            engine,
-            checked_field_address(window_class_ptr, 32, "WNDCLASSEXW.hIcon"),
-        )
-        .context("failed to read WNDCLASSEXW.hIcon")?;
-
-        let cursor_handle = read_guest_u64(
-            engine,
-            checked_field_address(window_class_ptr, 40, "WNDCLASSEXW.hCursor"),
-        )
-        .context("failed to read WNDCLASSEXW.hCursor")?;
-
-        let background_brush = read_guest_u64(
-            engine,
-            checked_field_address(window_class_ptr, 48, "WNDCLASSEXW.hbrBackground"),
-        )
-        .context("failed to read WNDCLASSEXW.hbrBackground")?;
-
-        let menu_name = read_guest_u64(
-            engine,
-            checked_field_address(window_class_ptr, 56, "WNDCLASSEXW.lpszMenuName"),
-        )
-        .context("failed to read WNDCLASSEXW.lpszMenuName")?;
-
-        let class_name_ptr = read_guest_u64(
-            engine,
-            checked_field_address(window_class_ptr, 64, "WNDCLASSEXW.lpszClassName"),
-        )
-        .context("failed to read WNDCLASSEXW.lpszClassName")?;
-
-        let small_icon_handle = read_guest_u64(
-            engine,
-            checked_field_address(window_class_ptr, 72, "WNDCLASSEXW.hIconSm"),
-        )
-        .context("failed to read WNDCLASSEXW.hIconSm")?;
+        // One shared-lock borrow instead of eleven per-field reads. The
+        // layout + pinned offsets live in `crate::guest_layout::WndClassEx`
+        // (the +0x38 `lpszMenuName` this repo's class-menu history hinges on).
+        let (
+            style,
+            window_proc,
+            instance_handle,
+            icon_handle,
+            cursor_handle,
+            background_brush,
+            menu_name,
+            class_name_ptr,
+            small_icon_handle,
+        ) = with_typed_read::<WndClassEx, _, _>(engine, window_class_ptr, |wc| {
+            Ok((
+                wc.style,
+                wc.window_proc,
+                wc.instance_handle,
+                wc.icon_handle,
+                wc.cursor_handle,
+                wc.background_brush,
+                wc.menu_name,
+                wc.class_name_ptr,
+                wc.small_icon_handle,
+            ))
+        })
+        .context("failed to read WNDCLASSEXW for RegisterClassExW")?;
 
         let class_name = read_guest_utf16_lossy(engine, class_name_ptr, 256)
             .context("failed to read RegisterClassExW class name")?;
@@ -247,75 +206,32 @@ pub fn handle_register_class_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     let return_value = if window_class_ptr == 0 {
         0
     } else {
-        /*
-         * WNDCLASSEXA on Win64 (same layout as WNDCLASSEXW, but lpszMenuName
-         * and lpszClassName point to ANSI strings):
-         * +0x00 UINT      cbSize
-         * +0x04 UINT      style
-         * +0x08 WNDPROC   lpfnWndProc
-         * +0x10 INT       cbClsExtra
-         * +0x14 INT       cbWndExtra
-         * +0x18 HINSTANCE hInstance
-         * +0x20 HICON     hIcon
-         * +0x28 HCURSOR   hCursor
-         * +0x30 HBRUSH    hbrBackground
-         * +0x38 LPCSTR    lpszMenuName
-         * +0x40 LPCSTR    lpszClassName
-         * +0x48 HICON     hIconSm
-         */
-        let style = read_guest_u32(
-            engine,
-            checked_field_address(window_class_ptr, 4, "WNDCLASSEXA.style"),
-        )
-        .context("failed to read WNDCLASSEXA.style")?;
-
-        let window_proc = read_guest_u64(
-            engine,
-            checked_field_address(window_class_ptr, 8, "WNDCLASSEXA.lpfnWndProc"),
-        )
-        .context("failed to read WNDCLASSEXA.lpfnWndProc")?;
-
-        let instance_handle = read_guest_u64(
-            engine,
-            checked_field_address(window_class_ptr, 24, "WNDCLASSEXA.hInstance"),
-        )
-        .context("failed to read WNDCLASSEXA.hInstance")?;
-
-        let icon_handle = read_guest_u64(
-            engine,
-            checked_field_address(window_class_ptr, 32, "WNDCLASSEXA.hIcon"),
-        )
-        .context("failed to read WNDCLASSEXA.hIcon")?;
-
-        let cursor_handle = read_guest_u64(
-            engine,
-            checked_field_address(window_class_ptr, 40, "WNDCLASSEXA.hCursor"),
-        )
-        .context("failed to read WNDCLASSEXA.hCursor")?;
-
-        let background_brush = read_guest_u64(
-            engine,
-            checked_field_address(window_class_ptr, 48, "WNDCLASSEXA.hbrBackground"),
-        )
-        .context("failed to read WNDCLASSEXA.hbrBackground")?;
-
-        let menu_name = read_guest_u64(
-            engine,
-            checked_field_address(window_class_ptr, 56, "WNDCLASSEXA.lpszMenuName"),
-        )
-        .context("failed to read WNDCLASSEXA.lpszMenuName")?;
-
-        let class_name_ptr = read_guest_u64(
-            engine,
-            checked_field_address(window_class_ptr, 64, "WNDCLASSEXA.lpszClassName"),
-        )
-        .context("failed to read WNDCLASSEXA.lpszClassName")?;
-
-        let small_icon_handle = read_guest_u64(
-            engine,
-            checked_field_address(window_class_ptr, 72, "WNDCLASSEXA.hIconSm"),
-        )
-        .context("failed to read WNDCLASSEXA.hIconSm")?;
+        // WNDCLASSEXA shares the WNDCLASSEXW layout; only the pointed-to
+        // strings are ANSI (see the W variant above).
+        let (
+            style,
+            window_proc,
+            instance_handle,
+            icon_handle,
+            cursor_handle,
+            background_brush,
+            menu_name,
+            class_name_ptr,
+            small_icon_handle,
+        ) = with_typed_read::<WndClassEx, _, _>(engine, window_class_ptr, |wc| {
+            Ok((
+                wc.style,
+                wc.window_proc,
+                wc.instance_handle,
+                wc.icon_handle,
+                wc.cursor_handle,
+                wc.background_brush,
+                wc.menu_name,
+                wc.class_name_ptr,
+                wc.small_icon_handle,
+            ))
+        })
+        .context("failed to read WNDCLASSEXA for RegisterClassExA")?;
 
         let class_name = read_guest_ansi_lossy(engine, class_name_ptr, 256)
             .context("failed to read RegisterClassExA class name")?;

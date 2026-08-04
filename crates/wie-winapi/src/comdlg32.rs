@@ -1,8 +1,9 @@
 //! Common dialog stubs (`comdlg32.dll`) for open/save file simulation.
 
+use crate::guest_layout::{ChooseFontW, FindReplace, LogFontW, OpenFileName};
 use crate::guest_memory::{
     checked_field_address, read_i32 as read_guest_i32, read_u32 as read_guest_u32,
-    read_u64 as read_guest_u64, write_u16 as write_guest_u16, write_u32 as write_guest_u32,
+    read_u64 as read_guest_u64, with_typed_read, with_typed_write,
 };
 use crate::guest_string::{
     read_ansi_lossy, read_utf16_lossy, write_ansi_c_string, write_utf16_c_string,
@@ -26,22 +27,10 @@ use crate::{
 };
 use anyhow::{Context, Result};
 
-/// `OPENFILENAME` field offsets on Win64 (8-byte pointer alignment).
-const OFN_LPSTR_FILE: u64 = 48;
-const OFN_NMAX_FILE: u64 = 56;
-const OFN_LPSTR_FILE_TITLE: u64 = 64;
-const OFN_NMAX_FILE_TITLE: u64 = 72;
-const OFN_FLAGS: u64 = 96;
-const OFN_NFILE_OFFSET: u64 = 100;
-const OFN_NFILE_EXTENSION: u64 = 102;
-/// `OPENFILENAME.hwndOwner` — the dialog's owner window.
-const OFN_HWND_OWNER: u64 = 8;
-/// `OPENFILENAME.lpstrFilter` — the double-NUL-terminated `name\0pattern\0` pairs.
-const OFN_LPSTR_FILTER: u64 = 24;
-/// `OPENFILENAME.lpstrInitialDir` — the directory the dialog lists.
-const OFN_LPSTR_INITIAL_DIR: u64 = 80;
-/// `OPENFILENAME.lpstrDefExt` — appended when the typed name has no extension.
-const OFN_LPSTR_DEF_EXT: u64 = 104;
+// The `OPENFILENAME` layout lives in `crate::guest_layout::OpenFileName`
+// (mingw-w64-verified offsets, including the Vista+ reserved tail); the
+// handlers read and write the struct through the typed views. The A-variant
+// shares the same offsets (only the pointed-to strings are ANSI).
 
 /// No extended common-dialog error.
 const CDERR_NONE: u32 = 0;
@@ -71,14 +60,9 @@ const FILE_DLG_CY: i32 = 200;
 const WS_BORDER: u32 = 0x0080_0000;
 const ES_AUTOHSCROLL: u32 = 0x0080;
 
-/// `FINDREPLACE` field offsets on Win64 (commdlg.h). The structure is a
-/// UNICODE structure regardless of the A/W suffix of the creating API.
-const FR_HWND_OWNER: u64 = 8;
-const FR_FLAGS: u64 = 24;
-const FR_LPSTR_FIND_WHAT: u64 = 32;
-const FR_LPSTR_REPLACE_WITH: u64 = 40;
-const FR_W_FIND_WHAT_LEN: u64 = 48;
-const FR_W_REPLACE_WITH_LEN: u64 = 52;
+// The `FINDREPLACE` layout lives in `crate::guest_layout::FindReplace`
+// (mingw-w64-verified offsets). The structure is a UNICODE structure
+// regardless of the A/W suffix of the creating API.
 
 /// `FINDREPLACE.Flags` bits (commdlg.h). `FR_DOWN` (0x1) is deliberately not
 /// named: the dialog preserves the owner's down/up choice untouched.
@@ -484,29 +468,15 @@ fn handle_get_file_name(
         });
     }
 
-    let file_buffer_ptr = read_guest_u64(
-        engine,
-        checked_field_address(ofn_ptr, OFN_LPSTR_FILE, "OPENFILENAME.lpstrFile"),
-    )
-    .with_context(|| format!("failed to read lpstrFile for {api_name}"))?;
-
-    let max_file = read_guest_u32(
-        engine,
-        checked_field_address(ofn_ptr, OFN_NMAX_FILE, "OPENFILENAME.nMaxFile"),
-    )
-    .with_context(|| format!("failed to read nMaxFile for {api_name}"))?;
-
-    let file_title_ptr = read_guest_u64(
-        engine,
-        checked_field_address(ofn_ptr, OFN_LPSTR_FILE_TITLE, "OPENFILENAME.lpstrFileTitle"),
-    )
-    .with_context(|| format!("failed to read lpstrFileTitle for {api_name}"))?;
-
-    let max_file_title = read_guest_u32(
-        engine,
-        checked_field_address(ofn_ptr, OFN_NMAX_FILE_TITLE, "OPENFILENAME.nMaxFileTitle"),
-    )
-    .with_context(|| format!("failed to read nMaxFileTitle for {api_name}"))?;
+    // One typed read for the whole OPENFILENAME (the four buffer fields the
+    // policy and interactive flows write through); the layout + offsets live
+    // in `crate::guest_layout::OpenFileName`.
+    let ofn = with_typed_read::<OpenFileName, _, _>(engine, ofn_ptr, |ofn| Ok(*ofn))
+        .with_context(|| format!("failed to read OPENFILENAME for {api_name}"))?;
+    let file_buffer_ptr = ofn.lpstr_file;
+    let max_file = ofn.n_max_file;
+    let file_title_ptr = ofn.lpstr_file_title;
+    let max_file_title = ofn.n_max_file_title;
 
     // Clone the policy to avoid borrowing state.window_state() across
     // mutable accesses inside the match arms.
@@ -876,25 +846,11 @@ fn open_host_file_dialog(
         });
     }
 
-    let owner_raw = read_guest_u64(
-        engine,
-        checked_field_address(ofn_ptr, OFN_HWND_OWNER, "OPENFILENAME.hwndOwner"),
-    )
-    .with_context(|| format!("failed to read hwndOwner for {api_name}"))?;
-    let initial_dir_ptr = read_guest_u64(
-        engine,
-        checked_field_address(
-            ofn_ptr,
-            OFN_LPSTR_INITIAL_DIR,
-            "OPENFILENAME.lpstrInitialDir",
-        ),
-    )
-    .with_context(|| format!("failed to read lpstrInitialDir for {api_name}"))?;
-    let def_ext_ptr = read_guest_u64(
-        engine,
-        checked_field_address(ofn_ptr, OFN_LPSTR_DEF_EXT, "OPENFILENAME.lpstrDefExt"),
-    )
-    .with_context(|| format!("failed to read lpstrDefExt for {api_name}"))?;
+    let ofn = with_typed_read::<OpenFileName, _, _>(engine, ofn_ptr, |ofn| Ok(*ofn))
+        .with_context(|| format!("failed to read OPENFILENAME for {api_name}"))?;
+    let owner_raw = ofn.hwnd_owner;
+    let initial_dir_ptr = ofn.lpstr_initial_dir;
+    let def_ext_ptr = ofn.lpstr_def_ext;
 
     let initial_file = read_ofn_string(engine, file_buffer_ptr, unicode, api_name)?;
     let caller_initial_dir = if initial_dir_ptr != 0 {
@@ -1171,11 +1127,9 @@ fn open_host_file_dialog_via_bridge(
     }
 
     let initial_file = read_ofn_string(engine, buffer.file_buffer_ptr, unicode, api_name)?;
-    let filter_ptr = read_guest_u64(
-        engine,
-        checked_field_address(buffer.ofn_ptr, OFN_LPSTR_FILTER, "OPENFILENAME.lpstrFilter"),
-    )
-    .with_context(|| format!("failed to read lpstrFilter for {api_name}"))?;
+    let ofn = with_typed_read::<OpenFileName, _, _>(engine, buffer.ofn_ptr, |ofn| Ok(*ofn))
+        .with_context(|| format!("failed to read OPENFILENAME for {api_name}"))?;
+    let filter_ptr = ofn.lpstr_filter;
 
     // The native panel starts at the BOTTLE ROOT (`{root}/drive_c`) — the
     // user asked for the bottle root, not the guest cwd (the process
@@ -1190,15 +1144,7 @@ fn open_host_file_dialog_via_bridge(
         .as_ref()
         .map(|root| root.join("drive_c"))
         .or_else(|| {
-            let initial_dir_ptr = read_guest_u64(
-                engine,
-                checked_field_address(
-                    buffer.ofn_ptr,
-                    OFN_LPSTR_INITIAL_DIR,
-                    "OPENFILENAME.lpstrInitialDir",
-                ),
-            )
-            .unwrap_or(0);
+            let initial_dir_ptr = ofn.lpstr_initial_dir;
             let caller_initial_dir = if initial_dir_ptr != 0 {
                 read_ofn_string(engine, initial_dir_ptr, unicode, api_name).unwrap_or_default()
             } else {
@@ -1563,31 +1509,20 @@ pub(crate) fn write_selected_path(
         }
     }
 
-    write_guest_u16(
-        engine,
-        checked_field_address(
-            request.ofn_ptr,
-            OFN_NFILE_OFFSET,
-            "OPENFILENAME.nFileOffset",
-        ),
-        file_offset,
-    )?;
-
-    write_guest_u16(
-        engine,
-        checked_field_address(
-            request.ofn_ptr,
-            OFN_NFILE_EXTENSION,
-            "OPENFILENAME.nFileExtension",
-        ),
-        extension_offset,
-    )?;
-
-    // Leave Flags as the guest provided them; only offsets/title/path are updated.
-    let _flags = read_guest_u32(
-        engine,
-        checked_field_address(request.ofn_ptr, OFN_FLAGS, "OPENFILENAME.Flags"),
-    )?;
+    // nFileOffset / nFileExtension write-back. OPENFILENAME is an in/out
+    // struct: the guest's untouched fields (Flags, lpstrInitialDir,
+    // lpTemplateName, the reserved tail, ...) must survive the write. Snapshot
+    // the whole struct (it is Copy), edit the two offset fields, write it back
+    // — the MENUITEMINFO pattern (two shared-lock borrows).
+    let mut ofn = with_typed_read::<OpenFileName, _, _>(engine, request.ofn_ptr, |ofn| Ok(*ofn))
+        .context("failed to read OPENFILENAME for the path write-back")?;
+    ofn.n_file_offset = file_offset;
+    ofn.n_file_extension = extension_offset;
+    with_typed_write::<OpenFileName, _, _>(engine, request.ofn_ptr, |ofn_view| {
+        *ofn_view = ofn;
+        Ok(())
+    })
+    .context("failed to write OPENFILENAME offsets back")?;
 
     Ok(())
 }
@@ -1659,48 +1594,25 @@ fn handle_find_replace_text(
         });
     }
 
-    let owner_raw = read_guest_u64(
-        engine,
-        checked_field_address(fr_ptr, FR_HWND_OWNER, "FINDREPLACE.hwndOwner"),
-    )
-    .with_context(|| format!("failed to read hwndOwner for {api_name}"))?;
-    let find_what_ptr = read_guest_u64(
-        engine,
-        checked_field_address(fr_ptr, FR_LPSTR_FIND_WHAT, "FINDREPLACE.lpstrFindWhat"),
-    )
-    .with_context(|| format!("failed to read lpstrFindWhat for {api_name}"))?;
-    let find_what_len = read_guest_u32(
-        engine,
-        checked_field_address(fr_ptr, FR_W_FIND_WHAT_LEN, "FINDREPLACE.wFindWhatLen"),
-    )
-    .with_context(|| format!("failed to read wFindWhatLen for {api_name}"))?;
+    // One typed read for the whole FINDREPLACE (the find/replace buffer
+    // pointers, their lengths, the checkbox Flags, and the owner); the layout
+    // lives in `crate::guest_layout::FindReplace`.
+    let fr = with_typed_read::<FindReplace, _, _>(engine, fr_ptr, |fr| Ok(*fr))
+        .with_context(|| format!("failed to read FINDREPLACE for {api_name}"))?;
+    let owner_raw = fr.hwnd_owner;
+    let find_what_ptr = fr.lpstr_find_what;
+    let find_what_len = u32::from(fr.w_find_what_len);
     let replace_with_ptr = if replace_mode {
-        read_guest_u64(
-            engine,
-            checked_field_address(
-                fr_ptr,
-                FR_LPSTR_REPLACE_WITH,
-                "FINDREPLACE.lpstrReplaceWith",
-            ),
-        )
-        .with_context(|| format!("failed to read lpstrReplaceWith for {api_name}"))?
+        fr.lpstr_replace_with
     } else {
         0
     };
     let replace_with_len = if replace_mode {
-        read_guest_u32(
-            engine,
-            checked_field_address(fr_ptr, FR_W_REPLACE_WITH_LEN, "FINDREPLACE.wReplaceWithLen"),
-        )
-        .with_context(|| format!("failed to read wReplaceWithLen for {api_name}"))?
+        u32::from(fr.w_replace_with_len)
     } else {
         0
     };
-    let flags = read_guest_u32(
-        engine,
-        checked_field_address(fr_ptr, FR_FLAGS, "FINDREPLACE.Flags"),
-    )
-    .with_context(|| format!("failed to read Flags for {api_name}"))?;
+    let flags = fr.flags;
 
     // The dialog's EDIT lines are seeded from the guest's buffers (RNotepad
     // keeps its search/replace text there across Find menu opens).
@@ -2163,13 +2075,12 @@ fn submit_find_dialog(
     };
 
     // Preserve the owner's bits (FR_DOWN, FR_HIDEWHOLEWORD, ...) and fold the
-    // checkbox state + the action into the action-bit group.
-    let current_flags = read_guest_u32(
-        engine,
-        checked_field_address(session.fr_ptr, FR_FLAGS, "FINDREPLACE.Flags"),
-    )
-    .context("failed to read FINDREPLACE.Flags on submit")?;
-    let mut new_flags = current_flags
+    // checkbox state + the action into the action-bit group. FINDREPLACE is an
+    // in/out struct: snapshot it (Copy), edit Flags, write it back untouched
+    // otherwise — the MENUITEMINFO pattern.
+    let mut fr = with_typed_read::<FindReplace, _, _>(engine, session.fr_ptr, |fr| Ok(*fr))
+        .context("failed to read FINDREPLACE on submit")?;
+    let mut new_flags = fr.flags
         & !(FR_FINDNEXT | FR_REPLACE | FR_REPLACEALL | FR_DIALOGTERM | FR_MATCHCASE | FR_WHOLEWORD);
     new_flags |= action_flag;
     if session.match_case_checked {
@@ -2189,12 +2100,12 @@ fn submit_find_dialog(
         write_utf16_c_string(engine, session.replace_with_ptr, replace_len, &replace_text)
             .context("failed to write FINDREPLACE.lpstrReplaceWith")?;
     }
-    write_guest_u32(
-        engine,
-        checked_field_address(session.fr_ptr, FR_FLAGS, "FINDREPLACE.Flags"),
-        new_flags,
-    )
-    .context("failed to write FINDREPLACE.Flags on submit")?;
+    fr.flags = new_flags;
+    with_typed_write::<FindReplace, _, _>(engine, session.fr_ptr, |fr_view| {
+        *fr_view = fr;
+        Ok(())
+    })
+    .context("failed to write FINDREPLACE on submit")?;
 
     post_find_msgstring(state, &session);
     Ok(())
@@ -2214,18 +2125,15 @@ fn close_find_dialog(
         .cloned()
         .context("find-dialog session vanished")?;
 
-    let current_flags = read_guest_u32(
-        engine,
-        checked_field_address(session.fr_ptr, FR_FLAGS, "FINDREPLACE.Flags"),
-    )
-    .context("failed to read FINDREPLACE.Flags on close")?;
-    write_guest_u32(
-        engine,
-        checked_field_address(session.fr_ptr, FR_FLAGS, "FINDREPLACE.Flags"),
-        (current_flags & !(FR_FINDNEXT | FR_REPLACE | FR_REPLACEALL | FR_DIALOGTERM))
-            | FR_DIALOGTERM,
-    )
-    .context("failed to write FINDREPLACE.Flags on close")?;
+    let mut fr = with_typed_read::<FindReplace, _, _>(engine, session.fr_ptr, |fr| Ok(*fr))
+        .context("failed to read FINDREPLACE on close")?;
+    fr.flags =
+        (fr.flags & !(FR_FINDNEXT | FR_REPLACE | FR_REPLACEALL | FR_DIALOGTERM)) | FR_DIALOGTERM;
+    with_typed_write::<FindReplace, _, _>(engine, session.fr_ptr, |fr_view| {
+        *fr_view = fr;
+        Ok(())
+    })
+    .context("failed to write FINDREPLACE on close")?;
 
     post_find_msgstring(state, &session);
     destroy_find_dialog(state, &session);
@@ -2897,68 +2805,44 @@ pub(crate) fn complete_font_dialog(
     }
 
     // OK: write the selection into the guest LOGFONTW, preserving every field
-    // the dialog does not own (weight, charset, italic, precision, …).
-    let effects_word = read_guest_u32(
-        engine,
-        checked_field_address(
-            session.log_font_ptr,
-            LF_ITALIC_UNDERLINE_STRIKE_CHARSET,
-            "LOGFONTW effects",
-        ),
-    )
-    .context("failed to read LOGFONTW effects on font-dialog accept")?;
-    let charset_byte = effects_word >> 24 & 0xFF;
-    let italic_byte = effects_word & 0xFF;
-    let lf_height = lf_height_from_point_size_tenths(point_size_tenths);
-    // lfHeight is negative (character height); write its i32 bit pattern.
-    let lf_height_bits = u32::from_le_bytes(lf_height.to_le_bytes());
-    write_guest_u32(
-        engine,
-        checked_field_address(session.log_font_ptr, LF_HEIGHT, "LOGFONTW.lfHeight"),
-        lf_height_bits,
-    )
-    .context("failed to write LOGFONTW.lfHeight")?;
-    let new_effects = italic_byte
-        | u32::from(underline_checked) << 8
-        | u32::from(strikeout_checked) << 16
-        | charset_byte << 24;
-    write_guest_u32(
-        engine,
-        checked_field_address(
-            session.log_font_ptr,
-            LF_ITALIC_UNDERLINE_STRIKE_CHARSET,
-            "LOGFONTW effects",
-        ),
-        new_effects,
-    )
-    .context("failed to write LOGFONTW underline/strikeout")?;
-    write_utf16_c_string(
-        engine,
-        checked_field_address(session.log_font_ptr, LF_FACE_NAME, "LOGFONTW.lfFaceName"),
-        32,
-        &family,
-    )
-    .context("failed to write LOGFONTW.lfFaceName")?;
+    // the dialog does not own (weight, charset, italic, precision, …). The
+    // typed views are READ-MODIFY-WRITE: `with_typed_write` zero-fills the
+    // view first, so the original struct is captured through a read view and
+    // restored before the dialog-owned fields change — the untouched fields
+    // and the explicit pads carry the guest's original bytes, byte-identical
+    // to the old per-field writes.
+    let original_log_font =
+        with_typed_read::<LogFontW, _, _>(engine, session.log_font_ptr, |log_font| Ok(*log_font))
+            .context("failed to read LOGFONTW on font-dialog accept")?;
+    let mut choose_font =
+        with_typed_read::<ChooseFontW, _, _>(engine, session.cf_ptr, |cf| Ok(*cf))
+            .context("failed to read CHOOSEFONTW on font-dialog accept")?;
 
-    // CHOOSEFONTW write-back: iPointSize (tenths), Flags, rgbColors.
-    write_guest_u32(
-        engine,
-        checked_field_address(session.cf_ptr, CF_IPOINT_SIZE, "CHOOSEFONTW.iPointSize"),
-        u32::try_from(point_size_tenths).context("iPointSize does not fit u32")?,
-    )
-    .context("failed to write CHOOSEFONTW.iPointSize")?;
-    write_guest_u32(
-        engine,
-        checked_field_address(session.cf_ptr, CF_FLAGS, "CHOOSEFONTW.Flags"),
-        session.flags | CF_SCREEN_FONTS,
-    )
-    .context("failed to write CHOOSEFONTW.Flags")?;
-    write_guest_u32(
-        engine,
-        checked_field_address(session.cf_ptr, CF_RGB_COLORS, "CHOOSEFONTW.rgbColors"),
-        session.rgb_colors,
-    )
-    .context("failed to write CHOOSEFONTW.rgbColors")?;
+    let lf_height = lf_height_from_point_size_tenths(point_size_tenths);
+    with_typed_write::<LogFontW, _, _>(engine, session.log_font_ptr, |log_font| {
+        *log_font = original_log_font;
+        log_font.height = lf_height;
+        log_font.underline = u8::from(underline_checked);
+        log_font.strike_out = u8::from(strikeout_checked);
+        // lfFaceName is a NUL-terminated WCHAR[LF_FACESIZE=32]: at most 31
+        // units (mirrors write_utf16_c_string's truncation).
+        let mut face_name = [0_u16; 32];
+        for (slot, unit) in face_name.iter_mut().zip(family.encode_utf16().take(31)) {
+            *slot = unit;
+        }
+        log_font.face_name = face_name;
+        Ok(())
+    })
+    .context("failed to write LOGFONTW on font-dialog accept")?;
+
+    choose_font.i_point_size = point_size_tenths;
+    choose_font.flags = session.flags | CF_SCREEN_FONTS;
+    choose_font.rgb_colors = session.rgb_colors;
+    with_typed_write::<ChooseFontW, _, _>(engine, session.cf_ptr, |cf| {
+        *cf = choose_font;
+        Ok(())
+    })
+    .context("failed to write CHOOSEFONTW on font-dialog accept")?;
 
     state.window_state().font_dialog = None;
     tracing::info!(
@@ -5036,8 +4920,11 @@ mod tests {
         engine
             .mem_write(fr_ptr + 40, &0x6100_u64.to_le_bytes())
             .ok(); // lpstrReplaceWith
-        engine.mem_write(fr_ptr + 48, &64_u32.to_le_bytes()).ok(); // wFindWhatLen
-        engine.mem_write(fr_ptr + 52, &64_u32.to_le_bytes()).ok(); // wReplaceWithLen
+        // The lengths are WORDs at 48/50 (lCustData needs 8-alignment, so the
+        // real layout pads 52..56) — the typed read enforces the header's
+        // offsets, unlike the old per-field constants.
+        engine.mem_write(fr_ptr + 48, &64_u16.to_le_bytes()).ok(); // wFindWhatLen
+        engine.mem_write(fr_ptr + 50, &64_u16.to_le_bytes()).ok(); // wReplaceWithLen
     }
 
     fn read_guest_u32_at(engine: &mut IcedCpu, address: u64) -> u32 {

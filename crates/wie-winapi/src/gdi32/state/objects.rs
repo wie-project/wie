@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 
 use crate::gdi32::{FontEngine, FontKey, ResolvedFont, fontdb_weight_for, height_px_from_lf};
+use crate::guest_layout::{BitmapInfoHeader, LogFontA, LogFontW};
 use crate::guest_memory::{
-    checked_field_address, read_i32 as read_guest_i32, read_u8 as read_guest_u8,
-    read_u16 as read_guest_u16, read_u32 as read_guest_u32, read_u64 as read_guest_u64,
+    checked_field_address, read_u32 as read_guest_u32, read_u64 as read_guest_u64, with_typed_read,
     write_u64 as write_guest_u64,
 };
 use crate::guest_string::{
@@ -96,15 +96,18 @@ pub fn handle_create_dib_section(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         .context("failed to read R9 for CreateDIBSection")?;
 
     let (width_abs, height_abs, bit_count, height_signed) = if bmi_ptr != 0 {
-        // BITMAPINFOHEADER: biWidth@4, biHeight@8, biBitCount@14
-        let bi_width = read_guest_i32(engine, checked_field_address(bmi_ptr, 4, "biWidth"))
-            .context("failed to read CreateDIBSection biWidth")?;
-        let bi_height = read_guest_i32(engine, checked_field_address(bmi_ptr, 8, "biHeight"))
-            .context("failed to read CreateDIBSection biHeight")?;
-        let bit_count = u32::from(
-            read_guest_u16(engine, checked_field_address(bmi_ptr, 14, "biBitCount"))
-                .context("failed to read CreateDIBSection biBitCount")?,
-        );
+        // BITMAPINFOHEADER (the fixed 40-byte header of a BITMAPINFO):
+        // biWidth@4, biHeight@8, biBitCount@14 — one typed read. The layout is
+        // pinned by the BitmapInfoHeader const-assert table.
+        let (bi_width, bi_height, bit_count) =
+            with_typed_read::<BitmapInfoHeader, _, _>(engine, bmi_ptr, |header| {
+                Ok((
+                    header.bi_width,
+                    header.bi_height,
+                    u32::from(header.bi_bit_count),
+                ))
+            })
+            .context("failed to read CreateDIBSection BITMAPINFOHEADER")?;
         // Preserve the signed height: negative = top-down DIB.
         // Use absolute values only for stride/allocation calculations.
         (
@@ -342,9 +345,11 @@ pub fn handle_create_font_indirect_w(ctx: &mut HandlerContext<'_>) -> Result<Win
 
 /// Shared `CreateFontIndirectA/W` implementation.
 ///
-/// Reads the guest LOGFONT (identical layout for both variants; only
-/// `lfFaceName` differs — `char[32]` for A, `wchar_t[32]` for W, both at
-/// offset 28). The A/W split mirrors `CreateFontA/W`.
+/// Reads the guest LOGFONT in one typed view. `LOGFONTA` (60 bytes) and
+/// `LOGFONTW` (92 bytes) share the header layout — `lfHeight` @0 …
+/// `lfPitchAndFamily` @27 — and differ only in `lfFaceName` at offset 28
+/// (`char[32]` for A, `wchar_t[32]` for W). The face name is decoded from the
+/// struct's inline bytes, so the guest memory is touched once.
 fn handle_create_font_indirect_impl(
     ctx: &mut HandlerContext<'_>,
     api_name: &str,
@@ -366,47 +371,32 @@ fn handle_create_font_indirect_impl(
         });
     }
 
-    // LOGFONT layout (Win64):
-    // LONG  lfHeight;         offset 0
-    // LONG  lfWidth;          offset 4
-    // LONG  lfEscapement;     offset 8
-    // LONG  lfOrientation;    offset 12
-    // LONG  lfWeight;         offset 16
-    // BYTE  lfItalic;         offset 20
-    // BYTE  lfUnderline;      offset 21
-    // BYTE  lfStrikeOut;      offset 22
-    // BYTE  lfCharSet;        offset 23
-    // BYTE  lfOutPrecision;   offset 24
-    // BYTE  lfClipPrecision;  offset 25
-    // BYTE  lfQuality;        offset 26
-    // BYTE  lfPitchAndFamily; offset 27
-    // TCHAR lfFaceName[32];   offset 28 (char[32] for A, wchar_t[32] for W)
-    let height = read_guest_i32(engine, logfont_ptr)
-        .with_context(|| format!("failed to read {api_name}.lfHeight"))?;
-    let weight = read_guest_i32(engine, checked_field_address(logfont_ptr, 16, "lfWeight"))
-        .with_context(|| format!("failed to read {api_name}.lfWeight"))?;
-    let italic_and_underline =
-        read_guest_u16(engine, checked_field_address(logfont_ptr, 20, "lfItalic"))
-            .with_context(|| format!("failed to read {api_name}.lfItalic"))?;
-    let charset = read_guest_u8(engine, checked_field_address(logfont_ptr, 23, "lfCharSet"))
-        .with_context(|| format!("failed to read {api_name}.lfCharSet"))?;
-    // BYTE lfPitchAndFamily; offset 27 — the pitch hint steers the monospace
-    // fallback for faces the font engine cannot resolve exactly.
-    let pitch = read_guest_u8(
-        engine,
-        checked_field_address(logfont_ptr, 27, "lfPitchAndFamily"),
-    )
-    .with_context(|| format!("failed to read {api_name}.lfPitchAndFamily"))?;
-    let face_name_ptr = checked_field_address(logfont_ptr, 28, "lfFaceName");
-    let face_name = if wide {
-        read_guest_utf16_lossy(engine, face_name_ptr, 32)
+    let (height, weight, italic, charset, pitch, face_name) = if wide {
+        with_typed_read::<LogFontW, _, _>(engine, logfont_ptr, |lf| {
+            Ok((
+                lf.height,
+                lf.weight,
+                lf.italic != 0,
+                lf.charset,
+                lf.pitch_and_family,
+                decode_wide_face_name(&lf.face_name),
+            ))
+        })
     } else {
-        read_guest_ansi_lossy(engine, face_name_ptr, 64)
+        with_typed_read::<LogFontA, _, _>(engine, logfont_ptr, |lf| {
+            Ok((
+                lf.height,
+                lf.weight,
+                lf.italic != 0,
+                lf.charset,
+                lf.pitch_and_family,
+                decode_ansi_face_name(&lf.face_name),
+            ))
+        })
     }
-    .with_context(|| format!("failed to read {api_name}.lfFaceName"))?;
+    .with_context(|| format!("failed to read {api_name} LOGFONT"))?;
 
     let weight = fontdb_weight_for(weight);
-    let italic = italic_and_underline & 0x1 != 0;
     let handle = state
         .gdi_state()
         .alloc_font(face_name.clone(), height, weight, italic, charset);
@@ -431,6 +421,39 @@ fn handle_create_font_indirect_impl(
         return_address,
         return_value: handle.as_u64(),
     })
+}
+
+/// Decode a NUL-terminated `CHAR[32]` face name from the LOGFONTA struct
+/// bytes.
+///
+/// Mirrors `read_ansi_lossy`: mingw stores A string literals as UTF-8; real
+/// Windows binaries pass ACP-encoded bytes, so invalid UTF-8 falls back to a
+/// strict Windows-1252 decode (the WHATWG codec, identical to codepage 1252
+/// including the 0x80–0x9F C1 range).
+fn decode_ansi_face_name(bytes: &[u8; 32]) -> String {
+    let head = bytes
+        .iter()
+        .take_while(|&&byte| byte != 0)
+        .copied()
+        .collect::<Vec<u8>>();
+    match std::str::from_utf8(&head) {
+        Ok(valid) => valid.to_owned(),
+        Err(_) => {
+            let (decoded, _, _) = encoding_rs::WINDOWS_1252.decode(&head);
+            decoded.into_owned()
+        }
+    }
+}
+
+/// Decode a NUL-terminated `WCHAR[32]` face name from the LOGFONTW struct
+/// units (UTF-16LE; the host is little-endian).
+fn decode_wide_face_name(units: &[u16; 32]) -> String {
+    let head = units
+        .iter()
+        .take_while(|&&unit| unit != 0)
+        .copied()
+        .collect::<Vec<u16>>();
+    String::from_utf16_lossy(&head)
 }
 
 /// Resolve the font currently selected into `dc_handle` through the font

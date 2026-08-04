@@ -6,12 +6,12 @@
 
 use super::SC_CLOSE;
 use super::{
-    Context, GuestCallbackRequest, HandlerContext, MessageQueueIdlePolicy, QueuedWindowMessage,
-    Result, WM_CHAR, WM_CLOSE, WM_DEADCHAR, WM_DESTROY, WM_ERASEBKGND, WM_GETFONT, WM_KEYDOWN,
-    WM_KEYUP, WM_MDICREATE, WM_PAINT, WM_QUIT, WM_SETFONT, WM_SYSCHAR, WM_SYSDEADCHAR,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WinApiControlSignal, WinApiHandlerResult, WinApiState, WinMsg,
-    checked_field_address, create_mdi_child_from_struct, dispatch_control_proc, find_window,
-    find_window_mut, is_known_window, read_guest_u32, read_guest_u64, write_message_structure,
+    Context, GuestCallbackRequest, HandlerContext, MessageQueueIdlePolicy, Msg,
+    QueuedWindowMessage, Result, WM_CHAR, WM_CLOSE, WM_DEADCHAR, WM_DESTROY, WM_ERASEBKGND,
+    WM_GETFONT, WM_KEYDOWN, WM_KEYUP, WM_MDICREATE, WM_PAINT, WM_QUIT, WM_SETFONT, WM_SYSCHAR,
+    WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WinApiControlSignal, WinApiHandlerResult,
+    WinApiState, WinMsg, create_mdi_child_from_struct, dispatch_control_proc, find_window,
+    find_window_mut, is_known_window, read_guest_u32, with_typed_read, write_message_structure,
 };
 use crate::OuterReturn;
 use crate::state::WindowFlags;
@@ -621,10 +621,10 @@ pub fn handle_translate_message(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let translated = if message_address == 0 {
         false
     } else {
-        let message_field_address = checked_field_address(message_address, 8, "MSG.message");
-
-        let message = crate::guest_memory::read_u32(engine, message_field_address)
-            .context("failed to read MSG.message for TranslateMessage")?;
+        // One shared-lock borrow instead of a per-field read; the MSG layout
+        // lives in `crate::guest_layout::Msg` (message @8).
+        let message = with_typed_read::<Msg, _, _>(engine, message_address, |msg| Ok(msg.message))
+            .context("failed to read MSG for TranslateMessage")?;
 
         matches!(
             message,
@@ -849,34 +849,14 @@ pub fn handle_dispatch_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         });
     }
 
-    /*
-     * MSG on Win64:
-     *
-     * +0x00 HWND   hwnd
-     * +0x08 UINT   message
-     * +0x10 WPARAM wParam
-     * +0x18 LPARAM lParam
-     * +0x20 DWORD  time
-     * +0x24 POINT  pt
-     */
-
-    let window_handle = read_guest_u64(engine, message_address)
-        .context("failed to read MSG.hwnd for DispatchMessageA")?;
-
-    let message_field_address = checked_field_address(message_address, 8, "MSG.message");
-
-    let message = read_guest_u32(engine, message_field_address)
-        .context("failed to read MSG.message for DispatchMessageA")?;
-
-    let word_parameter_address = checked_field_address(message_address, 16, "MSG.wParam");
-
-    let word_parameter = read_guest_u64(engine, word_parameter_address)
-        .context("failed to read MSG.wParam for DispatchMessageA")?;
-
-    let long_parameter_address = checked_field_address(message_address, 24, "MSG.lParam");
-
-    let long_parameter = read_guest_u64(engine, long_parameter_address)
-        .context("failed to read MSG.lParam for DispatchMessageA")?;
+    // One shared-lock borrow instead of four per-field reads; the MSG layout
+    // + pinned offsets live in `crate::guest_layout::Msg` (hwnd @0, message
+    // @8, wParam @16, lParam @24).
+    let (window_handle, message, word_parameter, long_parameter) =
+        with_typed_read::<Msg, _, _>(engine, message_address, |msg| {
+            Ok((msg.hwnd, msg.message, msg.wparam, msg.lparam))
+        })
+        .context("failed to read MSG for DispatchMessageA")?;
 
     // WM_ERASEBKGND is handled host-side (DefWindowProc semantics) — the
     // class-brush fill happens here and DispatchMessage returns TRUE, exactly

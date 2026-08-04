@@ -14,6 +14,11 @@ use super::{
     ret_bool_true, ret_u64, write_guest_u16, write_guest_u32, write_guest_u64,
     write_guest_utf16_units,
 };
+use crate::guest_layout::{
+    ByHandleFileInformation, FIND_DATA_A_ALT_NAME_OFFSET, FIND_DATA_FILE_NAME_OFFSET,
+    FIND_DATA_W_ALT_NAME_OFFSET, FindDataHeader,
+};
+use crate::guest_memory::with_typed_write;
 
 pub use dir::*;
 pub use open::*;
@@ -394,51 +399,31 @@ pub fn handle_get_file_information_by_handle(
     let success = open_file.is_some() && info_ptr != 0;
 
     if let Some(open_file) = open_file.filter(|_| info_ptr != 0) {
-        // BY_HANDLE_FILE_INFORMATION:
-        // DWORD    dwFileAttributes;     offset 0
-        // FILETIME ftCreationTime;       offset 4
-        // FILETIME ftLastAccessTime;     offset 12
-        // FILETIME ftLastWriteTime;      offset 20
-        // DWORD    dwVolumeSerialNumber; offset 28
-        // DWORD    nFileSizeHigh;        offset 32
-        // DWORD    nFileSizeLow;         offset 36
-        // DWORD    nNumberOfLinks;       offset 40
-        // DWORD    nFileIndexHigh;       offset 44
-        // DWORD    nFileIndexLow;        offset 48
-
-        let attributes_address = checked_field_address(info_ptr, 0, "dwFileAttributes");
-        let creation_time_address = checked_field_address(info_ptr, 4, "ftCreationTime");
-        let last_access_time_address = checked_field_address(info_ptr, 12, "ftLastAccessTime");
-        let last_write_time_address = checked_field_address(info_ptr, 20, "ftLastWriteTime");
-        let volume_serial_address = checked_field_address(info_ptr, 28, "dwVolumeSerialNumber");
-        let file_size_high_address = checked_field_address(info_ptr, 32, "nFileSizeHigh");
-        let file_size_low_address = checked_field_address(info_ptr, 36, "nFileSizeLow");
-        let number_of_links_address = checked_field_address(info_ptr, 40, "nNumberOfLinks");
-        let file_index_high_address = checked_field_address(info_ptr, 44, "nFileIndexHigh");
-        let file_index_low_address = checked_field_address(info_ptr, 48, "nFileIndexLow");
-
         let file_size = open_file.size();
-
-        write_guest_u32(
-            engine,
-            attributes_address,
-            u32::try_from(FILE_ATTRIBUTE_ARCHIVE).unwrap_or(0x20),
-        )?;
-        write_guest_u64(engine, creation_time_address, FIXED_SYSTEM_FILETIME)?;
-        write_guest_u64(engine, last_access_time_address, FIXED_SYSTEM_FILETIME)?;
-        write_guest_u64(engine, last_write_time_address, FIXED_SYSTEM_FILETIME)?;
-        write_guest_u32(engine, volume_serial_address, 0x1234_abcd)?;
-        let file_size_high =
-            u32::try_from(file_size >> 32).context("open file size high does not fit u32")?;
-
-        let file_size_low = u32::try_from(file_size & 0xffff_ffff)
-            .context("open file size low does not fit u32")?;
-
-        write_guest_u32(engine, file_size_high_address, file_size_high)?;
-        write_guest_u32(engine, file_size_low_address, file_size_low)?;
-        write_guest_u32(engine, number_of_links_address, 1)?;
-        write_guest_u32(engine, file_index_high_address, 0)?;
-        write_guest_u32(engine, file_index_low_address, 1)?;
+        // One shared-lock borrow instead of ten per-field writes. The view
+        // starts zeroed, which covers the (empty) struct tail; every field
+        // the old handler wrote is set explicitly below.
+        with_typed_write::<ByHandleFileInformation, _, _>(engine, info_ptr, |info| {
+            info.dw_file_attributes = u32::try_from(FILE_ATTRIBUTE_ARCHIVE).unwrap_or(0x20);
+            let ft_low = u32::try_from(FIXED_SYSTEM_FILETIME & 0xffff_ffff).unwrap_or(0);
+            let ft_high = u32::try_from(FIXED_SYSTEM_FILETIME >> 32).unwrap_or(0);
+            info.ft_creation_time_low = ft_low;
+            info.ft_creation_time_high = ft_high;
+            info.ft_last_access_time_low = ft_low;
+            info.ft_last_access_time_high = ft_high;
+            info.ft_last_write_time_low = ft_low;
+            info.ft_last_write_time_high = ft_high;
+            info.dw_volume_serial_number = 0x1234_abcd;
+            info.n_file_size_high =
+                u32::try_from(file_size >> 32).context("open file size high does not fit u32")?;
+            info.n_file_size_low = u32::try_from(file_size & 0xffff_ffff)
+                .context("open file size low does not fit u32")?;
+            info.n_number_of_links = 1;
+            info.n_file_index_high = 0;
+            info.n_file_index_low = 1;
+            Ok(())
+        })
+        .context("failed to write BY_HANDLE_FILE_INFORMATION")?;
 
         state.process.last_error = 0;
     } else {
@@ -653,32 +638,27 @@ pub(crate) fn write_find_data_common(
         return Ok(());
     }
 
-    // Build the 44-byte WIN32_FIND_DATA common header on the host stack and
-    // push it in a single mem_write. Previously nine scalar write_guest_u32/u64
-    // calls, each taking a fresh guest memory RwLock and page-walk.
-    //
-    // Layout (from wine/mingw headers, matches Microsoft SDK):
-    //   +0  dwFileAttributes  u32
-    //   +4  ftCreationTime    u64
-    //   +12 ftLastAccessTime  u64
-    //   +20 ftLastWriteTime   u64
-    //   +28 nFileSizeHigh     u32
-    //   +32 nFileSizeLow      u32
-    //   +36 dwReserved0       u32
-    //   +40 dwReserved1       u32
-    let mut header = [0_u8; 44];
-    header[0..4].copy_from_slice(&attributes.to_le_bytes());
-    header[4..12].copy_from_slice(&FIXED_SYSTEM_FILETIME.to_le_bytes());
-    header[12..20].copy_from_slice(&FIXED_SYSTEM_FILETIME.to_le_bytes());
-    header[20..28].copy_from_slice(&FIXED_SYSTEM_FILETIME.to_le_bytes());
-    let hi = u32::try_from(file_size >> 32).unwrap_or(0);
-    let lo = u32::try_from(file_size & 0xffff_ffff).unwrap_or(0);
-    header[28..32].copy_from_slice(&hi.to_le_bytes());
-    header[32..36].copy_from_slice(&lo.to_le_bytes());
-    // header[36..44] already zero (dwReserved0 / dwReserved1)
-    engine
-        .mem_write(find_data_ptr, &header)
-        .context("failed to write WIN32_FIND_DATA header")
+    // The 44-byte header goes through one typed write instead of a hand-built
+    // byte array. The view starts zeroed, which covers dwReserved0/1 — the
+    // old code zeroed them explicitly in the header array. `FILETIME` is a
+    // (low, high) `DWORD` pair, so the fixed time splits like the old
+    // `to_le_bytes` header write.
+    with_typed_write::<FindDataHeader, _, _>(engine, find_data_ptr, |header| {
+        header.dw_file_attributes = attributes;
+        let ft_low = u32::try_from(FIXED_SYSTEM_FILETIME & 0xffff_ffff).unwrap_or(0);
+        let ft_high = u32::try_from(FIXED_SYSTEM_FILETIME >> 32).unwrap_or(0);
+        header.ft_creation_time_low = ft_low;
+        header.ft_creation_time_high = ft_high;
+        header.ft_last_access_time_low = ft_low;
+        header.ft_last_access_time_high = ft_high;
+        header.ft_last_write_time_low = ft_low;
+        header.ft_last_write_time_high = ft_high;
+        header.n_file_size_high = u32::try_from(file_size >> 32).unwrap_or(0);
+        header.n_file_size_low = u32::try_from(file_size & 0xffff_ffff).unwrap_or(0);
+        // dwReserved0 / dwReserved1 stay zero.
+        Ok(())
+    })
+    .context("failed to write WIN32_FIND_DATA header")
 }
 
 pub(crate) fn write_find_data_w(
@@ -694,11 +674,18 @@ pub(crate) fn write_find_data_w(
         return Ok(());
     }
 
-    // cFileName is at offset 44 (after dwReserved1), not 48.
-    let file_name_address = checked_field_address(find_data_ptr, 44, "WIN32_FIND_DATAW.cFileName");
-    // cAlternateFileName[14] starts at 44 + MAX_PATH*2 = 564.
-    let alt_name_address =
-        checked_field_address(find_data_ptr, 564, "WIN32_FIND_DATAW.cAlternateFileName");
+    // cFileName is at offset 44 (after dwReserved1); cAlternateFileName[14]
+    // starts at 44 + MAX_PATH*2 = 564.
+    let file_name_address = checked_field_address(
+        find_data_ptr,
+        FIND_DATA_FILE_NAME_OFFSET,
+        "WIN32_FIND_DATAW.cFileName",
+    );
+    let alt_name_address = checked_field_address(
+        find_data_ptr,
+        FIND_DATA_W_ALT_NAME_OFFSET,
+        "WIN32_FIND_DATAW.cAlternateFileName",
+    );
 
     let mut bytes = Vec::new();
     for unit in file_name.encode_utf16() {
@@ -728,9 +715,16 @@ pub(crate) fn write_find_data_a(
     }
 
     // Same header as W; cFileName is CHAR[MAX_PATH] at offset 44.
-    let file_name_address = checked_field_address(find_data_ptr, 44, "WIN32_FIND_DATAA.cFileName");
-    let alt_name_address =
-        checked_field_address(find_data_ptr, 304, "WIN32_FIND_DATAA.cAlternateFileName");
+    let file_name_address = checked_field_address(
+        find_data_ptr,
+        FIND_DATA_FILE_NAME_OFFSET,
+        "WIN32_FIND_DATAA.cFileName",
+    );
+    let alt_name_address = checked_field_address(
+        find_data_ptr,
+        FIND_DATA_A_ALT_NAME_OFFSET,
+        "WIN32_FIND_DATAA.cAlternateFileName",
+    );
 
     let mut bytes = crate::vfs::encode_acp(file_name);
     bytes.push(0);

@@ -1,9 +1,7 @@
 use anyhow::{Context, Result};
 
-use crate::guest_memory::{
-    checked_field_address, write_i32 as write_guest_i32, write_u16 as write_guest_u16,
-    write_u32 as write_guest_u32, write_u64 as write_guest_u64,
-};
+use crate::guest_layout::{Bitmap, Size};
+use crate::guest_memory::with_typed_write;
 use crate::handles::{Hbitmap, Hbrush, Hdc, Hfont, Hpen};
 use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 
@@ -65,66 +63,21 @@ pub fn handle_get_object_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
     let return_value = if object_buffer_ptr == 0 && object_handle != 0 {
         BITMAP_STRUCT_SIZE
     } else if can_write_bitmap {
-        // Win64 BITMAP:
-        // LONG   bmType;       offset 0
-        // LONG   bmWidth;      offset 4
-        // LONG   bmHeight;     offset 8
-        // LONG   bmWidthBytes; offset 12
-        // WORD   bmPlanes;     offset 16
-        // WORD   bmBitsPixel;  offset 18
-        // padding              offset 20..23
-        // LPVOID bmBits;       offset 24
-
-        write_guest_i32(engine, object_buffer_ptr, 0).context("failed to write BITMAP.bmType")?;
-
-        write_guest_i32(
-            engine,
-            checked_field_address(object_buffer_ptr, 4, "BITMAP.bmWidth"),
-            16,
-        )
-        .context("failed to write BITMAP.bmWidth")?;
-
-        write_guest_i32(
-            engine,
-            checked_field_address(object_buffer_ptr, 8, "BITMAP.bmHeight"),
-            16,
-        )
-        .context("failed to write BITMAP.bmHeight")?;
-
-        write_guest_i32(
-            engine,
-            checked_field_address(object_buffer_ptr, 12, "BITMAP.bmWidthBytes"),
-            64,
-        )
-        .context("failed to write BITMAP.bmWidthBytes")?;
-
-        write_guest_u16(
-            engine,
-            checked_field_address(object_buffer_ptr, 16, "BITMAP.bmPlanes"),
-            1,
-        )
-        .context("failed to write BITMAP.bmPlanes")?;
-
-        write_guest_u16(
-            engine,
-            checked_field_address(object_buffer_ptr, 18, "BITMAP.bmBitsPixel"),
-            32,
-        )
-        .context("failed to write BITMAP.bmBitsPixel")?;
-
-        write_guest_u32(
-            engine,
-            checked_field_address(object_buffer_ptr, 20, "BITMAP padding"),
-            0,
-        )
-        .context("failed to write BITMAP padding")?;
-
-        write_guest_u64(
-            engine,
-            checked_field_address(object_buffer_ptr, 24, "BITMAP.bmBits"),
-            0,
-        )
-        .context("failed to write BITMAP.bmBits")?;
+        // Win64 BITMAP (32 bytes, layout pinned by the Bitmap const-assert
+        // table): LONG bmType @0 … WORD bmPlanes @16, WORD bmBitsPixel @18,
+        // pad @20..23, LPVOID bmBits @24. The typed view zero-fills the pad
+        // and leaves bmBits NULL, matching the old per-field writes.
+        with_typed_write::<Bitmap, _, _>(engine, object_buffer_ptr, |bitmap| {
+            bitmap.bm_type = 0;
+            bitmap.bm_width = 16;
+            bitmap.bm_height = 16;
+            bitmap.bm_width_bytes = 64;
+            bitmap.bm_planes = 1;
+            bitmap.bm_bits_pixel = 32;
+            bitmap.bm_bits = 0;
+            Ok(())
+        })
+        .context("failed to write BITMAP")?;
 
         BITMAP_STRUCT_SIZE
     } else {
@@ -327,20 +280,17 @@ fn handle_get_text_extent_point_32(
 
     let width = width.max(0);
     let height = height.max(0);
-    let (width_u32, height_u32) = (
-        u32::try_from(width).unwrap_or(u32::MAX),
-        u32::try_from(height).unwrap_or(u32::MAX),
-    );
 
     if size_ptr != 0 {
-        write_guest_u32(engine, size_ptr, width_u32)
-            .with_context(|| format!("failed to write SIZE.cx for {api_name}"))?;
-        write_guest_u32(
-            engine,
-            checked_field_address(size_ptr, 4, "SIZE.cy"),
-            height_u32,
-        )
-        .with_context(|| format!("failed to write SIZE.cy for {api_name}"))?;
+        // SIZE is LONG cx @0, LONG cy @4 — one typed write (the values are
+        // non-negative i32, so the i32 fields carry the exact guest bytes the
+        // old u32 writes produced).
+        with_typed_write::<Size, _, _>(engine, size_ptr, |size| {
+            size.cx = width;
+            size.cy = height;
+            Ok(())
+        })
+        .with_context(|| format!("failed to write SIZE for {api_name}"))?;
     }
 
     let return_value = u64::from(size_ptr != 0);

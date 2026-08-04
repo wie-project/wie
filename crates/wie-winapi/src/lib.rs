@@ -18,6 +18,7 @@ pub mod fake_va;
 pub mod gdi32;
 pub mod guest_heap;
 pub mod guest_io_host;
+mod guest_layout;
 mod guest_memory;
 mod guest_string;
 pub mod handles;

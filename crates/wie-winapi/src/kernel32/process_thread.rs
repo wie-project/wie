@@ -4,8 +4,31 @@ use super::{
     FAKE_CURRENT_PROCESS_ID, FIXED_SYSTEM_FILETIME, HandlerContext, MEM_COMMIT, MEM_RESERVE,
     PAGE_READWRITE, Result, THREAD_ENTRY_HOME_AND_RET, WORKER_STACK_REGION_BASE,
     WORKER_STACK_STRIDE, WinApiHandlerResult, WinApiState, checked_address, checked_field_address,
-    read_create_file_stack_u32, read_guest_u64, write_guest_u16, write_guest_u32, write_guest_u64,
+    read_create_file_stack_u32, read_guest_u64, write_guest_u32, write_guest_u64,
 };
+
+use crate::guest_layout::StartupInfo;
+use crate::guest_memory::with_typed_write;
+
+/// Write the Win64 `STARTUPINFO{A,W}` struct (both variants are
+/// layout-identical: the ANSI character pointers are still 8 bytes).
+///
+/// Windows zero-fills the whole struct before setting the three documented
+/// fields, so caller garbage never leaks into the reserved/stdio-handle
+/// region — the typed view starts zeroed and only `cb`, `dwFlags`, and
+/// `wShowWindow` are touched.
+fn write_startup_info(engine: &mut dyn wie_cpu::CpuEngine, startup_info_ptr: u64) -> Result<()> {
+    if startup_info_ptr == 0 {
+        return Ok(());
+    }
+    with_typed_write::<StartupInfo, _, _>(engine, startup_info_ptr, |info| {
+        info.cb = 104;
+        info.dw_flags = 0;
+        info.w_show_window = 1;
+        Ok(())
+    })
+    .context("failed to write STARTUPINFO")
+}
 
 /// Handles `KERNEL32.dll!GetStartupInfoA`.
 pub fn handle_get_startup_info_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -14,33 +37,7 @@ pub fn handle_get_startup_info_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         .read_rcx()
         .context("failed to read RCX for GetStartupInfoA")?;
 
-    if startup_info_ptr != 0 {
-        // STARTUPINFOA on Win64 is 104 bytes. Windows zero-fills the whole
-        // struct before setting the three fields, so caller garbage never
-        // leaks into the reserved/stdio-handle region between cb and the
-        // last written field.
-        let cb_address = checked_field_address(startup_info_ptr, 0, "cb");
-        let flags_address = checked_field_address(startup_info_ptr, 60, "dwFlags");
-        let show_window_address = checked_field_address(startup_info_ptr, 64, "wShowWindow");
-
-        write_guest_u32(engine, cb_address, 104)?;
-        // Zero the reserved region between cb and dwFlags (offset 4..60).
-        engine
-            .mem_write(
-                checked_field_address(startup_info_ptr, 4, "reserved fields"),
-                &[0_u8; 56],
-            )
-            .context("GetStartupInfoA zero reserved fields")?;
-        write_guest_u32(engine, flags_address, 0)?;
-        write_guest_u16(engine, show_window_address, 1)?;
-        // Zero the tail after wShowWindow (offset 66..104).
-        engine
-            .mem_write(
-                checked_field_address(startup_info_ptr, 66, "tail fields"),
-                &[0_u8; 38],
-            )
-            .context("GetStartupInfoA zero tail fields")?;
-    }
+    write_startup_info(engine, startup_info_ptr)?;
 
     let return_address = engine
         .return_from_win64_api(0)
@@ -58,33 +55,7 @@ pub fn handle_get_startup_info_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         .read_rcx()
         .context("failed to read RCX for GetStartupInfoW")?;
 
-    if startup_info_ptr != 0 {
-        // STARTUPINFOW on Win64 is 104 bytes. Windows zero-fills the whole
-        // struct before setting the three fields, so caller garbage never
-        // leaks into the reserved/stdio-handle region between cb and the
-        // last written field.
-        let cb_address = checked_field_address(startup_info_ptr, 0, "cb");
-        let flags_address = checked_field_address(startup_info_ptr, 60, "dwFlags");
-        let show_window_address = checked_field_address(startup_info_ptr, 64, "wShowWindow");
-
-        write_guest_u32(engine, cb_address, 104)?;
-        // Zero the reserved region between cb and dwFlags (offset 4..60).
-        engine
-            .mem_write(
-                checked_field_address(startup_info_ptr, 4, "reserved fields"),
-                &[0_u8; 56],
-            )
-            .context("GetStartupInfoW zero reserved fields")?;
-        write_guest_u32(engine, flags_address, 0)?;
-        write_guest_u16(engine, show_window_address, 1)?;
-        // Zero the tail after wShowWindow (offset 66..104).
-        engine
-            .mem_write(
-                checked_field_address(startup_info_ptr, 66, "tail fields"),
-                &[0_u8; 38],
-            )
-            .context("GetStartupInfoW zero tail fields")?;
-    }
+    write_startup_info(engine, startup_info_ptr)?;
 
     let return_address = engine
         .return_from_win64_api(0)

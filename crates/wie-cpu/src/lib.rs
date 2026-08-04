@@ -248,6 +248,24 @@ pub trait CpuEngine: Send {
         None
     }
 
+    /// Borrow a contiguous guest range as a host slice for writing.
+    ///
+    /// The mutable counterpart to [`Self::host_slice`]: callers get a
+    /// `&mut [u8]` tied to `&self`, so the borrow checker prevents holding it
+    /// across a mutation that could remap the arena.
+    ///
+    /// SMC correctness is preserved by construction: like `host_span(..,
+    /// write=true)`, executable spans are denied (RX pages yield `None`). The
+    /// `mem_write` code-invalidation path is therefore bypassed but can never
+    /// be needed for a returned slice.
+    ///
+    /// `None` when the range is unmapped, denied by software permissions,
+    /// executable, or spans more than one arena; callers fall back to
+    /// `mem_write`.
+    fn host_slice_mut(&self, _address: u64, _len: usize) -> Option<&mut [u8]> {
+        None
+    }
+
     /// Copy `len` bytes guest→guest with `memmove` semantics.
     ///
     /// Returns `false` when either side cannot be resolved to a single mapped
@@ -468,6 +486,9 @@ impl CpuEngine for Box<dyn CpuEngine> {
     }
     fn host_slice(&self, address: u64, len: usize) -> Option<&[u8]> {
         (**self).host_slice(address, len)
+    }
+    fn host_slice_mut(&self, address: u64, len: usize) -> Option<&mut [u8]> {
+        (**self).host_slice_mut(address, len)
     }
     fn mem_copy(&mut self, dst: u64, src: u64, len: usize) -> bool {
         (**self).mem_copy(dst, src, len)

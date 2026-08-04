@@ -1,8 +1,7 @@
 use anyhow::{Context, Result};
 
-use crate::guest_memory::{
-    checked_field_address, write_i32 as write_guest_i32, write_u16 as write_guest_u16,
-};
+use crate::guest_layout::{TextMetricA, TextMetricW};
+use crate::guest_memory::with_typed_write;
 use crate::handles::Hdc;
 use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 
@@ -121,86 +120,28 @@ pub fn handle_get_text_metrics_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         // System fonts are vector (variable-pitch); TMPF_VECTOR = 0x01.
         let pitch_and_family: u8 = 0x01;
 
-        // TEXTMETRICA layout (all LONG / BYTE fields packed):
-        // tmHeight 0, tmAscent 4, tmDescent 8, tmInternalLeading 12,
-        // tmExternalLeading 16, tmAveCharWidth 20, tmMaxCharWidth 24,
-        // tmWeight 28, tmOverhang 32, tmDigitizedAspectX 36,
-        // tmDigitizedAspectY 40, tmFirstChar 44, tmLastChar 45,
-        // tmDefaultChar 46, tmBreakChar 47, tmItalic 48, tmUnderlined 49,
-        // tmStruckOut 50, tmPitchAndFamily 51, tmCharSet 52
-        write_guest_i32(engine, metrics_ptr, m.height)?; // tmHeight
-        write_guest_i32(
-            engine,
-            checked_field_address(metrics_ptr, 4, "tmAscent"),
-            m.ascent,
-        )?;
-        write_guest_i32(
-            engine,
-            checked_field_address(metrics_ptr, 8, "tmDescent"),
-            m.descent,
-        )?;
-        write_guest_i32(
-            engine,
-            checked_field_address(metrics_ptr, 12, "tmInternalLeading"),
-            m.internal_leading,
-        )?;
-        write_guest_i32(
-            engine,
-            checked_field_address(metrics_ptr, 16, "tmExternalLeading"),
-            m.external_leading,
-        )?;
-        write_guest_i32(
-            engine,
-            checked_field_address(metrics_ptr, 20, "tmAveCharWidth"),
-            m.avg_width,
-        )?;
-        write_guest_i32(
-            engine,
-            checked_field_address(metrics_ptr, 24, "tmMaxCharWidth"),
-            m.max_width,
-        )?;
-        write_guest_i32(
-            engine,
-            checked_field_address(metrics_ptr, 28, "tmWeight"),
-            m.weight,
-        )?;
-        write_guest_i32(
-            engine,
-            checked_field_address(metrics_ptr, 32, "tmOverhang"),
-            0,
-        )?;
-        write_guest_i32(
-            engine,
-            checked_field_address(metrics_ptr, 36, "tmDigitizedAspectX"),
-            0,
-        )?;
-        write_guest_i32(
-            engine,
-            checked_field_address(metrics_ptr, 40, "tmDigitizedAspectY"),
-            0,
-        )?;
-        // BYTE fields at end
-        engine.mem_write(checked_field_address(metrics_ptr, 44, "tmFirstChar"), &[0])?;
-        engine.mem_write(checked_field_address(metrics_ptr, 45, "tmLastChar"), &[0])?;
-        engine.mem_write(
-            checked_field_address(metrics_ptr, 46, "tmDefaultChar"),
-            &[0],
-        )?;
-        engine.mem_write(checked_field_address(metrics_ptr, 47, "tmBreakChar"), &[0])?;
-        engine.mem_write(
-            checked_field_address(metrics_ptr, 48, "tmItalic"),
-            &[u8::from(m.italic)],
-        )?;
-        engine.mem_write(checked_field_address(metrics_ptr, 49, "tmUnderlined"), &[0])?;
-        engine.mem_write(checked_field_address(metrics_ptr, 50, "tmStruckOut"), &[0])?;
-        engine.mem_write(
-            checked_field_address(metrics_ptr, 51, "tmPitchAndFamily"),
-            &[pitch_and_family],
-        )?;
-        engine.mem_write(
-            checked_field_address(metrics_ptr, 52, "tmCharSet"),
-            &[m.charset],
-        )?;
+        // TEXTMETRICA: 11 LONGs, 9 BYTEs, 3 pad bytes = 56 bytes. The typed
+        // view zero-fills first, so the char fields (44..52), overhang, and
+        // digitized-aspect fields read as zero exactly like the old
+        // per-field writes left them.
+        with_typed_write::<TextMetricA, _, _>(engine, metrics_ptr, |tm| {
+            tm.height = m.height;
+            tm.ascent = m.ascent;
+            tm.descent = m.descent;
+            tm.internal_leading = m.internal_leading;
+            tm.external_leading = m.external_leading;
+            tm.avg_char_width = m.avg_width;
+            tm.max_char_width = m.max_width;
+            tm.weight = m.weight;
+            tm.overhang = 0;
+            tm.digitized_aspect_x = 0;
+            tm.digitized_aspect_y = 0;
+            tm.italic = u8::from(m.italic);
+            tm.pitch_and_family = pitch_and_family;
+            tm.charset = m.charset;
+            Ok(())
+        })
+        .context("failed to write TEXTMETRICA")?;
     }
 
     let return_value = u64::from(success);
@@ -236,100 +177,27 @@ pub fn handle_get_text_metrics_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         // System fonts are vector (variable-pitch); TMPF_VECTOR = 0x01.
         let pitch_and_family: u8 = 0x01;
 
-        // TEXTMETRICW layout (11 LONGs, 4 WCHARs, 5 BYTEs):
-        // tmHeight 0, tmAscent 4, tmDescent 8, tmInternalLeading 12,
-        // tmExternalLeading 16, tmAveCharWidth 20, tmMaxCharWidth 24,
-        // tmWeight 28, tmOverhang 32, tmDigitizedAspectX 36,
-        // tmDigitizedAspectY 40, tmFirstChar 44, tmLastChar 46,
-        // tmDefaultChar 48, tmBreakChar 50, tmItalic 52, tmUnderlined 53,
-        // tmStruckOut 54, tmPitchAndFamily 55, tmCharSet 56
-        write_guest_i32(engine, metrics_ptr, m.height)?; // tmHeight
-        write_guest_i32(
-            engine,
-            checked_field_address(metrics_ptr, 4, "tmAscent"),
-            m.ascent,
-        )?;
-        write_guest_i32(
-            engine,
-            checked_field_address(metrics_ptr, 8, "tmDescent"),
-            m.descent,
-        )?;
-        write_guest_i32(
-            engine,
-            checked_field_address(metrics_ptr, 12, "tmInternalLeading"),
-            m.internal_leading,
-        )?;
-        write_guest_i32(
-            engine,
-            checked_field_address(metrics_ptr, 16, "tmExternalLeading"),
-            m.external_leading,
-        )?;
-        write_guest_i32(
-            engine,
-            checked_field_address(metrics_ptr, 20, "tmAveCharWidth"),
-            m.avg_width,
-        )?;
-        write_guest_i32(
-            engine,
-            checked_field_address(metrics_ptr, 24, "tmMaxCharWidth"),
-            m.max_width,
-        )?;
-        write_guest_i32(
-            engine,
-            checked_field_address(metrics_ptr, 28, "tmWeight"),
-            m.weight,
-        )?;
-        write_guest_i32(
-            engine,
-            checked_field_address(metrics_ptr, 32, "tmOverhang"),
-            0,
-        )?;
-        write_guest_i32(
-            engine,
-            checked_field_address(metrics_ptr, 36, "tmDigitizedAspectX"),
-            0,
-        )?;
-        write_guest_i32(
-            engine,
-            checked_field_address(metrics_ptr, 40, "tmDigitizedAspectY"),
-            0,
-        )?;
-        // WCHAR fields (2 bytes each)
-        write_guest_u16(
-            engine,
-            checked_field_address(metrics_ptr, 44, "tmFirstChar"),
-            0,
-        )?;
-        write_guest_u16(
-            engine,
-            checked_field_address(metrics_ptr, 46, "tmLastChar"),
-            0,
-        )?;
-        write_guest_u16(
-            engine,
-            checked_field_address(metrics_ptr, 48, "tmDefaultChar"),
-            0,
-        )?;
-        write_guest_u16(
-            engine,
-            checked_field_address(metrics_ptr, 50, "tmBreakChar"),
-            0,
-        )?;
-        // BYTE fields at end
-        engine.mem_write(
-            checked_field_address(metrics_ptr, 52, "tmItalic"),
-            &[u8::from(m.italic)],
-        )?;
-        engine.mem_write(checked_field_address(metrics_ptr, 53, "tmUnderlined"), &[0])?;
-        engine.mem_write(checked_field_address(metrics_ptr, 54, "tmStruckOut"), &[0])?;
-        engine.mem_write(
-            checked_field_address(metrics_ptr, 55, "tmPitchAndFamily"),
-            &[pitch_and_family],
-        )?;
-        engine.mem_write(
-            checked_field_address(metrics_ptr, 56, "tmCharSet"),
-            &[m.charset],
-        )?;
+        // TEXTMETRICW: 11 LONGs, 4 WCHARs, 5 BYTEs, 3 pad bytes = 60 bytes.
+        // The char fields widen to WCHAR (44..51) and the flags shift to
+        // 52..56 — the layout verified by the TextMetricW const-assert table.
+        with_typed_write::<TextMetricW, _, _>(engine, metrics_ptr, |tm| {
+            tm.height = m.height;
+            tm.ascent = m.ascent;
+            tm.descent = m.descent;
+            tm.internal_leading = m.internal_leading;
+            tm.external_leading = m.external_leading;
+            tm.avg_char_width = m.avg_width;
+            tm.max_char_width = m.max_width;
+            tm.weight = m.weight;
+            tm.overhang = 0;
+            tm.digitized_aspect_x = 0;
+            tm.digitized_aspect_y = 0;
+            tm.italic = u8::from(m.italic);
+            tm.pitch_and_family = pitch_and_family;
+            tm.charset = m.charset;
+            Ok(())
+        })
+        .context("failed to write TEXTMETRICW")?;
     }
 
     let return_value = u64::from(success);

@@ -1,9 +1,10 @@
 use super::{
     Context, Result, WinApiHandlerResult, WinApiState, WindowClassRecord, allocate_menu_handle,
-    checked_field_address, read_guest_ansi_lossy, read_guest_u32, read_guest_u64,
-    read_guest_utf16_lossy, write_guest_ansi_c_string, write_guest_u32, write_guest_utf16_c_string,
+    read_guest_ansi_lossy, read_guest_utf16_lossy, with_typed_read, with_typed_write,
+    write_guest_ansi_c_string, write_guest_utf16_c_string,
 };
 use crate::HandlerContext;
+use crate::guest_layout::MenuItemInfo;
 use crate::handles::{Hmenu, Hwnd};
 use wie_pe::resources::{MenuItemTemplate, MenuTemplate};
 
@@ -874,72 +875,42 @@ fn fill_menu_item_info(
         return Ok(false);
     };
 
-    // MENUITEMINFO on Win64:
-    // cbSize 0, fMask 4, fType 8, fState 12, wID 16, hSubMenu 24,
-    // hbmpChecked 32, hbmpUnchecked 40, dwItemData 48, dwTypeData 56,
-    // cch 64, hbmpItem 72.
-    let f_mask = read_guest_u32(
-        engine,
-        checked_field_address(info_ptr, 4, "MENUITEMINFO.fMask"),
-    )
-    .context("failed to read MENUITEMINFO.fMask")?;
+    // MENUITEMINFO is an in/out struct: the guest's untouched fields (cbSize,
+    // hSubMenu, hbmp*, dwItemData, hbmpItem) must survive the write. Snapshot
+    // the whole struct (it is Copy), edit the mask-selected fields, write it
+    // back — two shared-lock borrows. The layout + pinned offsets (dwTypeData
+    // @56, cch @64) live in `crate::guest_layout::MenuItemInfo`.
+    let mut info = with_typed_read::<MenuItemInfo, _, _>(engine, info_ptr, |view| Ok(*view))
+        .context("failed to read MENUITEMINFO")?;
 
-    if f_mask & MIIM_STATE != 0 {
-        write_guest_u32(
-            engine,
-            checked_field_address(info_ptr, 12, "MENUITEMINFO.fState"),
-            item.flags & 0x00ff,
-        )
-        .context("failed to write MENUITEMINFO.fState")?;
+    if info.f_mask & MIIM_STATE != 0 {
+        info.f_state = item.flags & 0x00ff;
     }
 
-    if f_mask & MIIM_ID != 0 {
-        write_guest_u32(
-            engine,
-            checked_field_address(info_ptr, 16, "MENUITEMINFO.wID"),
-            item.id,
-        )
-        .context("failed to write MENUITEMINFO.wID")?;
+    if info.f_mask & MIIM_ID != 0 {
+        info.w_id = item.id;
     }
 
-    if f_mask & MIIM_TYPE != 0 {
-        write_guest_u32(
-            engine,
-            checked_field_address(info_ptr, 8, "MENUITEMINFO.fType"),
-            MFT_STRING,
-        )
-        .context("failed to write MENUITEMINFO.fType")?;
+    if info.f_mask & MIIM_TYPE != 0 {
+        info.f_type = MFT_STRING;
 
-        let type_data_ptr = read_guest_u64(
-            engine,
-            checked_field_address(info_ptr, 56, "MENUITEMINFO.dwTypeData"),
-        )
-        .context("failed to read MENUITEMINFO.dwTypeData")?;
+        let capacity = usize::try_from(info.cch).context("MENUITEMINFO.cch does not fit usize")?;
 
-        let capacity_raw = read_guest_u32(
-            engine,
-            checked_field_address(info_ptr, 64, "MENUITEMINFO.cch"),
-        )
-        .context("failed to read MENUITEMINFO.cch")?;
-
-        let capacity =
-            usize::try_from(capacity_raw).context("MENUITEMINFO.cch does not fit usize")?;
-
-        if type_data_ptr != 0 && capacity > 0 {
+        if info.type_data_ptr != 0 && capacity > 0 {
             let copied = if unicode {
-                write_guest_utf16_c_string(engine, type_data_ptr, capacity, &item.text)?
+                write_guest_utf16_c_string(engine, info.type_data_ptr, capacity, &item.text)?
             } else {
-                write_guest_ansi_c_string(engine, type_data_ptr, capacity, &item.text)?
+                write_guest_ansi_c_string(engine, info.type_data_ptr, capacity, &item.text)?
             };
-            let copied = u32::try_from(copied).context("menu text length does not fit u32")?;
-            write_guest_u32(
-                engine,
-                checked_field_address(info_ptr, 64, "MENUITEMINFO.cch"),
-                copied,
-            )
-            .context("failed to write MENUITEMINFO.cch")?;
+            info.cch = u32::try_from(copied).context("menu text length does not fit u32")?;
         }
     }
+
+    with_typed_write::<MenuItemInfo, _, _>(engine, info_ptr, |view| {
+        *view = info;
+        Ok(())
+    })
+    .context("failed to write MENUITEMINFO")?;
 
     Ok(true)
 }

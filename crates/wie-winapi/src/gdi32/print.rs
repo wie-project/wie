@@ -18,10 +18,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use crate::guest_memory::{
-    checked_field_address, read_i32 as read_guest_i32, read_u32 as read_guest_u32,
-    read_u64 as read_guest_u64,
-};
+use crate::guest_layout::DocInfoW;
+use crate::guest_memory::{checked_field_address, read_i32 as read_guest_i32, with_typed_read};
 use crate::guest_string::read_utf16_lossy as read_guest_utf16_lossy;
 use crate::handles::{Hbrush, Hdc, Hpen};
 use crate::user32::low_i32;
@@ -79,16 +77,14 @@ pub fn handle_start_doc_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 
     let mut success = false;
     if docinfo_ptr != 0 {
-        let _cb_size =
-            read_guest_u32(engine, docinfo_ptr).context("failed to read DOCINFO.cbSize")?;
-        // DOCINFOW (Win64): int cbSize @0 (4B + 4B alignment padding), then
-        // LPCWSTR lpszDocName @8, lpszOutput @16, lpszDatatype @24, DWORD
-        // fwType @32.
-        let doc_name_ptr = read_guest_u64(
-            engine,
-            checked_field_address(docinfo_ptr, 8, "DOCINFO.lpszDocName"),
-        )
-        .context("failed to read DOCINFO.lpszDocName")?;
+        // DOCINFOW (Win64): int cbSize @0, then LPCWSTR lpszDocName @8,
+        // lpszOutput @16, lpszDatatype @24, DWORD fwType @32. One typed read
+        // replaces the old cbSize + per-field pointer reads; the doc name is
+        // read through the view's pointer (capped at 4096 chars).
+        let doc_name_ptr = with_typed_read::<DocInfoW, _, _>(engine, docinfo_ptr, |docinfo| {
+            Ok(docinfo.lpsz_doc_name)
+        })
+        .context("failed to read DOCINFOW.lpszDocName")?;
         let doc_name = read_guest_utf16_lossy(engine, doc_name_ptr, 4096)
             .context("failed to read StartDocW document name")?;
 

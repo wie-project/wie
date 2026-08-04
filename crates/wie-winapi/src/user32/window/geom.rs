@@ -2,12 +2,13 @@
 //! (split from the former `window.rs`).
 
 use super::class::{find_window, find_window_mut};
+use crate::guest_layout::{WinPoint, WinRect};
 use crate::state::WindowFlags;
 use crate::user32::{
     Context, FAKE_DESKTOP_WINDOW_HANDLE, FAKE_PROCESS_ID, FAKE_SYSTEM_COLOR_BRUSH_BASE,
     FAKE_THREAD_ID, FAKE_WINDOW_HANDLE, HandlerContext, Result, WinApiHandlerResult, WinApiState,
-    checked_field_address, is_known_window, low_i32, read_guest_i32, read_guest_u32,
-    read_guest_u64, window_client_size, write_guest_i32, write_guest_u32, write_window_rect,
+    WindowPlacement, is_known_window, low_i32, read_guest_u32, read_guest_u64, window_client_size,
+    with_typed_read, with_typed_write, write_guest_u32,
 };
 
 /// Handles `USER32.dll!GetClientRect`.
@@ -26,7 +27,16 @@ pub fn handle_get_client_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 
     if success {
         let (width, height) = window_client_size(state, window_handle);
-        write_window_rect(engine, rect_ptr, 0, 0, width, height)?;
+        // One shared-lock borrow instead of four per-field writes; the RECT
+        // layout + pinned offsets live in `crate::guest_layout::WinRect`.
+        with_typed_write::<WinRect, _, _>(engine, rect_ptr, |rect| {
+            rect.left = 0;
+            rect.top = 0;
+            rect.right = width;
+            rect.bottom = height;
+            Ok(())
+        })
+        .context("failed to write GetClientRect RECT")?;
     }
 
     let return_value = u64::from(success);
@@ -151,11 +161,9 @@ pub fn handle_screen_to_client(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     let success = window_handle == FAKE_WINDOW_HANDLE && point_ptr != 0;
 
     if success {
-        let x = read_guest_i32(engine, point_ptr)?;
-
-        let y_address = checked_field_address(point_ptr, 4, "POINT.y");
-
-        let y = read_guest_i32(engine, y_address)?;
+        let (x, y) =
+            with_typed_read::<WinPoint, _, _>(engine, point_ptr, |point| Ok((point.x, point.y)))
+                .context("failed to read POINT for ScreenToClient")?;
 
         let client_x = x
             .checked_sub(state.window_state().window_x)
@@ -165,8 +173,12 @@ pub fn handle_screen_to_client(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
             .checked_sub(state.window_state().window_y)
             .context("ScreenToClient y coordinate overflow")?;
 
-        write_guest_i32(engine, point_ptr, client_x)?;
-        write_guest_i32(engine, y_address, client_y)?;
+        with_typed_write::<WinPoint, _, _>(engine, point_ptr, |point| {
+            point.x = client_x;
+            point.y = client_y;
+            Ok(())
+        })
+        .context("failed to write POINT for ScreenToClient")?;
     }
 
     let return_value = u64::from(success);
@@ -195,11 +207,9 @@ pub fn handle_client_to_screen(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     let success = window_handle == FAKE_WINDOW_HANDLE && point_ptr != 0;
 
     if success {
-        let x = read_guest_i32(engine, point_ptr)?;
-
-        let y_address = checked_field_address(point_ptr, 4, "POINT.y");
-
-        let y = read_guest_i32(engine, y_address)?;
+        let (x, y) =
+            with_typed_read::<WinPoint, _, _>(engine, point_ptr, |point| Ok((point.x, point.y)))
+                .context("failed to read POINT for ClientToScreen")?;
 
         let screen_x = x
             .checked_add(state.window_state().window_x)
@@ -209,8 +219,12 @@ pub fn handle_client_to_screen(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
             .checked_add(state.window_state().window_y)
             .context("ClientToScreen y coordinate overflow")?;
 
-        write_guest_i32(engine, point_ptr, screen_x)?;
-        write_guest_i32(engine, y_address, screen_y)?;
+        with_typed_write::<WinPoint, _, _>(engine, point_ptr, |point| {
+            point.x = screen_x;
+            point.y = screen_y;
+            Ok(())
+        })
+        .context("failed to write POINT for ClientToScreen")?;
     }
 
     let return_value = u64::from(success);
@@ -355,14 +369,14 @@ pub fn handle_set_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
     let success = rect_ptr != 0;
 
     if success {
-        write_window_rect(
-            engine,
-            rect_ptr,
-            low_i32(left_raw, "SetRect left")?,
-            low_i32(top_raw, "SetRect top")?,
-            low_i32(right_raw, "SetRect right")?,
-            low_i32(bottom_raw, "SetRect bottom")?,
-        )?;
+        with_typed_write::<WinRect, _, _>(engine, rect_ptr, |rect| {
+            rect.left = low_i32(left_raw, "SetRect left")?;
+            rect.top = low_i32(top_raw, "SetRect top")?;
+            rect.right = low_i32(right_raw, "SetRect right")?;
+            rect.bottom = low_i32(bottom_raw, "SetRect bottom")?;
+            Ok(())
+        })
+        .context("failed to write RECT for SetRect")?;
     }
 
     let return_value = u64::from(success);
@@ -557,15 +571,12 @@ pub fn handle_adjust_window_rect_ex(ctx: &mut HandlerContext<'_>) -> Result<WinA
     let success = rect_ptr != 0;
 
     if success {
-        let left = read_guest_i32(engine, rect_ptr)?;
-
-        let top_address = checked_field_address(rect_ptr, 4, "RECT.top");
-        let right_address = checked_field_address(rect_ptr, 8, "RECT.right");
-        let bottom_address = checked_field_address(rect_ptr, 12, "RECT.bottom");
-
-        let top = read_guest_i32(engine, top_address)?;
-        let right = read_guest_i32(engine, right_address)?;
-        let bottom = read_guest_i32(engine, bottom_address)?;
+        // Read-all → compute → write-all (one shared-lock borrow per view).
+        let (left, top, right, bottom) =
+            with_typed_read::<WinRect, _, _>(engine, rect_ptr, |rect| {
+                Ok((rect.left, rect.top, rect.right, rect.bottom))
+            })
+            .context("failed to read RECT for AdjustWindowRectEx")?;
 
         // Approximate classic non-client metrics:
         // 8 px frame on each side, 31 px caption,
@@ -589,14 +600,14 @@ pub fn handle_adjust_window_rect_ex(ctx: &mut HandlerContext<'_>) -> Result<WinA
             .checked_add(8)
             .context("AdjustWindowRectEx bottom overflow")?;
 
-        write_window_rect(
-            engine,
-            rect_ptr,
-            adjusted_left,
-            adjusted_top,
-            adjusted_right,
-            adjusted_bottom,
-        )?;
+        with_typed_write::<WinRect, _, _>(engine, rect_ptr, |rect| {
+            rect.left = adjusted_left;
+            rect.top = adjusted_top;
+            rect.right = adjusted_right;
+            rect.bottom = adjusted_bottom;
+            Ok(())
+        })
+        .context("failed to write RECT for AdjustWindowRectEx")?;
     }
 
     let return_value = u64::from(success);
@@ -693,48 +704,19 @@ pub fn handle_get_window_placement(ctx: &mut HandlerContext<'_>) -> Result<WinAp
         // restored state we can express.
         let show_cmd = u32::from(visible);
 
-        write_guest_u32(engine, placement_ptr, WINDOWPLACEMENT_LENGTH)
-            .context("failed to write WINDOWPLACEMENT.length")?;
-
-        write_guest_u32(
-            engine,
-            checked_field_address(placement_ptr, 4, "WINDOWPLACEMENT.flags"),
-            0,
-        )
-        .context("failed to write WINDOWPLACEMENT.flags")?;
-
-        write_guest_u32(
-            engine,
-            checked_field_address(placement_ptr, 8, "WINDOWPLACEMENT.showCmd"),
-            show_cmd,
-        )
-        .context("failed to write WINDOWPLACEMENT.showCmd")?;
-
-        // ptMinPosition / ptMaxPosition: zero without minimized/maximized
-        // tracking.
-        for (offset, name) in [
-            (12, "WINDOWPLACEMENT.ptMinPosition.x"),
-            (16, "WINDOWPLACEMENT.ptMinPosition.y"),
-            (20, "WINDOWPLACEMENT.ptMaxPosition.x"),
-            (24, "WINDOWPLACEMENT.ptMaxPosition.y"),
-        ] {
-            write_guest_i32(
-                engine,
-                checked_field_address(placement_ptr, offset, name),
-                0,
-            )
-            .with_context(|| format!("failed to write {name}"))?;
-        }
-
-        write_window_rect(
-            engine,
-            checked_field_address(placement_ptr, 28, "WINDOWPLACEMENT.rcNormalPosition"),
-            x,
-            y,
-            right,
-            bottom,
-        )
-        .context("failed to write WINDOWPLACEMENT.rcNormalPosition")?;
+        // One shared-lock borrow instead of ten per-field writes. The view
+        // starts zeroed, so flags and the min/max positions read as zero —
+        // the same bytes the old per-field path wrote explicitly.
+        with_typed_write::<WindowPlacement, _, _>(engine, placement_ptr, |placement| {
+            placement.length = WINDOWPLACEMENT_LENGTH;
+            placement.show_cmd = show_cmd;
+            placement.rc_left = x;
+            placement.rc_top = y;
+            placement.rc_right = right;
+            placement.rc_bottom = bottom;
+            Ok(())
+        })
+        .context("failed to write WINDOWPLACEMENT")?;
     }
 
     let return_value = u64::from(success);
@@ -773,35 +755,20 @@ pub fn handle_set_window_placement(ctx: &mut HandlerContext<'_>) -> Result<WinAp
     }
 
     if success {
-        let show_cmd = read_guest_u32(
-            engine,
-            checked_field_address(placement_ptr, 8, "WINDOWPLACEMENT.showCmd"),
-        )
-        .context("failed to read WINDOWPLACEMENT.showCmd")?;
-
-        let left = read_guest_i32(
-            engine,
-            checked_field_address(placement_ptr, 28, "WINDOWPLACEMENT.rcNormalPosition.left"),
-        )
-        .context("failed to read WINDOWPLACEMENT.rcNormalPosition.left")?;
-
-        let top = read_guest_i32(
-            engine,
-            checked_field_address(placement_ptr, 32, "WINDOWPLACEMENT.rcNormalPosition.top"),
-        )
-        .context("failed to read WINDOWPLACEMENT.rcNormalPosition.top")?;
-
-        let right = read_guest_i32(
-            engine,
-            checked_field_address(placement_ptr, 36, "WINDOWPLACEMENT.rcNormalPosition.right"),
-        )
-        .context("failed to read WINDOWPLACEMENT.rcNormalPosition.right")?;
-
-        let bottom = read_guest_i32(
-            engine,
-            checked_field_address(placement_ptr, 40, "WINDOWPLACEMENT.rcNormalPosition.bottom"),
-        )
-        .context("failed to read WINDOWPLACEMENT.rcNormalPosition.bottom")?;
+        // Read the whole struct with one shared-lock borrow instead of five
+        // per-field reads. The length gate above (Set rejects a pre-44
+        // 32-bit struct) still runs before the view is created.
+        let (show_cmd, left, top, right, bottom) =
+            with_typed_read::<WindowPlacement, _, _>(engine, placement_ptr, |placement| {
+                Ok((
+                    placement.show_cmd,
+                    placement.rc_left,
+                    placement.rc_top,
+                    placement.rc_right,
+                    placement.rc_bottom,
+                ))
+            })
+            .context("failed to read WINDOWPLACEMENT")?;
 
         let width = right
             .checked_sub(left)
@@ -894,10 +861,11 @@ pub fn handle_set_window_placement(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{
-        FAKE_WINDOW_HANDLE, find_window_mut, handle_get_client_rect, handle_move_window,
-        read_guest_i32, sys_color, window_client_size,
+        FAKE_WINDOW_HANDLE, find_window_mut, handle_get_client_rect, handle_move_window, sys_color,
+        window_client_size,
     };
 
+    use crate::user32::read_guest_i32;
     use wie_cpu::{CpuEngine, IcedCpu, RwxPerms};
 
     use ahash::HashMap;

@@ -60,6 +60,23 @@ impl CpuEngine for JitCpu {
         Some(unsafe { std::slice::from_raw_parts(ptr, len) })
     }
 
+    fn host_slice_mut(&self, address: u64, len: usize) -> Option<&mut [u8]> {
+        if len == 0 {
+            return Some(&mut []);
+        }
+        let ptr = self
+            .shared
+            .mem
+            .read()
+            .unwrap()
+            .host_span(address, len, true)?;
+        // SAFETY: as `IcedCpu::host_slice_mut` — `host_span(.., write=true)`
+        // denies executable spans, so SMC invalidation is never required for
+        // a returned slice.
+        #[expect(unsafe_code)]
+        Some(unsafe { std::slice::from_raw_parts_mut(ptr, len) })
+    }
+
     fn mem_copy(&mut self, dst: u64, src: u64, len: usize) -> bool {
         self.shared.mem.read().unwrap().mem_copy(dst, src, len)
     }

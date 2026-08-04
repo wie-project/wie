@@ -10,11 +10,12 @@ use super::{
     WM_CREATE, WM_DESTROY, WM_KILLFOCUS, WM_PAINT, WM_SETFOCUS, WinApiControlSignal,
     WinApiHandlerResult, WinApiState, create_window_record, dispatch_control_proc, is_known_window,
     read_guest_ansi_lossy, read_guest_i32, read_guest_u32, read_guest_u64, read_guest_utf16_lossy,
-    read_window_class_identifier_a, read_window_class_identifier_w, write_ansi_window_text,
-    write_guest_ansi_c_string, write_guest_i32, write_guest_u32, write_guest_u64,
-    write_guest_utf16_c_string, write_wide_window_text, write_window_rect,
+    read_window_class_identifier_a, read_window_class_identifier_w, with_typed_write,
+    write_ansi_window_text, write_guest_ansi_c_string, write_guest_utf16_c_string,
+    write_wide_window_text,
 };
 use crate::OuterReturn;
+use crate::guest_layout::{CreateStruct, WinRect};
 use crate::state::WindowFlags;
 
 mod class;
@@ -68,8 +69,16 @@ pub fn handle_get_window_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
             .checked_add(window.height)
             .context("GetWindowRect bottom coordinate overflow")?;
 
-        write_window_rect(engine, rect_ptr, window.x, window.y, right, bottom)
-            .context("failed to write GetWindowRect RECT")?;
+        // One shared-lock borrow instead of four per-field writes; the RECT
+        // layout + pinned offsets live in `crate::guest_layout::WinRect`.
+        with_typed_write::<WinRect, _, _>(engine, rect_ptr, |rect| {
+            rect.left = window.x;
+            rect.top = window.y;
+            rect.right = right;
+            rect.bottom = bottom;
+            Ok(())
+        })
+        .context("failed to write GetWindowRect RECT")?;
     }
 
     let return_value = u64::from(success);
@@ -1235,32 +1244,26 @@ pub fn handle_create_window_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
             });
         }
 
-        // CREATESTRUCT on Win64 layout:
-        //  +0x00 lpCreateParams (u64)
-        //  +0x08 hInstance (u64)
-        //  +0x10 hMenu (u64)
-        //  +0x18 hwndParent (u64)
-        //  +0x20 cy (i32)
-        //  +0x24 cx (i32)
-        //  +0x28 y (i32)
-        //  +0x2C x (i32)
-        //  +0x30 style (u32)
-        //  +0x38 lpszName (u64)
-        //  +0x40 lpszClass (u64)
-        //  +0x48 dwExStyle (u32)
-
-        write_guest_u64(engine, cs_va.wrapping_add(0x00), create_params)?;
-        write_guest_u64(engine, cs_va.wrapping_add(0x08), instance_handle)?;
-        write_guest_u64(engine, cs_va.wrapping_add(0x10), menu_handle)?;
-        write_guest_u64(engine, cs_va.wrapping_add(0x18), parent_handle)?;
-        write_guest_i32(engine, cs_va.wrapping_add(0x20), height)?;
-        write_guest_i32(engine, cs_va.wrapping_add(0x24), width)?;
-        write_guest_i32(engine, cs_va.wrapping_add(0x28), y)?;
-        write_guest_i32(engine, cs_va.wrapping_add(0x2C), x)?;
-        write_guest_u32(engine, cs_va.wrapping_add(0x30), style)?;
-        write_guest_u64(engine, cs_va.wrapping_add(0x38), window_title)?;
-        write_guest_u64(engine, cs_va.wrapping_add(0x40), class_value)?;
-        write_guest_u32(engine, cs_va.wrapping_add(0x48), ex_style)?;
+        // One shared-lock borrow instead of eleven per-field writes. The
+        // CREATESTRUCT layout + pinned offsets (dwExStyle @0x48) live in
+        // `crate::guest_layout::CreateStruct`; the zero-fill covers both
+        // alignment pads.
+        with_typed_write::<CreateStruct, _, _>(engine, cs_va, |cs| {
+            cs.create_params = create_params;
+            cs.instance_handle = instance_handle;
+            cs.menu_handle = menu_handle;
+            cs.parent_handle = parent_handle;
+            cs.cy = height;
+            cs.cx = width;
+            cs.y = y;
+            cs.x = x;
+            cs.style = style;
+            cs.name_ptr = window_title;
+            cs.class_ptr = class_value;
+            cs.extended_style = ex_style;
+            Ok(())
+        })
+        .context("failed to write CREATESTRUCT for CreateWindowExA")?;
 
         return Err(WinApiControlSignal::GuestCallbackRequested {
             request: GuestCallbackRequest {
@@ -1421,19 +1424,23 @@ pub fn handle_create_window_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
             });
         }
 
-        // CREATESTRUCT on Win64 layout (same as CreateWindowExA)
-        write_guest_u64(engine, cs_va.wrapping_add(0x00), create_params)?;
-        write_guest_u64(engine, cs_va.wrapping_add(0x08), instance_handle)?;
-        write_guest_u64(engine, cs_va.wrapping_add(0x10), menu_handle)?;
-        write_guest_u64(engine, cs_va.wrapping_add(0x18), parent_handle)?;
-        write_guest_i32(engine, cs_va.wrapping_add(0x20), height)?;
-        write_guest_i32(engine, cs_va.wrapping_add(0x24), width)?;
-        write_guest_i32(engine, cs_va.wrapping_add(0x28), y)?;
-        write_guest_i32(engine, cs_va.wrapping_add(0x2C), x)?;
-        write_guest_u32(engine, cs_va.wrapping_add(0x30), style)?;
-        write_guest_u64(engine, cs_va.wrapping_add(0x38), window_title)?;
-        write_guest_u64(engine, cs_va.wrapping_add(0x40), class_value)?;
-        write_guest_u32(engine, cs_va.wrapping_add(0x48), ex_style)?;
+        // CREATESTRUCT layout is shared with the ANSI variant (see above).
+        with_typed_write::<CreateStruct, _, _>(engine, cs_va, |cs| {
+            cs.create_params = create_params;
+            cs.instance_handle = instance_handle;
+            cs.menu_handle = menu_handle;
+            cs.parent_handle = parent_handle;
+            cs.cy = height;
+            cs.cx = width;
+            cs.y = y;
+            cs.x = x;
+            cs.style = style;
+            cs.name_ptr = window_title;
+            cs.class_ptr = class_value;
+            cs.extended_style = ex_style;
+            Ok(())
+        })
+        .context("failed to write CREATESTRUCT for CreateWindowExW")?;
 
         return Err(WinApiControlSignal::GuestCallbackRequested {
             request: GuestCallbackRequest {

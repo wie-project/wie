@@ -1,4 +1,6 @@
 use anyhow::{Context, Result};
+use wie_cpu::CpuEngine;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub(crate) fn read_i32(engine: &mut dyn wie_cpu::CpuEngine, address: u64) -> Result<i32> {
     let mut bytes = [0_u8; 4];
@@ -78,6 +80,11 @@ pub(crate) fn read_u16(engine: &mut dyn wie_cpu::CpuEngine, address: u64) -> Res
     Ok(u16::from_le_bytes(bytes))
 }
 
+/// Read a single guest byte.
+///
+/// Used only from `#[cfg(test)]` code (the gdi32 print-lane GetTextMetrics
+/// tests), so it is dead in the non-test lib target; kept for handler code.
+#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn read_u8(engine: &mut dyn wie_cpu::CpuEngine, address: u64) -> Result<u8> {
     let mut bytes = [0_u8; 1];
 
@@ -128,4 +135,114 @@ pub(crate) fn write_bytes(
     engine
         .mem_write(address, bytes)
         .context("failed to write bytes to guest memory")
+}
+
+/// Host staging buffer for typed writes when guest memory cannot be borrowed
+/// in place (a struct straddling an arena boundary, or an odd guest address).
+///
+/// `repr(align(16))` covers every Win64 struct alignment (8 for scalar
+/// structs, 16 for `__m128`-containing types), so `mut_from_bytes` never
+/// reports `AlignmentMismatch` on the fallback path.
+#[repr(align(16))]
+struct AlignedBuf<T> {
+    value: T,
+}
+
+impl<T: FromBytes + IntoBytes + Immutable> AlignedBuf<T> {
+    /// All-zero buffer (`FromBytes` guarantees the zero bit pattern is valid).
+    fn zeroed() -> Self {
+        Self {
+            value: T::new_zeroed(),
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        self.value.as_bytes()
+    }
+
+    fn as_mut_bytes(&mut self) -> &mut [u8] {
+        self.value.as_mut_bytes()
+    }
+}
+
+/// Run `f` against a typed read view of a guest struct.
+///
+/// Fast path: the struct is borrowed in place via [`CpuEngine::host_slice`]
+/// (one shared-lock acquisition). Fallback: the struct straddles an arena
+/// boundary or sits at a misaligned address — it is copied into a host buffer
+/// first. Both paths hand `f` a `&T`; the fallback is invisible to the caller,
+/// and Windows tolerates unaligned struct reads, so no guest program can
+/// observe the difference.
+///
+/// # Borrow rule
+/// `f` cannot touch the engine: while the view is alive the engine is
+/// mutably borrowed by this helper. Do all engine I/O before or after the
+/// closure (read-all → compute → write-all → return).
+pub(crate) fn with_typed_read<T, F, R>(engine: &mut dyn CpuEngine, address: u64, f: F) -> Result<R>
+where
+    T: KnownLayout + Immutable + FromBytes,
+    F: FnOnce(&T) -> Result<R>,
+{
+    let len = std::mem::size_of::<T>();
+    if let Some(bytes) = engine.host_slice(address, len)
+        && let Ok(view) = T::ref_from_bytes(bytes)
+    {
+        return f(view);
+    }
+    // Fallback: cross-arena span or alignment mismatch. `read_from_bytes` is
+    // alignment-agnostic, so the staging copy preserves guest bytes exactly.
+    let mut bytes = vec![0_u8; len];
+    engine
+        .mem_read(address, &mut bytes)
+        .context("failed to stage-read typed struct from guest memory")?;
+    // Map the cast error to an owned message: `SizeError` borrows the buffer,
+    // which cannot outlive this function.
+    let value = T::read_from_bytes(&bytes)
+        .map_err(|_| anyhow::anyhow!("staged typed read produced an invalid bit pattern"))?;
+    f(&value)
+}
+
+/// Run `f` against a typed mutable view of a guest struct, then commit.
+///
+/// Fast path: the struct is borrowed in place via [`CpuEngine::host_slice_mut`]
+/// (one shared-lock acquisition), and `f` writes land directly in guest
+/// memory. Fallback (cross-arena span or odd guest address): the struct is
+/// staged into an aligned host copy, `f` edits the copy, and the whole struct
+/// is written back with `mem_write`. The fallback also covers executable
+/// spans, which `host_slice_mut` denies by design (SMC) — `mem_write` runs the
+/// code-invalidation path there.
+///
+/// Zero-fill semantics: the view starts fully zeroed, so padding and any field
+/// `f` leaves unset read as zero (GetStartupInfo behavior — real Windows
+/// zeroes these structs before filling them).
+///
+/// # Borrow rule
+/// `f` cannot touch the engine: while the view is alive the engine is
+/// mutably borrowed by this helper. Do all engine I/O before or after the
+/// closure.
+pub(crate) fn with_typed_write<T, F, R>(engine: &mut dyn CpuEngine, address: u64, f: F) -> Result<R>
+where
+    T: KnownLayout + FromBytes + IntoBytes + Immutable,
+    F: FnOnce(&mut T) -> Result<R>,
+{
+    let len = std::mem::size_of::<T>();
+    if let Some(bytes) = engine.host_slice_mut(address, len)
+        && let Ok(view) = T::mut_from_bytes(bytes)
+    {
+        // Zero-fill first so padding and unset fields read as zero.
+        view.as_mut_bytes().fill(0);
+        return f(view);
+    }
+    // Staged fallback: edit an aligned host copy, then write the whole struct
+    // back in one shot.
+    let mut buf = AlignedBuf::<T>::zeroed();
+    // Map the cast error to an owned message: `CastError` borrows the buffer,
+    // which cannot outlive this function.
+    let view = T::mut_from_bytes(buf.as_mut_bytes())
+        .map_err(|_| anyhow::anyhow!("staged typed write buffer is misaligned"))?;
+    let result = f(view)?;
+    engine
+        .mem_write(address, buf.as_bytes())
+        .context("failed to stage-write typed struct to guest memory")?;
+    Ok(result)
 }
