@@ -787,11 +787,18 @@ pub fn handle_set_window_text_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .context("failed to read RDX for SetWindowTextA")?;
 
     let known = window_handle == FAKE_WINDOW_HANDLE || is_known_window(state, window_handle);
-    let success = known && text_ptr != 0;
+    // SetWindowText(hwnd, NULL) clears the text (documented Win32 semantics);
+    // RNotepad's FileNew/DoOpenFile clear the EDIT this way. A NULL pointer is
+    // not a failure — it means "empty string".
+    let success = known;
 
     if success {
-        let text = read_guest_ansi_lossy(engine, text_ptr, 32_768)
-            .context("failed to read SetWindowTextA text")?;
+        let text = if text_ptr == 0 {
+            String::new()
+        } else {
+            read_guest_ansi_lossy(engine, text_ptr, 32_768)
+                .context("failed to read SetWindowTextA text")?
+        };
         if window_handle == FAKE_WINDOW_HANDLE {
             state.window_state().window_title = text;
         } else if let Some(window) = find_window_mut(state, window_handle) {
@@ -860,11 +867,16 @@ pub fn handle_set_window_text_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .context("failed to read RDX for SetWindowTextW")?;
 
     let known = window_handle == FAKE_WINDOW_HANDLE || is_known_window(state, window_handle);
-    let success = known && text_ptr != 0;
+    // SetWindowText(hwnd, NULL) clears the text (see the ANSI variant above).
+    let success = known;
 
     if success {
-        let text = read_guest_utf16_lossy(engine, text_ptr, 32_768)
-            .context("failed to read SetWindowTextW text")?;
+        let text = if text_ptr == 0 {
+            String::new()
+        } else {
+            read_guest_utf16_lossy(engine, text_ptr, 32_768)
+                .context("failed to read SetWindowTextW text")?
+        };
         if window_handle == FAKE_WINDOW_HANDLE {
             state.window_state().window_title = text;
         } else if let Some(window) = find_window_mut(state, window_handle) {

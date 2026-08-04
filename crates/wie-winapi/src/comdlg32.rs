@@ -46,6 +46,18 @@ const OFN_LPSTR_DEF_EXT: u64 = 104;
 /// No extended common-dialog error.
 const CDERR_NONE: u32 = 0;
 
+/// `FNERR_INVALIDFILENAME` — the file name in `lpstrFile` is invalid.
+///
+/// Set when the native file dialog's pick exists but cannot be served: an
+/// Open pick whose host file does not exist (a raced/deleted pick — the open
+/// panel never offers nonexistent files) or a pick with no file name. The
+/// accept must fail like an invalid name rather than look like the user
+/// pressed Cancel (which a program like notepad treats as "abort the action,
+/// no error" — the silent no-op that made Save/Open appear broken). A
+/// well-formed out-of-bottle pick is no longer an error: it registers a
+/// pick-mount and returns TRUE.
+const FNERR_INVALIDFILENAME: u32 = 0x1003;
+
 /// Control ids inside the file dialog (must differ from `IDOK`/`IDCANCEL`,
 /// which the dialog-proc stub treats as close).
 const FILE_DLG_EDIT_ID: u64 = 1000;
@@ -1137,10 +1149,13 @@ fn open_host_file_dialog(
 ///   returns): take the pending record, write its pick back into the guest
 ///   `OPENFILENAME` buffer, and return the dialog result.
 ///
-/// The picked HOST path is confined to a guest volume at accept: a pick the
-/// guest filesystem cannot see (the user browsed outside the bottle via the
-/// panel's sidebar) cancels like a user pressing Cancel — FALSE, `lpstrFile`
-/// untouched, with a `tracing::warn`.
+/// The picked HOST path is served at accept. An in-bottle pick maps through
+/// the volumes (`C:\…` / `D:\…`). An out-of-bottle pick (the user browsed
+/// outside the bottle via the panel's sidebar) registers a pick-mount — the
+/// native dialog IS the user's explicit grant — and returns its guest path
+/// (`Z:\pick{N}\{name}`) so the guest can open/save the REAL host file in
+/// place. Only a genuinely invalid pick (an Open pick whose file no longer
+/// exists) cancels with `FNERR_INVALIDFILENAME`.
 fn open_host_file_dialog_via_bridge(
     ctx: &mut HandlerContext<'_>,
     api_name: &str,
@@ -1238,8 +1253,13 @@ fn open_host_file_dialog_via_bridge(
 ///
 /// Runs on the handler's re-entry (after the runtime ran the bridge WITHOUT
 /// the shared state lock). `None` pick = the user cancelled (or the bridge
-/// vanished mid-call — a racing teardown must not hang the guest); an
-/// out-of-bottle pick is refused like a cancel — FALSE, `lpstrFile` untouched.
+/// vanished mid-call — a racing teardown must not hang the guest). An
+/// out-of-bottle pick registers a pick-mount (see the `vfs::pick_mount`
+/// module) and returns its guest path with TRUE; a genuinely invalid pick
+/// (an Open pick whose host file does not exist) returns FALSE with
+/// `lpstrFile` untouched and sets `CommDlgExtendedError` to
+/// `FNERR_INVALIDFILENAME` so the failure is visible to the guest instead of
+/// an indistinguishable cancel.
 fn finish_native_file_dialog(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -1252,17 +1272,36 @@ fn finish_native_file_dialog(
         return file_dialog_return(engine, api_name, 0);
     };
 
-    // Confinement at accept: the picked HOST path must map into a guest volume
-    // (the C: bottle or the optional D: bridge). `host_path_to_guest` IS the
-    // confinement — it returns None for anything outside both volumes, so an
-    // out-of-bottle pick is refused like a cancel (FALSE, buffer untouched).
-    let Some(guest_path) = crate::vfs::host_path_to_guest(&state.file_io.volumes, &pick.host_path)
-    else {
-        state.window_state().comm_dlg_extended_error = CDERR_NONE;
+    // The consent boundary. An in-bottle pick maps through the volumes (the
+    // C: bottle or the optional D: bridge) as before. An OUT-of-bottle pick is
+    // the native panel's explicit grant to that one host file — register a
+    // pick-mount (`Z:\pick{N}\{name}`) so the guest's later CreateFileW on the
+    // returned guest path reads/writes the REAL host file in place (open in
+    // place, save in place, created where the user picked). Only a genuinely
+    // invalid pick stays a refusal: an Open pick whose host file does not
+    // exist (rfd's open panel only offers existing files, so a missing target
+    // is a raced/deleted pick) or a pick with no file name (a directory or
+    // volume root cannot key a file mount).
+    let guest_path = crate::vfs::host_path_to_guest(&state.file_io.volumes, &pick.host_path)
+        .or_else(|| {
+            let is_save = api_name.contains("Save");
+            (is_save || pick.host_path.is_file())
+                .then(|| crate::vfs::register_pick_mount(&pick.host_path))
+                .flatten()
+        });
+    let Some(guest_path) = guest_path else {
+        // NOT a plain cancel: the pick exists but cannot be served. Surface it
+        // as FNERR_INVALIDFILENAME (via CommDlgExtendedError) so a program
+        // that depends on the pick (notepad's Save/Open) reports a real
+        // failure instead of silently acting as if the user pressed Cancel.
+        state.window_state().comm_dlg_extended_error = FNERR_INVALIDFILENAME;
         tracing::warn!(
             api = api_name,
             host = %pick.host_path.display(),
-            "native file dialog pick outside the bottle; cancelling"
+            exists = pick.host_path.is_file(),
+            "native file dialog pick cannot be served: outside the bottle and \
+             not a mountable file (an Open pick must name an existing file) — \
+             refusing with FNERR_INVALIDFILENAME",
         );
         return file_dialog_return(engine, api_name, 0);
     };
@@ -2957,15 +2996,19 @@ fn window_handle_in_subtree(pairs: &[(Hwnd, Hwnd)], handle: Hwnd, root: Hwnd) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_default_extension, basename_of, complete_file_dialog, dialog_family_names,
-        directory_of, finalize_guest_path, handle_choose_font_w, handle_find_dialog_command,
-        handle_find_text_w, handle_get_open_file_name_w, handle_get_save_file_name_w,
-        handle_page_setup_dlg_w, handle_print_dlg_w, handle_replace_text_w,
-        is_absolute_windows_path, is_find_dialog_window, is_simple_filter_glob, list_directory,
-        parse_ofn_filter, resolve_initial_dir, split_path_components,
+        SelectedPathWrite, apply_default_extension, basename_of, complete_file_dialog,
+        dialog_family_names, directory_of, finalize_guest_path, handle_choose_font_w,
+        handle_find_dialog_command, handle_find_text_w, handle_get_open_file_name_w,
+        handle_get_save_file_name_w, handle_page_setup_dlg_w, handle_print_dlg_w,
+        handle_replace_text_w, is_absolute_windows_path, is_find_dialog_window,
+        is_simple_filter_glob, list_directory, parse_ofn_filter, resolve_initial_dir,
+        split_path_components, write_selected_path,
     };
     use crate::guest_heap::GuestHeap;
     use crate::handles::Hwnd;
+    use crate::kernel32::{
+        handle_close_handle, handle_create_file_w, handle_read_file, handle_write_file,
+    };
     use crate::present::MessageQueue;
     use crate::state::{
         FileDialogSession, FileIoState, HeapState, ProcessState, WinApiEnvironment,
@@ -3293,6 +3336,81 @@ mod tests {
             state.window_state().last_file_dialog_path.as_deref(),
             Some(r"C:\work\notes.txt")
         );
+    }
+
+    /// `write_selected_path` ANSI variant: the A API must write the path into
+    /// `lpstrFile`, the basename into `lpstrFileTitle`, and the
+    /// `nFileOffset`/`nFileExtension` offsets per the OPENFILENAME contract.
+    #[test]
+    fn write_selected_path_ansi_fills_offsets_and_title() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        let file_buf = 0x6000;
+        let title_buf = 0x7000;
+
+        write_selected_path(
+            &mut engine,
+            &SelectedPathWrite {
+                ofn_ptr: 0x5000,
+                file_buffer_ptr: file_buf,
+                max_file: 260,
+                file_title_ptr: title_buf,
+                max_file_title: 64,
+                path: r"C:\work\notes.txt",
+                unicode: false,
+            },
+        )
+        .expect("the ANSI write-back must succeed");
+
+        // ANSI bytes, NUL-terminated.
+        let mut raw = [0_u8; 64];
+        engine.mem_read(file_buf, &mut raw).ok();
+        let path_len = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
+        assert_eq!(&raw[..path_len], br"C:\work\notes.txt");
+        engine.mem_read(title_buf, &mut raw).ok();
+        let title_len = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
+        assert_eq!(&raw[..title_len], b"notes.txt");
+        // nFileOffset = basename start (8 for `C:\work\`), nFileExtension =
+        // the char after the dot (14).
+        let mut off = [0_u8; 2];
+        engine.mem_read(0x5000 + 100, &mut off).ok();
+        assert_eq!(u16::from_le_bytes(off), 8);
+        engine.mem_read(0x5000 + 102, &mut off).ok();
+        assert_eq!(u16::from_le_bytes(off), 14);
+        // No path state is recorded by the raw write-back (that is the
+        // caller's job).
+        assert!(state.window_state().last_file_dialog_path.is_none());
+    }
+
+    /// The extension offset for a dotless name points at the NUL terminator
+    /// (the position after the whole basename), per the OPENFILENAME docs.
+    #[test]
+    fn write_selected_path_dotless_name_extension_offset_is_end() {
+        let mut engine = test_engine();
+        let file_buf = 0x6000;
+
+        write_selected_path(
+            &mut engine,
+            &SelectedPathWrite {
+                ofn_ptr: 0x5000,
+                file_buffer_ptr: file_buf,
+                max_file: 260,
+                file_title_ptr: 0,
+                max_file_title: 0,
+                path: r"C:\dir\name",
+                unicode: true,
+            },
+        )
+        .expect("the dotless write-back must succeed");
+
+        assert_eq!(read_guest_utf16(&mut engine, file_buf, 64), r"C:\dir\name");
+        // `C:\dir\` is 7 chars (offset 7); the basename `name` has no dot, so
+        // nFileExtension = offset + basename length = 11 (the NUL position).
+        let mut off = [0_u8; 2];
+        engine.mem_read(0x5000 + 100, &mut off).ok();
+        assert_eq!(u16::from_le_bytes(off), 7);
+        engine.mem_read(0x5000 + 102, &mut off).ok();
+        assert_eq!(u16::from_le_bytes(off), 11);
     }
 
     #[test]
@@ -3787,10 +3905,16 @@ mod tests {
     }
 
     /// The picked host path lands OUTSIDE both guest volumes (the user
-    /// browsed away via the panel's sidebar): the confinement at accept must
-    /// refuse it like a cancel — FALSE, `lpstrFile` untouched.
+    /// browsed away via the panel's sidebar): the native dialog IS the
+    /// user's explicit grant, so the accept registers a pick-mount and
+    /// returns TRUE with the mounted guest path (`Z:\pick{N}\{name}`) in
+    /// `lpstrFile` — the guest can now open/save the REAL host file in place.
     #[test]
-    fn bridge_pick_outside_bottle_cancels_without_touching_buffer() {
+    fn bridge_pick_outside_bottle_registers_mount_and_returns_true() {
+        let _serial = crate::vfs::pick_mount::TEST_SERIAL
+            .lock()
+            .expect("pick-mount test lock poisoned");
+        crate::vfs::pick_mount::clear_pick_mounts();
         let mut engine = test_engine();
         let mut state = test_state();
         state.file_io.volumes = VolumeConfig {
@@ -3808,14 +3932,316 @@ mod tests {
         });
         let result = dispatch_open_with_bridge(&mut engine, &mut state, bridge)
             .expect("bridge accept must succeed");
-        assert_eq!(result.return_value, 0, "an out-of-bottle pick → FALSE");
+        assert_eq!(result.return_value, 1, "an out-of-bottle pick → TRUE");
+        let guest_path = read_guest_utf16(&mut engine, file_buf, 64);
+        assert!(
+            guest_path.starts_with(r"Z:\pick"),
+            "the pick registers a mounted guest path, got: {guest_path}"
+        );
+        assert!(guest_path.ends_with("\\passwd"));
+        // The mount binds the guest path to the EXACT picked host file.
+        assert_eq!(
+            crate::vfs::guest_path_to_host(&state.file_io.volumes, &guest_path).map(|map| map.host),
+            Some(PathBuf::from("/etc/passwd")),
+            "the guest path maps to the real picked host file"
+        );
+        assert_eq!(
+            state.window_state().last_file_dialog_path.as_deref(),
+            Some(guest_path.as_str())
+        );
+        assert!(
+            state.window_state().file_dialog.is_none(),
+            "the bridge path builds no in-app dialog session"
+        );
+    }
+
+    /// An Open pick whose host file does not exist is genuinely invalid (the
+    /// open panel never offers nonexistent files — a missing target is a
+    /// raced/deleted pick): it must stay a refusal — FALSE, `lpstrFile`
+    /// untouched — with `FNERR_INVALIDFILENAME` surfaced via
+    /// `CommDlgExtendedError` so the guest does not mistake it for a plain
+    /// cancel.
+    #[test]
+    fn bridge_open_pick_of_missing_file_stays_fnerr() {
+        let _serial = crate::vfs::pick_mount::TEST_SERIAL
+            .lock()
+            .expect("pick-mount test lock poisoned");
+        crate::vfs::pick_mount::clear_pick_mounts();
+        let mut engine = test_engine();
+        let mut state = test_state();
+        state.file_io.volumes = VolumeConfig {
+            bottle_root: Some(PathBuf::from("/tmp/bottle")),
+            drive_d_root: None,
+        };
+        let file_buf = 0x6000;
+        engine.mem_write(file_buf, &utf16_bytes("notes.txt")).ok();
+        write_ofn(&mut engine, 0x5000, file_buf, 260, 0);
+
+        let missing =
+            std::env::temp_dir().join(format!("wie-fnerr-missing-{}.txt", std::process::id()));
+        let _unused = std::fs::remove_file(&missing);
+        let bridge: FileDialogBridge = Box::new(move |_| {
+            Some(FileDialogPick {
+                host_path: missing.clone(),
+            })
+        });
+        let result = dispatch_open_with_bridge(&mut engine, &mut state, bridge)
+            .expect("bridge accept must succeed");
+        assert_eq!(result.return_value, 0, "a missing Open target → FALSE");
         assert_eq!(
             read_guest_utf16(&mut engine, file_buf, 64),
             "notes.txt",
             "lpstrFile stays untouched"
         );
         assert!(state.window_state().last_file_dialog_path.is_none());
-        assert_eq!(state.window_state().comm_dlg_extended_error, 0);
+        assert_eq!(
+            state.window_state().comm_dlg_extended_error,
+            super::FNERR_INVALIDFILENAME,
+            "an invalid pick must surface FNERR_INVALIDFILENAME, not a \
+             silent cancel"
+        );
+        // The invalid pick must NOT leave a mount behind.
+        assert_eq!(
+            crate::vfs::pick_mount::resolve_pick_mount(r"Z:\pick1\notes.txt"),
+            None,
+            "no mount may exist for the refused pick"
+        );
+    }
+
+    /// A SAVE pick of a host file that does not exist yet (the user typed a
+    /// new name in the save panel) is the create-case, not an error: the
+    /// accept registers a pick-mount and returns TRUE so the guest can create
+    /// the file where the user picked.
+    #[test]
+    fn bridge_save_pick_of_new_file_registers_mount_and_returns_true() {
+        let _serial = crate::vfs::pick_mount::TEST_SERIAL
+            .lock()
+            .expect("pick-mount test lock poisoned");
+        crate::vfs::pick_mount::clear_pick_mounts();
+        let mut engine = test_engine();
+        let mut state = test_state();
+        state.file_io.volumes = VolumeConfig {
+            bottle_root: Some(PathBuf::from("/tmp/bottle")),
+            drive_d_root: None,
+        };
+        let file_buf = 0x6000;
+        engine.mem_write(file_buf, &utf16_bytes("fresh.txt")).ok();
+        write_ofn(&mut engine, 0x5000, file_buf, 260, 0);
+
+        let picked_host =
+            std::env::temp_dir().join(format!("wie-save-create-{}.txt", std::process::id()));
+        let _unused = std::fs::remove_file(&picked_host);
+        let bridge_host = picked_host.clone();
+        let bridge: FileDialogBridge = Box::new(move |request| {
+            assert!(request.is_save, "GetSaveFileName is a save panel");
+            Some(FileDialogPick {
+                host_path: bridge_host.clone(),
+            })
+        });
+        state.window_state().file_dialog_policy = FileDialogPolicy::Interactive;
+        state.window_state().file_dialog_bridge = Some(bridge);
+        write_regs(&mut engine, 0x5000, 0, 0, 0);
+        let first = handle_get_save_file_name_w(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect_err("the first entry parks the guest for the native panel");
+        let signal = first
+            .downcast_ref::<WinApiControlSignal>()
+            .expect("a control signal");
+        let WinApiControlSignal::FileDialogBridgeRequested { request } = signal else {
+            panic!("expected a file-dialog bridge request");
+        };
+        let bridge = state
+            .window_state()
+            .file_dialog_bridge
+            .take()
+            .expect("bridge registered");
+        let picked = bridge(request);
+        state.window_state().file_dialog_bridge = Some(bridge);
+        state
+            .window_state()
+            .pending_native_file_dialog
+            .as_mut()
+            .expect("pending session recorded")
+            .pick = picked;
+        let result = handle_get_save_file_name_w(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("bridge save must succeed");
+        assert_eq!(result.return_value, 1, "a save pick of a new file → TRUE");
+        let guest_path = read_guest_utf16(&mut engine, file_buf, 64);
+        assert!(
+            guest_path.starts_with(r"Z:\pick"),
+            "the save pick registers a mounted guest path, got: {guest_path}"
+        );
+        assert_eq!(
+            crate::vfs::guest_path_to_host(&state.file_io.volumes, &guest_path).map(|map| map.host),
+            Some(picked_host.clone()),
+            "the guest path maps to the picked (not-yet-existing) host file"
+        );
+    }
+
+    // ── E2E through the file handlers ───────────────────────────────────────
+    //
+    // The dialog accept produces the guest path; the GUEST then reopens it
+    // with CreateFileW/WriteFile/ReadFile/CloseHandle. These drive the real
+    // handlers (the same entry points notepad hits) against a temp bottle.
+
+    /// Save-create end to end: the guest's `CreateFileW(CREATE_ALWAYS)` on a
+    /// mounted guest path must CREATE the real host file at the picked
+    /// location, and the bytes written through `WriteFile` must land on it.
+    #[test]
+    fn mounted_save_create_writes_the_real_host_file() {
+        let _serial = crate::vfs::pick_mount::TEST_SERIAL
+            .lock()
+            .expect("pick-mount test lock poisoned");
+        crate::vfs::pick_mount::clear_pick_mounts();
+        let mut engine = test_engine();
+        let mut state = test_state();
+        // The app runs in a bottle (the standing "filesystem ⇒ bottle"
+        // policy); the picked file itself lives OUTSIDE it, via the mount.
+        let bottle =
+            std::env::temp_dir().join(format!("wie-pickmount-bottle-{}", std::process::id()));
+        state.file_io.bottle_root = Some(bottle.clone());
+        state.file_io.volumes.bottle_root = Some(bottle);
+        let host =
+            std::env::temp_dir().join(format!("wie-pickmount-saved-{}.txt", std::process::id()));
+        let _unused = std::fs::remove_file(&host);
+
+        // The dialog-accept step: the pick registers the mount.
+        let guest_path =
+            crate::vfs::register_pick_mount(&host).expect("the pick mounts the new file");
+        let file_name_ptr = 0x6000;
+        engine
+            .mem_write(file_name_ptr, &utf16_bytes(&guest_path))
+            .ok();
+        // CreateFileW(file, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, ...).
+        write_regs(&mut engine, file_name_ptr, 0x4000_0000, 0, 0);
+        engine
+            .mem_write(STACK_TOP + 0x28, &2_u32.to_le_bytes())
+            .ok(); // CREATE_ALWAYS
+        let created = handle_create_file_w(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("CreateFileW on the mount must succeed");
+        let handle = created.return_value;
+        assert_ne!(
+            handle,
+            u64::MAX,
+            "a valid handle (not INVALID_HANDLE_VALUE)"
+        );
+
+        // WriteFile(handle, "saved through the mount", ...).
+        let payload = b"saved through the pick mount";
+        let data_ptr = 0x7000;
+        engine.mem_write(data_ptr, payload).ok();
+        write_regs(
+            &mut engine,
+            handle,
+            data_ptr,
+            u64::try_from(payload.len()).unwrap_or(0),
+            0x8000,
+        );
+        handle_write_file(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("WriteFile on the mount must succeed");
+
+        // CloseHandle — the guest's Save flow ends here.
+        write_regs(&mut engine, handle, 0, 0, 0);
+        handle_close_handle(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("CloseHandle must succeed");
+
+        let on_disk = std::fs::read(&host).expect("the real host file must exist");
+        assert_eq!(
+            on_disk, payload,
+            "the bytes land on the REAL host file at the picked location"
+        );
+        let _unused = std::fs::remove_file(&host);
+    }
+
+    /// Open end to end: a host file read through the mount — the guest's
+    /// `CreateFileW(OPEN_EXISTING)` + `ReadFile` on the mounted guest path
+    /// must return the real file's bytes.
+    #[test]
+    fn mounted_open_reads_the_real_host_file() {
+        let _serial = crate::vfs::pick_mount::TEST_SERIAL
+            .lock()
+            .expect("pick-mount test lock poisoned");
+        crate::vfs::pick_mount::clear_pick_mounts();
+        let mut engine = test_engine();
+        let mut state = test_state();
+        let bottle =
+            std::env::temp_dir().join(format!("wie-pickmount-bottle-{}", std::process::id()));
+        state.file_io.bottle_root = Some(bottle.clone());
+        state.file_io.volumes.bottle_root = Some(bottle);
+        let host =
+            std::env::temp_dir().join(format!("wie-pickmount-open-{}.txt", std::process::id()));
+        let original = b"hello from the host file";
+        std::fs::write(&host, original).expect("seed the host file");
+
+        let guest_path =
+            crate::vfs::register_pick_mount(&host).expect("the pick mounts the open file");
+        let file_name_ptr = 0x6000;
+        engine
+            .mem_write(file_name_ptr, &utf16_bytes(&guest_path))
+            .ok();
+        // CreateFileW(file, GENERIC_READ, 0, 0, OPEN_EXISTING, ...).
+        write_regs(&mut engine, file_name_ptr, 0x8000_0000, 0, 0);
+        engine
+            .mem_write(STACK_TOP + 0x28, &3_u32.to_le_bytes())
+            .ok(); // OPEN_EXISTING
+        let opened = handle_create_file_w(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("CreateFileW on the mount must succeed");
+        let handle = opened.return_value;
+        assert_ne!(
+            handle,
+            u64::MAX,
+            "a valid handle (not INVALID_HANDLE_VALUE)"
+        );
+
+        // ReadFile(handle, buf, 64, &bytesRead).
+        let read_ptr = 0x7000;
+        write_regs(&mut engine, handle, read_ptr, 64, 0x8000);
+        handle_read_file(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("ReadFile on the mount must succeed");
+        let mut read_back = vec![0_u8; original.len()];
+        engine
+            .mem_read(read_ptr, &mut read_back)
+            .expect("read the guest buffer back");
+        assert_eq!(
+            read_back, original,
+            "the guest reads the REAL host file through the mount"
+        );
+
+        write_regs(&mut engine, handle, 0, 0, 0);
+        handle_close_handle(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("CloseHandle must succeed");
+        let _unused = std::fs::remove_file(&host);
     }
 
     /// The bridge returning `None` is the user pressing Cancel in the native

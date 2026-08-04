@@ -2229,3 +2229,203 @@ fn notepad_font_dialog_ok_click_then_first_exit_exits() {
          notepad exit — a swallowed first command means a ghost modal state"
     );
 }
+
+/// Count non-COLOR_WINDOW (non-white) pixels in the top band of the owner's
+/// published frame — the region where the multiline EDIT's first text line
+/// renders (RNotepad moves the EDIT to (0,0) and it fills the client, so the
+/// text starts near the top-left; the status bar is at the bottom).
+///
+/// The band starts at x=8 to skip the EDIT's left border/margin and the caret
+/// bar (which sits at the text origin, x≈2..5), so a cleared edit reads ~0
+/// even when the caret is drawn.
+fn count_edit_ink(session: &wie_runtime::RuntimeSession, owner: u64) -> u32 {
+    let Some(frame) = session.take_frame(owner) else {
+        return 0;
+    };
+    let mut ink = 0_u32;
+    for y in 2..40_u32 {
+        for x in 8..400_u32 {
+            if x < frame.width && y < frame.height {
+                let idx = usize::try_from(y).unwrap_or(0) * frame.width as usize
+                    + usize::try_from(x).unwrap_or(0);
+                if frame.pixels.get(idx).copied() != Some(0x00FF_FFFF) {
+                    ink += 1;
+                }
+            }
+        }
+    }
+    ink
+}
+
+/// The New-flow continuation, end to end: type into the EDIT (dirty doc),
+/// post File→New (CMD_NEW=256), answer the save prompt with "Don't Save"
+/// (IDNO — the discard path), and assert the EDIT is CLEARED and the repaint
+/// reflects it (the text ink disappears from the owner's published frame).
+///
+/// This is the exp-4 coverage gap: the MessageBox bridge's IDYES/IDNO
+/// resolution is unit-tested in isolation, but the FULL guest continuation
+/// (WM_COMMAND 256 → the save prompt → the guest clears the EDIT via
+/// `SetWindowText(hEdit, NULL)`) was untested. RNotepad's `DIALOG_FileNew`
+/// (dialog.c) clears with `SetWindowText(Globals.hEdit, NULL)` — a NULL text
+/// pointer that the host handler must treat as "clear the text".
+#[test]
+fn notepad_file_new_discard_clears_the_edit() {
+    let Some(path) = real_exe("notepad.exe") else {
+        eprintln!("skip: real_exes/notepad.exe not present");
+        return;
+    };
+    let _suite = gui_suite_serialize();
+    use wie_runtime::EntryTraceTermination;
+
+    const WM_COMMAND: u32 = 0x0111;
+    const WM_CHAR: u32 = 0x0102;
+    const CMD_NEW: u32 = 256;
+
+    let mut session =
+        wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
+            .expect("notepad session starts");
+    let handle = session.guest_handle();
+    // IDNO = "Don't Save" → discard the changes → FileNew clears the edit.
+    let prompt_fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let prompt = std::sync::Arc::clone(&prompt_fired);
+    handle.set_message_box_bridge(Box::new(move |_, _, _| {
+        prompt.store(true, std::sync::atomic::Ordering::SeqCst);
+        7 // IDNO — discard
+    }));
+    pump_until_windows_ready(&mut session);
+
+    let main = session.first_guest_window_handle().unwrap_or(0);
+    let edit = session
+        .guest_windows_snapshot()
+        .iter()
+        .find(|(_, cls, ..)| cls == "EDIT")
+        .map(|(h, ..)| *h)
+        .unwrap_or(main);
+
+    // Type enough text that the first line spans well past the caret band.
+    for c in "hello world from wie".chars() {
+        handle.post_message(edit, WM_CHAR, u64::from(c as u32), 0);
+    }
+    // Drain so the text is inserted and its repaint is published.
+    for _ in 0..30 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    let ink_before = count_edit_ink(&session, main);
+    assert!(
+        ink_before > 40,
+        "typed text must render ink in the edit band before FileNew (got {ink_before} px)"
+    );
+
+    // FileNew on the dirty doc → the save prompt fires → IDNO → the edit is
+    // cleared and repainted.
+    handle.post_message(main, WM_COMMAND, u64::from(CMD_NEW), 0);
+    let mut ink_after = ink_before;
+    for _ in 0..60 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        ink_after = count_edit_ink(&session, main);
+        if ink_after < 10 {
+            break;
+        }
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    assert!(
+        prompt_fired.load(std::sync::atomic::Ordering::SeqCst),
+        "FileNew on a dirty doc must fire the save prompt (the bridge)"
+    );
+    assert!(
+        ink_after < 10,
+        "FileNew + Don't Save must clear the EDIT and repaint it: ink went \
+         {ink_before} → {ink_after} px (expected ~0 after the clear)"
+    );
+}
+
+/// The New-flow's "Yes" branch: FileNew on a dirty doc answered with IDYES
+/// ("Save") must route into the Save As dialog (`GetSaveFileNameW`), NOT
+/// clear the edit directly.
+///
+/// This pins the live "New → confirm → no clear" report: RNotepad's
+/// `DoCloseFile` (dialog.c) treats IDYES as "save first" — `DIALOG_FileSave`
+/// → `DIALOG_FileSaveAs` → `GetSaveFileNameW`. If that save is refused (an
+/// out-of-bottle pick now surfaces `FNERR_INVALIDFILENAME` instead of a silent
+/// cancel), `DoCloseFile` returns FALSE and FileNew aborts — the edit is
+/// correctly NOT cleared. So the user-visible "no clear" is the SAVE path
+/// failing, not the clear machinery.
+#[test]
+fn notepad_file_new_yes_save_prompt_routes_to_save_dialog() {
+    let Some(path) = real_exe("notepad.exe") else {
+        eprintln!("skip: real_exes/notepad.exe not present");
+        return;
+    };
+    let _suite = gui_suite_serialize();
+    use wie_runtime::EntryTraceTermination;
+
+    const WM_COMMAND: u32 = 0x0111;
+    const WM_CHAR: u32 = 0x0102;
+    const CMD_NEW: u32 = 256;
+
+    let mut session =
+        wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
+            .expect("notepad session starts");
+    session.set_file_dialog_policy(wie_winapi::FileDialogPolicy::Interactive);
+    let handle = session.guest_handle();
+    // IDYES = "Save" → FileNew routes into the Save As dialog.
+    let prompt_fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let prompt = std::sync::Arc::clone(&prompt_fired);
+    handle.set_message_box_bridge(Box::new(move |_, _, _| {
+        prompt.store(true, std::sync::atomic::Ordering::SeqCst);
+        6 // IDYES — save
+    }));
+    pump_until_windows_ready(&mut session);
+
+    let main = session.first_guest_window_handle().unwrap_or(0);
+    let edit = session
+        .guest_windows_snapshot()
+        .iter()
+        .find(|(_, cls, ..)| cls == "EDIT")
+        .map(|(h, ..)| *h)
+        .unwrap_or(main);
+    for c in "hello".chars() {
+        handle.post_message(edit, WM_CHAR, u64::from(c as u32), 0);
+    }
+    for _ in 0..30 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    handle.post_message(main, WM_COMMAND, u64::from(CMD_NEW), 0);
+    let opened = wait_for_window_class(&mut session, &handle, "FileDialog");
+    // Dismiss the dialog (IDCANCEL) so the session can wind down.
+    if let Some(dialog) = session
+        .guest_windows_snapshot()
+        .iter()
+        .find(|(_, cls, ..)| cls == "FileDialog")
+        .map(|(hwnd, ..)| *hwnd)
+    {
+        handle.post_message(dialog, WM_COMMAND, 2, 0); // IDCANCEL
+        for _ in 0..50 {
+            let _ = session.run_until_stop(1_000_000).expect("run");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    assert!(
+        prompt_fired.load(std::sync::atomic::Ordering::SeqCst),
+        "FileNew on a dirty doc must fire the save prompt (the bridge)"
+    );
+    assert!(
+        opened,
+        "FileNew answered 'Yes' must route into the Save As dialog \
+         (GetSaveFileNameW) — the 'New → confirm → no clear' report is the \
+         save path failing (an out-of-bottle pick now surfaces \
+         FNERR_INVALIDFILENAME), not the clear machinery"
+    );
+}

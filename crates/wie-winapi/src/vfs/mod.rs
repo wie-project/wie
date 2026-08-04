@@ -7,6 +7,7 @@
 pub mod backend;
 pub mod encoding;
 pub mod path;
+pub mod pick_mount;
 pub mod volume;
 
 pub use backend::{
@@ -26,6 +27,7 @@ pub use path::{
     paths_equal_ci, resolve_full_windows_path, split_find_pattern, strip_extended_prefix,
     wildcard_match,
 };
+pub(crate) use pick_mount::register_pick_mount;
 pub use volume::{
     BOTTLE_SKELETON_DIRS, BottleMissingError, DRIVE_FIXED, DRIVE_NO_ROOT_DIR, GUEST_SYSTEM_DIR,
     GUEST_TEMP_PATH, GUEST_WINDOWS_DIR, HostMap, VolumeConfig, bottle_missing_enforced,

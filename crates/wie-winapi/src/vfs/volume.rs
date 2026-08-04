@@ -190,6 +190,19 @@ pub fn guest_path_to_host(volumes: &VolumeConfig, guest_path: &str) -> Option<Ho
     // Work on separator-normalized form *without* collapsing `..` so escape
     // probes like `C:\App\..\..\etc\passwd` are rejected (legacy bottle rule).
     let sep_norm = normalize_windows_path_separators(trimmed);
+
+    // Consent-first: a pick-mount (registered by a native file-dialog accept
+    // — see the `pick_mount` module) binds the exact guest path to its
+    // consented host file, taking precedence over the volume roots. The
+    // symlink re-verify below is deliberately skipped: the mounted target IS
+    // the consent — living outside the bottle is the point of the mount.
+    if let Some(host) = super::pick_mount::resolve_pick_mount(&sep_norm) {
+        return Some(HostMap {
+            host,
+            drive: super::pick_mount::PICK_DRIVE,
+        });
+    }
+
     let drive = drive_letter(&sep_norm)?;
     let relative = relative_after_drive(&sep_norm, drive)?;
 
