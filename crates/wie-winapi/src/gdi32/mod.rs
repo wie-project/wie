@@ -5,11 +5,13 @@
 mod blit;
 mod font_system;
 mod pixel;
+mod print;
 mod state;
 mod text;
 
 // Re-export every public handler function from the submodules.
 pub use blit::*;
 pub use font_system::*;
+pub use print::*;
 pub use state::*;
 pub use text::*;

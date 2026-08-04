@@ -9,16 +9,16 @@ use super::listbox::paint_item_lines;
 use super::listbox::render_control_text;
 use super::r#static::paint_label;
 use super::{
-    control_items, control_sel_index, control_state, ControlClassKind, ControlState, Dimension,
-    PaintCtx, PaintFont, TextGeom, COLOR_BTNFACE, COLOR_BTNFACE_PRESSED, COLOR_BTNHIGHLIGHT,
-    COLOR_BTNSHADOW, COLOR_WINDOW,
+    COLOR_BTNFACE, COLOR_BTNFACE_PRESSED, COLOR_BTNHIGHLIGHT, COLOR_BTNSHADOW, COLOR_WINDOW,
+    ControlClassKind, ControlState, Dimension, LabelInvalidRect, LabelInvalidation, PaintCtx,
+    PaintFont, TextGeom, control_items, control_sel_index, control_state, control_state_mut,
 };
 use crate::gdi32::fill_rect_surface;
 use crate::gdi32::resolve_window_ancestor;
 use crate::gdi32::{FontEngine, FontKey, ResolvedFont};
 use crate::gdi32::{IRect, ResolvedWindow};
 use crate::state::WindowFlags;
-use crate::user32::{find_window, WinApiState};
+use crate::user32::{WinApiState, find_window};
 
 /// Paint a control into its ancestor's surface at its parent-relative offset.
 pub(super) fn paint_control(
@@ -88,7 +88,46 @@ pub(super) fn paint_control(
         };
         match kind {
             ControlClassKind::Button => {
-                paint_face_and_border(state, &info, size, pressed);
+                // The repaint scope: the pending face/caption rect, or the
+                // whole client — a clean scope, a structural change, a stale
+                // rect whose size no longer matches, or the first paint. The
+                // erase covers exactly the scope, so the published frame's
+                // region is the true changed area (the B3 dirty-region
+                // machinery the EDIT's row band feeds).
+                let dirty = label_dirty_rect(state, hwnd, size);
+                if dirty == IRect::from_xywh(0, 0, size.width, size.height) {
+                    // Full repaint: face + border + caption (the pre-scope
+                    // path, byte-identical).
+                    paint_face_and_border(state, &info, size, pressed);
+                } else {
+                    // Partial repaint: erase only the dirty rect with the
+                    // current face color. The border is redrawn only when the
+                    // dirty rect covers a border pixel (the erase overpaints
+                    // it otherwise); it is unchanged by press/text scopes.
+                    let face = if pressed {
+                        COLOR_BTNFACE_PRESSED
+                    } else {
+                        COLOR_BTNFACE
+                    };
+                    fill_rect_surface(
+                        state,
+                        info.hwnd,
+                        info.width,
+                        info.height,
+                        info.offset_x.saturating_add(dirty.left),
+                        info.offset_y.saturating_add(dirty.top),
+                        dirty.width(),
+                        dirty.height(),
+                        face,
+                    );
+                    if rect_touches_border(dirty, size) {
+                        stroke_border(state, &info, size, COLOR_BTNSHADOW);
+                    }
+                }
+                // The caption is always redrawn: the dirty rect is the union
+                // of the old and new caption rects (or the face), so the new
+                // glyphs land inside the erased area and the previous glyphs
+                // are gone.
                 // The ampersand is a mnemonic marker, not caption glyph.
                 let caption = strip_mnemonics(&text);
                 let tx =
@@ -109,20 +148,24 @@ pub(super) fn paint_control(
                         key,
                     },
                 )?;
+                label_consume_invalidation(state, hwnd);
             }
             ControlClassKind::Static => {
                 // COLOR_BTNFACE, not COLOR_WINDOW: a label sits on the dialog
                 // face and must not show as a white box (full WM_CTLCOLOR* is
-                // deferred).
+                // deferred). The erase covers only the pending caption rect
+                // (or the whole client for a full repaint), so the region
+                // reports the true changed area.
+                let dirty = label_dirty_rect(state, hwnd, size);
                 fill_rect_surface(
                     state,
                     info.hwnd,
                     info.width,
                     info.height,
-                    info.offset_x,
-                    info.offset_y,
-                    size.width,
-                    size.height,
+                    info.offset_x.saturating_add(dirty.left),
+                    info.offset_y.saturating_add(dirty.top),
+                    dirty.width(),
+                    dirty.height(),
                     COLOR_BTNFACE,
                 );
                 let caption = strip_mnemonics(&text);
@@ -143,6 +186,7 @@ pub(super) fn paint_control(
                         key,
                     },
                 )?;
+                label_consume_invalidation(state, hwnd);
             }
             ControlClassKind::Edit => {
                 // Erase only the dirty rows — the pending invalid row band,
@@ -452,11 +496,7 @@ fn paint_status_bar_parts(
             size.width
         } else {
             let value = part_rights.get(index).copied().unwrap_or(size.width);
-            if value < 0 {
-                size.width
-            } else {
-                value
-            }
+            if value < 0 { size.width } else { value }
         };
         let cell_left = left;
         left = right;
@@ -610,6 +650,253 @@ fn centered_text_x(
         .saturating_add(width.saturating_sub(text_w).saturating_div(2))
 }
 
+// ── Rect-level invalidation (the label-control optimization lane) ────────
+//
+// The BUTTON/STATIC repaint scopes mirror the EDIT's row bands at rect
+// granularity: the mutating ops mark the sub-rect they changed (a pressed
+// state change marks the face, a caption change the caption rect), and
+// `paint_control` erases exactly that rect — the erase fill is what feeds
+// the B3 dirty-region accumulator, so the published frame's `region`
+// reports the true changed area instead of the full control rect. The first
+// paint (and every structural change — a font change, a resize) stays full:
+// the surface behind a never-painted control is undefined, so a partial
+// repaint would leave holes.
+
+/// The client-relative rect a BUTTON/STATIC must erase and repaint on its
+/// next paint: the pending invalidation rect (when still valid against the
+/// CURRENT size), or the WHOLE client — a clean/full scope, a stale rect
+/// whose size stamp no longer matches (a resize reflowed the layout), or
+/// the first paint of a never-painted control. `paint_control` erases
+/// exactly the returned rect. Mirrors `edit_dirty_band` for the label
+/// controls.
+fn label_dirty_rect(state: &WinApiState, hwnd: u64, size: Dimension) -> IRect {
+    let pending = match control_state(state, hwnd) {
+        Some(ControlState::Button { invalidation, .. }) => Some(*invalidation),
+        Some(ControlState::Static { invalidation }) => Some(*invalidation),
+        _ => None,
+    };
+    match pending {
+        Some(LabelInvalidation::Rect(rect))
+            if rect.width == size.width && rect.height == size.height =>
+        {
+            rect.rect
+        }
+        _ => IRect::from_xywh(0, 0, size.width, size.height),
+    }
+}
+
+/// Union `rect` (client-relative, computed against `width`×`height`) into a
+/// label control's pending invalidation. A pending full repaint stays full
+/// (sticky — a structural change can never be narrowed by a later partial
+/// mark); a pending rect computed at a different size is stale (the layout
+/// reflowed) and escalates to full; two rects at the same size union.
+fn union_label_invalid(
+    current: LabelInvalidation,
+    rect: IRect,
+    width: i32,
+    height: i32,
+) -> LabelInvalidation {
+    match current {
+        LabelInvalidation::Full => LabelInvalidation::Full,
+        LabelInvalidation::Rect(pending) if pending.width != width || pending.height != height => {
+            LabelInvalidation::Full
+        }
+        LabelInvalidation::Rect(pending) => LabelInvalidation::Rect(LabelInvalidRect {
+            rect: union_rect(pending.rect, rect),
+            width,
+            height,
+        }),
+        LabelInvalidation::Clean => LabelInvalidation::Rect(LabelInvalidRect {
+            rect,
+            width,
+            height,
+        }),
+    }
+}
+
+/// The smallest axis-aligned rect covering both inputs.
+fn union_rect(a: IRect, b: IRect) -> IRect {
+    IRect {
+        left: a.left.min(b.left),
+        top: a.top.min(b.top),
+        right: a.right.max(b.right),
+        bottom: a.bottom.max(b.bottom),
+    }
+}
+
+/// The overlap of two rects (empty when they do not overlap).
+fn intersect_rect(a: IRect, b: IRect) -> IRect {
+    IRect {
+        left: a.left.max(b.left),
+        top: a.top.max(b.top),
+        right: a.right.min(b.right),
+        bottom: a.bottom.min(b.bottom),
+    }
+}
+
+/// Whether `rect` (client-relative) covers any pixel of a control's 1 px
+/// border — the erase filled it with the face color, so the border must be
+/// re-stroked.
+fn rect_touches_border(rect: IRect, size: Dimension) -> bool {
+    rect.left <= 0 || rect.top <= 0 || rect.right >= size.width || rect.bottom >= size.height
+}
+
+/// Mark `rect` (client-relative) as dirty on a BUTTON/STATIC control for the
+/// next paint, unioning with any pending scope, and mark the window
+/// invalidated. No-op for other kinds and for a degenerate (empty) rect — a
+/// control with nothing visible to repaint falls back to the window's own
+/// full invalidation.
+pub(super) fn label_invalidate_rect(state: &mut WinApiState, hwnd: u64, rect: IRect) {
+    let kind = find_window(state, hwnd).and_then(|w| w.control_kind);
+    if !matches!(
+        kind,
+        Some(ControlClassKind::Button | ControlClassKind::Static)
+    ) {
+        return;
+    }
+    if rect.right <= rect.left || rect.bottom <= rect.top {
+        return;
+    }
+    let (width, height) = find_window(state, hwnd).map_or((0, 0), |w| (w.width, w.height));
+    {
+        let control = control_state_mut(state, hwnd);
+        match control {
+            ControlState::Button { invalidation, .. } | ControlState::Static { invalidation } => {
+                *invalidation = union_label_invalid(*invalidation, rect, width, height);
+            }
+            _ => {}
+        }
+    }
+    super::invalidate(state, hwnd);
+}
+
+/// Reset a label control's pending invalidation to [`LabelInvalidation::Full`]
+/// WITHOUT marking the window — callers that already invalidate (or must not,
+/// e.g. a `redraw = 0` `WM_SETFONT`) control the window flag themselves.
+/// Non-seeding: a control with no state yet is untouched.
+pub(super) fn label_reset_invalid_full(state: &mut WinApiState, hwnd: u64) {
+    if let Some(ControlState::Button { invalidation, .. } | ControlState::Static { invalidation }) =
+        state
+            .window_state()
+            .control_states
+            .get_mut(&crate::handles::Hwnd::from(hwnd))
+    {
+        *invalidation = LabelInvalidation::Full;
+    }
+}
+
+/// BUTTON pressed-state change (press/release, Space, BM_SETSTATE): the
+/// whole face — the interior inside the 1 px border — repaints with the
+/// pressed (or released) face color and the caption shifts one px. The
+/// border color does not change, so the interior is the true painted region;
+/// the caption shift stays inside it for any control taller than one text
+/// line (a shorter control renders clipped anyway).
+pub(super) fn button_invalidate_pressed(state: &mut WinApiState, hwnd: u64) {
+    let (width, height) = find_window(state, hwnd).map_or((0, 0), |w| (w.width, w.height));
+    let interior = IRect::from_xywh(
+        1,
+        1,
+        width.saturating_sub(2).max(0),
+        height.saturating_sub(2).max(0),
+    );
+    label_invalidate_rect(state, hwnd, interior);
+}
+
+/// Mark the caption rect a WM_SETTEXT change dirties: the union of the OLD
+/// caption's rect and the NEW caption's rect (client-relative), so the next
+/// paint erases the previous glyphs too. Resolves the stored control font
+/// exactly like the paint path (centered for a BUTTON, padded-left for a
+/// STATIC, vertically centered for both); falls back to a full repaint when
+/// the font cannot be resolved. The rect is clamped to the control — a
+/// caption wider than the control clips at it, matching the paint.
+///
+/// `pub(crate)` (not `pub(super)` like the other helpers): the SetWindowText
+/// handlers in `user32::window` call it outside the control dispatch.
+pub(crate) fn label_invalidate_text_change(
+    state: &mut WinApiState,
+    hwnd: u64,
+    old_text: &str,
+    new_text: &str,
+) {
+    let kind = find_window(state, hwnd).and_then(|w| w.control_kind);
+    if !matches!(
+        kind,
+        Some(ControlClassKind::Button | ControlClassKind::Static)
+    ) {
+        return;
+    }
+    let (width, height, button) = find_window(state, hwnd).map_or((0, 0, false), |w| {
+        (
+            w.width,
+            w.height,
+            w.control_kind == Some(ControlClassKind::Button),
+        )
+    });
+    // The font engine is taken out of gdi state so the caption measurement
+    // can run next to `state` (the established pattern); it is put back
+    // unconditionally. Safe under the single shared WinApiState mutex — the
+    // take and the put cannot interleave with another handler's.
+    let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
+    let default_key = FontKey::default();
+    let key_and_resolved = match crate::gdi32::window_font_resolution(state, hwnd, &mut font_engine)
+    {
+        Some(key_and_resolved) => Some(key_and_resolved),
+        None => font_engine
+            .resolve(&default_key, 16)
+            .map(|resolved| (default_key, resolved)),
+    };
+    let rect = match &key_and_resolved {
+        Some((key, resolved)) => {
+            let line_h = resolved.line_height();
+            // The vertically centered caption band — the same `paint_label`
+            // geometry, client-relative.
+            let top = height.saturating_sub(line_h).saturating_div(2).max(0);
+            let mut rect_of = |caption: &str| {
+                let text_w =
+                    font_engine.text_advance(resolved, key, caption, caption.chars().count());
+                let left = if button {
+                    width.saturating_sub(text_w).saturating_div(2).max(0)
+                } else {
+                    2
+                };
+                IRect::from_xywh(left, top, text_w, line_h)
+            };
+            let union = union_rect(
+                rect_of(&strip_mnemonics(old_text)),
+                rect_of(&strip_mnemonics(new_text)),
+            );
+            // A pressed button shifts its caption one px down/right; pad so
+            // the erase covers both the shifted and unshifted ink.
+            let pad = if button { 1 } else { 0 };
+            IRect {
+                left: union.left.saturating_sub(pad),
+                top: union.top.saturating_sub(pad),
+                right: union.right.saturating_add(pad),
+                bottom: union.bottom.saturating_add(pad),
+            }
+        }
+        None => IRect::from_xywh(0, 0, width, height),
+    };
+    state.gdi_state().font_engine = font_engine;
+    // Clamp to the control: a caption wider than the control clips at it
+    // (the paint's own clip), so the region must not exceed the control.
+    let rect = intersect_rect(rect, IRect::from_xywh(0, 0, width, height));
+    label_invalidate_rect(state, hwnd, rect);
+}
+
+/// Consume a BUTTON/STATIC paint: the invalidation scope was applied (the
+/// erase covered it), so the next paint starts clean. The window's own
+/// `invalidated` flag still drives the next cycle.
+fn label_consume_invalidation(state: &mut WinApiState, hwnd: u64) {
+    let control = control_state_mut(state, hwnd);
+    match control {
+        ControlState::Button { invalidation, .. } | ControlState::Static { invalidation } => {
+            *invalidation = LabelInvalidation::Clean;
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::strip_mnemonics;
@@ -632,5 +919,105 @@ mod tests {
     #[test]
     fn strip_mnemonics_empty() {
         assert_eq!(strip_mnemonics(""), "");
+    }
+
+    // ── Rect-level invalidation (the label-control optimization lane) ──────
+
+    use super::{union_label_invalid, union_rect};
+    use crate::gdi32::IRect;
+    use crate::user32::controls::{LabelInvalidRect, LabelInvalidation};
+
+    /// Two partial marks before one paint union into one rect — the same
+    /// region-accumulation semantics the present dirty accumulator applies.
+    #[test]
+    fn two_marks_union_into_one_pending_rect() {
+        let first = IRect {
+            left: 4,
+            top: 6,
+            right: 20,
+            bottom: 18,
+        };
+        let second = IRect {
+            left: 30,
+            top: 10,
+            right: 50,
+            bottom: 22,
+        };
+        let pending = union_label_invalid(LabelInvalidation::Clean, first, 100, 40);
+        let pending = union_label_invalid(pending, second, 100, 40);
+        assert_eq!(
+            pending,
+            LabelInvalidation::Rect(LabelInvalidRect {
+                rect: IRect {
+                    left: 4,
+                    top: 6,
+                    right: 50,
+                    bottom: 22,
+                },
+                width: 100,
+                height: 40,
+            }),
+            "the pending scope is the union of both marks"
+        );
+    }
+
+    /// A pending full repaint is sticky: a later partial mark must not narrow
+    /// it (the first paint / a structural change covers everything).
+    #[test]
+    fn full_is_sticky_against_later_partial_marks() {
+        let rect = IRect {
+            left: 1,
+            top: 1,
+            right: 9,
+            bottom: 9,
+        };
+        let pending = union_label_invalid(LabelInvalidation::Full, rect, 100, 40);
+        assert_eq!(pending, LabelInvalidation::Full);
+    }
+
+    /// A pending rect computed at a different control size is stale — the
+    /// layout reflowed underneath it — and escalates to a full repaint.
+    #[test]
+    fn size_stale_rect_escalates_to_full() {
+        let rect = IRect {
+            left: 1,
+            top: 1,
+            right: 9,
+            bottom: 9,
+        };
+        let pending = union_label_invalid(LabelInvalidation::Clean, rect, 100, 40);
+        let pending = union_label_invalid(pending, rect, 120, 60);
+        assert_eq!(
+            pending,
+            LabelInvalidation::Full,
+            "a mark at a new size must not trust the old stamp"
+        );
+    }
+
+    /// The union helper covers both input rects exactly (axis-aligned
+    /// min/max), including a rect that extends past the other.
+    #[test]
+    fn union_rect_covers_both_inputs() {
+        let a = IRect {
+            left: 10,
+            top: 20,
+            right: 30,
+            bottom: 40,
+        };
+        let b = IRect {
+            left: 25,
+            top: 35,
+            right: 60,
+            bottom: 50,
+        };
+        assert_eq!(
+            union_rect(a, b),
+            IRect {
+                left: 10,
+                top: 20,
+                right: 60,
+                bottom: 50,
+            }
+        );
     }
 }

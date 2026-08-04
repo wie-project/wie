@@ -12,17 +12,17 @@
 use anyhow::Result;
 
 use super::{
-    find_window, find_window_mut, high_word, low_i32, low_word, make_command_wparam,
-    read_guest_ansi_lossy, read_guest_utf16_lossy, write_guest_u32, CommandPayload,
-    GuestCallbackRequest, WinApiControlSignal, WinApiState, WinMsg, WindowClassIdentifier,
-    BN_CLICKED, BST_FOCUS, BST_PUSHED, BS_DEFPUSHBUTTON, DLGC_BUTTON, DLGC_DEFPUSHBUTTON,
-    DLGC_UNDEFPUSHBUTTON, DLGC_WANTCHARS, EN_HSCROLL, EN_VSCROLL, VK_DELETE, VK_DOWN, VK_END,
-    VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SPACE, VK_UP, WM_COMMAND,
+    BN_CLICKED, BS_DEFPUSHBUTTON, BST_FOCUS, BST_PUSHED, CommandPayload, DLGC_BUTTON,
+    DLGC_DEFPUSHBUTTON, DLGC_UNDEFPUSHBUTTON, DLGC_WANTCHARS, EN_HSCROLL, EN_VSCROLL,
+    GuestCallbackRequest, VK_DELETE, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR,
+    VK_RIGHT, VK_SPACE, VK_UP, WM_COMMAND, WinApiControlSignal, WinApiState, WinMsg,
+    WindowClassIdentifier, find_window, find_window_mut, high_word, low_i32, low_word,
+    make_command_wparam, read_guest_ansi_lossy, read_guest_utf16_lossy, write_guest_u32,
 };
-use crate::gdi32::resolve_window_ancestor;
-use crate::gdi32::{FontEngine, FontKey, ResolvedFont};
-use crate::state::WindowFlags;
 use crate::OuterReturn;
+use crate::gdi32::resolve_window_ancestor;
+use crate::gdi32::{FontEngine, FontKey, IRect, ResolvedFont};
+use crate::state::WindowFlags;
 
 mod button;
 mod edit;
@@ -78,21 +78,24 @@ pub(crate) struct HitTestLayout {
     pub alignment: u32,
 }
 
-use button::paint_control;
+use button::{button_invalidate_pressed, label_reset_invalid_full, paint_control};
+// The text-change invalidation is also called from the SetWindowText handlers
+// in `user32::window` (they write control text outside the control dispatch).
+pub(crate) use button::label_invalidate_text_change;
 /// `UndoSnapshot` is the type of the public `ControlState::Edit::undo_snapshot`
 /// field, so it must be reachable at the same visibility as the enum.
 pub use edit::UndoSnapshot;
 use edit::{
-    ctrl_is_down, edit_can_undo, edit_caret_tick, edit_char, edit_clear, edit_copy, edit_cut,
-    edit_delete_at_caret, edit_empty_undo_buffer, edit_first_visible_line, edit_focus_gained,
-    edit_focus_lost, edit_get_handle, edit_get_limit, edit_get_line, edit_get_modify,
-    edit_get_selection, edit_invalidate_caret, edit_invalidate_text_buffer, edit_line_count,
-    edit_line_from_char, edit_line_index, edit_line_length, edit_mouse_dblclk, edit_mouse_down,
-    edit_mouse_move, edit_mouse_up, edit_mouse_wheel, edit_move_caret, edit_notify_change,
-    edit_notify_scroll, edit_paste, edit_pos_from_char, edit_replace_selection,
+    CARET_TIMER_ID, ctrl_is_down, edit_can_undo, edit_caret_tick, edit_char, edit_clear, edit_copy,
+    edit_cut, edit_delete_at_caret, edit_empty_undo_buffer, edit_first_visible_line,
+    edit_focus_gained, edit_focus_lost, edit_get_handle, edit_get_limit, edit_get_line,
+    edit_get_modify, edit_get_selection, edit_invalidate_caret, edit_invalidate_text_buffer,
+    edit_line_count, edit_line_from_char, edit_line_index, edit_line_length, edit_mouse_dblclk,
+    edit_mouse_down, edit_mouse_move, edit_mouse_up, edit_mouse_wheel, edit_move_caret,
+    edit_notify_change, edit_notify_scroll, edit_paste, edit_pos_from_char, edit_replace_selection,
     edit_reset_invalid_rows, edit_scroll_caret, edit_scroll_horizontal, edit_scroll_vertical,
     edit_selection_type, edit_set_handle, edit_set_limit, edit_set_modify, edit_set_selection,
-    edit_set_tab_stops, edit_undo, CARET_TIMER_ID,
+    edit_set_tab_stops, edit_undo,
 };
 use listbox::{listbox_hit_item, listbox_notify_change};
 use paint::write_control_text;
@@ -101,8 +104,8 @@ use paint::write_control_text;
 // unused import.
 #[cfg(test)]
 pub(crate) use edit::{
-    clamp_scroll_offset, edit_char_index_at_point, edit_text_area, layout_visible_lines,
-    scrollbar_visible, visible_line_count, visual_rows, VisibleSegment,
+    VisibleSegment, clamp_scroll_offset, edit_char_index_at_point, edit_text_area,
+    layout_visible_lines, scrollbar_visible, visible_line_count, visual_rows,
 };
 // The no-create undo-buffer clear is called from the SetWindowText handlers
 // in `user32::window` (they write control text outside the control dispatch).
@@ -254,6 +257,10 @@ impl ControlClassKind {
         match self {
             Self::Button => ControlState::Button {
                 default_push: false,
+                // A fresh control's content is undefined — the first paint
+                // must cover everything, so the seed is Full (a mutation mark
+                // before the first paint keeps it Full).
+                invalidation: LabelInvalidation::Full,
             },
             // No window context here, so the style bits seed to zero; the
             // EDIT's own seeder (`edit_state_mut`) captures the real dwStyle.
@@ -270,7 +277,10 @@ impl ControlClassKind {
                 part_rights: Vec::new(),
                 part_texts: Vec::new(),
             },
-            Self::Static => ControlState::Static,
+            Self::Static => ControlState::Static {
+                // Same undefined-content seed as the Button variant.
+                invalidation: LabelInvalidation::Full,
+            },
         }
     }
 
@@ -313,6 +323,13 @@ pub enum ControlState {
     Button {
         /// Carries `BS_DEFPUSHBUTTON` — Enter activates it in a dialog.
         default_push: bool,
+        /// The repaint scope for the next paint (see [`LabelInvalidation`]):
+        /// `Clean`/`Full` repaint the whole client, `Rect` only the dirty
+        /// sub-rect. Set by the mutating ops (a pressed-state change marks
+        /// the face rect, a text change the caption rect), reset to `Full`
+        /// by structural changes (WM_SETFONT, a resize), and consumed (back
+        /// to `Clean`) by the button paint.
+        invalidation: LabelInvalidation,
     },
     /// EDIT (single/multi-line text input).
     Edit {
@@ -404,7 +421,12 @@ pub enum ControlState {
         sel_index: i32,
     },
     /// STATIC (labels; text-only painting).
-    Static,
+    Static {
+        /// The repaint scope for the next paint — the same
+        /// [`LabelInvalidation`] the BUTTON variant carries: a caption
+        /// change marks the text rect, the first paint covers everything.
+        invalidation: LabelInvalidation,
+    },
     /// STATUSCLASSNAMEW (status bar): the SB_* parts and per-part texts.
     ///
     /// The bar renders as a BTNFACE strip at the bottom (or top) of its
@@ -471,6 +493,45 @@ pub struct EditInvalidRows {
     /// a pending band whose wrap width no longer matches the layout is
     /// ignored in favor of a full repaint (the rows reflowed underneath it).
     pub wrap_width: i32,
+}
+
+/// The repaint scope of a BUTTON/STATIC control between paints — what the
+/// next paint must redraw (the label-control equivalent of
+/// [`EditInvalidation`]'s row bands: a pressed-state change repaints only
+/// the face rect, a text change only the caption rect, instead of the whole
+/// control). The scope feeds the same B3 dirty-region machinery the EDIT's
+/// band does: the paint erases exactly the pending rect, so the published
+/// frame's `region` is the true changed area, not the full control rect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LabelInvalidation {
+    /// Nothing is pending — the control is clean since its last paint. The
+    /// window's own `invalidated` flag still drives the next paint (which
+    /// covers the whole control), but the next change starts fresh.
+    #[default]
+    Clean,
+    /// Exactly this client-relative rect is dirty — a pressed-state change
+    /// or a caption change. The rect is stamped with the control size it was
+    /// computed against: a resize reflows the layout, so a rect at a
+    /// different size is stale and the paint falls back to a full repaint.
+    Rect(LabelInvalidRect),
+    /// The whole client is dirty — the initial state and every structural
+    /// change (a font change, a resize). Sticky: a later partial mark must
+    /// not narrow it.
+    Full,
+}
+
+/// A label control's pending dirty rect (see [`LabelInvalidation::Rect`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LabelInvalidRect {
+    /// First dirty client x (inclusive), right/bottom exclusive.
+    pub rect: IRect,
+    /// The control width the rect was computed against — the staleness
+    /// check: a pending rect whose size no longer matches the layout is
+    /// ignored in favor of a full repaint (the control reflowed underneath
+    /// it).
+    pub width: i32,
+    /// The control height the rect was computed against.
+    pub height: i32,
 }
 
 impl ControlState {
@@ -729,7 +790,14 @@ impl ControlClassKind {
                     }
                     return Ok(Some(0));
                 }
-                invalidate(state, hwnd);
+                // A push-button press changes the whole face (the pressed
+                // color + the shifted caption); the other controls just mark
+                // the window for a full repaint.
+                if self == ControlClassKind::Button {
+                    button_invalidate_pressed(state, hwnd);
+                } else {
+                    invalidate(state, hwnd);
+                }
                 Ok(Some(0))
             }
             (_, WinMsg::WM_LBUTTONUP) => {
@@ -744,8 +812,12 @@ impl ControlClassKind {
                 if was_pressed {
                     if self == ControlClassKind::Button {
                         state.window_state().capture_window_handle = crate::handles::Hwnd::NULL;
+                        // The release restores the unpressed face — the same
+                        // face-rect scope the press marked.
+                        button_invalidate_pressed(state, hwnd);
+                    } else {
+                        invalidate(state, hwnd);
                     }
-                    invalidate(state, hwnd);
                     // BN_CLICKED is a BUTTON notification; other pressed
                     // controls (an EDIT mid-drag) must not command the parent.
                     if self == ControlClassKind::Button {
@@ -778,7 +850,7 @@ impl ControlClassKind {
                     if let Some(window) = find_window_mut(state, hwnd) {
                         window.flags.insert(WindowFlags::PRESSED);
                     }
-                    invalidate(state, hwnd);
+                    button_invalidate_pressed(state, hwnd);
                     Ok(Some(0))
                 } else {
                     Ok(None)
@@ -790,7 +862,7 @@ impl ControlClassKind {
                     if let Some(window) = find_window_mut(state, hwnd) {
                         window.flags.remove(WindowFlags::PRESSED);
                     }
-                    invalidate(state, hwnd);
+                    button_invalidate_pressed(state, hwnd);
                     let id = find_window(state, hwnd).map_or(0, |w| w.menu_handle);
                     let command_wparam = make_command_wparam(id, BN_CLICKED);
                     return deliver_button_command(engine, state, hwnd, command_wparam);
@@ -831,7 +903,7 @@ impl ControlClassKind {
                     prev
                 });
                 let previous = u64::from(previous);
-                invalidate(state, hwnd);
+                button_invalidate_pressed(state, hwnd);
                 Ok(Some(previous))
             }
             // EDIT focus: show the caret (blink phase reset to on) and arm
@@ -885,12 +957,16 @@ impl ControlClassKind {
             // sends WM_SETFONT to its EDIT right after creation.
             (_, WinMsg::WM_SETFONT) => {
                 // A font change reflows every row: an EDIT's pending row band
-                // is stale. The reset stays even when `redraw` is 0 — the next
-                // paint, whenever it comes, must re-render with the new font.
-                if find_window(state, hwnd)
-                    .is_some_and(|w| w.control_kind == Some(ControlClassKind::Edit))
-                {
-                    edit_reset_invalid_rows(state, hwnd);
+                // is stale, and a label control's pending caption rect is
+                // stale too (the ink moves with the new metrics). The reset
+                // stays even when `redraw` is 0 — the next paint, whenever it
+                // comes, must re-render with the new font.
+                match find_window(state, hwnd).and_then(|w| w.control_kind) {
+                    Some(ControlClassKind::Edit) => edit_reset_invalid_rows(state, hwnd),
+                    Some(ControlClassKind::Button | ControlClassKind::Static) => {
+                        label_reset_invalid_full(state, hwnd)
+                    }
+                    _ => {}
                 }
                 super::window::set_window_font(state, hwnd, word_parameter, long_parameter);
                 Ok(Some(0))
@@ -905,8 +981,21 @@ impl ControlClassKind {
                 } else {
                     read_guest_ansi_lossy(engine, long_parameter, 32_768)?
                 };
+                // A label control's old caption must survive the replacement:
+                // the text-change invalidation measures BOTH the old and the
+                // new caption rects so the next paint erases the previous
+                // glyphs too.
+                let kind = find_window(state, hwnd).and_then(|w| w.control_kind);
+                let old_text = if matches!(
+                    kind,
+                    Some(ControlClassKind::Button | ControlClassKind::Static)
+                ) {
+                    find_window(state, hwnd).map_or_else(String::new, |w| w.control_text.clone())
+                } else {
+                    String::new()
+                };
                 if let Some(window) = find_window_mut(state, hwnd) {
-                    window.control_text = text;
+                    window.control_text = text.clone();
                     window.invalidated = true;
                 }
                 // The text changed: an EDIT's cached EM_GETHANDLE buffer is
@@ -915,12 +1004,16 @@ impl ControlClassKind {
                 // revert past program-set text.
                 edit_invalidate_text_buffer(state, hwnd);
                 edit_clear_undo_buffer(state, hwnd);
-                // A whole-text replacement rewrites every row: reset any
-                // pending row band so the next paint covers the whole EDIT.
-                if find_window(state, hwnd)
-                    .is_some_and(|w| w.control_kind == Some(ControlClassKind::Edit))
-                {
-                    edit_reset_invalid_rows(state, hwnd);
+                match kind {
+                    // A whole-text replacement rewrites every row: reset any
+                    // pending row band so the next paint covers the whole EDIT.
+                    Some(ControlClassKind::Edit) => edit_reset_invalid_rows(state, hwnd),
+                    // A label caption change narrows the next paint to the
+                    // caption rect (the face/border are unchanged).
+                    Some(ControlClassKind::Button | ControlClassKind::Static) => {
+                        label_invalidate_text_change(state, hwnd, &old_text, &text)
+                    }
+                    _ => {}
                 }
                 Ok(Some(1))
             }
@@ -1489,11 +1582,13 @@ fn invalidate(state: &mut WinApiState, hwnd: u64) {
 mod tests {
     #[test]
     fn new_state_seeds_the_right_variant_per_kind() {
-        use super::{ControlClassKind, ControlState};
+        use super::{ControlClassKind, ControlState, LabelInvalidation};
         assert!(matches!(
             ControlClassKind::Button.new_state(),
             ControlState::Button {
-                default_push: false
+                default_push: false,
+                invalidation: LabelInvalidation::Full,
+                ..
             }
         ));
         assert!(matches!(
@@ -1515,7 +1610,10 @@ mod tests {
         ));
         assert!(matches!(
             ControlClassKind::Static.new_state(),
-            ControlState::Static
+            ControlState::Static {
+                invalidation: LabelInvalidation::Full,
+                ..
+            }
         ));
         assert!(matches!(
             ControlClassKind::StatusBar.new_state(),

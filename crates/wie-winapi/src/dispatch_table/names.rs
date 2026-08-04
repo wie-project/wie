@@ -1746,6 +1746,26 @@ static WINAPI_NAME_ROWS: &[(&str, &str, WinApiId)] = &[
         "pagesetupdlgw",
         WinApiId::Comdlg32Pagesetupdlgw,
     ),
+    (
+        // Rows placed at the table end with the appended variants (454-463),
+        // so the id table and the name rows stay in the same order.
+        "gdi32.dll",
+        "startdocw",
+        WinApiId::Gdi32Startdocw,
+    ),
+    ("gdi32.dll", "startpage", WinApiId::Gdi32Startpage),
+    ("gdi32.dll", "endpage", WinApiId::Gdi32Endpage),
+    ("gdi32.dll", "enddoc", WinApiId::Gdi32Enddoc),
+    ("gdi32.dll", "abortdoc", WinApiId::Gdi32Abortdoc),
+    ("gdi32.dll", "createdcw", WinApiId::Gdi32Createdcw),
+    (
+        "gdi32.dll",
+        "gettextmetricsw",
+        WinApiId::Gdi32Gettextmetricsw,
+    ),
+    ("gdi32.dll", "setmapmode", WinApiId::Gdi32Setmapmode),
+    ("gdi32.dll", "rectangle", WinApiId::Gdi32Rectangle),
+    ("user32.dll", "inflaterect", WinApiId::User32Inflaterect),
 ];
 
 /// Resolve library/export to id. Case-insensitive, allocation-free.

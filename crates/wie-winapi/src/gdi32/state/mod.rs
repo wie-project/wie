@@ -5,7 +5,7 @@ use crate::guest_memory::{
     write_u32 as write_guest_u32, write_u64 as write_guest_u64,
 };
 use crate::handles::{Hbitmap, Hbrush, Hdc, Hfont, Hpen};
-use crate::{HandlerContext, WinApiHandlerResult};
+use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 
 mod metrics;
 mod objects;
@@ -29,6 +29,20 @@ const FAKE_GDI_BITMAP_HANDLE_BASE: u64 = 0x0000_0000_6800_2000;
 pub(crate) const STOCK_WHITE_BRUSH_HANDLE: u64 = 0x0000_0000_6800_5001;
 /// Handle of the stock `BLACK_BRUSH` (0x6800_5002, matches `GetStockObject`).
 pub(crate) const STOCK_BLACK_BRUSH_HANDLE: u64 = 0x0000_0000_6800_5002;
+/// Handle of the stock `GRAY_BRUSH`.
+pub(crate) const STOCK_GRAY_BRUSH_HANDLE: u64 = 0x0000_0000_6800_5003;
+/// Handle of the stock `NULL_BRUSH`.
+pub(crate) const STOCK_NULL_BRUSH_HANDLE: u64 = 0x0000_0000_6800_5004;
+/// Handle of the stock `LTGRAY_BRUSH`.
+pub(crate) const STOCK_LTGRAY_BRUSH_HANDLE: u64 = 0x0000_0000_6800_5007;
+/// Handle of the stock `DKGRAY_BRUSH`.
+pub(crate) const STOCK_DKGRAY_BRUSH_HANDLE: u64 = 0x0000_0000_6800_5008;
+/// Handle of the stock `WHITE_PEN`.
+pub(crate) const STOCK_WHITE_PEN_HANDLE: u64 = 0x0000_0000_6800_5009;
+/// Handle of the stock `BLACK_PEN`.
+pub(crate) const STOCK_BLACK_PEN_HANDLE: u64 = 0x0000_0000_6800_500A;
+/// Handle of the stock `NULL_PEN`.
+pub(crate) const STOCK_NULL_PEN_HANDLE: u64 = 0x0000_0000_6800_500B;
 
 /// Handles `GDI32.dll!GetObjectA`.
 pub fn handle_get_object_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -127,11 +141,21 @@ pub fn handle_get_object_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
     })
 }
 
-/// Stock object identifiers (wingdi.h).
+/// Stock object identifiers (wingdi.h). Verified against the Windows SDK:
+/// WHITE_BRUSH 0, LTGRAY_BRUSH 1, GRAY_BRUSH 2, DKGRAY_BRUSH 3, BLACK_BRUSH 4,
+/// NULL_BRUSH 5, WHITE_PEN 6, BLACK_PEN 7, NULL_PEN 8, SYSTEM_FONT 13,
+/// DEFAULT_PALETTE 15. (The previous table mislabeled id 1 as BLACK_BRUSH —
+/// id 1 is LTGRAY_BRUSH and BLACK_BRUSH is id 4 — which broke any guest that
+/// requested `GetStockObject(BLACK_PEN)` = 7 or the true BLACK_BRUSH = 4.)
 const STOCK_WHITE_BRUSH: u64 = 0;
-const STOCK_BLACK_BRUSH: u64 = 1;
+const STOCK_LTGRAY_BRUSH: u64 = 1;
 const STOCK_GRAY_BRUSH: u64 = 2;
+const STOCK_DKGRAY_BRUSH: u64 = 3;
+const STOCK_BLACK_BRUSH: u64 = 4;
 const STOCK_NULL_BRUSH: u64 = 5;
+const STOCK_WHITE_PEN: u64 = 6;
+const STOCK_BLACK_PEN: u64 = 7;
+const STOCK_NULL_PEN: u64 = 8;
 const STOCK_SYSTEM_FONT: u64 = 13;
 const STOCK_DEFAULT_PALETTE: u64 = 15;
 
@@ -140,10 +164,15 @@ pub fn handle_get_stock_object(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     let engine = &mut *ctx.engine;
     let n_index = engine.read_rcx()? & 0xffff_ffff;
     let handle = match n_index {
-        STOCK_WHITE_BRUSH => 0x0000_0000_6800_5001,
-        STOCK_BLACK_BRUSH => 0x0000_0000_6800_5002,
-        STOCK_GRAY_BRUSH => 0x0000_0000_6800_5003,
-        STOCK_NULL_BRUSH => 0x0000_0000_6800_5004,
+        STOCK_WHITE_BRUSH => STOCK_WHITE_BRUSH_HANDLE,
+        STOCK_LTGRAY_BRUSH => STOCK_LTGRAY_BRUSH_HANDLE,
+        STOCK_GRAY_BRUSH => STOCK_GRAY_BRUSH_HANDLE,
+        STOCK_DKGRAY_BRUSH => STOCK_DKGRAY_BRUSH_HANDLE,
+        STOCK_BLACK_BRUSH => STOCK_BLACK_BRUSH_HANDLE,
+        STOCK_NULL_BRUSH => STOCK_NULL_BRUSH_HANDLE,
+        STOCK_WHITE_PEN => STOCK_WHITE_PEN_HANDLE,
+        STOCK_BLACK_PEN => STOCK_BLACK_PEN_HANDLE,
+        STOCK_NULL_PEN => STOCK_NULL_PEN_HANDLE,
         STOCK_SYSTEM_FONT => 0x0000_0000_6800_5005,
         STOCK_DEFAULT_PALETTE => 0x0000_0000_6800_5006,
         _ => 0, // NULL for unknown stock objects
@@ -169,26 +198,47 @@ pub fn handle_select_object(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 
     // Scope the object-kind checks so the mutable borrow ends before find_dc_mut.
     let object_kind = GdiObject::classify(object_handle, state.gdi_state());
+    // Stock brushes/pens never classify to `GdiObject` (0x6800_500x FAKE
+    // range) but must still be recorded so the fill/stroke paths resolve the
+    // DC's brush/pen color.
+    let stock_kind = stock_select_kind(object_handle);
 
-    let replaced = match object_kind {
-        Some(GdiObject::Dib(bitmap)) => state
-            .gdi_state()
-            .find_dc_mut(Hdc::from(dc_handle))
-            .map(|dc| dc.selected_bitmap.replace(bitmap).map(Hbitmap::as_u64)),
-        Some(GdiObject::Brush(brush)) => state
-            .gdi_state()
-            .find_dc_mut(Hdc::from(dc_handle))
-            .map(|dc| dc.selected_brush.replace(brush).map(Hbrush::as_u64)),
-        Some(GdiObject::Pen(pen)) => state
-            .gdi_state()
-            .find_dc_mut(Hdc::from(dc_handle))
-            .map(|dc| dc.selected_pen.replace(pen).map(Hpen::as_u64)),
-        Some(GdiObject::Font(font)) => state
-            .gdi_state()
-            .find_dc_mut(Hdc::from(dc_handle))
-            .map(|dc| dc.selected_font.replace(font).map(Hfont::as_u64)),
-        None => None,
-    };
+    let replaced =
+        match (stock_kind, object_kind) {
+            (Some(StockSelectKind::Brush), _) => state
+                .gdi_state()
+                .find_dc_mut(Hdc::from(dc_handle))
+                .map(|dc| {
+                    dc.selected_brush
+                        .replace(Hbrush::from(object_handle))
+                        .map(Hbrush::as_u64)
+                }),
+            (Some(StockSelectKind::Pen), _) => state
+                .gdi_state()
+                .find_dc_mut(Hdc::from(dc_handle))
+                .map(|dc| {
+                    dc.selected_pen
+                        .replace(Hpen::from(object_handle))
+                        .map(Hpen::as_u64)
+                }),
+            (None, Some(GdiObject::Dib(bitmap))) => state
+                .gdi_state()
+                .find_dc_mut(Hdc::from(dc_handle))
+                .map(|dc| dc.selected_bitmap.replace(bitmap).map(Hbitmap::as_u64)),
+            (None, Some(GdiObject::Brush(brush))) => state
+                .gdi_state()
+                .find_dc_mut(Hdc::from(dc_handle))
+                .map(|dc| dc.selected_brush.replace(brush).map(Hbrush::as_u64)),
+            (None, Some(GdiObject::Pen(pen))) => state
+                .gdi_state()
+                .find_dc_mut(Hdc::from(dc_handle))
+                .map(|dc| dc.selected_pen.replace(pen).map(Hpen::as_u64)),
+            (None, Some(GdiObject::Font(font))) => state
+                .gdi_state()
+                .find_dc_mut(Hdc::from(dc_handle))
+                .map(|dc| dc.selected_font.replace(font).map(Hfont::as_u64)),
+            (None, None) => None,
+        };
 
     if let Some(replaced) = replaced {
         let return_value = replaced.unwrap_or(FAKE_PREVIOUS_GDI_OBJECT_HANDLE);
@@ -328,10 +378,13 @@ pub fn handle_create_compatible_dc(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 /// Handles `GDI32.dll!GetDeviceCaps`.
 ///
 /// Returns plausible values for a 1920×1080 32-bpp desktop so Lunar Magic's
-/// display-mode probes succeed without real GDI.
+/// display-mode probes succeed without real GDI. Print DCs branch FIRST and
+/// report the print-job geometry (300 DPI, the paper size in device px) —
+/// the canvas always matches whatever this reports.
 pub fn handle_get_device_caps(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _hdc = engine
+    let state = &mut *ctx.state;
+    let hdc = engine
         .read_rcx()
         .context("failed to read RCX for GetDeviceCaps")?;
 
@@ -339,9 +392,34 @@ pub fn handle_get_device_caps(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         .read_rdx()
         .context("failed to read RDX for GetDeviceCaps")?;
 
+    let is_print = matches!(
+        state.gdi_state().find_dc(Hdc::from(hdc)).map(|dc| dc.kind),
+        Some(DcKind::Print(_))
+    );
+    let return_value = if is_print {
+        print_dc_caps(state, hdc, index)
+    } else {
+        screen_dc_caps(index)
+    };
+
+    tracing::debug!(index, return_value, "GetDeviceCaps");
+
+    let return_address = engine
+        .return_from_win64_api(return_value)
+        .context("failed to return from GetDeviceCaps")?;
+
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// The fake 1920×1080 screen caps table (shared by non-print DCs and the
+/// print fallback when a `Print`-typed record has no job — a torn state).
+fn screen_dc_caps(index: u64) -> u64 {
     // Common GetDeviceCaps indices from wingdi.h.
     // Identical return values are intentionally merged (clippy match_same_arms).
-    let return_value = match index {
+    match index {
         0 => 0x4000,                         // DRIVERVERSION
         2 | 26 | 112 | 113 | 119 | 121 => 0, // TECHNOLOGY, PDEVICESIZE, offsets, BLTALIGNMENT, COLORMGMTCAPS
         4 => 508,                            // HORZSIZE mm (~20")
@@ -369,18 +447,39 @@ pub fn handle_get_device_caps(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
             tracing::debug!(index, "GetDeviceCaps unknown index; returning 0");
             0
         }
+    }
+}
+
+/// The print-device caps for a print DC: 300 DPI, the job's paper geometry,
+/// no hardware margins (PHYSICALOFFSET = 0 — a documented P1a deviation).
+/// Color/plane/caps values reuse the screen table's.
+fn print_dc_caps(state: &mut WinApiState, hdc: u64, index: u64) -> u64 {
+    let Some(job) = state.gdi_state().find_print_job(Hdc::from(hdc)) else {
+        tracing::debug!(
+            index,
+            "GetDeviceCaps: print DC without a job; screen fallback"
+        );
+        return screen_dc_caps(index);
     };
-
-    tracing::debug!(index, return_value, "GetDeviceCaps");
-
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetDeviceCaps")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    let (paper_w, paper_h) = job.paper_px;
+    let (size_w, size_h) = job.paper_mm;
+    match index {
+        88 | 90 => u64::from(job.dpi),  // LOGPIXELSX / LOGPIXELSY
+        8 | 110 => u64::from(paper_w),  // HORZRES / PHYSICALWIDTH
+        10 | 111 => u64::from(paper_h), // VERTRES / PHYSICALHEIGHT
+        112 | 113 => 0,                 // PHYSICALOFFSETX / PHYSICALOFFSETY
+        4 => u64::from(size_w),         // HORZSIZE mm
+        6 => u64::from(size_h),         // VERTSIZE mm
+        12 => 32,                       // BITSPIXEL
+        14 => 1,                        // PLANES
+        24 => u64::MAX,                 // NUMCOLORS
+        34 => 0x7007,                   // TEXTCAPS (screen value)
+        38 => 0x7e99,                   // RASTERCAPS (screen value)
+        _ => {
+            tracing::debug!(index, "GetDeviceCaps(print) unknown index; returning 0");
+            0
+        }
+    }
 }
 
 /// Handles `GDI32.dll!GetPixel`.
@@ -409,9 +508,28 @@ pub fn handle_get_pixel(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 /// Handles `GDI32.dll!DeleteDC`.
 pub fn handle_delete_dc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let device_context_handle = engine
         .read_rcx()
         .context("failed to read RCX for DeleteDC")?;
+
+    // Print DCs own a job whose canvases can be ~34 MB each — drop it with
+    // the DC so the pages do not leak for the session's lifetime.
+    let is_print = matches!(
+        state
+            .gdi_state()
+            .find_dc(Hdc::from(device_context_handle))
+            .map(|dc| dc.kind),
+        Some(DcKind::Print(_))
+    );
+    if is_print {
+        state
+            .gdi_state()
+            .remove_print_job(Hdc::from(device_context_handle));
+    }
+    state
+        .gdi_state()
+        .remove_dc(Hdc::from(device_context_handle));
 
     let return_value = u64::from(device_context_handle != 0);
 

@@ -798,12 +798,38 @@ pub fn handle_set_window_text_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
             // Controls repaint with their new caption; other windows get the
             // title updated.
             if window.control_kind.is_some() {
-                window.control_text = text;
+                // A label control's old caption must survive the replacement:
+                // the text-change invalidation measures both captions so the
+                // next paint erases the previous glyphs (same as the WM_SETTEXT
+                // dispatch arm).
+                let old_text = if matches!(
+                    window.control_kind,
+                    Some(crate::user32::controls::ControlClassKind::Button)
+                        | Some(crate::user32::controls::ControlClassKind::Static)
+                ) {
+                    window.control_text.clone()
+                } else {
+                    String::new()
+                };
+                let kind = window.control_kind;
+                window.control_text = text.clone();
                 window.invalidated = true;
                 // Real Windows clears an EDIT's undo buffer when the program
                 // sets the text — WM_UNDO must not revert past it (the
                 // WM_SETTEXT dispatch arm does the same).
                 crate::user32::controls::edit_clear_undo_buffer(state, window_handle);
+                if matches!(
+                    kind,
+                    Some(crate::user32::controls::ControlClassKind::Button)
+                        | Some(crate::user32::controls::ControlClassKind::Static)
+                ) {
+                    crate::user32::controls::label_invalidate_text_change(
+                        state,
+                        window_handle,
+                        &old_text,
+                        &text,
+                    );
+                }
             } else {
                 window.title = text;
             }
@@ -843,11 +869,35 @@ pub fn handle_set_window_text_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
             state.window_state().window_title = text;
         } else if let Some(window) = find_window_mut(state, window_handle) {
             if window.control_kind.is_some() {
-                window.control_text = text;
+                // A label control's old caption must survive the replacement
+                // (see the ANSI variant above).
+                let old_text = if matches!(
+                    window.control_kind,
+                    Some(crate::user32::controls::ControlClassKind::Button)
+                        | Some(crate::user32::controls::ControlClassKind::Static)
+                ) {
+                    window.control_text.clone()
+                } else {
+                    String::new()
+                };
+                let kind = window.control_kind;
+                window.control_text = text.clone();
                 window.invalidated = true;
                 // SetWindowText clears an EDIT's undo buffer (see the ANSI
                 // variant above).
                 crate::user32::controls::edit_clear_undo_buffer(state, window_handle);
+                if matches!(
+                    kind,
+                    Some(crate::user32::controls::ControlClassKind::Button)
+                        | Some(crate::user32::controls::ControlClassKind::Static)
+                ) {
+                    crate::user32::controls::label_invalidate_text_change(
+                        state,
+                        window_handle,
+                        &old_text,
+                        &text,
+                    );
+                }
             } else {
                 window.title = text;
             }

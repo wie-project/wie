@@ -6,7 +6,9 @@ use crate::state::handle_newtype;
 use super::{
     BITMAP_HANDLE_BASE, BITMAP_HANDLE_STRIDE, BRUSH_HANDLE_BASE, BRUSH_HANDLE_STRIDE,
     DC_HANDLE_BASE, DC_HANDLE_STRIDE, FONT_HANDLE_BASE, FONT_HANDLE_STRIDE, PEN_HANDLE_BASE,
-    PEN_HANDLE_STRIDE, STOCK_BLACK_BRUSH_HANDLE, STOCK_WHITE_BRUSH_HANDLE,
+    PEN_HANDLE_STRIDE, STOCK_BLACK_BRUSH_HANDLE, STOCK_BLACK_PEN_HANDLE, STOCK_DKGRAY_BRUSH_HANDLE,
+    STOCK_GRAY_BRUSH_HANDLE, STOCK_LTGRAY_BRUSH_HANDLE, STOCK_NULL_BRUSH_HANDLE,
+    STOCK_NULL_PEN_HANDLE, STOCK_WHITE_BRUSH_HANDLE, STOCK_WHITE_PEN_HANDLE,
 };
 
 // ── Allocator-counter newtypes (ADR-003) ───────────────────────────────
@@ -61,6 +63,12 @@ pub enum DcKind {
     Memory,
     /// DC obtained via GetDC(NULL) — the screen.
     Screen,
+    /// A print DC from `CreateDCW` (or from `PrintDlgW` with `PD_RETURNDC`
+    /// once the comdlg32 lane wires it). The page canvas lives in a
+    /// [`PrintJob`] in `GdiState::print_jobs`, keyed by this DC's handle —
+    /// the `Hdc` payload mirrors the record's own handle so kind-only checks
+    /// (`GetDeviceCaps`, `DeleteDC`) never need a second lookup.
+    Print(Hdc),
 }
 
 /// A live device context (DC).
@@ -81,6 +89,8 @@ pub struct DcRecord {
     pub text_color: u32,
     pub bk_color: u32,
     pub bk_mode: u32,
+    /// `SetMapMode` mode (MM_TEXT = 1 default; rendering ignores it in P1a).
+    pub map_mode: u32,
 }
 
 /// A DIBSECTION allocated by CreateDIBSection (or a compatible bitmap).
@@ -118,6 +128,146 @@ pub struct PenRecord {
     pub handle: Hpen,
     /// 0RGB color (COLORREF-compatible).
     pub color: u32,
+}
+
+/// Resolution of WIE's emulated print device, in dots per inch.
+pub const PRINT_DPI: u32 = 300;
+
+/// Default paper: US Letter, in tenths of a millimetre (215.9 × 279.4 mm).
+pub const DEFAULT_PAPER_TENTHS_MM: (u32, u32) = (2159, 2794);
+
+/// Convert a paper size in tenths of a millimetre to device px at `dpi`.
+///
+/// 254 tenths-of-mm = 1 inch; plain integer division (no half-up) keeps the
+/// Letter default exact (2159 × 300 / 254 = 2550, 2794 × 300 / 254 = 3300).
+#[must_use]
+pub fn paper_tenths_mm_to_px(tenths_mm: u32, dpi: u32) -> u32 {
+    tenths_mm.saturating_mul(dpi) / 254
+}
+
+/// Convert a paper size in tenths of a millimetre to whole mm (rounded).
+#[must_use]
+pub fn paper_tenths_mm_to_mm(tenths_mm: u32) -> u32 {
+    tenths_mm.saturating_add(5) / 10
+}
+
+/// Page-printing state machine, per [`PrintJob`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrintJobState {
+    /// DC allocated; no document started.
+    Idle,
+    /// `StartDocW` succeeded — between StartDocW and EndDoc/AbortDoc.
+    DocStarted,
+    /// `StartPage` succeeded — `current` holds the page being painted.
+    PageActive,
+}
+
+/// A raster page of a print job: white-filled 0RGB pixels, top-down.
+///
+/// Memory note: a 300-DPI letter page is 2550 × 3300 px ≈ 33.7 MB. Canvases
+/// are allocated in `StartPage`, moved (never cloned) between the job's
+/// `current` and `pages`, and dropped with the job (`DeleteDC` / `AbortDoc` /
+/// `EndDoc`).
+#[derive(Debug, Clone)]
+pub struct PageCanvas {
+    /// Pixel width (== the job's paper width in device px).
+    pub width: u32,
+    /// Pixel height (== the job's paper height in device px).
+    pub height: u32,
+    /// `width * height` 0RGB pixels, white-filled (`0x00FF_FFFF`), top-down
+    /// (row 0 is the top of the page).
+    pub pixels: Vec<u32>,
+}
+
+impl PageCanvas {
+    /// A fresh white page canvas (`width` × `height` pixels, 0RGB white).
+    ///
+    /// The ~34 MB allocation is explicit here — callers move (never clone)
+    /// the canvas between job states.
+    #[must_use]
+    pub fn white(width: u32, height: u32) -> Self {
+        let count =
+            usize::try_from(u64::from(width).saturating_mul(u64::from(height))).unwrap_or(0);
+        Self {
+            width,
+            height,
+            pixels: vec![0x00FF_FFFF; count],
+        }
+    }
+
+    /// Mutable pixel at `(x, y)` — `None` when out of bounds, so callers can
+    /// draw partially-clipped rects without index-panic risk.
+    pub fn pixel_mut(&mut self, x: u32, y: u32) -> Option<&mut u32> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        let idx = usize::try_from(
+            u64::from(y)
+                .saturating_mul(u64::from(self.width))
+                .saturating_add(u64::from(x)),
+        )
+        .ok()?;
+        self.pixels.get_mut(idx)
+    }
+}
+
+/// A print job backing a `DcKind::Print` DC.
+///
+/// Lives in `GdiState::print_jobs`, NOT inside [`DcRecord`]: a 300-DPI page
+/// canvas is ~34 MB and `DcRecord` is cloned on some paths.
+#[derive(Debug, Clone)]
+pub struct PrintJob {
+    /// The print DC's handle (== the `DcKind::Print` payload).
+    pub dc: Hdc,
+    /// P1a: always 0. Reserved for the `PRINTDLG.hDC` identity that produced
+    /// this job once the comdlg32 lane wires `PrintDlgW`.
+    pub print_info_id: u32,
+    /// P1a: always `None`. Reserved for the page-setup pick once
+    /// `PageSetupDlgW` lands.
+    pub pick: Option<u32>,
+    /// Paper size in device px (`PHYSICALWIDTH`, `PHYSICALHEIGHT` — the
+    /// canvas matches these exactly).
+    pub paper_px: (u32, u32),
+    /// Paper size in whole mm (`HORZSIZE`, `VERTSIZE`).
+    pub paper_mm: (u32, u32),
+    /// Resolution in dots per inch ([`PRINT_DPI`]).
+    pub dpi: u32,
+    /// Doc/page state machine.
+    pub state: PrintJobState,
+    /// Completed pages (EndPage'd), in print order.
+    pub pages: Vec<PageCanvas>,
+    /// The page being painted (between StartPage and EndPage/AbortDoc).
+    pub current: Option<PageCanvas>,
+    /// `DOCINFO.lpszDocName` from `StartDocW`.
+    pub doc_name: String,
+    /// Copies requested (P1a: 1 — the default pick).
+    pub copies: u32,
+}
+
+impl PrintJob {
+    /// A fresh print job for `dc` with the default pick: US Letter, portrait,
+    /// 1 copy, 300 DPI, idle.
+    #[must_use]
+    pub fn new(dc: Hdc) -> Self {
+        let width = paper_tenths_mm_to_px(DEFAULT_PAPER_TENTHS_MM.0, PRINT_DPI);
+        let height = paper_tenths_mm_to_px(DEFAULT_PAPER_TENTHS_MM.1, PRINT_DPI);
+        Self {
+            dc,
+            print_info_id: 0,
+            pick: None,
+            paper_px: (width, height),
+            paper_mm: (
+                paper_tenths_mm_to_mm(DEFAULT_PAPER_TENTHS_MM.0),
+                paper_tenths_mm_to_mm(DEFAULT_PAPER_TENTHS_MM.1),
+            ),
+            dpi: PRINT_DPI,
+            state: PrintJobState::Idle,
+            pages: Vec::new(),
+            current: None,
+            doc_name: String::new(),
+            copies: 1,
+        }
+    }
 }
 
 /// A font allocated by `CreateFontA/W` or `CreateFontIndirectA`.
@@ -159,6 +309,10 @@ pub struct GdiState {
     pub pens: Vec<PenRecord>,
     /// All allocated fonts.
     pub fonts: Vec<FontRecord>,
+    /// Live print jobs — one per `DcKind::Print` DC. Kept OUT of `DcRecord`
+    /// because a 300-DPI page canvas is ~34 MB and `DcRecord` is cloned on
+    /// some paths.
+    pub print_jobs: Vec<PrintJob>,
     /// The system-font engine (face + metrics caches for text rendering).
     pub font_engine: FontEngine,
     /// Next handle for DC allocation.
@@ -181,6 +335,7 @@ impl Default for GdiState {
             brushes: Vec::new(),
             pens: Vec::new(),
             fonts: Vec::new(),
+            print_jobs: Vec::new(),
             font_engine: FontEngine::default(),
             next_dc_handle: DcHandle::from(DC_HANDLE_BASE),
             next_bitmap_handle: BitmapHandle::from(BITMAP_HANDLE_BASE),
@@ -192,12 +347,10 @@ impl Default for GdiState {
 }
 
 impl GdiState {
-    /// Allocate a new DC handle and record.
-    pub fn alloc_dc(&mut self, kind: DcKind) -> Hdc {
-        let handle = Hdc::from(self.next_dc_handle.as_u64());
-        self.next_dc_handle =
-            DcHandle::from(self.next_dc_handle.as_u64().wrapping_add(DC_HANDLE_STRIDE));
-        self.dcs.push(DcRecord {
+    /// A fresh `DcRecord` with the given kind (shared constructor so
+    /// [`Self::alloc_dc`] and [`Self::alloc_print_dc`] cannot drift).
+    fn new_dc_record(handle: Hdc, kind: DcKind) -> DcRecord {
+        DcRecord {
             handle,
             kind,
             selected_bitmap: None,
@@ -207,7 +360,34 @@ impl GdiState {
             text_color: 0,
             bk_color: 0x00FF_FFFF, // white
             bk_mode: 2,            // OPAQUE (real GDI default)
-        });
+            map_mode: 1,           // MM_TEXT
+        }
+    }
+
+    /// Compute and bump the next DC handle (shared by [`Self::alloc_dc`] and
+    /// [`Self::alloc_print_dc`]).
+    fn next_dc_handle_value(&mut self) -> Hdc {
+        let handle = Hdc::from(self.next_dc_handle.as_u64());
+        self.next_dc_handle =
+            DcHandle::from(self.next_dc_handle.as_u64().wrapping_add(DC_HANDLE_STRIDE));
+        handle
+    }
+
+    /// Allocate a new DC handle and record.
+    pub fn alloc_dc(&mut self, kind: DcKind) -> Hdc {
+        let handle = self.next_dc_handle_value();
+        self.dcs.push(Self::new_dc_record(handle, kind));
+        handle
+    }
+
+    /// Allocate a print DC: a `DcKind::Print` record plus its default-letter
+    /// [`PrintJob`]. The job's `dc` and the record's handle are the same
+    /// value, so every print API keys off one handle.
+    pub fn alloc_print_dc(&mut self) -> Hdc {
+        let handle = self.next_dc_handle_value();
+        self.dcs
+            .push(Self::new_dc_record(handle, DcKind::Print(handle)));
+        self.print_jobs.push(PrintJob::new(handle));
         handle
     }
 
@@ -312,6 +492,16 @@ impl GdiState {
         self.fonts.iter().find(|font| font.handle == handle)
     }
 
+    /// Find a print job by DC handle.
+    pub fn find_print_job(&self, dc: Hdc) -> Option<&PrintJob> {
+        self.print_jobs.iter().find(|job| job.dc == dc)
+    }
+
+    /// Find a mutable print job by DC handle.
+    pub fn find_print_job_mut(&mut self, dc: Hdc) -> Option<&mut PrintJob> {
+        self.print_jobs.iter_mut().find(|job| job.dc == dc)
+    }
+
     /// Remove a DC by handle.
     pub fn remove_dc(&mut self, handle: Hdc) {
         self.dcs.retain(|dc| dc.handle != handle);
@@ -335,6 +525,11 @@ impl GdiState {
     /// Remove a font by handle.
     pub fn remove_font(&mut self, handle: Hfont) {
         self.fonts.retain(|font| font.handle != handle);
+    }
+
+    /// Drop a print job (its page canvases go with it) by DC handle.
+    pub fn remove_print_job(&mut self, dc: Hdc) {
+        self.print_jobs.retain(|job| job.dc != dc);
     }
 }
 
@@ -404,12 +599,62 @@ pub fn brush_color(state: &mut WinApiState, brush_handle: Hbrush) -> Option<u32>
     match brush_handle.as_u64() {
         STOCK_WHITE_BRUSH_HANDLE => Some(0x00FF_FFFF),
         STOCK_BLACK_BRUSH_HANDLE => Some(0),
-        0x0000_0000_6800_5003 => Some(0x0080_8080), // GRAY_BRUSH
-        0x0000_0000_6800_5004 => None,              // NULL_BRUSH — no fill
+        STOCK_GRAY_BRUSH_HANDLE => Some(0x0080_8080),
+        STOCK_LTGRAY_BRUSH_HANDLE => Some(0x00C0_C0C0),
+        STOCK_DKGRAY_BRUSH_HANDLE => Some(0x0040_4040),
+        STOCK_NULL_BRUSH_HANDLE => None, // NULL_BRUSH — no fill
         _ => state
             .gdi_state()
             .find_brush(brush_handle)
             .map(|brush| brush.color),
+    }
+}
+
+/// Resolve a pen handle to its 0RGB color.
+///
+/// Recognizes the stock pens returned by `GetStockObject` (`WHITE_PEN`,
+/// `BLACK_PEN`, `NULL_PEN`); anything else must be a live [`PenRecord`].
+/// Returns `None` for the NULL_PEN (no stroke) and for unknown handles.
+#[must_use]
+pub fn pen_color(state: &mut WinApiState, pen_handle: Hpen) -> Option<u32> {
+    match pen_handle.as_u64() {
+        STOCK_WHITE_PEN_HANDLE => Some(0x00FF_FFFF),
+        STOCK_BLACK_PEN_HANDLE => Some(0),
+        STOCK_NULL_PEN_HANDLE => None, // NULL_PEN — no stroke
+        _ => state.gdi_state().find_pen(pen_handle).map(|pen| pen.color),
+    }
+}
+
+/// A stock-object handle that `SelectObject` records on a DC.
+///
+/// Stock handles live in the 0x6800_500x FAKE range, so
+/// [`GdiObject::classify`] decodes them to `None` — but selecting a stock
+/// brush/pen must still take effect for the fill/stroke paths. Stock fonts
+/// and palettes stay unrecorded (the font engine treats "no stored font" as
+/// the system default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StockSelectKind {
+    /// `WHITE_BRUSH` / `LTGRAY_BRUSH` / `GRAY_BRUSH` / `DKGRAY_BRUSH` /
+    /// `BLACK_BRUSH` (incl. `NULL_BRUSH`).
+    Brush,
+    /// `WHITE_PEN` / `BLACK_PEN` / `NULL_PEN`.
+    Pen,
+}
+
+/// Classify a stock-object handle into a selectable kind, if it is one.
+#[must_use]
+pub fn stock_select_kind(handle: u64) -> Option<StockSelectKind> {
+    match handle {
+        STOCK_WHITE_BRUSH_HANDLE
+        | STOCK_LTGRAY_BRUSH_HANDLE
+        | STOCK_GRAY_BRUSH_HANDLE
+        | STOCK_DKGRAY_BRUSH_HANDLE
+        | STOCK_BLACK_BRUSH_HANDLE
+        | STOCK_NULL_BRUSH_HANDLE => Some(StockSelectKind::Brush),
+        STOCK_WHITE_PEN_HANDLE | STOCK_BLACK_PEN_HANDLE | STOCK_NULL_PEN_HANDLE => {
+            Some(StockSelectKind::Pen)
+        }
+        _ => None,
     }
 }
 

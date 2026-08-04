@@ -6793,7 +6793,7 @@ impl ControlUiSnapshot {
                 snap.focused = window.flags.contains(WindowFlags::FOCUSED);
             }
             match ws.control_states.get(&crate::handles::Hwnd::from(hwnd)) {
-                Some(ControlState::Button { default_push }) => {
+                Some(ControlState::Button { default_push, .. }) => {
                     snap.default_push = *default_push;
                 }
                 Some(ControlState::Edit {
@@ -6842,7 +6842,7 @@ impl ControlUiSnapshot {
                     snap.part_rights = part_rights.clone();
                     snap.part_texts = part_texts.clone();
                 }
-                Some(ControlState::Static) | None => {}
+                Some(ControlState::Static { .. }) | None => {}
             }
         }
         snap
@@ -9947,6 +9947,363 @@ fn test_edit_partial_repaint_preserves_unpainted_rows() {
         }
     }
     assert!(row0_diffs > 0, "typing on row 0 must change its own pixels");
+}
+
+/// A top-level window with a BUTTON child (100×30 at (10,10)), for the
+/// label-control region tests.
+fn push_button_paint_pair(state: &mut WinApiState) -> (u64, u64) {
+    let top = 0x6610_0031_u64;
+    let button = 0x6610_0032_u64;
+    let ws = state.window_state();
+    ws.windows.push(WindowRecord {
+        handle: crate::handles::Hwnd::from(top),
+        title: "Top".to_owned(),
+        visible: true,
+        width: 200,
+        height: 100,
+        ..Default::default()
+    });
+    ws.windows.push(WindowRecord {
+        handle: crate::handles::Hwnd::from(button),
+        parent_handle: crate::handles::Hwnd::from(top),
+        x: 10,
+        y: 10,
+        width: 100,
+        height: 30,
+        control_kind: Some(crate::user32::controls::ControlClassKind::Button),
+        control_text: "OK".to_owned(),
+        visible: true,
+        ..Default::default()
+    });
+    (top, button)
+}
+
+/// A top-level window with a STATIC child (140×20 at (10,50)), for the
+/// label-control region tests.
+fn push_static_paint_pair(state: &mut WinApiState) -> (u64, u64) {
+    let top = 0x6610_0041_u64;
+    let label = 0x6610_0042_u64;
+    let ws = state.window_state();
+    ws.windows.push(WindowRecord {
+        handle: crate::handles::Hwnd::from(top),
+        title: "Top".to_owned(),
+        visible: true,
+        width: 200,
+        height: 100,
+        ..Default::default()
+    });
+    ws.windows.push(WindowRecord {
+        handle: crate::handles::Hwnd::from(label),
+        parent_handle: crate::handles::Hwnd::from(top),
+        x: 10,
+        y: 50,
+        width: 140,
+        height: 20,
+        control_kind: Some(crate::user32::controls::ControlClassKind::Static),
+        control_text: "Ready".to_owned(),
+        visible: true,
+        ..Default::default()
+    });
+    (top, label)
+}
+
+/// The first paint of a BUTTON covers its whole rect — the surface behind a
+/// never-painted control is undefined, so the region cannot be narrowed.
+#[test]
+fn test_button_first_paint_reports_the_full_control_rect() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (top, button) = push_button_paint_pair(&mut state);
+
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        button,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint ok")
+    .expect("some result");
+    state.present().drain_pending_publishes();
+    let frame = state
+        .present()
+        .published
+        .get(&crate::handles::Hwnd::from(top))
+        .expect("published frame");
+    assert_eq!(
+        frame.region, None,
+        "the first paint reports the full surface (the fresh accumulator \
+         starts fully dirty and a partial mark cannot narrow it)"
+    );
+}
+
+/// A BUTTON caption change (WM_SETTEXT) must report ONLY the caption band —
+/// the union of the old and new caption rects — instead of the full control
+/// rect, and every pixel change must land inside that region.
+#[test]
+fn test_button_caption_change_paints_only_the_caption_rect() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (top, button) = push_button_paint_pair(&mut state);
+
+    // First paint (full); capture the frame with the old caption "OK".
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        button,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint ok")
+    .expect("some result");
+    state.present().drain_pending_publishes();
+    let before = state
+        .present()
+        .published
+        .get(&crate::handles::Hwnd::from(top))
+        .expect("published frame")
+        .clone();
+
+    // Change the caption to a longer one, then repaint.
+    write_guest_ansi(&mut engine, 0x4000, "Start!");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        button,
+        crate::user32::wm::WinMsg::WM_SETTEXT.as_u32(),
+        0,
+        0x4000,
+    )
+    .expect("settext ok")
+    .expect("some result");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        button,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint2 ok")
+    .expect("some result");
+    state.present().drain_pending_publishes();
+    let after = state
+        .present()
+        .published
+        .get(&crate::handles::Hwnd::from(top))
+        .expect("published frame")
+        .clone();
+
+    let region = after.region.expect("a caption change is a partial repaint");
+    let control = crate::gdi32::IRect {
+        left: 10,
+        top: 10,
+        right: 110,
+        bottom: 40,
+    };
+    assert!(
+        region.left >= control.left
+            && region.top >= control.top
+            && region.right <= control.right
+            && region.bottom <= control.bottom,
+        "the region must stay inside the control, got {region:?}"
+    );
+    assert!(
+        region != control,
+        "a caption change must not report the full control rect, got {region:?}"
+    );
+    assert!(
+        region.height() < control.height(),
+        "the region is a single caption band, not the full face, got {region:?}"
+    );
+
+    // Every pixel diff between the two frames lies inside the region.
+    let mut diffs = 0_usize;
+    for y in 0..after.height {
+        for x in 0..after.width {
+            let idx = usize::try_from(y)
+                .unwrap_or(0)
+                .saturating_mul(after.width as usize)
+                .saturating_add(usize::try_from(x).unwrap_or(0));
+            if before.pixels.get(idx) != after.pixels.get(idx) {
+                assert!(
+                    i64::from(x) >= i64::from(region.left)
+                        && i64::from(x) < i64::from(region.right)
+                        && i64::from(y) >= i64::from(region.top)
+                        && i64::from(y) < i64::from(region.bottom),
+                    "a pixel diff at ({x},{y}) lies outside the reported region"
+                );
+                diffs = diffs.saturating_add(1);
+            }
+        }
+    }
+    assert!(diffs > 0, "the caption change must repaint pixels");
+}
+
+/// A BUTTON pressed-state change must report ONLY the face rect — the
+/// interior inside the 1 px border — because the border color does not
+/// change.
+#[test]
+fn test_button_press_reports_only_the_face_rect() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (top, button) = push_button_paint_pair(&mut state);
+
+    // First paint (full) so the border is established.
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        button,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint ok")
+    .expect("some result");
+    state.present().drain_pending_publishes();
+
+    // Press the button (a click in its client area) and repaint.
+    let lparam = u64::from(10_u16) | (u64::from(10_u16) << 16);
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        button,
+        crate::user32::WM_LBUTTONDOWN,
+        0,
+        lparam,
+    )
+    .expect("press ok")
+    .expect("some result");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        button,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint2 ok")
+    .expect("some result");
+    state.present().drain_pending_publishes();
+    let frame = state
+        .present()
+        .published
+        .get(&crate::handles::Hwnd::from(top))
+        .expect("published frame");
+
+    assert_eq!(
+        frame.region,
+        Some(crate::gdi32::IRect {
+            left: 11,
+            top: 11,
+            right: 109,
+            bottom: 39,
+        }),
+        "a press repaints only the face inside the 1 px border"
+    );
+}
+
+/// A STATIC caption change must report ONLY the caption band, not the whole
+/// label rect.
+#[test]
+fn test_static_caption_change_paints_only_the_caption_rect() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (top, label) = push_static_paint_pair(&mut state);
+
+    // First paint (full); capture the frame with the old caption "Ready".
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        label,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint ok")
+    .expect("some result");
+    state.present().drain_pending_publishes();
+    let before = state
+        .present()
+        .published
+        .get(&crate::handles::Hwnd::from(top))
+        .expect("published frame")
+        .clone();
+
+    write_guest_ansi(&mut engine, 0x4000, "Scanning drive C");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        label,
+        crate::user32::wm::WinMsg::WM_SETTEXT.as_u32(),
+        0,
+        0x4000,
+    )
+    .expect("settext ok")
+    .expect("some result");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        label,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint2 ok")
+    .expect("some result");
+    state.present().drain_pending_publishes();
+    let after = state
+        .present()
+        .published
+        .get(&crate::handles::Hwnd::from(top))
+        .expect("published frame")
+        .clone();
+
+    let region = after.region.expect("a caption change is a partial repaint");
+    let control = crate::gdi32::IRect {
+        left: 10,
+        top: 50,
+        right: 150,
+        bottom: 70,
+    };
+    assert!(
+        region.left >= control.left
+            && region.top >= control.top
+            && region.right <= control.right
+            && region.bottom <= control.bottom,
+        "the region must stay inside the control, got {region:?}"
+    );
+    assert!(
+        region != control,
+        "a caption change must not report the full control rect, got {region:?}"
+    );
+    assert!(
+        region.height() < control.height(),
+        "the region is a single caption band, not the whole label, got {region:?}"
+    );
+
+    let mut diffs = 0_usize;
+    for y in 0..after.height {
+        for x in 0..after.width {
+            let idx = usize::try_from(y)
+                .unwrap_or(0)
+                .saturating_mul(after.width as usize)
+                .saturating_add(usize::try_from(x).unwrap_or(0));
+            if before.pixels.get(idx) != after.pixels.get(idx) {
+                assert!(
+                    i64::from(x) >= i64::from(region.left)
+                        && i64::from(x) < i64::from(region.right)
+                        && i64::from(y) >= i64::from(region.top)
+                        && i64::from(y) < i64::from(region.bottom),
+                    "a pixel diff at ({x},{y}) lies outside the reported region"
+                );
+                diffs = diffs.saturating_add(1);
+            }
+        }
+    }
+    assert!(diffs > 0, "the caption change must repaint pixels");
 }
 
 #[test]

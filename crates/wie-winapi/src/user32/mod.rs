@@ -263,6 +263,7 @@ pub mod lang;
 pub mod menu;
 pub mod message;
 pub mod misc;
+pub mod rect;
 pub mod window;
 pub mod wm;
 pub use accel::*;
@@ -276,6 +277,7 @@ pub use lang::*;
 pub use menu::*;
 pub use message::*;
 pub use misc::*;
+pub use rect::*;
 pub use window::*;
 pub use wm::*;
 

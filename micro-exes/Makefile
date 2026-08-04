@@ -13,7 +13,7 @@ LDFLAGS  := -nostdlib -Wl,--subsystem,console -Wl,--entry,entry
 # Ordinary CRT-linked apps (independent-style): full toolchain defaults.
 CRT_CFLAGS := -O2
 
-.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes dll_tests game_exes interactive_exes ucrt_coverage gui_exes
+.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes dll_tests game_exes interactive_exes ucrt_coverage gui_exes print_bmp
 
 all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes game_exes interactive_exes dll_tests ucrt_coverage gui_exes
 
@@ -52,6 +52,12 @@ rand_test: $(OUT)/rand_test.exe
 snake: $(OUT)/snake.exe
 seh_access_violation: $(OUT)/seh_access_violation.exe
 seh_div_zero: $(OUT)/seh_div_zero.exe
+print_bmp: $(OUT)/print_bmp.exe
+
+# Print-DC pipeline (P1a): CreateDCW → StartDocW → StartPage/EndPage → EndDoc.
+$(OUT)/print_bmp.exe: print_bmp/main.c | $(OUT)
+	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32 -lgdi32
+	@echo "built $@"
 
 # ---- Правила для отдельных .exe ----
 $(OUT)/heap_alloc.exe: heap_alloc/main.c | $(OUT)

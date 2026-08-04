@@ -217,6 +217,9 @@ pub(crate) fn resolve_dest_info(state: &mut WinApiState, dc_handle: u64) -> Opti
     match dc.kind {
         DcKind::Window(hwnd) => resolve_window_ancestor(state, hwnd.as_u64()),
         DcKind::Memory | DcKind::Screen => None,
+        // Print DCs have no window destination — P1a rasterizes them on the
+        // page canvas only (see gdi32::print).
+        DcKind::Print(_) => None,
     }
 }
 

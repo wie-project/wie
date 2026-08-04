@@ -517,9 +517,29 @@ pub enum WinApiId {
     Comdlg32Printdlgw = 452,
     /// Appended here (not adjacent to Comdlg32Printdlgw) to avoid renumbering the entire enum.
     Comdlg32Pagesetupdlgw = 453,
+    /// Appended here (not adjacent to Comdlg32Pagesetupdlgw) to avoid renumbering the entire enum.
+    Gdi32Startdocw = 454,
+    /// Appended here (not adjacent to Gdi32Startdocw) to avoid renumbering the entire enum.
+    Gdi32Startpage = 455,
+    /// Appended here (not adjacent to Gdi32Startpage) to avoid renumbering the entire enum.
+    Gdi32Endpage = 456,
+    /// Appended here (not adjacent to Gdi32Endpage) to avoid renumbering the entire enum.
+    Gdi32Enddoc = 457,
+    /// Appended here (not adjacent to Gdi32Enddoc) to avoid renumbering the entire enum.
+    Gdi32Abortdoc = 458,
+    /// Appended here (not adjacent to Gdi32Abortdoc) to avoid renumbering the entire enum.
+    Gdi32Createdcw = 459,
+    /// Appended here (not adjacent to Gdi32Createdcw) to avoid renumbering the entire enum.
+    Gdi32Gettextmetricsw = 460,
+    /// Appended here (not adjacent to Gdi32Gettextmetricsw) to avoid renumbering the entire enum.
+    Gdi32Setmapmode = 461,
+    /// Appended here (not adjacent to Gdi32Setmapmode) to avoid renumbering the entire enum.
+    Gdi32Rectangle = 462,
+    /// Appended here (not adjacent to Gdi32Rectangle) to avoid renumbering the entire enum.
+    User32Inflaterect = 463,
 }
 
-pub const WINAPI_ID_COUNT: usize = 454;
+pub const WINAPI_ID_COUNT: usize = 464;
 
 impl WinApiId {
     /// Discriminant as `u16` (`#[repr(u16)]`).
@@ -558,7 +578,7 @@ const _: () = assert!(
 );
 
 /// Highest-numbered [`WinApiId`]; update alongside the enum's final variant.
-const LAST_WINAPI_ID: WinApiId = WinApiId::Comdlg32Pagesetupdlgw;
+const LAST_WINAPI_ID: WinApiId = WinApiId::User32Inflaterect;
 
 /// Hot-path dispatch: dense `u16` match over the `WinApiId` discriminant
 /// (LLVM jump table) with no string comparison — runs once per host API stop.
@@ -1085,6 +1105,16 @@ pub fn dispatch_winapi_id(
         WinApiId::User32Callwindowprocw => user32::handle_call_window_proc_w(ctx),
         WinApiId::Comdlg32Findtextw => comdlg32::handle_find_text_w(ctx),
         WinApiId::Comdlg32Replacetextw => comdlg32::handle_replace_text_w(ctx),
+        WinApiId::Gdi32Startdocw => gdi32::handle_start_doc_w(ctx),
+        WinApiId::Gdi32Startpage => gdi32::handle_start_page(ctx),
+        WinApiId::Gdi32Endpage => gdi32::handle_end_page(ctx),
+        WinApiId::Gdi32Enddoc => gdi32::handle_end_doc(ctx),
+        WinApiId::Gdi32Abortdoc => gdi32::handle_abort_doc(ctx),
+        WinApiId::Gdi32Createdcw => gdi32::handle_create_dc_w(ctx),
+        WinApiId::Gdi32Gettextmetricsw => gdi32::handle_get_text_metrics_w(ctx),
+        WinApiId::Gdi32Setmapmode => gdi32::handle_set_map_mode(ctx),
+        WinApiId::Gdi32Rectangle => gdi32::handle_rectangle(ctx),
+        WinApiId::User32Inflaterect => user32::handle_inflate_rect(ctx),
     }
 }
 
