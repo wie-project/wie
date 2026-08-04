@@ -164,3 +164,90 @@ pub(crate) fn run_until_yield(path: &Path, max_api: usize) -> Result<()> {
     let mut output = stdout.lock();
     write_entry_trace_summary(&mut output, &summary)
 }
+
+/// Owns raw-mode entry so the terminal is restored on *every* exit path —
+/// normal return, `?` error propagation, and panics.
+///
+/// The guard always restores on drop: [`wie_winapi::console::restore_terminal`]
+/// is idempotent, so it also covers raw mode the guest entered itself through
+/// `ReadConsoleInput` / `_getch` (`pump::ensure_input_ready`).
+struct TerminalRawGuard;
+
+impl TerminalRawGuard {
+    fn enter() -> Self {
+        if !wie_winapi::console::set_raw_mode(true) {
+            eprintln!(
+                "warning: --console needs a terminal (stdin is not a tty); keys will require Enter"
+            );
+        }
+        Self
+    }
+}
+
+impl Drop for TerminalRawGuard {
+    fn drop(&mut self) {
+        wie_winapi::console::restore_terminal();
+    }
+}
+
+/// Runs a PE under `--console`: raw-mode interactive input for terminal games.
+///
+/// Flow: switch the host terminal into raw mode → run the guest until
+/// `ExitProcess` (per-quantum budget is re-entered, never a session cap) →
+/// restore the terminal on every path via [`TerminalRawGuard`].
+///
+/// The guest ticks itself: its own `Sleep` + `ReadConsoleInputW(timeout)`
+/// loop is the frame clock (Windows-identical). With `VMIN`/`VTIME = 0` the
+/// read returns instantly with whatever the pump buffered, so every keystroke
+/// arrives immediately — no Enter, no host tick source.
+pub(crate) fn run_console_interactive(path: &Path, max_api: Option<usize>) -> Result<()> {
+    let _raw = TerminalRawGuard::enter();
+
+    // The guest's frame loop is Sleep + input poll, so Sleep(n>0) must park
+    // the host or the loop spins at 100% CPU. Same rationale (and SAFETY
+    // comment) as `run_until_yield`: main thread, before any guest thread.
+    #[expect(unsafe_code)]
+    unsafe {
+        std::env::set_var("WIE_IDLE", "park");
+    }
+
+    let mut session = wie_runtime::RuntimeSession::new_with_options(
+        path,
+        wie_winapi::MessageQueueIdlePolicy::YieldOnIdle,
+        wie_runtime::DEFAULT_LAYOUT,
+        wie_runtime::SessionOptions {
+            guest_args: Vec::new(),
+            // Empty stdin bytes → LiveHost mode, so ReadFile(STD_INPUT_HANDLE)
+            // and ReadConsoleInputW read from the host terminal.
+            stdin_bytes: Vec::new(),
+        },
+    )?;
+
+    // One quantum's worth of API stops; the loop re-enters, so this bounds a
+    // single `run_until_stop` call, not the session (an interactive game runs
+    // until the guest exits).
+    let quantum_budget = max_api.unwrap_or(1_000_000);
+    let exit_code = loop {
+        let summary = session.run_until_stop(quantum_budget)?;
+        match summary.termination {
+            wie_runtime::EntryTraceTermination::ExitProcess { code } => break code,
+            wie_runtime::EntryTraceTermination::WaitingForMessage => {
+                // Empty GetMessage with no message source. Park briefly and
+                // let the guest retry; a console game's Sleep loop resumes.
+                wie_winapi::idle::apply_message_park();
+            }
+            wie_runtime::EntryTraceTermination::GuestCallbackRequested { .. } => {
+                // Handled internally by the runtime; keep running.
+            }
+            wie_runtime::EntryTraceTermination::ApiLimit => {
+                // A per-quantum budget, not a session timeout — re-enter.
+            }
+            other => {
+                bail!("run_console: guest stopped early: {other:?}");
+            }
+        }
+    };
+
+    eprintln!("run_console: exit={exit_code}");
+    Ok(())
+}

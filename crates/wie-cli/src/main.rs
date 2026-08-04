@@ -83,6 +83,11 @@ enum Command {
         #[arg(long)]
         persistent: bool,
 
+        /// Raw-mode interactive console run: every keystroke reaches the guest
+        /// immediately (no Enter), terminal restored on exit. For terminal games.
+        #[arg(long)]
+        console: bool,
+
         /// Show GUI window (requires `gui` feature).
         #[arg(long)]
         gui: bool,
@@ -166,6 +171,7 @@ fn main() -> Result<()> {
             drive_d,
             stdin,
             persistent,
+            console,
             gui,
             screenshot,
             input_script,
@@ -190,7 +196,21 @@ fn main() -> Result<()> {
                 bail!("--input-script requires --gui");
             }
 
-            if persistent {
+            if console {
+                if persistent {
+                    bail!("--console and --persistent are mutually exclusive");
+                }
+                if root.is_some() || stdin.is_some() || drive_d.is_some() {
+                    bail!("--root / --drive-d / --stdin are only supported in micro mode");
+                }
+                if expect_code != 0 {
+                    bail!("--expect-code is only supported in micro mode");
+                }
+                if !guest_args.is_empty() {
+                    bail!("guest argv is only supported in micro mode (omit --console)");
+                }
+                commands::run_console_interactive(&path, max_api)?;
+            } else if persistent {
                 let max = max_api.unwrap_or(3400);
                 if !guest_args.is_empty() {
                     bail!("guest argv is only supported in micro mode (omit --persistent)");

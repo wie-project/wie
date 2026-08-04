@@ -1,5 +1,6 @@
-//! Winit application handler — displays the guest window and forwards input.
+//! Winit application handler — displays the guest windows and forwards input.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::mpsc;
@@ -59,10 +60,13 @@ impl WieApp {
     ///
     /// A window holding the mouse capture (SetCapture — a pressed BUTTON
     /// captures while down) receives every mouse message instead of the
-    /// hit-tested child, matching Windows. Falls back to the main window at
-    /// (0, 0) when the hit-test finds nothing (no visible top-level window
+    /// hit-tested child, matching Windows. Falls back to the primary window
+    /// at (0, 0) when the hit-test finds nothing (no visible top-level window
     /// yet). Mouse messages go to the topmost child containing the cursor,
-    /// with child-relative lParam coords.
+    /// with child-relative lParam coords. NOTE (L1): the hit-test runs on the
+    /// GUEST window tree, so it already resolves per-window; only the
+    /// no-hit fallback and the `window_at` call itself stay primary-window
+    /// scoped until L2's input-routing lane.
     fn mouse_target(&self, handle: &GuestHandle) -> (u64, u16, u16) {
         let sf = self.scale_factor();
         let (cx, cy) = self.cursor_pos;
@@ -76,7 +80,7 @@ impl WieApp {
             return (hwnd, rx as u16, ry as u16);
         }
         handle.window_at(x, y).map_or(
-            (self.runtime.as_ref().map_or(0, |rt| rt.hwnd.as_u64()), 0, 0),
+            (self.primary_hwnd.map_or(0, |h| h.as_u64()), 0, 0),
             |(hwnd, rx, ry)| (hwnd, rx as u16, ry as u16),
         )
     }
@@ -122,8 +126,12 @@ impl WieApp {
     /// degenerate or negative rect. When no window exists yet (the move
     /// arrived before the first published frame) the request stays pending
     /// and applies once the window is created.
+    ///
+    /// NOTE (L1): the geometry request slot is global, not per-hwnd, so the
+    /// move is applied to the primary window; per-window placement is a later
+    /// lane (the slot lives in session/window.rs).
     fn apply_host_geometry(&self) {
-        let Some(rt) = self.runtime.as_ref() else {
+        let Some(rt) = self.primary_runtime() else {
             return;
         };
         let Some(handle) = self.handle.as_ref() else {
@@ -148,11 +156,114 @@ impl WieApp {
         ));
     }
 
-    /// The window's device scale factor (physical px per logical 96-DPI px),
-    /// defaulting to 1.0 before the winit window exists (no scaling has
-    /// happened yet).
+    /// The primary window's device scale factor (physical px per logical
+    /// 96-DPI px), defaulting to 1.0 before any winit window exists (no
+    /// scaling has happened yet). Input paths that are not yet per-window
+    /// (mouse, keyboard) read the primary window's factor.
     fn scale_factor(&self) -> f64 {
-        self.runtime.as_ref().map_or(1.0, |rt| rt.scale_factor)
+        self.primary_runtime().map_or(1.0, |rt| rt.scale_factor)
+    }
+
+    /// The runtime of the primary host window — the first window created,
+    /// mirroring the guest's main window. Input events that are not yet
+    /// per-window (keyboard, focus, and the mouse fallback — L2's
+    /// input-routing lane) target it.
+    fn primary_runtime(&self) -> Option<&WindowRuntime> {
+        let hwnd = self.primary_hwnd?;
+        self.windows.values().find(|rt| rt.hwnd == hwnd)
+    }
+
+    /// Reconcile the host window registry against the guest's top-level
+    /// windows: create a winit window for each top-level that has none, and
+    /// destroy the winit windows of top-levels the guest no longer has.
+    ///
+    /// Runs on every `Frame` event; a cheap no-op when the guest window set
+    /// is unchanged (the top-level snapshot is a filter over the window
+    /// records). The first-window-on-first-publish behavior is preserved: the
+    /// first published frame still creates the first host window on this
+    /// exact event, from the guest's own title/size.
+    fn reconcile_windows(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(handle) = self.handle.as_ref() else {
+            return;
+        };
+        let top_levels = handle.guest_top_level_windows();
+        let live_hwnds: HashMap<u64, ()> =
+            top_levels.iter().map(|(hwnd, ..)| (*hwnd, ())).collect();
+        // Destroy winit windows for top-levels the guest no longer has.
+        // Dropping the last `Arc<Window>` clone closes the winit window
+        // (winit 0.30 `Window` drops the underlying window).
+        let stale: Vec<WindowId> = self
+            .windows
+            .iter()
+            .filter(|(_, rt)| !live_hwnds.contains_key(&rt.hwnd.as_u64()))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stale {
+            if let Some(rt) = self.windows.remove(&id) {
+                tracing::debug!(
+                    target: "wiegui",
+                    hwnd = rt.hwnd.as_u64(),
+                    "destroyed host window for closed guest top-level"
+                );
+            }
+        }
+        if self.windows.is_empty() {
+            self.primary_hwnd = None;
+        }
+        // Create winit windows for new top-levels, in guest creation order
+        // (the top-level snapshot preserves the `windows` record order), so
+        // the main window is created first.
+        for (hwnd, title, width, height) in top_levels {
+            if self.windows.values().any(|rt| rt.hwnd.as_u64() == hwnd) {
+                continue;
+            }
+            let is_first = self.primary_hwnd.is_none();
+            let width = width.max(100) as u32;
+            let height = height.max(100) as u32;
+            let attrs = window_attributes(&title, width, height);
+            let Ok(window) = event_loop.create_window(attrs) else {
+                tracing::error!(target: "wiegui", "create_window failed for a guest top-level");
+                continue;
+            };
+            let window = Arc::new(window);
+            if is_first {
+                // Publish the first window to the MessageBox bridge so its
+                // rfd dialog can parent to it (the NSAlert path instead of
+                // the legacy CFUserNotification fallback). A poisoned mutex
+                // leaves the bridge unparented — harmless, the fallback still
+                // works.
+                if let Ok(mut slot) = self.window_slot.lock() {
+                    *slot = Some(window.clone());
+                }
+            }
+            // winit reports the device scale factor (physical px per logical
+            // px); the input and resize paths divide winit's physical
+            // coordinates by it.
+            let scale_factor = window.scale_factor();
+            window.focus_window();
+            let id = window.id();
+            let rt = WindowRuntime {
+                hwnd: Hwnd::from(hwnd),
+                window: window.clone(),
+                surface: init_present_backend(&window),
+                last_presented_pixels: None,
+                last_presented_size: None,
+                pending_size: None,
+                last_resize: None,
+                last_sent_size: None,
+                scale_factor,
+            };
+            if is_first {
+                self.primary_hwnd = Some(rt.hwnd);
+            }
+            tracing::debug!(
+                target: "wiegui",
+                window_id = ?id,
+                hwnd = hwnd,
+                "created host window for guest top-level"
+            );
+            self.windows.insert(id, rt);
+        }
     }
 }
 
@@ -164,18 +275,27 @@ impl WieApp {
 /// macOS's trailing `Resized` events so the guest reallocates its DIB once.
 const RESIZE_SETTLE_MS: u64 = 50;
 
-/// Per-window host state for an active winit window — the payload of
-/// [`WindowState::Active`]. The "window exists iff hwnd known" invariant is
-/// now a type instead of per-arm checks.
+/// Per-window host state for one winit window — the payload of each entry in
+/// the [`WindowRegistry`]. One entry exists per guest top-level window; the
+/// "window exists iff hwnd known" invariant is now a type instead of
+/// per-arm checks.
 struct WindowRuntime {
     /// Guest HWND this window mirrors.
     hwnd: Hwnd,
     window: Arc<Window>,
     /// The wgpu (Metal) present backend, created at window construction.
     surface: Option<PresentBackend>,
-    /// Present generation of the last frame actually presented; frames
-    /// with an unchanged generation AND unchanged window size are skipped.
-    last_presented_generation: Option<u64>,
+    /// Pixels Arc of the last frame actually presented; a frame whose pixels
+    /// Arc is pointer-equal to this one AND whose window size is unchanged
+    /// since the last present is byte-identical — skip the re-upload.
+    ///
+    /// Publishes move a fresh Arc every time ([`present::publish`] wraps the
+    /// painted buffer in `Arc::from`), and this entry keeps the compared-to
+    /// allocation alive until the next present, so `Arc::ptr_eq` inequality
+    /// exactly means the window republished. Holding the Arc also pins the
+    /// allocation: a freed-and-reused header address would otherwise fake a
+    /// pointer match on a genuinely republished frame.
+    last_presented_pixels: Option<Arc<Vec<u32>>>,
     /// Window size at the last present (drag-stretch must not be skipped).
     last_presented_size: Option<(u32, u32)>,
     /// Latest window size from winit during a resize drag.
@@ -196,41 +316,12 @@ struct WindowRuntime {
     scale_factor: f64,
 }
 
-/// Window-bound state. The winit window is created lazily on the first
-/// published frame (the guest provides the title/size), so a session starts
-/// [`WindowState::Uncreated`] and moves to [`WindowState::Active`] exactly
-/// once, for the rest of the session. A thin [`Option`]-equivalent so call
-/// sites keep the `as_ref()` / `as_mut()` / `is_none()` shape.
-enum WindowState {
-    /// The winit window has not been created yet.
-    Uncreated,
-    /// A winit window exists and mirrors the guest window.
-    Active(WindowRuntime),
-}
-
-impl WindowState {
-    fn as_ref(&self) -> Option<&WindowRuntime> {
-        match self {
-            WindowState::Uncreated => None,
-            WindowState::Active(rt) => Some(rt),
-        }
-    }
-
-    fn as_mut(&mut self) -> Option<&mut WindowRuntime> {
-        match self {
-            WindowState::Uncreated => None,
-            WindowState::Active(rt) => Some(rt),
-        }
-    }
-
-    fn is_none(&self) -> bool {
-        matches!(self, WindowState::Uncreated)
-    }
-
-    fn is_some(&self) -> bool {
-        matches!(self, WindowState::Active(_))
-    }
-}
+/// One host winit window per guest top-level window, keyed by winit
+/// `WindowId`. Reconciled from the guest on every published frame (see
+/// [`WieApp::reconcile_windows`]). A session starts empty — no winit window
+/// exists until the first frame — and entries are created/destroyed as the
+/// guest opens and closes top-level windows.
+type WindowRegistry = HashMap<WindowId, WindowRuntime>;
 
 /// The wgpu (Metal) present backend for a window, created at window
 /// construction. The guest frame is uploaded to a staging texture and blitted
@@ -299,19 +390,25 @@ fn left_press_message(
     }
 }
 
-/// winit application state: bridges the guest window to the present backend.
+/// winit application state: bridges the guest windows to the present backend.
 struct WieApp {
     handle: Option<GuestHandle>,
-    /// Window-bound state; [`WindowState::Uncreated`] until the first frame
-    /// creates the winit window, then [`WindowState::Active`] for the session.
-    runtime: WindowState,
+    /// One winit window per guest top-level window; [`WindowRegistry`] is
+    /// empty until the first frame creates the first window, then reconciled
+    /// from the guest on every publish (see [`WieApp::reconcile_windows`]).
+    windows: WindowRegistry,
+    /// Guest HWND of the primary (first-created) host window — the window
+    /// that mirrors the guest's main window. Input events that are not yet
+    /// per-window (keyboard, focus, and the mouse hit-test fallback — L2's
+    /// input-routing lane) target it.
+    primary_hwnd: Option<Hwnd>,
     /// Wake-coalescing flag, shared with the guest-thread wake callback.
     /// Set on every publish; the first `Frame` event after a publish group
     /// swaps it and requests a redraw, duplicates skip.
     pending_frame: Arc<std::sync::atomic::AtomicBool>,
-    /// Shared slot for the winit window Arc, filled once at window creation
-    /// (on the event-loop thread) and read by the guest-thread MessageBox
-    /// bridge to parent its rfd dialog to the window.
+    /// Shared slot for the winit window Arc, filled once at the first window
+    /// creation (on the event-loop thread) and read by the guest-thread
+    /// MessageBox bridge to parent its rfd dialog to the window.
     window_slot: Arc<Mutex<Option<Arc<Window>>>>,
     /// Currently pressed mouse buttons (MK_* bits) — from MouseInput events.
     mouse_buttons: u16,
@@ -342,27 +439,31 @@ impl ApplicationHandler<WieEvent> for WieApp {
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        window_id: WindowId,
         event: WindowEvent,
     ) {
         // Handle events that need early processing before the runtime guard.
         match &event {
             WindowEvent::CloseRequested => {
-                if let (Some(handle), Some(rt)) = (self.handle.as_ref(), self.runtime.as_ref()) {
+                // WM_CLOSE to the event window's own guest HWND, so closing
+                // any top-level (the main window OR a dialog) asks the guest
+                // to destroy exactly that window.
+                if let Some(handle) = self.handle.as_ref()
+                    && let Some(rt) = self.windows.get(&window_id)
+                {
                     handle.post_message(rt.hwnd.as_u64(), input::WM_CLOSE, 0, 0);
-                }
-                if self.runtime.is_none() {
-                    event_loop.exit();
                 }
                 return;
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                // Keyboard events only fire once the winit window exists, so
-                // the runtime is always present here; no fresh-lookup needed.
+                // Keyboard events only fire once a winit window exists, so
+                // the primary window is always present here. NOTE (L1):
+                // keyboard routing stays primary-window until L2's input
+                // routing (the guest focus window is the real target).
                 let Some(handle) = self.handle.as_ref() else {
                     return;
                 };
-                let Some(rt) = self.runtime.as_ref() else {
+                let Some(rt) = self.primary_runtime() else {
                     return;
                 };
                 let hwnd = rt.hwnd.as_u64();
@@ -409,7 +510,9 @@ impl ApplicationHandler<WieEvent> for WieApp {
         let Some(ref handle) = self.handle else {
             return;
         };
-        let Some(hwnd) = self.runtime.as_ref().map(|rt| rt.hwnd) else {
+        // Input events that are not yet per-window (L2's input-routing lane)
+        // target the primary window's guest HWND.
+        let Some(hwnd) = self.primary_hwnd else {
             return;
         };
 
@@ -434,28 +537,34 @@ impl ApplicationHandler<WieEvent> for WieApp {
                 }
             }
             WindowEvent::RedrawRequested => {
-                let Some(rt) = self.runtime.as_mut() else {
+                let Some(rt) = self.windows.get_mut(&window_id) else {
                     return;
                 };
-                let frame = handle.take_frame(hwnd.as_u64());
+                let frame = handle.take_frame(rt.hwnd.as_u64());
                 if let Some(frame) = frame {
                     let (dst_w, dst_h) = {
                         let s = rt.window.inner_size();
                         (s.width.max(1), s.height.max(1))
                     };
-                    // Skip redundant presents. When neither the
-                    // present generation (nothing repainted) nor the
-                    // window size (drag-stretch) changed since the last
-                    // present, the published frame is byte-identical —
-                    // skip the copy + GPU upload entirely.
-                    let generation = handle.present_generation();
-                    if rt.last_presented_generation == Some(generation)
-                        && rt.last_presented_size == Some((dst_w, dst_h))
-                    {
+                    // Skip redundant presents, per window. When the frame's
+                    // pixels Arc is pointer-equal to the last one presented
+                    // (this window did NOT republish — some other window
+                    // woke us) AND the window size is unchanged (no
+                    // drag-stretch), the frame is byte-identical — skip the
+                    // copy + GPU upload entirely. The Arc compare is exact:
+                    // `publish` wraps the painted buffer in a fresh Arc every
+                    // time, and this entry holds the compared-to allocation
+                    // alive (see `last_presented_pixels`).
+                    let is_unchanged = rt
+                        .last_presented_pixels
+                        .as_ref()
+                        .is_some_and(|prev| Arc::ptr_eq(prev, &frame.pixels))
+                        && rt.last_presented_size == Some((dst_w, dst_h));
+                    if is_unchanged {
                         tracing::debug!(
                             target: "wiegui",
-                            generation,
-                            "skipping unchanged frame (gen+size)"
+                            hwnd = rt.hwnd.as_u64(),
+                            "skipping unchanged frame (ptr_eq+size)"
                         );
                         return;
                     }
@@ -475,11 +584,13 @@ impl ApplicationHandler<WieEvent> for WieApp {
                     // the sampler when the window size differs from the frame
                     // size (identical nearest semantics to stretch_nearest).
                     // The frame is moved so the present backend can drop the
-                    // pixel Arc right after the staging upload.
-                    if let Some(presenter) = rt.surface.as_mut() {
-                        if let Err(e) = presenter.present(frame, dst_w, dst_h) {
-                            tracing::error!(target: "wiegui", error = %e, "wgpu present failed");
-                        }
+                    // pixel Arc right after the staging upload; snapshot the
+                    // pixels Arc for the per-window skip BEFORE the move.
+                    let presented_pixels = Arc::clone(&frame.pixels);
+                    if let Some(presenter) = rt.surface.as_mut()
+                        && let Err(e) = presenter.present(frame, dst_w, dst_h)
+                    {
+                        tracing::error!(target: "wiegui", error = %e, "wgpu present failed");
                     }
                     if let Some(t0) = present_t0 {
                         handle.record_present_time(t0.elapsed().as_nanos());
@@ -490,7 +601,7 @@ impl ApplicationHandler<WieEvent> for WieApp {
                             "host present"
                         );
                     }
-                    rt.last_presented_generation = Some(generation);
+                    rt.last_presented_pixels = Some(presented_pixels);
                     rt.last_presented_size = Some((dst_w, dst_h));
                 }
             }
@@ -625,18 +736,23 @@ impl ApplicationHandler<WieEvent> for WieApp {
             WindowEvent::Moved(position) => {
                 // WM_MOVE: lParam = MAKELPARAM(x, y) screen coords — guest
                 // LOGICAL 96-DPI pixels, so divide winit's physical position
-                // by the device scale factor.
-                let sf = self.scale_factor();
+                // by the event window's device scale factor.
+                let Some(rt) = self.windows.get(&window_id) else {
+                    return;
+                };
                 let (px, py) = (
-                    input::physical_to_logical(f64::from(position.x.max(0)), sf) as u16,
-                    input::physical_to_logical(f64::from(position.y.max(0)), sf) as u16,
+                    input::physical_to_logical(f64::from(position.x.max(0)), rt.scale_factor)
+                        as u16,
+                    input::physical_to_logical(f64::from(position.y.max(0)), rt.scale_factor)
+                        as u16,
                 );
                 let lparam = input::make_lparam(px, py);
-                handle.post_message(hwnd.as_u64(), input::WM_MOVE, 0, lparam);
+                handle.post_message(rt.hwnd.as_u64(), input::WM_MOVE, 0, lparam);
             }
             WindowEvent::CursorEntered { .. } => {
                 // Windows sends WM_MOUSEHOVER only for windows that requested
-                // tracking via TrackMouseEvent.
+                // tracking via TrackMouseEvent. NOTE (L1): hover/leave stay
+                // primary-window until L2's per-window mouse routing.
                 if handle.mouse_tracking(hwnd.as_u64()) {
                     handle.post_message(hwnd.as_u64(), input::WM_MOUSEHOVER, 0, 0);
                 }
@@ -653,7 +769,7 @@ impl ApplicationHandler<WieEvent> for WieApp {
                 // so refresh the factor the input and resize paths divide by,
                 // then request a fresh render at the new scale — the next
                 // frame covers it.
-                if let Some(rt) = self.runtime.as_mut() {
+                if let Some(rt) = self.windows.get_mut(&window_id) {
                     rt.scale_factor = scale_factor;
                     rt.window.request_redraw();
                 }
@@ -708,12 +824,11 @@ impl ApplicationHandler<WieEvent> for WieApp {
             }
             WindowEvent::Resized(size) => {
                 tracing::debug!(
-                    "Resized event: {}x{} hwnd_set={}",
+                    "Resized event: {}x{} window={window_id:?}",
                     size.width,
                     size.height,
-                    self.runtime.is_some()
                 );
-                let Some(rt) = self.runtime.as_mut() else {
+                let Some(rt) = self.windows.get_mut(&window_id) else {
                     return;
                 };
                 // Keep the wgpu swapchain matching the window's physical
@@ -746,48 +861,56 @@ impl ApplicationHandler<WieEvent> for WieApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Debounced resize: when no Resized event arrived for the settle
-        // window, the drag has ended — post the final WM_SIZE (and a WM_PAINT
-        // so the guest reallocates its DIB exactly once, at the final size).
-        let Some(rt) = self.runtime.as_mut() else {
-            return;
-        };
-        if let Some(start) = rt.last_resize
-            && start.elapsed() >= Duration::from_millis(RESIZE_SETTLE_MS)
-        {
-            rt.last_resize = None;
-            if let Some((w, h)) = rt.pending_size.take() {
-                // The guest DIB is LOGICAL 96-DPI: post the PHYSICAL inner
-                // size divided by the device scale factor.
-                let (lw, lh) = guest_size_from_physical(w, h, rt.scale_factor);
-                tracing::debug!(
-                    "settle: pending={}x{} guest={}x{} last_sent={:?}",
-                    w,
-                    h,
-                    lw,
-                    lh,
-                    rt.last_sent_size
-                );
-                // Skip if the size hasn't changed since the last posted
-                // WM_SIZE — macOS fires trailing Resized events after the
-                // drag, and re-posting the same size would re-trigger the
-                // guest's expensive DIB recreation (which also delays
-                // close/quit handling).
-                if rt.last_sent_size != Some((lw, lh)) {
-                    let hwnd = rt.hwnd;
-                    if let Some(handle) = self.handle.as_ref() {
-                        // Update the guest-visible record now — together with
-                        // the WM_SIZE post — so GetClientRect matches the size
-                        // the guest is about to recreate its DIB at.
-                        handle.resize_window(hwnd.as_u64(), lw, lh);
-                        let lparam = input::make_lparam(lw as u16, lh as u16);
-                        handle.post_message(hwnd.as_u64(), input::WM_SIZE, 0, lparam);
-                        handle.post_message(hwnd.as_u64(), input::WM_PAINT, 0, 0);
-                        tracing::debug!("resize settled: WM_SIZE {}x{}", lw, lh);
-                    }
-                    rt.last_sent_size = Some((lw, lh));
-                }
+        // Debounced resize, per window: when no Resized event arrived for the
+        // settle window, the drag has ended — post the final WM_SIZE (and a
+        // WM_PAINT so the guest reallocates its DIB exactly once, at the
+        // final size). Each window settles independently (a dialog can be
+        // settling while the main window idles).
+        let mut any_settled = false;
+        for rt in self.windows.values_mut() {
+            let Some(start) = rt.last_resize else {
+                continue;
+            };
+            if start.elapsed() < Duration::from_millis(RESIZE_SETTLE_MS) {
+                continue;
             }
+            rt.last_resize = None;
+            any_settled = true;
+            let Some((w, h)) = rt.pending_size.take() else {
+                continue;
+            };
+            // The guest DIB is LOGICAL 96-DPI: post the PHYSICAL inner
+            // size divided by the device scale factor.
+            let (lw, lh) = guest_size_from_physical(w, h, rt.scale_factor);
+            tracing::debug!(
+                "settle: pending={}x{} guest={}x{} last_sent={:?}",
+                w,
+                h,
+                lw,
+                lh,
+                rt.last_sent_size
+            );
+            // Skip if the size hasn't changed since the last posted
+            // WM_SIZE — macOS fires trailing Resized events after the
+            // drag, and re-posting the same size would re-trigger the
+            // guest's expensive DIB recreation (which also delays
+            // close/quit handling).
+            if rt.last_sent_size != Some((lw, lh)) {
+                let hwnd = rt.hwnd;
+                if let Some(handle) = self.handle.as_ref() {
+                    // Update the guest-visible record now — together with
+                    // the WM_SIZE post — so GetClientRect matches the size
+                    // the guest is about to recreate its DIB at.
+                    handle.resize_window(hwnd.as_u64(), lw, lh);
+                    let lparam = input::make_lparam(lw as u16, lh as u16);
+                    handle.post_message(hwnd.as_u64(), input::WM_SIZE, 0, lparam);
+                    handle.post_message(hwnd.as_u64(), input::WM_PAINT, 0, 0);
+                    tracing::debug!("resize settled: WM_SIZE {}x{}", lw, lh);
+                }
+                rt.last_sent_size = Some((lw, lh));
+            }
+        }
+        if any_settled {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
@@ -802,61 +925,29 @@ impl ApplicationHandler<WieEvent> for WieApp {
                         .unwrap_or(u64::MAX),
                     "Frame event"
                 );
-                if self.runtime.is_none() {
-                    // First frame — create window with guest's title and size.
-                    if let Some((hwnd, title, w, h)) = self
-                        .handle
-                        .as_ref()
-                        .and_then(|h| h.first_guest_window_info())
-                    {
-                        let title: &str = &title;
-                        let w = w.max(100) as u32;
-                        let h = h.max(100) as u32;
-                        let attrs = window_attributes(title, w, h);
-                        if let Ok(window) = event_loop.create_window(attrs) {
-                            let window = Arc::new(window);
-                            // Publish the window to the MessageBox bridge so
-                            // its rfd dialog can parent to it (the NSAlert
-                            // path instead of the legacy CFUserNotification
-                            // fallback). A poisoned mutex leaves the bridge
-                            // unparented — harmless, the fallback still works.
-                            if let Ok(mut slot) = self.window_slot.lock() {
-                                *slot = Some(window.clone());
-                            }
-                            // winit reports the device scale factor (physical
-                            // px per logical px); the input and resize paths
-                            // divide winit's physical coordinates by it.
-                            let scale_factor = window.scale_factor();
-                            window.focus_window();
-                            self.runtime = WindowState::Active(WindowRuntime {
-                                hwnd: Hwnd::from(hwnd),
-                                window: window.clone(),
-                                surface: init_present_backend(&window),
-                                last_presented_generation: None,
-                                last_presented_size: None,
-                                pending_size: None,
-                                last_resize: None,
-                                last_sent_size: None,
-                                scale_factor,
-                            });
-                        }
-                    }
-                } else if let Some(rt) = self.runtime.as_ref() {
-                    // Coalesce wake storms. Every publish sets the flag;
-                    // the first Frame event after a publish group requests the
-                    // redraw and later duplicates (which see the flag cleared)
-                    // skip. A real new frame is never dropped: any new publish
-                    // re-sets the flag AND enqueues another Frame event, and
-                    // RedrawRequested additionally skips only when the present
-                    // generation AND window size are unchanged.
-                    if self
-                        .pending_frame
-                        .swap(false, std::sync::atomic::Ordering::SeqCst)
-                    {
+                // Reconcile the host window registry against the guest's
+                // top-level windows. On the first frame this creates the
+                // first window from the guest's own title/size (identical to
+                // the pre-registry first-window path); later frames create
+                // windows for newly opened top-levels (dialogs) and destroy
+                // the winit windows of closed ones.
+                self.reconcile_windows(event_loop);
+                // Coalesce wake storms. Every publish sets the flag; the
+                // first Frame event after a publish group requests the
+                // redraws and later duplicates (which see the flag cleared)
+                // skip. A real new frame is never dropped: any new publish
+                // re-sets the flag AND enqueues another Frame event, and each
+                // window's RedrawRequested additionally skips only when its
+                // own frame is unchanged (per-window ptr_eq skip).
+                if self
+                    .pending_frame
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    for rt in self.windows.values() {
                         rt.window.request_redraw();
-                    } else {
-                        tracing::debug!(target: "wiegui", "coalesced duplicate Frame event");
                     }
+                } else {
+                    tracing::debug!(target: "wiegui", "coalesced duplicate Frame event");
                 }
                 // Apply any guest-requested geometry (SetWindowPlacement) to
                 // the host window. The winapi handler set a pending request
@@ -871,12 +962,14 @@ impl ApplicationHandler<WieEvent> for WieApp {
             #[cfg(target_os = "macos")]
             WieEvent::MenuEvent(menu_event) => {
                 // Decode the string-form muda id back to the guest item id and
-                // deliver WM_COMMAND with wParam = MAKEWPARAM(id, 0).
+                // deliver WM_COMMAND with wParam = MAKEWPARAM(id, 0). The menu
+                // bar mirrors the primary window's menu (menu polish is L4's
+                // lane), so the command goes to the primary window's hwnd.
                 let id = menu_bar::menu_id_to_guest_id(menu_event.id());
                 if let Some(handle) = self.handle.as_ref()
-                    && let Some(hwnd) = self.runtime.as_ref().map_or_else(
+                    && let Some(hwnd) = self.primary_hwnd.map_or_else(
                         || handle.first_guest_window_handle(),
-                        |rt| Some(rt.hwnd.as_u64()),
+                        |hwnd| Some(hwnd.as_u64()),
                     )
                 {
                     handle.post_message(hwnd, input::WM_COMMAND, u64::from(id), 0);
@@ -1054,10 +1147,12 @@ pub fn run_gui_windowed(
         crate::gui::input_script::spawn(handle.clone(), steps)?;
     }
 
-    // Window is created lazily when the first frame arrives (in user_event).
+    // Windows are created lazily when frames arrive (in user_event):
+    // reconciliation creates a winit window per guest top-level.
     let mut app = WieApp {
         handle: Some(handle),
-        runtime: WindowState::Uncreated,
+        windows: WindowRegistry::new(),
+        primary_hwnd: None,
         pending_frame,
         window_slot,
         mouse_buttons: 0,

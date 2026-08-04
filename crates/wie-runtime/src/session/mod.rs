@@ -145,6 +145,27 @@ pub struct RuntimeSession {
     frame_last_jit: u64,
 }
 
+/// Rows of the guest's top-level windows, in guest creation order.
+///
+/// A top-level window has no parent or owner (`parent_handle == 0`); every
+/// other record — dialog boxes, controls, child windows — is excluded. The
+/// order is the `windows` record order, so the main window (created first) is
+/// the first row.
+fn top_level_window_rows(windows: &[wie_winapi::WindowRecord]) -> Vec<(u64, String, i32, i32)> {
+    windows
+        .iter()
+        .filter(|window| window.parent_handle == wie_winapi::handles::Hwnd::NULL)
+        .map(|window| {
+            (
+                window.handle.as_u64(),
+                window.title.clone(),
+                window.width,
+                window.height,
+            )
+        })
+        .collect()
+}
+
 impl RuntimeSession {
     /// Returns the PE entry-point address associated with this session.
     #[must_use]
@@ -420,6 +441,30 @@ impl RuntimeSession {
     }
 }
 
+impl GuestHandle {
+    /// Snapshot of the guest's top-level windows: (hwnd, title, width, height).
+    ///
+    /// The size-carrying variant of the session's `guest_windows_snapshot`
+    /// that the host presenter reconciles its winit window registry against
+    /// on every published frame — one host window per top-level. The rows
+    /// follow guest creation order (the `windows` record order), so the first
+    /// row is the main window.
+    ///
+    /// Kept here (the session module) instead of `session/window.rs` so this
+    /// lane owns the host-presentation seam; the implementation shares the
+    /// [`top_level_window_rows`] predicate with the session API.
+    #[must_use]
+    pub fn guest_top_level_windows(&self) -> Vec<(u64, String, i32, i32)> {
+        let Ok(state) = self.state.lock() else {
+            return Vec::new();
+        };
+        state
+            .try_window_state()
+            .map(|ws| top_level_window_rows(&ws.windows))
+            .unwrap_or_default()
+    }
+}
+
 impl Drop for RuntimeSession {
     fn drop(&mut self) {
         // Reap guest worker threads when the explicit ExitProcess path
@@ -551,5 +596,81 @@ fn journal_api_return(
     {
         use std::io::Write;
         let _ = f.write_all(line.as_bytes());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::GuestHandle;
+    use super::top_level_window_rows;
+    use crate::memory::DEFAULT_LAYOUT;
+    use std::sync::{Arc, Mutex, RwLock};
+    use wie_pe::ProcessIdentity;
+    use wie_winapi::WindowRecord;
+    use wie_winapi::handles::Hwnd;
+
+    fn record(handle: u64, parent: u64, title: &str, width: i32, height: i32) -> WindowRecord {
+        WindowRecord {
+            handle: Hwnd::from(handle),
+            parent_handle: Hwnd::from(parent),
+            title: title.to_owned(),
+            width,
+            height,
+            ..Default::default()
+        }
+    }
+
+    /// Build a `GuestHandle` whose window table holds the given records,
+    /// mirroring the `session/window.rs` test setup.
+    fn handle_with_windows(windows: Vec<WindowRecord>) -> GuestHandle {
+        let process = ProcessIdentity {
+            module_file_name: "top-levels.exe".to_owned(),
+            module_path: r"C:\App\top-levels.exe".to_owned(),
+            current_directory: r"C:\App".to_owned(),
+            command_line: "top-levels.exe".to_owned(),
+        };
+        let mut winapi_state =
+            crate::memory::default_winapi_state(&DEFAULT_LAYOUT, Arc::new(Vec::new()), &process)
+                .expect("winapi state");
+        winapi_state.window_state().windows = windows;
+        GuestHandle {
+            state: Arc::new(Mutex::new(winapi_state)),
+            queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+            menu_tree_cache: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// The top-level snapshot is size-carrying and per-top-level: N top-level
+    /// windows yield N rows, each carrying its own title and dimensions, and
+    /// children (parented controls, dialog-owned buttons) are excluded. The
+    /// rows are in guest creation order, so the main window is first.
+    #[test]
+    fn guest_top_level_windows_include_only_parentless_windows() {
+        let handle = handle_with_windows(vec![
+            record(0x100, 0, "main", 640, 420),
+            record(0x101, 0x100, "child edit", 100, 40),
+            record(0x102, 0, "dialog", 360, 140),
+        ]);
+        let rows = handle.guest_top_level_windows();
+        assert_eq!(rows.len(), 2, "only the parentless windows are top-level");
+        assert_eq!(
+            rows.first(),
+            Some(&(0x100, "main".to_owned(), 640, 420)),
+            "the main window is the first row, with its own size"
+        );
+        assert_eq!(
+            rows.get(1),
+            Some(&(0x102, "dialog".to_owned(), 360, 140)),
+            "an owned dialog is a top-level window too"
+        );
+    }
+
+    /// An empty window table yields an empty snapshot (no rows, no panic).
+    #[test]
+    fn guest_top_level_windows_are_empty_without_windows() {
+        let handle = handle_with_windows(Vec::new());
+        assert!(handle.guest_top_level_windows().is_empty());
+        assert!(top_level_window_rows(&[]).is_empty());
     }
 }

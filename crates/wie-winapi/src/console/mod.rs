@@ -505,6 +505,33 @@ impl ConsoleState {
     }
 }
 
+// ── Interactive raw-mode seam ────────────────────────────────────────────
+
+/// Switch the host terminal into raw (cbreak) mode for an interactive
+/// `--console` run.
+///
+/// `processed_input` mirrors `ENABLE_PROCESSED_INPUT`: when `true`, `ISIG`
+/// stays on so Ctrl+C raises `SIGINT` (the pump delivers it to the guest as a
+/// console control event); when `false`, Ctrl+C arrives as an ordinary key
+/// event. Returns `false` when stdin is not a terminal.
+///
+/// The guest's own console reads enter raw mode independently through
+/// [`pump::ensure_input_ready`]; this seam exists for the CLI to switch the
+/// terminal *before* the guest starts, so the first keystroke is delivered
+/// immediately.
+pub fn set_raw_mode(processed_input: bool) -> bool {
+    host_term::enter_raw(processed_input)
+}
+
+/// Restore the host terminal after an interactive run.
+///
+/// Idempotent: no-ops when raw mode was never entered (including non-terminal
+/// stdin). The `--console` CLI owns this through a drop guard so returns,
+/// errors and panics all restore the shell.
+pub fn restore_terminal() {
+    host_term::restore_now();
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
@@ -663,5 +690,46 @@ mod tests {
         assert_eq!(r.top, 0);
         assert_eq!(r.right, 0);
         assert_eq!(r.bottom, 0);
+    }
+
+    // --- Raw-mode seam ---
+
+    #[test]
+    fn restore_terminal_is_a_noop_when_raw_mode_was_never_entered() {
+        // Under the test harness stdin is piped (or the terminal untouched):
+        // restore must neither emit ANSI nor touch the terminal.
+        super::restore_terminal();
+        super::restore_terminal();
+        assert!(!host_term::raw_active());
+    }
+
+    #[test]
+    fn set_raw_mode_refuses_non_terminal_stdin() {
+        // CI / piped runs: `enter_raw` refuses instead of corrupting a
+        // terminal that is not there. On a real tty the mode is actually
+        // switched, so skip to avoid disturbing an interactive session.
+        if host_term::is_tty() {
+            return;
+        }
+        assert!(!super::set_raw_mode(true));
+        assert!(!host_term::raw_active());
+        super::restore_terminal();
+    }
+
+    #[test]
+    fn set_raw_mode_round_trips_on_a_real_terminal() {
+        // A dev running the suite from a shell has a tty; exercise the full
+        // switch/restore cycle there. Restore happens before any assertion so
+        // a failure cannot leave the terminal in raw mode (and the atexit hook
+        // from `enter_raw` is the last-resort safety net).
+        if !host_term::is_tty() {
+            return;
+        }
+        let entered = super::set_raw_mode(false);
+        let active = host_term::raw_active();
+        super::restore_terminal();
+        assert!(entered);
+        assert!(active);
+        assert!(!host_term::raw_active());
     }
 }
