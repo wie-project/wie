@@ -3,6 +3,7 @@
 pub(crate) mod app;
 pub(crate) mod file_dialog;
 pub(crate) mod find_dialog;
+pub(crate) mod font_dialog;
 pub(crate) mod headless;
 pub(crate) mod input;
 pub(crate) mod input_script;

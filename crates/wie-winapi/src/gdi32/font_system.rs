@@ -29,6 +29,25 @@ fn system_font_db() -> &'static fontdb::Database {
     })
 }
 
+/// Sorted, deduplicated primary family names of the system font database.
+///
+/// Feeds the `ChooseFontW` dialog's family LISTBOX. The database is
+/// process-wide and read-only, so this is cheap after the first
+/// `load_system_fonts`. Names keep their exact-case spelling; the font engine
+/// matches faces case-insensitively, so a chosen name resolves regardless of
+/// how the host system spells it.
+#[must_use]
+pub(crate) fn system_family_names() -> Vec<String> {
+    let db = system_font_db();
+    let mut names: Vec<String> = db
+        .faces()
+        .filter_map(|face| face.families.first().map(|(name, _)| name.to_string()))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// Fallback faces tried (in order) when the primary face lacks a glyph
 /// (e.g. CJK in a Latin-only primary). Each is checked for the codepoint.
 const FALLBACK_FAMILIES: &[&str] = &[

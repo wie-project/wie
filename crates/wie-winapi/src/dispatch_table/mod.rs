@@ -511,9 +511,15 @@ pub enum WinApiId {
     Comdlg32Findtextw = 449,
     /// Appended here (not adjacent to Comdlg32Findtextw) to avoid renumbering the entire enum.
     Comdlg32Replacetextw = 450,
+    /// Appended here (not adjacent to Comdlg32Replacetextw) to avoid renumbering the entire enum.
+    Comdlg32Choosefontw = 451,
+    /// Appended here (not adjacent to Comdlg32Choosefontw) to avoid renumbering the entire enum.
+    Comdlg32Printdlgw = 452,
+    /// Appended here (not adjacent to Comdlg32Printdlgw) to avoid renumbering the entire enum.
+    Comdlg32Pagesetupdlgw = 453,
 }
 
-pub const WINAPI_ID_COUNT: usize = 451;
+pub const WINAPI_ID_COUNT: usize = 454;
 
 impl WinApiId {
     /// Discriminant as `u16` (`#[repr(u16)]`).
@@ -552,7 +558,7 @@ const _: () = assert!(
 );
 
 /// Highest-numbered [`WinApiId`]; update alongside the enum's final variant.
-const LAST_WINAPI_ID: WinApiId = WinApiId::Comdlg32Replacetextw;
+const LAST_WINAPI_ID: WinApiId = WinApiId::Comdlg32Pagesetupdlgw;
 
 /// Hot-path dispatch: dense `u16` match over the `WinApiId` discriminant
 /// (LLVM jump table) with no string comparison — runs once per host API stop.
@@ -723,6 +729,9 @@ pub fn dispatch_winapi_id(
         WinApiId::Comdlg32Getsavefilenamew => comdlg32::handle_get_save_file_name_w(ctx),
         WinApiId::Comdlg32Commdlgextendederror => comdlg32::handle_comm_dlg_extended_error(ctx),
         WinApiId::Comdlg32Choosecolora => comdlg32::handle_choose_color_a(ctx),
+        WinApiId::Comdlg32Choosefontw => comdlg32::handle_choose_font_w(ctx),
+        WinApiId::Comdlg32Printdlgw => comdlg32::handle_print_dlg_w(ctx),
+        WinApiId::Comdlg32Pagesetupdlgw => comdlg32::handle_page_setup_dlg_w(ctx),
         WinApiId::Gdi32Selectobject => gdi32::handle_select_object(ctx),
         WinApiId::Gdi32Gettextextentpoint32a => gdi32::handle_get_text_extent_point_32_a(ctx),
         WinApiId::Gdi32Gettextextentpoint32w => gdi32::handle_get_text_extent_point_32_w(ctx),

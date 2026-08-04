@@ -4,7 +4,7 @@ use crate::vfs;
 use ahash::HashMapExt;
 
 use super::input::KeyboardState;
-use super::process::FileDialogPolicy;
+use super::process::{FileDialogPolicy, FontDialogPolicy};
 
 /// One in-flight interactive file dialog (`GetOpenFileName` / `GetSaveFileName`).
 ///
@@ -79,6 +79,47 @@ pub struct FindDialogSession {
     pub whole_word_checked: bool,
     /// Whether this is a Replace dialog (`ReplaceTextW`) vs a Find dialog.
     pub replace_mode: bool,
+}
+
+/// One in-flight modal font dialog (`ChooseFontW`).
+///
+/// Created by the comdlg32 handler when [`FontDialogPolicy::Interactive`] is
+/// set: it builds the font-dialog window (family LISTBOX, size LISTBOX,
+/// Strikeout/Underline effects buttons, OK/Cancel) and runs the file dialog's
+/// in-guest modal loop. The `EndDialog` handler writes the selection back
+/// into the guest `LOGFONTW` (via `lpLogFont`) and the `CHOOSEFONTW` fields;
+/// the effects buttons close through the shared dialog-proc stub with sentinel
+/// results, which this session translates into checkbox toggles (the dialog
+/// stays open). `None` when no font dialog is open.
+#[derive(Debug, Clone)]
+pub struct FontDialogSession {
+    /// The font-dialog window handle (a "FontDialog"-class window carrying the
+    /// file-dialog proc stub as its `dialog_proc`).
+    pub dialog_hwnd: u64,
+    /// Guest VA of the `CHOOSEFONTW` structure.
+    pub cf_ptr: u64,
+    /// Guest VA of the `LOGFONTW` the selection is written back into.
+    pub log_font_ptr: u64,
+    /// Guest `CHOOSEFONTW.rgbColors` (preserved; no color picker).
+    pub rgb_colors: u32,
+    /// Guest `CHOOSEFONTW.Flags`, preserved and OR'ed with `CF_SCREENFONTS`.
+    pub flags: u32,
+    /// The family LISTBOX control.
+    pub family_list_hwnd: u64,
+    /// The size LISTBOX control.
+    pub size_list_hwnd: u64,
+    /// The Strikeout effects button (`[x]` / `[ ]` caption carries the state).
+    pub strikeout_hwnd: u64,
+    /// The Underline effects button.
+    pub underline_hwnd: u64,
+    /// Host-side Strikeout toggle state.
+    pub strikeout_checked: bool,
+    /// Host-side Underline toggle state.
+    pub underline_checked: bool,
+    /// Selected family (seeded from the guest `LOGFONTW.lfFaceName`).
+    pub selected_family: String,
+    /// Selected point size in tenths of points (seeded from `lfHeight`).
+    pub selected_point_size: i32,
 }
 
 /// Window, UI, and input state.
@@ -158,6 +199,12 @@ pub struct WindowState {
     /// In-flight interactive file dialog, when [`FileDialogPolicy::Interactive`]
     /// is set and a dialog is open. See [`FileDialogSession`].
     pub file_dialog: Option<FileDialogSession>,
+    /// Host-side decision for `ChooseFontW` (Interactive shows the host font
+    /// dialog; Cancel returns FALSE without one).
+    pub font_dialog_policy: FontDialogPolicy,
+    /// In-flight modal font dialog, when [`FontDialogPolicy::Interactive`] is
+    /// set and a dialog is open. See [`FontDialogSession`].
+    pub font_dialog: Option<FontDialogSession>,
     /// All in-flight host-owned modeless Find/Replace dialogs (FindTextW /
     /// ReplaceTextW). See [`FindDialogSession`]. Multiple dialogs can be open
     /// at once (a guest may show Find and Replace together).
@@ -235,6 +282,8 @@ impl Default for WindowState {
             file_dialog_policy: FileDialogPolicy::default(),
             last_file_dialog_path: None,
             file_dialog: None,
+            font_dialog_policy: FontDialogPolicy::default(),
+            font_dialog: None,
             find_dialogs: Vec::new(),
             file_dialog_loop_va: 0,
             file_dialog_proc_va: 0,

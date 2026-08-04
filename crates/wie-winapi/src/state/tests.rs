@@ -2618,6 +2618,79 @@ fn test_status_bar_paint_draws_parts_with_client_edge_and_text() {
 }
 
 #[test]
+fn test_status_bar_paint_draws_part_separator_grooves() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (top, bar) = push_status_bar_pair(&mut state);
+
+    // 3 parts [80, 160, -1]; -1 = the last part extends to the right edge.
+    let parts_addr = 0x6000;
+    write_guest_int_array(&mut engine, parts_addr, &[80, 160, -1], "write parts");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        bar,
+        crate::user32::controls::SB_SETPARTS,
+        3,
+        parts_addr,
+    )
+    .expect("setparts ok")
+    .expect("some result");
+
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        bar,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint ok")
+    .expect("some result");
+    state.present().drain_pending_publishes();
+
+    let frame = state
+        .present()
+        .published
+        .get(&crate::handles::Hwnd::from(top))
+        .expect("published frame")
+        .clone();
+    let px = |col: i32, row: i32| -> u32 {
+        let idx = (usize::try_from(row).unwrap_or(0) * usize::try_from(frame.width).unwrap_or(0))
+            .saturating_add(usize::try_from(col).unwrap_or(0));
+        frame.pixels.get(idx).copied().unwrap_or(0)
+    };
+
+    // Each part boundary (except after the last part) carries the sunken
+    // groove: a BTNSHADOW line at the boundary with BTNHIGHLIGHT adjacent.
+    assert_eq!(px(80, 90), 0x00A0_A0A0, "groove shadow at boundary 80");
+    assert_eq!(px(81, 90), 0x00FF_FFFF, "groove highlight right of 80");
+    assert_eq!(px(160, 90), 0x00A0_A0A0, "groove shadow at boundary 160");
+    assert_eq!(px(161, 90), 0x00FF_FFFF, "groove highlight right of 160");
+
+    // The last part runs to the strip's right edge: no right separator.
+    assert_eq!(px(199, 90), 0x00F0_F0F0, "no separator after the last part");
+
+    // The groove spans only the interior rows (77..98), so its corners join
+    // the top highlight and bottom shadow lines cleanly.
+    assert_eq!(
+        px(80, 76),
+        0x00FF_FFFF,
+        "top edge continues over the groove"
+    );
+    assert_eq!(px(80, 77), 0x00A0_A0A0, "groove starts below the top edge");
+    assert_eq!(px(80, 98), 0x00A0_A0A0, "groove ends above the bottom edge");
+    assert_eq!(
+        px(80, 99),
+        0x00A0_A0A0,
+        "bottom edge continues over the groove"
+    );
+
+    // Between-part columns away from the grooves stay the plain face.
+    assert_eq!(px(120, 90), 0x00F0_F0F0, "part 1 interior stays BTNFACE");
+}
+
+#[test]
 fn test_status_bar_wm_size_sizes_and_positions_bar_in_parent() {
     let mut engine = test_engine();
     let mut state = default_winapi_state();

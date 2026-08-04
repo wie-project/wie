@@ -1130,6 +1130,10 @@ pub fn run_gui_windowed(
                         // enabled (see gui/find_dialog.rs); this call pins the
                         // wiring point next to the file dialog's.
                         crate::gui::find_dialog::enable_interactive_find_dialogs(&mut session);
+                        // ChooseFontW builds the host font dialog (family +
+                        // size + effects + OK/Cancel) and runs the file
+                        // dialog's in-guest modal loop.
+                        crate::gui::font_dialog::enable_interactive_font_dialogs(&mut session);
                         let handle = session.guest_handle();
 
                         // Register wake callback.

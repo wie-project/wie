@@ -1,14 +1,14 @@
 //! Common dialog stubs (`comdlg32.dll`) for open/save file simulation.
 
 use crate::guest_memory::{
-    checked_field_address, read_u32 as read_guest_u32, read_u64 as read_guest_u64,
-    write_u16 as write_guest_u16, write_u32 as write_guest_u32,
+    checked_field_address, read_i32 as read_guest_i32, read_u32 as read_guest_u32,
+    read_u64 as read_guest_u64, write_u16 as write_guest_u16, write_u32 as write_guest_u32,
 };
 use crate::guest_string::{
     read_ansi_lossy, read_utf16_lossy, write_ansi_c_string, write_utf16_c_string,
 };
 use crate::handles::Hwnd;
-use crate::state::{FileDialogSession, FindDialogSession};
+use crate::state::{FileDialogSession, FindDialogSession, FontDialogSession};
 use crate::user32::controls::{ControlClassKind, ControlState};
 use crate::user32::{
     BS_DEFPUSHBUTTON, CommandPayload, CreateWindowRequest, GuestCallbackRequest, IDCANCEL, IDOK,
@@ -17,7 +17,10 @@ use crate::user32::{
     find_window_mut, is_known_window, window_client_size,
 };
 use crate::vfs::VolumeConfig;
-use crate::{FileDialogPolicy, HandlerContext, OuterReturn, WinApiHandlerResult, WinApiState};
+use crate::{
+    FileDialogPolicy, FontDialogPolicy, HandlerContext, OuterReturn, WinApiHandlerResult,
+    WinApiState,
+};
 use anyhow::{Context, Result};
 
 /// `OPENFILENAME` field offsets on Win64 (8-byte pointer alignment).
@@ -104,6 +107,47 @@ const FINDMSGSTRING_NAME: &str = "findmsgstring";
 /// fallback registration in `findmsgstring_id`.
 const REGISTERED_MESSAGE_LIMIT: u32 = 0x1_0000;
 
+// ── ChooseFontW (commdlg.h / wingdi.h field offsets, Win64) ───────────────
+
+/// `CHOOSEFONTW.hwndOwner` — the dialog's owner window.
+const CF_HWND_OWNER: u64 = 0x08;
+/// `CHOOSEFONTW.lpLogFont` — pointer to the `LOGFONTW` written back.
+const CF_LP_LOG_FONT: u64 = 0x18;
+/// `CHOOSEFONTW.iPointSize` — returned size in tenths of points.
+const CF_IPOINT_SIZE: u64 = 0x20;
+/// `CHOOSEFONTW.Flags` — `CF_*` bits (commdlg.h).
+const CF_FLAGS: u64 = 0x24;
+/// `CHOOSEFONTW.rgbColors` — returned text color.
+const CF_RGB_COLORS: u64 = 0x28;
+
+/// `LOGFONTW.lfHeight` (negative = character height in px).
+const LF_HEIGHT: u64 = 0x00;
+/// `LOGFONTW.lfItalic` .. `lfCharSet` — one byte each, packed into a u32:
+/// italic (bit 0), underline (byte 1), strikeout (byte 2), charset (byte 3).
+/// `lfWeight` (offset 0x10) and the other untouched fields are preserved by
+/// the write-back (it only overwrites `lfHeight`, this word, and `lfFaceName`).
+const LF_ITALIC_UNDERLINE_STRIKE_CHARSET: u64 = 0x14;
+/// `LOGFONTW.lfFaceName` — `WCHAR[32]` (`LF_FACESIZE`).
+const LF_FACE_NAME: u64 = 0x1C;
+
+/// `CF_SCREENFONTS` (commdlg.h) — the dialog serves screen fonts.
+const CF_SCREEN_FONTS: u32 = 0x1;
+
+/// Control ids inside the font dialog (must differ from `IDOK`/`IDCANCEL`).
+///
+/// The two effects ids are the sentinel results the shared dialog-proc stub
+/// (`encode_file_dialog_proc`) passes to `EndDialog`; the `EndDialog` handler
+/// turns them into checkbox toggles instead of closing the dialog. They are
+/// `pub` because the wie-runtime stub encoder embeds them in machine code.
+pub const FONT_DLG_STRIKEOUT_ID: u64 = 1302;
+pub const FONT_DLG_UNDERLINE_ID: u64 = 1303;
+const FONT_DLG_FAMILY_LIST_ID: u64 = 1300;
+const FONT_DLG_SIZE_LIST_ID: u64 = 1301;
+
+/// Font-dialog window size (pixels).
+const FONT_DLG_CX: i32 = 340;
+const FONT_DLG_CY: i32 = 230;
+
 /// Handles `comdlg32.dll!GetOpenFileNameA`.
 pub fn handle_get_open_file_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     handle_get_file_name(ctx, false, "GetOpenFileNameA")
@@ -138,6 +182,50 @@ pub fn handle_comm_dlg_extended_error(ctx: &mut HandlerContext<'_>) -> Result<Wi
         return_address,
         return_value,
     })
+}
+
+/// Handles `comdlg32.dll!PrintDlgW` — simulated user-cancel.
+///
+/// Real printing is out of scope (the L6 plan): the dialog returns FALSE
+/// exactly like a user who cancels. RNotepad's `DIALOG_FilePrint` treats a
+/// FALSE return as "user canceled" and returns cleanly without touching
+/// `hDC`, so this is a safe no-op. `hDevMode`/`hDevNames` are left untouched
+/// (the `PRINTDLG` struct is not written).
+pub fn handle_print_dlg_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    state_comm_dlg_none(&mut *ctx.state);
+    tracing::info!(target: "wiegui", "PrintDlgW: printing is not emulated; cancelling");
+    let return_address = engine
+        .return_from_win64_api(0)
+        .context("failed to return from PrintDlgW")?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 0,
+    })
+}
+
+/// Handles `comdlg32.dll!PageSetupDlgW` — simulated user-cancel.
+///
+/// Like [`handle_print_dlg_w`], real page setup is out of scope: return FALSE
+/// (canceled). RNotepad's `DIALOG_FilePageSetup` ignores the return value and
+/// only copies `hDevMode`/`hDevNames` back out of the struct (both unchanged
+/// here), so the call is a clean no-op.
+pub fn handle_page_setup_dlg_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    state_comm_dlg_none(&mut *ctx.state);
+    tracing::info!(target: "wiegui", "PageSetupDlgW: page setup is not emulated; cancelling");
+    let return_address = engine
+        .return_from_win64_api(0)
+        .context("failed to return from PageSetupDlgW")?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 0,
+    })
+}
+
+/// Clear the common-dialog extended error (a canceled dialog is not an error).
+fn state_comm_dlg_none(state: &mut WinApiState) {
+    state.window_state().comm_dlg_extended_error = CDERR_NONE;
 }
 
 /// Handles `comdlg32.dll!GetFileTitleA`.
@@ -306,6 +394,48 @@ pub fn handle_choose_color_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         return_address,
         return_value: 1,
     })
+}
+
+/// Handles `comdlg32.dll!ChooseFontW`.
+///
+/// Under [`FontDialogPolicy::Cancel`] (the default for headless runs) returns
+/// FALSE like a user canceling. Under [`FontDialogPolicy::Interactive`] builds
+/// the host font dialog and runs its in-guest modal loop (see
+/// [`open_host_font_dialog`]).
+pub fn handle_choose_font_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let cf_ptr = engine
+        .read_rcx()
+        .context("failed to read RCX for ChooseFontW")?;
+
+    if cf_ptr == 0 {
+        state_comm_dlg_none(state);
+        let return_address = engine
+            .return_from_win64_api(0)
+            .context("failed to return from ChooseFontW")?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+
+    // Clone the policy to avoid borrowing window_state() across the match.
+    let policy = state.window_state().font_dialog_policy.clone();
+    match policy {
+        FontDialogPolicy::Cancel => {
+            state_comm_dlg_none(state);
+            tracing::debug!("ChooseFontW cancelled by policy");
+            let return_address = engine
+                .return_from_win64_api(0)
+                .context("failed to return from ChooseFontW")?;
+            Ok(WinApiHandlerResult {
+                return_address,
+                return_value: 0,
+            })
+        }
+        FontDialogPolicy::Interactive => open_host_font_dialog(ctx, cf_ptr),
+    }
 }
 
 fn handle_get_file_name(
@@ -1783,6 +1913,629 @@ fn destroy_find_dialog(state: &mut WinApiState, session: &FindDialogSession) {
     );
 }
 
+// ── ChooseFontW interactive dialog ─────────────────────────────────────────
+
+/// Whether `hwnd` is the in-flight modal font dialog.
+///
+/// The `EndDialog` handler routes on this: the font dialog's write-back
+/// (`complete_font_dialog`) handles the shared proc stub's sentinel results
+/// (effects toggles that keep the dialog open) in addition to OK/Cancel.
+#[must_use]
+pub(crate) fn is_font_dialog_window(state: &WinApiState, hwnd: u64) -> bool {
+    state.try_window_state().is_some_and(|ws| {
+        ws.font_dialog
+            .as_ref()
+            .is_some_and(|session| session.dialog_hwnd == hwnd)
+    })
+}
+
+/// Windows `MulDiv(a, b, c)` (wingdi.h): `(a * b + c / 2) / c`, signed
+/// rounding toward zero on the half. Used for the point ↔ pixel height
+/// conversion (the same formula RNotepad's `HeightFromPointSize` uses).
+fn mul_div(a: i64, b: i64, c: i64) -> i64 {
+    let product = a * b;
+    if product >= 0 {
+        (product + c / 2) / c
+    } else {
+        (product - c / 2) / c
+    }
+}
+
+/// Point size (tenths of points) for the initial `LOGFONTW.lfHeight`.
+///
+/// `lfHeight < 0` is a character height in pixels; at 96 DPI one point is
+/// 4/3 px, so `tenths = MulDiv(720, |height|, 96)`. `0` (the engine's default
+/// 16 px) maps to 12 points. Rounded to a whole point so the size LISTBOX
+/// (integer points 8..72) can seed its selection.
+fn point_size_tenths_from_lf_height(lf_height: i32) -> i32 {
+    let px = if lf_height == 0 {
+        16
+    } else {
+        lf_height.unsigned_abs().max(1)
+    };
+    let tenths = mul_div(720, i64::from(px), 96).max(1);
+    // Round to the nearest whole point (the list only offers integers).
+    i32::try_from((tenths + 5) / 10 * 10)
+        .unwrap_or(120)
+        .clamp(80, 720)
+}
+
+/// `LOGFONTW.lfHeight` for a point size in tenths: `-MulDiv(t, 96, 720)`.
+fn lf_height_from_point_size_tenths(point_tenths: i32) -> i32 {
+    let negative = -mul_div(i64::from(point_tenths), 96, 720);
+    i32::try_from(negative).unwrap_or(-16)
+}
+
+/// Family names for the dialog's LISTBOX, from the host font database.
+fn dialog_family_names() -> Vec<String> {
+    let mut names = crate::gdi32::system_family_names();
+    // Keep the list predictable even on a font-less host.
+    if names.is_empty() {
+        names.push("System".to_owned());
+    }
+    names
+}
+
+/// Point-size items (whole points 8..72) for the dialog's size LISTBOX.
+fn dialog_point_sizes() -> Vec<String> {
+    (8..=72).map(|point| point.to_string()).collect()
+}
+
+/// `FontDialogPolicy::Interactive`: build the host font dialog (a
+/// "FontDialog"-class window with a family LISTBOX, a size LISTBOX, the
+/// Strikeout/Underline effects buttons, and OK/Cancel) and ask the runtime to
+/// run the file dialog's in-guest modal loop.
+///
+/// The dialog window carries the planted file-dialog proc stub as its
+/// `dialog_proc`, so `WM_COMMAND(IDOK/IDCANCEL)` / `WM_CLOSE` bridge into the
+/// stub, which calls `EndDialog`. The extended `EndDialog` handler performs
+/// the `CHOOSEFONTW`/`LOGFONTW` write-back (see [`complete_font_dialog`]) and
+/// posts the `WM_QUIT` the loop exits on. The effects buttons close through
+/// the same stub with sentinel results, which the handler turns into toggles
+/// (the dialog stays open).
+fn open_host_font_dialog(ctx: &mut HandlerContext<'_>, cf_ptr: u64) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+
+    let log_font_ptr = read_guest_u64(
+        engine,
+        checked_field_address(cf_ptr, CF_LP_LOG_FONT, "CHOOSEFONTW.lpLogFont"),
+    )
+    .context("failed to read lpLogFont for ChooseFontW")?;
+    let initial_point_tenths = read_guest_u32(
+        engine,
+        checked_field_address(cf_ptr, CF_IPOINT_SIZE, "CHOOSEFONTW.iPointSize"),
+    )
+    .context("failed to read iPointSize for ChooseFontW")?;
+    let flags = read_guest_u32(
+        engine,
+        checked_field_address(cf_ptr, CF_FLAGS, "CHOOSEFONTW.Flags"),
+    )
+    .context("failed to read Flags for ChooseFontW")?;
+    let rgb_colors = read_guest_u32(
+        engine,
+        checked_field_address(cf_ptr, CF_RGB_COLORS, "CHOOSEFONTW.rgbColors"),
+    )
+    .context("failed to read rgbColors for ChooseFontW")?;
+
+    // Without the planted loop/proc bodies (headless/trace sessions) or with a
+    // font dialog already open, fall back to Cancel: a guest must never hang.
+    let loop_va = state.window_state().file_dialog_loop_va;
+    let proc_va = state.window_state().file_dialog_proc_va;
+    if log_font_ptr == 0
+        || loop_va == 0
+        || proc_va == 0
+        || state.window_state().font_dialog.is_some()
+    {
+        state_comm_dlg_none(state);
+        tracing::warn!("ChooseFontW interactive dialog unavailable; cancelling");
+        let return_address = engine
+            .return_from_win64_api(0)
+            .context("failed to return from ChooseFontW")?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+
+    // Seed the dialog from the guest's initial LOGFONTW (CF_INITTOLOGFONTSTRUCT
+    // semantics — RNotepad initializes `lf` from its stored font). The guest
+    // stack frame holding `lf` stays live for the whole modal loop, so the
+    // write-back re-reads it rather than caching the bytes here.
+    let initial_face = read_utf16_lossy(
+        engine,
+        checked_field_address(log_font_ptr, LF_FACE_NAME, "LOGFONTW.lfFaceName"),
+        32,
+    )
+    .context("failed to read ChooseFontW lfFaceName")?;
+    let lf_height = read_guest_i32(
+        engine,
+        checked_field_address(log_font_ptr, LF_HEIGHT, "LOGFONTW.lfHeight"),
+    )
+    .context("failed to read ChooseFontW lfHeight")?;
+    let effects_word = read_guest_u32(
+        engine,
+        checked_field_address(
+            log_font_ptr,
+            LF_ITALIC_UNDERLINE_STRIKE_CHARSET,
+            "LOGFONTW effects",
+        ),
+    )
+    .context("failed to read ChooseFontW underline/strikeout")?;
+
+    let family_names = dialog_family_names();
+    let point_sizes = dialog_point_sizes();
+    let seed_family_index = family_names
+        .iter()
+        .position(|name| name.eq_ignore_ascii_case(&initial_face))
+        .unwrap_or(0);
+    let seed_size_index = if initial_point_tenths != 0 {
+        let point = i32::try_from(initial_point_tenths / 10).unwrap_or(10);
+        point.clamp(8, 72).saturating_sub(8).clamp(
+            0,
+            i32::try_from(point_sizes.len().saturating_sub(1)).unwrap_or(0),
+        )
+    } else {
+        // lfHeight 0 → the engine's 16 px default → 12 points.
+        let point = point_size_tenths_from_lf_height(lf_height) / 10;
+        point.saturating_sub(8).clamp(0, 64)
+    };
+    let seed_family = family_names
+        .get(seed_family_index)
+        .cloned()
+        .unwrap_or_default();
+    let seed_point_size = point_sizes
+        .get(usize::try_from(seed_size_index).unwrap_or(0))
+        .and_then(|text| text.parse::<i32>().ok())
+        .unwrap_or(10)
+        .saturating_mul(10);
+
+    let owner_raw = read_guest_u64(
+        engine,
+        checked_field_address(cf_ptr, CF_HWND_OWNER, "CHOOSEFONTW.hwndOwner"),
+    )
+    .context("failed to read hwndOwner for ChooseFontW")?;
+    let parent_handle = resolve_dialog_owner(state, owner_raw);
+    let (owner_w, owner_h) = window_client_size(state, parent_handle);
+    let (dialog_x, dialog_y) =
+        if parent_handle != 0 && owner_w >= FONT_DLG_CX && owner_h >= FONT_DLG_CY {
+            (
+                owner_w.saturating_sub(FONT_DLG_CX).saturating_div(2),
+                owner_h.saturating_sub(FONT_DLG_CY).saturating_div(2),
+            )
+        } else {
+            (0, 0)
+        };
+
+    let (dialog_hwnd, _, _) = create_window_record(
+        state,
+        CreateWindowRequest {
+            class_identifier: WindowClassIdentifier::Name("FontDialog".to_owned()),
+            title: "Font".to_owned(),
+            style: WS_VISIBLE | WS_CLIPCHILDREN,
+            extended_style: 0,
+            parent_handle,
+            menu_handle: 0,
+            instance_handle: 0,
+            x: dialog_x,
+            y: dialog_y,
+            width: FONT_DLG_CX,
+            height: FONT_DLG_CY,
+        },
+        false,
+    )?;
+    if dialog_hwnd == 0 {
+        state_comm_dlg_none(state);
+        let return_address = engine
+            .return_from_win64_api(0)
+            .context("failed to return from ChooseFontW")?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+    if let Some(window) = find_window_mut(state, dialog_hwnd) {
+        window.dialog_proc = proc_va;
+        window.dialog_unicode = false;
+        window.client_rect = (0, 0, FONT_DLG_CX, FONT_DLG_CY);
+    }
+
+    // Row 0: "Font:" label + family LISTBOX (from the host font database).
+    create_find_control(
+        state,
+        dialog_hwnd,
+        WindowClassIdentifier::Atom(0x0082), // STATIC
+        "Font:".to_owned(),
+        0,
+        0,
+        8,
+        8,
+        60,
+        18,
+    )?;
+    let family_list_hwnd = create_find_control(
+        state,
+        dialog_hwnd,
+        WindowClassIdentifier::Atom(0x0083), // LISTBOX
+        String::new(),
+        0,
+        FONT_DLG_FAMILY_LIST_ID,
+        72,
+        8,
+        168,
+        140,
+    )?;
+    // Row 1: "Size:" label + size LISTBOX (whole points 8..72).
+    create_find_control(
+        state,
+        dialog_hwnd,
+        WindowClassIdentifier::Atom(0x0082), // STATIC
+        "Size:".to_owned(),
+        0,
+        0,
+        8,
+        156,
+        60,
+        18,
+    )?;
+    let size_list_hwnd = create_find_control(
+        state,
+        dialog_hwnd,
+        WindowClassIdentifier::Atom(0x0083), // LISTBOX
+        String::new(),
+        0,
+        FONT_DLG_SIZE_LIST_ID,
+        72,
+        156,
+        60,
+        60,
+    )?;
+
+    // Effects checkboxes render as push buttons whose caption shows the state
+    // (the find-dialog precedent); the checked state lives on the session and
+    // is mirrored into the LOGFONTW on OK. The shared dialog-proc stub maps
+    // these ids to sentinel EndDialog results the handler turns into toggles.
+    let strikeout_checked = effects_word >> 16 & 0xFF != 0;
+    let underline_checked = effects_word >> 8 & 0xFF != 0;
+    let strikeout_hwnd = create_find_control(
+        state,
+        dialog_hwnd,
+        WindowClassIdentifier::Atom(0x0080), // BUTTON
+        if strikeout_checked {
+            "[x] Strikeout".to_owned()
+        } else {
+            "[ ] Strikeout".to_owned()
+        },
+        0,
+        FONT_DLG_STRIKEOUT_ID,
+        16,
+        224,
+        100,
+        20,
+    )?;
+    let underline_hwnd = create_find_control(
+        state,
+        dialog_hwnd,
+        WindowClassIdentifier::Atom(0x0080), // BUTTON
+        if underline_checked {
+            "[x] Underline".to_owned()
+        } else {
+            "[ ] Underline".to_owned()
+        },
+        0,
+        FONT_DLG_UNDERLINE_ID,
+        120,
+        224,
+        100,
+        20,
+    )?;
+
+    // OK (the dialog's Enter default) and Cancel.
+    create_find_control(
+        state,
+        dialog_hwnd,
+        WindowClassIdentifier::Atom(0x0080), // BUTTON
+        "OK".to_owned(),
+        BS_DEFPUSHBUTTON,
+        IDOK,
+        FONT_DLG_CX.saturating_sub(176),
+        200,
+        80,
+        24,
+    )?;
+    create_find_control(
+        state,
+        dialog_hwnd,
+        WindowClassIdentifier::Atom(0x0080), // BUTTON
+        "Cancel".to_owned(),
+        0,
+        IDCANCEL,
+        FONT_DLG_CX.saturating_sub(88),
+        200,
+        80,
+        24,
+    )?;
+
+    // Seed the LISTBOX items + initial selections.
+    state
+        .window_state()
+        .control_states
+        .entry(Hwnd::from(family_list_hwnd))
+        .or_insert_with(|| ControlClassKind::ListBox.new_state());
+    state
+        .window_state()
+        .control_states
+        .entry(Hwnd::from(size_list_hwnd))
+        .or_insert_with(|| ControlClassKind::ListBox.new_state());
+    if let ControlState::ListBox { items, sel_index } = state
+        .window_state()
+        .control_states
+        .get_mut(&Hwnd::from(family_list_hwnd))
+        .context("family listbox state")?
+    {
+        *items = family_names;
+        *sel_index = i32::try_from(seed_family_index).unwrap_or(0);
+    }
+    if let ControlState::ListBox { items, sel_index } = state
+        .window_state()
+        .control_states
+        .get_mut(&Hwnd::from(size_list_hwnd))
+        .context("size listbox state")?
+    {
+        *items = point_sizes;
+        *sel_index = seed_size_index;
+    }
+
+    // The dialog is modal: an empty GetMessage must yield, and the dialog
+    // takes activation.
+    {
+        let mut queue = state.lock_message_queue();
+        queue.dialog_depth = queue.dialog_depth.saturating_add(1);
+    }
+    state.window_state().active_window_handle = Hwnd::from(dialog_hwnd);
+
+    state.window_state().font_dialog = Some(FontDialogSession {
+        dialog_hwnd,
+        cf_ptr,
+        log_font_ptr,
+        rgb_colors,
+        flags,
+        family_list_hwnd,
+        size_list_hwnd,
+        strikeout_hwnd,
+        underline_hwnd,
+        strikeout_checked,
+        underline_checked,
+        selected_family: seed_family,
+        selected_point_size: seed_point_size,
+    });
+
+    // Initial keyboard focus: the family LISTBOX.
+    state.window_state().focus_window_handle = Hwnd::from(family_list_hwnd);
+    let _ = deliver_focus_change(
+        state,
+        engine,
+        0,
+        family_list_hwnd,
+        OuterReturn::Fixed(family_list_hwnd),
+    )?;
+
+    // Mark the whole subtree invalidated so the first empty GetMessage paints
+    // the dialog face + controls.
+    for hwnd in [
+        dialog_hwnd,
+        family_list_hwnd,
+        size_list_hwnd,
+        strikeout_hwnd,
+        underline_hwnd,
+    ] {
+        if let Some(window) = find_window_mut(state, hwnd) {
+            window.invalidated = true;
+        }
+    }
+
+    tracing::info!(
+        target: "wiegui",
+        hwnd = dialog_hwnd,
+        parent = parent_handle,
+        "font dialog opened"
+    );
+
+    // Run the planted modal loop in-guest; its return value (the dialog
+    // result slot: 1 on OK, 0 on cancel) becomes the ChooseFont return.
+    Err(WinApiControlSignal::GuestCallbackRequested {
+        request: GuestCallbackRequest {
+            callback_address: loop_va,
+            window_handle: dialog_hwnd,
+            message: 0,
+            word_parameter: 0,
+            long_parameter: 0,
+            unicode: false,
+            outer_return: OuterReturn::Passthrough,
+        },
+    }
+    .into())
+}
+
+/// `EndDialog` write-back for a closing font dialog.
+///
+/// Three result shapes (the shared dialog-proc stub passes the control id):
+/// - `FONT_DLG_STRIKEOUT_ID` / `FONT_DLG_UNDERLINE_ID` — an effects toggle:
+///   flip the session's checkbox state + caption, repaint, and return `None`
+///   so the modal loop keeps running (the dialog stays open).
+/// - `1` (OK) — write the selection into the guest `LOGFONTW` (via
+///   `lpLogFont`) and the `CHOOSEFONTW` fields, return `Some(1)`.
+/// - `0` (Cancel / WM_CLOSE) — no write-back, return `Some(0)`.
+///
+/// The `LOGFONTW` is re-read from guest memory at write-back (the guest's
+/// stack frame holds it live across the modal loop), so untouched fields —
+/// `lfWeight`, `lfCharSet`, `lfItalic`, `lfPitchAndFamily`, … — are preserved
+/// exactly and only the dialog-owned fields (`lfHeight`, `lfUnderline`,
+/// `lfStrikeOut`, `lfFaceName`) change.
+pub(crate) fn complete_font_dialog(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+    dialog_hwnd: u64,
+    result: u64,
+) -> Result<Option<u64>> {
+    let Some(session) = state.window_state().font_dialog.clone() else {
+        return Ok(Some(result));
+    };
+    if session.dialog_hwnd != dialog_hwnd {
+        return Ok(Some(result));
+    }
+
+    // Effects toggle: flip the session checkbox state + caption, keep open.
+    if result == FONT_DLG_STRIKEOUT_ID || result == FONT_DLG_UNDERLINE_ID {
+        let (checked, checkbox_hwnd, label) = {
+            let font_dialog = state
+                .window_state()
+                .font_dialog
+                .as_mut()
+                .context("font-dialog session vanished")?;
+            if result == FONT_DLG_STRIKEOUT_ID {
+                font_dialog.strikeout_checked = !session.strikeout_checked;
+                (
+                    font_dialog.strikeout_checked,
+                    session.strikeout_hwnd,
+                    "Strikeout",
+                )
+            } else {
+                font_dialog.underline_checked = !session.underline_checked;
+                (
+                    font_dialog.underline_checked,
+                    session.underline_hwnd,
+                    "Underline",
+                )
+            }
+        };
+        tracing::debug!(target: "wiegui", label, checked, "font dialog effects toggled");
+        if let Some(window) = find_window_mut(state, checkbox_hwnd) {
+            window.control_text = format!("[{}] {label}", if checked { "x" } else { " " });
+            window.invalidated = true;
+        }
+        return Ok(None);
+    }
+
+    // Read the current selection from the LISTBOX controls.
+    let (family, point_size_tenths) = {
+        let window_state = state.window_state();
+        let family = window_state
+            .control_states
+            .get(&Hwnd::from(session.family_list_hwnd))
+            .and_then(|control_state| match control_state {
+                ControlState::ListBox { items, sel_index } => {
+                    let index = usize::try_from(*sel_index).ok()?;
+                    items.get(index).cloned()
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| session.selected_family.clone());
+        let point = window_state
+            .control_states
+            .get(&Hwnd::from(session.size_list_hwnd))
+            .and_then(|control_state| match control_state {
+                ControlState::ListBox { items, sel_index } => {
+                    let index = usize::try_from(*sel_index).ok()?;
+                    items.get(index).and_then(|text| text.parse::<i32>().ok())
+                }
+                _ => None,
+            })
+            .unwrap_or(session.selected_point_size / 10);
+        (family, point.saturating_mul(10).max(1))
+    };
+    let strikeout_checked = state
+        .window_state()
+        .font_dialog
+        .as_ref()
+        .map_or(session.strikeout_checked, |s| s.strikeout_checked);
+    let underline_checked = state
+        .window_state()
+        .font_dialog
+        .as_ref()
+        .map_or(session.underline_checked, |s| s.underline_checked);
+
+    if result == 0 {
+        state.window_state().font_dialog = None;
+        return Ok(Some(0));
+    }
+
+    // OK: write the selection into the guest LOGFONTW, preserving every field
+    // the dialog does not own (weight, charset, italic, precision, …).
+    let effects_word = read_guest_u32(
+        engine,
+        checked_field_address(
+            session.log_font_ptr,
+            LF_ITALIC_UNDERLINE_STRIKE_CHARSET,
+            "LOGFONTW effects",
+        ),
+    )
+    .context("failed to read LOGFONTW effects on font-dialog accept")?;
+    let charset_byte = effects_word >> 24 & 0xFF;
+    let italic_byte = effects_word & 0xFF;
+    let lf_height = lf_height_from_point_size_tenths(point_size_tenths);
+    // lfHeight is negative (character height); write its i32 bit pattern.
+    let lf_height_bits = u32::from_le_bytes(lf_height.to_le_bytes());
+    write_guest_u32(
+        engine,
+        checked_field_address(session.log_font_ptr, LF_HEIGHT, "LOGFONTW.lfHeight"),
+        lf_height_bits,
+    )
+    .context("failed to write LOGFONTW.lfHeight")?;
+    let new_effects = italic_byte
+        | u32::from(underline_checked) << 8
+        | u32::from(strikeout_checked) << 16
+        | charset_byte << 24;
+    write_guest_u32(
+        engine,
+        checked_field_address(
+            session.log_font_ptr,
+            LF_ITALIC_UNDERLINE_STRIKE_CHARSET,
+            "LOGFONTW effects",
+        ),
+        new_effects,
+    )
+    .context("failed to write LOGFONTW underline/strikeout")?;
+    write_utf16_c_string(
+        engine,
+        checked_field_address(session.log_font_ptr, LF_FACE_NAME, "LOGFONTW.lfFaceName"),
+        32,
+        &family,
+    )
+    .context("failed to write LOGFONTW.lfFaceName")?;
+
+    // CHOOSEFONTW write-back: iPointSize (tenths), Flags, rgbColors.
+    write_guest_u32(
+        engine,
+        checked_field_address(session.cf_ptr, CF_IPOINT_SIZE, "CHOOSEFONTW.iPointSize"),
+        u32::try_from(point_size_tenths).context("iPointSize does not fit u32")?,
+    )
+    .context("failed to write CHOOSEFONTW.iPointSize")?;
+    write_guest_u32(
+        engine,
+        checked_field_address(session.cf_ptr, CF_FLAGS, "CHOOSEFONTW.Flags"),
+        session.flags | CF_SCREEN_FONTS,
+    )
+    .context("failed to write CHOOSEFONTW.Flags")?;
+    write_guest_u32(
+        engine,
+        checked_field_address(session.cf_ptr, CF_RGB_COLORS, "CHOOSEFONTW.rgbColors"),
+        session.rgb_colors,
+    )
+    .context("failed to write CHOOSEFONTW.rgbColors")?;
+
+    state.window_state().font_dialog = None;
+    tracing::info!(
+        target: "wiegui",
+        %family,
+        point_tenths = point_size_tenths,
+        strikeout_checked,
+        underline_checked,
+        "font dialog accepted"
+    );
+    Ok(Some(1))
+}
+
 /// Whether `handle` is `root` or a descendant of `root` (parent-chain walk
 /// over a `(handle, parent)` snapshot).
 fn window_handle_in_subtree(pairs: &[(Hwnd, Hwnd)], handle: Hwnd, root: Hwnd) -> bool {
@@ -1807,10 +2560,11 @@ fn window_handle_in_subtree(pairs: &[(Hwnd, Hwnd)], handle: Hwnd, root: Hwnd) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_default_extension, basename_of, complete_file_dialog, directory_of,
-        finalize_guest_path, handle_find_dialog_command, handle_find_text_w,
-        handle_get_open_file_name_w, handle_replace_text_w, is_absolute_windows_path,
-        is_find_dialog_window, list_directory, resolve_initial_dir, split_path_components,
+        apply_default_extension, basename_of, complete_file_dialog, dialog_family_names,
+        directory_of, finalize_guest_path, handle_choose_font_w, handle_find_dialog_command,
+        handle_find_text_w, handle_get_open_file_name_w, handle_page_setup_dlg_w,
+        handle_print_dlg_w, handle_replace_text_w, is_absolute_windows_path, is_find_dialog_window,
+        list_directory, resolve_initial_dir, split_path_components,
     };
     use crate::guest_heap::GuestHeap;
     use crate::handles::Hwnd;
@@ -1820,6 +2574,7 @@ mod tests {
     };
     use crate::sync_obj::SyncState;
     use crate::thread::ThreadState;
+    use crate::user32::controls::ControlState;
     use crate::user32::dialog::handle_end_dialog;
     use crate::user32::{
         BN_CLICKED, CreateWindowRequest, IDOK, WS_VISIBLE, WinApiControlSignal,
@@ -1828,8 +2583,8 @@ mod tests {
     };
     use crate::vfs::VolumeConfig;
     use crate::{
-        DEFAULT_ENVIRONMENT, DllStateMap, FileDialogPolicy, HandlerContext, KernelState,
-        ModuleState, WinApiHandlerResult, WinApiState,
+        DEFAULT_ENVIRONMENT, DllStateMap, FileDialogPolicy, FontDialogPolicy, HandlerContext,
+        KernelState, ModuleState, WinApiHandlerResult, WinApiState,
     };
     use ahash::HashMap;
     use ahash::HashMapExt;
@@ -2534,6 +3289,337 @@ mod tests {
             "within-bottle `..` collapses and the canonical path is written back"
         );
         assert!(state.window_state().file_dialog.is_none());
+    }
+
+    // ── ChooseFontW (L6) ──────────────────────────────────────────────────
+
+    /// Write a `LOGFONTW` into guest memory at `ptr`.
+    fn write_logfont(engine: &mut IcedCpu, ptr: u64, face: &str, charset: u8) {
+        engine.mem_write(ptr, &0_i32.to_le_bytes()).ok(); // lfHeight (0 → 12 pt seed)
+        engine.mem_write(ptr + 0x10, &400_i32.to_le_bytes()).ok(); // lfWeight = FW_NORMAL
+        engine
+            .mem_write(ptr + 0x14, &(u32::from(charset) << 24).to_le_bytes())
+            .ok(); // lfItalic/Underline/StrikeOut = 0, lfCharSet = charset
+        engine.mem_write(ptr + 0x1C, &utf16_bytes(face)).ok(); // lfFaceName
+    }
+
+    /// Write a `CHOOSEFONTW` into guest memory at `cf_ptr` (Win64 layout).
+    fn write_choosefont(engine: &mut IcedCpu, cf_ptr: u64, logfont_ptr: u64, flags: u32, rgb: u32) {
+        engine.mem_write(cf_ptr, &0x60_u32.to_le_bytes()).ok(); // lStructSize
+        engine.mem_write(cf_ptr + 8, &0_u64.to_le_bytes()).ok(); // hwndOwner
+        engine
+            .mem_write(cf_ptr + 0x18, &logfont_ptr.to_le_bytes())
+            .ok(); // lpLogFont
+        engine.mem_write(cf_ptr + 0x20, &0_u32.to_le_bytes()).ok(); // iPointSize
+        engine.mem_write(cf_ptr + 0x24, &flags.to_le_bytes()).ok(); // Flags
+        engine.mem_write(cf_ptr + 0x28, &rgb.to_le_bytes()).ok(); // rgbColors
+    }
+
+    /// Drive `ChooseFontW` with a scripted policy; returns the result value.
+    fn dispatch_choose_font(
+        engine: &mut IcedCpu,
+        state: &mut WinApiState,
+        policy: FontDialogPolicy,
+    ) -> anyhow::Result<WinApiHandlerResult> {
+        state.window_state().font_dialog_policy = policy;
+        write_regs(engine, 0x5000, 0, 0, 0);
+        handle_choose_font_w(&mut HandlerContext::new(engine, test_environment(), state))
+    }
+
+    /// A font-dialog test scaffold: `CHOOSEFONTW` at 0x5000, `LOGFONTW` at
+    /// 0x6000, loop/proc stubs wired, Interactive policy.
+    fn font_dialog_scaffold(engine: &mut IcedCpu, state: &mut WinApiState, face: &str, flags: u32) {
+        state.window_state().file_dialog_loop_va = 0x7000_0040_B000;
+        state.window_state().file_dialog_proc_va = 0x7000_0040_B100;
+        write_logfont(engine, 0x6000, face, 1); // DEFAULT_CHARSET
+        write_choosefont(engine, 0x5000, 0x6000, flags, 0x00_30_50);
+        dispatch_choose_font(engine, state, FontDialogPolicy::Interactive)
+            .expect_err("interactive must request the modal loop");
+    }
+
+    #[test]
+    fn choose_font_cancel_policy_returns_false() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        write_logfont(&mut engine, 0x6000, "Arial", 1);
+        write_choosefont(&mut engine, 0x5000, 0x6000, 0x1 | 0x40 | 0x100, 0);
+
+        let result = dispatch_choose_font(&mut engine, &mut state, FontDialogPolicy::Cancel)
+            .expect("cancel must succeed");
+        assert_eq!(result.return_value, 0);
+        assert!(state.window_state().font_dialog.is_none());
+        // The LOGFONTW is untouched by a cancel.
+        assert_eq!(read_guest_utf16(&mut engine, 0x601C, 32), "Arial");
+    }
+
+    #[test]
+    fn choose_font_without_loop_machinery_falls_back_to_cancel() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        write_logfont(&mut engine, 0x6000, "Arial", 1);
+        write_choosefont(&mut engine, 0x5000, 0x6000, 0, 0);
+
+        let result = dispatch_choose_font(&mut engine, &mut state, FontDialogPolicy::Interactive)
+            .expect("fallback must succeed");
+        assert_eq!(result.return_value, 0, "no host dialog → cancel");
+        assert!(state.window_state().font_dialog.is_none());
+    }
+
+    #[test]
+    fn choose_font_interactive_builds_dialog_and_requests_loop() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        font_dialog_scaffold(&mut engine, &mut state, "", 0x1 | 0x40);
+
+        let dialog_hwnd = state
+            .window_state()
+            .font_dialog
+            .as_ref()
+            .expect("session recorded")
+            .dialog_hwnd;
+        let session = state.window_state().font_dialog.as_ref().unwrap().clone();
+
+        // The dialog + its controls exist; the dialog carries the proc stub.
+        // dialog + "Font:" label + family list + "Size:" label + size list +
+        // Strikeout + Underline + OK + Cancel = 9 windows.
+        let windows = &state.window_state().windows;
+        assert_eq!(windows.len(), 9, "font dialog + 8 controls");
+        let dialog = find_window(&mut state, dialog_hwnd).expect("dialog window");
+        assert_eq!(
+            dialog.dialog_proc, 0x7000_0040_B100,
+            "dialog proc = file-dialog stub"
+        );
+        // Modal: depth up, dialog active, family list focused.
+        assert_eq!(state.lock_message_queue().dialog_depth, 1);
+        assert_eq!(
+            state.window_state().active_window_handle.as_u64(),
+            dialog_hwnd
+        );
+        assert_eq!(
+            state.window_state().focus_window_handle.as_u64(),
+            session.family_list_hwnd
+        );
+        // The family list carries the host database families with a selection.
+        let ControlState::ListBox { items, sel_index } = state
+            .window_state()
+            .control_states
+            .get(&Hwnd::from(session.family_list_hwnd))
+            .expect("family listbox state")
+        else {
+            panic!("family list is a listbox");
+        };
+        assert!(!items.is_empty(), "family list seeded from the host db");
+        assert_eq!(*sel_index, 0, "default selection is the first family");
+        // The size list offers whole points 8..72 with the 12 pt seed.
+        let ControlState::ListBox {
+            items: sizes,
+            sel_index: size_sel,
+        } = state
+            .window_state()
+            .control_states
+            .get(&Hwnd::from(session.size_list_hwnd))
+            .expect("size listbox state")
+        else {
+            panic!("size list is a listbox");
+        };
+        assert_eq!(sizes.len(), 65, "8..72 inclusive");
+        assert_eq!(*size_sel, 4, "lfHeight 0 → 12 pt seed");
+    }
+
+    #[test]
+    fn end_dialog_font_writes_logfont_and_choosefont_back() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        font_dialog_scaffold(&mut engine, &mut state, "", 0x1 | 0x40);
+        let session = state.window_state().font_dialog.as_ref().unwrap().clone();
+
+        // The seeded family is whatever the host db lists first; the write-back
+        // must mirror exactly that (plus the seeded 12 pt size).
+        let ControlState::ListBox { items, sel_index } = state
+            .window_state()
+            .control_states
+            .get(&Hwnd::from(session.family_list_hwnd))
+            .expect("family listbox state")
+        else {
+            panic!("family list is a listbox");
+        };
+        let family = items
+            .get(usize::try_from(*sel_index).unwrap_or(0))
+            .unwrap()
+            .clone();
+
+        // OK: EndDialog(1) → the selection lands in the LOGFONTW + CHOOSEFONTW.
+        write_regs(&mut engine, session.dialog_hwnd, IDOK, 0, 0);
+        let result = handle_end_dialog(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("EndDialog succeeds");
+        assert_eq!(result.return_value, 1);
+
+        // LOGFONTW: lfHeight = -MulDiv(120, 96, 720) = -16; face written;
+        // underline/strikeout/charset preserved (0/0/1); weight untouched.
+        let mut height = [0_u8; 4];
+        engine.mem_read(0x6000, &mut height).ok();
+        assert_eq!(i32::from_le_bytes(height), -16, "12 pt at 96 DPI → -16 px");
+        assert_eq!(read_guest_utf16(&mut engine, 0x601C, 32), family);
+        let mut effects = [0_u8; 4];
+        engine.mem_read(0x6014, &mut effects).ok();
+        assert_eq!(
+            u32::from_le_bytes(effects),
+            1 << 24,
+            "charset preserved, effects off"
+        );
+        let mut weight = [0_u8; 4];
+        engine.mem_read(0x6010, &mut weight).ok();
+        assert_eq!(i32::from_le_bytes(weight), 400, "lfWeight preserved");
+
+        // CHOOSEFONTW: iPointSize in tenths, Flags OR CF_SCREENFONTS, rgbColors.
+        assert_eq!(
+            read_guest_u32_at(&mut engine, 0x5020),
+            120,
+            "12 pt in tenths"
+        );
+        assert_eq!(
+            read_guest_u32_at(&mut engine, 0x5024),
+            0x1 | 0x40 | 0x1,
+            "guest flags + CF_SCREENFONTS"
+        );
+        assert_eq!(
+            read_guest_u32_at(&mut engine, 0x5028),
+            0x00_30_50,
+            "rgbColors preserved"
+        );
+        assert!(
+            state.window_state().font_dialog.is_none(),
+            "session cleared"
+        );
+    }
+
+    #[test]
+    fn end_dialog_font_effects_toggle_keeps_dialog_open() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        font_dialog_scaffold(&mut engine, &mut state, "", 0x1 | 0x40);
+        let session = state.window_state().font_dialog.as_ref().unwrap().clone();
+
+        // EndDialog(strikeout sentinel) → toggle, no close.
+        write_regs(
+            &mut engine,
+            session.dialog_hwnd,
+            super::FONT_DLG_STRIKEOUT_ID,
+            0,
+            0,
+        );
+        let result = handle_end_dialog(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("EndDialog succeeds");
+        assert_eq!(result.return_value, 1, "EndDialog itself succeeds");
+        assert!(
+            state.window_state().font_dialog.is_some(),
+            "toggle must not close the dialog"
+        );
+        assert!(
+            state
+                .window_state()
+                .font_dialog
+                .as_ref()
+                .unwrap()
+                .strikeout_checked
+        );
+        assert!(
+            !state
+                .window_state()
+                .font_dialog
+                .as_ref()
+                .unwrap()
+                .underline_checked
+        );
+        let strikeout = find_window(&mut state, session.strikeout_hwnd).expect("strikeout button");
+        assert_eq!(strikeout.control_text, "[x] Strikeout");
+
+        // The underline toggle flips its own checkbox.
+        write_regs(
+            &mut engine,
+            session.dialog_hwnd,
+            super::FONT_DLG_UNDERLINE_ID,
+            0,
+            0,
+        );
+        handle_end_dialog(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("EndDialog succeeds");
+        assert!(
+            state
+                .window_state()
+                .font_dialog
+                .as_ref()
+                .unwrap()
+                .underline_checked
+        );
+
+        // OK now closes and writes the toggled effects into the LOGFONTW.
+        write_regs(&mut engine, session.dialog_hwnd, IDOK, 0, 0);
+        handle_end_dialog(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("EndDialog succeeds");
+        let mut effects = [0_u8; 4];
+        engine.mem_read(0x6014, &mut effects).ok();
+        assert_eq!(
+            u32::from_le_bytes(effects),
+            (1 << 8) | (1 << 16) | (1 << 24),
+            "underline + strikeout + charset written on OK"
+        );
+        assert!(state.window_state().font_dialog.is_none());
+    }
+
+    #[test]
+    fn print_dlg_and_page_setup_dlg_return_false() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        write_regs(&mut engine, 0x5000, 0, 0, 0);
+
+        let print_result = handle_print_dlg_w(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("PrintDlgW succeeds");
+        assert_eq!(
+            print_result.return_value, 0,
+            "PrintDlgW simulates user-cancel"
+        );
+
+        let setup_result = handle_page_setup_dlg_w(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("PageSetupDlgW succeeds");
+        assert_eq!(
+            setup_result.return_value, 0,
+            "PageSetupDlgW simulates user-cancel"
+        );
+    }
+
+    #[test]
+    fn font_dialog_family_enumeration_has_system_families() {
+        let families = dialog_family_names();
+        assert!(
+            !families.is_empty(),
+            "host fontdb must name at least one family"
+        );
+        assert!(families.windows(2).all(|pair| pair[0] <= pair[1]), "sorted");
     }
 
     // ── FindTextW / ReplaceTextW (Task 4.2) ───────────────────────────────

@@ -293,18 +293,31 @@ pub(crate) fn encode_file_dialog_loop(
 /// cmp eax, 0x0111 (WM_COMMAND); jne .zero
 /// mov eax, r8d; and eax, 0xFFFF   ; control id (low word of wParam)
 /// cmp eax, 1 (IDOK); je .ok
-/// cmp eax, 2 (IDCANCEL); jne .zero
+/// cmp eax, 2 (IDCANCEL); je .cancel
+/// cmp eax, strikeout_id; je .strikeout
+/// cmp eax, underline_id; je .underline
+/// jmp .zero
 /// .cancel: xor edx, edx; jmp .close
 /// .ok: mov edx, 1
+/// .strikeout: mov edx, strikeout_id; jmp .close
+/// .underline: mov edx, underline_id
 /// .close: sub rsp, 0x28; call EndDialog(hwnd=rcx, result=rdx); add rsp, 0x28
 /// .zero: xor eax, eax; ret
 /// ```
 ///
-/// The `EndDialog` handler performs the `OPENFILENAME` write-back and posts the
-/// `WM_QUIT` the modal loop exits on. Any other message (or unknown id) is
-/// ignored (`0`), matching DefDlgProc's pass-through.
+/// The stub is shared by the file dialog and the font dialog (`ChooseFontW`).
+/// The `EndDialog` handler performs the `OPENFILENAME` write-back for the file
+/// dialog and the `CHOOSEFONTW`/`LOGFONTW` write-back for the font dialog.
+/// The font dialog's Strikeout/Underline effects buttons carry the sentinel
+/// ids `wie_winapi::comdlg32::FONT_DLG_*_ID`; the stub ends the dialog with
+/// those ids as the result, and the `EndDialog` handler turns them into
+/// checkbox toggles (the dialog stays open) instead of closing. Any other
+/// message (or unknown id) is ignored (`0`), matching DefDlgProc's
+/// pass-through.
 pub(crate) fn encode_file_dialog_proc(end_dialog_va: u64) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(90);
+    let strikeout_id = u32::try_from(wie_winapi::comdlg32::FONT_DLG_STRIKEOUT_ID).unwrap_or(0);
+    let underline_id = u32::try_from(wie_winapi::comdlg32::FONT_DLG_UNDERLINE_ID).unwrap_or(0);
+    let mut buf = Vec::with_capacity(140);
     // mov eax, edx (message)
     buf.extend_from_slice(&[0x89, 0xd0]);
     // cmp eax, 0x0010 (WM_CLOSE); je .cancel
@@ -322,10 +335,23 @@ pub(crate) fn encode_file_dialog_proc(end_dialog_va: u64) -> Vec<u8> {
     buf.extend_from_slice(&[0x83, 0xf8, 0x01]);
     let je_ok = buf.len() + 1;
     buf.extend_from_slice(&[0x74, 0x00]);
-    // cmp eax, 2 (IDCANCEL); jne .zero
+    // cmp eax, 2 (IDCANCEL); je .cancel
     buf.extend_from_slice(&[0x83, 0xf8, 0x02]);
-    let jne_zero2 = buf.len() + 1;
-    buf.extend_from_slice(&[0x75, 0x00]);
+    let je_cancel_id = buf.len() + 1;
+    buf.extend_from_slice(&[0x74, 0x00]);
+    // cmp eax, strikeout_id; je .strikeout
+    buf.extend_from_slice(&[0x3d]);
+    buf.extend_from_slice(&strikeout_id.to_le_bytes());
+    let je_strikeout = buf.len() + 1;
+    buf.extend_from_slice(&[0x74, 0x00]);
+    // cmp eax, underline_id; je .underline
+    buf.extend_from_slice(&[0x3d]);
+    buf.extend_from_slice(&underline_id.to_le_bytes());
+    let je_underline = buf.len() + 1;
+    buf.extend_from_slice(&[0x74, 0x00]);
+    // jmp .zero (unknown id)
+    let jmp_zero = buf.len() + 1;
+    buf.extend_from_slice(&[0xeb, 0x00]);
     // .cancel: xor edx, edx ; jmp .close
     let cancel_at = buf.len();
     buf.extend_from_slice(&[0x31, 0xd2]);
@@ -334,6 +360,16 @@ pub(crate) fn encode_file_dialog_proc(end_dialog_va: u64) -> Vec<u8> {
     // .ok: mov edx, 1
     let ok_at = buf.len();
     buf.extend_from_slice(&[0xba, 0x01, 0x00, 0x00, 0x00]);
+    // .strikeout: mov edx, strikeout_id ; jmp .close
+    let strikeout_at = buf.len();
+    buf.extend_from_slice(&[0xba]);
+    buf.extend_from_slice(&strikeout_id.to_le_bytes());
+    let jmp_strikeout_close = buf.len() + 1;
+    buf.extend_from_slice(&[0xeb, 0x00]);
+    // .underline: mov edx, underline_id (falls through into .close)
+    let underline_at = buf.len();
+    buf.extend_from_slice(&[0xba]);
+    buf.extend_from_slice(&underline_id.to_le_bytes());
     // .close: sub rsp, 0x28 ; mov rax, end_dialog_va ; call rax ; add rsp, 0x28
     let close_at = buf.len();
     buf.extend_from_slice(&[0x48, 0x83, 0xec, 0x28]);
@@ -349,8 +385,17 @@ pub(crate) fn encode_file_dialog_proc(end_dialog_va: u64) -> Vec<u8> {
     patch_rel8(&mut buf, je_cancel, je_cancel + 1, cancel_at);
     patch_rel8(&mut buf, jne_zero, jne_zero + 1, zero_at);
     patch_rel8(&mut buf, je_ok, je_ok + 1, ok_at);
-    patch_rel8(&mut buf, jne_zero2, jne_zero2 + 1, zero_at);
+    patch_rel8(&mut buf, je_cancel_id, je_cancel_id + 1, cancel_at);
+    patch_rel8(&mut buf, je_strikeout, je_strikeout + 1, strikeout_at);
+    patch_rel8(&mut buf, je_underline, je_underline + 1, underline_at);
+    patch_rel8(&mut buf, jmp_zero, jmp_zero + 1, zero_at);
     patch_rel8(&mut buf, jmp_close, jmp_close + 1, close_at);
+    patch_rel8(
+        &mut buf,
+        jmp_strikeout_close,
+        jmp_strikeout_close + 1,
+        close_at,
+    );
     buf
 }
 

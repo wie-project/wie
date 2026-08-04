@@ -251,6 +251,24 @@ pub enum FileDialogPolicy {
     Interactive,
 }
 
+/// Host-side decision for `ChooseFontW`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum FontDialogPolicy {
+    #[default]
+    /// Simulate the user cancelling the dialog (`return FALSE`).
+    Cancel,
+
+    /// Show the host font dialog.
+    ///
+    /// `ChooseFontW` builds the font-dialog window (family LISTBOX, size
+    /// LISTBOX, Strikeout/Underline effects, OK/Cancel) and runs the same
+    /// in-guest modal loop the file dialog uses, so the guest stays
+    /// responsive while the user picks a font. Registered by the GUI
+    /// presenter at session start; headless runs keep [`Self::Cancel`] so a
+    /// guest can never hang on a dialog nobody can click.
+    Interactive,
+}
+
 /// One host file exposed to the guest under one or more Windows paths.
 #[derive(Debug, Clone)]
 pub struct HostFileMount {

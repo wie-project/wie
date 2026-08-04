@@ -33,11 +33,18 @@ pub(super) fn paint_control(
     let (width, height) = find_window(state, hwnd).map_or((0, 0), |w| (w.width, w.height));
 
     // The status bar's raised strip (BTNFACE face + the light/dark client
-    // edges) renders WITHOUT a font, so the strip is visible even before any
-    // text is set; the per-part text is drawn after the font resolution in
-    // the match below (Task 3.1).
+    // edges + the part grooves) renders WITHOUT a font, so the strip is
+    // visible even before any text is set; the per-part text is drawn after
+    // the font resolution in the match below (Task 3.1).
     if kind == ControlClassKind::StatusBar {
         paint_status_bar_strip(state, &info, width, height);
+        // The grooves follow the SB_SETPARTS layout, which is font-free too;
+        // the part_rights clone here mirrors the one in paint_status_bar_parts.
+        let part_rights = match control_state(state, hwnd) {
+            Some(ControlState::StatusBar { part_rights, .. }) => part_rights.clone(),
+            _ => Vec::new(),
+        };
+        paint_status_bar_separators(state, &info, width, height, &part_rights);
     }
 
     let pressed = find_window(state, hwnd).is_some_and(|w| w.flags.contains(WindowFlags::PRESSED));
@@ -250,6 +257,61 @@ fn paint_status_bar_strip(state: &mut WinApiState, info: &ResolvedWindow, width:
         1,
         COLOR_BTNSHADOW,
     );
+}
+
+/// Draw the classic comctl32 vertical groove at every part boundary.
+///
+/// Real Windows divides status-bar parts with a sunken groove: a BTNSHADOW
+/// vertical line at the boundary column with a BTNHIGHLIGHT line immediately
+/// to its right — shadow-left/highlight-right, the `EDGE_SUNKEN` direction,
+/// mirroring the raised client edge (`paint_status_bar_strip`). The lines
+/// span only the interior rows (one below the top highlight, one above the
+/// bottom shadow) so the corners join the client edges cleanly. The last
+/// part always extends to the right edge of the strip and gets no right
+/// separator; a boundary at or past the strip's edge leaves no room either.
+fn paint_status_bar_separators(
+    state: &mut WinApiState,
+    info: &ResolvedWindow,
+    width: i32,
+    height: i32,
+    part_rights: &[i32],
+) {
+    if part_rights.is_empty() || height < 3 {
+        return;
+    }
+    let top = info.offset_y.saturating_add(1);
+    let rows = height.saturating_sub(2);
+    let interior = part_rights.len().saturating_sub(1);
+    for right in part_rights.iter().take(interior) {
+        // -1 (SB_SETPARTS) means "extend to the right edge".
+        let boundary = if *right < 0 { width } else { *right };
+        if boundary >= width {
+            continue;
+        }
+        let bx = info.offset_x.saturating_add(boundary);
+        fill_rect_surface(
+            state,
+            info.hwnd,
+            info.width,
+            info.height,
+            bx,
+            top,
+            1,
+            rows,
+            COLOR_BTNSHADOW,
+        );
+        fill_rect_surface(
+            state,
+            info.hwnd,
+            info.width,
+            info.height,
+            bx.saturating_add(1),
+            top,
+            1,
+            rows,
+            COLOR_BTNHIGHLIGHT,
+        );
+    }
 }
 
 /// Draw each status-bar part's text, left-aligned in its cell with a small

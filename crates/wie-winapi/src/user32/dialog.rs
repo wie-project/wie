@@ -523,11 +523,38 @@ pub fn handle_end_dialog(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
     let return_value = if is_dialog {
         // A closing interactive file dialog writes its chosen path back into
         // the guest's OPENFILENAME buffer before the modal loop returns
-        // (GetOpenFileNameW's TRUE/FALSE is the EndDialog result). The
-        // effective result (0 when the edit held no path) is what the loop
-        // returns to the guest.
-        let result = crate::comdlg32::complete_file_dialog(engine, state, dialog_hwnd, result)
-            .context("EndDialog: file-dialog write-back failed")?;
+        // (GetOpenFileNameW's TRUE/FALSE is the EndDialog result). A closing
+        // font dialog writes the selection into the guest's LOGFONTW /
+        // CHOOSEFONTW instead — or, for an effects-toggle sentinel result,
+        // toggles the checkbox and keeps the dialog open (`None`). The
+        // effective result (0 when canceled) is what the loop returns to the
+        // guest.
+        let result = if crate::comdlg32::is_font_dialog_window(state, dialog_hwnd) {
+            let Some(font_result) =
+                crate::comdlg32::complete_font_dialog(engine, state, dialog_hwnd, result)
+                    .context("EndDialog: font-dialog write-back failed")?
+            else {
+                // Effects toggle: the dialog stays open — no result slot
+                // write, no WM_QUIT, no teardown. The stub's EndDialog call
+                // returns and the modal loop keeps pumping.
+                tracing::debug!(
+                    target: "wiegui",
+                    hwnd = dialog_hwnd,
+                    "EndDialog: font effects toggle (dialog stays open)"
+                );
+                let return_address = engine
+                    .return_from_win64_api(1)
+                    .context("failed to return from EndDialog")?;
+                return Ok(WinApiHandlerResult {
+                    return_address,
+                    return_value: 1,
+                });
+            };
+            font_result
+        } else {
+            crate::comdlg32::complete_file_dialog(engine, state, dialog_hwnd, result)
+                .context("EndDialog: file-dialog write-back failed")?
+        };
         let result = u64::from(u32::try_from(result & u64::from(u32::MAX)).unwrap_or(0));
         tracing::info!(
             target: "wiegui",
