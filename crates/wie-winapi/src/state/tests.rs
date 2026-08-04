@@ -3528,6 +3528,362 @@ fn test_edit_caret_blink_timer_toggles_caret_phase() {
     );
 }
 
+/// The visual row where the last paint drew `hwnd`'s caret bar (the
+/// `ControlState::Edit::last_caret_drawn_row` surface record).
+fn edit_caret_drawn_row(state: &WinApiState, hwnd: u64) -> Option<usize> {
+    match state
+        .try_window_state()
+        .and_then(|ws| ws.control_states.get(&crate::handles::Hwnd::from(hwnd)))
+    {
+        Some(crate::user32::controls::ControlState::Edit {
+            last_caret_drawn_row,
+            ..
+        }) => *last_caret_drawn_row,
+        _ => None,
+    }
+}
+
+/// The caret-blink tick must repaint BOTH the row where the last paint drew
+/// the caret bar AND the caret's current row. A caret that moved since the
+/// last paint leaves the old bar on the surface; a tick that repaints only
+/// the current row would let that bar survive forever (the stuck/ghost
+/// caret).
+#[test]
+fn test_edit_blink_tick_invalidates_last_drawn_and_current_caret_rows() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // 120×60 client: all three rows are visible (no auto-scroll on moves).
+    let (_, edit) = push_multiline_edit_pair(&mut state);
+
+    // Focus + paint: the caret (row 0) is drawn and its row recorded — the
+    // surface now shows the bar on row 0.
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_SETFOCUS,
+        0,
+        0,
+    )
+    .expect("focus ok")
+    .expect("some result");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint ok")
+    .expect("some result");
+    assert_eq!(
+        edit_caret_drawn_row(&state, edit),
+        Some(0),
+        "the paint must record the row where it drew the bar"
+    );
+
+    // Simulate the ghost interleaving: the caret moved to row 2 (the char
+    // `a` of "gamma") after that paint and no repaint followed, so the bar
+    // is still on the surface at row 0 while the caret lives on row 2.
+    {
+        let ws = state.window_state();
+        let crate::user32::controls::ControlState::Edit { caret, .. } = ws
+            .control_states
+            .get_mut(&crate::handles::Hwnd::from(edit))
+            .expect("edit state")
+        else {
+            panic!("edit state");
+        };
+        *caret = 12;
+    }
+
+    // The blink tick hides the bar and must repaint BOTH rows: the stale
+    // row 0 (erase the old bar) and the caret's current row 2.
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_TIMER,
+        1, // CARET_TIMER_ID
+        0,
+    )
+    .expect("blink ok")
+    .expect("some result");
+    assert!(
+        matches!(
+            control_ui(&state, edit).invalid_rows,
+            crate::user32::controls::EditInvalidation::Band(band)
+                if band.lo == 0 && band.hi >= 2
+        ),
+        "the tick must repaint the last-drawn row (0) and the current caret row (2), got {:?}",
+        control_ui(&state, edit).invalid_rows
+    );
+}
+
+/// A caret move while the blink phase is OFF must still repaint the row the
+/// caret LEFT: the old bar is cleared once the phase returns (the span
+/// invalidation covers the moved characters; the old caret's own row is
+/// repainted unconditionally so a boundary move can never skip it).
+#[test]
+fn test_edit_caret_move_with_blink_off_covers_old_and_new_rows() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // 120×60 client: the caret move from row 0 to row 1 stays in view, so
+    // no auto-scroll can widen the pending band to a full repaint.
+    let (_, edit) = push_multiline_edit_pair(&mut state);
+
+    // Focus + paint, then flip the blink phase OFF (one tick): the bar is
+    // hidden, so the next repaint must still cover the rows the caret
+    // travels — a repaint that skips the old row could leave a stale bar
+    // from an earlier paint on the surface.
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_SETFOCUS,
+        0,
+        0,
+    )
+    .expect("focus ok")
+    .expect("some result");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_TIMER,
+        1, // CARET_TIMER_ID
+        0,
+    )
+    .expect("blink ok")
+    .expect("some result");
+    assert!(
+        !control_ui(&state, edit).caret_on,
+        "the tick must hide the caret before the move"
+    );
+
+    // VK_DOWN moves the caret from row 0 to row 1. The EN_VSCROLL
+    // notification reaches the parent: with no guest WndProc in this
+    // fixture it resolves to a silent Ok (a guest-proc parent would
+    // deliver a control signal instead).
+    let moved = crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_KEYDOWN,
+        crate::user32::VK_DOWN,
+        0,
+    );
+    assert!(moved.is_ok(), "VK_DOWN must be handled by the edit");
+    assert_eq!(
+        control_ui(&state, edit).caret,
+        6,
+        "the caret must land at the start of row 1"
+    );
+    assert!(
+        matches!(
+            control_ui(&state, edit).invalid_rows,
+            crate::user32::controls::EditInvalidation::Band(band)
+                if band.lo == 0 && band.hi >= 1
+        ),
+        "the move must repaint the old caret row (0) and the new one (1), got {:?}",
+        control_ui(&state, edit).invalid_rows
+    );
+}
+
+/// A mouse click focuses an EDIT without a WM_SETFOCUS: the blink phase must
+/// reset to ON and the blink timer must re-arm, or a click on an edit whose
+/// phase was left OFF (and whose timer a kill-focus disarmed) would leave
+/// the caret invisible until the next key focus.
+#[test]
+fn test_edit_mouse_click_focus_resets_caret_blink_and_arms_timer() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (_, edit) = push_multiline_edit(&mut state, "alpha\nbeta\ngamma");
+
+    // Focus, flip the phase OFF, then lose focus: the edit is left with the
+    // caret hidden and the blink timer disarmed — the exact state a later
+    // mouse click must repair.
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_SETFOCUS,
+        0,
+        0,
+    )
+    .expect("focus ok")
+    .expect("some result");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_TIMER,
+        1, // CARET_TIMER_ID
+        0,
+    )
+    .expect("blink ok")
+    .expect("some result");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_KILLFOCUS,
+        0,
+        0,
+    )
+    .expect("killfocus ok")
+    .expect("some result");
+    assert!(
+        !control_ui(&state, edit).caret_on,
+        "the edit must be left in the hidden blink phase"
+    );
+    assert!(
+        !state
+            .window_state()
+            .timers
+            .iter()
+            .any(|t| { t.window_handle == crate::handles::Hwnd::from(edit) && t.timer_id == 1 }),
+        "kill focus must have disarmed the blink timer"
+    );
+
+    // A mouse click on the edit (the EDIT WM_LBUTTONDOWN arm) focuses it
+    // without a WM_SETFOCUS: the phase must come back ON and the timer must
+    // re-arm with the 530 ms blink half-period.
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_LBUTTONDOWN,
+        0,
+        u64::from((5_u32 << 16) | 5_u32), // lParam = (y << 16) | x
+    )
+    .expect("click ok")
+    .expect("some result");
+    assert!(
+        control_ui(&state, edit).caret_on,
+        "the click must reset the caret to the on phase"
+    );
+    assert!(
+        control_ui(&state, edit).focused,
+        "the click must focus the edit"
+    );
+    assert!(
+        state.window_state().timers.iter().any(|t| {
+            t.window_handle == crate::handles::Hwnd::from(edit)
+                && t.timer_id == 1
+                && t.interval_ms == 530
+        }),
+        "the click must re-arm the 530 ms caret timer"
+    );
+}
+
+/// The paint records the row where it actually drew the caret bar — the
+/// surface record the blink tick relies on. The record follows the caret
+/// across paints and stays put when a paint skips the bar (blink phase off).
+#[test]
+fn test_edit_paint_records_the_row_where_the_caret_was_drawn() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // 120×60 client: row 2 is on-screen, so the paint can actually draw the
+    // bar there.
+    let (_, edit) = push_multiline_edit_pair(&mut state);
+
+    // Never painted: nothing recorded.
+    assert_eq!(
+        edit_caret_drawn_row(&state, edit),
+        None,
+        "a never-painted edit has no drawn bar row"
+    );
+
+    // Focus + paint: the bar lands on row 0 and is recorded.
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_SETFOCUS,
+        0,
+        0,
+    )
+    .expect("focus ok")
+    .expect("some result");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint ok")
+    .expect("some result");
+    assert_eq!(
+        edit_caret_drawn_row(&state, edit),
+        Some(0),
+        "the first paint records the caret's row"
+    );
+
+    // The caret moves to row 2; the next paint records row 2.
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::EM_SETSEL,
+        12,
+        12,
+    )
+    .expect("setsel ok")
+    .expect("some result");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint2 ok")
+    .expect("some result");
+    assert_eq!(
+        edit_caret_drawn_row(&state, edit),
+        Some(2),
+        "the record follows the caret to row 2"
+    );
+
+    // Blink off + paint: the bar is NOT drawn, so the record is untouched
+    // (it still names the row the surface shows the bar on — the blink tick
+    // erases it from there once the phase returns).
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_TIMER,
+        1, // CARET_TIMER_ID
+        0,
+    )
+    .expect("blink ok")
+    .expect("some result");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint3 ok")
+    .expect("some result");
+    assert!(
+        !control_ui(&state, edit).caret_on,
+        "the blink phase must be off for this paint"
+    );
+    assert_eq!(
+        edit_caret_drawn_row(&state, edit),
+        Some(2),
+        "a paint that skips the bar must leave the record untouched"
+    );
+}
+
 #[test]
 fn test_edit_typing_at_bottom_autoscrolls_caret_into_view() {
     let mut engine = test_engine();

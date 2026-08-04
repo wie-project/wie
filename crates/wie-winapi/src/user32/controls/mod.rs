@@ -304,6 +304,7 @@ impl ControlClassKind {
             scrollbar_drag: None,
             tab_stops: Vec::new(),
             caret_on: true,
+            last_caret_drawn_row: None,
             invalid_rows: EditInvalidation::Clean,
             last_paint_rows: 0,
         }
@@ -386,6 +387,15 @@ pub enum ControlState {
         /// blink, ~530 ms — SPI_GETCARETTIMEOUT's default); paint draws the
         /// caret only in the on phase.
         caret_on: bool,
+        /// The visual row where the last paint DREW the caret bar (`None`
+        /// until a paint has drawn it). The surface keeps that bar until the
+        /// row is repainted without it, so the caret-blink tick invalidates
+        /// BOTH this row and the caret's current row — a caret that moved
+        /// since the last paint must never leave the old bar behind (the
+        /// stuck/ghost caret). Set only when the bar is actually drawn; a
+        /// stale value (a paint skipped the bar) merely repaints an empty
+        /// row once.
+        last_caret_drawn_row: Option<usize>,
         /// Tab stop positions in dialog units (`EM_SETTABSTOPS`). Only the
         /// tests read the stored stops today; the typing/tab-expansion path
         /// consumes them in Task 2.3.
@@ -713,6 +723,12 @@ impl ControlClassKind {
                 let x = i32::from(low_word(long_parameter));
                 let y = i32::from(high_word(long_parameter));
                 edit_mouse_down(state, hwnd, x, y);
+                // A mouse click focuses the EDIT without a WM_SETFOCUS: the
+                // blink phase is reset to ON and the blink timer re-armed
+                // exactly like the focus path, so a click on an edit whose
+                // phase was left OFF (or whose timer a kill-focus disarmed)
+                // cannot leave the caret invisible until the next key focus.
+                edit_focus_gained(state, hwnd);
                 if let Some(window) = find_window_mut(state, hwnd) {
                     window.flags.insert(WindowFlags::PRESSED);
                     window.flags.insert(WindowFlags::FOCUSED);

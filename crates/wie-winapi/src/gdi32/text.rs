@@ -59,15 +59,23 @@ enum TextTarget<'a> {
         width: u32,
         height: u32,
     },
+    /// A print job's active page canvas (0RGB white pixels, top-down). Same
+    /// shape as [`Self::Surface`] — the row blend is shared — but there is no
+    /// present-surface dirty rect to mark (the page is handed to EndDoc as-is).
+    Page {
+        pixels: &'a mut [u32],
+        width: u32,
+        height: u32,
+    },
 }
 
 impl TextTarget<'_> {
     /// (width, height) in pixels.
     fn dimensions(&self) -> (u32, u32) {
         match self {
-            Self::Dib { width, height, .. } | Self::Surface { width, height, .. } => {
-                (*width, *height)
-            }
+            Self::Dib { width, height, .. }
+            | Self::Surface { width, height, .. }
+            | Self::Page { width, height, .. } => (*width, *height),
         }
     }
 
@@ -121,6 +129,11 @@ impl TextTarget<'_> {
                 engine.mem_write(start, &buf)?;
             }
             Self::Surface {
+                pixels: surf,
+                width,
+                height: _,
+            }
+            | Self::Page {
                 pixels: surf,
                 width,
                 height: _,
@@ -278,7 +291,9 @@ struct ResolvedTextTarget<'a> {
 /// Resolve a DC handle to a writable pixel target.
 ///
 /// Memory DCs target the selected 32-bpp DIB; window DCs target the hwnd's
-/// present surface (created on demand). Screen DCs resolve to `None`.
+/// present surface (created on demand); print DCs target the job's active
+/// page canvas (`StartPage` must have run — otherwise the text is a silent
+/// no-op). Screen DCs resolve to `None`.
 fn resolve_text_target(state: &mut WinApiState, dc_handle: u64) -> Option<ResolvedTextTarget<'_>> {
     let kind = state
         .try_gdi_state()?
@@ -315,6 +330,23 @@ fn resolve_text_target(state: &mut WinApiState, dc_handle: u64) -> Option<Resolv
                     height: surface.height,
                 },
                 surface_hwnd: Some(hwnd),
+            })
+        }
+        // The print DC's canvas lives in the job (not the DcRecord — a
+        // 300-DPI letter page is ~34 MB). `current` is `Some` only between
+        // StartPage and EndPage, so TextOut before any page is a no-op.
+        DcKind::Print(dc) => {
+            let job = state.gdi_state().find_print_job_mut(dc)?;
+            let canvas = job.current.as_mut()?;
+            let width = canvas.width;
+            let height = canvas.height;
+            Some(ResolvedTextTarget {
+                target: TextTarget::Page {
+                    pixels: &mut canvas.pixels[..],
+                    width,
+                    height,
+                },
+                surface_hwnd: None,
             })
         }
         DcKind::Screen => None,
@@ -1049,8 +1081,26 @@ pub(crate) fn render_text_into_surface(
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::{blend_pixel, blend_row_dib, blend_row_surface, clip_run_band};
+    use super::{blend_pixel, blend_row_dib, blend_row_surface, clip_run_band, handle_text_out_w};
     use crate::gdi32::IRect;
+
+    use wie_cpu::{CpuEngine, IcedCpu, RwxPerms};
+
+    use std::sync::{Arc, Mutex};
+
+    use crate::guest_heap::GuestHeap;
+    use crate::handles::Hdc;
+    use crate::present::MessageQueue;
+    use crate::sync_obj::SyncState;
+    use crate::thread::ThreadState;
+    use crate::vfs::VolumeConfig;
+    use crate::{
+        DllStateMap, FileIoState, GuestStdinMode, HandlerContext, HeapState, KernelState,
+        ModuleState, ProcessState, WinApiEnvironment, WinApiState,
+    };
+
+    const STACK_VA: u64 = 0x100_0000;
+    const STACK_TOP: u64 = 0x100_FF00;
 
     /// The dirty rect for a window-DC text run must equal the run's clipped
     /// line band: `left = run x`, `top = baseline − ascent = y`,
@@ -1200,5 +1250,247 @@ mod tests {
             blend_row_dib(&mut buf, fg, &alphas);
             assert_eq!(buf, want, "DIB blend diverged from scalar reference");
         }
+    }
+
+    // ── Print-DC text routing (P1b) ──────────────────────────────────────
+    // The print arm drives the real handlers — CreateDCW → StartDocW →
+    // StartPage → TextOutW — and asserts the rasterized glyphs land in the
+    // job's active PageCanvas. Scaffolding mirrors the print.rs test module.
+
+    /// Minimal engine: maps guest pages and a stack with a valid return
+    /// address (`return_from_win64_api` pops it).
+    fn test_engine() -> IcedCpu {
+        let mut cpu = IcedCpu::open_x86_64();
+        cpu.mem_map(0x1000, 0x10_0000, RwxPerms::ALL)
+            .expect("map test memory");
+        cpu.mem_map(STACK_VA, 0x1_0000, RwxPerms::ALL)
+            .expect("map test stack");
+        cpu.mem_write(STACK_TOP, &0_u64.to_le_bytes())
+            .expect("write return address");
+        cpu.write_rsp(STACK_TOP).ok();
+        cpu
+    }
+
+    fn write_regs(cpu: &mut IcedCpu, rcx: u64, rdx: u64, r8: u64, r9: u64) {
+        cpu.write_rcx(rcx).ok();
+        cpu.write_rdx(rdx).ok();
+        cpu.write_r8(r8).ok();
+        cpu.write_r9(r9).ok();
+        // `return_from_win64_api` pops the return address, so RSP drifts 8
+        // bytes past STACK_TOP after the first call; reset it every call.
+        cpu.write_rsp(STACK_TOP).ok();
+    }
+
+    /// Write the 5th/6th stack args at their Win64 shadow-space slots.
+    fn write_stack_args(cpu: &mut IcedCpu, fifth: u64, sixth: u64) {
+        cpu.mem_write(STACK_TOP + 0x28, &fifth.to_le_bytes())
+            .expect("write 5th stack arg");
+        cpu.mem_write(STACK_TOP + 0x30, &sixth.to_le_bytes())
+            .expect("write 6th stack arg");
+    }
+
+    fn write_u64(cpu: &mut IcedCpu, addr: u64, value: u64) {
+        cpu.mem_write(addr, &value.to_le_bytes())
+            .expect("write u64");
+    }
+
+    fn write_utf16(cpu: &mut IcedCpu, addr: u64, s: &str) {
+        let mut bytes = Vec::new();
+        for unit in s.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        cpu.mem_write(addr, &bytes).expect("write utf16 string");
+    }
+
+    fn test_environment() -> WinApiEnvironment {
+        WinApiEnvironment {
+            image_base: 0,
+            command_line_a_ptr: 0,
+            command_line_w_ptr: 0,
+            environment_strings_w_ptr: 0,
+            module_file_name_a_ptr: 0,
+            module_file_name_w_ptr: 0,
+            process_heap_handle: 0,
+        }
+    }
+
+    /// Minimal state: the print + text handlers only touch the GDI slot
+    /// (lazily initialized by `gdi_state()`).
+    fn test_winapi_state() -> WinApiState {
+        WinApiState {
+            heap_state: HeapState {
+                heap: GuestHeap::new(0x2000, 0x10000),
+                next_fls_index: 0,
+                fls_slots: Vec::new(),
+                guest_fls_table_va: 0,
+            },
+            file_io: FileIoState {
+                executable_file_size: 0,
+                executable_file_bytes: Arc::new(Vec::new()),
+                executable_file_cursor: 0,
+                next_find_handle: crate::FindFileHandle::from(0),
+                find_handles: Vec::new(),
+                host_file_mounts: Vec::new(),
+                virtual_files: Vec::new(),
+                open_files: ahash::HashMap::default(),
+                next_file_handle: crate::FileHandle::from(0),
+                next_resource_handle: crate::ResourceHandle::from(0),
+                resources: Vec::new(),
+                current_directory_wide: Vec::new(),
+                bottle_root: None,
+                volumes: VolumeConfig::default(),
+                guest_file_data_next: 0,
+                guest_io: None,
+                stdin_bytes: Vec::new(),
+                stdin_cursor: 0,
+                stdin_mode: GuestStdinMode::InjectOnly,
+                ucrt_files: ahash::HashMap::default(),
+                ucrt_next_file_va: 0x0000_0000_6900_0000,
+                cached_streams: ahash::HashMap::default(),
+            },
+            process: ProcessState {
+                last_error: 0,
+                next_registry_key_handle: crate::RegistryKeyHandle::from(0),
+                registry_keys: Vec::new(),
+                main_module_file_name: String::new(),
+                main_module_path: String::new(),
+                main_module_host_dir: None,
+                error_mode: 0,
+                suspended_threads: ahash::HashMap::default(),
+                environment: Vec::new(),
+                main_module_dialogs: Vec::new(),
+                main_module_menus: Vec::new(),
+                main_module_strings: Vec::new(),
+                main_module_accelerators: Vec::new(),
+            },
+            kernel: KernelState {
+                threads: ThreadState::primary(),
+                sync: SyncState::new(),
+                seh_pending: ahash::HashMap::default(),
+            },
+            dll_states: DllStateMap::new(),
+            message_queue: Arc::new(Mutex::new(MessageQueue::default())),
+            module_state: ModuleState {
+                loaded_modules: ahash::HashMap::default(),
+                import_resolver: None,
+                get_proc_address_cache: ahash::HashMap::default(),
+                next_module_handle: crate::ModuleHandle::from(
+                    crate::dll_loader::REAL_MODULE_HANDLE_BASE,
+                ),
+            },
+        }
+    }
+
+    fn run(
+        ctx: &mut HandlerContext<'_>,
+        handler: fn(&mut HandlerContext<'_>) -> anyhow::Result<crate::WinApiHandlerResult>,
+    ) -> u64 {
+        handler(ctx).expect("handler should succeed").return_value
+    }
+
+    /// Create a print DC via the CreateDCW handler and return its handle.
+    fn create_print_dc(engine: &mut IcedCpu, state: &mut WinApiState) -> u64 {
+        write_regs(engine, 0, 0, 0, 0); // driver = NULL (any driver → print job)
+        run(
+            &mut HandlerContext::new(engine, test_environment(), state),
+            crate::gdi32::handle_create_dc_w,
+        )
+    }
+
+    /// StartDocW on `hdc` with a DOCINFOW written at `0x2000` (doc name at
+    /// `0x3000`). Returns the handler's success value.
+    fn start_doc(engine: &mut IcedCpu, state: &mut WinApiState, hdc: u64) -> u64 {
+        cpu_write_i32(engine, 0x2000, 40).expect("DOCINFO.cbSize");
+        write_u64(engine, 0x2008, 0x3000);
+        write_utf16(engine, 0x3000, "P1b text test");
+        write_regs(engine, hdc, 0x2000, 0, 0);
+        run(
+            &mut HandlerContext::new(engine, test_environment(), state),
+            crate::gdi32::handle_start_doc_w,
+        )
+    }
+
+    fn cpu_write_i32(cpu: &mut IcedCpu, addr: u64, value: i32) -> Result<(), wie_cpu::CpuError> {
+        cpu.mem_write(addr, &value.to_le_bytes())
+    }
+
+    /// TextOutW on an active print page must rasterize into the job's
+    /// PageCanvas: black 16 px glyphs at (200, 300) on the white 2550×3300
+    /// page leave non-white ink pixels.
+    #[test]
+    fn text_out_w_on_print_dc_rasterizes_page_pixels() {
+        let mut engine = test_engine();
+        let mut state = test_winapi_state();
+        let hdc = create_print_dc(&mut engine, &mut state);
+
+        assert_eq!(start_doc(&mut engine, &mut state, hdc), 1);
+        write_regs(&mut engine, hdc, 0, 0, 0);
+        assert_eq!(
+            run(
+                &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+                crate::gdi32::handle_start_page,
+            ),
+            1
+        );
+
+        // TextOutW(hdc, 200, 300, L"Hello print", 11).
+        const TEXT_VA: u64 = 0x4000;
+        write_utf16(&mut engine, TEXT_VA, "Hello print");
+        write_regs(&mut engine, hdc, 200, 300, TEXT_VA);
+        write_stack_args(&mut engine, 11, 0); // cch = 11 (WIDE chars)
+        assert_eq!(
+            run(
+                &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+                handle_text_out_w,
+            ),
+            11,
+            "TextOutW returns the character count"
+        );
+
+        let job = state
+            .gdi_state()
+            .find_print_job(Hdc::from(hdc))
+            .expect("print job");
+        let canvas = job.current.as_ref().expect("active page canvas");
+        assert_eq!((canvas.width, canvas.height), (2550, 3300));
+        // The only drawing is the text, so any non-white pixel is glyph ink.
+        let ink = canvas.pixels.iter().filter(|&&p| p != 0x00FF_FFFF).count();
+        assert!(
+            ink > 20,
+            "the page must carry rasterized text pixels (found {ink})"
+        );
+    }
+
+    /// TextOutW on a print DC before StartPage has no canvas: the handler
+    /// must be a silent no-op (returns the char count, page untouched).
+    #[test]
+    fn text_out_w_before_start_page_is_a_silent_noop() {
+        let mut engine = test_engine();
+        let mut state = test_winapi_state();
+        let hdc = create_print_dc(&mut engine, &mut state);
+
+        assert_eq!(start_doc(&mut engine, &mut state, hdc), 1);
+        // No StartPage — `job.current` is None, so the text arm resolves no
+        // target and draws nothing.
+        const TEXT_VA: u64 = 0x4000;
+        write_utf16(&mut engine, TEXT_VA, "Hello print");
+        write_regs(&mut engine, hdc, 200, 300, TEXT_VA);
+        write_stack_args(&mut engine, 11, 0);
+        assert_eq!(
+            run(
+                &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+                handle_text_out_w,
+            ),
+            11,
+            "TextOutW still returns the character count"
+        );
+
+        let job = state
+            .gdi_state()
+            .find_print_job(Hdc::from(hdc))
+            .expect("print job");
+        assert!(job.current.is_none(), "no page was started");
+        assert!(job.pages.is_empty());
     }
 }

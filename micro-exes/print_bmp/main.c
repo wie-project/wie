@@ -47,6 +47,22 @@ void entry(void) {
         SelectObject(hdc, GetStockObject(BLACK_PEN));
         Rectangle(hdc, 100, 100, 400, 300);
 
+        // P1b: a text header (inside the rect) and a footer line far below it.
+        // The host checks the BMPs for glyph ink in the footer band, so the
+        // text arm is proven independent of the P1a rectangle.
+        if (i == 0) {
+            if (!TextOutW(hdc, 150, 200, L"Hello print - page 1", 20)) {
+                ExitProcess(111);
+            }
+        } else {
+            if (!TextOutW(hdc, 150, 200, L"Hello print - page 2", 20)) {
+                ExitProcess(112);
+            }
+        }
+        if (!TextOutW(hdc, 150, 2400, L"WIE P1b footer", 14)) {
+            ExitProcess(113 + i);
+        }
+
         if (SetMapMode(hdc, MM_TEXT) != MM_TEXT) {
             ExitProcess(105 + i);
         }

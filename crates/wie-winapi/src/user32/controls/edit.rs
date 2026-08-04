@@ -6,19 +6,19 @@ use anyhow::Result;
 use super::listbox::render_control_text;
 use super::paint::fill_rect_clipped;
 use super::{
-    control_state, deliver_command, ControlClassKind, ControlState, Dimension, EditInvalidRows,
-    EditInvalidation, HitTestLayout, PaintCtx, PaintFont, TextGeom, COLOR_BTNFACE,
-    COLOR_BTNHIGHLIGHT, COLOR_BTNSHADOW, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, ES_MULTILINE,
-    SEL_EMPTY, SEL_MULTICHAR, SEL_MULTILINE, SEL_TEXT,
+    COLOR_BTNFACE, COLOR_BTNHIGHLIGHT, COLOR_BTNSHADOW, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT,
+    ControlClassKind, ControlState, Dimension, ES_MULTILINE, EditInvalidRows, EditInvalidation,
+    HitTestLayout, PaintCtx, PaintFont, SEL_EMPTY, SEL_MULTICHAR, SEL_MULTILINE, SEL_TEXT,
+    TextGeom, control_state, deliver_command,
 };
 use crate::gdi32::{FontKey, IRect, ResolvedWindow};
 use crate::guest_memory::read_u16 as read_guest_u16;
 use crate::state::{TimerRecord, WindowFlags};
 use crate::user32::{
-    find_window, find_window_mut, make_command_wparam, read_guest_ansi_lossy,
-    read_guest_utf16_lossy, write_guest_ansi_c_string, write_guest_i32, write_guest_utf16_c_string,
-    WinApiState, EN_CHANGE, VK_CONTROL, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR,
-    VK_RIGHT, VK_SHIFT, VK_UP,
+    EN_CHANGE, VK_CONTROL, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT,
+    VK_SHIFT, VK_UP, WinApiState, find_window, find_window_mut, make_command_wparam,
+    read_guest_ansi_lossy, read_guest_utf16_lossy, write_guest_ansi_c_string, write_guest_i32,
+    write_guest_utf16_c_string,
 };
 
 /// Cap for guest buffer reads (EM_SETHANDLE / EM_REPLACESEL adoption).
@@ -578,6 +578,9 @@ pub(super) fn edit_move_caret(state: &mut WinApiState, hwnd: u64, vk: u64) -> bo
             .map(|resolved| (default_key, resolved)),
     };
     let mut dirty_span: Option<(usize, usize)> = None;
+    // The character position the caret LEFT — its row is invalidated again
+    // below, independent of the dirty span's row mapping and of `caret_on`.
+    let mut moved_from: Option<usize> = None;
     let moved = (|| {
         let ws = state.window_state();
         let Some(window) = ws
@@ -613,6 +616,7 @@ pub(super) fn edit_move_caret(state: &mut WinApiState, hwnd: u64, vk: u64) -> bo
         let text = &window.control_text;
         let len = text.chars().count();
         let old_caret = (*caret).min(len);
+        moved_from = Some(old_caret);
         let (old_sel_start, old_sel_end) = (*sel_start, *sel_end);
         let multiline = *style_bits & ES_MULTILINE != 0;
         let vertical = multiline && matches!(vk, VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT);
@@ -676,10 +680,24 @@ pub(super) fn edit_move_caret(state: &mut WinApiState, hwnd: u64, vk: u64) -> bo
         true
     })();
     state.gdi_state().font_engine = font_engine;
+    if !moved {
+        return false;
+    }
     if let Some((lo, hi)) = dirty_span {
         edit_invalidate_span(state, hwnd, lo, hi.saturating_add(1));
     }
-    moved
+    // A caret-only span at the position the caret LEFT: the row where the
+    // caret bar was last drawn is repainted (erased) even when the move's
+    // character-span row mapping does not reach it — the stale-bar
+    // guarantee the span band cannot always give (a caret-only move on a
+    // line boundary can map the span to the adjacent line, and a caret
+    // move while `caret_on` is false must still clear the old bar once the
+    // blink phase returns). A redundant repaint of an already-clean row is
+    // harmless.
+    if let Some(old_caret) = moved_from {
+        edit_invalidate_span(state, hwnd, old_caret, old_caret.saturating_add(1));
+    }
+    true
 }
 
 /// The caret target for one navigation keypress: vertical moves step to the
@@ -2855,24 +2873,35 @@ pub(super) fn edit_invalidate_mutation(
     edit_invalidate_span(state, hwnd, line_start, hi);
 }
 
-/// Narrow the caret-blink repaint to the caret's row: the blink only toggles
-/// the 1 px × line-height caret bar, so the row holding the caret is all
-/// that is dirty (the row repaint erases the bar and redraws the row's text
-/// under it). Marks the window invalidated like `edit_invalidate_rows`.
-/// Falls back to a plain full-window invalidate when the layout cannot be
-/// resolved.
+/// Narrow the caret-blink repaint to the caret's rows: the blink only toggles
+/// the 1 px × line-height caret bar, so the rows holding the caret are all
+/// that is dirty (a row repaint erases the bar and redraws the row's text
+/// under it). The repaint covers BOTH the row where the last paint drew the
+/// bar (`last_caret_drawn_row`) and the caret's CURRENT row: when the caret
+/// moved since the last paint, the old bar is still on the surface at the
+/// old row, and a repaint of only the new row would leave it there forever
+/// (the stuck/ghost caret). Marks the window invalidated like
+/// `edit_invalidate_rows`. Falls back to a plain full-window invalidate when
+/// the layout cannot be resolved.
 pub(super) fn edit_invalidate_caret(state: &mut WinApiState, hwnd: u64) {
     let Some(context) = edit_scroll_context(state, hwnd) else {
         super::invalidate(state, hwnd);
         return;
     };
-    edit_invalidate_rows(
-        state,
-        hwnd,
-        context.caret_row,
-        context.caret_row,
-        context.wrap_width,
-    );
+    let last_drawn = match control_state(state, hwnd) {
+        Some(ControlState::Edit {
+            last_caret_drawn_row,
+            ..
+        }) => *last_caret_drawn_row,
+        _ => None,
+    };
+    let lo = last_drawn
+        .unwrap_or(context.caret_row)
+        .min(context.caret_row);
+    let hi = last_drawn
+        .unwrap_or(context.caret_row)
+        .max(context.caret_row);
+    edit_invalidate_rows(state, hwnd, lo, hi, context.wrap_width);
 }
 
 /// Whether the Shift key is held, per the guest keyboard state.
@@ -3160,6 +3189,7 @@ pub(super) fn paint_edit(
         caret_on,
         invalid_rows,
         last_paint_rows,
+        last_caret_drawn_row,
     ) = match control_state(ctx.state, info.dc_window.as_u64()) {
         Some(ControlState::Edit {
             caret,
@@ -3170,6 +3200,7 @@ pub(super) fn paint_edit(
             caret_on,
             invalid_rows,
             last_paint_rows,
+            last_caret_drawn_row,
             ..
         }) => (
             (*sel_start).min(*sel_end),
@@ -3180,8 +3211,9 @@ pub(super) fn paint_edit(
             *caret_on,
             *invalid_rows,
             *last_paint_rows,
+            *last_caret_drawn_row,
         ),
-        _ => (0, 0, 0, 0, 0, true, EditInvalidation::Full, 0),
+        _ => (0, 0, 0, 0, 0, true, EditInvalidation::Full, 0, None),
     };
     let (sel_start, sel_end, caret) = (sel_start.min(len), sel_end.min(len), caret.min(len));
     let line_h = font.resolved.line_height();
@@ -3299,6 +3331,11 @@ pub(super) fn paint_edit(
     let seg_hi = band_hi.saturating_sub(first_row);
     let mut painted_rows = 0_usize;
     let mut caret_drawn = false;
+    // The row the bar landed on in THIS paint (starts as the surface state:
+    // a paint that does not draw the bar must leave the recorded row
+    // untouched — the bar may still be elsewhere on the surface, or already
+    // erased by a previous repaint).
+    let mut drawn_row = last_caret_drawn_row;
     for (i, row) in rows.iter().enumerate() {
         if i < seg_lo || i > seg_hi {
             continue;
@@ -3393,7 +3430,11 @@ pub(super) fn paint_edit(
         // Pass 4: the 1 px caret bar at the caret's glyph cell. The caret
         // belongs to the first row ending at or past it — a wrap-boundary
         // caret lands at the END of the row before the break. It draws only
-        // in the blink ON phase (the focus timer toggles `caret_on`).
+        // in the blink ON phase (the focus timer toggles `caret_on`). The
+        // row where the bar lands is RECORDED on the state: the blink tick
+        // repaints that row too, so a caret that moved since this paint
+        // cannot leave the bar behind on the surface (the stale/ghost
+        // caret).
         if focused && caret_on && !caret_drawn && caret >= row.char_start && caret <= row.char_end {
             let local = caret.saturating_sub(row.char_start);
             let caret_x = x.saturating_add(font.engine.text_advance(
@@ -3410,6 +3451,7 @@ pub(super) fn paint_edit(
                 0x0000_0000,
             );
             caret_drawn = true;
+            drawn_row = Some(first_row.saturating_add(i));
         }
     }
     // Scrollbar chrome: painted LAST so it overdraws the border/text at the
@@ -3442,6 +3484,7 @@ pub(super) fn paint_edit(
     if let Some(ControlState::Edit {
         invalid_rows,
         last_paint_rows,
+        last_caret_drawn_row,
         ..
     }) = ctx
         .state
@@ -3451,6 +3494,7 @@ pub(super) fn paint_edit(
     {
         *invalid_rows = EditInvalidation::Clean;
         *last_paint_rows = painted_rows;
+        *last_caret_drawn_row = drawn_row;
     }
     Ok(())
 }
