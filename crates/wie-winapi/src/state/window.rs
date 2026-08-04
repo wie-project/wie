@@ -52,6 +52,35 @@ pub struct FileDialogPick {
     pub host_path: std::path::PathBuf,
 }
 
+/// One in-flight NATIVE (host-panel) file dialog.
+///
+/// The `GetOpenFileName`/`GetSaveFileName` handler records this on its first
+/// entry (state lock held) and returns
+/// [`WinApiControlSignal::FileDialogBridgeRequested`]; the runtime then runs
+/// the bridge WITHOUT the shared lock (the winit event loop needs that lock
+/// while the panel is up — holding it across the modal session deadlocks into
+/// the beachball) and stores the pick back here. The engine re-executes the
+/// fake API, the handler re-enters, takes this record, and writes the pick
+/// into the guest `OPENFILENAME` buffer.
+#[derive(Debug, Clone)]
+pub struct PendingNativeFileDialog {
+    /// Guest VA of the `OPENFILENAME` structure.
+    pub ofn_ptr: u64,
+    /// `OPENFILENAME.lpstrFile` buffer VA.
+    pub file_buffer_ptr: u64,
+    /// `OPENFILENAME.nMaxFile` (buffer capacity in TCHARs).
+    pub max_file: u32,
+    /// `OPENFILENAME.lpstrFileTitle` buffer VA (0 = none).
+    pub file_title_ptr: u64,
+    /// `OPENFILENAME.nMaxFileTitle`.
+    pub max_file_title: u32,
+    /// Whether the W (UTF-16) variant is in use.
+    pub unicode: bool,
+    /// The bridge's pick (the runtime records it; `None` = user cancelled or
+    /// the bridge vanished mid-call).
+    pub pick: Option<FileDialogPick>,
+}
+
 /// Host file-dialog callback: `(request) → pick, or `None` (user cancelled)`.
 ///
 /// Registered by the GUI presenter via `GuestHandle::set_file_dialog_bridge`;
@@ -266,6 +295,10 @@ pub struct WindowState {
     /// dialog, so headless runs and `trace` never see a native panel.
     /// Mirrors the MessageBox bridge seam (`present::message_box_bridge`).
     pub file_dialog_bridge: Option<FileDialogBridge>,
+    /// In-flight native file dialog: the guest is parked in
+    /// `GetOpenFileName`/`GetSaveFileName` while the host panel is up. See
+    /// [`PendingNativeFileDialog`].
+    pub pending_native_file_dialog: Option<PendingNativeFileDialog>,
     /// Host-side decision for `ChooseFontW` (Interactive shows the host font
     /// dialog; Cancel returns FALSE without one).
     pub font_dialog_policy: FontDialogPolicy,
@@ -350,6 +383,7 @@ impl Default for WindowState {
             last_file_dialog_path: None,
             file_dialog: None,
             file_dialog_bridge: None,
+            pending_native_file_dialog: None,
             font_dialog_policy: FontDialogPolicy::default(),
             font_dialog: None,
             find_dialogs: Vec::new(),
@@ -724,7 +758,7 @@ pub enum MessageQueueIdlePolicy {
 }
 
 /// Non-error control signal emitted by a WinAPI handler.
-#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum WinApiControlSignal {
     /// `GetMessageA` cannot continue until a message becomes available.
     #[error("waiting for a window message")]
@@ -735,6 +769,18 @@ pub enum WinApiControlSignal {
     GuestCallbackRequested {
         /// Description of the pending guest callback.
         request: GuestCallbackRequest,
+    },
+
+    /// `GetOpenFileName`/`GetSaveFileName` wants the host file panel shown.
+    ///
+    /// The runtime drops the shared state lock for the whole panel session
+    /// (the winit event loop needs that lock to service frame events while
+    /// the panel is up) and runs the registered [`FileDialogBridge`] on the
+    /// guest thread, then the handler's re-entry writes the pick back.
+    #[error("host file dialog bridge requested")]
+    FileDialogBridgeRequested {
+        /// Everything the native panel starts from.
+        request: FileDialogRequest,
     },
 
     /// Host thread must park (drop CPU lock) then retry / continue (MT.2/3).

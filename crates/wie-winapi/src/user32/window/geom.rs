@@ -92,7 +92,10 @@ pub fn handle_move_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         if repaint_raw != 0
             && let Some(window) = find_window_mut(state, window_handle)
         {
-            window.invalidated = false;
+            // bRepaint = TRUE invalidates the window (real Windows generates
+            // a WM_PAINT after the move) — the region stays dirty until the
+            // next paint cycle repaints it.
+            window.invalidated = true;
         }
         true
     } else if let Some(window) = find_window_mut(state, window_handle) {
@@ -107,11 +110,15 @@ pub fn handle_move_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         window.height = height;
         window.client_rect = (0, 0, width, height);
 
-        // MoveWindow(…, bRepaint = TRUE) requests a redraw, so no paint stays
-        // pending afterwards; bRepaint = FALSE leaves the previous
-        // invalidation in place.
+        // MoveWindow(…, bRepaint = TRUE) invalidates the window — a WM_PAINT
+        // is generated after the move (the moved window must repaint at its
+        // new geometry); bRepaint = FALSE leaves the previous invalidation in
+        // place. (The pre-fix semantics were inverted: TRUE *cleared* the
+        // invalidation, so a resized control never repainted — e.g. the
+        // multiline EDIT kept the status bar's stale pixels after the
+        // View > Status Bar toggle until a click repainted it.)
         if repaint_raw != 0 {
-            window.invalidated = false;
+            window.invalidated = true;
         }
         true
     } else {
@@ -1111,6 +1118,13 @@ mod tests {
 
         // The paint path sizes the client from the record:
         assert_eq!(window_client_size(&mut state, hwnd), (320, 480));
+        // bRepaint = TRUE leaves the window invalidated — the paint cycle
+        // repaints it at the new geometry (the status-bar-toggle regression:
+        // a cleared flag left the moved EDIT's old pixels until a click).
+        assert!(
+            record(&state, hwnd).invalidated,
+            "MoveWindow(…, TRUE) must invalidate the moved window"
+        );
 
         // GetClientRect reports the moved size (the reported symptom).
         engine.write_rcx(hwnd).ok();
@@ -1156,7 +1170,7 @@ mod tests {
     /// bRepaint = TRUE clears a pending invalidation (a redraw was requested,
     /// so nothing stays pending); bRepaint = FALSE leaves it in place.
     #[test]
-    fn move_window_repaint_flag_clears_pending_invalidation() {
+    fn move_window_repaint_flag_invalidates_the_window() {
         let mut engine = test_engine();
         let mut state = test_state();
         let hwnd = push_child_window(&mut state, "MoveWindowRepaint", 10, 10);
@@ -1171,11 +1185,14 @@ mod tests {
             "no repaint keeps the pending invalidation"
         );
 
-        // bRepaint = TRUE: the requested redraw consumes the pending flag.
+        // bRepaint = TRUE: the requested redraw leaves the window
+        // invalidated — the paint cycle repaints it at its new geometry
+        // (pre-fix the flag was CLEARED, so a moved control never repainted
+        // until an unrelated event; the status-bar-toggle regression).
         run_move_window(&mut engine, &mut state, (hwnd, 0, 0, 100, 100, 1));
         assert!(
-            !record(&state, hwnd).invalidated,
-            "repaint consumes the pending invalidation"
+            record(&state, hwnd).invalidated,
+            "repaint (TRUE) must leave the window invalidated for the paint cycle"
         );
     }
 

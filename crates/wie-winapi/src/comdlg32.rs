@@ -10,6 +10,7 @@ use crate::guest_string::{
 use crate::handles::Hwnd;
 use crate::state::{
     FileDialogFilter, FileDialogRequest, FileDialogSession, FindDialogSession, FontDialogSession,
+    PendingNativeFileDialog,
 };
 use crate::user32::controls::{ControlClassKind, ControlState};
 use crate::user32::{
@@ -1076,7 +1077,7 @@ fn open_host_file_dialog(
 
     // Initial keyboard focus: the path EDIT (host-side WM_SETFOCUS).
     state.window_state().focus_window_handle = Hwnd::from(edit_hwnd);
-    let _ = deliver_focus_change(state, engine, 0, edit_hwnd, OuterReturn::Fixed(edit_hwnd))?;
+    let _unused = deliver_focus_change(state, engine, 0, edit_hwnd, OuterReturn::Fixed(edit_hwnd))?;
 
     // Mark the whole subtree invalidated so the first empty GetMessage paints
     // the dialog face + controls.
@@ -1115,12 +1116,25 @@ fn open_host_file_dialog(
 /// native panel (macOS NSOpenPanel/NSSavePanel via rfd, behind the
 /// `GuestHandle::set_file_dialog_bridge` seam) and return its pick.
 ///
-/// The guest thread blocks inside the bridge until the panel closes — the
-/// native panel runs on the main thread (rfd's own dispatch), so the guest
-/// semantics match the MessageBox bridge. The picked HOST path is confined to
-/// a guest volume at accept: a pick the guest filesystem cannot see (the user
-/// browsed outside the bottle via the panel's sidebar) cancels like a user
-/// pressing Cancel — FALSE, `lpstrFile` untouched, with a `tracing::warn`.
+/// The handler runs in TWO entries, split around the bridge:
+///
+/// - **First entry** (state lock held): read the guest's `OPENFILENAME`,
+///   record everything the write-back needs in
+///   [`PendingNativeFileDialog`], and return
+///   [`WinApiControlSignal::FileDialogBridgeRequested`]. The runtime then
+///   DROPS the shared state lock and runs the bridge on the guest thread —
+///   the native panel blocks the main thread for the whole session, and the
+///   winit event loop needs the SAME lock to service frame/user events while
+///   the panel is up, so holding it across the bridge would deadlock into the
+///   macOS beachball.
+/// - **Re-entry** (the engine re-executes the fake API after the bridge
+///   returns): take the pending record, write its pick back into the guest
+///   `OPENFILENAME` buffer, and return the dialog result.
+///
+/// The picked HOST path is confined to a guest volume at accept: a pick the
+/// guest filesystem cannot see (the user browsed outside the bottle via the
+/// panel's sidebar) cancels like a user pressing Cancel — FALSE, `lpstrFile`
+/// untouched, with a `tracing::warn`.
 fn open_host_file_dialog_via_bridge(
     ctx: &mut HandlerContext<'_>,
     api_name: &str,
@@ -1130,46 +1144,53 @@ fn open_host_file_dialog_via_bridge(
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
 
+    // Re-entry: the runtime recorded the bridge's pick; write it back.
+    if let Some(pending) = state.window_state().pending_native_file_dialog.take() {
+        return finish_native_file_dialog(engine, state, api_name, pending);
+    }
+
     let initial_file = read_ofn_string(engine, buffer.file_buffer_ptr, unicode, api_name)?;
-    let initial_dir_ptr = read_guest_u64(
-        engine,
-        checked_field_address(
-            buffer.ofn_ptr,
-            OFN_LPSTR_INITIAL_DIR,
-            "OPENFILENAME.lpstrInitialDir",
-        ),
-    )
-    .with_context(|| format!("failed to read lpstrInitialDir for {api_name}"))?;
-    let caller_initial_dir = if initial_dir_ptr != 0 {
-        read_ofn_string(engine, initial_dir_ptr, unicode, api_name)?
-    } else {
-        String::new()
-    };
     let filter_ptr = read_guest_u64(
         engine,
         checked_field_address(buffer.ofn_ptr, OFN_LPSTR_FILTER, "OPENFILENAME.lpstrFilter"),
     )
     .with_context(|| format!("failed to read lpstrFilter for {api_name}"))?;
 
-    // Confined resolution (the same precedence the in-app dialog uses):
-    // lpstrInitialDir when guest-visible, then the lpstrFile directory, then
-    // the guest cwd, else the bottle root. The panel starts there — mapped to
-    // a host directory (the bottle root's drive_c when nothing maps).
-    let initial_dir = resolve_initial_dir(
-        &state.file_io.volumes,
-        &current_guest_directory(state),
-        &caller_initial_dir,
-        directory_of(&initial_file),
-    );
-    let initial_host_dir = crate::vfs::guest_path_to_host(&state.file_io.volumes, &initial_dir)
-        .map(|mapping| mapping.host)
+    // The native panel starts at the BOTTLE ROOT (`{root}/drive_c`) — the
+    // user asked for the bottle root, not the guest cwd (the process
+    // identity pins it to `C:\App`). The in-app emulated dialog keeps its
+    // own precedence; only the bridge path changes. Without a bottle root,
+    // fall back to the confined resolution (the same precedence the in-app
+    // dialog uses).
+    let initial_host_dir = state
+        .file_io
+        .volumes
+        .bottle_root
+        .as_ref()
+        .map(|root| root.join("drive_c"))
         .or_else(|| {
-            state
-                .file_io
-                .volumes
-                .bottle_root
-                .as_ref()
-                .map(|root| root.join("drive_c"))
+            let initial_dir_ptr = read_guest_u64(
+                engine,
+                checked_field_address(
+                    buffer.ofn_ptr,
+                    OFN_LPSTR_INITIAL_DIR,
+                    "OPENFILENAME.lpstrInitialDir",
+                ),
+            )
+            .unwrap_or(0);
+            let caller_initial_dir = if initial_dir_ptr != 0 {
+                read_ofn_string(engine, initial_dir_ptr, unicode, api_name).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let initial_dir = resolve_initial_dir(
+                &state.file_io.volumes,
+                &current_guest_directory(state),
+                &caller_initial_dir,
+                directory_of(&initial_file),
+            );
+            crate::vfs::guest_path_to_host(&state.file_io.volumes, &initial_dir)
+                .map(|mapping| mapping.host)
         });
     let default_file_name = {
         let basename = basename_of(&initial_file);
@@ -1190,17 +1211,36 @@ fn open_host_file_dialog_via_bridge(
         filters,
     };
 
-    // Invoke the host bridge; the borrow stays scoped to this statement so the
-    // write-back below can mutate `state`. `None` is the user cancelling (the
-    // `and_then` flattens the bridge's own `Option` — a `map` would nest it).
-    let picked = state
-        .try_window_state()
-        .and_then(|window_state| window_state.file_dialog_bridge.as_ref())
-        .and_then(|bridge| bridge(&request));
+    // Record the write-back metadata and hand the request to the runtime: it
+    // drops the shared state lock, runs the bridge on this guest thread, and
+    // the engine's re-execution of the fake API re-enters this handler (see
+    // `PendingNativeFileDialog`).
+    state.window_state().pending_native_file_dialog = Some(PendingNativeFileDialog {
+        ofn_ptr: buffer.ofn_ptr,
+        file_buffer_ptr: buffer.file_buffer_ptr,
+        max_file: buffer.max_file,
+        file_title_ptr: buffer.file_title_ptr,
+        max_file_title: buffer.max_file_title,
+        unicode,
+        pick: None,
+    });
 
-    let Some(pick) = picked else {
-        // User cancelled the panel (or the bridge vanished mid-call — a
-        // racing teardown must not hang the guest).
+    Err(WinApiControlSignal::FileDialogBridgeRequested { request }.into())
+}
+
+/// Write the native panel's pick back into the guest `OPENFILENAME` buffer.
+///
+/// Runs on the handler's re-entry (after the runtime ran the bridge WITHOUT
+/// the shared state lock). `None` pick = the user cancelled (or the bridge
+/// vanished mid-call — a racing teardown must not hang the guest); an
+/// out-of-bottle pick is refused like a cancel — FALSE, `lpstrFile` untouched.
+fn finish_native_file_dialog(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+    api_name: &str,
+    pending: PendingNativeFileDialog,
+) -> Result<WinApiHandlerResult> {
+    let Some(pick) = pending.pick else {
         state.window_state().comm_dlg_extended_error = CDERR_NONE;
         tracing::info!(api = api_name, "native file dialog cancelled");
         return file_dialog_return(engine, api_name, 0);
@@ -1221,7 +1261,7 @@ fn open_host_file_dialog_via_bridge(
         return file_dialog_return(engine, api_name, 0);
     };
 
-    if buffer.file_buffer_ptr == 0 || buffer.max_file == 0 {
+    if pending.file_buffer_ptr == 0 || pending.max_file == 0 {
         state.window_state().comm_dlg_extended_error = CDERR_NONE;
         tracing::warn!(
             api = api_name,
@@ -1236,20 +1276,20 @@ fn open_host_file_dialog_via_bridge(
     write_selected_path(
         engine,
         &SelectedPathWrite {
-            ofn_ptr: buffer.ofn_ptr,
-            file_buffer_ptr: buffer.file_buffer_ptr,
-            max_file: buffer.max_file,
-            file_title_ptr: buffer.file_title_ptr,
-            max_file_title: buffer.max_file_title,
+            ofn_ptr: pending.ofn_ptr,
+            file_buffer_ptr: pending.file_buffer_ptr,
+            max_file: pending.max_file,
+            file_title_ptr: pending.file_title_ptr,
+            max_file_title: pending.max_file_title,
             path: &guest_path,
-            unicode,
+            unicode: pending.unicode,
         },
     )
     .with_context(|| format!("failed to write selected path for {api_name}"))?;
 
     state.window_state().comm_dlg_extended_error = CDERR_NONE;
     state.window_state().last_file_dialog_path = Some(guest_path.clone());
-    tracing::info!(api = api_name, %guest_path, unicode, "native file dialog accepted");
+    tracing::info!(api = api_name, %guest_path, unicode = pending.unicode, "native file dialog accepted");
     file_dialog_return(engine, api_name, 1)
 }
 
@@ -1867,7 +1907,7 @@ fn handle_find_replace_text(
     // so the first keystrokes land in the find field.
     state.window_state().active_window_handle = Hwnd::from(dialog_hwnd);
     state.window_state().focus_window_handle = Hwnd::from(find_edit_hwnd);
-    let _ = deliver_focus_change(
+    let _unused = deliver_focus_change(
         state,
         engine,
         0,
@@ -2648,7 +2688,7 @@ fn open_host_font_dialog(ctx: &mut HandlerContext<'_>, cf_ptr: u64) -> Result<Wi
 
     // Initial keyboard focus: the family LISTBOX.
     state.window_state().focus_window_handle = Hwnd::from(family_list_hwnd);
-    let _ = deliver_focus_change(
+    let _unused = deliver_focus_change(
         state,
         engine,
         0,
@@ -3632,6 +3672,13 @@ mod tests {
     // ── Native file-dialog bridge (macOS panels via rfd) ──────────────────
 
     /// Drive the W handler with a scripted native bridge (Interactive policy).
+    ///
+    /// The real flow is two entries around the bridge: the handler's first
+    /// entry builds the request and returns `FileDialogBridgeRequested`; the
+    /// runtime runs the bridge WITHOUT the shared lock and records the pick;
+    /// the engine's re-execution of the fake API re-enters the handler, which
+    /// writes the pick back. This helper simulates exactly that (the runtime
+    /// is not involved in unit tests).
     fn dispatch_open_with_bridge(
         engine: &mut IcedCpu,
         state: &mut WinApiState,
@@ -3640,6 +3687,34 @@ mod tests {
         state.window_state().file_dialog_policy = FileDialogPolicy::Interactive;
         state.window_state().file_dialog_bridge = Some(bridge);
         write_regs(engine, 0x5000, 0, 0, 0);
+        let first = handle_get_open_file_name_w(&mut HandlerContext::new(
+            engine,
+            test_environment(),
+            state,
+        ))
+        .expect_err("the first entry parks the guest for the native panel");
+        let signal = first
+            .downcast_ref::<WinApiControlSignal>()
+            .expect("a control signal");
+        let WinApiControlSignal::FileDialogBridgeRequested { request } = signal else {
+            panic!("expected a file-dialog bridge request");
+        };
+        // What the runtime does between the two entries: take the bridge out,
+        // run it (no shared lock), restore it, record the pick.
+        let bridge = state
+            .window_state()
+            .file_dialog_bridge
+            .take()
+            .expect("bridge registered");
+        let picked = bridge(request);
+        state.window_state().file_dialog_bridge = Some(bridge);
+        state
+            .window_state()
+            .pending_native_file_dialog
+            .as_mut()
+            .expect("pending session recorded")
+            .pick = picked;
+        // Re-entry: the handler writes the pick back.
         handle_get_open_file_name_w(&mut HandlerContext::new(engine, test_environment(), state))
     }
 
@@ -3658,12 +3733,12 @@ mod tests {
         write_ofn(&mut engine, 0x5000, file_buf, 260, 0);
 
         let bridge: FileDialogBridge = Box::new(|request| {
-            // The panel starts in the guest cwd (C:\ fallback) mapped to the
-            // host bottle directory.
+            // The native panel starts at the BOTTLE ROOT mapped into the
+            // bottle (`{root}/drive_c`), not the guest cwd.
             assert_eq!(
                 request.initial_host_dir.as_deref(),
                 Some(std::path::Path::new("/tmp/bottle/drive_c")),
-                "initial dir = the confined guest dir mapped into the bottle"
+                "initial dir = the bottle root mapped into the bottle"
             );
             assert_eq!(request.default_file_name.as_deref(), Some("notes.txt"));
             assert!(!request.is_save, "GetOpenFileName is an open panel");
@@ -3779,6 +3854,34 @@ mod tests {
         state.window_state().file_dialog_policy = FileDialogPolicy::Interactive;
         state.window_state().file_dialog_bridge = Some(bridge);
         write_regs(&mut engine, 0x5000, 0, 0, 0);
+        // Entry 1: build the request; entry 2 (after the bridge ran) writes
+        // the pick back — the same two-entry flow `dispatch_open_with_bridge`
+        // drives, here for the Save handler.
+        let first = handle_get_save_file_name_w(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect_err("the first entry parks the guest for the native panel");
+        let signal = first
+            .downcast_ref::<WinApiControlSignal>()
+            .expect("a control signal");
+        let WinApiControlSignal::FileDialogBridgeRequested { request } = signal else {
+            panic!("expected a file-dialog bridge request");
+        };
+        let bridge = state
+            .window_state()
+            .file_dialog_bridge
+            .take()
+            .expect("bridge registered");
+        let picked = bridge(request);
+        state.window_state().file_dialog_bridge = Some(bridge);
+        state
+            .window_state()
+            .pending_native_file_dialog
+            .as_mut()
+            .expect("pending session recorded")
+            .pick = picked;
         let result = handle_get_save_file_name_w(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
@@ -3818,6 +3921,50 @@ mod tests {
         assert_eq!(
             read_guest_utf16(&mut engine, file_buf, 64),
             r"D:\archive\a.7z"
+        );
+    }
+
+    /// The native panel opens at the BOTTLE ROOT even when the guest cwd is
+    /// `C:\App` (the process identity hardcodes it) — the user asked for the
+    /// bottle root, not the guest's working directory.
+    #[test]
+    fn bridge_initial_dir_is_the_bottle_root_not_the_guest_cwd() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        state.file_io.volumes = VolumeConfig {
+            bottle_root: Some(PathBuf::from("/tmp/bottle")),
+            drive_d_root: None,
+        };
+        // The real session seeds the guest cwd to C:\App; the in-app dialog
+        // would resolve to {root}/drive_c/App, but the bridge must NOT.
+        state.file_io.current_directory_wide = "C:\\App\0".encode_utf16().collect();
+        let file_buf = 0x6000;
+        engine.mem_write(file_buf, &utf16_bytes("notes.txt")).ok();
+        write_ofn(&mut engine, 0x5000, file_buf, 260, 0);
+
+        let bridge: FileDialogBridge = Box::new(|request| {
+            assert_eq!(
+                request.initial_host_dir.as_deref(),
+                Some(std::path::Path::new("/tmp/bottle/drive_c")),
+                "initial dir = the bottle root, not C:\\App's directory"
+            );
+            assert_ne!(
+                request.initial_host_dir.as_deref(),
+                Some(std::path::Path::new("/tmp/bottle/drive_c/App")),
+                "the guest cwd must not leak into the native panel"
+            );
+            Some(FileDialogPick {
+                host_path: PathBuf::from("/tmp/bottle/drive_c/notes.txt"),
+            })
+        });
+
+        let result = dispatch_open_with_bridge(&mut engine, &mut state, bridge)
+            .expect("bridge accept must succeed");
+        assert_eq!(result.return_value, 1);
+        assert_eq!(
+            read_guest_utf16(&mut engine, file_buf, 64),
+            r"C:\notes.txt",
+            "a pick at the bottle root maps back to C:\\"
         );
     }
 

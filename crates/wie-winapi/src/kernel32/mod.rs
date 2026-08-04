@@ -119,6 +119,8 @@ const INVALID_SET_FILE_POINTER: u64 = 0xffff_ffff;
 const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_PATH_NOT_FOUND: u32 = 3;
 const ERROR_ACCESS_DENIED: u32 = 5;
+/// Win32 `ERROR_INVALID_DRIVE` — SetCurrentDirectory on an unmapped drive.
+const ERROR_INVALID_DRIVE: u32 = 15;
 /// CreateFile CREATE_NEW when the file already exists (Microsoft Learn).
 const ERROR_FILE_EXISTS: u32 = 80;
 const ERROR_MOD_NOT_FOUND: u32 = 126;

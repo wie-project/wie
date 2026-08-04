@@ -9,6 +9,7 @@ use super::{
 pub fn handle_create_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
+    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let path_ptr = engine.read_rcx()?;
     let path = if path_ptr == 0 {
         String::new()
@@ -26,6 +27,7 @@ pub fn handle_create_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 pub fn handle_create_directory_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
+    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let path_ptr = engine.read_rcx()?;
     let path = if path_ptr == 0 {
         String::new()
@@ -43,6 +45,7 @@ pub fn handle_create_directory_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 pub fn handle_delete_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
+    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let path_ptr = engine.read_rcx()?;
     let path = if path_ptr == 0 {
         String::new()
@@ -60,6 +63,7 @@ pub fn handle_delete_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 pub fn handle_delete_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
+    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let path_ptr = engine.read_rcx()?;
     let path = if path_ptr == 0 {
         String::new()
@@ -77,6 +81,7 @@ pub fn handle_delete_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 pub fn handle_remove_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
+    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let path_ptr = engine.read_rcx()?;
     let path = if path_ptr == 0 {
         String::new()
@@ -94,6 +99,7 @@ pub fn handle_remove_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 pub fn handle_remove_directory_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
+    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let path_ptr = engine.read_rcx()?;
     let path = if path_ptr == 0 {
         String::new()
@@ -111,6 +117,7 @@ pub fn handle_remove_directory_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 pub fn handle_move_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
+    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let from_ptr = engine.read_rcx()?;
     let to_ptr = engine.read_rdx()?;
     let from = if from_ptr == 0 {
@@ -134,6 +141,7 @@ pub fn handle_move_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 pub fn handle_move_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
+    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let from_ptr = engine.read_rcx()?;
     let to_ptr = engine.read_rdx()?;
     let from = if from_ptr == 0 {

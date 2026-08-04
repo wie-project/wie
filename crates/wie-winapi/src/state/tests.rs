@@ -2690,6 +2690,229 @@ fn test_status_bar_paint_draws_part_separator_grooves() {
     assert_eq!(px(120, 90), 0x00F0_F0F0, "part 1 interior stays BTNFACE");
 }
 
+/// Regression: View > Status Bar — a HIDDEN control must not paint.
+///
+/// `ShowWindow(SW_HIDE)` leaves the bar invalidated (RNotepad's toggle re-sizes
+/// the bar, which invalidates it), and the paint synthesizer queues a WM_PAINT
+/// for any invalidated window regardless of visibility. Real Windows discards a
+/// hidden window's invalid region; the paint-side gate (the `WM_PAINT` arm of
+/// `dispatch_control_proc`) skips `paint_control` for invisible windows but
+/// still consumes the invalidation so the hidden window cannot re-enter the
+/// paint cycle every idle drain.
+#[test]
+fn test_hidden_status_bar_paint_is_skipped_and_consumes_invalidation() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (top, bar) = push_status_bar_pair(&mut state);
+
+    let parts_addr = 0x6000;
+    write_guest_int_array(&mut engine, parts_addr, &[80, 160, -1], "write parts");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        bar,
+        crate::user32::controls::SB_SETPARTS,
+        3,
+        parts_addr,
+    )
+    .expect("setparts ok")
+    .expect("some result");
+
+    // The WM_SIZE aftermath of the toggle: hidden, but still invalidated.
+    {
+        let windows = &mut state.window_state().windows;
+        let bar_record = windows
+            .iter_mut()
+            .find(|window| window.handle == crate::handles::Hwnd::from(bar))
+            .expect("status bar record");
+        bar_record.visible = false;
+        bar_record.invalidated = true;
+    }
+
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        bar,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint dispatch ok")
+    .expect("paint handled");
+
+    // paint_control never ran: the WM_PAINT arm defers a publish only after a
+    // real paint, so a skipped hidden paint emits nothing to the ancestor.
+    assert_eq!(
+        state.present().drain_pending_publishes(),
+        0,
+        "a hidden control must not publish a paint into the ancestor surface"
+    );
+    assert!(
+        !state
+            .present()
+            .published
+            .contains_key(&crate::handles::Hwnd::from(top)),
+        "no frame may exist for a surface that never painted"
+    );
+
+    // The invalidation is consumed while hidden: ShowWindow(SW_SHOW) re-arms
+    // it, so the hidden window cannot livelock the paint pump.
+    let bar_record = state
+        .window_state()
+        .windows
+        .iter()
+        .find(|window| window.handle == crate::handles::Hwnd::from(bar))
+        .expect("status bar record");
+    assert!(!bar_record.invalidated, "the invalidation is consumed");
+    assert!(!bar_record.visible, "the bar stays hidden");
+}
+
+/// Round trip: hide → paint (no new bar content) → show → paint (bar appears).
+///
+/// Mirrors the View > Status Bar toggle: after the bar is hidden, the parent's
+/// repaint covers its old strip region (the strip content is unchanged — the
+/// bar never repaints over it); when the bar is shown again the show path
+/// re-invalidates it and the bar paints normally.
+#[test]
+fn test_status_bar_hide_paint_show_paint_round_trip() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (top, bar) = push_status_bar_pair(&mut state);
+
+    let parts_addr = 0x6000;
+    write_guest_int_array(&mut engine, parts_addr, &[80, 160, -1], "write parts");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        bar,
+        crate::user32::controls::SB_SETPARTS,
+        3,
+        parts_addr,
+    )
+    .expect("setparts ok")
+    .expect("some result");
+    let text_addr = 0x6100;
+    write_guest_utf16(&mut engine, text_addr, "EOLN");
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        bar,
+        crate::user32::controls::SB_SETTEXTW,
+        1,
+        text_addr,
+    )
+    .expect("settext ok")
+    .expect("some result");
+
+    // Show + paint: the strip renders at the bottom of the 200x100 top window.
+    let frame_before = {
+        crate::user32::controls::dispatch_control_proc(
+            &mut engine,
+            &mut state,
+            bar,
+            crate::user32::WM_PAINT,
+            0,
+            0,
+        )
+        .expect("paint dispatch ok")
+        .expect("paint handled");
+        assert_eq!(
+            state.present().drain_pending_publishes(),
+            1,
+            "a visible bar paint defers exactly one ancestor publish"
+        );
+        state
+            .present()
+            .published
+            .get(&crate::handles::Hwnd::from(top))
+            .expect("published frame")
+            .clone()
+    };
+    assert_eq!(
+        frame_before.pixels[(usize::try_from(77).unwrap_or(0)
+            * usize::try_from(frame_before.width).unwrap_or(0))
+            + usize::try_from(10).unwrap_or(0)],
+        0x00F0_F0F0,
+        "the visible bar paints its BTNFACE strip"
+    );
+
+    // Hide (SW_HIDE) while invalidated: the paint is skipped — no new
+    // publish, the strip region is unchanged, the invalidation is consumed.
+    {
+        let windows = &mut state.window_state().windows;
+        let bar_record = windows
+            .iter_mut()
+            .find(|window| window.handle == crate::handles::Hwnd::from(bar))
+            .expect("status bar record");
+        bar_record.visible = false;
+        bar_record.invalidated = true;
+    }
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        bar,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint dispatch ok")
+    .expect("paint handled");
+    assert_eq!(
+        state.present().drain_pending_publishes(),
+        0,
+        "a hidden bar paint must not publish"
+    );
+    let frame_after_hide = state
+        .present()
+        .published
+        .get(&crate::handles::Hwnd::from(top))
+        .expect("published frame")
+        .clone();
+    assert_eq!(
+        frame_after_hide.pixels, frame_before.pixels,
+        "the bar's surface region is unchanged by a hidden paint"
+    );
+
+    // Show again (SW_SHOW re-arms invalidated): the bar paints normally.
+    {
+        let windows = &mut state.window_state().windows;
+        let bar_record = windows
+            .iter_mut()
+            .find(|window| window.handle == crate::handles::Hwnd::from(bar))
+            .expect("status bar record");
+        bar_record.visible = true;
+        bar_record.invalidated = true;
+    }
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        bar,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint dispatch ok")
+    .expect("paint handled");
+    assert_eq!(
+        state.present().drain_pending_publishes(),
+        1,
+        "a shown bar paint publishes the strip again"
+    );
+    let frame_after_show = state
+        .present()
+        .published
+        .get(&crate::handles::Hwnd::from(top))
+        .expect("published frame")
+        .clone();
+    assert_eq!(
+        frame_after_show.pixels[(usize::try_from(77).unwrap_or(0)
+            * usize::try_from(frame_after_show.width).unwrap_or(0))
+            + usize::try_from(10).unwrap_or(0)],
+        0x00F0_F0F0,
+        "the re-shown bar repaints its BTNFACE strip"
+    );
+}
+
 /// Red-green regression for the real RNotepad status-bar geometry.
 ///
 /// `DIALOG_StatusBarAlignParts` does NOT measure the part text: it computes
@@ -3907,6 +4130,11 @@ fn test_open_thread_creates_handle() {
 fn test_get_file_attributes_ex_w_not_found() {
     let mut engine = test_engine();
     let mut state = default_winapi_state();
+    // "Not found" is only reachable with a bottle: without one the
+    // bottle-enforcement policy stops the run on the first file op instead
+    // (BottleMissingError). The root need not exist — the probe path does
+    // not exist under any root, which is exactly the case under test.
+    state.file_io.volumes.bottle_root = Some(std::path::PathBuf::from("/tmp/wie-bottle"));
     let path_ptr = 0x3000;
     engine
         .mem_write(
@@ -5776,9 +6004,10 @@ fn test_is_dialog_message_enter_resolves_default_button() {
             state,
         ));
         let error = result.expect_err("Enter must be consumed by the dialog");
-        *error
+        error
             .downcast_ref::<WinApiControlSignal>()
             .expect("control signal")
+            .clone()
     };
 
     // Enter with a default push button activates IT (id 1), not the
@@ -6213,6 +6442,23 @@ fn test_rnotepad_edit_live_sequence() {
         (0, 0),
         "child CW_USEDEFAULT x/y must be (0,0), not the top-level (100,100)"
     );
+
+    // The real flow shows the windows (notepad's ShowWindow(SW_SHOW) on the
+    // main window and the edit) before the message loop; a hidden control
+    // must NOT paint — the WM_PAINT dispatch gates on visibility (View >
+    // Status Bar regression) — so mirror the show here. SW_SHOW re-arms
+    // invalidated, exactly like the ShowWindow handler does.
+    for hwnd in [parent, edit] {
+        if let Some(window) = state
+            .window_state()
+            .windows
+            .iter_mut()
+            .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
+        {
+            window.visible = true;
+            window.invalidated = true;
+        }
+    }
 
     // Type "abc": the caret and the guest's Col stay sane after every char.
     // The guest formats `col + 1` into the status bar, so the 0-based col

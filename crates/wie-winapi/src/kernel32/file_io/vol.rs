@@ -359,6 +359,7 @@ pub fn handle_get_file_attributes_ex_w(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
+    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let path_ptr = engine.read_rcx()?;
     let _info_level = engine.read_rdx()?;
     let info_ptr = engine.read_r8()?;
@@ -419,6 +420,7 @@ pub fn handle_get_file_attributes_ex_a(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
+    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let path_ptr = engine.read_rcx()?;
     let _info_level = engine.read_rdx()?;
     let info_ptr = engine.read_r8()?;
@@ -476,6 +478,7 @@ pub fn handle_get_file_attributes_ex_a(
 pub fn handle_get_temp_path_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
+    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let buffer_len = engine.read_rcx()?;
     let buffer_ptr = engine.read_rdx()?;
     // Trailing backslash per Microsoft Learn.
@@ -501,6 +504,7 @@ pub fn handle_get_temp_path_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 pub fn handle_get_temp_path_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
+    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let buffer_len = engine.read_rcx()?;
     let buffer_ptr = engine.read_rdx()?;
     let temp = format!("{}\\", crate::vfs::GUEST_TEMP_PATH.trim_end_matches('\\'));

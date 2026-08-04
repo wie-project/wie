@@ -1,17 +1,18 @@
 use super::{
     CREATE_ALWAYS, CREATE_NEW, Context, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS,
     ERROR_DIR_NOT_EMPTY, ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER,
-    ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND,
-    ERROR_READ_FAULT, FAKE_DISK_CLUSTERS, FAKE_DISK_GIB, FAKE_STDERR_HANDLE, FAKE_STDIN_HANDLE,
-    FAKE_STDOUT_HANDLE, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY, FILE_BEGIN, FILE_CURRENT,
-    FILE_END, FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_UNKNOWN, FIXED_SYSTEM_FILETIME, FindHandle,
-    HandlerContext, INVALID_FILE_ATTRIBUTES, INVALID_HANDLE_VALUE, INVALID_SET_FILE_POINTER,
-    LOGICAL_DRIVE_TCHARS, OPEN_ALWAYS, OPEN_EXISTING, OpenGuestFile, Path, Result,
-    TRUNCATE_EXISTING, WinApiHandlerResult, WinApiState, checked_address, checked_field_address,
-    get_user_profile_dir_impl, is_main_module_path, low_u32, read_ansi_string_from_cpu,
-    read_guest_u16, read_guest_u64, read_guest_utf16_lossy, read_stack_u64,
-    read_wide_string_from_cpu, refill_stdin_from_host, ret_bool_true, ret_u64, write_guest_u16,
-    write_guest_u32, write_guest_u64, write_guest_utf16_units,
+    ERROR_INVALID_DRIVE, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES,
+    ERROR_PATH_NOT_FOUND, ERROR_READ_FAULT, FAKE_DISK_CLUSTERS, FAKE_DISK_GIB, FAKE_STDERR_HANDLE,
+    FAKE_STDIN_HANDLE, FAKE_STDOUT_HANDLE, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_BEGIN, FILE_CURRENT, FILE_END, FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_UNKNOWN,
+    FIXED_SYSTEM_FILETIME, FindHandle, HandlerContext, INVALID_FILE_ATTRIBUTES,
+    INVALID_HANDLE_VALUE, INVALID_SET_FILE_POINTER, LOGICAL_DRIVE_TCHARS, OPEN_ALWAYS,
+    OPEN_EXISTING, OpenGuestFile, Path, Result, TRUNCATE_EXISTING, WinApiHandlerResult,
+    WinApiState, checked_address, checked_field_address, get_user_profile_dir_impl,
+    is_main_module_path, low_u32, read_ansi_string_from_cpu, read_guest_u16, read_guest_u64,
+    read_guest_utf16_lossy, read_stack_u64, read_wide_string_from_cpu, refill_stdin_from_host,
+    ret_bool_true, ret_u64, write_guest_u16, write_guest_u32, write_guest_u64,
+    write_guest_utf16_units,
 };
 
 pub use dir::*;
@@ -55,6 +56,7 @@ pub fn handle_get_file_type(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 pub fn handle_get_file_attributes_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
+    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let path_ptr = engine
         .read_rcx()
         .context("failed to read RCX for GetFileAttributesA")?;
@@ -82,6 +84,7 @@ pub fn handle_get_file_attributes_a(ctx: &mut HandlerContext<'_>) -> Result<WinA
 pub fn handle_get_file_attributes_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
+    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let path_ptr = engine
         .read_rcx()
         .context("failed to read RCX for GetFileAttributesW")?;
@@ -109,6 +112,7 @@ pub fn handle_get_file_attributes_w(ctx: &mut HandlerContext<'_>) -> Result<WinA
 pub fn handle_find_first_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
+    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let pattern_ptr = engine
         .read_rcx()
         .context("failed to read RCX for FindFirstFileW")?;
@@ -133,6 +137,7 @@ pub fn handle_find_first_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 pub fn handle_find_first_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
+    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let pattern_ptr = engine
         .read_rcx()
         .context("failed to read RCX for FindFirstFileA")?;
@@ -225,6 +230,7 @@ pub fn handle_find_close(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 pub fn handle_create_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
+    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let file_name_ptr = engine
         .read_rcx()
         .context("failed to read RCX for CreateFileW")?;
@@ -274,6 +280,7 @@ pub fn handle_create_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 pub fn handle_create_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
+    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let file_name_ptr = engine
         .read_rcx()
         .context("failed to read RCX for CreateFileA")?;

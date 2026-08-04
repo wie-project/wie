@@ -1647,3 +1647,373 @@ fn notepad_file_save_builds_interactive_dialog() {
          — the action does not complete if no dialog appears"
     );
 }
+
+/// The ghost-modal regression: after the interactive file dialog closes (OK),
+/// the FIRST File→Exit click must make the guest exit.
+///
+/// Reported live: after closing any in-app modal (File→Open/Save, Format→Font)
+/// the dialog visually closes but a GHOST modal state persists — File→Exit
+/// needs TWO clicks. This drives the exact sequence through the real guest
+/// (notepad): CMD_OPEN → interactive FileDialog → CMD_OPEN's modal loop →
+/// OK (EndDialog) → modal loop exits → ONE CMD_EXIT → guest must exit.
+#[test]
+fn notepad_file_dialog_close_then_first_exit_click_exits() {
+    let Some(path) = real_exe("notepad.exe") else {
+        eprintln!("skip: real_exes/notepad.exe not present");
+        return;
+    };
+    // Serialized suite: see GUI_SUITE_LOCK.
+    let _suite = gui_suite_serialize();
+    use wie_runtime::EntryTraceTermination;
+
+    const WM_COMMAND: u32 = 0x0111;
+
+    let mut session =
+        wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
+            .expect("notepad session starts");
+    // The in-app (host-built) file dialog — what the GUI presenter enables.
+    session.set_file_dialog_policy(wie_winapi::FileDialogPolicy::Interactive);
+    let handle = session.guest_handle();
+    pump_until_windows_ready(&mut session);
+
+    let main = session.first_guest_window_handle().unwrap_or(0);
+    let tree = handle.window_menu_items();
+    // The File menu's Open and Exit ids (like the menu-bar decode does).
+    let open_id = tree
+        .iter()
+        .flat_map(|top| top.children.iter())
+        .find(|child| child.title.to_lowercase().contains("pen"))
+        .map(|child| child.id)
+        .unwrap_or(0);
+    let exit_id = tree
+        .iter()
+        .flat_map(|top| top.children.iter())
+        .find(|child| child.title.to_lowercase().contains("xit"))
+        .map(|child| child.id)
+        .unwrap_or(0);
+    assert_ne!(open_id, 0, "the File menu must contain an Open command");
+    assert_ne!(exit_id, 0, "the File menu must contain an Exit command");
+
+    // Stage 1: File→Open builds the interactive dialog and parks the guest's
+    // in-guest modal loop on an empty queue (dialog_depth == 1).
+    handle.post_message(main, WM_COMMAND, u64::from(open_id), 0);
+    let mut dialog_hwnd = 0_u64;
+    for _ in 0..150 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        if let Some((dhwnd, ..)) = session
+            .guest_windows_snapshot()
+            .iter()
+            .find(|(_, cls, ..)| cls == "FileDialog")
+        {
+            dialog_hwnd = *dhwnd;
+            break;
+        }
+        match summary.termination {
+            EntryTraceTermination::ExitProcess { code } => {
+                panic!("notepad exited (code {code}) while the file dialog should be open");
+            }
+            EntryTraceTermination::WaitingForMessage => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            other => panic!("notepad stopped unexpectedly while opening: {other:?}"),
+        }
+    }
+    assert_ne!(
+        dialog_hwnd, 0,
+        "CMD_OPEN must build the interactive file dialog"
+    );
+
+    // Stage 2: OK closes the dialog (the guest's modal loop consumes the
+    // WM_QUIT EndDialog posted — the depth returns to 0).
+    handle.post_message(dialog_hwnd, WM_COMMAND, 1, 0); // IDOK
+    for _ in 0..150 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        if !session
+            .guest_windows_snapshot()
+            .iter()
+            .any(|(_, cls, ..)| cls == "FileDialog")
+        {
+            break;
+        }
+        match summary.termination {
+            EntryTraceTermination::ExitProcess { code } => {
+                panic!("notepad exited (code {code}) while closing the file dialog");
+            }
+            EntryTraceTermination::WaitingForMessage => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            other => panic!("notepad stopped unexpectedly while closing: {other:?}"),
+        }
+    }
+    assert!(
+        !session
+            .guest_windows_snapshot()
+            .iter()
+            .any(|(_, cls, ..)| cls == "FileDialog"),
+        "OK must close the file dialog (EndDialog removes the subtree)"
+    );
+
+    // Stage 3: ONE File→Exit after the dialog is gone. A ghost modal state
+    // (stale dialog_depth or a leftover dialog window) swallows this first
+    // command — the guest idles on instead of exiting.
+    handle.post_message(main, WM_COMMAND, u64::from(exit_id), 0);
+
+    let mut exited = false;
+    for _ in 0..150 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        if matches!(
+            summary.termination,
+            EntryTraceTermination::ExitProcess { .. }
+        ) {
+            exited = true;
+            break;
+        }
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    assert!(
+        exited,
+        "the FIRST File→Exit click after closing the modal dialog must make \
+         notepad exit — a swallowed first command means a ghost modal state persists"
+    );
+}
+
+/// Same sequence as [`notepad_file_dialog_close_then_first_exit_click_exits`],
+/// but the final Exit command is delivered through the REAL GUI pump —
+/// [`run_windowed`] parked on the message-signal condvar, woken by a host
+/// thread's post (exactly what `wie-cli run --gui` does). The direct-drive
+/// test above proves the emulation; this one proves the GUI pump does not
+/// lose the first post after a modal dialog closes.
+#[test]
+fn notepad_modal_dialog_exit_survives_run_windowed_pump() {
+    let Some(path) = real_exe("notepad.exe") else {
+        eprintln!("skip: real_exes/notepad.exe not present");
+        return;
+    };
+    // Serialized suite: see GUI_SUITE_LOCK.
+    let _suite = gui_suite_serialize();
+    use wie_runtime::EntryTraceTermination;
+
+    const WM_COMMAND: u32 = 0x0111;
+
+    let mut session =
+        wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
+            .expect("notepad session starts");
+    session.set_file_dialog_policy(wie_winapi::FileDialogPolicy::Interactive);
+    let handle = session.guest_handle();
+    pump_until_windows_ready(&mut session);
+
+    let main = session.first_guest_window_handle().unwrap_or(0);
+    let tree = handle.window_menu_items();
+    let open_id = tree
+        .iter()
+        .flat_map(|top| top.children.iter())
+        .find(|child| child.title.to_lowercase().contains("pen"))
+        .map(|child| child.id)
+        .unwrap_or(0);
+    let exit_id = tree
+        .iter()
+        .flat_map(|top| top.children.iter())
+        .find(|child| child.title.to_lowercase().contains("xit"))
+        .map(|child| child.id)
+        .unwrap_or(0);
+    assert_ne!(open_id, 0, "the File menu must contain an Open command");
+    assert_ne!(exit_id, 0, "the File menu must contain an Exit command");
+
+    // Open the dialog, OK it, and wait until the subtree is gone.
+    handle.post_message(main, WM_COMMAND, u64::from(open_id), 0);
+    let mut dialog_hwnd = 0_u64;
+    for _ in 0..150 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        if let Some((dhwnd, ..)) = session
+            .guest_windows_snapshot()
+            .iter()
+            .find(|(_, cls, ..)| cls == "FileDialog")
+        {
+            dialog_hwnd = *dhwnd;
+            break;
+        }
+        match summary.termination {
+            EntryTraceTermination::ExitProcess { code } => {
+                panic!("notepad exited (code {code}) while the file dialog should be open");
+            }
+            EntryTraceTermination::WaitingForMessage => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            other => panic!("notepad stopped unexpectedly while opening: {other:?}"),
+        }
+    }
+    assert_ne!(
+        dialog_hwnd, 0,
+        "CMD_OPEN must build the interactive file dialog"
+    );
+    handle.post_message(dialog_hwnd, WM_COMMAND, 1, 0); // IDOK
+    for _ in 0..150 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        if !session
+            .guest_windows_snapshot()
+            .iter()
+            .any(|(_, cls, ..)| cls == "FileDialog")
+        {
+            break;
+        }
+        match summary.termination {
+            EntryTraceTermination::ExitProcess { code } => {
+                panic!("notepad exited (code {code}) while closing the file dialog");
+            }
+            EntryTraceTermination::WaitingForMessage => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            other => panic!("notepad stopped unexpectedly while closing: {other:?}"),
+        }
+    }
+
+    // The GUI's MenuEvent analog: a host thread posts ONE CMD_EXIT while the
+    // pump is parked on the message-signal condvar.
+    let poster = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        handle.post_message(main, WM_COMMAND, u64::from(exit_id), 0);
+    });
+
+    let control = wie_runtime::GuiControl::new();
+    let outcome = wie_runtime::run_windowed(&mut session, &control)
+        .expect("run_windowed after the modal dialog must succeed");
+    poster.join().expect("exit poster thread");
+
+    assert!(
+        matches!(outcome, wie_runtime::GuiOutcome::Exited(0)),
+        "run_windowed must return Exited after ONE post-close CMD_EXIT; got {outcome:?}"
+    );
+}
+
+/// The ghost-modal regression through the FONT dialog and the REAL host click
+/// path: Format→Font opens the in-app font dialog, a host-posted
+/// WM_LBUTTONDOWN/UP on its OK button closes it via the control → BN_CLICKED →
+/// dialog-proc → EndDialog chain (exactly what the live GUI mouse produces),
+/// and the FIRST File→Exit after the close must make the guest exit.
+#[test]
+fn notepad_font_dialog_ok_click_then_first_exit_exits() {
+    let Some(path) = real_exe("notepad.exe") else {
+        eprintln!("skip: real_exes/notepad.exe not present");
+        return;
+    };
+    // Serialized suite: see GUI_SUITE_LOCK.
+    let _suite = gui_suite_serialize();
+    use wie_runtime::EntryTraceTermination;
+
+    const WM_COMMAND: u32 = 0x0111;
+    const WM_LBUTTONDOWN: u32 = 0x0201;
+    const WM_LBUTTONUP: u32 = 0x0202;
+    const MK_LBUTTON: u64 = 0x0001;
+    const CMD_FONT: u32 = 320; // Format→Font...
+
+    let mut session =
+        wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
+            .expect("notepad session starts");
+    // The in-app font dialog — always the in-guest modal loop (no native
+    // bridge exists for ChooseFontW).
+    session.set_font_dialog_policy(wie_winapi::FontDialogPolicy::Interactive);
+    let handle = session.guest_handle();
+    pump_until_windows_ready(&mut session);
+
+    let main = session.first_guest_window_handle().unwrap_or(0);
+    let tree = handle.window_menu_items();
+    let exit_id = tree
+        .iter()
+        .flat_map(|top| top.children.iter())
+        .find(|child| child.title.to_lowercase().contains("xit"))
+        .map(|child| child.id)
+        .unwrap_or(0);
+    assert_ne!(exit_id, 0, "the File menu must contain an Exit command");
+
+    // Stage 1: Format→Font builds the font dialog and parks the modal loop.
+    handle.post_message(main, WM_COMMAND, u64::from(CMD_FONT), 0);
+    let mut dialog_hwnd = 0_u64;
+    for _ in 0..150 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        if let Some((dhwnd, ..)) = session
+            .guest_windows_snapshot()
+            .iter()
+            .find(|(_, cls, ..)| cls == "FontDialog")
+        {
+            dialog_hwnd = *dhwnd;
+            break;
+        }
+        match summary.termination {
+            EntryTraceTermination::ExitProcess { code } => {
+                panic!("notepad exited (code {code}) while the font dialog should be open");
+            }
+            EntryTraceTermination::WaitingForMessage => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            other => panic!("notepad stopped unexpectedly while opening: {other:?}"),
+        }
+    }
+    assert_ne!(
+        dialog_hwnd, 0,
+        "CMD_FONT must build the interactive font dialog"
+    );
+
+    // Stage 2: host-posted click on the OK button (a child of the dialog).
+    let ok_hwnd = session
+        .guest_windows_snapshot()
+        .iter()
+        .find(|(_, _cls, title, _)| title == "OK")
+        .map(|(h, ..)| *h)
+        .unwrap_or(0);
+    assert_ne!(ok_hwnd, 0, "the font dialog must have an OK button");
+    // The button's client rect is 80×24; click its center.
+    let lparam = u64::from(u32::try_from((12 << 16) | 40).unwrap_or(0));
+    handle.post_message(ok_hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lparam);
+    handle.post_message(ok_hwnd, WM_LBUTTONUP, 0, lparam);
+
+    // The dialog must close (EndDialog removes the subtree).
+    let mut closed = false;
+    for _ in 0..150 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        if !session
+            .guest_windows_snapshot()
+            .iter()
+            .any(|(_, cls, ..)| cls == "FontDialog")
+        {
+            closed = true;
+            break;
+        }
+        match summary.termination {
+            EntryTraceTermination::ExitProcess { code } => {
+                panic!("notepad exited (code {code}) while closing the font dialog");
+            }
+            EntryTraceTermination::WaitingForMessage => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            other => panic!("notepad stopped unexpectedly while closing: {other:?}"),
+        }
+    }
+    assert!(
+        closed,
+        "the OK click must close the font dialog (EndDialog removes the subtree)"
+    );
+
+    // Stage 3: ONE File→Exit after the dialog is gone.
+    handle.post_message(main, WM_COMMAND, u64::from(exit_id), 0);
+    let mut exited = false;
+    for _ in 0..150 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        if matches!(
+            summary.termination,
+            EntryTraceTermination::ExitProcess { .. }
+        ) {
+            exited = true;
+            break;
+        }
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    assert!(
+        exited,
+        "the FIRST File→Exit click after the font dialog closes must make \
+         notepad exit — a swallowed first command means a ghost modal state"
+    );
+}

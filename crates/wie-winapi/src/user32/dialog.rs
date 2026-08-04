@@ -156,7 +156,7 @@ fn handle_create_dialog_param(
         state.window_state().focus_window_handle = crate::handles::Hwnd::from(first_tabstop);
         // The focused control receives WM_SETFOCUS (host-side — controls have
         // no guest WndProc, so no bridge signal).
-        let _ = deliver_focus_change(
+        let _unused = deliver_focus_change(
             state,
             engine,
             0,

@@ -357,9 +357,18 @@ pub(crate) fn encode_file_dialog_proc(end_dialog_va: u64) -> Vec<u8> {
     buf.extend_from_slice(&[0x31, 0xd2]);
     let jmp_close = buf.len() + 1;
     buf.extend_from_slice(&[0xeb, 0x00]);
-    // .ok: mov edx, 1
+    // .ok: mov edx, 1 ; jmp .close
+    //
+    // The `jmp` is load-bearing: without it the OK branch falls through into
+    // the Strikeout branch below, `mov edx, strikeout_id` overwrites the IDOK
+    // result, and `EndDialog` receives the strikeout sentinel — the font
+    // dialog's OK then toggles the Strikeout checkbox instead of closing
+    // (ghost-modal: the first File→Exit after "OK" is eaten by the still-open
+    // modal loop).
     let ok_at = buf.len();
     buf.extend_from_slice(&[0xba, 0x01, 0x00, 0x00, 0x00]);
+    let jmp_ok_close = buf.len() + 1;
+    buf.extend_from_slice(&[0xeb, 0x00]);
     // .strikeout: mov edx, strikeout_id ; jmp .close
     let strikeout_at = buf.len();
     buf.extend_from_slice(&[0xba]);
@@ -390,6 +399,7 @@ pub(crate) fn encode_file_dialog_proc(end_dialog_va: u64) -> Vec<u8> {
     patch_rel8(&mut buf, je_underline, je_underline + 1, underline_at);
     patch_rel8(&mut buf, jmp_zero, jmp_zero + 1, zero_at);
     patch_rel8(&mut buf, jmp_close, jmp_close + 1, close_at);
+    patch_rel8(&mut buf, jmp_ok_close, jmp_ok_close + 1, close_at);
     patch_rel8(
         &mut buf,
         jmp_strikeout_close,

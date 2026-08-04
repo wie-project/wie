@@ -611,17 +611,35 @@ impl ControlClassKind {
         let unicode = find_window(state, hwnd).is_some_and(|w| w.unicode);
         match (self, WinMsg::from(message)) {
             (_, WinMsg::WM_PAINT) => {
-                paint_control(state, engine, hwnd, self)?;
-                // Publish the ancestor surface so the painted control becomes
-                // visible immediately — the ancestor's own WM_PAINT BitBlt may
-                // never run again (a modal dialog otherwise renders as an empty
-                // gray box until an unrelated repaint). Mirrors how paint_dialog
-                // publishes its face. B3.6: deferred — the runtime drains
-                // pending publishes once per repaint cycle (at the empty-queue
-                // idle boundary), so a repaint cycle (parent BitBlt + each
-                // child paint) emits one frame with the union region.
-                if let Some(ancestor) = resolve_window_ancestor(state, hwnd) {
-                    state.present().publish_deferred(ancestor.hwnd);
+                // A hidden window must not paint: real Windows discards its
+                // invalidated region (no WM_PAINT while hidden). The synthesized
+                // paint can still reach a just-hidden control (synth.rs selects
+                // invalidated windows without a visibility check), so the paint
+                // is gated here — otherwise a hidden status bar keeps painting
+                // over the control that grew into its space (View > Status Bar
+                // regression). The invalidation is consumed either way, so the
+                // hidden window cannot re-enter the paint cycle every idle
+                // drain; ShowWindow(SW_SHOW) re-arms it, so the window repaints
+                // the moment it is shown again. A hidden control's erase is
+                // skipped with the paint (it lives inside paint_control).
+                let visible = find_window(state, hwnd).is_some_and(|w| w.visible);
+                if let Some(window) = find_window_mut(state, hwnd) {
+                    window.invalidated = false;
+                }
+                if visible {
+                    paint_control(state, engine, hwnd, self)?;
+                    // Publish the ancestor surface so the painted control
+                    // becomes visible immediately — the ancestor's own WM_PAINT
+                    // BitBlt may never run again (a modal dialog otherwise
+                    // renders as an empty gray box until an unrelated repaint).
+                    // Mirrors how paint_dialog publishes its face. B3.6:
+                    // deferred — the runtime drains pending publishes once per
+                    // repaint cycle (at the empty-queue idle boundary), so a
+                    // repaint cycle (parent BitBlt + each child paint) emits
+                    // one frame with the union region.
+                    if let Some(ancestor) = resolve_window_ancestor(state, hwnd) {
+                        state.present().publish_deferred(ancestor.hwnd);
+                    }
                 }
                 Ok(Some(0))
             }

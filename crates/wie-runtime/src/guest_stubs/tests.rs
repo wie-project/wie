@@ -396,3 +396,42 @@ fn file_dialog_proc_stub_encodes_end_dialog_decision() {
         "proc stub must recognize IDCANCEL"
     );
 }
+
+/// The shared file/font dialog proc stub's IDOK branch must JUMP to the
+/// EndDialog block, not fall through into the Strikeout sentinel branch.
+///
+/// Regression: the OK branch ended in `mov edx, 1` with no jump, so execution
+/// continued into `.strikeout` (`mov edx, strikeout_id`), overwriting the
+/// result — the font dialog's OK button then toggled Strikeout instead of
+/// closing (ghost-modal: the first File→Exit after "OK" was eaten by the
+/// still-open modal loop).
+#[test]
+fn file_dialog_proc_stub_ok_branch_jumps_to_close() {
+    let body = encode_file_dialog_proc(0x0000_7000_0000_2d80);
+    // `mov edx, 1` — the IDOK result load (imm32 = 1 is unique in the body).
+    let ok_load = [0xba, 0x01, 0x00, 0x00, 0x00];
+    let found = body
+        .windows(ok_load.len())
+        .enumerate()
+        .find(|(_, w)| *w == ok_load)
+        .map(|(i, _)| i)
+        .expect("IDOK branch must load result 1 into edx");
+    assert_eq!(
+        body.get(found + 5),
+        Some(&0xeb),
+        "IDOK branch must jump after `mov edx, 1` — a fall-through would run \
+         the Strikeout branch and overwrite the result"
+    );
+    // The short-jump target must be the EndDialog block (`.close` starts with
+    // `sub rsp, 0x28`), not the strikeout load.
+    let rel8 = i8::from_le_bytes([body[found + 6]]);
+    let target = i64::try_from(found + 7)
+        .unwrap_or(0)
+        .saturating_add(i64::from(rel8));
+    let target = usize::try_from(target).expect("jump target in bounds");
+    assert_eq!(
+        body.get(target..target + 4),
+        Some(&[0x48, 0x83, 0xec, 0x28][..]),
+        "IDOK jump must land on the EndDialog call block"
+    );
+}

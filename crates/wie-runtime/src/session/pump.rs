@@ -709,6 +709,43 @@ impl super::RuntimeSession {
                                         }
                                         continue 'outer;
                                     }
+                                    Some(
+                                        wie_winapi::WinApiControlSignal::FileDialogBridgeRequested {
+                                            request,
+                                        },
+                                    ) => {
+                                        // The native panel (rfd) blocks the MAIN thread for the
+                                        // whole session, and the winit event loop needs the SAME
+                                        // shared state lock to service frame/user events while the
+                                        // panel is up (take_frame, reconcile, hit-testing). Holding
+                                        // the lock across the bridge deadlocks into the beachball,
+                                        // so drop it for the whole panel session — the
+                                        // GuestCallbackRequested pattern. Take the bridge out first
+                                        // (it lives behind the lock) and restore it on return.
+                                        let bridge = winapi_state
+                                            .window_state()
+                                            .file_dialog_bridge
+                                            .take();
+                                        drop(pair);
+                                        let picked =
+                                            bridge.as_ref().and_then(|bridge| bridge(request));
+                                        self.process.with_mut(|_, winapi_state| {
+                                            if winapi_state.kernel.threads.active.tid != primary_tid
+                                            {
+                                                winapi_state.kernel.threads.activate(primary_tid);
+                                            }
+                                            let window_state = winapi_state.window_state();
+                                            window_state.file_dialog_bridge = bridge;
+                                            if let Some(pending) =
+                                                window_state.pending_native_file_dialog.as_mut()
+                                            {
+                                                pending.pick = picked;
+                                            }
+                                        });
+                                        // Continue: the engine re-executes the fake API stop, the
+                                        // handler re-enters and writes the pick back.
+                                        quantum = Quantum::Continue;
+                                    }
                                     Some(wie_winapi::WinApiControlSignal::HostPark { reason }) => {
                                         // Per-thread engine: primary regs are already in `engine`;
                                         // only persist thread bookkeeping for TLS tracking.

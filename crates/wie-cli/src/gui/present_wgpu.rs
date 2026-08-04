@@ -80,9 +80,11 @@ pub(crate) enum PresentOutcome {
     /// The frame was uploaded and presented to the swapchain.
     Drawn,
     /// The frame was NOT drawn — the surface acquire skipped it. `retry` is
-    /// `true` for transient skips (occluded / out-of-date / timed-out / lost
-    /// surface) that a re-requested redraw can resolve; `false` for persistent
-    /// failures (validation) where re-requesting would spin.
+    /// `true` for transient skips (occluded / out-of-date / lost surface) that
+    /// a re-requested redraw can resolve; `false` for persistent failures
+    /// (validation) where re-requesting would spin. The app bounds the
+    /// re-request to once per presentable frame (`RetryBudget` in app.rs), so
+    /// a persistently-`retry: true` skip cannot spin the event loop.
     NotDrawn { retry: bool },
 }
 

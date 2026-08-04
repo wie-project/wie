@@ -1,15 +1,22 @@
 use super::{
-    Context, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER,
-    ERROR_PATH_NOT_FOUND, HandlerContext, Result, WinApiHandlerResult, WinApiState,
-    checked_address, get_user_profile_dir_impl, guest_dir_exists, read_ansi_string_from_cpu,
+    Context, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_DRIVE, ERROR_INVALID_HANDLE,
+    ERROR_INVALID_PARAMETER, ERROR_PATH_NOT_FOUND, HandlerContext, Result, WinApiHandlerResult,
+    WinApiState, checked_address, get_user_profile_dir_impl, read_ansi_string_from_cpu,
     read_guest_u16, read_guest_utf16_lossy, read_wide_string_from_cpu, write_guest_u64,
     write_guest_utf16_units,
 };
 
 /// Handles `KERNEL32.dll!GetCurrentDirectoryW`.
+///
+/// Returns the stored guest cwd — always a confined volume path (`C:\…` in
+/// the bottle, `D:\…` in the optional bridge). Buffer semantics match real
+/// Windows: on success the return value is the length written excluding the
+/// NUL; a buffer too small for path+NUL returns the required length including
+/// the NUL and sets `ERROR_INSUFFICIENT_BUFFER`.
 pub fn handle_get_current_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
+    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let buffer_length = engine
         .read_rcx()
         .context("failed to read RCX for GetCurrentDirectoryW")?;
@@ -28,8 +35,8 @@ pub fn handle_get_current_directory_w(ctx: &mut HandlerContext<'_>) -> Result<Wi
         .context("GetCurrentDirectoryW required size overflow")?;
 
     // Need nBufferLength > character_count so there is room for the NUL.
-    let return_value = if buffer_ptr == 0 || buffer_length == 0 || buffer_length <= character_count
-    {
+    let return_value = if buffer_ptr == 0 || buffer_length <= character_count {
+        state.process.last_error = ERROR_INSUFFICIENT_BUFFER;
         required_with_nul
     } else {
         let mut encoded = directory;
@@ -50,6 +57,7 @@ pub fn handle_get_current_directory_w(ctx: &mut HandlerContext<'_>) -> Result<Wi
             .mem_write(buffer_ptr, &bytes)
             .context("failed to write GetCurrentDirectoryW buffer")?;
 
+        state.process.last_error = 0;
         character_count
     };
 
@@ -63,9 +71,16 @@ pub fn handle_get_current_directory_w(ctx: &mut HandlerContext<'_>) -> Result<Wi
     })
 }
 /// Handles `KERNEL32.dll!SetCurrentDirectoryW`.
+///
+/// Stores only a guest directory that (a) confines to a configured volume
+/// (C: bottle / D: bridge) and (b) exists as a host directory in that volume.
+/// Relative names resolve against the current cwd first (MSDN). Failure codes
+/// per real Windows: missing directory → `ERROR_PATH_NOT_FOUND`; unmapped
+/// drive → `ERROR_INVALID_DRIVE`.
 pub fn handle_set_current_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
+    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let directory_ptr = engine
         .read_rcx()
         .context("failed to read RCX for SetCurrentDirectoryW")?;
@@ -81,18 +96,7 @@ pub fn handle_set_current_directory_w(ctx: &mut HandlerContext<'_>) -> Result<Wi
             state.process.last_error = ERROR_PATH_NOT_FOUND;
             false
         } else {
-            // Relative directory names resolve against the current directory (MSDN).
-            let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
-            let full = resolve_full_windows_path(&cwd, &directory);
-            if guest_dir_exists(state, &full) {
-                state.file_io.current_directory_wide = full.encode_utf16().collect();
-                // Keep guest cwd blob in sync when stubs are installed (best-effort).
-                state.process.last_error = 0;
-                true
-            } else {
-                state.process.last_error = ERROR_PATH_NOT_FOUND;
-                false
-            }
+            set_current_directory_impl(state, &directory)
         }
     };
 
@@ -307,6 +311,7 @@ pub(crate) fn handle_duplicate_handle(ctx: &mut HandlerContext<'_>) -> Result<Wi
 pub fn handle_get_full_path_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
+    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let input_path_ptr = engine
         .read_rcx()
         .context("failed to read RCX for GetFullPathNameW")?;
@@ -410,6 +415,7 @@ pub fn handle_get_full_path_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 pub fn handle_get_full_path_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
+    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let input_path_ptr = engine.read_rcx()?;
     let buffer_characters_raw = engine.read_rdx()?;
     let output_buffer_ptr = engine.read_r8()?;
@@ -459,22 +465,30 @@ pub fn handle_get_full_path_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinAp
     })
 }
 /// Handles `KERNEL32.dll!GetCurrentDirectoryA`.
+///
+/// Same semantics as [`handle_get_current_directory_w`], with the path
+/// ACP-encoded for the ANSI guest buffer.
 pub fn handle_get_current_directory_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
+    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let buffer_length = engine.read_rcx()?;
     let buffer_ptr = engine.read_rdx()?;
     let directory = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let bytes = crate::vfs::encode_acp(&directory);
-    let character_count = u64::try_from(bytes.len()).unwrap_or(0);
-    let required_with_nul = character_count.saturating_add(1);
-    let return_value = if buffer_ptr == 0 || buffer_length == 0 || buffer_length <= character_count
-    {
+    let character_count =
+        u64::try_from(bytes.len()).context("current directory byte length does not fit u64")?;
+    let required_with_nul = character_count
+        .checked_add(1)
+        .context("GetCurrentDirectoryA required size overflow")?;
+    let return_value = if buffer_ptr == 0 || buffer_length <= character_count {
+        state.process.last_error = ERROR_INSUFFICIENT_BUFFER;
         required_with_nul
     } else {
         let mut out = bytes;
         out.push(0);
         engine.mem_write(buffer_ptr, &out)?;
+        state.process.last_error = 0;
         character_count
     };
     let return_address = engine.return_from_win64_api(return_value)?;
@@ -484,9 +498,12 @@ pub fn handle_get_current_directory_a(ctx: &mut HandlerContext<'_>) -> Result<Wi
     })
 }
 /// Handles `KERNEL32.dll!SetCurrentDirectoryA`.
+///
+/// Same semantics as [`handle_set_current_directory_w`] (ANSI input).
 pub fn handle_set_current_directory_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
+    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let directory_ptr = engine.read_rcx()?;
     let success = if directory_ptr == 0 {
         state.process.last_error = ERROR_PATH_NOT_FOUND;
@@ -497,16 +514,7 @@ pub fn handle_set_current_directory_a(ctx: &mut HandlerContext<'_>) -> Result<Wi
             state.process.last_error = ERROR_PATH_NOT_FOUND;
             false
         } else {
-            let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
-            let full = resolve_full_windows_path(&cwd, &directory);
-            if guest_dir_exists(state, &full) {
-                state.file_io.current_directory_wide = full.encode_utf16().collect();
-                state.process.last_error = 0;
-                true
-            } else {
-                state.process.last_error = ERROR_PATH_NOT_FOUND;
-                false
-            }
+            set_current_directory_impl(state, &directory)
         }
     };
     let return_value = u64::from(success);
@@ -515,6 +523,59 @@ pub fn handle_set_current_directory_a(ctx: &mut HandlerContext<'_>) -> Result<Wi
         return_address,
         return_value,
     })
+}
+/// Validate and store the guest current directory (shared by the W/A setters).
+///
+/// The guest cwd is ALWAYS a confined volume path: `C:\…` inside the bottle
+/// (`{root}/drive_c/…`) or `D:\…` inside the optional host bridge. Rules, in
+/// order:
+/// 1. The resolved path must confine to a configured volume via
+///    [`crate::vfs::confine_guest_path`]. A drive that is not a configured
+///    volume (e.g. `E:\…`, a UNC share, a bare host path) sets
+///    `ERROR_INVALID_DRIVE`; a mapped drive that still fails confinement sets
+///    `ERROR_PATH_NOT_FOUND`.
+/// 2. The confined path must map to an existing host *directory* via
+///    [`crate::vfs::guest_path_to_host`]; otherwise `ERROR_PATH_NOT_FOUND`.
+///
+/// On success the stored cwd is the canonical confined guest path and `true`
+/// is returned with `last_error` cleared. On failure `last_error` is set and
+/// the stored cwd is left untouched (it never holds an unconfined path).
+fn set_current_directory_impl(state: &mut WinApiState, directory: &str) -> bool {
+    // Relative directory names resolve against the current directory (MSDN).
+    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
+    let full = resolve_full_windows_path(&cwd, directory);
+    let Some(confined) = crate::vfs::confine_guest_path(&state.file_io.volumes, &full) else {
+        // Unmapped drive → ERROR_INVALID_DRIVE; a mapped drive that fails
+        // confinement (escape probe / UNC) keeps the path-not-found code.
+        let mapped = crate::vfs::path::drive_letter(&full)
+            .is_some_and(|drive| drive_is_configured(&state.file_io.volumes, drive));
+        state.process.last_error = if mapped {
+            ERROR_PATH_NOT_FOUND
+        } else {
+            ERROR_INVALID_DRIVE
+        };
+        return false;
+    };
+    // The confined guest path must name a real host directory in the volume.
+    let exists = crate::vfs::guest_path_to_host(&state.file_io.volumes, &confined)
+        .is_some_and(|map| map.host.is_dir());
+    if exists {
+        state.file_io.current_directory_wide = confined.encode_utf16().collect();
+        state.process.last_error = 0;
+        true
+    } else {
+        state.process.last_error = ERROR_PATH_NOT_FOUND;
+        false
+    }
+}
+
+/// Whether `drive` names a configured guest volume (C: bottle / D: bridge).
+fn drive_is_configured(volumes: &crate::vfs::VolumeConfig, drive: char) -> bool {
+    match drive {
+        'C' => volumes.bottle_root.is_some(),
+        'D' => volumes.drive_d_root.is_some(),
+        _ => false,
+    }
 }
 // Copy a NUL-terminated ANSI path into a guest buffer.
 ///
@@ -750,5 +811,472 @@ mod path_resolve_tests {
             normalize_windows_path_components(r"C:\App\.\sub\..\x.txt"),
             r"C:\App\x.txt"
         );
+    }
+}
+
+/// Guest cwd semantics inside the bottle: `SetCurrentDirectory` only stores a
+/// confined (C: bottle / D: bridge), existing guest directory, and
+/// `GetCurrentDirectory` reports it back with real-Windows buffer semantics.
+#[cfg(test)]
+mod cwd_tests {
+    use super::*;
+    use crate::guest_heap::GuestHeap;
+    use crate::state::{
+        DllStateMap, FileIoState, HeapState, KernelState, ModuleState, ProcessState,
+        WinApiEnvironment,
+    };
+    use crate::sync_obj::SyncState;
+    use crate::vfs::VolumeConfig;
+    use crate::{HandlerContext, ThreadState, WinApiState};
+    use ahash::HashMapExt;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use wie_cpu::{CpuEngine, IcedCpu};
+
+    const STACK_VA: u64 = 0x100_0000;
+    const STACK_SIZE: usize = 0x1_0000;
+    const STACK_TOP: u64 = 0x100_FF00;
+    const STR_BUF: u64 = 0x6000; // guest string buffer (path in / result out)
+    const OUT_BUF: u64 = 0x6400; // guest GetCurrentDirectory result buffer
+
+    /// Minimal engine for handler unit tests (mirrors `state/tests.rs`).
+    fn test_engine() -> IcedCpu {
+        let mut cpu = IcedCpu::open_x86_64();
+        cpu.mem_map(0x1000, 0x10_0000, wie_cpu::RwxPerms::ALL)
+            .expect("map test memory");
+        cpu.mem_map(STACK_VA, STACK_SIZE, wie_cpu::RwxPerms::ALL)
+            .expect("map test stack");
+        cpu.mem_write(STACK_TOP, &0_u64.to_le_bytes())
+            .expect("write return address");
+        cpu.write_rsp(STACK_TOP).ok();
+        cpu
+    }
+
+    fn test_env() -> WinApiEnvironment {
+        WinApiEnvironment {
+            image_base: 0x0000_0000_1400_0000,
+            command_line_a_ptr: 0,
+            command_line_w_ptr: 0,
+            environment_strings_w_ptr: 0,
+            module_file_name_a_ptr: 0,
+            module_file_name_w_ptr: 0,
+            process_heap_handle: 1,
+        }
+    }
+
+    /// Default state seeded with cwd `C:\` (mirrors the runtime seed).
+    fn winapi_state_default() -> WinApiState {
+        WinApiState {
+            heap_state: HeapState {
+                heap: GuestHeap::new(0x2000, 0x10000),
+                next_fls_index: 0,
+                fls_slots: Vec::new(),
+                guest_fls_table_va: 0,
+            },
+            file_io: FileIoState {
+                executable_file_size: 0,
+                executable_file_bytes: Arc::new(Vec::new()),
+                executable_file_cursor: 0,
+                next_find_handle: crate::FindFileHandle::from(0),
+                find_handles: Vec::new(),
+                host_file_mounts: Vec::new(),
+                virtual_files: Vec::new(),
+                open_files: ahash::HashMap::new(),
+                next_file_handle: crate::FileHandle::from(0),
+                next_resource_handle: crate::ResourceHandle::from(0),
+                resources: Vec::new(),
+                current_directory_wide: r"C:\".encode_utf16().collect(),
+                bottle_root: None,
+                volumes: VolumeConfig::default(),
+                guest_file_data_next: 0,
+                guest_io: None,
+                stdin_bytes: Vec::new(),
+                stdin_cursor: 0,
+                stdin_mode: crate::GuestStdinMode::InjectOnly,
+                ucrt_files: ahash::HashMap::new(),
+                ucrt_next_file_va: 0x0000_0000_6900_0000,
+                cached_streams: ahash::HashMap::new(),
+            },
+            process: ProcessState {
+                last_error: 0,
+                next_registry_key_handle: crate::RegistryKeyHandle::from(0),
+                registry_keys: Vec::new(),
+                main_module_file_name: String::new(),
+                main_module_path: String::new(),
+                main_module_host_dir: None,
+                error_mode: 0,
+                suspended_threads: ahash::HashMap::new(),
+                environment: crate::DEFAULT_ENVIRONMENT
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .collect(),
+                main_module_dialogs: Vec::new(),
+                main_module_menus: Vec::new(),
+                main_module_strings: Vec::new(),
+                main_module_accelerators: Vec::new(),
+            },
+            kernel: KernelState {
+                threads: ThreadState::primary(),
+                sync: SyncState::new(),
+                seh_pending: ahash::HashMap::new(),
+            },
+            dll_states: DllStateMap::new(),
+            message_queue: Arc::new(Mutex::new(crate::present::MessageQueue::default())),
+            module_state: ModuleState {
+                loaded_modules: ahash::HashMap::new(),
+                import_resolver: None,
+                get_proc_address_cache: ahash::HashMap::new(),
+                next_module_handle: crate::ModuleHandle::from(
+                    crate::dll_loader::REAL_MODULE_HANDLE_BASE,
+                ),
+            },
+        }
+    }
+
+    /// Temp fixture: a bottle root with `drive_c` plus an optional D: bridge.
+    struct Fixture {
+        bottle_root: PathBuf,
+        drive_d_root: Option<PathBuf>,
+    }
+
+    impl Fixture {
+        fn bottle() -> Self {
+            let root = unique_dir("bottle");
+            std::fs::create_dir_all(root.join("drive_c")).expect("create bottle drive_c");
+            Self {
+                bottle_root: root,
+                drive_d_root: None,
+            }
+        }
+
+        fn bottle_and_drive_d() -> Self {
+            let mut fixture = Self::bottle();
+            let drive_d = unique_dir("drived");
+            std::fs::create_dir_all(drive_d.join("archive")).expect("create bridge dir");
+            fixture.drive_d_root = Some(drive_d);
+            fixture
+        }
+
+        fn volumes(&self) -> VolumeConfig {
+            VolumeConfig::from_parts(Some(self.bottle_root.clone()), self.drive_d_root.clone())
+        }
+
+        /// Create a host directory under the bottle's `drive_c`.
+        fn mkdir_c(&self, rel: &str) {
+            std::fs::create_dir_all(self.bottle_root.join("drive_c").join(rel))
+                .expect("create bottle subdir");
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            drop(std::fs::remove_dir_all(&self.bottle_root));
+            if let Some(drive_d) = &self.drive_d_root {
+                drop(std::fs::remove_dir_all(drive_d));
+            }
+        }
+    }
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("wie-cwd-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        dir
+    }
+
+    fn write_utf16(cpu: &mut IcedCpu, addr: u64, s: &str) {
+        let mut bytes = Vec::new();
+        for unit in s.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        cpu.mem_write(addr, &bytes).expect("write utf16 string");
+    }
+
+    fn write_ansi(cpu: &mut IcedCpu, addr: u64, s: &str) {
+        let mut bytes = s.as_bytes().to_vec();
+        bytes.push(0);
+        cpu.mem_write(addr, &bytes).expect("write ansi string");
+    }
+
+    fn read_utf16(cpu: &mut IcedCpu, addr: u64) -> String {
+        let mut units = Vec::new();
+        for index in 0_u64..256 {
+            let mut raw = [0_u8; 2];
+            cpu.mem_read(addr + 2 * index, &mut raw)
+                .expect("read utf16 unit");
+            let unit = u16::from_le_bytes(raw);
+            if unit == 0 {
+                break;
+            }
+            units.push(unit);
+        }
+        String::from_utf16(&units).expect("valid utf16")
+    }
+
+    fn read_ansi(cpu: &mut IcedCpu, addr: u64) -> String {
+        let mut bytes = Vec::new();
+        for index in 0_u64..512 {
+            let mut raw = [0_u8; 1];
+            cpu.mem_read(addr + index, &mut raw)
+                .expect("read ansi byte");
+            if raw[0] == 0 {
+                break;
+            }
+            bytes.push(raw[0]);
+        }
+        String::from_utf8(bytes).expect("valid ansi")
+    }
+
+    fn run_set_w(cpu: &mut IcedCpu, state: &mut WinApiState, path_ptr: u64) -> u64 {
+        cpu.write_rcx(path_ptr).ok();
+        cpu.write_rsp(STACK_TOP).ok();
+        let r = handle_set_current_directory_w(&mut HandlerContext::new(cpu, test_env(), state))
+            .expect("SetCurrentDirectoryW handler");
+        r.return_value
+    }
+
+    fn run_get_w(cpu: &mut IcedCpu, state: &mut WinApiState, buf_len: u64, buf_ptr: u64) -> u64 {
+        cpu.write_rcx(buf_len).ok();
+        cpu.write_rdx(buf_ptr).ok();
+        cpu.write_rsp(STACK_TOP).ok();
+        let r = handle_get_current_directory_w(&mut HandlerContext::new(cpu, test_env(), state))
+            .expect("GetCurrentDirectoryW handler");
+        r.return_value
+    }
+
+    fn stored_cwd(state: &WinApiState) -> String {
+        String::from_utf16_lossy(&state.file_io.current_directory_wide)
+    }
+
+    #[test]
+    fn set_get_round_trip_in_bottle_dir() {
+        let fixture = Fixture::bottle();
+        fixture.mkdir_c("App/Work");
+        let mut cpu = test_engine();
+        let mut state = winapi_state_default();
+        state.file_io.volumes = fixture.volumes();
+
+        write_utf16(&mut cpu, STR_BUF, r"C:\App\Work");
+        assert_eq!(run_set_w(&mut cpu, &mut state, STR_BUF), 1);
+        assert_eq!(state.process.last_error, 0);
+        assert_eq!(stored_cwd(&state), r"C:\App\Work");
+
+        let got = run_get_w(&mut cpu, &mut state, 64, OUT_BUF);
+        assert_eq!(got, 11); // len of "C:\App\Work" without NUL
+        assert_eq!(read_utf16(&mut cpu, OUT_BUF), r"C:\App\Work");
+        assert_eq!(state.process.last_error, 0);
+    }
+
+    #[test]
+    fn set_to_bottle_root() {
+        let fixture = Fixture::bottle();
+        let mut cpu = test_engine();
+        let mut state = winapi_state_default();
+        state.file_io.volumes = fixture.volumes();
+
+        write_utf16(&mut cpu, STR_BUF, r"C:\");
+        assert_eq!(run_set_w(&mut cpu, &mut state, STR_BUF), 1);
+        assert_eq!(stored_cwd(&state), r"C:\");
+        assert_eq!(run_get_w(&mut cpu, &mut state, 64, OUT_BUF), 3);
+        assert_eq!(read_utf16(&mut cpu, OUT_BUF), r"C:\");
+    }
+
+    #[test]
+    fn missing_in_bottle_dir_is_path_not_found() {
+        let fixture = Fixture::bottle();
+        let mut cpu = test_engine();
+        let mut state = winapi_state_default();
+        state.file_io.volumes = fixture.volumes();
+
+        write_utf16(&mut cpu, STR_BUF, r"C:\NoSuchDir");
+        assert_eq!(run_set_w(&mut cpu, &mut state, STR_BUF), 0);
+        assert_eq!(state.process.last_error, 3); // ERROR_PATH_NOT_FOUND
+        // Failed set leaves the stored cwd untouched.
+        assert_eq!(stored_cwd(&state), r"C:\");
+    }
+
+    #[test]
+    fn unmapped_drive_is_invalid_drive() {
+        let fixture = Fixture::bottle();
+        let mut cpu = test_engine();
+        let mut state = winapi_state_default();
+        state.file_io.volumes = fixture.volumes();
+
+        // E: is not a configured volume at all.
+        write_utf16(&mut cpu, STR_BUF, r"E:\anything");
+        assert_eq!(run_set_w(&mut cpu, &mut state, STR_BUF), 0);
+        assert_eq!(state.process.last_error, 15); // ERROR_INVALID_DRIVE
+        // D: exists only when the bridge is configured.
+        write_utf16(&mut cpu, STR_BUF, r"D:\x");
+        assert_eq!(run_set_w(&mut cpu, &mut state, STR_BUF), 0);
+        assert_eq!(state.process.last_error, 15);
+        assert_eq!(stored_cwd(&state), r"C:\");
+    }
+
+    #[test]
+    fn drive_d_bridge_round_trip() {
+        let fixture = Fixture::bottle_and_drive_d();
+        let mut cpu = test_engine();
+        let mut state = winapi_state_default();
+        state.file_io.volumes = fixture.volumes();
+
+        write_utf16(&mut cpu, STR_BUF, r"D:\archive");
+        assert_eq!(run_set_w(&mut cpu, &mut state, STR_BUF), 1);
+        assert_eq!(stored_cwd(&state), r"D:\archive");
+
+        // A missing dir under a bridged drive is still path-not-found.
+        write_utf16(&mut cpu, STR_BUF, r"D:\nope");
+        assert_eq!(run_set_w(&mut cpu, &mut state, STR_BUF), 0);
+        assert_eq!(state.process.last_error, 3);
+        assert_eq!(stored_cwd(&state), r"D:\archive");
+    }
+
+    #[test]
+    fn cwd_never_holds_unconfined_path() {
+        let fixture = Fixture::bottle();
+        fixture.mkdir_c("App");
+        let mut cpu = test_engine();
+        let mut state = winapi_state_default();
+        state.file_io.volumes = fixture.volumes();
+
+        // Establish a valid cwd first.
+        write_utf16(&mut cpu, STR_BUF, r"C:\App");
+        assert_eq!(run_set_w(&mut cpu, &mut state, STR_BUF), 1);
+
+        // Every failing set must leave the stored cwd unchanged.
+        let failing_paths = [
+            r"E:\x",             // unmapped drive
+            r"C:\Missing",       // missing in-bottle dir
+            r"D:\x",             // D: bridge not configured
+            r"\\server\share\x", // UNC share (unmapped)
+            r"/Users/me/x",      // bare host path → resolves to a missing C: path
+        ];
+        for path in failing_paths {
+            write_utf16(&mut cpu, STR_BUF, path);
+            assert_eq!(
+                run_set_w(&mut cpu, &mut state, STR_BUF),
+                0,
+                "set {path} must fail"
+            );
+            assert_eq!(stored_cwd(&state), r"C:\App");
+        }
+
+        // The stored cwd always re-confines to itself (canonical guest form).
+        let stored = stored_cwd(&state);
+        assert_eq!(
+            crate::vfs::confine_guest_path(&state.file_io.volumes, &stored),
+            Some(stored)
+        );
+    }
+
+    #[test]
+    fn relative_path_resolves_against_cwd() {
+        let fixture = Fixture::bottle();
+        fixture.mkdir_c("App/Sub");
+        let mut cpu = test_engine();
+        let mut state = winapi_state_default();
+        state.file_io.volumes = fixture.volumes();
+        write_utf16(&mut cpu, STR_BUF, r"C:\App");
+        assert_eq!(run_set_w(&mut cpu, &mut state, STR_BUF), 1);
+
+        write_utf16(&mut cpu, STR_BUF, r".\Sub");
+        assert_eq!(run_set_w(&mut cpu, &mut state, STR_BUF), 1);
+        assert_eq!(stored_cwd(&state), r"C:\App\Sub");
+
+        write_utf16(&mut cpu, STR_BUF, r"..");
+        assert_eq!(run_set_w(&mut cpu, &mut state, STR_BUF), 1);
+        assert_eq!(stored_cwd(&state), r"C:\App");
+    }
+
+    #[test]
+    fn get_w_insufficient_buffer_reports_required_size() {
+        let fixture = Fixture::bottle();
+        fixture.mkdir_c("App");
+        let mut cpu = test_engine();
+        let mut state = winapi_state_default();
+        state.file_io.volumes = fixture.volumes();
+        write_utf16(&mut cpu, STR_BUF, r"C:\App");
+        assert_eq!(run_set_w(&mut cpu, &mut state, STR_BUF), 1);
+
+        // Buffer of exactly the path length leaves no room for the NUL.
+        assert_eq!(run_get_w(&mut cpu, &mut state, 6, OUT_BUF), 7);
+        assert_eq!(state.process.last_error, 122); // ERROR_INSUFFICIENT_BUFFER
+
+        // Zero-length / null buffer behaves the same.
+        assert_eq!(run_get_w(&mut cpu, &mut state, 0, 0), 7);
+        assert_eq!(state.process.last_error, 122);
+
+        // An adequate buffer returns the path length (without NUL).
+        assert_eq!(run_get_w(&mut cpu, &mut state, 64, OUT_BUF), 6);
+        assert_eq!(read_utf16(&mut cpu, OUT_BUF), r"C:\App");
+        assert_eq!(state.process.last_error, 0);
+    }
+
+    #[test]
+    fn ansi_round_trip_and_insufficient_buffer() {
+        let fixture = Fixture::bottle();
+        fixture.mkdir_c("App");
+        let mut cpu = test_engine();
+        let mut state = winapi_state_default();
+        state.file_io.volumes = fixture.volumes();
+
+        write_ansi(&mut cpu, STR_BUF, r"C:\App");
+        cpu.write_rcx(STR_BUF).ok();
+        cpu.write_rsp(STACK_TOP).ok();
+        let r = handle_set_current_directory_a(&mut HandlerContext::new(
+            &mut cpu,
+            test_env(),
+            &mut state,
+        ))
+        .expect("SetCurrentDirectoryA handler");
+        assert_eq!(r.return_value, 1);
+        assert_eq!(state.process.last_error, 0);
+
+        // Too-small ANSI buffer → required size + ERROR_INSUFFICIENT_BUFFER.
+        cpu.write_rcx(3).ok();
+        cpu.write_rdx(OUT_BUF).ok();
+        cpu.write_rsp(STACK_TOP).ok();
+        let r = handle_get_current_directory_a(&mut HandlerContext::new(
+            &mut cpu,
+            test_env(),
+            &mut state,
+        ))
+        .expect("GetCurrentDirectoryA handler");
+        assert_eq!(r.return_value, 7);
+        assert_eq!(state.process.last_error, 122);
+
+        // Adequate ANSI buffer round-trips the stored cwd.
+        cpu.write_rcx(64).ok();
+        cpu.write_rdx(OUT_BUF).ok();
+        cpu.write_rsp(STACK_TOP).ok();
+        let r = handle_get_current_directory_a(&mut HandlerContext::new(
+            &mut cpu,
+            test_env(),
+            &mut state,
+        ))
+        .expect("GetCurrentDirectoryA handler");
+        assert_eq!(r.return_value, 6);
+        assert_eq!(read_ansi(&mut cpu, OUT_BUF), r"C:\App");
+        assert_eq!(state.process.last_error, 0);
+    }
+
+    #[test]
+    fn empty_or_null_path_fails_path_not_found() {
+        let fixture = Fixture::bottle();
+        let mut cpu = test_engine();
+        let mut state = winapi_state_default();
+        state.file_io.volumes = fixture.volumes();
+
+        assert_eq!(run_set_w(&mut cpu, &mut state, 0), 0);
+        assert_eq!(state.process.last_error, 3);
+        write_utf16(&mut cpu, STR_BUF, "");
+        assert_eq!(run_set_w(&mut cpu, &mut state, STR_BUF), 0);
+        assert_eq!(state.process.last_error, 3);
+        assert_eq!(stored_cwd(&state), r"C:\");
     }
 }

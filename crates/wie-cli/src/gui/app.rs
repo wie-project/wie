@@ -267,6 +267,7 @@ impl WieApp {
                 last_resize: None,
                 last_sent_size: None,
                 scale_factor,
+                retry_budget: RetryBudget::default(),
             };
             if is_first {
                 self.primary_hwnd = Some(rt.hwnd);
@@ -329,6 +330,10 @@ struct WindowRuntime {
     /// `ScaleFactorChanged`.  The guest space is logical; every winit
     /// physical value crossing the window boundary divides by this.
     scale_factor: f64,
+    /// Bounded redraw-retry budget for the present loop: a `NotDrawn`
+    /// present is retried at most once per presentable frame, then parked
+    /// until a natural redraw event (see [`RetryBudget`]).
+    retry_budget: RetryBudget,
 }
 
 /// One host winit window per guest top-level window, keyed by winit
@@ -348,6 +353,52 @@ type PresentBackend = crate::gui::present_wgpu::WgpuPresenter;
 /// records the frame as presented ONLY when it reached the screen (a skipped
 /// present must stay retryable).
 use crate::gui::present_wgpu::PresentOutcome;
+
+/// Bounded redraw-retry budget for one window's present loop.
+///
+/// A present that skips the draw (`NotDrawn { retry: true }` — occluded or
+/// out-of-date surface) must be retried, but a PERSISTENT skip must not spin
+/// the event loop. The pre-bound code re-requested the redraw unconditionally,
+/// so a window that stayed occluded (the acquire keeps timing out) looped
+/// forever: acquire-skip → re-request → acquire-skip → ... Each presentable
+/// frame now gets at most ONE immediate retry; after that the frame stays
+/// pending in the presenter (its `last_uploaded` holds it) and only a NATURAL
+/// redraw event — a new guest publish (Frame wake), a resize, a scale-factor
+/// change, or an un-occlusion (`Occluded(false)`) — retries it.
+#[derive(Debug, Default)]
+struct RetryBudget {
+    /// The pixels Arc of the frame that already consumed its one immediate
+    /// retry. The compare is exact: every publish wraps the painted buffer in
+    /// a fresh `Arc`, so `Arc::ptr_eq` distinguishes "the same frame again"
+    /// (budget spent) from "a genuinely new frame" (fresh budget).
+    retried: Option<Arc<Vec<u32>>>,
+}
+
+impl RetryBudget {
+    /// Whether a just-`NotDrawn` present of `pixels` should trigger an
+    /// immediate redraw retry. `true` for the FIRST skip of a frame (fresh
+    /// budget), `false` for the same frame's repeats — those park the frame
+    /// and wait for a natural redraw event.
+    fn should_retry(&self, pixels: &Arc<Vec<u32>>) -> bool {
+        self.retried
+            .as_ref()
+            .is_none_or(|prev| !Arc::ptr_eq(prev, pixels))
+    }
+
+    /// Mark `pixels` as having consumed its one immediate retry (called right
+    /// before the redraw is re-requested).
+    fn consume(&mut self, pixels: &Arc<Vec<u32>>) {
+        self.retried = Some(Arc::clone(pixels));
+    }
+
+    /// The frame reached the screen — the next present starts with a fresh
+    /// budget. Dropping the held Arc never unpins anything the presenter does
+    /// not already pin (`last_uploaded` / `last_presented` hold the same
+    /// frames while they matter).
+    fn reset(&mut self) {
+        self.retried = None;
+    }
+}
 
 /// Initialize the wgpu present backend. wgpu init is expected to succeed on
 /// macOS (Metal backend); a failure here means the host cannot present at all.
@@ -524,6 +575,21 @@ impl ApplicationHandler<WieEvent> for WieApp {
                 }
                 return;
             }
+            WindowEvent::Occluded(false) => {
+                // The window became visible again after being fully covered
+                // (its surface acquire was skipping with Occluded/Timeout). A
+                // frame may be parked in the presenter by the bounded-retry
+                // present — re-request the redraw so the parked frame draws.
+                // `Occluded(true)` needs no arm: while covered the frame stays
+                // parked, and this event (or a new publish, a resize) is the
+                // natural retry. winit emits this on macOS when the occlusion
+                // state clears, which is also how the un-occlusion acceptance
+                // test draws its parked frame.
+                if let Some(rt) = self.windows.get(&window_id) {
+                    rt.window.request_redraw();
+                }
+                return;
+            }
             _ => {}
         }
 
@@ -650,6 +716,9 @@ impl ApplicationHandler<WieEvent> for WieApp {
                         PresentOutcome::Drawn => {
                             rt.last_presented_pixels = Some(presented_pixels);
                             rt.last_presented_size = Some((dst_w, dst_h));
+                            // The frame reached the screen — the next present
+                            // starts with a fresh retry budget.
+                            rt.retry_budget.reset();
                         }
                         PresentOutcome::NotDrawn { retry } => {
                             // The frame never reached the screen. Keep
@@ -665,7 +734,16 @@ impl ApplicationHandler<WieEvent> for WieApp {
                             // dialog stays invisible until a mouse event
                             // repaints it. The backend skips the redundant
                             // staging re-upload on the retry, so this is cheap.
-                            if retry {
+                            //
+                            // The re-request is BOUNDED to one per presentable
+                            // frame ([`RetryBudget`]): a persistent skip — the
+                            // window occluded, the acquire keeps timing out —
+                            // must not spin the event loop. After the one
+                            // retry the frame stays pending in the presenter
+                            // and only a natural redraw event (a new publish,
+                            // a resize, an un-occlusion) retries it.
+                            if retry && rt.retry_budget.should_retry(&presented_pixels) {
+                                rt.retry_budget.consume(&presented_pixels);
                                 rt.window.request_redraw();
                             }
                         }
@@ -1285,8 +1363,11 @@ pub fn run_gui_windowed(
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
+    use std::sync::Arc;
+
     use super::{
-        guest_size_from_physical, map_alert_result, map_message_box_buttons, window_attributes,
+        RetryBudget, guest_size_from_physical, map_alert_result, map_message_box_buttons,
+        window_attributes,
     };
 
     /// `MB_*` button bits select the rfd button set; the bridge receives the
@@ -1403,5 +1484,34 @@ mod tests {
         // Scale factor 1.0 reproduces today's physical-as-logical posting.
         assert_eq!(guest_size_from_physical(640, 480, 1.0), (640, 480));
         assert_eq!(guest_size_from_physical(886, 776, 1.0), (886, 776));
+    }
+
+    /// A `NotDrawn` present is retried at most ONCE per presentable frame:
+    /// the first skip of a frame re-requests the redraw; the same frame's
+    /// repeats park (no re-request); a genuinely NEW frame or a DRAWN frame
+    /// resets the budget. This is what bounds the occluded-window spin — the
+    /// pre-bound app re-requested unconditionally, so a window that stayed
+    /// occluded (acquire keeps timing out) looped forever.
+    #[test]
+    fn notdrawn_present_retries_each_frame_at_most_once() {
+        let f1 = Arc::new(vec![1_u32]);
+        let f1_again = Arc::clone(&f1);
+        let f2 = Arc::new(vec![2_u32]);
+        let mut budget = RetryBudget::default();
+        // Fresh budget: the first NotDrawn of a frame triggers the retry.
+        assert!(budget.should_retry(&f1));
+        budget.consume(&f1);
+        // The SAME frame (same allocation, Arc::ptr_eq) may not retry again.
+        assert!(!budget.should_retry(&f1_again));
+        // A genuinely new frame (fresh allocation) gets a fresh budget.
+        assert!(budget.should_retry(&f2));
+        budget.consume(&f2);
+        assert!(!budget.should_retry(&f2));
+        // A frame that reached the screen resets the budget for the next
+        // present.
+        budget.reset();
+        assert!(budget.should_retry(&f1));
+        // An empty budget is exactly the default state (no frame retried yet).
+        assert!(budget.should_retry(&Arc::new(vec![3_u32])));
     }
 }
