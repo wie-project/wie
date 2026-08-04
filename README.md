@@ -86,7 +86,13 @@ make -C micro-exes snake      # individual targets (snake, crt_hello, …)
 
 ### Real 7-Zip
 
-WIE runs the **Windows PE64** standalone console from 7-Zip Extra (not macOS `7za`). The PE is not committed (`real_exes/` is gitignored) — download once, then:
+WIE runs the **Windows PE64** standalone console from 7-Zip Extra (not macOS `7za`). The PE is not committed (`real_exes/` is gitignored) — fetch it once, then:
+
+```bash
+./scripts/fetch.sh 7za
+```
+
+Then run:
 
 ```bash
 BOTTLE=$(mktemp -d)

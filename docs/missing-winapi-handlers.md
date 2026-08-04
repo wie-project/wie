@@ -4,6 +4,79 @@ Categorized by DLL. Based on the dispatch table and module structure in `crates/
 
 ---
 
+## Recently landed (notepad milestone, 2026-08)
+
+The classic-Win32 depth-of-coverage work (see `docs/notepad-support-plan.md`) landed a large
+batch of handlers that earlier sections of this file list as missing. The stale bullets are
+superseded by this list:
+
+- **Menus from resources**: `LoadMenuA/W` + `RT_MENU` parsing (wie-pe), `lpszMenuName` at
+  RegisterClassEx/CreateWindowEx, menu state (`EnableMenuItem`/`CheckMenuItem`/`CheckMenuRadioItem`)
+  mirrored into the macOS top bar (muda `MacMenuBar`), `Get/SetMenuItemInfo`, `ModifyMenu`,
+  `RemoveMenu`, `DestroyMenu`, `GetSystemMenu`.
+- **Accelerators**: `RT_ACCELERATOR` parsing, `LoadAcceleratorsW`, `TranslateAcceleratorA/W`,
+  `DestroyAcceleratorTable` — wired into the guest message loop ahead of `TranslateMessage`.
+- **String tables**: `LoadStringA/W` from `RT_STRING`; `RegisterWindowMessageA/W` (per-session
+  atom cache, 0xC000+ range).
+- **Multiline EDIT**: ES_MULTILINE + full EM_* family (LIMITTEXT/GETLINECOUNT/LINEFROMCHAR/
+  LINEINDEX/LINELENGTH/GETLINE/REPLACESEL/SCROLLCARET/GETHANDLE/SETHANDLE/GETMODIFY/SETMODIFY/
+  CANUNDO/UNDO/EMPTYUNDOBUFFER/SETTABSTOPS/SELECTIONTYPE/POSFROMCHAR), wrap, wheel + keyboard
+  vertical scrolling, mouse click/drag/double-click selection, caret blink, typing-at-bottom
+  auto-scroll, `WM_SETFONT`/`WM_GETFONT`, EN_CHANGE/EN_HSCROLL/EN_VSCROLL delivery.
+- **EDIT clipboard**: `WM_CUT/COPY/PASTE/CLEAR/UNDO` + single-level undo buffer +
+  `IsClipboardFormatAvailable(CF_TEXT)` (host `String` clipboard state; macOS NSPasteboard not
+  bridged — YAGNI).
+- **Status bar**: `STATUSCLASSNAMEW` built-in class, `CreateStatusWindowA/W`, `SB_SETPARTS`/
+  `SB_SETTEXTW`/`SB_GETTEXTW`/`SB_GETTEXTLENGTHW` + ANSI legacy ids, WM_SIZE bottom-anchor,
+  painted parts (BTNFACE raised edge, per-part clipped text).
+- **Common dialogs**: interactive `GetOpenFileNameW`/`GetSaveFileNameW` (host "FileDialog" window
+  under `FileDialogPolicy::Interactive`; `Cancel`/`Accept{path}` policy for headless), `FindTextW`/
+  `ReplaceTextW` modeless dialogs over `FINDMSGSTRING` (FR_FINDNEXT/FR_REPLACE/FR_REPLACEALL/
+  FR_DIALOGTERM), `GetFileTitleA/W`, `ChooseColorA`.
+- **Registry values**: `RegQueryValueExA/W`, `RegSetValueExA/W`, `RegDeleteValueA/W`,
+  `RegOpenKeyA/W`, `RegCreateKeyExA/W` — with per-bottle hive persistence
+  (`{root}/registry/hive.dat`, write-through, corrupt → fresh profile).
+- **Drag & drop**: `DragAcceptFiles`, `DragQueryFileA/W`, `DragQueryPoint`, `DragFinish`,
+  `WM_DROPFILES` from the winit file-drop event, `host_path_to_guest` bottle mapping.
+- **Misc**: `ShellAboutW` (via the MessageBox bridge), `ShellExecuteW` ("open" → detached
+  `wie-cli run <path>`), `GetTimeFormatW`/`GetDateFormatW` (full picture-string tokenizer),
+  `LocalLock`/`LocalUnlock`, `SetDlgItemInt`/`GetDlgItemInt`/`SendDlgItemMessageW`, `COLOR_INFOBK`.
+- **CRT/startup (UCRT)**: `_initialize_wide_environment`, `_configure_wide_argv`, `GetStartupInfoW`,
+  `GetUserDefaultUILanguage`, `__p__wenviron`, `_vsnwprintf`/`_vsnprintf`, `__stdio_common_vfprintf`,
+  and the notepad P0 chain (LoadStringW → RegOpenKeyW → CreateFontIndirectW → LoadIconW →
+  LoadCursorW → DragAcceptFiles → CreateStatusWindowW → GetFileTitleW → GetWindowTextLengthW →
+  GetWindowPlacement/SetWindowPlacement).
+- **Not winapi handlers**: multi-window winit host + `run --console` are wie-cli/runtime plumbing;
+  `SHUFPD` (SSE shuffle) is a wie-cpu iced/JIT instruction (commit b5952b3).
+
+## Notepad trace triage (Task 6.2, 2026-08-04)
+
+`./target/debug/wie-cli trace --max-api 400 real_exes/notepad.exe` now runs the full startup +
+first message-loop iterations to a clean `ExitProcess { code: 0 }` — the entire P0.3-era
+first-failure chain is resolved. `inspect --winapi-map` still flags 25 imports as TODO; 23 are
+genuinely unimplemented (2 are map artifacts: `RegCreateKeyExW` is soft-dispatched in advapi32,
+`DialogBoxParamW` is an in-guest stub). Remaining notepad imports that would bail if called:
+
+| Import | Status |
+| --- | --- |
+| `comdlg32!ChooseFontW`, `comdlg32!PageSetupDlgW`, `comdlg32!PrintDlgW` | **queued L6** (View→Font / Page Setup / Print) |
+| `gdi32!AbortDoc`, `EndDoc`, `EndPage`, `StartDocW`, `StartPage` | print-path stubs (L6 print scope) |
+| `gdi32!GetTextMetricsW` | only the A variant exists |
+| `gdi32!Rectangle`, `gdi32!SetMapMode` | drawing/state gaps |
+| `advapi32!IsTextUnicode` | encoding detect helper |
+| `kernel32!CreateFileMappingW` | MapViewOfFile/UnmapViewOfFile exist; the create-side is missing |
+| `shell32!SHAddToRecentDocs` | Recent-files list (called after open/save) |
+| `user32!InflateRect`, `user32!SetProcessDefaultLayout`, `user32!WinHelpW`, `user32!wsprintfW` | minor/rare paths |
+| `msvcrt!_wcmdln`, `fgetwc`, `getc`, `iswctype`, `vfprintf` | legacy CRT exports not reached by notepad |
+
+None of the 23 are on the startup path. Known live-run gap (not an import): the interactive
+file dialog's in-guest modal loop does not survive the live GUI run — opening File→Open/Save As
+from a scripted `WM_COMMAND` silently terminates the guest (exit 0) before the modal loop pumps;
+the `FileDialogPolicy::Accept` path and host-dialog construction are unit-tested. Investigation
+needed before File→Open/Save As is e2e-safe for a human.
+
+---
+
 ## DLLs With Zero Coverage
 
 Any call to these returns `bail!("unsupported WinAPI call: {library}!{name}")`:
@@ -27,12 +100,15 @@ Any call to these returns `bail!("unsupported WinAPI call: {library}!{name}")`:
 
 ---
 
-## SHELL32.dll — Only 3 of ~50+ exports
+## SHELL32.dll — ~10 of ~50+ exports
 
 **Implemented:**
 - `SHGetFolderPathW` — functional, maps CSIDL to synthetic bottle paths
 - `SHGetPathFromIDListW` — returns FALSE, writes empty string
 - `SHBrowseForFolderW` — returns NULL
+- `DragAcceptFiles`, `DragQueryFileA/W`, `DragQueryPoint`, `DragFinish` + `WM_DROPFILES` (see "Recently landed")
+- `ShellAboutW` (MessageBox bridge), `ShellExecuteW` ("open" → detached `wie-cli run`)
+- `SHAddToRecentDocs` — **still missing** (see the notepad triage table)
 
 **Missing:**
 - `ShellExecuteA` / `ShellExecuteW`
@@ -166,29 +242,20 @@ Any call to these returns `bail!("unsupported WinAPI call: {library}!{name}")`:
 - `MessageBoxA/W` — prints to stderr via tracing
 - `GetSystemMetrics` — returns synthetic values (800x600 screen, etc.)
 
-**Missing entirely:**
-- `CreateAcceleratorTableA/W`, `DestroyAcceleratorTable`, `TranslateAcceleratorA/W`
-- `DialogBoxParamA/W`, `CreateDialogParamA/W`, `EndDialog`, `DefDlgProcA/W`
-- `IsDialogMessageA/W`
-- `GetDlgItem`, `GetDlgItemInt`, `GetDlgItemTextA/W`, `SetDlgItemInt`, `SetDlgItemTextA/W`
-- `CheckDlgButton`, `CheckRadioButton`, `IsDlgButtonChecked`
+**Missing entirely (superseded items — accelerators, dialogs, focus/capture, menu APIs,
+window placement, clipboard, SetTimer/WM_TIMER, drag-drop, SetWindowText-family — are
+landed; see "Recently landed"):**
+- `CreateAcceleratorTableA/W` (runtime-built tables; resource tables + TranslateAccelerator are landed)
 - `MapDialogRect`
-- `SetActiveWindow`, `GetActiveWindow`, `SetFocus`, `GetFocus`
-- `GetCapture`, `SetCapture`, `ReleaseCapture`
-- `SendDlgItemMessageA/W`
+- `CheckDlgButton`, `CheckRadioButton`, `IsDlgButtonChecked`
 - `GetUpdateRect`, `GetUpdateRgn`, `ExcludeUpdateRgn`
 - `RedrawWindow`
-- `UpdateWindow`
 - `SetWindowRgn`, `GetWindowRgn`
-- `GetWindowPlacement`, `SetWindowPlacement`
 - `ArrangeIconicWindows`
-- `SetSysColors`, `GetSysColor`, `SetSysColorsTemp`, `GetSysColorBrush`
-- `DrawIcon`, `DrawIconEx`, `DrawTextA/W`, `DrawTextExA/W`, `TabbedTextOutA/W`
+- `SetSysColors`, `SetSysColorsTemp`, `GetSysColorBrush`
+- `DrawIcon`, `DrawIconEx`, `DrawTextExA/W`, `TabbedTextOutA/W`
 - `FillRect`, `DrawEdge`, `DrawFrameControl`, `DrawCaption`
 - `FrameRect`, `InvertRect`
-- `GetMenu`, `SetMenu`, `GetSubMenu`, `GetMenuItemInfoA/W`, `GetMenuStringA/W`
-- `AppendMenuA/W`, `InsertMenuItemA/W`, `DeleteMenu`, `DestroyMenu`, `CreateMenu`, `CreatePopupMenu`, `TrackPopupMenu`
-- `EnableMenuItem`, `CheckMenuItem`, `CheckMenuRadioItem`
 - `DrawMenuBar`
 - `WindowFromPoint`, `ChildWindowFromPoint`, `ChildWindowFromPointEx`
 - `FindWindowA/W`, `FindWindowExA/W`
@@ -199,16 +266,16 @@ Any call to these returns `bail!("unsupported WinAPI call: {library}!{name}")`:
 - `OpenIcon`, `CloseWindow`
 - `LockWindowUpdate`
 - `CreateCaret`, `ShowCaret`, `HideCaret`, `SetCaretPos`, `GetCaretPos`, `DestroyCaret`
-- `GetCursorPos`, `SetCursorPos`, `SetCursor`, `GetCursor`, `ShowCursor`, `LoadCursorFromFileA/W`
+- `GetCursorPos`, `SetCursorPos`, `GetCursor`, `ShowCursor`, `LoadCursorFromFileA/W`
 - `ClipCursor`, `GetClipCursor`
-- `MoveWindow`, `GetWindowRect` (has implementation), `SetWindowPos` (has implementation)
 - `CascadeWindows`, `TileWindows`
 
 ---
 
 ## ADVAPI32.dll — ~40% coverage, registry is minimal
 
-**Registry missing:**
+**Registry missing (value storage landed — RegQueryValueEx/RegSetValueEx/RegDeleteValueA/W,
+RegOpenKeyA/W, RegCreateKeyExA/W + per-bottle hive persistence; see "Recently landed"):**
 - `RegDeleteKeyA` / `RegDeleteKeyW`
 - `RegEnumKeyExA` / `RegEnumKeyExW`
 - `RegEnumValueA` / `RegEnumValueW`
@@ -288,10 +355,11 @@ Any call to these returns `bail!("unsupported WinAPI call: {library}!{name}")`:
 
 ---
 
-## COMCTL32.dll — ~60% coverage mostly ImageList
+## COMCTL32.dll — status bar landed, mostly ImageList otherwise
 
 **Implemented:**
 - Basic ImageList functions (Create, Destroy, GetImageCount, SetImageCount, Add, ReplaceIcon, Remove, GetIconSize, SetIconSize, GetIcon, SetOverlayImage, BeginDrag, EndDrag, DragEnter, DragLeave, DragMove, GetDragImage, SetDragCursorImage)
+- Status bar: `CreateStatusWindowA/W`, `STATUSCLASSNAMEW` class, `SB_SETPARTS`/`SB_SETTEXTW`/`SB_GETTEXTW`/`SB_GETTEXTLENGTHW` (see "Recently landed")
 
 **Missing:**
 - `InitCommonControls` / `InitCommonControlsEx` (may be stubs)

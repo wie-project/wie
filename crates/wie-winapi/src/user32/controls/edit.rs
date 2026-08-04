@@ -6,8 +6,9 @@ use anyhow::Result;
 use super::listbox::render_control_text;
 use super::paint::fill_rect_clipped;
 use super::{
-    COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, ControlClassKind, ControlState, ES_MULTILINE, SEL_EMPTY,
-    SEL_MULTICHAR, SEL_MULTILINE, SEL_TEXT, control_state, deliver_command,
+    COLOR_BTNFACE, COLOR_BTNHIGHLIGHT, COLOR_BTNSHADOW, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT,
+    ControlClassKind, ControlState, ES_MULTILINE, SEL_EMPTY, SEL_MULTICHAR, SEL_MULTILINE,
+    SEL_TEXT, control_state, deliver_command,
 };
 use crate::gdi32::ResolvedWindow;
 use crate::gdi32::{FontEngine, FontKey, ResolvedFont};
@@ -37,6 +38,28 @@ pub(super) const CARET_BLINK_MS: u32 = 530;
 /// wrap (notepad toggles wrap by dropping the horizontal scroll style).
 const WS_HSCROLL: u32 = 0x0010_0000;
 
+/// `WS_VSCROLL` — a multiline EDIT requests a vertical scrollbar. The chrome
+/// only shows when the content ALSO overflows the viewport (`scrollbar_visible`
+/// gates on both); an EDIT without the style never reserves the gutter.
+const WS_VSCROLL: u32 = 0x0020_0000;
+
+/// Whether an EDIT shows its vertical scrollbar: the window carries the
+/// `WS_VSCROLL` style AND the content (`total` visual rows) overflows the
+/// viewport (`visible` rows). Auto-hides when the content fits.
+#[must_use]
+pub(crate) fn scrollbar_visible(style: u32, total: usize, visible: usize) -> bool {
+    style & WS_VSCROLL != 0 && total > visible
+}
+
+/// Whether an EDIT word-wraps: multiline AND no horizontal scrollbar (notepad
+/// toggles wrap by dropping the horizontal scroll style); long lines are
+/// horizontally clipped otherwise. Single source of truth for the paint, the
+/// scroll math, and the click hit-test.
+#[must_use]
+fn edit_wrap_from_style(style: u32) -> bool {
+    style & ES_MULTILINE != 0 && style & WS_HSCROLL == 0
+}
+
 /// `WM_VSCROLL` / `WM_HSCROLL` scroll-bar request codes (winuser.h) — the
 /// wParam LOW word. THUMBTRACK/POSITION carry the thumb position in the high
 /// word.
@@ -49,6 +72,25 @@ const SB_THUMBTRACK: u16 = 5;
 const SB_TOP: u16 = 6;
 const SB_BOTTOM: u16 = 7;
 const SB_ENDSCROLL: u16 = 8;
+
+/// The horizontal scroll-bar codes — the SAME values winuser.h aliases for
+/// the H scrollbar (LINELEFT == LINEUP, and so on).
+const SB_LINELEFT: u16 = 0;
+const SB_LINERIGHT: u16 = 1;
+const SB_PAGELEFT: u16 = 2;
+const SB_PAGERIGHT: u16 = 3;
+const SB_LEFT: u16 = 6;
+const SB_RIGHT: u16 = 7;
+
+/// The classic scrollbar gutter — `SM_CXVSCROLL` (17 px). A multiline EDIT
+/// with an overflowing vertical scrollbar reserves this strip in the right of
+/// its client (shrinking the wrap column); the horizontal scrollbar reserves
+/// the same strip at the bottom.
+const SCROLLBAR_WIDTH: i32 = 17;
+
+/// One horizontal "line" scroll step in px (a nominal character cell; the
+/// host-side H scrollbar has no per-glyph metric at the message boundary).
+const H_LINE_STEP: usize = 8;
 
 /// The ES_LEFT/CENTER/RIGHT alignment bits (the low 2 style bits).
 const ES_ALIGN_MASK: u32 = 0x0003;
@@ -1165,7 +1207,7 @@ pub(crate) fn clamp_scroll_offset(
 /// a wrap boundary belongs to the row that ENDS at it — the row `paint_edit`
 /// draws the caret bar on.
 #[must_use]
-fn visual_rows<F>(
+pub(crate) fn visual_rows<F>(
     text: &str,
     width: i32,
     wrap: bool,
@@ -1209,6 +1251,101 @@ where
     (rows, caret_row)
 }
 
+/// The widest line's advance sum in px — the horizontal scroll range's far
+/// end for a wrap-off EDIT (a line's intrinsic width; independent of the
+/// viewport).
+#[must_use]
+fn max_line_advance<F>(text: &str, advance: &mut F) -> i32
+where
+    F: FnMut(char) -> i32,
+{
+    text.split('\n')
+        .map(|line| {
+            line.chars()
+                .fold(0_i32, |acc, ch| acc.saturating_add(advance(ch)))
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// The resolved text-area geometry of a multiline EDIT — shared by the scroll
+/// math (`edit_scroll_context`) and the paint (`paint_edit`) so their row
+/// counts, wrap columns, and scrollbar visibility ALWAYS agree (the F5
+/// deferral's stated reason). The vertical scrollbar, when shown, reserves a
+/// `SCROLLBAR_WIDTH` gutter in the right of the client, shrinking the wrap
+/// column; the horizontal scrollbar (wrap-off edits with WS_HSCROLL) reserves
+/// a bottom strip that the visible-row count reflects.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EditTextArea {
+    /// The wrap column: client width minus the 2 px side margins minus the
+    /// vertical gutter when the V scrollbar is shown.
+    pub wrap_width: i32,
+    /// Whether the vertical scrollbar is shown (the content overflows the
+    /// viewport after the gutter reservation).
+    pub v_scroll_visible: bool,
+    /// Whether the horizontal scrollbar is shown (a wrap-off line overflows
+    /// the text area).
+    pub h_scroll_visible: bool,
+    /// The wrap-aware visual row count at `wrap_width` — the V scroll range's
+    /// far end.
+    pub total: usize,
+    /// The visual row holding the caret.
+    pub caret_row: usize,
+    /// The row count visible in the client (the H strip, when shown, is not
+    /// part of the text area).
+    pub visible: usize,
+    /// The widest line's advance sum in px.
+    pub max_line_width: i32,
+}
+
+/// Resolve an EDIT's text-area geometry (see [`EditTextArea`]).
+///
+/// Visibility runs in a FIXED order with no feedback: the V scrollbar is
+/// decided on the no-gutter width first (reserving its gutter can only add
+/// wrap rows, so a shown scrollbar never needs to hide); the H scrollbar then
+/// compares the widest line against the remaining text area. `style` is the
+/// window's creation style; the wrap decision derives from it here, so the
+/// callers cannot disagree about it.
+pub(crate) fn edit_text_area<F>(
+    text: &str,
+    width: i32,
+    client_height: i32,
+    line_h: i32,
+    style: u32,
+    caret: usize,
+    advance: &mut F,
+) -> EditTextArea
+where
+    F: FnMut(char) -> i32,
+{
+    let wrap = edit_wrap_from_style(style);
+    let no_gutter = width.saturating_sub(4);
+    let total_no_gutter = visual_rows(text, no_gutter, wrap, caret, advance).0;
+    let v_visible = scrollbar_visible(
+        style,
+        total_no_gutter,
+        visible_line_count(client_height, line_h),
+    );
+    let v_gutter = if v_visible { SCROLLBAR_WIDTH } else { 0 };
+    let max_line_width = max_line_advance(text, advance);
+    // The H bar is a multiline no-wrap EDIT's (WS_HSCROLL implies no wrap);
+    // a single-line EDIT auto-scrolls instead and never shows chrome.
+    let h_visible =
+        style & ES_MULTILINE != 0 && !wrap && max_line_width > no_gutter.saturating_sub(v_gutter);
+    let h_strip = if h_visible { SCROLLBAR_WIDTH } else { 0 };
+    let wrap_width = no_gutter.saturating_sub(v_gutter);
+    let (total, caret_row) = visual_rows(text, wrap_width, wrap, caret, advance);
+    EditTextArea {
+        wrap_width,
+        v_scroll_visible: v_visible,
+        h_scroll_visible: h_visible,
+        total,
+        caret_row,
+        visible: visible_line_count(client_height.saturating_sub(h_strip), line_h),
+        max_line_width,
+    }
+}
+
 /// The wrap-aware vertical scroll context of a multiline EDIT: how many visual
 /// rows fit in the client (`visible`), the full row count (`total`), and the
 /// visual row holding the caret (`caret_row`). All three derive from the same
@@ -1218,6 +1355,17 @@ struct EditScrollContext {
     visible: usize,
     total: usize,
     caret_row: usize,
+    /// The horizontal scroll range in px (widest line − text area); 0 when
+    /// the H scrollbar is hidden (wrap-on or the content fits).
+    h_overflow: usize,
+    /// The horizontal page size in px (the visible text width).
+    h_page: usize,
+    /// Whether each scrollbar is currently shown.
+    v_scroll_visible: bool,
+    h_scroll_visible: bool,
+    /// The client dimensions (for the gutter hit-test).
+    client_width: i32,
+    client_height: i32,
 }
 
 /// Resolve an EDIT's [`EditScrollContext`] from its client height, the
@@ -1236,11 +1384,6 @@ fn edit_scroll_context(state: &mut WinApiState, hwnd: u64) -> Option<EditScrollC
         };
         (w.height, w.control_text.clone(), w.style, w.width, caret)
     };
-    let multiline = style & ES_MULTILINE != 0;
-    // Wrap is on when the multiline EDIT has no horizontal scrollbar — the
-    // same condition paint_edit uses, so row counts and painted rows agree.
-    let wrap = multiline && style & WS_HSCROLL == 0;
-    let wrap_width = width.saturating_sub(4);
     // The font engine is taken out of gdi state so the advance closure can
     // run next to it (the paint path does the same); it is put back
     // unconditionally. Safe under the single shared WinApiState mutex — the
@@ -1257,24 +1400,37 @@ fn edit_scroll_context(state: &mut WinApiState, hwnd: u64) -> Option<EditScrollC
             .resolve(&default_key, 16)
             .map(|resolved| (default_key, resolved)),
     };
-    let (line_h, rows) = match &key_and_resolved {
+    let area = match &key_and_resolved {
         Some((key, resolved)) => {
             let line_h = resolved.line_height();
             let advance = &mut |ch: char| font_engine.char_advance(resolved, key, ch);
-            (line_h, visual_rows(&text, wrap_width, wrap, caret, advance))
+            edit_text_area(&text, width, client_height, line_h, style, caret, advance)
         }
         // No system font: the 16 px default the EM_* line APIs assume, with
         // a fixed 8 px/char advance for the wrap walk.
-        None => (
-            16,
-            visual_rows(&text, wrap_width, wrap, caret, &mut |_| 8_i32),
-        ),
+        None => edit_text_area(&text, width, client_height, 16, style, caret, &mut |_| {
+            8_i32
+        }),
     };
     state.gdi_state().font_engine = font_engine;
+    // The H scroll range is non-zero only while the H bar is shown — a wrap-on
+    // EDIT (or a line that fits) has nothing to scroll, so WM_HSCROLL stays a
+    // no-op there (the pre-deferral behavior).
+    let h_overflow = if area.h_scroll_visible {
+        usize::try_from(area.max_line_width.saturating_sub(area.wrap_width).max(0)).unwrap_or(0)
+    } else {
+        0
+    };
     Some(EditScrollContext {
-        visible: visible_line_count(client_height, line_h),
-        total: rows.0,
-        caret_row: rows.1,
+        visible: area.visible,
+        total: area.total,
+        caret_row: area.caret_row,
+        h_overflow,
+        h_page: usize::try_from(area.wrap_width.max(0)).unwrap_or(0),
+        v_scroll_visible: area.v_scroll_visible,
+        h_scroll_visible: area.h_scroll_visible,
+        client_width: width,
+        client_height,
     })
 }
 
@@ -1312,6 +1468,43 @@ pub(super) fn edit_scroll_vertical(
     };
     *first_visible_line = clamp_scroll_offset(target, context.total, context.visible);
     *first_visible_line != old
+}
+
+/// EDIT: WM_HSCROLL — apply one horizontal scroll-bar request on a wrap-off
+/// EDIT (WS_HSCROLL). `code` is the SB_* code in the wParam low word; `thumb`
+/// is the high-word thumb position used by SB_THUMBTRACK/POSITION. Line
+/// scrolls step one character cell (8 px); pages are the visible text width.
+/// A wrap-on EDIT has no horizontal overflow, so every code clamps to 0.
+/// Returns whether the offset moved.
+pub(super) fn edit_scroll_horizontal(
+    state: &mut WinApiState,
+    hwnd: u64,
+    code: u16,
+    thumb: u16,
+) -> bool {
+    let Some(context) = edit_scroll_context(state, hwnd) else {
+        return false;
+    };
+    let ControlState::Edit {
+        first_visible_column,
+        ..
+    } = edit_state_for_window(state, hwnd)
+    else {
+        return false;
+    };
+    let old = *first_visible_column;
+    let target = match code {
+        SB_LINELEFT => old.saturating_sub(H_LINE_STEP),
+        SB_LINERIGHT => old.saturating_add(H_LINE_STEP),
+        SB_PAGELEFT => old.saturating_sub(context.h_page),
+        SB_PAGERIGHT => old.saturating_add(context.h_page),
+        SB_LEFT => 0,
+        SB_RIGHT => context.h_overflow,
+        SB_THUMBPOSITION | SB_THUMBTRACK => usize::from(thumb),
+        _ => old, // unknown codes: no-op
+    };
+    *first_visible_column = target.min(context.h_overflow);
+    *first_visible_column != old
 }
 
 /// EDIT: WM_MOUSEWHEEL — scroll the multiline EDIT vertically. `wparam`'s
@@ -1424,23 +1617,33 @@ where
 /// width the same way `paint_edit` derives them, so the caret lands on the
 /// glyph that is drawn at the click.
 fn edit_char_at_point(state: &mut WinApiState, hwnd: u64, x: i32, y: i32) -> Option<usize> {
-    let (text, style, width, first_visible_line) = {
+    let (text, style, width, height, first_visible_line, first_visible_column, caret) = {
         let ws = state.window_state();
         let w = ws
             .windows
             .iter()
             .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))?;
-        let first_visible_line = match ws.control_states.get(&crate::handles::Hwnd::from(hwnd)) {
-            Some(ControlState::Edit {
-                first_visible_line, ..
-            }) => *first_visible_line,
-            _ => 0,
-        };
-        (w.control_text.clone(), w.style, w.width, first_visible_line)
+        let (first_visible_line, first_visible_column, caret) =
+            match ws.control_states.get(&crate::handles::Hwnd::from(hwnd)) {
+                Some(ControlState::Edit {
+                    first_visible_line,
+                    first_visible_column,
+                    caret,
+                    ..
+                }) => (*first_visible_line, *first_visible_column, *caret),
+                _ => (0, 0, 0),
+            };
+        (
+            w.control_text.clone(),
+            w.style,
+            w.width,
+            w.height,
+            first_visible_line,
+            first_visible_column,
+            caret,
+        )
     };
-    let multiline = style & ES_MULTILINE != 0;
-    let wrap = multiline && style & WS_HSCROLL == 0;
-    let wrap_width = width.saturating_sub(4);
+    let wrap = edit_wrap_from_style(style);
     let alignment = style & ES_ALIGN_MASK;
     // The font engine is taken out of gdi state so the advance closure can
     // run next to it (the paint path does the same); it is put back
@@ -1461,11 +1664,19 @@ fn edit_char_at_point(state: &mut WinApiState, hwnd: u64, x: i32, y: i32) -> Opt
         Some((key, resolved)) => {
             let line_h = resolved.line_height();
             let advance = &mut |ch: char| font_engine.char_advance(resolved, key, ch);
+            let area = edit_text_area(&text, width, height, line_h, style, caret, advance);
+            // A wrap-off EDIT scrolled right draws its rows shifted left by
+            // the offset; add it back so the click maps to the drawn glyph.
+            let shift = if area.h_scroll_visible {
+                i32::try_from(first_visible_column).unwrap_or(0)
+            } else {
+                0
+            };
             edit_char_index_at_point(
                 &text,
-                x,
+                x.saturating_add(shift),
                 y,
-                wrap_width,
+                area.wrap_width,
                 line_h,
                 first_visible_line,
                 wrap,
@@ -1475,17 +1686,20 @@ fn edit_char_at_point(state: &mut WinApiState, hwnd: u64, x: i32, y: i32) -> Opt
         }
         // No system font: the 16 px default the EM_* line APIs assume, with
         // a fixed 8 px/char advance for the hit test.
-        None => edit_char_index_at_point(
-            &text,
-            x,
-            y,
-            wrap_width,
-            16,
-            first_visible_line,
-            wrap,
-            alignment,
-            &mut |_| 8_i32,
-        ),
+        None => {
+            let area = edit_text_area(&text, width, height, 16, style, caret, &mut |_| 8_i32);
+            edit_char_index_at_point(
+                &text,
+                x,
+                y,
+                area.wrap_width,
+                16,
+                first_visible_line,
+                wrap,
+                alignment,
+                &mut |_| 8_i32,
+            )
+        }
     };
     state.gdi_state().font_engine = font_engine;
     Some(result)
@@ -1494,7 +1708,14 @@ fn edit_char_at_point(state: &mut WinApiState, hwnd: u64, x: i32, y: i32) -> Opt
 /// EDIT: WM_LBUTTONDOWN — place the caret at the click and collapse the
 /// selection; the click becomes the drag anchor (the selection edge later
 /// mouse moves extend from). The dispatch arm sets the mouse capture.
+///
+/// A press in a scrollbar gutter is consumed by the scrollbar instead: a
+/// track click pages toward the pointer, a press on the thumb arms a drag
+/// (the follow-up moves drive the offset through `edit_scrollbar_drag`).
 pub(super) fn edit_mouse_down(state: &mut WinApiState, hwnd: u64, x: i32, y: i32) {
+    if edit_scrollbar_press(state, hwnd, x, y) {
+        return;
+    }
     let Some(index) = edit_char_at_point(state, hwnd, x, y) else {
         return;
     };
@@ -1527,16 +1748,100 @@ pub(super) fn edit_mouse_down(state: &mut WinApiState, hwnd: u64, x: i32, y: i32
     edit_scroll_caret(state, hwnd);
 }
 
+/// Resolve a press in the vertical/horizontal scrollbar gutter of an EDIT.
+/// A track click pages toward the pointer; a press on the thumb arms a thumb
+/// drag (stored on the control state; `edit_mouse_move` follows it while the
+/// edit holds the capture). Returns whether the press was consumed.
+fn edit_scrollbar_press(state: &mut WinApiState, hwnd: u64, x: i32, y: i32) -> bool {
+    let Some(context) = edit_scroll_context(state, hwnd) else {
+        return false;
+    };
+    // The vertical gutter: the right SCROLLBAR_WIDTH column.
+    if context.v_scroll_visible && x >= context.client_width.saturating_sub(SCROLLBAR_WIDTH) {
+        let (thumb, thumb_pos) = scrollbar_thumb(
+            context.client_height,
+            first_visible_line_of(state, hwnd),
+            context.total.saturating_sub(context.visible),
+            context.visible,
+        );
+        if y < thumb_pos {
+            edit_scroll_vertical(state, hwnd, SB_PAGEUP, 0);
+        } else if y >= thumb_pos.saturating_add(thumb) {
+            edit_scroll_vertical(state, hwnd, SB_PAGEDOWN, 0);
+        } else {
+            set_scrollbar_drag(state, hwnd, true, y.saturating_sub(thumb_pos));
+        }
+        return true;
+    }
+    // The horizontal gutter: the bottom SCROLLBAR_WIDTH strip of a wrap-off
+    // EDIT with an overflowing line.
+    if context.h_scroll_visible && y >= context.client_height.saturating_sub(SCROLLBAR_WIDTH) {
+        let (thumb, thumb_pos) = scrollbar_thumb(
+            context.client_width,
+            first_visible_column_of(state, hwnd),
+            context.h_overflow,
+            context.h_page,
+        );
+        if x < thumb_pos {
+            edit_scroll_horizontal(state, hwnd, SB_PAGELEFT, 0);
+        } else if x >= thumb_pos.saturating_add(thumb) {
+            edit_scroll_horizontal(state, hwnd, SB_PAGERIGHT, 0);
+        } else {
+            set_scrollbar_drag(state, hwnd, false, x.saturating_sub(thumb_pos));
+        }
+        return true;
+    }
+    false
+}
+
+/// The current vertical scroll offset of `hwnd` (0 when the state is absent).
+#[must_use]
+fn first_visible_line_of(state: &WinApiState, hwnd: u64) -> usize {
+    match control_state(state, hwnd) {
+        Some(ControlState::Edit {
+            first_visible_line, ..
+        }) => *first_visible_line,
+        _ => 0,
+    }
+}
+
+/// The current horizontal scroll offset (px) of `hwnd`.
+#[must_use]
+fn first_visible_column_of(state: &WinApiState, hwnd: u64) -> usize {
+    match control_state(state, hwnd) {
+        Some(ControlState::Edit {
+            first_visible_column,
+            ..
+        }) => *first_visible_column,
+        _ => 0,
+    }
+}
+
+/// Arm a scrollbar thumb drag with the given axis and grab offset.
+fn set_scrollbar_drag(state: &mut WinApiState, hwnd: u64, vertical: bool, grab_offset: i32) {
+    if let ControlState::Edit { scrollbar_drag, .. } = edit_state_for_window(state, hwnd) {
+        *scrollbar_drag = Some(super::ScrollDrag {
+            vertical,
+            grab_offset,
+        });
+    }
+}
+
 /// EDIT: WM_MOUSEMOVE while the edit holds the capture — extend the drag
 /// selection from the anchor (the click position) to the current position.
 ///
 /// The anchor is the selection edge the caret is not at, since the caret
 /// tracks the pointer (the same anchor model `edit_move_caret` uses for
 /// Shift-arrows); crossing the anchor flips the selection edge. Hover moves
-/// without capture are no-ops. Returns whether the selection changed.
+/// without capture are no-ops. An in-flight scrollbar thumb drag takes
+/// precedence (it scrolls instead of selecting). Returns whether the
+/// selection or scroll offset changed.
 pub(super) fn edit_mouse_move(state: &mut WinApiState, hwnd: u64, x: i32, y: i32) -> bool {
     if state.window_state().capture_window_handle != crate::handles::Hwnd::from(hwnd) {
         return false;
+    }
+    if let Some(drag) = scrollbar_drag_of(state, hwnd) {
+        return edit_scrollbar_drag(state, hwnd, drag, x, y);
     }
     let Some(index) = edit_char_at_point(state, hwnd, x, y) else {
         return false;
@@ -1574,11 +1879,79 @@ pub(super) fn edit_mouse_move(state: &mut WinApiState, hwnd: u64, x: i32, y: i32
     true
 }
 
-/// EDIT: WM_LBUTTONUP — end the drag session: release the mouse capture (the
-/// selection stays as-is; Windows finalizes the drag on release).
+/// The in-flight thumb drag of `hwnd`, if any.
+fn scrollbar_drag_of(state: &WinApiState, hwnd: u64) -> Option<super::ScrollDrag> {
+    match control_state(state, hwnd) {
+        Some(ControlState::Edit { scrollbar_drag, .. }) => *scrollbar_drag,
+        _ => None,
+    }
+}
+
+/// Follow an armed scrollbar thumb drag: map the pointer (minus the grab
+/// offset) onto the scrollbar travel, then back to the scroll offset.
+/// Returns whether the offset changed.
+fn edit_scrollbar_drag(
+    state: &mut WinApiState,
+    hwnd: u64,
+    drag: super::ScrollDrag,
+    x: i32,
+    y: i32,
+) -> bool {
+    let Some(context) = edit_scroll_context(state, hwnd) else {
+        return false;
+    };
+    let (track, span, visible, pointer) = if drag.vertical {
+        (
+            context.client_height,
+            context.total.saturating_sub(context.visible),
+            context.visible,
+            y,
+        )
+    } else {
+        (context.client_width, context.h_overflow, context.h_page, x)
+    };
+    let (thumb, _) = scrollbar_thumb(track, 0, span, visible);
+    let travel = track.saturating_sub(thumb);
+    let within = pointer.saturating_sub(drag.grab_offset).clamp(0, travel);
+    // Map the pointer back onto the scroll range (travel → span).
+    let offset = i64::from(within)
+        .saturating_mul(i64::try_from(span).unwrap_or(0))
+        .saturating_div(i64::from(travel.max(1)))
+        .max(0);
+    let offset = usize::try_from(offset).unwrap_or(0);
+    if drag.vertical {
+        let ControlState::Edit {
+            first_visible_line, ..
+        } = edit_state_for_window(state, hwnd)
+        else {
+            return false;
+        };
+        let old = *first_visible_line;
+        *first_visible_line = offset.min(span);
+        *first_visible_line != old
+    } else {
+        let ControlState::Edit {
+            first_visible_column,
+            ..
+        } = edit_state_for_window(state, hwnd)
+        else {
+            return false;
+        };
+        let old = *first_visible_column;
+        *first_visible_column = offset.min(span);
+        *first_visible_column != old
+    }
+}
+
+/// EDIT: WM_LBUTTONUP — end the drag session: release the mouse capture and
+/// clear any in-flight scrollbar thumb drag (the selection stays as-is;
+/// Windows finalizes the drag on release).
 pub(super) fn edit_mouse_up(state: &mut WinApiState, hwnd: u64) {
     if state.window_state().capture_window_handle == crate::handles::Hwnd::from(hwnd) {
         state.window_state().capture_window_handle = crate::handles::Hwnd::NULL;
+    }
+    if let ControlState::Edit { scrollbar_drag, .. } = edit_state_for_window(state, hwnd) {
+        *scrollbar_drag = None;
     }
 }
 
@@ -2015,6 +2388,263 @@ fn selection_overlap(row: &VisibleSegment, sel_start: usize, sel_end: usize) -> 
     )
 }
 
+/// The thumb length and leading-edge offset for a classic scrollbar:
+/// `track` is the travel axis length in px, `position` the scroll offset
+/// within `span` (total − visible rows, or the horizontal overflow in px),
+/// and `visible` the visible share. The thumb scales with visible/total
+/// (floored at 16 px so a large range keeps a grab handle and capped at the
+/// track).
+#[must_use]
+fn scrollbar_thumb(track: i32, position: usize, span: usize, visible: usize) -> (i32, i32) {
+    let total = span.saturating_add(visible).max(1);
+    let thumb = i32::try_from(
+        i64::try_from(visible)
+            .unwrap_or(0)
+            .saturating_mul(i64::from(track))
+            .saturating_div(i64::try_from(total).unwrap_or(1)),
+    )
+    .unwrap_or(0)
+    .max(16)
+    .min(track);
+    let travel = track.saturating_sub(thumb);
+    let offset = i32::try_from(
+        i64::try_from(position.min(span))
+            .unwrap_or(0)
+            .saturating_mul(i64::from(travel))
+            .saturating_div(i64::try_from(span.max(1)).unwrap_or(1)),
+    )
+    .unwrap_or(0);
+    (thumb, offset)
+}
+
+/// Paint the classic vertical scrollbar in the right gutter: a BTNFACE track
+/// with BTNHIGHLIGHT (left) / BTNSHADOW (right) edges and a raised thumb
+/// positioned by `first_visible_line` over the total/visible span.
+fn paint_vertical_scrollbar(
+    state: &mut WinApiState,
+    info: &ResolvedWindow,
+    width: i32,
+    height: i32,
+    first_visible_line: usize,
+    total: usize,
+    visible: usize,
+) {
+    let gutter_x = info
+        .offset_x
+        .saturating_add(width.saturating_sub(SCROLLBAR_WIDTH));
+    let track = height;
+    let (thumb, thumb_pos) = scrollbar_thumb(
+        track,
+        first_visible_line,
+        total.saturating_sub(visible),
+        visible,
+    );
+    // Track + its light/dark outer edges.
+    fill_rect_clipped(
+        state,
+        info,
+        width,
+        height,
+        gutter_x,
+        info.offset_y,
+        SCROLLBAR_WIDTH,
+        track,
+        COLOR_BTNFACE,
+    );
+    fill_rect_clipped(
+        state,
+        info,
+        width,
+        height,
+        gutter_x,
+        info.offset_y,
+        1,
+        track,
+        COLOR_BTNHIGHLIGHT,
+    );
+    fill_rect_clipped(
+        state,
+        info,
+        width,
+        height,
+        gutter_x.saturating_add(SCROLLBAR_WIDTH.saturating_sub(1)),
+        info.offset_y,
+        1,
+        track,
+        COLOR_BTNSHADOW,
+    );
+    // The raised thumb: BTNFACE with light top/left and shadow bottom/right.
+    let thumb_y = info.offset_y.saturating_add(thumb_pos);
+    fill_rect_clipped(
+        state,
+        info,
+        width,
+        height,
+        gutter_x,
+        thumb_y,
+        SCROLLBAR_WIDTH,
+        thumb,
+        COLOR_BTNFACE,
+    );
+    fill_rect_clipped(
+        state,
+        info,
+        width,
+        height,
+        gutter_x,
+        thumb_y,
+        SCROLLBAR_WIDTH,
+        1,
+        COLOR_BTNHIGHLIGHT,
+    );
+    fill_rect_clipped(
+        state,
+        info,
+        width,
+        height,
+        gutter_x,
+        thumb_y.saturating_add(thumb.saturating_sub(1)),
+        SCROLLBAR_WIDTH,
+        1,
+        COLOR_BTNSHADOW,
+    );
+    fill_rect_clipped(
+        state,
+        info,
+        width,
+        height,
+        gutter_x,
+        thumb_y,
+        1,
+        thumb,
+        COLOR_BTNHIGHLIGHT,
+    );
+    fill_rect_clipped(
+        state,
+        info,
+        width,
+        height,
+        gutter_x.saturating_add(SCROLLBAR_WIDTH.saturating_sub(1)),
+        thumb_y,
+        1,
+        thumb,
+        COLOR_BTNSHADOW,
+    );
+}
+
+/// Paint the classic horizontal scrollbar in the bottom strip of a wrap-off
+/// EDIT: BTNFACE with a light top and shadow bottom edge and a raised thumb
+/// positioned by `first_visible_column` over the max-line-width span.
+fn paint_horizontal_scrollbar(
+    state: &mut WinApiState,
+    info: &ResolvedWindow,
+    width: i32,
+    height: i32,
+    first_visible_column: usize,
+    max_line_width: i32,
+    wrap_width: i32,
+) {
+    let strip_y = info
+        .offset_y
+        .saturating_add(height.saturating_sub(SCROLLBAR_WIDTH));
+    let span = max_line_width.saturating_sub(wrap_width).max(0);
+    let (thumb, thumb_pos) = scrollbar_thumb(
+        width,
+        first_visible_column,
+        usize::try_from(span).unwrap_or(0),
+        usize::try_from(wrap_width.max(0)).unwrap_or(0),
+    );
+    fill_rect_clipped(
+        state,
+        info,
+        width,
+        height,
+        info.offset_x,
+        strip_y,
+        width,
+        SCROLLBAR_WIDTH,
+        COLOR_BTNFACE,
+    );
+    fill_rect_clipped(
+        state,
+        info,
+        width,
+        height,
+        info.offset_x,
+        strip_y,
+        width,
+        1,
+        COLOR_BTNHIGHLIGHT,
+    );
+    fill_rect_clipped(
+        state,
+        info,
+        width,
+        height,
+        info.offset_x,
+        strip_y.saturating_add(SCROLLBAR_WIDTH.saturating_sub(1)),
+        width,
+        1,
+        COLOR_BTNSHADOW,
+    );
+    let thumb_x = info.offset_x.saturating_add(thumb_pos);
+    fill_rect_clipped(
+        state,
+        info,
+        width,
+        height,
+        thumb_x,
+        strip_y,
+        thumb,
+        SCROLLBAR_WIDTH,
+        COLOR_BTNFACE,
+    );
+    fill_rect_clipped(
+        state,
+        info,
+        width,
+        height,
+        thumb_x,
+        strip_y,
+        1,
+        SCROLLBAR_WIDTH,
+        COLOR_BTNHIGHLIGHT,
+    );
+    fill_rect_clipped(
+        state,
+        info,
+        width,
+        height,
+        thumb_x.saturating_add(thumb.saturating_sub(1)),
+        strip_y,
+        1,
+        SCROLLBAR_WIDTH,
+        COLOR_BTNSHADOW,
+    );
+    fill_rect_clipped(
+        state,
+        info,
+        width,
+        height,
+        thumb_x,
+        strip_y,
+        thumb,
+        1,
+        COLOR_BTNHIGHLIGHT,
+    );
+    fill_rect_clipped(
+        state,
+        info,
+        width,
+        height,
+        thumb_x,
+        strip_y.saturating_add(SCROLLBAR_WIDTH.saturating_sub(1)),
+        thumb,
+        1,
+        COLOR_BTNSHADOW,
+    );
+}
+
 /// EDIT paint: text rows (wrap-aware), selection highlight, and the caret bar.
 ///
 /// Glyphs are proportional, so the caret and selection x positions are the
@@ -2038,36 +2668,36 @@ pub(super) fn paint_edit(
     let len = text.chars().count();
     let focused = find_window(state, info.dc_window.as_u64())
         .is_some_and(|w| w.flags.contains(WindowFlags::FOCUSED));
-    let (sel_start, sel_end, caret, style_bits, first_visible_line, caret_on) =
+    let (sel_start, sel_end, caret, first_visible_line, first_visible_column, caret_on) =
         match control_state(state, info.dc_window.as_u64()) {
             Some(ControlState::Edit {
                 caret,
                 sel_start,
                 sel_end,
-                style_bits,
                 first_visible_line,
+                first_visible_column,
                 caret_on,
                 ..
             }) => (
                 (*sel_start).min(*sel_end),
                 (*sel_start).max(*sel_end),
                 *caret,
-                *style_bits,
                 *first_visible_line,
+                *first_visible_column,
                 *caret_on,
             ),
             _ => (0, 0, 0, 0, 0, true),
         };
     let (sel_start, sel_end, caret) = (sel_start.min(len), sel_end.min(len), caret.min(len));
     let line_h = resolved.line_height();
-    // The multiline/wrap decisions read the LIVE creation style from the
-    // window record, not `style_bits`: the read-only `control_state` accessor
-    // never refreshes `style_bits`, whose lazy seed starts at 0 — so the very
-    // FIRST paint (WM_PAINT right after creation, before any keyboard/input
-    // message ran a mutating accessor) would otherwise render a multiline
-    // EDIT as single-line: one row, vertically centered. The caret/selection
-    // fields and the ES_ALIGN_MASK bits are correctly maintained (messages
-    // update them) and stay on the control state.
+    // The multiline/wrap/alignment decisions read the LIVE creation style
+    // from the window record, not `style_bits`: the read-only `control_state`
+    // accessor never refreshes `style_bits`, whose lazy seed starts at 0 — so
+    // the very FIRST paint (WM_PAINT right after creation, before any
+    // keyboard/input message ran a mutating accessor) would otherwise render
+    // a multiline EDIT as single-line (and an ES_CENTER/RIGHT edit as
+    // left-aligned). The caret/selection fields are correctly maintained and
+    // stay on the control state.
     let edit_style = state
         .window_state()
         .windows
@@ -2088,29 +2718,55 @@ pub(super) fn paint_edit(
             .saturating_add(height.saturating_sub(line_h).saturating_div(2))
             .max(info.offset_y)
     };
-    let right = info.offset_x.saturating_add(width);
-    let bottom = info.offset_y.saturating_add(height);
-    let clip = Some((info.offset_x, info.offset_y, right, bottom));
+    // The wrap column and scrollbar visibility come from the SAME shared
+    // resolution the scroll math uses (`edit_text_area`), so the painted rows
+    // and the scroll offsets always agree — including the V-scrollbar gutter
+    // reservation and the H-scrollbar bottom strip.
+    let area = {
+        let mut advance = |ch: char| font_engine.char_advance(resolved, key, ch);
+        edit_text_area(text, width, height, line_h, edit_style, caret, &mut advance)
+    };
+    // Text is clipped to the text area: the right edge stops before the V
+    // gutter (a wrap-off line's tail must not bleed into the scrollbar) and
+    // the bottom stops before the H strip.
+    let v_gutter = if area.v_scroll_visible {
+        SCROLLBAR_WIDTH
+    } else {
+        0
+    };
+    let h_strip = if area.h_scroll_visible {
+        SCROLLBAR_WIDTH
+    } else {
+        0
+    };
+    let text_right = info.offset_x.saturating_add(width).saturating_sub(v_gutter);
+    let text_bottom = info.offset_y.saturating_add(height).saturating_sub(h_strip);
+    let clip = Some((info.offset_x, info.offset_y, text_right, text_bottom));
     let has_selection = focused && sel_start != sel_end;
-    // The wrap column is the client width minus the 2 px side margins (the
-    // same 2 px inset the single-line text already uses on the left).
     let rows = layout_visible_lines(
         text,
-        width.saturating_sub(4),
+        area.wrap_width,
         line_h,
         if multiline { first_visible_line } else { 0 },
         wrap,
-        style_bits & ES_ALIGN_MASK,
+        edit_style & ES_ALIGN_MASK,
         &mut |ch| font_engine.char_advance(resolved, key, ch),
     );
+    // A wrap-off EDIT scrolled right shifts every row (and its caret/selection
+    // x) by the horizontal offset.
+    let h_shift = if area.h_scroll_visible {
+        i32::try_from(first_visible_column).unwrap_or(0)
+    } else {
+        0
+    };
 
     let mut caret_drawn = false;
     for row in &rows {
         let y = base_y.saturating_add(row.y);
-        if y >= bottom {
+        if y >= text_bottom {
             break;
         }
-        let x = tx.saturating_add(row.x);
+        let x = tx.saturating_sub(h_shift).saturating_add(row.x);
         // Pass 1: fill the selected cells with COLOR_HIGHLIGHT (behind text).
         let (sel_lo, sel_hi) = if has_selection {
             selection_overlap(row, sel_start, sel_end)
@@ -2198,6 +2854,30 @@ pub(super) fn paint_edit(
             );
             caret_drawn = true;
         }
+    }
+    // Scrollbar chrome: painted LAST so it overdraws the border/text at the
+    // client edges (the classic scrollbars are window chrome, not text area).
+    if area.v_scroll_visible {
+        paint_vertical_scrollbar(
+            state,
+            info,
+            width,
+            height,
+            first_visible_line,
+            area.total,
+            area.visible,
+        );
+    }
+    if area.h_scroll_visible {
+        paint_horizontal_scrollbar(
+            state,
+            info,
+            width,
+            height,
+            first_visible_column,
+            area.max_line_width,
+            area.wrap_width,
+        );
     }
     Ok(())
 }

@@ -6237,6 +6237,8 @@ struct ControlUiSnapshot {
     limit: usize,
     modified: bool,
     first_visible_line: usize,
+    first_visible_column: usize,
+    dragging_scrollbar: bool,
     tab_stops: Vec<u16>,
     caret_on: bool,
     part_rights: Vec<i32>,
@@ -6269,6 +6271,8 @@ impl ControlUiSnapshot {
                     limit,
                     modified,
                     first_visible_line,
+                    first_visible_column,
+                    scrollbar_drag,
                     tab_stops,
                     caret_on,
                     ..
@@ -6281,6 +6285,8 @@ impl ControlUiSnapshot {
                     snap.limit = *limit;
                     snap.modified = *modified;
                     snap.first_visible_line = *first_visible_line;
+                    snap.first_visible_column = *first_visible_column;
+                    snap.dragging_scrollbar = scrollbar_drag.is_some();
                     snap.tab_stops = tab_stops.clone();
                     snap.caret_on = *caret_on;
                 }
@@ -9331,6 +9337,547 @@ fn test_edit_multiline_first_paint_renders_rows_from_the_top() {
         topmost < 20,
         "the first text row must start at the edit's top edge (y 10), got topmost \
          ink row {topmost} (the stale single-line paint vertically centered it)"
+    );
+}
+
+#[test]
+fn test_edit_scrollbar_wrap_width_agrees_with_painted_rows() {
+    use crate::user32::controls::{
+        edit_text_area, layout_visible_lines, scrollbar_visible, visual_rows,
+    };
+    // The F5 deferral's core invariant: the shared gutter-aware resolution
+    // (edit_text_area — used by both the scroll math and the paint) and the
+    // actual painted layout must agree on the row count.
+    const ES_MULTILINE: u32 = 0x0004;
+    const WS_VSCROLL: u32 = 0x0020_0000;
+    const WS_HSCROLL: u32 = 0x0010_0000;
+    let advance = &mut |_| 8_i32;
+
+    // 26 chars at 8 px/char: 4 rows at the gutter-reserved wrap width (39 =
+    // 60 − 4 − 17), 4 rows at the no-gutter width (56); either way the
+    // 3-row viewport overflows, so the V scrollbar reserves its gutter and
+    // the paint must lay out at the SAME width.
+    let text = "abcdefghijklmnopqrstuvwxyz";
+    let style = ES_MULTILINE | WS_VSCROLL;
+    let area = edit_text_area(text, 60, 48, 16, style, 0, advance);
+    assert!(
+        scrollbar_visible(style, area.total, area.visible),
+        "26 chars overflow a 3-row viewport"
+    );
+    assert_eq!(
+        area.wrap_width,
+        60 - 4 - 17,
+        "the V scrollbar reserves the 17 px gutter"
+    );
+    // The paint path's rows (layout_visible_lines) and the scroll math's total
+    // (visual_rows) MUST count the same rows at the shared gutter-reserved
+    // width — the deferral's stated reason.
+    let painted = layout_visible_lines(text, area.wrap_width, 16, 0, true, 0, advance);
+    let (scroll_total, _) = visual_rows(text, area.wrap_width, true, 0, advance);
+    assert_eq!(
+        painted.len(),
+        scroll_total,
+        "paint rows == scroll-math rows"
+    );
+    assert_eq!(
+        scroll_total, area.total,
+        "scroll math == the shared area total"
+    );
+
+    // A 2-line text that fits: no gutter, full wrap width, no V scrollbar.
+    let area = edit_text_area("ab\ncd", 60, 48, 16, style, 0, advance);
+    assert!(!area.v_scroll_visible, "2 rows fit a 3-row viewport");
+    assert_eq!(area.wrap_width, 60 - 4, "no gutter when the content fits");
+
+    // A wrap-off EDIT (WS_HSCROLL): the H scrollbar shows when the widest
+    // line overflows, and the visible row count shrinks by its bottom strip.
+    let area = edit_text_area(
+        "abcdefghijklmnopqrstuvwxyz",
+        60,
+        48,
+        16,
+        ES_MULTILINE | WS_HSCROLL,
+        0,
+        advance,
+    );
+    assert!(
+        area.h_scroll_visible,
+        "a 208 px line overflows a 56 px text area"
+    );
+    assert_eq!(
+        area.visible, 1,
+        "the 17 px H strip leaves 1 row of a 48 px client"
+    );
+}
+
+#[test]
+fn test_edit_wm_hscroll_moves_first_visible_column() {
+    const SB_LINERIGHT: u16 = 1;
+    const SB_LINELEFT: u16 = 0;
+    const SB_LEFT: u16 = 6;
+    const SB_RIGHT: u16 = 7;
+    const SB_THUMBTRACK: u16 = 5;
+    const WS_HSCROLL: u32 = 0x0010_0000;
+
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (_, edit) = push_multiline_edit(&mut state, "abcdefghijklmnopqrstuvwxyz");
+    // Make the edit wrap-OFF: set WS_HSCROLL (the flag notepad's wrap-off
+    // edit carries).
+    for w in &mut state.window_state().windows {
+        if w.handle == crate::handles::Hwnd::from(edit) {
+            w.style |= WS_HSCROLL;
+        }
+    }
+
+    // hscroll(edit, code, thumb) -> first_visible_column after the scroll.
+    let hscroll = |engine: &mut IcedCpu, state: &mut WinApiState, code: u16, thumb: u16| -> usize {
+        let wparam = u64::from(code) | (u64::from(thumb) << 16);
+        crate::user32::controls::dispatch_control_proc(
+            engine,
+            state,
+            edit,
+            crate::user32::wm::WinMsg::WM_HSCROLL.as_u32(),
+            wparam,
+            0,
+        )
+        .expect_err("WM_HSCROLL must deliver EN_HSCROLL");
+        control_ui(state, edit).first_visible_column
+    };
+
+    // A line scroll steps one 8 px character cell (font-independent).
+    assert_eq!(hscroll(&mut engine, &mut state, SB_LINERIGHT, 0), 8);
+    assert_eq!(hscroll(&mut engine, &mut state, SB_LINERIGHT, 0), 16);
+    assert_eq!(hscroll(&mut engine, &mut state, SB_LINELEFT, 0), 8);
+    // SB_LEFT jumps to the start; SB_THUMBTRACK sets the raw px offset.
+    assert_eq!(hscroll(&mut engine, &mut state, SB_LEFT, 0), 0);
+    assert_eq!(hscroll(&mut engine, &mut state, SB_THUMBTRACK, 8), 8);
+    // SB_RIGHT jumps to the far end; the offset clamps there (the default
+    // font is proportional, so the far end is read back, not hardcoded).
+    let far = hscroll(&mut engine, &mut state, SB_RIGHT, 0);
+    assert!(
+        far >= 16,
+        "a 26-char line must overflow the narrow client, got far end {far}"
+    );
+    assert_eq!(
+        hscroll(&mut engine, &mut state, SB_THUMBTRACK, 999),
+        far,
+        "the offset clamps at the horizontal overflow"
+    );
+    assert_eq!(
+        hscroll(&mut engine, &mut state, SB_LINERIGHT, 0),
+        far,
+        "a line scroll past the end clamps"
+    );
+
+    // Wrap-on EDITs keep the pre-deferral behavior: WM_HSCROLL never moves
+    // the offset (there is no horizontal scrollbar to drag).
+    let wrap_edit = crate::user32::create_window_record(
+        &mut state,
+        crate::user32::CreateWindowRequest {
+            class_identifier: crate::user32::WindowClassIdentifier::Name("EDIT".to_owned()),
+            title: String::new(),
+            style: crate::user32::WS_CHILD | crate::user32::controls::ES_MULTILINE,
+            extended_style: 0,
+            parent_handle: 0,
+            menu_handle: 0,
+            instance_handle: 0,
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 20,
+        },
+        true,
+    )
+    .expect("create wrap edit")
+    .0;
+    for w in &mut state.window_state().windows {
+        if w.handle == crate::handles::Hwnd::from(wrap_edit) {
+            w.control_text = "abcdefghijklmnopqrstuvwxyz".to_owned();
+        }
+    }
+    let wparam = u64::from(SB_RIGHT) | (u64::from(999_u16) << 16);
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        wrap_edit,
+        crate::user32::wm::WinMsg::WM_HSCROLL.as_u32(),
+        wparam,
+        0,
+    )
+    .expect("wrap-on WM_HSCROLL ok")
+    .expect("wrap-on WM_HSCROLL result");
+    assert_eq!(
+        control_ui(&state, wrap_edit).first_visible_column,
+        0,
+        "wrap-on WM_HSCROLL stays a no-op"
+    );
+}
+
+#[test]
+fn test_edit_scrollbar_chrome_painted_in_gutter() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // A real multiline EDIT with WS_VSCROLL: 10 lines in a 5-row client, so
+    // the V scrollbar shows and reserves the right 17 px gutter.
+    let top = crate::user32::create_window_record(
+        &mut state,
+        crate::user32::CreateWindowRequest {
+            class_identifier: crate::user32::WindowClassIdentifier::Name("GuiClass".to_owned()),
+            title: String::new(),
+            style: crate::user32::WS_VISIBLE,
+            extended_style: 0,
+            parent_handle: 0,
+            menu_handle: 0,
+            instance_handle: 0,
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 100,
+        },
+        true,
+    )
+    .expect("create top")
+    .0;
+    let edit = crate::user32::create_window_record(
+        &mut state,
+        crate::user32::CreateWindowRequest {
+            class_identifier: crate::user32::WindowClassIdentifier::Name("EDIT".to_owned()),
+            title: String::new(),
+            style: crate::user32::WS_CHILD
+                | crate::user32::WS_VISIBLE
+                | crate::user32::controls::ES_MULTILINE
+                | 0x0020_0000, // WS_VSCROLL: the chrome shows only when asked
+            extended_style: 0,
+            parent_handle: top,
+            menu_handle: 0,
+            instance_handle: 0,
+            x: 10,
+            y: 10,
+            width: 80,
+            height: 80,
+        },
+        true,
+    )
+    .expect("create edit")
+    .0;
+    for w in &mut state.window_state().windows {
+        if w.handle == crate::handles::Hwnd::from(edit) {
+            w.control_text = "0\n1\n2\n3\n4\n5\n6\n7\n8\n9".to_owned();
+        }
+    }
+    // Size the client to EXACTLY 5 rows of the resolved default font, so the
+    // thumb geometry is deterministic (track = height, thumb = track × 5/10).
+    let line_h = {
+        let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
+        let line_h = font_engine
+            .resolve(&crate::gdi32::FontKey::default(), 16)
+            .expect("default font")
+            .line_height();
+        state.gdi_state().font_engine = font_engine;
+        line_h
+    };
+    let track = line_h.saturating_mul(5);
+    let thumb = track.saturating_div(2);
+    for w in &mut state.window_state().windows {
+        if w.handle == crate::handles::Hwnd::from(edit) {
+            w.height = track;
+        }
+    }
+
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint ok")
+    .expect("some result");
+    state.present().drain_pending_publishes();
+    let frame = state
+        .present()
+        .published
+        .get(&crate::handles::Hwnd::from(top))
+        .expect("published frame")
+        .clone();
+    let frame_width = usize::try_from(frame.width).unwrap_or(0);
+    let px = |col: i32, row: i32| {
+        let idx = (usize::try_from(row).unwrap_or(0))
+            .saturating_mul(frame_width)
+            .saturating_add(usize::try_from(col).unwrap_or(0));
+        frame.pixels.get(idx).copied()
+    };
+    // The edit is 80 px wide at x=10: the gutter spans x [73, 90) (80 − 17).
+    // Interior gutter pixel (clear of the 1 px track edges and the border).
+    assert_eq!(
+        px(80, 10 + thumb + 2),
+        Some(0x00F0_F0F0),
+        "the gutter interior is BTNFACE"
+    );
+    assert_eq!(
+        px(73, 10 + 5),
+        Some(0x00FF_FFFF),
+        "the gutter's left edge is BTNHIGHLIGHT"
+    );
+    assert_eq!(
+        px(89, 10 + 5),
+        Some(0x00A0_A0A0),
+        "the gutter's right edge is BTNSHADOW"
+    );
+    // Thumb: track = height, 10 rows total, 5 visible → thumb = track/2 at
+    // the top (first_visible_line 0); its bottom shadow edge at 10 + thumb − 1.
+    assert_eq!(
+        px(80, 10 + thumb - 1),
+        Some(0x00A0_A0A0),
+        "the thumb's bottom edge is BTNSHADOW"
+    );
+    assert_eq!(
+        px(80, 10 + thumb - 4),
+        Some(0x00F0_F0F0),
+        "the thumb face is BTNFACE"
+    );
+
+    // Auto-hide: a 2-line text in the same viewport shows no gutter — the
+    // right edge stays the COLOR_WINDOW fill.
+    for w in &mut state.window_state().windows {
+        if w.handle == crate::handles::Hwnd::from(edit) {
+            w.control_text = "ab\ncd".to_owned();
+        }
+    }
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint2 ok")
+    .expect("some result");
+    state.present().drain_pending_publishes();
+    let frame = state
+        .present()
+        .published
+        .get(&crate::handles::Hwnd::from(top))
+        .expect("published frame")
+        .clone();
+    let frame_width = usize::try_from(frame.width).unwrap_or(0);
+    let px = |col: i32, row: i32| {
+        let idx = (usize::try_from(row).unwrap_or(0))
+            .saturating_mul(frame_width)
+            .saturating_add(usize::try_from(col).unwrap_or(0));
+        frame.pixels.get(idx).copied()
+    };
+    assert_eq!(
+        px(80, 10 + thumb + 2),
+        Some(0x00FF_FFFF),
+        "no gutter when the content fits"
+    );
+}
+
+#[test]
+fn test_edit_scrollbar_track_click_pages_and_thumb_drags() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (_, edit) = push_multiline_edit(&mut state, "0\n1\n2\n3\n4\n5\n6\n7\n8\n9");
+    // WS_VSCROLL: the chrome shows only when the style asks for it.
+    for w in &mut state.window_state().windows {
+        if w.handle == crate::handles::Hwnd::from(edit) {
+            w.style |= 0x0020_0000; // WS_VSCROLL
+        }
+    }
+    // Size the client to EXACTLY 5 rows of the resolved default font, so the
+    // track/thumb geometry is deterministic: 10 rows total, 5 visible → thumb
+    // = track/2 at the top (first_visible_line 0).
+    let line_h = {
+        let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
+        let line_h = font_engine
+            .resolve(&crate::gdi32::FontKey::default(), 16)
+            .expect("default font")
+            .line_height();
+        state.gdi_state().font_engine = font_engine;
+        line_h
+    };
+    let track = line_h.saturating_mul(5);
+    let thumb = track.saturating_div(2);
+    for w in &mut state.window_state().windows {
+        if w.handle == crate::handles::Hwnd::from(edit) {
+            w.height = track;
+        }
+    }
+    // A click in the track BELOW the thumb pages down by the visible count.
+    let gutter_x = u16::try_from(120_i32.saturating_sub(17)).unwrap_or(0);
+    dispatch_mouse(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::wm::WinMsg::WM_LBUTTONDOWN.as_u32(),
+        gutter_x,
+        u16::try_from(thumb + 2).unwrap_or(0), // below the thumb
+    );
+    assert_eq!(
+        control_ui(&state, edit).first_visible_line,
+        5,
+        "a track click below the thumb pages down"
+    );
+    // A click in the track ABOVE the thumb pages up.
+    dispatch_mouse(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::wm::WinMsg::WM_LBUTTONDOWN.as_u32(),
+        gutter_x,
+        5,
+    );
+    assert_eq!(
+        control_ui(&state, edit).first_visible_line,
+        0,
+        "a track click above the thumb pages up"
+    );
+
+    // Thumb drag: grab the thumb (top, at y 5), drag to y 50, release. The
+    // travel is track − thumb = track/2 over a 5-row span → a pointer past the
+    // travel end lands on the last offset (5).
+    dispatch_mouse(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::wm::WinMsg::WM_LBUTTONDOWN.as_u32(),
+        gutter_x,
+        5, // inside the thumb (0..thumb)
+    );
+    assert!(
+        control_ui(&state, edit).dragging_scrollbar,
+        "a press on the thumb arms the drag"
+    );
+    dispatch_mouse(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::wm::WinMsg::WM_MOUSEMOVE.as_u32(),
+        gutter_x,
+        u16::try_from(thumb.saturating_add(20)).unwrap_or(0),
+    );
+    assert_eq!(
+        control_ui(&state, edit).first_visible_line,
+        5,
+        "the thumb follows the pointer to the end of the travel"
+    );
+    release_mouse(
+        &mut engine,
+        &mut state,
+        edit,
+        gutter_x,
+        u16::try_from(thumb.saturating_add(20)).unwrap_or(0),
+    );
+    assert!(
+        !control_ui(&state, edit).dragging_scrollbar,
+        "the release clears the thumb drag"
+    );
+
+    // A press in the text area still places the caret (the gutter only
+    // consumes presses inside it).
+    dispatch_mouse(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::wm::WinMsg::WM_LBUTTONDOWN.as_u32(),
+        20,
+        10,
+    );
+    assert!(
+        control_ui(&state, edit).caret > 0,
+        "a text-area click still navigates the caret"
+    );
+}
+
+#[test]
+fn test_edit_es_center_first_paint_centers_text() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // A single-line ES_CENTER edit through the REAL creation path: the first
+    // paint must read the live alignment (style_bits is stale 0 on the first
+    // paint, which would render left-aligned).
+    let top = crate::user32::create_window_record(
+        &mut state,
+        crate::user32::CreateWindowRequest {
+            class_identifier: crate::user32::WindowClassIdentifier::Name("GuiClass".to_owned()),
+            title: String::new(),
+            style: crate::user32::WS_VISIBLE,
+            extended_style: 0,
+            parent_handle: 0,
+            menu_handle: 0,
+            instance_handle: 0,
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 100,
+        },
+        true,
+    )
+    .expect("create top")
+    .0;
+    let edit = crate::user32::create_window_record(
+        &mut state,
+        crate::user32::CreateWindowRequest {
+            class_identifier: crate::user32::WindowClassIdentifier::Name("EDIT".to_owned()),
+            title: String::new(),
+            style: crate::user32::WS_CHILD | crate::user32::WS_VISIBLE | 0x0001, // ES_CENTER
+            extended_style: 0,
+            parent_handle: top,
+            menu_handle: 0,
+            instance_handle: 0,
+            x: 10,
+            y: 10,
+            width: 120,
+            height: 20,
+        },
+        true,
+    )
+    .expect("create edit")
+    .0;
+    for w in &mut state.window_state().windows {
+        if w.handle == crate::handles::Hwnd::from(edit) {
+            w.control_text = "ab".to_owned();
+        }
+    }
+    crate::user32::controls::dispatch_control_proc(
+        &mut engine,
+        &mut state,
+        edit,
+        crate::user32::WM_PAINT,
+        0,
+        0,
+    )
+    .expect("paint ok")
+    .expect("some result");
+    state.present().drain_pending_publishes();
+    let frame = state
+        .present()
+        .published
+        .get(&crate::handles::Hwnd::from(top))
+        .expect("published frame")
+        .clone();
+    let frame_width = usize::try_from(frame.width).unwrap_or(0);
+    // The ink of the centered "ab" must start well right of the 2 px left
+    // margin (a left-aligned paint would put it at x ≈ 12).
+    let mut min_ink_x = None;
+    let mid = 10_i32.saturating_add(20 / 2);
+    for x in 12_i32..130_i32 {
+        let idx = (usize::try_from(mid).unwrap_or(0))
+            .saturating_mul(frame_width)
+            .saturating_add(usize::try_from(x).unwrap_or(0));
+        if frame.pixels.get(idx).copied() == Some(0x0000_0000) {
+            min_ink_x = Some(x);
+            break;
+        }
+    }
+    let min_ink_x = min_ink_x.expect("the centered text must render ink");
+    assert!(
+        min_ink_x > 40,
+        "ES_CENTER must center the first paint, got first ink at x {min_ink_x}"
     );
 }
 

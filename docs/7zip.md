@@ -34,7 +34,7 @@ WIE needs the **x64 PE** from **7-Zip Extra** (standalone console). Root `7za.ex
 **One-time setup** (run from the WIE repo root):
 
 ```bash
-./scripts/fetch-7za.sh
+./scripts/fetch.sh 7za
 ```
 
 Homebrew `p7zip` is only a **bootstrap** to unpack the Extra archive; the guest under WIE is still the **Windows** PE.

@@ -41,8 +41,8 @@ use edit::{
     edit_line_from_char, edit_line_index, edit_line_length, edit_mouse_dblclk, edit_mouse_down,
     edit_mouse_move, edit_mouse_up, edit_mouse_wheel, edit_move_caret, edit_notify_change,
     edit_notify_scroll, edit_paste, edit_pos_from_char, edit_replace_selection, edit_scroll_caret,
-    edit_scroll_vertical, edit_selection_type, edit_set_handle, edit_set_limit, edit_set_modify,
-    edit_set_selection, edit_set_tab_stops, edit_undo,
+    edit_scroll_horizontal, edit_scroll_vertical, edit_selection_type, edit_set_handle,
+    edit_set_limit, edit_set_modify, edit_set_selection, edit_set_tab_stops, edit_undo,
 };
 use listbox::{listbox_hit_item, listbox_notify_change};
 use paint::write_control_text;
@@ -51,8 +51,8 @@ use paint::write_control_text;
 // unused import.
 #[cfg(test)]
 pub(crate) use edit::{
-    VisibleSegment, clamp_scroll_offset, edit_char_index_at_point, layout_visible_lines,
-    visible_line_count,
+    VisibleSegment, clamp_scroll_offset, edit_char_index_at_point, edit_text_area,
+    layout_visible_lines, scrollbar_visible, visible_line_count, visual_rows,
 };
 // The no-create undo-buffer clear is called from the SetWindowText handlers
 // in `user32::window` (they write control text outside the control dispatch).
@@ -240,6 +240,8 @@ impl ControlClassKind {
             handle_buffer: 0,
             undo_snapshot: None,
             first_visible_line: 0,
+            first_visible_column: 0,
+            scrollbar_drag: None,
             tab_stops: Vec::new(),
             caret_on: true,
         }
@@ -301,6 +303,15 @@ pub enum ControlState {
         /// (`layout_visible_lines`' `first_visible`); Task 2.4: it currently
         /// also serves as the vertical scroll offset.
         first_visible_line: usize,
+        /// Horizontal scroll offset in px for a wrap-off EDIT (WS_HSCROLL):
+        /// the row text is shifted left by this many pixels. Driven by
+        /// WM_HSCROLL and the host scrollbar thumb drag; 0 while the content
+        /// fits (or the EDIT wraps).
+        first_visible_column: usize,
+        /// An in-flight host-side scrollbar thumb drag (armed by a press on
+        /// the thumb while the edit holds the mouse capture). `None` between
+        /// interactions.
+        scrollbar_drag: Option<ScrollDrag>,
         /// Caret blink phase: `true` draws the caret bar, `false` hides it.
         /// The focused EDIT toggles it on its internal WM_TIMER (F5 caret
         /// blink, ~530 ms — SPI_GETCARETTIMEOUT's default); paint draws the
@@ -348,6 +359,16 @@ pub enum ControlState {
         /// overwrites it.
         part_texts: Vec<String>,
     },
+}
+
+/// An in-flight host-side scrollbar thumb drag (armed by a press on the
+/// thumb while the edit holds the mouse capture). `vertical` picks the axis;
+/// `grab_offset` is the pointer's offset from the thumb's leading edge in px,
+/// so the thumb does not jump to the pointer on the first move.
+#[derive(Debug, Clone, Copy)]
+pub struct ScrollDrag {
+    pub vertical: bool,
+    pub grab_offset: i32,
 }
 
 impl ControlState {
@@ -922,12 +943,18 @@ impl ControlClassKind {
                 }
                 Ok(Some(0))
             }
-            // WM_HSCROLL: the horizontal scroll offset (ES_AUTOHSCROLL state)
-            // is not implemented yet — swallow the message so a no-wrap EDIT
-            // does not fall through to a default scroll, and deliver
-            // EN_HSCROLL like a real edit control (notepad re-reads the
-            // caret position on it).
+            // WM_HSCROLL: the wParam low word is the SB_* scroll code, the
+            // high word the thumb position (SB_THUMBTRACK/POSITION). Moves
+            // the horizontal scroll offset of a wrap-off EDIT (WS_HSCROLL) —
+            // a wrap-on EDIT has no horizontal scrollbar, so the codes are
+            // no-ops there. EN_HSCROLL is delivered to the parent either way
+            // (notepad re-reads the caret position on it).
             (ControlClassKind::Edit, WinMsg::WM_HSCROLL) => {
+                let code = low_word(word_parameter);
+                let thumb = high_word(word_parameter);
+                if edit_scroll_horizontal(state, hwnd, code, thumb) {
+                    invalidate(state, hwnd);
+                }
                 edit_notify_scroll(state, hwnd, EN_HSCROLL)
             }
             // WM_MOUSEWHEEL: the signed delta in the wParam high word scrolls
