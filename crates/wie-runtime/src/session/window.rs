@@ -243,6 +243,28 @@ impl GuestHandle {
         })
     }
 
+    /// Atomic snapshot of the guest top-level z-order: the revision AND the
+    /// ordered list read under ONE lock.
+    ///
+    /// [`Self::z_rev`] and [`Self::top_level_z_order`] are two separate locked
+    /// reads — a guest z-change landing between them would hand the caller a
+    /// fresh revision with a stale list (or the reverse). The Frame handler
+    /// uses this combined accessor so the reorder always applies the list the
+    /// revision it compared actually describes.
+    #[must_use]
+    pub fn z_snapshot(&self) -> (u64, Vec<u64>) {
+        let Ok(state) = self.state.lock() else {
+            return (0, Vec::new());
+        };
+        let Some(present) = state.try_present() else {
+            return (0, Vec::new());
+        };
+        (
+            present.z_rev,
+            present.z_order.iter().map(|hwnd| hwnd.as_u64()).collect(),
+        )
+    }
+
     /// The top-level (parentless) ancestor of the focused window.
     ///
     /// The window a modal host dialog (the MessageBox bridge) should parent
@@ -438,11 +460,13 @@ impl GuestHandle {
     /// (IDOK/IDCANCEL/IDYES/IDNO) is returned to the guest.
     ///
     /// Mirrors [`Self::set_wake`]: the GUI presenter registers the native-alert
-    /// callback here once at startup, and the guest thread invokes it from the
-    /// handler. The callback blocks until the user dismisses the alert (the
-    /// guest thread parks inside the handler), which is MessageBox semantics.
-    /// When no bridge is registered the handlers keep the console-echo + IDOK
-    /// fallback, so headless runs and `trace` never hang.
+    /// callback here once at startup. The handlers never invoke it directly —
+    /// they return [`wie_winapi::WinApiControlSignal::MessageBoxBridgeRequested`]
+    /// and the runtime runs this callback WITHOUT the shared state lock (the
+    /// winit event loop needs that lock to service frame events while the
+    /// alert is up), then the handler's re-entry returns the chosen id to the
+    /// guest. When no bridge is registered the handlers keep the
+    /// console-echo + IDOK fallback, so headless runs and `trace` never hang.
     pub fn set_message_box_bridge(&self, cb: wie_winapi::present::MessageBoxBridge) {
         if let Ok(mut state) = self.state.lock() {
             state.present().message_box_bridge = Some(cb);
@@ -1353,5 +1377,57 @@ mod tests {
             state.drag_drop().files().is_empty(),
             "the drop list must stay empty"
         );
+    }
+
+    /// `z_snapshot` reads the revision AND the ordered list under ONE lock:
+    /// the Frame handler's reorder always applies the list the revision it
+    /// compared actually describes. Two separate locked reads (`z_rev` +
+    /// `top_level_z_order`) could observe the list mid-mutation.
+    #[test]
+    fn z_snapshot_reads_rev_and_order_under_one_lock() {
+        let process = wie_pe::ProcessIdentity {
+            module_file_name: "z.exe".to_owned(),
+            module_path: r"C:\App\z.exe".to_owned(),
+            current_directory: r"C:\App".to_owned(),
+            command_line: "z.exe".to_owned(),
+        };
+        let mut winapi_state =
+            crate::memory::default_winapi_state(&DEFAULT_LAYOUT, Arc::new(Vec::new()), &process)
+                .expect("winapi state");
+        {
+            let present = winapi_state.present();
+            present.register_top_level(wie_winapi::handles::Hwnd::from(0x100));
+            present.register_top_level(wie_winapi::handles::Hwnd::from(0x200));
+            present.register_top_level(wie_winapi::handles::Hwnd::from(0x300));
+            // HWND_TOP: 0x100 to the front → back-to-front [0x200, 0x300, 0x100].
+            present.z_order_to_top(wie_winapi::handles::Hwnd::from(0x100));
+        }
+        let handle = GuestHandle {
+            state: Arc::new(Mutex::new(winapi_state)),
+            queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+            menu_tree_cache: Arc::new(RwLock::new(None)),
+        };
+
+        let (rev, order) = handle.z_snapshot();
+        assert_eq!(rev, handle.z_rev(), "snapshot rev == the z_rev accessor");
+        assert_eq!(
+            order,
+            handle.top_level_z_order(),
+            "snapshot order == the top_level_z_order accessor"
+        );
+        assert_eq!(order, vec![0x200, 0x300, 0x100], "back-to-front order");
+
+        // A guest z-change bumps the revision; the NEXT snapshot reflects the
+        // new order atomically (HWND_BOTTOM: 0x300 to the back).
+        {
+            let mut state = handle.state.lock().expect("lock state");
+            state
+                .present()
+                .z_order_to_bottom(wie_winapi::handles::Hwnd::from(0x300));
+        }
+        let (rev2, order2) = handle.z_snapshot();
+        assert!(rev2 > rev, "the z-change bumps the revision");
+        assert_eq!(order2, vec![0x300, 0x200, 0x100], "reordered snapshot");
+        assert_eq!(rev2, handle.z_rev(), "still consistent after the change");
     }
 }

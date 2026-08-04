@@ -2,8 +2,8 @@
 
 use crate::guest_memory::{read_u64 as read_guest_u64, write_u32 as write_guest_u32};
 use crate::guest_string::{read_utf16_lossy, write_utf16_c_string};
-use crate::state::WindowFlags;
-use crate::user32::find_window_mut;
+use crate::state::{MessageBoxRequest, PendingNativeMessageBox, WinApiControlSignal, WindowFlags};
+use crate::user32::{IDOK, find_window_mut};
 use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 use anyhow::{Context, Result};
 
@@ -231,8 +231,9 @@ pub fn handle_drag_accept_files(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 /// Shows an About box. When the host MessageBox bridge is registered (the GUI
 /// presenter's rfd alert), the message routes through it with caption =
 /// `szAppName` and text = `szOtherStuff` — the same bridge `MessageBoxW` uses
-/// (`user32::misc`). Headless runs echo to the host console. Always returns
-/// TRUE (real Windows shows the box and returns TRUE).
+/// (`user32::misc`), through the same lock-free two-entry flow (see
+/// [`PendingNativeMessageBox`]). Headless runs echo to the host console.
+/// Always returns TRUE (real Windows shows the box and returns TRUE).
 pub fn handle_shell_about_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let (app_name, other_stuff) = {
         let engine = &mut *ctx.engine;
@@ -262,16 +263,45 @@ pub fn handle_shell_about_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     };
 
     tracing::info!(target: "wiegui", app_name = %app_name, "ShellAboutW");
-    if let Some(bridge) = ctx
+
+    // Re-entry: the runtime ran the bridge WITHOUT the shared state lock (the
+    // winit event loop needs that lock to service frame events while the
+    // alert is up) and recorded the pick — the fix-27 MessageBox two-entry
+    // flow. ShellAboutW is an MB_OK alert, so the pick is IDOK — which is
+    // also TRUE, the documented return.
+    if let Some(pending) = ctx.state.window_state().pending_native_message_box.take() {
+        let win32_id = pending
+            .pick
+            .and_then(|id| u64::try_from(id).ok())
+            .unwrap_or(IDOK);
+        return ret(ctx.engine, win32_id);
+    }
+
+    if ctx
         .state
         .try_present()
-        .and_then(|present| present.message_box_bridge.as_ref())
+        .is_some_and(|present| present.message_box_bridge.is_some())
     {
-        // MB_OK — a single OK button, like the real About dialog.
-        bridge(&app_name, &text, 0);
-    } else {
-        eprintln!("[ShellAboutW] {app_name}: {text}");
+        // First entry: record the write-back slot and hand the request to the
+        // runtime — it drops the shared state lock, runs the bridge on this
+        // guest thread, and the engine's re-execution of the fake API
+        // re-enters this handler. Reuses MessageBoxRequest as-is: an About box
+        // is exactly caption + text + MB_OK.
+        ctx.state.window_state().pending_native_message_box =
+            Some(PendingNativeMessageBox { pick: None });
+        return Err(WinApiControlSignal::MessageBoxBridgeRequested {
+            request: MessageBoxRequest {
+                caption: app_name,
+                text,
+                message_box_type: 0, // MB_OK — a single OK button, like the real About dialog.
+            },
+        }
+        .into());
     }
+
+    // Headless/trace: echo to the host console and auto-answer TRUE (IDOK) so
+    // the guest never hangs on a missing host.
+    eprintln!("[ShellAboutW] {app_name}: {text}");
     ret(ctx.engine, 1)
 }
 
@@ -532,6 +562,42 @@ mod tests {
         engine.mem_write(va, &bytes).expect("write wide string");
     }
 
+    /// Drive ShellAboutW through the two-entry bridge flow the runtime
+    /// performs between entries (the runtime itself is not involved in unit
+    /// tests): first entry → [`WinApiControlSignal::MessageBoxBridgeRequested`],
+    /// run the bridge without the shared lock, restore it, record the pick,
+    /// re-enter the handler for the return value.
+    fn dispatch_shell_about_with_bridge(
+        engine: &mut IcedCpu,
+        state: &mut WinApiState,
+    ) -> anyhow::Result<WinApiHandlerResult> {
+        let first =
+            handle_shell_about_w(&mut HandlerContext::new(engine, test_environment(), state))
+                .expect_err("the first entry parks the guest for the host alert");
+        let signal = first
+            .downcast_ref::<WinApiControlSignal>()
+            .expect("a control signal");
+        let WinApiControlSignal::MessageBoxBridgeRequested { request } = signal else {
+            panic!("expected a message-box bridge request");
+        };
+        // What the runtime does between the two entries: take the bridge out,
+        // run it (no shared lock), restore it, record the chosen id.
+        let bridge = state
+            .present()
+            .message_box_bridge
+            .take()
+            .expect("bridge registered");
+        let picked = bridge(&request.caption, &request.text, request.message_box_type);
+        state.present().message_box_bridge = Some(bridge);
+        state
+            .window_state()
+            .pending_native_message_box
+            .as_mut()
+            .expect("pending session recorded")
+            .pick = Some(picked);
+        handle_shell_about_w(&mut HandlerContext::new(engine, test_environment(), state))
+    }
+
     #[test]
     fn shell_about_w_routes_through_message_box_bridge() {
         let mut engine = test_engine();
@@ -549,12 +615,8 @@ mod tests {
         write_wide(&mut engine, 0x3000, "Notepad");
         write_wide(&mut engine, 0x4000, "Notepad Authors");
         write_regs(&mut engine, 0, 0x3000, 0x4000, 0);
-        let result = handle_shell_about_w(&mut HandlerContext::new(
-            &mut engine,
-            test_environment(),
-            &mut state,
-        ))
-        .expect("ShellAboutW should succeed");
+        let result = dispatch_shell_about_with_bridge(&mut engine, &mut state)
+            .expect("ShellAboutW should dispatch");
         assert_eq!(result.return_value, 1, "ShellAboutW returns TRUE");
 
         let calls = captured
@@ -584,12 +646,8 @@ mod tests {
         // NULL otherStuff → the fallback text keeps the box non-empty.
         write_wide(&mut engine, 0x3000, "Notepad");
         write_regs(&mut engine, 0, 0x3000, 0, 0);
-        let result = handle_shell_about_w(&mut HandlerContext::new(
-            &mut engine,
-            test_environment(),
-            &mut state,
-        ))
-        .expect("ShellAboutW should succeed");
+        let result = dispatch_shell_about_with_bridge(&mut engine, &mut state)
+            .expect("ShellAboutW should dispatch");
         assert_eq!(result.return_value, 1);
         let calls = captured
             .lock()

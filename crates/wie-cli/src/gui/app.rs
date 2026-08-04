@@ -132,7 +132,10 @@ impl WieApp {
         let Some(handle) = self.handle.as_ref() else {
             return;
         };
-        let rev = handle.z_rev();
+        // The revision AND the ordered list come from ONE locked snapshot —
+        // two separate reads could hand a fresh revision with a stale list if
+        // a guest z-change landed between them.
+        let (rev, order) = handle.z_snapshot();
         if self.last_z_rev == Some(rev) {
             return;
         }
@@ -143,11 +146,21 @@ impl WieApp {
         // created through the dialog-template path, which the reconcile
         // creates but this list does not carry) are skipped — a documented
         // limitation of the minimal z-order model.
-        for hwnd in handle.top_level_z_order() {
-            let Some(rt) = self.windows.values().find(|rt| rt.hwnd.as_u64() == hwnd) else {
+        for hwnd in order {
+            let Some(window) = self
+                .windows
+                .values()
+                .find(|rt| rt.hwnd.as_u64() == hwnd)
+                .map(|rt| Arc::clone(&rt.window))
+            else {
                 continue;
             };
-            order_window_front(&rt.window);
+            // The cloned Arc keeps the winit window (and its NSView, which
+            // `order_window_front` dereferences through a raw handle) alive
+            // for the whole AppKit call — a guest DestroyWindow racing the
+            // reorder can deallocate the host window only when the reconcile
+            // drops the last reference, which this clone prevents.
+            order_window_front(&window);
         }
     }
     /// Apply a guest-requested host-window move/resize (`SetWindowPlacement`)
@@ -1434,16 +1447,19 @@ pub fn run_gui_windowed(
                             window_slots_guest.clone(),
                         );
 
-                        // Register the native-alert MessageBox bridge. rfd's
-                        // parented dialog uses the modern NSAlert API
-                        // (dispatched to the main thread; the guest thread
-                        // blocks until the user clicks — MessageBox
-                        // semantics) and maps the result to the Win32 id.
-                        // With no parent, rfd falls back to the legacy
-                        // CFUserNotificationDisplayAlert path, which prints
-                        // "will block waiting for a response" on the main
-                        // thread — the window slots below switch to NSAlert
-                        // once a winit window exists.
+                        // Register the native-alert MessageBox bridge. The
+                        // MessageBoxA/W handlers never call this directly:
+                        // they return MessageBoxBridgeRequested, the runtime
+                        // drops the shared state lock, and THIS callback runs
+                        // on the guest thread — rfd's parented dialog uses the
+                        // modern NSAlert API (dispatched to the main thread;
+                        // the guest thread blocks until the user clicks —
+                        // MessageBox semantics) and maps the result to the
+                        // Win32 id. With no parent, rfd falls back to the
+                        // legacy CFUserNotificationDisplayAlert path, which
+                        // prints "will block waiting for a response" on the
+                        // main thread — the window slots below switch to
+                        // NSAlert once a winit window exists.
                         #[cfg(target_os = "macos")]
                         handle.set_message_box_bridge(Box::new({
                             let handle = handle.clone();

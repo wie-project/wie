@@ -71,18 +71,19 @@ impl TextTarget<'_> {
         }
     }
 
-    /// Blend a row of `(fg color, alpha)` pairs into the target.
+    /// Blend a row of coverage alphas into the target with uniform `fg`.
     ///
-    /// `None` = leave the existing pixel untouched (TRANSPARENT background).
-    /// `Some((color, alpha))` blends the foreground over the current pixel
-    /// with coverage alpha (255 = opaque).
+    /// `alpha 0` leaves the existing pixel untouched (TRANSPARENT
+    /// background); `alpha 255` replaces it with `fg`; anything between is
+    /// blended with coverage alpha.
     fn write_row(
         &mut self,
         engine: &mut dyn wie_cpu::CpuEngine,
         visual_row: i32,
         x0: i32,
         x1: i32,
-        pixels: &[Option<(u32, u8)>],
+        fg: u32,
+        alphas: &[u8],
     ) -> Result<()> {
         match self {
             Self::Dib {
@@ -116,13 +117,7 @@ impl TextTarget<'_> {
                 if engine.mem_read(start, &mut buf).is_err() {
                     return Ok(()); // unmapped row — nothing to draw
                 }
-                for (slot, pixel) in buf.chunks_exact_mut(4).zip(pixels.iter()) {
-                    if let Some((fg, alpha)) = pixel {
-                        let existing = u32::from_le_bytes(slot.try_into().unwrap_or([0; 4]));
-                        let blended = blend_pixel(existing, *fg, *alpha);
-                        slot.copy_from_slice(&bgra_bytes(blended));
-                    }
-                }
+                blend_row_dib(&mut buf, fg, alphas);
                 engine.mem_write(start, &buf)?;
             }
             Self::Surface {
@@ -139,11 +134,7 @@ impl TextTarget<'_> {
                 let Some(dst) = surf.get_mut(start..start.saturating_add(len)) else {
                     return Ok(());
                 };
-                for (slot, pixel) in dst.iter_mut().zip(pixels.iter()) {
-                    if let Some((fg, alpha)) = pixel {
-                        *slot = blend_pixel(*slot, *fg, *alpha);
-                    }
-                }
+                blend_row_surface(dst, fg, alphas);
             }
         }
         Ok(())
@@ -153,7 +144,10 @@ impl TextTarget<'_> {
 /// Alpha-blend `fg` over `dst` (both 0RGB) with coverage `alpha` (0..=255).
 ///
 /// Uses `>> 8` instead of `/ 255` — a 0.4%-bright approximation that avoids
-/// division (and is visually identical).
+/// division (and is visually identical). Test-only now: the production row
+/// blends inline this math, and the property tests pin this function as the
+/// byte-identical scalar reference.
+#[cfg(test)]
 fn blend_pixel(dst: u32, fg: u32, alpha: u8) -> u32 {
     let a = u32::from(alpha);
     if a >= 255 {
@@ -173,6 +167,88 @@ fn blend_pixel(dst: u32, fg: u32, alpha: u8) -> u32 {
         >> 8;
     let b = fb.saturating_mul(a).saturating_add(db.saturating_mul(inv)) >> 8;
     (r << 16) | (g << 8) | b
+}
+
+/// Blend a run of coverage alphas over a 0RGB pixel slice with uniform `fg`.
+///
+/// The glyph-coverage blend is `(fg_ch*a + dst_ch*(255-a)) >> 8` per channel
+/// (the `>>8` instead of `/255` is the pipeline's documented 0.4%-bright
+/// approximation; the weighted sum is bounded by 255·255, so plain u32
+/// arithmetic cannot overflow). The alpha endpoints are NOT representable by
+/// the formula — alpha 0 must leave the pixel untouched (TRANSPARENT), alpha
+/// 255 must replace it with `fg` — so the loop guards them: the math runs
+/// only for the AA pixels (1..=254), and LLVM's aarch64 backend lowers the
+/// guard to a skip / direct-store with `csel`.
+///
+/// `#[inline(never)]` keeps the loop out of `write_row`'s large guest-memory
+/// match, where inlining degrades its register allocation (2.34 ns/px
+/// release); as a standalone function it compiles to a tight scalar loop
+/// (~1.2 ns/px). The AUTOVECTORIZER does not fire in this repo's real build
+/// (`lto = true` suppresses loop vectorization at crate compile — the final
+/// binary is scalar `mul`/`madd`/`csel`), and an explicit 4-lane NEON variant
+/// (`wie_cpu::blend_0rgb_4x`) measured SLOWER (1.51 vs 1.2 ns/px) because its
+/// gather/scatter + endpoint fixups outweigh the parallel math on sparse
+/// coverage. Byte-identity with the original scalar path is pinned by the
+/// property tests below.
+#[inline(never)]
+fn blend_row_surface(dst: &mut [u32], fg: u32, alphas: &[u8]) {
+    let fr = (fg >> 16) & 0xFF;
+    let fg_g = (fg >> 8) & 0xFF;
+    let fb = fg & 0xFF;
+    let opaque = fg & 0x00FF_FFFF;
+    for (slot, &alpha) in dst.iter_mut().zip(alphas.iter()) {
+        let a = u32::from(alpha);
+        if a == 0 {
+            continue; // transparent — leave the pixel untouched
+        }
+        let inv = 255_u32.wrapping_sub(a);
+        let dr = (*slot >> 16) & 0xFF;
+        let dg = (*slot >> 8) & 0xFF;
+        let db = *slot & 0xFF;
+        let r = (fr * a + dr * inv) >> 8;
+        let g = (fg_g * a + dg * inv) >> 8;
+        let b = (fb * a + db * inv) >> 8;
+        let blended = (r << 16) | (g << 8) | b;
+        *slot = if a == 255 { opaque } else { blended };
+    }
+}
+
+/// Blend a run of coverage alphas into a 32-bpp DIB row (`BGRA` bytes,
+/// alpha forced opaque), with uniform `fg`.
+///
+/// Same math as `blend_row_surface`, byte-sliced because the guest DIB is a
+/// byte buffer. The u32 read/write per 4-byte slot keeps this a straight
+/// read-modify-write (no intermediate row copy).
+fn blend_row_dib(buf: &mut [u8], fg: u32, alphas: &[u8]) {
+    let n = alphas.len().min(buf.len() / 4);
+    let fr = (fg >> 16) & 0xFF;
+    let fg_g = (fg >> 8) & 0xFF;
+    let fb = fg & 0xFF;
+    let opaque = fg & 0x00FF_FFFF;
+    for (slot, &alpha) in buf[..n.saturating_mul(4)]
+        .chunks_exact_mut(4)
+        .zip(alphas.iter())
+    {
+        let a = u32::from(alpha);
+        if a == 0 {
+            continue;
+        }
+        let inv = 255_u32.wrapping_sub(a);
+        let existing = u32::from_le_bytes(slot.try_into().unwrap_or([0; 4]));
+        let dr = (existing >> 16) & 0xFF;
+        let dg = (existing >> 8) & 0xFF;
+        let db = existing & 0xFF;
+        let r = (fr * a + dr * inv) >> 8;
+        let g = (fg_g * a + dg * inv) >> 8;
+        let b = (fb * a + db * inv) >> 8;
+        let blended = if a == 255 {
+            opaque
+        } else {
+            (r << 16) | (g << 8) | b
+        };
+        let [b, g, r, _] = blended.to_le_bytes();
+        slot.copy_from_slice(&[b, g, r, 0xFF]);
+    }
 }
 
 /// Resolve the DC's text colors and background mode.
@@ -268,12 +344,6 @@ fn mark_surface_dirty(
 /// space glyph behavior).
 fn char_for_code_point(ch: u32) -> char {
     char::from_u32(ch).unwrap_or(' ')
-}
-
-/// 0RGB color → BGRA bytes for a 32-bpp DIB pixel (alpha forced opaque).
-fn bgra_bytes(color: u32) -> [u8; 4] {
-    let [b, g, r, _] = color.to_le_bytes();
-    [b, g, r, 0xFF]
 }
 
 /// Round an `f32` px metric to an `i32`.
@@ -394,9 +464,10 @@ fn render_run(
 
     let span = usize::try_from(x1.saturating_sub(x0)).unwrap_or(0);
     let x0_us = usize::try_from(x0).unwrap_or(0);
-    // Accumulate each glyph's coverage into the row buffers row by row.
+    // Accumulate each glyph's coverage into the row's alpha buffer row by
+    // row (0 = transparent), then blend the run color over the canvas.
     for row in y0..y1 {
-        let mut row_pixels: Vec<Option<(u32, u8)>> = vec![None; span];
+        let mut row_alphas: Vec<u8> = vec![0; span];
         let mut pen_x = x;
         for (glyph, _ch) in &glyphs {
             // Fake bold: re-draw the glyph one pixel right (foreground only).
@@ -404,35 +475,38 @@ fn render_run(
             for pass in 0..passes {
                 let offset = pass;
                 blend_glyph_row(
-                    &mut row_pixels,
+                    &mut row_alphas,
                     glyph,
                     pen_x.saturating_add(offset),
                     baseline,
                     row,
                     x0,
                     x0_us,
-                    attrs.text_color,
                 );
             }
             pen_x = pen_x.saturating_add(glyph.advance);
         }
-        target.write_row(engine, row, x0, x1, &row_pixels)?;
+        target.write_row(engine, row, x0, x1, attrs.text_color, &row_alphas)?;
     }
     Ok(Some(band))
 }
 
-/// Blend one glyph's coverage for `row` into the row's pixel accumulator.
-// Wide signature: one row of one glyph needs pen position + row bounds + fg.
+/// Blend one glyph's coverage for `row` into the row's alpha accumulator.
+///
+/// `row_pixels` holds one coverage byte per pixel (0 = transparent); later
+/// glyphs overwrite earlier ones at overlaps, exactly as the previous
+/// `Option` slots did. Coverage is color-independent — the run's uniform fg
+/// is applied when the row hits the canvas.
+// Wide signature: one row of one glyph needs pen position + row bounds.
 #[allow(clippy::too_many_arguments)]
 fn blend_glyph_row(
-    row_pixels: &mut [Option<(u32, u8)>],
+    row_pixels: &mut [u8],
     glyph: &RasterizedGlyph,
     pen_x: i32,
     baseline: i32,
     row: i32,
     x0: i32,
     x0_us: usize,
-    fg: u32,
 ) {
     let glyph_top = baseline.saturating_add(glyph.top);
     let r = row.saturating_sub(glyph_top);
@@ -458,7 +532,7 @@ fn blend_glyph_row(
         else {
             continue;
         };
-        *slot = Some((fg, alpha));
+        *slot = alpha;
     }
 }
 
@@ -484,9 +558,11 @@ fn fill_rect(
         return Ok(());
     }
     let span = usize::try_from(x1.saturating_sub(x0)).unwrap_or(0);
-    let row_pixels = vec![Some((color, 255)); span];
+    // Uniform opaque fill: every pixel gets alpha 255, so the row blend
+    // replaces each canvas pixel with the fill color.
+    let row_alphas = vec![255_u8; span];
     for row in y0..y1 {
-        target.write_row(engine, row, x0, x1, &row_pixels)?;
+        target.write_row(engine, row, x0, x1, color, &row_alphas)?;
     }
     Ok(())
 }
@@ -973,7 +1049,7 @@ pub(crate) fn render_text_into_surface(
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::clip_run_band;
+    use super::{blend_pixel, blend_row_dib, blend_row_surface, clip_run_band};
     use crate::gdi32::IRect;
 
     /// The dirty rect for a window-DC text run must equal the run's clipped
@@ -1034,5 +1110,95 @@ mod tests {
             clip_run_band(8, 8, 90, 30, 200, 100, Some((0, 100, 50, 150))),
             None
         );
+    }
+
+    /// Property test: the vectorized row blends are byte-identical to the
+    /// scalar reference (original `blend_pixel` + the alpha-0 skip / alpha-255
+    /// replace rules) over seeded random pixels, including the boundary alphas
+    /// 0 and 255. Pins the AA edges — the blend output must not change.
+    #[test]
+    fn blend_rows_match_scalar_reference() {
+        // The original write_row Surface semantics: alpha 0 leaves the pixel
+        // untouched (the old `None` slot), everything else goes through
+        // `blend_pixel`.
+        let reference = |dst: u32, fg: u32, alpha: u8| -> u32 {
+            if alpha == 0 {
+                dst
+            } else {
+                blend_pixel(dst, fg, alpha)
+            }
+        };
+        let mut state = 0x5EED_0DD5_u32;
+        let lcg = |s: &mut u32| -> u32 {
+            *s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *s
+        };
+        for _ in 0..2000 {
+            let n = usize::try_from(lcg(&mut state) % 129).unwrap_or(0);
+            let fg = lcg(&mut state) & 0x00FF_FFFF;
+            let mut dst: Vec<u32> = (0..n).map(|_| lcg(&mut state) & 0x00FF_FFFF).collect();
+            let mut alphas: Vec<u8> = (0..n)
+                .map(|_| u8::try_from(lcg(&mut state) & 0xFF).unwrap_or(0))
+                .collect();
+            // Pin the boundary alphas into every row.
+            if let Some(slot) = alphas.first_mut() {
+                *slot = 0;
+            }
+            if let Some(slot) = alphas.get_mut(1) {
+                *slot = 255;
+            }
+            let mut want = dst.clone();
+            for (i, &alpha) in alphas.iter().enumerate() {
+                want[i] = reference(want[i], fg, alpha);
+            }
+            blend_row_surface(&mut dst, fg, &alphas);
+            assert_eq!(dst, want, "surface blend diverged from scalar reference");
+        }
+    }
+
+    /// Property test: the DIB row blend (BGRA bytes, alpha forced opaque) is
+    /// byte-identical to the original write_row Dib loop over random bytes and
+    /// alphas, including the 0/255 boundaries.
+    #[test]
+    fn dib_blend_rows_match_scalar_reference() {
+        let lcg = |s: &mut u32| -> u32 {
+            *s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *s
+        };
+        // The original write_row Dib semantics per 4-byte BGRA slot.
+        let reference = |slot: &[u8], fg: u32, alpha: u8| -> [u8; 4] {
+            if alpha == 0 {
+                return [slot[0], slot[1], slot[2], slot[3]];
+            }
+            let existing = u32::from_le_bytes([slot[0], slot[1], slot[2], slot[3]]);
+            let blended = blend_pixel(existing, fg, alpha);
+            let [b, g, r, _] = blended.to_le_bytes();
+            [b, g, r, 0xFF]
+        };
+        let mut state = 0xD1B_5EED_u32;
+        for _ in 0..2000 {
+            let n = usize::try_from(lcg(&mut state) % 129).unwrap_or(0);
+            let fg = lcg(&mut state) & 0x00FF_FFFF;
+            let mut buf: Vec<u8> = (0..n.saturating_mul(4))
+                .map(|_| u8::try_from(lcg(&mut state) & 0xFF).unwrap_or(0))
+                .collect();
+            let mut alphas: Vec<u8> = (0..n)
+                .map(|_| u8::try_from(lcg(&mut state) & 0xFF).unwrap_or(0))
+                .collect();
+            if let Some(slot) = alphas.first_mut() {
+                *slot = 0;
+            }
+            if let Some(slot) = alphas.get_mut(1) {
+                *slot = 255;
+            }
+            let mut want = buf.clone();
+            for (i, &alpha) in alphas.iter().enumerate() {
+                let off = i.saturating_mul(4);
+                let out = reference(&want[off..off.saturating_add(4)], fg, alpha);
+                want[off..off.saturating_add(4)].copy_from_slice(&out);
+            }
+            blend_row_dib(&mut buf, fg, &alphas);
+            assert_eq!(buf, want, "DIB blend diverged from scalar reference");
+        }
     }
 }

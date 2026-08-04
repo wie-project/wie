@@ -1,11 +1,12 @@
 use super::{
     Context, DIALOG_BASE_UNIT_X, DIALOG_BASE_UNIT_Y, FAKE_CURSOR_HANDLE, FAKE_ICON_HANDLE,
-    FAKE_IMAGE_HANDLE, HandlerContext, IDOK, Result, TimerRecord, WinApiHandlerResult, WinApiState,
-    WindowClassRecord, WindowsHookRecord, checked_field_address,
+    FAKE_IMAGE_HANDLE, HandlerContext, IDCANCEL, IDOK, Result, TimerRecord, WinApiHandlerResult,
+    WinApiState, WindowClassRecord, WindowsHookRecord, checked_field_address,
     dispatch_control_proc_host_default, low_i32, read_guest_ansi_lossy, read_guest_i32,
     read_guest_u32, read_guest_u64, read_guest_utf16_lossy, register_window_class,
     write_guest_ansi_c_string, write_guest_utf16_c_string,
 };
+use crate::state::{MessageBoxRequest, PendingNativeMessageBox};
 use crate::{GuestCallbackRequest, OuterReturn, WinApiControlSignal};
 
 /// Handles `USER32.dll!LoadIconA`.
@@ -351,9 +352,14 @@ pub fn handle_register_class_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 /// A host-registered bridge (`GuestHandle::set_message_box_bridge`, the GUI
 /// presenter's rfd native alert) shows the message and returns the Win32 id
 /// the user chose; the guest thread blocks until then, which is correct
-/// MessageBox semantics. Without a bridge (headless runs, `trace`) the message
-/// echoes to the host console and the handler returns IDOK so no guest ever
-/// hangs on a missing host.
+/// MessageBox semantics. The handler runs in TWO entries, split around the
+/// bridge (see [`message_box_result`]): the first records the pending state
+/// and returns [`WinApiControlSignal::MessageBoxBridgeRequested`], the
+/// runtime drops the shared state lock and runs the bridge, and the engine's
+/// re-execution of the fake API re-enters the handler to return the chosen
+/// id. Without a bridge (headless runs, `trace`) the message echoes to the
+/// host console and the handler returns IDOK so no guest ever hangs on a
+/// missing host.
 pub fn handle_message_box_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let (caption, text, message_box_type) = {
         let engine = &mut *ctx.engine;
@@ -387,17 +393,7 @@ pub fn handle_message_box_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     };
 
     tracing::info!(caption = %caption, text = %text, message_box_type, "MessageBoxW");
-    let win32_id = message_box_result(ctx, &caption, &text, message_box_type, "MessageBoxW");
-
-    let return_address = ctx
-        .engine
-        .return_from_win64_api(win32_id)
-        .context("failed to return from MessageBoxW")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: win32_id,
-    })
+    message_box_result(ctx, &caption, &text, message_box_type, "MessageBoxW")
 }
 /// Handles `USER32.dll!MessageBoxA`.
 pub fn handle_message_box_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -433,45 +429,91 @@ pub fn handle_message_box_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     };
 
     tracing::info!(caption = %caption, text = %text, message_box_type, "MessageBoxA");
-    let win32_id = message_box_result(ctx, &caption, &text, message_box_type, "MessageBoxA");
-
-    let return_address = ctx
-        .engine
-        .return_from_win64_api(win32_id)
-        .context("failed to return from MessageBoxA")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: win32_id,
-    })
+    message_box_result(ctx, &caption, &text, message_box_type, "MessageBoxA")
 }
 
 /// Route a decoded MessageBox to the host bridge, or the console-echo fallback.
 ///
+/// The handler runs in TWO entries around the bridge:
+///
+/// - **Re-entry** (the engine re-executes the fake API after the runtime ran
+///   the bridge): take the pending record and return its chosen Win32 id
+///   (`None` pick = the bridge vanished mid-call — a racing teardown must not
+///   hang the guest, so it reads as IDCANCEL).
+/// - **First entry** (state lock held): when a bridge is registered, record
+///   the pending state and return
+///   [`WinApiControlSignal::MessageBoxBridgeRequested`]. The runtime then
+///   DROPS the shared state lock and runs the bridge on this guest thread —
+///   the winit event loop needs the SAME lock to service frame events while
+///   the alert is up, so holding it across the modal session would deadlock
+///   into the macOS beachball.
+///
+/// Without a bridge (headless runs, `trace`) the message echoes to the host
+/// console (7z bring-up behavior) and the handler auto-answers IDOK so no
+/// guest ever hangs on a missing host.
+///
 /// The `mb_type` argument passes through verbatim — the host bridge (wie-cli,
 /// where rfd lives) maps MB_* flag bits to its button/level sets, keeping rfd
-/// types out of this crate. The bridge's returned Win32 id (already the id the
-/// guest expects) is handed back; without a bridge the message echoes to the
-/// host console (7z bring-up behavior) and the handler auto-answers IDOK.
+/// types out of this crate.
 fn message_box_result(
     ctx: &mut HandlerContext<'_>,
     caption: &str,
     text: &str,
     message_box_type: u32,
     api_name: &str,
-) -> u64 {
-    if let Some(bridge) = ctx
+) -> Result<WinApiHandlerResult> {
+    // Re-entry: the runtime ran the bridge WITHOUT the shared state lock and
+    // recorded the user's choice; hand it to the guest.
+    if let Some(pending) = ctx.state.window_state().pending_native_message_box.take() {
+        let win32_id = pending
+            .pick
+            .and_then(|id| u64::try_from(id).ok())
+            .unwrap_or(IDCANCEL);
+        return finish_message_box(ctx, win32_id, api_name);
+    }
+
+    if ctx
         .state
         .try_present()
-        .and_then(|present| present.message_box_bridge.as_ref())
+        .is_some_and(|present| present.message_box_bridge.is_some())
     {
-        let win32_id = bridge(caption, text, message_box_type);
-        return u64::try_from(i64::from(win32_id)).unwrap_or(IDOK);
+        // First entry: record the write-back slot and hand the request to the
+        // runtime — it drops the shared state lock, runs the bridge on this
+        // guest thread, and the engine's re-execution of the fake API
+        // re-enters this handler (see `PendingNativeMessageBox`).
+        ctx.state.window_state().pending_native_message_box =
+            Some(PendingNativeMessageBox { pick: None });
+        return Err(WinApiControlSignal::MessageBoxBridgeRequested {
+            request: MessageBoxRequest {
+                caption: caption.to_owned(),
+                text: text.to_owned(),
+                message_box_type,
+            },
+        }
+        .into());
     }
+
     // Always surface guest error UI on host console (7z bring-up); no bridge
     // means headless/trace — auto-OK so the guest never hangs.
     eprintln!("[{api_name}] {caption}: {text}");
-    IDOK
+    finish_message_box(ctx, IDOK, api_name)
+}
+
+/// Return `win32_id` to the guest as the handler's `WinApiHandlerResult`.
+fn finish_message_box(
+    ctx: &mut HandlerContext<'_>,
+    win32_id: u64,
+    api_name: &str,
+) -> Result<WinApiHandlerResult> {
+    let return_address = ctx
+        .engine
+        .return_from_win64_api(win32_id)
+        .with_context(|| format!("failed to return from {api_name}"))?;
+
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: win32_id,
+    })
 }
 /// Handles dynamic `USER32.dll!SetProcessDPIAware`.
 pub fn handle_set_process_dpi_aware(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {

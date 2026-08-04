@@ -52,6 +52,39 @@ pub struct FileDialogPick {
     pub host_path: std::path::PathBuf,
 }
 
+/// One host MessageBox invocation: everything the native alert starts from.
+///
+/// Built by the `MessageBoxA/W` handlers from the guest arguments; consumed by
+/// the host bridge registered via `GuestHandle::set_message_box_bridge`.
+#[derive(Debug, Clone)]
+pub struct MessageBoxRequest {
+    /// The dialog caption (the `lpCaption` argument).
+    pub caption: String,
+    /// The message text (the `lpText` argument).
+    pub text: String,
+    /// The `MB_*` flag bits verbatim (button set, icon, …) — the host bridge
+    /// maps them to its own button/level sets, keeping rfd types out of this
+    /// crate.
+    pub message_box_type: u32,
+}
+
+/// One in-flight NATIVE MessageBox (host alert).
+///
+/// The `MessageBoxA/W` handlers record this on their first entry (state lock
+/// held) and return [`WinApiControlSignal::MessageBoxBridgeRequested`]; the
+/// runtime then runs the bridge WITHOUT the shared lock (the winit event loop
+/// needs that lock while the alert is up — holding it across the modal
+/// session deadlocks into the beachball) and stores the chosen Win32 id back
+/// here. The engine re-executes the fake API, the handler re-enters, takes
+/// this record, and returns the id to the guest.
+#[derive(Debug, Clone)]
+pub struct PendingNativeMessageBox {
+    /// The Win32 id the user chose (IDOK/IDCANCEL/IDYES/IDNO). `None` = the
+    /// bridge never answered (it vanished mid-call — a racing teardown must
+    /// not hang the guest); the handler falls back to IDCANCEL.
+    pub pick: Option<i32>,
+}
+
 /// One in-flight NATIVE (host-panel) file dialog.
 ///
 /// The `GetOpenFileName`/`GetSaveFileName` handler records this on its first
@@ -299,6 +332,9 @@ pub struct WindowState {
     /// `GetOpenFileName`/`GetSaveFileName` while the host panel is up. See
     /// [`PendingNativeFileDialog`].
     pub pending_native_file_dialog: Option<PendingNativeFileDialog>,
+    /// In-flight native MessageBox: the guest is parked in `MessageBoxA/W`
+    /// while the host alert is up. See [`PendingNativeMessageBox`].
+    pub pending_native_message_box: Option<PendingNativeMessageBox>,
     /// Host-side decision for `ChooseFontW` (Interactive shows the host font
     /// dialog; Cancel returns FALSE without one).
     pub font_dialog_policy: FontDialogPolicy,
@@ -384,6 +420,7 @@ impl Default for WindowState {
             file_dialog: None,
             file_dialog_bridge: None,
             pending_native_file_dialog: None,
+            pending_native_message_box: None,
             font_dialog_policy: FontDialogPolicy::default(),
             font_dialog: None,
             find_dialogs: Vec::new(),
@@ -781,6 +818,19 @@ pub enum WinApiControlSignal {
     FileDialogBridgeRequested {
         /// Everything the native panel starts from.
         request: FileDialogRequest,
+    },
+
+    /// `MessageBoxA/W` wants the host alert shown.
+    ///
+    /// The runtime drops the shared state lock for the whole alert session
+    /// (the winit event loop needs that lock to service frame events while
+    /// the alert is up) and runs the registered
+    /// [`crate::present::MessageBoxBridge`] on the guest thread, then the
+    /// handler's re-entry returns the chosen id.
+    #[error("host message box bridge requested")]
+    MessageBoxBridgeRequested {
+        /// Everything the host alert starts from.
+        request: MessageBoxRequest,
     },
 
     /// Host thread must park (drop CPU lock) then retry / continue (MT.2/3).

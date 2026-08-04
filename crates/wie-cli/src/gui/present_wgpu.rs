@@ -650,8 +650,15 @@ fn upload_source<'a>(
         };
     }
     // Pack the region rows into a padded buffer (region copies and unaligned
-    // full frames).
+    // full frames). The inner copy is a per-row u32 memcpy: on the little-
+    // endian hosts this emulator targets, the u32 LE bytes ARE the 0RGB pixel
+    // (the zero-copy full-frame path above already relies on this identity),
+    // so a slice copy lowers to the platform SIMD memcpy instead of the old
+    // per-pixel 4-byte stores. `padded` is a multiple of 256, so the u32 view
+    // of the pack buffer is exact, and `vec![0_u8; …]` is allocator-aligned.
     let mut buf = vec![0_u8; height_us.saturating_mul(padded)];
+    let buf_u32: &mut [u32] = bytemuck::cast_slice_mut(&mut buf);
+    let row_words = padded / 4;
     for row in 0..height_us {
         let src_start = top_us
             .saturating_add(row)
@@ -660,12 +667,10 @@ fn upload_source<'a>(
         let Some(src) = pixels.get(src_start..src_start.saturating_add(width_us)) else {
             continue;
         };
-        let dst_start = row.saturating_mul(padded);
-        for (i, px) in src.iter().enumerate() {
-            let offset = dst_start.saturating_add(i.saturating_mul(4));
-            if let Some(slot) = buf.get_mut(offset..offset.saturating_add(4)) {
-                slot.copy_from_slice(&px.to_le_bytes());
-            }
+        let dst_start = row.saturating_mul(row_words);
+        let dst_end = dst_start.saturating_add(width_us);
+        if let Some(dst) = buf_u32.get_mut(dst_start..dst_end) {
+            dst.copy_from_slice(src);
         }
     }
     UploadSource {
@@ -819,5 +824,45 @@ mod tests {
             (src.origin_x, src.origin_y, src.width, src.height),
             (40, 40, 10, 10)
         );
+    }
+
+    /// The region pack must be byte-identical regardless of row count (the
+    /// per-row u32 memcpy path writes exactly the region's pixels, padding
+    /// rows untouched).
+    #[test]
+    fn region_pack_round_trips_all_rows() {
+        // 31 cols × 4 = 124 B/row → padded to 256; 5 rows, 2 padding rows.
+        let pixels = frame(80, 20, 0x0011_2233);
+        let region = IRect {
+            left: 7,
+            top: 3,
+            right: 38,
+            bottom: 8,
+        };
+        let src = upload_source(&pixels, 80, 20, Some(region));
+        assert_eq!(src.rows, 5);
+        assert_eq!(src.bytes_per_row, 256);
+        let bytes = src.bytes.as_ref();
+        for row in 0_usize..5 {
+            for col in 0_usize..31 {
+                let off = row
+                    .saturating_mul(256)
+                    .saturating_add(col.saturating_mul(4));
+                let slot = &bytes[off..off.saturating_add(4)];
+                assert_eq!(
+                    u32::from_le_bytes([slot[0], slot[1], slot[2], slot[3]]),
+                    0x0011_2233,
+                    "row {row} col {col} must round-trip"
+                );
+            }
+        }
+        // Padding bytes after each row's pixels stay zero (only the width is
+        // copied, never the 256-byte stride).
+        for row in 0_usize..5 {
+            let pad_off = row
+                .saturating_mul(256)
+                .saturating_add(31_usize.saturating_mul(4));
+            assert_eq!(&bytes[pad_off..pad_off.saturating_add(2)], &[0, 0]);
+        }
     }
 }
