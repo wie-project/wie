@@ -6,8 +6,11 @@
 //! job lives OUT of `DcRecord`). The guest drives the job through the
 //! StartDocW → (StartPage → EndPage)* → EndDoc state machine; each EndPage
 //! moves the in-progress [`PageCanvas`] into the job's `pages`. EndDoc hands
-//! the collected pages off — in P1a that means writing `page-N.bmp` under the
-//! `WIE_PRINT_TO` directory (or dropping them with an info log when unset).
+//! the collected pages off (P3): under a registered print-JOB bridge the
+//! pages MOVE into a [`PrintJobRequest`] and a real host NSPrintOperation
+//! runs (the native macOS print pipeline); without a bridge the pages are
+//! written as `page-N.bmp` under the `WIE_PRINT_TO` directory (or dropped
+//! with an info log when unset) — the headless oracle.
 //!
 //! Text rasterization is deliberately out of scope: `TextOutW` / `DrawTextW`
 //! on a print DC are documented no-ops until the P1b text arm lands, so the
@@ -176,35 +179,96 @@ pub fn handle_end_page(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
 
 /// Handles `GDI32.dll!EndDoc` — finish the document and hand the pages off.
 ///
-/// The handoff in P1a writes each collected page as `page-N.bmp` under the
-/// `WIE_PRINT_TO` directory (info-log + drop when unset); pixel content lands
-/// with P1b's text arm. The job returns to `Idle`. Returns 1 on success; 0
-/// unless the job is `DocStarted` (an un-ended page is an error, as in real
-/// GDI).
+/// The handoff depends on the host: under a registered print-JOB bridge (GUI
+/// sessions — [`WindowState::print_job_bridge`]) the completed pages are MOVED
+/// into a [`PrintJobRequest`] and returned as
+/// [`WinApiControlSignal::PrintJobBridgeRequested`]; the runtime then runs the
+/// bridge (a real macOS NSPrintOperation) without the shared lock and the
+/// re-entry returns its success flag (1 / 0). Without a bridge (headless,
+/// tests) each collected page is written as `page-N.bmp` under the
+/// `WIE_PRINT_TO` directory (info-log + drop when unset) — the P1a oracle.
+/// The job returns to `Idle` either way. Returns 1 on success; 0 unless the
+/// job is `DocStarted` (an un-ended page is an error, as in real GDI).
 pub fn handle_end_doc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    use crate::state::{PendingNativePrintJob, PrintJobRequest, WinApiControlSignal};
+
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let hdc = engine.read_rcx().context("failed to read RCX for EndDoc")?;
 
-    let mut success = false;
-    if let Some(job) = state.gdi_state().find_print_job_mut(Hdc::from(hdc))
-        && job.state == PrintJobState::DocStarted
-    {
-        let dc = job.dc;
-        let doc_name = std::mem::take(&mut job.doc_name);
-        let pages = std::mem::take(&mut job.pages);
-        job.state = PrintJobState::Idle;
-        write_pages_bmp(dc, &doc_name, &pages);
-        success = true;
+    // Re-entry: the native print operation ran (the pump arm ran the
+    // print-job bridge without the shared lock and recorded its result).
+    // Return 1 on success, 0 on failure (or when the bridge never answered).
+    if let Some(pending) = state.window_state().pending_native_print_job.take() {
+        let success = pending.success.unwrap_or(false);
+        let return_address = engine
+            .return_from_win64_api(u64::from(success))
+            .context("failed to return from EndDoc")?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: u64::from(success),
+        });
     }
 
+    // Take the job payload OUT of the gdi borrow before the bridge decision:
+    // `gdi_state()` and `window_state()` both go through `dll_states`, so the
+    // two &mut accesses must not overlap.
+    let handoff = if let Some(job) = state.gdi_state().find_print_job_mut(Hdc::from(hdc))
+        && job.state == PrintJobState::DocStarted
+    {
+        let request = PrintJobRequest {
+            pages: std::mem::take(&mut job.pages),
+            print_info_id: u64::from(job.print_info_id),
+            doc_name: std::mem::take(&mut job.doc_name),
+            copies: job.copies,
+        };
+        let dc = job.dc;
+        job.state = PrintJobState::Idle;
+        Some((dc, request))
+    } else {
+        None
+    };
+
+    let Some((dc, request)) = handoff else {
+        let return_address = engine
+            .return_from_win64_api(0)
+            .context("failed to return from EndDoc")?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    };
+
+    // Native-bridge path (GUI sessions): park the guest while the host runs
+    // the NSPrintOperation; the engine re-executes the fake API and this
+    // handler's re-entry above returns the bridge's success flag.
+    if state
+        .try_window_state()
+        .is_some_and(|window_state| window_state.print_job_bridge.is_some())
+    {
+        state.window_state().pending_native_print_job =
+            Some(PendingNativePrintJob { success: None });
+        tracing::info!(
+            target: "wiegui",
+            pages = request.pages.len(),
+            print_info_id = request.print_info_id,
+            copies = request.copies,
+            doc_name = request.doc_name,
+            "EndDoc: native print operation requested"
+        );
+        return Err(WinApiControlSignal::PrintJobBridgeRequested { request }.into());
+    }
+
+    // No bridge (headless / tests): the WIE_PRINT_TO BMP oracle stays.
+    write_pages_bmp(dc, &request.doc_name, &request.pages);
+
     let return_address = engine
-        .return_from_win64_api(u64::from(success))
+        .return_from_win64_api(1)
         .context("failed to return from EndDoc")?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: u64::from(success),
+        return_value: 1,
     })
 }
 
@@ -519,7 +583,7 @@ mod tests {
     use crate::handles::{Hbrush, Hdc, Hpen};
     use crate::state::{
         DEFAULT_ENVIRONMENT, DllStateMap, HeapState, KernelState, ModuleState, ProcessState,
-        WinApiEnvironment, WinApiState,
+        WinApiControlSignal, WinApiEnvironment, WinApiState,
     };
     use crate::sync_obj::SyncState;
     use crate::thread::ThreadState;
@@ -870,6 +934,177 @@ mod tests {
             ),
             0,
             "EndDoc without StartDoc must fail"
+        );
+    }
+
+    // ── The native print-operation handoff (P3) ──────────────────────────
+
+    /// StartDocW ("WIE Print Test") + StartPage + EndPage on `hdc`, so the
+    /// job holds one completed page for the EndDoc handoff.
+    fn start_one_page_document(engine: &mut IcedCpu, state: &mut WinApiState, hdc: u64) {
+        write_i32(engine, 0x2000, 40).expect("cbSize");
+        write_utf16(engine, 0x3000, "WIE Print Test");
+        write_u64(engine, 0x2008, 0x3000).expect("lpszDocName");
+        assert_eq!(start_doc(engine, state, hdc, 0x2000), 1);
+        write_regs(engine, hdc, 0, 0, 0);
+        assert_eq!(
+            run(
+                &mut HandlerContext::new(engine, test_environment(), state),
+                handle_start_page,
+            ),
+            1
+        );
+        write_regs(engine, hdc, 0, 0, 0);
+        assert_eq!(
+            run(
+                &mut HandlerContext::new(engine, test_environment(), state),
+                handle_end_page,
+            ),
+            1
+        );
+    }
+
+    /// Drive the `EndDoc` → native print-operation handoff with a scripted
+    /// print-job bridge (the runtime's two-entry seam, simulated like the
+    /// print-dialog bridge helper in `state/tests.rs`): the first entry moves
+    /// the pages into [`WinApiControlSignal::PrintJobBridgeRequested`]; the
+    /// pump runs the bridge with the owned request; the re-entry returns the
+    /// bridge's success flag as the `EndDoc` value. Returns the re-entry's
+    /// return value.
+    fn end_doc_with_bridge(
+        engine: &mut IcedCpu,
+        state: &mut WinApiState,
+        hdc: u64,
+        bridge: crate::PrintJobBridge,
+        expect_request: impl FnOnce(&crate::PrintJobRequest),
+    ) -> u64 {
+        state.window_state().print_job_bridge = Some(bridge);
+        write_regs(engine, hdc, 0, 0, 0);
+        let err = handle_end_doc(&mut HandlerContext::new(engine, test_environment(), state))
+            .expect_err("the first entry parks the guest for the native print operation");
+        let signal = err
+            .downcast::<WinApiControlSignal>()
+            .expect("a control signal");
+        let WinApiControlSignal::PrintJobBridgeRequested { request } = signal else {
+            panic!("expected a print-job bridge request");
+        };
+        // Assert the moved payload BEFORE the bridge consumes the request.
+        expect_request(&request);
+        // What the runtime does between the two entries: take the bridge out,
+        // run it with the owned request (no shared lock), restore it, record
+        // the result on the pending record.
+        let bridge = state
+            .window_state()
+            .print_job_bridge
+            .take()
+            .expect("bridge registered");
+        let succeeded = bridge(request);
+        state.window_state().print_job_bridge = Some(bridge);
+        state
+            .window_state()
+            .pending_native_print_job
+            .as_mut()
+            .expect("pending print job recorded")
+            .success = Some(succeeded);
+        // Re-entry: the engine re-executes the fake API; the handler returns
+        // the bridge result as the EndDoc value.
+        write_regs(engine, hdc, 0, 0, 0);
+        run(
+            &mut HandlerContext::new(engine, test_environment(), state),
+            handle_end_doc,
+        )
+    }
+
+    #[test]
+    fn end_doc_moves_the_pages_into_the_print_job_bridge_and_returns_its_result() {
+        let mut engine = test_engine();
+        let mut state = winapi_state();
+        let hdc = create_print_dc(&mut engine, &mut state);
+        start_one_page_document(&mut engine, &mut state, hdc);
+        // The job's print-info id + copies come from the PrintDlgW pick; seed
+        // them so the round-trip through the request is observable.
+        {
+            let job = state
+                .gdi_state()
+                .find_print_job_mut(Hdc::from(hdc))
+                .unwrap();
+            job.print_info_id = 42;
+            job.copies = 3;
+        }
+
+        let result = end_doc_with_bridge(
+            &mut engine,
+            &mut state,
+            hdc,
+            Box::new(|request| {
+                // The bridge receives the pages BY VALUE — the moved canvases.
+                assert_eq!(request.pages.len(), 1);
+                assert_eq!(request.pages[0].pixels.len(), 2550 * 3300);
+                true
+            }),
+            |request| {
+                assert_eq!(request.pages.len(), 1, "the completed page moved");
+                assert_eq!(request.print_info_id, 42);
+                assert_eq!(request.doc_name, "WIE Print Test");
+                assert_eq!(request.copies, 3);
+            },
+        );
+
+        assert_eq!(result, 1, "a successful operation → EndDoc returns 1");
+        // The job returned to Idle; the pages are GONE (moved, never cloned).
+        let job = state.gdi_state().find_print_job(Hdc::from(hdc)).unwrap();
+        assert_eq!(job.state, PrintJobState::Idle);
+        assert!(
+            job.pages.is_empty(),
+            "pages moved into the request, not cloned"
+        );
+        assert!(job.doc_name.is_empty(), "doc name moved with the pages");
+        assert!(
+            state.window_state().pending_native_print_job.is_none(),
+            "the pending record is consumed by the re-entry"
+        );
+    }
+
+    #[test]
+    fn end_doc_returns_zero_when_the_print_bridge_reports_failure() {
+        let mut engine = test_engine();
+        let mut state = winapi_state();
+        let hdc = create_print_dc(&mut engine, &mut state);
+        start_one_page_document(&mut engine, &mut state, hdc);
+
+        let result = end_doc_with_bridge(
+            &mut engine,
+            &mut state,
+            hdc,
+            Box::new(|_request| false),
+            |_request| {},
+        );
+
+        assert_eq!(result, 0, "a failed operation → EndDoc returns 0");
+        let job = state.gdi_state().find_print_job(Hdc::from(hdc)).unwrap();
+        assert_eq!(job.state, PrintJobState::Idle);
+    }
+
+    #[test]
+    fn end_doc_without_a_bridge_keeps_the_bmp_oracle() {
+        let mut engine = test_engine();
+        let mut state = winapi_state();
+        let hdc = create_print_dc(&mut engine, &mut state);
+        start_one_page_document(&mut engine, &mut state, hdc);
+        // No print-job bridge: the headless WIE_PRINT_TO path (unset → pages
+        // dropped with an info log), EndDoc still succeeds.
+        assert_eq!(
+            run(
+                &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+                handle_end_doc,
+            ),
+            1
+        );
+        let job = state.gdi_state().find_print_job(Hdc::from(hdc)).unwrap();
+        assert_eq!(job.state, PrintJobState::Idle);
+        assert!(
+            state.window_state().pending_native_print_job.is_none(),
+            "the BMP path never records a pending native print job"
         );
     }
 

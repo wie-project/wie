@@ -1419,6 +1419,10 @@ pub fn run_gui_windowed(
                         // size + effects + OK/Cancel) and runs the file
                         // dialog's in-guest modal loop.
                         crate::gui::font_dialog::enable_interactive_font_dialogs(&mut session);
+                        // PrintDlgW shows the native macOS print panel (the
+                        // OS-equivalent of Windows' print dialog) when the
+                        // bridge is registered; headless runs keep Cancel.
+                        crate::gui::print::enable_interactive_print_dialogs(&mut session);
                         let handle = session.guest_handle();
 
                         // Register wake callback.
@@ -1446,6 +1450,35 @@ pub fn run_gui_windowed(
                             &handle,
                             window_slots_guest.clone(),
                         );
+
+                        // Native print dialogs: PrintDlgW shows the real macOS
+                        // print panel (NSPrintPanel) instead of returning a
+                        // scripted cancel — the OS-equivalent of Windows'
+                        // PrintDlg. The guest thread blocks in the bridge until
+                        // the user picks; the pick's NSPrintInfo is registered
+                        // in the session-scoped id-table (the EndDoc print
+                        // operation consumes the entry — both bridges share
+                        // ONE table so the panel's settings survive to the
+                        // operation).
+                        #[cfg(target_os = "macos")]
+                        {
+                            let print_info_table = crate::gui::print::PrintInfoTable::default();
+                            crate::gui::print::register_native_print_dialog_bridge(
+                                &handle,
+                                print_info_table.clone(),
+                            );
+                            // Native print operations: EndDoc hands the
+                            // completed pages to a real NSPrintOperation
+                            // (printer / "Save as PDF" — the user's destination
+                            // from the panel) instead of writing the
+                            // WIE_PRINT_TO BMP oracle. The guest thread blocks
+                            // until the operation finishes; its success flag is
+                            // the EndDoc return value.
+                            crate::gui::print::register_native_print_job_bridge(
+                                &handle,
+                                print_info_table,
+                            );
+                        }
 
                         // Register the native-alert MessageBox bridge. The
                         // MessageBoxA/W handlers never call this directly:

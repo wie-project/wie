@@ -70,10 +70,12 @@ pub use state::{
     GlobalAtomRecord, GuestCallbackRequest, GuestIoRuntimeConfig, GuestStdinMode, HandlerContext,
     HeapAllocation, HeapState, HostFileMount, HostParkReason, ImportResolver, KernelState,
     KeyboardState, MessageQueueIdlePolicy, ModuleHandle, ModuleState, OpenGuestFile, OuterReturn,
-    PTHREAD_RETURN_TRAMPOLINE_VA, ProcessState, QueuedWindowMessage, RegistryKey,
-    RegistryKeyHandle, ResourceHandle, ResourceRecord, TimerRecord, VirtualGuestFile,
-    WinApiControlSignal, WinApiEnvironment, WinApiState, WindowClassRecord, WindowFlags,
-    WindowRecord, WindowState, WindowsHookRecord, pthread_return_trampoline_va,
+    PTHREAD_RETURN_TRAMPOLINE_VA, PendingNativePrintJob, PrintDialogBridge, PrintDialogPick,
+    PrintDialogPolicy, PrintDialogRequest, PrintJobBridge, PrintJobRequest, ProcessState,
+    QueuedWindowMessage, RegistryKey, RegistryKeyHandle, ResourceHandle, ResourceRecord,
+    TimerRecord, VirtualGuestFile, WinApiControlSignal, WinApiEnvironment, WinApiState,
+    WindowClassRecord, WindowFlags, WindowRecord, WindowState, WindowsHookRecord,
+    pthread_return_trampoline_va,
 };
 
 mod dispatch_table;

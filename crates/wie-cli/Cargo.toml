@@ -50,7 +50,29 @@ rfd = { version = "0.17", default-features = false }
 # transitive dep via winit 0.30 (same 0.2 line + NSWindow feature — no new
 # lockfile version); the direct edge makes the use explicit. The one unsafe
 # pointer cast lives in app.rs under the crate's scoped-unsafe precedent.
-objc2-app-kit = { version = "0.2", features = ["NSView", "NSWindow"] }
+#
+# NSPrintPanel/NSPrintInfo: the PrintDlgW bridge (gui/print.rs) runs the real
+# macOS print panel — the OS-equivalent of Windows' PrintDlg — and registers
+# the user's NSPrintInfo in the host id-table for the P3 EndDoc handoff.
+# NSImage/NSImageRep/NSBitmapImageRep/NSPrintOperation/NSGraphics: the P3
+# print-operation glue (gui/print.rs) turns the rasterized page canvases into
+# NSImages (NSBitmapImageRep from the RGBA pixels) and drives a real
+# NSPrintOperation with the panel's NSPrintInfo.
+# objc2 + objc2-foundation are already transitive via winit 0.30 / app-kit 0.2
+# (same 0.5 / 0.2 lines — no new lockfile versions); the direct edges make
+# the uses in gui/print.rs explicit. The foundation features mirror what
+# winit's macos backend already enables, plus NSNumber for the copies value.
+objc2-app-kit = { version = "0.2", features = ["NSView", "NSWindow", "NSPrintInfo", "NSPrintPanel", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSPrintOperation", "NSGraphics"] }
+objc2 = { version = "0.5", default-features = false, features = ["std", "alloc"] }
+objc2-foundation = { version = "0.2", default-features = false, features = [
+    "dispatch",
+    "NSDictionary",
+    "NSGeometry",
+    "NSObject",
+    "NSString",
+    "NSThread",
+    "NSValue",
+] }
 wgpu = { version = "30", default-features = false, features = ["metal", "wgsl"] }
 pollster = { version = "1.0" }
 bytemuck = { version = "1" }

@@ -273,6 +273,31 @@ pub enum FontDialogPolicy {
     Interactive,
 }
 
+/// Host-side decision for `PrintDlgW`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PrintDialogPolicy {
+    #[default]
+    /// Simulate the user cancelling the dialog (`return FALSE`).
+    ///
+    /// No `hDC` / `hDevMode` / `hDevNames` write-back happens (the `PRINTDLG`
+    /// struct is untouched), exactly like a user pressing Cancel on the real
+    /// dialog. Headless runs and `trace` keep this default so a guest can
+    /// never hang on a print panel nobody can click.
+    Cancel,
+
+    /// Show the host print dialog.
+    ///
+    /// `PrintDlgW` returns
+    /// [`crate::WinApiControlSignal::PrintDialogBridgeRequested`] and the
+    /// runtime runs the registered [`crate::PrintDialogBridge`] (the native
+    /// macOS NSPrintPanel, registered by the GUI presenter) on the guest
+    /// thread; the re-entry allocates the print DC (`PD_RETURNDC`) and writes
+    /// `hDC` / `nCopies` / `hDevMode` / `hDevNames` back into the guest
+    /// `PRINTDLG`. When no bridge is registered the handler cancels (a guest
+    /// must never hang).
+    Interactive,
+}
+
 /// One host file exposed to the guest under one or more Windows paths.
 #[derive(Debug, Clone)]
 pub struct HostFileMount {

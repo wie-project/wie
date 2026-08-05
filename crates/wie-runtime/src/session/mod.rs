@@ -373,6 +373,12 @@ impl RuntimeSession {
             .with_mut(|_, s| s.window_state().font_dialog_policy = policy);
     }
 
+    /// Configures the next common print dialog outcome (`PrintDlgW`).
+    pub fn set_print_dialog_policy(&mut self, policy: wie_winapi::PrintDialogPolicy) {
+        self.process
+            .with_mut(|_, s| s.window_state().print_dialog_policy = policy);
+    }
+
     /// Returns the last path accepted by a simulated file dialog.
     #[must_use]
     pub fn last_file_dialog_path(&self) -> Option<String> {

@@ -10,3 +10,4 @@ pub(crate) mod input_script;
 #[cfg(target_os = "macos")]
 pub(crate) mod menu_bar;
 pub(crate) mod present_wgpu;
+pub(crate) mod print;

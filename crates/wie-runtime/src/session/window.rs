@@ -448,6 +448,40 @@ impl GuestHandle {
         }
     }
 
+    /// Set the host print-dialog bridge — called by the `PrintDlgW` handler
+    /// (under [`wie_winapi::PrintDialogPolicy::Interactive`]) with the
+    /// request seeded from the guest's `PRINTDLG`/DEVMODE; the returned
+    /// pick's settings are written back into the guest `PRINTDLG`.
+    ///
+    /// Mirrors [`Self::set_file_dialog_bridge`]: the GUI presenter registers
+    /// the native-panel callback (macOS NSPrintPanel) here once at startup,
+    /// and the guest thread invokes it from the handler. The callback blocks
+    /// until the user picks (the guest thread parks inside the handler),
+    /// which is dialog semantics. When no bridge is registered the handler
+    /// cancels, so headless runs and `trace` never hang.
+    pub fn set_print_dialog_bridge(&self, cb: wie_winapi::PrintDialogBridge) {
+        if let Ok(mut state) = self.state.lock() {
+            state.window_state().print_dialog_bridge = Some(cb);
+        }
+    }
+
+    /// Set the host print-operation bridge — called by the gdi32 `EndDoc`
+    /// handler (with the completed [`wie_winapi::PrintJobRequest`], pages
+    /// moved in) to run the native print pipeline (macOS NSPrintOperation);
+    /// the returned success flag becomes the `EndDoc` return value.
+    ///
+    /// Mirrors [`Self::set_print_dialog_bridge`]: the GUI presenter registers
+    /// the native-operation callback here once at startup, and the guest
+    /// thread invokes it from the handler. The callback blocks until the
+    /// operation finishes (the guest thread parks inside the handler), which
+    /// is print semantics. When no bridge is registered the handler keeps the
+    /// `WIE_PRINT_TO` BMP oracle, so headless runs and `trace` never block.
+    pub fn set_print_job_bridge(&self, cb: wie_winapi::PrintJobBridge) {
+        if let Ok(mut state) = self.state.lock() {
+            state.window_state().print_job_bridge = Some(cb);
+        }
+    }
+
     /// Set the wake callback — called when a new frame is published.
     pub fn set_wake(&self, cb: Box<dyn Fn() + Send>) {
         if let Ok(mut state) = self.state.lock() {

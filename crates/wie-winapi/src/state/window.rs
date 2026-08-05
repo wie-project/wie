@@ -1,10 +1,11 @@
 //! Window, UI, hook, timer, resource, and control-signal state types.
 
+use crate::gdi32::PageCanvas;
 use crate::vfs;
 use ahash::HashMapExt;
 
 use super::input::KeyboardState;
-use super::process::{FileDialogPolicy, FontDialogPolicy};
+use super::process::{FileDialogPolicy, FontDialogPolicy, PrintDialogPolicy};
 
 /// A parsed `OPENFILENAME.lpstrFilter` group: a display name and its extension
 /// globs (`"Text Documents"` → `["*.txt"]`).
@@ -114,6 +115,35 @@ pub struct PendingNativeFileDialog {
     pub pick: Option<FileDialogPick>,
 }
 
+/// One in-flight NATIVE (host-panel) print dialog.
+///
+/// The `PrintDlgW` handler records this on its first entry (state lock held)
+/// and returns [`WinApiControlSignal::PrintDialogBridgeRequested`]; the
+/// runtime then runs the bridge WITHOUT the shared lock (the winit event loop
+/// needs that lock while the panel is up — holding it across the modal
+/// session deadlocks into the beachball) and stores the pick back here. The
+/// engine re-executes the fake API, the handler re-enters, takes this record,
+/// allocates the print DC and writes the pick back into the guest `PRINTDLG`.
+#[derive(Debug, Clone)]
+pub struct PendingNativePrintDialog {
+    /// Guest VA of the `PRINTDLG` structure.
+    pub print_dlg_ptr: u64,
+    /// The input `PRINTDLG.hDevMode` (`HGLOBAL` — a guest VA under the
+    /// GMEM_FIXED semantics; 0 = none, the DEVMODE is then freshly allocated).
+    pub h_dev_mode_in: u64,
+    /// The input `PRINTDLG.hDevNames` (0 = none, the DEVNAMES is freshly
+    /// allocated).
+    pub h_dev_names_in: u64,
+    /// The `PRINTDLG.Flags` word verbatim (the re-entry checks `PD_RETURNDC`).
+    pub flags: u32,
+    /// The id the re-entry stores on the print job (the host `NSPrintInfo`
+    /// table key).
+    pub print_info_id: u64,
+    /// The bridge's pick (the runtime records it; `None` = user cancelled or
+    /// the bridge vanished mid-call).
+    pub pick: Option<PrintDialogPick>,
+}
+
 /// Host file-dialog callback: `(request) → pick, or `None` (user cancelled)`.
 ///
 /// Registered by the GUI presenter via `GuestHandle::set_file_dialog_bridge`;
@@ -121,6 +151,110 @@ pub struct PendingNativeFileDialog {
 /// guest thread, which blocks until the native panel closes (dialog
 /// semantics — the same seam as the MessageBox bridge).
 pub type FileDialogBridge = Box<dyn Fn(&FileDialogRequest) -> Option<FileDialogPick> + Send>;
+
+/// One host print-dialog invocation: everything the native panel starts from.
+///
+/// Built by the comdlg32 `PrintDlgW` handler from the guest `PRINTDLG` +
+/// DEVMODE; consumed by the host bridge registered via
+/// `GuestHandle::set_print_dialog_bridge`.
+#[derive(Debug, Clone, Copy)]
+pub struct PrintDialogRequest {
+    /// The initial paper size in millimetres — from the guest DEVMODE
+    /// (`dmPaperWidth`/`dmPaperLength`) or the US Letter default when the
+    /// guest passed no DEVMODE.
+    pub paper_size_mm: (u32, u32),
+    /// The initial `dmOrientation` value (1 = `DMORIENT_PORTRAIT`,
+    /// 2 = `DMORIENT_LANDSCAPE`); 0 when the guest passed no DEVMODE.
+    pub orientation: u16,
+    /// The initial `dmCopies` value (1 when the guest passed no DEVMODE).
+    pub copies: u16,
+    /// The initial `dmColor` value (1 = `DMCOLOR_MONOCHROME`, 2 = `DMCOLOR_COLOR`).
+    pub color: u16,
+    /// The id the handler will store on the print job. The bridge registers
+    /// the user's resulting `NSPrintInfo` under this key in the host-side
+    /// id-table (see the wie-cli `gui/print` module); P3's EndDoc handoff
+    /// consumes the entry.
+    pub print_info_id: u64,
+}
+
+/// The native print panel's pick: the print settings the user chose.
+///
+/// Plain data so the bridge never leaks AppKit types into this crate. The
+/// `NSPrintInfo` itself lives in the host-side id-table under
+/// [`PrintDialogRequest::print_info_id`] for the P3 print handoff.
+#[derive(Debug, Clone, Copy)]
+pub struct PrintDialogPick {
+    /// Paper size in millimetres (`width`, `height`).
+    pub paper_size_mm: (u32, u32),
+    /// The `dmOrientation` value (1 = portrait, 2 = landscape).
+    pub orientation: u16,
+    /// Number of copies (written back into `PRINTDLG.nCopies` and
+    /// `DEVMODE.dmCopies`; the guest's copy loop reads `nCopies`).
+    pub copies: u16,
+    /// The `dmColor` value (1 = monochrome, 2 = color). The macOS panel has
+    /// no color toggle, so the pick carries the seed value through unchanged.
+    pub color: u16,
+    /// The host `NSPrintInfo` table key (see [`PrintDialogRequest`]).
+    pub print_info_id: u64,
+}
+
+/// Host print-dialog callback: `(request) → pick, or `None` (user cancelled)`.
+///
+/// Registered by the GUI presenter via `GuestHandle::set_print_dialog_bridge`;
+/// invoked by the comdlg32 `PrintDlgW` handler on the guest thread, which
+/// blocks until the native panel closes (dialog semantics — the same seam as
+/// the file-dialog and MessageBox bridges).
+pub type PrintDialogBridge = Box<dyn Fn(&PrintDialogRequest) -> Option<PrintDialogPick> + Send>;
+
+/// A completed print document handed to the host for NATIVE printing.
+///
+/// Built by the gdi32 `EndDoc` handler from the finished [`PrintJob`]: the
+/// page canvases are MOVED in (a 300-DPI letter page is ~34 MB — never
+/// clone), so the request owns the only copy of the pixels. Consumed by the
+/// host bridge registered via `GuestHandle::set_print_job_bridge`, which
+/// drives the macOS NSPrintOperation.
+#[derive(Debug, Clone)]
+pub struct PrintJobRequest {
+    /// Completed pages, in print order (top-down 0RGB canvases at the job's
+    /// paper size — see [`PageCanvas`]).
+    pub pages: Vec<PageCanvas>,
+    /// The host `NSPrintInfo` table key (see [`PrintDialogRequest`]): 0 when
+    /// the DC came from `CreateDCW` rather than `PrintDlgW`, so the bridge
+    /// must fall back to a fresh `NSPrintInfo`.
+    pub print_info_id: u64,
+    /// `DOCINFO.lpszDocName` — the spooler/job title.
+    pub doc_name: String,
+    /// Copies requested (the DEVMODE / `PrintDlgW` pick).
+    pub copies: u32,
+}
+
+/// Host native print-operation callback: `(request) → success`.
+///
+/// Registered by the GUI presenter via `GuestHandle::set_print_job_bridge`;
+/// invoked by the gdi32 `EndDoc` handler on the guest thread, which blocks
+/// until the native NSPrintOperation finishes (dialog semantics — the same
+/// seam as the print-dialog bridge). The request is taken BY VALUE so the
+/// ~34 MB page canvases move straight into the native pipeline; the returned
+/// bool is the NSPrintOperation result (true → `EndDoc` returns 1).
+pub type PrintJobBridge = Box<dyn Fn(PrintJobRequest) -> bool + Send>;
+
+/// One in-flight NATIVE (host) print job.
+///
+/// The gdi32 `EndDoc` handler records this on its first entry (state lock
+/// held) and returns [`WinApiControlSignal::PrintJobBridgeRequested`]; the
+/// runtime then runs the bridge WITHOUT the shared lock (the NSPrintOperation
+/// needs the main thread, and the winit event loop needs that lock while the
+/// operation runs — holding it across the blocking call deadlocks into the
+/// beachball) and stores the success flag back here. The engine re-executes
+/// the fake API, the handler re-enters, takes this record, and returns 1/0 to
+/// the guest.
+#[derive(Debug, Clone)]
+pub struct PendingNativePrintJob {
+    /// The bridge's success flag (the runtime records it; `None` = the bridge
+    /// never answered — a racing teardown must not hang the guest, `EndDoc`
+    /// then returns 0).
+    pub success: Option<bool>,
+}
 
 /// One in-flight interactive file dialog (`GetOpenFileName` / `GetSaveFileName`).
 ///
@@ -341,6 +475,37 @@ pub struct WindowState {
     /// In-flight modal font dialog, when [`FontDialogPolicy::Interactive`] is
     /// set and a dialog is open. See [`FontDialogSession`].
     pub font_dialog: Option<FontDialogSession>,
+    /// Host-side decision for `PrintDlgW` (Interactive shows the host print
+    /// panel via the bridge; Cancel returns FALSE without one).
+    pub print_dialog_policy: PrintDialogPolicy,
+    /// Optional host native print-dialog bridge, registered by the GUI
+    /// presenter via `GuestHandle::set_print_dialog_bridge`.
+    ///
+    /// When set, `PrintDlgW` under [`PrintDialogPolicy::Interactive`] calls it
+    /// with the request (seeded from the guest DEVMODE) and writes its pick
+    /// back into the `PRINTDLG` (`hDC` / `nCopies` / `hDevMode` / `hDevNames`).
+    /// When unset the handler cancels, so headless runs and `trace` never see
+    /// a native panel. Mirrors the file-dialog bridge seam.
+    pub print_dialog_bridge: Option<PrintDialogBridge>,
+    /// In-flight native print dialog: the guest is parked in `PrintDlgW`
+    /// while the host panel is up. See [`PendingNativePrintDialog`].
+    pub pending_native_print_dialog: Option<PendingNativePrintDialog>,
+    /// Optional host native print-operation bridge, registered by the GUI
+    /// presenter via `GuestHandle::set_print_job_bridge`.
+    ///
+    /// When set, the gdi32 `EndDoc` handler hands the completed pages to it
+    /// (a real macOS NSPrintOperation) instead of writing the `WIE_PRINT_TO`
+    /// BMP oracle; the returned success flag becomes the `EndDoc` return
+    /// value. When unset (headless runs, `trace`) the BMP path stays — the
+    /// oracle. Mirrors the print-dialog bridge seam.
+    pub print_job_bridge: Option<PrintJobBridge>,
+    /// In-flight native print job: the guest is parked in `EndDoc` while the
+    /// host NSPrintOperation runs. See [`PendingNativePrintJob`].
+    pub pending_native_print_job: Option<PendingNativePrintJob>,
+    /// Next host `NSPrintInfo` id-table key (the handler assigns it; the
+    /// bridge registers the user's `NSPrintInfo` under it). Starts at 1 and
+    /// wraps to 1 on overflow — the wie-cli table is keyed by `u64`.
+    pub(crate) next_print_info_id: u32,
     /// All in-flight host-owned modeless Find/Replace dialogs (FindTextW /
     /// ReplaceTextW). See [`FindDialogSession`]. Multiple dialogs can be open
     /// at once (a guest may show Find and Replace together).
@@ -423,6 +588,12 @@ impl Default for WindowState {
             pending_native_message_box: None,
             font_dialog_policy: FontDialogPolicy::default(),
             font_dialog: None,
+            print_dialog_policy: PrintDialogPolicy::default(),
+            print_dialog_bridge: None,
+            pending_native_print_dialog: None,
+            print_job_bridge: None,
+            pending_native_print_job: None,
+            next_print_info_id: 1,
             find_dialogs: Vec::new(),
             file_dialog_loop_va: 0,
             file_dialog_proc_va: 0,
@@ -831,6 +1002,33 @@ pub enum WinApiControlSignal {
     MessageBoxBridgeRequested {
         /// Everything the host alert starts from.
         request: MessageBoxRequest,
+    },
+
+    /// `PrintDlgW` wants the host print panel shown.
+    ///
+    /// The runtime drops the shared state lock for the whole panel session
+    /// (the winit event loop needs that lock to service frame events while
+    /// the panel is up) and runs the registered [`PrintDialogBridge`] on the
+    /// guest thread, then the handler's re-entry allocates the print DC and
+    /// writes the pick back into the guest `PRINTDLG`.
+    #[error("host print dialog bridge requested")]
+    PrintDialogBridgeRequested {
+        /// Everything the native panel starts from.
+        request: PrintDialogRequest,
+    },
+
+    /// `EndDoc` wants the host native print operation run.
+    ///
+    /// The runtime drops the shared state lock for the whole operation (the
+    /// NSPrintOperation needs the main thread, and the winit event loop needs
+    /// that lock while it runs) and invokes the registered [`PrintJobBridge`]
+    /// on the guest thread — the request is moved in by value, pages and all
+    /// — then the handler's re-entry returns its success flag as the `EndDoc`
+    /// return value.
+    #[error("host print job bridge requested")]
+    PrintJobBridgeRequested {
+        /// The completed document (pages moved in, never cloned).
+        request: PrintJobRequest,
     },
 
     /// Host thread must park (drop CPU lock) then retry / continue (MT.2/3).

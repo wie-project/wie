@@ -633,10 +633,13 @@ impl super::RuntimeSession {
                                             export_key.as_deref(),
                                         );
                                     }
-                                    let control_signal =
-                                        error.downcast_ref::<wie_winapi::WinApiControlSignal>();
-                                    match control_signal {
-                                    Some(wie_winapi::WinApiControlSignal::WaitingForMessage) => {
+                                    // Owned downcast: the print-job arm MOVES its
+                                    // `PrintJobRequest` (page canvases ~34 MB each)
+                                    // into the bridge — a reference would force a
+                                    // clone. The consumed error is restored for the
+                                    // unsupported-API diagnostic below.
+                                    match error.downcast::<wie_winapi::WinApiControlSignal>() {
+                                    Ok(wie_winapi::WinApiControlSignal::WaitingForMessage) => {
                                         self.next_api_index = self
                                             .next_api_index
                                             .checked_sub(1)
@@ -671,12 +674,11 @@ impl super::RuntimeSession {
                                             Some(EntryTraceTermination::WaitingForMessage);
                                         quantum = Quantum::Break;
                                     }
-                                    Some(
+                                    Ok(
                                         wie_winapi::WinApiControlSignal::GuestCallbackRequested {
                                             request,
                                         },
                                     ) => {
-                                        let request = *request;
                                         charged_api = charged_api.saturating_add(1);
                                         // begin_guest_callback needs full self — mark and handle after drop
                                         drop(pair);
@@ -709,7 +711,7 @@ impl super::RuntimeSession {
                                         }
                                         continue 'outer;
                                     }
-                                    Some(
+                                    Ok(
                                         wie_winapi::WinApiControlSignal::FileDialogBridgeRequested {
                                             request,
                                         },
@@ -728,7 +730,7 @@ impl super::RuntimeSession {
                                             .take();
                                         drop(pair);
                                         let picked =
-                                            bridge.as_ref().and_then(|bridge| bridge(request));
+                                            bridge.as_ref().and_then(|bridge| bridge(&request));
                                         self.process.with_mut(|_, winapi_state| {
                                             if winapi_state.kernel.threads.active.tid != primary_tid
                                             {
@@ -746,7 +748,7 @@ impl super::RuntimeSession {
                                         // handler re-enters and writes the pick back.
                                         quantum = Quantum::Continue;
                                     }
-                                    Some(
+                                    Ok(
                                         wie_winapi::WinApiControlSignal::MessageBoxBridgeRequested {
                                             request,
                                         },
@@ -791,7 +793,93 @@ impl super::RuntimeSession {
                                         // handler re-enters and returns the chosen id.
                                         quantum = Quantum::Continue;
                                     }
-                                    Some(wie_winapi::WinApiControlSignal::HostPark { reason }) => {
+                                    Ok(
+                                        wie_winapi::WinApiControlSignal::PrintDialogBridgeRequested {
+                                            request,
+                                        },
+                                    ) => {
+                                        // The native print panel (NSPrintPanel)
+                                        // blocks the MAIN thread for the whole
+                                        // session, and the winit event loop needs
+                                        // the SAME shared state lock to service
+                                        // frame/user events while the panel is up.
+                                        // Holding the lock across the bridge
+                                        // deadlocks into the beachball, so drop it
+                                        // for the whole panel session — the
+                                        // GuestCallbackRequested pattern, mirroring
+                                        // the file-dialog arm above. Take the
+                                        // bridge out first (it lives behind the
+                                        // lock) and restore it on return.
+                                        let bridge = winapi_state
+                                            .window_state()
+                                            .print_dialog_bridge
+                                            .take();
+                                        drop(pair);
+                                        let picked =
+                                            bridge.as_ref().and_then(|bridge| bridge(&request));
+                                        self.process.with_mut(|_, winapi_state| {
+                                            if winapi_state.kernel.threads.active.tid != primary_tid
+                                            {
+                                                winapi_state.kernel.threads.activate(primary_tid);
+                                            }
+                                            let window_state = winapi_state.window_state();
+                                            window_state.print_dialog_bridge = bridge;
+                                            if let Some(pending) =
+                                                window_state.pending_native_print_dialog.as_mut()
+                                            {
+                                                pending.pick = picked;
+                                            }
+                                        });
+                                        // Continue: the engine re-executes the fake
+                                        // API stop, the handler re-enters and
+                                        // writes the pick back.
+                                        quantum = Quantum::Continue;
+                                    }
+                                    Ok(
+                                        wie_winapi::WinApiControlSignal::PrintJobBridgeRequested {
+                                            request,
+                                        },
+                                    ) => {
+                                        // The native NSPrintOperation blocks the
+                                        // MAIN thread for the whole print session,
+                                        // and the winit event loop needs the SAME
+                                        // shared state lock to service frame/user
+                                        // events while the operation runs. Holding
+                                        // the lock across the bridge deadlocks into
+                                        // the beachball, so drop it for the whole
+                                        // operation — the GuestCallbackRequested
+                                        // pattern, mirroring the print-dialog arm
+                                        // above. Take the bridge out first (it lives
+                                        // behind the lock) and restore it on return.
+                                        let bridge = winapi_state
+                                            .window_state()
+                                            .print_job_bridge
+                                            .take();
+                                        drop(pair);
+                                        // The request is moved in BY VALUE (the
+                                        // ~34 MB page canvases travel straight into
+                                        // the native pipeline — never cloned).
+                                        let succeeded =
+                                            bridge.as_ref().map(|bridge| bridge(request));
+                                        self.process.with_mut(|_, winapi_state| {
+                                            if winapi_state.kernel.threads.active.tid != primary_tid
+                                            {
+                                                winapi_state.kernel.threads.activate(primary_tid);
+                                            }
+                                            let window_state = winapi_state.window_state();
+                                            window_state.print_job_bridge = bridge;
+                                            if let Some(pending) =
+                                                window_state.pending_native_print_job.as_mut()
+                                            {
+                                                pending.success = succeeded;
+                                            }
+                                        });
+                                        // Continue: the engine re-executes the fake
+                                        // API stop, the handler re-enters and returns
+                                        // the success flag as the EndDoc result.
+                                        quantum = Quantum::Continue;
+                                    }
+                                    Ok(wie_winapi::WinApiControlSignal::HostPark { reason }) => {
                                         // Per-thread engine: primary regs are already in `engine`;
                                         // only persist thread bookkeeping for TLS tracking.
                                         winapi_state.kernel.threads.save_active();
@@ -804,18 +892,18 @@ impl super::RuntimeSession {
                                         if self.pending_callbacks.is_empty() {
                                             winapi_state.present().drain_pending_publishes();
                                         }
-                                        quantum = Quantum::Park(*reason);
+                                        quantum = Quantum::Park(reason);
                                     }
-                                    Some(wie_winapi::WinApiControlSignal::ExitThread { code }) => {
+                                    Ok(wie_winapi::WinApiControlSignal::ExitThread { code }) => {
                                         // Flush pending publishes before the
                                         // thread exits so the last painted frame is
                                         // not lost.
                                         if self.pending_callbacks.is_empty() {
                                             winapi_state.present().drain_pending_publishes();
                                         }
-                                        quantum = Quantum::ExitThread(*code);
+                                        quantum = Quantum::ExitThread(code);
                                     }
-                                    None => {
+                                    Err(error) => {
                                         let api = format!(
                                             "{}!{}: {error}",
                                             resolved.library.as_ref(),
