@@ -1423,6 +1423,11 @@ pub fn run_gui_windowed(
                         // OS-equivalent of Windows' print dialog) when the
                         // bridge is registered; headless runs keep Cancel.
                         crate::gui::print::enable_interactive_print_dialogs(&mut session);
+                        // PageSetupDlgW shows the native macOS page-layout
+                        // panel (the OS-equivalent of Windows' Page Setup
+                        // dialog) when the bridge is registered; headless
+                        // runs keep Cancel.
+                        crate::gui::print::enable_interactive_page_setup_dialogs(&mut session);
                         let handle = session.guest_handle();
 
                         // Register wake callback.
@@ -1478,6 +1483,12 @@ pub fn run_gui_windowed(
                                 &handle,
                                 print_info_table,
                             );
+                            // Native page setup: PageSetupDlgW shows the real
+                            // macOS page-layout panel (NSPageLayout) instead
+                            // of returning a scripted cancel. No id-table —
+                            // the pick's paper/orientation reach the later
+                            // PrintDlgW panel through the guest DEVMODE.
+                            crate::gui::print::register_native_page_setup_dialog_bridge(&handle);
                         }
 
                         // Register the native-alert MessageBox bridge. The

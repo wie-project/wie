@@ -2591,6 +2591,322 @@ fn test_print_dlg_bridge_seeds_from_guest_devmode_and_reuses_the_block() {
     assert_eq!(job.copies, 3);
 }
 
+// --- PageSetupDlgW (native page-layout panel bridge) ---
+
+/// Write a `PAGESETUPDLG` (Win64) into guest memory at `psd_ptr` (the typed
+/// view zero-fills the untouched fields — the layout lives in guest_layout).
+fn write_page_setup_dlg(
+    engine: &mut IcedCpu,
+    psd_ptr: u64,
+    h_dev_mode: u64,
+    h_dev_names: u64,
+    flags: u32,
+) {
+    crate::guest_memory::with_typed_write::<crate::guest_layout::PageSetupDlgW, _, _>(
+        engine,
+        psd_ptr,
+        |psd| {
+            psd.l_struct_size = 128;
+            psd.hwnd_owner = 0;
+            psd.h_dev_mode = h_dev_mode;
+            psd.h_dev_names = h_dev_names;
+            psd.flags = flags;
+            // Notepad's margin defaults (hundredths of mm) — the rtMargin the
+            // write-back must preserve untouched (no margin UI in the panel).
+            psd.rt_margin_left = 750;
+            psd.rt_margin_top = 1000;
+            psd.rt_margin_right = 750;
+            psd.rt_margin_bottom = 1000;
+            Ok(())
+        },
+    )
+    .expect("write PAGESETUPDLG");
+}
+
+/// Drive `PageSetupDlgW` with a scripted native page-layout bridge
+/// (Interactive policy). Mirrors [`dispatch_print_dlg_with_bridge`]: the
+/// first entry returns [`WinApiControlSignal::PageSetupBridgeRequested`], the
+/// bridge runs WITHOUT the shared lock (simulated here), the pending record's
+/// pick is set, and the handler re-entry writes the pick back.
+fn dispatch_page_setup_dlg_with_bridge(
+    engine: &mut IcedCpu,
+    state: &mut WinApiState,
+    bridge: crate::PageSetupDialogBridge,
+) -> anyhow::Result<kernel32::WinApiHandlerResult> {
+    seed_test_heap_bump(engine);
+    state.window_state().page_setup_dialog_policy = crate::PageSetupDialogPolicy::Interactive;
+    state.window_state().page_setup_dialog_bridge = Some(bridge);
+    write_regs(engine, 0x5000, 0, 0, 0, 0);
+    let first = comdlg32::handle_page_setup_dlg_w(&mut HandlerContext::new(
+        engine,
+        test_environment(),
+        state,
+    ))
+    .expect_err("the first entry parks the guest for the native page-layout panel");
+    let signal = first
+        .downcast_ref::<WinApiControlSignal>()
+        .expect("a control signal");
+    let WinApiControlSignal::PageSetupBridgeRequested { request } = signal else {
+        panic!("expected a page-setup bridge request");
+    };
+    // What the runtime does between the two entries: take the bridge out, run
+    // it (no shared lock), restore it, record the pick.
+    let bridge = state
+        .window_state()
+        .page_setup_dialog_bridge
+        .take()
+        .expect("bridge registered");
+    let picked = bridge(request);
+    state.window_state().page_setup_dialog_bridge = Some(bridge);
+    state
+        .window_state()
+        .pending_native_page_setup
+        .as_mut()
+        .expect("pending page setup recorded")
+        .pick = picked;
+    // Re-entry: the handler writes the pick back.
+    comdlg32::handle_page_setup_dlg_w(&mut HandlerContext::new(engine, test_environment(), state))
+}
+
+/// The default `Cancel` policy (headless runs, `trace`): PageSetupDlgW
+/// returns FALSE like a user canceling — no bridge, no write-back.
+#[test]
+fn test_page_setup_dlg_cancel_policy_returns_false_without_machinery() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    write_page_setup_dlg(&mut engine, 0x5000, 0, 0, 0x2); // PSD_MARGINS
+    write_regs(&mut engine, 0x5000, 0, 0, 0, 0);
+
+    let r = comdlg32::handle_page_setup_dlg_w(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("PageSetupDlgW must dispatch under Cancel");
+
+    assert_eq!(r.return_value, 0, "Cancel → FALSE");
+    assert!(
+        state.window_state().pending_native_page_setup.is_none(),
+        "no pending record on cancel"
+    );
+}
+
+/// `Interactive` policy but NO bridge registered (headless/trace sessions):
+/// the handler cancels so a guest never hangs on a panel nobody can click.
+#[test]
+fn test_page_setup_dlg_interactive_without_bridge_falls_back_to_cancel() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    state.window_state().page_setup_dialog_policy = crate::PageSetupDialogPolicy::Interactive;
+    write_page_setup_dlg(&mut engine, 0x5000, 0, 0, 0x2); // PSD_MARGINS
+    write_regs(&mut engine, 0x5000, 0, 0, 0, 0);
+
+    let r = comdlg32::handle_page_setup_dlg_w(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("PageSetupDlgW must dispatch without a bridge");
+
+    assert_eq!(r.return_value, 0, "no bridge → cancel");
+    assert!(state.window_state().pending_native_page_setup.is_none());
+}
+
+/// `PSD_RETURNDEFAULT` with NULL handles: the handler allocates fresh
+/// DEVMODE/DEVNAMES blocks, writes the handles back into the `PAGESETUPDLG`,
+/// and returns FALSE (the documented query semantics — no panel).
+#[test]
+fn test_page_setup_dlg_return_default_allocates_and_writes_default_blocks() {
+    use crate::guest_layout::{DevModeW, PageSetupDlgW};
+    use crate::guest_memory::with_typed_read;
+
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    write_page_setup_dlg(&mut engine, 0x5000, 0, 0, 0x400); // PSD_RETURNDEFAULT
+    seed_test_heap_bump(&mut engine);
+    write_regs(&mut engine, 0x5000, 0, 0, 0, 0);
+
+    let r = comdlg32::handle_page_setup_dlg_w(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("PSD_RETURNDEFAULT must dispatch");
+
+    assert_eq!(r.return_value, 0, "PSD_RETURNDEFAULT returns FALSE");
+
+    let psd = with_typed_read::<PageSetupDlgW, _, _>(&mut engine, 0x5000, |psd| Ok(*psd))
+        .expect("read PAGESETUPDLG");
+    assert_ne!(psd.h_dev_mode, 0, "a fresh DEVMODE block was allocated");
+    assert_ne!(psd.h_dev_names, 0, "a fresh DEVNAMES block was allocated");
+
+    let dm = with_typed_read::<DevModeW, _, _>(&mut engine, psd.h_dev_mode, |dm| Ok(*dm))
+        .expect("read the default DEVMODE");
+    assert_eq!(dm.dm_size, 220, "a full DEVMODEW");
+    assert_eq!(dm.dm_copies, 1);
+    assert_eq!(dm.dm_orientation, 1, "portrait");
+}
+
+/// A bridge accept (hundredths-of-mm units): the pick's paper/orientation are
+/// written back — `ptPaperSize` in 100ths of mm, the DEVMODE in tenths of mm
+/// (the later `PrintDlgW` panel seeds from it) — while `rtMargin` passes
+/// through unchanged and fresh DEVMODE/DEVNAMES blocks are allocated.
+#[test]
+fn test_page_setup_dlg_bridge_accept_writes_back_paper_and_devmode() {
+    use crate::guest_layout::{DevModeW, PageSetupDlgW};
+    use crate::guest_memory::with_typed_read;
+
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    write_page_setup_dlg(&mut engine, 0x5000, 0, 0, 0x2); // PSD_MARGINS
+
+    let bridge: crate::PageSetupDialogBridge = Box::new(|request| {
+        // No input DEVMODE → the panel seeds from the letter defaults.
+        assert_eq!(request.paper_size_mm, (216, 279));
+        assert_eq!(request.orientation, 1, "portrait default");
+        Some(crate::PageSetupDialogPick {
+            paper_size_mm: (210, 297), // A4
+            orientation: 2,            // landscape
+        })
+    });
+
+    let r = dispatch_page_setup_dlg_with_bridge(&mut engine, &mut state, bridge)
+        .expect("bridge accept must succeed");
+    assert_eq!(r.return_value, 1, "an accepted pick → TRUE");
+
+    let psd = with_typed_read::<PageSetupDlgW, _, _>(&mut engine, 0x5000, |psd| Ok(*psd))
+        .expect("read PAGESETUPDLG");
+    assert_eq!(psd.pt_paper_size_x, 21000, "A4 width in 100ths of mm");
+    assert_eq!(psd.pt_paper_size_y, 29700, "A4 height in 100ths of mm");
+    assert_eq!(psd.rt_margin_left, 750, "rtMargin passes through unchanged");
+    assert_eq!(psd.rt_margin_top, 1000);
+    assert_eq!(psd.rt_margin_right, 750);
+    assert_eq!(psd.rt_margin_bottom, 1000);
+    assert_ne!(psd.h_dev_mode, 0, "a fresh DEVMODE block was allocated");
+    assert_ne!(psd.h_dev_names, 0, "a fresh DEVNAMES block was allocated");
+
+    let dm = with_typed_read::<DevModeW, _, _>(&mut engine, psd.h_dev_mode, |dm| Ok(*dm))
+        .expect("read the DEVMODE write-back");
+    assert_eq!(dm.dm_paper_width, 2100, "A4 width in tenths of mm");
+    assert_eq!(dm.dm_paper_length, 2970, "A4 length in tenths of mm");
+    assert_eq!(dm.dm_paper_size, 9, "DMPAPER_A4");
+    assert_eq!(dm.dm_orientation, 2, "the pick's landscape orientation");
+}
+
+/// `PSD_INTHOUSANDTHSOFINCHES` switches `ptPaperSize` to thousandths of an
+/// inch (the DEVMODE stays tenths of mm — wingdi.h always uses those).
+#[test]
+fn test_page_setup_dlg_bridge_accept_writes_thousandths_of_inches_when_flag_set() {
+    use crate::guest_layout::PageSetupDlgW;
+    use crate::guest_memory::with_typed_read;
+
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // PSD_MARGINS | PSD_INTHOUSANDTHSOFINCHES.
+    write_page_setup_dlg(&mut engine, 0x5000, 0, 0, 0x2 | 0x4);
+
+    let bridge: crate::PageSetupDialogBridge = Box::new(|_| {
+        Some(crate::PageSetupDialogPick {
+            paper_size_mm: (210, 297), // A4
+            orientation: 1,
+        })
+    });
+
+    let r = dispatch_page_setup_dlg_with_bridge(&mut engine, &mut state, bridge)
+        .expect("bridge accept must succeed");
+    assert_eq!(r.return_value, 1);
+
+    let psd = with_typed_read::<PageSetupDlgW, _, _>(&mut engine, 0x5000, |psd| Ok(*psd))
+        .expect("read PAGESETUPDLG");
+    // 210 mm = 8268 thousandths of an inch; 297 mm = 11693.
+    assert_eq!(psd.pt_paper_size_x, 8268);
+    assert_eq!(psd.pt_paper_size_y, 11693);
+}
+
+/// A bridge cancel (the user pressed Cancel on the panel): PageSetupDlgW
+/// returns FALSE and the PAGESETUPDLG stays untouched (ptPaperSize 0, the
+/// caller's handles unchanged, rtMargin as written).
+#[test]
+fn test_page_setup_dlg_bridge_cancel_returns_false_without_write_back() {
+    use crate::guest_layout::PageSetupDlgW;
+    use crate::guest_memory::with_typed_read;
+
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    write_page_setup_dlg(&mut engine, 0x5000, 0x6000, 0x6200, 0x2); // PSD_MARGINS
+
+    let bridge: crate::PageSetupDialogBridge = Box::new(|_| None);
+    let r = dispatch_page_setup_dlg_with_bridge(&mut engine, &mut state, bridge)
+        .expect("bridge cancel must dispatch");
+    assert_eq!(r.return_value, 0, "a canceled pick → FALSE");
+
+    let psd = with_typed_read::<PageSetupDlgW, _, _>(&mut engine, 0x5000, |psd| Ok(*psd))
+        .expect("read PAGESETUPDLG");
+    assert_eq!(psd.h_dev_mode, 0x6000, "the caller's DEVMODE handle stays");
+    assert_eq!(
+        psd.h_dev_names, 0x6200,
+        "the caller's DEVNAMES handle stays"
+    );
+    assert_eq!(psd.pt_paper_size_x, 0, "ptPaperSize untouched");
+    assert_eq!(psd.pt_paper_size_y, 0);
+    assert_eq!(psd.rt_margin_left, 750, "rtMargin untouched");
+}
+
+/// A guest input DEVMODE seeds the page-layout panel (the bridge sees
+/// A4/landscape from `dmPaperWidth`/`dmPaperLength`/`dmOrientation`) and the
+/// accept reuses the SAME block for the write-back.
+#[test]
+fn test_page_setup_dlg_bridge_seeds_from_guest_devmode_and_reuses_the_block() {
+    use crate::guest_layout::{DevModeW, PageSetupDlgW};
+    use crate::guest_memory::{with_typed_read, with_typed_write};
+
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // A guest DEVMODE: A4 landscape.
+    with_typed_write::<DevModeW, _, _>(&mut engine, 0x6000, |dm| {
+        dm.dm_size = 220;
+        dm.dm_paper_width = 2100;
+        dm.dm_paper_length = 2970;
+        dm.dm_paper_size = 9;
+        dm.dm_orientation = 2;
+        Ok(())
+    })
+    .expect("write input DEVMODE");
+    write_page_setup_dlg(&mut engine, 0x5000, 0x6000, 0, 0x2); // PSD_MARGINS
+
+    let seed = Arc::new(Mutex::new(None));
+    let seed_capture = Arc::clone(&seed);
+    let bridge: crate::PageSetupDialogBridge = Box::new(move |request| {
+        *seed_capture.lock().expect("seed capture lock") =
+            Some((request.paper_size_mm, request.orientation));
+        Some(crate::PageSetupDialogPick {
+            paper_size_mm: request.paper_size_mm,
+            orientation: request.orientation,
+        })
+    });
+
+    let r = dispatch_page_setup_dlg_with_bridge(&mut engine, &mut state, bridge)
+        .expect("bridge accept must succeed");
+    assert_eq!(r.return_value, 1);
+    let (paper, orientation) = seed
+        .lock()
+        .expect("seed capture lock")
+        .expect("the bridge saw a request");
+    assert_eq!(paper, (210, 297), "the guest DEVMODE seeds the paper");
+    assert_eq!(orientation, 2, "the guest DEVMODE seeds the orientation");
+
+    let psd = with_typed_read::<PageSetupDlgW, _, _>(&mut engine, 0x5000, |psd| Ok(*psd))
+        .expect("read PAGESETUPDLG");
+    assert_eq!(
+        psd.h_dev_mode, 0x6000,
+        "the guest's DEVMODE block is reused"
+    );
+    let dm = with_typed_read::<DevModeW, _, _>(&mut engine, 0x6000, |dm| Ok(*dm))
+        .expect("read the rewritten DEVMODE");
+    assert_eq!(dm.dm_orientation, 2, "the round-trip keeps the orientation");
+    assert_eq!(dm.dm_paper_width, 2100);
+}
+
 // --- Comctl32 ---
 
 #[test]

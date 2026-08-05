@@ -8,11 +8,21 @@
 //! pick's paper/orientation/copies seed the DEVMODE and the print job, so the
 //! emulated print output matches what the user chose.
 //!
+//! `PageSetupDlgW` (comdlg32) gets the same treatment: under
+//! [`wie_winapi::PageSetupDialogPolicy::Interactive`] the handler runs the
+//! native macOS page-layout panel (NSPageLayout — the OS-equivalent of
+//! Windows' Page Setup dialog) through a second bridge registered here, then
+//! writes the pick's paper/orientation back into the guest `PAGESETUPDLG`
+//! (`ptPaperSize` / `hDevMode` / `hDevNames`). The settings reach the later
+//! `PrintDlgW` panel through the guest DEVMODE (the guest stores the handle,
+//! the print handler seeds from it) — no host-side carrier needed.
+//!
 //! This module is the GUI integration point: it enables the interactive
-//! policy on the runtime session so [`super::app::run_gui_windowed`] shows the
-//! panel exactly when a real window is on screen, and — on macOS — registers
-//! the native bridge. Headless runs and `trace` keep the default
-//! [`wie_winapi::PrintDialogPolicy::Cancel`] policy and never open a panel.
+//! policies on the runtime session so [`super::app::run_gui_windowed`] shows
+//! the panels exactly when a real window is on screen, and — on macOS —
+//! registers the native bridges. Headless runs and `trace` keep the default
+//! [`wie_winapi::PrintDialogPolicy::Cancel`] / [`wie_winapi::PageSetupDialogPolicy::Cancel`]
+//! policies and never open a panel.
 //!
 //! The bridge also maintains the session-scoped NSPrintInfo id-table: the
 //! handler assigns each `PrintDlgW` call an id ([`wie_winapi::PrintDialogRequest::print_info_id`]),
@@ -230,6 +240,115 @@ fn show_native_print_dialog(
             table.insert(request.print_info_id, PrintInfoEntry(updated));
         }
         Some(pick)
+    })
+}
+
+/// Enable interactive page-setup dialogs on a GUI session.
+///
+/// `PageSetupDlgW` then runs the native page-layout panel (when the bridge is
+/// registered) instead of returning a scripted policy answer. Must run before
+/// the guest executes — call it right after the session is created, before
+/// `run_windowed`.
+#[cfg(target_os = "macos")]
+pub fn enable_interactive_page_setup_dialogs(session: &mut RuntimeSession) {
+    session.set_page_setup_dialog_policy(wie_winapi::PageSetupDialogPolicy::Interactive);
+}
+
+/// Non-macOS builds have no native page-layout panel: keep the default Cancel
+/// policy, so `PageSetupDlgW` returns FALSE exactly like a user canceling.
+#[cfg(not(target_os = "macos"))]
+pub fn enable_interactive_page_setup_dialogs(_session: &mut RuntimeSession) {}
+
+/// Register the native macOS page-setup bridge on a GUI session.
+///
+/// With a bridge registered, `PageSetupDlgW` under
+/// [`wie_winapi::PageSetupDialogPolicy::Interactive`] shows a real
+/// NSPageLayout panel: the guest thread blocks inside the bridge until the
+/// user dismisses it (dialog semantics, the same seam as the print-panel
+/// bridge), then the handler writes the pick back into the `PAGESETUPDLG`.
+/// The panel shares NO id-table with the print panel — the pick's settings
+/// travel to the later `PrintDlgW` panel through the guest DEVMODE, which the
+/// handler writes. Sessions that never register a bridge keep the default
+/// Cancel (headless runs, `trace`).
+#[cfg(target_os = "macos")]
+pub fn register_native_page_setup_dialog_bridge(handle: &wie_runtime::GuestHandle) {
+    handle.set_page_setup_dialog_bridge(Box::new(show_native_page_setup_dialog));
+}
+
+/// Show one native page-layout panel from the page-setup bridge callback.
+///
+/// Runs on the guest thread; [`objc2_foundation::run_on_main`] dispatches the
+/// panel to the main thread's runloop (where AppKit's modal `runModal` is
+/// valid) and blocks until the user dismisses it. NSPageLayout edits paper
+/// size + orientation only — the margins have no panel control, so the guest
+/// `rtMargin` passes through unchanged (the documented deviation). The
+/// returned plain-data pick is written back into the guest `PAGESETUPDLG`.
+#[cfg(target_os = "macos")]
+#[expect(unsafe_code)]
+fn show_native_page_setup_dialog(
+    request: &wie_winapi::PageSetupDialogRequest,
+) -> Option<wie_winapi::PageSetupDialogPick> {
+    use objc2::ClassType;
+    use objc2_app_kit::{NSPageLayout, NSPageLayoutResult, NSPaperOrientation, NSPrintInfo};
+    use objc2_foundation::{NSSize, run_on_main};
+
+    run_on_main(|mtm| {
+        // A fresh NSPrintInfo per call — never the sharedPrintInfo singleton,
+        // so one session's settings cannot leak into the next.
+        // SAFETY: init: initializes the allocated object (the standard
+        // alloc/init pair; the object is owned by the returned Retained).
+        let print_info = unsafe { NSPrintInfo::init(NSPrintInfo::alloc()) };
+        let (width_mm, height_mm) = request.paper_size_mm;
+        // SAFETY: the two setters are plain property setters on the owned
+        // object (the NSPrintInfo seed — paper size + orientation).
+        unsafe {
+            print_info.setPaperSize(NSSize::new(
+                f64::from(width_mm) * POINTS_PER_MM,
+                f64::from(height_mm) * POINTS_PER_MM,
+            ));
+            print_info.setOrientation(if request.orientation == 2 {
+                NSPaperOrientation::Landscape
+            } else {
+                NSPaperOrientation::Portrait
+            });
+        }
+
+        // SAFETY: pageLayout: is the standard AppKit constructor (the panel
+        // is created on the main thread, which the marker proves).
+        let layout = unsafe { NSPageLayout::pageLayout(mtm) };
+        // SAFETY: runModalWithPrintInfo: is the standard AppKit modal page
+        // layout call; it blocks on the main runloop until the user dismisses
+        // the panel and mutates the passed NSPrintInfo with the choices.
+        let result = unsafe { layout.runModalWithPrintInfo(&print_info) };
+        if result != NSPageLayoutResult::Changed.0 {
+            return None;
+        }
+
+        // SAFETY: printInfo: returns the NSPrintInfo the panel was run with
+        // (the authoritative post-run settings); paperSize:/orientation: are
+        // plain property getters on it.
+        let updated = unsafe { layout.printInfo() }?;
+        let size = unsafe { updated.paperSize() };
+        let orientation = unsafe { updated.orientation() };
+        let width_mm = (size.width / POINTS_PER_MM).round().max(1.0) as u32;
+        let height_mm = (size.height / POINTS_PER_MM).round().max(1.0) as u32;
+        // Landscape swaps the reported paper dimensions on some systems;
+        // normalize so width ≤ height like the DEVMODE convention.
+        let paper_size_mm = if orientation == NSPaperOrientation::Landscape && width_mm < height_mm
+        {
+            (height_mm, width_mm)
+        } else {
+            (width_mm, height_mm)
+        };
+
+        Some(wie_winapi::PageSetupDialogPick {
+            paper_size_mm,
+            orientation: if orientation == NSPaperOrientation::Landscape {
+                2
+            } else {
+                1
+            },
+        })
     })
 }
 

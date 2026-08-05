@@ -465,6 +465,24 @@ impl GuestHandle {
         }
     }
 
+    /// Set the host page-setup bridge — called by the `PageSetupDlgW` handler
+    /// (under [`wie_winapi::PageSetupDialogPolicy::Interactive`]) with the
+    /// request seeded from the guest's `PAGESETUPDLG`/DEVMODE; the returned
+    /// pick's paper/orientation are written back into the guest
+    /// `PAGESETUPDLG`.
+    ///
+    /// Mirrors [`Self::set_print_dialog_bridge`]: the GUI presenter registers
+    /// the native-panel callback (macOS NSPageLayout) here once at startup,
+    /// and the guest thread invokes it from the handler. The callback blocks
+    /// until the user picks (the guest thread parks inside the handler),
+    /// which is dialog semantics. When no bridge is registered the handler
+    /// cancels, so headless runs and `trace` never hang.
+    pub fn set_page_setup_dialog_bridge(&self, cb: wie_winapi::PageSetupDialogBridge) {
+        if let Ok(mut state) = self.state.lock() {
+            state.window_state().page_setup_dialog_bridge = Some(cb);
+        }
+    }
+
     /// Set the host print-operation bridge — called by the gdi32 `EndDoc`
     /// handler (with the completed [`wie_winapi::PrintJobRequest`], pages
     /// moved in) to run the native print pipeline (macOS NSPrintOperation);

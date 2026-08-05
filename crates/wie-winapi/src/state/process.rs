@@ -298,6 +298,30 @@ pub enum PrintDialogPolicy {
     Interactive,
 }
 
+/// Host-side decision for `PageSetupDlgW`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PageSetupDialogPolicy {
+    #[default]
+    /// Simulate the user cancelling the dialog (`return FALSE`).
+    ///
+    /// No `ptPaperSize` / `hDevMode` / `hDevNames` write-back happens (the
+    /// `PAGESETUPDLG` struct is untouched), exactly like a user pressing
+    /// Cancel on the real dialog. Headless runs and `trace` keep this default
+    /// so a guest can never hang on a page-layout panel nobody can click.
+    Cancel,
+
+    /// Show the host page-setup dialog.
+    ///
+    /// `PageSetupDlgW` returns
+    /// [`crate::WinApiControlSignal::PageSetupBridgeRequested`] and the
+    /// runtime runs the registered [`crate::PageSetupDialogBridge`] (the
+    /// native macOS NSPageLayout panel, registered by the GUI presenter) on
+    /// the guest thread; the re-entry writes `ptPaperSize` / `hDevMode` /
+    /// `hDevNames` back into the guest `PAGESETUPDLG`. When no bridge is
+    /// registered the handler cancels (a guest must never hang).
+    Interactive,
+}
+
 /// One host file exposed to the guest under one or more Windows paths.
 #[derive(Debug, Clone)]
 pub struct HostFileMount {

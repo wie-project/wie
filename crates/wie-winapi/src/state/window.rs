@@ -5,7 +5,9 @@ use crate::vfs;
 use ahash::HashMapExt;
 
 use super::input::KeyboardState;
-use super::process::{FileDialogPolicy, FontDialogPolicy, PrintDialogPolicy};
+use super::process::{
+    FileDialogPolicy, FontDialogPolicy, PageSetupDialogPolicy, PrintDialogPolicy,
+};
 
 /// A parsed `OPENFILENAME.lpstrFilter` group: a display name and its extension
 /// globs (`"Text Documents"` → `["*.txt"]`).
@@ -144,6 +146,33 @@ pub struct PendingNativePrintDialog {
     pub pick: Option<PrintDialogPick>,
 }
 
+/// One in-flight NATIVE (host-panel) page-setup dialog.
+///
+/// The `PageSetupDlgW` handler records this on its first entry (state lock
+/// held) and returns [`WinApiControlSignal::PageSetupBridgeRequested`]; the
+/// runtime then runs the bridge WITHOUT the shared lock (the winit event loop
+/// needs that lock while the panel is up — holding it across the modal
+/// session deadlocks into the beachball) and stores the pick back here. The
+/// engine re-executes the fake API, the handler re-enters, takes this record,
+/// and writes the pick back into the guest `PAGESETUPDLG`.
+#[derive(Debug, Clone)]
+pub struct PendingNativePageSetup {
+    /// Guest VA of the `PAGESETUPDLG` structure.
+    pub page_setup_dlg_ptr: u64,
+    /// The input `PAGESETUPDLG.hDevMode` (`HGLOBAL` — a guest VA under the
+    /// GMEM_FIXED semantics; 0 = none, the DEVMODE is then freshly allocated).
+    pub h_dev_mode_in: u64,
+    /// The input `PAGESETUPDLG.hDevNames` (0 = none, the DEVNAMES is freshly
+    /// allocated).
+    pub h_dev_names_in: u64,
+    /// The `PAGESETUPDLG.Flags` word verbatim (the re-entry uses it for the
+    /// `ptPaperSize` unit conversion — `PSD_INTHOUSANDTHSOFINCHES`).
+    pub flags: u32,
+    /// The bridge's pick (the runtime records it; `None` = user cancelled or
+    /// the bridge vanished mid-call).
+    pub pick: Option<PageSetupDialogPick>,
+}
+
 /// Host file-dialog callback: `(request) → pick, or `None` (user cancelled)`.
 ///
 /// Registered by the GUI presenter via `GuestHandle::set_file_dialog_bridge`;
@@ -205,6 +234,49 @@ pub struct PrintDialogPick {
 /// blocks until the native panel closes (dialog semantics — the same seam as
 /// the file-dialog and MessageBox bridges).
 pub type PrintDialogBridge = Box<dyn Fn(&PrintDialogRequest) -> Option<PrintDialogPick> + Send>;
+
+/// One host page-setup invocation: everything the native page-layout panel
+/// starts from.
+///
+/// Built by the comdlg32 `PageSetupDlgW` handler from the guest `PAGESETUPDLG` +
+/// DEVMODE; consumed by the host bridge registered via
+/// `GuestHandle::set_page_setup_dialog_bridge`.
+#[derive(Debug, Clone, Copy)]
+pub struct PageSetupDialogRequest {
+    /// The initial paper size in millimetres — from the guest DEVMODE
+    /// (`dmPaperWidth`/`dmPaperLength`) or the US Letter default when the
+    /// guest passed no DEVMODE.
+    pub paper_size_mm: (u32, u32),
+    /// The initial `dmOrientation` value (1 = `DMORIENT_PORTRAIT`,
+    /// 2 = `DMORIENT_LANDSCAPE`); 0 when the guest passed no DEVMODE.
+    pub orientation: u16,
+}
+
+/// The native page-layout panel's pick: the paper/orientation the user chose.
+///
+/// Plain data so the bridge never leaks AppKit types into this crate. The
+/// margins are NOT part of the pick — NSPageLayout has no margin UI, so
+/// `rtMargin` passes through unchanged (the documented deviation). The
+/// settings reach the LATER `PrintDlgW` panel through the guest DEVMODE: the
+/// handler writes this pick into `hDevMode`, the guest stores the handle, and
+/// `PrintDlgW` seeds its panel from that DEVMODE — the same chain as real
+/// Windows, so no host-side id-table is involved here.
+#[derive(Debug, Clone, Copy)]
+pub struct PageSetupDialogPick {
+    /// Paper size in millimetres (`width`, `height`).
+    pub paper_size_mm: (u32, u32),
+    /// The `dmOrientation` value (1 = portrait, 2 = landscape).
+    pub orientation: u16,
+}
+
+/// Host page-setup callback: `(request) → pick, or `None` (user cancelled)`.
+///
+/// Registered by the GUI presenter via `GuestHandle::set_page_setup_dialog_bridge`;
+/// invoked by the comdlg32 `PageSetupDlgW` handler on the guest thread, which
+/// blocks until the native panel closes (dialog semantics — the same seam as
+/// the print-dialog and file-dialog bridges).
+pub type PageSetupDialogBridge =
+    Box<dyn Fn(&PageSetupDialogRequest) -> Option<PageSetupDialogPick> + Send>;
 
 /// A completed print document handed to the host for NATIVE printing.
 ///
@@ -490,6 +562,21 @@ pub struct WindowState {
     /// In-flight native print dialog: the guest is parked in `PrintDlgW`
     /// while the host panel is up. See [`PendingNativePrintDialog`].
     pub pending_native_print_dialog: Option<PendingNativePrintDialog>,
+    /// Host-side decision for `PageSetupDlgW` (Interactive shows the host
+    /// page-layout panel via the bridge; Cancel returns FALSE without one).
+    pub page_setup_dialog_policy: PageSetupDialogPolicy,
+    /// Optional host native page-setup bridge, registered by the GUI
+    /// presenter via `GuestHandle::set_page_setup_dialog_bridge`.
+    ///
+    /// When set, `PageSetupDlgW` under [`PageSetupDialogPolicy::Interactive`]
+    /// calls it with the request (seeded from the guest DEVMODE) and writes
+    /// its pick back into the `PAGESETUPDLG` (`ptPaperSize` / `hDevMode` /
+    /// `hDevNames`). When unset the handler cancels, so headless runs and
+    /// `trace` never see a native panel. Mirrors the print-dialog bridge seam.
+    pub page_setup_dialog_bridge: Option<PageSetupDialogBridge>,
+    /// In-flight native page-setup dialog: the guest is parked in
+    /// `PageSetupDlgW` while the host panel is up. See [`PendingNativePageSetup`].
+    pub pending_native_page_setup: Option<PendingNativePageSetup>,
     /// Optional host native print-operation bridge, registered by the GUI
     /// presenter via `GuestHandle::set_print_job_bridge`.
     ///
@@ -591,6 +678,9 @@ impl Default for WindowState {
             print_dialog_policy: PrintDialogPolicy::default(),
             print_dialog_bridge: None,
             pending_native_print_dialog: None,
+            page_setup_dialog_policy: PageSetupDialogPolicy::default(),
+            page_setup_dialog_bridge: None,
+            pending_native_page_setup: None,
             print_job_bridge: None,
             pending_native_print_job: None,
             next_print_info_id: 1,
@@ -1015,6 +1105,19 @@ pub enum WinApiControlSignal {
     PrintDialogBridgeRequested {
         /// Everything the native panel starts from.
         request: PrintDialogRequest,
+    },
+
+    /// `PageSetupDlgW` wants the host page-layout panel shown.
+    ///
+    /// The runtime drops the shared state lock for the whole panel session
+    /// (the winit event loop needs that lock to service frame events while
+    /// the panel is up) and runs the registered [`PageSetupDialogBridge`] on
+    /// the guest thread, then the handler's re-entry writes the pick back into
+    /// the guest `PAGESETUPDLG`.
+    #[error("host page-setup dialog bridge requested")]
+    PageSetupBridgeRequested {
+        /// Everything the native panel starts from.
+        request: PageSetupDialogRequest,
     },
 
     /// `EndDoc` wants the host native print operation run.

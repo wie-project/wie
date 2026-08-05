@@ -54,6 +54,24 @@ pub(crate) fn open_or_create_guest_path(
 
     let bottle_host =
         crate::vfs::guest_path_to_host(&state.file_io.volumes, &full_path).map(|m| m.host);
+
+    // The dialog-accept chain hands the guest a `Z:\pick{N}\{name}` path; log
+    // the entry and its mount resolution so a repro shows whether the mount
+    // lookup itself failed (a `mount_resolved_to = None` here is the
+    // open-side failure). Paths on every other drive are uninteresting.
+    let is_pick_mount = full_path
+        .chars()
+        .next()
+        .is_some_and(|drive| drive.eq_ignore_ascii_case(&crate::vfs::pick_mount::PICK_DRIVE))
+        && full_path.get(1..2) == Some(":");
+    if is_pick_mount {
+        tracing::info!(
+            guest_path = %full_path,
+            mount_resolved_to = ?bottle_host,
+            "CreateFile on a pick-mount path"
+        );
+    }
+
     let existed = guest_path_exists(state, &full_path);
 
     match creation_disposition {
@@ -179,6 +197,19 @@ pub(crate) fn ensure_virtual_file(state: &mut WinApiState, guest_path: &str) {
     });
 }
 pub(crate) fn resolve_guest_file_bytes(state: &WinApiState, guest_path: &str) -> Result<Vec<u8>> {
+    let resolved = resolve_guest_file_bytes_inner(state, guest_path);
+    // One log line per successful resolution (the caller's guest_path already
+    // shows which file): the byte count pins whether the read succeeded and
+    // how much the guest is about to see.
+    if let Ok(bytes) = &resolved {
+        tracing::info!(guest_path, bytes = bytes.len(), "resolved guest file bytes");
+    }
+    resolved
+}
+
+/// The resolution itself — split out so the success log lives at ONE tail
+/// point instead of at every return site.
+fn resolve_guest_file_bytes_inner(state: &WinApiState, guest_path: &str) -> Result<Vec<u8>> {
     if is_main_module_path(state, guest_path) {
         return Ok((*state.file_io.executable_file_bytes).clone());
     }

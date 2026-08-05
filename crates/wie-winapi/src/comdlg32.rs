@@ -1,7 +1,9 @@
 //! Common dialog stubs (`comdlg32.dll`) for open/save file simulation.
 
 use crate::gdi32::{paper_tenths_mm_to_mm, paper_tenths_mm_to_px};
-use crate::guest_layout::{ChooseFontW, DevModeW, FindReplace, LogFontW, OpenFileName, PrintDlgW};
+use crate::guest_layout::{
+    ChooseFontW, DevModeW, FindReplace, LogFontW, OpenFileName, PageSetupDlgW, PrintDlgW,
+};
 use crate::guest_memory::{
     checked_field_address, read_i32 as read_guest_i32, read_u32 as read_guest_u32,
     read_u64 as read_guest_u64, with_typed_read, with_typed_write,
@@ -12,7 +14,8 @@ use crate::guest_string::{
 use crate::handles::Hwnd;
 use crate::state::{
     FileDialogFilter, FileDialogRequest, FileDialogSession, FindDialogSession, FontDialogSession,
-    PendingNativeFileDialog, PendingNativePrintDialog, PrintDialogPick, PrintDialogRequest,
+    PageSetupDialogRequest, PendingNativeFileDialog, PendingNativePageSetup,
+    PendingNativePrintDialog, PrintDialogPick, PrintDialogRequest,
 };
 use crate::user32::controls::{ControlClassKind, ControlState};
 use crate::user32::{
@@ -23,8 +26,8 @@ use crate::user32::{
 };
 use crate::vfs::VolumeConfig;
 use crate::{
-    FileDialogPolicy, FontDialogPolicy, HandlerContext, OuterReturn, PrintDialogPolicy,
-    WinApiHandlerResult, WinApiState,
+    FileDialogPolicy, FontDialogPolicy, HandlerContext, OuterReturn, PageSetupDialogPolicy,
+    PrintDialogPolicy, WinApiHandlerResult, WinApiState,
 };
 use anyhow::{Context, Result};
 
@@ -741,23 +744,271 @@ fn print_dialog_return(
     })
 }
 
-/// Handles `comdlg32.dll!PageSetupDlgW` — simulated user-cancel.
+/// `PAGESETUPDLG.Flags`: query the defaults without showing a dialog.
+const PSD_RETURNDEFAULT: u32 = 0x0000_0400;
+/// `PAGESETUPDLG.Flags`: `ptPaperSize`/`rtMargin` are in thousandths of an
+/// inch; without it they are in hundredths of a millimetre.
+const PSD_INTHOUSANDTHSOFINCHES: u32 = 0x0000_0004;
+
+/// Handles `comdlg32.dll!PageSetupDlgW` — the interactive host page-setup
+/// dialog.
 ///
-/// Like [`handle_print_dlg_w`], real page setup is out of scope: return FALSE
-/// (canceled). RNotepad's `DIALOG_FilePageSetup` ignores the return value and
-/// only copies `hDevMode`/`hDevNames` back out of the struct (both unchanged
-/// here), so the call is a clean no-op.
+/// Reads the guest `PAGESETUPDLG` (the typed view in `guest_layout`),
+/// dispatches on `Flags` and [`PageSetupDialogPolicy`]:
+///
+/// - `PSD_RETURNDEFAULT` — fill the caller's `hDevMode`/`hDevNames` blocks
+///   with the host defaults (allocating fresh blocks when the handles are
+///   NULL) and return FALSE. No panel is shown.
+/// - Under [`PageSetupDialogPolicy::Interactive`] with a registered
+///   page-setup bridge the handler runs the native panel (macOS NSPageLayout)
+///   through the two-entry bridge flow (see [`open_native_page_setup_dialog`]);
+///   on accept the re-entry writes `ptPaperSize`, `hDevMode`, and `hDevNames`
+///   back into the `PAGESETUPDLG`. `rtMargin` passes through unchanged — the
+///   documented deviation: NSPageLayout has no margin UI, so the guest's
+///   margins survive the dialog. Under `Cancel` (or without a bridge) it
+///   returns FALSE exactly like a user canceling.
+/// - Anything else — no panel requested by policy: return FALSE.
+///
+/// The custom page-setup template and hook (`lpPageSetupTemplateName` /
+/// `lpfnPageSetupHook` / `lpfnPagePaintHook`) are ignored — WIE renders no
+/// guest dialog templates, so the header/footer strings are not editable
+/// in-session (the second documented deviation). `hDevMode`/`hDevNames` are
+/// the GMEM_FIXED kind of handle — the handle value IS the block address, so
+/// the handler reads and writes them directly.
 pub fn handle_page_setup_dlg_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    state_comm_dlg_none(&mut *ctx.state);
-    tracing::info!(target: "wiegui", "PageSetupDlgW: page setup is not emulated; cancelling");
-    let return_address = engine
-        .return_from_win64_api(0)
-        .context("failed to return from PageSetupDlgW")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 0,
+    let state = &mut *ctx.state;
+    let psd_ptr = engine
+        .read_rcx()
+        .context("failed to read RCX for PageSetupDlgW")?;
+
+    if psd_ptr == 0 {
+        state_comm_dlg_none(state);
+        return print_dialog_return(engine, 0);
+    }
+
+    // Re-entry: the native panel ran; take the pending record and write its
+    // pick back into the guest PAGESETUPDLG.
+    if let Some(pending) = state.window_state().pending_native_page_setup.take() {
+        return finish_native_page_setup(engine, state, pending);
+    }
+
+    let psd = with_typed_read::<PageSetupDlgW, _, _>(engine, psd_ptr, |psd| Ok(*psd))
+        .context("failed to read PAGESETUPDLG for PageSetupDlgW")?;
+    let flags = psd.flags;
+
+    // PSD_RETURNDEFAULT is a query, not a dialog: fill the caller's blocks
+    // with the default device mode/names and return FALSE (documented).
+    if flags & PSD_RETURNDEFAULT != 0 {
+        return handle_page_setup_return_default(engine, state, psd_ptr, &psd);
+    }
+
+    // Clone the policy to avoid borrowing window_state() across the match.
+    let policy = state.window_state().page_setup_dialog_policy.clone();
+    match policy {
+        PageSetupDialogPolicy::Cancel => {
+            state_comm_dlg_none(state);
+            tracing::debug!("PageSetupDlgW cancelled by policy");
+            print_dialog_return(engine, 0)
+        }
+        PageSetupDialogPolicy::Interactive => {
+            let bridge_registered = state
+                .try_window_state()
+                .is_some_and(|window_state| window_state.page_setup_dialog_bridge.is_some());
+            if !bridge_registered {
+                // Without a bridge (headless/trace sessions) a guest must
+                // never hang on a panel nobody can click.
+                state_comm_dlg_none(state);
+                tracing::warn!("PageSetupDlgW interactive but no page-setup bridge; cancelling");
+                return print_dialog_return(engine, 0);
+            }
+            open_native_page_setup_dialog(ctx, psd_ptr, &psd)
+        }
+    }
+}
+
+/// `PSD_RETURNDEFAULT`: fill the guest's `hDevMode`/`hDevNames` blocks with
+/// the host defaults and return FALSE (no panel — the documented query
+/// semantics).
+///
+/// A NULL handle means "give me a freshly allocated default block": the block
+/// is allocated from the guest heap and the handle written back into the
+/// `PAGESETUPDLG`. A non-NULL handle is used as the caller-provided buffer
+/// (the GMEM_FIXED handle IS the block address).
+fn handle_page_setup_return_default(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+    psd_ptr: u64,
+    psd: &PageSetupDlgW,
+) -> Result<WinApiHandlerResult> {
+    let mut updated = *psd;
+    let default_pick = None;
+
+    let dev_mode_va = write_print_dev_mode(engine, state, psd.h_dev_mode, default_pick)?;
+    if dev_mode_va != 0 {
+        updated.h_dev_mode = dev_mode_va;
+    }
+    let dev_names_va = write_print_dev_names(engine, state, psd.h_dev_names)?;
+    if dev_names_va != 0 {
+        updated.h_dev_names = dev_names_va;
+    }
+    if dev_mode_va == 0 || dev_names_va == 0 {
+        state_comm_dlg_none(state);
+        tracing::warn!("PageSetupDlgW PSD_RETURNDEFAULT: allocation failed; cancelling");
+        return print_dialog_return(engine, 0);
+    }
+
+    with_typed_write::<PageSetupDlgW, _, _>(engine, psd_ptr, |view| {
+        *view = updated;
+        Ok(())
     })
+    .context("failed to write PAGESETUPDLG handles back for PSD_RETURNDEFAULT")?;
+
+    state_comm_dlg_none(state);
+    tracing::debug!("PageSetupDlgW PSD_RETURNDEFAULT: default DEVMODE/DEVNAMES written");
+    print_dialog_return(engine, 0)
+}
+
+/// `PageSetupDialogPolicy::Interactive` with a host bridge registered: show
+/// the native page-layout panel (macOS NSPageLayout behind the
+/// `GuestHandle::set_page_setup_dialog_bridge` seam) and write its pick back.
+///
+/// The handler runs in TWO entries, split around the bridge, exactly like the
+/// print panel (see [`open_native_print_dialog`]):
+///
+/// - **First entry** (state lock held): read the guest's `PAGESETUPDLG` +
+///   DEVMODE, record everything the write-back needs in
+///   [`PendingNativePageSetup`], and return
+///   [`WinApiControlSignal::PageSetupBridgeRequested`]. The runtime then
+///   DROPS the shared state lock and runs the bridge on the guest thread —
+///   the native panel blocks the main thread for the whole session, and the
+///   winit event loop needs the SAME lock to service frame/user events while
+///   the panel is up, so holding it across the bridge would deadlock into the
+///   macOS beachball.
+/// - **Re-entry** (the engine re-executes the fake API after the bridge
+///   returns): take the pending record, write `ptPaperSize` / `hDevMode` /
+///   `hDevNames` back into the guest `PAGESETUPDLG`, and return TRUE.
+fn open_native_page_setup_dialog(
+    ctx: &mut HandlerContext<'_>,
+    psd_ptr: u64,
+    psd: &PageSetupDlgW,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+
+    // Seed the panel from the guest DEVMODE (when one was passed): paper size
+    // and orientation. The margins have no panel control — rtMargin is only
+    // read back unchanged.
+    let seed = read_print_dev_mode_seed(engine, psd.h_dev_mode);
+    let (paper_size_mm, orientation, _, _) = dev_mode_seed_ui(seed.as_ref());
+
+    let request = PageSetupDialogRequest {
+        paper_size_mm,
+        orientation,
+    };
+
+    state.window_state().pending_native_page_setup = Some(PendingNativePageSetup {
+        page_setup_dlg_ptr: psd_ptr,
+        h_dev_mode_in: psd.h_dev_mode,
+        h_dev_names_in: psd.h_dev_names,
+        flags: psd.flags,
+        pick: None,
+    });
+
+    tracing::info!(
+        target: "wiegui",
+        paper_mm = ?paper_size_mm,
+        orientation,
+        "PageSetupDlgW: native page-layout panel requested"
+    );
+
+    Err(WinApiControlSignal::PageSetupBridgeRequested { request }.into())
+}
+
+/// Write the native panel's pick back into the guest `PAGESETUPDLG`.
+///
+/// Runs on the handler's re-entry (after the runtime ran the bridge WITHOUT
+/// the shared state lock). `None` pick = the user cancelled (or the bridge
+/// vanished mid-call — a racing teardown must not hang the guest): return
+/// FALSE with the struct untouched. On accept, write the DEVMODE (paper +
+/// orientation — the later `PrintDlgW` panel seeds from it) and DEVNAMES into
+/// the guest's original blocks or freshly allocated ones, and write
+/// `ptPaperSize` / `hDevMode` / `hDevNames` back. `rtMargin` and everything
+/// else passes through unchanged (the deviations: no margin UI, no guest
+/// template/hook).
+fn finish_native_page_setup(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+    pending: PendingNativePageSetup,
+) -> Result<WinApiHandlerResult> {
+    let Some(pick) = pending.pick else {
+        state_comm_dlg_none(state);
+        tracing::info!("native page-setup dialog cancelled");
+        return print_dialog_return(engine, 0);
+    };
+
+    // The DEVMODE/DEVNAMES round-trip (the same helpers the print panel
+    // uses): the pick's paper/orientation land in the guest DEVMODE so the
+    // LATER PrintDlgW panel seeds from them (the guest stores the handle).
+    let print_pick = PrintDialogPick {
+        paper_size_mm: pick.paper_size_mm,
+        orientation: pick.orientation,
+        copies: 1,
+        color: u16::try_from(DMCOLOR_COLOR).unwrap_or(2),
+        print_info_id: 0,
+    };
+    let dev_mode_va =
+        write_print_dev_mode(engine, state, pending.h_dev_mode_in, Some(&print_pick))?;
+    let dev_names_va = write_print_dev_names(engine, state, pending.h_dev_names_in)?;
+    if dev_mode_va == 0 || dev_names_va == 0 {
+        state_comm_dlg_none(state);
+        tracing::warn!("PageSetupDlgW: DEVMODE/DEVNAMES allocation failed; cancelling");
+        return print_dialog_return(engine, 0);
+    }
+
+    // Snapshot the PAGESETUPDLG, edit the write-back fields (ptPaperSize in
+    // the units the flags request, the hDevMode/hDevNames handles), write it
+    // back untouched otherwise — the MENUITEMINFO pattern (two shared-lock
+    // borrows).
+    let mut psd =
+        with_typed_read::<PageSetupDlgW, _, _>(engine, pending.page_setup_dlg_ptr, |psd| Ok(*psd))
+            .context("failed to read PAGESETUPDLG on PageSetupDlgW re-entry")?;
+    let (width_tenths_mm, height_tenths_mm) =
+        paper_size_in_dialog_units(pending.flags, pick.paper_size_mm);
+    psd.pt_paper_size_x = i32::try_from(width_tenths_mm).unwrap_or(0);
+    psd.pt_paper_size_y = i32::try_from(height_tenths_mm).unwrap_or(0);
+    psd.h_dev_mode = dev_mode_va;
+    psd.h_dev_names = dev_names_va;
+    with_typed_write::<PageSetupDlgW, _, _>(engine, pending.page_setup_dlg_ptr, |view| {
+        *view = psd;
+        Ok(())
+    })
+    .context("failed to write PAGESETUPDLG back for PageSetupDlgW")?;
+
+    state_comm_dlg_none(state);
+    tracing::info!(
+        target: "wiegui",
+        paper_mm = ?pick.paper_size_mm,
+        orientation = pick.orientation,
+        "PageSetupDlgW accepted; paper/orientation written back"
+    );
+
+    print_dialog_return(engine, 1)
+}
+
+/// The paper size in the units `PAGESETUPDLG.ptPaperSize` uses: hundredths of
+/// a millimetre, or thousandths of an inch when `PSD_INTHOUSANDTHSOFINCHES`
+/// is set (commdlg.h). Returns `(width, height)`.
+fn paper_size_in_dialog_units(flags: u32, paper_mm: (u32, u32)) -> (u32, u32) {
+    let (width_mm, height_mm) = paper_mm;
+    if flags & PSD_INTHOUSANDTHSOFINCHES != 0 {
+        // 1 inch = 25.4 mm = 1000 thousandths of an inch; pure integer math
+        // (×10000/254 = ×(1000/25.4) scaled, +127 rounds half-up).
+        let to_thousandths = |mm: u32| mm.saturating_mul(10_000).saturating_add(127) / 254;
+        (to_thousandths(width_mm), to_thousandths(height_mm))
+    } else {
+        (width_mm.saturating_mul(100), height_mm.saturating_mul(100))
+    }
 }
 
 /// Clear the common-dialog extended error (a canceled dialog is not an error).
@@ -1810,7 +2061,16 @@ fn finish_native_file_dialog(
 
     state.window_state().comm_dlg_extended_error = CDERR_NONE;
     state.window_state().last_file_dialog_path = Some(guest_path.clone());
-    tracing::info!(api = api_name, %guest_path, unicode = pending.unicode, "native file dialog accepted");
+    // The post-accept chain's hand-off: the guest path is written back to
+    // lpstrFile and this handler returns TRUE — a repro's log ends HERE if the
+    // guest never issues the follow-up CreateFileW on the returned path.
+    tracing::info!(
+        api = api_name,
+        %guest_path,
+        unicode = pending.unicode,
+        ret = 1,
+        "native file dialog accepted"
+    );
     file_dialog_return(engine, api_name, 1)
 }
 
@@ -4654,6 +4914,112 @@ mod tests {
         assert_eq!(
             read_back, original,
             "the guest reads the REAL host file through the mount"
+        );
+
+        write_regs(&mut engine, handle, 0, 0, 0);
+        handle_close_handle(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("CloseHandle must succeed");
+        let _unused = std::fs::remove_file(&host);
+    }
+
+    /// THE full post-accept chain in one test: the scripted bridge picks an
+    /// out-of-bottle host file → the dialog re-entry writes the mounted guest
+    /// path (`Z:\pick{N}\{name}`) into `lpstrFile` → the guest re-opens THAT
+    /// BUFFER PATH with `CreateFileW(OPEN_EXISTING)` → `ReadFile` returns the
+    /// real host file's bytes. This is the hand-off the existing tests each
+    /// cover in isolation: the bridge tests stop at the buffer + mount, and
+    /// `mounted_open_reads_the_real_host_file` mounts directly, skipping the
+    /// dialog and the buffer round-trip.
+    #[test]
+    fn dialog_pick_to_open_reads_the_real_host_file() {
+        let _serial = crate::vfs::pick_mount::TEST_SERIAL
+            .lock()
+            .expect("pick-mount test lock poisoned");
+        crate::vfs::pick_mount::clear_pick_mounts();
+        let mut engine = test_engine();
+        let mut state = test_state();
+        let bottle =
+            std::env::temp_dir().join(format!("wie-dialog-chain-bottle-{}", std::process::id()));
+        state.file_io.bottle_root = Some(bottle.clone());
+        state.file_io.volumes = VolumeConfig {
+            bottle_root: Some(bottle),
+            drive_d_root: None,
+        };
+        // The user picked a host file OUTSIDE the bottle via the native panel.
+        let host =
+            std::env::temp_dir().join(format!("wie-dialog-chain-{}.txt", std::process::id()));
+        let original = b"dialog pick -> real host file bytes";
+        std::fs::write(&host, original).expect("seed the picked host file");
+
+        // Bridge entry → re-entry: the pick registers the mount and the guest
+        // buffer (`lpstrFile`) receives the mounted guest path.
+        let file_buf = 0x6000;
+        engine.mem_write(file_buf, &utf16_bytes("notes.txt")).ok();
+        write_ofn(&mut engine, 0x5000, file_buf, 260, 0);
+        let bridge_host = host.clone();
+        let bridge: FileDialogBridge = Box::new(move |_| {
+            Some(FileDialogPick {
+                host_path: bridge_host.clone(),
+            })
+        });
+        let result = dispatch_open_with_bridge(&mut engine, &mut state, bridge)
+            .expect("the dialog accept must succeed");
+        assert_eq!(result.return_value, 1, "an out-of-bottle pick → TRUE");
+        let guest_path = read_guest_utf16(&mut engine, file_buf, 64);
+        assert!(
+            guest_path.starts_with(r"Z:\pick"),
+            "lpstrFile must hold the mounted guest path, got: {guest_path}"
+        );
+        assert_eq!(
+            crate::vfs::guest_path_to_host(&state.file_io.volumes, &guest_path).map(|map| map.host),
+            Some(host.clone()),
+            "the mounted path maps to the exact picked host file"
+        );
+
+        // The guest re-opens THE BUFFER PATH with CreateFileW(OPEN_EXISTING)
+        // and ReadFile — the same handlers notepad hits after
+        // GetOpenFileNameW. The buffer is re-seeded from itself to make the
+        // round-trip explicit: the file op consumes the dialog's output.
+        let file_name_ptr = file_buf;
+        engine
+            .mem_write(file_name_ptr, &utf16_bytes(&guest_path))
+            .ok();
+        write_regs(&mut engine, file_name_ptr, 0x8000_0000, 0, 0); // GENERIC_READ
+        engine
+            .mem_write(STACK_TOP + 0x28, &3_u32.to_le_bytes())
+            .ok(); // OPEN_EXISTING
+        let opened = handle_create_file_w(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("CreateFileW on the returned buffer path must succeed");
+        let handle = opened.return_value;
+        assert_ne!(
+            handle,
+            u64::MAX,
+            "a valid handle (not INVALID_HANDLE_VALUE)"
+        );
+
+        let read_ptr = 0x7000;
+        write_regs(&mut engine, handle, read_ptr, 64, 0x8000);
+        handle_read_file(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("ReadFile on the returned buffer path must succeed");
+        let mut read_back = vec![0_u8; original.len()];
+        engine
+            .mem_read(read_ptr, &mut read_back)
+            .expect("read the guest buffer back");
+        assert_eq!(
+            read_back, original,
+            "the guest reads the REAL picked host file through the dialog-returned path"
         );
 
         write_regs(&mut engine, handle, 0, 0, 0);

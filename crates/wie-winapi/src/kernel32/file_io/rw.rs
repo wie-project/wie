@@ -239,6 +239,13 @@ pub fn handle_read_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
     }
 
     let return_value = u64::from(success);
+    // The read side of the open/read chain: one line per real-file read (the
+    // console paths return earlier) — a repro's log ends HERE with ret = 0
+    // when the read fails, or never reaches this line when the guest does not
+    // call ReadFile at all.
+    if let Some(open_file) = find_open_file(state, handle) {
+        tracing::info!(handle, path = %open_file.path, ret = return_value, "ReadFile");
+    }
     let return_address = engine.return_from_win64_api(return_value)?;
 
     Ok(WinApiHandlerResult {
