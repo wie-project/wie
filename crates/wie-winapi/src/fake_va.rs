@@ -231,6 +231,8 @@ pub enum Device9Method {
     EndScene = 42,
     Clear = 43,
     SetTransform = 44,
+    GetTransform = 45,
+    MultiplyTransform = 46,
     SetViewport = 47,
     GetViewport = 48,
     SetRenderState = 57,
@@ -241,6 +243,7 @@ pub enum Device9Method {
     SetTextureStageState = 67,
     GetSamplerState = 68,
     SetSamplerState = 69,
+    SetScissorRect = 75,
     DrawPrimitive = 81,
     DrawIndexedPrimitive = 82,
     DrawPrimitiveUp = 83,
@@ -283,6 +286,8 @@ impl Device9Method {
             42 => Some(Self::EndScene),
             43 => Some(Self::Clear),
             44 => Some(Self::SetTransform),
+            45 => Some(Self::GetTransform),
+            46 => Some(Self::MultiplyTransform),
             47 => Some(Self::SetViewport),
             48 => Some(Self::GetViewport),
             57 => Some(Self::SetRenderState),
@@ -312,6 +317,7 @@ impl Device9Method {
             108 => Some(Self::GetPixelShader),
             109 => Some(Self::SetPixelShaderConstantF),
             110 => Some(Self::GetPixelShaderConstantF),
+            75 => Some(Self::SetScissorRect),
             _ => None,
         }
     }
@@ -345,6 +351,8 @@ impl Device9Method {
             Self::EndScene => Cow::Borrowed("IDirect3DDevice9::EndScene"),
             Self::Clear => Cow::Borrowed("IDirect3DDevice9::Clear"),
             Self::SetTransform => Cow::Borrowed("IDirect3DDevice9::SetTransform"),
+            Self::GetTransform => Cow::Borrowed("IDirect3DDevice9::GetTransform"),
+            Self::MultiplyTransform => Cow::Borrowed("IDirect3DDevice9::MultiplyTransform"),
             Self::SetViewport => Cow::Borrowed("IDirect3DDevice9::SetViewport"),
             Self::GetViewport => Cow::Borrowed("IDirect3DDevice9::GetViewport"),
             Self::SetRenderState => Cow::Borrowed("IDirect3DDevice9::SetRenderState"),
@@ -384,6 +392,7 @@ impl Device9Method {
             Self::GetPixelShaderConstantF => {
                 Cow::Borrowed("IDirect3DDevice9::GetPixelShaderConstantF")
             }
+            Self::SetScissorRect => Cow::Borrowed("IDirect3DDevice9::SetScissorRect"),
         }
     }
 }

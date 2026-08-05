@@ -9,6 +9,7 @@ use crate::d3d9_render::{
     parse_vertex, rasterize_triangle, run_vertex_shader, vs_input_from_vertex,
 };
 use crate::d3d9_shader::{PS_SAMPLER_COUNT, ShaderKind};
+use crate::gdi32::IRect;
 
 // ── P3 software-render handlers (slice 1) ────────────────────────────────
 //
@@ -169,11 +170,13 @@ fn indexed_vertex(
 /// render state.
 ///
 /// Borrows the depth buffer (when bound) through a field-level mutable borrow
-/// so the caller can hold the backbuffer mutably at the same time.
+/// so the caller can hold the backbuffer mutably at the same time. `scissor`
+/// is the `SetScissorRect` rect (a device-level state, not a `D3DRS_*`).
 fn build_fragment_state<'a>(
     render_state: &RenderState,
     depth_stencil: u64,
     depth_surfaces: &'a mut ahash::HashMap<u64, DepthStencilRecord>,
+    scissor: Option<IRect>,
 ) -> FragmentState<'a> {
     let depth = if depth_stencil != 0 {
         depth_surfaces
@@ -191,6 +194,18 @@ fn build_fragment_state<'a>(
         src_blend: render_state.src_blend.as_u32(),
         dest_blend: render_state.dest_blend.as_u32(),
         blend_op: render_state.blend_op.as_u32(),
+        fog_enable: u32::from(render_state.fog_enable),
+        fog_color: render_state.fog_color,
+        fog_start: render_state.fog_start,
+        fog_end: render_state.fog_end,
+        fog_density: render_state.fog_density,
+        fog_table_mode: render_state.fog_table_mode,
+        fog_vertex_mode: render_state.fog_vertex_mode,
+        alpha_test: u32::from(render_state.alpha_test_enable),
+        alpha_func: render_state.alpha_func.as_u32(),
+        alpha_ref: render_state.alpha_ref,
+        scissor_test: u32::from(render_state.scissor_test_enable),
+        scissor,
     }
 }
 
@@ -407,6 +422,7 @@ fn rasterize_vertex_stream(
         &d3d.d3d9_render_state,
         d3d.d3d9_depth_stencil,
         &mut d3d.d3d9_depth_surfaces,
+        d3d.d3d9_scissor_rect,
     );
     for &(i0, i1, i2) in triples {
         let Some(v0) = indexed_vertex(data, layout, stride, indices, vertex_base, i0) else {

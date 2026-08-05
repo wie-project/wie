@@ -162,20 +162,27 @@ pub(crate) const D3D9_RED_QUAD_0RGB: u32 = 0x00FF_0000;
 pub(crate) const D3D9_FAR_DEPTH_0RGB: u32 = 0x00FF_00FF;
 /// P4c near depth quad (white, z=0.1) — wins the depth test in the overlap.
 pub(crate) const D3D9_NEAR_DEPTH_0RGB: u32 = 0x00FF_FFFF;
+/// L3 alpha-test quad's passing half (alpha 0x80 > ALPHAREF 0x40): white.
+pub(crate) const D3D9_ALPHA_PASS_0RGB: u32 = 0x00FF_FFFF;
+/// L3 fogged quad: red under blue LINEAR fog at f=0.5 → (128, 0, 128).
+pub(crate) const D3D9_FOGGED_0RGB: u32 = 0x0080_0080;
+/// L3 scissor quad inside the scissor rect: solid green.
+pub(crate) const D3D9_SCISSOR_INSIDE_0RGB: u32 = 0x0000_FF00;
 
 /// CI-gated hash of gui_d3d9's deterministic resting frame (320×240).
 ///
 /// The frame is the clear-red backbuffer with the gradient triangle, the cyan
 /// indexed triangle, the 2x2 textured quad, the P4c alpha-blended quads, the
-/// P4c depth-tested quads, the L1 vs_2_0-driven textured quad, and the L1
+/// P4c depth-tested quads, the L1 vs_2_0-driven textured quad, the L1
 /// w-skewed quad whose perspective-correct center pixel (165,175) samples the
-/// RED texel (affine interpolation would sample GREEN). Recompute with
+/// RED texel (affine interpolation would sample GREEN), and the L3
+/// fragment-stage strip at y∈[220,235] (the alpha-tested quad, the fogged
+/// quad, the scissor-clipped quad). Recompute with
 /// `./target/debug/wie-cli run --screenshot /tmp/d.bmp \
 /// micro-exes/out/gui_d3d9.exe` then FNV-1a 64 over the full 0RGB pixel bytes.
-/// Recomputed when the L1 lane added the vs_2_0 + w-skewed quads (the
-/// deliberate D3D9_RESTING_FRAME_HASH tripwire for the perspective-correct
-/// interpolation change).
-pub(crate) const D3D9_RESTING_FRAME_HASH: u64 = 0x8815_977E_652E_C6E7;
+/// Recomputed when the L3 lane added the fog/alpha-test/scissor strip (the
+/// deliberate D3D9_RESTING_FRAME_HASH tripwire for the fragment-stage change).
+pub(crate) const D3D9_RESTING_FRAME_HASH: u64 = 0x07EA_21E2_A9C9_4062;
 
 /// Verify the deterministic frame's pixel content: the gradient survives the
 /// WS_CLIPCHILDREN-clipped blit, the DIB text drew white glyph ink, and the

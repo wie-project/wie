@@ -26,6 +26,11 @@ pub(crate) const RT_STRING: u16 = 6;
 /// (`MAKEINTRESOURCE(9)`).
 pub(crate) const RT_ACCELERATOR: u16 = 9;
 
+/// Type id of `RT_VERSION` resources in the resource directory
+/// (`MAKEINTRESOURCE(16)`; the version resource is the `VS_VERSION_INFO`
+/// tree — see `super::version`).
+pub(crate) const RT_VERSION: u16 = 16;
+
 /// `IMAGE_SCN_CNT_INITIALIZED_DATA` (used to spot a resource-like section).
 const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x0000_0040;
 

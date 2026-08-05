@@ -14694,20 +14694,385 @@ fn test_d3d9_render_state_typed_round_trip() {
         0
     );
 
-    // Unmodeled D3DRS_* are inert: setting them is a no-op and the read
-    // falls back to 0 (D3D9's default for unused states).
+    // L3 raw-value layer: an unmodeled D3DRS_* keeps the last-set value —
+    // GetRenderState round-trips it (no more "0 for ignored").
     set(&mut engine, &mut state, 0x1FF, 7);
-    assert_eq!(get(&mut engine, &mut state, 0x1FF), 0);
-    // Unknown enum values round-trip through the raw register value.
-    set(
+    assert_eq!(get(&mut engine, &mut state, 0x1FF), 7);
+    // Setting the same unmodeled state again overwrites the stored value.
+    set(&mut engine, &mut state, 0x1FF, 9);
+    assert_eq!(get(&mut engine, &mut state, 0x1FF), 9);
+    // A never-set unmodeled state reads 0 (D3D9's default for unused states).
+    assert_eq!(get(&mut engine, &mut state, 0x1FE), 0);
+    // L3 validation: an out-of-range enum value is the honest
+    // D3DERR_INVALIDCALL and the state keeps its previous value.
+    write_regs(
         &mut engine,
-        &mut state,
-        crate::d3d9_render::D3DRS_SRCBLEND,
+        1,
+        u64::from(crate::d3d9_render::D3DRS_SRCBLEND),
         0xDEAD,
+        0,
+        0,
+    );
+    assert_return_value!(
+        d3d9::handle_set_render_state(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0x8876_086c // D3DERR_INVALIDCALL
     );
     assert_eq!(
         get(&mut engine, &mut state, crate::d3d9_render::D3DRS_SRCBLEND),
-        0xDEAD
+        5,
+        "the rejected value must not overwrite the last legal one"
+    );
+}
+
+#[test]
+fn test_d3d9_fog_alpha_scissor_render_state_round_trip() {
+    use crate::d3d9_render::{
+        D3DCMP_GREATER, D3DFOG_LINEAR, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE,
+        D3DRS_FOGCOLOR, D3DRS_FOGDENSITY, D3DRS_FOGENABLE, D3DRS_FOGEND, D3DRS_FOGSTART,
+        D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE, D3DRS_SCISSORTESTENABLE,
+    };
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let set = |engine: &mut IcedCpu, state: &mut WinApiState, state_id: u32, value: u32| {
+        write_regs(engine, 1, u64::from(state_id), u64::from(value), 0, 0);
+        assert_return_value!(
+            d3d9::handle_set_render_state(&mut HandlerContext::new(
+                engine,
+                test_environment(),
+                state,
+            )),
+            0
+        );
+    };
+    let get = |engine: &mut IcedCpu, state: &mut WinApiState, state_id: u32| -> u32 {
+        let out = 0x7400_u64;
+        write_regs(engine, 1, u64::from(state_id), out, 0, 0);
+        assert_return_value!(
+            d3d9::handle_get_render_state(&mut HandlerContext::new(
+                engine,
+                test_environment(),
+                state,
+            )),
+            0
+        );
+        let mut bytes = [0_u8; 4];
+        engine
+            .mem_read(out, &mut bytes)
+            .expect("read GetRenderState output");
+        u32::from_le_bytes(bytes)
+    };
+
+    // The L3 defaults (D3D9 fixed-function).
+    assert_eq!(get(&mut engine, &mut state, D3DRS_FOGENABLE), 0);
+    assert_eq!(get(&mut engine, &mut state, D3DRS_FOGCOLOR), 0);
+    assert_eq!(
+        get(&mut engine, &mut state, D3DRS_FOGSTART),
+        0.0_f32.to_bits()
+    );
+    assert_eq!(
+        get(&mut engine, &mut state, D3DRS_FOGEND),
+        1.0_f32.to_bits()
+    );
+    assert_eq!(
+        get(&mut engine, &mut state, D3DRS_FOGDENSITY),
+        1.0_f32.to_bits()
+    );
+    assert_eq!(get(&mut engine, &mut state, D3DRS_FOGTABLEMODE), 0);
+    assert_eq!(get(&mut engine, &mut state, D3DRS_FOGVERTEXMODE), 0);
+    assert_eq!(get(&mut engine, &mut state, D3DRS_ALPHATESTENABLE), 0);
+    assert_eq!(get(&mut engine, &mut state, D3DRS_ALPHAFUNC), 8); // D3DCMP_ALWAYS
+    assert_eq!(get(&mut engine, &mut state, D3DRS_ALPHAREF), 0);
+    assert_eq!(get(&mut engine, &mut state, D3DRS_SCISSORTESTENABLE), 0);
+
+    // Set + round-trip every fog/alpha/scissor state.
+    set(&mut engine, &mut state, D3DRS_FOGENABLE, 1);
+    set(&mut engine, &mut state, D3DRS_FOGCOLOR, 0x00FF_FF00);
+    set(&mut engine, &mut state, D3DRS_FOGSTART, 0.25_f32.to_bits());
+    set(&mut engine, &mut state, D3DRS_FOGEND, 0.75_f32.to_bits());
+    set(&mut engine, &mut state, D3DRS_FOGDENSITY, 0.5_f32.to_bits());
+    set(&mut engine, &mut state, D3DRS_FOGTABLEMODE, D3DFOG_LINEAR);
+    set(&mut engine, &mut state, D3DRS_FOGVERTEXMODE, D3DFOG_LINEAR);
+    set(&mut engine, &mut state, D3DRS_ALPHATESTENABLE, 1);
+    set(&mut engine, &mut state, D3DRS_ALPHAFUNC, D3DCMP_GREATER);
+    set(&mut engine, &mut state, D3DRS_ALPHAREF, 0x40);
+    set(&mut engine, &mut state, D3DRS_SCISSORTESTENABLE, 1);
+    assert_eq!(get(&mut engine, &mut state, D3DRS_FOGENABLE), 1);
+    assert_eq!(get(&mut engine, &mut state, D3DRS_FOGCOLOR), 0x00FF_FF00);
+    assert_eq!(
+        get(&mut engine, &mut state, D3DRS_FOGSTART),
+        0.25_f32.to_bits()
+    );
+    assert_eq!(
+        get(&mut engine, &mut state, D3DRS_FOGEND),
+        0.75_f32.to_bits()
+    );
+    assert_eq!(
+        get(&mut engine, &mut state, D3DRS_FOGDENSITY),
+        0.5_f32.to_bits()
+    );
+    assert_eq!(
+        get(&mut engine, &mut state, D3DRS_FOGTABLEMODE),
+        D3DFOG_LINEAR
+    );
+    assert_eq!(
+        get(&mut engine, &mut state, D3DRS_FOGVERTEXMODE),
+        D3DFOG_LINEAR
+    );
+    assert_eq!(get(&mut engine, &mut state, D3DRS_ALPHATESTENABLE), 1);
+    assert_eq!(
+        get(&mut engine, &mut state, D3DRS_ALPHAFUNC),
+        D3DCMP_GREATER
+    );
+    assert_eq!(get(&mut engine, &mut state, D3DRS_ALPHAREF), 0x40);
+    assert_eq!(get(&mut engine, &mut state, D3DRS_SCISSORTESTENABLE), 1);
+
+    // The typed struct mirrors the round-trip (the fragment stage reads it).
+    let rs = state.d3d9().d3d9_render_state;
+    assert!(rs.fog_enable);
+    assert_eq!(rs.fog_color, 0x00FF_FF00);
+    assert_eq!(rs.fog_start.to_bits(), 0.25_f32.to_bits());
+    assert_eq!(rs.fog_end.to_bits(), 0.75_f32.to_bits());
+    assert_eq!(rs.fog_density.to_bits(), 0.5_f32.to_bits());
+    assert_eq!(rs.fog_table_mode, D3DFOG_LINEAR);
+    assert_eq!(rs.fog_vertex_mode, D3DFOG_LINEAR);
+    assert!(rs.alpha_test_enable);
+    assert_eq!(rs.alpha_func.as_u32(), D3DCMP_GREATER);
+    assert_eq!(rs.alpha_ref, 0x40);
+    assert!(rs.scissor_test_enable);
+
+    // Validation: out-of-range values fail for the new states too.
+    for (state_id, bad) in [
+        (D3DRS_FOGENABLE, 2_u32),
+        (D3DRS_ALPHATESTENABLE, 2),
+        (D3DRS_SCISSORTESTENABLE, 2),
+        (D3DRS_ALPHAFUNC, 9),
+        (D3DRS_ALPHAREF, 256),
+        (D3DRS_FOGTABLEMODE, 4),
+        (D3DRS_FOGVERTEXMODE, 4),
+    ] {
+        write_regs(&mut engine, 1, u64::from(state_id), u64::from(bad), 0, 0);
+        assert_return_value!(
+            d3d9::handle_set_render_state(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state,
+            )),
+            0x8876_086c // D3DERR_INVALIDCALL
+        );
+    }
+    // The rejected sets left the earlier values intact.
+    assert_eq!(get(&mut engine, &mut state, D3DRS_FOGENABLE), 1);
+    assert_eq!(
+        get(&mut engine, &mut state, D3DRS_ALPHAFUNC),
+        D3DCMP_GREATER
+    );
+    assert_eq!(get(&mut engine, &mut state, D3DRS_ALPHAREF), 0x40);
+}
+
+#[test]
+fn test_d3d9_get_and_multiply_transform() {
+    use crate::d3d9_render::{D3DTS_TEXTURE0, D3DTS_WORLD};
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // Write a known column-major matrix at 0x6000: scale(2,3,0.5).
+    let matrix_va = 0x6000_u64;
+    let mut matrix = [0.0_f32; 16];
+    matrix[0] = 2.0;
+    matrix[5] = 3.0;
+    matrix[10] = 0.5;
+    matrix[15] = 1.0;
+    for (i, value) in matrix.iter().enumerate() {
+        engine
+            .mem_write(
+                matrix_va + u64::try_from(i).unwrap_or(0) * 4,
+                &value.to_le_bytes(),
+            )
+            .expect("write matrix element");
+    }
+    let read_matrix = |engine: &mut IcedCpu, va: u64| -> [f32; 16] {
+        let mut out = [0.0_f32; 16];
+        let mut bytes = [0_u8; 64];
+        engine
+            .mem_read(va, &mut bytes)
+            .expect("read D3DMATRIX output");
+        for (index, slot) in out.iter_mut().enumerate() {
+            let start = index.saturating_mul(4);
+            let raw: [u8; 4] = bytes
+                .get(start..start.saturating_add(4))
+                .and_then(|s| s.try_into().ok())
+                .unwrap_or([0; 4]);
+            *slot = f32::from_le_bytes(raw);
+        }
+        out
+    };
+
+    // MultiplyTransform(WORLD, M) — the world starts at identity, so the
+    // stored world must become exactly M (current × M).
+    write_regs(&mut engine, 1, u64::from(D3DTS_WORLD), matrix_va, 0, 0);
+    assert_return_value!(
+        d3d9::handle_multiply_transform(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    assert_eq!(
+        state.d3d9().d3d9_world_matrix.map(f32::to_bits),
+        matrix.map(f32::to_bits),
+        "MultiplyTransform on identity must yield the input matrix"
+    );
+
+    // GetTransform(WORLD) writes it back bit-exact.
+    let out_va = 0x6400_u64;
+    write_regs(&mut engine, 1, u64::from(D3DTS_WORLD), out_va, 0, 0);
+    assert_return_value!(
+        d3d9::handle_get_transform(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    assert_eq!(
+        read_matrix(&mut engine, out_va).map(f32::to_bits),
+        matrix.map(f32::to_bits),
+        "GetTransform must round-trip the multiplied matrix"
+    );
+
+    // A second MultiplyTransform concatenates: world = M × M.
+    write_regs(&mut engine, 1, u64::from(D3DTS_WORLD), matrix_va, 0, 0);
+    assert_return_value!(
+        d3d9::handle_multiply_transform(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let world = state.d3d9().d3d9_world_matrix;
+    let expected = crate::d3d9_render::mat4_mul(&matrix, &matrix);
+    assert_eq!(
+        world.map(f32::to_bits),
+        expected.map(f32::to_bits),
+        "the second multiply must concatenate current × M"
+    );
+
+    // D3DTS_TEXTURE0..7 store + round-trip (the actual texgen is a later slice).
+    write_regs(&mut engine, 1, u64::from(D3DTS_TEXTURE0), matrix_va, 0, 0);
+    assert_return_value!(
+        d3d9::handle_set_transform(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    write_regs(&mut engine, 1, u64::from(D3DTS_TEXTURE0), out_va, 0, 0);
+    assert_return_value!(
+        d3d9::handle_get_transform(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    assert_eq!(
+        read_matrix(&mut engine, out_va).map(f32::to_bits),
+        matrix.map(f32::to_bits),
+        "GetTransform must round-trip D3DTS_TEXTURE0"
+    );
+    // D3DTS_TEXTURE1 is still the identity default (TEXTURE1 = TEXTURE0 + 1).
+    write_regs(&mut engine, 1, u64::from(D3DTS_TEXTURE0 + 1), out_va, 0, 0);
+    assert_return_value!(
+        d3d9::handle_get_transform(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    assert_eq!(
+        read_matrix(&mut engine, out_va).map(f32::to_bits),
+        crate::d3d9_render::IDENTITY.map(f32::to_bits),
+        "D3DTS_TEXTURE1 defaults to identity"
+    );
+
+    // An unknown transform state is D3DERR_INVALIDCALL.
+    write_regs(&mut engine, 1, 0xDEAD, out_va, 0, 0);
+    assert_return_value!(
+        d3d9::handle_get_transform(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0x8876_086c
+    );
+    write_regs(&mut engine, 1, 0xDEAD, matrix_va, 0, 0);
+    assert_return_value!(
+        d3d9::handle_multiply_transform(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0x8876_086c
+    );
+}
+
+#[test]
+fn test_d3d9_set_scissor_rect() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // A RECT {10, 20, 130, 140} (4 x i32) at 0x6000.
+    let rect_va = 0x6000_u64;
+    for (i, v) in [10_i32, 20, 130, 140].iter().enumerate() {
+        engine
+            .mem_write(
+                rect_va + u64::try_from(i).unwrap_or(0) * 4,
+                &v.to_le_bytes(),
+            )
+            .expect("write RECT field");
+    }
+    write_regs(&mut engine, 1, rect_va, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_set_scissor_rect(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    assert_eq!(
+        state.d3d9().d3d9_scissor_rect,
+        Some(crate::gdi32::IRect {
+            left: 10,
+            top: 20,
+            right: 130,
+            bottom: 140
+        })
+    );
+    // NULL rect is D3DERR_INVALIDCALL and leaves the stored rect intact.
+    write_regs(&mut engine, 1, 0, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_set_scissor_rect(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0x8876_086c
+    );
+    assert_eq!(
+        state.d3d9().d3d9_scissor_rect,
+        Some(crate::gdi32::IRect {
+            left: 10,
+            top: 20,
+            right: 130,
+            bottom: 140
+        })
     );
 }
 
@@ -16254,4 +16619,151 @@ fn test_get_text_metrics_w_writes_textmetricw_byte_layout() {
     assert_eq!(bytes[55], 0x01, "tmPitchAndFamily @55");
     assert_eq!(bytes[56], 0, "tmCharSet @56");
     assert_eq!(&bytes[57..60], &[0, 0, 0], "trailing pad @57..59 zeroed");
+}
+
+// ── Version API (version.dll) ────────────────────────────────────────────
+
+/// Full dispatch of the version flow against a real file in a bottle:
+/// GetFileVersionInfoSizeW → GetFileVersionInfoW → VerQueryValueW. Uses the
+/// windres-built micro as the target file (skips when the micro suite has not
+/// been built, like the sibling micro tests).
+#[test]
+fn test_version_flow_reads_a_bottle_file() {
+    use std::path::PathBuf;
+
+    let mut src = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    src.pop();
+    src.pop();
+    src.push("micro-exes/out/version_query.exe");
+    if !src.is_file() {
+        return;
+    }
+    let exe_bytes = std::fs::read(&src).expect("read micro exe");
+
+    // A scratch bottle holding the target at C:\App\sample.exe.
+    let root = std::env::temp_dir().join(format!("wie-version-test-{}", std::process::id()));
+    let _unused = std::fs::remove_dir_all(&root);
+    let drive_c = root.join("drive_c").join("App");
+    std::fs::create_dir_all(&drive_c).expect("create bottle drive_c/App");
+    std::fs::write(drive_c.join("sample.exe"), &exe_bytes).expect("copy target into bottle");
+
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    state.file_io.volumes = VolumeConfig {
+        bottle_root: Some(root.clone()),
+        drive_d_root: None,
+    };
+    state.file_io.current_directory_wide = r"C:\".encode_utf16().collect();
+    state.process.main_module_file_name = "other.exe".to_owned();
+    state.process.main_module_path = r"C:\other.exe".to_owned();
+
+    // Guest path + handle/output buffers live in mapped memory.
+    let path_ptr = 0x6000_u64;
+    let handle_ptr = 0x7000_u64;
+    let data_ptr = 0x8000_u64;
+    let out_ptr = 0x9000_u64;
+    let len_ptr = 0xA000_u64;
+    let wide_path: Vec<u8> = r"C:\App\sample.exe"
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .chain(0_u16.to_le_bytes())
+        .collect();
+    engine
+        .mem_write(path_ptr, &wide_path)
+        .expect("write guest path");
+
+    // GetFileVersionInfoSizeW: the raw block length, written via the vfs.
+    write_regs(&mut engine, path_ptr, handle_ptr, 0, 0, 0);
+    let id = crate::resolve_winapi_id("version.dll", "GetFileVersionInfoSizeW")
+        .expect("GetFileVersionInfoSizeW must resolve");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("GetFileVersionInfoSizeW must dispatch");
+    let size = u32::try_from(r.return_value).expect("size fits u32");
+    assert!(size > 52, "size covers the fixed info: {size}");
+
+    // GetFileVersionInfoW: copies the raw block into the guest buffer.
+    write_regs(&mut engine, path_ptr, 0, u64::from(size), data_ptr, 0);
+    let id = crate::resolve_winapi_id("version.dll", "GetFileVersionInfoW")
+        .expect("GetFileVersionInfoW must resolve");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("GetFileVersionInfoW must dispatch");
+    assert_eq!(r.return_value, 1, "GetFileVersionInfoW succeeds");
+    let mut block = vec![0_u8; usize::try_from(size).expect("size fits usize")];
+    engine
+        .mem_read(data_ptr, &mut block)
+        .expect("read copied block");
+
+    // VerQueryValueW("\"): the fixed info reports 1.2.3.4.
+    let root_path: Vec<u8> = "\\"
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .chain(0_u16.to_le_bytes())
+        .collect();
+    engine
+        .mem_write(0x6000, &root_path)
+        .expect("write root path");
+    write_regs(&mut engine, data_ptr, 0x6000, out_ptr, len_ptr, 0);
+    let id = crate::resolve_winapi_id("version.dll", "VerQueryValueW")
+        .expect("VerQueryValueW must resolve");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("VerQueryValueW must dispatch");
+    assert_eq!(r.return_value, 1, "root query succeeds");
+    let mut fixed_ptr_bytes = [0_u8; 8];
+    engine
+        .mem_read(out_ptr, &mut fixed_ptr_bytes)
+        .expect("read fixed info pointer");
+    let fixed_ptr = u64::from_le_bytes(fixed_ptr_bytes);
+    let mut file_version_ms = [0_u8; 4];
+    engine
+        .mem_read(fixed_ptr + 8, &mut file_version_ms)
+        .expect("read dwFileVersionMS");
+    let mut file_version_ls = [0_u8; 4];
+    engine
+        .mem_read(fixed_ptr + 12, &mut file_version_ls)
+        .expect("read dwFileVersionLS");
+    assert_eq!(u32::from_le_bytes(file_version_ms), 0x0001_0002);
+    assert_eq!(u32::from_le_bytes(file_version_ls), 0x0003_0004);
+
+    let _unused = std::fs::remove_dir_all(&root);
+}
+
+/// GetFileVersionInfoSizeW on a missing file fails with ERROR_FILE_NOT_FOUND
+/// (the honest disposition, not a fabricated size).
+#[test]
+fn test_version_size_missing_file_sets_file_not_found() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    state.file_io.volumes = VolumeConfig {
+        bottle_root: Some(std::env::temp_dir()),
+        drive_d_root: None,
+    };
+    state.file_io.current_directory_wide = r"C:\".encode_utf16().collect();
+    let path_ptr = 0x6000_u64;
+    let wide_path: Vec<u8> = r"C:\no-such-file.exe"
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .chain(0_u16.to_le_bytes())
+        .collect();
+    engine
+        .mem_write(path_ptr, &wide_path)
+        .expect("write guest path");
+    write_regs(&mut engine, path_ptr, 0, 0, 0, 0);
+    let id = crate::resolve_winapi_id("version.dll", "GetFileVersionInfoSizeW")
+        .expect("GetFileVersionInfoSizeW must resolve");
+    let r = crate::dispatch_winapi_id(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        id,
+    )
+    .expect("GetFileVersionInfoSizeW must dispatch");
+    assert_eq!(r.return_value, 0, "missing file yields size 0");
+    assert_eq!(state.process.last_error, 2, "ERROR_FILE_NOT_FOUND");
 }

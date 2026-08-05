@@ -30,7 +30,10 @@ mod tests;
 use crate::gdi32::IRect;
 use wie_cpu::{blend_0rgb_4x, fill_0rgb_4x};
 
-pub use self::blend::{D3dBlend, D3dBlendOp, D3dCmpFunc, D3dZBufferType, is_top_or_left_edge};
+pub use self::blend::{
+    D3dBlend, D3dBlendOp, D3dCmpFunc, D3dZBufferType, alpha_test_pass, fog_blend, fog_factor,
+    is_top_or_left_edge,
+};
 pub use self::ps::{
     PsFragmentInput, PsProgram, pixel_shader_alpha_to_u8, pixel_shader_color_to_0rgb,
     run_pixel_shader,
@@ -76,6 +79,10 @@ pub const D3DTS_VIEW: u32 = 2;
 pub const D3DTS_PROJECTION: u32 = 3;
 /// `D3DTS_WORLD` (world matrix index 0).
 pub const D3DTS_WORLD: u32 = 256;
+/// `D3DTS_TEXTURE0` — the first texture-space transform matrix.
+pub const D3DTS_TEXTURE0: u32 = 16;
+/// `D3DTS_TEXTURE7` — the last texture-space transform matrix.
+pub const D3DTS_TEXTURE7: u32 = 23;
 
 // ── Texture-stage constants (d3d9types.h values) ────────────────────────
 
@@ -148,6 +155,42 @@ pub const D3DRS_ALPHABLENDENABLE: u32 = 27;
 /// `D3DRS_BLENDOP`.
 pub const D3DRS_BLENDOP: u32 = 171;
 
+// ── L3 fragment-stage render-state constants (d3d9types.h values) ───────
+
+/// `D3DRS_ALPHATESTENABLE` (the alpha-test gate).
+pub const D3DRS_ALPHATESTENABLE: u32 = 15;
+/// `D3DRS_ALPHAREF` (the alpha-test reference, a `u8`).
+pub const D3DRS_ALPHAREF: u32 = 24;
+/// `D3DRS_ALPHAFUNC` (the alpha-test compare function, `D3DCMP_*`).
+pub const D3DRS_ALPHAFUNC: u32 = 25;
+/// `D3DRS_FOGENABLE`.
+pub const D3DRS_FOGENABLE: u32 = 28;
+/// `D3DRS_FOGCOLOR` (a `D3DCOLOR`).
+pub const D3DRS_FOGCOLOR: u32 = 34;
+/// `D3DRS_FOGTABLEMODE` (pixel fog, a `D3DFOGMODE`).
+pub const D3DRS_FOGTABLEMODE: u32 = 35;
+/// `D3DRS_FOGSTART` (linear-fog depth start, a float).
+pub const D3DRS_FOGSTART: u32 = 36;
+/// `D3DRS_FOGEND` (linear-fog depth end, a float).
+pub const D3DRS_FOGEND: u32 = 37;
+/// `D3DRS_FOGDENSITY` (EXP/EXP2 fog density, a float).
+pub const D3DRS_FOGDENSITY: u32 = 38;
+/// `D3DRS_RANGEFOGENABLE` (a boolean; unmodeled — stored raw).
+pub const D3DRS_RANGEFOGENABLE: u32 = 48;
+/// `D3DRS_FOGVERTEXMODE` (vertex fog, a `D3DFOGMODE`).
+pub const D3DRS_FOGVERTEXMODE: u32 = 50;
+/// `D3DRS_SCISSORTESTENABLE` (the scissor-rect gate).
+pub const D3DRS_SCISSORTESTENABLE: u32 = 174;
+
+/// `D3DFOG_NONE` — no fog.
+pub const D3DFOG_NONE: u32 = 0;
+/// `D3DFOG_EXP` — exponential fog.
+pub const D3DFOG_EXP: u32 = 1;
+/// `D3DFOG_EXP2` — exponential-squared fog.
+pub const D3DFOG_EXP2: u32 = 2;
+/// `D3DFOG_LINEAR` — linear fog (the demo path).
+pub const D3DFOG_LINEAR: u32 = 3;
+
 /// `D3DZB_FALSE` (0) — depth test+write disabled.
 pub const D3DZB_FALSE: u32 = 0;
 /// `D3DZB_TRUE` (1) — depth test+write enabled.
@@ -203,10 +246,11 @@ pub const D3DBLENDOP_REVSUBTRACT: u32 = 3;
 /// Typed device render state (`D3DRS_*`), decoded at the `SetRenderState` /
 /// `GetRenderState` register boundary and read by the per-draw fragment stage.
 ///
-/// Unmodeled `D3DRS_*` states are dropped by the handler (they have no effect
-/// on the software pipeline and their `GetRenderState` reads fall back to 0,
-/// D3D9's default for unused states).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Unmodeled `D3DRS_*` states are carried verbatim by the handler's raw-value
+/// layer (`D3D9State::d3d9_render_state_raw`), so `GetRenderState` round-trips
+/// the last-set value for every state — modeled ones through these typed
+/// fields, ignored ones through the raw map.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RenderState {
     /// `D3DRS_ALPHABLENDENABLE`.
     pub alpha_blend_enable: bool,
@@ -222,6 +266,63 @@ pub struct RenderState {
     pub dest_blend: D3dBlend,
     /// `D3DRS_BLENDOP` (`D3DBLENDOP_*`).
     pub blend_op: D3dBlendOp,
+    // ── L3 fragment stages (fog / alpha test / scissor) ────────────────
+    /// `D3DRS_FOGENABLE` — gates the fog blend in the fragment stage.
+    pub fog_enable: bool,
+    /// `D3DRS_FOGCOLOR` (a `D3DCOLOR`; the fragment stage masks to 0RGB).
+    pub fog_color: u32,
+    /// `D3DRS_FOGSTART` (linear-fog depth start).
+    pub fog_start: f32,
+    /// `D3DRS_FOGEND` (linear-fog depth end).
+    pub fog_end: f32,
+    /// `D3DRS_FOGDENSITY` (EXP/EXP2 density).
+    pub fog_density: f32,
+    /// `D3DRS_FOGTABLEMODE` (`D3DFOGMODE_*`; non-NONE = pixel fog, which
+    /// takes precedence over vertex fog when both are set).
+    pub fog_table_mode: u32,
+    /// `D3DRS_FOGVERTEXMODE` (`D3DFOGMODE_*`; used when table mode is NONE).
+    pub fog_vertex_mode: u32,
+    /// `D3DRS_ALPHATESTENABLE` — gates the alpha test in the fragment stage.
+    pub alpha_test_enable: bool,
+    /// `D3DRS_ALPHAFUNC` (`D3DCMP_*`).
+    pub alpha_func: D3dCmpFunc,
+    /// `D3DRS_ALPHAREF` (the alpha-test reference).
+    pub alpha_ref: u8,
+    /// `D3DRS_SCISSORTESTENABLE` — gates the scissor clip in the fragment
+    /// stage.
+    pub scissor_test_enable: bool,
+}
+
+impl RenderState {
+    /// The typed value of a modeled `D3DRS_*` state, or `None` for unmodeled
+    /// states (those read from the raw-value layer).
+    ///
+    /// `GetRenderState` calls this after the handler's validation pass, so the
+    /// typed enums hold only legal values.
+    #[must_use]
+    pub fn value_of(&self, state_id: u32) -> Option<u32> {
+        match state_id {
+            D3DRS_ALPHABLENDENABLE => Some(u32::from(self.alpha_blend_enable)),
+            D3DRS_ZWRITEENABLE => Some(u32::from(self.z_write_enable)),
+            D3DRS_ZENABLE => Some(self.z_enable.as_u32()),
+            D3DRS_ZFUNC => Some(self.z_func.as_u32()),
+            D3DRS_SRCBLEND => Some(self.src_blend.as_u32()),
+            D3DRS_DESTBLEND => Some(self.dest_blend.as_u32()),
+            D3DRS_BLENDOP => Some(self.blend_op.as_u32()),
+            D3DRS_FOGENABLE => Some(u32::from(self.fog_enable)),
+            D3DRS_FOGCOLOR => Some(self.fog_color),
+            D3DRS_FOGSTART => Some(self.fog_start.to_bits()),
+            D3DRS_FOGEND => Some(self.fog_end.to_bits()),
+            D3DRS_FOGDENSITY => Some(self.fog_density.to_bits()),
+            D3DRS_FOGTABLEMODE => Some(self.fog_table_mode),
+            D3DRS_FOGVERTEXMODE => Some(self.fog_vertex_mode),
+            D3DRS_ALPHATESTENABLE => Some(u32::from(self.alpha_test_enable)),
+            D3DRS_ALPHAFUNC => Some(self.alpha_func.as_u32()),
+            D3DRS_ALPHAREF => Some(u32::from(self.alpha_ref)),
+            D3DRS_SCISSORTESTENABLE => Some(u32::from(self.scissor_test_enable)),
+            _ => None,
+        }
+    }
 }
 
 impl Default for RenderState {
@@ -236,7 +337,56 @@ impl Default for RenderState {
             src_blend: D3dBlend::One,
             dest_blend: D3dBlend::Zero,
             blend_op: D3dBlendOp::Add,
+            fog_enable: false,
+            fog_color: 0,
+            fog_start: 0.0,
+            fog_end: 1.0,
+            fog_density: 1.0,
+            fog_table_mode: D3DFOG_NONE,
+            fog_vertex_mode: D3DFOG_NONE,
+            alpha_test_enable: false,
+            alpha_func: D3dCmpFunc::Always,
+            alpha_ref: 0,
+            scissor_test_enable: false,
         }
+    }
+}
+
+/// The D3D9 render-state validation matrix: every modeled `D3DRS_*` state's
+/// legal value range.
+///
+/// `SetRenderState` rejects out-of-range values with `D3DERR_INVALIDCALL` —
+/// the honest response, never a silent accept. The blend/compare/op ranges
+/// are the *implemented* subset (a factor the software pipeline would render
+/// wrong is rejected rather than silently mis-rendered); boolean states take
+/// only TRUE/FALSE; unmodeled states carry no validation (their raw values
+/// round-trip untouched).
+#[must_use]
+pub fn render_state_value_valid(state_id: u32, value: u32) -> bool {
+    match state_id {
+        // Boolean states: only FALSE (0) / TRUE (1).
+        D3DRS_ALPHABLENDENABLE
+        | D3DRS_ZWRITEENABLE
+        | D3DRS_FOGENABLE
+        | D3DRS_RANGEFOGENABLE
+        | D3DRS_ALPHATESTENABLE
+        | D3DRS_SCISSORTESTENABLE => value <= 1,
+        // D3DZB_* depth modes.
+        D3DRS_ZENABLE => value <= D3DZB_USEW,
+        // D3DCMP_* compare functions (NEVER..ALWAYS).
+        D3DRS_ZFUNC | D3DRS_ALPHAFUNC => (D3DCMP_NEVER..=D3DCMP_ALWAYS).contains(&value),
+        // The implemented D3DBLEND_* factors (ZERO..INVDESTCOLOR).
+        D3DRS_SRCBLEND | D3DRS_DESTBLEND => {
+            (D3DBLEND_ZERO..=D3DBLEND_INVDESTCOLOR).contains(&value)
+        }
+        // The implemented D3DBLENDOP_* ops (ADD..REVSUBTRACT).
+        D3DRS_BLENDOP => (D3DBLENDOP_ADD..=D3DBLENDOP_REVSUBTRACT).contains(&value),
+        // D3DFOGMODE_* (NONE..LINEAR).
+        D3DRS_FOGTABLEMODE | D3DRS_FOGVERTEXMODE => value <= D3DFOG_LINEAR,
+        // D3DRS_ALPHAREF is a `u8`.
+        D3DRS_ALPHAREF => value <= 255,
+        // Unmodeled states are stored raw without validation.
+        _ => true,
     }
 }
 /// One texture stage's fixed-function state (stage index is the array slot).
@@ -325,6 +475,14 @@ impl Default for TextureStageState {
 /// existing backbuffer pixel with the `D3DBLEND_*` factors.
 /// The backbuffer stays 0RGB — alpha feeds the blend only.
 ///
+/// The L3 fragment stages run in D3D9's order: the scissor rect
+/// (`D3DRS_SCISSORTESTENABLE` + `SetScissorRect`) clips the pixel first, the
+/// alpha test (`D3DRS_ALPHATESTENABLE`/`ALPHAFUNC`/`ALPHAREF`) discards
+/// failing fragments after the color ops, and the fog blend
+/// (`D3DRS_FOGENABLE` + the fog color/start/end/density, vertex fog from the
+/// L1 stage's screen-space z or pixel fog from the interpolated z) tints the
+/// color before the write.
+///
 /// Degenerate (zero-area) triangles and triangles fully off-screen are
 /// dropped. The dirty region is the triangle's clipped bounding box —
 /// conservative but always a superset of the written pixels.
@@ -385,10 +543,37 @@ pub fn rasterize_triangle(
         && frag.src_blend == D3DBLEND_SRCALPHA
         && frag.dest_blend == D3DBLEND_INVSRCALPHA
         && frag.blend_op == D3DBLENDOP_ADD;
-    let flat_fill =
-        !blending && tex.is_none() && ps.is_none() && a.color == b.color && b.color == c.color;
+    // L3: the fragment stages gate `flat_fill` deliberately — fog blends a
+    // per-pixel color (the constant vertex color would be wrong), and the
+    // alpha test / scissor reject pixels whose color this fast path bypasses
+    // (the batch mechanics would still be correct, but the fast path's
+    // semantics only stay obvious when every fragment pipeline stage is off).
+    let flat_fill = !blending
+        && frag.fog_enable == 0
+        && frag.alpha_test == 0
+        && frag.scissor_test == 0
+        && tex.is_none()
+        && ps.is_none()
+        && a.color == b.color
+        && b.color == c.color;
     let flat_color = a.color & 0x00FF_FFFF;
     let flat_alpha = u8::try_from((a.color >> 24) & 0xFF).unwrap_or(0);
+    // L3 vertex fog: the factor is computed per-vertex from the L1 stage's
+    // screen-space z and interpolated across the triangle (Gouraud). Pixel
+    // fog (`D3DRS_FOGTABLEMODE` non-NONE) takes precedence and computes the
+    // factor from the interpolated z per-pixel instead.
+    let vertex_fog = frag.fog_enable != 0
+        && frag.fog_table_mode == D3DFOG_NONE
+        && frag.fog_vertex_mode != D3DFOG_NONE;
+    let (fog_fa, fog_fb, fog_fc) = if vertex_fog {
+        (
+            fog_factor(frag, frag.fog_vertex_mode, a.z),
+            fog_factor(frag, frag.fog_vertex_mode, b.z),
+            fog_factor(frag, frag.fog_vertex_mode, c.z),
+        )
+    } else {
+        (0.0, 0.0, 0.0)
+    };
     for py in y0..y1 {
         // P5b pending batch: up to 4 contiguous accepted pixels (index,
         // fragment color, alpha) flushed by the NEON kernel or the scalar
@@ -398,6 +583,14 @@ pub fn rasterize_triangle(
         let mut batch_alpha = [0u8; 4];
         let mut batch_n = 0usize;
         for px in x0..x1 {
+            // L3 scissor test: the D3D9 rasterization clip, applied before any
+            // fragment processing (including the depth test).
+            if frag.scissor_test != 0
+                && let Some(rect) = frag.scissor
+                && (px < rect.left || px >= rect.right || py < rect.top || py >= rect.bottom)
+            {
+                continue;
+            }
             let cx = px as f32 + 0.5;
             let cy = py as f32 + 0.5;
             let e_ab = (b.x - a.x) * (cy - a.y) - (b.y - a.y) * (cx - a.x);
@@ -493,6 +686,27 @@ pub fn rasterize_triangle(
                         ),
                     },
                 }
+            };
+
+            // ── L3 fragment stages: alpha test, then fog, before the write.
+            // Alpha test: the fragment alpha vs D3DRS_ALPHAFUNC/ALPHAREF. A
+            // failed test discards the fragment (no color write) — the `continue`
+            // also breaks a pending NEON batch, so the fast paths stay correct.
+            if frag.alpha_test != 0 && !alpha_test_pass(alpha, frag.alpha_func, frag.alpha_ref) {
+                continue;
+            }
+            // Fog: blend the color toward D3DRS_FOGCOLOR by the factor —
+            // pixel fog (FOGTABLEMODE) from the interpolated z, vertex fog
+            // (FOGVERTEXMODE) from the interpolated per-vertex factors.
+            let rgb = if frag.fog_enable != 0 {
+                let factor = if frag.fog_table_mode != D3DFOG_NONE {
+                    fog_factor(frag, frag.fog_table_mode, z)
+                } else {
+                    wa * fog_fa + wb * fog_fb + wc * fog_fc
+                };
+                fog_blend(rgb, frag.fog_color & 0x00FF_FFFF, factor)
+            } else {
+                rgb
             };
 
             if fast_blend || flat_fill {

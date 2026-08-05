@@ -6,7 +6,8 @@ use super::{
     D3DBLEND_DESTALPHA, D3DBLEND_DESTCOLOR, D3DBLEND_INVDESTCOLOR, D3DBLEND_INVSRCALPHA,
     D3DBLEND_INVSRCCOLOR, D3DBLEND_SRCALPHA, D3DBLEND_SRCCOLOR, D3DBLEND_ZERO,
     D3DBLENDOP_REVSUBTRACT, D3DBLENDOP_SUBTRACT, D3DCMP_EQUAL, D3DCMP_GREATER, D3DCMP_GREATEREQUAL,
-    D3DCMP_LESS, D3DCMP_LESSEQUAL, D3DCMP_NEVER, D3DCMP_NOTEQUAL,
+    D3DCMP_LESS, D3DCMP_LESSEQUAL, D3DCMP_NEVER, D3DCMP_NOTEQUAL, D3DFOG_EXP, D3DFOG_EXP2,
+    D3DFOG_LINEAR,
 };
 
 // ── Typed render-state values (D3DRS_* / D3DTSS_* / D3DSAMP_*) ─────────
@@ -307,6 +308,68 @@ pub(super) fn blend_fragment(dst: u32, src: u32, alpha: u8, frag: &FragmentState
 #[must_use]
 pub fn is_top_or_left_edge(dx: f32, dy: f32) -> bool {
     if dx == 0.0 { dy < 0.0 } else { dx > 0.0 }
+}
+/// The D3D9 alpha test: whether a fragment's alpha passes `D3DRS_ALPHAFUNC`
+/// against `D3DRS_ALPHAREF`.
+///
+/// The compare is exact `u8` math (no float conversion); unknown funcs pass
+/// (the same lenient fallback as [`depth_test`]).
+#[must_use]
+pub fn alpha_test_pass(alpha: u8, func: u32, reference: u8) -> bool {
+    match func {
+        D3DCMP_NEVER => false,
+        D3DCMP_LESS => alpha < reference,
+        D3DCMP_EQUAL => alpha == reference,
+        D3DCMP_LESSEQUAL => alpha <= reference,
+        D3DCMP_GREATER => alpha > reference,
+        D3DCMP_NOTEQUAL => alpha != reference,
+        D3DCMP_GREATEREQUAL => alpha >= reference,
+        // D3DCMP_ALWAYS and unknown funcs always pass.
+        _ => true,
+    }
+}
+/// The D3D9 fog factor for a depth `z` under `mode` (`D3DFOGMODE_*`).
+///
+/// `f = 1` at the fog start (no fog), `f = 0` at the fog end (fully fogged),
+/// per the D3D9 formulas: LINEAR `(end - z) / (end - start)`, EXP
+/// `e^(-z·density)`, EXP2 `e^(-(z·density)²)`. `D3DFOG_NONE` and unknown modes
+/// yield 1.0 — no fog. The result is clamped to `[0, 1]`.
+#[must_use]
+pub fn fog_factor(frag: &FragmentState<'_>, mode: u32, z: f32) -> f32 {
+    match mode {
+        D3DFOG_LINEAR => {
+            let span = frag.fog_end - frag.fog_start;
+            if span == 0.0 {
+                1.0
+            } else {
+                ((frag.fog_end - z) / span).clamp(0.0, 1.0)
+            }
+        }
+        D3DFOG_EXP => (-z * frag.fog_density).exp().clamp(0.0, 1.0),
+        D3DFOG_EXP2 => {
+            let scaled = z * frag.fog_density;
+            (-(scaled * scaled)).exp().clamp(0.0, 1.0)
+        }
+        // D3DFOG_NONE and unknown modes apply no fog.
+        _ => 1.0,
+    }
+}
+/// Blend a fragment's 0RGB color toward the fog color by `factor` (0 = fully
+/// fogged, 1 = no fog): `out = fog·(1 − f) + color·f` per channel, rounded.
+///
+/// `#[expect(casts)]`: channel bytes widen to `f32` for the blend and the
+/// result narrows back — `std` has no lossless float↔int `From`; the rounded
+/// result is clamped to 0..255 before narrowing.
+#[must_use]
+pub fn fog_blend(rgb: u32, fog: u32, factor: f32) -> u32 {
+    let channel = |shift: u32| {
+        let pixel = f32::from(u8::try_from((rgb >> shift) & 0xFF).unwrap_or(0));
+        let fog_ch = f32::from(u8::try_from((fog >> shift) & 0xFF).unwrap_or(0));
+        (fog_ch * (1.0 - factor) + pixel * factor)
+            .round()
+            .clamp(0.0, 255.0) as u32
+    };
+    (channel(16) << 16) | (channel(8) << 8) | channel(0)
 }
 #[must_use]
 pub(super) fn edge_inside(e: f32, dx: f32, dy: f32) -> bool {

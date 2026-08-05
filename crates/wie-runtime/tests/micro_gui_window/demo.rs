@@ -3,23 +3,29 @@
 //! gui_demo click-driven dialog paths.
 
 use crate::helpers::{
-    BTNFACE_0RGB, D3D9_BLEND_0RGB, D3D9_CLEAR_RED_0RGB, D3D9_CYAN_0RGB, D3D9_FAR_DEPTH_0RGB,
-    D3D9_NEAR_DEPTH_0RGB, D3D9_QUAD_BLUE_0RGB, D3D9_QUAD_GREEN_0RGB, D3D9_QUAD_RED_0RGB,
-    D3D9_QUAD_WHITE_0RGB, D3D9_RED_QUAD_0RGB, D3D9_RESTING_FRAME_HASH, DIALOG_OK_BUTTON_SAMPLE,
+    BTNFACE_0RGB, D3D9_ALPHA_PASS_0RGB, D3D9_BLEND_0RGB, D3D9_CLEAR_RED_0RGB, D3D9_CYAN_0RGB,
+    D3D9_FAR_DEPTH_0RGB, D3D9_FOGGED_0RGB, D3D9_NEAR_DEPTH_0RGB, D3D9_QUAD_BLUE_0RGB,
+    D3D9_QUAD_GREEN_0RGB, D3D9_QUAD_RED_0RGB, D3D9_QUAD_WHITE_0RGB, D3D9_RED_QUAD_0RGB,
+    D3D9_RESTING_FRAME_HASH, D3D9_SCISSOR_INSIDE_0RGB, DIALOG_OK_BUTTON_SAMPLE,
     GUI_BLIT_RESTING_FRAME_HASH, assert_frame_renders_gradient_text_and_controls,
     drive_gui_session, frame_hash, gui_suite_serialize, micro_exe,
 };
 
 /// Run gui_d3d9 end-to-end and prove the P3 D3D9 software-render slice:
 /// CreateDevice → Clear(red) → BeginScene → DrawPrimitiveUP (gradient
-/// triangle) → DrawIndexedPrimitiveUP (solid cyan triangle) → EndScene →
-/// Present publishes a SurfaceFrame through the GDI-shared pipeline.
+/// triangle) → DrawIndexedPrimitiveUP (solid cyan triangle) → the L1 vs_2_0 +
+/// w-skewed quads → the L3 alpha-test/fog/scissor strip → EndScene → Present
+/// publishes a SurfaceFrame through the GDI-shared pipeline.
 ///
 /// The exe exits 0 only if every D3D9 call's HRESULT succeeded AND
 /// GetDeviceCaps honestly reported the P5a caps (ps_2_0, vs stage still 0)
-/// AND the SetViewport/GetViewport round-trip matched. Pixel checks pin the
-/// rendered frame: clear red outside the triangles, the blended gradient
-/// triangle, and the solid cyan indexed triangle.
+/// AND the SetViewport/GetViewport round-trip matched AND the L3 state
+/// surface held (D3DERR_INVALIDCALL on an out-of-range value, the raw-value
+/// GetRenderState round-trip, the fog/alpha/scissor state round-trips, and
+/// the GetTransform / MultiplyTransform / D3DTS_TEXTURE0 round-trips). Pixel
+/// checks pin the rendered frame: clear red outside the triangles, the
+/// blended gradient triangle, the solid cyan indexed triangle, and the L3
+/// strip's alpha-tested / fogged / scissor-clipped colors.
 #[test]
 fn gui_d3d9_renders_clear_and_triangle() {
     let Some(path) = micro_exe("gui_d3d9.exe") else {
@@ -98,6 +104,16 @@ fn gui_d3d9_renders_clear_and_triangle() {
                 // after the w-divide, where the affine interpolant
                 // (≈(0.532,0.466)) would land on the GREEN texel.
                 && frame.pixels.get(idx(165, 175)).copied() == Some(D3D9_QUAD_RED_0RGB)
+                // L3 fragment stages (the y∈[220,235] strip): the alpha-test
+                // quad's failing left half shows the clear red, the passing
+                // right half draws white; the fog quad is red under blue
+                // LINEAR fog at f=0.5 → (128,0,128); the scissor quad draws
+                // green inside the rect and clear red outside it.
+                && frame.pixels.get(idx(110, 227)).copied() == Some(D3D9_CLEAR_RED_0RGB)
+                && frame.pixels.get(idx(140, 227)).copied() == Some(D3D9_ALPHA_PASS_0RGB)
+                && frame.pixels.get(idx(170, 227)).copied() == Some(D3D9_FOGGED_0RGB)
+                && frame.pixels.get(idx(197, 227)).copied() == Some(D3D9_SCISSOR_INSIDE_0RGB)
+                && frame.pixels.get(idx(212, 227)).copied() == Some(D3D9_CLEAR_RED_0RGB)
                 // The whole 320x240 frame is deterministic CPU output — gate it.
                 && frame_hash(&frame, 0, frame.height) == D3D9_RESTING_FRAME_HASH
             {

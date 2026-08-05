@@ -28,6 +28,19 @@ pub struct D3D9State {
     /// Typed device render state (`D3DRS_*`), decoded at the Set/GetRenderState
     /// register boundary.
     pub(crate) d3d9_render_state: crate::d3d9_render::RenderState,
+    /// Last-set raw values for unmodeled `D3DRS_*` states.
+    ///
+    /// The round-trip fidelity layer: `GetRenderState` returns exactly what
+    /// the guest last set — modeled states read the typed struct, ignored
+    /// states read this map (0 when never set).
+    pub(crate) d3d9_render_state_raw: HashMap<u32, u32>,
+    /// The `SetScissorRect` rect in backbuffer coords (None = never set —
+    /// the scissor test never clips).
+    pub(crate) d3d9_scissor_rect: Option<crate::gdi32::IRect>,
+    /// Fixed-function texture-space transforms (`D3DTS_TEXTURE0..7`), stored
+    /// for the `Set/GetTransform` + `MultiplyTransform` round-trips; the
+    /// actual texgen runs in a later slice.
+    pub(crate) d3d9_texture_matrices: [[f32; 16]; 8],
     /// Per-stage texture state (TSS + sampler), indexed by stage (0..8).
     pub(crate) d3d9_stage_states: [crate::d3d9_render::TextureStageState; 8],
     pub(crate) d3d9_device_object_address: u64,
@@ -103,6 +116,9 @@ impl Default for D3D9State {
             d3d9_current_vertex_shader: 0,
             d3d9_current_fvf: 0,
             d3d9_render_state: crate::d3d9_render::RenderState::default(),
+            d3d9_render_state_raw: HashMap::new(),
+            d3d9_scissor_rect: None,
+            d3d9_texture_matrices: [crate::d3d9_render::IDENTITY; 8],
             d3d9_stage_states: std::array::from_fn(|_| {
                 crate::d3d9_render::TextureStageState::default()
             }),

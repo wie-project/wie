@@ -13,9 +13,9 @@ LDFLAGS  := -nostdlib -Wl,--subsystem,console -Wl,--entry,entry
 # Ordinary CRT-linked apps (independent-style): full toolchain defaults.
 CRT_CFLAGS := -O2
 
-.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes dll_tests game_exes interactive_exes ucrt_coverage gui_exes print_bmp
+.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes dll_tests game_exes interactive_exes ucrt_coverage gui_exes print_bmp version_query
 
-all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes game_exes interactive_exes dll_tests ucrt_coverage gui_exes
+all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes game_exes interactive_exes dll_tests ucrt_coverage gui_exes version_query
 
 $(OUT):
 	mkdir -p $(OUT)
@@ -53,6 +53,7 @@ snake: $(OUT)/snake.exe
 seh_access_violation: $(OUT)/seh_access_violation.exe
 seh_div_zero: $(OUT)/seh_div_zero.exe
 print_bmp: $(OUT)/print_bmp.exe
+version_query: $(OUT)/version_query.exe
 
 # Print-DC pipeline (P1a): CreateDCW → StartDocW → StartPage/EndPage → EndDoc.
 $(OUT)/print_bmp.exe: print_bmp/main.c | $(OUT)
@@ -324,6 +325,15 @@ $(OUT)/gui_demo.exe: gui_demo/main.c $(OUT)/gui_demo_res.o | $(OUT)
 
 $(OUT)/gui_d3d9.exe: gui_d3d9/main.c | $(OUT)
 	$(MINGW_CC) $(GUI_CFLAGS) $(GUI_LDFLAGS) -o $@ $< $(GUI_LIBS) -ld3d9
+	@echo "built $@"
+
+# Version API (version.dll): the RT_VERSION resource comes from windres.
+$(OUT)/version_query_res.o: version_query/version.rc | $(OUT)
+	$(WINDRES) version_query/version.rc -o $@
+	@echo "built $@"
+
+$(OUT)/version_query.exe: version_query/main.c $(OUT)/version_query_res.o | $(OUT)
+	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ version_query/main.c $(OUT)/version_query_res.o -lkernel32 -lversion
 	@echo "built $@"
 
 clean:

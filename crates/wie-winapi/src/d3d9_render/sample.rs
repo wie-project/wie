@@ -39,6 +39,10 @@ pub struct TextureStage<'a> {
 ///
 /// `depth` is the bound depth buffer (None = no depth surface). The backbuffer
 /// stays 0RGB — the fragment alpha feeds the blend factors only.
+///
+/// The L3 fragment stages (fog, alpha test, scissor) ride here too: the
+/// rasterizer applies them in D3D9's order — scissor clip first, then the
+/// depth test, then the alpha test, then the fog blend, then the color blend.
 #[derive(Debug)]
 pub struct FragmentState<'a> {
     /// Bound depth buffer texels (None = no depth surface).
@@ -57,6 +61,32 @@ pub struct FragmentState<'a> {
     pub dest_blend: u32,
     /// `D3DRS_BLENDOP` (`D3DBLENDOP_*`).
     pub blend_op: u32,
+    // ── L3 fragment stages (fog / alpha test / scissor) ────────────────
+    /// `D3DRS_FOGENABLE` (bool as u32).
+    pub fog_enable: u32,
+    /// `D3DRS_FOGCOLOR` (D3DCOLOR; the fragment stage masks to 0RGB).
+    pub fog_color: u32,
+    /// `D3DRS_FOGSTART` — linear fog depth start.
+    pub fog_start: f32,
+    /// `D3DRS_FOGEND` — linear fog depth end.
+    pub fog_end: f32,
+    /// `D3DRS_FOGDENSITY` — EXP/EXP2 density.
+    pub fog_density: f32,
+    /// `D3DRS_FOGTABLEMODE` (`D3DFOGMODE_*`; non-NONE = pixel fog).
+    pub fog_table_mode: u32,
+    /// `D3DRS_FOGVERTEXMODE` (`D3DFOGMODE_*`; used when table mode is NONE).
+    pub fog_vertex_mode: u32,
+    /// `D3DRS_ALPHATESTENABLE` (bool as u32).
+    pub alpha_test: u32,
+    /// `D3DRS_ALPHAFUNC` (`D3DCMP_*`).
+    pub alpha_func: u32,
+    /// `D3DRS_ALPHAREF` (the alpha-test reference).
+    pub alpha_ref: u8,
+    /// `D3DRS_SCISSORTESTENABLE` (bool as u32).
+    pub scissor_test: u32,
+    /// The `SetScissorRect` rect in backbuffer coords (None = never set —
+    /// the scissor test never clips).
+    pub scissor: Option<crate::gdi32::IRect>,
 }
 /// Resolve a texel index from a raw (texel-space) index with the address mode.
 ///

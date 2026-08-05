@@ -13,6 +13,7 @@ mod kernel32;
 mod shell32;
 mod user32;
 mod uxtheme;
+mod version;
 mod winmm;
 
 use crate::dispatch_table::WinApiId;
@@ -34,6 +35,7 @@ static WINAPI_NAME_ROWS: &[&[(&str, &str, WinApiId)]] = &[
     winmm::ROWS,
     d3d9::ROWS,
     shell32::ROWS,
+    version::ROWS,
 ];
 
 /// Resolve library/export to id. Case-insensitive, allocation-free.
@@ -364,7 +366,7 @@ mod tests {
         // `::` at the camel-case boundary of a D3D9 interface method.
         const DLL_PREFIXES: &[&str] = &[
             "Kernel32", "User32", "Gdi32", "Advapi32", "Comctl32", "Comdlg32", "Shell32",
-            "Uxtheme", "Winmm", "D3d9",
+            "Uxtheme", "Winmm", "D3d9", "Version",
         ];
         let debug = format!("{id:?}");
         let (prefix, suffix) = DLL_PREFIXES

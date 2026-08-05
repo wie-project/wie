@@ -9,7 +9,7 @@ pub use names::{is_winapi_implemented, resolve_winapi_id, winapi_id_export};
 
 use crate::{
     HandlerContext, WinApiHandlerResult, advapi32, comctl32, comdlg32, d3d9, gdi32, kernel32,
-    shell32, user32, uxtheme, winmm,
+    shell32, user32, uxtheme, version, winmm,
 };
 use anyhow::{Result, bail};
 use strum::{EnumCount, FromRepr};
@@ -570,17 +570,60 @@ pub enum WinApiId {
     D3d9Idirect3ddevice9Getstreamsource = 476,
     /// Appended here (not adjacent to the other D3D9 ids) to avoid renumbering the entire enum.
     D3d9Idirect3ddevice9Getindices = 477,
+    /// Appended here (not adjacent to the other DLL ids) to avoid renumbering the entire enum.
+    VersionGetfileversioninfosizew = 478,
+    /// Appended here (not adjacent to the other DLL ids) to avoid renumbering the entire enum.
+    VersionGetfileversioninfosizea = 479,
+    /// Appended here (not adjacent to the other DLL ids) to avoid renumbering the entire enum.
+    VersionGetfileversioninfosizeexw = 480,
+    /// Appended here (not adjacent to the other DLL ids) to avoid renumbering the entire enum.
+    VersionGetfileversioninfosizeexa = 481,
+    /// Appended here (not adjacent to the other DLL ids) to avoid renumbering the entire enum.
+    VersionGetfileversioninfow = 482,
+    /// Appended here (not adjacent to the other DLL ids) to avoid renumbering the entire enum.
+    VersionGetfileversioninfoa = 483,
+    /// Appended here (not adjacent to the other DLL ids) to avoid renumbering the entire enum.
+    VersionGetfileversioninfoexw = 484,
+    /// Appended here (not adjacent to the other DLL ids) to avoid renumbering the entire enum.
+    VersionGetfileversioninfoexa = 485,
+    /// Appended here (not adjacent to the other DLL ids) to avoid renumbering the entire enum.
+    VersionVerqueryvaluew = 486,
+    /// Appended here (not adjacent to the other DLL ids) to avoid renumbering the entire enum.
+    VersionVerqueryvaluea = 487,
+    /// Appended here (not adjacent to the other DLL ids) to avoid renumbering the entire enum.
+    VersionGetfileversioninfobyhandlew = 488,
+    /// Appended here (not adjacent to the other DLL ids) to avoid renumbering the entire enum.
+    VersionGetfileversioninfobyhandlea = 489,
+    /// Appended here (not adjacent to the other DLL ids) to avoid renumbering the entire enum.
+    VersionVerlanguagenamew = 490,
+    /// Appended here (not adjacent to the other DLL ids) to avoid renumbering the entire enum.
+    VersionVerlanguagenamea = 491,
+    /// Appended here (not adjacent to the other DLL ids) to avoid renumbering the entire enum.
+    VersionVerfindfilew = 492,
+    /// Appended here (not adjacent to the other DLL ids) to avoid renumbering the entire enum.
+    VersionVerfindfilea = 493,
+    /// Appended here (not adjacent to the other DLL ids) to avoid renumbering the entire enum.
+    VersionVerinstallfilew = 494,
+    /// Appended here (not adjacent to the other DLL ids) to avoid renumbering the entire enum.
+    VersionVerinstallfilea = 495,
+    /// Appended here (not adjacent to the other D3D9 ids) to avoid renumbering the entire enum.
+    D3d9Idirect3ddevice9Gettransform = 496,
+    /// Appended here (not adjacent to the other D3D9 ids) to avoid renumbering the entire enum.
+    D3d9Idirect3ddevice9Multiplytransform = 497,
+    /// Appended here (not adjacent to the other D3D9 ids) to avoid renumbering the entire enum.
+    D3d9Idirect3ddevice9Setscissorrect = 498,
 }
 
 /// Number of dense [`WinApiId`] discriminants, i.e. one past the highest one.
 ///
 /// This is the size every discriminant-indexed array (`WINAPI_TRAITS`) needs,
 /// and it is NOT the same as strum's variant count: the enum has two
-/// discriminant holes (109/110, from APIs removed before the appends began), so
-/// `WinApiId::COUNT` is 476 while the highest discriminant is 477. Deriving
-/// from the final variant keeps the alias correct by construction: appending a
-/// variant with a higher discriminant updates this constant with it.
-pub const WINAPI_ID_COUNT: usize = WinApiId::D3d9Idirect3ddevice9Getindices.to_u16() as usize + 1;
+/// discriminant holes (109/110, from APIs removed before the appends began),
+/// so `WinApiId::COUNT` is lower. Deriving from the final variant keeps the
+/// alias correct by construction: appending a variant with a higher
+/// discriminant updates this constant with it.
+pub const WINAPI_ID_COUNT: usize =
+    WinApiId::D3d9Idirect3ddevice9Setscissorrect.to_u16() as usize + 1;
 
 impl WinApiId {
     /// Discriminant as `u16` (`#[repr(u16)]`).
@@ -924,6 +967,9 @@ pub fn dispatch_winapi_id(
         WinApiId::D3d9Idirect3ddevice9Endscene => d3d9::handle_end_scene(ctx),
         WinApiId::D3d9Idirect3ddevice9Clear => d3d9::handle_clear(ctx),
         WinApiId::D3d9Idirect3ddevice9Settransform => d3d9::handle_set_transform(ctx),
+        WinApiId::D3d9Idirect3ddevice9Gettransform => d3d9::handle_get_transform(ctx),
+        WinApiId::D3d9Idirect3ddevice9Multiplytransform => d3d9::handle_multiply_transform(ctx),
+        WinApiId::D3d9Idirect3ddevice9Setscissorrect => d3d9::handle_set_scissor_rect(ctx),
         WinApiId::D3d9Idirect3ddevice9Setviewport => d3d9::handle_set_viewport(ctx),
         WinApiId::D3d9Idirect3ddevice9Getviewport => d3d9::handle_get_viewport(ctx),
         WinApiId::D3d9Idirect3ddevice9Drawprimitive => d3d9::handle_draw_primitive(ctx),
@@ -1002,6 +1048,36 @@ pub fn dispatch_winapi_id(
         WinApiId::D3d9Idirect3dindexbuffer9Getdesc => d3d9::handle_index_buffer_get_desc(ctx),
         WinApiId::D3d9Idirect3ddevice9Getstreamsource => d3d9::handle_get_stream_source(ctx),
         WinApiId::D3d9Idirect3ddevice9Getindices => d3d9::handle_get_indices(ctx),
+        WinApiId::VersionGetfileversioninfosizew => {
+            version::handle_get_file_version_info_size_w(ctx)
+        }
+        WinApiId::VersionGetfileversioninfosizea => {
+            version::handle_get_file_version_info_size_a(ctx)
+        }
+        WinApiId::VersionGetfileversioninfosizeexw => {
+            version::handle_get_file_version_info_size_ex_w(ctx)
+        }
+        WinApiId::VersionGetfileversioninfosizeexa => {
+            version::handle_get_file_version_info_size_ex_a(ctx)
+        }
+        WinApiId::VersionGetfileversioninfow => version::handle_get_file_version_info_w(ctx),
+        WinApiId::VersionGetfileversioninfoa => version::handle_get_file_version_info_a(ctx),
+        WinApiId::VersionGetfileversioninfoexw => version::handle_get_file_version_info_ex_w(ctx),
+        WinApiId::VersionGetfileversioninfoexa => version::handle_get_file_version_info_ex_a(ctx),
+        WinApiId::VersionVerqueryvaluew => version::handle_ver_query_value_w(ctx),
+        WinApiId::VersionVerqueryvaluea => version::handle_ver_query_value_a(ctx),
+        WinApiId::VersionGetfileversioninfobyhandlew => {
+            version::handle_get_file_version_info_by_handle_w(ctx)
+        }
+        WinApiId::VersionGetfileversioninfobyhandlea => {
+            version::handle_get_file_version_info_by_handle_a(ctx)
+        }
+        WinApiId::VersionVerlanguagenamew => version::handle_ver_language_name_w(ctx),
+        WinApiId::VersionVerlanguagenamea => version::handle_ver_language_name_a(ctx),
+        WinApiId::VersionVerfindfilew => version::handle_ver_find_file_w(ctx),
+        WinApiId::VersionVerfindfilea => version::handle_ver_find_file_a(ctx),
+        WinApiId::VersionVerinstallfilew => version::handle_ver_install_file_w(ctx),
+        WinApiId::VersionVerinstallfilea => version::handle_ver_install_file_a(ctx),
         WinApiId::User32Enablemenuitem => user32::handle_enable_menu_item(ctx),
         WinApiId::User32Checkmenuitem => user32::handle_check_menu_item(ctx),
         WinApiId::User32Getmessagea => user32::handle_get_message_a(ctx),
@@ -1384,10 +1460,10 @@ mod tests {
     /// an append/renumber/backfill shows up as a test diff.
     #[test]
     fn count_is_pinned_to_enum() {
-        let last_plus_one = usize::from(WinApiId::D3d9Idirect3ddevice9Getindices.to_u16()) + 1;
+        let last_plus_one = usize::from(WinApiId::D3d9Idirect3ddevice9Setscissorrect.to_u16()) + 1;
         assert_eq!(WINAPI_ID_COUNT, last_plus_one);
-        assert_eq!(WINAPI_ID_COUNT, 478);
-        assert_eq!(WinApiId::COUNT, 476); // 476 variants, two discriminant holes
+        assert_eq!(WINAPI_ID_COUNT, 499);
+        assert_eq!(WinApiId::COUNT, 497); // 497 variants, two discriminant holes
     }
 
     /// Every discriminant is either a round-trippable variant (its `to_u16`
@@ -1406,6 +1482,6 @@ mod tests {
         }
         // The final variant is exactly the highest discriminant.
         let last = u16::try_from(WINAPI_ID_COUNT - 1).expect("count fits u16");
-        assert_eq!(WinApiId::D3d9Idirect3ddevice9Getindices.to_u16(), last);
+        assert_eq!(WinApiId::D3d9Idirect3ddevice9Setscissorrect.to_u16(), last);
     }
 }

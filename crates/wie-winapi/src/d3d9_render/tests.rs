@@ -27,6 +27,18 @@ fn no_frag() -> super::FragmentState<'static> {
         src_blend: super::D3DBLEND_ONE,
         dest_blend: super::D3DBLEND_ZERO,
         blend_op: super::D3DBLENDOP_ADD,
+        fog_enable: 0,
+        fog_color: 0,
+        fog_start: 0.0,
+        fog_end: 1.0,
+        fog_density: 1.0,
+        fog_table_mode: super::D3DFOG_NONE,
+        fog_vertex_mode: super::D3DFOG_NONE,
+        alpha_test: 0,
+        alpha_func: super::D3DCMP_ALWAYS,
+        alpha_ref: 0,
+        scissor_test: 0,
+        scissor: None,
     }
 }
 
@@ -35,14 +47,11 @@ fn blend_add_src_alpha_inv_src_alpha() {
     // src blue (0,0,255) at alpha 0x80 over dst red (255,0,0):
     // out = (src*128 + dst*127) >> 8 per channel.
     let frag = super::FragmentState {
-        depth: None,
-        z_enable: 0,
-        z_func: super::D3DCMP_LESSEQUAL,
-        z_write: 1,
         alpha_blend: 1,
         src_blend: D3DBLEND_SRCALPHA,
         dest_blend: D3DBLEND_INVSRCALPHA,
         blend_op: D3DBLENDOP_ADD,
+        ..no_frag()
     };
     let out = blend_fragment(0x00FF_0000, 0x0000_00FF, 0x80, &frag);
     let er = (255_u32 * 127) >> 8;
@@ -60,14 +69,11 @@ fn blend_op_subtract_and_revsubtract_clamp_at_zero() {
     // Factors are 8-bit fixed point (value>>8), so ONE = 255 and
     // out = (src*255 - dst*255) >> 8.
     let sub = super::FragmentState {
-        depth: None,
-        z_enable: 0,
-        z_func: super::D3DCMP_LESSEQUAL,
-        z_write: 1,
         alpha_blend: 1,
         src_blend: super::D3DBLEND_ONE,
         dest_blend: super::D3DBLEND_ONE,
         blend_op: D3DBLENDOP_SUBTRACT,
+        ..no_frag()
     };
     // src red 0x80 over dst red 0x40 → (128*255 - 64*255) >> 8 = 63.
     assert_eq!(
@@ -82,14 +88,11 @@ fn blend_op_subtract_and_revsubtract_clamp_at_zero() {
     );
     // REVSUBTRACT swaps the operands.
     let rev = super::FragmentState {
-        depth: None,
-        z_enable: 0,
-        z_func: super::D3DCMP_LESSEQUAL,
-        z_write: 1,
         alpha_blend: 1,
         src_blend: super::D3DBLEND_ONE,
         dest_blend: super::D3DBLEND_ONE,
         blend_op: D3DBLENDOP_REVSUBTRACT,
+        ..no_frag()
     };
     // src red 0x40 over dst red 0x80 → (128*255 - 64*255) >> 8 = 63.
     assert_eq!(
@@ -102,14 +105,11 @@ fn blend_op_subtract_and_revsubtract_clamp_at_zero() {
 #[test]
 fn blend_unknown_factor_falls_back_to_one() {
     let frag = super::FragmentState {
-        depth: None,
-        z_enable: 0,
-        z_func: super::D3DCMP_LESSEQUAL,
-        z_write: 1,
         alpha_blend: 1,
         src_blend: 0xDEAD,
         dest_blend: super::D3DBLEND_ZERO,
         blend_op: D3DBLENDOP_ADD,
+        ..no_frag()
     };
     // Unknown src factor → ONE (255): out = (src*255 + dst*0) >> 8, i.e.
     // each channel scales by 255/256 (the documented fixed-point approx).
@@ -1523,5 +1523,459 @@ fn perspective_interpolation_differs_from_affine_at_w_skewed_center() {
     assert!(
         affine_u >= 0.5 && affine_v < 0.5,
         "the affine uv must land in the GREEN texel quadrant"
+    );
+}
+
+// ── L3 fragment stages: fog / alpha test / scissor + the validation matrix ──
+
+/// A screen-space vertex helper (constant z, color).
+fn sv(x: f32, y: f32, z: f32, color: u32) -> ScreenVertex {
+    ScreenVertex {
+        x,
+        y,
+        z,
+        w: 1.0,
+        color,
+        u: 0.0,
+        v: 0.0,
+    }
+}
+
+#[test]
+fn fog_linear_factor_and_blend() {
+    // LINEAR: f = (end - z) / (end - start), clamped to [0, 1]. The fragment
+    // state carries the fog start/end; the mode selects the formula.
+    let frag = super::FragmentState {
+        fog_start: 0.25,
+        fog_end: 0.75,
+        ..no_frag()
+    };
+    // At the fog start the factor is 1 (no fog); at the end 0 (fully fogged).
+    assert_eq!(super::fog_factor(&frag, super::D3DFOG_LINEAR, 0.25), 1.0);
+    assert_eq!(super::fog_factor(&frag, super::D3DFOG_LINEAR, 0.75), 0.0);
+    // Mid-range (the demo quad at z=0.5): 0.25/0.5 are exactly representable,
+    // so f is exactly 0.5 (not 0.50000006 — the 0.4/0.6 pair is not).
+    assert_eq!(super::fog_factor(&frag, super::D3DFOG_LINEAR, 0.5), 0.5);
+    // Out of range clamps.
+    assert_eq!(super::fog_factor(&frag, super::D3DFOG_LINEAR, 0.0), 1.0);
+    assert_eq!(super::fog_factor(&frag, super::D3DFOG_LINEAR, 1.0), 0.0);
+    // D3DFOG_NONE and unknown modes apply no fog.
+    assert_eq!(super::fog_factor(&frag, super::D3DFOG_NONE, 0.5), 1.0);
+    assert_eq!(super::fog_factor(&frag, 0xDEAD, 0.5), 1.0);
+
+    // EXP / EXP2 from the density.
+    let exp_frag = super::FragmentState {
+        fog_density: 1.0,
+        ..no_frag()
+    };
+    // e^-1 ≈ 0.367879.
+    assert!((super::fog_factor(&exp_frag, super::D3DFOG_EXP, 1.0) - 0.36787944).abs() < 1e-6);
+    // e^-(1²) = e^-1.
+    assert!((super::fog_factor(&exp_frag, super::D3DFOG_EXP2, 1.0) - 0.36787944).abs() < 1e-6);
+
+    // The blend: out = fog·(1−f) + color·f, per channel, rounded. Red under
+    // blue fog at f=0.5 → (128, 0, 128) — the demo's deterministic pixel.
+    assert_eq!(super::fog_blend(0x00FF_0000, 0x0000_00FF, 0.5), 0x0080_0080);
+    // f=1 keeps the color; f=0 yields the fog color.
+    assert_eq!(super::fog_blend(0x00FF_0000, 0x0000_00FF, 1.0), 0x00FF_0000);
+    assert_eq!(super::fog_blend(0x00FF_0000, 0x0000_00FF, 0.0), 0x0000_00FF);
+    // The alpha byte is masked out before the blend.
+    assert_eq!(super::fog_blend(0x80FF_0000, 0x0000_00FF, 0.5), 0x0080_0080);
+}
+
+#[test]
+fn alpha_test_matrix() {
+    // Each D3DCMP_* against a reference of 0x40.
+    assert!(!super::alpha_test_pass(0x20, super::D3DCMP_NEVER, 0x40));
+    assert!(super::alpha_test_pass(0x20, super::D3DCMP_LESS, 0x40));
+    assert!(!super::alpha_test_pass(0x80, super::D3DCMP_LESS, 0x40));
+    assert!(super::alpha_test_pass(0x40, super::D3DCMP_EQUAL, 0x40));
+    assert!(super::alpha_test_pass(0x20, super::D3DCMP_LESSEQUAL, 0x40));
+    assert!(super::alpha_test_pass(0x40, super::D3DCMP_LESSEQUAL, 0x40));
+    assert!(!super::alpha_test_pass(0x80, super::D3DCMP_LESSEQUAL, 0x40));
+    // The demo's gate: GREATER with ref 0x40 — 0x20 fails, 0x80 passes.
+    assert!(!super::alpha_test_pass(0x20, super::D3DCMP_GREATER, 0x40));
+    assert!(super::alpha_test_pass(0x80, super::D3DCMP_GREATER, 0x40));
+    assert!(!super::alpha_test_pass(0x40, super::D3DCMP_GREATER, 0x40));
+    assert!(super::alpha_test_pass(0x20, super::D3DCMP_NOTEQUAL, 0x40));
+    assert!(!super::alpha_test_pass(0x40, super::D3DCMP_NOTEQUAL, 0x40));
+    assert!(super::alpha_test_pass(
+        0x80,
+        super::D3DCMP_GREATEREQUAL,
+        0x40
+    ));
+    assert!(super::alpha_test_pass(
+        0x40,
+        super::D3DCMP_GREATEREQUAL,
+        0x40
+    ));
+    assert!(super::alpha_test_pass(0x20, super::D3DCMP_ALWAYS, 0x40));
+    // Unknown funcs pass (the documented lenient fallback).
+    assert!(super::alpha_test_pass(0x20, 0xDEAD, 0x40));
+}
+
+#[test]
+fn render_state_validation_matrix() {
+    use super::*;
+    // Booleans: only 0/1.
+    for state in [
+        D3DRS_ALPHABLENDENABLE,
+        D3DRS_ZWRITEENABLE,
+        D3DRS_FOGENABLE,
+        D3DRS_RANGEFOGENABLE,
+        D3DRS_ALPHATESTENABLE,
+        D3DRS_SCISSORTESTENABLE,
+    ] {
+        assert!(render_state_value_valid(state, 0), "{state} FALSE");
+        assert!(render_state_value_valid(state, 1), "{state} TRUE");
+        assert!(!render_state_value_valid(state, 2), "{state} rejects 2");
+    }
+    // D3DZB_* depth modes.
+    assert!(render_state_value_valid(D3DRS_ZENABLE, 0));
+    assert!(render_state_value_valid(D3DRS_ZENABLE, 2));
+    assert!(!render_state_value_valid(D3DRS_ZENABLE, 3));
+    // D3DCMP_* ranges.
+    for state in [D3DRS_ZFUNC, D3DRS_ALPHAFUNC] {
+        assert!(
+            render_state_value_valid(state, D3DCMP_NEVER),
+            "{state} NEVER"
+        );
+        assert!(
+            render_state_value_valid(state, D3DCMP_ALWAYS),
+            "{state} ALWAYS"
+        );
+        assert!(!render_state_value_valid(state, 0), "{state} rejects 0");
+        assert!(!render_state_value_valid(state, 9), "{state} rejects 9");
+    }
+    // The implemented D3DBLEND_* factors.
+    for state in [D3DRS_SRCBLEND, D3DRS_DESTBLEND] {
+        assert!(render_state_value_valid(state, D3DBLEND_ZERO));
+        assert!(render_state_value_valid(state, D3DBLEND_INVDESTCOLOR));
+        assert!(!render_state_value_valid(state, 0));
+        assert!(
+            !render_state_value_valid(state, 11),
+            "BLENDFACTOR unimplemented → reject"
+        );
+    }
+    // The implemented D3DBLENDOP_* ops.
+    assert!(render_state_value_valid(D3DRS_BLENDOP, D3DBLENDOP_ADD));
+    assert!(render_state_value_valid(
+        D3DRS_BLENDOP,
+        D3DBLENDOP_REVSUBTRACT
+    ));
+    assert!(!render_state_value_valid(D3DRS_BLENDOP, 0));
+    assert!(
+        !render_state_value_valid(D3DRS_BLENDOP, 4),
+        "MIN unimplemented → reject"
+    );
+    // D3DFOGMODE_*.
+    for state in [D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE] {
+        assert!(render_state_value_valid(state, D3DFOG_NONE));
+        assert!(render_state_value_valid(state, D3DFOG_LINEAR));
+        assert!(!render_state_value_valid(state, 4), "{state} rejects 4");
+    }
+    // ALPHAREF is a u8.
+    assert!(render_state_value_valid(D3DRS_ALPHAREF, 0));
+    assert!(render_state_value_valid(D3DRS_ALPHAREF, 255));
+    assert!(!render_state_value_valid(D3DRS_ALPHAREF, 256));
+    // Unmodeled states accept anything (the raw-value layer round-trips).
+    assert!(render_state_value_valid(0x1FF, 7));
+    assert!(render_state_value_valid(0xDEAD, 0xDEAD));
+    // Unconstrained modeled states accept any D3DCOLOR / float bits.
+    assert!(render_state_value_valid(D3DRS_FOGCOLOR, 0xDEAD_BEEF));
+    assert!(render_state_value_valid(D3DRS_FOGSTART, 0x7FC0_0000));
+}
+
+#[test]
+fn render_state_value_of_round_trips_modeled_states() {
+    let rs = super::RenderState {
+        alpha_blend_enable: true,
+        z_write_enable: false,
+        z_enable: super::D3dZBufferType::True,
+        z_func: super::D3dCmpFunc::Greater,
+        src_blend: super::D3dBlend::SrcAlpha,
+        dest_blend: super::D3dBlend::InvSrcAlpha,
+        blend_op: super::D3dBlendOp::RevSubtract,
+        fog_enable: true,
+        fog_color: 0x00FF_FF00,
+        fog_start: 0.25,
+        fog_end: 0.75,
+        fog_density: 0.5,
+        fog_table_mode: super::D3DFOG_LINEAR,
+        fog_vertex_mode: super::D3DFOG_NONE,
+        alpha_test_enable: true,
+        alpha_func: super::D3dCmpFunc::GreaterEqual,
+        alpha_ref: 0x80,
+        scissor_test_enable: true,
+    };
+    use super::*;
+    assert_eq!(rs.value_of(D3DRS_ALPHABLENDENABLE), Some(1));
+    assert_eq!(rs.value_of(D3DRS_ZWRITEENABLE), Some(0));
+    assert_eq!(rs.value_of(D3DRS_ZENABLE), Some(1));
+    assert_eq!(rs.value_of(D3DRS_ZFUNC), Some(5));
+    assert_eq!(rs.value_of(D3DRS_SRCBLEND), Some(5));
+    assert_eq!(rs.value_of(D3DRS_DESTBLEND), Some(6));
+    assert_eq!(rs.value_of(D3DRS_BLENDOP), Some(3));
+    assert_eq!(rs.value_of(D3DRS_FOGENABLE), Some(1));
+    assert_eq!(rs.value_of(D3DRS_FOGCOLOR), Some(0x00FF_FF00));
+    assert_eq!(rs.value_of(D3DRS_FOGSTART), Some(0.25_f32.to_bits()));
+    assert_eq!(rs.value_of(D3DRS_FOGEND), Some(0.75_f32.to_bits()));
+    assert_eq!(rs.value_of(D3DRS_FOGDENSITY), Some(0.5_f32.to_bits()));
+    assert_eq!(rs.value_of(D3DRS_FOGTABLEMODE), Some(3));
+    assert_eq!(rs.value_of(D3DRS_FOGVERTEXMODE), Some(0));
+    assert_eq!(rs.value_of(D3DRS_ALPHATESTENABLE), Some(1));
+    assert_eq!(rs.value_of(D3DRS_ALPHAFUNC), Some(7));
+    assert_eq!(rs.value_of(D3DRS_ALPHAREF), Some(0x80));
+    assert_eq!(rs.value_of(D3DRS_SCISSORTESTENABLE), Some(1));
+    // Unmodeled states have no typed value.
+    assert_eq!(rs.value_of(0x1FF), None);
+}
+
+#[test]
+fn rasterize_alpha_test_clips_failing_fragments() {
+    // A full-coverage triangle (bigger than the buffer) with vertex alpha
+    // 0x20 fails GREATER 0x40 — no pixels may be written (the flat_fill fast
+    // path is gated off, so the per-fragment alpha test actually runs).
+    let mut back = [0xFF_00_00_00_u32; 4 * 4];
+    let mut dirty = Some(IRect::empty());
+    let mut frag = super::FragmentState {
+        alpha_test: 1,
+        alpha_func: super::D3DCMP_GREATER,
+        alpha_ref: 0x40,
+        ..no_frag()
+    };
+    let alpha = 0x20_u32 << 24;
+    rasterize_triangle(
+        &mut back,
+        4,
+        4,
+        sv(-1.0, -1.0, 0.5, alpha | 0xFF_FF_FF),
+        sv(9.0, -1.0, 0.5, alpha | 0xFF_FF_FF),
+        sv(-1.0, 9.0, 0.5, alpha | 0xFF_FF_FF),
+        None,
+        None,
+        &mut frag,
+        &mut dirty,
+    );
+    assert_eq!(
+        back, [0xFF_00_00_00; 16],
+        "failing alpha test writes nothing"
+    );
+
+    // The same triangle at alpha 0x80 passes and fills the buffer.
+    let mut frag = super::FragmentState {
+        alpha_test: 1,
+        alpha_func: super::D3DCMP_GREATER,
+        alpha_ref: 0x40,
+        ..no_frag()
+    };
+    let alpha = 0x80_u32 << 24;
+    let mut dirty = Some(IRect::empty());
+    let mut back = [0xFF_00_00_00_u32; 4 * 4];
+    rasterize_triangle(
+        &mut back,
+        4,
+        4,
+        sv(-1.0, -1.0, 0.5, alpha | 0xFF_FF_FF),
+        sv(9.0, -1.0, 0.5, alpha | 0xFF_FF_FF),
+        sv(-1.0, 9.0, 0.5, alpha | 0xFF_FF_FF),
+        None,
+        None,
+        &mut frag,
+        &mut dirty,
+    );
+    assert_eq!(back, [0x00_FF_FF_FF; 16], "passing alpha test fills");
+}
+
+#[test]
+fn rasterize_fog_blends_toward_fog_color() {
+    // A full-coverage triangle at constant z=0.5, red diffuse, blue fog,
+    // linear fog over [0.25, 0.75] → f=0.5 → (128, 0, 128) everywhere. The
+    // constant vertex color would normally trigger flat_fill; the fog gate
+    // must disable it so the per-pixel blend runs.
+    let mut back = [0xFF_00_00_00_u32; 4 * 4];
+    let mut dirty = Some(IRect::empty());
+    let mut frag = super::FragmentState {
+        fog_enable: 1,
+        fog_color: 0x00_00_00_FF,
+        fog_start: 0.25,
+        fog_end: 0.75,
+        fog_table_mode: super::D3DFOG_LINEAR,
+        ..no_frag()
+    };
+    rasterize_triangle(
+        &mut back,
+        4,
+        4,
+        sv(-1.0, -1.0, 0.5, 0xFF_FF_00_00),
+        sv(9.0, -1.0, 0.5, 0xFF_FF_00_00),
+        sv(-1.0, 9.0, 0.5, 0xFF_FF_00_00),
+        None,
+        None,
+        &mut frag,
+        &mut dirty,
+    );
+    assert_eq!(
+        back, [0x00_80_00_80; 16],
+        "red under blue fog at f=0.5 → (128, 0, 128)"
+    );
+}
+
+#[test]
+fn rasterize_vertex_fog_interpolates_vertex_factors() {
+    // Vertex fog: the factor is computed per-vertex from the vertex z and
+    // interpolated (Gouraud). Triangle A(0,0) z=0.25 (f=1, no fog) with
+    // B(4,0) and C(0,4) at z=0.75 (f=0, fully fogged) under LINEAR fog over
+    // [0.25, 0.75]. The pixel at (0,0) has barycentric weight 0.75 toward the
+    // near vertex → f=0.75 → mostly red; the far-edge pixels have f=0 →
+    // the fog color.
+    let mut back = [0xFF_00_00_00_u32; 4 * 4];
+    let mut dirty = Some(IRect::empty());
+    let mut frag = super::FragmentState {
+        fog_enable: 1,
+        fog_color: 0x00_00_00_FF,
+        fog_start: 0.25,
+        fog_end: 0.75,
+        fog_vertex_mode: super::D3DFOG_LINEAR,
+        ..no_frag()
+    };
+    rasterize_triangle(
+        &mut back,
+        4,
+        4,
+        sv(0.0, 0.0, 0.25, 0xFF_FF_00_00), // near vertex: f = 1 → pure red
+        sv(4.0, 0.0, 0.75, 0xFF_FF_00_00), // far vertex: f = 0 → pure fog blue
+        sv(0.0, 4.0, 0.75, 0xFF_FF_00_00), // far vertex: f = 0
+        None,
+        None,
+        &mut frag,
+        &mut dirty,
+    );
+    // Near the (0,0) vertex the interpolated factor is 0.75 — mostly red.
+    let near = back[0];
+    assert!(
+        (near >> 16) & 0xFF > 0xB0,
+        "near the start vertex the color must stay mostly red, got 0x{near:06X}"
+    );
+    // The far edge of the triangle (the excluded hypotenuse x+y=4) holds no
+    // pixels, so the most-far interior pixel is (2,0): its near-vertex
+    // weight is 0.25 → f=0.25 → r=64, b=191 — mostly fog blue.
+    let far = back[2];
+    assert_eq!(
+        far, 0x0040_00BF,
+        "the f=0.25 pixel must be (64, 0, 191), got 0x{far:06X}"
+    );
+    // The pixel-interpolated factor at (0,0) is 0.75, not 1 (the vertex is
+    // not the pixel center) — 255·0.75 = 191, so the red channel is 191.
+    assert_eq!(
+        (near >> 16) & 0xFF,
+        191,
+        "the Gouraud-interpolated factor at pixel (0,0) is 0.75"
+    );
+}
+
+#[test]
+fn rasterize_scissor_clips_outside_rect() {
+    // A full-coverage triangle with a scissor rect covering only the top-left
+    // 2x2: only those pixels may be written.
+    let mut back = [0xFF_00_00_00_u32; 4 * 4];
+    let mut dirty = Some(IRect::empty());
+    let mut frag = super::FragmentState {
+        scissor_test: 1,
+        scissor: Some(IRect {
+            left: 0,
+            top: 0,
+            right: 2,
+            bottom: 2,
+        }),
+        ..no_frag()
+    };
+    rasterize_triangle(
+        &mut back,
+        4,
+        4,
+        sv(-1.0, -1.0, 0.5, 0xFF_FF_FF_FF),
+        sv(9.0, -1.0, 0.5, 0xFF_FF_FF_FF),
+        sv(-1.0, 9.0, 0.5, 0xFF_FF_FF_FF),
+        None,
+        None,
+        &mut frag,
+        &mut dirty,
+    );
+    // Inside the scissor rect (2x2) → white; outside → untouched black.
+    assert_eq!(back[0], 0x00_FF_FF_FF);
+    assert_eq!(back[4 + 1], 0x00_FF_FF_FF);
+    assert_eq!(back[2], 0xFF_00_00_00, "x=2 is outside the scissor rect");
+    assert_eq!(
+        back[8 + 1],
+        0xFF_00_00_00,
+        "y=2 is outside the scissor rect"
+    );
+    // No rect set + test enabled → no clipping (the conservative fallback).
+    let mut back = [0xFF_00_00_00_u32; 4 * 4];
+    let mut dirty = Some(IRect::empty());
+    let mut frag = super::FragmentState {
+        scissor_test: 1,
+        scissor: None,
+        ..no_frag()
+    };
+    rasterize_triangle(
+        &mut back,
+        4,
+        4,
+        sv(-1.0, -1.0, 0.5, 0xFF_FF_FF_FF),
+        sv(9.0, -1.0, 0.5, 0xFF_FF_FF_FF),
+        sv(-1.0, 9.0, 0.5, 0xFF_FF_FF_FF),
+        None,
+        None,
+        &mut frag,
+        &mut dirty,
+    );
+    assert_eq!(back[15], 0x00_FF_FF_FF, "no rect → no clip");
+}
+
+#[test]
+fn rasterize_fog_alpha_scissor_combined_orders_stages() {
+    // The demo strip's combined pipeline: a scissor-clipped, alpha-tested,
+    // fogged triangle. Pixels inside the scissor rect pass every stage and
+    // land the fogged color; a pixel outside the scissor rect stays untouched.
+    let mut back = [0xFF_00_00_00_u32; 4 * 4];
+    let mut dirty = Some(IRect::empty());
+    let mut frag = super::FragmentState {
+        fog_enable: 1,
+        fog_color: 0x00_00_00_FF,
+        fog_start: 0.25,
+        fog_end: 0.75,
+        fog_table_mode: super::D3DFOG_LINEAR,
+        alpha_test: 1,
+        alpha_func: super::D3DCMP_GREATER,
+        alpha_ref: 0x40,
+        scissor_test: 1,
+        scissor: Some(IRect {
+            left: 0,
+            top: 0,
+            right: 3,
+            bottom: 3,
+        }),
+        ..no_frag()
+    };
+    // Alpha 0x80 passes, z=0.5 → f=0.5 → fogged (128, 0, 128).
+    rasterize_triangle(
+        &mut back,
+        4,
+        4,
+        sv(-1.0, -1.0, 0.5, 0x80_FF_00_00),
+        sv(9.0, -1.0, 0.5, 0x80_FF_00_00),
+        sv(-1.0, 9.0, 0.5, 0x80_FF_00_00),
+        None,
+        None,
+        &mut frag,
+        &mut dirty,
+    );
+    assert_eq!(back[4 + 1], 0x00_80_00_80, "(1,1) passes all three stages");
+    assert_eq!(
+        back[4 * 3 + 3],
+        0xFF_00_00_00,
+        "(3,3) is outside the scissor"
     );
 }

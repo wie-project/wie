@@ -21,11 +21,14 @@ use super::{
     IDIRECT3DDEVICE9_OBJECT_OFFSET, read_stack_argument,
 };
 use crate::d3d9_render::{
-    D3DRS_ALPHABLENDENABLE, D3DRS_BLENDOP, D3DRS_DESTBLEND, D3DRS_SRCBLEND, D3DRS_ZENABLE,
-    D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER,
-    D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTSS_ALPHAARG1, D3DTSS_ALPHAARG2, D3DTSS_ALPHAOP,
-    D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DTSS_TEXCOORDINDEX, D3dBlend, D3dBlendOp,
-    D3dCmpFunc, D3dZBufferType, RenderState, TextureStageState, parse_fvf,
+    D3DRS_ALPHABLENDENABLE, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE, D3DRS_BLENDOP,
+    D3DRS_DESTBLEND, D3DRS_FOGCOLOR, D3DRS_FOGDENSITY, D3DRS_FOGENABLE, D3DRS_FOGEND,
+    D3DRS_FOGSTART, D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE, D3DRS_SCISSORTESTENABLE,
+    D3DRS_SRCBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU,
+    D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTS_TEXTURE0,
+    D3DTS_TEXTURE7, D3DTSS_ALPHAARG1, D3DTSS_ALPHAARG2, D3DTSS_ALPHAOP, D3DTSS_COLORARG1,
+    D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DTSS_TEXCOORDINDEX, D3dBlend, D3dBlendOp, D3dCmpFunc,
+    D3dZBufferType, RenderState, TextureStageState, mat4_mul, parse_fvf,
 };
 use crate::fake_va::D3d9Iface;
 use crate::guest_memory::{write_u32 as write_guest_u32, write_u64 as write_guest_u64};
@@ -83,23 +86,45 @@ pub fn handle_set_render_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     let value = u32::try_from(value_raw & u64::from(u32::MAX))
         .context("SetRenderState value does not fit u32")?;
 
-    // Decode once at the register boundary into the typed render state. The
-    // D3DRS_* values are guest input; unmodeled states have no effect on the
-    // software pipeline and are dropped (their GetRenderState reads fall back
-    // to 0, D3D9's default for unused states).
-    let rs = &mut state.d3d9().d3d9_render_state;
-    match render_state {
-        D3DRS_ALPHABLENDENABLE => rs.alpha_blend_enable = value != 0,
-        D3DRS_ZWRITEENABLE => rs.z_write_enable = value != 0,
-        D3DRS_ZENABLE => rs.z_enable = D3dZBufferType::from_u32(value),
-        D3DRS_ZFUNC => rs.z_func = D3dCmpFunc::from_u32(value),
-        D3DRS_SRCBLEND => rs.src_blend = D3dBlend::from_u32(value),
-        D3DRS_DESTBLEND => rs.dest_blend = D3dBlend::from_u32(value),
-        D3DRS_BLENDOP => rs.blend_op = D3dBlendOp::from_u32(value),
-        _ => {}
-    }
-
-    let return_value = D3D_OK;
+    // L3 validation: an out-of-range value is the honest D3DERR_INVALIDCALL,
+    // never a silent accept. Unmodeled states skip the matrix (their raw
+    // values round-trip untouched).
+    let return_value = if !crate::d3d9_render::render_state_value_valid(render_state, value) {
+        D3DERR_INVALIDCALL
+    } else {
+        // Decode once at the register boundary into the typed render state.
+        // The D3DRS_* values are guest input; unmodeled states are preserved
+        // verbatim in the raw-value layer so GetRenderState round-trips the
+        // last-set value (the L3 fidelity rule — no more 0 for "ignored").
+        let d3d = state.d3d9();
+        let rs = &mut d3d.d3d9_render_state;
+        match render_state {
+            D3DRS_ALPHABLENDENABLE => rs.alpha_blend_enable = value != 0,
+            D3DRS_ZWRITEENABLE => rs.z_write_enable = value != 0,
+            D3DRS_ZENABLE => rs.z_enable = D3dZBufferType::from_u32(value),
+            D3DRS_ZFUNC => rs.z_func = D3dCmpFunc::from_u32(value),
+            D3DRS_SRCBLEND => rs.src_blend = D3dBlend::from_u32(value),
+            D3DRS_DESTBLEND => rs.dest_blend = D3dBlend::from_u32(value),
+            D3DRS_BLENDOP => rs.blend_op = D3dBlendOp::from_u32(value),
+            // ── L3 fragment stages ──
+            D3DRS_FOGENABLE => rs.fog_enable = value != 0,
+            D3DRS_FOGCOLOR => rs.fog_color = value,
+            D3DRS_FOGSTART => rs.fog_start = f32::from_bits(value),
+            D3DRS_FOGEND => rs.fog_end = f32::from_bits(value),
+            D3DRS_FOGDENSITY => rs.fog_density = f32::from_bits(value),
+            D3DRS_FOGTABLEMODE => rs.fog_table_mode = value,
+            D3DRS_FOGVERTEXMODE => rs.fog_vertex_mode = value,
+            D3DRS_ALPHATESTENABLE => rs.alpha_test_enable = value != 0,
+            D3DRS_ALPHAFUNC => rs.alpha_func = D3dCmpFunc::from_u32(value),
+            D3DRS_ALPHAREF => rs.alpha_ref = u8::try_from(value).unwrap_or(0),
+            D3DRS_SCISSORTESTENABLE => rs.scissor_test_enable = value != 0,
+            // Unmodeled state: preserve the raw value for the round-trip.
+            _ => {
+                d3d.d3d9_render_state_raw.insert(render_state, value);
+            }
+        }
+        D3D_OK
+    };
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -262,6 +287,9 @@ pub fn handle_device_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
             state.d3d9().d3d9_vs_constants = [[0.0; 4]; crate::d3d9_shader::VS_CONST_COUNT];
             state.d3d9().d3d9_current_fvf = 0;
             state.d3d9().d3d9_render_state = RenderState::default();
+            state.d3d9().d3d9_render_state_raw.clear();
+            state.d3d9().d3d9_scissor_rect = None;
+            state.d3d9().d3d9_texture_matrices = [crate::d3d9_render::IDENTITY; 8];
             state.d3d9().d3d9_stage_states = std::array::from_fn(|_| TextureStageState::default());
             state.d3d9().d3d9_backbuffer.clear();
             state.d3d9().d3d9_backbuffer_width = 0;
@@ -568,8 +596,9 @@ pub fn handle_end_scene(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 
 /// Handles `IDirect3DDevice9::SetTransform` (vtable slot 44).
 ///
-/// Stores the world / view / projection matrices (all other transform types
-/// are accepted and ignored — texture-space matrices are out of slice 1).
+/// Stores the world / view / projection matrices and the `D3DTS_TEXTURE0..7`
+/// texture-space matrices (the latter stored for `GetTransform` /
+/// `MultiplyTransform` round-trips — the actual texgen is a later slice).
 pub fn handle_set_transform(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
@@ -594,6 +623,13 @@ pub fn handle_set_transform(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
                 D3DTS_WORLD => state.d3d9().d3d9_world_matrix = matrix,
                 D3DTS_VIEW => state.d3d9().d3d9_view_matrix = matrix,
                 D3DTS_PROJECTION => state.d3d9().d3d9_projection_matrix = matrix,
+                D3DTS_TEXTURE0..=D3DTS_TEXTURE7 => {
+                    let index =
+                        usize::try_from(transform_state - D3DTS_TEXTURE0).unwrap_or(usize::MAX);
+                    if let Some(slot) = state.d3d9().d3d9_texture_matrices.get_mut(index) {
+                        *slot = matrix;
+                    }
+                }
                 _ => {}
             }
         }
@@ -605,6 +641,186 @@ pub fn handle_set_transform(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     Ok(WinApiHandlerResult {
         return_address,
         return_value: D3D_OK,
+    })
+}
+
+/// Handles `IDirect3DDevice9::GetTransform` (vtable slot 45).
+///
+/// Round-trip getter: writes the stored world / view / projection / texture
+/// matrix back to the guest. An unknown transform state is the honest
+/// `D3DERR_INVALIDCALL` (D3D9 rejects it too).
+pub fn handle_get_transform(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let _this_pointer = engine
+        .read_rcx()
+        .context("failed to read RCX for IDirect3DDevice9::GetTransform")?;
+    let state_raw = engine
+        .read_rdx()
+        .context("failed to read RDX for IDirect3DDevice9::GetTransform")?;
+    let matrix_ptr = engine
+        .read_r8()
+        .context("failed to read R8 for IDirect3DDevice9::GetTransform")?;
+
+    let transform_state = u32::try_from(state_raw & u64::from(u32::MAX))
+        .context("GetTransform state does not fit u32")?;
+
+    let stored = match transform_state {
+        D3DTS_WORLD => Some(state.d3d9().d3d9_world_matrix),
+        D3DTS_VIEW => Some(state.d3d9().d3d9_view_matrix),
+        D3DTS_PROJECTION => Some(state.d3d9().d3d9_projection_matrix),
+        D3DTS_TEXTURE0..=D3DTS_TEXTURE7 => {
+            let index = usize::try_from(transform_state - D3DTS_TEXTURE0).unwrap_or(usize::MAX);
+            state.d3d9().d3d9_texture_matrices.get(index).copied()
+        }
+        _ => None,
+    };
+
+    let return_value = match stored {
+        Some(matrix) if matrix_ptr != 0 => {
+            let mut bytes = [0_u8; 64];
+            for (index, value) in matrix.iter().enumerate() {
+                let start = index.saturating_mul(4);
+                let end = start.saturating_add(4);
+                if let Some(slot) = bytes.get_mut(start..end) {
+                    slot.copy_from_slice(&value.to_le_bytes());
+                }
+            }
+            engine
+                .mem_write(matrix_ptr, &bytes)
+                .context("failed to write D3DMATRIX")?;
+            D3D_OK
+        }
+        _ => D3DERR_INVALIDCALL,
+    };
+
+    let return_address = engine
+        .return_from_win64_api(return_value)
+        .context("failed to return from IDirect3DDevice9::GetTransform")?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `IDirect3DDevice9::MultiplyTransform` (vtable slot 46).
+///
+/// Real matrix multiply in the D3D9 row-vector convention: the stored
+/// transform becomes `current × pMatrix` (the pMatrix is applied after the
+/// current one). An unknown transform state is `D3DERR_INVALIDCALL`.
+pub fn handle_multiply_transform(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let _this_pointer = engine
+        .read_rcx()
+        .context("failed to read RCX for IDirect3DDevice9::MultiplyTransform")?;
+    let state_raw = engine
+        .read_rdx()
+        .context("failed to read RDX for IDirect3DDevice9::MultiplyTransform")?;
+    let matrix_ptr = engine
+        .read_r8()
+        .context("failed to read R8 for IDirect3DDevice9::MultiplyTransform")?;
+
+    let transform_state = u32::try_from(state_raw & u64::from(u32::MAX))
+        .context("MultiplyTransform state does not fit u32")?;
+
+    let return_value = if matrix_ptr != 0 {
+        let mut bytes = [0_u8; 64];
+        let readable = engine.mem_read(matrix_ptr, &mut bytes).is_ok();
+        if readable {
+            let matrix = parse_mat4(&bytes);
+            match transform_state {
+                D3DTS_WORLD => {
+                    let current = state.d3d9().d3d9_world_matrix;
+                    state.d3d9().d3d9_world_matrix = mat4_mul(&current, &matrix);
+                    D3D_OK
+                }
+                D3DTS_VIEW => {
+                    let current = state.d3d9().d3d9_view_matrix;
+                    state.d3d9().d3d9_view_matrix = mat4_mul(&current, &matrix);
+                    D3D_OK
+                }
+                D3DTS_PROJECTION => {
+                    let current = state.d3d9().d3d9_projection_matrix;
+                    state.d3d9().d3d9_projection_matrix = mat4_mul(&current, &matrix);
+                    D3D_OK
+                }
+                D3DTS_TEXTURE0..=D3DTS_TEXTURE7 => {
+                    let index =
+                        usize::try_from(transform_state - D3DTS_TEXTURE0).unwrap_or(usize::MAX);
+                    if let Some(current) = state.d3d9().d3d9_texture_matrices.get(index) {
+                        let combined = mat4_mul(current, &matrix);
+                        if let Some(slot) = state.d3d9().d3d9_texture_matrices.get_mut(index) {
+                            *slot = combined;
+                        }
+                        D3D_OK
+                    } else {
+                        D3DERR_INVALIDCALL
+                    }
+                }
+                _ => D3DERR_INVALIDCALL,
+            }
+        } else {
+            D3DERR_INVALIDCALL
+        }
+    } else {
+        D3DERR_INVALIDCALL
+    };
+
+    let return_address = engine
+        .return_from_win64_api(return_value)
+        .context("failed to return from IDirect3DDevice9::MultiplyTransform")?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `IDirect3DDevice9::SetScissorRect` (vtable slot 115).
+///
+/// Stores the screen-space `RECT` (exclusive right/bottom, like GDI). The
+/// fragment stage clips against it when `D3DRS_SCISSORTESTENABLE` is set.
+pub fn handle_set_scissor_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let _this_pointer = engine
+        .read_rcx()
+        .context("failed to read RCX for IDirect3DDevice9::SetScissorRect")?;
+    let rect_ptr = engine
+        .read_rdx()
+        .context("failed to read RDX for IDirect3DDevice9::SetScissorRect")?;
+
+    let return_value = if rect_ptr != 0 {
+        let mut bytes = [0_u8; 16];
+        if engine.mem_read(rect_ptr, &mut bytes).is_ok() {
+            let i32_at = |offset: usize| {
+                i32::from_le_bytes(
+                    bytes
+                        .get(offset..offset.saturating_add(4))
+                        .and_then(|s| s.try_into().ok())
+                        .unwrap_or([0; 4]),
+                )
+            };
+            state.d3d9().d3d9_scissor_rect = Some(crate::gdi32::IRect {
+                left: i32_at(0),
+                top: i32_at(4),
+                right: i32_at(8),
+                bottom: i32_at(12),
+            });
+            D3D_OK
+        } else {
+            D3DERR_INVALIDCALL
+        }
+    } else {
+        D3DERR_INVALIDCALL
+    };
+
+    let return_address = engine
+        .return_from_win64_api(return_value)
+        .context("failed to return from IDirect3DDevice9::SetScissorRect")?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
     })
 }
 

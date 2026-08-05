@@ -37,6 +37,7 @@ pub mod thread;
 pub mod ucrt;
 pub mod user32;
 pub mod uxtheme;
+pub mod version;
 pub mod vfs;
 pub mod winmm;
 pub use bottle::{bottle_root_from_env, drive_d_from_env, guest_path_to_host};

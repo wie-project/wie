@@ -4,16 +4,16 @@ use super::texture::allocate_surface_object;
 use super::{
     D3D_OK, D3DERR_INVALIDCALL, D3DFMT_D16, D3DFMT_D24S8, DepthStencilRecord, read_stack_argument,
 };
-use crate::d3d9_render::{
-    D3DRS_ALPHABLENDENABLE, D3DRS_BLENDOP, D3DRS_DESTBLEND, D3DRS_SRCBLEND, D3DRS_ZENABLE,
-    D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
-};
 use crate::guest_memory::{write_u32 as write_guest_u32, write_u64 as write_guest_u64};
 use crate::{HandlerContext, WinApiHandlerResult};
 
 // ── blend + depth handlers ──────────────────────────────────────────────
 
 /// Handles `IDirect3DDevice9::GetRenderState` (vtable slot 58).
+///
+/// Round-trip getter (L3): modeled states read back the typed value;
+/// unmodeled states read the last-set raw value from the raw-value layer
+/// (0 when never set) — D3D9's round-trip fidelity for every state.
 pub fn handle_get_render_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
@@ -30,18 +30,14 @@ pub fn handle_get_render_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     let state_id = u32::try_from(state_raw & u64::from(u32::MAX))
         .context("GetRenderState state identifier does not fit u32")?;
     if p_value != 0 {
-        // Modeled states read back from the typed struct; unmodeled ones read
-        // 0 (D3D9's default for unused states).
-        let rs = &state.d3d9().d3d9_render_state;
-        let value = match state_id {
-            D3DRS_ALPHABLENDENABLE => u32::from(rs.alpha_blend_enable),
-            D3DRS_ZWRITEENABLE => u32::from(rs.z_write_enable),
-            D3DRS_ZENABLE => rs.z_enable.as_u32(),
-            D3DRS_ZFUNC => rs.z_func.as_u32(),
-            D3DRS_SRCBLEND => rs.src_blend.as_u32(),
-            D3DRS_DESTBLEND => rs.dest_blend.as_u32(),
-            D3DRS_BLENDOP => rs.blend_op.as_u32(),
-            _ => 0,
+        let d3d = state.d3d9();
+        let value = match d3d.d3d9_render_state.value_of(state_id) {
+            Some(v) => v,
+            None => d3d
+                .d3d9_render_state_raw
+                .get(&state_id)
+                .copied()
+                .unwrap_or(0),
         };
         write_guest_u32(engine, p_value, value).context("failed to write GetRenderState output")?;
     }

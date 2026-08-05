@@ -42,10 +42,11 @@ pub use device::{
     handle_begin_scene, handle_clear, handle_create_index_buffer, handle_create_vertex_buffer,
     handle_device_release, handle_direct3d9_release, handle_draw_indexed_primitive,
     handle_draw_indexed_primitive_up, handle_draw_primitive, handle_draw_primitive_up,
-    handle_end_scene, handle_get_indices, handle_get_stream_source, handle_get_viewport,
-    handle_present, handle_set_fvf, handle_set_indices, handle_set_render_state,
-    handle_set_sampler_state, handle_set_stream_source, handle_set_texture_stage_state,
-    handle_set_transform, handle_set_viewport,
+    handle_end_scene, handle_get_indices, handle_get_stream_source, handle_get_transform,
+    handle_get_viewport, handle_multiply_transform, handle_present, handle_set_fvf,
+    handle_set_indices, handle_set_render_state, handle_set_sampler_state, handle_set_scissor_rect,
+    handle_set_stream_source, handle_set_texture_stage_state, handle_set_transform,
+    handle_set_viewport,
 };
 pub use shader::{
     IDIRECT3DSHADER9_METHOD_COUNT, handle_create_pixel_shader, handle_create_vertex_shader,

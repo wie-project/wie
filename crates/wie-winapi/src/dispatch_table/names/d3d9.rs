@@ -356,4 +356,21 @@ pub(super) const ROWS: &[(&str, &str, WinApiId)] = &[
         "idirect3ddevice9::getindices",
         WinApiId::D3d9Idirect3ddevice9Getindices,
     ),
+    // ── L3 appended rows (getters + the scissor setter) — the variant order
+    // mirrors the appended enum discriminants.
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::gettransform",
+        WinApiId::D3d9Idirect3ddevice9Gettransform,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::multiplytransform",
+        WinApiId::D3d9Idirect3ddevice9Multiplytransform,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::setscissorrect",
+        WinApiId::D3d9Idirect3ddevice9Setscissorrect,
+    ),
 ];
