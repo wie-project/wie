@@ -13,6 +13,7 @@
 //! alpha blend), [`ps`] (PS 2.0 interpreter), [`vs`] (VS 2.0 interpreter).
 
 mod blend;
+mod flow;
 mod ps;
 mod sample;
 mod vertex;
@@ -38,10 +39,11 @@ pub use self::ps::{
     PsFragmentInput, PsProgram, pixel_shader_alpha_to_u8, pixel_shader_color_to_0rgb,
     run_pixel_shader,
 };
-pub use self::sample::{FragmentState, TextureStage};
+pub use self::sample::{FragmentState, MAX_MIP_LEVELS, MipChain, MipLevelView, TextureStage};
 pub use self::vertex::{
-    FvfLayout, GuestVertex, IDENTITY, Mat4, ScreenVertex, Viewport, clip_to_screen,
-    clip_to_viewport, mat4_mul, parse_fvf, parse_vertex, transform_point,
+    ClipVertex, FvfLayout, GuestVertex, IDENTITY, Mat4, NEAR_CLIP_W, ScreenVertex, Viewport,
+    clip_polygon_near, clip_to_screen, clip_to_viewport, mat4_mul, parse_fvf, parse_vertex,
+    screen_from_clip, transform_point,
 };
 pub use self::vs::{VsOutput, VsProgram, VsVertexInput, run_vertex_shader, vs_input_from_vertex};
 
@@ -49,7 +51,7 @@ pub use self::vs::{VsOutput, VsProgram, VsVertexInput, run_vertex_shader, vs_inp
 // fragment stage through these, so each lives in the submodule that owns it.
 use self::blend::{blend_colors, blend_fragment, depth_test, edge_inside};
 use self::ps::color_to_float4;
-use self::sample::{eval_alpha_op, eval_color_op, sample_texture, stage_arg};
+use self::sample::{eval_alpha_op, eval_color_op, sample_texture_mip, stage_arg};
 
 /// `D3DFVF_XYZ`: untransformed position (3 floats).
 pub const D3DFVF_XYZ: u32 = 0x0002;
@@ -66,6 +68,12 @@ pub const D3DFVF_TEX1: u32 = 0x0100;
 /// `D3DFVF_TEX8`: last texture-coordinate set (the `TEX1..TEX8` bit mask).
 pub const D3DFVF_TEX8: u32 = 0x8000;
 
+/// `D3DPT_POINTLIST`.
+pub const D3DPT_POINTLIST: u32 = 1;
+/// `D3DPT_LINELIST`.
+pub const D3DPT_LINELIST: u32 = 2;
+/// `D3DPT_LINESTRIP`.
+pub const D3DPT_LINESTRIP: u32 = 3;
 /// `D3DPT_TRIANGLELIST`.
 pub const D3DPT_TRIANGLELIST: u32 = 4;
 /// `D3DPT_TRIANGLESTRIP`.
@@ -181,6 +189,13 @@ pub const D3DRS_RANGEFOGENABLE: u32 = 48;
 pub const D3DRS_FOGVERTEXMODE: u32 = 50;
 /// `D3DRS_SCISSORTESTENABLE` (the scissor-rect gate).
 pub const D3DRS_SCISSORTESTENABLE: u32 = 174;
+
+// ── L4 point/line render-state constants (d3d9types.h values) ──────────
+
+/// `D3DRS_POINTSIZE` (a float, in device units; 1.0 = one pixel). Not a
+/// modeled typed state — it rides the raw-value layer so `SetRenderState`
+/// stores it and the point rasterizer reads the bits at draw time.
+pub const D3DRS_POINTSIZE: u32 = 72;
 
 /// `D3DFOG_NONE` — no fog.
 pub const D3DFOG_NONE: u32 = 0;
@@ -513,6 +528,37 @@ pub fn rasterize_triangle(
     // edge (`e >= 0` for all three), then apply the top-left boundary rule.
     let (a, b, c) = if area < 0.0 { (a, c, b) } else { (a, b, c) };
 
+    // L4 mip LOD: the screen-space uv gradient of the (winding-normalized)
+    // triangle, measured in level-0 texels per pixel. Affine — exact for the
+    // w≈1 orthographic draws the FFP path produces; a documented approximation
+    // for perspective triangles (the true gradient varies per-pixel there).
+    // `area_abs` is the barycentric denominator of the normalized triangle.
+    let lod = if let Some(stage) = tex {
+        let area_abs = area.abs();
+        if area_abs > 1.0e-9 {
+            let (aw, bw, cw) = (a, b, c);
+            let du_dx =
+                (aw.u * (cw.y - bw.y) + bw.u * (aw.y - cw.y) + cw.u * (bw.y - aw.y)) / area_abs;
+            let du_dy =
+                (aw.u * (bw.x - cw.x) + bw.u * (cw.x - aw.x) + cw.u * (aw.x - bw.x)) / area_abs;
+            let dv_dx =
+                (aw.v * (cw.y - bw.y) + bw.v * (aw.y - cw.y) + cw.v * (bw.y - aw.y)) / area_abs;
+            let dv_dy =
+                (aw.v * (bw.x - cw.x) + bw.v * (cw.x - aw.x) + cw.v * (aw.x - bw.x)) / area_abs;
+            let w0 = stage.width as f32;
+            let h0 = stage.height as f32;
+            let footprint = (du_dx.abs() * w0)
+                .max(du_dy.abs() * w0)
+                .max(dv_dx.abs() * h0)
+                .max(dv_dy.abs() * h0);
+            footprint.max(1.0e-6).log2()
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+
     let min_x = a.x.min(b.x).min(c.x).floor() as i32;
     let max_x = a.x.max(b.x).max(c.x).ceil() as i32;
     let min_y = a.y.min(b.y).min(c.y).floor() as i32;
@@ -671,7 +717,7 @@ pub fn rasterize_triangle(
                     }
                     None => match tex {
                         Some(stage) if stage.color_op != D3DTOP_DISABLE => {
-                            let texel = sample_texture(stage, u, v);
+                            let texel = sample_texture_mip(stage, u, v, lod);
                             let arg1 = stage_arg(stage.color_arg1, texel, gcolor);
                             let arg2 = stage_arg(stage.color_arg2, texel, gcolor);
                             let rgb = eval_color_op(stage.color_op, arg1, arg2);
@@ -775,6 +821,11 @@ pub fn rasterize_triangle(
     };
     // Conservative dirty region: the clipped bounding box, unioned into the
     // accumulated region (a full-dirty frame stays full).
+    union_dirty_rect(dirty, rect);
+}
+/// Union one rect into the accumulated dirty region (None = full frame stays
+/// full — the union of any rect with the full frame is the full frame).
+fn union_dirty_rect(dirty: &mut Option<IRect>, rect: IRect) {
     *dirty = (*dirty).map(|prev| IRect {
         left: prev.left.min(rect.left),
         top: prev.top.min(rect.top),
@@ -856,8 +907,12 @@ fn flush_pixel_batch(
 /// Rasterize one triangle of already-transformed [`GuestVertex`]s.
 ///
 /// `pre_transformed` (`XYZRHW`) vertices bypass the matrix/viewport and use
-/// their X/Y as screen pixels directly. Any vertex at/behind the near-plane
-/// rejects the whole triangle (slice 1 limitation — no near-plane clipping).
+/// their X/Y as screen pixels directly; their z is clamped to `[0, 1]` and
+/// mapped through the viewport's `MinZ..MaxZ` (D3D9 applies the viewport
+/// z-transform to pre-transformed vertices too). `XYZ` vertices transform to
+/// clip space and are near-plane clipped (Sutherland–Hodgman against
+/// `w > NEAR_CLIP_W`) — a triangle straddling the near plane keeps its visible
+/// part instead of rejecting the whole triangle.
 // Wide signature: a triangle draw carries 3 vertices + transform + pipeline stages.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_triangle(
@@ -875,27 +930,312 @@ pub fn draw_triangle(
     frag: &mut FragmentState<'_>,
     dirty: &mut Option<IRect>,
 ) {
-    let to_screen = |v: GuestVertex| -> Option<ScreenVertex> {
-        let (sx, sy, sz, w) = if pre_transformed {
-            // XYZRHW: already screen-space. The attributes interpolate
-            // affinely, so the perspective divisor is 1.0.
-            (v.x, v.y, v.z, 1.0)
-        } else {
-            let clip = transform_point([v.x, v.y, v.z, v.w], matrix);
-            clip_to_viewport(clip, vp)?
-        };
-        Some(ScreenVertex {
-            x: sx,
-            y: sy,
-            z: sz,
-            w,
+    if pre_transformed {
+        // XYZRHW: already screen-space — no near-plane clip (negative RHW is
+        // undefined in D3D9). The attributes interpolate affinely, so the
+        // perspective divisor is 1.0 and the z is the viewport-mapped RHW z.
+        let to_screen = |v: GuestVertex| ScreenVertex {
+            x: v.x,
+            y: v.y,
+            z: vp.min_z + v.z.clamp(0.0, 1.0) * (vp.max_z - vp.min_z),
+            w: 1.0,
             color: v.color,
             u: v.u,
             v: v.v,
-        })
+        };
+        let (a, b, c) = (to_screen(v0), to_screen(v1), to_screen(v2));
+        rasterize_triangle(backbuffer, width, height, a, b, c, tex, ps, frag, dirty);
+        return;
+    }
+    let clip = |v: GuestVertex| ClipVertex {
+        pos: transform_point([v.x, v.y, v.z, v.w], matrix),
+        color: v.color,
+        u: v.u,
+        v: v.v,
     };
-    let Some(a) = to_screen(v0) else { return };
-    let Some(b) = to_screen(v1) else { return };
-    let Some(c) = to_screen(v2) else { return };
-    rasterize_triangle(backbuffer, width, height, a, b, c, tex, ps, frag, dirty);
+    let clipped = clip_polygon_near(&[clip(v0), clip(v1), clip(v2)]);
+    // Fan the clipped polygon: a triangle yields 3 or 4 vertices.
+    if let Some(first) = clipped.first() {
+        for pair in clipped.get(1..).unwrap_or(&[]).windows(2) {
+            let Some(a) = screen_from_clip(first, vp) else {
+                continue;
+            };
+            let Some(b) = screen_from_clip(&pair[0], vp) else {
+                continue;
+            };
+            let Some(c) = screen_from_clip(&pair[1], vp) else {
+                continue;
+            };
+            rasterize_triangle(backbuffer, width, height, a, b, c, tex, ps, frag, dirty);
+        }
+    }
+}
+/// Rasterize one screen-space point (D3DPT_POINTLIST element).
+///
+/// The point is a square of `point_size` device units (1.0 = one pixel)
+/// centered on the vertex, drawn with the half-open right/bottom edge rule
+/// (the point analogue of the triangle top-left rule). Every fragment runs
+/// the same pipeline as a triangle fragment (scissor, depth, texture/PS,
+/// alpha test, fog, blend) through [`shade_fragment`]. Points carry no uv
+/// gradient, so the mip LOD is 0 (level 0).
+// Wide signature: a point draw carries the vertex + pipeline stages + target.
+#[allow(clippy::too_many_arguments)]
+pub fn rasterize_point(
+    backbuffer: &mut [u32],
+    width: u32,
+    height: u32,
+    v: ScreenVertex,
+    point_size: f32,
+    tex: Option<&TextureStage<'_>>,
+    ps: Option<&PsProgram<'_>>,
+    frag: &mut FragmentState<'_>,
+    dirty: &mut Option<IRect>,
+) {
+    let half = point_size.max(1.0) * 0.5;
+    let left = (v.x - half).floor() as i32;
+    let top = (v.y - half).floor() as i32;
+    let right = (v.x + half).ceil() as i32;
+    let bottom = (v.y + half).ceil() as i32;
+    let w_i = i32::try_from(width).unwrap_or(i32::MAX);
+    let h_i = i32::try_from(height).unwrap_or(i32::MAX);
+    let x0 = left.max(0);
+    let y0 = top.max(0);
+    let x1 = right.min(w_i);
+    let y1 = bottom.min(h_i);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    union_dirty_rect(
+        dirty,
+        IRect {
+            left: x0,
+            top: y0,
+            right: x1,
+            bottom: y1,
+        },
+    );
+    let width_us = usize::try_from(width).unwrap_or(0);
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let cx = px as f32 + 0.5;
+            let cy = py as f32 + 0.5;
+            // Half-open right/bottom: a size-1 point at a half-integer vertex
+            // covers exactly the pixel containing the vertex.
+            if cx < v.x - half || cx >= v.x + half || cy < v.y - half || cy >= v.y + half {
+                continue;
+            }
+            let index = usize::try_from(py)
+                .unwrap_or(0)
+                .saturating_mul(width_us)
+                .saturating_add(usize::try_from(px).unwrap_or(0));
+            shade_fragment(
+                backbuffer, index, px, py, v.color, v.u, v.v, v.z, 0.0, tex, ps, frag,
+            );
+        }
+    }
+}
+/// Rasterize one screen-space line segment (a D3DPT_LINELIST/LINESTRIP
+/// element) as a 1-pixel-wide line.
+///
+/// D3D9 has no line-width state (D3DRS_LINEWIDTH was dropped after D3D8), so
+/// the line is always 1px: a pixel is covered when its center is within
+/// 0.5px of the segment (the diamond-exit approximation). Attributes
+/// interpolate along the segment with the same perspective-correct rule the
+/// triangle path uses, and the mip LOD comes from the segment's uv gradient.
+// Wide signature: a line draw carries 2 vertices + pipeline stages + target.
+#[allow(clippy::too_many_arguments)]
+pub fn rasterize_line(
+    backbuffer: &mut [u32],
+    width: u32,
+    height: u32,
+    a: ScreenVertex,
+    b: ScreenVertex,
+    tex: Option<&TextureStage<'_>>,
+    ps: Option<&PsProgram<'_>>,
+    frag: &mut FragmentState<'_>,
+    dirty: &mut Option<IRect>,
+) {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let len2 = dx * dx + dy * dy;
+    let min_x = a.x.min(b.x).floor() as i32;
+    let max_x = a.x.max(b.x).ceil() as i32;
+    let min_y = a.y.min(b.y).floor() as i32;
+    let max_y = a.y.max(b.y).ceil() as i32;
+    let w_i = i32::try_from(width).unwrap_or(i32::MAX);
+    let h_i = i32::try_from(height).unwrap_or(i32::MAX);
+    let x0 = min_x.max(0);
+    let y0 = min_y.max(0);
+    let x1 = max_x.min(w_i);
+    let y1 = max_y.min(h_i);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    union_dirty_rect(
+        dirty,
+        IRect {
+            left: x0,
+            top: y0,
+            right: x1,
+            bottom: y1,
+        },
+    );
+    // The mip LOD from the segment's uv gradient (texels per screen pixel
+    // along the segment's dominant axis).
+    let lod = match tex {
+        Some(stage) if len2 > 0.0 => {
+            let seg_len = len2.sqrt();
+            let footprint = ((b.u - a.u).abs() * stage.width as f32)
+                .max((b.v - a.v).abs() * stage.height as f32)
+                / seg_len;
+            footprint.max(1.0e-6).log2()
+        }
+        _ => 0.0,
+    };
+    // Perspective-correct line interpolation (the triangle-path rule).
+    let ia = if a.w > 0.0 { 1.0 / a.w } else { 1.0 };
+    let ib = if b.w > 0.0 { 1.0 / b.w } else { 1.0 };
+    let width_us = usize::try_from(width).unwrap_or(0);
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let cx = px as f32 + 0.5;
+            let cy = py as f32 + 0.5;
+            // Nearest point on the segment; distance <= 0.5px covers the pixel.
+            let t = if len2 > 0.0 {
+                ((cx - a.x) * dx + (cy - a.y) * dy) / len2
+            } else {
+                0.0
+            };
+            let t = t.clamp(0.0, 1.0);
+            let on_x = a.x + t * dx;
+            let on_y = a.y + t * dy;
+            let dist2 = (cx - on_x) * (cx - on_x) + (cy - on_y) * (cy - on_y);
+            if dist2 > 0.25 {
+                continue;
+            }
+            let iw = (1.0 - t) * ia + t * ib;
+            let interp = |va: f32, vb: f32| {
+                if iw != 0.0 {
+                    ((1.0 - t) * va * ia + t * vb * ib) / iw
+                } else {
+                    (1.0 - t) * va + t * vb
+                }
+            };
+            let index = usize::try_from(py)
+                .unwrap_or(0)
+                .saturating_mul(width_us)
+                .saturating_add(usize::try_from(px).unwrap_or(0));
+            shade_fragment(
+                backbuffer,
+                index,
+                px,
+                py,
+                blend_colors(1.0 - t, a.color, t, b.color, 0.0, 0),
+                interp(a.u, b.u),
+                interp(a.v, b.v),
+                interp(a.z, b.z),
+                lod,
+                tex,
+                ps,
+                frag,
+            );
+        }
+    }
+}
+/// The shared point/line fragment pipeline: scissor → depth → color
+/// (texture/PS/flat) → alpha test → fog → blend → write, in D3D9's order.
+///
+/// This is the per-pixel body the triangle path inlines (the triangle loop
+/// keeps its batched NEON fast paths; points/lines are not hot enough for
+/// them). `lod` selects the mip level for the texture sample.
+// Wide signature: one fragment carries its attributes + pipeline stages.
+#[allow(clippy::too_many_arguments)]
+fn shade_fragment(
+    backbuffer: &mut [u32],
+    index: usize,
+    px: i32,
+    py: i32,
+    gcolor: u32,
+    u: f32,
+    v: f32,
+    z: f32,
+    lod: f32,
+    tex: Option<&TextureStage<'_>>,
+    ps: Option<&PsProgram<'_>>,
+    frag: &mut FragmentState<'_>,
+) {
+    // L3 scissor test: the D3D9 rasterization clip, before the depth test.
+    if frag.scissor_test != 0
+        && let Some(rect) = frag.scissor
+        && (px < rect.left || px >= rect.right || py < rect.top || py >= rect.bottom)
+    {
+        return;
+    }
+    let depth_testing = frag.z_enable != 0 && frag.z_enable != D3DZB_USEW;
+    let depth_writing = frag.z_enable != 0 && frag.z_write != 0;
+    if let Some(depth) = frag.depth.as_deref_mut() {
+        let existing = depth.get(index).copied().unwrap_or(1.0);
+        if depth_testing && !depth_test(z, existing, frag.z_func) {
+            return; // discarded: no color write, no z write
+        }
+        if depth_writing && let Some(slot) = depth.get_mut(index) {
+            *slot = z;
+        }
+    }
+    let (rgb, alpha) = match ps {
+        Some(program) => {
+            // Pixel shader path (the triangle path's v0/t0 wiring).
+            let input = PsFragmentInput {
+                v0: color_to_float4(gcolor),
+                v1: [0.0; 4],
+                t0: [u, v, 0.0, 1.0],
+            };
+            match run_pixel_shader(program, &input) {
+                Some(oc0) => (
+                    pixel_shader_color_to_0rgb(oc0),
+                    pixel_shader_alpha_to_u8(oc0),
+                ),
+                // texkill discarded the fragment: no color, no depth.
+                None => return,
+            }
+        }
+        None => match tex {
+            Some(stage) if stage.color_op != D3DTOP_DISABLE => {
+                let texel = sample_texture_mip(stage, u, v, lod);
+                let arg1 = stage_arg(stage.color_arg1, texel, gcolor);
+                let arg2 = stage_arg(stage.color_arg2, texel, gcolor);
+                let rgb = eval_color_op(stage.color_op, arg1, arg2);
+                let alpha_arg1 = stage_arg(stage.alpha_arg1, texel, gcolor);
+                let alpha_arg2 = stage_arg(stage.alpha_arg2, texel, gcolor);
+                (rgb, eval_alpha_op(stage.alpha_op, alpha_arg1, alpha_arg2))
+            }
+            _ => (
+                gcolor & 0x00FF_FFFF,
+                u8::try_from((gcolor >> 24) & 0xFF).unwrap_or(0),
+            ),
+        },
+    };
+    // L3 alpha test, then fog, before the write (the triangle-path order).
+    if frag.alpha_test != 0 && !alpha_test_pass(alpha, frag.alpha_func, frag.alpha_ref) {
+        return;
+    }
+    let rgb = if frag.fog_enable != 0 {
+        let factor = if frag.fog_table_mode != D3DFOG_NONE {
+            fog_factor(frag, frag.fog_table_mode, z)
+        } else {
+            fog_factor(frag, frag.fog_vertex_mode, z)
+        };
+        fog_blend(rgb, frag.fog_color & 0x00FF_FFFF, factor)
+    } else {
+        rgb
+    };
+    let color = if frag.alpha_blend != 0 {
+        let dst = backbuffer.get(index).copied().unwrap_or(0);
+        blend_fragment(dst, rgb, alpha, frag)
+    } else {
+        rgb
+    };
+    if let Some(pixel) = backbuffer.get_mut(index) {
+        *pixel = color;
+    }
 }

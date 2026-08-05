@@ -18,29 +18,48 @@ use crate::guest_memory::{
 };
 use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 
+/// One mip level's host texels (levels 1..; level 0 lives in
+/// [`TextureRecord::pixels`]).
+#[derive(Debug, Clone)]
+pub struct MipLevel {
+    /// Level width in texels (the CreateTexture chain halves per level).
+    pub width: u32,
+    /// Level height in texels.
+    pub height: u32,
+    /// Texels in `0xAARRGGBB` order, row-major.
+    pub pixels: Vec<u32>,
+}
+
 /// A D3D9 texture: host-owned texels plus the guest lock state.
 ///
 /// Texels are stored in D3DCOLOR order (`0xAARRGGBB`, matching what the guest
 /// writes through `LockRect`), row-major, top row first. The fragment stage
-/// samples them and masks to 0RGB when writing the backbuffer.
+/// samples them and masks to 0RGB when writing the backbuffer. Level 0 is the
+/// record's `width`/`height`/`pixels`; the halved chain lives in `mip_levels`
+/// (empty when `levels == 1` — no mips).
 #[derive(Debug, Clone)]
 pub struct TextureRecord {
     /// The texture object's guest VA (also the `IDirect3DTexture9` pointer).
     pub handle: u64,
-    /// Texture width in texels.
+    /// Texture width in texels (level 0).
     pub width: u32,
-    /// Texture height in texels.
+    /// Texture height in texels (level 0).
     pub height: u32,
-    /// Number of levels (slice: `levels == 0` → 1; mip chain deferred).
+    /// Number of levels (slice: `levels == 0` → the full chain to 1×1).
     pub levels: u32,
     /// `D3DFMT_*` format (only A8R8G8B8 / X8R8G8B8 are accepted).
     pub format: u32,
-    /// Texels in `0xAARRGGBB` order.
+    /// Level-0 texels in `0xAARRGGBB` order.
     pub pixels: Vec<u32>,
-    /// Surface object VA handed out by `GetSurfaceLevel` (created lazily).
-    pub surface_va: u64,
+    /// Levels 1.. (the halved mip chain; empty for a single-level texture).
+    pub mip_levels: Vec<MipLevel>,
+    /// Surface object VA per level, handed out by `GetSurfaceLevel` (created
+    /// lazily; 0 = that level's surface not created yet).
+    pub surface_vas: Vec<u64>,
     /// Guest block VA handed out by the active `LockRect` (0 = not locked).
     pub locked_va: u64,
+    /// The level the active `LockRect` targets (valid when `locked_va != 0`).
+    pub locked_level: u32,
     /// Locked region (None = whole surface) in surface coordinates.
     pub locked_rect: Option<(i32, i32, i32, i32)>,
 }
@@ -176,9 +195,8 @@ pub fn handle_create_texture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         .context("CreateTexture width does not fit u32")?;
     let height = u32::try_from(height_raw & u64::from(u32::MAX))
         .context("CreateTexture height does not fit u32")?;
-    let levels = u32::try_from(levels_raw & u64::from(u32::MAX))
-        .context("CreateTexture levels does not fit u32")?
-        .max(1);
+    let levels_raw_value = u32::try_from(levels_raw & u64::from(u32::MAX))
+        .context("CreateTexture levels does not fit u32")?;
     let format = u32::try_from(format_raw & u64::from(u32::MAX))
         .context("CreateTexture format does not fit u32")?;
 
@@ -194,6 +212,29 @@ pub fn handle_create_texture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         if object == 0 {
             D3DERR_INVALIDCALL
         } else {
+            // L4 mip chain: `levels == 0` means the full chain down to 1×1;
+            // an explicit count is clamped to the chain length (a request
+            // beyond it is the honest clamp, not a silent 1-level texture).
+            let chain_len = (width.max(height)).ilog2().saturating_add(1);
+            let levels_requested = if levels_raw_value == 0 {
+                chain_len
+            } else {
+                levels_raw_value
+            };
+            let levels = levels_requested.min(chain_len);
+            let mip_levels = (1..levels)
+                .map(|level| {
+                    let level_w = (width >> level).max(1);
+                    let level_h = (height >> level).max(1);
+                    let texel_count =
+                        usize::try_from(level_w.checked_mul(level_h).unwrap_or(0)).unwrap_or(0);
+                    MipLevel {
+                        width: level_w,
+                        height: level_h,
+                        pixels: vec![0; texel_count],
+                    }
+                })
+                .collect();
             let texel_count = usize::try_from(width.checked_mul(height).unwrap_or(0)).unwrap_or(0);
             state.d3d9().d3d9_textures.insert(
                 object,
@@ -204,8 +245,10 @@ pub fn handle_create_texture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
                     levels,
                     format,
                     pixels: vec![0; texel_count],
-                    surface_va: 0,
+                    mip_levels,
+                    surface_vas: vec![0; usize::try_from(levels).unwrap_or(0)],
                     locked_va: 0,
+                    locked_level: 0,
                     locked_rect: None,
                 },
             );
@@ -228,9 +271,9 @@ pub fn handle_create_texture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
 
 /// Handles `IDirect3DTexture9::GetSurfaceLevel` (vtable slot 18).
 ///
-/// Slice model: the texture record IS the surface; level 0 is the whole
-/// texture (higher levels return the same record — mips deferred). The
-/// surface object is created lazily and cached on the record.
+/// L4: real level indexing — `level` must be inside the CreateTexture chain.
+/// Each level gets its own lazily-created surface object (cached on the
+/// record), so locking level 1 writes that level's texels, not level 0's.
 pub fn handle_texture_get_surface_level(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
@@ -239,39 +282,60 @@ pub fn handle_texture_get_surface_level(
     let this_pointer = engine
         .read_rcx()
         .context("failed to read RCX for GetSurfaceLevel")?;
-    let _level = engine
+    let level_raw = engine
         .read_rdx()
         .context("failed to read RDX for GetSurfaceLevel")?;
     let pp_surface = engine
         .read_r8()
         .context("failed to read R8 for GetSurfaceLevel")?;
 
+    let level = u32::try_from(level_raw & u64::from(u32::MAX))
+        .context("GetSurfaceLevel level does not fit u32")?;
     let valid_texture = state.d3d9().d3d9_textures.contains_key(&this_pointer);
     let return_value = if valid_texture && pp_surface != 0 {
-        let surface = match state.d3d9().d3d9_textures.get(&this_pointer) {
-            Some(record) if record.surface_va != 0 => record.surface_va,
-            _ => {
+        // Out-of-range level (or a degenerate record) → the honest invalid
+        // call; a level the chain does not have must not alias level 0.
+        let in_range = state
+            .d3d9()
+            .d3d9_textures
+            .get(&this_pointer)
+            .is_some_and(|record| level < record.levels);
+        if !in_range {
+            D3DERR_INVALIDCALL
+        } else {
+            let cached = state
+                .d3d9()
+                .d3d9_textures
+                .get(&this_pointer)
+                .and_then(|record| record.surface_vas.get(level as usize).copied())
+                .unwrap_or(0);
+            let surface = if cached != 0 {
+                cached
+            } else {
                 let object = allocate_surface_object(engine, state)?;
                 if object == 0 {
                     0
                 } else {
-                    if let Some(record) = state.d3d9().d3d9_textures.get_mut(&this_pointer) {
-                        record.surface_va = object;
+                    if let Some(record) = state.d3d9().d3d9_textures.get_mut(&this_pointer)
+                        && let Some(slot) = record.surface_vas.get_mut(level as usize)
+                    {
+                        *slot = object;
                     }
                     state
                         .d3d9()
                         .d3d9_surface_textures
                         .insert(object, this_pointer);
+                    state.d3d9().d3d9_surface_levels.insert(object, level);
                     object
                 }
+            };
+            if surface == 0 {
+                D3DERR_INVALIDCALL
+            } else {
+                write_guest_u64(engine, pp_surface, surface)
+                    .context("failed to return IDirect3DSurface9 pointer")?;
+                D3D_OK
             }
-        };
-        if surface == 0 {
-            D3DERR_INVALIDCALL
-        } else {
-            write_guest_u64(engine, pp_surface, surface)
-                .context("failed to return IDirect3DSurface9 pointer")?;
-            D3D_OK
         }
     } else {
         D3DERR_INVALIDCALL
@@ -316,23 +380,46 @@ fn read_guest_rect(
 
 /// Shared LockRect body: allocate a guest block, point `pLockedRect` at it
 /// (or at the rect's top-left), and remember the region for the copy-back.
+///
+/// `level` selects which mip level the lock targets (the surface form resolves
+/// it through [`D3D9State::d3d9_surface_levels`]; the texture form passes the
+/// `RDX` level directly).
 fn lock_rect_common(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
     texture_va: u64,
+    level: u32,
     p_locked_rect: u64,
     p_rect: u64,
 ) -> Result<u64> {
     let Some(record) = state.d3d9().d3d9_textures.get(&texture_va) else {
         return Ok(D3DERR_INVALIDCALL);
     };
-    let (width, height) = (record.width, record.height);
-    if record.locked_va != 0 || width == 0 || height == 0 {
-        return Ok(D3DERR_INVALIDCALL); // double lock / degenerate
+    // Level 0's dims are the record's; higher levels read the mip chain.
+    let level_width = if level == 0 {
+        record.width
+    } else {
+        record
+            .mip_levels
+            .get(level as usize - 1)
+            .map_or(0, |mip| mip.width)
+    };
+    let level_height = if level == 0 {
+        record.height
+    } else {
+        record
+            .mip_levels
+            .get(level as usize - 1)
+            .map_or(0, |mip| mip.height)
+    };
+    if record.locked_va != 0 || level >= record.levels || level_width == 0 || level_height == 0 {
+        return Ok(D3DERR_INVALIDCALL); // double lock / degenerate / bad level
     }
-    let pitch = width.checked_mul(4).context("texture pitch overflow")?;
+    let pitch = level_width
+        .checked_mul(4)
+        .context("texture pitch overflow")?;
     let total = u64::from(pitch)
-        .checked_mul(u64::from(height))
+        .checked_mul(u64::from(level_height))
         .context("texture lock size overflow")?;
 
     let rect = read_guest_rect(engine, p_rect)?;
@@ -341,8 +428,8 @@ fn lock_rect_common(
             && top >= 0
             && right > left
             && bottom > top
-            && right <= i32::try_from(width).unwrap_or(0)
-            && bottom <= i32::try_from(height).unwrap_or(0);
+            && right <= i32::try_from(level_width).unwrap_or(0)
+            && bottom <= i32::try_from(level_height).unwrap_or(0);
         if !within {
             return Ok(D3DERR_INVALIDCALL);
         }
@@ -371,6 +458,7 @@ fn lock_rect_common(
 
     if let Some(record) = state.d3d9().d3d9_textures.get_mut(&texture_va) {
         record.locked_va = block;
+        record.locked_level = level;
         record.locked_rect = rect;
     }
     Ok(D3D_OK)
@@ -397,8 +485,15 @@ pub fn handle_surface_lock_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .get(&this_pointer)
         .copied()
         .unwrap_or(0);
+    // The surface resolves its mip level through the surface→level map.
+    let level = state
+        .d3d9()
+        .d3d9_surface_levels
+        .get(&this_pointer)
+        .copied()
+        .unwrap_or(0);
     let return_value = if texture_va != 0 {
-        lock_rect_common(engine, state, texture_va, p_locked_rect, p_rect)?
+        lock_rect_common(engine, state, texture_va, level, p_locked_rect, p_rect)?
     } else {
         D3DERR_INVALIDCALL
     };
@@ -413,7 +508,7 @@ pub fn handle_surface_lock_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 }
 
 /// Handles `IDirect3DTexture9::LockRect` (vtable slot 19) — the deprecated
-/// texture-level form; `RDX` is the level (deferred, must be 0).
+/// texture-level form; `RDX` is the mip level.
 pub fn handle_texture_lock_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
@@ -431,13 +526,9 @@ pub fn handle_texture_lock_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .context("failed to read R9 for IDirect3DTexture9::LockRect")?;
     let _flags = read_stack_argument(engine, 0x28, "IDirect3DTexture9::LockRect Flags")?;
 
-    let level = level_raw & u64::from(u32::MAX);
-    let return_value = if level == 0 {
-        lock_rect_common(engine, state, this_pointer, p_locked_rect, p_rect)?
-    } else {
-        // Mips are deferred — only level 0 exists.
-        D3DERR_INVALIDCALL
-    };
+    let level = u32::try_from(level_raw & u64::from(u32::MAX))
+        .context("IDirect3DTexture9::LockRect level does not fit u32")?;
+    let return_value = lock_rect_common(engine, state, this_pointer, level, p_locked_rect, p_rect)?;
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -449,7 +540,7 @@ pub fn handle_texture_lock_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 }
 
 /// Shared UnlockRect body: copy the locked region back into the host texels
-/// and free the guest block.
+/// of the locked level and free the guest block.
 fn unlock_rect_common(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -459,10 +550,19 @@ fn unlock_rect_common(
         return D3DERR_INVALIDCALL;
     };
     let locked_va = record.locked_va;
+    let locked_level = record.locked_level;
     if locked_va == 0 {
         return D3DERR_INVALIDCALL; // not locked
     }
-    let (width, height) = (record.width, record.height);
+    // The locked level's dims (level 0 = the record's own texels).
+    let (width, height) = if locked_level == 0 {
+        (record.width, record.height)
+    } else {
+        record
+            .mip_levels
+            .get(locked_level as usize - 1)
+            .map_or((0, 0), |mip| (mip.width, mip.height))
+    };
     let rect = record.locked_rect;
     let pitch = u64::from(width.checked_mul(4).unwrap_or(0));
     let (left, top, right, bottom) = rect.unwrap_or((
@@ -489,23 +589,30 @@ fn unlock_rect_common(
             if engine.mem_read(src, &mut row_bytes).is_err() {
                 continue;
             }
-            // Copy the row into the host texels (D3DCOLOR byte order).
+            // Copy the row into the level's host texels (D3DCOLOR byte order).
             let mut texels: Vec<u32> = Vec::with_capacity(row_width);
             for chunk in row_bytes.chunks_exact(4) {
                 let bytes: [u8; 4] = chunk.try_into().unwrap_or([0; 4]);
                 texels.push(u32::from_le_bytes(bytes));
             }
-            if let Some(record) = state.d3d9().d3d9_textures.get_mut(&texture_va) {
-                let row_start = usize::try_from(row)
-                    .unwrap_or(0)
-                    .saturating_mul(usize::try_from(width).unwrap_or(0));
-                for (col, texel) in texels.into_iter().enumerate() {
-                    let index = row_start
-                        .saturating_add(usize::try_from(left).unwrap_or(0))
-                        .saturating_add(col);
-                    if let Some(slot) = record.pixels.get_mut(index) {
+            let row_start = usize::try_from(row)
+                .unwrap_or(0)
+                .saturating_mul(usize::try_from(width).unwrap_or(0));
+            for (col, texel) in texels.into_iter().enumerate() {
+                let index = row_start
+                    .saturating_add(usize::try_from(left).unwrap_or(0))
+                    .saturating_add(col);
+                if locked_level == 0 {
+                    if let Some(record) = state.d3d9().d3d9_textures.get_mut(&texture_va)
+                        && let Some(slot) = record.pixels.get_mut(index)
+                    {
                         *slot = texel;
                     }
+                } else if let Some(record) = state.d3d9().d3d9_textures.get_mut(&texture_va)
+                    && let Some(mip) = record.mip_levels.get_mut(locked_level as usize - 1)
+                    && let Some(slot) = mip.pixels.get_mut(index)
+                {
+                    *slot = texel;
                 }
             }
         }
@@ -513,6 +620,7 @@ fn unlock_rect_common(
     let _ = state.heap_state.heap.free_coherent(engine, locked_va);
     if let Some(record) = state.d3d9().d3d9_textures.get_mut(&texture_va) {
         record.locked_va = 0;
+        record.locked_level = 0;
         record.locked_rect = None;
     }
     D3D_OK
@@ -748,6 +856,9 @@ pub fn handle_get_sampler_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 }
 
 /// Handles `IDirect3DTexture9::Release` (vtable slot 2).
+///
+/// Frees every per-level surface object, the active lock block, and the
+/// texture record (the level texels drop with it).
 pub fn handle_texture_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
@@ -755,13 +866,14 @@ pub fn handle_texture_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         .read_rcx()
         .context("failed to read RCX for IDirect3DTexture9::Release")?;
 
-    let (surface_va, locked_va) = state
+    let (surface_vas, locked_va) = state
         .d3d9()
         .d3d9_textures
         .get(&this_pointer)
-        .map_or((0, 0), |r| (r.surface_va, r.locked_va));
-    let exists =
-        surface_va != 0 || locked_va != 0 || state.d3d9().d3d9_textures.contains_key(&this_pointer);
+        .map_or((Vec::new(), 0), |r| (r.surface_vas.clone(), r.locked_va));
+    let exists = !surface_vas.is_empty()
+        || locked_va != 0
+        || state.d3d9().d3d9_textures.contains_key(&this_pointer);
 
     let return_value = if exists {
         // Unbind from every stage.
@@ -770,8 +882,12 @@ pub fn handle_texture_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
                 *slot = 0;
             }
         }
-        if surface_va != 0 {
+        for surface_va in surface_vas {
+            if surface_va == 0 {
+                continue;
+            }
             state.d3d9().d3d9_surface_textures.remove(&surface_va);
+            state.d3d9().d3d9_surface_levels.remove(&surface_va);
             let vtable = surface_va.saturating_sub(IDIRECT3DSURFACE9_OBJECT_OFFSET);
             let _ = state.heap_state.heap.free_coherent(engine, vtable);
         }
@@ -808,8 +924,18 @@ pub fn handle_surface_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 
     let return_value =
         if let Some(texture_va) = state.d3d9().d3d9_surface_textures.remove(&this_pointer) {
-            if let Some(record) = state.d3d9().d3d9_textures.get_mut(&texture_va) {
-                record.surface_va = 0;
+            // Drop the surface view for its level (the record's texels —
+            // including every other level — survive until the texture
+            // itself is released).
+            let level = state
+                .d3d9()
+                .d3d9_surface_levels
+                .remove(&this_pointer)
+                .unwrap_or(0);
+            if let Some(record) = state.d3d9().d3d9_textures.get_mut(&texture_va)
+                && let Some(slot) = record.surface_vas.get_mut(level as usize)
+            {
+                *slot = 0;
             }
             let vtable = this_pointer.saturating_sub(IDIRECT3DSURFACE9_OBJECT_OFFSET);
             let _ = state.heap_state.heap.free_coherent(engine, vtable);

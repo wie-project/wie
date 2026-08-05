@@ -1,4 +1,4 @@
-// P3/P4b/P5a + L1/L2/L3 D3D9 software-render micro-test for WIE.
+// P3/P4b/P5a + L1/L2/L3/L4 D3D9 software-render micro-test for WIE.
 //
 // Exercises the software-render slice (roadmap B6 + P4b + P5a caps + the
 // vs_2_0 L1 vertex stage + the L2 buffer objects + the L3 state surface):
@@ -25,13 +25,24 @@
 //   affine interpolation would — the D3D9_RESTING_FRAME_HASH gate + the
 //   host-side pixel test prove the w plumbing.
 //
+// The L4 additions (the renderer-completeness strip, drawn after the L3
+// strip): the mip-select quad (a 64x64 texture with the full chain — level 1
+// is a yellow/magenta pattern that MIPFILTER POINT must select when the
+// level-0 footprint is 2 texels/pixel), the point list + line list/strip
+// (D3DRS_POINTSIZE 1 and 4), the MinZ/MaxZ occlusion quads (RHW z mapped
+// through a non-default viewport — the white B quad must win the overlap,
+// proving the mapped depth is what the depth test sees), and the
+// near-plane-clipped quad (a w-shear projection pushes half the quad behind
+// w=0; Sutherland–Hodgman keeps the visible half — pre-L4 the whole quad
+// vanished).
+//
 // Self-test (WIE_SELFTEST=1): every D3D9 call's HRESULT is checked, a
 // SetViewport/GetViewport round-trip is verified, the L3 state surface is
 // verified (the D3DERR_INVALIDCALL validation, the raw-value GetRenderState
 // round-trip of an unmodeled state, the fog/alpha/scissor state round-trips,
 // and the GetTransform / MultiplyTransform / D3DTS_TEXTURE0 round-trips),
 // and after TIMER_TICKS WM_TIMER ticks (each invalidating → repaint →
-// represent) the window quits with 0. Distinct non-zero codes (101-185)
+// represent) the window quits with 0. Distinct non-zero codes (101-210)
 // report the first stage that did not run. Interactive runs (no
 // WIE_SELFTEST) keep the window open — the timer drives nothing and the
 // window quits only on 'q' / close.
@@ -41,10 +52,13 @@
 // x∈[240,310], y∈[10,110] + a VS-driven textured quad at x∈[220,290],
 // y∈[150,220] + the w-skewed quad at x∈[136,196], y∈[141,215] + the L3
 // fragment-stage strip at x∈[100,220], y∈[220,235] (the alpha-tested quad,
-// the fogged quad, and the scissor-clipped quad). The CI test samples pixels
+// the fogged quad, and the scissor-clipped quad) + the L4 strip at
+// x∈[10,90], y∈[150,220] (the mip quad, the points/lines, the big point),
+// x∈[230,320], y∈[110,140] (the MinZ/MaxZ occlusion), and x∈[220,320],
+// y∈[220,240] (the near-plane-clipped quad). The CI test samples pixels
 // (clear red outside the geometry, triangle colors, quad texels, the
-// perspective-correct w-skewed center, the L3 strip colors) and gates a
-// resting-frame hash.
+// perspective-correct w-skewed center, the L3 strip colors, the L4 strip
+// colors) and gates a resting-frame hash.
 
 #define COBJMACROS
 #include <windows.h>
@@ -61,6 +75,7 @@ static HWND      g_hwnd;
 static IDirect3D9       *g_d3d;
 static IDirect3DDevice9 *g_device;
 static IDirect3DTexture9 *g_tex;
+static IDirect3DTexture9 *g_mip_tex;
 static IDirect3DSurface9 *g_depth;
 static IDirect3DVertexShader9 *g_vs;
 static D3DMATRIX g_ortho;      // the baseline orthographic projection
@@ -149,6 +164,86 @@ static int setup_texture(void) {
     if (FAILED(hr)) {
         return 134;
     }
+    IDirect3DDevice9_SetTexture(g_device, 0, NULL);
+    return 0;
+}
+
+// Create the L4 mip-chain texture: 64x64 with the full chain (levels 0..6 =
+// 64x64, 32x32, 16x16, 8x8, 4x4, 2x2, 1x1). Level 0 is a red/green/blue/white
+// checkerboard (texel (x%2, y%2)); level 1 (32x32) is a yellow/magenta
+// checkerboard (texel (x+y)%2 ? magenta : yellow). A quad whose level-0
+// footprint is 2 texels/pixel selects level 1, so the two check pixels prove
+// the MIPFILTER POINT level selection (the level-0 texels at those uv points
+// are white; the level-1 texels are yellow and magenta).
+// Returns 0 on success, else the exit code naming the failed stage.
+static int setup_mip_texture(void) {
+    HRESULT hr = IDirect3DDevice9_CreateTexture(
+        g_device, 64, 64, 0, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &g_mip_tex, NULL);
+    if (FAILED(hr) || g_mip_tex == NULL) {
+        return 190;
+    }
+    IDirect3DSurface9 *surf = NULL;
+    hr = IDirect3DTexture9_GetSurfaceLevel(g_mip_tex, 0, &surf);
+    if (FAILED(hr) || surf == NULL) {
+        return 191;
+    }
+    D3DLOCKED_RECT lr;
+    hr = IDirect3DSurface9_LockRect(surf, &lr, NULL, 0);
+    if (FAILED(hr) || lr.pBits == NULL || lr.Pitch < 64 * 4) {
+        return 192;
+    }
+    {
+        DWORD *bits = (DWORD *)lr.pBits;
+        for (int y = 0; y < 64; y++) {
+            for (int x = 0; x < 64; x++) {
+                DWORD c = (x & 1) == 0
+                    ? ((y & 1) == 0 ? D3DCOLOR_XRGB(255, 0, 0) : D3DCOLOR_XRGB(0, 0, 255))
+                    : ((y & 1) == 0 ? D3DCOLOR_XRGB(0, 255, 0) : D3DCOLOR_XRGB(255, 255, 255));
+                bits[y * 64 + x] = c;
+            }
+        }
+    }
+    hr = IDirect3DSurface9_UnlockRect(surf);
+    if (FAILED(hr)) {
+        return 193;
+    }
+    IDirect3DSurface9_Release(surf);
+    surf = NULL;
+    // Level 1 (32x32): the halved chain — the mip-select quad samples this.
+    hr = IDirect3DTexture9_GetSurfaceLevel(g_mip_tex, 1, &surf);
+    if (FAILED(hr) || surf == NULL) {
+        return 194;
+    }
+    hr = IDirect3DSurface9_LockRect(surf, &lr, NULL, 0);
+    if (FAILED(hr) || lr.pBits == NULL || lr.Pitch < 32 * 4) {
+        return 195;
+    }
+    {
+        DWORD *bits = (DWORD *)lr.pBits;
+        for (int y = 0; y < 32; y++) {
+            for (int x = 0; x < 32; x++) {
+                bits[y * 32 + x] = ((x + y) & 1) == 0
+                    ? D3DCOLOR_XRGB(255, 255, 0)   // yellow
+                    : D3DCOLOR_XRGB(255, 0, 255);  // magenta
+            }
+        }
+    }
+    hr = IDirect3DSurface9_UnlockRect(surf);
+    if (FAILED(hr)) {
+        return 196;
+    }
+    IDirect3DSurface9_Release(surf);
+    // Explicit POINT mip/min filters (they are the D3D9 defaults; the
+    // explicit set makes the test robust against any default drift).
+    hr = IDirect3DDevice9_SetSamplerState(g_device, 0, D3DSAMP_MIPFILTER, D3DTEXF_POINT);
+    if (FAILED(hr)) {
+        return 197;
+    }
+    hr = IDirect3DDevice9_SetSamplerState(g_device, 0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+    if (FAILED(hr)) {
+        return 198;
+    }
+    IDirect3DDevice9_SetTexture(g_device, 0, NULL);
     return 0;
 }
 
@@ -629,6 +724,195 @@ static int render_frame(void) {
             return 185;
         }
     }
+    // ── L4 renderer-completeness strip ─────────────────────────────────
+    // Deterministic additions at clear-red regions: the mip-select quad
+    // (R2 x∈[10,42], y∈[150,182]), the point list + line list/strip + big
+    // point (R2 x∈[48,90], y∈[150,190]), the MinZ/MaxZ occlusion quads
+    // (R6 x∈[230,320], y∈[110,140]), and the near-plane-clipped quad
+    // (R7 x∈[220,320], y∈[220,240]).
+    if (FAILED(IDirect3DDevice9_SetFVF(g_device, D3DFVF_XYZRHW | D3DFVF_DIFFUSE)) ||
+        FAILED(IDirect3DDevice9_SetRenderState(g_device, D3DRS_ZENABLE, FALSE)) ||
+        FAILED(IDirect3DDevice9_SetRenderState(g_device, D3DRS_ALPHABLENDENABLE, FALSE))) {
+        return 200;
+    }
+    // -- mip-select quad: 64x64 texture (level 0 checkerboard, level 1
+    //    yellow/magenta) over a 32x32 screen quad → level-0 footprint 2 →
+    //    MIPFILTER POINT selects level 1. World (screen-160, 120-screen).
+    if (FAILED(IDirect3DDevice9_SetFVF(g_device,
+                                       D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1)) ||
+        FAILED(IDirect3DDevice9_SetTexture(g_device, 0,
+                                           (IDirect3DBaseTexture9 *)g_mip_tex))) {
+        return 201;
+    }
+    {
+        struct TexVertex mq[4];
+        mq[0].x = -150.0f; mq[0].y = -30.0f; mq[0].z = 0.0f;
+        mq[0].color = D3DCOLOR_XRGB(255, 255, 255);
+        mq[0].u = 0.0f; mq[0].v = 0.0f;
+        mq[1].x = -118.0f; mq[1].y = -30.0f; mq[1].z = 0.0f;
+        mq[1].color = D3DCOLOR_XRGB(255, 255, 255);
+        mq[1].u = 1.0f; mq[1].v = 0.0f;
+        mq[2].x = -150.0f; mq[2].y = -62.0f; mq[2].z = 0.0f;
+        mq[2].color = D3DCOLOR_XRGB(255, 255, 255);
+        mq[2].u = 0.0f; mq[2].v = 1.0f;
+        mq[3].x = -118.0f; mq[3].y = -62.0f; mq[3].z = 0.0f;
+        mq[3].color = D3DCOLOR_XRGB(255, 255, 255);
+        mq[3].u = 1.0f; mq[3].v = 1.0f;
+        struct TexVertex verts[6];
+        verts[0] = mq[0]; verts[1] = mq[1]; verts[2] = mq[2];
+        verts[3] = mq[1]; verts[4] = mq[3]; verts[5] = mq[2];
+        if (FAILED(IDirect3DDevice9_DrawPrimitiveUP(
+                       g_device, D3DPT_TRIANGLELIST, 2, verts,
+                       (UINT)sizeof(verts[0])))) {
+            return 202;
+        }
+    }
+    if (FAILED(IDirect3DDevice9_SetTexture(g_device, 0, NULL)) ||
+        FAILED(IDirect3DDevice9_SetFVF(g_device, D3DFVF_XYZRHW | D3DFVF_DIFFUSE))) {
+        return 203;
+    }
+    // -- point list (size 1): three white points at half-integer positions so
+    //    each covers exactly the pixel containing the vertex.
+    {
+        struct RhwVertex pts[3];
+        pts[0].x = 50.5f; pts[0].y = 156.5f; pts[0].z = 0.0f; pts[0].rhw = 1.0f;
+        pts[0].color = D3DCOLOR_XRGB(255, 255, 255);
+        pts[1].x = 58.5f; pts[1].y = 156.5f; pts[1].z = 0.0f; pts[1].rhw = 1.0f;
+        pts[1].color = D3DCOLOR_XRGB(255, 255, 255);
+        pts[2].x = 66.5f; pts[2].y = 156.5f; pts[2].z = 0.0f; pts[2].rhw = 1.0f;
+        pts[2].color = D3DCOLOR_XRGB(255, 255, 255);
+        if (FAILED(IDirect3DDevice9_SetRenderState(g_device, D3DRS_POINTSIZE,
+                                                   *(DWORD *)&(float){ 1.0f })) ||
+            FAILED(IDirect3DDevice9_DrawPrimitiveUP(
+                       g_device, D3DPT_POINTLIST, 3, pts, (UINT)sizeof(pts[0])))) {
+            return 204;
+        }
+    }
+    // -- line list: one white 1px horizontal line.
+    {
+        struct RhwVertex line[2];
+        line[0].x = 50.5f; line[0].y = 166.5f; line[0].z = 0.0f; line[0].rhw = 1.0f;
+        line[0].color = D3DCOLOR_XRGB(255, 255, 255);
+        line[1].x = 66.5f; line[1].y = 166.5f; line[1].z = 0.0f; line[1].rhw = 1.0f;
+        line[1].color = D3DCOLOR_XRGB(255, 255, 255);
+        if (FAILED(IDirect3DDevice9_DrawPrimitiveUP(
+                       g_device, D3DPT_LINELIST, 1, line, (UINT)sizeof(line[0])))) {
+            return 205;
+        }
+    }
+    // -- line strip: an inverted V (two segments sharing the apex).
+    {
+        struct RhwVertex strip[3];
+        strip[0].x = 50.5f; strip[0].y = 176.5f; strip[0].z = 0.0f; strip[0].rhw = 1.0f;
+        strip[0].color = D3DCOLOR_XRGB(255, 255, 255);
+        strip[1].x = 58.5f; strip[1].y = 184.5f; strip[1].z = 0.0f; strip[1].rhw = 1.0f;
+        strip[1].color = D3DCOLOR_XRGB(255, 255, 255);
+        strip[2].x = 66.5f; strip[2].y = 176.5f; strip[2].z = 0.0f; strip[2].rhw = 1.0f;
+        strip[2].color = D3DCOLOR_XRGB(255, 255, 255);
+        if (FAILED(IDirect3DDevice9_DrawPrimitiveUP(
+                       g_device, D3DPT_LINESTRIP, 2, strip, (UINT)sizeof(strip[0])))) {
+            return 206;
+        }
+    }
+    // -- big point: POINTSIZE 4 at a half-integer center → a 3x3 square.
+    {
+        struct RhwVertex pt;
+        pt.x = 74.5f; pt.y = 158.5f; pt.z = 0.0f; pt.rhw = 1.0f;
+        pt.color = D3DCOLOR_XRGB(255, 255, 255);
+        if (FAILED(IDirect3DDevice9_SetRenderState(g_device, D3DRS_POINTSIZE,
+                                                   *(DWORD *)&(float){ 4.0f })) ||
+            FAILED(IDirect3DDevice9_DrawPrimitiveUP(
+                       g_device, D3DPT_POINTLIST, 1, &pt, (UINT)sizeof(pt))) ||
+            FAILED(IDirect3DDevice9_SetRenderState(g_device, D3DRS_POINTSIZE,
+                                                   *(DWORD *)&(float){ 1.0f }))) {
+            return 207;
+        }
+    }
+    // -- MinZ/MaxZ occlusion: draw A (magenta, RHW z=0.1) under the viewport
+    //    [0.5, 1.0] → mapped z 0.55; then B (white, RHW z=0.3) under the
+    //    default viewport → z 0.3. B (0.3) must win over A (0.55) — if the
+    //    RHW z were used raw (pre-L4), B (0.3) would lose to A (0.1) and the
+    //    overlap would stay magenta. The depth buffer at R6 is still the
+    //    frame-clear far plane (1.0), so A passes and stores 0.55.
+    {
+        D3DVIEWPORT9 vp;
+        if (FAILED(IDirect3DDevice9_GetViewport(g_device, &vp))) {
+            return 208;
+        }
+        if (FAILED(IDirect3DDevice9_SetRenderState(g_device, D3DRS_ZENABLE, D3DZB_TRUE)) ||
+            FAILED(IDirect3DDevice9_SetRenderState(g_device, D3DRS_ZFUNC, D3DCMP_LESSEQUAL)) ||
+            FAILED(IDirect3DDevice9_SetRenderState(g_device, D3DRS_ZWRITEENABLE, TRUE))) {
+            return 208;
+        }
+        D3DVIEWPORT9 narrow = vp;
+        narrow.MinZ = 0.5f;
+        narrow.MaxZ = 1.0f;
+        if (FAILED(IDirect3DDevice9_SetViewport(g_device, &narrow))) {
+            return 208;
+        }
+        int rc = draw_rhw_quad(230.0f, 110.0f, 320.0f, 140.0f, 0.1f,
+                               D3DCOLOR_XRGB(255, 0, 255));
+        if (rc != 0) {
+            return rc;
+        }
+        if (FAILED(IDirect3DDevice9_SetViewport(g_device, &vp))) {
+            return 208;
+        }
+        rc = draw_rhw_quad(275.0f, 110.0f, 320.0f, 140.0f, 0.3f,
+                           D3DCOLOR_XRGB(255, 255, 255));
+        if (rc != 0) {
+            return rc;
+        }
+        if (FAILED(IDirect3DDevice9_SetRenderState(g_device, D3DRS_ZENABLE, FALSE))) {
+            return 208;
+        }
+    }
+    // -- near-plane clip: a quad straddling w=0 under a w-shear projection.
+    //    The shear makes clip w = 1 + 0.05·y, so the y∈[-30,-20) half is
+    //    behind the near plane (w ≤ 0). Sutherland–Hodgman clips it: the
+    //    visible y∈[-20,10] half renders as a trapezoid in the sub-viewport
+    //    (220,220,100,20) — pre-L4 the whole quad vanished.
+    {
+        D3DVIEWPORT9 vp;
+        if (FAILED(IDirect3DDevice9_GetViewport(g_device, &vp))) {
+            return 209;
+        }
+        D3DMATRIX shear = g_ortho;
+        shear._24 = 0.05f;
+        if (FAILED(IDirect3DDevice9_SetTransform(g_device, D3DTS_PROJECTION, &shear)) ||
+            FAILED(IDirect3DDevice9_SetFVF(g_device, D3DFVF_XYZ | D3DFVF_DIFFUSE))) {
+            return 209;
+        }
+        D3DVIEWPORT9 clip_vp = vp;
+        clip_vp.X = 220;
+        clip_vp.Y = 220;
+        clip_vp.Width = 100;
+        clip_vp.Height = 20;
+        if (FAILED(IDirect3DDevice9_SetViewport(g_device, &clip_vp))) {
+            return 209;
+        }
+        struct Vertex quad[4];
+        quad[0].x = -20.0f; quad[0].y = 10.0f; quad[0].z = 0.0f;   // front, w=1.5
+        quad[1].x = 20.0f;  quad[1].y = 10.0f; quad[1].z = 0.0f;   // front, w=1.5
+        quad[2].x = -20.0f; quad[2].y = -30.0f; quad[2].z = 0.0f;  // behind, w=-0.5
+        quad[3].x = 20.0f;  quad[3].y = -30.0f; quad[3].z = 0.0f;  // behind, w=-0.5
+        for (int i = 0; i < 4; i++) {
+            quad[i].color = D3DCOLOR_XRGB(255, 0, 255);   // magenta
+        }
+        struct Vertex verts[6];
+        verts[0] = quad[0]; verts[1] = quad[1]; verts[2] = quad[2];
+        verts[3] = quad[1]; verts[4] = quad[3]; verts[5] = quad[2];
+        if (FAILED(IDirect3DDevice9_DrawPrimitiveUP(
+                       g_device, D3DPT_TRIANGLELIST, 2, verts,
+                       (UINT)sizeof(verts[0])))) {
+            return 210;
+        }
+        if (FAILED(IDirect3DDevice9_SetTransform(g_device, D3DTS_PROJECTION, &g_ortho)) ||
+            FAILED(IDirect3DDevice9_SetViewport(g_device, &vp)) ||
+            FAILED(IDirect3DDevice9_SetFVF(g_device, D3DFVF_XYZRHW | D3DFVF_DIFFUSE))) {
+            return 210;
+        }
+    }
     if (FAILED(IDirect3DDevice9_EndScene(g_device))) {
         return 108;
     }
@@ -683,6 +967,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (g_tex) {
             IDirect3DTexture9_Release(g_tex);
             g_tex = NULL;
+        }
+        if (g_mip_tex) {
+            IDirect3DTexture9_Release(g_mip_tex);
+            g_mip_tex = NULL;
         }
         if (g_depth) {
             IDirect3DSurface9_Release(g_depth);
@@ -917,6 +1205,13 @@ void entry(void) {
     {
         // P4b: the 2x2 checkerboard texture + stage-0 binding.
         int rc = setup_texture();
+        if (rc != 0) {
+            ExitProcess(rc);
+        }
+    }
+    {
+        // L4: the 64x64 mip-chain texture (full chain, level 1 filled).
+        int rc = setup_mip_texture();
         if (rc != 0) {
             ExitProcess(rc);
         }

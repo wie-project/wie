@@ -90,6 +90,10 @@ pub struct D3D9State {
     pub(crate) d3d9_textures: HashMap<u64, crate::d3d9::TextureRecord>,
     /// Surface object VA → texture object VA (`GetSurfaceLevel` views).
     pub(crate) d3d9_surface_textures: HashMap<u64, u64>,
+    /// Surface object VA → the mip level it views (L4: `GetSurfaceLevel` is
+    /// level-parameterized — the surface form of `LockRect` resolves which
+    /// level's texels the lock targets).
+    pub(crate) d3d9_surface_levels: HashMap<u64, u32>,
     /// Per-stage (0..8) texture binding (0 = none).
     pub(crate) d3d9_texture_bindings: [u64; 8],
     // ── depth-stencil state ────────────────────────────────────────────
@@ -108,6 +112,13 @@ pub struct D3D9State {
     /// Vertex-shader constant registers `c0..c255` (stored; the vertex stage
     /// stays FFP until vertex shaders execute).
     pub(crate) d3d9_vs_constants: [[f32; 4]; crate::d3d9_shader::VS_CONST_COUNT],
+    /// Vertex-shader integer constant registers `i0..i3` (int4; set via
+    /// `SetVertexShaderConstantI` + `defi` at Create time; the `loop`/`rep`
+    /// sources read these).
+    pub(crate) d3d9_vs_int_constants: [[i32; 4]; crate::d3d9_shader::VS_INT_CONST_COUNT],
+    /// Vertex-shader boolean constant registers `b0..b15` (set via
+    /// `SetVertexShaderConstantB` + `defb` at Create time).
+    pub(crate) d3d9_vs_bool_constants: [bool; crate::d3d9_shader::VS_BOOL_CONST_COUNT],
 }
 
 impl Default for D3D9State {
@@ -145,6 +156,7 @@ impl Default for D3D9State {
             d3d9_buffers: HashMap::new(),
             d3d9_textures: HashMap::new(),
             d3d9_surface_textures: HashMap::new(),
+            d3d9_surface_levels: HashMap::new(),
             d3d9_texture_bindings: [0; 8],
             d3d9_depth_surfaces: HashMap::new(),
             d3d9_depth_stencil: 0,
@@ -152,6 +164,8 @@ impl Default for D3D9State {
             d3d9_pixel_shader: 0,
             d3d9_ps_constants: [[0.0; 4]; crate::d3d9_shader::PS_CONST_COUNT],
             d3d9_vs_constants: [[0.0; 4]; crate::d3d9_shader::VS_CONST_COUNT],
+            d3d9_vs_int_constants: [[0; 4]; crate::d3d9_shader::VS_INT_CONST_COUNT],
+            d3d9_vs_bool_constants: [false; crate::d3d9_shader::VS_BOOL_CONST_COUNT],
         }
     }
 }

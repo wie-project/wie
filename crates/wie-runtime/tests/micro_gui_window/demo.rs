@@ -4,18 +4,21 @@
 
 use crate::helpers::{
     BTNFACE_0RGB, D3D9_ALPHA_PASS_0RGB, D3D9_BLEND_0RGB, D3D9_CLEAR_RED_0RGB, D3D9_CYAN_0RGB,
-    D3D9_FAR_DEPTH_0RGB, D3D9_FOGGED_0RGB, D3D9_NEAR_DEPTH_0RGB, D3D9_QUAD_BLUE_0RGB,
-    D3D9_QUAD_GREEN_0RGB, D3D9_QUAD_RED_0RGB, D3D9_QUAD_WHITE_0RGB, D3D9_RED_QUAD_0RGB,
-    D3D9_RESTING_FRAME_HASH, D3D9_SCISSOR_INSIDE_0RGB, DIALOG_OK_BUTTON_SAMPLE,
-    GUI_BLIT_RESTING_FRAME_HASH, assert_frame_renders_gradient_text_and_controls,
-    drive_gui_session, frame_hash, gui_suite_serialize, micro_exe,
+    D3D9_FAR_DEPTH_0RGB, D3D9_FOGGED_0RGB, D3D9_MIP_MAGENTA_0RGB, D3D9_MIP_YELLOW_0RGB,
+    D3D9_NEAR_DEPTH_0RGB, D3D9_QUAD_BLUE_0RGB, D3D9_QUAD_GREEN_0RGB, D3D9_QUAD_RED_0RGB,
+    D3D9_QUAD_WHITE_0RGB, D3D9_RED_QUAD_0RGB, D3D9_RESTING_FRAME_HASH, D3D9_SCISSOR_INSIDE_0RGB,
+    DIALOG_OK_BUTTON_SAMPLE, GUI_BLIT_RESTING_FRAME_HASH,
+    assert_frame_renders_gradient_text_and_controls, drive_gui_session, frame_hash,
+    gui_suite_serialize, micro_exe,
 };
 
 /// Run gui_d3d9 end-to-end and prove the P3 D3D9 software-render slice:
 /// CreateDevice → Clear(red) → BeginScene → DrawPrimitiveUP (gradient
 /// triangle) → DrawIndexedPrimitiveUP (solid cyan triangle) → the L1 vs_2_0 +
-/// w-skewed quads → the L3 alpha-test/fog/scissor strip → EndScene → Present
-/// publishes a SurfaceFrame through the GDI-shared pipeline.
+/// w-skewed quads → the L3 alpha-test/fog/scissor strip → the L4
+/// renderer-completeness strip (mip-select quad, point/line primitives,
+/// MinZ/MaxZ viewport-mapped depth, near-plane-clipped quad) → EndScene →
+/// Present publishes a SurfaceFrame through the GDI-shared pipeline.
 ///
 /// The exe exits 0 only if every D3D9 call's HRESULT succeeded AND
 /// GetDeviceCaps honestly reported the P5a caps (ps_2_0, vs stage still 0)
@@ -114,6 +117,25 @@ fn gui_d3d9_renders_clear_and_triangle() {
                 && frame.pixels.get(idx(170, 227)).copied() == Some(D3D9_FOGGED_0RGB)
                 && frame.pixels.get(idx(197, 227)).copied() == Some(D3D9_SCISSOR_INSIDE_0RGB)
                 && frame.pixels.get(idx(212, 227)).copied() == Some(D3D9_CLEAR_RED_0RGB)
+                // L4 renderer-completeness strip: the mip-select quad's
+                // level-1 texels (yellow at an even column, magenta at an odd
+                // one — level 0's red/white texels would prove the mip chain
+                // was NOT selected); the point list + line + big point (all
+                // white); the MinZ/MaxZ occlusion (magenta quad A where B does
+                // not cover, white quad B winning the overlap — proving the
+                // viewport-mapped RHW z is what the depth test sees); and the
+                // near-plane-clipped quad's magenta trapezoid (clear red above
+                // it where the w≤0 half was clipped away).
+                && frame.pixels.get(idx(13, 160)).copied() == Some(D3D9_MIP_MAGENTA_0RGB)
+                && frame.pixels.get(idx(14, 160)).copied() == Some(D3D9_MIP_YELLOW_0RGB)
+                && frame.pixels.get(idx(50, 156)).copied() == Some(0x00FF_FFFF)
+                && frame.pixels.get(idx(66, 156)).copied() == Some(0x00FF_FFFF)
+                && frame.pixels.get(idx(58, 166)).copied() == Some(0x00FF_FFFF)
+                && frame.pixels.get(idx(74, 158)).copied() == Some(0x00FF_FFFF)
+                && frame.pixels.get(idx(245, 125)).copied() == Some(D3D9_FAR_DEPTH_0RGB)
+                && frame.pixels.get(idx(300, 125)).copied() == Some(0x00FF_FFFF)
+                && frame.pixels.get(idx(258, 233)).copied() == Some(D3D9_FAR_DEPTH_0RGB)
+                && frame.pixels.get(idx(240, 223)).copied() == Some(D3D9_CLEAR_RED_0RGB)
                 // The whole 320x240 frame is deterministic CPU output — gate it.
                 && frame_hash(&frame, 0, frame.height) == D3D9_RESTING_FRAME_HASH
             {

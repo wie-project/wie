@@ -237,13 +237,15 @@ impl Default for Viewport {
     }
 }
 /// Map a clip-space vertex to screen pixels and depth; `None` when the
-/// vertex is at or behind the near-plane (`w <= 0`) — slice 1 rejects the
-/// whole triangle.
+/// vertex is at or behind the near-plane (`w <= 0`).
 ///
 /// The w-divide maps NDC to the viewport: x/y to the viewport rect, z to the
 /// `MinZ..MaxZ` depth range (so `ScreenVertex.z` is the post-viewport depth
-/// the depth buffer consumes). The clip-space `w` is returned unchanged for
-/// the perspective-correct attribute interpolation in the fragment stage.
+/// the depth buffer consumes). The NDC z is clamped to `[-1, 1]` before the
+/// mapping — the honest z-clamp (post-clip NDC z is always in range; a stray
+/// caller cannot push the stored depth outside the viewport range). The
+/// clip-space `w` is returned unchanged for the perspective-correct attribute
+/// interpolation in the fragment stage.
 ///
 /// `n`: viewport fields are `u32` but the mapping is float math — `f32:
 /// From<u32>` does not exist in `std`, and a 32-bit viewport coordinate
@@ -259,7 +261,7 @@ pub fn clip_to_viewport(c: [f32; 4], vp: &Viewport) -> Option<(f32, f32, f32, f3
     let nz = c[2] / w;
     let sx = vp.x as f32 + (nx + 1.0) * 0.5 * vp.width as f32;
     let sy = vp.y as f32 + (1.0 - ny) * 0.5 * vp.height as f32;
-    let sz = vp.min_z + (nz + 1.0) * 0.5 * (vp.max_z - vp.min_z);
+    let sz = vp.min_z + (nz.clamp(-1.0, 1.0) + 1.0) * 0.5 * (vp.max_z - vp.min_z);
     Some((sx, sy, sz, w))
 }
 
@@ -269,6 +271,114 @@ pub fn clip_to_viewport(c: [f32; 4], vp: &Viewport) -> Option<(f32, f32, f32, f3
 #[must_use]
 pub fn clip_to_screen(c: [f32; 4], vp: &Viewport) -> Option<(f32, f32)> {
     clip_to_viewport(c, vp).map(|(x, y, _z, _w)| (x, y))
+}
+
+/// A clip-space vertex with its interpolated attributes (post-vertex-stage).
+///
+/// The near-plane clip interpolates every field at the clip edge, so the
+/// rasterizer receives honest attributes (color/uv) on the clipped boundary.
+#[derive(Debug, Clone, Copy)]
+pub struct ClipVertex {
+    /// Clip-space position `(x, y, z, w)`.
+    pub pos: [f32; 4],
+    /// Diffuse color `0xAARRGGBB`.
+    pub color: u32,
+    /// Texture coordinate U.
+    pub u: f32,
+    /// Texture coordinate V.
+    pub v: f32,
+}
+
+/// The near plane in homogeneous clip space: vertices with `w` at or below
+/// this are clipped (Sutherland–Hodgman against `w > EPS`).
+///
+/// A tiny positive plane keeps the clipped vertices' `w` finite, so the
+/// viewport w-divide and the perspective-correct interpolation stay
+/// well-defined; the edge-position error is `EPS`-relative (a sub-pixel sliver
+/// at the screen edge for a typical w=1-ortho draw).
+pub const NEAR_CLIP_W: f32 = 1.0e-4;
+
+/// Sutherland–Hodgman clip of a polygon against the near plane (`w > EPS`).
+///
+/// Returns the surviving vertices in input order (0 for a fully-behind
+/// polygon). A triangle yields 3 or 4 vertices (a fan); a segment 0..2.
+#[must_use]
+pub fn clip_polygon_near(vertices: &[ClipVertex]) -> Vec<ClipVertex> {
+    let first = vertices.first().copied();
+    let Some(first) = first else {
+        return Vec::new();
+    };
+    let inside = |v: &ClipVertex| v.pos[3] > NEAR_CLIP_W;
+    let mut out = Vec::new();
+    let mut prev = first;
+    let mut prev_inside = inside(&prev);
+    for &curr in vertices {
+        let curr_inside = inside(&curr);
+        if curr_inside {
+            if !prev_inside {
+                out.push(near_intersect(prev, curr));
+            }
+            out.push(curr);
+        } else if prev_inside {
+            out.push(near_intersect(prev, curr));
+        }
+        prev = curr;
+        prev_inside = curr_inside;
+    }
+    out
+}
+/// Interpolate the clip-space segment `a → b` where it crosses the near plane
+/// (`w = NEAR_CLIP_W`), carrying every attribute with the same parameter.
+#[must_use]
+fn near_intersect(a: ClipVertex, b: ClipVertex) -> ClipVertex {
+    let wa = a.pos[3];
+    let wb = b.pos[3];
+    let t = (wa - NEAR_CLIP_W) / (wa - wb);
+    let pos = [
+        a.pos[0] + (b.pos[0] - a.pos[0]) * t,
+        a.pos[1] + (b.pos[1] - a.pos[1]) * t,
+        a.pos[2] + (b.pos[2] - a.pos[2]) * t,
+        NEAR_CLIP_W,
+    ];
+    ClipVertex {
+        pos,
+        color: lerp_color(a.color, b.color, t),
+        u: a.u + (b.u - a.u) * t,
+        v: a.v + (b.v - a.v) * t,
+    }
+}
+/// Per-channel `0xAARRGGBB` lerp (the clip edge interpolates color honestly).
+#[must_use]
+fn lerp_color(a: u32, b: u32, t: f32) -> u32 {
+    let mix = |x: u8, y: u8| {
+        let x = f32::from(x);
+        let y = f32::from(y);
+        (x + (y - x) * t).round() as u8
+    };
+    let channel = |v: u32, shift: u32| u8::try_from((v >> shift) & 0xFF).unwrap_or(0);
+    let r = mix(channel(a, 16), channel(b, 16));
+    let g = mix(channel(a, 8), channel(b, 8));
+    let bl = mix(channel(a, 0), channel(b, 0));
+    let al = mix(channel(a, 24), channel(b, 24));
+    (u32::from(al) << 24) | (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(bl)
+}
+/// Map a clipped clip-space vertex through the viewport transform.
+///
+/// `None` only for `w <= 0` — the near-plane clip guarantees `w > 0`, so this
+/// is a defensive guard (a caller passing an unclipped vertex still gets the
+/// old whole-primitive reject rather than a garbage divide).
+#[must_use]
+pub fn screen_from_clip(v: &ClipVertex, vp: &Viewport) -> Option<ScreenVertex> {
+    let (x, y, z, w) = clip_to_viewport(v.pos, vp)?;
+    Some(ScreenVertex {
+        x,
+        y,
+        z,
+        w,
+        color: v.color,
+        u: v.u,
+        v: v.v,
+    })
 }
 
 /// A screen-space vertex ready for rasterization.

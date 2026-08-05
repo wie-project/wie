@@ -51,9 +51,11 @@ pub use device::{
 pub use shader::{
     IDIRECT3DSHADER9_METHOD_COUNT, handle_create_pixel_shader, handle_create_vertex_shader,
     handle_get_pixel_shader, handle_get_pixel_shader_constant_f, handle_get_vertex_shader,
-    handle_get_vertex_shader_constant_f, handle_pixel_shader_release, handle_set_pixel_shader,
+    handle_get_vertex_shader_constant_b, handle_get_vertex_shader_constant_f,
+    handle_get_vertex_shader_constant_i, handle_pixel_shader_release, handle_set_pixel_shader,
     handle_set_pixel_shader_constant_f, handle_set_vertex_shader,
-    handle_set_vertex_shader_constant_f, handle_vertex_shader_release,
+    handle_set_vertex_shader_constant_b, handle_set_vertex_shader_constant_f,
+    handle_set_vertex_shader_constant_i, handle_vertex_shader_release,
 };
 pub use texture::{
     DepthStencilRecord, TextureRecord, handle_create_texture, handle_get_sampler_state,

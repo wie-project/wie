@@ -13926,6 +13926,210 @@ fn test_d3d9_texture_lock_unlock_round_trip() {
 }
 
 #[test]
+fn test_d3d9_mip_chain_selects_level_surface_and_texels() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // Seed the guest heap bump cursor (see the round-trip test).
+    engine
+        .mem_write(0x2000, &0x2000_u64.to_le_bytes())
+        .expect("seed bump cursor");
+
+    // CreateTexture(4x4, levels=0 → full chain 4x4/2x2/1x1, A8R8G8B8).
+    let pp_texture = 0x7000_u64;
+    write_regs(&mut engine, 1, 4, 4, 0, 0);
+    engine
+        .mem_write(STACK_TOP + 0x30, &D3DFMT_A8R8G8B8.to_le_bytes())
+        .expect("write format");
+    engine
+        .mem_write(STACK_TOP + 0x40, &pp_texture.to_le_bytes())
+        .expect("write ppTexture");
+    assert_return_value!(
+        d3d9::handle_create_texture(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut tex_bytes = [0_u8; 8];
+    engine
+        .mem_read(pp_texture, &mut tex_bytes)
+        .expect("read texture ptr");
+    let texture_va = u64::from_le_bytes(tex_bytes);
+    let record = state
+        .d3d9()
+        .d3d9_textures
+        .get(&texture_va)
+        .expect("record exists");
+    assert_eq!(
+        record.levels, 3,
+        "levels=0 must build the full chain 4x4/2x2/1x1, not a single level"
+    );
+    assert_eq!(record.mip_levels.len(), 2);
+    assert_eq!(record.mip_levels[0].width, 2);
+    assert_eq!(record.mip_levels[0].height, 2);
+    assert_eq!(record.mip_levels[1].width, 1);
+    assert_eq!(record.mip_levels[1].height, 1);
+
+    // GetSurfaceLevel(1) → the 2x2 level's own surface.
+    let pp_surface = 0x7100_u64;
+    write_regs(&mut engine, texture_va, 1, pp_surface, 0, 0);
+    assert_return_value!(
+        d3d9::handle_texture_get_surface_level(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut surf_bytes = [0_u8; 8];
+    engine
+        .mem_read(pp_surface, &mut surf_bytes)
+        .expect("read surface ptr");
+    let surface_va = u64::from_le_bytes(surf_bytes);
+    assert_ne!(surface_va, 0, "GetSurfaceLevel(1) must return a surface");
+    assert_eq!(
+        state.d3d9().d3d9_surface_levels.get(&surface_va),
+        Some(&1),
+        "the surface view must remember it is level 1"
+    );
+
+    // LockRect the level-1 surface → pitch is 2x4 = 8; write two magenta
+    // texels; UnlockRect must land them in mip_levels[0].pixels, NOT level 0.
+    let locked_rect = 0x7200_u64;
+    write_regs(&mut engine, surface_va, locked_rect, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_surface_lock_rect(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut pitch_bytes = [0_u8; 4];
+    engine
+        .mem_read(locked_rect, &mut pitch_bytes)
+        .expect("read pitch");
+    assert_eq!(u32::from_le_bytes(pitch_bytes), 8, "2x2 pitch must be 8");
+    let mut bits_bytes = [0_u8; 8];
+    engine
+        .mem_read(locked_rect + 8, &mut bits_bytes)
+        .expect("read pBits");
+    let p_bits = u64::from_le_bytes(bits_bytes);
+    engine
+        .mem_write(p_bits, &0xFF00_FFFF_u32.to_le_bytes())
+        .expect("write level-1 texel");
+    write_regs(&mut engine, surface_va, 0, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_surface_unlock_rect(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let record = state
+        .d3d9()
+        .d3d9_textures
+        .get(&texture_va)
+        .expect("record exists");
+    assert_eq!(
+        record.mip_levels[0].pixels[0], 0xFF00_FFFF,
+        "unlock on a level-1 surface must write the mip texels"
+    );
+    assert_eq!(record.pixels[0], 0, "level-0 texels must stay untouched");
+}
+
+#[test]
+fn test_d3d9_vertex_shader_int_bool_constant_round_trip() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+
+    // SetVertexShaderConstantI(0, data, 1) with an int4 (1,2,3,4).
+    let data_i = 0x7000_u64;
+    for (i, v) in [1_i32, 2, 3, 4].iter().enumerate() {
+        engine
+            .mem_write(data_i + u64::try_from(i).unwrap_or(0) * 4, &v.to_le_bytes())
+            .expect("write int constant");
+    }
+    write_regs(&mut engine, 1, 0, data_i, 1, 0);
+    assert_return_value!(
+        d3d9::handle_set_vertex_shader_constant_i(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    assert_eq!(
+        state.d3d9().d3d9_vs_int_constants[0],
+        [1, 2, 3, 4],
+        "SetVertexShaderConstantI must land in the i0 file"
+    );
+
+    // GetVertexShaderConstantI(0, out, 1) reads it back.
+    let out_i = 0x7100_u64;
+    write_regs(&mut engine, 1, 0, out_i, 1, 0);
+    assert_return_value!(
+        d3d9::handle_get_vertex_shader_constant_i(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut back = [0_u8; 16];
+    engine
+        .mem_read(out_i, &mut back)
+        .expect("read int constants");
+    assert_eq!(
+        back,
+        [1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0],
+        "GetVertexShaderConstantI must round-trip the int4"
+    );
+
+    // SetVertexShaderConstantB(1, data, 1) → b1 = TRUE.
+    let data_b = 0x7200_u64;
+    engine
+        .mem_write(data_b, &1_u32.to_le_bytes())
+        .expect("write bool constant");
+    write_regs(&mut engine, 1, 1, data_b, 1, 0);
+    assert_return_value!(
+        d3d9::handle_set_vertex_shader_constant_b(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    assert!(
+        state.d3d9().d3d9_vs_bool_constants[1],
+        "SetVertexShaderConstantB must land in the b1 file"
+    );
+
+    // GetVertexShaderConstantB(1, out, 1) reads it back as a nonzero DWORD.
+    let out_b = 0x7300_u64;
+    write_regs(&mut engine, 1, 1, out_b, 1, 0);
+    assert_return_value!(
+        d3d9::handle_get_vertex_shader_constant_b(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut bool_bytes = [0_u8; 4];
+    engine
+        .mem_read(out_b, &mut bool_bytes)
+        .expect("read bool constant");
+    assert_eq!(
+        u32::from_le_bytes(bool_bytes),
+        1,
+        "GetVertexShaderConstantB must round-trip the boolean"
+    );
+}
+
+#[test]
 fn test_d3d9_texture_unlock_with_rect() {
     let mut engine = test_engine();
     let mut state = default_winapi_state();

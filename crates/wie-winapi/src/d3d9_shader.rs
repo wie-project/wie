@@ -46,6 +46,9 @@ pub const COMMENTSIZE_FIELD_SHIFT: u32 = 16;
 pub const COMMENTSIZE_FIELD_MASK: u32 = 0x7FFF_0000;
 /// Predicated-instruction flag (bit 28).
 const D3DSHADER_INSTRUCTION_PREDICATED: u32 = 0x1000_0000;
+/// Public mirror of the predicated-flag bit for the guest bytecode walker
+/// (`d3d9/shader.rs`), which must count the extra predicate operand token.
+pub const PREDICATED_INSTRUCTION_MASK: u32 = 0x1000_0000;
 
 /// Register number (`D3DSP_REGNUM_MASK`).
 const D3DSP_REGNUM_MASK: u32 = 0x0000_07FF;
@@ -55,6 +58,11 @@ const D3DSP_REGTYPE_MASK: u32 = 0x7 << D3DSP_REGTYPE_SHIFT;
 /// Register type, high 2 bits (`D3DSP_REGTYPE_MASK2` = 0x1800 in bits 11-12).
 const D3DSP_REGTYPE_SHIFT2: u32 = 8;
 const D3DSP_REGTYPE_MASK2: u32 = 0x0000_1800;
+/// Relative-addressing flag (`D3DSHADER_ADDRESSMODE_MASK` = bit 13): when set,
+/// the operand's register number is offset by the `a0.x` address register
+/// (`c[a0.x + n]` vs `c[n]`). L5 decodes and executes this form.
+const RELATIVE_ADDRESSING_SHIFT: u32 = 13;
+const RELATIVE_ADDRESSING_MASK: u32 = 1 << RELATIVE_ADDRESSING_SHIFT;
 /// Source modifier (`D3DSP_SRCMOD_MASK` = 0xF << 24).
 const D3DSP_SRCMOD_SHIFT: u32 = 24;
 const D3DSP_SRCMOD_MASK: u32 = 0x0F << D3DSP_SRCMOD_SHIFT;
@@ -88,6 +96,15 @@ pub const D3DSPDM_NONE: u8 = 0;
 pub const D3DSPDM_SATURATE: u8 = 1;
 pub const D3DSPDM_PARTIALPRECISION: u8 = 2;
 pub const D3DSPDM_MSAMPCENTROID: u8 = 4;
+
+/// `D3DSHADER_COMPARISON` values (`D3DSPC_*`), carried in the opcode-specific
+/// control field of `ifc` / `breakc` / `setp` (from d3d9types.h).
+pub const D3DSPC_GT: u8 = 1;
+pub const D3DSPC_EQ: u8 = 2;
+pub const D3DSPC_GE: u8 = 3;
+pub const D3DSPC_LT: u8 = 4;
+pub const D3DSPC_NE: u8 = 5;
+pub const D3DSPC_LE: u8 = 6;
 
 /// `D3DSHADER_PARAM_REGISTER_TYPE` values (`D3DSPR_*`).
 ///
@@ -221,6 +238,10 @@ pub const PS_INPUT_COUNT: usize = 2;
 pub const PS_SAMPLER_COUNT: usize = 4;
 /// vs_2_0 constant-register file size (`MaxVertexShaderConst`).
 pub const VS_CONST_COUNT: usize = 256;
+/// vs_2_0 boolean constant-register file size (`b0..b15`).
+pub const VS_BOOL_CONST_COUNT: usize = 16;
+/// vs_2_0 integer/loop-register file size (`i0..i3`).
+pub const VS_INT_CONST_COUNT: usize = 4;
 
 /// Which programmable stage a shader targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,6 +298,10 @@ pub enum RegType {
     Loop,
     /// `sN` — sampler register file (texld sources).
     Sampler,
+    /// `l#` — label register (call/callnz targets; vertex shaders).
+    Label,
+    /// `p0` — the predicate register (setp destinations, predication sources).
+    Predicate,
     /// Unmodeled register file (raw value preserved).
     Other(u8),
 }
@@ -288,6 +313,9 @@ pub struct Operand {
     pub reg_type: RegType,
     /// Register number within the file.
     pub reg_num: u16,
+    /// Whether the register number is relative (`c[a0.x + n]`): the effective
+    /// index adds the address register `a0.x` (vs_2_0 relative addressing).
+    pub relative: bool,
     /// Per-output-component source select, each `0..3` (`D3DSP_SWIZZLE`).
     pub swizzle: [u8; 4],
     /// Source modifier (`D3DSPSM_*`); 0 = none.
@@ -357,6 +385,79 @@ pub enum PsOp {
     Dcl,
     /// `end`.
     End,
+    // ── L5 vs_2_0 arithmetic (the vs_2_0-only advanced ops) ─────────────
+    /// `m4x4 dst, v, m` — row-vector × 4x4 matrix (dst.i = v·row_i).
+    M4x4,
+    /// `m4x3 dst, v, m` — row-vector × 4x3 (dst.xyz written).
+    M4x3,
+    /// `m3x4 dst, v, m` — 3-vector × 3x4 (dst.xyzw written).
+    M3x4,
+    /// `m3x3 dst, v, m` — 3-vector × 3x3 (dst.xyz written).
+    M3x3,
+    /// `m3x2 dst, v, m` — 3-vector × 3x2 (dst.xy written).
+    M3x2,
+    /// `dst dst, s0, s1` — distance-vector helper (dst = (1, s0.y·s1.y, s0.z, s1.w)).
+    Dst,
+    /// `lit dst, s0` — lighting (diffuse + specular powers from N·L, N·H).
+    Lit,
+    /// `pow dst, s0, s1` — s0.x^s1.x replicated to all channels.
+    Pow,
+    /// `crs dst, s0, s1` — cross product of the .xyz components.
+    Crs,
+    /// `sgn dst, s0, s1, s2` — component sign of s0 (s1 = -1, s2 = +1 conventions).
+    Sgn,
+    /// `abs dst, s0` — per-component absolute value.
+    Abs,
+    /// `nrm dst, s0` — normalize s0.xyz.
+    Nrm,
+    /// `sincos dst, s0, s1, s2` — dst.xy = (cos, sin) of s0.x (s1/s2 unused).
+    SinCos,
+    /// `dp2add dst, s0, s1, s2` — 2-dot + scalar: s0.x·s1.x + s0.y·s1.y + s2.x.
+    Dp2Add,
+    /// `mova a0, s0` — write the address register (drives relative addressing).
+    Mova,
+    // ── L5 flow control (vs_2_0; ps_2_x subsets use the comparison forms) ─
+    /// `if bN` — skip to the matching else/endif when bN.x == 0.
+    If,
+    /// `ifc s0, s1` — conditional with the opcode-control comparison.
+    Ifc,
+    /// `else` — the false branch of an if/ifc block.
+    Else,
+    /// `endif` — ends an if/ifc block.
+    EndIf,
+    /// `loop iN, cI` — repeat the body aU times, iN stepping aL→aL+(aU-1)·aD.
+    Loop,
+    /// `endloop` — step the loop counter and jump back while iterations remain.
+    EndLoop,
+    /// `rep iN, cI` — repeat the body cI.x times.
+    Rep,
+    /// `endrep` — jump back while the repeat count remains.
+    EndRep,
+    /// `break` — exit the innermost loop/rep.
+    Break,
+    /// `breakc s0, s1` — break when the opcode-control comparison holds.
+    BreakC,
+    /// `breakp p0` — break when p0.x != 0.
+    BreakP,
+    /// `call l#` — call the label (push the return address).
+    Call,
+    /// `callnz l#, bN` — call when bN.x != 0.
+    CallNz,
+    /// `label l#` — a call target (no execution).
+    Label,
+    /// `ret` — return from the innermost call (top-level ret ends the shader).
+    Ret,
+    /// `setp p0, s0, s1` — per-component comparison → the predicate register.
+    Setp,
+    /// `defb bN, bool` (compile-time boolean constant; no execution).
+    DefB,
+    /// `defi iN, int` (compile-time integer constant; no execution).
+    DefI,
+    /// `texld dst, tN, sM` with the project control (texldp — sample at u/w, v/w).
+    TexLdP,
+    /// `texld dst, tN, sM` with the bias control (texldb — mip bias; no-op on
+    /// the single-level point sampler, documented).
+    TexLdB,
     /// Structurally valid but not executable (not yet implemented).
     Unsupported(u32),
 }
@@ -372,6 +473,12 @@ pub struct PsInstruction {
     pub srcs: Vec<Operand>,
     /// Sampler texture type (`D3DSTT_*`) for `dcl` on a sampler register.
     pub tex_type: Option<u32>,
+    /// Opcode-specific control bits (the `ifc`/`breakc`/`setp` comparison,
+    /// the `dcl` texture type). 0 when the opcode carries none.
+    pub control: u8,
+    /// Whether the instruction is predicated (bit 28): it executes only when
+    /// the predicate register `p0.x != 0`; the first operand token is `p0`.
+    pub predicated: bool,
     /// True for the terminating `end` instruction.
     pub end: bool,
 }
@@ -387,16 +494,23 @@ pub struct ParsedShader {
     pub instructions: Vec<PsInstruction>,
     /// `def cN, …` constants in declaration order.
     pub constants: Vec<(u32, [f32; 4])>,
+    /// `defb bN, bool` constants in declaration order.
+    pub bool_constants: Vec<(u32, bool)>,
+    /// `defi iN, int` constants in declaration order.
+    pub int_constants: Vec<(u32, i32)>,
 }
 
 impl ParsedShader {
     /// Whether every instruction is in the executable subset.
     ///
-    /// The interpreter implements the arithmetic core (`NOP`/`MOV`/`ADD`/
-    /// `SUB`/`MAD`/`MUL`/`DP3`/`DP4`/`MIN`/`MAX`/`SLT`/`SGE`/`EXP`/`LOG`/
-    /// `LRP`/`FRC`/`CMP`/`RCP`/`RSQ`/`TEX`/`TEXKILL` + `DEF`/`DCL`/`END`);
-    /// everything else (`LIT`, `POW`, `ABS`, flow control, …) parses but is
-    /// rejected at `Create*Shader` with `D3DERR_INVALIDCALL` (not yet implemented).
+    /// The interpreters implement the arithmetic core plus the L5 wave: the
+    /// vs_2_0 matrix/lighting ops (`M4x4`..`M3x2`, `DST`, `LIT`, `POW`, `CRS`,
+    /// `SGN`, `ABS`, `NRM`, `SINCOS`, `DP2ADD`, `MOVA`), ALL flow control
+    /// (`IF`/`IFC`/`ELSE`/`ENDIF`, `LOOP`/`ENDLOOP`, `REP`/`ENDREP`,
+    /// `BREAK`/`BREAKC`/`BREAKP`, `CALL`/`CALLNZ`/`LABEL`/`RET`, `SETP`,
+    /// predication), the `DEFB`/`DEFI` constant definitions, and the ps_2_a/b
+    /// texld forms (`TEXLDP`/`TEXLDB`). Everything else parses but is
+    /// rejected at `Create*Shader` with `D3DERR_INVALIDCALL`.
     #[must_use]
     pub fn is_fully_executable(&self) -> bool {
         self.instructions
@@ -447,12 +561,15 @@ fn parse_operand(token: u32) -> Operand {
         D3DSPR_CONSTBOOL => RegType::ConstBool,
         D3DSPR_LOOP => RegType::Loop,
         D3DSPR_SAMPLER => RegType::Sampler,
+        D3DSPR_LABEL => RegType::Label,
+        D3DSPR_PREDICATE => RegType::Predicate,
         other => RegType::Other(other),
     };
     // Register number: D3DSP_REGNUM_MASK (bits 0-10). For register files with
     // a nonzero type the top regtype bits sit in 8-10, so common files (temp,
     // const ≤ 31, sampler ≤ 15) only ever use bits 0-7.
     let reg_num = u16::try_from(token & D3DSP_REGNUM_MASK).unwrap_or(0);
+    let relative = token & RELATIVE_ADDRESSING_MASK != 0;
     let src_mod = u8::try_from((token & D3DSP_SRCMOD_MASK) >> D3DSP_SRCMOD_SHIFT).unwrap_or(0);
     let dst_mod = u8::try_from((token & D3DSP_DSTMOD_MASK) >> D3DSP_DSTMOD_SHIFT).unwrap_or(0);
     let write_mask =
@@ -466,6 +583,7 @@ fn parse_operand(token: u32) -> Operand {
     Operand {
         reg_type,
         reg_num,
+        relative,
         swizzle,
         src_mod,
         dst_mod,
@@ -492,19 +610,16 @@ pub fn instruction_payload_len(opcode: u32) -> Option<usize> {
         | D3DSIO_TEXM3x3 | D3DSIO_TEXM3x3DIFF | D3DSIO_TEXM3x3SPEC | D3DSIO_TEXM3x3VSPEC
         | D3DSIO_TEXM3x2PAD | D3DSIO_TEXM3x3PAD | D3DSIO_TEXDEPTH => Some(1),
         D3DSIO_MOV | D3DSIO_RCP | D3DSIO_RSQ | D3DSIO_EXP | D3DSIO_LOG | D3DSIO_LIT
-        | D3DSIO_DST | D3DSIO_FRC | D3DSIO_ABS | D3DSIO_NRM | D3DSIO_POW | D3DSIO_CRS
-        | D3DSIO_SGN | D3DSIO_MOVA | D3DSIO_TEXLDL | D3DSIO_DSX | D3DSIO_DSY | D3DSIO_LOOP
-        | D3DSIO_REP | D3DSIO_CALL | D3DSIO_DEFB | D3DSIO_DEFI | D3DSIO_IFC | D3DSIO_BREAKC => {
-            Some(2)
-        }
+        | D3DSIO_FRC | D3DSIO_ABS | D3DSIO_NRM | D3DSIO_MOVA | D3DSIO_TEXLDL | D3DSIO_DSX
+        | D3DSIO_DSY | D3DSIO_LOOP | D3DSIO_REP | D3DSIO_CALL | D3DSIO_DEFB | D3DSIO_DEFI
+        | D3DSIO_IFC | D3DSIO_BREAKC => Some(2),
         D3DSIO_ADD | D3DSIO_SUB | D3DSIO_MUL | D3DSIO_DP3 | D3DSIO_DP4 | D3DSIO_MIN
         | D3DSIO_MAX | D3DSIO_SLT | D3DSIO_SGE | D3DSIO_M4x4 | D3DSIO_M4x3 | D3DSIO_M3x4
-        | D3DSIO_M3x3 | D3DSIO_M3x2 | D3DSIO_DP2ADD | D3DSIO_TEXM3x2TEX | D3DSIO_TEXM3x3TEX
-        | D3DSIO_TEXDP3TEX | D3DSIO_TEXM3x2DEPTH | D3DSIO_BEM | D3DSIO_TEX | D3DSIO_CALLNZ
-        | D3DSIO_SETP => Some(3),
-        D3DSIO_MAD | D3DSIO_LRP | D3DSIO_CMP | D3DSIO_CND | D3DSIO_SINCOS | D3DSIO_TEXLDD => {
-            Some(4)
-        }
+        | D3DSIO_M3x3 | D3DSIO_M3x2 | D3DSIO_DST | D3DSIO_POW | D3DSIO_CRS | D3DSIO_SGN
+        | D3DSIO_TEXM3x2TEX | D3DSIO_TEXM3x3TEX | D3DSIO_TEXDP3TEX | D3DSIO_TEXM3x2DEPTH
+        | D3DSIO_BEM | D3DSIO_TEX | D3DSIO_CALLNZ | D3DSIO_SETP => Some(3),
+        D3DSIO_MAD | D3DSIO_LRP | D3DSIO_CMP | D3DSIO_CND | D3DSIO_SINCOS | D3DSIO_DP2ADD
+        | D3DSIO_TEXLDD => Some(4),
         _ => None,
     }
 }
@@ -519,23 +634,39 @@ fn parse_instruction(_kind: ShaderKind, tokens: &[u32]) -> Result<(PsInstruction
         .first()
         .context("empty instruction (missing opcode token)")?;
     let opcode = token & OPCODE_FIELD_MASK;
-    if token & D3DSHADER_INSTRUCTION_PREDICATED != 0 {
-        anyhow::bail!("predicated instruction (ps_3_0 feature) is unsupported");
-    }
+    // Predication (ps_3_0/vs_3_0 feature, but the ps_2_a/vs_2_0 token form is
+    // the same): the first operand token is the predicate register p0 and the
+    // instruction runs only while p0.x != 0.
+    let predicated = token & D3DSHADER_INSTRUCTION_PREDICATED != 0;
     let control = (token & D3DSP_OPCODESPECIFICCONTROL_MASK) >> D3DSP_OPCODESPECIFICCONTROL_SHIFT;
 
     let Some(payload_len) = instruction_payload_len(opcode) else {
         anyhow::bail!("unknown shader opcode {opcode:#06x}");
     };
+    // A predicated instruction carries the predicate operand ahead of its
+    // normal dst/src operands.
+    let pred_operands = usize::from(predicated);
     let total = payload_len
         .checked_add(1)
+        .and_then(|t| t.checked_add(pred_operands))
         .context("instruction length overflow")?;
     let payload = tokens.get(1..total).context("operand runs past bytecode")?;
+
+    if predicated {
+        let predicate = payload
+            .first()
+            .copied()
+            .map(parse_operand)
+            .context("missing predicate operand token")?;
+        if predicate.reg_type != RegType::Predicate {
+            anyhow::bail!("predicated instruction must target the p0 register");
+        }
+    }
 
     // Map to the executable op + validate structure.
     let decode_operand = |idx: usize| -> Result<Operand> {
         payload
-            .get(idx)
+            .get(idx.saturating_add(pred_operands))
             .copied()
             .map(parse_operand)
             .context("missing operand token")
@@ -560,11 +691,62 @@ fn parse_instruction(_kind: ShaderKind, tokens: &[u32]) -> Result<(PsInstruction
         D3DSIO_LRP => (PsOp::Lrp, Some(decode_operand(0)?), 3, None),
         D3DSIO_FRC => (PsOp::Frc, Some(decode_operand(0)?), 1, None),
         D3DSIO_CMP => (PsOp::Cmp, Some(decode_operand(0)?), 3, None),
-        D3DSIO_TEX => {
-            if control != 0 {
-                anyhow::bail!("texld with project/bias control (0x{control:x}) is unsupported");
+        // ── L5 vs_2_0 arithmetic ────────────────────────────────────────
+        D3DSIO_M4x4 => (PsOp::M4x4, Some(decode_operand(0)?), 2, None),
+        D3DSIO_M4x3 => (PsOp::M4x3, Some(decode_operand(0)?), 2, None),
+        D3DSIO_M3x4 => (PsOp::M3x4, Some(decode_operand(0)?), 2, None),
+        D3DSIO_M3x3 => (PsOp::M3x3, Some(decode_operand(0)?), 2, None),
+        D3DSIO_M3x2 => (PsOp::M3x2, Some(decode_operand(0)?), 2, None),
+        D3DSIO_DST => (PsOp::Dst, Some(decode_operand(0)?), 2, None),
+        D3DSIO_LIT => (PsOp::Lit, Some(decode_operand(0)?), 1, None),
+        D3DSIO_POW => (PsOp::Pow, Some(decode_operand(0)?), 2, None),
+        D3DSIO_CRS => (PsOp::Crs, Some(decode_operand(0)?), 2, None),
+        D3DSIO_SGN => (PsOp::Sgn, Some(decode_operand(0)?), 2, None),
+        D3DSIO_ABS => (PsOp::Abs, Some(decode_operand(0)?), 1, None),
+        D3DSIO_NRM => (PsOp::Nrm, Some(decode_operand(0)?), 1, None),
+        D3DSIO_SINCOS => (PsOp::SinCos, Some(decode_operand(0)?), 3, None),
+        D3DSIO_DP2ADD => (PsOp::Dp2Add, Some(decode_operand(0)?), 3, None),
+        D3DSIO_MOVA => (PsOp::Mova, Some(decode_operand(0)?), 1, None),
+        // ── L5 flow control ─────────────────────────────────────────────
+        D3DSIO_IF => (PsOp::If, Some(decode_operand(0)?), 0, None),
+        D3DSIO_IFC => (PsOp::Ifc, None, 2, None),
+        D3DSIO_ELSE => (PsOp::Else, None, 0, None),
+        D3DSIO_ENDIF => (PsOp::EndIf, None, 0, None),
+        D3DSIO_LOOP => (PsOp::Loop, Some(decode_operand(0)?), 1, None),
+        D3DSIO_ENDLOOP => (PsOp::EndLoop, None, 0, None),
+        D3DSIO_REP => (PsOp::Rep, Some(decode_operand(0)?), 1, None),
+        D3DSIO_ENDREP => (PsOp::EndRep, None, 0, None),
+        D3DSIO_BREAK => (PsOp::Break, None, 0, None),
+        D3DSIO_BREAKC => (PsOp::BreakC, None, 2, None),
+        D3DSIO_BREAKP => (PsOp::BreakP, None, 1, None),
+        D3DSIO_CALL => (PsOp::Call, None, 2, None),
+        D3DSIO_CALLNZ => (PsOp::CallNz, None, 3, None),
+        D3DSIO_LABEL => (PsOp::Label, Some(decode_operand(0)?), 0, None),
+        D3DSIO_RET => (PsOp::Ret, None, 0, None),
+        D3DSIO_SETP => (PsOp::Setp, Some(decode_operand(0)?), 2, None),
+        D3DSIO_DEFB => {
+            let dst = decode_operand(0)?;
+            if dst.reg_type != RegType::ConstBool {
+                anyhow::bail!("defb must target the boolean constant register file");
             }
-            (PsOp::Tex, Some(decode_operand(0)?), 2, None)
+            (PsOp::DefB, Some(dst), 0, None)
+        }
+        D3DSIO_DEFI => {
+            let dst = decode_operand(0)?;
+            if dst.reg_type != RegType::Loop {
+                anyhow::bail!("defi must target the integer loop register file");
+            }
+            (PsOp::DefI, Some(dst), 0, None)
+        }
+        D3DSIO_TEX => {
+            // ps_2_a/b texld forms: the opcode-specific control carries the
+            // project (texldp) or bias (texldb) modifier.
+            match control {
+                0 => (PsOp::Tex, Some(decode_operand(0)?), 2, None),
+                0x1 => (PsOp::TexLdP, Some(decode_operand(0)?), 2, None),
+                0x2 => (PsOp::TexLdB, Some(decode_operand(0)?), 2, None),
+                other => anyhow::bail!("texld with unknown control 0x{other:x}"),
+            }
         }
         D3DSIO_TEXKILL => (PsOp::TexKill, None, 1, None),
         D3DSIO_DEF => {
@@ -590,10 +772,13 @@ fn parse_instruction(_kind: ShaderKind, tokens: &[u32]) -> Result<(PsInstruction
     };
 
     let mut srcs = Vec::with_capacity(src_count);
-    // Source operands follow the destination operand (index 0), so the source
-    // `i` lives at payload index `i + 1`.
-    for idx in 1..=src_count {
-        srcs.push(decode_operand(idx)?);
+    // Source operands follow the destination operand (slot 0) when one
+    // exists, so source `i` lives at payload index `i + 1` (+ the predicate
+    // operand when present). A dst-less instruction (ifc/breakc/call/callnz)
+    // starts its sources at slot 0.
+    let src_base = usize::from(dst.is_some());
+    for slot in src_base..src_base + src_count {
+        srcs.push(decode_operand(slot)?);
     }
     let end = matches!(op, PsOp::End);
     Ok((
@@ -602,6 +787,8 @@ fn parse_instruction(_kind: ShaderKind, tokens: &[u32]) -> Result<(PsInstruction
             dst,
             srcs,
             tex_type,
+            control: u8::try_from(control).unwrap_or(0),
+            predicated,
             end,
         },
         total,
@@ -622,6 +809,8 @@ pub fn parse_shader(bytecode: &[u32]) -> Result<ParsedShader> {
 
     let mut instructions = Vec::new();
     let mut constants = Vec::new();
+    let mut bool_constants = Vec::new();
+    let mut int_constants = Vec::new();
     let mut pos = 1_usize;
     let mut saw_end = false;
     while pos < bytecode.len() {
@@ -657,6 +846,27 @@ pub fn parse_shader(bytecode: &[u32]) -> Result<ParsedShader> {
                 .context("def float payload is not 4 DWORDs")?;
             constants.push((u32::from(dst.reg_num), value));
         }
+        if let PsOp::DefB = instr.op {
+            let dst = instr.dst.context("defb instruction missing destination")?;
+            // A defb carries one boolean DWORD (TRUE/FALSE) after the operand.
+            let value = bytecode
+                .get(pos.checked_add(2).context("defb payload start overflow")?)
+                .copied()
+                .context("defb boolean payload missing")?;
+            bool_constants.push((u32::from(dst.reg_num), value != 0));
+        }
+        if let PsOp::DefI = instr.op {
+            let dst = instr.dst.context("defi instruction missing destination")?;
+            // A defi carries one signed-int DWORD after the operand.
+            let value = bytecode
+                .get(pos.checked_add(2).context("defi payload start overflow")?)
+                .copied()
+                .context("defi int payload missing")?;
+            int_constants.push((
+                u32::from(dst.reg_num),
+                i32::from_le_bytes(value.to_le_bytes()),
+            ));
+        }
         saw_end = instr.end;
         instructions.push(instr);
         pos = pos
@@ -674,6 +884,8 @@ pub fn parse_shader(bytecode: &[u32]) -> Result<ParsedShader> {
         version,
         instructions,
         constants,
+        bool_constants,
+        int_constants,
     })
 }
 
@@ -888,21 +1100,164 @@ mod tests {
     fn unsupported_opcode_parses_but_is_not_executable() {
         let bytecode = vec![
             0xFFFF_0200, // ps_2_0
-            0x0000_0014, // m4x4 (D3DSIO_M4x4 = 20) — valid ps_2_0, exec deferred
-            0x0000_0000, // r0
-            0x0000_0000, // c0
-            0x0000_0000, // c1
+            0x0000_0043, // texbem (D3DSIO_TEXBEM = 67) — valid ps_1_x, exec deferred
+            0x0000_0000, // r0 (its single payload operand per the length table)
             0x0000_FFFF, // end
         ];
-        let shader = parse_shader(&bytecode).expect("m4x4 parses structurally");
+        let shader = parse_shader(&bytecode).expect("texbem parses structurally");
         assert_eq!(
             shader
                 .instructions
                 .first()
-                .expect("shader starts with m4x4")
+                .expect("shader starts with texbem")
                 .op,
-            PsOp::Unsupported(20)
+            PsOp::Unsupported(67)
         );
         assert!(!shader.is_fully_executable());
+    }
+
+    /// vs_2_0 bytecode exercising the L5 surface: `defb`/`defi`, a relative
+    /// read `c[a0.x + 8]`, a predicated `mov`, a `loop` with a `breakc`, and
+    /// an `if/else/endif` — every decoded form the gate must now accept.
+    fn l5_vs_bytecode() -> Vec<u32> {
+        vec![
+            0xFFFE_0200, // vs_2_0
+            0x0000_002F, // defb
+            0x6000_0800, // b0 (CONSTBOOL)
+            0x0000_0001, // TRUE
+            0x0000_0030, // defi
+            0x7000_0800, // i0 (LOOP)
+            0x0000_0002, // 2
+            0x0000_001B, // loop
+            0x7000_0800, // i0 (LOOP dst)
+            0x70E4_0801, // i1 (LOOP src, NOSWIZZLE) — the (aL,aU,aD,aC) spec
+            0x1000_0001, // mov, predicated (bit 28)
+            0x3000_1000, // p0 (PREDICATE)
+            0x0000_0000, // r0 (TEMP dst)
+            0x20E4_2004, // c[a0.x + 4] (CONST regnum 4, bit 13 relative, NOSWIZZLE)
+            0x0003_002D, // breakc, comparison GE (3)
+            0x70E4_0800, // i0
+            0x70E4_0801, // i1
+            0x0000_001D, // endloop
+            0x0000_0028, // if
+            0x60E4_0800, // b0
+            0x0000_002A, // else
+            0x0000_002B, // endif
+            0x0000_FFFF, // end
+        ]
+    }
+
+    #[test]
+    fn tokenizer_decodes_l5_forms() {
+        let bytes = l5_vs_bytecode();
+        let shader = match parse_shader(&bytes) {
+            Ok(shader) => shader,
+            Err(err) => {
+                eprintln!("parse error: {err:?}");
+                panic!("L5 vs bytecode parses: {err}");
+            }
+        };
+        assert_eq!(shader.kind, ShaderKind::Vertex);
+        assert!(
+            shader.is_fully_executable(),
+            "every L5 op must pass the gate"
+        );
+
+        // defb b0, TRUE / defi i0, 2 land in the constant tables.
+        assert_eq!(shader.bool_constants, vec![(0, true)]);
+        assert_eq!(shader.int_constants, vec![(0, 2)]);
+
+        let ops: Vec<PsOp> = shader.instructions.iter().map(|instr| instr.op).collect();
+        assert_eq!(
+            ops,
+            vec![
+                PsOp::DefB,
+                PsOp::DefI,
+                PsOp::Loop,
+                PsOp::Mov,
+                PsOp::BreakC,
+                PsOp::EndLoop,
+                PsOp::If,
+                PsOp::Else,
+                PsOp::EndIf,
+                PsOp::End,
+            ]
+        );
+
+        // The relative read decodes bit 13 on the c4 source.
+        let mov = shader
+            .instructions
+            .get(3)
+            .expect("shader has the predicated mov");
+        assert!(mov.predicated, "the mov must carry the predicated flag");
+        let src = mov.srcs.first().expect("mov has a source");
+        assert!(src.relative, "c[a0.x + 4] must decode as relative");
+        assert_eq!(src.reg_type, RegType::Const);
+        assert_eq!(src.reg_num, 4);
+
+        // The loop's destination is the i0 loop register; the breakc carries
+        // the GE comparison control (D3DSPC_GE = 3).
+        let brk = shader.instructions.get(4).expect("shader has breakc");
+        assert_eq!(brk.control, D3DSPC_GE);
+        assert_eq!(brk.srcs.len(), 2);
+    }
+
+    #[test]
+    fn tokenizer_decodes_ps_2a_texld_forms() {
+        // ps_2_a: texldp r0, t0, s0 (project control 0x1) + texldb (0x2).
+        let bytecode = vec![
+            0xFFFF_0201, // ps_2_a
+            0x0201_0042, // texld with the project control (0x1 << 16)
+            0x0000_0000, // r0
+            0x30E4_0000, // t0
+            0x2000_0800, // s0
+            0x0202_0042, // texld with the bias control (0x2 << 16)
+            0x0000_0000, // r0
+            0x30E4_0000, // t0
+            0x2000_0800, // s0
+            0x0000_FFFF, // end
+        ];
+        let shader = parse_shader(&bytecode).expect("ps_2_a texld forms parse");
+        assert_eq!(shader.kind, ShaderKind::Pixel);
+        assert!(shader.is_fully_executable());
+        let ops: Vec<PsOp> = shader.instructions.iter().map(|instr| instr.op).collect();
+        assert_eq!(ops, vec![PsOp::TexLdP, PsOp::TexLdB, PsOp::End]);
+    }
+
+    #[test]
+    fn tokenizer_decodes_relative_and_predicate_operands() {
+        // A relative source (bit 13) on the CONST file.
+        let token = 0x20E4_2000 | 0x0000_0007; // c[a0.x + 7]
+        let op = parse_operand(token);
+        assert!(op.relative);
+        assert_eq!(op.reg_type, RegType::Const);
+        assert_eq!(op.reg_num, 7);
+        // A predicate register operand (PREDICATE = 19).
+        let pred = parse_operand(0x3000_1000);
+        assert_eq!(pred.reg_type, RegType::Predicate);
+        // A label operand (LABEL = 18).
+        let label = parse_operand(0x2000_1000);
+        assert_eq!(label.reg_type, RegType::Label);
+    }
+
+    #[test]
+    fn tokenizer_accepts_flow_control_payload_counts() {
+        // ifc with the GE comparison and two sources (3 operands total).
+        let bytecode = vec![
+            0xFFFE_0200, // vs_2_0
+            0x0003_0029, // ifc, comparison GE (3)
+            0x70E4_0800, // i0
+            0x70E4_0801, // i1
+            0x0000_0028, // if
+            0x60E4_0800, // b0
+            0x0000_002B, // endif
+            0x0000_FFFF, // end
+        ];
+        let shader = parse_shader(&bytecode).expect("ifc/if parse");
+        assert!(shader.is_fully_executable());
+        let ifc = shader.instructions.first().expect("shader starts with ifc");
+        assert_eq!(ifc.op, PsOp::Ifc);
+        assert_eq!(ifc.control, D3DSPC_GE);
+        assert_eq!(ifc.srcs.len(), 2);
     }
 }

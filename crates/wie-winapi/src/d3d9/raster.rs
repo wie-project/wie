@@ -3,12 +3,14 @@ use anyhow::{Context, Result};
 use super::{D3DFMT_INDEX32, DepthStencilRecord, TextureRecord};
 use crate::WinApiState;
 use crate::d3d9_render::{
-    D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DTOP_DISABLE, FragmentState,
-    FvfLayout, GuestVertex, Mat4, PsProgram, RenderState, ScreenVertex, TextureStage,
-    TextureStageState, Viewport, VsProgram, clip_to_viewport, draw_triangle, mat4_mul,
-    parse_vertex, rasterize_triangle, run_vertex_shader, vs_input_from_vertex,
+    ClipVertex, D3DPT_LINELIST, D3DPT_LINESTRIP, D3DPT_POINTLIST, D3DPT_TRIANGLEFAN,
+    D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DRS_POINTSIZE, D3DTOP_DISABLE, FragmentState,
+    FvfLayout, GuestVertex, MAX_MIP_LEVELS, Mat4, MipChain, MipLevelView, PsProgram, RenderState,
+    ScreenVertex, TextureStage, TextureStageState, Viewport, VsProgram, clip_polygon_near,
+    mat4_mul, parse_vertex, rasterize_line, rasterize_point, rasterize_triangle, run_vertex_shader,
+    screen_from_clip, transform_point, vs_input_from_vertex,
 };
-use crate::d3d9_shader::{PS_SAMPLER_COUNT, ShaderKind};
+use crate::d3d9_shader::{PS_SAMPLER_COUNT, ShaderKind, VS_BOOL_CONST_COUNT, VS_INT_CONST_COUNT};
 use crate::gdi32::IRect;
 
 // ── P3 software-render handlers (slice 1) ────────────────────────────────
@@ -86,44 +88,81 @@ pub(crate) fn fill_backbuffer_rect(
 }
 
 /// Number of vertices covered by `primitive_count` primitives of `type`, or
-/// `None` for a count that would overflow. Unsupported primitive types (point
-/// and line lists) return `Some(0)` — nothing to draw.
+/// `None` for a count that would overflow. Point and line primitives are
+/// real since L4: a point list uses one vertex per point, a line list two per
+/// line, a line strip `count + 1`.
 pub(crate) fn primitive_vertex_count(primitive_type: u64, primitive_count: u64) -> Option<usize> {
     let count = usize::try_from(primitive_count & u64::from(u32::MAX)).unwrap_or(0);
     match u32::try_from(primitive_type & u64::from(u32::MAX)).unwrap_or(u32::MAX) {
+        D3DPT_POINTLIST => Some(count),
+        D3DPT_LINELIST => count.checked_mul(2),
+        D3DPT_LINESTRIP => count.checked_add(1),
         D3DPT_TRIANGLELIST => count.checked_mul(3),
         D3DPT_TRIANGLESTRIP | D3DPT_TRIANGLEFAN => count.checked_add(2),
         _ => Some(0),
     }
 }
 
-/// The three vertex indices of every triangle in the primitive, in stream
-/// order (pre-indexing — the indexed form resolves each through the index
-/// buffer).
-fn triangle_index_triples(
-    primitive_type: u64,
-    primitive_count: u64,
-) -> Result<Vec<(usize, usize, usize)>> {
+/// The per-primitive vertex-index groups of a draw, in stream order
+/// (pre-indexing — the indexed form resolves each through the index buffer).
+#[derive(Debug)]
+pub(crate) enum PrimitiveGroups {
+    /// Point list: one vertex per point.
+    Points(Vec<usize>),
+    /// Line list/strip: one vertex pair per segment.
+    Lines(Vec<(usize, usize)>),
+    /// Triangle list/strip/fan: one triple per triangle.
+    Triangles(Vec<(usize, usize, usize)>),
+}
+
+impl PrimitiveGroups {
+    /// Whether the draw produced no primitives (the caller skips it).
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Points(v) => v.is_empty(),
+            Self::Lines(v) => v.is_empty(),
+            Self::Triangles(v) => v.is_empty(),
+        }
+    }
+}
+
+fn primitive_groups(primitive_type: u64, primitive_count: u64) -> Result<PrimitiveGroups> {
     let count = usize::try_from(primitive_count & u64::from(u32::MAX))
         .context("primitive count does not fit usize")?;
-    let mut triples = Vec::new();
     match u32::try_from(primitive_type & u64::from(u32::MAX)).unwrap_or(u32::MAX) {
-        D3DPT_TRIANGLELIST => {
-            triples.extend((0..count).map(|i| {
-                let base = i.saturating_mul(3);
-                (base, base.saturating_add(1), base.saturating_add(2))
-            }));
-        }
-        D3DPT_TRIANGLESTRIP => {
-            triples.extend((0..count).map(|i| (i, i.saturating_add(1), i.saturating_add(2))));
-        }
-        D3DPT_TRIANGLEFAN => {
-            triples.extend((0..count).map(|i| (0, i.saturating_add(1), i.saturating_add(2))));
-        }
-        // Point/line primitives are unsupported in slice 1 — no triangles.
-        _ => {}
+        D3DPT_POINTLIST => Ok(PrimitiveGroups::Points((0..count).collect())),
+        D3DPT_LINELIST => Ok(PrimitiveGroups::Lines(
+            (0..count)
+                .map(|i| {
+                    let base = i.saturating_mul(2);
+                    (base, base.saturating_add(1))
+                })
+                .collect(),
+        )),
+        D3DPT_LINESTRIP => Ok(PrimitiveGroups::Lines(
+            (0..count).map(|i| (i, i.saturating_add(1))).collect(),
+        )),
+        D3DPT_TRIANGLELIST => Ok(PrimitiveGroups::Triangles(
+            (0..count)
+                .map(|i| {
+                    let base = i.saturating_mul(3);
+                    (base, base.saturating_add(1), base.saturating_add(2))
+                })
+                .collect(),
+        )),
+        D3DPT_TRIANGLESTRIP => Ok(PrimitiveGroups::Triangles(
+            (0..count)
+                .map(|i| (i, i.saturating_add(1), i.saturating_add(2)))
+                .collect(),
+        )),
+        D3DPT_TRIANGLEFAN => Ok(PrimitiveGroups::Triangles(
+            (0..count)
+                .map(|i| (0, i.saturating_add(1), i.saturating_add(2)))
+                .collect(),
+        )),
+        // Unknown primitive types draw nothing.
+        _ => Ok(PrimitiveGroups::Points(Vec::new())),
     }
-    Ok(triples)
 }
 
 /// Read index `n` from a raw index buffer (`size` = 2 for INDEX16, 4 for
@@ -231,6 +270,29 @@ fn resolve_sampler_stage<'a>(
         return None;
     }
     let stage = stages.get(stage_idx)?;
+    // L4 mip chain: level 0 is the record's full-res texels; levels 1..
+    // are the halved per-level buffers from the CreateTexture desc.
+    let mut chain = MipChain {
+        count: 0,
+        levels: [None; MAX_MIP_LEVELS],
+    };
+    if let Some(slot) = chain.levels.first_mut() {
+        *slot = Some(MipLevelView {
+            width: record.width,
+            height: record.height,
+            pixels: &record.pixels,
+        });
+    }
+    chain.count = record.levels;
+    for (index, mip) in record.mip_levels.iter().enumerate() {
+        if let Some(slot) = chain.levels.get_mut(index.saturating_add(1)) {
+            *slot = Some(MipLevelView {
+                width: mip.width,
+                height: mip.height,
+                pixels: &mip.pixels,
+            });
+        }
+    }
     Some(TextureStage {
         pixels: &record.pixels,
         width: record.width,
@@ -238,6 +300,9 @@ fn resolve_sampler_stage<'a>(
         addr_u: stage.address_u,
         addr_v: stage.address_v,
         mag_filter: stage.mag_filter,
+        min_filter: stage.min_filter,
+        mip_filter: stage.mip_filter,
+        mips: chain,
         color_op: stage.color_op,
         color_arg1: stage.color_arg1,
         color_arg2: stage.color_arg2,
@@ -280,9 +345,12 @@ fn resolve_ps_samplers<'a>(
 }
 
 /// Resolve a bound vertex shader into an executable program: the parsed
-/// instructions (borrowed from the shader record) and a copy of the constant
-/// registers (SetVertexShaderConstantF + def from Create time). `None` when
-/// no shader is bound — the FFP transform runs.
+/// instructions (borrowed from the shader record) and a copy of the float
+/// constant registers (`SetVertexShaderConstantF` + `def` from Create time).
+/// The int/bool constant files are the zeroed defaults — the L5 handlers that
+/// set them (`SetVertexShaderConstantI/B`) land in parallel and will wire the
+/// real registers here. `None` when no shader is bound — the FFP transform
+/// runs.
 ///
 /// Takes the shader-record map by field-level reference so the returned
 /// program borrows only that field (the caller holds the backbuffer mutably
@@ -291,6 +359,8 @@ fn resolve_vs_program<'a>(
     current: u64,
     shaders: &'a ahash::HashMap<u64, crate::d3d9_shader::ShaderRecord>,
     constants: [[f32; 4]; crate::d3d9_shader::VS_CONST_COUNT],
+    int_constants: [[i32; 4]; VS_INT_CONST_COUNT],
+    bool_constants: [bool; VS_BOOL_CONST_COUNT],
 ) -> Option<VsProgram<'a>> {
     if current == 0 {
         return None;
@@ -299,52 +369,92 @@ fn resolve_vs_program<'a>(
         (record.kind == ShaderKind::Vertex).then(|| VsProgram {
             instructions: &record.parsed.instructions,
             constants,
+            int_constants,
+            bool_constants,
         })
     })
 }
 
-/// Run the bound vertex shader on one FVF-decoded vertex and map its `oPos`
-/// through the viewport transform (w-divide + MinZ/MaxZ z-scale).
-///
-/// `None` when `oPos.w <= 0` (at/behind the near plane — the triangle is
-/// rejected, same rule as the FFP path).
-fn vs_vertex_to_screen(
-    program: &VsProgram<'_>,
-    v: &GuestVertex,
-    layout: &FvfLayout,
-    vp: &Viewport,
-) -> Option<ScreenVertex> {
+/// Run the bound vertex shader on one FVF-decoded vertex and return its
+/// clip-space output with the interpolated attributes (the caller clips and
+/// viewport-transforms).
+fn vs_vertex_to_clip(program: &VsProgram<'_>, v: &GuestVertex, layout: &FvfLayout) -> ClipVertex {
     let input = vs_input_from_vertex(v, layout);
     let out = run_vertex_shader(program, &input);
-    let (sx, sy, sz, w) = clip_to_viewport(out.pos, vp)?;
-    Some(ScreenVertex {
-        x: sx,
-        y: sy,
-        z: sz,
-        w,
+    ClipVertex {
+        pos: out.pos,
         color: out.color,
         u: out.u,
         v: out.v,
-    })
+    }
+}
+
+/// Transform one FVF-decoded vertex to its draw-space form.
+///
+/// The vertex shader output and the FFP-transformed `XYZ` vertex are
+/// clip-space (near-plane clipped per primitive); `XYZRHW` is already
+/// screen-space (z viewport-mapped, no clip — negative RHW is undefined).
+enum TransformedVertex {
+    /// Already screen-space (`XYZRHW`): rasterize directly.
+    Screen(ScreenVertex),
+    /// Clip-space (VS output or FFP `XYZ`): near-clip then viewport-map.
+    Clip(ClipVertex),
+}
+
+fn transform_vertex(
+    v: &GuestVertex,
+    pre_transformed: bool,
+    matrix: &Mat4,
+    viewport: &Viewport,
+    vs_program: Option<&VsProgram<'_>>,
+    layout: &FvfLayout,
+) -> TransformedVertex {
+    if let Some(program) = vs_program {
+        TransformedVertex::Clip(vs_vertex_to_clip(program, v, layout))
+    } else if pre_transformed {
+        TransformedVertex::Screen(ScreenVertex {
+            x: v.x,
+            y: v.y,
+            z: viewport.min_z + v.z.clamp(0.0, 1.0) * (viewport.max_z - viewport.min_z),
+            w: 1.0,
+            color: v.color,
+            u: v.u,
+            v: v.v,
+        })
+    } else {
+        TransformedVertex::Clip(ClipVertex {
+            pos: transform_point([v.x, v.y, v.z, v.w], matrix),
+            color: v.color,
+            u: v.u,
+            v: v.v,
+        })
+    }
+}
+
+/// Map a clip-space vertex to screen (`None` only for the defensive
+/// `w <= 0` guard — the near-plane clip keeps `w > 0`).
+fn clip_to_screen_vertex(cv: &ClipVertex, viewport: &Viewport) -> Option<ScreenVertex> {
+    screen_from_clip(cv, viewport)
 }
 
 /// Rasterize a batched vertex stream into the backbuffer.
 ///
-/// `data` is the full vertex pool; `triples` names each triangle; `indices`
-/// (when present) resolves triangle corners through an index buffer (`bytes`,
+/// `data` is the full vertex pool; `groups` names each primitive; `indices`
+/// (when present) resolves primitive corners through an index buffer (`bytes`,
 /// index size, and the `StartIndex` offset into it). `vertex_base` is added
 /// to every resolved index (`BaseVertexIndex`). When a vertex shader is bound,
 /// each vertex runs through the VS interpreter (FVF decode → `v0..v15` →
-/// `oPos` → viewport transform); otherwise the world × view × projection
-/// transform applies. Rejects triangles behind the near-plane, and accumulates
-/// the dirty region. When a stage-0 texture is bound and enabled, the fragment
-/// stage samples it.
+/// `oPos`); otherwise the world × view × projection transform applies.
+/// Triangles/segments straddling the near plane are clipped
+/// (Sutherland–Hodgman) instead of rejected; points behind it are skipped.
+/// Accumulates the dirty region, and the fragment stage samples a bound
+/// stage-0 texture.
 fn rasterize_vertex_stream(
     state: &mut WinApiState,
     data: &[u8],
     layout: &FvfLayout,
     stride: usize,
-    triples: &[(usize, usize, usize)],
+    groups: &PrimitiveGroups,
     indices: Option<(&[u8], usize, usize)>,
     vertex_base: i64,
 ) {
@@ -352,7 +462,7 @@ fn rasterize_vertex_stream(
         state.d3d9().d3d9_backbuffer_width,
         state.d3d9().d3d9_backbuffer_height,
     );
-    if width == 0 || height == 0 || triples.is_empty() {
+    if width == 0 || height == 0 || groups.is_empty() {
         return;
     }
     let d3d = state.d3d9();
@@ -373,6 +483,14 @@ fn rasterize_vertex_stream(
         min_z: vp_min_z,
         max_z: vp_max_z,
     };
+    // L4 point size: `D3DRS_POINTSIZE` (a float) rides the raw-value render
+    // state layer (unmodeled states round-trip verbatim); default 1.0.
+    let point_size = f32::from_bits(
+        d3d.d3d9_render_state_raw
+            .get(&D3DRS_POINTSIZE)
+            .copied()
+            .unwrap_or(0x3F80_0000),
+    );
     // Resolve the texture stage through field-level borrows (the backbuffer
     // is held mutably below, so the stage must not borrow the whole struct).
     let tex = resolve_texture_stage(
@@ -409,12 +527,14 @@ fn rasterize_vertex_stream(
             })
     };
     // A bound vertex shader replaces the FFP transform: each vertex runs the
-    // interpreter and its oPos feeds the viewport transform directly (the
+    // interpreter and its oPos feeds the clip/near-clip path directly (the
     // world/view/projection matrices are ignored in the programmable path).
     let vs_program = resolve_vs_program(
         d3d.d3d9_current_vertex_shader,
         &d3d.d3d9_shaders,
         d3d.d3d9_vs_constants,
+        d3d.d3d9_vs_int_constants,
+        d3d.d3d9_vs_bool_constants,
     );
     // Resolve the blend + depth fragment state (mutably borrows the bound
     // depth buffer — a different field than the backbuffer).
@@ -424,55 +544,170 @@ fn rasterize_vertex_stream(
         &mut d3d.d3d9_depth_surfaces,
         d3d.d3d9_scissor_rect,
     );
-    for &(i0, i1, i2) in triples {
-        let Some(v0) = indexed_vertex(data, layout, stride, indices, vertex_base, i0) else {
-            continue;
-        };
-        let Some(v1) = indexed_vertex(data, layout, stride, indices, vertex_base, i1) else {
-            continue;
-        };
-        let Some(v2) = indexed_vertex(data, layout, stride, indices, vertex_base, i2) else {
-            continue;
-        };
-        if let Some(program) = &vs_program {
-            // Programmable path: VS per vertex → screen-space triangle.
-            let Some(a) = vs_vertex_to_screen(program, &v0, layout, &viewport) else {
-                continue;
-            };
-            let Some(b) = vs_vertex_to_screen(program, &v1, layout, &viewport) else {
-                continue;
-            };
-            let Some(c) = vs_vertex_to_screen(program, &v2, layout, &viewport) else {
-                continue;
-            };
-            rasterize_triangle(
-                &mut d3d.d3d9_backbuffer,
-                width,
-                height,
-                a,
-                b,
-                c,
-                tex.as_ref(),
-                ps.as_ref(),
-                &mut frag,
-                &mut dirty,
-            );
-        } else {
-            draw_triangle(
-                &mut d3d.d3d9_backbuffer,
-                width,
-                height,
-                v0,
-                v1,
-                v2,
-                pre_transformed,
-                &matrix,
-                &viewport,
-                tex.as_ref(),
-                ps.as_ref(),
-                &mut frag,
-                &mut dirty,
-            );
+    let transform = |v: GuestVertex| -> TransformedVertex {
+        transform_vertex(
+            &v,
+            pre_transformed,
+            &matrix,
+            &viewport,
+            vs_program.as_ref(),
+            layout,
+        )
+    };
+    match groups {
+        PrimitiveGroups::Points(points) => {
+            for &i0 in points {
+                let Some(v0) = indexed_vertex(data, layout, stride, indices, vertex_base, i0)
+                else {
+                    continue;
+                };
+                match transform(v0) {
+                    TransformedVertex::Screen(sv) => rasterize_point(
+                        &mut d3d.d3d9_backbuffer,
+                        width,
+                        height,
+                        sv,
+                        point_size,
+                        tex.as_ref(),
+                        ps.as_ref(),
+                        &mut frag,
+                        &mut dirty,
+                    ),
+                    // A point is either fully in front (draw) or behind
+                    // (skip) — clipping a point would only drop it.
+                    TransformedVertex::Clip(cv) => {
+                        if let Some(sv) = clip_to_screen_vertex(&cv, &viewport) {
+                            rasterize_point(
+                                &mut d3d.d3d9_backbuffer,
+                                width,
+                                height,
+                                sv,
+                                point_size,
+                                tex.as_ref(),
+                                ps.as_ref(),
+                                &mut frag,
+                                &mut dirty,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        PrimitiveGroups::Lines(lines) => {
+            for &(i0, i1) in lines {
+                let (Some(v0), Some(v1)) = (
+                    indexed_vertex(data, layout, stride, indices, vertex_base, i0),
+                    indexed_vertex(data, layout, stride, indices, vertex_base, i1),
+                ) else {
+                    continue;
+                };
+                match (transform(v0), transform(v1)) {
+                    (TransformedVertex::Screen(a), TransformedVertex::Screen(b)) => {
+                        rasterize_line(
+                            &mut d3d.d3d9_backbuffer,
+                            width,
+                            height,
+                            a,
+                            b,
+                            tex.as_ref(),
+                            ps.as_ref(),
+                            &mut frag,
+                            &mut dirty,
+                        );
+                    }
+                    (TransformedVertex::Clip(a), TransformedVertex::Clip(b)) => {
+                        // Near-clip the segment: 0 (fully behind), 1
+                        // (touches the plane), or 2 (straddles) vertices.
+                        let clipped = clip_polygon_near(&[a, b]);
+                        if clipped.len() == 2 {
+                            let (Some(a), Some(b)) = (
+                                clip_to_screen_vertex(&clipped[0], &viewport),
+                                clip_to_screen_vertex(&clipped[1], &viewport),
+                            ) else {
+                                continue;
+                            };
+                            rasterize_line(
+                                &mut d3d.d3d9_backbuffer,
+                                width,
+                                height,
+                                a,
+                                b,
+                                tex.as_ref(),
+                                ps.as_ref(),
+                                &mut frag,
+                                &mut dirty,
+                            );
+                        }
+                    }
+                    // Mixed screen/clip forms are impossible (the transform
+                    // is uniform per draw) — skip defensively.
+                    _ => {}
+                }
+            }
+        }
+        PrimitiveGroups::Triangles(triples) => {
+            for &(i0, i1, i2) in triples {
+                let (Some(v0), Some(v1), Some(v2)) = (
+                    indexed_vertex(data, layout, stride, indices, vertex_base, i0),
+                    indexed_vertex(data, layout, stride, indices, vertex_base, i1),
+                    indexed_vertex(data, layout, stride, indices, vertex_base, i2),
+                ) else {
+                    continue;
+                };
+                match (transform(v0), transform(v1), transform(v2)) {
+                    (
+                        TransformedVertex::Screen(a),
+                        TransformedVertex::Screen(b),
+                        TransformedVertex::Screen(c),
+                    ) => {
+                        rasterize_triangle(
+                            &mut d3d.d3d9_backbuffer,
+                            width,
+                            height,
+                            a,
+                            b,
+                            c,
+                            tex.as_ref(),
+                            ps.as_ref(),
+                            &mut frag,
+                            &mut dirty,
+                        );
+                    }
+                    (
+                        TransformedVertex::Clip(a),
+                        TransformedVertex::Clip(b),
+                        TransformedVertex::Clip(c),
+                    ) => {
+                        // Near-clip the triangle (Sutherland–Hodgman): a
+                        // straddling triangle fans into 3..4 screen triangles.
+                        let clipped = clip_polygon_near(&[a, b, c]);
+                        if let Some(first) = clipped.first() {
+                            for pair in clipped.get(1..).unwrap_or(&[]).windows(2) {
+                                let (Some(a), Some(b), Some(c)) = (
+                                    clip_to_screen_vertex(first, &viewport),
+                                    clip_to_screen_vertex(&pair[0], &viewport),
+                                    clip_to_screen_vertex(&pair[1], &viewport),
+                                ) else {
+                                    continue;
+                                };
+                                rasterize_triangle(
+                                    &mut d3d.d3d9_backbuffer,
+                                    width,
+                                    height,
+                                    a,
+                                    b,
+                                    c,
+                                    tex.as_ref(),
+                                    ps.as_ref(),
+                                    &mut frag,
+                                    &mut dirty,
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
     }
     d3d.d3d9_dirty = dirty;
@@ -503,8 +738,8 @@ pub(crate) fn draw_vertex_stream(
     if vertex_count == 0 || stride == 0 || data_ptr == 0 {
         return Ok(());
     }
-    let triples = triangle_index_triples(primitive_type, primitive_count)?;
-    if triples.is_empty() {
+    let groups = primitive_groups(primitive_type, primitive_count)?;
+    if groups.is_empty() {
         return Ok(());
     }
 
@@ -549,7 +784,6 @@ pub(crate) fn draw_vertex_stream(
         0,
     )
 }
-
 /// Rasterize a host-side vertex pool (+ optional host index data) — the
 /// buffer-form draw path (`DrawPrimitive`/`DrawIndexedPrimitive`).
 ///
@@ -576,8 +810,8 @@ pub(crate) fn draw_vertex_stream_host(
     if data.is_empty() || stride == 0 {
         return Ok(());
     }
-    let triples = triangle_index_triples(primitive_type, primitive_count)?;
-    if triples.is_empty() {
+    let groups = primitive_groups(primitive_type, primitive_count)?;
+    if groups.is_empty() {
         return Ok(());
     }
     rasterize_vertex_stream(
@@ -585,7 +819,7 @@ pub(crate) fn draw_vertex_stream_host(
         data,
         layout,
         stride,
-        &triples,
+        &groups,
         indices.map(|(bytes, size)| (bytes, size, index_offset)),
         vertex_base,
     );

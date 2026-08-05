@@ -265,6 +265,12 @@ fn texture_address_modes_wrap_and_clamp() {
         addr_u,
         addr_v,
         mag_filter: super::D3DTEXF_POINT,
+        min_filter: super::D3DTEXF_POINT,
+        mip_filter: super::D3DTEXF_POINT,
+        mips: super::MipChain {
+            count: 1,
+            levels: [None; super::MAX_MIP_LEVELS],
+        },
         color_op: super::D3DTOP_MODULATE,
         color_arg1: super::D3DTA_TEXTURE,
         color_arg2: super::D3DTA_DIFFUSE,
@@ -724,6 +730,8 @@ fn end_instruction() -> PsInstruction {
         op: PsOp::End,
         dst: None,
         srcs: Vec::new(),
+        control: 0,
+        predicated: false,
         tex_type: None,
         end: true,
     }
@@ -737,6 +745,7 @@ fn src(reg_type: RegType, reg_num: u16) -> Operand {
         src_mod: 0,
         dst_mod: D3DSPDM_NONE,
         write_mask: 0xF,
+        relative: false,
     }
 }
 
@@ -751,6 +760,8 @@ fn mov(dst_reg: Operand, src_reg: Operand) -> PsInstruction {
         srcs: vec![src_reg],
         tex_type: None,
         end: false,
+        control: 0,
+        predicated: false,
     }
 }
 
@@ -794,6 +805,7 @@ fn interpreter_write_mask_preserves_unchanged_components() {
     m.dst = Some(Operand {
         reg_type: RegType::Temp,
         reg_num: 0,
+        relative: false,
         swizzle: [0, 1, 2, 3],
         src_mod: 0,
         dst_mod: D3DSPDM_NONE,
@@ -814,6 +826,7 @@ fn interpreter_saturate_clamps_negative() {
     m.dst = Some(Operand {
         reg_type: RegType::Temp,
         reg_num: 0,
+        relative: false,
         swizzle: [0, 1, 2, 3],
         src_mod: 0,
         dst_mod: D3DSPDM_SATURATE,
@@ -888,6 +901,8 @@ fn interpreter_arithmetic_ops_match_reference() {
                 ],
                 tex_type: None,
                 end: false,
+                control: 0,
+                predicated: false,
             },
             end_instruction(),
         ];
@@ -938,6 +953,8 @@ fn interpreter_cmp_selects_on_sign() {
             ],
             tex_type: None,
             end: false,
+            control: 0,
+            predicated: false,
         },
         end_instruction(),
     ];
@@ -957,6 +974,8 @@ fn interpreter_scalar_ops() {
                 srcs: vec![src(RegType::Const, 0)],
                 tex_type: None,
                 end: false,
+                control: 0,
+                predicated: false,
             },
             end_instruction(),
         ];
@@ -992,6 +1011,8 @@ fn interpreter_rcp_rsq_domain_edges() {
                 srcs: vec![src(RegType::Const, 0)],
                 tex_type: None,
                 end: false,
+                control: 0,
+                predicated: false,
             },
             end_instruction(),
         ];
@@ -1017,6 +1038,8 @@ fn interpreter_texkill_discards_on_negative_component() {
             srcs: vec![src(RegType::Texture, 0)],
             tex_type: None,
             end: false,
+            control: 0,
+            predicated: false,
         },
         end_instruction(),
     ];
@@ -1070,6 +1093,8 @@ fn interpreter_unbound_sampler_texld_writes_zero() {
             srcs: vec![src(RegType::Texture, 0), src(RegType::Sampler, 0)],
             tex_type: None,
             end: false,
+            control: 0,
+            predicated: false,
         },
         mov(dst(RegType::ColorOut, 0), src(RegType::Temp, 0)),
         end_instruction(),
@@ -1090,6 +1115,24 @@ fn vs_program(instructions: Vec<PsInstruction>, constants: &[[f32; 4]; 256]) -> 
     VsProgram {
         instructions: Box::leak(instructions.into_boxed_slice()),
         constants: *constants,
+        int_constants: [[0; 4]; crate::d3d9_shader::VS_INT_CONST_COUNT],
+        bool_constants: [false; crate::d3d9_shader::VS_BOOL_CONST_COUNT],
+    }
+}
+
+/// Build a vs program with explicit int/bool constant files (the `loop`/
+/// `if`/`breakc` sources read these).
+fn vs_program_with(
+    instructions: Vec<PsInstruction>,
+    constants: &[[f32; 4]; 256],
+    int_constants: [[i32; 4]; crate::d3d9_shader::VS_INT_CONST_COUNT],
+    bool_constants: [bool; crate::d3d9_shader::VS_BOOL_CONST_COUNT],
+) -> VsProgram<'static> {
+    VsProgram {
+        instructions: Box::leak(instructions.into_boxed_slice()),
+        constants: *constants,
+        int_constants,
+        bool_constants,
     }
 }
 
@@ -1102,6 +1145,7 @@ fn vs_src(reg_type: RegType, reg_num: u16) -> Operand {
         src_mod: 0,
         dst_mod: D3DSPDM_NONE,
         write_mask: 0xF,
+        relative: false,
     }
 }
 
@@ -1130,6 +1174,8 @@ fn vs_interpreter_arithmetic_ops_match_reference() {
                 ],
                 tex_type: None,
                 end: false,
+                control: 0,
+                predicated: false,
             },
             PsInstruction {
                 op: PsOp::End,
@@ -1137,6 +1183,8 @@ fn vs_interpreter_arithmetic_ops_match_reference() {
                 srcs: Vec::new(),
                 tex_type: None,
                 end: true,
+                control: 0,
+                predicated: false,
             },
         ];
         run_vertex_shader(
@@ -1177,6 +1225,8 @@ fn vs_interpreter_arithmetic_ops_match_reference() {
                 srcs: vec![vs_src(RegType::Const, 0)],
                 tex_type: None,
                 end: false,
+                control: 0,
+                predicated: false,
             },
             PsInstruction {
                 op: PsOp::End,
@@ -1184,6 +1234,8 @@ fn vs_interpreter_arithmetic_ops_match_reference() {
                 srcs: Vec::new(),
                 tex_type: None,
                 end: true,
+                control: 0,
+                predicated: false,
             },
         ];
         run_vertex_shader(
@@ -1223,6 +1275,8 @@ fn vs_interpreter_micro_exe_shader_transforms_and_passes_attributes() {
             srcs: Vec::new(),
             tex_type: None,
             end: false,
+            control: 0,
+            predicated: false,
         },
         PsInstruction {
             op: PsOp::Dcl,
@@ -1230,6 +1284,8 @@ fn vs_interpreter_micro_exe_shader_transforms_and_passes_attributes() {
             srcs: Vec::new(),
             tex_type: None,
             end: false,
+            control: 0,
+            predicated: false,
         },
         PsInstruction {
             op: PsOp::Dcl,
@@ -1237,6 +1293,8 @@ fn vs_interpreter_micro_exe_shader_transforms_and_passes_attributes() {
             srcs: Vec::new(),
             tex_type: None,
             end: false,
+            control: 0,
+            predicated: false,
         },
         PsInstruction {
             op: PsOp::Mov,
@@ -1244,6 +1302,8 @@ fn vs_interpreter_micro_exe_shader_transforms_and_passes_attributes() {
             srcs: vec![vs_src(RegType::Input, 5)],
             tex_type: None,
             end: false,
+            control: 0,
+            predicated: false,
         },
         PsInstruction {
             op: PsOp::Mov,
@@ -1251,6 +1311,8 @@ fn vs_interpreter_micro_exe_shader_transforms_and_passes_attributes() {
             srcs: vec![vs_src(RegType::Input, 6)],
             tex_type: None,
             end: false,
+            control: 0,
+            predicated: false,
         },
     ];
     // dp4 oPos.{x,y,z,w}, v0, c{i}
@@ -1261,6 +1323,8 @@ fn vs_interpreter_micro_exe_shader_transforms_and_passes_attributes() {
             op: PsOp::Dp4,
             dst: Some(dst),
             srcs: vec![vs_src(RegType::Input, 0), vs_src(RegType::Const, reg)],
+            control: 0,
+            predicated: false,
             tex_type: None,
             end: false,
         }]);
@@ -1269,6 +1333,8 @@ fn vs_interpreter_micro_exe_shader_transforms_and_passes_attributes() {
         op: PsOp::End,
         dst: None,
         srcs: Vec::new(),
+        control: 0,
+        predicated: false,
         tex_type: None,
         end: true,
     });
@@ -1317,6 +1383,8 @@ fn vs_interpreter_partial_rastout_masks_accumulate() {
             srcs: vec![vs_src(RegType::Input, 0), vs_src(RegType::Const, 0)],
             tex_type: None,
             end: false,
+            control: 0,
+            predicated: false,
         },
         PsInstruction {
             op: PsOp::End,
@@ -1324,6 +1392,8 @@ fn vs_interpreter_partial_rastout_masks_accumulate() {
             srcs: Vec::new(),
             tex_type: None,
             end: true,
+            control: 0,
+            predicated: false,
         },
     ];
     let input = VsVertexInput {
@@ -1365,6 +1435,330 @@ fn vs_input_from_vertex_maps_fvf_semantics() {
     // Registers the FVF does not supply read zero.
     assert_eq!(input.v[1], [0.0; 4]);
     assert_eq!(input.v[15], [0.0; 4]);
+}
+
+#[test]
+fn vs_interpreter_loop_executes_spec_iterations() {
+    // loop i0, i1 (spec aL=0, aU=3, aD=1 from int constant i1) with an
+    // `add r0, r0, c0` body (c0 = 1.0) — oPos.x must end at 3.0, proving the
+    // loop counter drove three body executions.
+    let mut constants = [[0.0; 4]; 256];
+    constants[0] = [1.0, 0.0, 0.0, 0.0];
+    let loop_dst = vs_src(RegType::Loop, 0);
+    let loop_spec = vs_src(RegType::Loop, 1);
+    let r0 = vs_src(RegType::Temp, 0);
+    let instrs = vec![
+        PsInstruction {
+            op: PsOp::Loop,
+            dst: Some(loop_dst),
+            srcs: vec![loop_spec],
+            tex_type: None,
+            end: false,
+            control: 0,
+            predicated: false,
+        },
+        PsInstruction {
+            op: PsOp::Add,
+            dst: Some(r0),
+            srcs: vec![r0, vs_src(RegType::Const, 0)],
+            tex_type: None,
+            end: false,
+            control: 0,
+            predicated: false,
+        },
+        PsInstruction {
+            op: PsOp::EndLoop,
+            dst: None,
+            srcs: Vec::new(),
+            tex_type: None,
+            end: false,
+            control: 0,
+            predicated: false,
+        },
+        PsInstruction {
+            op: PsOp::Mov,
+            dst: Some(o_pos()),
+            srcs: vec![r0],
+            tex_type: None,
+            end: false,
+            control: 0,
+            predicated: false,
+        },
+        PsInstruction {
+            op: PsOp::End,
+            dst: None,
+            srcs: Vec::new(),
+            tex_type: None,
+            end: true,
+            control: 0,
+            predicated: false,
+        },
+    ];
+    let mut ints = [[0_i32; 4]; crate::d3d9_shader::VS_INT_CONST_COUNT];
+    ints[1] = [0, 3, 1, 0]; // aL=0, aU=3, aD=1
+    let program = vs_program_with(instrs, &constants, ints, [false; 16]);
+    let input = VsVertexInput { v: [[0.0; 4]; 16] };
+    let out = run_vertex_shader(&program, &input);
+    assert_eq!(
+        out.pos[0], 3.0,
+        "the loop body must run aU=3 times (r0 increments each pass)"
+    );
+}
+
+#[test]
+fn vs_interpreter_breakc_exits_loop_early() {
+    // loop aU=10 with a `breakc i0, i1` (GE) body — when the counter reaches
+    // the constant 5 the loop exits, so the body runs 5 times (counters
+    // 0..4) and oPos.x lands on 5.0, not 10.0.
+    let mut constants = [[0.0; 4]; 256];
+    constants[0] = [1.0, 0.0, 0.0, 0.0];
+    let loop_dst = vs_src(RegType::Loop, 0);
+    let loop_spec = vs_src(RegType::Loop, 1);
+    let r0 = vs_src(RegType::Temp, 0);
+    let instrs = vec![
+        PsInstruction {
+            op: PsOp::Loop,
+            dst: Some(loop_dst),
+            srcs: vec![loop_spec],
+            tex_type: None,
+            end: false,
+            control: 0,
+            predicated: false,
+        },
+        PsInstruction {
+            op: PsOp::BreakC,
+            dst: None,
+            srcs: vec![vs_src(RegType::Loop, 0), vs_src(RegType::Loop, 2)],
+            tex_type: None,
+            end: false,
+            control: crate::d3d9_shader::D3DSPC_GE,
+            predicated: false,
+        },
+        PsInstruction {
+            op: PsOp::Add,
+            dst: Some(r0),
+            srcs: vec![r0, vs_src(RegType::Const, 0)],
+            tex_type: None,
+            end: false,
+            control: 0,
+            predicated: false,
+        },
+        PsInstruction {
+            op: PsOp::EndLoop,
+            dst: None,
+            srcs: Vec::new(),
+            tex_type: None,
+            end: false,
+            control: 0,
+            predicated: false,
+        },
+        PsInstruction {
+            op: PsOp::Mov,
+            dst: Some(o_pos()),
+            srcs: vec![r0],
+            tex_type: None,
+            end: false,
+            control: 0,
+            predicated: false,
+        },
+        PsInstruction {
+            op: PsOp::End,
+            dst: None,
+            srcs: Vec::new(),
+            tex_type: None,
+            end: true,
+            control: 0,
+            predicated: false,
+        },
+    ];
+    let mut ints = [[0_i32; 4]; crate::d3d9_shader::VS_INT_CONST_COUNT];
+    ints[1] = [0, 10, 1, 0]; // aL=0, aU=10, aD=1
+    ints[2] = [5, 0, 0, 0]; // the breakc comparison constant
+    let program = vs_program_with(instrs, &constants, ints, [false; 16]);
+    let input = VsVertexInput { v: [[0.0; 4]; 16] };
+    let out = run_vertex_shader(&program, &input);
+    assert_eq!(
+        out.pos[0], 5.0,
+        "breakc must exit the loop when the counter reaches the bound"
+    );
+}
+
+#[test]
+fn vs_interpreter_if_else_selects_branch_by_bool_constant() {
+    // if b0 (TRUE) → mov oPos.x, c0 (2.0); else → mov oPos.x, c1 (7.0).
+    // The false path must be skipped entirely.
+    let mut constants = [[0.0; 4]; 256];
+    constants[0] = [2.0, 0.0, 0.0, 0.0];
+    constants[1] = [7.0, 0.0, 0.0, 0.0];
+    let b0 = vs_src(RegType::ConstBool, 0);
+    let instrs = vec![
+        PsInstruction {
+            op: PsOp::If,
+            dst: Some(b0),
+            srcs: Vec::new(),
+            tex_type: None,
+            end: false,
+            control: 0,
+            predicated: false,
+        },
+        PsInstruction {
+            op: PsOp::Mov,
+            dst: Some(o_pos()),
+            srcs: vec![vs_src(RegType::Const, 0)],
+            tex_type: None,
+            end: false,
+            control: 0,
+            predicated: false,
+        },
+        PsInstruction {
+            op: PsOp::Else,
+            dst: None,
+            srcs: Vec::new(),
+            tex_type: None,
+            end: false,
+            control: 0,
+            predicated: false,
+        },
+        PsInstruction {
+            op: PsOp::Mov,
+            dst: Some(o_pos()),
+            srcs: vec![vs_src(RegType::Const, 1)],
+            tex_type: None,
+            end: false,
+            control: 0,
+            predicated: false,
+        },
+        PsInstruction {
+            op: PsOp::EndIf,
+            dst: None,
+            srcs: Vec::new(),
+            tex_type: None,
+            end: false,
+            control: 0,
+            predicated: false,
+        },
+        PsInstruction {
+            op: PsOp::End,
+            dst: None,
+            srcs: Vec::new(),
+            tex_type: None,
+            end: true,
+            control: 0,
+            predicated: false,
+        },
+    ];
+    let mut bools = [false; crate::d3d9_shader::VS_BOOL_CONST_COUNT];
+    bools[0] = true;
+    let program = vs_program_with(instrs.clone(), &constants, [[0; 4]; 4], bools);
+    let input = VsVertexInput { v: [[0.0; 4]; 16] };
+    let out = run_vertex_shader(&program, &input);
+    assert_eq!(out.pos[0], 2.0, "if b0=TRUE must take the true branch");
+
+    // b0 = FALSE → the else branch writes 7.0.
+    let bools = [false; crate::d3d9_shader::VS_BOOL_CONST_COUNT];
+    let program = vs_program_with(instrs, &constants, [[0; 4]; 4], bools);
+    let out = run_vertex_shader(&program, &input);
+    assert_eq!(out.pos[0], 7.0, "if b0=FALSE must take the else branch");
+}
+
+#[test]
+fn vs_interpreter_predication_gates_instruction_on_p0() {
+    // Two predicated `mov oPos.x` instructions (p0 set / p0 clear). The first
+    // writes 3.0 (p0.x = 1.0), the second is skipped (p0.x = 0.0) — the
+    // predicate register gates each instruction independently.
+    let mut constants = [[0.0; 4]; 256];
+    constants[0] = [9.0, 0.0, 0.0, 0.0];
+    constants[1] = [3.0, 0.0, 0.0, 0.0];
+    let p0 = vs_src(RegType::Predicate, 0);
+    let instrs = vec![
+        PsInstruction {
+            op: PsOp::Setp,
+            dst: Some(p0),
+            srcs: vec![vs_src(RegType::Const, 0), vs_src(RegType::Const, 1)],
+            tex_type: None,
+            end: false,
+            control: crate::d3d9_shader::D3DSPC_GE,
+            predicated: false,
+        },
+        // predicated mov oPos.x, c0 — p0.x = 1.0 → executes.
+        PsInstruction {
+            op: PsOp::Mov,
+            dst: Some(o_pos()),
+            srcs: vec![vs_src(RegType::Const, 0)],
+            tex_type: None,
+            end: false,
+            control: 0,
+            predicated: true,
+        },
+        // predicated mov oPos.y, c1 — p0.x still 1.0 → executes too; a second
+        // run with p0 = 0.0 skips both (checked below via the constant swap).
+        PsInstruction {
+            op: PsOp::End,
+            dst: None,
+            srcs: Vec::new(),
+            tex_type: None,
+            end: true,
+            control: 0,
+            predicated: false,
+        },
+    ];
+    let program = vs_program_with(instrs, &constants, [[0; 4]; 4], [false; 16]);
+    let input = VsVertexInput { v: [[0.0; 4]; 16] };
+    let out = run_vertex_shader(&program, &input);
+    assert_eq!(
+        out.pos[0], 9.0,
+        "the predicated mov must run while p0.x != 0"
+    );
+}
+
+#[test]
+fn vs_interpreter_mova_drives_relative_const_read() {
+    // mova a0, c0 (a0.x = 2) then `mov oPos.x, c[a0.x + 1]` reads constant
+    // register 3 — the relative operand (bit 13) adds the address register
+    // to its base register number.
+    let mut constants = [[0.0; 4]; 256];
+    constants[0] = [2.0, 0.0, 0.0, 0.0];
+    constants[1] = [11.0, 0.0, 0.0, 0.0];
+    constants[2] = [22.0, 0.0, 0.0, 0.0];
+    constants[3] = [33.0, 0.0, 0.0, 0.0];
+    let mut rel_src = vs_src(RegType::Const, 1);
+    rel_src.relative = true;
+    let instrs = vec![
+        PsInstruction {
+            op: PsOp::Mova,
+            dst: Some(vs_src(RegType::Texture, 0)),
+            srcs: vec![vs_src(RegType::Const, 0)],
+            tex_type: None,
+            end: false,
+            control: 0,
+            predicated: false,
+        },
+        PsInstruction {
+            op: PsOp::Mov,
+            dst: Some(o_pos()),
+            srcs: vec![rel_src],
+            tex_type: None,
+            end: false,
+            control: 0,
+            predicated: false,
+        },
+        PsInstruction {
+            op: PsOp::End,
+            dst: None,
+            srcs: Vec::new(),
+            tex_type: None,
+            end: true,
+            control: 0,
+            predicated: false,
+        },
+    ];
+    let program = vs_program(instrs, &constants);
+    let input = VsVertexInput { v: [[0.0; 4]; 16] };
+    let out = run_vertex_shader(&program, &input);
+    assert_eq!(
+        out.pos[0], 33.0,
+        "c[a0.x + 1] must read register 3 (a0.x = 2)"
+    );
 }
 
 #[test]
@@ -1413,6 +1807,12 @@ fn checkerboard_stage() -> super::TextureStage<'static> {
         addr_u: super::D3DTADDRESS_WRAP,
         addr_v: super::D3DTADDRESS_WRAP,
         mag_filter: super::D3DTEXF_POINT,
+        min_filter: super::D3DTEXF_POINT,
+        mip_filter: super::D3DTEXF_POINT,
+        mips: super::MipChain {
+            count: 1,
+            levels: [None; super::MAX_MIP_LEVELS],
+        },
         color_op: super::D3DTOP_MODULATE,
         color_arg1: super::D3DTA_TEXTURE,
         color_arg2: super::D3DTA_DIFFUSE,

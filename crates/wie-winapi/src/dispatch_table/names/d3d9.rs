@@ -251,6 +251,26 @@ pub(super) const ROWS: &[(&str, &str, WinApiId)] = &[
     ),
     (
         "d3d9.dll",
+        "idirect3ddevice9::setvertexshaderconstanti",
+        WinApiId::D3d9Idirect3ddevice9Setvertexshaderconstanti,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::getvertexshaderconstanti",
+        WinApiId::D3d9Idirect3ddevice9Getvertexshaderconstanti,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::setvertexshaderconstantb",
+        WinApiId::D3d9Idirect3ddevice9Setvertexshaderconstantb,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::getvertexshaderconstantb",
+        WinApiId::D3d9Idirect3ddevice9Getvertexshaderconstantb,
+    ),
+    (
+        "d3d9.dll",
         "idirect3ddevice9::createpixelshader",
         WinApiId::D3d9Idirect3ddevice9Createpixelshader,
     ),

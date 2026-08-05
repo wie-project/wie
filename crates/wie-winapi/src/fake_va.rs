@@ -255,6 +255,10 @@ pub enum Device9Method {
     GetVertexShader = 93,
     SetVertexShaderConstantF = 94,
     GetVertexShaderConstantF = 95,
+    SetVertexShaderConstantI = 96,
+    GetVertexShaderConstantI = 97,
+    SetVertexShaderConstantB = 98,
+    GetVertexShaderConstantB = 99,
     SetStreamSource = 100,
     GetStreamSource = 101,
     SetIndices = 104,
@@ -308,6 +312,10 @@ impl Device9Method {
             93 => Some(Self::GetVertexShader),
             94 => Some(Self::SetVertexShaderConstantF),
             95 => Some(Self::GetVertexShaderConstantF),
+            96 => Some(Self::SetVertexShaderConstantI),
+            97 => Some(Self::GetVertexShaderConstantI),
+            98 => Some(Self::SetVertexShaderConstantB),
+            99 => Some(Self::GetVertexShaderConstantB),
             100 => Some(Self::SetStreamSource),
             101 => Some(Self::GetStreamSource),
             104 => Some(Self::SetIndices),
@@ -378,6 +386,18 @@ impl Device9Method {
             }
             Self::GetVertexShaderConstantF => {
                 Cow::Borrowed("IDirect3DDevice9::GetVertexShaderConstantF")
+            }
+            Self::SetVertexShaderConstantI => {
+                Cow::Borrowed("IDirect3DDevice9::SetVertexShaderConstantI")
+            }
+            Self::GetVertexShaderConstantI => {
+                Cow::Borrowed("IDirect3DDevice9::GetVertexShaderConstantI")
+            }
+            Self::SetVertexShaderConstantB => {
+                Cow::Borrowed("IDirect3DDevice9::SetVertexShaderConstantB")
+            }
+            Self::GetVertexShaderConstantB => {
+                Cow::Borrowed("IDirect3DDevice9::GetVertexShaderConstantB")
             }
             Self::SetStreamSource => Cow::Borrowed("IDirect3DDevice9::SetStreamSource"),
             Self::GetStreamSource => Cow::Borrowed("IDirect3DDevice9::GetStreamSource"),

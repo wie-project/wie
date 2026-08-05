@@ -1,5 +1,6 @@
 //! The PS 2.0 pixel-shader interpreter.
 
+use super::flow::{BlockState, FlowMap, FlowState, compare};
 use super::sample::{TextureStage, sample_texture};
 use crate::d3d9_shader::{
     D3DSPDM_SATURATE, D3DSPSM_ABS, D3DSPSM_ABSNEG, D3DSPSM_BIAS, D3DSPSM_BIASNEG, D3DSPSM_COMP,
@@ -43,6 +44,10 @@ struct PsRegisters {
     texcoord: [[f32; 4]; 4],
     /// `oC0` (the fragment color that feeds the blend stage).
     output: [f32; 4],
+    /// Loop counters for the ps_2_a/b `rep`/`loop` block forms.
+    loop_regs: [i32; 4],
+    /// `p0` — predicate register (`setp` / predication / `breakp`).
+    pred: [f32; 4],
 }
 /// Read the `i`-th component without indexing syntax (repo lint).
 #[inline]
@@ -117,6 +122,18 @@ fn read_operand(regs: &PsRegisters, op: &Operand) -> [f32; 4] {
             .get(usize::from(op.reg_num))
             .copied()
             .unwrap_or([0.0; 4]),
+        // The ps_2_x loop/rep counters read int→float; the predicate reads
+        // its stored float value (ps_2_a/b flow-control forms).
+        RegType::Loop => {
+            let ints = regs.loop_regs;
+            [
+                ints.first().copied().unwrap_or(0) as f32,
+                ints.get(1).copied().unwrap_or(0) as f32,
+                ints.get(2).copied().unwrap_or(0) as f32,
+                ints.get(3).copied().unwrap_or(0) as f32,
+            ]
+        }
+        RegType::Predicate => regs.pred,
         // ColorOut / Sampler / Other as a source is not valid ps_2_0.
         _ => [0.0; 4],
     };
@@ -127,7 +144,7 @@ fn read_operand(regs: &PsRegisters, op: &Operand) -> [f32; 4] {
 /// `_sat` clamps the written components to `[0, 1]`; `_pp` (partial
 /// precision) is ignored (full f32 precision, documented). `oDepth` writes
 /// are stored nowhere — the fragment depth is still the interpolated
-/// z (documented; deferred with the vertex stage).
+/// z (documented; deferred with the vertex stage). `p0` accepts `setp` results.
 fn write_operand(regs: &mut PsRegisters, op: &Operand, value: [f32; 4]) {
     let mut result = value;
     if op.dst_mod == D3DSPDM_SATURATE {
@@ -138,6 +155,7 @@ fn write_operand(regs: &mut PsRegisters, op: &Operand, value: [f32; 4]) {
     let target = match op.reg_type {
         RegType::Temp => regs.temp.get_mut(usize::from(op.reg_num)),
         RegType::ColorOut => Some(&mut regs.output),
+        RegType::Predicate => Some(&mut regs.pred),
         _ => None, // oDepth etc. not applied
     };
     let Some(target) = target else { return };
@@ -173,7 +191,12 @@ pub(super) fn color_to_float4(color: u32) -> [f32; 4] {
 /// their scalar result to all four channels; `exp`/`log` compute only the x
 /// channel and copy yzw). Domain edges use plain IEEE f32 arithmetic, which
 /// matches the hardware contract: `rcp(0) = +inf`, `rsq(0) = +inf`,
-/// `rsq(x<0) = 1/sqrt(|x|)`, `log2(0) = -inf`, `log2(x<0) = NaN`.
+/// `rsq(x<0) = 1/sqrt(|x|)`, `log2(0) = -inf`, `log2(x<0) = NaN`. The
+/// ps_2_a/b additions run too: `texldp` divides the uv by the coordinate's w
+/// before sampling, `texldb` passes the w as a mip bias (a no-op on the
+/// single-level point sampler, documented), `dp2add`, and the block flow
+/// control (`if`/`ifc`/`else`/`endif`, `rep`/`endrep`, `break`/`breakc`,
+/// `loop`/`endloop`, `setp` + predication).
 #[must_use]
 pub fn run_pixel_shader(program: &PsProgram<'_>, input: &PsFragmentInput) -> Option<[f32; 4]> {
     let mut regs = PsRegisters {
@@ -187,12 +210,29 @@ pub fn run_pixel_shader(program: &PsProgram<'_>, input: &PsFragmentInput) -> Opt
             [0.0, 0.0, 0.0, 1.0],
         ],
         output: [0.0; 4],
+        loop_regs: [0; 4],
+        pred: [0.0; 4],
     };
+    let flow = FlowMap::build(program.instructions);
+    let mut state = FlowState::default();
+    let mut pc: usize = 0;
 
-    for instr in program.instructions {
-        match instr.op {
+    while let Some(instr) = program.instructions.get(pc) {
+        state.steps = state.steps.saturating_add(1);
+        if state.steps > super::flow::MAX_SHADER_STEPS {
+            break;
+        }
+        // Predication: the instruction runs only while p0.x != 0.
+        if instr.predicated && comp(regs.pred, 0) == 0.0 {
+            pc = pc.saturating_add(1);
+            continue;
+        }
+        // `texkill` discards the fragment; every other arm falls through or
+        // jumps (Some(target) from a flow-control arm).
+        let mut discard = false;
+        let jump = match instr.op {
             PsOp::End => break,
-            PsOp::Nop | PsOp::Def | PsOp::Dcl => {}
+            PsOp::Nop | PsOp::Def | PsOp::Dcl | PsOp::DefB | PsOp::DefI | PsOp::Label => None,
             PsOp::Mov => {
                 if let Some(dst) = &instr.dst
                     && let Some(src) = instr.srcs.first()
@@ -200,6 +240,7 @@ pub fn run_pixel_shader(program: &PsProgram<'_>, input: &PsFragmentInput) -> Opt
                     let value = read_operand(&regs, src);
                     write_operand(&mut regs, dst, value);
                 }
+                None
             }
             PsOp::Add => {
                 if let Some(dst) = &instr.dst {
@@ -210,6 +251,7 @@ pub fn run_pixel_shader(program: &PsProgram<'_>, input: &PsFragmentInput) -> Opt
                         [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]],
                     );
                 }
+                None
             }
             PsOp::Sub => {
                 if let Some(dst) = &instr.dst {
@@ -220,6 +262,7 @@ pub fn run_pixel_shader(program: &PsProgram<'_>, input: &PsFragmentInput) -> Opt
                         [a[0] - b[0], a[1] - b[1], a[2] - b[2], a[3] - b[3]],
                     );
                 }
+                None
             }
             PsOp::Mad => {
                 if let Some(dst) = &instr.dst {
@@ -235,6 +278,7 @@ pub fn run_pixel_shader(program: &PsProgram<'_>, input: &PsFragmentInput) -> Opt
                         ],
                     );
                 }
+                None
             }
             PsOp::Mul => {
                 if let Some(dst) = &instr.dst {
@@ -245,6 +289,7 @@ pub fn run_pixel_shader(program: &PsProgram<'_>, input: &PsFragmentInput) -> Opt
                         [a[0] * b[0], a[1] * b[1], a[2] * b[2], a[3] * b[3]],
                     );
                 }
+                None
             }
             PsOp::Rcp => {
                 if let Some(dst) = &instr.dst
@@ -253,6 +298,7 @@ pub fn run_pixel_shader(program: &PsProgram<'_>, input: &PsFragmentInput) -> Opt
                     let r = 1.0 / comp(read_operand(&regs, src), 0);
                     write_operand(&mut regs, dst, [r, r, r, r]);
                 }
+                None
             }
             PsOp::Rsq => {
                 if let Some(dst) = &instr.dst
@@ -261,6 +307,7 @@ pub fn run_pixel_shader(program: &PsProgram<'_>, input: &PsFragmentInput) -> Opt
                     let r = 1.0 / comp(read_operand(&regs, src), 0).abs().sqrt();
                     write_operand(&mut regs, dst, [r, r, r, r]);
                 }
+                None
             }
             PsOp::Dp3 => {
                 if let Some(dst) = &instr.dst {
@@ -268,6 +315,7 @@ pub fn run_pixel_shader(program: &PsProgram<'_>, input: &PsFragmentInput) -> Opt
                     let d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
                     write_operand(&mut regs, dst, [d, d, d, d]);
                 }
+                None
             }
             PsOp::Dp4 => {
                 if let Some(dst) = &instr.dst {
@@ -275,6 +323,7 @@ pub fn run_pixel_shader(program: &PsProgram<'_>, input: &PsFragmentInput) -> Opt
                     let d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
                     write_operand(&mut regs, dst, [d, d, d, d]);
                 }
+                None
             }
             PsOp::Min => {
                 if let Some(dst) = &instr.dst {
@@ -290,6 +339,7 @@ pub fn run_pixel_shader(program: &PsProgram<'_>, input: &PsFragmentInput) -> Opt
                         ],
                     );
                 }
+                None
             }
             PsOp::Max => {
                 if let Some(dst) = &instr.dst {
@@ -305,6 +355,7 @@ pub fn run_pixel_shader(program: &PsProgram<'_>, input: &PsFragmentInput) -> Opt
                         ],
                     );
                 }
+                None
             }
             PsOp::Slt => {
                 if let Some(dst) = &instr.dst {
@@ -320,6 +371,7 @@ pub fn run_pixel_shader(program: &PsProgram<'_>, input: &PsFragmentInput) -> Opt
                         ],
                     );
                 }
+                None
             }
             PsOp::Sge => {
                 if let Some(dst) = &instr.dst {
@@ -335,6 +387,7 @@ pub fn run_pixel_shader(program: &PsProgram<'_>, input: &PsFragmentInput) -> Opt
                         ],
                     );
                 }
+                None
             }
             PsOp::Exp => {
                 if let Some(dst) = &instr.dst
@@ -343,6 +396,7 @@ pub fn run_pixel_shader(program: &PsProgram<'_>, input: &PsFragmentInput) -> Opt
                     let [sx, sy, sz, sw] = read_operand(&regs, src);
                     write_operand(&mut regs, dst, [2.0_f32.powf(sx), sy, sz, sw]);
                 }
+                None
             }
             PsOp::Log => {
                 if let Some(dst) = &instr.dst
@@ -351,6 +405,7 @@ pub fn run_pixel_shader(program: &PsProgram<'_>, input: &PsFragmentInput) -> Opt
                     let [sx, sy, sz, sw] = read_operand(&regs, src);
                     write_operand(&mut regs, dst, [sx.log2(), sy, sz, sw]);
                 }
+                None
             }
             PsOp::Lrp => {
                 if let Some(dst) = &instr.dst {
@@ -366,6 +421,7 @@ pub fn run_pixel_shader(program: &PsProgram<'_>, input: &PsFragmentInput) -> Opt
                         ],
                     );
                 }
+                None
             }
             PsOp::Frc => {
                 if let Some(dst) = &instr.dst
@@ -378,6 +434,7 @@ pub fn run_pixel_shader(program: &PsProgram<'_>, input: &PsFragmentInput) -> Opt
                         [x - x.floor(), y - y.floor(), z - z.floor(), w - w.floor()],
                     );
                 }
+                None
             }
             PsOp::Cmp => {
                 if let Some(dst) = &instr.dst {
@@ -393,6 +450,15 @@ pub fn run_pixel_shader(program: &PsProgram<'_>, input: &PsFragmentInput) -> Opt
                         ],
                     );
                 }
+                None
+            }
+            PsOp::Dp2Add => {
+                if let Some(dst) = &instr.dst {
+                    let [a, b, c] = read_three(&regs, &instr.srcs);
+                    let s = a[0] * b[0] + a[1] * b[1] + comp(c, 0);
+                    write_operand(&mut regs, dst, [s, s, s, s]);
+                }
+                None
             }
             PsOp::Tex => {
                 // texld rD, tN, sM — sample sampler sM at (tN.x, tN.y).
@@ -408,19 +474,290 @@ pub fn run_pixel_shader(program: &PsProgram<'_>, input: &PsFragmentInput) -> Opt
                         .map_or(0, |stage| sample_texture(stage, u, v));
                     write_operand(&mut regs, dst, texel_to_float4(texel));
                 }
+                None
+            }
+            PsOp::TexLdP => {
+                // texldp (project): sample at (tN.x / tN.w, tN.y / tN.w).
+                if let Some(dst) = &instr.dst
+                    && let Some(uv_src) = instr.srcs.first()
+                {
+                    let [u, v, _, w] = read_operand(&regs, uv_src);
+                    let texel = instr
+                        .srcs
+                        .get(1)
+                        .and_then(|sampler| program.samplers.get(usize::from(sampler.reg_num)))
+                        .and_then(|stage| *stage)
+                        .map_or(0, |stage| sample_texture(stage, u / w, v / w));
+                    write_operand(&mut regs, dst, texel_to_float4(texel));
+                }
+                None
+            }
+            PsOp::TexLdB => {
+                // texldb (bias): the w component biases the mip selection —
+                // a no-op on the single-level point sampler (documented).
+                if let Some(dst) = &instr.dst
+                    && let Some(uv_src) = instr.srcs.first()
+                {
+                    let [u, v, _, _] = read_operand(&regs, uv_src);
+                    let texel = instr
+                        .srcs
+                        .get(1)
+                        .and_then(|sampler| program.samplers.get(usize::from(sampler.reg_num)))
+                        .and_then(|stage| *stage)
+                        .map_or(0, |stage| sample_texture(stage, u, v));
+                    write_operand(&mut regs, dst, texel_to_float4(texel));
+                }
+                None
             }
             PsOp::TexKill => {
                 if let Some(src) = instr.srcs.first() {
                     let [x, y, z, w] = read_operand(&regs, src);
                     if x < 0.0 || y < 0.0 || z < 0.0 || w < 0.0 {
-                        return None;
+                        discard = true;
                     }
                 }
+                None
             }
+            // ── ps_2_a/b flow control (the shared block engine) ─────────
+            PsOp::If => {
+                let cond = instr
+                    .dst
+                    .as_ref()
+                    .is_some_and(|op| comp(read_operand(&regs, op), 0) != 0.0);
+                if cond { None } else { flow.branch_target(pc) }
+            }
+            PsOp::Ifc => {
+                let [a, b] = read_two(&regs, &instr.srcs);
+                if compare(comp(a, 0), comp(b, 0), instr.control) {
+                    None
+                } else {
+                    flow.branch_target(pc)
+                }
+            }
+            PsOp::Else => flow.else_target(pc),
+            PsOp::EndIf => None,
+            PsOp::Loop => {
+                if let (Some(dst), Some(src)) = (&instr.dst, instr.srcs.first())
+                    && let Some(end) = flow.loop_end(pc)
+                {
+                    let spec = read_operand_i32(&regs, src);
+                    let a_l = comp_opt(spec, 0);
+                    let a_u = comp_opt(spec, 1).max(1);
+                    let a_d = comp_opt(spec, 2);
+                    regs.loop_regs[0] = a_l;
+                    state.blocks.push(BlockState::Loop {
+                        reg: dst.reg_num,
+                        value: a_l,
+                        remaining: a_u,
+                        step: a_d,
+                        start: pc,
+                        end,
+                    });
+                }
+                None
+            }
+            PsOp::EndLoop => {
+                let Some(BlockState::Loop {
+                    reg,
+                    value,
+                    remaining,
+                    step,
+                    start,
+                    end: _,
+                }) = state.blocks.last_mut()
+                else {
+                    return None;
+                };
+                *value = value.saturating_add(*step);
+                *remaining = remaining.saturating_sub(1);
+                regs.loop_regs[usize::from(*reg)] = *value;
+                if *remaining > 0 {
+                    Some(start.saturating_add(1))
+                } else {
+                    state.blocks.pop();
+                    None
+                }
+            }
+            PsOp::Rep => {
+                if let (Some(dst), Some(src)) = (&instr.dst, instr.srcs.first())
+                    && let Some(end) = flow.rep_end(pc)
+                {
+                    let count = comp_opt(read_operand_i32(&regs, src), 0).max(1);
+                    regs.loop_regs[usize::from(dst.reg_num)] = count;
+                    state.blocks.push(BlockState::Rep {
+                        remaining: count,
+                        start: pc,
+                        end,
+                    });
+                }
+                None
+            }
+            PsOp::EndRep => {
+                let Some(BlockState::Rep {
+                    remaining,
+                    start,
+                    end: _,
+                }) = state.blocks.last_mut()
+                else {
+                    return None;
+                };
+                *remaining = remaining.saturating_sub(1);
+                if *remaining > 0 {
+                    Some(start.saturating_add(1))
+                } else {
+                    state.blocks.pop();
+                    None
+                }
+            }
+            PsOp::Break => break_from(&mut state.blocks),
+            PsOp::BreakC => {
+                let [a, b] = read_two(&regs, &instr.srcs);
+                if compare(comp(a, 0), comp(b, 0), instr.control) {
+                    break_from(&mut state.blocks)
+                } else {
+                    None
+                }
+            }
+            PsOp::BreakP => {
+                let pred = instr
+                    .srcs
+                    .first()
+                    .map_or(0.0, |op| comp(read_operand(&regs, op), 0));
+                if pred != 0.0 {
+                    break_from(&mut state.blocks)
+                } else {
+                    None
+                }
+            }
+            PsOp::Call => {
+                let label = instr
+                    .srcs
+                    .first()
+                    .or(instr.dst.as_ref())
+                    .map_or(0, |op| op.reg_num);
+                if state.call_stack.len() >= super::flow::CALL_DEPTH_LIMIT {
+                    None
+                } else {
+                    state.call_stack.push(pc.saturating_add(1));
+                    flow.label(label)
+                }
+            }
+            PsOp::CallNz => {
+                let should_call = instr
+                    .srcs
+                    .get(1)
+                    .is_some_and(|op| comp(read_operand(&regs, op), 0) != 0.0);
+                if should_call {
+                    let label = instr
+                        .srcs
+                        .first()
+                        .or(instr.dst.as_ref())
+                        .map_or(0, |op| op.reg_num);
+                    if state.call_stack.len() >= super::flow::CALL_DEPTH_LIMIT {
+                        None
+                    } else {
+                        state.call_stack.push(pc.saturating_add(1));
+                        flow.label(label)
+                    }
+                } else {
+                    None
+                }
+            }
+            PsOp::Ret => state.call_stack.pop(),
+            PsOp::Setp => {
+                if let Some(dst) = &instr.dst {
+                    let [a, b] = read_two(&regs, &instr.srcs);
+                    let result = [
+                        if compare(comp(a, 0), comp(b, 0), instr.control) {
+                            1.0
+                        } else {
+                            0.0
+                        },
+                        if compare(comp(a, 1), comp(b, 1), instr.control) {
+                            1.0
+                        } else {
+                            0.0
+                        },
+                        if compare(comp(a, 2), comp(b, 2), instr.control) {
+                            1.0
+                        } else {
+                            0.0
+                        },
+                        if compare(comp(a, 3), comp(b, 3), instr.control) {
+                            1.0
+                        } else {
+                            0.0
+                        },
+                    ];
+                    write_operand(&mut regs, dst, result);
+                }
+                None
+            }
+            // The vs-only arithmetic ops (mNxM, dst, lit, pow, crs, sgn, abs,
+            // nrm, sincos, mova) cannot appear in valid ps_2_x bytecode —
+            // they parse but never execute here.
+            PsOp::M4x4
+            | PsOp::M4x3
+            | PsOp::M3x4
+            | PsOp::M3x3
+            | PsOp::M3x2
+            | PsOp::Dst
+            | PsOp::Lit
+            | PsOp::Pow
+            | PsOp::Crs
+            | PsOp::Sgn
+            | PsOp::Abs
+            | PsOp::Nrm
+            | PsOp::SinCos
+            | PsOp::Mova => None,
             PsOp::Unsupported(_) => return None, // unreachable: Create rejects these
+        };
+        if discard {
+            return None;
+        }
+        match jump {
+            Some(target) => pc = target,
+            None => pc = pc.saturating_add(1),
         }
     }
     Some(regs.output)
+}
+/// Read a source operand's value as raw integers (the `loop`/`breakc` and
+/// `rep` integer sources: `iN` files read the stored ints, any other file
+/// truncates the float read).
+#[must_use]
+fn read_operand_i32(regs: &PsRegisters, op: &Operand) -> [i32; 4] {
+    match op.reg_type {
+        RegType::Loop => {
+            let sw = op.swizzle;
+            [
+                regs.loop_regs.get(usize::from(sw[0])).copied().unwrap_or(0),
+                regs.loop_regs.get(usize::from(sw[1])).copied().unwrap_or(0),
+                regs.loop_regs.get(usize::from(sw[2])).copied().unwrap_or(0),
+                regs.loop_regs.get(usize::from(sw[3])).copied().unwrap_or(0),
+            ]
+        }
+        _ => {
+            let value = read_operand(regs, op);
+            [
+                comp(value, 0).trunc() as i32,
+                comp(value, 1).trunc() as i32,
+                comp(value, 2).trunc() as i32,
+                comp(value, 3).trunc() as i32,
+            ]
+        }
+    }
+}
+/// Read a 4-component int value's `i`-th component.
+#[must_use]
+fn comp_opt(value: [i32; 4], i: usize) -> i32 {
+    value.get(i).copied().unwrap_or(0)
+}
+/// Pop the innermost `loop`/`rep` block and return its break target.
+fn break_from(blocks: &mut Vec<BlockState>) -> Option<usize> {
+    blocks.pop().map(|block| match block {
+        BlockState::Loop { end, .. } | BlockState::Rep { end, .. } => end.saturating_add(1),
+    })
 }
 /// Read exactly two source operands; short source lists read as zero.
 #[must_use]

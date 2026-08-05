@@ -285,6 +285,8 @@ pub fn handle_device_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
             state.d3d9().d3d9_shaders.clear();
             state.d3d9().d3d9_ps_constants = [[0.0; 4]; crate::d3d9_shader::PS_CONST_COUNT];
             state.d3d9().d3d9_vs_constants = [[0.0; 4]; crate::d3d9_shader::VS_CONST_COUNT];
+            state.d3d9().d3d9_vs_int_constants = [[0; 4]; crate::d3d9_shader::VS_INT_CONST_COUNT];
+            state.d3d9().d3d9_vs_bool_constants = [false; crate::d3d9_shader::VS_BOOL_CONST_COUNT];
             state.d3d9().d3d9_current_fvf = 0;
             state.d3d9().d3d9_render_state = RenderState::default();
             state.d3d9().d3d9_render_state_raw.clear();

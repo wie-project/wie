@@ -168,6 +168,13 @@ pub(crate) const D3D9_ALPHA_PASS_0RGB: u32 = 0x00FF_FFFF;
 pub(crate) const D3D9_FOGGED_0RGB: u32 = 0x0080_0080;
 /// L3 scissor quad inside the scissor rect: solid green.
 pub(crate) const D3D9_SCISSOR_INSIDE_0RGB: u32 = 0x0000_FF00;
+/// L4 mip-select quad at an odd column: the level-1 magenta texel (the level-0
+/// footprint is 2 texels/pixel, so MIPFILTER POINT must select level 1 — a
+/// level-0 texel would be red/white here).
+pub(crate) const D3D9_MIP_MAGENTA_0RGB: u32 = 0x00FE_00FE;
+/// L4 mip-select quad at an even column: the level-1 yellow texel (level-0
+/// would be green/blue here).
+pub(crate) const D3D9_MIP_YELLOW_0RGB: u32 = 0x00FE_FE00;
 
 /// CI-gated hash of gui_d3d9's deterministic resting frame (320×240).
 ///
@@ -182,7 +189,11 @@ pub(crate) const D3D9_SCISSOR_INSIDE_0RGB: u32 = 0x0000_FF00;
 /// micro-exes/out/gui_d3d9.exe` then FNV-1a 64 over the full 0RGB pixel bytes.
 /// Recomputed when the L3 lane added the fog/alpha-test/scissor strip (the
 /// deliberate D3D9_RESTING_FRAME_HASH tripwire for the fragment-stage change).
-pub(crate) const D3D9_RESTING_FRAME_HASH: u64 = 0x07EA_21E2_A9C9_4062;
+/// Recomputed again when the L4 lane added the renderer-completeness strip
+/// (the mip-select quad, the point/line primitives, the MinZ/MaxZ occlusion,
+/// and the near-plane-clipped quad) — that lane deliberately altered pixels,
+/// so the gate is re-anchored to the new deterministic frame.
+pub(crate) const D3D9_RESTING_FRAME_HASH: u64 = 0x6AF4_799A_6168_2388;
 
 /// Verify the deterministic frame's pixel content: the gradient survives the
 /// WS_CLIPCHILDREN-clipped blit, the DIB text drew white glyph ink, and the

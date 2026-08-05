@@ -612,6 +612,14 @@ pub enum WinApiId {
     D3d9Idirect3ddevice9Multiplytransform = 497,
     /// Appended here (not adjacent to the other D3D9 ids) to avoid renumbering the entire enum.
     D3d9Idirect3ddevice9Setscissorrect = 498,
+    /// Appended here (not adjacent to the other D3D9 ids) to avoid renumbering the entire enum.
+    D3d9Idirect3ddevice9Setvertexshaderconstanti = 499,
+    /// Appended here (not adjacent to the other D3D9 ids) to avoid renumbering the entire enum.
+    D3d9Idirect3ddevice9Getvertexshaderconstanti = 500,
+    /// Appended here (not adjacent to the other D3D9 ids) to avoid renumbering the entire enum.
+    D3d9Idirect3ddevice9Setvertexshaderconstantb = 501,
+    /// Appended here (not adjacent to the other D3D9 ids) to avoid renumbering the entire enum.
+    D3d9Idirect3ddevice9Getvertexshaderconstantb = 502,
 }
 
 /// Number of dense [`WinApiId`] discriminants, i.e. one past the highest one.
@@ -623,7 +631,7 @@ pub enum WinApiId {
 /// alias correct by construction: appending a variant with a higher
 /// discriminant updates this constant with it.
 pub const WINAPI_ID_COUNT: usize =
-    WinApiId::D3d9Idirect3ddevice9Setscissorrect.to_u16() as usize + 1;
+    WinApiId::D3d9Idirect3ddevice9Getvertexshaderconstantb.to_u16() as usize + 1;
 
 impl WinApiId {
     /// Discriminant as `u16` (`#[repr(u16)]`).
@@ -1018,6 +1026,18 @@ pub fn dispatch_winapi_id(
         }
         WinApiId::D3d9Idirect3ddevice9Getvertexshaderconstantf => {
             d3d9::handle_get_vertex_shader_constant_f(ctx)
+        }
+        WinApiId::D3d9Idirect3ddevice9Setvertexshaderconstanti => {
+            d3d9::handle_set_vertex_shader_constant_i(ctx)
+        }
+        WinApiId::D3d9Idirect3ddevice9Getvertexshaderconstanti => {
+            d3d9::handle_get_vertex_shader_constant_i(ctx)
+        }
+        WinApiId::D3d9Idirect3ddevice9Setvertexshaderconstantb => {
+            d3d9::handle_set_vertex_shader_constant_b(ctx)
+        }
+        WinApiId::D3d9Idirect3ddevice9Getvertexshaderconstantb => {
+            d3d9::handle_get_vertex_shader_constant_b(ctx)
         }
         WinApiId::D3d9Idirect3ddevice9Createpixelshader => d3d9::handle_create_pixel_shader(ctx),
         WinApiId::D3d9Idirect3ddevice9Setpixelshader => d3d9::handle_set_pixel_shader(ctx),
@@ -1460,10 +1480,11 @@ mod tests {
     /// an append/renumber/backfill shows up as a test diff.
     #[test]
     fn count_is_pinned_to_enum() {
-        let last_plus_one = usize::from(WinApiId::D3d9Idirect3ddevice9Setscissorrect.to_u16()) + 1;
+        let last_plus_one =
+            usize::from(WinApiId::D3d9Idirect3ddevice9Getvertexshaderconstantb.to_u16()) + 1;
         assert_eq!(WINAPI_ID_COUNT, last_plus_one);
-        assert_eq!(WINAPI_ID_COUNT, 499);
-        assert_eq!(WinApiId::COUNT, 497); // 497 variants, two discriminant holes
+        assert_eq!(WINAPI_ID_COUNT, 503);
+        assert_eq!(WinApiId::COUNT, 501); // 501 variants, two discriminant holes
     }
 
     /// Every discriminant is either a round-trippable variant (its `to_u16`
@@ -1482,6 +1503,9 @@ mod tests {
         }
         // The final variant is exactly the highest discriminant.
         let last = u16::try_from(WINAPI_ID_COUNT - 1).expect("count fits u16");
-        assert_eq!(WinApiId::D3d9Idirect3ddevice9Setscissorrect.to_u16(), last);
+        assert_eq!(
+            WinApiId::D3d9Idirect3ddevice9Getvertexshaderconstantb.to_u16(),
+            last
+        );
     }
 }

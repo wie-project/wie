@@ -74,7 +74,14 @@ fn read_shader_bytecode(
         }
         let payload_len =
             crate::d3d9_shader::instruction_payload_len(opcode).context("unknown shader opcode")?;
-        for _ in 0..payload_len {
+        // A predicated instruction (bit 28) carries the p0 predicate operand
+        // ahead of its normal dst/src operands — the tokenizer counts it the
+        // same way, so the walk must add one token here.
+        let predicated = token & crate::d3d9_shader::PREDICATED_INSTRUCTION_MASK != 0;
+        let operand_count = payload_len
+            .checked_add(usize::from(predicated))
+            .context("shader operand count overflow")?;
+        for _ in 0..operand_count {
             if tokens.len() >= MAX_TOKENS {
                 anyhow::bail!("shader exceeds {MAX_TOKENS} tokens");
             }
@@ -230,6 +237,46 @@ pub fn handle_create_vertex_shader(ctx: &mut HandlerContext<'_>) -> Result<WinAp
                             parsed,
                         },
                     );
+                    // `def`/`defb`/`defi` write the device constant registers
+                    // at Create time (real D3D9 semantics — the same as the
+                    // pixel-shader `def` path); later Set*ShaderConstant
+                    // calls override.
+                    let d3d = state.d3d9();
+                    let record = d3d
+                        .d3d9_shaders
+                        .get(&object)
+                        .map(|r| {
+                            (
+                                r.parsed.constants.clone(),
+                                r.parsed.bool_constants.clone(),
+                                r.parsed.int_constants.clone(),
+                            )
+                        })
+                        .unwrap_or_default();
+                    for (register, value) in &record.0 {
+                        if let Some(slot) = d3d
+                            .d3d9_vs_constants
+                            .get_mut(usize::try_from(*register).unwrap_or(usize::MAX))
+                        {
+                            *slot = *value;
+                        }
+                    }
+                    for (register, value) in &record.1 {
+                        if let Some(slot) = d3d
+                            .d3d9_vs_bool_constants
+                            .get_mut(usize::try_from(*register).unwrap_or(usize::MAX))
+                        {
+                            *slot = *value;
+                        }
+                    }
+                    for (register, value) in &record.2 {
+                        if let Some(slot) = d3d
+                            .d3d9_vs_int_constants
+                            .get_mut(usize::try_from(*register).unwrap_or(usize::MAX))
+                        {
+                            slot[0] = *value;
+                        }
+                    }
                     write_guest_u64(engine, pp_shader, object)
                         .context("failed to return IDirect3DVertexShader9 pointer")?;
                     D3D_OK
@@ -575,6 +622,272 @@ pub fn handle_get_vertex_shader_constant_f(
     let return_address = engine
         .return_from_win64_api(D3D_OK)
         .context("failed to return from GetVertexShaderConstantF")?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: D3D_OK,
+    })
+}
+
+/// Common Set*ShaderConstantI body: copy `count` int4s from the guest into an
+/// integer register file (clamped to the file end, like the float form).
+fn set_shader_constant_i(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    file: &mut [[i32; 4]],
+    start_register: u32,
+    data_ptr: u64,
+    count: u32,
+) -> Result<()> {
+    if data_ptr == 0 {
+        return Ok(());
+    }
+    for index in 0..count {
+        let register = start_register
+            .checked_add(index)
+            .context("constant register index overflow")?;
+        let Some(slot) = file.get_mut(usize::try_from(register).unwrap_or(usize::MAX)) else {
+            break;
+        };
+        let int_address = data_ptr.wrapping_add(u64::from(index).wrapping_mul(16));
+        let mut bytes = [0_u8; 16];
+        engine
+            .mem_read(int_address, &mut bytes)
+            .context("failed to read shader integer constant data")?;
+        for (channel, byte_chunk) in bytes.chunks_exact(4).enumerate() {
+            if let Some(slot_channel) = slot.get_mut(channel) {
+                *slot_channel = i32::from_le_bytes(byte_chunk.try_into().unwrap_or([0; 4]));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Common Get*ShaderConstantI body: copy `count` int4s back to the guest.
+fn get_shader_constant_i(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    file: &[[i32; 4]],
+    start_register: u32,
+    data_ptr: u64,
+    count: u32,
+) -> Result<()> {
+    if data_ptr == 0 {
+        return Ok(());
+    }
+    for index in 0..count {
+        let register = start_register
+            .checked_add(index)
+            .context("constant register index overflow")?;
+        let Some(value) = file.get(usize::try_from(register).unwrap_or(usize::MAX)) else {
+            break;
+        };
+        let address = data_ptr.wrapping_add(u64::from(index).wrapping_mul(16));
+        let mut bytes = [0_u8; 16];
+        for (channel, byte_chunk) in bytes.chunks_exact_mut(4).enumerate() {
+            let chunk = value.get(channel).copied().unwrap_or(0).to_le_bytes();
+            byte_chunk.copy_from_slice(&chunk);
+        }
+        engine
+            .mem_write(address, &bytes)
+            .context("failed to write shader integer constant data")?;
+    }
+    Ok(())
+}
+
+/// Common Set*ShaderConstantB body: copy `count` BOOLs (4 bytes each,
+/// TRUE = nonzero) into a boolean register file.
+fn set_shader_constant_b(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    file: &mut [bool],
+    start_register: u32,
+    data_ptr: u64,
+    count: u32,
+) -> Result<()> {
+    if data_ptr == 0 {
+        return Ok(());
+    }
+    for index in 0..count {
+        let register = start_register
+            .checked_add(index)
+            .context("constant register index overflow")?;
+        let Some(slot) = file.get_mut(usize::try_from(register).unwrap_or(usize::MAX)) else {
+            break;
+        };
+        let bool_address = data_ptr.wrapping_add(u64::from(index).wrapping_mul(4));
+        let mut bytes = [0_u8; 4];
+        engine
+            .mem_read(bool_address, &mut bytes)
+            .context("failed to read shader boolean constant data")?;
+        *slot = u32::from_le_bytes(bytes) != 0;
+    }
+    Ok(())
+}
+
+/// Common Get*ShaderConstantB body: copy `count` BOOLs back to the guest.
+fn get_shader_constant_b(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    file: &[bool],
+    start_register: u32,
+    data_ptr: u64,
+    count: u32,
+) -> Result<()> {
+    if data_ptr == 0 {
+        return Ok(());
+    }
+    for index in 0..count {
+        let register = start_register
+            .checked_add(index)
+            .context("constant register index overflow")?;
+        let Some(value) = file.get(usize::try_from(register).unwrap_or(usize::MAX)) else {
+            break;
+        };
+        let address = data_ptr.wrapping_add(u64::from(index).wrapping_mul(4));
+        let raw = if *value { 1_u32 } else { 0_u32 };
+        engine
+            .mem_write(address, &raw.to_le_bytes())
+            .context("failed to write shader boolean constant data")?;
+    }
+    Ok(())
+}
+
+/// Handles `IDirect3DDevice9::SetVertexShaderConstantI` (vtable slot 96).
+///
+/// Stores into the vs_2_0 integer constant file `i0..i3` (int4 per register);
+/// the `loop`/`rep` instructions read these as their iteration specs.
+pub fn handle_set_vertex_shader_constant_i(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let _this_pointer = engine
+        .read_rcx()
+        .context("failed to read RCX for SetVertexShaderConstantI")?;
+    let start_register = u32::try_from(engine.read_rdx()? & u64::from(u32::MAX))
+        .context("start register does not fit u32")?;
+    let data_ptr = engine
+        .read_r8()
+        .context("failed to read R8 for SetVertexShaderConstantI")?;
+    let count =
+        u32::try_from(engine.read_r9()? & u64::from(u32::MAX)).context("count does not fit u32")?;
+
+    let d3d = state.d3d9();
+    set_shader_constant_i(
+        engine,
+        &mut d3d.d3d9_vs_int_constants,
+        start_register,
+        data_ptr,
+        count,
+    )?;
+
+    let return_address = engine
+        .return_from_win64_api(D3D_OK)
+        .context("failed to return from SetVertexShaderConstantI")?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: D3D_OK,
+    })
+}
+
+/// Handles `IDirect3DDevice9::GetVertexShaderConstantI` (vtable slot 97).
+pub fn handle_get_vertex_shader_constant_i(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let _this_pointer = engine
+        .read_rcx()
+        .context("failed to read RCX for GetVertexShaderConstantI")?;
+    let start_register = u32::try_from(engine.read_rdx()? & u64::from(u32::MAX))
+        .context("start register does not fit u32")?;
+    let data_ptr = engine
+        .read_r8()
+        .context("failed to read R8 for GetVertexShaderConstantI")?;
+    let count =
+        u32::try_from(engine.read_r9()? & u64::from(u32::MAX)).context("count does not fit u32")?;
+
+    let d3d = state.d3d9();
+    get_shader_constant_i(
+        engine,
+        &d3d.d3d9_vs_int_constants,
+        start_register,
+        data_ptr,
+        count,
+    )?;
+
+    let return_address = engine
+        .return_from_win64_api(D3D_OK)
+        .context("failed to return from GetVertexShaderConstantI")?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: D3D_OK,
+    })
+}
+
+/// Handles `IDirect3DDevice9::SetVertexShaderConstantB` (vtable slot 98).
+///
+/// Stores into the vs_2_0 boolean constant file `b0..b15`; the `if`/`callnz`
+/// instructions read these as their conditions.
+pub fn handle_set_vertex_shader_constant_b(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let _this_pointer = engine
+        .read_rcx()
+        .context("failed to read RCX for SetVertexShaderConstantB")?;
+    let start_register = u32::try_from(engine.read_rdx()? & u64::from(u32::MAX))
+        .context("start register does not fit u32")?;
+    let data_ptr = engine
+        .read_r8()
+        .context("failed to read R8 for SetVertexShaderConstantB")?;
+    let count =
+        u32::try_from(engine.read_r9()? & u64::from(u32::MAX)).context("count does not fit u32")?;
+
+    let d3d = state.d3d9();
+    set_shader_constant_b(
+        engine,
+        &mut d3d.d3d9_vs_bool_constants,
+        start_register,
+        data_ptr,
+        count,
+    )?;
+
+    let return_address = engine
+        .return_from_win64_api(D3D_OK)
+        .context("failed to return from SetVertexShaderConstantB")?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: D3D_OK,
+    })
+}
+
+/// Handles `IDirect3DDevice9::GetVertexShaderConstantB` (vtable slot 99).
+pub fn handle_get_vertex_shader_constant_b(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let _this_pointer = engine
+        .read_rcx()
+        .context("failed to read RCX for GetVertexShaderConstantB")?;
+    let start_register = u32::try_from(engine.read_rdx()? & u64::from(u32::MAX))
+        .context("start register does not fit u32")?;
+    let data_ptr = engine
+        .read_r8()
+        .context("failed to read R8 for GetVertexShaderConstantB")?;
+    let count =
+        u32::try_from(engine.read_r9()? & u64::from(u32::MAX)).context("count does not fit u32")?;
+
+    let d3d = state.d3d9();
+    get_shader_constant_b(
+        engine,
+        &d3d.d3d9_vs_bool_constants,
+        start_register,
+        data_ptr,
+        count,
+    )?;
+
+    let return_address = engine
+        .return_from_win64_api(D3D_OK)
+        .context("failed to return from GetVertexShaderConstantB")?;
     Ok(WinApiHandlerResult {
         return_address,
         return_value: D3D_OK,
