@@ -10,5 +10,6 @@
 mod controls;
 mod demo;
 mod dialogs;
+mod find;
 mod helpers;
 mod notepad;

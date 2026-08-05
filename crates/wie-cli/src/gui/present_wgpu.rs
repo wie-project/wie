@@ -526,8 +526,11 @@ impl WgpuPresenter {
     }
 
     /// Create a staging texture at `width`×`height` plus its view and bind
-    /// group. `Rgba8Unorm`: the guest's 0RGB u32 LE bytes are R,G,B,0 in
-    /// memory, which is exactly an RGBA8 texel row.
+    /// group. `Bgra8Unorm`: guest pixels are 0RGB u32s whose little-endian
+    /// memory bytes are B,G,R,0 — exactly a BGRA8 texel row, so the zero-copy
+    /// upload stays valid and the R channel receives the guest's R. (An
+    /// RGBA8 staging here would swap R/B: guest blue #0078D7 rendered as
+    /// orange.)
     fn make_staging(&self, width: u32, height: u32) -> Result<StagingFrame> {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("wie guest frame staging"),
@@ -539,7 +542,7 @@ impl WgpuPresenter {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: wgpu::TextureFormat::Bgra8Unorm,
             usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });

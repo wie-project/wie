@@ -33,6 +33,12 @@ pub(crate) enum ScriptStep {
     Type(String),
     /// Post WM_COMMAND with the menu item id in wParam's low word.
     Menu(u32),
+    /// Left-click at logical client (x, y): hit-test via `window_at`, then
+    /// post WM_LBUTTONDOWN + WM_LBUTTONUP (the winit MouseInput path).
+    Click { x: u32, y: u32 },
+    /// Dump the current published owner frame to a BMP (BMP-script oracle for
+    /// real-window rendering regression checks).
+    Snapshot(String),
 }
 
 /// Message-posting sink the script interpreter drives. [`GuestHandle`] is the
@@ -109,9 +115,23 @@ pub(crate) fn parse_script(text: &str) -> Result<Vec<ScriptStep>> {
                     .map_err(|_| anyhow!("{}: menu id {id} out of range", what()))?;
                 steps.push(ScriptStep::Menu(id));
             }
+            "click" => {
+                let mut parts = rest.split_whitespace();
+                let x = parse_u64(parts.next().with_context(what)?).with_context(what)?;
+                let y = parse_u64(parts.next().with_context(what)?).with_context(what)?;
+                steps.push(ScriptStep::Click {
+                    x: u32::try_from(x)
+                        .map_err(|_| anyhow!("{}: click x {x} out of range", what()))?,
+                    y: u32::try_from(y)
+                        .map_err(|_| anyhow!("{}: click y {y} out of range", what()))?,
+                });
+            }
+            "snapshot" => {
+                steps.push(ScriptStep::Snapshot(rest.to_owned()));
+            }
             other => {
                 bail!(
-                    "{}: unknown command {other:?} (expected sleep|key|type|menu)",
+                    "{}: unknown command {other:?} (expected sleep|key|type|menu|click|snapshot)",
                     what()
                 );
             }
@@ -151,7 +171,7 @@ pub(crate) fn spawn(handle: GuestHandle, steps: Vec<ScriptStep>) -> Result<()> {
                 return;
             };
             tracing::info!(target: "wiegui", steps = steps.len(), "input script: executing");
-            execute_script(&handle, hwnd, &steps);
+            execute_real_steps(&handle, hwnd, &steps);
             tracing::info!(target: "wiegui", "input script: finished");
         })
         .context("spawn input-script thread")?;
@@ -167,6 +187,71 @@ pub(crate) fn execute_script<S: InputSink>(sink: &S, hwnd: u64, steps: &[ScriptS
             ScriptStep::Type(text) => post_type(sink, hwnd, text),
             ScriptStep::Menu(id) => {
                 sink.post_message(hwnd, input::WM_COMMAND, u64::from(*id), 0);
+            }
+            ScriptStep::Click { .. } | ScriptStep::Snapshot(_) => {
+                // GuestHandle-specific steps: the recording fake cannot
+                // hit-test or read frames, so `spawn` drives them through
+                // `execute_real_steps` instead; this arm keeps the shared
+                // interpreter total for every step kind.
+                let _ = (sink, hwnd);
+            }
+        }
+    }
+}
+
+/// Execute steps against a live [`GuestHandle`], including the
+/// `GuestHandle`-only `click` and `snapshot` steps, interleaved with the
+/// shared steps.
+fn execute_real_steps(handle: &GuestHandle, hwnd: u64, steps: &[ScriptStep]) {
+    for step in steps {
+        match step {
+            ScriptStep::Sleep(ms) => thread::sleep(Duration::from_millis(*ms)),
+            ScriptStep::Key { vk, shift, ctrl } => post_key(handle, hwnd, *vk, *shift, *ctrl),
+            ScriptStep::Type(text) => post_type(handle, hwnd, text),
+            ScriptStep::Menu(id) => {
+                handle.post_message(hwnd, input::WM_COMMAND, u64::from(*id), 0);
+            }
+            ScriptStep::Click { x, y } => {
+                let (x, y) = (
+                    i32::try_from(*x).unwrap_or(0),
+                    i32::try_from(*y).unwrap_or(0),
+                );
+                let Some((target, rx, ry)) = handle.window_at(x, y) else {
+                    tracing::warn!(target: "wiegui", "click: no window at ({x},{y})");
+                    continue;
+                };
+                let lparam = u64::from((ry << 16) | rx);
+                handle.post_message_at(
+                    target,
+                    input::WM_LBUTTONDOWN,
+                    u64::from(input::MK_LBUTTON),
+                    lparam,
+                    i32::try_from(rx).unwrap_or(0),
+                    i32::try_from(ry).unwrap_or(0),
+                );
+                handle.post_message_at(
+                    target,
+                    input::WM_LBUTTONUP,
+                    0,
+                    lparam,
+                    i32::try_from(rx).unwrap_or(0),
+                    i32::try_from(ry).unwrap_or(0),
+                );
+                tracing::info!(target: "wiegui", "click ({x},{y}) -> hwnd {target}");
+            }
+            ScriptStep::Snapshot(path) => {
+                let Some(owner) = handle.first_guest_window_handle() else {
+                    continue;
+                };
+                let Some(frame) = handle.take_frame(owner) else {
+                    tracing::warn!(target: "wiegui", "snapshot: no frame");
+                    continue;
+                };
+                let file = std::fs::File::create(path).expect("snapshot file");
+                let mut writer = std::io::BufWriter::new(file);
+                crate::bmp::write_bmp(&mut writer, frame.width, frame.height, &frame.pixels)
+                    .expect("snapshot bmp");
+                tracing::info!(target: "wiegui", "snapshot written to {path}");
             }
         }
     }
@@ -373,6 +458,28 @@ type q
     fn parse_hex_and_decimal_menu_ids() {
         let steps = parse_script("menu 0x10\nmenu 16\n").expect("parse");
         assert_eq!(steps, vec![ScriptStep::Menu(0x10), ScriptStep::Menu(16)]);
+    }
+
+    #[test]
+    fn parse_click_and_snapshot_commands() {
+        let steps = parse_script("click 438 218\nsnapshot /tmp/frame.bmp\n").expect("parse");
+        assert_eq!(
+            steps,
+            vec![
+                ScriptStep::Click { x: 438, y: 218 },
+                ScriptStep::Snapshot("/tmp/frame.bmp".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_rejects_bad_click_lines() {
+        for bad in ["click\n", "click 3\n", "click a b\n", "click -1 5\n"] {
+            assert!(
+                parse_script(bad).is_err(),
+                "line {bad:?} should fail to parse"
+            );
+        }
     }
 
     #[test]
