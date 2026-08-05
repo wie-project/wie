@@ -5,9 +5,9 @@
 pub(crate) use crate::guest_layout::{Msg, WindowPlacement};
 pub(crate) use crate::guest_memory::{
     checked_field_address, read_bytes as read_guest_bytes, read_i32 as read_guest_i32,
-    read_u32 as read_guest_u32, read_u64 as read_guest_u64, with_typed_read, with_typed_write,
-    write_bytes as write_guest_bytes, write_i32 as write_guest_i32, write_u32 as write_guest_u32,
-    write_u64 as write_guest_u64,
+    read_typed_copy, read_u32 as read_guest_u32, read_u64 as read_guest_u64, with_typed_read,
+    with_typed_write, write_bytes as write_guest_bytes, write_i32 as write_guest_i32,
+    write_typed_copy, write_u32 as write_guest_u32, write_u64 as write_guest_u64,
 };
 pub(crate) use crate::guest_string::{
     read_ansi_lossy as read_guest_ansi_lossy, read_utf16_lossy as read_guest_utf16_lossy,

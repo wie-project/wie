@@ -41,24 +41,40 @@ fn read_page_slice(
     Ok(take)
 }
 
+/// Decode a host byte slice as an ANSI string (the A-path decode), stopping
+/// at the first NUL byte.
+///
+/// A-strings are UTF-8 in WIE when the guest was compiled with mingw (the
+/// toolchain stores string literals as UTF-8); real Windows binaries pass
+/// ACP-encoded strings. Bytes that are not valid UTF-8 therefore fall back to
+/// a strict Windows-1252 decode — the WHATWG codec, identical to Windows
+/// codepage 1252 including the 0x80–0x9F C1 range.
+///
+/// The NUL stop matters for the fixed-size-buffer callers (a `CHAR[32]` face
+/// name): bytes past the terminator are uninitialized garbage. [`read_ansi_lossy`]
+/// already strips the terminator before decoding, so the stop is a no-op there.
+pub(crate) fn decode_ansi_lossy(bytes: &[u8]) -> String {
+    let head = bytes
+        .iter()
+        .take_while(|&&byte| byte != 0)
+        .copied()
+        .collect::<Vec<u8>>();
+    match std::str::from_utf8(&head) {
+        Ok(valid) => valid.to_owned(),
+        Err(_) => {
+            let (decoded, _, _) = encoding_rs::WINDOWS_1252.decode(&head);
+            decoded.into_owned()
+        }
+    }
+}
+
 pub(crate) fn read_ansi_lossy(
     engine: &mut dyn wie_cpu::CpuEngine,
     address: u64,
     max_bytes: usize,
 ) -> Result<String> {
     let bytes = read_ansi_bytes(engine, address, max_bytes)?;
-    // A-strings are UTF-8 in WIE when the guest was compiled with mingw (the
-    // toolchain stores string literals as UTF-8); real Windows binaries pass
-    // ACP-encoded strings. Bytes that are not valid UTF-8 therefore fall back
-    // to a strict Windows-1252 decode — the WHATWG codec, identical to
-    // Windows codepage 1252 including the 0x80–0x9F C1 range.
-    match std::str::from_utf8(&bytes) {
-        Ok(valid_utf8) => Ok(valid_utf8.to_owned()),
-        Err(_) => {
-            let (decoded, _, _) = encoding_rs::WINDOWS_1252.decode(&bytes);
-            Ok(decoded.into_owned())
-        }
-    }
+    Ok(decode_ansi_lossy(&bytes))
 }
 
 /// Read raw ANSI bytes (NUL-terminated), excluding the terminator.
@@ -100,6 +116,22 @@ pub(crate) fn read_ansi_bytes(
     }
 
     Ok(bytes)
+}
+
+/// Decode a host unit slice as a UTF-16 string (the W-path decode), stopping
+/// at the first NUL unit.
+///
+/// Fixed-size buffers (a `WCHAR[32]` face name) carry uninitialized garbage
+/// past the terminator, so the decode must stop at the NUL unit.
+/// [`read_utf16_lossy`]'s read loop already stops at the NUL, so the stop is
+/// a no-op there.
+pub(crate) fn decode_utf16_lossy(units: &[u16]) -> String {
+    let head = units
+        .iter()
+        .take_while(|&&unit| unit != 0)
+        .copied()
+        .collect::<Vec<u16>>();
+    String::from_utf16_lossy(&head)
 }
 
 pub(crate) fn read_utf16_lossy(
@@ -161,7 +193,7 @@ pub(crate) fn read_utf16_lossy(
         remaining_units = remaining_units.saturating_sub(got_pairs >> 1);
     }
 
-    Ok(String::from_utf16_lossy(&units))
+    Ok(decode_utf16_lossy(&units))
 }
 
 pub(crate) fn write_utf16_units(
@@ -465,6 +497,25 @@ mod tests {
     }
 
     // --- read_ansi_lossy (the A read path) ---
+
+    #[test]
+    fn decode_ansi_lossy_stops_at_nul_and_decodes_utf8_then_cp1252() {
+        // The shared decode behind read_ansi_lossy and the fixed-size LOGFONT
+        // face-name read: bytes past the terminator must not leak into text.
+        assert_eq!(decode_ansi_lossy(b"caf\xC3\xA9\0garbage"), "café");
+        assert_eq!(decode_ansi_lossy(&[0x63, 0xE9, 0x00, 0xFF]), "cé");
+        assert_eq!(decode_ansi_lossy(b"\x80\0"), "€");
+        assert_eq!(decode_ansi_lossy(b""), "");
+    }
+
+    #[test]
+    fn decode_utf16_lossy_stops_at_nul_unit() {
+        let mut units = "Segoe".encode_utf16().collect::<Vec<u16>>();
+        units.push(0);
+        units.push(0xDEAD);
+        assert_eq!(decode_utf16_lossy(&units), "Segoe");
+        assert_eq!(decode_utf16_lossy(&[]), "");
+    }
 
     #[test]
     fn read_ansi_lossy_decodes_utf8_literals_first() {

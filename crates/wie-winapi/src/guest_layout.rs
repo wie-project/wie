@@ -1947,6 +1947,7 @@ mod tests {
         })
         .expect("staged typed read");
     }
+
     // ── gdi32 lane: TEXTMETRIC / LOGFONT / RECT / SIZE / BITMAP ─────────
 
     const TM_A_VA: u64 = 0x6000;
@@ -2716,6 +2717,7 @@ mod tests {
         .expect("typed TRACKMOUSEEVENT read");
     }
 }
+
 // --- kernel32 lane: WIN32_FIND_DATA header / STARTUPINFO / BY_HANDLE_FILE_INFORMATION / ---
 // --- WIN32_FILE_ATTRIBUTE_DATA / SYSTEMTIME (sizes verified against mingw-w64 14.0.0) ---
 
@@ -3634,7 +3636,9 @@ mod kernel32_lane_tests {
 #[allow(clippy::expect_used)]
 mod comdlg32_lane_tests {
     use super::*;
-    use crate::guest_memory::{with_typed_read, with_typed_write};
+    use crate::guest_memory::{
+        read_typed_copy, with_typed_read, with_typed_write, write_typed_copy,
+    };
     use wie_cpu::{CpuEngine, IcedCpu, RwxPerms};
 
     /// Minimal engine with mapped guest memory for view round-trips. Each
@@ -3831,15 +3835,10 @@ mod comdlg32_lane_tests {
             .mem_write(va, &bytes)
             .expect("write raw OPENFILENAME");
 
-        let mut ofn = with_typed_read::<OpenFileName, _, _>(&mut engine, va, |ofn| Ok(*ofn))
-            .expect("typed read");
+        let mut ofn = read_typed_copy::<OpenFileName>(&mut engine, va).expect("typed read");
         ofn.n_file_offset = 9;
         ofn.n_file_extension = 15;
-        with_typed_write::<OpenFileName, _, _>(&mut engine, va, |ofn_view| {
-            *ofn_view = ofn;
-            Ok(())
-        })
-        .expect("typed write-back");
+        write_typed_copy(&mut engine, va, ofn).expect("typed write-back");
         let after = raw_bytes(&mut engine, va, 152);
         assert_eq!(&after[0..4], &152_u32.to_le_bytes());
         assert_eq!(&after[8..16], &0x00AA_0001_u64.to_le_bytes());

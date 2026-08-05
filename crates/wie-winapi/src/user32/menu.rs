@@ -1,7 +1,7 @@
 use super::{
     Context, Result, WinApiHandlerResult, WinApiState, WindowClassRecord, allocate_menu_handle,
-    read_guest_ansi_lossy, read_guest_utf16_lossy, with_typed_read, with_typed_write,
-    write_guest_ansi_c_string, write_guest_utf16_c_string,
+    read_guest_ansi_lossy, read_guest_utf16_lossy, read_typed_copy, write_guest_ansi_c_string,
+    write_guest_utf16_c_string, write_typed_copy,
 };
 use crate::HandlerContext;
 use crate::guest_layout::MenuItemInfo;
@@ -878,10 +878,11 @@ fn fill_menu_item_info(
     // MENUITEMINFO is an in/out struct: the guest's untouched fields (cbSize,
     // hSubMenu, hbmp*, dwItemData, hbmpItem) must survive the write. Snapshot
     // the whole struct (it is Copy), edit the mask-selected fields, write it
-    // back — two shared-lock borrows. The layout + pinned offsets (dwTypeData
-    // @56, cch @64) live in `crate::guest_layout::MenuItemInfo`.
-    let mut info = with_typed_read::<MenuItemInfo, _, _>(engine, info_ptr, |view| Ok(*view))
-        .context("failed to read MENUITEMINFO")?;
+    // back — two shared-lock borrows with engine I/O (the string writes)
+    // between them. The layout + pinned offsets (dwTypeData @56, cch @64)
+    // live in `crate::guest_layout::MenuItemInfo`.
+    let mut info =
+        read_typed_copy::<MenuItemInfo>(engine, info_ptr).context("failed to read MENUITEMINFO")?;
 
     if info.f_mask & MIIM_STATE != 0 {
         info.f_state = item.flags & 0x00ff;
@@ -906,11 +907,7 @@ fn fill_menu_item_info(
         }
     }
 
-    with_typed_write::<MenuItemInfo, _, _>(engine, info_ptr, |view| {
-        *view = info;
-        Ok(())
-    })
-    .context("failed to write MENUITEMINFO")?;
+    write_typed_copy(engine, info_ptr, info).context("failed to write MENUITEMINFO")?;
 
     Ok(true)
 }

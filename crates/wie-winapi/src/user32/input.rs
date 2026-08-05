@@ -51,7 +51,7 @@ pub fn handle_track_mouse_event(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
             with_typed_read::<TrackMouseEvent, _, _>(engine, track_mouse_event_ptr, |tme| {
                 Ok((tme.flags, tme.track_window_handle))
             })
-            .map_or((0, 0), |decoded| decoded);
+            .unwrap_or((0, 0));
 
         if hwnd_track != 0 && super::is_known_window(state, hwnd_track) {
             if flags & TME_CANCEL != 0 {

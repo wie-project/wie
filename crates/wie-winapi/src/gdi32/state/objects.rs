@@ -7,7 +7,8 @@ use crate::guest_memory::{
     write_u64 as write_guest_u64,
 };
 use crate::guest_string::{
-    read_ansi_lossy as read_guest_ansi_lossy, read_utf16_lossy as read_guest_utf16_lossy,
+    decode_ansi_lossy, decode_utf16_lossy, read_ansi_lossy as read_guest_ansi_lossy,
+    read_utf16_lossy as read_guest_utf16_lossy,
 };
 use crate::handles::Hdc;
 use crate::user32::low_i32;
@@ -379,7 +380,7 @@ fn handle_create_font_indirect_impl(
                 lf.italic != 0,
                 lf.charset,
                 lf.pitch_and_family,
-                decode_wide_face_name(&lf.face_name),
+                decode_utf16_lossy(&lf.face_name),
             ))
         })
     } else {
@@ -390,7 +391,7 @@ fn handle_create_font_indirect_impl(
                 lf.italic != 0,
                 lf.charset,
                 lf.pitch_and_family,
-                decode_ansi_face_name(&lf.face_name),
+                decode_ansi_lossy(&lf.face_name),
             ))
         })
     }
@@ -421,39 +422,6 @@ fn handle_create_font_indirect_impl(
         return_address,
         return_value: handle.as_u64(),
     })
-}
-
-/// Decode a NUL-terminated `CHAR[32]` face name from the LOGFONTA struct
-/// bytes.
-///
-/// Mirrors `read_ansi_lossy`: mingw stores A string literals as UTF-8; real
-/// Windows binaries pass ACP-encoded bytes, so invalid UTF-8 falls back to a
-/// strict Windows-1252 decode (the WHATWG codec, identical to codepage 1252
-/// including the 0x80–0x9F C1 range).
-fn decode_ansi_face_name(bytes: &[u8; 32]) -> String {
-    let head = bytes
-        .iter()
-        .take_while(|&&byte| byte != 0)
-        .copied()
-        .collect::<Vec<u8>>();
-    match std::str::from_utf8(&head) {
-        Ok(valid) => valid.to_owned(),
-        Err(_) => {
-            let (decoded, _, _) = encoding_rs::WINDOWS_1252.decode(&head);
-            decoded.into_owned()
-        }
-    }
-}
-
-/// Decode a NUL-terminated `WCHAR[32]` face name from the LOGFONTW struct
-/// units (UTF-16LE; the host is little-endian).
-fn decode_wide_face_name(units: &[u16; 32]) -> String {
-    let head = units
-        .iter()
-        .take_while(|&&unit| unit != 0)
-        .copied()
-        .collect::<Vec<u16>>();
-    String::from_utf16_lossy(&head)
 }
 
 /// Resolve the font currently selected into `dc_handle` through the font

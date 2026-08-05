@@ -246,3 +246,36 @@ where
         .context("failed to stage-write typed struct to guest memory")?;
     Ok(result)
 }
+
+/// Read a whole guest struct into a host copy (the read-modify-write
+/// snapshot).
+///
+/// The in/out structs (`MENUITEMINFO`, `OPENFILENAME`) are read into a `Copy`
+/// value, edited on the host copy (which may touch the engine between read
+/// and write — the string writes), then committed whole with
+/// [`write_typed_copy`], so the guest's untouched fields and pad bytes
+/// survive. This is the `with_typed_read` form that copies the whole struct
+/// out; see [`with_typed_read`] for the borrow rule and staging fallback.
+pub(crate) fn read_typed_copy<T>(engine: &mut dyn CpuEngine, address: u64) -> Result<T>
+where
+    T: KnownLayout + Immutable + FromBytes + Copy,
+{
+    with_typed_read::<T, _, _>(engine, address, |view| Ok(*view))
+}
+
+/// Write a whole host struct copy back to a guest address (the
+/// read-modify-write commit).
+///
+/// The zero-fill write view is overwritten field-for-field by `value`, so the
+/// snapshot's pad bytes (carried by the copy) land in the guest unchanged —
+/// the in/out semantics real Windows structs use. See [`with_typed_write`]
+/// for the borrow rule and staging fallback.
+pub(crate) fn write_typed_copy<T>(engine: &mut dyn CpuEngine, address: u64, value: T) -> Result<()>
+where
+    T: KnownLayout + FromBytes + IntoBytes + Immutable,
+{
+    with_typed_write::<T, _, _>(engine, address, |view| {
+        *view = value;
+        Ok(())
+    })
+}
