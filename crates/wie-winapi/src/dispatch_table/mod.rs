@@ -542,6 +542,34 @@ pub enum WinApiId {
     Gdi32Rectangle = 462,
     /// Appended here (not adjacent to Gdi32Rectangle) to avoid renumbering the entire enum.
     User32Inflaterect = 463,
+    /// Appended here (not adjacent to the other D3D9 ids) to avoid renumbering the entire enum.
+    D3d9Idirect3dvertexbuffer9Queryinterface = 464,
+    /// Appended here (not adjacent to the other D3D9 ids) to avoid renumbering the entire enum.
+    D3d9Idirect3dvertexbuffer9Addref = 465,
+    /// Appended here (not adjacent to the other D3D9 ids) to avoid renumbering the entire enum.
+    D3d9Idirect3dvertexbuffer9Release = 466,
+    /// Appended here (not adjacent to the other D3D9 ids) to avoid renumbering the entire enum.
+    D3d9Idirect3dvertexbuffer9Lock = 467,
+    /// Appended here (not adjacent to the other D3D9 ids) to avoid renumbering the entire enum.
+    D3d9Idirect3dvertexbuffer9Unlock = 468,
+    /// Appended here (not adjacent to the other D3D9 ids) to avoid renumbering the entire enum.
+    D3d9Idirect3dvertexbuffer9Getdesc = 469,
+    /// Appended here (not adjacent to the other D3D9 ids) to avoid renumbering the entire enum.
+    D3d9Idirect3dindexbuffer9Queryinterface = 470,
+    /// Appended here (not adjacent to the other D3D9 ids) to avoid renumbering the entire enum.
+    D3d9Idirect3dindexbuffer9Addref = 471,
+    /// Appended here (not adjacent to the other D3D9 ids) to avoid renumbering the entire enum.
+    D3d9Idirect3dindexbuffer9Release = 472,
+    /// Appended here (not adjacent to the other D3D9 ids) to avoid renumbering the entire enum.
+    D3d9Idirect3dindexbuffer9Lock = 473,
+    /// Appended here (not adjacent to the other D3D9 ids) to avoid renumbering the entire enum.
+    D3d9Idirect3dindexbuffer9Unlock = 474,
+    /// Appended here (not adjacent to the other D3D9 ids) to avoid renumbering the entire enum.
+    D3d9Idirect3dindexbuffer9Getdesc = 475,
+    /// Appended here (not adjacent to the other D3D9 ids) to avoid renumbering the entire enum.
+    D3d9Idirect3ddevice9Getstreamsource = 476,
+    /// Appended here (not adjacent to the other D3D9 ids) to avoid renumbering the entire enum.
+    D3d9Idirect3ddevice9Getindices = 477,
 }
 
 /// Number of dense [`WinApiId`] discriminants, i.e. one past the highest one.
@@ -549,10 +577,10 @@ pub enum WinApiId {
 /// This is the size every discriminant-indexed array (`WINAPI_TRAITS`) needs,
 /// and it is NOT the same as strum's variant count: the enum has two
 /// discriminant holes (109/110, from APIs removed before the appends began), so
-/// `WinApiId::COUNT` is 462 while the highest discriminant is 463. Deriving
+/// `WinApiId::COUNT` is 476 while the highest discriminant is 477. Deriving
 /// from the final variant keeps the alias correct by construction: appending a
 /// variant with a higher discriminant updates this constant with it.
-pub const WINAPI_ID_COUNT: usize = WinApiId::User32Inflaterect.to_u16() as usize + 1;
+pub const WINAPI_ID_COUNT: usize = WinApiId::D3d9Idirect3ddevice9Getindices.to_u16() as usize + 1;
 
 impl WinApiId {
     /// Discriminant as `u16` (`#[repr(u16)]`).
@@ -956,6 +984,24 @@ pub fn dispatch_winapi_id(
         }
         WinApiId::D3d9Idirect3dpixelshader9Release => d3d9::handle_pixel_shader_release(ctx),
         WinApiId::D3d9Idirect3dvertexshader9Release => d3d9::handle_vertex_shader_release(ctx),
+        WinApiId::D3d9Idirect3dvertexbuffer9Queryinterface => {
+            d3d9::handle_vertex_buffer_query_interface(ctx)
+        }
+        WinApiId::D3d9Idirect3dvertexbuffer9Addref => d3d9::handle_vertex_buffer_add_ref(ctx),
+        WinApiId::D3d9Idirect3dvertexbuffer9Release => d3d9::handle_vertex_buffer_release(ctx),
+        WinApiId::D3d9Idirect3dvertexbuffer9Lock => d3d9::handle_vertex_buffer_lock(ctx),
+        WinApiId::D3d9Idirect3dvertexbuffer9Unlock => d3d9::handle_vertex_buffer_unlock(ctx),
+        WinApiId::D3d9Idirect3dvertexbuffer9Getdesc => d3d9::handle_vertex_buffer_get_desc(ctx),
+        WinApiId::D3d9Idirect3dindexbuffer9Queryinterface => {
+            d3d9::handle_index_buffer_query_interface(ctx)
+        }
+        WinApiId::D3d9Idirect3dindexbuffer9Addref => d3d9::handle_index_buffer_add_ref(ctx),
+        WinApiId::D3d9Idirect3dindexbuffer9Release => d3d9::handle_index_buffer_release(ctx),
+        WinApiId::D3d9Idirect3dindexbuffer9Lock => d3d9::handle_index_buffer_lock(ctx),
+        WinApiId::D3d9Idirect3dindexbuffer9Unlock => d3d9::handle_index_buffer_unlock(ctx),
+        WinApiId::D3d9Idirect3dindexbuffer9Getdesc => d3d9::handle_index_buffer_get_desc(ctx),
+        WinApiId::D3d9Idirect3ddevice9Getstreamsource => d3d9::handle_get_stream_source(ctx),
+        WinApiId::D3d9Idirect3ddevice9Getindices => d3d9::handle_get_indices(ctx),
         WinApiId::User32Enablemenuitem => user32::handle_enable_menu_item(ctx),
         WinApiId::User32Checkmenuitem => user32::handle_check_menu_item(ctx),
         WinApiId::User32Getmessagea => user32::handle_get_message_a(ctx),
@@ -1338,10 +1384,10 @@ mod tests {
     /// an append/renumber/backfill shows up as a test diff.
     #[test]
     fn count_is_pinned_to_enum() {
-        let last_plus_one = usize::from(WinApiId::User32Inflaterect.to_u16()) + 1;
+        let last_plus_one = usize::from(WinApiId::D3d9Idirect3ddevice9Getindices.to_u16()) + 1;
         assert_eq!(WINAPI_ID_COUNT, last_plus_one);
-        assert_eq!(WINAPI_ID_COUNT, 464);
-        assert_eq!(WinApiId::COUNT, 462); // 462 variants, two discriminant holes
+        assert_eq!(WINAPI_ID_COUNT, 478);
+        assert_eq!(WinApiId::COUNT, 476); // 476 variants, two discriminant holes
     }
 
     /// Every discriminant is either a round-trippable variant (its `to_u16`
@@ -1360,6 +1406,6 @@ mod tests {
         }
         // The final variant is exactly the highest discriminant.
         let last = u16::try_from(WINAPI_ID_COUNT - 1).expect("count fits u16");
-        assert_eq!(WinApiId::User32Inflaterect.to_u16(), last);
+        assert_eq!(WinApiId::D3d9Idirect3ddevice9Getindices.to_u16(), last);
     }
 }

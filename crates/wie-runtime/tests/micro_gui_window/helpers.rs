@@ -166,13 +166,16 @@ pub(crate) const D3D9_NEAR_DEPTH_0RGB: u32 = 0x00FF_FFFF;
 /// CI-gated hash of gui_d3d9's deterministic resting frame (320×240).
 ///
 /// The frame is the clear-red backbuffer with the gradient triangle, the cyan
-/// indexed triangle, the 2x2 textured quad, the P4c alpha-blended quads, and
-/// the P4c depth-tested quads (rows 200..800 of the GDI hash do not apply —
-/// the D3D9 frame is fully deterministic CPU output). Recompute with
+/// indexed triangle, the 2x2 textured quad, the P4c alpha-blended quads, the
+/// P4c depth-tested quads, the L1 vs_2_0-driven textured quad, and the L1
+/// w-skewed quad whose perspective-correct center pixel (165,175) samples the
+/// RED texel (affine interpolation would sample GREEN). Recompute with
 /// `./target/debug/wie-cli run --screenshot /tmp/d.bmp \
 /// micro-exes/out/gui_d3d9.exe` then FNV-1a 64 over the full 0RGB pixel bytes.
-/// Recomputed when P4c added the blend + depth quads.
-pub(crate) const D3D9_RESTING_FRAME_HASH: u64 = 0x28C1_AE13_5D5C_D9D0;
+/// Recomputed when the L1 lane added the vs_2_0 + w-skewed quads (the
+/// deliberate D3D9_RESTING_FRAME_HASH tripwire for the perspective-correct
+/// interpolation change).
+pub(crate) const D3D9_RESTING_FRAME_HASH: u64 = 0x8815_977E_652E_C6E7;
 
 /// Verify the deterministic frame's pixel content: the gradient survives the
 /// WS_CLIPCHILDREN-clipped blit, the DIB text drew white glyph ink, and the

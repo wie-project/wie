@@ -245,20 +245,36 @@ pub struct ShaderRecord {
 }
 
 /// Register-file selector of one operand.
+///
+/// The enum is shared between the pixel and vertex stages — the shader kind
+/// decides the meaning of the shared type values (`Texture` = `tN` texture
+/// coordinates in pixel shaders, the `a0` address register in vertex shaders).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegType {
     /// `rN` — temporary register file.
     Temp,
-    /// `vN` — interpolated input register file.
+    /// `vN` — interpolated input register file (pixel shaders) / the
+    /// FVF-stream vertex input registers `v0..v15` (vertex shaders).
     Input,
     /// `cN` — constant register file.
     Const,
-    /// `tN` — texture-coordinate register file (pixel shaders).
+    /// `tN` — texture-coordinate register file (pixel shaders) / the `a0`
+    /// address register (vertex shaders; written by `mova`, which is L5).
     Texture,
     /// `oC0` — color output register (pixel shader destination).
     ColorOut,
     /// `oDepth` — depth output register (pixel shader; stored, not applied).
     DepthOut,
+    /// `oPos`/`oFog`/`oPts` — rasterizer-output registers (vertex shaders).
+    RastOut,
+    /// `oD0`/`oD1` — vertex color output registers.
+    AttrOut,
+    /// `oT0..oT7` — vertex texture-coordinate output registers.
+    TexcrdOut,
+    /// `bN` — boolean constant registers (vertex shaders).
+    ConstBool,
+    /// `iN` — integer loop registers (vertex shaders; the loop ops are L5).
+    Loop,
     /// `sN` — sampler register file (texld sources).
     Sampler,
     /// Unmodeled register file (raw value preserved).
@@ -423,8 +439,13 @@ fn parse_operand(token: u32) -> Operand {
         D3DSPR_INPUT => RegType::Input,
         D3DSPR_CONST => RegType::Const,
         D3DSPR_TEXTURE => RegType::Texture,
+        D3DSPR_RASTOUT => RegType::RastOut,
+        D3DSPR_ATTROUT => RegType::AttrOut,
+        D3DSPR_TEXCRDOUT => RegType::TexcrdOut,
         D3DSPR_COLOROUT => RegType::ColorOut,
         D3DSPR_DEPTHOUT => RegType::DepthOut,
+        D3DSPR_CONSTBOOL => RegType::ConstBool,
+        D3DSPR_LOOP => RegType::Loop,
         D3DSPR_SAMPLER => RegType::Sampler,
         other => RegType::Other(other),
     };

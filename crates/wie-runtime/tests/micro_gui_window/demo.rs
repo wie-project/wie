@@ -87,6 +87,17 @@ fn gui_d3d9_renders_clear_and_triangle() {
                 // does not cover; the near (z=0.1) white wins the overlap.
                 && frame.pixels.get(idx(30, 120)).copied() == Some(D3D9_FAR_DEPTH_0RGB)
                 && frame.pixels.get(idx(80, 120)).copied() == Some(D3D9_NEAR_DEPTH_0RGB)
+                // L1 vs_2_0 quad: the VS transform + oT0/oD0 passthrough
+                // render the 2x2 checkerboard at x∈[220,290], y∈[150,220].
+                && frame.pixels.get(idx(237, 202)).copied() == Some(D3D9_QUAD_RED_0RGB)
+                && frame.pixels.get(idx(272, 202)).copied() == Some(D3D9_QUAD_GREEN_0RGB)
+                && frame.pixels.get(idx(237, 167)).copied() == Some(D3D9_QUAD_BLUE_0RGB)
+                && frame.pixels.get(idx(272, 167)).copied() == Some(D3D9_QUAD_WHITE_0RGB)
+                // L1 w-skewed quad: the center pixel (165,175) samples the
+                // RED texel — the perspective-correct uv (≈(0.499,0.499))
+                // after the w-divide, where the affine interpolant
+                // (≈(0.532,0.466)) would land on the GREEN texel.
+                && frame.pixels.get(idx(165, 175)).copied() == Some(D3D9_QUAD_RED_0RGB)
                 // The whole 320x240 frame is deterministic CPU output — gate it.
                 && frame_hash(&frame, 0, frame.height) == D3D9_RESTING_FRAME_HASH
             {
@@ -110,14 +121,16 @@ fn gui_d3d9_renders_clear_and_triangle() {
         Some(0),
         "gui_d3d9.exe must exit 0 (proves CreateDevice → Clear → BeginScene → \
          DrawPrimitiveUP → DrawIndexedPrimitiveUP → CreateTexture → LockRect → \
-         UnlockRect → SetTexture → textured DrawPrimitiveUP → EndScene → Present \
-         all succeeded and caps honesty held); got {exit_code:?}"
+         UnlockRect → SetTexture → textured DrawPrimitiveUP → CreateVertexShader \
+         (vs_2_0 gate) → SetVertexShader → vs_2_0 DrawPrimitiveUP → the \
+         w-skewed-quad SetTransform → EndScene → Present all succeeded and \
+         caps honesty held); got {exit_code:?}"
     );
     assert!(
         saw_d3d9_frame,
         "the D3D9 frame (clear red + gradient triangle + cyan indexed \
-         triangle + textured quad) was never observed in the device window's \
-         published surface"
+         triangle + textured quad + vs_2_0 quad + w-skewed quad) was never \
+         observed in the device window's published surface"
     );
 }
 

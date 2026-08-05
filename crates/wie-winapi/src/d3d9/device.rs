@@ -10,13 +10,15 @@
 
 use anyhow::{Context, Result};
 
+use super::buffer::{BufferKind, create_buffer_record};
 use super::raster::{
-    draw_vertex_stream, fill_backbuffer_rect, parse_mat4, primitive_vertex_count, read_f32_at,
-    read_u32_at,
+    draw_vertex_stream, draw_vertex_stream_host, fill_backbuffer_rect, parse_mat4,
+    primitive_vertex_count, read_f32_at, read_u32_at,
 };
 use super::{
-    D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DERR_INVALIDCALL, D3DTS_PROJECTION, D3DTS_VIEW,
-    D3DTS_WORLD, IDIRECT3D9_OBJECT_OFFSET, IDIRECT3DDEVICE9_OBJECT_OFFSET, read_stack_argument,
+    D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DERR_INVALIDCALL, D3DFMT_INDEX16, D3DFMT_INDEX32,
+    D3DTS_PROJECTION, D3DTS_VIEW, D3DTS_WORLD, IDIRECT3D9_OBJECT_OFFSET,
+    IDIRECT3DDEVICE9_OBJECT_OFFSET, read_stack_argument,
 };
 use crate::d3d9_render::{
     D3DRS_ALPHABLENDENABLE, D3DRS_BLENDOP, D3DRS_DESTBLEND, D3DRS_SRCBLEND, D3DRS_ZENABLE,
@@ -25,7 +27,8 @@ use crate::d3d9_render::{
     D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DTSS_TEXCOORDINDEX, D3dBlend, D3dBlendOp,
     D3dCmpFunc, D3dZBufferType, RenderState, TextureStageState, parse_fvf,
 };
-use crate::guest_memory::write_u64 as write_guest_u64;
+use crate::fake_va::D3d9Iface;
+use crate::guest_memory::{write_u32 as write_guest_u32, write_u64 as write_guest_u64};
 use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 
 /// Handles `IDirect3DDevice9::SetFVF`.
@@ -266,6 +269,14 @@ pub fn handle_device_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
             state.d3d9().d3d9_present_hwnd = crate::handles::Hwnd::NULL;
             state.d3d9().d3d9_scene_active = crate::state::SceneState::Inactive;
             state.d3d9().d3d9_dirty = None;
+            // L2: the vertex/index buffers are device-owned COM objects — drop
+            // their records (their vtable blocks are freed by the guest's own
+            // Release calls, which normally precede device teardown).
+            state.d3d9().d3d9_buffers.clear();
+            state.d3d9().d3d9_stream_source_va = 0;
+            state.d3d9().d3d9_stream_stride = 0;
+            state.d3d9().d3d9_stream_offset = 0;
+            state.d3d9().d3d9_index_buffer_va = 0;
         }
 
         u64::from(remaining_references)
@@ -812,68 +823,197 @@ pub fn handle_draw_indexed_primitive_up(
     })
 }
 
-/// Handles `IDirect3DDevice9::DrawPrimitive` (vtable slot 81).
+/// Handles `IDirect3DDevice9::DrawPrimitive` (vtable slot 81) — the
+/// buffer-form non-indexed draw.
 ///
-/// Slice 1 implements the UP forms only; buffer-form draws require
-/// `CreateVertexBuffer`/`Lock` (new COM interfaces), which are deferred. This
-/// returns success without drawing — the honest outcome, since no valid
-/// vertex buffer can exist while `CreateVertexBuffer` reports failure.
+/// L2: real — reads the vertex buffer bound by `SetStreamSource` (the same
+/// rasterize path as `DrawPrimitiveUP`, with `StartVertex` folding into the
+/// stream base). An unset/invalid stream or a stride smaller than the FVF
+/// layout is the honest `D3DERR_INVALIDCALL`.
 pub fn handle_draw_primitive(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _primitive_type = engine
+    let state = &mut *ctx.state;
+    let _this_pointer = engine
+        .read_rcx()
+        .context("failed to read RCX for DrawPrimitive")?;
+    let primitive_type = engine
         .read_rdx()
         .context("failed to read RDX for DrawPrimitive")?;
-    let _start_vertex = engine
+    let start_vertex = engine
         .read_r8()
         .context("failed to read R8 for DrawPrimitive")?;
-    let _primitive_count = engine
+    let primitive_count = engine
         .read_r9()
         .context("failed to read R9 for DrawPrimitive")?;
 
-    tracing::debug!("DrawPrimitive (buffer form) is a no-op in slice 1");
+    let return_value =
+        draw_buffer_form_common(state, primitive_type, primitive_count, None, start_vertex)?;
 
     let return_address = engine
-        .return_from_win64_api(D3D_OK)
+        .return_from_win64_api(return_value)
         .context("failed to return from DrawPrimitive")?;
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: D3D_OK,
+        return_value,
     })
 }
 
-/// Handles `IDirect3DDevice9::DrawIndexedPrimitive` (vtable slot 82).
+/// Handles `IDirect3DDevice9::DrawIndexedPrimitive` (vtable slot 82) — the
+/// buffer-form indexed draw.
 ///
-/// Buffer form — a no-op in slice 1 (see [`handle_draw_primitive`]).
+/// L2: real — resolves triangle corners through the index buffer bound by
+/// `SetIndices` against the vertex buffer bound by `SetStreamSource`.
+/// `StartIndex` offsets into the index buffer and `BaseVertexIndex` (a
+/// signed `INT`) shifts every resolved vertex position.
 pub fn handle_draw_indexed_primitive(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _primitive_type = engine
+    let state = &mut *ctx.state;
+    let _this_pointer = engine
+        .read_rcx()
+        .context("failed to read RCX for DrawIndexedPrimitive")?;
+    let primitive_type = engine
         .read_rdx()
         .context("failed to read RDX for DrawIndexedPrimitive")?;
-    let _base_vertex_index = engine
+    let base_vertex_index = engine
         .read_r8()
         .context("failed to read R8 for DrawIndexedPrimitive")?;
     let _min_vertex_index = engine
         .read_r9()
         .context("failed to read R9 for DrawIndexedPrimitive")?;
     let _num_vertices = read_stack_argument(engine, 0x28, "DrawIndexedPrimitive NumVertices")?;
-    let _start_index = read_stack_argument(engine, 0x30, "DrawIndexedPrimitive StartIndex")?;
-    let _primitive_count =
-        read_stack_argument(engine, 0x38, "DrawIndexedPrimitive PrimitiveCount")?;
+    let start_index = read_stack_argument(engine, 0x30, "DrawIndexedPrimitive StartIndex")?;
+    let primitive_count = read_stack_argument(engine, 0x38, "DrawIndexedPrimitive PrimitiveCount")?;
 
-    tracing::debug!("DrawIndexedPrimitive (buffer form) is a no-op in slice 1");
+    // The indexed form's index stream offsets into the index buffer, so the
+    // vertex offset is not the start-vertex slot (which the non-indexed form
+    // uses) — pass a per-draw index-stream marker instead.
+    let return_value = draw_buffer_form_common(
+        state,
+        primitive_type,
+        primitive_count,
+        Some((base_vertex_index, start_index)),
+        0,
+    )?;
 
     let return_address = engine
-        .return_from_win64_api(D3D_OK)
+        .return_from_win64_api(return_value)
         .context("failed to return from DrawIndexedPrimitive")?;
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: D3D_OK,
+        return_value,
     })
+}
+
+/// Shared body of the two buffer-form draws.
+///
+/// `indexed` is `Some((base_vertex_index, start_index))` for the indexed
+/// form; `start_vertex` (the non-indexed form's vertex offset) is folded into
+/// the stream base. Reads the `SetStreamSource` vertex buffer and (for the
+/// indexed form) the `SetIndices` index buffer from their host records.
+#[allow(clippy::too_many_arguments)]
+fn draw_buffer_form_common(
+    state: &mut WinApiState,
+    primitive_type: u64,
+    primitive_count: u64,
+    indexed: Option<(u64, u64)>,
+    start_vertex: u64,
+) -> Result<u64> {
+    if state.d3d9().d3d9_scene_active != crate::state::SceneState::Active {
+        return Ok(D3DERR_INVALIDCALL);
+    }
+    let Some(layout) = parse_fvf(state.d3d9().d3d9_current_fvf) else {
+        return Ok(D3DERR_INVALIDCALL);
+    };
+    let (stream_va, stride_u32, stream_offset) = {
+        let d3d = state.d3d9();
+        (
+            d3d.d3d9_stream_source_va,
+            d3d.d3d9_stream_stride,
+            d3d.d3d9_stream_offset,
+        )
+    };
+    let stride = usize::try_from(stride_u32).unwrap_or(0);
+    let layout_stride = usize::try_from(layout.stride).unwrap_or(usize::MAX);
+    if stream_va == 0 || stride < layout_stride {
+        // No stream, or a stride smaller than the FVF's natural size — real
+        // D3D9 rejects both.
+        return Ok(D3DERR_INVALIDCALL);
+    }
+
+    // Clone the vertex slice out of the record so the mutable `state` borrow
+    // below (the rasterizer) is uncontended (the handle_present pattern).
+    let stream_base =
+        u64::from(stream_offset).saturating_add(start_vertex.saturating_mul(u64::from(stride_u32)));
+    let data = {
+        let d3d = state.d3d9();
+        let Some(record) = d3d.d3d9_buffers.get(&stream_va) else {
+            return Ok(D3DERR_INVALIDCALL);
+        };
+        if !matches!(record.kind, BufferKind::Vertex { .. }) {
+            return Ok(D3DERR_INVALIDCALL);
+        }
+        // The stream slice is everything after the base; the rasterizer skips
+        // vertices past the buffer end (out-of-range → no pixels, like the UP
+        // path's bad-pointer skip).
+        record
+            .data
+            .get(usize::try_from(stream_base).unwrap_or(usize::MAX)..)
+            .unwrap_or(&[])
+            .to_vec()
+    };
+    let vertex_count = primitive_vertex_count(primitive_type, primitive_count).unwrap_or(0);
+
+    let (index_data, index_size, index_offset, vertex_base) = match indexed {
+        Some((base_vertex_index, start_index)) => {
+            let index_va = state.d3d9().d3d9_index_buffer_va;
+            if index_va == 0 {
+                return Ok(D3DERR_INVALIDCALL);
+            }
+            let index_bytes = {
+                let d3d = state.d3d9();
+                let Some(index_record) = d3d.d3d9_buffers.get(&index_va) else {
+                    return Ok(D3DERR_INVALIDCALL);
+                };
+                let BufferKind::Index { format } = index_record.kind else {
+                    return Ok(D3DERR_INVALIDCALL);
+                };
+                let index_size =
+                    usize::try_from(if format == D3DFMT_INDEX32 { 4 } else { 2 }).unwrap_or(2);
+                (index_record.data.clone(), index_size)
+            };
+            // BaseVertexIndex is a signed INT: bit 31 is the sign.
+            let base_vertex = i64::try_from(base_vertex_index & u64::from(u32::MAX)).unwrap_or(0);
+            let base_vertex = if base_vertex_index & (1_u64 << 31) != 0 {
+                base_vertex.wrapping_sub(1_i64 << 32)
+            } else {
+                base_vertex
+            };
+            let start = usize::try_from(start_index & u64::from(u32::MAX)).unwrap_or(0);
+            (Some(index_bytes.0), index_bytes.1, start, base_vertex)
+        }
+        None => (None, 0, 0, 0),
+    };
+
+    draw_vertex_stream_host(
+        state,
+        &data,
+        &layout,
+        stride,
+        vertex_count,
+        primitive_type,
+        primitive_count,
+        index_data.as_deref().map(|bytes| (bytes, index_size)),
+        index_offset,
+        vertex_base,
+    )?;
+    Ok(D3D_OK)
 }
 
 /// Handles `IDirect3DDevice9::SetStreamSource` (vtable slot 100).
 ///
-/// Stores stream 0 (used by the deferred buffer-form draws); returns success.
+/// Stores stream 0's vertex buffer (object VA), `OffsetInBytes`, and stride.
+/// A non-NULL stream data must be a known vertex buffer (the honest D3D9
+/// contract — binding garbage must not silently draw nothing later).
 pub fn handle_set_stream_source(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
@@ -886,20 +1026,88 @@ pub fn handle_set_stream_source(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let stream_data = engine
         .read_r8()
         .context("failed to read R8 for SetStreamSource")?;
-    let _offset_in_bytes = engine
+    let offset_in_bytes = engine
         .read_r9()
         .context("failed to read R9 for SetStreamSource")?;
     let stride_raw = read_stack_argument(engine, 0x28, "SetStreamSource Stride")?;
 
-    if stream_number == 0 {
+    let known_buffer = stream_data == 0
+        || state
+            .d3d9()
+            .d3d9_buffers
+            .get(&stream_data)
+            .is_some_and(|record| matches!(record.kind, BufferKind::Vertex { .. }));
+
+    let return_value = if stream_number == 0 && known_buffer {
         state.d3d9().d3d9_stream_source_va = stream_data;
         state.d3d9().d3d9_stream_stride =
             u32::try_from(stride_raw & u64::from(u32::MAX)).unwrap_or(0);
+        state.d3d9().d3d9_stream_offset =
+            u32::try_from(offset_in_bytes & u64::from(u32::MAX)).unwrap_or(0);
+        D3D_OK
+    } else {
+        D3DERR_INVALIDCALL
+    };
+
+    let return_address = engine
+        .return_from_win64_api(return_value)
+        .context("failed to return from SetStreamSource")?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `IDirect3DDevice9::GetStreamSource` (vtable slot 101).
+///
+/// Round-trip getter: writes back the stream-0 buffer, `OffsetInBytes`, and
+/// stride. Streams beyond 0 were never bound (stream 1+ is out of slice 1),
+/// so they read as a NULL buffer with zero offset/stride.
+pub fn handle_get_stream_source(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let _this_pointer = engine
+        .read_rcx()
+        .context("failed to read RCX for GetStreamSource")?;
+    let stream_number = engine
+        .read_rdx()
+        .context("failed to read RDX for GetStreamSource")?;
+    let pp_stream_data = engine
+        .read_r8()
+        .context("failed to read R8 for GetStreamSource")?;
+    let p_offset = engine
+        .read_r9()
+        .context("failed to read R9 for GetStreamSource")?;
+    let p_stride = read_stack_argument(engine, 0x28, "GetStreamSource pStride")?;
+
+    let (stream_va, offset, stride) = if stream_number == 0 {
+        let d3d = state.d3d9();
+        (
+            d3d.d3d9_stream_source_va,
+            d3d.d3d9_stream_offset,
+            d3d.d3d9_stream_stride,
+        )
+    } else {
+        (0, 0, 0)
+    };
+    if pp_stream_data != 0 {
+        write_guest_u64(engine, pp_stream_data, stream_va)
+            .context("failed to write GetStreamSource buffer output")?;
+    }
+    // `pOffsetInBytes` / `pStride` are 4-byte `UINT` out-params — an 8-byte
+    // write would clobber the guest's adjacent stack locals.
+    if p_offset != 0 {
+        write_guest_u32(engine, p_offset, offset)
+            .context("failed to write GetStreamSource offset output")?;
+    }
+    if p_stride != 0 {
+        write_guest_u32(engine, p_stride, stride)
+            .context("failed to write GetStreamSource stride output")?;
     }
 
     let return_address = engine
         .return_from_win64_api(D3D_OK)
-        .context("failed to return from SetStreamSource")?;
+        .context("failed to return from GetStreamSource")?;
     Ok(WinApiHandlerResult {
         return_address,
         return_value: D3D_OK,
@@ -907,6 +1115,9 @@ pub fn handle_set_stream_source(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 }
 
 /// Handles `IDirect3DDevice9::SetIndices` (vtable slot 104).
+///
+/// Binds the index buffer for the buffer-form indexed draws. A non-NULL
+/// pointer must be a known index buffer (the honest D3D9 contract).
 pub fn handle_set_indices(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
@@ -916,11 +1127,51 @@ pub fn handle_set_indices(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     let index_data = engine
         .read_rdx()
         .context("failed to read RDX for SetIndices")?;
-    state.d3d9().d3d9_index_buffer_va = index_data;
+
+    let known_buffer = index_data == 0
+        || state
+            .d3d9()
+            .d3d9_buffers
+            .get(&index_data)
+            .is_some_and(|record| matches!(record.kind, BufferKind::Index { .. }));
+
+    let return_value = if known_buffer {
+        state.d3d9().d3d9_index_buffer_va = index_data;
+        D3D_OK
+    } else {
+        D3DERR_INVALIDCALL
+    };
+
+    let return_address = engine
+        .return_from_win64_api(return_value)
+        .context("failed to return from SetIndices")?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `IDirect3DDevice9::GetIndices` (vtable slot 105).
+///
+/// Round-trip getter: writes back the index buffer bound by `SetIndices`.
+pub fn handle_get_indices(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let _this_pointer = engine
+        .read_rcx()
+        .context("failed to read RCX for GetIndices")?;
+    let pp_index_data = engine
+        .read_rdx()
+        .context("failed to read RDX for GetIndices")?;
+
+    if pp_index_data != 0 {
+        write_guest_u64(engine, pp_index_data, state.d3d9().d3d9_index_buffer_va)
+            .context("failed to write GetIndices output")?;
+    }
 
     let return_address = engine
         .return_from_win64_api(D3D_OK)
-        .context("failed to return from SetIndices")?;
+        .context("failed to return from GetIndices")?;
     Ok(WinApiHandlerResult {
         return_address,
         return_value: D3D_OK,
@@ -929,65 +1180,144 @@ pub fn handle_set_indices(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 
 /// Handles `IDirect3DDevice9::CreateVertexBuffer` (vtable slot 26).
 ///
-/// Slice 1 does not implement buffer-form rendering (no vertex-buffer COM
-/// objects / Lock), so this honestly reports failure — games using buffers
-/// fall back or bail instead of silently rendering nothing.
+/// L2: real — allocates an `IDirect3DVertexBuffer9` object backed by a
+/// host-owned byte store (see [`buffer`](super::buffer) for the lock model).
+/// `Length` must be > 0, the FVF parseable, and the pool not SCRATCH; the
+/// guest fills the buffer through `Lock`/`Unlock`, binds it with
+/// `SetStreamSource`, and the buffer-form draws read the host copy.
 pub fn handle_create_vertex_buffer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _length = engine
+    let state = &mut *ctx.state;
+    let _this_pointer = engine
+        .read_rcx()
+        .context("failed to read RCX for CreateVertexBuffer")?;
+    let length_raw = engine
         .read_rdx()
         .context("failed to read RDX for CreateVertexBuffer")?;
-    let _usage = engine
+    let usage_raw = engine
         .read_r8()
         .context("failed to read R8 for CreateVertexBuffer")?;
-    let _fvf = engine
+    let fvf_raw = engine
         .read_r9()
         .context("failed to read R9 for CreateVertexBuffer")?;
+    let pool_raw = read_stack_argument(engine, 0x28, "CreateVertexBuffer Pool")?;
     let pp_buffer = read_stack_argument(engine, 0x30, "CreateVertexBuffer ppBuffer")?;
-    if pp_buffer != 0 {
-        write_guest_u64(engine, pp_buffer, 0)
-            .context("failed to clear CreateVertexBuffer output pointer")?;
-    }
+    let _shared_handle = read_stack_argument(engine, 0x38, "CreateVertexBuffer pSharedHandle")?;
 
-    tracing::debug!("CreateVertexBuffer unsupported in slice 1 (UP forms only)");
+    let length = u32::try_from(length_raw & u64::from(u32::MAX))
+        .context("CreateVertexBuffer length does not fit u32")?;
+    let usage = u32::try_from(usage_raw & u64::from(u32::MAX))
+        .context("CreateVertexBuffer usage does not fit u32")?;
+    let fvf = u32::try_from(fvf_raw & u64::from(u32::MAX))
+        .context("CreateVertexBuffer FVF does not fit u32")?;
+    let pool = u32::try_from(pool_raw & u64::from(u32::MAX))
+        .context("CreateVertexBuffer pool does not fit u32")?;
+
+    // The FVF must describe a vertex layout the rasterizer can decode; an
+    // unparseable mask (no XYZ/XYZRHW, or both) is a real Create-time error.
+    let valid_fvf = parse_fvf(fvf).is_some();
+    let return_value = if valid_fvf && pp_buffer != 0 {
+        let object = create_buffer_record(
+            engine,
+            state,
+            D3d9Iface::VertexBuffer9,
+            length,
+            usage,
+            pool,
+            fvf,
+        )?;
+        if object == 0 {
+            write_guest_u64(engine, pp_buffer, 0)
+                .context("failed to clear CreateVertexBuffer output pointer")?;
+            D3DERR_INVALIDCALL
+        } else {
+            write_guest_u64(engine, pp_buffer, object)
+                .context("failed to return IDirect3DVertexBuffer9 pointer")?;
+            D3D_OK
+        }
+    } else {
+        if pp_buffer != 0 {
+            write_guest_u64(engine, pp_buffer, 0)
+                .context("failed to clear CreateVertexBuffer output pointer")?;
+        }
+        D3DERR_INVALIDCALL
+    };
 
     let return_address = engine
-        .return_from_win64_api(D3DERR_INVALIDCALL)
+        .return_from_win64_api(return_value)
         .context("failed to return from CreateVertexBuffer")?;
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: D3DERR_INVALIDCALL,
+        return_value,
     })
 }
 
 /// Handles `IDirect3DDevice9::CreateIndexBuffer` (vtable slot 27).
 ///
-/// Slice 1 does not implement buffer-form rendering (see
-/// [`handle_create_vertex_buffer`]).
+/// L2: real — the index-buffer analogue of [`handle_create_vertex_buffer`].
+/// The format must be `D3DFMT_INDEX16` (101) or `D3DFMT_INDEX32` (102); the
+/// index size drives the buffer-form `DrawIndexedPrimitive` fetch.
 pub fn handle_create_index_buffer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _length = engine
+    let state = &mut *ctx.state;
+    let _this_pointer = engine
+        .read_rcx()
+        .context("failed to read RCX for CreateIndexBuffer")?;
+    let length_raw = engine
         .read_rdx()
         .context("failed to read RDX for CreateIndexBuffer")?;
-    let _usage = engine
+    let usage_raw = engine
         .read_r8()
         .context("failed to read R8 for CreateIndexBuffer")?;
-    let _format = engine
+    let format_raw = engine
         .read_r9()
         .context("failed to read R9 for CreateIndexBuffer")?;
+    let pool_raw = read_stack_argument(engine, 0x28, "CreateIndexBuffer Pool")?;
     let pp_buffer = read_stack_argument(engine, 0x30, "CreateIndexBuffer ppBuffer")?;
-    if pp_buffer != 0 {
-        write_guest_u64(engine, pp_buffer, 0)
-            .context("failed to clear CreateIndexBuffer output pointer")?;
-    }
+    let _shared_handle = read_stack_argument(engine, 0x38, "CreateIndexBuffer pSharedHandle")?;
 
-    tracing::debug!("CreateIndexBuffer unsupported in slice 1 (UP forms only)");
+    let length = u32::try_from(length_raw & u64::from(u32::MAX))
+        .context("CreateIndexBuffer length does not fit u32")?;
+    let usage = u32::try_from(usage_raw & u64::from(u32::MAX))
+        .context("CreateIndexBuffer usage does not fit u32")?;
+    let format = u32::try_from(format_raw & u64::from(u32::MAX))
+        .context("CreateIndexBuffer format does not fit u32")?;
+    let pool = u32::try_from(pool_raw & u64::from(u32::MAX))
+        .context("CreateIndexBuffer pool does not fit u32")?;
+
+    let valid_format = matches!(format, D3DFMT_INDEX16 | D3DFMT_INDEX32);
+    let return_value = if valid_format && pp_buffer != 0 {
+        let object = create_buffer_record(
+            engine,
+            state,
+            D3d9Iface::IndexBuffer9,
+            length,
+            usage,
+            pool,
+            format,
+        )?;
+        if object == 0 {
+            write_guest_u64(engine, pp_buffer, 0)
+                .context("failed to clear CreateIndexBuffer output pointer")?;
+            D3DERR_INVALIDCALL
+        } else {
+            write_guest_u64(engine, pp_buffer, object)
+                .context("failed to return IDirect3DIndexBuffer9 pointer")?;
+            D3D_OK
+        }
+    } else {
+        if pp_buffer != 0 {
+            write_guest_u64(engine, pp_buffer, 0)
+                .context("failed to clear CreateIndexBuffer output pointer")?;
+        }
+        D3DERR_INVALIDCALL
+    };
 
     let return_address = engine
-        .return_from_win64_api(D3DERR_INVALIDCALL)
+        .return_from_win64_api(return_value)
         .context("failed to return from CreateIndexBuffer")?;
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: D3DERR_INVALIDCALL,
+        return_value,
     })
 }

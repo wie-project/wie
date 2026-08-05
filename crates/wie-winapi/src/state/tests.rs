@@ -13362,12 +13362,15 @@ fn test_d3d9_caps_declare_pixel_shader_pipeline() {
             .expect("read caps field");
         u32::from_le_bytes(bytes)
     };
-    // Caps honesty: the ps_2_0 interpreter is implemented, so the caps
-    // report D3DPS_VERSION(2,0) and PixelShader1xMaxValue 1.0; the vertex
-    // stage is still FFP (vertex shader execution is not yet implemented),
-    // so VertexShaderVersion stays 0 and MaxVertexShaderConst reports the
-    // vs_2_0 constant file.
-    assert_eq!(read_u32_at(196), 0, "VertexShaderVersion must be 0.0");
+    // Caps honesty: the ps_2_0 interpreter AND the vs_2_0 vertex stage are
+    // implemented, so the caps report D3DPS_VERSION(2,0) and D3DVS_VERSION
+    // (2,0) (0xFFFE0200 — the vs version tag is 0xFFFE0000, not the ps tag's
+    // 0xFFFF0000), PixelShader1xMaxValue 1.0, and the vs_2_0 constant file.
+    assert_eq!(
+        read_u32_at(196),
+        0xFFFE_0200,
+        "VertexShaderVersion must be D3DVS_VERSION(2,0)"
+    );
     assert_eq!(
         read_u32_at(200),
         256,
@@ -14028,6 +14031,422 @@ fn test_d3d9_texture_unlock_with_rect() {
     );
     assert_eq!(record.pixels.get(2).copied(), Some(0));
     assert_eq!(record.pixels.get(3).copied(), Some(0));
+}
+
+#[test]
+fn test_d3d9_vertex_buffer_lifecycle_lock_desc_round_trip() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // Seed the guest heap bump cursor (see the texture round-trip test).
+    engine
+        .mem_write(0x2000, &0x2000_u64.to_le_bytes())
+        .expect("seed bump cursor");
+
+    // CreateVertexBuffer(3 * 20 bytes, usage=WRITEONLY, FVF=XYZRHW|DIFFUSE,
+    // pool=MANAGED) → buffer at 0x7000.
+    let fvf = 0x0004 | 0x0040; // D3DFVF_XYZRHW | D3DFVF_DIFFUSE (stride 20)
+    let pp_buffer = 0x7000_u64;
+    write_regs(&mut engine, 1, 3 * 20, 0x0000_0008, fvf, 0);
+    engine
+        .mem_write(STACK_TOP + 0x28, &1_u32.to_le_bytes()) // D3DPOOL_MANAGED
+        .expect("write pool");
+    engine
+        .mem_write(STACK_TOP + 0x30, &pp_buffer.to_le_bytes())
+        .expect("write ppBuffer");
+    assert_return_value!(
+        d3d9::handle_create_vertex_buffer(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut buf_bytes = [0_u8; 8];
+    engine
+        .mem_read(pp_buffer, &mut buf_bytes)
+        .expect("read buffer ptr");
+    let vb = u64::from_le_bytes(buf_bytes);
+    assert_ne!(vb, 0, "CreateVertexBuffer must return an object");
+
+    // Lock(offset 4, size 0 → rest) → ppbData at 0x7100; fill one vertex.
+    let pp_data = 0x7100_u64;
+    write_regs(&mut engine, vb, 4, 0, pp_data, 0);
+    assert_return_value!(
+        d3d9::handle_vertex_buffer_lock(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut data_bytes = [0_u8; 8];
+    engine
+        .mem_read(pp_data, &mut data_bytes)
+        .expect("read ppbData");
+    let p_data = u64::from_le_bytes(data_bytes);
+    assert_ne!(p_data, 0, "Lock must hand out a guest block");
+    // Write one XYZRHW vertex (16 bytes) + diffuse (red) at the locked block.
+    for (i, v) in [1.0_f32, 2.0, 0.5, 1.0].iter().enumerate() {
+        engine
+            .mem_write(p_data + u64::try_from(i).unwrap_or(0) * 4, &v.to_le_bytes())
+            .expect("write vertex position");
+    }
+    engine
+        .mem_write(p_data + 16, &0xFFFF_0000_u32.to_le_bytes())
+        .expect("write diffuse");
+    assert_return_value!(
+        d3d9::handle_vertex_buffer_unlock(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    // Unlock copied the block back into the host record at the locked offset.
+    let record = state.d3d9().d3d9_buffers.get(&vb).expect("record exists");
+    assert_eq!(record.size, 60);
+    assert_eq!(record.locked_va, 0, "lock state cleared");
+    let mut pos_bytes = [0_u8; 4];
+    engine.mem_read(pp_data, &mut pos_bytes).ok();
+    let _ = pos_bytes;
+    // The guest wrote through the lock block; the host copy must show the
+    // diffuse word at offset 4 + 16 (the locked offset shifted the vertex).
+    let mut diffuse = [0_u8; 4];
+    engine.mem_read(p_data + 16, &mut diffuse).ok();
+    assert_eq!(u32::from_le_bytes(diffuse), 0xFFFF_0000);
+
+    // GetDesc → D3DVERTEXBUFFER_DESC: Type=VERTEXBUFFER(6) @4, Size=60 @16,
+    // FVF @20 (the desc layout verified against d3d9types.h).
+    let desc_va = 0x7200_u64;
+    write_regs(&mut engine, vb, desc_va, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_vertex_buffer_get_desc(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut desc = [0_u8; 24];
+    engine.mem_read(desc_va, &mut desc).expect("read desc");
+    assert_eq!(
+        u32::from_le_bytes(desc[4..8].try_into().unwrap_or([0; 4])),
+        6
+    );
+    assert_eq!(
+        u32::from_le_bytes(desc[12..16].try_into().unwrap_or([0; 4])),
+        1,
+        "pool round-trips"
+    );
+    assert_eq!(
+        u32::from_le_bytes(desc[16..20].try_into().unwrap_or([0; 4])),
+        60,
+        "size round-trips"
+    );
+    assert_eq!(
+        u32::from_le_bytes(desc[20..24].try_into().unwrap_or([0; 4])),
+        u32::try_from(fvf).unwrap_or(0),
+        "FVF round-trips"
+    );
+
+    // AddRef → 2; Release → 1; Release → 0 (record gone, stream unbound).
+    write_regs(&mut engine, vb, 0, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_vertex_buffer_add_ref(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        2
+    );
+    write_regs(&mut engine, vb, 0, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_vertex_buffer_release(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        1
+    );
+    write_regs(&mut engine, vb, 0, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_vertex_buffer_release(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    assert!(!state.d3d9().d3d9_buffers.contains_key(&vb));
+}
+
+#[test]
+fn test_d3d9_buffer_form_draw_indexed_primitive() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // Seed the guest heap bump cursor (see the texture round-trip test).
+    engine
+        .mem_write(0x2000, &0x2000_u64.to_le_bytes())
+        .expect("seed bump cursor");
+
+    // A 4x3 backbuffer, full viewport, FVF = XYZRHW|DIFFUSE (screen-space).
+    let fvf = 0x0004 | 0x0040;
+    {
+        let d3d = state.d3d9();
+        d3d.d3d9_backbuffer_width = 4;
+        d3d.d3d9_backbuffer_height = 3;
+        d3d.d3d9_backbuffer = vec![0_u32; 12];
+        d3d.d3d9_viewport = (0, 0, 4, 3, 0.0, 1.0);
+    }
+    write_regs(&mut engine, 1, fvf, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_set_fvf(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    write_regs(&mut engine, 1, 0, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_begin_scene(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+
+    // CreateVertexBuffer(3 * 20, FVF XYZRHW|DIFFUSE) → 0x7000.
+    let pp_vb = 0x7000_u64;
+    write_regs(&mut engine, 1, 3 * 20, 0, fvf, 0);
+    engine
+        .mem_write(STACK_TOP + 0x28, &1_u32.to_le_bytes())
+        .expect("write pool");
+    engine
+        .mem_write(STACK_TOP + 0x30, &pp_vb.to_le_bytes())
+        .expect("write ppBuffer");
+    assert_return_value!(
+        d3d9::handle_create_vertex_buffer(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut vb_bytes = [0_u8; 8];
+    engine.mem_read(pp_vb, &mut vb_bytes).expect("read vb ptr");
+    let vb = u64::from_le_bytes(vb_bytes);
+
+    // Lock, write a solid-cyan right triangle (0,0)(3,0)(0,2), unlock.
+    let pp_vdata = 0x7100_u64;
+    write_regs(&mut engine, vb, 0, 0, pp_vdata, 0);
+    assert_return_value!(
+        d3d9::handle_vertex_buffer_lock(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut vdata_bytes = [0_u8; 8];
+    engine
+        .mem_read(pp_vdata, &mut vdata_bytes)
+        .expect("read vdata");
+    let vdata = u64::from_le_bytes(vdata_bytes);
+    let verts = [
+        (0.0_f32, 0.0_f32, 0.5_f32, 1.0_f32, 0xFF00_FFFF_u32), // cyan
+        (3.0_f32, 0.0_f32, 0.5_f32, 1.0_f32, 0xFF00_FFFF_u32),
+        (0.0_f32, 2.0_f32, 0.5_f32, 1.0_f32, 0xFF00_FFFF_u32),
+    ];
+    for (i, (x, y, z, rhw, color)) in verts.iter().enumerate() {
+        let base = vdata + u64::try_from(i).unwrap_or(0) * 20;
+        for (j, v) in [x, y, z, rhw].iter().enumerate() {
+            engine
+                .mem_write(base + u64::try_from(j).unwrap_or(0) * 4, &v.to_le_bytes())
+                .expect("write vertex");
+        }
+        engine
+            .mem_write(base + 16, &color.to_le_bytes())
+            .expect("write diffuse");
+    }
+    assert_return_value!(
+        d3d9::handle_vertex_buffer_unlock(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+
+    // CreateIndexBuffer(3 * 2 bytes, INDEX16) → 0x7500; fill {0,1,2}.
+    let pp_ib = 0x7500_u64;
+    write_regs(&mut engine, 1, 6, 0, 101, 0); // D3DFMT_INDEX16 = 101
+    engine
+        .mem_write(STACK_TOP + 0x28, &1_u32.to_le_bytes())
+        .expect("write pool");
+    engine
+        .mem_write(STACK_TOP + 0x30, &pp_ib.to_le_bytes())
+        .expect("write ppBuffer");
+    assert_return_value!(
+        d3d9::handle_create_index_buffer(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut ib_bytes = [0_u8; 8];
+    engine.mem_read(pp_ib, &mut ib_bytes).expect("read ib ptr");
+    let ib = u64::from_le_bytes(ib_bytes);
+    let pp_idata = 0x7600_u64;
+    write_regs(&mut engine, ib, 0, 0, pp_idata, 0);
+    assert_return_value!(
+        d3d9::handle_index_buffer_lock(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut idata_bytes = [0_u8; 8];
+    engine
+        .mem_read(pp_idata, &mut idata_bytes)
+        .expect("read idata");
+    let idata = u64::from_le_bytes(idata_bytes);
+    for (i, idx) in [0_u16, 1, 2].iter().enumerate() {
+        engine
+            .mem_write(
+                idata + u64::try_from(i).unwrap_or(0) * 2,
+                &idx.to_le_bytes(),
+            )
+            .expect("write index");
+    }
+    assert_return_value!(
+        d3d9::handle_index_buffer_unlock(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+
+    // SetStreamSource(0, vb, offset 0, stride 20); SetIndices(ib).
+    write_regs(&mut engine, 1, 0, vb, 0, 0);
+    engine
+        .mem_write(STACK_TOP + 0x28, &20_u32.to_le_bytes())
+        .expect("write stride");
+    assert_return_value!(
+        d3d9::handle_set_stream_source(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    write_regs(&mut engine, 1, ib, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_set_indices(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+
+    // The L2 round-trip getters return the bound objects.
+    let out_vb = 0x7700_u64;
+    let out_off = 0x7780_u64;
+    let out_stride = 0x7800_u64;
+    write_regs(&mut engine, 1, 0, out_vb, out_off, 0);
+    engine
+        .mem_write(STACK_TOP + 0x28, &out_stride.to_le_bytes())
+        .expect("write pStride");
+    assert_return_value!(
+        d3d9::handle_get_stream_source(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut out_bytes = [0_u8; 8];
+    engine
+        .mem_read(out_vb, &mut out_bytes)
+        .expect("read vb out");
+    assert_eq!(u64::from_le_bytes(out_bytes), vb);
+    engine
+        .mem_read(out_off, &mut out_bytes)
+        .expect("read offset out");
+    assert_eq!(u64::from_le_bytes(out_bytes), 0);
+    engine
+        .mem_read(out_stride, &mut out_bytes)
+        .expect("read stride out");
+    assert_eq!(u64::from_le_bytes(out_bytes), 20);
+    let out_ib = 0x7880_u64;
+    write_regs(&mut engine, 1, out_ib, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_get_indices(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    engine
+        .mem_read(out_ib, &mut out_bytes)
+        .expect("read ib out");
+    assert_eq!(u64::from_le_bytes(out_bytes), ib);
+
+    // DrawIndexedPrimitive(TRIANGLELIST, base 0, min 0, num 3, start 0, 1).
+    write_regs(&mut engine, 1, u64::from(D3DPT_TRIANGLELIST), 0, 0, 0);
+    engine
+        .mem_write(STACK_TOP + 0x28, &3_u32.to_le_bytes())
+        .expect("write NumVertices");
+    engine
+        .mem_write(STACK_TOP + 0x30, &0_u32.to_le_bytes())
+        .expect("write StartIndex");
+    engine
+        .mem_write(STACK_TOP + 0x38, &1_u32.to_le_bytes())
+        .expect("write PrimitiveCount");
+    assert_return_value!(
+        d3d9::handle_draw_indexed_primitive(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+
+    // The cyan right triangle (0,0)(3,0)(0,2) covers the pixel centers
+    // (0.5,0.5), (1.5,0.5), (0.5,1.5) — the hypotenuse x = 3 − 1.5y cuts the
+    // rest of the 4x3 grid out; the outside stays cleared.
+    let idx =
+        |x: u32, y: u32| usize::try_from(y).unwrap_or(0) * 4 + usize::try_from(x).unwrap_or(0);
+    let back = &state.d3d9().d3d9_backbuffer;
+    for (x, y) in [(0, 0), (1, 0), (0, 1)] {
+        assert_eq!(
+            back.get(idx(x, y)).copied(),
+            Some(0x0000_FFFF),
+            "buffer-form draw must fill ({x},{y}) cyan"
+        );
+    }
+    for (x, y) in [
+        (2, 0),
+        (2, 1),
+        (3, 0),
+        (3, 1),
+        (0, 2),
+        (1, 2),
+        (2, 2),
+        (3, 2),
+    ] {
+        assert_eq!(
+            back.get(idx(x, y)).copied(),
+            Some(0),
+            "outside the triangle at ({x},{y}) stays cleared"
+        );
+    }
 }
 
 #[test]

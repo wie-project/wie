@@ -5,12 +5,14 @@
 //! The `IDirect3DDevice9` dispatch handlers (render state, scene, viewport,
 //! draws, streams, index/vertex buffers) live in [`device`]; shader objects
 //! live in [`shader`], software rasterization in [`raster`], texture/surface
-//! lifecycle in [`texture`], and blend/depth state in [`blend`].
+//! lifecycle in [`texture`], vertex/index-buffer COM objects in [`buffer`],
+//! and blend/depth state in [`blend`].
 
 use anyhow::{Context, Result};
 
 use crate::fake_va::{
-    D3d9Iface, Device9Method, Direct3D9Method, Surface9Method, Texture9Method, encode_com,
+    D3d9Iface, Device9Method, Direct3D9Method, IndexBuffer9Method, Surface9Method, Texture9Method,
+    VertexBuffer9Method, encode_com,
 };
 use crate::guest_memory::{
     read_u32 as read_guest_u32, read_u64 as read_guest_u64, write_u32 as write_guest_u32,
@@ -19,6 +21,7 @@ use crate::guest_memory::{
 use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 
 mod blend;
+mod buffer;
 mod device;
 mod raster;
 mod shader;
@@ -28,13 +31,21 @@ pub use blend::{
     handle_create_depth_stencil_surface, handle_get_depth_stencil_surface, handle_get_render_state,
     handle_set_depth_stencil_surface,
 };
+pub use buffer::{
+    BufferKind, BufferRecord, handle_index_buffer_add_ref, handle_index_buffer_get_desc,
+    handle_index_buffer_lock, handle_index_buffer_query_interface, handle_index_buffer_release,
+    handle_index_buffer_unlock, handle_vertex_buffer_add_ref, handle_vertex_buffer_get_desc,
+    handle_vertex_buffer_lock, handle_vertex_buffer_query_interface, handle_vertex_buffer_release,
+    handle_vertex_buffer_unlock,
+};
 pub use device::{
     handle_begin_scene, handle_clear, handle_create_index_buffer, handle_create_vertex_buffer,
     handle_device_release, handle_direct3d9_release, handle_draw_indexed_primitive,
     handle_draw_indexed_primitive_up, handle_draw_primitive, handle_draw_primitive_up,
-    handle_end_scene, handle_get_viewport, handle_present, handle_set_fvf, handle_set_indices,
-    handle_set_render_state, handle_set_sampler_state, handle_set_stream_source,
-    handle_set_texture_stage_state, handle_set_transform, handle_set_viewport,
+    handle_end_scene, handle_get_indices, handle_get_stream_source, handle_get_viewport,
+    handle_present, handle_set_fvf, handle_set_indices, handle_set_render_state,
+    handle_set_sampler_state, handle_set_stream_source, handle_set_texture_stage_state,
+    handle_set_transform, handle_set_viewport,
 };
 pub use shader::{
     IDIRECT3DSHADER9_METHOD_COUNT, handle_create_pixel_shader, handle_create_vertex_shader,
@@ -74,6 +85,9 @@ pub(crate) const D3DERR_INVALIDCALL: u64 = 0x8876_086c;
 
 /// `D3DPS_VERSION(2, 0)` — the pixel-shader version reported in D3DCAPS9.
 const D3DPS_VERSION_2_0: u32 = 0xFFFF_0200;
+/// `D3DVS_VERSION(2, 0)` — the vertex-shader version reported in D3DCAPS9
+/// (the vs tag is `0xFFFE0000`, unlike the ps tag's `0xFFFF0000`).
+const D3DVS_VERSION_2_0: u32 = 0xFFFE_0200;
 
 const D3DDEVTYPE_HAL: u64 = 1;
 const D3DDEVTYPE_REF: u64 = 2;
@@ -104,6 +118,8 @@ pub(super) const D3DTS_PROJECTION: u32 = 3;
 /// `D3DFMT_INDEX32` — 32-bit indices (102). 16-bit indices (`D3DFMT_INDEX16`,
 /// 101) are the default and need no constant here.
 pub(crate) const D3DFMT_INDEX32: u32 = 102;
+/// `D3DFMT_INDEX16` — 16-bit indices (101).
+pub(crate) const D3DFMT_INDEX16: u32 = 101;
 
 /// `D3DFMT_A8R8G8B8` — 32-bpp with alpha (texels stored `0xAARRGGBB`).
 pub(crate) const D3DFMT_A8R8G8B8: u32 = 21;
@@ -119,6 +135,20 @@ pub const IDIRECT3DTEXTURE9_METHOD_COUNT: usize = Texture9Method::VTABLE_SLOTS;
 pub(crate) const IDIRECT3DTEXTURE9_ALLOCATION_SIZE: u64 = 0x100;
 /// Offset of the COM object after the 22-entry vtable.
 pub(crate) const IDIRECT3DTEXTURE9_OBJECT_OFFSET: u64 = 0x80;
+
+/// Number of methods in the `IDirect3DVertexBuffer9` vtable (0..13).
+pub const IDIRECT3DVERTEXBUFFER9_METHOD_COUNT: usize = VertexBuffer9Method::VTABLE_SLOTS;
+/// Space reserved for the vertex-buffer vtable + COM object.
+pub(crate) const IDIRECT3DVERTEXBUFFER9_ALLOCATION_SIZE: u64 = 0x100;
+/// Offset of the COM object after the 14-entry vtable.
+pub(crate) const IDIRECT3DVERTEXBUFFER9_OBJECT_OFFSET: u64 = 0x80;
+
+/// Number of methods in the `IDirect3DIndexBuffer9` vtable (0..13).
+pub const IDIRECT3DINDEXBUFFER9_METHOD_COUNT: usize = IndexBuffer9Method::VTABLE_SLOTS;
+/// Space reserved for the index-buffer vtable + COM object.
+pub(crate) const IDIRECT3DINDEXBUFFER9_ALLOCATION_SIZE: u64 = 0x100;
+/// Offset of the COM object after the 14-entry vtable.
+pub(crate) const IDIRECT3DINDEXBUFFER9_OBJECT_OFFSET: u64 = 0x80;
 
 /// Number of methods in the `IDirect3DSurface9` vtable (0..17).
 pub const IDIRECT3DSURFACE9_METHOD_COUNT: usize = Surface9Method::VTABLE_SLOTS;
@@ -362,10 +392,19 @@ pub fn handle_get_device_caps(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         // MaxStreamStride
         write_caps_u32(engine, caps_address, 192, 255, "MaxStreamStride")?;
 
-        // VertexShaderVersion — caps honesty: the vertex stage is still the
-        // FFP Gouraud path (vertex shader execution is not yet implemented),
-        // so this stays 0 — games branching on `VertexShaderVersion != 0`
-        // take the FFP path they actually get.
+        // VertexShaderVersion — the vs_2_0 interpreter runs in the vertex
+        // stage (FVF decode → v0..v15 → the VS → oPos → viewport transform),
+        // so the caps honestly report D3DVS_VERSION(2,0) = 0xFFFE0200
+        // (D3DVS_VERSION's tag is 0xFFFE0000 — the 0xFFFF tag is the pixel
+        // shader's). Games branching on `VertexShaderVersion != 0` now take
+        // the programmable path we actually implement.
+        write_caps_u32(
+            engine,
+            caps_address,
+            196,
+            D3DVS_VERSION_2_0,
+            "VertexShaderVersion",
+        )?;
 
         // MaxVertexShaderConst — the vs_2_0 constant file is implemented
         // (256 float4s; the size the caps report).
@@ -618,6 +657,7 @@ fn init_device_state(
     d3d.d3d9_dirty = None;
     d3d.d3d9_stream_source_va = 0;
     d3d.d3d9_stream_stride = 0;
+    d3d.d3d9_stream_offset = 0;
     d3d.d3d9_index_buffer_va = 0;
 
     let needed = usize::try_from(width.checked_mul(height).unwrap_or(0)).unwrap_or(0);

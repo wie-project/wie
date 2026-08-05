@@ -10,12 +10,10 @@ anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-serde_json.workspace = true
 
 wie-pe = { path = "../wie-pe" }
 wie-runtime = { path = "../wie-runtime" }
 wie-winapi = { path = "../wie-winapi" }
-wie-cpu = { path = "../wie-cpu" }
 
 # macOS-only policy: winit's default features enable the X11/Wayland backends
 # (Linux-only), which pull x11-dl, wayland-*, sctk, calloop, etc. into the

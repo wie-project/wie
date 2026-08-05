@@ -53,9 +53,10 @@ mod exception_helpers;
 mod exception_tests;
 pub use fake_va::{
     ComMethod, D3d9Iface, Device9Method, Direct3D9Method, FAKE_API_BASE, FAKE_API_SIZE, FakeVa,
-    PixelShader9Method, SPECIAL_CALLBACK_RETURN, SPECIAL_SEH_CONTINUE, Surface9Method,
-    Texture9Method, VertexShader9Method, callback_return_trampoline_va, decode as decode_fake_va,
-    encode_alias, encode_com, encode_export, encode_unresolved, seh_continue_trampoline_va,
+    IndexBuffer9Method, PixelShader9Method, SPECIAL_CALLBACK_RETURN, SPECIAL_SEH_CONTINUE,
+    Surface9Method, Texture9Method, VertexBuffer9Method, VertexShader9Method,
+    callback_return_trampoline_va, decode as decode_fake_va, encode_alias, encode_com,
+    encode_export, encode_unresolved, seh_continue_trampoline_va,
 };
 pub use guest_heap::GuestHeap;
 pub use idle::{IdleContext, IdlePolicy};

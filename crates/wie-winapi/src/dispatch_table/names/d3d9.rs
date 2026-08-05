@@ -284,4 +284,76 @@ pub(super) const ROWS: &[(&str, &str, WinApiId)] = &[
         "idirect3dvertexshader9::release",
         WinApiId::D3d9Idirect3dvertexshader9Release,
     ),
+    // ── L2 buffer objects (appended after the D3d9* block — the row order
+    // mirrors the enum discriminants, and these were appended at 464+).
+    (
+        "d3d9.dll",
+        "idirect3dvertexbuffer9::queryinterface",
+        WinApiId::D3d9Idirect3dvertexbuffer9Queryinterface,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3dvertexbuffer9::addref",
+        WinApiId::D3d9Idirect3dvertexbuffer9Addref,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3dvertexbuffer9::release",
+        WinApiId::D3d9Idirect3dvertexbuffer9Release,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3dvertexbuffer9::lock",
+        WinApiId::D3d9Idirect3dvertexbuffer9Lock,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3dvertexbuffer9::unlock",
+        WinApiId::D3d9Idirect3dvertexbuffer9Unlock,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3dvertexbuffer9::getdesc",
+        WinApiId::D3d9Idirect3dvertexbuffer9Getdesc,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3dindexbuffer9::queryinterface",
+        WinApiId::D3d9Idirect3dindexbuffer9Queryinterface,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3dindexbuffer9::addref",
+        WinApiId::D3d9Idirect3dindexbuffer9Addref,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3dindexbuffer9::release",
+        WinApiId::D3d9Idirect3dindexbuffer9Release,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3dindexbuffer9::lock",
+        WinApiId::D3d9Idirect3dindexbuffer9Lock,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3dindexbuffer9::unlock",
+        WinApiId::D3d9Idirect3dindexbuffer9Unlock,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3dindexbuffer9::getdesc",
+        WinApiId::D3d9Idirect3dindexbuffer9Getdesc,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::getstreamsource",
+        WinApiId::D3d9Idirect3ddevice9Getstreamsource,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::getindices",
+        WinApiId::D3d9Idirect3ddevice9Getindices,
+    ),
 ];

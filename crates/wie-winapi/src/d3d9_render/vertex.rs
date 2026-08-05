@@ -236,24 +236,41 @@ impl Default for Viewport {
         }
     }
 }
-/// Map a clip-space vertex to screen pixels; `None` when the vertex is at or
-/// behind the near-plane (`w <= 0`) — slice 1 rejects the whole triangle.
+/// Map a clip-space vertex to screen pixels and depth; `None` when the
+/// vertex is at or behind the near-plane (`w <= 0`) — slice 1 rejects the
+/// whole triangle.
 ///
-/// `#[expect(casts)]`: viewport fields are `u32` but the mapping is float
-/// math — `f32: From<u32>` does not exist in `std`, and a 32-bit viewport
-/// coordinate (≤ ~2^24 px) cannot lose precision in `f32`'s 23-bit mantissa.
+/// The w-divide maps NDC to the viewport: x/y to the viewport rect, z to the
+/// `MinZ..MaxZ` depth range (so `ScreenVertex.z` is the post-viewport depth
+/// the depth buffer consumes). The clip-space `w` is returned unchanged for
+/// the perspective-correct attribute interpolation in the fragment stage.
+///
+/// `n`: viewport fields are `u32` but the mapping is float math — `f32:
+/// From<u32>` does not exist in `std`, and a 32-bit viewport coordinate
+/// (≤ ~2^24 px) cannot lose precision in `f32`'s 23-bit mantissa.
 #[must_use]
-pub fn clip_to_screen(c: [f32; 4], vp: &Viewport) -> Option<(f32, f32)> {
+pub fn clip_to_viewport(c: [f32; 4], vp: &Viewport) -> Option<(f32, f32, f32, f32)> {
     let [_x, _y, _z, w] = c;
     if w <= 0.0 {
         return None;
     }
     let nx = c[0] / w;
     let ny = c[1] / w;
+    let nz = c[2] / w;
     let sx = vp.x as f32 + (nx + 1.0) * 0.5 * vp.width as f32;
     let sy = vp.y as f32 + (1.0 - ny) * 0.5 * vp.height as f32;
-    Some((sx, sy))
+    let sz = vp.min_z + (nz + 1.0) * 0.5 * (vp.max_z - vp.min_z);
+    Some((sx, sy, sz, w))
 }
+
+/// Map a clip-space vertex to screen pixels only (the x/y of
+/// [`clip_to_viewport`]); `None` when the vertex is at or behind the
+/// near-plane. Kept for callers that need just the screen position.
+#[must_use]
+pub fn clip_to_screen(c: [f32; 4], vp: &Viewport) -> Option<(f32, f32)> {
+    clip_to_viewport(c, vp).map(|(x, y, _z, _w)| (x, y))
+}
+
 /// A screen-space vertex ready for rasterization.
 #[derive(Debug, Clone, Copy)]
 pub struct ScreenVertex {
@@ -261,13 +278,17 @@ pub struct ScreenVertex {
     pub x: f32,
     /// Screen Y.
     pub y: f32,
-    /// Depth: screen-space 0..1 for `XYZRHW`; the raw model z for `XYZ`
-    /// (the software pipeline applies no viewport z transform — affine depth,
-    /// consistent with the affine uv interpolation).
+    /// Depth: the post-viewport depth (`MinZ..MaxZ` mapped) for transformed
+    /// vertices; the raw `0..1` z for pre-transformed (`XYZRHW`) vertices.
     pub z: f32,
+    /// Clip-space w (the w-divide divisor). The fragment stage uses it for
+    /// perspective-correct interpolation of uv/depth; 1.0 for `XYZRHW`
+    /// (already screen-space — attributes interpolate affinely).
+    pub w: f32,
     /// Diffuse color `0xAARRGGBB`.
     pub color: u32,
-    /// Texture coordinate U (affine-interpolated across the triangle).
+    /// Texture coordinate U (perspective-correct interpolated across the
+    /// triangle when `w` varies).
     pub u: f32,
     /// Texture coordinate V.
     pub v: f32,

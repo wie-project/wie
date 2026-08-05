@@ -10,12 +10,13 @@
 //!
 //! Submodules: [`vertex`] (FVF layout + transform), [`sample`] (texture-stage
 //! sampling + FFP color ops), [`blend`] (typed render-state enums, depth test,
-//! alpha blend), [`ps`] (PS 2.0 interpreter).
+//! alpha blend), [`ps`] (PS 2.0 interpreter), [`vs`] (VS 2.0 interpreter).
 
 mod blend;
 mod ps;
 mod sample;
 mod vertex;
+mod vs;
 
 #[cfg(test)]
 #[allow(
@@ -36,9 +37,10 @@ pub use self::ps::{
 };
 pub use self::sample::{FragmentState, TextureStage};
 pub use self::vertex::{
-    FvfLayout, GuestVertex, IDENTITY, Mat4, ScreenVertex, Viewport, clip_to_screen, mat4_mul,
-    parse_fvf, parse_vertex, transform_point,
+    FvfLayout, GuestVertex, IDENTITY, Mat4, ScreenVertex, Viewport, clip_to_screen,
+    clip_to_viewport, mat4_mul, parse_fvf, parse_vertex, transform_point,
 };
+pub use self::vs::{VsOutput, VsProgram, VsVertexInput, run_vertex_shader, vs_input_from_vertex};
 
 // Private cross-module helpers: rasterize_triangle (below) drives the
 // fragment stage through these, so each lives in the submodule that owns it.
@@ -304,10 +306,11 @@ impl Default for TextureStageState {
 /// with barycentric solid-fill, accumulating the covered region into `dirty`.
 ///
 /// When `tex` is present and its `color_op` is not `D3DTOP_DISABLE`, each
-/// fragment is textured: the uv is affine-interpolated (perspective-correct
-/// interpolation deferred — fine for screen-aligned quads), sampled with the
-/// stage's address modes/filter, and combined with the Gouraud diffuse via the
-/// color op; the alpha op (default MODULATE) yields the fragment alpha.
+/// fragment is textured: the uv is perspective-correct interpolated (the
+/// per-vertex clip w divides the interpolant — the projective-correct value
+/// that reproduces world-space linear uv), sampled with the stage's address
+/// modes/filter, and combined with the Gouraud diffuse via the color op; the
+/// alpha op (default MODULATE) yields the fragment alpha.
 ///
 /// When `ps` is present (a pixel shader is bound), the fragment stage runs the
 /// PS 2.0 interpreter instead of the FFP color/alpha ops: `oC0` feeds the
@@ -315,10 +318,11 @@ impl Default for TextureStageState {
 /// fragment (no color write, no depth write). Blend + depth apply
 /// identically after the shader output is resolved.
 ///
-/// `frag` carries the blend + depth configuration: the depth is affine-
-/// interpolated and tested/written per `D3DRS_ZFUNC`/`ZWRITEENABLE` before the
-/// color write; then, when `D3DRS_ALPHABLENDENABLE` is set, the fragment color
-/// blends over the existing backbuffer pixel with the `D3DBLEND_*` factors.
+/// `frag` carries the blend + depth configuration: the depth is
+/// perspective-correct interpolated and tested/written per
+/// `D3DRS_ZFUNC`/`ZWRITEENABLE` before the color write; then, when
+/// `D3DRS_ALPHABLENDENABLE` is set, the fragment color blends over the
+/// existing backbuffer pixel with the `D3DBLEND_*` factors.
 /// The backbuffer stays 0RGB — alpha feeds the blend only.
 ///
 /// Degenerate (zero-area) triangles and triangles fully off-screen are
@@ -417,8 +421,26 @@ pub fn rasterize_triangle(
                 .saturating_mul(width_us)
                 .saturating_add(usize::try_from(px).unwrap_or(0));
 
+            // Perspective-correct depth + attributes: interpolate
+            // `attr/w` and `1/w` in screen space, then divide — the
+            // projective-correct interpolant that reproduces the world-space
+            // linear value (reduces to affine when w is constant, e.g.
+            // XYZRHW w=1.0 or an orthographic projection). The transform
+            // paths guarantee w > 0 (near-plane rejection); a direct
+            // rasterize_triangle caller passing w <= 0 falls back to affine.
+            let ia = if a.w > 0.0 { 1.0 / a.w } else { 1.0 };
+            let ib = if b.w > 0.0 { 1.0 / b.w } else { 1.0 };
+            let ic = if c.w > 0.0 { 1.0 / c.w } else { 1.0 };
+            let iw = wa * ia + wb * ib + wc * ic;
+            let perspective = |attr_a: f32, attr_b: f32, attr_c: f32| {
+                if iw != 0.0 {
+                    (wa * attr_a * ia + wb * attr_b * ib + wc * attr_c * ic) / iw
+                } else {
+                    wa * attr_a + wb * attr_b + wc * attr_c
+                }
+            };
             // Depth test + write (before the color write, per pixel).
-            let z = wa * a.z + wb * b.z + wc * c.z;
+            let z = perspective(a.z, b.z, c.z);
             if let Some(depth) = frag.depth.as_deref_mut() {
                 let existing = depth.get(index).copied().unwrap_or(1.0);
                 if depth_testing && !depth_test(z, existing, frag.z_func) {
@@ -433,8 +455,8 @@ pub fn rasterize_triangle(
                 (flat_color, flat_alpha)
             } else {
                 let gcolor = blend_colors(wa, a.color, wb, b.color, wc, c.color);
-                let u = wa * a.u + wb * b.u + wc * c.u;
-                let v = wa * a.v + wb * b.v + wc * c.v;
+                let u = perspective(a.u, b.u, c.u);
+                let v = perspective(a.v, b.v, c.v);
                 match ps {
                     Some(program) => {
                         // Pixel shader path: v0 = interpolated diffuse, t0 = the
@@ -640,16 +662,19 @@ pub fn draw_triangle(
     dirty: &mut Option<IRect>,
 ) {
     let to_screen = |v: GuestVertex| -> Option<ScreenVertex> {
-        let (sx, sy) = if pre_transformed {
-            (v.x, v.y)
+        let (sx, sy, sz, w) = if pre_transformed {
+            // XYZRHW: already screen-space. The attributes interpolate
+            // affinely, so the perspective divisor is 1.0.
+            (v.x, v.y, v.z, 1.0)
         } else {
             let clip = transform_point([v.x, v.y, v.z, v.w], matrix);
-            clip_to_screen(clip, vp)?
+            clip_to_viewport(clip, vp)?
         };
         Some(ScreenVertex {
             x: sx,
             y: sy,
-            z: v.z,
+            z: sz,
+            w,
             color: v.color,
             u: v.u,
             v: v.v,

@@ -70,19 +70,25 @@ pub enum D3d9Iface {
     PixelShader9,
     /// `IDirect3DVertexShader9` (ABI 5).
     VertexShader9,
+    /// `IDirect3DVertexBuffer9` (ABI 6).
+    VertexBuffer9,
+    /// `IDirect3DIndexBuffer9` (ABI 7).
+    IndexBuffer9,
     /// Not one of the D3D9 interfaces (raw byte preserved).
     Unknown(u8),
 }
 
 impl D3d9Iface {
     /// The real D3D9 interfaces.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::Direct3D9,
         Self::Device9,
         Self::Texture9,
         Self::Surface9,
         Self::PixelShader9,
         Self::VertexShader9,
+        Self::VertexBuffer9,
+        Self::IndexBuffer9,
     ];
 
     /// Decode the ABI iface byte (never fails — unknown bytes stay decodable).
@@ -95,6 +101,8 @@ impl D3d9Iface {
             3 => Self::Surface9,
             4 => Self::PixelShader9,
             5 => Self::VertexShader9,
+            6 => Self::VertexBuffer9,
+            7 => Self::IndexBuffer9,
             _ => Self::Unknown(v),
         }
     }
@@ -109,6 +117,8 @@ impl D3d9Iface {
             Self::Surface9 => 3,
             Self::PixelShader9 => 4,
             Self::VertexShader9 => 5,
+            Self::VertexBuffer9 => 6,
+            Self::IndexBuffer9 => 7,
             Self::Unknown(v) => v,
         }
     }
@@ -243,7 +253,9 @@ pub enum Device9Method {
     SetVertexShaderConstantF = 94,
     GetVertexShaderConstantF = 95,
     SetStreamSource = 100,
+    GetStreamSource = 101,
     SetIndices = 104,
+    GetIndices = 105,
     CreatePixelShader = 106,
     SetPixelShader = 107,
     GetPixelShader = 108,
@@ -292,7 +304,9 @@ impl Device9Method {
             94 => Some(Self::SetVertexShaderConstantF),
             95 => Some(Self::GetVertexShaderConstantF),
             100 => Some(Self::SetStreamSource),
+            101 => Some(Self::GetStreamSource),
             104 => Some(Self::SetIndices),
+            105 => Some(Self::GetIndices),
             106 => Some(Self::CreatePixelShader),
             107 => Some(Self::SetPixelShader),
             108 => Some(Self::GetPixelShader),
@@ -358,6 +372,8 @@ impl Device9Method {
                 Cow::Borrowed("IDirect3DDevice9::GetVertexShaderConstantF")
             }
             Self::SetStreamSource => Cow::Borrowed("IDirect3DDevice9::SetStreamSource"),
+            Self::GetStreamSource => Cow::Borrowed("IDirect3DDevice9::GetStreamSource"),
+            Self::GetIndices => Cow::Borrowed("IDirect3DDevice9::GetIndices"),
             Self::SetIndices => Cow::Borrowed("IDirect3DDevice9::SetIndices"),
             Self::CreatePixelShader => Cow::Borrowed("IDirect3DDevice9::CreatePixelShader"),
             Self::SetPixelShader => Cow::Borrowed("IDirect3DDevice9::SetPixelShader"),
@@ -556,6 +572,110 @@ impl VertexShader9Method {
     }
 }
 
+/// `IDirect3DVertexBuffer9` vtable method (ABI slot positions; unmodeled
+/// slots are carried by [`ComMethod::Unknown`]).
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VertexBuffer9Method {
+    QueryInterface = 0,
+    AddRef = 1,
+    Release = 2,
+    Lock = 11,
+    Unlock = 12,
+    GetDesc = 13,
+}
+
+impl VertexBuffer9Method {
+    /// Total `IDirect3DVertexBuffer9` vtable slots (0..13).
+    pub const VTABLE_SLOTS: usize = 14;
+
+    /// Decode a vtable slot; `None` for unmodeled slots.
+    #[must_use]
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::QueryInterface),
+            1 => Some(Self::AddRef),
+            2 => Some(Self::Release),
+            11 => Some(Self::Lock),
+            12 => Some(Self::Unlock),
+            13 => Some(Self::GetDesc),
+            _ => None,
+        }
+    }
+
+    /// The raw vtable slot byte (`#[repr(u8)]` — the discriminant IS the
+    /// slot, so this cannot drift from the explicit discriminants).
+    #[must_use]
+    pub const fn slot(self) -> u8 {
+        self as u8
+    }
+
+    /// Trace name (`IDirect3DVertexBuffer9::Xxx`).
+    #[must_use]
+    pub fn name(self) -> Cow<'static, str> {
+        match self {
+            Self::QueryInterface => Cow::Borrowed("IDirect3DVertexBuffer9::QueryInterface"),
+            Self::AddRef => Cow::Borrowed("IDirect3DVertexBuffer9::AddRef"),
+            Self::Release => Cow::Borrowed("IDirect3DVertexBuffer9::Release"),
+            Self::Lock => Cow::Borrowed("IDirect3DVertexBuffer9::Lock"),
+            Self::Unlock => Cow::Borrowed("IDirect3DVertexBuffer9::Unlock"),
+            Self::GetDesc => Cow::Borrowed("IDirect3DVertexBuffer9::GetDesc"),
+        }
+    }
+}
+
+/// `IDirect3DIndexBuffer9` vtable method (ABI slot positions; unmodeled
+/// slots are carried by [`ComMethod::Unknown`]).
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexBuffer9Method {
+    QueryInterface = 0,
+    AddRef = 1,
+    Release = 2,
+    Lock = 11,
+    Unlock = 12,
+    GetDesc = 13,
+}
+
+impl IndexBuffer9Method {
+    /// Total `IDirect3DIndexBuffer9` vtable slots (0..13).
+    pub const VTABLE_SLOTS: usize = 14;
+
+    /// Decode a vtable slot; `None` for unmodeled slots.
+    #[must_use]
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::QueryInterface),
+            1 => Some(Self::AddRef),
+            2 => Some(Self::Release),
+            11 => Some(Self::Lock),
+            12 => Some(Self::Unlock),
+            13 => Some(Self::GetDesc),
+            _ => None,
+        }
+    }
+
+    /// The raw vtable slot byte (`#[repr(u8)]` — the discriminant IS the
+    /// slot, so this cannot drift from the explicit discriminants).
+    #[must_use]
+    pub const fn slot(self) -> u8 {
+        self as u8
+    }
+
+    /// Trace name (`IDirect3DIndexBuffer9::Xxx`).
+    #[must_use]
+    pub fn name(self) -> Cow<'static, str> {
+        match self {
+            Self::QueryInterface => Cow::Borrowed("IDirect3DIndexBuffer9::QueryInterface"),
+            Self::AddRef => Cow::Borrowed("IDirect3DIndexBuffer9::AddRef"),
+            Self::Release => Cow::Borrowed("IDirect3DIndexBuffer9::Release"),
+            Self::Lock => Cow::Borrowed("IDirect3DIndexBuffer9::Lock"),
+            Self::Unlock => Cow::Borrowed("IDirect3DIndexBuffer9::Unlock"),
+            Self::GetDesc => Cow::Borrowed("IDirect3DIndexBuffer9::GetDesc"),
+        }
+    }
+}
+
 /// A COM vtable method decoded against its interface (the `kind=Com` low
 /// payload byte).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -566,6 +686,8 @@ pub enum ComMethod {
     Surface9(Surface9Method),
     PixelShader9(PixelShader9Method),
     VertexShader9(VertexShader9Method),
+    VertexBuffer9(VertexBuffer9Method),
+    IndexBuffer9(IndexBuffer9Method),
     /// Unmodeled slot (raw byte preserved).
     Unknown(u8),
 }
@@ -600,6 +722,14 @@ impl ComMethod {
                 Some(m) => Self::VertexShader9(m),
                 None => Self::Unknown(slot),
             },
+            D3d9Iface::VertexBuffer9 => match VertexBuffer9Method::from_u8(slot) {
+                Some(m) => Self::VertexBuffer9(m),
+                None => Self::Unknown(slot),
+            },
+            D3d9Iface::IndexBuffer9 => match IndexBuffer9Method::from_u8(slot) {
+                Some(m) => Self::IndexBuffer9(m),
+                None => Self::Unknown(slot),
+            },
             D3d9Iface::Unknown(_) => Self::Unknown(slot),
         }
     }
@@ -614,6 +744,8 @@ impl ComMethod {
             Self::Surface9(m) => m.slot(),
             Self::PixelShader9(m) => m.slot(),
             Self::VertexShader9(m) => m.slot(),
+            Self::VertexBuffer9(m) => m.slot(),
+            Self::IndexBuffer9(m) => m.slot(),
             Self::Unknown(v) => v,
         }
     }
@@ -631,6 +763,8 @@ impl ComMethod {
             Self::Surface9(m) => m.name(),
             Self::PixelShader9(m) => m.name(),
             Self::VertexShader9(m) => m.name(),
+            Self::VertexBuffer9(m) => m.name(),
+            Self::IndexBuffer9(m) => m.name(),
             Self::Unknown(v) => match iface {
                 D3d9Iface::Direct3D9 => Cow::Owned(format!("IDirect3D9::Slot{v:03}")),
                 D3d9Iface::Device9 => Cow::Owned(format!("IDirect3DDevice9::Slot{v:03}")),
@@ -640,6 +774,10 @@ impl ComMethod {
                 D3d9Iface::VertexShader9 => {
                     Cow::Owned(format!("IDirect3DVertexShader9::Slot{v:03}"))
                 }
+                D3d9Iface::VertexBuffer9 => {
+                    Cow::Owned(format!("IDirect3DVertexBuffer9::Slot{v:03}"))
+                }
+                D3d9Iface::IndexBuffer9 => Cow::Owned(format!("IDirect3DIndexBuffer9::Slot{v:03}")),
                 D3d9Iface::Unknown(_) => Cow::Owned(format!("Com{}::Method{v}", iface.as_u8())),
             },
         }
@@ -884,15 +1022,18 @@ mod tests {
             assert_eq!(method.slot(), slot);
         }
         assert_eq!(D3d9Iface::Unknown(9).as_u8(), 9);
-        // Iface bytes 4 and 5 decode to the shader interfaces.
+        // Iface bytes 4 and 5 decode to the shader interfaces; 6/7 to the
+        // vertex/index buffer interfaces (the L2 buffer-object additions).
         assert_eq!(D3d9Iface::from_u8(4), D3d9Iface::PixelShader9);
         assert_eq!(D3d9Iface::from_u8(5), D3d9Iface::VertexShader9);
+        assert_eq!(D3d9Iface::from_u8(6), D3d9Iface::VertexBuffer9);
+        assert_eq!(D3d9Iface::from_u8(7), D3d9Iface::IndexBuffer9);
     }
 
     #[test]
     fn iface_and_method_slots_are_the_abi_mapping() {
-        // The ABI mapping is explicit and locked: iface bytes 0..5 decode to
-        // the six interfaces in order, and every modeled method slot is its
+        // The ABI mapping is explicit and locked: iface bytes 0..7 decode to
+        // the eight interfaces in order, and every modeled method slot is its
         // real vtable position.
         assert_eq!(D3d9Iface::from_u8(0), D3d9Iface::Direct3D9);
         assert_eq!(D3d9Iface::from_u8(1), D3d9Iface::Device9);
@@ -900,12 +1041,16 @@ mod tests {
         assert_eq!(D3d9Iface::from_u8(3), D3d9Iface::Surface9);
         assert_eq!(D3d9Iface::from_u8(4), D3d9Iface::PixelShader9);
         assert_eq!(D3d9Iface::from_u8(5), D3d9Iface::VertexShader9);
+        assert_eq!(D3d9Iface::from_u8(6), D3d9Iface::VertexBuffer9);
+        assert_eq!(D3d9Iface::from_u8(7), D3d9Iface::IndexBuffer9);
         assert_eq!(D3d9Iface::Direct3D9.as_u8(), 0);
         assert_eq!(D3d9Iface::Device9.as_u8(), 1);
         assert_eq!(D3d9Iface::Texture9.as_u8(), 2);
         assert_eq!(D3d9Iface::Surface9.as_u8(), 3);
         assert_eq!(D3d9Iface::PixelShader9.as_u8(), 4);
         assert_eq!(D3d9Iface::VertexShader9.as_u8(), 5);
+        assert_eq!(D3d9Iface::VertexBuffer9.as_u8(), 6);
+        assert_eq!(D3d9Iface::IndexBuffer9.as_u8(), 7);
 
         assert_eq!(Direct3D9Method::from_u8(2), Some(Direct3D9Method::Release));
         assert_eq!(
@@ -924,6 +1069,14 @@ mod tests {
         assert_eq!(Device9Method::Present.slot(), 17);
         assert_eq!(Device9Method::SetRenderState.slot(), 57);
         assert_eq!(Device9Method::SetIndices.slot(), 104);
+        // The L2 buffer-form getters (slots verified against d3d9.h).
+        assert_eq!(
+            Device9Method::from_u8(101),
+            Some(Device9Method::GetStreamSource)
+        );
+        assert_eq!(Device9Method::from_u8(105), Some(Device9Method::GetIndices));
+        assert_eq!(Device9Method::GetStreamSource.slot(), 101);
+        assert_eq!(Device9Method::GetIndices.slot(), 105);
         // Device shader methods (slots verified against d3d9.h).
         assert_eq!(
             Device9Method::from_u8(91),
@@ -948,6 +1101,26 @@ mod tests {
         assert_eq!(Texture9Method::GetSurfaceLevel.slot(), 18);
         assert_eq!(Surface9Method::from_u8(13), Some(Surface9Method::LockRect));
         assert_eq!(Surface9Method::LockRect.slot(), 13);
+
+        // Vertex/index buffer methods (slots verified against d3d9.h: the
+        // IUnknown trio 0..2, Lock 11, Unlock 12, GetDesc 13).
+        assert_eq!(
+            VertexBuffer9Method::from_u8(11),
+            Some(VertexBuffer9Method::Lock)
+        );
+        assert_eq!(
+            VertexBuffer9Method::from_u8(13),
+            Some(VertexBuffer9Method::GetDesc)
+        );
+        assert_eq!(VertexBuffer9Method::Lock.slot(), 11);
+        assert_eq!(VertexBuffer9Method::GetDesc.slot(), 13);
+        assert_eq!(VertexBuffer9Method::VTABLE_SLOTS, 14);
+        assert_eq!(
+            IndexBuffer9Method::from_u8(12),
+            Some(IndexBuffer9Method::Unlock)
+        );
+        assert_eq!(IndexBuffer9Method::Unlock.slot(), 12);
+        assert_eq!(IndexBuffer9Method::VTABLE_SLOTS, 14);
 
         // Unmodeled slots decode to None.
         assert_eq!(Direct3D9Method::from_u8(200), None);

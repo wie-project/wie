@@ -1,26 +1,44 @@
-// P3/P4b/P5a D3D9 software-render micro-test for WIE.
+// P3/P4b/P5a + L1 D3D9 software-render micro-test for WIE.
 //
-// Exercises the software-render slice (roadmap B6 + P4b + P5a caps):
-// Direct3DCreate9 → GetDeviceCaps (honest P5a caps: ps_2_0 reported, the
-// vertex stage still 0) → CreateDevice
+// Exercises the software-render slice (roadmap B6 + P4b + P5a caps + the
+// vs_2_0 L1 vertex stage + the L2 buffer objects):
+// Direct3DCreate9 → GetDeviceCaps (honest P5a caps: ps_2_0 AND vs_2_0
+// reported) → CreateDevice
 // → Clear → BeginScene → DrawPrimitiveUP (XYZ|DIFFUSE gradient triangle) →
-// DrawIndexedPrimitiveUP (solid indexed triangle) → a TEXTURED quad
-// (CreateTexture → GetSurfaceLevel → LockRect → UnlockRect → SetTexture →
-// DrawPrimitiveUP with XYZ|DIFFUSE|TEX1) → EndScene → Present. The frame is
-// rendered from WM_PAINT; Present publishes it through the same PresentState
-// surface pipeline GDI BitBlt uses.
+// the L2 buffer-form DrawIndexedPrimitive (CreateVertexBuffer → Lock → fill →
+// Unlock → SetStreamSource → CreateIndexBuffer → Lock → fill → Unlock →
+// SetIndices → GetStreamSource/GetIndices round-trip → DrawIndexedPrimitive —
+// the same cyan triangle the pre-L2 exe drew via DrawIndexedPrimitiveUP) → a
+// TEXTURED quad (CreateTexture → GetSurfaceLevel → LockRect → UnlockRect →
+// SetTexture → DrawPrimitiveUP with XYZ|DIFFUSE|TEX1) → EndScene → Present.
+// The frame is rendered from WM_PAINT; Present publishes it through the same
+// PresentState surface pipeline GDI BitBlt uses.
+//
+// The L1 additions:
+// - A vs_2_0 shader (embedded hand-encoded bytecode) transforms a textured
+//   quad by the orthographic projection's constant columns; the VS output
+//   (oPos/oD0/oT0) drives the same viewport transform + fragment stage as
+//   the FFP path.
+// - A w-skewed quad under a perspective-shear projection matrix: the
+//   per-vertex clip w varies, so the perspective-correct uv interpolation
+//   (this lane) picks a different texel at the quad's center than the old
+//   affine interpolation would — the D3D9_RESTING_FRAME_HASH gate + the
+//   host-side pixel test prove the w plumbing.
 //
 // Self-test (WIE_SELFTEST=1): every D3D9 call's HRESULT is checked, a
 // SetViewport/GetViewport round-trip is verified, and after TIMER_TICKS
 // WM_TIMER ticks (each invalidating → repaint → represent) the window quits
-// with 0. Distinct non-zero codes (101-136) report the first stage that did
+// with 0. Distinct non-zero codes (101-155) report the first stage that did
 // not run. Interactive runs (no WIE_SELFTEST) keep the window open — the
 // timer drives nothing and the window quits only on 'q' / close.
 //
 // The resting frame is deterministic: red clear + two triangles + a textured
 // quad whose 2x2 checkerboard (red/green/blue/white) fills the screen region
-// x∈[240,310], y∈[10,110]. The CI test samples pixels (clear red outside the
-// geometry, triangle colors, quad texels) and gates a resting-frame hash.
+// x∈[240,310], y∈[10,110] + a VS-driven textured quad at x∈[220,290],
+// y∈[150,220] + the w-skewed quad at x∈[136,196], y∈[141,215]. The CI test
+// samples pixels (clear red outside the geometry, triangle colors, quad
+// texels, the perspective-correct w-skewed center) and gates a resting-frame
+// hash.
 
 #define COBJMACROS
 #include <windows.h>
@@ -38,8 +56,52 @@ static IDirect3D9       *g_d3d;
 static IDirect3DDevice9 *g_device;
 static IDirect3DTexture9 *g_tex;
 static IDirect3DSurface9 *g_depth;
+static IDirect3DVertexShader9 *g_vs;
+static D3DMATRIX g_ortho;      // the baseline orthographic projection
 static int g_selftest;
 static int g_timer_count;
+
+// ── the L1 vs_2_0 shader (hand-encoded bytecode) ────────────────────────
+//
+// vs_2_0: dcl v0/v5/v6 → mov oT0, v5 / mov oD0, v6 → transform by the
+// projection columns c0..c3 (row-vector: oPos = dp4 per output channel):
+//   dcl v0; dcl v5; dcl v6;
+//   mov oT0, v5; mov oD0, v6;
+//   dp4 oPos.x, v0, c0; dp4 oPos.y, v0, c1;
+//   dp4 oPos.z, v0, c2; dp4 oPos.w, v0, c3;
+//   end
+static const DWORD g_vs_bytecode[] = {
+    0xFFFE0200,        // vs_2_0 version token
+    0x0000001F,        // dcl
+    0x10000000,        // v0
+    0x0000001F,        // dcl
+    0x10000005,        // v5
+    0x0000001F,        // dcl
+    0x10000006,        // v6
+    0x00000001,        // mov
+    0x600F0000,        // oT0 (TEXCRDOUT reg 0, writemask all)
+    0x10E40005,        // v5 (INPUT reg 5, NOSWIZZLE)
+    0x00000001,        // mov
+    0x500F0000,        // oD0 (ATTROUT reg 0, writemask all)
+    0x10E40006,        // v6 (INPUT reg 6, NOSWIZZLE)
+    0x00000009,        // dp4
+    0x40010000,        // oPos.x (RASTOUT reg 0, .x writemask)
+    0x10E40000,        // v0 (INPUT reg 0, NOSWIZZLE)
+    0x20E40000,        // c0 (CONST reg 0, NOSWIZZLE)
+    0x00000009,        // dp4
+    0x40020000,        // oPos.y
+    0x10E40000,        // v0
+    0x20E40001,        // c1
+    0x00000009,        // dp4
+    0x40040000,        // oPos.z
+    0x10E40000,        // v0
+    0x20E40002,        // c2
+    0x00000009,        // dp4
+    0x40080000,        // oPos.w
+    0x10E40000,        // v0
+    0x20E40003,        // c3
+    0x0000FFFF,        // end
+};
 
 static int selftest_enabled(void) {
     char buf[16];
@@ -125,8 +187,12 @@ static int render_frame(void) {
                                                 1, tri, (UINT)sizeof(tri[0])))) {
         return 107;
     }
-    // Indexed path: a second triangle (solid cyan) below the first via
-    // DrawIndexedPrimitiveUP with 16-bit indices.
+    // Indexed path (L2 buffer form): a second triangle (solid cyan) below the
+    // first via CreateVertexBuffer → Lock → fill → Unlock → SetStreamSource
+    // → CreateIndexBuffer → Lock → fill → Unlock → SetIndices →
+    // DrawIndexedPrimitive. The geometry is identical to the pre-L2
+    // DrawIndexedPrimitiveUP call, so the resting-frame pixels do not change;
+    // the GetStreamSource/GetIndices round-trip asserts the getters.
     struct Vertex indexed[3];
     indexed[0].x = -60.0f; indexed[0].y = 100.0f; indexed[0].z = 0.0f;
     indexed[0].color = D3DCOLOR_XRGB(0, 255, 255);
@@ -135,12 +201,83 @@ static int render_frame(void) {
     indexed[2].x = 0.0f; indexed[2].y = 40.0f; indexed[2].z = 0.0f;
     indexed[2].color = D3DCOLOR_XRGB(0, 255, 255);
     {
-        unsigned short indices[3] = { 0, 1, 2 };
-        if (FAILED(IDirect3DDevice9_DrawIndexedPrimitiveUP(
-                       g_device, D3DPT_TRIANGLELIST, 0, 3, 1, indices,
-                       D3DFMT_INDEX16, indexed, (UINT)sizeof(indexed[0])))) {
-            return 111;
+        IDirect3DVertexBuffer9 *vb = NULL;
+        IDirect3DIndexBuffer9 *ib = NULL;
+        HRESULT hr = IDirect3DDevice9_CreateVertexBuffer(
+            g_device, (UINT)sizeof(indexed), D3DUSAGE_WRITEONLY,
+            D3DFVF_XYZ | D3DFVF_DIFFUSE, D3DPOOL_MANAGED, &vb, NULL);
+        if (FAILED(hr) || vb == NULL) {
+            return 156;
         }
+        void *vdata = NULL;
+        hr = IDirect3DVertexBuffer9_Lock(vb, 0, 0, &vdata, 0);
+        if (FAILED(hr) || vdata == NULL) {
+            return 157;
+        }
+        // The guest fills the locked block through ordinary memory writes
+        // (struct assignment — no libc in this -nostdlib micro-exe).
+        {
+            struct Vertex *vd = (struct Vertex *)vdata;
+            vd[0] = indexed[0];
+            vd[1] = indexed[1];
+            vd[2] = indexed[2];
+        }
+        if (FAILED(IDirect3DVertexBuffer9_Unlock(vb))) {
+            return 158;
+        }
+        hr = IDirect3DDevice9_SetStreamSource(g_device, 0, vb, 0,
+                                              (UINT)sizeof(indexed[0]));
+        if (FAILED(hr)) {
+            return 159;
+        }
+        hr = IDirect3DDevice9_CreateIndexBuffer(
+            g_device, (UINT)(3 * sizeof(unsigned short)), D3DUSAGE_WRITEONLY,
+            D3DFMT_INDEX16, D3DPOOL_MANAGED, &ib, NULL);
+        if (FAILED(hr) || ib == NULL) {
+            return 160;
+        }
+        void *idata = NULL;
+        hr = IDirect3DIndexBuffer9_Lock(ib, 0, 0, &idata, 0);
+        if (FAILED(hr) || idata == NULL) {
+            return 161;
+        }
+        {
+            unsigned short *id = (unsigned short *)idata;
+            id[0] = 0;
+            id[1] = 1;
+            id[2] = 2;
+        }
+        if (FAILED(IDirect3DIndexBuffer9_Unlock(ib))) {
+            return 162;
+        }
+        if (FAILED(IDirect3DDevice9_SetIndices(g_device, ib))) {
+            return 163;
+        }
+        {
+            // The L2 round-trip getters: GetStreamSource must return the bound
+            // buffer with the exact offset/stride, GetIndices the index buffer.
+            IDirect3DVertexBuffer9 *vb2 = NULL;
+            UINT off = 0xDEADu;
+            UINT stride = 0xDEADu;
+            if (FAILED(IDirect3DDevice9_GetStreamSource(
+                           g_device, 0, &vb2, &off, &stride)) ||
+                vb2 != vb || off != 0 || stride != (UINT)sizeof(indexed[0])) {
+                return 164;
+            }
+            IDirect3DIndexBuffer9 *ib2 = NULL;
+            if (FAILED(IDirect3DDevice9_GetIndices(g_device, &ib2)) || ib2 != ib) {
+                return 165;
+            }
+        }
+        if (FAILED(IDirect3DDevice9_DrawIndexedPrimitive(
+                       g_device, D3DPT_TRIANGLELIST, 0, 0, 3, 0, 1))) {
+            return 166;
+        }
+        // Unbind + release the per-frame buffers (device-owned COM objects).
+        IDirect3DDevice9_SetStreamSource(g_device, 0, NULL, 0, 0);
+        IDirect3DDevice9_SetIndices(g_device, NULL);
+        IDirect3DVertexBuffer9_Release(vb);
+        IDirect3DIndexBuffer9_Release(ib);
     }
     // Textured quad (XYZ|DIFFUSE|TEX1, 24-byte vertices) covering the screen
     // region x∈[240,310], y∈[10,110] with the full uv range. World coords:
@@ -181,6 +318,106 @@ static int render_frame(void) {
     // Unbind so the next frame's triangles start untextured.
     if (FAILED(IDirect3DDevice9_SetTexture(g_device, 0, NULL))) {
         return 134;
+    }
+    // ── L1 vertex-shader quad (vs_2_0 execution) ─────────────────────────
+    // A textured quad at screen x∈[220,290], y∈[150,220] (world x∈[60,130],
+    // y∈[-100,-30]) transformed by the VS shader: the constant registers
+    // c0..c3 hold the orthographic projection's columns and the shader
+    // computes oPos = v0·M channel by channel. oT0 (uv) and oD0 (diffuse)
+    // pass through, proving the VS output feeds the viewport transform +
+    // fragment stage like the FFP path.
+    {
+        float vs_c[16];
+        vs_c[0]  = g_ortho._11; vs_c[1]  = g_ortho._21;
+        vs_c[2]  = g_ortho._31; vs_c[3]  = g_ortho._41;
+        vs_c[4]  = g_ortho._12; vs_c[5]  = g_ortho._22;
+        vs_c[6]  = g_ortho._32; vs_c[7]  = g_ortho._42;
+        vs_c[8]  = g_ortho._13; vs_c[9]  = g_ortho._23;
+        vs_c[10] = g_ortho._33; vs_c[11] = g_ortho._43;
+        vs_c[12] = g_ortho._14; vs_c[13] = g_ortho._24;
+        vs_c[14] = g_ortho._34; vs_c[15] = g_ortho._44;
+        if (FAILED(IDirect3DDevice9_SetVertexShaderConstantF(
+                       g_device, 0, vs_c, 4))) {
+            return 151;
+        }
+        if (FAILED(IDirect3DDevice9_SetVertexShader(g_device, g_vs))) {
+            return 152;
+        }
+        if (FAILED(IDirect3DDevice9_SetTexture(g_device, 0,
+                                               (IDirect3DBaseTexture9 *)g_tex))) {
+            return 134;
+        }
+        struct TexVertex vsq[4];
+        vsq[0].x = 60.0f;  vsq[0].y = -100.0f; vsq[0].z = 0.0f;
+        vsq[0].color = D3DCOLOR_XRGB(255, 255, 255);
+        vsq[0].u = 0.0f; vsq[0].v = 0.0f;
+        vsq[1].x = 130.0f; vsq[1].y = -100.0f; vsq[1].z = 0.0f;
+        vsq[1].color = D3DCOLOR_XRGB(255, 255, 255);
+        vsq[1].u = 1.0f; vsq[1].v = 0.0f;
+        vsq[2].x = 60.0f; vsq[2].y = -30.0f; vsq[2].z = 0.0f;
+        vsq[2].color = D3DCOLOR_XRGB(255, 255, 255);
+        vsq[2].u = 0.0f; vsq[2].v = 1.0f;
+        vsq[3].x = 130.0f; vsq[3].y = -30.0f; vsq[3].z = 0.0f;
+        vsq[3].color = D3DCOLOR_XRGB(255, 255, 255);
+        vsq[3].u = 1.0f; vsq[3].v = 1.0f;
+        struct TexVertex vsverts[6];
+        vsverts[0] = vsq[0]; vsverts[1] = vsq[1]; vsverts[2] = vsq[2];
+        vsverts[3] = vsq[1]; vsverts[4] = vsq[3]; vsverts[5] = vsq[2];
+        if (FAILED(IDirect3DDevice9_DrawPrimitiveUP(
+                       g_device, D3DPT_TRIANGLELIST, 2, vsverts,
+                       (UINT)sizeof(vsverts[0])))) {
+            return 153;
+        }
+        if (FAILED(IDirect3DDevice9_SetVertexShader(g_device, NULL)) ||
+            FAILED(IDirect3DDevice9_SetTexture(g_device, 0, NULL))) {
+            return 152;
+        }
+    }
+    // ── L1 w-skewed quad (perspective-correct interpolation) ─────────────
+    // The projection matrix is the ortho PLUS a w-shear (`_24 = 0.002`, so
+    // clip w = 1 + 0.002·y varies 0.84..0.96 across the quad). The quad
+    // covers screen x∈[136,196], y∈[141,215]; its center pixel (165,175)
+    // samples texel (0,0) RED under perspective-correct uv (≈(0.499,0.499))
+    // but texel (1,0) GREEN under the old affine interpolation
+    // (≈(0.532,0.466)) — the host renderer test + the resting-frame hash
+    // gate the difference.
+    {
+        D3DMATRIX wskew = g_ortho;
+        wskew._24 = 0.002f;
+        if (FAILED(IDirect3DDevice9_SetTransform(
+                       g_device, D3DTS_PROJECTION, &wskew))) {
+            return 154;
+        }
+        if (FAILED(IDirect3DDevice9_SetTexture(g_device, 0,
+                                               (IDirect3DBaseTexture9 *)g_tex))) {
+            return 134;
+        }
+        struct TexVertex wsq[4];
+        wsq[0].x = -20.0f; wsq[0].y = -20.0f; wsq[0].z = 0.0f;
+        wsq[0].color = D3DCOLOR_XRGB(255, 255, 255);
+        wsq[0].u = 0.0f; wsq[0].v = 0.0f;
+        wsq[1].x = 30.0f; wsq[1].y = -20.0f; wsq[1].z = 0.0f;
+        wsq[1].color = D3DCOLOR_XRGB(255, 255, 255);
+        wsq[1].u = 1.0f; wsq[1].v = 0.0f;
+        wsq[2].x = -20.0f; wsq[2].y = -80.0f; wsq[2].z = 0.0f;
+        wsq[2].color = D3DCOLOR_XRGB(255, 255, 255);
+        wsq[2].u = 0.0f; wsq[2].v = 1.0f;
+        wsq[3].x = 30.0f; wsq[3].y = -80.0f; wsq[3].z = 0.0f;
+        wsq[3].color = D3DCOLOR_XRGB(255, 255, 255);
+        wsq[3].u = 1.0f; wsq[3].v = 1.0f;
+        struct TexVertex wsverts[6];
+        wsverts[0] = wsq[0]; wsverts[1] = wsq[1]; wsverts[2] = wsq[2];
+        wsverts[3] = wsq[1]; wsverts[4] = wsq[3]; wsverts[5] = wsq[2];
+        if (FAILED(IDirect3DDevice9_DrawPrimitiveUP(
+                       g_device, D3DPT_TRIANGLELIST, 2, wsverts,
+                       (UINT)sizeof(wsverts[0])))) {
+            return 155;
+        }
+        if (FAILED(IDirect3DDevice9_SetTransform(
+                       g_device, D3DTS_PROJECTION, &g_ortho)) ||
+            FAILED(IDirect3DDevice9_SetTexture(g_device, 0, NULL))) {
+            return 154;
+        }
     }
     // ── P4c blend: an opaque red quad, then a half-alpha blue quad over its
     // left half. Blend factors SRCALPHA/INVSRCALPHA, ADD.
@@ -346,6 +583,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             IDirect3DSurface9_Release(g_depth);
             g_depth = NULL;
         }
+        if (g_vs) {
+            IDirect3DVertexShader9_Release(g_vs);
+            g_vs = NULL;
+        }
         if (g_timer_count < TIMER_TICKS_MIN) {
             PostQuitMessage(120);
         }
@@ -392,16 +633,15 @@ void entry(void) {
         ExitProcess(102);
     }
     {
-        // P5a caps honesty: the ps_2_0 interpreter is implemented, so the
-        // caps report D3DPS_VERSION(2,0) and PixelShader1xMaxValue 1.0; the
-        // vertex stage is still the FFP Gouraud path (vs_2_0 execution is
-        // P5a-2), so VertexShaderVersion stays 0. MaxVertexShaderConst
-        // reports the implemented vs_2_0 constant file (256 float4s).
+        // P5a caps honesty: the ps_2_0 interpreter AND the vs_2_0 vertex
+        // stage are implemented, so the caps report D3DPS_VERSION(2,0),
+        // D3DVS_VERSION(2,0), PixelShader1xMaxValue 1.0, and
+        // MaxVertexShaderConst 256 (the implemented vs_2_0 constant file).
         D3DCAPS9 caps;
         if (FAILED(IDirect3D9_GetDeviceCaps(g_d3d, 0, D3DDEVTYPE_HAL, &caps))) {
             ExitProcess(103);
         }
-        if (caps.VertexShaderVersion != 0) {
+        if (caps.VertexShaderVersion != D3DVS_VERSION(2, 0)) {
             ExitProcess(104);
         }
         if (caps.PixelShaderVersion != D3DPS_VERSION(2, 0)) {
@@ -434,13 +674,24 @@ void entry(void) {
         }
     }
     {
+        // Create the vs_2_0 shader (embedded bytecode above).
+        HRESULT hr = IDirect3DDevice9_CreateVertexShader(g_device,
+                                                         g_vs_bytecode, &g_vs);
+        if (FAILED(hr) || g_vs == NULL) {
+            ExitProcess(150);
+        }
+    }
+    {
         // Orthographic projection: world x ∈ [-160,160] → NDC [-1,1],
         // world y ∈ [-120,120] → NDC [-1,1] (y-up world, y-down screen).
+        // Stored in g_ortho: the VS quad's constant columns and the w-skewed
+        // quad's restore both read it.
         D3DMATRIX proj;
         proj._11 = 2.0f / BACKBUFFER_W; proj._12 = 0.0f; proj._13 = 0.0f; proj._14 = 0.0f;
         proj._21 = 0.0f; proj._22 = 2.0f / BACKBUFFER_H; proj._23 = 0.0f; proj._24 = 0.0f;
         proj._31 = 0.0f; proj._32 = 0.0f; proj._33 = 1.0f; proj._34 = 0.0f;
         proj._41 = 0.0f; proj._42 = 0.0f; proj._43 = 0.0f; proj._44 = 1.0f;
+        g_ortho = proj;
         if (FAILED(IDirect3DDevice9_SetTransform(g_device, D3DTS_PROJECTION, &proj))) {
             ExitProcess(110);
         }

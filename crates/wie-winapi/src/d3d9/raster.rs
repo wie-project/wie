@@ -4,8 +4,9 @@ use super::{D3DFMT_INDEX32, DepthStencilRecord, TextureRecord};
 use crate::WinApiState;
 use crate::d3d9_render::{
     D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DTOP_DISABLE, FragmentState,
-    FvfLayout, GuestVertex, Mat4, PsProgram, RenderState, TextureStage, TextureStageState,
-    Viewport, draw_triangle, mat4_mul, parse_vertex,
+    FvfLayout, GuestVertex, Mat4, PsProgram, RenderState, ScreenVertex, TextureStage,
+    TextureStageState, Viewport, VsProgram, clip_to_viewport, draw_triangle, mat4_mul,
+    parse_vertex, rasterize_triangle, run_vertex_shader, vs_input_from_vertex,
 };
 use crate::d3d9_shader::{PS_SAMPLER_COUNT, ShaderKind};
 
@@ -141,18 +142,27 @@ fn read_index(bytes: &[u8], n: usize, size: usize) -> Option<usize> {
 
 /// Resolve one triangle corner to a vertex: either the stream position
 /// directly (non-indexed) or through the index buffer (indexed).
+///
+/// `indices` is `(bytes, index size, start-index offset)` — the offset is
+/// `DrawIndexedPrimitive`'s `StartIndex`, the first buffer position used.
+/// `vertex_base` is `BaseVertexIndex`, added to every resolved index (a
+/// negative base references vertices before the indexed window; out-of-range
+/// results reject the vertex).
 fn indexed_vertex(
     data: &[u8],
     layout: &FvfLayout,
     stride: usize,
-    indices: Option<(&[u8], usize)>,
+    indices: Option<(&[u8], usize, usize)>,
+    vertex_base: i64,
     vertex_index: usize,
 ) -> Option<GuestVertex> {
     let index = match indices {
-        Some((bytes, size)) => read_index(bytes, vertex_index, size)?,
+        Some((bytes, size, offset)) => read_index(bytes, offset.checked_add(vertex_index)?, size)?,
         None => vertex_index,
     };
-    parse_vertex(data, index.checked_mul(stride)?, layout)
+    let resolved = i64::try_from(index).ok()?.checked_add(vertex_base)?;
+    let resolved = usize::try_from(resolved).ok()?;
+    parse_vertex(data, resolved.checked_mul(stride)?, layout)
 }
 
 /// Build the per-draw blend + depth fragment state from the typed device
@@ -254,20 +264,74 @@ fn resolve_ps_samplers<'a>(
     samplers
 }
 
+/// Resolve a bound vertex shader into an executable program: the parsed
+/// instructions (borrowed from the shader record) and a copy of the constant
+/// registers (SetVertexShaderConstantF + def from Create time). `None` when
+/// no shader is bound — the FFP transform runs.
+///
+/// Takes the shader-record map by field-level reference so the returned
+/// program borrows only that field (the caller holds the backbuffer mutably
+/// below).
+fn resolve_vs_program<'a>(
+    current: u64,
+    shaders: &'a ahash::HashMap<u64, crate::d3d9_shader::ShaderRecord>,
+    constants: [[f32; 4]; crate::d3d9_shader::VS_CONST_COUNT],
+) -> Option<VsProgram<'a>> {
+    if current == 0 {
+        return None;
+    }
+    shaders.get(&current).and_then(|record| {
+        (record.kind == ShaderKind::Vertex).then(|| VsProgram {
+            instructions: &record.parsed.instructions,
+            constants,
+        })
+    })
+}
+
+/// Run the bound vertex shader on one FVF-decoded vertex and map its `oPos`
+/// through the viewport transform (w-divide + MinZ/MaxZ z-scale).
+///
+/// `None` when `oPos.w <= 0` (at/behind the near plane — the triangle is
+/// rejected, same rule as the FFP path).
+fn vs_vertex_to_screen(
+    program: &VsProgram<'_>,
+    v: &GuestVertex,
+    layout: &FvfLayout,
+    vp: &Viewport,
+) -> Option<ScreenVertex> {
+    let input = vs_input_from_vertex(v, layout);
+    let out = run_vertex_shader(program, &input);
+    let (sx, sy, sz, w) = clip_to_viewport(out.pos, vp)?;
+    Some(ScreenVertex {
+        x: sx,
+        y: sy,
+        z: sz,
+        w,
+        color: out.color,
+        u: out.u,
+        v: out.v,
+    })
+}
+
 /// Rasterize a batched vertex stream into the backbuffer.
 ///
 /// `data` is the full vertex pool; `triples` names each triangle; `indices`
-/// (when present) resolves triangle corners through an index buffer. Reads
-/// the world × view × projection transform and viewport from device state,
-/// rejects triangles behind the near-plane, and accumulates the dirty region.
-/// When a stage-0 texture is bound and enabled, the fragment stage samples it.
+/// (when present) resolves triangle corners through an index buffer (`bytes`,
+/// index size, and the `StartIndex` offset into it). `vertex_base` is added
+/// to every resolved index (`BaseVertexIndex`). When a vertex shader is bound,
+/// each vertex runs through the VS interpreter (FVF decode → `v0..v15` →
+/// `oPos` → viewport transform); otherwise the world × view × projection
+/// transform applies. Rejects triangles behind the near-plane, and accumulates
+/// the dirty region. When a stage-0 texture is bound and enabled, the fragment
+/// stage samples it.
 fn rasterize_vertex_stream(
     state: &mut WinApiState,
     data: &[u8],
     layout: &FvfLayout,
     stride: usize,
     triples: &[(usize, usize, usize)],
-    indices: Option<(&[u8], usize)>,
+    indices: Option<(&[u8], usize, usize)>,
+    vertex_base: i64,
 ) {
     let (width, height) = (
         state.d3d9().d3d9_backbuffer_width,
@@ -329,6 +393,14 @@ fn rasterize_vertex_stream(
                 })
             })
     };
+    // A bound vertex shader replaces the FFP transform: each vertex runs the
+    // interpreter and its oPos feeds the viewport transform directly (the
+    // world/view/projection matrices are ignored in the programmable path).
+    let vs_program = resolve_vs_program(
+        d3d.d3d9_current_vertex_shader,
+        &d3d.d3d9_shaders,
+        d3d.d3d9_vs_constants,
+    );
     // Resolve the blend + depth fragment state (mutably borrows the bound
     // depth buffer — a different field than the backbuffer).
     let mut frag = build_fragment_state(
@@ -337,35 +409,61 @@ fn rasterize_vertex_stream(
         &mut d3d.d3d9_depth_surfaces,
     );
     for &(i0, i1, i2) in triples {
-        let Some(v0) = indexed_vertex(data, layout, stride, indices, i0) else {
+        let Some(v0) = indexed_vertex(data, layout, stride, indices, vertex_base, i0) else {
             continue;
         };
-        let Some(v1) = indexed_vertex(data, layout, stride, indices, i1) else {
+        let Some(v1) = indexed_vertex(data, layout, stride, indices, vertex_base, i1) else {
             continue;
         };
-        let Some(v2) = indexed_vertex(data, layout, stride, indices, i2) else {
+        let Some(v2) = indexed_vertex(data, layout, stride, indices, vertex_base, i2) else {
             continue;
         };
-        draw_triangle(
-            &mut d3d.d3d9_backbuffer,
-            width,
-            height,
-            v0,
-            v1,
-            v2,
-            pre_transformed,
-            &matrix,
-            &viewport,
-            tex.as_ref(),
-            ps.as_ref(),
-            &mut frag,
-            &mut dirty,
-        );
+        if let Some(program) = &vs_program {
+            // Programmable path: VS per vertex → screen-space triangle.
+            let Some(a) = vs_vertex_to_screen(program, &v0, layout, &viewport) else {
+                continue;
+            };
+            let Some(b) = vs_vertex_to_screen(program, &v1, layout, &viewport) else {
+                continue;
+            };
+            let Some(c) = vs_vertex_to_screen(program, &v2, layout, &viewport) else {
+                continue;
+            };
+            rasterize_triangle(
+                &mut d3d.d3d9_backbuffer,
+                width,
+                height,
+                a,
+                b,
+                c,
+                tex.as_ref(),
+                ps.as_ref(),
+                &mut frag,
+                &mut dirty,
+            );
+        } else {
+            draw_triangle(
+                &mut d3d.d3d9_backbuffer,
+                width,
+                height,
+                v0,
+                v1,
+                v2,
+                pre_transformed,
+                &matrix,
+                &viewport,
+                tex.as_ref(),
+                ps.as_ref(),
+                &mut frag,
+                &mut dirty,
+            );
+        }
     }
     d3d.d3d9_dirty = dirty;
 }
 
-/// Batched-memory-read a vertex pool (+ optional index buffer) and rasterize.
+/// Batched-memory-read a guest vertex pool (+ optional guest index buffer)
+/// and rasterize — the Draw*UP path.
 ///
 /// The guest vertex data is read with ONE `mem_read` per buffer (the GDI blit
 /// span pattern), then parsed host-side by FVF layout. Unreadable/malformed
@@ -420,15 +518,60 @@ pub(crate) fn draw_vertex_stream(
         None
     };
 
-    rasterize_vertex_stream(
+    draw_vertex_stream_host(
         state,
         &data,
         layout,
         stride,
-        &triples,
+        vertex_count,
+        primitive_type,
+        primitive_count,
         indices
             .as_ref()
             .map(|(bytes, size)| (bytes.as_slice(), *size)),
+        0,
+        0,
+    )
+}
+
+/// Rasterize a host-side vertex pool (+ optional host index data) — the
+/// buffer-form draw path (`DrawPrimitive`/`DrawIndexedPrimitive`).
+///
+/// `data` starts at the stream base already (the `SetStreamSource`
+/// `OffsetInBytes` and `DrawPrimitive`'s `StartVertex` are baked into the
+/// slice by the caller). `indices` carries `(bytes, index size)`; `index_offset`
+/// is `StartIndex`; `vertex_base` is `BaseVertexIndex`. Out-of-range vertices
+/// reject their triangle (the same skip the UP path uses for bad pointers) —
+/// no guest memory is touched.
+// Wide signature: one full draw command (host stream + FVF + primitive + indices).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_vertex_stream_host(
+    state: &mut WinApiState,
+    data: &[u8],
+    layout: &FvfLayout,
+    stride: usize,
+    _vertex_count: usize,
+    primitive_type: u64,
+    primitive_count: u64,
+    indices: Option<(&[u8], usize)>,
+    index_offset: usize,
+    vertex_base: i64,
+) -> Result<()> {
+    if data.is_empty() || stride == 0 {
+        return Ok(());
+    }
+    let triples = triangle_index_triples(primitive_type, primitive_count)?;
+    if triples.is_empty() {
+        return Ok(());
+    }
+    rasterize_vertex_stream(
+        state,
+        data,
+        layout,
+        stride,
+        &triples,
+        indices.map(|(bytes, size)| (bytes, size, index_offset)),
+        vertex_base,
     );
     Ok(())
 }

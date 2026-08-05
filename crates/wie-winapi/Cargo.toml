@@ -10,7 +10,6 @@ anyhow.workspace = true
 ahash.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-serde.workspace = true
 libc = "0.2"
 ab_glyph = "0.2"
 fontdb = "0.24"

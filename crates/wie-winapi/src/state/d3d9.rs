@@ -60,13 +60,18 @@ pub struct D3D9State {
     /// Accumulated dirty region since the last Present (backbuffer coords);
     /// `None` = the whole backbuffer changed (Clear always sets this).
     pub(crate) d3d9_dirty: Option<crate::gdi32::IRect>,
-    /// `SetStreamSource` stream-0 vertex pointer (buffer form; slice 1 stores
-    /// but never creates real buffers — see `CreateVertexBuffer`).
+    /// `SetStreamSource` stream-0 vertex buffer pointer (buffer form).
     pub(crate) d3d9_stream_source_va: u64,
     /// `SetStreamSource` stream-0 stride.
     pub(crate) d3d9_stream_stride: u32,
-    /// `SetIndices` index pointer (buffer form; unused in slice 1).
+    /// `SetStreamSource` stream-0 `OffsetInBytes` (added to the buffer base
+    /// when the buffer-form draws resolve vertex positions).
+    pub(crate) d3d9_stream_offset: u32,
+    /// `SetIndices` index buffer pointer (buffer form; unused in slice 1).
     pub(crate) d3d9_index_buffer_va: u64,
+    // ── L2 buffer-object state ──────────────────────────────────────────
+    /// Vertex/index buffer records keyed by the buffer object's guest VA.
+    pub(crate) d3d9_buffers: HashMap<u64, crate::d3d9::BufferRecord>,
     // ── P4b texture state ───────────────────────────────────────────────
     /// Texture records keyed by the texture object's guest VA.
     pub(crate) d3d9_textures: HashMap<u64, crate::d3d9::TextureRecord>,
@@ -119,7 +124,9 @@ impl Default for D3D9State {
             d3d9_dirty: None,
             d3d9_stream_source_va: 0,
             d3d9_stream_stride: 0,
+            d3d9_stream_offset: 0,
             d3d9_index_buffer_va: 0,
+            d3d9_buffers: HashMap::new(),
             d3d9_textures: HashMap::new(),
             d3d9_surface_textures: HashMap::new(),
             d3d9_texture_bindings: [0; 8],

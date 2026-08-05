@@ -4,9 +4,10 @@ use super::{
     D3DBLENDOP_SUBTRACT, D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCMP_GREATER, D3DCMP_GREATEREQUAL,
     D3DCMP_LESS, D3DCMP_LESSEQUAL, D3DCMP_NEVER, D3DCMP_NOTEQUAL, D3DFVF_DIFFUSE, D3DFVF_NORMAL,
     D3DFVF_SPECULAR, D3DFVF_XYZ, D3DFVF_XYZRHW, GuestVertex, IDENTITY, PsFragmentInput, PsProgram,
-    ScreenVertex, Viewport, clip_to_screen, draw_triangle, is_top_or_left_edge, mat4_mul,
-    parse_fvf, parse_vertex, pixel_shader_alpha_to_u8, pixel_shader_color_to_0rgb,
-    rasterize_triangle, run_pixel_shader, transform_point,
+    ScreenVertex, Viewport, VsProgram, VsVertexInput, clip_to_screen, clip_to_viewport,
+    draw_triangle, is_top_or_left_edge, mat4_mul, parse_fvf, parse_vertex,
+    pixel_shader_alpha_to_u8, pixel_shader_color_to_0rgb, rasterize_triangle, run_pixel_shader,
+    run_vertex_shader, transform_point, vs_input_from_vertex,
 };
 use crate::d3d9_shader::{
     D3DSPDM_NONE, D3DSPDM_SATURATE, D3DSPSM_ABS, D3DSPSM_ABSNEG, D3DSPSM_BIAS, D3DSPSM_BIASNEG,
@@ -394,6 +395,7 @@ fn rasterize_fills_triangle_pixels() {
             x: 0.0,
             y: 0.0,
             z: 0.0,
+            w: 1.0,
             color,
             u: 0.0,
             v: 0.0,
@@ -402,6 +404,7 @@ fn rasterize_fills_triangle_pixels() {
             x: 4.0,
             y: 0.0,
             z: 0.0,
+            w: 1.0,
             color,
             u: 0.0,
             v: 0.0,
@@ -410,6 +413,7 @@ fn rasterize_fills_triangle_pixels() {
             x: 0.0,
             y: 4.0,
             z: 0.0,
+            w: 1.0,
             color,
             u: 0.0,
             v: 0.0,
@@ -455,6 +459,7 @@ fn rasterize_shared_edge_single_ownership() {
             x: 0.0,
             y: 0.0,
             z: 0.0,
+            w: 1.0,
             color: red,
             u: 0.0,
             v: 0.0,
@@ -463,6 +468,7 @@ fn rasterize_shared_edge_single_ownership() {
             x: 2.0,
             y: 0.0,
             z: 0.0,
+            w: 1.0,
             color: red,
             u: 0.0,
             v: 0.0,
@@ -471,6 +477,7 @@ fn rasterize_shared_edge_single_ownership() {
             x: 2.0,
             y: 4.0,
             z: 0.0,
+            w: 1.0,
             color: red,
             u: 0.0,
             v: 0.0,
@@ -488,6 +495,7 @@ fn rasterize_shared_edge_single_ownership() {
             x: 2.0,
             y: 0.0,
             z: 0.0,
+            w: 1.0,
             color: blue,
             u: 0.0,
             v: 0.0,
@@ -496,6 +504,7 @@ fn rasterize_shared_edge_single_ownership() {
             x: 4.0,
             y: 0.0,
             z: 0.0,
+            w: 1.0,
             color: blue,
             u: 0.0,
             v: 0.0,
@@ -504,6 +513,7 @@ fn rasterize_shared_edge_single_ownership() {
             x: 2.0,
             y: 4.0,
             z: 0.0,
+            w: 1.0,
             color: blue,
             u: 0.0,
             v: 0.0,
@@ -1071,4 +1081,447 @@ fn interpreter_unbound_sampler_texld_writes_zero() {
     };
     let out = run_pixel_shader(&prog, &input()).expect("runs");
     assert_eq!(out, [0.0; 4]);
+}
+
+// ── vertex-shader interpreter + z/w plumbing tests ───────────────────
+
+/// Build a vs program with the given instructions and constant registers.
+fn vs_program(instructions: Vec<PsInstruction>, constants: &[[f32; 4]; 256]) -> VsProgram<'static> {
+    VsProgram {
+        instructions: Box::leak(instructions.into_boxed_slice()),
+        constants: *constants,
+    }
+}
+
+/// A vs operand builder with a writable field set.
+fn vs_src(reg_type: RegType, reg_num: u16) -> Operand {
+    Operand {
+        reg_type,
+        reg_num,
+        swizzle: [0, 1, 2, 3],
+        src_mod: 0,
+        dst_mod: D3DSPDM_NONE,
+        write_mask: 0xF,
+    }
+}
+
+/// `oPos` — the vs rasterizer-output destination register.
+fn o_pos() -> Operand {
+    vs_src(RegType::RastOut, 0)
+}
+
+#[test]
+fn vs_interpreter_arithmetic_ops_match_reference() {
+    // The same reference-math table as the PS interpreter, executed through
+    // the vertex stage (results land in oPos).
+    let mut constants = [[0.0; 4]; 256];
+    constants[0] = [2.0, 3.0, 4.0, 5.0]; // a
+    constants[1] = [3.0, 1.0, -2.0, 0.5]; // b
+    constants[2] = [1.0, 1.0, 1.0, 1.0]; // c
+    let run = |op: PsOp| {
+        let instrs = vec![
+            PsInstruction {
+                op,
+                dst: Some(o_pos()),
+                srcs: vec![
+                    vs_src(RegType::Const, 0),
+                    vs_src(RegType::Const, 1),
+                    vs_src(RegType::Const, 2),
+                ],
+                tex_type: None,
+                end: false,
+            },
+            PsInstruction {
+                op: PsOp::End,
+                dst: None,
+                srcs: Vec::new(),
+                tex_type: None,
+                end: true,
+            },
+        ];
+        run_vertex_shader(
+            &vs_program(instrs, &constants),
+            &VsVertexInput { v: [[0.0; 4]; 16] },
+        )
+        .pos
+    };
+    assert_eq!(run(PsOp::Add), [5.0, 4.0, 2.0, 5.5]);
+    assert_eq!(run(PsOp::Sub), [-1.0, 2.0, 6.0, 4.5]);
+    assert_eq!(run(PsOp::Mul), [6.0, 3.0, -8.0, 2.5]);
+    assert_eq!(run(PsOp::Mad), [7.0, 4.0, -7.0, 3.5]);
+    assert_eq!(run(PsOp::Dp3), [1.0; 4]);
+    assert_eq!(run(PsOp::Dp4), [3.5; 4]);
+    assert_eq!(run(PsOp::Min), [2.0, 1.0, -2.0, 0.5]);
+    assert_eq!(run(PsOp::Max), [3.0, 3.0, 4.0, 5.0]);
+    assert_eq!(run(PsOp::Slt), [1.0, 0.0, 0.0, 0.0]);
+    assert_eq!(run(PsOp::Sge), [0.0, 1.0, 1.0, 1.0]);
+    assert_eq!(
+        run(PsOp::Lrp),
+        [
+            2.0 * 3.0 + (1.0 - 2.0) * 1.0,
+            3.0 * 1.0 + (1.0 - 3.0) * 1.0,
+            4.0 * -2.0 + (1.0 - 4.0) * 1.0,
+            5.0 * 0.5 + (1.0 - 5.0) * 1.0
+        ]
+    );
+    assert_eq!(run(PsOp::Cmp), [3.0, 1.0, -2.0, 0.5]);
+    // Scalar ops (rcp/rsq/exp/log/frc) read only constants[0]; run them
+    // with a dedicated scalar input.
+    let run_scalar = |op: PsOp, c0: [f32; 4]| {
+        let mut scalar_constants = [[0.0; 4]; 256];
+        scalar_constants[0] = c0;
+        let instrs = vec![
+            PsInstruction {
+                op,
+                dst: Some(o_pos()),
+                srcs: vec![vs_src(RegType::Const, 0)],
+                tex_type: None,
+                end: false,
+            },
+            PsInstruction {
+                op: PsOp::End,
+                dst: None,
+                srcs: Vec::new(),
+                tex_type: None,
+                end: true,
+            },
+        ];
+        run_vertex_shader(
+            &vs_program(instrs, &scalar_constants),
+            &VsVertexInput { v: [[0.0; 4]; 16] },
+        )
+        .pos
+    };
+    assert_eq!(run_scalar(PsOp::Rcp, [4.0, 99.0, 99.0, 99.0]), [0.25; 4]);
+    assert_eq!(run_scalar(PsOp::Rsq, [4.0, 99.0, 99.0, 99.0]), [0.5; 4]);
+    // exp/log compute the x channel and copy yzw.
+    assert_eq!(
+        run_scalar(PsOp::Exp, [4.0, 99.0, 99.0, 99.0]),
+        [16.0, 99.0, 99.0, 99.0]
+    );
+    assert_eq!(
+        run_scalar(PsOp::Log, [4.0, 99.0, 99.0, 99.0]),
+        [2.0, 99.0, 99.0, 99.0]
+    );
+    // frc applies per component.
+    assert_eq!(
+        run_scalar(PsOp::Frc, [4.5, 99.0, 99.0, 99.0]),
+        [0.5, 0.0, 0.0, 0.0]
+    );
+}
+
+#[test]
+fn vs_interpreter_micro_exe_shader_transforms_and_passes_attributes() {
+    // The exact shader the gui_d3d9 micro-exe ships: dcl v0/v5/v6 → mov
+    // oT0,v5 / mov oD0,v6 → dp4 oPos.x/y/z/w, v0, c0..c3 → end. With the
+    // orthographic projection's columns in c0..c3, oPos must equal
+    // v0·M and oT0/oD0 must pass through untouched.
+    let mut instrs = vec![
+        PsInstruction {
+            op: PsOp::Dcl,
+            dst: Some(vs_src(RegType::Input, 0)),
+            srcs: Vec::new(),
+            tex_type: None,
+            end: false,
+        },
+        PsInstruction {
+            op: PsOp::Dcl,
+            dst: Some(vs_src(RegType::Input, 5)),
+            srcs: Vec::new(),
+            tex_type: None,
+            end: false,
+        },
+        PsInstruction {
+            op: PsOp::Dcl,
+            dst: Some(vs_src(RegType::Input, 6)),
+            srcs: Vec::new(),
+            tex_type: None,
+            end: false,
+        },
+        PsInstruction {
+            op: PsOp::Mov,
+            dst: Some(vs_src(RegType::TexcrdOut, 0)),
+            srcs: vec![vs_src(RegType::Input, 5)],
+            tex_type: None,
+            end: false,
+        },
+        PsInstruction {
+            op: PsOp::Mov,
+            dst: Some(vs_src(RegType::AttrOut, 0)),
+            srcs: vec![vs_src(RegType::Input, 6)],
+            tex_type: None,
+            end: false,
+        },
+    ];
+    // dp4 oPos.{x,y,z,w}, v0, c{i}
+    for (channel, reg) in [(0_u16, 0_u16), (1, 1), (2, 2), (3, 3)] {
+        let mut dst = o_pos();
+        dst.write_mask = 1 << channel;
+        instrs.extend([PsInstruction {
+            op: PsOp::Dp4,
+            dst: Some(dst),
+            srcs: vec![vs_src(RegType::Input, 0), vs_src(RegType::Const, reg)],
+            tex_type: None,
+            end: false,
+        }]);
+    }
+    instrs.push(PsInstruction {
+        op: PsOp::End,
+        dst: None,
+        srcs: Vec::new(),
+        tex_type: None,
+        end: true,
+    });
+
+    let mut constants = [[0.0; 4]; 256];
+    // The ortho projection columns (row-vector: oPos = v0·M).
+    constants[0] = [2.0 / 320.0, 0.0, 0.0, 0.0];
+    constants[1] = [0.0, 2.0 / 240.0, 0.0, 0.0];
+    constants[2] = [0.0, 0.0, 1.0, 0.0];
+    constants[3] = [0.0, 0.0, 0.0, 1.0];
+    let input = VsVertexInput {
+        v: {
+            let mut v = [[0.0_f32; 4]; 16];
+            v[0] = [80.0, 110.0, 0.0, 1.0];
+            v[5] = [0.25, 0.75, 0.0, 1.0];
+            v[6] = [1.0, 1.0, 1.0, 1.0];
+            v
+        },
+    };
+    let out = run_vertex_shader(&vs_program(instrs, &constants), &input);
+    assert_eq!(out.u, 0.25);
+    assert_eq!(out.v, 0.75);
+    assert_eq!(out.color, 0xFF_FF_FF_FF);
+    // oPos = v0·M: x = 80·(2/320) = 0.5, y = 110·(2/240) = 0.91667, z = 0, w = 1.
+    let expected = transform_point([80.0, 110.0, 0.0, 1.0], &{
+        let mut m = IDENTITY;
+        m[0] = 2.0 / 320.0;
+        m[5] = 2.0 / 240.0;
+        m
+    });
+    assert_eq!(out.pos, expected);
+}
+
+#[test]
+fn vs_interpreter_partial_rastout_masks_accumulate() {
+    // dp4 oPos.x, v0, c0 writes only .x — the other channels must stay 0
+    // (the same write-mask merging the PS interpreter applies).
+    let mut constants = [[0.0; 4]; 256];
+    constants[0] = [1.0, 0.0, 0.0, 0.0];
+    let mut dst = o_pos();
+    dst.write_mask = 0x1;
+    let instrs = vec![
+        PsInstruction {
+            op: PsOp::Dp4,
+            dst: Some(dst),
+            srcs: vec![vs_src(RegType::Input, 0), vs_src(RegType::Const, 0)],
+            tex_type: None,
+            end: false,
+        },
+        PsInstruction {
+            op: PsOp::End,
+            dst: None,
+            srcs: Vec::new(),
+            tex_type: None,
+            end: true,
+        },
+    ];
+    let input = VsVertexInput {
+        v: {
+            let mut v = [[0.0_f32; 4]; 16];
+            v[0] = [5.0, 0.0, 0.0, 1.0];
+            v
+        },
+    };
+    let out = run_vertex_shader(&vs_program(instrs, &constants), &input);
+    assert_eq!(out.pos, [5.0, 0.0, 0.0, 0.0]);
+}
+
+#[test]
+fn vs_input_from_vertex_maps_fvf_semantics() {
+    // XYZ|DIFFUSE|TEX1 → v0 = position, v5 = texcoord0, v6 = diffuse.
+    let layout = parse_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | 0x0100).expect("valid FVF");
+    let v = GuestVertex {
+        x: 1.0,
+        y: 2.0,
+        z: 3.0,
+        w: 1.0,
+        color: 0xFF_80_40_20,
+        u: 0.25,
+        v: 0.5,
+    };
+    let input = vs_input_from_vertex(&v, &layout);
+    assert_eq!(input.v[0], [1.0, 2.0, 3.0, 1.0]);
+    assert_eq!(input.v[5], [0.25, 0.5, 0.0, 1.0]);
+    assert_eq!(
+        input.v[6],
+        [
+            0x80 as f32 / 255.0,
+            0x40 as f32 / 255.0,
+            0x20 as f32 / 255.0,
+            1.0
+        ]
+    );
+    // Registers the FVF does not supply read zero.
+    assert_eq!(input.v[1], [0.0; 4]);
+    assert_eq!(input.v[15], [0.0; 4]);
+}
+
+#[test]
+fn clip_to_viewport_applies_w_divide_and_minmax_z_scale() {
+    let vp = Viewport {
+        x: 10,
+        y: 20,
+        width: 100,
+        height: 50,
+        min_z: 0.25,
+        max_z: 0.75,
+    };
+    // NDC (-1, 1, 0.5) at w=1 → top-left corner, z = 0.25 + (0.5+1)·0.5·0.5.
+    let (sx, sy, sz, w) = clip_to_viewport([-1.0, 1.0, 0.5, 1.0], &vp).expect("in front");
+    assert_eq!((sx, sy), (10.0, 20.0));
+    assert!((sz - 0.625).abs() < 1e-6);
+    assert_eq!(w, 1.0);
+    // The z-range clamps at MinZ/MaxZ for z_ndc = -1 / +1.
+    let (_, _, z0, _) = clip_to_viewport([0.0, 0.0, -1.0, 1.0], &vp).expect("in front");
+    let (_, _, z1, _) = clip_to_viewport([0.0, 0.0, 1.0, 1.0], &vp).expect("in front");
+    assert_eq!(z0, vp.min_z);
+    assert_eq!(z1, vp.max_z);
+    // The w-divide: a clip point at half w lands at half the NDC extent.
+    let (sx, sy, _, w) = clip_to_viewport([1.0, -1.0, 0.0, 2.0], &vp).expect("in front");
+    assert_eq!((sx, sy), (85.0, 57.5)); // NDC (0.5, -0.5) → mid between center and corner
+    assert_eq!(w, 2.0);
+    // w <= 0 (on/behind the near plane) → rejected.
+    assert!(clip_to_viewport([0.0, 0.0, 0.0, 0.0], &vp).is_none());
+    assert!(clip_to_viewport([0.0, 0.0, 0.0, -1.0], &vp).is_none());
+}
+
+/// A 2x2 checkerboard texture stage (red/green/blue/white, POINT, WRAP) —
+/// the gui_d3d9 micro-exe's texture.
+fn checkerboard_stage() -> super::TextureStage<'static> {
+    let texels = vec![
+        0xFF_FF_00_00_u32, // red    (u=0, v=0)
+        0xFF_00_FF_00,     // green  (u=1, v=0)
+        0xFF_00_00_FF,     // blue   (u=0, v=1)
+        0xFF_FF_FF_FF,     // white  (u=1, v=1)
+    ]
+    .leak();
+    super::TextureStage {
+        pixels: texels,
+        width: 2,
+        height: 2,
+        addr_u: super::D3DTADDRESS_WRAP,
+        addr_v: super::D3DTADDRESS_WRAP,
+        mag_filter: super::D3DTEXF_POINT,
+        color_op: super::D3DTOP_MODULATE,
+        color_arg1: super::D3DTA_TEXTURE,
+        color_arg2: super::D3DTA_DIFFUSE,
+        alpha_op: super::D3DTOP_MODULATE,
+        alpha_arg1: super::D3DTA_TEXTURE,
+        alpha_arg2: super::D3DTA_DIFFUSE,
+    }
+}
+
+/// The w-skewed quad's projection matrix from the micro-exe: the ortho plus
+/// a w-shear (`_24 = 0.002`), so clip w = 1 + 0.002·y varies across the quad.
+fn w_skew_projection() -> super::Mat4 {
+    let mut m = IDENTITY;
+    m[0] = 2.0 / 320.0; // _11
+    m[5] = 2.0 / 240.0; // _22
+    m[10] = 1.0; // _33
+    m[15] = 1.0; // _44
+    m[7] = 0.002; // _24 — the w-shear
+    m
+}
+
+#[test]
+fn perspective_interpolation_differs_from_affine_at_w_skewed_center() {
+    // The micro-exe's w-skewed quad (world A(-20,-20) B(30,-20) C(-20,-80)
+    // D(30,-80), uv full range, white diffuse). The quad's center pixel
+    // (165,175) — the world-space center (5,-50) projects to ≈(165.56,
+    // 175.56) — must sample texel (0,0) RED: perspective-correct uv is
+    // ≈(0.499, 0.499) (world-linear interpolation preserved), while the
+    // affine uv ≈(0.532, 0.466) lands in texel (1,0) GREEN. The observed
+    // pixel proves the fragment stage divides by the interpolated 1/w.
+    let vp = Viewport {
+        x: 0,
+        y: 0,
+        width: 320,
+        height: 240,
+        min_z: 0.0,
+        max_z: 1.0,
+    };
+    let mut back = vec![0xFF_00_00_00_u32; 320 * 240];
+    let mut dirty = Some(IRect::empty());
+    let v = |x: f32, y: f32, u: f32, vt: f32| GuestVertex {
+        x,
+        y,
+        z: 0.0,
+        w: 1.0,
+        color: 0xFF_FF_FF_FF,
+        u,
+        v: vt,
+    };
+    let tex = checkerboard_stage();
+    // Triangle (A,B,C) and (B,D,C), the same triangulation as the micro-exe.
+    draw_triangle(
+        &mut back,
+        320,
+        240,
+        v(-20.0, -20.0, 0.0, 0.0),
+        v(30.0, -20.0, 1.0, 0.0),
+        v(-20.0, -80.0, 0.0, 1.0),
+        false,
+        &w_skew_projection(),
+        &vp,
+        Some(&tex),
+        None,
+        &mut no_frag(),
+        &mut dirty,
+    );
+    draw_triangle(
+        &mut back,
+        320,
+        240,
+        v(30.0, -20.0, 1.0, 0.0),
+        v(30.0, -80.0, 1.0, 1.0),
+        v(-20.0, -80.0, 0.0, 1.0),
+        false,
+        &w_skew_projection(),
+        &vp,
+        Some(&tex),
+        None,
+        &mut no_frag(),
+        &mut dirty,
+    );
+    let center = back[175 * 320 + 165];
+    assert_eq!(
+        center, 0x00_FE_00_00,
+        "the w-skewed quad's center pixel must be the perspective-correct \
+         RED texel (0,0), not the affine GREEN (1,0)"
+    );
+    // Sanity: the affine uv at the same pixel really is in texel (1,0) —
+    // i.e. the two interpolants disagree by more than one texel. Computed
+    // from the screen-space triangle (A,B,C) directly: barycentric weights
+    // at pixel center (165.5, 175.5) → affine u ≈ 0.532, v ≈ 0.466.
+    let (ax, ay) = (139.17_f32, 140.83);
+    let (bx, by) = (191.25, 140.83);
+    let (cx, cy) = (136.19, 215.24);
+    let (px, py) = (165.5, 175.5);
+    let e_bc = (cx - bx) * (py - by) - (cy - by) * (px - bx);
+    let e_ca = (ax - cx) * (py - cy) - (ay - cy) * (px - cx);
+    let e_ab = (bx - ax) * (py - ay) - (by - ay) * (px - ax);
+    let sum = e_bc + e_ca + e_ab;
+    let (wa, wb, _wc) = (e_bc / sum, e_ca / sum, e_ab / sum);
+    let affine_u = wa * 0.0 + wb * 1.0;
+    let affine_v = wa * 0.0 + wb * 0.0 + (e_ab / sum) * 1.0;
+    assert!(
+        (affine_u - 0.5).abs() > 0.02 && (affine_v - 0.5).abs() > 0.02,
+        "the affine interpolant must differ from the perspective center \
+         (u={affine_u}, v={affine_v}) — the test quad no longer discriminates"
+    );
+    assert!(
+        affine_u >= 0.5 && affine_v < 0.5,
+        "the affine uv must land in the GREEN texel quadrant"
+    );
 }

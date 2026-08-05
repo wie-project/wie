@@ -191,9 +191,9 @@ pub fn handle_create_pixel_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 
 /// Handles `IDirect3DDevice9::CreateVertexShader` (vtable slot 91).
 ///
-/// Accepts vs_2_0 bytecode and stores the object (it must round-trip and
-/// bind); the vertex stage keeps the FFP Gouraud path until vertex shaders
-/// execute.
+/// Accepts vs_2_0 bytecode whose opcodes the vertex-stage interpreter
+/// executes; the advanced ops (`m4x4`/`dst`/`lit`/`pow`/… and all flow
+/// control) parse but are rejected with `D3DERR_INVALIDCALL` until L5.
 pub fn handle_create_vertex_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
@@ -214,7 +214,9 @@ pub fn handle_create_vertex_shader(ctx: &mut HandlerContext<'_>) -> Result<WinAp
             .ok()
             .and_then(|tokens| parse_shader(tokens).ok());
         match (bytecode, parsed) {
-            (Ok(bytecode), Some(parsed)) if parsed.kind == ShaderKind::Vertex => {
+            (Ok(bytecode), Some(parsed))
+                if parsed.kind == ShaderKind::Vertex && parsed.is_fully_executable() =>
+            {
                 let object = allocate_shader_object(engine, state, D3d9Iface::VertexShader9)?;
                 if object == 0 {
                     D3DERR_INVALIDCALL
