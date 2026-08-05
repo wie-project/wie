@@ -173,15 +173,17 @@ pub fn parse_dialogs(image: &[u8], sections: &[PeSectionMap]) -> Vec<DialogTempl
 
 /// Parse one dialog template from its resource bytes.
 ///
-/// Skips `DLGTEMPLATEEX` and any template whose items run past the
-/// byte slice (malformed → treated as absent).
+/// Handles both the standard `DLGTEMPLATE` (winuser.h, style first) and the
+/// extended `DLGTEMPLATEEX` (`dlgVer=1`, signature `0xFFFF` — the format
+/// `DIALOGEX`/`windres` emit). Malformed templates (items running past the
+/// byte slice) are treated as absent.
 fn parse_dialog_template(template_id: u16, lang: u16, bytes: &[u8]) -> Option<DialogTemplate> {
     let word0 = read_u16_at(bytes, 0)?;
     let word1 = read_u16_at(bytes, 2)?;
 
-    // DLGTEMPLATEEX (dlgVer=1, signature=0xFFFF): not parsed.
+    // DLGTEMPLATEEX (dlgVer=1, signature=0xFFFF): extended layout.
     if word0 == 1 && word1 == 0xFFFF {
-        return None;
+        return parse_dialog_template_ex(template_id, lang, bytes);
     }
 
     // Header selection. windres/rc emit the winuser.h DLGTEMPLATE (style
@@ -250,6 +252,71 @@ fn parse_dialog_template(template_id: u16, lang: u16, bytes: &[u8]) -> Option<Di
     })
 }
 
+/// Parse one `DLGTEMPLATEEX` — the extended dialog template `DIALOGEX`
+/// resources use (`dlgVer=1`, signature `0xFFFF`; emitted by windres/rc for
+/// the `DIALOGEX` statement).
+///
+/// Header layout (mirroring the winuser.h struct, byte-for-byte as windres
+/// emits it): `WORD dlgVer, WORD signature, DWORD helpID, DWORD exStyle,
+/// DWORD style, WORD cDlgItems, SHORT x, SHORT y, SHORT cx, SHORT cy`, then
+/// the menu/class/title `sz_Or_Ord` fields (packed — binutils windres does
+/// NOT DWORD-align these), then — when `DS_SETFONT` — `WORD pointSize, WORD
+/// weight, BYTE italic, BYTE charset, WCHAR typeface[]`, then the items.
+fn parse_dialog_template_ex(template_id: u16, lang: u16, bytes: &[u8]) -> Option<DialogTemplate> {
+    let ex_style = WindowExStyle(read_u32_at(bytes, 8)?);
+    let style = WindowStyle(read_u32_at(bytes, 12)?);
+    let item_count = u32::from(read_u16_at(bytes, 16)?);
+    let x = read_i16_at(bytes, 18)?;
+    let y = read_i16_at(bytes, 20)?;
+    let cx = read_i16_at(bytes, 22)?;
+    let cy = read_i16_at(bytes, 24)?;
+    let mut p = 26;
+
+    let (_menu, next) = read_optional_text(bytes, p)?;
+    p = next;
+    let (_class, next) = read_optional_text(bytes, p)?;
+    p = next;
+    let (title, next) = read_optional_text(bytes, p)?;
+    p = next;
+
+    // DS_SETFONT: the extended template carries pointSize + weight (u16s),
+    // italic + charset (u8s), then the NUL-terminated typeface string.
+    let mut font_point = None;
+    let mut font_face = None;
+    if style.contains(WindowStyle::DS_SETFONT) {
+        font_point = Some(read_u16_at(bytes, p)?);
+        let (face, next) = read_utf16_string(bytes, p.checked_add(6)?, None)?;
+        font_face = Some(face);
+        p = next;
+    }
+
+    // Items are DWORD-aligned relative to the start of the template.
+    let mut item_pos = p;
+    let mut items = Vec::new();
+    for _ in 0..item_count {
+        item_pos = align4(item_pos)?;
+        let (item, next) = parse_dialog_item_ex(bytes, item_pos)?;
+        items.push(item);
+        item_pos = next;
+    }
+
+    Some(DialogTemplate {
+        name: template_id,
+        lang,
+        style: style.bits(),
+        ex_style: ex_style.bits(),
+        x,
+        y,
+        cx,
+        cy,
+        title,
+        font_point,
+        font_face,
+        pixel_rect: PixelRect::from_dlu(x, y, cx, cy),
+        items,
+    })
+}
+
 /// Parse one `DLGITEMTEMPLATE`, returning the item and the offset just past
 /// its creation data.
 fn parse_dialog_item(bytes: &[u8], pos: usize) -> Option<(DialogItemTemplate, usize)> {
@@ -261,6 +328,53 @@ fn parse_dialog_item(bytes: &[u8], pos: usize) -> Option<(DialogItemTemplate, us
     let cy = read_i16_at(bytes, pos.checked_add(14)?)?;
     let id = read_u16_at(bytes, pos.checked_add(16)?)?;
     let mut p = pos.checked_add(18)?;
+
+    let (class, next) = parse_item_class(bytes, p)?;
+    p = next;
+    let (title, next) = read_optional_text(bytes, p)?;
+    p = next;
+    let creation_data_size = read_u16_at(bytes, p)?;
+    p = p
+        .checked_add(2)?
+        .checked_add(usize::from(creation_data_size))?;
+
+    Some((
+        DialogItemTemplate {
+            id,
+            style: style.bits(),
+            ex_style: ex_style.bits(),
+            x,
+            y,
+            cx,
+            cy,
+            class,
+            title,
+            pixel_rect: PixelRect::from_dlu(x, y, cx, cy),
+        },
+        p,
+    ))
+}
+
+/// Parse one `DLGITEMTEMPLATEEX` — the extended item layout `DIALOGEX`
+/// templates use — returning the item and the offset just past its creation
+/// data.
+///
+/// Layout (winuser.h, as windres emits it): `DWORD helpID, DWORD exStyle,
+/// DWORD style, SHORT x, SHORT y, SHORT cx, SHORT cy, DWORD id`, then the
+/// class/title `sz_Or_Ord` fields and the creation-data size word.
+fn parse_dialog_item_ex(bytes: &[u8], pos: usize) -> Option<(DialogItemTemplate, usize)> {
+    let _help_id = read_u32_at(bytes, pos)?;
+    let ex_style = WindowExStyle(read_u32_at(bytes, pos.checked_add(4)?)?);
+    let style = WindowStyle(read_u32_at(bytes, pos.checked_add(8)?)?);
+    let x = read_i16_at(bytes, pos.checked_add(12)?)?;
+    let y = read_i16_at(bytes, pos.checked_add(14)?)?;
+    let cx = read_i16_at(bytes, pos.checked_add(16)?)?;
+    let cy = read_i16_at(bytes, pos.checked_add(18)?)?;
+    // The EX item id is a DWORD; the runtime's GetDlgItem dispatches control
+    // ids through WM_COMMAND's 16-bit low word, so truncation matches the
+    // emulated surface (ids beyond 0xFFFF are not addressable by the guest).
+    let id = u16::try_from(read_u32_at(bytes, pos.checked_add(20)?)?).unwrap_or(0);
+    let mut p = pos.checked_add(24)?;
 
     let (class, next) = parse_item_class(bytes, p)?;
     p = next;
@@ -523,10 +637,61 @@ mod tests {
     }
 
     #[test]
-    fn dlg_template_ex_is_deferred() {
-        // dlgVer=1, signature=0xFFFF → skipped (unsupported).
-        let bytes = [1_u8, 0, 0xFF, 0xFF];
-        assert!(parse_dialog_template(1, 0x0409, &bytes).is_none());
+    fn parses_dlg_template_ex() {
+        // A `DIALOGEX` template as windres emits it: dlgVer=1, signature
+        // 0xFFFF, helpID, exStyle, style (DS_SETFONT), cDlgItems, x/y/cx/cy,
+        // then packed menu/class/title, the extended font block
+        // (pointSize + weight + italic + charset), then DWORD-aligned items.
+        let mut b = Vec::new();
+        put_u16(&mut b, 1); // dlgVer
+        put_u16(&mut b, 0xFFFF); // signature
+        put_u32(&mut b, 0); // helpID
+        put_u32(&mut b, 0); // exStyle
+        put_u32(&mut b, 0x80C0_0040); // WS_POPUP|WS_CAPTION|DS_SETFONT
+        put_u16(&mut b, 1); // cDlgItems
+        put_u16(&mut b, 10);
+        put_u16(&mut b, 20);
+        put_u16(&mut b, 100);
+        put_u16(&mut b, 40);
+        put_u16(&mut b, 0); // menu: absent
+        put_u16(&mut b, 0); // class: absent
+        put_utf16(&mut b, "Hi");
+        put_u16(&mut b, 8); // pointSize
+        put_u16(&mut b, 400); // weight (FW_NORMAL)
+        put_u16(&mut b, 0x0100); // italic=0, charset=DEFAULT_CHARSET(1)
+        put_utf16(&mut b, "Arial");
+        while b.len() & 3 != 0 {
+            b.push(0);
+        }
+        // Item: EDIT at (5, 5, 50, 14), id 0x208, helpID 7.
+        put_u32(&mut b, 7); // item helpID
+        put_u32(&mut b, 0); // exStyle
+        put_u32(&mut b, 0x5000_0080); // WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL
+        put_u16(&mut b, 5);
+        put_u16(&mut b, 5);
+        put_u16(&mut b, 50);
+        put_u16(&mut b, 14);
+        put_u32(&mut b, 0x208); // DWORD id
+        put_u16(&mut b, 0xFFFF);
+        put_u16(&mut b, 0x0081); // EDIT
+        put_utf16(&mut b, "");
+        put_u16(&mut b, 0); // creation data size
+
+        let t = parse_dialog_template(0x207, 0x0409, &b).expect("template");
+        assert_eq!(t.name, 0x207);
+        assert_eq!(t.style, 0x80C0_0040);
+        assert_eq!((t.x, t.y, t.cx, t.cy), (10, 20, 100, 40));
+        assert_eq!(t.pixel_rect.cx, 200);
+        assert_eq!(t.title, "Hi");
+        assert_eq!(t.font_point, Some(8));
+        assert_eq!(t.font_face.as_deref(), Some("Arial"));
+        assert_eq!(t.items.len(), 1);
+        let item = &t.items[0];
+        assert_eq!(item.id, 0x208);
+        assert_eq!(item.class, ItemClass::Edit);
+        assert_eq!(item.title, "");
+        assert_eq!((item.x, item.y, item.cx, item.cy), (5, 5, 50, 14));
+        assert_eq!(item.pixel_rect.cx, 100);
     }
 
     #[test]
@@ -540,6 +705,19 @@ mod tests {
         put_u16(&mut b, 0);
         put_u16(&mut b, 0);
         put_u16(&mut b, 0);
+        assert!(parse_dialog_template(1, 0x0409, &b).is_none());
+    }
+
+    #[test]
+    fn truncated_dlg_template_ex_is_not_fatal() {
+        // EX header claims 1 item but the bytes end inside the header.
+        let mut b = Vec::new();
+        put_u16(&mut b, 1); // dlgVer
+        put_u16(&mut b, 0xFFFF); // signature
+        put_u32(&mut b, 0); // helpID
+        put_u32(&mut b, 0); // exStyle
+        put_u32(&mut b, 0x80C0_0000);
+        put_u16(&mut b, 1); // cDlgItems
         assert!(parse_dialog_template(1, 0x0409, &b).is_none());
     }
 

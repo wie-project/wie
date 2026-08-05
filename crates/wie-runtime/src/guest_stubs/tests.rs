@@ -44,6 +44,43 @@ fn dialog_box_stub_encodes_modal_loop() {
 }
 
 #[test]
+fn dialog_box_stub_forwards_init_param_at_the_callee_read_offset() {
+    // The stub forwards DialogBoxParam's 5th arg (dwInitParam) as
+    // CreateDialogParam's 5th arg. The CALLER places arg5 at [rsp+0x20] so
+    // the callee reads it at [rsp+0x28] after the call pushes the return
+    // address. A store at [rsp+0x28] (as originally written) put the value 8
+    // bytes too high — the guest dialog proc then read garbage lParam and
+    // faulted on `s_pGotoData->iLine` in WM_INITDIALOG.
+    let body = GuestStubKind::DialogBoxParam {
+        create_dialog_param_va: 0x0000_7000_0000_2c00,
+        get_message_va: 0x0000_7000_0000_1f60,
+        is_dialog_message_va: 0x0000_7000_0000_2c10,
+        dispatch_message_va: 0x0000_7000_0000_22c0,
+        dialog_result_va: 0x0000_7000_0040_a000,
+    }
+    .encode();
+    // `mov rax, [rsp+0x90]` (load the caller's 5th arg) immediately followed
+    // by `mov [rsp+0x20], rax` (store it in CreateDialogParam's arg5 slot).
+    let forward = [
+        0x48, 0x8b, 0x84, 0x24, 0x90, 0x00, 0x00, 0x00, // mov rax, [rsp+0x90]
+        0x48, 0x89, 0x44, 0x24, 0x20, // mov [rsp+0x20], rax
+    ];
+    assert!(
+        body.windows(forward.len()).any(|w| w == forward),
+        "dialog stub must place dwInitParam at [rsp+0x20] (callee reads \
+         [rsp+0x28] after the call pushes the return address)"
+    );
+    // And it must NOT store at [rsp+0x28] (the old 8-bytes-too-high offset).
+    let wrong = [
+        0x48, 0x8b, 0x84, 0x24, 0x90, 0x00, 0x00, 0x00, 0x48, 0x89, 0x44, 0x24, 0x28,
+    ];
+    assert!(
+        !body.windows(wrong.len()).any(|w| w == wrong),
+        "dialog stub must not store dwInitParam at [rsp+0x28] (off by 8)"
+    );
+}
+
+#[test]
 fn dialog_callee_vas_resolve_without_imports() {
     // A guest that imports ONLY DialogBoxParamA never imports the modal
     // loop's callees; their fake VAs must still decode to the right

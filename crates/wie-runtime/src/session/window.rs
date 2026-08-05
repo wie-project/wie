@@ -65,6 +65,28 @@ impl GuestHandle {
             .cloned()
     }
 
+    /// The EDIT control's caret/selection for `hwnd`: `(caret, sel_start,
+    /// sel_end)` in character indices. `None` for a non-EDIT window or an
+    /// unseeded control. Read by the GUI micro-tests to observe the caret
+    /// after a guest `EM_SETSEL`/`EM_SCROLLCARET`.
+    #[must_use]
+    pub fn edit_selection(&self, hwnd: u64) -> Option<(usize, usize, usize)> {
+        let state = self.state.lock().ok()?;
+        state.try_window_state()?.edit_selection(hwnd)
+    }
+
+    /// The control-text buffer of `hwnd` (what `SetWindowText`/`WM_SETTEXT`
+    /// maintain for built-in controls). Read by the GUI micro-tests to check
+    /// a dialog field's contents.
+    #[must_use]
+    pub fn control_text(&self, hwnd: u64) -> Option<String> {
+        let state = self.state.lock().ok()?;
+        state
+            .try_window_state()?
+            .control_text(hwnd)
+            .map(str::to_owned)
+    }
+
     /// Whether frame timing instrumentation is active (lock-free gate).
     #[must_use]
     pub fn frame_timing_enabled(&self) -> bool {

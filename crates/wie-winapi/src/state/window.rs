@@ -627,6 +627,39 @@ pub struct WindowState {
     pub dialog_result_va: u64,
 }
 
+impl WindowState {
+    /// The EDIT control's caret/selection for `hwnd`, when its control state
+    /// has been seeded: `(caret, sel_start, sel_end)` in character indices.
+    ///
+    /// `None` for a non-EDIT window or an EDIT whose state was never touched
+    /// (the state seeds lazily on first message). Read by the GUI micro-tests
+    /// to observe the caret after a guest `EM_SETSEL`/`EM_SCROLLCARET`.
+    #[must_use]
+    pub fn edit_selection(&self, hwnd: u64) -> Option<(usize, usize, usize)> {
+        match self.control_states.get(&crate::handles::Hwnd::from(hwnd)) {
+            Some(crate::user32::controls::ControlState::Edit {
+                caret,
+                sel_start,
+                sel_end,
+                ..
+            }) => Some((*caret, *sel_start, *sel_end)),
+            _ => None,
+        }
+    }
+
+    /// The `control_text` of `hwnd` (the buffer `SetWindowText`/`WM_SETTEXT`
+    /// maintain for built-in controls), when it is a known window.
+    ///
+    /// Read by the GUI micro-tests to observe a dialog field's contents.
+    #[must_use]
+    pub fn control_text(&self, hwnd: u64) -> Option<&str> {
+        self.windows
+            .iter()
+            .find(|w| w.handle == crate::handles::Hwnd::from(hwnd))
+            .map(|w| w.control_text.as_str())
+    }
+}
+
 impl Default for WindowState {
     fn default() -> Self {
         Self {

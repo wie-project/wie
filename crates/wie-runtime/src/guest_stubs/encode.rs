@@ -80,7 +80,10 @@ pub(super) fn encode_initterm(check_status: bool) -> Vec<u8> {
 /// ```text
 /// push rbx; sub rsp, 0x60     ; rbx = alignment pad (preserved)
 /// mov rax, [rsp+0x90]        ; dwInitParam (caller's 5th arg)
-/// mov [rsp+0x28], rax        ; 5th arg slot for CreateDialogParam
+/// mov [rsp+0x20], rax        ; 5th arg slot for CreateDialogParam — the
+///                            ; caller places arg5 at [rsp+0x20] so the
+///                            ; callee reads it at [rsp+0x28] after the
+///                            ; call pushes the return address
 /// call CreateDialogParamA/W  ; host: build dialog, WM_INITDIALOG bridge
 /// test rax, rax; jnz .created
 ///   mov rax, -1; jmp .done   ; creation failed → DialogBoxParam returns -1
@@ -124,9 +127,9 @@ pub(super) fn encode_dialog_box_param(
     // push rbx ; sub rsp, 0x60
     buf.extend_from_slice(&[0x53]);
     buf.extend_from_slice(&[0x48, 0x83, 0xec, 0x60]);
-    // mov rax, [rsp+0x90] ; mov [rsp+0x28], rax
+    // mov rax, [rsp+0x90] ; mov [rsp+0x20], rax
     buf.extend_from_slice(&[0x48, 0x8b, 0x84, 0x24, 0x90, 0x00, 0x00, 0x00]);
-    buf.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x28]);
+    buf.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x20]);
     // call CreateDialogParamA/W
     buf.extend_from_slice(&[0x48, 0xb8]);
     buf.extend_from_slice(&create_dialog_param_va.to_le_bytes());
