@@ -50,102 +50,6 @@ pub fn handle_get_client_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         return_value,
     })
 }
-/// Handles `USER32.dll!MoveWindow`.
-pub fn handle_move_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for MoveWindow")?;
-
-    let x_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for MoveWindow")?;
-
-    let y_raw = engine
-        .read_r8()
-        .context("failed to read R8 for MoveWindow")?;
-
-    let width_raw = engine
-        .read_r9()
-        .context("failed to read R9 for MoveWindow")?;
-
-    let rsp = engine
-        .read_rsp()
-        .context("failed to read RSP for MoveWindow")?;
-
-    let height_arg_address = rsp
-        .checked_add(0x28)
-        .context("MoveWindow height argument address overflow")?;
-
-    let repaint_arg_address = rsp
-        .checked_add(0x30)
-        .context("MoveWindow repaint argument address overflow")?;
-
-    let height_raw = read_guest_u64(engine, height_arg_address)?;
-    let repaint_raw = read_guest_u64(engine, repaint_arg_address)?;
-
-    let x = low_i32(x_raw, "MoveWindow x")?;
-    let y = low_i32(y_raw, "MoveWindow y")?;
-    let width = low_i32(width_raw, "MoveWindow width")?;
-    let height = low_i32(height_raw, "MoveWindow height")?;
-
-    // MoveWindow returns nonzero for the legacy fake window (which drives the
-    // host winit window through the single-window WindowState fields) and for
-    // any known window record; only an unknown handle fails (returns 0).
-    let success = if window_handle == FAKE_WINDOW_HANDLE {
-        state.window_state().window_x = x;
-        state.window_state().window_y = y;
-        state.window_state().window_width = width;
-        state.window_state().window_height = height;
-
-        if repaint_raw != 0
-            && let Some(window) = find_window_mut(state, window_handle)
-        {
-            // bRepaint = TRUE invalidates the window (real Windows generates
-            // a WM_PAINT after the move) — the region stays dirty until the
-            // next paint cycle repaints it.
-            window.invalidated = true;
-        }
-        true
-    } else if let Some(window) = find_window_mut(state, window_handle) {
-        // Mirror the SetWindowPlacement geometry update (see
-        // `handle_set_window_placement`): the outer rect lands on the record
-        // and the client rect tracks the new size. MoveWindow carries no
-        // visibility state, so `visible` stays untouched (the placement
-        // branch derives it from showCmd).
-        window.x = x;
-        window.y = y;
-        window.width = width;
-        window.height = height;
-        window.client_rect = (0, 0, width, height);
-
-        // MoveWindow(…, bRepaint = TRUE) invalidates the window — a WM_PAINT
-        // is generated after the move (the moved window must repaint at its
-        // new geometry); bRepaint = FALSE leaves the previous invalidation in
-        // place. (The pre-fix semantics were inverted: TRUE *cleared* the
-        // invalidation, so a resized control never repainted — e.g. the
-        // multiline EDIT kept the status bar's stale pixels after the
-        // View > Status Bar toggle until a click repainted it.)
-        if repaint_raw != 0 {
-            window.invalidated = true;
-        }
-        true
-    } else {
-        false
-    };
-
-    let return_value = u64::from(success);
-
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from MoveWindow")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
-}
 /// Handles `USER32.dll!ScreenToClient`.
 pub fn handle_screen_to_client(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -861,8 +765,7 @@ pub fn handle_set_window_placement(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{
-        FAKE_WINDOW_HANDLE, find_window_mut, handle_get_client_rect, handle_move_window, sys_color,
-        window_client_size,
+        FAKE_WINDOW_HANDLE, find_window_mut, handle_get_client_rect, sys_color, window_client_size,
     };
 
     use crate::user32::read_guest_i32;
@@ -878,7 +781,8 @@ mod tests {
     use crate::thread::ThreadState;
     use crate::user32::{
         CreateWindowRequest, WS_CHILD, WindowClassIdentifier, controls, create_window_record,
-        handle_create_window_ex_a, handle_destroy_window, handle_set_window_pos,
+        handle_create_window_ex_a, handle_destroy_window, handle_move_window,
+        handle_set_window_pos,
     };
     use crate::vfs::VolumeConfig;
     use crate::{
