@@ -1017,6 +1017,12 @@ impl ControlClassKind {
                     }
                     _ => {}
                 }
+                // The Edit reset writes no row band of its own (Button/Static
+                // already bumped via the label seam) — bump here so a
+                // programmatic WM_SETTEXT republishes the new text.
+                if matches!(kind, Some(ControlClassKind::Edit)) {
+                    crate::present::PresentState::request_paint(state, hwnd);
+                }
                 Ok(Some(1))
             }
             (ControlClassKind::Button, WinMsg::WM_GETDLGCODE) => {
@@ -1075,6 +1081,11 @@ impl ControlClassKind {
                     _ => -1,
                 };
                 invalidate(state, hwnd);
+                // A programmatic selection is a visible change for BOTH
+                // kinds; the LISTBOX row marks bump via the listbox seam, but
+                // the ComboBox shares this dispatch and the seam gates it out —
+                // bump here so the combo's selection republishes too.
+                crate::present::PresentState::request_paint(state, hwnd);
                 // A programmatic selection lands on a possibly-scrolled
                 // viewport: bring it into view like a click would (the scroll
                 // marks its own band change when it moves).
@@ -1126,6 +1137,10 @@ impl ControlClassKind {
                 // ComboBox arm shares this dispatch and ignores the mark).
                 listbox_invalidate_appended(state, hwnd);
                 invalidate(state, hwnd);
+                // An added item is a visible change for BOTH kinds; the
+                // LISTBOX row bump comes from the appended seam, the ComboBox
+                // needs this arm (the seam gates it out).
+                crate::present::PresentState::request_paint(state, hwnd);
                 Ok(Some(index))
             }
             (

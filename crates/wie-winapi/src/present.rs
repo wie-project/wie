@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
+use crate::WinApiState;
 use crate::gdi32::IRect;
 
 /// Global gate for B9 frame-timing instrumentation (publish / blit-copy /
@@ -157,6 +158,29 @@ pub struct WindowSurface {
 /// invoked by the `MessageBoxA/W` handlers on the guest thread.
 pub type MessageBoxBridge = Box<dyn Fn(&str, &str, u32) -> i32 + Send>;
 
+/// Monotonic per-top-level content fingerprint for the pull-based repaint
+/// latch: bumped by [`PresentState::request_paint`] on every visible-state
+/// mutation of a window (or any of its descendant controls).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentRev(pub u64);
+
+/// The revision bookkeeping [`PresentState::reconcile_and_publish`] diffs at
+/// the idle boundary: what each top-level's content revision currently IS vs
+/// what was last published. A window whose `content_rev` differs from its
+/// `last_published_rev` is stale and gets republished.
+///
+/// `content_rev` entries exist only for windows a mutation touched since the
+/// state was created (a never-mutated window is absent, hence never stale),
+/// so the idle diff iterates the mutation set, not the whole window registry.
+#[derive(Debug)]
+pub struct WindowRevisions {
+    /// Current content revision per top-level window (absent = untouched).
+    pub content_rev: ahash::HashMap<crate::handles::Hwnd, ContentRev>,
+    /// The content revision the last publish of each top-level carried
+    /// (absent = never published).
+    pub last_published_rev: ahash::HashMap<crate::handles::Hwnd, ContentRev>,
+}
+
 /// Manages per-window compositing surfaces and frame publishing.
 pub struct PresentState {
     /// Persistent composite surface per HWND (scratch buffer for accumulating blits).
@@ -243,6 +267,10 @@ pub struct PresentState {
     /// every create/destroy of a parentless window AND every `SetWindowPos`
     /// HWND_TOP/HWND_BOTTOM z-change. Read via `GuestHandle::z_rev`.
     pub z_rev: u64,
+    /// Revision latch for the pull-based repaint: content revisions per
+    /// top-level vs what was last published, diffed by
+    /// [`Self::reconcile_and_publish`] at the idle boundary.
+    pub(crate) revisions: WindowRevisions,
 }
 
 impl std::fmt::Debug for PresentState {
@@ -271,6 +299,11 @@ impl std::fmt::Debug for PresentState {
             .field("windows_rev", &self.windows_rev)
             .field("z_order_count", &self.z_order.len())
             .field("z_rev", &self.z_rev)
+            .field("content_rev_count", &self.revisions.content_rev.len())
+            .field(
+                "last_published_rev_count",
+                &self.revisions.last_published_rev.len(),
+            )
             .finish()
     }
 }
@@ -300,6 +333,10 @@ impl PresentState {
             windows_rev: 0,
             z_order: Vec::new(),
             z_rev: 0,
+            revisions: WindowRevisions {
+                content_rev: ahash::HashMap::new(),
+                last_published_rev: ahash::HashMap::new(),
+            },
         }
     }
 
@@ -564,6 +601,39 @@ impl PresentState {
         }
     }
 
+    /// Bump the top-level content revision for `hwnd` and wake the presenter —
+    /// the push half of the pull-based repaint latch.
+    ///
+    /// Every visible-state mutation routes through here (the control
+    /// invalidation seams, the SetWindowText/WM_SETTEXT handlers, the
+    /// font/show-window paths): the mutation marks its dirty region exactly as
+    /// before, and this records that the window's content CHANGED since the
+    /// last publish. The idle loop's [`Self::reconcile_and_publish`] then
+    /// republishes any top-level whose revision advanced, so a visible change
+    /// can never silently fail to reach the host (the stale-surface class of
+    /// repaint bugs).
+    ///
+    /// Children resolve to their top-level ancestor — the surface that
+    /// actually composites them, so a control's mutation marks the frame the
+    /// host presents. Unknown windows and the legacy fake window resolve to
+    /// nothing and are silently ignored: they have no surface to publish. The
+    /// wake fires the same stored callback the publish path fires
+    /// (`request_host_sync`'s idempotent pattern); a headless run with no wake
+    /// is a silent no-op.
+    pub fn request_paint(state: &mut WinApiState, hwnd: u64) {
+        let Some(top) = crate::gdi32::resolve_window_ancestor(state, hwnd) else {
+            return;
+        };
+        let present = state.present();
+        let before = present.revisions.content_rev.get(&top.hwnd).copied();
+        let after = ContentRev(before.map_or(0, |r| r.0).wrapping_add(1));
+        assert_mutation_bumped_rev(before, after);
+        present.revisions.content_rev.insert(top.hwnd, after);
+        if let Some(wake) = &present.wake {
+            wake();
+        }
+    }
+
     /// Register a newly created top-level window at the TOP of the z-order.
     ///
     /// Bumps BOTH revisions: the window-set revision (the presenter
@@ -591,6 +661,11 @@ impl PresentState {
             self.z_rev = self.z_rev.wrapping_add(1);
         }
         self.windows_rev = self.windows_rev.wrapping_add(1);
+        // Drop the revision bookkeeping with the window: a destroyed top-level
+        // must not stay stale (an idle reconcile would republish its ghost
+        // surface) or leak its entries.
+        self.revisions.content_rev.remove(&hwnd);
+        self.revisions.last_published_rev.remove(&hwnd);
     }
 
     /// Move `hwnd` to the TOP of the z-order (`SetWindowPos` HWND_TOP).
@@ -663,7 +738,55 @@ impl PresentState {
         }
         pending.len()
     }
+
+    /// Publish every top-level whose content revision advanced past its last
+    /// published revision — the pull half of the repaint latch.
+    ///
+    /// Runs at the empty-queue idle boundary immediately after
+    /// [`Self::drain_pending_publishes`]. A mutation that already painted and
+    /// deferred a frame is a no-op here (the drain's publish moved the surface
+    /// buffer into the Arc, so [`Self::publish`] early-returns on the empty
+    /// buffer); a mutation whose paint produced no deferred publish still
+    /// republishes the surface, so the host always sees the change. Advances
+    /// `last_published_rev` for every stale window, so a caught-up window is
+    /// skipped until the next mutation. Returns how many windows were
+    /// considered (whether or not `publish` emitted).
+    pub fn reconcile_and_publish(&mut self) -> usize {
+        let stale: Vec<(crate::handles::Hwnd, ContentRev)> = self
+            .revisions
+            .content_rev
+            .iter()
+            .filter_map(|(hwnd, rev)| {
+                (self.revisions.last_published_rev.get(hwnd) != Some(rev)).then_some((*hwnd, *rev))
+            })
+            .collect();
+        let count = stale.len();
+        for (hwnd, rev) in stale {
+            self.publish(hwnd);
+            self.revisions.last_published_rev.insert(hwnd, rev);
+        }
+        count
+    }
 }
+
+/// Debug-only invariant: [`PresentState::request_paint`] must advance the
+/// content revision. A mutation that fails to bump leaves the window's
+/// revision equal to its last published revision, so the idle reconcile would
+/// skip it and the visible change could never reach the host — this assertion
+/// catches that silently-dropped-frame class in debug builds. The release
+/// twin below is a no-op so call sites stay uniform.
+#[cfg(debug_assertions)]
+fn assert_mutation_bumped_rev(before: Option<ContentRev>, after: ContentRev) {
+    debug_assert!(
+        before.is_none_or(|r| r.0 != after.0),
+        "request_paint did not advance the content revision (before {before:?}, after {after:?})"
+    );
+}
+
+/// Release twin of `assert_mutation_bumped_rev`: the invariant checks only in
+/// debug builds.
+#[cfg(not(debug_assertions))]
+fn assert_mutation_bumped_rev(_before: Option<ContentRev>, _after: ContentRev) {}
 
 impl Default for PresentState {
     fn default() -> Self {
@@ -674,7 +797,7 @@ impl Default for PresentState {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::{DEFAULT_BACKGROUND_COLOR, PresentState, SurfaceFrame};
+    use super::{ContentRev, DEFAULT_BACKGROUND_COLOR, PresentState, SurfaceFrame};
     use crate::gdi32::IRect;
     use crate::handles::Hwnd;
     use std::sync::Arc;
@@ -1276,5 +1399,95 @@ mod tests {
             surface.pixels, *held,
             "the cloned buffer carries the same pixels (the composite keeps accumulating)"
         );
+    }
+
+    /// A stale top-level (content revision ahead of its last published
+    /// revision) is republished by `reconcile_and_publish`; the last-published
+    /// revision catches up, so the same window is then skipped.
+    #[test]
+    fn reconcile_publishes_stale_top_levels_and_advances_their_rev() {
+        let mut state = PresentState::new();
+        let hwnd = Hwnd::from(40);
+        state.ensure_surface(hwnd, 32, 16);
+        // Paint recognizable content so the reconcile's republish carries it.
+        if let Some(surf) = state.surfaces.get_mut(&hwnd) {
+            for px in &mut surf.pixels {
+                *px = 0x00FF_FFFF;
+            }
+        }
+        state.revisions.content_rev.insert(hwnd, ContentRev(3));
+        state
+            .revisions
+            .last_published_rev
+            .insert(hwnd, ContentRev(2));
+
+        assert_eq!(
+            state.reconcile_and_publish(),
+            1,
+            "the stale top-level is republished once"
+        );
+        assert!(state.published.contains_key(&hwnd));
+        assert_eq!(
+            state.revisions.last_published_rev.get(&hwnd),
+            Some(&ContentRev(3)),
+            "the last-published revision catches up to the content revision"
+        );
+
+        assert_eq!(
+            state.reconcile_and_publish(),
+            0,
+            "a caught-up window is skipped until the next mutation"
+        );
+    }
+
+    /// A window with no `content_rev` entry was never mutated — the reconcile
+    /// diff iterates the mutation set, not the window registry.
+    #[test]
+    fn reconcile_ignores_windows_without_a_content_revision() {
+        let mut state = PresentState::new();
+        let hwnd = Hwnd::from(41);
+        state.ensure_surface(hwnd, 8, 8);
+        state.publish(hwnd);
+        assert_eq!(state.reconcile_and_publish(), 0);
+    }
+
+    /// A stale top-level with NO surface still catches up: the publish is a
+    /// no-op, but the revision must not stay stale forever — an idle loop
+    /// would otherwise republish it on every boundary.
+    #[test]
+    fn reconcile_catches_up_revisions_even_without_a_surface() {
+        let mut state = PresentState::new();
+        let hwnd = Hwnd::from(42);
+        state.revisions.content_rev.insert(hwnd, ContentRev(1));
+
+        assert_eq!(state.reconcile_and_publish(), 1);
+        assert!(
+            !state.published.contains_key(&hwnd),
+            "no surface means nothing to publish"
+        );
+        assert_eq!(
+            state.revisions.last_published_rev.get(&hwnd),
+            Some(&ContentRev(1))
+        );
+        assert_eq!(state.reconcile_and_publish(), 0);
+    }
+
+    /// `unregister_top_level` drops a destroyed window's revision
+    /// bookkeeping: it must not stay stale (an idle reconcile would
+    /// republish its ghost surface) or leak its entries.
+    #[test]
+    fn unregister_top_level_drops_the_revision_bookkeeping() {
+        let mut state = PresentState::new();
+        let hwnd = Hwnd::from(43);
+        state.revisions.content_rev.insert(hwnd, ContentRev(5));
+        state
+            .revisions
+            .last_published_rev
+            .insert(hwnd, ContentRev(5));
+
+        state.unregister_top_level(hwnd);
+
+        assert!(!state.revisions.content_rev.contains_key(&hwnd));
+        assert!(!state.revisions.last_published_rev.contains_key(&hwnd));
     }
 }

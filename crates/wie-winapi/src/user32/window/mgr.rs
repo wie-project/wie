@@ -162,6 +162,13 @@ pub fn handle_show_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         }
     }
 
+    if show_command != 0 {
+        // Showing a window is a visible change: bump the content revision so
+        // the idle reconcile republishes its first painted frame (an unknown
+        // window resolves to nothing and is a silent no-op).
+        crate::present::PresentState::request_paint(state, window_handle);
+    }
+
     let return_value = u64::from(previously_visible);
 
     let return_address = engine
@@ -525,6 +532,11 @@ pub fn handle_invalidate_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         }
     }
 
+    // An explicit invalidation requests a visible change: bump the content
+    // revision so the idle reconcile republishes the surface (an unknown
+    // window resolves to nothing and is a silent no-op).
+    crate::present::PresentState::request_paint(state, window_handle);
+
     let return_value = u64::from(success);
 
     let return_address = engine
@@ -561,6 +573,11 @@ pub fn handle_redraw_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     if let Some(window) = find_window_mut(state, window_handle) {
         window.invalidated = false;
     }
+
+    // A requested redraw is a visible change: bump the content revision so
+    // the idle reconcile republishes the surface (an unknown window resolves
+    // to nothing and is a silent no-op).
+    crate::present::PresentState::request_paint(state, window_handle);
 
     let return_value = u64::from(success);
 

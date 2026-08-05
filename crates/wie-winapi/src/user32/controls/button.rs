@@ -862,6 +862,11 @@ pub(super) fn invalidate_control_rect(state: &mut WinApiState, hwnd: u64, rect: 
         }
     }
     super::invalidate(state, hwnd);
+    // Every rect-scoped control change funnels through here — a button's
+    // pressed face, a label's caption, a listbox's rows — so this is the
+    // button/label/listbox arm of the repaint latch: bump the content
+    // revision of the owning top-level.
+    crate::present::PresentState::request_paint(state, hwnd);
 }
 
 /// Reset a rect-scope control's pending invalidation to

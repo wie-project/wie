@@ -538,6 +538,10 @@ fn open_host_font_dialog(ctx: &mut HandlerContext<'_>, cf_ptr: u64) -> Result<Wi
         }
     }
 
+    // A freshly created dialog is a visible change: bump the content revision
+    // so the idle reconcile republishes its first painted frame.
+    crate::present::PresentState::request_paint(state, dialog_hwnd);
+
     tracing::info!(
         target: "wiegui",
         hwnd = dialog_hwnd,

@@ -670,6 +670,16 @@ impl super::RuntimeSession {
                                         // nesting, and full-frame publishes make the
                                         // emitted snapshot always coherent.
                                         winapi_state.present().drain_pending_publishes();
+                                        // The pull half of the repaint latch:
+                                        // republish every top-level whose
+                                        // content revision advanced since its
+                                        // last publish. A mutation that painted
+                                        // this cycle was already published by
+                                        // the drain (its surface buffer is now
+                                        // empty, so the publish no-ops); a
+                                        // mutation that produced no deferred
+                                        // publish still reaches the host here.
+                                        winapi_state.present().reconcile_and_publish();
                                         break_term =
                                             Some(EntryTraceTermination::WaitingForMessage);
                                         quantum = Quantum::Break;

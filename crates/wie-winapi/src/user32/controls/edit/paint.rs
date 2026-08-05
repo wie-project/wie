@@ -243,6 +243,10 @@ pub(super) fn edit_invalidate_rows(
     };
     *invalid_rows = next;
     invalidate(state, hwnd);
+    // Every row-band edit mutation (typing, caret move, selection, paste,
+    // undo, the caret blink) funnels through here — bump the content revision
+    // so the idle reconcile republishes the surface.
+    crate::present::PresentState::request_paint(state, hwnd);
 }
 
 /// Mark the whole EDIT dirty for the next paint — every structural change: a
@@ -258,6 +262,9 @@ pub(super) fn edit_invalidate_full(state: &mut WinApiState, hwnd: u64) {
         *invalid_rows = EditInvalidation::Full;
     }
     invalidate(state, hwnd);
+    // Structural edit changes (whole-text replacement, scroll, font, resize)
+    // funnel through here — bump the content revision (the repaint latch).
+    crate::present::PresentState::request_paint(state, hwnd);
 }
 
 /// Reset an EDIT's pending invalidation to [`EditInvalidation::Full`]
@@ -355,6 +362,9 @@ pub(super) fn edit_invalidate_mutation(
 pub(super) fn edit_invalidate_caret(state: &mut WinApiState, hwnd: u64) {
     let Some(context) = edit_scroll_context(state, hwnd) else {
         invalidate(state, hwnd);
+        // The caret blink is a visible change even when the layout cannot be
+        // resolved (the fallback full invalidate) — bump the latch.
+        crate::present::PresentState::request_paint(state, hwnd);
         return;
     };
     let last_drawn = match control_state(state, hwnd) {

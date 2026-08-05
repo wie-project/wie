@@ -77,6 +77,10 @@ pub fn handle_set_window_text_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
                 window.title = text;
             }
         }
+        // The visible change: bump the owning top-level's content revision so
+        // the idle reconcile republishes the surface even if the next repaint
+        // cycle is skipped (the pull-based repaint latch).
+        crate::present::PresentState::request_paint(state, window_handle);
     }
 
     let return_value = u64::from(success);
@@ -150,6 +154,10 @@ pub fn handle_set_window_text_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
                 window.title = text;
             }
         }
+        // The visible change: bump the owning top-level's content revision so
+        // the idle reconcile republishes the surface even if the next repaint
+        // cycle is skipped (the pull-based repaint latch).
+        crate::present::PresentState::request_paint(state, window_handle);
     }
 
     let return_value = u64::from(success);
@@ -323,6 +331,12 @@ pub(crate) fn set_window_font(state: &mut WinApiState, hwnd: u64, font_handle: u
             window.invalidated = true;
             window.flags.insert(WindowFlags::ERASE_BACKGROUND);
         }
+    }
+    if redraw != 0 {
+        // A redraw is a visible change: bump the content revision so the idle
+        // reconcile republishes with the new font. An unknown window resolves
+        // to nothing and is a silent no-op.
+        crate::present::PresentState::request_paint(state, hwnd);
     }
 }
 
