@@ -100,6 +100,9 @@ use listbox::{
 // the font-dialog listboxes by scrolling the initial selection into view).
 pub(crate) use listbox::listbox_scroll_selection_into_view;
 use paint::write_control_text;
+// Re-exported for the dialog paint (the z-order-aware update-region clip
+// against windows composited above the painter).
+pub(crate) use paint::clip_rects_around_above;
 // Re-exported for the host unit tests in `state/tests.rs` (the `edit` module
 // itself stays private to `controls`); test-only so the lib build has no
 // unused import.

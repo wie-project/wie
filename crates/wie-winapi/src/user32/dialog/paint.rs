@@ -5,6 +5,7 @@ use crate::gdi32::IRect;
 use crate::gdi32::fill_rect_surface;
 use crate::gdi32::resolve_window_ancestor;
 use crate::gdi32::subtract_rect;
+use crate::user32::controls::clip_rects_around_above;
 use crate::user32::{WinApiState, find_window};
 
 /// `GetSysColor(COLOR_BTNFACE)` — the classic dialog face color.
@@ -16,8 +17,11 @@ const DIALOG_BORDER: u32 = 0x00A0_A0A0;
 ///
 /// The face honors the dialog's forced `WS_CLIPCHILDREN` (subtract_rect
 /// decomposition, mirroring `blit.rs`), so a dialog repaint can never erase
-/// its controls. Publishes the owner surface so headless frame capture sees
-/// the dialog the moment it opens; control paints publish afterwards.
+/// its controls. The face also decomposes around the windows that composite
+/// ABOVE the dialog in the same surface (a later dialog over this one), so
+/// the face fill cannot overwrite a window on top of it. Publishes the owner
+/// surface so headless frame capture sees the dialog the moment it opens;
+/// control paints publish afterwards.
 pub(crate) fn paint_dialog(state: &mut WinApiState, hwnd: u64) {
     let (width, height) = find_window(state, hwnd).map_or((0, 0), |w| (w.width, w.height));
     if width <= 0 || height <= 0 {
@@ -44,7 +48,25 @@ pub(crate) fn paint_dialog(state: &mut WinApiState, hwnd: u64) {
     for child in children {
         rects = subtract_rect(rects, child);
     }
-    for rect in rects {
+    // Offset the dialog-local face rects into surface coordinates, then
+    // decompose around the windows that composite above the dialog (the
+    // z-order-aware update-region clip).
+    let surface_rects: Vec<IRect> = rects
+        .iter()
+        .map(|rect| IRect {
+            left: rect.left.saturating_add(info.offset_x),
+            top: rect.top.saturating_add(info.offset_y),
+            right: rect.right.saturating_add(info.offset_x),
+            bottom: rect.bottom.saturating_add(info.offset_y),
+        })
+        .collect();
+    let face_rects = clip_rects_around_above(
+        state,
+        info.hwnd.as_u64(),
+        info.dc_window.as_u64(),
+        surface_rects,
+    );
+    for rect in face_rects {
         if rect.width() <= 0 || rect.height() <= 0 {
             continue;
         }
@@ -53,8 +75,8 @@ pub(crate) fn paint_dialog(state: &mut WinApiState, hwnd: u64) {
             info.hwnd,
             info.width,
             info.height,
-            rect.left.saturating_add(info.offset_x),
-            rect.top.saturating_add(info.offset_y),
+            rect.left,
+            rect.top,
             rect.width(),
             rect.height(),
             DIALOG_BG,
@@ -64,21 +86,31 @@ pub(crate) fn paint_dialog(state: &mut WinApiState, hwnd: u64) {
     if width > 2 && height > 2 {
         let right = info.offset_x.saturating_add(width).saturating_sub(1);
         let bottom = info.offset_y.saturating_add(height).saturating_sub(1);
-        for rect in [
-            (info.offset_x, info.offset_y, width, 1),
-            (info.offset_x, bottom, width, 1),
-            (info.offset_x, info.offset_y, 1, height),
-            (right, info.offset_y, 1, height),
-        ] {
+        let border_rects = clip_rects_around_above(
+            state,
+            info.hwnd.as_u64(),
+            info.dc_window.as_u64(),
+            [
+                IRect::from_xywh(info.offset_x, info.offset_y, width, 1),
+                IRect::from_xywh(info.offset_x, bottom, width, 1),
+                IRect::from_xywh(info.offset_x, info.offset_y, 1, height),
+                IRect::from_xywh(right, info.offset_y, 1, height),
+            ]
+            .to_vec(),
+        );
+        for rect in border_rects {
+            if rect.width() <= 0 || rect.height() <= 0 {
+                continue;
+            }
             fill_rect_surface(
                 state,
                 info.hwnd,
                 info.width,
                 info.height,
-                rect.0,
-                rect.1,
-                rect.2,
-                rect.3,
+                rect.left,
+                rect.top,
+                rect.width(),
+                rect.height(),
                 DIALOG_BORDER,
             );
         }

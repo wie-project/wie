@@ -18,6 +18,7 @@ use crate::gdi32::resolve_window_ancestor;
 use crate::gdi32::{FontEngine, FontKey, ResolvedFont};
 use crate::gdi32::{IRect, ResolvedWindow};
 use crate::state::WindowFlags;
+use crate::user32::controls::paint::fill_surface_rect_above_clipped;
 use crate::user32::{WinApiState, find_window};
 
 /// Paint a control into its ancestor's surface at its parent-relative offset.
@@ -109,15 +110,15 @@ pub(super) fn paint_control(
                     } else {
                         COLOR_BTNFACE
                     };
-                    fill_rect_surface(
+                    fill_surface_rect_above_clipped(
                         state,
-                        info.hwnd,
-                        info.width,
-                        info.height,
-                        info.offset_x.saturating_add(dirty.left),
-                        info.offset_y.saturating_add(dirty.top),
-                        dirty.width(),
-                        dirty.height(),
+                        &info,
+                        IRect::from_xywh(
+                            info.offset_x.saturating_add(dirty.left),
+                            info.offset_y.saturating_add(dirty.top),
+                            dirty.width(),
+                            dirty.height(),
+                        ),
                         face,
                     );
                     if rect_touches_border(dirty, size) {
@@ -157,15 +158,15 @@ pub(super) fn paint_control(
                 // (or the whole client for a full repaint), so the region
                 // reports the true changed area.
                 let dirty = control_dirty_rect(state, hwnd, size);
-                fill_rect_surface(
+                fill_surface_rect_above_clipped(
                     state,
-                    info.hwnd,
-                    info.width,
-                    info.height,
-                    info.offset_x.saturating_add(dirty.left),
-                    info.offset_y.saturating_add(dirty.top),
-                    dirty.width(),
-                    dirty.height(),
+                    &info,
+                    IRect::from_xywh(
+                        info.offset_x.saturating_add(dirty.left),
+                        info.offset_y.saturating_add(dirty.top),
+                        dirty.width(),
+                        dirty.height(),
+                    ),
                     COLOR_BTNFACE,
                 );
                 let caption = strip_mnemonics(&text);
@@ -209,15 +210,20 @@ pub(super) fn paint_control(
                     )
                 };
                 if band_bottom > band_top {
-                    fill_rect_surface(
+                    // The band erase is the z-order-sensitive fill: a
+                    // full-width white band here would wipe an overlapping
+                    // window composited above the EDIT in the same surface
+                    // (the FindDialog — the live "dialog turns white" bug),
+                    // so the erase is decomposed around the above windows.
+                    fill_surface_rect_above_clipped(
                         state,
-                        info.hwnd,
-                        info.width,
-                        info.height,
-                        info.offset_x,
-                        info.offset_y.saturating_add(band_top),
-                        size.width,
-                        band_bottom.saturating_sub(band_top),
+                        &info,
+                        IRect::from_xywh(
+                            info.offset_x,
+                            info.offset_y.saturating_add(band_top),
+                            size.width,
+                            band_bottom.saturating_sub(band_top),
+                        ),
                         COLOR_WINDOW,
                     );
                 }
@@ -250,15 +256,15 @@ pub(super) fn paint_control(
                 // the scope render (`paint_item_lines` takes the rect), so a
                 // partial repaint never wipes the untouched rows.
                 let dirty = control_dirty_rect(state, hwnd, size);
-                fill_rect_surface(
+                fill_surface_rect_above_clipped(
                     state,
-                    info.hwnd,
-                    info.width,
-                    info.height,
-                    info.offset_x.saturating_add(dirty.left),
-                    info.offset_y.saturating_add(dirty.top),
-                    dirty.width(),
-                    dirty.height(),
+                    &info,
+                    IRect::from_xywh(
+                        info.offset_x.saturating_add(dirty.left),
+                        info.offset_y.saturating_add(dirty.top),
+                        dirty.width(),
+                        dirty.height(),
+                    ),
                     COLOR_WINDOW,
                 );
                 // The erase overpainted the 1 px border wherever the band
