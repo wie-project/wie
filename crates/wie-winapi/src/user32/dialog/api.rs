@@ -35,13 +35,7 @@ fn handle_get_dlg_item(
 
     let child = get_dlg_item(state, dialog_hwnd, id);
 
-    let return_address = engine
-        .return_from_win64_api(child)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: child,
-    })
+    ctx.finish(child)
 }
 
 /// Find a dialog's child control by id (control ids live in `menu_handle`).
@@ -112,13 +106,7 @@ fn handle_get_dlg_item_text(
         u64::try_from(copied).unwrap_or(0)
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `USER32.dll!SetDlgItemTextA`.
@@ -163,13 +151,7 @@ fn handle_set_dlg_item_text(
     }
 
     let return_value = u64::from(success);
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `USER32.dll!SetDlgItemInt`.
@@ -214,13 +196,7 @@ pub fn handle_set_dlg_item_int(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     }
 
     let return_value = u64::from(success);
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from SetDlgItemInt")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `USER32.dll!GetDlgItemInt`.
@@ -267,13 +243,7 @@ pub fn handle_get_dlg_item_int(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     }
 
     let return_value = u64::from(value);
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetDlgItemInt")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Parse a control's text the way `GetDlgItemInt` does.
@@ -348,13 +318,7 @@ pub fn handle_send_dlg_item_message_w(ctx: &mut HandlerContext<'_>) -> Result<Wi
 
     let child = get_dlg_item(state, dialog_hwnd, id);
     if child == 0 {
-        let return_address = engine
-            .return_from_win64_api(0)
-            .context("failed to return from SendDlgItemMessageW")?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
 
     // Rewrite the registers to address the child, then run the shared

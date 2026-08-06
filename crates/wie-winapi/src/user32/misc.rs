@@ -58,14 +58,7 @@ fn handle_load_image_like_impl(
         "{api_name}"
     );
 
-    let return_address = engine
-        .return_from_win64_api(fake_handle)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: fake_handle,
-    })
+    ctx.finish(fake_handle)
 }
 
 /// Decode a `LoadIcon`/`LoadCursor` name argument into `(resource_id, name)`.
@@ -150,14 +143,7 @@ pub fn handle_register_class_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApi
         )?
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from RegisterClassExW")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!RegisterClassExA`.
 pub fn handle_register_class_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -218,14 +204,7 @@ pub fn handle_register_class_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
         )?
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from RegisterClassExA")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!MessageBoxW`.
 ///
@@ -349,7 +328,7 @@ fn message_box_result(
             .pick
             .and_then(|id| u64::try_from(id).ok())
             .unwrap_or(IDCANCEL);
-        return finish_message_box(ctx, win32_id, api_name);
+        return finish_message_box(ctx, win32_id);
     }
 
     if ctx
@@ -376,36 +355,16 @@ fn message_box_result(
     // Always surface guest error UI on host console (7z bring-up); no bridge
     // means headless/trace — auto-OK so the guest never hangs.
     eprintln!("[{api_name}] {caption}: {text}");
-    finish_message_box(ctx, IDOK, api_name)
+    finish_message_box(ctx, IDOK)
 }
 
 /// Return `win32_id` to the guest as the handler's `WinApiHandlerResult`.
-fn finish_message_box(
-    ctx: &mut HandlerContext<'_>,
-    win32_id: u64,
-    api_name: &str,
-) -> Result<WinApiHandlerResult> {
-    let return_address = ctx
-        .engine
-        .return_from_win64_api(win32_id)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: win32_id,
-    })
+fn finish_message_box(ctx: &mut HandlerContext<'_>, win32_id: u64) -> Result<WinApiHandlerResult> {
+    ctx.finish(win32_id)
 }
 /// Handles dynamic `USER32.dll!SetProcessDPIAware`.
 pub fn handle_set_process_dpi_aware(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let return_address = engine
-        .return_from_win64_api(1)
-        .context("failed to return from SetProcessDPIAware")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 /// Handles `USER32.dll!LoadImageA`.
 pub fn handle_load_image_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -438,14 +397,7 @@ pub(crate) fn handle_load_image(
 
     // Win64 arguments 5 and 6 are desired height and load flags.
     // For bootstrap purposes, return a stable non-null image handle.
-    let return_address = engine
-        .return_from_win64_api(FAKE_IMAGE_HANDLE)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: FAKE_IMAGE_HANDLE,
-    })
+    ctx.finish(FAKE_IMAGE_HANDLE)
 }
 /// Handles `USER32.dll!DestroyIcon`.
 pub fn handle_destroy_icon(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -456,28 +408,13 @@ pub fn handle_destroy_icon(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
 
     let return_value = u64::from(icon_handle != 0);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from DestroyIcon")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!GetDialogBaseUnits`.
 pub fn handle_get_dialog_base_units(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
     let return_value = u64::from(DIALOG_BASE_UNIT_X | (DIALOG_BASE_UNIT_Y << 16));
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetDialogBaseUnits")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!SetTimer`.
 pub fn handle_set_timer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -547,14 +484,7 @@ pub fn handle_set_timer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
         0
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from SetTimer")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!KillTimer`.
 pub fn handle_kill_timer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -590,14 +520,7 @@ pub fn handle_kill_timer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 
     let return_value = u64::from(existed);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from KillTimer")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!SetWindowsHookExW`.
 pub fn handle_set_windows_hook_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -650,14 +573,7 @@ pub fn handle_set_windows_hook_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinA
         handle
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from SetWindowsHookExW")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!UnhookWindowsHookEx`.
 pub fn handle_unhook_windows_hook_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -682,14 +598,7 @@ pub fn handle_unhook_windows_hook_ex(ctx: &mut HandlerContext<'_>) -> Result<Win
 
     let return_value = u64::from(existed);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from UnhookWindowsHookEx")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!SetScrollInfo`.
 pub fn handle_set_scroll_info(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -739,14 +648,7 @@ pub fn handle_set_scroll_info(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         "SetScrollInfo"
     );
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from SetScrollInfo")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// One past the last id `RegisterWindowMessageA/W` may return (0xFFFF).
 ///
@@ -816,14 +718,7 @@ fn handle_register_window_message(
         "{api_name}"
     );
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `USER32.dll!LoadStringW`.
@@ -894,14 +789,7 @@ fn handle_load_string(ctx: &mut HandlerContext<'_>, api_name: &str) -> Result<Wi
         "{api_name}"
     );
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Look up a string-table entry by id for `hinst`.
@@ -1060,22 +948,10 @@ fn handle_call_window_proc(
                 long_parameter,
             )?
         {
-            let return_address = engine
-                .return_from_win64_api(result)
-                .with_context(|| format!("failed to return from {api_name}"))?;
-            return Ok(WinApiHandlerResult {
-                return_address,
-                return_value: result,
-            });
+            return ctx.finish(result);
         }
         // Non-control window (or an unhandled message): DefWindowProc-ish 0.
-        let return_address = engine
-            .return_from_win64_api(0)
-            .with_context(|| format!("failed to return from {api_name}"))?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
 
     // A foreign (non-marker) proc: call it, as real Windows does.
@@ -1096,11 +972,5 @@ fn handle_call_window_proc(
 
     // prev_wndfunc == 0 but the window recorded a non-zero original:
     // conservative zero rather than calling a NULL proc (documented).
-    let return_address = engine
-        .return_from_win64_api(0)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 0,
-    })
+    ctx.finish(0)
 }

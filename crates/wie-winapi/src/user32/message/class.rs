@@ -18,13 +18,7 @@ pub fn handle_register_class_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         .context("failed to read RCX for RegisterClassA")?;
 
     if class_ptr == 0 {
-        let ra = engine
-            .return_from_win64_api(0)
-            .context("failed to return from RegisterClassA")?;
-        return Ok(WinApiHandlerResult {
-            return_address: ra,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
 
     // One shared-lock borrow instead of ten per-field reads; the layout and
@@ -79,13 +73,7 @@ pub fn handle_register_class_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     )
     .context("failed to register window class for RegisterClassA")?;
 
-    let ra = engine
-        .return_from_win64_api(atom)
-        .context("failed to return from RegisterClassA")?;
-    Ok(WinApiHandlerResult {
-        return_address: ra,
-        return_value: atom,
-    })
+    ctx.finish(atom)
 }
 
 /// Handles `USER32.dll!RegisterClassW`.
@@ -98,13 +86,7 @@ pub fn handle_register_class_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         .context("failed to read RCX for RegisterClassW")?;
 
     if class_ptr == 0 {
-        let ra = engine
-            .return_from_win64_api(0)
-            .context("failed to return from RegisterClassW")?;
-        return Ok(WinApiHandlerResult {
-            return_address: ra,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
 
     // WNDCLASSW shares the WNDCLASSA layout (see the A variant above); only
@@ -157,84 +139,36 @@ pub fn handle_register_class_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     )
     .context("failed to register window class for RegisterClassW")?;
 
-    let ra = engine
-        .return_from_win64_api(atom)
-        .context("failed to return from RegisterClassW")?;
-    Ok(WinApiHandlerResult {
-        return_address: ra,
-        return_value: atom,
-    })
+    ctx.finish(atom)
 }
 
 /// Handles `USER32.dll!UnregisterClassA`.
 pub fn handle_unregister_class_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let return_address = engine
-        .return_from_win64_api(1)
-        .context("failed to return from UnregisterClassA")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 
 /// Handles `USER32.dll!UnregisterClassW`.
 pub fn handle_unregister_class_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let return_address = engine
-        .return_from_win64_api(1)
-        .context("failed to return from UnregisterClassW")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 
 /// Handles `USER32.dll!ValidateRect`.
 pub fn handle_validate_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let return_address = engine
-        .return_from_win64_api(1)
-        .context("failed to return from ValidateRect")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 
 /// Handles `USER32.dll!SetWindowLongA`.
 pub fn handle_set_window_long_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let return_address = engine
-        .return_from_win64_api(0)
-        .context("failed to return from SetWindowLongA")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 0,
-    })
+    ctx.finish(0)
 }
 
 /// Handles `USER32.dll!SetWindowLongW`.
 pub fn handle_set_window_long_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let return_address = engine
-        .return_from_win64_api(0)
-        .context("failed to return from SetWindowLongW")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 0,
-    })
+    ctx.finish(0)
 }
 
 /// Handles `USER32.dll!GetWindowDC`.
 pub fn handle_get_window_dc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
     let dc = FAKE_DEVICE_CONTEXT_HANDLE;
-    let return_address = engine
-        .return_from_win64_api(dc)
-        .context("failed to return from GetWindowDC")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: dc,
-    })
+    ctx.finish(dc)
 }

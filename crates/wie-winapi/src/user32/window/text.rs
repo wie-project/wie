@@ -94,14 +94,7 @@ pub fn handle_set_window_text_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 
     let return_value = u64::from(success);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from SetWindowTextA")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!SetWindowTextW`.
 pub fn handle_set_window_text_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -178,14 +171,7 @@ pub fn handle_set_window_text_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 
     let return_value = u64::from(success);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from SetWindowTextW")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!GetWindowTextA`.
 pub fn handle_get_window_text_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -211,14 +197,7 @@ pub fn handle_get_window_text_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         write_ansi_window_text(engine, buffer_ptr, max_characters, &text)?
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetWindowTextA")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!GetWindowTextW`.
 pub fn handle_get_window_text_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -244,14 +223,7 @@ pub fn handle_get_window_text_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         write_wide_window_text(engine, buffer_ptr, max_characters, &text)?
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetWindowTextW")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `USER32.dll!GetWindowTextLengthW`.
@@ -272,14 +244,7 @@ pub fn handle_get_window_text_length_w(
     let length = u64::try_from(text.encode_utf16().count())
         .context("window text length does not fit u64")?;
 
-    let return_address = engine
-        .return_from_win64_api(length)
-        .context("failed to return from GetWindowTextLengthW")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: length,
-    })
+    ctx.finish(length)
 }
 
 /// Handles `USER32.dll!GetWindowTextLengthA`.
@@ -303,14 +268,7 @@ pub fn handle_get_window_text_length_a(
     let length = u64::try_from(crate::guest_string::encode_cp1252(&text).len())
         .context("window text length does not fit u64")?;
 
-    let return_address = engine
-        .return_from_win64_api(length)
-        .context("failed to return from GetWindowTextLengthA")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: length,
-    })
+    ctx.finish(length)
 }
 
 /// The text GetWindowTextA/W reports for a window: the control buffer for

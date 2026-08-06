@@ -42,14 +42,7 @@ pub fn handle_initialize_critical_section(
     }
 
     // void return; RAX is unused but cleared for determinism.
-    let return_address = engine
-        .return_from_win64_api(0)
-        .context("failed to return from InitializeCriticalSection")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 0,
-    })
+    ctx.finish(0)
 }
 /// Handles `KERNEL32.dll!EnterCriticalSection` (reentrant; blocks when needed).
 pub fn handle_enter_critical_section(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -71,14 +64,7 @@ pub fn handle_enter_critical_section(ctx: &mut HandlerContext<'_>) -> Result<Win
         }
     }
 
-    let return_address = engine
-        .return_from_win64_api(0)
-        .context("failed to return from EnterCriticalSection")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 0,
-    })
+    ctx.finish(0)
 }
 /// Handles `KERNEL32.dll!LeaveCriticalSection`.
 pub fn handle_leave_critical_section(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -99,14 +85,7 @@ pub fn handle_leave_critical_section(ctx: &mut HandlerContext<'_>) -> Result<Win
         }
     }
 
-    let return_address = engine
-        .return_from_win64_api(0)
-        .context("failed to return from LeaveCriticalSection")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 0,
-    })
+    ctx.finish(0)
 }
 /// Handles `KERNEL32.dll!DeleteCriticalSection`.
 pub fn handle_delete_critical_section(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -119,14 +98,7 @@ pub fn handle_delete_critical_section(ctx: &mut HandlerContext<'_>) -> Result<Wi
         write_critical_section_unlocked(engine, cs, 0)?;
     }
 
-    let return_address = engine
-        .return_from_win64_api(0)
-        .context("failed to return from DeleteCriticalSection")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 0,
-    })
+    ctx.finish(0)
 }
 pub(crate) fn try_enter_critical_section_guest(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -213,14 +185,7 @@ pub fn handle_initialize_critical_section_and_spin_count(
         write_critical_section_unlocked(engine, critical_section_ptr, spin_count)?;
     }
 
-    let return_address = engine
-        .return_from_win64_api(1)
-        .context("failed to return from InitializeCriticalSectionAndSpinCount")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 pub fn handle_create_semaphore(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -368,29 +333,16 @@ pub fn handle_signal_object_and_wait(ctx: &mut HandlerContext<'_>) -> Result<Win
         Some(crate::KernelObject::Event(e)) => {
             if e.wait(0) {
                 state.process.last_error = 0;
-                let return_address =
-                    engine.return_from_win64_api(u64::from(crate::WAIT_OBJECT_0))?;
-                return Ok(WinApiHandlerResult {
-                    return_address,
-                    return_value: u64::from(crate::WAIT_OBJECT_0),
-                });
+                return ctx.finish(u64::from(crate::WAIT_OBJECT_0));
             }
         }
         Some(crate::KernelObject::Thread(t)) if t.is_finished() => {
             state.process.last_error = 0;
-            let return_address = engine.return_from_win64_api(u64::from(crate::WAIT_OBJECT_0))?;
-            return Ok(WinApiHandlerResult {
-                return_address,
-                return_value: u64::from(crate::WAIT_OBJECT_0),
-            });
+            return ctx.finish(u64::from(crate::WAIT_OBJECT_0));
         }
         None => {
             state.process.last_error = ERROR_INVALID_HANDLE;
-            let return_address = engine.return_from_win64_api(u64::from(crate::WAIT_FAILED))?;
-            return Ok(WinApiHandlerResult {
-                return_address,
-                return_value: u64::from(crate::WAIT_FAILED),
-            });
+            return ctx.finish(u64::from(crate::WAIT_FAILED));
         }
         _ => {}
     }
@@ -528,11 +480,7 @@ pub(crate) fn handle_interlocked_increment(
         |a| a.fetch_add(1, Ordering::SeqCst).wrapping_add(1),
         |old| old.wrapping_add(1),
     )?;
-    let return_address = engine.return_from_win64_api(i32_to_rax(new))?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: i32_to_rax(new),
-    })
+    ctx.finish(i32_to_rax(new))
 }
 pub(crate) fn handle_interlocked_decrement(
     ctx: &mut HandlerContext<'_>,
@@ -546,11 +494,7 @@ pub(crate) fn handle_interlocked_decrement(
         |a| a.fetch_sub(1, Ordering::SeqCst).wrapping_sub(1),
         |old| old.wrapping_sub(1),
     )?;
-    let return_address = engine.return_from_win64_api(i32_to_rax(new))?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: i32_to_rax(new),
-    })
+    ctx.finish(i32_to_rax(new))
 }
 pub(crate) fn handle_interlocked_exchange(
     ctx: &mut HandlerContext<'_>,
@@ -566,11 +510,7 @@ pub(crate) fn handle_interlocked_exchange(
         |a| a.swap(value, Ordering::SeqCst),
         |old| (old, value),
     )?;
-    let return_address = engine.return_from_win64_api(i32_to_rax(prev))?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: i32_to_rax(prev),
-    })
+    ctx.finish(i32_to_rax(prev))
 }
 pub(crate) fn handle_interlocked_compare_exchange(
     ctx: &mut HandlerContext<'_>,
@@ -594,11 +534,7 @@ pub(crate) fn handle_interlocked_compare_exchange(
             }
         },
     )?;
-    let return_address = engine.return_from_win64_api(i32_to_rax(prev))?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: i32_to_rax(prev),
-    })
+    ctx.finish(i32_to_rax(prev))
 }
 pub(crate) fn handle_interlocked_exchange_add(
     ctx: &mut HandlerContext<'_>,
@@ -613,11 +549,7 @@ pub(crate) fn handle_interlocked_exchange_add(
         |a| a.fetch_add(addend, Ordering::SeqCst),
         |old| (old, old.wrapping_add(addend)),
     )?;
-    let return_address = engine.return_from_win64_api(i32_to_rax(prev))?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: i32_to_rax(prev),
-    })
+    ctx.finish(i32_to_rax(prev))
 }
 pub(crate) fn handle_interlocked_increment64(
     ctx: &mut HandlerContext<'_>,
@@ -631,11 +563,7 @@ pub(crate) fn handle_interlocked_increment64(
         |a| a.fetch_add(1, Ordering::SeqCst).wrapping_add(1),
         |old| old.wrapping_add(1),
     )?;
-    let return_address = engine.return_from_win64_api(i64_to_rax(new))?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: i64_to_rax(new),
-    })
+    ctx.finish(i64_to_rax(new))
 }
 pub(crate) fn handle_interlocked_decrement64(
     ctx: &mut HandlerContext<'_>,
@@ -649,11 +577,7 @@ pub(crate) fn handle_interlocked_decrement64(
         |a| a.fetch_sub(1, Ordering::SeqCst).wrapping_sub(1),
         |old| old.wrapping_sub(1),
     )?;
-    let return_address = engine.return_from_win64_api(i64_to_rax(new))?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: i64_to_rax(new),
-    })
+    ctx.finish(i64_to_rax(new))
 }
 pub(crate) fn handle_interlocked_exchange64(
     ctx: &mut HandlerContext<'_>,
@@ -668,11 +592,7 @@ pub(crate) fn handle_interlocked_exchange64(
         |a| a.swap(value, Ordering::SeqCst),
         |old| (old, value),
     )?;
-    let return_address = engine.return_from_win64_api(i64_to_rax(prev))?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: i64_to_rax(prev),
-    })
+    ctx.finish(i64_to_rax(prev))
 }
 pub(crate) fn handle_interlocked_compare_exchange64(
     ctx: &mut HandlerContext<'_>,
@@ -696,11 +616,7 @@ pub(crate) fn handle_interlocked_compare_exchange64(
             }
         },
     )?;
-    let return_address = engine.return_from_win64_api(i64_to_rax(prev))?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: i64_to_rax(prev),
-    })
+    ctx.finish(i64_to_rax(prev))
 }
 pub(crate) fn handle_interlocked_exchange_add64(
     ctx: &mut HandlerContext<'_>,
@@ -715,11 +631,7 @@ pub(crate) fn handle_interlocked_exchange_add64(
         |a| a.fetch_add(addend, Ordering::SeqCst),
         |old| (old, old.wrapping_add(addend)),
     )?;
-    let return_address = engine.return_from_win64_api(i64_to_rax(prev))?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: i64_to_rax(prev),
-    })
+    ctx.finish(i64_to_rax(prev))
 }
 pub(crate) fn handle_wait_for_single_object(
     ctx: &mut HandlerContext<'_>,
@@ -751,43 +663,24 @@ pub(crate) fn handle_wait_for_single_object(
         Some(crate::KernelObject::Thread(t)) => {
             if t.is_finished() {
                 state.process.last_error = 0;
-                let return_address =
-                    engine.return_from_win64_api(u64::from(crate::WAIT_OBJECT_0))?;
-                return Ok(WinApiHandlerResult {
-                    return_address,
-                    return_value: u64::from(crate::WAIT_OBJECT_0),
-                });
+                return ctx.finish(u64::from(crate::WAIT_OBJECT_0));
             }
         }
         Some(crate::KernelObject::Event(e)) => {
             if e.wait(0) {
                 state.process.last_error = 0;
-                let return_address =
-                    engine.return_from_win64_api(u64::from(crate::WAIT_OBJECT_0))?;
-                return Ok(WinApiHandlerResult {
-                    return_address,
-                    return_value: u64::from(crate::WAIT_OBJECT_0),
-                });
+                return ctx.finish(u64::from(crate::WAIT_OBJECT_0));
             }
         }
         Some(crate::KernelObject::Semaphore(s)) => {
             if s.try_acquire() {
                 state.process.last_error = 0;
-                let return_address =
-                    engine.return_from_win64_api(u64::from(crate::WAIT_OBJECT_0))?;
-                return Ok(WinApiHandlerResult {
-                    return_address,
-                    return_value: u64::from(crate::WAIT_OBJECT_0),
-                });
+                return ctx.finish(u64::from(crate::WAIT_OBJECT_0));
             }
         }
         None => {
             state.process.last_error = ERROR_INVALID_HANDLE;
-            let return_address = engine.return_from_win64_api(u64::from(crate::WAIT_FAILED))?;
-            return Ok(WinApiHandlerResult {
-                return_address,
-                return_value: u64::from(crate::WAIT_FAILED),
-            });
+            return ctx.finish(u64::from(crate::WAIT_FAILED));
         }
     }
 
@@ -819,11 +712,7 @@ pub(crate) fn handle_create_event(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 
     let (handle, _) = state.kernel.sync.register_event(manual, initial);
     state.process.last_error = 0;
-    let return_address = engine.return_from_win64_api(handle)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: handle,
-    })
+    ctx.finish(handle)
 }
 pub(crate) fn handle_set_event(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -838,18 +727,10 @@ pub(crate) fn handle_set_event(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     };
     if ok {
         state.process.last_error = 0;
-        let return_address = engine.return_from_win64_api(1)?;
-        Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 1,
-        })
+        ctx.finish(1)
     } else {
         state.process.last_error = ERROR_INVALID_HANDLE;
-        let return_address = engine.return_from_win64_api(0)?;
-        Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        })
+        ctx.finish(0)
     }
 }
 pub(crate) fn handle_reset_event(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -865,18 +746,10 @@ pub(crate) fn handle_reset_event(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     };
     if ok {
         state.process.last_error = 0;
-        let return_address = engine.return_from_win64_api(1)?;
-        Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 1,
-        })
+        ctx.finish(1)
     } else {
         state.process.last_error = ERROR_INVALID_HANDLE;
-        let return_address = engine.return_from_win64_api(0)?;
-        Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        })
+        ctx.finish(0)
     }
 }
 pub(crate) fn handle_flush_instruction_cache(
@@ -896,29 +769,17 @@ pub(crate) fn handle_flush_instruction_cache(
     let size_usize = usize::try_from(size).unwrap_or(usize::MAX);
     if size_usize == usize::MAX && size != 0 {
         state.process.last_error = ERROR_INVALID_PARAMETER;
-        let return_address = engine.return_from_win64_api(0)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
     match engine.flush_instruction_cache(base, size_usize) {
         Ok(()) => {
             state.process.last_error = 0;
-            let return_address = engine.return_from_win64_api(1)?;
-            Ok(WinApiHandlerResult {
-                return_address,
-                return_value: 1,
-            })
+            ctx.finish(1)
         }
         Err(e) => {
             state.process.last_error =
                 wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
-            let return_address = engine.return_from_win64_api(0)?;
-            Ok(WinApiHandlerResult {
-                return_address,
-                return_value: 0,
-            })
+            ctx.finish(0)
         }
     }
 }

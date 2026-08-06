@@ -63,13 +63,7 @@ fn handle_is_dialog_message(
 
     if (dialog_proc == 0 && !host_find_dialog) || message_address == 0 {
         // Not a dialog (or no message): caller continues normal dispatch.
-        let return_address = engine
-            .return_from_win64_api(0)
-            .with_context(|| format!("failed to return from {api_name}"))?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
 
     let message = read_u32(engine, checked_address(message_address, 8, "MSG.message"))
@@ -96,15 +90,7 @@ fn handle_is_dialog_message(
     };
 
     match action {
-        DialogKeyAction::None => {
-            let return_address = engine
-                .return_from_win64_api(0)
-                .with_context(|| format!("failed to return from {api_name}"))?;
-            Ok(WinApiHandlerResult {
-                return_address,
-                return_value: 0,
-            })
-        }
+        DialogKeyAction::None => ctx.finish(0),
         DialogKeyAction::Focus => {
             tracing::debug!(
                 target: "wiegui",
@@ -116,13 +102,7 @@ fn handle_is_dialog_message(
             {
                 return Err(signal.into());
             }
-            let return_address = engine
-                .return_from_win64_api(1)
-                .with_context(|| format!("failed to return from {api_name}"))?;
-            Ok(WinApiHandlerResult {
-                return_address,
-                return_value: 1,
-            })
+            ctx.finish(1)
         }
         DialogKeyAction::ActivateButton(button_hwnd) => {
             tracing::debug!(
@@ -146,13 +126,7 @@ fn handle_is_dialog_message(
                     button_hwnd,
                 )
                 .context("host find dialog Enter command failed")?;
-                let return_address = engine
-                    .return_from_win64_api(1)
-                    .with_context(|| format!("failed to return from {api_name}"))?;
-                return Ok(WinApiHandlerResult {
-                    return_address,
-                    return_value: 1,
-                });
+                return ctx.finish(1);
             }
             // Consumed: the caller's DispatchMessage must not see the message.
             // The guest dialog proc runs synchronously (WM_COMMAND may call
@@ -188,13 +162,7 @@ fn handle_is_dialog_message(
                     0,
                 )
                 .context("host find dialog Escape command failed")?;
-                let return_address = engine
-                    .return_from_win64_api(1)
-                    .with_context(|| format!("failed to return from {api_name}"))?;
-                return Ok(WinApiHandlerResult {
-                    return_address,
-                    return_value: 1,
-                });
+                return ctx.finish(1);
             }
             // Consumed: the caller's DispatchMessage must not see the message.
             // The guest dialog proc runs synchronously (WM_COMMAND may call
@@ -332,9 +300,9 @@ fn vk_is_shift_down(state: &WinApiState) -> bool {
 
 /// Handles `USER32.dll!DefDlgProcA` (delegates to the default window proc).
 pub fn handle_def_dlg_proc_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_default_window_procedure(ctx, "DefDlgProcA")
+    handle_default_window_procedure(ctx)
 }
 /// Handles `USER32.dll!DefDlgProcW`.
 pub fn handle_def_dlg_proc_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_default_window_procedure(ctx, "DefDlgProcW")
+    handle_default_window_procedure(ctx)
 }

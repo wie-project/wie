@@ -54,14 +54,7 @@ pub fn handle_set_fvf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
 
     let return_value = D3D_OK;
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DDevice9::SetFVF")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DDevice9::SetRenderState`.
@@ -126,14 +119,7 @@ pub fn handle_set_render_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         D3D_OK
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DDevice9::SetRenderState")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Apply one decoded `D3DTSS_*` slot to a stage's typed state. Unmodeled
@@ -206,15 +192,7 @@ pub fn handle_set_texture_stage_state(ctx: &mut HandlerContext<'_>) -> Result<Wi
 
     let return_value = D3D_OK;
 
-    let return_address = engine.return_from_win64_api(return_value).context(
-        "failed to return from \
-             IDirect3DDevice9::SetTextureStageState",
-    )?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DDevice9::SetSamplerState`.
@@ -244,14 +222,7 @@ pub fn handle_set_sampler_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 
     let return_value = D3D_OK;
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from SetSamplerState")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DDevice9::Release`.
@@ -314,14 +285,7 @@ pub fn handle_device_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         0
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DDevice9::Release")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3D9::Release`.
@@ -357,14 +321,7 @@ pub fn handle_direct3d9_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         0
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3D9::Release")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `IDirect3DDevice9::Present` (vtable slot 17).
 ///
@@ -419,13 +376,7 @@ pub fn handle_present(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
     }
     tracing::trace!(target: "wiegui", bb_w, bb_h, hwnd = hwnd.as_u64(), "D3D9 Present");
 
-    let return_address = engine
-        .return_from_win64_api(D3D_OK)
-        .context("failed to return from IDirect3DDevice9::Present")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: D3D_OK,
-    })
+    ctx.finish(D3D_OK)
 }
 
 /// Handles `IDirect3DDevice9::Clear` (vtable slot 43).
@@ -562,13 +513,7 @@ pub fn handle_clear(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult>
     }
     // D3DCLEAR_ZBUFFER: no depth surface in slice 1 — accepted, clears nothing.
 
-    let return_address = engine
-        .return_from_win64_api(D3D_OK)
-        .context("failed to return from IDirect3DDevice9::Clear")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: D3D_OK,
-    })
+    ctx.finish(D3D_OK)
 }
 /// Handles `IDirect3DDevice9::BeginScene` (vtable slot 41).
 pub fn handle_begin_scene(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -585,13 +530,7 @@ pub fn handle_begin_scene(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         D3D_OK
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DDevice9::BeginScene")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DDevice9::EndScene` (vtable slot 42).
@@ -612,13 +551,7 @@ pub fn handle_end_scene(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
         D3DERR_INVALIDCALL
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DDevice9::EndScene")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DDevice9::SetTransform` (vtable slot 44).
@@ -662,13 +595,7 @@ pub fn handle_set_transform(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         }
     }
 
-    let return_address = engine
-        .return_from_win64_api(D3D_OK)
-        .context("failed to return from IDirect3DDevice9::SetTransform")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: D3D_OK,
-    })
+    ctx.finish(D3D_OK)
 }
 
 /// Handles `IDirect3DDevice9::GetTransform` (vtable slot 45).
@@ -721,13 +648,7 @@ pub fn handle_get_transform(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         _ => D3DERR_INVALIDCALL,
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DDevice9::GetTransform")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DDevice9::MultiplyTransform` (vtable slot 46).
@@ -794,13 +715,7 @@ pub fn handle_multiply_transform(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         D3DERR_INVALIDCALL
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DDevice9::MultiplyTransform")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DDevice9::SetScissorRect` (vtable slot 115).
@@ -842,13 +757,7 @@ pub fn handle_set_scissor_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         D3DERR_INVALIDCALL
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DDevice9::SetScissorRect")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DDevice9::SetViewport` (vtable slot 47).
@@ -876,13 +785,7 @@ pub fn handle_set_viewport(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
         }
     }
 
-    let return_address = engine
-        .return_from_win64_api(D3D_OK)
-        .context("failed to return from IDirect3DDevice9::SetViewport")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: D3D_OK,
-    })
+    ctx.finish(D3D_OK)
 }
 
 /// Handles `IDirect3DDevice9::GetViewport` (vtable slot 48).
@@ -913,13 +816,7 @@ pub fn handle_get_viewport(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
         D3DERR_INVALIDCALL
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DDevice9::GetViewport")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Shared body of the two `Draw*UP` handlers.
@@ -1003,13 +900,7 @@ pub fn handle_draw_primitive_up(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         0,
     )?;
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from DrawPrimitiveUP")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DDevice9::DrawIndexedPrimitiveUP` (vtable slot 84).
@@ -1057,13 +948,7 @@ pub fn handle_draw_indexed_primitive_up(
         index_count,
     )?;
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from DrawIndexedPrimitiveUP")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DDevice9::DrawPrimitive` (vtable slot 81) — the
@@ -1092,13 +977,7 @@ pub fn handle_draw_primitive(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     let return_value =
         draw_buffer_form_common(state, primitive_type, primitive_count, None, start_vertex)?;
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from DrawPrimitive")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DDevice9::DrawIndexedPrimitive` (vtable slot 82) — the
@@ -1138,13 +1017,7 @@ pub fn handle_draw_indexed_primitive(ctx: &mut HandlerContext<'_>) -> Result<Win
         0,
     )?;
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from DrawIndexedPrimitive")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Shared body of the two buffer-form draws.
@@ -1292,13 +1165,7 @@ pub fn handle_set_stream_source(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         D3DERR_INVALIDCALL
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from SetStreamSource")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DDevice9::GetStreamSource` (vtable slot 101).
@@ -1348,13 +1215,7 @@ pub fn handle_get_stream_source(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
             .context("failed to write GetStreamSource stride output")?;
     }
 
-    let return_address = engine
-        .return_from_win64_api(D3D_OK)
-        .context("failed to return from GetStreamSource")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: D3D_OK,
-    })
+    ctx.finish(D3D_OK)
 }
 
 /// Handles `IDirect3DDevice9::SetIndices` (vtable slot 104).
@@ -1385,13 +1246,7 @@ pub fn handle_set_indices(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         D3DERR_INVALIDCALL
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from SetIndices")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DDevice9::GetIndices` (vtable slot 105).
@@ -1412,13 +1267,7 @@ pub fn handle_get_indices(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
             .context("failed to write GetIndices output")?;
     }
 
-    let return_address = engine
-        .return_from_win64_api(D3D_OK)
-        .context("failed to return from GetIndices")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: D3D_OK,
-    })
+    ctx.finish(D3D_OK)
 }
 
 /// Handles `IDirect3DDevice9::CreateVertexBuffer` (vtable slot 26).
@@ -1486,13 +1335,7 @@ pub fn handle_create_vertex_buffer(ctx: &mut HandlerContext<'_>) -> Result<WinAp
         D3DERR_INVALIDCALL
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from CreateVertexBuffer")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DDevice9::CreateIndexBuffer` (vtable slot 27).
@@ -1556,13 +1399,7 @@ pub fn handle_create_index_buffer(ctx: &mut HandlerContext<'_>) -> Result<WinApi
         D3DERR_INVALIDCALL
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from CreateIndexBuffer")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DDevice9::CreateRenderTarget` (vtable slot 24).
@@ -1640,13 +1477,7 @@ pub fn handle_create_render_target(ctx: &mut HandlerContext<'_>) -> Result<WinAp
         D3DERR_INVALIDCALL
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from CreateRenderTarget")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DDevice9::SetRenderTarget` (vtable slot 36).
@@ -1682,13 +1513,7 @@ pub fn handle_set_render_target(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         D3DERR_INVALIDCALL
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from SetRenderTarget")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DDevice9::GetRenderTarget` (vtable slot 37).
@@ -1721,11 +1546,5 @@ pub fn handle_get_render_target(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         D3DERR_INVALIDCALL
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetRenderTarget")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }

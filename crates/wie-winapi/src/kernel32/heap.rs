@@ -31,12 +31,7 @@ pub fn handle_heap_alloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
         addr
     };
 
-    let return_address = engine.return_from_win64_api(return_value)?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!HeapFree`.
 pub fn handle_heap_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -54,12 +49,7 @@ pub fn handle_heap_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
         0
     };
 
-    let return_address = engine.return_from_win64_api(return_value)?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!HeapReAlloc`.
 pub fn handle_heap_realloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -122,12 +112,7 @@ pub fn handle_heap_realloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
         }
     };
 
-    let return_address = engine.return_from_win64_api(return_value)?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!HeapCreate`.
 pub fn handle_heap_create(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -145,14 +130,7 @@ pub fn handle_heap_create(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         .read_r8()
         .context("failed to read R8 for HeapCreate")?;
 
-    let return_address = engine
-        .return_from_win64_api(process_heap_handle)
-        .context("failed to return from HeapCreate")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: process_heap_handle,
-    })
+    ctx.finish(process_heap_handle)
 }
 /// Handles `KERNEL32.dll!HeapSetInformation`.
 pub fn handle_heap_set_information(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -169,14 +147,7 @@ pub fn handle_heap_set_information(ctx: &mut HandlerContext<'_>) -> Result<WinAp
         .read_r8()
         .context("failed to read R8 for HeapSetInformation")?;
 
-    let return_address = engine
-        .return_from_win64_api(1)
-        .context("failed to return from HeapSetInformation")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 /// Handles `KERNEL32.dll!HeapSize`.
 pub fn handle_heap_size(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -203,12 +174,7 @@ pub fn handle_heap_size(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
         })
         .unwrap_or(HEAP_SIZE_FAILURE);
 
-    let return_address = engine.return_from_win64_api(return_value)?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GlobalMemoryStatus`.
 pub fn handle_global_memory_status(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -244,14 +210,7 @@ pub fn handle_global_memory_status(ctx: &mut HandlerContext<'_>) -> Result<WinAp
             .context("failed to write MEMORYSTATUS")?;
     }
 
-    let return_address = engine
-        .return_from_win64_api(0)
-        .context("failed to return from GlobalMemoryStatus")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 0,
-    })
+    ctx.finish(0)
 }
 pub fn handle_global_memory_status_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -307,14 +266,7 @@ pub fn handle_local_alloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 
     let return_value = allocate_fake_heap_block(engine, state, size);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from LocalAlloc")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!LocalFree`.
 pub fn handle_local_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -325,14 +277,7 @@ pub fn handle_local_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
         .context("failed to read RCX for LocalFree")?;
 
     if memory == 0 {
-        let return_address = engine
-            .return_from_win64_api(0)
-            .context("failed to return from LocalFree")?;
-
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
 
     let existed = state.heap_state.heap.free_coherent(engine, memory);
@@ -340,14 +285,7 @@ pub fn handle_local_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
     // LocalFree returns NULL on success and the original handle on failure.
     let return_value = if existed { 0 } else { memory };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from LocalFree")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!LocalLock`.
 ///
@@ -368,14 +306,7 @@ pub fn handle_local_lock(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
         0
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from LocalLock")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!LocalUnlock`.
 ///
@@ -396,14 +327,7 @@ pub fn handle_local_unlock(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
     }
 
     let return_value = u64::from(live);
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from LocalUnlock")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GlobalAlloc`.
 pub fn handle_global_alloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -419,14 +343,7 @@ pub fn handle_global_alloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
 
     let return_value = allocate_fake_heap_block(engine, state, size);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GlobalAlloc")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GlobalFree`.
 pub fn handle_global_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -437,14 +354,7 @@ pub fn handle_global_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         .context("failed to read RCX for GlobalFree")?;
 
     if memory == 0 {
-        let return_address = engine
-            .return_from_win64_api(0)
-            .context("failed to return from GlobalFree")?;
-
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
 
     let existed = state.heap_state.heap.free_coherent(engine, memory);
@@ -452,14 +362,7 @@ pub fn handle_global_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     // GlobalFree returns NULL on success and the original handle on failure.
     let return_value = if existed { 0 } else { memory };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GlobalFree")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GlobalLock`.
 pub fn handle_global_lock(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -475,14 +378,7 @@ pub fn handle_global_lock(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         0
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GlobalLock")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GlobalUnlock`.
 pub fn handle_global_unlock(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -498,14 +394,7 @@ pub fn handle_global_unlock(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 
     let return_value = 0;
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GlobalUnlock")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GlobalSize`.
 pub fn handle_global_size(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -517,14 +406,7 @@ pub fn handle_global_size(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 
     let return_value = state.heap_state.heap.size_of(memory).unwrap_or(0);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GlobalSize")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GlobalAddAtomA`.
 pub fn handle_global_add_atom_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -572,14 +454,7 @@ pub fn handle_global_add_atom_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         }
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GlobalAddAtomA")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GlobalDeleteAtom`.
 pub fn handle_global_delete_atom(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -612,14 +487,7 @@ pub fn handle_global_delete_atom(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     // GlobalDeleteAtom returns zero on success, otherwise the original atom.
     let return_value = if existed { 0 } else { u64::from(atom) };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GlobalDeleteAtom")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 #[cfg(test)]

@@ -154,18 +154,10 @@ pub fn handle_get_compressed_file_size_a(
     let st = stat_guest_path(state, &full);
     if st.kind == crate::vfs::PathKind::NotFound {
         state.process.last_error = ERROR_FILE_NOT_FOUND;
-        let return_address = engine.return_from_win64_api(INVALID_FILE_ATTRIBUTES)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: INVALID_FILE_ATTRIBUTES,
-        });
+        return ctx.finish(INVALID_FILE_ATTRIBUTES);
     }
     state.process.last_error = 0;
-    let return_address = engine.return_from_win64_api(st.size)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: st.size,
-    })
+    ctx.finish(st.size)
 }
 /// Handles `KERNEL32.dll!GetCompressedFileSizeW` — return real uncompressed size via VFS.
 pub fn handle_get_compressed_file_size_w(
@@ -181,18 +173,10 @@ pub fn handle_get_compressed_file_size_w(
     let st = stat_guest_path(state, &full);
     if st.kind == crate::vfs::PathKind::NotFound {
         state.process.last_error = ERROR_FILE_NOT_FOUND;
-        let return_address = engine.return_from_win64_api(INVALID_FILE_ATTRIBUTES)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: INVALID_FILE_ATTRIBUTES,
-        });
+        return ctx.finish(INVALID_FILE_ATTRIBUTES);
     }
     state.process.last_error = 0;
-    let return_address = engine.return_from_win64_api(st.size)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: st.size,
-    })
+    ctx.finish(st.size)
 }
 /// Handles `KERNEL32.dll!GetVolumeInformationW` — real bottle volume info.
 pub fn handle_get_volume_information_w(
@@ -241,11 +225,7 @@ pub fn handle_get_volume_information_w(
         let _unused = write_guest_u32(engine, fs_len_ptr, 4);
     }
     state.process.last_error = 0;
-    let return_address = engine.return_from_win64_api(1)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 /// Handles `KERNEL32.dll!GetVolumeInformationA` — real bottle volume info.
 pub fn handle_get_volume_information_a(
@@ -289,11 +269,7 @@ pub fn handle_get_volume_information_a(
     }
 
     state.process.last_error = 0;
-    let return_address = engine.return_from_win64_api(1)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 /// Handles `KERNEL32.dll!LockFile` — validate file handle and return TRUE.
 pub fn handle_lock_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -302,18 +278,10 @@ pub fn handle_lock_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
     let handle = engine.read_rcx()?;
     if !is_open_file_handle(state, handle) && handle != FAKE_STDIN_HANDLE {
         state.process.last_error = ERROR_INVALID_HANDLE;
-        let return_address = engine.return_from_win64_api(0)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
     state.process.last_error = 0;
-    let return_address = engine.return_from_win64_api(1)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 /// Handles `KERNEL32.dll!UnlockFile` — validate file handle and return TRUE.
 pub fn handle_unlock_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -322,18 +290,10 @@ pub fn handle_unlock_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     let handle = engine.read_rcx()?;
     if !is_open_file_handle(state, handle) && handle != FAKE_STDIN_HANDLE {
         state.process.last_error = ERROR_INVALID_HANDLE;
-        let return_address = engine.return_from_win64_api(0)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
     state.process.last_error = 0;
-    let return_address = engine.return_from_win64_api(1)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 /// Handles `KERNEL32.dll!SetFileValidData` — validate file handle and return TRUE.
 pub fn handle_set_file_valid_data(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -342,18 +302,10 @@ pub fn handle_set_file_valid_data(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     let handle = engine.read_rcx()?;
     if !is_open_file_handle(state, handle) {
         state.process.last_error = ERROR_INVALID_HANDLE;
-        let return_address = engine.return_from_win64_api(0)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
     state.process.last_error = 0;
-    let return_address = engine.return_from_win64_api(1)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 /// Handles `KERNEL32.dll!GetFileAttributesExW` — real extended attributes via VFS.
 pub fn handle_get_file_attributes_ex_w(
@@ -371,11 +323,7 @@ pub fn handle_get_file_attributes_ex_w(
     let st = stat_guest_path(state, &full);
     if st.kind == crate::vfs::PathKind::NotFound {
         state.process.last_error = ERROR_FILE_NOT_FOUND;
-        let return_address = engine.return_from_win64_api(0)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
     if info_ptr != 0 {
         with_typed_write::<FileAttributeData, _, _>(engine, info_ptr, |data| {
@@ -395,11 +343,7 @@ pub fn handle_get_file_attributes_ex_w(
         .context("failed to write WIN32_FILE_ATTRIBUTE_DATA")?;
     }
     state.process.last_error = 0;
-    let return_address = engine.return_from_win64_api(1)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 /// Handles `KERNEL32.dll!GetFileAttributesExA` — real extended attributes via VFS.
 pub fn handle_get_file_attributes_ex_a(
@@ -417,11 +361,7 @@ pub fn handle_get_file_attributes_ex_a(
     let st = stat_guest_path(state, &full);
     if st.kind == crate::vfs::PathKind::NotFound {
         state.process.last_error = ERROR_FILE_NOT_FOUND;
-        let return_address = engine.return_from_win64_api(0)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
     if info_ptr != 0 {
         with_typed_write::<FileAttributeData, _, _>(engine, info_ptr, |data| {
@@ -441,11 +381,7 @@ pub fn handle_get_file_attributes_ex_a(
         .context("failed to write WIN32_FILE_ATTRIBUTE_DATA")?;
     }
     state.process.last_error = 0;
-    let return_address = engine.return_from_win64_api(1)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 pub fn handle_get_temp_path_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -466,11 +402,7 @@ pub fn handle_get_temp_path_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         u64::try_from(terminated.len().saturating_sub(1)).unwrap_or(0)
     };
     state.process.last_error = 0;
-    let return_address = engine.return_from_win64_api(return_value)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GetTempPathA`.
 pub fn handle_get_temp_path_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -491,11 +423,7 @@ pub fn handle_get_temp_path_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         u64::try_from(out.len().saturating_sub(1)).unwrap_or(0)
     };
     state.process.last_error = 0;
-    let return_address = engine.return_from_win64_api(return_value)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GetTempFileNameW` (unique name under path; creates 0-byte file).
 pub fn handle_get_temp_file_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -537,11 +465,7 @@ pub fn handle_get_temp_file_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinAp
     }
     state.process.last_error = 0;
     let return_value = u64::from(id_u32).max(1);
-    let return_address = engine.return_from_win64_api(return_value)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GetTempFileNameA`.
 pub fn handle_get_temp_file_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -583,11 +507,7 @@ pub fn handle_get_temp_file_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinAp
     }
     state.process.last_error = 0;
     let return_value = u64::from(id_u32).max(1);
-    let return_address = engine.return_from_win64_api(return_value)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GetDriveTypeW`.
 pub fn handle_get_drive_type_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -600,11 +520,7 @@ pub fn handle_get_drive_type_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         read_wide_string_from_cpu(engine, path_ptr, 16)?
     };
     let return_value = u64::from(crate::vfs::get_drive_type(&state.file_io.volumes, &path));
-    let return_address = engine.return_from_win64_api(return_value)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GetDriveTypeA`.
 pub fn handle_get_drive_type_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -617,22 +533,13 @@ pub fn handle_get_drive_type_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         read_ansi_string_from_cpu(engine, path_ptr, 16)?
     };
     let return_value = u64::from(crate::vfs::get_drive_type(&state.file_io.volumes, &path));
-    let return_address = engine.return_from_win64_api(return_value)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GetLogicalDrives`.
 pub fn handle_get_logical_drives(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let return_value = u64::from(crate::vfs::logical_drives_mask(&state.file_io.volumes));
-    let return_address = engine.return_from_win64_api(return_value)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GetSystemDirectoryW`.
 pub fn handle_get_system_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {

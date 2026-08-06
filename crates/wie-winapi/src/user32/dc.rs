@@ -19,14 +19,7 @@ pub fn handle_get_dc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult
         crate::handles::Hdc::from(FAKE_DEVICE_CONTEXT_HANDLE)
     };
 
-    let return_address = engine
-        .return_from_win64_api(dc_handle.as_u64())
-        .context("failed to return from GetDC")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: dc_handle.as_u64(),
-    })
+    ctx.finish(dc_handle.as_u64())
 }
 /// Handles `USER32.dll!ReleaseDC`.
 pub fn handle_release_dc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -44,14 +37,7 @@ pub fn handle_release_dc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
         .gdi_state()
         .remove_dc(crate::handles::Hdc::from(dc_handle));
 
-    let return_address = engine
-        .return_from_win64_api(1)
-        .context("failed to return from ReleaseDC")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 /// Handles `USER32.dll!BeginPaint`.
 pub fn handle_begin_paint(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -113,14 +99,7 @@ pub fn handle_begin_paint(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         0
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from BeginPaint")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!EndPaint`.
 pub fn handle_end_paint(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -143,14 +122,7 @@ pub fn handle_end_paint(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
     }
 
     let return_value = u64::from(success);
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from EndPaint")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!ScrollDC` (no-op success stub; no real pixel scroll).
 pub fn handle_scroll_dc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -159,12 +131,5 @@ pub fn handle_scroll_dc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
         .read_rcx()
         .context("failed to read RCX for ScrollDC")?;
 
-    let return_address = engine
-        .return_from_win64_api(1)
-        .context("failed to return from ScrollDC")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }

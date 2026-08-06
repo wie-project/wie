@@ -108,13 +108,7 @@ pub fn handle_create_window_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     .context("failed to create window record for CreateWindowExA")?;
 
     if hwnd == 0 {
-        let ra = engine
-            .return_from_win64_api(0)
-            .context("failed to return from CreateWindowExA")?;
-        return Ok(WinApiHandlerResult {
-            return_address: ra,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
 
     // A new top-level window (no parent) enters the host-visible window set
@@ -140,13 +134,7 @@ pub fn handle_create_window_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         let cs_va = state.heap_state.heap.alloc_coherent(engine, 0x50);
         if cs_va == 0 {
             // Allocation failed — return HWND without WM_CREATE
-            let ra = engine
-                .return_from_win64_api(hwnd)
-                .context("failed to return from CreateWindowExA")?;
-            return Ok(WinApiHandlerResult {
-                return_address: ra,
-                return_value: hwnd,
-            });
+            return ctx.finish(hwnd);
         }
 
         // One shared-lock borrow instead of eleven per-field writes. The
@@ -185,13 +173,7 @@ pub fn handle_create_window_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     }
 
     // No window procedure — return the HWND directly
-    let ra = engine
-        .return_from_win64_api(hwnd)
-        .context("failed to return from CreateWindowExA")?;
-    Ok(WinApiHandlerResult {
-        return_address: ra,
-        return_value: hwnd,
-    })
+    ctx.finish(hwnd)
 }
 
 /// Handles `USER32.dll!CreateWindowExW`.
@@ -293,13 +275,7 @@ pub fn handle_create_window_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     .context("failed to create window record for CreateWindowExW")?;
 
     if hwnd == 0 {
-        let ra = engine
-            .return_from_win64_api(0)
-            .context("failed to return from CreateWindowExW")?;
-        return Ok(WinApiHandlerResult {
-            return_address: ra,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
 
     // A new top-level window registers with the host-visible window set and
@@ -320,13 +296,7 @@ pub fn handle_create_window_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         // Allocate CREATESTRUCT in guest memory (0x50 bytes)
         let cs_va = state.heap_state.heap.alloc_coherent(engine, 0x50);
         if cs_va == 0 {
-            let ra = engine
-                .return_from_win64_api(hwnd)
-                .context("failed to return from CreateWindowExW")?;
-            return Ok(WinApiHandlerResult {
-                return_address: ra,
-                return_value: hwnd,
-            });
+            return ctx.finish(hwnd);
         }
 
         // CREATESTRUCT layout is shared with the ANSI variant (see above).
@@ -362,11 +332,5 @@ pub fn handle_create_window_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     }
 
     // No window procedure — return the HWND directly
-    let ra = engine
-        .return_from_win64_api(hwnd)
-        .context("failed to return from CreateWindowExW")?;
-    Ok(WinApiHandlerResult {
-        return_address: ra,
-        return_value: hwnd,
-    })
+    ctx.finish(hwnd)
 }

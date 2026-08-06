@@ -22,14 +22,7 @@ pub fn handle_is_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
     // not just the legacy fake top-level handle.
     let return_value = u64::from(is_known_window(state, window_handle));
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IsWindow")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!IsWindowVisible`.
 pub fn handle_is_window_visible(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -45,14 +38,7 @@ pub fn handle_is_window_visible(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         find_window(state, window_handle).is_some_and(|window| window.visible)
     });
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IsWindowVisible")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!IsWindowEnabled`.
 pub fn handle_is_window_enabled(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -69,14 +55,7 @@ pub fn handle_is_window_enabled(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
             .is_some_and(|window| window.flags.contains(WindowFlags::ENABLED))
     });
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IsWindowEnabled")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!GetParent`.
 pub fn handle_get_parent(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -89,44 +68,21 @@ pub fn handle_get_parent(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
     let return_value =
         find_window(state, window_handle).map_or(0, |window| window.parent_handle.as_u64());
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetParent")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!GetActiveWindow`.
 pub fn handle_get_active_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let return_value = state.window_state().active_window_handle.as_u64();
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetActiveWindow")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!GetForegroundWindow`.
 pub fn handle_get_foreground_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let return_value = state.window_state().foreground_window_handle.as_u64();
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetForegroundWindow")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!ShowWindow`.
 pub fn handle_show_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -197,14 +153,7 @@ pub fn handle_show_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 
     let return_value = u64::from(previously_visible);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from ShowWindow")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!EnableWindow`.
 pub fn handle_enable_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -227,14 +176,7 @@ pub fn handle_enable_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     // EnableWindow returns nonzero when the window was previously disabled.
     let return_value = u64::from(previously_disabled);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from EnableWindow")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!SetForegroundWindow`.
 pub fn handle_set_foreground_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -253,14 +195,7 @@ pub fn handle_set_foreground_window(ctx: &mut HandlerContext<'_>) -> Result<WinA
 
     let return_value = u64::from(success);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from SetForegroundWindow")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!SetActiveWindow`.
 pub fn handle_set_active_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -276,14 +211,7 @@ pub fn handle_set_active_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         state.window_state().active_window_handle = crate::handles::Hwnd::from(window_handle);
     }
 
-    let return_address = engine
-        .return_from_win64_api(previous_window.as_u64())
-        .context("failed to return from SetActiveWindow")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: previous_window.as_u64(),
-    })
+    ctx.finish(previous_window.as_u64())
 }
 /// Handles `USER32.dll!SetFocus`.
 pub fn handle_set_focus(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -316,14 +244,7 @@ pub fn handle_set_focus(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
         return Err(signal.into());
     }
 
-    let return_address = engine
-        .return_from_win64_api(previous_window.as_u64())
-        .context("failed to return from SetFocus")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: previous_window.as_u64(),
-    })
+    ctx.finish(previous_window.as_u64())
 }
 
 /// Bridge one guest callback, or post it when the bridge is already taken.
@@ -447,18 +368,10 @@ pub(crate) fn deliver_focus_change(
 }
 /// Handles `USER32.dll!GetFocus`.
 pub fn handle_get_focus(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let return_value = state.window_state().focus_window_handle.as_u64();
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetFocus")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!UpdateWindow`.
 pub fn handle_update_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -510,14 +423,7 @@ pub fn handle_update_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     // No update region or no guest WndProc: succeed without painting.
     let return_value = 1;
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from UpdateWindow")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!InvalidateRect`.
 pub fn handle_invalidate_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -549,14 +455,7 @@ pub fn handle_invalidate_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 
     let return_value = u64::from(success);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from InvalidateRect")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!RedrawWindow`.
 pub fn handle_redraw_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -591,14 +490,7 @@ pub fn handle_redraw_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 
     let return_value = u64::from(success);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from RedrawWindow")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!DestroyWindow`.
 pub fn handle_destroy_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -613,13 +505,7 @@ pub fn handle_destroy_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         find_window(state, window_handle).map(|w| (w.window_proc, w.unicode, w.parent_handle));
 
     let Some((window_proc, unicode, parent_handle)) = window_info else {
-        let ra = engine
-            .return_from_win64_api(0)
-            .context("failed to return from DestroyWindow")?;
-        return Ok(WinApiHandlerResult {
-            return_address: ra,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     };
 
     // A destroyed top-level window publishes no frame, so the host window
@@ -645,13 +531,7 @@ pub fn handle_destroy_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
             .window_state()
             .windows
             .retain(|w| w.handle != crate::handles::Hwnd::from(window_handle));
-        let ra = engine
-            .return_from_win64_api(1)
-            .context("failed to return from DestroyWindow")?;
-        return Ok(WinApiHandlerResult {
-            return_address: ra,
-            return_value: 1,
-        });
+        return ctx.finish(1);
     }
 
     // Send WM_DESTROY to the window procedure.

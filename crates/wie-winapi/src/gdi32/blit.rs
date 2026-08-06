@@ -538,13 +538,7 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
 
     if rop != SRCCOPY && rop != BLACKNESS && rop != WHITENESS {
         tracing::debug!(rop, "BitBlt unsupported ROP, returning success");
-        let ra = engine
-            .return_from_win64_api(1)
-            .context("failed to return from BitBlt")?;
-        return Ok(WinApiHandlerResult {
-            return_address: ra,
-            return_value: 1,
-        });
+        return ctx.finish(1);
     }
 
     // BLACKNESS / WHITENESS: solid fill, no source needed.
@@ -565,35 +559,17 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
                 );
             }
         }
-        let ra = engine
-            .return_from_win64_api(1)
-            .context("failed to return from BitBlt")?;
-        return Ok(WinApiHandlerResult {
-            return_address: ra,
-            return_value: 1,
-        });
+        return ctx.finish(1);
     }
 
     // SRCCOPY path: read from source DIB, write to destination surface.
     let Some((src_va, src_stride, src_w, src_h, top_down)) = resolve_src_info(state, hdc_src)
     else {
         tracing::debug!("BitBlt: invalid source");
-        let ra = engine
-            .return_from_win64_api(1)
-            .context("failed to return from BitBlt")?;
-        return Ok(WinApiHandlerResult {
-            return_address: ra,
-            return_value: 1,
-        });
+        return ctx.finish(1);
     };
     let Some(info) = resolve_dest_info(state, hdc_dst) else {
-        let ra = engine
-            .return_from_win64_api(1)
-            .context("failed to return from BitBlt")?;
-        return Ok(WinApiHandlerResult {
-            return_address: ra,
-            return_value: 1,
-        });
+        return ctx.finish(1);
     };
 
     // Clip. Window sizes beyond i32::MAX (unreachable for real screens)
@@ -603,13 +579,7 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
     let Some((dx, dy, sx, sy, cw, ch)) =
         clip_blit_rect(dest_w_i, dest_h_i, src_w, src_h, x, y, x1, y1, cx, cy)
     else {
-        let ra = engine
-            .return_from_win64_api(1)
-            .context("failed to return from BitBlt")?;
-        return Ok(WinApiHandlerResult {
-            return_address: ra,
-            return_value: 1,
-        });
+        return ctx.finish(1);
     };
 
     // WS_CLIPCHILDREN: decompose the dest rect around visible children so a
@@ -655,13 +625,7 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
             .get_mut(&info.hwnd)
             .map(|s| &mut s.pixels[..]);
         let Some(dest) = dest else {
-            let ra = engine
-                .return_from_win64_api(1)
-                .context("failed to return from BitBlt")?;
-            return Ok(WinApiHandlerResult {
-                return_address: ra,
-                return_value: 1,
-            });
+            return ctx.finish(1);
         };
         for rect in &rects {
             let rect_w = rect.width();
@@ -727,13 +691,7 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
     // fully-painted composite with the union region.
     state.present().publish_deferred(info.hwnd);
 
-    let ra = engine
-        .return_from_win64_api(1)
-        .context("failed to return from BitBlt")?;
-    Ok(WinApiHandlerResult {
-        return_address: ra,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 
 /// Handles `GDI32.dll!StretchBlt` (stub).
@@ -751,13 +709,7 @@ pub fn handle_stretch_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     let _cx = engine
         .read_r9()
         .context("failed to read R9 for StretchBlt")?;
-    let ra = engine
-        .return_from_win64_api(1)
-        .context("failed to return from StretchBlt")?;
-    Ok(WinApiHandlerResult {
-        return_address: ra,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 
 /// Handles `GDI32.dll!PatBlt` — fills the rectangle with the DC's current
@@ -812,13 +764,7 @@ pub fn handle_pat_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
     }
 
     // NULL_BRUSH / unknown DC: no pixels change, but PatBlt still succeeds.
-    let ra = engine
-        .return_from_win64_api(1)
-        .context("failed to return from PatBlt")?;
-    Ok(WinApiHandlerResult {
-        return_address: ra,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 
 /// Handles `GDI32.dll!FillRect` — fills the RECT with the given brush.
@@ -868,13 +814,7 @@ pub fn handle_fill_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
     }
 
     let return_value = u64::from(filled);
-    let ra = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from FillRect")?;
-    Ok(WinApiHandlerResult {
-        return_address: ra,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 #[cfg(test)]

@@ -53,14 +53,7 @@ pub fn handle_create_dc_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 
     let handle = state.gdi_state().alloc_print_dc();
 
-    let return_address = engine
-        .return_from_win64_api(handle.as_u64())
-        .context("failed to return from CreateDCW")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: handle.as_u64(),
-    })
+    ctx.finish(handle.as_u64())
 }
 
 /// Handles `GDI32.dll!StartDocW` — begin a print document.
@@ -100,14 +93,7 @@ pub fn handle_start_doc_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         }
     }
 
-    let return_address = engine
-        .return_from_win64_api(u64::from(success))
-        .context("failed to return from StartDocW")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: u64::from(success),
-    })
+    ctx.finish(u64::from(success))
 }
 
 /// Handles `GDI32.dll!StartPage` — begin a new page of the document.
@@ -136,14 +122,7 @@ pub fn handle_start_page(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
         success = true;
     }
 
-    let return_address = engine
-        .return_from_win64_api(u64::from(success))
-        .context("failed to return from StartPage")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: u64::from(success),
-    })
+    ctx.finish(u64::from(success))
 }
 
 /// Handles `GDI32.dll!EndPage` — finish the page being painted.
@@ -167,14 +146,7 @@ pub fn handle_end_page(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
         success = true;
     }
 
-    let return_address = engine
-        .return_from_win64_api(u64::from(success))
-        .context("failed to return from EndPage")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: u64::from(success),
-    })
+    ctx.finish(u64::from(success))
 }
 
 /// Handles `GDI32.dll!EndDoc` — finish the document and hand the pages off.
@@ -201,13 +173,7 @@ pub fn handle_end_doc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
     // Return 1 on success, 0 on failure (or when the bridge never answered).
     if let Some(pending) = state.window_state().pending_native_print_job.take() {
         let success = pending.success.unwrap_or(false);
-        let return_address = engine
-            .return_from_win64_api(u64::from(success))
-            .context("failed to return from EndDoc")?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: u64::from(success),
-        });
+        return ctx.finish(u64::from(success));
     }
 
     // Take the job payload OUT of the gdi borrow before the bridge decision:
@@ -230,13 +196,7 @@ pub fn handle_end_doc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
     };
 
     let Some((dc, request)) = handoff else {
-        let return_address = engine
-            .return_from_win64_api(0)
-            .context("failed to return from EndDoc")?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     };
 
     // Native-bridge path (GUI sessions): park the guest while the host runs
@@ -262,14 +222,7 @@ pub fn handle_end_doc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
     // No bridge (headless / tests): the WIE_PRINT_TO BMP oracle stays.
     write_pages_bmp(dc, &request.doc_name, &request.pages);
 
-    let return_address = engine
-        .return_from_win64_api(1)
-        .context("failed to return from EndDoc")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 
 /// Handles `GDI32.dll!AbortDoc` — abandon the current document.
@@ -294,14 +247,7 @@ pub fn handle_abort_doc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
         was_active = true;
     }
 
-    let return_address = engine
-        .return_from_win64_api(u64::from(was_active))
-        .context("failed to return from AbortDoc")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: u64::from(was_active),
-    })
+    ctx.finish(u64::from(was_active))
 }
 
 /// Handles `GDI32.dll!SetMapMode` — store/return the previous mapping mode.
@@ -326,14 +272,7 @@ pub fn handle_set_map_mode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
         .find_dc_mut(Hdc::from(hdc))
         .map_or(1, |dc| std::mem::replace(&mut dc.map_mode, mode));
 
-    let return_address = engine
-        .return_from_win64_api(u64::from(previous))
-        .context("failed to return from SetMapMode")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: u64::from(previous),
-    })
+    ctx.finish(u64::from(previous))
 }
 
 /// Handles `GDI32.dll!Rectangle` — 1-px pen border, optional brush fill.
@@ -402,14 +341,7 @@ pub fn handle_rectangle(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
         draw_rect_canvas(canvas, left, top, right, bottom, stroke, fill);
     }
 
-    let return_address = engine
-        .return_from_win64_api(1)
-        .context("failed to return from Rectangle")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 
 /// Stroke/fill a rectangle on the canvas (1-px pen border).

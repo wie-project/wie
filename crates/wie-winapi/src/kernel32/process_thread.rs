@@ -39,14 +39,7 @@ pub fn handle_get_startup_info_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 
     write_startup_info(engine, startup_info_ptr)?;
 
-    let return_address = engine
-        .return_from_win64_api(0)
-        .context("failed to return from GetStartupInfoA")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 0,
-    })
+    ctx.finish(0)
 }
 /// Handles `KERNEL32.dll!GetStartupInfoW`.
 pub fn handle_get_startup_info_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -57,27 +50,12 @@ pub fn handle_get_startup_info_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 
     write_startup_info(engine, startup_info_ptr)?;
 
-    let return_address = engine
-        .return_from_win64_api(0)
-        .context("failed to return from GetStartupInfoW")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 0,
-    })
+    ctx.finish(0)
 }
 /// Handles `KERNEL32.dll!GetProcessHeap`.
 pub fn handle_get_process_heap(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let process_heap_handle = ctx.environment.process_heap_handle;
-    let engine = &mut *ctx.engine;
-    let return_address = engine
-        .return_from_win64_api(process_heap_handle)
-        .context("failed to return from GetProcessHeap")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: process_heap_handle,
-    })
+    ctx.finish(process_heap_handle)
 }
 /// Handles `KERNEL32.dll!GetSystemTimeAsFileTime`.
 pub fn handle_get_system_time_as_file_time(
@@ -103,55 +81,24 @@ pub fn handle_get_system_time_as_file_time(
         write_guest_u32(engine, high_address, high)?;
     }
 
-    let return_address = engine
-        .return_from_win64_api(0)
-        .context("failed to return from GetSystemTimeAsFileTime")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 0,
-    })
+    ctx.finish(0)
 }
 /// Handles `KERNEL32.dll!GetCurrentProcessId`.
 pub fn handle_get_current_process_id(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let return_address = engine
-        .return_from_win64_api(FAKE_CURRENT_PROCESS_ID)
-        .context("failed to return from GetCurrentProcessId")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: FAKE_CURRENT_PROCESS_ID,
-    })
+    ctx.finish(FAKE_CURRENT_PROCESS_ID)
 }
 /// Handles `KERNEL32.dll!GetCurrentThreadId`.
 pub fn handle_get_current_thread_id(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let tid = u64::from(state.kernel.threads.current_tid());
-    let return_address = engine
-        .return_from_win64_api(tid)
-        .context("failed to return from GetCurrentThreadId")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: tid,
-    })
+    ctx.finish(tid)
 }
 /// Handles `KERNEL32.dll!GetCurrentProcess`.
 pub fn handle_get_current_process(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
     // Windows pseudohandle for the current process: (HANDLE)-1.
     let return_value = u64::MAX;
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetCurrentProcess")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 pub(crate) fn ret_bool_true(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -281,11 +228,7 @@ pub fn handle_open_thread(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         });
     if let Some(handle) = found {
         state.process.last_error = 0;
-        let return_address = engine.return_from_win64_api(handle)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: handle,
-        });
+        return ctx.finish(handle);
     }
     // Thread not found — create a fresh thread object.
     let (handle, _) = state
@@ -293,11 +236,7 @@ pub fn handle_open_thread(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         .sync
         .register_thread(tid_u32, wie_cpu::ThreadContext::default());
     state.process.last_error = 0;
-    let return_address = engine.return_from_win64_api(handle)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: handle,
-    })
+    ctx.finish(handle)
 }
 /// Handles `KERNEL32.dll!CreateJobObjectW` — return handle tracked in sync state.
 pub fn handle_create_job_object_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -309,11 +248,7 @@ pub fn handle_create_job_object_w(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     state.kernel.sync.next_handle =
         crate::KernelHandle::from(state.kernel.sync.next_handle.as_u64().wrapping_add(4));
     state.process.last_error = 0;
-    let return_address = engine.return_from_win64_api(handle)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: handle,
-    })
+    ctx.finish(handle)
 }
 /// Handles `KERNEL32.dll!CreateJobObjectA` — return handle tracked in sync state.
 pub fn handle_create_job_object_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -325,11 +260,7 @@ pub fn handle_create_job_object_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     state.kernel.sync.next_handle =
         crate::KernelHandle::from(state.kernel.sync.next_handle.as_u64().wrapping_add(4));
     state.process.last_error = 0;
-    let return_address = engine.return_from_win64_api(handle)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: handle,
-    })
+    ctx.finish(handle)
 }
 /// Handles `KERNEL32.dll!AssignProcessToJobObject` — return TRUE (tracked in state).
 pub fn handle_assign_process_to_job_object(
@@ -340,11 +271,7 @@ pub fn handle_assign_process_to_job_object(
     let _job = engine.read_rcx()?;
     let _proc = engine.read_rdx()?;
     state.process.last_error = 0;
-    let return_address = engine.return_from_win64_api(1)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 /// Handles `KERNEL32.dll!TerminateProcess` — signal process exit.
 pub fn handle_terminate_process(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -354,11 +281,7 @@ pub fn handle_terminate_process(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let _code = engine.read_rdx()?;
     state.kernel.sync.process_dying = true;
     state.process.last_error = 0;
-    let return_address = engine.return_from_win64_api(1)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 /// Handles `KERNEL32.dll!TerminateThread` — signal thread exit.
 pub fn handle_terminate_thread(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -376,18 +299,10 @@ pub fn handle_terminate_thread(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     {
         t.finish(code);
         state.process.last_error = 0;
-        let return_address = engine.return_from_win64_api(1)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 1,
-        });
+        return ctx.finish(1);
     }
     state.process.last_error = ERROR_INVALID_HANDLE;
-    let return_address = engine.return_from_win64_api(0)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 0,
-    })
+    ctx.finish(0)
 }
 /// Handles `KERNEL32.dll!SuspendThread` — track suspend count.
 pub fn handle_suspend_thread(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -406,11 +321,7 @@ pub fn handle_suspend_thread(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         });
     let Some(tid) = tid else {
         state.process.last_error = ERROR_INVALID_HANDLE;
-        let return_address = engine.return_from_win64_api(u64::MAX)?; // THREAD_PRIORITY_ERROR_RETURN
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: u64::MAX,
-        });
+        return ctx.finish(u64::MAX); // THREAD_PRIORITY_ERROR_RETURN
     };
     let prev = state
         .process
@@ -423,11 +334,7 @@ pub fn handle_suspend_thread(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         .suspended_threads
         .insert(tid, prev.saturating_add(1));
     state.process.last_error = 0;
-    let return_address = engine.return_from_win64_api(u64::from(prev))?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: u64::from(prev),
-    })
+    ctx.finish(u64::from(prev))
 }
 pub(crate) fn mt_create_thread_enabled() -> bool {
     !matches!(
@@ -463,11 +370,7 @@ pub(crate) fn handle_create_thread(ctx: &mut HandlerContext<'_>) -> Result<WinAp
     let tid_out = read_stack_u64(engine, 0x30).unwrap_or(0);
 
     let handle = create_guest_thread(engine, state, stack_size_raw, start, param, flags, tid_out)?;
-    let return_address = engine.return_from_win64_api(handle)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: handle,
-    })
+    ctx.finish(handle)
 }
 pub fn create_guest_thread(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -637,21 +540,13 @@ pub(crate) fn handle_get_exit_code_thread(
         t.exit_code.load(std::sync::atomic::Ordering::Acquire)
     } else {
         state.process.last_error = ERROR_INVALID_HANDLE;
-        let return_address = engine.return_from_win64_api(0)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     };
     if out_ptr != 0 {
         drop(engine.mem_write(out_ptr, &code.to_le_bytes()));
     }
     state.process.last_error = 0;
-    let return_address = engine.return_from_win64_api(1)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 pub(crate) fn handle_get_thread_priority(
     ctx: &mut HandlerContext<'_>,
@@ -671,28 +566,15 @@ pub(crate) fn handle_get_thread_priority(
     if !valid {
         state.process.last_error = ERROR_INVALID_HANDLE;
         // THREAD_PRIORITY_ERROR_RETURN = MAXLONG (0x7FFFFFFF)
-        let return_address = engine.return_from_win64_api(0x7FFF_FFFF)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0x7FFF_FFFF,
-        });
+        return ctx.finish(0x7FFF_FFFF);
     }
 
-    let return_address = engine.return_from_win64_api(0)?; // THREAD_PRIORITY_NORMAL
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 0,
-    })
+    ctx.finish(0) // THREAD_PRIORITY_NORMAL
 }
 pub(crate) fn handle_get_current_thread(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
     // CURRENT_THREAD_PSEUDO_HANDLE = (HANDLE)-2
     let return_value = u64::MAX - 1;
-    let return_address = engine.return_from_win64_api(return_value)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }

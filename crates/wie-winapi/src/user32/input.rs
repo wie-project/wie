@@ -21,14 +21,7 @@ pub fn handle_get_async_key_state(ctx: &mut HandlerContext<'_>) -> Result<WinApi
         result |= 1; // most-significant bit set → key down
     }
 
-    let return_address = engine
-        .return_from_win64_api(result)
-        .context("failed to return from GetAsyncKeyState")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: result,
-    })
+    ctx.finish(result)
 }
 /// Handles dynamic `USER32.dll!TrackMouseEvent`.
 ///
@@ -70,14 +63,7 @@ pub fn handle_track_mouse_event(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 
     let return_value = u64::from(tracking);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from TrackMouseEvent")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!GetCursorPos`.
 pub fn handle_get_cursor_pos(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -97,14 +83,7 @@ pub fn handle_get_cursor_pos(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         .context("failed to write POINT for GetCursorPos")?;
     }
 
-    let return_address = engine
-        .return_from_win64_api(1)
-        .context("failed to return from GetCursorPos")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 /// Handles `USER32.dll!ClipCursor` (accept clip rect or release when NULL).
 pub fn handle_clip_cursor(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -116,14 +95,7 @@ pub fn handle_clip_cursor(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     // No host cursor clipping; always succeed so editor drag paths continue.
     tracing::debug!(rect_ptr, "ClipCursor");
 
-    let return_address = engine
-        .return_from_win64_api(1)
-        .context("failed to return from ClipCursor")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 /// Handles `USER32.dll!GetClipCursor`.
 pub fn handle_get_clip_cursor(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -139,14 +111,7 @@ pub fn handle_get_clip_cursor(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     }
 
     let return_value = u64::from(success);
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetClipCursor")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!SetCursor`.
 pub fn handle_set_cursor(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -159,29 +124,14 @@ pub fn handle_set_cursor(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
     let previous_cursor = state.window_state().cursor_handle;
     state.window_state().cursor_handle = cursor_handle;
 
-    let return_address = engine
-        .return_from_win64_api(previous_cursor)
-        .context("failed to return from SetCursor")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: previous_cursor,
-    })
+    ctx.finish(previous_cursor)
 }
 /// Handles `USER32.dll!GetCursor`.
 pub fn handle_get_cursor(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let return_value = state.window_state().cursor_handle;
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetCursor")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!SetKeyboardState`.
 pub fn handle_set_keyboard_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -204,14 +154,7 @@ pub fn handle_set_keyboard_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 
     let return_value = u64::from(success);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from SetKeyboardState")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!GetKeyboardState`.
 pub fn handle_get_keyboard_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -234,14 +177,7 @@ pub fn handle_get_keyboard_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 
     let return_value = u64::from(success);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetKeyboardState")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!GetKeyState`.
 pub fn handle_get_key_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -263,14 +199,7 @@ pub fn handle_get_key_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         0
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetKeyState")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!MapVirtualKeyA`.
 pub fn handle_map_virtual_key_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -295,12 +224,5 @@ pub fn handle_map_virtual_key_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         _ => 0,
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from MapVirtualKeyA")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }

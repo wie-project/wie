@@ -84,14 +84,7 @@ pub fn handle_get_object_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
         0
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetObjectA")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Stock object identifiers (wingdi.h). Verified against the Windows SDK:
@@ -130,11 +123,7 @@ pub fn handle_get_stock_object(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         STOCK_DEFAULT_PALETTE => 0x0000_0000_6800_5006,
         _ => 0, // NULL for unknown stock objects
     };
-    let return_address = engine.return_from_win64_api(handle)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: handle,
-    })
+    ctx.finish(handle)
 }
 
 /// Handles `GDI32.dll!SelectObject`.
@@ -195,24 +184,11 @@ pub fn handle_select_object(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 
     if let Some(replaced) = replaced {
         let return_value = replaced.unwrap_or(FAKE_PREVIOUS_GDI_OBJECT_HANDLE);
-        let ra = engine
-            .return_from_win64_api(return_value)
-            .context("failed to return from SelectObject")?;
-        return Ok(WinApiHandlerResult {
-            return_address: ra,
-            return_value,
-        });
+        return ctx.finish(return_value);
     }
 
     // For fonts and unknown DCs/objects, return the fake handle.
-    let return_address = engine
-        .return_from_win64_api(FAKE_PREVIOUS_GDI_OBJECT_HANDLE)
-        .context("failed to return from SelectObject")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: FAKE_PREVIOUS_GDI_OBJECT_HANDLE,
-    })
+    ctx.finish(FAKE_PREVIOUS_GDI_OBJECT_HANDLE)
 }
 
 /// Handles `GDI32.dll!GetTextExtentPoint32A`.
@@ -293,14 +269,7 @@ fn handle_get_text_extent_point_32(
 
     let return_value = u64::from(size_ptr != 0);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `GDI32.dll!CreateCompatibleDC`.
@@ -313,14 +282,7 @@ pub fn handle_create_compatible_dc(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 
     let dc_handle = state.gdi_state().alloc_dc(DcKind::Memory);
 
-    let return_address = engine
-        .return_from_win64_api(dc_handle.as_u64())
-        .context("failed to return from CreateCompatibleDC")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: dc_handle.as_u64(),
-    })
+    ctx.finish(dc_handle.as_u64())
 }
 
 /// Handles `GDI32.dll!GetDeviceCaps`.
@@ -352,14 +314,7 @@ pub fn handle_get_device_caps(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 
     tracing::debug!(index, return_value, "GetDeviceCaps");
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetDeviceCaps")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// The fake 1920×1080 screen caps table (shared by non-print DCs and the
@@ -443,14 +398,7 @@ pub fn handle_get_pixel(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 
     let _y = engine.read_r8().context("failed to read R8 for GetPixel")?;
 
-    let return_address = engine
-        .return_from_win64_api(FAKE_PIXEL_COLOR)
-        .context("failed to return from GetPixel")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: FAKE_PIXEL_COLOR,
-    })
+    ctx.finish(FAKE_PIXEL_COLOR)
 }
 
 /// Handles `GDI32.dll!DeleteDC`.
@@ -481,14 +429,7 @@ pub fn handle_delete_dc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 
     let return_value = u64::from(device_context_handle != 0);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from DeleteDC")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `GDI32.dll!DeleteObject`.
@@ -516,14 +457,7 @@ pub fn handle_delete_object(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 
     let return_value = u64::from(existed || object_handle != 0);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from DeleteObject")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 // --- Phase 2b: Real GDI handle table ---

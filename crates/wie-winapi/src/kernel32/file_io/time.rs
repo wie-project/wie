@@ -41,14 +41,7 @@ pub fn handle_file_time_to_local_file_time(
 
     let return_value = u64::from(success);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from FileTimeToLocalFileTime")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!FileTimeToSystemTime`.
 pub fn handle_file_time_to_system_time(
@@ -90,14 +83,7 @@ pub fn handle_file_time_to_system_time(
 
     let return_value = u64::from(success);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from FileTimeToSystemTime")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GetFileTime`.
 pub fn handle_get_file_time(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -141,14 +127,7 @@ pub fn handle_get_file_time(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 
     let return_value = u64::from(success);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetFileTime")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!SetFilePointer`.
 pub fn handle_set_file_pointer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -234,14 +213,7 @@ pub fn handle_set_file_pointer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         }
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from SetFilePointer")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GetFileSize`.
 pub fn handle_get_file_size(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -276,14 +248,7 @@ pub fn handle_get_file_size(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         0xffff_ffff
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetFileSize")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 pub fn handle_compare_file_time(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;

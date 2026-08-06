@@ -17,11 +17,7 @@ pub fn handle_create_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         read_wide_string_from_cpu(engine, path_ptr, 32_768)?
     };
     let return_value = finish_create_directory(state, &path);
-    let return_address = engine.return_from_win64_api(return_value)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!CreateDirectoryA`.
 pub fn handle_create_directory_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -35,11 +31,7 @@ pub fn handle_create_directory_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         read_ansi_string_from_cpu(engine, path_ptr, 32_768)?
     };
     let return_value = finish_create_directory(state, &path);
-    let return_address = engine.return_from_win64_api(return_value)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!DeleteFileW`.
 pub fn handle_delete_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -53,11 +45,7 @@ pub fn handle_delete_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         read_wide_string_from_cpu(engine, path_ptr, 32_768)?
     };
     let return_value = finish_delete_file(state, &path);
-    let return_address = engine.return_from_win64_api(return_value)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!DeleteFileA`.
 pub fn handle_delete_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -71,11 +59,7 @@ pub fn handle_delete_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         read_ansi_string_from_cpu(engine, path_ptr, 32_768)?
     };
     let return_value = finish_delete_file(state, &path);
-    let return_address = engine.return_from_win64_api(return_value)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!RemoveDirectoryW`.
 pub fn handle_remove_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -89,11 +73,7 @@ pub fn handle_remove_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         read_wide_string_from_cpu(engine, path_ptr, 32_768)?
     };
     let return_value = finish_remove_directory(state, &path);
-    let return_address = engine.return_from_win64_api(return_value)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!RemoveDirectoryA`.
 pub fn handle_remove_directory_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -107,11 +87,7 @@ pub fn handle_remove_directory_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         read_ansi_string_from_cpu(engine, path_ptr, 32_768)?
     };
     let return_value = finish_remove_directory(state, &path);
-    let return_address = engine.return_from_win64_api(return_value)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!MoveFileW`.
 pub fn handle_move_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -131,11 +107,7 @@ pub fn handle_move_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         read_wide_string_from_cpu(engine, to_ptr, 32_768)?
     };
     let return_value = finish_move_file(state, &from, &to);
-    let return_address = engine.return_from_win64_api(return_value)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!MoveFileA`.
 pub fn handle_move_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -155,11 +127,7 @@ pub fn handle_move_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         read_ansi_string_from_cpu(engine, to_ptr, 32_768)?
     };
     let return_value = finish_move_file(state, &from, &to);
-    let return_address = engine.return_from_win64_api(return_value)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 pub(crate) fn finish_create_directory(state: &mut WinApiState, path: &str) -> u64 {
     if path.is_empty() {

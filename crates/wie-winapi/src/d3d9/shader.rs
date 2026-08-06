@@ -187,13 +187,7 @@ pub fn handle_create_pixel_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApi
         D3DERR_INVALIDCALL
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from CreatePixelShader")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DDevice9::CreateVertexShader` (vtable slot 91).
@@ -288,13 +282,7 @@ pub fn handle_create_vertex_shader(ctx: &mut HandlerContext<'_>) -> Result<WinAp
         D3DERR_INVALIDCALL
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from CreateVertexShader")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Common Set*Shader body: validate the pointer (NULL clears) and bind it.
@@ -329,13 +317,7 @@ pub fn handle_set_pixel_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     set_shader_binding(state, shader, ShaderKind::Pixel);
 
     let return_value = D3D_OK;
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from SetPixelShader")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DDevice9::GetPixelShader` (vtable slot 108).
@@ -356,13 +338,7 @@ pub fn handle_get_pixel_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     } else {
         D3DERR_INVALIDCALL
     };
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetPixelShader")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DDevice9::SetVertexShader` (vtable slot 92).
@@ -379,13 +355,7 @@ pub fn handle_set_vertex_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     set_shader_binding(state, vertex_shader, ShaderKind::Vertex);
 
     let return_value = D3D_OK;
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from SetVertexShader")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DDevice9::GetVertexShader` (vtable slot 93).
@@ -406,13 +376,7 @@ pub fn handle_get_vertex_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     } else {
         D3DERR_INVALIDCALL
     };
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetVertexShader")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Common Set*ShaderConstantF body: copy `count` float4s from the guest.
@@ -511,13 +475,7 @@ pub fn handle_set_pixel_shader_constant_f(
         count,
     )?;
 
-    let return_address = engine
-        .return_from_win64_api(D3D_OK)
-        .context("failed to return from SetPixelShaderConstantF")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: D3D_OK,
-    })
+    ctx.finish(D3D_OK)
 }
 
 /// Handles `IDirect3DDevice9::GetPixelShaderConstantF` (vtable slot 110).
@@ -546,13 +504,7 @@ pub fn handle_get_pixel_shader_constant_f(
         count,
     )?;
 
-    let return_address = engine
-        .return_from_win64_api(D3D_OK)
-        .context("failed to return from GetPixelShaderConstantF")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: D3D_OK,
-    })
+    ctx.finish(D3D_OK)
 }
 
 /// Handles `IDirect3DDevice9::SetVertexShaderConstantF` (vtable slot 94).
@@ -584,13 +536,7 @@ pub fn handle_set_vertex_shader_constant_f(
         count,
     )?;
 
-    let return_address = engine
-        .return_from_win64_api(D3D_OK)
-        .context("failed to return from SetVertexShaderConstantF")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: D3D_OK,
-    })
+    ctx.finish(D3D_OK)
 }
 
 /// Handles `IDirect3DDevice9::GetVertexShaderConstantF` (vtable slot 95).
@@ -619,13 +565,7 @@ pub fn handle_get_vertex_shader_constant_f(
         count,
     )?;
 
-    let return_address = engine
-        .return_from_win64_api(D3D_OK)
-        .context("failed to return from GetVertexShaderConstantF")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: D3D_OK,
-    })
+    ctx.finish(D3D_OK)
 }
 
 /// Common Set*ShaderConstantI body: copy `count` int4s from the guest into an
@@ -777,13 +717,7 @@ pub fn handle_set_vertex_shader_constant_i(
         count,
     )?;
 
-    let return_address = engine
-        .return_from_win64_api(D3D_OK)
-        .context("failed to return from SetVertexShaderConstantI")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: D3D_OK,
-    })
+    ctx.finish(D3D_OK)
 }
 
 /// Handles `IDirect3DDevice9::GetVertexShaderConstantI` (vtable slot 97).
@@ -812,13 +746,7 @@ pub fn handle_get_vertex_shader_constant_i(
         count,
     )?;
 
-    let return_address = engine
-        .return_from_win64_api(D3D_OK)
-        .context("failed to return from GetVertexShaderConstantI")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: D3D_OK,
-    })
+    ctx.finish(D3D_OK)
 }
 
 /// Handles `IDirect3DDevice9::SetVertexShaderConstantB` (vtable slot 98).
@@ -850,13 +778,7 @@ pub fn handle_set_vertex_shader_constant_b(
         count,
     )?;
 
-    let return_address = engine
-        .return_from_win64_api(D3D_OK)
-        .context("failed to return from SetVertexShaderConstantB")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: D3D_OK,
-    })
+    ctx.finish(D3D_OK)
 }
 
 /// Handles `IDirect3DDevice9::GetVertexShaderConstantB` (vtable slot 99).
@@ -885,13 +807,7 @@ pub fn handle_get_vertex_shader_constant_b(
         count,
     )?;
 
-    let return_address = engine
-        .return_from_win64_api(D3D_OK)
-        .context("failed to return from GetVertexShaderConstantB")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: D3D_OK,
-    })
+    ctx.finish(D3D_OK)
 }
 
 /// Handles `IDirect3DPixelShader9::Release` (vtable slot 2).
@@ -913,13 +829,7 @@ pub fn handle_pixel_shader_release(ctx: &mut HandlerContext<'_>) -> Result<WinAp
         0
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DPixelShader9::Release")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DVertexShader9::Release` (vtable slot 2).
@@ -941,11 +851,5 @@ pub fn handle_vertex_shader_release(ctx: &mut HandlerContext<'_>) -> Result<WinA
         0
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DVertexShader9::Release")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }

@@ -23,12 +23,5 @@ pub fn handle_choose_color_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         ));
     }
 
-    let return_address = engine
-        .return_from_win64_api(1)
-        .context("failed to return from ChooseColorA")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }

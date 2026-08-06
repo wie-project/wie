@@ -15,8 +15,8 @@
 //! message's wParam, not from the keyboard layout.
 
 use super::{
-    Context, Msg, QueuedWindowMessage, Result, WM_CHAR, WM_COMMAND, WM_KEYDOWN, WM_SYSCHAR,
-    WM_SYSKEYDOWN, WinApiHandlerResult, WinApiState, make_command_wparam, with_typed_read,
+    Context, Msg, Result, WM_CHAR, WM_COMMAND, WM_KEYDOWN, WM_SYSCHAR, WM_SYSKEYDOWN,
+    WinApiHandlerResult, WinApiState, make_command_wparam, with_typed_read,
 };
 use crate::HandlerContext;
 use crate::handles::{Haccel, Hwnd};
@@ -111,14 +111,7 @@ fn handle_load_accelerators(
         "{api_name}"
     );
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Resolve `(instance_handle, table_id)` to a fake `HACCEL`, caching it.
@@ -179,14 +172,7 @@ pub fn handle_destroy_accelerator_table(
         .retain(|record| record.handle != accel_handle);
     let return_value = u64::from(ws.accel_tables.len() != before);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from DestroyAcceleratorTable")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `USER32.dll!TranslateAcceleratorW`.
@@ -253,35 +239,20 @@ fn handle_translate_accelerator(
 
     let return_value = if let Some(command_id) = command_id {
         let mut queue = state.lock_message_queue();
-        let time = queue.next_message_time;
-        queue.next_message_time = queue
-            .next_message_time
-            .checked_add(1)
-            .context("TranslateAccelerator timestamp overflow")?;
-        queue.messages.push(QueuedWindowMessage {
-            window_handle: Hwnd::from(window_handle),
-            message: WM_COMMAND,
+        queue.push(
+            Hwnd::from(window_handle),
+            WM_COMMAND,
             // MAKEWPARAM(id, 0): accelerator command ids are u16, so the
             // high word of wParam is 0 (no notification code).
-            word_parameter: make_command_wparam(u64::from(command_id), 0),
-            long_parameter: 0,
-            time,
-            point_x: 0,
-            point_y: 0,
-        });
+            make_command_wparam(u64::from(command_id), 0),
+            0,
+        )?;
         1
     } else {
         0
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// First table entry that translates `(message, wParam)`.

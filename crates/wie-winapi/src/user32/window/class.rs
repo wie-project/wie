@@ -47,14 +47,7 @@ fn handle_set_window_long_ptr_impl(
 
     remember_subclass_original(state, window_handle, index_raw, previous_value);
 
-    let return_address = engine
-        .return_from_win64_api(previous_value)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: previous_value,
-    })
+    ctx.finish(previous_value)
 }
 
 /// When a guest replaces `GWLP_WNDPROC`, remember the proc it displaced the
@@ -92,46 +85,23 @@ pub fn handle_set_capture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         state.window_state().capture_window_handle = crate::handles::Hwnd::from(window_handle);
     }
 
-    let return_address = engine
-        .return_from_win64_api(previous_window.as_u64())
-        .context("failed to return from SetCapture")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: previous_window.as_u64(),
-    })
+    ctx.finish(previous_window.as_u64())
 }
 /// Handles `USER32.dll!GetCapture`.
 pub fn handle_get_capture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let return_value = state.window_state().capture_window_handle.as_u64();
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetCapture")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!ReleaseCapture`.
 pub fn handle_release_capture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     state.window_state().capture_window_handle = crate::handles::Hwnd::NULL;
 
     let return_value = 1;
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from ReleaseCapture")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `USER32.dll!GetWindowLongPtrA`.
@@ -148,14 +118,7 @@ pub fn handle_get_window_long_ptr_a(ctx: &mut HandlerContext<'_>) -> Result<WinA
 
     let value = get_window_long_ptr_value(window_handle, index_raw, state, "GetWindowLongPtrA")?;
 
-    let return_address = engine
-        .return_from_win64_api(value)
-        .context("failed to return from GetWindowLongPtrA")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: value,
-    })
+    ctx.finish(value)
 }
 /// Handles `USER32.dll!GetWindowLongPtrW`.
 pub fn handle_get_window_long_ptr_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -171,14 +134,7 @@ pub fn handle_get_window_long_ptr_w(ctx: &mut HandlerContext<'_>) -> Result<WinA
 
     let value = get_window_long_ptr_value(window_handle, index_raw, state, "GetWindowLongPtrW")?;
 
-    let return_address = engine
-        .return_from_win64_api(value)
-        .context("failed to return from GetWindowLongPtrW")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: value,
-    })
+    ctx.finish(value)
 }
 
 pub(crate) fn find_window(state: &mut WinApiState, handle: u64) -> Option<&WindowRecord> {
@@ -235,14 +191,7 @@ fn handle_get_class_long_ptr(
             .map_or(0, |(_, _, value)| *value)
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `USER32.dll!SetClassLongPtrA`.
@@ -282,14 +231,7 @@ fn handle_set_class_long_ptr(
         set_class_long_ptr_value(state, atom, index, new_value)
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Resolve a window handle to its registered class atom (0 when unregistered).

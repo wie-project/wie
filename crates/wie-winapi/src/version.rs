@@ -724,13 +724,7 @@ pub fn handle_get_file_version_info_by_handle_w(
         state.process.last_error = 0;
         1
     };
-    let return_address = engine
-        .return_from_win64_api(ok)
-        .context("failed to return from GetFileVersionInfoByHandleW")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: ok,
-    })
+    ctx.finish(ok)
 }
 
 /// Handles `VERSION.dll!GetFileVersionInfoByHandleA` (identical body).
@@ -761,13 +755,7 @@ pub fn handle_ver_language_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     // The full length in characters excluding NUL — the "required size"
     // contract even when a small buffer truncated the write.
     let units = u64::try_from(name.encode_utf16().count()).unwrap_or(0);
-    let return_address = engine
-        .return_from_win64_api(units)
-        .context("failed to return from VerLanguageNameW")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: units,
-    })
+    ctx.finish(units)
 }
 
 /// Handles `VERSION.dll!VerLanguageNameA`.
@@ -790,13 +778,7 @@ pub fn handle_ver_language_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     let _written = crate::guest_string::write_ansi_c_string(engine, buf, cch_usize, &name)?;
     // CP1252 is one byte per char, so the byte count is the char count.
     let bytes = u64::try_from(crate::guest_string::encode_cp1252(&name).len()).unwrap_or(0);
-    let return_address = engine
-        .return_from_win64_api(bytes)
-        .context("failed to return from VerLanguageNameA")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: bytes,
-    })
+    ctx.finish(bytes)
 }
 
 /// Handles `VERSION.dll!VerFindFileW`.
@@ -820,13 +802,7 @@ pub fn handle_ver_find_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     // concept WIE does not model, so it stays empty (documented above).
     flags |= write_dir_out(engine, cur_dir_ptr, cur_dir_len_ptr, &located)?;
     flags |= write_dir_out(engine, dest_dir_ptr, dest_dir_len_ptr, "")?;
-    let return_address = engine
-        .return_from_win64_api(u64::from(flags))
-        .context("failed to return from VerFindFileW")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: u64::from(flags),
-    })
+    ctx.finish(u64::from(flags))
 }
 
 /// Handles `VERSION.dll!VerFindFileA`.
@@ -848,13 +824,7 @@ pub fn handle_ver_find_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     let (mut flags, located) = find_file_dirs(state, &file);
     flags |= write_dir_out(engine, cur_dir_ptr, cur_dir_len_ptr, &located)?;
     flags |= write_dir_out(engine, dest_dir_ptr, dest_dir_len_ptr, "")?;
-    let return_address = engine
-        .return_from_win64_api(u64::from(flags))
-        .context("failed to return from VerFindFileA")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: u64::from(flags),
-    })
+    ctx.finish(u64::from(flags))
 }
 
 /// `VerInstallFile` core: really copy the source into the destination dir.
@@ -930,13 +900,7 @@ pub fn handle_ver_install_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     if written < needed {
         flags |= VIF_BUFFTOOSMALL;
     }
-    let return_address = engine
-        .return_from_win64_api(u64::from(flags))
-        .context("failed to return from VerInstallFileW")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: u64::from(flags),
-    })
+    ctx.finish(u64::from(flags))
 }
 
 /// Handles `VERSION.dll!VerInstallFileA`.
@@ -986,13 +950,7 @@ pub fn handle_ver_install_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     if written < needed {
         flags |= VIF_BUFFTOOSMALL;
     }
-    let return_address = engine
-        .return_from_win64_api(u64::from(flags))
-        .context("failed to return from VerInstallFileA")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: u64::from(flags),
-    })
+    ctx.finish(u64::from(flags))
 }
 
 /// Return 0 with the current last-error already set.

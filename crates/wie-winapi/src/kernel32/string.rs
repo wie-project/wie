@@ -1,8 +1,9 @@
 use super::{
     ANSI_CODE_PAGE, C1_ALPHA, C1_BLANK, C1_CNTRL, C1_DIGIT, C1_LOWER, C1_PUNCT, C1_SPACE, C1_UPPER,
     C1_XDIGIT, CT_CTYPE1, Context, HandlerContext, OEM_CODE_PAGE, Result, WinApiHandlerResult,
-    checked_address, low_u32_to_i32, read_u16, read_u64, write_guest_u16, write_guest_u32,
+    checked_address, read_u16, read_u64, write_guest_u16, write_guest_u32,
 };
+use crate::user32::low_i32;
 
 /// Handles `KERNEL32.dll!lstrlenW`.
 pub fn handle_lstrlen_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -27,13 +28,7 @@ pub fn handle_lstrlen_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
         }
         len
     };
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from lstrlenW")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!lstrcpyW` — copy wide string; returns dest.
 pub fn handle_lstrcpy_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -59,13 +54,7 @@ pub fn handle_lstrcpy_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
             }
         }
     }
-    let return_address = engine
-        .return_from_win64_api(dest)
-        .context("failed to return from lstrcpyW")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: dest,
-    })
+    ctx.finish(dest)
 }
 /// Handles `KERNEL32.dll!lstrcatW` — append wide string; returns dest.
 pub fn handle_lstrcat_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -104,13 +93,7 @@ pub fn handle_lstrcat_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
             }
         }
     }
-    let return_address = engine
-        .return_from_win64_api(dest)
-        .context("failed to return from lstrcatW")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: dest,
-    })
+    ctx.finish(dest)
 }
 pub(crate) fn read_utf16_units(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -121,7 +104,7 @@ pub(crate) fn read_utf16_units(
         return Ok(Vec::new());
     }
 
-    let wide_len_i32 = low_u32_to_i32(wide_len_raw, "WideCharToMultiByte cchWideChar")?;
+    let wide_len_i32 = low_i32(wide_len_raw, "WideCharToMultiByte cchWideChar")?;
 
     if wide_len_i32 == -1 {
         read_null_terminated_utf16_units(engine, wide_ptr)
@@ -237,7 +220,7 @@ pub(crate) fn read_multibyte_bytes(
         return Ok(Vec::new());
     }
 
-    let input_len_i32 = low_u32_to_i32(input_len_raw, "MultiByteToWideChar cbMultiByte")?;
+    let input_len_i32 = low_i32(input_len_raw, "MultiByteToWideChar cbMultiByte")?;
 
     if input_len_i32 == -1 {
         read_null_terminated_bytes(engine, input_ptr)
@@ -341,38 +324,15 @@ pub fn handle_wide_char_to_multi_byte(ctx: &mut HandlerContext<'_>) -> Result<Wi
         }
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from WideCharToMultiByte")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GetACP`.
 pub fn handle_get_acp(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let return_address = engine
-        .return_from_win64_api(ANSI_CODE_PAGE)
-        .context("failed to return from GetACP")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: ANSI_CODE_PAGE,
-    })
+    ctx.finish(ANSI_CODE_PAGE)
 }
 /// Handles `KERNEL32.dll!GetOEMCP`.
 pub fn handle_get_oem_cp(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let return_address = engine
-        .return_from_win64_api(OEM_CODE_PAGE)
-        .context("failed to return from GetOEMCP")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: OEM_CODE_PAGE,
-    })
+    ctx.finish(OEM_CODE_PAGE)
 }
 /// Handles `KERNEL32.dll!GetCPInfo`.
 pub fn handle_get_cp_info(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -399,14 +359,7 @@ pub fn handle_get_cp_info(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
             .context("failed to write CPINFO LeadByte")?;
     }
 
-    let return_address = engine
-        .return_from_win64_api(1)
-        .context("failed to return from GetCPInfo")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 /// Handles `KERNEL32.dll!IsValidCodePage`.
 pub fn handle_is_valid_code_page(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -420,14 +373,7 @@ pub fn handle_is_valid_code_page(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         _ => 0,
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IsValidCodePage")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GetStringTypeW`.
 pub fn handle_get_string_type_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -473,14 +419,7 @@ pub fn handle_get_string_type_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         1
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetStringTypeW")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!MultiByteToWideChar`.
 pub fn handle_multi_byte_to_wide_char(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -531,11 +470,7 @@ pub fn handle_multi_byte_to_wide_char(ctx: &mut HandlerContext<'_>) -> Result<Wi
         }
     };
 
-    let return_address = engine.return_from_win64_api(return_value)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!LCMapStringW`.
 pub fn handle_lc_map_string_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -598,12 +533,5 @@ pub fn handle_lc_map_string_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         }
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from LCMapStringW")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }

@@ -120,13 +120,7 @@ fn handle_find_replace_text(
 
     if fr_ptr == 0 {
         // FindTextW(NULL) fails like GetOpenFileName(NULL): no dialog.
-        let return_address = engine
-            .return_from_win64_api(0)
-            .with_context(|| format!("failed to return from {api_name}"))?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
 
     // One typed read for the whole FINDREPLACE (the find/replace buffer
@@ -202,13 +196,7 @@ fn handle_find_replace_text(
         true,
     )?;
     if dialog_hwnd == 0 {
-        let return_address = engine
-            .return_from_win64_api(0)
-            .with_context(|| format!("failed to return from {api_name}"))?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
 
     // Row 0: "Find what:" label + search EDIT.
@@ -441,14 +429,7 @@ fn handle_find_replace_text(
         "find dialog opened"
     );
 
-    let return_address = engine
-        .return_from_win64_api(dialog_hwnd)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: dialog_hwnd,
-    })
+    ctx.finish(dialog_hwnd)
 }
 
 /// Create one control inside the find dialog and set its client rect.

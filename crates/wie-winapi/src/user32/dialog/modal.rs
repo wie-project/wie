@@ -78,13 +78,7 @@ fn handle_create_dialog_param(
     )?;
 
     if dialog_hwnd == 0 {
-        let return_address = engine
-            .return_from_win64_api(0)
-            .with_context(|| format!("failed to return from {api_name}"))?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
 
     tracing::info!(
@@ -118,13 +112,7 @@ fn handle_create_dialog_param(
 
     if dialog_proc == 0 {
         // No dialog proc: nothing to bridge, the dialog just exists.
-        let return_address = engine
-            .return_from_win64_api(dialog_hwnd)
-            .with_context(|| format!("failed to return from {api_name}"))?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: dialog_hwnd,
-        });
+        return ctx.finish(dialog_hwnd);
     }
 
     // WM_INITDIALOG through the established callback bridge. `Fixed(hwnd)`
@@ -341,13 +329,7 @@ pub fn handle_end_dialog(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
                     hwnd = dialog_hwnd,
                     "EndDialog: font effects toggle (dialog stays open)"
                 );
-                let return_address = engine
-                    .return_from_win64_api(1)
-                    .context("failed to return from EndDialog")?;
-                return Ok(WinApiHandlerResult {
-                    return_address,
-                    return_value: 1,
-                });
+                return ctx.finish(1);
             };
             font_result
         } else {
@@ -402,13 +384,7 @@ pub fn handle_end_dialog(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
         0
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from EndDialog")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Remove `dialog_hwnd` and every descendant window from the runtime state.

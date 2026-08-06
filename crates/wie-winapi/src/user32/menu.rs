@@ -109,14 +109,7 @@ pub fn handle_enable_menu_item(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     // Windows returns -1 when no item matches; otherwise the previous state.
     let return_value = u64::from(if mutated { previous_flags } else { u32::MAX });
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from EnableMenuItem")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!CheckMenuItem`.
 pub fn handle_check_menu_item(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -164,28 +157,10 @@ pub fn handle_check_menu_item(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 
     let return_value = u64::from(if mutated { previous_flags } else { u32::MAX });
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from CheckMenuItem")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
-pub(crate) fn handle_menu_success(
-    ctx: &mut HandlerContext<'_>,
-    api_name: &str,
-) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let return_address = engine
-        .return_from_win64_api(1)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+pub(crate) fn handle_menu_success(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    ctx.finish(1)
 }
 /// Handles `USER32.dll!GetMenu` — returns the HMENU for a window, or 0.
 pub fn handle_get_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -198,45 +173,27 @@ pub fn handle_get_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
         .iter()
         .find(|w| w.handle == hwnd)
         .map_or(0, |w| w.menu_handle);
-    let return_address = engine.return_from_win64_api(menu_handle)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: menu_handle,
-    })
+    ctx.finish(menu_handle)
 }
 /// Handles `USER32.dll!CreateMenu`.
 pub fn handle_create_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let handle = allocate_menu_handle(state)?;
     state.window_state().menus.push(MenuRecord {
         handle: Hmenu::from(handle),
         items: Vec::new(),
     });
-    let return_address = engine
-        .return_from_win64_api(handle)
-        .context("failed to return from CreateMenu")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: handle,
-    })
+    ctx.finish(handle)
 }
 /// Handles `USER32.dll!CreatePopupMenu`.
 pub fn handle_create_popup_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let handle = allocate_menu_handle(state)?;
     state.window_state().menus.push(MenuRecord {
         handle: Hmenu::from(handle),
         items: Vec::new(),
     });
-    let return_address = engine
-        .return_from_win64_api(handle)
-        .context("failed to return from CreatePopupMenu")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: handle,
-    })
+    ctx.finish(handle)
 }
 /// One loaded fake resource menu (`LoadMenuA/W` or a class `lpszMenuName`).
 ///
@@ -301,14 +258,7 @@ fn handle_load_menu(ctx: &mut HandlerContext<'_>, api_name: &str) -> Result<WinA
         "{api_name}"
     );
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Resolve `(instance_handle, menu_id)` to a fake `HMENU`, caching it.
@@ -536,14 +486,7 @@ fn handle_append_menu(
     record.items.push(entry);
     ws.menu_dirty = true;
 
-    let return_address = engine
-        .return_from_win64_api(1)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 /// Handles `USER32.dll!SetMenu` — stores the handle on the window record.
 ///
@@ -566,13 +509,7 @@ pub fn handle_set_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
         window.menu_handle = menu_handle;
         ws.menu_dirty = true;
     }
-    let return_address = engine
-        .return_from_win64_api(1)
-        .context("failed to return from SetMenu")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 /// Handles `USER32.dll!DestroyMenu`.
 pub fn handle_destroy_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -592,48 +529,34 @@ pub fn handle_destroy_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
     if ws.menus.len() != before {
         ws.menu_dirty = true;
     }
-    handle_menu_success(ctx, "DestroyMenu")
+    handle_menu_success(ctx)
 }
 /// Handles `USER32.dll!RemoveMenu`.
 pub fn handle_remove_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_menu_success(ctx, "RemoveMenu")
+    handle_menu_success(ctx)
 }
 /// Handles `USER32.dll!DeleteMenu`.
 pub fn handle_delete_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_menu_success(ctx, "DeleteMenu")
+    handle_menu_success(ctx)
 }
 /// Handles `USER32.dll!ModifyMenuA`.
 pub fn handle_modify_menu_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_menu_success(ctx, "ModifyMenuA")
+    handle_menu_success(ctx)
 }
 /// Handles `USER32.dll!ModifyMenuW`.
 pub fn handle_modify_menu_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_menu_success(ctx, "ModifyMenuW")
+    handle_menu_success(ctx)
 }
 /// Handles `USER32.dll!GetSystemMenu`.
 pub fn handle_get_system_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let handle = allocate_menu_handle(state)?;
-    let return_address = engine
-        .return_from_win64_api(handle)
-        .context("failed to return from GetSystemMenu")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: handle,
-    })
+    ctx.finish(handle)
 }
 /// Handles `USER32.dll!TrackPopupMenu`.
 pub fn handle_track_popup_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
     // No item selected.
-    let return_address = engine
-        .return_from_win64_api(0)
-        .context("failed to return from TrackPopupMenu")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 0,
-    })
+    ctx.finish(0)
 }
 /// Handles `USER32.dll!GetMenuItemInfoA`.
 pub fn handle_get_menu_item_info_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -683,14 +606,7 @@ fn handle_get_menu_item_info(
 
     let return_value = u64::from(success);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Reconstructed `MF_*` state flags for an entry, as reported by
@@ -943,29 +859,22 @@ pub fn handle_get_menu_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     )
     .map_or(u64::from(u32::MAX), |item| u64::from(item.flags));
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetMenuState")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `USER32.dll!DrawMenuBar` (rendering deferred; always succeeds).
 pub fn handle_draw_menu_bar(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_menu_success(ctx, "DrawMenuBar")
+    handle_menu_success(ctx)
 }
 /// Handles `USER32.dll!SetMenuItemInfoA`.
 pub fn handle_set_menu_item_info_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_menu_success(ctx, "SetMenuItemInfoA")
+    handle_menu_success(ctx)
 }
 /// Handles `USER32.dll!SetMenuItemInfoW`.
 pub fn handle_set_menu_item_info_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_menu_success(ctx, "SetMenuItemInfoW")
+    handle_menu_success(ctx)
 }
 /// Handles `USER32.dll!CheckMenuRadioItem`.
 pub fn handle_check_menu_radio_item(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_menu_success(ctx, "CheckMenuRadioItem")
+    handle_menu_success(ctx)
 }

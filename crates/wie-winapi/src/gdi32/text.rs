@@ -705,14 +705,7 @@ fn handle_text_out_impl(
         }
     }
 
-    let return_address = engine
-        .return_from_win64_api(u64::from(cch))
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: u64::from(cch),
-    })
+    ctx.finish(u64::from(cch))
 }
 
 /// Handles `GDI32.dll!TextOutA`.
@@ -849,14 +842,7 @@ pub fn handle_ext_text_out_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         }
     }
 
-    let return_address = engine
-        .return_from_win64_api(1)
-        .context("failed to return from ExtTextOutW")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 
 /// Shared `DrawTextA/W` implementation.
@@ -1000,14 +986,7 @@ fn handle_draw_text_impl(
         0
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `USER32.dll!DrawTextA`.

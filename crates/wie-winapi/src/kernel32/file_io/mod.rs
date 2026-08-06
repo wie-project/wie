@@ -47,14 +47,7 @@ pub fn handle_get_file_type(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         _ => FILE_TYPE_UNKNOWN,
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetFileType")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GetFileAttributesA`.
 pub fn handle_get_file_attributes_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -75,14 +68,7 @@ pub fn handle_get_file_attributes_a(ctx: &mut HandlerContext<'_>) -> Result<WinA
         state.process.last_error = 0;
     }
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetFileAttributesA")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GetFileAttributesW`.
 pub fn handle_get_file_attributes_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -103,14 +89,7 @@ pub fn handle_get_file_attributes_w(ctx: &mut HandlerContext<'_>) -> Result<WinA
         state.process.last_error = 0;
     }
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetFileAttributesW")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!FindFirstFileW`.
 pub fn handle_find_first_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -128,14 +107,7 @@ pub fn handle_find_first_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let pattern = read_wide_string_from_cpu(engine, pattern_ptr, 1024)?;
     let return_value = finish_find_first(engine, state, &pattern, find_data_ptr, true)?;
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from FindFirstFileW")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!FindFirstFileA`.
 pub fn handle_find_first_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -153,14 +125,7 @@ pub fn handle_find_first_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let pattern = read_ansi_string_from_cpu(engine, pattern_ptr, 1024)?;
     let return_value = finish_find_first(engine, state, &pattern, find_data_ptr, false)?;
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from FindFirstFileA")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!FindNextFileW`.
 pub fn handle_find_next_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -176,14 +141,7 @@ pub fn handle_find_next_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
 
     let return_value = finish_find_next(engine, state, find_handle, find_data_ptr, true)?;
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from FindNextFileW")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!FindNextFileA`.
 pub fn handle_find_next_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -199,14 +157,7 @@ pub fn handle_find_next_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
 
     let return_value = finish_find_next(engine, state, find_handle, find_data_ptr, false)?;
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from FindNextFileA")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!FindClose`.
 pub fn handle_find_close(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -221,14 +172,7 @@ pub fn handle_find_close(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
         .find_handles
         .retain(|handle| handle.handle != find_handle);
 
-    let return_address = engine
-        .return_from_win64_api(1)
-        .context("failed to return from FindClose")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 /// Handles `KERNEL32.dll!CreateFileW`.
 pub fn handle_create_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -271,14 +215,7 @@ pub fn handle_create_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         "CreateFileW",
     );
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from CreateFileW")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!CreateFileA`.
 pub fn handle_create_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -320,14 +257,7 @@ pub fn handle_create_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         "CreateFileA",
     );
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from CreateFileA")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!CloseHandle`.
 pub fn handle_close_handle(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -371,14 +301,7 @@ pub fn handle_close_handle(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
         1
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from CloseHandle")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GetFileInformationByHandle`.
 pub fn handle_get_file_information_by_handle(
@@ -431,14 +354,7 @@ pub fn handle_get_file_information_by_handle(
 
     let return_value = u64::from(success);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetFileInformationByHandle")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GetFileSizeEx`.
 pub fn handle_get_file_size_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -456,11 +372,7 @@ pub fn handle_get_file_size_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         state.process.last_error = ERROR_INVALID_HANDLE;
         0
     };
-    let return_address = engine.return_from_win64_api(return_value)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!SetFilePointerEx`.
 pub fn handle_set_file_pointer_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -506,11 +418,7 @@ pub fn handle_set_file_pointer_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApi
             1
         }
     };
-    let return_address = engine.return_from_win64_api(return_value)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!SetEndOfFile`.
 pub fn handle_set_end_of_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -540,11 +448,7 @@ pub fn handle_set_end_of_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         state.process.last_error = ERROR_INVALID_HANDLE;
         0
     };
-    let return_address = engine.return_from_win64_api(return_value)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!FlushFileBuffers`.
 pub(crate) fn file_attributes_for_path(state: &WinApiState, path: &str) -> u64 {

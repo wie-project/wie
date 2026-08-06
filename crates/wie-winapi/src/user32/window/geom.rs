@@ -41,14 +41,7 @@ pub fn handle_get_client_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 
     let return_value = u64::from(success);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetClientRect")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!ScreenToClient`.
 pub fn handle_screen_to_client(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -87,14 +80,7 @@ pub fn handle_screen_to_client(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
 
     let return_value = u64::from(success);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from ScreenToClient")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!ClientToScreen`.
 pub fn handle_client_to_screen(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -133,26 +119,11 @@ pub fn handle_client_to_screen(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
 
     let return_value = u64::from(success);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from ClientToScreen")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!GetDesktopWindow`.
 pub fn handle_get_desktop_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let return_address = engine
-        .return_from_win64_api(FAKE_DESKTOP_WINDOW_HANDLE)
-        .context("failed to return from GetDesktopWindow")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: FAKE_DESKTOP_WINDOW_HANDLE,
-    })
+    ctx.finish(FAKE_DESKTOP_WINDOW_HANDLE)
 }
 /// Handles `USER32.dll!GetSysColor`.
 pub fn handle_get_sys_color(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -163,14 +134,7 @@ pub fn handle_get_sys_color(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 
     let return_value = u64::from(sys_color(u32::try_from(color_index).unwrap_or(u32::MAX)));
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetSysColor")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// The classic Windows system-color table, as 0RGB.
@@ -236,14 +200,7 @@ pub fn handle_get_sys_color_brush(ctx: &mut HandlerContext<'_>) -> Result<WinApi
         .checked_add(color_index)
         .context("GetSysColorBrush handle overflow")?;
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetSysColorBrush")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!SetRect`.
 pub fn handle_set_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -285,14 +242,7 @@ pub fn handle_set_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
 
     let return_value = u64::from(success);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from SetRect")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!IsIconic`.
 pub fn handle_is_iconic(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -303,14 +253,7 @@ pub fn handle_is_iconic(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 
     let return_value = 0;
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IsIconic")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!IsZoomed`.
 pub fn handle_is_zoomed(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -321,14 +264,7 @@ pub fn handle_is_zoomed(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 
     let return_value = 0;
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IsZoomed")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!GetWindowThreadProcessId`.
 pub fn handle_get_window_thread_process_id(
@@ -352,14 +288,7 @@ pub fn handle_get_window_thread_process_id(
 
     let return_value = if valid_window { FAKE_THREAD_ID } else { 0 };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetWindowThreadProcessId")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!GetDlgCtrlID`.
 pub fn handle_get_dlg_ctrl_id(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -377,14 +306,7 @@ pub fn handle_get_dlg_ctrl_id(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         find_window(state, window_handle).map_or(u64::from(u32::MAX), |window| window.menu_handle)
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetDlgCtrlID")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!IsChild`.
 pub fn handle_is_child(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -400,14 +322,7 @@ pub fn handle_is_child(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
 
     let return_value = u64::from(descends_from(state, child_handle, parent_handle));
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IsChild")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Whether `child` is `parent` or a descendant of `parent` (parent-chain walk).
@@ -444,14 +359,7 @@ pub fn handle_get_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 
     let return_value = 0;
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetWindow")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!AdjustWindowRectEx`.
 pub fn handle_adjust_window_rect_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -516,14 +424,7 @@ pub fn handle_adjust_window_rect_ex(ctx: &mut HandlerContext<'_>) -> Result<WinA
 
     let return_value = u64::from(success);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from AdjustWindowRectEx")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!ScrollWindowEx` (no-op success stub).
 pub fn handle_scroll_window_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -533,14 +434,7 @@ pub fn handle_scroll_window_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         .context("failed to read RCX for ScrollWindowEx")?;
 
     // Returns TRUE on success.
-    let return_address = engine
-        .return_from_win64_api(1)
-        .context("failed to return from ScrollWindowEx")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 /// Size of the x64 `WINDOWPLACEMENT` struct in bytes: `UINT length` @0,
 /// `UINT flags` @4, `UINT showCmd` @8, `POINT ptMinPosition` @12, `POINT
@@ -625,14 +519,7 @@ pub fn handle_get_window_placement(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 
     let return_value = u64::from(success);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetWindowPlacement")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!SetWindowPlacement`.
 pub fn handle_set_window_placement(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -751,14 +638,7 @@ pub fn handle_set_window_placement(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 
     let return_value = u64::from(success);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from SetWindowPlacement")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 #[cfg(test)]

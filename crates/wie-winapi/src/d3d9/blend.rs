@@ -42,13 +42,7 @@ pub fn handle_get_render_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         write_guest_u32(engine, p_value, value).context("failed to write GetRenderState output")?;
     }
 
-    let return_address = engine
-        .return_from_win64_api(D3D_OK)
-        .context("failed to return from GetRenderState")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: D3D_OK,
-    })
+    ctx.finish(D3D_OK)
 }
 
 /// Handles `IDirect3DDevice9::CreateDepthStencilSurface` (vtable slot 29).
@@ -119,13 +113,7 @@ pub fn handle_create_depth_stencil_surface(
         D3DERR_INVALIDCALL
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from CreateDepthStencilSurface")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DDevice9::SetDepthStencilSurface` (vtable slot 38).
@@ -150,13 +138,7 @@ pub fn handle_set_depth_stencil_surface(
         D3DERR_INVALIDCALL
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from SetDepthStencilSurface")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DDevice9::GetDepthStencilSurface` (vtable slot 39).
@@ -181,11 +163,5 @@ pub fn handle_get_depth_stencil_surface(
         D3DERR_INVALIDCALL
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetDepthStencilSurface")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }

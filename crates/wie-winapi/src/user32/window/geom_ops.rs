@@ -95,14 +95,7 @@ pub fn handle_move_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 
     let return_value = u64::from(success);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from MoveWindow")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!SetWindowPos`.
 ///
@@ -155,14 +148,7 @@ pub fn handle_set_window_pos(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         }
     }
 
-    let return_address = engine
-        .return_from_win64_api(1)
-        .context("failed to return from SetWindowPos")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 
 /// `SetWindowPos` flag bit that leaves the z-order untouched.

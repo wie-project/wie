@@ -352,13 +352,7 @@ pub fn handle_vertex_buffer_query_interface(
         .read_rcx()
         .context("failed to read RCX for IDirect3DVertexBuffer9::QueryInterface")?;
     let return_value = buffer_query_interface_common(engine, state, this_pointer)?;
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DVertexBuffer9::QueryInterface")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DVertexBuffer9::AddRef` (slot 1).
@@ -369,13 +363,7 @@ pub fn handle_vertex_buffer_add_ref(ctx: &mut HandlerContext<'_>) -> Result<WinA
         .read_rcx()
         .context("failed to read RCX for IDirect3DVertexBuffer9::AddRef")?;
     let return_value = buffer_add_ref_common(state, this_pointer);
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DVertexBuffer9::AddRef")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DVertexBuffer9::Release` (slot 2).
@@ -386,13 +374,7 @@ pub fn handle_vertex_buffer_release(ctx: &mut HandlerContext<'_>) -> Result<WinA
         .read_rcx()
         .context("failed to read RCX for IDirect3DVertexBuffer9::Release")?;
     let return_value = buffer_release_common(engine, state, this_pointer)?;
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DVertexBuffer9::Release")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DVertexBuffer9::Lock` (slot 11).
@@ -403,13 +385,7 @@ pub fn handle_vertex_buffer_lock(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         .read_rcx()
         .context("failed to read RCX for IDirect3DVertexBuffer9::Lock")?;
     let return_value = buffer_lock_common(engine, state, this_pointer)?;
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DVertexBuffer9::Lock")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DVertexBuffer9::Unlock` (slot 12).
@@ -420,13 +396,7 @@ pub fn handle_vertex_buffer_unlock(ctx: &mut HandlerContext<'_>) -> Result<WinAp
         .read_rcx()
         .context("failed to read RCX for IDirect3DVertexBuffer9::Unlock")?;
     let return_value = buffer_unlock_common(engine, state, this_pointer)?;
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DVertexBuffer9::Unlock")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DVertexBuffer9::GetDesc` (slot 13).
@@ -471,13 +441,7 @@ pub fn handle_vertex_buffer_get_desc(ctx: &mut HandlerContext<'_>) -> Result<Win
         D3DERR_INVALIDCALL
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DVertexBuffer9::GetDesc")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 // ── IDirect3DIndexBuffer9 handlers (vtable slots 0, 1, 2, 11, 12, 13) ──
@@ -492,13 +456,7 @@ pub fn handle_index_buffer_query_interface(
         .read_rcx()
         .context("failed to read RCX for IDirect3DIndexBuffer9::QueryInterface")?;
     let return_value = buffer_query_interface_common(engine, state, this_pointer)?;
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DIndexBuffer9::QueryInterface")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DIndexBuffer9::AddRef` (slot 1).
@@ -509,13 +467,7 @@ pub fn handle_index_buffer_add_ref(ctx: &mut HandlerContext<'_>) -> Result<WinAp
         .read_rcx()
         .context("failed to read RCX for IDirect3DIndexBuffer9::AddRef")?;
     let return_value = buffer_add_ref_common(state, this_pointer);
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DIndexBuffer9::AddRef")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DIndexBuffer9::Release` (slot 2).
@@ -526,13 +478,7 @@ pub fn handle_index_buffer_release(ctx: &mut HandlerContext<'_>) -> Result<WinAp
         .read_rcx()
         .context("failed to read RCX for IDirect3DIndexBuffer9::Release")?;
     let return_value = buffer_release_common(engine, state, this_pointer)?;
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DIndexBuffer9::Release")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DIndexBuffer9::Lock` (slot 11).
@@ -543,13 +489,7 @@ pub fn handle_index_buffer_lock(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .read_rcx()
         .context("failed to read RCX for IDirect3DIndexBuffer9::Lock")?;
     let return_value = buffer_lock_common(engine, state, this_pointer)?;
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DIndexBuffer9::Lock")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DIndexBuffer9::Unlock` (slot 12).
@@ -560,13 +500,7 @@ pub fn handle_index_buffer_unlock(ctx: &mut HandlerContext<'_>) -> Result<WinApi
         .read_rcx()
         .context("failed to read RCX for IDirect3DIndexBuffer9::Unlock")?;
     let return_value = buffer_unlock_common(engine, state, this_pointer)?;
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DIndexBuffer9::Unlock")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DIndexBuffer9::GetDesc` (slot 13).
@@ -611,13 +545,7 @@ pub fn handle_index_buffer_get_desc(ctx: &mut HandlerContext<'_>) -> Result<WinA
         D3DERR_INVALIDCALL
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DIndexBuffer9::GetDesc")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 // ── Create*Buffer record helpers (used by device.rs) ────────────────────

@@ -286,13 +286,7 @@ pub fn handle_create_texture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         D3DERR_INVALIDCALL
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from CreateTexture")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DTexture9::GetSurfaceLevel` (vtable slot 18).
@@ -367,13 +361,7 @@ pub fn handle_texture_get_surface_level(
         D3DERR_INVALIDCALL
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetSurfaceLevel")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Read a guest RECT (four i32s) at `rect_ptr`.
@@ -705,13 +693,7 @@ pub fn handle_surface_get_desc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         D3DERR_INVALIDCALL
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DSurface9::GetDesc")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DSurface9::LockRect` (vtable slot 13).
@@ -750,13 +732,7 @@ pub fn handle_surface_lock_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         D3DERR_INVALIDCALL
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DSurface9::LockRect")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DTexture9::LockRect` (vtable slot 19) — the deprecated
@@ -782,13 +758,7 @@ pub fn handle_texture_lock_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .context("IDirect3DTexture9::LockRect level does not fit u32")?;
     let return_value = lock_rect_common(engine, state, this_pointer, level, p_locked_rect, p_rect)?;
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DTexture9::LockRect")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Shared UnlockRect body: copy the locked region back into the host texels
@@ -900,13 +870,7 @@ pub fn handle_surface_unlock_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApi
         D3DERR_INVALIDCALL
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DSurface9::UnlockRect")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DTexture9::UnlockRect` (vtable slot 20).
@@ -919,13 +883,7 @@ pub fn handle_texture_unlock_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 
     let return_value = unlock_rect_common(engine, state, this_pointer);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DTexture9::UnlockRect")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DDevice9::SetTexture` (vtable slot 65).
@@ -952,13 +910,7 @@ pub fn handle_set_texture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         *slot = texture_ptr;
     }
 
-    let return_address = engine
-        .return_from_win64_api(D3D_OK)
-        .context("failed to return from SetTexture")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: D3D_OK,
-    })
+    ctx.finish(D3D_OK)
 }
 
 /// Handles `IDirect3DDevice9::GetTexture` (vtable slot 64).
@@ -988,13 +940,7 @@ pub fn handle_get_texture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
             .context("failed to write GetTexture output")?;
     }
 
-    let return_address = engine
-        .return_from_win64_api(D3D_OK)
-        .context("failed to return from GetTexture")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: D3D_OK,
-    })
+    ctx.finish(D3D_OK)
 }
 
 /// Handles `IDirect3DDevice9::GetTextureStageState` (vtable slot 66).
@@ -1046,13 +992,7 @@ pub fn handle_get_texture_stage_state(ctx: &mut HandlerContext<'_>) -> Result<Wi
             .context("failed to write GetTextureStageState output")?;
     }
 
-    let return_address = engine
-        .return_from_win64_api(D3D_OK)
-        .context("failed to return from GetTextureStageState")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: D3D_OK,
-    })
+    ctx.finish(D3D_OK)
 }
 
 /// Handles `IDirect3DDevice9::GetSamplerState` (vtable slot 68).
@@ -1100,13 +1040,7 @@ pub fn handle_get_sampler_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
             .context("failed to write GetSamplerState output")?;
     }
 
-    let return_address = engine
-        .return_from_win64_api(D3D_OK)
-        .context("failed to return from GetSamplerState")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: D3D_OK,
-    })
+    ctx.finish(D3D_OK)
 }
 
 /// Handles `IDirect3DTexture9::Release` (vtable slot 2).
@@ -1156,13 +1090,7 @@ pub fn handle_texture_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         0
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DTexture9::Release")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DSurface9::Release` (vtable slot 2).
@@ -1225,13 +1153,7 @@ pub fn handle_surface_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
             0
         };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3DSurface9::Release")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3DTexture9::GetLevelCount` (vtable slot 13).
@@ -1249,11 +1171,5 @@ pub fn handle_texture_get_level_count(ctx: &mut HandlerContext<'_>) -> Result<Wi
         .map_or(0, |r| r.levels);
     let return_value = u64::from(levels);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetLevelCount")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }

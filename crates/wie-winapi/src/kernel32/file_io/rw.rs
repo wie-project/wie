@@ -34,11 +34,7 @@ pub fn handle_read_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 
     if buffer_ptr == 0 {
         state.process.last_error = ERROR_INVALID_PARAMETER;
-        let return_address = engine.return_from_win64_api(0)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
 
     // Console stdin: inject buffer, then optional live host line-fill.
@@ -63,19 +59,11 @@ pub fn handle_read_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
                 Ok(false) => {
                     // Host EOF → success with 0 bytes (already zeroed count).
                     state.process.last_error = 0;
-                    let return_address = engine.return_from_win64_api(1)?;
-                    return Ok(WinApiHandlerResult {
-                        return_address,
-                        return_value: 1,
-                    });
+                    return ctx.finish(1);
                 }
                 Err(()) => {
                     state.process.last_error = ERROR_READ_FAULT;
-                    let return_address = engine.return_from_win64_api(0)?;
-                    return Ok(WinApiHandlerResult {
-                        return_address,
-                        return_value: 0,
-                    });
+                    return ctx.finish(0);
                 }
             }
         }
@@ -104,21 +92,13 @@ pub fn handle_read_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
         }
         // available == 0 && InjectOnly → inject exhausted → EOF (0 bytes, success).
         state.process.last_error = 0;
-        let return_address = engine.return_from_win64_api(1)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 1,
-        });
+        return ctx.finish(1);
     }
 
     // Console stdout/stderr are not readable.
     if is_console_output_handle(handle) {
         state.process.last_error = ERROR_INVALID_HANDLE;
-        let return_address = engine.return_from_win64_api(0)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
 
     let success = is_open_file_handle(state, handle);
@@ -142,11 +122,7 @@ pub fn handle_read_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
             };
             let Some(host) = host_path else {
                 state.process.last_error = ERROR_INVALID_HANDLE;
-                let return_address = engine.return_from_win64_api(0)?;
-                return Ok(WinApiHandlerResult {
-                    return_address,
-                    return_value: 0,
-                });
+                return ctx.finish(0);
             };
             let mut data = vec![0_u8; requested];
             // Cache an open `File` per handle so streaming ReadFile loops don't
@@ -246,12 +222,7 @@ pub fn handle_read_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
     if let Some(open_file) = find_open_file(state, handle) {
         tracing::info!(handle, path = %open_file.path, ret = return_value, "ReadFile");
     }
-    let return_address = engine.return_from_win64_api(return_value)?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!WriteFile`.
 pub fn handle_write_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -280,11 +251,7 @@ pub fn handle_write_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 
     if buffer_ptr == 0 {
         state.process.last_error = ERROR_INVALID_PARAMETER;
-        let return_address = engine.return_from_win64_api(0)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
 
     // Console stdout/stderr → host console.
@@ -304,21 +271,13 @@ pub fn handle_write_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
             write_guest_u32(engine, bytes_written_ptr, write_len_u32)?;
         }
         state.process.last_error = 0;
-        let return_address = engine.return_from_win64_api(1)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 1,
-        });
+        return ctx.finish(1);
     }
 
     // Console stdin is not writable.
     if handle == FAKE_STDIN_HANDLE {
         state.process.last_error = ERROR_INVALID_HANDLE;
-        let return_address = engine.return_from_win64_api(0)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
 
     let success = is_open_file_handle(state, handle);
@@ -452,14 +411,7 @@ pub fn handle_write_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 
     let return_value = u64::from(success);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from WriteFile")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 pub fn handle_backup_read(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -475,11 +427,7 @@ pub fn handle_backup_read(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     }
     if buf == 0 || to_read == 0 {
         state.process.last_error = 0;
-        let return_address = engine.return_from_win64_api(1)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 1,
-        });
+        return ctx.finish(1);
     }
     if let Some(file) = state.file_io.open_files.get_mut(&handle) {
         let cursor_usize = usize::try_from(file.cursor).unwrap_or(0);
@@ -501,18 +449,10 @@ pub fn handle_backup_read(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
             write_guest_u32(engine, bytes_read_ptr, u32::try_from(read_len).unwrap_or(0))?;
         }
         state.process.last_error = 0;
-        let return_address = engine.return_from_win64_api(1)?;
-        Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 1,
-        })
+        ctx.finish(1)
     } else {
         state.process.last_error = ERROR_INVALID_HANDLE;
-        let return_address = engine.return_from_win64_api(0)?;
-        Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        })
+        ctx.finish(0)
     }
 }
 /// Handles `KERNEL32.dll!BackupSeek` — seek within open file bytes.
@@ -536,18 +476,10 @@ pub fn handle_backup_seek(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
             )?;
         }
         state.process.last_error = 0;
-        let return_address = engine.return_from_win64_api(1)?;
-        Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 1,
-        })
+        ctx.finish(1)
     } else {
         state.process.last_error = ERROR_INVALID_HANDLE;
-        let return_address = engine.return_from_win64_api(0)?;
-        Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        })
+        ctx.finish(0)
     }
 }
 /// Handles `KERNEL32.dll!BackupWrite` — write to open file bytes.
@@ -565,11 +497,7 @@ pub fn handle_backup_write(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
     }
     if buf == 0 || to_write == 0 {
         state.process.last_error = 0;
-        let return_address = engine.return_from_win64_api(1)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 1,
-        });
+        return ctx.finish(1);
     }
     let to_write_usize = usize::try_from(to_write).unwrap_or(0);
     if let Some(file) = state.file_io.open_files.get_mut(&handle) {
@@ -592,18 +520,10 @@ pub fn handle_backup_write(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
             write_guest_u32(engine, written_ptr, u32::try_from(to_write).unwrap_or(0))?;
         }
         state.process.last_error = 0;
-        let return_address = engine.return_from_win64_api(1)?;
-        Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 1,
-        })
+        ctx.finish(1)
     } else {
         state.process.last_error = ERROR_INVALID_HANDLE;
-        let return_address = engine.return_from_win64_api(0)?;
-        Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        })
+        ctx.finish(0)
     }
 }
 pub fn handle_flush_file_buffers(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -618,9 +538,5 @@ pub fn handle_flush_file_buffers(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         state.process.last_error = ERROR_INVALID_HANDLE;
         0
     };
-    let return_address = engine.return_from_win64_api(return_value)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }

@@ -61,14 +61,7 @@ pub fn handle_get_current_directory_w(ctx: &mut HandlerContext<'_>) -> Result<Wi
         character_count
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetCurrentDirectoryW")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!SetCurrentDirectoryW`.
 ///
@@ -102,14 +95,7 @@ pub fn handle_set_current_directory_w(ctx: &mut HandlerContext<'_>) -> Result<Wi
 
     let return_value = u64::from(success);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from SetCurrentDirectoryW")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Shared implementation for the GetLongPathName/GetShortPathName A/W quartet.
 ///
@@ -135,11 +121,7 @@ fn handle_mock_long_short_path_impl(
     } else {
         write_mock_string_a(engine, state, &path, dst, dst_len)?
     };
-    let return_address = engine.return_from_win64_api(written)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: written,
-    })
+    ctx.finish(written)
 }
 /// Handles `KERNEL32.dll!GetLongPathNameW` — return same as input.
 pub fn handle_get_long_path_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -238,18 +220,10 @@ pub(crate) fn handle_duplicate_handle(ctx: &mut HandlerContext<'_>) -> Result<Wi
             }
             engine.mem_write(target_handle_ptr, &new_handle_u64.to_le_bytes())?;
             state.process.last_error = 0;
-            let return_address = engine.return_from_win64_api(1)?;
-            return Ok(WinApiHandlerResult {
-                return_address,
-                return_value: 1,
-            });
+            return ctx.finish(1);
         }
         state.process.last_error = ERROR_INVALID_HANDLE;
-        let return_address = engine.return_from_win64_api(0)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     };
 
     // Pseudohandle path: find or create the ThreadObject for `tid`.
@@ -287,11 +261,7 @@ pub(crate) fn handle_duplicate_handle(ctx: &mut HandlerContext<'_>) -> Result<Wi
 
     engine.mem_write(target_handle_ptr, &new_handle_u64.to_le_bytes())?;
     state.process.last_error = 0;
-    let return_address = engine.return_from_win64_api(1)?; // TRUE
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1) // TRUE
 }
 /// Handles `KERNEL32.dll!GetFullPathNameW`.
 pub fn handle_get_full_path_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -388,14 +358,7 @@ pub fn handle_get_full_path_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinAp
         }
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetFullPathNameW")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GetFullPathNameA`.
 pub fn handle_get_full_path_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -444,11 +407,7 @@ pub fn handle_get_full_path_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinAp
         }
     };
 
-    let return_address = engine.return_from_win64_api(return_value)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GetCurrentDirectoryA`.
 ///
@@ -477,11 +436,7 @@ pub fn handle_get_current_directory_a(ctx: &mut HandlerContext<'_>) -> Result<Wi
         state.process.last_error = 0;
         character_count
     };
-    let return_address = engine.return_from_win64_api(return_value)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!SetCurrentDirectoryA`.
 ///
@@ -504,11 +459,7 @@ pub fn handle_set_current_directory_a(ctx: &mut HandlerContext<'_>) -> Result<Wi
         }
     };
     let return_value = u64::from(success);
-    let return_address = engine.return_from_win64_api(return_value)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Validate and store the guest current directory (shared by the W/A setters).
 ///

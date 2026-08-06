@@ -97,14 +97,7 @@ pub fn handle_get_window_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 
     let return_value = u64::from(success);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetWindowRect")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles dynamic `USER32.dll!GetDpiForWindow`.
 pub fn handle_get_dpi_for_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -116,14 +109,7 @@ pub fn handle_get_dpi_for_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     // Standard 100% Windows DPI.
     let return_value = 96;
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetDpiForWindow")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles dynamic `USER32.dll!AdjustWindowRectExForDpi`.
 pub fn handle_adjust_window_rect_ex_for_dpi(
@@ -150,14 +136,7 @@ pub fn handle_adjust_window_rect_ex_for_dpi(
     // uses 96 DPI, so preserving the supplied client rectangle is sufficient.
     let return_value = u64::from(rect_ptr != 0);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from AdjustWindowRectExForDpi")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `USER32.dll!GetClassNameA`.
@@ -214,12 +193,5 @@ pub(crate) fn handle_get_class_name(
     let return_value =
         u64::try_from(copied).with_context(|| format!("{api_name} length does not fit u64"))?;
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }

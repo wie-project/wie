@@ -228,14 +228,7 @@ pub fn handle_direct3d_create9(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         0
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from Direct3DCreate9")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3D9::GetAdapterCount`.
@@ -248,14 +241,7 @@ pub fn handle_get_adapter_count(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     // Expose one deterministic display adapter.
     let return_value = 1;
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3D9::GetAdapterCount")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3D9::GetAdapterMonitor`.
@@ -271,14 +257,7 @@ pub fn handle_get_adapter_monitor(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 
     let return_value = if adapter == 0 { FAKE_MONITOR_HANDLE } else { 0 };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3D9::GetAdapterMonitor")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 fn write_caps_u32(
@@ -448,14 +427,7 @@ pub fn handle_get_device_caps(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         D3D_OK
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3D9::GetDeviceCaps")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `IDirect3D9::GetAdapterDisplayMode`.
@@ -512,14 +484,7 @@ pub fn handle_get_adapter_display_mode(
         D3D_OK
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3D9::GetAdapterDisplayMode")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 pub(crate) fn allocate_direct3d_block(
@@ -784,12 +749,5 @@ pub fn handle_create_device(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         D3DERR_INVALIDCALL
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from IDirect3D9::CreateDevice")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }

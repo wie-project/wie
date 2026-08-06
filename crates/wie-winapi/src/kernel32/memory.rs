@@ -37,21 +37,13 @@ pub(crate) fn handle_virtual_alloc(ctx: &mut HandlerContext<'_>) -> Result<WinAp
     let size_usize = usize::try_from(size).unwrap_or(usize::MAX);
     if size_usize == usize::MAX {
         state.process.last_error = ERROR_INVALID_PARAMETER;
-        let return_address = engine.return_from_win64_api(0)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
     match engine.virtual_alloc(addr, size_usize, alloc_type, protect) {
         Ok(base) => {
             state.process.last_error = 0;
             tracing::debug!(addr, size, alloc_type, protect, base, "VirtualAlloc ok");
-            let return_address = engine.return_from_win64_api(base)?;
-            Ok(WinApiHandlerResult {
-                return_address,
-                return_value: base,
-            })
+            ctx.finish(base)
         }
         Err(e) => {
             state.process.last_error =
@@ -65,11 +57,7 @@ pub(crate) fn handle_virtual_alloc(ctx: &mut HandlerContext<'_>) -> Result<WinAp
                 last_error = state.process.last_error,
                 "VirtualAlloc failed"
             );
-            let return_address = engine.return_from_win64_api(0)?;
-            Ok(WinApiHandlerResult {
-                return_address,
-                return_value: 0,
-            })
+            ctx.finish(0)
         }
     }
 }
@@ -82,29 +70,17 @@ pub(crate) fn handle_virtual_free(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     let size_usize = usize::try_from(size).unwrap_or(usize::MAX);
     if size_usize == usize::MAX {
         state.process.last_error = ERROR_INVALID_PARAMETER;
-        let return_address = engine.return_from_win64_api(0)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
     match engine.virtual_free(addr, size_usize, free_type) {
         Ok(()) => {
             state.process.last_error = 0;
-            let return_address = engine.return_from_win64_api(1)?;
-            Ok(WinApiHandlerResult {
-                return_address,
-                return_value: 1,
-            })
+            ctx.finish(1)
         }
         Err(e) => {
             state.process.last_error =
                 wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
-            let return_address = engine.return_from_win64_api(0)?;
-            Ok(WinApiHandlerResult {
-                return_address,
-                return_value: 0,
-            })
+            ctx.finish(0)
         }
     }
 }
@@ -118,39 +94,23 @@ pub(crate) fn handle_virtual_protect(ctx: &mut HandlerContext<'_>) -> Result<Win
     // Microsoft Learn: if lpflOldProtect is NULL or invalid, the function fails.
     if old_prot == 0 {
         state.process.last_error = ERROR_INVALID_PARAMETER;
-        let return_address = engine.return_from_win64_api(0)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
     let size_usize = usize::try_from(size).unwrap_or(usize::MAX);
     if size_usize == 0 || size_usize == usize::MAX {
         state.process.last_error = ERROR_INVALID_PARAMETER;
-        let return_address = engine.return_from_win64_api(0)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
     match engine.virtual_protect(addr, size_usize, new_protect) {
         Ok(old) => {
             write_guest_u32(engine, old_prot, old)?;
             state.process.last_error = 0;
-            let return_address = engine.return_from_win64_api(1)?;
-            Ok(WinApiHandlerResult {
-                return_address,
-                return_value: 1,
-            })
+            ctx.finish(1)
         }
         Err(e) => {
             state.process.last_error =
                 wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
-            let return_address = engine.return_from_win64_api(0)?;
-            Ok(WinApiHandlerResult {
-                return_address,
-                return_value: 0,
-            })
+            ctx.finish(0)
         }
     }
 }
@@ -163,20 +123,12 @@ pub(crate) fn handle_virtual_query(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 
     if buffer == 0 || length < 48 {
         state.process.last_error = ERROR_INVALID_PARAMETER;
-        let return_address = engine.return_from_win64_api(0)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
 
     let mbi = engine.virtual_query(address);
     let bytes = mbi.to_bytes();
     engine.mem_write(buffer, &bytes)?;
     state.process.last_error = 0;
-    let return_address = engine.return_from_win64_api(48)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 48,
-    })
+    ctx.finish(48)
 }

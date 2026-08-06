@@ -43,14 +43,7 @@ pub fn handle_get_local_time(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         write_guest_u16(engine, milliseconds_address, 0)?;
     }
 
-    let return_address = engine
-        .return_from_win64_api(0)
-        .context("failed to return from GetLocalTime")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 0,
-    })
+    ctx.finish(0)
 }
 /// Handles `KERNEL32.dll!GetTimeZoneInformation`.
 pub fn handle_get_time_zone_information(
@@ -114,14 +107,7 @@ pub fn handle_get_time_zone_information(
         TIME_ZONE_ID_INVALID
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetTimeZoneInformation")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 // ── GetTimeFormatW / GetDateFormatW ────────────────────────────────────────
@@ -283,14 +269,7 @@ fn handle_get_time_date_format(
         0
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Read the `SYSTEMTIME` fields the format engine needs.

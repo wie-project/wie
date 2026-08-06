@@ -31,11 +31,5 @@ pub fn handle_is_clipboard_format_available(
         .read_rcx()
         .context("failed to read RCX for IsClipboardFormatAvailable")?;
     let available = format == u64::from(CF_TEXT) && ctx.state.clipboard().has_text();
-    let return_address = engine
-        .return_from_win64_api(u64::from(available))
-        .context("failed to return from IsClipboardFormatAvailable")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: u64::from(available),
-    })
+    ctx.finish(u64::from(available))
 }

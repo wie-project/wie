@@ -157,14 +157,7 @@ pub fn handle_get_system_metrics(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 
     let return_value = fake_system_metric(metric_index);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetSystemMetrics")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles dynamic `USER32.dll!MonitorFromWindow`.
 pub fn handle_monitor_from_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -177,14 +170,7 @@ pub fn handle_monitor_from_window(ctx: &mut HandlerContext<'_>) -> Result<WinApi
         .read_rdx()
         .context("failed to read RDX for MonitorFromWindow")?;
 
-    let return_address = engine
-        .return_from_win64_api(FAKE_MONITOR_HANDLE)
-        .context("failed to return from MonitorFromWindow")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: FAKE_MONITOR_HANDLE,
-    })
+    ctx.finish(FAKE_MONITOR_HANDLE)
 }
 /// Handles dynamic `USER32.dll!GetMonitorInfoA`.
 pub fn handle_get_monitor_info_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -205,14 +191,7 @@ pub fn handle_get_monitor_info_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 
     let return_value = u64::from(success);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetMonitorInfoA")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles dynamic `USER32.dll!GetMonitorInfoW`.
 pub fn handle_get_monitor_info_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -233,14 +212,7 @@ pub fn handle_get_monitor_info_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 
     let return_value = u64::from(success);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetMonitorInfoW")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles dynamic `USER32.dll!MonitorFromRect`.
 pub fn handle_monitor_from_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -253,14 +225,7 @@ pub fn handle_monitor_from_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .read_rdx()
         .context("failed to read RDX for MonitorFromRect")?;
 
-    let return_address = engine
-        .return_from_win64_api(FAKE_MONITOR_HANDLE)
-        .context("failed to return from MonitorFromRect")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: FAKE_MONITOR_HANDLE,
-    })
+    ctx.finish(FAKE_MONITOR_HANDLE)
 }
 /// Handles dynamic `USER32.dll!MonitorFromPoint`.
 pub fn handle_monitor_from_point(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -273,14 +238,7 @@ pub fn handle_monitor_from_point(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         .read_rdx()
         .context("failed to read RDX for MonitorFromPoint")?;
 
-    let return_address = engine
-        .return_from_win64_api(FAKE_MONITOR_HANDLE)
-        .context("failed to return from MonitorFromPoint")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: FAKE_MONITOR_HANDLE,
-    })
+    ctx.finish(FAKE_MONITOR_HANDLE)
 }
 /// Handles dynamic `USER32.dll!EnumDisplayMonitors`.
 pub fn handle_enum_display_monitors(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -307,14 +265,7 @@ pub fn handle_enum_display_monitors(ctx: &mut HandlerContext<'_>) -> Result<WinA
     // If Lunar Magic later depends on the callback being invoked, we will need
     // to emulate a Win64 callback call into guest code with:
     //   callback(fake_monitor, fake_hdc, rect_ptr, data)
-    let return_address = engine
-        .return_from_win64_api(1)
-        .context("failed to return from EnumDisplayMonitors")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 /// Handles dynamic `USER32.dll!EnumDisplayDevicesA`.
 pub fn handle_enum_display_devices_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -384,14 +335,7 @@ pub fn handle_enum_display_devices_a(ctx: &mut HandlerContext<'_>) -> Result<Win
 
     let return_value = u64::from(success);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from EnumDisplayDevicesA")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles dynamic `USER32.dll!EnumDisplayDevicesW`.
 pub fn handle_enum_display_devices_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -461,14 +405,7 @@ pub fn handle_enum_display_devices_w(ctx: &mut HandlerContext<'_>) -> Result<Win
 
     let return_value = u64::from(success);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from EnumDisplayDevicesW")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 pub(crate) fn scale_system_metric_for_dpi(base_value: u64, dpi: u64) -> Result<u64> {
     if dpi == 0 {
@@ -497,12 +434,5 @@ pub fn handle_get_system_metrics_for_dpi(
     let base_value = fake_system_metric(metric_index);
     let return_value = scale_system_metric_for_dpi(base_value, dpi)?;
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetSystemMetricsForDpi")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }

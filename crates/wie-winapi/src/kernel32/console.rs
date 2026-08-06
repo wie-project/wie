@@ -102,14 +102,7 @@ pub fn handle_get_std_handle(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         _ => INVALID_HANDLE_VALUE,
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetStdHandle")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 pub fn handle_set_console_ctrl_handler(

@@ -118,12 +118,7 @@ pub fn handle_peek_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         });
         let Some(synthesized_index) = synthesized_index else {
             drop(queue);
-            return Ok(WinApiHandlerResult {
-                return_address: engine
-                    .return_from_win64_api(0)
-                    .context("failed to return from PeekMessageA")?,
-                return_value: 0,
-            });
+            return ctx.finish(0);
         };
         let queued = if w_remove_msg != 0 {
             // PM_REMOVE: remove from queue.
@@ -152,14 +147,7 @@ pub fn handle_peek_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         0
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from PeekMessageA")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!CallMsgFilterA/W`.
 ///
@@ -177,14 +165,7 @@ pub fn handle_call_msg_filter(
         .read_rdx()
         .with_context(|| format!("failed to read RDX for {api_name}"))?;
 
-    let return_address = engine
-        .return_from_win64_api(0)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 0,
-    })
+    ctx.finish(0)
 }
 /// Handles `USER32.dll!PostMessageA`.
 pub fn handle_post_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -215,32 +196,17 @@ pub fn handle_post_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
 
     if valid_window {
         let mut queue = state.lock_message_queue();
-        let time = queue.next_message_time;
-        queue.next_message_time = queue
-            .next_message_time
-            .checked_add(1)
-            .context("PostMessageA timestamp overflow")?;
-        queue.messages.push(QueuedWindowMessage {
-            window_handle: crate::handles::Hwnd::from(window_handle),
+        queue.push(
+            crate::handles::Hwnd::from(window_handle),
             message,
             word_parameter,
             long_parameter,
-            time,
-            point_x: 0,
-            point_y: 0,
-        });
+        )?;
     }
 
     let return_value = u64::from(valid_window);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from PostMessageA")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!SendMessageA`.
 pub fn handle_send_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -288,13 +254,7 @@ pub(crate) fn handle_send_message(
     // class-brush background without invoking a guest WndProc.
     if message == WM_ERASEBKGND {
         let erased = erase_window_background(state, window_handle);
-        let return_address = engine
-            .return_from_win64_api(u64::from(erased))
-            .with_context(|| format!("failed to return from {api_name}"))?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: u64::from(erased),
-        });
+        return ctx.finish(u64::from(erased));
     }
 
     // MDI client windows have no guest WndProc; WM_MDICREATE is handled here.
@@ -302,14 +262,7 @@ pub(crate) fn handle_send_message(
         let child = create_mdi_child_from_struct(engine, state, long_parameter, prefer_unicode)
             .with_context(|| format!("failed to handle WM_MDICREATE in {api_name}"))?;
 
-        let return_address = engine
-            .return_from_win64_api(child)
-            .with_context(|| format!("failed to return from {api_name} WM_MDICREATE"))?;
-
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: child,
-        });
+        return ctx.finish(child);
     }
 
     if let Some(target_window) = super::find_window(state, window_handle)
@@ -350,13 +303,7 @@ pub(crate) fn handle_send_message(
             long_parameter,
         )?
     {
-        let return_address = engine
-            .return_from_win64_api(result)
-            .with_context(|| format!("failed to return from {api_name}"))?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: result,
-        });
+        return ctx.finish(result);
     }
 
     // Modal dialogs have a dialog proc instead of a guest WndProc; bridge
@@ -385,33 +332,14 @@ pub(crate) fn handle_send_message(
     // still stores the font and WM_GETFONT still returns it.
     if message == WM_SETFONT {
         super::window::set_window_font(state, window_handle, word_parameter, long_parameter);
-        let return_address = engine
-            .return_from_win64_api(0)
-            .with_context(|| format!("failed to return from {api_name}"))?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
     if message == WM_GETFONT {
         let font = super::window::window_font(state, window_handle);
-        let return_address = engine
-            .return_from_win64_api(font)
-            .with_context(|| format!("failed to return from {api_name}"))?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: font,
-        });
+        return ctx.finish(font);
     }
 
-    let return_address = engine
-        .return_from_win64_api(0)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 0,
-    })
+    ctx.finish(0)
 }
 /// Handles `USER32.dll!CallNextHookEx`.
 pub fn handle_call_next_hook_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -435,14 +363,7 @@ pub fn handle_call_next_hook_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     // There is currently no host-side hook chain after the guest hook.
     let return_value = 0;
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from CallNextHookEx")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handle an empty message queue in `GetMessageA/W`.
 ///
@@ -468,21 +389,13 @@ fn empty_queue_result(
              * WM_QUIT so the guest performs its normal teardown.
              */
             let mut queue = state.lock_message_queue();
-            let quit_message = QueuedWindowMessage {
-                window_handle: crate::handles::Hwnd::NULL,
-                message: WM_QUIT,
-                word_parameter: 0,
-                long_parameter: 0,
-                time: queue.next_message_time,
-                point_x: 0,
-                point_y: 0,
-            };
-
-            queue.next_message_time = queue
-                .next_message_time
-                .checked_add(1)
-                .context("GetMessageA timestamp overflow")?;
-
+            queue.push(crate::handles::Hwnd::NULL, WM_QUIT, 0, 0)?;
+            // `push` appends, but this synthetic WM_QUIT is returned directly
+            // to the guest (never left in the queue) — take it back out.
+            let quit_message = queue
+                .messages
+                .pop()
+                .context("synthesized WM_QUIT vanished")?;
             drop(queue);
             write_message_structure(engine, message_address, &quit_message)?;
 
@@ -602,14 +515,7 @@ pub fn handle_get_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         return empty_queue_result(engine, state, message_address, "GetMessageA");
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetMessageA")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `USER32.dll!TranslateMessage`.
 pub fn handle_translate_message(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -641,18 +547,10 @@ pub fn handle_translate_message(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 
     let return_value = u64::from(translated);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from TranslateMessage")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 pub(crate) fn handle_default_window_procedure(
     ctx: &mut HandlerContext<'_>,
-    api_name: &str,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
@@ -763,14 +661,7 @@ pub(crate) fn handle_default_window_procedure(
         _ => 0,
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// F2 no-black fallback: fill `hwnd`'s background with the system default
@@ -808,27 +699,27 @@ fn erase_with_system_background(state: &mut WinApiState, hwnd: u64) {
 
 /// Handles `USER32.dll!DefWindowProcA`.
 pub fn handle_def_window_proc_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_default_window_procedure(ctx, "DefWindowProcA")
+    handle_default_window_procedure(ctx)
 }
 /// Handles `USER32.dll!DefWindowProcW`.
 pub fn handle_def_window_proc_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_default_window_procedure(ctx, "DefWindowProcW")
+    handle_default_window_procedure(ctx)
 }
 /// Handles `USER32.dll!DefFrameProcA`.
 pub fn handle_def_frame_proc_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_default_window_procedure(ctx, "DefFrameProcA")
+    handle_default_window_procedure(ctx)
 }
 /// Handles `USER32.dll!DefFrameProcW`.
 pub fn handle_def_frame_proc_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_default_window_procedure(ctx, "DefFrameProcW")
+    handle_default_window_procedure(ctx)
 }
 /// Handles `USER32.dll!DefMDIChildProcA`.
 pub fn handle_def_mdi_child_proc_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_default_window_procedure(ctx, "DefMDIChildProcA")
+    handle_default_window_procedure(ctx)
 }
 /// Handles `USER32.dll!DefMDIChildProcW`.
 pub fn handle_def_mdi_child_proc_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_default_window_procedure(ctx, "DefMDIChildProcW")
+    handle_default_window_procedure(ctx)
 }
 /// Handles `USER32.dll!DispatchMessageA`.
 pub fn handle_dispatch_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -839,14 +730,7 @@ pub fn handle_dispatch_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         .context("failed to read RCX for DispatchMessageA")?;
 
     if message_address == 0 {
-        let return_address = engine
-            .return_from_win64_api(0)
-            .context("failed to return from DispatchMessageA")?;
-
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
 
     // One shared-lock borrow instead of four per-field reads; the MSG layout
@@ -864,13 +748,7 @@ pub fn handle_dispatch_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     if message == WM_ERASEBKGND {
         let erased = erase_window_background(state, window_handle);
         let return_value = u64::from(erased);
-        let return_address = engine
-            .return_from_win64_api(return_value)
-            .context("failed to return from DispatchMessageA")?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value,
-        });
+        return ctx.finish(return_value);
     }
 
     let target_window = state
@@ -885,14 +763,7 @@ pub fn handle_dispatch_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
      * Both cases retain the old neutral DispatchMessageA behavior.
      */
     let Some(target_window) = target_window else {
-        let return_address = engine
-            .return_from_win64_api(0)
-            .context("failed to return from DispatchMessageA")?;
-
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     };
 
     // Extract the Copy fields so the record borrow ends before the control
@@ -932,13 +803,7 @@ pub fn handle_dispatch_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
                 long_parameter,
             )?
         {
-            let return_address = engine
-                .return_from_win64_api(result)
-                .context("failed to return from DispatchMessageA")?;
-            return Ok(WinApiHandlerResult {
-                return_address,
-                return_value: result,
-            });
+            return ctx.finish(result);
         }
 
         // Modal dialogs have no guest WndProc but a dialog proc. WM_PAINT
@@ -968,14 +833,7 @@ pub fn handle_dispatch_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
             }
         }
 
-        let return_address = engine
-            .return_from_win64_api(0)
-            .context("failed to return from DispatchMessageA")?;
-
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
 
     /*
@@ -1252,11 +1110,8 @@ mod tests {
     fn dispatch_wm_paint(engine: &mut IcedCpu, state: &mut WinApiState, hwnd: u64) {
         let message = u64::from(crate::user32::WinMsg::WM_PAINT.as_u32());
         write_regs(engine, hwnd, message, 0, 0);
-        handle_default_window_procedure(
-            &mut HandlerContext::new(engine, test_env(), state),
-            "DefWindowProcW",
-        )
-        .expect("DefWindowProc WM_PAINT");
+        handle_default_window_procedure(&mut HandlerContext::new(engine, test_env(), state))
+            .expect("DefWindowProc WM_PAINT");
     }
 
     /// An empty frame for the headless record slot.

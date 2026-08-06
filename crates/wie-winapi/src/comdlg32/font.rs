@@ -79,13 +79,7 @@ pub fn handle_choose_font_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 
     if cf_ptr == 0 {
         state_comm_dlg_none(state);
-        let return_address = engine
-            .return_from_win64_api(0)
-            .context("failed to return from ChooseFontW")?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
 
     // Clone the policy to avoid borrowing window_state() across the match.
@@ -94,13 +88,7 @@ pub fn handle_choose_font_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         FontDialogPolicy::Cancel => {
             state_comm_dlg_none(state);
             tracing::debug!("ChooseFontW cancelled by policy");
-            let return_address = engine
-                .return_from_win64_api(0)
-                .context("failed to return from ChooseFontW")?;
-            Ok(WinApiHandlerResult {
-                return_address,
-                return_value: 0,
-            })
+            ctx.finish(0)
         }
         FontDialogPolicy::Interactive => open_host_font_dialog(ctx, cf_ptr),
     }
@@ -221,13 +209,7 @@ fn open_host_font_dialog(ctx: &mut HandlerContext<'_>, cf_ptr: u64) -> Result<Wi
     {
         state_comm_dlg_none(state);
         tracing::warn!("ChooseFontW interactive dialog unavailable; cancelling");
-        let return_address = engine
-            .return_from_win64_api(0)
-            .context("failed to return from ChooseFontW")?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
 
     // Seed the dialog from the guest's initial LOGFONTW (CF_INITTOLOGFONTSTRUCT
@@ -318,13 +300,7 @@ fn open_host_font_dialog(ctx: &mut HandlerContext<'_>, cf_ptr: u64) -> Result<Wi
     )?;
     if dialog_hwnd == 0 {
         state_comm_dlg_none(state);
-        let return_address = engine
-            .return_from_win64_api(0)
-            .context("failed to return from ChooseFontW")?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
     if let Some(window) = find_window_mut(state, dialog_hwnd) {
         window.dialog_proc = proc_va;

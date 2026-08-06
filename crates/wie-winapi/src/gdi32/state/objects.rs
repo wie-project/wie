@@ -31,14 +31,7 @@ pub fn handle_create_solid_brush(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 
     tracing::debug!(handle = handle.as_u64(), color, "CreateSolidBrush");
 
-    let return_address = engine
-        .return_from_win64_api(handle.as_u64())
-        .context("failed to return from CreateSolidBrush")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: handle.as_u64(),
-    })
+    ctx.finish(handle.as_u64())
 }
 
 /// Handles `GDI32.dll!CreatePen` (object allocated; stroke rendering deferred).
@@ -62,14 +55,7 @@ pub fn handle_create_pen(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 
     tracing::debug!(handle = handle.as_u64(), color, "CreatePen");
 
-    let return_address = engine
-        .return_from_win64_api(handle.as_u64())
-        .context("failed to return from CreatePen")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: handle.as_u64(),
-    })
+    ctx.finish(handle.as_u64())
 }
 
 /// Handles `GDI32.dll!CreateDIBSection`.
@@ -141,13 +127,7 @@ pub fn handle_create_dib_section(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
             image_size,
             "CreateDIBSection heap allocation failed"
         );
-        let return_address = engine
-            .return_from_win64_api(0)
-            .context("failed to return from CreateDIBSection")?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
 
     // Zero the pixel buffer so guest reads are defined.
@@ -194,14 +174,7 @@ pub fn handle_create_dib_section(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         "CreateDIBSection"
     );
 
-    let return_address = engine
-        .return_from_win64_api(dib_handle.as_u64())
-        .context("failed to return from CreateDIBSection")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: dib_handle.as_u64(),
-    })
+    ctx.finish(dib_handle.as_u64())
 }
 
 /// Handles `GDI32.dll!CreateCompatibleBitmap`.
@@ -230,14 +203,7 @@ pub fn handle_create_compatible_bitmap(
 
     tracing::debug!(handle, width, height, "CreateCompatibleBitmap");
 
-    let return_address = engine
-        .return_from_win64_api(handle)
-        .context("failed to return from CreateCompatibleBitmap")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: handle,
-    })
+    ctx.finish(handle)
 }
 
 fn next_gdi_bitmap_handle(state: &mut WinApiState) -> Result<u64> {
@@ -322,14 +288,7 @@ fn handle_create_font_impl(
         api_name
     );
 
-    let return_address = engine
-        .return_from_win64_api(handle.as_u64())
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: handle.as_u64(),
-    })
+    ctx.finish(handle.as_u64())
 }
 
 /// Handles `GDI32.dll!CreateFontIndirectA`.
@@ -361,13 +320,7 @@ fn handle_create_font_indirect_impl(
         .with_context(|| format!("failed to read RCX for {api_name}"))?;
 
     if logfont_ptr == 0 {
-        let return_address = engine
-            .return_from_win64_api(0)
-            .with_context(|| format!("failed to return from {api_name}"))?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
 
     let (height, weight, italic, charset, pitch, face_name) = if wide {
@@ -412,14 +365,7 @@ fn handle_create_font_indirect_impl(
         api_name
     );
 
-    let return_address = engine
-        .return_from_win64_api(handle.as_u64())
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: handle.as_u64(),
-    })
+    ctx.finish(handle.as_u64())
 }
 
 /// Resolve the font currently selected into `dc_handle` through the font

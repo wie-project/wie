@@ -143,14 +143,7 @@ pub fn handle_get_text_metrics_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     }
 
     let return_value = u64::from(success);
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetTextMetricsA")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `GDI32.dll!GetTextMetricsW`.
@@ -199,14 +192,7 @@ pub fn handle_get_text_metrics_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     }
 
     let return_value = u64::from(success);
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetTextMetricsW")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `GDI32.dll!SetTextColor` (stores on the DC, returns previous color).
@@ -228,14 +214,7 @@ pub fn handle_set_text_color(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         .find_dc_mut(Hdc::from(hdc))
         .map_or(0, |dc| std::mem::replace(&mut dc.text_color, color));
 
-    let return_address = engine
-        .return_from_win64_api(u64::from(previous))
-        .context("failed to return from SetTextColor")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: u64::from(previous),
-    })
+    ctx.finish(u64::from(previous))
 }
 
 /// Handles `GDI32.dll!SetBkColor` (stores on the DC, returns previous color).
@@ -257,14 +236,7 @@ pub fn handle_set_bk_color(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
         .find_dc_mut(Hdc::from(hdc))
         .map_or(0x00ff_ffff, |dc| std::mem::replace(&mut dc.bk_color, color));
 
-    let return_address = engine
-        .return_from_win64_api(u64::from(previous))
-        .context("failed to return from SetBkColor")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: u64::from(previous),
-    })
+    ctx.finish(u64::from(previous))
 }
 
 /// Handles `GDI32.dll!SetBkMode` (stores on the DC, returns previous mode).
@@ -288,12 +260,5 @@ pub fn handle_set_bk_mode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         .find_dc_mut(Hdc::from(hdc))
         .map_or(2, |dc| std::mem::replace(&mut dc.bk_mode, mode));
 
-    let return_address = engine
-        .return_from_win64_api(u64::from(previous))
-        .context("failed to return from SetBkMode")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: u64::from(previous),
-    })
+    ctx.finish(u64::from(previous))
 }

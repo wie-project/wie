@@ -66,18 +66,10 @@ pub fn handle_get_save_file_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 
 /// Handles `comdlg32.dll!CommDlgExtendedError`.
 pub fn handle_comm_dlg_extended_error(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let return_value = u64::from(state.window_state().comm_dlg_extended_error);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from CommDlgExtendedError")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `comdlg32.dll!GetFileTitleA`.
 pub fn handle_get_file_title_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -161,14 +153,7 @@ fn handle_get_file_title(
         }
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Copies `basename` into the guest title buffer, returning the GetFileTitle
@@ -230,14 +215,7 @@ fn handle_get_file_name(
 
     if ofn_ptr == 0 {
         state.window_state().comm_dlg_extended_error = CDERR_NONE;
-        let return_address = engine
-            .return_from_win64_api(0)
-            .with_context(|| format!("failed to return from {api_name}"))?;
-
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
 
     // One typed read for the whole OPENFILENAME (the four buffer fields the
@@ -315,14 +293,7 @@ fn handle_get_file_name(
         }
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// The `OPENFILENAME` buffer fields both the policy and the interactive flows
@@ -590,13 +561,7 @@ fn open_host_file_dialog(
             api = api_name,
             "interactive file dialog unavailable; cancelling"
         );
-        let return_address = engine
-            .return_from_win64_api(0)
-            .with_context(|| format!("failed to return from {api_name}"))?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
 
     let ofn = with_typed_read::<OpenFileName, _, _>(engine, ofn_ptr, |ofn| Ok(*ofn))
@@ -663,13 +628,7 @@ fn open_host_file_dialog(
     )?;
     if dialog_hwnd == 0 {
         state.window_state().comm_dlg_extended_error = CDERR_NONE;
-        let return_address = engine
-            .return_from_win64_api(0)
-            .with_context(|| format!("failed to return from {api_name}"))?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
     if let Some(window) = find_window_mut(state, dialog_hwnd) {
         window.dialog_proc = proc_va;

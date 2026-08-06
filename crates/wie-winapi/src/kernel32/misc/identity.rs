@@ -220,11 +220,7 @@ pub fn handle_get_computer_name_ex_w(ctx: &mut HandlerContext<'_>) -> Result<Win
         _ => {
             // Unsupported type → ERROR_INVALID_PARAMETER
             state.process.last_error = ERROR_INVALID_PARAMETER;
-            let return_address = engine.return_from_win64_api(0)?;
-            Ok(WinApiHandlerResult {
-                return_address,
-                return_value: 0,
-            })
+            ctx.finish(0)
         }
     }
 }
@@ -256,11 +252,7 @@ pub fn handle_query_full_process_image_name_w(
     let size_ptr = engine.read_r9()?;
     if buf == 0 || size_ptr == 0 {
         state.process.last_error = ERROR_INVALID_PARAMETER;
-        let return_address = engine.return_from_win64_api(0)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
     let mut size_buf = [0_u8; 4];
     engine.mem_read(size_ptr, &mut size_buf)?;
@@ -268,20 +260,12 @@ pub fn handle_query_full_process_image_name_w(
     let path = state.process.main_module_path.clone();
     let written = write_mock_string_w(engine, state, &path, buf, buf_len)?;
     if written == 0 {
-        let return_address = engine.return_from_win64_api(0)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
     let count = u32::try_from(written).unwrap_or(0);
     write_guest_u32(engine, size_ptr, count)?;
     state.process.last_error = 0;
-    let return_address = engine.return_from_win64_api(1)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 /// Handles `KERNEL32.dll!QueryFullProcessImageNameA` — return main module path.
 pub fn handle_query_full_process_image_name_a(
@@ -295,11 +279,7 @@ pub fn handle_query_full_process_image_name_a(
     let size_ptr = engine.read_r9()?;
     if buf == 0 || size_ptr == 0 {
         state.process.last_error = ERROR_INVALID_PARAMETER;
-        let return_address = engine.return_from_win64_api(0)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
     let mut size_buf = [0_u8; 4];
     engine.mem_read(size_ptr, &mut size_buf)?;
@@ -307,18 +287,10 @@ pub fn handle_query_full_process_image_name_a(
     let path = state.process.main_module_path.clone();
     let written = write_mock_string_a(engine, state, &path, buf, buf_len)?;
     if written == 0 {
-        let return_address = engine.return_from_win64_api(0)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
     let count = u32::try_from(written).unwrap_or(0);
     write_guest_u32(engine, size_ptr, count)?;
     state.process.last_error = 0;
-    let return_address = engine.return_from_win64_api(1)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }

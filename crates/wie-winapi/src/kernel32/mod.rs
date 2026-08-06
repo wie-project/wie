@@ -163,13 +163,6 @@ const GUEST_OS_PLATFORM_NT: u32 = 2;
 ///
 /// Microsoft Learn: `lpModuleName == NULL` → handle of the calling process's
 /// `.exe`. Named module must already be loaded; otherwise returns `NULL`.
-pub(crate) fn low_u32_to_i32(value: u64, context_name: &str) -> Result<i32> {
-    let low = u32::try_from(value & 0xffff_ffff)
-        .with_context(|| format!("{context_name} low u32 conversion failed"))?;
-
-    Ok(i32::from_ne_bytes(low.to_ne_bytes()))
-}
-
 pub(crate) fn read_ansi_string_from_cpu(
     engine: &mut dyn wie_cpu::CpuEngine,
     address: u64,

@@ -714,14 +714,7 @@ pub fn handle_initialize_security_descriptor(
         write_guest_u32(engine, security_descriptor_ptr, 1)?;
     }
 
-    let return_address = engine
-        .return_from_win64_api(1)
-        .context("failed to return from InitializeSecurityDescriptor")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 
 /// Handles `ADVAPI32.dll!SetSecurityDescriptorDacl`.
@@ -744,14 +737,7 @@ pub fn handle_set_security_descriptor_dacl(
 
     let return_value = u64::from(security_descriptor_ptr != 0);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from SetSecurityDescriptorDacl")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// `LSTATUS RegEnumKeyExW(HKEY, DWORD, LPWSTR, LPDWORD, ...)`.

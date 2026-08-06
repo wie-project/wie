@@ -7,6 +7,7 @@
 use std::any::Any;
 use std::sync::{Arc, Mutex};
 
+use anyhow::Result;
 use wie_cpu::CpuEngine;
 
 use crate::console;
@@ -480,5 +481,20 @@ impl<'a> HandlerContext<'a> {
             environment,
             state,
         }
+    }
+
+    /// Canonical handler tail: pop the guest return address, write `value`
+    /// into RAX, and package the result.
+    ///
+    /// Replaces the two-step `engine.return_from_win64_api(v)?;` +
+    /// `Ok(WinApiHandlerResult { return_address, return_value })` idiom.
+    /// Errors need no per-API context here — the dispatcher already wraps
+    /// handler failures as `{lib}!{name}: {error}`.
+    pub fn finish(&mut self, value: u64) -> Result<crate::WinApiHandlerResult> {
+        let return_address = self.engine.return_from_win64_api(value)?;
+        Ok(crate::WinApiHandlerResult {
+            return_address,
+            return_value: value,
+        })
     }
 }

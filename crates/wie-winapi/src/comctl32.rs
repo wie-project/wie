@@ -73,27 +73,12 @@ pub fn handle_dll_get_version(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         )?;
     }
 
-    let return_address = engine
-        .return_from_win64_api(S_OK)
-        .context("failed to return from DllGetVersion")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: S_OK,
-    })
+    ctx.finish(S_OK)
 }
 
 /// Handles `COMCTL32.dll!InitCommonControls` imported as ordinal 17.
 pub fn handle_init_common_controls(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let return_address = engine
-        .return_from_win64_api(1)
-        .context("failed to return from InitCommonControls")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    ctx.finish(1)
 }
 
 /// Handles dynamic `COMCTL32.dll!InitCommonControlsEx`.
@@ -105,14 +90,7 @@ pub fn handle_init_common_controls_ex(ctx: &mut HandlerContext<'_>) -> Result<Wi
 
     let return_value = u64::from(init_common_controls_ex_ptr != 0);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from InitCommonControlsEx")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `COMCTL32.dll!ImageList_Create`.
@@ -149,14 +127,7 @@ pub fn handle_image_list_create(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
             .push((FAKE_IMAGE_LIST_HANDLE, 0));
     }
 
-    let return_address = engine
-        .return_from_win64_api(FAKE_IMAGE_LIST_HANDLE)
-        .context("failed to return from ImageList_Create")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: FAKE_IMAGE_LIST_HANDLE,
-    })
+    ctx.finish(FAKE_IMAGE_LIST_HANDLE)
 }
 
 /// Handles `COMCTL32.dll!ImageList_AddMasked`.
@@ -195,14 +166,7 @@ pub fn handle_image_list_add_masked(ctx: &mut HandlerContext<'_>) -> Result<WinA
         u64::MAX
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from ImageList_AddMasked")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `COMCTL32.dll!ImageList_SetBkColor`.
@@ -248,14 +212,7 @@ pub fn handle_image_list_set_bk_color(ctx: &mut HandlerContext<'_>) -> Result<Wi
         u64::from(CLR_NONE)
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from ImageList_SetBkColor")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `COMCTL32.dll!ImageList_Destroy`.
@@ -286,14 +243,7 @@ pub fn handle_image_list_destroy(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 
     let return_value = u64::from(existed);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from ImageList_Destroy")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 /// Handles `COMCTL32.dll!CreateStatusWindowA`.
@@ -367,14 +317,7 @@ fn handle_create_status_window(
     )
     .with_context(|| format!("failed to create status window for {api_name}"))?;
 
-    let return_address = engine
-        .return_from_win64_api(hwnd)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: hwnd,
-    })
+    ctx.finish(hwnd)
 }
 
 // ── Task 3.1: the STATUSCLASSNAMEW control's own message dispatch ────────

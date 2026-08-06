@@ -48,12 +48,5 @@ pub fn handle_inflate_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
         .context("failed to write RECT for InflateRect")?;
     }
 
-    let return_address = engine
-        .return_from_win64_api(u64::from(success))
-        .context("failed to return from InflateRect")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: u64::from(success),
-    })
+    ctx.finish(u64::from(success))
 }

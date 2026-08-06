@@ -21,12 +21,5 @@ pub fn handle_set_window_theme(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     // HRESULT S_OK.
     let return_value = 0;
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from SetWindowTheme")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
