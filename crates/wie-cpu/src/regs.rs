@@ -459,24 +459,40 @@ pub(crate) fn set_logic_flags(regs: &mut RegFile, result: u64, size: usize) {
     // AF undefined for logic; leave unchanged.
 }
 
+/// Shared flag-update core for ADD/SUB (and CMP, which is SUB for flags).
+/// `d`/`s`/`r` are the caller-masked operands and result; only CF/OF differ
+/// between the two modes, so the caller computes those and passes them in.
+pub(crate) fn set_arith_flags(
+    regs: &mut RegFile,
+    d: u64,
+    s: u64,
+    r: u64,
+    size: usize,
+    cf: bool,
+    of: bool,
+) {
+    let sign = 1_u64 << (size.saturating_mul(8)).saturating_sub(1);
+
+    regs.set_flag(Rflags::CF, cf);
+    regs.set_flag(Rflags::ZF, r == 0);
+    regs.set_flag(Rflags::SF, (r & sign) != 0);
+    regs.set_flag(Rflags::PF, parity_even(low_byte(r)));
+    regs.set_flag(Rflags::OF, of);
+    regs.set_flag(Rflags::AF, ((d ^ s ^ r) & 0x10) != 0);
+}
+
 /// Update flags after ADD.
 pub(crate) fn set_add_flags(regs: &mut RegFile, dst: u64, src: u64, result: u64, size: usize) {
     let mask = size_mask(size);
     let d = dst & mask;
     let s = src & mask;
     let r = result & mask;
-    let bits = size.saturating_mul(8);
-    let sign = 1_u64 << bits.saturating_sub(1);
+    let sign = 1_u64 << (size.saturating_mul(8)).saturating_sub(1);
 
     let wide = u128::from(d).wrapping_add(u128::from(s));
-    regs.set_flag(Rflags::CF, wide > u128::from(mask));
-    regs.set_flag(Rflags::ZF, r == 0);
-    regs.set_flag(Rflags::SF, (r & sign) != 0);
-    regs.set_flag(Rflags::PF, parity_even(low_byte(r)));
     // OF: same sign operands, result different sign
     let of = ((d ^ r) & (s ^ r) & sign) != 0;
-    regs.set_flag(Rflags::OF, of);
-    regs.set_flag(Rflags::AF, ((d ^ s ^ r) & 0x10) != 0);
+    set_arith_flags(regs, d, s, r, size, wide > u128::from(mask), of);
 }
 
 /// Update flags after SUB / CMP.
@@ -485,17 +501,11 @@ pub(crate) fn set_sub_flags(regs: &mut RegFile, dst: u64, src: u64, result: u64,
     let d = dst & mask;
     let s = src & mask;
     let r = result & mask;
-    let bits = size.saturating_mul(8);
-    let sign = 1_u64 << bits.saturating_sub(1);
+    let sign = 1_u64 << (size.saturating_mul(8)).saturating_sub(1);
 
-    regs.set_flag(Rflags::CF, d < s);
-    regs.set_flag(Rflags::ZF, r == 0);
-    regs.set_flag(Rflags::SF, (r & sign) != 0);
-    regs.set_flag(Rflags::PF, parity_even(low_byte(r)));
     // OF: different sign operands, result sign != dst sign
     let of = ((d ^ s) & (d ^ r) & sign) != 0;
-    regs.set_flag(Rflags::OF, of);
-    regs.set_flag(Rflags::AF, ((d ^ s ^ r) & 0x10) != 0);
+    set_arith_flags(regs, d, s, r, size, d < s, of);
 }
 
 #[must_use]
