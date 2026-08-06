@@ -18,15 +18,8 @@ use crate::asm_utils::patch_rel32;
 use crate::hooks::RuntimeFakeApiEntry;
 use crate::memory::RuntimeMemoryLayout;
 use anyhow::{Context, Result};
+use wie_winapi::guest_heap::{HEAP_SIZE_CLASS_COUNT, LARGE_THRESHOLD, SIZE_CLASSES};
 use wie_winapi::{WinApiId, encode_alias};
-
-/// Must match `wie_winapi::guest_heap` size classes.
-const HEAP_SIZE_CLASS_COUNT: usize = 24;
-const SIZE_CLASSES: [u64; HEAP_SIZE_CLASS_COUNT] = [
-    16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192,
-    12288, 16384, 24576, 32768, 49152, 65536,
-];
-const LARGE_THRESHOLD: u64 = 65_536;
 
 /// Control block: bump (u64) + freelist heads (24 × u64).
 pub const HEAP_CTRL_SIZE: usize = 8 + HEAP_SIZE_CLASS_COUNT * 8;
