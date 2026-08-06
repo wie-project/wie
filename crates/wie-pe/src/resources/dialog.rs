@@ -9,7 +9,8 @@
 use crate::PeSectionMap;
 
 use super::common::{
-    RT_DIALOG, parse_resource_type, read_i16_at, read_u16_at, read_u32_at, read_utf16_string,
+    ORDINAL_MARKER, RT_DIALOG, parse_resource_type, read_i16_at, read_u16_at, read_u32_at,
+    read_utf16_string,
 };
 
 /// Window style bits (`WS_*`/`DS_*`, winuser.h) used while parsing dialog
@@ -182,7 +183,7 @@ fn parse_dialog_template(template_id: u16, lang: u16, bytes: &[u8]) -> Option<Di
     let word1 = read_u16_at(bytes, 2)?;
 
     // DLGTEMPLATEEX (dlgVer=1, signature=0xFFFF): extended layout.
-    if word0 == 1 && word1 == 0xFFFF {
+    if word0 == 1 && word1 == ORDINAL_MARKER {
         return parse_dialog_template_ex(template_id, lang, bytes);
     }
 
@@ -409,7 +410,7 @@ fn parse_dialog_item_ex(bytes: &[u8], pos: usize) -> Option<(DialogItemTemplate,
 /// NUL-terminated UTF-16 class name.
 fn parse_item_class(bytes: &[u8], pos: usize) -> Option<(ItemClass, usize)> {
     let word = read_u16_at(bytes, pos)?;
-    if word == 0xFFFF {
+    if word == ORDINAL_MARKER {
         let ordinal = read_u16_at(bytes, pos.checked_add(2)?)?;
         return Some((ItemClass::from_ordinal(ordinal), pos.checked_add(4)?));
     }
@@ -450,7 +451,7 @@ impl ItemClass {
 /// resolve; they come back as empty strings.
 fn read_optional_text(bytes: &[u8], pos: usize) -> Option<(String, usize)> {
     let word = read_u16_at(bytes, pos)?;
-    if word == 0xFFFF {
+    if word == ORDINAL_MARKER {
         let _ordinal = read_u16_at(bytes, pos.checked_add(2)?)?;
         return Some((String::new(), pos.checked_add(4)?));
     }

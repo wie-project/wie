@@ -4,6 +4,10 @@
 //! elsewhere.  Intrinsics lower to real instructions even in debug builds,
 //! so the per-pixel conversion stays fast regardless of the host profile.
 
+/// 0RGB mask: clears the alpha byte of a little-endian BGRA pixel
+/// (`0xAARRGGBB` → `0x00RRGGBB`).
+const O_RGB_MASK: u32 = 0x00FF_FFFF;
+
 /// Mask the alpha byte of little-endian BGRA pixels (`0xAARRGGBB`) into
 /// present-format 0RGB (`0x00RRGGBB`).
 ///
@@ -32,7 +36,7 @@ pub fn mask_bgra_to_0rgb(dst: &mut [u32], src: &[u8]) {
         unsafe {
             use std::arch::aarch64::{vandq_u32, vdupq_n_u32, vld1q_u32, vst1q_u32};
 
-            let mask = vdupq_n_u32(0x00FF_FFFF);
+            let mask = vdupq_n_u32(O_RGB_MASK);
             let src_p = src.as_ptr().cast::<u32>();
             let dst_p = dst.as_mut_ptr();
             let n16 = n & !15;
@@ -59,7 +63,7 @@ pub fn mask_bgra_to_0rgb(dst: &mut [u32], src: &[u8]) {
             while i < n {
                 // Little-endian host: a raw u32 read equals from_le_bytes.
                 let p = src_p.add(i).read_unaligned();
-                dst_p.add(i).write(p & 0x00FF_FFFF);
+                dst_p.add(i).write(p & O_RGB_MASK);
                 i += 1;
             }
         }
@@ -73,7 +77,7 @@ pub fn mask_bgra_to_0rgb(dst: &mut [u32], src: &[u8]) {
             let dst_p = dst.as_mut_ptr();
             for i in 0..n {
                 let p = src_p.add(i).read_unaligned();
-                dst_p.add(i).write(p & 0x00FF_FFFF);
+                dst_p.add(i).write(p & O_RGB_MASK);
             }
         }
     }
@@ -461,7 +465,7 @@ mod tests {
         let elapsed = t.elapsed();
         // 2M px fits in u32; f64::from(u32) avoids a lossy usize cast.
         let px_f = f64::from(u32::try_from(px).unwrap_or(1));
-        eprintln!(
+        tracing::error!(
             "mask_bgra_to_0rgb: {px} px in {elapsed:?} ({:.2} ns/px)",
             elapsed.as_secs_f64() * 1e9 / px_f
         );

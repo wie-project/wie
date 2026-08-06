@@ -34,6 +34,44 @@ pub(crate) const RT_VERSION: u16 = 16;
 /// `IMAGE_SCN_CNT_INITIALIZED_DATA` (used to spot a resource-like section).
 const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x0000_0040;
 
+/// High bit of a resource directory entry's `Name` / `OffsetToData` field.
+///
+/// On `Name` it is `IMAGE_RESOURCE_NAME_IS_STRING` (the name is a string);
+/// on `OffsetToData` it is `IMAGE_RESOURCE_DATA_IS_DIRECTORY` (the target is
+/// a subdirectory). Both constants are `0x80000000` in the PE spec.
+pub(crate) const RESOURCE_ENTRY_HIGH_BIT: u32 = 0x8000_0000;
+
+/// Mask stripping the high bit from an `OffsetToData` field, leaving the
+/// offset relative to the resource root directory.
+const RESOURCE_ENTRY_OFFSET_MASK: u32 = 0x7FFF_FFFF;
+
+/// `IMAGE_NT_OPTIONAL_HDR64_MAGIC` — PE32+ optional-header magic.
+const IMAGE_NT_OPTIONAL_HDR64_MAGIC: u16 = 0x20B;
+
+/// DOS header `e_lfanew` field offset (points at the `PE\0\0` signature).
+const E_LFANEW_OFFSET: usize = 0x3C;
+
+/// `IMAGE_SIZEOF_FILE_HEADER` — COFF file-header size (optional header follows).
+const IMAGE_SIZEOF_FILE_HEADER: usize = 20;
+
+/// PE32+ optional header: offset of `NumberOfRvaAndSizes` (4 bytes before
+/// the data-directory table).
+const PE32P_OPT_NUM_RVA_AND_SIZES_OFF: usize = 108;
+
+/// PE32+ optional header: offset of the data-directory table.
+const PE32P_OPT_DATA_DIRECTORY_OFF: usize = 112;
+
+/// `IMAGE_DIRECTORY_ENTRY_RESOURCE` — index of the resource data directory.
+const IMAGE_DIRECTORY_ENTRY_RESOURCE: u32 = 2;
+
+/// Size of one `IMAGE_DATA_DIRECTORY` entry (8 bytes: `VirtualAddress` +
+/// `Size`).
+const IMAGE_DATA_DIRECTORY_SIZE: usize = 8;
+
+/// Marker word for ordinal template fields (dialog menus/classes/titles and
+/// item classes): a `0xFFFF` word means the next WORD is an ordinal.
+pub(crate) const ORDINAL_MARKER: u16 = 0xFFFF;
+
 /// Safety cap: dialog/menu/string-table strings arrive as length-prefixed
 /// bytes from a possibly hostile PE, and a corrupt prefix or a missing NUL
 /// terminator must not force unbounded parse-time allocation. 4096 UTF-16
@@ -104,7 +142,7 @@ pub(crate) fn parse_resource_type<T>(
             continue;
         }
         // The type level must point at a subdirectory (the template-id level).
-        if (type_off & 0x8000_0000) == 0 {
+        if (type_off & RESOURCE_ENTRY_HIGH_BIT) == 0 {
             continue;
         }
         let Some(type_dir_off) = entry_target(&walk, type_off) else {
@@ -131,7 +169,7 @@ pub(crate) fn parse_resource_type<T>(
 /// they are rebased onto the walk's `root_rva` and re-mapped through the
 /// section map.
 fn entry_target(walk: &ResourceWalk<'_>, entry_off: u32) -> Option<usize> {
-    let rel = entry_off & 0x7FFF_FFFF;
+    let rel = entry_off & RESOURCE_ENTRY_OFFSET_MASK;
     let rva = walk.root_rva.checked_add(rel)?;
     rva_to_file(walk.image, walk.sections, rva)
 }
@@ -149,7 +187,7 @@ fn collect_language_leaves<T>(
     parse_template: fn(u16, u16, &[u8]) -> Option<T>,
     out: &mut Vec<T>,
 ) {
-    if (entry_off & 0x8000_0000) != 0 {
+    if (entry_off & RESOURCE_ENTRY_HIGH_BIT) != 0 {
         let Some(dir_off) = entry_target(walk, entry_off) else {
             return;
         };
@@ -219,26 +257,33 @@ fn resource_root_rva(image: &[u8], sections: &[PeSectionMap]) -> Option<u32> {
 /// Read `IMAGE_DIRECTORY_ENTRY_RESOURCE` (directory index 2) from the
 /// optional header of the PE in `image`.
 fn pe_resource_root_rva(image: &[u8]) -> Option<u32> {
-    let pe_off = usize::try_from(read_u32_at(image, 0x3C)?).ok()?;
+    let pe_off = usize::try_from(read_u32_at(image, E_LFANEW_OFFSET)?).ok()?;
     let sig_off = pe_off.checked_add(4)?;
     let sig_end = sig_off.checked_add(4)?;
     if image.get(sig_off..sig_end) != Some(&b"PE\0\0"[..]) {
         return None;
     }
     // The optional header starts after the 20-byte COFF header.
-    let opt_off = pe_off.checked_add(4)?.checked_add(20)?;
+    let opt_off = pe_off
+        .checked_add(4)?
+        .checked_add(IMAGE_SIZEOF_FILE_HEADER)?;
     // PE32+ only; PE32 (0x10B) is rejected by WIE and has different offsets.
-    if read_u16_at(image, opt_off)? != 0x20B {
+    if read_u16_at(image, opt_off)? != IMAGE_NT_OPTIONAL_HDR64_MAGIC {
         return None;
     }
     // NumberOfRvaAndSizes sits 4 bytes before the directory table; the
     // resource directory is index 2 (16 bytes into the table).
-    let num_dirs = read_u32_at(image, opt_off.checked_add(108)?)?;
-    if num_dirs <= 2 {
+    let num_dirs = read_u32_at(image, opt_off.checked_add(PE32P_OPT_NUM_RVA_AND_SIZES_OFF)?)?;
+    if num_dirs <= IMAGE_DIRECTORY_ENTRY_RESOURCE {
         return None;
     }
-    let dirs_off = opt_off.checked_add(112)?;
-    let root_rva = read_u32_at(image, dirs_off.checked_add(16)?)?;
+    let dirs_off = opt_off.checked_add(PE32P_OPT_DATA_DIRECTORY_OFF)?;
+    let dir_entry_off = dirs_off.checked_add(
+        usize::try_from(IMAGE_DIRECTORY_ENTRY_RESOURCE)
+            .ok()?
+            .checked_mul(IMAGE_DATA_DIRECTORY_SIZE)?,
+    )?;
+    let root_rva = read_u32_at(image, dir_entry_off)?;
     (root_rva != 0).then_some(root_rva)
 }
 
@@ -289,7 +334,7 @@ fn read_resource_dir(image: &[u8], off: usize) -> Option<ResourceDir> {
 /// `IMAGE_RESOURCE_DIR_STRING_U` (WORD length + UTF-16 chars) whose offset is
 /// relative to the root directory.
 fn resource_name(walk: &ResourceWalk<'_>, name: u32) -> Option<ResourceName> {
-    if (name & 0x8000_0000) != 0 {
+    if (name & RESOURCE_ENTRY_HIGH_BIT) != 0 {
         // Bounds-check the name string without building it (only ids matter).
         let off = entry_target(walk, name)?;
         let len = read_u16_at(walk.image, off)?;

@@ -470,10 +470,16 @@ pub(super) struct CompiledBlock {
     pub guest_end: u64,
 }
 
+/// SplitMix64 / Fibonacci-hashing golden-ratio multiplier (`2^64 / φ`).
+///
+/// Well-mixed multiplicative scatter for hashing guest VAs into chain-table
+/// slots; the odd, evenly-distributed bits avoid low-bit clustering.
+const GOLDEN_RATIO_64: u64 = 0x9E37_79B9_7F4A_7C15;
+
 /// Hash a guest VA into a chain-table slot.
 #[inline]
 pub(super) fn chain_hash(va: u64) -> usize {
-    let h = va.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let h = va.wrapping_mul(GOLDEN_RATIO_64);
     (h as usize) & (CHAIN_SLOTS - 1)
 }
 

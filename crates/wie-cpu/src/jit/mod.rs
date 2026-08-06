@@ -36,6 +36,10 @@ use lower::CompiledBlock;
 use shared::BgWaitCell;
 use std::sync::Arc;
 
+/// All 16 dirty bits set (GPR or XMM bank): the "everything is dirty" sentinel
+/// for trampolines / fault paths that cannot track individual registers.
+pub(super) const ALL_DIRTY_BITS: u16 = u16::MAX;
+
 /// Hybrid CPU: Cranelift for hot pure-GPR blocks, iced for everything else.
 ///
 /// Holds a shared compilation cache + guest memory (Arc) and per-thread
@@ -110,11 +114,12 @@ pub fn dump_mem_path_stats(s: &JitStats) {
         return;
     }
     let helpers = s.load_calls.saturating_add(s.store_calls);
-    eprintln!(
+    tracing::error!(
         "[wie] mem_path helpers={helpers} load={} store={}",
-        s.load_calls, s.store_calls
+        s.load_calls,
+        s.store_calls
     );
-    eprintln!(
+    tracing::error!(
         "[wie]   resolve: sticky={} multi={} pin={} walk={} cross={} slow={}",
         s.mem_sticky_hit,
         s.mem_multi_hit,
@@ -123,17 +128,26 @@ pub fn dump_mem_path_stats(s: &JitStats) {
         s.mem_cross_page,
         s.mem_slow
     );
-    eprintln!(
+    tracing::error!(
         "[wie]   sticky_miss: key={} gen={} prot={} swaps={}",
-        s.mem_sticky_miss_key, s.mem_sticky_miss_gen, s.mem_sticky_miss_prot, s.mem_sticky_swaps
+        s.mem_sticky_miss_key,
+        s.mem_sticky_miss_gen,
+        s.mem_sticky_miss_prot,
+        s.mem_sticky_swaps
     );
-    eprintln!(
+    tracing::error!(
         "[wie]   addr_vs_pin: stack={} heap={} outside={}",
-        s.mem_addr_stack_pin, s.mem_addr_heap_pin, s.mem_addr_outside
+        s.mem_addr_stack_pin,
+        s.mem_addr_heap_pin,
+        s.mem_addr_outside
     );
-    eprintln!(
+    tracing::error!(
         "[wie]   gen: bumps={} peak={}  pins: stack_bytes={:#x} heap_bytes={:#x} allow={:#x}",
-        s.mem_gen_bumps, s.mem_gen_peak, s.pin_stack_bytes, s.pin_heap_bytes, s.pin_allow_bits
+        s.mem_gen_bumps,
+        s.mem_gen_peak,
+        s.pin_stack_bytes,
+        s.pin_heap_bytes,
+        s.pin_allow_bits
     );
     if helpers > 0 {
         let pct10 = |n: u64| -> u64 { n.saturating_mul(1000).checked_div(helpers).unwrap_or(0) };
@@ -141,7 +155,7 @@ pub fn dump_mem_path_stats(s: &JitStats) {
             let t = pct10(n);
             format!("{}.{}", t.checked_div(10).unwrap_or(0), t % 10)
         };
-        eprintln!(
+        tracing::error!(
             "[wie]   resolve%: multi={}% pin={}% walk={}% key_miss={}% outside={}%",
             fmt(s.mem_multi_hit),
             fmt(s.mem_pin_hit),

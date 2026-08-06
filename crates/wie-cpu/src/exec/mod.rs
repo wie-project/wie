@@ -919,7 +919,7 @@ pub fn dump_iced_counters() {
     }
     pairs.sort_by_key(|a| std::cmp::Reverse(a.0));
     let total: u64 = pairs.iter().map(|(c, _)| *c).sum();
-    eprintln!("--- iced-interp mnemonic counts (total={total}) ---");
+    tracing::error!("--- iced-interp mnemonic counts (total={total}) ---");
     let show = pairs.len().min(60);
     for (count, idx) in pairs.iter().take(show) {
         let name = Mnemonic::try_from(*idx)
@@ -928,12 +928,12 @@ pub fn dump_iced_counters() {
         let pct = count.saturating_mul(1000).checked_div(total).unwrap_or(0);
         let pct_whole = pct / 10;
         let pct_frac = pct % 10;
-        eprintln!("{count:>10}  {pct_whole:3}.{pct_frac}%  {name}");
+        tracing::error!("{count:>10}  {pct_whole:3}.{pct_frac}%  {name}");
     }
     if pairs.len() > show {
-        eprintln!("  … {} more mnemonics", pairs.len() - show);
+        tracing::error!("  … {} more mnemonics", pairs.len() - show);
     }
-    eprintln!("--- end ---");
+    tracing::error!("--- end ---");
 }
 
 /// Zero counters (for multi-run tooling). No-op when trace is disabled.

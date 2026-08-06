@@ -57,12 +57,17 @@ impl super::RuntimeSession {
         let instruction_budget = layout.instruction_budget;
         let no_hook_limit = layout.no_hook_slice_limit;
 
+        // Ceiling on API stops that did not charge toward `max_api` (noisy
+        // fast-path returns): 50× the budget, at least a fixed 50k slack.
+        const NOISY_API_FACTOR: usize = 50;
+        const NOISY_API_SLACK: usize = 50_000;
+
         let mut events: Vec<crate::trace::EntryTraceEvent> = Vec::new();
         let mut termination = EntryTraceTermination::ApiLimit;
 
         let max_noisy_api = max_api
-            .saturating_mul(50)
-            .max(max_api.saturating_add(50_000));
+            .saturating_mul(NOISY_API_FACTOR)
+            .max(max_api.saturating_add(NOISY_API_SLACK));
         let mut charged_api = 0_usize;
         let mut noisy_api = 0_usize;
 
@@ -1016,7 +1021,7 @@ impl super::RuntimeSession {
                             // so workers can ExitThread / SetEvent / CreateThread.
                             let _ = self.process.drain_spawns();
                             if crate::mt_runtime::mt_debug() {
-                                eprintln!(
+                                tracing::error!(
                                     "[mt] primary park WaitObject handle={handle:#x} timeout={timeout_ms:#x}"
                                 );
                             }
@@ -1060,7 +1065,7 @@ impl super::RuntimeSession {
                             // so the worker can start executing guest code.
                             let _ = self.process.drain_spawns();
                             if crate::mt_runtime::mt_debug() {
-                                eprintln!("[mt] primary park PthreadWait");
+                                tracing::error!("[mt] primary park PthreadWait");
                             }
                             // Yield briefly so the handler can re-check its
                             // condition (WakeQueue park) on re-entry.
@@ -1069,7 +1074,7 @@ impl super::RuntimeSession {
                         wie_winapi::HostParkReason::WaitMultiple => {
                             let _ = self.process.drain_spawns();
                             if crate::mt_runtime::mt_debug() {
-                                eprintln!("[mt] primary park WaitMultiple");
+                                tracing::error!("[mt] primary park WaitMultiple");
                             }
                             let req = self
                                 .process

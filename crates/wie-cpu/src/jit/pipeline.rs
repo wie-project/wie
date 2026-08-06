@@ -9,6 +9,7 @@
     private_interfaces // JitShared/PerThreadJitState expose crate-private types
 )]
 
+use super::ALL_DIRTY_BITS;
 use super::JitStats;
 use super::block::{self, BlockKind, decode_pure_gpr_block, pure_is_self_loop};
 use super::config::JitConfig;
@@ -670,7 +671,7 @@ impl JitCpu {
             let mut m = meta.xmm_live_mask;
             // If mask is empty but uses_sse (fp-only edge), load all.
             if m == 0 {
-                m = 0xffff;
+                m = ALL_DIRTY_BITS;
             }
             let mut i = 0_usize;
             while m != 0 {
@@ -768,11 +769,11 @@ impl JitCpu {
         // micro-stub does not chain). Cranelift leaves bits at 0 → full sync
         // (internal block chaining can dirty arbitrary GPRs).
         let dirty = if ctx.fault != 0 || ctx.gpr_dirty_bits == 0 {
-            0xffff_u16
+            ALL_DIRTY_BITS
         } else {
             ctx.gpr_dirty_bits as u16
         };
-        if dirty == 0xffff {
+        if dirty == ALL_DIRTY_BITS {
             for i in 0..16 {
                 if let Some(&v) = ctx.gpr.get(i) {
                     regs.set_gpr(i, v);
@@ -797,7 +798,7 @@ impl JitCpu {
             // so we always OR both so trampoline-only writes and Cranelift writes
             // are both covered.
             let dirty = if ctx.fault != 0 {
-                u16::try_from(ctx.xmm_dirty_bits).unwrap_or(0xffff)
+                u16::try_from(ctx.xmm_dirty_bits).unwrap_or(ALL_DIRTY_BITS)
             } else {
                 u16::try_from(ctx.xmm_dirty_bits).unwrap_or(0)
             };

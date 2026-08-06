@@ -757,17 +757,16 @@ impl super::RuntimeSession {
 
         // Guest page for UCRT FILE* cookies / CRT pointer slots (ucrt module).
         engine
-            .mem_map(0x0000_0000_6800_0000, 0x1000, wie_cpu::RwxPerms::READ_WRITE)
+            .mem_map(super::CRT_GUEST_BASE, 0x1000, wie_cpu::RwxPerms::READ_WRITE)
             .context("failed to map guest UCRT data page")?;
         // Pre-init CRT pointer slots (filled fully after process identity is known).
         {
-            const CRT: u64 = 0x0000_0000_6800_0000;
-            engine.mem_write(CRT + 0x300, &0_u64.to_le_bytes())?; // environ ptr
-            engine.mem_write(CRT + 0x308, &0_u64.to_le_bytes())?; // argv ptr (set below)
-            engine.mem_write(CRT + 0x310, &1_u32.to_le_bytes())?; // argc (set below)
-            engine.mem_write(CRT + 0x318, &0_u32.to_le_bytes())?; // commode
-            engine.mem_write(CRT + 0x320, &0_u32.to_le_bytes())?; // fmode
-            engine.mem_write(CRT + 0x328, &0_u64.to_le_bytes())?; // acmdln (set below)
+            engine.mem_write(super::CRT_ENVIRON_PTR_SLOT, &0_u64.to_le_bytes())?; // environ ptr
+            engine.mem_write(super::CRT_ARGV_PTR_SLOT, &0_u64.to_le_bytes())?; // argv ptr (set below)
+            engine.mem_write(super::CRT_ARGC_SLOT, &1_u32.to_le_bytes())?; // argc (set below)
+            engine.mem_write(super::CRT_COMMODE_SLOT, &0_u32.to_le_bytes())?; // commode
+            engine.mem_write(super::CRT_FMODE_SLOT, &0_u32.to_le_bytes())?; // fmode
+            engine.mem_write(super::CRT_ACMDLN_PTR_SLOT, &0_u64.to_le_bytes())?; // acmdln (set below)
         }
 
         let command_line_a_ptr = layout

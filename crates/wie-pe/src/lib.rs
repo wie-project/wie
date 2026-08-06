@@ -576,6 +576,9 @@ pub fn inspect_pe_sections_bytes(bytes: &[u8]) -> Result<Vec<PeSectionSummary>> 
     Ok(sections)
 }
 
+/// `IMAGE_SIZEOF_IMPORT_DESCRIPTOR` — stride between import descriptors.
+const IMPORT_DESCRIPTOR_SIZE: u32 = 20;
+
 /// Read import metadata from a `PE` image on disk.
 pub fn inspect_pe_imports(path: &Path) -> Result<Vec<PeImportSummary>> {
     let bytes = read_pe_file(path)?;
@@ -643,7 +646,7 @@ fn inspect_pe_imports_from_parsed(pe: &PE, bytes: &[u8]) -> Result<Vec<PeImportS
         )?;
 
         descriptor_rva = descriptor_rva
-            .checked_add(20)
+            .checked_add(IMPORT_DESCRIPTOR_SIZE)
             .context("import descriptor RVA overflow")?;
     }
 

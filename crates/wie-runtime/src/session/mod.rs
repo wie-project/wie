@@ -36,15 +36,22 @@ pub struct SessionOptions {
 }
 
 /// Guest CRT page layout (must match `wie_winapi::ucrt` and guest stubs).
-const CRT_GUEST_BASE: u64 = 0x0000_0000_6800_0000;
+pub(crate) const CRT_GUEST_BASE: u64 = 0x0000_0000_6800_0000;
+const CRT_ENVIRON_PTR_SLOT: u64 = CRT_GUEST_BASE + 0x300;
 const CRT_ARGV_PTR_SLOT: u64 = CRT_GUEST_BASE + 0x308;
 const CRT_ARGC_SLOT: u64 = CRT_GUEST_BASE + 0x310;
+const CRT_COMMODE_SLOT: u64 = CRT_GUEST_BASE + 0x318;
+const CRT_FMODE_SLOT: u64 = CRT_GUEST_BASE + 0x320;
 const CRT_ACMDLN_PTR_SLOT: u64 = CRT_GUEST_BASE + 0x328;
 /// Pointer table for `char *argv[]` (null-terminated).
 const CRT_ARGV_TABLE: u64 = CRT_GUEST_BASE + 0x400;
 /// Storage for argv string bodies.
 const CRT_ARGV_STRINGS: u64 = CRT_GUEST_BASE + 0x500;
 const CRT_PAGE_END: u64 = CRT_GUEST_BASE + 0x1000;
+
+/// Default per-quantum API-stop budget for [`RuntimeSession::run_until_stop`]
+/// callers that do not need a custom cap (the GUI loop uses this).
+pub(crate) const MAX_API_QUANTUM: usize = 1_000_000;
 
 /// Materialize UCRT `__p___argc` / `__p___argv` / `__p__acmdln` guest slots.
 fn materialize_crt_argv(

@@ -14,7 +14,7 @@ pub const TEB_LAST_ERROR_VA: u64 = wie_cpu::GS_BASE + 0x68;
 pub const GUEST_FLS_SLOT_COUNT: u32 = 256;
 
 /// Guest UCRT data-page base (CRT pointer slots live at `CRT + 0x3xx`).
-const CRT: u64 = 0x0000_0000_6800_0000;
+const CRT: u64 = crate::session::CRT_GUEST_BASE;
 
 /// Marker library for the UCRT group in [`CLASSIFY_TABLE`].
 ///

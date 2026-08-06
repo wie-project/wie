@@ -133,7 +133,7 @@ impl ProcessResources {
             return Ok(());
         }
         if mt_debug() {
-            eprintln!(
+            tracing::error!(
                 "[mt] drain_spawns count={} tids={:?}",
                 spawns.len(),
                 spawns
@@ -206,7 +206,7 @@ fn worker_main(
     tid: u32,
 ) {
     if mt_debug() {
-        eprintln!("[mt] worker_main start tid={tid:#x}");
+        tracing::error!("[mt] worker_main start tid={tid:#x}");
     }
     let layout = &config.layout;
     let budget = layout.instruction_budget;
@@ -222,7 +222,7 @@ fn worker_main(
     ) {
         tracing::error!(tid, error = %e, "failed to install runtime hooks for worker");
         if mt_debug() {
-            eprintln!("[mt] worker_main hooks failed tid={tid:#x}: {e}");
+            tracing::error!("[mt] worker_main hooks failed tid={tid:#x}: {e}");
         }
         // Always mark finished so joiners do not hang forever.
         let st = lock(&shared_winapi);
@@ -266,7 +266,7 @@ fn worker_main(
                 Ok(r) => r,
                 Err(e) => {
                     if mt_debug() {
-                        eprintln!("[mt] worker_main run error tid={tid:#x}: {e}");
+                        tracing::error!("[mt] worker_main run error tid={tid:#x}: {e}");
                     }
                     let st = lock(&shared_winapi);
                     finish_tid(&st, tid, 1);
@@ -283,7 +283,7 @@ fn worker_main(
         {
             let return_value = engine.read_rax().unwrap_or(0);
             if mt_debug() {
-                eprintln!("[mt] worker tid={tid:#x} pthread return value={return_value:#x}");
+                tracing::error!("[mt] worker tid={tid:#x} pthread return value={return_value:#x}");
             }
             let mut st = lock(&shared_winapi);
             st.kernel.threads.activate(tid);
@@ -304,7 +304,7 @@ fn worker_main(
         if rip_now == 0 || (run.invalid_memory.hit && run.invalid_memory.address == 0) {
             let code = u32::try_from(engine.read_rax().unwrap_or(0) & 0xffff_ffff).unwrap_or(0);
             if mt_debug() {
-                eprintln!("[mt] worker_main exit tid={tid:#x} code={code} (ret-to-0)");
+                tracing::error!("[mt] worker_main exit tid={tid:#x} code={code} (ret-to-0)");
             }
             let st = lock(&shared_winapi);
             finish_tid(&st, tid, code);

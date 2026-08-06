@@ -65,7 +65,7 @@ pub fn run_windowed(session: &mut RuntimeSession, control: &GuiControl) -> Resul
     let mut paint_posted = false;
     loop {
         let summary = session
-            .run_until_stop(1_000_000)
+            .run_until_stop(crate::session::MAX_API_QUANTUM)
             .context("GUI loop run_until_stop failed")?;
 
         match summary.termination {
