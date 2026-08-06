@@ -103,23 +103,6 @@ fn descends_from_window(state: &WinApiState, child: u64, parent: u64) -> bool {
     }
 }
 
-/// Decrement the queue's modal-dialog depth when a `WM_QUIT` is consumed.
-///
-/// `EndDialog` posts the quit; the modal loop consumes it. The depth gates
-/// the `ExitOnIdle` synthetic-quit override (a dialog must never see the
-/// regression `WM_QUIT`).
-pub(super) fn note_wm_quit_consumed(state: &mut WinApiState) {
-    let mut queue = state.lock_message_queue();
-    if queue.dialog_depth > 0 {
-        queue.dialog_depth = queue.dialog_depth.saturating_sub(1);
-        tracing::debug!(
-            target: "wiegui",
-            depth = queue.dialog_depth,
-            "dialog depth down"
-        );
-    }
-}
-
 /// Handles of every window that matches a dialog window filter's descendant
 /// rule (the filter window itself plus its whole subtree).
 ///

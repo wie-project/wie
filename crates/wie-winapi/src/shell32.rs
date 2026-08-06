@@ -3,7 +3,7 @@
 use crate::guest_memory::{read_u64, write_u32 as write_guest_u32};
 use crate::guest_string::{read_utf16_lossy, write_utf16_c_string};
 use crate::state::{MessageBoxRequest, PendingNativeMessageBox, WinApiControlSignal, WindowFlags};
-use crate::user32::{IDOK, find_window_mut};
+use crate::user32::{IDOK, ModalFrame, ModalResult, find_window_mut, finish_modal};
 use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 use anyhow::{Context, Result};
 
@@ -268,12 +268,23 @@ pub fn handle_shell_about_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     // winit event loop needs that lock to service frame events while the
     // alert is up) and recorded the pick — the fix-27 MessageBox two-entry
     // flow. ShellAboutW is an MB_OK alert, so the pick is IDOK — which is
-    // also TRUE, the documented return.
+    // also TRUE, the documented return. Close the modal frame the first entry
+    // opened (depth down, owner restored) before returning.
     if let Some(pending) = ctx.state.window_state().pending_native_message_box.take() {
         let win32_id = pending
             .pick
             .and_then(|id| u64::try_from(id).ok())
             .unwrap_or(IDOK);
+        if let Some(frame) = pending.frame {
+            let result = if win32_id == IDOK {
+                ModalResult::Ok(win32_id)
+            } else {
+                ModalResult::Cancel
+            };
+            if let Some(signal) = finish_modal(ctx.state, ctx.engine, frame, result)? {
+                return Err(signal.into());
+            }
+        }
         return finish(ctx.engine, win32_id);
     }
 
@@ -286,9 +297,14 @@ pub fn handle_shell_about_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         // runtime — it drops the shared state lock, runs the bridge on this
         // guest thread, and the engine's re-execution of the fake API
         // re-enters this handler. Reuses MessageBoxRequest as-is: an About box
-        // is exactly caption + text + MB_OK.
-        ctx.state.window_state().pending_native_message_box =
-            Some(PendingNativeMessageBox { pick: None });
+        // is exactly caption + text + MB_OK. The alert is a modal session
+        // (same frame protocol as MessageBoxA/W).
+        let owner = ctx.state.window_state().active_window_handle.as_u64();
+        let (frame, _signal) = ModalFrame::activate(ctx.state, ctx.engine, owner, None, &[])?;
+        ctx.state.window_state().pending_native_message_box = Some(PendingNativeMessageBox {
+            pick: None,
+            frame: Some(frame),
+        });
         return Err(WinApiControlSignal::MessageBoxBridgeRequested {
             request: MessageBoxRequest {
                 caption: app_name,

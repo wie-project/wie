@@ -25,10 +25,7 @@ pub use class::{
     handle_unregister_class_w, handle_validate_rect,
 };
 pub(crate) use synth::erase_window_background;
-use synth::{
-    message_matches_filter, note_wm_quit_consumed, retarget_keyboard_messages,
-    synthesize_idle_messages,
-};
+use synth::{message_matches_filter, retarget_keyboard_messages, synthesize_idle_messages};
 
 /// Handles `USER32.dll!PeekMessageA`.
 pub fn handle_peek_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -93,9 +90,6 @@ pub fn handle_peek_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
                 .cloned()
                 .context("PeekMessageA matching index vanished")?
         };
-        if w_remove_msg != 0 && queued.message == WM_QUIT {
-            note_wm_quit_consumed(state);
-        }
         tracing::debug!(
             target: "wiegui",
             message = queued.message,
@@ -132,9 +126,6 @@ pub fn handle_peek_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
                 .context("PeekMessageA synthesized index vanished")?
         };
         drop(queue);
-        if w_remove_msg != 0 && queued.message == WM_QUIT {
-            note_wm_quit_consumed(state);
-        }
         tracing::debug!(
             target: "wiegui",
             message = queued.message,
@@ -467,9 +458,6 @@ pub fn handle_get_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         let mut queue = state.lock_message_queue();
         let queued = queue.messages.remove(index);
         drop(queue);
-        if queued.message == WM_QUIT {
-            note_wm_quit_consumed(state);
-        }
 
         tracing::debug!(
             target: "wiegui",
@@ -499,9 +487,6 @@ pub fn handle_get_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         };
         let queued = queue.messages.remove(synthesized_index);
         drop(queue);
-        if queued.message == WM_QUIT {
-            note_wm_quit_consumed(state);
-        }
         tracing::debug!(
             target: "wiegui",
             message = queued.message,

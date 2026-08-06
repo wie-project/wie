@@ -1,10 +1,10 @@
 use super::{
     Context, DIALOG_BASE_UNIT_X, DIALOG_BASE_UNIT_Y, FAKE_CURSOR_HANDLE, FAKE_ICON_HANDLE,
-    FAKE_IMAGE_HANDLE, HandlerContext, IDCANCEL, IDOK, Result, TimerRecord, WinApiHandlerResult,
-    WinApiState, WindowClassRecord, WindowsHookRecord, checked_address,
-    dispatch_control_proc_host_default, low_i32, read_guest_ansi_lossy, read_guest_utf16_lossy,
-    read_i32, read_u64, register_window_class, with_typed_read, write_guest_ansi_c_string,
-    write_guest_utf16_c_string,
+    FAKE_IMAGE_HANDLE, HandlerContext, IDCANCEL, IDOK, ModalFrame, ModalResult, Result,
+    TimerRecord, WinApiHandlerResult, WinApiState, WindowClassRecord, WindowsHookRecord,
+    checked_address, dispatch_control_proc_host_default, finish_modal, low_i32,
+    read_guest_ansi_lossy, read_guest_utf16_lossy, read_i32, read_u64, register_window_class,
+    with_typed_read, write_guest_ansi_c_string, write_guest_utf16_c_string,
 };
 use crate::guest_layout::WndClassEx;
 use crate::state::{MessageBoxRequest, PendingNativeMessageBox};
@@ -322,12 +322,24 @@ fn message_box_result(
     api_name: &str,
 ) -> Result<WinApiHandlerResult> {
     // Re-entry: the runtime ran the bridge WITHOUT the shared state lock and
-    // recorded the user's choice; hand it to the guest.
+    // recorded the user's choice; hand it to the guest. The native alert was a
+    // modal session (the first entry opened the frame): close it — depth down,
+    // owner restored + invalidated — before returning the id.
     if let Some(pending) = ctx.state.window_state().pending_native_message_box.take() {
         let win32_id = pending
             .pick
             .and_then(|id| u64::try_from(id).ok())
             .unwrap_or(IDCANCEL);
+        if let Some(frame) = pending.frame {
+            let result = if win32_id == IDCANCEL {
+                ModalResult::Cancel
+            } else {
+                ModalResult::Ok(win32_id)
+            };
+            if let Some(signal) = finish_modal(ctx.state, ctx.engine, frame, result)? {
+                return Err(signal.into());
+            }
+        }
         return finish_message_box(ctx, win32_id);
     }
 
@@ -339,9 +351,16 @@ fn message_box_result(
         // First entry: record the write-back slot and hand the request to the
         // runtime — it drops the shared state lock, runs the bridge on this
         // guest thread, and the engine's re-execution of the fake API
-        // re-enters this handler (see `PendingNativeMessageBox`).
-        ctx.state.window_state().pending_native_message_box =
-            Some(PendingNativeMessageBox { pick: None });
+        // re-enters this handler (see `PendingNativeMessageBox`). The alert is
+        // modal (an empty GetMessage must keep yielding while it is up) and
+        // the owner is captured for the re-entry's restore — a MessageBox
+        // opened from a dialog proc must not corrupt that dialog's depth.
+        let owner = ctx.state.window_state().active_window_handle.as_u64();
+        let (frame, _signal) = ModalFrame::activate(ctx.state, ctx.engine, owner, None, &[])?;
+        ctx.state.window_state().pending_native_message_box = Some(PendingNativeMessageBox {
+            pick: None,
+            frame: Some(frame),
+        });
         return Err(WinApiControlSignal::MessageBoxBridgeRequested {
             request: MessageBoxRequest {
                 caption: caption.to_owned(),

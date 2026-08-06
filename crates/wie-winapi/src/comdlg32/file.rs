@@ -13,9 +13,10 @@ use crate::state::{
 };
 use crate::user32::controls::{ControlClassKind, ControlState};
 use crate::user32::{
-    BS_DEFPUSHBUTTON, CreateWindowRequest, GuestCallbackRequest, IDCANCEL, IDOK, WS_CHILD,
-    WS_CLIPCHILDREN, WS_TABSTOP, WS_VISIBLE, WinApiControlSignal, WindowClassIdentifier,
-    activate_modal_dialog, create_window_record, find_window, find_window_mut, window_client_size,
+    BS_DEFPUSHBUTTON, CreateWindowRequest, GuestCallbackRequest, IDCANCEL, IDOK, ModalFrame,
+    ModalResult, WS_CHILD, WS_CLIPCHILDREN, WS_TABSTOP, WS_VISIBLE, WinApiControlSignal,
+    WindowClassIdentifier, create_window_record, find_window, find_window_mut, finish_modal,
+    window_client_size,
 };
 use crate::vfs::VolumeConfig;
 use crate::{FileDialogPolicy, HandlerContext, OuterReturn, WinApiHandlerResult, WinApiState};
@@ -756,13 +757,18 @@ fn open_host_file_dialog(
     // The dialog is modal: an empty GetMessage must yield, not synthesize the
     // regression-mode WM_QUIT, and the dialog takes activation. The path EDIT
     // gets the initial keyboard focus (host-side WM_SETFOCUS).
-    let _unused = activate_modal_dialog(
+    let (frame, _signal) = ModalFrame::activate(
         state,
         engine,
         dialog_hwnd,
         Some(edit_hwnd),
         &[dialog_hwnd, edit_hwnd, list_hwnd, ok_hwnd, cancel_hwnd],
     )?;
+    // Store the frame so EndDialog's shared teardown can finish this session.
+    state
+        .window_state()
+        .modal_frames
+        .insert(Hwnd::from(dialog_hwnd), frame);
 
     tracing::info!(
         target: "wiegui",
@@ -884,7 +890,11 @@ fn open_host_file_dialog_via_bridge(
     // Record the write-back metadata and hand the request to the runtime: it
     // drops the shared state lock, runs the bridge on this guest thread, and
     // the engine's re-execution of the fake API re-enters this handler (see
-    // `PendingNativeFileDialog`).
+    // `PendingNativeFileDialog`). The panel is a modal session too: open the
+    // frame (depth up, activation captured) so the re-entry's `finish_modal`
+    // restores the owner.
+    let owner = state.window_state().active_window_handle.as_u64();
+    let (frame, _signal) = ModalFrame::activate(state, engine, owner, None, &[])?;
     state.window_state().pending_native_file_dialog = Some(PendingNativeFileDialog {
         ofn_ptr: buffer.ofn_ptr,
         file_buffer_ptr: buffer.file_buffer_ptr,
@@ -893,6 +903,7 @@ fn open_host_file_dialog_via_bridge(
         max_file_title: buffer.max_file_title,
         unicode,
         pick: None,
+        frame: Some(frame),
     });
 
     Err(WinApiControlSignal::FileDialogBridgeRequested { request }.into())
@@ -915,10 +926,11 @@ fn finish_native_file_dialog(
     api_name: &str,
     pending: PendingNativeFileDialog,
 ) -> Result<WinApiHandlerResult> {
+    let frame = pending.frame;
     let Some(pick) = pending.pick else {
         state.window_state().comm_dlg_extended_error = CDERR_NONE;
         tracing::info!(api = api_name, "native file dialog cancelled");
-        return file_dialog_return(engine, api_name, 0);
+        return finish_file_bridge(engine, state, api_name, frame, 0);
     };
 
     // The consent boundary. An in-bottle pick maps through the volumes (the
@@ -952,7 +964,7 @@ fn finish_native_file_dialog(
              not a mountable file (an Open pick must name an existing file) — \
              refusing with FNERR_INVALIDFILENAME",
         );
-        return file_dialog_return(engine, api_name, 0);
+        return finish_file_bridge(engine, state, api_name, frame, 0);
     };
 
     if pending.file_buffer_ptr == 0 || pending.max_file == 0 {
@@ -961,7 +973,7 @@ fn finish_native_file_dialog(
             api = api_name,
             "file dialog bridge accepted but lpstrFile/nMaxFile invalid"
         );
-        return file_dialog_return(engine, api_name, 0);
+        return finish_file_bridge(engine, state, api_name, frame, 0);
     }
 
     // The shared write-back (`write_selected_path` — the same machinery the
@@ -993,7 +1005,30 @@ fn finish_native_file_dialog(
         ret = 1,
         "native file dialog accepted"
     );
-    file_dialog_return(engine, api_name, 1)
+    finish_file_bridge(engine, state, api_name, frame, 1)
+}
+
+/// Finish the native bridge's modal frame (opened at the first entry) and
+/// return `value` from the file dialog — every native re-entry tail, accept
+/// or refuse, closes the frame the same way.
+fn finish_file_bridge(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+    api_name: &str,
+    frame: Option<ModalFrame>,
+    value: u64,
+) -> Result<WinApiHandlerResult> {
+    if let Some(frame) = frame {
+        let result = if value == 0 {
+            ModalResult::Cancel
+        } else {
+            ModalResult::Ok(value)
+        };
+        if let Some(signal) = finish_modal(state, engine, frame, result)? {
+            return Err(signal.into());
+        }
+    }
+    file_dialog_return(engine, api_name, value)
 }
 
 /// Build a `WinApiHandlerResult` that returns `value` from the API.

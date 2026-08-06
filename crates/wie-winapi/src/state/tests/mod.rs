@@ -698,6 +698,7 @@ mod kernel32_tests;
 mod listbox;
 mod menu;
 mod message_box;
+mod modal_frame;
 mod ole_auto;
 mod registry;
 mod repaint;

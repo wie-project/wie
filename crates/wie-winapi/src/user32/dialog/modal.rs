@@ -4,16 +4,16 @@
 //! dialog window (parented to the owner so it composites into the owner's
 //! present surface) plus one child `WindowRecord` per template item, sends
 //! `WM_INITDIALOG` to the guest dialog proc through the callback bridge, and
-//! bumps the queue's dialog depth.
+//! bumps the queue's dialog depth (via the shared [`ModalFrame::activate`]).
 //!
 //! `EndDialog` writes the result into the fixed guest dialog-result slot,
 //! posts `WM_QUIT` (the stub's loop exits on it), removes the dialog subtree
-//! and invalidates the owner so its next repaint erases the region.
+//! — the per-site tail — and hands the shared bookkeeping (depth down,
+//! activation/focus restore, owner invalidation) to [`finish_modal`].
 
 use anyhow::{Context, Result};
 
 use crate::OuterReturn;
-use crate::state::WindowFlags;
 use crate::user32::{
     BS_DEFPUSHBUTTON, CreateWindowRequest, GuestCallbackRequest, HandlerContext,
     QueuedWindowMessage, WM_INITDIALOG, WM_QUIT, WS_CHILD, WS_CLIPCHILDREN, WS_TABSTOP, WS_VISIBLE,
@@ -23,8 +23,8 @@ use crate::user32::{
 };
 use wie_pe::resources::{DialogItemTemplate, DialogTemplate, ItemClass};
 
-use super::activate_modal_dialog;
 use super::template::resolve_template;
+use super::{ModalFrame, ModalResult, finish_modal};
 
 /// Handles `USER32.dll!CreateDialogParamA`.
 pub fn handle_create_dialog_param_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -102,13 +102,19 @@ fn handle_create_dialog_param_impl(
     // keystrokes land on the dialog instead of the owner and GetFocus() reads
     // a control.
     let first_tabstop = first_tabstop_child(state, dialog_hwnd);
-    let _unused = activate_modal_dialog(
+    let (frame, _signal) = ModalFrame::activate(
         state,
         engine,
         dialog_hwnd,
         (first_tabstop != 0).then_some(first_tabstop),
         &subtree,
     )?;
+    // Store the frame so EndDialog's shared teardown (`finish_modal`) can
+    // restore the owner and the focus when this dialog closes.
+    state
+        .window_state()
+        .modal_frames
+        .insert(crate::handles::Hwnd::from(dialog_hwnd), frame);
 
     if dialog_proc == 0 {
         // No dialog proc: nothing to bridge, the dialog just exists.
@@ -350,8 +356,7 @@ pub fn handle_end_dialog(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
             drop(engine.mem_write(result_va, &low.to_le_bytes()));
         }
 
-        // Post WM_QUIT — the modal stub's GetMessage loop exits on it. The
-        // dialog depth is decremented when that WM_QUIT is consumed.
+        // Post WM_QUIT — the modal stub's GetMessage loop exits on it.
         {
             let mut queue = state.lock_message_queue();
             let time = queue.next_message_time;
@@ -367,17 +372,37 @@ pub fn handle_end_dialog(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
             });
         }
 
-        // Remove the dialog subtree, then rerender the WHOLE window in one
-        // cycle: invalidate the owner (with erase, so the class brush
-        // repaints its background over the dialog region) and every remaining
-        // descendant (so controls repaint over the dialog face too — no
-        // piecemeal per-control disappearance, no patchy background).
-        let owner = remove_dialog_subtree(state, dialog_hwnd);
-        if let Some(window) = find_window_mut(state, owner) {
-            window.invalidated = true;
-            window.flags.insert(WindowFlags::ERASE_BACKGROUND);
+        // Remove the dialog subtree (the per-site tail). The owner rerender
+        // that used to live here (erase + full-subtree invalidation) moved
+        // into finish_modal below — the shared down half.
+        let _owner = remove_dialog_subtree(state, dialog_hwnd);
+
+        // Shared "down" half: dialog depth down, activation restored to the
+        // owner, focus handed back when the dialog took it, and the owner
+        // invalidated with the erase pattern so its next repaint erases the
+        // dialog region. The frame was stored by the builder's activate. The
+        // result-slot write + WM_QUIT ordering above is pinned by the dialog
+        // micro-suite — the quit is already queued when a bridged focus
+        // message (below) runs, so the modal loop still exits afterwards.
+        let modal_result = if result == 0 {
+            ModalResult::Cancel
+        } else {
+            ModalResult::Ok(result)
+        };
+        if let Some(frame) = state
+            .window_state()
+            .modal_frames
+            .remove(&crate::handles::Hwnd::from(dialog_hwnd))
+        {
+            if let Some(signal) = finish_modal(state, engine, frame, modal_result)? {
+                return Err(signal.into());
+            }
+        } else {
+            // No frame (a hand-built dialog or a double close): still balance
+            // the depth so a stale depth cannot swallow the next command.
+            let mut queue = state.lock_message_queue();
+            queue.dialog_depth = queue.dialog_depth.saturating_sub(1);
         }
-        invalidate_subtree(state, crate::handles::Hwnd::from(owner));
 
         1
     } else {
@@ -413,25 +438,4 @@ fn remove_dialog_subtree(state: &mut WinApiState, dialog_hwnd: u64) -> u64 {
         state.window_state().control_states.remove(&hwnd);
     }
     owner
-}
-
-/// Mark `hwnd` and every descendant invalidated so the next paint cycle
-/// repaints the whole subtree in one pass — the full-window rerender after a
-/// modal dialog closes (the dialog composited into the owner surface, so the
-/// owner background and all remaining controls must repaint over its region).
-fn invalidate_subtree(state: &mut WinApiState, hwnd: crate::handles::Hwnd) {
-    if let Some(window) = find_window_mut(state, hwnd.as_u64()) {
-        window.invalidated = true;
-    }
-    let mut frontier: Vec<crate::handles::Hwnd> = vec![hwnd];
-    while !frontier.is_empty() {
-        let mut next: Vec<crate::handles::Hwnd> = Vec::new();
-        for window in &mut state.window_state().windows {
-            if frontier.contains(&window.parent_handle) {
-                window.invalidated = true;
-                next.push(window.handle);
-            }
-        }
-        frontier = next;
-    }
 }

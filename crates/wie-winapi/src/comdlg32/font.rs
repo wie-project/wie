@@ -11,9 +11,9 @@ use crate::handles::Hwnd;
 use crate::state::FontDialogSession;
 use crate::user32::controls::{ControlClassKind, ControlState};
 use crate::user32::{
-    BS_DEFPUSHBUTTON, CreateWindowRequest, GuestCallbackRequest, IDCANCEL, IDOK, WS_CLIPCHILDREN,
-    WS_VISIBLE, WinApiControlSignal, WindowClassIdentifier, activate_modal_dialog,
-    create_window_record, find_window_mut, window_client_size,
+    BS_DEFPUSHBUTTON, CreateWindowRequest, GuestCallbackRequest, IDCANCEL, IDOK, ModalFrame,
+    WS_CLIPCHILDREN, WS_VISIBLE, WinApiControlSignal, WindowClassIdentifier, create_window_record,
+    find_window_mut, window_client_size,
 };
 use crate::{FontDialogPolicy, HandlerContext, OuterReturn, WinApiHandlerResult, WinApiState};
 use anyhow::{Context, Result};
@@ -484,7 +484,7 @@ fn open_host_font_dialog(ctx: &mut HandlerContext<'_>, cf_ptr: u64) -> Result<Wi
     // The dialog is modal: an empty GetMessage must yield, and the dialog
     // takes activation. The family LISTBOX gets the initial keyboard focus
     // (host-side WM_SETFOCUS).
-    let _unused = activate_modal_dialog(
+    let (frame, _signal) = ModalFrame::activate(
         state,
         engine,
         dialog_hwnd,
@@ -497,6 +497,11 @@ fn open_host_font_dialog(ctx: &mut HandlerContext<'_>, cf_ptr: u64) -> Result<Wi
             underline_hwnd,
         ],
     )?;
+    // Store the frame so EndDialog's shared teardown can finish this session.
+    state
+        .window_state()
+        .modal_frames
+        .insert(Hwnd::from(dialog_hwnd), frame);
 
     // A freshly created dialog is a visible change: bump the content revision
     // so the idle reconcile republishes its first painted frame.

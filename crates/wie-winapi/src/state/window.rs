@@ -1,6 +1,7 @@
 //! Window, UI, hook, timer, resource, and control-signal state types.
 
 use crate::gdi32::PageCanvas;
+use crate::user32::dialog::ModalFrame;
 use crate::vfs;
 use ahash::HashMapExt;
 
@@ -86,6 +87,11 @@ pub struct PendingNativeMessageBox {
     /// bridge never answered (it vanished mid-call — a racing teardown must
     /// not hang the guest); the handler falls back to IDCANCEL.
     pub pick: Option<i32>,
+    /// The modal frame opened at the first entry (`ModalFrame::activate`),
+    /// finished by `finish_modal` on the re-entry — the native alert is a
+    /// modal session too, and while the guest is parked the queue must stay
+    /// modal (a nested dialog's depth must not be corrupted).
+    pub(crate) frame: Option<ModalFrame>,
 }
 
 /// One in-flight NATIVE (host-panel) file dialog.
@@ -115,6 +121,8 @@ pub struct PendingNativeFileDialog {
     /// The bridge's pick (the runtime records it; `None` = user cancelled or
     /// the bridge vanished mid-call).
     pub pick: Option<FileDialogPick>,
+    /// The modal frame opened at the first entry, finished on the re-entry.
+    pub(crate) frame: Option<ModalFrame>,
 }
 
 /// One in-flight NATIVE (host-panel) print dialog.
@@ -144,6 +152,8 @@ pub struct PendingNativePrintDialog {
     /// The bridge's pick (the runtime records it; `None` = user cancelled or
     /// the bridge vanished mid-call).
     pub pick: Option<PrintDialogPick>,
+    /// The modal frame opened at the first entry, finished on the re-entry.
+    pub(crate) frame: Option<ModalFrame>,
 }
 
 /// One in-flight NATIVE (host-panel) page-setup dialog.
@@ -171,6 +181,8 @@ pub struct PendingNativePageSetup {
     /// The bridge's pick (the runtime records it; `None` = user cancelled or
     /// the bridge vanished mid-call).
     pub pick: Option<PageSetupDialogPick>,
+    /// The modal frame opened at the first entry, finished on the re-entry.
+    pub(crate) frame: Option<ModalFrame>,
 }
 
 /// Host file-dialog callback: `(request) → pick, or `None` (user cancelled)`.
@@ -625,6 +637,13 @@ pub struct WindowState {
     /// `EndDialog` writes the result here; the in-guest `DialogBoxParam` stub
     /// reads it after its `WM_QUIT`. Zero when no dialog machinery is wired.
     pub dialog_result_va: u64,
+    /// In-flight modal frames keyed by the modal window (dialog) handle.
+    ///
+    /// Set by the modal builders' [`ModalFrame::activate`] and consumed by
+    /// `EndDialog`'s `finish_modal` when the modal closes. The native-bridge
+    /// families carry their frame in the pending-bridge record instead (they
+    /// have no guest window to key by).
+    pub(crate) modal_frames: ahash::HashMap<crate::handles::Hwnd, ModalFrame>,
 }
 
 impl WindowState {
@@ -679,6 +698,7 @@ impl Default for WindowState {
     fn default() -> Self {
         Self {
             dialog_result_va: 0,
+            modal_frames: ahash::HashMap::new(),
             next_window_class_atom: 0xC000,
             next_window_handle: crate::handles::Hwnd::from(0x0000_0000_6610_0000),
             next_menu_handle: crate::handles::Hmenu::from(0x0000_0000_6620_0000),

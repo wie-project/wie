@@ -9,6 +9,7 @@ use crate::state::{
     PageSetupDialogRequest, PendingNativePageSetup, PendingNativePrintDialog, PrintDialogPick,
     PrintDialogRequest,
 };
+use crate::user32::{ModalFrame, ModalResult, finish_modal};
 use crate::{
     HandlerContext, PageSetupDialogPolicy, PrintDialogPolicy, WinApiControlSignal,
     WinApiHandlerResult, WinApiState,
@@ -451,6 +452,9 @@ fn open_native_print_dialog(
         flags: pd.flags,
         print_info_id,
         pick: None,
+        // The native panel is a modal session: open the frame (depth up, the
+        // active window captured) so the re-entry's finish_modal restores it.
+        frame: Some(open_native_bridge_frame(state, engine)?),
     });
 
     tracing::info!(
@@ -463,6 +467,19 @@ fn open_native_print_dialog(
     );
 
     Err(WinApiControlSignal::PrintDialogBridgeRequested { request }.into())
+}
+
+/// Open the modal frame for a native panel launch: the panel is a modal
+/// session (the queue stays modal while the guest is parked), keyed by the
+/// window that was active when it opened — restored + invalidated by the
+/// re-entry's `finish_modal`.
+fn open_native_bridge_frame(
+    state: &mut WinApiState,
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> anyhow::Result<ModalFrame> {
+    let owner = state.window_state().active_window_handle.as_u64();
+    let (frame, _signal) = ModalFrame::activate(state, engine, owner, None, &[])?;
+    Ok(frame)
 }
 
 /// Write the native panel's pick back into the guest `PRINTDLG`.
@@ -479,16 +496,17 @@ fn finish_native_print_dialog(
     state: &mut WinApiState,
     pending: PendingNativePrintDialog,
 ) -> Result<WinApiHandlerResult> {
+    let frame = pending.frame;
     let Some(pick) = pending.pick else {
         state_comm_dlg_none(state);
         tracing::info!("native print dialog cancelled");
-        return print_dialog_return(engine, 0);
+        return finish_print_bridge(engine, state, frame, 0);
     };
 
     if pending.flags & PD_RETURNDC == 0 {
         state_comm_dlg_none(state);
         tracing::warn!("PrintDlgW bridge accepted but PD_RETURNDC not set; cancelling");
-        return print_dialog_return(engine, 0);
+        return finish_print_bridge(engine, state, frame, 0);
     }
 
     // PD_RETURNDC: allocate the print DC and apply the pick to its job, so
@@ -518,7 +536,7 @@ fn finish_native_print_dialog(
     if dev_mode_va == 0 || dev_names_va == 0 {
         state_comm_dlg_none(state);
         tracing::warn!("PrintDlgW: DEVMODE/DEVNAMES allocation failed; cancelling");
-        return print_dialog_return(engine, 0);
+        return finish_print_bridge(engine, state, frame, 0);
     }
 
     // Snapshot the PRINTDLG, edit the write-back fields (hDC, nCopies, the
@@ -547,7 +565,29 @@ fn finish_native_print_dialog(
         "PrintDlgW accepted; print DC allocated"
     );
 
-    print_dialog_return(engine, 1)
+    finish_print_bridge(engine, state, frame, 1)
+}
+
+/// Finish the native bridge's modal frame (opened at the first entry) and
+/// return `value` from the print/page-setup dialog — every re-entry tail,
+/// accept or cancel, closes the frame the same way.
+fn finish_print_bridge(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+    frame: Option<ModalFrame>,
+    value: u64,
+) -> Result<WinApiHandlerResult> {
+    if let Some(frame) = frame {
+        let result = if value == 0 {
+            ModalResult::Cancel
+        } else {
+            ModalResult::Ok(value)
+        };
+        if let Some(signal) = finish_modal(state, engine, frame, result)? {
+            return Err(signal.into());
+        }
+    }
+    print_dialog_return(engine, value)
 }
 
 /// Build a `WinApiHandlerResult` that returns `value` from PrintDlgW.
@@ -733,6 +773,9 @@ fn open_native_page_setup_dialog(
         h_dev_names_in: psd.h_dev_names,
         flags: psd.flags,
         pick: None,
+        // The native panel is a modal session: open the frame (depth up, the
+        // active window captured) so the re-entry's finish_modal restores it.
+        frame: Some(open_native_bridge_frame(state, engine)?),
     });
 
     tracing::info!(
@@ -761,10 +804,11 @@ fn finish_native_page_setup(
     state: &mut WinApiState,
     pending: PendingNativePageSetup,
 ) -> Result<WinApiHandlerResult> {
+    let frame = pending.frame;
     let Some(pick) = pending.pick else {
         state_comm_dlg_none(state);
         tracing::info!("native page-setup dialog cancelled");
-        return print_dialog_return(engine, 0);
+        return finish_print_bridge(engine, state, frame, 0);
     };
 
     // The DEVMODE/DEVNAMES round-trip (the same helpers the print panel
@@ -783,7 +827,7 @@ fn finish_native_page_setup(
     if dev_mode_va == 0 || dev_names_va == 0 {
         state_comm_dlg_none(state);
         tracing::warn!("PageSetupDlgW: DEVMODE/DEVNAMES allocation failed; cancelling");
-        return print_dialog_return(engine, 0);
+        return finish_print_bridge(engine, state, frame, 0);
     }
 
     // Snapshot the PAGESETUPDLG, edit the write-back fields (ptPaperSize in
@@ -813,7 +857,7 @@ fn finish_native_page_setup(
         "PageSetupDlgW accepted; paper/orientation written back"
     );
 
-    print_dialog_return(engine, 1)
+    finish_print_bridge(engine, state, frame, 1)
 }
 
 /// The paper size in the units `PAGESETUPDLG.ptPaperSize` uses: hundredths of
