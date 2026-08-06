@@ -1,10 +1,10 @@
 use super::{
     Context, DIALOG_BASE_UNIT_X, DIALOG_BASE_UNIT_Y, FAKE_CURSOR_HANDLE, FAKE_ICON_HANDLE,
-    FAKE_IMAGE_HANDLE, HandlerContext, IDCANCEL, IDOK, ModalFrame, ModalResult, Result,
+    FAKE_IMAGE_HANDLE, HandlerContext, IDCANCEL, IDOK, ModalResult, NativePanelKind, Result,
     TimerRecord, WinApiHandlerResult, WinApiState, WindowClassRecord, WindowsHookRecord,
-    checked_address, dispatch_control_proc_host_default, finish_modal, low_i32,
-    read_guest_ansi_lossy, read_guest_utf16_lossy, read_i32, read_u64, register_window_class,
-    with_typed_read, write_guest_ansi_c_string, write_guest_utf16_c_string,
+    checked_address, dispatch_control_proc_host_default, finish_native_panel, low_i32,
+    open_native_panel, read_guest_ansi_lossy, read_guest_utf16_lossy, read_i32, read_u64,
+    register_window_class, with_typed_read, write_guest_ansi_c_string, write_guest_utf16_c_string,
 };
 use crate::guest_layout::WndClassEx;
 use crate::state::{MessageBoxRequest, PendingNativeMessageBox};
@@ -330,15 +330,13 @@ fn message_box_result(
             .pick
             .and_then(|id| u64::try_from(id).ok())
             .unwrap_or(IDCANCEL);
-        if let Some(frame) = pending.frame {
-            let result = if win32_id == IDCANCEL {
-                ModalResult::Cancel
-            } else {
-                ModalResult::Ok(win32_id)
-            };
-            if let Some(signal) = finish_modal(ctx.state, ctx.engine, frame, result)? {
-                return Err(signal.into());
-            }
+        let result = if win32_id == IDCANCEL {
+            ModalResult::Cancel
+        } else {
+            ModalResult::Ok(win32_id)
+        };
+        if let Some(signal) = finish_native_panel(ctx.state, ctx.engine, pending.frame, result)? {
+            return Err(signal.into());
         }
         return finish_message_box(ctx, win32_id);
     }
@@ -355,11 +353,13 @@ fn message_box_result(
         // modal (an empty GetMessage must keep yielding while it is up) and
         // the owner is captured for the re-entry's restore — a MessageBox
         // opened from a dialog proc must not corrupt that dialog's depth.
-        let owner = ctx.state.window_state().active_window_handle.as_u64();
-        let (frame, _signal) = ModalFrame::activate(ctx.state, ctx.engine, owner, None, &[])?;
         ctx.state.window_state().pending_native_message_box = Some(PendingNativeMessageBox {
             pick: None,
-            frame: Some(frame),
+            frame: Some(open_native_panel(
+                ctx.state,
+                ctx.engine,
+                NativePanelKind::MessageBox,
+            )?),
         });
         return Err(WinApiControlSignal::MessageBoxBridgeRequested {
             request: MessageBoxRequest {

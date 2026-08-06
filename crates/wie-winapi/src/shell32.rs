@@ -3,7 +3,9 @@
 use crate::guest_memory::{read_u64, write_u32 as write_guest_u32};
 use crate::guest_string::{read_utf16_lossy, write_utf16_c_string};
 use crate::state::{MessageBoxRequest, PendingNativeMessageBox, WinApiControlSignal, WindowFlags};
-use crate::user32::{IDOK, ModalFrame, ModalResult, find_window_mut, finish_modal};
+use crate::user32::{
+    IDOK, ModalResult, NativePanelKind, find_window_mut, finish_native_panel, open_native_panel,
+};
 use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 use anyhow::{Context, Result};
 
@@ -275,15 +277,13 @@ pub fn handle_shell_about_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
             .pick
             .and_then(|id| u64::try_from(id).ok())
             .unwrap_or(IDOK);
-        if let Some(frame) = pending.frame {
-            let result = if win32_id == IDOK {
-                ModalResult::Ok(win32_id)
-            } else {
-                ModalResult::Cancel
-            };
-            if let Some(signal) = finish_modal(ctx.state, ctx.engine, frame, result)? {
-                return Err(signal.into());
-            }
+        let result = if win32_id == IDOK {
+            ModalResult::Ok(win32_id)
+        } else {
+            ModalResult::Cancel
+        };
+        if let Some(signal) = finish_native_panel(ctx.state, ctx.engine, pending.frame, result)? {
+            return Err(signal.into());
         }
         return finish(ctx.engine, win32_id);
     }
@@ -299,11 +299,13 @@ pub fn handle_shell_about_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         // re-enters this handler. Reuses MessageBoxRequest as-is: an About box
         // is exactly caption + text + MB_OK. The alert is a modal session
         // (same frame protocol as MessageBoxA/W).
-        let owner = ctx.state.window_state().active_window_handle.as_u64();
-        let (frame, _signal) = ModalFrame::activate(ctx.state, ctx.engine, owner, None, &[])?;
         ctx.state.window_state().pending_native_message_box = Some(PendingNativeMessageBox {
             pick: None,
-            frame: Some(frame),
+            frame: Some(open_native_panel(
+                ctx.state,
+                ctx.engine,
+                NativePanelKind::ShellAbout,
+            )?),
         });
         return Err(WinApiControlSignal::MessageBoxBridgeRequested {
             request: MessageBoxRequest {

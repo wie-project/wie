@@ -87,8 +87,9 @@ pub struct PendingNativeMessageBox {
     /// bridge never answered (it vanished mid-call — a racing teardown must
     /// not hang the guest); the handler falls back to IDCANCEL.
     pub pick: Option<i32>,
-    /// The modal frame opened at the first entry (`ModalFrame::activate`),
-    /// finished by `finish_modal` on the re-entry — the native alert is a
+    /// The modal frame opened at the first entry
+    /// (`crate::user32::dialog::open_native_panel`), finished by
+    /// `finish_native_panel` on the re-entry — the native alert is a
     /// modal session too, and while the guest is parked the queue must stay
     /// modal (a nested dialog's depth must not be corrupted).
     pub(crate) frame: Option<ModalFrame>,
@@ -121,7 +122,9 @@ pub struct PendingNativeFileDialog {
     /// The bridge's pick (the runtime records it; `None` = user cancelled or
     /// the bridge vanished mid-call).
     pub pick: Option<FileDialogPick>,
-    /// The modal frame opened at the first entry, finished on the re-entry.
+    /// The modal frame opened at the first entry
+    /// (`crate::user32::dialog::open_native_panel`), finished by
+    /// `finish_native_panel` on the re-entry.
     pub(crate) frame: Option<ModalFrame>,
 }
 
@@ -152,7 +155,9 @@ pub struct PendingNativePrintDialog {
     /// The bridge's pick (the runtime records it; `None` = user cancelled or
     /// the bridge vanished mid-call).
     pub pick: Option<PrintDialogPick>,
-    /// The modal frame opened at the first entry, finished on the re-entry.
+    /// The modal frame opened at the first entry
+    /// (`crate::user32::dialog::open_native_panel`), finished by
+    /// `finish_native_panel` on the re-entry.
     pub(crate) frame: Option<ModalFrame>,
 }
 
@@ -181,7 +186,9 @@ pub struct PendingNativePageSetup {
     /// The bridge's pick (the runtime records it; `None` = user cancelled or
     /// the bridge vanished mid-call).
     pub pick: Option<PageSetupDialogPick>,
-    /// The modal frame opened at the first entry, finished on the re-entry.
+    /// The modal frame opened at the first entry
+    /// (`crate::user32::dialog::open_native_panel`), finished by
+    /// `finish_native_panel` on the re-entry.
     pub(crate) frame: Option<ModalFrame>,
 }
 

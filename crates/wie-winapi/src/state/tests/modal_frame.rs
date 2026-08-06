@@ -9,7 +9,9 @@
 use super::*;
 use crate::handles::Hwnd;
 use crate::state::WindowFlags;
-use crate::user32::dialog::{ModalFrame, ModalResult, finish_modal};
+use crate::user32::dialog::{
+    ModalFrame, ModalResult, NativePanelKind, finish_modal, finish_native_panel, open_native_panel,
+};
 use crate::user32::{
     CreateWindowRequest, WM_SETFOCUS, WindowClassIdentifier, create_window_record, find_window_mut,
 };
@@ -268,4 +270,45 @@ fn modal_frame_native_bridge_shape_balances_depth_and_owner() {
     assert!(signal.is_none(), "native panels never take guest focus");
     assert_eq!(state.lock_message_queue().dialog_depth, 0);
     assert_eq!(state.window_state().active_window_handle.as_u64(), owner);
+}
+
+/// The shared native-panel pair (`open_native_panel` / `finish_native_panel`)
+/// wraps the native-bridge shape from the test above and balances depth /
+/// activation across the two bridge entries for every kind. A `None` frame (a
+/// bridge that opened no frame) finishes nothing — the depth stays untouched.
+#[test]
+fn native_panel_open_and_finish_balance_depth_and_focus() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let owner = create_top_window(&mut state, "Owner", 0);
+    state.window_state().active_window_handle = Hwnd::from(owner);
+
+    // The bridge first entry: the shared up half opens the frame keyed by the
+    // active window, no focus, no subtree.
+    let frame =
+        open_native_panel(&mut state, &mut engine, NativePanelKind::File).expect("open succeeds");
+    assert_eq!(state.lock_message_queue().dialog_depth, 1);
+    assert_eq!(
+        state.window_state().active_window_handle.as_u64(),
+        owner,
+        "the panel has no guest window; the owner stays active"
+    );
+    assert_eq!(
+        state.window_state().focus_window_handle.as_u64(),
+        0,
+        "native panels never take guest focus"
+    );
+
+    // The bridge re-entry: the shared down half restores depth + activation.
+    let signal = finish_native_panel(&mut state, &mut engine, Some(frame), ModalResult::Ok(1))
+        .expect("finish succeeds");
+    assert!(signal.is_none(), "native panels never take guest focus");
+    assert_eq!(state.lock_message_queue().dialog_depth, 0);
+    assert_eq!(state.window_state().active_window_handle.as_u64(), owner);
+
+    // A bridge that opened no frame finishes nothing: the depth is untouched.
+    let signal = finish_native_panel(&mut state, &mut engine, None, ModalResult::Cancel)
+        .expect("finish with no frame succeeds");
+    assert!(signal.is_none());
+    assert_eq!(state.lock_message_queue().dialog_depth, 0);
 }

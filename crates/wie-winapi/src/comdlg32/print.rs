@@ -9,7 +9,9 @@ use crate::state::{
     PageSetupDialogRequest, PendingNativePageSetup, PendingNativePrintDialog, PrintDialogPick,
     PrintDialogRequest,
 };
-use crate::user32::{ModalFrame, ModalResult, finish_modal};
+use crate::user32::{
+    ModalFrame, ModalResult, NativePanelKind, finish_native_panel, open_native_panel,
+};
 use crate::{
     HandlerContext, PageSetupDialogPolicy, PrintDialogPolicy, WinApiControlSignal,
     WinApiHandlerResult, WinApiState,
@@ -453,8 +455,9 @@ fn open_native_print_dialog(
         print_info_id,
         pick: None,
         // The native panel is a modal session: open the frame (depth up, the
-        // active window captured) so the re-entry's finish_modal restores it.
-        frame: Some(open_native_bridge_frame(state, engine)?),
+        // active window captured) so the re-entry's finish_native_panel
+        // restores it.
+        frame: Some(open_native_panel(state, engine, NativePanelKind::Print)?),
     });
 
     tracing::info!(
@@ -467,19 +470,6 @@ fn open_native_print_dialog(
     );
 
     Err(WinApiControlSignal::PrintDialogBridgeRequested { request }.into())
-}
-
-/// Open the modal frame for a native panel launch: the panel is a modal
-/// session (the queue stays modal while the guest is parked), keyed by the
-/// window that was active when it opened — restored + invalidated by the
-/// re-entry's `finish_modal`.
-fn open_native_bridge_frame(
-    state: &mut WinApiState,
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> anyhow::Result<ModalFrame> {
-    let owner = state.window_state().active_window_handle.as_u64();
-    let (frame, _signal) = ModalFrame::activate(state, engine, owner, None, &[])?;
-    Ok(frame)
 }
 
 /// Write the native panel's pick back into the guest `PRINTDLG`.
@@ -571,21 +561,23 @@ fn finish_native_print_dialog(
 /// Finish the native bridge's modal frame (opened at the first entry) and
 /// return `value` from the print/page-setup dialog — every re-entry tail,
 /// accept or cancel, closes the frame the same way.
+///
+/// The per-kind result mapping stays here: the print/page-setup dialogs
+/// return 0 as a cancel and any other value as an `Ok` result; the shared
+/// down half ([`finish_native_panel`]) does the frame teardown.
 fn finish_print_bridge(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
     frame: Option<ModalFrame>,
     value: u64,
 ) -> Result<WinApiHandlerResult> {
-    if let Some(frame) = frame {
-        let result = if value == 0 {
-            ModalResult::Cancel
-        } else {
-            ModalResult::Ok(value)
-        };
-        if let Some(signal) = finish_modal(state, engine, frame, result)? {
-            return Err(signal.into());
-        }
+    let result = if value == 0 {
+        ModalResult::Cancel
+    } else {
+        ModalResult::Ok(value)
+    };
+    if let Some(signal) = finish_native_panel(state, engine, frame, result)? {
+        return Err(signal.into());
     }
     print_dialog_return(engine, value)
 }
@@ -774,8 +766,13 @@ fn open_native_page_setup_dialog(
         flags: psd.flags,
         pick: None,
         // The native panel is a modal session: open the frame (depth up, the
-        // active window captured) so the re-entry's finish_modal restores it.
-        frame: Some(open_native_bridge_frame(state, engine)?),
+        // active window captured) so the re-entry's finish_native_panel
+        // restores it.
+        frame: Some(open_native_panel(
+            state,
+            engine,
+            NativePanelKind::PageSetup,
+        )?),
     });
 
     tracing::info!(

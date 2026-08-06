@@ -28,10 +28,12 @@ use anyhow::Result;
 
 mod api;
 mod modal;
+mod native;
 mod paint;
 mod proc;
 mod template;
 
+pub(crate) use native::{NativePanelKind, finish_native_panel, open_native_panel};
 pub(crate) use paint::paint_dialog;
 
 /// The unified result contract for a finished modal session.
