@@ -1,10 +1,10 @@
 use super::{
     Context, DIALOG_BASE_UNIT_X, DIALOG_BASE_UNIT_Y, FAKE_CURSOR_HANDLE, FAKE_ICON_HANDLE,
     FAKE_IMAGE_HANDLE, HandlerContext, IDCANCEL, IDOK, Result, TimerRecord, WinApiHandlerResult,
-    WinApiState, WindowClassRecord, WindowsHookRecord, checked_field_address,
-    dispatch_control_proc_host_default, low_i32, read_guest_ansi_lossy, read_guest_i32,
-    read_guest_u64, read_guest_utf16_lossy, register_window_class, with_typed_read,
-    write_guest_ansi_c_string, write_guest_utf16_c_string,
+    WinApiState, WindowClassRecord, WindowsHookRecord, checked_address,
+    dispatch_control_proc_host_default, low_i32, read_guest_ansi_lossy, read_guest_utf16_lossy,
+    read_int, register_window_class, with_typed_read, write_guest_ansi_c_string,
+    write_guest_utf16_c_string,
 };
 use crate::guest_layout::WndClassEx;
 use crate::state::{MessageBoxRequest, PendingNativeMessageBox};
@@ -719,9 +719,9 @@ pub fn handle_set_scroll_info(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     // int  nPos;      20
     // int  nTrackPos; 24
     let return_value = if scroll_info_ptr != 0 {
-        let n_pos = read_guest_i32(
+        let n_pos = read_int::<i32>(
             engine,
-            checked_field_address(scroll_info_ptr, 20, "SCROLLINFO.nPos"),
+            checked_address(scroll_info_ptr, 20, "SCROLLINFO.nPos"),
         )
         .unwrap_or(0);
         // Win32 returns the current scroll-box position after the update.
@@ -1022,7 +1022,7 @@ fn handle_call_window_proc(
     let rsp = engine
         .read_rsp()
         .with_context(|| format!("failed to read RSP for {api_name}"))?;
-    let long_parameter = read_guest_u64(
+    let long_parameter = read_int::<u64>(
         engine,
         rsp.checked_add(0x28)
             .with_context(|| format!("{api_name}: lParam address overflow"))?,

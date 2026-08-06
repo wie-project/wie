@@ -14,10 +14,7 @@ use crate::fake_va::{
     D3d9Iface, Device9Method, Direct3D9Method, IndexBuffer9Method, Surface9Method, Texture9Method,
     VertexBuffer9Method, encode_com,
 };
-use crate::guest_memory::{
-    read_u32 as read_guest_u32, read_u64 as read_guest_u64, write_u32 as write_guest_u32,
-    write_u64 as write_guest_u64,
-};
+use crate::guest_memory::{read_int, write_u32 as write_guest_u32, write_u64 as write_guest_u64};
 use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 
 mod blend;
@@ -545,7 +542,7 @@ pub(crate) fn read_stack_argument(
         .checked_add(offset)
         .with_context(|| format!("{argument_name} stack address overflow"))?;
 
-    read_guest_u64(engine, argument_address)
+    read_int::<u64>(engine, argument_address)
 }
 
 fn normalize_presentation_parameters(
@@ -555,14 +552,14 @@ fn normalize_presentation_parameters(
     focus_window: u64,
 ) -> Result<()> {
     let width =
-        read_guest_u32(engine, parameters_address).context("failed to read BackBufferWidth")?;
+        read_int::<u32>(engine, parameters_address).context("failed to read BackBufferWidth")?;
 
     let height_address = parameters_address
         .checked_add(4)
         .context("BackBufferHeight address overflow")?;
 
     let height =
-        read_guest_u32(engine, height_address).context("failed to read BackBufferHeight")?;
+        read_int::<u32>(engine, height_address).context("failed to read BackBufferHeight")?;
 
     if width == 0 {
         let fallback_width = u32::try_from(state.window_state().window_width)
@@ -586,7 +583,7 @@ fn normalize_presentation_parameters(
         .context("hDeviceWindow address overflow")?;
 
     let device_window =
-        read_guest_u64(engine, device_window_address).context("failed to read hDeviceWindow")?;
+        read_int::<u64>(engine, device_window_address).context("failed to read hDeviceWindow")?;
 
     if device_window == 0 && focus_window != 0 {
         write_guest_u64(engine, device_window_address, focus_window)
@@ -620,19 +617,19 @@ fn init_device_state(
 ) -> Result<()> {
     let d3d = state.d3d9();
     let width =
-        read_guest_u32(engine, parameters_address).context("failed to read BackBufferWidth")?;
+        read_int::<u32>(engine, parameters_address).context("failed to read BackBufferWidth")?;
     let height_address = parameters_address
         .checked_add(4)
         .context("BackBufferHeight address overflow")?;
     let height =
-        read_guest_u32(engine, height_address).context("failed to read BackBufferHeight")?;
+        read_int::<u32>(engine, height_address).context("failed to read BackBufferHeight")?;
 
     // On Win64, hDeviceWindow is at offset 32 (HWND is 64-bit aligned).
     let device_window_address = parameters_address
         .checked_add(32)
         .context("hDeviceWindow address overflow")?;
     let present_hwnd =
-        read_guest_u64(engine, device_window_address).context("failed to read hDeviceWindow")?;
+        read_int::<u64>(engine, device_window_address).context("failed to read hDeviceWindow")?;
 
     // P5c quarter-scale: `WIE_D3D9_SCALE` divides the render resolution by a
     // power of two (4 = quarter-scale). The guest still thinks it rendered at

@@ -2,24 +2,34 @@ use anyhow::{Context, Result};
 use wie_cpu::CpuEngine;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-pub(crate) fn read_i32(engine: &mut dyn wie_cpu::CpuEngine, address: u64) -> Result<i32> {
-    let mut bytes = [0_u8; 4];
-
-    engine
-        .mem_read(address, &mut bytes)
-        .context("failed to read i32 from guest memory")?;
-
-    Ok(i32::from_le_bytes(bytes))
-}
-
-pub(crate) fn read_u64(engine: &mut dyn wie_cpu::CpuEngine, address: u64) -> Result<u64> {
-    let mut bytes = [0_u8; 8];
-
-    engine
-        .mem_read(address, &mut bytes)
-        .context("failed to read u64 from guest memory")?;
-
-    Ok(u64::from_le_bytes(bytes))
+/// Read a little-endian integer (`u8`, `u16`, `u32`, `u64`, or `i32`) from
+/// guest memory.
+///
+/// The width is fixed by the return type (`size_of::<T>()`), so the former
+/// five per-width readers collapse into this one generic. The error context
+/// names the concrete type, keeping the per-width "failed to read u32 from
+/// guest memory" messages.
+pub(crate) fn read_int<T>(engine: &mut dyn CpuEngine, address: u64) -> Result<T>
+where
+    T: FromBytes,
+{
+    // One fixed staging buffer covers every integer width this helper is
+    // instantiated with; the active range is sized at runtime, which
+    // sidesteps the const-generic array-length restriction on stable.
+    let mut bytes = [0_u8; 16];
+    let len = std::mem::size_of::<T>();
+    let buf = bytes
+        .get_mut(..len)
+        .ok_or_else(|| anyhow::anyhow!("read_int: width exceeds staging buffer"))?;
+    engine.mem_read(address, buf).with_context(|| {
+        format!(
+            "failed to read {} from guest memory",
+            std::any::type_name::<T>()
+        )
+    })?;
+    // `read_from_bytes` is alignment-agnostic and can only fail on a length
+    // mismatch, which the `size_of::<T>()` buffer makes impossible.
+    T::read_from_bytes(buf).map_err(|_| anyhow::anyhow!("read_int: internal size mismatch"))
 }
 
 pub(crate) fn write_u32(
@@ -57,42 +67,13 @@ pub(crate) fn write_u64(
 /// Guest VAs are checked at allocation time (bounded to <48-bit VA), so
 /// overflow on field-offset computation is a programming error.  Using
 /// `wrapping_add` avoids the checked-branch on every handler memory access.
-#[must_use]
-pub(crate) fn checked_field_address(base: u64, offset: u64, _field_name: &str) -> u64 {
-    base.wrapping_add(offset)
-}
-
-/// Compute a guest VA with wrapping arithmetic.
 ///
-/// See [`checked_field_address`] for rationale.
+/// The `description` argument is unused by the computation; each call site
+/// passes the field or argument the resulting address refers to, which
+/// documents the Win64 ABI slot being accessed.
 #[must_use]
-pub(crate) fn checked_address(base: u64, offset: u64, _context_name: &str) -> u64 {
+pub(crate) fn checked_address(base: u64, offset: u64, _description: &str) -> u64 {
     base.wrapping_add(offset)
-}
-
-pub(crate) fn read_u16(engine: &mut dyn wie_cpu::CpuEngine, address: u64) -> Result<u16> {
-    let mut bytes = [0_u8; 2];
-
-    engine
-        .mem_read(address, &mut bytes)
-        .context("failed to read u16 from guest memory")?;
-
-    Ok(u16::from_le_bytes(bytes))
-}
-
-/// Read a single guest byte.
-///
-/// Used only from `#[cfg(test)]` code (the gdi32 print-lane GetTextMetrics
-/// tests), so it is dead in the non-test lib target; kept for handler code.
-#[cfg_attr(not(test), expect(dead_code))]
-pub(crate) fn read_u8(engine: &mut dyn wie_cpu::CpuEngine, address: u64) -> Result<u8> {
-    let mut bytes = [0_u8; 1];
-
-    engine
-        .mem_read(address, &mut bytes)
-        .context("failed to read u8 from guest memory")?;
-
-    Ok(bytes[0])
 }
 
 pub(crate) fn write_u16(
@@ -103,16 +84,6 @@ pub(crate) fn write_u16(
     engine
         .mem_write(address, &value.to_le_bytes())
         .context("failed to write u16 to guest memory")
-}
-
-pub(crate) fn read_u32(engine: &mut dyn wie_cpu::CpuEngine, address: u64) -> Result<u32> {
-    let mut bytes = [0_u8; 4];
-
-    engine
-        .mem_read(address, &mut bytes)
-        .context("failed to read u32 from guest memory")?;
-
-    Ok(u32::from_le_bytes(bytes))
 }
 
 /// Reads an arbitrary byte slice from guest memory.

@@ -25,7 +25,7 @@
 //! conversions fall through as literals. This is the set notepad's trace
 //! needs; `f`/`e`/`g` floating point is deliberately unsupported (YAGNI).
 
-use crate::guest_memory::read_u64 as read_guest_u64;
+use crate::guest_memory::read_int;
 use crate::{HandlerContext, WinApiHandlerResult};
 use anyhow::Result;
 
@@ -159,7 +159,7 @@ fn emit_text<U: FmtUnit>(out: &mut Vec<U>, width: Option<usize>, left_justify: b
 /// Pull one 8-byte vararg slot from the guest va_list cursor.
 #[inline]
 fn read_vararg(engine: &mut dyn wie_cpu::CpuEngine, va: &mut u64) -> u64 {
-    let v = read_guest_u64(engine, *va).unwrap_or(0);
+    let v = read_int::<u64>(engine, *va).unwrap_or(0);
     *va = va.wrapping_add(8);
     v
 }

@@ -11,7 +11,7 @@ use super::{
     WM_GETFONT, WM_KEYDOWN, WM_KEYUP, WM_MDICREATE, WM_PAINT, WM_QUIT, WM_SETFONT, WM_SYSCHAR,
     WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WinApiControlSignal, WinApiHandlerResult,
     WinApiState, WinMsg, create_mdi_child_from_struct, dispatch_control_proc, find_window,
-    find_window_mut, is_known_window, read_guest_u32, with_typed_read, write_message_structure,
+    find_window_mut, is_known_window, read_int, with_typed_read, write_message_structure,
 };
 use crate::OuterReturn;
 use crate::state::WindowFlags;
@@ -53,7 +53,7 @@ pub fn handle_peek_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     let w_remove_msg = engine
         .read_rsp()
         .ok()
-        .and_then(|rsp| read_guest_u32(engine, rsp.wrapping_add(0x28)).ok())
+        .and_then(|rsp| read_int::<u32>(engine, rsp.wrapping_add(0x28)).ok())
         .unwrap_or(0);
 
     let minimum_message = u32::try_from(minimum_message_raw & u64::from(u32::MAX))

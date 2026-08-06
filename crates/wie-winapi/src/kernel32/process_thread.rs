@@ -3,8 +3,8 @@ use super::{
     ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_SUPPORTED_MT,
     FAKE_CURRENT_PROCESS_ID, FIXED_SYSTEM_FILETIME, HandlerContext, MEM_COMMIT, MEM_RESERVE,
     PAGE_READWRITE, Result, THREAD_ENTRY_HOME_AND_RET, WORKER_STACK_REGION_BASE,
-    WORKER_STACK_STRIDE, WinApiHandlerResult, WinApiState, checked_address, checked_field_address,
-    read_create_file_stack_u32, read_guest_u64, write_guest_u32, write_guest_u64,
+    WORKER_STACK_STRIDE, WinApiHandlerResult, WinApiState, checked_address,
+    read_create_file_stack_u32, read_int, write_guest_u32, write_guest_u64,
 };
 
 use crate::guest_layout::StartupInfo;
@@ -89,8 +89,8 @@ pub fn handle_get_system_time_as_file_time(
         .context("failed to read RCX for GetSystemTimeAsFileTime")?;
 
     if filetime_ptr != 0 {
-        let low_address = checked_field_address(filetime_ptr, 0, "dwLowDateTime");
-        let high_address = checked_field_address(filetime_ptr, 4, "dwHighDateTime");
+        let low_address = checked_address(filetime_ptr, 0, "dwLowDateTime");
+        let high_address = checked_address(filetime_ptr, 4, "dwHighDateTime");
 
         // B5: matches the wall-clock FILETIME the host publishes into the guest
         // clock table (slot 3), which the in-guest stub copies verbatim.
@@ -185,7 +185,7 @@ pub fn handle_get_process_times(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let exit_t = engine.read_r8().context("GetProcessTimes R8")?;
     let kernel = engine.read_r9().context("GetProcessTimes R9")?;
     let rsp = engine.read_rsp().context("GetProcessTimes RSP")?;
-    let user = read_guest_u64(
+    let user = read_int::<u64>(
         engine,
         checked_address(rsp, 0x28, "GetProcessTimes lpUserTime"),
     )?;

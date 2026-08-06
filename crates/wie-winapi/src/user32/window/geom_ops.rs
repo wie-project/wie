@@ -4,8 +4,7 @@
 
 use super::class::find_window_mut;
 use crate::user32::{
-    Context, FAKE_WINDOW_HANDLE, HandlerContext, Result, WinApiHandlerResult, low_i32,
-    read_guest_u32, read_guest_u64,
+    Context, FAKE_WINDOW_HANDLE, HandlerContext, Result, WinApiHandlerResult, low_i32, read_int,
 };
 
 /// Handles `USER32.dll!MoveWindow`.
@@ -40,8 +39,8 @@ pub fn handle_move_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         .checked_add(0x30)
         .context("MoveWindow repaint argument address overflow")?;
 
-    let height_raw = read_guest_u64(engine, height_arg_address)?;
-    let repaint_raw = read_guest_u64(engine, repaint_arg_address)?;
+    let height_raw = read_int::<u64>(engine, height_arg_address)?;
+    let repaint_raw = read_int::<u64>(engine, repaint_arg_address)?;
 
     let x = low_i32(x_raw, "MoveWindow x")?;
     let y = low_i32(y_raw, "MoveWindow y")?;
@@ -136,7 +135,7 @@ pub fn handle_set_window_pos(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         .checked_add(0x38)
         .context("SetWindowPos flags address overflow")?;
     let flags =
-        read_guest_u32(engine, flags_address).context("failed to read SetWindowPos flags")?;
+        read_int::<u32>(engine, flags_address).context("failed to read SetWindowPos flags")?;
 
     // SWP_NOZORDER (0x0004): the caller explicitly leaves the z-order alone.
     if flags & SWP_NOZORDER == 0 {

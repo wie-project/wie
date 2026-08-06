@@ -1,6 +1,6 @@
 //! Minimal `shell32.dll` stubs (folder paths / browse UI / About / launch) for CLI tools.
 
-use crate::guest_memory::{read_u64 as read_guest_u64, write_u32 as write_guest_u32};
+use crate::guest_memory::{read_int, write_u32 as write_guest_u32};
 use crate::guest_string::{read_utf16_lossy, write_utf16_c_string};
 use crate::state::{MessageBoxRequest, PendingNativeMessageBox, WinApiControlSignal, WindowFlags};
 use crate::user32::{IDOK, find_window_mut};
@@ -340,8 +340,8 @@ pub fn handle_shell_execute_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         let rsp = engine
             .read_rsp()
             .context("failed to read RSP for ShellExecuteW")?;
-        let _directory_ptr = read_guest_u64(engine, rsp.wrapping_add(0x28))?;
-        let _show_cmd = read_guest_u64(engine, rsp.wrapping_add(0x30))?;
+        let _directory_ptr = read_int::<u64>(engine, rsp.wrapping_add(0x28))?;
+        let _show_cmd = read_int::<u64>(engine, rsp.wrapping_add(0x30))?;
         let operation = read_utf16_lossy(engine, operation_ptr, 64)?;
         let file = read_utf16_lossy(engine, file_ptr, 1024)?;
         (operation, file)

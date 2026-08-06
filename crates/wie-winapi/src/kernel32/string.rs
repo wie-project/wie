@@ -1,8 +1,7 @@
 use super::{
     ANSI_CODE_PAGE, C1_ALPHA, C1_BLANK, C1_CNTRL, C1_DIGIT, C1_LOWER, C1_PUNCT, C1_SPACE, C1_UPPER,
     C1_XDIGIT, CT_CTYPE1, Context, HandlerContext, OEM_CODE_PAGE, Result, WinApiHandlerResult,
-    checked_address, checked_field_address, low_u32_to_i32, read_guest_u16, read_guest_u64,
-    write_guest_u16, write_guest_u32,
+    checked_address, low_u32_to_i32, read_int, write_guest_u16, write_guest_u32,
 };
 
 /// Handles `KERNEL32.dll!lstrlenW`.
@@ -150,7 +149,7 @@ pub(crate) fn read_null_terminated_utf16_units(
             .context("UTF-16 offset overflow")?;
 
         let address = checked_address(wide_ptr, offset, "UTF-16 NUL scan");
-        let unit = read_guest_u16(engine, address)?;
+        let unit = read_int::<u16>(engine, address)?;
 
         units.push(unit);
 
@@ -175,7 +174,7 @@ pub(crate) fn read_fixed_utf16_units(
             .context("UTF-16 offset overflow")?;
 
         let address = checked_address(wide_ptr, offset, "fixed UTF-16 read");
-        units.push(read_guest_u16(engine, address)?);
+        units.push(read_int::<u16>(engine, address)?);
     }
 
     Ok(units)
@@ -314,8 +313,8 @@ pub fn handle_wide_char_to_multi_byte(ctx: &mut HandlerContext<'_>) -> Result<Wi
     let out_ptr_address = checked_address(rsp, 0x28, "WideCharToMultiByte lpMultiByteStr");
     let out_len_address = checked_address(rsp, 0x30, "WideCharToMultiByte cbMultiByte");
 
-    let out_ptr = read_guest_u64(engine, out_ptr_address)?;
-    let out_len = read_guest_u64(engine, out_len_address)?;
+    let out_ptr = read_int::<u64>(engine, out_ptr_address)?;
+    let out_len = read_int::<u64>(engine, out_len_address)?;
 
     let units = read_utf16_units(engine, wide_ptr, wide_len_raw)?;
     let cp = u32::try_from(code_page & 0xffff_ffff).unwrap_or(crate::vfs::CP_ACP);
@@ -387,9 +386,9 @@ pub fn handle_get_cp_info(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         .context("failed to read RDX for GetCPInfo")?;
 
     if cp_info_ptr != 0 {
-        let max_char_size_address = checked_field_address(cp_info_ptr, 0, "MaxCharSize");
-        let default_char_address = checked_field_address(cp_info_ptr, 4, "DefaultChar");
-        let lead_byte_address = checked_field_address(cp_info_ptr, 6, "LeadByte");
+        let max_char_size_address = checked_address(cp_info_ptr, 0, "MaxCharSize");
+        let default_char_address = checked_address(cp_info_ptr, 4, "DefaultChar");
+        let lead_byte_address = checked_address(cp_info_ptr, 6, "LeadByte");
 
         write_guest_u32(engine, max_char_size_address, 1)?;
         engine
@@ -492,11 +491,11 @@ pub fn handle_multi_byte_to_wide_char(ctx: &mut HandlerContext<'_>) -> Result<Wi
     let input_len_raw = engine.read_r9()?;
 
     let rsp = engine.read_rsp()?;
-    let output_ptr = read_guest_u64(
+    let output_ptr = read_int::<u64>(
         engine,
         checked_address(rsp, 0x28, "MultiByteToWideChar lpWideCharStr"),
     )?;
-    let output_len = read_guest_u64(
+    let output_len = read_int::<u64>(
         engine,
         checked_address(rsp, 0x30, "MultiByteToWideChar cchWideChar"),
     )?;
@@ -564,8 +563,8 @@ pub fn handle_lc_map_string_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     let dest_ptr_address = checked_address(rsp, 0x28, "LCMapStringW lpDestStr");
     let dest_len_address = checked_address(rsp, 0x30, "LCMapStringW cchDest");
 
-    let dest_ptr = read_guest_u64(engine, dest_ptr_address)?;
-    let dest_len = read_guest_u64(engine, dest_len_address)?;
+    let dest_ptr = read_int::<u64>(engine, dest_ptr_address)?;
+    let dest_len = read_int::<u64>(engine, dest_len_address)?;
 
     let source_units = read_utf16_units(engine, source_ptr, source_len_raw)?;
     let required_units =

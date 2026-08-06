@@ -2,7 +2,7 @@ use super::{
     Context, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_DRIVE, ERROR_INVALID_HANDLE,
     ERROR_INVALID_PARAMETER, ERROR_PATH_NOT_FOUND, HandlerContext, Result, WinApiHandlerResult,
     WinApiState, checked_address, get_user_profile_dir_impl, read_ansi_string_from_cpu,
-    read_guest_u16, read_guest_utf16_lossy, read_wide_string_from_cpu, write_guest_u64,
+    read_guest_utf16_lossy, read_int, read_wide_string_from_cpu, write_guest_u64,
     write_guest_utf16_units,
 };
 
@@ -640,7 +640,7 @@ pub(crate) fn copy_path_w_to_guest_buffer(
             .checked_mul(2)
             .context("wide guest string source offset overflow")?;
         let source_address = checked_address(source_ptr, source_offset, "wide guest source string");
-        let unit = read_guest_u16(engine, source_address)?;
+        let unit = read_int::<u16>(engine, source_address)?;
         if unit == 0 {
             break;
         }

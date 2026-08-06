@@ -3,10 +3,10 @@ use super::{
     FAKE_STDIN_HANDLE, FIXED_SYSTEM_FILETIME, HandlerContext, INVALID_FILE_ATTRIBUTES,
     LOGICAL_DRIVE_TCHARS, Result, WinApiHandlerResult, checked_address,
     finish_create_file_create_only, handle_move_file_w, is_open_file_handle, low_u32,
-    read_ansi_string_from_cpu, read_guest_u64, read_wide_string_from_cpu,
-    resolve_full_windows_path, ret_bool_true, ret_u64, stat_guest_path, temp_name_id_u32,
-    write_fixed_dir_a, write_fixed_dir_w, write_guest_u32, write_guest_u64,
-    write_guest_utf16_units, write_mock_string_a, write_mock_string_w,
+    read_ansi_string_from_cpu, read_int, read_wide_string_from_cpu, resolve_full_windows_path,
+    ret_bool_true, ret_u64, stat_guest_path, temp_name_id_u32, write_fixed_dir_a,
+    write_fixed_dir_w, write_guest_u32, write_guest_u64, write_guest_utf16_units,
+    write_mock_string_a, write_mock_string_w,
 };
 use crate::guest_layout::FileAttributeData;
 use crate::guest_memory::with_typed_write;
@@ -37,7 +37,7 @@ pub fn handle_get_disk_free_space_w(ctx: &mut HandlerContext<'_>) -> Result<WinA
     let bps = engine.read_r8()?; // bytes per sector
     let free_clusters = engine.read_r9()?;
     let rsp = engine.read_rsp()?;
-    let total_clusters = read_guest_u64(
+    let total_clusters = read_int::<u64>(
         engine,
         checked_address(rsp, 0x28, "GetDiskFreeSpaceW total"),
     )?;

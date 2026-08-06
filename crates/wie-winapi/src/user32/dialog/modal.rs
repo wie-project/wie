@@ -18,7 +18,7 @@ use crate::user32::{
     BS_DEFPUSHBUTTON, CreateWindowRequest, GuestCallbackRequest, HandlerContext,
     QueuedWindowMessage, WM_INITDIALOG, WM_QUIT, WS_CHILD, WS_CLIPCHILDREN, WS_TABSTOP, WS_VISIBLE,
     WinApiControlSignal, WinApiHandlerResult, WinApiState, WindowClassIdentifier,
-    controls::ControlClassKind, create_window_record, find_window, find_window_mut, read_guest_u64,
+    controls::ControlClassKind, create_window_record, find_window, find_window_mut, read_int,
     window_client_size,
 };
 use wie_pe::resources::{DialogItemTemplate, DialogTemplate, ItemClass};
@@ -58,7 +58,7 @@ fn handle_create_dialog_param(
     let rsp = engine
         .read_rsp()
         .with_context(|| format!("failed to read RSP for {api_name}"))?;
-    let init_param = read_guest_u64(engine, rsp.wrapping_add(0x28))
+    let init_param = read_int::<u64>(engine, rsp.wrapping_add(0x28))
         .with_context(|| format!("failed to read 5th arg for {api_name}"))?;
 
     let template = resolve_template(

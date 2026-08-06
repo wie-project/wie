@@ -14,7 +14,7 @@ use crate::d3d9_render::{
 };
 use crate::fake_va::{D3d9Iface, encode_com};
 use crate::guest_memory::{
-    checked_field_address, write_u32 as write_guest_u32, write_u64 as write_guest_u64,
+    checked_address, write_u32 as write_guest_u32, write_u64 as write_guest_u64,
 };
 use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 
@@ -476,7 +476,7 @@ fn lock_rect_common(
             .context("failed to write D3DLOCKED_RECT.Pitch")?;
         write_guest_u64(
             engine,
-            checked_field_address(p_locked_rect, 8, "D3DLOCKED_RECT.pBits"),
+            checked_address(p_locked_rect, 8, "D3DLOCKED_RECT.pBits"),
             p_bits,
         )
         .context("failed to write D3DLOCKED_RECT.pBits")?;
@@ -576,7 +576,7 @@ fn lock_rect_render_target(
             .context("failed to write D3DLOCKED_RECT.Pitch")?;
         write_guest_u64(
             engine,
-            checked_field_address(p_locked_rect, 8, "D3DLOCKED_RECT.pBits"),
+            checked_address(p_locked_rect, 8, "D3DLOCKED_RECT.pBits"),
             p_bits,
         )
         .context("failed to write D3DLOCKED_RECT.pBits")?;

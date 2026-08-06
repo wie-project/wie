@@ -1,6 +1,6 @@
 use super::{
     Context, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICE_PRIMARY_DEVICE,
-    FAKE_MONITOR_HANDLE, HandlerContext, Result, WinApiHandlerResult, checked_field_address,
+    FAKE_MONITOR_HANDLE, HandlerContext, Result, WinApiHandlerResult, checked_address,
     write_guest_fixed_ansi, write_guest_fixed_utf16, write_guest_i32, write_guest_u32,
 };
 
@@ -26,53 +26,49 @@ pub(crate) fn write_fake_monitor_info(
     // SM_CYSCREEN (all report a 1920×1080 fake display).
     write_guest_i32(
         engine,
-        checked_field_address(monitor_info_ptr, 4, "rcMonitor.left"),
+        checked_address(monitor_info_ptr, 4, "rcMonitor.left"),
         0,
     )?;
     write_guest_i32(
         engine,
-        checked_field_address(monitor_info_ptr, 8, "rcMonitor.top"),
+        checked_address(monitor_info_ptr, 8, "rcMonitor.top"),
         0,
     )?;
     write_guest_i32(
         engine,
-        checked_field_address(monitor_info_ptr, 12, "rcMonitor.right"),
+        checked_address(monitor_info_ptr, 12, "rcMonitor.right"),
         1920,
     )?;
     write_guest_i32(
         engine,
-        checked_field_address(monitor_info_ptr, 16, "rcMonitor.bottom"),
+        checked_address(monitor_info_ptr, 16, "rcMonitor.bottom"),
         1080,
     )?;
 
     // rcWork = { left: 0, top: 0, right: 1920, bottom: 1040 } (1080 - 40 taskbar)
     write_guest_i32(
         engine,
-        checked_field_address(monitor_info_ptr, 20, "rcWork.left"),
+        checked_address(monitor_info_ptr, 20, "rcWork.left"),
         0,
     )?;
     write_guest_i32(
         engine,
-        checked_field_address(monitor_info_ptr, 24, "rcWork.top"),
+        checked_address(monitor_info_ptr, 24, "rcWork.top"),
         0,
     )?;
     write_guest_i32(
         engine,
-        checked_field_address(monitor_info_ptr, 28, "rcWork.right"),
+        checked_address(monitor_info_ptr, 28, "rcWork.right"),
         1920,
     )?;
     write_guest_i32(
         engine,
-        checked_field_address(monitor_info_ptr, 32, "rcWork.bottom"),
+        checked_address(monitor_info_ptr, 32, "rcWork.bottom"),
         1040,
     )?;
 
     // MONITORINFOF_PRIMARY
-    write_guest_u32(
-        engine,
-        checked_field_address(monitor_info_ptr, 36, "dwFlags"),
-        1,
-    )?;
+    write_guest_u32(engine, checked_address(monitor_info_ptr, 36, "dwFlags"), 1)?;
 
     Ok(())
 }
@@ -353,34 +349,34 @@ pub fn handle_enum_display_devices_a(ctx: &mut HandlerContext<'_>) -> Result<Win
 
         write_guest_fixed_ansi(
             engine,
-            checked_field_address(display_device_ptr, 4, "DeviceName"),
+            checked_address(display_device_ptr, 4, "DeviceName"),
             32,
             b"\\\\.\\DISPLAY1",
         )?;
 
         write_guest_fixed_ansi(
             engine,
-            checked_field_address(display_device_ptr, 36, "DeviceString"),
+            checked_address(display_device_ptr, 36, "DeviceString"),
             128,
             b"Generic Display",
         )?;
 
         write_guest_u32(
             engine,
-            checked_field_address(display_device_ptr, 164, "StateFlags"),
+            checked_address(display_device_ptr, 164, "StateFlags"),
             DISPLAY_DEVICE_ATTACHED_TO_DESKTOP | DISPLAY_DEVICE_PRIMARY_DEVICE,
         )?;
 
         write_guest_fixed_ansi(
             engine,
-            checked_field_address(display_device_ptr, 168, "DeviceID"),
+            checked_address(display_device_ptr, 168, "DeviceID"),
             128,
             b"MONITOR\\WIE\\DISPLAY1",
         )?;
 
         write_guest_fixed_ansi(
             engine,
-            checked_field_address(display_device_ptr, 296, "DeviceKey"),
+            checked_address(display_device_ptr, 296, "DeviceKey"),
             128,
             b"\\Registry\\Machine\\System\\CurrentControlSet\\Enum\\DISPLAY\\WIE",
         )?;
@@ -430,34 +426,34 @@ pub fn handle_enum_display_devices_w(ctx: &mut HandlerContext<'_>) -> Result<Win
 
         write_guest_fixed_utf16(
             engine,
-            checked_field_address(display_device_ptr, 4, "DeviceName"),
+            checked_address(display_device_ptr, 4, "DeviceName"),
             32,
             "\\\\.\\DISPLAY1",
         )?;
 
         write_guest_fixed_utf16(
             engine,
-            checked_field_address(display_device_ptr, 68, "DeviceString"),
+            checked_address(display_device_ptr, 68, "DeviceString"),
             128,
             "Generic Display",
         )?;
 
         write_guest_u32(
             engine,
-            checked_field_address(display_device_ptr, 324, "StateFlags"),
+            checked_address(display_device_ptr, 324, "StateFlags"),
             DISPLAY_DEVICE_ATTACHED_TO_DESKTOP | DISPLAY_DEVICE_PRIMARY_DEVICE,
         )?;
 
         write_guest_fixed_utf16(
             engine,
-            checked_field_address(display_device_ptr, 328, "DeviceID"),
+            checked_address(display_device_ptr, 328, "DeviceID"),
             128,
             "MONITOR\\WIE\\DISPLAY1",
         )?;
 
         write_guest_fixed_utf16(
             engine,
-            checked_field_address(display_device_ptr, 584, "DeviceKey"),
+            checked_address(display_device_ptr, 584, "DeviceKey"),
             128,
             "\\Registry\\Machine\\System\\CurrentControlSet\\Enum\\DISPLAY\\WIE",
         )?;

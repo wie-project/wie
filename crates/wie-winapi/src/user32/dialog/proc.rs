@@ -11,9 +11,9 @@ use crate::OuterReturn;
 use crate::user32::{
     BN_CLICKED, GuestCallbackRequest, HandlerContext, IDCANCEL, VK_ESCAPE, VK_RETURN, VK_SHIFT,
     VK_TAB, WM_COMMAND, WM_KEYDOWN, WS_TABSTOP, WinApiControlSignal, WinApiHandlerResult,
-    WinApiState, checked_field_address, controls::ControlClassKind, controls::ControlState,
-    find_window, make_command_wparam, message::handle_default_window_procedure, read_guest_u32,
-    read_guest_u64, window::deliver_focus_change,
+    WinApiState, checked_address, controls::ControlClassKind, controls::ControlState, find_window,
+    make_command_wparam, message::handle_default_window_procedure, read_int,
+    window::deliver_focus_change,
 };
 
 /// Outcome of an `IsDialogMessage` keyboard translation.
@@ -72,16 +72,11 @@ fn handle_is_dialog_message(
         });
     }
 
-    let message = read_guest_u32(
-        engine,
-        checked_field_address(message_address, 8, "MSG.message"),
-    )
-    .with_context(|| format!("failed to read MSG.message for {api_name}"))?;
-    let word_parameter = read_guest_u64(
-        engine,
-        checked_field_address(message_address, 16, "MSG.wParam"),
-    )
-    .with_context(|| format!("failed to read MSG.wParam for {api_name}"))?;
+    let message = read_int::<u32>(engine, checked_address(message_address, 8, "MSG.message"))
+        .with_context(|| format!("failed to read MSG.message for {api_name}"))?;
+    let word_parameter =
+        read_int::<u64>(engine, checked_address(message_address, 16, "MSG.wParam"))
+            .with_context(|| format!("failed to read MSG.wParam for {api_name}"))?;
 
     // Tab navigation is fully host-side; Enter/Esc become WM_COMMAND to the
     // dialog proc (bridged, so EndDialog inside the proc works). Enter

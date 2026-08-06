@@ -8,11 +8,10 @@ use super::{
     FIXED_SYSTEM_FILETIME, FindHandle, HandlerContext, INVALID_FILE_ATTRIBUTES,
     INVALID_HANDLE_VALUE, INVALID_SET_FILE_POINTER, LOGICAL_DRIVE_TCHARS, OPEN_ALWAYS,
     OPEN_EXISTING, OpenGuestFile, Path, Result, TRUNCATE_EXISTING, WinApiHandlerResult,
-    WinApiState, checked_address, checked_field_address, get_user_profile_dir_impl,
-    is_main_module_path, low_u32, read_ansi_string_from_cpu, read_guest_u16, read_guest_u64,
-    read_guest_utf16_lossy, read_stack_u64, read_wide_string_from_cpu, refill_stdin_from_host,
-    ret_bool_true, ret_u64, write_guest_u16, write_guest_u32, write_guest_u64,
-    write_guest_utf16_units,
+    WinApiState, checked_address, get_user_profile_dir_impl, is_main_module_path, low_u32,
+    read_ansi_string_from_cpu, read_guest_utf16_lossy, read_int, read_stack_u64,
+    read_wide_string_from_cpu, refill_stdin_from_host, ret_bool_true, ret_u64, write_guest_u16,
+    write_guest_u32, write_guest_u64, write_guest_utf16_units,
 };
 use crate::guest_layout::{
     ByHandleFileInformation, FIND_DATA_A_ALT_NAME_OFFSET, FIND_DATA_FILE_NAME_OFFSET,
@@ -676,12 +675,12 @@ pub(crate) fn write_find_data_w(
 
     // cFileName is at offset 44 (after dwReserved1); cAlternateFileName[14]
     // starts at 44 + MAX_PATH*2 = 564.
-    let file_name_address = checked_field_address(
+    let file_name_address = checked_address(
         find_data_ptr,
         FIND_DATA_FILE_NAME_OFFSET,
         "WIN32_FIND_DATAW.cFileName",
     );
-    let alt_name_address = checked_field_address(
+    let alt_name_address = checked_address(
         find_data_ptr,
         FIND_DATA_W_ALT_NAME_OFFSET,
         "WIN32_FIND_DATAW.cAlternateFileName",
@@ -715,12 +714,12 @@ pub(crate) fn write_find_data_a(
     }
 
     // Same header as W; cFileName is CHAR[MAX_PATH] at offset 44.
-    let file_name_address = checked_field_address(
+    let file_name_address = checked_address(
         find_data_ptr,
         FIND_DATA_FILE_NAME_OFFSET,
         "WIN32_FIND_DATAA.cFileName",
     );
-    let alt_name_address = checked_field_address(
+    let alt_name_address = checked_address(
         find_data_ptr,
         FIND_DATA_A_ALT_NAME_OFFSET,
         "WIN32_FIND_DATAA.cAlternateFileName",

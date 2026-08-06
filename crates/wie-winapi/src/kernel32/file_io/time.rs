@@ -1,7 +1,7 @@
 use super::{
     Context, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, FILE_BEGIN, FILE_CURRENT, FILE_END,
     FIXED_SYSTEM_FILETIME, HandlerContext, INVALID_SET_FILE_POINTER, Result, WinApiHandlerResult,
-    find_open_file, find_open_file_mut, is_main_module_path, is_open_file_handle, read_guest_u64,
+    find_open_file, find_open_file_mut, is_main_module_path, is_open_file_handle, read_int,
     ret_bool_true, ret_u64, write_guest_u16, write_guest_u32, write_guest_u64,
 };
 use crate::guest_layout::SystemTime;
@@ -292,12 +292,12 @@ pub fn handle_compare_file_time(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let ta = if a == 0 {
         0
     } else {
-        read_guest_u64(engine, a)?
+        read_int::<u64>(engine, a)?
     };
     let tb = if b == 0 {
         0
     } else {
-        read_guest_u64(engine, b)?
+        read_int::<u64>(engine, b)?
     };
     let cmp: i32 = match ta.cmp(&tb) {
         std::cmp::Ordering::Less => -1,
@@ -320,7 +320,7 @@ pub fn handle_local_file_time_to_file_time(
         return ret_u64(engine, 0, "LocalFileTimeToFileTime");
     }
     // Prototype: treat local == UTC (no timezone conversion).
-    let t = read_guest_u64(engine, local)?;
+    let t = read_int::<u64>(engine, local)?;
     write_guest_u64(engine, file, t)?;
     ret_bool_true(engine, "LocalFileTimeToFileTime")
 }

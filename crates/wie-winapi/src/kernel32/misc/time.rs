@@ -1,9 +1,8 @@
 use super::{
     Context, ERROR_INVALID_PARAMETER, HandlerContext, Result, TIME_ZONE_ID_INVALID,
-    TIME_ZONE_ID_UNKNOWN, WinApiHandlerResult, checked_field_address, write_guest_u16,
-    write_guest_u32,
+    TIME_ZONE_ID_UNKNOWN, WinApiHandlerResult, checked_address, write_guest_u16, write_guest_u32,
 };
-use crate::guest_memory::{read_u16 as read_guest_u16, read_u64 as read_guest_u64};
+use crate::guest_memory::read_int;
 use crate::guest_string::{read_utf16_lossy as read_guest_utf16_lossy, write_utf16_c_string};
 
 /// Handles `KERNEL32.dll!GetLocalTime`.
@@ -24,14 +23,14 @@ pub fn handle_get_local_time(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         // WORD wSecond;       offset 12
         // WORD wMilliseconds; offset 14
 
-        let year_address = checked_field_address(system_time_ptr, 0, "wYear");
-        let month_address = checked_field_address(system_time_ptr, 2, "wMonth");
-        let day_of_week_address = checked_field_address(system_time_ptr, 4, "wDayOfWeek");
-        let day_address = checked_field_address(system_time_ptr, 6, "wDay");
-        let hour_address = checked_field_address(system_time_ptr, 8, "wHour");
-        let minute_address = checked_field_address(system_time_ptr, 10, "wMinute");
-        let second_address = checked_field_address(system_time_ptr, 12, "wSecond");
-        let milliseconds_address = checked_field_address(system_time_ptr, 14, "wMilliseconds");
+        let year_address = checked_address(system_time_ptr, 0, "wYear");
+        let month_address = checked_address(system_time_ptr, 2, "wMonth");
+        let day_of_week_address = checked_address(system_time_ptr, 4, "wDayOfWeek");
+        let day_address = checked_address(system_time_ptr, 6, "wDay");
+        let hour_address = checked_address(system_time_ptr, 8, "wHour");
+        let minute_address = checked_address(system_time_ptr, 10, "wMinute");
+        let second_address = checked_address(system_time_ptr, 12, "wSecond");
+        let milliseconds_address = checked_address(system_time_ptr, 14, "wMilliseconds");
 
         // Deterministic fake local time.
         write_guest_u16(engine, year_address, 2026)?;
@@ -75,13 +74,13 @@ pub fn handle_get_time_zone_information(
         // SYSTEMTIME DaylightDate;      offset 152
         // LONG       DaylightBias;      offset 168
 
-        let bias_address = checked_field_address(time_zone_info_ptr, 0, "Bias");
-        let standard_name_address = checked_field_address(time_zone_info_ptr, 4, "StandardName");
-        let standard_date_address = checked_field_address(time_zone_info_ptr, 68, "StandardDate");
-        let standard_bias_address = checked_field_address(time_zone_info_ptr, 84, "StandardBias");
-        let daylight_name_address = checked_field_address(time_zone_info_ptr, 88, "DaylightName");
-        let daylight_date_address = checked_field_address(time_zone_info_ptr, 152, "DaylightDate");
-        let daylight_bias_address = checked_field_address(time_zone_info_ptr, 168, "DaylightBias");
+        let bias_address = checked_address(time_zone_info_ptr, 0, "Bias");
+        let standard_name_address = checked_address(time_zone_info_ptr, 4, "StandardName");
+        let standard_date_address = checked_address(time_zone_info_ptr, 68, "StandardDate");
+        let standard_bias_address = checked_address(time_zone_info_ptr, 84, "StandardBias");
+        let daylight_name_address = checked_address(time_zone_info_ptr, 88, "DaylightName");
+        let daylight_date_address = checked_address(time_zone_info_ptr, 152, "DaylightDate");
+        let daylight_bias_address = checked_address(time_zone_info_ptr, 168, "DaylightBias");
 
         let empty_name = [0_u8; 64];
         let empty_system_time = [0_u8; 16];
@@ -239,9 +238,9 @@ fn handle_get_time_date_format(
     let rsp = engine
         .read_rsp()
         .with_context(|| format!("failed to read RSP for {api_name}"))?;
-    let buffer_ptr = read_guest_u64(engine, rsp.wrapping_add(0x28))
+    let buffer_ptr = read_int::<u64>(engine, rsp.wrapping_add(0x28))
         .with_context(|| format!("failed to read 5th arg for {api_name}"))?;
-    let buffer_len_raw = read_guest_u64(engine, rsp.wrapping_add(0x30))
+    let buffer_len_raw = read_int::<u64>(engine, rsp.wrapping_add(0x30))
         .with_context(|| format!("failed to read 6th arg for {api_name}"))?;
 
     let locale = u32::try_from(locale_raw & u64::from(u32::MAX)).unwrap_or(0);
@@ -300,22 +299,13 @@ fn read_system_time(
     system_time_ptr: u64,
 ) -> Result<TimeParts> {
     Ok(TimeParts {
-        year: read_guest_u16(engine, checked_field_address(system_time_ptr, 0, "wYear"))?,
-        month: read_guest_u16(engine, checked_field_address(system_time_ptr, 2, "wMonth"))?,
-        day_of_week: read_guest_u16(
-            engine,
-            checked_field_address(system_time_ptr, 4, "wDayOfWeek"),
-        )?,
-        day: read_guest_u16(engine, checked_field_address(system_time_ptr, 6, "wDay"))?,
-        hour: read_guest_u16(engine, checked_field_address(system_time_ptr, 8, "wHour"))?,
-        minute: read_guest_u16(
-            engine,
-            checked_field_address(system_time_ptr, 10, "wMinute"),
-        )?,
-        second: read_guest_u16(
-            engine,
-            checked_field_address(system_time_ptr, 12, "wSecond"),
-        )?,
+        year: read_int::<u16>(engine, checked_address(system_time_ptr, 0, "wYear"))?,
+        month: read_int::<u16>(engine, checked_address(system_time_ptr, 2, "wMonth"))?,
+        day_of_week: read_int::<u16>(engine, checked_address(system_time_ptr, 4, "wDayOfWeek"))?,
+        day: read_int::<u16>(engine, checked_address(system_time_ptr, 6, "wDay"))?,
+        hour: read_int::<u16>(engine, checked_address(system_time_ptr, 8, "wHour"))?,
+        minute: read_int::<u16>(engine, checked_address(system_time_ptr, 10, "wMinute"))?,
+        second: read_int::<u16>(engine, checked_address(system_time_ptr, 12, "wSecond"))?,
     })
 }
 

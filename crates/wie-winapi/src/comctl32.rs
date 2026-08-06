@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 
 use crate::gdi32::window_font_resolution_or_default;
-use crate::guest_memory::{checked_field_address, read_i32, write_u32 as write_guest_u32};
+use crate::guest_memory::{checked_address, read_int, write_u32 as write_guest_u32};
 use crate::user32::controls::{
     CCS_BOTTOM, CCS_NOPARENTALIGN, CCS_NORESIZE, ControlClassKind, ControlState, SB_GETPARTS,
     SB_GETTEXTA, SB_GETTEXTLENGTHA, SB_GETTEXTLENGTHW, SB_GETTEXTW, SB_SETPARTS, SB_SETTEXTA,
@@ -53,22 +53,22 @@ pub fn handle_dll_get_version(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         write_guest_u32(engine, version_info_ptr, 20)?;
         write_guest_u32(
             engine,
-            checked_field_address(version_info_ptr, 4, "dwMajorVersion"),
+            checked_address(version_info_ptr, 4, "dwMajorVersion"),
             6,
         )?;
         write_guest_u32(
             engine,
-            checked_field_address(version_info_ptr, 8, "dwMinorVersion"),
+            checked_address(version_info_ptr, 8, "dwMinorVersion"),
             0,
         )?;
         write_guest_u32(
             engine,
-            checked_field_address(version_info_ptr, 12, "dwBuildNumber"),
+            checked_address(version_info_ptr, 12, "dwBuildNumber"),
             7600,
         )?;
         write_guest_u32(
             engine,
-            checked_field_address(version_info_ptr, 16, "dwPlatformID"),
+            checked_address(version_info_ptr, 16, "dwPlatformID"),
             1,
         )?;
     }
@@ -473,7 +473,7 @@ pub(crate) fn dispatch_status_bar_message(
                 let value = if long_parameter == 0 {
                     -1 // no array: the whole strip is one part
                 } else {
-                    read_i32(engine, long_parameter.saturating_add(off))
+                    read_int::<i32>(engine, long_parameter.saturating_add(off))
                         .context("SB_SETPARTS part width read failed")?
                 };
                 rights.push(value);

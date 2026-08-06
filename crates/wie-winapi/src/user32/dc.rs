@@ -1,6 +1,6 @@
 use super::{
     Context, FAKE_DEVICE_CONTEXT_HANDLE, HandlerContext, Result, WinApiHandlerResult,
-    checked_field_address, write_guest_i32, write_guest_u32, write_guest_u64,
+    checked_address, write_guest_i32, write_guest_u32, write_guest_u64,
 };
 use crate::gdi32::DcKind;
 use crate::state::WindowFlags;
@@ -87,35 +87,23 @@ pub fn handle_begin_paint(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
             .is_some_and(|window| window.flags.contains(WindowFlags::ERASE_BACKGROUND));
         write_guest_u32(
             engine,
-            checked_field_address(paint_ptr, 8, "fErase"),
+            checked_address(paint_ptr, 8, "fErase"),
             u32::from(f_erase),
         )?;
+        write_guest_i32(engine, checked_address(paint_ptr, 12, "rcPaint.left"), 0)?;
+        write_guest_i32(engine, checked_address(paint_ptr, 16, "rcPaint.top"), 0)?;
         write_guest_i32(
             engine,
-            checked_field_address(paint_ptr, 12, "rcPaint.left"),
-            0,
-        )?;
-        write_guest_i32(
-            engine,
-            checked_field_address(paint_ptr, 16, "rcPaint.top"),
-            0,
-        )?;
-        write_guest_i32(
-            engine,
-            checked_field_address(paint_ptr, 20, "rcPaint.right"),
+            checked_address(paint_ptr, 20, "rcPaint.right"),
             width,
         )?;
         write_guest_i32(
             engine,
-            checked_field_address(paint_ptr, 24, "rcPaint.bottom"),
+            checked_address(paint_ptr, 24, "rcPaint.bottom"),
             height,
         )?;
-        write_guest_u32(engine, checked_field_address(paint_ptr, 28, "fRestore"), 0)?;
-        write_guest_u32(
-            engine,
-            checked_field_address(paint_ptr, 32, "fIncUpdate"),
-            0,
-        )?;
+        write_guest_u32(engine, checked_address(paint_ptr, 28, "fRestore"), 0)?;
+        write_guest_u32(engine, checked_address(paint_ptr, 32, "fIncUpdate"), 0)?;
         // rgbReserved left zeroed by guest or ignored.
 
         tracing::debug!(window_handle, width, height, "BeginPaint");

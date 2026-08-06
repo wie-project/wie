@@ -1,7 +1,7 @@
 //! UCRT stdio surface: `FILE` cookie streams, printf/scanf format engines, and
 //! the single host console-write path shared across the crate.
 
-use crate::guest_memory::read_u64 as read_guest_u64;
+use crate::guest_memory::read_int;
 use crate::{GuestStdinMode, HandlerContext, WinApiHandlerResult};
 use anyhow::{Context, Result};
 
@@ -151,7 +151,7 @@ pub(crate) fn handle_stdio_common_vfprintf(
         }
         let fmt = read_guest_str(engine, fmt_ptr, 4096)?;
         let rsp = engine.read_rsp()?;
-        let mut va = read_guest_u64(engine, rsp.wrapping_add(0x28)).unwrap_or(0);
+        let mut va = read_int::<u64>(engine, rsp.wrapping_add(0x28)).unwrap_or(0);
 
         const MAX_OUTPUT: usize = 4096;
         let mut out = Vec::with_capacity(256);
@@ -163,7 +163,7 @@ pub(crate) fn handle_stdio_common_vfprintf(
                 let mut field_width: Option<i32> = None;
                 // Parse optional field width (digits or *).
                 if bytes[i] == b'*' {
-                    field_width = Some(read_guest_u64(engine, va).unwrap_or(0) as i32);
+                    field_width = Some(read_int::<u64>(engine, va).unwrap_or(0) as i32);
                     va = va.wrapping_add(8);
                     i += 1;
                 } else if bytes[i].is_ascii_digit() {
@@ -180,7 +180,7 @@ pub(crate) fn handle_stdio_common_vfprintf(
                 if i < bytes.len() && bytes[i] == b'.' {
                     i += 1;
                     if i < bytes.len() && bytes[i] == b'*' {
-                        let _prec: i32 = read_guest_u64(engine, va).unwrap_or(0) as i32;
+                        let _prec: i32 = read_int::<u64>(engine, va).unwrap_or(0) as i32;
                         va = va.wrapping_add(8);
                         i += 1;
                     } else {
@@ -191,19 +191,19 @@ pub(crate) fn handle_stdio_common_vfprintf(
                 }
                 match bytes[i] {
                     b'd' | b'i' | b'u' | b'X' | b'x' => {
-                        let v = read_guest_u64(engine, va).unwrap_or(0);
+                        let v = read_int::<u64>(engine, va).unwrap_or(0);
                         va = va.wrapping_add(8);
                         let s = format!("{}", v as i64);
                         pad_or_trim(&mut out, field_width, &s);
                     }
                     b's' => {
-                        let p = read_guest_u64(engine, va).unwrap_or(0);
+                        let p = read_int::<u64>(engine, va).unwrap_or(0);
                         va = va.wrapping_add(8);
                         let s = read_guest_str(engine, p, 1024).unwrap_or_default();
                         pad_or_trim(&mut out, field_width, &s);
                     }
                     b'c' => {
-                        let v = read_guest_u64(engine, va).unwrap_or(0);
+                        let v = read_int::<u64>(engine, va).unwrap_or(0);
                         va = va.wrapping_add(8);
                         out.push(v as u8);
                     }
@@ -253,7 +253,7 @@ pub(crate) fn handle_stdio_common_vsprintf(
     }
     let fmt = read_guest_str(engine, fmt_ptr, 4096)?;
     let rsp = engine.read_rsp()?;
-    let mut va = read_guest_u64(engine, rsp.wrapping_add(0x30)).unwrap_or(0);
+    let mut va = read_int::<u64>(engine, rsp.wrapping_add(0x30)).unwrap_or(0);
 
     const MAX_OUTPUT: usize = 4096;
     let mut out = Vec::with_capacity(256);
@@ -265,7 +265,7 @@ pub(crate) fn handle_stdio_common_vsprintf(
             let mut field_width: Option<i32> = None;
             // Parse optional field width (digits or *).
             if bytes[i] == b'*' {
-                field_width = Some(read_guest_u64(engine, va).unwrap_or(0) as i32);
+                field_width = Some(read_int::<u64>(engine, va).unwrap_or(0) as i32);
                 va = va.wrapping_add(8);
                 i += 1;
             } else if bytes[i].is_ascii_digit() {
@@ -282,7 +282,7 @@ pub(crate) fn handle_stdio_common_vsprintf(
             if i < bytes.len() && bytes[i] == b'.' {
                 i += 1;
                 if i < bytes.len() && bytes[i] == b'*' {
-                    let _prec: i32 = read_guest_u64(engine, va).unwrap_or(0) as i32;
+                    let _prec: i32 = read_int::<u64>(engine, va).unwrap_or(0) as i32;
                     va = va.wrapping_add(8);
                     i += 1;
                 } else {
@@ -293,7 +293,7 @@ pub(crate) fn handle_stdio_common_vsprintf(
             }
             match bytes[i] {
                 b'd' | b'i' | b'u' => {
-                    let v = read_guest_u64(engine, va).unwrap_or(0);
+                    let v = read_int::<u64>(engine, va).unwrap_or(0);
                     va = va.wrapping_add(8);
                     let s = if bytes[i] == b'u' {
                         format!("{v}")
@@ -303,19 +303,19 @@ pub(crate) fn handle_stdio_common_vsprintf(
                     crate::ucrt::pad_or_trim(&mut out, field_width, &s);
                 }
                 b'x' | b'X' => {
-                    let v = read_guest_u64(engine, va).unwrap_or(0);
+                    let v = read_int::<u64>(engine, va).unwrap_or(0);
                     va = va.wrapping_add(8);
                     let s = format!("{v:x}");
                     crate::ucrt::pad_or_trim(&mut out, field_width, &s);
                 }
                 b's' => {
-                    let p = read_guest_u64(engine, va).unwrap_or(0);
+                    let p = read_int::<u64>(engine, va).unwrap_or(0);
                     va = va.wrapping_add(8);
                     let s = read_guest_str(engine, p, 1024).unwrap_or_default();
                     crate::ucrt::pad_or_trim(&mut out, field_width, &s);
                 }
                 b'c' => {
-                    let v = read_guest_u64(engine, va).unwrap_or(0);
+                    let v = read_int::<u64>(engine, va).unwrap_or(0);
                     va = va.wrapping_add(8);
                     out.push(v as u8);
                 }
@@ -348,7 +348,7 @@ pub(crate) fn handle_stdio_common_vsscanf(
     let src = read_guest_str(engine, src_ptr, 4096)?;
     let fmt = read_guest_str(engine, fmt_ptr, 4096)?;
     let rsp = engine.read_rsp()?;
-    let mut va = read_guest_u64(engine, rsp.wrapping_add(0x30)).unwrap_or(0);
+    let mut va = read_int::<u64>(engine, rsp.wrapping_add(0x30)).unwrap_or(0);
     let sb = src.as_bytes();
     let fb = fmt.as_bytes();
     let mut si = 0;
@@ -381,7 +381,7 @@ pub(crate) fn handle_stdio_common_vsscanf(
                         } else {
                             s.parse::<i32>().unwrap_or(0)
                         };
-                        let out = read_guest_u64(engine, va).unwrap_or(0);
+                        let out = read_int::<u64>(engine, va).unwrap_or(0);
                         va = va.wrapping_add(8);
                         if out != 0 {
                             drop(engine.mem_write(out, &val_i32.to_le_bytes()));
@@ -397,7 +397,7 @@ pub(crate) fn handle_stdio_common_vsscanf(
                     while si < sb.len() && !sb[si].is_ascii_whitespace() {
                         si += 1;
                     }
-                    let out = read_guest_u64(engine, va).unwrap_or(0);
+                    let out = read_int::<u64>(engine, va).unwrap_or(0);
                     va = va.wrapping_add(8);
                     if out != 0 {
                         let mut w = sb[start..si].to_vec();
@@ -436,7 +436,7 @@ pub(crate) fn handle_stdio_common_vfscanf(
     }
     let fmt = read_guest_str(engine, fmt_ptr, 4096)?;
     let rsp = engine.read_rsp()?;
-    let mut va = read_guest_u64(engine, rsp.wrapping_add(0x28)).unwrap_or(0);
+    let mut va = read_int::<u64>(engine, rsp.wrapping_add(0x28)).unwrap_or(0);
     let fb = fmt.as_bytes();
     let mut fi = 0;
     let mut items = 0_usize;
@@ -512,7 +512,7 @@ pub(crate) fn handle_stdio_common_vfscanf(
                         } else {
                             s.parse::<i32>().unwrap_or(0)
                         };
-                        let out = read_guest_u64(engine, va).unwrap_or(0);
+                        let out = read_int::<u64>(engine, va).unwrap_or(0);
                         va = va.wrapping_add(8);
                         if out != 0 {
                             drop(engine.mem_write(out, &val_i32.to_le_bytes()));
@@ -527,7 +527,7 @@ pub(crate) fn handle_stdio_common_vfscanf(
                     if pos < input.len() {
                         let c = input[pos];
                         pos += 1;
-                        let out = read_guest_u64(engine, va).unwrap_or(0);
+                        let out = read_int::<u64>(engine, va).unwrap_or(0);
                         va = va.wrapping_add(8);
                         if out != 0 {
                             // Write a full i32 (zero-extended). Many student
@@ -547,7 +547,7 @@ pub(crate) fn handle_stdio_common_vfscanf(
                     while pos < input.len() && !input[pos].is_ascii_whitespace() {
                         pos += 1;
                     }
-                    let out = read_guest_u64(engine, va).unwrap_or(0);
+                    let out = read_int::<u64>(engine, va).unwrap_or(0);
                     va = va.wrapping_add(8);
                     if out != 0 && pos > start {
                         let mut w = input[start..pos].to_vec();
