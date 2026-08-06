@@ -15,7 +15,8 @@
 // real bridged WM_COMMAND click path, not a direct call), the timer posts
 // Enter to close the dialog, verify the dialog text echoed back, then set
 // the edit text, select a combo item, and exit 0 only if every step
-// verified (incl. a UTF-8 round-trip through the A-string boundary).
+// verified (incl. a UTF-16 round-trip through the W-string boundary; the
+// ANSI A path stays cp1252-faithful, so unicode coverage uses the W path).
 // Interactive runs keep the window open and quit on 'q' / Exit / close.
 
 #include <windows.h>
@@ -40,7 +41,7 @@ static HINSTANCE g_inst;
 static HWND g_edit, g_combo, g_list, g_btn_dialog;
 static int g_selftest;
 static int g_timer_count;
-static char g_dialog_text[128];
+static wchar_t g_dialog_text_w[128];
 static int g_dialog_result;
 
 static int selftest_enabled(void) {
@@ -58,9 +59,22 @@ static int eq_str(const char *a, const char *b) {
     return *a == *b;
 }
 
+static int eq_str_w(const wchar_t *a, const wchar_t *b) {
+    while (*a && *b) {
+        if (*a != *b) return 0;
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
 // Set the echo label text; the control paints through the host WndProc.
 static void set_label(HWND parent, int id, const char *text) {
     SetDlgItemTextA(parent, id, text);
+}
+
+static void set_label_w(HWND parent, int id, const wchar_t *text) {
+    SetDlgItemTextW(parent, id, text);
 }
 
 static void sync_edit_label(void) {
@@ -134,11 +148,13 @@ static void on_add(void) {
 static INT_PTR CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_INITDIALOG:
-        SetDlgItemTextA(hwnd, IDC_DLG_EDIT, "dialog text — ✓");
+        // Unicode echo via the W path (lossless by design; the ANSI A path is
+        // cp1252-faithful and would degrade U+2713 to '?').
+        SetDlgItemTextW(hwnd, IDC_DLG_EDIT, L"dialog text — ✓");
         return 1;
     case WM_COMMAND:
         if (LOWORD(wParam) == 1) { // IDOK
-            GetDlgItemTextA(hwnd, IDC_DLG_EDIT, g_dialog_text, sizeof(g_dialog_text));
+            GetDlgItemTextW(hwnd, IDC_DLG_EDIT, g_dialog_text_w, sizeof(g_dialog_text_w) / sizeof(wchar_t));
             g_dialog_result = 1;
             EndDialog(hwnd, 1);
             return 1;
@@ -154,23 +170,23 @@ static INT_PTR CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 }
 
 static void on_dialog(void) {
-    g_dialog_text[0] = 0;
+    g_dialog_text_w[0] = 0;
     g_dialog_result = -1;
     INT_PTR result = DialogBoxParamA(g_inst, (LPCSTR)100, g_hwnd, DlgProc, 0);
     g_dialog_result = (int)result;
     if (result == 1) {
-        char out[160];
-        out[0] = 'D';
-        out[1] = ':';
-        out[2] = ' ';
+        wchar_t out[160];
+        out[0] = L'D';
+        out[1] = L':';
+        out[2] = L' ';
         int i = 3;
-        for (int j = 0; g_dialog_text[j] && i < (int)sizeof(out) - 1; j++, i++) {
-            out[i] = g_dialog_text[j];
+        for (int j = 0; g_dialog_text_w[j] && i < (int)(sizeof(out) / sizeof(wchar_t)) - 1; j++, i++) {
+            out[i] = g_dialog_text_w[j];
         }
         out[i] = 0;
-        set_label(g_hwnd, IDC_LBL_DLG, out);
+        set_label_w(g_hwnd, IDC_LBL_DLG, out);
     } else {
-        set_label(g_hwnd, IDC_LBL_DLG, "D: (cancelled)");
+        set_label_w(g_hwnd, IDC_LBL_DLG, L"D: (cancelled)");
     }
 }
 
@@ -241,11 +257,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 // Verify every component echoed. Each step exits with a
                 // distinct code so CI failures pinpoint the component.
                 char buf[128];
-                // 1. Dialog text echo (UTF-8 round-trip through the A-string
-                // boundary: the literal is UTF-8 in the PE, the host stores it
-                // UTF-8, and the label read-back must match byte-identically).
-                GetWindowTextA(GetDlgItem(g_hwnd, IDC_LBL_DLG), buf, sizeof(buf));
-                int ok = g_dialog_result == 1 && eq_str(buf, "D: dialog text — ✓");
+                // 1. Dialog text echo (UTF-16 round-trip through the W-string
+                // boundary: the literal is UTF-16 in the PE, the host stores
+                // it UTF-8, and the label read-back must match exactly).
+                wchar_t wbuf[128];
+                GetWindowTextW(GetDlgItem(g_hwnd, IDC_LBL_DLG), wbuf, 128);
+                int ok = g_dialog_result == 1 && eq_str_w(wbuf, L"D: dialog text — ✓");
                 if (ok) {
                     // 2. Edit echo.
                     SetWindowTextA(g_edit, "Hello WIE");
