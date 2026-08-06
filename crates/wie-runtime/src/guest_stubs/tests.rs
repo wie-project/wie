@@ -6,24 +6,26 @@ use super::*;
 
 #[test]
 fn get_cwd_stub_encodes_and_patches_rel8() {
+    let cfg = GuestStubConfig::from_layout(&crate::memory::DEFAULT_LAYOUT);
     let body = GuestStubKind::GetCurrentDirectoryW {
-        cwd_blob_va: 0x7000_0004_3500,
+        cwd_blob_va: cfg.cwd_blob_va,
     }
-    .encode();
+    .encode(&cfg);
     assert!(body.len() > 20);
     assert_eq!(*body.last().unwrap(), 0xc3);
 }
 
 #[test]
 fn dialog_box_stub_encodes_modal_loop() {
+    let cfg = GuestStubConfig::from_layout(&crate::memory::DEFAULT_LAYOUT);
     let body = GuestStubKind::DialogBoxParam {
-        create_dialog_param_va: 0x0000_7000_0000_2c00,
-        get_message_va: 0x0000_7000_0000_1f60,
-        is_dialog_message_va: 0x0000_7000_0000_2c10,
-        dispatch_message_va: 0x0000_7000_0000_22c0,
-        dialog_result_va: 0x0000_7000_0040_a000,
+        create_dialog_param_va: cfg.create_dialog_param_a_va,
+        get_message_va: cfg.get_message_a_va,
+        is_dialog_message_va: cfg.is_dialog_message_a_va,
+        dispatch_message_va: cfg.dispatch_message_a_va,
+        dialog_result_va: cfg.dialog_result_va,
     }
-    .encode();
+    .encode(&cfg);
     // ~120 bytes of modal loop; must end in `ret`.
     assert!(body.len() > 80, "dialog stub too short: {}", body.len());
     assert!(body.len() < 200, "dialog stub too long: {}", body.len());
@@ -51,14 +53,15 @@ fn dialog_box_stub_forwards_init_param_at_the_callee_read_offset() {
     // address. A store at [rsp+0x28] (as originally written) put the value 8
     // bytes too high — the guest dialog proc then read garbage lParam and
     // faulted on `s_pGotoData->iLine` in WM_INITDIALOG.
+    let cfg = GuestStubConfig::from_layout(&crate::memory::DEFAULT_LAYOUT);
     let body = GuestStubKind::DialogBoxParam {
-        create_dialog_param_va: 0x0000_7000_0000_2c00,
-        get_message_va: 0x0000_7000_0000_1f60,
-        is_dialog_message_va: 0x0000_7000_0000_2c10,
-        dispatch_message_va: 0x0000_7000_0000_22c0,
-        dialog_result_va: 0x0000_7000_0040_a000,
+        create_dialog_param_va: cfg.create_dialog_param_a_va,
+        get_message_va: cfg.get_message_a_va,
+        is_dialog_message_va: cfg.is_dialog_message_a_va,
+        dispatch_message_va: cfg.dispatch_message_a_va,
+        dialog_result_va: cfg.dialog_result_va,
     }
-    .encode();
+    .encode(&cfg);
     // `mov rax, [rsp+0x90]` (load the caller's 5th arg) immediately followed
     // by `mov [rsp+0x20], rax` (store it in CreateDialogParam's arg5 slot).
     let forward = [
@@ -215,7 +218,7 @@ fn clock_stubs_classify_to_table_slots() {
             "{kind:?} embeds the table VA and must be re-derived at plant time"
         );
         // Encoded bodies are self-contained machine code ending in `ret`.
-        let body = kind.encode();
+        let body = kind.encode(&cfg);
         assert_eq!(body.last(), Some(&0xc3), "{kind:?} must end in ret");
     }
 }
@@ -359,8 +362,8 @@ fn every_stub_needing_real_addresses_is_listed() {
 
         match (kind0, kind1) {
             (Some(k0), Some(k1)) => {
-                let body0 = k0.encode();
-                let body1 = k1.encode();
+                let body0 = k0.encode(&GuestStubConfig::CLASSIFY_ONLY);
+                let body1 = k1.encode(&real_cfg);
                 if body0 != body1 {
                     assert!(
                         k0.needs_real_guest_addresses(),
@@ -386,12 +389,11 @@ fn every_stub_needing_real_addresses_is_listed() {
 
 #[test]
 fn file_dialog_loop_stub_encodes_modal_loop() {
-    let body = encode_file_dialog_loop(
-        0x0000_7000_0000_1f60, // GetMessageA
-        0x0000_7000_0000_2c10, // IsDialogMessageA
-        0x0000_7000_0000_22c0, // DispatchMessageA
-        0x0000_7000_0040_a000, // dialog-result slot
-    );
+    let cfg = GuestStubConfig::from_layout(&crate::memory::DEFAULT_LAYOUT);
+    let mut buf = Vec::new();
+    let mut ctx = StubCtx::new(&mut buf, &cfg);
+    ctx.encode_file_dialog_loop();
+    let body = buf;
     assert!(body.len() > 80, "loop too short: {}", body.len());
     assert!(body.len() < 200, "loop too long: {}", body.len());
     assert_eq!(*body.last().unwrap(), 0xc3, "ends in ret");

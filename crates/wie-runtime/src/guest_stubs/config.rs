@@ -33,7 +33,7 @@ pub(crate) struct GuestStubConfig {
     /// on every host stop; in-guest clock stubs read it with no host stop.
     pub clock_table_va: u64,
     /// Guest VA of the planted file-dialog modal-loop body (see
-    /// [`super::encode::encode_file_dialog_loop`]).
+    /// [`super::encode::StubCtx::encode_file_dialog_loop`]).
     pub file_dialog_loop_va: u64,
     /// Guest VA of the planted file-dialog proc stub (see
     /// [`super::encode::encode_file_dialog_proc`]).

@@ -1,9 +1,7 @@
 //! Stub kinds and their classification metadata.
 
-use super::encode::{
-    encode_copy_u64_to_ptr, encode_dialog_box_param, encode_fls_get, encode_fls_set,
-    encode_get_current_directory_w, encode_initterm, encode_load_u32_table,
-};
+use super::config::GuestStubConfig;
+use super::encode::{StubCtx, encode_copy_u64_to_ptr, encode_load_u32_table};
 
 /// Kind of in-guest stub to plant at a fake API VA.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -70,7 +68,7 @@ impl GuestStubKind {
     /// Encodes the stub body. Most stubs fit the 16-byte IAT stride; longer ones
     /// are planted outside the hooked range with a 12-byte `jmp` at the IAT.
     #[must_use]
-    pub(crate) fn encode(self) -> Vec<u8> {
+    pub(crate) fn encode(self, cfg: &GuestStubConfig) -> Vec<u8> {
         match self {
             Self::VoidRet => vec![0xc3],
             Self::IdentityRcxToRax => vec![0x48, 0x89, 0xc8, 0xc3],
@@ -103,14 +101,12 @@ impl GuestStubKind {
             }
             Self::CopyU64FromVaToRcxPtr { slot_va } => encode_copy_u64_to_ptr(slot_va, false),
             Self::CopyU64FromVaToRcxPtrRetOne { slot_va } => encode_copy_u64_to_ptr(slot_va, true),
-            Self::FlsGetValue {
-                table_va,
-                max_slots,
-            } => encode_fls_get(table_va, max_slots),
-            Self::FlsSetValue {
-                table_va,
-                max_slots,
-            } => encode_fls_set(table_va, max_slots),
+            Self::FlsGetValue { max_slots, .. } => {
+                encode_with(cfg, |ctx| ctx.encode_fls_get(max_slots))
+            }
+            Self::FlsSetValue { max_slots, .. } => {
+                encode_with(cfg, |ctx| ctx.encode_fls_set(max_slots))
+            }
             Self::AcrtIobFunc => {
                 // mov eax, 0x68000000 ; shl ecx, 8 ; add eax, ecx ; ret
                 let mut buf = vec![0xb8, 0x00, 0x00, 0x00, 0x68];
@@ -130,24 +126,17 @@ impl GuestStubKind {
                 buf.extend_from_slice(&[0x48, 0x01, 0xc8, 0xc3]);
                 buf
             }
-            Self::GetCurrentDirectoryW { cwd_blob_va } => {
-                encode_get_current_directory_w(cwd_blob_va)
+            Self::GetCurrentDirectoryW { .. } => {
+                encode_with(cfg, |ctx| ctx.encode_get_current_directory_w())
             }
-            Self::Initterm => encode_initterm(false),
-            Self::InittermE => encode_initterm(true),
+            Self::Initterm => encode_with(cfg, |ctx| ctx.encode_initterm(false)),
+            Self::InittermE => encode_with(cfg, |ctx| ctx.encode_initterm(true)),
             Self::DialogBoxParam {
                 create_dialog_param_va,
-                get_message_va,
-                is_dialog_message_va,
-                dispatch_message_va,
-                dialog_result_va,
-            } => encode_dialog_box_param(
-                create_dialog_param_va,
-                get_message_va,
-                is_dialog_message_va,
-                dispatch_message_va,
-                dialog_result_va,
-            ),
+                ..
+            } => encode_with(cfg, |ctx| {
+                ctx.encode_dialog_box_param(create_dialog_param_va)
+            }),
         }
     }
 
@@ -218,4 +207,16 @@ impl GuestStubKind {
             Self::DialogBoxParam { .. } => true,
         }
     }
+}
+
+/// Encodes a [`StubCtx`]-based stub body into a fresh buffer.
+///
+/// The ctx-based encoders append into the buffer they hold, so a caller that
+/// wants a self-contained `Vec<u8>` body (plant-time, tests) hands the config
+/// in and takes the buffer back.
+fn encode_with(cfg: &GuestStubConfig, encode: impl FnOnce(&mut StubCtx<'_>)) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut ctx = StubCtx::new(&mut buf, cfg);
+    encode(&mut ctx);
+    buf
 }

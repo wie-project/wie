@@ -48,7 +48,7 @@ pub(crate) fn plant_guest_stubs(
         if seen_kinds.insert(kind) {
             tracing::debug!(name = %entry.name, kind = ?kind, "planted new guest stub kind");
         }
-        let body = kind.encode();
+        let body = kind.encode(cfg);
         let va = entry.fake_target_va;
         if va < fake_api_base {
             continue;

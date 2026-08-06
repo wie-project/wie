@@ -562,12 +562,9 @@ impl super::RuntimeSession {
         // `GetSaveFileName` handler runs the modal loop via a guest callback
         // and bridges WM_COMMAND/WM_CLOSE to the proc stub, which ends the
         // dialog; both are pure guest code with fixed fake-VA callees.
-        let file_dialog_loop = crate::guest_stubs::encode_file_dialog_loop(
-            stub_cfg.get_message_a_va,
-            stub_cfg.is_dialog_message_a_va,
-            stub_cfg.dispatch_message_a_va,
-            stub_cfg.dialog_result_va,
-        );
+        let mut file_dialog_loop = Vec::new();
+        let mut stub_ctx = crate::guest_stubs::StubCtx::new(&mut file_dialog_loop, &stub_cfg);
+        stub_ctx.encode_file_dialog_loop();
         engine
             .mem_write(stub_cfg.file_dialog_loop_va, &file_dialog_loop)
             .context("failed to write file-dialog modal-loop body")?;
