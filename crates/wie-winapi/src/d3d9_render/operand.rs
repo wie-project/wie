@@ -14,8 +14,9 @@
 //! pattern for the shared flow-control machinery.
 
 use crate::d3d9_shader::{
-    D3DSPDM_SATURATE, D3DSPSM_ABS, D3DSPSM_ABSNEG, D3DSPSM_BIAS, D3DSPSM_BIASNEG, D3DSPSM_COMP,
-    D3DSPSM_NEG, D3DSPSM_SIGN, D3DSPSM_SIGNNEG, D3DSPSM_X2, D3DSPSM_X2NEG, Operand, RegType,
+    D3DSP_WRITEMASK_0, D3DSP_WRITEMASK_1, D3DSP_WRITEMASK_2, D3DSP_WRITEMASK_3, D3DSPDM_SATURATE,
+    D3DSPSM_ABS, D3DSPSM_ABSNEG, D3DSPSM_BIAS, D3DSPSM_BIASNEG, D3DSPSM_COMP, D3DSPSM_NEG,
+    D3DSPSM_SIGN, D3DSPSM_SIGNNEG, D3DSPSM_X2, D3DSPSM_X2NEG, Operand, RegType,
 };
 
 /// The register-file interface both interpreters execute against.
@@ -53,10 +54,10 @@ pub(super) trait ShaderRegisters {
         let [x, y, z, w] = value;
         let [ox, oy, oz, ow] = *target;
         *target = [
-            if mask & 0x1 != 0 { x } else { ox },
-            if mask & 0x2 != 0 { y } else { oy },
-            if mask & 0x4 != 0 { z } else { oz },
-            if mask & 0x8 != 0 { w } else { ow },
+            if mask & D3DSP_WRITEMASK_0 != 0 { x } else { ox },
+            if mask & D3DSP_WRITEMASK_1 != 0 { y } else { oy },
+            if mask & D3DSP_WRITEMASK_2 != 0 { z } else { oz },
+            if mask & D3DSP_WRITEMASK_3 != 0 { w } else { ow },
         ];
     }
 }

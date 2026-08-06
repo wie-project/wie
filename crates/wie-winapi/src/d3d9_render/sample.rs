@@ -2,8 +2,8 @@
 //! fixed-function color/alpha ops.
 
 use super::{
-    D3DTA_CURRENT, D3DTA_DIFFUSE, D3DTA_TEXTURE, D3DTADDRESS_WRAP, D3DTEXF_LINEAR, D3DTOP_MODULATE,
-    D3DTOP_SELECTARG2,
+    D3DCOLOR_RGB_MASK, D3DTA_CURRENT, D3DTA_DIFFUSE, D3DTA_TEXTURE, D3DTADDRESS_WRAP,
+    D3DTEXF_LINEAR, D3DTOP_MODULATE, D3DTOP_SELECTARG2,
 };
 
 /// Maximum number of mip levels a stage carries. A 4096² texture chains to 13
@@ -331,7 +331,7 @@ pub(super) fn stage_arg(arg: u32, texel: u32, diffuse: u32) -> u32 {
 #[must_use]
 pub(super) fn eval_color_op(op: u32, arg1: u32, arg2: u32) -> u32 {
     match op {
-        D3DTOP_SELECTARG2 => arg2 & 0x00FF_FFFF,
+        D3DTOP_SELECTARG2 => arg2 & D3DCOLOR_RGB_MASK,
         D3DTOP_MODULATE => {
             let r = (u32::from(u8::try_from((arg1 >> 16) & 0xFF).unwrap_or(0)))
                 .saturating_mul(u32::from(u8::try_from((arg2 >> 16) & 0xFF).unwrap_or(0)))
@@ -344,7 +344,7 @@ pub(super) fn eval_color_op(op: u32, arg1: u32, arg2: u32) -> u32 {
                 >> 8;
             (r << 16) | (g << 8) | b
         }
-        _ => arg1 & 0x00FF_FFFF,
+        _ => arg1 & D3DCOLOR_RGB_MASK,
     }
 }
 /// Evaluate a `D3DTSS_ALPHAOP` over two `0xAARRGGBB` args → the alpha byte.

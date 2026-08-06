@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 
 use super::texture::allocate_surface_object;
 use super::{
-    D3D_OK, D3DERR_INVALIDCALL, D3DFMT_D16, D3DFMT_D24S8, DepthStencilRecord, read_stack_argument,
+    D3D_OK, D3DERR_INVALIDCALL, D3DFMT_D16, D3DFMT_D24S8, DepthStencilRecord,
+    MAX_TEXTURE_DIMENSION, read_stack_argument,
 };
 use crate::guest_memory::{write_u32 as write_guest_u32, write_u64 as write_guest_u64};
 use crate::{HandlerContext, WinApiHandlerResult};
@@ -84,8 +85,8 @@ pub fn handle_create_depth_stencil_surface(
 
     let valid = width > 0
         && height > 0
-        && width <= 4096
-        && height <= 4096
+        && width <= MAX_TEXTURE_DIMENSION
+        && height <= MAX_TEXTURE_DIMENSION
         && matches!(format, D3DFMT_D16 | D3DFMT_D24S8)
         && pp_surface != 0;
 

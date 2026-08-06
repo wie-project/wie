@@ -106,6 +106,15 @@ const D3DCAPS9_SIZE: usize = 304;
 
 pub(crate) const D3DFMT_X8R8G8B8: u32 = 22;
 
+/// `D3DPTEXTURECAPS_NONPOW2CONDITIONAL` — the `D3DCAPS9.TextureCaps` flag
+/// claiming non-power-of-two texture support (conditional; the sampler handles
+/// NPOT sizes with wrap/clamp address modes).
+const D3DPTEXTURECAPS_NONPOW2CONDITIONAL: u32 = 0x0000_0100;
+
+/// Maximum texture dimension the device accepts — the `D3DCAPS9`
+/// MaxTextureWidth/Height/AspectRatio claim, enforced by the Create* checks.
+pub(crate) const MAX_TEXTURE_DIMENSION: u32 = 4096;
+
 /// `D3DCLEAR_TARGET` — clear the render-target (backbuffer) surface.
 pub(super) const D3DCLEAR_TARGET: u32 = 0x0000_0001;
 /// `D3DCLEAR_ZBUFFER` — clear the depth buffer (deferred in slice 1).
@@ -315,13 +324,31 @@ pub fn handle_get_device_caps(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         write_caps_u32(engine, caps_address, 4, 0, "AdapterOrdinal")?;
 
         // MaxTextureWidth / MaxTextureHeight
-        write_caps_u32(engine, caps_address, 88, 4096, "MaxTextureWidth")?;
-        write_caps_u32(engine, caps_address, 92, 4096, "MaxTextureHeight")?;
+        write_caps_u32(
+            engine,
+            caps_address,
+            88,
+            MAX_TEXTURE_DIMENSION,
+            "MaxTextureWidth",
+        )?;
+        write_caps_u32(
+            engine,
+            caps_address,
+            92,
+            MAX_TEXTURE_DIMENSION,
+            "MaxTextureHeight",
+        )?;
 
         // TextureCaps — P4b: the sampler handles non-power-of-two sizes with
-        // wrap/clamp address modes, so claim NONPOW2CONDITIONAL (0x100).
+        // wrap/clamp address modes, so claim NONPOW2CONDITIONAL.
         // POW2 is trivially a subset and needs no separate claim.
-        write_caps_u32(engine, caps_address, 60, 0x0000_0100, "TextureCaps")?;
+        write_caps_u32(
+            engine,
+            caps_address,
+            60,
+            D3DPTEXTURECAPS_NONPOW2CONDITIONAL,
+            "TextureCaps",
+        )?;
 
         // MaxVolumeExtent
         write_caps_u32(engine, caps_address, 96, 256, "MaxVolumeExtent")?;
@@ -330,7 +357,13 @@ pub fn handle_get_device_caps(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         write_caps_u32(engine, caps_address, 100, 8192, "MaxTextureRepeat")?;
 
         // MaxTextureAspectRatio
-        write_caps_u32(engine, caps_address, 104, 4096, "MaxTextureAspectRatio")?;
+        write_caps_u32(
+            engine,
+            caps_address,
+            104,
+            MAX_TEXTURE_DIMENSION,
+            "MaxTextureAspectRatio",
+        )?;
 
         // MaxAnisotropy
         write_caps_u32(engine, caps_address, 108, 1, "MaxAnisotropy")?;

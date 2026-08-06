@@ -259,6 +259,24 @@ pub const D3DBLENDOP_SUBTRACT: u32 = 2;
 /// `D3DBLENDOP_REVSUBTRACT`.
 pub const D3DBLENDOP_REVSUBTRACT: u32 = 3;
 
+// ── Rasterizer conventions (not D3D header values) ─────────────────────
+
+/// The RGB channels of a `D3DCOLOR` (`0xAARRGGBB`) — the 0RGB backbuffer
+/// convention, where the alpha byte is zeroed before the color is stored.
+pub const D3DCOLOR_RGB_MASK: u32 = 0x00FF_FFFF;
+
+/// The pixel-center offset: the D3D9 rasterization rules evaluate the edge
+/// functions at the pixel center (integer coordinates + 0.5).
+const PIXEL_CENTER: f32 = 0.5;
+
+/// Minimum triangle area for the mip-LOD gradient (a smaller area is a
+/// degenerate triangle whose barycentric denominator is numerically unsafe).
+const MIN_TRIANGLE_AREA: f32 = 1.0e-9;
+
+/// Minimum uv-footprint for the mip LOD (`log2` floor — a smaller footprint
+/// would drive the LOD to `-inf` and clamp to level 0 anyway).
+const MIN_MIP_FOOTPRINT: f32 = 1.0e-6;
+
 /// Typed device render state (`D3DRS_*`), decoded at the `SetRenderState` /
 /// `GetRenderState` register boundary and read by the per-draw fragment stage.
 ///
@@ -536,7 +554,7 @@ pub fn rasterize_triangle(
     // `area_abs` is the barycentric denominator of the normalized triangle.
     let lod = if let Some(stage) = tex {
         let area_abs = area.abs();
-        if area_abs > 1.0e-9 {
+        if area_abs > MIN_TRIANGLE_AREA {
             let (aw, bw, cw) = (a, b, c);
             let du_dx =
                 (aw.u * (cw.y - bw.y) + bw.u * (aw.y - cw.y) + cw.u * (bw.y - aw.y)) / area_abs;
@@ -552,7 +570,7 @@ pub fn rasterize_triangle(
                 .max(du_dy.abs() * w0)
                 .max(dv_dx.abs() * h0)
                 .max(dv_dy.abs() * h0);
-            footprint.max(1.0e-6).log2()
+            footprint.max(MIN_MIP_FOOTPRINT).log2()
         } else {
             0.0
         }
@@ -603,7 +621,7 @@ pub fn rasterize_triangle(
         && ps.is_none()
         && a.color == b.color
         && b.color == c.color;
-    let flat_color = a.color & 0x00FF_FFFF;
+    let flat_color = a.color & D3DCOLOR_RGB_MASK;
     let flat_alpha = u8::try_from((a.color >> 24) & 0xFF).unwrap_or(0);
     // L3 vertex fog: the factor is computed per-vertex from the L1 stage's
     // screen-space z and interpolated across the triangle (Gouraud). Pixel
@@ -638,8 +656,8 @@ pub fn rasterize_triangle(
             {
                 continue;
             }
-            let cx = px as f32 + 0.5;
-            let cy = py as f32 + 0.5;
+            let cx = px as f32 + PIXEL_CENTER;
+            let cy = py as f32 + PIXEL_CENTER;
             let e_ab = (b.x - a.x) * (cy - a.y) - (b.y - a.y) * (cx - a.x);
             let e_bc = (c.x - b.x) * (cy - b.y) - (c.y - b.y) * (cx - b.x);
             let e_ca = (a.x - c.x) * (cy - c.y) - (a.y - c.y) * (cx - c.x);
@@ -728,7 +746,7 @@ pub fn rasterize_triangle(
                             (rgb, alpha)
                         }
                         _ => (
-                            gcolor & 0x00FF_FFFF,
+                            gcolor & D3DCOLOR_RGB_MASK,
                             u8::try_from((gcolor >> 24) & 0xFF).unwrap_or(0),
                         ),
                     },
@@ -751,7 +769,7 @@ pub fn rasterize_triangle(
                 } else {
                     wa * fog_fa + wb * fog_fb + wc * fog_fc
                 };
-                fog_blend(rgb, frag.fog_color & 0x00FF_FFFF, factor)
+                fog_blend(rgb, frag.fog_color & D3DCOLOR_RGB_MASK, factor)
             } else {
                 rgb
             };
@@ -1018,8 +1036,8 @@ pub fn rasterize_point(
     let width_us = usize::try_from(width).unwrap_or(0);
     for py in y0..y1 {
         for px in x0..x1 {
-            let cx = px as f32 + 0.5;
-            let cy = py as f32 + 0.5;
+            let cx = px as f32 + PIXEL_CENTER;
+            let cy = py as f32 + PIXEL_CENTER;
             // Half-open right/bottom: a size-1 point at a half-integer vertex
             // covers exactly the pixel containing the vertex.
             if cx < v.x - half || cx >= v.x + half || cy < v.y - half || cy >= v.y + half {
@@ -1089,7 +1107,7 @@ pub fn rasterize_line(
             let footprint = ((b.u - a.u).abs() * stage.width as f32)
                 .max((b.v - a.v).abs() * stage.height as f32)
                 / seg_len;
-            footprint.max(1.0e-6).log2()
+            footprint.max(MIN_MIP_FOOTPRINT).log2()
         }
         _ => 0.0,
     };
@@ -1099,8 +1117,8 @@ pub fn rasterize_line(
     let width_us = usize::try_from(width).unwrap_or(0);
     for py in y0..y1 {
         for px in x0..x1 {
-            let cx = px as f32 + 0.5;
-            let cy = py as f32 + 0.5;
+            let cx = px as f32 + PIXEL_CENTER;
+            let cy = py as f32 + PIXEL_CENTER;
             // Nearest point on the segment; distance <= 0.5px covers the pixel.
             let t = if len2 > 0.0 {
                 ((cx - a.x) * dx + (cy - a.y) * dy) / len2
@@ -1111,7 +1129,7 @@ pub fn rasterize_line(
             let on_x = a.x + t * dx;
             let on_y = a.y + t * dy;
             let dist2 = (cx - on_x) * (cx - on_x) + (cy - on_y) * (cy - on_y);
-            if dist2 > 0.25 {
+            if dist2 > PIXEL_CENTER * PIXEL_CENTER {
                 continue;
             }
             let iw = (1.0 - t) * ia + t * ib;
@@ -1211,7 +1229,7 @@ fn shade_fragment(
                 (rgb, eval_alpha_op(stage.alpha_op, alpha_arg1, alpha_arg2))
             }
             _ => (
-                gcolor & 0x00FF_FFFF,
+                gcolor & D3DCOLOR_RGB_MASK,
                 u8::try_from((gcolor >> 24) & 0xFF).unwrap_or(0),
             ),
         },
@@ -1226,7 +1244,7 @@ fn shade_fragment(
         } else {
             fog_factor(frag, frag.fog_vertex_mode, z)
         };
-        fog_blend(rgb, frag.fog_color & 0x00FF_FFFF, factor)
+        fog_blend(rgb, frag.fog_color & D3DCOLOR_RGB_MASK, factor)
     } else {
         rgb
     };

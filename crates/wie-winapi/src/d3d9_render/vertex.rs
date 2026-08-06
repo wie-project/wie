@@ -13,6 +13,9 @@ pub const IDENTITY: Mat4 = [
     0.0, 0.0, 1.0, 0.0, //
     0.0, 0.0, 0.0, 1.0, //
 ];
+/// The default diffuse color `D3DCOLOR_ARGB(255,255,255,255)` — opaque white,
+/// used when a vertex stream carries no `D3DFVF_DIFFUSE`.
+const D3DCOLOR_OPAQUE_WHITE: u32 = 0xFF_FF_FF_FF;
 /// Parsed FVF layout for one vertex stream.
 ///
 /// `#[expect(struct_excessive_bools)]`: the four flags mirror the four D3DFVF
@@ -140,7 +143,7 @@ pub fn parse_vertex(data: &[u8], offset: usize, fvf: &FvfLayout) -> Option<Guest
         off = off.checked_add(4)?;
         value
     } else {
-        0xFF_FF_FF_FF
+        D3DCOLOR_OPAQUE_WHITE
     };
     if fvf.has_specular {
         let _ = off.checked_add(4)?;

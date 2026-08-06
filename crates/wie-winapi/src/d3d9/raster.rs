@@ -504,7 +504,7 @@ fn rasterize_vertex_stream(
         d3d.d3d9_render_state_raw
             .get(&D3DRS_POINTSIZE)
             .copied()
-            .unwrap_or(0x3F80_0000),
+            .unwrap_or(1.0_f32.to_bits()),
     );
     // Resolve the texture stage through field-level borrows (the backbuffer
     // is held mutably below, so the stage must not borrow the whole struct).

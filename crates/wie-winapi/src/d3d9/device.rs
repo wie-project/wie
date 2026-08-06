@@ -18,17 +18,17 @@ use super::raster::{
 use super::{
     D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DERR_INVALIDCALL, D3DFMT_INDEX16, D3DFMT_INDEX32,
     D3DTS_PROJECTION, D3DTS_VIEW, D3DTS_WORLD, IDIRECT3D9_OBJECT_OFFSET,
-    IDIRECT3DDEVICE9_OBJECT_OFFSET, read_stack_argument,
+    IDIRECT3DDEVICE9_OBJECT_OFFSET, MAX_TEXTURE_DIMENSION, read_stack_argument,
 };
 use crate::d3d9_render::{
-    D3DRS_ALPHABLENDENABLE, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE, D3DRS_BLENDOP,
-    D3DRS_DESTBLEND, D3DRS_FOGCOLOR, D3DRS_FOGDENSITY, D3DRS_FOGENABLE, D3DRS_FOGEND,
-    D3DRS_FOGSTART, D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE, D3DRS_SCISSORTESTENABLE,
-    D3DRS_SRCBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU,
-    D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTS_TEXTURE0,
-    D3DTS_TEXTURE7, D3DTSS_ALPHAARG1, D3DTSS_ALPHAARG2, D3DTSS_ALPHAOP, D3DTSS_COLORARG1,
-    D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DTSS_TEXCOORDINDEX, D3dBlend, D3dBlendOp, D3dCmpFunc,
-    D3dZBufferType, RenderState, TextureStageState, mat4_mul, parse_fvf,
+    D3DCOLOR_RGB_MASK, D3DRS_ALPHABLENDENABLE, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF,
+    D3DRS_ALPHATESTENABLE, D3DRS_BLENDOP, D3DRS_DESTBLEND, D3DRS_FOGCOLOR, D3DRS_FOGDENSITY,
+    D3DRS_FOGENABLE, D3DRS_FOGEND, D3DRS_FOGSTART, D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE,
+    D3DRS_SCISSORTESTENABLE, D3DRS_SRCBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
+    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
+    D3DTS_TEXTURE0, D3DTS_TEXTURE7, D3DTSS_ALPHAARG1, D3DTSS_ALPHAARG2, D3DTSS_ALPHAOP,
+    D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DTSS_TEXCOORDINDEX, D3dBlend, D3dBlendOp,
+    D3dCmpFunc, D3dZBufferType, RenderState, TextureStageState, mat4_mul, parse_fvf,
 };
 use crate::fake_va::D3d9Iface;
 use crate::guest_memory::{write_u32 as write_guest_u32, write_u64 as write_guest_u64};
@@ -425,7 +425,7 @@ pub fn handle_clear(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult>
         .context("Clear rect count does not fit usize")?;
     let color =
         u32::try_from(color_raw & u64::from(u32::MAX)).context("Clear color does not fit u32")?;
-    let color_0rgb = color & 0x00FF_FFFF;
+    let color_0rgb = color & D3DCOLOR_RGB_MASK;
 
     if clear_target {
         // L6: Clear targets the bound render target when one is set, else
@@ -1445,8 +1445,8 @@ pub fn handle_create_render_target(ctx: &mut HandlerContext<'_>) -> Result<WinAp
     // cannot be honored honestly.
     let valid = width > 0
         && height > 0
-        && width <= 4096
-        && height <= 4096
+        && width <= MAX_TEXTURE_DIMENSION
+        && height <= MAX_TEXTURE_DIMENSION
         && matches!(format, super::D3DFMT_A8R8G8B8 | super::D3DFMT_X8R8G8B8)
         && multi_sample == 0
         && pp_surface != 0;

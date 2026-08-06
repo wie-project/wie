@@ -225,6 +225,22 @@ pub const D3DSIO_PHASE: u32 = 0xFFFD;
 pub const D3DSIO_COMMENT: u32 = 0xFFFE;
 pub const D3DSIO_END: u32 = 0xFFFF;
 
+/// `D3DSI_TEXLD_PROJECT` — the ps_2_a/b `texld` opcode-specific control for
+/// the projective form (`texldp`: sample at `u/w`, `v/w`).
+const D3DSI_TEXLD_PROJECT: u32 = 0x1;
+/// `D3DSI_TEXLD_BIAS` — the ps_2_a/b `texld` control for the bias form
+/// (`texldb`: the `w` component biases the mip selection).
+const D3DSI_TEXLD_BIAS: u32 = 0x2;
+
+/// `D3DSP_WRITEMASK_0` — write-mask bit for component 0 (x).
+pub const D3DSP_WRITEMASK_0: u8 = 0x1;
+/// `D3DSP_WRITEMASK_1` — write-mask bit for component 1 (y).
+pub const D3DSP_WRITEMASK_1: u8 = 0x2;
+/// `D3DSP_WRITEMASK_2` — write-mask bit for component 2 (z).
+pub const D3DSP_WRITEMASK_2: u8 = 0x4;
+/// `D3DSP_WRITEMASK_3` — write-mask bit for component 3 (w).
+pub const D3DSP_WRITEMASK_3: u8 = 0x8;
+
 /// Bound on the number of DWORD tokens one shader may contain.
 ///
 /// ps_2_0 caps instruction counts in the dozens; 4096 is a generous ceiling
@@ -743,8 +759,8 @@ fn parse_instruction(_kind: ShaderKind, tokens: &[u32]) -> Result<(PsInstruction
             // project (texldp) or bias (texldb) modifier.
             match control {
                 0 => (PsOp::Tex, Some(decode_operand(0)?), 2, None),
-                0x1 => (PsOp::TexLdP, Some(decode_operand(0)?), 2, None),
-                0x2 => (PsOp::TexLdB, Some(decode_operand(0)?), 2, None),
+                D3DSI_TEXLD_PROJECT => (PsOp::TexLdP, Some(decode_operand(0)?), 2, None),
+                D3DSI_TEXLD_BIAS => (PsOp::TexLdB, Some(decode_operand(0)?), 2, None),
                 other => anyhow::bail!("texld with unknown control 0x{other:x}"),
             }
         }
@@ -1153,7 +1169,7 @@ mod tests {
         let shader = match parse_shader(&bytes) {
             Ok(shader) => shader,
             Err(err) => {
-                eprintln!("parse error: {err:?}");
+                tracing::error!("parse error: {err:?}");
                 panic!("L5 vs bytecode parses: {err}");
             }
         };

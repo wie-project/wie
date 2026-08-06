@@ -4,8 +4,8 @@ use super::{
     D3D_OK, D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8, D3DFMT_X8R8G8B8,
     IDIRECT3DSURFACE9_ALLOCATION_SIZE, IDIRECT3DSURFACE9_METHOD_COUNT,
     IDIRECT3DSURFACE9_OBJECT_OFFSET, IDIRECT3DTEXTURE9_ALLOCATION_SIZE,
-    IDIRECT3DTEXTURE9_METHOD_COUNT, IDIRECT3DTEXTURE9_OBJECT_OFFSET, allocate_direct3d_block,
-    read_stack_argument,
+    IDIRECT3DTEXTURE9_METHOD_COUNT, IDIRECT3DTEXTURE9_OBJECT_OFFSET, MAX_TEXTURE_DIMENSION,
+    allocate_direct3d_block, read_stack_argument,
 };
 use crate::d3d9_render::{
     D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
@@ -228,8 +228,8 @@ pub fn handle_create_texture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
 
     let valid = width > 0
         && height > 0
-        && width <= 4096
-        && height <= 4096
+        && width <= MAX_TEXTURE_DIMENSION
+        && height <= MAX_TEXTURE_DIMENSION
         && matches!(format, D3DFMT_A8R8G8B8 | D3DFMT_X8R8G8B8)
         && pp_texture != 0;
 
