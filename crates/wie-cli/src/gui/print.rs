@@ -123,6 +123,12 @@ pub fn register_native_print_dialog_bridge(
 #[cfg(target_os = "macos")]
 const POINTS_PER_MM: f64 = 72.0 / 25.4;
 
+/// Win32 `dmOrientation` values (the DEVMODE field the pick round-trips).
+#[cfg(target_os = "macos")]
+const DMORIENT_PORTRAIT: u16 = 1;
+#[cfg(target_os = "macos")]
+const DMORIENT_LANDSCAPE: u16 = 2;
+
 /// Show one native print panel from the bridge callback.
 ///
 /// Runs on the guest thread; [`objc2_foundation::run_on_main`] dispatches the
@@ -158,7 +164,7 @@ fn show_native_print_dialog(
                 f64::from(width_mm) * POINTS_PER_MM,
                 f64::from(height_mm) * POINTS_PER_MM,
             ));
-            print_info.setOrientation(if request.orientation == 2 {
+            print_info.setOrientation(if request.orientation == DMORIENT_LANDSCAPE {
                 NSPaperOrientation::Landscape
             } else {
                 NSPaperOrientation::Portrait
@@ -226,9 +232,9 @@ fn show_native_print_dialog(
         let pick = wie_winapi::PrintDialogPick {
             paper_size_mm,
             orientation: if orientation == NSPaperOrientation::Landscape {
-                2
+                DMORIENT_LANDSCAPE
             } else {
-                1
+                DMORIENT_PORTRAIT
             },
             copies: u16::try_from(copies).unwrap_or(1),
             color: request.color.max(1),
@@ -306,7 +312,7 @@ fn show_native_page_setup_dialog(
                 f64::from(width_mm) * POINTS_PER_MM,
                 f64::from(height_mm) * POINTS_PER_MM,
             ));
-            print_info.setOrientation(if request.orientation == 2 {
+            print_info.setOrientation(if request.orientation == DMORIENT_LANDSCAPE {
                 NSPaperOrientation::Landscape
             } else {
                 NSPaperOrientation::Portrait
@@ -344,9 +350,9 @@ fn show_native_page_setup_dialog(
         Some(wie_winapi::PageSetupDialogPick {
             paper_size_mm,
             orientation: if orientation == NSPaperOrientation::Landscape {
-                2
+                DMORIENT_LANDSCAPE
             } else {
-                1
+                DMORIENT_PORTRAIT
             },
         })
     })

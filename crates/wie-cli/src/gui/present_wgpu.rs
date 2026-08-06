@@ -570,6 +570,11 @@ impl WgpuPresenter {
     }
 }
 
+/// wgpu's `COPY_BYTES_PER_ROW_ALIGNMENT`: the byte-stride multiple
+/// `write_texture` requires for every row (`bytes_per_row` must satisfy
+/// `% 256 == 0`).
+const COPY_BYTES_PER_ROW_ALIGNMENT: usize = 256;
+
 /// The source bytes + copy layout for one `write_texture` call.
 struct UploadSource<'a> {
     /// Source bytes. `Cow::Borrowed` for a full frame whose natural pitch is
@@ -637,7 +642,9 @@ fn upload_source<'a>(
     let row_bytes = width_us.saturating_mul(4);
     // wgpu requires `bytes_per_row` to be a multiple of 256 (the
     // COPY_BYTES_PER_ROW_ALIGNMENT validation in wgpu-core).
-    let padded = row_bytes.div_ceil(256).saturating_mul(256);
+    let padded = row_bytes
+        .div_ceil(COPY_BYTES_PER_ROW_ALIGNMENT)
+        .saturating_mul(COPY_BYTES_PER_ROW_ALIGNMENT);
     if region.is_none() && row_bytes == padded {
         // Full frame with a naturally aligned pitch: zero-copy u32 → u8 view
         // of the 0RGB buffer (LE on all supported hosts). `bytemuck::cast_slice`

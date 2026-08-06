@@ -8,6 +8,15 @@ use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+/// Default host-API-stop cap for micro runs (freestanding PEs until
+/// `ExitProcess`). Matches the runtime's own `run_micro_exe` default.
+const MICRO_MAX_API_DEFAULT: usize = 256;
+/// Default host-API-stop cap for the persistent run loop (yields on idle
+/// instead of gating on `ExitProcess`).
+const PERSISTENT_MAX_API_DEFAULT: usize = 3400;
+/// Default cap for `trace` (controlled entry-point API trace).
+const TRACE_MAX_API_DEFAULT: usize = 20;
+
 #[derive(Debug, Parser)]
 #[command(name = "wie-cli")]
 #[command(about = "WIE — PE64 userspace emulator")]
@@ -59,7 +68,8 @@ enum Command {
     Run {
         path: PathBuf,
 
-        /// Cap host API stops (micro default 256; persistent default 3400).
+        /// Cap host API stops (micro default `MICRO_MAX_API_DEFAULT`; persistent
+        /// default `PERSISTENT_MAX_API_DEFAULT`).
         #[arg(long)]
         max_api: Option<usize>,
 
@@ -111,7 +121,7 @@ enum Command {
     #[command(alias = "entry-trace")]
     Trace {
         path: PathBuf,
-        #[arg(long, default_value_t = 20)]
+        #[arg(long, default_value_t = TRACE_MAX_API_DEFAULT)]
         max_api: usize,
     },
 }
@@ -211,7 +221,7 @@ fn main() -> Result<()> {
                 }
                 commands::run_console_interactive(&path, max_api)?;
             } else if persistent {
-                let max = max_api.unwrap_or(3400);
+                let max = max_api.unwrap_or(PERSISTENT_MAX_API_DEFAULT);
                 if !guest_args.is_empty() {
                     bail!("guest argv is only supported in micro mode (omit --persistent)");
                 }
@@ -223,7 +233,7 @@ fn main() -> Result<()> {
                 }
                 commands::run_until_yield(&path, max)?;
             } else {
-                let max = max_api.unwrap_or(256);
+                let max = max_api.unwrap_or(MICRO_MAX_API_DEFAULT);
                 commands::run_micro(
                     &path,
                     max,

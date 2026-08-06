@@ -155,7 +155,8 @@ pub(crate) fn script_path(cli: Option<&Path>) -> Option<PathBuf> {
 }
 
 /// Spawn the driver thread. The thread waits for the guest's first window
-/// (up to 30 s), then executes `steps`, posting messages on its own schedule.
+/// (up to [`FIRST_WINDOW_WAIT_SECS`] s), then executes `steps`, posting
+/// messages on its own schedule.
 ///
 /// The guest keeps running after the script ends — acceptance scripts must
 /// drive the app to quit themselves (e.g. `type q` or `menu 2`).
@@ -337,16 +338,23 @@ fn vk_from_char(c: char) -> u16 {
     }
 }
 
-/// Wait up to 30 s for the guest to create its first window, polling the
-/// window tree every 10 ms. Returns `None` on timeout so the caller can skip
-/// the script instead of posting into a void.
+/// How long the script driver waits for the guest's first window before giving
+/// up and skipping the script.
+const FIRST_WINDOW_WAIT_SECS: u64 = 30;
+/// How often the wait polls the window tree.
+const FIRST_WINDOW_POLL_MS: u64 = 10;
+
+/// Wait up to [`FIRST_WINDOW_WAIT_SECS`] for the guest to create its first
+/// window, polling the window tree every [`FIRST_WINDOW_POLL_MS`]. Returns
+/// `None` on timeout so the caller can skip the script instead of posting into
+/// a void.
 fn wait_for_window(handle: &GuestHandle) -> Option<u64> {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(FIRST_WINDOW_WAIT_SECS);
     while Instant::now() < deadline {
         if let Some(hwnd) = handle.first_guest_window_handle() {
             return Some(hwnd);
         }
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(Duration::from_millis(FIRST_WINDOW_POLL_MS));
     }
     None
 }

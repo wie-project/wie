@@ -66,7 +66,7 @@ pub(crate) fn ensure_exe_in_bottle(
             dest.display()
         )
     })?;
-    eprintln!(
+    tracing::error!(
         "bottle: copied exe in ({} -> {})",
         host_path.display(),
         dest.display()
@@ -113,7 +113,7 @@ pub(crate) fn run_micro(
         Some(p) if is_interactive_stdin(p) => {
             // Interactive stdin: let the emulator read line-by-line from the host
             // TTY via LiveHost mode (empty bytes = live reading).
-            eprintln!("stdin: interactive (LiveHost mode)");
+            tracing::error!("stdin: interactive (LiveHost mode)");
             Vec::new()
         }
         Some(p) => std::fs::read(p)
@@ -137,13 +137,14 @@ pub(crate) fn run_micro(
         },
     )?;
 
-    eprintln!("run_micro: path={}", summary.path);
-    eprintln!("cpu_backend: {}", summary.cpu_backend);
-    eprintln!(
+    tracing::error!("run_micro: path={}", summary.path);
+    tracing::error!("cpu_backend: {}", summary.cpu_backend);
+    tracing::error!(
         "entry={:#018x} initial_rsp={:#018x}",
-        summary.entry_point_va, summary.initial_rsp
+        summary.entry_point_va,
+        summary.initial_rsp
     );
-    eprintln!(
+    tracing::error!(
         "events={} termination={:?}",
         summary.run.events.len(),
         summary.run.termination
@@ -159,7 +160,7 @@ pub(crate) fn run_micro(
     let force_full = std::env::var_os("WIE_API_TRACE").is_some();
     if force_full || events.len() <= HEAD + TAIL {
         for event in events {
-            eprintln!(
+            tracing::error!(
                 "  [{:>4}] {}!{} handled={} ret={:?}",
                 event.index,
                 event.library.as_ref(),
@@ -170,7 +171,7 @@ pub(crate) fn run_micro(
         }
     } else {
         for event in events.iter().take(HEAD) {
-            eprintln!(
+            tracing::error!(
                 "  [{:>4}] {}!{} handled={} ret={:?}",
                 event.index,
                 event.library.as_ref(),
@@ -180,9 +181,9 @@ pub(crate) fn run_micro(
             );
         }
         let omitted = events.len().saturating_sub(HEAD + TAIL);
-        eprintln!("  … {omitted} events omitted (set WIE_API_TRACE=1 for full dump) …");
+        tracing::error!("  … {omitted} events omitted (set WIE_API_TRACE=1 for full dump) …");
         for event in events.iter().skip(events.len().saturating_sub(TAIL)) {
-            eprintln!(
+            tracing::error!(
                 "  [{:>4}] {}!{} handled={} ret={:?}",
                 event.index,
                 event.library.as_ref(),
@@ -194,12 +195,12 @@ pub(crate) fn run_micro(
     }
 
     if let Some(profile) = &summary.profile {
-        eprintln!("{}", profile.report());
+        tracing::error!("{}", profile.report());
     }
 
     match summary.exit_code {
         Some(code) if code == expect_code => {
-            eprintln!("run_micro: ok exit={code}");
+            tracing::error!("run_micro: ok exit={code}");
             Ok(())
         }
         Some(code) => {
@@ -250,7 +251,7 @@ struct TerminalRawGuard;
 impl TerminalRawGuard {
     fn enter() -> Self {
         if !wie_winapi::console::set_raw_mode(true) {
-            eprintln!(
+            tracing::error!(
                 "warning: --console needs a terminal (stdin is not a tty); keys will require Enter"
             );
         }
@@ -263,6 +264,11 @@ impl Drop for TerminalRawGuard {
         wie_winapi::console::restore_terminal();
     }
 }
+
+/// How many API stops one `run_until_stop` call may consume before the loop
+/// re-enters. A per-quantum budget, not a session cap — an interactive game
+/// runs until the guest exits.
+const QUANTUM_MAX_API_DEFAULT: usize = 1_000_000;
 
 /// Runs a PE under `--console`: raw-mode interactive input for terminal games.
 ///
@@ -306,7 +312,7 @@ pub(crate) fn run_console_interactive(path: &Path, max_api: Option<usize>) -> Re
     // One quantum's worth of API stops; the loop re-enters, so this bounds a
     // single `run_until_stop` call, not the session (an interactive game runs
     // until the guest exits).
-    let quantum_budget = max_api.unwrap_or(1_000_000);
+    let quantum_budget = max_api.unwrap_or(QUANTUM_MAX_API_DEFAULT);
     let exit_code = loop {
         let summary = session.run_until_stop(quantum_budget)?;
         match summary.termination {
@@ -328,7 +334,7 @@ pub(crate) fn run_console_interactive(path: &Path, max_api: Option<usize>) -> Re
         }
     };
 
-    eprintln!("run_console: exit={exit_code}");
+    tracing::error!("run_console: exit={exit_code}");
     Ok(())
 }
 
@@ -439,7 +445,9 @@ mod tests {
         micro.push("micro-exes/out");
         micro.push("crt_hello.exe");
         if !micro.is_file() {
-            eprintln!("skip: micro-exes/out/crt_hello.exe not built (run make -C micro-exes)");
+            tracing::error!(
+                "skip: micro-exes/out/crt_hello.exe not built (run make -C micro-exes)"
+            );
             return;
         }
         // Stage the exe outside the bottle, in an unrelated temp dir.

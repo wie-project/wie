@@ -171,8 +171,8 @@ impl WieApp {
     /// event-loop thread where winit calls must run. Guest coordinates are
     /// LOGICAL 96-DPI pixels, so each value is multiplied by the window's
     /// device scale factor ([`input::logical_to_physical`]) to reach winit's
-    /// physical space — the same `max(100)` clamp guards against a
-    /// degenerate or negative rect. When no winit window exists yet (the
+    /// physical space — the same [`MIN_GUEST_WINDOW_SIZE`] clamp guards against
+    /// a degenerate or negative rect. When no winit window exists yet (the
     /// move arrived before the first published frame) the request stays
     /// pending and applies once the window is created.
     fn apply_host_geometry(&self) {
@@ -210,8 +210,8 @@ impl WieApp {
         // here). The returned actual size is informational — the winit
         // Resized event carries the settle.
         let _ = rt.window.request_inner_size(PhysicalSize::new(
-            input::logical_to_physical(width.max(100) as f64, sf) as u32,
-            input::logical_to_physical(height.max(100) as f64, sf) as u32,
+            input::logical_to_physical(width.max(MIN_GUEST_WINDOW_SIZE) as f64, sf) as u32,
+            input::logical_to_physical(height.max(MIN_GUEST_WINDOW_SIZE) as f64, sf) as u32,
         ));
     }
 
@@ -286,8 +286,8 @@ impl WieApp {
                 continue;
             }
             let is_first = self.primary_hwnd.is_none();
-            let width = width.max(100) as u32;
-            let height = height.max(100) as u32;
+            let width = width.max(MIN_GUEST_WINDOW_SIZE) as u32;
+            let height = height.max(MIN_GUEST_WINDOW_SIZE) as u32;
             let attrs = window_attributes(&title, width, height);
             let Ok(window) = event_loop.create_window(attrs) else {
                 tracing::error!(target: "wiegui", "create_window failed for a guest top-level");
@@ -359,6 +359,20 @@ const PARKED_RETRY_MS: u64 = 100;
 const OCCLUDED_RETRY_MS: u64 = 1000;
 /// How many slow re-arms an occluded window gets before the frame parks.
 const OCCLUDED_RETRY_MAX: u8 = 3;
+
+/// Minimum guest window dimension (LOGICAL 96-DPI px): clamps a degenerate or
+/// negative rect from `SetWindowPlacement` / the guest top-level records so
+/// winit never sees a zero-size window.
+const MIN_GUEST_WINDOW_SIZE: i32 = 100;
+
+/// Win32 `WHEEL_DELTA`: the per-notch distance of a mouse-wheel line delta
+/// (winit `LineDelta` values are multiples of this).
+const WHEEL_DELTA: f32 = 120.0;
+
+/// Stack size for the guest thread (`thread::Builder::stack_size`). A GUI
+/// guest (guest stubs, host-stop handlers, the winit bridge) needs a deep
+/// host stack; 8 MiB is the macOS main-thread default.
+const GUEST_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 /// Per-window host state for one winit window — the payload of each entry in
 /// the [`WindowRegistry`]. One entry exists per guest top-level window; the
@@ -949,7 +963,7 @@ impl ApplicationHandler<WieEvent> for WieApp {
             WindowEvent::MouseWheel { delta, .. } => {
                 let (delta_x, delta_y) = match delta {
                     winit::event::MouseScrollDelta::LineDelta(x, y) => {
-                        ((x * 120.0) as i32, (y * 120.0) as i32)
+                        ((x * WHEEL_DELTA) as i32, (y * WHEEL_DELTA) as i32)
                     }
                     winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.x as i32, pos.y as i32),
                 };
@@ -1307,6 +1321,40 @@ impl ApplicationHandler<WieEvent> for WieApp {
     }
 }
 
+/// Win32 `MB_*` flag bits (the low nibble of `MB_ICONMASK`/`MB_TYPEMASK` picks
+/// the button set; the next nibble the icon). The rfd bridge receives the raw
+/// flag word from the guest's MessageBoxA/W call.
+#[cfg(target_os = "macos")]
+const MB_TYPEMASK: u32 = 0x0000_000F;
+#[cfg(target_os = "macos")]
+const MB_ICONMASK: u32 = 0x0000_00F0;
+#[cfg(target_os = "macos")]
+const MB_OK: u32 = 0x0000_0000;
+#[cfg(target_os = "macos")]
+const MB_OKCANCEL: u32 = 0x0000_0001;
+#[cfg(target_os = "macos")]
+const MB_YESNOCANCEL: u32 = 0x0000_0003;
+#[cfg(target_os = "macos")]
+const MB_YESNO: u32 = 0x0000_0004;
+#[cfg(target_os = "macos")]
+const MB_ICONERROR: u32 = 0x0000_0010;
+#[cfg(target_os = "macos")]
+const MB_ICONQUESTION: u32 = 0x0000_0020;
+#[cfg(target_os = "macos")]
+const MB_ICONWARNING: u32 = 0x0000_0030;
+#[cfg(target_os = "macos")]
+const MB_ICONINFORMATION: u32 = 0x0000_0040;
+
+/// Win32 standard dialog-command ids (`WM_COMMAND` wParam lows).
+#[cfg(target_os = "macos")]
+const IDOK: i32 = 1;
+#[cfg(target_os = "macos")]
+const IDCANCEL: i32 = 2;
+#[cfg(target_os = "macos")]
+const IDYES: i32 = 6;
+#[cfg(target_os = "macos")]
+const IDNO: i32 = 7;
+
 /// Map Win32 `MB_*` flag bits to rfd's dialog shape.
 ///
 /// The low nibble selects the button set, the next nibble the icon. rfd has no
@@ -1314,32 +1362,34 @@ impl ApplicationHandler<WieEvent> for WieApp {
 /// fall back to the MB_OK / no-icon defaults, matching real MessageBox.
 #[cfg(target_os = "macos")]
 fn map_message_box_buttons(mb_type: u32) -> (rfd::MessageButtons, rfd::MessageLevel) {
-    let buttons = match mb_type & 0x0F {
-        0x1 => rfd::MessageButtons::OkCancel,
-        0x3 => rfd::MessageButtons::YesNoCancel,
-        0x4 => rfd::MessageButtons::YesNo,
-        _ => rfd::MessageButtons::Ok, // 0x0 = MB_OK
+    let buttons = match mb_type & MB_TYPEMASK {
+        MB_OK => rfd::MessageButtons::Ok,
+        MB_OKCANCEL => rfd::MessageButtons::OkCancel,
+        MB_YESNOCANCEL => rfd::MessageButtons::YesNoCancel,
+        MB_YESNO => rfd::MessageButtons::YesNo,
+        // Unknown button bits fall back to Ok (matching real MessageBox).
+        _ => rfd::MessageButtons::Ok,
     };
-    let level = match mb_type & 0xF0 {
-        0x10 => rfd::MessageLevel::Error,
-        0x30 => rfd::MessageLevel::Warning,
-        0x40 => rfd::MessageLevel::Info,
-        // 0x20 = MB_ICONQUESTION and 0x00 = no icon both read as Info.
+    let level = match mb_type & MB_ICONMASK {
+        MB_ICONERROR => rfd::MessageLevel::Error,
+        MB_ICONWARNING => rfd::MessageLevel::Warning,
+        MB_ICONINFORMATION | MB_ICONQUESTION => rfd::MessageLevel::Info,
+        // No icon bits (plain MB_OK) also read as Info.
         _ => rfd::MessageLevel::Info,
     };
     (buttons, level)
 }
 
-/// Map an rfd alert result to the Win32 id the guest expects
-/// (IDOK=1, IDCANCEL=2, IDYES=6, IDNO=7).
+/// Map an rfd alert result to the Win32 id the guest expects (IDOK, IDCANCEL,
+/// IDYES, IDNO).
 #[cfg(target_os = "macos")]
 fn map_alert_result(result: rfd::MessageDialogResult) -> i32 {
     match result {
-        rfd::MessageDialogResult::Ok => 1,
-        rfd::MessageDialogResult::Cancel => 2,
-        rfd::MessageDialogResult::Yes => 6,
-        rfd::MessageDialogResult::No => 7,
-        rfd::MessageDialogResult::Custom(_) => 2,
+        rfd::MessageDialogResult::Ok => IDOK,
+        rfd::MessageDialogResult::Cancel => IDCANCEL,
+        rfd::MessageDialogResult::Yes => IDYES,
+        rfd::MessageDialogResult::No => IDNO,
+        rfd::MessageDialogResult::Custom(_) => IDCANCEL,
     }
 }
 
@@ -1460,7 +1510,7 @@ pub fn run_gui_windowed(
 
         thread::Builder::new()
             .name("wie-guest-primary".into())
-            .stack_size(8 * 1024 * 1024)
+            .stack_size(GUEST_THREAD_STACK_BYTES)
             .spawn(move || {
                 match RuntimeSession::new(
                     &run_path,

@@ -34,7 +34,7 @@ pub fn run_screenshot(path: &Path, out_path: &Path) -> Result<()> {
     // the new frame-time fields.
     if session.profile_enabled() {
         session.finalize_profile(run_t0.elapsed().as_nanos(), 0, 0);
-        eprintln!("{}", session.profile().report());
+        tracing::error!("{}", session.profile().report());
     }
 
     // Try to capture a frame for screenshot.
