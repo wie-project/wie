@@ -458,16 +458,31 @@ fn rasterize_vertex_stream(
     indices: Option<(&[u8], usize, usize)>,
     vertex_base: i64,
 ) {
-    let (width, height) = (
+    let (bb_width, bb_height) = (
         state.d3d9().d3d9_backbuffer_width,
         state.d3d9().d3d9_backbuffer_height,
     );
-    if width == 0 || height == 0 || groups.is_empty() {
+    let rt = state.d3d9().d3d9_render_target;
+    if rt != 0 && !state.d3d9().d3d9_render_targets.contains_key(&rt) {
+        return; // stale RT binding — nothing to draw into
+    }
+    if groups.is_empty() {
+        return;
+    }
+    // L6 output target: a bound render target redirects every draw into its
+    // own texel buffer; otherwise the implicit backbuffer receives the frame.
+    let (width, height): (u32, u32) = if rt == 0 {
+        (bb_width, bb_height)
+    } else {
+        let d3d = state.d3d9();
+        d3d.d3d9_render_targets
+            .get(&rt)
+            .map_or((0, 0), |record| (record.width, record.height))
+    };
+    if width == 0 || height == 0 {
         return;
     }
     let d3d = state.d3d9();
-    // Copy the transform state out of the borrowed state (small f32 copies)
-    // so the rasterizer can hold the backbuffer mutably below.
     let world = d3d.d3d9_world_matrix;
     let view = d3d.d3d9_view_matrix;
     let projection = d3d.d3d9_projection_matrix;
@@ -554,6 +569,18 @@ fn rasterize_vertex_stream(
             layout,
         )
     };
+    // L6: resolve the color output buffer once — the bound render target's
+    // texels when one is set, else the implicit backbuffer. Field-level
+    // borrows keep `frag` (depth surfaces) and the output disjoint.
+    let output: &mut [u32] = if rt == 0 {
+        &mut d3d.d3d9_backbuffer
+    } else {
+        &mut d3d
+            .d3d9_render_targets
+            .get_mut(&rt)
+            .expect("RT presence checked above")
+            .pixels
+    };
     match groups {
         PrimitiveGroups::Points(points) => {
             for &i0 in points {
@@ -563,7 +590,7 @@ fn rasterize_vertex_stream(
                 };
                 match transform(v0) {
                     TransformedVertex::Screen(sv) => rasterize_point(
-                        &mut d3d.d3d9_backbuffer,
+                        output,
                         width,
                         height,
                         sv,
@@ -578,7 +605,7 @@ fn rasterize_vertex_stream(
                     TransformedVertex::Clip(cv) => {
                         if let Some(sv) = clip_to_screen_vertex(&cv, &viewport) {
                             rasterize_point(
-                                &mut d3d.d3d9_backbuffer,
+                                output,
                                 width,
                                 height,
                                 sv,
@@ -604,7 +631,7 @@ fn rasterize_vertex_stream(
                 match (transform(v0), transform(v1)) {
                     (TransformedVertex::Screen(a), TransformedVertex::Screen(b)) => {
                         rasterize_line(
-                            &mut d3d.d3d9_backbuffer,
+                            output,
                             width,
                             height,
                             a,
@@ -627,7 +654,7 @@ fn rasterize_vertex_stream(
                                 continue;
                             };
                             rasterize_line(
-                                &mut d3d.d3d9_backbuffer,
+                                output,
                                 width,
                                 height,
                                 a,
@@ -661,7 +688,7 @@ fn rasterize_vertex_stream(
                         TransformedVertex::Screen(c),
                     ) => {
                         rasterize_triangle(
-                            &mut d3d.d3d9_backbuffer,
+                            output,
                             width,
                             height,
                             a,
@@ -691,7 +718,7 @@ fn rasterize_vertex_stream(
                                     continue;
                                 };
                                 rasterize_triangle(
-                                    &mut d3d.d3d9_backbuffer,
+                                    output,
                                     width,
                                     height,
                                     a,

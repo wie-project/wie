@@ -224,7 +224,10 @@ pub enum Device9Method {
     CreateTexture = 23,
     CreateVertexBuffer = 26,
     CreateIndexBuffer = 27,
+    CreateRenderTarget = 28,
     CreateDepthStencilSurface = 29,
+    SetRenderTarget = 37,
+    GetRenderTarget = 38,
     SetDepthStencilSurface = 39,
     GetDepthStencilSurface = 40,
     BeginScene = 41,
@@ -283,7 +286,10 @@ impl Device9Method {
             23 => Some(Self::CreateTexture),
             26 => Some(Self::CreateVertexBuffer),
             27 => Some(Self::CreateIndexBuffer),
+            28 => Some(Self::CreateRenderTarget),
             29 => Some(Self::CreateDepthStencilSurface),
+            37 => Some(Self::SetRenderTarget),
+            38 => Some(Self::GetRenderTarget),
             39 => Some(Self::SetDepthStencilSurface),
             40 => Some(Self::GetDepthStencilSurface),
             41 => Some(Self::BeginScene),
@@ -344,11 +350,14 @@ impl Device9Method {
             Self::Release => Cow::Borrowed("IDirect3DDevice9::Release"),
             Self::Present => Cow::Borrowed("IDirect3DDevice9::Present"),
             Self::CreateTexture => Cow::Borrowed("IDirect3DDevice9::CreateTexture"),
+            Self::CreateRenderTarget => Cow::Borrowed("IDirect3DDevice9::CreateRenderTarget"),
             Self::CreateVertexBuffer => Cow::Borrowed("IDirect3DDevice9::CreateVertexBuffer"),
             Self::CreateIndexBuffer => Cow::Borrowed("IDirect3DDevice9::CreateIndexBuffer"),
             Self::CreateDepthStencilSurface => {
                 Cow::Borrowed("IDirect3DDevice9::CreateDepthStencilSurface")
             }
+            Self::SetRenderTarget => Cow::Borrowed("IDirect3DDevice9::SetRenderTarget"),
+            Self::GetRenderTarget => Cow::Borrowed("IDirect3DDevice9::GetRenderTarget"),
             Self::SetDepthStencilSurface => {
                 Cow::Borrowed("IDirect3DDevice9::SetDepthStencilSurface")
             }

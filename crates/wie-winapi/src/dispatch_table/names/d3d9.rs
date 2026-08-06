@@ -393,4 +393,26 @@ pub(super) const ROWS: &[(&str, &str, WinApiId)] = &[
         "idirect3ddevice9::setscissorrect",
         WinApiId::D3d9Idirect3ddevice9Setscissorrect,
     ),
+    // ── L6 appended rows (render targets + the surface GetDesc) — the
+    // variant order mirrors the appended enum discriminants.
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::createrendertarget",
+        WinApiId::D3d9Idirect3ddevice9Createrendertarget,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::setrendertarget",
+        WinApiId::D3d9Idirect3ddevice9Setrendertarget,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3ddevice9::getrendertarget",
+        WinApiId::D3d9Idirect3ddevice9Getrendertarget,
+    ),
+    (
+        "d3d9.dll",
+        "idirect3dsurface9::getdesc",
+        WinApiId::D3d9Idirect3dsurface9Getdesc,
+    ),
 ];

@@ -1,6 +1,9 @@
 //! D3D9 P3 software-render handler tests: caps, clear, scene flags, transform / viewport state, triangle rasterization, and Present frame publishing.
 use super::*;
 
+/// `D3DFMT_A8R8G8B8` — the render-target format the L6 handlers accept.
+const D3DFMT_A8R8G8B8: u32 = 21;
+
 // ── P3 D3D9 software-render handlers ────────────────────────────────
 
 #[test]
@@ -431,4 +434,451 @@ fn test_d3d9_present_publishes_surface_frame() {
         .expect("Present must publish a SurfaceFrame");
     assert_eq!((frame.width, frame.height), (4, 3));
     assert_eq!(&frame.pixels[..], &(0_u32..12).collect::<Vec<u32>>()[..]);
+}
+
+// ── L6 render-target handlers ─────────────────────────────────────
+
+/// CreateRenderTarget(4x4, A8R8G8B8) → a surface object with its own texels.
+#[test]
+fn test_d3d9_create_render_target_allocates_surface() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    engine
+        .mem_write(0x2000, &0x2000_u64.to_le_bytes())
+        .expect("seed bump cursor");
+
+    let pp_surface = 0x7000_u64;
+    write_regs(&mut engine, 1, 4, 4, u64::from(D3DFMT_A8R8G8B8), 0);
+    // MultiSample=0 (NONE) @0x28, MultiSampleQuality=0 @0x30, Lockable=1
+    // @0x38, ppSurface @0x40.
+    engine
+        .mem_write(STACK_TOP + 0x28, &0_u32.to_le_bytes())
+        .expect("write MultiSample");
+    engine
+        .mem_write(STACK_TOP + 0x40, &pp_surface.to_le_bytes())
+        .expect("write ppSurface");
+    assert_return_value!(
+        d3d9::handle_create_render_target(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut surf_bytes = [0_u8; 8];
+    engine
+        .mem_read(pp_surface, &mut surf_bytes)
+        .expect("read surface ptr");
+    let rt_va = u64::from_le_bytes(surf_bytes);
+    let record = state
+        .d3d9()
+        .d3d9_render_targets
+        .get(&rt_va)
+        .expect("render-target record exists");
+    assert_eq!((record.width, record.height), (4, 4));
+    assert_eq!(record.pixels.len(), 16);
+    assert!(record.pixels.iter().all(|&p| p == 0), "RT starts zeroed");
+
+    // A multisample request above NONE is the honest D3DERR_INVALIDCALL.
+    let pp2 = 0x7100_u64;
+    write_regs(&mut engine, 1, 4, 4, u64::from(D3DFMT_A8R8G8B8), 0);
+    engine
+        .mem_write(STACK_TOP + 0x28, &4_u32.to_le_bytes())
+        .expect("write MultiSample=4");
+    engine
+        .mem_write(STACK_TOP + 0x40, &pp2.to_le_bytes())
+        .expect("write ppSurface");
+    assert_return_value!(
+        d3d9::handle_create_render_target(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0x8876_086c_u64
+    );
+    let mut cleared = [0_u8; 8];
+    engine
+        .mem_read(pp2, &mut cleared)
+        .expect("read failed surface ptr");
+    assert_eq!(u64::from_le_bytes(cleared), 0, "failed Create writes NULL");
+}
+
+/// SetRenderTarget(0, rt) binds; GetRenderTarget(0) round-trips; NULL
+/// rebinds the backbuffer; an unknown surface is the honest INVALIDCALL.
+#[test]
+fn test_d3d9_set_get_render_target_binding() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    engine
+        .mem_write(0x2000, &0x2000_u64.to_le_bytes())
+        .expect("seed bump cursor");
+
+    let pp_surface = 0x7000_u64;
+    write_regs(&mut engine, 1, 4, 4, u64::from(D3DFMT_A8R8G8B8), 0);
+    engine
+        .mem_write(STACK_TOP + 0x28, &0_u32.to_le_bytes())
+        .expect("write MultiSample");
+    engine
+        .mem_write(STACK_TOP + 0x40, &pp_surface.to_le_bytes())
+        .expect("write ppSurface");
+    assert_return_value!(
+        d3d9::handle_create_render_target(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut surf_bytes = [0_u8; 8];
+    engine
+        .mem_read(pp_surface, &mut surf_bytes)
+        .expect("read surface ptr");
+    let rt_va = u64::from_le_bytes(surf_bytes);
+
+    // SetRenderTarget(0, rt).
+    write_regs(&mut engine, 1, 0, rt_va, 0, 0);
+    assert_return_value!(
+        d3d9::handle_set_render_target(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    assert_eq!(state.d3d9().d3d9_render_target, rt_va);
+
+    // GetRenderTarget(0, out) returns it.
+    let out_rt = 0x7200_u64;
+    write_regs(&mut engine, 1, 0, out_rt, 0, 0);
+    assert_return_value!(
+        d3d9::handle_get_render_target(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut out_bytes = [0_u8; 8];
+    engine
+        .mem_read(out_rt, &mut out_bytes)
+        .expect("read returned RT");
+    assert_eq!(u64::from_le_bytes(out_bytes), rt_va);
+
+    // SetRenderTarget(0, NULL) rebinds the backbuffer (returns 0).
+    write_regs(&mut engine, 1, 0, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_set_render_target(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    assert_eq!(state.d3d9().d3d9_render_target, 0);
+    write_regs(&mut engine, 1, 0, out_rt, 0, 0);
+    assert_return_value!(
+        d3d9::handle_get_render_target(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    engine
+        .mem_read(out_rt, &mut out_bytes)
+        .expect("read unbound RT");
+    assert_eq!(u64::from_le_bytes(out_bytes), 0, "unbound RT returns 0");
+
+    // An unknown surface is the honest D3DERR_INVALIDCALL.
+    write_regs(&mut engine, 1, 0, 0x9999, 0, 0);
+    assert_return_value!(
+        d3d9::handle_set_render_target(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0x8876_086c_u64
+    );
+}
+
+/// Clear + DrawPrimitiveUP route into the bound RT's texels, not the
+/// backbuffer; the backbuffer is untouched.
+#[test]
+fn test_d3d9_clear_and_draw_route_to_bound_render_target() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    engine
+        .mem_write(0x2000, &0x2000_u64.to_le_bytes())
+        .expect("seed bump cursor");
+    {
+        let d3d = state.d3d9();
+        d3d.d3d9_backbuffer_width = 16;
+        d3d.d3d9_backbuffer_height = 16;
+        d3d.d3d9_backbuffer = vec![0x00_AB_CD_EF_u32; 16 * 16]; // sentinel
+        d3d.d3d9_viewport = (0, 0, 16, 16, 0.0, 1.0);
+    }
+
+    // Create an 8x8 render target.
+    let pp_surface = 0x7000_u64;
+    write_regs(&mut engine, 1, 8, 8, u64::from(D3DFMT_A8R8G8B8), 0);
+    engine
+        .mem_write(STACK_TOP + 0x28, &0_u32.to_le_bytes())
+        .expect("write MultiSample");
+    engine
+        .mem_write(STACK_TOP + 0x40, &pp_surface.to_le_bytes())
+        .expect("write ppSurface");
+    assert_return_value!(
+        d3d9::handle_create_render_target(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut surf_bytes = [0_u8; 8];
+    engine
+        .mem_read(pp_surface, &mut surf_bytes)
+        .expect("read surface ptr");
+    let rt_va = u64::from_le_bytes(surf_bytes);
+
+    // The viewport must match the bound RT (a real app sets viewport =
+    // RT size after binding); a 16x16 viewport would map the triangle into a
+    // 16-wide screen space and clip into the 8-wide RT.
+    {
+        let d3d = state.d3d9();
+        d3d.d3d9_viewport = (0, 0, 8, 8, 0.0, 1.0);
+    }
+
+    // Bind it, clear it red, draw a full-frame triangle.
+    write_regs(&mut engine, 1, 0, rt_va, 0, 0);
+    assert_return_value!(
+        d3d9::handle_set_render_target(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    write_regs(&mut engine, 1, 0, 0, u64::from(D3DCLEAR_TARGET), 0);
+    engine
+        .mem_write(STACK_TOP + 0x28, &0xFF_C8_00_00_u32.to_le_bytes())
+        .expect("write clear color");
+    assert_return_value!(
+        d3d9::handle_clear(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    // The RT is clear red; the backbuffer keeps its sentinel.
+    assert!(
+        state
+            .d3d9()
+            .d3d9_render_targets
+            .get(&rt_va)
+            .is_some_and(|record| record.pixels.iter().all(|&p| p == 0x00_C8_00_00)),
+        "RT clear must fill the RT texels"
+    );
+    assert!(
+        state
+            .d3d9()
+            .d3d9_backbuffer
+            .iter()
+            .all(|&p| p == 0x00_AB_CD_EF),
+        "RT clear must not touch the backbuffer"
+    );
+
+    // FVF + BeginScene + a full-frame triangle into the RT.
+    write_regs(&mut engine, 1, u64::from(0x0002_u32 | 0x0040_u32), 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_set_fvf(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    write_regs(&mut engine, 1, 0, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_begin_scene(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let data_va = 0x6000_u64;
+    let vertices: [[f32; 3]; 3] = [[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [-1.0, 1.0, 0.0]];
+    let colors: [u32; 3] = [0xFF_FF_00_00, 0xFF_00_FF_00, 0xFF_00_00_FF];
+    for (i, vertex) in vertices.iter().enumerate() {
+        for (j, component) in vertex.iter().enumerate() {
+            engine
+                .mem_write(
+                    data_va
+                        + u64::try_from(i).unwrap_or(0) * 16
+                        + u64::try_from(j).unwrap_or(0) * 4,
+                    &component.to_le_bytes(),
+                )
+                .expect("write vertex position");
+        }
+        engine
+            .mem_write(
+                data_va + u64::try_from(i).unwrap_or(0) * 16 + 12,
+                &colors.get(i).copied().unwrap_or(0).to_le_bytes(),
+            )
+            .expect("write vertex color");
+    }
+    write_regs(&mut engine, 1, u64::from(D3DPT_TRIANGLELIST), 1, data_va, 0);
+    engine
+        .mem_write(STACK_TOP + 0x28, &16_u64.to_le_bytes())
+        .expect("write stride");
+    assert_return_value!(
+        d3d9::handle_draw_primitive_up(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+
+    // The RT now holds the triangle's colors; the backbuffer is untouched.
+    let rt_pixels = state
+        .d3d9()
+        .d3d9_render_targets
+        .get(&rt_va)
+        .expect("RT exists")
+        .pixels
+        .clone();
+    let back_pixels = state.d3d9().d3d9_backbuffer.clone();
+    let rt_pixel = |x: u32, y: u32| {
+        rt_pixels
+            .get(usize::try_from(y).unwrap_or(0) * 8 + usize::try_from(x).unwrap_or(0))
+            .copied()
+    };
+    assert!(
+        (rt_pixel(1, 7).unwrap_or(0) >> 16) & 0xFF > 0xB0,
+        "bottom-left corner of the RT is red-dominant (triangle red vertex)"
+    );
+    assert!(
+        (rt_pixel(7, 7).unwrap_or(0) >> 8) & 0xFF > 0xB0,
+        "bottom-right corner of the RT is green-dominant (triangle green vertex)"
+    );
+    assert!(
+        (rt_pixel(1, 1).unwrap_or(0) & 0xFF) > 0xB0,
+        "top-left corner of the RT is blue-dominant (triangle blue vertex)"
+    );
+    assert!(
+        back_pixels.iter().all(|&p| p == 0x00_AB_CD_EF),
+        "the backbuffer must be untouched by RT-bound draws"
+    );
+
+    // The GetDesc of the RT surface reports its dims + format.
+    let desc_va = 0x7400_u64;
+    write_regs(&mut engine, rt_va, desc_va, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_surface_get_desc(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut desc_bytes = [0_u8; 32];
+    engine
+        .mem_read(desc_va, &mut desc_bytes)
+        .expect("read surface desc");
+    let format = u32::from_le_bytes(desc_bytes[0..4].try_into().unwrap_or([0; 4]));
+    let width = u32::from_le_bytes(desc_bytes[24..28].try_into().unwrap_or([0; 4]));
+    let height = u32::from_le_bytes(desc_bytes[28..32].try_into().unwrap_or([0; 4]));
+    assert_eq!(format, D3DFMT_A8R8G8B8, "RT GetDesc reports its format");
+    assert_eq!((width, height), (8, 8), "RT GetDesc reports its dims");
+}
+
+/// Surface LockRect/UnlockRect round-trips an offscreen RT's texels.
+#[test]
+fn test_d3d9_render_target_lock_unlock_round_trip() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    engine
+        .mem_write(0x2000, &0x2000_u64.to_le_bytes())
+        .expect("seed bump cursor");
+
+    let pp_surface = 0x7000_u64;
+    write_regs(&mut engine, 1, 4, 4, u64::from(D3DFMT_A8R8G8B8), 0);
+    engine
+        .mem_write(STACK_TOP + 0x28, &0_u32.to_le_bytes())
+        .expect("write MultiSample");
+    engine
+        .mem_write(STACK_TOP + 0x40, &pp_surface.to_le_bytes())
+        .expect("write ppSurface");
+    assert_return_value!(
+        d3d9::handle_create_render_target(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut surf_bytes = [0_u8; 8];
+    engine
+        .mem_read(pp_surface, &mut surf_bytes)
+        .expect("read surface ptr");
+    let rt_va = u64::from_le_bytes(surf_bytes);
+
+    // LockRect → pitch 16, pBits; write a texel; UnlockRect lands it.
+    let locked_rect = 0x7200_u64;
+    write_regs(&mut engine, rt_va, locked_rect, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_surface_lock_rect(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut pitch_bytes = [0_u8; 4];
+    engine
+        .mem_read(locked_rect, &mut pitch_bytes)
+        .expect("read pitch");
+    assert_eq!(u32::from_le_bytes(pitch_bytes), 16, "4x4 pitch must be 16");
+    let mut bits_bytes = [0_u8; 8];
+    engine
+        .mem_read(locked_rect + 8, &mut bits_bytes)
+        .expect("read pBits");
+    let p_bits = u64::from_le_bytes(bits_bytes);
+    engine
+        .mem_write(p_bits, &0xFF_12_34_56_u32.to_le_bytes())
+        .expect("write texel");
+    write_regs(&mut engine, rt_va, 0, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_surface_unlock_rect(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    assert_eq!(
+        state
+            .d3d9()
+            .d3d9_render_targets
+            .get(&rt_va)
+            .expect("RT")
+            .pixels[0],
+        0xFF_12_34_56,
+        "RT UnlockRect must copy the texel back"
+    );
+
+    // Release the RT: record gone, lock state cleared, binding reset.
+    write_regs(&mut engine, rt_va, 0, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_surface_release(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        1
+    );
+    assert!(!state.d3d9().d3d9_render_targets.contains_key(&rt_va));
 }

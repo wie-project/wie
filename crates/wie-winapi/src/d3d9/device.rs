@@ -477,14 +477,31 @@ pub fn handle_clear(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult>
     let color_0rgb = color & 0x00FF_FFFF;
 
     if clear_target {
-        let (width, height) = (
-            state.d3d9().d3d9_backbuffer_width,
-            state.d3d9().d3d9_backbuffer_height,
-        );
+        // L6: Clear targets the bound render target when one is set, else
+        // the implicit backbuffer. The RT's own dims size the clear.
+        let rt = state.d3d9().d3d9_render_target;
+        let (width, height) = if rt == 0 {
+            (
+                state.d3d9().d3d9_backbuffer_width,
+                state.d3d9().d3d9_backbuffer_height,
+            )
+        } else {
+            state
+                .d3d9()
+                .d3d9_render_targets
+                .get(&rt)
+                .map_or((0, 0), |record| (record.width, record.height))
+        };
         if width > 0 && height > 0 {
             let needed = usize::try_from(width.checked_mul(height).unwrap_or(0)).unwrap_or(0);
-            if state.d3d9().d3d9_backbuffer.len() != needed {
-                state.d3d9().d3d9_backbuffer = vec![color_0rgb; needed];
+            if rt == 0 {
+                if state.d3d9().d3d9_backbuffer.len() != needed {
+                    state.d3d9().d3d9_backbuffer = vec![color_0rgb; needed];
+                }
+            } else if let Some(record) = state.d3d9().d3d9_render_targets.get_mut(&rt)
+                && record.pixels.len() != needed
+            {
+                record.pixels = vec![color_0rgb; needed];
             }
             if rects_ptr != 0 && rect_count > 0 {
                 let mut rect_bytes = vec![0_u8; rect_count.saturating_mul(16)];
@@ -514,25 +531,33 @@ pub fn handle_clear(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult>
                                 .and_then(|s| s.try_into().ok())
                                 .unwrap_or([0; 4]),
                         );
+                        let output: &mut [u32] = if rt == 0 {
+                            &mut state.d3d9().d3d9_backbuffer
+                        } else {
+                            state
+                                .d3d9()
+                                .d3d9_render_targets
+                                .get_mut(&rt)
+                                .map_or(&mut [], |record| record.pixels.as_mut_slice())
+                        };
                         fill_backbuffer_rect(
-                            &mut state.d3d9().d3d9_backbuffer,
-                            width,
-                            height,
-                            left,
-                            top,
-                            right,
-                            bottom,
-                            color_0rgb,
+                            output, width, height, left, top, right, bottom, color_0rgb,
                         );
                     }
                 }
-            } else {
+            } else if rt == 0 {
                 for pixel in &mut state.d3d9().d3d9_backbuffer {
+                    *pixel = color_0rgb;
+                }
+            } else if let Some(record) = state.d3d9().d3d9_render_targets.get_mut(&rt) {
+                for pixel in &mut record.pixels {
                     *pixel = color_0rgb;
                 }
             }
             // The whole frame changed — a partial Present region is invalid.
-            state.d3d9().d3d9_dirty = None;
+            if rt == 0 {
+                state.d3d9().d3d9_dirty = None;
+            }
         }
     }
     // D3DCLEAR_ZBUFFER: no depth surface in slice 1 — accepted, clears nothing.
@@ -1534,6 +1559,171 @@ pub fn handle_create_index_buffer(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     let return_address = engine
         .return_from_win64_api(return_value)
         .context("failed to return from CreateIndexBuffer")?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `IDirect3DDevice9::CreateRenderTarget` (vtable slot 24).
+///
+/// L6: real — creates an offscreen render-target surface with its own host
+/// texel buffer. Formats `D3DFMT_A8R8G8B8` (21) and `D3DFMT_X8R8G8B8` (22)
+/// are accepted; a multisample request above `D3DMULTISAMPLE_NONE` (0) is the
+/// honest `D3DERR_INVALIDCALL` (the software rasterizer is single-sampled).
+/// The surface is a first-class `IDirect3DSurface9`: `GetDesc` describes it
+/// and `LockRect`/`UnlockRect` read its texels back.
+pub fn handle_create_render_target(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let _this_pointer = engine
+        .read_rcx()
+        .context("failed to read RCX for CreateRenderTarget")?;
+    let width_raw = engine
+        .read_rdx()
+        .context("failed to read RDX for CreateRenderTarget")?;
+    let height_raw = engine
+        .read_r8()
+        .context("failed to read R8 for CreateRenderTarget")?;
+    let format_raw = engine
+        .read_r9()
+        .context("failed to read R9 for CreateRenderTarget")?;
+    let multi_sample = read_stack_argument(engine, 0x28, "CreateRenderTarget MultiSample")?;
+    let _multi_sample_quality =
+        read_stack_argument(engine, 0x30, "CreateRenderTarget MultiSampleQuality")?;
+    let _lockable = read_stack_argument(engine, 0x38, "CreateRenderTarget Lockable")?;
+    let pp_surface = read_stack_argument(engine, 0x40, "CreateRenderTarget ppSurface")?;
+    let _shared_handle = read_stack_argument(engine, 0x48, "CreateRenderTarget pSharedHandle")?;
+
+    let width = u32::try_from(width_raw & u64::from(u32::MAX))
+        .context("CreateRenderTarget width does not fit u32")?;
+    let height = u32::try_from(height_raw & u64::from(u32::MAX))
+        .context("CreateRenderTarget height does not fit u32")?;
+    let format = u32::try_from(format_raw & u64::from(u32::MAX))
+        .context("CreateRenderTarget format does not fit u32")?;
+    let multi_sample = u32::try_from(multi_sample & u64::from(u32::MAX))
+        .context("CreateRenderTarget MultiSample does not fit u32")?;
+
+    // The rasterizer is single-sampled; a multisample request beyond NONE
+    // cannot be honored honestly.
+    let valid = width > 0
+        && height > 0
+        && width <= 4096
+        && height <= 4096
+        && matches!(format, super::D3DFMT_A8R8G8B8 | super::D3DFMT_X8R8G8B8)
+        && multi_sample == 0
+        && pp_surface != 0;
+
+    let return_value = if valid {
+        let object = super::texture::allocate_surface_object(engine, state)?;
+        if object == 0 {
+            D3DERR_INVALIDCALL
+        } else {
+            let texel_count = usize::try_from(width.checked_mul(height).unwrap_or(0)).unwrap_or(0);
+            state.d3d9().d3d9_render_targets.insert(
+                object,
+                super::texture::RenderTargetRecord {
+                    handle: object,
+                    width,
+                    height,
+                    format,
+                    pixels: vec![0; texel_count],
+                    locked_va: 0,
+                    locked_rect: None,
+                },
+            );
+            write_guest_u64(engine, pp_surface, object)
+                .context("failed to return render-target surface pointer")?;
+            D3D_OK
+        }
+    } else {
+        D3DERR_INVALIDCALL
+    };
+
+    let return_address = engine
+        .return_from_win64_api(return_value)
+        .context("failed to return from CreateRenderTarget")?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `IDirect3DDevice9::SetRenderTarget` (vtable slot 36).
+///
+/// L6: real — binds render-target slot 0 to an offscreen surface created by
+/// [`handle_create_render_target`]; `NULL` (0) rebinds the implicit
+/// backbuffer. A non-`D3D9_RENDERTARGET`-bound surface is rejected with the
+/// honest `D3DERR_INVALIDCALL`. Multi-target slots (1..3) are not modeled —
+/// the same honest error, documented (the software rasterizer writes a single
+/// color buffer).
+pub fn handle_set_render_target(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let _this_pointer = engine
+        .read_rcx()
+        .context("failed to read RCX for SetRenderTarget")?;
+    let index_raw = engine
+        .read_rdx()
+        .context("failed to read RDX for SetRenderTarget")?;
+    let surface = engine
+        .read_r8()
+        .context("failed to read R8 for SetRenderTarget")?;
+
+    let index = u32::try_from(index_raw & u64::from(u32::MAX))
+        .context("SetRenderTarget index does not fit u32")?;
+    // NULL rebinds the backbuffer; a non-NULL surface must be a known RT.
+    let valid =
+        index == 0 && (surface == 0 || state.d3d9().d3d9_render_targets.contains_key(&surface));
+    let return_value = if valid {
+        state.d3d9().d3d9_render_target = surface;
+        D3D_OK
+    } else {
+        D3DERR_INVALIDCALL
+    };
+
+    let return_address = engine
+        .return_from_win64_api(return_value)
+        .context("failed to return from SetRenderTarget")?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `IDirect3DDevice9::GetRenderTarget` (vtable slot 37).
+///
+/// L6: real — returns the surface bound to render-target slot 0 (the
+/// implicit backbuffer when none is bound: a NULL surface is returned and
+/// `D3D_OK` reported, matching D3D9's "no RT bound" contract for the
+/// backbuffer default).
+pub fn handle_get_render_target(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let _this_pointer = engine
+        .read_rcx()
+        .context("failed to read RCX for GetRenderTarget")?;
+    let index_raw = engine
+        .read_rdx()
+        .context("failed to read RDX for GetRenderTarget")?;
+    let pp_surface = engine
+        .read_r8()
+        .context("failed to read R8 for GetRenderTarget")?;
+
+    let index = u32::try_from(index_raw & u64::from(u32::MAX))
+        .context("GetRenderTarget index does not fit u32")?;
+    let return_value = if index == 0 && pp_surface != 0 {
+        let bound = state.d3d9().d3d9_render_target;
+        write_guest_u64(engine, pp_surface, bound)
+            .context("failed to return render-target surface pointer")?;
+        D3D_OK
+    } else {
+        D3DERR_INVALIDCALL
+    };
+
+    let return_address = engine
+        .return_from_win64_api(return_value)
+        .context("failed to return from GetRenderTarget")?;
     Ok(WinApiHandlerResult {
         return_address,
         return_value,

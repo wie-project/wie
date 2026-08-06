@@ -39,12 +39,13 @@ pub use buffer::{
     handle_vertex_buffer_unlock,
 };
 pub use device::{
-    handle_begin_scene, handle_clear, handle_create_index_buffer, handle_create_vertex_buffer,
-    handle_device_release, handle_direct3d9_release, handle_draw_indexed_primitive,
-    handle_draw_indexed_primitive_up, handle_draw_primitive, handle_draw_primitive_up,
-    handle_end_scene, handle_get_indices, handle_get_stream_source, handle_get_transform,
-    handle_get_viewport, handle_multiply_transform, handle_present, handle_set_fvf,
-    handle_set_indices, handle_set_render_state, handle_set_sampler_state, handle_set_scissor_rect,
+    handle_begin_scene, handle_clear, handle_create_index_buffer, handle_create_render_target,
+    handle_create_vertex_buffer, handle_device_release, handle_direct3d9_release,
+    handle_draw_indexed_primitive, handle_draw_indexed_primitive_up, handle_draw_primitive,
+    handle_draw_primitive_up, handle_end_scene, handle_get_indices, handle_get_render_target,
+    handle_get_stream_source, handle_get_transform, handle_get_viewport, handle_multiply_transform,
+    handle_present, handle_set_fvf, handle_set_indices, handle_set_render_state,
+    handle_set_render_target, handle_set_sampler_state, handle_set_scissor_rect,
     handle_set_stream_source, handle_set_texture_stage_state, handle_set_transform,
     handle_set_viewport,
 };
@@ -58,11 +59,11 @@ pub use shader::{
     handle_set_vertex_shader_constant_i, handle_vertex_shader_release,
 };
 pub use texture::{
-    DepthStencilRecord, TextureRecord, handle_create_texture, handle_get_sampler_state,
-    handle_get_texture, handle_get_texture_stage_state, handle_set_texture,
-    handle_surface_lock_rect, handle_surface_release, handle_surface_unlock_rect,
-    handle_texture_get_level_count, handle_texture_get_surface_level, handle_texture_lock_rect,
-    handle_texture_release, handle_texture_unlock_rect,
+    DepthStencilRecord, RenderTargetRecord, TextureRecord, handle_create_texture,
+    handle_get_sampler_state, handle_get_texture, handle_get_texture_stage_state,
+    handle_set_texture, handle_surface_get_desc, handle_surface_lock_rect, handle_surface_release,
+    handle_surface_unlock_rect, handle_texture_get_level_count, handle_texture_get_surface_level,
+    handle_texture_lock_rect, handle_texture_release, handle_texture_unlock_rect,
 };
 
 /// Expected `D3D_SDK_VERSION` for Direct3D 9.

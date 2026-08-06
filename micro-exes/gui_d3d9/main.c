@@ -42,7 +42,7 @@
 // round-trip of an unmodeled state, the fog/alpha/scissor state round-trips,
 // and the GetTransform / MultiplyTransform / D3DTS_TEXTURE0 round-trips),
 // and after TIMER_TICKS WM_TIMER ticks (each invalidating → repaint →
-// represent) the window quits with 0. Distinct non-zero codes (101-210)
+// represent) the window quits with 0. Distinct non-zero codes (101-218)
 // report the first stage that did not run. Interactive runs (no
 // WIE_SELFTEST) keep the window open — the timer drives nothing and the
 // window quits only on 'q' / close.
@@ -77,6 +77,7 @@ static IDirect3DDevice9 *g_device;
 static IDirect3DTexture9 *g_tex;
 static IDirect3DTexture9 *g_mip_tex;
 static IDirect3DSurface9 *g_depth;
+static IDirect3DSurface9 *g_rt;
 static IDirect3DVertexShader9 *g_vs;
 static D3DMATRIX g_ortho;      // the baseline orthographic projection
 static int g_selftest;
@@ -247,8 +248,110 @@ static int setup_mip_texture(void) {
     return 0;
 }
 
-// Draw one XYZRHW quad (two triangles) with the current FVF/render state.
-// Returns 0 on success, else the exit code naming the failed stage.
+// ── L6 render-target self-test ─────────────────────────────────────────
+//
+// CreateRenderTarget(8x8) → bind slot 0 → SetViewport(8x8) → Clear(green)
+// → draw a full-frame magenta triangle → GetRenderTarget round-trip →
+// LockRect the RT back and verify the clear green + the triangle's magenta
+// → unbind (NULL rebinds the backbuffer) → release. Every HRESULT is
+// checked; a failed stage exits with its distinct code (211-218).
+static IDirect3DSurface9 *g_rt;
+
+static int setup_render_target(void) {
+    HRESULT hr = IDirect3DDevice9_CreateRenderTarget(
+        g_device, 8, 8, D3DFMT_A8R8G8B8,
+        D3DMULTISAMPLE_NONE, 0, TRUE, &g_rt, NULL);
+    if (FAILED(hr) || g_rt == NULL) {
+        return 211;
+    }
+    // Bind slot 0 to the RT; NULL later rebinds the backbuffer.
+    hr = IDirect3DDevice9_SetRenderTarget(g_device, 0, g_rt);
+    if (FAILED(hr)) {
+        return 212;
+    }
+    // The viewport must match the RT (as a real app would set it).
+    D3DVIEWPORT9 vp;
+    vp.X = 0; vp.Y = 0; vp.Width = 8; vp.Height = 8;
+    vp.MinZ = 0.0f; vp.MaxZ = 1.0f;
+    if (FAILED(IDirect3DDevice9_SetViewport(g_device, &vp))) {
+        return 214;
+    }
+    // The RT draw uses the IDENTITY projection: g_ortho maps world [-1,1]
+    // onto the 320x240 backbuffer, which would compress the NDC triangle
+    // into a 1px sliver inside the 8x8 RT. Identity keeps NDC == clip, so
+    // the full-frame triangle fills the RT (the same setup the CI's
+    // reference rasterizer test uses).
+    D3DMATRIX id;
+    id._11 = 1.0f; id._12 = 0.0f; id._13 = 0.0f; id._14 = 0.0f;
+    id._21 = 0.0f; id._22 = 1.0f; id._23 = 0.0f; id._24 = 0.0f;
+    id._31 = 0.0f; id._32 = 0.0f; id._33 = 1.0f; id._34 = 0.0f;
+    id._41 = 0.0f; id._42 = 0.0f; id._43 = 0.0f; id._44 = 1.0f;
+    if (FAILED(IDirect3DDevice9_SetTransform(g_device, D3DTS_PROJECTION, &id))) {
+        return 214;
+    }
+    // Clear the RT to green (D3DCLEAR_TARGET; the backbuffer is untouched).
+    if (FAILED(IDirect3DDevice9_Clear(g_device, 0, NULL,
+                                      D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 255, 0),
+                                      0.0f, 0)) ||
+        FAILED(IDirect3DDevice9_BeginScene(g_device)) ||
+        FAILED(IDirect3DDevice9_SetFVF(g_device, D3DFVF_XYZ | D3DFVF_DIFFUSE))) {
+        return 215;
+    }
+    // A full-frame magenta triangle in NDC.
+    struct { float x, y, z; DWORD color; } tri[3];
+    tri[0].x = -1.0f; tri[0].y = -1.0f; tri[0].z = 0.0f;
+    tri[0].color = D3DCOLOR_XRGB(255, 0, 255);
+    tri[1].x =  1.0f; tri[1].y = -1.0f; tri[1].z = 0.0f;
+    tri[1].color = D3DCOLOR_XRGB(255, 0, 255);
+    tri[2].x = -1.0f; tri[2].y =  1.0f; tri[2].z = 0.0f;
+    tri[2].color = D3DCOLOR_XRGB(255, 0, 255);
+    if (FAILED(IDirect3DDevice9_DrawPrimitiveUP(
+                   g_device, D3DPT_TRIANGLELIST, 1, tri, (UINT)sizeof(tri[0]))) ||
+        FAILED(IDirect3DDevice9_EndScene(g_device))) {
+        return 215;
+    }
+    // LockRect the RT and verify: the bottom-left half is magenta (the
+    // triangle's interior), the top-right corner keeps the clear green.
+    D3DLOCKED_RECT lr;
+    hr = IDirect3DSurface9_LockRect(g_rt, &lr, NULL, 0);
+    if (FAILED(hr) || lr.pBits == NULL || lr.Pitch < 8 * 4) {
+        return 216;
+    }
+    {
+        const DWORD *bits = (const DWORD *)lr.pBits;
+        // Vertices map to screen (0,8),(8,8),(0,0); the interior is y > x
+        // (below the hypotenuse from (8,8) to (0,0)). (1,3) is clearly inside,
+        // (6,2) clearly outside (y < x).
+        DWORD interior = bits[3 * 8 + 1];
+        DWORD outside  = bits[2 * 8 + 6];
+        if ((interior & 0x00FFFFFF) != 0x00FF00FF) {
+            return 217; // triangle interior missing
+        }
+        if ((outside & 0x00FFFFFF) != 0x0000FF00) {
+            return 217; // clear green missing
+        }
+    }
+    hr = IDirect3DSurface9_UnlockRect(g_rt);
+    if (FAILED(hr)) {
+        return 218;
+    }
+    // Unbind: NULL rebinds the implicit backbuffer for the main frame, and
+    // restore the g_ortho projection the main frame renders with.
+    if (FAILED(IDirect3DDevice9_SetTransform(g_device, D3DTS_PROJECTION, &g_ortho)) ||
+        FAILED(IDirect3DDevice9_SetRenderTarget(g_device, 0, NULL))) {
+        return 218;
+    }
+    D3DVIEWPORT9 main_vp;
+    if (FAILED(IDirect3DDevice9_GetViewport(g_device, &main_vp))) {
+        return 218;
+    }
+    main_vp.X = 0; main_vp.Y = 0; main_vp.Width = BACKBUFFER_W; main_vp.Height = BACKBUFFER_H;
+    if (FAILED(IDirect3DDevice9_SetViewport(g_device, &main_vp))) {
+        return 218;
+    }
+    return 0;
+}
+
 static int draw_rhw_quad(float x0, float y0, float x1, float y1, float z, DWORD color) {
     struct RhwQuadVertex { float x, y, z, rhw; DWORD color; };
     struct RhwQuadVertex q[4];
@@ -972,6 +1075,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             IDirect3DTexture9_Release(g_mip_tex);
             g_mip_tex = NULL;
         }
+        if (g_rt) {
+            IDirect3DSurface9_Release(g_rt);
+            g_rt = NULL;
+        }
         if (g_depth) {
             IDirect3DSurface9_Release(g_depth);
             g_depth = NULL;
@@ -1212,6 +1319,15 @@ void entry(void) {
     {
         // L4: the 64x64 mip-chain texture (full chain, level 1 filled).
         int rc = setup_mip_texture();
+        if (rc != 0) {
+            ExitProcess(rc);
+        }
+    }
+    {
+        // L6: an offscreen render target — bind, clear, draw, read back,
+        // unbind. Proves CreateRenderTarget/SetRenderTarget/GetRenderTarget
+        // + RT-routed Clear/draws + RT LockRect round-trip.
+        int rc = setup_render_target();
         if (rc != 0) {
             ExitProcess(rc);
         }

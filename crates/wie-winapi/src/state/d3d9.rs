@@ -96,6 +96,13 @@ pub struct D3D9State {
     pub(crate) d3d9_surface_levels: HashMap<u64, u32>,
     /// Per-stage (0..8) texture binding (0 = none).
     pub(crate) d3d9_texture_bindings: [u64; 8],
+    // ── L6 render-target state ─────────────────────────────────────────
+    /// Offscreen render targets keyed by the surface object's guest VA.
+    /// Each holds its own host texel buffer (A8R8G8B8), so `SetRenderTarget`
+    /// + `Clear`/draws can render offscreen (post-processing, shadow maps).
+    pub(crate) d3d9_render_targets: HashMap<u64, crate::d3d9::RenderTargetRecord>,
+    /// Bound render target slot 0's surface VA (0 = the implicit backbuffer).
+    pub(crate) d3d9_render_target: u64,
     // ── depth-stencil state ────────────────────────────────────────────
     /// Depth-stencil surfaces keyed by the surface object's guest VA.
     pub(crate) d3d9_depth_surfaces: HashMap<u64, crate::d3d9::DepthStencilRecord>,
@@ -158,6 +165,8 @@ impl Default for D3D9State {
             d3d9_surface_textures: HashMap::new(),
             d3d9_surface_levels: HashMap::new(),
             d3d9_texture_bindings: [0; 8],
+            d3d9_render_targets: HashMap::new(),
+            d3d9_render_target: 0,
             d3d9_depth_surfaces: HashMap::new(),
             d3d9_depth_stencil: 0,
             d3d9_shaders: HashMap::new(),

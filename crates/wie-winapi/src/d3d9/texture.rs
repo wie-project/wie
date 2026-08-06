@@ -18,6 +18,9 @@ use crate::guest_memory::{
 };
 use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 
+/// `D3DRTYPE_SURFACE` — the `D3DRESOURCETYPE` a surface reports in GetDesc.
+const D3DRTYPE_SURFACE: u32 = 3;
+
 /// One mip level's host texels (levels 1..; level 0 lives in
 /// [`TextureRecord::pixels`]).
 #[derive(Debug, Clone)]
@@ -28,6 +31,29 @@ pub struct MipLevel {
     pub height: u32,
     /// Texels in `0xAARRGGBB` order, row-major.
     pub pixels: Vec<u32>,
+}
+
+/// An offscreen render target (L6: `CreateRenderTarget`).
+///
+/// Owns its own host texel buffer, so `SetRenderTarget` redirects Clear and
+/// draw output here instead of the implicit backbuffer. Texels are stored in
+/// `0xAARRGGBB` order (the same convention as [`TextureRecord`]).
+#[derive(Debug, Clone)]
+pub struct RenderTargetRecord {
+    /// The surface object's guest VA (also the `IDirect3DSurface9` pointer).
+    pub handle: u64,
+    /// Width in texels.
+    pub width: u32,
+    /// Height in texels.
+    pub height: u32,
+    /// `D3DFMT_*` format (only A8R8G8B8 / X8R8G8B8 are accepted).
+    pub format: u32,
+    /// Texels in `0xAARRGGBB` order, row-major, top row first.
+    pub pixels: Vec<u32>,
+    /// Guest block VA handed out by the active `LockRect` (0 = not locked).
+    pub locked_va: u64,
+    /// Locked region (None = whole surface) in surface coordinates.
+    pub locked_rect: Option<(i32, i32, i32, i32)>,
 }
 
 /// A D3D9 texture: host-owned texels plus the guest lock state.
@@ -464,6 +490,230 @@ fn lock_rect_common(
     Ok(D3D_OK)
 }
 
+/// LockRect body for an offscreen render target (L6): same guest-block
+/// hand-off as the texture form, but the copy-back lands in the RT's own
+/// texel buffer.
+fn lock_rect_render_target(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+    rt_va: u64,
+    p_locked_rect: u64,
+    p_rect: u64,
+) -> Result<u64> {
+    let Some(record) = state.d3d9().d3d9_render_targets.get(&rt_va) else {
+        return Ok(D3DERR_INVALIDCALL);
+    };
+    let (width, height) = (record.width, record.height);
+    if record.locked_va != 0 || width == 0 || height == 0 {
+        return Ok(D3DERR_INVALIDCALL); // double lock / degenerate
+    }
+    let pitch = width
+        .checked_mul(4)
+        .context("render-target pitch overflow")?;
+    let total = u64::from(pitch)
+        .checked_mul(u64::from(height))
+        .context("render-target lock size overflow")?;
+
+    let rect = read_guest_rect(engine, p_rect)?;
+    if let Some((left, top, right, bottom)) = rect {
+        let within = left >= 0
+            && top >= 0
+            && right > left
+            && bottom > top
+            && right <= i32::try_from(width).unwrap_or(0)
+            && bottom <= i32::try_from(height).unwrap_or(0);
+        if !within {
+            return Ok(D3DERR_INVALIDCALL);
+        }
+    }
+
+    let block = state.heap_state.heap.alloc_coherent(engine, total);
+    if block == 0 {
+        return Ok(D3DERR_INVALIDCALL); // allocation failed
+    }
+    // L6 read-back: LockRect exposes the surface's CURRENT texels (real
+    // D3D9 semantics — the guest may read what was rendered). Copy the RT
+    // content into the locked block; the guest's UnlockRect writes it back.
+    let (left, top) = rect.map_or((0_i32, 0_i32), |r| (r.0, r.1));
+    let row_width = usize::try_from(rect.map_or(width, |r| {
+        u32::try_from(r.2.saturating_sub(r.0)).unwrap_or(0)
+    }))
+    .unwrap_or(0);
+    for row in 0..height {
+        let src_row = top.saturating_add(i32::try_from(row).unwrap_or(0));
+        if src_row < 0 || src_row >= i32::try_from(height).unwrap_or(0) {
+            continue;
+        }
+        let mut row_bytes = vec![0_u8; row_width.saturating_mul(4)];
+        if let Some(record) = state.d3d9().d3d9_render_targets.get(&rt_va) {
+            let row_start = usize::try_from(src_row)
+                .unwrap_or(0)
+                .saturating_mul(usize::try_from(width).unwrap_or(0))
+                .saturating_add(usize::try_from(left).unwrap_or(0));
+            for (col, chunk) in row_bytes.chunks_exact_mut(4).enumerate() {
+                let texel = record
+                    .pixels
+                    .get(row_start.saturating_add(col))
+                    .copied()
+                    .unwrap_or(0);
+                chunk.copy_from_slice(&texel.to_le_bytes());
+            }
+        }
+        let dst = block.saturating_add(
+            u64::try_from(i64::from(row).saturating_mul(i64::from(pitch))).unwrap_or(0),
+        );
+        if engine.mem_write(dst, &row_bytes).is_err() {
+            break;
+        }
+    }
+    let offset = u64::try_from(i64::from(top).saturating_mul(i64::from(pitch)))
+        .unwrap_or(0)
+        .saturating_add(u64::try_from(i64::from(left).saturating_mul(4)).unwrap_or(0));
+    let p_bits = block.saturating_add(offset);
+
+    if p_locked_rect != 0 {
+        write_guest_u32(engine, p_locked_rect, pitch)
+            .context("failed to write D3DLOCKED_RECT.Pitch")?;
+        write_guest_u64(
+            engine,
+            checked_field_address(p_locked_rect, 8, "D3DLOCKED_RECT.pBits"),
+            p_bits,
+        )
+        .context("failed to write D3DLOCKED_RECT.pBits")?;
+    }
+
+    if let Some(record) = state.d3d9().d3d9_render_targets.get_mut(&rt_va) {
+        record.locked_va = block;
+        record.locked_rect = rect;
+    }
+    Ok(D3D_OK)
+}
+
+/// UnlockRect body for an offscreen render target: copy the locked guest
+/// region back into the RT's texels and free the guest block.
+fn unlock_rect_render_target(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+    rt_va: u64,
+) -> u64 {
+    let Some(record) = state.d3d9().d3d9_render_targets.get(&rt_va) else {
+        return D3DERR_INVALIDCALL;
+    };
+    let locked_va = record.locked_va;
+    if locked_va == 0 {
+        return D3DERR_INVALIDCALL; // not locked
+    }
+    let (width, height) = (record.width, record.height);
+    let rect = record.locked_rect;
+    let pitch = u64::from(width.checked_mul(4).unwrap_or(0));
+    let (left, top, right, bottom) = rect.unwrap_or((
+        0,
+        0,
+        i32::try_from(width).unwrap_or(0),
+        i32::try_from(height).unwrap_or(0),
+    ));
+    let (left, top) = (left.max(0), top.max(0));
+    let (right, bottom) = (
+        right.min(i32::try_from(width).unwrap_or(0)),
+        bottom.min(i32::try_from(height).unwrap_or(0)),
+    );
+    if left < right && top < bottom {
+        let row_width = usize::try_from(right.saturating_sub(left)).unwrap_or(0);
+        let mut row_bytes = vec![0_u8; row_width.saturating_mul(4)];
+        for row in top..bottom {
+            let src = locked_va
+                .saturating_add(
+                    u64::try_from(i64::from(row).saturating_mul(i64::try_from(pitch).unwrap_or(0)))
+                        .unwrap_or(0),
+                )
+                .saturating_add(u64::try_from(i64::from(left).saturating_mul(4)).unwrap_or(0));
+            if engine.mem_read(src, &mut row_bytes).is_err() {
+                continue;
+            }
+            let mut texels: Vec<u32> = Vec::with_capacity(row_width);
+            for chunk in row_bytes.chunks_exact(4) {
+                let bytes: [u8; 4] = chunk.try_into().unwrap_or([0; 4]);
+                texels.push(u32::from_le_bytes(bytes));
+            }
+            let row_start = usize::try_from(row)
+                .unwrap_or(0)
+                .saturating_mul(usize::try_from(width).unwrap_or(0));
+            if let Some(record) = state.d3d9().d3d9_render_targets.get_mut(&rt_va) {
+                for (col, texel) in texels.into_iter().enumerate() {
+                    let index = row_start
+                        .saturating_add(usize::try_from(left).unwrap_or(0))
+                        .saturating_add(col);
+                    if let Some(slot) = record.pixels.get_mut(index) {
+                        *slot = texel;
+                    }
+                }
+            }
+        }
+    }
+    let _ = state.heap_state.heap.free_coherent(engine, locked_va);
+    if let Some(record) = state.d3d9().d3d9_render_targets.get_mut(&rt_va) {
+        record.locked_va = 0;
+        record.locked_rect = None;
+    }
+    D3D_OK
+}
+
+/// Handles `IDirect3DSurface9::GetDesc` (vtable slot 12).
+///
+/// L6: real — writes the `D3DSURFACE_DESC` for a texture-view surface or an
+/// offscreen render target. Layout (d3d9types.h): `Format @0`, `Type @4`
+/// (`D3DRTYPE_SURFACE` = 3), `Usage @8`, `Pool @12`, `MultiSampleType @16`,
+/// `MultiSampleQuality @20`, `Width @24`, `Height @28`.
+pub fn handle_surface_get_desc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let this_pointer = engine
+        .read_rcx()
+        .context("failed to read RCX for IDirect3DSurface9::GetDesc")?;
+    let desc_ptr = engine
+        .read_rdx()
+        .context("failed to read RDX for IDirect3DSurface9::GetDesc")?;
+
+    let d3d = state.d3d9();
+    let desc = d3d
+        .d3d9_surface_textures
+        .get(&this_pointer)
+        .and_then(|texture_va| d3d.d3d9_textures.get(texture_va))
+        .map(|record| (record.format, record.width, record.height))
+        .or_else(|| {
+            d3d.d3d9_render_targets
+                .get(&this_pointer)
+                .map(|record| (record.format, record.width, record.height))
+        });
+
+    let return_value = if let Some((format, width, height)) = desc
+        && desc_ptr != 0
+    {
+        let mut bytes = [0_u8; 32];
+        bytes[0..4].copy_from_slice(&format.to_le_bytes());
+        bytes[4..8].copy_from_slice(&D3DRTYPE_SURFACE.to_le_bytes());
+        bytes[16..20].copy_from_slice(&0_u32.to_le_bytes()); // MultiSampleType: NONE
+        bytes[20..24].copy_from_slice(&0_u32.to_le_bytes()); // MultiSampleQuality: 0
+        bytes[24..28].copy_from_slice(&width.to_le_bytes());
+        bytes[28..32].copy_from_slice(&height.to_le_bytes());
+        if engine.mem_write(desc_ptr, &bytes).is_ok() {
+            D3D_OK
+        } else {
+            D3DERR_INVALIDCALL
+        }
+    } else {
+        D3DERR_INVALIDCALL
+    };
+
+    let return_address = engine
+        .return_from_win64_api(return_value)
+        .context("failed to return from IDirect3DSurface9::GetDesc")?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
 /// Handles `IDirect3DSurface9::LockRect` (vtable slot 13).
 pub fn handle_surface_lock_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -494,6 +744,8 @@ pub fn handle_surface_lock_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .unwrap_or(0);
     let return_value = if texture_va != 0 {
         lock_rect_common(engine, state, texture_va, level, p_locked_rect, p_rect)?
+    } else if state.d3d9().d3d9_render_targets.contains_key(&this_pointer) {
+        lock_rect_render_target(engine, state, this_pointer, p_locked_rect, p_rect)?
     } else {
         D3DERR_INVALIDCALL
     };
@@ -642,6 +894,8 @@ pub fn handle_surface_unlock_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApi
         .unwrap_or(0);
     let return_value = if texture_va != 0 {
         unlock_rect_common(engine, state, texture_va)
+    } else if state.d3d9().d3d9_render_targets.contains_key(&this_pointer) {
+        unlock_rect_render_target(engine, state, this_pointer)
     } else {
         D3DERR_INVALIDCALL
     };
@@ -949,6 +1203,20 @@ pub fn handle_surface_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
             // Depth-stencil surface: drop the record (and unbind if bound).
             if state.d3d9().d3d9_depth_stencil == this_pointer {
                 state.d3d9().d3d9_depth_stencil = 0;
+            }
+            let vtable = this_pointer.saturating_sub(IDIRECT3DSURFACE9_OBJECT_OFFSET);
+            let _ = state.heap_state.heap.free_coherent(engine, vtable);
+            1
+        } else if state
+            .d3d9()
+            .d3d9_render_targets
+            .remove(&this_pointer)
+            .is_some()
+        {
+            // L6 render target: drop the record (and unbind if it is the
+            // bound slot-0 target — the backbuffer default is restored).
+            if state.d3d9().d3d9_render_target == this_pointer {
+                state.d3d9().d3d9_render_target = 0;
             }
             let vtable = this_pointer.saturating_sub(IDIRECT3DSURFACE9_OBJECT_OFFSET);
             let _ = state.heap_state.heap.free_coherent(engine, vtable);

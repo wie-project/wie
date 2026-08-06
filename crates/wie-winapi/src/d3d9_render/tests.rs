@@ -1761,6 +1761,275 @@ fn vs_interpreter_mova_drives_relative_const_read() {
     );
 }
 
+// ── ps_2_x flow-control execution (the shared FlowMap engine) ─────────
+//
+// The vs path's flow-control execution is proven above; these tests exercise
+// the SAME FlowMap/FlowState machinery through the pixel-shader interpreter,
+// closing the L5 coverage gap my wave report flagged.
+
+/// A pixel-shader loop: `loop i0, c0` (aL=0, aU=4, aD=1) with an `add r0, r0,
+/// c1` body (c1 = 1.0) — oC0.x must reach 4.0.
+#[test]
+fn ps_interpreter_loop_executes_spec_iterations() {
+    let mut constants = [[0.0; 4]; 32];
+    constants[0] = [0.0, 4.0, 1.0, 0.0]; // the loop spec (aL, aU, aD, aC)
+    constants[1] = [1.0, 0.0, 0.0, 0.0];
+    let r0 = dst(RegType::Temp, 0);
+    let instrs = vec![
+        PsInstruction {
+            op: PsOp::Loop,
+            dst: Some(dst(RegType::Loop, 0)),
+            srcs: vec![src(RegType::Const, 0)],
+            tex_type: None,
+            end: false,
+            control: 0,
+            predicated: false,
+        },
+        PsInstruction {
+            op: PsOp::Add,
+            dst: Some(r0),
+            srcs: vec![src(RegType::Temp, 0), src(RegType::Const, 1)],
+            tex_type: None,
+            end: false,
+            control: 0,
+            predicated: false,
+        },
+        PsInstruction {
+            op: PsOp::EndLoop,
+            dst: None,
+            srcs: Vec::new(),
+            tex_type: None,
+            end: false,
+            control: 0,
+            predicated: false,
+        },
+        mov(dst(RegType::ColorOut, 0), src(RegType::Temp, 0)),
+        end_instruction(),
+    ];
+    let prog = program(instrs, &constants);
+    let out = run_pixel_shader(&prog, &input()).expect("no texkill");
+    assert_eq!(
+        out[0], 4.0,
+        "the ps loop body must run aU=4 times (r0 increments each pass)"
+    );
+}
+
+/// A ps_2_x `ifc` (comparison) branching on a constant comparison.
+#[test]
+fn ps_interpreter_ifc_takes_branch_on_comparison() {
+    let mut constants = [[0.0; 4]; 32];
+    constants[0] = [5.0, 0.0, 0.0, 0.0];
+    constants[1] = [3.0, 0.0, 0.0, 0.0];
+    constants[2] = [7.0, 0.0, 0.0, 0.0];
+    let instrs = vec![
+        PsInstruction {
+            op: PsOp::Ifc,
+            dst: None,
+            srcs: vec![src(RegType::Const, 0), src(RegType::Const, 1)],
+            tex_type: None,
+            end: false,
+            control: crate::d3d9_shader::D3DSPC_GE, // 5.0 >= 3.0 → true
+            predicated: false,
+        },
+        mov(dst(RegType::ColorOut, 0), src(RegType::Const, 2)), // 7.0
+        PsInstruction {
+            op: PsOp::EndIf,
+            dst: None,
+            srcs: Vec::new(),
+            tex_type: None,
+            end: false,
+            control: 0,
+            predicated: false,
+        },
+        end_instruction(),
+    ];
+    let prog = program(instrs, &constants);
+    let out = run_pixel_shader(&prog, &input()).expect("no texkill");
+    assert_eq!(out[0], 7.0, "ifc GE(5,3) must take the true branch");
+
+    // GE(3,5) is false → the body is skipped (oC0 stays 0).
+    let mut constants = [[0.0; 4]; 32];
+    constants[0] = [3.0, 0.0, 0.0, 0.0];
+    constants[1] = [5.0, 0.0, 0.0, 0.0];
+    constants[2] = [7.0, 0.0, 0.0, 0.0];
+    let instrs = vec![
+        PsInstruction {
+            op: PsOp::Ifc,
+            dst: None,
+            srcs: vec![src(RegType::Const, 0), src(RegType::Const, 1)],
+            tex_type: None,
+            end: false,
+            control: crate::d3d9_shader::D3DSPC_GE, // 3.0 >= 5.0 → false
+            predicated: false,
+        },
+        mov(dst(RegType::ColorOut, 0), src(RegType::Const, 2)),
+        PsInstruction {
+            op: PsOp::EndIf,
+            dst: None,
+            srcs: Vec::new(),
+            tex_type: None,
+            end: false,
+            control: 0,
+            predicated: false,
+        },
+        end_instruction(),
+    ];
+    let prog = program(instrs, &constants);
+    let out = run_pixel_shader(&prog, &input()).expect("no texkill");
+    assert_eq!(out[0], 0.0, "ifc GE(3,5) must skip the body");
+}
+
+/// ps_2_x predication: a predicated `mov` runs only while p0.x != 0.
+#[test]
+fn ps_interpreter_predication_gates_instruction_on_p0() {
+    let mut constants = [[0.0; 4]; 32];
+    constants[0] = [9.0, 0.0, 0.0, 0.0];
+    constants[1] = [3.0, 0.0, 0.0, 0.0];
+    let instrs = vec![
+        PsInstruction {
+            op: PsOp::Setp,
+            dst: Some(dst(RegType::Predicate, 0)),
+            srcs: vec![src(RegType::Const, 0), src(RegType::Const, 1)],
+            tex_type: None,
+            end: false,
+            control: crate::d3d9_shader::D3DSPC_GE, // 9.0 >= 3.0 → p0 = true
+            predicated: false,
+        },
+        PsInstruction {
+            op: PsOp::Mov,
+            dst: Some(dst(RegType::ColorOut, 0)),
+            srcs: vec![src(RegType::Const, 0)],
+            tex_type: None,
+            end: false,
+            control: 0,
+            predicated: true, // runs while p0.x != 0
+        },
+        end_instruction(),
+    ];
+    let prog = program(instrs, &constants);
+    let out = run_pixel_shader(&prog, &input()).expect("no texkill");
+    assert_eq!(out[0], 9.0, "the predicated mov must run while p0.x != 0");
+}
+
+/// A ps_2_x `breakc` inside a loop exits when the comparison holds.
+#[test]
+fn ps_interpreter_breakc_exits_loop_early() {
+    let mut constants = [[0.0; 4]; 32];
+    constants[0] = [0.0, 10.0, 1.0, 0.0]; // loop spec aL=0, aU=10, aD=1
+    constants[1] = [5.0, 0.0, 0.0, 0.0]; // the breakc bound
+    constants[2] = [1.0, 0.0, 0.0, 0.0]; // the body increment
+    let r0 = dst(RegType::Temp, 0);
+    let instrs = vec![
+        PsInstruction {
+            op: PsOp::Loop,
+            dst: Some(dst(RegType::Loop, 0)),
+            srcs: vec![src(RegType::Const, 0)],
+            tex_type: None,
+            end: false,
+            control: 0,
+            predicated: false,
+        },
+        // breakc i0, c1 (GE) — exits when the counter reaches 5.
+        PsInstruction {
+            op: PsOp::BreakC,
+            dst: None,
+            srcs: vec![src(RegType::Loop, 0), src(RegType::Const, 1)],
+            tex_type: None,
+            end: false,
+            control: crate::d3d9_shader::D3DSPC_GE,
+            predicated: false,
+        },
+        PsInstruction {
+            op: PsOp::Add,
+            dst: Some(r0),
+            srcs: vec![src(RegType::Temp, 0), src(RegType::Const, 2)],
+            tex_type: None,
+            end: false,
+            control: 0,
+            predicated: false,
+        },
+        PsInstruction {
+            op: PsOp::EndLoop,
+            dst: None,
+            srcs: Vec::new(),
+            tex_type: None,
+            end: false,
+            control: 0,
+            predicated: false,
+        },
+        mov(dst(RegType::ColorOut, 0), src(RegType::Temp, 0)),
+        end_instruction(),
+    ];
+    let prog = program(instrs, &constants);
+    let out = run_pixel_shader(&prog, &input()).expect("no texkill");
+    assert_eq!(
+        out[0], 5.0,
+        "breakc must exit the ps loop when the counter reaches the bound"
+    );
+}
+
+/// ps_2_a `texldp` (project control): the texture is sampled at (tN.x/tN.w,
+/// tN.y/tN.w) — the projected coordinate, not the raw tN. A 4x4 texture
+/// whose R channel encodes the texel index makes the projected sample visible.
+#[test]
+fn ps_interpreter_texldp_samples_projected_coordinates() {
+    let mut texels = Vec::new();
+    for y in 0..4_u32 {
+        for x in 0..4_u32 {
+            texels.push(0xFF00_0000 | ((y * 4 + x + 1) << 16)); // R = index
+        }
+    }
+    let stage = super::TextureStage {
+        pixels: Box::leak(texels.into_boxed_slice()),
+        width: 4,
+        height: 4,
+        addr_u: super::D3DTADDRESS_CLAMP,
+        addr_v: super::D3DTADDRESS_CLAMP,
+        mag_filter: super::D3DTEXF_POINT,
+        min_filter: super::D3DTEXF_POINT,
+        mip_filter: super::D3DTEXF_POINT,
+        mips: super::MipChain {
+            count: 1,
+            levels: [None; super::MAX_MIP_LEVELS],
+        },
+        color_op: super::D3DTOP_SELECTARG1,
+        color_arg1: super::D3DTA_TEXTURE,
+        color_arg2: super::D3DTA_DIFFUSE,
+        alpha_op: super::D3DTOP_SELECTARG1,
+        alpha_arg1: super::D3DTA_TEXTURE,
+        alpha_arg2: super::D3DTA_DIFFUSE,
+    };
+    let mut input = input();
+    // t0 = (0.75, 0.75, 0, 3.0): raw uv (0.75,0.75) → texel (3,3) index 16;
+    // projected uv (0.25, 0.25) → texel (1,1) index 6.
+    input.t0 = [0.75, 0.75, 0.0, 3.0];
+    let instrs = vec![
+        PsInstruction {
+            op: PsOp::TexLdP,
+            dst: Some(dst(RegType::Temp, 0)),
+            srcs: vec![src(RegType::Texture, 0), src(RegType::Sampler, 0)],
+            tex_type: None,
+            end: false,
+            control: 1, // project control
+            predicated: false,
+        },
+        mov(dst(RegType::ColorOut, 0), src(RegType::Temp, 0)),
+        end_instruction(),
+    ];
+    let prog = PsProgram {
+        instructions: Box::leak(instrs.into_boxed_slice()),
+        constants: [[0.0; 4]; 32],
+        samplers: [Some(&stage), None, None, None],
+    };
+    let out = run_pixel_shader(&prog, &input).expect("runs");
+    // The sampled texel's R channel is the projected index: texel (1,1) = 6.
+    assert_eq!(
+        (out[0] * 255.0).round() as i32,
+        6,
+        "texldp must sample at the projected (u/w, v/w) coordinate"
+    );
+}
+
 #[test]
 fn clip_to_viewport_applies_w_divide_and_minmax_z_scale() {
     let vp = Viewport {
