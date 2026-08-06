@@ -14,9 +14,9 @@ use crate::state::{
 use crate::user32::controls::{ControlClassKind, ControlState};
 use crate::user32::{
     BS_DEFPUSHBUTTON, CreateWindowRequest, GuestCallbackRequest, IDCANCEL, IDOK, ModalFrame,
-    ModalResult, NativePanelKind, WS_CHILD, WS_CLIPCHILDREN, WS_TABSTOP, WS_VISIBLE,
-    WinApiControlSignal, WindowClassIdentifier, create_window_record, find_window, find_window_mut,
-    finish_native_panel, open_native_panel, window_client_size,
+    ModalResult, NativePanelCtx, NativePanelKind, WS_CHILD, WS_CLIPCHILDREN, WS_TABSTOP,
+    WS_VISIBLE, WinApiControlSignal, WindowClassIdentifier, create_window_record, find_window,
+    find_window_mut, window_client_size,
 };
 use crate::vfs::VolumeConfig;
 use crate::{FileDialogPolicy, HandlerContext, OuterReturn, WinApiHandlerResult, WinApiState};
@@ -892,7 +892,11 @@ fn open_host_file_dialog_via_bridge(
     // the engine's re-execution of the fake API re-enters this handler (see
     // `PendingNativeFileDialog`). The panel is a modal session too: open the
     // frame (depth up, activation captured) so the re-entry's
-    // `finish_native_panel` restores the owner.
+    // `NativePanelCtx::finish` restores the owner.
+    let frame = {
+        let mut native = NativePanelCtx::new(state, engine, NativePanelKind::File);
+        native.open()?
+    };
     state.window_state().pending_native_file_dialog = Some(PendingNativeFileDialog {
         ofn_ptr: buffer.ofn_ptr,
         file_buffer_ptr: buffer.file_buffer_ptr,
@@ -901,7 +905,7 @@ fn open_host_file_dialog_via_bridge(
         max_file_title: buffer.max_file_title,
         unicode,
         pick: None,
-        frame: Some(open_native_panel(state, engine, NativePanelKind::File)?),
+        frame: Some(frame),
     });
 
     Err(WinApiControlSignal::FileDialogBridgeRequested { request }.into())
@@ -1012,7 +1016,7 @@ fn finish_native_file_dialog(
 ///
 /// The per-kind result mapping stays here: the file dialog returns 0 as a
 /// cancel and any other value as an `Ok` result; the shared down half
-/// ([`finish_native_panel`]) does the frame teardown.
+/// (`NativePanelCtx::finish`) does the frame teardown.
 fn finish_file_bridge(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -1025,7 +1029,11 @@ fn finish_file_bridge(
     } else {
         ModalResult::Ok(value)
     };
-    if let Some(signal) = finish_native_panel(state, engine, frame, result)? {
+    let signal = {
+        let mut native = NativePanelCtx::new(state, engine, NativePanelKind::File);
+        native.finish(frame, result)?
+    };
+    if let Some(signal) = signal {
         return Err(signal.into());
     }
     file_dialog_return(engine, api_name, value)

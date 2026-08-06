@@ -1,5 +1,5 @@
 //! ModalFrame protocol tests: the shared "up" (`ModalFrame::activate`) and
-//! "down" (`finish_modal`) halves of a modal session's lifecycle.
+//! "down" (`ModalFrame::finish`) halves of a modal session's lifecycle.
 //!
 //! Covers the frame's contract: depth up/down, activation + focus
 //! takeover/restore (including the guest-WndProc focus bridge), the
@@ -9,16 +9,14 @@
 use super::*;
 use crate::handles::Hwnd;
 use crate::state::WindowFlags;
-use crate::user32::dialog::{
-    ModalFrame, ModalResult, NativePanelKind, finish_modal, finish_native_panel, open_native_panel,
-};
+use crate::user32::dialog::{ModalFrame, ModalResult, NativePanelCtx, NativePanelKind};
 use crate::user32::{
     CreateWindowRequest, WM_SETFOCUS, WindowClassIdentifier, create_window_record, find_window_mut,
 };
 use crate::{OuterReturn, WinApiControlSignal};
 
 /// A top-level window that can act as the modal owner. `proc != 0` gives it a
-/// guest WndProc (so `finish_modal`'s focus restore bridges).
+/// guest WndProc (so `ModalFrame::finish`'s focus restore bridges).
 fn create_top_window(state: &mut WinApiState, class: &str, proc: u64) -> u64 {
     let (hwnd, _, _) = create_window_record(
         state,
@@ -110,8 +108,9 @@ fn modal_frame_activate_and_finish_round_trip() {
     );
 
     // Down half: everything restored, owner invalidated with the erase flag.
-    let signal =
-        finish_modal(&mut state, &mut engine, frame, ModalResult::Ok(1)).expect("finish succeeds");
+    let signal = frame
+        .finish(&mut state, &mut engine, ModalResult::Ok(1))
+        .expect("finish succeeds");
     assert!(
         signal.is_none(),
         "an owner without a guest proc bridges nothing"
@@ -164,7 +163,8 @@ fn modal_frame_finish_bridges_focus_back_to_a_guest_wndproc_owner() {
     )
     .expect("activate succeeds");
 
-    let signal = finish_modal(&mut state, &mut engine, frame, ModalResult::Ok(7))
+    let signal = frame
+        .finish(&mut state, &mut engine, ModalResult::Ok(7))
         .expect("finish succeeds")
         .expect("the guest-WndProc owner must receive WM_SETFOCUS through the bridge");
     let WinApiControlSignal::GuestCallbackRequested { request } = signal else {
@@ -204,8 +204,9 @@ fn modal_frame_finish_leaves_focus_when_the_modal_never_took_it() {
         "no WS_TABSTOP child → the owner keeps focus"
     );
 
-    let signal =
-        finish_modal(&mut state, &mut engine, frame, ModalResult::Cancel).expect("finish succeeds");
+    let signal = frame
+        .finish(&mut state, &mut engine, ModalResult::Cancel)
+        .expect("finish succeeds");
     assert!(signal.is_none());
     assert_eq!(state.lock_message_queue().dialog_depth, 0);
     assert_eq!(
@@ -236,7 +237,8 @@ fn modal_frame_without_owner_skips_restore_and_invalidation() {
     assert_eq!(frame.previous_active.as_u64(), 0, "nothing was active");
     assert_eq!(state.lock_message_queue().dialog_depth, 1);
 
-    finish_modal(&mut state, &mut engine, frame, ModalResult::Cancel)
+    frame
+        .finish(&mut state, &mut engine, ModalResult::Cancel)
         .expect("finish must not panic without an owner");
     assert_eq!(state.lock_message_queue().dialog_depth, 0);
     assert_eq!(state.window_state().active_window_handle.as_u64(), 0);
@@ -265,17 +267,18 @@ fn modal_frame_native_bridge_shape_balances_depth_and_owner() {
     assert_eq!(state.window_state().focus_window_handle.as_u64(), 0);
 
     // The bridge re-entry: finish restores depth and the active window.
-    let signal =
-        finish_modal(&mut state, &mut engine, frame, ModalResult::Ok(1)).expect("finish succeeds");
+    let signal = frame
+        .finish(&mut state, &mut engine, ModalResult::Ok(1))
+        .expect("finish succeeds");
     assert!(signal.is_none(), "native panels never take guest focus");
     assert_eq!(state.lock_message_queue().dialog_depth, 0);
     assert_eq!(state.window_state().active_window_handle.as_u64(), owner);
 }
 
-/// The shared native-panel pair (`open_native_panel` / `finish_native_panel`)
-/// wraps the native-bridge shape from the test above and balances depth /
-/// activation across the two bridge entries for every kind. A `None` frame (a
-/// bridge that opened no frame) finishes nothing — the depth stays untouched.
+/// The shared native-panel ctx (`NativePanelCtx::open` / `finish`) wraps the
+/// native-bridge shape from the test above and balances depth / activation
+/// across the two bridge entries for every kind. A `None` frame (a bridge
+/// that opened no frame) finishes nothing — the depth stays untouched.
 #[test]
 fn native_panel_open_and_finish_balance_depth_and_focus() {
     let mut engine = test_engine();
@@ -285,8 +288,10 @@ fn native_panel_open_and_finish_balance_depth_and_focus() {
 
     // The bridge first entry: the shared up half opens the frame keyed by the
     // active window, no focus, no subtree.
-    let frame =
-        open_native_panel(&mut state, &mut engine, NativePanelKind::File).expect("open succeeds");
+    let frame = {
+        let mut native = NativePanelCtx::new(&mut state, &mut engine, NativePanelKind::File);
+        native.open().expect("open succeeds")
+    };
     assert_eq!(state.lock_message_queue().dialog_depth, 1);
     assert_eq!(
         state.window_state().active_window_handle.as_u64(),
@@ -300,15 +305,23 @@ fn native_panel_open_and_finish_balance_depth_and_focus() {
     );
 
     // The bridge re-entry: the shared down half restores depth + activation.
-    let signal = finish_native_panel(&mut state, &mut engine, Some(frame), ModalResult::Ok(1))
-        .expect("finish succeeds");
+    let signal = {
+        let mut native = NativePanelCtx::new(&mut state, &mut engine, NativePanelKind::File);
+        native
+            .finish(Some(frame), ModalResult::Ok(1))
+            .expect("finish succeeds")
+    };
     assert!(signal.is_none(), "native panels never take guest focus");
     assert_eq!(state.lock_message_queue().dialog_depth, 0);
     assert_eq!(state.window_state().active_window_handle.as_u64(), owner);
 
     // A bridge that opened no frame finishes nothing: the depth is untouched.
-    let signal = finish_native_panel(&mut state, &mut engine, None, ModalResult::Cancel)
-        .expect("finish with no frame succeeds");
+    let signal = {
+        let mut native = NativePanelCtx::new(&mut state, &mut engine, NativePanelKind::File);
+        native
+            .finish(None, ModalResult::Cancel)
+            .expect("finish with no frame succeeds")
+    };
     assert!(signal.is_none());
     assert_eq!(state.lock_message_queue().dialog_depth, 0);
 }

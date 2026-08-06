@@ -9,9 +9,7 @@ use crate::state::{
     PageSetupDialogRequest, PendingNativePageSetup, PendingNativePrintDialog, PrintDialogPick,
     PrintDialogRequest,
 };
-use crate::user32::{
-    ModalFrame, ModalResult, NativePanelKind, finish_native_panel, open_native_panel,
-};
+use crate::user32::{ModalFrame, ModalResult, NativePanelCtx, NativePanelKind};
 use crate::{
     HandlerContext, PageSetupDialogPolicy, PrintDialogPolicy, WinApiControlSignal,
     WinApiHandlerResult, WinApiState,
@@ -455,9 +453,12 @@ fn open_native_print_dialog(
         print_info_id,
         pick: None,
         // The native panel is a modal session: open the frame (depth up, the
-        // active window captured) so the re-entry's finish_native_panel
+        // active window captured) so the re-entry's `NativePanelCtx::finish`
         // restores it.
-        frame: Some(open_native_panel(state, engine, NativePanelKind::Print)?),
+        frame: Some({
+            let mut native = NativePanelCtx::new(state, engine, NativePanelKind::Print);
+            native.open()?
+        }),
     });
 
     tracing::info!(
@@ -564,7 +565,9 @@ fn finish_native_print_dialog(
 ///
 /// The per-kind result mapping stays here: the print/page-setup dialogs
 /// return 0 as a cancel and any other value as an `Ok` result; the shared
-/// down half ([`finish_native_panel`]) does the frame teardown.
+/// down half (`NativePanelCtx::finish`) does the frame teardown. The helper
+/// serves both `PrintDlgW` and `PageSetupDlgW`, so the ctx kind is nominal
+/// here — `finish` never reads it (only `open`'s trace does).
 fn finish_print_bridge(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -576,7 +579,11 @@ fn finish_print_bridge(
     } else {
         ModalResult::Ok(value)
     };
-    if let Some(signal) = finish_native_panel(state, engine, frame, result)? {
+    let signal = {
+        let mut native = NativePanelCtx::new(state, engine, NativePanelKind::Print);
+        native.finish(frame, result)?
+    };
+    if let Some(signal) = signal {
         return Err(signal.into());
     }
     print_dialog_return(engine, value)
@@ -766,13 +773,12 @@ fn open_native_page_setup_dialog(
         flags: psd.flags,
         pick: None,
         // The native panel is a modal session: open the frame (depth up, the
-        // active window captured) so the re-entry's finish_native_panel
+        // active window captured) so the re-entry's `NativePanelCtx::finish`
         // restores it.
-        frame: Some(open_native_panel(
-            state,
-            engine,
-            NativePanelKind::PageSetup,
-        )?),
+        frame: Some({
+            let mut native = NativePanelCtx::new(state, engine, NativePanelKind::PageSetup);
+            native.open()?
+        }),
     });
 
     tracing::info!(

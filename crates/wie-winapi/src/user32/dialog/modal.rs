@@ -9,7 +9,7 @@
 //! `EndDialog` writes the result into the fixed guest dialog-result slot,
 //! posts `WM_QUIT` (the stub's loop exits on it), removes the dialog subtree
 //! — the per-site tail — and hands the shared bookkeeping (depth down,
-//! activation/focus restore, owner invalidation) to [`finish_modal`].
+//! activation/focus restore, owner invalidation) to [`ModalFrame::finish`].
 
 use anyhow::{Context, Result};
 
@@ -24,7 +24,7 @@ use crate::user32::{
 use wie_pe::resources::{DialogItemTemplate, DialogTemplate, ItemClass};
 
 use super::template::resolve_template;
-use super::{ModalFrame, ModalResult, finish_modal};
+use super::{ModalFrame, ModalResult, finish_modal_without_frame};
 
 /// Handles `USER32.dll!CreateDialogParamA`.
 pub fn handle_create_dialog_param_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -109,8 +109,8 @@ fn handle_create_dialog_param_impl(
         (first_tabstop != 0).then_some(first_tabstop),
         &subtree,
     )?;
-    // Store the frame so EndDialog's shared teardown (`finish_modal`) can
-    // restore the owner and the focus when this dialog closes.
+    // Store the frame so EndDialog's shared teardown (`ModalFrame::finish`)
+    // can restore the owner and the focus when this dialog closes.
     state
         .window_state()
         .modal_frames
@@ -374,7 +374,7 @@ pub fn handle_end_dialog(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 
         // Remove the dialog subtree (the per-site tail). The owner rerender
         // that used to live here (erase + full-subtree invalidation) moved
-        // into finish_modal below — the shared down half.
+        // into `ModalFrame::finish` below — the shared down half.
         let _owner = remove_dialog_subtree(state, dialog_hwnd);
 
         // Shared "down" half: dialog depth down, activation restored to the
@@ -394,14 +394,13 @@ pub fn handle_end_dialog(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
             .modal_frames
             .remove(&crate::handles::Hwnd::from(dialog_hwnd))
         {
-            if let Some(signal) = finish_modal(state, engine, frame, modal_result)? {
+            if let Some(signal) = frame.finish(state, engine, modal_result)? {
                 return Err(signal.into());
             }
         } else {
             // No frame (a hand-built dialog or a double close): still balance
             // the depth so a stale depth cannot swallow the next command.
-            let mut queue = state.lock_message_queue();
-            queue.dialog_depth = queue.dialog_depth.saturating_sub(1);
+            finish_modal_without_frame(state);
         }
 
         1

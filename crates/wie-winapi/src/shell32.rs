@@ -3,9 +3,7 @@
 use crate::guest_memory::{read_u64, write_u32 as write_guest_u32};
 use crate::guest_string::{read_utf16_lossy, write_utf16_c_string};
 use crate::state::{MessageBoxRequest, PendingNativeMessageBox, WinApiControlSignal, WindowFlags};
-use crate::user32::{
-    IDOK, ModalResult, NativePanelKind, find_window_mut, finish_native_panel, open_native_panel,
-};
+use crate::user32::{IDOK, ModalResult, NativePanelCtx, NativePanelKind, find_window_mut};
 use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 use anyhow::{Context, Result};
 
@@ -282,7 +280,12 @@ pub fn handle_shell_about_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         } else {
             ModalResult::Cancel
         };
-        if let Some(signal) = finish_native_panel(ctx.state, ctx.engine, pending.frame, result)? {
+        let signal = {
+            let mut native =
+                NativePanelCtx::new(ctx.state, ctx.engine, NativePanelKind::ShellAbout);
+            native.finish(pending.frame, result)?
+        };
+        if let Some(signal) = signal {
             return Err(signal.into());
         }
         return finish(ctx.engine, win32_id);
@@ -299,13 +302,14 @@ pub fn handle_shell_about_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         // re-enters this handler. Reuses MessageBoxRequest as-is: an About box
         // is exactly caption + text + MB_OK. The alert is a modal session
         // (same frame protocol as MessageBoxA/W).
+        let frame = {
+            let mut native =
+                NativePanelCtx::new(ctx.state, ctx.engine, NativePanelKind::ShellAbout);
+            native.open()?
+        };
         ctx.state.window_state().pending_native_message_box = Some(PendingNativeMessageBox {
             pick: None,
-            frame: Some(open_native_panel(
-                ctx.state,
-                ctx.engine,
-                NativePanelKind::ShellAbout,
-            )?),
+            frame: Some(frame),
         });
         return Err(WinApiControlSignal::MessageBoxBridgeRequested {
             request: MessageBoxRequest {

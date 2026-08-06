@@ -647,9 +647,9 @@ pub struct WindowState {
     /// In-flight modal frames keyed by the modal window (dialog) handle.
     ///
     /// Set by the modal builders' [`ModalFrame::activate`] and consumed by
-    /// `EndDialog`'s `finish_modal` when the modal closes. The native-bridge
-    /// families carry their frame in the pending-bridge record instead (they
-    /// have no guest window to key by).
+    /// `EndDialog`'s [`ModalFrame::finish`] when the modal closes. The
+    /// native-bridge families carry their frame in the pending-bridge record
+    /// instead (they have no guest window to key by).
     pub(crate) modal_frames: ahash::HashMap<crate::handles::Hwnd, ModalFrame>,
 }
 

@@ -33,16 +33,16 @@ mod paint;
 mod proc;
 mod template;
 
-pub(crate) use native::{NativePanelKind, finish_native_panel, open_native_panel};
+pub(crate) use native::{NativePanelCtx, NativePanelKind};
 pub(crate) use paint::paint_dialog;
 
 /// The unified result contract for a finished modal session.
 ///
 /// Both modal mechanisms funnel into this one return contract: the in-guest
 /// modal loop's `EndDialog` result (written to the guest result slot) and the
-/// native bridge's host-side pick. [`finish_modal`] consumes it for the shared
-/// bookkeeping; the per-kind tails (subtree removal, session close, panel
-/// cleanup) stay per-site.
+/// native bridge's host-side pick. [`ModalFrame::finish`] consumes it for the
+/// shared bookkeeping; the per-kind tails (subtree removal, session close,
+/// panel cleanup) stay per-site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ModalResult {
     /// The modal completed with a result value (`IDOK`, `IDYES`, …).
@@ -54,11 +54,11 @@ pub(crate) enum ModalResult {
 /// One in-flight modal session's lifecycle bookkeeping.
 ///
 /// Created by [`ModalFrame::activate`] when the modal opens (the "up" half)
-/// and consumed by [`finish_modal`] when it closes (the "down" half). The
-/// frame carries everything the shared teardown needs that is NOT derivable
-/// once the modal window is gone: the previous active window (the owner,
-/// restored and invalidated on finish) and whether the modal took keyboard
-/// focus at activation.
+/// and consumed by [`ModalFrame::finish`] when it closes (the "down" half).
+/// The frame carries everything the shared teardown needs that is NOT
+/// derivable once the modal window is gone: the previous active window (the
+/// owner, restored and invalidated on finish) and whether the modal took
+/// keyboard focus at activation.
 #[derive(Debug, Clone)]
 pub(crate) struct ModalFrame {
     /// The modal window: the dialog hwnd (template / file / font dialogs) or,
@@ -67,10 +67,11 @@ pub(crate) struct ModalFrame {
     pub(crate) active: Hwnd,
     /// The window the user returns to when the modal closes: the modal's
     /// owner (the dialog's parent, or the window that was active when a
-    /// native panel launched). Restored and invalidated by [`finish_modal`].
+    /// native panel launched). Restored and invalidated by
+    /// [`ModalFrame::finish`].
     pub(crate) previous_active: Hwnd,
     /// The focus the modal took at activation (`None` = it left focus alone,
-    /// so [`finish_modal`] restores nothing).
+    /// so [`ModalFrame::finish`] restores nothing).
     pub(crate) focus: Option<Hwnd>,
     /// The windows invalidated at activation (the first-paint subtree).
     pub(crate) subtree: Vec<Hwnd>,
@@ -105,9 +106,9 @@ impl ModalFrame {
         subtree: &[u64],
     ) -> Result<(ModalFrame, Option<WinApiControlSignal>)> {
         // Capture the window the user returns to BEFORE the modal takes over:
-        // `finish_modal` restores it, and at finish time the modal window may
-        // already be gone (the per-site subtree-removal tail runs first). This
-        // is the modal's OWNER — the dialog's parent when it has one (the
+        // `ModalFrame::finish` restores it, and at finish time the modal window
+        // may already be gone (the per-site subtree-removal tail runs first).
+        // This is the modal's OWNER — the dialog's parent when it has one (the
         // active-window slot is not always set in synthetic/headless sessions,
         // while the dialog's parent always is), else the window that was
         // active at activation (the native-bridge shape, where the panel
@@ -155,97 +156,112 @@ impl ModalFrame {
         };
         Ok((frame, signal))
     }
-}
 
-/// Finish a modal session: the shared "down" half symmetric to
-/// [`ModalFrame::activate`].
-///
-/// Decrements the queue's dialog depth (the single decrement point — the
-/// `WM_QUIT` the `EndDialog` tail posts is just a message, consumed by the
-/// loop with no bookkeeping), restores activation to the previous active
-/// window (the owner, captured in `activate`), hands keyboard focus back to
-/// the owner when the modal took it, and invalidates the owner with the erase
-/// pattern `EndDialog` uses so its next repaint erases the modal's region.
-///
-/// The per-kind TAILS stay per-site: template-dialog window-subtree removal
-/// (`EndDialog`), file/font session close, native-bridge panel cleanup. The
-/// native bridge is not forced into the loop's shape — its frame is created
-/// and finished around the two-entry bridge flow instead.
-///
-/// Returns the `deliver_focus_change` bridge signal when a guest-WndProc owner
-/// must run first (the caller returns it as `Err(..)`; the outer API call then
-/// completes with the modal result's value).
-pub(crate) fn finish_modal(
-    state: &mut WinApiState,
-    engine: &mut dyn wie_cpu::CpuEngine,
-    frame: ModalFrame,
-    result: ModalResult,
-) -> Result<Option<WinApiControlSignal>> {
-    // Depth down, symmetric with activate's saturating_add.
-    {
-        let mut queue = state.lock_message_queue();
-        queue.dialog_depth = queue.dialog_depth.saturating_sub(1);
-        tracing::debug!(
-            target: "wiegui",
-            depth = queue.dialog_depth,
-            "dialog depth down"
-        );
-    }
+    /// Finish this modal session: the shared "down" half symmetric to
+    /// [`ModalFrame::activate`].
+    ///
+    /// Decrements the queue's dialog depth (the single decrement point — the
+    /// `WM_QUIT` the `EndDialog` tail posts is just a message, consumed by the
+    /// loop with no bookkeeping), restores activation to the previous active
+    /// window (the owner, captured in `activate`), hands keyboard focus back to
+    /// the owner when the modal took it, and invalidates the owner with the
+    /// erase pattern `EndDialog` uses so its next repaint erases the modal's
+    /// region.
+    ///
+    /// The per-kind TAILS stay per-site: template-dialog window-subtree removal
+    /// (`EndDialog`), file/font session close, native-bridge panel cleanup. The
+    /// native bridge is not forced into the loop's shape — its frame is created
+    /// and finished around the two-entry bridge flow instead. A dialog that
+    /// closed with NO stored frame (a hand-built dialog or a double close) has
+    /// nothing to restore; only the depth balances — see
+    /// [`finish_modal_without_frame`].
+    ///
+    /// Returns the `deliver_focus_change` bridge signal when a guest-WndProc
+    /// owner must run first (the caller returns it as `Err(..)`; the outer API
+    /// call then completes with the modal result's value).
+    pub(crate) fn finish(
+        self,
+        state: &mut WinApiState,
+        engine: &mut dyn wie_cpu::CpuEngine,
+        result: ModalResult,
+    ) -> Result<Option<WinApiControlSignal>> {
+        // Depth down, symmetric with activate's saturating_add.
+        {
+            let mut queue = state.lock_message_queue();
+            queue.dialog_depth = queue.dialog_depth.saturating_sub(1);
+            tracing::debug!(
+                target: "wiegui",
+                depth = queue.dialog_depth,
+                "dialog depth down"
+            );
+        }
 
-    // Restore activation to the window that owned the modal.
-    state.window_state().active_window_handle = frame.previous_active;
+        // Restore activation to the window that owned the modal.
+        state.window_state().active_window_handle = self.previous_active;
 
-    // Restore keyboard focus to the owner when the modal took it at
-    // activation. `deliver_focus_change` dispatches host-side controls in
-    // place and bridges guest WndProcs / dialog procs; the outer API call the
-    // bridge completes carries the modal result's value.
-    let mut signal = None;
-    if frame.focus.is_some() {
-        let owner = frame.previous_active;
-        if owner != Hwnd::NULL {
-            let current_focus = state.window_state().focus_window_handle;
-            if current_focus != owner {
-                state.window_state().focus_window_handle = owner;
-                signal = deliver_focus_change(
-                    state,
-                    engine,
-                    current_focus.as_u64(),
-                    owner.as_u64(),
-                    OuterReturn::Fixed(modal_result_value(result)),
-                )?;
+        // Restore keyboard focus to the owner when the modal took it at
+        // activation. `deliver_focus_change` dispatches host-side controls in
+        // place and bridges guest WndProcs / dialog procs; the outer API call the
+        // bridge completes carries the modal result's value.
+        let mut signal = None;
+        if self.focus.is_some() {
+            let owner = self.previous_active;
+            if owner != Hwnd::NULL {
+                let current_focus = state.window_state().focus_window_handle;
+                if current_focus != owner {
+                    state.window_state().focus_window_handle = owner;
+                    signal = deliver_focus_change(
+                        state,
+                        engine,
+                        current_focus.as_u64(),
+                        owner.as_u64(),
+                        OuterReturn::Fixed(modal_result_value(result)),
+                    )?;
+                }
             }
         }
-    }
 
-    // Invalidate the owner with the erase pattern EndDialog uses: the dialog
-    // composited into its surface, so the next cycle repaints the class-brush
-    // background over the dialog region and every remaining control over the
-    // face. The owner is the modal window's parent when it still exists (the
-    // per-site subtree-removal tail runs before this in the EndDialog path,
-    // so the captured `previous_active` carries it), else the window that was
-    // active at activation.
-    let owner = find_window(state, frame.active.as_u64())
-        .filter(|window| window.parent_handle != Hwnd::NULL)
-        .map_or(frame.previous_active, |window| window.parent_handle);
-    if owner != Hwnd::NULL
-        && let Some(window) = find_window_mut(state, owner.as_u64())
-    {
-        window.invalidated = true;
-        window.flags.insert(WindowFlags::ERASE_BACKGROUND);
-    }
-    invalidate_subtree(state, owner);
-
-    // Defensive, symmetric with activate's first-paint invalidation: any
-    // modal window that survived its family's teardown tail (a future closer
-    // that forgets to remove the subtree) still ends invalidated instead of
-    // lingering painted on the owner surface.
-    for &hwnd in &frame.subtree {
-        if let Some(window) = find_window_mut(state, hwnd.as_u64()) {
+        // Invalidate the owner with the erase pattern EndDialog uses: the dialog
+        // composited into its surface, so the next cycle repaints the class-brush
+        // background over the dialog region and every remaining control over the
+        // face. The owner is the modal window's parent when it still exists (the
+        // per-site subtree-removal tail runs before this in the EndDialog path,
+        // so the captured `previous_active` carries it), else the window that was
+        // active at activation.
+        let owner = find_window(state, self.active.as_u64())
+            .filter(|window| window.parent_handle != Hwnd::NULL)
+            .map_or(self.previous_active, |window| window.parent_handle);
+        if owner != Hwnd::NULL
+            && let Some(window) = find_window_mut(state, owner.as_u64())
+        {
             window.invalidated = true;
+            window.flags.insert(WindowFlags::ERASE_BACKGROUND);
         }
-    }
+        invalidate_subtree(state, owner);
 
-    Ok(signal)
+        // Defensive, symmetric with activate's first-paint invalidation: any
+        // modal window that survived its family's teardown tail (a future closer
+        // that forgets to remove the subtree) still ends invalidated instead of
+        // lingering painted on the owner surface.
+        for &hwnd in &self.subtree {
+            if let Some(window) = find_window_mut(state, hwnd.as_u64()) {
+                window.invalidated = true;
+            }
+        }
+
+        Ok(signal)
+    }
+}
+
+/// The frame-less modal teardown: `EndDialog`'s hand-built / double-close path.
+///
+/// When a dialog closes with no stored [`ModalFrame`] (the builder never ran
+/// `activate`, or the close already consumed the frame), there is nothing to
+/// restore — activation and focus were never taken — but the queue depth still
+/// balances so a stale depth cannot swallow the next command.
+pub(crate) fn finish_modal_without_frame(state: &mut WinApiState) {
+    let mut queue = state.lock_message_queue();
+    queue.dialog_depth = queue.dialog_depth.saturating_sub(1);
 }
 
 /// The numeric value a modal result contributes to the outer API return of a
