@@ -368,8 +368,15 @@ pub fn handle_is_valid_code_page(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         .read_rcx()
         .context("failed to read RCX for IsValidCodePage")?;
 
-    let return_value = match code_page {
-        0 | 437 | 1252 | 1200 | 65001 => 1,
+    // The 0 alias + the code pages WIE actually round-trips. Out-of-range
+    // registers stay invalid exactly as the old u64 match left them.
+    let cp32 = u32::try_from(code_page).unwrap_or(u32::MAX);
+    let return_value = match cp32 {
+        0
+        | crate::vfs::CP_OEMCP
+        | crate::vfs::CP_ACP
+        | crate::vfs::CP_UTF16
+        | crate::vfs::CP_UTF8 => 1,
         _ => 0,
     };
 

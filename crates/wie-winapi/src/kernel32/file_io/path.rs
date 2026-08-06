@@ -1,9 +1,9 @@
 use super::{
-    Context, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_DRIVE, ERROR_INVALID_HANDLE,
-    ERROR_INVALID_PARAMETER, ERROR_PATH_NOT_FOUND, HandlerContext, Result, WinApiHandlerResult,
-    WinApiState, checked_address, get_user_profile_dir_impl, read_ansi_string_from_cpu,
-    read_guest_utf16_lossy, read_u16, read_wide_string_from_cpu, write_guest_u64,
-    write_guest_utf16_units,
+    Context, DUPLICATE_CLOSE_SOURCE, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_DRIVE,
+    ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_PATH_NOT_FOUND, HandlerContext, Result,
+    WinApiHandlerResult, WinApiState, checked_address, get_user_profile_dir_impl,
+    read_ansi_string_from_cpu, read_guest_utf16_lossy, read_u16, read_wide_string_from_cpu,
+    write_guest_u64, write_guest_utf16_units,
 };
 
 /// Handles `KERNEL32.dll!GetCurrentDirectoryW`.
@@ -184,7 +184,7 @@ pub(crate) fn handle_duplicate_handle(ctx: &mut HandlerContext<'_>) -> Result<Wi
         .is_ok()
     {
         let opts = u32::from_le_bytes(opt_bytes);
-        (opts & 0x1) != 0 // DUPLICATE_CLOSE_SOURCE = 0x1
+        (opts & DUPLICATE_CLOSE_SOURCE) != 0
     } else {
         false
     };

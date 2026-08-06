@@ -318,10 +318,10 @@ pub(crate) fn handle_get_osfhandle(ctx: &mut HandlerContext<'_>) -> Result<WinAp
     let fd = engine.read_rcx()? & 0xffff_ffff;
     // Align with kernel32 fake std handles.
     let handle = match fd {
-        0 => 0x0000_0000_6000_0001_u64, // stdin
-        1 => 0x0000_0000_6000_0002_u64, // stdout
-        2 => 0x0000_0000_6000_0003_u64, // stderr
-        _ => u64::MAX,                  // INVALID_HANDLE_VALUE
+        0 => crate::kernel32::FAKE_STDIN_HANDLE,
+        1 => crate::kernel32::FAKE_STDOUT_HANDLE,
+        2 => crate::kernel32::FAKE_STDERR_HANDLE,
+        _ => crate::kernel32::INVALID_HANDLE_VALUE,
     };
     ret(engine, handle)
 }
@@ -525,13 +525,16 @@ pub(crate) fn handle_cxx_throw_exception(
     let rec = rsp.saturating_sub(0x100);
     let rip = engine.read_rip()?;
     // ExceptionCode = 0xE06D7363 ('msc' | 0xE0000000)
-    engine.mem_write(rec, &0xE06D_7363_u32.to_le_bytes())?;
+    engine.mem_write(rec, &crate::seh::MSVC_EXCEPTION_CODE.to_le_bytes())?;
     engine.mem_write(rec.saturating_add(4), &1_u32.to_le_bytes())?; // noncontinuable
     engine.mem_write(rec.saturating_add(8), &[0u8; 8])?;
     engine.mem_write(rec.saturating_add(16), &rip.to_le_bytes())?;
     engine.mem_write(rec.saturating_add(24), &4_u32.to_le_bytes())?; // NumberParameters
     // Parameters[0] = EH magic, [1] = object, [2] = ThrowInfo, [3] = image base (0)
-    engine.mem_write(rec.saturating_add(32), &0x1993_0520_u64.to_le_bytes())?;
+    engine.mem_write(
+        rec.saturating_add(32),
+        &u64::from(crate::msvc_eh::FUNCINFO_MAGIC_V1).to_le_bytes(),
+    )?;
     engine.mem_write(rec.saturating_add(40), &pexception_object.to_le_bytes())?;
     engine.mem_write(rec.saturating_add(48), &pthrow_info.to_le_bytes())?;
     engine.mem_write(rec.saturating_add(56), &0_u64.to_le_bytes())?;

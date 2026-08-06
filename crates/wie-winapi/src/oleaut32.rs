@@ -21,6 +21,16 @@ const VT_BOOL: u16 = 11;
 const VT_I8: u16 = 20;
 const VT_UI4: u16 = 19;
 
+/// HRESULT codes the stubs return (winerror.h).
+/// `E_INVALIDARG` — one or more arguments are invalid.
+const E_INVALIDARG: u64 = 0x8007_0057;
+/// `E_OUTOFMEMORY` — the operation could not allocate memory.
+const E_OUTOFMEMORY: u64 = 0x8007_000E;
+/// `DISP_E_DIVBYZERO` — a variant arithmetic operation divided by zero.
+const DISP_E_DIVBYZERO: u64 = 0x8002_0011;
+/// `DISP_E_MEMBERNOTFOUND` — fallback for an unsupported source VARTYPE.
+const DISP_E_MEMBERNOTFOUND: u64 = 0x8002_0003;
+
 /// Soft-dispatch path for OLEAUT32 (name or `ORDINAL N`).
 pub fn dispatch_oleaut32(
     ctx: &mut HandlerContext<'_>,
@@ -347,7 +357,7 @@ fn handle_variant_copy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
     let src = engine.read_rdx()?;
     if dest == 0 || src == 0 {
         // Real OLEAUT32 returns `E_INVALIDARG` for null pointers.
-        return ret(engine, 0x8007_0057);
+        return ret(engine, E_INVALIDARG);
     }
     if dest == src {
         return ret(engine, 0);
@@ -363,7 +373,7 @@ fn handle_variant_copy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
         let new_bstr = dup_bstr(engine, state, src_bstr)?;
         if src_bstr != 0 && new_bstr == 0 {
             // Out of memory.
-            return ret(engine, 0x8007_000E);
+            return ret(engine, E_OUTOFMEMORY);
         }
         // vt = VT_BSTR, reserved zeros, bstrVal = new_bstr
         engine.mem_write(dest, &VT_BSTR.to_le_bytes())?;
@@ -393,7 +403,7 @@ fn handle_var_math(ctx: &mut HandlerContext<'_>, op: &str) -> Result<WinApiHandl
     let plhs = engine.read_rdx()?;
     let prhs = engine.read_r8()?;
     if presult == 0 || plhs == 0 || prhs == 0 {
-        return ret(engine, 0x8007_0057); // E_INVALIDARG
+        return ret(engine, E_INVALIDARG);
     }
     let (lvt, lhs_val) = read_variant_num(engine, plhs)?;
     let (rvt, rhs_val) = read_variant_num(engine, prhs)?;
@@ -408,14 +418,14 @@ fn handle_var_math(ctx: &mut HandlerContext<'_>, op: &str) -> Result<WinApiHandl
             if rhs_val == 0 {
                 // Clear result to VT_EMPTY and return error
                 engine.mem_write(presult, &[0_u8; VARIANT_SIZE])?;
-                return ret(engine, 0x8002_0011); // DISP_E_DIVBYZERO
+                return ret(engine, DISP_E_DIVBYZERO);
             }
             lhs_val / rhs_val
         }
         "varmod" | "mod" => {
             if rhs_val == 0 {
                 engine.mem_write(presult, &[0_u8; VARIANT_SIZE])?;
-                return ret(engine, 0x8002_0011);
+                return ret(engine, DISP_E_DIVBYZERO);
             }
             lhs_val % rhs_val
         }
@@ -439,7 +449,7 @@ fn handle_var_bstr_from_num(
     let presult = engine.read_rcx()?;
     let raw_val = engine.read_rdx()?;
     if presult == 0 {
-        return ret(engine, 0x8007_0057);
+        return ret(engine, E_INVALIDARG);
     }
     let s = match src_vt {
         VT_I4 => format!("{}", raw_val as i32),
@@ -448,7 +458,7 @@ fn handle_var_bstr_from_num(
             f32::from_bits(u32::try_from(raw_val & 0xffff_ffff).unwrap_or(0))
         ),
         VT_R8 | VT_DATE => format!("{}", f64::from_bits(raw_val)),
-        _ => return ret(engine, 0x8002_0003), // E_INVALIDARG
+        _ => return ret(engine, DISP_E_MEMBERNOTFOUND),
     };
     let units: Vec<u16> = s.encode_utf16().collect();
     let bstr = alloc_bstr(engine, state, &units)?;
@@ -472,7 +482,7 @@ fn handle_var_num_from_bstr(
     let presult = engine.read_rcx()?;
     let psrc = engine.read_rdx()?;
     if presult == 0 || psrc == 0 {
-        return ret(engine, 0x8007_0057);
+        return ret(engine, E_INVALIDARG);
     }
     let vt = read_vt(engine, psrc)?;
     if vt != VT_BSTR {
@@ -524,7 +534,7 @@ fn handle_var_num_from_num(
     let presult = engine.read_rcx()?;
     let psrc = engine.read_rdx()?;
     if presult == 0 || psrc == 0 {
-        return ret(engine, 0x8007_0057);
+        return ret(engine, E_INVALIDARG);
     }
     let (_svt, val) = read_variant_num(engine, psrc)?;
     write_variant_num(engine, presult, out_vt, val)?;

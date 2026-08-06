@@ -651,10 +651,13 @@ pub(crate) fn handle_wait_for_single_object(
             Some(crate::KernelObject::Semaphore(_)) => "Sem".into(),
             None => "INVALID".into(),
         };
-        eprintln!(
-            "[mt] WaitForSingleObject handle={handle:#x} timeout={timeout_ms:#x} kind={kind} active={:#x} pending={}",
-            state.kernel.threads.current_tid(),
-            state.kernel.sync.pending_spawns.len(),
+        tracing::error!(
+            handle = format_args!("{handle:#x}"),
+            timeout_ms = format_args!("{timeout_ms:#x}"),
+            kind = %kind,
+            active_tid = format_args!("{:#x}", state.kernel.threads.current_tid()),
+            pending = state.kernel.sync.pending_spawns.len(),
+            "[mt] WaitForSingleObject"
         );
     }
 

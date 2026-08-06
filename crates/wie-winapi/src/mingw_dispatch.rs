@@ -45,7 +45,7 @@ pub fn dispatch_stdcpp(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinAp
             let rsp = engine.read_rsp()?;
             let rec = rsp.saturating_sub(0x100);
             engine
-                .mem_write(rec, &0xE06D_7363_u32.to_le_bytes())
+                .mem_write(rec, &crate::seh::MSVC_EXCEPTION_CODE.to_le_bytes())
                 .context("exc code")?;
             engine
                 .mem_write(rec.saturating_add(4), &0_u32.to_le_bytes())
@@ -60,7 +60,10 @@ pub fn dispatch_stdcpp(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinAp
                 .mem_write(rec.saturating_add(24), &3_u32.to_le_bytes())
                 .context("num params")?;
             engine
-                .mem_write(rec.saturating_add(32), &0x1993_0522_u64.to_le_bytes())
+                .mem_write(
+                    rec.saturating_add(32),
+                    &u64::from(crate::msvc_eh::FUNCINFO_MAGIC_V3).to_le_bytes(),
+                )
                 .context("param0")?;
             engine
                 .mem_write(rec.saturating_add(40), &exc_obj.to_le_bytes())

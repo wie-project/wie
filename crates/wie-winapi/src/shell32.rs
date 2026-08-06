@@ -301,7 +301,7 @@ pub fn handle_shell_about_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 
     // Headless/trace: echo to the host console and auto-answer TRUE (IDOK) so
     // the guest never hangs on a missing host.
-    eprintln!("[ShellAboutW] {app_name}: {text}");
+    tracing::error!(app_name = %app_name, text = %text, "[ShellAboutW]");
     ret(ctx.engine, 1)
 }
 

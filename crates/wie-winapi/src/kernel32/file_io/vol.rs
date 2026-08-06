@@ -1,7 +1,7 @@
 use super::{
     Context, ERROR_FILE_NOT_FOUND, ERROR_INVALID_HANDLE, FAKE_DISK_CLUSTERS, FAKE_DISK_GIB,
     FAKE_STDIN_HANDLE, FIXED_SYSTEM_FILETIME, HandlerContext, INVALID_FILE_ATTRIBUTES,
-    LOGICAL_DRIVE_TCHARS, Result, WinApiHandlerResult, checked_address,
+    INVALID_HANDLE_VALUE, LOGICAL_DRIVE_TCHARS, Result, WinApiHandlerResult, checked_address,
     finish_create_file_create_only, handle_move_file_w, is_open_file_handle, low_u32,
     read_ansi_string_from_cpu, read_u64, read_wide_string_from_cpu, resolve_full_windows_path,
     ret_bool_true, ret_u64, stat_guest_path, temp_name_id_u32, write_fixed_dir_a,
@@ -10,6 +10,7 @@ use super::{
 };
 use crate::guest_layout::FileAttributeData;
 use crate::guest_memory::with_typed_write;
+use crate::kernel32::{ERROR_HANDLE_EOF, ERROR_INVALID_FUNCTION};
 
 pub fn handle_get_disk_free_space_ex_w(
     ctx: &mut HandlerContext<'_>,
@@ -111,21 +112,21 @@ pub fn handle_create_hard_link_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let _ = (engine.read_rcx()?, engine.read_rdx()?, engine.read_r8()?);
-    state.process.last_error = 1; // ERROR_INVALID_FUNCTION-ish
+    state.process.last_error = ERROR_INVALID_FUNCTION;
     ret_u64(engine, 0, "CreateHardLinkW")
 }
 pub fn handle_find_first_stream_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let _ = (engine.read_rcx()?, engine.read_rdx()?, engine.read_r8()?);
-    state.process.last_error = 38; // ERROR_HANDLE_EOF
-    ret_u64(engine, u64::MAX, "FindFirstStreamW") // INVALID_HANDLE_VALUE
+    state.process.last_error = ERROR_HANDLE_EOF;
+    ret_u64(engine, INVALID_HANDLE_VALUE, "FindFirstStreamW")
 }
 pub fn handle_find_next_stream_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let _ = (engine.read_rcx()?, engine.read_rdx()?);
-    state.process.last_error = 38;
+    state.process.last_error = ERROR_HANDLE_EOF;
     ret_u64(engine, 0, "FindNextStreamW")
 }
 pub fn handle_device_io_control(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -137,7 +138,7 @@ pub fn handle_device_io_control(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         engine.read_r8()?,
         engine.read_r9()?,
     );
-    state.process.last_error = 1;
+    state.process.last_error = ERROR_INVALID_FUNCTION;
     ret_u64(engine, 0, "DeviceIoControl")
 }
 /// Handles `KERNEL32.dll!GetCompressedFileSizeA` — return real uncompressed size via VFS.

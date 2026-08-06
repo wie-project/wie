@@ -9,6 +9,8 @@ pub const CP_ACP: u32 = 1252;
 pub const CP_OEMCP: u32 = 437;
 /// UTF-8 code page.
 pub const CP_UTF8: u32 = 65001;
+/// UTF-16LE code page (`WideCharToMultiByte` / `MultiByteToWideChar`).
+pub const CP_UTF16: u32 = 1200;
 
 /// Windows-1252 mapping for bytes 0x80..=0x9F (rest is Latin-1 / identity).
 const CP1252_80_9F: [u16; 32] = [

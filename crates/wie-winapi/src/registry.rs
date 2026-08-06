@@ -133,14 +133,22 @@ impl RegistryState {
 #[must_use]
 pub(crate) fn root_prefix(handle: u64) -> Option<&'static str> {
     match handle {
-        0x8000_0000 => Some("HKCR"),
-        0x8000_0001 => Some("HKCU"),
-        0x8000_0002 => Some("HKLM"),
-        0x8000_0003 => Some("HKU"),
-        0x8000_0005 => Some("HKCC"),
+        HKEY_CLASSES_ROOT => Some("HKCR"),
+        HKEY_CURRENT_USER => Some("HKCU"),
+        HKEY_LOCAL_MACHINE => Some("HKLM"),
+        HKEY_USERS => Some("HKU"),
+        HKEY_CURRENT_CONFIG => Some("HKCC"),
         _ => None,
     }
 }
+
+// WinNT.h root-handle constants: the handle values guests pass to
+// `RegOpenKey*` / `RegCreateKeyEx*` as the parent key.
+pub(crate) const HKEY_CLASSES_ROOT: u64 = 0x8000_0000;
+pub(crate) const HKEY_CURRENT_USER: u64 = 0x8000_0001;
+pub(crate) const HKEY_LOCAL_MACHINE: u64 = 0x8000_0002;
+pub(crate) const HKEY_USERS: u64 = 0x8000_0003;
+pub(crate) const HKEY_CURRENT_CONFIG: u64 = 0x8000_0005;
 
 /// The hive file lives at `{bottle_root}/registry/hive.dat`, beside `drive_c/`.
 fn hive_file_path(root: &Path) -> PathBuf {
@@ -346,8 +354,8 @@ mod tests {
 
     #[test]
     fn root_prefix_maps_standard_hives() {
-        assert_eq!(root_prefix(0x8000_0001), Some("HKCU"));
-        assert_eq!(root_prefix(0x8000_0002), Some("HKLM"));
+        assert_eq!(root_prefix(HKEY_CURRENT_USER), Some("HKCU"));
+        assert_eq!(root_prefix(HKEY_LOCAL_MACHINE), Some("HKLM"));
         assert_eq!(root_prefix(0x7000_0000), None);
     }
 }

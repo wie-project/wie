@@ -13,6 +13,8 @@ const ERROR_INVALID_HANDLE: u64 = 6;
 const ERROR_INVALID_PARAMETER: u64 = 87;
 const ERROR_MORE_DATA: u64 = 234;
 const ERROR_NO_MORE_ITEMS: u64 = 259;
+/// Win32 `ERROR_INSUFFICIENT_BUFFER` — the caller's buffer was too small.
+const ERROR_INSUFFICIENT_BUFFER: u64 = 122;
 const REG_CREATED_NEW_KEY: u32 = 1;
 const REG_OPENED_EXISTING_KEY: u32 = 2;
 
@@ -771,7 +773,7 @@ fn handle_reg_enum_key_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         return return_status(engine, ERROR_NO_MORE_ITEMS);
     };
     if name_buf == 0 || name_len_ptr == 0 {
-        return return_status(engine, 87); // ERROR_INVALID_PARAMETER
+        return return_status(engine, ERROR_INVALID_PARAMETER);
     }
     let mut len_buf = [0_u8; 4];
     engine.mem_read(name_len_ptr, &mut len_buf)?;
@@ -780,7 +782,7 @@ fn handle_reg_enum_key_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     let needed = u32::try_from(units.len()).unwrap_or(0);
     if needed >= buf_len {
         write_guest_u32(engine, name_len_ptr, needed.saturating_add(1))?;
-        return return_status(engine, 122); // ERROR_INSUFFICIENT_BUFFER
+        return return_status(engine, ERROR_INSUFFICIENT_BUFFER);
     }
     let mut bytes = Vec::with_capacity(units.len().saturating_mul(2).saturating_add(2));
     for u in &units {
@@ -884,6 +886,7 @@ fn read_optional_utf16_string(engine: &mut dyn wie_cpu::CpuEngine, address: u64)
 mod tests {
     use super::*;
     use crate::guest_heap::GuestHeap;
+    use crate::registry::HKEY_CURRENT_USER;
     use crate::state::{
         DllStateMap, FileIoState, HeapState, KernelState, ModuleState, ProcessState,
         WinApiEnvironment,
@@ -898,7 +901,6 @@ mod tests {
     const STACK_SIZE: usize = 0x1_0000;
     // STACK_VA + STACK_SIZE - 0x100 (leave room for a dummy return address).
     const STACK_TOP: u64 = 0x100_FF00;
-    const HKEY_CURRENT_USER: u64 = 0x8000_0001;
     const NOTEPAD_KEY: u64 = 0x100;
 
     /// Minimal engine for handler unit tests: maps guest pages with a valid

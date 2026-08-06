@@ -28,9 +28,9 @@ const STD_OUTPUT_HANDLE_ID: u32 = 0xffff_fff5;
 const STD_ERROR_HANDLE_ID: u32 = 0xffff_fff4;
 
 /// Fake console handles returned by `GetStdHandle` (Microsoft Learn std ids).
-const FAKE_STDIN_HANDLE: u64 = 0x0000_0000_6000_0001;
-const FAKE_STDOUT_HANDLE: u64 = 0x0000_0000_6000_0002;
-const FAKE_STDERR_HANDLE: u64 = 0x0000_0000_6000_0003;
+pub(crate) const FAKE_STDIN_HANDLE: u64 = 0x0000_0000_6000_0001;
+pub(crate) const FAKE_STDOUT_HANDLE: u64 = 0x0000_0000_6000_0002;
+pub(crate) const FAKE_STDERR_HANDLE: u64 = 0x0000_0000_6000_0003;
 
 /// Cap for a single host console line fill (safety against huge pastes).
 const MAX_HOST_STDIN_LINE: usize = 64 * 1024;
@@ -76,6 +76,18 @@ const HEAP_SIZE_FAILURE: u64 = u64::MAX;
 /// `HEAP_ZERO_MEMORY` (heapapi.h / Microsoft Learn).
 const HEAP_ZERO_MEMORY: u64 = 0x0000_0008;
 
+/// `IsProcessorFeaturePresent` feature ids (winnt.h `PF_*`).
+const PF_FLOATING_POINT_PRECISION_ERRATA: u32 = 0;
+const PF_COMPARE_EXCHANGE_DOUBLE: u32 = 6;
+const PF_MMX_INSTRUCTIONS_AVAILABLE: u32 = 7;
+const PF_XMMI_INSTRUCTIONS_AVAILABLE: u32 = 8;
+const PF_3DNOW_INSTRUCTIONS_AVAILABLE: u32 = 10;
+const PF_XMMI64_INSTRUCTIONS_AVAILABLE: u32 = 13;
+const PF_SSE3_INSTRUCTIONS_AVAILABLE: u32 = 14;
+const PF_NX_ENABLED: u32 = 21;
+const PF_RDTSC_INSTRUCTION_AVAILABLE: u32 = 23;
+const PF_COMPARE_EXCHANGE128: u32 = 25;
+
 const FAKE_KERNEL32_MODULE: u64 = 0x0000_0000_6100_0000;
 const FAKE_USER32_MODULE: u64 = 0x0000_0000_6100_1000;
 const FAKE_GDI32_MODULE: u64 = 0x0000_0000_6100_2000;
@@ -89,8 +101,15 @@ const INVALID_FILE_ATTRIBUTES: u64 = 0xffff_ffff;
 const FILE_ATTRIBUTE_DIRECTORY: u64 = 0x0000_0010;
 const FILE_ATTRIBUTE_ARCHIVE: u64 = 0x0000_0020;
 
-const INVALID_HANDLE_VALUE: u64 = u64::MAX;
+pub(crate) const INVALID_HANDLE_VALUE: u64 = u64::MAX;
 const ERROR_NO_MORE_FILES: u32 = 18;
+
+/// Win32 `ERROR_INVALID_FUNCTION` — the operation is not supported on this handle.
+pub(crate) const ERROR_INVALID_FUNCTION: u32 = 1;
+/// Win32 `ERROR_HANDLE_EOF` — the handle reached end-of-file (FindFirstStreamW).
+pub(crate) const ERROR_HANDLE_EOF: u32 = 38;
+/// `DUPLICATE_CLOSE_SOURCE` (process.h) — DuplicateHandle flag: close the source.
+pub(crate) const DUPLICATE_CLOSE_SOURCE: u32 = 0x1;
 
 const FAKE_RESOURCE_DATA_BASE: u64 = 0x0000_0000_6400_0000;
 const FAKE_RESOURCE_SIZE: u32 = 16;

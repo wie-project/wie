@@ -190,9 +190,11 @@ pub fn handle_resume_thread(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     if let Some(spawn) = state.kernel.sync.suspended_spawns.remove(&handle) {
         if std::env::var_os("WIE_MT_DEBUG").is_some() {
             let pending_after = state.kernel.sync.pending_spawns.len().saturating_add(1);
-            eprintln!(
-                "[mt] ResumeThread handle={handle:#x} tid={:#x} pending→{pending_after}",
-                spawn.tid,
+            tracing::error!(
+                handle = format_args!("{handle:#x}"),
+                tid = format_args!("{:#x}", spawn.tid),
+                pending_after,
+                "[mt] ResumeThread"
             );
         }
         state.kernel.sync.pending_spawns.push(spawn);
@@ -487,11 +489,16 @@ pub fn create_guest_thread(
     }
 
     if std::env::var_os("WIE_MT_DEBUG").is_some() {
-        eprintln!(
-            "[mt] CreateThread tid={tid:#x} handle={handle:#x} start={start:#x} param={param:#x} flags={flags:#x} suspended={} pending={} active_tid={:#x}",
-            (flags & CREATE_SUSPENDED) != 0,
-            state.kernel.sync.pending_spawns.len(),
-            state.kernel.threads.current_tid(),
+        tracing::error!(
+            tid = format_args!("{tid:#x}"),
+            handle = format_args!("{handle:#x}"),
+            start = format_args!("{start:#x}"),
+            param = format_args!("{param:#x}"),
+            flags = format_args!("{flags:#x}"),
+            suspended = (flags & CREATE_SUSPENDED) != 0,
+            pending = state.kernel.sync.pending_spawns.len(),
+            active_tid = format_args!("{:#x}", state.kernel.threads.current_tid()),
+            "[mt] CreateThread"
         );
     }
 

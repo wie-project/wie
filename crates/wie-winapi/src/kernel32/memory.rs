@@ -1,6 +1,6 @@
 use super::{
-    ERROR_INVALID_PARAMETER, HandlerContext, Result, WinApiHandlerResult, ret_bool_true, ret_u64,
-    write_guest_u32,
+    ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY, HandlerContext, Result,
+    WinApiHandlerResult, ret_bool_true, ret_u64, write_guest_u32,
 };
 
 pub fn handle_map_view_of_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -12,7 +12,7 @@ pub fn handle_map_view_of_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         engine.read_r8()?,
         engine.read_r9()?,
     );
-    state.process.last_error = 8; // ERROR_NOT_ENOUGH_MEMORY
+    state.process.last_error = ERROR_NOT_ENOUGH_MEMORY;
     ret_u64(engine, 0, "MapViewOfFile")
 }
 pub fn handle_unmap_view_of_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -24,7 +24,7 @@ pub fn handle_open_file_mapping(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let _ = (engine.read_rcx()?, engine.read_rdx()?, engine.read_r8()?);
-    state.process.last_error = 2; // ERROR_FILE_NOT_FOUND
+    state.process.last_error = ERROR_FILE_NOT_FOUND;
     ret_u64(engine, 0, "OpenFileMapping")
 }
 pub(crate) fn handle_virtual_alloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {

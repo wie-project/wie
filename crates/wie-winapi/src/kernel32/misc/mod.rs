@@ -1,10 +1,13 @@
 use super::{
     Context, ERROR_INVALID_PARAMETER, FIXED_PERFORMANCE_FREQUENCY, FLS_OUT_OF_INDEXES, FlsSlot,
     GUEST_OS_BUILD, GUEST_OS_MAJOR, GUEST_OS_MINOR, GUEST_OS_PLATFORM_NT, HandlerContext,
-    LANG_EN_US, OnceLock, Result, TIME_ZONE_ID_INVALID, TIME_ZONE_ID_UNKNOWN, WinApiHandlerResult,
-    WinApiState, checked_address, low_u32, read_guest_ansi_lossy, read_guest_utf16_lossy,
-    ret_bool_true, ret_u64, write_guest_u16, write_guest_u32, write_guest_u64, write_mock_string_a,
-    write_mock_string_w,
+    LANG_EN_US, OnceLock, PF_3DNOW_INSTRUCTIONS_AVAILABLE, PF_COMPARE_EXCHANGE_DOUBLE,
+    PF_COMPARE_EXCHANGE128, PF_FLOATING_POINT_PRECISION_ERRATA, PF_MMX_INSTRUCTIONS_AVAILABLE,
+    PF_NX_ENABLED, PF_RDTSC_INSTRUCTION_AVAILABLE, PF_SSE3_INSTRUCTIONS_AVAILABLE,
+    PF_XMMI_INSTRUCTIONS_AVAILABLE, PF_XMMI64_INSTRUCTIONS_AVAILABLE, Result, TIME_ZONE_ID_INVALID,
+    TIME_ZONE_ID_UNKNOWN, WinApiHandlerResult, WinApiState, checked_address, low_u32,
+    read_guest_ansi_lossy, read_guest_utf16_lossy, ret_bool_true, ret_u64, write_guest_u16,
+    write_guest_u32, write_guest_u64, write_mock_string_a, write_mock_string_w,
 };
 use crate::user32::lang::ui_language;
 use crate::user32::low_i32;
@@ -352,10 +355,20 @@ pub fn handle_is_processor_feature_present(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let feature = low_u32(engine.read_rcx()?, "IsProcessorFeaturePresent")?;
-    // Advertise a few common x64 features as present; unknown → FALSE.
-    // 0=floating point, 6=compare exchange double, 7=MMX, 8=XMMI (SSE),
-    // 10=3DNow, 13=SSE2, 14=SSE3, 21=NX, 23=RDTSC, 25=compare exchange 128.
-    let present = matches!(feature, 0 | 6 | 7 | 8 | 10 | 13 | 14 | 21 | 23 | 25);
+    // Advertise the common x64 feature set as present; unknown → FALSE.
+    let present = matches!(
+        feature,
+        PF_FLOATING_POINT_PRECISION_ERRATA
+            | PF_COMPARE_EXCHANGE_DOUBLE
+            | PF_MMX_INSTRUCTIONS_AVAILABLE
+            | PF_XMMI_INSTRUCTIONS_AVAILABLE
+            | PF_3DNOW_INSTRUCTIONS_AVAILABLE
+            | PF_XMMI64_INSTRUCTIONS_AVAILABLE
+            | PF_SSE3_INSTRUCTIONS_AVAILABLE
+            | PF_NX_ENABLED
+            | PF_RDTSC_INSTRUCTION_AVAILABLE
+            | PF_COMPARE_EXCHANGE128
+    );
     ret_u64(engine, u64::from(present), "IsProcessorFeaturePresent")
 }
 pub fn handle_get_large_page_minimum(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
