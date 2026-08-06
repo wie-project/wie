@@ -235,7 +235,7 @@ fn fill_console_output(
         FillKind::Attribute => u16::try_from(raw_value & 0xFFFF).unwrap_or(0),
     };
 
-    let mut filled = 0_u32;
+    let mut cells_filled = 0_u32;
     if let Some(buffer) = ctx.state.console().buffer_mut(buffer_handle) {
         let total = usize::try_from(length).unwrap_or(0).min(MAX_CELLS);
         let Some(origin) = buffer.index_of(start.x, start.y) else {
@@ -253,13 +253,13 @@ fn fill_console_output(
                 FillKind::Attribute => cell.attributes = unit,
                 FillKind::Wide | FillKind::Ansi => cell.unit = unit,
             }
-            filled = filled.saturating_add(1);
+            cells_filled = cells_filled.saturating_add(1);
         }
     }
 
     flush_active(ctx);
     if written_ptr != 0 {
-        write_guest_u32(ctx.engine, written_ptr, filled)?;
+        write_guest_u32(ctx.engine, written_ptr, cells_filled)?;
     }
     ret_bool_true(ctx.engine, api)
 }

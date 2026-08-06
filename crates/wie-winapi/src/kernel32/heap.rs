@@ -280,10 +280,10 @@ pub fn handle_local_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
         return ctx.finish(0);
     }
 
-    let existed = state.heap_state.heap.free_coherent(engine, memory);
+    let was_live = state.heap_state.heap.free_coherent(engine, memory);
 
     // LocalFree returns NULL on success and the original handle on failure.
-    let return_value = if existed { 0 } else { memory };
+    let return_value = if was_live { 0 } else { memory };
 
     ctx.finish(return_value)
 }
@@ -357,10 +357,10 @@ pub fn handle_global_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         return ctx.finish(0);
     }
 
-    let existed = state.heap_state.heap.free_coherent(engine, memory);
+    let was_live = state.heap_state.heap.free_coherent(engine, memory);
 
     // GlobalFree returns NULL on success and the original handle on failure.
-    let return_value = if existed { 0 } else { memory };
+    let return_value = if was_live { 0 } else { memory };
 
     ctx.finish(return_value)
 }
@@ -388,9 +388,9 @@ pub fn handle_global_unlock(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         .read_rcx()
         .context("failed to read RCX for GlobalUnlock")?;
 
-    let existed = state.heap_state.heap.is_live(memory);
+    let was_live = state.heap_state.heap.is_live(memory);
 
-    state.process.last_error = if existed { 0 } else { ERROR_INVALID_HANDLE };
+    state.process.last_error = if was_live { 0 } else { ERROR_INVALID_HANDLE };
 
     let return_value = 0;
 

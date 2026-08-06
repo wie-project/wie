@@ -580,7 +580,7 @@ impl PresentState {
             width,
             height,
             generation = self.generation,
-            publish_us = match t0 {
+            elapsed_us = match t0 {
                 Some(t) => u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX),
                 None => 0,
             },
