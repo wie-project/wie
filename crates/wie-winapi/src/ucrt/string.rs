@@ -312,6 +312,66 @@ pub(crate) fn handle_isspace(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         u64::from(c.is_ascii_whitespace() || c == b'\t' || c == b'\n' || c == b'\r'),
     )
 }
+/// `iswctype(wc, mask)` — wide-char ctype test with an explicit attribute
+/// mask, the MS CRT `corecrt_wctype.h` bit layout: `_UPPER` 0x1, `_LOWER`
+/// 0x2, `_DIGIT` 0x4, `_SPACE` 0x8, `_PUNCT` 0x10, `_CONTROL` 0x20,
+/// `_BLANK` 0x40, `_HEX` 0x80, `_ALPHA` 0x103 (`0x100|_UPPER|_LOWER`),
+/// `_LEADBYTE` 0x8000. Returns nonzero when `wc` carries ANY of the bits in
+/// `mask`; `WEOF` (0xFFFF) never matches. RNotepad's whole-word Find calls
+/// this (via `_istalnum` → `iswalnum` → `iswctype`) with `_ALPHA|_DIGIT`
+/// (0x107) on the characters around a candidate match — before this handler
+/// existed the dispatch bailed with "unsupported UCRT export" and the whole
+/// session stopped (the "Match whole word crashes the app" report).
+pub(crate) fn handle_iswctype(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let wc = u32::try_from(engine.read_rcx()?).unwrap_or(0);
+    let mask = u32::try_from(engine.read_rdx()?).unwrap_or(0);
+    let matched = wc != 0xFFFF && wc_ctype_attrs(wc) & mask != 0;
+    finish(engine, u64::from(matched))
+}
+
+/// The MS CRT ctype attribute bits for one wide character (see
+/// [`handle_iswctype`]).
+///
+/// The 0x100 bit alone is the "is a letter" marker; `_UPPER`/`_LOWER` are set
+/// only for cased letters, so a caseless letter (`中`) matches an `_ALPHA`
+/// mask (0x103) but NOT an `_UPPER`/`_LOWER` mask. Unpaired surrogates and
+/// non-characters carry no attributes.
+fn wc_ctype_attrs(wc: u32) -> u32 {
+    let Some(c) = char::from_u32(wc) else {
+        return 0;
+    };
+    let mut attrs = 0_u32;
+    if c.is_uppercase() {
+        attrs |= 0x0001; // _UPPER
+    }
+    if c.is_lowercase() {
+        attrs |= 0x0002; // _LOWER
+    }
+    if c.is_ascii_digit() {
+        attrs |= 0x0004; // _DIGIT (ASCII-scoped like the narrow ctype handlers)
+    }
+    if c.is_whitespace() {
+        attrs |= 0x0008; // _SPACE
+    }
+    // _PUNCT: printable but neither alphanumeric, whitespace, nor control.
+    if !c.is_alphanumeric() && !c.is_whitespace() && !c.is_control() {
+        attrs |= 0x0010;
+    }
+    if c.is_control() {
+        attrs |= 0x0020; // _CONTROL
+    }
+    if matches!(c, ' ' | '\t') {
+        attrs |= 0x0040; // _BLANK
+    }
+    if c.is_ascii_hexdigit() {
+        attrs |= 0x0080; // _HEX
+    }
+    if c.is_alphabetic() {
+        attrs |= 0x0100; // _ALPHA letter bit (caseless letters included)
+    }
+    attrs
+}
 pub(crate) fn handle_toupper(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let c = engine.read_rcx()?;

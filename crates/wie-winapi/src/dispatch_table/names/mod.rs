@@ -153,6 +153,7 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
                 | "_endthreadex"
                 | "_purecall"
                 | "perror"
+                | "iswctype"
         );
     }
     if library.eq_ignore_ascii_case("ole32.dll") {

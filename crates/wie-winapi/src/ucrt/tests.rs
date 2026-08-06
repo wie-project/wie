@@ -652,3 +652,66 @@ fn vsnwprintf_lld_reads_the_full_64_bit_slot() {
     assert_eq!(read_wide(&mut engine, 0x4000), "4294967298");
     assert_eq!(r.return_value, 10);
 }
+
+/// `iswctype(wc, mask)` — the wide ctype dispatch RNotepad's whole-word Find
+/// depends on (`_istalnum` → `iswalnum` → `iswctype(c, _ALPHA|_DIGIT)`). The
+/// handler must classify per the MS CRT `corecrt_wctype.h` mask bits, or the
+/// session stops with "unsupported UCRT export: iswctype" the moment the
+/// user enables "Match whole word" and clicks Find Next.
+#[test]
+fn iswctype_classifies_against_the_crt_mask() {
+    let alnum = 0x107; // _UPPER|_LOWER|_DIGIT|_ALPHA
+    let alpha = 0x103; // _ALPHA = 0x100|_UPPER|_LOWER
+    let upper = 0x001;
+    let lower = 0x002;
+    let digit = 0x004;
+    let space = 0x008;
+    let punct = 0x010;
+    let control = 0x020;
+    let blank = 0x040;
+    let hex = 0x080;
+
+    let expect = |engine: &mut IcedCpu, state: &mut WinApiState, wc: u32, mask: u32, want: u64| {
+        write_regs(engine, u64::from(wc), u64::from(mask), 0, 0);
+        let r = dispatch("msvcrt.dll", "iswctype", engine, state);
+        assert_eq!(r.return_value, want, "iswctype(0x{wc:x}, 0x{mask:x})");
+    };
+
+    let mut engine = test_engine();
+    let mut state = test_state();
+    // Whole-word search classifies the neighbours of a match.
+    expect(&mut engine, &mut state, u32::from(' '), alnum, 0);
+    expect(&mut engine, &mut state, u32::from('_'), alnum, 0);
+    expect(&mut engine, &mut state, u32::from('a'), alnum, 1);
+    expect(&mut engine, &mut state, u32::from('Z'), alnum, 1);
+    expect(&mut engine, &mut state, u32::from('0'), alnum, 1);
+    // Caseless letter: ALPHA yes, UPPER/LOWER no.
+    expect(&mut engine, &mut state, 0x4E2D, alpha, 1); // 中
+    expect(&mut engine, &mut state, 0x4E2D, upper, 0);
+    expect(&mut engine, &mut state, 0x4E2D, lower, 0);
+    // Case-sensitive masks distinguish upper/lower.
+    expect(&mut engine, &mut state, u32::from('A'), upper, 1);
+    expect(&mut engine, &mut state, u32::from('A'), lower, 0);
+    expect(&mut engine, &mut state, u32::from('a'), lower, 1);
+    expect(&mut engine, &mut state, u32::from('a'), upper, 0);
+    // Digit/hex: 'f' is a hex digit but not a decimal digit.
+    expect(&mut engine, &mut state, u32::from('7'), digit, 1);
+    expect(&mut engine, &mut state, u32::from('7'), hex, 1);
+    expect(&mut engine, &mut state, u32::from('f'), digit, 0);
+    expect(&mut engine, &mut state, u32::from('f'), hex, 1);
+    // Whitespace/blank/control.
+    expect(&mut engine, &mut state, u32::from(' '), space, 1);
+    expect(&mut engine, &mut state, u32::from('\t'), blank, 1);
+    expect(&mut engine, &mut state, u32::from('\n'), space, 1);
+    expect(&mut engine, &mut state, u32::from('\n'), blank, 0);
+    expect(&mut engine, &mut state, u32::from('\n'), control, 1);
+    expect(&mut engine, &mut state, 0x7F, control, 1);
+    // Punctuation.
+    expect(&mut engine, &mut state, u32::from('.'), punct, 1);
+    expect(&mut engine, &mut state, u32::from('.'), alnum, 0);
+    // WEOF never matches.
+    expect(&mut engine, &mut state, 0xFFFF, alnum, 0);
+    expect(&mut engine, &mut state, 0xFFFF, control, 0);
+    // Surrogate (not a valid char) matches nothing.
+    expect(&mut engine, &mut state, 0xD800, alnum, 0);
+}

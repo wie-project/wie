@@ -924,3 +924,193 @@ fn find_dialog_face_survives_selection_in_its_row_range() {
          {leaked}/18 clicks leaked"
     );
 }
+
+/// Drive one session through doc "catalog cat" → caret home → Find dialog →
+/// type "cat" → (optional) "Match whole word" checkbox → ONE Find Next click.
+///
+/// Returns the leftmost x of the selection highlight (COLOR_HIGHLIGHT
+/// 0x0000_78D7) in the owner frame, or `u32::MAX` when no selection appears.
+/// With whole-word OFF the first match is the leading "catalog" (x ≈ text
+/// origin); with whole-word ON the embedded match is rejected and the first
+/// match is the standalone trailing "cat" (~8 chars to the right).
+fn whole_word_probe(whole_word: bool) -> u32 {
+    use wie_runtime::EntryTraceTermination;
+    let path = real_exe("notepad.exe").expect("notepad.exe present");
+    let mut session =
+        wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
+            .expect("notepad session starts");
+    let handle = session.guest_handle();
+    pump_until_windows_ready(&mut session);
+
+    let main = session.first_guest_window_handle().unwrap_or(0);
+    let main_edit = session
+        .guest_windows_snapshot()
+        .iter()
+        .find(|(_, cls, ..)| cls == "EDIT")
+        .map(|(h, ..)| *h)
+        .unwrap_or(0);
+    assert_ne!(main, 0, "notepad main window exists");
+    assert_ne!(main_edit, 0, "notepad main EDIT exists");
+    let (_, _, w, h) = handle
+        .first_guest_window_info()
+        .unwrap_or((0, String::new(), 0, 0));
+
+    // 1. Document where whole-word matters: "cat" is embedded in "catalog" at
+    // position 0 AND standalone at position 8. Park the caret at the start
+    // (before the dialog opens — the dialog grabs keyboard focus).
+    for ch in "catalog cat".chars() {
+        handle.post_message(main_edit, WM_CHAR, u64::from(ch as u32), 0);
+    }
+    handle.post_message(main_edit, WM_KEYDOWN, u64::from(VK_HOME), 0);
+    handle.post_message(main_edit, WM_KEYUP, u64::from(VK_HOME), 0);
+    for _ in 0..30 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    assert!(
+        crate::helpers::count_edit_ink(&session, main) > 0,
+        "typed text renders in the main EDIT"
+    );
+
+    // 2. Open the modeless Find dialog.
+    handle.post_message(main, WM_COMMAND, u64::from(CMD_FIND), 0);
+    let mut dialog = 0;
+    let mut find_edit = 0;
+    for _ in 0..150 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        for (hwnd, cls, _, _) in session.guest_windows_snapshot() {
+            if cls == "FindDialog" {
+                dialog = hwnd;
+            } else if cls == "#129" && dialog != 0 {
+                find_edit = hwnd;
+            }
+        }
+        if dialog != 0 && find_edit != 0 {
+            break;
+        }
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    assert_ne!(dialog, 0, "find dialog opens");
+    assert_ne!(find_edit, 0, "find dialog has its EDIT");
+
+    let (dx, dy) = (
+        w.saturating_sub(FIND_DLG_CX) / 2,
+        h.saturating_sub(FIND_DLG_CY) / 2,
+    );
+
+    // 3. Type the search text; optionally check "Match whole word"
+    // (dialog-client (16, 64) 140x20 → center (86, 74)); then Find Next.
+    for ch in "cat".chars() {
+        handle.post_message(find_edit, WM_CHAR, u64::from(ch as u32), 0);
+    }
+    if whole_word {
+        let (wx, wy) = (dx + 16 + 70, dy + 64 + 10);
+        let (whole_word_button, _, _) = handle
+            .window_at(wx, wy)
+            .expect("Match whole word checkbox is hit-testable at its center");
+        let wlparam = u64::from((wy << 16 | wx) as u32);
+        handle.post_message_at(
+            whole_word_button,
+            WM_LBUTTONDOWN,
+            MK_LBUTTON,
+            wlparam,
+            wx,
+            wy,
+        );
+        handle.post_message_at(whole_word_button, WM_LBUTTONUP, 0, wlparam, wx, wy);
+    }
+    let (bx, by) = (
+        dx + FIND_DLG_FIND_NEXT_X + FIND_DLG_BTN_W / 2,
+        dy + FIND_DLG_FIND_NEXT_Y + FIND_DLG_BTN_H / 2,
+    );
+    let (button_hwnd, _, _) = handle
+        .window_at(bx, by)
+        .expect("Find Next button is hit-testable at its center");
+    let lparam = u64::from((by << 16 | bx) as u32);
+    handle.post_message_at(button_hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lparam, bx, by);
+    handle.post_message_at(button_hwnd, WM_LBUTTONUP, 0, lparam, bx, by);
+
+    // 4. The guest runs the search (with whole-word ON this exercises
+    // msvcrt.dll!iswctype — the pre-fix crash: the dispatch bailed with
+    // "unsupported UCRT export: iswctype" and the session stopped). Pump until
+    // the selection highlight appears; fail loudly on any non-idle termination.
+    for _ in 0..300 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        if !matches!(
+            summary.termination,
+            EntryTraceTermination::WaitingForMessage
+        ) {
+            panic!(
+                "session stopped during Find Next (whole_word={whole_word}): {:?} \
+                 (rip={:#x}, last_api={})",
+                summary.termination,
+                summary.final_rip,
+                summary
+                    .events
+                    .last()
+                    .map(|e| format!("{}!{}", e.library.as_ref(), e.name.as_ref()))
+                    .unwrap_or_else(|| "-".to_owned()),
+            );
+        }
+        if let Some(owner) = session.first_guest_window_handle()
+            && let Some(frame) = session.take_frame(owner)
+        {
+            let leftmost = frame
+                .pixels
+                .iter()
+                .enumerate()
+                .filter(|&(_, &p)| p == 0x0000_78D7)
+                .map(|(i, _)| u32::try_from(i % frame.width as usize).unwrap_or(0))
+                .min();
+            if let Some(left) = leftmost {
+                return left;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    u32::MAX
+}
+
+/// LIVE-BUG regression: "Match whole word" in the Find dialog must work (and
+/// must not crash the session).
+///
+/// The guest (RNotepad) implements the whole-word check guest-side in
+/// `NOTEPAD_FindTextAt` via `_istalnum` — which calls the imported
+/// `msvcrt.dll!iswctype(c, _ALPHA|_DIGIT)`. WIE had no `iswctype` handler, so
+/// the dispatch bailed with "unsupported UCRT export: iswctype" and the whole
+/// session stopped the moment a whole-word search compared the characters
+/// around a match ("checking Match whole word CRASHES the app").
+///
+/// Semantic proof: on "catalog cat", whole-word Find Next must reject the
+/// embedded match at position 0 and select the standalone trailing "cat"
+/// (~8 chars right of the substring selection), while the plain Find Next
+/// selects the leading "catalog".
+#[test]
+fn whole_word_find_next_does_not_crash() {
+    if real_exe("notepad.exe").is_none() {
+        eprintln!("skip: real_exes/notepad.exe not present");
+        return;
+    }
+    let _suite = gui_suite_serialize();
+
+    let sub_left = whole_word_probe(false);
+    let ww_left = whole_word_probe(true);
+
+    assert_ne!(sub_left, u32::MAX, "plain Find Next selects a match");
+    assert_ne!(ww_left, u32::MAX, "whole-word Find Next selects a match");
+    assert!(
+        sub_left < 30,
+        "plain Find Next selects the leading 'catalog' (leftmost highlight \
+         x={sub_left}, expected near the text origin)"
+    );
+    assert!(
+        ww_left >= sub_left.saturating_add(40),
+        "whole-word Find Next must skip the embedded 'catalog' match and \
+         select the standalone trailing 'cat' (whole-word leftmost x={ww_left} \
+         vs substring {sub_left})"
+    );
+}
