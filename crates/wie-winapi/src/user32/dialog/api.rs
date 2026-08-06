@@ -6,8 +6,7 @@ use anyhow::{Context, Result};
 
 use crate::user32::{
     HandlerContext, WinApiHandlerResult, WinApiState, WindowRecord, find_window_mut,
-    message::handle_send_message, read_guest_ansi_lossy, read_guest_utf16_lossy, read_u64,
-    write_guest_ansi_c_string, write_guest_u32, write_guest_utf16_c_string,
+    message::handle_send_message, read_arg_string, read_u64, write_guest_u32, write_out_string,
 };
 
 /// Handles `USER32.dll!GetDlgItemA`.
@@ -97,13 +96,7 @@ fn handle_get_dlg_item_text_impl(
     let return_value = if text.is_empty() || buffer_ptr == 0 {
         0
     } else {
-        let capacity = usize::try_from(max_characters).unwrap_or(0);
-        let copied = if unicode {
-            write_guest_utf16_c_string(engine, buffer_ptr, capacity, &text)?
-        } else {
-            write_guest_ansi_c_string(engine, buffer_ptr, capacity, &text)?
-        };
-        u64::try_from(copied).unwrap_or(0)
+        write_out_string(engine, buffer_ptr, max_characters, &text, unicode)?
     };
 
     ctx.finish(return_value)
@@ -139,11 +132,7 @@ fn handle_set_dlg_item_text_impl(
     let child = get_dlg_item(state, dialog_hwnd, id);
     let success = child != 0 && text_ptr != 0;
     if success {
-        let text = if unicode {
-            read_guest_utf16_lossy(engine, text_ptr, 32_768)?
-        } else {
-            read_guest_ansi_lossy(engine, text_ptr, 32_768)?
-        };
+        let text = read_arg_string(engine, text_ptr, unicode)?;
         if let Some(window) = find_window_mut(state, child) {
             window.control_text = text;
             window.invalidated = true;
@@ -529,6 +518,114 @@ mod tests {
 
     fn control_text(state: &WinApiState, hwnd: u64) -> String {
         find_window_ref(state, hwnd).map_or_else(String::new, |window| window.control_text.clone())
+    }
+
+    // ── GetDlgItemTextA/W / SetDlgItemTextA/W (the A/W arg pair family) ──
+
+    /// The guest UTF-16LE bytes (NUL-terminated) for `text`.
+    fn utf16_c_string_bytes(text: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes
+    }
+
+    /// Read a NUL-terminated UTF-16LE guest buffer at `ptr` (test-side).
+    fn read_guest_utf16(engine: &mut IcedCpu, ptr: u64) -> String {
+        let mut raw = [0_u8; 128];
+        engine.mem_read(ptr, &mut raw).expect("read guest buffer");
+        let mut units = Vec::new();
+        for pair in raw.chunks_exact(2) {
+            let unit = u16::from_le_bytes([pair[0], pair[1]]);
+            if unit == 0 {
+                break;
+            }
+            units.push(unit);
+        }
+        String::from_utf16_lossy(&units)
+    }
+
+    #[test]
+    fn dlg_item_text_w_round_trips_via_wide_boundary() {
+        // The demo W-path pin: SetDlgItemTextW with "dialog text — ✓" then
+        // GetDlgItemTextW must echo the identical text back — em dash and
+        // U+2713 included (the A path would degrade ✓ to '?').
+        let mut engine = test_engine();
+        let mut state = test_state();
+        let (dialog, _edit) = build_dialog_with_edit(&mut state, 0x10);
+
+        let text_ptr = 0x4000;
+        engine
+            .mem_write(text_ptr, &utf16_c_string_bytes("dialog text — ✓"))
+            .expect("write guest text");
+        write_regs(&mut engine, dialog, 0x10, text_ptr, 0);
+        let result = handle_set_dlg_item_text_w(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("SetDlgItemTextW should succeed");
+        assert_eq!(result.return_value, 1, "existing item sets text");
+
+        let out_ptr = 0x5000;
+        write_regs(&mut engine, dialog, 0x10, out_ptr, 64);
+        let result = handle_get_dlg_item_text_w(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("GetDlgItemTextW should succeed");
+        assert_eq!(
+            result.return_value, 15,
+            "15 UTF-16 units copied excluding the NUL"
+        );
+        assert_eq!(
+            read_guest_utf16(&mut engine, out_ptr),
+            "dialog text — ✓",
+            "the W round-trip must be lossless"
+        );
+    }
+
+    #[test]
+    fn dlg_item_text_a_reads_utf8_first_and_writes_cp1252() {
+        // The A-path asymmetry through the converted glue: the guest stores
+        // mingw A-string literals as UTF-8 ("café" = 63 61 66 C3 A9), and the
+        // write side re-encodes as the cp1252 bytes Windows writes (é → E9).
+        let mut engine = test_engine();
+        let mut state = test_state();
+        let (dialog, _edit) = build_dialog_with_edit(&mut state, 0x10);
+
+        let text_ptr = 0x4000;
+        engine
+            .mem_write(text_ptr, b"caf\xC3\xA9\0")
+            .expect("write UTF-8 literal");
+        write_regs(&mut engine, dialog, 0x10, text_ptr, 0);
+        let result = handle_set_dlg_item_text_a(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("SetDlgItemTextA should succeed");
+        assert_eq!(result.return_value, 1, "existing item sets text");
+
+        let out_ptr = 0x5000;
+        write_regs(&mut engine, dialog, 0x10, out_ptr, 8);
+        let result = handle_get_dlg_item_text_a(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("GetDlgItemTextA should succeed");
+        assert_eq!(result.return_value, 4, "4 CP1252 chars, not 5 UTF-8 bytes");
+        let mut raw = [0_u8; 8];
+        engine.mem_read(out_ptr, &mut raw).expect("read out buffer");
+        assert_eq!(
+            &raw[..5],
+            &[0x63, 0x61, 0x66, 0xE9, 0x00],
+            "UTF-8-first read, cp1252 write, NUL-terminated"
+        );
     }
 
     #[test]

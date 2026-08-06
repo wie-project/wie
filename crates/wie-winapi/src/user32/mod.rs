@@ -10,10 +10,10 @@ pub(crate) use crate::guest_memory::{
     write_u64 as write_guest_u64,
 };
 pub(crate) use crate::guest_string::{
-    read_ansi_lossy as read_guest_ansi_lossy, read_utf16_lossy as read_guest_utf16_lossy,
-    write_ansi_c_string as write_guest_ansi_c_string, write_fixed_ansi as write_guest_fixed_ansi,
-    write_fixed_utf16 as write_guest_fixed_utf16,
-    write_utf16_c_string as write_guest_utf16_c_string,
+    read_ansi_lossy as read_guest_ansi_lossy, read_arg_string,
+    read_utf16_lossy as read_guest_utf16_lossy, write_ansi_c_string as write_guest_ansi_c_string,
+    write_fixed_ansi as write_guest_fixed_ansi, write_fixed_utf16 as write_guest_fixed_utf16,
+    write_out_string, write_utf16_c_string as write_guest_utf16_c_string,
 };
 pub(crate) use crate::state::WindowFlags;
 pub(crate) use crate::{
@@ -339,36 +339,6 @@ pub(crate) fn write_window_rect(
     write_guest_i32(engine, checked_address(rect_ptr, 12, "RECT.bottom"), bottom)?;
 
     Ok(())
-}
-
-pub(crate) fn write_ansi_window_text(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    buffer_ptr: u64,
-    max_characters: u64,
-    text: &str,
-) -> Result<u64> {
-    let capacity =
-        usize::try_from(max_characters).context("ANSI window text capacity does not fit usize")?;
-
-    let copied = write_guest_ansi_c_string(engine, buffer_ptr, capacity, text)
-        .context("failed to write ANSI window text")?;
-
-    u64::try_from(copied).context("ANSI window text length does not fit u64")
-}
-
-pub(crate) fn write_wide_window_text(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    buffer_ptr: u64,
-    max_characters: u64,
-    text: &str,
-) -> Result<u64> {
-    let capacity =
-        usize::try_from(max_characters).context("wide window text capacity does not fit usize")?;
-
-    let copied = write_guest_utf16_c_string(engine, buffer_ptr, capacity, text)
-        .context("failed to write wide window text")?;
-
-    u64::try_from(copied).context("wide window text length does not fit u64")
 }
 
 /// `GWLP_WNDPROC` (-4) as the zero-extended `u64` a Win64

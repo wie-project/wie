@@ -4,7 +4,7 @@ use super::{
     NativePanelKind, Result, TimerRecord, WinApiHandlerResult, WinApiState, WindowClassRecord,
     WindowsHookRecord, checked_address, dispatch_control_proc_host_default, low_i32,
     read_guest_ansi_lossy, read_guest_utf16_lossy, read_i32, read_u64, register_window_class,
-    with_typed_read, write_guest_ansi_c_string, write_guest_utf16_c_string,
+    with_typed_read, write_out_string,
 };
 use crate::guest_layout::WndClassEx;
 use crate::state::{MessageBoxRequest, PendingNativeMessageBox};
@@ -753,11 +753,11 @@ fn handle_register_window_message_impl(
 
 /// Handles `USER32.dll!LoadStringW`.
 pub fn handle_load_string_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_load_string_impl(ctx, "LoadStringW")
+    handle_load_string_impl(ctx, true, "LoadStringW")
 }
 /// Handles `USER32.dll!LoadStringA`.
 pub fn handle_load_string_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_load_string_impl(ctx, "LoadStringA")
+    handle_load_string_impl(ctx, false, "LoadStringA")
 }
 
 /// Shared `LoadStringA/W` implementation.
@@ -770,6 +770,7 @@ pub fn handle_load_string_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 /// the main EXE (loaded-DLL string tables are not parsed yet).
 fn handle_load_string_impl(
     ctx: &mut HandlerContext<'_>,
+    wide: bool,
     api_name: &str,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -790,8 +791,6 @@ fn handle_load_string_impl(
     // API contract: LoadString string ids are u16 (anything wider cannot
     // address a parsed block).
     let string_id = u16::try_from(string_id_raw & u64::from(u16::MAX)).unwrap_or(0);
-    let max_characters = usize::try_from(max_characters_raw)
-        .with_context(|| format!("{api_name} cchMax does not fit usize"))?;
 
     let text = resolve_string_text(
         state,
@@ -803,14 +802,8 @@ fn handle_load_string_impl(
     let return_value = if text.is_empty() {
         // Not found (or empty string): Windows returns 0 either way.
         0
-    } else if api_name.ends_with('W') {
-        let copied = write_guest_utf16_c_string(engine, buffer_ptr, max_characters, &text)?;
-        u64::try_from(copied).unwrap_or(0)
     } else {
-        // A-strings follow the codebase UTF-8 convention; the byte count
-        // equals the character count for the ASCII strings real apps load.
-        let copied = write_guest_ansi_c_string(engine, buffer_ptr, max_characters, &text)?;
-        u64::try_from(copied).unwrap_or(0)
+        write_out_string(engine, buffer_ptr, max_characters_raw, &text, wide)?
     };
 
     tracing::debug!(

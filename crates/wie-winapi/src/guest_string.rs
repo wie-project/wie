@@ -401,6 +401,57 @@ pub(crate) fn write_utf16_c_string(
     Ok(copied)
 }
 
+// ── The A/W string-argument pair family ──────────────────────────────────
+//
+// The per-handler-pair A/W glue (read a string argument, write a string out)
+// used to repeat the wide-vs-ansi branch at every handler pair. These two
+// helpers carry that split ONCE; the A-path asymmetry is preserved exactly —
+// the read is UTF-8-first with a cp1252 fallback, the write is cp1252 (one
+// byte per char, unmappables → '?'), the W path is lossless UTF-16 both ways.
+
+/// Default cap for a guest string-argument read: bytes for the A path, UTF-16
+/// units for the W path. This is the 32 KiB window the text-setting handlers
+/// (SetWindowText/SetDlgItemText) use; the page-safe readers stop at the first
+/// NUL far earlier for real strings.
+const STRING_ARG_MAX: usize = 32_768;
+
+/// Read a NUL-terminated guest string argument: UTF-16 units when `wide` is
+/// true, ANSI/UTF-8 bytes otherwise. A NULL pointer (or the empty string)
+/// yields `""`. Capped at [`STRING_ARG_MAX`].
+pub(crate) fn read_arg_string(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    ptr: u64,
+    wide: bool,
+) -> Result<String> {
+    if wide {
+        read_utf16_lossy(engine, ptr, STRING_ARG_MAX)
+    } else {
+        read_ansi_lossy(engine, ptr, STRING_ARG_MAX)
+    }
+}
+
+/// Write `text` into a guest c-string buffer — cp1252 bytes (unmappables →
+/// `?`) for the A path, UTF-16 units for the W path — truncating to
+/// `cap - 1` content characters plus the terminating NUL. Returns the content
+/// count (characters for A, units for W) excluding the NUL, as `u64` — the
+/// length semantics both GetWindowTextA/W and the A/W LoadString/DlgItem
+/// variants report.
+pub(crate) fn write_out_string(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    ptr: u64,
+    cap: u64,
+    text: &str,
+    wide: bool,
+) -> Result<u64> {
+    let capacity = usize::try_from(cap).context("guest string capacity does not fit usize")?;
+    let copied = if wide {
+        write_utf16_c_string(engine, ptr, capacity, text)?
+    } else {
+        write_ansi_c_string(engine, ptr, capacity, text)?
+    };
+    u64::try_from(copied).context("guest string length does not fit u64")
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -635,5 +686,166 @@ mod tests {
             .expect("write guest bytes");
         let text = read_ansi_lossy(&mut engine, BUF, 64).expect("read ANSI");
         assert_eq!(text, "Hello");
+    }
+
+    // --- read_arg_string / write_out_string (the A/W arg pair family) ---
+
+    /// The guest UTF-16LE bytes (NUL-terminated) for `text`.
+    fn utf16_c_string_bytes(text: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn read_arg_string_wide_round_trips_utf16() {
+        // The demo W-path pin ("dialog text — ✓" echoes losslessly through
+        // SetDlgItemTextW/GetDlgItemTextW): the family's wide read must
+        // decode the guest UTF-16 units back to the identical text — em dash
+        // and U+2713 included (the A path would degrade ✓ to '?').
+        let mut engine = test_engine();
+        engine
+            .mem_write(BUF, &utf16_c_string_bytes("dialog text — ✓"))
+            .expect("write guest units");
+        let text = read_arg_string(&mut engine, BUF, true).expect("wide arg read");
+        assert_eq!(text, "dialog text — ✓");
+    }
+
+    #[test]
+    fn read_arg_string_ansi_is_utf8_first_then_cp1252() {
+        // The A-path read asymmetry: a mingw UTF-8 literal decodes to the
+        // original chars, an ACP 1252 byte string falls back to cp1252.
+        let mut engine = test_engine();
+        engine
+            .mem_write(BUF, b"caf\xC3\xA9\0")
+            .expect("write UTF-8 literal");
+        let text = read_arg_string(&mut engine, BUF, false).expect("ANSI arg read");
+        assert_eq!(text, "café");
+
+        engine
+            .mem_write(BUF, &[0x63, 0xE9, 0x00])
+            .expect("write CP1252 bytes");
+        let text = read_arg_string(&mut engine, BUF, false).expect("ANSI arg read");
+        assert_eq!(text, "cé");
+    }
+
+    #[test]
+    fn read_arg_string_null_ptr_and_nul_stop() {
+        let mut engine = test_engine();
+        assert_eq!(
+            read_arg_string(&mut engine, 0, false).expect("NULL ANSI arg"),
+            ""
+        );
+        assert_eq!(
+            read_arg_string(&mut engine, 0, true).expect("NULL wide arg"),
+            ""
+        );
+        engine
+            .mem_write(BUF, b"Hello\0World")
+            .expect("write guest bytes");
+        assert_eq!(
+            read_arg_string(&mut engine, BUF, false).expect("NUL-stopped ANSI arg"),
+            "Hello"
+        );
+    }
+
+    #[test]
+    fn write_out_string_wide_round_trips_utf16_and_counts_units() {
+        let mut engine = test_engine();
+        let copied =
+            write_out_string(&mut engine, BUF, 16, "dialog text — ✓", true).expect("wide write");
+        // 15 BMP units (the em dash and U+2713 are single units), NUL excluded.
+        assert_eq!(copied, 15, "UTF-16 unit count excluding the NUL");
+        let text = read_utf16_lossy(&mut engine, BUF, 64).expect("read back wide");
+        assert_eq!(text, "dialog text — ✓", "W-path round-trip is lossless");
+    }
+
+    #[test]
+    fn write_out_string_ansi_encodes_cp1252_and_counts() {
+        let mut engine = test_engine();
+        let copied = write_out_string(&mut engine, BUF, 16, "café", false).expect("ANSI write");
+        assert_eq!(copied, 4, "4 CP1252 chars, not 5 UTF-8 bytes");
+        assert_eq!(
+            read_guest_bytes(&mut engine, BUF, 5),
+            &[0x63, 0x61, 0x66, 0xE9, 0x00],
+            "é writes one byte (E9), NUL-terminated"
+        );
+    }
+
+    #[test]
+    fn write_out_string_ansi_unmappable_falls_back_to_question() {
+        let mut engine = test_engine();
+        let copied = write_out_string(&mut engine, BUF, 16, "€ā", false).expect("ANSI write");
+        assert_eq!(copied, 2);
+        assert_eq!(
+            read_guest_bytes(&mut engine, BUF, 3),
+            &[0x80, 0x3F, 0x00],
+            "€ → 0x80 (C1), ā → Windows' '?'"
+        );
+    }
+
+    #[test]
+    fn write_out_string_truncates_and_nul_terminates() {
+        let mut engine = test_engine();
+        // Capacity 6 → 5 content chars + NUL (ASCII stays byte-identical).
+        let copied =
+            write_out_string(&mut engine, BUF, 6, "Hello World", false).expect("ANSI write");
+        assert_eq!(copied, 5);
+        assert_eq!(read_guest_bytes(&mut engine, BUF, 6), b"Hello\0");
+
+        // Wide truncation counts UTF-16 units: cap 5 → 4 units + NUL.
+        let copied =
+            write_out_string(&mut engine, BUF, 5, "Hello World", true).expect("wide write");
+        assert_eq!(copied, 4);
+        assert_eq!(
+            read_utf16_lossy(&mut engine, BUF, 64).expect("read back"),
+            "Hell"
+        );
+    }
+
+    #[test]
+    fn write_out_string_zero_cap_and_null_ptr_write_nothing() {
+        let mut engine = test_engine();
+        assert_eq!(
+            write_out_string(&mut engine, BUF, 0, "x", false).expect("zero-cap ANSI write"),
+            0
+        );
+        assert_eq!(
+            write_out_string(&mut engine, BUF, 0, "x", true).expect("zero-cap wide write"),
+            0
+        );
+        assert_eq!(
+            write_out_string(&mut engine, 0, 16, "x", false).expect("NULL-ptr write"),
+            0
+        );
+        assert_eq!(
+            read_guest_bytes(&mut engine, BUF, 4),
+            &[0, 0, 0, 0],
+            "nothing must be written"
+        );
+    }
+
+    #[test]
+    fn read_a_then_write_a_preserves_the_cp1252_contract() {
+        // The full A-path asymmetry through the family: a mingw UTF-8 literal
+        // reads back as the original chars, then the write side re-encodes
+        // them as the cp1252 bytes Windows writes (é → one byte E9).
+        let mut engine = test_engine();
+        engine
+            .mem_write(BUF, b"caf\xC3\xA9\0")
+            .expect("write UTF-8 literal");
+        let text = read_arg_string(&mut engine, BUF, false).expect("read A");
+        assert_eq!(text, "café");
+
+        let copied = write_out_string(&mut engine, BUF + 0x100, 8, &text, false).expect("write A");
+        assert_eq!(copied, 4);
+        assert_eq!(
+            read_guest_bytes(&mut engine, BUF + 0x100, 5),
+            &[0x63, 0x61, 0x66, 0xE9, 0x00],
+            "UTF-8-first read, cp1252 write"
+        );
     }
 }

@@ -6,34 +6,48 @@ use super::class::{find_window, find_window_mut};
 use crate::state::WindowFlags;
 use crate::user32::{
     Context, FAKE_WINDOW_HANDLE, HandlerContext, Result, WinApiHandlerResult, WinApiState,
-    is_known_window, read_guest_ansi_lossy, read_guest_utf16_lossy, write_ansi_window_text,
-    write_wide_window_text,
+    is_known_window, read_arg_string, write_out_string,
 };
 
 /// Handles `USER32.dll!SetWindowTextA`.
 pub fn handle_set_window_text_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_set_window_text_impl(ctx, false, "SetWindowTextA")
+}
+/// Handles `USER32.dll!SetWindowTextW`.
+pub fn handle_set_window_text_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_set_window_text_impl(ctx, true, "SetWindowTextW")
+}
+
+/// Shared `SetWindowTextA/W` implementation (Win64 ABI: `rcx` = hwnd,
+/// `rdx` = text).
+///
+/// `SetWindowText(hwnd, NULL)` clears the text (documented Win32 semantics);
+/// RNotepad's FileNew/DoOpenFile clear the EDIT this way. A NULL pointer is
+/// not a failure — it means "empty string".
+fn handle_set_window_text_impl(
+    ctx: &mut HandlerContext<'_>,
+    wide: bool,
+    api_name: &str,
+) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
-        .context("failed to read RCX for SetWindowTextA")?;
+        .with_context(|| format!("failed to read RCX for {api_name}"))?;
 
     let text_ptr = engine
         .read_rdx()
-        .context("failed to read RDX for SetWindowTextA")?;
+        .with_context(|| format!("failed to read RDX for {api_name}"))?;
 
     let known = window_handle == FAKE_WINDOW_HANDLE || is_known_window(state, window_handle);
-    // SetWindowText(hwnd, NULL) clears the text (documented Win32 semantics);
-    // RNotepad's FileNew/DoOpenFile clear the EDIT this way. A NULL pointer is
-    // not a failure — it means "empty string".
     let success = known;
 
     if success {
         let text = if text_ptr == 0 {
             String::new()
         } else {
-            read_guest_ansi_lossy(engine, text_ptr, 32_768)
-                .context("failed to read SetWindowTextA text")?
+            read_arg_string(engine, text_ptr, wide)
+                .with_context(|| format!("failed to read {api_name} text"))?
         };
         if window_handle == FAKE_WINDOW_HANDLE {
             state.window_state().window_title = text;
@@ -96,131 +110,43 @@ pub fn handle_set_window_text_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 
     ctx.finish(return_value)
 }
-/// Handles `USER32.dll!SetWindowTextW`.
-pub fn handle_set_window_text_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for SetWindowTextW")?;
-
-    let text_ptr = engine
-        .read_rdx()
-        .context("failed to read RDX for SetWindowTextW")?;
-
-    let known = window_handle == FAKE_WINDOW_HANDLE || is_known_window(state, window_handle);
-    // SetWindowText(hwnd, NULL) clears the text (see the ANSI variant above).
-    let success = known;
-
-    if success {
-        let text = if text_ptr == 0 {
-            String::new()
-        } else {
-            read_guest_utf16_lossy(engine, text_ptr, 32_768)
-                .context("failed to read SetWindowTextW text")?
-        };
-        if window_handle == FAKE_WINDOW_HANDLE {
-            state.window_state().window_title = text;
-        } else if let Some(window) = find_window_mut(state, window_handle) {
-            if window.control_kind.is_some() {
-                // A label control's old caption must survive the replacement
-                // (see the ANSI variant above).
-                let old_text = if matches!(
-                    window.control_kind,
-                    Some(crate::user32::controls::ControlClassKind::Button)
-                        | Some(crate::user32::controls::ControlClassKind::Static)
-                ) {
-                    window.control_text.clone()
-                } else {
-                    String::new()
-                };
-                let kind = window.control_kind;
-                window.control_text = text.clone();
-                window.invalidated = true;
-                // SetWindowText clears an EDIT's undo buffer (see the ANSI
-                // variant above).
-                crate::user32::controls::edit_clear_undo_buffer(state, window_handle);
-                // An EDIT's caret+selection reset to the document start when
-                // the text is set programmatically (real Windows; see the
-                // ANSI variant above).
-                if kind == Some(crate::user32::controls::ControlClassKind::Edit) {
-                    crate::user32::controls::edit_set_selection(state, window_handle, 0, 0);
-                    crate::user32::controls::edit_reset_invalid_rows(state, window_handle);
-                }
-                if matches!(
-                    kind,
-                    Some(crate::user32::controls::ControlClassKind::Button)
-                        | Some(crate::user32::controls::ControlClassKind::Static)
-                ) {
-                    crate::user32::controls::label_invalidate_text_change(
-                        state,
-                        window_handle,
-                        &old_text,
-                        &text,
-                    );
-                }
-            } else {
-                window.title = text;
-            }
-        }
-        // The visible change: bump the owning top-level's content revision so
-        // the idle reconcile republishes the surface even if the next repaint
-        // cycle is skipped (the pull-based repaint latch).
-        crate::present::PresentState::request_paint(state, window_handle);
-    }
-
-    let return_value = u64::from(success);
-
-    ctx.finish(return_value)
-}
 /// Handles `USER32.dll!GetWindowTextA`.
 pub fn handle_get_window_text_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for GetWindowTextA")?;
-
-    let buffer_ptr = engine
-        .read_rdx()
-        .context("failed to read RDX for GetWindowTextA")?;
-
-    let max_characters = engine
-        .read_r8()
-        .context("failed to read R8 for GetWindowTextA")?;
-
-    let text = resolve_window_text(state, window_handle);
-
-    let return_value = if text.is_empty() {
-        0
-    } else {
-        write_ansi_window_text(engine, buffer_ptr, max_characters, &text)?
-    };
-
-    ctx.finish(return_value)
+    handle_get_window_text_impl(ctx, false, "GetWindowTextA")
 }
 /// Handles `USER32.dll!GetWindowTextW`.
 pub fn handle_get_window_text_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_get_window_text_impl(ctx, true, "GetWindowTextW")
+}
+
+/// Shared `GetWindowTextA/W` implementation (Win64 ABI: `rcx` = hwnd,
+/// `rdx` = buffer, `r8` = max characters). Returns the copied content count
+/// (characters for A, units for W), excluding the NUL.
+fn handle_get_window_text_impl(
+    ctx: &mut HandlerContext<'_>,
+    wide: bool,
+    api_name: &str,
+) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let window_handle = engine
         .read_rcx()
-        .context("failed to read RCX for GetWindowTextW")?;
+        .with_context(|| format!("failed to read RCX for {api_name}"))?;
 
     let buffer_ptr = engine
         .read_rdx()
-        .context("failed to read RDX for GetWindowTextW")?;
+        .with_context(|| format!("failed to read RDX for {api_name}"))?;
 
     let max_characters = engine
         .read_r8()
-        .context("failed to read R8 for GetWindowTextW")?;
+        .with_context(|| format!("failed to read R8 for {api_name}"))?;
 
     let text = resolve_window_text(state, window_handle);
 
     let return_value = if text.is_empty() {
         0
     } else {
-        write_wide_window_text(engine, buffer_ptr, max_characters, &text)?
+        write_out_string(engine, buffer_ptr, max_characters, &text, wide)?
     };
 
     ctx.finish(return_value)

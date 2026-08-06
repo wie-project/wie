@@ -5,7 +5,7 @@ use super::{CDERR_NONE, ES_AUTOHSCROLL, WS_BORDER, resolve_dialog_owner};
 use crate::guest_layout::OpenFileName;
 use crate::guest_memory::{with_typed_read, with_typed_write};
 use crate::guest_string::{
-    read_ansi_lossy, read_utf16_lossy, write_ansi_c_string, write_utf16_c_string,
+    read_ansi_lossy, read_utf16_lossy, write_ansi_c_string, write_out_string, write_utf16_c_string,
 };
 use crate::handles::Hwnd;
 use crate::state::{
@@ -1226,40 +1226,26 @@ pub(crate) fn write_selected_path(
     engine: &mut dyn wie_cpu::CpuEngine,
     request: &SelectedPathWrite<'_>,
 ) -> Result<()> {
-    let max_file_chars =
-        usize::try_from(request.max_file).context("OPENFILENAME.nMaxFile does not fit usize")?;
-
-    if request.unicode {
-        write_utf16_c_string(
-            engine,
-            request.file_buffer_ptr,
-            max_file_chars,
-            request.path,
-        )
-        .context("failed to write Unicode lpstrFile")?;
-    } else {
-        write_ansi_c_string(
-            engine,
-            request.file_buffer_ptr,
-            max_file_chars,
-            request.path,
-        )
-        .context("failed to write ANSI lpstrFile")?;
-    }
+    write_out_string(
+        engine,
+        request.file_buffer_ptr,
+        u64::from(request.max_file),
+        request.path,
+        request.unicode,
+    )
+    .context("failed to write lpstrFile")?;
 
     let (file_name, file_offset, extension_offset) = split_path_components(request.path);
 
     if request.file_title_ptr != 0 && request.max_file_title != 0 {
-        let max_title_chars = usize::try_from(request.max_file_title)
-            .context("OPENFILENAME.nMaxFileTitle does not fit usize")?;
-
-        if request.unicode {
-            write_utf16_c_string(engine, request.file_title_ptr, max_title_chars, file_name)
-                .context("failed to write Unicode lpstrFileTitle")?;
-        } else {
-            write_ansi_c_string(engine, request.file_title_ptr, max_title_chars, file_name)
-                .context("failed to write ANSI lpstrFileTitle")?;
-        }
+        write_out_string(
+            engine,
+            request.file_title_ptr,
+            u64::from(request.max_file_title),
+            file_name,
+            request.unicode,
+        )
+        .context("failed to write lpstrFileTitle")?;
     }
 
     // nFileOffset / nFileExtension write-back. OPENFILENAME is an in/out
