@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Enforce the file-size policy from docs/restructure-plan.md (ADR-002):
+# Enforce the file-size policy (ADR-002):
 #   - hard cap: 1500 lines per source file
 #   - target:   <= 1000 lines per source file
 # Exemptions:
@@ -36,7 +36,7 @@ while IFS= read -r -d '' f; do
 done < <(find "$ROOT/crates" -name '*.rs' -not -path '*/target/*' -print0)
 
 if (( fail )); then
-  echo "file-size policy violated (cap $HARD_CAP lines, see docs/restructure-plan.md ADR-002)"
+  echo "file-size policy violated (cap $HARD_CAP lines, see scripts/check-file-sizes.sh)"
   exit 1
 fi
 echo "file sizes ok (hard cap $HARD_CAP)"

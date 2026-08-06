@@ -55,25 +55,22 @@ superseded by this list:
 first message-loop iterations to a clean `ExitProcess { code: 0 }` — the entire P0.3-era
 first-failure chain is resolved. `inspect --winapi-map` still flags 25 imports as TODO; 23 are
 genuinely unimplemented (2 are map artifacts: `RegCreateKeyExW` is soft-dispatched in advapi32,
-`DialogBoxParamW` is an in-guest stub). Remaining notepad imports that would bail if called:
+`DialogBoxParamW` is an in-guest stub). Verified against the current dispatch table (2026-08),
+the remaining notepad imports that would bail if called:
 
 | Import | Status |
 | --- | --- |
-| `comdlg32!ChooseFontW`, `comdlg32!PageSetupDlgW`, `comdlg32!PrintDlgW` | **queued L6** (View→Font / Page Setup / Print) |
-| `gdi32!AbortDoc`, `EndDoc`, `EndPage`, `StartDocW`, `StartPage` | print-path stubs (L6 print scope) |
-| `gdi32!GetTextMetricsW` | only the A variant exists |
-| `gdi32!Rectangle`, `gdi32!SetMapMode` | drawing/state gaps |
 | `advapi32!IsTextUnicode` | encoding detect helper |
 | `kernel32!CreateFileMappingW` | MapViewOfFile/UnmapViewOfFile exist; the create-side is missing |
 | `shell32!SHAddToRecentDocs` | Recent-files list (called after open/save) |
-| `user32!InflateRect`, `user32!SetProcessDefaultLayout`, `user32!WinHelpW`, `user32!wsprintfW` | minor/rare paths |
+| `user32!WinHelpW`, `user32!wsprintfW` | minor/rare paths |
 | `msvcrt!_wcmdln`, `fgetwc`, `getc`, `iswctype`, `vfprintf` | legacy CRT exports not reached by notepad |
 
-None of the 23 are on the startup path. Known live-run gap (not an import): the interactive
-file dialog's in-guest modal loop does not survive the live GUI run — opening File→Open/Save As
-from a scripted `WM_COMMAND` silently terminates the guest (exit 0) before the modal loop pumps;
-the `FileDialogPolicy::Accept` path and host-dialog construction are unit-tested. Investigation
-needed before File→Open/Save As is e2e-safe for a human.
+Previously-listed gaps that have since landed: `ChooseFontW`/`PageSetupDlgW`/`PrintDlgW`
+(native font/page-setup/print panels), the print-path GDI stubs (`AbortDoc`/`EndDoc`/`EndPage`/
+`StartDocW`/`StartPage`), `GetTextMetricsW`, `Rectangle`, `SetMapMode`, `InflateRect`,
+`SetProcessDefaultLayout`, and the interactive file dialog (native rfd Open/Save bridge —
+the earlier "in-guest modal loop does not survive a live run" gap is superseded by it).
 
 ---
 

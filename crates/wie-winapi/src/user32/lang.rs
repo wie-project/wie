@@ -10,9 +10,9 @@
 //! first entry of the macOS `AppleLanguages` user default, then `LANG`.
 //!
 //! The UI language is process-wide host state, not per-session handler state,
-//! so it lives in one process-global `OnceLock` (see idiom-plan I-5: host
-//! config behind a `get_or_init` accessor) shared by every language handler —
-//! never on `WinApiState`.
+//! so it lives in one process-global `OnceLock` (host config behind a
+//! `get_or_init` accessor) shared by every language handler — never on
+//! `WinApiState`.
 
 use std::sync::OnceLock;
 

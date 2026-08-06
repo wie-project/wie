@@ -51,6 +51,42 @@ WIE_JIT_MEM_TRACE=1 WIE_RUNTIME_PROFILE=1 ./target/release/wie-cli run real_exes
 # mem_path helpers=… resolve: sticky= multi= pin= walk= …
 ```
 
+## Environment knobs (full table)
+
+The README keeps the shortlist; the complete set lives here.
+
+| Variable | Effect |
+| --- | --- |
+| `WIE_CPU=jit` \| `iced` | CPU backend (default **jit**) |
+| `WIE_MPROTECT=0` | Disable optional host `mprotect` dual-protection (SPC remains on) |
+| `WIE_JIT_MEM=sticky` \| `pin` \| `slow` | JIT mem lower (default **sticky** = 2-way multi sticky + stack pin) |
+| `WIE_JIT_MEM_TRACE=1` | Dump helper mem-path histogram on finalize |
+| `WIE_JIT_SUPER=loop` \| `0` \| `all` | Block-wide stack super path: default **loop** (self-loops only) |
+| `WIE_JIT_CHAIN=0` | Disable FuncRef chaining / chain table / edge IC |
+| `WIE_STRING_BULK=0` | Disable host-span bulk REP MOVS/STOS |
+| `WIE_STRING_INLINE=0` | Disable inline 16–64 B REP Neon path |
+| `WIE_JIT_SIMD=0` | Scalar XMM lowering (no CLIF SIMD / Neon) |
+| `WIE_TLB_NEON=0` | Scalar 4-way TLB tag scan |
+| `WIE_JIT_OPT=speed\|speed_and_size\|none` | Cranelift opt_level (default **speed**) |
+| `WIE_JIT_VERIFY=1` | Enable Cranelift IR verifier outside tests |
+| `WIE_FIXED_CLOCK=1` | Freeze the guest clock table (deterministic runs) |
+| `WIE_D3D9_SCALE=2\|4\|8` | D3D9 render resolution divisor (quarter-scale = 4; Present upscales to the window) |
+| `WIE_RUNTIME_PROFILE=1` | Wall/CPU%, host stops, JIT counters, `mem_backend` |
+| `WIE_PROCESS_HEAP_MB` | Guest process-heap size in MiB (default **512**) |
+| `WIE_API_JOURNAL=path` | Per-API journal for backend A/B diffs |
+| `WIE_ROOT` / `--root` | Bottle root for guest `C:\` file APIs (required for file-touching apps) |
+| `WIE_DRIVE_D` / `--drive-d` | Host root for guest `D:\` bridge (`auto` = host cwd) |
+| `WIE_PRINT_TO=<dir>` | EndDoc headless oracle: write rendered pages as `page-N.bmp` (no bridge needed) |
+| `WIE_GUEST_HEAP=1` | Rewire process-heap `HeapAlloc`/`HeapFree` to guest code |
+| `WIE_GUEST_IO=0` \| `all` | I/O accelerator: default seeks/size in-guest; `all` also guest Read |
+| `WIE_GUEST_MBWC=1` | Guest MultiByte↔WideChar helpers |
+| `WIE_IDLE=busy\|yield\|park` | Host idle policy: micros default **yield**; interactive default **park** |
+| `WIE_IDLE_PARK_MS` / `WIE_IDLE_MAX_PARKS` | Message-park quantum / cap |
+| `WIE_HOST_SLEEP=1` | **Legacy:** `Sleep(n>0)` park only |
+| `WIE_MT=0` | Disable guest worker spawn |
+| `WIE_MT_MAX_THREADS` | Cap on guest worker threads (default **64**) |
+| `RUST_LOG` | tracing filter (CLI defaults to `warn`) |
+
 ## Docs map
 
 | Topic | Doc |
