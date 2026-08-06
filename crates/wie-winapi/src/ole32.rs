@@ -11,7 +11,7 @@ const S_FALSE: u64 = 1;
 /// `REGDB_E_CLASSNOTREG` — class not registered (no real COM servers).
 const REGDB_E_CLASSNOTREG: u64 = 0x8004_0154;
 
-fn ret(engine: &mut dyn wie_cpu::CpuEngine, value: u64) -> Result<WinApiHandlerResult> {
+fn finish(engine: &mut dyn wie_cpu::CpuEngine, value: u64) -> Result<WinApiHandlerResult> {
     let return_address = engine
         .return_from_win64_api(value)
         .context("ole32 return")?;
@@ -40,7 +40,7 @@ pub fn dispatch_ole32(
 fn handle_co_initialize(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let _reserved = engine.read_rcx()?;
-    ret(engine, S_OK)
+    finish(engine, S_OK)
 }
 
 /// `HRESULT CoInitializeEx(LPVOID, DWORD)`
@@ -48,13 +48,13 @@ fn handle_co_initialize_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
     let engine = &mut *ctx.engine;
     let _reserved = engine.read_rcx()?;
     let _coinit = engine.read_rdx()?;
-    ret(engine, S_OK)
+    finish(engine, S_OK)
 }
 
 /// `void CoUninitialize(void)`
 fn handle_co_uninitialize(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    ret(engine, 0)
+    finish(engine, 0)
 }
 
 /// `HRESULT CoCreateInstance(rclsid, pUnkOuter, dwClsContext, riid, ppv)`
@@ -80,5 +80,5 @@ fn handle_co_create_instance(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     if ppv != 0 {
         engine.mem_write(ppv, &0_u64.to_le_bytes())?;
     }
-    ret(engine, REGDB_E_CLASSNOTREG)
+    finish(engine, REGDB_E_CLASSNOTREG)
 }

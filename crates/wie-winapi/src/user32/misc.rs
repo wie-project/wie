@@ -666,16 +666,16 @@ const REGISTERED_MESSAGE_LIMIT: u32 = 0x1_0000;
 pub fn handle_register_window_message_w(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
-    handle_register_window_message(ctx, "RegisterWindowMessageW")
+    handle_register_window_message_impl(ctx, "RegisterWindowMessageW")
 }
 /// Handles `USER32.dll!RegisterWindowMessageA`.
 pub fn handle_register_window_message_a(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
-    handle_register_window_message(ctx, "RegisterWindowMessageA")
+    handle_register_window_message_impl(ctx, "RegisterWindowMessageA")
 }
 
-fn handle_register_window_message(
+fn handle_register_window_message_impl(
     ctx: &mut HandlerContext<'_>,
     api_name: &str,
 ) -> Result<WinApiHandlerResult> {
@@ -728,11 +728,11 @@ fn handle_register_window_message(
 
 /// Handles `USER32.dll!LoadStringW`.
 pub fn handle_load_string_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_load_string(ctx, "LoadStringW")
+    handle_load_string_impl(ctx, "LoadStringW")
 }
 /// Handles `USER32.dll!LoadStringA`.
 pub fn handle_load_string_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_load_string(ctx, "LoadStringA")
+    handle_load_string_impl(ctx, "LoadStringA")
 }
 
 /// Shared `LoadStringA/W` implementation.
@@ -743,7 +743,10 @@ pub fn handle_load_string_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 /// to `cchMax - 1` chars, NUL-terminates, and returns the number of characters
 /// copied excluding the NUL — 0 when the id is not found or the module is not
 /// the main EXE (loaded-DLL string tables are not parsed yet).
-fn handle_load_string(ctx: &mut HandlerContext<'_>, api_name: &str) -> Result<WinApiHandlerResult> {
+fn handle_load_string_impl(
+    ctx: &mut HandlerContext<'_>,
+    api_name: &str,
+) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let instance_handle = engine
@@ -868,11 +871,11 @@ pub(crate) fn timer_deadline(interval_ms: u32) -> std::time::Instant {
 
 /// Handles `USER32.dll!CallWindowProcW`.
 pub fn handle_call_window_proc_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_call_window_proc(ctx, "CallWindowProcW")
+    handle_call_window_proc_impl(ctx, "CallWindowProcW")
 }
 /// Handles `USER32.dll!CallWindowProcA`.
 pub fn handle_call_window_proc_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_call_window_proc(ctx, "CallWindowProcA")
+    handle_call_window_proc_impl(ctx, "CallWindowProcA")
 }
 
 /// Shared `CallWindowProcA/W` implementation.
@@ -894,7 +897,7 @@ pub fn handle_call_window_proc_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 ///   subclassing, where the displaced proc is another guest callback).
 /// - `prevWndFunc == 0` on a window whose original is a non-zero value:
 ///   conservative 0 — real Windows would fault calling a NULL proc.
-fn handle_call_window_proc(
+fn handle_call_window_proc_impl(
     ctx: &mut HandlerContext<'_>,
     api_name: &str,
 ) -> Result<WinApiHandlerResult> {

@@ -73,12 +73,12 @@ pub fn handle_comm_dlg_extended_error(ctx: &mut HandlerContext<'_>) -> Result<Wi
 }
 /// Handles `comdlg32.dll!GetFileTitleA`.
 pub fn handle_get_file_title_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_get_file_title(ctx, false, "GetFileTitleA")
+    handle_get_file_title_impl(ctx, false, "GetFileTitleA")
 }
 
 /// Handles `comdlg32.dll!GetFileTitleW`.
 pub fn handle_get_file_title_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_get_file_title(ctx, true, "GetFileTitleW")
+    handle_get_file_title_impl(ctx, true, "GetFileTitleW")
 }
 
 /// GetFileTitle's documented return for an invalid file name / title buffer.
@@ -94,7 +94,7 @@ const GET_FILE_TITLE_MAX_PATH: usize = 0x8000;
 /// Return contract (MSDN): 0 = success, 1 = invalid file name, negative =
 /// buffer too small (the absolute value is the required size in characters
 /// including the terminating NUL).
-fn handle_get_file_title(
+fn handle_get_file_title_impl(
     ctx: &mut HandlerContext<'_>,
     unicode: bool,
     api_name: &str,

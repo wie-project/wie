@@ -31,15 +31,15 @@ enum DialogKeyAction {
 
 /// Handles `USER32.dll!IsDialogMessageA`.
 pub fn handle_is_dialog_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_is_dialog_message(ctx, "IsDialogMessageA")
+    handle_is_dialog_message_impl(ctx, "IsDialogMessageA")
 }
 /// Handles `USER32.dll!IsDialogMessageW`.
 pub fn handle_is_dialog_message_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_is_dialog_message(ctx, "IsDialogMessageW")
+    handle_is_dialog_message_impl(ctx, "IsDialogMessageW")
 }
 
 /// Shared `IsDialogMessageA/W` implementation.
-fn handle_is_dialog_message(
+fn handle_is_dialog_message_impl(
     ctx: &mut HandlerContext<'_>,
     api_name: &str,
 ) -> Result<WinApiHandlerResult> {

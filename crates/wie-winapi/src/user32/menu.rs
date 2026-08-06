@@ -213,11 +213,11 @@ pub struct ResourceMenuRecord {
 
 /// Handles `USER32.dll!LoadMenuW`.
 pub fn handle_load_menu_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_load_menu(ctx, "LoadMenuW")
+    handle_load_menu_impl(ctx, "LoadMenuW")
 }
 /// Handles `USER32.dll!LoadMenuA`.
 pub fn handle_load_menu_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_load_menu(ctx, "LoadMenuA")
+    handle_load_menu_impl(ctx, "LoadMenuA")
 }
 
 /// Shared `LoadMenuA/W` implementation.
@@ -227,7 +227,10 @@ pub fn handle_load_menu_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 /// mapping and returns `NULL`, mirroring how `LoadStringA/W` and
 /// `LoadAcceleratorsA/W` resolve ids only. The resource is only parsed for
 /// the main EXE module, so any other `hinst` also resolves to `NULL`.
-fn handle_load_menu(ctx: &mut HandlerContext<'_>, api_name: &str) -> Result<WinApiHandlerResult> {
+fn handle_load_menu_impl(
+    ctx: &mut HandlerContext<'_>,
+    api_name: &str,
+) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let instance_handle = engine
@@ -402,13 +405,13 @@ pub(crate) fn resolve_class_menu(
 }
 /// Handles `USER32.dll!AppendMenuA`.
 pub fn handle_append_menu_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_append_menu(ctx, "AppendMenuA", false)
+    handle_append_menu_impl(ctx, "AppendMenuA", false)
 }
 /// Handles `USER32.dll!AppendMenuW`.
 pub fn handle_append_menu_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_append_menu(ctx, "AppendMenuW", true)
+    handle_append_menu_impl(ctx, "AppendMenuW", true)
 }
-fn handle_append_menu(
+fn handle_append_menu_impl(
     ctx: &mut HandlerContext<'_>,
     api_name: &str,
     unicode: bool,
@@ -560,13 +563,13 @@ pub fn handle_track_popup_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
 }
 /// Handles `USER32.dll!GetMenuItemInfoA`.
 pub fn handle_get_menu_item_info_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_get_menu_item_info(ctx, "GetMenuItemInfoA", false)
+    handle_get_menu_item_info_impl(ctx, "GetMenuItemInfoA", false)
 }
 /// Handles `USER32.dll!GetMenuItemInfoW`.
 pub fn handle_get_menu_item_info_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_get_menu_item_info(ctx, "GetMenuItemInfoW", true)
+    handle_get_menu_item_info_impl(ctx, "GetMenuItemInfoW", true)
 }
-fn handle_get_menu_item_info(
+fn handle_get_menu_item_info_impl(
     ctx: &mut HandlerContext<'_>,
     api_name: &str,
     unicode: bool,

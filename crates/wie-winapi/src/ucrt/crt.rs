@@ -6,49 +6,49 @@ use anyhow::{Context, Result};
 
 use super::{
     ACMDLN_PTR_SLOT, ARGC_SLOT, ARGV_PTR_SLOT, COMMODE_SLOT, CRT_GUEST_BASE, ENVIRON_PTR_SLOT,
-    FMODE_SLOT, NARROW_ARGV_TABLE, WARGV_PTR_SLOT, WENVIRON_PTR_SLOT, read_guest_str, ret,
+    FMODE_SLOT, NARROW_ARGV_TABLE, WARGV_PTR_SLOT, WENVIRON_PTR_SLOT, finish, read_guest_str,
 };
 pub(crate) fn handle_set_new_mode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let _mode = engine.read_rcx()?;
-    ret(engine, 0)
+    finish(engine, 0)
 }
 
 pub(crate) fn handle_p_environ(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     // char*** — point at a slot holding NULL (empty environment block list).
     engine.mem_write(ENVIRON_PTR_SLOT, &0_u64.to_le_bytes())?;
-    ret(engine, ENVIRON_PTR_SLOT)
+    finish(engine, ENVIRON_PTR_SLOT)
 }
 
 pub(crate) fn handle_p_acmdln(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     // Slot is filled at session start (points at GetCommandLineA buffer).
-    ret(engine, ACMDLN_PTR_SLOT)
+    finish(engine, ACMDLN_PTR_SLOT)
 }
 
 pub(crate) fn handle_p_argc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     // Slot is filled at session start from guest argv.
-    ret(engine, ARGC_SLOT)
+    finish(engine, ARGC_SLOT)
 }
 
 pub(crate) fn handle_p_argv(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     // Slot holds char** filled at session start.
-    ret(engine, ARGV_PTR_SLOT)
+    finish(engine, ARGV_PTR_SLOT)
 }
 
 pub(crate) fn handle_p_commode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     engine.mem_write(COMMODE_SLOT, &0_u32.to_le_bytes())?;
-    ret(engine, COMMODE_SLOT)
+    finish(engine, COMMODE_SLOT)
 }
 
 pub(crate) fn handle_p_fmode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     engine.mem_write(FMODE_SLOT, &0_u32.to_le_bytes())?;
-    ret(engine, FMODE_SLOT)
+    finish(engine, FMODE_SLOT)
 }
 /// Legacy msvcrt `__getmainargs(argc*, argv**, env**, doWildcard, startupinfo*)`.
 ///
@@ -58,7 +58,7 @@ pub(crate) fn handle_getenv(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     // `getenv(const char* name)` → returns NULL (variable not found).
     // The C++ runtime checks for debug/env flags during startup; returning
     // NULL is safe — no deployment expects these to be set.
-    ret(engine, 0)
+    finish(engine, 0)
 }
 
 pub(crate) fn handle_getmainargs(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -94,7 +94,7 @@ pub(crate) fn handle_getmainargs(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
             .mem_write(env_ptr, &ENVIRON_PTR_SLOT.to_le_bytes())
             .context("__getmainargs write *env")?;
     }
-    ret(engine, 0)
+    finish(engine, 0)
 }
 /// `_initterm(first, last)` — call void (*)() for each non-null entry in [first, last).
 ///
@@ -104,7 +104,7 @@ pub(crate) fn handle_initterm(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     let engine = &mut *ctx.engine;
     let _first = engine.read_rcx()?;
     let _last = engine.read_rdx()?;
-    ret(engine, 0)
+    finish(engine, 0)
 }
 
 /// `_initterm_e` — same as `_initterm` but entries return `int`; non-zero aborts.
@@ -113,7 +113,7 @@ pub(crate) fn handle_initterm_e(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let engine = &mut *ctx.engine;
     let _first = engine.read_rcx()?;
     let _last = engine.read_rdx()?;
-    ret(engine, 0)
+    finish(engine, 0)
 }
 
 pub(crate) fn handle_configure_narrow_argv(
@@ -121,13 +121,13 @@ pub(crate) fn handle_configure_narrow_argv(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let _mode = engine.read_rcx()?;
-    ret(engine, 0)
+    finish(engine, 0)
 }
 pub(crate) fn handle_initialize_narrow_environment(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    ret(engine, 0)
+    finish(engine, 0)
 }
 
 /// UCRT `_initialize_wide_environment` — sets up the wide environment.
@@ -138,7 +138,7 @@ pub(crate) fn handle_initialize_wide_environment(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    ret(engine, 0)
+    finish(engine, 0)
 }
 
 /// UCRT `_configure_wide_argv(mode)` — selects argv parsing mode.
@@ -150,7 +150,7 @@ pub(crate) fn handle_configure_wide_argv(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let _mode = engine.read_rcx()?;
-    ret(engine, 0)
+    finish(engine, 0)
 }
 
 /// UCRT `_fpreset` — restore the FPU control word to its default.
@@ -158,7 +158,7 @@ pub(crate) fn handle_configure_wide_argv(
 /// The guest x87 state is not exposed to hosts, so there is nothing to reset.
 pub(crate) fn handle_fpreset(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    ret(engine, 0)
+    finish(engine, 0)
 }
 
 pub(crate) fn handle_p_wenviron(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -173,7 +173,7 @@ pub(crate) fn handle_p_wenviron(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     if u64::from_le_bytes(slot) == 0 {
         materialize_wide_env(engine, state)?;
     }
-    ret(engine, WENVIRON_PTR_SLOT)
+    finish(engine, WENVIRON_PTR_SLOT)
 }
 
 /// Build the guest `wchar_t**` table behind `__p__wenviron` from the host
@@ -253,7 +253,7 @@ pub(crate) fn handle_p_wargv(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     if u64::from_le_bytes(slot) == 0 {
         materialize_wide_argv(engine, state)?;
     }
-    ret(engine, WARGV_PTR_SLOT)
+    finish(engine, WARGV_PTR_SLOT)
 }
 
 /// Build the guest `wchar_t**` table behind `__p___wargv` from the narrow argv
@@ -334,33 +334,33 @@ fn materialize_wide_argv(
 pub(crate) fn handle_crt_atexit(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let _fn = engine.read_rcx()?;
-    ret(engine, 0)
+    finish(engine, 0)
 }
 
 pub(crate) fn handle_set_app_type(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let _t = engine.read_rcx()?;
-    ret(engine, 0)
+    finish(engine, 0)
 }
 pub(crate) fn handle_cexit(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    ret(engine, 0)
+    finish(engine, 0)
 }
 pub(crate) fn handle_exit_like(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     // Should be intercepted via exit_process trait; if not, still return.
     let code = engine.read_rcx()?;
-    ret(engine, code)
+    finish(engine, code)
 }
 
 pub(crate) fn handle_abort(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    ret(engine, 3)
+    finish(engine, 3)
 }
 /// `_onexit` / `__dllonexit` — accept callback, return it (success).
 pub(crate) fn handle_onexit(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let func = engine.read_rcx()?;
     // Return the function pointer to indicate registration success (MSVC CRT contract).
-    ret(engine, func)
+    finish(engine, func)
 }

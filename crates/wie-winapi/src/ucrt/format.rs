@@ -29,7 +29,7 @@ use crate::guest_memory::read_u64;
 use crate::{HandlerContext, WinApiHandlerResult};
 use anyhow::Result;
 
-use super::{i32_status_to_u64, ret};
+use super::{finish, i32_status_to_u64};
 
 /// Absolute ceiling for one formatted result. Real callers pass buffer sizes
 /// in the low KBs (notepad's status bar); this only guards hostile formats.
@@ -386,7 +386,7 @@ pub(crate) fn handle_vsnwprintf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let fmt_ptr = engine.read_r8()?;
     let va_list = engine.read_r9()?;
     if buf == 0 || fmt_ptr == 0 || count_raw == 0 {
-        return ret(engine, i32_status_to_u64(-1));
+        return finish(engine, i32_status_to_u64(-1));
     }
     let count = usize::try_from(count_raw)
         .unwrap_or(0)
@@ -407,12 +407,12 @@ pub(crate) fn handle_vsnwprintf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         let mut write = out[..keep].to_vec();
         write.push(0);
         crate::guest_string::write_utf16_units(engine, buf, &write)?;
-        return ret(engine, i32_status_to_u64(-1));
+        return finish(engine, i32_status_to_u64(-1));
     }
     out.push(0);
     crate::guest_string::write_utf16_units(engine, buf, &out)?;
     let written = u64::try_from(out.len().saturating_sub(1)).unwrap_or(0);
-    ret(engine, written)
+    finish(engine, written)
 }
 
 /// `_vsnprintf(char* buf, size_t count, const char* fmt, va_list)`.
@@ -423,7 +423,7 @@ pub(crate) fn handle_vsnprintf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     let fmt_ptr = engine.read_r8()?;
     let va_list = engine.read_r9()?;
     if buf == 0 || fmt_ptr == 0 || count_raw == 0 {
-        return ret(engine, i32_status_to_u64(-1));
+        return finish(engine, i32_status_to_u64(-1));
     }
     let count = usize::try_from(count_raw)
         .unwrap_or(0)
@@ -440,10 +440,10 @@ pub(crate) fn handle_vsnprintf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         let mut write = out[..keep].to_vec();
         write.push(0);
         crate::guest_memory::write_bytes(engine, buf, &write)?;
-        return ret(engine, i32_status_to_u64(-1));
+        return finish(engine, i32_status_to_u64(-1));
     }
     out.push(0);
     crate::guest_memory::write_bytes(engine, buf, &out)?;
     let written = u64::try_from(out.len().saturating_sub(1)).unwrap_or(0);
-    ret(engine, written)
+    finish(engine, written)
 }

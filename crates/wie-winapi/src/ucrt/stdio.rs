@@ -5,7 +5,7 @@ use crate::guest_memory::read_u64;
 use crate::{GuestStdinMode, HandlerContext, WinApiHandlerResult};
 use anyhow::{Context, Result};
 
-use super::{FILE_STDERR, FILE_STDIN, FILE_STDOUT, read_guest_str, ret};
+use super::{FILE_STDERR, FILE_STDIN, FILE_STDOUT, finish, read_guest_str};
 /// `__acrt_iob_func(ix)` → `FILE*` for stdin/stdout/stderr.
 pub(crate) fn handle_acrt_iob_func(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -16,7 +16,7 @@ pub(crate) fn handle_acrt_iob_func(ctx: &mut HandlerContext<'_>) -> Result<WinAp
         2 => FILE_STDERR,
         _ => 0,
     };
-    ret(engine, ptr)
+    finish(engine, ptr)
 }
 /// Cap output at 64 KiB per call (matches JIT fast path guard).
 const MAX_FWRITE_OUTPUT: usize = 64 * 1024;
@@ -29,18 +29,18 @@ pub(crate) fn handle_fwrite(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     let stream = engine.read_r9()?;
 
     if size == 0 || count == 0 {
-        return ret(engine, 0);
+        return finish(engine, 0);
     }
     let total = size.saturating_mul(count);
     let total_usize = usize::try_from(total).unwrap_or(0);
     if total_usize == 0 {
-        return ret(engine, 0);
+        return finish(engine, 0);
     }
     // Probe-read first byte to validate buffer is readable.
     if buf != 0 {
         let mut probe = [0_u8; 1];
         if engine.mem_read(buf, &mut probe).is_err() {
-            return ret(engine, count); // skip silently
+            return finish(engine, count); // skip silently
         }
     }
     let capped = total_usize.min(MAX_FWRITE_OUTPUT);
@@ -62,7 +62,7 @@ pub(crate) fn handle_fwrite(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         write_host_console(stream, bytes);
     }
 
-    ret(engine, count)
+    finish(engine, count)
 }
 
 pub(crate) fn handle_fflush(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -72,7 +72,7 @@ pub(crate) fn handle_fflush(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     // The previous design deferred to Sleep for atomic frame flushing,
     // but fflush is the standard C mechanism for this purpose.
     ctx.state.flush_console();
-    ret(engine, 0)
+    finish(engine, 0)
 }
 
 /// Host console write without `std::io::{stdout,stderr}` lock (hot CRT path).
@@ -133,7 +133,7 @@ pub(crate) fn handle_setvbuf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     let _buf = engine.read_rdx()?;
     let _mode = engine.read_r8()?;
     let _size = engine.read_r9()?;
-    ret(engine, 0)
+    finish(engine, 0)
 }
 /// `__stdio_common_vfprintf(options, FILE*, format, locale, va_list)`.
 /// Formats the string and writes it to the host console.
@@ -147,7 +147,7 @@ pub(crate) fn handle_stdio_common_vfprintf(
         let fmt_ptr = engine.read_r8()?;
         let _locale = engine.read_r9()?;
         if fmt_ptr == 0 {
-            return ret(engine, 0);
+            return finish(engine, 0);
         }
         let fmt = read_guest_str(engine, fmt_ptr, 4096)?;
         let rsp = engine.read_rsp()?;
@@ -224,7 +224,7 @@ pub(crate) fn handle_stdio_common_vfprintf(
     } else {
         crate::kernel32::console::emit_text_from_bytes(ctx, &out);
     }
-    ret(&mut *ctx.engine, out.len() as u64)
+    finish(&mut *ctx.engine, out.len() as u64)
 }
 
 /// `__stdio_common_vsprintf(options, buf, count, format, locale, va_list)`.
@@ -249,7 +249,7 @@ pub(crate) fn handle_stdio_common_vsprintf(
     let buf = engine.read_rdx()?;
     let fmt_ptr = engine.read_r9()?;
     if buf == 0 || fmt_ptr == 0 {
-        return ret(engine, 0);
+        return finish(engine, 0);
     }
     let fmt = read_guest_str(engine, fmt_ptr, 4096)?;
     let rsp = engine.read_rsp()?;
@@ -332,7 +332,7 @@ pub(crate) fn handle_stdio_common_vsprintf(
     }
     out.push(0);
     drop(engine.mem_write(buf, &out));
-    ret(engine, (out.len().saturating_sub(1)) as u64)
+    finish(engine, (out.len().saturating_sub(1)) as u64)
 }
 
 /// `__stdio_common_vsscanf(options, buf, count, format, locale, va_list)`.
@@ -343,7 +343,7 @@ pub(crate) fn handle_stdio_common_vsscanf(
     let src_ptr = engine.read_rdx()?;
     let fmt_ptr = engine.read_r9()?;
     if src_ptr == 0 || fmt_ptr == 0 {
-        return ret(engine, 0);
+        return finish(engine, 0);
     }
     let src = read_guest_str(engine, src_ptr, 4096)?;
     let fmt = read_guest_str(engine, fmt_ptr, 4096)?;
@@ -417,7 +417,7 @@ pub(crate) fn handle_stdio_common_vsscanf(
         }
         fi += 1;
     }
-    ret(engine, items)
+    finish(engine, items)
 }
 /// `__stdio_common_vfscanf(options, FILE*, format, locale, va_list)`.
 /// Used by `scanf`, `fscanf`, etc. — reads from stdin via the file-io buffer.
@@ -432,7 +432,7 @@ pub(crate) fn handle_stdio_common_vfscanf(
     let engine = &mut *ctx.engine;
     let fmt_ptr = engine.read_r8()?;
     if fmt_ptr == 0 {
-        return ret(engine, 0);
+        return finish(engine, 0);
     }
     let fmt = read_guest_str(engine, fmt_ptr, 4096)?;
     let rsp = engine.read_rsp()?;
@@ -574,7 +574,7 @@ pub(crate) fn handle_stdio_common_vfscanf(
             .saturating_add(pos)
             .min(state.file_io.stdin_bytes.len());
     }
-    ret(engine, items.try_into().unwrap_or(0))
+    finish(engine, items.try_into().unwrap_or(0))
 }
 /// `fputc(c, stream)`.
 pub(crate) fn handle_fputc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -584,16 +584,16 @@ pub(crate) fn handle_fputc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
     if stream == FILE_STDERR {
         write_host_console(FILE_STDERR, &[ch]);
         let engine = &mut *ctx.engine;
-        return ret(engine, u64::from(ch));
+        return finish(engine, u64::from(ch));
     }
     if stream == FILE_STDIN {
         let engine = &mut *ctx.engine;
-        return ret(engine, u64::from(u32::MAX)); // EOF
+        return finish(engine, u64::from(u32::MAX)); // EOF
     }
     // stdout or unknown FILE* — route through console buffer.
     crate::kernel32::console::emit_text_from_bytes(ctx, &[ch]);
     let engine = &mut *ctx.engine;
-    ret(engine, u64::from(ch))
+    finish(engine, u64::from(ch))
 }
 /// `putchar(c)` — write character to stdout, return the character or EOF on error.
 pub(crate) fn handle_putchar(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -601,7 +601,7 @@ pub(crate) fn handle_putchar(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     let ch = u8::try_from(c).unwrap_or(0);
     crate::kernel32::console::emit_text_from_bytes(ctx, &[ch]);
     let engine = &mut *ctx.engine;
-    ret(engine, u64::from(ch))
+    finish(engine, u64::from(ch))
 }
 /// `getchar()` — read one character from stdin, return it or EOF.
 pub(crate) fn handle_getchar(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -614,7 +614,7 @@ pub(crate) fn handle_getchar(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         let ch = state.file_io.stdin_bytes[idx];
         if ch == b'\n' {
             state.file_io.stdin_cursor = idx.wrapping_add(1);
-            return ret(engine, u64::from(b'\n'));
+            return finish(engine, u64::from(b'\n'));
         }
         // Not '\n' — skip ahead if there's a newline later in the buffer.
         if let Some(nl_pos) = state.file_io.stdin_bytes[idx..]
@@ -622,13 +622,13 @@ pub(crate) fn handle_getchar(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
             .position(|&b| b == b'\n')
         {
             state.file_io.stdin_cursor = idx.wrapping_add(nl_pos).wrapping_add(1);
-            return ret(engine, u64::from(b'\n'));
+            return finish(engine, u64::from(b'\n'));
         }
         state.file_io.stdin_cursor = idx.wrapping_add(1);
-        return ret(engine, u64::from(ch));
+        return finish(engine, u64::from(ch));
     }
     if state.file_io.stdin_mode != GuestStdinMode::LiveHost {
-        return ret(engine, u64::from(u32::MAX)); // EOF (InjectOnly)
+        return finish(engine, u64::from(u32::MAX)); // EOF (InjectOnly)
     }
     // LiveHost mode with a TTY: read raw bytes from stdin.
     // We buffer up to 64 bytes so arrow-key escape sequences
@@ -653,7 +653,7 @@ pub(crate) fn handle_getchar(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         if idx < state.file_io.stdin_bytes.len() {
             let ch = state.file_io.stdin_bytes[idx];
             state.file_io.stdin_cursor = idx.wrapping_add(1);
-            return ret(engine, u64::from(ch));
+            return finish(engine, u64::from(ch));
         }
     } else {
         // Piped input: read a line (like fgets) so shared state works.
@@ -676,17 +676,17 @@ pub(crate) fn handle_getchar(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
             let idx = 0_usize;
             let ch = state.file_io.stdin_bytes[idx];
             state.file_io.stdin_cursor = idx.wrapping_add(1);
-            return ret(engine, u64::from(ch));
+            return finish(engine, u64::from(ch));
         }
     }
-    ret(engine, u64::from(u32::MAX)) // EOF
+    finish(engine, u64::from(u32::MAX)) // EOF
 }
 /// `fputs(s, stream)`.
 pub(crate) fn handle_fputs(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let s = ctx.engine.read_rcx()?;
     let stream = ctx.engine.read_rdx()?;
     if s == 0 {
-        return ret(&mut *ctx.engine, u64::from(u32::MAX)); // EOF
+        return finish(&mut *ctx.engine, u64::from(u32::MAX)); // EOF
     }
     let mut bytes = Vec::new();
     let mut off = 0_u64;
@@ -708,13 +708,13 @@ pub(crate) fn handle_fputs(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
         // Buffer through the console module — flushes atomically on Sleep.
         crate::kernel32::console::emit_text_from_bytes(ctx, &bytes);
     }
-    ret(&mut *ctx.engine, 0)
+    finish(&mut *ctx.engine, 0)
 }
 /// `puts(s)` — write NUL-terminated string + newline to stdout.
 pub(crate) fn handle_puts(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let s = ctx.engine.read_rcx()?;
     if s == 0 {
-        return ret(&mut *ctx.engine, u64::from(u32::MAX)); // EOF
+        return finish(&mut *ctx.engine, u64::from(u32::MAX)); // EOF
     }
     let mut bytes = Vec::new();
     let mut off = 0_u64;
@@ -733,7 +733,7 @@ pub(crate) fn handle_puts(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     bytes.push(b'\n');
     crate::kernel32::console::emit_text_from_bytes(ctx, &bytes);
     let engine = &mut *ctx.engine;
-    ret(engine, 0) // non-negative = success
+    finish(engine, 0) // non-negative = success
 }
 /// `fopen(path, mode)` — open a file for stdio access.
 pub(crate) fn handle_fopen(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -742,14 +742,14 @@ pub(crate) fn handle_fopen(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
     let m = engine.read_rdx()?;
     drop(read_guest_str(engine, p, 1024).ok());
     drop(read_guest_str(engine, m, 16).ok());
-    ret(engine, 0) // NULL = not implemented yet (needs VFS-to-CRT bridge)
+    finish(engine, 0) // NULL = not implemented yet (needs VFS-to-CRT bridge)
 }
 
 /// `fclose(stream)` — close a stdio file handle.
 pub(crate) fn handle_fclose(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     engine.read_rcx()?;
-    ret(engine, u64::from(u32::MAX)) // EOF = not implemented
+    finish(engine, u64::from(u32::MAX)) // EOF = not implemented
 }
 /// `fgets(buf, max, stream)` — read one line from stdin.
 pub(crate) fn handle_fgets(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -760,7 +760,7 @@ pub(crate) fn handle_fgets(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
     let max = engine.read_rdx()?;
     let _stream = engine.read_r8()?;
     if buf == 0 || max == 0 {
-        return ret(engine, 0); // NULL
+        return finish(engine, 0); // NULL
     }
     let cap = usize::try_from(max).unwrap_or(0);
     // Refill from host stdin if buffer is empty and LiveHost mode.
@@ -802,7 +802,7 @@ pub(crate) fn handle_fgets(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
         }
     }
     if written == 0 {
-        return ret(engine, 0); // NULL -> EOF / error
+        return finish(engine, 0); // NULL -> EOF / error
     }
     // NUL-terminate.
     let nul_byte = [0_u8];
@@ -810,11 +810,11 @@ pub(crate) fn handle_fgets(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
         buf.wrapping_add(u64::try_from(written).unwrap_or(0)),
         &nul_byte,
     )?;
-    ret(engine, buf) // returns buf on success
+    finish(engine, buf) // returns buf on success
 }
 /// `fgetc(stream)` — EOF for empty stdin inject.
 pub(crate) fn handle_fgetc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let _stream = engine.read_rcx()?;
-    ret(engine, u64::from(u32::MAX)) // EOF
+    finish(engine, u64::from(u32::MAX)) // EOF
 }

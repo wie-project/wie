@@ -65,11 +65,11 @@ pub(crate) fn allocate_accel_handle(state: &mut WinApiState) -> Result<u64> {
 
 /// Handles `USER32.dll!LoadAcceleratorsW`.
 pub fn handle_load_accelerators_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_load_accelerators(ctx, "LoadAcceleratorsW")
+    handle_load_accelerators_impl(ctx, "LoadAcceleratorsW")
 }
 /// Handles `USER32.dll!LoadAcceleratorsA`.
 pub fn handle_load_accelerators_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_load_accelerators(ctx, "LoadAcceleratorsA")
+    handle_load_accelerators_impl(ctx, "LoadAcceleratorsA")
 }
 
 /// Shared `LoadAcceleratorsA/W` implementation.
@@ -77,7 +77,7 @@ pub fn handle_load_accelerators_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 /// Win64 ABI: `rcx` = hinst, `rdx` = `lpTableName`. Only `MAKEINTRESOURCE`
 /// ids are resolvable — a string-named table has no parsed counterpart and
 /// returns `NULL`, mirroring how `LoadStringA/W` resolves ids only.
-fn handle_load_accelerators(
+fn handle_load_accelerators_impl(
     ctx: &mut HandlerContext<'_>,
     api_name: &str,
 ) -> Result<WinApiHandlerResult> {
@@ -177,11 +177,11 @@ pub fn handle_destroy_accelerator_table(
 
 /// Handles `USER32.dll!TranslateAcceleratorW`.
 pub fn handle_translate_accelerator_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_translate_accelerator(ctx, "TranslateAcceleratorW")
+    handle_translate_accelerator_impl(ctx, "TranslateAcceleratorW")
 }
 /// Handles `USER32.dll!TranslateAcceleratorA`.
 pub fn handle_translate_accelerator_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_translate_accelerator(ctx, "TranslateAcceleratorA")
+    handle_translate_accelerator_impl(ctx, "TranslateAcceleratorA")
 }
 
 /// Shared `TranslateAcceleratorA/W` implementation.
@@ -190,7 +190,7 @@ pub fn handle_translate_accelerator_a(ctx: &mut HandlerContext<'_>) -> Result<Wi
 /// `WM_COMMAND` (wParam = the entry's command id, lParam = 0) is posted to
 /// `hwnd` and `TRUE` is returned; otherwise `FALSE` and the message queue is
 /// untouched.
-fn handle_translate_accelerator(
+fn handle_translate_accelerator_impl(
     ctx: &mut HandlerContext<'_>,
     api_name: &str,
 ) -> Result<WinApiHandlerResult> {

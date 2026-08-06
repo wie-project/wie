@@ -11,7 +11,7 @@
 //!
 //! Split into `stdio`, `crt`, `string`, `format`, and `misc` submodules. This
 //! file keeps the dense dispatch table and the shared helpers (guest-VA
-//! constants, `ret`, the string reader, status bitcasts) plus the small
+//! constants, `finish`, the string reader, status bitcasts) plus the small
 //! heap-handler group.
 
 use crate::{HandlerContext, WinApiHandlerResult};
@@ -263,7 +263,7 @@ pub fn dispatch_ucrt(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiH
         _ => anyhow::bail!("unsupported UCRT export: {name}"),
     }
 }
-fn ret(engine: &mut dyn wie_cpu::CpuEngine, value: u64) -> Result<WinApiHandlerResult> {
+fn finish(engine: &mut dyn wie_cpu::CpuEngine, value: u64) -> Result<WinApiHandlerResult> {
     let return_address = engine.return_from_win64_api(value)?;
     Ok(WinApiHandlerResult {
         return_address,
@@ -285,7 +285,7 @@ fn handle_malloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     } else {
         state.heap_state.heap.alloc_coherent(engine, size)
     };
-    ret(engine, ptr)
+    finish(engine, ptr)
 }
 
 fn handle_calloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -305,7 +305,7 @@ fn handle_calloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
         }
         p
     };
-    ret(engine, ptr)
+    finish(engine, ptr)
 }
 
 fn handle_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -315,7 +315,7 @@ fn handle_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     if ptr != 0 {
         let _ = state.heap_state.heap.free_coherent(engine, ptr);
     }
-    ret(engine, 0)
+    finish(engine, 0)
 }
 /// CRT `realloc(ptr, size)`.
 fn handle_realloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -329,14 +329,14 @@ fn handle_realloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
         } else {
             state.heap_state.heap.alloc_coherent(engine, new_size)
         };
-        return ret(engine, p);
+        return finish(engine, p);
     }
     if new_size == 0 {
         let _ = state.heap_state.heap.free_coherent(engine, ptr);
-        return ret(engine, 0);
+        return finish(engine, 0);
     }
     if let Some(same) = state.heap_state.heap.try_realloc_in_place(ptr, new_size) {
-        return ret(engine, same);
+        return finish(engine, same);
     }
     let old_size = state
         .heap_state
@@ -352,7 +352,7 @@ fn handle_realloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
         .unwrap_or(0);
     let new_addr = state.heap_state.heap.alloc_coherent(engine, new_size);
     if new_addr == 0 {
-        return ret(engine, 0);
+        return finish(engine, 0);
     }
     let copy_len = usize::try_from(old_size.min(new_size)).unwrap_or(0);
     if copy_len > 0 {
@@ -361,7 +361,7 @@ fn handle_realloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
         engine.mem_write(new_addr, &bytes)?;
     }
     let _ = state.heap_state.heap.free_coherent(engine, ptr);
-    ret(engine, new_addr)
+    finish(engine, new_addr)
 }
 /// Read a NUL-terminated string from guest memory into a host buffer.
 fn read_guest_str(engine: &mut dyn wie_cpu::CpuEngine, ptr: u64, max: usize) -> Result<String> {

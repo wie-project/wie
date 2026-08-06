@@ -28,15 +28,15 @@ use super::template::resolve_template;
 
 /// Handles `USER32.dll!CreateDialogParamA`.
 pub fn handle_create_dialog_param_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_create_dialog_param(ctx, false, "CreateDialogParamA")
+    handle_create_dialog_param_impl(ctx, false, "CreateDialogParamA")
 }
 /// Handles `USER32.dll!CreateDialogParamW`.
 pub fn handle_create_dialog_param_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_create_dialog_param(ctx, true, "CreateDialogParamW")
+    handle_create_dialog_param_impl(ctx, true, "CreateDialogParamW")
 }
 
 /// Shared `CreateDialogParamA/W` implementation.
-fn handle_create_dialog_param(
+fn handle_create_dialog_param_impl(
     ctx: &mut HandlerContext<'_>,
     unicode: bool,
     api_name: &str,

@@ -12,14 +12,14 @@ use crate::user32::{
 
 /// Handles `USER32.dll!GetDlgItemA`.
 pub fn handle_get_dlg_item_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_get_dlg_item(ctx, "GetDlgItemA")
+    handle_get_dlg_item_impl(ctx, "GetDlgItemA")
 }
 /// Handles `USER32.dll!GetDlgItemW`.
 pub fn handle_get_dlg_item_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_get_dlg_item(ctx, "GetDlgItemW")
+    handle_get_dlg_item_impl(ctx, "GetDlgItemW")
 }
 
-fn handle_get_dlg_item(
+fn handle_get_dlg_item_impl(
     ctx: &mut HandlerContext<'_>,
     api_name: &str,
 ) -> Result<WinApiHandlerResult> {
@@ -53,14 +53,14 @@ fn get_dlg_item(state: &WinApiState, dialog_hwnd: u64, id: u16) -> u64 {
 
 /// Handles `USER32.dll!GetDlgItemTextA`.
 pub fn handle_get_dlg_item_text_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_get_dlg_item_text(ctx, false, "GetDlgItemTextA")
+    handle_get_dlg_item_text_impl(ctx, false, "GetDlgItemTextA")
 }
 /// Handles `USER32.dll!GetDlgItemTextW`.
 pub fn handle_get_dlg_item_text_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_get_dlg_item_text(ctx, true, "GetDlgItemTextW")
+    handle_get_dlg_item_text_impl(ctx, true, "GetDlgItemTextW")
 }
 
-fn handle_get_dlg_item_text(
+fn handle_get_dlg_item_text_impl(
     ctx: &mut HandlerContext<'_>,
     unicode: bool,
     api_name: &str,
@@ -111,14 +111,14 @@ fn handle_get_dlg_item_text(
 
 /// Handles `USER32.dll!SetDlgItemTextA`.
 pub fn handle_set_dlg_item_text_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_set_dlg_item_text(ctx, false, "SetDlgItemTextA")
+    handle_set_dlg_item_text_impl(ctx, false, "SetDlgItemTextA")
 }
 /// Handles `USER32.dll!SetDlgItemTextW`.
 pub fn handle_set_dlg_item_text_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_set_dlg_item_text(ctx, true, "SetDlgItemTextW")
+    handle_set_dlg_item_text_impl(ctx, true, "SetDlgItemTextW")
 }
 
-fn handle_set_dlg_item_text(
+fn handle_set_dlg_item_text_impl(
     ctx: &mut HandlerContext<'_>,
     unicode: bool,
     api_name: &str,

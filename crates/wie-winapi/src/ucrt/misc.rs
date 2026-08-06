@@ -7,7 +7,7 @@ use crate::sync_obj::KernelObject;
 use crate::{HandlerContext, WinApiControlSignal, WinApiHandlerResult};
 use anyhow::{Context, Result};
 
-use super::{read_guest_str, ret};
+use super::{finish, read_guest_str};
 /// Shared RNG state between `srand` and `rand`.
 /// Uses a host `AtomicU32` so seeding and reading are properly ordered
 /// even if the guest remains single-threaded through the emulator.
@@ -79,7 +79,7 @@ pub(crate) fn handle_localtime64(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let state = &mut *ctx.state;
     let t_ptr = engine.read_rcx()?;
     if t_ptr == 0 {
-        return ret(engine, 0);
+        return finish(engine, 0);
     }
     let mut buf = [0_u8; 8];
     engine.mem_read(t_ptr, &mut buf)?;
@@ -90,13 +90,13 @@ pub(crate) fn handle_localtime64(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     // Allocate and write from the heap.
     let va = state.heap_state.heap.alloc_coherent(engine, 36);
     if va == 0 {
-        return ret(engine, 0);
+        return finish(engine, 0);
     }
     for (i, &v) in tm.iter().enumerate() {
         let off = u64::try_from(i * 4).unwrap_or(0);
         drop(engine.mem_write(va.wrapping_add(off), &(v as u32).to_le_bytes()));
     }
-    ret(engine, va)
+    finish(engine, va)
 }
 
 /// `_time64(t)` — get current time in seconds since epoch.
@@ -110,7 +110,7 @@ pub(crate) fn handle_time64(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     if t_ptr != 0 {
         drop(engine.mem_write(t_ptr, &now.to_le_bytes()));
     }
-    ret(engine, now)
+    finish(engine, now)
 }
 
 /// `srand(seed)` — seed the CRT random number generator.
@@ -124,7 +124,7 @@ pub(crate) fn handle_srand(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
     let engine = &mut *ctx.engine;
     let seed = engine.read_rcx()?;
     CRT_RNG.store(seed as u32, std::sync::atomic::Ordering::Relaxed);
-    ret(engine, 0)
+    finish(engine, 0)
 }
 
 /// `rand()` → pseudo-random integer between 0 and RAND_MAX (0x7FFF).
@@ -134,7 +134,7 @@ pub(crate) fn handle_rand(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     let next = prev.wrapping_mul(214_013).wrapping_add(2_531_011);
     CRT_RNG.store(next, std::sync::atomic::Ordering::Relaxed);
     let val = (next >> 16) & 0x7FFF;
-    ret(engine, u64::from(val))
+    finish(engine, u64::from(val))
 }
 /// `_kbhit()` — non-blocking key-press check (peek, does NOT consume).
 pub(crate) fn handle_kbhit(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -143,7 +143,7 @@ pub(crate) fn handle_kbhit(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
     let state = &mut *ctx.state;
     crate::console::pump::ensure_input_ready(state);
     let ready = crate::console::pump::peek_key_press(state);
-    ret(engine, u64::from(ready))
+    finish(engine, u64::from(ready))
 }
 
 // Map a Windows VK code to the scan code MSVC `_getch` returns for
@@ -183,24 +183,24 @@ pub(crate) fn handle_getch(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
     // If a scan code is pending from a previous extended-key prefix, return it.
     if let Some(scan) = PENDING_SCAN.get() {
         PENDING_SCAN.set(None);
-        return ret(engine, u64::from(scan));
+        return finish(engine, u64::from(scan));
     }
 
     crate::console::pump::ensure_input_ready(state);
     let Some(key) = crate::console::pump::next_key_press(state, true) else {
-        return ret(engine, 0);
+        return finish(engine, 0);
     };
 
     if key.unit != 0 {
         // Regular key: return the character directly.
-        return ret(engine, u64::from(key.unit));
+        return finish(engine, u64::from(key.unit));
     }
 
     // Extended key (no character): return 0 now, save scan code for next call.
     if let Some(scan) = vk_to_scan(key.virtual_key_code) {
         PENDING_SCAN.set(Some(scan));
     }
-    ret(engine, 0)
+    finish(engine, 0)
 }
 /// `system(command)` — run a shell command on the host.
 ///
@@ -213,9 +213,9 @@ pub(crate) fn handle_system(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         // MSDN: passing NULL queries whether a command processor exists.
         let eng = &mut *ctx.engine;
         #[cfg(not(target_os = "windows"))]
-        return ret(eng, 1);
+        return finish(eng, 1);
         #[cfg(target_os = "windows")]
-        return ret(eng, 0);
+        return finish(eng, 0);
     }
     // Read the command string from guest memory (null-terminated).
     let mut cmd_bytes = Vec::new();
@@ -241,7 +241,7 @@ pub(crate) fn handle_system(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         // atomic write on Sleep.
         crate::kernel32::console::emit_text_from_bytes(ctx, b"\x1b[2J\x1b[H");
         let eng = &mut *ctx.engine;
-        return ret(eng, 0);
+        return finish(eng, 0);
     }
     // Other commands are passed to the host shell.
     let eng = &mut *ctx.engine;
@@ -254,12 +254,12 @@ pub(crate) fn handle_system(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
             .stderr(std::process::Stdio::inherit())
             .status();
         let code = result.ok().and_then(|s| s.code()).unwrap_or(-1);
-        ret(eng, code as u64)
+        finish(eng, code as u64)
     }
     #[cfg(target_os = "windows")]
     {
         let _ = cmd;
-        ret(eng, 0)
+        finish(eng, 0)
     }
 }
 pub(crate) fn handle_config_thread_locale(
@@ -267,13 +267,13 @@ pub(crate) fn handle_config_thread_locale(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let _ = engine.read_rcx()?;
-    ret(engine, 0)
+    finish(engine, 0)
 }
 
 pub(crate) fn handle_set_user_matherr(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let _ = engine.read_rcx()?;
-    ret(engine, 0)
+    finish(engine, 0)
 }
 
 pub(crate) fn handle_c_specific_handler(
@@ -281,7 +281,7 @@ pub(crate) fn handle_c_specific_handler(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     // Exception filter: continue search.
-    ret(engine, 1)
+    finish(engine, 1)
 }
 /// `_XcptFilter` — SEH filter; continue search (no host exception model).
 pub(crate) fn handle_xcpt_filter(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -289,27 +289,27 @@ pub(crate) fn handle_xcpt_filter(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let _xcptnum = engine.read_rcx()?;
     let _info = engine.read_rdx()?;
     // EXCEPTION_CONTINUE_SEARCH
-    ret(engine, 0)
+    finish(engine, 0)
 }
 pub(crate) fn handle_set_invalid_parameter_handler(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let _h = engine.read_rcx()?;
-    ret(engine, 0)
+    finish(engine, 0)
 }
 pub(crate) fn handle_signal(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let _sig = engine.read_rcx()?;
     let _handler = engine.read_rdx()?;
-    ret(engine, 0)
+    finish(engine, 0)
 }
 /// `_isatty(fd)` — treat 0/1/2 as console TTYs.
 pub(crate) fn handle_isatty(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let fd = engine.read_rcx()? & 0xffff_ffff;
     let is_tty = (0..=2).contains(&fd);
-    ret(engine, u64::from(is_tty))
+    finish(engine, u64::from(is_tty))
 }
 
 /// `_get_osfhandle(fd)` → fake console HANDLE for std streams.
@@ -323,7 +323,7 @@ pub(crate) fn handle_get_osfhandle(ctx: &mut HandlerContext<'_>) -> Result<WinAp
         2 => crate::kernel32::FAKE_STDERR_HANDLE,
         _ => crate::kernel32::INVALID_HANDLE_VALUE,
     };
-    ret(engine, handle)
+    finish(engine, handle)
 }
 /// `atoi(s)` — parse ASCII string to int.
 pub(crate) fn handle_atoi(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -331,7 +331,7 @@ pub(crate) fn handle_atoi(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     let ptr = engine.read_rcx()?;
     let s = read_guest_str(engine, ptr, 32)?;
     let val: i32 = s.trim().parse().unwrap_or(0);
-    ret(engine, val as u64)
+    finish(engine, val as u64)
 }
 
 /// `atol(s)` — parse ASCII string to long.
@@ -340,7 +340,7 @@ pub(crate) fn handle_atol(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     let ptr = engine.read_rcx()?;
     let s = read_guest_str(engine, ptr, 32)?;
     let val: i64 = s.trim().parse().unwrap_or(0);
-    ret(engine, val as u64)
+    finish(engine, val as u64)
 }
 /// `strerror(errnum)` — returns a string describing the error code.
 pub(crate) fn handle_strerror(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -355,9 +355,9 @@ pub(crate) fn handle_strerror(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         let addr = 0x7EFD_0080;
         drop(engine.mem_write(addr, msg));
         STRERROR_VA.store(addr, std::sync::atomic::Ordering::Relaxed);
-        ret(engine, addr)
+        finish(engine, addr)
     } else {
-        ret(engine, va)
+        finish(engine, va)
     }
 }
 /// `setlocale(category, locale)` — set/get program locale.
@@ -373,16 +373,16 @@ pub(crate) fn handle_setlocale(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
             let addr = 0x7EFD_0090;
             drop(engine.mem_write(addr, b"C\0"));
             LOCALE_VA.store(addr, std::sync::atomic::Ordering::Relaxed);
-            ret(engine, addr)
+            finish(engine, addr)
         } else {
-            ret(engine, va)
+            finish(engine, va)
         }
     } else {
         // Set: ignore, return the old locale.
         // For now, return "C" as the old locale.
         let old = 0x7EFD_0090;
         drop(engine.mem_write(old, b"C\0"));
-        ret(engine, old)
+        finish(engine, old)
     }
 }
 /// `_errno()` — returns a pointer to the thread-local errno variable.
@@ -397,9 +397,9 @@ pub(crate) fn handle_errno(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
         let addr = 0x7EFD_0070; // TEB page + offset after LastErrorValue
         engine.mem_write(addr, &[0u8; 4]).ok();
         ERRNO_VA.store(addr, std::sync::atomic::Ordering::Relaxed);
-        ret(engine, addr)
+        finish(engine, addr)
     } else {
-        ret(engine, va)
+        finish(engine, va)
     }
 }
 /// `perror(str)` — print `str: errno_message\n` to stderr.
@@ -430,7 +430,7 @@ pub(crate) fn handle_perror(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         }
     }
     let engine = &mut *ctx.engine;
-    ret(engine, 0)
+    finish(engine, 0)
 }
 /// `_beginthreadex` — same worker spawn path as `CreateThread` (MSVC CRT).
 ///
@@ -447,7 +447,7 @@ pub(crate) fn handle_begin_thread_ex(ctx: &mut HandlerContext<'_>) -> Result<Win
     let flags = read_stack_u32(engine, 0x28).unwrap_or(0);
     let tid_out = read_stack_u64(engine, 0x30).unwrap_or(0);
     let handle = create_guest_thread(engine, state, stack_size, start, arg, flags, tid_out)?;
-    ret(engine, handle)
+    finish(engine, handle)
 }
 
 /// `_endthreadex` — terminate the current guest worker (like `ExitThread`).
@@ -490,18 +490,18 @@ fn read_stack_u64(engine: &mut dyn wie_cpu::CpuEngine, offset: u64) -> Result<u6
 pub(crate) fn handle_purecall(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     // Pure virtual call — abort-like.
-    ret(engine, 0)
+    finish(engine, 0)
 }
 
 pub(crate) fn handle_terminate_cxx(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    ret(engine, 0)
+    finish(engine, 0)
 }
 
 pub(crate) fn handle_type_info_dtor(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let this = engine.read_rcx()?;
-    ret(engine, this)
+    finish(engine, this)
 }
 /// `_CxxThrowException(pExceptionObject, pThrowInfo)` — MSVC C++ throw.
 ///

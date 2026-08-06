@@ -155,15 +155,15 @@ pub(crate) fn find_window_mut(state: &mut WinApiState, handle: u64) -> Option<&m
 
 /// Handles `USER32.dll!GetClassLongPtrA`.
 pub fn handle_get_class_long_ptr_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_get_class_long_ptr(ctx, "GetClassLongPtrA")
+    handle_get_class_long_ptr_impl(ctx, "GetClassLongPtrA")
 }
 
 /// Handles `USER32.dll!GetClassLongPtrW`.
 pub fn handle_get_class_long_ptr_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_get_class_long_ptr(ctx, "GetClassLongPtrW")
+    handle_get_class_long_ptr_impl(ctx, "GetClassLongPtrW")
 }
 
-fn handle_get_class_long_ptr(
+fn handle_get_class_long_ptr_impl(
     ctx: &mut HandlerContext<'_>,
     api_name: &str,
 ) -> Result<WinApiHandlerResult> {
@@ -196,15 +196,15 @@ fn handle_get_class_long_ptr(
 
 /// Handles `USER32.dll!SetClassLongPtrA`.
 pub fn handle_set_class_long_ptr_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_set_class_long_ptr(ctx, "SetClassLongPtrA")
+    handle_set_class_long_ptr_impl(ctx, "SetClassLongPtrA")
 }
 
 /// Handles `USER32.dll!SetClassLongPtrW`.
 pub fn handle_set_class_long_ptr_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_set_class_long_ptr(ctx, "SetClassLongPtrW")
+    handle_set_class_long_ptr_impl(ctx, "SetClassLongPtrW")
 }
 
-fn handle_set_class_long_ptr(
+fn handle_set_class_long_ptr_impl(
     ctx: &mut HandlerContext<'_>,
     api_name: &str,
 ) -> Result<WinApiHandlerResult> {

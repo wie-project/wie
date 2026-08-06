@@ -248,12 +248,12 @@ pub fn handle_image_list_destroy(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 
 /// Handles `COMCTL32.dll!CreateStatusWindowA`.
 pub fn handle_create_status_window_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_create_status_window(ctx, "CreateStatusWindowA", false)
+    handle_create_status_window_impl(ctx, "CreateStatusWindowA", false)
 }
 
 /// Handles `COMCTL32.dll!CreateStatusWindowW`.
 pub fn handle_create_status_window_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    handle_create_status_window(ctx, "CreateStatusWindowW", true)
+    handle_create_status_window_impl(ctx, "CreateStatusWindowW", true)
 }
 
 /// Shared `CreateStatusWindowA/W` implementation.
@@ -264,7 +264,7 @@ pub fn handle_create_status_window_w(ctx: &mut HandlerContext<'_>) -> Result<Win
 /// forcing `WS_CHILD` onto the caller's style, and returns the new HWND. The
 /// creation text lands on the window record (`control_text`) and reads as
 /// part 0's text until an `SB_SETTEXTW(0, …)` overwrites it (Task 3.1).
-fn handle_create_status_window(
+fn handle_create_status_window_impl(
     ctx: &mut HandlerContext<'_>,
     api_name: &str,
     unicode: bool,

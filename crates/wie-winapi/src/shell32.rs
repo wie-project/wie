@@ -20,7 +20,7 @@ const SE_ERR_FNF: u64 = 2;
 /// `SE_ERR_NOASSOC` — no application is associated with the operation.
 const SE_ERR_NOASSOC: u64 = 31;
 
-fn ret(engine: &mut dyn wie_cpu::CpuEngine, value: u64) -> Result<WinApiHandlerResult> {
+fn finish(engine: &mut dyn wie_cpu::CpuEngine, value: u64) -> Result<WinApiHandlerResult> {
     let return_address = engine
         .return_from_win64_api(value)
         .context("shell32 return")?;
@@ -79,7 +79,7 @@ fn handle_sh_get_folder_path_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     if path_ptr != 0 {
         write_utf16_c_string(engine, path_ptr, 260, path)?;
     }
-    ret(engine, S_OK)
+    finish(engine, S_OK)
 }
 
 /// `LPWSTR* CommandLineToArgvW(LPCWSTR lpCmdLine, int* pNumArgs)`.
@@ -92,7 +92,7 @@ fn handle_command_line_to_argv_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let cmd_line_ptr = engine.read_rcx()?;
     let num_args_ptr = engine.read_rdx()?;
     if cmd_line_ptr == 0 || num_args_ptr == 0 {
-        return ret(engine, 0); // NULL → failure
+        return finish(engine, 0); // NULL → failure
     }
     // Read the command line.
     let mut units = Vec::new();
@@ -136,14 +136,14 @@ fn handle_command_line_to_argv_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         .heap
         .alloc_coherent(engine, u64::try_from(argv_bytes).unwrap_or(64));
     if argv_va == 0 {
-        return ret(engine, 0);
+        return finish(engine, 0);
     }
     let mut offset = 0_u64;
     for arg in &args {
         let units: Vec<u16> = arg.encode_utf16().collect();
         let bstr = alloc_shell_bstr(engine, state, &units)?;
         if bstr == 0 {
-            return ret(engine, 0);
+            return finish(engine, 0);
         }
         engine.mem_write(argv_va.wrapping_add(offset), &bstr.to_le_bytes())?;
         offset = offset.saturating_add(8);
@@ -153,7 +153,7 @@ fn handle_command_line_to_argv_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     // Write argc.
     let argc_u32 = u32::try_from(args.len()).unwrap_or(0);
     drop(write_guest_u32(engine, num_args_ptr, argc_u32));
-    ret(engine, argv_va)
+    finish(engine, argv_va)
 }
 
 /// Allocate a shell-style BSTR from the process heap.
@@ -190,7 +190,7 @@ fn handle_sh_get_path_from_id_list_w(ctx: &mut HandlerContext<'_>) -> Result<Win
     if path_ptr != 0 {
         write_utf16_c_string(engine, path_ptr, 260, "")?;
     }
-    ret(engine, 0) // FALSE
+    finish(engine, 0) // FALSE
 }
 
 /// `PIDLIST_ABSOLUTE SHBrowseForFolderW(lpbi)` — no UI; return NULL.
@@ -198,7 +198,7 @@ fn handle_sh_browse_for_folder_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let engine = &mut *ctx.engine;
     let _lpbi = engine.read_rcx()?;
     let _ = E_FAIL;
-    ret(engine, 0)
+    finish(engine, 0)
 }
 
 /// `void DragAcceptFiles(HWND hWnd, BOOL fAccept)`.
@@ -223,7 +223,7 @@ pub fn handle_drag_accept_files(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
             window.flags.remove(WindowFlags::DROP_ACCEPTED);
         }
     }
-    ret(engine, 1)
+    finish(engine, 1)
 }
 
 /// `BOOL ShellAboutW(HWND hwnd, LPCWSTR szAppName, LPCWSTR szOtherStuff, HICON hIcon)`.
@@ -274,7 +274,7 @@ pub fn handle_shell_about_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
             .pick
             .and_then(|id| u64::try_from(id).ok())
             .unwrap_or(IDOK);
-        return ret(ctx.engine, win32_id);
+        return finish(ctx.engine, win32_id);
     }
 
     if ctx
@@ -302,7 +302,7 @@ pub fn handle_shell_about_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     // Headless/trace: echo to the host console and auto-answer TRUE (IDOK) so
     // the guest never hangs on a missing host.
     tracing::error!(app_name = %app_name, text = %text, "[ShellAboutW]");
-    ret(ctx.engine, 1)
+    finish(ctx.engine, 1)
 }
 
 /// `HINSTANCE ShellExecuteW(HWND hwnd, LPCWSTR lpOperation, LPCWSTR lpFile,
@@ -364,7 +364,7 @@ pub fn handle_shell_execute_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         return_value,
         "ShellExecuteW"
     );
-    ret(ctx.engine, return_value)
+    finish(ctx.engine, return_value)
 }
 
 /// Spawn a new WIE instance of the guest exe at `guest_path` (`wie-cli run`).

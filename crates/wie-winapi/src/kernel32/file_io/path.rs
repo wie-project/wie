@@ -146,9 +146,9 @@ pub fn handle_get_user_profile_directory_w(
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let _h_profile = engine.read_rcx()?;
-    let buf = engine.read_rdx()?;
+    let name_ptr = engine.read_rdx()?;
     let size_ptr = engine.read_r8()?;
-    get_user_profile_dir_impl(engine, state, buf, size_ptr, true)
+    get_user_profile_dir_impl(engine, state, name_ptr, size_ptr, true)
 }
 /// Handles `KERNEL32.dll!GetUserProfileDirectoryA` — return profile path from bottle/env.
 pub fn handle_get_user_profile_directory_a(
@@ -157,9 +157,9 @@ pub fn handle_get_user_profile_directory_a(
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let _h_profile = engine.read_rcx()?;
-    let buf = engine.read_rdx()?;
+    let name_ptr = engine.read_rdx()?;
     let size_ptr = engine.read_r8()?;
-    get_user_profile_dir_impl(engine, state, buf, size_ptr, false)
+    get_user_profile_dir_impl(engine, state, name_ptr, size_ptr, false)
 }
 pub(crate) fn handle_duplicate_handle(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -629,51 +629,51 @@ pub(crate) fn copy_path_w_to_guest_buffer(
     }
 }
 
-/// Write a NUL-terminated ANSI string into a guest buffer at `buf` with room
-/// for `buf_len` bytes.  Returns the number of characters written (excluding
-/// NUL), or 0 with `ERROR_INSUFFICIENT_BUFFER` on truncation.
+/// Write a NUL-terminated ANSI string into a guest buffer at `out_ptr` with
+/// room for `out_cap` bytes.  Returns the number of characters written
+/// (excluding NUL), or 0 with `ERROR_INSUFFICIENT_BUFFER` on truncation.
 pub(crate) fn write_mock_string_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
     s: &str,
-    buf: u64,
-    buf_len: u64,
+    out_ptr: u64,
+    out_cap: u64,
 ) -> Result<u64> {
-    if buf == 0 || buf_len == 0 {
+    if out_ptr == 0 || out_cap == 0 {
         state.process.last_error = ERROR_INSUFFICIENT_BUFFER;
         return Ok(0);
     }
     let encoded = crate::vfs::encode_acp(s);
     let needed = encoded.len(); // bytes (excluding NUL)
-    let cap = usize::try_from(buf_len).unwrap_or(0);
+    let cap = usize::try_from(out_cap).unwrap_or(0);
     if cap < needed.saturating_add(1) {
         state.process.last_error = ERROR_INSUFFICIENT_BUFFER;
         return Ok(0);
     }
     let mut payload = encoded;
     payload.push(0);
-    engine.mem_write(buf, &payload)?;
+    engine.mem_write(out_ptr, &payload)?;
     state.process.last_error = 0;
     Ok(u64::try_from(needed).unwrap_or(0))
 }
 
-/// Write a NUL-terminated UTF-16 string into a guest buffer at `buf` with room
-/// for `buf_len` WCHARs.  Returns the number of characters written (excluding
-/// NUL), or 0 with `ERROR_INSUFFICIENT_BUFFER` on truncation.
+/// Write a NUL-terminated UTF-16 string into a guest buffer at `out_ptr` with
+/// room for `out_cap` WCHARs.  Returns the number of characters written
+/// (excluding NUL), or 0 with `ERROR_INSUFFICIENT_BUFFER` on truncation.
 pub(crate) fn write_mock_string_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
     s: &str,
-    buf: u64,
-    buf_len: u64,
+    out_ptr: u64,
+    out_cap: u64,
 ) -> Result<u64> {
-    if buf == 0 || buf_len == 0 {
+    if out_ptr == 0 || out_cap == 0 {
         state.process.last_error = ERROR_INSUFFICIENT_BUFFER;
         return Ok(0);
     }
     let units: Vec<u16> = s.encode_utf16().collect();
     let needed = units.len();
-    let cap = usize::try_from(buf_len).unwrap_or(0);
+    let cap = usize::try_from(out_cap).unwrap_or(0);
     if cap < needed.saturating_add(1) {
         state.process.last_error = ERROR_INSUFFICIENT_BUFFER;
         return Ok(0);
@@ -683,7 +683,7 @@ pub(crate) fn write_mock_string_w(
         bytes.extend_from_slice(&u.to_le_bytes());
     }
     bytes.extend_from_slice(&0_u16.to_le_bytes());
-    engine.mem_write(buf, &bytes)?;
+    engine.mem_write(out_ptr, &bytes)?;
     state.process.last_error = 0;
     Ok(u64::try_from(needed).unwrap_or(0))
 }

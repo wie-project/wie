@@ -195,17 +195,17 @@ pub fn handle_select_object(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 pub fn handle_get_text_extent_point_32_a(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
-    handle_get_text_extent_point_32(ctx, "GetTextExtentPoint32A", false)
+    handle_get_text_extent_point_32_impl(ctx, "GetTextExtentPoint32A", false)
 }
 
 /// Handles `GDI32.dll!GetTextExtentPoint32W`.
 pub fn handle_get_text_extent_point_32_w(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
-    handle_get_text_extent_point_32(ctx, "GetTextExtentPoint32W", true)
+    handle_get_text_extent_point_32_impl(ctx, "GetTextExtentPoint32W", true)
 }
 
-fn handle_get_text_extent_point_32(
+fn handle_get_text_extent_point_32_impl(
     ctx: &mut HandlerContext<'_>,
     api_name: &str,
     wide: bool,
