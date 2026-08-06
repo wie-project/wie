@@ -163,9 +163,7 @@ pub fn pe_identity_from_bytes(path: &Path, bytes: &[u8]) -> Result<PeIdentity> {
 
 /// Extract loader identity from a pre-parsed PE without re-parsing.
 pub fn pe_identity_from_parsed(pe: &PE, path: &Path, _bytes: &[u8]) -> Result<PeIdentity> {
-    if !pe.is_64 {
-        bail!("expected PE64 image, got PE32");
-    }
+    ensure_pe64(pe)?;
 
     let image_base = u64::try_from(pe.image_base).context("image base does not fit into u64")?;
     let entry_rva = u64::try_from(pe.entry).context("entry point does not fit into u64")?;
@@ -195,10 +193,22 @@ pub fn pe_identity_from_parsed(pe: &PE, path: &Path, _bytes: &[u8]) -> Result<Pe
     })
 }
 
+/// Ensure the image is PE64 (PE32+); PE32 is rejected by this crate.
+fn ensure_pe64(pe: &PE) -> Result<()> {
+    if !pe.is_64 {
+        bail!("expected PE64 image, got PE32");
+    }
+    Ok(())
+}
+
+/// Read a PE file's bytes with a standard contextual error.
+fn read_pe_file(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path).with_context(|| format!("failed to read PE file: {}", path.display()))
+}
+
 /// Read a PE64 file and return loader identity.
 pub fn pe_identity_from_file(path: &Path) -> Result<PeIdentity> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("failed to read PE file: {}", path.display()))?;
+    let bytes = read_pe_file(path)?;
     pe_identity_from_bytes(path, &bytes)
 }
 
@@ -362,8 +372,7 @@ pub fn protect_from_section_characteristics(characteristics: u32) -> u32 {
 
 /// Build a [`PeMapPlan`] from a PE file on disk.
 pub fn pe_map_plan_from_file(path: &Path) -> Result<PeMapPlan> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("failed to read PE file: {}", path.display()))?;
+    let bytes = read_pe_file(path)?;
     pe_map_plan_from_bytes(&bytes)
 }
 
@@ -375,9 +384,7 @@ pub fn pe_map_plan_from_bytes(bytes: &[u8]) -> Result<PeMapPlan> {
 
 /// Private: build map plan from a pre-parsed PE (no re-parse).
 fn pe_map_plan_from_parsed(pe: &PE, bytes: &[u8]) -> Result<PeMapPlan> {
-    if !pe.is_64 {
-        bail!("expected PE64 image, got PE32");
-    }
+    ensure_pe64(pe)?;
     let identity = pe_identity_from_parsed(pe, Path::new("<memory>"), bytes)?;
     let mut sections = Vec::with_capacity(pe.sections.len());
     for section in &pe.sections {
@@ -414,13 +421,9 @@ pub fn page_align_image_range(rva: u64, len: u64, size_of_image: u64) -> Option<
     }
     let end = (rva.saturating_add(len)).min(size_of_image);
     let start = rva / PAGE * PAGE;
-    let end_aligned = end
-        .div_ceil(PAGE)
-        .saturating_mul(PAGE)
-        .min(size_of_image.div_ceil(PAGE).saturating_mul(PAGE).max(end));
     // Clamp end to size_of_image rounded up to page within image mapping.
     let img_end = size_of_image.div_ceil(PAGE).saturating_mul(PAGE);
-    let end_aligned = end_aligned.min(img_end);
+    let end_aligned = end.div_ceil(PAGE).saturating_mul(PAGE).min(img_end);
     if end_aligned <= start {
         return None;
     }
@@ -510,8 +513,7 @@ pub struct PePatchedImport {
 
 /// Read and inspect a `PE` image from disk.
 pub fn inspect_pe_file(path: &Path) -> Result<PeImageSummary> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("failed to read PE file: {}", path.display()))?;
+    let bytes = read_pe_file(path)?;
 
     inspect_pe_bytes(path, &bytes)
 }
@@ -519,12 +521,8 @@ pub fn inspect_pe_file(path: &Path) -> Result<PeImageSummary> {
 /// Inspect a `PE` image from bytes.
 pub fn inspect_pe_bytes(path: &Path, bytes: &[u8]) -> Result<PeImageSummary> {
     let pe = PE::parse(bytes).context("failed to parse PE image")?;
-
-    if !pe.is_64 {
-        bail!("expected PE64 image, got PE32");
-    }
-
-    let identity = pe_identity_from_bytes(path, bytes)?;
+    ensure_pe64(&pe)?;
+    let identity = pe_identity_from_parsed(&pe, path, bytes)?;
 
     Ok(PeImageSummary {
         path: identity.path,
@@ -541,8 +539,7 @@ pub fn inspect_pe_bytes(path: &Path, bytes: &[u8]) -> Result<PeImageSummary> {
 
 /// Read section metadata from a `PE` image on disk.
 pub fn inspect_pe_sections(path: &Path) -> Result<Vec<PeSectionSummary>> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("failed to read PE file: {}", path.display()))?;
+    let bytes = read_pe_file(path)?;
 
     inspect_pe_sections_bytes(&bytes)
 }
@@ -550,10 +547,7 @@ pub fn inspect_pe_sections(path: &Path) -> Result<Vec<PeSectionSummary>> {
 /// Read section metadata from `PE` bytes.
 pub fn inspect_pe_sections_bytes(bytes: &[u8]) -> Result<Vec<PeSectionSummary>> {
     let pe = PE::parse(bytes).context("failed to parse PE image")?;
-
-    if !pe.is_64 {
-        bail!("expected PE64 image, got PE32");
-    }
+    ensure_pe64(&pe)?;
 
     let image_base = u64::try_from(pe.image_base).context("image base does not fit into u64")?;
     let mut sections = Vec::with_capacity(pe.sections.len());
@@ -584,8 +578,7 @@ pub fn inspect_pe_sections_bytes(bytes: &[u8]) -> Result<Vec<PeSectionSummary>> 
 
 /// Read import metadata from a `PE` image on disk.
 pub fn inspect_pe_imports(path: &Path) -> Result<Vec<PeImportSummary>> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("failed to read PE file: {}", path.display()))?;
+    let bytes = read_pe_file(path)?;
 
     inspect_pe_imports_bytes(&bytes)
 }
@@ -598,9 +591,7 @@ pub fn inspect_pe_imports_bytes(bytes: &[u8]) -> Result<Vec<PeImportSummary>> {
 
 /// Private: parse imports from a pre-parsed PE (no re-parse).
 fn inspect_pe_imports_from_parsed(pe: &PE, bytes: &[u8]) -> Result<Vec<PeImportSummary>> {
-    if !pe.is_64 {
-        bail!("expected PE64 image, got PE32");
-    }
+    ensure_pe64(pe)?;
 
     let image_base = u64::try_from(pe.image_base).context("image base does not fit into u64")?;
     let import_directory = pe
@@ -862,8 +853,7 @@ fn checked_add_usize(left: usize, right: usize) -> Result<usize> {
 
 /// Build a Windows-loader-like memory image from a `PE64` file.
 pub fn build_loaded_image(path: &Path) -> Result<(Vec<u8>, PeLoadedImageSummary)> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("failed to read PE file: {}", path.display()))?;
+    let bytes = read_pe_file(path)?;
 
     build_loaded_image_bytes(&bytes)
 }
@@ -879,9 +869,7 @@ fn build_loaded_image_from_parsed(
     pe: &PE,
     bytes: &[u8],
 ) -> Result<(Vec<u8>, PeLoadedImageSummary)> {
-    if !pe.is_64 {
-        bail!("expected PE64 image, got PE32");
-    }
+    ensure_pe64(pe)?;
 
     // Path is only for diagnostics in identity; bytes carry all header fields.
     let identity = pe_identity_from_parsed(pe, Path::new("<memory>"), bytes)?;
@@ -973,8 +961,7 @@ pub fn build_loaded_image_with_fake_imports_with<F>(
 where
     F: FnMut(&PeImportSummary) -> Result<u64>,
 {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("failed to read PE file: {}", path.display()))?;
+    let bytes = read_pe_file(path)?;
     let pe = PE::parse(&bytes).context("failed to parse PE image")?;
 
     let (mut image, summary) = build_loaded_image_from_parsed(&pe, &bytes)?;
@@ -1008,8 +995,7 @@ where
     F: FnMut(&PeImportSummary) -> Result<u64>,
     W: FnMut(u64, &[u8]) -> Result<()>,
 {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("failed to read PE file: {}", path.display()))?;
+    let bytes = read_pe_file(path)?;
     load_pe_direct_from_bytes(&bytes, image_base, image_size, mem_write, fake_target)
 }
 
@@ -1028,9 +1014,7 @@ where
     F: FnMut(&PeImportSummary) -> Result<u64>,
     W: FnMut(u64, &[u8]) -> Result<()>,
 {
-    if !pe.is_64 {
-        bail!("expected PE64 image, got PE32");
-    }
+    ensure_pe64(pe)?;
 
     let identity = pe_identity_from_parsed(pe, Path::new("<memory>"), bytes)?;
     let map_plan = pe_map_plan_from_parsed(pe, bytes)?;
@@ -1113,6 +1097,23 @@ where
     load_pe_direct_from_parsed(&pe, bytes, image_base, image_size, mem_write, fake_target)
 }
 
+/// Build a [`PePatchedImport`] entry, labeling ordinal imports as `ORDINAL n`.
+fn patched_import_entry(import: &PeImportSummary, fake_target_va: u64) -> PePatchedImport {
+    let name = if import.name.is_empty() {
+        format!("ORDINAL {}", import.ordinal)
+    } else {
+        import.name.clone()
+    };
+
+    PePatchedImport {
+        library: import.library.clone(),
+        name,
+        iat_slot_va: import.iat_slot_va,
+        iat_slot_rva: import.iat_slot_rva,
+        fake_target_va,
+    }
+}
+
 /// Patches IAT slots in guest memory through a writer callback.
 /// Used internally by [`load_pe_direct`].
 fn patch_loaded_image_imports_direct<F, W>(
@@ -1137,19 +1138,7 @@ where
         mem_write(slot_va, &fake_target_va.to_le_bytes())
             .context("failed to patch IAT slot in guest memory")?;
 
-        let name = if import.name.is_empty() {
-            format!("ORDINAL {}", import.ordinal)
-        } else {
-            import.name.clone()
-        };
-
-        patched.push(PePatchedImport {
-            library: import.library.clone(),
-            name,
-            iat_slot_va: import.iat_slot_va,
-            iat_slot_rva: import.iat_slot_rva,
-            fake_target_va,
-        });
+        patched.push(patched_import_entry(import, fake_target_va));
     }
 
     Ok(patched)
@@ -1182,19 +1171,7 @@ where
 
         slot.copy_from_slice(&fake_target_va.to_le_bytes());
 
-        let name = if import.name.is_empty() {
-            format!("ORDINAL {}", import.ordinal)
-        } else {
-            import.name.clone()
-        };
-
-        patched.push(PePatchedImport {
-            library: import.library.clone(),
-            name,
-            iat_slot_va: import.iat_slot_va,
-            iat_slot_rva: import.iat_slot_rva,
-            fake_target_va,
-        });
+        patched.push(patched_import_entry(import, fake_target_va));
     }
 
     Ok(patched)
