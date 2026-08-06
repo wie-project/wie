@@ -134,13 +134,18 @@ pub(crate) fn decode_utf16_lossy(units: &[u16]) -> String {
     String::from_utf16_lossy(&head)
 }
 
-pub(crate) fn read_utf16_lossy(
+/// Read up to `max_units` NUL-terminated UTF-16 units from guest memory.
+///
+/// Uses 4 KiB page-sliced bulk reads — one lock acquisition per page instead
+/// of the one-per-unit loop the KERNEL32 W-string reader used to run. Stops at
+/// the first NUL unit or after `max_units` units.
+fn read_utf16_units(
     engine: &mut dyn wie_cpu::CpuEngine,
     address: u64,
     max_units: usize,
-) -> Result<String> {
+) -> Result<Vec<u16>> {
     if address == 0 || max_units == 0 {
-        return Ok(String::new());
+        return Ok(Vec::new());
     }
 
     // Text-rendering hot path: preallocate the common short-string size so
@@ -193,7 +198,43 @@ pub(crate) fn read_utf16_lossy(
         remaining_units = remaining_units.saturating_sub(got_pairs >> 1);
     }
 
-    Ok(decode_utf16_lossy(&units))
+    Ok(units)
+}
+
+/// UTF-16 decode mode for [`read_utf16`]: `Strict` fails on a lone surrogate,
+/// `Lossy` replaces invalid units with U+FFFD.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Utf16Decode {
+    Strict,
+    Lossy,
+}
+
+/// Read a NUL-terminated UTF-16 string, decoding per `mode`.
+///
+/// `Strict` is the KERNEL32 W-string reader contract (`from_utf16`); `Lossy`
+/// is the [`read_utf16_lossy`] contract (`from_utf16_lossy`). Both share the
+/// page-safe bulk read loop — only the decode step differs.
+pub(crate) fn read_utf16(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    address: u64,
+    max_units: usize,
+    mode: Utf16Decode,
+) -> Result<String> {
+    let units = read_utf16_units(engine, address, max_units)?;
+    match mode {
+        Utf16Decode::Strict => {
+            String::from_utf16(&units).context("wide string is not valid UTF-16")
+        }
+        Utf16Decode::Lossy => Ok(String::from_utf16_lossy(&units)),
+    }
+}
+
+pub(crate) fn read_utf16_lossy(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    address: u64,
+    max_units: usize,
+) -> Result<String> {
+    read_utf16(engine, address, max_units, Utf16Decode::Lossy)
 }
 
 pub(crate) fn write_utf16_units(
@@ -515,6 +556,43 @@ mod tests {
         units.push(0xDEAD);
         assert_eq!(decode_utf16_lossy(&units), "Segoe");
         assert_eq!(decode_utf16_lossy(&[]), "");
+    }
+
+    #[test]
+    fn read_utf16_strict_stops_at_nul_and_roundtrips() {
+        // The strict reader (read_wide_string_from_cpu's path) shares the bulk
+        // loop with the lossy reader and must stop at the NUL unit.
+        let mut engine = test_engine();
+        let mut bytes = "Hello"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<u8>>();
+        bytes.extend_from_slice(&[0, 0]); // NUL unit terminator
+        bytes.push(0xDE);
+        bytes.push(0xAD);
+        engine
+            .mem_write(BUF, &bytes)
+            .expect("write guest units + garbage");
+        let text = read_utf16(&mut engine, BUF, 64, Utf16Decode::Strict).expect("strict read");
+        assert_eq!(text, "Hello");
+    }
+
+    #[test]
+    fn read_utf16_strict_rejects_lone_surrogate_that_lossy_replaces() {
+        // The one behavioral divergence between read_wide_string_from_cpu
+        // (Strict) and read_utf16_lossy (Lossy): a lone surrogate must fail
+        // the strict read, not silently become U+FFFD.
+        let mut engine = test_engine();
+        engine
+            .mem_write(BUF, &[0x00, 0xD8, 0x00, 0x00])
+            .expect("write lone surrogate + NUL");
+        let strict = read_utf16(&mut engine, BUF, 64, Utf16Decode::Strict);
+        assert!(
+            strict.is_err(),
+            "lone surrogate must fail the strict decode"
+        );
+        let lossy = read_utf16(&mut engine, BUF, 64, Utf16Decode::Lossy).expect("lossy decode");
+        assert_eq!(lossy, "\u{FFFD}");
     }
 
     #[test]

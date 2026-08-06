@@ -111,65 +111,51 @@ pub fn handle_set_current_directory_w(ctx: &mut HandlerContext<'_>) -> Result<Wi
         return_value,
     })
 }
-/// Handles `KERNEL32.dll!GetLongPathNameW` — return same as input.
-pub fn handle_get_long_path_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+/// Shared implementation for the GetLongPathName/GetShortPathName A/W quartet.
+///
+/// Real Windows resolves 8.3 short names to long names; WIE stores neither
+/// form, so every variant returns the input unchanged. The `wide` flag picks
+/// the W-string read/write pair; the A-pair goes through the ACP path.
+fn handle_mock_long_short_path_impl(
+    ctx: &mut HandlerContext<'_>,
+    wide: bool,
+) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let src = engine.read_rcx()?;
     let dst = engine.read_rdx()?;
     let dst_len = engine.read_r8()?;
-    let path = read_wide_string_from_cpu(engine, src, 1024)?;
-    let written = write_mock_string_w(engine, state, &path, dst, dst_len)?;
+    let path = if wide {
+        read_wide_string_from_cpu(engine, src, 1024)?
+    } else {
+        read_ansi_string_from_cpu(engine, src, 1024)?
+    };
+    let written = if wide {
+        write_mock_string_w(engine, state, &path, dst, dst_len)?
+    } else {
+        write_mock_string_a(engine, state, &path, dst, dst_len)?
+    };
     let return_address = engine.return_from_win64_api(written)?;
     Ok(WinApiHandlerResult {
         return_address,
         return_value: written,
     })
+}
+/// Handles `KERNEL32.dll!GetLongPathNameW` — return same as input.
+pub fn handle_get_long_path_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_mock_long_short_path_impl(ctx, true)
 }
 /// Handles `KERNEL32.dll!GetLongPathNameA` — return same as input.
 pub fn handle_get_long_path_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let src = engine.read_rcx()?;
-    let dst = engine.read_rdx()?;
-    let dst_len = engine.read_r8()?;
-    let path = read_ansi_string_from_cpu(engine, src, 1024)?;
-    let written = write_mock_string_a(engine, state, &path, dst, dst_len)?;
-    let return_address = engine.return_from_win64_api(written)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: written,
-    })
+    handle_mock_long_short_path_impl(ctx, false)
 }
 /// Handles `KERNEL32.dll!GetShortPathNameW` — return same as input.
 pub fn handle_get_short_path_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let src = engine.read_rcx()?;
-    let dst = engine.read_rdx()?;
-    let dst_len = engine.read_r8()?;
-    let path = read_wide_string_from_cpu(engine, src, 1024)?;
-    let written = write_mock_string_w(engine, state, &path, dst, dst_len)?;
-    let return_address = engine.return_from_win64_api(written)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: written,
-    })
+    handle_mock_long_short_path_impl(ctx, true)
 }
 /// Handles `KERNEL32.dll!GetShortPathNameA` — return same as input.
 pub fn handle_get_short_path_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let src = engine.read_rcx()?;
-    let dst = engine.read_rdx()?;
-    let dst_len = engine.read_r8()?;
-    let path = read_ansi_string_from_cpu(engine, src, 1024)?;
-    let written = write_mock_string_a(engine, state, &path, dst, dst_len)?;
-    let return_address = engine.return_from_win64_api(written)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: written,
-    })
+    handle_mock_long_short_path_impl(ctx, false)
 }
 /// Handles `KERNEL32.dll!GetUserProfileDirectoryW` — return profile path from bottle/env.
 pub fn handle_get_user_profile_directory_w(

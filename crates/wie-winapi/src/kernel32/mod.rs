@@ -181,33 +181,22 @@ pub(crate) fn read_ansi_string_from_cpu(
     read_guest_ansi_lossy(engine, address, max_len)
 }
 
+/// Read a NUL-terminated wide string from guest memory, strict-UTF-16.
+///
+/// Shares the page-safe 4 KiB bulk read loop with `read_utf16_lossy`; the
+/// strict decode (`from_utf16`) is the KERNEL32 W-string contract — a lone
+/// surrogate fails the read instead of becoming U+FFFD.
 pub(crate) fn read_wide_string_from_cpu(
     engine: &mut dyn wie_cpu::CpuEngine,
     address: u64,
     max_units: usize,
 ) -> Result<String> {
-    if address == 0 {
-        return Ok(String::new());
-    }
-
-    let mut units = Vec::new();
-
-    for index in 0..max_units {
-        let index_u64 = u64::try_from(index).context("wide string index does not fit u64")?;
-        let offset = index_u64
-            .checked_mul(2)
-            .context("wide string offset overflow")?;
-        let unit_address = checked_address(address, offset, "wide string read");
-        let unit = read_guest_u16(engine, unit_address)?;
-
-        if unit == 0 {
-            break;
-        }
-
-        units.push(unit);
-    }
-
-    String::from_utf16(&units).context("wide string is not valid UTF-16")
+    crate::guest_string::read_utf16(
+        engine,
+        address,
+        max_units,
+        crate::guest_string::Utf16Decode::Strict,
+    )
 }
 
 pub(crate) fn create_fake_resource_record(
