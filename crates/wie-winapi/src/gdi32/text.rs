@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use crate::gdi32::state::dc_resolved_font;
 use crate::gdi32::{FontEngine, FontKey, IRect, RasterizedGlyph, ResolvedFont};
 use crate::guest_layout::Rect;
-use crate::guest_memory::{checked_address, read_int, with_typed_read, with_typed_write};
+use crate::guest_memory::{checked_address, read_u32, read_u64, with_typed_read, with_typed_write};
 use crate::guest_string::{read_ansi_bytes as read_guest_ansi_bytes, read_utf16_lossy};
 use crate::user32::{low_i32, window_client_size};
 use crate::{HandlerContext, WinApiHandlerResult, WinApiState, gdi32::DcKind};
@@ -659,7 +659,7 @@ fn handle_text_out_impl(
     let rsp = engine
         .read_rsp()
         .with_context(|| format!("failed to read RSP for {api_name}"))?;
-    let cch = read_int::<u32>(engine, checked_address(rsp, 0x28, "cchString"))
+    let cch = read_u32(engine, checked_address(rsp, 0x28, "cchString"))
         .with_context(|| format!("failed to read {api_name} cchString"))?;
 
     if cch != 0 {
@@ -756,11 +756,11 @@ pub fn handle_ext_text_out_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     let rsp = engine
         .read_rsp()
         .context("failed to read RSP for ExtTextOutW")?;
-    let rect_ptr = read_int::<u64>(engine, checked_address(rsp, 0x28, "lprect"))
+    let rect_ptr = read_u64(engine, checked_address(rsp, 0x28, "lprect"))
         .context("failed to read ExtTextOutW lprect")?;
-    let text_ptr = read_int::<u64>(engine, checked_address(rsp, 0x30, "lpString"))
+    let text_ptr = read_u64(engine, checked_address(rsp, 0x30, "lpString"))
         .context("failed to read ExtTextOutW lpString")?;
-    let cch = read_int::<u32>(engine, checked_address(rsp, 0x38, "cch"))
+    let cch = read_u32(engine, checked_address(rsp, 0x38, "cch"))
         .context("failed to read ExtTextOutW cch")?;
 
     let mut clip = None;
@@ -888,7 +888,7 @@ fn handle_draw_text_impl(
     let rsp = engine
         .read_rsp()
         .with_context(|| format!("failed to read RSP for {api_name}"))?;
-    let format = read_int::<u32>(engine, checked_address(rsp, 0x28, "format"))
+    let format = read_u32(engine, checked_address(rsp, 0x28, "format"))
         .with_context(|| format!("failed to read {api_name} format"))?;
 
     let return_value = if rect_ptr != 0 {

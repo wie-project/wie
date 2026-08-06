@@ -3,7 +3,7 @@ use super::{
     FAKE_IMAGE_HANDLE, HandlerContext, IDCANCEL, IDOK, Result, TimerRecord, WinApiHandlerResult,
     WinApiState, WindowClassRecord, WindowsHookRecord, checked_address,
     dispatch_control_proc_host_default, low_i32, read_guest_ansi_lossy, read_guest_utf16_lossy,
-    read_int, register_window_class, with_typed_read, write_guest_ansi_c_string,
+    read_i32, read_u64, register_window_class, with_typed_read, write_guest_ansi_c_string,
     write_guest_utf16_c_string,
 };
 use crate::guest_layout::WndClassEx;
@@ -719,7 +719,7 @@ pub fn handle_set_scroll_info(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     // int  nPos;      20
     // int  nTrackPos; 24
     let return_value = if scroll_info_ptr != 0 {
-        let n_pos = read_int::<i32>(
+        let n_pos = read_i32(
             engine,
             checked_address(scroll_info_ptr, 20, "SCROLLINFO.nPos"),
         )
@@ -1022,7 +1022,7 @@ fn handle_call_window_proc(
     let rsp = engine
         .read_rsp()
         .with_context(|| format!("failed to read RSP for {api_name}"))?;
-    let long_parameter = read_int::<u64>(
+    let long_parameter = read_u64(
         engine,
         rsp.checked_add(0x28)
             .with_context(|| format!("{api_name}: lParam address overflow"))?,

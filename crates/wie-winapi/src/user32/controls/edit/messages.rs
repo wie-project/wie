@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 
-use crate::guest_memory::read_int;
+use crate::guest_memory::read_u16;
 use crate::state::{TimerRecord, WindowFlags};
 use crate::user32::controls::{ControlState, SEL_EMPTY, SEL_MULTICHAR, SEL_MULTILINE, SEL_TEXT};
 use crate::user32::controls::{WinMsg, control_state, deliver_command, invalidate};
@@ -906,7 +906,7 @@ pub(super) fn edit_set_tab_stops(
     }
     // Sanity-cap the guest-supplied count; each stop is a u16 at +2i.
     for i in 0..count.min(256) {
-        let stop = read_int::<u16>(engine, ptr.wrapping_add(i.saturating_mul(2)))?;
+        let stop = read_u16(engine, ptr.wrapping_add(i.saturating_mul(2)))?;
         tab_stops.push(stop);
     }
     Ok(true)

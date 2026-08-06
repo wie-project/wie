@@ -7,8 +7,8 @@ use crate::state::WindowFlags;
 use crate::user32::{
     Context, FAKE_DESKTOP_WINDOW_HANDLE, FAKE_PROCESS_ID, FAKE_SYSTEM_COLOR_BRUSH_BASE,
     FAKE_THREAD_ID, FAKE_WINDOW_HANDLE, HandlerContext, Result, WinApiHandlerResult, WinApiState,
-    WindowPlacement, is_known_window, low_i32, read_int, window_client_size, with_typed_read,
-    with_typed_write, write_guest_u32,
+    WindowPlacement, is_known_window, low_i32, read_u32, read_u64, window_client_size,
+    with_typed_read, with_typed_write, write_guest_u32,
 };
 
 /// Handles `USER32.dll!GetClientRect`.
@@ -268,7 +268,7 @@ pub fn handle_set_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
         .checked_add(0x28)
         .context("SetRect bottom argument address overflow")?;
 
-    let bottom_raw = read_int::<u64>(engine, bottom_address)?;
+    let bottom_raw = read_u64(engine, bottom_address)?;
 
     let success = rect_ptr != 0;
 
@@ -650,8 +650,8 @@ pub fn handle_set_window_placement(ctx: &mut HandlerContext<'_>) -> Result<WinAp
     let mut success = known && placement_ptr != 0;
 
     if success {
-        let length = read_int::<u32>(engine, placement_ptr)
-            .context("failed to read WINDOWPLACEMENT.length")?;
+        let length =
+            read_u32(engine, placement_ptr).context("failed to read WINDOWPLACEMENT.length")?;
 
         // A length below the x64 WINDOWPLACEMENT size (a 32-bit struct) is
         // rejected, mirroring real Windows.
@@ -768,7 +768,7 @@ mod tests {
         FAKE_WINDOW_HANDLE, find_window_mut, handle_get_client_rect, sys_color, window_client_size,
     };
 
-    use crate::user32::read_int;
+    use crate::user32::read_i32;
     use wie_cpu::{CpuEngine, IcedCpu, RwxPerms};
 
     use ahash::HashMap;
@@ -1098,10 +1098,10 @@ mod tests {
         .expect("GetClientRect handler")
         .return_value;
         assert_eq!(get_client_rect_ret, 1);
-        let left = read_int::<i32>(&mut engine, RECT_BUF).expect("RECT.left");
-        let top = read_int::<i32>(&mut engine, RECT_BUF + 4).expect("RECT.top");
-        let right = read_int::<i32>(&mut engine, RECT_BUF + 8).expect("RECT.right");
-        let bottom = read_int::<i32>(&mut engine, RECT_BUF + 12).expect("RECT.bottom");
+        let left = read_i32(&mut engine, RECT_BUF).expect("RECT.left");
+        let top = read_i32(&mut engine, RECT_BUF + 4).expect("RECT.top");
+        let right = read_i32(&mut engine, RECT_BUF + 8).expect("RECT.right");
+        let bottom = read_i32(&mut engine, RECT_BUF + 12).expect("RECT.bottom");
         assert_eq!((left, top, right, bottom), (0, 0, 320, 480));
     }
 

@@ -9,7 +9,7 @@ use super::{
     INVALID_HANDLE_VALUE, INVALID_SET_FILE_POINTER, LOGICAL_DRIVE_TCHARS, OPEN_ALWAYS,
     OPEN_EXISTING, OpenGuestFile, Path, Result, TRUNCATE_EXISTING, WinApiHandlerResult,
     WinApiState, checked_address, get_user_profile_dir_impl, is_main_module_path, low_u32,
-    read_ansi_string_from_cpu, read_guest_utf16_lossy, read_int, read_stack_u64,
+    read_ansi_string_from_cpu, read_guest_utf16_lossy, read_stack_u64, read_u16, read_u64,
     read_wide_string_from_cpu, refill_stdin_from_host, ret_bool_true, ret_u64, write_guest_u16,
     write_guest_u32, write_guest_u64, write_guest_utf16_units,
 };

@@ -2,7 +2,7 @@ use super::{
     Context, ERROR_INVALID_PARAMETER, HandlerContext, Result, TIME_ZONE_ID_INVALID,
     TIME_ZONE_ID_UNKNOWN, WinApiHandlerResult, checked_address, write_guest_u16, write_guest_u32,
 };
-use crate::guest_memory::read_int;
+use crate::guest_memory::{read_u16, read_u64};
 use crate::guest_string::{read_utf16_lossy as read_guest_utf16_lossy, write_utf16_c_string};
 
 /// Handles `KERNEL32.dll!GetLocalTime`.
@@ -238,9 +238,9 @@ fn handle_get_time_date_format(
     let rsp = engine
         .read_rsp()
         .with_context(|| format!("failed to read RSP for {api_name}"))?;
-    let buffer_ptr = read_int::<u64>(engine, rsp.wrapping_add(0x28))
+    let buffer_ptr = read_u64(engine, rsp.wrapping_add(0x28))
         .with_context(|| format!("failed to read 5th arg for {api_name}"))?;
-    let buffer_len_raw = read_int::<u64>(engine, rsp.wrapping_add(0x30))
+    let buffer_len_raw = read_u64(engine, rsp.wrapping_add(0x30))
         .with_context(|| format!("failed to read 6th arg for {api_name}"))?;
 
     let locale = u32::try_from(locale_raw & u64::from(u32::MAX)).unwrap_or(0);
@@ -299,13 +299,13 @@ fn read_system_time(
     system_time_ptr: u64,
 ) -> Result<TimeParts> {
     Ok(TimeParts {
-        year: read_int::<u16>(engine, checked_address(system_time_ptr, 0, "wYear"))?,
-        month: read_int::<u16>(engine, checked_address(system_time_ptr, 2, "wMonth"))?,
-        day_of_week: read_int::<u16>(engine, checked_address(system_time_ptr, 4, "wDayOfWeek"))?,
-        day: read_int::<u16>(engine, checked_address(system_time_ptr, 6, "wDay"))?,
-        hour: read_int::<u16>(engine, checked_address(system_time_ptr, 8, "wHour"))?,
-        minute: read_int::<u16>(engine, checked_address(system_time_ptr, 10, "wMinute"))?,
-        second: read_int::<u16>(engine, checked_address(system_time_ptr, 12, "wSecond"))?,
+        year: read_u16(engine, checked_address(system_time_ptr, 0, "wYear"))?,
+        month: read_u16(engine, checked_address(system_time_ptr, 2, "wMonth"))?,
+        day_of_week: read_u16(engine, checked_address(system_time_ptr, 4, "wDayOfWeek"))?,
+        day: read_u16(engine, checked_address(system_time_ptr, 6, "wDay"))?,
+        hour: read_u16(engine, checked_address(system_time_ptr, 8, "wHour"))?,
+        minute: read_u16(engine, checked_address(system_time_ptr, 10, "wMinute"))?,
+        second: read_u16(engine, checked_address(system_time_ptr, 12, "wSecond"))?,
     })
 }
 

@@ -12,7 +12,7 @@ use super::{
 use crate::console::{
     CharInfo, Coord, RenderMode, ScreenBuffer, SmallRect, codepage, host_term, screen,
 };
-use crate::guest_memory::{read_bytes as read_guest_bytes, read_int};
+use crate::guest_memory::{read_bytes as read_guest_bytes, read_u16};
 
 /// `ERROR_INVALID_HANDLE`.
 const ERROR_INVALID_HANDLE: u32 = 6;
@@ -34,7 +34,7 @@ fn stack_arg(ctx: &mut HandlerContext<'_>, index: usize, api: &str) -> Result<u6
         .with_context(|| format!("{api} RSP"))?;
     let offset = 0x28_u64.saturating_add((u64::try_from(index).unwrap_or(0)).saturating_mul(8));
     let address = super::checked_address(rsp, offset, api);
-    super::read_int::<u64>(ctx.engine, address)
+    super::read_u64(ctx.engine, address)
 }
 
 /// Resolve an output handle to a screen-buffer handle.
@@ -182,9 +182,9 @@ pub fn handle_set_console_cursor_info(ctx: &mut HandlerContext<'_>) -> Result<Wi
     let Some(buffer_handle) = buffer_handle_for(ctx.state, handle) else {
         return ret_invalid_handle(ctx, "SetConsoleCursorInfo");
     };
-    let size = super::read_int::<u32>(ctx.engine, info_ptr)?;
+    let size = super::read_u32(ctx.engine, info_ptr)?;
     let visible_ptr = super::checked_address(info_ptr, 4, "SetConsoleCursorInfo bVisible");
-    let visible = super::read_int::<u32>(ctx.engine, visible_ptr)? != 0;
+    let visible = super::read_u32(ctx.engine, visible_ptr)? != 0;
     if let Some(buffer) = ctx.state.console().buffer_mut(buffer_handle) {
         buffer.cursor_size = size;
         buffer.cursor_visible = visible;
@@ -292,10 +292,10 @@ pub fn handle_fill_console_output_attribute(
 
 /// Read a `SMALL_RECT` from guest memory (four `SHORT`s, inclusive edges).
 fn read_small_rect(ctx: &mut HandlerContext<'_>, address: u64, api: &str) -> Result<SmallRect> {
-    let left = read_int::<u16>(ctx.engine, address)?;
-    let top = read_int::<u16>(ctx.engine, super::checked_address(address, 2, api))?;
-    let right = read_int::<u16>(ctx.engine, super::checked_address(address, 4, api))?;
-    let bottom = read_int::<u16>(ctx.engine, super::checked_address(address, 6, api))?;
+    let left = read_u16(ctx.engine, address)?;
+    let top = read_u16(ctx.engine, super::checked_address(address, 2, api))?;
+    let right = read_u16(ctx.engine, super::checked_address(address, 4, api))?;
+    let bottom = read_u16(ctx.engine, super::checked_address(address, 6, api))?;
     Ok(SmallRect {
         left: i16::from_ne_bytes(left.to_ne_bytes()),
         top: i16::from_ne_bytes(top.to_ne_bytes()),
@@ -782,8 +782,8 @@ fn scroll_console_screen_buffer(
     let fill = if fill_ptr == 0 {
         CharInfo::default()
     } else {
-        let raw_char = read_int::<u16>(ctx.engine, fill_ptr)?;
-        let attributes = read_int::<u16>(ctx.engine, super::checked_address(fill_ptr, 2, api))?;
+        let raw_char = read_u16(ctx.engine, fill_ptr)?;
+        let attributes = read_u16(ctx.engine, super::checked_address(fill_ptr, 2, api))?;
         CharInfo {
             unit: raw_char,
             attributes,

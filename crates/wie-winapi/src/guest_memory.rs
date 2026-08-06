@@ -2,34 +2,46 @@ use anyhow::{Context, Result};
 use wie_cpu::CpuEngine;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-/// Read a little-endian integer (`u8`, `u16`, `u32`, `u64`, or `i32`) from
-/// guest memory.
+/// Read exactly `N` raw bytes from guest memory.
 ///
-/// The width is fixed by the return type (`size_of::<T>()`), so the former
-/// five per-width readers collapse into this one generic. The error context
-/// names the concrete type, keeping the per-width "failed to read u32 from
-/// guest memory" messages.
-pub(crate) fn read_int<T>(engine: &mut dyn CpuEngine, address: u64) -> Result<T>
-where
-    T: FromBytes,
-{
-    // One fixed staging buffer covers every integer width this helper is
-    // instantiated with; the active range is sized at runtime, which
-    // sidesteps the const-generic array-length restriction on stable.
-    let mut bytes = [0_u8; 16];
-    let len = std::mem::size_of::<T>();
-    let buf = bytes
-        .get_mut(..len)
-        .ok_or_else(|| anyhow::anyhow!("read_int: width exceeds staging buffer"))?;
-    engine.mem_read(address, buf).with_context(|| {
-        format!(
-            "failed to read {} from guest memory",
-            std::any::type_name::<T>()
-        )
-    })?;
-    // `read_from_bytes` is alignment-agnostic and can only fail on a length
-    // mismatch, which the `size_of::<T>()` buffer makes impossible.
-    T::read_from_bytes(buf).map_err(|_| anyhow::anyhow!("read_int: internal size mismatch"))
+/// `N` sizes the stack buffer exactly — legal for a const generic parameter on
+/// stable, no `generic_const_exprs` — so a typed read never stages more stack
+/// than its width. The [`read_u8`]/[`read_u16`]/[`read_u32`]/[`read_u64`]/
+/// [`read_i32`] wrappers convert the byte array with `from_le_bytes`.
+pub(crate) fn read_uint_at<const N: usize>(
+    engine: &mut dyn CpuEngine,
+    address: u64,
+) -> Result<[u8; N]> {
+    let mut bytes = [0_u8; N];
+    engine
+        .mem_read(address, &mut bytes)
+        .with_context(|| format!("failed to read {N} bytes from guest memory"))?;
+    Ok(bytes)
+}
+
+/// Read a single guest byte.
+///
+/// Used only from `#[cfg(test)]` code (the gdi32 print-lane GetTextMetrics
+/// tests), so it is dead in the non-test lib target; kept for handler code.
+#[cfg_attr(not(test), expect(dead_code))]
+pub(crate) fn read_u8(engine: &mut dyn CpuEngine, address: u64) -> Result<u8> {
+    Ok(u8::from_le_bytes(read_uint_at::<1>(engine, address)?))
+}
+
+pub(crate) fn read_u16(engine: &mut dyn CpuEngine, address: u64) -> Result<u16> {
+    Ok(u16::from_le_bytes(read_uint_at::<2>(engine, address)?))
+}
+
+pub(crate) fn read_u32(engine: &mut dyn CpuEngine, address: u64) -> Result<u32> {
+    Ok(u32::from_le_bytes(read_uint_at::<4>(engine, address)?))
+}
+
+pub(crate) fn read_u64(engine: &mut dyn CpuEngine, address: u64) -> Result<u64> {
+    Ok(u64::from_le_bytes(read_uint_at::<8>(engine, address)?))
+}
+
+pub(crate) fn read_i32(engine: &mut dyn CpuEngine, address: u64) -> Result<i32> {
+    Ok(i32::from_le_bytes(read_uint_at::<4>(engine, address)?))
 }
 
 pub(crate) fn write_u32(

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 
 use crate::guest_layout::Rect;
-use crate::guest_memory::{checked_address, read_int, with_typed_read};
+use crate::guest_memory::{checked_address, read_i32, read_u64, with_typed_read};
 use crate::user32::WS_CLIPCHILDREN;
 use crate::{
     HandlerContext, WinApiHandlerResult, WinApiState, WindowRecord, gdi32::DcKind,
@@ -521,15 +521,15 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
         "BitBlt cx",
     )?;
     let rsp = engine.read_rsp().context("failed to read RSP for BitBlt")?;
-    let cy = read_int::<i32>(engine, checked_address(rsp, 0x28, "BitBlt cy"))
+    let cy = read_i32(engine, checked_address(rsp, 0x28, "BitBlt cy"))
         .context("failed to read BitBlt cy")?;
-    let hdc_src = read_int::<u64>(engine, checked_address(rsp, 0x30, "BitBlt hdcSrc"))
+    let hdc_src = read_u64(engine, checked_address(rsp, 0x30, "BitBlt hdcSrc"))
         .context("failed to read BitBlt hdcSrc")?;
-    let x1 = read_int::<i32>(engine, checked_address(rsp, 0x38, "BitBlt x1"))
+    let x1 = read_i32(engine, checked_address(rsp, 0x38, "BitBlt x1"))
         .context("failed to read BitBlt x1")?;
-    let y1 = read_int::<i32>(engine, checked_address(rsp, 0x40, "BitBlt y1"))
+    let y1 = read_i32(engine, checked_address(rsp, 0x40, "BitBlt y1"))
         .context("failed to read BitBlt y1")?;
-    let rop_raw = read_int::<i32>(engine, checked_address(rsp, 0x48, "BitBlt rop"))
+    let rop_raw = read_i32(engine, checked_address(rsp, 0x48, "BitBlt rop"))
         .context("failed to read BitBlt rop")?;
     // ROP is a DWORD; a negative value is an unsupported code either way.
     let rop = u32::try_from(rop_raw).unwrap_or(0);
@@ -779,9 +779,9 @@ pub fn handle_pat_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
         "PatBlt cx",
     )?;
     let rsp = engine.read_rsp().context("failed to read RSP for PatBlt")?;
-    let cy = read_int::<i32>(engine, checked_address(rsp, 0x28, "PatBlt cy"))
+    let cy = read_i32(engine, checked_address(rsp, 0x28, "PatBlt cy"))
         .context("failed to read PatBlt cy")?;
-    let _rop = read_int::<i32>(engine, checked_address(rsp, 0x30, "PatBlt rop"))
+    let _rop = read_i32(engine, checked_address(rsp, 0x30, "PatBlt rop"))
         .context("failed to read PatBlt rop")?;
 
     // A DC's default brush is WHITE_BRUSH, mirroring real GDI.

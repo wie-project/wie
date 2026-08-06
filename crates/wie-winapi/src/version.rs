@@ -236,7 +236,7 @@ fn read_version_block_from_guest(
     engine: &mut dyn wie_cpu::CpuEngine,
     block_ptr: u64,
 ) -> Result<Option<Vec<u8>>> {
-    let len = u64::from(kernel32::read_int::<u16>(engine, block_ptr)?);
+    let len = u64::from(kernel32::read_u16(engine, block_ptr)?);
     if len < 6 {
         return Ok(None);
     }
@@ -402,7 +402,7 @@ fn write_dir_out(
         // Nothing to report back.
         return Ok(0);
     }
-    let cap = usize::try_from(u64::from(kernel32::read_int::<u32>(engine, len_ptr)?))
+    let cap = usize::try_from(u64::from(kernel32::read_u32(engine, len_ptr)?))
         .context("directory capacity does not fit usize")?;
     let needed = dir.encode_utf16().count();
     let written = if buf_ptr == 0 {
@@ -911,11 +911,8 @@ pub fn handle_ver_install_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let cap = if tmp_file_len_ptr == 0 {
         0
     } else {
-        usize::try_from(u64::from(kernel32::read_int::<u32>(
-            engine,
-            tmp_file_len_ptr,
-        )?))
-        .context("VerInstallFileW temp length does not fit usize")?
+        usize::try_from(u64::from(kernel32::read_u32(engine, tmp_file_len_ptr)?))
+            .context("VerInstallFileW temp length does not fit usize")?
     };
     let needed = dest_file.encode_utf16().count();
     let written = if tmp_file_ptr == 0 {
@@ -970,11 +967,8 @@ pub fn handle_ver_install_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let cap = if tmp_file_len_ptr == 0 {
         0
     } else {
-        usize::try_from(u64::from(kernel32::read_int::<u32>(
-            engine,
-            tmp_file_len_ptr,
-        )?))
-        .context("VerInstallFileA temp length does not fit usize")?
+        usize::try_from(u64::from(kernel32::read_u32(engine, tmp_file_len_ptr)?))
+            .context("VerInstallFileA temp length does not fit usize")?
     };
     let needed = crate::guest_string::encode_cp1252(&dest_file).len();
     let written = if tmp_file_ptr == 0 {

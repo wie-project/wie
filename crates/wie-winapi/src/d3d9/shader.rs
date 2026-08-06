@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use super::{D3D_OK, D3DERR_INVALIDCALL, allocate_direct3d_block};
 use crate::d3d9_shader::{ShaderKind, ShaderRecord, parse_shader};
 use crate::fake_va::{D3d9Iface, PixelShader9Method};
-use crate::guest_memory::{read_int, write_u64 as write_guest_u64};
+use crate::guest_memory::{read_u32, write_u64 as write_guest_u64};
 use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 
 use super::texture::fill_com_vtable;
@@ -36,7 +36,7 @@ fn read_shader_bytecode(
     const MAX_TOKENS: usize = crate::d3d9_shader::MAX_SHADER_TOKENS;
     let mut tokens = Vec::new();
     // Version token.
-    let version = read_int::<u32>(engine, bytecode_ptr).context("failed to read shader version")?;
+    let version = read_u32(engine, bytecode_ptr).context("failed to read shader version")?;
     tokens.push(version);
     let mut offset: u64 = 4;
     let _ = crate::d3d9_shader::decode_shader_version(version)
@@ -46,8 +46,8 @@ fn read_shader_bytecode(
             anyhow::bail!("shader exceeds {MAX_TOKENS} tokens");
         }
         let address = bytecode_ptr.wrapping_add(offset);
-        let token = read_int::<u32>(engine, address)
-            .context("failed to read shader token from guest memory")?;
+        let token =
+            read_u32(engine, address).context("failed to read shader token from guest memory")?;
         offset = offset.wrapping_add(4);
         tokens.push(token);
         let opcode = token & crate::d3d9_shader::OPCODE_FIELD_MASK;
@@ -65,7 +65,7 @@ fn read_shader_bytecode(
                     anyhow::bail!("shader exceeds {MAX_TOKENS} tokens");
                 }
                 let comment_address = bytecode_ptr.wrapping_add(offset);
-                let comment_token = read_int::<u32>(engine, comment_address)
+                let comment_token = read_u32(engine, comment_address)
                     .context("failed to read shader comment payload")?;
                 offset = offset.wrapping_add(4);
                 tokens.push(comment_token);
@@ -86,8 +86,8 @@ fn read_shader_bytecode(
                 anyhow::bail!("shader exceeds {MAX_TOKENS} tokens");
             }
             let operand_address = bytecode_ptr.wrapping_add(offset);
-            let operand_token = read_int::<u32>(engine, operand_address)
-                .context("failed to read shader operand token")?;
+            let operand_token =
+                read_u32(engine, operand_address).context("failed to read shader operand token")?;
             offset = offset.wrapping_add(4);
             tokens.push(operand_token);
         }

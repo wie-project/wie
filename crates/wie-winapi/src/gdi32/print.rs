@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 use crate::guest_layout::DocInfoW;
-use crate::guest_memory::{checked_address, read_int, with_typed_read};
+use crate::guest_memory::{checked_address, read_i32, with_typed_read};
 use crate::guest_string::read_utf16_lossy as read_guest_utf16_lossy;
 use crate::handles::{Hbrush, Hdc, Hpen};
 use crate::user32::low_i32;
@@ -371,7 +371,7 @@ pub fn handle_rectangle(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
     let rsp = engine
         .read_rsp()
         .context("failed to read RSP for Rectangle")?;
-    let bottom = read_int::<i32>(engine, checked_address(rsp, 0x28, "Rectangle bottom"))
+    let bottom = read_i32(engine, checked_address(rsp, 0x28, "Rectangle bottom"))
         .context("failed to read Rectangle bottom")?;
 
     let dc_handle = Hdc::from(hdc);
@@ -579,7 +579,7 @@ mod tests {
     };
     use crate::gdi32::{handle_get_device_caps, handle_get_stock_object, handle_rectangle};
     use crate::guest_heap::GuestHeap;
-    use crate::guest_memory::{read_int, write_i32, write_u64};
+    use crate::guest_memory::{read_i32, read_u8, write_i32, write_u64};
     use crate::handles::{Hbrush, Hdc, Hpen};
     use crate::state::{
         DEFAULT_ENVIRONMENT, DllStateMap, HeapState, KernelState, ModuleState, ProcessState,
@@ -1491,16 +1491,16 @@ mod tests {
             ),
             1
         );
-        let tm_height = read_int::<i32>(&mut engine, 0x4000).expect("tmHeight");
-        let tm_weight = read_int::<i32>(&mut engine, 0x401C).expect("tmWeight");
-        let tm_italic = read_int::<u8>(&mut engine, 0x4034).expect("tmItalic");
+        let tm_height = read_i32(&mut engine, 0x4000).expect("tmHeight");
+        let tm_weight = read_i32(&mut engine, 0x401C).expect("tmWeight");
+        let tm_italic = read_u8(&mut engine, 0x4034).expect("tmItalic");
         // W layout puts tmItalic at offset 52 and the char fields before it as
         // WCHARs (the A path would put tmItalic at 48).
         assert!(tm_height > 0, "resolved font height is positive");
         assert_eq!(tm_weight, 400, "regular weight default");
         assert_eq!(tm_italic, 0);
         assert_eq!(
-            read_int::<u8>(&mut engine, 0x4037).expect("tmPitchAndFamily"),
+            read_u8(&mut engine, 0x4037).expect("tmPitchAndFamily"),
             0x01
         );
     }
@@ -1527,10 +1527,10 @@ mod tests {
             ),
             1
         );
-        assert_eq!(read_int::<i32>(&mut engine, 0x2000).expect("left"), 0);
-        assert_eq!(read_int::<i32>(&mut engine, 0x2004).expect("top"), 5);
-        assert_eq!(read_int::<i32>(&mut engine, 0x2008).expect("right"), 110);
-        assert_eq!(read_int::<i32>(&mut engine, 0x200C).expect("bottom"), 55);
+        assert_eq!(read_i32(&mut engine, 0x2000).expect("left"), 0);
+        assert_eq!(read_i32(&mut engine, 0x2004).expect("top"), 5);
+        assert_eq!(read_i32(&mut engine, 0x2008).expect("right"), 110);
+        assert_eq!(read_i32(&mut engine, 0x200C).expect("bottom"), 55);
 
         // Deflate by (-10, -5) → back to the original.
         write_regs(&mut engine, 0x2000, -10_i64 as u64, -5_i64 as u64, 0);
@@ -1538,10 +1538,10 @@ mod tests {
             &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
             handle_inflate_rect,
         );
-        assert_eq!(read_int::<i32>(&mut engine, 0x2000).expect("left"), 10);
-        assert_eq!(read_int::<i32>(&mut engine, 0x2004).expect("top"), 10);
-        assert_eq!(read_int::<i32>(&mut engine, 0x2008).expect("right"), 100);
-        assert_eq!(read_int::<i32>(&mut engine, 0x200C).expect("bottom"), 50);
+        assert_eq!(read_i32(&mut engine, 0x2000).expect("left"), 10);
+        assert_eq!(read_i32(&mut engine, 0x2004).expect("top"), 10);
+        assert_eq!(read_i32(&mut engine, 0x2008).expect("right"), 100);
+        assert_eq!(read_i32(&mut engine, 0x200C).expect("bottom"), 50);
 
         // NULL rect → FALSE.
         write_regs(&mut engine, 0, 10, 5, 0);

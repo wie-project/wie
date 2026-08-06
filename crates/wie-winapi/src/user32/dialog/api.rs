@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 
 use crate::user32::{
     HandlerContext, WinApiHandlerResult, WinApiState, WindowRecord, find_window_mut,
-    message::handle_send_message, read_guest_ansi_lossy, read_guest_utf16_lossy, read_int,
+    message::handle_send_message, read_guest_ansi_lossy, read_guest_utf16_lossy, read_u64,
     write_guest_ansi_c_string, write_guest_u32, write_guest_utf16_c_string,
 };
 
@@ -342,7 +342,7 @@ pub fn handle_send_dlg_item_message_w(ctx: &mut HandlerContext<'_>) -> Result<Wi
     let rsp = engine
         .read_rsp()
         .context("failed to read RSP for SendDlgItemMessageW")?;
-    let long_parameter = read_int::<u64>(engine, rsp.wrapping_add(0x28))
+    let long_parameter = read_u64(engine, rsp.wrapping_add(0x28))
         .context("failed to read 5th arg for SendDlgItemMessageW")?;
     let id = u16::try_from(id_raw & u64::from(u32::MAX)).unwrap_or(0);
 

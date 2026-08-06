@@ -1,7 +1,7 @@
 use super::{
     Context, ERROR_FILE_NOT_FOUND, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER,
     ERROR_TOO_MANY_POSTS, EnterCsResult, HandlerContext, Result, WinApiHandlerResult, WinApiState,
-    checked_address, i32_to_rax, i64_to_rax, low_u32, read_int, ret_u64, trunc_i32,
+    checked_address, i32_to_rax, i64_to_rax, low_u32, read_u64, ret_u64, trunc_i32,
     write_guest_u32, write_guest_u64,
 };
 
@@ -137,7 +137,7 @@ pub(crate) fn try_enter_critical_section_guest(
     let recursion_va = checked_address(cs, 12, "RecursionCount");
     let owner_va = checked_address(cs, 16, "OwningThread");
 
-    let owning = read_int::<u64>(engine, owner_va).unwrap_or(0);
+    let owning = read_u64(engine, owner_va).unwrap_or(0);
     let me = u64::from(owner_tid);
 
     // Unlocked or recursive re-enter by owner.
@@ -172,7 +172,7 @@ pub(crate) fn leave_critical_section_guest(
     let recursion_va = checked_address(cs, 12, "RecursionCount");
     let owner_va = checked_address(cs, 16, "OwningThread");
 
-    let owning = read_int::<u64>(engine, owner_va).unwrap_or(0);
+    let owning = read_u64(engine, owner_va).unwrap_or(0);
     let me = u64::from(owner_tid);
     if owning != me {
         // Windows: leaving a CS you do not own is undefined; ignore.
@@ -309,7 +309,7 @@ pub fn handle_wait_for_multiple_objects(
     let mut handles = Vec::with_capacity(count_usize);
     for i in 0..count {
         let ha = handles_ptr.wrapping_add(u64::from(i).wrapping_mul(8));
-        handles.push(read_int::<u64>(engine, ha)?);
+        handles.push(read_u64(engine, ha)?);
     }
 
     // Fast path: already satisfied (no host park).

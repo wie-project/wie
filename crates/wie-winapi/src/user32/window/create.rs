@@ -7,7 +7,7 @@ use crate::guest_layout::CreateStruct;
 use crate::user32::{
     Context, CreateWindowRequest, GuestCallbackRequest, HandlerContext, Result, WM_CREATE,
     WinApiControlSignal, WinApiHandlerResult, create_window_record, read_guest_ansi_lossy,
-    read_guest_utf16_lossy, read_int, read_window_class_identifier_a,
+    read_guest_utf16_lossy, read_i32, read_u64, read_window_class_identifier_a,
     read_window_class_identifier_w, with_typed_write,
 };
 
@@ -40,14 +40,14 @@ pub fn handle_create_window_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
             .with_context(|| format!("CreateWindowExA: {name} address overflow"))
     };
 
-    let x_raw = read_int::<i32>(engine, stack_arg(0x28, "X")?)?;
-    let y_raw = read_int::<i32>(engine, stack_arg(0x30, "Y")?)?;
-    let width_raw = read_int::<i32>(engine, stack_arg(0x38, "nWidth")?)?;
-    let height_raw = read_int::<i32>(engine, stack_arg(0x40, "nHeight")?)?;
-    let parent_handle = read_int::<u64>(engine, stack_arg(0x48, "hWndParent")?)?;
-    let menu_handle = read_int::<u64>(engine, stack_arg(0x50, "hMenu")?)?;
-    let instance_handle = read_int::<u64>(engine, stack_arg(0x58, "hInstance")?)?;
-    let create_params = read_int::<u64>(engine, stack_arg(0x60, "lpParam")?)?;
+    let x_raw = read_i32(engine, stack_arg(0x28, "X")?)?;
+    let y_raw = read_i32(engine, stack_arg(0x30, "Y")?)?;
+    let width_raw = read_i32(engine, stack_arg(0x38, "nWidth")?)?;
+    let height_raw = read_i32(engine, stack_arg(0x40, "nHeight")?)?;
+    let parent_handle = read_u64(engine, stack_arg(0x48, "hWndParent")?)?;
+    let menu_handle = read_u64(engine, stack_arg(0x50, "hMenu")?)?;
+    let instance_handle = read_u64(engine, stack_arg(0x58, "hInstance")?)?;
+    let create_params = read_u64(engine, stack_arg(0x60, "lpParam")?)?;
 
     // Read window title if present
     let title = if window_title == 0 {
@@ -223,14 +223,14 @@ pub fn handle_create_window_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
             .with_context(|| format!("CreateWindowExW: {name} address overflow"))
     };
 
-    let x_raw = read_int::<i32>(engine, stack_arg(0x28, "X")?)?;
-    let y_raw = read_int::<i32>(engine, stack_arg(0x30, "Y")?)?;
-    let width_raw = read_int::<i32>(engine, stack_arg(0x38, "nWidth")?)?;
-    let height_raw = read_int::<i32>(engine, stack_arg(0x40, "nHeight")?)?;
-    let parent_handle = read_int::<u64>(engine, stack_arg(0x48, "hWndParent")?)?;
-    let menu_handle = read_int::<u64>(engine, stack_arg(0x50, "hMenu")?)?;
-    let instance_handle = read_int::<u64>(engine, stack_arg(0x58, "hInstance")?)?;
-    let create_params = read_int::<u64>(engine, stack_arg(0x60, "lpParam")?)?;
+    let x_raw = read_i32(engine, stack_arg(0x28, "X")?)?;
+    let y_raw = read_i32(engine, stack_arg(0x30, "Y")?)?;
+    let width_raw = read_i32(engine, stack_arg(0x38, "nWidth")?)?;
+    let height_raw = read_i32(engine, stack_arg(0x40, "nHeight")?)?;
+    let parent_handle = read_u64(engine, stack_arg(0x48, "hWndParent")?)?;
+    let menu_handle = read_u64(engine, stack_arg(0x50, "hMenu")?)?;
+    let instance_handle = read_u64(engine, stack_arg(0x58, "hInstance")?)?;
+    let create_params = read_u64(engine, stack_arg(0x60, "lpParam")?)?;
 
     // Read window title if present (UTF-16 for the W variant)
     let title = if window_title == 0 {

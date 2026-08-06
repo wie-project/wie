@@ -3,8 +3,8 @@
 //! by concern; this file re-exports the shared guest-memory/string helpers.
 
 pub(crate) use crate::guest_memory::{
-    checked_address, read_int, write_u16 as write_guest_u16, write_u32 as write_guest_u32,
-    write_u64 as write_guest_u64,
+    checked_address, read_u16, read_u32, read_u64, write_u16 as write_guest_u16,
+    write_u32 as write_guest_u32, write_u64 as write_guest_u64,
 };
 pub(crate) use crate::guest_string::{
     read_ansi_lossy as read_guest_ansi_lossy, read_utf16_lossy as read_guest_utf16_lossy,

@@ -3,7 +3,9 @@
 use super::{resolve_dialog_owner, state_comm_dlg_none};
 use crate::comdlg32::find::create_find_control;
 use crate::guest_layout::{ChooseFontW, LogFontW};
-use crate::guest_memory::{checked_address, read_int, with_typed_read, with_typed_write};
+use crate::guest_memory::{
+    checked_address, read_i32, read_u32, read_u64, with_typed_read, with_typed_write,
+};
 use crate::guest_string::read_utf16_lossy;
 use crate::handles::Hwnd;
 use crate::state::FontDialogSession;
@@ -187,22 +189,22 @@ fn open_host_font_dialog(ctx: &mut HandlerContext<'_>, cf_ptr: u64) -> Result<Wi
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
 
-    let log_font_ptr = read_int::<u64>(
+    let log_font_ptr = read_u64(
         engine,
         checked_address(cf_ptr, CF_LP_LOG_FONT, "CHOOSEFONTW.lpLogFont"),
     )
     .context("failed to read lpLogFont for ChooseFontW")?;
-    let initial_point_tenths = read_int::<u32>(
+    let initial_point_tenths = read_u32(
         engine,
         checked_address(cf_ptr, CF_IPOINT_SIZE, "CHOOSEFONTW.iPointSize"),
     )
     .context("failed to read iPointSize for ChooseFontW")?;
-    let flags = read_int::<u32>(
+    let flags = read_u32(
         engine,
         checked_address(cf_ptr, CF_FLAGS, "CHOOSEFONTW.Flags"),
     )
     .context("failed to read Flags for ChooseFontW")?;
-    let rgb_colors = read_int::<u32>(
+    let rgb_colors = read_u32(
         engine,
         checked_address(cf_ptr, CF_RGB_COLORS, "CHOOSEFONTW.rgbColors"),
     )
@@ -238,12 +240,12 @@ fn open_host_font_dialog(ctx: &mut HandlerContext<'_>, cf_ptr: u64) -> Result<Wi
         32,
     )
     .context("failed to read ChooseFontW lfFaceName")?;
-    let lf_height = read_int::<i32>(
+    let lf_height = read_i32(
         engine,
         checked_address(log_font_ptr, LF_HEIGHT, "LOGFONTW.lfHeight"),
     )
     .context("failed to read ChooseFontW lfHeight")?;
-    let effects_word = read_int::<u32>(
+    let effects_word = read_u32(
         engine,
         checked_address(
             log_font_ptr,
@@ -280,7 +282,7 @@ fn open_host_font_dialog(ctx: &mut HandlerContext<'_>, cf_ptr: u64) -> Result<Wi
         .unwrap_or(10)
         .saturating_mul(10);
 
-    let owner_raw = read_int::<u64>(
+    let owner_raw = read_u64(
         engine,
         checked_address(cf_ptr, CF_HWND_OWNER, "CHOOSEFONTW.hwndOwner"),
     )

@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use crate::gdi32::{FontEngine, FontKey, ResolvedFont, fontdb_weight_for, height_px_from_lf};
 use crate::guest_layout::{BitmapInfoHeader, LogFontA, LogFontW};
 use crate::guest_memory::{
-    checked_address, read_int, with_typed_read, write_u64 as write_guest_u64,
+    checked_address, read_u32, read_u64, with_typed_read, write_u64 as write_guest_u64,
 };
 use crate::guest_string::{
     decode_ansi_lossy, decode_utf16_lossy, read_ansi_lossy as read_guest_ansi_lossy,
@@ -280,17 +280,17 @@ fn handle_create_font_impl(
         .read_rsp()
         .with_context(|| format!("failed to read RSP for {api_name}"))?;
     // Stack args are 8-byte slots; arg 5 (`cWeight`) lives at [rsp+0x28].
-    let weight_raw = read_int::<u32>(engine, checked_address(rsp, 0x28, "cWeight"))
+    let weight_raw = read_u32(engine, checked_address(rsp, 0x28, "cWeight"))
         .with_context(|| format!("failed to read {api_name} cWeight"))?;
-    let italic_raw = read_int::<u32>(engine, checked_address(rsp, 0x30, "bItalic"))
+    let italic_raw = read_u32(engine, checked_address(rsp, 0x30, "bItalic"))
         .with_context(|| format!("failed to read {api_name} bItalic"))?;
     // arg 9 (`iCharSet`) at [rsp+0x48].
-    let charset_raw = read_int::<u32>(engine, checked_address(rsp, 0x48, "iCharSet"))
+    let charset_raw = read_u32(engine, checked_address(rsp, 0x48, "iCharSet"))
         .with_context(|| format!("failed to read {api_name} iCharSet"))?;
     // arg 13 (`iPitchAndFamily`) at [rsp+0x68]; low byte is the pitch hint.
-    let pitch_and_family = read_int::<u32>(engine, checked_address(rsp, 0x68, "iPitchAndFamily"))
+    let pitch_and_family = read_u32(engine, checked_address(rsp, 0x68, "iPitchAndFamily"))
         .with_context(|| format!("failed to read {api_name} iPitchAndFamily"))?;
-    let face_name_ptr = read_int::<u64>(engine, checked_address(rsp, 0x70, "pszFaceName"))
+    let face_name_ptr = read_u64(engine, checked_address(rsp, 0x70, "pszFaceName"))
         .with_context(|| format!("failed to read {api_name} pszFaceName"))?;
 
     let face_name = if wide {

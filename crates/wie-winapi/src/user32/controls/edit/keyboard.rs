@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 
-use crate::guest_memory::read_int;
+use crate::guest_memory::read_u16;
 use crate::user32::controls::{ControlState, ES_MULTILINE, control_state};
 use crate::user32::{
     VK_CONTROL, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SHIFT, VK_UP,
@@ -500,7 +500,7 @@ pub(super) fn edit_get_line(
     }) else {
         return Ok(0);
     };
-    let capacity = usize::from(read_int::<u16>(engine, buffer)?);
+    let capacity = usize::from(read_u16(engine, buffer)?);
     let copied = if unicode {
         write_guest_utf16_c_string(engine, buffer, capacity, line_text)?
     } else {
