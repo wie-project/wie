@@ -214,7 +214,7 @@ fn write_heap_alloc_impl(
     // ensure header size
     c.extend_from_slice(&[0x48, 0x89, 0x5f, 0xf8]); // mov [rdi-8], rbx
     let jmp_ret = c.len();
-    c.extend_from_slice(&[0xe9, 0, 0, 0, 0]); // jmp ret_ptr
+    c.extend_from_slice(&[0xe9, 0, 0, 0, 0]); // jmp ret_pos
 
     // bump path
     let bump_pos = c.len();
@@ -240,7 +240,7 @@ fn write_heap_alloc_impl(
     c.extend_from_slice(&[0x48, 0x89, 0x5f, 0xf8]); // mov [rdi-8], rbx
 
     // Skip HEAP_ZERO_MEMORY: host path ignores zeroing too; Unicorn rep-stos is costly.
-    let ret_ptr = c.len();
+    let ret_pos = c.len();
     c.extend_from_slice(&[0x48, 0x89, 0xf8]); // mov rax, rdi
     c.extend_from_slice(&[0x5f, 0x5e, 0x5d, 0x5b, 0xc3]); // pop; ret
 
@@ -263,7 +263,7 @@ fn write_heap_alloc_impl(
     patch_rel32(&mut c, jz_bump + 2, jz_bump + 6, bump_pos);
     patch_rel32(&mut c, jb_bad_head + 2, jb_bad_head + 6, bump_pos);
     patch_rel32(&mut c, jae_bad_head + 2, jae_bad_head + 6, bump_pos);
-    patch_rel32(&mut c, jmp_ret + 1, jmp_ret + 5, ret_ptr);
+    patch_rel32(&mut c, jmp_ret + 1, jmp_ret + 5, ret_pos);
     patch_rel32(&mut c, ja_oom + 2, ja_oom + 6, fallback);
 
     engine

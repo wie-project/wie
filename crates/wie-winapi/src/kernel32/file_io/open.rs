@@ -52,7 +52,7 @@ pub(crate) fn open_or_create_guest_path(
     let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full_path = resolve_full_windows_path(&cwd, guest_path);
 
-    let bottle_host =
+    let bottle_dir =
         crate::vfs::guest_path_to_host(&state.file_io.volumes, &full_path).map(|m| m.host);
 
     // The dialog-accept chain hands the guest a `Z:\pick{N}\{name}` path; log
@@ -67,7 +67,7 @@ pub(crate) fn open_or_create_guest_path(
     if is_pick_mount {
         tracing::info!(
             guest_path = %full_path,
-            mount_resolved_to = ?bottle_host,
+            mount_resolved_to = ?bottle_dir,
             "CreateFile on a pick-mount path"
         );
     }
@@ -79,14 +79,14 @@ pub(crate) fn open_or_create_guest_path(
             if existed {
                 return Err(ERROR_FILE_EXISTS);
             }
-            let handle = create_new_guest_file(state, &full_path, bottle_host.as_ref())?;
+            let handle = create_new_guest_file(state, &full_path, bottle_dir.as_ref())?;
             Ok(OpenFileOutcome::HandleCreated(handle))
         }
         CREATE_ALWAYS => {
             let handle = if existed {
-                open_existing_guest_file(state, &full_path, bottle_host.as_ref(), true)?
+                open_existing_guest_file(state, &full_path, bottle_dir.as_ref(), true)?
             } else {
-                create_new_guest_file(state, &full_path, bottle_host.as_ref())?
+                create_new_guest_file(state, &full_path, bottle_dir.as_ref())?
             };
             Ok(if existed {
                 OpenFileOutcome::HandleExists(handle)
@@ -98,16 +98,16 @@ pub(crate) fn open_or_create_guest_path(
             if !existed {
                 return Err(ERROR_FILE_NOT_FOUND);
             }
-            let handle = open_existing_guest_file(state, &full_path, bottle_host.as_ref(), false)?;
+            let handle = open_existing_guest_file(state, &full_path, bottle_dir.as_ref(), false)?;
             Ok(OpenFileOutcome::Handle(handle))
         }
         OPEN_ALWAYS => {
             if existed {
                 let handle =
-                    open_existing_guest_file(state, &full_path, bottle_host.as_ref(), false)?;
+                    open_existing_guest_file(state, &full_path, bottle_dir.as_ref(), false)?;
                 Ok(OpenFileOutcome::HandleExists(handle))
             } else {
-                let handle = create_new_guest_file(state, &full_path, bottle_host.as_ref())?;
+                let handle = create_new_guest_file(state, &full_path, bottle_dir.as_ref())?;
                 Ok(OpenFileOutcome::HandleCreated(handle))
             }
         }
@@ -115,7 +115,7 @@ pub(crate) fn open_or_create_guest_path(
             if !existed {
                 return Err(ERROR_FILE_NOT_FOUND);
             }
-            let handle = open_existing_guest_file(state, &full_path, bottle_host.as_ref(), true)?;
+            let handle = open_existing_guest_file(state, &full_path, bottle_dir.as_ref(), true)?;
             Ok(OpenFileOutcome::Handle(handle))
         }
         _ => {
@@ -127,10 +127,10 @@ pub(crate) fn open_or_create_guest_path(
 pub(crate) fn open_existing_guest_file(
     state: &mut WinApiState,
     guest_path: &str,
-    bottle_host: Option<&std::path::PathBuf>,
+    bottle_dir: Option<&std::path::PathBuf>,
     truncate: bool,
 ) -> std::result::Result<u64, u32> {
-    let host_path = bottle_host.cloned().or_else(|| {
+    let host_path = bottle_dir.cloned().or_else(|| {
         state
             .file_io
             .host_file_mounts
@@ -163,9 +163,9 @@ pub(crate) fn open_existing_guest_file(
 pub(crate) fn create_new_guest_file(
     state: &mut WinApiState,
     guest_path: &str,
-    bottle_host: Option<&std::path::PathBuf>,
+    bottle_dir: Option<&std::path::PathBuf>,
 ) -> std::result::Result<u64, u32> {
-    if let Some(host) = bottle_host {
+    if let Some(host) = bottle_dir {
         if let Some(parent) = host.parent() {
             std::fs::create_dir_all(parent).map_err(|_| ERROR_PATH_NOT_FOUND)?;
         }
