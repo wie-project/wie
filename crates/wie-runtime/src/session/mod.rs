@@ -281,21 +281,12 @@ impl RuntimeSession {
     ) -> Result<()> {
         let queue_arc = self.process.message_queue_arc();
         let mut queue = queue_arc.lock().unwrap_or_else(|e| e.into_inner());
-        let time = queue.next_message_time;
-        queue.next_message_time = queue
-            .next_message_time
-            .checked_add(1)
-            .context("runtime message timestamp overflow")?;
-        queue.messages.push(wie_winapi::QueuedWindowMessage {
-            window_handle: wie_winapi::handles::Hwnd::from(window_handle.0),
+        queue.push(
+            wie_winapi::handles::Hwnd::from(window_handle.0),
             message,
             word_parameter,
             long_parameter,
-            time,
-            point_x: 0,
-            point_y: 0,
-        });
-        Ok(())
+        )
     }
 
     /// Returns the first window backed by a guest WndProc.

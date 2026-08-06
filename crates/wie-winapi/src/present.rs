@@ -4,6 +4,7 @@
 //! CreateDIBSection → SelectObject → BitBlt actually renders pixels.
 
 use ahash::HashMapExt;
+use anyhow::Context;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
@@ -87,6 +88,37 @@ impl Default for MessageQueue {
             signal: Arc::new(MessageSignal::new()),
             dialog_depth: 0,
         }
+    }
+}
+
+impl MessageQueue {
+    /// Push one message with a fresh timestamp and a zero cursor point.
+    ///
+    /// Bumps `next_message_time` (overflow is an error) and appends the
+    /// `PostMessage`-style payload: word/long parameters as given, point
+    /// `(0, 0)`. The single overflow message covers every posting site.
+    pub fn push(
+        &mut self,
+        window_handle: crate::handles::Hwnd,
+        message: u32,
+        word_parameter: u64,
+        long_parameter: u64,
+    ) -> anyhow::Result<()> {
+        let time = self.next_message_time;
+        self.next_message_time = self
+            .next_message_time
+            .checked_add(1)
+            .context("message timestamp overflow")?;
+        self.messages.push(crate::QueuedWindowMessage {
+            window_handle,
+            message,
+            word_parameter,
+            long_parameter,
+            time,
+            point_x: 0,
+            point_y: 0,
+        });
+        Ok(())
     }
 }
 

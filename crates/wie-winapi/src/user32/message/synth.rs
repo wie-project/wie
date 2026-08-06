@@ -10,7 +10,7 @@ use crate::state::WindowFlags;
 use crate::user32::misc::timer_deadline;
 use crate::user32::window::sys_color;
 use crate::user32::{
-    Context, FAKE_SYSTEM_COLOR_BRUSH_BASE, QueuedWindowMessage, Result, WM_CHAR, WM_CONTEXTMENU,
+    FAKE_SYSTEM_COLOR_BRUSH_BASE, QueuedWindowMessage, Result, WM_CHAR, WM_CONTEXTMENU,
     WM_DEADCHAR, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_PAINT, WM_QUIT, WM_SYSCHAR,
     WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WS_CLIPCHILDREN, WinApiState,
     find_window, find_window_mut, is_known_window,
@@ -225,20 +225,7 @@ fn synthesize_wm_timer(
             hwnd = window_handle.as_u64(),
             "WM_TIMER fired"
         );
-        let time = queue.next_message_time;
-        queue.next_message_time = queue
-            .next_message_time
-            .checked_add(1)
-            .context("WM_TIMER synthesis timestamp overflow")?;
-        queue.messages.push(QueuedWindowMessage {
-            window_handle,
-            message: WM_TIMER,
-            word_parameter: timer_id,
-            long_parameter: 0,
-            time,
-            point_x: 0,
-            point_y: 0,
-        });
+        queue.push(window_handle, WM_TIMER, timer_id, 0)?;
     }
     Ok(true)
 }
@@ -308,27 +295,10 @@ fn synthesize_wm_paint(
     }
 
     let mut queue = state.lock_message_queue();
-    let mut push = |message: u32| -> Result<()> {
-        let time = queue.next_message_time;
-        queue.next_message_time = queue
-            .next_message_time
-            .checked_add(1)
-            .context("WM_PAINT synthesis timestamp overflow")?;
-        queue.messages.push(QueuedWindowMessage {
-            window_handle: hwnd,
-            message,
-            word_parameter: 0,
-            long_parameter: 0,
-            time,
-            point_x: 0,
-            point_y: 0,
-        });
-        Ok(())
-    };
     if erase_background {
-        push(WM_ERASEBKGND)?;
+        queue.push(hwnd, WM_ERASEBKGND, 0, 0)?;
     }
-    push(WM_PAINT)?;
+    queue.push(hwnd, WM_PAINT, 0, 0)?;
     Ok(true)
 }
 

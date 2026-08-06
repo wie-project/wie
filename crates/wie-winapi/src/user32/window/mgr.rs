@@ -5,10 +5,9 @@ use super::class::{find_window, find_window_mut};
 use crate::OuterReturn;
 use crate::state::WindowFlags;
 use crate::user32::{
-    Context, FAKE_WINDOW_HANDLE, GWLP_WNDPROC_RAW, GuestCallbackRequest, HandlerContext,
-    QueuedWindowMessage, Result, WM_DESTROY, WM_KILLFOCUS, WM_PAINT, WM_SETFOCUS,
-    WinApiControlSignal, WinApiHandlerResult, WinApiState, dispatch_control_proc,
-    get_window_long_ptr_value, is_known_window,
+    Context, FAKE_WINDOW_HANDLE, GWLP_WNDPROC_RAW, GuestCallbackRequest, HandlerContext, Result,
+    WM_DESTROY, WM_KILLFOCUS, WM_PAINT, WM_SETFOCUS, WinApiControlSignal, WinApiHandlerResult,
+    WinApiState, dispatch_control_proc, get_window_long_ptr_value, is_known_window,
 };
 
 /// Handles `USER32.dll!IsWindow`.
@@ -327,6 +326,28 @@ pub fn handle_set_focus(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
     })
 }
 
+/// Bridge one guest callback, or post it when the bridge is already taken.
+///
+/// The bridge is one-shot per API stop: the first callback returns as
+/// `GuestCallbackRequested`; a later one is posted so it arrives after the
+/// bridged message (queue order).
+fn bridge_or_post(
+    state: &mut WinApiState,
+    bridged: &mut Option<WinApiControlSignal>,
+    request: GuestCallbackRequest,
+) -> Result<()> {
+    if bridged.is_none() {
+        *bridged = Some(WinApiControlSignal::GuestCallbackRequested { request });
+        return Ok(());
+    }
+    state.lock_message_queue().push(
+        crate::handles::Hwnd::from(request.window_handle),
+        request.message,
+        request.word_parameter,
+        request.long_parameter,
+    )
+}
+
 /// Deliver the focus-change message pair (`WM_KILLFOCUS` to `old_focus`, then
 /// `WM_SETFOCUS` to `new_focus`) when the focus actually moved.
 ///
@@ -395,26 +416,7 @@ pub(crate) fn deliver_focus_change(
                 unicode,
                 outer_return,
             };
-            if bridged.is_none() {
-                bridged = Some(WinApiControlSignal::GuestCallbackRequested { request });
-            } else {
-                // The bridge is one-shot: post the second message so it
-                // arrives after the bridged one (queue order).
-                let mut queue = state.lock_message_queue();
-                let time = queue.next_message_time;
-                queue.next_message_time = time
-                    .checked_add(1)
-                    .context("focus-change message timestamp overflow")?;
-                queue.messages.push(QueuedWindowMessage {
-                    window_handle: crate::handles::Hwnd::from(hwnd),
-                    message,
-                    word_parameter: wparam,
-                    long_parameter: 0,
-                    time,
-                    point_x: 0,
-                    point_y: 0,
-                });
-            }
+            bridge_or_post(state, &mut bridged, request)?;
             continue;
         }
         if window_proc == 0 && dialog_proc == 0 {
@@ -439,26 +441,7 @@ pub(crate) fn deliver_focus_change(
             unicode: callback_unicode,
             outer_return,
         };
-        if bridged.is_none() {
-            bridged = Some(WinApiControlSignal::GuestCallbackRequested { request });
-        } else {
-            // The bridge is one-shot: post the second message so it arrives
-            // after the bridged one (queue order).
-            let mut queue = state.lock_message_queue();
-            let time = queue.next_message_time;
-            queue.next_message_time = time
-                .checked_add(1)
-                .context("focus-change message timestamp overflow")?;
-            queue.messages.push(QueuedWindowMessage {
-                window_handle: crate::handles::Hwnd::from(hwnd),
-                message,
-                word_parameter: wparam,
-                long_parameter: 0,
-                time,
-                point_x: 0,
-                point_y: 0,
-            });
-        }
+        bridge_or_post(state, &mut bridged, request)?;
     }
     Ok(bridged)
 }
