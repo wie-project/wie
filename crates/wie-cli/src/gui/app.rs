@@ -1652,9 +1652,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        guest_size_from_physical, map_alert_result, map_message_box_buttons,
-        resolve_gui_run_source, retry_delay, window_attributes, OCCLUDED_RETRY_MAX,
-        OCCLUDED_RETRY_MS, PARKED_RETRY_MS,
+        OCCLUDED_RETRY_MAX, OCCLUDED_RETRY_MS, PARKED_RETRY_MS, guest_size_from_physical,
+        map_alert_result, map_message_box_buttons, resolve_gui_run_source, retry_delay,
+        window_attributes,
     };
 
     /// `MB_*` button bits select the rfd button set; the bridge receives the

@@ -179,6 +179,7 @@ pub(crate) fn spawn(handle: GuestHandle, steps: Vec<ScriptStep>) -> Result<()> {
 }
 
 /// Execute the steps against the guest, sleeping between timed steps.
+#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn execute_script<S: InputSink>(sink: &S, hwnd: u64, steps: &[ScriptStep]) {
     for step in steps {
         match step {
