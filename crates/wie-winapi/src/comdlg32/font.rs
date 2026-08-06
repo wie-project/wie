@@ -13,8 +13,8 @@ use crate::state::FontDialogSession;
 use crate::user32::controls::{ControlClassKind, ControlState};
 use crate::user32::{
     BS_DEFPUSHBUTTON, CreateWindowRequest, GuestCallbackRequest, IDCANCEL, IDOK, WS_CLIPCHILDREN,
-    WS_VISIBLE, WinApiControlSignal, WindowClassIdentifier, create_window_record,
-    deliver_focus_change, find_window_mut, window_client_size,
+    WS_VISIBLE, WinApiControlSignal, WindowClassIdentifier, activate_modal_dialog,
+    create_window_record, find_window_mut, window_client_size,
 };
 use crate::{FontDialogPolicy, HandlerContext, OuterReturn, WinApiHandlerResult, WinApiState};
 use anyhow::{Context, Result};
@@ -490,14 +490,6 @@ fn open_host_font_dialog(ctx: &mut HandlerContext<'_>, cf_ptr: u64) -> Result<Wi
     let _scrolled_size =
         crate::user32::controls::listbox_scroll_selection_into_view(state, size_list_hwnd);
 
-    // The dialog is modal: an empty GetMessage must yield, and the dialog
-    // takes activation.
-    {
-        let mut queue = state.lock_message_queue();
-        queue.dialog_depth = queue.dialog_depth.saturating_add(1);
-    }
-    state.window_state().active_window_handle = Hwnd::from(dialog_hwnd);
-
     state.window_state().font_dialog = Some(FontDialogSession {
         dialog_hwnd,
         cf_ptr,
@@ -514,29 +506,22 @@ fn open_host_font_dialog(ctx: &mut HandlerContext<'_>, cf_ptr: u64) -> Result<Wi
         selected_point_size: seed_point_size,
     });
 
-    // Initial keyboard focus: the family LISTBOX.
-    state.window_state().focus_window_handle = Hwnd::from(family_list_hwnd);
-    let _unused = deliver_focus_change(
+    // The dialog is modal: an empty GetMessage must yield, and the dialog
+    // takes activation. The family LISTBOX gets the initial keyboard focus
+    // (host-side WM_SETFOCUS).
+    let _unused = activate_modal_dialog(
         state,
         engine,
-        0,
-        family_list_hwnd,
-        OuterReturn::Fixed(family_list_hwnd),
-    )?;
-
-    // Mark the whole subtree invalidated so the first empty GetMessage paints
-    // the dialog face + controls.
-    for hwnd in [
         dialog_hwnd,
-        family_list_hwnd,
-        size_list_hwnd,
-        strikeout_hwnd,
-        underline_hwnd,
-    ] {
-        if let Some(window) = find_window_mut(state, hwnd) {
-            window.invalidated = true;
-        }
-    }
+        Some(family_list_hwnd),
+        &[
+            dialog_hwnd,
+            family_list_hwnd,
+            size_list_hwnd,
+            strikeout_hwnd,
+            underline_hwnd,
+        ],
+    )?;
 
     // A freshly created dialog is a visible change: bump the content revision
     // so the idle reconcile republishes its first painted frame.

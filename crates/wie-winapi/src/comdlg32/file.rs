@@ -15,7 +15,7 @@ use crate::user32::controls::{ControlClassKind, ControlState};
 use crate::user32::{
     BS_DEFPUSHBUTTON, CreateWindowRequest, GuestCallbackRequest, IDCANCEL, IDOK, WS_CHILD,
     WS_CLIPCHILDREN, WS_TABSTOP, WS_VISIBLE, WinApiControlSignal, WindowClassIdentifier,
-    create_window_record, deliver_focus_change, find_window, find_window_mut, window_client_size,
+    activate_modal_dialog, create_window_record, find_window, find_window_mut, window_client_size,
 };
 use crate::vfs::VolumeConfig;
 use crate::{FileDialogPolicy, HandlerContext, OuterReturn, WinApiHandlerResult, WinApiState};
@@ -780,14 +780,6 @@ fn open_host_file_dialog(
         *items = listing;
     }
 
-    // The dialog is modal: an empty GetMessage must yield, not synthesize the
-    // regression-mode WM_QUIT, and the dialog takes activation.
-    {
-        let mut queue = state.lock_message_queue();
-        queue.dialog_depth = queue.dialog_depth.saturating_add(1);
-    }
-    state.window_state().active_window_handle = Hwnd::from(dialog_hwnd);
-
     // Record the session for the EndDialog write-back.
     state.window_state().file_dialog = Some(FileDialogSession {
         dialog_hwnd,
@@ -802,17 +794,16 @@ fn open_host_file_dialog(
         default_extension,
     });
 
-    // Initial keyboard focus: the path EDIT (host-side WM_SETFOCUS).
-    state.window_state().focus_window_handle = Hwnd::from(edit_hwnd);
-    let _unused = deliver_focus_change(state, engine, 0, edit_hwnd, OuterReturn::Fixed(edit_hwnd))?;
-
-    // Mark the whole subtree invalidated so the first empty GetMessage paints
-    // the dialog face + controls.
-    for hwnd in [dialog_hwnd, edit_hwnd, list_hwnd, ok_hwnd, cancel_hwnd] {
-        if let Some(window) = find_window_mut(state, hwnd) {
-            window.invalidated = true;
-        }
-    }
+    // The dialog is modal: an empty GetMessage must yield, not synthesize the
+    // regression-mode WM_QUIT, and the dialog takes activation. The path EDIT
+    // gets the initial keyboard focus (host-side WM_SETFOCUS).
+    let _unused = activate_modal_dialog(
+        state,
+        engine,
+        dialog_hwnd,
+        Some(edit_hwnd),
+        &[dialog_hwnd, edit_hwnd, list_hwnd, ok_hwnd, cancel_hwnd],
+    )?;
 
     tracing::info!(
         target: "wiegui",

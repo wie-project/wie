@@ -19,10 +19,11 @@ use crate::user32::{
     QueuedWindowMessage, WM_INITDIALOG, WM_QUIT, WS_CHILD, WS_CLIPCHILDREN, WS_TABSTOP, WS_VISIBLE,
     WinApiControlSignal, WinApiHandlerResult, WinApiState, WindowClassIdentifier,
     controls::ControlClassKind, create_window_record, find_window, find_window_mut, read_guest_u64,
-    window::deliver_focus_change, window_client_size,
+    window_client_size,
 };
 use wie_pe::resources::{DialogItemTemplate, DialogTemplate, ItemClass};
 
+use super::activate_modal_dialog;
 use super::template::resolve_template;
 
 /// Handles `USER32.dll!CreateDialogParamA`.
@@ -100,47 +101,20 @@ fn handle_create_dialog_param(
         drop(engine.mem_write(result_va, &0_u32.to_le_bytes()));
     }
 
-    // Modal dialogs are open: an empty GetMessage must yield, not synthesize
-    // the regression-mode WM_QUIT (that would close the dialog at open).
-    {
-        let mut queue = state.lock_message_queue();
-        queue.dialog_depth = queue.dialog_depth.saturating_add(1);
-        tracing::debug!(
-            target: "wiegui",
-            depth = queue.dialog_depth,
-            "dialog depth up"
-        );
-    }
-
-    // A modal dialog takes activation (real Windows): GetActiveWindow must
-    // return the dialog while it is open — guests post Enter/keys to it.
-    state.window_state().active_window_handle = crate::handles::Hwnd::from(dialog_hwnd);
-
-    // Dialogs paint on open: mark the dialog and its controls invalidated so
-    // the first empty GetMessage synthesizes their WM_PAINTs.
-    for hwnd in subtree {
-        if let Some(window) = find_window_mut(state, hwnd) {
-            window.invalidated = true;
-        }
-    }
-
-    // Initial keyboard focus: the first WS_TABSTOP child in creation order.
-    // Windows gives it focus and passes it as WM_INITDIALOG's wParam, so the
-    // first keystrokes land on the dialog instead of the owner and GetFocus()
-    // reads a control.
+    // The dialog is modal (an empty GetMessage must yield, not synthesize the
+    // regression-mode WM_QUIT), takes activation, and its first WS_TABSTOP
+    // child in creation order gets the initial keyboard focus — Windows gives
+    // it focus and passes it as WM_INITDIALOG's wParam, so the first
+    // keystrokes land on the dialog instead of the owner and GetFocus() reads
+    // a control.
     let first_tabstop = first_tabstop_child(state, dialog_hwnd);
-    if first_tabstop != 0 {
-        state.window_state().focus_window_handle = crate::handles::Hwnd::from(first_tabstop);
-        // The focused control receives WM_SETFOCUS (host-side — controls have
-        // no guest WndProc, so no bridge signal).
-        let _unused = deliver_focus_change(
-            state,
-            engine,
-            0,
-            first_tabstop,
-            OuterReturn::Fixed(first_tabstop),
-        )?;
-    }
+    let _unused = activate_modal_dialog(
+        state,
+        engine,
+        dialog_hwnd,
+        (first_tabstop != 0).then_some(first_tabstop),
+        &subtree,
+    )?;
 
     if dialog_proc == 0 {
         // No dialog proc: nothing to bridge, the dialog just exists.
