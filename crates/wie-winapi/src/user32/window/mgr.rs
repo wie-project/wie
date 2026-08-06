@@ -142,6 +142,15 @@ pub fn handle_show_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         .context("failed to read RDX for ShowWindow")?;
 
     let previously_visible = state.window_state().window_visible;
+    tracing::debug!(
+        target: "wiegui",
+        hwnd = window_handle,
+        show_command,
+        "ShowWindow"
+    );
+    // The parent of a window this call hides while it was visible: its rect
+    // vacates the owner surface, so the OWNER must erase over it (see below).
+    let mut hidden_child_parent = None;
 
     if window_handle == FAKE_WINDOW_HANDLE {
         // SW_HIDE is zero. Other commands make the window visible in the
@@ -150,6 +159,10 @@ pub fn handle_show_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     } else if let Some(window) = find_window_mut(state, window_handle) {
         // Real window records track their own visibility (used by the host
         // mouse hit-test in `GuestHandle::window_at`).
+        let was_visible = window.visible;
+        if show_command == 0 && was_visible {
+            hidden_child_parent = Some(window.parent_handle);
+        }
         window.visible = show_command != 0;
         // Showing a window invalidates it with erase (real Windows): the
         // first paint cycle fills the client with the class-brush background
@@ -167,6 +180,20 @@ pub fn handle_show_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         // the idle reconcile republishes its first painted frame (an unknown
         // window resolves to nothing and is a silent no-op).
         crate::present::PresentState::request_paint(state, window_handle);
+    } else if let Some(parent) = hidden_child_parent {
+        // Hiding a visible CHILD vacates its rect in the owner surface —
+        // real Windows repaints the parent's vacated region. Invalidate the
+        // owner with erase and bump its revision, AND erase the owner
+        // surface synchronously right now: the vacated rect is covered
+        // without waiting for the paint synthesizer's cycle (the child is
+        // hidden, so the WS_CLIPCHILDREN subtraction no longer excludes its
+        // rect). The later synthesized erase is then a harmless repeat.
+        if let Some(owner) = find_window_mut(state, parent.as_u64()) {
+            owner.invalidated = true;
+            owner.flags.insert(WindowFlags::ERASE_BACKGROUND);
+        }
+        crate::user32::message::erase_window_background(state, parent.as_u64());
+        crate::present::PresentState::request_paint(state, parent.as_u64());
     }
 
     let return_value = u64::from(previously_visible);

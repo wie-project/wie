@@ -319,6 +319,8 @@ impl WieApp {
                 scale_factor,
                 retry_budget: RetryBudget::default(),
                 retry_at: None,
+                occluded_retries: 0,
+                occluded: false,
             };
             if is_first {
                 self.primary_hwnd = Some(rt.hwnd);
@@ -349,6 +351,14 @@ const RESIZE_SETTLE_MS: u64 = 50;
 /// frame-per-mutation storm (at most 10 wakeups/s, only while a frame is
 /// unpresented).
 const PARKED_RETRY_MS: u64 = 100;
+/// Slow re-arm cadence for a present skipped while the window is reported
+/// occluded: the fast 100 ms cadence would be a visible spin, and parking
+/// entirely (waiting for `Occluded(false)`) can strand a frame published
+/// while the window was briefly covered (a menu interaction) when the
+/// un-occlusion event never arrives. Bounded to a few tries, then parked.
+const OCCLUDED_RETRY_MS: u64 = 1000;
+/// How many slow re-arms an occluded window gets before the frame parks.
+const OCCLUDED_RETRY_MAX: u8 = 3;
 
 /// Per-window host state for one winit window — the payload of each entry in
 /// the [`WindowRegistry`]. One entry exists per guest top-level window; the
@@ -398,8 +408,18 @@ struct WindowRuntime {
     /// exactly one publish wake; if that one present is `NotDrawn` the frame
     /// parks with no follow-up publish to re-arm it, so the strip stays on
     /// screen until the next input). `about_to_wait` re-requests the redraw
-    /// when the deadline passes and clears it on a `Drawn`.
+    /// when the deadline passes and clears it on a `Drawn`. Suspended while
+    /// the window is occluded (see `occluded`).
     retry_at: Option<Instant>,
+    /// Slow-re-arm attempts while occluded (see `OCCLUDED_RETRY_MS`); reset
+    /// on a Drawn present or an un-occlusion.
+    occluded_retries: u8,
+    /// The winit-reported occlusion state (`WindowEvent::Occluded`). While
+    /// occluded every surface acquire fails, so the parked-frame re-arm is
+    /// throttled to a few slow tries: re-arming at the fast cadence would
+    /// spin redraw → NotDrawn → re-arm forever. `Occluded(false)` re-arms by
+    /// requesting one redraw instead.
+    occluded: bool,
 }
 
 /// One host winit window per guest top-level window, keyed by winit
@@ -663,18 +683,27 @@ impl ApplicationHandler<WieEvent> for WieApp {
                 }
                 return;
             }
-            WindowEvent::Occluded(false) => {
-                // The window became visible again after being fully covered
-                // (its surface acquire was skipping with Occluded/Timeout). A
-                // frame may be parked in the presenter by the bounded-retry
-                // present — re-request the redraw so the parked frame draws.
-                // `Occluded(true)` needs no arm: while covered the frame stays
-                // parked, and this event (or a new publish, a resize) is the
-                // natural retry. winit emits this on macOS when the occlusion
-                // state clears, which is also how the un-occlusion acceptance
-                // test draws its parked frame.
-                if let Some(rt) = self.windows.get(&window_id) {
-                    rt.window.request_redraw();
+            WindowEvent::Occluded(occluded) => {
+                let occluded = *occluded;
+                if let Some(rt) = self.windows.get_mut(&window_id) {
+                    rt.occluded = occluded;
+                    if occluded {
+                        // Fully covered: every surface acquire fails. The
+                        // parked-frame re-arm is throttled to a few slow
+                        // tries (`OCCLUDED_RETRY_MS`) rather than cleared —
+                        // a frame published while the window was briefly
+                        // covered (menu interaction) still gets its chance,
+                        // and the bounded cadence cannot spin.
+                    } else {
+                        // Visible again: a frame may be parked in the
+                        // presenter by the bounded-retry present — re-request
+                        // the redraw so the parked frame draws, with a fresh
+                        // slow-retry budget. winit emits this on macOS when
+                        // the occlusion state clears, which is also how the
+                        // un-occlusion acceptance test draws its parked frame.
+                        rt.occluded_retries = 0;
+                        rt.window.request_redraw();
+                    }
                 }
                 return;
             }
@@ -808,6 +837,7 @@ impl ApplicationHandler<WieEvent> for WieApp {
                             // starts with a fresh retry budget.
                             rt.retry_budget.reset();
                             rt.retry_at = None;
+                            rt.occluded_retries = 0;
                         }
                         PresentOutcome::NotDrawn { retry } => {
                             // The frame never reached the screen. Keep
@@ -837,8 +867,31 @@ impl ApplicationHandler<WieEvent> for WieApp {
                                 rt.retry_budget.consume(&presented_pixels);
                                 rt.window.request_redraw();
                             } else if retry {
-                                rt.retry_at =
-                                    Some(Instant::now() + Duration::from_millis(PARKED_RETRY_MS));
+                                // Budget spent: re-arm. Visible windows get
+                                // the fast cadence (transient timeout/outdated
+                                // surface). Occluded windows get a few slow
+                                // tries — enough to recover a frame published
+                                // while the window was briefly covered, then
+                                // park until `Occluded(false)` or a new
+                                // publish. The fast cadence while occluded
+                                // would spin forever; no re-arm at all could
+                                // strand the frame when the un-occlusion
+                                // event never arrives.
+                                if !rt.occluded {
+                                    rt.occluded_retries = 0;
+                                    rt.retry_at = Some(
+                                        Instant::now()
+                                            + Duration::from_millis(PARKED_RETRY_MS),
+                                    );
+                                } else if rt.occluded_retries < OCCLUDED_RETRY_MAX {
+                                    rt.occluded_retries += 1;
+                                    rt.retry_at = Some(
+                                        Instant::now()
+                                            + Duration::from_millis(OCCLUDED_RETRY_MS),
+                                    );
+                                } else {
+                                    rt.retry_at = None;
+                                }
                             }
                         }
                     }

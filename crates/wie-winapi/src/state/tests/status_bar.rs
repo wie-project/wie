@@ -1083,3 +1083,47 @@ fn test_status_bar_wm_size_sizes_and_positions_bar_in_parent() {
         "CCS_BOTTOM: the bar sits flush at the parent bottom"
     );
 }
+
+/// Regression: View > Status Bar — hiding a visible CHILD must erase its
+/// vacated rect in the owner surface.
+///
+/// `ShowWindow(SW_HIDE)` used to only flip `visible`: nothing invalidated the
+/// owner, so the strip pixels stayed in the surface until a later input's
+/// repaint covered them (the "status bar persists until a click" bug — the
+/// hidden bar's own paint is gated, so NOTHING ever erased the region). Real
+/// Windows repaints the parent's vacated region; WIE now invalidates the
+/// owner with erase + a content-revision bump on SW_HIDE.
+#[test]
+fn test_hide_child_invalidates_owner_with_erase() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (top, bar) = push_status_bar_pair(&mut state);
+
+    // ShowWindow(bar, SW_HIDE): RCX = hwnd, RDX = 0.
+    write_regs(&mut engine, bar, 0, 0, 0, 0);
+    dispatch_user32(&mut engine, &mut state, "ShowWindow");
+
+    let ws = state.window_state();
+    let bar_record = ws
+        .windows
+        .iter()
+        .find(|window| window.handle == crate::handles::Hwnd::from(bar))
+        .expect("status bar record");
+    assert!(!bar_record.visible, "the bar is hidden");
+
+    let top_record = ws
+        .windows
+        .iter()
+        .find(|window| window.handle == crate::handles::Hwnd::from(top))
+        .expect("owner record");
+    assert!(
+        top_record.invalidated,
+        "hiding a child invalidates the owner so the erase covers the vacated rect"
+    );
+    assert!(
+        top_record
+            .flags
+            .contains(crate::state::WindowFlags::ERASE_BACKGROUND),
+        "the owner erase is requested"
+    );
+}
