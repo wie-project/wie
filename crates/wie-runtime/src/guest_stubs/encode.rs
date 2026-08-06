@@ -72,6 +72,90 @@ pub(super) fn encode_initterm(check_status: bool) -> Vec<u8> {
     buf
 }
 
+/// Shared `GetMessageA` → `IsDialogMessageA` → `DispatchMessageA` modal-loop
+/// body, appended to `buf` after a prologue that stored the dialog HWND in
+/// `[rsp+0x20]` and set up the 0x60-byte stack frame.
+///
+/// ```text
+/// .loop:
+///   lea rcx, [rsp+0x28]      ; lpMsg
+///   xor edx, edx             ; hWnd = NULL — real modal loops pull every
+///                            ; thread message (the owner's WM_TIMER must
+///                            ; still be dispatched inside the dialog)
+///   xor r8d, r8d; xor r9d, r9d
+///   call GetMessageA
+///   test eax, eax; jz .quit
+///   mov rcx, [rsp+0x20]; lea rdx, [rsp+0x28]
+///   call IsDialogMessageA
+///   test eax, eax; jnz .loop ; consumed (Tab/Enter/Esc) → keep going
+///   lea rcx, [rsp+0x28]
+///   call DispatchMessageA
+///   jmp .loop
+/// .quit:
+/// mov rax, result_va        ; EndDialog wrote the result here
+/// mov eax, [rax]
+/// ```
+///
+/// The `.done` epilogue (`add rsp, 0x60; pop rbx; ret`) is appended by the
+/// caller immediately after this returns, so the caller can take `.done` as
+/// `buf.len()` at return time. All three rel8 branches (`.quit`, `.loop` ×2)
+/// target offsets inside the appended bytes, so the patches are
+/// self-contained.
+///
+/// Returns `(loop_at, quit_at)` — the absolute offsets of `.loop` and `.quit`
+/// in `buf`, for callers that need programmatic branch targets (both current
+/// encoders append the loop purely for its side effect).
+fn append_modal_loop(
+    buf: &mut Vec<u8>,
+    get_msg_va: u64,
+    is_dlg_va: u64,
+    dispatch_va: u64,
+    result_va: u64,
+) -> (usize, usize) {
+    // .loop:
+    let loop_at = buf.len();
+    // lea rcx, [rsp+0x28] ; xor edx, edx ; xor r8d, r8d ; xor r9d, r9d
+    buf.extend_from_slice(&[0x48, 0x8d, 0x4c, 0x24, 0x28]);
+    buf.extend_from_slice(&[0x31, 0xd2]);
+    buf.extend_from_slice(&[0x45, 0x31, 0xc0]);
+    buf.extend_from_slice(&[0x45, 0x31, 0xc9]);
+    // call GetMessageA
+    buf.extend_from_slice(&[0x48, 0xb8]);
+    buf.extend_from_slice(&get_msg_va.to_le_bytes());
+    buf.extend_from_slice(&[0xff, 0xd0]);
+    // test eax, eax ; jz .quit
+    buf.extend_from_slice(&[0x85, 0xc0]);
+    let jz_quit = buf.len() + 1;
+    buf.extend_from_slice(&[0x74, 0x00]);
+    // mov rcx, [rsp+0x20] ; lea rdx, [rsp+0x28] ; call IsDialogMessageA
+    buf.extend_from_slice(&[0x48, 0x8b, 0x4c, 0x24, 0x20]);
+    buf.extend_from_slice(&[0x48, 0x8d, 0x54, 0x24, 0x28]);
+    buf.extend_from_slice(&[0x48, 0xb8]);
+    buf.extend_from_slice(&is_dlg_va.to_le_bytes());
+    buf.extend_from_slice(&[0xff, 0xd0]);
+    // test eax, eax ; jnz .loop (consumed by IsDialogMessageA)
+    buf.extend_from_slice(&[0x85, 0xc0]);
+    let jnz_loop = buf.len() + 1;
+    buf.extend_from_slice(&[0x75, 0x00]);
+    // lea rcx, [rsp+0x28] ; call DispatchMessageA ; jmp .loop
+    buf.extend_from_slice(&[0x48, 0x8d, 0x4c, 0x24, 0x28]);
+    buf.extend_from_slice(&[0x48, 0xb8]);
+    buf.extend_from_slice(&dispatch_va.to_le_bytes());
+    buf.extend_from_slice(&[0xff, 0xd0]);
+    let jmp_loop = buf.len() + 1;
+    buf.extend_from_slice(&[0xeb, 0x00]);
+    // .quit: mov rax, result_va ; mov eax, [rax]
+    let quit_at = buf.len();
+    buf.extend_from_slice(&[0x48, 0xb8]);
+    buf.extend_from_slice(&result_va.to_le_bytes());
+    buf.extend_from_slice(&[0x8b, 0x00]);
+
+    patch_rel8(buf, jz_quit, jz_quit + 1, quit_at);
+    patch_rel8(buf, jnz_loop, jnz_loop + 1, loop_at);
+    patch_rel8(buf, jmp_loop, jmp_loop + 1, loop_at);
+    (loop_at, quit_at)
+}
+
 /// `DialogBoxParamA/W` modal-loop body (out-of-line helper).
 ///
 /// Win64 entry: `RCX=hInstance, RDX=lpTemplateName, R8=hWndParent,
@@ -92,23 +176,8 @@ pub(super) fn encode_initterm(check_status: bool) -> Vec<u8> {
 ///                            ; guest callback clobbers every register, and
 ///                            ; its frame sits BELOW ours, so the stack slot
 ///                            ; survives
-/// .loop:
-///   lea rcx, [rsp+0x28]      ; lpMsg
-///   xor edx, edx             ; hWnd = NULL — real modal loops pull every
-///                            ; thread message (the owner's WM_TIMER must
-///                            ; still be dispatched inside the dialog)
-///   xor r8d, r8d; xor r9d, r9d
-///   call GetMessageA
-///   test eax, eax; jz .quit
-///   mov rcx, [rsp+0x20]; lea rdx, [rsp+0x28]
-///   call IsDialogMessageA
-///   test eax, eax; jnz .loop ; consumed (Tab/Enter/Esc) → keep going
-///   lea rcx, [rsp+0x28]
-///   call DispatchMessageA
-///   jmp .loop
-/// .quit:
-/// mov rax, dialog_result_va  ; EndDialog wrote the result here
-/// mov eax, [rax]
+/// .loop: … .quit:
+/// (see [`append_modal_loop`] — shared with the file-dialog loop)
 /// .done:
 /// add rsp, 0x60; pop rbx; ret
 /// ```
@@ -145,43 +214,14 @@ pub(super) fn encode_dialog_box_param(
     // .created: mov [rsp+0x20], rax  (hwnd slot)
     let created_at = buf.len();
     buf.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x20]);
-    // .loop:
-    let loop_at = buf.len();
-    // lea rcx, [rsp+0x28] ; xor edx, edx ; xor r8d, r8d ; xor r9d, r9d
-    buf.extend_from_slice(&[0x48, 0x8d, 0x4c, 0x24, 0x28]);
-    buf.extend_from_slice(&[0x31, 0xd2]);
-    buf.extend_from_slice(&[0x45, 0x31, 0xc0]);
-    buf.extend_from_slice(&[0x45, 0x31, 0xc9]);
-    // call GetMessageA
-    buf.extend_from_slice(&[0x48, 0xb8]);
-    buf.extend_from_slice(&get_message_va.to_le_bytes());
-    buf.extend_from_slice(&[0xff, 0xd0]);
-    // test eax, eax ; jz .quit
-    buf.extend_from_slice(&[0x85, 0xc0]);
-    let jz_quit = buf.len() + 1;
-    buf.extend_from_slice(&[0x74, 0x00]);
-    // mov rcx, [rsp+0x20] ; lea rdx, [rsp+0x28] ; call IsDialogMessageA
-    buf.extend_from_slice(&[0x48, 0x8b, 0x4c, 0x24, 0x20]);
-    buf.extend_from_slice(&[0x48, 0x8d, 0x54, 0x24, 0x28]);
-    buf.extend_from_slice(&[0x48, 0xb8]);
-    buf.extend_from_slice(&is_dialog_message_va.to_le_bytes());
-    buf.extend_from_slice(&[0xff, 0xd0]);
-    // test eax, eax ; jnz .loop (consumed)
-    buf.extend_from_slice(&[0x85, 0xc0]);
-    let jnz_loop = buf.len() + 1;
-    buf.extend_from_slice(&[0x75, 0x00]);
-    // lea rcx, [rsp+0x28] ; call DispatchMessageA ; jmp .loop
-    buf.extend_from_slice(&[0x48, 0x8d, 0x4c, 0x24, 0x28]);
-    buf.extend_from_slice(&[0x48, 0xb8]);
-    buf.extend_from_slice(&dispatch_message_va.to_le_bytes());
-    buf.extend_from_slice(&[0xff, 0xd0]);
-    let jmp_loop = buf.len() + 1;
-    buf.extend_from_slice(&[0xeb, 0x00]);
-    // .quit: mov rax, dialog_result_va ; mov eax, [rax]
-    let quit_at = buf.len();
-    buf.extend_from_slice(&[0x48, 0xb8]);
-    buf.extend_from_slice(&dialog_result_va.to_le_bytes());
-    buf.extend_from_slice(&[0x8b, 0x00]);
+    // .loop → .quit: shared GetMessage/IsDialogMessage/Dispatch modal loop
+    let (_loop_at, _quit_at) = append_modal_loop(
+        &mut buf,
+        get_message_va,
+        is_dialog_message_va,
+        dispatch_message_va,
+        dialog_result_va,
+    );
     // .done: add rsp, 0x60 ; pop rbx ; ret
     let done_at = buf.len();
     buf.extend_from_slice(&[0x48, 0x83, 0xc4, 0x60]);
@@ -190,37 +230,21 @@ pub(super) fn encode_dialog_box_param(
 
     patch_rel8(&mut buf, jnz_created, jnz_created + 1, created_at);
     patch_rel8(&mut buf, jmp_done, jmp_done + 1, done_at);
-    patch_rel8(&mut buf, jz_quit, jz_quit + 1, quit_at);
-    patch_rel8(&mut buf, jnz_loop, jnz_loop + 1, loop_at);
-    patch_rel8(&mut buf, jmp_loop, jmp_loop + 1, loop_at);
     buf
 }
 
 /// `GetOpenFileName`/`GetSaveFileName` modal-loop body (out-of-line helper).
 ///
 /// The comdlg32 handler builds the file dialog and stores its HWND in the
-/// callback-entry `RCX`; the body runs the same modal message loop as
-/// [`encode_dialog_box_param`] — `GetMessageA` → `IsDialogMessageA` →
+/// callback-entry `RCX`; the body runs the shared modal message loop
+/// [`append_modal_loop`] — `GetMessageA` → `IsDialogMessageA` →
 /// `DispatchMessageA` until `WM_QUIT` (posted by `EndDialog`), then returns
 /// the dialog-result slot (the `GetOpenFileName` TRUE/FALSE the guest sees).
 ///
 /// ```text
 /// push rbx; sub rsp, 0x60
 /// mov [rsp+0x20], rcx        ; dialog hwnd from the callback frame
-/// .loop:
-///   lea rcx, [rsp+0x28]      ; lpMsg
-///   xor edx, edx; xor r8d, r8d; xor r9d, r9d
-///   call GetMessageA
-///   test eax, eax; jz .quit
-///   mov rcx, [rsp+0x20]; lea rdx, [rsp+0x28]
-///   call IsDialogMessageA
-///   test eax, eax; jnz .loop ; consumed (Tab/Enter/Esc) → keep going
-///   lea rcx, [rsp+0x28]
-///   call DispatchMessageA
-///   jmp .loop
-/// .quit:
-/// mov rax, dialog_result_va  ; EndDialog wrote the result here
-/// mov eax, [rax]
+/// .loop: … .quit:            ; append_modal_loop (shared with the dialog box)
 /// .done:
 /// add rsp, 0x60; pop rbx; ret
 /// ```
@@ -236,51 +260,18 @@ pub(crate) fn encode_file_dialog_loop(
     buf.extend_from_slice(&[0x48, 0x83, 0xec, 0x60]);
     // mov [rsp+0x20], rcx (dialog hwnd from the callback frame)
     buf.extend_from_slice(&[0x48, 0x89, 0x4c, 0x24, 0x20]);
-    // .loop:
-    let loop_at = buf.len();
-    // lea rcx, [rsp+0x28] ; xor edx, edx ; xor r8d, r8d ; xor r9d, r9d
-    buf.extend_from_slice(&[0x48, 0x8d, 0x4c, 0x24, 0x28]);
-    buf.extend_from_slice(&[0x31, 0xd2]);
-    buf.extend_from_slice(&[0x45, 0x31, 0xc0]);
-    buf.extend_from_slice(&[0x45, 0x31, 0xc9]);
-    // call GetMessageA
-    buf.extend_from_slice(&[0x48, 0xb8]);
-    buf.extend_from_slice(&get_message_va.to_le_bytes());
-    buf.extend_from_slice(&[0xff, 0xd0]);
-    // test eax, eax ; jz .quit
-    buf.extend_from_slice(&[0x85, 0xc0]);
-    let jz_quit = buf.len() + 1;
-    buf.extend_from_slice(&[0x74, 0x00]);
-    // mov rcx, [rsp+0x20] ; lea rdx, [rsp+0x28] ; call IsDialogMessageA
-    buf.extend_from_slice(&[0x48, 0x8b, 0x4c, 0x24, 0x20]);
-    buf.extend_from_slice(&[0x48, 0x8d, 0x54, 0x24, 0x28]);
-    buf.extend_from_slice(&[0x48, 0xb8]);
-    buf.extend_from_slice(&is_dialog_message_va.to_le_bytes());
-    buf.extend_from_slice(&[0xff, 0xd0]);
-    // test eax, eax ; jnz .loop (consumed)
-    buf.extend_from_slice(&[0x85, 0xc0]);
-    let jnz_loop = buf.len() + 1;
-    buf.extend_from_slice(&[0x75, 0x00]);
-    // lea rcx, [rsp+0x28] ; call DispatchMessageA ; jmp .loop
-    buf.extend_from_slice(&[0x48, 0x8d, 0x4c, 0x24, 0x28]);
-    buf.extend_from_slice(&[0x48, 0xb8]);
-    buf.extend_from_slice(&dispatch_message_va.to_le_bytes());
-    buf.extend_from_slice(&[0xff, 0xd0]);
-    let jmp_loop = buf.len() + 1;
-    buf.extend_from_slice(&[0xeb, 0x00]);
-    // .quit: mov rax, dialog_result_va ; mov eax, [rax]
-    let quit_at = buf.len();
-    buf.extend_from_slice(&[0x48, 0xb8]);
-    buf.extend_from_slice(&dialog_result_va.to_le_bytes());
-    buf.extend_from_slice(&[0x8b, 0x00]);
+    // .loop → .quit: shared GetMessage/IsDialogMessage/Dispatch modal loop
+    let (_loop_at, _quit_at) = append_modal_loop(
+        &mut buf,
+        get_message_va,
+        is_dialog_message_va,
+        dispatch_message_va,
+        dialog_result_va,
+    );
     // .done: add rsp, 0x60 ; pop rbx ; ret (fall-through after .quit)
     buf.extend_from_slice(&[0x48, 0x83, 0xc4, 0x60]);
     buf.push(0x5b);
     buf.push(0xc3);
-
-    patch_rel8(&mut buf, jz_quit, jz_quit + 1, quit_at);
-    patch_rel8(&mut buf, jnz_loop, jnz_loop + 1, loop_at);
-    patch_rel8(&mut buf, jmp_loop, jmp_loop + 1, loop_at);
     buf
 }
 
