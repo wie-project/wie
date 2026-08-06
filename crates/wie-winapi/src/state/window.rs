@@ -647,6 +647,21 @@ impl WindowState {
         }
     }
 
+    /// The text of a status-bar part (`SB_SETTEXT`/`SBPART_*`), when `hwnd`
+    /// is a STATUSCLASSNAMEW window whose state has been seeded.
+    ///
+    /// Read by the GUI micro-tests to observe the Ln/Col indicator text
+    /// without going through a guest `SB_GETTEXT` round-trip.
+    #[must_use]
+    pub fn status_bar_part_text(&self, hwnd: u64, part: usize) -> Option<String> {
+        match self.control_states.get(&crate::handles::Hwnd::from(hwnd)) {
+            Some(crate::user32::controls::ControlState::StatusBar { part_texts, .. }) => {
+                part_texts.get(part).cloned()
+            }
+            _ => None,
+        }
+    }
+
     /// The `control_text` of `hwnd` (the buffer `SetWindowText`/`WM_SETTEXT`
     /// maintain for built-in controls), when it is a known window.
     ///

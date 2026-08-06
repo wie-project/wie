@@ -88,10 +88,7 @@ pub use edit::UndoSnapshot;
 // `controls` only keeps the cross-cutting call sites: the generic WM_LBUTTONUP
 // arm ends an EDIT's drag session, and the WM_SETFONT / WM_SETTEXT arms reset
 // the EDIT's pending row band / buffer state outside the control dispatch.
-use edit::{
-    dispatch_edit_message, edit_invalidate_text_buffer, edit_mouse_up, edit_notify_scroll,
-    edit_reset_invalid_rows,
-};
+use edit::{dispatch_edit_message, edit_invalidate_text_buffer, edit_mouse_up, edit_notify_scroll};
 use listbox::{
     listbox_hit_item, listbox_invalidate_appended, listbox_invalidate_selection,
     listbox_key_move_selection, listbox_notify_change, listbox_scroll_wheel,
@@ -112,8 +109,13 @@ pub(crate) use edit::{
     layout_visible_lines, scrollbar_visible, visible_line_count, visual_rows,
 };
 // The no-create undo-buffer clear is called from the SetWindowText handlers
-// in `user32::window` (they write control text outside the control dispatch).
+// in `user32::window` (they write control text outside the control dispatch);
+// the caret/selection reset and the full-band reset keep the EDIT state
+// consistent there too (FileNew's `SetWindowText(hEdit, NULL)` must move the
+// caret to the document start so the Ln/Col status refresh reads position 1).
 pub(crate) use edit::edit_clear_undo_buffer;
+pub(crate) use edit::edit_reset_invalid_rows;
+pub(crate) use edit::edit_set_selection;
 
 /// `GetSysColor(COLOR_BTNFACE)` — the standard push-button face.
 const COLOR_BTNFACE: u32 = 0x00F0_F0F0;
@@ -589,6 +591,57 @@ impl ControlState {
     }
 }
 
+/// Reset every EDIT's pending row band to Full in `root`'s window subtree.
+///
+/// The erase machinery (`user32::message::synth::erase_window_background`)
+/// calls this after a full-surface erase: the erase painted over the
+/// controls beneath the erased window, destroying their paint base, so an
+/// EDIT's band-limited repaint would leave the erased rows blank (the Go To
+/// line-N blank-rows bug). A full repaint is always correct; the band
+/// optimization is only valid while the surface base survives.
+pub(crate) fn reset_edit_bands_in_subtree(state: &mut WinApiState, root: u64) {
+    // Snapshot (handle, parent, kind) so the subtree walk does not borrow
+    // `state` mutably while the resets below do.
+    let snapshot: Vec<(u64, u64, Option<ControlClassKind>)> = state
+        .window_state()
+        .windows
+        .iter()
+        .map(|window| {
+            (
+                window.handle.as_u64(),
+                window.parent_handle.as_u64(),
+                window.control_kind,
+            )
+        })
+        .collect();
+    let edit_subtree: Vec<u64> = snapshot
+        .iter()
+        .filter(|(handle, _, kind)| {
+            *kind == Some(ControlClassKind::Edit) && {
+                // Is `root` an ancestor-or-self of this window?
+                let mut current = *handle;
+                loop {
+                    if current == root {
+                        break true;
+                    }
+                    let Some(&(_, next_parent, _)) = snapshot.iter().find(|(h, ..)| *h == current)
+                    else {
+                        break false;
+                    };
+                    if next_parent == 0 || next_parent == current {
+                        break false;
+                    }
+                    current = next_parent;
+                }
+            }
+        })
+        .map(|(handle, ..)| *handle)
+        .collect();
+    for hwnd in edit_subtree {
+        edit_reset_invalid_rows(state, hwnd);
+    }
+}
+
 /// Host-side dispatch for a built-in control window.
 ///
 /// `Ok(Some(value))` means the control handled `message` and the guest-visible
@@ -1012,7 +1065,14 @@ impl ControlClassKind {
                 match kind {
                     // A whole-text replacement rewrites every row: reset any
                     // pending row band so the next paint covers the whole EDIT.
-                    Some(ControlClassKind::Edit) => edit_reset_invalid_rows(state, hwnd),
+                    // The caret+selection also reset to the document start —
+                    // real Windows moves the caret to 0 when the text is set
+                    // programmatically (a stale caret makes the parent's Ln/Col
+                    // status refresh read the old position after FileNew).
+                    Some(ControlClassKind::Edit) => {
+                        edit_set_selection(state, hwnd, 0, 0);
+                        edit_reset_invalid_rows(state, hwnd);
+                    }
                     // A label caption change narrows the next paint to the
                     // caption rect (the face/border are unchanged).
                     Some(ControlClassKind::Button | ControlClassKind::Static) => {

@@ -87,6 +87,15 @@ impl GuestHandle {
             .map(str::to_owned)
     }
 
+    /// The text of status-bar part `part` (`SB_SETTEXT`), when `hwnd` is a
+    /// STATUSCLASSNAMEW window. Read by the GUI micro-tests to observe the
+    /// Ln/Col indicator text after a guest mutation.
+    #[must_use]
+    pub fn status_bar_part_text(&self, hwnd: u64, part: usize) -> Option<String> {
+        let state = self.state.lock().ok()?;
+        state.try_window_state()?.status_bar_part_text(hwnd, part)
+    }
+
     /// Whether frame timing instrumentation is active (lock-free gate).
     #[must_use]
     pub fn frame_timing_enabled(&self) -> bool {

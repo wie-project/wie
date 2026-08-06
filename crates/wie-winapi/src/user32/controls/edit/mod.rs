@@ -36,9 +36,13 @@ pub(super) use messages::edit_invalidate_text_buffer;
 pub(super) use messages::edit_notify_scroll;
 // The generic WM_LBUTTONUP arm in `controls` ends an EDIT's drag session.
 pub(super) use mouse::edit_mouse_up;
+// The SetWindowText / WM_SETTEXT handlers in `controls` reset an EDIT's
+// caret+selection to the document start (real Windows moves the caret to 0
+// when the text is set programmatically) and its pending row band to full.
+pub(crate) use keyboard::edit_set_selection;
 // The generic WM_SETFONT / WM_SETTEXT arms in `controls` reset an EDIT's
 // pending row band to full.
-pub(super) use paint::edit_reset_invalid_rows;
+pub(crate) use paint::edit_reset_invalid_rows;
 // `controls::button` reads the EDIT's dirty band and paints it through the
 // same `paint_edit` the control dispatch's WM_PAINT arm uses.
 pub(super) use paint::{edit_dirty_band, paint_edit};

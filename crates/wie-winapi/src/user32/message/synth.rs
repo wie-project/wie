@@ -249,6 +249,15 @@ fn synthesize_wm_timer(
 /// generates `WM_PAINT` once per `InvalidateRect`/validate cycle, so a window
 /// whose WndProc never calls `BeginPaint` cannot livelock the pump.
 ///
+/// A HIDDEN window (clear `WS_VISIBLE`) is never selected: real Windows
+/// discards a hidden window's invalidated region and never sends it a
+/// WM_PAINT. Without this, an invalidation that predates a `ShowWindow(
+/// SW_HIDE)` (the status bar's `SB_SETTEXTW` outliving the hide) would be
+/// synthesized and dispatched after the hide, re-painting the hidden bar's
+/// strip over the control that grew into its space (the live View > Status
+/// Bar regression). The dispatch arm keeps its own visibility gate as
+/// defense-in-depth; the synthesis gate is the Windows-faithful first check.
+///
 /// When the invalidation requested an erase (`InvalidateRect` `bErase`) AND
 /// the window class has a background brush, a `WM_ERASEBKGND` is queued ahead
 /// of the paint (Windows order). The erase message is dispatched host-side
@@ -272,6 +281,7 @@ fn synthesize_wm_paint(
             .iter()
             .find(|window| {
                 window.invalidated
+                    && window.visible
                     && (window_filter == 0
                         || window.handle == crate::handles::Hwnd::from(window_filter)
                         || dialog_matches.contains(&window.handle))
@@ -444,5 +454,14 @@ pub(crate) fn erase_window_background(state: &mut WinApiState, hwnd: u64) -> boo
             color,
         );
     }
+    // The erase painted over the surface this window owns, INCLUDING any
+    // controls beneath it (a window without `WS_CLIPCHILDREN` erases over
+    // its children — real Windows repaints them afterward). The EDIT's
+    // row-band optimization assumes its surface base is intact; a full
+    // erase destroys that base, so a band-limited repaint would leave the
+    // erased rows blank (the Go To line-N blank-rows bug: the modal dialog
+    // close erases the owner white, then the EDIT repaints only its pending
+    // band). Reset every EDIT in the subtree to a full repaint.
+    crate::user32::controls::reset_edit_bands_in_subtree(state, hwnd);
     true
 }

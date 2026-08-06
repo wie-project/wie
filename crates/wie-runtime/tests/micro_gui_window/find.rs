@@ -705,7 +705,7 @@ fn find_dialog_face_stays_gray_through_find_next_click() {
         mut session,
         handle,
         main,
-        main_edit,
+        main_edit: _,
         dx,
         dy,
     } = face_session_new(FIND_DLG_CY);

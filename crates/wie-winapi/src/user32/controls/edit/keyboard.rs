@@ -307,7 +307,7 @@ pub(super) fn edit_delete_at_caret(state: &mut WinApiState, hwnd: u64) -> bool {
 
 /// EDIT: EM_SETSEL — set the selection. A negative argument means "end of
 /// text", so `(0, -1)` selects everything; the caret lands at the end edge.
-pub(super) fn edit_set_selection(state: &mut WinApiState, hwnd: u64, start: i32, end: i32) {
+pub(crate) fn edit_set_selection(state: &mut WinApiState, hwnd: u64, start: i32, end: i32) {
     let span = {
         let ws = state.window_state();
         let Some(window) = ws

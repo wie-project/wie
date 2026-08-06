@@ -155,3 +155,133 @@ fn mutation_reconcile_publishes_the_fresh_frame_once() {
         "a caught-up window is skipped until the next mutation"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Paint synthesis visibility: a hidden window's invalid region is discarded.
+// ---------------------------------------------------------------------------
+
+/// Real Windows never synthesizes `WM_PAINT` for a window whose `WS_VISIBLE`
+/// is clear: the synthesizer must not select an invalidated hidden window.
+/// The status-bar live regression: the bar's `SB_SETTEXTW` invalidation
+/// outlives `ShowWindow(SW_HIDE)`, so without the synthesis gate the hidden
+/// bar's paint is queued and dispatched after the hide, re-drawing its strip
+/// over the edit that grew into its space.
+#[test]
+fn synthesize_wm_paint_skips_hidden_invalidated_windows() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // Yield on an empty queue (the ExitOnIdle default would synthesize a
+    // WM_QUIT and mask what the synthesizer did or did not queue).
+    state.window_state().message_queue_idle_policy = MessageQueueIdlePolicy::YieldOnIdle;
+    let top = 0x6610_0101_u64;
+    let hidden = 0x6610_0102_u64;
+    state.window_state().windows.push(WindowRecord {
+        handle: crate::handles::Hwnd::from(top),
+        visible: true,
+        width: 200,
+        height: 100,
+        ..Default::default()
+    });
+    state.window_state().windows.push(WindowRecord {
+        handle: crate::handles::Hwnd::from(hidden),
+        parent_handle: crate::handles::Hwnd::from(top),
+        control_kind: Some(crate::user32::controls::ControlClassKind::StatusBar),
+        // Hidden, but invalidated: the invalidation predates the hide.
+        visible: false,
+        invalidated: true,
+        ..Default::default()
+    });
+
+    // GetMessageA on the empty queue synthesizes idle messages (WM_PAINT for
+    // the first invalidated window). A hidden window must not be selected.
+    write_regs(&mut engine, 0x3000, 0, 0, 0, 0x3000);
+    let result = crate::user32::handle_get_message_a(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ));
+    assert!(
+        result.is_err(),
+        "an empty queue with only hidden invalidated windows must yield"
+    );
+    // No WM_PAINT (and no WM_ERASEBKGND) was queued for the hidden window.
+    {
+        let queue = state.lock_message_queue();
+        assert!(
+            queue
+                .messages
+                .iter()
+                .all(|m| m.message != crate::user32::WinMsg::WM_PAINT.as_u32()
+                    && m.message != crate::user32::WM_ERASEBKGND),
+            "a hidden window's invalidated region must not be synthesized as a paint"
+        );
+    }
+    // The invalidation is NOT consumed: the window repaints when shown again
+    // (ShowWindow(SW_SHOW) re-arms it) — no stale skipped paint is lost.
+    assert!(
+        state
+            .window_state()
+            .windows
+            .iter()
+            .find(|w| w.handle.as_u64() == hidden)
+            .is_some_and(|w| w.invalidated),
+        "the hidden window's invalidation survives the skipped synthesis"
+    );
+}
+
+/// Control for the hidden-window gate: a VISIBLE invalidated window is still
+/// selected and its `WM_PAINT` is synthesized and delivered by GetMessage.
+#[test]
+fn synthesize_wm_paint_selects_visible_invalidated_windows() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    state.window_state().message_queue_idle_policy = MessageQueueIdlePolicy::YieldOnIdle;
+    let top = 0x6610_0101_u64;
+    let child = 0x6610_0102_u64;
+    state.window_state().windows.push(WindowRecord {
+        handle: crate::handles::Hwnd::from(top),
+        visible: true,
+        width: 200,
+        height: 100,
+        ..Default::default()
+    });
+    state.window_state().windows.push(WindowRecord {
+        handle: crate::handles::Hwnd::from(child),
+        parent_handle: crate::handles::Hwnd::from(top),
+        control_kind: Some(crate::user32::controls::ControlClassKind::StatusBar),
+        visible: true,
+        invalidated: true,
+        ..Default::default()
+    });
+
+    write_regs(&mut engine, 0x3000, 0, 0, 0, 0x3000);
+    let result = crate::user32::handle_get_message_a(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("GetMessageA must deliver the synthesized WM_PAINT");
+    assert_eq!(
+        result.return_value, 1,
+        "GetMessage returns 1 for a delivered paint"
+    );
+    let mut bytes = [0_u8; 4];
+    engine
+        .mem_read(0x3008, &mut bytes)
+        .expect("read MSG.message");
+    assert_eq!(
+        u32::from_le_bytes(bytes),
+        crate::user32::WinMsg::WM_PAINT.as_u32(),
+        "the visible invalidated window's WM_PAINT is synthesized"
+    );
+    // The visible window's invalidation was consumed by the synthesis.
+    assert!(
+        state
+            .window_state()
+            .windows
+            .iter()
+            .find(|w| w.handle.as_u64() == child)
+            .is_some_and(|w| !w.invalidated),
+        "the synthesized window's invalidation is consumed"
+    );
+}

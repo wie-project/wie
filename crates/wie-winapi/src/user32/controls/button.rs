@@ -28,6 +28,14 @@ pub(super) fn paint_control(
     hwnd: u64,
     kind: ControlClassKind,
 ) -> Result<()> {
+    // Defense-in-depth: a hidden control must never paint (real Windows
+    // discards a hidden window's invalid region). The dispatch arm and the
+    // paint synthesizer both gate visibility, but a direct paint path would
+    // otherwise let a just-hidden status bar draw its strip over the control
+    // that grew into its space.
+    if find_window(state, hwnd).is_some_and(|w| !w.visible) {
+        return Ok(());
+    }
     tracing::trace!(target: "wiegui", kind = ?kind, hwnd, "control paint");
     let Some(info) = resolve_window_ancestor(state, hwnd) else {
         return Ok(());

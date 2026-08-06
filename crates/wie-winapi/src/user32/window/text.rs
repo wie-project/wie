@@ -61,6 +61,15 @@ pub fn handle_set_window_text_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
                 // sets the text — WM_UNDO must not revert past it (the
                 // WM_SETTEXT dispatch arm does the same).
                 crate::user32::controls::edit_clear_undo_buffer(state, window_handle);
+                // An EDIT's caret+selection reset to the document start when
+                // the text is set programmatically (real Windows). Without it
+                // a FileNew's `SetWindowText(hEdit, NULL)` leaves the stale
+                // caret, and the guest's Ln/Col status refresh reads the old
+                // position ("Col N doesn't return to 1 instantly").
+                if kind == Some(crate::user32::controls::ControlClassKind::Edit) {
+                    crate::user32::controls::edit_set_selection(state, window_handle, 0, 0);
+                    crate::user32::controls::edit_reset_invalid_rows(state, window_handle);
+                }
                 if matches!(
                     kind,
                     Some(crate::user32::controls::ControlClassKind::Button)
@@ -138,6 +147,13 @@ pub fn handle_set_window_text_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
                 // SetWindowText clears an EDIT's undo buffer (see the ANSI
                 // variant above).
                 crate::user32::controls::edit_clear_undo_buffer(state, window_handle);
+                // An EDIT's caret+selection reset to the document start when
+                // the text is set programmatically (real Windows; see the
+                // ANSI variant above).
+                if kind == Some(crate::user32::controls::ControlClassKind::Edit) {
+                    crate::user32::controls::edit_set_selection(state, window_handle, 0, 0);
+                    crate::user32::controls::edit_reset_invalid_rows(state, window_handle);
+                }
                 if matches!(
                     kind,
                     Some(crate::user32::controls::ControlClassKind::Button)

@@ -318,6 +318,7 @@ impl WieApp {
                 last_sent_size: None,
                 scale_factor,
                 retry_budget: RetryBudget::default(),
+                retry_at: None,
             };
             if is_first {
                 self.primary_hwnd = Some(rt.hwnd);
@@ -340,6 +341,14 @@ impl WieApp {
 /// repaint is the dominant cost, ~55 ms at 886×776), long enough to absorb
 /// macOS's trailing `Resized` events so the guest reallocates its DIB once.
 const RESIZE_SETTLE_MS: u64 = 50;
+
+/// How often a parked (budget-exhausted, `NotDrawn`) frame is re-armed for a
+/// present. A single-wake flow (the status-bar toggle publishes exactly one
+/// frame) whose present is lost would otherwise stay parked until the next
+/// input event re-publishes — the throttled retry recovers it without a
+/// frame-per-mutation storm (at most 10 wakeups/s, only while a frame is
+/// unpresented).
+const PARKED_RETRY_MS: u64 = 100;
 
 /// Per-window host state for one winit window — the payload of each entry in
 /// the [`WindowRegistry`]. One entry exists per guest top-level window; the
@@ -384,6 +393,13 @@ struct WindowRuntime {
     /// present is retried at most once per presentable frame, then parked
     /// until a natural redraw event (see [`RetryBudget`]).
     retry_budget: RetryBudget,
+    /// When a parked (budget-exhausted) frame should next be retried — the
+    /// throttled re-arm for SINGLE-wake flows (the status-bar toggle fires
+    /// exactly one publish wake; if that one present is `NotDrawn` the frame
+    /// parks with no follow-up publish to re-arm it, so the strip stays on
+    /// screen until the next input). `about_to_wait` re-requests the redraw
+    /// when the deadline passes and clears it on a `Drawn`.
+    retry_at: Option<Instant>,
 }
 
 /// One host winit window per guest top-level window, keyed by winit
@@ -791,6 +807,7 @@ impl ApplicationHandler<WieEvent> for WieApp {
                             // The frame reached the screen — the next present
                             // starts with a fresh retry budget.
                             rt.retry_budget.reset();
+                            rt.retry_at = None;
                         }
                         PresentOutcome::NotDrawn { retry } => {
                             // The frame never reached the screen. Keep
@@ -811,12 +828,17 @@ impl ApplicationHandler<WieEvent> for WieApp {
                             // frame ([`RetryBudget`]): a persistent skip — the
                             // window occluded, the acquire keeps timing out —
                             // must not spin the event loop. After the one
-                            // retry the frame stays pending in the presenter
-                            // and only a natural redraw event (a new publish,
-                            // a resize, an un-occlusion) retries it.
+                            // retry the frame parks; the throttled `retry_at`
+                            // deadline (about_to_wait) re-arms it periodically
+                            // so a SINGLE-wake flow (the status-bar toggle)
+                            // whose one present is lost is not stranded until
+                            // the next input.
                             if retry && rt.retry_budget.should_retry(&presented_pixels) {
                                 rt.retry_budget.consume(&presented_pixels);
                                 rt.window.request_redraw();
+                            } else if retry {
+                                rt.retry_at =
+                                    Some(Instant::now() + Duration::from_millis(PARKED_RETRY_MS));
                             }
                         }
                     }
@@ -1154,6 +1176,29 @@ impl ApplicationHandler<WieEvent> for WieApp {
         if any_settled {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
+
+        // Re-arm parked presents. A frame whose present was `NotDrawn` with
+        // the retry budget exhausted stays parked (no follow-up wake for a
+        // single-publish flow); when its deadline passes, retry it with a
+        // fresh budget. Bounded: at most one wakeup per `PARKED_RETRY_MS`
+        // per parked window, and it stops the moment the frame draws.
+        let now = Instant::now();
+        let mut earliest_retry: Option<Instant> = None;
+        for rt in self.windows.values_mut() {
+            let Some(at) = rt.retry_at else {
+                continue;
+            };
+            if at <= now {
+                rt.retry_at = None;
+                rt.retry_budget.reset();
+                rt.window.request_redraw();
+            } else {
+                earliest_retry = Some(earliest_retry.map_or(at, |e| e.min(at)));
+            }
+        }
+        if let Some(at) = earliest_retry {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(at));
+        }
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WieEvent) {
@@ -1184,22 +1229,23 @@ impl ApplicationHandler<WieEvent> for WieApp {
                 } else {
                     self.reconcile_windows(event_loop);
                 }
-                // Coalesce wake storms. Every publish sets the flag; the
-                // first Frame event after a publish group requests the
-                // redraws and later duplicates (which see the flag cleared)
-                // skip. A real new frame is never dropped: any new publish
-                // re-sets the flag AND enqueues another Frame event, and each
-                // window's RedrawRequested additionally skips only when its
-                // own frame is unchanged (per-window ptr_eq skip).
-                if self
+                // Request a redraw for EVERY publish wake, without the
+                // coalescing drop. The flag previously gated the request to
+                // the FIRST Frame event of a publish group, which could run
+                // BEFORE the group's final publish landed (the guest thread
+                // publishes at the idle boundary while the host event loop
+                // processes the earlier wake) — the final frame's wake was
+                // then coalesced away and the new surface never reached the
+                // OS window until the next input ("the status bar persists
+                // until a click"). `request_redraw` is cheap and winit
+                // coalesces it; each window's RedrawRequested additionally
+                // skips via the per-window ptr_eq compare, so a genuinely
+                // unchanged frame does no GPU work.
+                let _ = self
                     .pending_frame
-                    .swap(false, std::sync::atomic::Ordering::SeqCst)
-                {
-                    for rt in self.windows.values() {
-                        rt.window.request_redraw();
-                    }
-                } else {
-                    tracing::debug!(target: "wiegui", "coalesced duplicate Frame event");
+                    .swap(false, std::sync::atomic::Ordering::SeqCst);
+                for rt in self.windows.values() {
+                    rt.window.request_redraw();
                 }
                 // Apply any guest-requested geometry (SetWindowPlacement) to
                 // the host window. The winapi handler set a pending request

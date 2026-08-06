@@ -327,26 +327,32 @@ pub(super) fn edit_invalidate_span(state: &mut WinApiState, hwnd: u64, lo: usize
 
 /// Mark the rows a text mutation dirtied for the next paint: every visual
 /// row of the logical line holding the edit start (a wrapped line reflows as
-/// a whole), or everything from that line down when the edit crossed a line
-/// boundary (`\n` inserted/removed — the rows below shift position).
+/// a whole), or the whole EDIT when the edit crossed a line boundary
+/// (`\n` inserted/removed — every row below the edit shifts position, and a
+/// SHORTER replacement vacates rows that must be erased, so the pending band
+/// cannot narrow to the new text's extent).
 pub(super) fn edit_invalidate_mutation(
     state: &mut WinApiState,
     hwnd: u64,
     char_index: usize,
     crossed_lines: bool,
 ) {
+    if crossed_lines {
+        // A line-structure change reflows every row below the edit; the
+        // band-limited span [line_start, new-text-end] would leave the rows
+        // vacated by a SHORTER replacement painted with the old text (the
+        // Time/Date full-selection stale-rows bug). Full is the safe scope —
+        // the design's "structural change resets the band to full".
+        edit_invalidate_full(state, hwnd);
+        return;
+    }
     let Some((text, _, _, _)) = edit_geometry(state, hwnd) else {
         return;
     };
     let line = line_from_char(&text, char_index);
     let line_start = line_index_of(&text, line).unwrap_or(0);
     let line_end = line_start.saturating_add(line_char_len(&text, line).unwrap_or(0));
-    let hi = if crossed_lines {
-        text.chars().count()
-    } else {
-        line_end
-    };
-    edit_invalidate_span(state, hwnd, line_start, hi);
+    edit_invalidate_span(state, hwnd, line_start, line_end);
 }
 
 /// Narrow the caret-blink repaint to the caret's rows: the blink only toggles

@@ -497,16 +497,24 @@ fn status_bar_toggle_off_removes_the_strip_with_no_further_input() {
 
     // ONE command; after it NO further input is posted — the hidden bar's
     // strip must vanish from a published frame on the command's own pump
-    // cycles (the stale-surface repaint bug the user reports).
+    // cycles (the stale-surface repaint bug the user reports), and STAY gone
+    // across every subsequent frame. The bar is hidden but its SB_SETTEXTW
+    // invalidation outlives the hide; if the paint synthesizer queued its
+    // WM_PAINT, the bar would re-draw its strip over the edit's erase on a
+    // later cycle (the live ordering), so the assertion is that the strip
+    // never reappears in ANY published frame.
     handle.post_message(main, WM_COMMAND, u64::from(status_bar_id), 0);
 
     let mut after_face = before_face;
+    let mut observations = 0_u32;
+    let mut reappeared = false;
     for _ in 0..80 {
         let summary = session.run_until_stop(1_000_000).expect("run after toggle");
         if let Some(frame) = session.take_frame(main) {
+            observations += 1;
             after_face = count_status_bar_face(&frame, 40);
-            if after_face == 0 {
-                break;
+            if after_face != 0 {
+                reappeared = true;
             }
         }
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
@@ -514,11 +522,317 @@ fn status_bar_toggle_off_removes_the_strip_with_no_further_input() {
         }
     }
 
+    assert!(
+        observations > 1,
+        "the pump must observe several published frames after the toggle"
+    );
     assert_eq!(
         after_face, 0,
         "toggling the status bar OFF must remove its BTNFACE strip from the \
          published frame with NO further input (stale-surface repaint bug): \
          face pixels went {before_face} -> {after_face} — the user sees the \
          bar until a click forces a repaint"
+    );
+    assert!(
+        !reappeared,
+        "the hidden bar's strip must never re-appear in a later frame — the \
+         SB_SETTEXTW invalidation outlives the hide, and a synthesized \
+         WM_PAINT for the hidden bar would re-draw it over the edit's erase"
+    );
+}
+
+/// LIVE-symptom regression: Edit → Time/Date on a full selection replaces
+/// the whole document with the date string, and every row BELOW the inserted
+/// date must come up blank in the published frame — the vacated rows must
+/// not keep the old text's pixels (the "line under the replaced selection
+/// takes a few instants to clear" report).
+#[test]
+fn time_date_replace_all_clears_rows_below_the_date() {
+    let Some(path) = real_exe("notepad.exe") else {
+        eprintln!("skip: real_exes/notepad.exe not present");
+        return;
+    };
+    let _suite = gui_suite_serialize();
+    use wie_runtime::EntryTraceTermination;
+
+    const WM_COMMAND: u32 = 0x0111;
+    const WM_CHAR: u32 = 0x0102;
+    const EM_SETSEL: u32 = 0x00B1;
+    const CMD_TIME_DATE: u32 = 0x117;
+
+    let mut session =
+        wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
+            .expect("notepad session starts");
+    let handle = session.guest_handle();
+    pump_until_windows_ready(&mut session);
+
+    let main = session.first_guest_window_handle().unwrap_or(0);
+    let edit = session
+        .guest_windows_snapshot()
+        .iter()
+        .find(|(_, cls, ..)| cls == "EDIT")
+        .map(|(h, ..)| *h)
+        .unwrap_or(main);
+    assert_ne!(main, 0, "notepad main window exists");
+    assert_ne!(edit, 0, "notepad main EDIT exists");
+
+    // A multi-line document so a full replace leaves many vacated rows.
+    for n in 0..20 {
+        for ch in format!("line {n}\r").chars() {
+            handle.post_message(edit, WM_CHAR, u64::from(ch as u32), 0);
+        }
+    }
+    for _ in 0..30 {
+        let summary = session.run_until_stop(1_000_000).expect("run after typing");
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    // Ink in the rows below the first text line, BEFORE the replace — the
+    // rows that must end up blank.
+    let ink_below = |session: &wie_runtime::RuntimeSession| -> u32 {
+        let Some(frame) = session.take_frame(main) else {
+            return 0;
+        };
+        let mut ink = 0_u32;
+        for y in 60..frame.height.saturating_sub(40) {
+            for x in 4..frame.width.saturating_sub(620) {
+                let idx = usize::try_from(y).unwrap_or(0) * frame.width as usize
+                    + usize::try_from(x).unwrap_or(0);
+                if frame.pixels.get(idx).copied() != Some(0x00FF_FFFF) {
+                    ink += 1;
+                }
+            }
+        }
+        ink
+    };
+    assert!(
+        ink_below(&session) > 500,
+        "precondition: the rows below the first line carry the multi-line text"
+    );
+
+    // Select all, then ONE Time/Date command; after it NO further input is
+    // posted — the vacated rows must be blank in a published frame on the
+    // command's own pump cycles.
+    handle.post_message(edit, EM_SETSEL, 0, u64::from(u32::MAX)); // (0, -1)
+    for _ in 0..10 {
+        let _ = session
+            .run_until_stop(1_000_000)
+            .expect("run after select-all");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    handle.post_message(main, WM_COMMAND, u64::from(CMD_TIME_DATE), 0);
+
+    let mut ink_after = u32::MAX;
+    for _ in 0..80 {
+        let summary = session
+            .run_until_stop(1_000_000)
+            .expect("run after Time/Date");
+        ink_after = ink_below(&session);
+        if ink_after < 60 {
+            break;
+        }
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    assert!(
+        ink_after < 60,
+        "Time/Date on a full selection must clear the vacated rows with NO \
+         further input (stale-text repaint bug): below-rows ink stayed \
+         {ink_after} px"
+    );
+}
+
+/// LIVE-symptom regression: New resets the caret to the document start, so
+/// the status-bar Ln/Col indicator must read "Line 1, column 1" on the New
+/// command's OWN pump cycles (the "Col N doesn't return to 1 instantly"
+/// report). The guest refreshes the bar via `DIALOG_StatusBarUpdateAll` after
+/// `SetWindowText(hEdit, NULL)`; if the host fails to reset the edit caret,
+/// the refresh reads the stale position and the bar keeps the old column.
+#[test]
+fn new_resets_status_bar_line_col_to_one() {
+    let Some(path) = real_exe("notepad.exe") else {
+        eprintln!("skip: real_exes/notepad.exe not present");
+        return;
+    };
+    let _suite = gui_suite_serialize();
+    use wie_runtime::EntryTraceTermination;
+
+    const WM_COMMAND: u32 = 0x0111;
+    const WM_CHAR: u32 = 0x0102;
+    const CMD_NEW: u32 = 0x100;
+    const SBPART_CURPOS: usize = 0;
+
+    let mut session =
+        wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
+            .expect("notepad session starts");
+    let handle = session.guest_handle();
+    let prompt_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let prompt = Arc::clone(&prompt_fired);
+    handle.set_message_box_bridge(Box::new(move |_, _, _| {
+        prompt.store(true, std::sync::atomic::Ordering::SeqCst);
+        7 // IDNO — discard
+    }));
+    pump_until_windows_ready(&mut session);
+
+    let main = session.first_guest_window_handle().unwrap_or(0);
+    let edit = session
+        .guest_windows_snapshot()
+        .iter()
+        .find(|(_, cls, ..)| cls == "EDIT")
+        .map(|(h, ..)| *h)
+        .unwrap_or(main);
+    let status_bar = session
+        .guest_windows_snapshot()
+        .iter()
+        .find(|(_, cls, ..)| cls == "msctls_statusbar32")
+        .map(|(h, ..)| *h)
+        .unwrap_or(0);
+    assert_ne!(main, 0, "notepad main window exists");
+    assert_ne!(edit, 0, "notepad main EDIT exists");
+    assert_ne!(status_bar, 0, "notepad status bar exists");
+
+    // Type a multi-line document and leave the caret somewhere with a column
+    // > 1, so the pre-New status-bar part reads e.g. "Line 2, column 4".
+    for n in 0..3 {
+        for ch in format!("line {n}\r").chars() {
+            handle.post_message(edit, WM_CHAR, u64::from(ch as u32), 0);
+        }
+    }
+    for _ in 0..30 {
+        let summary = session.run_until_stop(1_000_000).expect("run after typing");
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    let before_text = handle.status_bar_part_text(status_bar, SBPART_CURPOS);
+
+    // ONE New command; the guest clears the edit and refreshes the bar. The
+    // save prompt bridge answers IDNO, so no further input is needed.
+    handle.post_message(main, WM_COMMAND, u64::from(CMD_NEW), 0);
+
+    let mut after_text = None;
+    for _ in 0..80 {
+        let summary = session.run_until_stop(1_000_000).expect("run after New");
+        after_text = handle.status_bar_part_text(status_bar, SBPART_CURPOS);
+        if after_text
+            .as_deref()
+            .is_some_and(|t| t == "Line 1, column 1")
+        {
+            break;
+        }
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    assert!(
+        prompt_fired.load(std::sync::atomic::Ordering::SeqCst),
+        "New on a dirty doc must fire the save prompt (the bridge)"
+    );
+    assert_eq!(
+        after_text.as_deref(),
+        Some("Line 1, column 1"),
+        "New must reset the status-bar Ln/Col indicator to the document start \
+         on its own pump cycles (the guest refreshes the bar after \
+         SetWindowText(NULL); a stale edit caret makes it read the old \
+         position) — before New it was {before_text:?}"
+    );
+}
+
+/// Wake/publish protocol pin for the "status bar persists until a click"
+/// class: the status-bar toggle publishes exactly ONE frame (the edit's
+/// full repaint over the strip), and that frame's publish MUST fire the
+/// presenter wake in the SAME run_until_stop that makes the strip-free frame
+/// observable. A wake that fires BEFORE the paint (a pre-paint
+/// `request_paint` latch bump) would make the host's redraw present the
+/// pre-toggle frame, with no follow-up wake to correct it — the stale strip
+/// stays until the next input. The host presenter itself is not headlessly
+/// testable (it needs a real wgpu/winit window), so this pins the
+/// wake/publish half of the protocol the presenter consumes.
+#[test]
+fn status_bar_toggle_wakes_with_its_publish() {
+    let Some(path) = real_exe("notepad.exe") else {
+        eprintln!("skip: real_exes/notepad.exe not present");
+        return;
+    };
+    let _suite = gui_suite_serialize();
+    use wie_runtime::EntryTraceTermination;
+
+    const WM_COMMAND: u32 = 0x0111;
+
+    let mut session =
+        wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
+            .expect("notepad session starts");
+    let handle = session.guest_handle();
+    pump_until_windows_ready(&mut session);
+
+    let main = session.first_guest_window_handle().unwrap_or(0);
+    assert_ne!(main, 0, "notepad main window exists");
+    let tree = handle.window_menu_items();
+    let status_bar_id = tree
+        .iter()
+        .flat_map(|top| top.children.iter())
+        .find(|child| child.title.to_lowercase().contains("status bar"))
+        .map(|child| child.id)
+        .unwrap_or(0);
+    assert_ne!(
+        status_bar_id, 0,
+        "the View menu must contain a Status Bar command"
+    );
+
+    // A wake counter — the wake runs on the guest thread inside publish
+    // (which holds the state lock), so it can only bump the counter; the
+    // pump loop reads the count around each run_until_stop.
+    let wake_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let wc = Arc::clone(&wake_count);
+    handle.set_wake(Box::new(move || {
+        wc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+
+    // Settle the startup frame; the wake count must be quiescent before the
+    // toggle (no pending pre-paint wake).
+    for _ in 0..10 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    let wakes_before_toggle = wake_count.load(std::sync::atomic::Ordering::SeqCst);
+
+    handle.post_message(main, WM_COMMAND, u64::from(status_bar_id), 0);
+
+    let mut face = u32::MAX;
+    let mut frame_wake_delta = 0_u32;
+    for _ in 0..80 {
+        let summary = session.run_until_stop(1_000_000).expect("run after toggle");
+        let wakes_after = wake_count.load(std::sync::atomic::Ordering::SeqCst);
+        if let Some(frame) = session.take_frame(main) {
+            face = count_status_bar_face(&frame, 40);
+            if face == 0 {
+                // The strip-free frame first became observable. The wake
+                // count delta across the whole toggle is the assertion: the
+                // flow must fire EXACTLY ONE wake (the publish's own — the
+                // publish fires the stored wake inside
+                // drain_pending_publishes). A pre-paint wake (e.g. a
+                // request_paint latch bump before the paint) would add a
+                // SECOND wake, and a publish that forgot to wake would leave
+                // the delta at 0 — the host's redraw would then present the
+                // pre-toggle frame with no follow-up.
+                frame_wake_delta = wakes_after.saturating_sub(wakes_before_toggle);
+                break;
+            }
+        }
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    assert_eq!(
+        face, 0,
+        "precondition: the toggle must drop the strip from the published frame"
+    );
+    assert_eq!(
+        frame_wake_delta, 1,
+        "the status-bar toggle must fire EXACTLY ONE wake — the publish's own          wake, fired inside drain_pending_publishes after the strip-free frame          is in the published slot (a pre-paint wake would present the          pre-toggle frame and strand the strip until the next input): wakes          before toggle {wakes_before_toggle}"
     );
 }
