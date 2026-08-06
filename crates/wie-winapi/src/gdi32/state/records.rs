@@ -294,6 +294,13 @@ pub struct FontRecord {
     /// The FIXED_PITCH bit (0x01) steers the monospace fallback at resolve
     /// time; recorded verbatim because `alloc_font` predates it.
     pub pitch: u8,
+    /// `lfStrikeOut` requested — the rasterizer paints a strike line through
+    /// the run. Recorded via [`GdiState::set_font_effects`] because
+    /// `alloc_font` predates it (same pattern as `pitch`).
+    pub strike_out: bool,
+    /// `lfUnderline` requested — the rasterizer paints an underline below the
+    /// baseline. See [`GdiState::set_font_effects`].
+    pub underline: bool,
 }
 
 /// Per-slot GDI state stored in `DllId::Gdi`.
@@ -449,6 +456,8 @@ impl GdiState {
             italic,
             charset,
             pitch: 0,
+            strike_out: false,
+            underline: false,
         });
         handle
     }
@@ -459,6 +468,16 @@ impl GdiState {
     pub fn set_font_pitch(&mut self, handle: Hfont, pitch: u8) {
         if let Some(font) = self.fonts.iter_mut().find(|font| font.handle == handle) {
             font.pitch = pitch;
+        }
+    }
+
+    /// Record the LOGFONT's `lfStrikeOut`/`lfUnderline` flags on a font (the
+    /// rasterizer draws the effect strokes from them). A no-op for an unknown
+    /// handle — the caller allocates the font first, so a miss is a bug.
+    pub fn set_font_effects(&mut self, handle: Hfont, strike_out: bool, underline: bool) {
+        if let Some(font) = self.fonts.iter_mut().find(|font| font.handle == handle) {
+            font.strike_out = strike_out;
+            font.underline = underline;
         }
     }
 

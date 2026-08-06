@@ -518,6 +518,36 @@ fn render_run(
         }
         target.write_row(engine, row, x0, x1, attrs.text_color, &row_alphas)?;
     }
+
+    // Effect strokes (GDI paints these AFTER the glyph ink, cutting through
+    // the text): a horizontal line per enabled effect in the run's color,
+    // spanning the whole visible band. Positions derive from the resolved
+    // font metrics like Windows' otmfsStrikeoutPos/otmfsUnderlinePos — strike
+    // ~45% of the ascent above the baseline (through the cap height),
+    // underline just below it — both ~5% of the em thick.
+    if (key.strike_out || key.underline) && span > 0 {
+        let stroke_alphas = vec![255_u8; span];
+        let stroke_thickness = resolved.height_px.div_euclid(20).max(1);
+        let stroke = |target: &mut TextTarget<'_>,
+                      row_start: i32,
+                      engine: &mut dyn wie_cpu::CpuEngine|
+         -> Result<()> {
+            for row in row_start..row_start.saturating_add(stroke_thickness) {
+                if row < y0 || row >= y1 {
+                    continue;
+                }
+                target.write_row(engine, row, x0, x1, attrs.text_color, &stroke_alphas)?;
+            }
+            Ok(())
+        };
+        if key.strike_out {
+            let strike_top = baseline.saturating_sub(round_i32(resolved.ascent * 0.45));
+            stroke(&mut *target, strike_top, engine)?;
+        }
+        if key.underline {
+            stroke(&mut *target, baseline.saturating_add(1), engine)?;
+        }
+    }
     Ok(Some(band))
 }
 
@@ -1432,6 +1462,178 @@ mod tests {
         assert!(
             ink > 20,
             "the page must carry rasterized text pixels (found {ink})"
+        );
+    }
+
+    /// Count rows of `text`'s line band that are SOLID ink across the whole
+    /// run advance — the signature of a drawn effect stroke. Proportional
+    /// glyph ink always leaves gaps between letters, so a no-effect run
+    /// yields 0; each strike/underline stroke yields 1.
+    fn solid_row_count(state: &mut WinApiState, hdc: u64, x: i32, y: i32, text: &str) -> usize {
+        let (advance, line_height) = state.with_font_engine(|state, font_engine| {
+            let (key, resolved) = crate::gdi32::state::dc_resolved_font(state, hdc, font_engine)
+                .expect("the DC's font resolves");
+            let advance = font_engine.text_advance(&resolved, &key, text, text.chars().count());
+            (advance, resolved.line_height())
+        });
+        let job = state
+            .gdi_state()
+            .find_print_job(Hdc::from(hdc))
+            .expect("print job");
+        let canvas = job.current.as_ref().expect("active page canvas");
+        let x_us = usize::try_from(x).unwrap_or(0);
+        let adv_us = usize::try_from(advance).unwrap_or(0);
+        let width_us = usize::try_from(canvas.width).unwrap_or(0);
+        let mut count = 0_usize;
+        for row in y..y.saturating_add(line_height) {
+            if row < 0 {
+                continue;
+            }
+            let row_idx = usize::try_from(row).unwrap_or(0);
+            let start = row_idx.saturating_mul(width_us).saturating_add(x_us);
+            let run = &canvas.pixels[start..start.saturating_add(adv_us)];
+            if run.iter().all(|&p| p != 0x00FF_FFFF) {
+                count = count.saturating_add(1);
+            }
+        }
+        count
+    }
+
+    /// LIVE-symptom repro: ChooseFontW toggling Strikeout/Underline writes
+    /// the LOGFONT flags (the comdlg32 write-back tests prove that seam), but
+    /// the drawn text showed NO effect. The broken seam is the render path:
+    /// CreateFontIndirectW must capture `lfUnderline`/`lfStrikeOut` into the
+    /// font record, the FontKey must carry them, and the rasterizer must
+    /// paint a stroke per enabled effect in the run's color, spanning the
+    /// whole advance, positioned from the font metrics (strike ~45% of the
+    /// ascent above the baseline, underline just below it).
+    #[test]
+    fn text_out_w_renders_strikeout_and_underline_effects() {
+        let mut engine = test_engine();
+        let mut state = test_winapi_state();
+        let hdc = create_print_dc(&mut engine, &mut state);
+
+        // A LOGFONT with BOTH effects on (what ChooseFontW OK produces when
+        // both checkboxes are ticked).
+        const LOGFONT_VA: u64 = 0x6000;
+        crate::guest_memory::with_typed_write::<crate::guest_layout::LogFontW, _, _>(
+            &mut engine,
+            LOGFONT_VA,
+            |lf| {
+                lf.height = -16;
+                lf.weight = 400;
+                lf.italic = 0;
+                lf.underline = 1;
+                lf.strike_out = 1;
+                lf.charset = 1;
+                lf.face_name = [0_u16; 32];
+                Ok(())
+            },
+        )
+        .expect("write LOGFONTW");
+        write_regs(&mut engine, LOGFONT_VA, 0, 0, 0);
+        let hfont = run(
+            &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+            crate::gdi32::handle_create_font_indirect_w,
+        );
+
+        // Seam 1 (write): the guest LOGFONT's effect flags must reach the GDI
+        // font record — pre-fix CreateFontIndirectW dropped them entirely.
+        let record = state
+            .gdi_state()
+            .find_font(crate::handles::Hfont::from(hfont))
+            .expect("font record");
+        assert!(record.underline, "lfUnderline must reach the font record");
+        assert!(record.strike_out, "lfStrikeOut must reach the font record");
+
+        assert_eq!(start_doc(&mut engine, &mut state, hdc), 1);
+        write_regs(&mut engine, hdc, 0, 0, 0);
+        assert_eq!(
+            run(
+                &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+                crate::gdi32::handle_start_page,
+            ),
+            1
+        );
+
+        const TEXT_VA: u64 = 0x4000;
+        write_utf16(&mut engine, TEXT_VA, "Hello print");
+        // Control: the same run with the DC's default font (no effects) must
+        // draw NO solid row — proportional glyph ink leaves letter gaps.
+        write_regs(&mut engine, hdc, 200, 300, TEXT_VA);
+        write_stack_args(&mut engine, 11, 0); // cch = 11 (WIDE chars)
+        assert_eq!(
+            run(
+                &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+                handle_text_out_w,
+            ),
+            11
+        );
+        assert_eq!(
+            solid_row_count(&mut state, hdc, 200, 300, "Hello print"),
+            0,
+            "a no-effect run must not draw a solid stroke row"
+        );
+
+        // Select the effect font and draw the same run below the control.
+        write_regs(&mut engine, hdc, hfont, 0, 0);
+        run(
+            &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+            crate::gdi32::handle_select_object,
+        );
+        write_regs(&mut engine, hdc, 200, 400, TEXT_VA);
+        write_stack_args(&mut engine, 11, 0);
+        assert_eq!(
+            run(
+                &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+                handle_text_out_w,
+            ),
+            11
+        );
+
+        // Seam 2 (render): the strike and underline rows — derived from the
+        // resolved font's metrics exactly as the rasterizer positions them —
+        // must be solid ink across the run's whole advance.
+        let (strike_top, underline_top, advance) = state.with_font_engine(|state, font_engine| {
+            let (key, resolved) = crate::gdi32::state::dc_resolved_font(state, hdc, font_engine)
+                .expect("effect font resolves");
+            let baseline = 400_i32.saturating_add(super::round_i32(resolved.ascent));
+            let advance = font_engine.text_advance(&resolved, &key, "Hello print", 11);
+            (
+                baseline.saturating_sub(super::round_i32(resolved.ascent * 0.45)),
+                baseline.saturating_add(1),
+                advance,
+            )
+        });
+        assert!(
+            strike_top < underline_top,
+            "the strike line must sit above the underline (strike {strike_top}, underline {underline_top})"
+        );
+        let job = state
+            .gdi_state()
+            .find_print_job(Hdc::from(hdc))
+            .expect("print job");
+        let canvas = job.current.as_ref().expect("active page canvas");
+        let width_us = usize::try_from(canvas.width).unwrap_or(0);
+        let adv_us = usize::try_from(advance).unwrap_or(0);
+        assert!(adv_us > 20, "the run must be wide enough to host a stroke");
+        for row in [strike_top, underline_top] {
+            let start = usize::try_from(row)
+                .unwrap_or(0)
+                .saturating_mul(width_us)
+                .saturating_add(200);
+            let run = &canvas.pixels[start..start.saturating_add(adv_us)];
+            assert!(
+                run.iter().all(|&p| p != 0x00FF_FFFF),
+                "row {row} must be a solid effect stroke in the run color"
+            );
+        }
+        // Exactly the two effect strokes are solid in the run's band (the
+        // control run already proved glyph ink alone never is).
+        assert_eq!(
+            solid_row_count(&mut state, hdc, 200, 400, "Hello print"),
+            2,
+            "strike + underline = 2 solid stroke rows"
         );
     }
 

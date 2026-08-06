@@ -68,7 +68,7 @@ const FALLBACK_FAMILIES: &[&str] = &[
 /// per 24 px glyph the cap bounds the cache to a few MB.
 const GLYPH_CACHE_CAP: usize = 4096;
 
-/// A font identity for caching: lowercase family + weight + italic.
+/// A font identity for caching: lowercase family + weight + italic + effects.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FontKey {
     /// Lowercased Win32 `lfFaceName` ("" = system default).
@@ -80,6 +80,12 @@ pub struct FontKey {
     /// `lfPitchAndFamily` carries the FIXED_PITCH bit (0x01): prefer a
     /// monospace face when the requested face is unavailable.
     pub fixed_pitch: bool,
+    /// `lfStrikeOut` requested — the rasterizer paints a strike line through
+    /// the run (positioned from the resolved ascent).
+    pub strike_out: bool,
+    /// `lfUnderline` requested — the rasterizer paints an underline below the
+    /// baseline.
+    pub underline: bool,
 }
 
 impl Default for FontKey {
@@ -89,6 +95,8 @@ impl Default for FontKey {
             weight: 400,
             italic: false,
             fixed_pitch: false,
+            strike_out: false,
+            underline: false,
         }
     }
 }
@@ -954,6 +962,8 @@ mod tests {
             weight: 400,
             italic: false,
             fixed_pitch: true,
+            strike_out: false,
+            underline: false,
         };
         let Some(resolved) = engine.resolve(&key, 16) else {
             return; // no system fonts — nothing to resolve
@@ -985,6 +995,8 @@ mod tests {
             weight: 400,
             italic: false,
             fixed_pitch: true,
+            strike_out: false,
+            underline: false,
         };
         let Some(resolved) = engine.resolve(&key, height_px_from_lf(-13)) else {
             return; // no system fonts — nothing to resolve
@@ -1032,6 +1044,8 @@ mod tests {
                 weight: 400,
                 italic: false,
                 fixed_pitch: false,
+                strike_out: false,
+                underline: false,
             };
             if super::round_px(engine.resolve(&key, 16)?.line_gap) != 0 {
                 Some(key.family)
@@ -1047,6 +1061,8 @@ mod tests {
             weight: 400,
             italic: false,
             fixed_pitch: false,
+            strike_out: false,
+            underline: false,
         };
         let Some(resolved) = engine.resolve(&key, 16) else {
             return;
@@ -1079,6 +1095,42 @@ mod tests {
         assert_eq!(fontdb_weight_for(700), 700);
         assert_eq!(fontdb_weight_for(1000), 700);
         assert_eq!(fontdb_weight_for(i32::MIN), 400);
+    }
+
+    #[test]
+    fn font_key_includes_effects() {
+        // `lfUnderline`/`lfStrikeOut` are part of the font identity: two keys
+        // differing only in an effect are distinct (a plain resolve must never
+        // serve an underlined run's cached metrics — the rasterizer reads the
+        // effect flags off the key to paint the strokes). Pre-fix the key
+        // ignored the effects entirely, so the renderer had no signal to draw
+        // them.
+        let plain = FontKey::default();
+        let underlined = FontKey {
+            underline: true,
+            ..plain.clone()
+        };
+        let struck = FontKey {
+            strike_out: true,
+            ..plain.clone()
+        };
+        let both = FontKey {
+            strike_out: true,
+            underline: true,
+            ..plain.clone()
+        };
+        assert_ne!(plain, underlined, "underline must distinguish the key");
+        assert_ne!(plain, struck, "strikeout must distinguish the key");
+        assert_ne!(underlined, struck, "the two effects are independent bits");
+        assert_eq!(
+            FontKey {
+                strike_out: true,
+                underline: true,
+                ..plain.clone()
+            },
+            both,
+            "the effect bits round-trip through the key"
+        );
     }
 
     #[test]

@@ -323,7 +323,7 @@ fn handle_create_font_indirect_impl(
         return ctx.finish(0);
     }
 
-    let (height, weight, italic, charset, pitch, face_name) = if wide {
+    let (height, weight, italic, charset, pitch, underline, strike_out, face_name) = if wide {
         with_typed_read::<LogFontW, _, _>(engine, logfont_ptr, |lf| {
             Ok((
                 lf.height,
@@ -331,6 +331,8 @@ fn handle_create_font_indirect_impl(
                 lf.italic != 0,
                 lf.charset,
                 lf.pitch_and_family,
+                lf.underline != 0,
+                lf.strike_out != 0,
                 decode_utf16_lossy(&lf.face_name),
             ))
         })
@@ -342,6 +344,8 @@ fn handle_create_font_indirect_impl(
                 lf.italic != 0,
                 lf.charset,
                 lf.pitch_and_family,
+                lf.underline != 0,
+                lf.strike_out != 0,
                 decode_ansi_lossy(&lf.face_name),
             ))
         })
@@ -353,12 +357,17 @@ fn handle_create_font_indirect_impl(
         .gdi_state()
         .alloc_font(face_name.clone(), height, weight, italic, charset);
     state.gdi_state().set_font_pitch(handle, pitch);
+    state
+        .gdi_state()
+        .set_font_effects(handle, strike_out, underline);
 
     tracing::debug!(
         handle = handle.as_u64(),
         height,
         weight,
         italic,
+        strike_out,
+        underline,
         charset,
         pitch,
         face_name,
@@ -406,23 +415,30 @@ pub(crate) fn window_font_resolution(
     // font table (NULL / never set / stale / foreign) — resolves the system
     // default: sans-serif, 16 px, regular. A bad handle must never fail the
     // whole control paint.
-    let (family, height, weight, italic, fixed_pitch) = state
+    let (family, height, weight, italic, fixed_pitch, strike_out, underline) = state
         .try_gdi_state()
         .and_then(|gdi| gdi.find_font(stored))
-        .map_or((String::new(), 0, 400, false, false), |font| {
-            (
-                font.family.clone(),
-                font.height,
-                font.weight,
-                font.italic,
-                font.pitch & 0x01 != 0,
-            )
-        });
+        .map_or(
+            (String::new(), 0, 400, false, false, false, false),
+            |font| {
+                (
+                    font.family.clone(),
+                    font.height,
+                    font.weight,
+                    font.italic,
+                    font.pitch & 0x01 != 0,
+                    font.strike_out,
+                    font.underline,
+                )
+            },
+        );
     let key = FontKey {
         family: family.to_ascii_lowercase(),
         weight,
         italic,
         fixed_pitch,
+        strike_out,
+        underline,
     };
     let resolved = font_engine.resolve(&key, height_px_from_lf(height))?;
     Some((key, resolved))
@@ -460,7 +476,7 @@ fn resolve_stored_font(
     font_engine: &mut FontEngine,
 ) -> Option<(FontKey, ResolvedFont)> {
     let gdi = state.try_gdi_state()?;
-    let (family, height, weight, italic, fixed_pitch) = match font_handle {
+    let (family, height, weight, italic, fixed_pitch, strike_out, underline) = match font_handle {
         Some(font_handle) => {
             let font = gdi.find_font(font_handle)?;
             (
@@ -469,15 +485,19 @@ fn resolve_stored_font(
                 font.weight,
                 font.italic,
                 font.pitch & 0x01 != 0,
+                font.strike_out,
+                font.underline,
             )
         }
-        None => (String::new(), 0, 400, false, false),
+        None => (String::new(), 0, 400, false, false, false, false),
     };
     let key = FontKey {
         family: family.to_ascii_lowercase(),
         weight,
         italic,
         fixed_pitch,
+        strike_out,
+        underline,
     };
     let resolved = font_engine.resolve(&key, height_px_from_lf(height))?;
     Some((key, resolved))
