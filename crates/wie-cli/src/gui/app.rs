@@ -317,7 +317,7 @@ impl WieApp {
                 last_resize: None,
                 last_sent_size: None,
                 scale_factor,
-                retry_budget: RetryBudget::default(),
+                retried_once: false,
                 retry_at: None,
                 occluded_retries: 0,
                 occluded: false,
@@ -399,10 +399,10 @@ struct WindowRuntime {
     /// `ScaleFactorChanged`.  The guest space is logical; every winit
     /// physical value crossing the window boundary divides by this.
     scale_factor: f64,
-    /// Bounded redraw-retry budget for the present loop: a `NotDrawn`
-    /// present is retried at most once per presentable frame, then parked
-    /// until a natural redraw event (see [`RetryBudget`]).
-    retry_budget: RetryBudget,
+    /// Whether the current published frame already consumed its one
+    /// immediate present retry. Reset on every publish wake (a new frame
+    /// deserves a fresh attempt) and on a Drawn present.
+    retried_once: bool,
     /// When a parked (budget-exhausted) frame should next be retried — the
     /// throttled re-arm for SINGLE-wake flows (the status-bar toggle fires
     /// exactly one publish wake; if that one present is `NotDrawn` the frame
@@ -453,47 +453,44 @@ use crate::gui::present_wgpu::PresentOutcome;
 
 /// Bounded redraw-retry budget for one window's present loop.
 ///
-/// A present that skips the draw (`NotDrawn { retry: true }` — occluded or
-/// out-of-date surface) must be retried, but a PERSISTENT skip must not spin
-/// the event loop. The pre-bound code re-requested the redraw unconditionally,
-/// so a window that stayed occluded (the acquire keeps timing out) looped
-/// forever: acquire-skip → re-request → acquire-skip → ... Each presentable
-/// frame now gets at most ONE immediate retry; after that the frame stays
-/// pending in the presenter (its `last_uploaded` holds it) and only a NATURAL
-/// redraw event — a new guest publish (Frame wake), a resize, a scale-factor
-/// change, or an un-occlusion (`Occluded(false)`) — retries it.
-#[derive(Debug, Default)]
-struct RetryBudget {
-    /// The pixels Arc of the frame that already consumed its one immediate
-    /// retry. The compare is exact: every publish wraps the painted buffer in
-    /// a fresh `Arc`, so `Arc::ptr_eq` distinguishes "the same frame again"
-    /// (budget spent) from "a genuinely new frame" (fresh budget).
-    retried: Option<Arc<Vec<u32>>>,
+/// The delay before the next present attempt after a `NotDrawn` skip, or
+/// `None` to park the frame. Pure so the retry policy is unit-testable: the
+/// first skip of a frame retries immediately, repeat skips re-arm throttled
+/// (fast while visible, slow + capped while occluded), and once the occluded
+/// bound is spent the frame parks until `Occluded(false)` or a new publish
+/// (a Frame wake resets `retried_once`, granting a fresh immediate attempt).
+fn retry_delay(retried_once: bool, occluded: bool, occluded_retries: u8) -> Option<Duration> {
+    if !retried_once {
+        Some(Duration::ZERO)
+    } else if occluded {
+        (occluded_retries < OCCLUDED_RETRY_MAX).then(|| Duration::from_millis(OCCLUDED_RETRY_MS))
+    } else {
+        Some(Duration::from_millis(PARKED_RETRY_MS))
+    }
 }
 
-impl RetryBudget {
-    /// Whether a just-`NotDrawn` present of `pixels` should trigger an
-    /// immediate redraw retry. `true` for the FIRST skip of a frame (fresh
-    /// budget), `false` for the same frame's repeats — those park the frame
-    /// and wait for a natural redraw event.
-    fn should_retry(&self, pixels: &Arc<Vec<u32>>) -> bool {
-        self.retried
-            .as_ref()
-            .is_none_or(|prev| !Arc::ptr_eq(prev, pixels))
+impl WindowRuntime {
+    /// Schedule the next present attempt after a `NotDrawn` skip — the ONE
+    /// place that decides retry timing; `about_to_wait` is the only executor.
+    /// See [`retry_delay`] for the policy.
+    fn schedule_present_retry(&mut self) {
+        match retry_delay(self.retried_once, self.occluded, self.occluded_retries) {
+            Some(delay) => {
+                self.retried_once = true;
+                if self.occluded {
+                    self.occluded_retries += 1;
+                }
+                self.retry_at = Some(Instant::now() + delay);
+            }
+            None => self.retry_at = None,
+        }
     }
 
-    /// Mark `pixels` as having consumed its one immediate retry (called right
-    /// before the redraw is re-requested).
-    fn consume(&mut self, pixels: &Arc<Vec<u32>>) {
-        self.retried = Some(Arc::clone(pixels));
-    }
-
-    /// The frame reached the screen — the next present starts with a fresh
-    /// budget. Dropping the held Arc never unpins anything the presenter does
-    /// not already pin (`last_uploaded` / `last_presented` hold the same
-    /// frames while they matter).
-    fn reset(&mut self) {
-        self.retried = None;
+    /// A frame reached the screen: the next present starts fresh.
+    fn note_present_drawn(&mut self) {
+        self.retried_once = false;
+        self.retry_at = None;
+        self.occluded_retries = 0;
     }
 }
 
@@ -835,63 +832,25 @@ impl ApplicationHandler<WieEvent> for WieApp {
                             rt.last_presented_size = Some((dst_w, dst_h));
                             // The frame reached the screen — the next present
                             // starts with a fresh retry budget.
-                            rt.retry_budget.reset();
-                            rt.retry_at = None;
-                            rt.occluded_retries = 0;
+                            rt.note_present_drawn();
                         }
                         PresentOutcome::NotDrawn { retry } => {
-                            // The frame never reached the screen. Keep
-                            // last_presented_* stale — the ptr_eq skip above
-                            // would otherwise reject the retry of this same
-                            // frame — and re-request the redraw when the skip
-                            // is transient (occluded/out-of-date surface). This
-                            // is what makes a modal dialog's FIRST composite
-                            // frame appear: the dialog publishes once (into the
-                            // owner surface) and then the guest parks in its
-                            // in-guest modal loop, so a lost present has no
-                            // follow-up publish to re-arm the redraw — the
-                            // dialog stays invisible until a mouse event
-                            // repaints it. The backend skips the redundant
-                            // staging re-upload on the retry, so this is cheap.
-                            //
-                            // The re-request is BOUNDED to one per presentable
-                            // frame ([`RetryBudget`]): a persistent skip — the
-                            // window occluded, the acquire keeps timing out —
-                            // must not spin the event loop. After the one
-                            // retry the frame parks; the throttled `retry_at`
-                            // deadline (about_to_wait) re-arms it periodically
-                            // so a SINGLE-wake flow (the status-bar toggle)
-                            // whose one present is lost is not stranded until
-                            // the next input.
-                            if retry && rt.retry_budget.should_retry(&presented_pixels) {
-                                rt.retry_budget.consume(&presented_pixels);
-                                rt.window.request_redraw();
-                            } else if retry {
-                                // Budget spent: re-arm. Visible windows get
-                                // the fast cadence (transient timeout/outdated
-                                // surface). Occluded windows get a few slow
-                                // tries — enough to recover a frame published
-                                // while the window was briefly covered, then
-                                // park until `Occluded(false)` or a new
-                                // publish. The fast cadence while occluded
-                                // would spin forever; no re-arm at all could
-                                // strand the frame when the un-occlusion
-                                // event never arrives.
-                                if !rt.occluded {
-                                    rt.occluded_retries = 0;
-                                    rt.retry_at = Some(
-                                        Instant::now()
-                                            + Duration::from_millis(PARKED_RETRY_MS),
-                                    );
-                                } else if rt.occluded_retries < OCCLUDED_RETRY_MAX {
-                                    rt.occluded_retries += 1;
-                                    rt.retry_at = Some(
-                                        Instant::now()
-                                            + Duration::from_millis(OCCLUDED_RETRY_MS),
-                                    );
-                                } else {
-                                    rt.retry_at = None;
-                                }
+                            // The frame never reached the screen (occluded,
+                            // out-of-date surface, or a transient acquire
+                            // failure). Keep last_presented_* stale — the
+                            // ptr_eq skip above would otherwise reject the
+                            // retry of this same frame. One scheduling
+                            // decision covers every case (see
+                            // `WindowRuntime::schedule_present_retry`): the
+                            // first skip retries immediately, repeat skips
+                            // re-arm at a throttled cadence, and the frame
+                            // parks once the bound is spent — so a single
+                            // lost present (a modal dialog's first composite
+                            // frame, the status-bar toggle) still reaches
+                            // the screen, while a persistent skip (an
+                            // occluded window) cannot spin the event loop.
+                            if retry {
+                                rt.schedule_present_retry();
                             }
                         }
                     }
@@ -1230,11 +1189,11 @@ impl ApplicationHandler<WieEvent> for WieApp {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
 
-        // Re-arm parked presents. A frame whose present was `NotDrawn` with
-        // the retry budget exhausted stays parked (no follow-up wake for a
-        // single-publish flow); when its deadline passes, retry it with a
-        // fresh budget. Bounded: at most one wakeup per `PARKED_RETRY_MS`
-        // per parked window, and it stops the moment the frame draws.
+        // Re-arm parked presents. A frame whose present was `NotDrawn` and
+        // whose retry bound is spent stays parked (no follow-up wake for a
+        // single-publish flow); when its deadline passes, re-request the
+        // redraw. Bounded: at most one wakeup per retry cadence per parked
+        // window, and it stops the moment the frame draws.
         let now = Instant::now();
         let mut earliest_retry: Option<Instant> = None;
         for rt in self.windows.values_mut() {
@@ -1243,7 +1202,6 @@ impl ApplicationHandler<WieEvent> for WieApp {
             };
             if at <= now {
                 rt.retry_at = None;
-                rt.retry_budget.reset();
                 rt.window.request_redraw();
             } else {
                 earliest_retry = Some(earliest_retry.map_or(at, |e| e.min(at)));
@@ -1297,7 +1255,11 @@ impl ApplicationHandler<WieEvent> for WieApp {
                 let _ = self
                     .pending_frame
                     .swap(false, std::sync::atomic::Ordering::SeqCst);
-                for rt in self.windows.values() {
+                for rt in self.windows.values_mut() {
+                    // A publish wake means a genuinely new frame is in the
+                    // slot: the next present starts with a fresh immediate
+                    // retry (see `schedule_present_retry`).
+                    rt.retried_once = false;
                     rt.window.request_redraw();
                 }
                 // Apply any guest-requested geometry (SetWindowPlacement) to
@@ -1687,11 +1649,12 @@ pub fn run_gui_windowed(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use std::time::Duration;
 
     use super::{
-        RetryBudget, guest_size_from_physical, map_alert_result, map_message_box_buttons,
-        resolve_gui_run_source, window_attributes,
+        guest_size_from_physical, map_alert_result, map_message_box_buttons,
+        resolve_gui_run_source, retry_delay, window_attributes, OCCLUDED_RETRY_MAX,
+        OCCLUDED_RETRY_MS, PARKED_RETRY_MS,
     };
 
     /// `MB_*` button bits select the rfd button set; the bridge receives the
@@ -1810,33 +1773,44 @@ mod tests {
         assert_eq!(guest_size_from_physical(886, 776, 1.0), (886, 776));
     }
 
-    /// A `NotDrawn` present is retried at most ONCE per presentable frame:
-    /// the first skip of a frame re-requests the redraw; the same frame's
-    /// repeats park (no re-request); a genuinely NEW frame or a DRAWN frame
-    /// resets the budget. This is what bounds the occluded-window spin — the
-    /// pre-bound app re-requested unconditionally, so a window that stayed
-    /// occluded (acquire keeps timing out) looped forever.
+    /// The retry policy for a `NotDrawn` present: the first skip of a frame
+    /// retries immediately; repeat skips re-arm throttled — fast while
+    /// visible, slow while occluded, and at most `OCCLUDED_RETRY_MAX` slow
+    /// tries before the frame parks. A new frame (`retried_once` reset by a
+    /// publish wake) always gets a fresh immediate attempt, even while
+    /// parked. This is what bounds the occluded-window spin — the pre-bound
+    /// app re-requested unconditionally, so a window that stayed occluded
+    /// (acquire keeps timing out) looped forever.
     #[test]
-    fn notdrawn_present_retries_each_frame_at_most_once() {
-        let f1 = Arc::new(vec![1_u32]);
-        let f1_again = Arc::clone(&f1);
-        let f2 = Arc::new(vec![2_u32]);
-        let mut budget = RetryBudget::default();
-        // Fresh budget: the first NotDrawn of a frame triggers the retry.
-        assert!(budget.should_retry(&f1));
-        budget.consume(&f1);
-        // The SAME frame (same allocation, Arc::ptr_eq) may not retry again.
-        assert!(!budget.should_retry(&f1_again));
-        // A genuinely new frame (fresh allocation) gets a fresh budget.
-        assert!(budget.should_retry(&f2));
-        budget.consume(&f2);
-        assert!(!budget.should_retry(&f2));
-        // A frame that reached the screen resets the budget for the next
-        // present.
-        budget.reset();
-        assert!(budget.should_retry(&f1));
-        // An empty budget is exactly the default state (no frame retried yet).
-        assert!(budget.should_retry(&Arc::new(vec![3_u32])));
+    fn present_retry_delay_policy() {
+        // First skip of a frame: immediate.
+        assert_eq!(retry_delay(false, false, 0), Some(Duration::ZERO));
+        assert_eq!(retry_delay(false, true, 0), Some(Duration::ZERO));
+        // Repeat skip, visible: fast cadence.
+        assert_eq!(
+            retry_delay(true, false, 0),
+            Some(Duration::from_millis(PARKED_RETRY_MS))
+        );
+        // Repeat skip, occluded: slow cadence, capped at the bound.
+        assert_eq!(
+            retry_delay(true, true, 0),
+            Some(Duration::from_millis(OCCLUDED_RETRY_MS))
+        );
+        assert_eq!(
+            retry_delay(true, true, OCCLUDED_RETRY_MAX - 1),
+            Some(Duration::from_millis(OCCLUDED_RETRY_MS))
+        );
+        assert_eq!(
+            retry_delay(true, true, OCCLUDED_RETRY_MAX),
+            None,
+            "parked once the occluded bound is spent"
+        );
+        // A new frame always gets a fresh immediate attempt, even while
+        // parked (the publish wake reset `retried_once`).
+        assert_eq!(
+            retry_delay(false, true, OCCLUDED_RETRY_MAX),
+            Some(Duration::ZERO)
+        );
     }
 
     // -----------------------------------------------------------------------
