@@ -940,10 +940,10 @@ pub(super) fn edit_pos_from_char(
         // it is put back unconditionally. Safe under the single shared
         // WinApiState mutex — the take and the put cannot interleave with
         // another handler's.
-        let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
-        let line_h = crate::gdi32::window_font_resolution(state, hwnd, &mut font_engine)
-            .map_or(0, |(_key, resolved)| resolved.line_height());
-        state.gdi_state().font_engine = font_engine;
+        let line_h = state.with_font_engine(|state, font_engine| {
+            crate::gdi32::window_font_resolution(state, hwnd, font_engine)
+                .map_or(0, |(_key, resolved)| resolved.line_height())
+        });
         let line = line_from_char(&text, usize::try_from(char_index).unwrap_or(0));
         let y = i32::try_from(line).unwrap_or(0).saturating_mul(line_h);
         write_guest_i32(engine, point.wrapping_add(4), y)?;

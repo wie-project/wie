@@ -11,7 +11,7 @@ use super::{
     PaintFont, control_items, control_sel_index, control_state, control_state_mut, deliver_command,
 };
 use crate::gdi32::render_text_into_surface;
-use crate::gdi32::{FontKey, IRect, ResolvedWindow};
+use crate::gdi32::{IRect, ResolvedWindow};
 use crate::user32::{LBN_SELCHANGE, VK_DOWN, VK_UP, WinApiState, find_window, make_command_wparam};
 
 /// Draw the LISTBOX items (one line each) from the viewport's first-visible
@@ -194,16 +194,10 @@ pub(super) fn listbox_hit_item(
 /// default (the same resolution the paint path uses, so the scroll clamp and
 /// the painted rows always agree).
 fn listbox_line_height(state: &mut WinApiState, hwnd: u64) -> i32 {
-    let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
-    let default_key = FontKey::default();
-    let line_h = match crate::gdi32::window_font_resolution(state, hwnd, &mut font_engine) {
-        Some((_key, resolved)) => resolved.line_height(),
-        None => font_engine
-            .resolve(&default_key, 16)
-            .map_or(16, |resolved| resolved.line_height()),
-    };
-    state.gdi_state().font_engine = font_engine;
-    line_h
+    state.with_font_engine(|state, font_engine| {
+        crate::gdi32::window_font_resolution_or_default(state, hwnd, font_engine)
+            .map_or(16, |(_key, resolved)| resolved.line_height())
+    })
 }
 
 /// How many item rows fit in the LISTBOX client at the resolved line height

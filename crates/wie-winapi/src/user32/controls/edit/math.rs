@@ -4,7 +4,6 @@
 //! span mapping. Split from the monolithic `edit.rs`; the `pub(super)` items
 //! are the cross-file surface imported through `super::math::…`.
 
-use crate::gdi32::FontKey;
 use crate::user32::WinApiState;
 use crate::user32::controls::{ControlState, ES_MULTILINE};
 
@@ -390,31 +389,25 @@ pub(super) fn edit_scroll_context(state: &mut WinApiState, hwnd: u64) -> Option<
     // run next to it (the paint path does the same); it is put back
     // unconditionally. Safe under the single shared WinApiState mutex — the
     // take and the put cannot interleave with another handler's.
-    let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
-    let default_key = FontKey::default();
     // The STORED font (falling back to the system default) drives the line
     // height — the same resolution the paint path uses, so the scroll math
     // and the painted rows agree even after a WM_SETFONT.
-    let key_and_resolved = match crate::gdi32::window_font_resolution(state, hwnd, &mut font_engine)
-    {
-        Some(key_and_resolved) => Some(key_and_resolved),
-        None => font_engine
-            .resolve(&default_key, 16)
-            .map(|resolved| (default_key, resolved)),
-    };
-    let area = match &key_and_resolved {
-        Some((key, resolved)) => {
-            let line_h = resolved.line_height();
-            let advance = &mut |ch: char| font_engine.char_advance(resolved, key, ch);
-            edit_text_area(&text, width, client_height, line_h, style, caret, advance)
+    let area = state.with_font_engine(|state, font_engine| {
+        let key_and_resolved =
+            crate::gdi32::window_font_resolution_or_default(state, hwnd, font_engine);
+        match &key_and_resolved {
+            Some((key, resolved)) => {
+                let line_h = resolved.line_height();
+                let advance = &mut |ch: char| font_engine.char_advance(resolved, key, ch);
+                edit_text_area(&text, width, client_height, line_h, style, caret, advance)
+            }
+            // No system font: the 16 px default the EM_* line APIs assume, with
+            // a fixed 8 px/char advance for the wrap walk.
+            None => edit_text_area(&text, width, client_height, 16, style, caret, &mut |_| {
+                8_i32
+            }),
         }
-        // No system font: the 16 px default the EM_* line APIs assume, with
-        // a fixed 8 px/char advance for the wrap walk.
-        None => edit_text_area(&text, width, client_height, 16, style, caret, &mut |_| {
-            8_i32
-        }),
-    };
-    state.gdi_state().font_engine = font_engine;
+    });
     // The H scroll range is non-zero only while the H bar is shown — a wrap-on
     // EDIT (or a line that fits) has nothing to scroll, so WM_HSCROLL stays a
     // no-op there (the pre-deferral behavior).

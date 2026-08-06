@@ -259,9 +259,8 @@ fn handle_get_text_extent_point_32(
     // Width = the sum of the per-glyph advances of the resolved font (the
     // same advances the rasterizer uses, including the CJK fallback), so the
     // extent always matches the drawn text. Height = ascent + descent.
-    let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
-    let (width, height) = {
-        let resolved = dc_resolved_font(state, device_context_handle, &mut font_engine);
+    let (width, height) = state.with_font_engine(|state, font_engine| -> Result<(i32, i32)> {
+        let resolved = dc_resolved_font(state, device_context_handle, font_engine);
         match resolved {
             Some((key, resolved)) => {
                 let chars = crate::gdi32::text::read_text_chars(engine, text_ptr, count, wide)?;
@@ -271,12 +270,11 @@ fn handle_get_text_extent_point_32(
                         width = width.saturating_add(font_engine.char_advance(&resolved, &key, ch));
                     }
                 }
-                (width, resolved.line_height())
+                Ok((width, resolved.line_height()))
             }
-            None => (0, 16),
+            None => Ok((0, 16)),
         }
-    };
-    state.gdi_state().font_engine = font_engine;
+    })?;
 
     let width = width.max(0);
     let height = height.max(0);

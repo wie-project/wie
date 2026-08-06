@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 
-use crate::gdi32::{FontKey, window_font_resolution};
+use crate::gdi32::window_font_resolution_or_default;
 use crate::guest_memory::{checked_field_address, read_i32, write_u32 as write_guest_u32};
 use crate::user32::controls::{
     CCS_BOTTOM, CCS_NOPARENTALIGN, CCS_NORESIZE, ControlClassKind, ControlState, SB_GETPARTS,
@@ -649,14 +649,9 @@ fn status_bar_reposition(state: &mut WinApiState, hwnd: u64) -> Result<()> {
 /// The bar's default height: the stored control font's line height (the
 /// system default when none is set) plus the two client-edge border rows.
 fn status_bar_default_height(state: &mut WinApiState, hwnd: u64) -> Result<i32> {
-    let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
-    let default_key = FontKey::default();
-    let line_h = match window_font_resolution(state, hwnd, &mut font_engine) {
-        Some((_key, resolved)) => resolved.line_height(),
-        None => font_engine
-            .resolve(&default_key, 16)
-            .map_or(16, |resolved| resolved.line_height()),
-    };
-    state.gdi_state().font_engine = font_engine;
+    let line_h = state.with_font_engine(|state, font_engine| {
+        window_font_resolution_or_default(state, hwnd, font_engine)
+            .map_or(16, |(_key, resolved)| resolved.line_height())
+    });
     Ok(line_h.saturating_add(4))
 }

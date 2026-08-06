@@ -484,6 +484,27 @@ pub(crate) fn window_font_resolution(
     Some((key, resolved))
 }
 
+/// Resolve a window's stored font through [`window_font_resolution`], falling
+/// back to the system default (sans-serif, 16 px, regular) when the stored
+/// font cannot be resolved. Returns `None` only when the default lookup itself
+/// fails — the resolution every control paint/measure/hit-test path needs, so
+/// the per-site `match` + `FontKey::default()` fallback is folded here.
+pub(crate) fn window_font_resolution_or_default(
+    state: &WinApiState,
+    hwnd: u64,
+    font_engine: &mut FontEngine,
+) -> Option<(FontKey, ResolvedFont)> {
+    match window_font_resolution(state, hwnd, font_engine) {
+        Some(key_and_resolved) => Some(key_and_resolved),
+        None => {
+            let default_key = FontKey::default();
+            font_engine
+                .resolve(&default_key, 16)
+                .map(|resolved| (default_key, resolved))
+        }
+    }
+}
+
 /// Resolve an optional stored HFONT (or the system default when `None`) into
 /// a [`FontKey`] + resolved px metrics. An HFONT absent from the GDI font
 /// table fails the lookup (`None`) — the per-window path turns that into the

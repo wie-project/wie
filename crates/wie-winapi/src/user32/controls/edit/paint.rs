@@ -9,12 +9,12 @@
 
 use anyhow::Result;
 
-use crate::gdi32::{FontKey, IRect, ResolvedWindow};
+use crate::gdi32::{IRect, ResolvedWindow};
 use crate::state::WindowFlags;
 use crate::user32::controls::{
     COLOR_BTNFACE, COLOR_BTNHIGHLIGHT, COLOR_BTNSHADOW, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT,
     ControlState, Dimension, ES_MULTILINE, EditInvalidRows, EditInvalidation, PaintCtx, PaintFont,
-    TextGeom, control_state, invalidate,
+    TextGeom, control_state, invalidate_and_request_paint,
 };
 use crate::user32::{WinApiState, find_window};
 
@@ -242,11 +242,10 @@ pub(super) fn edit_invalidate_rows(
         EditInvalidation::Clean => EditInvalidation::Band(EditInvalidRows { lo, hi, wrap_width }),
     };
     *invalid_rows = next;
-    invalidate(state, hwnd);
     // Every row-band edit mutation (typing, caret move, selection, paste,
-    // undo, the caret blink) funnels through here — bump the content revision
-    // so the idle reconcile republishes the surface.
-    crate::present::PresentState::request_paint(state, hwnd);
+    // undo, the caret blink) funnels through here — mark the window and bump
+    // the content revision so the idle reconcile republishes the surface.
+    invalidate_and_request_paint(state, hwnd);
 }
 
 /// Mark the whole EDIT dirty for the next paint — every structural change: a
@@ -261,10 +260,10 @@ pub(super) fn edit_invalidate_full(state: &mut WinApiState, hwnd: u64) {
     {
         *invalid_rows = EditInvalidation::Full;
     }
-    invalidate(state, hwnd);
     // Structural edit changes (whole-text replacement, scroll, font, resize)
-    // funnel through here — bump the content revision (the repaint latch).
-    crate::present::PresentState::request_paint(state, hwnd);
+    // funnel through here — mark the window and bump the content revision
+    // (the repaint latch).
+    invalidate_and_request_paint(state, hwnd);
 }
 
 /// Reset an EDIT's pending invalidation to [`EditInvalidation::Full`]
@@ -294,31 +293,26 @@ pub(super) fn edit_invalidate_span(state: &mut WinApiState, hwnd: u64, lo: usize
         return;
     };
     // The font engine is taken out of gdi state so the advance closure can
-    // run next to `state` (the established pattern); it is put back
-    // unconditionally. Safe under the single shared WinApiState mutex — the
-    // take and the put cannot interleave with another handler's.
-    let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
-    let default_key = FontKey::default();
-    let key_and_resolved = match crate::gdi32::window_font_resolution(state, hwnd, &mut font_engine)
-    {
-        Some(key_and_resolved) => Some(key_and_resolved),
-        None => font_engine
-            .resolve(&default_key, 16)
-            .map(|resolved| (default_key, resolved)),
-    };
-    let band = match &key_and_resolved {
-        Some((key, resolved)) => {
-            let line_h = resolved.line_height();
-            let caret = edit_caret_of(state, hwnd);
-            let wrap = edit_wrap_from_style(style);
-            let advance = &mut |ch: char| font_engine.char_advance(resolved, key, ch);
-            let area = edit_text_area(&text, width, height, line_h, style, caret, advance);
-            let (first, last) = span_row_range(&text, area.wrap_width, wrap, lo, hi, advance);
-            Some((first, last, area.wrap_width))
+    // run next to `state` (the established pattern, now structural via
+    // `with_font_engine`); it is put back unconditionally. Safe under the
+    // single shared WinApiState mutex — the take and the put cannot
+    // interleave with another handler's.
+    let band = state.with_font_engine(|state, font_engine| {
+        let key_and_resolved =
+            crate::gdi32::window_font_resolution_or_default(state, hwnd, font_engine);
+        match &key_and_resolved {
+            Some((key, resolved)) => {
+                let line_h = resolved.line_height();
+                let caret = edit_caret_of(state, hwnd);
+                let wrap = edit_wrap_from_style(style);
+                let advance = &mut |ch: char| font_engine.char_advance(resolved, key, ch);
+                let area = edit_text_area(&text, width, height, line_h, style, caret, advance);
+                let (first, last) = span_row_range(&text, area.wrap_width, wrap, lo, hi, advance);
+                Some((first, last, area.wrap_width))
+            }
+            None => None,
         }
-        None => None,
-    };
-    state.gdi_state().font_engine = font_engine;
+    });
     let Some((first, last, wrap_width)) = band else {
         return;
     };
@@ -367,10 +361,10 @@ pub(super) fn edit_invalidate_mutation(
 /// the layout cannot be resolved.
 pub(super) fn edit_invalidate_caret(state: &mut WinApiState, hwnd: u64) {
     let Some(context) = edit_scroll_context(state, hwnd) else {
-        invalidate(state, hwnd);
         // The caret blink is a visible change even when the layout cannot be
-        // resolved (the fallback full invalidate) — bump the latch.
-        crate::present::PresentState::request_paint(state, hwnd);
+        // resolved (the fallback full invalidate) — mark the window and bump
+        // the latch.
+        invalidate_and_request_paint(state, hwnd);
         return;
     };
     let last_drawn = match control_state(state, hwnd) {

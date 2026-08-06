@@ -379,6 +379,28 @@ impl WinApiState {
         self.dll_states.get_or_init::<gdi32::GdiState>(DllId::Gdi)
     }
 
+    /// Run `f` with the font engine taken out of GDI state, putting it back
+    /// unconditionally when `f` returns — including on early `return`s inside
+    /// `f`, which would silently drop the engine from `gdi_state` under the
+    /// manual take/put idiom.
+    ///
+    /// The engine is taken out so the paint/measure/hit-test bodies can pass
+    /// `&mut state` and `&mut FontEngine` side by side (a plain field cannot
+    /// be split-borrowed alongside `state`); the helper makes the put-back
+    /// structural. Safe under the single shared `WinApiState` mutex: every
+    /// API handler — the caller and any concurrent one on another host
+    /// thread — runs while holding it, so the take and the put cannot
+    /// interleave.
+    pub fn with_font_engine<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self, &mut gdi32::FontEngine) -> T,
+    ) -> T {
+        let mut font_engine = std::mem::take(&mut self.gdi_state().font_engine);
+        let result = f(self, &mut font_engine);
+        self.gdi_state().font_engine = font_engine;
+        result
+    }
+
     /// Mutable access to present state (compositing surfaces, frame publishing).
     pub fn present(&mut self) -> &mut present::PresentState {
         self.dll_states

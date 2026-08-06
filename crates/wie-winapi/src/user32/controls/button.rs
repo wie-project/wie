@@ -16,7 +16,7 @@ use super::{
 use crate::gdi32::fill_rect_surface;
 use crate::gdi32::resolve_window_ancestor;
 use crate::gdi32::{FontEngine, FontKey, ResolvedFont};
-use crate::gdi32::{IRect, ResolvedWindow};
+use crate::gdi32::{IRect, ResolvedWindow, intersect_rect, union_rect};
 use crate::state::WindowFlags;
 use crate::user32::controls::paint::fill_surface_rect_above_clipped;
 use crate::user32::{WinApiState, find_window};
@@ -77,47 +77,89 @@ pub(super) fn paint_control(
     // 16 px). Both resolve through the same engine cache. The engine is taken
     // out of gdi state so the paint can pass `&mut state` and `&mut font_engine`
     // side by side (a plain field cannot be split-borrowed alongside `state`);
-    // it is put back unconditionally after the body. This is safe under the
-    // single shared WinApiState mutex: every API handler — this WM_PAINT and
-    // any concurrent one on another host thread — runs while holding it, so
-    // the take and the put cannot interleave.
-    let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
-    let default_key = FontKey::default();
-    let key_and_resolved = match crate::gdi32::window_font_resolution(state, hwnd, &mut font_engine)
-    {
-        Some(key_and_resolved) => Some(key_and_resolved),
-        None => font_engine
-            .resolve(&default_key, 16)
-            .map(|resolved| (default_key, resolved)),
-    };
-    let result = (|| -> Result<()> {
-        let Some((key, resolved)) = &key_and_resolved else {
-            // No system font: paint faces/borders but skip the text.
-            return Ok(());
-        };
-        match kind {
-            ControlClassKind::Button => {
-                // The repaint scope: the pending face/caption rect, or the
-                // whole client — a clean scope, a structural change, a stale
-                // rect whose size no longer matches, or the first paint. The
-                // erase covers exactly the scope, so the published frame's
-                // region is the true changed area (the B3 dirty-region
-                // machinery the EDIT's row band feeds).
-                let dirty = control_dirty_rect(state, hwnd, size);
-                if dirty == IRect::from_xywh(0, 0, size.width, size.height) {
-                    // Full repaint: face + border + caption (the pre-scope
-                    // path, byte-identical).
-                    paint_face_and_border(state, &info, size, pressed);
-                } else {
-                    // Partial repaint: erase only the dirty rect with the
-                    // current face color. The border is redrawn only when the
-                    // dirty rect covers a border pixel (the erase overpaints
-                    // it otherwise); it is unchanged by press/text scopes.
-                    let face = if pressed {
-                        COLOR_BTNFACE_PRESSED
+    // `with_font_engine` puts it back unconditionally. Safe under the single
+    // shared WinApiState mutex: every API handler — this WM_PAINT and any
+    // concurrent one on another host thread — runs while holding it, so the
+    // take and the put cannot interleave.
+    state.with_font_engine(|state, font_engine| {
+        let key_and_resolved =
+            crate::gdi32::window_font_resolution_or_default(state, hwnd, font_engine);
+        (|| -> Result<()> {
+            let Some((key, resolved)) = &key_and_resolved else {
+                // No system font: paint faces/borders but skip the text.
+                return Ok(());
+            };
+            match kind {
+                ControlClassKind::Button => {
+                    // The repaint scope: the pending face/caption rect, or the
+                    // whole client — a clean scope, a structural change, a stale
+                    // rect whose size no longer matches, or the first paint. The
+                    // erase covers exactly the scope, so the published frame's
+                    // region is the true changed area (the B3 dirty-region
+                    // machinery the EDIT's row band feeds).
+                    let dirty = control_dirty_rect(state, hwnd, size);
+                    if dirty == IRect::from_xywh(0, 0, size.width, size.height) {
+                        // Full repaint: face + border + caption (the pre-scope
+                        // path, byte-identical).
+                        paint_face_and_border(state, &info, size, pressed);
                     } else {
-                        COLOR_BTNFACE
-                    };
+                        // Partial repaint: erase only the dirty rect with the
+                        // current face color. The border is redrawn only when the
+                        // dirty rect covers a border pixel (the erase overpaints
+                        // it otherwise); it is unchanged by press/text scopes.
+                        let face = if pressed {
+                            COLOR_BTNFACE_PRESSED
+                        } else {
+                            COLOR_BTNFACE
+                        };
+                        fill_surface_rect_above_clipped(
+                            state,
+                            &info,
+                            IRect::from_xywh(
+                                info.offset_x.saturating_add(dirty.left),
+                                info.offset_y.saturating_add(dirty.top),
+                                dirty.width(),
+                                dirty.height(),
+                            ),
+                            face,
+                        );
+                        if rect_touches_border(dirty, size) {
+                            stroke_border(state, &info, size, COLOR_BTNSHADOW);
+                        }
+                    }
+                    // The caption is always redrawn: the dirty rect is the union
+                    // of the old and new caption rects (or the face), so the new
+                    // glyphs land inside the erased area and the previous glyphs
+                    // are gone.
+                    // The ampersand is a mnemonic marker, not caption glyph.
+                    let caption = strip_mnemonics(&text);
+                    let tx =
+                        centered_text_x(&info, size.width, &caption, font_engine, resolved, key);
+                    paint_label(
+                        &mut PaintCtx { state, engine },
+                        &info,
+                        &caption,
+                        TextGeom {
+                            tx,
+                            width: size.width,
+                            height: size.height,
+                        },
+                        pressed,
+                        &mut PaintFont {
+                            engine: font_engine,
+                            resolved,
+                            key,
+                        },
+                    )?;
+                    consume_control_invalidation(state, hwnd);
+                }
+                ControlClassKind::Static => {
+                    // COLOR_BTNFACE, not COLOR_WINDOW: a label sits on the dialog
+                    // face and must not show as a white box (full WM_CTLCOLOR* is
+                    // deferred). The erase covers only the pending caption rect
+                    // (or the whole client for a full repaint), so the region
+                    // reports the true changed area.
+                    let dirty = control_dirty_rect(state, hwnd, size);
                     fill_surface_rect_above_clipped(
                         state,
                         &info,
@@ -127,218 +169,169 @@ pub(super) fn paint_control(
                             dirty.width(),
                             dirty.height(),
                         ),
-                        face,
+                        COLOR_BTNFACE,
                     );
-                    if rect_touches_border(dirty, size) {
-                        stroke_border(state, &info, size, COLOR_BTNSHADOW);
-                    }
+                    let caption = strip_mnemonics(&text);
+                    let tx = info.offset_x.saturating_add(2);
+                    paint_label(
+                        &mut PaintCtx { state, engine },
+                        &info,
+                        &caption,
+                        TextGeom {
+                            tx,
+                            width: size.width,
+                            height: size.height,
+                        },
+                        false,
+                        &mut PaintFont {
+                            engine: font_engine,
+                            resolved,
+                            key,
+                        },
+                    )?;
+                    consume_control_invalidation(state, hwnd);
                 }
-                // The caption is always redrawn: the dirty rect is the union
-                // of the old and new caption rects (or the face), so the new
-                // glyphs land inside the erased area and the previous glyphs
-                // are gone.
-                // The ampersand is a mnemonic marker, not caption glyph.
-                let caption = strip_mnemonics(&text);
-                let tx =
-                    centered_text_x(&info, size.width, &caption, &mut font_engine, resolved, key);
-                paint_label(
-                    &mut PaintCtx { state, engine },
-                    &info,
-                    &caption,
-                    TextGeom {
-                        tx,
-                        width: size.width,
-                        height: size.height,
-                    },
-                    pressed,
-                    &mut PaintFont {
-                        engine: &mut font_engine,
-                        resolved,
-                        key,
-                    },
-                )?;
-                consume_control_invalidation(state, hwnd);
-            }
-            ControlClassKind::Static => {
-                // COLOR_BTNFACE, not COLOR_WINDOW: a label sits on the dialog
-                // face and must not show as a white box (full WM_CTLCOLOR* is
-                // deferred). The erase covers only the pending caption rect
-                // (or the whole client for a full repaint), so the region
-                // reports the true changed area.
-                let dirty = control_dirty_rect(state, hwnd, size);
-                fill_surface_rect_above_clipped(
-                    state,
-                    &info,
-                    IRect::from_xywh(
-                        info.offset_x.saturating_add(dirty.left),
-                        info.offset_y.saturating_add(dirty.top),
-                        dirty.width(),
-                        dirty.height(),
-                    ),
-                    COLOR_BTNFACE,
-                );
-                let caption = strip_mnemonics(&text);
-                let tx = info.offset_x.saturating_add(2);
-                paint_label(
-                    &mut PaintCtx { state, engine },
-                    &info,
-                    &caption,
-                    TextGeom {
-                        tx,
-                        width: size.width,
-                        height: size.height,
-                    },
-                    false,
-                    &mut PaintFont {
-                        engine: &mut font_engine,
-                        resolved,
-                        key,
-                    },
-                )?;
-                consume_control_invalidation(state, hwnd);
-            }
-            ControlClassKind::Edit => {
-                // Erase only the dirty rows — the pending invalid row band,
-                // or the whole client for a full repaint — so a caret blink
-                // or a typed character does not wipe the untouched rows
-                // (`paint_edit` redraws exactly the same band). The border is
-                // stroked after the erase exactly like the full fill was, so
-                // the edge pixels are preserved.
-                let edit_style = find_window(state, hwnd).map_or(0, |w| w.style);
-                let (band_top, band_bottom) = {
-                    let mut advance = |ch: char| font_engine.char_advance(resolved, key, ch);
-                    edit_dirty_band(
-                        state,
-                        hwnd,
+                ControlClassKind::Edit => {
+                    // Erase only the dirty rows — the pending invalid row band,
+                    // or the whole client for a full repaint — so a caret blink
+                    // or a typed character does not wipe the untouched rows
+                    // (`paint_edit` redraws exactly the same band). The border is
+                    // stroked after the erase exactly like the full fill was, so
+                    // the edge pixels are preserved.
+                    let edit_style = find_window(state, hwnd).map_or(0, |w| w.style);
+                    let (band_top, band_bottom) = {
+                        let mut advance = |ch: char| font_engine.char_advance(resolved, key, ch);
+                        edit_dirty_band(
+                            state,
+                            hwnd,
+                            &text,
+                            size,
+                            resolved.line_height(),
+                            edit_style,
+                            &mut advance,
+                        )
+                    };
+                    if band_bottom > band_top {
+                        // The band erase is the z-order-sensitive fill: a
+                        // full-width white band here would wipe an overlapping
+                        // window composited above the EDIT in the same surface
+                        // (the FindDialog — the live "dialog turns white" bug),
+                        // so the erase is decomposed around the above windows.
+                        fill_surface_rect_above_clipped(
+                            state,
+                            &info,
+                            IRect::from_xywh(
+                                info.offset_x,
+                                info.offset_y.saturating_add(band_top),
+                                size.width,
+                                band_bottom.saturating_sub(band_top),
+                            ),
+                            COLOR_WINDOW,
+                        );
+                    }
+                    stroke_border(state, &info, size, 0x0000_0000);
+                    let tx = info.offset_x.saturating_add(2);
+                    paint_edit(
+                        &mut PaintCtx { state, engine },
+                        &info,
                         &text,
-                        size,
-                        resolved.line_height(),
-                        edit_style,
-                        &mut advance,
-                    )
-                };
-                if band_bottom > band_top {
-                    // The band erase is the z-order-sensitive fill: a
-                    // full-width white band here would wipe an overlapping
-                    // window composited above the EDIT in the same surface
-                    // (the FindDialog — the live "dialog turns white" bug),
-                    // so the erase is decomposed around the above windows.
+                        TextGeom {
+                            tx,
+                            width: size.width,
+                            height: size.height,
+                        },
+                        &mut PaintFont {
+                            engine: font_engine,
+                            resolved,
+                            key,
+                        },
+                    )?;
+                }
+                ControlClassKind::ListBox => {
+                    // The repaint scope: the pending dirty rect (a scroll's
+                    // old+new visible bands, a selection change's rows, an item
+                    // append's row), or the whole client — a clean scope, a stale
+                    // rect whose size no longer matches, or the first paint. The
+                    // erase covers exactly the scope, so the published frame's
+                    // region is the true changed area (the same B3 dirty-region
+                    // machinery the EDIT/button bands feed). Only the rows inside
+                    // the scope render (`paint_item_lines` takes the rect), so a
+                    // partial repaint never wipes the untouched rows.
+                    let dirty = control_dirty_rect(state, hwnd, size);
                     fill_surface_rect_above_clipped(
                         state,
                         &info,
                         IRect::from_xywh(
-                            info.offset_x,
-                            info.offset_y.saturating_add(band_top),
-                            size.width,
-                            band_bottom.saturating_sub(band_top),
+                            info.offset_x.saturating_add(dirty.left),
+                            info.offset_y.saturating_add(dirty.top),
+                            dirty.width(),
+                            dirty.height(),
                         ),
                         COLOR_WINDOW,
                     );
+                    // The erase overpainted the 1 px border wherever the band
+                    // reaches it — re-stroke only those edges (the row bands span
+                    // the client's full width and start at its top edge, so a
+                    // mid-client band wipes the left/right edges but not the top
+                    // or bottom ones).
+                    stroke_border_partial(state, &info, size, dirty, 0x0000_0000);
+                    paint_item_lines(
+                        &mut PaintCtx { state, engine },
+                        &info,
+                        &items,
+                        size,
+                        sel_index,
+                        &mut PaintFont {
+                            engine: font_engine,
+                            resolved,
+                            key,
+                        },
+                        dirty,
+                    )?;
+                    consume_control_invalidation(state, hwnd);
                 }
-                stroke_border(state, &info, size, 0x0000_0000);
-                let tx = info.offset_x.saturating_add(2);
-                paint_edit(
-                    &mut PaintCtx { state, engine },
-                    &info,
-                    &text,
-                    TextGeom {
-                        tx,
-                        width: size.width,
-                        height: size.height,
-                    },
-                    &mut PaintFont {
-                        engine: &mut font_engine,
-                        resolved,
-                        key,
-                    },
-                )?;
+                ControlClassKind::ComboBox => {
+                    paint_face_and_border(state, &info, size, false);
+                    let first = items.first().map_or("", String::as_str);
+                    let tx = info.offset_x.saturating_add(4);
+                    paint_label(
+                        &mut PaintCtx { state, engine },
+                        &info,
+                        first,
+                        TextGeom {
+                            tx,
+                            width: size.width,
+                            height: size.height,
+                        },
+                        false,
+                        &mut PaintFont {
+                            engine: font_engine,
+                            resolved,
+                            key,
+                        },
+                    )?;
+                }
+                // The strip face/edges were painted before the font resolution;
+                // this arm only draws each part's text clipped to its cell.
+                ControlClassKind::StatusBar => {
+                    let (status_key, status_resolved) =
+                        status_bar_part_font(state, hwnd, font_engine, key, resolved);
+                    paint_status_bar_parts(
+                        state,
+                        engine,
+                        &info,
+                        hwnd,
+                        &mut PaintFont {
+                            engine: font_engine,
+                            resolved: &status_resolved,
+                            key: &status_key,
+                        },
+                    )?;
+                }
             }
-            ControlClassKind::ListBox => {
-                // The repaint scope: the pending dirty rect (a scroll's
-                // old+new visible bands, a selection change's rows, an item
-                // append's row), or the whole client — a clean scope, a stale
-                // rect whose size no longer matches, or the first paint. The
-                // erase covers exactly the scope, so the published frame's
-                // region is the true changed area (the same B3 dirty-region
-                // machinery the EDIT/button bands feed). Only the rows inside
-                // the scope render (`paint_item_lines` takes the rect), so a
-                // partial repaint never wipes the untouched rows.
-                let dirty = control_dirty_rect(state, hwnd, size);
-                fill_surface_rect_above_clipped(
-                    state,
-                    &info,
-                    IRect::from_xywh(
-                        info.offset_x.saturating_add(dirty.left),
-                        info.offset_y.saturating_add(dirty.top),
-                        dirty.width(),
-                        dirty.height(),
-                    ),
-                    COLOR_WINDOW,
-                );
-                // The erase overpainted the 1 px border wherever the band
-                // reaches it — re-stroke only those edges (the row bands span
-                // the client's full width and start at its top edge, so a
-                // mid-client band wipes the left/right edges but not the top
-                // or bottom ones).
-                stroke_border_partial(state, &info, size, dirty, 0x0000_0000);
-                paint_item_lines(
-                    &mut PaintCtx { state, engine },
-                    &info,
-                    &items,
-                    size,
-                    sel_index,
-                    &mut PaintFont {
-                        engine: &mut font_engine,
-                        resolved,
-                        key,
-                    },
-                    dirty,
-                )?;
-                consume_control_invalidation(state, hwnd);
-            }
-            ControlClassKind::ComboBox => {
-                paint_face_and_border(state, &info, size, false);
-                let first = items.first().map_or("", String::as_str);
-                let tx = info.offset_x.saturating_add(4);
-                paint_label(
-                    &mut PaintCtx { state, engine },
-                    &info,
-                    first,
-                    TextGeom {
-                        tx,
-                        width: size.width,
-                        height: size.height,
-                    },
-                    false,
-                    &mut PaintFont {
-                        engine: &mut font_engine,
-                        resolved,
-                        key,
-                    },
-                )?;
-            }
-            // The strip face/edges were painted before the font resolution;
-            // this arm only draws each part's text clipped to its cell.
-            ControlClassKind::StatusBar => {
-                let (status_key, status_resolved) =
-                    status_bar_part_font(state, hwnd, &mut font_engine, key, resolved);
-                paint_status_bar_parts(
-                    state,
-                    engine,
-                    &info,
-                    hwnd,
-                    &mut PaintFont {
-                        engine: &mut font_engine,
-                        resolved: &status_resolved,
-                        key: &status_key,
-                    },
-                )?;
-            }
-        }
-        Ok(())
-    })();
-    state.gdi_state().font_engine = font_engine;
-    result
+            Ok(())
+        })()
+    })
 }
 
 /// Paint a STATUSCLASSNAMEW strip: the BTNFACE face plus the classic raised
@@ -820,25 +813,8 @@ fn union_label_invalid(
     }
 }
 
-/// The smallest axis-aligned rect covering both inputs.
-fn union_rect(a: IRect, b: IRect) -> IRect {
-    IRect {
-        left: a.left.min(b.left),
-        top: a.top.min(b.top),
-        right: a.right.max(b.right),
-        bottom: a.bottom.max(b.bottom),
-    }
-}
-
-/// The overlap of two rects (empty when they do not overlap).
-fn intersect_rect(a: IRect, b: IRect) -> IRect {
-    IRect {
-        left: a.left.max(b.left),
-        top: a.top.max(b.top),
-        right: a.right.min(b.right),
-        bottom: a.bottom.min(b.bottom),
-    }
-}
+// The smallest axis-aligned rect covering both inputs.
+// (Shared `crate::gdi32::union_rect` — see `gdi32/blit.rs`.)
 
 /// Whether `rect` (client-relative) covers any pixel of a control's 1 px
 /// border — the erase filled it with the face color, so the border must be
@@ -875,12 +851,11 @@ pub(super) fn invalidate_control_rect(state: &mut WinApiState, hwnd: u64, rect: 
             _ => {}
         }
     }
-    super::invalidate(state, hwnd);
     // Every rect-scoped control change funnels through here — a button's
     // pressed face, a label's caption, a listbox's rows — so this is the
-    // button/label/listbox arm of the repaint latch: bump the content
-    // revision of the owning top-level.
-    crate::present::PresentState::request_paint(state, hwnd);
+    // button/label/listbox arm of the repaint latch: mark the window and
+    // bump the content revision of the owning top-level.
+    super::invalidate_and_request_paint(state, hwnd);
 }
 
 /// Reset a rect-scope control's pending invalidation to
@@ -950,51 +925,46 @@ pub(crate) fn label_invalidate_text_change(
         )
     });
     // The font engine is taken out of gdi state so the caption measurement
-    // can run next to `state` (the established pattern); it is put back
-    // unconditionally. Safe under the single shared WinApiState mutex — the
-    // take and the put cannot interleave with another handler's.
-    let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
-    let default_key = FontKey::default();
-    let key_and_resolved = match crate::gdi32::window_font_resolution(state, hwnd, &mut font_engine)
-    {
-        Some(key_and_resolved) => Some(key_and_resolved),
-        None => font_engine
-            .resolve(&default_key, 16)
-            .map(|resolved| (default_key, resolved)),
-    };
-    let rect = match &key_and_resolved {
-        Some((key, resolved)) => {
-            let line_h = resolved.line_height();
-            // The vertically centered caption band — the same `paint_label`
-            // geometry, client-relative.
-            let top = height.saturating_sub(line_h).saturating_div(2).max(0);
-            let mut rect_of = |caption: &str| {
-                let text_w =
-                    font_engine.text_advance(resolved, key, caption, caption.chars().count());
-                let left = if button {
-                    width.saturating_sub(text_w).saturating_div(2).max(0)
-                } else {
-                    2
+    // can run next to `state` (the established pattern, now structural via
+    // `with_font_engine`); it is put back unconditionally. Safe under the
+    // single shared WinApiState mutex — the take and the put cannot
+    // interleave with another handler's.
+    let rect = state.with_font_engine(|state, font_engine| {
+        let key_and_resolved =
+            crate::gdi32::window_font_resolution_or_default(state, hwnd, font_engine);
+        match &key_and_resolved {
+            Some((key, resolved)) => {
+                let line_h = resolved.line_height();
+                // The vertically centered caption band — the same `paint_label`
+                // geometry, client-relative.
+                let top = height.saturating_sub(line_h).saturating_div(2).max(0);
+                let mut rect_of = |caption: &str| {
+                    let text_w =
+                        font_engine.text_advance(resolved, key, caption, caption.chars().count());
+                    let left = if button {
+                        width.saturating_sub(text_w).saturating_div(2).max(0)
+                    } else {
+                        2
+                    };
+                    IRect::from_xywh(left, top, text_w, line_h)
                 };
-                IRect::from_xywh(left, top, text_w, line_h)
-            };
-            let union = union_rect(
-                rect_of(&strip_mnemonics(old_text)),
-                rect_of(&strip_mnemonics(new_text)),
-            );
-            // A pressed button shifts its caption one px down/right; pad so
-            // the erase covers both the shifted and unshifted ink.
-            let pad = if button { 1 } else { 0 };
-            IRect {
-                left: union.left.saturating_sub(pad),
-                top: union.top.saturating_sub(pad),
-                right: union.right.saturating_add(pad),
-                bottom: union.bottom.saturating_add(pad),
+                let union = union_rect(
+                    rect_of(&strip_mnemonics(old_text)),
+                    rect_of(&strip_mnemonics(new_text)),
+                );
+                // A pressed button shifts its caption one px down/right; pad so
+                // the erase covers both the shifted and unshifted ink.
+                let pad = if button { 1 } else { 0 };
+                IRect {
+                    left: union.left.saturating_sub(pad),
+                    top: union.top.saturating_sub(pad),
+                    right: union.right.saturating_add(pad),
+                    bottom: union.bottom.saturating_add(pad),
+                }
             }
+            None => IRect::from_xywh(0, 0, width, height),
         }
-        None => IRect::from_xywh(0, 0, width, height),
-    };
-    state.gdi_state().font_engine = font_engine;
+    });
     // Clamp to the control: a caption wider than the control clips at it
     // (the paint's own clip), so the region must not exceed the control.
     let rect = intersect_rect(rect, IRect::from_xywh(0, 0, width, height));
@@ -1042,8 +1012,9 @@ mod tests {
 
     // ── Rect-level invalidation (the label-control optimization lane) ──────
 
-    use super::{union_label_invalid, union_rect};
+    use super::union_label_invalid;
     use crate::gdi32::IRect;
+    use crate::gdi32::union_rect;
     use crate::user32::controls::{LabelInvalidRect, LabelInvalidation};
 
     /// Two partial marks before one paint union into one rect — the same

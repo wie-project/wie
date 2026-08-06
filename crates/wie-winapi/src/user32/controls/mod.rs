@@ -1084,7 +1084,7 @@ impl ControlClassKind {
                 // already bumped via the label seam) — bump here so a
                 // programmatic WM_SETTEXT republishes the new text.
                 if matches!(kind, Some(ControlClassKind::Edit)) {
-                    crate::present::PresentState::request_paint(state, hwnd);
+                    invalidate_and_request_paint(state, hwnd);
                 }
                 Ok(Some(1))
             }
@@ -1143,12 +1143,11 @@ impl ControlClassKind {
                     }
                     _ => -1,
                 };
-                invalidate(state, hwnd);
                 // A programmatic selection is a visible change for BOTH
                 // kinds; the LISTBOX row marks bump via the listbox seam, but
                 // the ComboBox shares this dispatch and the seam gates it out —
-                // bump here so the combo's selection republishes too.
-                crate::present::PresentState::request_paint(state, hwnd);
+                // mark + bump here so the combo's selection republishes too.
+                invalidate_and_request_paint(state, hwnd);
                 // A programmatic selection lands on a possibly-scrolled
                 // viewport: bring it into view like a click would (the scroll
                 // marks its own band change when it moves).
@@ -1199,11 +1198,10 @@ impl ControlClassKind {
                 // The appended row shows the new item (a LISTBOX only; the
                 // ComboBox arm shares this dispatch and ignores the mark).
                 listbox_invalidate_appended(state, hwnd);
-                invalidate(state, hwnd);
                 // An added item is a visible change for BOTH kinds; the
                 // LISTBOX row bump comes from the appended seam, the ComboBox
                 // needs this arm (the seam gates it out).
-                crate::present::PresentState::request_paint(state, hwnd);
+                invalidate_and_request_paint(state, hwnd);
                 Ok(Some(index))
             }
             (
@@ -1431,6 +1429,17 @@ fn invalidate(state: &mut WinApiState, hwnd: u64) {
     if let Some(window) = find_window_mut(state, hwnd) {
         window.invalidated = true;
     }
+}
+
+/// Mark a window for a future synthesized WM_PAINT and bump the owning
+/// top-level's content revision (the repaint latch) — the pair every control
+/// mutation's invalidation function ends with (the EDIT's row bands, the
+/// BUTTON/STATIC/LISTBOX rect scopes, the SETCURSEL/ADDSTRING arms). The
+/// window-layer callers that manage `invalidated` themselves keep calling
+/// `PresentState::request_paint` alone.
+fn invalidate_and_request_paint(state: &mut WinApiState, hwnd: u64) {
+    invalidate(state, hwnd);
+    crate::present::PresentState::request_paint(state, hwnd);
 }
 
 #[cfg(test)]

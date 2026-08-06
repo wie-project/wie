@@ -4,7 +4,6 @@
 //! to). Split from the monolithic `edit.rs`; the `pub(super)` items are the
 //! cross-file surface imported through `super::mouse::…`.
 
-use crate::gdi32::FontKey;
 use crate::user32::WinApiState;
 use crate::user32::controls::{ControlState, HitTestLayout, ScrollDrag, control_state};
 
@@ -120,64 +119,58 @@ fn edit_char_at_point(state: &mut WinApiState, hwnd: u64, x: i32, y: i32) -> Opt
     // The font engine is taken out of gdi state so the advance closure can
     // run next to it (the paint path does the same); it is put back
     // unconditionally. Safe under the single shared WinApiState mutex.
-    let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
-    let default_key = FontKey::default();
     // The STORED font (falling back to the system default) drives the line
     // height and the per-glyph advances — the same resolution the paint path
     // uses, so the click-to-caret mapping and the drawn glyphs agree.
-    let key_and_resolved = match crate::gdi32::window_font_resolution(state, hwnd, &mut font_engine)
-    {
-        Some(key_and_resolved) => Some(key_and_resolved),
-        None => font_engine
-            .resolve(&default_key, 16)
-            .map(|resolved| (default_key, resolved)),
-    };
-    let result = match &key_and_resolved {
-        Some((key, resolved)) => {
-            let line_h = resolved.line_height();
-            let advance = &mut |ch: char| font_engine.char_advance(resolved, key, ch);
-            let area = edit_text_area(&text, width, height, line_h, style, caret, advance);
-            // A wrap-off EDIT scrolled right draws its rows shifted left by
-            // the offset; add it back so the click maps to the drawn glyph.
-            let shift = if area.h_scroll_visible {
-                i32::try_from(first_visible_column).unwrap_or(0)
-            } else {
-                0
-            };
-            edit_char_index_at_point(
-                &text,
-                x.saturating_add(shift),
-                y,
-                &HitTestLayout {
-                    wrap_width: area.wrap_width,
-                    line_height: line_h,
-                    first_visible: first_visible_line,
-                    wrap,
-                    alignment,
-                },
-                advance,
-            )
+    let result = state.with_font_engine(|state, font_engine| {
+        let key_and_resolved =
+            crate::gdi32::window_font_resolution_or_default(state, hwnd, font_engine);
+        match &key_and_resolved {
+            Some((key, resolved)) => {
+                let line_h = resolved.line_height();
+                let advance = &mut |ch: char| font_engine.char_advance(resolved, key, ch);
+                let area = edit_text_area(&text, width, height, line_h, style, caret, advance);
+                // A wrap-off EDIT scrolled right draws its rows shifted left by
+                // the offset; add it back so the click maps to the drawn glyph.
+                let shift = if area.h_scroll_visible {
+                    i32::try_from(first_visible_column).unwrap_or(0)
+                } else {
+                    0
+                };
+                edit_char_index_at_point(
+                    &text,
+                    x.saturating_add(shift),
+                    y,
+                    &HitTestLayout {
+                        wrap_width: area.wrap_width,
+                        line_height: line_h,
+                        first_visible: first_visible_line,
+                        wrap,
+                        alignment,
+                    },
+                    advance,
+                )
+            }
+            // No system font: the 16 px default the EM_* line APIs assume, with
+            // a fixed 8 px/char advance for the hit test.
+            None => {
+                let area = edit_text_area(&text, width, height, 16, style, caret, &mut |_| 8_i32);
+                edit_char_index_at_point(
+                    &text,
+                    x,
+                    y,
+                    &HitTestLayout {
+                        wrap_width: area.wrap_width,
+                        line_height: 16,
+                        first_visible: first_visible_line,
+                        wrap,
+                        alignment,
+                    },
+                    &mut |_| 8_i32,
+                )
+            }
         }
-        // No system font: the 16 px default the EM_* line APIs assume, with
-        // a fixed 8 px/char advance for the hit test.
-        None => {
-            let area = edit_text_area(&text, width, height, 16, style, caret, &mut |_| 8_i32);
-            edit_char_index_at_point(
-                &text,
-                x,
-                y,
-                &HitTestLayout {
-                    wrap_width: area.wrap_width,
-                    line_height: 16,
-                    first_visible: first_visible_line,
-                    wrap,
-                    alignment,
-                },
-                &mut |_| 8_i32,
-            )
-        }
-    };
-    state.gdi_state().font_engine = font_engine;
+    });
     Some(result)
 }
 

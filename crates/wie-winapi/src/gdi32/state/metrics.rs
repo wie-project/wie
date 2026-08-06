@@ -32,9 +32,8 @@ struct TextMetrics {
 /// fallback for an unresolved font), so `GetTextMetricsA` and `GetTextMetricsW`
 /// can never disagree.
 fn resolve_text_metrics(state: &mut WinApiState, hdc: u64) -> TextMetrics {
-    let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
-    let (resolved, charset, bold, italic) = {
-        let resolved = dc_resolved_font(state, hdc, &mut font_engine);
+    let (resolved, charset, bold, italic) = state.with_font_engine(|state, font_engine| {
+        let resolved = dc_resolved_font(state, hdc, font_engine);
         match resolved {
             Some((key, resolved)) => {
                 let charset = state
@@ -51,8 +50,7 @@ fn resolve_text_metrics(state: &mut WinApiState, hdc: u64) -> TextMetrics {
             }
             None => (None, 0, false, false),
         }
-    };
-    state.gdi_state().font_engine = font_engine;
+    });
 
     let (height, ascent, descent, internal_leading, external_leading, avg_width, max_width) =
         match resolved {

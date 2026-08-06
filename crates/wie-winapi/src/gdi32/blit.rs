@@ -131,6 +131,32 @@ pub(crate) fn subtract_rect(rects: Vec<IRect>, child: IRect) -> Vec<IRect> {
     out
 }
 
+/// The smallest axis-aligned rect covering both inputs (the min/max union the
+/// dirty accumulators and the label-caption scopes apply). Callers keep their
+/// own empty-sentinel handling (a degenerate rect is NOT a union identity —
+/// blending a (0,0,0,0) origin into a write would widen the region to the
+/// surface's top-left).
+#[must_use]
+pub(crate) fn union_rect(a: IRect, b: IRect) -> IRect {
+    IRect {
+        left: a.left.min(b.left),
+        top: a.top.min(b.top),
+        right: a.right.max(b.right),
+        bottom: a.bottom.max(b.bottom),
+    }
+}
+
+/// The overlap of two rects (empty when they do not overlap).
+#[must_use]
+pub(crate) fn intersect_rect(a: IRect, b: IRect) -> IRect {
+    IRect {
+        left: a.left.max(b.left),
+        top: a.top.max(b.top),
+        right: a.right.min(b.right),
+        bottom: a.bottom.min(b.bottom),
+    }
+}
+
 /// Walk `windows` from `hwnd` to its top-level ancestor, accumulating the
 /// starting window's position in the ancestor's client coordinate space.
 ///
@@ -685,12 +711,7 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
             };
             Some(match acc {
                 None => piece,
-                Some(union) => IRect {
-                    left: union.left.min(piece.left),
-                    top: union.top.min(piece.top),
-                    right: union.right.max(piece.right),
-                    bottom: union.bottom.max(piece.bottom),
-                },
+                Some(union) => union_rect(union, piece),
             })
         });
         if let Some(dirty) = dirty {

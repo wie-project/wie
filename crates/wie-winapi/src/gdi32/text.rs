@@ -670,39 +670,40 @@ fn handle_text_out_impl(
         let attrs = dc_text_attrs(state, hdc);
         if !chars.is_empty() {
             // Take the font engine out of gdi state so the surface borrow
-            // below can coexist; put it back when the render is done.
-            let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
-            let resolved = dc_resolved_font(state, hdc, &mut font_engine);
-            let rendered: Result<()> = if let Some((key, resolved)) = resolved {
-                match resolve_text_target(state, hdc) {
-                    Some(ResolvedTextTarget {
-                        mut target,
-                        surface_hwnd,
-                    }) => {
-                        // Window-DC text marks its clipped line band as the
-                        // surface's dirty rect, so the next publish uploads
-                        // only the repainted line.
-                        let band = render_run(
-                            engine,
-                            &mut font_engine,
-                            &resolved,
-                            &key,
-                            &mut target,
-                            x,
-                            y,
-                            &chars,
-                            &attrs,
-                            None,
-                        )?;
-                        mark_surface_dirty(state, surface_hwnd, band.unwrap_or(IRect::empty()));
-                        Ok(())
+            // below can coexist; `with_font_engine` puts it back when the
+            // render is done.
+            let rendered: Result<()> = state.with_font_engine(|state, font_engine| {
+                let resolved = dc_resolved_font(state, hdc, font_engine);
+                if let Some((key, resolved)) = resolved {
+                    match resolve_text_target(state, hdc) {
+                        Some(ResolvedTextTarget {
+                            mut target,
+                            surface_hwnd,
+                        }) => {
+                            // Window-DC text marks its clipped line band as the
+                            // surface's dirty rect, so the next publish uploads
+                            // only the repainted line.
+                            let band = render_run(
+                                engine,
+                                font_engine,
+                                &resolved,
+                                &key,
+                                &mut target,
+                                x,
+                                y,
+                                &chars,
+                                &attrs,
+                                None,
+                            )?;
+                            mark_surface_dirty(state, surface_hwnd, band.unwrap_or(IRect::empty()));
+                            Ok(())
+                        }
+                        None => Ok(()),
                     }
-                    None => Ok(()),
+                } else {
+                    Ok(())
                 }
-            } else {
-                Ok(())
-            };
-            state.gdi_state().font_engine = font_engine;
+            });
             rendered?;
         }
     }
@@ -818,35 +819,35 @@ pub fn handle_ext_text_out_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         let chars = read_text_chars(engine, text_ptr, cch, true)?;
         let attrs = dc_text_attrs(state, hdc);
         if !chars.is_empty() {
-            let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
-            let resolved = dc_resolved_font(state, hdc, &mut font_engine);
-            let rendered: Result<()> = if let Some((key, resolved)) = resolved {
-                match resolve_text_target(state, hdc) {
-                    Some(ResolvedTextTarget {
-                        mut target,
-                        surface_hwnd,
-                    }) => {
-                        let band = render_run(
-                            engine,
-                            &mut font_engine,
-                            &resolved,
-                            &key,
-                            &mut target,
-                            x,
-                            y,
-                            &chars,
-                            &attrs,
-                            clip,
-                        )?;
-                        mark_surface_dirty(state, surface_hwnd, band.unwrap_or(IRect::empty()));
-                        Ok(())
+            let rendered: Result<()> = state.with_font_engine(|state, font_engine| {
+                let resolved = dc_resolved_font(state, hdc, font_engine);
+                if let Some((key, resolved)) = resolved {
+                    match resolve_text_target(state, hdc) {
+                        Some(ResolvedTextTarget {
+                            mut target,
+                            surface_hwnd,
+                        }) => {
+                            let band = render_run(
+                                engine,
+                                font_engine,
+                                &resolved,
+                                &key,
+                                &mut target,
+                                x,
+                                y,
+                                &chars,
+                                &attrs,
+                                clip,
+                            )?;
+                            mark_surface_dirty(state, surface_hwnd, band.unwrap_or(IRect::empty()));
+                            Ok(())
+                        }
+                        None => Ok(()),
                     }
-                    None => Ok(()),
+                } else {
+                    Ok(())
                 }
-            } else {
-                Ok(())
-            };
-            state.gdi_state().font_engine = font_engine;
+            });
             rendered?;
         }
     }
@@ -910,21 +911,22 @@ fn handle_draw_text_impl(
         };
 
         let attrs = dc_text_attrs(state, hdc);
-        let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
-        let resolved_font = dc_resolved_font(state, hdc, &mut font_engine);
-        let (line_h, text_w) = match &resolved_font {
-            Some((key, resolved)) => {
-                let mut width = 0_i32;
-                for &code in &chars {
-                    if let Some(ch) = char::from_u32(code) {
-                        width = width.saturating_add(font_engine.char_advance(resolved, key, ch));
+        let (line_h, text_w) = state.with_font_engine(|state, font_engine| {
+            let resolved_font = dc_resolved_font(state, hdc, font_engine);
+            match &resolved_font {
+                Some((key, resolved)) => {
+                    let mut width = 0_i32;
+                    for &code in &chars {
+                        if let Some(ch) = char::from_u32(code) {
+                            width =
+                                width.saturating_add(font_engine.char_advance(resolved, key, ch));
+                        }
                     }
+                    (resolved.line_height(), width)
                 }
-                (resolved.line_height(), width)
+                None => (16, 0),
             }
-            None => (16, 0),
-        };
-        state.gdi_state().font_engine = font_engine;
+        });
 
         // Horizontal alignment inside the rect.
         let rect_w = right.saturating_sub(left);
@@ -960,36 +962,38 @@ fn handle_draw_text_impl(
                 Some((left, top, right, bottom))
             };
             if !chars.is_empty() {
-                let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
-                let rendered: Result<()> = if let Some((key, resolved)) =
-                    dc_resolved_font(state, hdc, &mut font_engine)
-                {
-                    match resolve_text_target(state, hdc) {
-                        Some(ResolvedTextTarget {
-                            mut target,
-                            surface_hwnd,
-                        }) => {
-                            let band = render_run(
-                                engine,
-                                &mut font_engine,
-                                &resolved,
-                                &key,
-                                &mut target,
-                                x,
-                                y,
-                                &chars,
-                                &attrs,
-                                clip,
-                            )?;
-                            mark_surface_dirty(state, surface_hwnd, band.unwrap_or(IRect::empty()));
-                            Ok(())
+                let rendered: Result<()> = state.with_font_engine(|state, font_engine| {
+                    if let Some((key, resolved)) = dc_resolved_font(state, hdc, font_engine) {
+                        match resolve_text_target(state, hdc) {
+                            Some(ResolvedTextTarget {
+                                mut target,
+                                surface_hwnd,
+                            }) => {
+                                let band = render_run(
+                                    engine,
+                                    font_engine,
+                                    &resolved,
+                                    &key,
+                                    &mut target,
+                                    x,
+                                    y,
+                                    &chars,
+                                    &attrs,
+                                    clip,
+                                )?;
+                                mark_surface_dirty(
+                                    state,
+                                    surface_hwnd,
+                                    band.unwrap_or(IRect::empty()),
+                                );
+                                Ok(())
+                            }
+                            None => Ok(()),
                         }
-                        None => Ok(()),
+                    } else {
+                        Ok(())
                     }
-                } else {
-                    Ok(())
-                };
-                state.gdi_state().font_engine = font_engine;
+                });
                 rendered?;
             }
         }

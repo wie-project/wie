@@ -7,7 +7,6 @@
 
 use anyhow::Result;
 
-use crate::gdi32::FontKey;
 use crate::guest_memory::read_u16 as read_guest_u16;
 use crate::user32::controls::{ControlState, ES_MULTILINE, control_state};
 use crate::user32::{
@@ -31,18 +30,13 @@ pub(super) fn edit_move_caret(state: &mut WinApiState, hwnd: u64, vk: u64) -> bo
     let extend = shift_is_down(state);
     let ctrl = ctrl_is_down(state);
     // The font engine is taken out of gdi state so the stored-font resolution
-    // can run next to `state` (the same take/put the paint path uses); it is
-    // put back on every path below. Safe under the single shared WinApiState
-    // mutex — the take and the put cannot interleave with another handler's.
-    let mut font_engine = std::mem::take(&mut state.gdi_state().font_engine);
-    let default_key = FontKey::default();
-    let key_and_resolved = match crate::gdi32::window_font_resolution(state, hwnd, &mut font_engine)
-    {
-        Some(key_and_resolved) => Some(key_and_resolved),
-        None => font_engine
-            .resolve(&default_key, 16)
-            .map(|resolved| (default_key, resolved)),
-    };
+    // can run next to `state` (the same take/put the paint path uses, now
+    // structural via `with_font_engine`); it is put back unconditionally.
+    // Safe under the single shared WinApiState mutex — the take and the put
+    // cannot interleave with another handler's.
+    let key_and_resolved = state.with_font_engine(|state, font_engine| {
+        crate::gdi32::window_font_resolution_or_default(state, hwnd, font_engine)
+    });
     let mut dirty_span: Option<(usize, usize)> = None;
     // The character position the caret LEFT — its row is invalidated again
     // below, independent of the dirty span's row mapping and of `caret_on`.
@@ -145,7 +139,6 @@ pub(super) fn edit_move_caret(state: &mut WinApiState, hwnd: u64, vk: u64) -> bo
         dirty_span = Some((lo, hi));
         true
     })();
-    state.gdi_state().font_engine = font_engine;
     if !moved {
         return false;
     }

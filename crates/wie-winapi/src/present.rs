@@ -10,7 +10,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use crate::WinApiState;
-use crate::gdi32::IRect;
+use crate::gdi32::{IRect, union_rect};
 
 /// Global gate for B9 frame-timing instrumentation (publish / blit-copy /
 /// host-present wall times). Set by `RuntimeSession` when `WIE_RUNTIME_PROFILE`
@@ -500,10 +500,7 @@ impl PresentState {
                     // region to the surface's top-left). Start from the write.
                     *acc = rect;
                 } else {
-                    acc.left = acc.left.min(rect.left);
-                    acc.top = acc.top.min(rect.top);
-                    acc.right = acc.right.max(rect.right);
-                    acc.bottom = acc.bottom.max(rect.bottom);
+                    *acc = union_rect(*acc, rect);
                 }
             }
         }
