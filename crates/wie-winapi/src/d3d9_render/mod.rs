@@ -14,6 +14,7 @@
 
 mod blend;
 mod flow;
+mod operand;
 mod ps;
 mod sample;
 mod vertex;

@@ -1,11 +1,13 @@
 //! The PS 2.0 pixel-shader interpreter.
 
 use super::flow::{BlockState, FlowMap, FlowState, compare};
+use super::operand::{
+    comp, comp_opt, read_operand, read_operand_i32, read_three, read_two, write_operand,
+};
 use super::sample::{TextureStage, sample_texture};
 use crate::d3d9_shader::{
-    D3DSPDM_SATURATE, D3DSPSM_ABS, D3DSPSM_ABSNEG, D3DSPSM_BIAS, D3DSPSM_BIASNEG, D3DSPSM_COMP,
-    D3DSPSM_NEG, D3DSPSM_SIGN, D3DSPSM_SIGNNEG, D3DSPSM_X2, D3DSPSM_X2NEG, Operand, PS_CONST_COUNT,
-    PS_INPUT_COUNT, PS_SAMPLER_COUNT, PS_TEMP_COUNT, PsInstruction, PsOp, RegType,
+    Operand, PS_CONST_COUNT, PS_INPUT_COUNT, PS_SAMPLER_COUNT, PS_TEMP_COUNT, PsInstruction, PsOp,
+    RegType,
 };
 
 // ── PS 2.0 interpreter (fragment stage) ────────────────────────────────
@@ -49,124 +51,55 @@ struct PsRegisters {
     /// `p0` — predicate register (`setp` / predication / `breakp`).
     pred: [f32; 4],
 }
-/// Read the `i`-th component without indexing syntax (repo lint).
-#[inline]
-#[must_use]
-fn comp(value: [f32; 4], i: usize) -> f32 {
-    value.get(i).copied().unwrap_or(0.0)
-}
-/// Apply a source modifier (`D3DSPSM_*`) to a register value.
-///
-/// `DZ`/`DW` (texcoord-depth modifiers) and `NOT` (boolean registers) are
-/// unmodeled and read as identity — they do not occur in the ps_2_0 subset
-/// the interpreter executes.
-#[must_use]
-fn apply_src_mod(value: [f32; 4], src_mod: u8) -> [f32; 4] {
-    let [x, y, z, w] = value;
-    match src_mod {
-        D3DSPSM_NEG => [-x, -y, -z, -w],
-        D3DSPSM_BIAS => [x - 0.5, y - 0.5, z - 0.5, w - 0.5],
-        D3DSPSM_BIASNEG => [0.5 - x, 0.5 - y, 0.5 - z, 0.5 - w],
-        D3DSPSM_SIGN => [
-            if x >= 0.0 { 1.0 } else { -1.0 },
-            if y >= 0.0 { 1.0 } else { -1.0 },
-            if z >= 0.0 { 1.0 } else { -1.0 },
-            if w >= 0.0 { 1.0 } else { -1.0 },
-        ],
-        D3DSPSM_SIGNNEG => [
-            if x >= 0.0 { -1.0 } else { 1.0 },
-            if y >= 0.0 { -1.0 } else { 1.0 },
-            if z >= 0.0 { -1.0 } else { 1.0 },
-            if w >= 0.0 { -1.0 } else { 1.0 },
-        ],
-        D3DSPSM_COMP => [1.0 - x, 1.0 - y, 1.0 - z, 1.0 - w],
-        D3DSPSM_X2 => [2.0 * x, 2.0 * y, 2.0 * z, 2.0 * w],
-        D3DSPSM_X2NEG => [-2.0 * x, -2.0 * y, -2.0 * z, -2.0 * w],
-        D3DSPSM_ABS => [x.abs(), y.abs(), z.abs(), w.abs()],
-        D3DSPSM_ABSNEG => [-x.abs(), -y.abs(), -z.abs(), -w.abs()],
-        // NONE and any unmodeled modifier pass the value through.
-        _ => [x, y, z, w],
-    }
-}
-/// Reorder a register value by the operand's per-component swizzle.
-#[must_use]
-fn apply_swizzle(value: [f32; 4], swizzle: [u8; 4]) -> [f32; 4] {
-    [
-        comp(value, usize::from(swizzle[0])),
-        comp(value, usize::from(swizzle[1])),
-        comp(value, usize::from(swizzle[2])),
-        comp(value, usize::from(swizzle[3])),
-    ]
-}
-/// Read a source operand: register fetch → source modifier → swizzle.
-#[must_use]
-fn read_operand(regs: &PsRegisters, op: &Operand) -> [f32; 4] {
-    let base = match op.reg_type {
-        RegType::Temp => regs
-            .temp
-            .get(usize::from(op.reg_num))
-            .copied()
-            .unwrap_or([0.0; 4]),
-        RegType::Const => regs
-            .constants
-            .get(usize::from(op.reg_num))
-            .copied()
-            .unwrap_or([0.0; 4]),
-        RegType::Input => regs
-            .input
-            .get(usize::from(op.reg_num))
-            .copied()
-            .unwrap_or([0.0; 4]),
-        RegType::Texture => regs
-            .texcoord
-            .get(usize::from(op.reg_num))
-            .copied()
-            .unwrap_or([0.0; 4]),
-        // The ps_2_x loop/rep counters read int→float; the predicate reads
-        // its stored float value (ps_2_a/b flow-control forms).
-        RegType::Loop => {
-            let ints = regs.loop_regs;
-            [
-                ints.first().copied().unwrap_or(0) as f32,
-                ints.get(1).copied().unwrap_or(0) as f32,
-                ints.get(2).copied().unwrap_or(0) as f32,
-                ints.get(3).copied().unwrap_or(0) as f32,
-            ]
-        }
-        RegType::Predicate => regs.pred,
-        // ColorOut / Sampler / Other as a source is not valid ps_2_0.
-        _ => [0.0; 4],
-    };
-    apply_swizzle(apply_src_mod(base, op.src_mod), op.swizzle)
-}
-/// Write an operand's value into the register file (write mask + saturate).
-///
-/// `_sat` clamps the written components to `[0, 1]`; `_pp` (partial
-/// precision) is ignored (full f32 precision, documented). `oDepth` writes
-/// are stored nowhere — the fragment depth is still the interpolated
-/// z (documented; deferred with the vertex stage). `p0` accepts `setp` results.
-fn write_operand(regs: &mut PsRegisters, op: &Operand, value: [f32; 4]) {
-    let mut result = value;
-    if op.dst_mod == D3DSPDM_SATURATE {
-        for channel in &mut result {
-            *channel = channel.clamp(0.0, 1.0);
+/// The ps_2_0 register-file mapping: which `RegType` reads/writes which
+/// storage. The operand readers/writers live in [`super::operand`] and are
+/// generic over this trait; this impl is the pixel stage's only operand code.
+impl super::operand::ShaderRegisters for PsRegisters {
+    fn fetch(&self, reg_type: RegType, index: usize) -> [f32; 4] {
+        match reg_type {
+            RegType::Temp => self.temp.get(index).copied().unwrap_or([0.0; 4]),
+            RegType::Const => self.constants.get(index).copied().unwrap_or([0.0; 4]),
+            RegType::Input => self.input.get(index).copied().unwrap_or([0.0; 4]),
+            RegType::Texture => self.texcoord.get(index).copied().unwrap_or([0.0; 4]),
+            // The ps_2_x loop/rep counters read int→float; the predicate reads
+            // its stored float value (ps_2_a/b flow-control forms).
+            RegType::Loop => {
+                let ints = self.loop_regs;
+                [
+                    ints.first().copied().unwrap_or(0) as f32,
+                    ints.get(1).copied().unwrap_or(0) as f32,
+                    ints.get(2).copied().unwrap_or(0) as f32,
+                    ints.get(3).copied().unwrap_or(0) as f32,
+                ]
+            }
+            RegType::Predicate => self.pred,
+            // ColorOut / Sampler / Other as a source is not valid ps_2_0.
+            _ => [0.0; 4],
         }
     }
-    let target = match op.reg_type {
-        RegType::Temp => regs.temp.get_mut(usize::from(op.reg_num)),
-        RegType::ColorOut => Some(&mut regs.output),
-        RegType::Predicate => Some(&mut regs.pred),
-        _ => None, // oDepth etc. not applied
-    };
-    let Some(target) = target else { return };
-    let [x, y, z, w] = result;
-    let [ox, oy, oz, ow] = *target;
-    *target = [
-        if op.write_mask & 0x1 != 0 { x } else { ox },
-        if op.write_mask & 0x2 != 0 { y } else { oy },
-        if op.write_mask & 0x4 != 0 { z } else { oz },
-        if op.write_mask & 0x8 != 0 { w } else { ow },
-    ];
+
+    fn fetch_i32(&self, _index: usize) -> [i32; 4] {
+        // The ps_2_x `iN` file is one flat 4-wide counter array; the caller
+        // applies the operand's swizzle.
+        self.loop_regs
+    }
+
+    fn effective_index(&self, op: &Operand) -> usize {
+        // ps_2_0 has no relative addressing.
+        usize::from(op.reg_num)
+    }
+
+    fn slot(&mut self, reg_type: RegType, index: usize) -> Option<&mut [f32; 4]> {
+        match reg_type {
+            RegType::Temp => self.temp.get_mut(index),
+            // `oDepth` writes are stored nowhere — the fragment depth is still
+            // the interpolated z (documented; deferred with the vertex stage).
+            // `p0` accepts `setp` results.
+            RegType::ColorOut => Some(&mut self.output),
+            RegType::Predicate => Some(&mut self.pred),
+            _ => None,
+        }
+    }
 }
 /// Convert a `0xAARRGGBB` texel to the shader's `[r, g, b, a]` 0..1 float4.
 #[must_use]
@@ -722,57 +655,11 @@ pub fn run_pixel_shader(program: &PsProgram<'_>, input: &PsFragmentInput) -> Opt
     }
     Some(regs.output)
 }
-/// Read a source operand's value as raw integers (the `loop`/`breakc` and
-/// `rep` integer sources: `iN` files read the stored ints, any other file
-/// truncates the float read).
-#[must_use]
-fn read_operand_i32(regs: &PsRegisters, op: &Operand) -> [i32; 4] {
-    match op.reg_type {
-        RegType::Loop => {
-            let sw = op.swizzle;
-            [
-                regs.loop_regs.get(usize::from(sw[0])).copied().unwrap_or(0),
-                regs.loop_regs.get(usize::from(sw[1])).copied().unwrap_or(0),
-                regs.loop_regs.get(usize::from(sw[2])).copied().unwrap_or(0),
-                regs.loop_regs.get(usize::from(sw[3])).copied().unwrap_or(0),
-            ]
-        }
-        _ => {
-            let value = read_operand(regs, op);
-            [
-                comp(value, 0).trunc() as i32,
-                comp(value, 1).trunc() as i32,
-                comp(value, 2).trunc() as i32,
-                comp(value, 3).trunc() as i32,
-            ]
-        }
-    }
-}
-/// Read a 4-component int value's `i`-th component.
-#[must_use]
-fn comp_opt(value: [i32; 4], i: usize) -> i32 {
-    value.get(i).copied().unwrap_or(0)
-}
 /// Pop the innermost `loop`/`rep` block and return its break target.
 fn break_from(blocks: &mut Vec<BlockState>) -> Option<usize> {
     blocks.pop().map(|block| match block {
         BlockState::Loop { end, .. } | BlockState::Rep { end, .. } => end.saturating_add(1),
     })
-}
-/// Read exactly two source operands; short source lists read as zero.
-#[must_use]
-fn read_two(regs: &PsRegisters, srcs: &[Operand]) -> [[f32; 4]; 2] {
-    let a = srcs.first().map_or([0.0; 4], |op| read_operand(regs, op));
-    let b = srcs.get(1).map_or([0.0; 4], |op| read_operand(regs, op));
-    [a, b]
-}
-/// Read exactly three source operands; short source lists read as zero.
-#[must_use]
-fn read_three(regs: &PsRegisters, srcs: &[Operand]) -> [[f32; 4]; 3] {
-    let a = srcs.first().map_or([0.0; 4], |op| read_operand(regs, op));
-    let b = srcs.get(1).map_or([0.0; 4], |op| read_operand(regs, op));
-    let c = srcs.get(2).map_or([0.0; 4], |op| read_operand(regs, op));
-    [a, b, c]
 }
 /// Convert the shader's `oC0` float4 to an `0RGB` backbuffer color
 /// (`round(v * 255)` per channel, clamped to 0..255).

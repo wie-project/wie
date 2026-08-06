@@ -29,12 +29,14 @@
 //! a hostile shader's total work.
 
 use super::flow::{BlockState, FlowMap, FlowState, compare};
+use super::operand::{
+    ShaderRegisters, apply_src_mod, apply_swizzle, comp, comp_opt, read_operand, read_operand_i32,
+    read_three, read_two, write_operand,
+};
 use super::ps::color_to_float4;
 use super::vertex::{FvfLayout, GuestVertex};
 use crate::d3d9_shader::{
-    D3DSPDM_SATURATE, D3DSPSM_ABS, D3DSPSM_ABSNEG, D3DSPSM_BIAS, D3DSPSM_BIASNEG, D3DSPSM_COMP,
-    D3DSPSM_NEG, D3DSPSM_SIGN, D3DSPSM_SIGNNEG, D3DSPSM_X2, D3DSPSM_X2NEG, Operand, PsInstruction,
-    PsOp, RegType, VS_BOOL_CONST_COUNT, VS_CONST_COUNT, VS_INT_CONST_COUNT,
+    Operand, PsInstruction, PsOp, RegType, VS_BOOL_CONST_COUNT, VS_CONST_COUNT, VS_INT_CONST_COUNT,
 };
 
 // ── vs_2_0 register-file sizes (the interpreter's contract) ─────────────
@@ -121,118 +123,78 @@ struct VsRegisters {
     texcrd_out: [[f32; 4]; VS_TEXCRDOUT_COUNT],
 }
 
-/// Read the `i`-th component without indexing syntax (repo lint).
-#[inline]
-#[must_use]
-fn comp(value: [f32; 4], i: usize) -> f32 {
-    value.get(i).copied().unwrap_or(0.0)
-}
-
-/// Apply a source modifier (`D3DSPSM_*`) to a register value.
-///
-/// `DZ`/`DW` (texcoord-depth modifiers) and `NOT` (boolean registers) are
-/// unmodeled and read as identity — they do not occur in the vs_2_0 subset
-/// the interpreter executes.
-#[must_use]
-fn apply_src_mod(value: [f32; 4], src_mod: u8) -> [f32; 4] {
-    let [x, y, z, w] = value;
-    match src_mod {
-        D3DSPSM_NEG => [-x, -y, -z, -w],
-        D3DSPSM_BIAS => [x - 0.5, y - 0.5, z - 0.5, w - 0.5],
-        D3DSPSM_BIASNEG => [0.5 - x, 0.5 - y, 0.5 - z, 0.5 - w],
-        D3DSPSM_SIGN => [
-            if x >= 0.0 { 1.0 } else { -1.0 },
-            if y >= 0.0 { 1.0 } else { -1.0 },
-            if z >= 0.0 { 1.0 } else { -1.0 },
-            if w >= 0.0 { 1.0 } else { -1.0 },
-        ],
-        D3DSPSM_SIGNNEG => [
-            if x >= 0.0 { -1.0 } else { 1.0 },
-            if y >= 0.0 { -1.0 } else { 1.0 },
-            if z >= 0.0 { -1.0 } else { 1.0 },
-            if w >= 0.0 { -1.0 } else { 1.0 },
-        ],
-        D3DSPSM_COMP => [1.0 - x, 1.0 - y, 1.0 - z, 1.0 - w],
-        D3DSPSM_X2 => [2.0 * x, 2.0 * y, 2.0 * z, 2.0 * w],
-        D3DSPSM_X2NEG => [-2.0 * x, -2.0 * y, -2.0 * z, -2.0 * w],
-        D3DSPSM_ABS => [x.abs(), y.abs(), z.abs(), w.abs()],
-        D3DSPSM_ABSNEG => [-x.abs(), -y.abs(), -z.abs(), -w.abs()],
-        // NONE and any unmodeled modifier pass the value through.
-        _ => [x, y, z, w],
-    }
-}
-
-/// Reorder a register value by the operand's per-component swizzle.
-#[must_use]
-fn apply_swizzle(value: [f32; 4], swizzle: [u8; 4]) -> [f32; 4] {
-    [
-        comp(value, usize::from(swizzle[0])),
-        comp(value, usize::from(swizzle[1])),
-        comp(value, usize::from(swizzle[2])),
-        comp(value, usize::from(swizzle[3])),
-    ]
-}
-
-/// The effective register-file index for an operand: the base register number
-/// plus the integer part of `a0.x` when the operand is relative
-/// (`c[a0.x + n]`). Out-of-range indices read zero (documented).
-#[must_use]
-fn effective_index(regs: &VsRegisters, op: &Operand) -> usize {
-    let base = i64::from(op.reg_num);
-    let offset = if op.relative {
-        i64::from(comp(regs.addr, 0).trunc() as i32)
-    } else {
-        0
-    };
-    usize::try_from(base + offset).unwrap_or(0)
-}
-
-/// Fetch the raw register value (int/bool files converted to float).
-#[must_use]
-fn fetch_file(regs: &VsRegisters, reg_type: RegType, index: usize) -> [f32; 4] {
-    match reg_type {
-        RegType::Temp => regs.temp.get(index).copied().unwrap_or([0.0; 4]),
-        RegType::Const => regs.constants.get(index).copied().unwrap_or([0.0; 4]),
-        RegType::Input => regs.input.get(index).copied().unwrap_or([0.0; 4]),
-        RegType::Texture => regs.addr,
-        RegType::RastOut => regs.rast_out.get(index).copied().unwrap_or([0.0; 4]),
-        RegType::AttrOut => regs.attr_out.get(index).copied().unwrap_or([0.0; 4]),
-        RegType::TexcrdOut => regs.texcrd_out.get(index).copied().unwrap_or([0.0; 4]),
-        // Boolean registers read 1.0/0.0 (D3D9's boolean→float semantics).
-        RegType::ConstBool => {
-            if regs.const_bool.get(index).copied().unwrap_or(false) {
-                [1.0; 4]
-            } else {
-                [0.0; 4]
+/// The vs_2_0 register-file mapping: which `RegType` reads/writes which
+/// storage. The operand readers/writers live in [`super::operand`] and are
+/// generic over this trait; this impl is the vertex stage's only operand
+/// code (its semantic additions: relative `c[a0.x + n]` addressing and the
+/// int/bool constant files).
+impl ShaderRegisters for VsRegisters {
+    fn fetch(&self, reg_type: RegType, index: usize) -> [f32; 4] {
+        match reg_type {
+            RegType::Temp => self.temp.get(index).copied().unwrap_or([0.0; 4]),
+            RegType::Const => self.constants.get(index).copied().unwrap_or([0.0; 4]),
+            RegType::Input => self.input.get(index).copied().unwrap_or([0.0; 4]),
+            // The register-type value 3 is shared with the pixel stage's `tN`;
+            // the vertex stage reads the `a0` address register here.
+            RegType::Texture => self.addr,
+            RegType::RastOut => self.rast_out.get(index).copied().unwrap_or([0.0; 4]),
+            RegType::AttrOut => self.attr_out.get(index).copied().unwrap_or([0.0; 4]),
+            RegType::TexcrdOut => self.texcrd_out.get(index).copied().unwrap_or([0.0; 4]),
+            // Boolean registers read 1.0/0.0 (D3D9's boolean→float semantics).
+            RegType::ConstBool => {
+                if self.const_bool.get(index).copied().unwrap_or(false) {
+                    [1.0; 4]
+                } else {
+                    [0.0; 4]
+                }
             }
+            // Integer registers read as int→float (a `loop` counter of 2 reads
+            // 2.0, matching the hardware's int→float source conversion).
+            RegType::Loop => {
+                let ints = self.loop_regs.get(index).copied().unwrap_or([0; 4]);
+                [
+                    ints[0] as f32,
+                    ints[1] as f32,
+                    ints[2] as f32,
+                    ints[3] as f32,
+                ]
+            }
+            RegType::Predicate => self.pred,
+            // ColorOut / DepthOut / Sampler / Label / Other as a source is not
+            // valid vs_2_0.
+            _ => [0.0; 4],
         }
-        // Integer registers read as int→float (a `loop` counter of 2 reads
-        // 2.0, matching the hardware's int→float source conversion).
-        RegType::Loop => {
-            let ints = regs.loop_regs.get(index).copied().unwrap_or([0; 4]);
-            [
-                ints[0] as f32,
-                ints[1] as f32,
-                ints[2] as f32,
-                ints[3] as f32,
-            ]
-        }
-        RegType::Predicate => regs.pred,
-        // ColorOut / DepthOut / Sampler / Label / Other as a source is not
-        // valid vs_2_0.
-        _ => [0.0; 4],
     }
-}
 
-/// Read a source operand: register fetch → source modifier → swizzle.
-///
-/// `RegType::Texture` reads the `a0` address register here (the register-type
-/// value 3 is shared with the pixel stage's `tN`; the vertex stage decides by
-/// context — see [`RegType`]).
-#[must_use]
-fn read_operand(regs: &VsRegisters, op: &Operand) -> [f32; 4] {
-    let base = fetch_file(regs, op.reg_type, effective_index(regs, op));
-    apply_swizzle(apply_src_mod(base, op.src_mod), op.swizzle)
+    fn fetch_i32(&self, index: usize) -> [i32; 4] {
+        self.loop_regs.get(index).copied().unwrap_or([0; 4])
+    }
+
+    fn effective_index(&self, op: &Operand) -> usize {
+        let base = i64::from(op.reg_num);
+        let offset = if op.relative {
+            i64::from(comp(self.addr, 0).trunc() as i32)
+        } else {
+            0
+        };
+        usize::try_from(base + offset).unwrap_or(0)
+    }
+
+    fn slot(&mut self, reg_type: RegType, index: usize) -> Option<&mut [f32; 4]> {
+        match reg_type {
+            RegType::Temp => self.temp.get_mut(index),
+            RegType::RastOut => self.rast_out.get_mut(index),
+            RegType::AttrOut => self.attr_out.get_mut(index),
+            RegType::TexcrdOut => self.texcrd_out.get_mut(index),
+            // The `a0` register accepts writes (`mova`), and `p0` accepts
+            // `setp` results.
+            RegType::Texture => Some(&mut self.addr),
+            RegType::Predicate => Some(&mut self.pred),
+            // Writes to the constant/bool/loop/input files are dropped (not
+            // valid vs_2_0 destinations).
+            _ => None,
+        }
+    }
 }
 
 /// Read a matrix row: like [`read_operand`] but from `base + row_offset`
@@ -240,73 +202,9 @@ fn read_operand(regs: &VsRegisters, op: &Operand) -> [f32; 4] {
 /// source).
 #[must_use]
 fn read_operand_row(regs: &VsRegisters, op: &Operand, row_offset: usize) -> [f32; 4] {
-    let index = effective_index(regs, op).saturating_add(row_offset);
-    let base = fetch_file(regs, op.reg_type, index);
+    let index = regs.effective_index(op).saturating_add(row_offset);
+    let base = regs.fetch(op.reg_type, index);
     apply_swizzle(apply_src_mod(base, op.src_mod), op.swizzle)
-}
-
-/// Read a source operand's register value as raw integers.
-///
-/// Integer registers (`iN`) read the stored ints; any other file falls back
-/// to truncating the float read (the `loop`/`breakc` integer sources).
-#[must_use]
-fn read_operand_i32(regs: &VsRegisters, op: &Operand) -> [i32; 4] {
-    let index = effective_index(regs, op);
-    match op.reg_type {
-        RegType::Loop => {
-            let raw = regs.loop_regs.get(index).copied().unwrap_or([0; 4]);
-            let sw = op.swizzle;
-            [
-                raw.get(usize::from(sw[0])).copied().unwrap_or(0),
-                raw.get(usize::from(sw[1])).copied().unwrap_or(0),
-                raw.get(usize::from(sw[2])).copied().unwrap_or(0),
-                raw.get(usize::from(sw[3])).copied().unwrap_or(0),
-            ]
-        }
-        _ => {
-            let value = read_operand(regs, op);
-            [
-                comp(value, 0).trunc() as i32,
-                comp(value, 1).trunc() as i32,
-                comp(value, 2).trunc() as i32,
-                comp(value, 3).trunc() as i32,
-            ]
-        }
-    }
-}
-
-/// Write an operand's value into the register file (write mask + saturate).
-///
-/// `_sat` clamps the written components to `[0, 1]`; `_pp` (partial
-/// precision) is ignored (full f32 precision, documented). Writes to the
-/// constant/bool/loop/input files are dropped (not valid vs_2_0
-/// destinations). The `a0` register accepts writes (`mova`), and `p0` accepts
-/// `setp` results.
-fn write_operand(regs: &mut VsRegisters, op: &Operand, value: [f32; 4]) {
-    let mut result = value;
-    if op.dst_mod == D3DSPDM_SATURATE {
-        for channel in &mut result {
-            *channel = channel.clamp(0.0, 1.0);
-        }
-    }
-    let target = match op.reg_type {
-        RegType::Temp => regs.temp.get_mut(usize::from(op.reg_num)),
-        RegType::RastOut => regs.rast_out.get_mut(usize::from(op.reg_num)),
-        RegType::AttrOut => regs.attr_out.get_mut(usize::from(op.reg_num)),
-        RegType::TexcrdOut => regs.texcrd_out.get_mut(usize::from(op.reg_num)),
-        RegType::Texture => Some(&mut regs.addr),
-        RegType::Predicate => Some(&mut regs.pred),
-        _ => None,
-    };
-    let Some(target) = target else { return };
-    let [x, y, z, w] = result;
-    let [ox, oy, oz, ow] = *target;
-    *target = [
-        if op.write_mask & 0x1 != 0 { x } else { ox },
-        if op.write_mask & 0x2 != 0 { y } else { oy },
-        if op.write_mask & 0x4 != 0 { z } else { oz },
-        if op.write_mask & 0x8 != 0 { w } else { ow },
-    ];
 }
 
 /// Convert a float4 color to `0xAARRGGBB` (`round(v * 255)` per channel,
@@ -926,12 +824,6 @@ fn matrix_mul_op(
     None
 }
 
-/// Read a 4-component int value's `i`-th component.
-#[must_use]
-fn comp_opt(value: [i32; 4], i: usize) -> i32 {
-    value.get(i).copied().unwrap_or(0)
-}
-
 /// The `call`/`callnz` label number: the label operand's register number.
 #[must_use]
 fn instr_label(srcs: &[Operand], dst: &Option<Operand>) -> u16 {
@@ -1010,21 +902,4 @@ pub fn run_vertex_shader(program: &VsProgram<'_>, input: &VsVertexInput) -> VsOu
         u: comp(o_t0, 0),
         v: comp(o_t0, 1),
     }
-}
-
-/// Read exactly two source operands; short source lists read as zero.
-#[must_use]
-fn read_two(regs: &VsRegisters, srcs: &[Operand]) -> [[f32; 4]; 2] {
-    let a = srcs.first().map_or([0.0; 4], |op| read_operand(regs, op));
-    let b = srcs.get(1).map_or([0.0; 4], |op| read_operand(regs, op));
-    [a, b]
-}
-
-/// Read exactly three source operands; short source lists read as zero.
-#[must_use]
-fn read_three(regs: &VsRegisters, srcs: &[Operand]) -> [[f32; 4]; 3] {
-    let a = srcs.first().map_or([0.0; 4], |op| read_operand(regs, op));
-    let b = srcs.get(1).map_or([0.0; 4], |op| read_operand(regs, op));
-    let c = srcs.get(2).map_or([0.0; 4], |op| read_operand(regs, op));
-    [a, b, c]
 }
