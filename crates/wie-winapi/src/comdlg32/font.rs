@@ -687,11 +687,26 @@ pub(crate) fn complete_font_dialog(
             .context("failed to read CHOOSEFONTW on font-dialog accept")?;
 
     let lf_height = lf_height_from_point_size_tenths(point_size_tenths);
+    // The dialog owns `lfPitchAndFamily` (real Windows' ChooseFont writes the
+    // SELECTED font's pitch). The guest LOGFONT may carry the previous font's
+    // FIXED_PITCH (notepad's default face is Lucida Console); a proportional
+    // pick must clear it, or the guest's CreateFontIndirectW resolves the
+    // chosen proportional family to monospace via the pitch-substitution rule
+    // (the live "size applies, family does not" bug). The family nibble
+    // (FF_*) is preserved.
+    let fixed_pitch = crate::gdi32::family_is_monospaced(&family);
+    let mut pitch_and_family = original_log_font.pitch_and_family;
+    if fixed_pitch {
+        pitch_and_family |= 0x01;
+    } else {
+        pitch_and_family &= !0x01;
+    }
     with_typed_write::<LogFontW, _, _>(engine, session.log_font_ptr, |log_font| {
         *log_font = original_log_font;
         log_font.height = lf_height;
         log_font.underline = u8::from(underline_checked);
         log_font.strike_out = u8::from(strikeout_checked);
+        log_font.pitch_and_family = pitch_and_family;
         // lfFaceName is a NUL-terminated WCHAR[LF_FACESIZE=32]: at most 31
         // units (mirrors write_utf16_c_string's truncation).
         let mut face_name = [0_u16; 32];
@@ -1259,5 +1274,104 @@ mod tests {
             "host fontdb must name at least one family"
         );
         assert!(families.windows(2).all(|pair| pair[0] <= pair[1]), "sorted");
+    }
+
+    /// LIVE-symptom repro: the Font dialog's chosen FAMILY must round-trip —
+    /// dialog pick → `LOGFONTW.lfFaceName` → `CreateFontIndirectW` → the font
+    /// engine's resolution. The size path (lfHeight) is proven; the family
+    /// path breaks because RNotepad's LOGFONT carries `FIXED_PITCH` (its
+    /// default face is Lucida Console), and the dialog's write-back preserves
+    /// `lfPitchAndFamily` — so a PROPORTIONAL pick is handed back to the guest
+    /// with the OLD fixed-pitch flag, and the Windows pitch-substitution rule
+    /// then substitutes monospace for the picked proportional family.
+    #[test]
+    fn font_dialog_picked_family_must_clear_fixed_pitch() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        font_dialog_scaffold(&mut engine, &mut state, "", 0x1 | 0x40);
+        let session = state.window_state().font_dialog.as_ref().unwrap().clone();
+
+        // Pick a PROPORTIONAL family from the list (the write-back must not
+        // leave the default's FIXED_PITCH on a proportional pick).
+        let picked = {
+            let ws = state.window_state();
+            let ControlState::ListBox {
+                items, sel_index, ..
+            } = ws
+                .control_states
+                .get_mut(&Hwnd::from(session.family_list_hwnd))
+                .expect("family listbox state")
+            else {
+                panic!("family list is a listbox");
+            };
+            let index = items.len().min(2).saturating_sub(1);
+            *sel_index = i32::try_from(index).unwrap_or(0);
+            items[index].clone()
+        };
+        assert_ne!(
+            picked,
+            dialog_family_names()[0],
+            "the repro must pick a non-default family"
+        );
+
+        // RNotepad's LOGFONT carries FIXED_PITCH|FF_MODERN (0x31) — its
+        // default face is Lucida Console. The dialog's write-back must clear
+        // the pitch bit for a proportional pick (real Windows' ChooseFont sets
+        // lfPitchAndFamily to the selected font's pitch).
+        engine.mem_write(0x601B, &[0x31]).ok();
+
+        write_regs(&mut engine, session.dialog_hwnd, IDOK, 0, 0);
+        handle_end_dialog(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("EndDialog succeeds");
+
+        // The family was written into the guest LOGFONTW…
+        let written = read_guest_utf16(&mut engine, 0x601C, 32);
+        assert_eq!(
+            written, picked,
+            "the picked family must be written into LOGFONTW.lfFaceName"
+        );
+        // …and the FIXED_PITCH bit (0x01) must be cleared for the proportional
+        // pick, or the guest's CreateFontIndirectW resolves it to monospace.
+        let mut pitch = [0_u8; 1];
+        engine.mem_read(0x601B, &mut pitch).ok();
+        assert_eq!(
+            pitch[0] & 0x01,
+            0,
+            "a proportional family pick must clear FIXED_PITCH in \
+             lfPitchAndFamily (chosen '{picked}' kept the default's \
+             fixed-pitch flag)"
+        );
+
+        // Full round-trip: the guest re-creates the font from the corrected
+        // LOGFONT and applies it; the paint resolution must pick the CHOSEN
+        // proportional family, not the monospace substitution.
+        use crate::gdi32::{FontEngine, handle_create_font_indirect_w, window_font_resolution};
+        write_regs(&mut engine, 0x6000, 0, 0, 0);
+        let font = handle_create_font_indirect_w(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("CreateFontIndirectW succeeds")
+        .return_value;
+        let owner_hwnd = create_owner_window(&mut state);
+        crate::user32::find_window_mut(&mut state, owner_hwnd)
+            .expect("owner window")
+            .font_handle = crate::handles::Hfont::from(font);
+        let mut font_engine = FontEngine::default();
+        let (key, _resolved) = window_font_resolution(&state, owner_hwnd, &mut font_engine)
+            .expect("the picked font must resolve");
+        assert_eq!(
+            key.family,
+            picked.to_ascii_lowercase(),
+            "the chosen proportional family must survive dialog → LOGFONT → \
+             CreateFontIndirect → resolution (got the default '{family}', \
+             picked '{picked}')",
+            family = key.family,
+        );
     }
 }

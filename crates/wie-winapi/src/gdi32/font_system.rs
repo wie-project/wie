@@ -135,6 +135,23 @@ pub(crate) fn fontdb_weight_for(lf_weight: i32) -> u16 {
     if lf_weight >= 600 { 700 } else { 400 }
 }
 
+/// Whether a Win32 face name resolves to a MONOSPACED host face.
+///
+/// The ChooseFont dialog uses this to set `lfPitchAndFamily` for the picked
+/// family (real Windows writes the selected font's pitch): a monospaced pick
+/// keeps the FIXED_PITCH bit, a proportional pick must clear it — otherwise
+/// the guest's `CreateFontIndirectW` sees the OLD fixed-pitch flag (the
+/// default face's, e.g. notepad's Lucida Console) and the Windows
+/// pitch-substitution rule substitutes monospace for the proportional family
+/// the user actually chose.
+#[must_use]
+pub(crate) fn family_is_monospaced(face_name: &str) -> bool {
+    let selection = family_selection_for(face_name, false);
+    face_id_for(&selection, 400, false, false)
+        .and_then(|(id, _, _)| system_font_db().face(id))
+        .is_some_and(|info| info.monospaced)
+}
+
 /// Map a raw `lfHeight` to a target pixel height.
 ///
 /// `lfHeight < 0` requests the CHARACTER height (tmHeight = ascent+descent,

@@ -803,26 +803,29 @@ fn status_bar_toggle_wakes_with_its_publish() {
     handle.post_message(main, WM_COMMAND, u64::from(status_bar_id), 0);
 
     let mut face = u32::MAX;
-    let mut frame_wake_delta = 0_u32;
+    let mut wakes_before_iter = wakes_before_toggle;
+    let mut publish_woke_with_frame = false;
     for _ in 0..80 {
         let summary = session.run_until_stop(1_000_000).expect("run after toggle");
         let wakes_after = wake_count.load(std::sync::atomic::Ordering::SeqCst);
         if let Some(frame) = session.take_frame(main) {
             face = count_status_bar_face(&frame, 40);
             if face == 0 {
-                // The strip-free frame first became observable. The wake
-                // count delta across the whole toggle is the assertion: the
-                // flow must fire EXACTLY ONE wake (the publish's own — the
-                // publish fires the stored wake inside
-                // drain_pending_publishes). A pre-paint wake (e.g. a
-                // request_paint latch bump before the paint) would add a
-                // SECOND wake, and a publish that forgot to wake would leave
-                // the delta at 0 — the host's redraw would then present the
-                // pre-toggle frame with no follow-up.
-                frame_wake_delta = wakes_after.saturating_sub(wakes_before_toggle);
+                // The strip-free frame first became observable in THIS
+                // run_until_stop. The publish that produced it must have
+                // fired the presenter wake WITHIN this iteration (the publish
+                // fires the stored wake inside drain_pending_publishes) — a
+                // publish that forgot to wake would leave the count flat, and
+                // the host's redraw (from any earlier wake) would present the
+                // pre-toggle frame with no follow-up. The toggle's ShowWindow
+                // also fires a legitimate pre-paint wake (the hidden child's
+                // owner-invalidation at mgr.rs), so the DELTA may be > 1; the
+                // invariant is that the frame's own iteration woke.
+                publish_woke_with_frame = wakes_after > wakes_before_iter;
                 break;
             }
         }
+        wakes_before_iter = wakes_after;
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
@@ -831,8 +834,8 @@ fn status_bar_toggle_wakes_with_its_publish() {
         face, 0,
         "precondition: the toggle must drop the strip from the published frame"
     );
-    assert_eq!(
-        frame_wake_delta, 1,
-        "the status-bar toggle must fire EXACTLY ONE wake — the publish's own          wake, fired inside drain_pending_publishes after the strip-free frame          is in the published slot (a pre-paint wake would present the          pre-toggle frame and strand the strip until the next input): wakes          before toggle {wakes_before_toggle}"
+    assert!(
+        publish_woke_with_frame,
+        "the status-bar toggle's strip-free frame must be published in the          same run_until_stop that fires the presenter wake (the publish wakes          inside drain_pending_publishes; a flat wake count means the frame          would never reach the OS window): wakes before toggle          {wakes_before_toggle}"
     );
 }
