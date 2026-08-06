@@ -354,7 +354,12 @@ fn message_box_result(
 
     // Always surface guest error UI on host console (7z bring-up); no bridge
     // means headless/trace — auto-OK so the guest never hangs.
-    eprintln!("[{api_name}] {caption}: {text}");
+    tracing::error!(
+        api = %api_name,
+        caption = %caption,
+        text = %text,
+        "MessageBox without a host bridge (auto-OK)"
+    );
     finish_message_box(ctx, IDOK)
 }
 

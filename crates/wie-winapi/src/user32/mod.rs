@@ -78,6 +78,11 @@ pub(crate) const VK_RIGHT: u64 = 0x27;
 pub(crate) const VK_DOWN: u64 = 0x28;
 pub(crate) const VK_DELETE: u64 = 0x2E;
 
+/// The high bit of a keyboard-state byte (`GetKeyState`/`KeyboardState`): the
+/// key is down. The keyboard-state slot holds one byte per VK code; the low
+/// seven bits are the toggle state, so "pressed" is bit 7.
+pub(crate) const KEY_STATE_DOWN: u8 = 0x80;
+
 pub(crate) const WM_KEYDOWN: u32 = wm::WinMsg::WM_KEYDOWN.as_u32();
 pub(crate) const WM_KEYUP: u32 = wm::WinMsg::WM_KEYUP.as_u32();
 pub(crate) const WM_CHAR: u32 = wm::WinMsg::WM_CHAR.as_u32();
@@ -254,6 +259,32 @@ pub(crate) const TME_HOVER: u32 = 0x0000_0001;
 pub(crate) const TME_LEAVE: u32 = 0x0000_0002;
 pub(crate) const TME_CANCEL: u32 = 0x8000_0000;
 
+// GetSysColor color INDICES (winuser.h) — the `nIndex` argument, NOT the 0RGB
+// values they resolve to (`window::geom::sys_color` holds that mapping). The
+// controls module's `COLOR_*` constants are RGB VALUES for a few of these
+// (e.g. `controls::COLOR_WINDOW` is the white `GetSysColor(COLOR_WINDOW)`
+// result); the index names live here so both read naturally at their sites.
+pub(crate) const COLOR_SCROLLBAR: u32 = 0;
+pub(crate) const COLOR_BACKGROUND: u32 = 1;
+pub(crate) const COLOR_ACTIVECAPTION: u32 = 2;
+pub(crate) const COLOR_INACTIVECAPTION: u32 = 3;
+pub(crate) const COLOR_WINDOW: u32 = 5;
+pub(crate) const COLOR_WINDOWFRAME: u32 = 6;
+pub(crate) const COLOR_MENUTEXT: u32 = 7;
+pub(crate) const COLOR_WINDOWTEXT: u32 = 8;
+pub(crate) const COLOR_CAPTIONTEXT: u32 = 9;
+pub(crate) const COLOR_ACTIVEBORDER: u32 = 10;
+pub(crate) const COLOR_INACTIVEBORDER: u32 = 11;
+pub(crate) const COLOR_APPWORKSPACE: u32 = 12;
+pub(crate) const COLOR_HIGHLIGHT: u32 = 13;
+pub(crate) const COLOR_HIGHLIGHTTEXT: u32 = 14;
+pub(crate) const COLOR_BTNSHADOW: u32 = 16;
+pub(crate) const COLOR_GRAYTEXT: u32 = 17;
+pub(crate) const COLOR_BTNTEXT: u32 = 18;
+pub(crate) const COLOR_BTNHIGHLIGHT: u32 = 20;
+pub(crate) const COLOR_3DDKSHADOW: u32 = 21;
+pub(crate) const COLOR_INFOBK: u32 = 24;
+
 pub mod accel;
 pub mod controls;
 pub mod dc;
@@ -344,6 +375,11 @@ pub(crate) fn write_wide_window_text(
 /// `Get/SetWindowLongPtr*` index register carries it (MSVC emits
 /// `mov edx, -4`, writing `0xFFFF_FFFC`).
 pub(crate) const GWLP_WNDPROC_RAW: u64 = 0xFFFF_FFFC;
+
+/// `GWLP_WNDPROC` (-4) as the SIGNED index — what the raw value denotes after
+/// `window_long_ptr_index` reinterprets it (the comparison form used when the
+/// raw zero-extended form has already been decoded).
+pub(crate) const GWLP_WNDPROC: i64 = -4;
 
 /// Reinterpret a raw `GetWindowLongPtr*` index (a zero-extended `i32`) as
 /// the signed `i64` slot it denotes.

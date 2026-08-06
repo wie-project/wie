@@ -10,7 +10,9 @@ use anyhow::Result;
 use crate::guest_memory::read_u16;
 use crate::state::{TimerRecord, WindowFlags};
 use crate::user32::controls::{ControlState, SEL_EMPTY, SEL_MULTICHAR, SEL_MULTILINE, SEL_TEXT};
-use crate::user32::controls::{WinMsg, control_state, deliver_command, invalidate};
+use crate::user32::controls::{
+    WHEEL_DELTA, WHEEL_SCROLL_LINES, WinMsg, control_state, deliver_command, invalidate,
+};
 use crate::user32::{
     DLGC_WANTCHARS, EN_CHANGE, EN_HSCROLL, EN_VSCROLL, VK_DELETE, VK_DOWN, VK_END, VK_HOME,
     VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_UP, WinApiState, find_window, find_window_mut,
@@ -728,8 +730,12 @@ pub(super) fn edit_mouse_wheel(state: &mut WinApiState, hwnd: u64, wparam: u64) 
     let hi = u16::try_from((wparam >> 16) & 0xFFFF).unwrap_or(0);
     let delta = i32::from(i16::from_le_bytes(hi.to_le_bytes()));
     // Truncating division drops partial notches: a 60-unit trackpad flick is
-    // a no-op while a 120-unit notch scrolls a full 3 lines.
-    let lines = i64::from(delta.saturating_div(120).saturating_mul(3));
+    // a no-op while a full notch scrolls `WHEEL_SCROLL_LINES` lines.
+    let lines = i64::from(
+        delta
+            .saturating_div(WHEEL_DELTA)
+            .saturating_mul(WHEEL_SCROLL_LINES),
+    );
     let Some(context) = edit_scroll_context(state, hwnd) else {
         return false;
     };

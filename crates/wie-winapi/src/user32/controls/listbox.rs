@@ -8,7 +8,8 @@ use super::button::invalidate_control_rect;
 use super::paint::fill_rect_clipped;
 use super::{
     COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, ControlClassKind, ControlState, Dimension, PaintCtx,
-    PaintFont, control_items, control_sel_index, control_state, control_state_mut, deliver_command,
+    PaintFont, WHEEL_DELTA, WHEEL_SCROLL_LINES, control_items, control_sel_index, control_state,
+    control_state_mut, deliver_command,
 };
 use crate::gdi32::render_text_into_surface;
 use crate::gdi32::{IRect, ResolvedWindow};
@@ -233,8 +234,12 @@ pub(crate) fn listbox_scroll_wheel(state: &mut WinApiState, hwnd: u64, wparam: u
     let hi = u16::try_from((wparam >> 16) & 0xFFFF).unwrap_or(0);
     let delta = i32::from(i16::from_le_bytes(hi.to_le_bytes()));
     // Truncating division drops partial notches: a 60-unit trackpad flick is
-    // a no-op while a 120-unit notch scrolls a full 3 rows.
-    let rows = i64::from(delta.saturating_div(120).saturating_mul(3));
+    // a no-op while a full notch scrolls `WHEEL_SCROLL_LINES` rows.
+    let rows = i64::from(
+        delta
+            .saturating_div(WHEEL_DELTA)
+            .saturating_mul(WHEEL_SCROLL_LINES),
+    );
     let old = match control_state(state, hwnd) {
         Some(ControlState::ListBox { first_visible, .. }) => *first_visible,
         _ => return false,

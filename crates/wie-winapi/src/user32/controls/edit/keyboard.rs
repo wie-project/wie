@@ -10,8 +10,8 @@ use anyhow::Result;
 use crate::guest_memory::read_u16;
 use crate::user32::controls::{ControlState, ES_MULTILINE, control_state};
 use crate::user32::{
-    VK_CONTROL, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SHIFT, VK_UP,
-    WinApiState, write_guest_ansi_c_string, write_guest_utf16_c_string,
+    KEY_STATE_DOWN, VK_CONTROL, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT,
+    VK_SHIFT, VK_UP, WinApiState, write_guest_ansi_c_string, write_guest_utf16_c_string,
 };
 
 use super::math::{line_char_len, line_from_char, line_index_of};
@@ -514,7 +514,7 @@ fn shift_is_down(state: &WinApiState) -> bool {
     state.try_window_state().is_some_and(|ws| {
         ws.keyboard_state
             .get(usize::try_from(VK_SHIFT).unwrap_or(0))
-            & 0x80
+            & KEY_STATE_DOWN
             != 0
     })
 }
@@ -525,7 +525,7 @@ pub(super) fn ctrl_is_down(state: &WinApiState) -> bool {
     state.try_window_state().is_some_and(|ws| {
         ws.keyboard_state
             .get(usize::try_from(VK_CONTROL).unwrap_or(0))
-            & 0x80
+            & KEY_STATE_DOWN
             != 0
     })
 }

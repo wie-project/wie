@@ -9,11 +9,11 @@ use anyhow::{Context, Result};
 
 use crate::OuterReturn;
 use crate::user32::{
-    BN_CLICKED, GuestCallbackRequest, HandlerContext, IDCANCEL, VK_ESCAPE, VK_RETURN, VK_SHIFT,
-    VK_TAB, WM_COMMAND, WM_KEYDOWN, WS_TABSTOP, WinApiControlSignal, WinApiHandlerResult,
-    WinApiState, checked_address, controls::ControlClassKind, controls::ControlState, find_window,
-    make_command_wparam, message::handle_default_window_procedure, read_u32, read_u64,
-    window::deliver_focus_change,
+    BN_CLICKED, GuestCallbackRequest, HandlerContext, IDCANCEL, KEY_STATE_DOWN, VK_ESCAPE,
+    VK_RETURN, VK_SHIFT, VK_TAB, WM_COMMAND, WM_KEYDOWN, WS_TABSTOP, WinApiControlSignal,
+    WinApiHandlerResult, WinApiState, checked_address, controls::ControlClassKind,
+    controls::ControlState, find_window, make_command_wparam,
+    message::handle_default_window_procedure, read_u32, read_u64, window::deliver_focus_change,
 };
 
 /// Outcome of an `IsDialogMessage` keyboard translation.
@@ -293,7 +293,7 @@ fn vk_is_shift_down(state: &WinApiState) -> bool {
     state.try_window_state().is_some_and(|ws| {
         ws.keyboard_state
             .get(usize::try_from(VK_SHIFT).unwrap_or(0))
-            & 0x80
+            & KEY_STATE_DOWN
             != 0
     })
 }

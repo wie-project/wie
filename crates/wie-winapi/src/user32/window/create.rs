@@ -11,6 +11,17 @@ use crate::user32::{
     read_window_class_identifier_w, with_typed_write,
 };
 
+/// `CW_USEDEFAULT` (winuser.h 0x8000_0000) — the "use the default geometry"
+/// sentinel a guest passes for a CreateWindowEx x/y/cx/cy argument. Stored as
+/// a 32-bit DWORD on the stack, it reads back as `i32::MIN`.
+const CW_USEDEFAULT: i32 = i32::MIN;
+/// `CW_USEDEFAULT` top-level origin: the cascaded (100, 100) position (each
+/// new window steps 100 px down/right from the previous one).
+const CW_USEDEFAULT_ORIGIN: i32 = 100;
+/// `CW_USEDEFAULT` top-level size: 640×480.
+const CW_USEDEFAULT_WIDTH: i32 = 640;
+const CW_USEDEFAULT_HEIGHT: i32 = 480;
+
 /// Handles `USER32.dll!CreateWindowExA`.
 pub fn handle_create_window_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -61,26 +72,34 @@ pub fn handle_create_window_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let style = u32::try_from(style_raw).context("CreateWindowExA: style does not fit u32")?;
     let ex_style = u32::try_from(ex_style).context("CreateWindowExA: ex_style does not fit u32")?;
 
-    // Handle CW_USEDEFAULT (0x8000_0000 stored as i32 = i32::MIN on the stack).
-    // A CHILD window with CW_USEDEFAULT x/y is placed at (0,0) of the parent's
-    // client area; only a top-level window gets the cascaded (100,100).
-    let x = if x_raw == i32::MIN {
-        if parent_handle != 0 { 0 } else { 100 }
+    // Handle CW_USEDEFAULT. A CHILD window with CW_USEDEFAULT x/y is placed
+    // at (0,0) of the parent's client area; only a top-level window gets the
+    // cascaded (CW_USEDEFAULT_ORIGIN, CW_USEDEFAULT_ORIGIN).
+    let x = if x_raw == CW_USEDEFAULT {
+        if parent_handle != 0 {
+            0
+        } else {
+            CW_USEDEFAULT_ORIGIN
+        }
     } else {
         x_raw
     };
-    let y = if y_raw == i32::MIN {
-        if parent_handle != 0 { 0 } else { 100 }
+    let y = if y_raw == CW_USEDEFAULT {
+        if parent_handle != 0 {
+            0
+        } else {
+            CW_USEDEFAULT_ORIGIN
+        }
     } else {
         y_raw
     };
-    let width = if width_raw == i32::MIN {
-        640
+    let width = if width_raw == CW_USEDEFAULT {
+        CW_USEDEFAULT_WIDTH
     } else {
         width_raw
     };
-    let height = if height_raw == i32::MIN {
-        480
+    let height = if height_raw == CW_USEDEFAULT {
+        CW_USEDEFAULT_HEIGHT
     } else {
         height_raw
     };
@@ -222,28 +241,35 @@ pub fn handle_create_window_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
             .context("failed to read CreateWindowExW window title")?
     };
 
-    // Handle CW_USEDEFAULT (0x8000_0000) — stored as a 32-bit DWORD in the
-    // stack slot, so it reads back as i32::MIN through read_guest_i32.
-    // A CHILD window with CW_USEDEFAULT x/y is placed at (0,0) of the
-    // parent's client area; only a top-level window gets the cascaded
-    // (100,100).
-    let x = if x_raw == i32::MIN {
-        if parent_handle != 0 { 0 } else { 100 }
+    // Handle CW_USEDEFAULT — stored as a 32-bit DWORD in the stack slot, so
+    // it reads back as i32::MIN through read_guest_i32. A CHILD window with
+    // CW_USEDEFAULT x/y is placed at (0,0) of the parent's client area; only
+    // a top-level window gets the cascaded origin.
+    let x = if x_raw == CW_USEDEFAULT {
+        if parent_handle != 0 {
+            0
+        } else {
+            CW_USEDEFAULT_ORIGIN
+        }
     } else {
         x_raw
     };
-    let y = if y_raw == i32::MIN {
-        if parent_handle != 0 { 0 } else { 100 }
+    let y = if y_raw == CW_USEDEFAULT {
+        if parent_handle != 0 {
+            0
+        } else {
+            CW_USEDEFAULT_ORIGIN
+        }
     } else {
         y_raw
     };
-    let width = if width_raw == i32::MIN {
-        640
+    let width = if width_raw == CW_USEDEFAULT {
+        CW_USEDEFAULT_WIDTH
     } else {
         width_raw
     };
-    let height = if height_raw == i32::MIN {
-        480
+    let height = if height_raw == CW_USEDEFAULT {
+        CW_USEDEFAULT_HEIGHT
     } else {
         height_raw
     };

@@ -99,6 +99,9 @@ pub fn handle_get_window_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 
     ctx.finish(return_value)
 }
+/// `USER_DEFAULT_SCREEN_DPI` (shellscalingapi.h) — the DPI of a 100% display.
+const USER_DEFAULT_SCREEN_DPI: u64 = 96;
+
 /// Handles dynamic `USER32.dll!GetDpiForWindow`.
 pub fn handle_get_dpi_for_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -107,7 +110,7 @@ pub fn handle_get_dpi_for_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         .context("failed to read RCX for GetDpiForWindow")?;
 
     // Standard 100% Windows DPI.
-    let return_value = 96;
+    let return_value = USER_DEFAULT_SCREEN_DPI;
 
     ctx.finish(return_value)
 }

@@ -60,6 +60,14 @@ pub(super) const H_LINE_STEP: usize = 8;
 /// The ES_LEFT/CENTER/RIGHT alignment bits (the low 2 style bits).
 pub(super) const ES_ALIGN_MASK: u32 = 0x0003;
 
+/// `ES_CENTER` — the low alignment bit value for centered rows (winuser.h
+/// 0x0001; the paint/layout `alignment` match on this value).
+pub(super) const ES_CENTER: u32 = 0x0001;
+
+/// `ES_RIGHT` — the low alignment bit value for right-aligned rows
+/// (winuser.h 0x0002).
+pub(super) const ES_RIGHT: u32 = 0x0002;
+
 /// The EDIT control's state, seeded on demand. Only reachable from the
 /// `(Edit, _)` dispatch arms, so the seed kind is always `Edit`. Takes the
 /// `control_states` field (not the whole `WindowState`) so callers can hold a

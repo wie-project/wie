@@ -72,8 +72,8 @@ fn synthesized_default() -> DialogTemplate {
         ex_style: 0,
         x: 0,
         y: 0,
-        cx: 150, // DEFAULT_DIALOG_CX / 2
-        cy: 100, // DEFAULT_DIALOG_CY / 2
+        cx: i16::try_from(DEFAULT_DIALOG_CX / 2).unwrap_or(0),
+        cy: i16::try_from(DEFAULT_DIALOG_CY / 2).unwrap_or(0),
         title: "WIE Dialog".to_owned(),
         font_point: None,
         font_face: None,

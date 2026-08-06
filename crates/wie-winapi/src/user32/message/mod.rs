@@ -682,7 +682,7 @@ fn erase_with_system_background(state: &mut WinApiState, hwnd: u64) {
     if width <= 0 || height <= 0 {
         return;
     }
-    let color = crate::user32::sys_color(5); // COLOR_WINDOW — white
+    let color = crate::user32::sys_color(crate::user32::COLOR_WINDOW); // white
     crate::gdi32::fill_rect_surface(
         state,
         info.hwnd,

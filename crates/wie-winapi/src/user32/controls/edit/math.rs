@@ -7,7 +7,7 @@
 use crate::user32::WinApiState;
 use crate::user32::controls::{ControlState, ES_MULTILINE};
 
-use super::state::{SCROLLBAR_WIDTH, edit_wrap_from_style, scrollbar_visible};
+use super::state::{ES_CENTER, ES_RIGHT, SCROLLBAR_WIDTH, edit_wrap_from_style, scrollbar_visible};
 
 /// The character index of the start of `line` (None when out of range).
 pub(super) fn line_index_of(text: &str, line: usize) -> Option<usize> {
@@ -155,8 +155,8 @@ where
             .chars()
             .fold(0_i32, |acc, ch| acc.saturating_add(advance(ch)));
         let x = match alignment {
-            0x1 => (width.saturating_sub(row_width)).saturating_div(2).max(0),
-            0x2 => width.saturating_sub(row_width).max(0),
+            ES_CENTER => (width.saturating_sub(row_width)).saturating_div(2).max(0),
+            ES_RIGHT => width.saturating_sub(row_width).max(0),
             _ => 0,
         };
         segments.push(VisibleSegment {

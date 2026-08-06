@@ -15,8 +15,8 @@
 //! message's wParam, not from the keyboard layout.
 
 use super::{
-    Context, Msg, Result, WM_CHAR, WM_COMMAND, WM_KEYDOWN, WM_SYSCHAR, WM_SYSKEYDOWN,
-    WinApiHandlerResult, WinApiState, make_command_wparam, with_typed_read,
+    Context, KEY_STATE_DOWN, Msg, Result, WM_CHAR, WM_COMMAND, WM_KEYDOWN, WM_SYSCHAR,
+    WM_SYSKEYDOWN, WinApiHandlerResult, WinApiState, make_command_wparam, with_typed_read,
 };
 use crate::HandlerContext;
 use crate::handles::{Haccel, Hwnd};
@@ -284,9 +284,9 @@ fn find_matching_command(
 /// modifier set exactly (a pressed key with no matching `F*` bit kills the
 /// match, mirroring real `TranslateAccelerator`).
 fn modifiers_match(entry_flags: u16, keyboard: &KeyboardState) -> bool {
-    let shift_down = keyboard.get(VK_SHIFT) & 0x80 != 0;
-    let ctrl_down = keyboard.get(VK_CONTROL) & 0x80 != 0;
-    let alt_down = keyboard.get(VK_MENU) & 0x80 != 0;
+    let shift_down = keyboard.get(VK_SHIFT) & KEY_STATE_DOWN != 0;
+    let ctrl_down = keyboard.get(VK_CONTROL) & KEY_STATE_DOWN != 0;
+    let alt_down = keyboard.get(VK_MENU) & KEY_STATE_DOWN != 0;
     shift_down == (entry_flags & FSHIFT != 0)
         && ctrl_down == (entry_flags & FCONTROL != 0)
         && alt_down == (entry_flags & FALT != 0)

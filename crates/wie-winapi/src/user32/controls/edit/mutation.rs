@@ -10,6 +10,16 @@ use crate::user32::controls::{ControlState, ES_MULTILINE};
 use super::paint::edit_invalidate_mutation;
 use super::state::edit_state_mut;
 
+/// WM_CHAR codes the EDIT treats as control characters, not printable glyphs
+/// (winuser.h VK_* values — an EDIT delivers the Delete key's keystroke as
+/// `WM_CHAR` 0x7F, the ASCII DEL, which is distinct from `VK_DELETE` (0x2E)
+/// that arrives via `WM_KEYDOWN`).
+const VK_BACK: u32 = 0x08;
+const VK_RETURN: u32 = 0x0D;
+const VK_ESCAPE: u32 = 0x1B;
+const VK_SPACE: u32 = 0x20;
+const CHAR_DELETE: u32 = 0x7F;
+
 /// EDIT: process one `WM_CHAR` — insert at the caret (replacing an active
 /// selection), Backspace deletes before the caret. Enter inserts `\n` in a
 /// multiline EDIT (`ES_MULTILINE`); the `EM_LIMITTEXT` cap is honored. Returns
@@ -46,7 +56,7 @@ pub(super) fn edit_char(state: &mut WinApiState, hwnd: u64, char_code: u64) -> b
         let len = text.chars().count();
         let (start, end) = normalized_selection(*sel_start, *sel_end, len);
         match ch {
-            0x08 => {
+            VK_BACK => {
                 // VK_BACK: delete the selection, or the character before the caret.
                 if start != end {
                     let crossed = replace_crosses_lines(text, start, end, "");
@@ -94,9 +104,9 @@ pub(super) fn edit_char(state: &mut WinApiState, hwnd: u64, char_code: u64) -> b
                 }
             }
             // Enter inserts a line break only in a multiline EDIT; Escape and
-            // 0x7F (DEL) are never inserted as characters (DEL is handled by the
-            // WM_KEYDOWN VK_DELETE path).
-            0x0D => {
+            // CHAR_DELETE are never inserted as characters (Delete is handled
+            // by the WM_KEYDOWN VK_DELETE path).
+            VK_RETURN => {
                 if *style_bits & ES_MULTILINE != 0 {
                     let crossed = replace_crosses_lines(text, start, end, "\n");
                     let changed = replace_range(
@@ -120,8 +130,8 @@ pub(super) fn edit_char(state: &mut WinApiState, hwnd: u64, char_code: u64) -> b
                     (false, 0, false)
                 }
             }
-            0x1B | 0x7F => (false, 0, false),
-            _ if ch >= 0x20 => {
+            VK_ESCAPE | CHAR_DELETE => (false, 0, false),
+            _ if ch >= VK_SPACE => {
                 let Some(c) = char::from_u32(ch) else {
                     return false;
                 };

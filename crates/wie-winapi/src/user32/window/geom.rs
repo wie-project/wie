@@ -5,10 +5,14 @@ use super::class::{find_window, find_window_mut};
 use crate::guest_layout::{WinPoint, WinRect};
 use crate::state::WindowFlags;
 use crate::user32::{
-    Context, FAKE_DESKTOP_WINDOW_HANDLE, FAKE_PROCESS_ID, FAKE_SYSTEM_COLOR_BRUSH_BASE,
-    FAKE_THREAD_ID, FAKE_WINDOW_HANDLE, HandlerContext, Result, WinApiHandlerResult, WinApiState,
-    WindowPlacement, is_known_window, low_i32, read_u32, read_u64, window_client_size,
-    with_typed_read, with_typed_write, write_guest_u32,
+    COLOR_3DDKSHADOW, COLOR_ACTIVEBORDER, COLOR_ACTIVECAPTION, COLOR_APPWORKSPACE,
+    COLOR_BACKGROUND, COLOR_BTNHIGHLIGHT, COLOR_BTNSHADOW, COLOR_BTNTEXT, COLOR_CAPTIONTEXT,
+    COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_INACTIVEBORDER,
+    COLOR_INACTIVECAPTION, COLOR_INFOBK, COLOR_MENUTEXT, COLOR_SCROLLBAR, COLOR_WINDOW,
+    COLOR_WINDOWFRAME, COLOR_WINDOWTEXT, Context, FAKE_DESKTOP_WINDOW_HANDLE, FAKE_PROCESS_ID,
+    FAKE_SYSTEM_COLOR_BRUSH_BASE, FAKE_THREAD_ID, FAKE_WINDOW_HANDLE, HandlerContext, Result,
+    WinApiHandlerResult, WinApiState, WindowPlacement, is_known_window, low_i32, read_u32,
+    read_u64, window_client_size, with_typed_read, with_typed_write, write_guest_u32,
 };
 
 /// Handles `USER32.dll!GetClientRect`.
@@ -144,46 +148,41 @@ pub fn handle_get_sys_color(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 #[must_use]
 pub(crate) fn sys_color(color_index: u32) -> u32 {
     match color_index {
-        // Black-like colors:
-        // COLOR_BACKGROUND, COLOR_WINDOWFRAME,
-        // COLOR_MENUTEXT, COLOR_WINDOWTEXT,
-        // COLOR_CAPTIONTEXT, COLOR_BTNTEXT.
-        1 | 6 | 7..=9 | 18 => 0x0000_0000,
-
-        // Accent colors:
-        // COLOR_ACTIVECAPTION, COLOR_HIGHLIGHT.
-        // #0078D7 as 0RGB (the previous 0xD77830 was the B/R-swapped value and
-        // rendered orange).
-        2 | 13 => 0x0000_78D7,
+        // Black: the background/frame and the three black text colors
+        // (COLOR_MENUTEXT..=COLOR_CAPTIONTEXT is the contiguous 7..=9 run).
+        COLOR_BACKGROUND | COLOR_WINDOWFRAME | COLOR_MENUTEXT | COLOR_WINDOWTEXT
+        | COLOR_CAPTIONTEXT | COLOR_BTNTEXT => 0x0000_0000,
+        // Accent: COLOR_ACTIVECAPTION / COLOR_HIGHLIGHT. #0078D7 as 0RGB (the
+        // previous 0xD77830 was the B/R-swapped value and rendered orange).
+        COLOR_ACTIVECAPTION | COLOR_HIGHLIGHT => 0x0000_78D7,
 
         // COLOR_INACTIVECAPTION.
-        3 => 0x00bf_bfbf,
+        COLOR_INACTIVECAPTION => 0x00bf_bfbf,
 
-        // White-like colors:
-        // COLOR_WINDOW, COLOR_HIGHLIGHTTEXT, COLOR_BTNHIGHLIGHT (the 3D
-        // edge highlight).
-        5 | 14 | 20 => 0x00ff_ffff,
+        // White: COLOR_WINDOW, COLOR_HIGHLIGHTTEXT, COLOR_BTNHIGHLIGHT (the
+        // 3D edge highlight).
+        COLOR_WINDOW | COLOR_HIGHLIGHTTEXT | COLOR_BTNHIGHLIGHT => 0x00ff_ffff,
 
         // COLOR_ACTIVEBORDER, COLOR_INACTIVEBORDER.
-        10 | 11 => 0x00b4_b4b4,
+        COLOR_ACTIVEBORDER | COLOR_INACTIVEBORDER => 0x00b4_b4b4,
 
         // COLOR_APPWORKSPACE.
-        12 => 0x00ab_abab,
+        COLOR_APPWORKSPACE => 0x00ab_abab,
 
         // COLOR_BTNSHADOW.
-        16 => 0x00a0_a0a0,
+        COLOR_BTNSHADOW => 0x00a0_a0a0,
 
         // COLOR_3DDKSHADOW (the darkest 3D edge).
-        21 => 0x0069_6969,
+        COLOR_3DDKSHADOW => 0x0069_6969,
 
         // COLOR_GRAYTEXT.
-        17 => 0x006d_6d6d,
+        COLOR_GRAYTEXT => 0x006d_6d6d,
 
-        // COLOR_INFOBK (24) — the tooltip background (#FFFFE1, Windows 2000+).
-        24 => 0x00ff_ffe1,
+        // COLOR_INFOBK — the tooltip background (#FFFFE1, Windows 2000+).
+        COLOR_INFOBK => 0x00ff_ffe1,
 
         // COLOR_SCROLLBAR.
-        0 => 0x00c8_c8c8,
+        COLOR_SCROLLBAR => 0x00c8_c8c8,
 
         // COLOR_MENU, COLOR_BTNFACE and neutral fallback.
         _ => 0x00f0_f0f0,
@@ -361,6 +360,14 @@ pub fn handle_get_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 
     ctx.finish(return_value)
 }
+/// Approximate classic non-client metrics for `AdjustWindowRectEx` — the
+/// values the handler adds/subtracts instead of querying `GetSystemMetrics`
+/// (the real metrics they approximate: `SM_CXFRAME` frame, `SM_CYCAPTION`
+/// caption, `SM_CYMENU` menu bar).
+const NC_FRAME_PX: i32 = 8;
+const NC_CAPTION_PX: i32 = 31;
+const NC_MENU_PX: i32 = 20;
+
 /// Handles `USER32.dll!AdjustWindowRectEx`.
 pub fn handle_adjust_window_rect_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -390,26 +397,24 @@ pub fn handle_adjust_window_rect_ex(ctx: &mut HandlerContext<'_>) -> Result<WinA
             })
             .context("failed to read RECT for AdjustWindowRectEx")?;
 
-        // Approximate classic non-client metrics:
-        // 8 px frame on each side, 31 px caption,
-        // and another 20 px when a menu is present.
-        let menu_height = if has_menu != 0 { 20 } else { 0 };
+        // Approximate classic non-client metrics (see the NC_* constants).
+        let menu_height = if has_menu != 0 { NC_MENU_PX } else { 0 };
 
         let adjusted_left = left
-            .checked_sub(8)
+            .checked_sub(NC_FRAME_PX)
             .context("AdjustWindowRectEx left overflow")?;
 
         let adjusted_top = top
-            .checked_sub(31)
+            .checked_sub(NC_CAPTION_PX)
             .and_then(|value| value.checked_sub(menu_height))
             .context("AdjustWindowRectEx top overflow")?;
 
         let adjusted_right = right
-            .checked_add(8)
+            .checked_add(NC_FRAME_PX)
             .context("AdjustWindowRectEx right overflow")?;
 
         let adjusted_bottom = bottom
-            .checked_add(8)
+            .checked_add(NC_FRAME_PX)
             .context("AdjustWindowRectEx bottom overflow")?;
 
         with_typed_write::<WinRect, _, _>(engine, rect_ptr, |rect| {
@@ -645,7 +650,8 @@ pub fn handle_set_window_placement(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{
-        FAKE_WINDOW_HANDLE, find_window_mut, handle_get_client_rect, sys_color, window_client_size,
+        COLOR_INFOBK, FAKE_WINDOW_HANDLE, find_window_mut, handle_get_client_rect, sys_color,
+        window_client_size,
     };
 
     use crate::user32::read_i32;
@@ -932,11 +938,11 @@ mod tests {
             .expect("window record exists")
     }
 
-    /// COLOR_INFOBK (24) is the tooltip background — pinned so a future edit
+    /// COLOR_INFOBK is the tooltip background — pinned so a future edit
     /// to the system-color table cannot silently drop the fidelity fix.
     #[test]
     fn sys_color_infobk_is_tooltip_yellow() {
-        assert_eq!(sys_color(24), 0x00ff_ffe1);
+        assert_eq!(sys_color(COLOR_INFOBK), 0x00ff_ffe1);
     }
 
     /// RNotepad's WM_SIZE handler calls MoveWindow on its multiline EDIT; the

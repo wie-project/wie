@@ -244,11 +244,11 @@ fn build_dialog_item(
 /// Map a parsed template item class to a built-in control class identifier.
 fn item_class_identifier(class: &ItemClass) -> Option<WindowClassIdentifier> {
     let ordinal = match class {
-        ItemClass::Button => 0x0080,
-        ItemClass::Edit => 0x0081,
-        ItemClass::Static => 0x0082,
-        ItemClass::ListBox => 0x0083,
-        ItemClass::ComboBox => 0x0085,
+        ItemClass::Button => ControlClassKind::ORDINAL_BUTTON,
+        ItemClass::Edit => ControlClassKind::ORDINAL_EDIT,
+        ItemClass::Static => ControlClassKind::ORDINAL_STATIC,
+        ItemClass::ListBox => ControlClassKind::ORDINAL_LISTBOX,
+        ItemClass::ComboBox => ControlClassKind::ORDINAL_COMBOBOX,
         ItemClass::Other(_) => return None,
     };
     Some(WindowClassIdentifier::Atom(ordinal))

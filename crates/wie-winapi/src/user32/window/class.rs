@@ -2,7 +2,7 @@
 //! window-lookup helpers (split from the former `window.rs`).
 
 use crate::user32::{
-    Context, HandlerContext, Result, WinApiHandlerResult, WinApiState, WindowRecord,
+    Context, GWLP_WNDPROC, HandlerContext, Result, WinApiHandlerResult, WinApiState, WindowRecord,
     get_window_long_ptr_value, is_known_window, set_window_long_ptr_value, window_long_ptr_index,
 };
 
@@ -59,7 +59,7 @@ fn remember_subclass_original(
     index_raw: u64,
     previous_value: u64,
 ) {
-    if window_long_ptr_index(index_raw, "SetWindowLongPtr").ok() != Some(-4) {
+    if window_long_ptr_index(index_raw, "SetWindowLongPtr").ok() != Some(GWLP_WNDPROC) {
         return;
     }
     if let Some(window) = find_window_mut(state, window_handle)

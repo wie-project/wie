@@ -149,6 +149,17 @@ const COLOR_HIGHLIGHTTEXT: u32 = 0x00FF_FFFF;
 /// a task reads get a named constant here.
 pub(crate) const ES_MULTILINE: u32 = 0x0004;
 
+/// `WHEEL_DELTA` (winuser.h) — the delta-unit value of one mouse-wheel notch.
+///
+/// A `WM_MOUSEWHEEL` wParam carries the signed delta in its high word; the
+/// LISTBOX and EDIT scroll one notch's worth of lines (`WHEEL_SCROLL_LINES`)
+/// per `WHEEL_DELTA`, with smaller trackpad deltas scrolling proportionally.
+pub(crate) const WHEEL_DELTA: i32 = 120;
+
+/// Lines/rows a wheel notch scrolls — the `SPI_GETWHEELSCROLLLINES` default
+/// (3) that both the LISTBOX and EDIT scroll paths apply per `WHEEL_DELTA`.
+pub(crate) const WHEEL_SCROLL_LINES: i32 = 3;
+
 // ── Status-bar (SB_*) messages (commctrl.h) ─────────────────────────────
 //
 // The status bar is a comctl32 control, so its messages are WM_USER+ offsets
@@ -217,12 +228,13 @@ pub enum ControlClassKind {
 }
 
 impl ControlClassKind {
-    /// Built-in class ordinals (user32's pre-registered atoms).
-    const ORDINAL_BUTTON: u16 = 0x0080;
-    const ORDINAL_EDIT: u16 = 0x0081;
-    const ORDINAL_STATIC: u16 = 0x0082;
-    const ORDINAL_LISTBOX: u16 = 0x0083;
-    const ORDINAL_COMBOBOX: u16 = 0x0085;
+    /// Built-in class ordinals (user32's pre-registered atoms). `pub(crate)`:
+    /// the dialog-template builder maps parsed item classes to these.
+    pub(crate) const ORDINAL_BUTTON: u16 = 0x0080;
+    pub(crate) const ORDINAL_EDIT: u16 = 0x0081;
+    pub(crate) const ORDINAL_STATIC: u16 = 0x0082;
+    pub(crate) const ORDINAL_LISTBOX: u16 = 0x0083;
+    pub(crate) const ORDINAL_COMBOBOX: u16 = 0x0085;
 
     /// Resolve a `CreateWindowEx` class identifier to a built-in control
     /// class, by ordinal (`MAKEINTRESOURCE`) or by case-insensitive name.
