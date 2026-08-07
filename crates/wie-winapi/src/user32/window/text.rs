@@ -75,13 +75,14 @@ fn handle_set_window_text_impl(
                 // sets the text — WM_UNDO must not revert past it (the
                 // WM_SETTEXT dispatch arm does the same).
                 crate::user32::controls::edit_clear_undo_buffer(state, window_handle);
-                // An EDIT's caret+selection reset to the document start when
-                // the text is set programmatically (real Windows). Without it
-                // a FileNew's `SetWindowText(hEdit, NULL)` leaves the stale
-                // caret, and the guest's Ln/Col status refresh reads the old
-                // position ("Col N doesn't return to 1 instantly").
+                // An EDIT's caret+selection move to the END of the text set
+                // programmatically (real Windows): the caret lands after the
+                // last character, so typing appends to a prefilled field.
+                // `-1` is the EM_SETSEL "end of text" convention; the FileNew
+                // `SetWindowText(hEdit, NULL)` empty case resolves to (0, 0),
+                // and the guest's Ln/Col status refresh reads the start.
                 if kind == Some(crate::user32::controls::ControlClassKind::Edit) {
-                    crate::user32::controls::edit_set_selection(state, window_handle, 0, 0);
+                    crate::user32::controls::edit_set_selection(state, window_handle, -1, -1);
                     crate::user32::controls::edit_reset_invalid_rows(state, window_handle);
                 }
                 if matches!(

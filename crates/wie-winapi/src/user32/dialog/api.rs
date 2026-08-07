@@ -182,6 +182,16 @@ pub fn handle_set_dlg_item_int(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
             window.control_text = text;
             window.invalidated = true;
         }
+        // Real Windows `SetDlgItemInt` sends `WM_SETTEXT` to the child, so an
+        // EDIT's caret lands at the END of the new value (typing appends to a
+        // prefilled dialog field). The direct write above bypasses that
+        // dispatch, so mirror the WM_SETTEXT arm's caret placement here.
+        if let Some(kind) = find_window_mut(state, child).map(|w| w.control_kind)
+            && kind == Some(crate::user32::controls::ControlClassKind::Edit)
+        {
+            crate::user32::controls::edit_set_selection(state, child, -1, -1);
+            crate::user32::controls::edit_reset_invalid_rows(state, child);
+        }
     }
 
     let return_value = u64::from(success);

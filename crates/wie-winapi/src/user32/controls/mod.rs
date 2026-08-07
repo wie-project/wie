@@ -1077,12 +1077,16 @@ impl ControlClassKind {
                 match kind {
                     // A whole-text replacement rewrites every row: reset any
                     // pending row band so the next paint covers the whole EDIT.
-                    // The caret+selection also reset to the document start —
-                    // real Windows moves the caret to 0 when the text is set
-                    // programmatically (a stale caret makes the parent's Ln/Col
-                    // status refresh read the old position after FileNew).
+                    // The caret+selection move to the END of the new text —
+                    // real Windows places the caret after the last character
+                    // of programmatically-set text, so a prefilled dialog
+                    // field appends on typing (a stale caret otherwise points
+                    // into the old text; the parent's Ln/Col status refresh
+                    // would read the wrong position after FileNew). `-1` is
+                    // the EM_SETSEL "end of text" convention; empty text
+                    // resolves to (0, 0), identical to the old reset.
                     Some(ControlClassKind::Edit) => {
-                        edit_set_selection(state, hwnd, 0, 0);
+                        edit_set_selection(state, hwnd, -1, -1);
                         edit_reset_invalid_rows(state, hwnd);
                     }
                     // A label caption change narrows the next paint to the

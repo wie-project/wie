@@ -565,6 +565,144 @@ fn goto_cancel_click_closes_dialog_on_first_click() {
     );
 }
 
+/// The Go To dialog prefills its line-number EDIT with the current line
+/// (`SetDlgItemInt` → WM_SETTEXT in `DIALOG_GoTo_DialogProc`'s WM_INITDIALOG;
+/// the guest never EM_SETSELs the prefill). Real Windows places the caret at
+/// the END of programmatically-set text, so the prefill's caret must sit after
+/// the last digit and typing must APPEND — the SetWindowText caret-reset that
+/// forced (0, 0) on every programmatic set puts the caret at the LEFT and
+/// typing inserts at the front instead.
+#[test]
+fn goto_prefill_caret_is_at_end_and_typing_appends() {
+    let Some(path) = real_exe("notepad.exe") else {
+        eprintln!("skip: real_exes/notepad.exe not present");
+        return;
+    };
+    // Serialized suite: see GUI_SUITE_LOCK.
+    let _suite = gui_suite_serialize();
+    use wie_runtime::EntryTraceTermination;
+
+    const WM_COMMAND: u32 = 0x0111;
+    const WM_CHAR: u32 = 0x0102;
+    const WM_KEYDOWN: u32 = 0x0100;
+    const WM_KEYUP: u32 = 0x0101;
+    const VK_END: u64 = 0x23;
+
+    let mut session =
+        wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
+            .expect("notepad session starts");
+    let handle = session.guest_handle();
+    pump_until_windows_ready(&mut session);
+
+    let main = session.first_guest_window_handle().unwrap_or(0);
+    assert_ne!(main, 0, "notepad main window exists");
+    let tree = handle.window_menu_items();
+    let goto_id = tree
+        .iter()
+        .flat_map(|top| top.children.iter())
+        .find(|child| child.title.to_lowercase().contains("go to"))
+        .map(|child| child.id)
+        .unwrap_or(0);
+    assert_ne!(goto_id, 0, "the Edit menu must contain a Go To command");
+
+    let main_edit = session
+        .guest_windows_snapshot()
+        .iter()
+        .find(|(_, cls, ..)| cls == "EDIT")
+        .map(|(h, ..)| *h)
+        .unwrap_or(main);
+    assert_ne!(main_edit, 0, "notepad main EDIT exists");
+
+    // A three-line document with the caret parked at the end (line 3): the Go
+    // To prefill reads the CURRENT line, so the field must hold "3".
+    for c in "line one".chars() {
+        handle.post_message(main_edit, WM_CHAR, u64::from(c as u32), 0);
+    }
+    handle.post_message(main_edit, WM_CHAR, 0x0D, 0); // Enter → '\n'
+    for c in "line two".chars() {
+        handle.post_message(main_edit, WM_CHAR, u64::from(c as u32), 0);
+    }
+    handle.post_message(main_edit, WM_CHAR, 0x0D, 0);
+    for c in "line three".chars() {
+        handle.post_message(main_edit, WM_CHAR, u64::from(c as u32), 0);
+    }
+    handle.post_message(main_edit, WM_KEYDOWN, VK_END, 0);
+    handle.post_message(main_edit, WM_KEYUP, VK_END, 0);
+    for _ in 0..30 {
+        let summary = session.run_until_stop(1_000_000).expect("run after typing");
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    // Open the Go To dialog and wait for the WM_INITDIALOG prefill to land.
+    handle.post_message(main, WM_COMMAND, u64::from(goto_id), 0);
+    let mut dialog_hwnd = 0_u64;
+    let mut prefill = String::new();
+    for _ in 0..200 {
+        let summary = session
+            .run_until_stop(1_000_000)
+            .expect("run after CMD_GOTO");
+        if matches!(
+            summary.termination,
+            EntryTraceTermination::ExitProcess { .. }
+        ) {
+            panic!("notepad exited while the Go To dialog should be open");
+        }
+        if let Some((dhwnd, ..)) = session
+            .guest_windows_snapshot()
+            .iter()
+            .find(|(_, cls, ..)| cls == "Dialog")
+        {
+            dialog_hwnd = *dhwnd;
+        }
+        let edit_hwnd = dialog_edit(&session, dialog_hwnd);
+        prefill = handle.control_text(edit_hwnd).unwrap_or_default();
+        if dialog_hwnd != 0 && edit_hwnd != 0 && !prefill.is_empty() {
+            break;
+        }
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    assert_ne!(dialog_hwnd, 0, "CMD_GOTO must open a Dialog window");
+    assert_eq!(
+        prefill, "3",
+        "the Go To prefill must hold the current line (3) — the WM_INITDIALOG \
+         SetDlgItemInt handoff is broken (got {prefill:?})"
+    );
+
+    // The prefill's caret must sit at the END (len 1), not the start: the
+    // host's programmatic SetWindowText caret placement is what typing
+    // appends from.
+    let edit_hwnd = dialog_edit(&session, dialog_hwnd);
+    assert_eq!(
+        handle.edit_selection(edit_hwnd),
+        Some((1, 1, 1)),
+        "the prefilled line-number's caret must sit after the digit (end of \
+         the value), so typing appends — a (0, 0) caret means the SetWindowText \
+         reset put it at the LEFT (actual: {:?})",
+        handle.edit_selection(edit_hwnd)
+    );
+
+    // One typed digit must APPEND (the caret is at the end), not insert at
+    // the front.
+    handle.post_message(edit_hwnd, WM_CHAR, u64::from('5' as u32), 0);
+    for _ in 0..20 {
+        let _ = session.run_until_stop(1_000_000).expect("run after typing");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        handle.control_text(edit_hwnd).unwrap_or_default(),
+        "35",
+        "typing into the prefilled field must append to the value (caret at \
+         the end), not insert at the front"
+    );
+
+    // Close the dialog (IDCANCEL) so the session winds down cleanly.
+    handle.post_message(dialog_hwnd, WM_COMMAND, 2, 0); // IDCANCEL
+}
+
 /// Locate the Go To dialog's line-number EDIT child (built-in class atom
 /// EDIT=0x0081 → snapshot class "#129").
 fn dialog_edit(session: &wie_runtime::RuntimeSession, dialog_hwnd: u64) -> u64 {
