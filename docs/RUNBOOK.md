@@ -27,7 +27,7 @@ One-page playbook for regressions after the foundational work and the **great cl
 | TLB Neon issues on aarch64 | `WIE_TLB_NEON=0` |
 | Host mprotect noise / faults | `WIE_MPROTECT=0` (SPC still enforces) |
 | Heap freelist suspicion | `WIE_GUEST_HEAP=0` (host freelist only; default) |
-| Hang on Wait / CS under MT | See [`mt-threads.md`](mt-threads.md); `ExitProcess` wakes waiters; check peer never signals |
+| Hang on Wait / CS under MT | See [`docs/architecture/runtime.md`](architecture/runtime.md) (threading model); `ExitProcess` wakes waiters; check peer never signals |
 | `CreateThread` fails | Unset `WIE_MT=0`; raise `WIE_MT_MAX_THREADS` (default 64) |
 | Interlocked wrong | Expect host atomics via soft-translate; try `WIE_CPU=iced` |
 
@@ -91,7 +91,7 @@ The README keeps the shortlist; the complete set lives here.
 
 | Topic | Doc |
 | ----- | --- |
-| Multithreading | [`mt-threads.md`](mt-threads.md) |
+| Multithreading | [`docs/architecture/runtime.md`](architecture/runtime.md) (threading model) |
 | Live progress log | [`../.slim/deepwork/gui-implementation.md`](../.slim/deepwork/gui-implementation.md) |
 
 ## Non-goals of this sheet

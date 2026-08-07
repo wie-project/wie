@@ -84,6 +84,15 @@ Hot APIs never stop the host: the runtime plants x86-64 machine-code bodies into
 
 Stub correctness policy: stubs are planted only when the in-guest body honours the documented API contract — simplified always-success answers that diverge from Microsoft Learn are not used; those APIs stay on the host path.
 
+## Threading model
+
+Guest threads map **1:1 to host threads**, each with its own `CpuEngine` (JIT: shared `Arc<JitShared>` compile cache; iced: shared `Arc<RwLock<GuestMemory>>`). WinAPI/kernel-object/heap state sits behind `Arc<Mutex<WinApiState>>`.
+
+- **Lock scope**: the WinAPI mutex is held only for activate/dispatch/state-mutate — never across pure `run_until_stop` guest compute. Host waits (`WaitFor*`, contended critical sections) park **outside** the mutex so peers can signal.
+- **Active-TID rule**: `ThreadState.active` is process-global — a peer may have activated itself while this thread ran pure guest code. Every dispatch path must `activate(own_tid)` again under the lock before any handler using `current_tid()` (CS ownership, TLS, waits). Missing re-activation caused false CS ownership and deadlocks under `7za -mmt2` (workers steal `active` while the primary runs pure guest code).
+- **Stacks**: default guest worker stack is **1 MiB** when `dwStackSize == 0` (Windows-like); host worker threads use **8 MiB** so JIT/iced dispatch doesn't overflow secondary-thread defaults.
+- **What works**: `CreateThread`/`ExitThread` + joins, `_beginthreadex`/`_endthreadex`, `CREATE_SUSPENDED` + `ResumeThread`, critical sections (reenter + contended park), events/semaphores/`WaitForMultipleObjects` (any/all), `Interlocked*` (host atomics), TLS.
+
 ## Cross-thread handles
 
 `GuestHandle` is the cloneable, cross-thread window into a session: `window_at` (full-hierarchy hit-test), `post_message`, `take_frame`, the wake callback, menu-tree cache. Posting locks **only the message queue**, never the big WinAPI mutex — the guest thread blocks on API state, not on the host posting to it. A waiting guest wakes immediately (condvar + `triggered` atomic), not on a poll tick.

@@ -85,6 +85,7 @@ flowchart LR
 | [Architecture](docs/architecture/) | Crate-by-crate deep dive (pe, cpu & memory, winapi, GUI, D3D9, runtime) |
 | [Runbook](docs/RUNBOOK.md) | Debugging playbook + all environment knobs |
 | [Missing handlers](docs/missing-winapi-handlers.md) | WinAPI surface gaps |
+| [Real-app runbooks](docs/7zip.md) | 7-Zip, 2048, Snake workflows |
 
 ## Contributing
 
