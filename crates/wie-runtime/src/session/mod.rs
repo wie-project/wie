@@ -7,6 +7,7 @@ mod profile;
 mod pump;
 mod types;
 mod window;
+mod window_msg;
 
 pub use self::menu::MenuNode;
 pub use self::profile::RuntimeProfile;
