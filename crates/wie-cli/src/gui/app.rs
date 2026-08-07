@@ -374,6 +374,23 @@ const MIN_GUEST_WINDOW_SIZE: i32 = 100;
 /// (winit `LineDelta` values are multiples of this).
 const WHEEL_DELTA: f32 = 120.0;
 
+/// Accumulate a wheel delta and return the whole 120-unit notches to emit,
+/// leaving the fraction in `accumulator` for the next event.
+///
+/// macOS trackpads deliver pixel deltas far below one notch per event
+/// (10–60 px), and the guest EDIT/LISTBOX wheel handlers truncate
+/// `delta / WHEEL_DELTA` — without accumulation every trackpad flick would
+/// scroll zero lines. This mirrors what a real Windows input driver does
+/// before posting `WM_MOUSEWHEEL`; a physical wheel (LineDelta ±1 → ±120)
+/// emits exactly one notch per event, unchanged.
+#[must_use]
+fn wheel_notches(accumulator: &mut f32, delta: f32) -> i32 {
+    *accumulator += delta;
+    let notches = (*accumulator / WHEEL_DELTA) as i32;
+    *accumulator -= notches as f32 * WHEEL_DELTA;
+    notches
+}
+
 /// Stack size for the guest thread (`thread::Builder::stack_size`). A GUI
 /// guest (guest stubs, host-stop handlers, the winit bridge) needs a deep
 /// host stack; 8 MiB is the macOS main-thread default.
@@ -571,6 +588,12 @@ struct WieApp {
     mouse_buttons: u16,
     /// Last reported cursor position in client coords (x, y).
     cursor_pos: (f64, f64),
+    /// Residual wheel deltas (x, y) not yet emitted as a whole 120-unit
+    /// notch — macOS trackpads deliver sub-notch pixel deltas per event,
+    /// and the guest wheel handlers truncate partial deltas to zero (see
+    /// [`wheel_notches`]).
+    wheel_accum_x: f32,
+    wheel_accum_y: f32,
     /// The last left-button press (time, position, target window), for
     /// double-click detection — a second press on the same window within the
     /// time window and slop rectangle posts WM_LBUTTONDBLCLK instead of
@@ -1155,6 +1178,8 @@ pub fn run_gui_windowed(
         last_z_rev: None,
         mouse_buttons: 0,
         cursor_pos: (0.0, 0.0),
+        wheel_accum_x: 0.0,
+        wheel_accum_y: 0.0,
         last_left_press: None,
         modifiers: winit::keyboard::ModifiersState::default(),
         #[cfg(target_os = "macos")]
@@ -1177,8 +1202,53 @@ mod tests {
     use super::{
         OCCLUDED_RETRY_MAX, OCCLUDED_RETRY_MS, PARKED_RETRY_MS, guest_size_from_physical,
         map_alert_result, map_message_box_buttons, resolve_gui_run_source, retry_delay,
-        window_attributes,
+        wheel_notches, window_attributes,
     };
+
+    /// A physical wheel notch (LineDelta ±1 → ±120) emits exactly one notch
+    /// per event and leaves no residue.
+    #[test]
+    fn wheel_notches_full_notch_emits_immediately() {
+        let mut accum = 0.0_f32;
+        assert_eq!(wheel_notches(&mut accum, 120.0), 1);
+        assert_eq!(accum, 0.0);
+        assert_eq!(wheel_notches(&mut accum, -120.0), -1);
+        assert_eq!(accum, 0.0);
+    }
+
+    /// Trackpad flicks (PixelDelta, 10–60 px per event) accumulate across
+    /// events until a whole 120-unit notch forms — a 3×40 flick scrolls.
+    #[test]
+    fn wheel_notches_accumulates_trackpad_flicks() {
+        let mut accum = 0.0_f32;
+        assert_eq!(wheel_notches(&mut accum, 40.0), 0);
+        assert_eq!(accum, 40.0);
+        assert_eq!(wheel_notches(&mut accum, 40.0), 0);
+        assert_eq!(accum, 80.0);
+        assert_eq!(wheel_notches(&mut accum, 40.0), 1);
+        assert_eq!(accum, 0.0);
+    }
+
+    /// Negative accumulation mirrors the positive case (scrolling down).
+    #[test]
+    fn wheel_notches_accumulates_downward_flicks() {
+        let mut accum = 0.0_f32;
+        assert_eq!(wheel_notches(&mut accum, -60.0), 0);
+        assert_eq!(accum, -60.0);
+        assert_eq!(wheel_notches(&mut accum, -60.0), -1);
+        assert_eq!(accum, 0.0);
+    }
+
+    /// A fast flick that exceeds a notch emits the whole-notch part and
+    /// carries the remainder into the next event.
+    #[test]
+    fn wheel_notches_emits_whole_notches_keeps_remainder() {
+        let mut accum = 0.0_f32;
+        assert_eq!(wheel_notches(&mut accum, 250.0), 2);
+        assert_eq!(accum, 10.0);
+        assert_eq!(wheel_notches(&mut accum, 110.0), 1);
+        assert_eq!(accum, 0.0);
+    }
 
     /// `MB_*` button bits select the rfd button set; the bridge receives the
     /// raw flag word, so this mapping is the winapi crate's documented seam.

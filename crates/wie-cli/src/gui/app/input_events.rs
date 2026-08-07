@@ -14,7 +14,7 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::window::WindowId;
 
-use super::{RESIZE_SETTLE_MS, WHEEL_DELTA, WieApp};
+use super::{RESIZE_SETTLE_MS, WHEEL_DELTA, WieApp, wheel_notches};
 use crate::gui::input;
 
 // Whether a present actually drew its frame — the RedrawRequested arm records
@@ -393,12 +393,18 @@ impl WieApp {
                 );
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                // Keep the deltas in float units so trackpad pixel deltas
+                // accumulate toward whole notches (see `wheel_notches`):
+                // truncating each event to i32 first would drop every
+                // sub-120 trackpad flick before the accumulator sees it.
                 let (delta_x, delta_y) = match delta {
                     winit::event::MouseScrollDelta::LineDelta(x, y) => {
-                        ((x * WHEEL_DELTA) as i32, (y * WHEEL_DELTA) as i32)
+                        (x * WHEEL_DELTA, y * WHEEL_DELTA)
                     }
-                    winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.x as i32, pos.y as i32),
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32),
                 };
+                let notch_x = wheel_notches(&mut self.wheel_accum_x, delta_x);
+                let notch_y = wheel_notches(&mut self.wheel_accum_y, delta_y);
                 let mk = self.mk_flags();
                 // WM_MOUSEWHEEL/HWHEEL go to the FOCUS window, not the window
                 // under the cursor (DefWindowProc then bubbles them up the
@@ -409,8 +415,12 @@ impl WieApp {
                     Some(focus) => (focus, 0, 0),
                     None => self.mouse_target(handle, event_hwnd.unwrap_or(primary_hwnd), event_sf),
                 };
-                if delta_y != 0 {
-                    let wparam = input::make_wparam(mk, delta_y as u16);
+                if notch_y != 0 {
+                    // Whole notches re-emitted as a signed 120-unit delta
+                    // (exact in i32; the u16 wrap carries the sign, which
+                    // the guest reads back as i16).
+                    let delta = (notch_y as f32 * WHEEL_DELTA) as i32;
+                    let wparam = input::make_wparam(mk, delta as u16);
                     handle.post_message_at(
                         target,
                         input::WM_MOUSEWHEEL,
@@ -420,8 +430,9 @@ impl WieApp {
                         i32::from(ry),
                     );
                 }
-                if delta_x != 0 {
-                    let wparam = input::make_wparam(mk, delta_x as u16);
+                if notch_x != 0 {
+                    let delta = (notch_x as f32 * WHEEL_DELTA) as i32;
+                    let wparam = input::make_wparam(mk, delta as u16);
                     handle.post_message_at(
                         target,
                         input::WM_MOUSEHWHEEL,
