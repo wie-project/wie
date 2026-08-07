@@ -108,8 +108,8 @@ pub(crate) fn run_micro(
         .map(std::path::Path::to_path_buf)
         .or_else(wie_winapi::bottle_root_from_env);
     match root.as_ref() {
-        Some(r) => println!("bottle_root: {} (override)", r.display()),
-        None => println!(
+        Some(r) => tracing::debug!("bottle_root: {} (override)", r.display()),
+        None => tracing::debug!(
             "bottle_root: {} (global default)",
             wie_winapi::global_bottle_root().display()
         ),
@@ -118,7 +118,7 @@ pub(crate) fn run_micro(
         .map(std::path::Path::to_path_buf)
         .or_else(wie_winapi::drive_d_from_env);
     if let Some(ref d) = drive_d_root {
-        println!("drive_d: {}", d.display());
+        tracing::debug!("drive_d: {}", d.display());
     }
     // FS policy: an exe outside the bottle runs from a drive_c copy so the
     // guest identity's `C:\Program Files\{name}\{name}.exe` label maps back

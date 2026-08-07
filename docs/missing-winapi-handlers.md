@@ -61,9 +61,8 @@ the remaining notepad imports that would bail if called:
 | Import | Status |
 | --- | --- |
 | `advapi32!IsTextUnicode` | encoding detect helper |
-| `kernel32!CreateFileMappingW` | MapViewOfFile/UnmapViewOfFile exist; the create-side is missing |
 | `user32!WinHelpW`, `user32!wsprintfW` | minor/rare paths |
-| `msvcrt!_wcmdln`, `fgetwc`, `getc`, `iswctype`, `vfprintf` | legacy CRT exports not reached by notepad |
+| `msvcrt!_wcmdln`, `fgetwc`, `getc`, `vfprintf` | legacy CRT exports not reached by notepad |
 
 Previously-listed gaps that have since landed: `ChooseFontW`/`PageSetupDlgW`/`PrintDlgW`
 (native font/page-setup/print panels), the print-path GDI stubs (`AbortDoc`/`EndDoc`/`EndPage`/
@@ -104,7 +103,6 @@ Any call to these returns `bail!("unsupported WinAPI call: {library}!{name}")`:
 - `SHBrowseForFolderW` — returns NULL
 - `DragAcceptFiles`, `DragQueryFileA/W`, `DragQueryPoint`, `DragFinish` + `WM_DROPFILES` (see "Recently landed")
 - `ShellAboutW` (MessageBox bridge), `ShellExecuteW` ("open" → detached `wie-cli run`)
-- `SHAddToRecentDocs` — **still missing** (see the notepad triage table)
 
 **Missing:**
 - `ShellExecuteA` / `ShellExecuteW`

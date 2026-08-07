@@ -179,6 +179,17 @@ pub fn handle_get_compressed_file_size_w(
     state.process.last_error = 0;
     ctx.finish(st.size)
 }
+/// Real `winnt.h` `FILE_*` flags the bottle volume claims — the honest set
+/// for the host-bottle directory (macOS): case-preserved + unicode names,
+/// persistent ACLs, named streams. Values must match the real headers; a
+/// mismatch sends apps down the wrong feature path.
+const FILE_CASE_PRESERVED_NAMES: u32 = 0x0000_0002;
+const FILE_UNICODE_ON_DISK: u32 = 0x0000_0004;
+const FILE_PERSISTENT_ACLS: u32 = 0x0000_0008;
+const FILE_NAMED_STREAMS: u32 = 0x0004_0000;
+const BOTTLE_FS_FLAGS: u32 =
+    FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK | FILE_PERSISTENT_ACLS | FILE_NAMED_STREAMS;
+
 /// Handles `KERNEL32.dll!GetVolumeInformationW` — real bottle volume info.
 pub fn handle_get_volume_information_w(
     ctx: &mut HandlerContext<'_>,
@@ -210,11 +221,7 @@ pub fn handle_get_volume_information_w(
     if max_comp_ptr != 0 {
         let _unused = write_guest_u32(engine, max_comp_ptr, 255);
     }
-    // FileSystemFlags: FILE_CASE_SENSITIVE_SEARCH | FILE_CASE_PRESERVED_NAMES |
-    //                   FILE_UNICODE_ON_DISK | FILE_PERSISTENT_ACLS | FILE_NAMED_STREAMS |
-    //                   FILE_FILE_COMPRESSION
-    let fs_flags: u32 =
-        0x0000_0008 | 0x0000_0002 | 0x0000_0004 | 0x0000_0010 | 0x0000_0040 | 0x0020_0000;
+    let fs_flags: u32 = BOTTLE_FS_FLAGS;
     if flags_ptr != 0 {
         let _unused = write_guest_u32(engine, flags_ptr, fs_flags);
     }
@@ -257,8 +264,7 @@ pub fn handle_get_volume_information_a(
     if max_comp_ptr != 0 {
         let _unused = write_guest_u32(engine, max_comp_ptr, 255);
     }
-    let fs_flags: u32 =
-        0x0000_0008 | 0x0000_0002 | 0x0000_0004 | 0x0000_0010 | 0x0000_0040 | 0x0020_0000;
+    let fs_flags: u32 = BOTTLE_FS_FLAGS;
     if flags_ptr != 0 {
         let _unused = write_guest_u32(engine, flags_ptr, fs_flags);
     }

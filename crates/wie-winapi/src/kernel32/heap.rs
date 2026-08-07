@@ -467,13 +467,13 @@ pub fn handle_global_delete_atom(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let atom_low = atom_raw & u64::from(u16::MAX);
     let atom = u16::try_from(atom_low).context("GlobalDeleteAtom identifier does not fit u16")?;
 
-    let existed = state
+    let was_live = state
         .window_state()
         .global_atoms
         .iter()
         .any(|record| record.atom == atom);
 
-    if existed {
+    if was_live {
         state
             .window_state()
             .global_atoms
@@ -485,7 +485,7 @@ pub fn handle_global_delete_atom(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     }
 
     // GlobalDeleteAtom returns zero on success, otherwise the original atom.
-    let return_value = if existed { 0 } else { u64::from(atom) };
+    let return_value = if was_live { 0 } else { u64::from(atom) };
 
     ctx.finish(return_value)
 }
