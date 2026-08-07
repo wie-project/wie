@@ -334,9 +334,12 @@ pub(crate) fn dispatch_edit_message(
             Ok(Some(handle))
         }
         // EM_SETHANDLE: adopt the guest buffer as the text (the caller
-        // relinquishes ownership; caret/selection reset).
+        // relinquishes ownership; caret/selection reset). The buffer handle
+        // rides in wParam per MSDN — lParam is unused and must be zero
+        // (RNotepad's DoOpenFile sends (WPARAM)hBuffer in wParam; reading
+        // lParam instead would see 0 and silently keep the edit empty).
         WinMsg::EM_SETHANDLE => {
-            let ok = edit_set_handle(engine, unicode, state, hwnd, long_parameter)?;
+            let ok = edit_set_handle(engine, unicode, state, hwnd, word_parameter)?;
             Ok(Some(u64::from(ok)))
         }
         // EM_SETTABSTOPS: wParam = stop count, lParam = u16 array in dialog

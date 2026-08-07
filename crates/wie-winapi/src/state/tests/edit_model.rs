@@ -338,8 +338,8 @@ fn test_edit_em_set_handle_adopts_guest_text() {
         &mut state,
         edit,
         crate::user32::EM_SETHANDLE,
+        0x4000, // wParam = the adopted buffer (MSDN: lParam is unused)
         0,
-        0x4000,
     )
     .expect("sethandle ok")
     .expect("some result");

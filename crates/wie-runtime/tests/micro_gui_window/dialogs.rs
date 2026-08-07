@@ -1044,6 +1044,14 @@ fn notepad_file_save_native_bridge_accept_completes_save_flow() {
         "the native-bridge Save flow must not stop the session (the reported \
          crash dies right after the accept + frame finish); stop={stop_message}"
     );
+    // The saved file must hold the typed text (the guest's WriteFile on the
+    // mounted path carries the edit content).
+    let saved = std::fs::read(&picked_host).unwrap_or_default();
+    assert!(
+        String::from_utf8_lossy(&saved).contains("save me"),
+        "the saved file must contain the typed text; got {:?}",
+        String::from_utf8_lossy(&saved)
+    );
     let _ = std::fs::remove_file(&picked_host);
     let _ = std::fs::remove_dir_all(&bottle);
 }
@@ -1144,11 +1152,172 @@ fn notepad_file_open_native_bridge_accept_reads_picked_file() {
          api sequence:\n{}",
         api_sequence.join("\n")
     );
+
+    // THE content path: the EDIT must hold the picked file's bytes (notepad
+    // reads opened files exclusively through the mapped view). The reported
+    // live bug is that the dialog works and the title updates but the edit
+    // stays EMPTY — this pins the byte copy from the view into the edit.
+    let edit = session
+        .guest_windows_snapshot()
+        .iter()
+        .find(|(_, cls, ..)| cls == "EDIT")
+        .map(|(h, ..)| *h)
+        .unwrap_or(0);
+    assert_ne!(edit, 0, "notepad must have an EDIT control");
+    let mut edit_text = String::new();
+    for _ in 0..50 {
+        edit_text = handle.control_text(edit).unwrap_or_default();
+        if edit_text == String::from_utf8_lossy(original) {
+            break;
+        }
+        // Keep pumping so the guest's post-read SetWindowText/EM_SETHANDLE
+        // dispatch lands on the host control.
+        let _ = session.run_until_stop(1_000_000).expect("run");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(
+        edit_text,
+        String::from_utf8_lossy(original),
+        "the OPEN flow must load the picked file's CONTENT into the EDIT \
+         (the dialog + title work but the edit was empty in the live bug); \
+         api sequence:\n{}",
+        api_sequence.join("\n")
+    );
     let _ = std::fs::remove_file(&picked_host);
     let _ = std::fs::remove_dir_all(&bottle);
 }
 
-/// The New-flow continuation, end to end: type into the EDIT (dirty doc),
+/// SAVE→OPEN roundtrip through the native bridge: a file saved by the guest
+/// (via the pick-mount) must re-open with the SAME content in the EDIT. This
+/// pins the full content path — the save's WriteFile, the re-open's
+/// CreateFileMappingW → MapViewOfFile view, and the guest's EM_SETHANDLE
+/// adoption of the view copy.
+#[test]
+fn notepad_file_save_then_open_roundtrips_content() {
+    let Some(path) = real_exe("notepad.exe") else {
+        eprintln!("skip: real_exes/notepad.exe not present");
+        return;
+    };
+    let _suite = gui_suite_serialize();
+    use wie_runtime::EntryTraceTermination;
+
+    const WM_COMMAND: u32 = 0x0111;
+    const WM_CHAR: u32 = 0x0102;
+    const CMD_SAVE: u32 = 259;
+    const CMD_OPEN: u32 = 258;
+
+    let bottle =
+        std::env::temp_dir().join(format!("wie-ofn-roundtrip-bottle-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(bottle.join("drive_c"));
+    let picked_host = std::env::temp_dir().join(format!(
+        "wie-ofn-roundtrip-picked-{}.txt",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&picked_host);
+    let roundtrip_text = "roundtrip content 42";
+
+    let mut session =
+        wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
+            .expect("notepad session starts");
+    session.set_bottle_root(Some(bottle.clone()));
+    session.set_file_dialog_policy(wie_winapi::FileDialogPolicy::Interactive);
+    let handle = session.guest_handle();
+    let picked = picked_host.clone();
+    handle.set_file_dialog_bridge(Box::new(move |_request| {
+        Some(wie_winapi::FileDialogPick {
+            host_path: picked.clone(),
+        })
+    }));
+    pump_until_windows_ready(&mut session);
+
+    let main = session.first_guest_window_handle().unwrap_or(0);
+    let edit = session
+        .guest_windows_snapshot()
+        .iter()
+        .find(|(_, cls, ..)| cls == "EDIT")
+        .map(|(h, ..)| *h)
+        .unwrap_or(main);
+
+    // Stage 1: type text and Save it through the native bridge.
+    for c in roundtrip_text.chars() {
+        handle.post_message(edit, WM_CHAR, u64::from(c as u32), 0);
+    }
+    for _ in 0..30 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    handle.post_message(main, WM_COMMAND, u64::from(CMD_SAVE), 0);
+    let mut saved = false;
+    for _ in 0..200 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if picked_host.is_file() {
+            saved = true;
+            break;
+        }
+    }
+    assert!(saved, "the Save must create the picked host file");
+    let on_disk = std::fs::read(&picked_host).unwrap_or_default();
+    assert!(
+        String::from_utf8_lossy(&on_disk).contains(roundtrip_text),
+        "saved file must hold the typed text; got {:?}",
+        String::from_utf8_lossy(&on_disk)
+    );
+
+    // Stage 2: File→New (discard via the save prompt bridge — the doc is
+    // clean after Save, so no prompt fires), then Open the same file back.
+    handle.post_message(main, WM_COMMAND, u64::from(256_u32), 0); // CMD_NEW
+    for _ in 0..50 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    handle.post_message(main, WM_COMMAND, u64::from(CMD_OPEN), 0);
+
+    // The re-opened EDIT must hold the SAME content (the mapping view path).
+    let mut edit_text = String::new();
+    let mut open_alive = true;
+    for _ in 0..200 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        edit_text = handle.control_text(edit).unwrap_or_default();
+        if edit_text.contains(roundtrip_text) {
+            break;
+        }
+        match summary.termination {
+            EntryTraceTermination::ExitProcess { .. } => break,
+            EntryTraceTermination::WaitingForMessage => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            EntryTraceTermination::RuntimeStop(message) => {
+                open_alive = false;
+                eprintln!("DIAG ROUNDTRIP RuntimeStop: {message}");
+                break;
+            }
+            EntryTraceTermination::UnsupportedApi(message) => {
+                open_alive = false;
+                eprintln!("DIAG ROUNDTRIP UnsupportedApi: {message}");
+                break;
+            }
+            other => {
+                eprintln!("DIAG ROUNDTRIP other: {other:?}");
+            }
+        }
+    }
+    assert!(open_alive, "the roundtrip OPEN must not stop the session");
+    assert!(
+        edit_text.contains(roundtrip_text),
+        "the re-opened EDIT must hold the saved content; got {:?}",
+        edit_text
+    );
+
+    let _ = std::fs::remove_file(&picked_host);
+    let _ = std::fs::remove_dir_all(&bottle);
+}
 /// post File→New (CMD_NEW=256), answer the save prompt with "Don't Save"
 /// (IDNO — the discard path), and assert the EDIT is CLEARED and the repaint
 /// reflects it (the text ink disappears from the owner's published frame).
