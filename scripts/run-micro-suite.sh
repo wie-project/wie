@@ -9,6 +9,10 @@ CLI="${CLI:-$ROOT/target/release/wie}"
 CPU="${WIE_CPU:-jit}"
 CATEGORY="${1:-all}"
 
+# The per-run summary (path, events, exit) is a `wie`-target debug log; show
+# it by default so the suite reports what each exe did.
+export RUST_LOG="${RUST_LOG:-wie=debug}"
+
 if [[ ! -x "$CLI" ]]; then
   echo "building wie (release)…"
   cargo build -p wie-cli --release --manifest-path "$ROOT/Cargo.toml"
