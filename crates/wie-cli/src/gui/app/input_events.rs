@@ -401,7 +401,18 @@ impl WieApp {
                     winit::event::MouseScrollDelta::LineDelta(x, y) => {
                         (x * WHEEL_DELTA, y * WHEEL_DELTA)
                     }
-                    winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32),
+                    // winit reports trackpad deltas in PHYSICAL pixels
+                    // (the macOS backend multiplies the logical points by
+                    // the scale factor); the guest surface is LOGICAL
+                    // 96-DPI and the notch math is in logical units, so
+                    // convert back — without this a Retina (2×) gesture
+                    // accumulates twice as many notches. Plain division,
+                    // not `physical_to_logical`: deltas keep fractional
+                    // precision for slow scrolling, unlike coordinates.
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => (
+                        pos.x as f32 / event_sf as f32,
+                        pos.y as f32 / event_sf as f32,
+                    ),
                 };
                 let notch_x = wheel_notches(&mut self.wheel_accum_x, delta_x);
                 let notch_y = wheel_notches(&mut self.wheel_accum_y, delta_y);
