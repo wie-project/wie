@@ -110,12 +110,33 @@ pub(crate) fn logical_to_physical(logical: f64, scale_factor: f64) -> f64 {
     (logical * scale_factor).round()
 }
 
+/// Convert a PHYSICAL pixel DELTA (a scroll delta, a drag distance) to
+/// LOGICAL 96-DPI units: `delta ÷ scale_factor`, WITHOUT rounding.
+///
+/// Deltas accumulate across events (the wheel-notch accumulator, drag
+/// distance), so rounding each event would alias away sub-pixel motion —
+/// a 1.5 px event must stay 1.5, not bounce between 1 and 2. The rounded
+/// [`physical_to_logical`] is for discrete coordinates, which land on
+/// integer guest pixels.
+#[must_use]
+pub(crate) fn physical_delta_to_logical(delta: f64, scale_factor: f64) -> f64 {
+    delta / scale_factor
+}
+
+/// Convert a LOGICAL pixel DELTA to PHYSICAL units, WITHOUT rounding (the
+/// unrounded counterpart of [`logical_to_physical`]; see
+/// [`physical_delta_to_logical`]).
+#[must_use]
+pub(crate) fn logical_delta_to_physical(delta: f64, scale_factor: f64) -> f64 {
+    delta * scale_factor
+}
+
 /// The double-click slop in PHYSICAL pixels at `scale_factor`: winit cursor
 /// positions are physical, while [`DOUBLE_CLICK_SLOP_PX`] is a logical
 /// 96-DPI distance.
 #[must_use]
 pub(crate) fn double_click_slop(scale_factor: f64) -> f64 {
-    DOUBLE_CLICK_SLOP_PX * scale_factor
+    logical_delta_to_physical(DOUBLE_CLICK_SLOP_PX, scale_factor)
 }
 
 // ---------------------------------------------------------------------------
@@ -234,7 +255,8 @@ pub(crate) fn virt_key_from_physical(key: winit::keyboard::PhysicalKey) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DOUBLE_CLICK_SLOP_PX, double_click_slop, logical_to_physical, physical_to_logical,
+        DOUBLE_CLICK_SLOP_PX, double_click_slop, logical_delta_to_physical, logical_to_physical,
+        physical_delta_to_logical, physical_to_logical,
     };
 
     /// At scale factor 1.0 the conversions are the identity — the
@@ -282,5 +304,29 @@ mod tests {
     fn double_click_slop_scales_with_factor() {
         assert_eq!(double_click_slop(2.0), 8.0);
         assert_eq!(double_click_slop(1.5), 6.0);
+    }
+
+    /// Deltas convert WITHOUT rounding — a 3-px physical delta at 2× is
+    /// 1.5 logical, not 2 (the wheel accumulator depends on the fraction
+    /// surviving).
+    #[test]
+    fn delta_conversions_preserve_fractions() {
+        assert_eq!(physical_delta_to_logical(3.0, 2.0), 1.5);
+        assert_eq!(physical_delta_to_logical(1.0, 1.5), 1.0 / 1.5);
+        assert_eq!(logical_delta_to_physical(1.5, 2.0), 3.0);
+        assert_eq!(logical_delta_to_physical(1.0, 1.5), 1.5);
+    }
+
+    /// Delta conversions round-trip exactly at any factor.
+    #[test]
+    fn delta_conversions_round_trip() {
+        for sf in [1.0, 1.5, 2.0, 3.0] {
+            for d in [0.5, 1.0, 40.0, 120.0, 250.0] {
+                assert_eq!(
+                    logical_delta_to_physical(physical_delta_to_logical(d, sf), sf),
+                    d
+                );
+            }
+        }
     }
 }

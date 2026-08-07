@@ -406,12 +406,12 @@ impl WieApp {
                     // the scale factor); the guest surface is LOGICAL
                     // 96-DPI and the notch math is in logical units, so
                     // convert back — without this a Retina (2×) gesture
-                    // accumulates twice as many notches. Plain division,
-                    // not `physical_to_logical`: deltas keep fractional
-                    // precision for slow scrolling, unlike coordinates.
+                    // accumulates twice as many notches. The delta helper
+                    // keeps fractional precision for slow scrolling,
+                    // unlike the rounded coordinate conversion.
                     winit::event::MouseScrollDelta::PixelDelta(pos) => (
-                        pos.x as f32 / event_sf as f32,
-                        pos.y as f32 / event_sf as f32,
+                        input::physical_delta_to_logical(pos.x, event_sf) as f32,
+                        input::physical_delta_to_logical(pos.y, event_sf) as f32,
                     ),
                 };
                 let notch_x = wheel_notches(&mut self.wheel_accum_x, delta_x);
