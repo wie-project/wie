@@ -18,6 +18,9 @@ cargo build -p wie-cli --release
 brew tap wie-project/wie
 brew install wie
 
+# Prebuilt release binaries are built by the release-on-tag workflow (.github/workflows/release.yml)
+# and published as GitHub release assets.
+
 # A Windows console app
 ./target/release/wie run micro-exes/out/crt_hello.exe
 
