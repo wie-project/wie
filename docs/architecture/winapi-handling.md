@@ -75,7 +75,7 @@ Guest `C:\` maps to `{root}/drive_c/` (`WIE_ROOT` / `--root`); a `D:` host bridg
 
 ## SEH and MSVC C++ EH
 
-Win64 SEH dispatch is host-side except the guest's actual handler bodies: the host walks a copy of the guest's `.pdata` function tables, runs unwind-map actions via guest trampolines, and — the surprising part — **CALLs MSVC catch funclets** (they return their continuation IP in RAX; jumping in would make `ret` pop garbage). `msvc_eh.rs` parses `__CxxThrowException` payloads and reconstructs catch frames. Per-TID pending state keeps concurrent throws from overwriting each other. The full walk-through lives in [`docs/cpp-exceptions.md`](../cpp-exceptions.md).
+Win64 SEH dispatch is host-side except the guest's actual handler bodies: the host walks a copy of the guest's `.pdata` function tables, runs unwind-map actions via guest trampolines, and — the surprising part — **CALLs MSVC catch funclets** (they return their continuation IP in RAX; jumping in would make `ret` pop garbage). `msvc_eh.rs` parses `__CxxThrowException` payloads and reconstructs catch frames. Per-TID pending state keeps concurrent throws from overwriting each other. The full walk-through lives in [`cpp-exceptions.md`](cpp-exceptions.md).
 
 ## State
 

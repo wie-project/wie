@@ -86,12 +86,70 @@ Stub correctness policy: stubs are planted only when the in-guest body honours t
 
 ## Threading model
 
-Guest threads map **1:1 to host threads**, each with its own `CpuEngine` (JIT: shared `Arc<JitShared>` compile cache; iced: shared `Arc<RwLock<GuestMemory>>`). WinAPI/kernel-object/heap state sits behind `Arc<Mutex<WinApiState>>`.
+Guest threads map **1:1 to host threads**, and every guest thread owns a `CpuEngine` that no other thread runs on. `ProcessResources` (`mt_runtime.rs`) holds the primary engine plus the shared backend caches and the WinAPI state; a spawned worker gets its own engine and runs `worker_main`, a loop of activate → pure guest compute → dispatch → park that mirrors the session pump.
 
-- **Lock scope**: the WinAPI mutex is held only for activate/dispatch/state-mutate — never across pure `run_until_stop` guest compute. Host waits (`WaitFor*`, contended critical sections) park **outside** the mutex so peers can signal.
-- **Active-TID rule**: `ThreadState.active` is process-global — a peer may have activated itself while this thread ran pure guest code. Every dispatch path must `activate(own_tid)` again under the lock before any handler using `current_tid()` (CS ownership, TLS, waits). Missing re-activation caused false CS ownership and deadlocks under `7za -mmt2` (workers steal `active` while the primary runs pure guest code).
-- **Stacks**: default guest worker stack is **1 MiB** when `dwStackSize == 0` (Windows-like); host worker threads use **8 MiB** so JIT/iced dispatch doesn't overflow secondary-thread defaults.
-- **What works**: `CreateThread`/`ExitThread` + joins, `_beginthreadex`/`_endthreadex`, `CREATE_SUSPENDED` + `ResumeThread`, critical sections (reenter + contended park), events/semaphores/`WaitForMultipleObjects` (any/all), `Interlocked*` (host atomics), TLS.
+```mermaid
+sequenceDiagram
+    participant W as worker (host thread)
+    participant E as per-thread engine
+    participant L as shared_winapi mutex
+    participant O as kernel object (condvar)
+
+    W->>E: run_until_stop (no lock held)
+    E-->>W: fake-VA stop
+    W->>L: lock: activate(tid) + dispatch
+    L-->>W: HostPark { reason }
+    W->>W: drop lock
+    W->>O: park on WaitTarget / CS queue / multi-wait poll
+    O-->>W: signaled (peer SetEvent / LeaveCS / ExitThread)
+    W->>E: return_from_win64_api(WAIT_OBJECT_0)
+```
+
+### One host thread per guest thread
+
+- The **primary** thread runs on the session host thread; its engine is `ProcessResources.engine`, created at session init.
+- A guest `CreateThread` does not spawn anything immediately — the handler records a `PendingSpawn` (`SyncState.pending_spawns`), and `drain_spawns` spawns the host thread at the next pump quantum.
+- Each worker host thread is named `wie-guest-{tid}` and runs `worker_main`. JIT workers get `JitCpu::new_shared(Arc<JitShared>)` — the compilation cache is shared, the engine is not; iced workers get `IcedCpu::new_shared` over the shared `Arc<RwLock<GuestMemory>>`. Only WinAPI state sits behind the shared `Arc<Mutex<WinApiState>>`.
+- `WIE_MT_DEBUG=1` traces every spawn / park / worker exit (a cached `OnceLock` env check, `mt_debug()`).
+
+### The WinAPI mutex and its scope
+
+The mutex is held only for activate, dispatch, and state mutation — **never across pure `run_until_stop` guest compute**, so worker quanta overlap instead of serializing on one engine. Both loops re-enter it once per quantum:
+
+- The pump activates the primary under the lock before each quantum, drops the lock for `run_until_stop`, and re-locks after the quantum returns to dispatch the stop.
+- `worker_main` locks around activate + process-dying check + dispatch, then drops the lock before any host park (`// drop WinAPI lock before host park`).
+
+### The active-TID rule
+
+`ThreadState.active` is process-global: a peer may have activated itself while this thread ran pure guest code without the lock. `activate(tid)` persists the current `GuestThread` into `by_tid` and loads `tid`'s, so every dispatch path must re-activate its own TID under the lock before any handler that reads `current_tid()` — CS ownership, TLS, waits. The pump re-activates the primary before each quantum and again after it returns; `worker_main` re-activates at loop top, at the SEH-continue trampoline, and before every dispatch. Missing re-activation caused false CS ownership and deadlocks under `7za -mmt2` (workers steal `active` while the primary runs pure guest code).
+
+### Parking waits outside the lock
+
+A blocking handler must not hold the WinAPI mutex while waiting: the signaling peer needs that same mutex to mutate state (`SetEvent`, `LeaveCriticalSection`, `ExitThread`), so holding it across the wait deadlocks. A blocking handler therefore returns `WinApiControlSignal::HostPark { reason }`, the loop drops the lock, and `handle_park` (workers) or the pump's `Quantum::Park` arm (primary) executes the wait with **no process lock held**:
+
+- **`WaitObject`** (`WaitForSingleObject`): the park resolves a detached `WaitTarget` — an `Arc` clone of the thread / event / semaphore object — under the lock, then blocks on the object's own condvar. An `INFINITE` wait polls in 50 ms slices and re-checks `process_dying` between slices so teardown can break it; the primary also calls `drain_spawns` inside the loop so workers keep spawning while it is parked.
+- **`CriticalSection`**: a contended `EnterCriticalSection` parks on the CS's wait queue — one `CsWaitQueue` per guest CS VA, created on demand in `SyncState.cs_waiters`. `park_brief` yields with exponential backoff (2, 4, 8) then waits 1 ms on the queue condvar; the caller must **retry `EnterCriticalSection`** afterwards, because `Leave` may have notified before the waiter reached the condvar (lost-wakeup safety). The guest retries by re-executing the fake-API stop (the API index is not charged again).
+- **`WaitMultiple`**: the handler stashes a `MultiWaitRequest` in `SyncState.multi_wait` keyed by the waiter's TID; the park resolves all handles to targets and polls with ≤ 25 ms slices (5 ms for wait-all, which must not consume auto-reset units before every target is ready).
+- **`PthreadWait`**: parked inside the handler through the pthread `WakeQueue`; the park just sleeps 1 ms so the next handler re-entry can re-check the condition.
+
+Waking works because the waiter holds nothing: `SetEvent` / `ReleaseSemaphore` / `LeaveCriticalSection` / `ExitThread` / `thread.finish` notify the relevant condvar, the parked thread wakes, and `return_from_win64_api` writes `WAIT_OBJECT_0` (or `WAIT_TIMEOUT`) into the guest RAX.
+
+### TLS
+
+TLS indices are process-wide (`ThreadState.tls_index_count`, `TlsAlloc`); values live per thread in `GuestThread.tls_values`. `activate(tid)` swaps the active thread's value vector into place (growing it to the process count), so `TlsGetValue`/`TlsSetValue` handlers read `active.tls_values[index]`. TEB last-error is still mirrored at the fixed low VA for the primary thread.
+
+### Stacks
+
+- Guest worker stack: **1 MiB** when `CreateThread`'s `dwStackSize == 0` (Windows-like default).
+- Host worker threads: **8 MiB** (`drain_spawns`), so JIT/iced dispatch does not overflow the ~512 KiB secondary-thread default.
+
+### Teardown
+
+`join_workers` takes the mutex, sets `process_dying`, notifies every CS wait queue, sets every event, wakes every semaphore, and marks unfinished thread objects finished — then joins the worker handles. Workers check `process_dying` at every activation and dispatch and exit via `finish_tid`. A worker's normal end is detected by its completion path, not by the join: the pthread-return trampoline (or a `ret` to RIP 0) marks the `ThreadObject` finished and wakes joiners, so `WaitForSingleObject(thread_handle)` returns `WAIT_OBJECT_0`.
+
+### What works
+
+`CreateThread`/`ExitThread` + joins, `_beginthreadex`/`_endthreadex`, `CREATE_SUSPENDED` + `ResumeThread`, critical sections (reenter + contended park), events/semaphores/`WaitForMultipleObjects` (any/all), `Interlocked*` (host atomics), TLS.
 
 ## Cross-thread handles
 

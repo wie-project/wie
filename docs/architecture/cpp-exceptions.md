@@ -1,5 +1,7 @@
 # C++ Exception Handling on Windows x64
 
+This document explains how WIE dispatches Win64 SEH and MSVC C++ exception handling end to end. WIE hosts the machine-code machinery — `.pdata` function tables, the unwind walk, and the dispatch loop (`wie-winapi::exception`, `seh.rs`) — while the guest's own CRT supplies the type-matching and destructor logic (`__CxxFrameHandler3` / `__gxx_personality_seh0`), which WIE invokes through guest trampolines. The sections below walk the mechanism from the compiler's `throw` down to the catch block, then describe where each piece lives in WIE and what the guest CRT still does itself.
+
 ## 1. The Core Problem: Why Exceptions Are Not Just a Function Call
 
 A normal WinAPI call in WIE works like this:
@@ -577,10 +579,10 @@ When the dispatcher calls `__CxxFrameHandler3` or `__gxx_personality_v0`, the ha
 
 ### WIE responsibility
 
-- **Decide: host-side or guest-side LS handler.** Either implement the parsing logic in Rust (more code, more control) or set up a guest call frame and let the existing CRT code run (less code, depends on guest code working).
-- **For the MVP (guest-side):**
+- **Host-side dispatch with guest handler bodies.** WIE walks the frame metadata and unwind actions in Rust and runs the guest CRT's handler code through trampolines — the split the current implementation uses.
+- **Guest-side dispatch (the shape in use today):**
   - When `__CxxThrowException` is called, save the exception record.
-  - Instead of bailing, enter the dispatch loop.
+  - Enter the dispatch loop with the saved exception record.
   - At each handler frame: push arguments onto the guest stack, set RIP to the handler address, run the handler, read the disposition from RAX.
   - The handler writes the target CONTEXT. Read it back, set guest registers, resume.
 
@@ -671,11 +673,11 @@ Cranelift-compiled blocks need unwind metadata so `RtlLookupFunctionEntry` can f
 
 3. **Trap and redirect** — if the dispatcher reaches a JIT code address with no function table entry, fall through to the iced interpreter path. The interpreter has a normal `.pdata` entry. This is the simplest MVP but means exceptions in hot JIT code always fall back to iced.
 
-For the MVP, option 3 is sufficient. C++ exceptions are rare enough that the interpreter fallback cost is negligible.
+For the JIT, option 1 is off: `unwind_info` stays `false`, so compiled blocks register no unwind metadata. It is not needed — the dispatcher unwinds **guest** stack frames whose RIPs are all guest VAs, so `RtlLookupFunctionEntry` never sees a JIT block address.
 
 ---
 
-## 11. Implementation Plan
+## 11. Implementation
 
 ### Metadata foundation
 - `RUNTIME_FUNCTION`, `UNWIND_INFO`, `UNWIND_CODE` structs in `wie-winapi`.
@@ -695,14 +697,11 @@ For the MVP, option 3 is sufficient. C++ exceptions are rare enough that the int
 - `RtlRestoreContext`: write CONTEXT registers back into the CpuEngine.
 
 ### C++ integration
-- Rewrite `handle_cxx_throw_exception`: instead of `bail!()`, construct the C++ exception record and dispatch.
-- Test with Mingw-w64 micro-exe (`throw int; catch(int)`).
-- Test destructor cleanup (stack object with destructor between throw and catch).
-- Add MSVC `__CxxFrameHandler3` support (parse `FuncInfo`/`TryBlockMap`) or delegate to guest.
+- `handle_cxx_throw_exception` (`ucrt/misc.rs`) builds the C++ exception record and enters SEH dispatch instead of aborting the session.
+- Mingw-w64 micro-exes (`throw int; catch(int)`), destructor cleanup between throw and catch, and `__CxxFrameHandler3` FuncInfo parsing (`msvc_eh.rs`) exercise the same path.
 
 ### JIT unwind metadata
-- Enable Cranelift unwind info emission or add `RtlInstallFunctionTableCallback`.
-- Verify: exception thrown inside JIT-compiled code unwinds correctly.
+- Cranelift emits no unwind metadata (`unwind_info = false`). JIT blocks do not need it: the unwind walk only ever sees guest RIPs, so a JIT block address never reaches `RtlLookupFunctionEntry`.
 
 ---
 
