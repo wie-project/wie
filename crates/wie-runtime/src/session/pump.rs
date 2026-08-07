@@ -966,6 +966,17 @@ impl super::RuntimeSession {
                                             resolved.library.as_ref(),
                                             resolved.name.as_ref(),
                                         );
+                                        // Surface the failure through tracing so a
+                                        // live run (console or GUI) shows WHY the
+                                        // session stopped — the guest-fault family
+                                        // (e.g. an unsupported UCRT export) is
+                                        // otherwise only visible in the entry-trace
+                                        // summary and headless reproductions.
+                                        tracing::error!(
+                                            api = %api,
+                                            rip = format_args!("{:#x}", hook.address),
+                                            "unsupported API (session will stop)"
+                                        );
                                         events.push(EntryTraceEvent {
                                             index,
                                             library: resolved.library.clone().into(),
