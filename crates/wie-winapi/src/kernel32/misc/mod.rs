@@ -31,11 +31,11 @@ pub fn handle_get_version(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 /// Handles `KERNEL32.dll!GetVersionExA`.
 pub fn handle_get_version_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let version_info_ptr = engine
+    let version_info_va = engine
         .read_rcx()
         .context("failed to read RCX for GetVersionExA")?;
 
-    if version_info_ptr == 0 {
+    if version_info_va == 0 {
         return ctx.finish(0);
     }
 
@@ -50,10 +50,10 @@ pub fn handle_get_version_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     // DWORD dwMinorVersion;      offset 8
     // DWORD dwBuildNumber;       offset 12
     // DWORD dwPlatformId;        offset 16
-    let major_version_address = checked_address(version_info_ptr, 4, "dwMajorVersion");
-    let minor_version_address = checked_address(version_info_ptr, 8, "dwMinorVersion");
-    let build_number_address = checked_address(version_info_ptr, 12, "dwBuildNumber");
-    let platform_id_address = checked_address(version_info_ptr, 16, "dwPlatformId");
+    let major_version_address = checked_address(version_info_va, 4, "dwMajorVersion");
+    let minor_version_address = checked_address(version_info_va, 8, "dwMinorVersion");
+    let build_number_address = checked_address(version_info_va, 12, "dwBuildNumber");
+    let platform_id_address = checked_address(version_info_va, 16, "dwPlatformId");
 
     write_guest_u32(engine, major_version_address, major_version)?;
     write_guest_u32(engine, minor_version_address, minor_version)?;
@@ -64,13 +64,13 @@ pub fn handle_get_version_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
 }
 /// Handles `KERNEL32.dll!GetCommandLineA`.
 pub fn handle_get_command_line_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let command_line_ptr = ctx.environment.command_line_a_ptr;
-    ctx.finish(command_line_ptr)
+    let command_line_va = ctx.environment.command_line_a_ptr;
+    ctx.finish(command_line_va)
 }
 /// Handles `KERNEL32.dll!GetCommandLineW`.
 pub fn handle_get_command_line_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let command_line_ptr = ctx.environment.command_line_w_ptr;
-    ctx.finish(command_line_ptr)
+    let command_line_va = ctx.environment.command_line_w_ptr;
+    ctx.finish(command_line_va)
 }
 /// Handles `KERNEL32.dll!GetTickCount`.
 pub fn handle_get_tick_count(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -87,12 +87,12 @@ pub fn handle_query_performance_counter(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let counter_ptr = engine
+    let counter_va = engine
         .read_rcx()
         .context("failed to read RCX for QueryPerformanceCounter")?;
 
-    if counter_ptr != 0 {
-        write_guest_u64(engine, counter_ptr, super::clock::performance_counter())?;
+    if counter_va != 0 {
+        write_guest_u64(engine, counter_va, super::clock::performance_counter())?;
     }
 
     ctx.finish(1)
@@ -252,7 +252,7 @@ pub fn handle_set_unhandled_exception_filter(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _filter_ptr = engine
+    let _filter_va = engine
         .read_rcx()
         .context("failed to read RCX for SetUnhandledExceptionFilter")?;
 
@@ -396,9 +396,9 @@ pub fn handle_debug_break(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 /// Handles `KERNEL32.dll!OutputDebugStringA` — log and return.
 pub fn handle_output_debug_string_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let msg_ptr = engine.read_rcx()?;
-    if msg_ptr != 0 {
-        let msg = read_guest_ansi_lossy(engine, msg_ptr, 1024).unwrap_or_default();
+    let msg_va = engine.read_rcx()?;
+    if msg_va != 0 {
+        let msg = read_guest_ansi_lossy(engine, msg_va, 1024).unwrap_or_default();
         tracing::debug!("OutputDebugStringA: {msg}");
     }
     ctx.finish(1)
@@ -406,9 +406,9 @@ pub fn handle_output_debug_string_a(ctx: &mut HandlerContext<'_>) -> Result<WinA
 /// Handles `KERNEL32.dll!OutputDebugStringW` — log and return.
 pub fn handle_output_debug_string_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let msg_ptr = engine.read_rcx()?;
-    if msg_ptr != 0 {
-        let msg = read_guest_utf16_lossy(engine, msg_ptr, 1024).unwrap_or_default();
+    let msg_va = engine.read_rcx()?;
+    if msg_va != 0 {
+        let msg = read_guest_utf16_lossy(engine, msg_va, 1024).unwrap_or_default();
         tracing::debug!("OutputDebugStringW: {msg}");
     }
     ctx.finish(1)
@@ -427,11 +427,11 @@ pub fn handle_set_thread_error_mode(ctx: &mut HandlerContext<'_>) -> Result<WinA
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let mode = u32::try_from(engine.read_rcx()? & 0xffff_ffff).unwrap_or(0);
-    let prev_mode_ptr = engine.read_rdx()?;
+    let prev_mode_va = engine.read_rdx()?;
     let prev = state.process.error_mode;
     state.process.error_mode = mode;
-    if prev_mode_ptr != 0 {
-        write_guest_u32(engine, prev_mode_ptr, prev)?;
+    if prev_mode_va != 0 {
+        write_guest_u32(engine, prev_mode_va, prev)?;
     }
     state.process.last_error = 0;
     ctx.finish(1)
@@ -447,13 +447,13 @@ pub(crate) fn handle_rtl_capture_context(
     use anyhow::Context;
     let engine = &mut *ctx.engine;
 
-    let ctx_ptr = engine.read_rcx()?;
-    if ctx_ptr == 0 {
+    let ctx_va = engine.read_rcx()?;
+    if ctx_va == 0 {
         return ctx.finish(0);
     }
 
     let tctx = engine.snapshot_thread_context();
-    // Write CONTEXT64 at ctx_ptr (subset of the Win64 CONTEXT layout).
+    // Write CONTEXT64 at ctx_va (subset of the Win64 CONTEXT layout).
     let mut cbuf = [0u8; 0x200];
     // ContextFlags at +0x30
     if let Some(slot) = cbuf.get_mut(0x30..0x34) {
@@ -485,7 +485,7 @@ pub(crate) fn handle_rtl_capture_context(
         }
     }
     engine
-        .mem_write(ctx_ptr, &cbuf)
+        .mem_write(ctx_va, &cbuf)
         .context("RtlCaptureContext: failed to write context")?;
     ctx.finish(0)
 }

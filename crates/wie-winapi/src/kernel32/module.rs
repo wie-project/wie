@@ -15,15 +15,15 @@ pub fn handle_get_module_handle_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let environment = ctx.environment;
-    let module_name_ptr = engine
+    let module_name_va = engine
         .read_rcx()
         .context("failed to read RCX for GetModuleHandleA")?;
 
-    let return_value = if module_name_ptr == 0 {
+    let return_value = if module_name_va == 0 {
         state.process.last_error = 0;
         environment.image_base
     } else {
-        let module_name = read_ansi_string_from_cpu(engine, module_name_ptr, 260)?;
+        let module_name = read_ansi_string_from_cpu(engine, module_name_va, 260)?;
         let handle = resolve_loaded_module_handle(&module_name, environment.image_base, state);
         if handle == 0 {
             state.process.last_error = ERROR_MOD_NOT_FOUND;
@@ -40,15 +40,15 @@ pub fn handle_get_module_handle_w(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let environment = ctx.environment;
-    let module_name_ptr = engine
+    let module_name_va = engine
         .read_rcx()
         .context("failed to read RCX for GetModuleHandleW")?;
 
-    let return_value = if module_name_ptr == 0 {
+    let return_value = if module_name_va == 0 {
         state.process.last_error = 0;
         environment.image_base
     } else {
-        let module_name = read_guest_utf16_lossy(engine, module_name_ptr, 260)?;
+        let module_name = read_guest_utf16_lossy(engine, module_name_va, 260)?;
         let handle = resolve_loaded_module_handle(&module_name, environment.image_base, state);
         if handle == 0 {
             state.process.last_error = ERROR_MOD_NOT_FOUND;
@@ -208,14 +208,14 @@ pub(crate) fn resolve_windows_dll_path(
 
 /// Handles `KERNEL32.dll!GetModuleFileNameA`.
 pub fn handle_get_module_file_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let module_file_name_a_ptr = ctx.environment.module_file_name_a_ptr;
+    let module_file_name_a_va = ctx.environment.module_file_name_a_ptr;
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let _module_handle = engine
         .read_rcx()
         .context("failed to read RCX for GetModuleFileNameA")?;
 
-    let buffer_ptr = engine
+    let buffer_va = engine
         .read_rdx()
         .context("failed to read RDX for GetModuleFileNameA")?;
 
@@ -224,7 +224,7 @@ pub fn handle_get_module_file_name_a(ctx: &mut HandlerContext<'_>) -> Result<Win
         .context("failed to read R8 for GetModuleFileNameA")?;
 
     let (return_value, truncated) =
-        copy_path_a_to_guest_buffer(engine, module_file_name_a_ptr, buffer_ptr, buffer_len)?;
+        copy_path_a_to_guest_buffer(engine, module_file_name_a_va, buffer_va, buffer_len)?;
 
     state.process.last_error = if truncated {
         ERROR_INSUFFICIENT_BUFFER
@@ -236,14 +236,14 @@ pub fn handle_get_module_file_name_a(ctx: &mut HandlerContext<'_>) -> Result<Win
 }
 /// Handles `KERNEL32.dll!GetModuleFileNameW`.
 pub fn handle_get_module_file_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let module_file_name_w_ptr = ctx.environment.module_file_name_w_ptr;
+    let module_file_name_w_va = ctx.environment.module_file_name_w_ptr;
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let _module_handle = engine
         .read_rcx()
         .context("failed to read RCX for GetModuleFileNameW")?;
 
-    let buffer_ptr = engine
+    let buffer_va = engine
         .read_rdx()
         .context("failed to read RDX for GetModuleFileNameW")?;
 
@@ -252,7 +252,7 @@ pub fn handle_get_module_file_name_w(ctx: &mut HandlerContext<'_>) -> Result<Win
         .context("failed to read R8 for GetModuleFileNameW")?;
 
     let (return_value, truncated) =
-        copy_path_w_to_guest_buffer(engine, module_file_name_w_ptr, buffer_ptr, buffer_len)?;
+        copy_path_w_to_guest_buffer(engine, module_file_name_w_va, buffer_va, buffer_len)?;
 
     state.process.last_error = if truncated {
         ERROR_INSUFFICIENT_BUFFER
@@ -267,15 +267,15 @@ pub fn handle_load_library_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let environment = ctx.environment;
-    let library_name_ptr = engine
+    let library_name_va = engine
         .read_rcx()
         .context("failed to read RCX for LoadLibraryA")?;
 
-    let return_value = if library_name_ptr == 0 {
+    let return_value = if library_name_va == 0 {
         state.process.last_error = ERROR_MOD_NOT_FOUND;
         0
     } else {
-        let library_name = read_ansi_string_from_cpu(engine, library_name_ptr, 260)?;
+        let library_name = read_ansi_string_from_cpu(engine, library_name_va, 260)?;
         let handle = resolve_or_load_dll(&library_name, engine, environment, state);
         if handle == 0 {
             state.process.last_error = ERROR_MOD_NOT_FOUND;
@@ -292,15 +292,15 @@ pub fn handle_load_library_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let environment = ctx.environment;
-    let library_name_ptr = engine
+    let library_name_va = engine
         .read_rcx()
         .context("failed to read RCX for LoadLibraryW")?;
 
-    let return_value = if library_name_ptr == 0 {
+    let return_value = if library_name_va == 0 {
         state.process.last_error = ERROR_MOD_NOT_FOUND;
         0
     } else {
-        let library_name = read_wide_string_from_cpu(engine, library_name_ptr, 260)?;
+        let library_name = read_wide_string_from_cpu(engine, library_name_va, 260)?;
         let handle = resolve_or_load_dll(&library_name, engine, environment, state);
         if handle == 0 {
             state.process.last_error = ERROR_MOD_NOT_FOUND;
@@ -373,17 +373,17 @@ pub fn handle_get_proc_address(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         .read_rcx()
         .context("failed to read RCX for GetProcAddress")?;
 
-    let proc_name_ptr = engine
+    let proc_name_va = engine
         .read_rdx()
         .context("failed to read RDX for GetProcAddress")?;
 
     // Microsoft Learn: if `lpProcName` is an ordinal, the high bits are zero
     // (MAKEINTRESOURCE). We treat small pointers as ordinals.
-    let (proc_name, is_ordinal) = if proc_name_ptr <= 0xffff {
-        (format!("ORDINAL {proc_name_ptr:#x}"), true)
+    let (proc_name, is_ordinal) = if proc_name_va <= 0xffff {
+        (format!("ORDINAL {proc_name_va:#x}"), true)
     } else {
         (
-            read_guest_ansi_lossy(engine, proc_name_ptr, 256)
+            read_guest_ansi_lossy(engine, proc_name_va, 256)
                 .context("failed to read GetProcAddress proc name")?,
             false,
         )
@@ -411,7 +411,7 @@ pub fn handle_get_proc_address(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
             .find(|m| m.handle == module_handle)
         {
             let va = if is_ordinal {
-                let ordinal = u16::try_from(proc_name_ptr).unwrap_or(0);
+                let ordinal = u16::try_from(proc_name_va).unwrap_or(0);
                 module.get_export_va_by_ordinal(ordinal)
             } else {
                 module.get_export_va(&proc_name)
@@ -459,7 +459,7 @@ pub fn handle_load_library_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let environment = ctx.environment;
-    let library_name_ptr = engine
+    let library_name_va = engine
         .read_rcx()
         .context("failed to read RCX for LoadLibraryExA")?;
 
@@ -471,7 +471,7 @@ pub fn handle_load_library_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .read_r8()
         .context("failed to read R8 for LoadLibraryExA")?;
 
-    let library_name = read_ansi_string_from_cpu(engine, library_name_ptr, 260)?;
+    let library_name = read_ansi_string_from_cpu(engine, library_name_va, 260)?;
     let return_value = resolve_or_load_dll(&library_name, engine, environment, state);
 
     ctx.finish(return_value)
@@ -481,7 +481,7 @@ pub fn handle_load_library_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let environment = ctx.environment;
-    let library_name_ptr = engine
+    let library_name_va = engine
         .read_rcx()
         .context("failed to read RCX for LoadLibraryExW")?;
 
@@ -493,7 +493,7 @@ pub fn handle_load_library_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .read_r8()
         .context("failed to read R8 for LoadLibraryExW")?;
 
-    let library_name = read_wide_string_from_cpu(engine, library_name_ptr, 260)?;
+    let library_name = read_wide_string_from_cpu(engine, library_name_va, 260)?;
     let return_value = resolve_or_load_dll(&library_name, engine, environment, state);
 
     ctx.finish(return_value)

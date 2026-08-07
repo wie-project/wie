@@ -179,11 +179,11 @@ pub fn handle_heap_size(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 /// Handles `KERNEL32.dll!GlobalMemoryStatus`.
 pub fn handle_global_memory_status(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let memory_status_ptr = engine
+    let memory_status_va = engine
         .read_rcx()
         .context("failed to read RCX for GlobalMemoryStatus")?;
 
-    if memory_status_ptr != 0 {
+    if memory_status_va != 0 {
         // MEMORYSTATUS on Win64 (56 bytes) — build once and push in a single
         // mem_write to avoid 8 separate scalar writes (each locking guest mem
         // and page-walking).
@@ -206,7 +206,7 @@ pub fn handle_global_memory_status(ctx: &mut HandlerContext<'_>) -> Result<WinAp
         buf[40..48].copy_from_slice(&(128_u64 * 1024 * 1024 * 1024).to_le_bytes());
         buf[48..56].copy_from_slice(&(120_u64 * 1024 * 1024 * 1024).to_le_bytes());
         engine
-            .mem_write(memory_status_ptr, &buf)
+            .mem_write(memory_status_va, &buf)
             .context("failed to write MEMORYSTATUS")?;
     }
 
@@ -412,15 +412,15 @@ pub fn handle_global_size(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 pub fn handle_global_add_atom_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let name_ptr = engine
+    let name_va = engine
         .read_rcx()
         .context("failed to read RCX for GlobalAddAtomA")?;
 
-    let return_value = if name_ptr == 0 {
+    let return_value = if name_va == 0 {
         state.process.last_error = ERROR_INVALID_PARAMETER;
         0
     } else {
-        let name = read_ansi_string_from_cpu(engine, name_ptr, 255)
+        let name = read_ansi_string_from_cpu(engine, name_va, 255)
             .context("failed to read GlobalAddAtomA name")?;
 
         if name.is_empty() {

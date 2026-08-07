@@ -6,9 +6,9 @@ use super::{
 
 pub(crate) fn write_fake_monitor_info(
     engine: &mut dyn wie_cpu::CpuEngine,
-    monitor_info_ptr: u64,
+    monitor_info_va: u64,
 ) -> Result<()> {
-    if monitor_info_ptr == 0 {
+    if monitor_info_va == 0 {
         return Ok(());
     }
 
@@ -19,56 +19,56 @@ pub(crate) fn write_fake_monitor_info(
     // DWORD dwFlags;   offset 36
     //
     // MONITORINFOEXA/W has the same prefix plus device name after offset 40.
-    write_guest_u32(engine, monitor_info_ptr, 40)?;
+    write_guest_u32(engine, monitor_info_va, 40)?;
 
     // rcMonitor = { left: 0, top: 0, right: 1920, bottom: 1080 }
     // Matches GetDeviceCaps HORZRES/VERTRES and GetSystemMetrics SM_CXSCREEN/
     // SM_CYSCREEN (all report a 1920×1080 fake display).
     write_guest_i32(
         engine,
-        checked_address(monitor_info_ptr, 4, "rcMonitor.left"),
+        checked_address(monitor_info_va, 4, "rcMonitor.left"),
         0,
     )?;
     write_guest_i32(
         engine,
-        checked_address(monitor_info_ptr, 8, "rcMonitor.top"),
+        checked_address(monitor_info_va, 8, "rcMonitor.top"),
         0,
     )?;
     write_guest_i32(
         engine,
-        checked_address(monitor_info_ptr, 12, "rcMonitor.right"),
+        checked_address(monitor_info_va, 12, "rcMonitor.right"),
         1920,
     )?;
     write_guest_i32(
         engine,
-        checked_address(monitor_info_ptr, 16, "rcMonitor.bottom"),
+        checked_address(monitor_info_va, 16, "rcMonitor.bottom"),
         1080,
     )?;
 
     // rcWork = { left: 0, top: 0, right: 1920, bottom: 1040 } (1080 - 40 taskbar)
     write_guest_i32(
         engine,
-        checked_address(monitor_info_ptr, 20, "rcWork.left"),
+        checked_address(monitor_info_va, 20, "rcWork.left"),
         0,
     )?;
     write_guest_i32(
         engine,
-        checked_address(monitor_info_ptr, 24, "rcWork.top"),
+        checked_address(monitor_info_va, 24, "rcWork.top"),
         0,
     )?;
     write_guest_i32(
         engine,
-        checked_address(monitor_info_ptr, 28, "rcWork.right"),
+        checked_address(monitor_info_va, 28, "rcWork.right"),
         1920,
     )?;
     write_guest_i32(
         engine,
-        checked_address(monitor_info_ptr, 32, "rcWork.bottom"),
+        checked_address(monitor_info_va, 32, "rcWork.bottom"),
         1040,
     )?;
 
     // MONITORINFOF_PRIMARY
-    write_guest_u32(engine, checked_address(monitor_info_ptr, 36, "dwFlags"), 1)?;
+    write_guest_u32(engine, checked_address(monitor_info_va, 36, "dwFlags"), 1)?;
 
     Ok(())
 }
@@ -179,14 +179,14 @@ pub fn handle_get_monitor_info_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         .read_rcx()
         .context("failed to read RCX for GetMonitorInfoA")?;
 
-    let monitor_info_ptr = engine
+    let monitor_info_va = engine
         .read_rdx()
         .context("failed to read RDX for GetMonitorInfoA")?;
 
-    let success = monitor_handle == FAKE_MONITOR_HANDLE && monitor_info_ptr != 0;
+    let success = monitor_handle == FAKE_MONITOR_HANDLE && monitor_info_va != 0;
 
     if success {
-        write_fake_monitor_info(engine, monitor_info_ptr)?;
+        write_fake_monitor_info(engine, monitor_info_va)?;
     }
 
     let return_value = u64::from(success);
@@ -200,14 +200,14 @@ pub fn handle_get_monitor_info_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         .read_rcx()
         .context("failed to read RCX for GetMonitorInfoW")?;
 
-    let monitor_info_ptr = engine
+    let monitor_info_va = engine
         .read_rdx()
         .context("failed to read RDX for GetMonitorInfoW")?;
 
-    let success = monitor_handle == FAKE_MONITOR_HANDLE && monitor_info_ptr != 0;
+    let success = monitor_handle == FAKE_MONITOR_HANDLE && monitor_info_va != 0;
 
     if success {
-        write_fake_monitor_info(engine, monitor_info_ptr)?;
+        write_fake_monitor_info(engine, monitor_info_va)?;
     }
 
     let return_value = u64::from(success);
@@ -217,7 +217,7 @@ pub fn handle_get_monitor_info_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 /// Handles dynamic `USER32.dll!MonitorFromRect`.
 pub fn handle_monitor_from_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _rect_ptr = engine
+    let _rect_va = engine
         .read_rcx()
         .context("failed to read RCX for MonitorFromRect")?;
 
@@ -247,11 +247,11 @@ pub fn handle_enum_display_monitors(ctx: &mut HandlerContext<'_>) -> Result<WinA
         .read_rcx()
         .context("failed to read RCX for EnumDisplayMonitors")?;
 
-    let _clip_rect_ptr = engine
+    let _clip_rect_va = engine
         .read_rdx()
         .context("failed to read RDX for EnumDisplayMonitors")?;
 
-    let _callback_ptr = engine
+    let _callback_va = engine
         .read_r8()
         .context("failed to read R8 for EnumDisplayMonitors")?;
 
@@ -264,13 +264,13 @@ pub fn handle_enum_display_monitors(ctx: &mut HandlerContext<'_>) -> Result<WinA
     //
     // If Lunar Magic later depends on the callback being invoked, we will need
     // to emulate a Win64 callback call into guest code with:
-    //   callback(fake_monitor, fake_hdc, rect_ptr, data)
+    //   callback(fake_monitor, fake_hdc, rect_va, data)
     ctx.finish(1)
 }
 /// Handles dynamic `USER32.dll!EnumDisplayDevicesA`.
 pub fn handle_enum_display_devices_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _device_name_ptr = engine
+    let _device_name_va = engine
         .read_rcx()
         .context("failed to read RCX for EnumDisplayDevicesA")?;
 
@@ -278,7 +278,7 @@ pub fn handle_enum_display_devices_a(ctx: &mut HandlerContext<'_>) -> Result<Win
         .read_rdx()
         .context("failed to read RDX for EnumDisplayDevicesA")?;
 
-    let display_device_ptr = engine
+    let display_device_va = engine
         .read_r8()
         .context("failed to read R8 for EnumDisplayDevicesA")?;
 
@@ -286,7 +286,7 @@ pub fn handle_enum_display_devices_a(ctx: &mut HandlerContext<'_>) -> Result<Win
         .read_r9()
         .context("failed to read R9 for EnumDisplayDevicesA")?;
 
-    let success = device_index == 0 && display_device_ptr != 0;
+    let success = device_index == 0 && display_device_va != 0;
 
     if success {
         // DISPLAY_DEVICEA:
@@ -296,38 +296,38 @@ pub fn handle_enum_display_devices_a(ctx: &mut HandlerContext<'_>) -> Result<Win
         // DWORD StateFlags;         offset 164
         // CHAR  DeviceID[128];      offset 168
         // CHAR  DeviceKey[128];     offset 296
-        write_guest_u32(engine, display_device_ptr, 424)?;
+        write_guest_u32(engine, display_device_va, 424)?;
 
         write_guest_fixed_ansi(
             engine,
-            checked_address(display_device_ptr, 4, "DeviceName"),
+            checked_address(display_device_va, 4, "DeviceName"),
             32,
             b"\\\\.\\DISPLAY1",
         )?;
 
         write_guest_fixed_ansi(
             engine,
-            checked_address(display_device_ptr, 36, "DeviceString"),
+            checked_address(display_device_va, 36, "DeviceString"),
             128,
             b"Generic Display",
         )?;
 
         write_guest_u32(
             engine,
-            checked_address(display_device_ptr, 164, "StateFlags"),
+            checked_address(display_device_va, 164, "StateFlags"),
             DISPLAY_DEVICE_ATTACHED_TO_DESKTOP | DISPLAY_DEVICE_PRIMARY_DEVICE,
         )?;
 
         write_guest_fixed_ansi(
             engine,
-            checked_address(display_device_ptr, 168, "DeviceID"),
+            checked_address(display_device_va, 168, "DeviceID"),
             128,
             b"MONITOR\\WIE\\DISPLAY1",
         )?;
 
         write_guest_fixed_ansi(
             engine,
-            checked_address(display_device_ptr, 296, "DeviceKey"),
+            checked_address(display_device_va, 296, "DeviceKey"),
             128,
             b"\\Registry\\Machine\\System\\CurrentControlSet\\Enum\\DISPLAY\\WIE",
         )?;
@@ -340,7 +340,7 @@ pub fn handle_enum_display_devices_a(ctx: &mut HandlerContext<'_>) -> Result<Win
 /// Handles dynamic `USER32.dll!EnumDisplayDevicesW`.
 pub fn handle_enum_display_devices_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _device_name_ptr = engine
+    let _device_name_va = engine
         .read_rcx()
         .context("failed to read RCX for EnumDisplayDevicesW")?;
 
@@ -348,7 +348,7 @@ pub fn handle_enum_display_devices_w(ctx: &mut HandlerContext<'_>) -> Result<Win
         .read_rdx()
         .context("failed to read RDX for EnumDisplayDevicesW")?;
 
-    let display_device_ptr = engine
+    let display_device_va = engine
         .read_r8()
         .context("failed to read R8 for EnumDisplayDevicesW")?;
 
@@ -356,7 +356,7 @@ pub fn handle_enum_display_devices_w(ctx: &mut HandlerContext<'_>) -> Result<Win
         .read_r9()
         .context("failed to read R9 for EnumDisplayDevicesW")?;
 
-    let success = device_index == 0 && display_device_ptr != 0;
+    let success = device_index == 0 && display_device_va != 0;
 
     if success {
         // DISPLAY_DEVICEW:
@@ -366,38 +366,38 @@ pub fn handle_enum_display_devices_w(ctx: &mut HandlerContext<'_>) -> Result<Win
         // DWORD StateFlags;         offset 324
         // WCHAR DeviceID[128];      offset 328
         // WCHAR DeviceKey[128];     offset 584
-        write_guest_u32(engine, display_device_ptr, 840)?;
+        write_guest_u32(engine, display_device_va, 840)?;
 
         write_guest_fixed_utf16(
             engine,
-            checked_address(display_device_ptr, 4, "DeviceName"),
+            checked_address(display_device_va, 4, "DeviceName"),
             32,
             "\\\\.\\DISPLAY1",
         )?;
 
         write_guest_fixed_utf16(
             engine,
-            checked_address(display_device_ptr, 68, "DeviceString"),
+            checked_address(display_device_va, 68, "DeviceString"),
             128,
             "Generic Display",
         )?;
 
         write_guest_u32(
             engine,
-            checked_address(display_device_ptr, 324, "StateFlags"),
+            checked_address(display_device_va, 324, "StateFlags"),
             DISPLAY_DEVICE_ATTACHED_TO_DESKTOP | DISPLAY_DEVICE_PRIMARY_DEVICE,
         )?;
 
         write_guest_fixed_utf16(
             engine,
-            checked_address(display_device_ptr, 328, "DeviceID"),
+            checked_address(display_device_va, 328, "DeviceID"),
             128,
             "MONITOR\\WIE\\DISPLAY1",
         )?;
 
         write_guest_fixed_utf16(
             engine,
-            checked_address(display_device_ptr, 584, "DeviceKey"),
+            checked_address(display_device_va, 584, "DeviceKey"),
             128,
             "\\Registry\\Machine\\System\\CurrentControlSet\\Enum\\DISPLAY\\WIE",
         )?;

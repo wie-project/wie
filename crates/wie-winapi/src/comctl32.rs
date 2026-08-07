@@ -37,11 +37,11 @@ const STATUSCLASSNAME: &str = "msctls_statusbar32";
 /// Handles dynamic `COMCTL32.dll!DllGetVersion`.
 pub fn handle_dll_get_version(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let version_info_ptr = engine
+    let version_info_va = engine
         .read_rcx()
         .context("failed to read RCX for DllGetVersion")?;
 
-    if version_info_ptr != 0 {
+    if version_info_va != 0 {
         // DLLVERSIONINFO:
         // DWORD cbSize;          offset 0
         // DWORD dwMajorVersion;  offset 4
@@ -50,25 +50,25 @@ pub fn handle_dll_get_version(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         // DWORD dwPlatformID;    offset 16
         //
         // Common Controls v6-ish fake version.
-        write_guest_u32(engine, version_info_ptr, 20)?;
+        write_guest_u32(engine, version_info_va, 20)?;
         write_guest_u32(
             engine,
-            checked_address(version_info_ptr, 4, "dwMajorVersion"),
+            checked_address(version_info_va, 4, "dwMajorVersion"),
             6,
         )?;
         write_guest_u32(
             engine,
-            checked_address(version_info_ptr, 8, "dwMinorVersion"),
+            checked_address(version_info_va, 8, "dwMinorVersion"),
             0,
         )?;
         write_guest_u32(
             engine,
-            checked_address(version_info_ptr, 12, "dwBuildNumber"),
+            checked_address(version_info_va, 12, "dwBuildNumber"),
             7600,
         )?;
         write_guest_u32(
             engine,
-            checked_address(version_info_ptr, 16, "dwPlatformID"),
+            checked_address(version_info_va, 16, "dwPlatformID"),
             1,
         )?;
     }
@@ -84,11 +84,11 @@ pub fn handle_init_common_controls(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 /// Handles dynamic `COMCTL32.dll!InitCommonControlsEx`.
 pub fn handle_init_common_controls_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let init_common_controls_ex_ptr = engine
+    let init_common_controls_ex_va = engine
         .read_rcx()
         .context("failed to read RCX for InitCommonControlsEx")?;
 
-    let return_value = u64::from(init_common_controls_ex_ptr != 0);
+    let return_value = u64::from(init_common_controls_ex_va != 0);
 
     ctx.finish(return_value)
 }
@@ -274,7 +274,7 @@ fn handle_create_status_window_impl(
     let style_raw = engine
         .read_rcx()
         .with_context(|| format!("failed to read RCX for {api_name}"))?;
-    let text_ptr = engine
+    let text_va = engine
         .read_rdx()
         .with_context(|| format!("failed to read RDX for {api_name}"))?;
     let parent_handle = engine
@@ -287,13 +287,13 @@ fn handle_create_status_window_impl(
     let style =
         u32::try_from(style_raw).with_context(|| format!("{api_name}: style does not fit u32"))?;
 
-    let text = if text_ptr == 0 {
+    let text = if text_va == 0 {
         String::new()
     } else if unicode {
-        read_guest_utf16_lossy(engine, text_ptr, 512)
+        read_guest_utf16_lossy(engine, text_va, 512)
             .with_context(|| format!("failed to read {api_name} text"))?
     } else {
-        read_guest_ansi_lossy(engine, text_ptr, 512)
+        read_guest_ansi_lossy(engine, text_va, 512)
             .with_context(|| format!("failed to read {api_name} text"))?
     };
 

@@ -417,21 +417,21 @@ pub(crate) fn dispatch_edit_message(
 }
 
 /// EDIT: EM_REPLACESEL — replace the selection with the guest string at
-/// `text_ptr` (honoring the limit). Returns whether the text changed.
+/// `text_va` (honoring the limit). Returns whether the text changed.
 pub(super) fn edit_replace_selection(
     engine: &mut dyn wie_cpu::CpuEngine,
     unicode: bool,
     state: &mut WinApiState,
     hwnd: u64,
-    text_ptr: u64,
+    text_va: u64,
 ) -> Result<bool> {
-    if text_ptr == 0 {
+    if text_va == 0 {
         return Ok(false);
     }
     let replacement = if unicode {
-        read_guest_utf16_lossy(engine, text_ptr, MAX_GUEST_TEXT)?
+        read_guest_utf16_lossy(engine, text_va, MAX_GUEST_TEXT)?
     } else {
-        read_guest_ansi_lossy(engine, text_ptr, MAX_GUEST_TEXT)?
+        read_guest_ansi_lossy(engine, text_va, MAX_GUEST_TEXT)?
     };
     Ok(edit_replace_selection_with(state, hwnd, &replacement))
 }

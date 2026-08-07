@@ -300,11 +300,11 @@ fn write_print_dev_names(
 pub fn handle_print_dlg_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let pd_ptr = engine
+    let pd_va = engine
         .read_rcx()
         .context("failed to read RCX for PrintDlgW")?;
 
-    if pd_ptr == 0 {
+    if pd_va == 0 {
         state_comm_dlg_none(state);
         return print_dialog_return(engine, 0);
     }
@@ -315,14 +315,14 @@ pub fn handle_print_dlg_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         return finish_native_print_dialog(engine, state, pending);
     }
 
-    let pd = with_typed_read::<PrintDlgW, _, _>(engine, pd_ptr, |pd| Ok(*pd))
+    let pd = with_typed_read::<PrintDlgW, _, _>(engine, pd_va, |pd| Ok(*pd))
         .context("failed to read PRINTDLG for PrintDlgW")?;
     let flags = pd.flags;
 
     // PD_RETURNDEFAULT is a query, not a dialog: fill the caller's blocks
     // with the default device mode/names and return FALSE (documented).
     if flags & PD_RETURNDEFAULT != 0 {
-        return handle_print_dlg_return_default(engine, state, pd_ptr, &pd);
+        return handle_print_dlg_return_default(engine, state, pd_va, &pd);
     }
 
     // Without PD_RETURNDC there is no DC to hand back; Windows requires it
@@ -352,7 +352,7 @@ pub fn handle_print_dlg_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
                 tracing::warn!("PrintDlgW interactive but no print-dialog bridge; cancelling");
                 return print_dialog_return(engine, 0);
             }
-            open_native_print_dialog(ctx, pd_ptr, &pd)
+            open_native_print_dialog(ctx, pd_va, &pd)
         }
     }
 }
@@ -367,7 +367,7 @@ pub fn handle_print_dlg_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 fn handle_print_dlg_return_default(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
-    pd_ptr: u64,
+    pd_va: u64,
     pd: &PrintDlgW,
 ) -> Result<WinApiHandlerResult> {
     let mut updated = *pd;
@@ -387,7 +387,7 @@ fn handle_print_dlg_return_default(
         return print_dialog_return(engine, 0);
     }
 
-    with_typed_write::<PrintDlgW, _, _>(engine, pd_ptr, |view| {
+    with_typed_write::<PrintDlgW, _, _>(engine, pd_va, |view| {
         *view = updated;
         Ok(())
     })
@@ -419,7 +419,7 @@ fn handle_print_dlg_return_default(
 ///   `PRINTDLG`.
 fn open_native_print_dialog(
     ctx: &mut HandlerContext<'_>,
-    pd_ptr: u64,
+    pd_va: u64,
     pd: &PrintDlgW,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -446,7 +446,7 @@ fn open_native_print_dialog(
     };
 
     state.window_state().pending_native_print_dialog = Some(PendingNativePrintDialog {
-        print_dlg_ptr: pd_ptr,
+        print_dlg_ptr: pd_va,
         h_dev_mode_in: pd.h_dev_mode,
         h_dev_names_in: pd.h_dev_names,
         flags: pd.flags,
@@ -637,11 +637,11 @@ const PSD_INTHOUSANDTHSOFINCHES: u32 = 0x0000_0004;
 pub fn handle_page_setup_dlg_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let psd_ptr = engine
+    let psd_va = engine
         .read_rcx()
         .context("failed to read RCX for PageSetupDlgW")?;
 
-    if psd_ptr == 0 {
+    if psd_va == 0 {
         state_comm_dlg_none(state);
         return print_dialog_return(engine, 0);
     }
@@ -652,14 +652,14 @@ pub fn handle_page_setup_dlg_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         return finish_native_page_setup(engine, state, pending);
     }
 
-    let psd = with_typed_read::<PageSetupDlgW, _, _>(engine, psd_ptr, |psd| Ok(*psd))
+    let psd = with_typed_read::<PageSetupDlgW, _, _>(engine, psd_va, |psd| Ok(*psd))
         .context("failed to read PAGESETUPDLG for PageSetupDlgW")?;
     let flags = psd.flags;
 
     // PSD_RETURNDEFAULT is a query, not a dialog: fill the caller's blocks
     // with the default device mode/names and return FALSE (documented).
     if flags & PSD_RETURNDEFAULT != 0 {
-        return handle_page_setup_return_default(engine, state, psd_ptr, &psd);
+        return handle_page_setup_return_default(engine, state, psd_va, &psd);
     }
 
     // Clone the policy to avoid borrowing window_state() across the match.
@@ -681,7 +681,7 @@ pub fn handle_page_setup_dlg_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
                 tracing::warn!("PageSetupDlgW interactive but no page-setup bridge; cancelling");
                 return print_dialog_return(engine, 0);
             }
-            open_native_page_setup_dialog(ctx, psd_ptr, &psd)
+            open_native_page_setup_dialog(ctx, psd_va, &psd)
         }
     }
 }
@@ -697,7 +697,7 @@ pub fn handle_page_setup_dlg_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
 fn handle_page_setup_return_default(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
-    psd_ptr: u64,
+    psd_va: u64,
     psd: &PageSetupDlgW,
 ) -> Result<WinApiHandlerResult> {
     let mut updated = *psd;
@@ -717,7 +717,7 @@ fn handle_page_setup_return_default(
         return print_dialog_return(engine, 0);
     }
 
-    with_typed_write::<PageSetupDlgW, _, _>(engine, psd_ptr, |view| {
+    with_typed_write::<PageSetupDlgW, _, _>(engine, psd_va, |view| {
         *view = updated;
         Ok(())
     })
@@ -749,7 +749,7 @@ fn handle_page_setup_return_default(
 ///   `hDevNames` back into the guest `PAGESETUPDLG`, and return TRUE.
 fn open_native_page_setup_dialog(
     ctx: &mut HandlerContext<'_>,
-    psd_ptr: u64,
+    psd_va: u64,
     psd: &PageSetupDlgW,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -767,7 +767,7 @@ fn open_native_page_setup_dialog(
     };
 
     state.window_state().pending_native_page_setup = Some(PendingNativePageSetup {
-        page_setup_dlg_ptr: psd_ptr,
+        page_setup_dlg_ptr: psd_va,
         h_dev_mode_in: psd.h_dev_mode,
         h_dev_names_in: psd.h_dev_names,
         flags: psd.flags,

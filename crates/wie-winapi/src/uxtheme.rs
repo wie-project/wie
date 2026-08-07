@@ -10,11 +10,11 @@ pub fn handle_set_window_theme(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         .read_rcx()
         .context("failed to read RCX for SetWindowTheme")?;
 
-    let _sub_app_name_ptr = engine
+    let _sub_app_name_va = engine
         .read_rdx()
         .context("failed to read RDX for SetWindowTheme")?;
 
-    let _sub_id_list_ptr = engine
+    let _sub_id_list_va = engine
         .read_r8()
         .context("failed to read R8 for SetWindowTheme")?;
 

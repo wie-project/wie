@@ -63,35 +63,35 @@ pub(crate) fn handle_getenv(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 
 pub(crate) fn handle_getmainargs(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let argc_ptr = engine.read_rcx()?;
-    let argv_ptr = engine.read_rdx()?;
-    let env_ptr = engine.read_r8()?;
+    let argc_va = engine.read_rcx()?;
+    let argv_va = engine.read_rdx()?;
+    let env_va = engine.read_r8()?;
     let _do_wildcard = engine.read_r9()?;
     // 5th arg on stack is ignored (startupinfo*).
 
-    if argc_ptr != 0 {
+    if argc_va != 0 {
         let mut argc_bytes = [0_u8; 4];
         engine
             .mem_read(ARGC_SLOT, &mut argc_bytes)
             .context("__getmainargs read argc slot")?;
         engine
-            .mem_write(argc_ptr, &argc_bytes)
+            .mem_write(argc_va, &argc_bytes)
             .context("__getmainargs write *argc")?;
     }
-    if argv_ptr != 0 {
+    if argv_va != 0 {
         // *argv = char** table (same layout as __p___argv materialization).
         const ARGV_TABLE: u64 = CRT_GUEST_BASE + 0x400;
         engine
-            .mem_write(argv_ptr, &ARGV_TABLE.to_le_bytes())
+            .mem_write(argv_va, &ARGV_TABLE.to_le_bytes())
             .context("__getmainargs write *argv")?;
     }
-    if env_ptr != 0 {
+    if env_va != 0 {
         // Empty environment: ENVIRON_PTR_SLOT holds a single NULL char* terminator.
         engine
             .mem_write(ENVIRON_PTR_SLOT, &0_u64.to_le_bytes())
             .context("__getmainargs zero env list")?;
         engine
-            .mem_write(env_ptr, &ENVIRON_PTR_SLOT.to_le_bytes())
+            .mem_write(env_va, &ENVIRON_PTR_SLOT.to_le_bytes())
             .context("__getmainargs write *env")?;
     }
     finish(engine, 0)

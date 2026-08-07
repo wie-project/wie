@@ -202,7 +202,7 @@ fn handle_translate_accelerator_impl(
     let accel_handle = engine
         .read_rdx()
         .with_context(|| format!("failed to read RDX for {api_name}"))?;
-    let message_ptr = engine
+    let message_va = engine
         .read_r8()
         .with_context(|| format!("failed to read R8 for {api_name}"))?;
 
@@ -210,7 +210,7 @@ fn handle_translate_accelerator_impl(
     // + pinned offsets (message @8, wParam @16) live in
     // `crate::guest_layout::Msg`.
     let (message, word_parameter) =
-        with_typed_read::<Msg, _, _>(engine, message_ptr, |msg| Ok((msg.message, msg.wparam)))
+        with_typed_read::<Msg, _, _>(engine, message_va, |msg| Ok((msg.message, msg.wparam)))
             .with_context(|| format!("failed to read {api_name} MSG"))?;
 
     // Resolve handle → table id → parsed entries, then match.

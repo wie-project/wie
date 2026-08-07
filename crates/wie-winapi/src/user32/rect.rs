@@ -15,7 +15,7 @@ use crate::{HandlerContext, WinApiHandlerResult};
 /// shrink its width by 2·dx, so the documented Win32 behavior wins.)
 pub fn handle_inflate_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let rect_ptr = engine
+    let rect_va = engine
         .read_rcx()
         .context("failed to read RCX for InflateRect")?;
     let dx_raw = engine
@@ -28,17 +28,17 @@ pub fn handle_inflate_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
     let dx = low_i32(dx_raw, "InflateRect dx")?;
     let dy = low_i32(dy_raw, "InflateRect dy")?;
 
-    let success = rect_ptr != 0;
+    let success = rect_va != 0;
     if success {
         // Read-all → compute → write-all (one shared-lock borrow per view);
         // the RECT layout + pinned offsets live in `crate::guest_layout::WinRect`.
         let (left, top, right, bottom) =
-            with_typed_read::<WinRect, _, _>(engine, rect_ptr, |rect| {
+            with_typed_read::<WinRect, _, _>(engine, rect_va, |rect| {
                 Ok((rect.left, rect.top, rect.right, rect.bottom))
             })
             .context("failed to read RECT for InflateRect")?;
 
-        with_typed_write::<WinRect, _, _>(engine, rect_ptr, |rect| {
+        with_typed_write::<WinRect, _, _>(engine, rect_va, |rect| {
             rect.left = left.saturating_add(dx.saturating_neg());
             rect.top = top.saturating_add(dy.saturating_neg());
             rect.right = right.saturating_add(dx);

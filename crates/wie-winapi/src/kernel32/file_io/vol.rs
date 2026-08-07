@@ -147,9 +147,9 @@ pub fn handle_get_compressed_file_size_a(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let path_ptr = engine.read_rcx()?;
-    let _high_ptr = engine.read_rdx()?;
-    let path = read_ansi_string_from_cpu(engine, path_ptr, 1024)?;
+    let path_va = engine.read_rcx()?;
+    let _high_va = engine.read_rdx()?;
+    let path = read_ansi_string_from_cpu(engine, path_va, 1024)?;
     let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full = resolve_full_windows_path(&cwd, &path);
     let st = stat_guest_path(state, &full);
@@ -166,9 +166,9 @@ pub fn handle_get_compressed_file_size_w(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let path_ptr = engine.read_rcx()?;
-    let _high_ptr = engine.read_rdx()?;
-    let path = read_wide_string_from_cpu(engine, path_ptr, 1024)?;
+    let path_va = engine.read_rcx()?;
+    let _high_va = engine.read_rdx()?;
+    let path = read_wide_string_from_cpu(engine, path_va, 1024)?;
     let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full = resolve_full_windows_path(&cwd, &path);
     let st = stat_guest_path(state, &full);
@@ -201,10 +201,10 @@ pub fn handle_get_volume_information_w(
     let vol_name_len = engine.read_r8()?;
     let _serial = engine.read_r9()?;
     let rsp = engine.read_rsp()?;
-    let max_comp_ptr = checked_address(rsp, 0x28, "lpMaximumComponentLength");
-    let flags_ptr = checked_address(rsp, 0x30, "lpFileSystemFlags");
-    let name_ptr = checked_address(rsp, 0x38, "lpFileSystemNameBuffer");
-    let fs_len_ptr = checked_address(rsp, 0x40, "lpFileSystemNameLength");
+    let max_comp_va = checked_address(rsp, 0x28, "lpMaximumComponentLength");
+    let flags_va = checked_address(rsp, 0x30, "lpFileSystemFlags");
+    let name_va = checked_address(rsp, 0x38, "lpFileSystemNameBuffer");
+    let fs_len_va = checked_address(rsp, 0x40, "lpFileSystemNameLength");
 
     // Derive volume label from the bottle root name, or use a default.
     let label = state
@@ -218,19 +218,19 @@ pub fn handle_get_volume_information_w(
     write_mock_string_w(engine, state, &label, vol_name, vol_name_len)?;
 
     // MaximumComponentLength = 255 (NTFS)
-    if max_comp_ptr != 0 {
-        let _unused = write_guest_u32(engine, max_comp_ptr, 255);
+    if max_comp_va != 0 {
+        let _unused = write_guest_u32(engine, max_comp_va, 255);
     }
     let fs_flags: u32 = BOTTLE_FS_FLAGS;
-    if flags_ptr != 0 {
-        let _unused = write_guest_u32(engine, flags_ptr, fs_flags);
+    if flags_va != 0 {
+        let _unused = write_guest_u32(engine, flags_va, fs_flags);
     }
     // FileSystemName = "NTFS"
-    if name_ptr != 0 {
-        let _unused = write_mock_string_w(engine, state, "NTFS", name_ptr, 16);
+    if name_va != 0 {
+        let _unused = write_mock_string_w(engine, state, "NTFS", name_va, 16);
     }
-    if fs_len_ptr != 0 {
-        let _unused = write_guest_u32(engine, fs_len_ptr, 4);
+    if fs_len_va != 0 {
+        let _unused = write_guest_u32(engine, fs_len_va, 4);
     }
     state.process.last_error = 0;
     ctx.finish(1)
@@ -246,10 +246,10 @@ pub fn handle_get_volume_information_a(
     let vol_name_len = engine.read_r8()?;
     let _serial = engine.read_r9()?;
     let rsp = engine.read_rsp()?;
-    let max_comp_ptr = checked_address(rsp, 0x28, "lpMaximumComponentLength");
-    let flags_ptr = checked_address(rsp, 0x30, "lpFileSystemFlags");
-    let name_ptr = checked_address(rsp, 0x38, "lpFileSystemNameBuffer");
-    let fs_len_ptr = checked_address(rsp, 0x40, "lpFileSystemNameLength");
+    let max_comp_va = checked_address(rsp, 0x28, "lpMaximumComponentLength");
+    let flags_va = checked_address(rsp, 0x30, "lpFileSystemFlags");
+    let name_va = checked_address(rsp, 0x38, "lpFileSystemNameBuffer");
+    let fs_len_va = checked_address(rsp, 0x40, "lpFileSystemNameLength");
 
     let label = state
         .file_io
@@ -261,18 +261,18 @@ pub fn handle_get_volume_information_a(
         .to_owned();
     write_mock_string_a(engine, state, &label, vol_name, vol_name_len)?;
 
-    if max_comp_ptr != 0 {
-        let _unused = write_guest_u32(engine, max_comp_ptr, 255);
+    if max_comp_va != 0 {
+        let _unused = write_guest_u32(engine, max_comp_va, 255);
     }
     let fs_flags: u32 = BOTTLE_FS_FLAGS;
-    if flags_ptr != 0 {
-        let _unused = write_guest_u32(engine, flags_ptr, fs_flags);
+    if flags_va != 0 {
+        let _unused = write_guest_u32(engine, flags_va, fs_flags);
     }
-    if name_ptr != 0 {
-        let _unused = write_mock_string_a(engine, state, "NTFS", name_ptr, 16);
+    if name_va != 0 {
+        let _unused = write_mock_string_a(engine, state, "NTFS", name_va, 16);
     }
-    if fs_len_ptr != 0 {
-        let _unused = write_guest_u32(engine, fs_len_ptr, 4);
+    if fs_len_va != 0 {
+        let _unused = write_guest_u32(engine, fs_len_va, 4);
     }
 
     state.process.last_error = 0;
@@ -320,10 +320,10 @@ pub fn handle_get_file_attributes_ex_w(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let path_ptr = engine.read_rcx()?;
+    let path_va = engine.read_rcx()?;
     let _info_level = engine.read_rdx()?;
-    let info_ptr = engine.read_r8()?;
-    let path = read_wide_string_from_cpu(engine, path_ptr, 1024)?;
+    let info_va = engine.read_r8()?;
+    let path = read_wide_string_from_cpu(engine, path_va, 1024)?;
     let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full = resolve_full_windows_path(&cwd, &path);
     let st = stat_guest_path(state, &full);
@@ -331,8 +331,8 @@ pub fn handle_get_file_attributes_ex_w(
         state.process.last_error = ERROR_FILE_NOT_FOUND;
         return ctx.finish(0);
     }
-    if info_ptr != 0 {
-        with_typed_write::<FileAttributeData, _, _>(engine, info_ptr, |data| {
+    if info_va != 0 {
+        with_typed_write::<FileAttributeData, _, _>(engine, info_va, |data| {
             data.dw_file_attributes = st.attributes;
             let ft_low = u32::try_from(FIXED_SYSTEM_FILETIME & 0xffff_ffff).unwrap_or(0);
             let ft_high = u32::try_from(FIXED_SYSTEM_FILETIME >> 32).unwrap_or(0);
@@ -357,10 +357,10 @@ pub fn handle_get_file_attributes_ex_a(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let path_ptr = engine.read_rcx()?;
+    let path_va = engine.read_rcx()?;
     let _info_level = engine.read_rdx()?;
-    let info_ptr = engine.read_r8()?;
-    let path = read_ansi_string_from_cpu(engine, path_ptr, 1024)?;
+    let info_va = engine.read_r8()?;
+    let path = read_ansi_string_from_cpu(engine, path_va, 1024)?;
     let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full = resolve_full_windows_path(&cwd, &path);
     let st = stat_guest_path(state, &full);
@@ -368,8 +368,8 @@ pub fn handle_get_file_attributes_ex_a(
         state.process.last_error = ERROR_FILE_NOT_FOUND;
         return ctx.finish(0);
     }
-    if info_ptr != 0 {
-        with_typed_write::<FileAttributeData, _, _>(engine, info_ptr, |data| {
+    if info_va != 0 {
+        with_typed_write::<FileAttributeData, _, _>(engine, info_va, |data| {
             data.dw_file_attributes = st.attributes;
             let ft_low = u32::try_from(FIXED_SYSTEM_FILETIME & 0xffff_ffff).unwrap_or(0);
             let ft_high = u32::try_from(FIXED_SYSTEM_FILETIME >> 32).unwrap_or(0);
@@ -392,17 +392,17 @@ pub fn handle_get_temp_path_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let buffer_len = engine.read_rcx()?;
-    let buffer_ptr = engine.read_rdx()?;
+    let buffer_va = engine.read_rdx()?;
     // Trailing backslash per Microsoft Learn.
     let temp = format!("{}\\", crate::vfs::GUEST_TEMP_PATH.trim_end_matches('\\'));
     let units: Vec<u16> = temp.encode_utf16().collect();
     let required = u64::try_from(units.len().saturating_add(1)).unwrap_or(0);
-    let return_value = if buffer_ptr == 0 || buffer_len < required {
+    let return_value = if buffer_va == 0 || buffer_len < required {
         required
     } else {
         let mut terminated = units;
         terminated.push(0);
-        write_guest_utf16_units(engine, buffer_ptr, &terminated)?;
+        write_guest_utf16_units(engine, buffer_va, &terminated)?;
         u64::try_from(terminated.len().saturating_sub(1)).unwrap_or(0)
     };
     state.process.last_error = 0;
@@ -413,16 +413,16 @@ pub fn handle_get_temp_path_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let buffer_len = engine.read_rcx()?;
-    let buffer_ptr = engine.read_rdx()?;
+    let buffer_va = engine.read_rdx()?;
     let temp = format!("{}\\", crate::vfs::GUEST_TEMP_PATH.trim_end_matches('\\'));
     let bytes = crate::vfs::encode_acp(&temp);
     let required = u64::try_from(bytes.len().saturating_add(1)).unwrap_or(0);
-    let return_value = if buffer_ptr == 0 || buffer_len < required {
+    let return_value = if buffer_va == 0 || buffer_len < required {
         required
     } else {
         let mut out = bytes;
         out.push(0);
-        engine.mem_write(buffer_ptr, &out)?;
+        engine.mem_write(buffer_va, &out)?;
         u64::try_from(out.len().saturating_sub(1)).unwrap_or(0)
     };
     state.process.last_error = 0;
@@ -432,19 +432,19 @@ pub fn handle_get_temp_path_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 pub fn handle_get_temp_file_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let path_ptr = engine.read_rcx()?;
-    let prefix_ptr = engine.read_rdx()?;
+    let path_va = engine.read_rcx()?;
+    let prefix_va = engine.read_rdx()?;
     let unique = engine.read_r8()?;
-    let buffer_ptr = engine.read_r9()?;
-    let path = if path_ptr == 0 {
+    let buffer_va = engine.read_r9()?;
+    let path = if path_va == 0 {
         crate::vfs::GUEST_TEMP_PATH.to_owned()
     } else {
-        read_wide_string_from_cpu(engine, path_ptr, 32_768)?
+        read_wide_string_from_cpu(engine, path_va, 32_768)?
     };
-    let prefix = if prefix_ptr == 0 {
+    let prefix = if prefix_va == 0 {
         "WIE".to_owned()
     } else {
-        read_wide_string_from_cpu(engine, prefix_ptr, 16)?
+        read_wide_string_from_cpu(engine, prefix_va, 16)?
     };
     let prefix: String = prefix.chars().take(3).collect();
     let id = if unique == 0 {
@@ -461,10 +461,10 @@ pub fn handle_get_temp_file_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinAp
         id_u32
     );
     finish_create_file_create_only(state, &name);
-    if buffer_ptr != 0 {
+    if buffer_va != 0 {
         let mut units: Vec<u16> = name.encode_utf16().collect();
         units.push(0);
-        write_guest_utf16_units(engine, buffer_ptr, &units)?;
+        write_guest_utf16_units(engine, buffer_va, &units)?;
     }
     state.process.last_error = 0;
     let return_value = u64::from(id_u32).max(1);
@@ -474,19 +474,19 @@ pub fn handle_get_temp_file_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 pub fn handle_get_temp_file_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let path_ptr = engine.read_rcx()?;
-    let prefix_ptr = engine.read_rdx()?;
+    let path_va = engine.read_rcx()?;
+    let prefix_va = engine.read_rdx()?;
     let unique = engine.read_r8()?;
-    let buffer_ptr = engine.read_r9()?;
-    let path = if path_ptr == 0 {
+    let buffer_va = engine.read_r9()?;
+    let path = if path_va == 0 {
         crate::vfs::GUEST_TEMP_PATH.to_owned()
     } else {
-        read_ansi_string_from_cpu(engine, path_ptr, 32_768)?
+        read_ansi_string_from_cpu(engine, path_va, 32_768)?
     };
-    let prefix = if prefix_ptr == 0 {
+    let prefix = if prefix_va == 0 {
         "WIE".to_owned()
     } else {
-        read_ansi_string_from_cpu(engine, prefix_ptr, 16)?
+        read_ansi_string_from_cpu(engine, prefix_va, 16)?
     };
     let prefix: String = prefix.chars().take(3).collect();
     let id = if unique == 0 {
@@ -503,10 +503,10 @@ pub fn handle_get_temp_file_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinAp
         id_u32
     );
     finish_create_file_create_only(state, &name);
-    if buffer_ptr != 0 {
+    if buffer_va != 0 {
         let mut out = crate::vfs::encode_acp(&name);
         out.push(0);
-        engine.mem_write(buffer_ptr, &out)?;
+        engine.mem_write(buffer_va, &out)?;
     }
     state.process.last_error = 0;
     let return_value = u64::from(id_u32).max(1);
@@ -516,11 +516,11 @@ pub fn handle_get_temp_file_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 pub fn handle_get_drive_type_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let path_ptr = engine.read_rcx()?;
-    let path = if path_ptr == 0 {
+    let path_va = engine.read_rcx()?;
+    let path = if path_va == 0 {
         String::new()
     } else {
-        read_wide_string_from_cpu(engine, path_ptr, 16)?
+        read_wide_string_from_cpu(engine, path_va, 16)?
     };
     let return_value = u64::from(crate::vfs::get_drive_type(&state.file_io.volumes, &path));
     ctx.finish(return_value)
@@ -529,11 +529,11 @@ pub fn handle_get_drive_type_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
 pub fn handle_get_drive_type_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let path_ptr = engine.read_rcx()?;
-    let path = if path_ptr == 0 {
+    let path_va = engine.read_rcx()?;
+    let path = if path_va == 0 {
         String::new()
     } else {
-        read_ansi_string_from_cpu(engine, path_ptr, 16)?
+        read_ansi_string_from_cpu(engine, path_va, 16)?
     };
     let return_value = u64::from(crate::vfs::get_drive_type(&state.file_io.volumes, &path));
     ctx.finish(return_value)

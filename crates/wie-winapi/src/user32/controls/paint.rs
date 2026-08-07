@@ -209,18 +209,18 @@ pub(crate) fn fill_surface_rect_above_clipped(
 pub(super) fn write_control_text(
     engine: &mut dyn wie_cpu::CpuEngine,
     unicode: bool,
-    buffer_ptr: u64,
+    buffer_va: u64,
     max_characters: u64,
     text: &str,
 ) -> Result<u64> {
-    if buffer_ptr == 0 {
+    if buffer_va == 0 {
         return Ok(0);
     }
     let capacity = usize::try_from(max_characters).unwrap_or(0);
     let copied = if unicode {
-        write_guest_utf16_c_string(engine, buffer_ptr, capacity, text)?
+        write_guest_utf16_c_string(engine, buffer_va, capacity, text)?
     } else {
-        write_guest_ansi_c_string(engine, buffer_ptr, capacity, text)?
+        write_guest_ansi_c_string(engine, buffer_va, capacity, text)?
     };
     Ok(u64::try_from(copied).unwrap_or(0))
 }

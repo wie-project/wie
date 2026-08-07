@@ -774,14 +774,14 @@ pub fn handle_fill_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
     let hdc = engine
         .read_rcx()
         .context("failed to read RCX for FillRect")?;
-    let rect_ptr = engine
+    let rect_va = engine
         .read_rdx()
         .context("failed to read RDX for FillRect")?;
     let brush = engine.read_r8().context("failed to read R8 for FillRect")?;
 
     let mut filled = false;
-    if rect_ptr != 0 {
-        let (left, top, right, bottom) = with_typed_read::<Rect, _, _>(engine, rect_ptr, |rect| {
+    if rect_va != 0 {
+        let (left, top, right, bottom) = with_typed_read::<Rect, _, _>(engine, rect_va, |rect| {
             Ok((rect.left, rect.top, rect.right, rect.bottom))
         })
         .context("failed to read RECT")?;

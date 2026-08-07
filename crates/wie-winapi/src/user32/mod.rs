@@ -324,19 +324,19 @@ pub(crate) fn low_i32(value: u64, name: &str) -> Result<i32> {
 
 pub(crate) fn write_window_rect(
     engine: &mut dyn wie_cpu::CpuEngine,
-    rect_ptr: u64,
+    rect_va: u64,
     left: i32,
     top: i32,
     right: i32,
     bottom: i32,
 ) -> Result<()> {
-    write_guest_i32(engine, rect_ptr, left)?;
+    write_guest_i32(engine, rect_va, left)?;
 
-    write_guest_i32(engine, checked_address(rect_ptr, 4, "RECT.top"), top)?;
+    write_guest_i32(engine, checked_address(rect_va, 4, "RECT.top"), top)?;
 
-    write_guest_i32(engine, checked_address(rect_ptr, 8, "RECT.right"), right)?;
+    write_guest_i32(engine, checked_address(rect_va, 8, "RECT.right"), right)?;
 
-    write_guest_i32(engine, checked_address(rect_ptr, 12, "RECT.bottom"), bottom)?;
+    write_guest_i32(engine, checked_address(rect_va, 12, "RECT.bottom"), bottom)?;
 
     Ok(())
 }
@@ -702,10 +702,10 @@ pub(crate) fn create_window_record(
 pub(crate) fn create_mdi_child_from_struct(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
-    create_struct_ptr: u64,
+    create_struct_va: u64,
     unicode: bool,
 ) -> Result<u64> {
-    if create_struct_ptr == 0 {
+    if create_struct_va == 0 {
         return Ok(0);
     }
 
@@ -719,49 +719,49 @@ pub(crate) fn create_mdi_child_from_struct(
     // +0x24 cy
     // +0x28 style
     // +0x30 lParam
-    let class_ptr =
-        read_u64(engine, create_struct_ptr).context("failed to read MDICREATESTRUCT.szClass")?;
-    let title_ptr = read_u64(
+    let class_va =
+        read_u64(engine, create_struct_va).context("failed to read MDICREATESTRUCT.szClass")?;
+    let title_va = read_u64(
         engine,
-        checked_address(create_struct_ptr, 8, "MDICREATESTRUCT.szTitle"),
+        checked_address(create_struct_va, 8, "MDICREATESTRUCT.szTitle"),
     )?;
     let owner = read_u64(
         engine,
-        checked_address(create_struct_ptr, 16, "MDICREATESTRUCT.hOwner"),
+        checked_address(create_struct_va, 16, "MDICREATESTRUCT.hOwner"),
     )?;
     let x = read_i32(
         engine,
-        checked_address(create_struct_ptr, 24, "MDICREATESTRUCT.x"),
+        checked_address(create_struct_va, 24, "MDICREATESTRUCT.x"),
     )?;
     let y = read_i32(
         engine,
-        checked_address(create_struct_ptr, 28, "MDICREATESTRUCT.y"),
+        checked_address(create_struct_va, 28, "MDICREATESTRUCT.y"),
     )?;
     let cx = read_i32(
         engine,
-        checked_address(create_struct_ptr, 32, "MDICREATESTRUCT.cx"),
+        checked_address(create_struct_va, 32, "MDICREATESTRUCT.cx"),
     )?;
     let cy = read_i32(
         engine,
-        checked_address(create_struct_ptr, 36, "MDICREATESTRUCT.cy"),
+        checked_address(create_struct_va, 36, "MDICREATESTRUCT.cy"),
     )?;
     let style = read_u32(
         engine,
-        checked_address(create_struct_ptr, 40, "MDICREATESTRUCT.style"),
+        checked_address(create_struct_va, 40, "MDICREATESTRUCT.style"),
     )?;
 
     let class_identifier = if unicode {
-        read_window_class_identifier_w(engine, class_ptr)?
+        read_window_class_identifier_w(engine, class_va)?
     } else {
-        read_window_class_identifier_a(engine, class_ptr)?
+        read_window_class_identifier_a(engine, class_va)?
     };
 
-    let title = if title_ptr == 0 {
+    let title = if title_va == 0 {
         String::new()
     } else if unicode {
-        read_guest_utf16_lossy(engine, title_ptr, 512)?
+        read_guest_utf16_lossy(engine, title_va, 512)?
     } else {
-        read_guest_ansi_lossy(engine, title_ptr, 512)?
+        read_guest_ansi_lossy(engine, title_va, 512)?
     };
 
     let (handle, _window_proc, _class_unicode) = create_window_record(

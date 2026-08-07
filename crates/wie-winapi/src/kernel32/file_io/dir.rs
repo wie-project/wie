@@ -9,11 +9,11 @@ use super::{
 pub fn handle_create_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let path_ptr = engine.read_rcx()?;
-    let path = if path_ptr == 0 {
+    let path_va = engine.read_rcx()?;
+    let path = if path_va == 0 {
         String::new()
     } else {
-        read_wide_string_from_cpu(engine, path_ptr, 32_768)?
+        read_wide_string_from_cpu(engine, path_va, 32_768)?
     };
     let return_value = finish_create_directory(state, &path);
     ctx.finish(return_value)
@@ -22,11 +22,11 @@ pub fn handle_create_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 pub fn handle_create_directory_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let path_ptr = engine.read_rcx()?;
-    let path = if path_ptr == 0 {
+    let path_va = engine.read_rcx()?;
+    let path = if path_va == 0 {
         String::new()
     } else {
-        read_ansi_string_from_cpu(engine, path_ptr, 32_768)?
+        read_ansi_string_from_cpu(engine, path_va, 32_768)?
     };
     let return_value = finish_create_directory(state, &path);
     ctx.finish(return_value)
@@ -35,11 +35,11 @@ pub fn handle_create_directory_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 pub fn handle_delete_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let path_ptr = engine.read_rcx()?;
-    let path = if path_ptr == 0 {
+    let path_va = engine.read_rcx()?;
+    let path = if path_va == 0 {
         String::new()
     } else {
-        read_wide_string_from_cpu(engine, path_ptr, 32_768)?
+        read_wide_string_from_cpu(engine, path_va, 32_768)?
     };
     let return_value = finish_delete_file(state, &path);
     ctx.finish(return_value)
@@ -48,11 +48,11 @@ pub fn handle_delete_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 pub fn handle_delete_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let path_ptr = engine.read_rcx()?;
-    let path = if path_ptr == 0 {
+    let path_va = engine.read_rcx()?;
+    let path = if path_va == 0 {
         String::new()
     } else {
-        read_ansi_string_from_cpu(engine, path_ptr, 32_768)?
+        read_ansi_string_from_cpu(engine, path_va, 32_768)?
     };
     let return_value = finish_delete_file(state, &path);
     ctx.finish(return_value)
@@ -61,11 +61,11 @@ pub fn handle_delete_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 pub fn handle_remove_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let path_ptr = engine.read_rcx()?;
-    let path = if path_ptr == 0 {
+    let path_va = engine.read_rcx()?;
+    let path = if path_va == 0 {
         String::new()
     } else {
-        read_wide_string_from_cpu(engine, path_ptr, 32_768)?
+        read_wide_string_from_cpu(engine, path_va, 32_768)?
     };
     let return_value = finish_remove_directory(state, &path);
     ctx.finish(return_value)
@@ -74,11 +74,11 @@ pub fn handle_remove_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 pub fn handle_remove_directory_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let path_ptr = engine.read_rcx()?;
-    let path = if path_ptr == 0 {
+    let path_va = engine.read_rcx()?;
+    let path = if path_va == 0 {
         String::new()
     } else {
-        read_ansi_string_from_cpu(engine, path_ptr, 32_768)?
+        read_ansi_string_from_cpu(engine, path_va, 32_768)?
     };
     let return_value = finish_remove_directory(state, &path);
     ctx.finish(return_value)
@@ -87,17 +87,17 @@ pub fn handle_remove_directory_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 pub fn handle_move_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let from_ptr = engine.read_rcx()?;
-    let to_ptr = engine.read_rdx()?;
-    let from = if from_ptr == 0 {
+    let from_va = engine.read_rcx()?;
+    let to_va = engine.read_rdx()?;
+    let from = if from_va == 0 {
         String::new()
     } else {
-        read_wide_string_from_cpu(engine, from_ptr, 32_768)?
+        read_wide_string_from_cpu(engine, from_va, 32_768)?
     };
-    let to = if to_ptr == 0 {
+    let to = if to_va == 0 {
         String::new()
     } else {
-        read_wide_string_from_cpu(engine, to_ptr, 32_768)?
+        read_wide_string_from_cpu(engine, to_va, 32_768)?
     };
     let return_value = finish_move_file(state, &from, &to);
     ctx.finish(return_value)
@@ -106,17 +106,17 @@ pub fn handle_move_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 pub fn handle_move_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let from_ptr = engine.read_rcx()?;
-    let to_ptr = engine.read_rdx()?;
-    let from = if from_ptr == 0 {
+    let from_va = engine.read_rcx()?;
+    let to_va = engine.read_rdx()?;
+    let from = if from_va == 0 {
         String::new()
     } else {
-        read_ansi_string_from_cpu(engine, from_ptr, 32_768)?
+        read_ansi_string_from_cpu(engine, from_va, 32_768)?
     };
-    let to = if to_ptr == 0 {
+    let to = if to_va == 0 {
         String::new()
     } else {
-        read_ansi_string_from_cpu(engine, to_ptr, 32_768)?
+        read_ansi_string_from_cpu(engine, to_va, 32_768)?
     };
     let return_value = finish_move_file(state, &from, &to);
     ctx.finish(return_value)

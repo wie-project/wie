@@ -465,7 +465,7 @@ pub fn handle_redraw_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         .read_rcx()
         .context("failed to read RCX for RedrawWindow")?;
 
-    let _update_rect_ptr = engine
+    let _update_rect_va = engine
         .read_rdx()
         .context("failed to read RDX for RedrawWindow")?;
 

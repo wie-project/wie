@@ -87,13 +87,13 @@ pub struct BufferRecord {
     pub ref_count: u32,
 }
 
-/// Read a guest IID (16 bytes) at `iid_ptr`.
-fn read_guest_iid(engine: &mut dyn wie_cpu::CpuEngine, iid_ptr: u64) -> Option<[u8; 16]> {
-    if iid_ptr == 0 {
+/// Read a guest IID (16 bytes) at `iid_va`.
+fn read_guest_iid(engine: &mut dyn wie_cpu::CpuEngine, iid_va: u64) -> Option<[u8; 16]> {
+    if iid_va == 0 {
         return None;
     }
     let mut bytes = [0_u8; 16];
-    engine.mem_read(iid_ptr, &mut bytes).ok()?;
+    engine.mem_read(iid_va, &mut bytes).ok()?;
     Some(bytes)
 }
 
@@ -144,7 +144,7 @@ fn buffer_query_interface_common(
     state: &mut WinApiState,
     this_pointer: u64,
 ) -> Result<u64> {
-    let iid_ptr = engine
+    let iid_va = engine
         .read_rdx()
         .context("failed to read RDX for QueryInterface")?;
     let ppv_object = engine
@@ -158,7 +158,7 @@ fn buffer_query_interface_common(
         }
         return Ok(E_NOINTERFACE);
     }
-    let requested = read_guest_iid(engine, iid_ptr).unwrap_or([0; 16]);
+    let requested = read_guest_iid(engine, iid_va).unwrap_or([0; 16]);
     // The self IID depends only on the record kind, which the object type
     // pins at Create time.
     let self_iid = state
@@ -410,11 +410,11 @@ pub fn handle_vertex_buffer_get_desc(ctx: &mut HandlerContext<'_>) -> Result<Win
     let this_pointer = engine
         .read_rcx()
         .context("failed to read RCX for IDirect3DVertexBuffer9::GetDesc")?;
-    let desc_ptr = engine
+    let desc_va = engine
         .read_rdx()
         .context("failed to read RDX for IDirect3DVertexBuffer9::GetDesc")?;
 
-    let return_value = if desc_ptr != 0 {
+    let return_value = if desc_va != 0 {
         match state.d3d9().d3d9_buffers.get(&this_pointer) {
             Some(record) if matches!(record.kind, BufferKind::Vertex { .. }) => {
                 let mut bytes = [0_u8; 24];
@@ -431,7 +431,7 @@ pub fn handle_vertex_buffer_get_desc(ctx: &mut HandlerContext<'_>) -> Result<Win
                 bytes[16..20].copy_from_slice(&record.size.to_le_bytes());
                 bytes[20..24].copy_from_slice(&fvf.to_le_bytes());
                 engine
-                    .mem_write(desc_ptr, &bytes)
+                    .mem_write(desc_va, &bytes)
                     .context("failed to write D3DVERTEXBUFFER_DESC")?;
                 D3D_OK
             }
@@ -514,11 +514,11 @@ pub fn handle_index_buffer_get_desc(ctx: &mut HandlerContext<'_>) -> Result<WinA
     let this_pointer = engine
         .read_rcx()
         .context("failed to read RCX for IDirect3DIndexBuffer9::GetDesc")?;
-    let desc_ptr = engine
+    let desc_va = engine
         .read_rdx()
         .context("failed to read RDX for IDirect3DIndexBuffer9::GetDesc")?;
 
-    let return_value = if desc_ptr != 0 {
+    let return_value = if desc_va != 0 {
         match state.d3d9().d3d9_buffers.get(&this_pointer) {
             Some(record) if matches!(record.kind, BufferKind::Index { .. }) => {
                 let mut bytes = [0_u8; 20];
@@ -535,7 +535,7 @@ pub fn handle_index_buffer_get_desc(ctx: &mut HandlerContext<'_>) -> Result<WinA
                 bytes[12..16].copy_from_slice(&record.pool.to_le_bytes());
                 bytes[16..20].copy_from_slice(&record.size.to_le_bytes());
                 engine
-                    .mem_write(desc_ptr, &bytes)
+                    .mem_write(desc_va, &bytes)
                     .context("failed to write D3DINDEXBUFFER_DESC")?;
                 D3D_OK
             }

@@ -17,11 +17,11 @@ use crate::guest_memory::with_typed_write;
 /// fields, so caller garbage never leaks into the reserved/stdio-handle
 /// region — the typed view starts zeroed and only `cb`, `dwFlags`, and
 /// `wShowWindow` are touched.
-fn write_startup_info(engine: &mut dyn wie_cpu::CpuEngine, startup_info_ptr: u64) -> Result<()> {
-    if startup_info_ptr == 0 {
+fn write_startup_info(engine: &mut dyn wie_cpu::CpuEngine, startup_info_va: u64) -> Result<()> {
+    if startup_info_va == 0 {
         return Ok(());
     }
-    with_typed_write::<StartupInfo, _, _>(engine, startup_info_ptr, |info| {
+    with_typed_write::<StartupInfo, _, _>(engine, startup_info_va, |info| {
         info.cb = 104;
         info.dw_flags = 0;
         info.w_show_window = 1;
@@ -33,22 +33,22 @@ fn write_startup_info(engine: &mut dyn wie_cpu::CpuEngine, startup_info_ptr: u64
 /// Handles `KERNEL32.dll!GetStartupInfoA`.
 pub fn handle_get_startup_info_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let startup_info_ptr = engine
+    let startup_info_va = engine
         .read_rcx()
         .context("failed to read RCX for GetStartupInfoA")?;
 
-    write_startup_info(engine, startup_info_ptr)?;
+    write_startup_info(engine, startup_info_va)?;
 
     ctx.finish(0)
 }
 /// Handles `KERNEL32.dll!GetStartupInfoW`.
 pub fn handle_get_startup_info_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let startup_info_ptr = engine
+    let startup_info_va = engine
         .read_rcx()
         .context("failed to read RCX for GetStartupInfoW")?;
 
-    write_startup_info(engine, startup_info_ptr)?;
+    write_startup_info(engine, startup_info_va)?;
 
     ctx.finish(0)
 }
@@ -62,13 +62,13 @@ pub fn handle_get_system_time_as_file_time(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let filetime_ptr = engine
+    let filetime_va = engine
         .read_rcx()
         .context("failed to read RCX for GetSystemTimeAsFileTime")?;
 
-    if filetime_ptr != 0 {
-        let low_address = checked_address(filetime_ptr, 0, "dwLowDateTime");
-        let high_address = checked_address(filetime_ptr, 4, "dwHighDateTime");
+    if filetime_va != 0 {
+        let low_address = checked_address(filetime_va, 0, "dwLowDateTime");
+        let high_address = checked_address(filetime_va, 4, "dwHighDateTime");
 
         // B5: matches the wall-clock FILETIME the host publishes into the guest
         // clock table (slot 3), which the in-guest stub copies verbatim.
@@ -542,15 +542,15 @@ pub(crate) fn handle_get_exit_code_thread(
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let handle = engine.read_rcx()?;
-    let out_ptr = engine.read_rdx()?;
+    let out_va = engine.read_rdx()?;
     let code = if let Some(t) = state.kernel.sync.thread_by_handle(handle) {
         t.exit_code.load(std::sync::atomic::Ordering::Acquire)
     } else {
         state.process.last_error = ERROR_INVALID_HANDLE;
         return ctx.finish(0);
     };
-    if out_ptr != 0 {
-        drop(engine.mem_write(out_ptr, &code.to_le_bytes()));
+    if out_va != 0 {
+        drop(engine.mem_write(out_va, &code.to_le_bytes()));
     }
     state.process.last_error = 0;
     ctx.finish(1)

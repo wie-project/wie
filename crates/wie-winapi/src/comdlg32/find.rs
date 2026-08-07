@@ -114,11 +114,11 @@ fn handle_find_replace_text(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let fr_ptr = engine
+    let fr_va = engine
         .read_rcx()
         .with_context(|| format!("failed to read RCX for {api_name}"))?;
 
-    if fr_ptr == 0 {
+    if fr_va == 0 {
         // FindTextW(NULL) fails like GetOpenFileName(NULL): no dialog.
         return ctx.finish(0);
     }
@@ -126,12 +126,12 @@ fn handle_find_replace_text(
     // One typed read for the whole FINDREPLACE (the find/replace buffer
     // pointers, their lengths, the checkbox Flags, and the owner); the layout
     // lives in `crate::guest_layout::FindReplace`.
-    let fr = with_typed_read::<FindReplace, _, _>(engine, fr_ptr, |fr| Ok(*fr))
+    let fr = with_typed_read::<FindReplace, _, _>(engine, fr_va, |fr| Ok(*fr))
         .with_context(|| format!("failed to read FINDREPLACE for {api_name}"))?;
     let owner_raw = fr.hwnd_owner;
-    let find_what_ptr = fr.lpstr_find_what;
+    let find_what_va = fr.lpstr_find_what;
     let find_what_len = u32::from(fr.w_find_what_len);
-    let replace_with_ptr = if replace_mode {
+    let replace_with_va = if replace_mode {
         fr.lpstr_replace_with
     } else {
         0
@@ -145,14 +145,14 @@ fn handle_find_replace_text(
 
     // The dialog's EDIT lines are seeded from the guest's buffers (RNotepad
     // keeps its search/replace text there across Find menu opens).
-    let seed_find = if find_what_ptr != 0 {
-        read_utf16_lossy(engine, find_what_ptr, 1024)
+    let seed_find = if find_what_va != 0 {
+        read_utf16_lossy(engine, find_what_va, 1024)
             .with_context(|| format!("failed to read {api_name} find text"))?
     } else {
         String::new()
     };
-    let seed_replace = if replace_with_ptr != 0 {
-        read_utf16_lossy(engine, replace_with_ptr, 1024)
+    let seed_replace = if replace_with_va != 0 {
+        read_utf16_lossy(engine, replace_with_va, 1024)
             .with_context(|| format!("failed to read {api_name} replace text"))?
     } else {
         String::new()
@@ -368,11 +368,11 @@ fn handle_find_replace_text(
     // keeps yielding normally while the guest pumps its main loop.
     state.window_state().find_dialogs.push(FindDialogSession {
         dialog_hwnd,
-        fr_ptr,
+        fr_ptr: fr_va,
         owner_hwnd: parent_handle,
-        find_what_ptr,
+        find_what_ptr: find_what_va,
         find_what_len,
-        replace_with_ptr,
+        replace_with_ptr: replace_with_va,
         replace_with_len,
         find_edit_hwnd,
         replace_edit_hwnd,
@@ -677,7 +677,7 @@ fn post_find_msgstring(state: &mut WinApiState, session: &FindDialogSession) {
         target: "wiegui",
         message_id,
         owner = session.owner_hwnd,
-        fr_ptr = session.fr_ptr,
+        fr_va = session.fr_ptr,
         "FINDMSGSTRING posted"
     );
 }
@@ -851,24 +851,20 @@ mod tests {
     const FR_TEST_REPLACEALL: u32 = 0x0020;
     const FR_TEST_DIALOGTERM: u32 = 0x0040;
 
-    /// Write a `FINDREPLACE` (Win64) into guest memory at `fr_ptr`, with the
+    /// Write a `FINDREPLACE` (Win64) into guest memory at `fr_va`, with the
     /// find/replace string buffers at the fixed test addresses 0x6000/0x6100.
-    fn write_findreplace(engine: &mut IcedCpu, fr_ptr: u64, owner: u64, flags: u32) {
-        engine.mem_write(fr_ptr, &0x58_u32.to_le_bytes()).ok(); // lStructSize
-        engine.mem_write(fr_ptr + 8, &owner.to_le_bytes()).ok(); // hwndOwner
-        engine.mem_write(fr_ptr + 16, &0_u64.to_le_bytes()).ok(); // hInstance
-        engine.mem_write(fr_ptr + 24, &flags.to_le_bytes()).ok(); // Flags
-        engine
-            .mem_write(fr_ptr + 32, &0x6000_u64.to_le_bytes())
-            .ok(); // lpstrFindWhat
-        engine
-            .mem_write(fr_ptr + 40, &0x6100_u64.to_le_bytes())
-            .ok(); // lpstrReplaceWith
+    fn write_findreplace(engine: &mut IcedCpu, fr_va: u64, owner: u64, flags: u32) {
+        engine.mem_write(fr_va, &0x58_u32.to_le_bytes()).ok(); // lStructSize
+        engine.mem_write(fr_va + 8, &owner.to_le_bytes()).ok(); // hwndOwner
+        engine.mem_write(fr_va + 16, &0_u64.to_le_bytes()).ok(); // hInstance
+        engine.mem_write(fr_va + 24, &flags.to_le_bytes()).ok(); // Flags
+        engine.mem_write(fr_va + 32, &0x6000_u64.to_le_bytes()).ok(); // lpstrFindWhat
+        engine.mem_write(fr_va + 40, &0x6100_u64.to_le_bytes()).ok(); // lpstrReplaceWith
         // The lengths are WORDs at 48/50 (lCustData needs 8-alignment, so the
         // real layout pads 52..56) — the typed read enforces the header's
         // offsets, unlike the old per-field constants.
-        engine.mem_write(fr_ptr + 48, &64_u16.to_le_bytes()).ok(); // wFindWhatLen
-        engine.mem_write(fr_ptr + 50, &64_u16.to_le_bytes()).ok(); // wReplaceWithLen
+        engine.mem_write(fr_va + 48, &64_u16.to_le_bytes()).ok(); // wFindWhatLen
+        engine.mem_write(fr_va + 50, &64_u16.to_le_bytes()).ok(); // wReplaceWithLen
     }
 
     /// Open a find (or replace) dialog the way the guest would: `FindTextW`

@@ -26,7 +26,7 @@ pub fn handle_reg_create_key_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
         .read_rcx()
         .context("failed to read RCX for RegCreateKeyExA")?;
 
-    let subkey_ptr = engine
+    let subkey_va = engine
         .read_rdx()
         .context("failed to read RDX for RegCreateKeyExA")?;
 
@@ -38,9 +38,9 @@ pub fn handle_reg_create_key_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     let disposition_address = checked_address(rsp, 0x48, "RegCreateKeyExA lpdwDisposition");
 
     let phk_result = read_u64(engine, phk_result_address)?;
-    let disposition_ptr = read_u64(engine, disposition_address)?;
+    let disposition_va = read_u64(engine, disposition_address)?;
 
-    let subkey = read_optional_ansi_string(engine, subkey_ptr)?;
+    let subkey = read_optional_ansi_string(engine, subkey_va)?;
 
     // RegCreateKeyEx is the only entry point permitted to create a key.
     let (handle, disposition) = open_or_create_registry_key(state, parent_key, subkey, true)?
@@ -50,8 +50,8 @@ pub fn handle_reg_create_key_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
         write_guest_u64(engine, phk_result, handle)?;
     }
 
-    if disposition_ptr != 0 {
-        write_guest_u32(engine, disposition_ptr, disposition)?;
+    if disposition_va != 0 {
+        write_guest_u32(engine, disposition_va, disposition)?;
     }
 
     return_status(engine, ERROR_SUCCESS)
@@ -65,7 +65,7 @@ pub fn handle_reg_open_key_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .read_rcx()
         .context("failed to read RCX for RegOpenKeyExA")?;
 
-    let subkey_ptr = engine
+    let subkey_va = engine
         .read_rdx()
         .context("failed to read RDX for RegOpenKeyExA")?;
 
@@ -76,7 +76,7 @@ pub fn handle_reg_open_key_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let phk_result_address = checked_address(rsp, 0x30, "RegOpenKeyExA phkResult");
     let phk_result = read_u64(engine, phk_result_address)?;
 
-    let subkey = read_optional_ansi_string(engine, subkey_ptr)?;
+    let subkey = read_optional_ansi_string(engine, subkey_va)?;
     // RegOpenKeyEx opens only: a missing key is ERROR_FILE_NOT_FOUND and
     // must not be materialized (that is RegCreateKeyEx's job).
     let Some((handle, _disposition)) =
@@ -103,7 +103,7 @@ pub fn handle_reg_open_key_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .read_rcx()
         .context("failed to read RCX for RegOpenKeyExW")?;
 
-    let subkey_ptr = engine
+    let subkey_va = engine
         .read_rdx()
         .context("failed to read RDX for RegOpenKeyExW")?;
 
@@ -114,7 +114,7 @@ pub fn handle_reg_open_key_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let phk_result_address = checked_address(rsp, 0x30, "RegOpenKeyExW phkResult");
     let phk_result = read_u64(engine, phk_result_address)?;
 
-    let subkey = read_optional_utf16_string(engine, subkey_ptr)?;
+    let subkey = read_optional_utf16_string(engine, subkey_va)?;
     // RegOpenKeyEx opens only: a missing key is ERROR_FILE_NOT_FOUND and
     // must not be materialized (that is RegCreateKeyEx's job).
     let Some((handle, _disposition)) =
@@ -145,7 +145,7 @@ pub fn handle_reg_open_key_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         .read_rcx()
         .context("failed to read RCX for RegOpenKeyA")?;
 
-    let subkey_ptr = engine
+    let subkey_va = engine
         .read_rdx()
         .context("failed to read RDX for RegOpenKeyA")?;
 
@@ -155,7 +155,7 @@ pub fn handle_reg_open_key_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         .read_r8()
         .context("failed to read R8 for RegOpenKeyA")?;
 
-    let subkey = read_optional_ansi_string(engine, subkey_ptr)?;
+    let subkey = read_optional_ansi_string(engine, subkey_va)?;
     // Legacy RegOpenKey is open-only, same as RegOpenKeyEx: a missing key is
     // ERROR_FILE_NOT_FOUND and is not materialized.
     let Some((handle, _disposition)) =
@@ -184,7 +184,7 @@ pub fn handle_reg_open_key_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         .read_rcx()
         .context("failed to read RCX for RegOpenKeyW")?;
 
-    let subkey_ptr = engine
+    let subkey_va = engine
         .read_rdx()
         .context("failed to read RDX for RegOpenKeyW")?;
 
@@ -192,7 +192,7 @@ pub fn handle_reg_open_key_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         .read_r8()
         .context("failed to read R8 for RegOpenKeyW")?;
 
-    let subkey = read_optional_utf16_string(engine, subkey_ptr)?;
+    let subkey = read_optional_utf16_string(engine, subkey_va)?;
     // Legacy RegOpenKey is open-only, same as RegOpenKeyEx: a missing key is
     // ERROR_FILE_NOT_FOUND and is not materialized.
     let Some((handle, _disposition)) =
@@ -217,7 +217,7 @@ pub fn handle_reg_create_key_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApi
         .read_rcx()
         .context("failed to read RCX for RegCreateKeyExW")?;
 
-    let subkey_ptr = engine
+    let subkey_va = engine
         .read_rdx()
         .context("failed to read RDX for RegCreateKeyExW")?;
 
@@ -229,9 +229,9 @@ pub fn handle_reg_create_key_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     let disposition_address = checked_address(rsp, 0x48, "RegCreateKeyExW lpdwDisposition");
 
     let phk_result = read_u64(engine, phk_result_address)?;
-    let disposition_ptr = read_u64(engine, disposition_address)?;
+    let disposition_va = read_u64(engine, disposition_address)?;
 
-    let subkey = read_optional_utf16_string(engine, subkey_ptr)?;
+    let subkey = read_optional_utf16_string(engine, subkey_va)?;
 
     // RegCreateKeyEx is the only entry point permitted to create a key.
     let (handle, disposition) = open_or_create_registry_key(state, parent_key, subkey, true)?
@@ -241,8 +241,8 @@ pub fn handle_reg_create_key_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApi
         write_guest_u64(engine, phk_result, handle)?;
     }
 
-    if disposition_ptr != 0 {
-        write_guest_u32(engine, disposition_ptr, disposition)?;
+    if disposition_va != 0 {
+        write_guest_u32(engine, disposition_va, disposition)?;
     }
 
     return_status(engine, ERROR_SUCCESS)
@@ -346,12 +346,12 @@ fn handle_get_file_security(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     let sd = engine.read_r8()?;
     let len = engine.read_r9()? & 0xffff_ffff;
     let rsp = engine.read_rsp()?;
-    let needed_ptr = read_u64(
+    let needed_va = read_u64(
         engine,
         checked_address(rsp, 0x28, "GetFileSecurity length needed"),
     )?;
-    if needed_ptr != 0 {
-        write_guest_u32(engine, needed_ptr, FAKE_SD_NEED)?;
+    if needed_va != 0 {
+        write_guest_u32(engine, needed_va, FAKE_SD_NEED)?;
     }
     if sd != 0 && len >= u64::from(FAKE_SD_NEED) {
         // Zeroed SD stub.
@@ -389,29 +389,29 @@ pub fn handle_reg_query_value_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinAp
     let key = engine
         .read_rcx()
         .context("failed to read RCX for RegQueryValueExA")?;
-    let value_name_ptr = engine
+    let value_name_va = engine
         .read_rdx()
         .context("failed to read RDX for RegQueryValueExA")?;
     let _reserved = engine
         .read_r8()
         .context("failed to read R8 for RegQueryValueExA")?;
-    let type_ptr = engine
+    let type_va = engine
         .read_r9()
         .context("failed to read R9 for RegQueryValueExA")?;
     let rsp = engine
         .read_rsp()
         .context("failed to read RSP for RegQueryValueExA")?;
-    let data_ptr = read_u64(
+    let data_va = read_u64(
         engine,
         checked_address(rsp, 0x28, "RegQueryValueExA lpData"),
     )?;
-    let cb_ptr = read_u64(
+    let cb_va = read_u64(
         engine,
         checked_address(rsp, 0x30, "RegQueryValueExA lpcbData"),
     )?;
-    let value_name = read_optional_ansi_string(engine, value_name_ptr)?;
+    let value_name = read_optional_ansi_string(engine, value_name_va)?;
     let state = &mut *ctx.state;
-    query_registry_value(engine, state, key, &value_name, type_ptr, data_ptr, cb_ptr)
+    query_registry_value(engine, state, key, &value_name, type_va, data_va, cb_va)
 }
 
 /// Handles `ADVAPI32.dll!RegQueryValueExW`.
@@ -420,29 +420,29 @@ pub fn handle_reg_query_value_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinAp
     let key = engine
         .read_rcx()
         .context("failed to read RCX for RegQueryValueExW")?;
-    let value_name_ptr = engine
+    let value_name_va = engine
         .read_rdx()
         .context("failed to read RDX for RegQueryValueExW")?;
     let _reserved = engine
         .read_r8()
         .context("failed to read R8 for RegQueryValueExW")?;
-    let type_ptr = engine
+    let type_va = engine
         .read_r9()
         .context("failed to read R9 for RegQueryValueExW")?;
     let rsp = engine
         .read_rsp()
         .context("failed to read RSP for RegQueryValueExW")?;
-    let data_ptr = read_u64(
+    let data_va = read_u64(
         engine,
         checked_address(rsp, 0x28, "RegQueryValueExW lpData"),
     )?;
-    let cb_ptr = read_u64(
+    let cb_va = read_u64(
         engine,
         checked_address(rsp, 0x30, "RegQueryValueExW lpcbData"),
     )?;
-    let value_name = read_optional_utf16_string(engine, value_name_ptr)?;
+    let value_name = read_optional_utf16_string(engine, value_name_va)?;
     let state = &mut *ctx.state;
-    query_registry_value(engine, state, key, &value_name, type_ptr, data_ptr, cb_ptr)
+    query_registry_value(engine, state, key, &value_name, type_va, data_va, cb_va)
 }
 
 /// Shared `RegQueryValueEx` body — the A/W variants differ only in how the
@@ -458,9 +458,9 @@ fn query_registry_value(
     state: &mut WinApiState,
     key: u64,
     value_name: &str,
-    type_ptr: u64,
-    data_ptr: u64,
-    cb_ptr: u64,
+    type_va: u64,
+    data_va: u64,
+    cb_va: u64,
 ) -> Result<WinApiHandlerResult> {
     let Some(path) = registry_key_full_path(state, key) else {
         return return_status(engine, ERROR_INVALID_HANDLE);
@@ -470,23 +470,23 @@ fn query_registry_value(
     store.ensure_loaded(root.as_deref());
     let Some(value) = store.get_value(&path, value_name) else {
         // Real Windows zeroes *lpcbData when the value is missing.
-        if cb_ptr != 0 {
-            write_guest_u32(engine, cb_ptr, 0)?;
+        if cb_va != 0 {
+            write_guest_u32(engine, cb_va, 0)?;
         }
         return return_status(engine, ERROR_FILE_NOT_FOUND);
     };
-    if type_ptr != 0 {
-        write_guest_u32(engine, type_ptr, value.value_type)?;
+    if type_va != 0 {
+        write_guest_u32(engine, type_va, value.value_type)?;
     }
     let required = u32::try_from(value.data.len()).unwrap_or(u32::MAX);
-    if cb_ptr == 0 {
+    if cb_va == 0 {
         return return_status(engine, ERROR_SUCCESS);
     }
     let mut cb_buf = [0_u8; 4];
-    engine.mem_read(cb_ptr, &mut cb_buf)?;
+    engine.mem_read(cb_va, &mut cb_buf)?;
     let capacity = u32::from_le_bytes(cb_buf);
-    write_guest_u32(engine, cb_ptr, required)?;
-    if data_ptr == 0 {
+    write_guest_u32(engine, cb_va, required)?;
+    if data_va == 0 {
         // Size probe: the caller wants the required size, not the data.
         return return_status(engine, ERROR_SUCCESS);
     }
@@ -496,7 +496,7 @@ fn query_registry_value(
         return return_status(engine, ERROR_MORE_DATA);
     }
     if !value.data.is_empty() {
-        engine.mem_write(data_ptr, &value.data)?;
+        engine.mem_write(data_va, &value.data)?;
     }
     return_status(engine, ERROR_SUCCESS)
 }
@@ -507,7 +507,7 @@ pub fn handle_reg_set_value_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let key = engine
         .read_rcx()
         .context("failed to read RCX for RegSetValueExA")?;
-    let value_name_ptr = engine
+    let value_name_va = engine
         .read_rdx()
         .context("failed to read RDX for RegSetValueExA")?;
     let _reserved = engine
@@ -520,18 +520,16 @@ pub fn handle_reg_set_value_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let rsp = engine
         .read_rsp()
         .context("failed to read RSP for RegSetValueExA")?;
-    let data_ptr = read_u64(engine, checked_address(rsp, 0x28, "RegSetValueExA lpData"))?;
+    let data_va = read_u64(engine, checked_address(rsp, 0x28, "RegSetValueExA lpData"))?;
     let mut cb_buf = [0_u8; 4];
     engine.mem_read(
         checked_address(rsp, 0x30, "RegSetValueExA cbData"),
         &mut cb_buf,
     )?;
     let cb_data = u32::from_le_bytes(cb_buf);
-    let value_name = read_optional_ansi_string(engine, value_name_ptr)?;
+    let value_name = read_optional_ansi_string(engine, value_name_va)?;
     let state = &mut *ctx.state;
-    set_registry_value(
-        engine, state, key, value_name, value_type, data_ptr, cb_data,
-    )
+    set_registry_value(engine, state, key, value_name, value_type, data_va, cb_data)
 }
 
 /// Handles `ADVAPI32.dll!RegSetValueExW`.
@@ -540,7 +538,7 @@ pub fn handle_reg_set_value_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let key = engine
         .read_rcx()
         .context("failed to read RCX for RegSetValueExW")?;
-    let value_name_ptr = engine
+    let value_name_va = engine
         .read_rdx()
         .context("failed to read RDX for RegSetValueExW")?;
     let _reserved = engine
@@ -553,18 +551,16 @@ pub fn handle_reg_set_value_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let rsp = engine
         .read_rsp()
         .context("failed to read RSP for RegSetValueExW")?;
-    let data_ptr = read_u64(engine, checked_address(rsp, 0x28, "RegSetValueExW lpData"))?;
+    let data_va = read_u64(engine, checked_address(rsp, 0x28, "RegSetValueExW lpData"))?;
     let mut cb_buf = [0_u8; 4];
     engine.mem_read(
         checked_address(rsp, 0x30, "RegSetValueExW cbData"),
         &mut cb_buf,
     )?;
     let cb_data = u32::from_le_bytes(cb_buf);
-    let value_name = read_optional_utf16_string(engine, value_name_ptr)?;
+    let value_name = read_optional_utf16_string(engine, value_name_va)?;
     let state = &mut *ctx.state;
-    set_registry_value(
-        engine, state, key, value_name, value_type, data_ptr, cb_data,
-    )
+    set_registry_value(engine, state, key, value_name, value_type, data_va, cb_data)
 }
 
 /// Shared `RegSetValueEx` body — stores the raw bytes exactly as given
@@ -576,21 +572,21 @@ fn set_registry_value(
     key: u64,
     value_name: String,
     value_type: u32,
-    data_ptr: u64,
+    data_va: u64,
     cb_data: u32,
 ) -> Result<WinApiHandlerResult> {
     let Some(path) = registry_key_full_path(state, key) else {
         return return_status(engine, ERROR_INVALID_HANDLE);
     };
     let data_len = usize::try_from(cb_data).unwrap_or(0);
-    if data_len > 0 && data_ptr == 0 {
+    if data_len > 0 && data_va == 0 {
         return return_status(engine, ERROR_INVALID_PARAMETER);
     }
     let data = if data_len == 0 {
         Vec::new()
     } else {
         let mut buf = vec![0_u8; data_len];
-        engine.mem_read(data_ptr, &mut buf)?;
+        engine.mem_read(data_va, &mut buf)?;
         buf
     };
     let root = state.file_io.bottle_root.clone();
@@ -614,10 +610,10 @@ pub fn handle_reg_delete_value_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let key = engine
         .read_rcx()
         .context("failed to read RCX for RegDeleteValueA")?;
-    let value_name_ptr = engine
+    let value_name_va = engine
         .read_rdx()
         .context("failed to read RDX for RegDeleteValueA")?;
-    let value_name = read_optional_ansi_string(engine, value_name_ptr)?;
+    let value_name = read_optional_ansi_string(engine, value_name_va)?;
     let state = &mut *ctx.state;
     delete_registry_value(engine, state, key, &value_name)
 }
@@ -629,10 +625,10 @@ pub fn handle_reg_delete_value_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let key = engine
         .read_rcx()
         .context("failed to read RCX for RegDeleteValueW")?;
-    let value_name_ptr = engine
+    let value_name_va = engine
         .read_rdx()
         .context("failed to read RDX for RegDeleteValueW")?;
-    let value_name = read_optional_utf16_string(engine, value_name_ptr)?;
+    let value_name = read_optional_utf16_string(engine, value_name_va)?;
     let state = &mut *ctx.state;
     delete_registry_value(engine, state, key, &value_name)
 }
@@ -706,14 +702,14 @@ pub fn handle_initialize_security_descriptor(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let security_descriptor_ptr = engine
+    let security_descriptor_va = engine
         .read_rcx()
         .context("failed to read RCX for InitializeSecurityDescriptor")?;
 
-    if security_descriptor_ptr != 0 {
+    if security_descriptor_va != 0 {
         // Minimal SECURITY_DESCRIPTOR-like marker. Enough for code that only
         // expects the call to succeed.
-        write_guest_u32(engine, security_descriptor_ptr, 1)?;
+        write_guest_u32(engine, security_descriptor_va, 1)?;
     }
 
     ctx.finish(1)
@@ -724,20 +720,20 @@ pub fn handle_set_security_descriptor_dacl(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let security_descriptor_ptr = engine
+    let security_descriptor_va = engine
         .read_rcx()
         .context("failed to read RCX for SetSecurityDescriptorDacl")?;
     let _dacl_present = engine
         .read_rdx()
         .context("failed to read RDX for SetSecurityDescriptorDacl")?;
-    let _dacl_ptr = engine
+    let _dacl_va = engine
         .read_r8()
         .context("failed to read R8 for SetSecurityDescriptorDacl")?;
     let _dacl_defaulted = engine
         .read_r9()
         .context("failed to read R9 for SetSecurityDescriptorDacl")?;
 
-    let return_value = u64::from(security_descriptor_ptr != 0);
+    let return_value = u64::from(security_descriptor_va != 0);
 
     ctx.finish(return_value)
 }
@@ -749,7 +745,7 @@ fn handle_reg_enum_key_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     let hkey = engine.read_rcx()?;
     let index = engine.read_rdx()? & 0xffff_ffff;
     let name_buf = engine.read_r8()?;
-    let name_len_ptr = engine.read_r9()?;
+    let name_len_va = engine.read_r9()?;
     let rsp = engine.read_rsp()?;
     let _reserved = read_u64(engine, checked_address(rsp, 0x28, "lpReserved")).unwrap_or(0);
     let _class = read_u64(engine, checked_address(rsp, 0x30, "lpClass")).unwrap_or(0);
@@ -772,16 +768,16 @@ fn handle_reg_enum_key_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     let Some(name) = subkeys.get(idx) else {
         return return_status(engine, ERROR_NO_MORE_ITEMS);
     };
-    if name_buf == 0 || name_len_ptr == 0 {
+    if name_buf == 0 || name_len_va == 0 {
         return return_status(engine, ERROR_INVALID_PARAMETER);
     }
     let mut len_buf = [0_u8; 4];
-    engine.mem_read(name_len_ptr, &mut len_buf)?;
+    engine.mem_read(name_len_va, &mut len_buf)?;
     let buf_len = u32::from_le_bytes(len_buf);
     let units: Vec<u16> = name.encode_utf16().collect();
     let needed = u32::try_from(units.len()).unwrap_or(0);
     if needed >= buf_len {
-        write_guest_u32(engine, name_len_ptr, needed.saturating_add(1))?;
+        write_guest_u32(engine, name_len_va, needed.saturating_add(1))?;
         return return_status(engine, ERROR_INSUFFICIENT_BUFFER);
     }
     let mut bytes = Vec::with_capacity(units.len().saturating_mul(2).saturating_add(2));
@@ -790,7 +786,7 @@ fn handle_reg_enum_key_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     }
     bytes.extend_from_slice(&0_u16.to_le_bytes());
     engine.mem_write(name_buf, &bytes)?;
-    write_guest_u32(engine, name_len_ptr, needed)?;
+    write_guest_u32(engine, name_len_va, needed)?;
     return_status(engine, ERROR_SUCCESS)
 }
 
@@ -1043,13 +1039,13 @@ mod tests {
     fn run_set_value_w(
         engine: &mut IcedCpu,
         state: &mut WinApiState,
-        name_ptr: u64,
+        name_va: u64,
         value_type: u32,
-        data_ptr: u64,
+        data_va: u64,
         cb_data: u32,
     ) -> u64 {
-        write_regs(engine, NOTEPAD_KEY, name_ptr, 0, u64::from(value_type));
-        write_stack_args(engine, data_ptr, u64::from(cb_data));
+        write_regs(engine, NOTEPAD_KEY, name_va, 0, u64::from(value_type));
+        write_stack_args(engine, data_va, u64::from(cb_data));
         let r = handle_reg_set_value_ex_w(&mut HandlerContext::new(engine, test_env(), state))
             .expect("RegSetValueExW handler");
         r.return_value
@@ -1058,13 +1054,13 @@ mod tests {
     fn run_query_value_w(
         engine: &mut IcedCpu,
         state: &mut WinApiState,
-        name_ptr: u64,
-        type_ptr: u64,
-        data_ptr: u64,
-        cb_ptr: u64,
+        name_va: u64,
+        type_va: u64,
+        data_va: u64,
+        cb_va: u64,
     ) -> u64 {
-        write_regs(engine, NOTEPAD_KEY, name_ptr, 0, type_ptr);
-        write_stack_args(engine, data_ptr, cb_ptr);
+        write_regs(engine, NOTEPAD_KEY, name_va, 0, type_va);
+        write_stack_args(engine, data_va, cb_va);
         let r = handle_reg_query_value_ex_w(&mut HandlerContext::new(engine, test_env(), state))
             .expect("RegQueryValueExW handler");
         r.return_value
@@ -1087,38 +1083,31 @@ mod tests {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
         seed_notepad_key(&mut state);
-        let name_ptr = 0x5000;
-        write_utf16(&mut engine, name_ptr, "fWrap");
-        let data_ptr = 0x4200;
+        let name_va = 0x5000;
+        write_utf16(&mut engine, name_va, "fWrap");
+        let data_va = 0x4200;
         engine
-            .mem_write(data_ptr, &1_u32.to_le_bytes())
+            .mem_write(data_va, &1_u32.to_le_bytes())
             .expect("write dword value");
         assert_eq!(
-            run_set_value_w(&mut engine, &mut state, name_ptr, 4, data_ptr, 4),
+            run_set_value_w(&mut engine, &mut state, name_va, 4, data_va, 4),
             0
         );
 
         // Query with a 16-byte buffer: expect type + data + exact size back.
-        let type_ptr = 0x4300;
+        let type_va = 0x4300;
         let query_buf = 0x4400;
-        let cb_ptr = 0x4500;
+        let cb_va = 0x4500;
         engine
-            .mem_write(cb_ptr, &16_u32.to_le_bytes())
+            .mem_write(cb_va, &16_u32.to_le_bytes())
             .expect("write buffer capacity");
         assert_eq!(
-            run_query_value_w(
-                &mut engine,
-                &mut state,
-                name_ptr,
-                type_ptr,
-                query_buf,
-                cb_ptr
-            ),
+            run_query_value_w(&mut engine, &mut state, name_va, type_va, query_buf, cb_va),
             0 // ERROR_SUCCESS
         );
-        assert_eq!(read_u32_at(&mut engine, type_ptr), 4); // REG_DWORD
+        assert_eq!(read_u32_at(&mut engine, type_va), 4); // REG_DWORD
         assert_eq!(read_u32_at(&mut engine, query_buf), 1);
-        assert_eq!(read_u32_at(&mut engine, cb_ptr), 4); // required size, not capacity
+        assert_eq!(read_u32_at(&mut engine, cb_va), 4); // required size, not capacity
     }
 
     #[test]
@@ -1126,15 +1115,15 @@ mod tests {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
         seed_notepad_key(&mut state);
-        let name_ptr = 0x5000;
-        write_utf16(&mut engine, name_ptr, "noSuchValue");
-        let cb_ptr = 0x4500;
+        let name_va = 0x5000;
+        write_utf16(&mut engine, name_va, "noSuchValue");
+        let cb_va = 0x4500;
         engine
-            .mem_write(cb_ptr, &8_u32.to_le_bytes())
+            .mem_write(cb_va, &8_u32.to_le_bytes())
             .expect("write cbData");
-        let status = run_query_value_w(&mut engine, &mut state, name_ptr, 0, 0, cb_ptr);
+        let status = run_query_value_w(&mut engine, &mut state, name_va, 0, 0, cb_va);
         assert_eq!(status, 2); // ERROR_FILE_NOT_FOUND
-        assert_eq!(read_u32_at(&mut engine, cb_ptr), 0); // real Windows zeroes *lpcbData
+        assert_eq!(read_u32_at(&mut engine, cb_va), 0); // real Windows zeroes *lpcbData
     }
 
     #[test]
@@ -1142,20 +1131,20 @@ mod tests {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
         seed_notepad_key(&mut state);
-        let name_ptr = 0x5000;
-        write_utf16(&mut engine, name_ptr, "szHeader");
-        let data_ptr = 0x4200;
+        let name_va = 0x5000;
+        write_utf16(&mut engine, name_va, "szHeader");
+        let data_va = 0x4200;
         let stored = b"&f\0";
-        engine.mem_write(data_ptr, stored).expect("write sz value");
+        engine.mem_write(data_va, stored).expect("write sz value");
         assert_eq!(
-            run_set_value_w(&mut engine, &mut state, name_ptr, 1, data_ptr, 3),
+            run_set_value_w(&mut engine, &mut state, name_va, 1, data_va, 3),
             0
         );
         // Buffer of 2 bytes < stored 3 bytes.
         let query_buf = 0x4400;
-        let cb_ptr = 0x4500;
+        let cb_va = 0x4500;
         engine
-            .mem_write(cb_ptr, &2_u32.to_le_bytes())
+            .mem_write(cb_va, &2_u32.to_le_bytes())
             .expect("write small capacity");
         // Sentinel the guest buffer; real Windows must leave it untouched on
         // ERROR_MORE_DATA (it only reports the required size in *lpcbData).
@@ -1163,9 +1152,9 @@ mod tests {
         engine
             .mem_write(query_buf, &sentinel)
             .expect("write sentinel into query buffer");
-        let status = run_query_value_w(&mut engine, &mut state, name_ptr, 0, query_buf, cb_ptr);
+        let status = run_query_value_w(&mut engine, &mut state, name_va, 0, query_buf, cb_va);
         assert_eq!(status, 234); // ERROR_MORE_DATA
-        assert_eq!(read_u32_at(&mut engine, cb_ptr), 3); // required size
+        assert_eq!(read_u32_at(&mut engine, cb_va), 3); // required size
         assert_eq!(read_bytes_at(&mut engine, query_buf, 4), sentinel); // buffer untouched
     }
 
@@ -1174,23 +1163,23 @@ mod tests {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
         seed_notepad_key(&mut state);
-        let name_ptr = 0x5000;
-        write_utf16(&mut engine, name_ptr, "szTrailer");
-        let data_ptr = 0x4200;
+        let name_va = 0x5000;
+        write_utf16(&mut engine, name_va, "szTrailer");
+        let data_va = 0x4200;
         let stored = b"&t\0";
-        engine.mem_write(data_ptr, stored).expect("write sz value");
+        engine.mem_write(data_va, stored).expect("write sz value");
         assert_eq!(
-            run_set_value_w(&mut engine, &mut state, name_ptr, 1, data_ptr, 3),
+            run_set_value_w(&mut engine, &mut state, name_va, 1, data_va, 3),
             0
         );
         // lpData = NULL: sizing query returns success and the required size.
-        let cb_ptr = 0x4500;
+        let cb_va = 0x4500;
         engine
-            .mem_write(cb_ptr, &0_u32.to_le_bytes())
+            .mem_write(cb_va, &0_u32.to_le_bytes())
             .expect("write cbData");
-        let status = run_query_value_w(&mut engine, &mut state, name_ptr, 0, 0, cb_ptr);
+        let status = run_query_value_w(&mut engine, &mut state, name_va, 0, 0, cb_va);
         assert_eq!(status, 0); // ERROR_SUCCESS
-        assert_eq!(read_u32_at(&mut engine, cb_ptr), 3);
+        assert_eq!(read_u32_at(&mut engine, cb_va), 3);
     }
 
     #[test]
@@ -1198,15 +1187,15 @@ mod tests {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
         seed_notepad_key(&mut state);
-        let name_ptr = 0x5000;
-        write_ansi(&mut engine, name_ptr, "searchString");
-        let data_ptr = 0x4200;
+        let name_va = 0x5000;
+        write_ansi(&mut engine, name_va, "searchString");
+        let data_va = 0x4200;
         engine
-            .mem_write(data_ptr, b"notepad\0")
+            .mem_write(data_va, b"notepad\0")
             .expect("write ansi sz value");
         // RegSetValueExA(hKey, "searchString", 0, REG_SZ, data, 8)
-        write_regs(&mut engine, NOTEPAD_KEY, name_ptr, 0, u64::from(1_u32));
-        write_stack_args(&mut engine, data_ptr, 8);
+        write_regs(&mut engine, NOTEPAD_KEY, name_va, 0, u64::from(1_u32));
+        write_stack_args(&mut engine, data_va, 8);
         let r = handle_reg_set_value_ex_a(&mut HandlerContext::new(
             &mut engine,
             test_env(),
@@ -1216,26 +1205,20 @@ mod tests {
         assert_eq!(r.return_value, 0);
 
         // Query via W (value names are store-wide; encoding only affects the call).
-        let wname_ptr = 0x5100;
-        write_utf16(&mut engine, wname_ptr, "searchString");
-        let type_ptr = 0x4300;
+        let wname_va = 0x5100;
+        write_utf16(&mut engine, wname_va, "searchString");
+        let type_va = 0x4300;
         let query_buf = 0x4400;
-        let cb_ptr = 0x4500;
+        let cb_va = 0x4500;
         engine
-            .mem_write(cb_ptr, &64_u32.to_le_bytes())
+            .mem_write(cb_va, &64_u32.to_le_bytes())
             .expect("write capacity");
-        let status = run_query_value_w(
-            &mut engine,
-            &mut state,
-            wname_ptr,
-            type_ptr,
-            query_buf,
-            cb_ptr,
-        );
+        let status =
+            run_query_value_w(&mut engine, &mut state, wname_va, type_va, query_buf, cb_va);
         assert_eq!(status, 0);
-        assert_eq!(read_u32_at(&mut engine, type_ptr), 1); // REG_SZ
+        assert_eq!(read_u32_at(&mut engine, type_va), 1); // REG_SZ
         assert_eq!(read_bytes_at(&mut engine, query_buf, 8), b"notepad\0");
-        assert_eq!(read_u32_at(&mut engine, cb_ptr), 8); // includes the NUL
+        assert_eq!(read_u32_at(&mut engine, cb_va), 8); // includes the NUL
     }
 
     #[test]
@@ -1243,21 +1226,21 @@ mod tests {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
         seed_notepad_key(&mut state);
-        let name_ptr = 0x5000;
-        write_utf16(&mut engine, name_ptr, "fWrap");
-        let data_ptr = 0x4200;
+        let name_va = 0x5000;
+        write_utf16(&mut engine, name_va, "fWrap");
+        let data_va = 0x4200;
         engine
-            .mem_write(data_ptr, &1_u32.to_le_bytes())
+            .mem_write(data_va, &1_u32.to_le_bytes())
             .expect("write dword value");
         assert_eq!(
-            run_set_value_w(&mut engine, &mut state, name_ptr, 4, data_ptr, 4),
+            run_set_value_w(&mut engine, &mut state, name_va, 4, data_va, 4),
             0
         );
 
         // RegDeleteValueA takes an ANSI name; the set used a UTF-16 buffer.
-        let ansi_name_ptr = 0x5200;
-        write_ansi(&mut engine, ansi_name_ptr, "fWrap");
-        write_regs(&mut engine, NOTEPAD_KEY, ansi_name_ptr, 0, 0);
+        let ansi_name_va = 0x5200;
+        write_ansi(&mut engine, ansi_name_va, "fWrap");
+        write_regs(&mut engine, NOTEPAD_KEY, ansi_name_va, 0, 0);
         let r = handle_reg_delete_value_a(&mut HandlerContext::new(
             &mut engine,
             test_env(),
@@ -1280,15 +1263,15 @@ mod tests {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
         seed_notepad_key(&mut state);
-        let name_ptr = 0x5000;
-        write_utf16(&mut engine, name_ptr, "fWrap");
-        let data_ptr = 0x4200;
+        let name_va = 0x5000;
+        write_utf16(&mut engine, name_va, "fWrap");
+        let data_va = 0x4200;
         engine
-            .mem_write(data_ptr, &1_u32.to_le_bytes())
+            .mem_write(data_va, &1_u32.to_le_bytes())
             .expect("write dword value");
         // Handle 0x999 does not exist.
-        write_regs(&mut engine, 0x999, name_ptr, 0, u64::from(4_u32));
-        write_stack_args(&mut engine, data_ptr, 4);
+        write_regs(&mut engine, 0x999, name_va, 0, u64::from(4_u32));
+        write_stack_args(&mut engine, data_va, 4);
         let r = handle_reg_set_value_ex_w(&mut HandlerContext::new(
             &mut engine,
             test_env(),
@@ -1302,20 +1285,20 @@ mod tests {
     fn test_values_persist_across_sessions() {
         let root = std::env::temp_dir().join("wie_registry_test_advapi32");
         std::fs::remove_dir_all(&root).ok();
-        let name_ptr = 0x5000;
-        let data_ptr = 0x4200;
+        let name_va = 0x5000;
+        let data_va = 0x4200;
 
         // Session 1: set iWindowPosX = 300 and let go of the state.
         let mut engine = test_engine();
         let mut state = default_winapi_state();
         state.file_io.bottle_root = Some(root.clone());
         seed_notepad_key(&mut state);
-        write_utf16(&mut engine, name_ptr, "iWindowPosX");
+        write_utf16(&mut engine, name_va, "iWindowPosX");
         engine
-            .mem_write(data_ptr, &300_u32.to_le_bytes())
+            .mem_write(data_va, &300_u32.to_le_bytes())
             .expect("write dword value");
         assert_eq!(
-            run_set_value_w(&mut engine, &mut state, name_ptr, 4, data_ptr, 4),
+            run_set_value_w(&mut engine, &mut state, name_va, 4, data_va, 4),
             0
         );
         drop(state);
@@ -1325,25 +1308,18 @@ mod tests {
         let mut state = default_winapi_state();
         state.file_io.bottle_root = Some(root.clone());
         seed_notepad_key(&mut state);
-        write_utf16(&mut engine, name_ptr, "iWindowPosX");
-        let type_ptr = 0x4300;
+        write_utf16(&mut engine, name_va, "iWindowPosX");
+        let type_va = 0x4300;
         let query_buf = 0x4400;
-        let cb_ptr = 0x4500;
+        let cb_va = 0x4500;
         engine
-            .mem_write(cb_ptr, &64_u32.to_le_bytes())
+            .mem_write(cb_va, &64_u32.to_le_bytes())
             .expect("write capacity");
-        let status = run_query_value_w(
-            &mut engine,
-            &mut state,
-            name_ptr,
-            type_ptr,
-            query_buf,
-            cb_ptr,
-        );
+        let status = run_query_value_w(&mut engine, &mut state, name_va, type_va, query_buf, cb_va);
         assert_eq!(status, 0);
-        assert_eq!(read_u32_at(&mut engine, type_ptr), 4);
+        assert_eq!(read_u32_at(&mut engine, type_va), 4);
         assert_eq!(read_u32_at(&mut engine, query_buf), 300);
-        assert_eq!(read_u32_at(&mut engine, cb_ptr), 4);
+        assert_eq!(read_u32_at(&mut engine, cb_va), 4);
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1370,15 +1346,15 @@ mod tests {
             subkey: "Software\\Microsoft\\Notepad".into(),
         });
 
-        let name_ptr = 0x5000;
-        let data_ptr = 0x4200;
-        write_utf16(&mut engine, name_ptr, "fWrap");
+        let name_va = 0x5000;
+        let data_va = 0x4200;
+        write_utf16(&mut engine, name_va, "fWrap");
         engine
-            .mem_write(data_ptr, &1_u32.to_le_bytes())
+            .mem_write(data_va, &1_u32.to_le_bytes())
             .expect("write dword value");
         // Set through the nested handle.
-        write_regs(&mut engine, 0x201, name_ptr, 0, u64::from(4_u32));
-        write_stack_args(&mut engine, data_ptr, 4);
+        write_regs(&mut engine, 0x201, name_va, 0, u64::from(4_u32));
+        write_stack_args(&mut engine, data_va, 4);
         let r = handle_reg_set_value_ex_w(&mut HandlerContext::new(
             &mut engine,
             test_env(),
@@ -1388,14 +1364,14 @@ mod tests {
         assert_eq!(r.return_value, 0);
 
         // Query through the directly-opened handle: same path, same value.
-        let type_ptr = 0x4300;
+        let type_va = 0x4300;
         let query_buf = 0x4400;
-        let cb_ptr = 0x4500;
+        let cb_va = 0x4500;
         engine
-            .mem_write(cb_ptr, &64_u32.to_le_bytes())
+            .mem_write(cb_va, &64_u32.to_le_bytes())
             .expect("write capacity");
-        write_regs(&mut engine, 0x202, name_ptr, 0, type_ptr);
-        write_stack_args(&mut engine, query_buf, cb_ptr);
+        write_regs(&mut engine, 0x202, name_va, 0, type_va);
+        write_stack_args(&mut engine, query_buf, cb_va);
         let r = handle_reg_query_value_ex_w(&mut HandlerContext::new(
             &mut engine,
             test_env(),

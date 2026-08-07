@@ -248,11 +248,11 @@ fn p_wenviron_materializes_wide_env_from_host() {
     // Walk the NULL-terminated table; every entry must parse as KEY=VALUE.
     let mut entries: Vec<String> = Vec::new();
     for i in 0_u64..4096 {
-        let mut entry_ptr = [0_u8; 8];
+        let mut entry_va = [0_u8; 8];
         engine
-            .mem_read(table.wrapping_add(i.wrapping_mul(8)), &mut entry_ptr)
+            .mem_read(table.wrapping_add(i.wrapping_mul(8)), &mut entry_va)
             .expect("read entry pointer");
-        let ptr = u64::from_le_bytes(entry_ptr);
+        let ptr = u64::from_le_bytes(entry_va);
         if ptr == 0 {
             break; // NULL terminator ends the table.
         }

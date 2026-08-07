@@ -52,11 +52,11 @@ fn test_reg_enum_key_ex() {
         subkey: "Nested".into(),
     });
     let name_buf = 0x4000;
-    let name_len_ptr = 0x5000;
+    let name_len_va = 0x5000;
     let name_len: u32 = 32;
-    engine.mem_write(name_len_ptr, &name_len.to_le_bytes()).ok();
-    // RegEnumKeyExW(hKey=0x100, dwIndex=0, lpName=name_buf, lpcchName=name_len_ptr, ...)
-    write_regs(&mut engine, 0x100, 0, name_buf, name_len_ptr, STACK_TOP);
+    engine.mem_write(name_len_va, &name_len.to_le_bytes()).ok();
+    // RegEnumKeyExW(hKey=0x100, dwIndex=0, lpName=name_buf, lpcchName=name_len_va, ...)
+    write_regs(&mut engine, 0x100, 0, name_buf, name_len_va, STACK_TOP);
     let r = {
         let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
         advapi32::dispatch_advapi32_extra(&mut ctx, "RegEnumKeyExW")
@@ -65,7 +65,7 @@ fn test_reg_enum_key_ex() {
     .expect("handled");
     assert_eq!(r.return_value, 0); // ERROR_SUCCESS
     let mut len_out = [0_u8; 4];
-    engine.mem_read(name_len_ptr, &mut len_out).ok();
+    engine.mem_read(name_len_va, &mut len_out).ok();
     assert_eq!(u32::from_le_bytes(len_out), 6); // "Nested" length
 }
 
@@ -113,34 +113,34 @@ fn test_reg_open_key_w_opens_existing_key() {
         parent: HKEY_CURRENT_USER,
         subkey: "Software\\Microsoft\\Notepad".into(),
     });
-    let subkey_ptr = 0x5000;
-    let phk_ptr = 0x3000;
-    write_guest_utf16(&mut engine, subkey_ptr, "Software\\Microsoft\\Notepad");
+    let subkey_va = 0x5000;
+    let phk_va = 0x3000;
+    write_guest_utf16(&mut engine, subkey_va, "Software\\Microsoft\\Notepad");
     // Sentinel: a failed open must not leave stale data behind.
     engine
-        .mem_write(phk_ptr, &0xDEAD_BEEF_u64.to_le_bytes())
+        .mem_write(phk_va, &0xDEAD_BEEF_u64.to_le_bytes())
         .expect("write sentinel phkResult");
-    // RegOpenKeyW(hKey=HKCU, lpSubKey=subkey_ptr, phkResult=phk_ptr)
-    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_ptr, phk_ptr, 0, 0);
+    // RegOpenKeyW(hKey=HKCU, lpSubKey=subkey_va, phkResult=phk_va)
+    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_va, phk_va, 0, 0);
     let status = reg_open_key("advapi32.dll", "RegOpenKeyW", &mut state, &mut engine);
     assert_eq!(status, 0); // ERROR_SUCCESS
-    assert_eq!(read_guest_handle(&mut engine, phk_ptr), 0x100);
+    assert_eq!(read_guest_handle(&mut engine, phk_va), 0x100);
 }
 
 #[test]
 fn test_reg_open_key_w_missing_returns_file_not_found() {
     let mut engine = test_engine();
     let mut state = default_winapi_state();
-    let subkey_ptr = 0x5000;
-    let phk_ptr = 0x3000;
-    write_guest_utf16(&mut engine, subkey_ptr, "Software\\Microsoft\\Notepad");
+    let subkey_va = 0x5000;
+    let phk_va = 0x3000;
+    write_guest_utf16(&mut engine, subkey_va, "Software\\Microsoft\\Notepad");
     engine
-        .mem_write(phk_ptr, &0xDEAD_BEEF_u64.to_le_bytes())
+        .mem_write(phk_va, &0xDEAD_BEEF_u64.to_le_bytes())
         .expect("write sentinel phkResult");
-    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_ptr, phk_ptr, 0, 0);
+    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_va, phk_va, 0, 0);
     let status = reg_open_key("advapi32.dll", "RegOpenKeyW", &mut state, &mut engine);
     assert_eq!(status, 2); // ERROR_FILE_NOT_FOUND
-    assert_eq!(read_guest_handle(&mut engine, phk_ptr), 0);
+    assert_eq!(read_guest_handle(&mut engine, phk_va), 0);
     // Open-only: the missing key must not be materialized by the legacy pair.
     assert!(state.process.registry_keys.is_empty());
 }
@@ -154,28 +154,28 @@ fn test_reg_open_key_a_matches_w() {
         parent: HKEY_CURRENT_USER,
         subkey: "Software\\Microsoft\\Notepad".into(),
     });
-    let subkey_ptr = 0x5000;
-    let phk_ptr = 0x3000;
-    write_guest_ansi(&mut engine, subkey_ptr, "Software\\Microsoft\\Notepad");
+    let subkey_va = 0x5000;
+    let phk_va = 0x3000;
+    write_guest_ansi(&mut engine, subkey_va, "Software\\Microsoft\\Notepad");
     engine
-        .mem_write(phk_ptr, &0xDEAD_BEEF_u64.to_le_bytes())
+        .mem_write(phk_va, &0xDEAD_BEEF_u64.to_le_bytes())
         .expect("write sentinel phkResult");
-    // RegOpenKeyA(hKey=HKCU, lpSubKey=subkey_ptr, phkResult=phk_ptr)
-    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_ptr, phk_ptr, 0, 0);
+    // RegOpenKeyA(hKey=HKCU, lpSubKey=subkey_va, phkResult=phk_va)
+    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_va, phk_va, 0, 0);
     let status = reg_open_key("advapi32.dll", "RegOpenKeyA", &mut state, &mut engine);
     assert_eq!(status, 0); // ERROR_SUCCESS
-    assert_eq!(read_guest_handle(&mut engine, phk_ptr), 0x100);
+    assert_eq!(read_guest_handle(&mut engine, phk_va), 0x100);
     // ANSI missing path mirrors the W variant.
-    let missing_ptr = 0x5000;
+    let missing_va = 0x5000;
     let missing_phk = 0x3100;
-    write_guest_ansi(&mut engine, missing_ptr, "Software\\Missing");
+    write_guest_ansi(&mut engine, missing_va, "Software\\Missing");
     engine
         .mem_write(missing_phk, &0xDEAD_BEEF_u64.to_le_bytes())
         .expect("write sentinel phkResult");
     write_regs(
         &mut engine,
         HKEY_CURRENT_USER,
-        missing_ptr,
+        missing_va,
         missing_phk,
         0,
         0,
@@ -192,32 +192,32 @@ fn test_reg_open_key_a_matches_w() {
 fn test_reg_open_key_ex_a_missing_returns_file_not_found_and_does_not_create() {
     let mut engine = test_engine();
     let mut state = default_winapi_state();
-    let subkey_ptr = 0x5000;
-    let phk_ptr = 0x3000;
-    write_guest_ansi(&mut engine, subkey_ptr, "Software\\Missing\\Key");
+    let subkey_va = 0x5000;
+    let phk_va = 0x3000;
+    write_guest_ansi(&mut engine, subkey_va, "Software\\Missing\\Key");
     // RegOpenKeyExA passes phkResult in the 5th stack slot: [rsp+0x30].
     engine
-        .mem_write(STACK_TOP + 0x30, &u64::to_le_bytes(phk_ptr))
+        .mem_write(STACK_TOP + 0x30, &u64::to_le_bytes(phk_va))
         .expect("write phkResult arg");
     engine
-        .mem_write(phk_ptr, &0xDEAD_BEEF_u64.to_le_bytes())
+        .mem_write(phk_va, &0xDEAD_BEEF_u64.to_le_bytes())
         .expect("write sentinel phkResult");
-    // RegOpenKeyExA(hKey=HKCU, lpSubKey=subkey_ptr, ulOptions=0, samDesired=0, phkResult=[rsp+0x30])
-    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_ptr, 0, 0, 0);
+    // RegOpenKeyExA(hKey=HKCU, lpSubKey=subkey_va, ulOptions=0, samDesired=0, phkResult=[rsp+0x30])
+    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_va, 0, 0, 0);
     let status = reg_open_key("advapi32.dll", "RegOpenKeyExA", &mut state, &mut engine);
     assert_eq!(status, 2); // ERROR_FILE_NOT_FOUND
-    assert_eq!(read_guest_handle(&mut engine, phk_ptr), 0);
+    assert_eq!(read_guest_handle(&mut engine, phk_va), 0);
     // The key must not be materialized: a second open on the same path fails
     // identically (and again zeroes the output handle).
     assert!(state.process.registry_keys.is_empty());
     engine
-        .mem_write(phk_ptr, &0xDEAD_BEEF_u64.to_le_bytes())
+        .mem_write(phk_va, &0xDEAD_BEEF_u64.to_le_bytes())
         .expect("write sentinel phkResult");
     // Re-arm the registers: the first dispatch clobbers them on return.
-    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_ptr, 0, 0, 0);
+    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_va, 0, 0, 0);
     let status = reg_open_key("advapi32.dll", "RegOpenKeyExA", &mut state, &mut engine);
     assert_eq!(status, 2); // ERROR_FILE_NOT_FOUND
-    assert_eq!(read_guest_handle(&mut engine, phk_ptr), 0);
+    assert_eq!(read_guest_handle(&mut engine, phk_va), 0);
     assert!(state.process.registry_keys.is_empty());
 }
 
@@ -227,16 +227,16 @@ fn test_reg_open_key_ex_a_missing_returns_file_not_found_and_does_not_create() {
 fn test_reg_open_key_ex_w_missing_returns_file_not_found() {
     let mut engine = test_engine();
     let mut state = default_winapi_state();
-    let subkey_ptr = 0x5000;
-    let phk_ptr = 0x3000;
-    write_guest_utf16(&mut engine, subkey_ptr, "Software\\Missing\\Key");
+    let subkey_va = 0x5000;
+    let phk_va = 0x3000;
+    write_guest_utf16(&mut engine, subkey_va, "Software\\Missing\\Key");
     engine
-        .mem_write(STACK_TOP + 0x30, &u64::to_le_bytes(phk_ptr))
+        .mem_write(STACK_TOP + 0x30, &u64::to_le_bytes(phk_va))
         .expect("write phkResult arg");
     engine
-        .mem_write(phk_ptr, &0xDEAD_BEEF_u64.to_le_bytes())
+        .mem_write(phk_va, &0xDEAD_BEEF_u64.to_le_bytes())
         .expect("write sentinel phkResult");
-    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_ptr, 0, 0, 0);
+    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_va, 0, 0, 0);
     let r = {
         let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
         advapi32::dispatch_advapi32_extra(&mut ctx, "RegOpenKeyExW")
@@ -244,7 +244,7 @@ fn test_reg_open_key_ex_w_missing_returns_file_not_found() {
     .expect("dispatch")
     .expect("handled");
     assert_eq!(r.return_value, 2); // ERROR_FILE_NOT_FOUND
-    assert_eq!(read_guest_handle(&mut engine, phk_ptr), 0);
+    assert_eq!(read_guest_handle(&mut engine, phk_va), 0);
     assert!(state.process.registry_keys.is_empty());
 }
 
@@ -258,19 +258,19 @@ fn test_reg_open_key_ex_a_opens_existing_key() {
         parent: HKEY_CURRENT_USER,
         subkey: "Software\\Microsoft\\Notepad".into(),
     });
-    let subkey_ptr = 0x5000;
-    let phk_ptr = 0x3000;
-    write_guest_ansi(&mut engine, subkey_ptr, "Software\\Microsoft\\Notepad");
+    let subkey_va = 0x5000;
+    let phk_va = 0x3000;
+    write_guest_ansi(&mut engine, subkey_va, "Software\\Microsoft\\Notepad");
     engine
-        .mem_write(STACK_TOP + 0x30, &u64::to_le_bytes(phk_ptr))
+        .mem_write(STACK_TOP + 0x30, &u64::to_le_bytes(phk_va))
         .expect("write phkResult arg");
     engine
-        .mem_write(phk_ptr, &0xDEAD_BEEF_u64.to_le_bytes())
+        .mem_write(phk_va, &0xDEAD_BEEF_u64.to_le_bytes())
         .expect("write sentinel phkResult");
-    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_ptr, 0, 0, 0);
+    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_va, 0, 0, 0);
     let status = reg_open_key("advapi32.dll", "RegOpenKeyExA", &mut state, &mut engine);
     assert_eq!(status, 0); // ERROR_SUCCESS
-    assert_eq!(read_guest_handle(&mut engine, phk_ptr), 0x100);
+    assert_eq!(read_guest_handle(&mut engine, phk_va), 0x100);
 }
 
 /// `RegCreateKeyExA` is the ONLY entry point allowed to create: the same
@@ -287,24 +287,24 @@ fn test_reg_create_key_ex_a_creates_missing_key() {
         subkey: "Software\\Existing".into(),
     });
     state.process.next_registry_key_handle = crate::RegistryKeyHandle::from(0x101);
-    let subkey_ptr = 0x5000;
-    let phk_ptr = 0x3000;
-    let disposition_ptr = 0x3100;
-    write_guest_ansi(&mut engine, subkey_ptr, "Software\\Missing\\Key");
+    let subkey_va = 0x5000;
+    let phk_va = 0x3000;
+    let disposition_va = 0x3100;
+    write_guest_ansi(&mut engine, subkey_va, "Software\\Missing\\Key");
     // RegCreateKeyExA passes phkResult at [rsp+0x40] and lpdwDisposition at [rsp+0x48].
     engine
-        .mem_write(STACK_TOP + 0x40, &u64::to_le_bytes(phk_ptr))
+        .mem_write(STACK_TOP + 0x40, &u64::to_le_bytes(phk_va))
         .expect("write phkResult arg");
     engine
-        .mem_write(STACK_TOP + 0x48, &u64::to_le_bytes(disposition_ptr))
+        .mem_write(STACK_TOP + 0x48, &u64::to_le_bytes(disposition_va))
         .expect("write lpdwDisposition arg");
-    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_ptr, 0, 0, 0);
+    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_va, 0, 0, 0);
     let status = reg_open_key("advapi32.dll", "RegCreateKeyExA", &mut state, &mut engine);
     assert_eq!(status, 0); // ERROR_SUCCESS
-    assert_eq!(read_guest_handle(&mut engine, phk_ptr), 0x101);
+    assert_eq!(read_guest_handle(&mut engine, phk_va), 0x101);
     let mut disp = [0_u8; 4];
     engine
-        .mem_read(disposition_ptr, &mut disp)
+        .mem_read(disposition_va, &mut disp)
         .expect("read disposition");
     assert_eq!(u32::from_le_bytes(disp), 1); // REG_CREATED_NEW_KEY
     // The previously-missing path now opens with the created handle.
@@ -315,7 +315,7 @@ fn test_reg_create_key_ex_a_creates_missing_key() {
     engine
         .mem_write(open_phk, &0xDEAD_BEEF_u64.to_le_bytes())
         .expect("write sentinel phkResult");
-    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_ptr, 0, 0, 0);
+    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_va, 0, 0, 0);
     let status = reg_open_key("advapi32.dll", "RegOpenKeyExA", &mut state, &mut engine);
     assert_eq!(status, 0); // ERROR_SUCCESS
     assert_eq!(read_guest_handle(&mut engine, open_phk), 0x101);
@@ -332,17 +332,17 @@ fn test_reg_create_key_ex_w_creates_missing_key() {
         subkey: "Software\\Existing".into(),
     });
     state.process.next_registry_key_handle = crate::RegistryKeyHandle::from(0x101);
-    let subkey_ptr = 0x5000;
-    let phk_ptr = 0x3000;
-    let disposition_ptr = 0x3100;
-    write_guest_utf16(&mut engine, subkey_ptr, "Software\\Missing\\Key");
+    let subkey_va = 0x5000;
+    let phk_va = 0x3000;
+    let disposition_va = 0x3100;
+    write_guest_utf16(&mut engine, subkey_va, "Software\\Missing\\Key");
     engine
-        .mem_write(STACK_TOP + 0x40, &u64::to_le_bytes(phk_ptr))
+        .mem_write(STACK_TOP + 0x40, &u64::to_le_bytes(phk_va))
         .expect("write phkResult arg");
     engine
-        .mem_write(STACK_TOP + 0x48, &u64::to_le_bytes(disposition_ptr))
+        .mem_write(STACK_TOP + 0x48, &u64::to_le_bytes(disposition_va))
         .expect("write lpdwDisposition arg");
-    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_ptr, 0, 0, 0);
+    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_va, 0, 0, 0);
     let r = {
         let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
         advapi32::dispatch_advapi32_extra(&mut ctx, "RegCreateKeyExW")
@@ -350,10 +350,10 @@ fn test_reg_create_key_ex_w_creates_missing_key() {
     .expect("dispatch")
     .expect("handled");
     assert_eq!(r.return_value, 0); // ERROR_SUCCESS
-    assert_eq!(read_guest_handle(&mut engine, phk_ptr), 0x101);
+    assert_eq!(read_guest_handle(&mut engine, phk_va), 0x101);
     let mut disp = [0_u8; 4];
     engine
-        .mem_read(disposition_ptr, &mut disp)
+        .mem_read(disposition_va, &mut disp)
         .expect("read disposition");
     assert_eq!(u32::from_le_bytes(disp), 1); // REG_CREATED_NEW_KEY
 }

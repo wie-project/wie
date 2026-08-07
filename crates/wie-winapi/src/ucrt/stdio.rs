@@ -143,13 +143,13 @@ pub(crate) fn handle_stdio_common_vfprintf(
     let (out, is_stderr) = {
         let engine = &mut *ctx.engine;
         let _options = engine.read_rcx()?;
-        let file_ptr = engine.read_rdx()?; // FILE* (0=stdin, 1=stdout, 2=stderr)
-        let fmt_ptr = engine.read_r8()?;
+        let file_va = engine.read_rdx()?; // FILE* (0=stdin, 1=stdout, 2=stderr)
+        let fmt_va = engine.read_r8()?;
         let _locale = engine.read_r9()?;
-        if fmt_ptr == 0 {
+        if fmt_va == 0 {
             return finish(engine, 0);
         }
-        let fmt = read_guest_str(engine, fmt_ptr, 4096)?;
+        let fmt = read_guest_str(engine, fmt_va, 4096)?;
         let rsp = engine.read_rsp()?;
         let mut va = read_u64(engine, rsp.wrapping_add(0x28)).unwrap_or(0);
 
@@ -216,7 +216,7 @@ pub(crate) fn handle_stdio_common_vfprintf(
             }
             i += 1;
         }
-        (out, file_ptr == 2)
+        (out, file_va == 2)
     };
     // Engine borrow is dropped — now we can use ctx.
     if is_stderr {
@@ -247,11 +247,11 @@ pub(crate) fn handle_stdio_common_vsprintf(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let buf = engine.read_rdx()?;
-    let fmt_ptr = engine.read_r9()?;
-    if buf == 0 || fmt_ptr == 0 {
+    let fmt_va = engine.read_r9()?;
+    if buf == 0 || fmt_va == 0 {
         return finish(engine, 0);
     }
-    let fmt = read_guest_str(engine, fmt_ptr, 4096)?;
+    let fmt = read_guest_str(engine, fmt_va, 4096)?;
     let rsp = engine.read_rsp()?;
     let mut va = read_u64(engine, rsp.wrapping_add(0x30)).unwrap_or(0);
 
@@ -340,13 +340,13 @@ pub(crate) fn handle_stdio_common_vsscanf(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let src_ptr = engine.read_rdx()?;
-    let fmt_ptr = engine.read_r9()?;
-    if src_ptr == 0 || fmt_ptr == 0 {
+    let src_va = engine.read_rdx()?;
+    let fmt_va = engine.read_r9()?;
+    if src_va == 0 || fmt_va == 0 {
         return finish(engine, 0);
     }
-    let src = read_guest_str(engine, src_ptr, 4096)?;
-    let fmt = read_guest_str(engine, fmt_ptr, 4096)?;
+    let src = read_guest_str(engine, src_va, 4096)?;
+    let fmt = read_guest_str(engine, fmt_va, 4096)?;
     let rsp = engine.read_rsp()?;
     let mut va = read_u64(engine, rsp.wrapping_add(0x30)).unwrap_or(0);
     let sb = src.as_bytes();
@@ -430,11 +430,11 @@ pub(crate) fn handle_stdio_common_vfscanf(
 ) -> Result<WinApiHandlerResult> {
     ctx.state.flush_console();
     let engine = &mut *ctx.engine;
-    let fmt_ptr = engine.read_r8()?;
-    if fmt_ptr == 0 {
+    let fmt_va = engine.read_r8()?;
+    if fmt_va == 0 {
         return finish(engine, 0);
     }
-    let fmt = read_guest_str(engine, fmt_ptr, 4096)?;
+    let fmt = read_guest_str(engine, fmt_va, 4096)?;
     let rsp = engine.read_rsp()?;
     let mut va = read_u64(engine, rsp.wrapping_add(0x28)).unwrap_or(0);
     let fb = fmt.as_bytes();

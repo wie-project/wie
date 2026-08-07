@@ -101,10 +101,10 @@ fn handle_get_file_title_impl(
     api_name: &str,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let file_ptr = engine
+    let file_va = engine
         .read_rcx()
         .with_context(|| format!("failed to read RCX for {api_name}"))?;
-    let title_ptr = engine
+    let title_va = engine
         .read_rdx()
         .with_context(|| format!("failed to read RDX for {api_name}"))?;
     let cch_raw = engine
@@ -113,16 +113,16 @@ fn handle_get_file_title_impl(
     // cchTitle is a WORD (u16); clamp oversized guest values defensively.
     let cch_title = usize::from(u16::try_from(cch_raw).unwrap_or(u16::MAX));
 
-    let return_value = if title_ptr == 0 {
+    let return_value = if title_va == 0 {
         // Real GetFileTitle treats a NULL title buffer as an invalid parameter.
         tracing::warn!(api = api_name, "GetFileTitle called with NULL title buffer");
         GET_FILE_TITLE_ERR_INVALID
     } else {
         let path = if unicode {
-            read_utf16_lossy(engine, file_ptr, GET_FILE_TITLE_MAX_PATH)
+            read_utf16_lossy(engine, file_va, GET_FILE_TITLE_MAX_PATH)
                 .with_context(|| format!("failed to read {api_name} path"))?
         } else {
-            read_ansi_lossy(engine, file_ptr, GET_FILE_TITLE_MAX_PATH)
+            read_ansi_lossy(engine, file_va, GET_FILE_TITLE_MAX_PATH)
                 .with_context(|| format!("failed to read {api_name} path"))?
         };
 
@@ -140,9 +140,9 @@ fn handle_get_file_title_impl(
             // form as an invalid file name; an empty path succeeds with an
             // empty title. The buffer is NUL-terminated either way.
             if unicode {
-                write_utf16_c_string(engine, title_ptr, cch_title, "")?;
+                write_utf16_c_string(engine, title_va, cch_title, "")?;
             } else {
-                write_ansi_c_string(engine, title_ptr, cch_title, "")?;
+                write_ansi_c_string(engine, title_va, cch_title, "")?;
             }
             if path.is_empty() {
                 0
@@ -150,7 +150,7 @@ fn handle_get_file_title_impl(
                 GET_FILE_TITLE_ERR_INVALID
             }
         } else {
-            write_get_file_title(engine, title_ptr, cch_title, basename, unicode)?
+            write_get_file_title(engine, title_va, cch_title, basename, unicode)?
         }
     };
 
@@ -164,7 +164,7 @@ fn handle_get_file_title_impl(
 /// W variant, bytes for the A variant (A buffers are byte-counted).
 fn write_get_file_title(
     engine: &mut dyn wie_cpu::CpuEngine,
-    title_ptr: u64,
+    title_va: u64,
     cch_title: usize,
     basename: &str,
     unicode: bool,
@@ -185,9 +185,9 @@ fn write_get_file_title(
         // buffer even when the char-aligned prefix is longer than the cap.
         let truncated: String = basename.chars().take(cch_title.saturating_sub(1)).collect();
         if unicode {
-            write_utf16_c_string(engine, title_ptr, cch_title, &truncated)?;
+            write_utf16_c_string(engine, title_va, cch_title, &truncated)?;
         } else {
-            write_ansi_c_string(engine, title_ptr, cch_title, &truncated)?;
+            write_ansi_c_string(engine, title_va, cch_title, &truncated)?;
         }
         // Two's-complement of the required size in the low 32 bits (EAX) so
         // the guest sees the negative int return.
@@ -196,9 +196,9 @@ fn write_get_file_title(
         Ok(u64::from(0_u32.wrapping_sub(required_u32)))
     } else {
         if unicode {
-            write_utf16_c_string(engine, title_ptr, cch_title, basename)?;
+            write_utf16_c_string(engine, title_va, cch_title, basename)?;
         } else {
-            write_ansi_c_string(engine, title_ptr, cch_title, basename)?;
+            write_ansi_c_string(engine, title_va, cch_title, basename)?;
         }
         Ok(0)
     }
@@ -210,11 +210,11 @@ fn handle_get_file_name(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let ofn_ptr = engine
+    let ofn_va = engine
         .read_rcx()
         .with_context(|| format!("failed to read RCX for {api_name}"))?;
 
-    if ofn_ptr == 0 {
+    if ofn_va == 0 {
         state.window_state().comm_dlg_extended_error = CDERR_NONE;
         return ctx.finish(0);
     }
@@ -222,21 +222,21 @@ fn handle_get_file_name(
     // One typed read for the whole OPENFILENAME (the four buffer fields the
     // policy and interactive flows write through); the layout + offsets live
     // in `crate::guest_layout::OpenFileName`.
-    let ofn = with_typed_read::<OpenFileName, _, _>(engine, ofn_ptr, |ofn| Ok(*ofn))
+    let ofn = with_typed_read::<OpenFileName, _, _>(engine, ofn_va, |ofn| Ok(*ofn))
         .with_context(|| format!("failed to read OPENFILENAME for {api_name}"))?;
-    let file_buffer_ptr = ofn.lpstr_file;
+    let file_buffer_va = ofn.lpstr_file;
     let max_file = ofn.n_max_file;
-    let file_title_ptr = ofn.lpstr_file_title;
+    let file_title_va = ofn.lpstr_file_title;
     let max_file_title = ofn.n_max_file_title;
 
     // Clone the policy to avoid borrowing state.window_state() across
     // mutable accesses inside the match arms.
     let policy = state.window_state().file_dialog_policy.clone();
     let buffer = OfnBuffer {
-        ofn_ptr,
-        file_buffer_ptr,
+        ofn_ptr: ofn_va,
+        file_buffer_ptr: file_buffer_va,
         max_file,
-        file_title_ptr,
+        file_title_ptr: file_title_va,
         max_file_title,
     };
     let return_value = match policy {
@@ -545,10 +545,10 @@ fn open_host_file_dialog(
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let OfnBuffer {
-        ofn_ptr,
-        file_buffer_ptr,
+        ofn_ptr: ofn_va,
+        file_buffer_ptr: file_buffer_va,
         max_file,
-        file_title_ptr,
+        file_title_ptr: file_title_va,
         max_file_title,
     } = *buffer;
 
@@ -565,15 +565,15 @@ fn open_host_file_dialog(
         return ctx.finish(0);
     }
 
-    let ofn = with_typed_read::<OpenFileName, _, _>(engine, ofn_ptr, |ofn| Ok(*ofn))
+    let ofn = with_typed_read::<OpenFileName, _, _>(engine, ofn_va, |ofn| Ok(*ofn))
         .with_context(|| format!("failed to read OPENFILENAME for {api_name}"))?;
     let owner_raw = ofn.hwnd_owner;
-    let initial_dir_ptr = ofn.lpstr_initial_dir;
-    let def_ext_ptr = ofn.lpstr_def_ext;
+    let initial_dir_va = ofn.lpstr_initial_dir;
+    let def_ext_va = ofn.lpstr_def_ext;
 
-    let initial_file = read_ofn_string(engine, file_buffer_ptr, unicode, api_name)?;
-    let caller_initial_dir = if initial_dir_ptr != 0 {
-        read_ofn_string(engine, initial_dir_ptr, unicode, api_name)?
+    let initial_file = read_ofn_string(engine, file_buffer_va, unicode, api_name)?;
+    let caller_initial_dir = if initial_dir_va != 0 {
+        read_ofn_string(engine, initial_dir_va, unicode, api_name)?
     } else {
         String::new()
     };
@@ -585,8 +585,8 @@ fn open_host_file_dialog(
         &caller_initial_dir,
         directory_of(&initial_file),
     );
-    let default_extension = if def_ext_ptr != 0 {
-        Some(read_ofn_string(engine, def_ext_ptr, unicode, api_name)?)
+    let default_extension = if def_ext_va != 0 {
+        Some(read_ofn_string(engine, def_ext_va, unicode, api_name)?)
     } else {
         None
     };
@@ -744,10 +744,10 @@ fn open_host_file_dialog(
     state.window_state().file_dialog = Some(FileDialogSession {
         dialog_hwnd,
         edit_hwnd,
-        ofn_ptr,
-        file_buffer_ptr,
+        ofn_ptr: ofn_va,
+        file_buffer_ptr: file_buffer_va,
         max_file,
-        file_title_ptr,
+        file_title_ptr: file_title_va,
         max_file_title,
         unicode,
         initial_dir,
@@ -838,7 +838,7 @@ fn open_host_file_dialog_via_bridge(
     let initial_file = read_ofn_string(engine, buffer.file_buffer_ptr, unicode, api_name)?;
     let ofn = with_typed_read::<OpenFileName, _, _>(engine, buffer.ofn_ptr, |ofn| Ok(*ofn))
         .with_context(|| format!("failed to read OPENFILENAME for {api_name}"))?;
-    let filter_ptr = ofn.lpstr_filter;
+    let filter_va = ofn.lpstr_filter;
 
     // The native panel starts at the BOTTLE ROOT (`{root}/drive_c`) — the
     // user asked for the bottle root, not the guest cwd (the process
@@ -853,9 +853,9 @@ fn open_host_file_dialog_via_bridge(
         .as_ref()
         .map(|root| root.join("drive_c"))
         .or_else(|| {
-            let initial_dir_ptr = ofn.lpstr_initial_dir;
-            let caller_initial_dir = if initial_dir_ptr != 0 {
-                read_ofn_string(engine, initial_dir_ptr, unicode, api_name).unwrap_or_default()
+            let initial_dir_va = ofn.lpstr_initial_dir;
+            let caller_initial_dir = if initial_dir_va != 0 {
+                read_ofn_string(engine, initial_dir_va, unicode, api_name).unwrap_or_default()
             } else {
                 String::new()
             };
@@ -873,8 +873,8 @@ fn open_host_file_dialog_via_bridge(
         (!basename.is_empty()).then(|| basename.to_owned())
     };
     let is_save = api_name.contains("Save");
-    let filters = if filter_ptr != 0 {
-        let components = read_ofn_filter_components(engine, filter_ptr, unicode)?;
+    let filters = if filter_va != 0 {
+        let components = read_ofn_filter_components(engine, filter_va, unicode)?;
         parse_ofn_filter(&components)
     } else {
         Vec::new()

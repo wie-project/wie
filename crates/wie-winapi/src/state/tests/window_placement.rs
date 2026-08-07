@@ -62,9 +62,9 @@ fn dispatch_set_window_placement(
     engine: &mut IcedCpu,
     state: &mut WinApiState,
     hwnd: u64,
-    placement_ptr: u64,
+    placement_va: u64,
 ) -> u64 {
-    write_regs(engine, hwnd, placement_ptr, 0, 0, 0);
+    write_regs(engine, hwnd, placement_va, 0, 0, 0);
     let id = crate::resolve_winapi_id("user32.dll", "SetWindowPlacement")
         .expect("SetWindowPlacement must resolve to a WinApiId");
     let r = crate::dispatch_winapi_id(
@@ -81,8 +81,8 @@ fn test_get_window_placement_fills_struct() {
     let mut engine = test_engine();
     let mut state = default_winapi_state();
     let hwnd = push_geometry_window(&mut state);
-    let placement_ptr = 0x4000_u64;
-    write_regs(&mut engine, hwnd, placement_ptr, 0, 0, 0);
+    let placement_va = 0x4000_u64;
+    write_regs(&mut engine, hwnd, placement_va, 0, 0, 0);
     let id = crate::resolve_winapi_id("user32.dll", "GetWindowPlacement")
         .expect("GetWindowPlacement must resolve to a WinApiId");
     let r = crate::dispatch_winapi_id(
@@ -95,37 +95,37 @@ fn test_get_window_placement_fills_struct() {
     // WINDOWPLACEMENT (x64): UINT length @0, UINT flags @4, UINT showCmd @8,
     // POINT ptMinPosition @12, POINT ptMaxPosition @20, RECT rcNormalPosition @28.
     assert_eq!(
-        read_test_u32(&mut engine, placement_ptr),
+        read_test_u32(&mut engine, placement_va),
         user32::WINDOWPLACEMENT_LENGTH,
         "length must be sizeof(WINDOWPLACEMENT)"
     );
     assert_eq!(
-        read_test_u32(&mut engine, placement_ptr + 4),
+        read_test_u32(&mut engine, placement_va + 4),
         0,
         "flags must be 0"
     );
     assert_eq!(
-        read_test_u32(&mut engine, placement_ptr + 8),
+        read_test_u32(&mut engine, placement_va + 8),
         1,
         "visible window reports SW_SHOWNORMAL"
     );
     assert_eq!(
-        read_test_i32(&mut engine, placement_ptr + 28),
+        read_test_i32(&mut engine, placement_va + 28),
         40,
         "rcNormalPosition.left comes from the window rect"
     );
     assert_eq!(
-        read_test_i32(&mut engine, placement_ptr + 32),
+        read_test_i32(&mut engine, placement_va + 32),
         50,
         "rcNormalPosition.top comes from the window rect"
     );
     assert_eq!(
-        read_test_i32(&mut engine, placement_ptr + 36),
+        read_test_i32(&mut engine, placement_va + 36),
         640,
         "rcNormalPosition.right = x + width"
     );
     assert_eq!(
-        read_test_i32(&mut engine, placement_ptr + 40),
+        read_test_i32(&mut engine, placement_va + 40),
         450,
         "rcNormalPosition.bottom = y + height"
     );
@@ -141,8 +141,8 @@ fn test_get_window_placement_hidden_window_reports_sw_hide() {
         visible: false,
         ..Default::default()
     });
-    let placement_ptr = 0x4000_u64;
-    write_regs(&mut engine, handle, placement_ptr, 0, 0, 0);
+    let placement_va = 0x4000_u64;
+    write_regs(&mut engine, handle, placement_va, 0, 0, 0);
     let id = crate::resolve_winapi_id("user32.dll", "GetWindowPlacement")
         .expect("GetWindowPlacement must resolve to a WinApiId");
     let r = crate::dispatch_winapi_id(
@@ -152,7 +152,7 @@ fn test_get_window_placement_hidden_window_reports_sw_hide() {
     .expect("GetWindowPlacement must dispatch");
     assert_eq!(r.return_value, 1, "known hwnd must return TRUE");
     assert_eq!(
-        read_test_u32(&mut engine, placement_ptr + 8),
+        read_test_u32(&mut engine, placement_va + 8),
         0,
         "hidden window reports SW_HIDE"
     );
@@ -200,37 +200,37 @@ fn test_set_window_placement_stores_placement() {
     let mut engine = test_engine();
     let mut state = default_winapi_state();
     let hwnd = push_geometry_window(&mut state);
-    let placement_ptr = 0x4000_u64;
+    let placement_va = 0x4000_u64;
     // length, flags, showCmd=SW_SHOWMINIMIZED, ptMinPosition, ptMaxPosition,
     // then rcNormalPosition (20, 30, 220, 130).
     engine
-        .mem_write(placement_ptr, &user32::WINDOWPLACEMENT_LENGTH.to_le_bytes())
+        .mem_write(placement_va, &user32::WINDOWPLACEMENT_LENGTH.to_le_bytes())
         .expect("placement length");
     engine
-        .mem_write(placement_ptr + 4, &0_u32.to_le_bytes())
+        .mem_write(placement_va + 4, &0_u32.to_le_bytes())
         .expect("placement flags");
     engine
-        .mem_write(placement_ptr + 8, &2_u32.to_le_bytes())
+        .mem_write(placement_va + 8, &2_u32.to_le_bytes())
         .expect("placement showCmd");
     for offset in [12, 16, 20, 24] {
         engine
-            .mem_write(placement_ptr + offset, &0_i32.to_le_bytes())
+            .mem_write(placement_va + offset, &0_i32.to_le_bytes())
             .expect("placement point");
     }
     engine
-        .mem_write(placement_ptr + 28, &20_i32.to_le_bytes())
+        .mem_write(placement_va + 28, &20_i32.to_le_bytes())
         .expect("placement left");
     engine
-        .mem_write(placement_ptr + 32, &30_i32.to_le_bytes())
+        .mem_write(placement_va + 32, &30_i32.to_le_bytes())
         .expect("placement top");
     engine
-        .mem_write(placement_ptr + 36, &220_i32.to_le_bytes())
+        .mem_write(placement_va + 36, &220_i32.to_le_bytes())
         .expect("placement right");
     engine
-        .mem_write(placement_ptr + 40, &130_i32.to_le_bytes())
+        .mem_write(placement_va + 40, &130_i32.to_le_bytes())
         .expect("placement bottom");
 
-    write_regs(&mut engine, hwnd, placement_ptr, 0, 0, 0);
+    write_regs(&mut engine, hwnd, placement_va, 0, 0, 0);
     let id = crate::resolve_winapi_id("user32.dll", "SetWindowPlacement")
         .expect("SetWindowPlacement must resolve to a WinApiId");
     let r = crate::dispatch_winapi_id(
@@ -258,23 +258,23 @@ fn test_set_window_placement_sw_hide_hides_window() {
     let mut engine = test_engine();
     let mut state = default_winapi_state();
     let hwnd = push_geometry_window(&mut state);
-    let placement_ptr = 0x4000_u64;
+    let placement_va = 0x4000_u64;
     engine
-        .mem_write(placement_ptr, &user32::WINDOWPLACEMENT_LENGTH.to_le_bytes())
+        .mem_write(placement_va, &user32::WINDOWPLACEMENT_LENGTH.to_le_bytes())
         .expect("placement length");
     engine
-        .mem_write(placement_ptr + 4, &0_u32.to_le_bytes())
+        .mem_write(placement_va + 4, &0_u32.to_le_bytes())
         .expect("placement flags");
     // SW_HIDE (0): keep the previous rect, hide the window.
     engine
-        .mem_write(placement_ptr + 8, &0_u32.to_le_bytes())
+        .mem_write(placement_va + 8, &0_u32.to_le_bytes())
         .expect("placement showCmd");
     for offset in [12, 16, 20, 24, 28, 32, 36, 40] {
         engine
-            .mem_write(placement_ptr + offset, &0_i32.to_le_bytes())
+            .mem_write(placement_va + offset, &0_i32.to_le_bytes())
             .expect("placement field");
     }
-    write_regs(&mut engine, hwnd, placement_ptr, 0, 0, 0);
+    write_regs(&mut engine, hwnd, placement_va, 0, 0, 0);
     let id = crate::resolve_winapi_id("user32.dll", "SetWindowPlacement")
         .expect("SetWindowPlacement must resolve to a WinApiId");
     let r = crate::dispatch_winapi_id(
@@ -356,9 +356,9 @@ fn test_set_window_placement_sw_shownormal_triggers_erase_paint_cycle() {
 
     // SW_SHOWNORMAL: the placement call is what shows the window, so it must
     // enter the erase/paint cycle exactly like ShowWindow(SW_SHOW).
-    let placement_ptr = 0x4000_u64;
-    write_placement_struct(&mut engine, placement_ptr, 1, 20, 30, 220, 130);
-    let returned = dispatch_set_window_placement(&mut engine, &mut state, hwnd, placement_ptr);
+    let placement_va = 0x4000_u64;
+    write_placement_struct(&mut engine, placement_va, 1, 20, 30, 220, 130);
+    let returned = dispatch_set_window_placement(&mut engine, &mut state, hwnd, placement_va);
     assert_eq!(returned, 1, "known hwnd must return TRUE");
 
     let window = state
@@ -385,9 +385,9 @@ fn test_set_window_placement_sw_hide_skips_erase_invalidation() {
     let hwnd = push_placement_brush_window(&mut state, "PlacementHide");
 
     // SW_HIDE (0): a hidden window never enters the erase/paint cycle.
-    let placement_ptr = 0x4000_u64;
-    write_placement_struct(&mut engine, placement_ptr, 0, 20, 30, 220, 130);
-    let returned = dispatch_set_window_placement(&mut engine, &mut state, hwnd, placement_ptr);
+    let placement_va = 0x4000_u64;
+    write_placement_struct(&mut engine, placement_va, 0, 20, 30, 220, 130);
+    let returned = dispatch_set_window_placement(&mut engine, &mut state, hwnd, placement_va);
     assert_eq!(returned, 1, "known hwnd must return TRUE");
 
     let window = state
@@ -412,12 +412,12 @@ fn test_set_window_placement_short_length_is_false() {
     let mut engine = test_engine();
     let mut state = default_winapi_state();
     let hwnd = push_geometry_window(&mut state);
-    let placement_ptr = 0x4000_u64;
+    let placement_va = 0x4000_u64;
     // Pre-44 length (a 32-bit WINDOWPLACEMENT); the record must be untouched.
     engine
-        .mem_write(placement_ptr, &40_u32.to_le_bytes())
+        .mem_write(placement_va, &40_u32.to_le_bytes())
         .expect("placement length");
-    write_regs(&mut engine, hwnd, placement_ptr, 0, 0, 0);
+    write_regs(&mut engine, hwnd, placement_va, 0, 0, 0);
     let id = crate::resolve_winapi_id("user32.dll", "SetWindowPlacement")
         .expect("SetWindowPlacement must resolve to a WinApiId");
     let r = crate::dispatch_winapi_id(
@@ -439,11 +439,11 @@ fn test_set_window_placement_short_length_is_false() {
 fn test_set_window_placement_unknown_hwnd_is_false() {
     let mut engine = test_engine();
     let mut state = default_winapi_state();
-    let placement_ptr = 0x4000_u64;
+    let placement_va = 0x4000_u64;
     engine
-        .mem_write(placement_ptr, &44_u32.to_le_bytes())
+        .mem_write(placement_va, &44_u32.to_le_bytes())
         .expect("placement length");
-    write_regs(&mut engine, 0x1234, placement_ptr, 0, 0, 0);
+    write_regs(&mut engine, 0x1234, placement_va, 0, 0, 0);
     let id = crate::resolve_winapi_id("user32.dll", "SetWindowPlacement")
         .expect("SetWindowPlacement must resolve to a WinApiId");
     let r = crate::dispatch_winapi_id(
@@ -459,10 +459,10 @@ fn test_set_window_placement_requests_host_geometry_on_change() {
     let mut engine = test_engine();
     let mut state = default_winapi_state();
     let hwnd = push_geometry_window(&mut state);
-    let placement_ptr = 0x4000_u64;
-    write_placement_struct(&mut engine, placement_ptr, 2, 20, 30, 220, 130);
+    let placement_va = 0x4000_u64;
+    write_placement_struct(&mut engine, placement_va, 2, 20, 30, 220, 130);
     assert_eq!(
-        dispatch_set_window_placement(&mut engine, &mut state, hwnd, placement_ptr),
+        dispatch_set_window_placement(&mut engine, &mut state, hwnd, placement_va),
         1,
         "known hwnd must return TRUE"
     );
@@ -479,10 +479,10 @@ fn test_set_window_placement_unchanged_rect_skips_host_sync() {
     let mut state = default_winapi_state();
     // push_geometry_window's record is already at (40, 50, 600, 400).
     let hwnd = push_geometry_window(&mut state);
-    let placement_ptr = 0x4000_u64;
-    write_placement_struct(&mut engine, placement_ptr, 1, 40, 50, 640, 450);
+    let placement_va = 0x4000_u64;
+    write_placement_struct(&mut engine, placement_va, 1, 40, 50, 640, 450);
     assert_eq!(
-        dispatch_set_window_placement(&mut engine, &mut state, hwnd, placement_ptr),
+        dispatch_set_window_placement(&mut engine, &mut state, hwnd, placement_va),
         1,
         "known hwnd must return TRUE"
     );
@@ -497,14 +497,14 @@ fn test_set_window_placement_unchanged_rect_skips_host_sync() {
 fn test_set_window_placement_fake_window_forwards_host_geometry() {
     let mut engine = test_engine();
     let mut state = default_winapi_state();
-    let placement_ptr = 0x4000_u64;
-    write_placement_struct(&mut engine, placement_ptr, 1, 100, 200, 300, 300);
+    let placement_va = 0x4000_u64;
+    write_placement_struct(&mut engine, placement_va, 1, 100, 200, 300, 300);
     assert_eq!(
         dispatch_set_window_placement(
             &mut engine,
             &mut state,
             user32::FAKE_WINDOW_HANDLE,
-            placement_ptr,
+            placement_va,
         ),
         1,
         "the fake window is a known hwnd"
@@ -526,11 +526,11 @@ fn test_set_window_placement_changed_rect_wakes_host_presenter() {
         flag.store(true, std::sync::atomic::Ordering::SeqCst);
     }));
     let hwnd = push_geometry_window(&mut state);
-    let placement_ptr = 0x4000_u64;
+    let placement_va = 0x4000_u64;
 
-    write_placement_struct(&mut engine, placement_ptr, 1, 20, 30, 220, 130);
+    write_placement_struct(&mut engine, placement_va, 1, 20, 30, 220, 130);
     assert_eq!(
-        dispatch_set_window_placement(&mut engine, &mut state, hwnd, placement_ptr),
+        dispatch_set_window_placement(&mut engine, &mut state, hwnd, placement_va),
         1
     );
     assert!(
@@ -540,9 +540,9 @@ fn test_set_window_placement_changed_rect_wakes_host_presenter() {
 
     // The same rect again: no new wake, and the pending request survives.
     wake_flag.store(false, std::sync::atomic::Ordering::SeqCst);
-    write_placement_struct(&mut engine, placement_ptr, 1, 20, 30, 220, 130);
+    write_placement_struct(&mut engine, placement_va, 1, 20, 30, 220, 130);
     assert_eq!(
-        dispatch_set_window_placement(&mut engine, &mut state, hwnd, placement_ptr),
+        dispatch_set_window_placement(&mut engine, &mut state, hwnd, placement_va),
         1
     );
     assert!(

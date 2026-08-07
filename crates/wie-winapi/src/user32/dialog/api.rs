@@ -72,7 +72,7 @@ fn handle_get_dlg_item_text_impl(
     let id_raw = engine
         .read_rdx()
         .with_context(|| format!("failed to read RDX for {api_name}"))?;
-    let buffer_ptr = engine
+    let buffer_va = engine
         .read_r8()
         .with_context(|| format!("failed to read R8 for {api_name}"))?;
     let max_characters = engine
@@ -93,10 +93,10 @@ fn handle_get_dlg_item_text_impl(
         })
     };
 
-    let return_value = if text.is_empty() || buffer_ptr == 0 {
+    let return_value = if text.is_empty() || buffer_va == 0 {
         0
     } else {
-        write_out_string(engine, buffer_ptr, max_characters, &text, unicode)?
+        write_out_string(engine, buffer_va, max_characters, &text, unicode)?
     };
 
     ctx.finish(return_value)
@@ -124,15 +124,15 @@ fn handle_set_dlg_item_text_impl(
     let id_raw = engine
         .read_rdx()
         .with_context(|| format!("failed to read RDX for {api_name}"))?;
-    let text_ptr = engine
+    let text_va = engine
         .read_r8()
         .with_context(|| format!("failed to read R8 for {api_name}"))?;
     let id = u16::try_from(id_raw & u64::from(u32::MAX)).unwrap_or(0);
 
     let child = get_dlg_item(state, dialog_hwnd, id);
-    let success = child != 0 && text_ptr != 0;
+    let success = child != 0 && text_va != 0;
     if success {
-        let text = read_arg_string(engine, text_ptr, unicode)?;
+        let text = read_arg_string(engine, text_va, unicode)?;
         if let Some(window) = find_window_mut(state, child) {
             window.control_text = text;
             window.invalidated = true;
@@ -214,7 +214,7 @@ pub fn handle_get_dlg_item_int(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     let id_raw = engine
         .read_rdx()
         .context("failed to read RDX for GetDlgItemInt")?;
-    let translated_ptr = engine
+    let translated_va = engine
         .read_r8()
         .context("failed to read R8 for GetDlgItemInt")?;
     let signed_raw = engine
@@ -237,8 +237,8 @@ pub fn handle_get_dlg_item_int(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
 
     let (value, translated) = parse_dlg_item_int(&text, signed_raw != 0);
 
-    if translated_ptr != 0 {
-        write_guest_u32(engine, translated_ptr, u32::from(translated))?;
+    if translated_va != 0 {
+        write_guest_u32(engine, translated_va, u32::from(translated))?;
     }
 
     let return_value = u64::from(value);
@@ -566,11 +566,11 @@ mod tests {
         let mut state = test_state();
         let (dialog, _edit) = build_dialog_with_edit(&mut state, 0x10);
 
-        let text_ptr = 0x4000;
+        let text_va = 0x4000;
         engine
-            .mem_write(text_ptr, &utf16_c_string_bytes("dialog text — ✓"))
+            .mem_write(text_va, &utf16_c_string_bytes("dialog text — ✓"))
             .expect("write guest text");
-        write_regs(&mut engine, dialog, 0x10, text_ptr, 0);
+        write_regs(&mut engine, dialog, 0x10, text_va, 0);
         let result = handle_set_dlg_item_text_w(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
@@ -579,8 +579,8 @@ mod tests {
         .expect("SetDlgItemTextW should succeed");
         assert_eq!(result.return_value, 1, "existing item sets text");
 
-        let out_ptr = 0x5000;
-        write_regs(&mut engine, dialog, 0x10, out_ptr, 64);
+        let out_va = 0x5000;
+        write_regs(&mut engine, dialog, 0x10, out_va, 64);
         let result = handle_get_dlg_item_text_w(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
@@ -592,7 +592,7 @@ mod tests {
             "15 UTF-16 units copied excluding the NUL"
         );
         assert_eq!(
-            read_guest_utf16(&mut engine, out_ptr),
+            read_guest_utf16(&mut engine, out_va),
             "dialog text — ✓",
             "the W round-trip must be lossless"
         );
@@ -607,11 +607,11 @@ mod tests {
         let mut state = test_state();
         let (dialog, _edit) = build_dialog_with_edit(&mut state, 0x10);
 
-        let text_ptr = 0x4000;
+        let text_va = 0x4000;
         engine
-            .mem_write(text_ptr, b"caf\xC3\xA9\0")
+            .mem_write(text_va, b"caf\xC3\xA9\0")
             .expect("write UTF-8 literal");
-        write_regs(&mut engine, dialog, 0x10, text_ptr, 0);
+        write_regs(&mut engine, dialog, 0x10, text_va, 0);
         let result = handle_set_dlg_item_text_a(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
@@ -620,8 +620,8 @@ mod tests {
         .expect("SetDlgItemTextA should succeed");
         assert_eq!(result.return_value, 1, "existing item sets text");
 
-        let out_ptr = 0x5000;
-        write_regs(&mut engine, dialog, 0x10, out_ptr, 8);
+        let out_va = 0x5000;
+        write_regs(&mut engine, dialog, 0x10, out_va, 8);
         let result = handle_get_dlg_item_text_a(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
@@ -630,7 +630,7 @@ mod tests {
         .expect("GetDlgItemTextA should succeed");
         assert_eq!(result.return_value, 4, "4 CP1252 chars, not 5 UTF-8 bytes");
         let mut raw = [0_u8; 8];
-        engine.mem_read(out_ptr, &mut raw).expect("read out buffer");
+        engine.mem_read(out_va, &mut raw).expect("read out buffer");
         assert_eq!(
             &raw[..5],
             &[0x63, 0x61, 0x66, 0xE9, 0x00],
@@ -702,7 +702,7 @@ mod tests {
         let mut engine = test_engine();
         let mut state = test_state();
         let (dialog, _edit) = build_dialog_with_edit(&mut state, 0x10);
-        let translated_ptr = 0x4000_u64;
+        let translated_va = 0x4000_u64;
 
         write_regs(&mut engine, dialog, 0x10, 123, 0);
         handle_set_dlg_item_int(&mut HandlerContext::new(
@@ -712,7 +712,7 @@ mod tests {
         ))
         .expect("SetDlgItemInt should succeed");
 
-        write_regs(&mut engine, dialog, 0x10, translated_ptr, 1);
+        write_regs(&mut engine, dialog, 0x10, translated_va, 1);
         let result = handle_get_dlg_item_int(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
@@ -722,7 +722,7 @@ mod tests {
         assert_eq!(result.return_value, 123);
         let mut flag = [0_u8; 4];
         engine
-            .mem_read(translated_ptr, &mut flag)
+            .mem_read(translated_va, &mut flag)
             .expect("read translated flag");
         assert_eq!(u32::from_le_bytes(flag), 1, "translated flag is TRUE");
     }
@@ -775,12 +775,12 @@ mod tests {
         let mut engine = test_engine();
         let mut state = test_state();
         let (dialog, edit) = build_dialog_with_edit(&mut state, 0x10);
-        let translated_ptr = 0x4000_u64;
+        let translated_va = 0x4000_u64;
 
         if let Some(window) = find_window_mut(&mut state, edit) {
             window.control_text = "abc".to_owned();
         }
-        write_regs(&mut engine, dialog, 0x10, translated_ptr, 1);
+        write_regs(&mut engine, dialog, 0x10, translated_va, 1);
         let result = handle_get_dlg_item_int(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
@@ -790,7 +790,7 @@ mod tests {
         assert_eq!(result.return_value, 0);
         let mut flag = [0_u8; 4];
         engine
-            .mem_read(translated_ptr, &mut flag)
+            .mem_read(translated_va, &mut flag)
             .expect("read translated flag");
         assert_eq!(u32::from_le_bytes(flag), 0, "translated flag is FALSE");
     }
@@ -800,13 +800,13 @@ mod tests {
         let mut engine = test_engine();
         let mut state = test_state();
         let (dialog, edit) = build_dialog_with_edit(&mut state, 0x10);
-        let translated_ptr = 0x4000_u64;
+        let translated_va = 0x4000_u64;
 
         // u32::MAX parses fine.
         if let Some(window) = find_window_mut(&mut state, edit) {
             window.control_text = "4294967295".to_owned();
         }
-        write_regs(&mut engine, dialog, 0x10, translated_ptr, 0);
+        write_regs(&mut engine, dialog, 0x10, translated_va, 0);
         let result = handle_get_dlg_item_int(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
@@ -819,7 +819,7 @@ mod tests {
         if let Some(window) = find_window_mut(&mut state, edit) {
             window.control_text = "4294967296".to_owned();
         }
-        write_regs(&mut engine, dialog, 0x10, translated_ptr, 0);
+        write_regs(&mut engine, dialog, 0x10, translated_va, 0);
         let result = handle_get_dlg_item_int(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
@@ -829,7 +829,7 @@ mod tests {
         assert_eq!(result.return_value, 0);
         let mut flag = [0_u8; 4];
         engine
-            .mem_read(translated_ptr, &mut flag)
+            .mem_read(translated_va, &mut flag)
             .expect("read translated flag");
         assert_eq!(u32::from_le_bytes(flag), 0, "overflow reports FALSE");
     }

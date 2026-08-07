@@ -383,15 +383,15 @@ pub(crate) fn handle_vsnwprintf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let engine = &mut *ctx.engine;
     let buf = engine.read_rcx()?;
     let count_raw = engine.read_rdx()?;
-    let fmt_ptr = engine.read_r8()?;
+    let fmt_va = engine.read_r8()?;
     let va_list = engine.read_r9()?;
-    if buf == 0 || fmt_ptr == 0 || count_raw == 0 {
+    if buf == 0 || fmt_va == 0 || count_raw == 0 {
         return finish(engine, i32_status_to_u64(-1));
     }
     let count = usize::try_from(count_raw)
         .unwrap_or(0)
         .min(MAX_FORMAT_OUTPUT);
-    let fmt = crate::guest_string::read_utf16_lossy(engine, fmt_ptr, 4096)
+    let fmt = crate::guest_string::read_utf16_lossy(engine, fmt_va, 4096)
         .map(|s| s.encode_utf16().collect::<Vec<u16>>())
         .unwrap_or_default();
     let mut va = va_list;
@@ -420,15 +420,15 @@ pub(crate) fn handle_vsnprintf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     let engine = &mut *ctx.engine;
     let buf = engine.read_rcx()?;
     let count_raw = engine.read_rdx()?;
-    let fmt_ptr = engine.read_r8()?;
+    let fmt_va = engine.read_r8()?;
     let va_list = engine.read_r9()?;
-    if buf == 0 || fmt_ptr == 0 || count_raw == 0 {
+    if buf == 0 || fmt_va == 0 || count_raw == 0 {
         return finish(engine, i32_status_to_u64(-1));
     }
     let count = usize::try_from(count_raw)
         .unwrap_or(0)
         .min(MAX_FORMAT_OUTPUT);
-    let fmt = crate::guest_string::read_ansi_bytes(engine, fmt_ptr, 4096).unwrap_or_default();
+    let fmt = crate::guest_string::read_ansi_bytes(engine, fmt_va, 4096).unwrap_or_default();
     let mut va = va_list;
     let mut out: Vec<u8> = Vec::with_capacity(64);
     let mut read_string = |engine: &mut dyn wie_cpu::CpuEngine, p: u64| -> Vec<u8> {

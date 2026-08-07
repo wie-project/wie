@@ -13,11 +13,11 @@ pub fn handle_register_class_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
 
-    let class_ptr = engine
+    let class_va = engine
         .read_rcx()
         .context("failed to read RCX for RegisterClassA")?;
 
-    if class_ptr == 0 {
+    if class_va == 0 {
         return ctx.finish(0);
     }
 
@@ -33,8 +33,8 @@ pub fn handle_register_class_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         cursor,
         background_brush,
         menu_name,
-        class_name_ptr,
-    ) = with_typed_read::<WndClass, _, _>(engine, class_ptr, |wc| {
+        class_name_va,
+    ) = with_typed_read::<WndClass, _, _>(engine, class_va, |wc| {
         Ok((
             wc.style,
             wc.window_proc,
@@ -48,10 +48,10 @@ pub fn handle_register_class_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     })
     .context("failed to read WNDCLASSA for RegisterClassA")?;
 
-    let class_name = if class_name_ptr == 0 {
+    let class_name = if class_name_va == 0 {
         String::new()
     } else {
-        read_guest_ansi_lossy(engine, class_name_ptr, 256)
+        read_guest_ansi_lossy(engine, class_name_va, 256)
             .context("failed to read WNDCLASS.lpszClassName for RegisterClassA")?
     };
 
@@ -81,11 +81,11 @@ pub fn handle_register_class_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
 
-    let class_ptr = engine
+    let class_va = engine
         .read_rcx()
         .context("failed to read RCX for RegisterClassW")?;
 
-    if class_ptr == 0 {
+    if class_va == 0 {
         return ctx.finish(0);
     }
 
@@ -99,8 +99,8 @@ pub fn handle_register_class_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         cursor,
         background_brush,
         menu_name,
-        class_name_ptr,
-    ) = with_typed_read::<WndClass, _, _>(engine, class_ptr, |wc| {
+        class_name_va,
+    ) = with_typed_read::<WndClass, _, _>(engine, class_va, |wc| {
         Ok((
             wc.style,
             wc.window_proc,
@@ -114,10 +114,10 @@ pub fn handle_register_class_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     })
     .context("failed to read WNDCLASSW for RegisterClassW")?;
 
-    let class_name = if class_name_ptr == 0 {
+    let class_name = if class_name_va == 0 {
         String::new()
     } else {
-        read_guest_utf16_lossy(engine, class_name_ptr, 256)
+        read_guest_utf16_lossy(engine, class_name_va, 256)
             .context("failed to read WNDCLASSW.lpszClassName for RegisterClassW")?
     };
 

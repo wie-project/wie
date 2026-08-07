@@ -752,17 +752,17 @@ fn rasterize_vertex_stream(
 pub(crate) fn draw_vertex_stream(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
-    data_ptr: u64,
+    data_va: u64,
     layout: &FvfLayout,
     stride: usize,
     vertex_count: usize,
     primitive_type: u64,
     primitive_count: u64,
-    index_ptr: u64,
+    index_va: u64,
     index_format: u32,
     index_count: usize,
 ) -> Result<()> {
-    if vertex_count == 0 || stride == 0 || data_ptr == 0 {
+    if vertex_count == 0 || stride == 0 || data_va == 0 {
         return Ok(());
     }
     let groups = primitive_groups(primitive_type, primitive_count)?;
@@ -774,12 +774,12 @@ pub(crate) fn draw_vertex_stream(
         .checked_mul(stride)
         .context("vertex stream size overflow")?;
     let mut data = vec![0_u8; data_bytes];
-    if engine.mem_read(data_ptr, &mut data).is_err() {
+    if engine.mem_read(data_va, &mut data).is_err() {
         // Unmapped guest memory: skip the draw rather than fault the guest.
         return Ok(());
     }
 
-    let indices = if index_count > 0 && index_ptr != 0 {
+    let indices = if index_count > 0 && index_va != 0 {
         // D3DFMT_INDEX32 = 102 (4-byte indices); everything else — including
         // D3DFMT_INDEX16 = 101 — is 16-bit. Unknown formats default lenient.
         let size = usize::try_from(if index_format == D3DFMT_INDEX32 { 4 } else { 2 })
@@ -788,7 +788,7 @@ pub(crate) fn draw_vertex_stream(
             .checked_mul(size)
             .context("index buffer size overflow")?;
         let mut index_data = vec![0_u8; index_bytes];
-        if engine.mem_read(index_ptr, &mut index_data).is_err() {
+        if engine.mem_read(index_va, &mut index_data).is_err() {
             return Ok(());
         }
         Some((index_data, size))

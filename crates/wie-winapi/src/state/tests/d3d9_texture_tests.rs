@@ -408,17 +408,17 @@ fn test_d3d9_texture_unlock_with_rect() {
     let surface_va = u64::from_le_bytes(surf_bytes);
 
     // Lock only the top-left texel: RECT {0,0,1,1} at 0x7400.
-    let rect_ptr = 0x7400_u64;
+    let rect_va = 0x7400_u64;
     for (i, v) in [0_i32, 0, 1, 1].iter().enumerate() {
         engine
             .mem_write(
-                rect_ptr + u64::try_from(i).unwrap_or(0) * 4,
+                rect_va + u64::try_from(i).unwrap_or(0) * 4,
                 &v.to_le_bytes(),
             )
             .expect("write rect field");
     }
     let locked_rect = 0x7200_u64;
-    write_regs(&mut engine, surface_va, locked_rect, rect_ptr, 0, 0);
+    write_regs(&mut engine, surface_va, locked_rect, rect_va, 0, 0);
     assert_return_value!(
         d3d9::handle_surface_lock_rect(&mut HandlerContext::new(
             &mut engine,

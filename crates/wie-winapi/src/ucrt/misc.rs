@@ -77,12 +77,12 @@ fn unix_ts_to_tm(ts: i64) -> [i32; 9] {
 pub(crate) fn handle_localtime64(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let t_ptr = engine.read_rcx()?;
-    if t_ptr == 0 {
+    let t_va = engine.read_rcx()?;
+    if t_va == 0 {
         return finish(engine, 0);
     }
     let mut buf = [0_u8; 8];
-    engine.mem_read(t_ptr, &mut buf)?;
+    engine.mem_read(t_va, &mut buf)?;
     let ts = i64::from_le_bytes(buf);
     let tm = unix_ts_to_tm(ts);
     // x64 struct tm layout: tm_sec(4), tm_min(4), tm_hour(4), tm_mday(4),
@@ -102,13 +102,13 @@ pub(crate) fn handle_localtime64(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 /// `_time64(t)` — get current time in seconds since epoch.
 pub(crate) fn handle_time64(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let t_ptr = engine.read_rcx()?;
+    let t_va = engine.read_rcx()?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    if t_ptr != 0 {
-        drop(engine.mem_write(t_ptr, &now.to_le_bytes()));
+    if t_va != 0 {
+        drop(engine.mem_write(t_va, &now.to_le_bytes()));
     }
     finish(engine, now)
 }
@@ -208,8 +208,8 @@ pub(crate) fn handle_getch(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
 /// shell, and returns the exit code. When `command` is NULL, returns
 /// non-zero to indicate a command processor is available (per spec).
 pub(crate) fn handle_system(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let cmd_ptr = ctx.engine.read_rcx()?;
-    if cmd_ptr == 0 {
+    let cmd_va = ctx.engine.read_rcx()?;
+    if cmd_va == 0 {
         // MSDN: passing NULL queries whether a command processor exists.
         let eng = &mut *ctx.engine;
         #[cfg(not(target_os = "windows"))]
@@ -219,7 +219,7 @@ pub(crate) fn handle_system(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     }
     // Read the command string from guest memory (null-terminated).
     let mut cmd_bytes = Vec::new();
-    let mut addr = cmd_ptr;
+    let mut addr = cmd_va;
     loop {
         let mut byte = [0_u8];
         ctx.engine.mem_read(addr, &mut byte)?;
@@ -364,8 +364,8 @@ pub(crate) fn handle_strerror(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 pub(crate) fn handle_setlocale(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let _cat = engine.read_rcx()?;
-    let locale_ptr = engine.read_rdx()?;
-    if locale_ptr == 0 {
+    let locale_va = engine.read_rdx()?;
+    if locale_va == 0 {
         // Query: return "C" from a static location.
         static LOCALE_VA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let va = LOCALE_VA.load(std::sync::atomic::Ordering::Relaxed);
@@ -405,9 +405,9 @@ pub(crate) fn handle_errno(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
 /// `perror(str)` — print `str: errno_message\n` to stderr.
 pub(crate) fn handle_perror(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let s_ptr = engine.read_rcx()?;
-    let prefix = if s_ptr != 0 {
-        read_guest_str(engine, s_ptr, 256)?
+    let s_va = engine.read_rcx()?;
+    let prefix = if s_va != 0 {
+        read_guest_str(engine, s_va, 256)?
     } else {
         String::new()
     };

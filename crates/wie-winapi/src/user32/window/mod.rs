@@ -65,14 +65,14 @@ pub fn handle_get_window_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         .read_rcx()
         .context("failed to read RCX for GetWindowRect")?;
 
-    let rect_ptr = engine
+    let rect_va = engine
         .read_rdx()
         .context("failed to read RDX for GetWindowRect")?;
 
     let window = find_window(state, window_handle);
-    let success = window.is_some() && rect_ptr != 0;
+    let success = window.is_some() && rect_va != 0;
 
-    if let Some(window) = window.filter(|_| rect_ptr != 0) {
+    if let Some(window) = window.filter(|_| rect_va != 0) {
         let right = window
             .x
             .checked_add(window.width)
@@ -85,7 +85,7 @@ pub fn handle_get_window_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 
         // One shared-lock borrow instead of four per-field writes; the RECT
         // layout + pinned offsets live in `crate::guest_layout::WinRect`.
-        with_typed_write::<WinRect, _, _>(engine, rect_ptr, |rect| {
+        with_typed_write::<WinRect, _, _>(engine, rect_va, |rect| {
             rect.left = window.x;
             rect.top = window.y;
             rect.right = right;
@@ -119,7 +119,7 @@ pub fn handle_adjust_window_rect_ex_for_dpi(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let rect_ptr = engine
+    let rect_va = engine
         .read_rcx()
         .context("failed to read RCX for AdjustWindowRectExForDpi")?;
 
@@ -137,7 +137,7 @@ pub fn handle_adjust_window_rect_ex_for_dpi(
 
     // The fifth argument, dpi, is on the Win64 stack. For now the fake desktop
     // uses 96 DPI, so preserving the supplied client rectangle is sufficient.
-    let return_value = u64::from(rect_ptr != 0);
+    let return_value = u64::from(rect_va != 0);
 
     ctx.finish(return_value)
 }
@@ -163,7 +163,7 @@ pub(crate) fn handle_get_class_name(
         .read_rcx()
         .with_context(|| format!("failed to read RCX for {api_name}"))?;
 
-    let buffer_ptr = engine
+    let buffer_va = engine
         .read_rdx()
         .with_context(|| format!("failed to read RDX for {api_name}"))?;
 
@@ -186,10 +186,10 @@ pub(crate) fn handle_get_class_name(
     let copied = if class_name.is_empty() {
         0
     } else if unicode {
-        write_guest_utf16_c_string(engine, buffer_ptr, capacity, &class_name)
+        write_guest_utf16_c_string(engine, buffer_va, capacity, &class_name)
             .with_context(|| format!("failed to write class name for {api_name}"))?
     } else {
-        write_guest_ansi_c_string(engine, buffer_ptr, capacity, &class_name)
+        write_guest_ansi_c_string(engine, buffer_va, capacity, &class_name)
             .with_context(|| format!("failed to write class name for {api_name}"))?
     };
 

@@ -134,16 +134,16 @@ fn finish_version_size(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
     full_path: &str,
-    handle_ptr: u64,
+    handle_va: u64,
 ) -> Result<WinApiHandlerResult> {
     let (value, last_error) = match load_version_block(state, full_path)? {
         VersionFileOutcome::NotFound => (0, ERROR_FILE_NOT_FOUND),
         VersionFileOutcome::NoVersionResource => (0, ERROR_RESOURCE_DATA_NOT_FOUND),
         VersionFileOutcome::Block(raw) => {
-            if handle_ptr != 0 {
+            if handle_va != 0 {
                 // The opaque handle: always 0 — WIE keeps no handle bookkeeping,
                 // and `GetFileVersionInfo` ignores the value anyway.
-                kernel32::write_guest_u32(engine, handle_ptr, 0)
+                kernel32::write_guest_u32(engine, handle_va, 0)
                     .context("failed to write version handle")?;
             }
             (u64::try_from(raw.len()).unwrap_or(0), 0)
@@ -165,17 +165,17 @@ fn finish_version_info(
     state: &mut WinApiState,
     full_path: &str,
     data_len: u64,
-    data_ptr: u64,
+    data_va: u64,
 ) -> Result<WinApiHandlerResult> {
     let (ok, last_error) = match load_version_block(state, full_path)? {
         VersionFileOutcome::NotFound => (0, ERROR_FILE_NOT_FOUND),
         VersionFileOutcome::NoVersionResource => (0, ERROR_RESOURCE_DATA_NOT_FOUND),
         VersionFileOutcome::Block(raw) => {
             let raw_len = u64::try_from(raw.len()).unwrap_or(0);
-            if data_ptr == 0 || raw_len > data_len {
+            if data_va == 0 || raw_len > data_len {
                 (0, ERROR_INSUFFICIENT_BUFFER)
             } else {
-                crate::guest_memory::write_bytes(engine, data_ptr, &raw)
+                crate::guest_memory::write_bytes(engine, data_va, &raw)
                     .context("failed to copy version block to guest")?;
                 (1, 0)
             }
@@ -194,25 +194,25 @@ fn finish_version_info(
 /// Shared `VerQueryValue*` tail: walk the copied block in guest memory.
 fn finish_ver_query_value(
     engine: &mut dyn wie_cpu::CpuEngine,
-    block_ptr: u64,
+    block_va: u64,
     path: &str,
     buffer_out: u64,
     len_out: u64,
 ) -> Result<WinApiHandlerResult> {
-    let ok = if block_ptr == 0 || buffer_out == 0 || len_out == 0 {
+    let ok = if block_va == 0 || buffer_out == 0 || len_out == 0 {
         0
     } else {
-        match read_version_block_from_guest(engine, block_ptr)? {
+        match read_version_block_from_guest(engine, block_va)? {
             None => 0,
             Some(block) => match wie_pe::resources::query_version_value(&block, path) {
                 None => 0,
                 Some(m) => {
                     let offset =
                         u64::try_from(m.offset).context("query offset does not fit u64")?;
-                    let value_ptr = block_ptr
+                    let value_va = block_va
                         .checked_add(offset)
                         .context("query value pointer overflow")?;
-                    kernel32::write_guest_u64(engine, buffer_out, value_ptr)
+                    kernel32::write_guest_u64(engine, buffer_out, value_va)
                         .context("failed to write query buffer pointer")?;
                     let len = u32::try_from(m.len).context("query length does not fit u32")?;
                     kernel32::write_guest_u32(engine, len_out, len)
@@ -234,16 +234,16 @@ fn finish_ver_query_value(
 /// Read the whole guest version block (bounded by its `wLength`).
 fn read_version_block_from_guest(
     engine: &mut dyn wie_cpu::CpuEngine,
-    block_ptr: u64,
+    block_va: u64,
 ) -> Result<Option<Vec<u8>>> {
-    let len = u64::from(kernel32::read_u16(engine, block_ptr)?);
+    let len = u64::from(kernel32::read_u16(engine, block_va)?);
     if len < 6 {
         return Ok(None);
     }
     let len_usize = usize::try_from(len).context("version block length does not fit usize")?;
     let len_usize = len_usize.min(MAX_GUEST_VERSION_BLOCK);
     let mut block = vec![0_u8; len_usize];
-    crate::guest_memory::read_bytes(engine, block_ptr, &mut block)?;
+    crate::guest_memory::read_bytes(engine, block_va, &mut block)?;
     Ok(Some(block))
 }
 
@@ -394,24 +394,24 @@ fn find_file_dirs(state: &WinApiState, file: &str) -> (u32, String) {
 /// required size, `GetTempPath`-style).
 fn write_dir_out(
     engine: &mut dyn wie_cpu::CpuEngine,
-    buf_ptr: u64,
-    len_ptr: u64,
+    buf_va: u64,
+    len_va: u64,
     dir: &str,
 ) -> Result<u32> {
-    if len_ptr == 0 {
+    if len_va == 0 {
         // Nothing to report back.
         return Ok(0);
     }
-    let cap = usize::try_from(u64::from(kernel32::read_u32(engine, len_ptr)?))
+    let cap = usize::try_from(u64::from(kernel32::read_u32(engine, len_va)?))
         .context("directory capacity does not fit usize")?;
     let needed = dir.encode_utf16().count();
-    let written = if buf_ptr == 0 {
+    let written = if buf_va == 0 {
         0
     } else {
-        crate::guest_string::write_utf16_c_string(engine, buf_ptr, cap, dir)?
+        crate::guest_string::write_utf16_c_string(engine, buf_va, cap, dir)?
     };
     let needed_u32 = u32::try_from(needed).unwrap_or(u32::MAX);
-    kernel32::write_guest_u32(engine, len_ptr, needed_u32)?;
+    kernel32::write_guest_u32(engine, len_va, needed_u32)?;
     Ok(if written < needed {
         VFF_BUFFTOOSMALL
     } else {
@@ -440,16 +440,16 @@ pub fn handle_get_file_version_info_size_w(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let file_ptr = engine
+    let file_va = engine
         .read_rcx()
         .context("failed to read RCX for GetFileVersionInfoSizeW")?;
-    let handle_ptr = engine
+    let handle_va = engine
         .read_rdx()
         .context("failed to read RDX for GetFileVersionInfoSizeW")?;
-    let path = read_wide_string_from_cpu(engine, file_ptr, 1024)?;
+    let path = read_wide_string_from_cpu(engine, file_va, 1024)?;
     let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full_path = kernel32::resolve_full_windows_path(&cwd, &path);
-    finish_version_size(engine, state, &full_path, handle_ptr)
+    finish_version_size(engine, state, &full_path, handle_va)
 }
 
 /// Handles `VERSION.dll!GetFileVersionInfoSizeA`.
@@ -458,16 +458,16 @@ pub fn handle_get_file_version_info_size_a(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let file_ptr = engine
+    let file_va = engine
         .read_rcx()
         .context("failed to read RCX for GetFileVersionInfoSizeA")?;
-    let handle_ptr = engine
+    let handle_va = engine
         .read_rdx()
         .context("failed to read RDX for GetFileVersionInfoSizeA")?;
-    let path = read_ansi_string_from_cpu(engine, file_ptr, 1024)?;
+    let path = read_ansi_string_from_cpu(engine, file_va, 1024)?;
     let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full_path = kernel32::resolve_full_windows_path(&cwd, &path);
-    finish_version_size(engine, state, &full_path, handle_ptr)
+    finish_version_size(engine, state, &full_path, handle_va)
 }
 
 /// Handles `VERSION.dll!GetFileVersionInfoSizeExW`.
@@ -485,16 +485,16 @@ pub fn handle_get_file_version_info_size_ex_w(
     if !validate_ver_get_flags(flags, state) {
         return return_zero(engine, "GetFileVersionInfoSizeExW");
     }
-    let file_ptr = engine
+    let file_va = engine
         .read_rdx()
         .context("failed to read RDX for GetFileVersionInfoSizeExW")?;
-    let handle_ptr = engine
+    let handle_va = engine
         .read_r8()
         .context("failed to read R8 for GetFileVersionInfoSizeExW")?;
-    let path = read_wide_string_from_cpu(engine, file_ptr, 1024)?;
+    let path = read_wide_string_from_cpu(engine, file_va, 1024)?;
     let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full_path = kernel32::resolve_full_windows_path(&cwd, &path);
-    finish_version_size(engine, state, &full_path, handle_ptr)
+    finish_version_size(engine, state, &full_path, handle_va)
 }
 
 /// Handles `VERSION.dll!GetFileVersionInfoSizeExA`.
@@ -512,23 +512,23 @@ pub fn handle_get_file_version_info_size_ex_a(
     if !validate_ver_get_flags(flags, state) {
         return return_zero(engine, "GetFileVersionInfoSizeExA");
     }
-    let file_ptr = engine
+    let file_va = engine
         .read_rdx()
         .context("failed to read RDX for GetFileVersionInfoSizeExA")?;
-    let handle_ptr = engine
+    let handle_va = engine
         .read_r8()
         .context("failed to read R8 for GetFileVersionInfoSizeExA")?;
-    let path = read_ansi_string_from_cpu(engine, file_ptr, 1024)?;
+    let path = read_ansi_string_from_cpu(engine, file_va, 1024)?;
     let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full_path = kernel32::resolve_full_windows_path(&cwd, &path);
-    finish_version_size(engine, state, &full_path, handle_ptr)
+    finish_version_size(engine, state, &full_path, handle_va)
 }
 
 /// Handles `VERSION.dll!GetFileVersionInfoW`.
 pub fn handle_get_file_version_info_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let file_ptr = engine
+    let file_va = engine
         .read_rcx()
         .context("failed to read RCX for GetFileVersionInfoW")?;
     let _handle = engine
@@ -537,20 +537,20 @@ pub fn handle_get_file_version_info_w(ctx: &mut HandlerContext<'_>) -> Result<Wi
     let data_len = engine
         .read_r8()
         .context("failed to read R8 for GetFileVersionInfoW")?;
-    let data_ptr = engine
+    let data_va = engine
         .read_r9()
         .context("failed to read R9 for GetFileVersionInfoW")?;
-    let path = read_wide_string_from_cpu(engine, file_ptr, 1024)?;
+    let path = read_wide_string_from_cpu(engine, file_va, 1024)?;
     let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full_path = kernel32::resolve_full_windows_path(&cwd, &path);
-    finish_version_info(engine, state, &full_path, data_len, data_ptr)
+    finish_version_info(engine, state, &full_path, data_len, data_va)
 }
 
 /// Handles `VERSION.dll!GetFileVersionInfoA`.
 pub fn handle_get_file_version_info_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let file_ptr = engine
+    let file_va = engine
         .read_rcx()
         .context("failed to read RCX for GetFileVersionInfoA")?;
     let _handle = engine
@@ -559,13 +559,13 @@ pub fn handle_get_file_version_info_a(ctx: &mut HandlerContext<'_>) -> Result<Wi
     let data_len = engine
         .read_r8()
         .context("failed to read R8 for GetFileVersionInfoA")?;
-    let data_ptr = engine
+    let data_va = engine
         .read_r9()
         .context("failed to read R9 for GetFileVersionInfoA")?;
-    let path = read_ansi_string_from_cpu(engine, file_ptr, 1024)?;
+    let path = read_ansi_string_from_cpu(engine, file_va, 1024)?;
     let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full_path = kernel32::resolve_full_windows_path(&cwd, &path);
-    finish_version_info(engine, state, &full_path, data_len, data_ptr)
+    finish_version_info(engine, state, &full_path, data_len, data_va)
 }
 
 /// Handles `VERSION.dll!GetFileVersionInfoExW`.
@@ -583,7 +583,7 @@ pub fn handle_get_file_version_info_ex_w(
     if !validate_ver_get_flags(flags, state) {
         return return_zero(engine, "GetFileVersionInfoExW");
     }
-    let file_ptr = engine
+    let file_va = engine
         .read_rdx()
         .context("failed to read RDX for GetFileVersionInfoExW")?;
     let _handle = engine
@@ -592,11 +592,11 @@ pub fn handle_get_file_version_info_ex_w(
     let data_len = engine
         .read_r9()
         .context("failed to read R9 for GetFileVersionInfoExW")?;
-    let data_ptr = read_stack_u64(engine, 0x28)?; // 5th arg
-    let path = read_wide_string_from_cpu(engine, file_ptr, 1024)?;
+    let data_va = read_stack_u64(engine, 0x28)?; // 5th arg
+    let path = read_wide_string_from_cpu(engine, file_va, 1024)?;
     let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full_path = kernel32::resolve_full_windows_path(&cwd, &path);
-    finish_version_info(engine, state, &full_path, data_len, data_ptr)
+    finish_version_info(engine, state, &full_path, data_len, data_va)
 }
 
 /// Handles `VERSION.dll!GetFileVersionInfoExA`.
@@ -614,7 +614,7 @@ pub fn handle_get_file_version_info_ex_a(
     if !validate_ver_get_flags(flags, state) {
         return return_zero(engine, "GetFileVersionInfoExA");
     }
-    let file_ptr = engine
+    let file_va = engine
         .read_rdx()
         .context("failed to read RDX for GetFileVersionInfoExA")?;
     let _handle = engine
@@ -623,20 +623,20 @@ pub fn handle_get_file_version_info_ex_a(
     let data_len = engine
         .read_r9()
         .context("failed to read R9 for GetFileVersionInfoExA")?;
-    let data_ptr = read_stack_u64(engine, 0x28)?; // 5th arg
-    let path = read_ansi_string_from_cpu(engine, file_ptr, 1024)?;
+    let data_va = read_stack_u64(engine, 0x28)?; // 5th arg
+    let path = read_ansi_string_from_cpu(engine, file_va, 1024)?;
     let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full_path = kernel32::resolve_full_windows_path(&cwd, &path);
-    finish_version_info(engine, state, &full_path, data_len, data_ptr)
+    finish_version_info(engine, state, &full_path, data_len, data_va)
 }
 
 /// Handles `VERSION.dll!VerQueryValueW`.
 pub fn handle_ver_query_value_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let block_ptr = engine
+    let block_va = engine
         .read_rcx()
         .context("failed to read RCX for VerQueryValueW")?;
-    let path_ptr = engine
+    let path_va = engine
         .read_rdx()
         .context("failed to read RDX for VerQueryValueW")?;
     let buffer_out = engine
@@ -645,17 +645,17 @@ pub fn handle_ver_query_value_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let len_out = engine
         .read_r9()
         .context("failed to read R9 for VerQueryValueW")?;
-    let path = read_wide_string_from_cpu(engine, path_ptr, 1024)?;
-    finish_ver_query_value(engine, block_ptr, &path, buffer_out, len_out)
+    let path = read_wide_string_from_cpu(engine, path_va, 1024)?;
+    finish_ver_query_value(engine, block_va, &path, buffer_out, len_out)
 }
 
 /// Handles `VERSION.dll!VerQueryValueA`.
 pub fn handle_ver_query_value_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let block_ptr = engine
+    let block_va = engine
         .read_rcx()
         .context("failed to read RCX for VerQueryValueA")?;
-    let path_ptr = engine
+    let path_va = engine
         .read_rdx()
         .context("failed to read RDX for VerQueryValueA")?;
     let buffer_out = engine
@@ -665,8 +665,8 @@ pub fn handle_ver_query_value_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .read_r9()
         .context("failed to read R9 for VerQueryValueA")?;
     // The A-path is decoded via the shared CP1252 path (UTF-8 literals first).
-    let path = read_ansi_string_from_cpu(engine, path_ptr, 1024)?;
-    finish_ver_query_value(engine, block_ptr, &path, buffer_out, len_out)
+    let path = read_ansi_string_from_cpu(engine, path_va, 1024)?;
+    finish_ver_query_value(engine, block_va, &path, buffer_out, len_out)
 }
 
 /// Handles `VERSION.dll!GetFileVersionInfoByHandleW`.
@@ -687,7 +687,7 @@ pub fn handle_get_file_version_info_by_handle_w(
     let data_len = engine
         .read_r8()
         .context("failed to read R8 for GetFileVersionInfoByHandleW")?;
-    let data_ptr = engine
+    let data_va = engine
         .read_r9()
         .context("failed to read R9 for GetFileVersionInfoByHandleW")?;
     let Some(bytes) = read_open_handle_bytes(state, handle) else {
@@ -707,11 +707,11 @@ pub fn handle_get_file_version_info_by_handle_w(
     };
     let raw = resource.raw;
     let raw_len = u64::try_from(raw.len()).unwrap_or(0);
-    let ok = if data_ptr == 0 || raw_len > data_len {
+    let ok = if data_va == 0 || raw_len > data_len {
         state.process.last_error = ERROR_INSUFFICIENT_BUFFER;
         0
     } else {
-        crate::guest_memory::write_bytes(engine, data_ptr, &raw)
+        crate::guest_memory::write_bytes(engine, data_va, &raw)
             .context("failed to copy version block to guest")?;
         state.process.last_error = 0;
         1
@@ -780,19 +780,19 @@ pub fn handle_ver_find_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     let _flags = engine
         .read_rcx()
         .context("failed to read RCX for VerFindFileW")?;
-    let file_ptr = engine
+    let file_va = engine
         .read_rdx()
         .context("failed to read RDX for VerFindFileW")?;
-    let cur_dir_ptr = read_stack_u64(engine, 0x28)?;
-    let cur_dir_len_ptr = read_stack_u64(engine, 0x30)?;
-    let dest_dir_ptr = read_stack_u64(engine, 0x38)?;
-    let dest_dir_len_ptr = read_stack_u64(engine, 0x40)?;
-    let file = read_wide_string_from_cpu(engine, file_ptr, 1024)?;
+    let cur_dir_va = read_stack_u64(engine, 0x28)?;
+    let cur_dir_len_va = read_stack_u64(engine, 0x30)?;
+    let dest_dir_va = read_stack_u64(engine, 0x38)?;
+    let dest_dir_len_va = read_stack_u64(engine, 0x40)?;
+    let file = read_wide_string_from_cpu(engine, file_va, 1024)?;
     let (mut flags, located) = find_file_dirs(state, &file);
     // Report the located directory; the dest dir is a Windows-versioning
     // concept WIE does not model, so it stays empty (documented above).
-    flags |= write_dir_out(engine, cur_dir_ptr, cur_dir_len_ptr, &located)?;
-    flags |= write_dir_out(engine, dest_dir_ptr, dest_dir_len_ptr, "")?;
+    flags |= write_dir_out(engine, cur_dir_va, cur_dir_len_va, &located)?;
+    flags |= write_dir_out(engine, dest_dir_va, dest_dir_len_va, "")?;
     ctx.finish(u64::from(flags))
 }
 
@@ -803,17 +803,17 @@ pub fn handle_ver_find_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     let _flags = engine
         .read_rcx()
         .context("failed to read RCX for VerFindFileA")?;
-    let file_ptr = engine
+    let file_va = engine
         .read_rdx()
         .context("failed to read RDX for VerFindFileA")?;
-    let cur_dir_ptr = read_stack_u64(engine, 0x28)?;
-    let cur_dir_len_ptr = read_stack_u64(engine, 0x30)?;
-    let dest_dir_ptr = read_stack_u64(engine, 0x38)?;
-    let dest_dir_len_ptr = read_stack_u64(engine, 0x40)?;
-    let file = read_ansi_string_from_cpu(engine, file_ptr, 1024)?;
+    let cur_dir_va = read_stack_u64(engine, 0x28)?;
+    let cur_dir_len_va = read_stack_u64(engine, 0x30)?;
+    let dest_dir_va = read_stack_u64(engine, 0x38)?;
+    let dest_dir_len_va = read_stack_u64(engine, 0x40)?;
+    let file = read_ansi_string_from_cpu(engine, file_va, 1024)?;
     let (mut flags, located) = find_file_dirs(state, &file);
-    flags |= write_dir_out(engine, cur_dir_ptr, cur_dir_len_ptr, &located)?;
-    flags |= write_dir_out(engine, dest_dir_ptr, dest_dir_len_ptr, "")?;
+    flags |= write_dir_out(engine, cur_dir_va, cur_dir_len_va, &located)?;
+    flags |= write_dir_out(engine, dest_dir_va, dest_dir_len_va, "")?;
     ctx.finish(u64::from(flags))
 }
 
@@ -848,41 +848,41 @@ pub fn handle_ver_install_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let _flags = engine
         .read_rcx()
         .context("failed to read RCX for VerInstallFileW")?;
-    let src_file_ptr = engine
+    let src_file_va = engine
         .read_rdx()
         .context("failed to read RDX for VerInstallFileW")?;
-    let dest_file_ptr = engine
+    let dest_file_va = engine
         .read_r8()
         .context("failed to read R8 for VerInstallFileW")?;
-    let src_dir_ptr = engine
+    let src_dir_va = engine
         .read_r9()
         .context("failed to read R9 for VerInstallFileW")?;
-    let dest_dir_ptr = read_stack_u64(engine, 0x28)?;
-    let tmp_file_ptr = read_stack_u64(engine, 0x38)?;
-    let tmp_file_len_ptr = read_stack_u64(engine, 0x40)?;
-    let src_file = read_wide_string_from_cpu(engine, src_file_ptr, 1024)?;
-    let dest_file = read_wide_string_from_cpu(engine, dest_file_ptr, 1024)?;
-    let src_dir = read_wide_string_from_cpu(engine, src_dir_ptr, 1024)?;
-    let dest_dir = read_wide_string_from_cpu(engine, dest_dir_ptr, 1024)?;
+    let dest_dir_va = read_stack_u64(engine, 0x28)?;
+    let tmp_file_va = read_stack_u64(engine, 0x38)?;
+    let tmp_file_len_va = read_stack_u64(engine, 0x40)?;
+    let src_file = read_wide_string_from_cpu(engine, src_file_va, 1024)?;
+    let dest_file = read_wide_string_from_cpu(engine, dest_file_va, 1024)?;
+    let src_dir = read_wide_string_from_cpu(engine, src_dir_va, 1024)?;
+    let dest_dir = read_wide_string_from_cpu(engine, dest_dir_va, 1024)?;
     let mut flags = install_file(state, &src_dir, &src_file, &dest_dir, &dest_file)?;
     // The temp file is the destination file itself (WIE copies in place —
     // there is no two-phase temp-then-rename dance to report).
-    let cap = if tmp_file_len_ptr == 0 {
+    let cap = if tmp_file_len_va == 0 {
         0
     } else {
-        usize::try_from(u64::from(kernel32::read_u32(engine, tmp_file_len_ptr)?))
+        usize::try_from(u64::from(kernel32::read_u32(engine, tmp_file_len_va)?))
             .context("VerInstallFileW temp length does not fit usize")?
     };
     let needed = dest_file.encode_utf16().count();
-    let written = if tmp_file_ptr == 0 {
+    let written = if tmp_file_va == 0 {
         0
     } else {
-        crate::guest_string::write_utf16_c_string(engine, tmp_file_ptr, cap, &dest_file)?
+        crate::guest_string::write_utf16_c_string(engine, tmp_file_va, cap, &dest_file)?
     };
-    if tmp_file_len_ptr != 0 {
+    if tmp_file_len_va != 0 {
         kernel32::write_guest_u32(
             engine,
-            tmp_file_len_ptr,
+            tmp_file_len_va,
             u32::try_from(needed).unwrap_or(u32::MAX),
         )?;
     }
@@ -899,39 +899,39 @@ pub fn handle_ver_install_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let _flags = engine
         .read_rcx()
         .context("failed to read RCX for VerInstallFileA")?;
-    let src_file_ptr = engine
+    let src_file_va = engine
         .read_rdx()
         .context("failed to read RDX for VerInstallFileA")?;
-    let dest_file_ptr = engine
+    let dest_file_va = engine
         .read_r8()
         .context("failed to read R8 for VerInstallFileA")?;
-    let src_dir_ptr = engine
+    let src_dir_va = engine
         .read_r9()
         .context("failed to read R9 for VerInstallFileA")?;
-    let dest_dir_ptr = read_stack_u64(engine, 0x28)?;
-    let tmp_file_ptr = read_stack_u64(engine, 0x38)?;
-    let tmp_file_len_ptr = read_stack_u64(engine, 0x40)?;
-    let src_file = read_ansi_string_from_cpu(engine, src_file_ptr, 1024)?;
-    let dest_file = read_ansi_string_from_cpu(engine, dest_file_ptr, 1024)?;
-    let src_dir = read_ansi_string_from_cpu(engine, src_dir_ptr, 1024)?;
-    let dest_dir = read_ansi_string_from_cpu(engine, dest_dir_ptr, 1024)?;
+    let dest_dir_va = read_stack_u64(engine, 0x28)?;
+    let tmp_file_va = read_stack_u64(engine, 0x38)?;
+    let tmp_file_len_va = read_stack_u64(engine, 0x40)?;
+    let src_file = read_ansi_string_from_cpu(engine, src_file_va, 1024)?;
+    let dest_file = read_ansi_string_from_cpu(engine, dest_file_va, 1024)?;
+    let src_dir = read_ansi_string_from_cpu(engine, src_dir_va, 1024)?;
+    let dest_dir = read_ansi_string_from_cpu(engine, dest_dir_va, 1024)?;
     let mut flags = install_file(state, &src_dir, &src_file, &dest_dir, &dest_file)?;
-    let cap = if tmp_file_len_ptr == 0 {
+    let cap = if tmp_file_len_va == 0 {
         0
     } else {
-        usize::try_from(u64::from(kernel32::read_u32(engine, tmp_file_len_ptr)?))
+        usize::try_from(u64::from(kernel32::read_u32(engine, tmp_file_len_va)?))
             .context("VerInstallFileA temp length does not fit usize")?
     };
     let needed = crate::guest_string::encode_cp1252(&dest_file).len();
-    let written = if tmp_file_ptr == 0 {
+    let written = if tmp_file_va == 0 {
         0
     } else {
-        crate::guest_string::write_ansi_c_string(engine, tmp_file_ptr, cap, &dest_file)?
+        crate::guest_string::write_ansi_c_string(engine, tmp_file_va, cap, &dest_file)?
     };
-    if tmp_file_len_ptr != 0 {
+    if tmp_file_len_va != 0 {
         kernel32::write_guest_u32(
             engine,
-            tmp_file_len_ptr,
+            tmp_file_len_va,
             u32::try_from(needed).unwrap_or(u32::MAX),
         )?;
     }

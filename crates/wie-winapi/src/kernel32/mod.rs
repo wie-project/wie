@@ -230,22 +230,22 @@ pub(crate) fn create_fake_resource_record(
         .checked_mul(0x100)
         .context("resource data offset overflow")?;
 
-    let data_ptr = FAKE_RESOURCE_DATA_BASE
+    let data_va = FAKE_RESOURCE_DATA_BASE
         .checked_add(data_offset)
         .context("resource data pointer overflow")?;
 
     engine
-        .mem_write(data_ptr, &FAKE_RESOURCE_BYTES)
+        .mem_write(data_va, &FAKE_RESOURCE_BYTES)
         .context("failed to write fake resource bytes")?;
 
     // For this compatibility harness, make the loaded resource handle pointer-like.
     // Some old Win32-style code uses the result of LoadResource directly as data.
-    let loaded_handle = data_ptr;
+    let loaded_handle = data_va;
 
     let record = ResourceRecord {
         handle,
         loaded_handle,
-        data_ptr,
+        data_ptr: data_va,
         size: FAKE_RESOURCE_SIZE,
     };
 

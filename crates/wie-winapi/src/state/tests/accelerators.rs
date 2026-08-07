@@ -80,20 +80,20 @@ fn test_translate_accelerator_w_posts_wm_command() {
     assert_ne!(haccel, 0);
 
     // MSG struct at 0x4000: message = WM_KEYDOWN, wParam = VK_N (0x4E).
-    let msg_ptr = 0x4000_u64;
+    let msg_va = 0x4000_u64;
     engine
-        .mem_map(msg_ptr, 0x1000, wie_cpu::RwxPerms::ALL)
+        .mem_map(msg_va, 0x1000, wie_cpu::RwxPerms::ALL)
         .expect("map msg struct");
     let mut msg = hwnd.to_le_bytes().to_vec();
     msg.extend_from_slice(&crate::user32::WM_KEYDOWN.to_le_bytes());
     msg.extend_from_slice(&[0_u8; 4]); // alignment padding
     msg.extend_from_slice(&0x4E_u64.to_le_bytes());
     msg.extend_from_slice(&0_u64.to_le_bytes()); // lParam
-    engine.mem_write(msg_ptr, &msg).expect("write MSG struct");
+    engine.mem_write(msg_va, &msg).expect("write MSG struct");
     // Ctrl is down (the table entry requires FCONTROL).
     state.window_state().keyboard_state.set(0x11, 0x80);
 
-    write_regs(&mut engine, hwnd, haccel, msg_ptr, 0, 0);
+    write_regs(&mut engine, hwnd, haccel, msg_va, 0, 0);
     let translated = dispatch_user32(&mut engine, &mut state, "TranslateAcceleratorW");
     assert_eq!(translated, 1, "matching VK + Ctrl must translate");
 
@@ -128,9 +128,9 @@ fn test_translate_accelerator_w_no_match_posts_nothing() {
     write_regs(&mut engine, image_base, 0x100, 0, 0, 0);
     let haccel = dispatch_user32(&mut engine, &mut state, "LoadAcceleratorsW");
 
-    let msg_ptr = 0x4000_u64;
+    let msg_va = 0x4000_u64;
     engine
-        .mem_map(msg_ptr, 0x1000, wie_cpu::RwxPerms::ALL)
+        .mem_map(msg_va, 0x1000, wie_cpu::RwxPerms::ALL)
         .expect("map msg struct");
     // WM_KEYDOWN with VK_N but Ctrl NOT down: the FCONTROL entry must not match.
     let mut msg = hwnd.to_le_bytes().to_vec();
@@ -138,9 +138,9 @@ fn test_translate_accelerator_w_no_match_posts_nothing() {
     msg.extend_from_slice(&[0_u8; 4]);
     msg.extend_from_slice(&0x4E_u64.to_le_bytes());
     msg.extend_from_slice(&0_u64.to_le_bytes());
-    engine.mem_write(msg_ptr, &msg).expect("write MSG struct");
+    engine.mem_write(msg_va, &msg).expect("write MSG struct");
 
-    write_regs(&mut engine, hwnd, haccel, msg_ptr, 0, 0);
+    write_regs(&mut engine, hwnd, haccel, msg_va, 0, 0);
     let translated = dispatch_user32(&mut engine, &mut state, "TranslateAcceleratorW");
     assert_eq!(translated, 0, "Ctrl-up must not translate");
     assert_eq!(
@@ -170,18 +170,18 @@ fn test_translate_accelerator_w_plain_char() {
     let haccel = dispatch_user32(&mut engine, &mut state, "LoadAcceleratorsW");
 
     // A non-VIRTKEY entry matches a WM_CHAR whose wParam is the ANSI char.
-    let msg_ptr = 0x4000_u64;
+    let msg_va = 0x4000_u64;
     engine
-        .mem_map(msg_ptr, 0x1000, wie_cpu::RwxPerms::ALL)
+        .mem_map(msg_va, 0x1000, wie_cpu::RwxPerms::ALL)
         .expect("map msg struct");
     let mut msg = hwnd.to_le_bytes().to_vec();
     msg.extend_from_slice(&crate::user32::WM_CHAR.to_le_bytes());
     msg.extend_from_slice(&[0_u8; 4]);
     msg.extend_from_slice(&0x61_u64.to_le_bytes()); // 'a'
     msg.extend_from_slice(&0_u64.to_le_bytes());
-    engine.mem_write(msg_ptr, &msg).expect("write MSG struct");
+    engine.mem_write(msg_va, &msg).expect("write MSG struct");
 
-    write_regs(&mut engine, hwnd, haccel, msg_ptr, 0, 0);
+    write_regs(&mut engine, hwnd, haccel, msg_va, 0, 0);
     let translated = dispatch_user32(&mut engine, &mut state, "TranslateAcceleratorW");
     assert_eq!(translated, 1, "plain-char match must translate");
     let queue = state
@@ -212,18 +212,18 @@ fn test_translate_accelerator_a_mirrors_w() {
 
     // Shift+O (0x05 = FVIRTKEY|FSHIFT = 0x01|0x04, VK_O) via the A variant.
     state.window_state().keyboard_state.set(0x10, 0x80); // VK_SHIFT
-    let msg_ptr = 0x4000_u64;
+    let msg_va = 0x4000_u64;
     engine
-        .mem_map(msg_ptr, 0x1000, wie_cpu::RwxPerms::ALL)
+        .mem_map(msg_va, 0x1000, wie_cpu::RwxPerms::ALL)
         .expect("map msg struct");
     let mut msg = hwnd.to_le_bytes().to_vec();
     msg.extend_from_slice(&crate::user32::WM_KEYDOWN.to_le_bytes());
     msg.extend_from_slice(&[0_u8; 4]);
     msg.extend_from_slice(&0x4F_u64.to_le_bytes()); // VK_O
     msg.extend_from_slice(&0_u64.to_le_bytes());
-    engine.mem_write(msg_ptr, &msg).expect("write MSG struct");
+    engine.mem_write(msg_va, &msg).expect("write MSG struct");
 
-    write_regs(&mut engine, hwnd, haccel, msg_ptr, 0, 0);
+    write_regs(&mut engine, hwnd, haccel, msg_va, 0, 0);
     let translated = dispatch_user32(&mut engine, &mut state, "TranslateAcceleratorA");
     assert_eq!(translated, 1, "Shift+O must translate via the A variant");
     let queue = state
@@ -242,15 +242,15 @@ fn test_translate_accelerator_a_mirrors_w() {
 fn test_translate_accelerator_w_unknown_haccel_is_false() {
     let mut engine = test_engine();
     let mut state = default_winapi_state();
-    let msg_ptr = 0x4000_u64;
+    let msg_va = 0x4000_u64;
     engine
-        .mem_map(msg_ptr, 0x1000, wie_cpu::RwxPerms::ALL)
+        .mem_map(msg_va, 0x1000, wie_cpu::RwxPerms::ALL)
         .expect("map msg struct");
     write_regs(
         &mut engine,
         0x6610_1000,
         0x0000_0000_6640_0005,
-        msg_ptr,
+        msg_va,
         0,
         0,
     );

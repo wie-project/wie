@@ -432,7 +432,7 @@ fn handle_append_menu_impl(
         .read_r8()
         .with_context(|| format!("failed to read R8 for {api_name}"))?;
 
-    let item_text_ptr = engine
+    let item_text_va = engine
         .read_r9()
         .with_context(|| format!("failed to read R9 for {api_name}"))?;
 
@@ -442,13 +442,13 @@ fn handle_append_menu_impl(
     let item_id = u32::try_from(item_id_raw & u64::from(u32::MAX))
         .with_context(|| format!("{api_name} item id does not fit u32"))?;
 
-    let text = if item_text_ptr == 0 || flags & MF_SEPARATOR != 0 {
+    let text = if item_text_va == 0 || flags & MF_SEPARATOR != 0 {
         String::new()
     } else if unicode {
-        read_guest_utf16_lossy(engine, item_text_ptr, 1024)
+        read_guest_utf16_lossy(engine, item_text_va, 1024)
             .with_context(|| format!("failed to read {api_name} item text"))?
     } else {
-        read_guest_ansi_lossy(engine, item_text_ptr, 1024)
+        read_guest_ansi_lossy(engine, item_text_va, 1024)
             .with_context(|| format!("failed to read {api_name} item text"))?
     };
 
@@ -590,19 +590,19 @@ fn handle_get_menu_item_info_impl(
         .read_r8()
         .with_context(|| format!("failed to read R8 for {api_name}"))?;
 
-    let info_ptr = engine
+    let info_va = engine
         .read_r9()
         .with_context(|| format!("failed to read R9 for {api_name}"))?;
 
     let by_position = by_position_raw != 0;
-    let success = info_ptr != 0
+    let success = info_va != 0
         && fill_menu_item_info(
             engine,
             state,
             menu_handle,
             item_value,
             by_position,
-            info_ptr,
+            info_va,
             unicode,
         )
         .with_context(|| format!("failed to fill {api_name} MENUITEMINFO"))?;
@@ -782,7 +782,7 @@ fn fill_menu_item_info(
     menu_handle: Hmenu,
     item_value: u64,
     by_position: bool,
-    info_ptr: u64,
+    info_va: u64,
     unicode: bool,
 ) -> Result<bool> {
     let Some(item) = find_menu_entry(
@@ -801,7 +801,7 @@ fn fill_menu_item_info(
     // between them. The layout + pinned offsets (dwTypeData @56, cch @64)
     // live in `crate::guest_layout::MenuItemInfo`.
     let mut info =
-        read_typed_copy::<MenuItemInfo>(engine, info_ptr).context("failed to read MENUITEMINFO")?;
+        read_typed_copy::<MenuItemInfo>(engine, info_va).context("failed to read MENUITEMINFO")?;
 
     if info.f_mask & MIIM_STATE != 0 {
         info.f_state = item.flags & 0x00ff;
@@ -826,7 +826,7 @@ fn fill_menu_item_info(
         }
     }
 
-    write_typed_copy(engine, info_ptr, info).context("failed to write MENUITEMINFO")?;
+    write_typed_copy(engine, info_va, info).context("failed to write MENUITEMINFO")?;
 
     Ok(true)
 }

@@ -53,11 +53,11 @@ pub fn handle_get_file_type(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 pub fn handle_get_file_attributes_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let path_ptr = engine
+    let path_va = engine
         .read_rcx()
         .context("failed to read RCX for GetFileAttributesA")?;
 
-    let path = read_ansi_string_from_cpu(engine, path_ptr, 1024)?;
+    let path = read_ansi_string_from_cpu(engine, path_va, 1024)?;
     let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full_path = resolve_full_windows_path(&cwd, &path);
     let return_value = file_attributes_for_path(state, &full_path);
@@ -73,11 +73,11 @@ pub fn handle_get_file_attributes_a(ctx: &mut HandlerContext<'_>) -> Result<WinA
 pub fn handle_get_file_attributes_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let path_ptr = engine
+    let path_va = engine
         .read_rcx()
         .context("failed to read RCX for GetFileAttributesW")?;
 
-    let path = read_wide_string_from_cpu(engine, path_ptr, 1024)?;
+    let path = read_wide_string_from_cpu(engine, path_va, 1024)?;
     let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let full_path = resolve_full_windows_path(&cwd, &path);
     let return_value = file_attributes_for_path(state, &full_path);
@@ -93,16 +93,16 @@ pub fn handle_get_file_attributes_w(ctx: &mut HandlerContext<'_>) -> Result<WinA
 pub fn handle_find_first_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let pattern_ptr = engine
+    let pattern_va = engine
         .read_rcx()
         .context("failed to read RCX for FindFirstFileW")?;
 
-    let find_data_ptr = engine
+    let find_data_va = engine
         .read_rdx()
         .context("failed to read RDX for FindFirstFileW")?;
 
-    let pattern = read_wide_string_from_cpu(engine, pattern_ptr, 1024)?;
-    let return_value = finish_find_first(engine, state, &pattern, find_data_ptr, true)?;
+    let pattern = read_wide_string_from_cpu(engine, pattern_va, 1024)?;
+    let return_value = finish_find_first(engine, state, &pattern, find_data_va, true)?;
 
     ctx.finish(return_value)
 }
@@ -110,16 +110,16 @@ pub fn handle_find_first_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 pub fn handle_find_first_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let pattern_ptr = engine
+    let pattern_va = engine
         .read_rcx()
         .context("failed to read RCX for FindFirstFileA")?;
 
-    let find_data_ptr = engine
+    let find_data_va = engine
         .read_rdx()
         .context("failed to read RDX for FindFirstFileA")?;
 
-    let pattern = read_ansi_string_from_cpu(engine, pattern_ptr, 1024)?;
-    let return_value = finish_find_first(engine, state, &pattern, find_data_ptr, false)?;
+    let pattern = read_ansi_string_from_cpu(engine, pattern_va, 1024)?;
+    let return_value = finish_find_first(engine, state, &pattern, find_data_va, false)?;
 
     ctx.finish(return_value)
 }
@@ -131,11 +131,11 @@ pub fn handle_find_next_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         .read_rcx()
         .context("failed to read RCX for FindNextFileW")?;
 
-    let find_data_ptr = engine
+    let find_data_va = engine
         .read_rdx()
         .context("failed to read RDX for FindNextFileW")?;
 
-    let return_value = finish_find_next(engine, state, find_handle, find_data_ptr, true)?;
+    let return_value = finish_find_next(engine, state, find_handle, find_data_va, true)?;
 
     ctx.finish(return_value)
 }
@@ -147,11 +147,11 @@ pub fn handle_find_next_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         .read_rcx()
         .context("failed to read RCX for FindNextFileA")?;
 
-    let find_data_ptr = engine
+    let find_data_va = engine
         .read_rdx()
         .context("failed to read RDX for FindNextFileA")?;
 
-    let return_value = finish_find_next(engine, state, find_handle, find_data_ptr, false)?;
+    let return_value = finish_find_next(engine, state, find_handle, find_data_va, false)?;
 
     ctx.finish(return_value)
 }
@@ -174,7 +174,7 @@ pub fn handle_find_close(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 pub fn handle_create_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let file_name_ptr = engine
+    let file_name_va = engine
         .read_rcx()
         .context("failed to read RCX for CreateFileW")?;
 
@@ -190,10 +190,10 @@ pub fn handle_create_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         .read_r9()
         .context("failed to read R9 for CreateFileW")?;
 
-    let file_name = if file_name_ptr == 0 {
+    let file_name = if file_name_va == 0 {
         String::new()
     } else {
-        read_wide_string_from_cpu(engine, file_name_ptr, 32_768)
+        read_wide_string_from_cpu(engine, file_name_va, 32_768)
             .context("failed to read CreateFileW file name")?
     };
 
@@ -216,7 +216,7 @@ pub fn handle_create_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 pub fn handle_create_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let file_name_ptr = engine
+    let file_name_va = engine
         .read_rcx()
         .context("failed to read RCX for CreateFileA")?;
 
@@ -232,10 +232,10 @@ pub fn handle_create_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         .read_r9()
         .context("failed to read R9 for CreateFileA")?;
 
-    let file_name = if file_name_ptr == 0 {
+    let file_name = if file_name_va == 0 {
         String::new()
     } else {
-        read_ansi_string_from_cpu(engine, file_name_ptr, 32_768)
+        read_ansi_string_from_cpu(engine, file_name_va, 32_768)
             .context("failed to read CreateFileA file name")?
     };
 
@@ -307,19 +307,19 @@ pub fn handle_get_file_information_by_handle(
         .read_rcx()
         .context("failed to read RCX for GetFileInformationByHandle")?;
 
-    let info_ptr = engine
+    let info_va = engine
         .read_rdx()
         .context("failed to read RDX for GetFileInformationByHandle")?;
 
     let open_file = find_open_file(state, handle);
-    let success = open_file.is_some() && info_ptr != 0;
+    let success = open_file.is_some() && info_va != 0;
 
-    if let Some(open_file) = open_file.filter(|_| info_ptr != 0) {
+    if let Some(open_file) = open_file.filter(|_| info_va != 0) {
         let file_size = open_file.size();
         // One shared-lock borrow instead of ten per-field writes. The view
         // starts zeroed, which covers the (empty) struct tail; every field
         // the old handler wrote is set explicitly below.
-        with_typed_write::<ByHandleFileInformation, _, _>(engine, info_ptr, |info| {
+        with_typed_write::<ByHandleFileInformation, _, _>(engine, info_va, |info| {
             info.dw_file_attributes = u32::try_from(FILE_ATTRIBUTE_ARCHIVE).unwrap_or(0x20);
             let ft_low = u32::try_from(FIXED_SYSTEM_FILETIME & 0xffff_ffff).unwrap_or(0);
             let ft_high = u32::try_from(FIXED_SYSTEM_FILETIME >> 32).unwrap_or(0);
@@ -355,10 +355,10 @@ pub fn handle_get_file_size_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let handle = engine.read_rcx()?;
-    let size_ptr = engine.read_rdx()?;
+    let size_va = engine.read_rdx()?;
     let return_value = if let Some(open_file) = find_open_file(state, handle) {
-        if size_ptr != 0 {
-            write_guest_u64(engine, size_ptr, open_file.size())?;
+        if size_va != 0 {
+            write_guest_u64(engine, size_va, open_file.size())?;
         }
         state.process.last_error = 0;
         1
@@ -377,7 +377,7 @@ pub fn handle_set_file_pointer_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     let distance_raw = engine.read_rdx()?;
     let distance = i64::from_le_bytes(distance_raw.to_le_bytes());
     let move_method = engine.read_r8()?;
-    let new_pos_ptr = engine.read_r9()?;
+    let new_pos_va = engine.read_r9()?;
 
     let valid_method =
         move_method == FILE_BEGIN || move_method == FILE_CURRENT || move_method == FILE_END;
@@ -405,8 +405,8 @@ pub fn handle_set_file_pointer_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApi
         } else {
             let new_cursor = u64::try_from(new_position).unwrap_or(0);
             open_file.cursor = new_cursor;
-            if new_pos_ptr != 0 {
-                write_guest_u64(engine, new_pos_ptr, new_cursor)?;
+            if new_pos_va != 0 {
+                write_guest_u64(engine, new_pos_va, new_cursor)?;
             }
             state.process.last_error = 0;
             1
@@ -527,11 +527,11 @@ pub(crate) fn collect_find_entries(
 /// ```
 pub(crate) fn write_find_data_common(
     engine: &mut dyn wie_cpu::CpuEngine,
-    find_data_ptr: u64,
+    find_data_va: u64,
     attributes: u32,
     file_size: u64,
 ) -> Result<()> {
-    if find_data_ptr == 0 {
+    if find_data_va == 0 {
         return Ok(());
     }
 
@@ -540,7 +540,7 @@ pub(crate) fn write_find_data_common(
     // old code zeroed them explicitly in the header array. `FILETIME` is a
     // (low, high) `DWORD` pair, so the fixed time splits like the old
     // `to_le_bytes` header write.
-    with_typed_write::<FindDataHeader, _, _>(engine, find_data_ptr, |header| {
+    with_typed_write::<FindDataHeader, _, _>(engine, find_data_va, |header| {
         header.dw_file_attributes = attributes;
         let ft_low = u32::try_from(FIXED_SYSTEM_FILETIME & 0xffff_ffff).unwrap_or(0);
         let ft_high = u32::try_from(FIXED_SYSTEM_FILETIME >> 32).unwrap_or(0);
@@ -560,26 +560,26 @@ pub(crate) fn write_find_data_common(
 
 pub(crate) fn write_find_data_w(
     engine: &mut dyn wie_cpu::CpuEngine,
-    find_data_ptr: u64,
+    find_data_va: u64,
     file_name: &str,
     attributes: u32,
     file_size: u64,
 ) -> Result<()> {
-    write_find_data_common(engine, find_data_ptr, attributes, file_size)?;
+    write_find_data_common(engine, find_data_va, attributes, file_size)?;
 
-    if find_data_ptr == 0 {
+    if find_data_va == 0 {
         return Ok(());
     }
 
     // cFileName is at offset 44 (after dwReserved1); cAlternateFileName[14]
     // starts at 44 + MAX_PATH*2 = 564.
     let file_name_address = checked_address(
-        find_data_ptr,
+        find_data_va,
         FIND_DATA_FILE_NAME_OFFSET,
         "WIN32_FIND_DATAW.cFileName",
     );
     let alt_name_address = checked_address(
-        find_data_ptr,
+        find_data_va,
         FIND_DATA_W_ALT_NAME_OFFSET,
         "WIN32_FIND_DATAW.cAlternateFileName",
     );
@@ -600,25 +600,25 @@ pub(crate) fn write_find_data_w(
 
 pub(crate) fn write_find_data_a(
     engine: &mut dyn wie_cpu::CpuEngine,
-    find_data_ptr: u64,
+    find_data_va: u64,
     file_name: &str,
     attributes: u32,
     file_size: u64,
 ) -> Result<()> {
-    write_find_data_common(engine, find_data_ptr, attributes, file_size)?;
+    write_find_data_common(engine, find_data_va, attributes, file_size)?;
 
-    if find_data_ptr == 0 {
+    if find_data_va == 0 {
         return Ok(());
     }
 
     // Same header as W; cFileName is CHAR[MAX_PATH] at offset 44.
     let file_name_address = checked_address(
-        find_data_ptr,
+        find_data_va,
         FIND_DATA_FILE_NAME_OFFSET,
         "WIN32_FIND_DATAA.cFileName",
     );
     let alt_name_address = checked_address(
-        find_data_ptr,
+        find_data_va,
         FIND_DATA_A_ALT_NAME_OFFSET,
         "WIN32_FIND_DATAA.cAlternateFileName",
     );
@@ -640,7 +640,7 @@ pub(crate) fn finish_find_first(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
     pattern: &str,
-    find_data_ptr: u64,
+    find_data_va: u64,
     unicode: bool,
 ) -> Result<u64> {
     if pattern.trim().is_empty() {
@@ -663,7 +663,7 @@ pub(crate) fn finish_find_first(
     if unicode {
         write_find_data_w(
             engine,
-            find_data_ptr,
+            find_data_va,
             &first.name,
             first.attributes,
             first.size,
@@ -671,7 +671,7 @@ pub(crate) fn finish_find_first(
     } else {
         write_find_data_a(
             engine,
-            find_data_ptr,
+            find_data_va,
             &first.name,
             first.attributes,
             first.size,
@@ -701,7 +701,7 @@ pub(crate) fn finish_find_next(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
     find_handle: u64,
-    find_data_ptr: u64,
+    find_data_va: u64,
     unicode: bool,
 ) -> Result<u64> {
     let Some(slot) = state
@@ -719,21 +719,9 @@ pub(crate) fn finish_find_next(
         return Ok(0);
     };
     if unicode {
-        write_find_data_w(
-            engine,
-            find_data_ptr,
-            &next.name,
-            next.attributes,
-            next.size,
-        )?;
+        write_find_data_w(engine, find_data_va, &next.name, next.attributes, next.size)?;
     } else {
-        write_find_data_a(
-            engine,
-            find_data_ptr,
-            &next.name,
-            next.attributes,
-            next.size,
-        )?;
+        write_find_data_a(engine, find_data_va, &next.name, next.attributes, next.size)?;
     }
     state.process.last_error = 0;
     Ok(1)
@@ -844,15 +832,15 @@ pub(crate) fn write_fixed_dir_w(
     dir: &str,
 ) -> Result<WinApiHandlerResult> {
     let buffer_len = engine.read_rcx()?;
-    let buffer_ptr = engine.read_rdx()?;
+    let buffer_va = engine.read_rdx()?;
     let units: Vec<u16> = dir.encode_utf16().collect();
     let required = u64::try_from(units.len().saturating_add(1)).unwrap_or(0);
-    let return_value = if buffer_ptr == 0 || buffer_len < required {
+    let return_value = if buffer_va == 0 || buffer_len < required {
         required
     } else {
         let mut t = units;
         t.push(0);
-        write_guest_utf16_units(engine, buffer_ptr, &t)?;
+        write_guest_utf16_units(engine, buffer_va, &t)?;
         u64::try_from(t.len().saturating_sub(1)).unwrap_or(0)
     };
     let return_address = engine.return_from_win64_api(return_value)?;
@@ -867,15 +855,15 @@ pub(crate) fn write_fixed_dir_a(
     dir: &str,
 ) -> Result<WinApiHandlerResult> {
     let buffer_len = engine.read_rcx()?;
-    let buffer_ptr = engine.read_rdx()?;
+    let buffer_va = engine.read_rdx()?;
     let bytes = crate::vfs::encode_acp(dir);
     let required = u64::try_from(bytes.len().saturating_add(1)).unwrap_or(0);
-    let return_value = if buffer_ptr == 0 || buffer_len < required {
+    let return_value = if buffer_va == 0 || buffer_len < required {
         required
     } else {
         let mut out = bytes;
         out.push(0);
-        engine.mem_write(buffer_ptr, &out)?;
+        engine.mem_write(buffer_va, &out)?;
         u64::try_from(out.len().saturating_sub(1)).unwrap_or(0)
     };
     let return_address = engine.return_from_win64_api(return_value)?;

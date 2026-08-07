@@ -108,11 +108,11 @@ pub fn handle_get_text_metrics_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         .read_rcx()
         .context("failed to read RCX for GetTextMetricsA")?;
 
-    let metrics_ptr = engine
+    let metrics_va = engine
         .read_rdx()
         .context("failed to read RDX for GetTextMetricsA")?;
 
-    let success = metrics_ptr != 0;
+    let success = metrics_va != 0;
     if success {
         let m = resolve_text_metrics(state, hdc);
         // System fonts are vector (variable-pitch); TMPF_VECTOR = 0x01.
@@ -122,7 +122,7 @@ pub fn handle_get_text_metrics_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         // view zero-fills first, so the char fields (44..52), overhang, and
         // digitized-aspect fields read as zero exactly like the old
         // per-field writes left them.
-        with_typed_write::<TextMetricA, _, _>(engine, metrics_ptr, |tm| {
+        with_typed_write::<TextMetricA, _, _>(engine, metrics_va, |tm| {
             tm.height = m.height;
             tm.ascent = m.ascent;
             tm.descent = m.descent;
@@ -158,11 +158,11 @@ pub fn handle_get_text_metrics_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         .read_rcx()
         .context("failed to read RCX for GetTextMetricsW")?;
 
-    let metrics_ptr = engine
+    let metrics_va = engine
         .read_rdx()
         .context("failed to read RDX for GetTextMetricsW")?;
 
-    let success = metrics_ptr != 0;
+    let success = metrics_va != 0;
     if success {
         let m = resolve_text_metrics(state, hdc);
         // System fonts are vector (variable-pitch); TMPF_VECTOR = 0x01.
@@ -171,7 +171,7 @@ pub fn handle_get_text_metrics_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         // TEXTMETRICW: 11 LONGs, 4 WCHARs, 5 BYTEs, 3 pad bytes = 60 bytes.
         // The char fields widen to WCHAR (44..51) and the flags shift to
         // 52..56 — the layout verified by the TextMetricW const-assert table.
-        with_typed_write::<TextMetricW, _, _>(engine, metrics_ptr, |tm| {
+        with_typed_write::<TextMetricW, _, _>(engine, metrics_va, |tm| {
             tm.height = m.height;
             tm.ascent = m.ascent;
             tm.descent = m.descent;

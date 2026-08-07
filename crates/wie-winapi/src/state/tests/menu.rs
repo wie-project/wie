@@ -54,7 +54,7 @@ fn create_menu(state: &mut WinApiState) -> u64 {
     r.return_value
 }
 
-/// Invoke `AppendMenuA(menu, flags, item_id, text_ptr)`, writing `text`
+/// Invoke `AppendMenuA(menu, flags, item_id, text_va)`, writing `text`
 /// into guest memory first (empty text uses a null pointer).
 fn append_menu_a(
     engine: &mut IcedCpu,
@@ -64,7 +64,7 @@ fn append_menu_a(
     item_id: u32,
     text: &str,
 ) {
-    let text_ptr = if text.is_empty() {
+    let text_va = if text.is_empty() {
         0
     } else {
         engine
@@ -77,7 +77,7 @@ fn append_menu_a(
         menu,
         u64::from(flags),
         u64::from(item_id),
-        text_ptr,
+        text_va,
         0,
     );
     assert_return_value!(

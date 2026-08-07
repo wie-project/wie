@@ -113,24 +113,24 @@ pub(crate) fn test_environment() -> WinApiEnvironment {
         process_heap_handle: 0,
     }
 }
-/// Write an `OPENFILENAME` (Win64) into guest memory at `ofn_ptr` with
-/// `lpstrFile` → `file_buf` and optional `lpstrDefExt` → `def_ext_ptr`.
+/// Write an `OPENFILENAME` (Win64) into guest memory at `ofn_va` with
+/// `lpstrFile` → `file_buf` and optional `lpstrDefExt` → `def_ext_va`.
 pub(crate) fn write_ofn(
     engine: &mut IcedCpu,
-    ofn_ptr: u64,
+    ofn_va: u64,
     file_buf: u64,
     max_file: u32,
-    def_ext_ptr: u64,
+    def_ext_va: u64,
 ) {
-    engine.mem_write(ofn_ptr, &0x58_u32.to_le_bytes()).ok(); // lStructSize
-    engine.mem_write(ofn_ptr + 8, &0_u64.to_le_bytes()).ok(); // hwndOwner
-    engine.mem_write(ofn_ptr + 48, &file_buf.to_le_bytes()).ok(); // lpstrFile
-    engine.mem_write(ofn_ptr + 56, &max_file.to_le_bytes()).ok(); // nMaxFile
-    engine.mem_write(ofn_ptr + 64, &0_u64.to_le_bytes()).ok(); // lpstrFileTitle
-    engine.mem_write(ofn_ptr + 72, &0_u32.to_le_bytes()).ok(); // nMaxFileTitle
-    engine.mem_write(ofn_ptr + 80, &0_u64.to_le_bytes()).ok(); // lpstrInitialDir (0 → guest cwd fallback)
+    engine.mem_write(ofn_va, &0x58_u32.to_le_bytes()).ok(); // lStructSize
+    engine.mem_write(ofn_va + 8, &0_u64.to_le_bytes()).ok(); // hwndOwner
+    engine.mem_write(ofn_va + 48, &file_buf.to_le_bytes()).ok(); // lpstrFile
+    engine.mem_write(ofn_va + 56, &max_file.to_le_bytes()).ok(); // nMaxFile
+    engine.mem_write(ofn_va + 64, &0_u64.to_le_bytes()).ok(); // lpstrFileTitle
+    engine.mem_write(ofn_va + 72, &0_u32.to_le_bytes()).ok(); // nMaxFileTitle
+    engine.mem_write(ofn_va + 80, &0_u64.to_le_bytes()).ok(); // lpstrInitialDir (0 → guest cwd fallback)
     engine
-        .mem_write(ofn_ptr + 104, &def_ext_ptr.to_le_bytes())
+        .mem_write(ofn_va + 104, &def_ext_va.to_le_bytes())
         .ok(); // lpstrDefExt
 }
 pub(crate) fn read_guest_utf16(engine: &mut IcedCpu, ptr: u64, max_units: usize) -> String {

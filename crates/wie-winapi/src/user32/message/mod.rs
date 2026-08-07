@@ -149,7 +149,7 @@ pub fn handle_call_msg_filter(
     api_name: &str,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _msg_ptr = engine
+    let _msg_va = engine
         .read_rcx()
         .with_context(|| format!("failed to read RCX for {api_name}"))?;
     let _code = engine

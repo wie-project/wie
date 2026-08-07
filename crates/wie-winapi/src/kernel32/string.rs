@@ -97,27 +97,27 @@ pub fn handle_lstrcat_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 }
 pub(crate) fn read_utf16_units(
     engine: &mut dyn wie_cpu::CpuEngine,
-    wide_ptr: u64,
+    wide_va: u64,
     wide_len_raw: u64,
 ) -> Result<Vec<u16>> {
-    if wide_ptr == 0 {
+    if wide_va == 0 {
         return Ok(Vec::new());
     }
 
     let wide_len_i32 = low_i32(wide_len_raw, "WideCharToMultiByte cchWideChar")?;
 
     if wide_len_i32 == -1 {
-        read_null_terminated_utf16_units(engine, wide_ptr)
+        read_null_terminated_utf16_units(engine, wide_va)
     } else {
         let wide_len =
             usize::try_from(wide_len_i32).context("negative UTF-16 length is not supported")?;
 
-        read_fixed_utf16_units(engine, wide_ptr, wide_len)
+        read_fixed_utf16_units(engine, wide_va, wide_len)
     }
 }
 pub(crate) fn read_null_terminated_utf16_units(
     engine: &mut dyn wie_cpu::CpuEngine,
-    wide_ptr: u64,
+    wide_va: u64,
 ) -> Result<Vec<u16>> {
     const MAX_UNITS: usize = 32_768;
 
@@ -131,7 +131,7 @@ pub(crate) fn read_null_terminated_utf16_units(
             .checked_mul(2)
             .context("UTF-16 offset overflow")?;
 
-        let address = checked_address(wide_ptr, offset, "UTF-16 NUL scan");
+        let address = checked_address(wide_va, offset, "UTF-16 NUL scan");
         let unit = read_u16(engine, address)?;
 
         units.push(unit);
@@ -145,7 +145,7 @@ pub(crate) fn read_null_terminated_utf16_units(
 }
 pub(crate) fn read_fixed_utf16_units(
     engine: &mut dyn wie_cpu::CpuEngine,
-    wide_ptr: u64,
+    wide_va: u64,
     wide_len: usize,
 ) -> Result<Vec<u16>> {
     let mut units = Vec::with_capacity(wide_len);
@@ -156,7 +156,7 @@ pub(crate) fn read_fixed_utf16_units(
             .checked_mul(2)
             .context("UTF-16 offset overflow")?;
 
-        let address = checked_address(wide_ptr, offset, "fixed UTF-16 read");
+        let address = checked_address(wide_va, offset, "fixed UTF-16 read");
         units.push(read_u16(engine, address)?);
     }
 
@@ -213,27 +213,27 @@ pub(crate) fn classify_ctype1(unit: u16) -> u16 {
 }
 pub(crate) fn read_multibyte_bytes(
     engine: &mut dyn wie_cpu::CpuEngine,
-    input_ptr: u64,
+    input_va: u64,
     input_len_raw: u64,
 ) -> Result<Vec<u8>> {
-    if input_ptr == 0 {
+    if input_va == 0 {
         return Ok(Vec::new());
     }
 
     let input_len_i32 = low_i32(input_len_raw, "MultiByteToWideChar cbMultiByte")?;
 
     if input_len_i32 == -1 {
-        read_null_terminated_bytes(engine, input_ptr)
+        read_null_terminated_bytes(engine, input_va)
     } else {
         let input_len =
             usize::try_from(input_len_i32).context("negative multibyte length is not supported")?;
 
-        read_fixed_bytes(engine, input_ptr, input_len)
+        read_fixed_bytes(engine, input_va, input_len)
     }
 }
 pub(crate) fn read_null_terminated_bytes(
     engine: &mut dyn wie_cpu::CpuEngine,
-    input_ptr: u64,
+    input_va: u64,
 ) -> Result<Vec<u8>> {
     const MAX_BYTES: usize = 32_768;
 
@@ -241,7 +241,7 @@ pub(crate) fn read_null_terminated_bytes(
 
     for index in 0..MAX_BYTES {
         let offset = u64::try_from(index).context("byte index does not fit u64")?;
-        let address = checked_address(input_ptr, offset, "multibyte NUL scan");
+        let address = checked_address(input_va, offset, "multibyte NUL scan");
 
         let mut byte = [0_u8; 1];
         engine
@@ -259,13 +259,13 @@ pub(crate) fn read_null_terminated_bytes(
 }
 pub(crate) fn read_fixed_bytes(
     engine: &mut dyn wie_cpu::CpuEngine,
-    input_ptr: u64,
+    input_va: u64,
     input_len: usize,
 ) -> Result<Vec<u8>> {
     let mut bytes = vec![0_u8; input_len];
 
     engine
-        .mem_read(input_ptr, &mut bytes)
+        .mem_read(input_va, &mut bytes)
         .context("failed to read fixed multibyte bytes")?;
 
     Ok(bytes)
@@ -281,7 +281,7 @@ pub fn handle_wide_char_to_multi_byte(ctx: &mut HandlerContext<'_>) -> Result<Wi
         .read_rdx()
         .context("failed to read RDX for WideCharToMultiByte")?;
 
-    let wide_ptr = engine
+    let wide_va = engine
         .read_r8()
         .context("failed to read R8 for WideCharToMultiByte")?;
 
@@ -296,10 +296,10 @@ pub fn handle_wide_char_to_multi_byte(ctx: &mut HandlerContext<'_>) -> Result<Wi
     let out_ptr_address = checked_address(rsp, 0x28, "WideCharToMultiByte lpMultiByteStr");
     let out_len_address = checked_address(rsp, 0x30, "WideCharToMultiByte cbMultiByte");
 
-    let out_ptr = read_u64(engine, out_ptr_address)?;
+    let out_va = read_u64(engine, out_ptr_address)?;
     let out_len = read_u64(engine, out_len_address)?;
 
-    let units = read_utf16_units(engine, wide_ptr, wide_len_raw)?;
+    let units = read_utf16_units(engine, wide_va, wide_len_raw)?;
     let cp = u32::try_from(code_page & 0xffff_ffff).unwrap_or(crate::vfs::CP_ACP);
     let bytes = crate::vfs::wide_to_multibyte(cp, &units)
         .ok_or_else(|| anyhow::anyhow!("WideCharToMultiByte invalid UTF-16"))?;
@@ -307,7 +307,7 @@ pub fn handle_wide_char_to_multi_byte(ctx: &mut HandlerContext<'_>) -> Result<Wi
     let required_size =
         u64::try_from(bytes.len()).context("WideCharToMultiByte result length does not fit u64")?;
 
-    let return_value = if out_ptr == 0 || out_len == 0 {
+    let return_value = if out_va == 0 || out_len == 0 {
         required_size
     } else {
         let out_len_usize = usize::try_from(out_len)
@@ -317,7 +317,7 @@ pub fn handle_wide_char_to_multi_byte(ctx: &mut HandlerContext<'_>) -> Result<Wi
             0
         } else {
             engine
-                .mem_write(out_ptr, &bytes)
+                .mem_write(out_va, &bytes)
                 .context("failed to write WideCharToMultiByte output")?;
 
             required_size
@@ -341,14 +341,14 @@ pub fn handle_get_cp_info(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         .read_rcx()
         .context("failed to read RCX for GetCPInfo")?;
 
-    let cp_info_ptr = engine
+    let cp_info_va = engine
         .read_rdx()
         .context("failed to read RDX for GetCPInfo")?;
 
-    if cp_info_ptr != 0 {
-        let max_char_size_address = checked_address(cp_info_ptr, 0, "MaxCharSize");
-        let default_char_address = checked_address(cp_info_ptr, 4, "DefaultChar");
-        let lead_byte_address = checked_address(cp_info_ptr, 6, "LeadByte");
+    if cp_info_va != 0 {
+        let max_char_size_address = checked_address(cp_info_va, 0, "MaxCharSize");
+        let default_char_address = checked_address(cp_info_va, 4, "DefaultChar");
+        let lead_byte_address = checked_address(cp_info_va, 6, "LeadByte");
 
         write_guest_u32(engine, max_char_size_address, 1)?;
         engine
@@ -389,7 +389,7 @@ pub fn handle_get_string_type_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .read_rcx()
         .context("failed to read RCX for GetStringTypeW")?;
 
-    let source_ptr = engine
+    let source_va = engine
         .read_rdx()
         .context("failed to read RDX for GetStringTypeW")?;
 
@@ -397,14 +397,14 @@ pub fn handle_get_string_type_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .read_r8()
         .context("failed to read R8 for GetStringTypeW")?;
 
-    let char_type_ptr = engine
+    let char_type_va = engine
         .read_r9()
         .context("failed to read R9 for GetStringTypeW")?;
 
-    let return_value = if source_ptr == 0 || char_type_ptr == 0 {
+    let return_value = if source_va == 0 || char_type_va == 0 {
         0
     } else {
-        let units = read_utf16_units(engine, source_ptr, source_len_raw)?;
+        let units = read_utf16_units(engine, source_va, source_len_raw)?;
 
         for (index, unit) in units.iter().enumerate() {
             let index_u64 =
@@ -412,7 +412,7 @@ pub fn handle_get_string_type_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
             let offset = index_u64
                 .checked_mul(2)
                 .context("GetStringTypeW output offset overflow")?;
-            let output_address = checked_address(char_type_ptr, offset, "GetStringTypeW output");
+            let output_address = checked_address(char_type_va, offset, "GetStringTypeW output");
 
             let flags = if info_type == CT_CTYPE1 {
                 classify_ctype1(*unit)
@@ -433,11 +433,11 @@ pub fn handle_multi_byte_to_wide_char(ctx: &mut HandlerContext<'_>) -> Result<Wi
     let engine = &mut *ctx.engine;
     let code_page = engine.read_rcx()?;
     let _flags = engine.read_rdx()?;
-    let input_ptr = engine.read_r8()?;
+    let input_va = engine.read_r8()?;
     let input_len_raw = engine.read_r9()?;
 
     let rsp = engine.read_rsp()?;
-    let output_ptr = read_u64(
+    let output_va = read_u64(
         engine,
         checked_address(rsp, 0x28, "MultiByteToWideChar lpWideCharStr"),
     )?;
@@ -446,14 +446,14 @@ pub fn handle_multi_byte_to_wide_char(ctx: &mut HandlerContext<'_>) -> Result<Wi
         checked_address(rsp, 0x30, "MultiByteToWideChar cchWideChar"),
     )?;
 
-    let input_bytes = read_multibyte_bytes(engine, input_ptr, input_len_raw)?;
+    let input_bytes = read_multibyte_bytes(engine, input_va, input_len_raw)?;
     let cp = u32::try_from(code_page & 0xffff_ffff).unwrap_or(0);
     let units = crate::vfs::multibyte_to_wide(cp, &input_bytes);
 
     let required_units =
         u64::try_from(units.len()).context("MultiByteToWideChar unit length does not fit u64")?;
 
-    let return_value = if output_ptr == 0 || output_len == 0 {
+    let return_value = if output_va == 0 || output_len == 0 {
         required_units
     } else {
         let output_len_usize = usize::try_from(output_len)
@@ -471,7 +471,7 @@ pub fn handle_multi_byte_to_wide_char(ctx: &mut HandlerContext<'_>) -> Result<Wi
                 }
             }
             engine
-                .mem_write(output_ptr, &output_bytes)
+                .mem_write(output_va, &output_bytes)
                 .context("failed to write MultiByteToWideChar output")?;
             required_units
         }
@@ -490,7 +490,7 @@ pub fn handle_lc_map_string_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         .read_rdx()
         .context("failed to read RDX for LCMapStringW")?;
 
-    let source_ptr = engine
+    let source_va = engine
         .read_r8()
         .context("failed to read R8 for LCMapStringW")?;
 
@@ -505,14 +505,14 @@ pub fn handle_lc_map_string_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     let dest_ptr_address = checked_address(rsp, 0x28, "LCMapStringW lpDestStr");
     let dest_len_address = checked_address(rsp, 0x30, "LCMapStringW cchDest");
 
-    let dest_ptr = read_u64(engine, dest_ptr_address)?;
+    let dest_va = read_u64(engine, dest_ptr_address)?;
     let dest_len = read_u64(engine, dest_len_address)?;
 
-    let source_units = read_utf16_units(engine, source_ptr, source_len_raw)?;
+    let source_units = read_utf16_units(engine, source_va, source_len_raw)?;
     let required_units =
         u64::try_from(source_units.len()).context("LCMapStringW result length does not fit u64")?;
 
-    let return_value = if dest_ptr == 0 || dest_len == 0 {
+    let return_value = if dest_va == 0 || dest_len == 0 {
         required_units
     } else {
         let dest_len_usize =
@@ -533,7 +533,7 @@ pub fn handle_lc_map_string_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
             }
 
             engine
-                .mem_write(dest_ptr, &output_bytes)
+                .mem_write(dest_va, &output_bytes)
                 .context("failed to write LCMapStringW output")?;
 
             required_units

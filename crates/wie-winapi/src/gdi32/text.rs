@@ -682,7 +682,7 @@ fn handle_text_out_impl(
             .with_context(|| format!("failed to read R8 for {api_name}"))?,
         api_name,
     )?;
-    let text_ptr = engine
+    let text_va = engine
         .read_r9()
         .with_context(|| format!("failed to read R9 for {api_name}"))?;
     // `cchString` is the 5th argument — first stack slot.
@@ -693,7 +693,7 @@ fn handle_text_out_impl(
         .with_context(|| format!("failed to read {api_name} cchString"))?;
 
     if cch != 0 {
-        let chars = read_text_chars(engine, text_ptr, cch, wide)?;
+        let chars = read_text_chars(engine, text_va, cch, wide)?;
         let attrs = dc_text_attrs(state, hdc);
         if !chars.is_empty() {
             // Take the font engine out of gdi state so the surface borrow
@@ -779,16 +779,16 @@ pub fn handle_ext_text_out_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     let rsp = engine
         .read_rsp()
         .context("failed to read RSP for ExtTextOutW")?;
-    let rect_ptr = read_u64(engine, checked_address(rsp, 0x28, "lprect"))
+    let rect_va = read_u64(engine, checked_address(rsp, 0x28, "lprect"))
         .context("failed to read ExtTextOutW lprect")?;
-    let text_ptr = read_u64(engine, checked_address(rsp, 0x30, "lpString"))
+    let text_va = read_u64(engine, checked_address(rsp, 0x30, "lpString"))
         .context("failed to read ExtTextOutW lpString")?;
     let cch = read_u32(engine, checked_address(rsp, 0x38, "cch"))
         .context("failed to read ExtTextOutW cch")?;
 
     let mut clip = None;
-    if options & (ETO_OPAQUE | ETO_CLIPPED) != 0 && rect_ptr != 0 {
-        let (left, top, right, bottom) = with_typed_read::<Rect, _, _>(engine, rect_ptr, |rect| {
+    if options & (ETO_OPAQUE | ETO_CLIPPED) != 0 && rect_va != 0 {
+        let (left, top, right, bottom) = with_typed_read::<Rect, _, _>(engine, rect_va, |rect| {
             Ok((rect.left, rect.top, rect.right, rect.bottom))
         })
         .context("failed to read ExtTextOutW RECT")?;
@@ -836,7 +836,7 @@ pub fn handle_ext_text_out_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     }
 
     if cch != 0 {
-        let chars = read_text_chars(engine, text_ptr, cch, true)?;
+        let chars = read_text_chars(engine, text_va, cch, true)?;
         let attrs = dc_text_attrs(state, hdc);
         if !chars.is_empty() {
             let rendered: Result<()> = state.with_font_engine(|state, font_engine| {
@@ -891,13 +891,13 @@ fn handle_draw_text_impl(
     let hdc = engine
         .read_rcx()
         .with_context(|| format!("failed to read RCX for {api_name}"))?;
-    let text_ptr = engine
+    let text_va = engine
         .read_rdx()
         .with_context(|| format!("failed to read RDX for {api_name}"))?;
     let cch_raw = engine
         .read_r8()
         .with_context(|| format!("failed to read R8 for {api_name}"))?;
-    let rect_ptr = engine
+    let rect_va = engine
         .read_r9()
         .with_context(|| format!("failed to read R9 for {api_name}"))?;
     // `format` is the 5th argument — first stack slot.
@@ -907,8 +907,8 @@ fn handle_draw_text_impl(
     let format = read_u32(engine, checked_address(rsp, 0x28, "format"))
         .with_context(|| format!("failed to read {api_name} format"))?;
 
-    let return_value = if rect_ptr != 0 {
-        let (left, top, right, bottom) = with_typed_read::<Rect, _, _>(engine, rect_ptr, |rect| {
+    let return_value = if rect_va != 0 {
+        let (left, top, right, bottom) = with_typed_read::<Rect, _, _>(engine, rect_va, |rect| {
             Ok((rect.left, rect.top, rect.right, rect.bottom))
         })
         .with_context(|| format!("failed to read {api_name} RECT"))?;
@@ -916,9 +916,9 @@ fn handle_draw_text_impl(
         // `cchText == -1` means the string is NUL-terminated.
         let cch = low_i32(cch_raw, api_name)?;
         let chars = if cch == -1 {
-            read_text_chars(engine, text_ptr, 4096, wide)?
+            read_text_chars(engine, text_va, 4096, wide)?
         } else if cch > 0 {
-            read_text_chars(engine, text_ptr, u32::try_from(cch).unwrap_or(0), wide)?
+            read_text_chars(engine, text_va, u32::try_from(cch).unwrap_or(0), wide)?
         } else {
             Vec::new()
         };
@@ -960,7 +960,7 @@ fn handle_draw_text_impl(
             // left/top otherwise).
             let new_right = x.saturating_add(text_w);
             let new_bottom = y.saturating_add(line_h);
-            with_typed_write::<Rect, _, _>(engine, rect_ptr, |rect| {
+            with_typed_write::<Rect, _, _>(engine, rect_va, |rect| {
                 rect.left = left;
                 rect.top = top;
                 rect.right = new_right;

@@ -116,8 +116,8 @@ pub fn handle_set_console_ctrl_handler(
 
 pub fn handle_get_console_mode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let handle = ctx.engine.read_rcx().context("GetConsoleMode RCX")?;
-    let mode_ptr = ctx.engine.read_rdx().context("GetConsoleMode RDX")?;
-    if mode_ptr == 0 {
+    let mode_va = ctx.engine.read_rdx().context("GetConsoleMode RDX")?;
+    if mode_va == 0 {
         return ret_invalid_handle(ctx, "GetConsoleMode");
     }
     let mode = if handle == FAKE_STDIN_HANDLE {
@@ -127,7 +127,7 @@ pub fn handle_get_console_mode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     } else {
         return ret_invalid_handle(ctx, "GetConsoleMode");
     };
-    write_guest_u32(ctx.engine, mode_ptr, mode)?;
+    write_guest_u32(ctx.engine, mode_va, mode)?;
     ret_bool_true(ctx.engine, "GetConsoleMode")
 }
 
@@ -193,11 +193,11 @@ pub fn handle_get_console_screen_buffer_info(
         .engine
         .read_rcx()
         .context("GetConsoleScreenBufferInfo RCX")?;
-    let info_ptr = ctx
+    let info_va = ctx
         .engine
         .read_rdx()
         .context("GetConsoleScreenBufferInfo RDX")?;
-    if info_ptr == 0 {
+    if info_va == 0 {
         return ret_invalid_handle(ctx, "GetConsoleScreenBufferInfo");
     }
     let Some(buffer_handle) = buffer_handle_for(ctx.state.console(), handle) else {
@@ -232,7 +232,7 @@ pub fn handle_get_console_screen_buffer_info(
     write_le_u16(&mut buf, 18, columns);
     write_le_u16(&mut buf, 20, rows);
     ctx.engine
-        .mem_write(info_ptr, &buf)
+        .mem_write(info_va, &buf)
         .context("GetConsoleScreenBufferInfo write")?;
     ret_bool_true(ctx.engine, "GetConsoleScreenBufferInfo")
 }
@@ -258,24 +258,24 @@ fn write_console(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiHandl
         "WriteConsoleA"
     };
     let handle = ctx.engine.read_rcx().context("WriteConsole RCX")?;
-    let buffer_ptr = ctx.engine.read_rdx().context("WriteConsole RDX")?;
+    let buffer_va = ctx.engine.read_rdx().context("WriteConsole RDX")?;
     let count = low_u32(
         ctx.engine.read_r8().context("WriteConsole R8")?,
         "WriteConsole count",
     )?;
-    let written_ptr = ctx.engine.read_r9().context("WriteConsole R9")?;
+    let written_va = ctx.engine.read_r9().context("WriteConsole R9")?;
 
     if !is_console_output_handle(ctx.state.console(), handle) {
         return ret_invalid_handle(ctx, api);
     }
 
     let count_usize = usize::try_from(count).unwrap_or(0);
-    let units: Vec<u16> = if buffer_ptr == 0 || count_usize == 0 {
+    let units: Vec<u16> = if buffer_va == 0 || count_usize == 0 {
         Vec::new()
     } else if wide {
         let byte_len = count_usize.saturating_mul(2);
         let mut bytes = vec![0_u8; byte_len];
-        read_guest_bytes(ctx.engine, buffer_ptr, &mut bytes)
+        read_guest_bytes(ctx.engine, buffer_va, &mut bytes)
             .context("WriteConsoleW guest buffer")?;
         bytes
             .as_chunks::<2>()
@@ -290,7 +290,7 @@ fn write_console(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiHandl
             .collect()
     } else {
         let mut bytes = vec![0_u8; count_usize];
-        read_guest_bytes(ctx.engine, buffer_ptr, &mut bytes)
+        read_guest_bytes(ctx.engine, buffer_va, &mut bytes)
             .context("WriteConsoleA guest buffer")?;
         let code_page = ctx.state.console().output_code_page;
         codepage::decode_to_units(code_page, &bytes)
@@ -298,8 +298,8 @@ fn write_console(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiHandl
 
     emit_console_text(ctx, handle, &units);
 
-    if written_ptr != 0 {
-        write_guest_u32(ctx.engine, written_ptr, count)?;
+    if written_va != 0 {
+        write_guest_u32(ctx.engine, written_va, count)?;
     }
     ret_bool_true(ctx.engine, api)
 }
@@ -536,20 +536,20 @@ pub fn emit_text_from_bytes(ctx: &mut HandlerContext<'_>, bytes: &[u8]) {
 fn read_console(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiHandlerResult> {
     let api = if wide { "ReadConsoleW" } else { "ReadConsoleA" };
     let handle = ctx.engine.read_rcx().context("ReadConsole RCX")?;
-    let buffer_ptr = ctx.engine.read_rdx().context("ReadConsole RDX")?;
+    let buffer_va = ctx.engine.read_rdx().context("ReadConsole RDX")?;
     let capacity = low_u32(
         ctx.engine.read_r8().context("ReadConsole R8")?,
         "ReadConsole capacity",
     )?;
-    let read_ptr = ctx.engine.read_r9().context("ReadConsole R9")?;
+    let read_va = ctx.engine.read_r9().context("ReadConsole R9")?;
 
     if handle != FAKE_STDIN_HANDLE {
         return ret_invalid_handle(ctx, api);
     }
     let capacity_usize = usize::try_from(capacity).unwrap_or(0);
-    if buffer_ptr == 0 || capacity_usize == 0 {
-        if read_ptr != 0 {
-            write_guest_u32(ctx.engine, read_ptr, 0)?;
+    if buffer_va == 0 || capacity_usize == 0 {
+        if read_va != 0 {
+            write_guest_u32(ctx.engine, read_va, 0)?;
         }
         return ret_bool_true(ctx.engine, api);
     }
@@ -577,18 +577,18 @@ fn read_console(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiHandle
             bytes.extend_from_slice(&unit.to_le_bytes());
         }
         ctx.engine
-            .mem_write(buffer_ptr, &bytes)
+            .mem_write(buffer_va, &bytes)
             .context("ReadConsoleW guest buffer")?;
         u32::try_from(units.len()).unwrap_or(0)
     } else {
         ctx.engine
-            .mem_write(buffer_ptr, &chunk)
+            .mem_write(buffer_va, &chunk)
             .context("ReadConsoleA guest buffer")?;
         u32::try_from(chunk.len()).unwrap_or(0)
     };
 
-    if read_ptr != 0 {
-        write_guest_u32(ctx.engine, read_ptr, written)?;
+    if read_va != 0 {
+        write_guest_u32(ctx.engine, read_va, written)?;
     }
     ret_bool_true(ctx.engine, api)
 }
@@ -653,13 +653,13 @@ fn set_console_title(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiH
     } else {
         "SetConsoleTitleA"
     };
-    let title_ptr = ctx.engine.read_rcx().context("SetConsoleTitle RCX")?;
-    let title = if title_ptr == 0 {
+    let title_va = ctx.engine.read_rcx().context("SetConsoleTitle RCX")?;
+    let title = if title_va == 0 {
         String::new()
     } else if wide {
-        read_guest_utf16_lossy(ctx.engine, title_ptr, 1024)?
+        read_guest_utf16_lossy(ctx.engine, title_va, 1024)?
     } else {
-        let bytes = read_ansi_bytes(ctx.engine, title_ptr, 1024)?;
+        let bytes = read_ansi_bytes(ctx.engine, title_va, 1024)?;
         let code_page = ctx.state.console().output_code_page;
         codepage::units_to_host_utf8(&codepage::decode_to_units(code_page, &bytes))
     };
@@ -690,13 +690,13 @@ fn get_console_title(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiH
     } else {
         "GetConsoleTitleA"
     };
-    let buffer_ptr = ctx.engine.read_rcx().context("GetConsoleTitle RCX")?;
+    let buffer_va = ctx.engine.read_rcx().context("GetConsoleTitle RCX")?;
     let capacity = low_u32(
         ctx.engine.read_rdx().context("GetConsoleTitle RDX")?,
         "GetConsoleTitle size",
     )?;
     let capacity_usize = usize::try_from(capacity).unwrap_or(0);
-    if buffer_ptr == 0 || capacity_usize == 0 {
+    if buffer_va == 0 || capacity_usize == 0 {
         return ret_u64(ctx.engine, 0, api);
     }
 
@@ -711,7 +711,7 @@ fn get_console_title(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiH
             bytes.extend_from_slice(&unit.to_le_bytes());
         }
         ctx.engine
-            .mem_write(buffer_ptr, &bytes)
+            .mem_write(buffer_va, &bytes)
             .context("GetConsoleTitleW write")?;
         count
     } else {
@@ -722,7 +722,7 @@ fn get_console_title(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiH
         let count = bytes.len();
         bytes.push(0);
         ctx.engine
-            .mem_write(buffer_ptr, &bytes)
+            .mem_write(buffer_va, &bytes)
             .context("GetConsoleTitleA write")?;
         count
     };
@@ -784,15 +784,15 @@ pub fn handle_get_largest_console_window_size(
 pub fn handle_get_number_of_console_mouse_buttons(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
-    let count_ptr = ctx
+    let count_va = ctx
         .engine
         .read_rcx()
         .context("GetNumberOfConsoleMouseButtons RCX")?;
-    if count_ptr == 0 {
+    if count_va == 0 {
         return ret_invalid_handle(ctx, "GetNumberOfConsoleMouseButtons");
     }
     // Three: xterm-style mouse reporting distinguishes left, middle, right.
-    write_guest_u32(ctx.engine, count_ptr, 3)?;
+    write_guest_u32(ctx.engine, count_va, 3)?;
     ret_bool_true(ctx.engine, "GetNumberOfConsoleMouseButtons")
 }
 

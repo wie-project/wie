@@ -29,14 +29,11 @@ const IDIRECT3DSHADER9_OBJECT_OFFSET: u64 = 0x20;
 /// retained); stops at the `end` opcode. The instruction-length walk uses the
 /// same per-opcode operand counts as the tokenizer, so malformed streams fail
 /// here with `D3DERR_INVALIDCALL` rather than reading past the buffer.
-fn read_shader_bytecode(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    bytecode_ptr: u64,
-) -> Result<Vec<u32>> {
+fn read_shader_bytecode(engine: &mut dyn wie_cpu::CpuEngine, bytecode_va: u64) -> Result<Vec<u32>> {
     const MAX_TOKENS: usize = crate::d3d9_shader::MAX_SHADER_TOKENS;
     let mut tokens = Vec::new();
     // Version token.
-    let version = read_u32(engine, bytecode_ptr).context("failed to read shader version")?;
+    let version = read_u32(engine, bytecode_va).context("failed to read shader version")?;
     tokens.push(version);
     let mut offset: u64 = 4;
     let _ = crate::d3d9_shader::decode_shader_version(version)
@@ -45,7 +42,7 @@ fn read_shader_bytecode(
         if tokens.len() >= MAX_TOKENS {
             anyhow::bail!("shader exceeds {MAX_TOKENS} tokens");
         }
-        let address = bytecode_ptr.wrapping_add(offset);
+        let address = bytecode_va.wrapping_add(offset);
         let token =
             read_u32(engine, address).context("failed to read shader token from guest memory")?;
         offset = offset.wrapping_add(4);
@@ -64,7 +61,7 @@ fn read_shader_bytecode(
                 if tokens.len() >= MAX_TOKENS {
                     anyhow::bail!("shader exceeds {MAX_TOKENS} tokens");
                 }
-                let comment_address = bytecode_ptr.wrapping_add(offset);
+                let comment_address = bytecode_va.wrapping_add(offset);
                 let comment_token = read_u32(engine, comment_address)
                     .context("failed to read shader comment payload")?;
                 offset = offset.wrapping_add(4);
@@ -85,7 +82,7 @@ fn read_shader_bytecode(
             if tokens.len() >= MAX_TOKENS {
                 anyhow::bail!("shader exceeds {MAX_TOKENS} tokens");
             }
-            let operand_address = bytecode_ptr.wrapping_add(offset);
+            let operand_address = bytecode_va.wrapping_add(offset);
             let operand_token =
                 read_u32(engine, operand_address).context("failed to read shader operand token")?;
             offset = offset.wrapping_add(4);
@@ -130,15 +127,15 @@ pub fn handle_create_pixel_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     let _this_pointer = engine
         .read_rcx()
         .context("failed to read RCX for CreatePixelShader")?;
-    let bytecode_ptr = engine
+    let bytecode_va = engine
         .read_rdx()
         .context("failed to read RDX for CreatePixelShader")?;
     let pp_shader = engine
         .read_r8()
         .context("failed to read R8 for CreatePixelShader")?;
 
-    let return_value = if bytecode_ptr != 0 && pp_shader != 0 {
-        let bytecode = read_shader_bytecode(engine, bytecode_ptr);
+    let return_value = if bytecode_va != 0 && pp_shader != 0 {
+        let bytecode = read_shader_bytecode(engine, bytecode_va);
         let parsed = bytecode
             .as_deref()
             .ok()
@@ -201,15 +198,15 @@ pub fn handle_create_vertex_shader(ctx: &mut HandlerContext<'_>) -> Result<WinAp
     let _this_pointer = engine
         .read_rcx()
         .context("failed to read RCX for CreateVertexShader")?;
-    let bytecode_ptr = engine
+    let bytecode_va = engine
         .read_rdx()
         .context("failed to read RDX for CreateVertexShader")?;
     let pp_shader = engine
         .read_r8()
         .context("failed to read R8 for CreateVertexShader")?;
 
-    let return_value = if bytecode_ptr != 0 && pp_shader != 0 {
-        let bytecode = read_shader_bytecode(engine, bytecode_ptr);
+    let return_value = if bytecode_va != 0 && pp_shader != 0 {
+        let bytecode = read_shader_bytecode(engine, bytecode_va);
         let parsed = bytecode
             .as_deref()
             .ok()
@@ -387,10 +384,10 @@ fn set_shader_constant_f(
     engine: &mut dyn wie_cpu::CpuEngine,
     file: &mut [[f32; 4]],
     start_register: u32,
-    data_ptr: u64,
+    data_va: u64,
     count: u32,
 ) -> Result<()> {
-    if data_ptr == 0 {
+    if data_va == 0 {
         return Ok(());
     }
     for index in 0..count {
@@ -400,7 +397,7 @@ fn set_shader_constant_f(
         let Some(slot) = file.get_mut(usize::try_from(register).unwrap_or(usize::MAX)) else {
             break;
         };
-        let float_address = data_ptr.wrapping_add(u64::from(index).wrapping_mul(16));
+        let float_address = data_va.wrapping_add(u64::from(index).wrapping_mul(16));
         let mut bytes = [0_u8; 16];
         engine
             .mem_read(float_address, &mut bytes)
@@ -423,10 +420,10 @@ fn get_shader_constant_f(
     engine: &mut dyn wie_cpu::CpuEngine,
     file: &[[f32; 4]],
     start_register: u32,
-    data_ptr: u64,
+    data_va: u64,
     count: u32,
 ) -> Result<()> {
-    if data_ptr == 0 {
+    if data_va == 0 {
         return Ok(());
     }
     for index in 0..count {
@@ -436,7 +433,7 @@ fn get_shader_constant_f(
         let Some(value) = file.get(usize::try_from(register).unwrap_or(usize::MAX)) else {
             break;
         };
-        let address = data_ptr.wrapping_add(u64::from(index).wrapping_mul(16));
+        let address = data_va.wrapping_add(u64::from(index).wrapping_mul(16));
         let mut bytes = [0_u8; 16];
         for (channel, byte_chunk) in bytes.chunks_exact_mut(4).enumerate() {
             let chunk = value.get(channel).copied().unwrap_or(0.0).to_le_bytes();
@@ -460,7 +457,7 @@ pub fn handle_set_pixel_shader_constant_f(
         .context("failed to read RCX for SetPixelShaderConstantF")?;
     let start_register = u32::try_from(engine.read_rdx()? & u64::from(u32::MAX))
         .context("start register does not fit u32")?;
-    let data_ptr = engine
+    let data_va = engine
         .read_r8()
         .context("failed to read R8 for SetPixelShaderConstantF")?;
     let count =
@@ -471,7 +468,7 @@ pub fn handle_set_pixel_shader_constant_f(
         engine,
         &mut d3d.d3d9_ps_constants,
         start_register,
-        data_ptr,
+        data_va,
         count,
     )?;
 
@@ -489,7 +486,7 @@ pub fn handle_get_pixel_shader_constant_f(
         .context("failed to read RCX for GetPixelShaderConstantF")?;
     let start_register = u32::try_from(engine.read_rdx()? & u64::from(u32::MAX))
         .context("start register does not fit u32")?;
-    let data_ptr = engine
+    let data_va = engine
         .read_r8()
         .context("failed to read R8 for GetPixelShaderConstantF")?;
     let count =
@@ -500,7 +497,7 @@ pub fn handle_get_pixel_shader_constant_f(
         engine,
         &d3d.d3d9_ps_constants,
         start_register,
-        data_ptr,
+        data_va,
         count,
     )?;
 
@@ -521,7 +518,7 @@ pub fn handle_set_vertex_shader_constant_f(
         .context("failed to read RCX for SetVertexShaderConstantF")?;
     let start_register = u32::try_from(engine.read_rdx()? & u64::from(u32::MAX))
         .context("start register does not fit u32")?;
-    let data_ptr = engine
+    let data_va = engine
         .read_r8()
         .context("failed to read R8 for SetVertexShaderConstantF")?;
     let count =
@@ -532,7 +529,7 @@ pub fn handle_set_vertex_shader_constant_f(
         engine,
         &mut d3d.d3d9_vs_constants,
         start_register,
-        data_ptr,
+        data_va,
         count,
     )?;
 
@@ -550,7 +547,7 @@ pub fn handle_get_vertex_shader_constant_f(
         .context("failed to read RCX for GetVertexShaderConstantF")?;
     let start_register = u32::try_from(engine.read_rdx()? & u64::from(u32::MAX))
         .context("start register does not fit u32")?;
-    let data_ptr = engine
+    let data_va = engine
         .read_r8()
         .context("failed to read R8 for GetVertexShaderConstantF")?;
     let count =
@@ -561,7 +558,7 @@ pub fn handle_get_vertex_shader_constant_f(
         engine,
         &d3d.d3d9_vs_constants,
         start_register,
-        data_ptr,
+        data_va,
         count,
     )?;
 
@@ -574,10 +571,10 @@ fn set_shader_constant_i(
     engine: &mut dyn wie_cpu::CpuEngine,
     file: &mut [[i32; 4]],
     start_register: u32,
-    data_ptr: u64,
+    data_va: u64,
     count: u32,
 ) -> Result<()> {
-    if data_ptr == 0 {
+    if data_va == 0 {
         return Ok(());
     }
     for index in 0..count {
@@ -587,7 +584,7 @@ fn set_shader_constant_i(
         let Some(slot) = file.get_mut(usize::try_from(register).unwrap_or(usize::MAX)) else {
             break;
         };
-        let int_address = data_ptr.wrapping_add(u64::from(index).wrapping_mul(16));
+        let int_address = data_va.wrapping_add(u64::from(index).wrapping_mul(16));
         let mut bytes = [0_u8; 16];
         engine
             .mem_read(int_address, &mut bytes)
@@ -606,10 +603,10 @@ fn get_shader_constant_i(
     engine: &mut dyn wie_cpu::CpuEngine,
     file: &[[i32; 4]],
     start_register: u32,
-    data_ptr: u64,
+    data_va: u64,
     count: u32,
 ) -> Result<()> {
-    if data_ptr == 0 {
+    if data_va == 0 {
         return Ok(());
     }
     for index in 0..count {
@@ -619,7 +616,7 @@ fn get_shader_constant_i(
         let Some(value) = file.get(usize::try_from(register).unwrap_or(usize::MAX)) else {
             break;
         };
-        let address = data_ptr.wrapping_add(u64::from(index).wrapping_mul(16));
+        let address = data_va.wrapping_add(u64::from(index).wrapping_mul(16));
         let mut bytes = [0_u8; 16];
         for (channel, byte_chunk) in bytes.chunks_exact_mut(4).enumerate() {
             let chunk = value.get(channel).copied().unwrap_or(0).to_le_bytes();
@@ -638,10 +635,10 @@ fn set_shader_constant_b(
     engine: &mut dyn wie_cpu::CpuEngine,
     file: &mut [bool],
     start_register: u32,
-    data_ptr: u64,
+    data_va: u64,
     count: u32,
 ) -> Result<()> {
-    if data_ptr == 0 {
+    if data_va == 0 {
         return Ok(());
     }
     for index in 0..count {
@@ -651,7 +648,7 @@ fn set_shader_constant_b(
         let Some(slot) = file.get_mut(usize::try_from(register).unwrap_or(usize::MAX)) else {
             break;
         };
-        let bool_address = data_ptr.wrapping_add(u64::from(index).wrapping_mul(4));
+        let bool_address = data_va.wrapping_add(u64::from(index).wrapping_mul(4));
         let mut bytes = [0_u8; 4];
         engine
             .mem_read(bool_address, &mut bytes)
@@ -666,10 +663,10 @@ fn get_shader_constant_b(
     engine: &mut dyn wie_cpu::CpuEngine,
     file: &[bool],
     start_register: u32,
-    data_ptr: u64,
+    data_va: u64,
     count: u32,
 ) -> Result<()> {
-    if data_ptr == 0 {
+    if data_va == 0 {
         return Ok(());
     }
     for index in 0..count {
@@ -679,7 +676,7 @@ fn get_shader_constant_b(
         let Some(value) = file.get(usize::try_from(register).unwrap_or(usize::MAX)) else {
             break;
         };
-        let address = data_ptr.wrapping_add(u64::from(index).wrapping_mul(4));
+        let address = data_va.wrapping_add(u64::from(index).wrapping_mul(4));
         let raw = if *value { 1_u32 } else { 0_u32 };
         engine
             .mem_write(address, &raw.to_le_bytes())
@@ -702,7 +699,7 @@ pub fn handle_set_vertex_shader_constant_i(
         .context("failed to read RCX for SetVertexShaderConstantI")?;
     let start_register = u32::try_from(engine.read_rdx()? & u64::from(u32::MAX))
         .context("start register does not fit u32")?;
-    let data_ptr = engine
+    let data_va = engine
         .read_r8()
         .context("failed to read R8 for SetVertexShaderConstantI")?;
     let count =
@@ -713,7 +710,7 @@ pub fn handle_set_vertex_shader_constant_i(
         engine,
         &mut d3d.d3d9_vs_int_constants,
         start_register,
-        data_ptr,
+        data_va,
         count,
     )?;
 
@@ -731,7 +728,7 @@ pub fn handle_get_vertex_shader_constant_i(
         .context("failed to read RCX for GetVertexShaderConstantI")?;
     let start_register = u32::try_from(engine.read_rdx()? & u64::from(u32::MAX))
         .context("start register does not fit u32")?;
-    let data_ptr = engine
+    let data_va = engine
         .read_r8()
         .context("failed to read R8 for GetVertexShaderConstantI")?;
     let count =
@@ -742,7 +739,7 @@ pub fn handle_get_vertex_shader_constant_i(
         engine,
         &d3d.d3d9_vs_int_constants,
         start_register,
-        data_ptr,
+        data_va,
         count,
     )?;
 
@@ -763,7 +760,7 @@ pub fn handle_set_vertex_shader_constant_b(
         .context("failed to read RCX for SetVertexShaderConstantB")?;
     let start_register = u32::try_from(engine.read_rdx()? & u64::from(u32::MAX))
         .context("start register does not fit u32")?;
-    let data_ptr = engine
+    let data_va = engine
         .read_r8()
         .context("failed to read R8 for SetVertexShaderConstantB")?;
     let count =
@@ -774,7 +771,7 @@ pub fn handle_set_vertex_shader_constant_b(
         engine,
         &mut d3d.d3d9_vs_bool_constants,
         start_register,
-        data_ptr,
+        data_va,
         count,
     )?;
 
@@ -792,7 +789,7 @@ pub fn handle_get_vertex_shader_constant_b(
         .context("failed to read RCX for GetVertexShaderConstantB")?;
     let start_register = u32::try_from(engine.read_rdx()? & u64::from(u32::MAX))
         .context("start register does not fit u32")?;
-    let data_ptr = engine
+    let data_va = engine
         .read_r8()
         .context("failed to read R8 for GetVertexShaderConstantB")?;
     let count =
@@ -803,7 +800,7 @@ pub fn handle_get_vertex_shader_constant_b(
         engine,
         &d3d.d3d9_vs_bool_constants,
         start_register,
-        data_ptr,
+        data_va,
         count,
     )?;
 

@@ -123,8 +123,8 @@ fn test_get_text_metrics_a_writes_textmetrica_byte_layout() {
     let mut engine = test_engine();
     let mut state = default_winapi_state();
     let hdc = create_memory_dc(&mut engine, &mut state);
-    let metrics_ptr = 0x4000_u64;
-    write_regs(&mut engine, hdc, metrics_ptr, 0, 0, 0);
+    let metrics_va = 0x4000_u64;
+    write_regs(&mut engine, hdc, metrics_va, 0, 0, 0);
     let r = crate::gdi32::handle_get_text_metrics_a(&mut HandlerContext::new(
         &mut engine,
         test_environment(),
@@ -133,7 +133,7 @@ fn test_get_text_metrics_a_writes_textmetrica_byte_layout() {
     .expect("GetTextMetricsA must dispatch");
     assert_eq!(r.return_value, 1);
 
-    let bytes = read_guest_bytes(&mut engine, metrics_ptr, 56);
+    let bytes = read_guest_bytes(&mut engine, metrics_va, 56);
     let height = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     let weight = i32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
     assert!(height > 0, "resolved font height is positive");
@@ -153,8 +153,8 @@ fn test_get_text_metrics_w_writes_textmetricw_byte_layout() {
     let mut engine = test_engine();
     let mut state = default_winapi_state();
     let hdc = create_memory_dc(&mut engine, &mut state);
-    let metrics_ptr = 0x4000_u64;
-    write_regs(&mut engine, hdc, metrics_ptr, 0, 0, 0);
+    let metrics_va = 0x4000_u64;
+    write_regs(&mut engine, hdc, metrics_va, 0, 0, 0);
     let r = crate::gdi32::handle_get_text_metrics_w(&mut HandlerContext::new(
         &mut engine,
         test_environment(),
@@ -163,7 +163,7 @@ fn test_get_text_metrics_w_writes_textmetricw_byte_layout() {
     .expect("GetTextMetricsW must dispatch");
     assert_eq!(r.return_value, 1);
 
-    let bytes = read_guest_bytes(&mut engine, metrics_ptr, 60);
+    let bytes = read_guest_bytes(&mut engine, metrics_va, 60);
     let height = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     let weight = i32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
     assert!(height > 0, "resolved font height is positive");

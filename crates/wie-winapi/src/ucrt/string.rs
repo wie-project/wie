@@ -182,10 +182,10 @@ pub(crate) fn handle_strncmp(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
 /// `strtol(s, endptr, base)` — parse string to long.
 pub(crate) fn handle_strtol(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let s_ptr = engine.read_rcx()?;
+    let s_va = engine.read_rcx()?;
     let _endptr = engine.read_rdx()?;
     let base = engine.read_r8()?;
-    let s = read_guest_str(engine, s_ptr, 64)?;
+    let s = read_guest_str(engine, s_va, 64)?;
     let val = i64::from_str_radix(s.trim(), u32::try_from(base).unwrap_or(10)).unwrap_or(0);
     finish(engine, val as u64)
 }
@@ -193,10 +193,10 @@ pub(crate) fn handle_strtol(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 /// `strtoul(s, endptr, base)` — parse string to unsigned long.
 pub(crate) fn handle_strtoul(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let s_ptr = engine.read_rcx()?;
+    let s_va = engine.read_rcx()?;
     let _endptr = engine.read_rdx()?;
     let base = engine.read_r8()?;
-    let s = read_guest_str(engine, s_ptr, 64)?;
+    let s = read_guest_str(engine, s_va, 64)?;
     let val = u64::from_str_radix(s.trim(), u32::try_from(base).unwrap_or(10)).unwrap_or(0);
     finish(engine, val)
 }
@@ -204,9 +204,9 @@ pub(crate) fn handle_strtoul(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
 /// `strtod(s, endptr)` — parse string to double.
 pub(crate) fn handle_strtod(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let s_ptr = engine.read_rcx()?;
+    let s_va = engine.read_rcx()?;
     let _endptr = engine.read_rdx()?;
-    let s = read_guest_str(engine, s_ptr, 64)?;
+    let s = read_guest_str(engine, s_va, 64)?;
     let val: f64 = s.trim().parse().unwrap_or(0.0);
     finish(engine, val.to_bits())
 }
@@ -214,18 +214,18 @@ pub(crate) fn handle_strtod(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 /// `strtok(s, delim)` — tokenize string (single-threaded, static buffer).
 pub(crate) fn handle_strtok(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let s_ptr = engine.read_rcx()?;
-    let d_ptr = engine.read_rdx()?;
+    let s_va = engine.read_rcx()?;
+    let d_va = engine.read_rdx()?;
     static SAVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let ptr = if s_ptr == 0 {
+    let ptr = if s_va == 0 {
         SAVE.load(std::sync::atomic::Ordering::Relaxed)
     } else {
-        s_ptr
+        s_va
     };
     if ptr == 0 {
         return finish(engine, 0);
     }
-    let delim = read_guest_str(engine, d_ptr, 32).unwrap_or_default();
+    let delim = read_guest_str(engine, d_va, 32).unwrap_or_default();
     // Skip leading delimiters.
     let start = {
         let mut p = ptr;

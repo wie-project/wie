@@ -87,11 +87,11 @@ fn decode_name_or_resource(
 pub fn handle_register_class_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_class_ptr = engine
+    let window_class_va = engine
         .read_rcx()
         .context("failed to read RCX for RegisterClassExW")?;
 
-    let return_value = if window_class_ptr == 0 {
+    let return_value = if window_class_va == 0 {
         0
     } else {
         // One shared-lock borrow instead of eleven per-field reads. The
@@ -105,9 +105,9 @@ pub fn handle_register_class_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApi
             cursor_handle,
             background_brush,
             menu_name,
-            class_name_ptr,
+            class_name_va,
             small_icon_handle,
-        ) = with_typed_read::<WndClassEx, _, _>(engine, window_class_ptr, |wc| {
+        ) = with_typed_read::<WndClassEx, _, _>(engine, window_class_va, |wc| {
             Ok((
                 wc.style,
                 wc.window_proc,
@@ -122,7 +122,7 @@ pub fn handle_register_class_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApi
         })
         .context("failed to read WNDCLASSEXW for RegisterClassExW")?;
 
-        let class_name = read_guest_utf16_lossy(engine, class_name_ptr, 256)
+        let class_name = read_guest_utf16_lossy(engine, class_name_va, 256)
             .context("failed to read RegisterClassExW class name")?;
 
         register_window_class(
@@ -149,11 +149,11 @@ pub fn handle_register_class_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 pub fn handle_register_class_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_class_ptr = engine
+    let window_class_va = engine
         .read_rcx()
         .context("failed to read RCX for RegisterClassExA")?;
 
-    let return_value = if window_class_ptr == 0 {
+    let return_value = if window_class_va == 0 {
         0
     } else {
         // WNDCLASSEXA shares the WNDCLASSEXW layout; only the pointed-to
@@ -166,9 +166,9 @@ pub fn handle_register_class_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
             cursor_handle,
             background_brush,
             menu_name,
-            class_name_ptr,
+            class_name_va,
             small_icon_handle,
-        ) = with_typed_read::<WndClassEx, _, _>(engine, window_class_ptr, |wc| {
+        ) = with_typed_read::<WndClassEx, _, _>(engine, window_class_va, |wc| {
             Ok((
                 wc.style,
                 wc.window_proc,
@@ -183,7 +183,7 @@ pub fn handle_register_class_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
         })
         .context("failed to read WNDCLASSEXA for RegisterClassExA")?;
 
-        let class_name = read_guest_ansi_lossy(engine, class_name_ptr, 256)
+        let class_name = read_guest_ansi_lossy(engine, class_name_va, 256)
             .context("failed to read RegisterClassExA class name")?;
 
         register_window_class(
@@ -226,11 +226,11 @@ pub fn handle_message_box_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
             .read_rcx()
             .context("failed to read RCX for MessageBoxW")?;
 
-        let text_ptr = engine
+        let text_va = engine
             .read_rdx()
             .context("failed to read RDX for MessageBoxW")?;
 
-        let caption_ptr = engine
+        let caption_va = engine
             .read_r8()
             .context("failed to read R8 for MessageBoxW")?;
 
@@ -238,10 +238,10 @@ pub fn handle_message_box_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
             .read_r9()
             .context("failed to read R9 for MessageBoxW")?;
 
-        let text = read_guest_utf16_lossy(engine, text_ptr, 1024)
+        let text = read_guest_utf16_lossy(engine, text_va, 1024)
             .context("failed to read MessageBoxW text")?;
 
-        let caption = read_guest_utf16_lossy(engine, caption_ptr, 256)
+        let caption = read_guest_utf16_lossy(engine, caption_va, 256)
             .context("failed to read MessageBoxW caption")?;
 
         (
@@ -262,11 +262,11 @@ pub fn handle_message_box_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
             .read_rcx()
             .context("failed to read RCX for MessageBoxA")?;
 
-        let text_ptr = engine
+        let text_va = engine
             .read_rdx()
             .context("failed to read RDX for MessageBoxA")?;
 
-        let caption_ptr = engine
+        let caption_va = engine
             .read_r8()
             .context("failed to read R8 for MessageBoxA")?;
 
@@ -274,10 +274,10 @@ pub fn handle_message_box_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
             .read_r9()
             .context("failed to read R9 for MessageBoxA")?;
 
-        let text = read_guest_ansi_lossy(engine, text_ptr, 1024)
+        let text = read_guest_ansi_lossy(engine, text_va, 1024)
             .context("failed to read MessageBoxA text")?;
 
-        let caption = read_guest_ansi_lossy(engine, caption_ptr, 256)
+        let caption = read_guest_ansi_lossy(engine, caption_va, 256)
             .context("failed to read MessageBoxA caption")?;
 
         (
@@ -413,7 +413,7 @@ pub(crate) fn handle_load_image(
         .read_rcx()
         .with_context(|| format!("failed to read RCX for {api_name}"))?;
 
-    let _image_name_ptr = engine
+    let _image_name_va = engine
         .read_rdx()
         .with_context(|| format!("failed to read RDX for {api_name}"))?;
 
@@ -641,7 +641,7 @@ pub fn handle_set_scroll_info(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         .read_rdx()
         .context("failed to read RDX for SetScrollInfo")?;
 
-    let scroll_info_ptr = engine
+    let scroll_info_va = engine
         .read_r8()
         .context("failed to read R8 for SetScrollInfo")?;
 
@@ -657,10 +657,10 @@ pub fn handle_set_scroll_info(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     // UINT nPage;     16
     // int  nPos;      20
     // int  nTrackPos; 24
-    let return_value = if scroll_info_ptr != 0 {
+    let return_value = if scroll_info_va != 0 {
         let n_pos = read_i32(
             engine,
-            checked_address(scroll_info_ptr, 20, "SCROLLINFO.nPos"),
+            checked_address(scroll_info_va, 20, "SCROLLINFO.nPos"),
         )
         .unwrap_or(0);
         // Win32 returns the current scroll-box position after the update.
@@ -673,7 +673,7 @@ pub fn handle_set_scroll_info(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     tracing::debug!(
         window_handle,
         bar,
-        scroll_info_ptr,
+        scroll_info_va,
         return_value,
         "SetScrollInfo"
     );
@@ -706,15 +706,15 @@ fn handle_register_window_message_impl(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let name_ptr = engine
+    let name_va = engine
         .read_rcx()
         .with_context(|| format!("failed to read RCX for {api_name}"))?;
 
     let name = if api_name.ends_with('W') {
-        read_guest_utf16_lossy(engine, name_ptr, 256)
+        read_guest_utf16_lossy(engine, name_va, 256)
             .with_context(|| format!("failed to read {api_name} message name"))?
     } else {
-        read_guest_ansi_lossy(engine, name_ptr, 256)
+        read_guest_ansi_lossy(engine, name_va, 256)
             .with_context(|| format!("failed to read {api_name} message name"))?
     };
 
@@ -781,7 +781,7 @@ fn handle_load_string_impl(
     let string_id_raw = engine
         .read_rdx()
         .with_context(|| format!("failed to read RDX for {api_name}"))?;
-    let buffer_ptr = engine
+    let buffer_va = engine
         .read_r8()
         .with_context(|| format!("failed to read R8 for {api_name}"))?;
     let max_characters_raw = engine
@@ -803,7 +803,7 @@ fn handle_load_string_impl(
         // Not found (or empty string): Windows returns 0 either way.
         0
     } else {
-        write_out_string(engine, buffer_ptr, max_characters_raw, &text, wide)?
+        write_out_string(engine, buffer_va, max_characters_raw, &text, wide)?
     };
 
     tracing::debug!(

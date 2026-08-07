@@ -42,12 +42,12 @@ use super::state::{
 pub fn handle_create_dc_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let driver_ptr = engine
+    let driver_va = engine
         .read_rcx()
         .context("failed to read RCX for CreateDCW")?;
 
-    if driver_ptr != 0 {
-        let driver = read_guest_utf16_lossy(engine, driver_ptr, 64).unwrap_or_default();
+    if driver_va != 0 {
+        let driver = read_guest_utf16_lossy(engine, driver_va, 64).unwrap_or_default();
         tracing::debug!(driver, "CreateDCW");
     }
 
@@ -67,21 +67,21 @@ pub fn handle_start_doc_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     let hdc = engine
         .read_rcx()
         .context("failed to read RCX for StartDocW")?;
-    let docinfo_ptr = engine
+    let docinfo_va = engine
         .read_rdx()
         .context("failed to read RDX for StartDocW")?;
 
     let mut success = false;
-    if docinfo_ptr != 0 {
+    if docinfo_va != 0 {
         // DOCINFOW (Win64): int cbSize @0, then LPCWSTR lpszDocName @8,
         // lpszOutput @16, lpszDatatype @24, DWORD fwType @32. One typed read
         // replaces the old cbSize + per-field pointer reads; the doc name is
         // read through the view's pointer (capped at 4096 chars).
-        let doc_name_ptr = with_typed_read::<DocInfoW, _, _>(engine, docinfo_ptr, |docinfo| {
+        let doc_name_va = with_typed_read::<DocInfoW, _, _>(engine, docinfo_va, |docinfo| {
             Ok(docinfo.lpsz_doc_name)
         })
         .context("failed to read DOCINFOW.lpszDocName")?;
-        let doc_name = read_guest_utf16_lossy(engine, doc_name_ptr, 4096)
+        let doc_name = read_guest_utf16_lossy(engine, doc_name_va, 4096)
             .context("failed to read StartDocW document name")?;
 
         if let Some(job) = state.gdi_state().find_print_job_mut(Hdc::from(hdc))
@@ -667,8 +667,8 @@ mod tests {
     }
 
     /// StartDocW on `hdc` with the given guest doc-name pointer.
-    fn start_doc(engine: &mut IcedCpu, state: &mut WinApiState, hdc: u64, docinfo_ptr: u64) -> u64 {
-        write_regs(engine, hdc, docinfo_ptr, 0, 0);
+    fn start_doc(engine: &mut IcedCpu, state: &mut WinApiState, hdc: u64, docinfo_va: u64) -> u64 {
+        write_regs(engine, hdc, docinfo_va, 0, 0);
         run(
             &mut HandlerContext::new(engine, test_environment(), state),
             handle_start_doc_w,

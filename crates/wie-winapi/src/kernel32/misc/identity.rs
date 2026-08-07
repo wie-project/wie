@@ -57,10 +57,10 @@ pub(crate) fn write_name_to_buffer(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
     name: &str,
-    name_ptr: u64,
-    size_ptr: u64,
+    name_va: u64,
+    size_va: u64,
 ) -> Result<WinApiHandlerResult> {
-    if name_ptr == 0 || size_ptr == 0 {
+    if name_va == 0 || size_va == 0 {
         state.process.last_error = ERROR_INVALID_PARAMETER;
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
@@ -69,9 +69,9 @@ pub(crate) fn write_name_to_buffer(
         });
     }
     let mut size_buf = [0_u8; 4];
-    engine.mem_read(size_ptr, &mut size_buf)?;
+    engine.mem_read(size_va, &mut size_buf)?;
     let name_cap = u64::from(u32::from_le_bytes(size_buf));
-    let written = write_mock_string_w(engine, state, name, name_ptr, name_cap)?;
+    let written = write_mock_string_w(engine, state, name, name_va, name_cap)?;
     if written == 0 {
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
@@ -79,7 +79,7 @@ pub(crate) fn write_name_to_buffer(
             return_value: 0,
         });
     }
-    write_guest_u32(engine, size_ptr, u32::try_from(written).unwrap_or(0))?;
+    write_guest_u32(engine, size_va, u32::try_from(written).unwrap_or(0))?;
     state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?;
     Ok(WinApiHandlerResult {
@@ -90,27 +90,27 @@ pub(crate) fn write_name_to_buffer(
 pub(crate) fn get_canonical_computer_name(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
-    name_ptr: u64,
-    size_ptr: u64,
+    name_va: u64,
+    size_va: u64,
 ) -> Result<WinApiHandlerResult> {
-    write_name_to_buffer(engine, state, &friendly_computer_name(), name_ptr, size_ptr)
+    write_name_to_buffer(engine, state, &friendly_computer_name(), name_va, size_va)
 }
 pub(crate) fn get_dns_hostname(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
-    name_ptr: u64,
-    size_ptr: u64,
+    name_va: u64,
+    size_va: u64,
 ) -> Result<WinApiHandlerResult> {
-    write_name_to_buffer(engine, state, &dns_hostname(), name_ptr, size_ptr)
+    write_name_to_buffer(engine, state, &dns_hostname(), name_va, size_va)
 }
 pub(crate) fn get_user_name_impl(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
-    name_ptr: u64,
-    size_ptr: u64,
+    name_va: u64,
+    size_va: u64,
     unicode: bool,
 ) -> Result<WinApiHandlerResult> {
-    if name_ptr == 0 || size_ptr == 0 {
+    if name_va == 0 || size_va == 0 {
         state.process.last_error = ERROR_INVALID_PARAMETER;
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
@@ -119,13 +119,13 @@ pub(crate) fn get_user_name_impl(
         });
     }
     let mut size_buf = [0_u8; 4];
-    engine.mem_read(size_ptr, &mut size_buf)?;
+    engine.mem_read(size_va, &mut size_buf)?;
     let name_cap = u64::from(u32::from_le_bytes(size_buf));
     let name = host_user_name();
     let written = if unicode {
-        write_mock_string_w(engine, state, &name, name_ptr, name_cap)?
+        write_mock_string_w(engine, state, &name, name_va, name_cap)?
     } else {
-        write_mock_string_a(engine, state, &name, name_ptr, name_cap)?
+        write_mock_string_a(engine, state, &name, name_va, name_cap)?
     };
     if written == 0 {
         let return_address = engine.return_from_win64_api(0)?;
@@ -134,7 +134,7 @@ pub(crate) fn get_user_name_impl(
             return_value: 0,
         });
     }
-    write_guest_u32(engine, size_ptr, u32::try_from(written).unwrap_or(0))?;
+    write_guest_u32(engine, size_va, u32::try_from(written).unwrap_or(0))?;
     state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?;
     Ok(WinApiHandlerResult {
@@ -153,11 +153,11 @@ pub(crate) fn host_profile_dir(state: &WinApiState) -> String {
 pub(crate) fn get_user_profile_dir_impl(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
-    name_ptr: u64,
-    size_ptr: u64,
+    name_va: u64,
+    size_va: u64,
     unicode: bool,
 ) -> Result<WinApiHandlerResult> {
-    if name_ptr == 0 || size_ptr == 0 {
+    if name_va == 0 || size_va == 0 {
         state.process.last_error = ERROR_INVALID_PARAMETER;
         let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
@@ -166,13 +166,13 @@ pub(crate) fn get_user_profile_dir_impl(
         });
     }
     let mut size_buf = [0_u8; 4];
-    engine.mem_read(size_ptr, &mut size_buf)?;
+    engine.mem_read(size_va, &mut size_buf)?;
     let name_cap = u64::from(u32::from_le_bytes(size_buf));
     let dir = host_profile_dir(state);
     let written = if unicode {
-        write_mock_string_w(engine, state, &dir, name_ptr, name_cap)?
+        write_mock_string_w(engine, state, &dir, name_va, name_cap)?
     } else {
-        write_mock_string_a(engine, state, &dir, name_ptr, name_cap)?
+        write_mock_string_a(engine, state, &dir, name_va, name_cap)?
     };
     if written == 0 {
         let return_address = engine.return_from_win64_api(0)?;
@@ -181,7 +181,7 @@ pub(crate) fn get_user_profile_dir_impl(
             return_value: 0,
         });
     }
-    write_guest_u32(engine, size_ptr, u32::try_from(written).unwrap_or(0))?;
+    write_guest_u32(engine, size_va, u32::try_from(written).unwrap_or(0))?;
     state.process.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?;
     Ok(WinApiHandlerResult {
@@ -193,18 +193,18 @@ pub(crate) fn get_user_profile_dir_impl(
 pub fn handle_get_computer_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let name_ptr = engine.read_rcx()?;
-    let size_ptr = engine.read_rdx()?;
-    get_canonical_computer_name(engine, state, name_ptr, size_ptr)
+    let name_va = engine.read_rcx()?;
+    let size_va = engine.read_rdx()?;
+    get_canonical_computer_name(engine, state, name_va, size_va)
 }
 /// Handles `KERNEL32.dll!GetComputerNameA` — friendly name (NetBIOS equivalent).
 pub fn handle_get_computer_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     // ANSI variant: write name to guest using ANSI encoding.
-    let name_ptr = engine.read_rcx()?;
-    let size_ptr = engine.read_rdx()?;
-    let r = get_canonical_computer_name(engine, state, name_ptr, size_ptr)?;
+    let name_va = engine.read_rcx()?;
+    let size_va = engine.read_rdx()?;
+    let r = get_canonical_computer_name(engine, state, name_va, size_va)?;
     Ok(r)
 }
 /// Handles `KERNEL32.dll!GetComputerNameExW` — returns appropriate name type.
@@ -212,11 +212,11 @@ pub fn handle_get_computer_name_ex_w(ctx: &mut HandlerContext<'_>) -> Result<Win
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let name_type = engine.read_rcx()?;
-    let name_ptr = engine.read_rdx()?;
-    let size_ptr = engine.read_r8()?;
+    let name_va = engine.read_rdx()?;
+    let size_va = engine.read_r8()?;
     match name_type {
-        0 | 5 => get_canonical_computer_name(engine, state, name_ptr, size_ptr),
-        1 | 3 => get_dns_hostname(engine, state, name_ptr, size_ptr),
+        0 | 5 => get_canonical_computer_name(engine, state, name_va, size_va),
+        1 | 3 => get_dns_hostname(engine, state, name_va, size_va),
         _ => {
             // Unsupported type → ERROR_INVALID_PARAMETER
             state.process.last_error = ERROR_INVALID_PARAMETER;
@@ -228,17 +228,17 @@ pub fn handle_get_computer_name_ex_w(ctx: &mut HandlerContext<'_>) -> Result<Win
 pub fn handle_get_user_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let name_ptr = engine.read_rcx()?;
-    let size_ptr = engine.read_rdx()?;
-    get_user_name_impl(engine, state, name_ptr, size_ptr, true)
+    let name_va = engine.read_rcx()?;
+    let size_va = engine.read_rdx()?;
+    get_user_name_impl(engine, state, name_va, size_va, true)
 }
 /// Handles `KERNEL32.dll!GetUserNameA` — return real user name.
 pub fn handle_get_user_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let name_ptr = engine.read_rcx()?;
-    let size_ptr = engine.read_rdx()?;
-    get_user_name_impl(engine, state, name_ptr, size_ptr, false)
+    let name_va = engine.read_rcx()?;
+    let size_va = engine.read_rdx()?;
+    get_user_name_impl(engine, state, name_va, size_va, false)
 }
 /// Handles `KERNEL32.dll!QueryFullProcessImageNameW` — return main module path.
 pub fn handle_query_full_process_image_name_w(
@@ -248,22 +248,22 @@ pub fn handle_query_full_process_image_name_w(
     let state = &mut *ctx.state;
     let _h_process = engine.read_rcx()?;
     let _flags = engine.read_rdx()?;
-    let name_ptr = engine.read_r8()?;
-    let size_ptr = engine.read_r9()?;
-    if name_ptr == 0 || size_ptr == 0 {
+    let name_va = engine.read_r8()?;
+    let size_va = engine.read_r9()?;
+    if name_va == 0 || size_va == 0 {
         state.process.last_error = ERROR_INVALID_PARAMETER;
         return ctx.finish(0);
     }
     let mut size_buf = [0_u8; 4];
-    engine.mem_read(size_ptr, &mut size_buf)?;
+    engine.mem_read(size_va, &mut size_buf)?;
     let name_cap = u64::from(u32::from_le_bytes(size_buf));
     let path = state.process.main_module_path.clone();
-    let written = write_mock_string_w(engine, state, &path, name_ptr, name_cap)?;
+    let written = write_mock_string_w(engine, state, &path, name_va, name_cap)?;
     if written == 0 {
         return ctx.finish(0);
     }
     let count = u32::try_from(written).unwrap_or(0);
-    write_guest_u32(engine, size_ptr, count)?;
+    write_guest_u32(engine, size_va, count)?;
     state.process.last_error = 0;
     ctx.finish(1)
 }
@@ -275,22 +275,22 @@ pub fn handle_query_full_process_image_name_a(
     let state = &mut *ctx.state;
     let _h_process = engine.read_rcx()?;
     let _flags = engine.read_rdx()?;
-    let name_ptr = engine.read_r8()?;
-    let size_ptr = engine.read_r9()?;
-    if name_ptr == 0 || size_ptr == 0 {
+    let name_va = engine.read_r8()?;
+    let size_va = engine.read_r9()?;
+    if name_va == 0 || size_va == 0 {
         state.process.last_error = ERROR_INVALID_PARAMETER;
         return ctx.finish(0);
     }
     let mut size_buf = [0_u8; 4];
-    engine.mem_read(size_ptr, &mut size_buf)?;
+    engine.mem_read(size_va, &mut size_buf)?;
     let name_cap = u64::from(u32::from_le_bytes(size_buf));
     let path = state.process.main_module_path.clone();
-    let written = write_mock_string_a(engine, state, &path, name_ptr, name_cap)?;
+    let written = write_mock_string_a(engine, state, &path, name_va, name_cap)?;
     if written == 0 {
         return ctx.finish(0);
     }
     let count = u32::try_from(written).unwrap_or(0);
-    write_guest_u32(engine, size_ptr, count)?;
+    write_guest_u32(engine, size_va, count)?;
     state.process.last_error = 0;
     ctx.finish(1)
 }

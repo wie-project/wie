@@ -47,12 +47,12 @@ pub fn handle_begin_paint(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         .read_rcx()
         .context("failed to read RCX for BeginPaint")?;
 
-    let paint_ptr = engine
+    let paint_va = engine
         .read_rdx()
         .context("failed to read RDX for BeginPaint")?;
 
     let known = super::is_known_window(state, window_handle);
-    let return_value = if known && paint_ptr != 0 {
+    let return_value = if known && paint_va != 0 {
         let (width, height) = super::window_client_size(state, window_handle);
 
         // PAINTSTRUCT (Win64):
@@ -65,7 +65,7 @@ pub fn handle_begin_paint(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         let begin_dc = state
             .gdi_state()
             .alloc_dc(DcKind::Window(crate::handles::Hwnd::from(window_handle)));
-        write_guest_u64(engine, paint_ptr, begin_dc.as_u64())?;
+        write_guest_u64(engine, paint_va, begin_dc.as_u64())?;
         // fErase: nonzero when the background still needs erasing — i.e. the
         // invalidation asked for an erase and no WM_ERASEBKGND consumed it
         // (a class brush that erased it clears the flag on dispatch).
@@ -73,29 +73,29 @@ pub fn handle_begin_paint(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
             .is_some_and(|window| window.flags.contains(WindowFlags::ERASE_BACKGROUND));
         write_guest_u32(
             engine,
-            checked_address(paint_ptr, 8, "fErase"),
+            checked_address(paint_va, 8, "fErase"),
             u32::from(f_erase),
         )?;
-        write_guest_i32(engine, checked_address(paint_ptr, 12, "rcPaint.left"), 0)?;
-        write_guest_i32(engine, checked_address(paint_ptr, 16, "rcPaint.top"), 0)?;
+        write_guest_i32(engine, checked_address(paint_va, 12, "rcPaint.left"), 0)?;
+        write_guest_i32(engine, checked_address(paint_va, 16, "rcPaint.top"), 0)?;
         write_guest_i32(
             engine,
-            checked_address(paint_ptr, 20, "rcPaint.right"),
+            checked_address(paint_va, 20, "rcPaint.right"),
             width,
         )?;
         write_guest_i32(
             engine,
-            checked_address(paint_ptr, 24, "rcPaint.bottom"),
+            checked_address(paint_va, 24, "rcPaint.bottom"),
             height,
         )?;
-        write_guest_u32(engine, checked_address(paint_ptr, 28, "fRestore"), 0)?;
-        write_guest_u32(engine, checked_address(paint_ptr, 32, "fIncUpdate"), 0)?;
+        write_guest_u32(engine, checked_address(paint_va, 28, "fRestore"), 0)?;
+        write_guest_u32(engine, checked_address(paint_va, 32, "fIncUpdate"), 0)?;
         // rgbReserved left zeroed by guest or ignored.
 
         tracing::debug!(window_handle, width, height, "BeginPaint");
         begin_dc.as_u64()
     } else {
-        tracing::debug!(window_handle, paint_ptr, known, "BeginPaint rejected");
+        tracing::debug!(window_handle, paint_va, known, "BeginPaint rejected");
         0
     };
 
@@ -109,7 +109,7 @@ pub fn handle_end_paint(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
         .read_rcx()
         .context("failed to read RCX for EndPaint")?;
 
-    let _paint_ptr = engine
+    let _paint_va = engine
         .read_rdx()
         .context("failed to read RDX for EndPaint")?;
 

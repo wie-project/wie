@@ -153,7 +153,7 @@ fn test_peek_message_a_with_message() {
             point_x: 0,
             point_y: 0,
         });
-    // PeekMessageA(msg_ptr=msg_va, hwnd=0, min=0, max=0, wRemoveMsg=1)
+    // PeekMessageA(msg_va=msg_va, hwnd=0, min=0, max=0, wRemoveMsg=1)
     // wRemoveMsg is on the stack at RSP+0x28.
     write_regs(&mut engine, msg_va, 0, 0, 0, 0x3000);
     // Write wRemoveMsg=1 (PM_REMOVE) at RSP+0x28.
@@ -248,7 +248,7 @@ fn test_get_message_wm_quit_bypasses_window_filter() {
             point_x: 0,
             point_y: 0,
         });
-    // GetMessageA(msg_ptr, hWnd=0x5678 filter, min=0, max=0).
+    // GetMessageA(msg_va, hWnd=0x5678 filter, min=0, max=0).
     write_regs(&mut engine, msg_va, 0x5678, 0, 0, 0x3000);
     let r = user32::handle_get_message_a(&mut HandlerContext::new(
         &mut engine,
@@ -327,7 +327,7 @@ fn test_get_message_dialog_filter_matches_descendants() {
             point_x: 0,
             point_y: 0,
         });
-    // GetMessageA(msg_ptr, hWnd=dialog, min=0, max=0): the child's message
+    // GetMessageA(msg_va, hWnd=dialog, min=0, max=0): the child's message
     // must match through the dialog's descendant rule.
     write_regs(&mut engine, msg_va, dialog, 0, 0, 0x3000);
     let r = user32::handle_get_message_a(&mut HandlerContext::new(

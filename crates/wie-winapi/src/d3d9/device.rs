@@ -394,7 +394,7 @@ pub fn handle_clear(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult>
     let count_raw = engine
         .read_rdx()
         .context("failed to read RDX for IDirect3DDevice9::Clear")?;
-    let rects_ptr = engine
+    let rects_va = engine
         .read_r8()
         .context("failed to read R8 for IDirect3DDevice9::Clear")?;
     let flags_raw = engine
@@ -454,9 +454,9 @@ pub fn handle_clear(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult>
             {
                 record.pixels = vec![color_0rgb; needed];
             }
-            if rects_ptr != 0 && rect_count > 0 {
+            if rects_va != 0 && rect_count > 0 {
                 let mut rect_bytes = vec![0_u8; rect_count.saturating_mul(16)];
-                if engine.mem_read(rects_ptr, &mut rect_bytes).is_ok() {
+                if engine.mem_read(rects_va, &mut rect_bytes).is_ok() {
                     for chunk in rect_bytes.chunks(16).take(rect_count) {
                         let left = i32::from_le_bytes(
                             chunk
@@ -568,16 +568,16 @@ pub fn handle_set_transform(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     let state_raw = engine
         .read_rdx()
         .context("failed to read RDX for IDirect3DDevice9::SetTransform")?;
-    let matrix_ptr = engine
+    let matrix_va = engine
         .read_r8()
         .context("failed to read R8 for IDirect3DDevice9::SetTransform")?;
 
     let transform_state = u32::try_from(state_raw & u64::from(u32::MAX))
         .context("SetTransform state does not fit u32")?;
 
-    if matrix_ptr != 0 {
+    if matrix_va != 0 {
         let mut bytes = [0_u8; 64];
-        if engine.mem_read(matrix_ptr, &mut bytes).is_ok() {
+        if engine.mem_read(matrix_va, &mut bytes).is_ok() {
             let matrix = parse_mat4(&bytes);
             match transform_state {
                 D3DTS_WORLD => state.d3d9().d3d9_world_matrix = matrix,
@@ -612,7 +612,7 @@ pub fn handle_get_transform(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     let state_raw = engine
         .read_rdx()
         .context("failed to read RDX for IDirect3DDevice9::GetTransform")?;
-    let matrix_ptr = engine
+    let matrix_va = engine
         .read_r8()
         .context("failed to read R8 for IDirect3DDevice9::GetTransform")?;
 
@@ -631,7 +631,7 @@ pub fn handle_get_transform(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     };
 
     let return_value = match stored {
-        Some(matrix) if matrix_ptr != 0 => {
+        Some(matrix) if matrix_va != 0 => {
             let mut bytes = [0_u8; 64];
             for (index, value) in matrix.iter().enumerate() {
                 let start = index.saturating_mul(4);
@@ -641,7 +641,7 @@ pub fn handle_get_transform(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
                 }
             }
             engine
-                .mem_write(matrix_ptr, &bytes)
+                .mem_write(matrix_va, &bytes)
                 .context("failed to write D3DMATRIX")?;
             D3D_OK
         }
@@ -665,16 +665,16 @@ pub fn handle_multiply_transform(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let state_raw = engine
         .read_rdx()
         .context("failed to read RDX for IDirect3DDevice9::MultiplyTransform")?;
-    let matrix_ptr = engine
+    let matrix_va = engine
         .read_r8()
         .context("failed to read R8 for IDirect3DDevice9::MultiplyTransform")?;
 
     let transform_state = u32::try_from(state_raw & u64::from(u32::MAX))
         .context("MultiplyTransform state does not fit u32")?;
 
-    let return_value = if matrix_ptr != 0 {
+    let return_value = if matrix_va != 0 {
         let mut bytes = [0_u8; 64];
-        let readable = engine.mem_read(matrix_ptr, &mut bytes).is_ok();
+        let readable = engine.mem_read(matrix_va, &mut bytes).is_ok();
         if readable {
             let matrix = parse_mat4(&bytes);
             match transform_state {
@@ -728,13 +728,13 @@ pub fn handle_set_scissor_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     let _this_pointer = engine
         .read_rcx()
         .context("failed to read RCX for IDirect3DDevice9::SetScissorRect")?;
-    let rect_ptr = engine
+    let rect_va = engine
         .read_rdx()
         .context("failed to read RDX for IDirect3DDevice9::SetScissorRect")?;
 
-    let return_value = if rect_ptr != 0 {
+    let return_value = if rect_va != 0 {
         let mut bytes = [0_u8; 16];
-        if engine.mem_read(rect_ptr, &mut bytes).is_ok() {
+        if engine.mem_read(rect_va, &mut bytes).is_ok() {
             let i32_at = |offset: usize| {
                 i32::from_le_bytes(
                     bytes
@@ -767,13 +767,13 @@ pub fn handle_set_viewport(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
     let _this_pointer = engine
         .read_rcx()
         .context("failed to read RCX for IDirect3DDevice9::SetViewport")?;
-    let viewport_ptr = engine
+    let viewport_va = engine
         .read_rdx()
         .context("failed to read RDX for IDirect3DDevice9::SetViewport")?;
 
-    if viewport_ptr != 0 {
+    if viewport_va != 0 {
         let mut bytes = [0_u8; 24];
-        if engine.mem_read(viewport_ptr, &mut bytes).is_ok() {
+        if engine.mem_read(viewport_va, &mut bytes).is_ok() {
             state.d3d9().d3d9_viewport = (
                 read_u32_at(&bytes, 0),
                 read_u32_at(&bytes, 4),
@@ -795,11 +795,11 @@ pub fn handle_get_viewport(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
     let _this_pointer = engine
         .read_rcx()
         .context("failed to read RCX for IDirect3DDevice9::GetViewport")?;
-    let viewport_ptr = engine
+    let viewport_va = engine
         .read_rdx()
         .context("failed to read RDX for IDirect3DDevice9::GetViewport")?;
 
-    let return_value = if viewport_ptr != 0 {
+    let return_value = if viewport_va != 0 {
         let (x, y, width, height, min_z, max_z) = state.d3d9().d3d9_viewport;
         let mut bytes = [0_u8; 24];
         bytes[0..4].copy_from_slice(&x.to_le_bytes());
@@ -809,7 +809,7 @@ pub fn handle_get_viewport(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
         bytes[16..20].copy_from_slice(&min_z.to_le_bytes());
         bytes[20..24].copy_from_slice(&max_z.to_le_bytes());
         engine
-            .mem_write(viewport_ptr, &bytes)
+            .mem_write(viewport_va, &bytes)
             .context("failed to write D3DVIEWPORT9")?;
         D3D_OK
     } else {
@@ -831,33 +831,33 @@ fn handle_draw_up_common(
     state: &mut WinApiState,
     primitive_type: u64,
     primitive_count: u64,
-    data_ptr: u64,
+    data_va: u64,
     stride_raw: u64,
-    index_ptr: u64,
+    index_va: u64,
     index_format: u32,
     vertex_count: usize,
     index_count: usize,
 ) -> Result<u64> {
     let return_value =
-        if state.d3d9().d3d9_scene_active == crate::state::SceneState::Active && data_ptr != 0 {
+        if state.d3d9().d3d9_scene_active == crate::state::SceneState::Active && data_va != 0 {
             match parse_fvf(state.d3d9().d3d9_current_fvf) {
                 Some(layout) => {
                     let stride = usize::try_from(stride_raw & u64::from(u32::MAX))
                         .context("DrawPrimitiveUP stride does not fit usize")?;
                     let layout_stride = usize::try_from(layout.stride).unwrap_or(usize::MAX);
-                    if stride < layout_stride || (index_count > 0 && index_ptr == 0) {
+                    if stride < layout_stride || (index_count > 0 && index_va == 0) {
                         D3DERR_INVALIDCALL
                     } else {
                         draw_vertex_stream(
                             engine,
                             state,
-                            data_ptr,
+                            data_va,
                             &layout,
                             stride,
                             vertex_count,
                             primitive_type,
                             primitive_count,
-                            index_ptr,
+                            index_va,
                             index_format,
                             index_count,
                         )?;
@@ -881,7 +881,7 @@ pub fn handle_draw_primitive_up(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let primitive_count = engine
         .read_r8()
         .context("failed to read R8 for DrawPrimitiveUP")?;
-    let data_ptr = engine
+    let data_va = engine
         .read_r9()
         .context("failed to read R9 for DrawPrimitiveUP")?;
     let stride_raw = read_stack_argument(engine, 0x28, "DrawPrimitiveUP VertexStreamZeroStride")?;
@@ -892,7 +892,7 @@ pub fn handle_draw_primitive_up(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         &mut *ctx.state,
         primitive_type,
         primitive_count,
-        data_ptr,
+        data_va,
         stride_raw,
         0,
         0,
@@ -919,10 +919,10 @@ pub fn handle_draw_indexed_primitive_up(
         .context("failed to read R9 for DrawIndexedPrimitiveUP")?;
     let primitive_count =
         read_stack_argument(engine, 0x28, "DrawIndexedPrimitiveUP PrimitiveCount")?;
-    let index_ptr = read_stack_argument(engine, 0x30, "DrawIndexedPrimitiveUP pIndexData")?;
+    let index_va = read_stack_argument(engine, 0x30, "DrawIndexedPrimitiveUP pIndexData")?;
     let index_format_raw =
         read_stack_argument(engine, 0x38, "DrawIndexedPrimitiveUP IndexDataFormat")?;
-    let data_ptr =
+    let data_va =
         read_stack_argument(engine, 0x40, "DrawIndexedPrimitiveUP pVertexStreamZeroData")?;
     let stride_raw = read_stack_argument(
         engine,
@@ -940,9 +940,9 @@ pub fn handle_draw_indexed_primitive_up(
         &mut *ctx.state,
         primitive_type,
         primitive_count,
-        data_ptr,
+        data_va,
         stride_raw,
-        index_ptr,
+        index_va,
         index_format,
         num_vertices,
         index_count,

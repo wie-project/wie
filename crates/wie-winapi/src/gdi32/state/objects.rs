@@ -69,7 +69,7 @@ pub fn handle_create_dib_section(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         .read_rcx()
         .context("failed to read RCX for CreateDIBSection")?;
 
-    let bmi_ptr = engine
+    let bmi_va = engine
         .read_rdx()
         .context("failed to read RDX for CreateDIBSection")?;
 
@@ -77,16 +77,16 @@ pub fn handle_create_dib_section(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         .read_r8()
         .context("failed to read R8 for CreateDIBSection")?;
 
-    let bits_out_ptr = engine
+    let bits_out_va = engine
         .read_r9()
         .context("failed to read R9 for CreateDIBSection")?;
 
-    let (width_abs, height_abs, bit_count, height_signed) = if bmi_ptr != 0 {
+    let (width_abs, height_abs, bit_count, height_signed) = if bmi_va != 0 {
         // BITMAPINFOHEADER (the fixed 40-byte header of a BITMAPINFO):
         // biWidth@4, biHeight@8, biBitCount@14 — one typed read. The layout is
         // pinned by the BitmapInfoHeader const-assert table.
         let (bi_width, bi_height, bit_count) =
-            with_typed_read::<BitmapInfoHeader, _, _>(engine, bmi_ptr, |header| {
+            with_typed_read::<BitmapInfoHeader, _, _>(engine, bmi_va, |header| {
                 Ok((
                     header.bi_width,
                     header.bi_height,
@@ -118,8 +118,8 @@ pub fn handle_create_dib_section(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         .checked_mul(u64::from(height_abs))
         .context("CreateDIBSection image size overflow")?;
 
-    let bits_ptr = allocate_gdi_heap_block(engine, state, image_size.max(16));
-    if bits_ptr == 0 {
+    let bits_va = allocate_gdi_heap_block(engine, state, image_size.max(16));
+    if bits_va == 0 {
         tracing::warn!(
             width_abs,
             height_abs,
@@ -135,13 +135,13 @@ pub fn handle_create_dib_section(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         let zero = vec![0_u8; usize::try_from(image_size).unwrap_or(0)];
         if !zero.is_empty() {
             engine
-                .mem_write(bits_ptr, &zero)
+                .mem_write(bits_va, &zero)
                 .context("failed to zero CreateDIBSection bits")?;
         }
     }
 
-    if bits_out_ptr != 0 {
-        write_guest_u64(engine, bits_out_ptr, bits_ptr)
+    if bits_out_va != 0 {
+        write_guest_u64(engine, bits_out_va, bits_va)
             .context("failed to write CreateDIBSection *ppvBits")?;
     }
 
@@ -160,13 +160,13 @@ pub fn handle_create_dib_section(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         height: height_signed, // preserved sign
         bit_count: u16::try_from(bit_count).unwrap_or(0),
         stride: i32::try_from(stride).unwrap_or(i32::MAX),
-        bits_va: bits_ptr,
+        bits_va,
         byte_len: image_size,
     });
 
     tracing::debug!(
         dib_handle = dib_handle.as_u64(),
-        bits_ptr,
+        bits_va,
         width_abs,
         height_signed,
         bit_count,
@@ -256,13 +256,13 @@ fn handle_create_font_impl(
     // arg 13 (`iPitchAndFamily`) at [rsp+0x68]; low byte is the pitch hint.
     let pitch_and_family = read_u32(engine, checked_address(rsp, 0x68, "iPitchAndFamily"))
         .with_context(|| format!("failed to read {api_name} iPitchAndFamily"))?;
-    let face_name_ptr = read_u64(engine, checked_address(rsp, 0x70, "pszFaceName"))
+    let face_name_va = read_u64(engine, checked_address(rsp, 0x70, "pszFaceName"))
         .with_context(|| format!("failed to read {api_name} pszFaceName"))?;
 
     let face_name = if wide {
-        read_guest_utf16_lossy(engine, face_name_ptr, 64)
+        read_guest_utf16_lossy(engine, face_name_va, 64)
     } else {
-        read_guest_ansi_lossy(engine, face_name_ptr, 64)
+        read_guest_ansi_lossy(engine, face_name_va, 64)
     }
     .with_context(|| format!("failed to read {api_name} face name"))?;
 
@@ -315,16 +315,16 @@ fn handle_create_font_indirect_impl(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let logfont_ptr = engine
+    let logfont_va = engine
         .read_rcx()
         .with_context(|| format!("failed to read RCX for {api_name}"))?;
 
-    if logfont_ptr == 0 {
+    if logfont_va == 0 {
         return ctx.finish(0);
     }
 
     let (height, weight, italic, charset, pitch, underline, strike_out, face_name) = if wide {
-        with_typed_read::<LogFontW, _, _>(engine, logfont_ptr, |lf| {
+        with_typed_read::<LogFontW, _, _>(engine, logfont_va, |lf| {
             Ok((
                 lf.height,
                 lf.weight,
@@ -337,7 +337,7 @@ fn handle_create_font_indirect_impl(
             ))
         })
     } else {
-        with_typed_read::<LogFontA, _, _>(engine, logfont_ptr, |lf| {
+        with_typed_read::<LogFontA, _, _>(engine, logfont_va, |lf| {
             Ok((
                 lf.height,
                 lf.weight,

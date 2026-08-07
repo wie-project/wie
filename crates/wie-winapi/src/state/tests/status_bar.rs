@@ -932,20 +932,20 @@ fn test_status_bar_measurement_matches_paint_font_when_selected() {
 
     // A 13 px "MS Shell Dlg" font through the real dispatch path (the guest's
     // own UI font; the HFONT lands in the GDI font table).
-    let logfont_ptr = 0x5000_u64;
+    let logfont_va = 0x5000_u64;
     engine
-        .mem_write(logfont_ptr, &(-13_i32).to_le_bytes())
+        .mem_write(logfont_va, &(-13_i32).to_le_bytes())
         .expect("write LOGFONTA.lfHeight");
     engine
-        .mem_write(logfont_ptr + 16, &(400_i32).to_le_bytes())
+        .mem_write(logfont_va + 16, &(400_i32).to_le_bytes())
         .expect("write LOGFONTA.lfWeight");
     engine
-        .mem_write(logfont_ptr + 23, &[1_u8])
+        .mem_write(logfont_va + 23, &[1_u8])
         .expect("write LOGFONTA.lfCharSet");
     engine
-        .mem_write(logfont_ptr + 28, b"MS Shell Dlg\0")
+        .mem_write(logfont_va + 28, b"MS Shell Dlg\0")
         .expect("write LOGFONTA.lfFaceName");
-    write_regs(&mut engine, logfont_ptr, 0, 0, 0, 0);
+    write_regs(&mut engine, logfont_va, 0, 0, 0, 0);
     let id = crate::resolve_winapi_id("gdi32.dll", "CreateFontIndirectA")
         .expect("CreateFontIndirectA must resolve");
     let r = crate::dispatch_winapi_id(

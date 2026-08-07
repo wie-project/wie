@@ -8,13 +8,13 @@ fn test_command_line_to_argv_w() {
     use crate::guest_string::write_utf16_c_string;
     let mut engine = test_engine();
     let mut state = winapi_state_default();
-    let cmd_ptr = 0x3000;
-    let num_args_ptr = 0x4000;
+    let cmd_va = 0x3000;
+    let num_args_va = 0x4000;
     // Write "hello" as the command line.
-    write_utf16_c_string(&mut engine, cmd_ptr, 10, "hello").ok();
-    engine.mem_write(num_args_ptr, &[0_u8; 4]).ok();
+    write_utf16_c_string(&mut engine, cmd_va, 10, "hello").ok();
+    engine.mem_write(num_args_va, &[0_u8; 4]).ok();
     // Call handler directly.
-    write_regs(&mut engine, cmd_ptr, num_args_ptr, 0, 0, STACK_TOP);
+    write_regs(&mut engine, cmd_va, num_args_va, 0, 0, STACK_TOP);
     let result = {
         let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
         shell32::dispatch_shell32(&mut ctx, "CommandLineToArgvW")
@@ -23,7 +23,7 @@ fn test_command_line_to_argv_w() {
     .expect("handler not found");
     assert!(result.return_value != 0, "return_value is 0");
     let mut argc_buf = [0_u8; 4];
-    engine.mem_read(num_args_ptr, &mut argc_buf).ok();
+    engine.mem_read(num_args_va, &mut argc_buf).ok();
     assert_eq!(u32::from_le_bytes(argc_buf), 1);
 }
 
@@ -87,10 +87,10 @@ fn test_sh_add_to_recent_docs_pathw_returns_without_error() {
     use crate::guest_string::write_utf16_c_string;
     let mut engine = test_engine();
     let mut state = winapi_state_default();
-    let path_ptr = 0x3000;
-    write_utf16_c_string(&mut engine, path_ptr, 64, "C:\\tmp\\x.txt").ok();
+    let path_va = 0x3000;
+    write_utf16_c_string(&mut engine, path_va, 64, "C:\\tmp\\x.txt").ok();
     // RCX = SHARD_PATHW (0x3), RDX = path pointer.
-    write_regs(&mut engine, 0x3, path_ptr, 0, 0, STACK_TOP);
+    write_regs(&mut engine, 0x3, path_va, 0, 0, STACK_TOP);
     let result = {
         let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
         shell32::dispatch_shell32(&mut ctx, "SHAddToRecentDocs")
@@ -131,10 +131,10 @@ fn test_sh_get_folder_path_w_returns_seeded_skeleton_paths() {
     ];
     for &(csidl, expected) in cases {
         // 5th arg (path buffer) sits at [rsp+0x28] in the Win64 ABI.
-        let path_ptr = 0x6000_u64;
+        let path_va = 0x6000_u64;
         engine
-            .mem_write(STACK_TOP + 0x28, &path_ptr.to_le_bytes())
-            .expect("write path_ptr stack slot");
+            .mem_write(STACK_TOP + 0x28, &path_va.to_le_bytes())
+            .expect("write path_va stack slot");
         write_regs(&mut engine, 0, csidl, 0, 0, STACK_TOP);
         let result = {
             let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
@@ -143,7 +143,7 @@ fn test_sh_get_folder_path_w_returns_seeded_skeleton_paths() {
         .expect("dispatch failed")
         .expect("handler not found");
         assert_eq!(result.return_value, 0, "S_OK for csidl {csidl:#x}");
-        let returned = read_guest_utf16_raw(&mut engine, path_ptr, 260);
+        let returned = read_guest_utf16_raw(&mut engine, path_va, 260);
         assert_eq!(
             returned, expected,
             "csidl {csidl:#x} must return the seeded dir"

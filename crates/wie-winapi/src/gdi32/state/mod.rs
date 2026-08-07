@@ -53,21 +53,21 @@ pub fn handle_get_object_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
         .read_rdx()
         .context("failed to read RDX for GetObjectA")?;
 
-    let object_buffer_ptr = engine
+    let object_buffer_va = engine
         .read_r8()
         .context("failed to read R8 for GetObjectA")?;
 
     let can_write_bitmap =
-        object_handle != 0 && object_buffer_ptr != 0 && buffer_size >= BITMAP_STRUCT_SIZE;
+        object_handle != 0 && object_buffer_va != 0 && buffer_size >= BITMAP_STRUCT_SIZE;
 
-    let return_value = if object_buffer_ptr == 0 && object_handle != 0 {
+    let return_value = if object_buffer_va == 0 && object_handle != 0 {
         BITMAP_STRUCT_SIZE
     } else if can_write_bitmap {
         // Win64 BITMAP (32 bytes, layout pinned by the Bitmap const-assert
         // table): LONG bmType @0 … WORD bmPlanes @16, WORD bmBitsPixel @18,
         // pad @20..23, LPVOID bmBits @24. The typed view zero-fills the pad
         // and leaves bmBits NULL, matching the old per-field writes.
-        with_typed_write::<Bitmap, _, _>(engine, object_buffer_ptr, |bitmap| {
+        with_typed_write::<Bitmap, _, _>(engine, object_buffer_va, |bitmap| {
             bitmap.bm_type = 0;
             bitmap.bm_width = 16;
             bitmap.bm_height = 16;
@@ -216,7 +216,7 @@ fn handle_get_text_extent_point_32_impl(
         .read_rcx()
         .with_context(|| format!("failed to read RCX for {api_name}"))?;
 
-    let text_ptr = engine
+    let text_va = engine
         .read_rdx()
         .with_context(|| format!("failed to read RDX for {api_name}"))?;
 
@@ -224,7 +224,7 @@ fn handle_get_text_extent_point_32_impl(
         .read_r8()
         .with_context(|| format!("failed to read R8 for {api_name}"))?;
 
-    let size_ptr = engine
+    let size_va = engine
         .read_r9()
         .with_context(|| format!("failed to read R9 for {api_name}"))?;
 
@@ -239,7 +239,7 @@ fn handle_get_text_extent_point_32_impl(
         let resolved = dc_resolved_font(state, device_context_handle, font_engine);
         match resolved {
             Some((key, resolved)) => {
-                let chars = crate::gdi32::text::read_text_chars(engine, text_ptr, count, wide)?;
+                let chars = crate::gdi32::text::read_text_chars(engine, text_va, count, wide)?;
                 let mut width = 0_i32;
                 for ch in chars {
                     if let Some(ch) = char::from_u32(ch) {
@@ -255,11 +255,11 @@ fn handle_get_text_extent_point_32_impl(
     let width = width.max(0);
     let height = height.max(0);
 
-    if size_ptr != 0 {
+    if size_va != 0 {
         // SIZE is LONG cx @0, LONG cy @4 — one typed write (the values are
         // non-negative i32, so the i32 fields carry the exact guest bytes the
         // old u32 writes produced).
-        with_typed_write::<Size, _, _>(engine, size_ptr, |size| {
+        with_typed_write::<Size, _, _>(engine, size_va, |size| {
             size.cx = width;
             size.cy = height;
             Ok(())
@@ -267,7 +267,7 @@ fn handle_get_text_extent_point_32_impl(
         .with_context(|| format!("failed to write SIZE for {api_name}"))?;
     }
 
-    let return_value = u64::from(size_ptr != 0);
+    let return_value = u64::from(size_va != 0);
 
     ctx.finish(return_value)
 }

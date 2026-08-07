@@ -7,7 +7,7 @@ use super::{
 
 pub(crate) fn write_critical_section_unlocked(
     engine: &mut dyn wie_cpu::CpuEngine,
-    critical_section_ptr: u64,
+    critical_section_va: u64,
     spin_count: u64,
 ) -> Result<()> {
     // RTL_CRITICAL_SECTION on Win64 (40 bytes) — built once on the host stack
@@ -25,7 +25,7 @@ pub(crate) fn write_critical_section_unlocked(
     buf[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
     buf[32..40].copy_from_slice(&spin_count.to_le_bytes());
     engine
-        .mem_write(critical_section_ptr, &buf)
+        .mem_write(critical_section_va, &buf)
         .context("failed to write RTL_CRITICAL_SECTION init state")
 }
 /// Handles `KERNEL32.dll!InitializeCriticalSection`.
@@ -33,12 +33,12 @@ pub fn handle_initialize_critical_section(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let critical_section_ptr = engine
+    let critical_section_va = engine
         .read_rcx()
         .context("failed to read RCX for InitializeCriticalSection")?;
 
-    if critical_section_ptr != 0 {
-        write_critical_section_unlocked(engine, critical_section_ptr, 0)?;
+    if critical_section_va != 0 {
+        write_critical_section_unlocked(engine, critical_section_va, 0)?;
     }
 
     // void return; RAX is unused but cleared for determinism.
@@ -173,7 +173,7 @@ pub fn handle_initialize_critical_section_and_spin_count(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let critical_section_ptr = engine
+    let critical_section_va = engine
         .read_rcx()
         .context("failed to read RCX for InitializeCriticalSectionAndSpinCount")?;
 
@@ -181,8 +181,8 @@ pub fn handle_initialize_critical_section_and_spin_count(
         .read_rdx()
         .context("failed to read RDX for InitializeCriticalSectionAndSpinCount")?;
 
-    if critical_section_ptr != 0 {
-        write_critical_section_unlocked(engine, critical_section_ptr, spin_count)?;
+    if critical_section_va != 0 {
+        write_critical_section_unlocked(engine, critical_section_va, spin_count)?;
     }
 
     ctx.finish(1)
@@ -256,13 +256,13 @@ pub fn handle_wait_for_multiple_objects(
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let count = low_u32(engine.read_rcx()?, "WaitForMultipleObjects count")?;
-    let handles_ptr = engine.read_rdx()?;
+    let handles_va = engine.read_rdx()?;
     let wait_all = (engine.read_r8()? & 0xffff_ffff) != 0;
     let timeout_raw = engine.read_r9()?;
     let timeout_ms = u32::try_from(timeout_raw & u64::from(u32::MAX)).unwrap_or(0);
 
     let count_usize = usize::try_from(count).unwrap_or(usize::MAX);
-    if count == 0 || handles_ptr == 0 || count_usize > crate::MAXIMUM_WAIT_OBJECTS {
+    if count == 0 || handles_va == 0 || count_usize > crate::MAXIMUM_WAIT_OBJECTS {
         state.process.last_error = ERROR_INVALID_PARAMETER;
         return ret_u64(
             engine,
@@ -273,7 +273,7 @@ pub fn handle_wait_for_multiple_objects(
 
     let mut handles = Vec::with_capacity(count_usize);
     for i in 0..count {
-        let ha = handles_ptr.wrapping_add(u64::from(i).wrapping_mul(8));
+        let ha = handles_va.wrapping_add(u64::from(i).wrapping_mul(8));
         handles.push(read_u64(engine, ha)?);
     }
 

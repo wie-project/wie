@@ -66,11 +66,11 @@ fn get_environment_variable(
     } else {
         "GetEnvironmentVariableA"
     };
-    let name_ptr = ctx
+    let name_va = ctx
         .engine
         .read_rcx()
         .context("GetEnvironmentVariable RCX")?;
-    let buffer_ptr = ctx
+    let buffer_va = ctx
         .engine
         .read_rdx()
         .context("GetEnvironmentVariable RDX")?;
@@ -79,14 +79,14 @@ fn get_environment_variable(
         "GetEnvironmentVariable size",
     )?;
 
-    if name_ptr == 0 {
+    if name_va == 0 {
         ctx.state.process.last_error = ERROR_ENVVAR_NOT_FOUND;
         return ret_u64(ctx.engine, 0, api);
     }
     let name = if wide {
-        read_guest_utf16_lossy(ctx.engine, name_ptr, MAX_ENV_CHARS)?
+        read_guest_utf16_lossy(ctx.engine, name_va, MAX_ENV_CHARS)?
     } else {
-        read_guest_ansi_lossy(ctx.engine, name_ptr, MAX_ENV_CHARS)?
+        read_guest_ansi_lossy(ctx.engine, name_va, MAX_ENV_CHARS)?
     };
 
     let Some(value) = lookup(ctx, &name) else {
@@ -101,16 +101,16 @@ fn get_environment_variable(
     };
     let capacity_usize = usize::try_from(capacity).unwrap_or(0);
 
-    if buffer_ptr == 0 || capacity_usize <= needed {
+    if buffer_va == 0 || capacity_usize <= needed {
         // Buffer too small: report the size including the terminator.
         let required = u64::try_from(needed.saturating_add(1)).unwrap_or(0);
         return ret_u64(ctx.engine, required, api);
     }
 
     if wide {
-        write_utf16_c_string(ctx.engine, buffer_ptr, capacity_usize, &value)?;
+        write_utf16_c_string(ctx.engine, buffer_va, capacity_usize, &value)?;
     } else {
-        write_ansi_c_string(ctx.engine, buffer_ptr, capacity_usize, &value)?;
+        write_ansi_c_string(ctx.engine, buffer_va, capacity_usize, &value)?;
     }
     ctx.state.process.last_error = 0;
     ret_u64(ctx.engine, u64::try_from(needed).unwrap_or(0), api)
@@ -140,23 +140,23 @@ fn set_environment_variable(
     } else {
         "SetEnvironmentVariableA"
     };
-    let name_ptr = ctx
+    let name_va = ctx
         .engine
         .read_rcx()
         .context("SetEnvironmentVariable RCX")?;
-    let value_ptr = ctx
+    let value_va = ctx
         .engine
         .read_rdx()
         .context("SetEnvironmentVariable RDX")?;
 
-    if name_ptr == 0 {
+    if name_va == 0 {
         ctx.state.process.last_error = super::ERROR_INVALID_PARAMETER;
         return ret_u64(ctx.engine, 0, api);
     }
     let name = if wide {
-        read_guest_utf16_lossy(ctx.engine, name_ptr, MAX_ENV_CHARS)?
+        read_guest_utf16_lossy(ctx.engine, name_va, MAX_ENV_CHARS)?
     } else {
-        read_guest_ansi_lossy(ctx.engine, name_ptr, MAX_ENV_CHARS)?
+        read_guest_ansi_lossy(ctx.engine, name_va, MAX_ENV_CHARS)?
     };
     // A name containing '=' would produce an environment block that cannot be
     // parsed back, so Windows rejects it.
@@ -165,16 +165,12 @@ fn set_environment_variable(
         return ret_u64(ctx.engine, 0, api);
     }
 
-    let value = if value_ptr == 0 {
+    let value = if value_va == 0 {
         None
     } else if wide {
-        Some(read_guest_utf16_lossy(
-            ctx.engine,
-            value_ptr,
-            MAX_ENV_CHARS,
-        )?)
+        Some(read_guest_utf16_lossy(ctx.engine, value_va, MAX_ENV_CHARS)?)
     } else {
-        Some(read_guest_ansi_lossy(ctx.engine, value_ptr, MAX_ENV_CHARS)?)
+        Some(read_guest_ansi_lossy(ctx.engine, value_va, MAX_ENV_CHARS)?)
     };
 
     assign(ctx, &name, value.as_deref());
@@ -240,11 +236,11 @@ fn expand_environment_strings(
     } else {
         "ExpandEnvironmentStringsA"
     };
-    let src_ptr = ctx
+    let src_va = ctx
         .engine
         .read_rcx()
         .context("ExpandEnvironmentStrings RCX")?;
-    let dst_ptr = ctx
+    let dst_va = ctx
         .engine
         .read_rdx()
         .context("ExpandEnvironmentStrings RDX")?;
@@ -255,14 +251,14 @@ fn expand_environment_strings(
         "ExpandEnvironmentStrings size",
     )?;
 
-    if src_ptr == 0 {
+    if src_va == 0 {
         ctx.state.process.last_error = super::ERROR_INVALID_PARAMETER;
         return ret_u64(ctx.engine, 0, api);
     }
     let source = if wide {
-        read_guest_utf16_lossy(ctx.engine, src_ptr, MAX_ENV_CHARS)?
+        read_guest_utf16_lossy(ctx.engine, src_va, MAX_ENV_CHARS)?
     } else {
-        read_guest_ansi_lossy(ctx.engine, src_ptr, MAX_ENV_CHARS)?
+        read_guest_ansi_lossy(ctx.engine, src_va, MAX_ENV_CHARS)?
     };
     let expanded = expand(ctx, &source);
 
@@ -274,11 +270,11 @@ fn expand_environment_strings(
     let required = chars.saturating_add(1);
     let capacity_usize = usize::try_from(capacity).unwrap_or(0);
 
-    if dst_ptr != 0 && capacity_usize >= required {
+    if dst_va != 0 && capacity_usize >= required {
         if wide {
-            write_utf16_c_string(ctx.engine, dst_ptr, capacity_usize, &expanded)?;
+            write_utf16_c_string(ctx.engine, dst_va, capacity_usize, &expanded)?;
         } else {
-            write_ansi_c_string(ctx.engine, dst_ptr, capacity_usize, &expanded)?;
+            write_ansi_c_string(ctx.engine, dst_va, capacity_usize, &expanded)?;
         }
         ctx.state.process.last_error = 0;
     }

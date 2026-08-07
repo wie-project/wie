@@ -23,16 +23,16 @@ pub fn handle_read_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let handle = engine.read_rcx()?;
-    let buffer_ptr = engine.read_rdx()?;
+    let buffer_va = engine.read_rdx()?;
     let bytes_to_read = engine.read_r8()?;
-    let bytes_read_ptr = engine.read_r9()?;
+    let bytes_read_va = engine.read_r9()?;
 
     // Microsoft Learn: sets *lpNumberOfBytesRead to zero before any work/error check.
-    if bytes_read_ptr != 0 {
-        write_guest_u32(engine, bytes_read_ptr, 0)?;
+    if bytes_read_va != 0 {
+        write_guest_u32(engine, bytes_read_va, 0)?;
     }
 
-    if buffer_ptr == 0 {
+    if buffer_va == 0 {
         state.process.last_error = ERROR_INVALID_PARAMETER;
         return ctx.finish(0);
     }
@@ -81,13 +81,13 @@ pub fn handle_read_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
                 .get(state.file_io.stdin_cursor..end)
                 .context("ReadFile stdin slice out of range")?;
             engine
-                .mem_write(buffer_ptr, data)
+                .mem_write(buffer_va, data)
                 .context("failed to write ReadFile stdin bytes")?;
             state.file_io.stdin_cursor = end;
-            if bytes_read_ptr != 0 {
+            if bytes_read_va != 0 {
                 let read_len_u32 =
                     u32::try_from(read_len).context("ReadFile byte count does not fit u32")?;
-                write_guest_u32(engine, bytes_read_ptr, read_len_u32)?;
+                write_guest_u32(engine, bytes_read_va, read_len_u32)?;
             }
         }
         // available == 0 && InjectOnly → inject exhausted → EOF (0 bytes, success).
@@ -144,13 +144,13 @@ pub fn handle_read_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
             };
             data.truncate(n);
             engine
-                .mem_write(buffer_ptr, &data)
+                .mem_write(buffer_va, &data)
                 .context("failed to write ReadFile stream bytes")?;
             if let Some(open_file) = find_open_file_mut(state, handle) {
                 open_file.cursor = cursor_before.saturating_add(u64::try_from(n).unwrap_or(0));
             }
-            if bytes_read_ptr != 0 {
-                write_guest_u32(engine, bytes_read_ptr, u32::try_from(n).unwrap_or(0))?;
+            if bytes_read_va != 0 {
+                write_guest_u32(engine, bytes_read_va, u32::try_from(n).unwrap_or(0))?;
             }
             if is_main_module_path(state, &path) {
                 state.file_io.executable_file_cursor =
@@ -192,13 +192,13 @@ pub fn handle_read_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
                     .get(start..end)
                     .context("ReadFile slice out of range")?;
                 engine
-                    .mem_write(buffer_ptr, data)
+                    .mem_write(buffer_va, data)
                     .context("failed to write ReadFile bytes")?;
 
                 let read_len_u32 =
                     u32::try_from(data.len()).context("ReadFile byte count does not fit u32")?;
-                if bytes_read_ptr != 0 {
-                    write_guest_u32(engine, bytes_read_ptr, read_len_u32)?;
+                if bytes_read_va != 0 {
+                    write_guest_u32(engine, bytes_read_va, read_len_u32)?;
                 }
             }
 
@@ -232,7 +232,7 @@ pub fn handle_write_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
         .read_rcx()
         .context("failed to read RCX for WriteFile")?;
 
-    let buffer_ptr = engine
+    let buffer_va = engine
         .read_rdx()
         .context("failed to read RDX for WriteFile")?;
 
@@ -240,16 +240,16 @@ pub fn handle_write_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
         .read_r8()
         .context("failed to read R8 for WriteFile")?;
 
-    let bytes_written_ptr = engine
+    let bytes_written_va = engine
         .read_r9()
         .context("failed to read R9 for WriteFile")?;
 
     // Mirror ReadFile: zero the optional out-count before validation.
-    if bytes_written_ptr != 0 {
-        write_guest_u32(engine, bytes_written_ptr, 0)?;
+    if bytes_written_va != 0 {
+        write_guest_u32(engine, bytes_written_va, 0)?;
     }
 
-    if buffer_ptr == 0 {
+    if buffer_va == 0 {
         state.process.last_error = ERROR_INVALID_PARAMETER;
         return ctx.finish(0);
     }
@@ -261,14 +261,14 @@ pub fn handle_write_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
         let mut data = vec![0_u8; write_len];
         if write_len > 0 {
             engine
-                .mem_read(buffer_ptr, &mut data)
+                .mem_read(buffer_va, &mut data)
                 .context("failed to read WriteFile console buffer")?;
         }
         write_host_console_handle(handle, &data);
-        if bytes_written_ptr != 0 {
+        if bytes_written_va != 0 {
             let write_len_u32 =
                 u32::try_from(write_len).context("WriteFile byte count does not fit u32")?;
-            write_guest_u32(engine, bytes_written_ptr, write_len_u32)?;
+            write_guest_u32(engine, bytes_written_va, write_len_u32)?;
         }
         state.process.last_error = 0;
         return ctx.finish(1);
@@ -289,7 +289,7 @@ pub fn handle_write_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
         let mut data = vec![0_u8; write_len];
         if write_len > 0 {
             engine
-                .mem_read(buffer_ptr, &mut data)
+                .mem_read(buffer_va, &mut data)
                 .context("failed to read WriteFile source buffer")?;
         }
 
@@ -382,13 +382,13 @@ pub fn handle_write_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
         let write_len_u32 =
             u32::try_from(write_len).context("WriteFile byte count does not fit u32")?;
 
-        if bytes_written_ptr != 0 {
-            write_guest_u32(engine, bytes_written_ptr, write_len_u32)?;
+        if bytes_written_va != 0 {
+            write_guest_u32(engine, bytes_written_va, write_len_u32)?;
         }
 
         tracing::debug!(
             handle,
-            buffer = buffer_ptr,
+            buffer = buffer_va,
             requested = bytes_to_write,
             cursor_before,
             actual_write = write_len,
@@ -402,7 +402,7 @@ pub fn handle_write_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
     } else {
         tracing::debug!(
             handle,
-            buffer = buffer_ptr,
+            buffer = buffer_va,
             requested = bytes_to_write,
             "WriteFile invalid handle"
         );
@@ -419,11 +419,11 @@ pub fn handle_backup_read(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     let handle = engine.read_rcx()?;
     let buf = engine.read_rdx()?;
     let to_read = engine.read_r8()?;
-    let bytes_read_ptr = engine.read_r9()?;
+    let bytes_read_va = engine.read_r9()?;
     let _context = read_stack_u64(engine, 0x28).unwrap_or(0);
     let _secured = read_stack_u64(engine, 0x30).unwrap_or(0);
-    if bytes_read_ptr != 0 {
-        write_guest_u32(engine, bytes_read_ptr, 0)?;
+    if bytes_read_va != 0 {
+        write_guest_u32(engine, bytes_read_va, 0)?;
     }
     if buf == 0 || to_read == 0 {
         state.process.last_error = 0;
@@ -445,8 +445,8 @@ pub fn handle_backup_read(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
                 .cursor
                 .saturating_add(u64::try_from(read_len).unwrap_or(0));
         }
-        if bytes_read_ptr != 0 {
-            write_guest_u32(engine, bytes_read_ptr, u32::try_from(read_len).unwrap_or(0))?;
+        if bytes_read_va != 0 {
+            write_guest_u32(engine, bytes_read_va, u32::try_from(read_len).unwrap_or(0))?;
         }
         state.process.last_error = 0;
         ctx.finish(1)
@@ -462,16 +462,16 @@ pub fn handle_backup_seek(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     let handle = engine.read_rcx()?;
     let lo = engine.read_rdx()?;
     let hi = engine.read_r8()?;
-    let lo_ptr = engine.read_r9()?;
-    let _hi_ptr = read_stack_u64(engine, 0x28).unwrap_or(0);
+    let lo_va = engine.read_r9()?;
+    let _hi_va = read_stack_u64(engine, 0x28).unwrap_or(0);
     let _context = read_stack_u64(engine, 0x30).unwrap_or(0);
     if let Some(file) = state.file_io.open_files.get_mut(&handle) {
         let offset = lo | (hi << 32);
         file.cursor = offset;
-        if lo_ptr != 0 {
+        if lo_va != 0 {
             write_guest_u32(
                 engine,
-                lo_ptr,
+                lo_va,
                 u32::try_from(offset & 0xFFFF_FFFF).unwrap_or(0),
             )?;
         }
@@ -489,11 +489,11 @@ pub fn handle_backup_write(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
     let handle = engine.read_rcx()?;
     let buf = engine.read_rdx()?;
     let to_write = engine.read_r8()?;
-    let written_ptr = engine.read_r9()?;
+    let written_va = engine.read_r9()?;
     let _context = read_stack_u64(engine, 0x28).unwrap_or(0);
     let _secured = read_stack_u64(engine, 0x30).unwrap_or(0);
-    if written_ptr != 0 {
-        write_guest_u32(engine, written_ptr, 0)?;
+    if written_va != 0 {
+        write_guest_u32(engine, written_va, 0)?;
     }
     if buf == 0 || to_write == 0 {
         state.process.last_error = 0;
@@ -516,8 +516,8 @@ pub fn handle_backup_write(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
             dst.copy_from_slice(&chunk);
         }
         file.cursor = file.cursor.saturating_add(to_write);
-        if written_ptr != 0 {
-            write_guest_u32(engine, written_ptr, u32::try_from(to_write).unwrap_or(0))?;
+        if written_va != 0 {
+            write_guest_u32(engine, written_va, u32::try_from(to_write).unwrap_or(0))?;
         }
         state.process.last_error = 0;
         ctx.finish(1)

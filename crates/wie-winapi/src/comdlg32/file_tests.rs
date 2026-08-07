@@ -953,12 +953,12 @@ fn mounted_save_create_writes_the_real_host_file() {
 
     // The dialog-accept step: the pick registers the mount.
     let guest_path = crate::vfs::register_pick_mount(&host).expect("the pick mounts the new file");
-    let file_name_ptr = 0x6000;
+    let file_name_va = 0x6000;
     engine
-        .mem_write(file_name_ptr, &utf16_bytes(&guest_path))
+        .mem_write(file_name_va, &utf16_bytes(&guest_path))
         .ok();
     // CreateFileW(file, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, ...).
-    write_regs(&mut engine, file_name_ptr, 0x4000_0000, 0, 0);
+    write_regs(&mut engine, file_name_va, 0x4000_0000, 0, 0);
     engine
         .mem_write(STACK_TOP + 0x28, &2_u32.to_le_bytes())
         .ok(); // CREATE_ALWAYS
@@ -977,12 +977,12 @@ fn mounted_save_create_writes_the_real_host_file() {
 
     // WriteFile(handle, "saved through the mount", ...).
     let payload = b"saved through the pick mount";
-    let data_ptr = 0x7000;
-    engine.mem_write(data_ptr, payload).ok();
+    let data_va = 0x7000;
+    engine.mem_write(data_va, payload).ok();
     write_regs(
         &mut engine,
         handle,
-        data_ptr,
+        data_va,
         u64::try_from(payload.len()).unwrap_or(0),
         0x8000,
     );
@@ -1029,12 +1029,12 @@ fn mounted_open_reads_the_real_host_file() {
     std::fs::write(&host, original).expect("seed the host file");
 
     let guest_path = crate::vfs::register_pick_mount(&host).expect("the pick mounts the open file");
-    let file_name_ptr = 0x6000;
+    let file_name_va = 0x6000;
     engine
-        .mem_write(file_name_ptr, &utf16_bytes(&guest_path))
+        .mem_write(file_name_va, &utf16_bytes(&guest_path))
         .ok();
     // CreateFileW(file, GENERIC_READ, 0, 0, OPEN_EXISTING, ...).
-    write_regs(&mut engine, file_name_ptr, 0x8000_0000, 0, 0);
+    write_regs(&mut engine, file_name_va, 0x8000_0000, 0, 0);
     engine
         .mem_write(STACK_TOP + 0x28, &3_u32.to_le_bytes())
         .ok(); // OPEN_EXISTING
@@ -1052,8 +1052,8 @@ fn mounted_open_reads_the_real_host_file() {
     );
 
     // ReadFile(handle, buf, 64, &bytesRead).
-    let read_ptr = 0x7000;
-    write_regs(&mut engine, handle, read_ptr, 64, 0x8000);
+    let read_va = 0x7000;
+    write_regs(&mut engine, handle, read_va, 64, 0x8000);
     handle_read_file(&mut HandlerContext::new(
         &mut engine,
         test_environment(),
@@ -1062,7 +1062,7 @@ fn mounted_open_reads_the_real_host_file() {
     .expect("ReadFile on the mount must succeed");
     let mut read_back = vec![0_u8; original.len()];
     engine
-        .mem_read(read_ptr, &mut read_back)
+        .mem_read(read_va, &mut read_back)
         .expect("read the guest buffer back");
     assert_eq!(
         read_back, original,
@@ -1136,11 +1136,11 @@ fn dialog_pick_to_open_reads_the_real_host_file() {
     // and ReadFile — the same handlers notepad hits after
     // GetOpenFileNameW. The buffer is re-seeded from itself to make the
     // round-trip explicit: the file op consumes the dialog's output.
-    let file_name_ptr = file_buf;
+    let file_name_va = file_buf;
     engine
-        .mem_write(file_name_ptr, &utf16_bytes(&guest_path))
+        .mem_write(file_name_va, &utf16_bytes(&guest_path))
         .ok();
-    write_regs(&mut engine, file_name_ptr, 0x8000_0000, 0, 0); // GENERIC_READ
+    write_regs(&mut engine, file_name_va, 0x8000_0000, 0, 0); // GENERIC_READ
     engine
         .mem_write(STACK_TOP + 0x28, &3_u32.to_le_bytes())
         .ok(); // OPEN_EXISTING
@@ -1157,8 +1157,8 @@ fn dialog_pick_to_open_reads_the_real_host_file() {
         "a valid handle (not INVALID_HANDLE_VALUE)"
     );
 
-    let read_ptr = 0x7000;
-    write_regs(&mut engine, handle, read_ptr, 64, 0x8000);
+    let read_va = 0x7000;
+    write_regs(&mut engine, handle, read_va, 64, 0x8000);
     handle_read_file(&mut HandlerContext::new(
         &mut engine,
         test_environment(),
@@ -1167,7 +1167,7 @@ fn dialog_pick_to_open_reads_the_real_host_file() {
     .expect("ReadFile on the returned buffer path must succeed");
     let mut read_back = vec![0_u8; original.len()];
     engine
-        .mem_read(read_ptr, &mut read_back)
+        .mem_read(read_va, &mut read_back)
         .expect("read the guest buffer back");
     assert_eq!(
         read_back, original,

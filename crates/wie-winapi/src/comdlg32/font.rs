@@ -73,11 +73,11 @@ const FONT_DLG_CY: i32 = 260;
 pub fn handle_choose_font_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let cf_ptr = engine
+    let cf_va = engine
         .read_rcx()
         .context("failed to read RCX for ChooseFontW")?;
 
-    if cf_ptr == 0 {
+    if cf_va == 0 {
         state_comm_dlg_none(state);
         return ctx.finish(0);
     }
@@ -90,7 +90,7 @@ pub fn handle_choose_font_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
             tracing::debug!("ChooseFontW cancelled by policy");
             ctx.finish(0)
         }
-        FontDialogPolicy::Interactive => open_host_font_dialog(ctx, cf_ptr),
+        FontDialogPolicy::Interactive => open_host_font_dialog(ctx, cf_va),
     }
 }
 // ── ChooseFontW interactive dialog ─────────────────────────────────────────
@@ -173,28 +173,28 @@ fn dialog_point_sizes() -> Vec<String> {
 /// posts the `WM_QUIT` the loop exits on. The effects buttons close through
 /// the same stub with sentinel results, which the handler turns into toggles
 /// (the dialog stays open).
-fn open_host_font_dialog(ctx: &mut HandlerContext<'_>, cf_ptr: u64) -> Result<WinApiHandlerResult> {
+fn open_host_font_dialog(ctx: &mut HandlerContext<'_>, cf_va: u64) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
 
-    let log_font_ptr = read_u64(
+    let log_font_va = read_u64(
         engine,
-        checked_address(cf_ptr, CF_LP_LOG_FONT, "CHOOSEFONTW.lpLogFont"),
+        checked_address(cf_va, CF_LP_LOG_FONT, "CHOOSEFONTW.lpLogFont"),
     )
     .context("failed to read lpLogFont for ChooseFontW")?;
     let initial_point_tenths = read_u32(
         engine,
-        checked_address(cf_ptr, CF_IPOINT_SIZE, "CHOOSEFONTW.iPointSize"),
+        checked_address(cf_va, CF_IPOINT_SIZE, "CHOOSEFONTW.iPointSize"),
     )
     .context("failed to read iPointSize for ChooseFontW")?;
     let flags = read_u32(
         engine,
-        checked_address(cf_ptr, CF_FLAGS, "CHOOSEFONTW.Flags"),
+        checked_address(cf_va, CF_FLAGS, "CHOOSEFONTW.Flags"),
     )
     .context("failed to read Flags for ChooseFontW")?;
     let rgb_colors = read_u32(
         engine,
-        checked_address(cf_ptr, CF_RGB_COLORS, "CHOOSEFONTW.rgbColors"),
+        checked_address(cf_va, CF_RGB_COLORS, "CHOOSEFONTW.rgbColors"),
     )
     .context("failed to read rgbColors for ChooseFontW")?;
 
@@ -202,7 +202,7 @@ fn open_host_font_dialog(ctx: &mut HandlerContext<'_>, cf_ptr: u64) -> Result<Wi
     // font dialog already open, fall back to Cancel: a guest must never hang.
     let loop_va = state.window_state().file_dialog_loop_va;
     let proc_va = state.window_state().file_dialog_proc_va;
-    if log_font_ptr == 0
+    if log_font_va == 0
         || loop_va == 0
         || proc_va == 0
         || state.window_state().font_dialog.is_some()
@@ -218,19 +218,19 @@ fn open_host_font_dialog(ctx: &mut HandlerContext<'_>, cf_ptr: u64) -> Result<Wi
     // write-back re-reads it rather than caching the bytes here.
     let initial_face = read_utf16_lossy(
         engine,
-        checked_address(log_font_ptr, LF_FACE_NAME, "LOGFONTW.lfFaceName"),
+        checked_address(log_font_va, LF_FACE_NAME, "LOGFONTW.lfFaceName"),
         32,
     )
     .context("failed to read ChooseFontW lfFaceName")?;
     let lf_height = read_i32(
         engine,
-        checked_address(log_font_ptr, LF_HEIGHT, "LOGFONTW.lfHeight"),
+        checked_address(log_font_va, LF_HEIGHT, "LOGFONTW.lfHeight"),
     )
     .context("failed to read ChooseFontW lfHeight")?;
     let effects_word = read_u32(
         engine,
         checked_address(
-            log_font_ptr,
+            log_font_va,
             LF_ITALIC_UNDERLINE_STRIKE_CHARSET,
             "LOGFONTW effects",
         ),
@@ -266,7 +266,7 @@ fn open_host_font_dialog(ctx: &mut HandlerContext<'_>, cf_ptr: u64) -> Result<Wi
 
     let owner_raw = read_u64(
         engine,
-        checked_address(cf_ptr, CF_HWND_OWNER, "CHOOSEFONTW.hwndOwner"),
+        checked_address(cf_va, CF_HWND_OWNER, "CHOOSEFONTW.hwndOwner"),
     )
     .context("failed to read hwndOwner for ChooseFontW")?;
     let parent_handle = resolve_dialog_owner(state, owner_raw);
@@ -467,8 +467,8 @@ fn open_host_font_dialog(ctx: &mut HandlerContext<'_>, cf_ptr: u64) -> Result<Wi
 
     state.window_state().font_dialog = Some(FontDialogSession {
         dialog_hwnd,
-        cf_ptr,
-        log_font_ptr,
+        cf_ptr: cf_va,
+        log_font_ptr: log_font_va,
         rgb_colors,
         flags,
         family_list_hwnd,
@@ -730,16 +730,16 @@ mod tests {
         engine.mem_write(ptr + 0x1C, &utf16_bytes(face)).ok(); // lfFaceName
     }
 
-    /// Write a `CHOOSEFONTW` into guest memory at `cf_ptr` (Win64 layout).
-    fn write_choosefont(engine: &mut IcedCpu, cf_ptr: u64, logfont_ptr: u64, flags: u32, rgb: u32) {
-        engine.mem_write(cf_ptr, &0x60_u32.to_le_bytes()).ok(); // lStructSize
-        engine.mem_write(cf_ptr + 8, &0_u64.to_le_bytes()).ok(); // hwndOwner
+    /// Write a `CHOOSEFONTW` into guest memory at `cf_va` (Win64 layout).
+    fn write_choosefont(engine: &mut IcedCpu, cf_va: u64, logfont_va: u64, flags: u32, rgb: u32) {
+        engine.mem_write(cf_va, &0x60_u32.to_le_bytes()).ok(); // lStructSize
+        engine.mem_write(cf_va + 8, &0_u64.to_le_bytes()).ok(); // hwndOwner
         engine
-            .mem_write(cf_ptr + 0x18, &logfont_ptr.to_le_bytes())
+            .mem_write(cf_va + 0x18, &logfont_va.to_le_bytes())
             .ok(); // lpLogFont
-        engine.mem_write(cf_ptr + 0x20, &0_u32.to_le_bytes()).ok(); // iPointSize
-        engine.mem_write(cf_ptr + 0x24, &flags.to_le_bytes()).ok(); // Flags
-        engine.mem_write(cf_ptr + 0x28, &rgb.to_le_bytes()).ok(); // rgbColors
+        engine.mem_write(cf_va + 0x20, &0_u32.to_le_bytes()).ok(); // iPointSize
+        engine.mem_write(cf_va + 0x24, &flags.to_le_bytes()).ok(); // Flags
+        engine.mem_write(cf_va + 0x28, &rgb.to_le_bytes()).ok(); // rgbColors
     }
 
     /// Drive `ChooseFontW` with a scripted policy; returns the result value.

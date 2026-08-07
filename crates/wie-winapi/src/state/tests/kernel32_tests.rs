@@ -190,12 +190,12 @@ fn test_get_startup_info_w_writes_startupinfow() {
     // Full dispatch path: name resolution (names.rs) → dense id → handler arm.
     let mut engine = test_engine();
     let mut state = default_winapi_state();
-    let info_ptr = 0x5000;
+    let info_va = 0x5000;
     // Pre-fill so field writes are observable (STARTUPINFOW is 104 bytes).
     engine
-        .mem_write(info_ptr, &[0xAA_u8; 104])
+        .mem_write(info_va, &[0xAA_u8; 104])
         .expect("prefill STARTUPINFOW");
-    write_regs(&mut engine, info_ptr, 0, 0, 0, 0);
+    write_regs(&mut engine, info_va, 0, 0, 0, 0);
     // Sentinel return address so the handler's pop is observable (test_engine
     // defaults to 0).
     engine
@@ -216,16 +216,16 @@ fn test_get_startup_info_w_writes_startupinfow() {
     assert_eq!(r.return_value, 0);
     // Mirror of GetStartupInfoA: cb = 104, dwFlags = 0, wShowWindow = 1.
     let mut cb = [0_u8; 4];
-    engine.mem_read(info_ptr, &mut cb).expect("read cb");
+    engine.mem_read(info_va, &mut cb).expect("read cb");
     assert_eq!(u32::from_le_bytes(cb), 104);
     let mut flags = [0_u8; 4];
     engine
-        .mem_read(info_ptr + 60, &mut flags)
+        .mem_read(info_va + 60, &mut flags)
         .expect("read dwFlags");
     assert_eq!(u32::from_le_bytes(flags), 0);
     let mut show_window = [0_u8; 2];
     engine
-        .mem_read(info_ptr + 64, &mut show_window)
+        .mem_read(info_va + 64, &mut show_window)
         .expect("read wShowWindow");
     assert_eq!(u16::from_le_bytes(show_window), 1);
     // Windows zero-fills the whole struct: the caller's 0xAA pre-fill must
@@ -234,7 +234,7 @@ fn test_get_startup_info_w_writes_startupinfow() {
     // may be nonzero; dwFlags (60..64) is written as 0.
     let mut full = [0_u8; 104];
     engine
-        .mem_read(info_ptr, &mut full)
+        .mem_read(info_va, &mut full)
         .expect("read full STARTUPINFOW");
     let mut nonzero_offsets: Vec<usize> = Vec::new();
     for (offset, &byte) in full.iter().enumerate() {
@@ -406,27 +406,27 @@ fn test_create_font_indirect_w_resolves_logfontw() {
     // must survive the round trip through the font record table.
     let mut engine = test_engine();
     let mut state = default_winapi_state();
-    let logfont_ptr = 0x5000;
+    let logfont_va = 0x5000;
     // LOGFONTW header fields (layout shared with LOGFONTA until lfFaceName).
     let height = 16_i32.to_le_bytes();
     engine
-        .mem_write(logfont_ptr, &height)
+        .mem_write(logfont_va, &height)
         .expect("write LOGFONTW.lfHeight");
     let weight = 700_i32.to_le_bytes();
     engine
-        .mem_write(logfont_ptr + 16, &weight)
+        .mem_write(logfont_va + 16, &weight)
         .expect("write LOGFONTW.lfWeight");
     let italic_byte = [1_u8];
     engine
-        .mem_write(logfont_ptr + 20, &italic_byte)
+        .mem_write(logfont_va + 20, &italic_byte)
         .expect("write LOGFONTW.lfItalic");
     let charset_byte = [1_u8]; // DEFAULT_CHARSET
     engine
-        .mem_write(logfont_ptr + 23, &charset_byte)
+        .mem_write(logfont_va + 23, &charset_byte)
         .expect("write LOGFONTW.lfCharSet");
     // lfFaceName is wchar_t[32] at offset 28 (64 bytes, UTF-16LE).
-    write_guest_utf16(&mut engine, logfont_ptr + 28, "Segoe UI");
-    write_regs(&mut engine, logfont_ptr, 0, 0, 0, 0);
+    write_guest_utf16(&mut engine, logfont_va + 28, "Segoe UI");
+    write_regs(&mut engine, logfont_va, 0, 0, 0, 0);
     // Sentinel return address so the handler's pop is observable (test_engine
     // defaults to 0).
     engine
@@ -828,8 +828,8 @@ fn test_set_thread_error_mode() {
     let mut engine = test_engine();
     let mut state = default_winapi_state();
     state.process.error_mode = 1;
-    let prev_ptr = 0x4000;
-    write_regs(&mut engine, 0x03, prev_ptr, 0, 0, STACK_TOP);
+    let prev_va = 0x4000;
+    write_regs(&mut engine, 0x03, prev_va, 0, 0, STACK_TOP);
     let r = kernel32::handle_set_thread_error_mode(&mut HandlerContext::new(
         &mut engine,
         test_environment(),
@@ -839,7 +839,7 @@ fn test_set_thread_error_mode() {
     assert_eq!(r.return_value, 1); // TRUE
     assert_eq!(state.process.error_mode, 3);
     let mut buf = [0_u8; 4];
-    engine.mem_read(prev_ptr, &mut buf).ok();
+    engine.mem_read(prev_va, &mut buf).ok();
     assert_eq!(u32::from_le_bytes(buf), 1); // previous mode written back
 }
 
@@ -935,20 +935,20 @@ fn test_get_file_attributes_ex_w_not_found() {
     // global app-data bottle. The root need not exist — the probe path does
     // not exist under any root, which is exactly the case under test.
     state.file_io.volumes.bottle_root = Some(std::path::PathBuf::from("/tmp/wie-bottle"));
-    let path_ptr = 0x3000;
+    let path_va = 0x3000;
     engine
         .mem_write(
-            path_ptr,
+            path_va,
             &"C:\\nonexistent"
                 .encode_utf16()
                 .flat_map(u16::to_le_bytes)
                 .collect::<Vec<_>>(),
         )
         .ok();
-    engine.mem_write(path_ptr.wrapping_add(26), &[0, 0]).ok();
+    engine.mem_write(path_va.wrapping_add(26), &[0, 0]).ok();
     write_regs(
         &mut engine,
-        path_ptr,
+        path_va,
         1, /* GetFileExInfoStandard */
         0x4000,
         0,
@@ -1045,9 +1045,9 @@ fn test_create_file_mapping_w_registers_and_validates() {
     kernel32::mount_host_file(&mut state, r"C:\mapped.txt", &host).expect("mount");
 
     // CreateFileW(C:\mapped.txt) → a valid open-file handle.
-    let name_ptr = 0x3000;
-    write_guest_utf16(&mut engine, name_ptr, r"C:\mapped.txt");
-    write_regs(&mut engine, name_ptr, 0x8000_0000, 0, 0, STACK_TOP); // GENERIC_READ
+    let name_va = 0x3000;
+    write_guest_utf16(&mut engine, name_va, r"C:\mapped.txt");
+    write_regs(&mut engine, name_va, 0x8000_0000, 0, 0, STACK_TOP); // GENERIC_READ
     engine
         .mem_write(STACK_TOP + 0x28, &3_u32.to_le_bytes())
         .ok(); // OPEN_EXISTING
@@ -1124,9 +1124,9 @@ fn test_map_view_of_file_copies_bytes_into_guest_memory() {
     kernel32::mount_host_file(&mut state, r"C:\mapped.txt", &host).expect("mount");
 
     // CreateFileW → handle.
-    let name_ptr = 0x3000;
-    write_guest_utf16(&mut engine, name_ptr, r"C:\mapped.txt");
-    write_regs(&mut engine, name_ptr, 0x8000_0000, 0, 0, STACK_TOP);
+    let name_va = 0x3000;
+    write_guest_utf16(&mut engine, name_va, r"C:\mapped.txt");
+    write_regs(&mut engine, name_va, 0x8000_0000, 0, 0, STACK_TOP);
     engine
         .mem_write(STACK_TOP + 0x28, &3_u32.to_le_bytes())
         .ok();
@@ -1238,10 +1238,10 @@ fn test_file_op_without_root_creates_and_writes_the_global_bottle() {
 
     let unique = format!("global-bottle-{}.txt", std::process::id());
     let guest_path = format!(r"C:\wie-global-bottle-e2e\{unique}");
-    let name_ptr = 0x3000;
-    write_guest_utf16(&mut engine, name_ptr, &guest_path);
+    let name_va = 0x3000;
+    write_guest_utf16(&mut engine, name_va, &guest_path);
     // CreateFileW(ptr, GENERIC_WRITE=0x40000000, 0, 0, CREATE_ALWAYS=2, ...).
-    write_regs(&mut engine, name_ptr, 0x4000_0000, 0, 0, STACK_TOP);
+    write_regs(&mut engine, name_va, 0x4000_0000, 0, 0, STACK_TOP);
     engine
         .mem_write(STACK_TOP + 0x28, &2_u32.to_le_bytes())
         .ok();

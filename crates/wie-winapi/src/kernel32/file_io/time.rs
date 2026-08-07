@@ -13,25 +13,25 @@ pub fn handle_file_time_to_local_file_time(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let input_file_time_ptr = engine
+    let input_file_time_va = engine
         .read_rcx()
         .context("failed to read RCX for FileTimeToLocalFileTime")?;
 
-    let output_file_time_ptr = engine
+    let output_file_time_va = engine
         .read_rdx()
         .context("failed to read RDX for FileTimeToLocalFileTime")?;
 
-    let success = input_file_time_ptr != 0 && output_file_time_ptr != 0;
+    let success = input_file_time_va != 0 && output_file_time_va != 0;
 
     if success {
         let mut bytes = [0_u8; 8];
 
         engine
-            .mem_read(input_file_time_ptr, &mut bytes)
+            .mem_read(input_file_time_va, &mut bytes)
             .context("failed to read input FILETIME")?;
 
         engine
-            .mem_write(output_file_time_ptr, &bytes)
+            .mem_write(output_file_time_va, &bytes)
             .context("failed to write output FILETIME")?;
 
         state.process.last_error = 0;
@@ -49,21 +49,21 @@ pub fn handle_file_time_to_system_time(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let input_file_time_ptr = engine
+    let input_file_time_va = engine
         .read_rcx()
         .context("failed to read RCX for FileTimeToSystemTime")?;
 
-    let system_time_ptr = engine
+    let system_time_va = engine
         .read_rdx()
         .context("failed to read RDX for FileTimeToSystemTime")?;
 
-    let success = input_file_time_ptr != 0 && system_time_ptr != 0;
+    let success = input_file_time_va != 0 && system_time_va != 0;
 
     if success {
         // Deterministic fake converted time — one typed write covers all eight
         // WORD fields (the view starts zeroed, matching the old per-field
         // writes that explicitly set every field).
-        with_typed_write::<SystemTime, _, _>(engine, system_time_ptr, |st| {
+        with_typed_write::<SystemTime, _, _>(engine, system_time_va, |st| {
             st.w_year = 2026;
             st.w_month = 7;
             st.w_day_of_week = 4;
@@ -93,31 +93,31 @@ pub fn handle_get_file_time(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         .read_rcx()
         .context("failed to read RCX for GetFileTime")?;
 
-    let creation_time_ptr = engine
+    let creation_time_va = engine
         .read_rdx()
         .context("failed to read RDX for GetFileTime")?;
 
-    let last_access_time_ptr = engine
+    let last_access_time_va = engine
         .read_r8()
         .context("failed to read R8 for GetFileTime")?;
 
-    let last_write_time_ptr = engine
+    let last_write_time_va = engine
         .read_r9()
         .context("failed to read R9 for GetFileTime")?;
 
     let success = is_open_file_handle(state, handle);
 
     if success {
-        if creation_time_ptr != 0 {
-            write_guest_u64(engine, creation_time_ptr, FIXED_SYSTEM_FILETIME)?;
+        if creation_time_va != 0 {
+            write_guest_u64(engine, creation_time_va, FIXED_SYSTEM_FILETIME)?;
         }
 
-        if last_access_time_ptr != 0 {
-            write_guest_u64(engine, last_access_time_ptr, FIXED_SYSTEM_FILETIME)?;
+        if last_access_time_va != 0 {
+            write_guest_u64(engine, last_access_time_va, FIXED_SYSTEM_FILETIME)?;
         }
 
-        if last_write_time_ptr != 0 {
-            write_guest_u64(engine, last_write_time_ptr, FIXED_SYSTEM_FILETIME)?;
+        if last_write_time_va != 0 {
+            write_guest_u64(engine, last_write_time_va, FIXED_SYSTEM_FILETIME)?;
         }
 
         state.process.last_error = 0;
@@ -141,7 +141,7 @@ pub fn handle_set_file_pointer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         .read_rdx()
         .context("failed to read RDX for SetFilePointer")?;
 
-    let distance_high_ptr = engine
+    let distance_high_va = engine
         .read_r8()
         .context("failed to read R8 for SetFilePointer")?;
 
@@ -197,10 +197,10 @@ pub fn handle_set_file_pointer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
                 state.file_io.executable_file_cursor = new_cursor;
             }
 
-            if distance_high_ptr != 0 {
+            if distance_high_va != 0 {
                 let high = u32::try_from(new_cursor >> 32)
                     .context("new file cursor high does not fit u32")?;
-                write_guest_u32(engine, distance_high_ptr, high)?;
+                write_guest_u32(engine, distance_high_va, high)?;
             }
 
             state.process.last_error = 0;
@@ -223,7 +223,7 @@ pub fn handle_get_file_size(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         .read_rcx()
         .context("failed to read RCX for GetFileSize")?;
 
-    let file_size_high_ptr = engine
+    let file_size_high_va = engine
         .read_rdx()
         .context("failed to read RDX for GetFileSize")?;
 
@@ -236,8 +236,8 @@ pub fn handle_get_file_size(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         let file_size_low = u32::try_from(file_size & 0xffff_ffff)
             .context("open file size low does not fit u32")?;
 
-        if file_size_high_ptr != 0 {
-            write_guest_u32(engine, file_size_high_ptr, file_size_high)?;
+        if file_size_high_va != 0 {
+            write_guest_u32(engine, file_size_high_va, file_size_high)?;
         }
 
         state.process.last_error = 0;
@@ -286,8 +286,8 @@ pub fn handle_file_time_to_dos_date_time(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let ft = engine.read_rcx()?;
-    let date_ptr = engine.read_rdx()?;
-    let time_ptr = engine.read_r8()?;
+    let date_va = engine.read_rdx()?;
+    let time_va = engine.read_r8()?;
     if ft == 0 {
         return ret_u64(engine, 0, "FileTimeToDosDateTime");
     }
@@ -296,11 +296,11 @@ pub fn handle_file_time_to_dos_date_time(
     // 2026-07-19 → DOS date word; noon → DOS time word.
     let dos_date: u16 = 0x5c_f3; // precomputed: day|month<<5|(year-1980)<<9
     let dos_time: u16 = 0x60_00; // hour 12 << 11
-    if date_ptr != 0 {
-        write_guest_u16(engine, date_ptr, dos_date)?;
+    if date_va != 0 {
+        write_guest_u16(engine, date_va, dos_date)?;
     }
-    if time_ptr != 0 {
-        write_guest_u16(engine, time_ptr, dos_time)?;
+    if time_va != 0 {
+        write_guest_u16(engine, time_va, dos_time)?;
     }
     ret_bool_true(engine, "FileTimeToDosDateTime")
 }

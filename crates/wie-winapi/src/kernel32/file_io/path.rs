@@ -20,7 +20,7 @@ pub fn handle_get_current_directory_w(ctx: &mut HandlerContext<'_>) -> Result<Wi
         .read_rcx()
         .context("failed to read RCX for GetCurrentDirectoryW")?;
 
-    let buffer_ptr = engine
+    let buffer_va = engine
         .read_rdx()
         .context("failed to read RDX for GetCurrentDirectoryW")?;
 
@@ -34,7 +34,7 @@ pub fn handle_get_current_directory_w(ctx: &mut HandlerContext<'_>) -> Result<Wi
         .context("GetCurrentDirectoryW required size overflow")?;
 
     // Need nBufferLength > character_count so there is room for the NUL.
-    let return_value = if buffer_ptr == 0 || buffer_length <= character_count {
+    let return_value = if buffer_va == 0 || buffer_length <= character_count {
         state.process.last_error = ERROR_INSUFFICIENT_BUFFER;
         required_with_nul
     } else {
@@ -53,7 +53,7 @@ pub fn handle_get_current_directory_w(ctx: &mut HandlerContext<'_>) -> Result<Wi
         }
 
         engine
-            .mem_write(buffer_ptr, &bytes)
+            .mem_write(buffer_va, &bytes)
             .context("failed to write GetCurrentDirectoryW buffer")?;
 
         state.process.last_error = 0;
@@ -72,15 +72,15 @@ pub fn handle_get_current_directory_w(ctx: &mut HandlerContext<'_>) -> Result<Wi
 pub fn handle_set_current_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let directory_ptr = engine
+    let directory_va = engine
         .read_rcx()
         .context("failed to read RCX for SetCurrentDirectoryW")?;
 
-    let success = if directory_ptr == 0 {
+    let success = if directory_va == 0 {
         state.process.last_error = ERROR_PATH_NOT_FOUND;
         false
     } else {
-        let directory = read_wide_string_from_cpu(engine, directory_ptr, 32_768)
+        let directory = read_wide_string_from_cpu(engine, directory_va, 32_768)
             .context("failed to read SetCurrentDirectoryW path")?;
 
         if directory.is_empty() {
@@ -144,9 +144,9 @@ pub fn handle_get_user_profile_directory_w(
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let _h_profile = engine.read_rcx()?;
-    let name_ptr = engine.read_rdx()?;
-    let size_ptr = engine.read_r8()?;
-    get_user_profile_dir_impl(engine, state, name_ptr, size_ptr, true)
+    let name_va = engine.read_rdx()?;
+    let size_va = engine.read_r8()?;
+    get_user_profile_dir_impl(engine, state, name_va, size_va, true)
 }
 /// Handles `KERNEL32.dll!GetUserProfileDirectoryA` — return profile path from bottle/env.
 pub fn handle_get_user_profile_directory_a(
@@ -155,9 +155,9 @@ pub fn handle_get_user_profile_directory_a(
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let _h_profile = engine.read_rcx()?;
-    let name_ptr = engine.read_rdx()?;
-    let size_ptr = engine.read_r8()?;
-    get_user_profile_dir_impl(engine, state, name_ptr, size_ptr, false)
+    let name_va = engine.read_rdx()?;
+    let size_va = engine.read_r8()?;
+    get_user_profile_dir_impl(engine, state, name_va, size_va, false)
 }
 pub(crate) fn handle_duplicate_handle(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -172,7 +172,7 @@ pub(crate) fn handle_duplicate_handle(ctx: &mut HandlerContext<'_>) -> Result<Wi
     let _source_proc = engine.read_rcx()?;
     let source_handle = engine.read_rdx()?;
     let _target_proc = engine.read_r8()?;
-    let target_handle_ptr = engine.read_r9()?;
+    let target_handle_va = engine.read_r9()?;
 
     // Read dwOptions from the guest stack to honour DUPLICATE_CLOSE_SOURCE.
     let rsp = engine.read_rsp()?;
@@ -216,7 +216,7 @@ pub(crate) fn handle_duplicate_handle(ctx: &mut HandlerContext<'_>) -> Result<Wi
                     .objects
                     .remove(&crate::KernelHandle::from(source_handle));
             }
-            engine.mem_write(target_handle_ptr, &new_handle_u64.to_le_bytes())?;
+            engine.mem_write(target_handle_va, &new_handle_u64.to_le_bytes())?;
             state.process.last_error = 0;
             return ctx.finish(1);
         }
@@ -257,7 +257,7 @@ pub(crate) fn handle_duplicate_handle(ctx: &mut HandlerContext<'_>) -> Result<Wi
             .remove(&crate::KernelHandle::from(source_handle));
     }
 
-    engine.mem_write(target_handle_ptr, &new_handle_u64.to_le_bytes())?;
+    engine.mem_write(target_handle_va, &new_handle_u64.to_le_bytes())?;
     state.process.last_error = 0;
     ctx.finish(1) // TRUE
 }
@@ -265,7 +265,7 @@ pub(crate) fn handle_duplicate_handle(ctx: &mut HandlerContext<'_>) -> Result<Wi
 pub fn handle_get_full_path_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let input_path_ptr = engine
+    let input_path_va = engine
         .read_rcx()
         .context("failed to read RCX for GetFullPathNameW")?;
 
@@ -273,19 +273,19 @@ pub fn handle_get_full_path_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinAp
         .read_rdx()
         .context("failed to read RDX for GetFullPathNameW")?;
 
-    let output_buffer_ptr = engine
+    let output_buffer_va = engine
         .read_r8()
         .context("failed to read R8 for GetFullPathNameW")?;
 
-    let file_part_ptr_ptr = engine
+    let file_part_out_va = engine
         .read_r9()
         .context("failed to read R9 for GetFullPathNameW")?;
 
-    let return_value = if input_path_ptr == 0 {
+    let return_value = if input_path_va == 0 {
         state.process.last_error = ERROR_INVALID_PARAMETER;
         0
     } else {
-        let input_path = read_guest_utf16_lossy(engine, input_path_ptr, 32_768)
+        let input_path = read_guest_utf16_lossy(engine, input_path_va, 32_768)
             .context("failed to read GetFullPathNameW input path")?;
 
         if input_path.is_empty() {
@@ -307,9 +307,9 @@ pub fn handle_get_full_path_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinAp
             let buffer_characters = usize::try_from(buffer_characters_raw)
                 .context("GetFullPathNameW buffer size does not fit usize")?;
 
-            if output_buffer_ptr == 0 || buffer_characters < required_with_null {
-                if file_part_ptr_ptr != 0 {
-                    write_guest_u64(engine, file_part_ptr_ptr, 0)?;
+            if output_buffer_va == 0 || buffer_characters < required_with_null {
+                if file_part_out_va != 0 {
+                    write_guest_u64(engine, file_part_out_va, 0)?;
                 }
 
                 state.process.last_error = 0;
@@ -320,9 +320,9 @@ pub fn handle_get_full_path_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinAp
                 let mut terminated_units = path_units;
                 terminated_units.push(0);
 
-                write_guest_utf16_units(engine, output_buffer_ptr, &terminated_units)?;
+                write_guest_utf16_units(engine, output_buffer_va, &terminated_units)?;
 
-                if file_part_ptr_ptr != 0 {
+                if file_part_out_va != 0 {
                     let file_component_offset = full_path
                         .rfind('\\')
                         .map_or(0, |separator_index| separator_index.saturating_add(1));
@@ -340,11 +340,11 @@ pub fn handle_get_full_path_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinAp
                     let byte_offset_u64 = u64::try_from(byte_offset)
                         .context("GetFullPathNameW file-part offset does not fit u64")?;
 
-                    let file_part_ptr = output_buffer_ptr
+                    let file_part_va = output_buffer_va
                         .checked_add(byte_offset_u64)
                         .context("GetFullPathNameW file-part pointer overflow")?;
 
-                    write_guest_u64(engine, file_part_ptr_ptr, file_part_ptr)?;
+                    write_guest_u64(engine, file_part_out_va, file_part_va)?;
                 }
 
                 state.process.last_error = 0;
@@ -361,16 +361,16 @@ pub fn handle_get_full_path_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 pub fn handle_get_full_path_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let input_path_ptr = engine.read_rcx()?;
+    let input_path_va = engine.read_rcx()?;
     let buffer_characters_raw = engine.read_rdx()?;
-    let output_buffer_ptr = engine.read_r8()?;
-    let file_part_ptr_ptr = engine.read_r9()?;
+    let output_buffer_va = engine.read_r8()?;
+    let file_part_out_va = engine.read_r9()?;
 
-    let return_value = if input_path_ptr == 0 {
+    let return_value = if input_path_va == 0 {
         state.process.last_error = ERROR_INVALID_PARAMETER;
         0
     } else {
-        let input_path = read_ansi_string_from_cpu(engine, input_path_ptr, 32_768)?;
+        let input_path = read_ansi_string_from_cpu(engine, input_path_va, 32_768)?;
         if input_path.is_empty() {
             state.process.last_error = ERROR_INVALID_PARAMETER;
             0
@@ -381,21 +381,21 @@ pub fn handle_get_full_path_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinAp
             let path_length = path_bytes.len();
             let required_with_null = path_length.saturating_add(1);
             let buffer_characters = usize::try_from(buffer_characters_raw).unwrap_or(0);
-            if output_buffer_ptr == 0 || buffer_characters < required_with_null {
-                if file_part_ptr_ptr != 0 {
-                    write_guest_u64(engine, file_part_ptr_ptr, 0)?;
+            if output_buffer_va == 0 || buffer_characters < required_with_null {
+                if file_part_out_va != 0 {
+                    write_guest_u64(engine, file_part_out_va, 0)?;
                 }
                 state.process.last_error = 0;
                 u64::try_from(required_with_null).unwrap_or(0)
             } else {
                 let mut out = path_bytes;
                 out.push(0);
-                engine.mem_write(output_buffer_ptr, &out)?;
-                if file_part_ptr_ptr != 0 {
+                engine.mem_write(output_buffer_va, &out)?;
+                if file_part_out_va != 0 {
                     let file_off = full_path.rfind('\\').map_or(0, |i| i.saturating_add(1));
-                    let file_part_ptr =
-                        output_buffer_ptr.saturating_add(u64::try_from(file_off).unwrap_or(0));
-                    write_guest_u64(engine, file_part_ptr_ptr, file_part_ptr)?;
+                    let file_part_va =
+                        output_buffer_va.saturating_add(u64::try_from(file_off).unwrap_or(0));
+                    write_guest_u64(engine, file_part_out_va, file_part_va)?;
                 }
                 state.process.last_error = 0;
                 u64::try_from(path_length).unwrap_or(0)
@@ -413,7 +413,7 @@ pub fn handle_get_current_directory_a(ctx: &mut HandlerContext<'_>) -> Result<Wi
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let buffer_length = engine.read_rcx()?;
-    let buffer_ptr = engine.read_rdx()?;
+    let buffer_va = engine.read_rdx()?;
     let directory = String::from_utf16_lossy(&state.file_io.current_directory_wide);
     let bytes = crate::vfs::encode_acp(&directory);
     let character_count =
@@ -421,13 +421,13 @@ pub fn handle_get_current_directory_a(ctx: &mut HandlerContext<'_>) -> Result<Wi
     let required_with_nul = character_count
         .checked_add(1)
         .context("GetCurrentDirectoryA required size overflow")?;
-    let return_value = if buffer_ptr == 0 || buffer_length <= character_count {
+    let return_value = if buffer_va == 0 || buffer_length <= character_count {
         state.process.last_error = ERROR_INSUFFICIENT_BUFFER;
         required_with_nul
     } else {
         let mut out = bytes;
         out.push(0);
-        engine.mem_write(buffer_ptr, &out)?;
+        engine.mem_write(buffer_va, &out)?;
         state.process.last_error = 0;
         character_count
     };
@@ -439,12 +439,12 @@ pub fn handle_get_current_directory_a(ctx: &mut HandlerContext<'_>) -> Result<Wi
 pub fn handle_set_current_directory_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let directory_ptr = engine.read_rcx()?;
-    let success = if directory_ptr == 0 {
+    let directory_va = engine.read_rcx()?;
+    let success = if directory_va == 0 {
         state.process.last_error = ERROR_PATH_NOT_FOUND;
         false
     } else {
-        let directory = read_ansi_string_from_cpu(engine, directory_ptr, 32_768)?;
+        let directory = read_ansi_string_from_cpu(engine, directory_va, 32_768)?;
         if directory.is_empty() {
             state.process.last_error = ERROR_PATH_NOT_FOUND;
             false
@@ -514,11 +514,11 @@ fn drive_is_configured(volumes: &crate::vfs::VolumeConfig, drive: char) -> bool 
 /// `GetModuleFileNameA` semantics.
 pub(crate) fn copy_path_a_to_guest_buffer(
     engine: &mut dyn wie_cpu::CpuEngine,
-    source_ptr: u64,
-    dest_ptr: u64,
+    source_va: u64,
+    dest_va: u64,
     dest_len: u64,
 ) -> Result<(u64, bool)> {
-    if dest_ptr == 0 || dest_len == 0 {
+    if dest_va == 0 || dest_len == 0 {
         return Ok((0, false));
     }
 
@@ -530,7 +530,7 @@ pub(crate) fn copy_path_a_to_guest_buffer(
     let max_scan = dest_len_usize.saturating_add(1).max(1);
     for index in 0..max_scan {
         let index_u64 = u64::try_from(index).context("guest string index does not fit u64")?;
-        let source_address = checked_address(source_ptr, index_u64, "guest source string");
+        let source_address = checked_address(source_va, index_u64, "guest source string");
         let mut byte = [0_u8; 1];
         engine
             .mem_read(source_address, &mut byte)
@@ -549,14 +549,14 @@ pub(crate) fn copy_path_a_to_guest_buffer(
         let mut out = source_bytes.get(..keep).unwrap_or(&[]).to_vec();
         out.push(0);
         engine
-            .mem_write(dest_ptr, &out)
+            .mem_write(dest_va, &out)
             .context("failed to write truncated guest path")?;
         Ok((dest_len, true))
     } else {
         let mut out = source_bytes;
         out.push(0);
         engine
-            .mem_write(dest_ptr, &out)
+            .mem_write(dest_va, &out)
             .context("failed to write guest path")?;
         let written = u64::try_from(path_len).context("path length does not fit u64")?;
         Ok((written, false))
@@ -566,11 +566,11 @@ pub(crate) fn copy_path_a_to_guest_buffer(
 // Copy a NUL-terminated UTF-16 path into a guest buffer (WCHAR units).
 pub(crate) fn copy_path_w_to_guest_buffer(
     engine: &mut dyn wie_cpu::CpuEngine,
-    source_ptr: u64,
-    dest_ptr: u64,
+    source_va: u64,
+    dest_va: u64,
     dest_len: u64,
 ) -> Result<(u64, bool)> {
-    if dest_ptr == 0 || dest_len == 0 {
+    if dest_va == 0 || dest_len == 0 {
         return Ok((0, false));
     }
 
@@ -584,7 +584,7 @@ pub(crate) fn copy_path_w_to_guest_buffer(
         let source_offset = index_u64
             .checked_mul(2)
             .context("wide guest string source offset overflow")?;
-        let source_address = checked_address(source_ptr, source_offset, "wide guest source string");
+        let source_address = checked_address(source_va, source_offset, "wide guest source string");
         let unit = read_u16(engine, source_address)?;
         if unit == 0 {
             break;
@@ -604,7 +604,7 @@ pub(crate) fn copy_path_w_to_guest_buffer(
             bytes.extend_from_slice(&unit.to_le_bytes());
         }
         engine
-            .mem_write(dest_ptr, &bytes)
+            .mem_write(dest_va, &bytes)
             .context("failed to write truncated wide guest path")?;
         Ok((dest_len, true))
     } else {
@@ -616,24 +616,24 @@ pub(crate) fn copy_path_w_to_guest_buffer(
             bytes.extend_from_slice(&unit.to_le_bytes());
         }
         engine
-            .mem_write(dest_ptr, &bytes)
+            .mem_write(dest_va, &bytes)
             .context("failed to write wide guest path")?;
         let written = u64::try_from(path_len).context("wide path length does not fit u64")?;
         Ok((written, false))
     }
 }
 
-/// Write a NUL-terminated ANSI string into a guest buffer at `out_ptr` with
+/// Write a NUL-terminated ANSI string into a guest buffer at `out_va` with
 /// room for `out_cap` bytes.  Returns the number of characters written
 /// (excluding NUL), or 0 with `ERROR_INSUFFICIENT_BUFFER` on truncation.
 pub(crate) fn write_mock_string_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
     s: &str,
-    out_ptr: u64,
+    out_va: u64,
     out_cap: u64,
 ) -> Result<u64> {
-    if out_ptr == 0 || out_cap == 0 {
+    if out_va == 0 || out_cap == 0 {
         state.process.last_error = ERROR_INSUFFICIENT_BUFFER;
         return Ok(0);
     }
@@ -646,22 +646,22 @@ pub(crate) fn write_mock_string_a(
     }
     let mut payload = encoded;
     payload.push(0);
-    engine.mem_write(out_ptr, &payload)?;
+    engine.mem_write(out_va, &payload)?;
     state.process.last_error = 0;
     Ok(u64::try_from(needed).unwrap_or(0))
 }
 
-/// Write a NUL-terminated UTF-16 string into a guest buffer at `out_ptr` with
+/// Write a NUL-terminated UTF-16 string into a guest buffer at `out_va` with
 /// room for `out_cap` WCHARs.  Returns the number of characters written
 /// (excluding NUL), or 0 with `ERROR_INSUFFICIENT_BUFFER` on truncation.
 pub(crate) fn write_mock_string_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
     s: &str,
-    out_ptr: u64,
+    out_va: u64,
     out_cap: u64,
 ) -> Result<u64> {
-    if out_ptr == 0 || out_cap == 0 {
+    if out_va == 0 || out_cap == 0 {
         state.process.last_error = ERROR_INSUFFICIENT_BUFFER;
         return Ok(0);
     }
@@ -677,7 +677,7 @@ pub(crate) fn write_mock_string_w(
         bytes.extend_from_slice(&u.to_le_bytes());
     }
     bytes.extend_from_slice(&0_u16.to_le_bytes());
-    engine.mem_write(out_ptr, &bytes)?;
+    engine.mem_write(out_va, &bytes)?;
     state.process.last_error = 0;
     Ok(u64::try_from(needed).unwrap_or(0))
 }
@@ -963,17 +963,17 @@ mod cwd_tests {
         String::from_utf8(bytes).expect("valid ansi")
     }
 
-    fn run_set_w(cpu: &mut IcedCpu, state: &mut WinApiState, path_ptr: u64) -> u64 {
-        cpu.write_rcx(path_ptr).ok();
+    fn run_set_w(cpu: &mut IcedCpu, state: &mut WinApiState, path_va: u64) -> u64 {
+        cpu.write_rcx(path_va).ok();
         cpu.write_rsp(STACK_TOP).ok();
         let r = handle_set_current_directory_w(&mut HandlerContext::new(cpu, test_env(), state))
             .expect("SetCurrentDirectoryW handler");
         r.return_value
     }
 
-    fn run_get_w(cpu: &mut IcedCpu, state: &mut WinApiState, buf_len: u64, buf_ptr: u64) -> u64 {
+    fn run_get_w(cpu: &mut IcedCpu, state: &mut WinApiState, buf_len: u64, buf_va: u64) -> u64 {
         cpu.write_rcx(buf_len).ok();
-        cpu.write_rdx(buf_ptr).ok();
+        cpu.write_rdx(buf_va).ok();
         cpu.write_rsp(STACK_TOP).ok();
         let r = handle_get_current_directory_w(&mut HandlerContext::new(cpu, test_env(), state))
             .expect("GetCurrentDirectoryW handler");

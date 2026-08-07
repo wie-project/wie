@@ -3,18 +3,18 @@ use super::*;
 
 // --- PrintDlgW (native print-panel bridge) ---
 
-/// Write a `PRINTDLG` (Win64) into guest memory at `pd_ptr` (the typed view
+/// Write a `PRINTDLG` (Win64) into guest memory at `pd_va` (the typed view
 /// zero-fills the untouched fields — the layout lives in guest_layout).
 fn write_print_dlg(
     engine: &mut IcedCpu,
-    pd_ptr: u64,
+    pd_va: u64,
     h_dev_mode: u64,
     h_dev_names: u64,
     flags: u32,
 ) {
     crate::guest_memory::with_typed_write::<crate::guest_layout::PrintDlgW, _, _>(
         engine,
-        pd_ptr,
+        pd_va,
         |pd| {
             pd.l_struct_size = 120;
             pd.hwnd_owner = 0;
@@ -398,18 +398,18 @@ fn test_print_dlg_bridge_seeds_from_guest_devmode_and_reuses_the_block() {
 
 // --- PageSetupDlgW (native page-layout panel bridge) ---
 
-/// Write a `PAGESETUPDLG` (Win64) into guest memory at `psd_ptr` (the typed
+/// Write a `PAGESETUPDLG` (Win64) into guest memory at `psd_va` (the typed
 /// view zero-fills the untouched fields — the layout lives in guest_layout).
 fn write_page_setup_dlg(
     engine: &mut IcedCpu,
-    psd_ptr: u64,
+    psd_va: u64,
     h_dev_mode: u64,
     h_dev_names: u64,
     flags: u32,
 ) {
     crate::guest_memory::with_typed_write::<crate::guest_layout::PageSetupDlgW, _, _>(
         engine,
-        psd_ptr,
+        psd_va,
         |psd| {
             psd.l_struct_size = 128;
             psd.hwnd_owner = 0;
@@ -890,11 +890,11 @@ fn test_get_file_title_a_basename_ansi() {
 fn test_choose_color_a_writes_color() {
     let mut engine = test_engine();
     let mut state = default_winapi_state();
-    let cc_ptr = 0x5000;
+    let cc_va = 0x5000;
     engine
-        .mem_map(cc_ptr, 0x1000, wie_cpu::RwxPerms::ALL)
+        .mem_map(cc_va, 0x1000, wie_cpu::RwxPerms::ALL)
         .expect("map CHOOSECOLOR");
-    write_regs(&mut engine, cc_ptr, 0, 0, 0, 0);
+    write_regs(&mut engine, cc_va, 0, 0, 0, 0);
     assert_return_value!(
         comdlg32::handle_choose_color_a(&mut HandlerContext::new(
             &mut engine,
@@ -905,6 +905,6 @@ fn test_choose_color_a_writes_color() {
     );
     // rgbResult is at offset 0x10 in CHOOSECOLOR — should be RGB black (0).
     let mut rgb = [0_u8; 4];
-    engine.mem_read(cc_ptr + 0x10, &mut rgb).ok();
+    engine.mem_read(cc_va + 0x10, &mut rgb).ok();
     assert_eq!(u32::from_le_bytes(rgb), 0x00_00_00);
 }

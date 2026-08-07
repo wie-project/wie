@@ -28,23 +28,23 @@ fn test_wm_setfont_on_control_stores_and_getfont_returns() {
 
     // CreateFontIndirectA: LOGFONTA header fields at their Win64 offsets
     // (height 0, weight 16, charset 23), face name char[32] at offset 28.
-    let logfont_ptr = 0x5000_u64;
+    let logfont_va = 0x5000_u64;
     engine
-        .mem_write(logfont_ptr, &(-16_i32).to_le_bytes())
+        .mem_write(logfont_va, &(-16_i32).to_le_bytes())
         .expect("write LOGFONTA.lfHeight");
     engine
-        .mem_write(logfont_ptr + 16, &(700_i32).to_le_bytes())
+        .mem_write(logfont_va + 16, &(700_i32).to_le_bytes())
         .expect("write LOGFONTA.lfWeight");
     engine
-        .mem_write(logfont_ptr + 20, &[1_u8])
+        .mem_write(logfont_va + 20, &[1_u8])
         .expect("write LOGFONTA.lfItalic");
     engine
-        .mem_write(logfont_ptr + 23, &[1_u8])
+        .mem_write(logfont_va + 23, &[1_u8])
         .expect("write LOGFONTA.lfCharSet");
     engine
-        .mem_write(logfont_ptr + 28, b"Courier New\0")
+        .mem_write(logfont_va + 28, b"Courier New\0")
         .expect("write LOGFONTA.lfFaceName");
-    write_regs(&mut engine, logfont_ptr, 0, 0, 0, 0);
+    write_regs(&mut engine, logfont_va, 0, 0, 0, 0);
     let id = crate::resolve_winapi_id("gdi32.dll", "CreateFontIndirectA")
         .expect("CreateFontIndirectA must resolve to a WinApiId");
     let r = crate::dispatch_winapi_id(
@@ -315,20 +315,20 @@ fn push_32px_font(engine: &mut IcedCpu, state: &mut WinApiState) -> crate::handl
     // LOGFONTA header fields at their Win64 offsets (lfHeight at 0, lfWeight
     // at 16, lfCharSet at 23), face name char[32] at offset 28; |lfHeight|
     // becomes the px height.
-    let logfont_ptr = 0x5000_u64;
+    let logfont_va = 0x5000_u64;
     engine
-        .mem_write(logfont_ptr, &(-32_i32).to_le_bytes())
+        .mem_write(logfont_va, &(-32_i32).to_le_bytes())
         .expect("write LOGFONTA.lfHeight");
     engine
-        .mem_write(logfont_ptr + 16, &(400_i32).to_le_bytes())
+        .mem_write(logfont_va + 16, &(400_i32).to_le_bytes())
         .expect("write LOGFONTA.lfWeight");
     engine
-        .mem_write(logfont_ptr + 23, &[1_u8])
+        .mem_write(logfont_va + 23, &[1_u8])
         .expect("write LOGFONTA.lfCharSet");
     engine
-        .mem_write(logfont_ptr + 28, b"Segoe UI\0")
+        .mem_write(logfont_va + 28, b"Segoe UI\0")
         .expect("write LOGFONTA.lfFaceName");
-    write_regs(engine, logfont_ptr, 0, 0, 0, 0);
+    write_regs(engine, logfont_va, 0, 0, 0, 0);
     let id = crate::resolve_winapi_id("gdi32.dll", "CreateFontIndirectA")
         .expect("CreateFontIndirectA must resolve to a WinApiId");
     let r = crate::dispatch_winapi_id(
@@ -476,23 +476,23 @@ fn test_lucida_console_fixed_pitch_resolves_to_monospace_through_edit() {
 
     // LOGFONTA: lfHeight=0 lfWeight=16 lfCharSet=23 lfPitchAndFamily=27
     // lfFaceName char[32] at 28. FIXED_PITCH(0x01)|FF_MODERN(0x30) = 0x31.
-    let logfont_ptr = 0x5000_u64;
+    let logfont_va = 0x5000_u64;
     engine
-        .mem_write(logfont_ptr, &(-16_i32).to_le_bytes())
+        .mem_write(logfont_va, &(-16_i32).to_le_bytes())
         .expect("write LOGFONTA.lfHeight");
     engine
-        .mem_write(logfont_ptr + 16, &(400_i32).to_le_bytes())
+        .mem_write(logfont_va + 16, &(400_i32).to_le_bytes())
         .expect("write LOGFONTA.lfWeight");
     engine
-        .mem_write(logfont_ptr + 23, &[1_u8])
+        .mem_write(logfont_va + 23, &[1_u8])
         .expect("write LOGFONTA.lfCharSet");
     engine
-        .mem_write(logfont_ptr + 27, &[0x31_u8])
+        .mem_write(logfont_va + 27, &[0x31_u8])
         .expect("write LOGFONTA.lfPitchAndFamily");
     engine
-        .mem_write(logfont_ptr + 28, b"Lucida Console\0")
+        .mem_write(logfont_va + 28, b"Lucida Console\0")
         .expect("write LOGFONTA.lfFaceName");
-    write_regs(&mut engine, logfont_ptr, 0, 0, 0, 0);
+    write_regs(&mut engine, logfont_va, 0, 0, 0, 0);
     let id = crate::resolve_winapi_id("gdi32.dll", "CreateFontIndirectA")
         .expect("CreateFontIndirectA must resolve to a WinApiId");
     let r = crate::dispatch_winapi_id(

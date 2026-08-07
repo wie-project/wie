@@ -364,17 +364,17 @@ pub fn handle_texture_get_surface_level(
     ctx.finish(return_value)
 }
 
-/// Read a guest RECT (four i32s) at `rect_ptr`.
+/// Read a guest RECT (four i32s) at `rect_va`.
 fn read_guest_rect(
     engine: &mut dyn wie_cpu::CpuEngine,
-    rect_ptr: u64,
+    rect_va: u64,
 ) -> Result<Option<(i32, i32, i32, i32)>> {
-    if rect_ptr == 0 {
+    if rect_va == 0 {
         return Ok(None);
     }
     let mut bytes = [0_u8; 16];
     engine
-        .mem_read(rect_ptr, &mut bytes)
+        .mem_read(rect_va, &mut bytes)
         .context("failed to read lock RECT")?;
     let read_i32_at = |off: usize| -> i32 {
         i32::from_le_bytes(
@@ -658,7 +658,7 @@ pub fn handle_surface_get_desc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     let this_pointer = engine
         .read_rcx()
         .context("failed to read RCX for IDirect3DSurface9::GetDesc")?;
-    let desc_ptr = engine
+    let desc_va = engine
         .read_rdx()
         .context("failed to read RDX for IDirect3DSurface9::GetDesc")?;
 
@@ -675,7 +675,7 @@ pub fn handle_surface_get_desc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         });
 
     let return_value = if let Some((format, width, height)) = desc
-        && desc_ptr != 0
+        && desc_va != 0
     {
         let mut bytes = [0_u8; 32];
         bytes[0..4].copy_from_slice(&format.to_le_bytes());
@@ -684,7 +684,7 @@ pub fn handle_surface_get_desc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         bytes[20..24].copy_from_slice(&0_u32.to_le_bytes()); // MultiSampleQuality: 0
         bytes[24..28].copy_from_slice(&width.to_le_bytes());
         bytes[28..32].copy_from_slice(&height.to_le_bytes());
-        if engine.mem_write(desc_ptr, &bytes).is_ok() {
+        if engine.mem_write(desc_va, &bytes).is_ok() {
             D3D_OK
         } else {
             D3DERR_INVALIDCALL
@@ -896,7 +896,7 @@ pub fn handle_set_texture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     let stage_raw = engine
         .read_rdx()
         .context("failed to read RDX for SetTexture")?;
-    let texture_ptr = engine
+    let texture_va = engine
         .read_r8()
         .context("failed to read R8 for SetTexture")?;
 
@@ -907,7 +907,7 @@ pub fn handle_set_texture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         .d3d9_texture_bindings
         .get_mut(usize::try_from(stage).unwrap_or(usize::MAX))
     {
-        *slot = texture_ptr;
+        *slot = texture_va;
     }
 
     ctx.finish(D3D_OK)

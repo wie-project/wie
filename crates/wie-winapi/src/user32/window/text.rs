@@ -35,7 +35,7 @@ fn handle_set_window_text_impl(
         .read_rcx()
         .with_context(|| format!("failed to read RCX for {api_name}"))?;
 
-    let text_ptr = engine
+    let text_va = engine
         .read_rdx()
         .with_context(|| format!("failed to read RDX for {api_name}"))?;
 
@@ -43,10 +43,10 @@ fn handle_set_window_text_impl(
     let success = known;
 
     if success {
-        let text = if text_ptr == 0 {
+        let text = if text_va == 0 {
             String::new()
         } else {
-            read_arg_string(engine, text_ptr, wide)
+            read_arg_string(engine, text_va, wide)
                 .with_context(|| format!("failed to read {api_name} text"))?
         };
         if window_handle == FAKE_WINDOW_HANDLE {
@@ -134,7 +134,7 @@ fn handle_get_window_text_impl(
         .read_rcx()
         .with_context(|| format!("failed to read RCX for {api_name}"))?;
 
-    let buffer_ptr = engine
+    let buffer_va = engine
         .read_rdx()
         .with_context(|| format!("failed to read RDX for {api_name}"))?;
 
@@ -147,7 +147,7 @@ fn handle_get_window_text_impl(
     let return_value = if text.is_empty() {
         0
     } else {
-        write_out_string(engine, buffer_ptr, max_characters, &text, wide)?
+        write_out_string(engine, buffer_va, max_characters, &text, wide)?
     };
 
     ctx.finish(return_value)

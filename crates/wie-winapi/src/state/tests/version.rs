@@ -38,22 +38,22 @@ fn test_version_flow_reads_a_bottle_file() {
     state.process.main_module_path = r"C:\other.exe".to_owned();
 
     // Guest path + handle/output buffers live in mapped memory.
-    let path_ptr = 0x6000_u64;
-    let handle_ptr = 0x7000_u64;
-    let data_ptr = 0x8000_u64;
-    let out_ptr = 0x9000_u64;
-    let len_ptr = 0xA000_u64;
+    let path_va = 0x6000_u64;
+    let handle_va = 0x7000_u64;
+    let data_va = 0x8000_u64;
+    let out_va = 0x9000_u64;
+    let len_va = 0xA000_u64;
     let wide_path: Vec<u8> = r"C:\App\sample.exe"
         .encode_utf16()
         .flat_map(|u| u.to_le_bytes())
         .chain(0_u16.to_le_bytes())
         .collect();
     engine
-        .mem_write(path_ptr, &wide_path)
+        .mem_write(path_va, &wide_path)
         .expect("write guest path");
 
     // GetFileVersionInfoSizeW: the raw block length, written via the vfs.
-    write_regs(&mut engine, path_ptr, handle_ptr, 0, 0, 0);
+    write_regs(&mut engine, path_va, handle_va, 0, 0, 0);
     let id = crate::resolve_winapi_id("version.dll", "GetFileVersionInfoSizeW")
         .expect("GetFileVersionInfoSizeW must resolve");
     let r = crate::dispatch_winapi_id(
@@ -65,7 +65,7 @@ fn test_version_flow_reads_a_bottle_file() {
     assert!(size > 52, "size covers the fixed info: {size}");
 
     // GetFileVersionInfoW: copies the raw block into the guest buffer.
-    write_regs(&mut engine, path_ptr, 0, u64::from(size), data_ptr, 0);
+    write_regs(&mut engine, path_va, 0, u64::from(size), data_va, 0);
     let id = crate::resolve_winapi_id("version.dll", "GetFileVersionInfoW")
         .expect("GetFileVersionInfoW must resolve");
     let r = crate::dispatch_winapi_id(
@@ -76,7 +76,7 @@ fn test_version_flow_reads_a_bottle_file() {
     assert_eq!(r.return_value, 1, "GetFileVersionInfoW succeeds");
     let mut block = vec![0_u8; usize::try_from(size).expect("size fits usize")];
     engine
-        .mem_read(data_ptr, &mut block)
+        .mem_read(data_va, &mut block)
         .expect("read copied block");
 
     // VerQueryValueW("\"): the fixed info reports 1.2.3.4.
@@ -88,7 +88,7 @@ fn test_version_flow_reads_a_bottle_file() {
     engine
         .mem_write(0x6000, &root_path)
         .expect("write root path");
-    write_regs(&mut engine, data_ptr, 0x6000, out_ptr, len_ptr, 0);
+    write_regs(&mut engine, data_va, 0x6000, out_va, len_va, 0);
     let id = crate::resolve_winapi_id("version.dll", "VerQueryValueW")
         .expect("VerQueryValueW must resolve");
     let r = crate::dispatch_winapi_id(
@@ -99,16 +99,16 @@ fn test_version_flow_reads_a_bottle_file() {
     assert_eq!(r.return_value, 1, "root query succeeds");
     let mut fixed_ptr_bytes = [0_u8; 8];
     engine
-        .mem_read(out_ptr, &mut fixed_ptr_bytes)
+        .mem_read(out_va, &mut fixed_ptr_bytes)
         .expect("read fixed info pointer");
-    let fixed_ptr = u64::from_le_bytes(fixed_ptr_bytes);
+    let fixed_va = u64::from_le_bytes(fixed_ptr_bytes);
     let mut file_version_ms = [0_u8; 4];
     engine
-        .mem_read(fixed_ptr + 8, &mut file_version_ms)
+        .mem_read(fixed_va + 8, &mut file_version_ms)
         .expect("read dwFileVersionMS");
     let mut file_version_ls = [0_u8; 4];
     engine
-        .mem_read(fixed_ptr + 12, &mut file_version_ls)
+        .mem_read(fixed_va + 12, &mut file_version_ls)
         .expect("read dwFileVersionLS");
     assert_eq!(u32::from_le_bytes(file_version_ms), 0x0001_0002);
     assert_eq!(u32::from_le_bytes(file_version_ls), 0x0003_0004);
@@ -127,16 +127,16 @@ fn test_version_size_missing_file_sets_file_not_found() {
         drive_d_root: None,
     };
     state.file_io.current_directory_wide = r"C:\".encode_utf16().collect();
-    let path_ptr = 0x6000_u64;
+    let path_va = 0x6000_u64;
     let wide_path: Vec<u8> = r"C:\no-such-file.exe"
         .encode_utf16()
         .flat_map(|u| u.to_le_bytes())
         .chain(0_u16.to_le_bytes())
         .collect();
     engine
-        .mem_write(path_ptr, &wide_path)
+        .mem_write(path_va, &wide_path)
         .expect("write guest path");
-    write_regs(&mut engine, path_ptr, 0, 0, 0, 0);
+    write_regs(&mut engine, path_va, 0, 0, 0, 0);
     let id = crate::resolve_winapi_id("version.dll", "GetFileVersionInfoSizeW")
         .expect("GetFileVersionInfoSizeW must resolve");
     let r = crate::dispatch_winapi_id(

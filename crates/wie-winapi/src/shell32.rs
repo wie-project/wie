@@ -44,7 +44,7 @@ fn handle_sh_add_to_recent_docs(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let flags = engine
         .read_rcx()
         .context("failed to read RCX for SHAddToRecentDocs")?;
-    let name_ptr = engine
+    let name_va = engine
         .read_rdx()
         .context("failed to read RDX for SHAddToRecentDocs")?;
     match flags {
@@ -52,13 +52,13 @@ fn handle_sh_add_to_recent_docs(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         SHARD_PIDL => {}
         // ANSI path.
         SHARD_PATHA => {
-            if let Ok(name) = crate::guest_string::read_arg_string(engine, name_ptr, false) {
+            if let Ok(name) = crate::guest_string::read_arg_string(engine, name_va, false) {
                 tracing::debug!(recent_doc = %name, "SHAddToRecentDocs");
             }
         }
         // Wide path (RNotepad's call).
         SHARD_PATHW => {
-            if let Ok(name) = crate::guest_string::read_arg_string(engine, name_ptr, true) {
+            if let Ok(name) = crate::guest_string::read_arg_string(engine, name_va, true) {
                 tracing::debug!(recent_doc = %name, "SHAddToRecentDocs");
             }
         }
@@ -98,7 +98,7 @@ fn handle_sh_get_folder_path_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     let mut path_ptr_bytes = [0_u8; 8];
     let rsp = engine.read_rsp()?;
     engine.mem_read(rsp.wrapping_add(0x28), &mut path_ptr_bytes)?;
-    let path_ptr = u64::from_le_bytes(path_ptr_bytes);
+    let path_va = u64::from_le_bytes(path_ptr_bytes);
 
     // Common CSIDL values → synthetic bottle paths (MAX_PATH buffer expected).
     // `csidl` already masked to low 32 bits (u64).
@@ -116,8 +116,8 @@ fn handle_sh_get_folder_path_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         _ => r"C:\Users\WIE",
     };
 
-    if path_ptr != 0 {
-        write_utf16_c_string(engine, path_ptr, 260, path)?;
+    if path_va != 0 {
+        write_utf16_c_string(engine, path_va, 260, path)?;
     }
     finish(engine, S_OK)
 }
@@ -129,9 +129,9 @@ fn handle_sh_get_folder_path_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
 fn handle_command_line_to_argv_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let cmd_line_ptr = engine.read_rcx()?;
-    let num_args_ptr = engine.read_rdx()?;
-    if cmd_line_ptr == 0 || num_args_ptr == 0 {
+    let cmd_line_va = engine.read_rcx()?;
+    let num_args_va = engine.read_rdx()?;
+    if cmd_line_va == 0 || num_args_va == 0 {
         return finish(engine, 0); // NULL → failure
     }
     // Read the command line.
@@ -139,7 +139,7 @@ fn handle_command_line_to_argv_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let mut i = 0_u64;
     loop {
         let mut b = [0_u8; 2];
-        engine.mem_read(cmd_line_ptr.wrapping_add(i.wrapping_mul(2)), &mut b)?;
+        engine.mem_read(cmd_line_va.wrapping_add(i.wrapping_mul(2)), &mut b)?;
         let w = u16::from_le_bytes(b);
         if w == 0 {
             break;
@@ -192,7 +192,7 @@ fn handle_command_line_to_argv_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     engine.mem_write(argv_va.wrapping_add(offset), &[0_u8; 8])?;
     // Write argc.
     let argc_u32 = u32::try_from(args.len()).unwrap_or(0);
-    drop(write_guest_u32(engine, num_args_ptr, argc_u32));
+    drop(write_guest_u32(engine, num_args_va, argc_u32));
     finish(engine, argv_va)
 }
 
@@ -226,9 +226,9 @@ fn alloc_shell_bstr(
 fn handle_sh_get_path_from_id_list_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let _pidl = engine.read_rcx()?;
-    let path_ptr = engine.read_rdx()?;
-    if path_ptr != 0 {
-        write_utf16_c_string(engine, path_ptr, 260, "")?;
+    let path_va = engine.read_rdx()?;
+    if path_va != 0 {
+        write_utf16_c_string(engine, path_va, 260, "")?;
     }
     finish(engine, 0) // FALSE
 }
@@ -280,10 +280,10 @@ pub fn handle_shell_about_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         let _hwnd = engine
             .read_rcx()
             .context("failed to read RCX for ShellAboutW")?;
-        let app_name_ptr = engine
+        let app_name_va = engine
             .read_rdx()
             .context("failed to read RDX for ShellAboutW")?;
-        let other_stuff_ptr = engine
+        let other_stuff_va = engine
             .read_r8()
             .context("failed to read R8 for ShellAboutW")?;
         let _h_icon = engine
@@ -291,8 +291,8 @@ pub fn handle_shell_about_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
             .context("failed to read R9 for ShellAboutW")?;
         // read_utf16_lossy treats NULL as an empty string, so either argument
         // may be omitted (real Windows falls back to module/version strings).
-        let app_name = read_utf16_lossy(engine, app_name_ptr, 256)?;
-        let other_stuff = read_utf16_lossy(engine, other_stuff_ptr, 1024)?;
+        let app_name = read_utf16_lossy(engine, app_name_va, 256)?;
+        let other_stuff = read_utf16_lossy(engine, other_stuff_va, 1024)?;
         (app_name, other_stuff)
     };
 
@@ -390,22 +390,22 @@ pub fn handle_shell_execute_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         let _hwnd = engine
             .read_rcx()
             .context("failed to read RCX for ShellExecuteW")?;
-        let operation_ptr = engine
+        let operation_va = engine
             .read_rdx()
             .context("failed to read RDX for ShellExecuteW")?;
-        let file_ptr = engine
+        let file_va = engine
             .read_r8()
             .context("failed to read R8 for ShellExecuteW")?;
-        let _parameters_ptr = engine
+        let _parameters_va = engine
             .read_r9()
             .context("failed to read R9 for ShellExecuteW")?;
         let rsp = engine
             .read_rsp()
             .context("failed to read RSP for ShellExecuteW")?;
-        let _directory_ptr = read_u64(engine, rsp.wrapping_add(0x28))?;
+        let _directory_va = read_u64(engine, rsp.wrapping_add(0x28))?;
         let _show_cmd = read_u64(engine, rsp.wrapping_add(0x30))?;
-        let operation = read_utf16_lossy(engine, operation_ptr, 64)?;
-        let file = read_utf16_lossy(engine, file_ptr, 1024)?;
+        let operation = read_utf16_lossy(engine, operation_va, 64)?;
+        let file = read_utf16_lossy(engine, file_va, 1024)?;
         (operation, file)
     };
 
