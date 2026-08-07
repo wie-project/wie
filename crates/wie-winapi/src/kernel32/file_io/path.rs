@@ -16,7 +16,6 @@ use super::{
 pub fn handle_get_current_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let buffer_length = engine
         .read_rcx()
         .context("failed to read RCX for GetCurrentDirectoryW")?;
@@ -73,7 +72,6 @@ pub fn handle_get_current_directory_w(ctx: &mut HandlerContext<'_>) -> Result<Wi
 pub fn handle_set_current_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let directory_ptr = engine
         .read_rcx()
         .context("failed to read RCX for SetCurrentDirectoryW")?;
@@ -267,7 +265,6 @@ pub(crate) fn handle_duplicate_handle(ctx: &mut HandlerContext<'_>) -> Result<Wi
 pub fn handle_get_full_path_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let input_path_ptr = engine
         .read_rcx()
         .context("failed to read RCX for GetFullPathNameW")?;
@@ -364,7 +361,6 @@ pub fn handle_get_full_path_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 pub fn handle_get_full_path_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let input_path_ptr = engine.read_rcx()?;
     let buffer_characters_raw = engine.read_rdx()?;
     let output_buffer_ptr = engine.read_r8()?;
@@ -416,7 +412,6 @@ pub fn handle_get_full_path_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 pub fn handle_get_current_directory_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let buffer_length = engine.read_rcx()?;
     let buffer_ptr = engine.read_rdx()?;
     let directory = String::from_utf16_lossy(&state.file_io.current_directory_wide);
@@ -444,7 +439,6 @@ pub fn handle_get_current_directory_a(ctx: &mut HandlerContext<'_>) -> Result<Wi
 pub fn handle_set_current_directory_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let directory_ptr = engine.read_rcx()?;
     let success = if directory_ptr == 0 {
         state.process.last_error = ERROR_PATH_NOT_FOUND;

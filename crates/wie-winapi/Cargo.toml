@@ -16,6 +16,7 @@ fontdb = "0.24"
 encoding_rs = "0.8"
 strum = { version = "0.26", features = ["derive"] }
 zerocopy = { version = "0.8", features = ["derive"] }
+dirs = "6"
 
 wie-cpu = { path = "../wie-cpu" }
 goblin.workspace = true

@@ -53,7 +53,6 @@ pub fn handle_get_file_type(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 pub fn handle_get_file_attributes_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let path_ptr = engine
         .read_rcx()
         .context("failed to read RCX for GetFileAttributesA")?;
@@ -74,7 +73,6 @@ pub fn handle_get_file_attributes_a(ctx: &mut HandlerContext<'_>) -> Result<WinA
 pub fn handle_get_file_attributes_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let path_ptr = engine
         .read_rcx()
         .context("failed to read RCX for GetFileAttributesW")?;
@@ -95,7 +93,6 @@ pub fn handle_get_file_attributes_w(ctx: &mut HandlerContext<'_>) -> Result<WinA
 pub fn handle_find_first_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let pattern_ptr = engine
         .read_rcx()
         .context("failed to read RCX for FindFirstFileW")?;
@@ -113,7 +110,6 @@ pub fn handle_find_first_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 pub fn handle_find_first_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let pattern_ptr = engine
         .read_rcx()
         .context("failed to read RCX for FindFirstFileA")?;
@@ -178,7 +174,6 @@ pub fn handle_find_close(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 pub fn handle_create_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let file_name_ptr = engine
         .read_rcx()
         .context("failed to read RCX for CreateFileW")?;
@@ -221,7 +216,6 @@ pub fn handle_create_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 pub fn handle_create_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let file_name_ptr = engine
         .read_rcx()
         .context("failed to read RCX for CreateFileA")?;

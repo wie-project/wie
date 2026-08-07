@@ -931,9 +931,8 @@ fn test_open_thread_creates_handle() {
 fn test_get_file_attributes_ex_w_not_found() {
     let mut engine = test_engine();
     let mut state = default_winapi_state();
-    // "Not found" is only reachable with a bottle: without one the
-    // bottle-enforcement policy stops the run on the first file op instead
-    // (BottleMissingError). The root need not exist — the probe path does
+    // "Not found" needs a concrete root so the probe does not hit the real
+    // global app-data bottle. The root need not exist — the probe path does
     // not exist under any root, which is exactly the case under test.
     state.file_io.volumes.bottle_root = Some(std::path::PathBuf::from("/tmp/wie-bottle"));
     let path_ptr = 0x3000;
@@ -1034,7 +1033,8 @@ fn test_create_file_mapping_w_registers_and_validates() {
     // Mount a real host file so CreateFileW can open it with content.
     let host = std::env::temp_dir().join(format!("wie-map-unit-{}.txt", std::process::id()));
     std::fs::write(&host, b"mapped bytes").expect("write host file");
-    // The standing "filesystem ⇒ bottle" policy: file ops require a bottle.
+    // Give the test an explicit root so the mount lands under a real bottle
+    // rather than the global app-data default.
     let bottle = std::env::temp_dir().join(format!("wie-map-unit-bottle-{}", std::process::id()));
     std::fs::create_dir_all(bottle.join("drive_c")).expect("create bottle");
     state.file_io.bottle_root = Some(bottle.clone());
@@ -1221,6 +1221,89 @@ fn test_map_view_of_file_copies_bytes_into_guest_memory() {
     assert!(
         state.kernel.sync.object(mapping_handle).is_none(),
         "CloseHandle removes the mapping object"
+    );
+
+    let _cleanup = std::fs::remove_file(&host);
+}
+
+/// The global-bottle policy, end to end at the handler level: a file op with
+/// NO `--root` and NO `WIE_ROOT` succeeds — guest `C:\…` maps to the default
+/// app-data bottle, which the op creates on demand.
+#[test]
+fn test_file_op_without_root_creates_and_writes_the_global_bottle() {
+    let mut engine = test_engine();
+    // `default_winapi_state` uses `VolumeConfig::default()`: no override, so
+    // resolution falls back to the global app-data bottle.
+    let mut state = default_winapi_state();
+
+    let unique = format!("global-bottle-{}.txt", std::process::id());
+    let guest_path = format!(r"C:\wie-global-bottle-e2e\{unique}");
+    let name_ptr = 0x3000;
+    write_guest_utf16(&mut engine, name_ptr, &guest_path);
+    // CreateFileW(ptr, GENERIC_WRITE=0x40000000, 0, 0, CREATE_ALWAYS=2, ...).
+    write_regs(&mut engine, name_ptr, 0x4000_0000, 0, 0, STACK_TOP);
+    engine
+        .mem_write(STACK_TOP + 0x28, &2_u32.to_le_bytes())
+        .ok();
+    let created = kernel32::handle_create_file_w(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("CreateFileW without a root must not error");
+    let file_handle = created.return_value;
+    assert_ne!(
+        file_handle,
+        u64::MAX,
+        "valid file handle via the global bottle"
+    );
+
+    // WriteFile(h, buf, 5, &written, 0).
+    const DATA: &[u8] = b"GLOBAL";
+    engine.mem_write(0x5000, DATA).expect("stage write buffer");
+    write_regs(
+        &mut engine,
+        file_handle,
+        0x5000,
+        DATA.len() as u64,
+        0x6000,
+        STACK_TOP,
+    );
+    let wrote = kernel32::handle_write_file(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("WriteFile");
+    assert_eq!(wrote.return_value, 1, "WriteFile succeeds");
+    let mut written = [0_u8; 4];
+    engine
+        .mem_read(0x6000, &mut written)
+        .expect("read written count");
+    assert_eq!(u32::from_le_bytes(written), DATA.len() as u32);
+
+    write_regs(&mut engine, file_handle, 0, 0, 0, STACK_TOP);
+    kernel32::handle_close_handle(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("CloseHandle");
+
+    // The global bottle now exists and holds the written bytes.
+    let host = crate::vfs::global_bottle_root()
+        .join("drive_c")
+        .join("wie-global-bottle-e2e")
+        .join(&unique);
+    assert!(
+        host.is_file(),
+        "file must exist under the global bottle: {}",
+        host.display()
+    );
+    assert_eq!(
+        std::fs::read(&host).expect("read back"),
+        DATA,
+        "bytes round-trip through the global bottle"
     );
 
     let _cleanup = std::fs::remove_file(&host);

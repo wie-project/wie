@@ -440,7 +440,6 @@ pub fn handle_get_file_version_info_size_w(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let file_ptr = engine
         .read_rcx()
         .context("failed to read RCX for GetFileVersionInfoSizeW")?;
@@ -459,7 +458,6 @@ pub fn handle_get_file_version_info_size_a(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let file_ptr = engine
         .read_rcx()
         .context("failed to read RCX for GetFileVersionInfoSizeA")?;
@@ -478,7 +476,6 @@ pub fn handle_get_file_version_info_size_ex_w(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let flags = kernel32::low_u32(
         engine
             .read_rcx()
@@ -506,7 +503,6 @@ pub fn handle_get_file_version_info_size_ex_a(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let flags = kernel32::low_u32(
         engine
             .read_rcx()
@@ -532,7 +528,6 @@ pub fn handle_get_file_version_info_size_ex_a(
 pub fn handle_get_file_version_info_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let file_ptr = engine
         .read_rcx()
         .context("failed to read RCX for GetFileVersionInfoW")?;
@@ -555,7 +550,6 @@ pub fn handle_get_file_version_info_w(ctx: &mut HandlerContext<'_>) -> Result<Wi
 pub fn handle_get_file_version_info_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let file_ptr = engine
         .read_rcx()
         .context("failed to read RCX for GetFileVersionInfoA")?;
@@ -580,7 +574,6 @@ pub fn handle_get_file_version_info_ex_w(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let flags = kernel32::low_u32(
         engine
             .read_rcx()
@@ -612,7 +605,6 @@ pub fn handle_get_file_version_info_ex_a(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let flags = kernel32::low_u32(
         engine
             .read_rcx()
@@ -785,7 +777,6 @@ pub fn handle_ver_language_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 pub fn handle_ver_find_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let _flags = engine
         .read_rcx()
         .context("failed to read RCX for VerFindFileW")?;
@@ -809,7 +800,6 @@ pub fn handle_ver_find_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 pub fn handle_ver_find_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let _flags = engine
         .read_rcx()
         .context("failed to read RCX for VerFindFileA")?;
@@ -855,7 +845,6 @@ fn install_file(
 pub fn handle_ver_install_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let _flags = engine
         .read_rcx()
         .context("failed to read RCX for VerInstallFileW")?;
@@ -907,7 +896,6 @@ pub fn handle_ver_install_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 pub fn handle_ver_install_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    crate::vfs::enforce_bottle(&state.file_io.volumes)?;
     let _flags = engine
         .read_rcx()
         .context("failed to read RCX for VerInstallFileA")?;

@@ -82,7 +82,7 @@ Interactive GUI sessions stay open until you close the window. Build all test bi
 
 ### Windows Notepad — the flagship demo
 
-Fetch the real Windows PE once, then run it in a bottle. Its File menu, Find/Replace, Go To, Time/Date, Font and Print all work against real macOS UI:
+Fetch the real Windows PE once, then run it. Its `C:` lives in the per-user app-data bottle by default; the `--root` below gives this run an isolated one:
 
 ```bash
 ./scripts/fetch.sh notepad     # builds katahiromz/RNotepad (needs cmake + mingw-w64)
@@ -113,8 +113,8 @@ See [`docs/7zip.md`](docs/7zip.md) for the full workflow.
 
 Guest `C:\` maps to a **bottle** — a host directory the app can treat as its own machine:
 
-- **The app's own world stays in the bottle.** Its config, its CWD, its data files: `C:\…` → `{root}/drive_c/…`. A program that touches the filesystem must run with a bottle (`--root` / `WIE_ROOT`) — without one, the first file operation stops with a clear error instead of guessing.
-- **An exe outside the bottle is copied in before it runs**, so the guest always executes from a real file it knows.
+- **Apps just work.** File operations never need setup: guest `C:\…` maps to a per-user app-data bottle at `~/Library/Application Support/WIE/bottle/drive_c/…`, created on demand the first time the app touches a file. `--root` / `WIE_ROOT` optionally override that default with a per-session bottle (tests, CI, isolation).
+- **The app's own world stays in the bottle.** Its config, its CWD, its data files: `C:\…` → `{root}/drive_c/…`. An exe launched outside a configured bottle runs in place — its own file ops still land in the bottle.
 - **Your files are yours.** The native Open/Save panels are the boundary: a file you pick there is mounted into the guest (`Z:\pickN\…`) and read or written **in place** — the host file is what changes.
 - **The guest cannot reach your Mac on its own.** Symlink escapes and unmapped paths fail closed; the only way to a host path is a file you explicitly chose in a dialog.
 
@@ -202,7 +202,7 @@ The full knob table (30+ switches: JIT memory lower, chaining, SIMD, strings, he
 
 ## History
 
-Early work targeted an alternate way to run FuSoYa's Lunar Magic and used Unicorn Engine. After full init sequences proved feasible, Unicorn-specific paths were removed in favour of iced-x86 + Cranelift. The 2026 roadmap then landed the memory backend (mmap-only, soft-translate), the JIT fast paths (multi sticky, region pins, super path, SIMD, bulk strings), the GUI program (windows → controls → dialogs → menus → fonts → wgpu present), the D3D9 software renderer, a type-system-driven architecture cleanup (typed handles, WinMsg, menu tree, per-kind control state), and the 2026-08 wave: **native macOS dialogs** (Open/Save anywhere via pick-mounts, confirmations, Font, Page Setup), **real printing** (the macOS print panel → GDI print DCs → NSPrintOperation), the bottle policy (always-in-a-bottle, copy-in, fail-closed isolation), a **zero-copy struct-read layer** (`zerocopy` + compile-time layout asserts), a repo-wide structure rule (no file over 1,500 lines, per-seam module splits), **VS 2.0 + PS 2.0 shader execution with flow control**, and **pull-based repaint** (content-revision latch + idle reconcile).
+Early work targeted an alternate way to run FuSoYa's Lunar Magic and used Unicorn Engine. After full init sequences proved feasible, Unicorn-specific paths were removed in favour of iced-x86 + Cranelift. The 2026 roadmap then landed the memory backend (mmap-only, soft-translate), the JIT fast paths (multi sticky, region pins, super path, SIMD, bulk strings), the GUI program (windows → controls → dialogs → menus → fonts → wgpu present), the D3D9 software renderer, a type-system-driven architecture cleanup (typed handles, WinMsg, menu tree, per-kind control state), and the 2026-08 wave: **native macOS dialogs** (Open/Save anywhere via pick-mounts, confirmations, Font, Page Setup), **real printing** (the macOS print panel → GDI print DCs → NSPrintOperation), the bottle policy (global app-data bottle, per-session overrides, fail-closed isolation), a **zero-copy struct-read layer** (`zerocopy` + compile-time layout asserts), a repo-wide structure rule (no file over 1,500 lines, per-seam module splits), **VS 2.0 + PS 2.0 shader execution with flow control**, and **pull-based repaint** (content-revision latch + idle reconcile).
 
 ## AI-Usage
 

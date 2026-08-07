@@ -491,10 +491,11 @@ fn resolve_initial_dir_prefers_confined_caller_dir() {
         resolve_initial_dir(&volumes, r"D:\cwd", r"D:\caller", r"D:\file"),
         r"C:\"
     );
-    // No bottle configured → the fallback root (listing will be empty).
+    // No explicit override: the global app-data bottle always maps C:, so
+    // the guest cwd confines (default root, not an empty fallback).
     assert_eq!(
         resolve_initial_dir(&VolumeConfig::default(), r"C:\App", "", ""),
-        r"C:\"
+        r"C:\App"
     );
 }
 

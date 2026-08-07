@@ -74,7 +74,7 @@ The README keeps the shortlist; the complete set lives here.
 | `WIE_RUNTIME_PROFILE=1` | Wall/CPU%, host stops, JIT counters, `mem_backend` |
 | `WIE_PROCESS_HEAP_MB` | Guest process-heap size in MiB (default **512**) |
 | `WIE_API_JOURNAL=path` | Per-API journal for backend A/B diffs |
-| `WIE_ROOT` / `--root` | Bottle root for guest `C:\` file APIs (required for file-touching apps) |
+| `WIE_ROOT` / `--root` | Optional bottle override for guest `C:\` file APIs (default: per-user app-data bottle at `~/Library/Application Support/WIE/bottle`, created on demand) |
 | `WIE_DRIVE_D` / `--drive-d` | Host root for guest `D:\` bridge (`auto` = host cwd) |
 | `WIE_PRINT_TO=<dir>` | EndDoc headless oracle: write rendered pages as `page-N.bmp` (no bridge needed) |
 | `WIE_GUEST_HEAP=1` | Rewire process-heap `HeapAlloc`/`HeapFree` to guest code |

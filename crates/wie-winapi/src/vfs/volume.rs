@@ -1,48 +1,35 @@
-//! Volume table: bottle C: + optional host-bridge D:.
+//! Volume table: global/override bottle C: + optional host-bridge D:.
 //!
-//! # Bottle enforcement ("filesystem ⇒ bottle")
+//! # The global bottle (default root)
 //!
-//! The user policy: a program that needs the filesystem must ALWAYS run in a
-//! bottle (`--root` / `WIE_ROOT`). The volume-resolution layer is the single
-//! funnel every filesystem operation passes through (CreateFileW, the file
-//! dialogs' listings, GetFullPathName, …), so it is the one place that
-//! latches a missing bottle:
+//! WIE apps behave like native macOS apps: file operations never *require* a
+//! configured bottle. When no override is present, guest `C:\…` maps to a
+//! per-user app-data bottle — on macOS
+//! `~/Library/Application Support/WIE/bottle/` (via [`dirs::data_dir`], see
+//! [`global_bottle_root`]). The bottle is created on demand: file ops create
+//! their directories through the VFS backend, so the first write that touches
+//! `C:\…` brings the global bottle into existence.
 //!
-//! - The first resolution that needs the C: volume while `bottle_root` is
-//!   `None` sets the [`BOTTLE_MISSING_ENFORCED`] latch and the entry point
-//!   resolves to `None` (the same contract as an unmapped path, so callers
-//!   that treat `None` as "not found" need no change).
-//! - File-op handlers call [`enforce_bottle`] once per operation. The first
-//!   call without a bottle returns [`BottleMissingError`], which propagates
-//!   through the handler `Result` and stops the session via the existing
-//!   runtime emulation-error path. Every later call fails fast with the
-//!   identical error — the bottle is never re-derived per call; the latch is
-//!   what makes "enforce only once" hold.
+//! `--root` / `WIE_ROOT` become an OPTIONAL override on top of that default
+//! (per-session isolation for tests/CI): when `VolumeConfig::bottle_root` is
+//! `Some`, it replaces the global bottle for the whole session. The volume
+//! layer is the single funnel every filesystem operation passes through
+//! (CreateFileW, the file dialogs' listings, GetFullPathName, …), so the
+//! default root applies uniformly.
 //!
-//! The latch is process-global rather than a field on [`VolumeConfig`]:
-//! `VolumeConfig` is built from struct literals across the crate (including
-//! the file-dialog confinement tests), so a new field would break those
-//! sites. One process runs one session (the CLI), so a process-global latch
-//! is exactly once per run; [`enforce_bottle`] still checks `bottle_root`
-//! first, so a later state that does have a bottle never inherits an earlier
-//! missing-bottle latch.
+//! # The D: bridge and pick-mounts stay real
 //!
-//! # The D:-only edge
-//!
-//! A D: bridge (`--drive-d`) is a second volume that never *needs* the C:
-//! bottle: `D:\…` resolves through `drive_d_root` and does not set the
-//! latch. But the handler-level policy is unconditional: without a C: bottle
-//! *any* file operation stops on its first call, even a `D:\` one — the
-//! bottle provides the C: skeleton (TEMP, System32, CWD) that file code
-//! depends on, so "run with `--root`" is the answer even for D:-only data.
-//! Without a D: bridge either, `D:\` paths stay unmapped (`None`), unchanged.
+//! The `Z:\pickN\` pick-mounts (native file-dialog accepts) and the optional
+//! D: bridge (`--drive-d` / `WIE_DRIVE_D`) are second volumes that never
+//! resolve through the bottle: `D:\…` maps to the bridge root, pick-mounts
+//! bind an exact guest path to its consented host file. Both are unchanged
+//! by the default root — picked files are the real macOS files.
 
 use super::path::{
     canonicalize_host_target, collapse_windows_components, drive_letter, guest_path_from_relative,
     normalize_host_path, normalize_windows_path_separators, relative_after_drive,
 };
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Synthetic Win10-ish skeleton under bottle `drive_c` (no PE/DLL payloads).
 pub const BOTTLE_SKELETON_DIRS: &[&str] = &[
@@ -63,72 +50,14 @@ pub const GUEST_WINDOWS_DIR: &str = r"C:\Windows";
 /// Guest System32 directory.
 pub const GUEST_SYSTEM_DIR: &str = r"C:\Windows\System32";
 
-/// One-shot record that a resolution needed the C: bottle while none was
-/// configured. Set by the first missing-bottle resolution or the first
-/// [`enforce_bottle`] call; every later enforcement fails fast on it.
-///
-/// Process-global, not a [`VolumeConfig`] field: `VolumeConfig` is built
-/// from struct literals across the crate (including the file-dialog
-/// confinement tests), so a new field would break those sites. One process
-/// runs one session, so the latch is exactly once per run.
-static BOTTLE_MISSING_ENFORCED: AtomicBool = AtomicBool::new(false);
-
-/// The specific error for the "filesystem ⇒ bottle" policy.
-///
-/// The message is fixed and actionable: it names both ways to configure a
-/// bottle (`--root` on the CLI, `WIE_ROOT` in the environment). Propagated
-/// through handler `Result`s so the session stops with this text visible via
-/// the existing runtime emulation-error path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BottleMissingError;
-
-impl std::fmt::Display for BottleMissingError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "file operations require a bottle: set --root or WIE_ROOT to map guest C:\\"
-        )
-    }
-}
-
-impl std::error::Error for BottleMissingError {}
-
-/// Whether the missing-bottle condition was ever latched (tests + diagnostics).
-#[must_use]
-pub fn bottle_missing_enforced() -> bool {
-    BOTTLE_MISSING_ENFORCED.load(Ordering::Relaxed)
-}
-
-/// Enforce the "filesystem ⇒ bottle" policy at the handler boundary.
-///
-/// File-op handlers call this once per operation. With a bottle configured
-/// it is a no-op; without one the first call latches and returns
-/// [`BottleMissingError`], and every later call returns the identical error
-/// (there is nothing left to derive — the error is fixed, so the latch *is*
-/// the short-circuit).
-pub fn enforce_bottle(volumes: &VolumeConfig) -> Result<(), BottleMissingError> {
-    if volumes.bottle_root.is_some() {
-        return Ok(());
-    }
-    BOTTLE_MISSING_ENFORCED.store(true, Ordering::Relaxed);
-    Err(BottleMissingError)
-}
-
-/// Record that a resolution needed the C: bottle while none was configured.
-///
-/// Called by the resolution entry points on their C:-missing path so the
-/// latch is set by the resolution funnel itself, not only by the handler
-/// boundary ([`enforce_bottle`]).
-fn note_bottle_missing(volumes: &VolumeConfig) {
-    if volumes.bottle_root.is_none() {
-        BOTTLE_MISSING_ENFORCED.store(true, Ordering::Relaxed);
-    }
-}
-
 /// Volume / path mapping configuration on `WinApiState`.
+///
+/// `bottle_root = None` means *use the global app-data bottle* ([`global_bottle_root`]),
+/// so a default-constructed config already has a working C: volume.
 #[derive(Debug, Clone, Default)]
 pub struct VolumeConfig {
-    /// Bottle root: `C:\…` → `{root}/drive_c/…`.
+    /// Optional per-session bottle override: `C:\…` → `{root}/drive_c/…`.
+    /// `None` falls back to the global app-data bottle.
     pub bottle_root: Option<PathBuf>,
     /// Optional host root for `D:\…`.
     pub drive_d_root: Option<PathBuf>,
@@ -148,6 +77,38 @@ impl VolumeConfig {
     pub fn has_drive_d(&self) -> bool {
         self.drive_d_root.is_some()
     }
+}
+
+/// The default (global) bottle root: the per-user app-data dir.
+///
+/// On macOS this is `~/Library/Application Support/WIE/bottle/`
+/// ([`dirs::data_dir`] returns `~/Library/Application Support`). It is the
+/// `C:` volume when no `--root` / `WIE_ROOT` override is configured, so file
+/// operations never *require* a bottle — WIE apps behave like native macOS
+/// apps. The bottle is created on demand: the VFS backend's `create_dir_all`
+/// brings `drive_c` (and any parent) into existence on the first write.
+#[must_use]
+pub fn global_bottle_root() -> PathBuf {
+    let base = dirs::data_dir().unwrap_or_else(|| {
+        // Last-resort fallback: HOME-based app-data, then the working dir.
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Library")
+            .join("Application Support")
+    });
+    base.join("WIE").join("bottle")
+}
+
+/// The effective bottle root for a volume config.
+///
+/// The explicit override wins; `None` means the global app-data bottle.
+#[must_use]
+pub fn effective_bottle_root(volumes: &VolumeConfig) -> PathBuf {
+    volumes
+        .bottle_root
+        .clone()
+        .unwrap_or_else(global_bottle_root)
 }
 
 /// Successful guest → host path map.
@@ -211,13 +172,8 @@ pub fn guest_path_to_host(volumes: &VolumeConfig, guest_path: &str) -> Option<Ho
     }
 
     let host_root = match drive {
-        'C' => {
-            let Some(bottle) = volumes.bottle_root.as_ref() else {
-                note_bottle_missing(volumes);
-                return None;
-            };
-            bottle.join("drive_c")
-        }
+        // C: always resolves: the override bottle or the global app-data bottle.
+        'C' => effective_bottle_root(volumes).join("drive_c"),
         'D' => volumes.drive_d_root.clone()?,
         _ => return None,
     };
@@ -247,9 +203,7 @@ pub fn guest_path_to_host(volumes: &VolumeConfig, guest_path: &str) -> Option<Ho
 fn host_resolves_within_roots(volumes: &VolumeConfig, host: &Path) -> bool {
     let canonical = normalize_host_path(&canonicalize_host_target(host));
     let mut roots: Vec<PathBuf> = Vec::new();
-    if let Some(bottle) = volumes.bottle_root.as_ref() {
-        roots.push(bottle.join("drive_c"));
-    }
+    roots.push(effective_bottle_root(volumes).join("drive_c"));
     if let Some(drive_d) = volumes.drive_d_root.as_ref() {
         roots.push(drive_d.clone());
     }
@@ -284,14 +238,10 @@ pub fn confine_guest_path(volumes: &VolumeConfig, guest_path: &str) -> Option<St
     let drive = drive_letter(&sep_norm)?;
     let relative = relative_after_drive(&sep_norm, drive)?;
 
-    // The drive must name a configured volume: C: bottle or D: bridge.
+    // The drive must name a mapped volume. C: always exists (the override
+    // bottle or the global app-data bottle); D: needs the bridge.
     match drive {
-        'C' => {
-            if volumes.bottle_root.is_none() {
-                note_bottle_missing(volumes);
-                return None;
-            }
-        }
+        'C' => {}
         'D' => {
             volumes.drive_d_root.as_ref()?;
         }
@@ -333,15 +283,9 @@ pub fn host_path_to_guest(volumes: &VolumeConfig, host_path: &Path) -> Option<St
     // align the two forms — strip the prefix explicitly (see
     // normalize_host_path).
     let host_path = normalize_host_path(host_path);
-    if let Some(bottle) = volumes.bottle_root.as_ref() {
-        let drive_c = normalize_host_path(&bottle.join("drive_c"));
-        if let Ok(relative) = host_path.strip_prefix(&drive_c) {
-            return Some(guest_path_from_relative('C', relative));
-        }
-    } else {
-        // Without a bottle no host path can be a guest C: path; record the
-        // missing-bottle condition for the enforcement latch.
-        note_bottle_missing(volumes);
+    let drive_c = normalize_host_path(&effective_bottle_root(volumes).join("drive_c"));
+    if let Ok(relative) = host_path.strip_prefix(&drive_c) {
+        return Some(guest_path_from_relative('C', relative));
     }
     if let Some(drive_d) = volumes.drive_d_root.as_ref() {
         let drive_d = normalize_host_path(drive_d);
@@ -352,7 +296,9 @@ pub fn host_path_to_guest(volumes: &VolumeConfig, host_path: &Path) -> Option<St
     None
 }
 
-/// Resolve bottle root from `WIE_ROOT`.
+/// Resolve bottle root from `WIE_ROOT` (optional override).
+///
+/// `None` means *no override*: the session uses the global app-data bottle.
 #[must_use]
 pub fn bottle_root_from_env() -> Option<PathBuf> {
     std::env::var_os("WIE_ROOT").map(PathBuf::from)
@@ -481,7 +427,8 @@ mod tests {
         );
         // Outside both volumes → no drive mapping exists.
         assert_eq!(host_path_to_guest(&v, Path::new("/etc/passwd")), None);
-        // Drive-C path with no bottle configured → None.
+        // A host path under some OTHER bottle is not guest-visible — only the
+        // effective root (override or global app-data bottle) maps to C:.
         let no_bottle = VolumeConfig {
             bottle_root: None,
             drive_d_root: None,
@@ -607,68 +554,125 @@ mod tests {
     }
 
     #[test]
-    fn confine_guest_path_requires_a_volume() {
+    fn confine_guest_path_never_requires_a_bottle() {
+        // C: always exists — the default is the global app-data bottle, so
+        // confinement never fails for lack of a configured root.
         let no_bottle = VolumeConfig::default();
-        assert_eq!(confine_guest_path(&no_bottle, r"C:\App"), None);
-        assert_eq!(confine_guest_path(&no_bottle, r"C:\"), None);
+        assert_eq!(
+            confine_guest_path(&no_bottle, r"C:\App"),
+            Some(r"C:\App".to_owned())
+        );
+        assert_eq!(
+            confine_guest_path(&no_bottle, r"C:\"),
+            Some(r"C:\".to_owned())
+        );
+        // Unmapped drives still confine to None.
+        assert_eq!(confine_guest_path(&no_bottle, r"D:\x"), None);
+        assert_eq!(confine_guest_path(&no_bottle, r"E:\x"), None);
     }
 
     #[test]
-    fn enforce_bottle_returns_error_and_latches_on_first_op() {
+    fn default_config_resolves_c_to_the_global_bottle() {
+        // No --root and no WIE_ROOT: guest C: maps into the app-data bottle.
         let no_bottle = VolumeConfig::default();
-        // First FS op without a bottle: the specific error, latch set.
-        assert_eq!(enforce_bottle(&no_bottle), Err(BottleMissingError));
-        assert!(bottle_missing_enforced());
-        // Second op: identical error via the latch (no re-derivation).
-        assert_eq!(enforce_bottle(&no_bottle), Err(BottleMissingError));
-        // A different bottle-less config (D: bridge only) fails identically.
-        let d_only = VolumeConfig {
-            bottle_root: None,
-            drive_d_root: Some(PathBuf::from("/Users/me/data")),
-        };
-        assert_eq!(enforce_bottle(&d_only), Err(BottleMissingError));
+        let m = guest_path_to_host(&no_bottle, r"C:\App\out.txt").expect("default C: maps");
+        assert_eq!(
+            m.host,
+            global_bottle_root()
+                .join("drive_c")
+                .join("App")
+                .join("out.txt")
+        );
+        // The global root is the OS app-data dir under WIE/bottle.
+        assert_eq!(
+            global_bottle_root(),
+            dirs::data_dir()
+                .expect("data dir")
+                .join("WIE")
+                .join("bottle")
+        );
+        #[cfg(target_os = "macos")]
+        assert!(global_bottle_root().ends_with("Application Support/WIE/bottle"));
+        // Host paths under the global drive_c map back to C:\.
+        assert_eq!(
+            host_path_to_guest(
+                &no_bottle,
+                &global_bottle_root().join("drive_c").join("x.txt")
+            ),
+            Some(r"C:\x.txt".to_owned())
+        );
+        // A host path under some OTHER bottle is not guest-visible.
+        assert_eq!(
+            host_path_to_guest(&no_bottle, Path::new("/tmp/bottle/drive_c/x.txt")),
+            None
+        );
     }
 
     #[test]
-    fn enforce_bottle_is_noop_with_bottle() {
-        // A configured bottle wins even if an earlier bottle-less config
-        // latched (the global latch must never leak into a bottle run).
+    fn explicit_override_replaces_the_global_bottle() {
+        // An explicit root wins over the global default (per-session isolation).
         let with_bottle = VolumeConfig {
             bottle_root: Some(PathBuf::from("/tmp/bottle")),
             drive_d_root: None,
         };
-        assert_eq!(enforce_bottle(&with_bottle), Ok(()));
+        let m = guest_path_to_host(&with_bottle, r"C:\App\out.txt").expect("override maps");
+        assert_eq!(m.host, PathBuf::from("/tmp/bottle/drive_c/App/out.txt"));
+        assert_eq!(
+            effective_bottle_root(&with_bottle),
+            PathBuf::from("/tmp/bottle")
+        );
+        assert_eq!(
+            effective_bottle_root(&VolumeConfig::default()),
+            global_bottle_root()
+        );
     }
 
     #[test]
-    fn bottle_missing_error_message_has_root_guidance() {
-        let msg = BottleMissingError.to_string();
-        assert!(msg.contains("--root"), "message: {msg}");
-        assert!(msg.contains("WIE_ROOT"), "message: {msg}");
-        assert!(msg.contains("bottle"), "message: {msg}");
-    }
-
-    #[test]
-    fn c_resolutions_without_bottle_latch() {
-        let no_bottle = VolumeConfig::default();
-        assert!(guest_path_to_host(&no_bottle, r"C:\App\out.txt").is_none());
-        assert!(confine_guest_path(&no_bottle, r"C:\App").is_none());
-        assert!(host_path_to_guest(&no_bottle, Path::new("/tmp/bottle/drive_c/x.txt")).is_none());
-        assert!(bottle_missing_enforced());
-    }
-
-    #[test]
-    fn d_bridge_without_bottle_resolves_but_file_ops_still_fire() {
+    fn d_bridge_without_override_maps_d_through_the_bridge() {
+        // D: resolution never needs a configured C: bottle — it maps through
+        // the bridge, and C: falls back to the global default.
         let d_only = VolumeConfig {
             bottle_root: None,
             drive_d_root: Some(PathBuf::from("/Users/me/data")),
         };
-        // D: resolution never needs the C: bottle — it maps through the bridge.
         let m = guest_path_to_host(&d_only, r"D:\archive\a.7z").expect("d bridge maps");
         assert_eq!(m.host, PathBuf::from("/Users/me/data/archive/a.7z"));
-        // But the handler-level policy is unconditional: any file operation
-        // without a C: bottle stops, even a D: one.
-        assert_eq!(enforce_bottle(&d_only), Err(BottleMissingError));
+        // C: still resolves through the global bottle alongside the bridge.
+        let c = guest_path_to_host(&d_only, r"C:\App\out.txt").expect("C: maps with bridge");
+        assert_eq!(
+            c.host,
+            global_bottle_root()
+                .join("drive_c")
+                .join("App")
+                .join("out.txt")
+        );
+    }
+
+    #[test]
+    fn global_bottle_is_created_on_demand_by_file_ops() {
+        // The policy: a file op with no --root and no WIE_ROOT succeeds and
+        // creates the global bottle. This exercises the real app-data path
+        // (the VFS backend's create_dir_all is what brings it into being).
+        let no_bottle = VolumeConfig::default();
+        let guest = r"C:\wie-global-bottle-test\probe.txt";
+        let map = guest_path_to_host(&no_bottle, guest).expect("default C: maps");
+        // Unique per run so a stale file from a crashed earlier run can't
+        // masquerade as a fresh creation.
+        let file = map
+            .host
+            .parent()
+            .expect("mapped file has a parent dir")
+            .join(format!("probe-{}.txt", std::process::id()));
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent).expect("create global bottle dirs");
+        }
+        std::fs::write(&file, b"global-bottle").expect("write through the global bottle");
+        assert!(file.is_file(), "global bottle file must exist");
+        let back = host_path_to_guest(&no_bottle, &file).expect("host maps back");
+        assert!(back.starts_with(r"C:\"), "guest path is C: based: {back}");
+        // Clean up only the file; the bottle itself stays (it is the product's
+        // own app-data dir, legitimately created by the run).
+        let _unused = std::fs::remove_file(&file);
     }
 
     /// A real bottle on disk with a small `drive_c` layout for mapping tests.

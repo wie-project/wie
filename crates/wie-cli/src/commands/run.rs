@@ -23,16 +23,20 @@ fn is_interactive_stdin(path: &Path) -> bool {
 /// Copy `host_path` into the bottle when it lives outside any mapped volume,
 /// returning the host path the run should load.
 ///
-/// FS policy: a program that needs the filesystem always runs inside a bottle.
-/// An exe launched from outside gets a copy of its own at `{root}/drive_c/{name}`
-/// (install-style — the source stays untouched). The guest identity label is
-/// `C:\{name}` (derived from the basename), so with the copy in place that
-/// label maps through the volume config to a real bottle file: GetModuleFileName
-/// and the shell32 "New Window" relaunch both resolve the in-bottle copy.
+/// FS policy: file operations never require a bottle — guest `C:\…` always
+/// maps (the per-session `--root`/`WIE_ROOT` override, or the default global
+/// app-data bottle). An exe launched from outside a *configured* bottle gets a
+/// copy of its own at `{root}/drive_c/{name}` (install-style — the source
+/// stays untouched). The guest identity label is `C:\{name}` (derived from
+/// the basename), so with the copy in place that label maps through the volume
+/// config to a real bottle file: GetModuleFileName and the shell32 "New
+/// Window" relaunch both resolve the in-bottle copy.
 ///
-/// Pass-through cases: no bottle (`None`), or the exe already lives under a
-/// mapped volume (`{root}/drive_c` or the optional D: bridge). A nested in-bottle
-/// exe passes through unchanged even though `C:\{name}` then maps to the volume
+/// Pass-through cases: no explicit bottle (`None`), or the exe already lives
+/// under a mapped volume (`{root}/drive_c` or the optional D: bridge). Without
+/// an explicit root the exe runs in place — its own file ops still land in the
+/// global app-data bottle, so nothing needs copying. A nested in-bottle exe
+/// passes through unchanged even though `C:\{name}` then maps to the volume
 /// root rather than the real file — accepted per the in-bottle policy. A
 /// same-named file already in `drive_c` is overwritten: the bottle copy is this
 /// run's own (no hash check — that would be over-engineering).
@@ -97,8 +101,12 @@ pub(crate) fn run_micro(
     let root = bottle_root
         .map(std::path::Path::to_path_buf)
         .or_else(wie_winapi::bottle_root_from_env);
-    if let Some(ref r) = root {
-        println!("bottle_root: {}", r.display());
+    match root.as_ref() {
+        Some(r) => println!("bottle_root: {} (override)", r.display()),
+        None => println!(
+            "bottle_root: {} (global default)",
+            wie_winapi::global_bottle_root().display()
+        ),
     }
     let drive_d_root = drive_d
         .map(std::path::Path::to_path_buf)

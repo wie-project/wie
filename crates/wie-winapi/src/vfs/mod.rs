@@ -1,7 +1,11 @@
 //! Clean-room Windows 10 userspace VFS facade for WIE.
 //!
-//! - **C:** bottle (`{root}/drive_c/…`) — isolated guest workspace + synthetic skeleton
+//! - **C:** global app-data bottle by default (`~/Library/Application
+//!   Support/WIE/bottle/drive_c/…`), overridable per session via
+//!   `--root` / `WIE_ROOT` — guest `C:\…` always maps
 //! - **D:** optional host bridge (`WIE_DRIVE_D` / `--drive-d`)
+//! - **Z:** pick-mounts — native file-dialog accepts map the picked file's
+//!   real macOS path back into the guest
 //! - No Wine-style System32 PE payload; DLLs stay fake LoadLibrary handles
 
 pub mod backend;
@@ -29,9 +33,9 @@ pub use path::{
 };
 pub(crate) use pick_mount::register_pick_mount;
 pub use volume::{
-    BOTTLE_SKELETON_DIRS, BottleMissingError, DRIVE_FIXED, DRIVE_NO_ROOT_DIR, GUEST_SYSTEM_DIR,
-    GUEST_TEMP_PATH, GUEST_WINDOWS_DIR, HostMap, VolumeConfig, bottle_missing_enforced,
-    bottle_root_from_env, confine_guest_path, drive_d_from_env, enforce_bottle,
-    ensure_bottle_skeleton, get_drive_type, guest_path_to_host, guest_path_to_host_bottle,
-    host_path_to_guest, logical_drives_mask,
+    BOTTLE_SKELETON_DIRS, DRIVE_FIXED, DRIVE_NO_ROOT_DIR, GUEST_SYSTEM_DIR, GUEST_TEMP_PATH,
+    GUEST_WINDOWS_DIR, HostMap, VolumeConfig, bottle_root_from_env, confine_guest_path,
+    drive_d_from_env, effective_bottle_root, ensure_bottle_skeleton, get_drive_type,
+    global_bottle_root, guest_path_to_host, guest_path_to_host_bottle, host_path_to_guest,
+    logical_drives_mask,
 };

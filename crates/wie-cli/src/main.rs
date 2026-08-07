@@ -77,7 +77,9 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         expect_code: u32,
 
-        /// Bottle root: guest `C:\…` maps to `{root}/drive_c/…` (also `WIE_ROOT`).
+        /// Optional bottle override: guest `C:\…` maps to `{root}/drive_c/…`
+        /// (also `WIE_ROOT`). Default: per-user app-data bottle
+        /// (`~/Library/Application Support/WIE/bottle`), created on demand.
         #[arg(long)]
         root: Option<PathBuf>,
 
@@ -196,7 +198,12 @@ fn main() -> Result<()> {
                         bail!("input script not found: {}", script.display());
                     }
                     let script = gui::input_script::script_path(input_script.as_deref());
-                    return gui::app::run_gui_windowed(&path, script, root.as_deref(), drive_d.as_deref());
+                    return gui::app::run_gui_windowed(
+                        &path,
+                        script,
+                        root.as_deref(),
+                        drive_d.as_deref(),
+                    );
                 }
                 if let Some(out_path) = screenshot {
                     return gui::headless::run_screenshot(&path, &out_path);

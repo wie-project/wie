@@ -18,8 +18,8 @@
 //!
 //! # Store
 //!
-//! Process-global `Mutex<Vec<_>>` — the same shared-mutable-state seam as
-//! [`super::volume::BOTTLE_MISSING_ENFORCED`]. `guest_path_to_host` is a free
+//! Process-global `Mutex<Vec<_>>` — the same shared-mutable-state seam as the
+//! volume layer's on-demand bottle creation. `guest_path_to_host` is a free
 //! function taking only `&VolumeConfig`, so the table it consults must live
 //! outside the state; one process runs one session (the CLI), so a
 //! process-global table is exactly the session's table.
