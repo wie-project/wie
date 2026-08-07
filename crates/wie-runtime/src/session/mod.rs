@@ -33,6 +33,14 @@ pub struct SessionOptions {
     /// Non-empty: inject-only (no host block). Empty: live host stdin when the
     /// guest reads STD_INPUT (line-oriented).
     pub stdin_bytes: Vec<u8>,
+    /// Bottle root for guest `C:\…` mapping (`None` = `WIE_ROOT`, else the
+    /// global app-data bottle). Applied before the process identity is
+    /// derived, so an in-bottle exe's guest module path reflects its real
+    /// location (e.g. `C:\Program Files\{name}\{name}.exe`).
+    pub bottle_root: Option<std::path::PathBuf>,
+    /// Optional host root for guest `D:\…` (`None` = `WIE_DRIVE_D`, else no
+    /// D: drive).
+    pub drive_d_root: Option<std::path::PathBuf>,
 }
 
 /// Guest CRT page layout (must match `wie_winapi::ucrt` and guest stubs).

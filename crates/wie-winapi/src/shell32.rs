@@ -784,9 +784,10 @@ mod tests {
         let _cleanup = std::fs::remove_dir_all(&bottle);
     }
 
-    /// The FS-policy bottle copy (`C:\{name}` → `{root}/drive_c/{name}`): when
-    /// the main module lives in the bottle, its relaunch resolves through the
-    /// volume mapping — never through the temp-file spill.
+    /// The FS-policy bottle copy (install-style `C:\Program Files\{name}\…` →
+    /// `{root}/drive_c/Program Files/{name}/…`): when the main module lives in
+    /// the bottle, its relaunch resolves through the volume mapping — never
+    /// through the temp-file spill.
     #[test]
     fn resolve_launch_host_path_prefers_bottle_copy_over_spill() {
         let mut state = test_state();

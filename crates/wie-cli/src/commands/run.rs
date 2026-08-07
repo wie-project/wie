@@ -23,23 +23,22 @@ fn is_interactive_stdin(path: &Path) -> bool {
 /// Copy `host_path` into the bottle when it lives outside any mapped volume,
 /// returning the host path the run should load.
 ///
-/// FS policy: file operations never require a bottle — guest `C:\…` always
-/// maps (the per-session `--root`/`WIE_ROOT` override, or the default global
-/// app-data bottle). An exe launched from outside a *configured* bottle gets a
-/// copy of its own at `{root}/drive_c/{name}` (install-style — the source
-/// stays untouched). The guest identity label is `C:\{name}` (derived from
-/// the basename), so with the copy in place that label maps through the volume
-/// config to a real bottle file: GetModuleFileName and the shell32 "New
-/// Window" relaunch both resolve the in-bottle copy.
+/// FS policy: an exe launched from outside a *configured* bottle gets a copy
+/// of its own at `{root}/drive_c/Program Files/{name}/{name}.exe` where
+/// `{name}` is the exe's file stem (install-style — the source stays
+/// untouched). The guest identity derives through the volume mapping, so the
+/// copy's guest path is `C:\Program Files\{name}\{name}.exe`: the guest's
+/// self-path (GetModuleFileName) and the shell32 "New Window" relaunch both
+/// resolve the in-bottle copy.
 ///
 /// Pass-through cases: no explicit bottle (`None`), or the exe already lives
 /// under a mapped volume (`{root}/drive_c` or the optional D: bridge). Without
 /// an explicit root the exe runs in place — its own file ops still land in the
 /// global app-data bottle, so nothing needs copying. A nested in-bottle exe
-/// passes through unchanged even though `C:\{name}` then maps to the volume
-/// root rather than the real file — accepted per the in-bottle policy. A
-/// same-named file already in `drive_c` is overwritten: the bottle copy is this
-/// run's own (no hash check — that would be over-engineering).
+/// passes through unchanged even though its `C:\…` label then maps to the
+/// volume root rather than the real file — accepted per the in-bottle policy.
+/// A same-named file already at the copy target is overwritten: the bottle
+/// copy is this run's own (no hash check — that would be over-engineering).
 pub(crate) fn ensure_exe_in_bottle(
     host_path: &Path,
     bottle_root: Option<&Path>,
@@ -59,10 +58,17 @@ pub(crate) fn ensure_exe_in_bottle(
     let Some(file_name) = host_path.file_name() else {
         bail!("run source has no file name: {}", host_path.display());
     };
+    // Install-style layout: the stem names the app dir under Program Files,
+    // the file keeps its original basename.
+    let app_dir = host_path
+        .file_stem()
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or(file_name);
     let drive_c = root.join("drive_c");
-    std::fs::create_dir_all(&drive_c)
-        .with_context(|| format!("create bottle drive_c: {}", drive_c.display()))?;
-    let dest = drive_c.join(file_name);
+    let dest_dir = drive_c.join("Program Files").join(app_dir);
+    std::fs::create_dir_all(&dest_dir)
+        .with_context(|| format!("create bottle app dir: {}", dest_dir.display()))?;
+    let dest = dest_dir.join(file_name);
     std::fs::copy(host_path, &dest).with_context(|| {
         format!(
             "copy exe into bottle ({} -> {})",
@@ -115,7 +121,8 @@ pub(crate) fn run_micro(
         println!("drive_d: {}", d.display());
     }
     // FS policy: an exe outside the bottle runs from a drive_c copy so the
-    // guest identity's `C:\{name}` label maps back to a real bottle file.
+    // guest identity's `C:\Program Files\{name}\{name}.exe` label maps back
+    // to a real bottle file.
     let run_path = ensure_exe_in_bottle(path, root.as_deref(), drive_d_root.as_deref())?;
     let stdin_bytes = match stdin_path {
         Some(p) if is_interactive_stdin(p) => {
@@ -314,6 +321,9 @@ pub(crate) fn run_console_interactive(path: &Path, max_api: Option<usize>) -> Re
             // Empty stdin bytes → LiveHost mode, so ReadFile(STD_INPUT_HANDLE)
             // and ReadConsoleInputW read from the host terminal.
             stdin_bytes: Vec::new(),
+            // Console mode has no `--root` flag; the copy above used the env
+            // roots, so the session defaults (env → global bottle) match.
+            ..wie_runtime::SessionOptions::default()
         },
     )?;
 
@@ -383,15 +393,23 @@ mod tests {
     }
 
     #[test]
-    fn copies_outside_exe_into_bottle_drive_c() {
+    fn copies_outside_exe_into_bottle_program_files() {
         let source = TempDir::new("copy-src");
         let src_exe = fake_exe(source.path(), "app.exe");
         let bottle = TempDir::new("copy-bottle");
 
         let resolved =
             ensure_exe_in_bottle(&src_exe, Some(bottle.path()), None).expect("copy should succeed");
-        let expected = bottle.path().join("drive_c").join("app.exe");
-        assert_eq!(resolved, expected, "resolved path is the drive_c copy");
+        let expected = bottle
+            .path()
+            .join("drive_c")
+            .join("Program Files")
+            .join("app")
+            .join("app.exe");
+        assert_eq!(
+            resolved, expected,
+            "resolved path is the Program Files copy"
+        );
         assert!(expected.is_file(), "bottle copy must exist");
         assert_eq!(
             std::fs::read(&expected).expect("read copy"),
@@ -399,6 +417,25 @@ mod tests {
             "copy carries the source bytes"
         );
         assert!(src_exe.is_file(), "copy is non-destructive: source stays");
+    }
+
+    #[test]
+    fn copied_exe_resolves_to_program_files_guest_path() {
+        let source = TempDir::new("copy-guest-path-src");
+        let src_exe = fake_exe(source.path(), "app.exe");
+        let bottle = TempDir::new("copy-guest-path-bottle");
+
+        let resolved =
+            ensure_exe_in_bottle(&src_exe, Some(bottle.path()), None).expect("copy should succeed");
+        // The loader default labels every exe `C:\{name}`; the runtime remaps
+        // the module path through the volume config, which is what this test
+        // mirrors (see session/init.rs identity derivation).
+        let volumes = wie_winapi::VolumeConfig::from_parts(Some(bottle.path().to_path_buf()), None);
+        assert_eq!(
+            wie_winapi::host_path_to_guest(&volumes, &resolved).as_deref(),
+            Some(r"C:\Program Files\app\app.exe"),
+            "the in-bottle copy resolves to its Program Files guest path"
+        );
     }
 
     #[test]
@@ -444,7 +481,8 @@ mod tests {
     }
 
     /// End-to-end: a micro exe outside the bottle runs from a drive_c copy,
-    /// and the guest identity labels that copy (`C:\{name}` → real file).
+    /// and the guest identity labels that copy (`C:\Program Files\…` → real
+    /// bottle file).
     #[test]
     fn run_micro_runs_outside_exe_from_bottle_copy() {
         let mut micro = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -467,13 +505,24 @@ mod tests {
         run_micro(&src_exe, 1024, 0, Some(bottle.path()), None, None, &[])
             .expect("run_micro exits 0 from the bottle copy");
 
-        let copy = bottle.path().join("drive_c").join("crt_hello.exe");
+        let copy = bottle
+            .path()
+            .join("drive_c")
+            .join("Program Files")
+            .join("crt_hello")
+            .join("crt_hello.exe");
         assert!(copy.is_file(), "bottle copy must exist after the run");
         // The identity of the copy is the guest label, which the volume config
-        // maps back to this same file.
+        // maps back to this same file. The runtime derives the module path
+        // through that mapping (loader default is `C:\{name}`).
         let identity = wie_pe::process_identity_from_host_path_with_args(&copy, &[]);
         assert_eq!(identity.module_file_name, "crt_hello.exe");
-        assert_eq!(identity.module_path, r"C:\crt_hello.exe");
+        let volumes = wie_winapi::VolumeConfig::from_parts(Some(bottle.path().to_path_buf()), None);
+        assert_eq!(
+            wie_winapi::host_path_to_guest(&volumes, &copy).as_deref(),
+            Some(r"C:\Program Files\crt_hello\crt_hello.exe"),
+            "the copy's guest module path is its Program Files location"
+        );
         assert_eq!(identity.current_directory, r"C:\");
     }
 }

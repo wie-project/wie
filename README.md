@@ -114,7 +114,7 @@ See [`docs/7zip.md`](docs/7zip.md) for the full workflow.
 Guest `C:\` maps to a **bottle** — a host directory the app can treat as its own machine:
 
 - **Apps just work.** File operations never need setup: guest `C:\…` maps to a per-user app-data bottle at `~/Library/Application Support/WIE/bottle/drive_c/…`, created on demand the first time the app touches a file. `--root` / `WIE_ROOT` optionally override that default with a per-session bottle (tests, CI, isolation).
-- **The app's own world stays in the bottle.** Its config, its CWD, its data files: `C:\…` → `{root}/drive_c/…`. An exe launched outside a configured bottle runs in place — its own file ops still land in the bottle.
+- **The app's own world stays in the bottle.** Its config, its CWD, its data files: `C:\…` → `{root}/drive_c/…`. An exe launched outside a configured bottle is copied to `C:\Program Files\{name}\` inside the bottle (the source stays untouched), so its self-path, `GetModuleFileName`, sidecars, and New Window relaunch all resolve the in-bottle copy.
 - **Your files are yours.** The native Open/Save panels are the boundary: a file you pick there is mounted into the guest (`Z:\pickN\…`) and read or written **in place** — the host file is what changes.
 - **The guest cannot reach your Mac on its own.** Symlink escapes and unmapped paths fail closed; the only way to a host path is a file you explicitly chose in a dialog.
 

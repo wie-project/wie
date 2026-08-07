@@ -205,8 +205,15 @@ pub fn run_micro_exe_with_options(
         crate::SessionOptions {
             guest_args: options.guest_args,
             stdin_bytes: options.stdin_bytes,
+            // Threaded through the session so the process identity (module
+            // path) derives from the same roots the volume config will use.
+            bottle_root: options.bottle_root.clone(),
+            drive_d_root: options.drive_d_root.clone(),
         },
     )?;
+    // An explicit `None` root means "no bottle, ignore WIE_ROOT" — the
+    // setters make that authoritative over the env fallback applied during
+    // session construction (idempotent when a root was given).
     session.set_bottle_root(options.bottle_root);
     if options.drive_d_root.is_some() {
         session.set_drive_d(options.drive_d_root);

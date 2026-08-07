@@ -1922,8 +1922,8 @@ mod tests {
 
     /// The GUI entry's copy + identity wiring, mirroring
     /// `run_micro_runs_outside_exe_from_bottle_copy`: an exe outside the
-    /// bottle resolves to a `drive_c` copy, and that copy's identity is the
-    /// guest label `C:\{name}` — the reason the copy must happen before the
+    /// bottle resolves to a `drive_c` copy, and that copy's identity is its
+    /// Program Files guest label — the reason the copy must happen before the
     /// session build.
     #[test]
     fn gui_run_source_copies_outside_exe_into_bottle() {
@@ -1933,8 +1933,16 @@ mod tests {
 
         let resolved = resolve_gui_run_source(&src_exe, Some(bottle.path()), None)
             .expect("copy into the bottle should succeed");
-        let expected = bottle.path().join("drive_c").join("app.exe");
-        assert_eq!(resolved, expected, "the GUI run source is the drive_c copy");
+        let expected = bottle
+            .path()
+            .join("drive_c")
+            .join("Program Files")
+            .join("app")
+            .join("app.exe");
+        assert_eq!(
+            resolved, expected,
+            "the GUI run source is the Program Files copy"
+        );
         assert!(expected.is_file(), "bottle copy must exist");
         assert!(
             src_exe.is_file(),
@@ -1943,7 +1951,14 @@ mod tests {
 
         let identity = wie_pe::process_identity_from_host_path_with_args(&resolved, &[]);
         assert_eq!(identity.module_file_name, "app.exe");
-        assert_eq!(identity.module_path, r"C:\app.exe");
+        // The runtime remaps the loader's `C:\{name}` through the volume
+        // config, so the copy's guest module path is its real location.
+        let volumes = wie_winapi::VolumeConfig::from_parts(Some(bottle.path().to_path_buf()), None);
+        assert_eq!(
+            wie_winapi::host_path_to_guest(&volumes, &resolved).as_deref(),
+            Some(r"C:\Program Files\app\app.exe"),
+            "the copy's guest module path is its Program Files location"
+        );
         assert_eq!(identity.current_directory, r"C:\");
     }
 

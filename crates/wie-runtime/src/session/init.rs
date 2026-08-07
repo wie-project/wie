@@ -791,7 +791,29 @@ impl super::RuntimeSession {
             .checked_add(0x800)
             .context("entry module file name W pointer overflow")?;
 
-        let process = wie_pe::process_identity_from_host_path_with_args(path, &options.guest_args);
+        // Effective volume roots: explicit session options win, else `WIE_ROOT`
+        // / `WIE_DRIVE_D`, else the global app-data bottle. The identity is
+        // derived from the SAME volumes the winapi state will use, so an
+        // in-bottle exe's guest module path reflects its real location.
+        let bottle_root = options
+            .bottle_root
+            .clone()
+            .or_else(wie_winapi::bottle_root_from_env);
+        let drive_d_root = options
+            .drive_d_root
+            .clone()
+            .or_else(wie_winapi::drive_d_from_env);
+        let volumes =
+            wie_winapi::VolumeConfig::from_parts(bottle_root.clone(), drive_d_root.clone());
+
+        let mut process =
+            wie_pe::process_identity_from_host_path_with_args(path, &options.guest_args);
+        // The loader defaults the module path to `C:\{name}` (it has no volume
+        // knowledge); remap through the volume config when the host path lives
+        // under a mapped volume — the bottle's `drive_c` or the D: bridge.
+        if let Some(guest_path) = wie_winapi::host_path_to_guest(&volumes, path) {
+            process.module_path = guest_path;
+        }
         write_process_identity_strings(
             &mut engine,
             command_line_a_ptr,
@@ -868,6 +890,15 @@ impl super::RuntimeSession {
         let executable_file_bytes = pe_bytes.clone();
 
         let mut winapi_state = default_winapi_state(&layout, executable_file_bytes, &process)?;
+        // `default_winapi_state` built its volume config from the environment;
+        // re-apply the effective roots so the state's volumes agree with the
+        // identity derived above (an explicit `SessionOptions` root overrides
+        // `WIE_ROOT`, mirroring the old post-hoc `set_bottle_root`).
+        winapi_state.file_io.volumes = volumes;
+        winapi_state.file_io.bottle_root = bottle_root;
+        if let Some(ref root) = winapi_state.file_io.bottle_root {
+            let _ = wie_winapi::ensure_bottle_skeleton(root);
+        }
         // Register the primary thread kernel object so DuplicateHandle
         // can resolve GetCurrentThread/GetCurrentProcess pseudohandles.
         {
@@ -1008,5 +1039,57 @@ impl super::RuntimeSession {
             "guest session started"
         );
         Ok(session)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::indexing_slicing)]
+mod tests {
+    use std::path::PathBuf;
+    use wie_winapi::MessageQueueIdlePolicy;
+
+    /// A staged in-bottle copy's guest module path derives through the volume
+    /// mapping: `{root}/drive_c/Program Files/{name}/{name}.exe` becomes
+    /// `C:\Program Files\{name}\{name}.exe` in the session's process identity
+    /// (the string GetModuleFileName serves).
+    #[test]
+    fn session_identity_maps_bottle_copy_to_program_files() {
+        let mut micro = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        micro.pop();
+        micro.pop();
+        micro.push("micro-exes/out/crt_hello.exe");
+        if !micro.is_file() {
+            tracing::error!(
+                "skip: micro-exes/out/crt_hello.exe not built (run make -C micro-exes)"
+            );
+            return;
+        }
+        let bottle =
+            std::env::temp_dir().join(format!("wie-identity-bottle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bottle);
+        let copy = bottle
+            .join("drive_c")
+            .join("Program Files")
+            .join("crt_hello")
+            .join("crt_hello.exe");
+        std::fs::create_dir_all(copy.parent().expect("app dir")).expect("create app dir");
+        std::fs::copy(&micro, &copy).expect("stage the in-bottle copy");
+
+        let session = crate::RuntimeSession::new_with_options(
+            &copy,
+            MessageQueueIdlePolicy::ExitOnIdle,
+            crate::DEFAULT_LAYOUT,
+            crate::SessionOptions {
+                bottle_root: Some(bottle.clone()),
+                ..crate::SessionOptions::default()
+            },
+        )
+        .expect("session builds from the staged copy");
+
+        let module_path = session
+            .process
+            .with_winapi_ref(|s| s.process.main_module_path.clone());
+        assert_eq!(module_path, r"C:\Program Files\crt_hello\crt_hello.exe");
+        let _ = std::fs::remove_dir_all(&bottle);
     }
 }

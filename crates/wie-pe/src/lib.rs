@@ -97,8 +97,10 @@ pub fn process_identity_from_host_path(host_path: &Path) -> ProcessIdentity {
 /// The guest module path and current directory default to the `C:` drive root
 /// (`C:\{name}` / `C:\`) — app-generic, not tied to any app directory. This
 /// crate is the loader and has no bottle/volume knowledge, so it cannot derive
-/// the guest path from the host path; a future refinement would map it through
-/// the volume config in the runtime crate.
+/// the guest path from the host path; the runtime crate remaps `module_path`
+/// through the volume config (see `wie_winapi::host_path_to_guest`) when the
+/// host path lives under a mapped volume, so an in-bottle exe's guest path
+/// reflects its real location (e.g. `C:\Program Files\{name}\{name}.exe`).
 #[must_use]
 pub fn process_identity_from_host_path_with_args(
     host_path: &Path,
