@@ -971,12 +971,28 @@ impl super::RuntimeSession {
                                         // session stopped — the guest-fault family
                                         // (e.g. an unsupported UCRT export) is
                                         // otherwise only visible in the entry-trace
-                                        // summary and headless reproductions.
-                                        tracing::error!(
-                                            api = %api,
-                                            rip = format_args!("{:#x}", hook.address),
-                                            "unsupported API (session will stop)"
-                                        );
+                                        // summary and headless reproductions. A
+                                        // missing bottle is NOT an unsupported API:
+                                        // label it as the configuration error it is
+                                        // (the chain may wrap it in handler context).
+                                        let bottle_missing = error.chain().any(|cause| {
+                                            cause
+                                                .downcast_ref::<wie_winapi::vfs::volume::BottleMissingError>()
+                                                .is_some()
+                                        });
+                                        if bottle_missing {
+                                            tracing::warn!(
+                                                api = %api,
+                                                rip = format_args!("{:#x}", hook.address),
+                                                "session stopped: file operations require a bottle — run with --root or WIE_ROOT"
+                                            );
+                                        } else {
+                                            tracing::error!(
+                                                api = %api,
+                                                rip = format_args!("{:#x}", hook.address),
+                                                "unsupported API (session will stop)"
+                                            );
+                                        }
                                         events.push(EntryTraceEvent {
                                             index,
                                             library: resolved.library.clone().into(),

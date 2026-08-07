@@ -1450,9 +1450,9 @@ fn order_window_front(window: &Arc<Window>) {
 /// policy: an exe outside the bottle runs from a `drive_c` copy (see
 /// [`crate::commands::ensure_exe_in_bottle`]), so the guest identity's
 /// `C:\{name}` label maps back to a real bottle file. The roots are threaded
-/// the same way the other run entries thread them — `run_gui_windowed` fills
-/// them from `WIE_ROOT`/`WIE_DRIVE_D`, because the CLI's `--root`/`--drive-d`
-/// args are micro-mode-only and never reach the GUI entry. Explicit roots
+/// the same way the other run entries thread them — `run_gui_windowed`
+/// propagates the CLI's `--root`/`--drive-d` into `WIE_ROOT`/`WIE_DRIVE_D`,
+/// which this resolution (and the winapi volume config) read. Explicit roots
 /// keep the wiring testable without mutating the process environment.
 fn resolve_gui_run_source(
     path: &std::path::Path,
@@ -1471,7 +1471,27 @@ fn resolve_gui_run_source(
 pub fn run_gui_windowed(
     path: &std::path::Path,
     input_script: Option<std::path::PathBuf>,
+    bottle_root: Option<&std::path::Path>,
+    drive_d_root: Option<&std::path::Path>,
 ) -> Result<()> {
+    // The winapi volume config and the run-source resolution read the bottle
+    // from WIE_ROOT/WIE_DRIVE_D. Propagate the GUI-entry flags into the
+    // environment so `--root`/`--drive-d` work in GUI mode too (the console
+    // entries consume the flags directly; this mirrors their env-channel).
+    let resolved_root = bottle_root
+        .map(std::path::Path::to_path_buf)
+        .or_else(wie_winapi::bottle_root_from_env);
+    let resolved_drive_d = drive_d_root
+        .map(std::path::Path::to_path_buf)
+        .or_else(wie_winapi::drive_d_from_env);
+    if let Some(root) = resolved_root.as_deref() {
+        // SAFETY: set before the guest thread or any session reads it.
+        unsafe { std::env::set_var("WIE_ROOT", root) };
+    }
+    if let Some(d) = resolved_drive_d.as_deref() {
+        // SAFETY: set before the guest thread or any session reads it.
+        unsafe { std::env::set_var("WIE_DRIVE_D", d) };
+    }
     let script_steps = match &input_script {
         Some(script_path) => Some(crate::gui::input_script::read_script(script_path)?),
         None => None,

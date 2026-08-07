@@ -196,7 +196,7 @@ fn main() -> Result<()> {
                         bail!("input script not found: {}", script.display());
                     }
                     let script = gui::input_script::script_path(input_script.as_deref());
-                    return gui::app::run_gui_windowed(&path, script);
+                    return gui::app::run_gui_windowed(&path, script, root.as_deref(), drive_d.as_deref());
                 }
                 if let Some(out_path) = screenshot {
                     return gui::headless::run_screenshot(&path, &out_path);
