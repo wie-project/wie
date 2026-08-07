@@ -22,6 +22,7 @@ use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 mod blend;
 mod buffer;
 mod device;
+mod draw;
 mod raster;
 mod shader;
 mod texture;

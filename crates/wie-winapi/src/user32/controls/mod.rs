@@ -100,6 +100,9 @@ use paint::write_control_text;
 // Re-exported for the dialog paint (the z-order-aware update-region clip
 // against windows composited above the painter).
 pub(crate) use paint::clip_rects_around_above;
+// The control invalidation helpers live in `paint` (the erase machinery and
+// the edit module reference them through the `controls` path).
+pub(crate) use paint::{invalidate, invalidate_and_request_paint, reset_edit_bands_in_subtree};
 // Re-exported for the host unit tests in `state/tests.rs` (the `edit` module
 // itself stays private to `controls`); test-only so the lib build has no
 // unused import.
@@ -600,57 +603,6 @@ impl ControlState {
         if let Self::Button { default_push, .. } = self {
             *default_push = value;
         }
-    }
-}
-
-/// Reset every EDIT's pending row band to Full in `root`'s window subtree.
-///
-/// The erase machinery (`user32::message::synth::erase_window_background`)
-/// calls this after a full-surface erase: the erase painted over the
-/// controls beneath the erased window, destroying their paint base, so an
-/// EDIT's band-limited repaint would leave the erased rows blank (the Go To
-/// line-N blank-rows bug). A full repaint is always correct; the band
-/// optimization is only valid while the surface base survives.
-pub(crate) fn reset_edit_bands_in_subtree(state: &mut WinApiState, root: u64) {
-    // Snapshot (handle, parent, kind) so the subtree walk does not borrow
-    // `state` mutably while the resets below do.
-    let snapshot: Vec<(u64, u64, Option<ControlClassKind>)> = state
-        .window_state()
-        .windows
-        .iter()
-        .map(|window| {
-            (
-                window.handle.as_u64(),
-                window.parent_handle.as_u64(),
-                window.control_kind,
-            )
-        })
-        .collect();
-    let edit_subtree: Vec<u64> = snapshot
-        .iter()
-        .filter(|(handle, _, kind)| {
-            *kind == Some(ControlClassKind::Edit) && {
-                // Is `root` an ancestor-or-self of this window?
-                let mut current = *handle;
-                loop {
-                    if current == root {
-                        break true;
-                    }
-                    let Some(&(_, next_parent, _)) = snapshot.iter().find(|(h, ..)| *h == current)
-                    else {
-                        break false;
-                    };
-                    if next_parent == 0 || next_parent == current {
-                        break false;
-                    }
-                    current = next_parent;
-                }
-            }
-        })
-        .map(|(handle, ..)| *handle)
-        .collect();
-    for hwnd in edit_subtree {
-        edit_reset_invalid_rows(state, hwnd);
     }
 }
 
@@ -1441,23 +1393,6 @@ fn control_sel_index(state: &WinApiState, hwnd: u64) -> i32 {
 }
 
 /// Mark a window for a future synthesized WM_PAINT.
-fn invalidate(state: &mut WinApiState, hwnd: u64) {
-    if let Some(window) = find_window_mut(state, hwnd) {
-        window.invalidated = true;
-    }
-}
-
-/// Mark a window for a future synthesized WM_PAINT and bump the owning
-/// top-level's content revision (the repaint latch) — the pair every control
-/// mutation's invalidation function ends with (the EDIT's row bands, the
-/// BUTTON/STATIC/LISTBOX rect scopes, the SETCURSEL/ADDSTRING arms). The
-/// window-layer callers that manage `invalidated` themselves keep calling
-/// `PresentState::request_paint` alone.
-fn invalidate_and_request_paint(state: &mut WinApiState, hwnd: u64) {
-    invalidate(state, hwnd);
-    crate::present::PresentState::request_paint(state, hwnd);
-}
-
 #[cfg(test)]
 mod tests {
     #[test]

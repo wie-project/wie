@@ -7,6 +7,9 @@
 mod names;
 pub use names::{is_winapi_implemented, resolve_winapi_id, winapi_id_export};
 
+mod traits;
+pub use traits::WinApiTraits;
+
 use crate::{
     HandlerContext, WinApiHandlerResult, advapi32, comctl32, comdlg32, d3d9, gdi32, kernel32,
     shell32, user32, uxtheme, version, winmm,
@@ -1323,83 +1326,6 @@ pub fn dispatch_winapi(
         return crate::mingw_dispatch::dispatch_stdcpp(ctx, name);
     }
     bail!("unsupported WinAPI call: {library}!{name}");
-}
-
-/// Fast classification for the runtime loop (no string compares per call).
-///
-/// Packed bitflags instead of four separate bools (avoids excessive-bools lint
-/// and keeps the hot-path struct one byte).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct WinApiTraits {
-    bits: u8,
-}
-
-impl WinApiTraits {
-    const NOISY: u8 = 1 << 0;
-    const FAST_VOID_SYNC: u8 = 1 << 1;
-    const EXIT_PROCESS: u8 = 1 << 2;
-    const GUEST_STUB: u8 = 1 << 3;
-
-    /// No flags set.
-    pub const EMPTY: Self = Self { bits: 0 };
-
-    #[must_use]
-    pub const fn with_noisy(self) -> Self {
-        Self {
-            bits: self.bits | Self::NOISY,
-        }
-    }
-    #[must_use]
-    pub const fn with_fast_void_sync(self) -> Self {
-        Self {
-            bits: self.bits | Self::FAST_VOID_SYNC,
-        }
-    }
-    #[must_use]
-    pub const fn with_exit_process(self) -> Self {
-        Self {
-            bits: self.bits | Self::EXIT_PROCESS,
-        }
-    }
-    #[must_use]
-    pub const fn with_guest_stub(self) -> Self {
-        Self {
-            bits: self.bits | Self::GUEST_STUB,
-        }
-    }
-
-    #[must_use]
-    pub const fn noisy(self) -> bool {
-        self.bits & Self::NOISY != 0
-    }
-    #[must_use]
-    pub const fn fast_void_sync(self) -> bool {
-        self.bits & Self::FAST_VOID_SYNC != 0
-    }
-    #[must_use]
-    pub const fn exit_process(self) -> bool {
-        self.bits & Self::EXIT_PROCESS != 0
-    }
-    #[must_use]
-    pub const fn guest_stub(self) -> bool {
-        self.bits & Self::GUEST_STUB != 0
-    }
-
-    pub fn set_noisy(&mut self, on: bool) {
-        if on {
-            self.bits |= Self::NOISY;
-        } else {
-            self.bits &= !Self::NOISY;
-        }
-    }
-
-    pub fn set_guest_stub(&mut self, on: bool) {
-        if on {
-            self.bits |= Self::GUEST_STUB;
-        } else {
-            self.bits &= !Self::GUEST_STUB;
-        }
-    }
 }
 
 /// Per-API trait flags indexed by [`WinApiId`] discriminant (zero-cost lookup).
