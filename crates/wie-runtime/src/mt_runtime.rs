@@ -189,6 +189,8 @@ fn join_workers_impl(winapi: &Arc<Mutex<WinApiState>>, joins: &mut Vec<JoinHandl
                         t.finish(1);
                     }
                 }
+                // File mappings hold no waiters; nothing to wake at teardown.
+                wie_winapi::KernelObject::FileMapping(_) => {}
             }
         }
     }

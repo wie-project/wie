@@ -79,3 +79,23 @@ fn test_drag_accept_files_sets_and_clears_accepts_drops_flag() {
         "FALSE must clear the drop-accept flag"
     );
 }
+
+/// `SHAddToRecentDocs(SHARD_PATHW, path)` (RNotepad's call after open/save)
+/// must record-and-return, never stop the session.
+#[test]
+fn test_sh_add_to_recent_docs_pathw_returns_without_error() {
+    use crate::guest_string::write_utf16_c_string;
+    let mut engine = test_engine();
+    let mut state = winapi_state_default();
+    let path_ptr = 0x3000;
+    write_utf16_c_string(&mut engine, path_ptr, 64, "C:\\tmp\\x.txt").ok();
+    // RCX = SHARD_PATHW (0x3), RDX = path pointer.
+    write_regs(&mut engine, 0x3, path_ptr, 0, 0, STACK_TOP);
+    let result = {
+        let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
+        shell32::dispatch_shell32(&mut ctx, "SHAddToRecentDocs")
+    }
+    .expect("dispatch failed")
+    .expect("handler not found");
+    assert_eq!(result.return_value, 0, "void return");
+}

@@ -62,7 +62,6 @@ the remaining notepad imports that would bail if called:
 | --- | --- |
 | `advapi32!IsTextUnicode` | encoding detect helper |
 | `kernel32!CreateFileMappingW` | MapViewOfFile/UnmapViewOfFile exist; the create-side is missing |
-| `shell32!SHAddToRecentDocs` | Recent-files list (called after open/save) |
 | `user32!WinHelpW`, `user32!wsprintfW` | minor/rare paths |
 | `msvcrt!_wcmdln`, `fgetwc`, `getc`, `iswctype`, `vfprintf` | legacy CRT exports not reached by notepad |
 

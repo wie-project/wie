@@ -1023,3 +1023,205 @@ fn test_set_file_valid_data_validates_handle() {
     assert_eq!(r.return_value, 0); // FALSE — invalid handle
     assert_eq!(state.process.last_error, 6);
 }
+
+/// CreateFileMappingW on an open handle must register a mapping object; a
+/// bogus handle must fail with ERROR_INVALID_HANDLE.
+#[test]
+fn test_create_file_mapping_w_registers_and_validates() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+
+    // Mount a real host file so CreateFileW can open it with content.
+    let host = std::env::temp_dir().join(format!("wie-map-unit-{}.txt", std::process::id()));
+    std::fs::write(&host, b"mapped bytes").expect("write host file");
+    // The standing "filesystem ⇒ bottle" policy: file ops require a bottle.
+    let bottle = std::env::temp_dir().join(format!("wie-map-unit-bottle-{}", std::process::id()));
+    std::fs::create_dir_all(bottle.join("drive_c")).expect("create bottle");
+    state.file_io.bottle_root = Some(bottle.clone());
+    state.file_io.volumes = VolumeConfig {
+        bottle_root: Some(bottle),
+        drive_d_root: None,
+    };
+    kernel32::mount_host_file(&mut state, r"C:\mapped.txt", &host).expect("mount");
+
+    // CreateFileW(C:\mapped.txt) → a valid open-file handle.
+    let name_ptr = 0x3000;
+    write_guest_utf16(&mut engine, name_ptr, r"C:\mapped.txt");
+    write_regs(&mut engine, name_ptr, 0x8000_0000, 0, 0, STACK_TOP); // GENERIC_READ
+    engine
+        .mem_write(STACK_TOP + 0x28, &3_u32.to_le_bytes())
+        .ok(); // OPEN_EXISTING
+    let opened = kernel32::handle_create_file_w(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("CreateFileW");
+    let file_handle = opened.return_value;
+    assert_ne!(file_handle, u64::MAX, "valid file handle");
+
+    // CreateFileMappingW(hFile, 0, PAGE_READONLY=2, 0, 0, 0): size 0 → file size.
+    write_regs(&mut engine, file_handle, 0, 2, 0, STACK_TOP);
+    engine
+        .mem_write(STACK_TOP + 0x28, &0_u64.to_le_bytes())
+        .ok(); // dwMaximumSizeLow
+    let mapped = kernel32::handle_create_file_mapping_w(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("CreateFileMappingW");
+    let mapping_handle = mapped.return_value;
+    assert_ne!(mapping_handle, 0, "mapping handle must be non-zero");
+
+    // The mapping object exists in the kernel table and carries the file size.
+    let kernel_object = state
+        .kernel
+        .sync
+        .object(mapping_handle)
+        .cloned()
+        .expect("mapping registered");
+    let crate::KernelObject::FileMapping(mapping) = kernel_object else {
+        panic!("expected a FileMapping kernel object");
+    };
+    assert_eq!(mapping.size, 12, "size matches the mounted file's bytes");
+    assert_eq!(mapping.guest_path, r"C:\mapped.txt");
+
+    // Bogus source handle → ERROR_INVALID_HANDLE.
+    write_regs(&mut engine, 0xDEAD_BEEF, 0, 2, 0, STACK_TOP);
+    engine
+        .mem_write(STACK_TOP + 0x28, &0_u64.to_le_bytes())
+        .ok();
+    let failed = kernel32::handle_create_file_mapping_w(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("CreateFileMappingW bogus");
+    assert_eq!(failed.return_value, 0, "bogus handle → NULL");
+    assert_eq!(state.process.last_error, 6, "ERROR_INVALID_HANDLE");
+
+    let _cleanup = std::fs::remove_file(&host);
+}
+
+/// The full read path: MapViewOfFile must copy the mapped file's bytes into a
+/// guest region the guest can read, and UnmapViewOfFile must free it.
+#[test]
+fn test_map_view_of_file_copies_bytes_into_guest_memory() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+
+    let host = std::env::temp_dir().join(format!("wie-mapview-unit-{}.txt", std::process::id()));
+    std::fs::write(&host, b"0123456789ab").expect("write host file");
+    let bottle =
+        std::env::temp_dir().join(format!("wie-mapview-unit-bottle-{}", std::process::id()));
+    std::fs::create_dir_all(bottle.join("drive_c")).expect("create bottle");
+    state.file_io.bottle_root = Some(bottle.clone());
+    state.file_io.volumes = VolumeConfig {
+        bottle_root: Some(bottle),
+        drive_d_root: None,
+    };
+    kernel32::mount_host_file(&mut state, r"C:\mapped.txt", &host).expect("mount");
+
+    // CreateFileW → handle.
+    let name_ptr = 0x3000;
+    write_guest_utf16(&mut engine, name_ptr, r"C:\mapped.txt");
+    write_regs(&mut engine, name_ptr, 0x8000_0000, 0, 0, STACK_TOP);
+    engine
+        .mem_write(STACK_TOP + 0x28, &3_u32.to_le_bytes())
+        .ok();
+    let opened = kernel32::handle_create_file_w(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("CreateFileW");
+    let file_handle = opened.return_value;
+
+    // CreateFileMappingW → mapping handle.
+    write_regs(&mut engine, file_handle, 0, 2, 0, STACK_TOP);
+    engine
+        .mem_write(STACK_TOP + 0x28, &0_u64.to_le_bytes())
+        .ok();
+    let mapped = kernel32::handle_create_file_mapping_w(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("CreateFileMappingW");
+    let mapping_handle = mapped.return_value;
+
+    // MapViewOfFile(mapping, FILE_MAP_READ=4, offsetHigh=0, offsetLow=0, 0=whole file).
+    write_regs(&mut engine, mapping_handle, 4, 0, 0, STACK_TOP);
+    engine
+        .mem_write(STACK_TOP + 0x28, &0_u64.to_le_bytes())
+        .ok(); // dwNumberOfBytesToMap
+    let view = kernel32::handle_map_view_of_file(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("MapViewOfFile");
+    let view_va = view.return_value;
+    assert_ne!(view_va, 0, "view must be a guest VA");
+
+    // The guest reads the mapped file's bytes at view_va.
+    let mut read_back = [0_u8; 12];
+    engine
+        .mem_read(view_va, &mut read_back)
+        .expect("read mapped view");
+    assert_eq!(
+        &read_back, b"0123456789ab",
+        "bytes copied into guest memory"
+    );
+
+    // A partial map at an offset reads the tail.
+    write_regs(&mut engine, mapping_handle, 4, 0, 4, STACK_TOP); // offset 4
+    engine
+        .mem_write(STACK_TOP + 0x28, &4_u64.to_le_bytes())
+        .ok(); // 4 bytes
+    let view2 = kernel32::handle_map_view_of_file(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("MapViewOfFile partial");
+    let view2_va = view2.return_value;
+    assert_ne!(view2_va, 0);
+    let mut tail = [0_u8; 4];
+    engine
+        .mem_read(view2_va, &mut tail)
+        .expect("read partial view");
+    assert_eq!(&tail, b"4567", "offset + length respected");
+
+    // UnmapViewOfFile frees both views.
+    write_regs(&mut engine, view_va, 0, 0, 0, STACK_TOP);
+    kernel32::handle_unmap_view_of_file(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("UnmapViewOfFile");
+    write_regs(&mut engine, view2_va, 0, 0, 0, STACK_TOP);
+    kernel32::handle_unmap_view_of_file(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("UnmapViewOfFile second");
+
+    // CloseHandle on the mapping removes the kernel object.
+    write_regs(&mut engine, mapping_handle, 0, 0, 0, STACK_TOP);
+    kernel32::handle_close_handle(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("CloseHandle mapping");
+    assert!(
+        state.kernel.sync.object(mapping_handle).is_none(),
+        "CloseHandle removes the mapping object"
+    );
+
+    let _cleanup = std::fs::remove_file(&host);
+}

@@ -157,11 +157,35 @@ impl SyncState {
         (handle_u64, obj)
     }
 
+    /// Register a file mapping (`CreateFileMappingW`).
+    ///
+    /// The mapping captures the mapped file's guest path and size; the actual
+    /// byte copy happens at `MapViewOfFile` time so the file can be re-read
+    /// after the source handle closes.
+    pub fn register_file_mapping(
+        &mut self,
+        guest_path: String,
+        size: u64,
+    ) -> (u64, Arc<FileMappingObject>) {
+        let handle = self.alloc_handle();
+        let handle_u64 = handle.as_u64();
+        let obj = Arc::new(FileMappingObject {
+            handle: handle_u64,
+            guest_path,
+            size,
+        });
+        self.objects
+            .insert(handle, KernelObject::FileMapping(Arc::clone(&obj)));
+        (handle_u64, obj)
+    }
+
     /// Look up a thread object by handle.
     pub fn thread_by_handle(&self, handle: u64) -> Option<Arc<ThreadObject>> {
         match self.objects.get(&KernelHandle::from(handle))? {
             KernelObject::Thread(t) => Some(Arc::clone(t)),
-            KernelObject::Event(_) | KernelObject::Semaphore(_) => None,
+            KernelObject::Event(_) | KernelObject::Semaphore(_) | KernelObject::FileMapping(_) => {
+                None
+            }
         }
     }
 
@@ -169,7 +193,6 @@ impl SyncState {
     pub fn object(&self, handle: u64) -> Option<&KernelObject> {
         self.objects.get(&KernelHandle::from(handle))
     }
-
     /// CS wait queue for guest VA (created on demand).
     pub fn cs_queue(&mut self, cs_va: u64) -> Arc<CsWaitQueue> {
         self.cs_waiters
@@ -210,6 +233,9 @@ pub enum KernelObject {
     Event(Arc<EventObject>),
     /// Counting semaphore.
     Semaphore(Arc<SemaphoreObject>),
+    /// A file mapping (`CreateFileMappingW`) — a snapshot of an open file's
+    /// bytes that `MapViewOfFile` copies into guest memory.
+    FileMapping(Arc<FileMappingObject>),
 }
 
 /// Guest thread waitable + exit state.
@@ -479,6 +505,20 @@ impl SemaphoreObject {
     }
 }
 
+/// A file-mapping object (`CreateFileMappingW`).
+///
+/// Carries the mapped file's guest path and size so `MapViewOfFile` can copy
+/// its bytes into guest memory. Not waitable (Windows maps never are).
+#[derive(Debug)]
+pub struct FileMappingObject {
+    /// Kernel handle.
+    pub handle: u64,
+    /// The mapped file's guest path (`C:\...` / `Z:\pick{N}\...`).
+    pub guest_path: String,
+    /// Mapped size in bytes (the file size at creation).
+    pub size: u64,
+}
+
 /// Wait queue for one guest critical section VA.
 #[derive(Debug)]
 pub struct CsWaitQueue {
@@ -686,6 +726,8 @@ impl SyncState {
             KernelObject::Thread(t) => Some(WaitTarget::Thread(Arc::clone(t))),
             KernelObject::Event(e) => Some(WaitTarget::Event(Arc::clone(e))),
             KernelObject::Semaphore(s) => Some(WaitTarget::Semaphore(Arc::clone(s))),
+            // File mappings are not waitable.
+            KernelObject::FileMapping(_) => None,
         }
     }
 

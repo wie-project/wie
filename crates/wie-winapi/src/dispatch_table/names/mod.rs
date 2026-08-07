@@ -167,7 +167,10 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
         let n = name.to_ascii_lowercase();
         return matches!(
             n.as_str(),
-            "shgetfolderpathw" | "shgetpathfromidlistw" | "shbrowseforfolderw"
+            "shgetfolderpathw"
+                | "shgetpathfromidlistw"
+                | "shbrowseforfolderw"
+                | "shaddtorecentdocs"
         );
     }
     if library.eq_ignore_ascii_case("oleaut32.dll") {
@@ -285,6 +288,7 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
                 | "deviceiocontrol"
                 | "mapviewoffile"
                 | "unmapviewoffile"
+                | "createfilemappingw"
                 | "openfilemappingw"
                 | "openfilemappinga"
         );

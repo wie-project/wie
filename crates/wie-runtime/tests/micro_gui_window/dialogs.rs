@@ -918,6 +918,236 @@ fn notepad_font_dialog_ok_click_then_first_exit_exits() {
     );
 }
 
+/// REPRO: the native-bridge Save flow (the crash seam). RNotepad's
+/// File→Save As → GetSaveFileNameW with a scripted NATIVE bridge picking an
+/// OUT-OF-BOTTLE host file: the accept registers a pick-mount
+/// (`Z:\pick1\{name}`), writes it back into `lpstrFile`, finishes the modal
+/// frame, and the guest then re-opens the returned path with
+/// CreateFileW/WriteFile. This is the reported crash: the session must
+/// complete the save (file created on the pick path, session keeps running)
+/// instead of dying right after the frame's "depth down".
+#[test]
+fn notepad_file_save_native_bridge_accept_completes_save_flow() {
+    let Some(path) = real_exe("notepad.exe") else {
+        eprintln!("skip: real_exes/notepad.exe not present");
+        return;
+    };
+    let _suite = gui_suite_serialize();
+    use wie_runtime::EntryTraceTermination;
+
+    const WM_COMMAND: u32 = 0x0111;
+    const WM_CHAR: u32 = 0x0102;
+    const CMD_SAVE: u32 = 259;
+
+    // A temp bottle (the standing "filesystem ⇒ bottle" policy) plus an
+    // OUT-OF-BOTTLE pick target: the native panel pick lands outside the
+    // guest volumes, so the accept registers a pick-mount and returns the
+    // mounted guest path (`Z:\pick{N}\...`) — the exact seam in the trace.
+    let bottle =
+        std::env::temp_dir().join(format!("wie-ofn-bridge-save-bottle-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(bottle.join("drive_c"));
+    let picked_host = std::env::temp_dir().join(format!(
+        "wie-ofn-bridge-save-picked-{}.txt",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&picked_host);
+
+    let mut session =
+        wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
+            .expect("notepad session starts");
+    session.set_bottle_root(Some(bottle.clone()));
+    session.set_file_dialog_policy(wie_winapi::FileDialogPolicy::Interactive);
+    let handle = session.guest_handle();
+    let picked = picked_host.clone();
+    handle.set_file_dialog_bridge(Box::new(move |request| {
+        assert!(
+            request.is_save,
+            "CMD_SAVE on an untitled doc opens a Save panel"
+        );
+        Some(wie_winapi::FileDialogPick {
+            host_path: picked.clone(),
+        })
+    }));
+    pump_until_windows_ready(&mut session);
+
+    let main = session.first_guest_window_handle().unwrap_or(0);
+    let edit = session
+        .guest_windows_snapshot()
+        .iter()
+        .find(|(_, cls, ..)| cls == "EDIT")
+        .map(|(h, ..)| *h)
+        .unwrap_or(main);
+    // Type text so the save writes something, then trigger File→Save.
+    for c in "save me".chars() {
+        handle.post_message(edit, WM_CHAR, u64::from(c as u32), 0);
+    }
+    for _ in 0..30 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    handle.post_message(main, WM_COMMAND, u64::from(CMD_SAVE), 0);
+
+    // Drive the save flow to completion: the accept → pick-mount → guest
+    // CreateFileW/WriteFile/CloseHandle chain must finish without the
+    // session stopping (the reported crash dies right after the frame's
+    // "depth down").
+    let mut session_alive = true;
+    let mut stop_message = String::new();
+    let mut api_sequence: Vec<String> = Vec::new();
+    for _ in 0..200 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        for event in &summary.events {
+            api_sequence.push(format!(
+                "{}!{} handled={} ret={:?}",
+                event.library, event.name, event.handled, event.return_value
+            ));
+        }
+        match summary.termination {
+            EntryTraceTermination::ExitProcess { .. } => break,
+            EntryTraceTermination::WaitingForMessage => {
+                // The save flow wrote the file once the guest idles again;
+                // keep pumping a bounded time for the write-back to land.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            EntryTraceTermination::RuntimeStop(message) => {
+                session_alive = false;
+                stop_message = message.clone();
+                eprintln!("DIAG SAVE RuntimeStop: {message}");
+                break;
+            }
+            EntryTraceTermination::UnsupportedApi(message) => {
+                session_alive = false;
+                stop_message = message.clone();
+                eprintln!("DIAG SAVE UnsupportedApi: {message}");
+                break;
+            }
+            other => {
+                eprintln!("DIAG SAVE other: {other:?}");
+            }
+        }
+        if picked_host.is_file() {
+            break;
+        }
+    }
+
+    assert!(
+        picked_host.is_file(),
+        "the Save flow must create the REAL host file at the picked location \
+         (the guest's CreateFileW/WriteFile on the mounted path); \
+         session_alive={session_alive} stop={stop_message}\napi sequence:\n{}",
+        api_sequence.join("\n")
+    );
+    assert!(
+        session_alive,
+        "the native-bridge Save flow must not stop the session (the reported \
+         crash dies right after the accept + frame finish); stop={stop_message}"
+    );
+    let _ = std::fs::remove_file(&picked_host);
+    let _ = std::fs::remove_dir_all(&bottle);
+}
+
+/// REPRO: the native-bridge OPEN flow. RNotepad's File→Open with a scripted
+/// NATIVE bridge picking an OUT-OF-BOTTLE host file must read the REAL file
+/// through the pick-mount and keep the session alive — the reported crash
+/// family is Open/Save, and this pins the Open side of the seam.
+#[test]
+fn notepad_file_open_native_bridge_accept_reads_picked_file() {
+    let Some(path) = real_exe("notepad.exe") else {
+        eprintln!("skip: real_exes/notepad.exe not present");
+        return;
+    };
+    let _suite = gui_suite_serialize();
+    use wie_runtime::EntryTraceTermination;
+
+    const WM_COMMAND: u32 = 0x0111;
+    const CMD_OPEN: u32 = 258;
+
+    let bottle =
+        std::env::temp_dir().join(format!("wie-ofn-bridge-open-bottle-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(bottle.join("drive_c"));
+    let picked_host = std::env::temp_dir().join(format!(
+        "wie-ofn-bridge-open-picked-{}.txt",
+        std::process::id()
+    ));
+    let original = b"hello from the picked host file";
+    std::fs::write(&picked_host, original).expect("seed the picked file");
+
+    let mut session =
+        wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
+            .expect("notepad session starts");
+    session.set_bottle_root(Some(bottle.clone()));
+    session.set_file_dialog_policy(wie_winapi::FileDialogPolicy::Interactive);
+    let handle = session.guest_handle();
+    let picked = picked_host.clone();
+    handle.set_file_dialog_bridge(Box::new(move |request| {
+        assert!(!request.is_save, "CMD_OPEN opens an Open panel");
+        Some(wie_winapi::FileDialogPick {
+            host_path: picked.clone(),
+        })
+    }));
+    pump_until_windows_ready(&mut session);
+
+    let main = session.first_guest_window_handle().unwrap_or(0);
+    handle.post_message(main, WM_COMMAND, u64::from(CMD_OPEN), 0);
+
+    let mut session_alive = true;
+    let mut stop_message = String::new();
+    let mut api_sequence: Vec<String> = Vec::new();
+    for _ in 0..200 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        for event in &summary.events {
+            api_sequence.push(format!(
+                "{}!{} handled={} ret={:?}",
+                event.library, event.name, event.handled, event.return_value
+            ));
+        }
+        match summary.termination {
+            EntryTraceTermination::ExitProcess { .. } => break,
+            EntryTraceTermination::WaitingForMessage => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            EntryTraceTermination::RuntimeStop(message) => {
+                session_alive = false;
+                stop_message = message.clone();
+                eprintln!("DIAG OPEN RuntimeStop: {message}");
+                break;
+            }
+            EntryTraceTermination::UnsupportedApi(message) => {
+                session_alive = false;
+                stop_message = message.clone();
+                eprintln!("DIAG OPEN UnsupportedApi: {message}");
+                break;
+            }
+            other => {
+                eprintln!("DIAG OPEN other: {other:?}");
+            }
+        }
+    }
+
+    assert!(
+        session_alive,
+        "the native-bridge OPEN flow must not stop the session (the reported \
+         crash family is Open/Save); stop={stop_message}\napi sequence:\n{}",
+        api_sequence.join("\n")
+    );
+    // The opened file's content must have landed in the main EDIT (the guest
+    // reads it through the CreateFileMappingW → MapViewOfFile view): the
+    // window title (SetWindowTextW) carries the picked file's name.
+    assert!(
+        session
+            .guest_windows_snapshot()
+            .iter()
+            .any(|(_, _, title, _)| title.to_lowercase().contains("pick")),
+        "the OPEN flow must load the picked file (the title carries its name); \
+         api sequence:\n{}",
+        api_sequence.join("\n")
+    );
+    let _ = std::fs::remove_file(&picked_host);
+    let _ = std::fs::remove_dir_all(&bottle);
+}
+
 /// The New-flow continuation, end to end: type into the EDIT (dirty doc),
 /// post File→New (CMD_NEW=256), answer the save prompt with "Don't Save"
 /// (IDNO — the discard path), and assert the EDIT is CLEARED and the repaint

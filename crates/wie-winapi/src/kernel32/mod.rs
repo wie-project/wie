@@ -489,6 +489,7 @@ pub fn dispatch_kernel32_extra(
         "deviceiocontrol" => Ok(Some(handle_device_io_control(ctx)?)),
         "mapviewoffile" => Ok(Some(handle_map_view_of_file(ctx)?)),
         "unmapviewoffile" => Ok(Some(handle_unmap_view_of_file(ctx)?)),
+        "createfilemappingw" => Ok(Some(handle_create_file_mapping_w(ctx)?)),
         "openfilemappingw" | "openfilemappinga" => Ok(Some(handle_open_file_mapping(ctx)?)),
         // Mock-data stubs
         "isdebuggerpresent" => Ok(Some(handle_is_debugger_present(ctx)?)),

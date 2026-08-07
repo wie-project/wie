@@ -649,6 +649,7 @@ pub(crate) fn handle_wait_for_single_object(
             }
             Some(crate::KernelObject::Event(e)) => format!("Event(manual={})", e.manual_reset),
             Some(crate::KernelObject::Semaphore(_)) => "Sem".into(),
+            Some(crate::KernelObject::FileMapping(_)) => "Map".into(),
             None => "INVALID".into(),
         };
         tracing::error!(
@@ -680,6 +681,11 @@ pub(crate) fn handle_wait_for_single_object(
                 state.process.last_error = 0;
                 return ctx.finish(u64::from(crate::WAIT_OBJECT_0));
             }
+        }
+        // File mappings are not waitable: treat like an invalid wait handle.
+        Some(crate::KernelObject::FileMapping(_)) => {
+            state.process.last_error = ERROR_INVALID_HANDLE;
+            return ctx.finish(u64::from(crate::WAIT_FAILED));
         }
         None => {
             state.process.last_error = ERROR_INVALID_HANDLE;

@@ -20,6 +20,11 @@ const SE_ERR_FNF: u64 = 2;
 /// `SE_ERR_NOASSOC` — no application is associated with the operation.
 const SE_ERR_NOASSOC: u64 = 31;
 
+/// `SHAddToRecentDocs` `uFlags` values (shlobj_core.h): the pointer's shape.
+const SHARD_PIDL: u64 = 0x1;
+const SHARD_PATHA: u64 = 0x2;
+const SHARD_PATHW: u64 = 0x3;
+
 fn finish(engine: &mut dyn wie_cpu::CpuEngine, value: u64) -> Result<WinApiHandlerResult> {
     let return_address = engine
         .return_from_win64_api(value)
@@ -28,6 +33,38 @@ fn finish(engine: &mut dyn wie_cpu::CpuEngine, value: u64) -> Result<WinApiHandl
         return_address,
         return_value: value,
     })
+}
+
+/// `SHAddToRecentDocs(uFlags, lpName)` — records a file in the shell's
+/// recent-documents list. WIE has no recent-docs UI, so the honest
+/// implementation validates the arguments and no-ops; the call must not stop
+/// the session (RNotepad calls it after every open/save). Returns void.
+fn handle_sh_add_to_recent_docs(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let flags = engine
+        .read_rcx()
+        .context("failed to read RCX for SHAddToRecentDocs")?;
+    let name_ptr = engine
+        .read_rdx()
+        .context("failed to read RDX for SHAddToRecentDocs")?;
+    match flags {
+        // A PIDL (item id list) — unparsed; nothing to record.
+        SHARD_PIDL => {}
+        // ANSI path.
+        SHARD_PATHA => {
+            if let Ok(name) = crate::guest_string::read_arg_string(engine, name_ptr, false) {
+                tracing::debug!(recent_doc = %name, "SHAddToRecentDocs");
+            }
+        }
+        // Wide path (RNotepad's call).
+        SHARD_PATHW => {
+            if let Ok(name) = crate::guest_string::read_arg_string(engine, name_ptr, true) {
+                tracing::debug!(recent_doc = %name, "SHAddToRecentDocs");
+            }
+        }
+        _ => {}
+    }
+    finish(engine, 0)
 }
 
 /// Soft dispatch for `shell32.dll`.
@@ -41,6 +78,7 @@ pub fn dispatch_shell32(
         "shgetpathfromidlistw" => Ok(Some(handle_sh_get_path_from_id_list_w(ctx)?)),
         "shbrowseforfolderw" => Ok(Some(handle_sh_browse_for_folder_w(ctx)?)),
         "commandlinetoargvw" => Ok(Some(handle_command_line_to_argv_w(ctx)?)),
+        "shaddtorecentdocs" => Ok(Some(handle_sh_add_to_recent_docs(ctx)?)),
         _ => Ok(None),
     }
 }
