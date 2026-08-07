@@ -756,6 +756,18 @@ fn destroy_find_dialog(state: &mut WinApiState, session: &FindDialogSession) {
     // owner frame. Mark the owner's whole remaining subtree invalidated: the
     // next empty GetMessage repaints the owner + controls over the stale face
     // (mirrors the font-dialog open pattern at comdlg32/font.rs).
+    //
+    // The owner's OWN WM_PAINT is not enough on its own: the paint synthesizer
+    // only picks windows whose `visible` flag is set, and a top-level created
+    // WITHOUT `WS_VISIBLE` (RNotepad's main window — it shows its children,
+    // not itself) never repaints through the synthesizer. The window that
+    // actually sits BENEATH the dialog in the owner surface — the main EDIT —
+    // must erase the vacated rect. An EDIT repaints only its pending row band
+    // (a caret blink leaves a 1-row band), so the band is reset to FULL: the
+    // edit's next synthesized WM_PAINT repaints its whole client, covering the
+    // dialog's face. This is the "Cancel takes two clicks" fix — the first
+    // click closed the dialog but the face stayed in the frame until an
+    // unrelated repaint hid it.
     let owner_handle = Hwnd::from(session.owner_hwnd);
     if owner_handle != Hwnd::NULL {
         let pairs: Vec<(Hwnd, Hwnd)> = state
@@ -774,11 +786,16 @@ fn destroy_find_dialog(state: &mut WinApiState, session: &FindDialogSession) {
                 }
             })
             .collect();
-        for hwnd in owner_subtree {
+        for hwnd in &owner_subtree {
             if let Some(window) = find_window_mut(state, hwnd.as_u64()) {
                 window.invalidated = true;
             }
         }
+        // The band reset MUST follow the invalidation: a full band on a window
+        // that never repaints is as dead as the owner's own flag; the reset
+        // converts the edit's pending narrow band (which a caret blink or
+        // EM_SETSEL left behind) into the full repaint the vacated face needs.
+        crate::user32::controls::reset_edit_bands_in_subtree(state, owner_handle.as_u64());
     }
     tracing::info!(
         target: "wiegui",
@@ -811,7 +828,7 @@ fn window_handle_in_subtree(pairs: &[(Hwnd, Hwnd)], handle: Hwnd, root: Hwnd) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_find_dialog_command, handle_find_text_w, handle_replace_text_w,
+        create_find_control, handle_find_dialog_command, handle_find_text_w, handle_replace_text_w,
         is_find_dialog_window,
     };
     use crate::comdlg32::test_support::{
@@ -819,7 +836,9 @@ mod tests {
         test_state, utf16_bytes, write_regs,
     };
     use crate::handles::Hwnd;
-    use crate::user32::{BN_CLICKED, find_window, find_window_mut, make_command_wparam};
+    use crate::user32::{
+        BN_CLICKED, WindowClassIdentifier, find_window, find_window_mut, make_command_wparam,
+    };
     use crate::{HandlerContext, WinApiState};
     use wie_cpu::{CpuEngine, IcedCpu};
 
@@ -1079,6 +1098,85 @@ mod tests {
                 .windows
                 .iter()
                 .all(|w| w.handle.as_u64() != dialog_hwnd)
+        );
+    }
+
+    /// The stale-face regression at the unit level: closing a find dialog must
+    /// reset every EDIT's pending row band in the owner subtree to a FULL
+    /// repaint. The dialog composites into the owner surface (it has no winit
+    /// window of its own); the EDIT beneath it erases the vacated face ONLY if
+    /// its next paint covers the whole client — a pending caret-row band would
+    /// leave the face in the frame (the "Cancel takes two clicks" symptom: the
+    /// first click closes the dialog but the pixels stay until an unrelated
+    /// repaint).
+    #[test]
+    fn cancel_resets_owner_edit_bands_to_full() {
+        use crate::user32::controls::{ControlClassKind, ControlState, EditInvalidation};
+
+        let mut engine = test_engine();
+        let mut state = test_state();
+        let owner_hwnd = create_owner_window(&mut state);
+        // An EDIT child of the owner — the window that sits beneath the dialog
+        // in the owner surface (the dialog overlaps it).
+        let owner_edit = create_find_control(
+            &mut state,
+            owner_hwnd,
+            WindowClassIdentifier::Atom(0x0081),
+            String::new(),
+            0,
+            0,
+            0,
+            0,
+            800,
+            600,
+        )
+        .expect("owner edit created");
+        // Seed a narrow pending band — what a caret blink / EM_SETSEL leaves
+        // behind — so a pre-fix close would repaint only that row.
+        if let ControlState::Edit { invalid_rows, .. } = state
+            .window_state()
+            .control_states
+            .entry(Hwnd::from(owner_edit))
+            .or_insert_with(|| ControlClassKind::Edit.new_state())
+        {
+            *invalid_rows = EditInvalidation::Band(crate::user32::controls::EditInvalidRows {
+                lo: 3,
+                hi: 3,
+                wrap_width: 100,
+            });
+        }
+
+        let dialog_hwnd = open_find_dialog(&mut engine, &mut state, owner_hwnd, false);
+        let cancel_hwnd = state
+            .window_state()
+            .windows
+            .iter()
+            .find(|w| w.menu_handle == u64::from(super::FIND_DLG_CANCEL_ID))
+            .expect("Cancel button")
+            .handle
+            .as_u64();
+        handle_find_dialog_command(
+            &mut engine,
+            &mut state,
+            dialog_hwnd,
+            make_command_wparam(u64::from(super::FIND_DLG_CANCEL_ID), BN_CLICKED),
+            cancel_hwnd,
+        )
+        .expect("Cancel handled");
+
+        let band = match state
+            .window_state()
+            .control_states
+            .get(&Hwnd::from(owner_edit))
+        {
+            Some(ControlState::Edit { invalid_rows, .. }) => *invalid_rows,
+            _ => panic!("owner edit state must survive the dialog close"),
+        };
+        assert_eq!(
+            band,
+            EditInvalidation::Full,
+            "the owner EDIT's band must reset to Full so its next paint \
+             covers the dialog's vacated rect"
         );
     }
 

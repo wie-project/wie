@@ -29,6 +29,9 @@ const FIND_DLG_BTN_X: i32 = 244;
 const FIND_DLG_FIELD_X: i32 = 92;
 const FIND_DLG_REPLACE_BTN_Y: i32 = 38;
 const FIND_DLG_CANCEL_FIND_Y: i32 = 40;
+/// Replace mode stacks the command buttons: Find Next (8), Replace (38),
+/// Replace All (68), Cancel (98) — mirror comdlg32/find.rs `cancel_y`.
+const FIND_DLG_CANCEL_REPLACE_Y: i32 = 98;
 const FIND_DLG_BTN_W: i32 = 88;
 const FIND_DLG_BTN_H: i32 = 26;
 
@@ -291,6 +294,136 @@ fn cancel_removes_dialog_pixels_from_owner_frame() {
         frame_face < 1000,
         "the owner frame must drop the dialog's pixels after Cancel \
          (stale-face bug): got {frame_face}"
+    );
+}
+
+/// LIVE-BUG regression: ONE click on the REPLACE dialog's Cancel must close it.
+///
+/// Reported: "Cancel in the Replace dialog takes two clicks — the first does
+/// not close it." The Find dialog's single-click close is covered above; the
+/// Replace dialog is TALLER (190 vs 150) and stacks a fourth button row
+/// (Cancel at dialog-client y=98), so its click path is independently pinned
+/// here. Dialog-gone after ONE Cancel click is the pass signal.
+#[test]
+fn replace_cancel_closes_dialog_in_one_click() {
+    let Some(path) = real_exe("notepad.exe") else {
+        eprintln!("skip: real_exes/notepad.exe not present");
+        return;
+    };
+    let _suite = gui_suite_serialize();
+    use wie_runtime::EntryTraceTermination;
+
+    let mut session =
+        wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
+            .expect("notepad session starts");
+    let handle = session.guest_handle();
+    pump_until_windows_ready(&mut session);
+
+    let main = session.first_guest_window_handle().unwrap_or(0);
+    assert_ne!(main, 0, "notepad main window exists");
+    let (_, _, w, h) = handle
+        .first_guest_window_info()
+        .unwrap_or((0, String::new(), 0, 0));
+    let (dx, dy) = (
+        w.saturating_sub(FIND_DLG_CX) / 2,
+        h.saturating_sub(FIND_DLG_CY_REPLACE) / 2,
+    );
+    // Dialog-face pixel count inside the dialog rect of the owner frame
+    // (COLOR_BTNFACE) — the stale-face oracle from cancel_removes_dialog_pixels.
+    let face_count = |session: &wie_runtime::RuntimeSession| -> u32 {
+        let Some(frame) = session.take_frame(main) else {
+            return 0;
+        };
+        let mut n = 0_u32;
+        for py in dy..(dy + FIND_DLG_CY_REPLACE) {
+            for px in dx..(dx + FIND_DLG_CX) {
+                if frame
+                    .pixels
+                    .get(py as usize * frame.width as usize + px as usize)
+                    .is_some_and(|&p| p & 0x00FF_FFFF == 0x00F0_F0F0)
+                {
+                    n = n.saturating_add(1);
+                }
+            }
+        }
+        n
+    };
+
+    // Open the modeless Replace dialog (Search → Replace = 0x122).
+    handle.post_message(main, WM_COMMAND, u64::from(CMD_REPLACE), 0);
+    let mut dialog = 0;
+    let mut face_visible = false;
+    for _ in 0..150 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        if let Some(hwnd) = session
+            .guest_windows_snapshot()
+            .iter()
+            .find(|(_, cls, ..)| cls == "FindDialog")
+            .map(|(h, ..)| *h)
+        {
+            dialog = hwnd;
+        }
+        if dialog != 0 && face_count(&session) > 1000 {
+            face_visible = true;
+            break;
+        }
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    assert_ne!(dialog, 0, "replace dialog opens");
+    assert!(
+        face_visible,
+        "replace dialog face is composited in the owner frame"
+    );
+
+    // Settle for a few caret-blink periods (the live interaction: the user
+    // reads the dialog before clicking Cancel). The main EDIT's pending row
+    // band narrows to the caret row — without the destroy-time band reset the
+    // edit's post-close repaint would skip the dialog's vacated region and the
+    // face would stay in the frame (the "Cancel takes two clicks" symptom).
+    for _ in 0..30 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    // ONE click on Cancel (replace-mode layout: (244, 98) 88x26).
+    let (cx, cy) = (
+        dx + FIND_DLG_BTN_X + FIND_DLG_BTN_W / 2,
+        dy + FIND_DLG_CANCEL_REPLACE_Y + FIND_DLG_BTN_H / 2,
+    );
+    let (cancel_hwnd, _, _) = handle
+        .window_at(cx, cy)
+        .expect("Cancel button is hit-testable at its center");
+    let lparam = u64::from((cy << 16 | cx) as u32);
+    handle.post_message_at(cancel_hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lparam, cx, cy);
+    handle.post_message_at(cancel_hwnd, WM_LBUTTONUP, 0, lparam, cx, cy);
+
+    // Pump until the dialog is destroyed — must close after ONE click.
+    let mut closed = false;
+    let mut frame_face = u32::MAX;
+    for _ in 0..150 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        if !session
+            .guest_windows_snapshot()
+            .iter()
+            .any(|(_, cls, ..)| cls == "FindDialog")
+        {
+            closed = true;
+            frame_face = face_count(&session);
+            break;
+        }
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    assert!(closed, "ONE click on Cancel closes the replace dialog");
+    assert!(
+        frame_face < 1000,
+        "the owner frame must drop the replace dialog's pixels after ONE Cancel \
+         click (stale-face bug): got {frame_face}"
     );
 }
 
