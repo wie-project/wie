@@ -239,6 +239,19 @@ impl ModalFrame {
         }
         invalidate_subtree(state, owner);
 
+        // A top-level created WITHOUT `WS_VISIBLE` (RNotepad's main window —
+        // it shows its children, not itself) never repaints through the paint
+        // synthesizer, so the owner's own erase can never cover the modal's
+        // vacated face. The window that actually sits BENEATH the dialog in
+        // the owner surface — the main EDIT — must repaint over it, and an
+        // EDIT repaints only its pending row band (a caret blink leaves a
+        // 1-row band). Reset every EDIT in the owner subtree to a FULL
+        // repaint so the next synthesized WM_PAINT covers the whole client —
+        // the "Cancel takes two clicks" fix (mirrors comdlg32/find.rs): the
+        // first click closed the dialog but its face stayed in the frame
+        // until an unrelated repaint hid it.
+        crate::user32::controls::reset_edit_bands_in_subtree(state, owner.as_u64());
+
         // Defensive, symmetric with activate's first-paint invalidation: any
         // modal window that survived its family's teardown tail (a future closer
         // that forgets to remove the subtree) still ends invalidated instead of

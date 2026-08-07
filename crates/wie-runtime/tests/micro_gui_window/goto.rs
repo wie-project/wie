@@ -13,6 +13,12 @@
 
 use crate::helpers::{gui_suite_serialize, pump_until_windows_ready, real_exe};
 
+/// The Go To dialog template (RT_DIALOG 0x207) is 165x50 DLUs → 330x100 px.
+/// `center_in_owner` centers it over the owner client, so its face rect in
+/// the owner surface is `((w-330)/2, (h-100)/2, 330, 100)`.
+const GOTO_DLG_CX: i32 = 330;
+const GOTO_DLG_CY: i32 = 100;
+
 /// Post `WM_COMMAND(CMD_GOTO)` to notepad's main window, then assert the
 /// whole flow: a Dialog window appears (not the synthesized fallback — it
 /// must carry the EDIT + OK/Cancel children from the RT_DIALOG template),
@@ -231,6 +237,331 @@ fn goto_dialog_resolves_edit_and_moves_the_caret() {
         caret_on_line_two,
         "Go To line 2 must move the main EDIT's caret to index 9 (start of \
          line two) via EM_LINEINDEX+EM_SETSEL+EM_SCROLLCARET"
+    );
+}
+
+/// LIVE-symptom regression: ONE real mouse click on the Go To dialog's Cancel
+/// button must close the dialog.
+///
+/// Reported live: clicking Cancel needs TWO clicks — the first click appears
+/// to leave the dialog open. The dialog window IS removed on the first click,
+/// but its face stays composited in the owner frame: RNotepad's main window is
+/// created WITHOUT `WS_VISIBLE` (it shows its children, not itself), so the
+/// paint synthesizer never picks it for the erase, and the main EDIT beneath
+/// the dialog repaints only its pending row band — a full repaint would cover
+/// the vacated face, a narrow band (the last keystroke's row) does not. The
+/// user sees the dialog and clicks again; the second click lands on the now
+/// exposed EDIT, whose caret-placement repaint finally hides the stale face.
+#[test]
+fn goto_cancel_click_closes_dialog_on_first_click() {
+    let Some(path) = real_exe("notepad.exe") else {
+        eprintln!("skip: real_exes/notepad.exe not present");
+        return;
+    };
+    // Serialized suite: see GUI_SUITE_LOCK.
+    let _suite = gui_suite_serialize();
+    use wie_runtime::EntryTraceTermination;
+
+    const WM_COMMAND: u32 = 0x0111;
+    const WM_CHAR: u32 = 0x0102;
+    const WM_LBUTTONDOWN: u32 = 0x0201;
+    const WM_LBUTTONUP: u32 = 0x0202;
+    const MK_LBUTTON: u64 = 0x0001;
+
+    let mut session =
+        wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
+            .expect("notepad session starts");
+    let handle = session.guest_handle();
+    pump_until_windows_ready(&mut session);
+
+    let main = session.first_guest_window_handle().unwrap_or(0);
+    assert_ne!(main, 0, "notepad main window exists");
+    let tree = handle.window_menu_items();
+    let goto_id = tree
+        .iter()
+        .flat_map(|top| top.children.iter())
+        .find(|child| child.title.to_lowercase().contains("go to"))
+        .map(|child| child.id)
+        .unwrap_or(0);
+    assert_ne!(goto_id, 0, "the Edit menu must contain a Go To command");
+
+    // The live flow: the user TYPES in the main EDIT first, which leaves a
+    // narrow pending row band (not a full repaint). After the modal close the
+    // edit's next synthesized WM_PAINT must still cover the vacated dialog
+    // face — a band-limited repaint leaves it in the frame.
+    let main_edit = session
+        .guest_windows_snapshot()
+        .iter()
+        .find(|(_, cls, ..)| cls == "EDIT")
+        .map(|(h, ..)| *h)
+        .unwrap_or(main);
+    assert_ne!(main_edit, 0, "notepad main EDIT exists");
+    for c in "line one".chars() {
+        handle.post_message(main_edit, WM_CHAR, u64::from(c as u32), 0);
+    }
+    handle.post_message(main_edit, WM_CHAR, 0x0D, 0); // Enter → '\n'
+    for c in "line two".chars() {
+        handle.post_message(main_edit, WM_CHAR, u64::from(c as u32), 0);
+    }
+    for _ in 0..10 {
+        let summary = session.run_until_stop(1_000_000).expect("run after typing");
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    // Open the Go To dialog and wait for its controls.
+    handle.post_message(main, WM_COMMAND, u64::from(goto_id), 0);
+    let mut dialog_hwnd = 0_u64;
+    for _ in 0..200 {
+        let summary = session
+            .run_until_stop(1_000_000)
+            .expect("run after CMD_GOTO");
+        if matches!(
+            summary.termination,
+            EntryTraceTermination::ExitProcess { .. }
+        ) {
+            panic!("notepad exited while the Go To dialog should be open");
+        }
+        if let Some((dhwnd, ..)) = session
+            .guest_windows_snapshot()
+            .iter()
+            .find(|(_, cls, ..)| cls == "Dialog")
+        {
+            dialog_hwnd = *dhwnd;
+        }
+        if dialog_hwnd != 0 && dialog_edit(&session, dialog_hwnd) != 0 {
+            break;
+        }
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    assert_ne!(dialog_hwnd, 0, "CMD_GOTO must open a Dialog window");
+
+    let cancel_hwnd = session
+        .guest_windows_snapshot()
+        .iter()
+        .find(|(_, cls, title, _)| cls == "#128" && title == "Cancel")
+        .map(|(h, ..)| *h)
+        .unwrap_or(0);
+    assert_ne!(cancel_hwnd, 0, "the Go To dialog must have a Cancel button");
+
+    // Leave a NARROW pending row band on the main EDIT while the dialog is
+    // open: a live user's last keystroke before the Cancel click lands exactly
+    // here. A band-limited repaint after the close would leave the vacated
+    // dialog face in the frame (the "Cancel takes two clicks" symptom), so the
+    // close must force the edit's next paint to cover the whole client.
+    handle.post_message(main_edit, WM_CHAR, u64::from('x' as u32), 0);
+    for _ in 0..3 {
+        let _ = session
+            .run_until_stop(1_000_000)
+            .expect("run after band set");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // The Go To dialog template is 330x100 DLU→px, centered over the owner
+    // client. The owner's status bar is ALSO COLOR_BTNFACE-gray, so the
+    // stale-face oracle must count gray pixels ONLY inside the dialog's rect
+    // (the status bar band would otherwise pollute the count).
+    let (_, _, win_w, win_h) = handle
+        .first_guest_window_info()
+        .unwrap_or((0, String::new(), 0, 0));
+    let (dlg_x, dlg_y) = (
+        win_w.saturating_sub(GOTO_DLG_CX) / 2,
+        win_h.saturating_sub(GOTO_DLG_CY) / 2,
+    );
+    let frame_face_count = |session: &wie_runtime::RuntimeSession| -> u32 {
+        let Some(frame) = session.take_frame(main) else {
+            return 0;
+        };
+        let mut n = 0_u32;
+        for py in dlg_y..(dlg_y + GOTO_DLG_CY) {
+            for px in dlg_x..(dlg_x + GOTO_DLG_CX) {
+                let idx = py as usize * frame.width as usize + px as usize;
+                if frame
+                    .pixels
+                    .get(idx)
+                    .is_some_and(|&p| p & 0x00FF_FFFF == 0x00F0_F0F0)
+                {
+                    n = n.saturating_add(1);
+                }
+            }
+        }
+        n
+    };
+    let face_open = frame_face_count(&session);
+    assert!(
+        face_open > 1000,
+        "the Go To dialog face must be composited in the owner frame (got {face_open})"
+    );
+
+    // ONE real mouse click on the Cancel button: resolve it through the live
+    // hit-test (window_at descends the dialog child hierarchy) and post the
+    // WM_LBUTTONDOWN/UP the winit MouseInput path produces, with the
+    // button-relative coordinates.
+    let (click_x, click_y) = {
+        let mut found = None;
+        'scan: for y in 0..1000_i32 {
+            for x in 0..1000_i32 {
+                if let Some((h, _, _)) = handle.window_at(x, y)
+                    && h == cancel_hwnd
+                {
+                    found = Some((x, y));
+                    break 'scan;
+                }
+            }
+        }
+        found.expect("hit-test must resolve the Cancel button")
+    };
+    let (target, rx, ry) = handle
+        .window_at(click_x, click_y)
+        .expect("window_at resolves the click");
+    assert_eq!(
+        target, cancel_hwnd,
+        "the click must resolve to the Cancel button"
+    );
+    let lparam = u64::from((ry << 16) | rx);
+    handle.post_message(target, WM_LBUTTONDOWN, MK_LBUTTON, lparam);
+    handle.post_message(target, WM_LBUTTONUP, 0, lparam);
+
+    let mut closed_after_one_click = false;
+    let mut frame_face = u32::MAX;
+    for _ in 0..150 {
+        let summary = session
+            .run_until_stop(1_000_000)
+            .expect("run after Cancel click");
+        if matches!(
+            summary.termination,
+            EntryTraceTermination::ExitProcess { .. }
+        ) {
+            panic!("notepad exited instead of closing the Go To dialog");
+        }
+        if !session
+            .guest_windows_snapshot()
+            .iter()
+            .any(|(_, cls, ..)| cls == "Dialog")
+        {
+            closed_after_one_click = true;
+            // Settle the repaint cycle: the owner must erase the dialog
+            // region and repaint its controls before the frame is judged.
+            for _ in 0..10 {
+                let _ = session.run_until_stop(1_000_000).expect("settle run");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            frame_face = frame_face_count(&session);
+            break;
+        }
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    assert!(
+        closed_after_one_click,
+        "ONE Cancel click must close the Go To dialog — a swallowed first click \
+         means the WM_LBUTTONDOWN/UP → BN_CLICKED → WM_COMMAND(IDCANCEL) → \
+         EndDialog chain lost a step"
+    );
+    assert!(
+        frame_face < 1000,
+        "the owner frame must drop the Go To dialog's face pixels after ONE \
+         Cancel click (stale-face bug): got {frame_face}"
+    );
+
+    // Re-open the dialog (the state of a PREVIOUS dialog session must not
+    // swallow the first click of a later one) and click Cancel once again.
+    handle.post_message(main, WM_COMMAND, u64::from(goto_id), 0);
+    let mut dialog_hwnd = 0_u64;
+    for _ in 0..200 {
+        let summary = session
+            .run_until_stop(1_000_000)
+            .expect("run after second CMD_GOTO");
+        if matches!(
+            summary.termination,
+            EntryTraceTermination::ExitProcess { .. }
+        ) {
+            panic!("notepad exited while the second Go To dialog should be open");
+        }
+        if let Some((dhwnd, ..)) = session
+            .guest_windows_snapshot()
+            .iter()
+            .find(|(_, cls, ..)| cls == "Dialog")
+        {
+            dialog_hwnd = *dhwnd;
+        }
+        if dialog_hwnd != 0 && dialog_edit(&session, dialog_hwnd) != 0 {
+            break;
+        }
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    assert_ne!(dialog_hwnd, 0, "second CMD_GOTO must open a Dialog window");
+
+    let cancel_hwnd = session
+        .guest_windows_snapshot()
+        .iter()
+        .find(|(_, cls, title, _)| cls == "#128" && title == "Cancel")
+        .map(|(h, ..)| *h)
+        .unwrap_or(0);
+    assert_ne!(
+        cancel_hwnd, 0,
+        "the second Go To dialog must have a Cancel button"
+    );
+
+    // Resolve the cancel center through the hit-test again and click once.
+    let (click_x, click_y) = {
+        let mut found = None;
+        'scan: for y in 0..1000_i32 {
+            for x in 0..1000_i32 {
+                if let Some((h, _, _)) = handle.window_at(x, y)
+                    && h == cancel_hwnd
+                {
+                    found = Some((x, y));
+                    break 'scan;
+                }
+            }
+        }
+        found.expect("hit-test must resolve the second dialog's Cancel button")
+    };
+    let (target, rx, ry) = handle
+        .window_at(click_x, click_y)
+        .expect("window_at resolves the second click");
+    assert_eq!(
+        target, cancel_hwnd,
+        "the second click must resolve to the Cancel button"
+    );
+    let lparam = u64::from((ry << 16) | rx);
+    handle.post_message(target, WM_LBUTTONDOWN, MK_LBUTTON, lparam);
+    handle.post_message(target, WM_LBUTTONUP, 0, lparam);
+
+    let mut closed_again = false;
+    for _ in 0..150 {
+        let summary = session
+            .run_until_stop(1_000_000)
+            .expect("run after second Cancel click");
+        if matches!(
+            summary.termination,
+            EntryTraceTermination::ExitProcess { .. }
+        ) {
+            panic!("notepad exited instead of closing the second Go To dialog");
+        }
+        if !session
+            .guest_windows_snapshot()
+            .iter()
+            .any(|(_, cls, ..)| cls == "Dialog")
+        {
+            closed_again = true;
+            break;
+        }
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    assert!(
+        closed_again,
+        "a re-opened Go To dialog must also close on ONE Cancel click — a stale \
+         state from the previous dialog session swallows the first click"
     );
 }
 
