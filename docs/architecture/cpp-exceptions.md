@@ -1,6 +1,6 @@
 # C++ Exception Handling on Windows x64
 
-This document explains how WIE dispatches Win64 SEH and MSVC C++ exception handling end to end. WIE hosts the machine-code machinery — `.pdata` function tables, the unwind walk, and the dispatch loop (`wie-winapi::exception`, `seh.rs`) — while the guest's own CRT supplies the type-matching and destructor logic (`__CxxFrameHandler3` / `__gxx_personality_seh0`), which WIE invokes through guest trampolines. The sections below walk the mechanism from the compiler's `throw` down to the catch block, then describe where each piece lives in WIE and what the guest CRT still does itself.
+This document explains how WIE dispatches Win64 SEH and MSVC C++ exception handling end to end. WIE hosts the machine-code machinery — `.pdata` function tables, the unwind walk, and the dispatch loop (`wie-winapi::exception`, `seh.rs`) — and does the type-matching itself (`msvc_eh.rs`, `exception/unwind.rs`). The guest's CRT still owns the exception object and the destructor code, which WIE invokes through guest trampolines (UnwindMap actions, MSVC catch funclets); the guest personality functions (`__CxxFrameHandler3` / `__gxx_personality_seh0`) are never called. The sections below walk the mechanism from the compiler's `throw` down to the catch block, then describe where each piece lives in WIE and what the guest CRT still does itself.
 
 ## 1. The Core Problem: Why Exceptions Are Not Just a Function Call
 
@@ -245,16 +245,12 @@ The language-specific handler is hard because it requires **parsing compiler-gen
 
 These data structures are stored in different sections (`.xdata` for MSVC, `.gcc_except_table` for Mingw) and use completely different formats for matching types.
 
-WIE has two options:
+WIE's actual split is **host-side parsing with guest-side actions**:
 
-**Option A (host-side LS handler):** Implement `__CxxFrameHandler3` or `__gxx_personality_v0` in Rust. Parse the `FuncInfo` / LSDA from guest memory, do type matching via RTTI tables, return the landing pad address. This gives full control but requires reimplementing nontrivial C++ ABI logic.
+- **Host side** (`seh.rs` + `exception/`): WIE parses both `FuncInfo` (MSVC) and the Itanium LSDA (Mingw) from guest memory, does the catch type-matching itself, and plans the transfer as a list of steps (`SehStep`). The personality RVA in `.xdata` is used only to locate the language data — `__CxxFrameHandler3` / `__gxx_personality_seh0` are never called by the dispatcher. If guest code reaches the `__c_specific_handler` / `__cxxframehandler` import directly, the host stub (`ucrt/misc.rs::handle_c_specific_handler`) returns continue-search.
+- **Guest side**: only the destructor actions (MSVC `UnwindMap` action RVAs) and the MSVC catch funclets execute as guest code, entered via `setup_guest_call` with the SEH continue trampoline as the return address.
 
-**Option B (guest-side LS handler):** Let the guest's own `__CxxFrameHandler3` execute. The host calls it like any other guest function — push arguments, set RIP, run. This works because:
-- The handler only reads guest memory (no host calls needed).
-- The handler is already compiled into the guest binary.
-- Type matching, destructor calls, and landing pad computation are handled by existing, tested CRT code.
-
-The tradeoff: option B requires the handler to run in-guest without host-stopping on every import (it calls ~20 CRT functions during a normal dispatch). In practice, most of those calls are either guest-stubbed (`_CxxFrameHandler3` itself) or hit fast UCRT paths. Option A requires more Rust code but is more predictable.
+The tradeoff: this avoids host-stopping on every CRT import inside a personality function, at the cost of reimplementing the catch-matching logic host-side (`msvc_eh.rs` for `FuncInfo`, `exception/unwind.rs` + `dwarf.rs` for the LSDA).
 
 ---
 
@@ -332,10 +328,10 @@ Unwind codes are stored in reverse execution order (last prologue instruction fi
 
 ### WIE responsibility
 
-- **Parse `.pdata` and `.xdata`** during PE load. Store `Vec<RUNTIME_FUNCTION>` per module.
-- **`RtlLookupFunctionEntry`**: given a guest RIP, binary-search the function table to find the covering `RUNTIME_FUNCTION`. Return the unwind info.
-- **`RtlAddFunctionTable`**: register additional function tables for JIT code or dynamically loaded DLLs.
-- **JIT integration**: for Cranelift-compiled blocks, either emit `.pdata` entries or use `RtlInstallFunctionTableCallback` for dynamic lookup.
+- **Parse `.pdata`** at session init: `wie_winapi::exception::parse_pdata` reads the raw section bytes into a sorted `Vec<RuntimeFunction>`; `wie-runtime/src/session/init.rs` registers the result as `SyncState.function_tables[image_base]`. `.xdata` is not pre-parsed — it stays in guest memory and is read lazily during unwinding.
+- **`exception::lookup_function_entry`**: given a guest RIP, range-check each registered module table, then binary-search by `BeginAddress` for the covering `RuntimeFunction`.
+- **Dynamic tables**: only the main module's table is registered today. `RtlAddFunctionTable` for JIT code or loaded DLLs is **not implemented**; a RIP with no covering entry falls back to the leaf unwind path (see section 10).
+- **JIT integration**: Cranelift emits no unwind metadata (`unwind_info = false`), and no `RtlInstallFunctionTableCallback` exists — the unwind walk only ever sees guest RIPs, so a JIT block address never reaches `lookup_function_entry` (section 10).
 
 ---
 
@@ -422,10 +418,10 @@ RtlVirtualUnwind(CONTEXT* ctx, RUNTIME_FUNCTION* entry):
 
 ### WIE responsibility
 
-- Implement `RtlVirtualUnwind` as a pure function reading guest memory.
-- Maintain a virtual CONTEXT (RIP, RSP, GPR[0..15], XMM[0..15], RFLAGS, segment registers).
-- Return handler information so the dispatcher can decide whether to call a handler or keep unwinding.
-- Handle leaf functions, chained unwind info, and epilogue detection.
+- Implement `virtual_unwind` as a pure function reading guest memory (`wie-winapi/src/exception/unwind.rs`).
+- Maintain an `UnwindContext` (RIP, RSP, GPR[0..15], XMM[0..15]) — no RFLAGS or segment registers (section 9).
+- Return handler information (`UnwindResult.handler_rva` / `handler_data` / `exception_data_va`) so the dispatcher can decide whether to match a handler or keep unwinding.
+- Leaf functions and chained unwind info are handled; **epilogue detection is not implemented** — the UWOP interpretation assumes RIP is in the prologue region.
 
 ---
 
@@ -442,7 +438,7 @@ void RaiseException(EXCEPTION_RECORD* record) {
 }
 ```
 
-`RtlDispatchException` implements the two-pass model:
+`RtlDispatchException` implements the two-pass model. WIE reimplements the same two passes host-side with its own symbols — `dispatch_exception`, `search_and_plan`, `continue_pending` (`seh.rs`) — and no guest call into `RtlDispatchException`. The pseudocode below is the canonical Windows flow; the mapping to WIE's actual code is in "WIE responsibility".
 
 ### Pass 1: Search
 
@@ -506,11 +502,13 @@ pass_2(record, ctx, target_ctx):
 
 ### WIE responsibility
 
-- **`RaiseException`**: build EXCEPTION_RECORD in guest memory, call the dispatch loop.
-- **`RtlDispatchException`**: the two-pass loop above.
-- **`RtlUnwindEx`**: similar to pass 2 but invoked deliberately by `__cxa_throw` (Itanium) or `_CxxThrowException` (MSVC). Unwinds to a specific target frame.
-- **VEH chain**: `RtlAddVectoredExceptionHandler` — maintain a linked list. Before pass 1, call each VEH handler. If one returns `EXCEPTION_CONTINUE_EXECUTION`, skip SEH entirely.
-- **Handler invocation bridge**: set up a guest call frame and run the LS handler function. Read its return value (disposition) from RAX.
+- **Entry points.** `KERNEL32!RaiseException` → `handle_raise_exception` (`kernel32/misc/mod.rs`) → `seh::dispatch_exception` (`seh.rs`), which recovers a `ThrowPayload` (MSVC `0xE06D7363` or GCC `0x20474343` — `' GCC'`) from the register arguments or from an `EXCEPTION_RECORD*` in RCX. `msvcrt!_CxxThrowException` → `handle_cxx_throw_exception` (`ucrt/misc.rs`), which passes `pExceptionObject` / `pThrowInfo` to `dispatch_exception_with_payload`. Guest hardware faults (access violation, divide-by-zero) → `seh::dispatch_hardware_fault`, called from the runtime pump (`wie-runtime/src/session/pump.rs`).
+- **Search + plan (pass 1).** `dispatch_exception_with_payload` snapshots `ThreadContext`, reads the throw site (the return address on the guest stack), and calls `search_and_plan`. That walks frames with `unwind_one` (→ `exception::lookup_function_entry` + `exception::virtual_unwind`; leaf frames just pop the return address) and resolves a catch with `resolve_landing_pad`: MSVC `FuncInfo` via `msvc_eh::find_msvc_catch`, or the Itanium LSDA via `exception::find_landing_pad_ex`. Instead of returning a disposition, it **plans** pass 2 as a `Vec<SehStep>`: `Action` (MSVC `UnwindMap` destructor RVA), `MsvcCatch` (funclet call), `Jump` (Mingw landing pad).
+- **Step execution (pass 2).** `begin_or_finish` stores the steps in `state.kernel.seh_pending[tid]` and `run_next_step` executes the front step. Guest code runs only for destructor actions and MSVC catch funclets, via `setup_guest_call`: it pushes a return address of `seh_continue_trampoline_va` (a fake VA) and sets RDX = establisher frame. When the guest `ret`s into that trampoline, the runtime pump (`pump.rs`) or the MT worker (`mt_runtime.rs`) calls `seh::continue_pending`, which pops the next step — or, for a returned MSVC catch funclet, treats RAX as the continuation IP and resumes the catching function.
+- **Register restore.** The terminal `SehStep::Jump` / `SehStep::MsvcCatch` restores the catch frame's GPRs/XMMs, RSP and RIP through `engine.restore_thread_context` + `write_rip` / `write_rsp` / `write_rax` / `write_rdx`. There is no `RtlRestoreContext` symbol.
+- **`RtlUnwindEx`.** `handle_rtl_unwind_ex` (`kernel32/misc/mod.rs`) → `seh::forced_unwind_to`. When a Mingw cleanup landing pad left `expect_cleanup_resume` set, this drains the next planned step via `continue_pending`; otherwise it walks frames with `unwind_one` until `target_frame_rsp` / `target_ip` and restores the resulting context.
+- **VEH chain**: `RtlAddVectoredExceptionHandler` is **not implemented** — no vectored handlers run before the SEH walk.
+- **Handler invocation bridge**: `setup_guest_call` (push RA = `seh_continue_trampoline_va`, RDX = establisher, set RIP). The host never calls the guest language-specific handler, so there is no disposition read back from RAX — the only guest-returned value consumed is the MSVC catch funclet's continuation IP.
 
 ---
 
@@ -579,93 +577,48 @@ When the dispatcher calls `__CxxFrameHandler3` or `__gxx_personality_v0`, the ha
 
 ### WIE responsibility
 
-- **Host-side dispatch with guest handler bodies.** WIE walks the frame metadata and unwind actions in Rust and runs the guest CRT's handler code through trampolines — the split the current implementation uses.
-- **Guest-side dispatch (the shape in use today):**
-  - When `__CxxThrowException` is called, save the exception record.
-  - Enter the dispatch loop with the saved exception record.
-  - At each handler frame: push arguments onto the guest stack, set RIP to the handler address, run the handler, read the disposition from RAX.
-  - The handler writes the target CONTEXT. Read it back, set guest registers, resume.
+- **Host-side matching, guest-side actions.** WIE parses `FuncInfo` (`msvc_eh.rs`) and the Itanium LSDA (`exception/unwind.rs` + `dwarf.rs`) itself, and plans the dispatch as `SehStep`s. The guest's personality / frame handlers are **not invoked** — only the pieces of guest code those handlers would have run:
+  - `SehStep::Action` — MSVC `UnwindMap` destructor RVAs collected by `msvc_eh::collect_unwind_actions`, entered via `setup_guest_call` (RDX = establisher frame, RA = `seh_continue_trampoline_va`).
+  - `SehStep::MsvcCatch` — the matched MSVC catch funclet, CALLed with the catch object placed at the `HandlerType.dispCatchObj` slot (`place_msvc_catch_object`); on return, RAX holds the continuation IP (`continue_pending`).
+  - `SehStep::Jump` — a Mingw/Itanium landing pad, entered by restoring the catch frame's registers; intermediate cleanup pads end in `_Unwind_Resume` → `RtlUnwindEx` → `forced_unwind_to`, which continues with the next pending step.
+- The type matching WIE does host-side: MSVC compares `ThrowInfo` `CatchableType` RVAs against `HandlerType.typeRva` (`msvc_eh::handler_matches`); Mingw compares the thrown typeinfo pointer against the LSDA type table (`match_action` in `exception/unwind.rs`). Catch-all (`...`) matches without a type table.
 
 ---
 
-## 9. CONTEXT Structure
+## 9. Register Contexts: ThreadContext and UnwindContext (no CONTEXT64)
 
-WIE currently has a minimal `ThreadContext` (GPR[16], XMM[16], RIP, RFLAGS). For exception handling, it must match the OS `CONTEXT64` format:
+WIE does **not** maintain the full OS `CONTEXT64` (1232 bytes). Exception handling uses two smaller register shapes, both indexed by GPR number (RAX=0 … R15=15):
 
-```c
-struct CONTEXT64 {
-    // Header
-    uint64_t P1Home;           // parameter home addresses
-    uint64_t P2Home;
-    uint64_t P3Home;
-    uint64_t P4Home;
-    uint64_t P5Home;
-    uint64_t P6Home;
+```rust
+// wie-cpu/src/regs.rs — thread-switch snapshot, also the dispatch entry/exit shape
+pub struct ThreadContext {
+    pub gpr: [u64; 16],      // RAX..R15
+    pub xmm: [u128; 16],     // XMM0..XMM15
+    pub rip: u64,
+    pub rflags: Rflags,
+}
 
-    // Control
-    uint32_t ContextFlags;
-    uint32_t MxCsr;
-
-    // Segment registers
-    uint16_t SegCs;
-    uint16_t SegDs;
-    uint16_t SegEs;
-    uint16_t SegFs;
-    uint16_t SegGs;
-    uint16_t SegSs;
-    uint32_t EFlags;
-
-    // Integer registers (must be in this order — RtlVirtualUnwind uses indices)
-    uint64_t Rax;
-    uint64_t Rcx;
-    uint64_t Rdx;
-    uint64_t Rbx;
-    uint64_t Rsp;
-    uint64_t Rbp;
-    uint64_t Rsi;
-    uint64_t Rdi;
-    uint64_t R8;
-    uint64_t R9;
-    uint64_t R10;
-    uint64_t R11;
-    uint64_t R12;
-    uint64_t R13;
-    uint64_t R14;
-    uint64_t R15;
-
-    // Instruction pointer
-    uint64_t Rip;
-
-    // Floating point / XMM
-    M128A Xmm0[16];            // 16 bytes each, indexed by `0..15`
-
-    // Debug registers
-    uint64_t Dr0;
-    uint64_t Dr1;
-    uint64_t Dr2;
-    uint64_t Dr3;
-    uint64_t Dr6;
-    uint64_t Dr7;
-
-    // More at the end (vector control, debug control, etc.)
-};  // total size: 1232 bytes for full CONTEXT
+// wie-winapi/src/exception/mod.rs — what the unwinder walks
+pub struct UnwindContext {
+    pub rip: u64,
+    pub rsp: u64,
+    pub gpr: [u64; 16],
+    pub xmm: [u128; 16],     // only indices 6..=15 (XMM6–XMM15) are restored
+}
 ```
+
+`RtlCaptureContext` (host stub `handle_rtl_capture_context`, `kernel32/misc/mod.rs`) writes a **partial** `CONTEXT64` subset into the guest buffer so filter expressions that read the context see a plausible shape: ContextFlags at +0x30, Rflags at +0x44, RAX..R15 at +0x78..+0xF8, RIP at +0xF8, XMM0..XMM15 at +0x100 (16 bytes each). This is a compatibility subset — WIE never parses a full `CONTEXT64` back.
 
 ### WIE responsibility
 
-- Expand `ThreadContext` to match the `CONTEXT64` layout.
-- Implement bidirectional conversion between `RegFile` (used by JIT/iced) and `CONTEXT64` (used by the unwinder):
-  ```rust
-  impl From<&RegFile> for CONTEXT64 { ... }
-  impl From<&CONTEXT64> for RegFile { ... }
-  ```
-- The nonvolatile registers (RBX, RBP, RDI, RSI, R12-R15, XMM6-XMM15) are the only ones the unwinder restores — the caller expects them preserved. Volatile registers (RAX, RCX, RDX, R8-R11, XMM0-XMM5) can be anything.
+- No full `CONTEXT64` struct and no `RegFile ↔ CONTEXT64` conversion exist. The dispatcher snapshots `ThreadContext` (`engine.snapshot_thread_context()`) and walks `UnwindContext`; the final register restore is `engine.restore_thread_context` + `write_rip` / `write_rsp` / `write_rax` / `write_rdx` in `seh.rs::run_next_step`.
+- The nonvolatile registers (RBX, RBP, RDI, RSI, R12-R15, XMM6-XMM15) are the only ones the unwinder restores — the UWOP codes only ever name registers the function saved, which are the nonvolatiles. Volatile registers (RAX, RCX, RDX, R8-R11, XMM0-XMM5) can be anything.
 
 ---
 
 ## 10. JIT Integration
 
-Cranelift-compiled blocks need unwind metadata so `RtlLookupFunctionEntry` can find them. Three approaches:
+Cranelift-compiled blocks would need unwind metadata only if `lookup_function_entry` could see a JIT block address. Three approaches exist:
 
 1. **Emit `.pdata`/`.xdata` per block** — Cranelift can generate `UNWIND_INFO` when `unwind_info = true` is set in the flags. Each compiled block gets a `RUNTIME_FUNCTION` entry. Register the JIT code range as a function table via `RtlAddFunctionTable`. This is the cleanest approach.
 
@@ -673,35 +626,36 @@ Cranelift-compiled blocks need unwind metadata so `RtlLookupFunctionEntry` can f
 
 3. **Trap and redirect** — if the dispatcher reaches a JIT code address with no function table entry, fall through to the iced interpreter path. The interpreter has a normal `.pdata` entry. This is the simplest MVP but means exceptions in hot JIT code always fall back to iced.
 
-For the JIT, option 1 is off: `unwind_info` stays `false`, so compiled blocks register no unwind metadata. It is not needed — the dispatcher unwinds **guest** stack frames whose RIPs are all guest VAs, so `RtlLookupFunctionEntry` never sees a JIT block address.
+None of the three is used. `unwind_info` stays `false` (`wie-cpu/src/jit/engine.rs`), so compiled blocks register no unwind metadata, and no function-table callback exists. It is not needed — the dispatcher unwinds **guest** stack frames whose RIPs are all guest VAs, so `lookup_function_entry` never sees a JIT block address.
 
 ---
 
 ## 11. Implementation
 
 ### Metadata foundation
-- `RUNTIME_FUNCTION`, `UNWIND_INFO`, `UNWIND_CODE` structs in `wie-winapi`.
-- `pdata.rs` in `wie-pe`: find `.pdata` section during PE load, count entries, store guest VA.
-- `FunctionTableRegistry` in `WinApiState.sync`: map guest VA range → sorted `RUNTIME_FUNCTION` slice.
-- `RtlLookupFunctionEntry(ControlPc)` → `Option<&RUNTIME_FUNCTION>`. Binary search by address.
+- `RuntimeFunction`, `UnwindInfo`, `UnwindCode` structs in `wie-winapi/src/exception/mod.rs` (PE/COFF §5 layouts).
+- `.pdata` parsing: `wie_winapi::exception::parse_pdata` (`exception/mod.rs`) reads the raw section bytes into a sorted `Vec<RuntimeFunction>`; `wie-runtime/src/session/init.rs` registers the main module's table as `SyncState.function_tables[image_base]`. Loaded DLLs currently register no table — unwinding through a DLL frame falls back to the leaf path.
+- `SyncState.function_tables: HashMap<u64, Vec<RuntimeFunction>>` (`sync_obj.rs`): image base → sorted entries.
+- `exception::lookup_function_entry(&sync, control_pc)` → `Option<FunctionEntry>` (`exception/mod.rs`): per-module range check + binary search by `BeginAddress`.
 
 ### Virtual unwinding
-- `RtlVirtualUnwind` in `wie-winapi/src/exception.rs`. Interpret UWOP codes, update CONTEXT.
-- Handle leaf functions, chained unwind info, epilogue detection.
-- `CONTEXT64` struct + `RegFile` ↔ `CONTEXT64` conversions.
+- `exception::virtual_unwind(read_mem, image_base, entry, ctx)` in `wie-winapi/src/exception/unwind.rs`. Interprets the UWOP codes and returns the caller's `UnwindContext` plus `UnwindResult` (handler RVA, language-data DWORD, embedded-LSDA VA).
+- Leaf functions (no unwind data) pop the return address (`unwind_leaf`); chained unwind info (`UNW_FLAG_CHAININFO`) recurses into the chained `UNWIND_INFO`. **Epilogue detection is not implemented.**
+- The Mingw LSDA walk lives in the same module: `find_landing_pad_ex` (catch match with type filter + handler switch value) and `find_cleanup_landing_pad` (action-index-0 cleanup pads), with `DW_EH_PE` encodings in `exception/dwarf.rs`.
+- The register shape is `UnwindContext` (`exception/mod.rs`), not a `CONTEXT64`; there is no `RegFile ↔ CONTEXT64` conversion (section 9).
 
 ### Exception dispatch
-- `RaiseException` handler: build EXCEPTION_RECORD, enter dispatch loop.
-- `RtlDispatchException`: save register context, walk frames, call handlers.
-- Handler invocation bridge: push arguments onto guest stack, switch to guest RIP, read result.
-- `RtlRestoreContext`: write CONTEXT registers back into the CpuEngine.
+- Entry: `kernel32/misc/mod.rs::handle_raise_exception` → `seh::dispatch_exception` (recovers `ThrowPayload`); `ucrt/misc.rs::handle_cxx_throw_exception` → `seh::dispatch_exception_with_payload`; runtime faults → `seh::dispatch_hardware_fault`.
+- `seh::search_and_plan` walks frames once (`unwind_one`) and produces `Vec<SehStep>` (`Action` / `MsvcCatch` / `Jump`). `begin_or_finish` stores a `SehPending` per TID in `state.kernel.seh_pending`; `run_next_step` executes the steps; guest continuations return through the `seh_continue_trampoline_va` fake VA → `seh::continue_pending` (`pump.rs` / `mt_runtime.rs`).
+- MSVC catch funclets are CALLed (`RDX` = establisher; `RAX` = continuation IP on return) — `SehStep::MsvcCatch` + `continue_pending`. Mingw landing pads are entered by register restore (`SehStep::Jump`); cleanup pads end in `_Unwind_Resume` → `RtlUnwindEx` → `forced_unwind_to`, which drains the next pending step (`has_cleanup_resume`).
+- Register restore is `engine.restore_thread_context` + `write_rip` / `write_rsp` / `write_rax` / `write_rdx` in `run_next_step` — there is no `RtlRestoreContext`, and no guest personality call.
 
 ### C++ integration
 - `handle_cxx_throw_exception` (`ucrt/misc.rs`) builds the C++ exception record and enters SEH dispatch instead of aborting the session.
 - Mingw-w64 micro-exes (`throw int; catch(int)`), destructor cleanup between throw and catch, and `__CxxFrameHandler3` FuncInfo parsing (`msvc_eh.rs`) exercise the same path.
 
 ### JIT unwind metadata
-- Cranelift emits no unwind metadata (`unwind_info = false`). JIT blocks do not need it: the unwind walk only ever sees guest RIPs, so a JIT block address never reaches `RtlLookupFunctionEntry`.
+- Cranelift emits no unwind metadata (`unwind_info = false`, `wie-cpu/src/jit/engine.rs`). JIT blocks do not need it: the unwind walk only ever sees guest RIPs, so a JIT block address never reaches `lookup_function_entry`.
 
 ---
 
@@ -709,11 +663,11 @@ For the JIT, option 1 is off: `unwind_info` stays `false`, so compiled blocks re
 
 | Component | Handled by |
 |-----------|-----------|
-| Type info comparison (RTTI) | Guest CRT (`__CxxFrameHandler3` / RTTI tables) |
-| Destructor calls during unwind | Guest CRT (called by frame handler with terminate action) |
+| Type info comparison (RTTI) | Host — `msvc_eh::handler_matches` (CatchableType RVAs) and `match_action` in `exception/unwind.rs` (typeinfo pointer) |
+| Destructor calls during unwind | Guest code, dispatched by the host: MSVC `UnwindMap` action RVAs (`SehStep::Action`) and Mingw cleanup pads (`SehStep::Jump`) |
 | Exception object construction/destruction | Guest CRT (heap-allocated by `__cxx_throw_exception`) |
 | Stack cookie (/GS) checks | Guest code (compiled into the binary) |
-| `SetUnhandledExceptionFilter` logic | Already stubbed — filter stored, never called |
+| `SetUnhandledExceptionFilter` logic | Host stub `handle_set_unhandled_exception_filter` ignores the filter and returns NULL (`kernel32/misc/mod.rs`) |
 | `longjmp` / `setjmp` | Separate mechanism (not exception-based) |
 
 ---
