@@ -31,14 +31,50 @@ use super::path::{
 };
 use std::path::{Path, PathBuf};
 
-/// Synthetic Win10-ish skeleton under bottle `drive_c` (no PE/DLL payloads).
+/// Default Windows folder skeleton seeded under a bottle's `drive_c`
+/// (no PE/DLL payloads).
+///
+/// Mirrors a fresh Windows install's system roots, program-file roots, shared
+/// `Public` tree, the `WIE` user profile (the [`shell32`] `SHGetFolderPath`
+/// `C:\Users\WIE` convention), and the scratch `Temp` root — so the
+/// path-returning APIs (`GetWindowsDirectory`, `GetSystemDirectory`,
+/// `GetTempPath`, `SHGetFolderPath`) point at directories that exist on the
+/// host. `App` is WIE's own install convention (bottle copy target).
+///
+/// [`shell32`]: crate::shell32
 pub const BOTTLE_SKELETON_DIRS: &[&str] = &[
+    // WIE's own install convention (the `C:\Program Files\{name}` copy target
+    // and the micro-suite's `C:\App` scratch).
     "App",
+    // System roots.
     "Windows/System32",
     "Windows/SysWOW64",
-    "Users/WIE/AppData/Local/Temp",
-    "Temp",
+    "Program Files",
+    "Program Files/Common Files", // CSIDL_PROGRAM_FILES_COMMON (SHGetFolderPath 0x2a)
+    "Program Files (x86)",
     "ProgramData",
+    // Shared user tree.
+    "Users/Public",
+    "Users/Public/Documents",
+    // The WIE user profile (the SHGetFolderPath C:\Users\WIE convention).
+    "Users/WIE/Documents",
+    "Users/WIE/Desktop",
+    "Users/WIE/Downloads",
+    "Users/WIE/Pictures",
+    "Users/WIE/Music",
+    "Users/WIE/Videos",
+    "Users/WIE/AppData/Roaming",
+    "Users/WIE/AppData/Local",
+    "Users/WIE/AppData/Local/Temp",
+    "Users/WIE/AppData/LocalLow",
+    "Users/WIE/Favorites",
+    "Users/WIE/Links",
+    "Users/WIE/Saved Games",
+    "Users/WIE/Searches",
+    "Users/WIE/Templates",
+    "Users/WIE/Contacts",
+    // Scratch root.
+    "Temp",
 ];
 
 /// Guest TEMP path (env + GetTempPath).
@@ -321,8 +357,13 @@ pub fn drive_d_from_env() -> Option<PathBuf> {
     Some(PathBuf::from(val))
 }
 
-/// Create synthetic skeleton directories under the bottle (no files).
-pub fn ensure_bottle_skeleton(bottle_root: &Path) -> std::io::Result<()> {
+/// Seed the default Windows folder skeleton under a bottle's `drive_c`.
+///
+/// Runs when a bottle's drive is first materialized (the session start seeds
+/// the effective root). Idempotent: `create_dir_all` makes re-runs — a
+/// re-seeded session, or a bottle that file ops already created — no-ops.
+/// Creates only directories; the skeleton carries no PE/DLL payloads.
+pub fn seed_default_skeleton(bottle_root: &Path) -> std::io::Result<()> {
     let drive_c = bottle_root.join("drive_c");
     for rel in BOTTLE_SKELETON_DIRS {
         let path = drive_c.join(rel);
@@ -828,5 +869,71 @@ mod tests {
             );
         }
         let _unused = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn seed_default_skeleton_materializes_the_full_windows_folder_set() {
+        // A fresh bottle root: nothing exists yet. Seeding must create every
+        // default folder — system roots, Program Files, Public, the WIE
+        // profile with its per-user subfolders, Temp — under drive_c.
+        let root = std::env::temp_dir().join(format!("wie-seed-{}", std::process::id()));
+        let _unused = std::fs::remove_dir_all(&root);
+        seed_default_skeleton(&root).expect("seeding a fresh bottle must succeed");
+
+        for rel in BOTTLE_SKELETON_DIRS {
+            let dir = root.join("drive_c").join(rel);
+            assert!(
+                dir.is_dir(),
+                "seeded skeleton dir must exist: {}",
+                dir.display()
+            );
+        }
+
+        // Idempotent: re-seeding a materialized bottle is a no-op (re-runs).
+        seed_default_skeleton(&root).expect("re-seeding must not error");
+        for rel in BOTTLE_SKELETON_DIRS {
+            let dir = root.join("drive_c").join(rel);
+            assert!(dir.is_dir(), "re-seed keeps every dir: {}", dir.display());
+        }
+
+        let _unused = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn seeded_skeleton_paths_map_into_the_bottle() {
+        // Every seeded folder is guest-visible as a `C:\` path inside the
+        // bottle, and resolves to the same host dir the seed created.
+        let root = std::env::temp_dir().join(format!("wie-seed-map-{}", std::process::id()));
+        let _unused = std::fs::remove_dir_all(&root);
+        seed_default_skeleton(&root).expect("seed");
+        let volumes = VolumeConfig {
+            bottle_root: Some(root.clone()),
+            drive_d_root: None,
+        };
+        for rel in BOTTLE_SKELETON_DIRS {
+            let guest = format!(r"C:\{}", rel.replace('/', r"\"));
+            let map = guest_path_to_host(&volumes, &guest)
+                .unwrap_or_else(|| panic!("seeded dir must map: {guest}"));
+            let expected = root.join("drive_c").join(rel);
+            assert_eq!(map.host, expected, "seeded dir maps to its host location");
+            assert!(map.host.is_dir(), "mapped dir exists on disk");
+        }
+        let _unused = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn seed_default_skeleton_never_requires_a_bottle() {
+        // The default-constructed config resolves C: to the global app-data
+        // bottle, which seeding materializes on demand — the same no-setup
+        // policy as file ops.
+        let no_bottle = VolumeConfig::default();
+        seed_default_skeleton(&effective_bottle_root(&no_bottle))
+            .expect("seeding the global bottle must succeed");
+        for rel in BOTTLE_SKELETON_DIRS {
+            let dir = effective_bottle_root(&no_bottle).join("drive_c").join(rel);
+            assert!(dir.is_dir(), "global bottle seeded: {}", dir.display());
+        }
+        // Leave only the skeleton dirs in place — the global bottle is the
+        // product's own app-data layout and legitimately persists.
     }
 }

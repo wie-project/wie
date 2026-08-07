@@ -48,8 +48,8 @@ pub use sync_obj::{
     WAIT_OBJECT_0, WAIT_TIMEOUT, WaitTarget, wait_multiple,
 };
 pub use vfs::{
-    VolumeConfig, effective_bottle_root, ensure_bottle_skeleton, global_bottle_root,
-    host_path_to_guest,
+    VolumeConfig, effective_bottle_root, global_bottle_root, host_path_to_guest,
+    seed_default_skeleton,
 };
 #[cfg(test)]
 mod exception_helpers;

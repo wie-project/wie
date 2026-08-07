@@ -99,3 +99,63 @@ fn test_sh_add_to_recent_docs_pathw_returns_without_error() {
     .expect("handler not found");
     assert_eq!(result.return_value, 0, "void return");
 }
+
+/// `SHGetFolderPathW` must return paths that point INTO the seeded default
+/// skeleton: after a temp-root bottle is seeded, every CSIDL folder the
+/// handler knows exists on the host under `{root}/drive_c/…`.
+#[test]
+fn test_sh_get_folder_path_w_returns_seeded_skeleton_paths() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // Seed a fresh temp-root bottle so the returned folders exist on disk.
+    let root = std::env::temp_dir().join(format!("wie-shfold-{}", std::process::id()));
+    let _unused = std::fs::remove_dir_all(&root);
+    crate::vfs::seed_default_skeleton(&root).expect("seed skeleton");
+    state.file_io.volumes = VolumeConfig {
+        bottle_root: Some(root.clone()),
+        drive_d_root: None,
+    };
+
+    // csidl → the seeded guest folder (see handle_sh_get_folder_path_w).
+    let cases: &[(u64, &str)] = &[
+        (0x00, r"C:\Users\WIE\Desktop"),          // CSIDL_DESKTOP
+        (0x05, r"C:\Users\WIE\Documents"),        // CSIDL_PERSONAL
+        (0x1a, r"C:\Users\WIE\AppData\Roaming"),  // CSIDL_APPDATA
+        (0x1c, r"C:\Users\WIE\AppData\Local"),    // CSIDL_LOCAL_APPDATA
+        (0x23, r"C:\ProgramData"),                // CSIDL_COMMON_APPDATA
+        (0x24, r"C:\Windows"),                    // CSIDL_WINDOWS
+        (0x25, r"C:\Windows\System32"),           // CSIDL_SYSTEM
+        (0x26, r"C:\Program Files"),              // CSIDL_PROGRAM_FILES
+        (0x2a, r"C:\Program Files\Common Files"), // CSIDL_PROGRAM_FILES_COMMON
+        (0x28, r"C:\Users\WIE"),                  // CSIDL_PROFILE
+    ];
+    for &(csidl, expected) in cases {
+        // 5th arg (path buffer) sits at [rsp+0x28] in the Win64 ABI.
+        let path_ptr = 0x6000_u64;
+        engine
+            .mem_write(STACK_TOP + 0x28, &path_ptr.to_le_bytes())
+            .expect("write path_ptr stack slot");
+        write_regs(&mut engine, 0, csidl, 0, 0, STACK_TOP);
+        let result = {
+            let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
+            shell32::dispatch_shell32(&mut ctx, "SHGetFolderPathW")
+        }
+        .expect("dispatch failed")
+        .expect("handler not found");
+        assert_eq!(result.return_value, 0, "S_OK for csidl {csidl:#x}");
+        let returned = read_guest_utf16_raw(&mut engine, path_ptr, 260);
+        assert_eq!(
+            returned, expected,
+            "csidl {csidl:#x} must return the seeded dir"
+        );
+        // The returned path maps into the seeded skeleton and exists on disk.
+        let map = crate::vfs::guest_path_to_host(&state.file_io.volumes, &returned)
+            .unwrap_or_else(|| panic!("csidl {csidl:#x}: returned path must map into the bottle"));
+        assert!(
+            map.host.is_dir(),
+            "csidl {csidl:#x}: {} must exist on the host",
+            map.host.display()
+        );
+    }
+    let _unused = std::fs::remove_dir_all(&root);
+}

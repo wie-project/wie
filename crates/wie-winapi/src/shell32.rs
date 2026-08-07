@@ -86,7 +86,9 @@ pub fn dispatch_shell32(
 /// `HRESULT SHGetFolderPathW(hwnd, csidl, hToken, dwFlags, pszPath)`
 ///
 /// Fills a fixed bottle-friendly path under `C:\Users\WIE\…` style so tools
-/// that only need a writable home directory keep going.
+/// that only need a writable home directory keep going. Every returned path
+/// points INTO the seeded default skeleton ([`crate::vfs::BOTTLE_SKELETON_DIRS`]),
+/// so the folder exists on the host once the bottle is materialized.
 fn handle_sh_get_folder_path_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let _hwnd = engine.read_rcx()?;

@@ -894,11 +894,14 @@ impl super::RuntimeSession {
         // re-apply the effective roots so the state's volumes agree with the
         // identity derived above (an explicit `SessionOptions` root overrides
         // `WIE_ROOT`, mirroring the old post-hoc `set_bottle_root`).
+        // Seed the default Windows folder skeleton for the session's C:
+        // volume — the override root OR the global app-data bottle (the
+        // effective root is the C: the guest will see). Idempotent mkdirs
+        // make re-seeding harmless.
+        let effective_root = wie_winapi::effective_bottle_root(&volumes);
         winapi_state.file_io.volumes = volumes;
         winapi_state.file_io.bottle_root = bottle_root;
-        if let Some(ref root) = winapi_state.file_io.bottle_root {
-            let _ = wie_winapi::ensure_bottle_skeleton(root);
-        }
+        let _ = wie_winapi::seed_default_skeleton(&effective_root);
         // Register the primary thread kernel object so DuplicateHandle
         // can resolve GetCurrentThread/GetCurrentProcess pseudohandles.
         {

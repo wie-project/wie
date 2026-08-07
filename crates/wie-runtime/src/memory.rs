@@ -293,7 +293,7 @@ pub(crate) fn default_winapi_state(
                 let bottle = wie_winapi::bottle_root_from_env();
                 let drive_d = wie_winapi::drive_d_from_env();
                 if let Some(ref root) = bottle {
-                    let _ = wie_winapi::ensure_bottle_skeleton(root);
+                    let _ = wie_winapi::seed_default_skeleton(root);
                 }
                 wie_winapi::VolumeConfig::from_parts(bottle, drive_d)
             },

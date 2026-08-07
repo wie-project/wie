@@ -49,9 +49,38 @@ fn n2_write_and_read_file_in_bottle() {
         read_summary.run.termination
     );
 
-    // Skeleton dirs from ensure_bottle_skeleton.
+    // Skeleton dirs from seed_default_skeleton.
     assert!(bottle.join("drive_c/Windows/System32").is_dir());
     assert!(bottle.join("drive_c/Users/WIE/AppData/Local/Temp").is_dir());
+
+    let _ = std::fs::remove_dir_all(&bottle);
+}
+
+/// The default Windows folder skeleton, end to end: a fresh bottle (explicit
+/// temp root) gets the full folder set materialized by the time the guest's
+/// first file op runs. The session start seeds the effective root, so the
+/// write_file.exe run above leaves every `BOTTLE_SKELETON_DIRS` directory on
+/// the host.
+#[test]
+fn n2_fresh_bottle_gets_the_full_default_skeleton() {
+    let Some(write_pe) = micro_exe("write_file.exe") else {
+        eprintln!("skip: write_file.exe not built");
+        return;
+    };
+
+    let bottle = std::env::temp_dir().join(format!("wie-skeleton-test-{}", std::process::id()));
+    let summary = wie_runtime::run_micro_exe_with_root(&write_pe, 256, Some(bottle.clone()))
+        .expect("write_file run");
+    assert_eq!(summary.exit_code, Some(0), "{:?}", summary.run.termination);
+
+    for rel in wie_winapi::vfs::BOTTLE_SKELETON_DIRS {
+        let dir = bottle.join("drive_c").join(rel);
+        assert!(
+            dir.is_dir(),
+            "fresh bottle must be seeded with {rel}: {}",
+            dir.display()
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&bottle);
 }

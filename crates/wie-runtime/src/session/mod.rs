@@ -194,7 +194,7 @@ impl RuntimeSession {
     pub fn set_bottle_root(&mut self, root: Option<std::path::PathBuf>) {
         self.process.with_mut(|_, s| {
             if let Some(ref r) = root {
-                let _ = wie_winapi::ensure_bottle_skeleton(r);
+                let _ = wie_winapi::seed_default_skeleton(r);
             }
             s.file_io.bottle_root = root.clone();
             s.file_io.volumes.bottle_root = root;

@@ -35,7 +35,7 @@ pub(crate) use pick_mount::register_pick_mount;
 pub use volume::{
     BOTTLE_SKELETON_DIRS, DRIVE_FIXED, DRIVE_NO_ROOT_DIR, GUEST_SYSTEM_DIR, GUEST_TEMP_PATH,
     GUEST_WINDOWS_DIR, HostMap, VolumeConfig, bottle_root_from_env, confine_guest_path,
-    drive_d_from_env, effective_bottle_root, ensure_bottle_skeleton, get_drive_type,
-    global_bottle_root, guest_path_to_host, guest_path_to_host_bottle, host_path_to_guest,
-    logical_drives_mask,
+    drive_d_from_env, effective_bottle_root, get_drive_type, global_bottle_root,
+    guest_path_to_host, guest_path_to_host_bottle, host_path_to_guest, logical_drives_mask,
+    seed_default_skeleton,
 };

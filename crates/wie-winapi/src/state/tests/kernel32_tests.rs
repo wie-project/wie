@@ -1308,3 +1308,71 @@ fn test_file_op_without_root_creates_and_writes_the_global_bottle() {
 
     let _cleanup = std::fs::remove_file(&host);
 }
+
+/// Dispatch one fixed-dir handler (`GetWindowsDirectory*`, `GetSystemDirectory*`,
+/// `GetTempPath*`) and return its return value.
+fn dispatch_fixed_dir_handler(engine: &mut IcedCpu, state: &mut WinApiState, name: &str) -> u64 {
+    let result = {
+        let mut ctx = HandlerContext::new(engine, default_env(), state);
+        match name {
+            "GetWindowsDirectoryW" => kernel32::handle_get_windows_directory_w(&mut ctx),
+            "GetWindowsDirectoryA" => kernel32::handle_get_windows_directory_a(&mut ctx),
+            "GetSystemDirectoryW" => kernel32::handle_get_system_directory_w(&mut ctx),
+            "GetSystemDirectoryA" => kernel32::handle_get_system_directory_a(&mut ctx),
+            "GetTempPathW" => kernel32::handle_get_temp_path_w(&mut ctx),
+            "GetTempPathA" => kernel32::handle_get_temp_path_a(&mut ctx),
+            other => panic!("unknown fixed-dir handler {other}"),
+        }
+    }
+    .expect("fixed-dir handler must dispatch");
+    result.return_value
+}
+
+/// The path-returning kernel32 handlers must point INTO the seeded default
+/// skeleton: after a temp-root bottle is seeded, every returned directory
+/// exists on the host under `{root}/drive_c/…`.
+#[test]
+fn test_windows_system_and_temp_dir_handlers_return_seeded_paths() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // Seed a fresh temp-root bottle so the fixed dirs exist on the host.
+    let root = std::env::temp_dir().join(format!("wie-fixed-dirs-{}", std::process::id()));
+    let _unused = std::fs::remove_dir_all(&root);
+    crate::vfs::seed_default_skeleton(&root).expect("seed skeleton");
+    state.file_io.volumes = VolumeConfig {
+        bottle_root: Some(root.clone()),
+        drive_d_root: None,
+    };
+
+    // GetTempPath* appends a trailing backslash (Microsoft Learn).
+    let cases: &[(&str, u64, &str)] = &[
+        ("GetWindowsDirectoryW", 0x6000, r"C:\Windows"),
+        ("GetWindowsDirectoryA", 0x6100, r"C:\Windows"),
+        ("GetSystemDirectoryW", 0x6200, r"C:\Windows\System32"),
+        ("GetSystemDirectoryA", 0x6300, r"C:\Windows\System32"),
+        ("GetTempPathW", 0x6400, r"C:\Users\WIE\AppData\Local\Temp\"),
+        ("GetTempPathA", 0x6500, r"C:\Users\WIE\AppData\Local\Temp\"),
+    ];
+    for &(name, buf, expected) in cases {
+        // rcx = buffer length in TCHARs, rdx = buffer.
+        write_regs(&mut engine, 260, buf, 0, 0, STACK_TOP);
+        let len = dispatch_fixed_dir_handler(&mut engine, &mut state, name);
+        assert!(len > 0, "{name} must return a length");
+        let returned = if name.ends_with('W') {
+            read_guest_utf16_raw(&mut engine, buf, 260)
+        } else {
+            read_guest_ansi_raw(&mut engine, buf, 260)
+        };
+        assert_eq!(returned, expected, "{name} must return the seeded dir");
+        // The returned path maps into the seeded skeleton and exists on disk.
+        let map =
+            crate::vfs::guest_path_to_host(&state.file_io.volumes, returned.trim_end_matches('\\'))
+                .unwrap_or_else(|| panic!("{name}: returned path must map into the bottle"));
+        assert!(
+            map.host.is_dir(),
+            "{name}: {} must exist on the host",
+            map.host.display()
+        );
+    }
+    let _unused = std::fs::remove_dir_all(&root);
+}
