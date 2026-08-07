@@ -20,7 +20,7 @@ The capability matrix, performance numbers, and the roadmap — the long-form co
 | **Printing** | ✅ | File→Print opens the **macOS print panel** (printer or Save as PDF) |
 | **File access** | ✅ | Global app-data bottle by default; Open/Save dialogs read and write **anywhere on your Mac** |
 | **Text** | ✅ | Real macOS system fonts (Unicode, proportional, bold/italic) |
-| **Graphics (D3D9)** | 🟡 | Software renderer: Clear, triangles, textures with **full mip chains**, alpha blend, depth, **VS 2.0 + PS 2.0** (flow control, predication, relative addressing), point/line primitives, near-plane clipping. Device API surface is still small (~5–7% of `IDirect3DDevice9`) |
+| **Graphics (D3D9)** | 🟡 | Software renderer: Clear, triangles, textures with **full mip chains**, alpha blend, depth, **VS 2.0 + PS 2.0** (flow control, predication, relative addressing), point/line primitives, near-plane clipping. 51 of 119 `IDirect3DDevice9` methods landed (~43%) |
 | **Present** | ✅ | wgpu (Metal) with dirty-region uploads |
 
 The WinAPI surface is intentionally incomplete — many handlers are stubs sufficient for the micro-suite and engine bring-up. See [`docs/missing-winapi-handlers.md`](missing-winapi-handlers.md) for the gap list.
@@ -37,15 +37,83 @@ Headline numbers on Apple Silicon release builds (re-measure with `WIE_RUNTIME_P
 
 What actually burns CPU today: tight guest loops (expected ~100% under JIT), memory helpers (cold / non-pinned loads through TLB helpers), host API stops (every non-stub import), block entry/exit GPR sync, and the cold-compile tax on one-shot code.
 
-## Roadmap
+## Roadmap — the feature list for running "everything"
 
-Modern apps are the destination:
+The destination: Qt-class desktop apps, games, and anything linking the wider system-DLL
+surface. Each pillar lists what it takes, why real apps need it, and the current state
+(✅ landed · 🟡 partial · ⬜ missing). The per-DLL gap inventory lives in
+[`docs/missing-winapi-handlers.md`](missing-winapi-handlers.md).
 
-1. **Widen the D3D9 pipeline** — larger device API surface, fixed-function coverage, remaining shader details.
-2. **Take rendering to the GPU** — the wgpu/Metal present path already uploads dirty regions; the next step is offloading rasterization to Metal compute, keeping the software renderer as the correctness oracle.
-3. **Widen the API surface** — newer graphics APIs, broader Win32 coverage, and the DLL ecosystem real apps link.
+### 1. CPU / ABI fidelity — everything else sits on this
 
-Progress is tracked in the live log at `.slim/deepwork/gui-implementation.md`.
+| Feature | Why apps need it | State |
+| --- | --- | --- |
+| SIMD breadth (SSE4.1/4.2, AVX, AVX2, BMI1/2, FMA, POPCNT, CRC32, RDRAND, AES-NI) | Modern Qt builds and game engines compile with `/arch:AVX2` and dispatch on CPUID feature bits | 🟡 SSE/SSE2-era covered; AVX+ missing |
+| CPUID fidelity | Binaries branch on reported features; lying breaks the chosen code path | 🟡 |
+| RDTSC / RDTSCP semantics; QPC/QPF coherence | Frame pacing, profilers, game timers | ✅ QPC/GetTickCount landed |
+| x87 / MMX for older binaries | Legacy 32-bit-era PE32 payloads (32-bit apps are a non-goal, but DLL payloads appear) | 🟡 iced covers; JIT limited |
+| JIT unwind metadata (`unwind_info = false` today) | C++ exceptions thrown *through* JIT-compiled frames need .pdata-equivalent info | ⬜ deliberate gap |
+
+### 2. Win32 surface — zero-coverage DLLs ("all kinds of system DLLs")
+
+| DLL | What real apps use it for | State |
+| --- | --- | --- |
+| `WS2_32` | **QtNetwork**, game multiplayer, updaters, any TCP/UDP | ⬜ 0 handlers |
+| `WININET` / `URLMON` | HTTP/update checks, web content | ⬜ |
+| `CRYPT32` | Certificates, code signing, hash APIs | ⬜ |
+| `MSIMG32` | AlphaBlend/TransparentBlt (GDI-era UI polish) | ⬜ |
+| `IMM32` | IME text input (CJK apps, Qt text fields) | ⬜ |
+| `SETUPAPI` / `CFGMGR32` | Installers, device queries | ⬜ |
+| `UXTHEME` | Visual styles — Qt apps call `SetWindowTheme` | 🟡 `SetWindowTheme` no-op only |
+| `MSVCR71` / `MSVCP71` | Legacy CRT binaries | ⬜ |
+| `DBGHELP` / `IMAGEHLP` | Crash handlers, stack walking | ⬜ |
+
+### 3. Qt-class apps (Qt5/Qt6, Electron-class)
+
+- **OpenGL (WGL/`opengl32`)** — Qt Quick and the Qt OpenGL backend render through it; the biggest single blocker for real Qt apps. ⬜
+- **API-set forwarding** (`api-ms-win-*`) — modern Qt6 links these names; forwarding exists (7 sites). ✅
+- **OLE clipboard + drag-drop** (`IDropTarget`, OLE formats) — Qt's clipboard and DnD are OLE-based, not CF_* based. 🟡
+- **COM registration lookup** — `CoCreateInstance` returns `REGDB_E_CLASSNOTREG`; Qt ActiveX/QAxWidget and many frameworks need real COM servers. ⬜
+- **Registry breadth** — QSettings reads/writes the hive; per-bottle persistence exists; the `RegDelete*`/security family is still missing. 🟡
+- **Fonts** — `EnumFontFamiliesEx`, `AddFontResource`, font linking; Qt enumerates system fonts for its font dialogs. 🟡 text works, enumeration missing
+- **`ReadDirectoryChangesW`** — `QFileSystemWatcher` (0 handlers today). ⬜
+- **`CreateProcess`** — `QProcess` and every app that spawns a child (0 handlers today; today's apps must be single-process). ⬜
+- **Locales** — `CompareString`, `LCMapString`, `GetLocaleInfo` for collation and string mapping. ⬜
+- **Console APIs** — full `ReadConsoleInput` etc. for interactive CLIs. 🟡
+
+### 4. Games
+
+- **D3D9 completion** — cube/volume textures, materials/lighting, clip planes, queries, swap chains, `Reset`, `TestCooperativeLevel`, VS 3.0/PS 3.0 (51 of 119 device methods today, ≈43%). 🟡
+- **D3D11 / DXGI** — modern titles. ⬜
+- **GPU offload** — move rasterization to Metal compute, software renderer stays the correctness oracle. ⬜ (roadmap item)
+- **Audio** — XAudio2, DirectSound, `waveOut`/winmm (0 audio output today; winmm has only `timeGetTime`). ⬜
+- **Input** — XInput (controllers), DirectInput, raw input. ⬜
+- **Fullscreen** — exclusive mode, `ChangeDisplaySettings`, monitor enumeration. 🟡
+- **Timing/perf** — QPC present; SIMD JIT quality and frame pacing are the perf levers. 🟡
+
+### 5. Process model & inter-process plumbing
+
+- **`CreateProcess` + child processes** — exit codes, stdio pipes, console inheritance. ⬜
+- **Named pipes / mailslots** — IPC between a parent and its children. ⬜
+- **Job objects** — full `Set/QueryInformationJobObject` (create/assign landed). 🟡
+- **Thread pools / fibers** — `QueueUserWorkItem`, `SwitchToFiber`. 🟡
+
+### 6. User-facing completeness
+
+- **Clipboard** — all formats incl. OLE (EDIT cut/copy/paste landed). 🟡
+- **IME** (IMM32) — CJK input. ⬜
+- **Fonts** — enumeration, `AddFontResource`, `GetGlyphOutline`. 🟡
+- **Time zones / DST** — `GetTimeZoneInformation` correctness. 🟡
+
+### 7. Ecosystem & tooling
+
+- **Installers** (Inno Setup / NSIS) — registry, shell links, `ShellExecuteEx`, COM. 🟡
+- **Manifests / SxS activation contexts** — modern apps ship manifests; resolution may matter. 🟡
+- **`version.dll`** — landed (RNotepad dependency). ✅
+
+The immediate next milestone is **Qt-class apps**: OpenGL, `CreateProcess`, winsock, and the
+OLE clipboard/drag-drop stack unlock real Qt5 GUI apps; audio + D3D9 completion + GPU offload
+then unlock games. Progress is tracked in the live log at `.slim/deepwork/gui-implementation.md`.
 
 ## History
 
