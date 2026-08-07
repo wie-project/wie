@@ -76,7 +76,7 @@ pub(crate) fn ensure_exe_in_bottle(
             dest.display()
         )
     })?;
-    tracing::error!(
+    tracing::debug!(
         "bottle: copied exe in ({} -> {})",
         host_path.display(),
         dest.display()
@@ -128,7 +128,7 @@ pub(crate) fn run_micro(
         Some(p) if is_interactive_stdin(p) => {
             // Interactive stdin: let the emulator read line-by-line from the host
             // TTY via LiveHost mode (empty bytes = live reading).
-            tracing::error!("stdin: interactive (LiveHost mode)");
+            tracing::debug!("stdin: interactive (LiveHost mode)");
             Vec::new()
         }
         Some(p) => std::fs::read(p)
@@ -152,14 +152,14 @@ pub(crate) fn run_micro(
         },
     )?;
 
-    tracing::error!("run_micro: path={}", summary.path);
-    tracing::error!("cpu_backend: {}", summary.cpu_backend);
-    tracing::error!(
+    tracing::debug!("run_micro: path={}", summary.path);
+    tracing::debug!("cpu_backend: {}", summary.cpu_backend);
+    tracing::debug!(
         "entry={:#018x} initial_rsp={:#018x}",
         summary.entry_point_va,
         summary.initial_rsp
     );
-    tracing::error!(
+    tracing::debug!(
         "events={} termination={:?}",
         summary.run.events.len(),
         summary.run.termination
@@ -175,7 +175,7 @@ pub(crate) fn run_micro(
     let force_full = std::env::var_os("WIE_API_TRACE").is_some();
     if force_full || events.len() <= HEAD + TAIL {
         for event in events {
-            tracing::error!(
+            tracing::debug!(
                 "  [{:>4}] {}!{} handled={} ret={:?}",
                 event.index,
                 event.library.as_ref(),
@@ -186,7 +186,7 @@ pub(crate) fn run_micro(
         }
     } else {
         for event in events.iter().take(HEAD) {
-            tracing::error!(
+            tracing::debug!(
                 "  [{:>4}] {}!{} handled={} ret={:?}",
                 event.index,
                 event.library.as_ref(),
@@ -196,9 +196,9 @@ pub(crate) fn run_micro(
             );
         }
         let omitted = events.len().saturating_sub(HEAD + TAIL);
-        tracing::error!("  … {omitted} events omitted (set WIE_API_TRACE=1 for full dump) …");
+        tracing::debug!("  … {omitted} events omitted (set WIE_API_TRACE=1 for full dump) …");
         for event in events.iter().skip(events.len().saturating_sub(TAIL)) {
-            tracing::error!(
+            tracing::debug!(
                 "  [{:>4}] {}!{} handled={} ret={:?}",
                 event.index,
                 event.library.as_ref(),
@@ -210,12 +210,12 @@ pub(crate) fn run_micro(
     }
 
     if let Some(profile) = &summary.profile {
-        tracing::error!("{}", profile.report());
+        tracing::debug!("{}", profile.report());
     }
 
     match summary.exit_code {
         Some(code) if code == expect_code => {
-            tracing::error!("run_micro: ok exit={code}");
+            tracing::debug!("run_micro: ok exit={code}");
             Ok(())
         }
         Some(code) => {
@@ -266,7 +266,7 @@ struct TerminalRawGuard;
 impl TerminalRawGuard {
     fn enter() -> Self {
         if !wie_winapi::console::set_raw_mode(true) {
-            tracing::error!(
+            tracing::warn!(
                 "warning: --console needs a terminal (stdin is not a tty); keys will require Enter"
             );
         }
@@ -352,7 +352,7 @@ pub(crate) fn run_console_interactive(path: &Path, max_api: Option<usize>) -> Re
         }
     };
 
-    tracing::error!("run_console: exit={exit_code}");
+    tracing::debug!("run_console: exit={exit_code}");
     Ok(())
 }
 
@@ -491,9 +491,7 @@ mod tests {
         micro.push("micro-exes/out");
         micro.push("crt_hello.exe");
         if !micro.is_file() {
-            tracing::error!(
-                "skip: micro-exes/out/crt_hello.exe not built (run make -C micro-exes)"
-            );
+            tracing::warn!("skip: micro-exes/out/crt_hello.exe not built (run make -C micro-exes)");
             return;
         }
         // Stage the exe outside the bottle, in an unrelated temp dir.
