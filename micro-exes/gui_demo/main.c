@@ -236,24 +236,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 // Click the Dialog button through the REAL bridged click
                 // path (BM_CLICK → host button WndProc → WM_COMMAND into the
                 // guest WndProc → DialogBoxParam). The modal loop runs inside
-                // this dispatch; the next tick's Enter closes the dialog.
+                // this dispatch. The dialog stays open until the HOST closes
+                // it (a real OK-button click) — the host test waits for the
+                // dialog's face in the published surface first, so the close
+                // can never race the dialog's first paint (a host-clock
+                // timer-based close would fire during the open dispatch under
+                // CPU starvation and the dialog would close unpainted).
                 SendMessageA(g_btn_dialog, BM_CLICK, 0, 0);
-            } else if (g_timer_count == 2) {
-                // The click is synchronous, so the dialog's modal loop is
-                // running right now. Close it with a REAL mouse click on the
-                // OK button (WM_LBUTTONDOWN/UP → BN_CLICKED →
-                // WM_COMMAND(IDOK) → EndDialog) — the exact path a user's
-                // click takes.
-                HWND dlg = GetActiveWindow();
-                if (dlg && dlg != g_hwnd) {
-                    HWND ok = GetDlgItem(dlg, 1);
-                    if (ok) {
-                        PostMessageA(ok, WM_LBUTTONDOWN, MK_LBUTTON, 0);
-                        PostMessageA(ok, WM_LBUTTONUP, 0, 0);
-                    }
-                }
             }
-            if (g_timer_count >= TIMER_TICKS) {
+            // The dialog is closed by the HOST (a real OK-button click posted
+            // after the host observed the dialog's face in the published
+            // surface — the selftest must never close it on a timer tick:
+            // under CPU starvation the host-clock tick could fire inside the
+            // open dispatch and the dialog would close unpainted). The
+            // verification therefore waits for the dialog to actually close
+            // (g_dialog_result != -1): if it is still open, skip this tick
+            // and let the next timer tick retry.
+            if (g_timer_count >= TIMER_TICKS && g_dialog_result != -1) {
                 // Verify every component echoed. Each step exits with a
                 // distinct code so CI failures pinpoint the component.
                 char buf[128];

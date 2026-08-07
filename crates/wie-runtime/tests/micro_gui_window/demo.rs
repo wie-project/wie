@@ -521,6 +521,16 @@ fn gui_dialog_shift_tab_moves_focus() {
 /// the quiescent drain was skipped (`pending_callbacks` non-empty) and the
 /// dialog never appeared until the callback popped (the reported "click
 /// Dialog… → nothing; click Exit → dialog suddenly appears" behavior).
+///
+/// The dialog is closed by the HOST (a real OK-button click through the
+/// host posting path), not by a guest timer: the selftest used to close it
+/// on a host-clock timer tick, and under CPU starvation that deadline can
+/// land inside the open dispatch — the dialog then closed before its first
+/// WM_PAINT (paint synthesis happens only at an empty-queue scan) and never
+/// published, a load-dependent flake. Gating the close on the observed face
+/// makes the test deterministic: the dialog stays open until the host has
+/// proof it painted, and the publish-model regression now fails via the
+/// iteration bound instead of racing the close.
 #[test]
 fn gui_demo_dialog_opens_on_click() {
     let Some(path) = micro_exe("gui_demo.exe") else {
@@ -540,6 +550,12 @@ fn gui_demo_dialog_opens_on_click() {
     // owner's published surface.
     const DIALOG_FACE_SAMPLE: (u32, u32) = (490, 150);
 
+    // Host-posted OK-button click: the same WM_LBUTTONDOWN/UP pair the
+    // interactive test drives (a real user's click).
+    const WM_LBUTTONDOWN: u32 = 0x0201;
+    const WM_LBUTTONUP: u32 = 0x0202;
+    const MK_LBUTTON: u64 = 0x0001;
+
     let mut session =
         wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
             .expect("GUI session starts");
@@ -551,6 +567,7 @@ fn gui_demo_dialog_opens_on_click() {
     let mut iterations = 0;
     let mut saw_dialog_face = false;
     let mut saw_button_hit_test = false;
+    let mut closed_dialog = false;
     let handle = session.guest_handle();
     let exit_code = loop {
         let summary = session
@@ -590,6 +607,28 @@ fn gui_demo_dialog_opens_on_click() {
                 && ry < 40
             {
                 saw_button_hit_test = true;
+            }
+        }
+
+        // Close the dialog from the HOST — a real OK-button click through
+        // the host posting path (`window_at` hit-test + `post_message_at`).
+        // The close waits for the observed face: the selftest no longer
+        // closes on a timer tick (a host-clock deadline can land inside the
+        // open dispatch under load and the dialog closes before its first
+        // WM_PAINT — see the test doc). While the dialog is open, the
+        // selftest's verification retries on later ticks, so the host has
+        // unbounded time to observe the face; a publish-model regression now
+        // fails the 300-iteration bound instead of racing the close.
+        if saw_dialog_face && saw_button_hit_test && !closed_dialog {
+            if let Some((hwnd, rx, ry)) = handle.window_at(240, 248)
+                && hwnd != 0
+                && rx < 120
+                && ry < 40
+            {
+                let lparam = u64::from(ry << 16 | rx);
+                handle.post_message_at(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lparam, 240, 248);
+                handle.post_message_at(hwnd, WM_LBUTTONUP, 0, lparam, 240, 248);
+                closed_dialog = true;
             }
         }
 
