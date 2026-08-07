@@ -9,9 +9,11 @@ CLI="${CLI:-$ROOT/target/release/wie}"
 CPU="${WIE_CPU:-jit}"
 CATEGORY="${1:-all}"
 
-# The per-run summary (path, events, exit) is a `wie`-target debug log; show
-# it by default so the suite reports what each exe did.
-export RUST_LOG="${RUST_LOG:-wie=debug}"
+# The per-run summary (path, events, exit) is a `wie::commands::run`-target
+# debug log; show it by default so the suite reports what each exe did.
+# (Note: EnvFilter matches string prefixes, so `wie` alone would also enable
+# `wie_cpu`/`wiegui`/`wie_runtime` — the full target path keeps the noise out.)
+export RUST_LOG="${RUST_LOG:-wie::commands::run=debug}"
 
 if [[ ! -x "$CLI" ]]; then
   echo "building wie (release)…"
