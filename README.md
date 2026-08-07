@@ -11,7 +11,12 @@
 ## Quick start
 
 ```bash
+# Build from source
 cargo build -p wie-cli --release
+
+# Or install the prebuilt binary with Homebrew
+brew tap wie-project/wie
+brew install wie
 
 # A Windows console app
 ./target/release/wie-cli run micro-exes/out/crt_hello.exe
