@@ -23,14 +23,14 @@
 #   ./scripts/notepad-scenario.sh --manual   # + interactive GUI scenario
 #
 # Knobs:
-#   WIE_CLI           wie-cli binary (default ./target/debug/wie-cli)
+#   WIE_CLI           wie binary (default ./target/debug/wie)
 #   WIE_NOTEPAD_ROOT  bottle root (default ${TMPDIR}/wie-notepad-scenario)
 #   NOTEPAD_TIMEOUT   per-run timeout in seconds (default 90)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 NOTEPAD="$ROOT/real_exes/notepad.exe"
-WIE_CLI="${WIE_CLI:-$ROOT/target/debug/wie-cli}"
+WIE_CLI="${WIE_CLI:-$ROOT/target/debug/wie}"
 BOTTLE="${WIE_NOTEPAD_ROOT:-${TMPDIR:-/tmp}/wie-notepad-scenario}"
 TIMEOUT_S="${NOTEPAD_TIMEOUT:-90}"
 
@@ -44,7 +44,7 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
 # --- preflight ---------------------------------------------------------------
 [[ -f "$NOTEPAD" ]] || fail "real_exes/notepad.exe missing — run ./scripts/fetch-rnotepad.sh"
-[[ -x "$WIE_CLI" ]] || fail "wie-cli missing at $WIE_CLI — build with: cargo build -p wie-cli"
+[[ -x "$WIE_CLI" ]] || fail "wie missing at $WIE_CLI — build with: cargo build -p wie-cli"
 
 # --- step 0: bottle + fixture (headless) -------------------------------------
 say "step 0: fixture in bottle ($BOTTLE/drive_c)"
@@ -182,7 +182,7 @@ if [[ $MANUAL -eq 1 ]]; then
     echo "  1. Status bar (automated above): $BOTTLE/notepad-frame.bmp"
     echo "  2. Live window incl. the macOS menu bar:"
     echo "       ./scripts/notepad-scenario.sh --manual   (leave notepad open)"
-    echo "       screencapture -l \$(osascript -e 'tell app \"wie-cli\" to id of window 1') \\"
+    echo "       screencapture -l \$(osascript -e 'tell app \"wie\" to id of window 1') \\"
     echo "         $BOTTLE/notepad-live.png"
 fi
 

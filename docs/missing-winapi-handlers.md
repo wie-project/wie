@@ -51,7 +51,7 @@ superseded by this list:
 
 ## Notepad trace triage (Task 6.2, 2026-08-04)
 
-`./target/debug/wie-cli trace --max-api 400 real_exes/notepad.exe` now runs the full startup +
+`./target/debug/wie trace --max-api 400 real_exes/notepad.exe` now runs the full startup +
 first message-loop iterations to a clean `ExitProcess { code: 0 }` — the entire P0.3-era
 first-failure chain is resolved. `inspect --winapi-map` still flags 25 imports as TODO; 23 are
 genuinely unimplemented (2 are map artifacts: `RegCreateKeyExW` is soft-dispatched in advapi32,

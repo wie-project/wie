@@ -5,6 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+# The produced binary is `wie` (the crate keeps its name for the
+# dependency graph).
+[[bin]]
+name = "wie"
+path = "src/main.rs"
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

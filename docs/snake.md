@@ -11,7 +11,7 @@ make -C micro-exes snake
 ## Run
 
 ```bash
-./target/release/wie-cli run --persistent --max-api 100000000 micro-exes/out/snake.exe
+./target/release/wie run --persistent --max-api 100000000 micro-exes/out/snake.exe
 ```
 
 **Controls:** `WASD` or arrow keys, `q` to quit.

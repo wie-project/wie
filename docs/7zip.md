@@ -57,7 +57,7 @@ One bottle, synthetic payloads only (no personal files). After `real_exes/7za.ex
 
 ```bash
 cargo build -p wie-cli --release
-CLI=./target/release/wie-cli
+CLI=./target/release/wie
 PE=real_exes/7za.exe
 test -f "$PE" || { echo "missing $PE â€” install Windows x64 7za (see above)"; exit 1; }
 
@@ -122,9 +122,9 @@ test -f real_exes/7za.exe || { echo "install x64 7za.exe first"; exit 1; }
 B=$(mktemp -d) && mkdir -p "$B/drive_c/App" && \
   cp real_exes/7za.exe "$B/drive_c/App/" && \
   echo hi > "$B/drive_c/App/hello.txt" && \
-  ./target/release/wie-cli run --root "$B" --max-api 200000 real_exes/7za.exe -- \
+  ./target/release/wie run --root "$B" --max-api 200000 real_exes/7za.exe -- \
     a -mmt1 -bd 'C:\App\h.7z' 'C:\App\hello.txt' && \
-  ./target/release/wie-cli run --root "$B" --max-api 200000 real_exes/7za.exe -- \
+  ./target/release/wie run --root "$B" --max-api 200000 real_exes/7za.exe -- \
     x -mmt1 -bd -y -o'C:\App\out' 'C:\App\h.7z' && \
   cat "$B/drive_c/App/out/hello.txt" && rm -rf "$B"
 ```
@@ -160,7 +160,7 @@ Small and medium create/list/extract (README universal example, including ~140â€
 
 ```bash
 B="/tmp/w7z_heavy_$$" && mkdir -p "$B/drive_c/App"
-time env WIE_RUNTIME_PROFILE=1 ./target/release/wie-cli run \
+time env WIE_RUNTIME_PROFILE=1 ./target/release/wie run \
   --root "$B" \
   --drive-d "/path/to/large_tree" \
   --max-api 20000000 \

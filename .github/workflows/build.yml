@@ -38,7 +38,7 @@ jobs:
         run: cargo build -p wie-cli --release
 
       - name: Package the binary
-        run: tar czf wie-macos-arm64.tar.gz -C target/release wie-cli
+        run: tar czf wie-macos-arm64.tar.gz -C target/release wie
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

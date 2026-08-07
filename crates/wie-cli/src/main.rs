@@ -1,4 +1,4 @@
-//! `wie-cli` — WIE PE64 userspace emulator CLI.
+//! `wie` — WIE PE64 userspace emulator CLI.
 
 mod bmp;
 mod commands;
@@ -18,7 +18,7 @@ const PERSISTENT_MAX_API_DEFAULT: usize = 3400;
 const TRACE_MAX_API_DEFAULT: usize = 20;
 
 #[derive(Debug, Parser)]
-#[command(name = "wie-cli")]
+#[command(name = "wie")]
 #[command(about = "WIE — PE64 userspace emulator")]
 #[command(long_about = "\
 Generic PE64 userspace emulator CLI.\n\
@@ -114,7 +114,7 @@ enum Command {
         #[arg(long)]
         input_script: Option<PathBuf>,
 
-        /// Guest argv after the module name (`wie-cli run pe -- -n 3 -m hi`).
+        /// Guest argv after the module name (`wie run pe -- -n 3 -m hi`).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         guest_args: Vec<String>,
     },

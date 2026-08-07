@@ -25,7 +25,7 @@ pub struct MenuNode {
     /// The raw Windows-style shortcut suffix split off `title` at its first
     /// tab (e.g. `"Ctrl+N"`, `"Del"`, `"F5"`); `None` when the item has none.
     ///
-    /// Kept as the raw resource string — the host bar (wie-cli) parses it
+    /// Kept as the raw resource string — the host bar (wie) parses it
     /// into a platform key equivalent, since only that crate depends on muda.
     pub accelerator: Option<String>,
     /// Submenu items (non-empty only for `MF_POPUP` items).

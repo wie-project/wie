@@ -19,17 +19,17 @@ brew tap wie-project/wie
 brew install wie
 
 # A Windows console app
-./target/release/wie-cli run micro-exes/out/crt_hello.exe
+./target/release/wie run micro-exes/out/crt_hello.exe
 
 # A Windows GUI app — a real window opens on your Mac
-./target/release/wie-cli run --gui micro-exes/out/gui_demo.exe
+./target/release/wie run --gui micro-exes/out/gui_demo.exe
 
 # A terminal game
-./target/release/wie-cli run --console micro-exes/out/snake.exe
+./target/release/wie run --console micro-exes/out/snake.exe
 
 # The flagship demo: real Windows Notepad (fetch once)
 ./scripts/fetch.sh notepad
-./target/release/wie-cli run --gui real_exes/notepad.exe
+./target/release/wie run --gui real_exes/notepad.exe
 ```
 
 File operations just work — no setup. Guest `C:\` maps to a per-user app-data bottle (`~/Library/Application Support/WIE/bottle/`), created on demand; `--root` overrides it. Files you pick in the native Open/Save panels are read and written **in place** on your Mac.

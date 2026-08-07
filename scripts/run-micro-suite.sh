@@ -5,12 +5,12 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-CLI="${CLI:-$ROOT/target/release/wie-cli}"
+CLI="${CLI:-$ROOT/target/release/wie}"
 CPU="${WIE_CPU:-jit}"
 CATEGORY="${1:-all}"
 
 if [[ ! -x "$CLI" ]]; then
-  echo "building wie-cli (release)…"
+  echo "building wie (release)…"
   cargo build -p wie-cli --release --manifest-path "$ROOT/Cargo.toml"
 fi
 

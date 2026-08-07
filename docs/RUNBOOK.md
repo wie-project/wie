@@ -44,10 +44,10 @@ WIE_JIT_MEM=pin  ./scripts/run-micro-suite.sh
 ## Profile snapshot
 
 ```bash
-WIE_RUNTIME_PROFILE=1 ./target/release/wie-cli run micro-exes/out/long_loop.exe
+WIE_RUNTIME_PROFILE=1 ./target/release/wie run micro-exes/out/long_loop.exe
 # expect ~100% CPU on pure loops; mem_backend=mmap
 
-WIE_JIT_MEM_TRACE=1 WIE_RUNTIME_PROFILE=1 ./target/release/wie-cli run real_exes/7za.exe -- …
+WIE_JIT_MEM_TRACE=1 WIE_RUNTIME_PROFILE=1 ./target/release/wie run real_exes/7za.exe -- …
 # mem_path helpers=… resolve: sticky= multi= pin= walk= …
 ```
 
