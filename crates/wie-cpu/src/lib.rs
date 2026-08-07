@@ -651,7 +651,7 @@ pub fn active_backend_name() -> &'static str {
 /// Backend open failure.
 pub fn open_default_cpu() -> Result<Box<dyn CpuEngine>, CpuError> {
     let name = active_backend_name();
-    tracing::info!(backend = name, "opening WIE CPU backend");
+    tracing::debug!(backend = name, "opening WIE CPU backend");
     match name {
         "iced" => Ok(Box::new(IcedCpu::open_x86_64())),
         _ => Ok(Box::new(JitCpu::open_x86_64())),
@@ -704,7 +704,7 @@ impl CpuBackend {
 /// Backend open failure.
 pub fn open_cpu() -> Result<CpuBackend, CpuError> {
     let name = active_backend_name();
-    tracing::info!(backend = name, "opening WIE CPU backend");
+    tracing::debug!(backend = name, "opening WIE CPU backend");
     if name == "iced" {
         let cpu = IcedCpu::open_x86_64();
         let guest_mem = Arc::clone(cpu.guest_mem_arc());

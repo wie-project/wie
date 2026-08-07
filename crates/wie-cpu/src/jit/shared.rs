@@ -149,7 +149,7 @@ impl JitShared {
     pub(super) fn new() -> Self {
         let has_engine = match JitEngine::new() {
             Ok(e) => {
-                tracing::info!("cranelift JIT module ready");
+                tracing::debug!("cranelift JIT module ready");
                 Some(e)
             }
             Err(e) => {
