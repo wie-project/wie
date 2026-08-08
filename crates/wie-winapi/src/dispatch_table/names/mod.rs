@@ -294,11 +294,7 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
         let n = name.to_ascii_lowercase();
         return matches!(
             n.as_str(),
-            "regdeletekeyw"
-                | "regdeletekeya"
-                | "regflushkey"
-                | "regsavekeyw"
-                | "regsavekeya"
+            "regdeletekeyw" | "regdeletekeya" | "regflushkey" | "regsavekeyw" | "regsavekeya"
         );
     }
     if library.eq_ignore_ascii_case("KERNEL32.dll") {
