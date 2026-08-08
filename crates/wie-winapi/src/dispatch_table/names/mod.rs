@@ -108,6 +108,8 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
                 | "memset"
                 | "strlen"
                 | "strncmp"
+                | "strchr"
+                | "strstr"
                 | "_initterm"
                 | "_initterm_e"
                 | "_configure_narrow_argv"

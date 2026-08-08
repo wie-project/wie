@@ -278,6 +278,72 @@ pub(crate) fn handle_strtok(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         finish(engine, 0)
     }
 }
+/// `strstr(haystack, needle)` — pointer to the FIRST occurrence of `needle`
+/// in `haystack`, or NULL. Empty needle → haystack.
+pub(crate) fn handle_strstr(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let haystack = engine.read_rcx()?;
+    let needle = engine.read_rdx()?;
+    if haystack == 0 || needle == 0 {
+        return finish(engine, 0);
+    }
+    // Read both NUL-terminated strings into host buffers (NUL excluded so a
+    // mid-string needle match does not need to align the terminators).
+    let mut hay = Vec::new();
+    let mut ndl = Vec::new();
+    let mut i = 0_u64;
+    loop {
+        let mut b = [0_u8; 1];
+        if engine.mem_read(haystack.wrapping_add(i), &mut b).is_err() {
+            break;
+        }
+        if b[0] == 0 || i > 1_000_000 {
+            break;
+        }
+        hay.push(b[0]);
+        i = i.saturating_add(1);
+    }
+    i = 0;
+    loop {
+        let mut b = [0_u8; 1];
+        if engine.mem_read(needle.wrapping_add(i), &mut b).is_err() {
+            break;
+        }
+        if b[0] == 0 || i > 1_000_000 {
+            break;
+        }
+        ndl.push(b[0]);
+        i = i.saturating_add(1);
+    }
+    if ndl.is_empty() {
+        return finish(engine, haystack);
+    }
+    // Sliding match over the host buffers.
+    let mut pos = 0_usize;
+    while pos < hay.len() {
+        let mut matched = true;
+        let mut k = 0_usize;
+        while k < ndl.len() {
+            let Some(h) = hay.get(pos + k) else {
+                matched = false;
+                break;
+            };
+            if *h != ndl[k] {
+                matched = false;
+                break;
+            }
+            k += 1;
+        }
+        if matched {
+            return finish(
+                engine,
+                haystack.wrapping_add(u64::try_from(pos).unwrap_or(0)),
+            );
+        }
+        pos += 1;
+    }
+    finish(engine, 0)
+}
 /// ctype helpers: isalpha, isdigit, isalnum, islower, isupper, isspace, toupper, tolower.
 pub(crate) fn handle_isalpha(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -777,4 +843,31 @@ pub(crate) fn handle_wcsrchr(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         }
     }
     finish(engine, last)
+}
+/// `strchr(s, c)` — pointer to the FIRST occurrence of byte `c`, or NULL.
+pub(crate) fn handle_strchr(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let s = engine.read_rcx()?;
+    let c = u8::try_from(engine.read_rdx()? & 0xff).unwrap_or(0);
+    if s == 0 {
+        return finish(engine, 0);
+    }
+    let mut i = 0_u64;
+    loop {
+        let mut b = [0_u8; 1];
+        if engine.mem_read(s.wrapping_add(i), &mut b).is_err() {
+            break;
+        }
+        if b[0] == c {
+            return finish(engine, s.wrapping_add(i));
+        }
+        if b[0] == 0 {
+            break;
+        }
+        i = i.saturating_add(1);
+        if i > 1_000_000 {
+            break;
+        }
+    }
+    finish(engine, 0)
 }

@@ -57,10 +57,11 @@ use stdio::{
 };
 use string::{
     handle_isalnum, handle_isalpha, handle_isdigit, handle_islower, handle_isspace, handle_isupper,
-    handle_iswctype, handle_memcmp, handle_memcpy, handle_memset, handle_strcmp, handle_strlen,
-    handle_strncmp, handle_strncpy, handle_strtod, handle_strtok, handle_strtol, handle_strtoul,
-    handle_tolower, handle_toupper, handle_towupper, handle_wcscat, handle_wcscmp, handle_wcscpy,
-    handle_wcslen, handle_wcsncmp, handle_wcsncpy, handle_wcsnicmp, handle_wcsrchr, handle_wcsstr,
+    handle_iswctype, handle_memcmp, handle_memcpy, handle_memset, handle_strchr, handle_strcmp,
+    handle_strlen, handle_strncmp, handle_strncpy, handle_strstr, handle_strtod, handle_strtok,
+    handle_strtol, handle_strtoul, handle_tolower, handle_toupper, handle_towupper, handle_wcscat,
+    handle_wcscmp, handle_wcscpy, handle_wcslen, handle_wcsncmp, handle_wcsncpy, handle_wcsnicmp,
+    handle_wcsrchr, handle_wcsstr,
 };
 /// Guest VA base for synthetic CRT objects (FILE cookies, env pointers, etc.).
 const ACMDLN_PTR_SLOT: u64 = CRT_GUEST_BASE + 0x328;
@@ -236,6 +237,8 @@ pub fn dispatch_ucrt(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiH
         "fgetc" => handle_fgetc(ctx),
         "strtok" => handle_strtok(ctx),
         "strcmp" => handle_strcmp(ctx),
+        "strchr" => handle_strchr(ctx),
+        "strstr" => handle_strstr(ctx),
         "strncpy" => handle_strncpy(ctx),
         "isalpha" => handle_isalpha(ctx),
         "isdigit" => handle_isdigit(ctx),

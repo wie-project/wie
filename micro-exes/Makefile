@@ -14,9 +14,9 @@ LDFLAGS  := -nostdlib -Wl,--subsystem,console -Wl,--entry,entry
 # Ordinary CRT-linked apps (independent-style): full toolchain defaults.
 CRT_CFLAGS := -O2
 
-.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes dll_tests game_exes interactive_exes ucrt_coverage gui_exes print_bmp version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo
+.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes dll_tests game_exes interactive_exes ucrt_coverage gui_exes print_bmp version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo http_get
 
-all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes game_exes interactive_exes dll_tests ucrt_coverage gui_exes version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo
+all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes game_exes interactive_exes dll_tests ucrt_coverage gui_exes version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo http_get
 
 $(OUT):
 	mkdir -p $(OUT)
@@ -382,6 +382,14 @@ $(OUT)/ime_noop.exe: ime_noop/main.c | $(OUT)
 ws2_echo: $(OUT)/ws2_echo.exe
 
 $(OUT)/ws2_echo.exe: ws2_echo/main.c | $(OUT)
+	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $< -lws2_32
+	@echo "built $@"
+
+# WS2_32 HTTP (http_get): real HTTP/1.1 GET against example.com through the
+# host resolver + Winsock handlers.
+http_get: $(OUT)/http_get.exe
+
+$(OUT)/http_get.exe: http_get/main.c | $(OUT)
 	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $< -lws2_32
 	@echo "built $@"
 
