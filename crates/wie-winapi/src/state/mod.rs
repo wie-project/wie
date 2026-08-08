@@ -443,7 +443,8 @@ impl WinApiState {
     /// Mutable access to the Winsock socket table (guest `SOCKET` → host
     /// socket). Lazy: allocated on first `WS2_32` call.
     pub fn ws2(&mut self) -> &mut crate::ws2_32::Ws2State {
-        self.dll_states.get_or_init::<crate::ws2_32::Ws2State>(DllId::Ws2)
+        self.dll_states
+            .get_or_init::<crate::ws2_32::Ws2State>(DllId::Ws2)
     }
 
     /// Mutable access to the crypto handle tables. Lazy: allocated on first

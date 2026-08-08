@@ -6,6 +6,7 @@
 MINGW_CC   ?= x86_64-w64-mingw32-gcc
 MINGW_CXX  ?= x86_64-w64-mingw32-g++
 WINDRES    ?= x86_64-w64-mingw32-windres
+DLLTOOL    ?= x86_64-w64-mingw32-dlltool
 
 OUT      := out
 CFLAGS   := -O2 -ffreestanding -fno-stack-protector -fno-asynchronous-unwind-tables
@@ -13,9 +14,9 @@ LDFLAGS  := -nostdlib -Wl,--subsystem,console -Wl,--entry,entry
 # Ordinary CRT-linked apps (independent-style): full toolchain defaults.
 CRT_CFLAGS := -O2
 
-.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes dll_tests game_exes interactive_exes ucrt_coverage gui_exes print_bmp version_query
+.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes dll_tests game_exes interactive_exes ucrt_coverage gui_exes print_bmp version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo
 
-all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes game_exes interactive_exes dll_tests ucrt_coverage gui_exes version_query
+all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes game_exes interactive_exes dll_tests ucrt_coverage gui_exes version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo
 
 $(OUT):
 	mkdir -p $(OUT)
@@ -54,6 +55,9 @@ seh_access_violation: $(OUT)/seh_access_violation.exe
 seh_div_zero: $(OUT)/seh_div_zero.exe
 print_bmp: $(OUT)/print_bmp.exe
 version_query: $(OUT)/version_query.exe
+setupapi_list: $(OUT)/setupapi_list.exe
+dbghelp_stub: $(OUT)/dbghelp_stub.exe
+crypt_hash: $(OUT)/crypt_hash.exe
 
 # Print-DC pipeline (P1a): CreateDCW → StartDocW → StartPage/EndPage → EndDoc.
 $(OUT)/print_bmp.exe: print_bmp/main.c | $(OUT)
@@ -334,6 +338,51 @@ $(OUT)/version_query_res.o: version_query/version.rc | $(OUT)
 
 $(OUT)/version_query.exe: version_query/main.c $(OUT)/version_query_res.o | $(OUT)
 	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ version_query/main.c $(OUT)/version_query_res.o -lkernel32 -lversion
+	@echo "built $@"
+
+# Crypto (CRYPT32.dll): CryptAcquireContext / CryptGenRandom / hash round-trip.
+#
+# The legacy CryptoAPI functions live in advapi32.dll on real Windows, but WIE
+# routes them under crypt32.dll (see dispatch_crypt32). A .def-built import lib
+# re-binds them to crypt32.dll so the PE imports match WIE's dispatch table.
+$(OUT)/libcrypt32api.a: crypt_hash/crypt32api.def | $(OUT)
+	$(DLLTOOL) -d crypt_hash/crypt32api.def -l $@ -D crypt32.dll
+	@echo "built $@"
+
+$(OUT)/crypt_hash.exe: crypt_hash/main.c $(OUT)/libcrypt32api.a | $(OUT)
+	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -L$(OUT) -lcrypt32api -lkernel32
+	@echo "built $@"
+
+# Setup API (SETUPAPI.dll + CFGMGR32.dll): empty device enumeration.
+$(OUT)/setupapi_list.exe: setupapi_list/main.c | $(OUT)
+	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lsetupapi -lkernel32
+	@echo "built $@"
+
+# Debug helpers (DBGHELP.dll + IMAGEHLP.dll): symbol init / failed lookup / cleanup.
+$(OUT)/dbghelp_stub.exe: dbghelp_stub/main.c | $(OUT)
+	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -ldbghelp -lkernel32
+	@echo "built $@"
+
+# MSIMG32 (gdi_alpha): AlphaBlend source-alpha compositing onto a DIB.
+gdi_alpha: $(OUT)/gdi_alpha.exe
+
+$(OUT)/gdi_alpha.exe: gdi_alpha/main.c | $(OUT)
+	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lmsimg32 -lgdi32 -lkernel32
+	@echo "built $@"
+
+# IMM32 (ime_noop): every IME API returns the benign "no IME" value.
+ime_noop: $(OUT)/ime_noop.exe
+
+$(OUT)/ime_noop.exe: ime_noop/main.c | $(OUT)
+	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -limm32 -lkernel32
+	@echo "built $@"
+
+# WS2_32 (ws2_echo): single-process loopback TCP echo through the real
+# Winsock handlers (crates/wie-winapi/src/ws2_32.rs).
+ws2_echo: $(OUT)/ws2_echo.exe
+
+$(OUT)/ws2_echo.exe: ws2_echo/main.c | $(OUT)
+	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lws2_32 -lkernel32
 	@echo "built $@"
 
 clean:

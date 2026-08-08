@@ -78,19 +78,37 @@ Any call to these returns `bail!("unsupported WinAPI call: {library}!{name}")`:
 
 | DLL | Purpose |
 |-----|---------|
-| `MSIMG32.dll` | Image operations (AlphaBlend, etc.) |
-| `IMM32.dll` | Input Method Manager |
-| `WS2_32.dll` | Winsock / network APIs |
 | `WININET.dll` | Internet APIs |
 | `URLMON.dll` | URL Moniker |
-| `CRYPT32.dll` | Cryptography |
-| `IMAGEHLP.dll` | PE image helpers |
-| `DBGHELP.dll` | Debug help |
-| `SETUPAPI.dll` | Device setup |
-| `CFGmgr32.dll` | Configuration manager |
-| `MSVCR71.dll` | Older CRT (MSVC 7.1) |
-| `MSVCP71.dll` | Older C++ Standard Library |
-| `UXTHEME.dll` | Visual styles (has dispatch entries but likely stub) |
+
+**Recently landed (Tier-1 universal-DLL wave, release 0.2):**
+
+- `WS2_32.dll` — real Winsock: TCP loopback sockets via host `std::net`
+  (socket/bind/listen/accept/connect/send/recv/select/getaddrinfo/gethostbyname/…).
+  SOCKET table lives in `DllId::Ws2` (`Ws2State`). `ws2_echo` micro round-trips
+  "ping"→"pong" through the JIT and iced backends.
+- `CRYPT32.dll` — real hashing (SHA-1/SHA-256 via sha1/sha2 crates) + real entropy
+  (`/dev/urandom`): acquire/release context, GenRandom, Create/DestroyHash,
+  HashData, GetHashParam. `DllId::Crypt32` (`Crypt32State`). `crypt_hash` micro
+  verifies both digest vectors. NOTE: mingw links these CryptoAPI exports under
+  `advapi32.dll` — `crypt_hash` uses a `.def`/dlltool import lib rebinding them
+  to `crypt32.dll` where WIE dispatches them.
+- `MSIMG32.dll` — real DIB-to-DIB `AlphaBlend` (per-pixel straight alpha,
+  AC_SRC_ALPHA-gated), `TransparentBlt` (color-keyed copy), `GradientFill`
+  (H/V rect modes). `gdi_alpha` micro proves blending end-to-end.
+- `IMM32.dll` — benign no-ops (IME is a non-goal): ImmGetContext→NULL,
+  ImmGetOpenStatus→0, ImmReleaseContext→TRUE, ImmGetCompositionStringW→0.
+- `UXTHEME.dll` — visual-style no-ops: OpenThemeData→NULL, CloseThemeData→S_OK,
+  IsThemeActive→FALSE, GetWindowTheme→NULL (SetWindowTheme already S_OK).
+- `SETUPAPI.dll` + `CFGmgr32.dll` — empty device enumeration: GetClassDevs→fake
+  HDEVINFO, EnumDeviceInfo→FALSE + ERROR_NO_MORE_ITEMS, DestroyDeviceInfoList→TRUE,
+  CM_Get_Device_ID_List→CR_SUCCESS with empty buffer.
+- `DBGHELP.dll` + `IMAGEHLP.dll` — minimal: SymInitialize/SymCleanup→TRUE,
+  SymFromAddr→FALSE + ERROR_INVALID_ADDRESS, MapFileAndCheckSum→CHECKSUM_SUCCESS
+  with zeroed sums.
+- `MSVCR71.dll` + `MSVCP71.dll` — legacy CRT forwarded into the existing
+  `dispatch_ucrt` (added to `is_ucrt_library`); data imports (`_iob`, `_fmode`,
+  `_acmdln`, `__initenv`) were already covered.
 
 ---
 

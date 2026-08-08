@@ -341,10 +341,7 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
     }
     if library.eq_ignore_ascii_case("msimg32.dll") {
         let n = name.to_ascii_lowercase();
-        return matches!(
-            n.as_str(),
-            "alphablend" | "transparentblt" | "gradientfill"
-        );
+        return matches!(n.as_str(), "alphablend" | "transparentblt" | "gradientfill");
     }
     if library.eq_ignore_ascii_case("imm32.dll") {
         let n = name.to_ascii_lowercase();
@@ -353,8 +350,16 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
             "immgetcontext" | "immgetopenstatus" | "immreleasecontext" | "immgetcompositionstringw"
         );
     }
-    if library.eq_ignore_ascii_case("setupapi.dll")
-        || library.eq_ignore_ascii_case("cfgmgr32.dll")
+    if library.eq_ignore_ascii_case("uxtheme.dll") {
+        let n = name.to_ascii_lowercase();
+        // SetWindowTheme is a dense-row API; these are the string-dispatched
+        // no-op extensions (open/close theme data, theme-active queries).
+        return matches!(
+            n.as_str(),
+            "openthemedata" | "closethemedata" | "isthemeactive" | "getwindowtheme"
+        );
+    }
+    if library.eq_ignore_ascii_case("setupapi.dll") || library.eq_ignore_ascii_case("cfgmgr32.dll")
     {
         let n = name.to_ascii_lowercase();
         return matches!(
@@ -367,9 +372,7 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
                 | "cm_get_device_id_lista"
         );
     }
-    if library.eq_ignore_ascii_case("dbghelp.dll")
-        || library.eq_ignore_ascii_case("imagehlp.dll")
-    {
+    if library.eq_ignore_ascii_case("dbghelp.dll") || library.eq_ignore_ascii_case("imagehlp.dll") {
         let n = name.to_ascii_lowercase();
         return matches!(
             n.as_str(),

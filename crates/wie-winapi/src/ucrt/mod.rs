@@ -123,7 +123,15 @@ pub fn is_ucrt_library(library: &str) -> bool {
     let mut scratch = [0_u8; ASCII_LOWER_SCRATCH];
     let mut owned: Option<String> = None;
     let l = ascii_lower(library, &mut scratch, &mut owned);
-    l.starts_with("api-ms-win-crt-") || l == "ucrtbase.dll" || l == "msvcrt.dll"
+    // Legacy VC7 runtimes forward to the same name dispatch as msvcrt: their
+    // exports (printf, memcpy, `??2@YAPEAX_K@Z`, …) are all CRT functions
+    // already handled below. Data imports (_iob, _fmode, …) resolve via
+    // `crt_data_import_va`.
+    l.starts_with("api-ms-win-crt-")
+        || l == "ucrtbase.dll"
+        || l == "msvcrt.dll"
+        || l == "msvcr71.dll"
+        || l == "msvcp71.dll"
 }
 /// Guest VA for legacy `msvcrt` **data** imports (`_fmode`, `_commode`, `_acmdln`).
 ///

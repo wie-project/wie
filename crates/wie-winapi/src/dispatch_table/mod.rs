@@ -1327,6 +1327,11 @@ pub fn dispatch_winapi(
     {
         return Ok(r);
     }
+    if library.eq_ignore_ascii_case("uxtheme.dll")
+        && let Some(r) = crate::uxtheme::dispatch_uxtheme(ctx, name)?
+    {
+        return Ok(r);
+    }
     if library.eq_ignore_ascii_case("imm32.dll")
         && let Some(r) = crate::imm32::dispatch_imm32(ctx, name)?
     {
@@ -1338,8 +1343,7 @@ pub fn dispatch_winapi(
     {
         return Ok(r);
     }
-    if (library.eq_ignore_ascii_case("dbghelp.dll")
-        || library.eq_ignore_ascii_case("imagehlp.dll"))
+    if (library.eq_ignore_ascii_case("dbghelp.dll") || library.eq_ignore_ascii_case("imagehlp.dll"))
         && let Some(r) = crate::dbghelp::dispatch_dbghelp(ctx, name)?
     {
         return Ok(r);

@@ -46,8 +46,11 @@ network tools). Each gets a micro-exe verification.
 | `DBGHELP` + `IMAGEHLP` | SymInitialize, SymCleanup, SymFromAddr, StackWalk64, MapFileAndCheckSum | minimal: init no-op, lookups fail gracefully | `dbghelp_stub` — init + fail path |
 | `MSVCR71` / `MSVCP71` | legacy CRT entry points | forward to the ucrt/msvcrt handlers where names match | old mingw binaries load |
 
-**Milestone M1**: all of Tier 1 with micro-exes green, zero-coverage table empty
-except WININET/URLMON.
+**Milestone M1**: ✅ LANDED (2026-08) — all Tier-1 families implemented with
+micro-exes green under JIT and iced: WS2_32 (real loopback TCP), CRYPT32
+(real SHA-1/SHA-256 + /dev/urandom), MSIMG32 (real AlphaBlend/TransparentBlt/
+GradientFill), IMM32, UXTHEME, SETUPAPI/CFGMGR32, DBGHELP/IMAGEHLP,
+MSVCR71/MSVCP71 forwarding. Zero-coverage table now holds only WININET/URLMON.
 
 ## Tier 2 — universal but partial today
 

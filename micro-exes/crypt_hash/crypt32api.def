@@ -1,0 +1,10 @@
+LIBRARY crypt32.dll
+EXPORTS
+    CryptAcquireContextA
+    CryptAcquireContextW
+    CryptReleaseContext
+    CryptGenRandom
+    CryptCreateHash
+    CryptDestroyHash
+    CryptHashData
+    CryptGetHashParam
