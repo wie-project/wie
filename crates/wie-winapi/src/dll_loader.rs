@@ -7,7 +7,9 @@
 //! (above the fake handle range `0x6100_xxxx`). Fake modules (kernel32,
 //! user32, etc.) keep their existing handles — the loader skips them.
 
-use std::collections::{HashMap, HashSet};
+use ahash::HashMap;
+use ahash::HashMapExt;
+use std::collections::HashSet;
 
 use anyhow::{Context, Result, bail};
 use wie_cpu::CpuEngine;
@@ -56,6 +58,10 @@ pub struct LoadedModule {
     pub ordinal_base: u16,
     /// Number of export entries.
     pub export_count: u16,
+    /// Parsed `RT_DIALOG` templates from the module's `.rsrc` section
+    /// (best-effort; empty when the module has none). Dialog machinery
+    /// (DialogBoxParam) resolves an `hInstance`+id against this list.
+    pub dialogs: Vec<wie_pe::resources::DialogTemplate>,
 }
 
 impl LoadedModule {
@@ -86,28 +92,24 @@ impl LoadedModule {
 
 /// Read a u32 from a slice at a given offset (little-endian).
 /// Caller MUST verify `off + 4 <= buf.len()`.
-#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 fn read_u32_le(buf: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
 }
 
 /// Read a u16 from a slice at a given offset (little-endian).
 /// Caller MUST verify `off + 2 <= buf.len()`.
-#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 fn read_u16_le(buf: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([buf[off], buf[off + 1]])
 }
 
 /// Read an i32 from a slice at a given offset (little-endian).
 /// Caller MUST verify `off + 4 <= buf.len()`.
-#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 fn read_i32_le(buf: &[u8], off: usize) -> i32 {
     i32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
 }
 
 /// Read an i64 from a slice at a given offset (little-endian).
 /// Caller MUST verify `off + 8 <= buf.len()`.
-#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 fn read_i64_le(buf: &[u8], off: usize) -> i64 {
     i64::from_le_bytes([
         buf[off],
@@ -127,7 +129,6 @@ fn read_i64_le(buf: &[u8], off: usize) -> i64 {
 /// Export names are lowercased for case-insensitive lookup.
 ///
 /// `pe_bytes` must be the raw file bytes (not the mapped image).
-#[allow(clippy::arithmetic_side_effects)]
 pub fn parse_dll_exports(pe: &goblin::pe::PE<'_>, pe_bytes: &[u8]) -> Result<DllExports> {
     let header = pe
         .header
@@ -190,26 +191,26 @@ pub fn parse_dll_exports(pe: &goblin::pe::PE<'_>, pe_bytes: &[u8]) -> Result<Dll
 
     // Build the address table in host memory by reading 4-byte RVA entries
     // from the file (each entry is an RVA or 0 for unused/forwarder).
-    let mut address_table: Vec<u64> = Vec::with_capacity(num_functions);
-    for i in 0..num_functions {
-        let i_u32 = u32::try_from(i).unwrap_or(0);
-        let entry_file_off =
-            rva_to_file_offset(pe, address_table_rva.wrapping_add(i_u32.wrapping_mul(4))).ok();
-        let rva = match entry_file_off {
-            Some(off) if off.saturating_add(4) <= pe_bytes.len() => {
-                u64::from(read_u32_le(pe_bytes, off))
+    let address_table: Vec<u64> = (0..num_functions)
+        .map(|i| {
+            let i_u32 = u32::try_from(i).unwrap_or(0);
+            let entry_file_off =
+                rva_to_file_offset(pe, address_table_rva.wrapping_add(i_u32.wrapping_mul(4))).ok();
+            let rva = match entry_file_off {
+                Some(off) if off.saturating_add(4) <= pe_bytes.len() => {
+                    u64::from(read_u32_le(pe_bytes, off))
+                }
+                _ => 0,
+            };
+            // If the RVA falls within the export directory, it's a forwarder
+            // string, not a real export address.
+            if rva != 0 && rva >= u64::from(export_rva) && rva < export_dir_end {
+                0
+            } else {
+                rva
             }
-            _ => 0,
-        };
-        // If the RVA falls within the export directory, it's a forwarder
-        // string, not a real export address.
-        let rva = if rva != 0 && rva >= u64::from(export_rva) && rva < export_dir_end {
-            0
-        } else {
-            rva
-        };
-        address_table.push(rva);
-    }
+        })
+        .collect();
 
     // Read name-pointer table entries.
     for i in 0..num_names {
@@ -419,7 +420,6 @@ pub fn resolve_dll_path(
 /// - `IMAGE_REL_BASED_DIR64` (10): 8-byte delta (x64 native)
 ///
 /// All other types return an error (unsupported).
-#[allow(clippy::arithmetic_side_effects)]
 pub fn apply_relocations(
     pe: &goblin::pe::PE<'_>,
     pe_bytes: &[u8],
@@ -460,7 +460,6 @@ pub fn apply_relocations(
             break;
         }
 
-        #[allow(clippy::integer_division)]
         let page_rva = read_u32_le(reloc_data, offset);
         let block_size = read_u32_le(reloc_data, offset.wrapping_add(4));
         let block_size_usize = usize::try_from(block_size).unwrap_or(0);
@@ -472,22 +471,34 @@ pub fn apply_relocations(
             bail!("invalid relocation block size: {block_size_usize}");
         }
 
-        #[allow(clippy::integer_division)]
         let entry_count = (block_size_usize - 8) / 2;
         let entries_base = offset.wrapping_add(8);
 
-        for i in 0..entry_count {
-            let entry_off = entries_base.wrapping_add(i.wrapping_mul(2));
-            if entry_off.saturating_add(2) > reloc_data.len() {
-                bail!("relocation entry at offset {entry_off} exceeds block data");
+        let entries = reloc_data.get(entries_base..).unwrap_or(&[]);
+        // The old loop bailed when the first entry could not even start within
+        // the data (a block declared exactly at the end). An empty tail must
+        // keep bailing — not silently skip the block.
+        if entries.is_empty() && entry_count > 0 {
+            bail!("relocation entry at offset {entries_base:#x} exceeds block data");
+        }
+        for (i, chunk) in entries.chunks(2).take(entry_count).enumerate() {
+            // A short chunk means the block's last entry overruns the
+            // relocation data — the same condition the old per-entry bounds
+            // check `entry_off + 2 > len` bailed on.
+            if chunk.len() != 2 {
+                bail!(
+                    "relocation entry at offset {:#x} exceeds block data",
+                    entries_base.wrapping_add(i.wrapping_mul(2))
+                );
             }
-
-            let entry = read_u16_le(reloc_data, entry_off);
+            let entry = u16::from_le_bytes([
+                chunk.first().copied().unwrap_or(0),
+                chunk.get(1).copied().unwrap_or(0),
+            ]);
             let type_ = entry >> 12;
             let rva_offset = u32::from(entry & 0x0fff);
             let target_rva = page_rva.wrapping_add(rva_offset);
 
-            #[allow(clippy::cast_possible_truncation, clippy::as_conversions)]
             match type_ {
                 0 => {
                     // IMAGE_REL_BASED_ABSOLUTE — no-op alignment padding.
@@ -652,12 +663,15 @@ pub fn load_dll(
     let entry_rva = identity.entry_rva;
 
     // Step 2: Allocate a module handle.
-    let handle = state.module_state.next_module_handle;
-    state.module_state.next_module_handle = state
-        .module_state
-        .next_module_handle
-        .checked_add(0x1000)
-        .context("module handle overflow")?;
+    let handle = state.module_state.next_module_handle.as_u64();
+    state.module_state.next_module_handle = crate::ModuleHandle::from(
+        state
+            .module_state
+            .next_module_handle
+            .as_u64()
+            .checked_add(0x1000)
+            .context("module handle overflow")?,
+    );
 
     // Step 3: Map guest memory. Try preferred base first.
     let load_base = preferred_base;
@@ -678,11 +692,6 @@ pub fn load_dll(
 
     // Delta is intentionally wrapping: image_base and preferred_base are
     // close in address space; the signed difference fits in i64 for real PEs.
-    #[allow(
-        clippy::cast_possible_wrap,
-        clippy::as_conversions,
-        clippy::arithmetic_side_effects
-    )]
     let delta = image_base as i64 - preferred_base as i64;
 
     // Step 4: Build the map plan for section protections.
@@ -798,6 +807,7 @@ pub fn load_dll(
         exports_by_ordinal: exports.by_ordinal,
         ordinal_base: exports.ordinal_base,
         export_count: exports.export_count,
+        dialogs: wie_pe::resources::parse_dialogs(&pe_bytes, &map_plan.sections),
     };
 
     state

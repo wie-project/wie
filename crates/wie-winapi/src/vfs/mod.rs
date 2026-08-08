@@ -1,12 +1,17 @@
 //! Clean-room Windows 10 userspace VFS facade for WIE.
 //!
-//! - **C:** bottle (`{root}/drive_c/…`) — isolated guest workspace + synthetic skeleton
+//! - **C:** global app-data bottle by default (`~/Library/Application
+//!   Support/WIE/bottle/drive_c/…`), overridable per session via
+//!   `--root` / `WIE_ROOT` — guest `C:\…` always maps
 //! - **D:** optional host bridge (`WIE_DRIVE_D` / `--drive-d`)
+//! - **Z:** pick-mounts — native file-dialog accepts map the picked file's
+//!   real macOS path back into the guest
 //! - No Wine-style System32 PE payload; DLLs stay fake LoadLibrary handles
 
 pub mod backend;
 pub mod encoding;
 pub mod path;
+pub mod pick_mount;
 pub mod volume;
 
 pub use backend::{
@@ -17,16 +22,20 @@ pub use backend::{
     read_all_host, remove_dir_host, remove_file_host, rename_host, stat_path,
 };
 pub use encoding::{
-    CP_ACP, CP_OEMCP, CP_UTF8, decode_acp, encode_acp, multibyte_to_wide, wide_to_multibyte,
+    CP_ACP, CP_OEMCP, CP_UTF8, CP_UTF16, decode_acp, decode_ansi_utf8_first, encode_acp,
+    multibyte_to_wide, wide_to_multibyte,
 };
 pub use path::{
-    guest_basename, guest_parent, is_windows_absolute_path, normalize_windows_path_components,
-    normalize_windows_path_separators, paths_equal_ci, resolve_full_windows_path,
-    split_find_pattern, strip_extended_prefix, wildcard_match,
+    canonicalize_host_target, guest_basename, guest_dir_of, guest_parent, is_windows_absolute_path,
+    normalize_host_path, normalize_windows_path_components, normalize_windows_path_separators,
+    paths_equal_ci, resolve_full_windows_path, split_find_pattern, strip_extended_prefix,
+    wildcard_match,
 };
+pub(crate) use pick_mount::register_pick_mount;
 pub use volume::{
     BOTTLE_SKELETON_DIRS, DRIVE_FIXED, DRIVE_NO_ROOT_DIR, GUEST_SYSTEM_DIR, GUEST_TEMP_PATH,
-    GUEST_WINDOWS_DIR, HostMap, VolumeConfig, bottle_root_from_env, drive_d_from_env,
-    ensure_bottle_skeleton, get_drive_type, guest_path_to_host, guest_path_to_host_bottle,
-    logical_drives_mask,
+    GUEST_WINDOWS_DIR, HostMap, VolumeConfig, bottle_root_from_env, confine_guest_path,
+    drive_d_from_env, effective_bottle_root, get_drive_type, global_bottle_root,
+    guest_path_to_host, guest_path_to_host_bottle, host_path_to_guest, logical_drives_mask,
+    seed_default_skeleton,
 };

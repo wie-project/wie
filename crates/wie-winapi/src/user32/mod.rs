@@ -1,14 +1,21 @@
+//! USER32 handlers: window management, messages, dialogs, controls, input,
+//! menus, and display. Submodules split handlers by concern; this file
+//! re-exports the shared guest-memory/string helpers and fake handles.
+
+pub(crate) use crate::guest_layout::{Msg, WindowPlacement};
 pub(crate) use crate::guest_memory::{
-    checked_field_address, read_bytes as read_guest_bytes, read_i32 as read_guest_i32,
-    read_u32 as read_guest_u32, read_u64 as read_guest_u64, write_bytes as write_guest_bytes,
-    write_i32 as write_guest_i32, write_u32 as write_guest_u32, write_u64 as write_guest_u64,
+    checked_address, read_bytes as read_guest_bytes, read_i32, read_typed_copy, read_u32, read_u64,
+    with_typed_read, with_typed_write, write_bytes as write_guest_bytes,
+    write_i32 as write_guest_i32, write_typed_copy, write_u32 as write_guest_u32,
+    write_u64 as write_guest_u64,
 };
 pub(crate) use crate::guest_string::{
-    read_ansi_lossy as read_guest_ansi_lossy, read_utf16_lossy as read_guest_utf16_lossy,
-    write_ansi_c_string as write_guest_ansi_c_string, write_fixed_ansi as write_guest_fixed_ansi,
-    write_fixed_utf16 as write_guest_fixed_utf16,
-    write_utf16_c_string as write_guest_utf16_c_string,
+    read_ansi_lossy as read_guest_ansi_lossy, read_arg_string,
+    read_utf16_lossy as read_guest_utf16_lossy, write_ansi_c_string as write_guest_ansi_c_string,
+    write_fixed_ansi as write_guest_fixed_ansi, write_fixed_utf16 as write_guest_fixed_utf16,
+    write_out_string, write_utf16_c_string as write_guest_utf16_c_string,
 };
+pub(crate) use crate::state::WindowFlags;
 pub(crate) use crate::{
     GuestCallbackRequest, HandlerContext, MessageQueueIdlePolicy, QueuedWindowMessage, TimerRecord,
     WinApiControlSignal, WinApiHandlerResult, WinApiState, WindowClassRecord, WindowRecord,
@@ -19,8 +26,15 @@ pub(crate) use anyhow::{Context, Result};
 pub(crate) const FAKE_ICON_HANDLE: u64 = 0x0000_0000_6600_0001;
 pub(crate) const FAKE_CURSOR_HANDLE: u64 = 0x0000_0000_6600_0002;
 pub(crate) const IDOK: u64 = 1;
+pub(crate) const IDCANCEL: u64 = 2;
+// MessageBox return constants used only by the cfg(test) MB_YESNO bridge tests
+// (state/tests.rs); kept for the MessageBox return-value surface.
+#[allow(dead_code)]
+pub(crate) const IDYES: u64 = 6;
+#[allow(dead_code)]
+pub(crate) const IDNO: u64 = 7;
 
-pub(crate) const WM_MDICREATE: u32 = 0x0220;
+pub(crate) const WM_MDICREATE: u32 = wm::WinMsg::WM_MDICREATE.as_u32();
 pub(crate) const FAKE_MONITOR_HANDLE: u64 = 0x0000_0000_6600_0010;
 pub(crate) const DISPLAY_DEVICE_ATTACHED_TO_DESKTOP: u32 = 0x0000_0001;
 pub(crate) const DISPLAY_DEVICE_PRIMARY_DEVICE: u32 = 0x0000_0004;
@@ -35,31 +49,270 @@ pub(crate) const FAKE_THREAD_ID: u64 = 1;
 pub(crate) const DIALOG_BASE_UNIT_X: u32 = 8;
 pub(crate) const DIALOG_BASE_UNIT_Y: u32 = 16;
 
-pub(crate) const WM_QUIT: u32 = 0x0012;
+// Standard window styles (winuser.h).
+pub(crate) const WS_CHILD: u32 = 0x4000_0000;
+pub(crate) const WS_VISIBLE: u32 = 0x1000_0000;
+pub(crate) const WS_CLIPCHILDREN: u32 = 0x0200_0000;
+/// Control style: the control can receive keyboard focus via Tab navigation.
+pub(crate) const WS_TABSTOP: u32 = 0x0001_0000;
 
-pub(crate) const WM_KEYDOWN: u32 = 0x0100;
-pub(crate) const WM_KEYUP: u32 = 0x0101;
-pub(crate) const WM_CHAR: u32 = 0x0102;
-pub(crate) const WM_DEADCHAR: u32 = 0x0103;
-pub(crate) const WM_SYSKEYDOWN: u32 = 0x0104;
-pub(crate) const WM_SYSKEYUP: u32 = 0x0105;
-pub(crate) const WM_SYSCHAR: u32 = 0x0106;
-pub(crate) const WM_SYSDEADCHAR: u32 = 0x0107;
+pub(crate) const WM_QUIT: u32 = wm::WinMsg::WM_QUIT.as_u32();
 
+pub(crate) const WM_INITDIALOG: u32 = wm::WinMsg::WM_INITDIALOG.as_u32();
+
+// Virtual-key codes used by IsDialogMessage navigation and EDIT caret
+// movement (winuser.h).
+pub(crate) const VK_TAB: u64 = 0x09;
+pub(crate) const VK_RETURN: u64 = 0x0D;
+pub(crate) const VK_SHIFT: u64 = 0x10;
+pub(crate) const VK_CONTROL: u64 = 0x11;
+pub(crate) const VK_ESCAPE: u64 = 0x1B;
+pub(crate) const VK_SPACE: u64 = 0x20;
+pub(crate) const VK_PRIOR: u64 = 0x21; // Page Up
+pub(crate) const VK_NEXT: u64 = 0x22; // Page Down
+pub(crate) const VK_END: u64 = 0x23;
+pub(crate) const VK_HOME: u64 = 0x24;
+pub(crate) const VK_LEFT: u64 = 0x25;
+pub(crate) const VK_UP: u64 = 0x26;
+pub(crate) const VK_RIGHT: u64 = 0x27;
+pub(crate) const VK_DOWN: u64 = 0x28;
+pub(crate) const VK_DELETE: u64 = 0x2E;
+
+/// The high bit of a keyboard-state byte (`GetKeyState`/`KeyboardState`): the
+/// key is down. The keyboard-state slot holds one byte per VK code; the low
+/// seven bits are the toggle state, so "pressed" is bit 7.
+pub(crate) const KEY_STATE_DOWN: u8 = 0x80;
+
+pub(crate) const WM_KEYDOWN: u32 = wm::WinMsg::WM_KEYDOWN.as_u32();
+pub(crate) const WM_KEYUP: u32 = wm::WinMsg::WM_KEYUP.as_u32();
+pub(crate) const WM_CHAR: u32 = wm::WinMsg::WM_CHAR.as_u32();
+pub(crate) const WM_DEADCHAR: u32 = wm::WinMsg::WM_DEADCHAR.as_u32();
+pub(crate) const WM_SYSKEYDOWN: u32 = wm::WinMsg::WM_SYSKEYDOWN.as_u32();
+pub(crate) const WM_SYSKEYUP: u32 = wm::WinMsg::WM_SYSKEYUP.as_u32();
+pub(crate) const WM_SYSCHAR: u32 = wm::WinMsg::WM_SYSCHAR.as_u32();
+pub(crate) const WM_SYSDEADCHAR: u32 = wm::WinMsg::WM_SYSDEADCHAR.as_u32();
+pub(crate) const WM_CREATE: u32 = wm::WinMsg::WM_CREATE.as_u32();
+pub(crate) const WM_DESTROY: u32 = wm::WinMsg::WM_DESTROY.as_u32();
+#[expect(dead_code)]
+pub(crate) const WM_MOVE: u32 = wm::WinMsg::WM_MOVE.as_u32();
+#[allow(dead_code)] // used only from cfg(test) state/tests.rs (status-bar WM_SIZE)
+pub(crate) const WM_SIZE: u32 = wm::WinMsg::WM_SIZE.as_u32();
+#[expect(dead_code)]
+pub(crate) const WM_ACTIVATE: u32 = wm::WinMsg::WM_ACTIVATE.as_u32();
+pub(crate) const WM_SETFOCUS: u32 = wm::WinMsg::WM_SETFOCUS.as_u32();
+pub(crate) const WM_KILLFOCUS: u32 = wm::WinMsg::WM_KILLFOCUS.as_u32();
+pub(crate) const WM_PAINT: u32 = wm::WinMsg::WM_PAINT.as_u32();
+pub(crate) const WM_CLOSE: u32 = wm::WinMsg::WM_CLOSE.as_u32();
+pub(crate) const WM_ERASEBKGND: u32 = wm::WinMsg::WM_ERASEBKGND.as_u32();
+/// WM_SETFONT — store the HFONT a window/control draws its text with
+/// (DefWindowProc semantics; notepad sends this to its EDIT after creation).
+pub(crate) const WM_SETFONT: u32 = wm::WinMsg::WM_SETFONT.as_u32();
+/// WM_GETFONT — the stored HFONT (0 when never set).
+pub(crate) const WM_GETFONT: u32 = wm::WinMsg::WM_GETFONT.as_u32();
+#[expect(dead_code)]
+pub(crate) const WM_SHOWWINDOW: u32 = wm::WinMsg::WM_SHOWWINDOW.as_u32();
+#[expect(dead_code)] // alias kept for crate users; dispatch uses WinMsg::WM_SETCURSOR
+pub(crate) const WM_SETCURSOR: u32 = wm::WinMsg::WM_SETCURSOR.as_u32();
+#[expect(dead_code)]
+pub(crate) const WM_GETMINMAXINFO: u32 = wm::WinMsg::WM_GETMINMAXINFO.as_u32();
+pub(crate) const WM_CONTEXTMENU: u32 = wm::WinMsg::WM_CONTEXTMENU.as_u32();
+#[expect(dead_code)]
+pub(crate) const WM_NCCREATE: u32 = wm::WinMsg::WM_NCCREATE.as_u32();
+#[expect(dead_code)]
+pub(crate) const WM_NCDESTROY: u32 = wm::WinMsg::WM_NCDESTROY.as_u32();
+#[expect(dead_code)]
+pub(crate) const WM_NCCALCSIZE: u32 = wm::WinMsg::WM_NCCALCSIZE.as_u32();
+#[expect(dead_code)] // alias kept for crate users; dispatch uses WinMsg::WM_SYSCOMMAND
+pub(crate) const WM_SYSCOMMAND: u32 = wm::WinMsg::WM_SYSCOMMAND.as_u32();
+pub(crate) const WM_COMMAND: u32 = wm::WinMsg::WM_COMMAND.as_u32();
+pub(crate) const WM_TIMER: u32 = wm::WinMsg::WM_TIMER.as_u32();
+#[expect(dead_code)]
+pub(crate) const WM_MOUSEMOVE: u32 = wm::WinMsg::WM_MOUSEMOVE.as_u32();
+#[cfg(test)]
+pub(crate) const WM_LBUTTONDOWN: u32 = wm::WinMsg::WM_LBUTTONDOWN.as_u32();
+#[expect(dead_code)]
+pub(crate) const WM_RBUTTONDOWN: u32 = wm::WinMsg::WM_RBUTTONDOWN.as_u32();
+#[expect(dead_code)]
+pub(crate) const WM_RBUTTONUP: u32 = wm::WinMsg::WM_RBUTTONUP.as_u32();
+#[expect(dead_code)]
+pub(crate) const WM_MBUTTONDOWN: u32 = wm::WinMsg::WM_MBUTTONDOWN.as_u32();
+#[expect(dead_code)]
+pub(crate) const WM_MBUTTONUP: u32 = wm::WinMsg::WM_MBUTTONUP.as_u32();
+#[expect(dead_code)]
+pub(crate) const WM_MOUSEWHEEL: u32 = wm::WinMsg::WM_MOUSEWHEEL.as_u32();
+// Clipboard edit messages (Task 2.6): `u32` aliases survive only for the lib
+// tests — the control dispatch matches these via `WinMsg`.
+#[cfg(test)]
+pub(crate) const WM_CUT: u32 = wm::WinMsg::WM_CUT.as_u32();
+#[cfg(test)]
+pub(crate) const WM_COPY: u32 = wm::WinMsg::WM_COPY.as_u32();
+#[cfg(test)]
+pub(crate) const WM_PASTE: u32 = wm::WinMsg::WM_PASTE.as_u32();
+#[cfg(test)]
+pub(crate) const WM_CLEAR: u32 = wm::WinMsg::WM_CLEAR.as_u32();
+#[cfg(test)]
+pub(crate) const WM_UNDO: u32 = wm::WinMsg::WM_UNDO.as_u32();
+#[expect(dead_code)]
+pub(crate) const SIZE_RESTORED: u64 = 0;
+pub(crate) const SC_CLOSE: u64 = 0xF060;
+#[expect(dead_code)]
+pub(crate) const SW_SHOW: u64 = 5;
+
+// List-box messages (winuser.h); the LISTBOX/COMBOBOX dispatch matches these
+// via `WinMsg` — the `u32` aliases survive only for the lib tests.
+#[cfg(test)]
+pub(crate) const LB_ADDSTRING: u32 = wm::WinMsg::LB_ADDSTRING.as_u32();
+#[cfg(test)]
+pub(crate) const LB_SETCURSEL: u32 = wm::WinMsg::LB_SETCURSEL.as_u32();
+#[cfg(test)]
+pub(crate) const LB_GETCURSEL: u32 = wm::WinMsg::LB_GETCURSEL.as_u32();
+
+// Edit-control messages (winuser.h); `u32` aliases survive only for the lib
+// tests — the dispatch matches these via `WinMsg`.
+#[cfg(test)]
+pub(crate) const EM_GETSEL: u32 = wm::WinMsg::EM_GETSEL.as_u32();
+#[cfg(test)]
+pub(crate) const EM_SETSEL: u32 = wm::WinMsg::EM_SETSEL.as_u32();
+#[cfg(test)]
+pub(crate) const EM_CANUNDO: u32 = wm::WinMsg::EM_CANUNDO.as_u32();
+#[cfg(test)]
+pub(crate) const EM_SCROLLCARET: u32 = wm::WinMsg::EM_SCROLLCARET.as_u32();
+#[cfg(test)]
+pub(crate) const EM_GETMODIFY: u32 = wm::WinMsg::EM_GETMODIFY.as_u32();
+#[cfg(test)]
+pub(crate) const EM_SETMODIFY: u32 = wm::WinMsg::EM_SETMODIFY.as_u32();
+#[cfg(test)]
+pub(crate) const EM_GETLINECOUNT: u32 = wm::WinMsg::EM_GETLINECOUNT.as_u32();
+#[cfg(test)]
+pub(crate) const EM_LINEINDEX: u32 = wm::WinMsg::EM_LINEINDEX.as_u32();
+#[cfg(test)]
+pub(crate) const EM_SETHANDLE: u32 = wm::WinMsg::EM_SETHANDLE.as_u32();
+#[cfg(test)]
+pub(crate) const EM_GETHANDLE: u32 = wm::WinMsg::EM_GETHANDLE.as_u32();
+#[cfg(test)]
+pub(crate) const EM_LINELENGTH: u32 = wm::WinMsg::EM_LINELENGTH.as_u32();
+#[cfg(test)]
+pub(crate) const EM_REPLACESEL: u32 = wm::WinMsg::EM_REPLACESEL.as_u32();
+#[cfg(test)]
+pub(crate) const EM_GETLINE: u32 = wm::WinMsg::EM_GETLINE.as_u32();
+#[cfg(test)]
+pub(crate) const EM_LIMITTEXT: u32 = wm::WinMsg::EM_LIMITTEXT.as_u32();
+#[cfg(test)]
+pub(crate) const EM_UNDO: u32 = wm::WinMsg::EM_UNDO.as_u32();
+#[cfg(test)]
+pub(crate) const EM_LINEFROMCHAR: u32 = wm::WinMsg::EM_LINEFROMCHAR.as_u32();
+#[cfg(test)]
+pub(crate) const EM_SETTABSTOPS: u32 = wm::WinMsg::EM_SETTABSTOPS.as_u32();
+#[cfg(test)]
+pub(crate) const EM_EMPTYUNDOBUFFER: u32 = wm::WinMsg::EM_EMPTYUNDOBUFFER.as_u32();
+#[cfg(test)]
+pub(crate) const EM_GETFIRSTVISIBLELINE: u32 = wm::WinMsg::EM_GETFIRSTVISIBLELINE.as_u32();
+#[cfg(test)]
+pub(crate) const EM_GETLIMITTEXT: u32 = wm::WinMsg::EM_GETLIMITTEXT.as_u32();
+#[cfg(test)]
+pub(crate) const EM_POSFROMCHAR: u32 = wm::WinMsg::EM_POSFROMCHAR.as_u32();
+#[cfg(test)]
+pub(crate) const EM_SELECTIONTYPE: u32 = wm::WinMsg::EM_SELECTIONTYPE.as_u32();
+
+// Control notification codes / DLGC_* dialog codes (winuser.h).
+pub(crate) const BN_CLICKED: u64 = 0;
+/// EDIT notification code: the text changed.
+///
+/// winuser.h value 0x0300 (the EN_* codes live in the 0x0100..0x0602 range,
+/// NOT the small LBN_*/BN_* numbers — the previous 1 never matched a guest's
+/// `HIWORD(wParam) == EN_CHANGE` check, e.g. notepad's status-bar update).
+pub(crate) const EN_CHANGE: u64 = 0x0300;
+/// EDIT notification code: the user scrolled horizontally (winuser.h 0x0601).
+pub(crate) const EN_HSCROLL: u64 = 0x0601;
+/// EDIT notification code: the user scrolled vertically (winuser.h 0x0602).
+pub(crate) const EN_VSCROLL: u64 = 0x0602;
+/// LISTBOX notification code: the selection changed.
+pub(crate) const LBN_SELCHANGE: u64 = 1;
+/// `WM_GETDLGCODE` for an EDIT: wants character input. (WinUser.h: 0x0080;
+/// the previous 0x2000 was actually DLGC_BUTTON's value.)
+pub(crate) const DLGC_WANTCHARS: u64 = 0x0080;
+/// `WM_GETDLGCODE` for a push button.
+pub(crate) const DLGC_BUTTON: u64 = 0x2000;
+/// `WM_GETDLGCODE` when the button carries `BS_DEFPUSHBUTTON` (Enter default).
+pub(crate) const DLGC_DEFPUSHBUTTON: u64 = 0x0010;
+/// `WM_GETDLGCODE` when the button is a plain (non-default) push button.
+pub(crate) const DLGC_UNDEFPUSHBUTTON: u64 = 0x0020;
+/// Button style: the dialog default button (Enter activates it).
+pub(crate) const BS_DEFPUSHBUTTON: u32 = 0x0000_0001;
+/// Button state bit reported by `BM_GETSTATE`: the button is pressed.
+pub(crate) const BST_PUSHED: u64 = 0x0004;
+/// Button state bit reported by `BM_GETSTATE`: the button has keyboard focus.
+pub(crate) const BST_FOCUS: u64 = 0x0008;
+/// Button messages: `BM_GETSTATE` (read pressed/focus state); `u32` aliases
+/// survive only for the lib tests — the dispatch matches these via `WinMsg`.
+#[cfg(test)]
+pub(crate) const BM_GETSTATE: u32 = wm::WinMsg::BM_GETSTATE.as_u32();
+/// Button messages: `BM_SETSTATE` (write the pressed state, no click).
+#[cfg(test)]
+pub(crate) const BM_SETSTATE: u32 = wm::WinMsg::BM_SETSTATE.as_u32();
+/// Button messages: `BM_CLICK` (programmatic activation → `BN_CLICKED`).
+#[cfg(test)]
+pub(crate) const BM_CLICK: u32 = wm::WinMsg::BM_CLICK.as_u32();
+
+// TrackMouseEvent flags (winuser.h).
+pub(crate) const TME_HOVER: u32 = 0x0000_0001;
+pub(crate) const TME_LEAVE: u32 = 0x0000_0002;
+pub(crate) const TME_CANCEL: u32 = 0x8000_0000;
+
+// GetSysColor color INDICES (winuser.h) — the `nIndex` argument, NOT the 0RGB
+// values they resolve to (`window::geom::sys_color` holds that mapping). The
+// controls module's `COLOR_*` constants are RGB VALUES for a few of these
+// (e.g. `controls::COLOR_WINDOW` is the white `GetSysColor(COLOR_WINDOW)`
+// result); the index names live here so both read naturally at their sites.
+pub(crate) const COLOR_SCROLLBAR: u32 = 0;
+pub(crate) const COLOR_BACKGROUND: u32 = 1;
+pub(crate) const COLOR_ACTIVECAPTION: u32 = 2;
+pub(crate) const COLOR_INACTIVECAPTION: u32 = 3;
+pub(crate) const COLOR_WINDOW: u32 = 5;
+pub(crate) const COLOR_WINDOWFRAME: u32 = 6;
+pub(crate) const COLOR_MENUTEXT: u32 = 7;
+pub(crate) const COLOR_WINDOWTEXT: u32 = 8;
+pub(crate) const COLOR_CAPTIONTEXT: u32 = 9;
+pub(crate) const COLOR_ACTIVEBORDER: u32 = 10;
+pub(crate) const COLOR_INACTIVEBORDER: u32 = 11;
+pub(crate) const COLOR_APPWORKSPACE: u32 = 12;
+pub(crate) const COLOR_HIGHLIGHT: u32 = 13;
+pub(crate) const COLOR_HIGHLIGHTTEXT: u32 = 14;
+pub(crate) const COLOR_BTNSHADOW: u32 = 16;
+pub(crate) const COLOR_GRAYTEXT: u32 = 17;
+pub(crate) const COLOR_BTNTEXT: u32 = 18;
+pub(crate) const COLOR_BTNHIGHLIGHT: u32 = 20;
+pub(crate) const COLOR_3DDKSHADOW: u32 = 21;
+pub(crate) const COLOR_INFOBK: u32 = 24;
+
+pub mod accel;
+pub mod controls;
 pub mod dc;
+pub mod dialog;
 pub mod display;
+pub mod dragdrop;
 pub mod input;
+pub mod lang;
 pub mod menu;
 pub mod message;
 pub mod misc;
+pub mod rect;
 pub mod window;
+pub mod wm;
+pub use accel::*;
+pub use controls::*;
 pub use dc::*;
+pub use dialog::*;
 pub use display::*;
+pub use dragdrop::*;
 pub use input::*;
+pub use lang::*;
 pub use menu::*;
 pub use message::*;
 pub use misc::*;
+pub use rect::*;
 pub use window::*;
+pub use wm::*;
 
 pub(crate) fn low_i32(value: u64, name: &str) -> Result<i32> {
     let low_value = value & u64::from(u32::MAX);
@@ -71,70 +324,47 @@ pub(crate) fn low_i32(value: u64, name: &str) -> Result<i32> {
 
 pub(crate) fn write_window_rect(
     engine: &mut dyn wie_cpu::CpuEngine,
-    rect_ptr: u64,
+    rect_va: u64,
     left: i32,
     top: i32,
     right: i32,
     bottom: i32,
 ) -> Result<()> {
-    write_guest_i32(engine, rect_ptr, left)?;
+    write_guest_i32(engine, rect_va, left)?;
 
-    write_guest_i32(engine, checked_field_address(rect_ptr, 4, "RECT.top"), top)?;
+    write_guest_i32(engine, checked_address(rect_va, 4, "RECT.top"), top)?;
 
-    write_guest_i32(
-        engine,
-        checked_field_address(rect_ptr, 8, "RECT.right"),
-        right,
-    )?;
+    write_guest_i32(engine, checked_address(rect_va, 8, "RECT.right"), right)?;
 
-    write_guest_i32(
-        engine,
-        checked_field_address(rect_ptr, 12, "RECT.bottom"),
-        bottom,
-    )?;
+    write_guest_i32(engine, checked_address(rect_va, 12, "RECT.bottom"), bottom)?;
 
     Ok(())
 }
 
-pub(crate) fn write_ansi_window_text(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    buffer_ptr: u64,
-    max_characters: u64,
-    text: &str,
-) -> Result<u64> {
-    let capacity =
-        usize::try_from(max_characters).context("ANSI window text capacity does not fit usize")?;
+/// `GWLP_WNDPROC` (-4) as the zero-extended `u64` a Win64
+/// `Get/SetWindowLongPtr*` index register carries it (MSVC emits
+/// `mov edx, -4`, writing `0xFFFF_FFFC`).
+pub(crate) const GWLP_WNDPROC_RAW: u64 = 0xFFFF_FFFC;
 
-    let copied = write_guest_ansi_c_string(engine, buffer_ptr, capacity, text)
-        .context("failed to write ANSI window text")?;
+/// `GWLP_WNDPROC` (-4) as the SIGNED index — what the raw value denotes after
+/// `window_long_ptr_index` reinterprets it (the comparison form used when the
+/// raw zero-extended form has already been decoded).
+pub(crate) const GWLP_WNDPROC: i64 = -4;
 
-    u64::try_from(copied).context("ANSI window text length does not fit u64")
-}
-
-pub(crate) fn write_wide_window_text(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    buffer_ptr: u64,
-    max_characters: u64,
-    text: &str,
-) -> Result<u64> {
-    let capacity =
-        usize::try_from(max_characters).context("wide window text capacity does not fit usize")?;
-
-    let copied = write_guest_utf16_c_string(engine, buffer_ptr, capacity, text)
-        .context("failed to write wide window text")?;
-
-    u64::try_from(copied).context("wide window text length does not fit u64")
-}
-
+/// Reinterpret a raw `GetWindowLongPtr*` index (a zero-extended `i32`) as
+/// the signed `i64` slot it denotes.
 ///
-/// Fills `PAINTSTRUCT` with a fake HDC and client rect; real painting is stubbed.
+/// Only the low 32 bits carry the index; the upper bits of the Win64 index
+/// register are unspecified (MSVC zero-extends, but sign-extension also
+/// occurs in practice), so they are masked off rather than rejected.
 pub(crate) fn window_long_ptr_index(index_raw: u64, api_name: &str) -> Result<i64> {
-    let index_low = u32::try_from(index_raw)
+    let index_low = u32::try_from(index_raw & u64::from(u32::MAX))
         .with_context(|| format!("{api_name} index does not fit in u32"))?;
 
     Ok(i64::from(i32::from_ne_bytes(index_low.to_ne_bytes())))
 }
 
+/// Read the stored value for `(window_handle, index)`, or 0 if never set.
 pub(crate) fn get_window_long_ptr_value(
     window_handle: u64,
     index_raw: u64,
@@ -153,6 +383,7 @@ pub(crate) fn get_window_long_ptr_value(
         .map_or(0, |(_, _, value)| *value))
 }
 
+/// Store `new_value` for `(window_handle, index)`; returns the previous value.
 pub(crate) fn set_window_long_ptr_value(
     window_handle: u64,
     index_raw: u64,
@@ -192,78 +423,34 @@ pub(crate) fn write_message_structure(
     message_address: u64,
     message: &QueuedWindowMessage,
 ) -> Result<()> {
-    write_guest_u64(engine, message_address, message.window_handle)
-        .context("failed to write MSG.hwnd")?;
-
-    write_guest_u32(
-        engine,
-        checked_field_address(message_address, 8, "MSG.message"),
-        message.message,
-    )
-    .context("failed to write MSG.message")?;
-
-    // Bytes 12..16 are alignment padding on Win64.
-    write_guest_u32(
-        engine,
-        checked_field_address(message_address, 12, "MSG alignment padding"),
-        0,
-    )
-    .context("failed to clear MSG alignment padding")?;
-
-    write_guest_u64(
-        engine,
-        checked_field_address(message_address, 16, "MSG.wParam"),
-        message.word_parameter,
-    )
-    .context("failed to write MSG.wParam")?;
-
-    write_guest_u64(
-        engine,
-        checked_field_address(message_address, 24, "MSG.lParam"),
-        message.long_parameter,
-    )
-    .context("failed to write MSG.lParam")?;
-
-    write_guest_u32(
-        engine,
-        checked_field_address(message_address, 32, "MSG.time"),
-        message.time,
-    )
-    .context("failed to write MSG.time")?;
-
-    write_guest_i32(
-        engine,
-        checked_field_address(message_address, 36, "MSG.pt.x"),
-        message.point_x,
-    )
-    .context("failed to write MSG.pt.x")?;
-
-    write_guest_i32(
-        engine,
-        checked_field_address(message_address, 40, "MSG.pt.y"),
-        message.point_y,
-    )
-    .context("failed to write MSG.pt.y")?;
-
-    // MSG.lPrivate on modern Win64 layouts.
-    write_guest_u32(
-        engine,
-        checked_field_address(message_address, 44, "MSG.lPrivate"),
-        0,
-    )
-    .context("failed to clear MSG.lPrivate")?;
-
-    Ok(())
+    // One shared-lock borrow instead of eight per-field exclusive writes. The
+    // view starts zeroed, so the Win64 padding (bytes 12..16) and the private
+    // lPrivate slot (bytes 44..48) read as zero — exactly the bytes the old
+    // per-field path cleared explicitly.
+    with_typed_write::<Msg, _, _>(engine, message_address, |msg| {
+        msg.hwnd = message.window_handle.as_u64();
+        msg.message = message.message;
+        msg.wparam = message.word_parameter;
+        msg.lparam = message.long_parameter;
+        msg.time = message.time;
+        msg.pt_x = message.point_x;
+        msg.pt_y = message.point_y;
+        Ok(())
+    })
+    .context("failed to write MSG structure")
 }
 
 /// Neutral default message handler used by several USER32 `Def*Proc` APIs.
 pub(crate) fn allocate_menu_handle(state: &mut WinApiState) -> Result<u64> {
-    let handle = state.window_state().next_menu_handle;
-    state.window_state().next_menu_handle = state
-        .window_state()
-        .next_menu_handle
-        .checked_add(1)
-        .context("menu handle allocator overflow")?;
+    let handle = state.window_state().next_menu_handle.as_u64();
+    state.window_state().next_menu_handle = crate::handles::Hmenu::from(
+        state
+            .window_state()
+            .next_menu_handle
+            .as_u64()
+            .checked_add(1)
+            .context("menu handle allocator overflow")?,
+    );
     Ok(handle)
 }
 
@@ -305,17 +492,17 @@ pub(crate) fn register_window_class(
 
 #[derive(Debug)]
 pub(crate) struct CreateWindowRequest {
-    class_identifier: WindowClassIdentifier,
-    title: String,
-    style: u32,
-    extended_style: u32,
-    parent_handle: u64,
-    menu_handle: u64,
-    instance_handle: u64,
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
+    pub(crate) class_identifier: WindowClassIdentifier,
+    pub(crate) title: String,
+    pub(crate) style: u32,
+    pub(crate) extended_style: u32,
+    pub(crate) parent_handle: u64,
+    pub(crate) menu_handle: u64,
+    pub(crate) instance_handle: u64,
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) width: i32,
+    pub(crate) height: i32,
 }
 
 #[derive(Debug)]
@@ -396,33 +583,38 @@ pub(crate) fn create_window_record(
 ) -> Result<(u64, u64, bool)> {
     let registered_class = find_window_class(state, &request.class_identifier, unicode).cloned();
 
-    let handle = state.window_state().next_window_handle;
+    let handle = state.window_state().next_window_handle.as_u64();
 
     if handle == 0 {
         return Ok((0, 0, unicode));
     }
 
-    state.window_state().next_window_handle = state
-        .window_state()
-        .next_window_handle
-        .checked_add(1)
-        .context("fake window handle overflow")?;
+    state.window_state().next_window_handle = crate::handles::Hwnd::from(
+        state
+            .window_state()
+            .next_window_handle
+            .as_u64()
+            .checked_add(1)
+            .context("fake window handle overflow")?,
+    );
+
+    // Built-in control classes (BUTTON/STATIC/EDIT/LISTBOX/COMBOBOX) resolve
+    // by ordinal or name and get a host-side WndProc (dispatch_control_proc).
+    let control_kind = controls::ControlClassKind::from_identifier(&request.class_identifier);
 
     let (class_atom, class_name, window_proc, class_unicode) =
-        if let Some(window_class) = registered_class {
+        if let Some(window_class) = registered_class.as_ref() {
             (
                 window_class.atom,
-                window_class.class_name,
+                window_class.class_name.clone(),
                 window_class.window_proc,
                 window_class.unicode,
             )
         } else {
-            let class_name = match request.class_identifier {
-                WindowClassIdentifier::Atom(atom) => {
-                    format!("#{atom}")
-                }
+            let class_name = match &request.class_identifier {
+                WindowClassIdentifier::Atom(atom) => format!("#{atom}"),
 
-                WindowClassIdentifier::Name(name) => name,
+                WindowClassIdentifier::Name(name) => name.clone(),
             };
 
             /*
@@ -434,24 +626,74 @@ pub(crate) fn create_window_record(
             (0, class_name, 0, unicode)
         };
 
+    // WS_VISIBLE children are immediately visible; controls marked visible at
+    // creation also start invalidated so the first empty GetMessage paints
+    // them (mirrors Windows painting a shown control).
+    let visible = request.style & WS_VISIBLE != 0;
+
+    if let Some(kind) = control_kind {
+        tracing::debug!(
+            target: "wiegui",
+            kind = ?kind,
+            hwnd = handle,
+            class = %class_name,
+            title = %request.title,
+            x = request.x,
+            y = request.y,
+            width = request.width,
+            height = request.height,
+            "control created"
+        );
+    } else {
+        tracing::info!(
+            target: "wiegui",
+            hwnd = handle,
+            class = %class_name,
+            title = %request.title,
+            x = request.x,
+            y = request.y,
+            width = request.width,
+            height = request.height,
+            "window created"
+        );
+    }
+
+    // A top-level window created without an explicit hMenu inherits its
+    // registered class's lpszMenuName menu (notepad's pattern); child
+    // windows never carry a menu.
+    let menu_handle = if request.style & WS_CHILD != 0 {
+        request.menu_handle
+    } else {
+        menu::resolve_class_menu(state, request.menu_handle, registered_class.as_ref())?
+    };
+
     state.window_state().windows.push(WindowRecord {
-        handle,
+        handle: crate::handles::Hwnd::from(handle),
         class_atom,
         class_name,
         window_proc,
         unicode: class_unicode,
-        title: request.title,
+        title: request.title.clone(),
         style: request.style,
         extended_style: request.extended_style,
-        parent_handle: request.parent_handle,
-        menu_handle: request.menu_handle,
+        parent_handle: crate::handles::Hwnd::from(request.parent_handle),
+        menu_handle,
         instance_handle: request.instance_handle,
         x: request.x,
         y: request.y,
         width: request.width,
         height: request.height,
-        visible: false,
-        enabled: true,
+        visible,
+        flags: WindowFlags::ENABLED,
+        invalidated: control_kind.is_some() && visible,
+        mouse_tracking: false,
+        client_rect: (0, 0, 0, 0),
+        control_kind,
+        control_text: request.title,
+        font_handle: crate::handles::Hfont::NULL,
+        dialog_proc: 0,
+        dialog_unicode: false,
+        subclass_original_wndproc: 0,
     });
 
     Ok((handle, window_proc, class_unicode))
@@ -460,10 +702,10 @@ pub(crate) fn create_window_record(
 pub(crate) fn create_mdi_child_from_struct(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
-    create_struct_ptr: u64,
+    create_struct_va: u64,
     unicode: bool,
 ) -> Result<u64> {
-    if create_struct_ptr == 0 {
+    if create_struct_va == 0 {
         return Ok(0);
     }
 
@@ -477,49 +719,49 @@ pub(crate) fn create_mdi_child_from_struct(
     // +0x24 cy
     // +0x28 style
     // +0x30 lParam
-    let class_ptr = read_guest_u64(engine, create_struct_ptr)
-        .context("failed to read MDICREATESTRUCT.szClass")?;
-    let title_ptr = read_guest_u64(
+    let class_va =
+        read_u64(engine, create_struct_va).context("failed to read MDICREATESTRUCT.szClass")?;
+    let title_va = read_u64(
         engine,
-        checked_field_address(create_struct_ptr, 8, "MDICREATESTRUCT.szTitle"),
+        checked_address(create_struct_va, 8, "MDICREATESTRUCT.szTitle"),
     )?;
-    let owner = read_guest_u64(
+    let owner = read_u64(
         engine,
-        checked_field_address(create_struct_ptr, 16, "MDICREATESTRUCT.hOwner"),
+        checked_address(create_struct_va, 16, "MDICREATESTRUCT.hOwner"),
     )?;
-    let x = read_guest_i32(
+    let x = read_i32(
         engine,
-        checked_field_address(create_struct_ptr, 24, "MDICREATESTRUCT.x"),
+        checked_address(create_struct_va, 24, "MDICREATESTRUCT.x"),
     )?;
-    let y = read_guest_i32(
+    let y = read_i32(
         engine,
-        checked_field_address(create_struct_ptr, 28, "MDICREATESTRUCT.y"),
+        checked_address(create_struct_va, 28, "MDICREATESTRUCT.y"),
     )?;
-    let cx = read_guest_i32(
+    let cx = read_i32(
         engine,
-        checked_field_address(create_struct_ptr, 32, "MDICREATESTRUCT.cx"),
+        checked_address(create_struct_va, 32, "MDICREATESTRUCT.cx"),
     )?;
-    let cy = read_guest_i32(
+    let cy = read_i32(
         engine,
-        checked_field_address(create_struct_ptr, 36, "MDICREATESTRUCT.cy"),
+        checked_address(create_struct_va, 36, "MDICREATESTRUCT.cy"),
     )?;
-    let style = read_guest_u32(
+    let style = read_u32(
         engine,
-        checked_field_address(create_struct_ptr, 40, "MDICREATESTRUCT.style"),
+        checked_address(create_struct_va, 40, "MDICREATESTRUCT.style"),
     )?;
 
     let class_identifier = if unicode {
-        read_window_class_identifier_w(engine, class_ptr)?
+        read_window_class_identifier_w(engine, class_va)?
     } else {
-        read_window_class_identifier_a(engine, class_ptr)?
+        read_window_class_identifier_a(engine, class_va)?
     };
 
-    let title = if title_ptr == 0 {
+    let title = if title_va == 0 {
         String::new()
     } else if unicode {
-        read_guest_utf16_lossy(engine, title_ptr, 512)?
+        read_guest_utf16_lossy(engine, title_va, 512)?
     } else {
-        read_guest_ansi_lossy(engine, title_ptr, 512)?
+        read_guest_ansi_lossy(engine, title_va, 512)?
     };
 
     let (handle, _window_proc, _class_unicode) = create_window_record(
@@ -550,6 +792,6 @@ pub(crate) fn is_known_window(state: &mut WinApiState, handle: u64) -> bool {
     handle == FAKE_WINDOW_HANDLE
         || handle == FAKE_DESKTOP_WINDOW_HANDLE
         || find_window(state, handle).is_some()
-        || state.window_state().active_window_handle == handle
-        || state.window_state().foreground_window_handle == handle
+        || state.window_state().active_window_handle == crate::handles::Hwnd::from(handle)
+        || state.window_state().foreground_window_handle == crate::handles::Hwnd::from(handle)
 }

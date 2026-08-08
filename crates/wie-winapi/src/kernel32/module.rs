@@ -15,15 +15,15 @@ pub fn handle_get_module_handle_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let environment = ctx.environment;
-    let module_name_ptr = engine
+    let module_name_va = engine
         .read_rcx()
         .context("failed to read RCX for GetModuleHandleA")?;
 
-    let return_value = if module_name_ptr == 0 {
+    let return_value = if module_name_va == 0 {
         state.process.last_error = 0;
         environment.image_base
     } else {
-        let module_name = read_ansi_string_from_cpu(engine, module_name_ptr, 260)?;
+        let module_name = read_ansi_string_from_cpu(engine, module_name_va, 260)?;
         let handle = resolve_loaded_module_handle(&module_name, environment.image_base, state);
         if handle == 0 {
             state.process.last_error = ERROR_MOD_NOT_FOUND;
@@ -33,29 +33,22 @@ pub fn handle_get_module_handle_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
         handle
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetModuleHandleA")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GetModuleHandleW`.
 pub fn handle_get_module_handle_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let environment = ctx.environment;
-    let module_name_ptr = engine
+    let module_name_va = engine
         .read_rcx()
         .context("failed to read RCX for GetModuleHandleW")?;
 
-    let return_value = if module_name_ptr == 0 {
+    let return_value = if module_name_va == 0 {
         state.process.last_error = 0;
         environment.image_base
     } else {
-        let module_name = read_guest_utf16_lossy(engine, module_name_ptr, 260)?;
+        let module_name = read_guest_utf16_lossy(engine, module_name_va, 260)?;
         let handle = resolve_loaded_module_handle(&module_name, environment.image_base, state);
         if handle == 0 {
             state.process.last_error = ERROR_MOD_NOT_FOUND;
@@ -65,14 +58,7 @@ pub fn handle_get_module_handle_w(ctx: &mut HandlerContext<'_>) -> Result<WinApi
         handle
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetModuleHandleW")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 pub(crate) fn normalize_module_name(name: &str) -> String {
     name.trim()
@@ -166,8 +152,10 @@ pub(crate) fn resolve_or_load_dll(
         return 0;
     };
 
-    // Build a guest-style path from the host path for the module descriptor.
-    let guest_path = resolve_windows_dll_path(name, &state.process.main_module_path);
+    // Synthesize a guest-style path for the module descriptor, derived from
+    // the process identity (main module dir → guest cwd → drive root).
+    let guest_cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
+    let guest_path = resolve_windows_dll_path(name, &state.process.main_module_path, &guest_cwd);
 
     match crate::dll_loader::load_dll(engine, state, host, &guest_path, &mut |lib, name, slot| {
         resolver.resolve(lib, name, slot)
@@ -192,27 +180,42 @@ pub(crate) fn resolve_or_load_dll(
         }
     }
 }
-pub(crate) fn resolve_windows_dll_path(name: &str, main_module_path: &str) -> String {
+/// Synthesize a guest-style absolute DLL path from a bare module name.
+///
+/// The directory comes from the process identity, never a literal default:
+/// the main module's guest directory first, then the guest current directory,
+/// then the `C:\` drive root. A `name` that is already a path (separator or
+/// drive letter present) is returned unchanged.
+pub(crate) fn resolve_windows_dll_path(
+    name: &str,
+    main_module_path: &str,
+    current_directory: &str,
+) -> String {
     if name.contains('\\') || name.contains('/') || name.contains(':') {
         return name.to_owned();
     }
-    if let Some(parent) = std::path::Path::new(main_module_path).parent() {
-        let dir = parent.to_string_lossy().replace('/', "\\");
-        format!("{dir}\\{name}")
-    } else {
-        format!("C:\\App\\{name}")
+    if let Some(dir) = crate::vfs::guest_dir_of(main_module_path) {
+        return format!("{dir}\\{name}");
     }
+    let cwd = current_directory
+        .trim_end_matches(['\\', '/'])
+        .replace('/', "\\");
+    if cwd.is_empty() {
+        return format!("C:\\{name}");
+    }
+    format!("{cwd}\\{name}")
 }
+
 /// Handles `KERNEL32.dll!GetModuleFileNameA`.
 pub fn handle_get_module_file_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let module_file_name_a_ptr = ctx.environment.module_file_name_a_ptr;
+    let module_file_name_a_va = ctx.environment.module_file_name_a_ptr;
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let _module_handle = engine
         .read_rcx()
         .context("failed to read RCX for GetModuleFileNameA")?;
 
-    let buffer_ptr = engine
+    let buffer_va = engine
         .read_rdx()
         .context("failed to read RDX for GetModuleFileNameA")?;
 
@@ -221,7 +224,7 @@ pub fn handle_get_module_file_name_a(ctx: &mut HandlerContext<'_>) -> Result<Win
         .context("failed to read R8 for GetModuleFileNameA")?;
 
     let (return_value, truncated) =
-        copy_path_a_to_guest_buffer(engine, module_file_name_a_ptr, buffer_ptr, buffer_len)?;
+        copy_path_a_to_guest_buffer(engine, module_file_name_a_va, buffer_va, buffer_len)?;
 
     state.process.last_error = if truncated {
         ERROR_INSUFFICIENT_BUFFER
@@ -229,25 +232,18 @@ pub fn handle_get_module_file_name_a(ctx: &mut HandlerContext<'_>) -> Result<Win
         0
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetModuleFileNameA")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GetModuleFileNameW`.
 pub fn handle_get_module_file_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let module_file_name_w_ptr = ctx.environment.module_file_name_w_ptr;
+    let module_file_name_w_va = ctx.environment.module_file_name_w_ptr;
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let _module_handle = engine
         .read_rcx()
         .context("failed to read RCX for GetModuleFileNameW")?;
 
-    let buffer_ptr = engine
+    let buffer_va = engine
         .read_rdx()
         .context("failed to read RDX for GetModuleFileNameW")?;
 
@@ -256,7 +252,7 @@ pub fn handle_get_module_file_name_w(ctx: &mut HandlerContext<'_>) -> Result<Win
         .context("failed to read R8 for GetModuleFileNameW")?;
 
     let (return_value, truncated) =
-        copy_path_w_to_guest_buffer(engine, module_file_name_w_ptr, buffer_ptr, buffer_len)?;
+        copy_path_w_to_guest_buffer(engine, module_file_name_w_va, buffer_va, buffer_len)?;
 
     state.process.last_error = if truncated {
         ERROR_INSUFFICIENT_BUFFER
@@ -264,29 +260,22 @@ pub fn handle_get_module_file_name_w(ctx: &mut HandlerContext<'_>) -> Result<Win
         0
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetModuleFileNameW")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!LoadLibraryA` — real DLL loading.
 pub fn handle_load_library_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let environment = ctx.environment;
-    let library_name_ptr = engine
+    let library_name_va = engine
         .read_rcx()
         .context("failed to read RCX for LoadLibraryA")?;
 
-    let return_value = if library_name_ptr == 0 {
+    let return_value = if library_name_va == 0 {
         state.process.last_error = ERROR_MOD_NOT_FOUND;
         0
     } else {
-        let library_name = read_ansi_string_from_cpu(engine, library_name_ptr, 260)?;
+        let library_name = read_ansi_string_from_cpu(engine, library_name_va, 260)?;
         let handle = resolve_or_load_dll(&library_name, engine, environment, state);
         if handle == 0 {
             state.process.last_error = ERROR_MOD_NOT_FOUND;
@@ -296,29 +285,22 @@ pub fn handle_load_library_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         handle
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from LoadLibraryA")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!LoadLibraryW` — real DLL loading.
 pub fn handle_load_library_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let environment = ctx.environment;
-    let library_name_ptr = engine
+    let library_name_va = engine
         .read_rcx()
         .context("failed to read RCX for LoadLibraryW")?;
 
-    let return_value = if library_name_ptr == 0 {
+    let return_value = if library_name_va == 0 {
         state.process.last_error = ERROR_MOD_NOT_FOUND;
         0
     } else {
-        let library_name = read_wide_string_from_cpu(engine, library_name_ptr, 260)?;
+        let library_name = read_wide_string_from_cpu(engine, library_name_va, 260)?;
         let handle = resolve_or_load_dll(&library_name, engine, environment, state);
         if handle == 0 {
             state.process.last_error = ERROR_MOD_NOT_FOUND;
@@ -328,14 +310,7 @@ pub fn handle_load_library_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         handle
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from LoadLibraryW")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!FreeLibrary`.
 pub fn handle_free_library(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -358,11 +333,7 @@ pub fn handle_free_library(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
             .map(|(n, _)| n.clone())
         else {
             state.process.last_error = ERROR_INVALID_HANDLE;
-            let return_address = engine.return_from_win64_api(0)?;
-            return Ok(WinApiHandlerResult {
-                return_address,
-                return_value: 0,
-            });
+            return ctx.finish(0);
         };
 
         if let Some(module) = state.module_state.loaded_modules.get_mut(&name) {
@@ -392,14 +363,7 @@ pub fn handle_free_library(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
         1
     };
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from FreeLibrary")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GetProcAddress`.
 pub fn handle_get_proc_address(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -409,17 +373,17 @@ pub fn handle_get_proc_address(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         .read_rcx()
         .context("failed to read RCX for GetProcAddress")?;
 
-    let proc_name_ptr = engine
+    let proc_name_va = engine
         .read_rdx()
         .context("failed to read RDX for GetProcAddress")?;
 
     // Microsoft Learn: if `lpProcName` is an ordinal, the high bits are zero
     // (MAKEINTRESOURCE). We treat small pointers as ordinals.
-    let (proc_name, is_ordinal) = if proc_name_ptr <= 0xffff {
-        (format!("ORDINAL {proc_name_ptr:#x}"), true)
+    let (proc_name, is_ordinal) = if proc_name_va <= 0xffff {
+        (format!("ORDINAL {proc_name_va:#x}"), true)
     } else {
         (
-            read_guest_ansi_lossy(engine, proc_name_ptr, 256)
+            read_guest_ansi_lossy(engine, proc_name_va, 256)
                 .context("failed to read GetProcAddress proc name")?,
             false,
         )
@@ -447,7 +411,7 @@ pub fn handle_get_proc_address(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
             .find(|m| m.handle == module_handle)
         {
             let va = if is_ordinal {
-                let ordinal = u16::try_from(proc_name_ptr).unwrap_or(0);
+                let ordinal = u16::try_from(proc_name_va).unwrap_or(0);
                 module.get_export_va_by_ordinal(ordinal)
             } else {
                 module.get_export_va(&proc_name)
@@ -465,19 +429,11 @@ pub fn handle_get_proc_address(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
                     },
                 );
                 state.process.last_error = 0;
-                let return_address = engine.return_from_win64_api(address)?;
-                return Ok(WinApiHandlerResult {
-                    return_address,
-                    return_value: address,
-                });
+                return ctx.finish(address);
             }
         }
         state.process.last_error = ERROR_PROC_NOT_FOUND;
-        let return_address = engine.return_from_win64_api(0)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return ctx.finish(0);
     }
 
     // Fall back to existing fake-API resolution for fake module handles.
@@ -492,26 +448,18 @@ pub fn handle_get_proc_address(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
             },
         );
         state.process.last_error = 0;
-        let return_address = engine.return_from_win64_api(address)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: address,
-        });
+        return ctx.finish(address);
     }
 
     state.process.last_error = ERROR_PROC_NOT_FOUND;
-    let return_address = engine.return_from_win64_api(0)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 0,
-    })
+    ctx.finish(0)
 }
 /// Handles `KERNEL32.dll!LoadLibraryExA` — real DLL loading.
 pub fn handle_load_library_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let environment = ctx.environment;
-    let library_name_ptr = engine
+    let library_name_va = engine
         .read_rcx()
         .context("failed to read RCX for LoadLibraryExA")?;
 
@@ -523,24 +471,17 @@ pub fn handle_load_library_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .read_r8()
         .context("failed to read R8 for LoadLibraryExA")?;
 
-    let library_name = read_ansi_string_from_cpu(engine, library_name_ptr, 260)?;
+    let library_name = read_ansi_string_from_cpu(engine, library_name_va, 260)?;
     let return_value = resolve_or_load_dll(&library_name, engine, environment, state);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from LoadLibraryExA")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!LoadLibraryExW` — real DLL loading.
 pub fn handle_load_library_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let environment = ctx.environment;
-    let library_name_ptr = engine
+    let library_name_va = engine
         .read_rcx()
         .context("failed to read RCX for LoadLibraryExW")?;
 
@@ -552,17 +493,10 @@ pub fn handle_load_library_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .read_r8()
         .context("failed to read R8 for LoadLibraryExW")?;
 
-    let library_name = read_wide_string_from_cpu(engine, library_name_ptr, 260)?;
+    let library_name = read_wide_string_from_cpu(engine, library_name_va, 260)?;
     let return_value = resolve_or_load_dll(&library_name, engine, environment, state);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from LoadLibraryExW")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!FindResourceA`.
 pub fn handle_find_resource_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -582,14 +516,7 @@ pub fn handle_find_resource_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 
     let record = create_fake_resource_record(engine, state)?;
 
-    let return_address = engine
-        .return_from_win64_api(record.handle)
-        .context("failed to return from FindResourceA")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: record.handle,
-    })
+    ctx.finish(record.handle)
 }
 /// Handles `KERNEL32.dll!LoadResource`.
 pub fn handle_load_resource(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -606,14 +533,7 @@ pub fn handle_load_resource(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     let return_value = find_resource_by_handle(state, resource_handle)
         .map_or(0, |resource| resource.loaded_handle);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from LoadResource")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!LockResource`.
 pub fn handle_lock_resource(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -626,14 +546,7 @@ pub fn handle_lock_resource(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     let return_value =
         find_resource_by_handle(state, resource_handle).map_or(0, |resource| resource.data_ptr);
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from LockResource")?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!SizeofResource`.
 pub fn handle_sizeof_resource(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -650,12 +563,83 @@ pub fn handle_sizeof_resource(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     let return_value = find_resource_by_handle(state, resource_handle)
         .map_or(0, |resource| u64::from(resource.size));
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from SizeofResource")?;
+    ctx.finish(return_value)
+}
 
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+#[cfg(test)]
+mod tests {
+    use super::resolve_windows_dll_path;
+
+    #[test]
+    fn dll_path_derives_from_main_module_dir() {
+        // A non-C:\App main module: the synthesized path follows its directory.
+        assert_eq!(
+            resolve_windows_dll_path("x.dll", r"C:\Program Files\MyApp\main.exe", ""),
+            r"C:\Program Files\MyApp\x.dll"
+        );
+    }
+
+    #[test]
+    fn dll_path_keeps_app_dir_when_main_module_is_under_it() {
+        // Main module under C:\App: the derived (not literal) dir is C:\App.
+        assert_eq!(
+            resolve_windows_dll_path("x.dll", r"C:\App\myapp.exe", r"C:\App"),
+            r"C:\App\x.dll"
+        );
+    }
+
+    #[test]
+    fn dll_path_falls_back_to_guest_cwd() {
+        assert_eq!(
+            resolve_windows_dll_path("x.dll", "", r"C:\work"),
+            r"C:\work\x.dll"
+        );
+        // A bare file name has no directory component either.
+        assert_eq!(
+            resolve_windows_dll_path("x.dll", "main.exe", r"C:\work"),
+            r"C:\work\x.dll"
+        );
+    }
+
+    #[test]
+    fn dll_path_last_resort_is_drive_root_not_literal_app() {
+        assert_eq!(resolve_windows_dll_path("x.dll", "", ""), r"C:\x.dll");
+    }
+
+    #[test]
+    fn dll_path_passes_qualified_names_through() {
+        assert_eq!(
+            resolve_windows_dll_path(r"C:\sys\x.dll", "", ""),
+            r"C:\sys\x.dll"
+        );
+        assert_eq!(
+            resolve_windows_dll_path("x.dll", r"C:\App\main.exe", ""),
+            r"C:\App\x.dll"
+        );
+    }
+
+    #[test]
+    fn guest_dir_of_splits_windows_paths_host_agnostically() {
+        // Delegates to the canonical vfs/path.rs module (crate::vfs::guest_dir_of).
+        assert_eq!(
+            crate::vfs::guest_dir_of(r"C:\App\main.exe"),
+            Some(r"C:\App".to_owned())
+        );
+        assert_eq!(
+            crate::vfs::guest_dir_of(r"C:\Program Files\MyApp\main.exe"),
+            Some(r"C:\Program Files\MyApp".to_owned())
+        );
+        // A bare drive letter maps to the drive root.
+        assert_eq!(
+            crate::vfs::guest_dir_of(r"C:\main.exe"),
+            Some(r"C:\".to_owned())
+        );
+        assert_eq!(crate::vfs::guest_dir_of("main.exe"), None);
+        assert_eq!(crate::vfs::guest_dir_of(""), None);
+        // Forward slashes are normalized to backslashes.
+        assert_eq!(
+            crate::vfs::guest_dir_of(r"C:/App/main.exe"),
+            Some(r"C:\App".to_owned())
+        );
+    }
 }

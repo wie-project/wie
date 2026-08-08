@@ -1,0 +1,60 @@
+# Build and publish the Apple Silicon release binary on every version tag.
+#
+# On a push of a `v*` tag (e.g. `v1.2.3`) this runs the same build as
+# build.yml, packages `target/release/wie` as `wie-<version>-darwin-arm64.tar.gz`
+# (version without the leading `v`), creates a GitHub release for the tag,
+# and attaches the tarball. The Homebrew formula (wie-project/homebrew-wie)
+# downloads this artifact.
+#
+# Code-signing/notarization are out of scope; macOS will warn about the
+# unsigned binary (the formula comment notes this).
+
+name: Release (Apple Silicon)
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build and publish release (arm64)
+    runs-on: macos-14 # GitHub's native Apple Silicon runner
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build wie-cli (release)
+        run: cargo build -p wie-cli --release
+
+      - name: Compute release version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Package the binary
+        run: tar czf "wie-${{ steps.version.outputs.version }}-darwin-arm64.tar.gz" -C target/release wie
+
+      - name: Create GitHub release and attach the tarball
+        uses: softprops/action-gh-release@v2
+        with:
+          files: wie-${{ steps.version.outputs.version }}-darwin-arm64.tar.gz
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          token: ${{ secrets.GITHUB_TOKEN }}

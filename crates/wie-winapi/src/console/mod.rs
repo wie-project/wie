@@ -35,17 +35,6 @@
 
 // Most of these modules are consumed by the dispatch layer. Until every
 // function is wired the `dead_code` and `unreachable_pub` lints are noise.
-#![allow(
-    clippy::as_conversions,
-    clippy::integer_division,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap,
-    clippy::items_after_statements,
-    clippy::format_push_string,
-    clippy::cast_lossless,
-    clippy::arithmetic_side_effects
-)]
 
 pub(crate) mod codepage;
 pub(crate) mod host_term;
@@ -151,11 +140,9 @@ impl Coord {
     /// Decode the packed `COORD` the Win64 ABI passes by value in a register.
     #[must_use]
     pub const fn from_packed(packed: u64) -> Self {
-        #[allow(clippy::cast_possible_truncation, clippy::as_conversions)]
         // COORD is two i16 fields packed into the low 32 bits; the truncation
         // to u16 then reinterpretation as i16 is exactly the ABI's layout.
         let x = (packed & 0xffff) as u16;
-        #[allow(clippy::cast_possible_truncation, clippy::as_conversions)]
         let y = ((packed >> 16) & 0xffff) as u16;
         Self {
             x: i16::from_ne_bytes(x.to_ne_bytes()),
@@ -320,6 +307,15 @@ impl ScreenBuffer {
     }
 }
 
+use crate::state::handle_newtype;
+
+// ── Console buffer-handle newtype (ADR-003) ────────────────────────────
+
+handle_newtype! {
+    /// A fake console screen-buffer handle (`CreateConsoleScreenBuffer`).
+    ConsoleBufferHandle
+}
+
 /// All console state for the emulated process.
 #[derive(Debug, Clone)]
 pub struct ConsoleState {
@@ -335,7 +331,7 @@ pub struct ConsoleState {
     /// Handle whose buffer is currently displayed.
     pub active_buffer: u64,
     /// Next handle value handed out by `CreateConsoleScreenBuffer`.
-    pub next_buffer_handle: u64,
+    pub next_buffer_handle: ConsoleBufferHandle,
     /// Decoded records not yet consumed by `ReadConsoleInput`.
     pub pending_input: VecDeque<InputRecord>,
     /// Undecoded bytes from the host terminal.
@@ -368,7 +364,7 @@ impl Default for ConsoleState {
             buffers: vec![(PRIMARY_BUFFER_HANDLE, ScreenBuffer::new(columns, rows))],
             output_modes: vec![(PRIMARY_BUFFER_HANDLE, DEFAULT_OUTPUT_MODE)],
             active_buffer: PRIMARY_BUFFER_HANDLE,
-            next_buffer_handle: FIRST_ALT_BUFFER_HANDLE,
+            next_buffer_handle: ConsoleBufferHandle::from(FIRST_ALT_BUFFER_HANDLE),
             pending_input: VecDeque::new(),
             input_bytes: Vec::new(),
             rendered: None,
@@ -464,8 +460,9 @@ impl ConsoleState {
     /// Allocate a screen buffer and return its handle.
     pub fn create_buffer(&mut self) -> u64 {
         let (columns, rows) = host_term::window_size();
-        let handle = self.next_buffer_handle;
-        self.next_buffer_handle = self.next_buffer_handle.saturating_add(1);
+        let handle = self.next_buffer_handle.as_u64();
+        self.next_buffer_handle =
+            ConsoleBufferHandle::from(self.next_buffer_handle.as_u64().saturating_add(1));
         self.buffers
             .push((handle, ScreenBuffer::new(columns, rows)));
         self.output_modes.push((handle, DEFAULT_OUTPUT_MODE));
@@ -506,6 +503,33 @@ impl ConsoleState {
             self.repaint_forced = true;
         }
     }
+}
+
+// ── Interactive raw-mode seam ────────────────────────────────────────────
+
+/// Switch the host terminal into raw (cbreak) mode for an interactive
+/// `--console` run.
+///
+/// `processed_input` mirrors `ENABLE_PROCESSED_INPUT`: when `true`, `ISIG`
+/// stays on so Ctrl+C raises `SIGINT` (the pump delivers it to the guest as a
+/// console control event); when `false`, Ctrl+C arrives as an ordinary key
+/// event. Returns `false` when stdin is not a terminal.
+///
+/// The guest's own console reads enter raw mode independently through
+/// [`pump::ensure_input_ready`]; this seam exists for the CLI to switch the
+/// terminal *before* the guest starts, so the first keystroke is delivered
+/// immediately.
+pub fn set_raw_mode(processed_input: bool) -> bool {
+    host_term::enter_raw(processed_input)
+}
+
+/// Restore the host terminal after an interactive run.
+///
+/// Idempotent: no-ops when raw mode was never entered (including non-terminal
+/// stdin). The `--console` CLI owns this through a drop guard so returns,
+/// errors and panics all restore the shell.
+pub fn restore_terminal() {
+    host_term::restore_now();
 }
 
 #[cfg(test)]
@@ -666,5 +690,46 @@ mod tests {
         assert_eq!(r.top, 0);
         assert_eq!(r.right, 0);
         assert_eq!(r.bottom, 0);
+    }
+
+    // --- Raw-mode seam ---
+
+    #[test]
+    fn restore_terminal_is_a_noop_when_raw_mode_was_never_entered() {
+        // Under the test harness stdin is piped (or the terminal untouched):
+        // restore must neither emit ANSI nor touch the terminal.
+        super::restore_terminal();
+        super::restore_terminal();
+        assert!(!host_term::raw_active());
+    }
+
+    #[test]
+    fn set_raw_mode_refuses_non_terminal_stdin() {
+        // CI / piped runs: `enter_raw` refuses instead of corrupting a
+        // terminal that is not there. On a real tty the mode is actually
+        // switched, so skip to avoid disturbing an interactive session.
+        if host_term::is_tty() {
+            return;
+        }
+        assert!(!super::set_raw_mode(true));
+        assert!(!host_term::raw_active());
+        super::restore_terminal();
+    }
+
+    #[test]
+    fn set_raw_mode_round_trips_on_a_real_terminal() {
+        // A dev running the suite from a shell has a tty; exercise the full
+        // switch/restore cycle there. Restore happens before any assertion so
+        // a failure cannot leave the terminal in raw mode (and the atexit hook
+        // from `enter_raw` is the last-resort safety net).
+        if !host_term::is_tty() {
+            return;
+        }
+        let entered = super::set_raw_mode(false);
+        let active = host_term::raw_active();
+        super::restore_terminal();
+        assert!(entered);
+        assert!(active);
+        assert!(!host_term::raw_active());
     }
 }

@@ -4,14 +4,26 @@
 //! the shared CPU engine. Guest data races are still the application's problem;
 //! engine metadata is serialized by the runtime process lock.
 
-use std::collections::HashMap;
+use ahash::HashMap;
+use ahash::HashMapExt;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use wie_cpu::ThreadContext;
 
+use crate::state::handle_newtype;
+
 /// `STILL_ACTIVE` — thread has not terminated (`GetExitCodeThread`).
 pub const STILL_ACTIVE: u32 = 259;
+
+// A kernel-object handle (thread / event / semaphore) in the [`SyncState`]
+// table. Typed so a `KernelHandle` cannot be mixed with file, window, or other
+// handle namespaces (ADR-003). Handlers keep raw `u64` registers; lookups
+// convert at the table boundary.
+handle_newtype! {
+    /// A kernel-object handle (thread / event / semaphore).
+    KernelHandle
+}
 
 /// `WAIT_OBJECT_0` success from `WaitForSingleObject`.
 pub const WAIT_OBJECT_0: u32 = 0;
@@ -26,25 +38,29 @@ pub const INFINITE: u32 = 0xffff_ffff;
 #[derive(Debug, Clone, Default)]
 pub struct SyncState {
     /// Next kernel handle value (never zero / `INVALID_HANDLE_VALUE`).
-    pub next_handle: u64,
+    ///
+    /// `pub(crate)`: only the allocators here and the kernel32 handle writers
+    /// touch the counter; external crates receive handles as raw `u64`.
+    pub(crate) next_handle: KernelHandle,
     /// Live kernel objects keyed by handle.
-    pub objects: HashMap<u64, KernelObject>,
+    pub objects: HashMap<KernelHandle, KernelObject>,
     /// Guest TID → saved CPU context while not running on the shared engine.
     pub thread_cpu: HashMap<u32, ThreadContext>,
     /// Critical-section wait queues keyed by guest CS VA.
     pub cs_waiters: HashMap<u64, Arc<CsWaitQueue>>,
     /// Monotonic stack slot for worker stacks.
-    pub next_stack_slot: u32,
+    pub(crate) next_stack_slot: u32,
     /// Threads waiting to be spawned by the session after `CreateThread`.
     pub pending_spawns: Vec<PendingSpawn>,
     /// `CREATE_SUSPENDED` threads awaiting `ResumeThread` (keyed by handle).
-    pub suspended_spawns: HashMap<u64, PendingSpawn>,
+    pub(crate) suspended_spawns: HashMap<u64, PendingSpawn>,
     /// Pending `WaitForMultipleObjects` args, keyed by guest TID of the waiter.
     pub multi_wait: HashMap<u32, MultiWaitRequest>,
     /// Process is dying (`ExitProcess`); workers should stop.
     pub process_dying: bool,
     /// Per-module function tables (image_base → sorted Vec of RuntimeFunction).
     /// Used by `RtlLookupFunctionEntry` to find unwind info for a given RIP.
+    /// Seeded by the runtime at session init (`parse_pdata`).
     pub function_tables: HashMap<u64, Vec<crate::exception::RuntimeFunction>>,
 }
 
@@ -64,7 +80,7 @@ impl SyncState {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            next_handle: 0x0000_0000_8000_0001,
+            next_handle: KernelHandle::from(0x0000_0000_8000_0001),
             objects: HashMap::new(),
             thread_cpu: HashMap::new(),
             cs_waiters: HashMap::new(),
@@ -77,21 +93,24 @@ impl SyncState {
         }
     }
 
-    fn alloc_handle(&mut self) -> u64 {
+    fn alloc_handle(&mut self) -> KernelHandle {
         let h = self.next_handle;
-        self.next_handle = self.next_handle.saturating_add(1);
-        if self.next_handle == 0 || self.next_handle == u64::MAX {
-            self.next_handle = 0x0000_0000_8000_0001;
-        }
+        let next = h.as_u64().saturating_add(1);
+        self.next_handle = if next == 0 || next == u64::MAX {
+            KernelHandle::from(0x0000_0000_8000_0001)
+        } else {
+            KernelHandle::from(next)
+        };
         h
     }
 
     /// Register a new thread object; returns (handle, Arc body).
     pub fn register_thread(&mut self, tid: u32, ctx: ThreadContext) -> (u64, Arc<ThreadObject>) {
         let handle = self.alloc_handle();
+        let handle_u64 = handle.as_u64();
         let obj = Arc::new(ThreadObject {
             tid,
-            handle,
+            handle: handle_u64,
             exit_code: std::sync::atomic::AtomicU32::new(STILL_ACTIVE),
             finished: Mutex::new(false),
             finished_cv: Condvar::new(),
@@ -99,21 +118,22 @@ impl SyncState {
         self.thread_cpu.insert(tid, ctx);
         self.objects
             .insert(handle, KernelObject::Thread(Arc::clone(&obj)));
-        (handle, obj)
+        (handle_u64, obj)
     }
 
     /// Register a Win32 event object.
     pub fn register_event(&mut self, manual_reset: bool, initial: bool) -> (u64, Arc<EventObject>) {
         let handle = self.alloc_handle();
+        let handle_u64 = handle.as_u64();
         let obj = Arc::new(EventObject {
-            handle,
+            handle: handle_u64,
             manual_reset,
             state: Mutex::new(EventInner { signaled: initial }),
             cv: Condvar::new(),
         });
         self.objects
             .insert(handle, KernelObject::Event(Arc::clone(&obj)));
-        (handle, obj)
+        (handle_u64, obj)
     }
 
     /// Register a Win32 semaphore (`CreateSemaphore*`).
@@ -123,32 +143,56 @@ impl SyncState {
         maximum_count: i32,
     ) -> (u64, Arc<SemaphoreObject>) {
         let handle = self.alloc_handle();
+        let handle_u64 = handle.as_u64();
         let initial = initial_count.clamp(0, maximum_count.max(0));
         let maximum = maximum_count.max(1);
         let obj = Arc::new(SemaphoreObject {
-            handle,
+            handle: handle_u64,
             maximum,
             state: Mutex::new(SemaphoreInner { count: initial }),
             cv: Condvar::new(),
         });
         self.objects
             .insert(handle, KernelObject::Semaphore(Arc::clone(&obj)));
-        (handle, obj)
+        (handle_u64, obj)
+    }
+
+    /// Register a file mapping (`CreateFileMappingW`).
+    ///
+    /// The mapping captures the mapped file's guest path and size; the actual
+    /// byte copy happens at `MapViewOfFile` time so the file can be re-read
+    /// after the source handle closes.
+    pub fn register_file_mapping(
+        &mut self,
+        guest_path: String,
+        size: u64,
+    ) -> (u64, Arc<FileMappingObject>) {
+        let handle = self.alloc_handle();
+        let handle_u64 = handle.as_u64();
+        let obj = Arc::new(FileMappingObject {
+            handle: handle_u64,
+            guest_path,
+            size,
+        });
+        self.objects
+            .insert(handle, KernelObject::FileMapping(Arc::clone(&obj)));
+        (handle_u64, obj)
     }
 
     /// Look up a thread object by handle.
     pub fn thread_by_handle(&self, handle: u64) -> Option<Arc<ThreadObject>> {
-        match self.objects.get(&handle)? {
+        match self.objects.get(&KernelHandle::from(handle))? {
             KernelObject::Thread(t) => Some(Arc::clone(t)),
-            KernelObject::Event(_) | KernelObject::Semaphore(_) => None,
+            KernelObject::Event(_) | KernelObject::Semaphore(_) | KernelObject::FileMapping(_) => {
+                None
+            }
         }
     }
 
     /// Look up any waitable object.
     pub fn object(&self, handle: u64) -> Option<&KernelObject> {
-        self.objects.get(&handle)
+        self.objects.get(&KernelHandle::from(handle))
     }
-
     /// CS wait queue for guest VA (created on demand).
     pub fn cs_queue(&mut self, cs_va: u64) -> Arc<CsWaitQueue> {
         self.cs_waiters
@@ -189,6 +233,9 @@ pub enum KernelObject {
     Event(Arc<EventObject>),
     /// Counting semaphore.
     Semaphore(Arc<SemaphoreObject>),
+    /// A file mapping (`CreateFileMappingW`) — a snapshot of an open file's
+    /// bytes that `MapViewOfFile` copies into guest memory.
+    FileMapping(Arc<FileMappingObject>),
 }
 
 /// Guest thread waitable + exit state.
@@ -458,6 +505,20 @@ impl SemaphoreObject {
     }
 }
 
+/// A file-mapping object (`CreateFileMappingW`).
+///
+/// Carries the mapped file's guest path and size so `MapViewOfFile` can copy
+/// its bytes into guest memory. Not waitable (Windows maps never are).
+#[derive(Debug)]
+pub struct FileMappingObject {
+    /// Kernel handle.
+    pub handle: u64,
+    /// The mapped file's guest path (`C:\...` / `Z:\pick{N}\...`).
+    pub guest_path: String,
+    /// Mapped size in bytes (the file size at creation).
+    pub size: u64,
+}
+
 /// Wait queue for one guest critical section VA.
 #[derive(Debug)]
 pub struct CsWaitQueue {
@@ -661,10 +722,12 @@ fn multi_try_once(targets: &[WaitTarget], wait_all: bool) -> Option<u32> {
 impl SyncState {
     /// Clone a waitable handle into a [`WaitTarget`] (or `None` if invalid).
     pub fn wait_target(&self, handle: u64) -> Option<WaitTarget> {
-        match self.objects.get(&handle)? {
+        match self.objects.get(&KernelHandle::from(handle))? {
             KernelObject::Thread(t) => Some(WaitTarget::Thread(Arc::clone(t))),
             KernelObject::Event(e) => Some(WaitTarget::Event(Arc::clone(e))),
             KernelObject::Semaphore(s) => Some(WaitTarget::Semaphore(Arc::clone(s))),
+            // File mappings are not waitable.
+            KernelObject::FileMapping(_) => None,
         }
     }
 

@@ -5,14 +5,85 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+# The produced binary is `wie` (the crate keeps its name for the
+# dependency graph).
+[[bin]]
+name = "wie"
+path = "src/main.rs"
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-serde_json.workspace = true
 
 wie-pe = { path = "../wie-pe" }
 wie-runtime = { path = "../wie-runtime" }
 wie-winapi = { path = "../wie-winapi" }
-wie-cpu = { path = "../wie-cpu" }
+
+# macOS-only policy: winit's default features enable the X11/Wayland backends
+# (Linux-only), which pull x11-dl, wayland-*, sctk, calloop, etc. into the
+# feature graph and lockfile. The macOS backend compiles unconditionally —
+# the only feature it needs is rwh_06 (raw-window-handle 0.6), which wgpu
+# requires to construct its surface from winit's Window.
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
+
+# macOS application menu bar (guest window menu -> top bar). muda is a safe
+# wrapper over AppKit — no hand-written objc2 lives in this crate anymore.
+# macOS-only dep: muda 0.19.3 with default-features disabled has no Linux
+# backend (the gtk feature is required there, and it needs GTK3 system libs),
+# so gating keeps non-macOS builds clean. Its internal objc2 0.6.x line is
+# separate from winit's 0.5.2 and muda does not re-export objc2 types.
+#
+# wgpu (Metal backend) + pollster power the P4a present path (present_wgpu.rs).
+# macOS-only policy: the "metal" feature is a no-op on non-Apple targets, so
+# like muda these are target-gated to keep non-macOS builds clean. pollster
+# blocks on the async adapter/device requests (no runtime in wie-cli). bytemuck
+# provides the u32→u8 pixel-buffer view for write_texture (wgpu 30 removed its
+# own `util::cast_slice`; bytemuck is wgpu's own replacement and already in the
+# tree as a wgpu dependency).
+[target.'cfg(target_os = "macos")'.dependencies]
+muda = { version = "0.19.3", default-features = false, features = [] }
+# Native alerts for MessageBoxA/W. default-features off: the defaults are
+# Linux-only extras (wayland + xdg-portal) that only pollute the lockfile and
+# feature graph; the macOS backend (objc2-app-kit + block2) is unconditional.
+rfd = { version = "0.17", default-features = false }
+# Guest z-order mirroring: winit 0.30 exposes no window-ordering API, so the
+# Frame handler calls AppKit's NSWindow orderFront directly on the winit
+# window's NSView (see `order_window_front` in gui/app.rs). Already a
+# transitive dep via winit 0.30 (same 0.2 line + NSWindow feature — no new
+# lockfile version); the direct edge makes the use explicit. The one unsafe
+# pointer cast lives in app.rs under the crate's scoped-unsafe precedent.
+#
+# NSPrintPanel/NSPrintInfo: the PrintDlgW bridge (gui/print.rs) runs the real
+# macOS print panel — the OS-equivalent of Windows' PrintDlg — and registers
+# the user's NSPrintInfo in the host id-table for the P3 EndDoc handoff.
+# NSImage/NSImageRep/NSBitmapImageRep/NSPrintOperation/NSGraphics: the P3
+# print-operation glue (gui/print.rs) turns the rasterized page canvases into
+# NSImages (NSBitmapImageRep from the RGBA pixels) and drives a real
+# NSPrintOperation with the panel's NSPrintInfo.
+# objc2 + objc2-foundation are already transitive via winit 0.30 / app-kit 0.2
+# (same 0.5 / 0.2 lines — no new lockfile versions); the direct edges make
+# the uses in gui/print.rs explicit. The foundation features mirror what
+# winit's macos backend already enables, plus NSNumber for the copies value.
+# NSPageLayout: the P4 page-setup panel (gui/print.rs) — the macOS
+# OS-equivalent of Windows' PageSetupDlg, edits paper size + orientation.
+# NSAlert/NSButton: the pre-window MessageBox fallback (gui/app.rs) — a
+# MessageBox raised before the first frame created a winit window must not
+# take rfd's unparented CFUserNotificationDisplayAlert path (it prints a
+# "will block waiting for a response" line on the main thread), so it shows
+# a bare NSAlert instead.
+objc2-app-kit = { version = "0.2", features = ["NSView", "NSWindow", "NSPrintInfo", "NSPrintPanel", "NSPageLayout", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSPrintOperation", "NSGraphics", "NSAlert", "NSButton"] }
+objc2 = { version = "0.5", default-features = false, features = ["std", "alloc"] }
+objc2-foundation = { version = "0.2", default-features = false, features = [
+    "dispatch",
+    "NSDictionary",
+    "NSGeometry",
+    "NSObject",
+    "NSString",
+    "NSThread",
+    "NSValue",
+] }
+wgpu = { version = "30", default-features = false, features = ["metal", "wgsl"] }
+pollster = { version = "1.0" }
+bytemuck = { version = "1" }

@@ -2,24 +2,88 @@
 
 use crate::CpuError;
 use iced_x86::Register;
+use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, Not};
 
-/// RFLAGS bit masks (subset used by the interpreter).
-pub(crate) mod rflags {
-    pub(crate) const CF: u64 = 1;
-    pub(crate) const PF: u64 = 1 << 2;
-    pub(crate) const AF: u64 = 1 << 4;
-    pub(crate) const ZF: u64 = 1 << 6;
-    pub(crate) const SF: u64 = 1 << 7;
-    pub(crate) const IF: u64 = 1 << 9;
-    pub(crate) const DF: u64 = 1 << 10;
-    pub(crate) const OF: u64 = 1 << 11;
+/// RFLAGS bit masks (subset used by the interpreter / JIT).
+///
+/// A transparent newtype over the raw u64 RFLAGS word: flag bits are only
+/// referenced through the named associated constants, so a typo'd bit can
+/// never silently alias another flag. The inner word keeps the exact numeric
+/// encoding (0/1/…/16) the memory-access layer and `InvalidMemoryAccess`
+/// report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(transparent)]
+pub struct Rflags(u64);
+
+impl Rflags {
+    /// Carry flag.
+    pub const CF: Self = Self(1);
+    /// Parity flag.
+    pub const PF: Self = Self(1 << 2);
+    /// Auxiliary carry flag.
+    pub const AF: Self = Self(1 << 4);
+    /// Zero flag.
+    pub const ZF: Self = Self(1 << 6);
+    /// Sign flag.
+    pub const SF: Self = Self(1 << 7);
+    /// Interrupt flag.
+    pub const IF: Self = Self(1 << 9);
+    /// Direction flag.
+    pub const DF: Self = Self(1 << 10);
+    /// Overflow flag.
+    pub const OF: Self = Self(1 << 11);
     /// Architectural reserved bit 1 is always 1.
-    pub(crate) const ALWAYS1: u64 = 1 << 1;
+    pub const ALWAYS1: Self = Self(1 << 1);
     /// Default after reset / process start (IF + reserved bit 1).
-    pub(crate) const DEFAULT: u64 = ALWAYS1 | IF;
+    pub const DEFAULT: Self = Self(Self::ALWAYS1.0 | Self::IF.0);
 }
 
-/// Portable snapshot of architectural CPU state for guest thread switch (MT.2).
+impl From<u64> for Rflags {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+impl From<Rflags> for u64 {
+    fn from(value: Rflags) -> Self {
+        value.0
+    }
+}
+
+impl BitOr for Rflags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl BitOrAssign for Rflags {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+impl BitAnd for Rflags {
+    type Output = Self;
+    fn bitand(self, rhs: Self) -> Self::Output {
+        Self(self.0 & rhs.0)
+    }
+}
+
+impl BitAndAssign for Rflags {
+    fn bitand_assign(&mut self, rhs: Self) {
+        self.0 &= rhs.0;
+    }
+}
+
+impl Not for Rflags {
+    type Output = Self;
+    fn not(self) -> Self::Output {
+        Self(!self.0)
+    }
+}
+
+/// Portable snapshot of architectural CPU state for guest thread switch.
 ///
 /// Used when multiple host threads serialize on one shared [`crate::CpuEngine`]:
 /// each guest thread parks its regs here while another runs.
@@ -32,7 +96,7 @@ pub struct ThreadContext {
     /// Instruction pointer.
     pub rip: u64,
     /// RFLAGS (includes reserved bit 1).
-    pub rflags: u64,
+    pub rflags: Rflags,
 }
 
 impl Default for ThreadContext {
@@ -41,7 +105,7 @@ impl Default for ThreadContext {
             gpr: [0; 16],
             xmm: [0; 16],
             rip: 0,
-            rflags: rflags::DEFAULT,
+            rflags: Rflags::DEFAULT,
         }
     }
 }
@@ -62,7 +126,7 @@ pub struct RegFile {
     /// XMM0..XMM15 as 128-bit values (low 64 used by scalar SSE2).
     xmm: [u128; 16],
     pub rip: u64,
-    pub rflags: u64,
+    pub rflags: Rflags,
 }
 
 impl Default for RegFile {
@@ -71,18 +135,19 @@ impl Default for RegFile {
             gpr: [0; 16],
             xmm: [0; 16],
             rip: 0,
-            rflags: rflags::DEFAULT,
+            rflags: Rflags::DEFAULT,
         }
     }
 }
 
 impl RegFile {
+    /// Create a fresh all-zero register file with default RFLAGS.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Export a full architectural snapshot (MT thread switch).
+    /// Export a full architectural snapshot for a guest thread switch.
     #[must_use]
     pub fn snapshot(&self) -> ThreadContext {
         ThreadContext {
@@ -93,7 +158,7 @@ impl RegFile {
         }
     }
 
-    /// Restore a full architectural snapshot (MT thread switch).
+    /// Restore a full architectural snapshot after a guest thread switch.
     pub fn restore(&mut self, ctx: &ThreadContext) {
         self.gpr = ctx.gpr;
         self.xmm = ctx.xmm;
@@ -101,86 +166,107 @@ impl RegFile {
         self.set_rflags_checked(ctx.rflags);
     }
 
+    /// Read GPR `idx` (RAX=0 … R15=15); out-of-range reads yield 0.
     #[must_use]
     pub fn gpr(&self, idx: usize) -> u64 {
         self.gpr.get(idx).copied().unwrap_or(0)
     }
 
+    /// Write GPR `idx`; out-of-range writes are ignored.
     pub(crate) fn set_gpr(&mut self, idx: usize, value: u64) {
         if let Some(slot) = self.gpr.get_mut(idx) {
             *slot = value;
         }
     }
 
-    /// Public GPR write for MT bootstrap (thread start RCX/RSP/…).
+    /// Public GPR write for guest thread bootstrap (thread start RCX/RSP/…).
     pub fn set_gpr_public(&mut self, idx: usize, value: u64) {
         self.set_gpr(idx, value);
     }
 
+    /// Read RAX.
     #[must_use]
     pub fn rax(&self) -> u64 {
         self.gpr(0)
     }
+    /// Write RAX.
     pub(crate) fn set_rax(&mut self, v: u64) {
         self.set_gpr(0, v);
     }
+    /// Read RCX.
     #[must_use]
     pub fn rcx(&self) -> u64 {
         self.gpr(1)
     }
+    /// Write RCX.
     pub(crate) fn set_rcx(&mut self, v: u64) {
         self.set_gpr(1, v);
     }
+    /// Read RDX.
     #[must_use]
     pub fn rdx(&self) -> u64 {
         self.gpr(2)
     }
+    /// Write RDX.
     pub(crate) fn set_rdx(&mut self, v: u64) {
         self.set_gpr(2, v);
     }
+    /// Read RBX.
     #[must_use]
     pub fn rbx(&self) -> u64 {
         self.gpr(3)
     }
+    /// Read RSP.
     #[must_use]
     pub fn rsp(&self) -> u64 {
         self.gpr(4)
     }
+    /// Write RSP.
     pub(crate) fn set_rsp(&mut self, v: u64) {
         self.set_gpr(4, v);
     }
+    /// Read RBP.
     #[must_use]
     pub fn rbp(&self) -> u64 {
         self.gpr(5)
     }
+    /// Write RBP.
     pub(crate) fn set_rbp(&mut self, v: u64) {
         self.set_gpr(5, v);
     }
+    /// Read RSI.
     #[must_use]
     pub fn rsi(&self) -> u64 {
         self.gpr(6)
     }
+    /// Write RSI.
     pub(crate) fn set_rsi(&mut self, v: u64) {
         self.set_gpr(6, v);
     }
+    /// Read RDI.
     #[must_use]
     pub fn rdi(&self) -> u64 {
         self.gpr(7)
     }
+    /// Write RDI.
     pub(crate) fn set_rdi(&mut self, v: u64) {
         self.set_gpr(7, v);
     }
+    /// Read R8.
     #[must_use]
     pub fn r8(&self) -> u64 {
         self.gpr(8)
     }
+    /// Write R8.
     pub(crate) fn set_r8(&mut self, v: u64) {
         self.set_gpr(8, v);
     }
+    /// Read R9.
     #[must_use]
     pub fn r9(&self) -> u64 {
         self.gpr(9)
     }
+    /// Write R9.
     pub(crate) fn set_r9(&mut self, v: u64) {
         self.set_gpr(9, v);
     }
@@ -282,9 +368,10 @@ impl RegFile {
         Ok(())
     }
 
+    /// Test whether any bit of `mask` is set in RFLAGS.
     #[must_use]
-    pub fn flag(&self, mask: u64) -> bool {
-        (self.rflags & mask) != 0
+    pub fn flag(&self, mask: Rflags) -> bool {
+        u64::from(self.rflags & mask) != 0
     }
 
     /// Read XMM0–XMM15 (128-bit).
@@ -326,9 +413,10 @@ impl RegFile {
         }
     }
 
-    pub(crate) fn set_flag(&mut self, mask: u64, on: bool) {
-        // No `|= ALWAYS1` here: bit 1 does not overlap any flag mask defined in
-        // `rflags`, so a per-flag re-assert is pure overhead (6 redundant
+    /// Set or clear the flags in `mask`.
+    pub(crate) fn set_flag(&mut self, mask: Rflags, on: bool) {
+        // No `|= ALWAYS1` here: bit 1 does not overlap any flag mask defined on
+        // `Rflags`, so a per-flag re-assert is pure overhead (6 redundant
         // OR+stores per arithmetic op). The invariant is instead established at
         // every wholesale RFLAGS assignment via [`Self::set_rflags_checked`].
         if on {
@@ -341,8 +429,8 @@ impl RegFile {
     /// Assign the whole RFLAGS word, re-asserting the architectural reserved
     /// bit 1. This is the single place the `ALWAYS1` invariant is maintained;
     /// use it for any bulk assignment (thread-context restore, JIT writeback).
-    pub(crate) fn set_rflags_checked(&mut self, value: u64) {
-        self.rflags = value | rflags::ALWAYS1;
+    pub(crate) fn set_rflags_checked(&mut self, value: Rflags) {
+        self.rflags = Rflags::from(u64::from(value) | u64::from(Rflags::ALWAYS1));
     }
 }
 
@@ -362,13 +450,35 @@ fn gpr_index(full: Register) -> Result<usize, CpuError> {
 pub(crate) fn set_logic_flags(regs: &mut RegFile, result: u64, size: usize) {
     let mask = size_mask(size);
     let v = result & mask;
-    regs.set_flag(rflags::ZF, v == 0);
+    regs.set_flag(Rflags::ZF, v == 0);
     let sign_bit = 1_u64 << ((size.saturating_mul(8)).saturating_sub(1));
-    regs.set_flag(rflags::SF, (v & sign_bit) != 0);
-    regs.set_flag(rflags::PF, parity_even(low_byte(v)));
-    regs.set_flag(rflags::CF, false);
-    regs.set_flag(rflags::OF, false);
+    regs.set_flag(Rflags::SF, (v & sign_bit) != 0);
+    regs.set_flag(Rflags::PF, parity_even(low_byte(v)));
+    regs.set_flag(Rflags::CF, false);
+    regs.set_flag(Rflags::OF, false);
     // AF undefined for logic; leave unchanged.
+}
+
+/// Shared flag-update core for ADD/SUB (and CMP, which is SUB for flags).
+/// `d`/`s`/`r` are the caller-masked operands and result; only CF/OF differ
+/// between the two modes, so the caller computes those and passes them in.
+pub(crate) fn set_arith_flags(
+    regs: &mut RegFile,
+    d: u64,
+    s: u64,
+    r: u64,
+    size: usize,
+    cf: bool,
+    of: bool,
+) {
+    let sign = 1_u64 << (size.saturating_mul(8)).saturating_sub(1);
+
+    regs.set_flag(Rflags::CF, cf);
+    regs.set_flag(Rflags::ZF, r == 0);
+    regs.set_flag(Rflags::SF, (r & sign) != 0);
+    regs.set_flag(Rflags::PF, parity_even(low_byte(r)));
+    regs.set_flag(Rflags::OF, of);
+    regs.set_flag(Rflags::AF, ((d ^ s ^ r) & 0x10) != 0);
 }
 
 /// Update flags after ADD.
@@ -377,18 +487,12 @@ pub(crate) fn set_add_flags(regs: &mut RegFile, dst: u64, src: u64, result: u64,
     let d = dst & mask;
     let s = src & mask;
     let r = result & mask;
-    let bits = size.saturating_mul(8);
-    let sign = 1_u64 << bits.saturating_sub(1);
+    let sign = 1_u64 << (size.saturating_mul(8)).saturating_sub(1);
 
     let wide = u128::from(d).wrapping_add(u128::from(s));
-    regs.set_flag(rflags::CF, wide > u128::from(mask));
-    regs.set_flag(rflags::ZF, r == 0);
-    regs.set_flag(rflags::SF, (r & sign) != 0);
-    regs.set_flag(rflags::PF, parity_even(low_byte(r)));
     // OF: same sign operands, result different sign
     let of = ((d ^ r) & (s ^ r) & sign) != 0;
-    regs.set_flag(rflags::OF, of);
-    regs.set_flag(rflags::AF, ((d ^ s ^ r) & 0x10) != 0);
+    set_arith_flags(regs, d, s, r, size, wide > u128::from(mask), of);
 }
 
 /// Update flags after SUB / CMP.
@@ -397,17 +501,11 @@ pub(crate) fn set_sub_flags(regs: &mut RegFile, dst: u64, src: u64, result: u64,
     let d = dst & mask;
     let s = src & mask;
     let r = result & mask;
-    let bits = size.saturating_mul(8);
-    let sign = 1_u64 << bits.saturating_sub(1);
+    let sign = 1_u64 << (size.saturating_mul(8)).saturating_sub(1);
 
-    regs.set_flag(rflags::CF, d < s);
-    regs.set_flag(rflags::ZF, r == 0);
-    regs.set_flag(rflags::SF, (r & sign) != 0);
-    regs.set_flag(rflags::PF, parity_even(low_byte(r)));
     // OF: different sign operands, result sign != dst sign
     let of = ((d ^ s) & (d ^ r) & sign) != 0;
-    regs.set_flag(rflags::OF, of);
-    regs.set_flag(rflags::AF, ((d ^ s ^ r) & 0x10) != 0);
+    set_arith_flags(regs, d, s, r, size, d < s, of);
 }
 
 #[must_use]

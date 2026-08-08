@@ -49,11 +49,75 @@ fn n2_write_and_read_file_in_bottle() {
         read_summary.run.termination
     );
 
-    // Skeleton dirs from ensure_bottle_skeleton.
+    // Skeleton dirs from seed_default_skeleton.
     assert!(bottle.join("drive_c/Windows/System32").is_dir());
     assert!(bottle.join("drive_c/Users/WIE/AppData/Local/Temp").is_dir());
 
     let _ = std::fs::remove_dir_all(&bottle);
+}
+
+/// The default Windows folder skeleton, end to end: a fresh bottle (explicit
+/// temp root) gets the full folder set materialized by the time the guest's
+/// first file op runs. The session start seeds the effective root, so the
+/// write_file.exe run above leaves every `BOTTLE_SKELETON_DIRS` directory on
+/// the host.
+#[test]
+fn n2_fresh_bottle_gets_the_full_default_skeleton() {
+    let Some(write_pe) = micro_exe("write_file.exe") else {
+        eprintln!("skip: write_file.exe not built");
+        return;
+    };
+
+    let bottle = std::env::temp_dir().join(format!("wie-skeleton-test-{}", std::process::id()));
+    let summary = wie_runtime::run_micro_exe_with_root(&write_pe, 256, Some(bottle.clone()))
+        .expect("write_file run");
+    assert_eq!(summary.exit_code, Some(0), "{:?}", summary.run.termination);
+
+    for rel in wie_winapi::vfs::BOTTLE_SKELETON_DIRS {
+        let dir = bottle.join("drive_c").join(rel);
+        assert!(
+            dir.is_dir(),
+            "fresh bottle must be seeded with {rel}: {}",
+            dir.display()
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&bottle);
+}
+
+/// The global-bottle policy, end to end through a real session: a file op
+/// with NO `--root` and NO `WIE_ROOT` succeeds — guest `C:\…` maps to the
+/// default app-data bottle, which the write creates on demand.
+#[test]
+fn n2_write_file_without_root_uses_the_global_bottle() {
+    let Some(write_pe) = micro_exe("write_file.exe") else {
+        eprintln!("skip: write_file.exe not built");
+        return;
+    };
+
+    // `None` root + `run_micro_exe_with_root` ignores WIE_ROOT, so this
+    // deterministically exercises the global app-data bottle fallback.
+    let summary = wie_runtime::run_micro_exe_with_root(&write_pe, 256, None).expect("run");
+    assert_eq!(summary.exit_code, Some(0), "{:?}", summary.run.termination);
+
+    let host = wie_winapi::global_bottle_root()
+        .join("drive_c")
+        .join("App")
+        .join("n2_out.txt");
+    assert!(
+        host.is_file(),
+        "write_file.exe must have created the global bottle file: {}",
+        host.display()
+    );
+    assert_eq!(
+        std::fs::read(&host).expect("read global bottle output"),
+        b"WIE_N2",
+        "bytes round-trip through the global bottle"
+    );
+
+    // Remove only the artifact; the global bottle dirs are the product's own
+    // app-data layout and legitimately persist.
+    let _cleanup = std::fs::remove_file(&host);
 }
 
 #[test]

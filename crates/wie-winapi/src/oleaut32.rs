@@ -21,6 +21,16 @@ const VT_BOOL: u16 = 11;
 const VT_I8: u16 = 20;
 const VT_UI4: u16 = 19;
 
+/// HRESULT codes the stubs return (winerror.h).
+/// `E_INVALIDARG` — one or more arguments are invalid.
+const E_INVALIDARG: u64 = 0x8007_0057;
+/// `E_OUTOFMEMORY` — the operation could not allocate memory.
+const E_OUTOFMEMORY: u64 = 0x8007_000E;
+/// `DISP_E_DIVBYZERO` — a variant arithmetic operation divided by zero.
+const DISP_E_DIVBYZERO: u64 = 0x8002_0011;
+/// `DISP_E_MEMBERNOTFOUND` — fallback for an unsupported source VARTYPE.
+const DISP_E_MEMBERNOTFOUND: u64 = 0x8002_0003;
+
 /// Soft-dispatch path for OLEAUT32 (name or `ORDINAL N`).
 pub fn dispatch_oleaut32(
     ctx: &mut HandlerContext<'_>,
@@ -77,7 +87,7 @@ pub fn dispatch_oleaut32(
     }
 }
 
-fn ret(engine: &mut dyn wie_cpu::CpuEngine, value: u64) -> Result<WinApiHandlerResult> {
+fn finish(engine: &mut dyn wie_cpu::CpuEngine, value: u64) -> Result<WinApiHandlerResult> {
     let return_address = engine
         .return_from_win64_api(value)
         .context("OLEAUT32 return")?;
@@ -120,7 +130,7 @@ fn handle_sys_alloc_string(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
     let state = &mut *ctx.state;
     let src = engine.read_rcx()?;
     if src == 0 {
-        return ret(engine, 0);
+        return finish(engine, 0);
     }
     let mut units = Vec::new();
     let mut i = 0_u64;
@@ -138,7 +148,7 @@ fn handle_sys_alloc_string(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
         }
     }
     let bstr = alloc_bstr(engine, state, &units)?;
-    ret(engine, bstr)
+    finish(engine, bstr)
 }
 
 /// `BSTR SysAllocStringLen(const OLECHAR*, UINT)`.
@@ -158,7 +168,7 @@ fn handle_sys_alloc_string_len(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         }
     }
     let bstr = alloc_bstr(engine, state, &units)?;
-    ret(engine, bstr)
+    finish(engine, bstr)
 }
 
 /// `void SysFreeString(BSTR)`.
@@ -173,7 +183,7 @@ fn handle_sys_free_string(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
             .heap
             .free_coherent(engine, bstr.wrapping_sub(4));
     }
-    ret(engine, 0)
+    finish(engine, 0)
 }
 
 /// `UINT SysStringLen(BSTR)`.
@@ -181,12 +191,12 @@ fn handle_sys_string_len(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
     let engine = &mut *ctx.engine;
     let bstr = engine.read_rcx()?;
     if bstr == 0 {
-        return ret(engine, 0);
+        return finish(engine, 0);
     }
     let mut len_bytes = [0_u8; 4];
     engine.mem_read(bstr.wrapping_sub(4), &mut len_bytes)?;
     let byte_len = u32::from_le_bytes(len_bytes);
-    ret(engine, u64::from(byte_len.wrapping_shr(1)))
+    finish(engine, u64::from(byte_len.wrapping_shr(1)))
 }
 
 /// `UINT SysStringByteLen(BSTR)`.
@@ -194,11 +204,11 @@ fn handle_sys_string_byte_len(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     let engine = &mut *ctx.engine;
     let bstr = engine.read_rcx()?;
     if bstr == 0 {
-        return ret(engine, 0);
+        return finish(engine, 0);
     }
     let mut len_bytes = [0_u8; 4];
     engine.mem_read(bstr.wrapping_sub(4), &mut len_bytes)?;
-    ret(engine, u64::from(u32::from_le_bytes(len_bytes)))
+    finish(engine, u64::from(u32::from_le_bytes(len_bytes)))
 }
 
 /// `void VariantInit(VARIANTARG*)` — set VT_EMPTY.
@@ -208,7 +218,7 @@ fn handle_variant_init(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
     if pvar != 0 {
         engine.mem_write(pvar, &[0_u8; 24])?;
     }
-    ret(engine, 0)
+    finish(engine, 0)
 }
 
 /// x64 `VARIANT` / `PROPVARIANT` payload size (vt + reserved + union).
@@ -218,7 +228,6 @@ const VARIANT_DATA_OFF: u64 = 8;
 
 /// Read the numeric value from a VARIANT at data offset 8 as i64 (sign-extended
 /// for integers, bitcast for floats).
-#[expect(clippy::as_conversions, clippy::cast_possible_truncation)]
 fn read_variant_num(engine: &mut dyn wie_cpu::CpuEngine, pvar: u64) -> Result<(u16, i64)> {
     let vt = read_vt(engine, pvar)?;
     let mut raw = [0_u8; 8];
@@ -244,13 +253,6 @@ fn read_variant_num(engine: &mut dyn wie_cpu::CpuEngine, pvar: u64) -> Result<(u
 }
 
 /// Write a numeric value back into a VARIANT, setting the appropriate vt.
-#[expect(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss,
-    clippy::cast_lossless
-)]
 fn write_variant_num(
     engine: &mut dyn wie_cpu::CpuEngine,
     pvar: u64,
@@ -341,7 +343,7 @@ fn handle_variant_clear(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
     let state = &mut *ctx.state;
     let pvar = engine.read_rcx()?;
     variant_clear_at(engine, state, pvar)?;
-    ret(engine, 0) // S_OK
+    finish(engine, 0) // S_OK
 }
 
 /// `HRESULT VariantCopy(VARIANTARG* dest, const VARIANTARG* src)`.
@@ -355,10 +357,10 @@ fn handle_variant_copy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
     let src = engine.read_rdx()?;
     if dest == 0 || src == 0 {
         // Real OLEAUT32 returns `E_INVALIDARG` for null pointers.
-        return ret(engine, 0x8007_0057);
+        return finish(engine, E_INVALIDARG);
     }
     if dest == src {
-        return ret(engine, 0);
+        return finish(engine, 0);
     }
 
     let src_vt = read_vt(engine, src)?;
@@ -371,7 +373,7 @@ fn handle_variant_copy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
         let new_bstr = dup_bstr(engine, state, src_bstr)?;
         if src_bstr != 0 && new_bstr == 0 {
             // Out of memory.
-            return ret(engine, 0x8007_000E);
+            return finish(engine, E_OUTOFMEMORY);
         }
         // vt = VT_BSTR, reserved zeros, bstrVal = new_bstr
         engine.mem_write(dest, &VT_BSTR.to_le_bytes())?;
@@ -379,7 +381,7 @@ fn handle_variant_copy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
         engine.mem_write(dest.wrapping_add(VARIANT_DATA_OFF), &new_bstr.to_le_bytes())?;
         // Zero high padding of the 24-byte VARIANT if any remainder exists.
         // Data field is 8 bytes at +8; total 16 used + 8 pad already covered by clear.
-        return ret(engine, 0);
+        return finish(engine, 0);
     }
 
     // Simple / non-owning types: bitwise copy of the 24-byte x64 VARIANT.
@@ -387,7 +389,7 @@ fn handle_variant_copy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
     let mut buf = [0_u8; VARIANT_SIZE];
     engine.mem_read(src, &mut buf)?;
     engine.mem_write(dest, &buf)?;
-    ret(engine, 0)
+    finish(engine, 0)
 }
 
 // ── Variant arithmetic ─────────────────────────────────────────────────────
@@ -395,14 +397,13 @@ fn handle_variant_copy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
 /// Shared handler for VarAdd / VarSub / VarMul / VarDiv / VarMod.
 ///
 /// Win64: RCX = result VARIANT*, RDX = lhs VARIANT*, R8 = rhs VARIANT*.
-#[expect(clippy::integer_division, clippy::arithmetic_side_effects)]
 fn handle_var_math(ctx: &mut HandlerContext<'_>, op: &str) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let presult = engine.read_rcx()?;
     let plhs = engine.read_rdx()?;
     let prhs = engine.read_r8()?;
     if presult == 0 || plhs == 0 || prhs == 0 {
-        return ret(engine, 0x8007_0057); // E_INVALIDARG
+        return finish(engine, E_INVALIDARG);
     }
     let (lvt, lhs_val) = read_variant_num(engine, plhs)?;
     let (rvt, rhs_val) = read_variant_num(engine, prhs)?;
@@ -417,21 +418,21 @@ fn handle_var_math(ctx: &mut HandlerContext<'_>, op: &str) -> Result<WinApiHandl
             if rhs_val == 0 {
                 // Clear result to VT_EMPTY and return error
                 engine.mem_write(presult, &[0_u8; VARIANT_SIZE])?;
-                return ret(engine, 0x8002_0011); // DISP_E_DIVBYZERO
+                return finish(engine, DISP_E_DIVBYZERO);
             }
             lhs_val / rhs_val
         }
         "varmod" | "mod" => {
             if rhs_val == 0 {
                 engine.mem_write(presult, &[0_u8; VARIANT_SIZE])?;
-                return ret(engine, 0x8002_0011);
+                return finish(engine, DISP_E_DIVBYZERO);
             }
             lhs_val % rhs_val
         }
         _ => 0,
     };
     write_variant_num(engine, presult, out_vt, result)?;
-    ret(engine, 0) // S_OK
+    finish(engine, 0) // S_OK
 }
 
 // ── Variant type conversions: BSTR ← number ────────────────────────────────
@@ -439,7 +440,6 @@ fn handle_var_math(ctx: &mut HandlerContext<'_>, op: &str) -> Result<WinApiHandl
 /// Converts a numeric VARIANT to a BSTR VARIANT (VarBstrFromI4, etc.).
 ///
 /// Win64: RCX = result VARIANT*, RDX = input number (as VT argument variant).
-#[expect(clippy::cast_possible_truncation, clippy::as_conversions)]
 fn handle_var_bstr_from_num(
     ctx: &mut HandlerContext<'_>,
     src_vt: u16,
@@ -449,7 +449,7 @@ fn handle_var_bstr_from_num(
     let presult = engine.read_rcx()?;
     let raw_val = engine.read_rdx()?;
     if presult == 0 {
-        return ret(engine, 0x8007_0057);
+        return finish(engine, E_INVALIDARG);
     }
     let s = match src_vt {
         VT_I4 => format!("{}", raw_val as i32),
@@ -458,7 +458,7 @@ fn handle_var_bstr_from_num(
             f32::from_bits(u32::try_from(raw_val & 0xffff_ffff).unwrap_or(0))
         ),
         VT_R8 | VT_DATE => format!("{}", f64::from_bits(raw_val)),
-        _ => return ret(engine, 0x8002_0003), // E_INVALIDARG
+        _ => return finish(engine, DISP_E_MEMBERNOTFOUND),
     };
     let units: Vec<u16> = s.encode_utf16().collect();
     let bstr = alloc_bstr(engine, state, &units)?;
@@ -466,7 +466,7 @@ fn handle_var_bstr_from_num(
     engine.mem_write(presult.wrapping_add(2), &[0_u8; 6])?;
     engine.mem_write(presult.wrapping_add(VARIANT_DATA_OFF), &bstr.to_le_bytes())?;
     engine.mem_write(presult.wrapping_add(16), &[0_u8; 8])?;
-    ret(engine, 0) // S_OK
+    finish(engine, 0) // S_OK
 }
 
 // ── Variant type conversions: number ← BSTR ────────────────────────────────
@@ -474,7 +474,6 @@ fn handle_var_bstr_from_num(
 /// Parses a BSTR VARIANT into a numeric VARIANT (VarI4FromBstr, etc.).
 ///
 /// Win64: RCX = result VARIANT*, RDX = source VARIANT*.
-#[expect(clippy::cast_possible_truncation, clippy::as_conversions)]
 fn handle_var_num_from_bstr(
     ctx: &mut HandlerContext<'_>,
     out_vt: u16,
@@ -483,19 +482,19 @@ fn handle_var_num_from_bstr(
     let presult = engine.read_rcx()?;
     let psrc = engine.read_rdx()?;
     if presult == 0 || psrc == 0 {
-        return ret(engine, 0x8007_0057);
+        return finish(engine, E_INVALIDARG);
     }
     let vt = read_vt(engine, psrc)?;
     if vt != VT_BSTR {
         // Try to read a numeric source and convert directly.
         let (_svt, val) = read_variant_num(engine, psrc)?;
         write_variant_num(engine, presult, out_vt, val)?;
-        return ret(engine, 0);
+        return finish(engine, 0);
     }
     let bstr = read_bstr_field(engine, psrc)?;
     if bstr == 0 {
         write_variant_num(engine, presult, out_vt, 0)?;
-        return ret(engine, 0);
+        return finish(engine, 0);
     }
     let mut len_bytes = [0_u8; 4];
     engine.mem_read(bstr.wrapping_sub(4), &mut len_bytes)?;
@@ -518,7 +517,7 @@ fn handle_var_num_from_bstr(
         _ => 0,
     };
     write_variant_num(engine, presult, out_vt, val)?;
-    ret(engine, 0)
+    finish(engine, 0)
 }
 
 // ── Variant type conversions: num ← num ────────────────────────────────────
@@ -535,9 +534,9 @@ fn handle_var_num_from_num(
     let presult = engine.read_rcx()?;
     let psrc = engine.read_rdx()?;
     if presult == 0 || psrc == 0 {
-        return ret(engine, 0x8007_0057);
+        return finish(engine, E_INVALIDARG);
     }
     let (_svt, val) = read_variant_num(engine, psrc)?;
     write_variant_num(engine, presult, out_vt, val)?;
-    ret(engine, 0)
+    finish(engine, 0)
 }

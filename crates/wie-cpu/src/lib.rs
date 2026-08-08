@@ -14,6 +14,14 @@ mod iced_cpu;
 mod jit;
 mod mem;
 mod regs;
+mod simd;
+
+/// Concurrent hash map for cross-thread JIT state.
+///
+/// Backed by `papaya` (hazard-pointer epoch reclamation); readers and writers
+/// proceed without a global lock, which is what the shared block cache and
+/// chain-id table need under the multithreaded runtime.
+pub type ConcurrentHashMap<K, V> = papaya::HashMap<K, V>;
 
 /// Dump residual iced-interpreter mnemonic histogram (`WIE_EXEC_TRACE=1`).
 pub use exec::{dump_iced_counters, reset_iced_counters};
@@ -22,7 +30,7 @@ pub use jit::{
     FastApiKind, JitCpu, JitFastPathConfig, JitHeapLayout, JitShared, JitStats, PerThreadJitState,
     dump_mem_path_stats,
 };
-/// Windows `PAGE_*` constants and software access checks (Phase 3).
+/// Windows `PAGE_*` constants and software access checks.
 pub use mem::protect;
 pub use mem::{
     ERROR_INVALID_ADDRESS, ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY,
@@ -31,7 +39,9 @@ pub use mem::{
     MmapArenaBackend, PAGE_SIZE, PAGE_SIZE_USIZE, PageMap, PageRun, PageState, RegionKind,
     RegionTable, VadNode, VadTable, align_down, align_up, win32_from_cpu_error,
 };
-pub use regs::{RegFile, ThreadContext};
+pub use regs::{RegFile, Rflags, ThreadContext};
+/// SIMD pixel helpers for the GUI present path (NEON on aarch64).
+pub use simd::{blend_0rgb_4x, fill_0rgb_4x, mask_bgra_to_0rgb, mul_0rgb_4x, stretch_nearest};
 
 /// Guest GS segment base — points to the Thread Environment Block (TEB).
 /// Shared with `wie_runtime::DEFAULT_LAYOUT.teb_low_base`.
@@ -170,6 +180,13 @@ pub enum CpuError {
     /// Integer divide-by-zero at the given instruction pointer.
     #[error("integer divide by zero at rip={0:#x}")]
     DivideByZero(u64),
+    /// Win32 failure: `GetLastError` code plus a static context message.
+    ///
+    /// The typed counterpart to the legacy `win32(N): …` string form that
+    /// [`mem::win32_from_cpu_error`] parses — extraction is a direct field
+    /// read instead of a string scan.
+    #[error("win32({0}): {1}")]
+    Win32(u32, &'static str),
 }
 
 /// Outcome of running until a code hook or stop condition.
@@ -185,7 +202,7 @@ pub struct RunUntilHook {
 ///
 /// Object-safe so the session can hold `Box<dyn CpuEngine>`.
 ///
-/// `Send` is required so MT.2 can move a shared engine behind `Mutex` onto
+/// `Send` is required so a shared engine can move behind a `Mutex` onto
 /// worker host threads (access is still serialized by that mutex).
 pub trait CpuEngine: Send {
     /// Map a guest VA range.
@@ -206,7 +223,7 @@ pub trait CpuEngine: Send {
     /// Unmapped / backend read failure.
     fn mem_read(&mut self, address: u64, bytes: &mut [u8]) -> Result<(), CpuError>;
 
-    /// Soft-translate a contiguous guest range to a host data pointer (MT.4).
+    /// Soft-translate a contiguous guest range to a host data pointer.
     ///
     /// Used by `Interlocked*` (aligned host atomics) and bulk helpers. Returns
     /// `None` when the range is unmapped, SPC denies the access, multi-arena,
@@ -228,6 +245,24 @@ pub trait CpuEngine: Send {
     /// `None` when the range is unmapped, denied by software permissions, or
     /// spans more than one arena; callers fall back to `mem_read`.
     fn host_slice(&self, _address: u64, _len: usize) -> Option<&[u8]> {
+        None
+    }
+
+    /// Borrow a contiguous guest range as a host slice for writing.
+    ///
+    /// The mutable counterpart to [`Self::host_slice`]: callers get a
+    /// `&mut [u8]` tied to `&self`, so the borrow checker prevents holding it
+    /// across a mutation that could remap the arena.
+    ///
+    /// SMC correctness is preserved by construction: like `host_span(..,
+    /// write=true)`, executable spans are denied (RX pages yield `None`). The
+    /// `mem_write` code-invalidation path is therefore bypassed but can never
+    /// be needed for a returned slice.
+    ///
+    /// `None` when the range is unmapped, denied by software permissions,
+    /// executable, or spans more than one arena; callers fall back to
+    /// `mem_write`.
+    fn host_slice_mut(&self, _address: u64, _len: usize) -> Option<&mut [u8]> {
         None
     }
 
@@ -278,7 +313,7 @@ pub trait CpuEngine: Send {
     }
 
     /// Register a named guest VA region (stack, heap, image, …).
-    /// Used by the region table (Phase 1); no-op if the backend ignores it.
+    /// Used by the region table; no-op if the backend ignores it.
     fn register_region(&mut self, _region: mem::GuestRegion) {}
 
     /// Look up the named region containing `va`, if any.
@@ -289,7 +324,8 @@ pub trait CpuEngine: Send {
     /// `VirtualAlloc` — reserve and/or commit private guest pages.
     ///
     /// # Errors
-    /// Invalid flags/address or out of guest VA (`CpuError` carries `win32(N):` prefix).
+    /// Invalid flags/address or out of guest VA (`CpuError::Win32` carries the
+    /// `GetLastError` code).
     fn virtual_alloc(
         &mut self,
         _addr: u64,
@@ -297,9 +333,7 @@ pub trait CpuEngine: Send {
         _alloc_type: u32,
         _protect: u32,
     ) -> Result<u64, CpuError> {
-        Err(CpuError::Message(
-            "win32(120): VirtualAlloc not implemented".into(),
-        ))
+        Err(CpuError::Win32(120, "VirtualAlloc not implemented"))
     }
 
     /// `VirtualFree` — decommit or release.
@@ -307,9 +341,7 @@ pub trait CpuEngine: Send {
     /// # Errors
     /// Invalid free type / address.
     fn virtual_free(&mut self, _addr: u64, _size: usize, _free_type: u32) -> Result<(), CpuError> {
-        Err(CpuError::Message(
-            "win32(120): VirtualFree not implemented".into(),
-        ))
+        Err(CpuError::Win32(120, "VirtualFree not implemented"))
     }
 
     /// `VirtualProtect` — change page protect; returns previous protect of the first page.
@@ -322,9 +354,7 @@ pub trait CpuEngine: Send {
         _size: usize,
         _new_protect: u32,
     ) -> Result<u32, CpuError> {
-        Err(CpuError::Message(
-            "win32(120): VirtualProtect not implemented".into(),
-        ))
+        Err(CpuError::Win32(120, "VirtualProtect not implemented"))
     }
 
     /// `VirtualQuery` — describe the page state at `addr`.
@@ -423,14 +453,14 @@ pub trait CpuEngine: Send {
     /// # Errors
     fn read_r12(&mut self) -> Result<u64, CpuError>;
 
-    /// Snapshot GPRs + XMM + RIP + RFLAGS for guest thread switch (MT.2).
+    /// Snapshot GPRs + XMM + RIP + RFLAGS for guest thread switch.
     ///
     /// Default: empty context (backends that own a [`RegFile`] override).
     fn snapshot_thread_context(&mut self) -> ThreadContext {
         ThreadContext::new()
     }
 
-    /// Restore a prior [`Self::snapshot_thread_context`] (MT.2).
+    /// Restore a prior [`Self::snapshot_thread_context`].
     fn restore_thread_context(&mut self, ctx: &ThreadContext) {
         let _ = ctx;
     }
@@ -456,6 +486,9 @@ impl CpuEngine for Box<dyn CpuEngine> {
     }
     fn host_slice(&self, address: u64, len: usize) -> Option<&[u8]> {
         (**self).host_slice(address, len)
+    }
+    fn host_slice_mut(&self, address: u64, len: usize) -> Option<&mut [u8]> {
+        (**self).host_slice_mut(address, len)
     }
     fn mem_copy(&mut self, dst: u64, src: u64, len: usize) -> bool {
         (**self).mem_copy(dst, src, len)
@@ -618,7 +651,7 @@ pub fn active_backend_name() -> &'static str {
 /// Backend open failure.
 pub fn open_default_cpu() -> Result<Box<dyn CpuEngine>, CpuError> {
     let name = active_backend_name();
-    tracing::info!(backend = name, "opening WIE CPU backend");
+    tracing::debug!(backend = name, "opening WIE CPU backend");
     match name {
         "iced" => Ok(Box::new(IcedCpu::open_x86_64())),
         _ => Ok(Box::new(JitCpu::open_x86_64())),
@@ -671,7 +704,7 @@ impl CpuBackend {
 /// Backend open failure.
 pub fn open_cpu() -> Result<CpuBackend, CpuError> {
     let name = active_backend_name();
-    tracing::info!(backend = name, "opening WIE CPU backend");
+    tracing::debug!(backend = name, "opening WIE CPU backend");
     if name == "iced" {
         let cpu = IcedCpu::open_x86_64();
         let guest_mem = Arc::clone(cpu.guest_mem_arc());

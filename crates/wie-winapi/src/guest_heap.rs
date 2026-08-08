@@ -5,19 +5,20 @@
 //! - **Fast path O(1)**: alloc/free for class-sized blocks are stack pop/push + HashMap.
 //! - Large blocks use a separate free list with best-fit scan (rare for WIE).
 
-use std::collections::HashMap;
+use ahash::HashMap;
+use ahash::HashMapExt;
 
 /// Number of fixed size classes (powers-of-two-ish ladder).
 pub const HEAP_SIZE_CLASS_COUNT: usize = 24;
 
 /// Size classes in bytes (must be strictly increasing, all ≥ 16 and 16-byte aligned).
-const SIZE_CLASSES: [u64; HEAP_SIZE_CLASS_COUNT] = [
+pub const SIZE_CLASSES: [u64; HEAP_SIZE_CLASS_COUNT] = [
     16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192,
     12288, 16384, 24576, 32768, 49152, 65536,
 ];
 
 /// Threshold above which blocks use the large free-list instead of size classes.
-const LARGE_THRESHOLD: u64 = 65_536;
+pub const LARGE_THRESHOLD: u64 = 65_536;
 
 /// One free large block awaiting reuse.
 #[derive(Debug, Clone, Copy)]

@@ -1,9 +1,7 @@
 /target
 .DS_Store
-real_exes/
+# Root-level real_exes/ holds gitignored Windows PEs; docs/real_exes/ is tracked.
+/real_exes/
 # micro-exes/out/ -- tracked for test reproducibility
-
-# deepwork session state
 .slim/deepwork/
-CLAUDE.md
-snake
+

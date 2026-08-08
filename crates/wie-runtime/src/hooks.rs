@@ -1,30 +1,31 @@
 //! Fake API registration and dense VA decode for the runtime hook range.
 
+use ahash::HashMap;
 use anyhow::Result;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use wie_winapi::{
-    FakeVa, WinApiId, WinApiTraits, decode_fake_va, encode_export, encode_unresolved,
-    resolve_winapi_id, winapi_id_export,
+    ComMethod, D3d9Iface, FakeVa, WinApiId, WinApiTraits, decode_fake_va, encode_export,
+    encode_unresolved, resolve_winapi_id, winapi_id_export,
 };
 
 /// Runtime fake API dispatch entry (IAT soft slots + trace metadata).
 #[derive(Debug, Clone)]
 pub struct RuntimeFakeApiEntry {
-    /// Fake API target virtual address.
+    /// Dense encoded stop VA in the fake range that lands control here.
     pub fake_target_va: u64,
 
-    /// Imported library name.
+    /// Library the import came from (ASCII, case preserved).
     pub library: Arc<str>,
 
-    /// Imported function name.
+    /// Imported export name.
     pub name: Arc<str>,
 
-    /// Runtime `IAT` slot virtual address (0 if not from IAT).
+    /// Guest VA of the backing IAT slot (0 when not IAT-resolved).
     pub iat_slot_va: u64,
 
-    /// Pre-resolved dense handler id (None = soft / string dispatch).
+    /// Pre-resolved dense handler id; `None` for soft/string dispatch.
     pub winapi_id: Option<WinApiId>,
 
     /// Hot-path classification resolved once at table build.
@@ -43,15 +44,16 @@ pub struct RuntimeFakeApiEntry {
 #[derive(Debug, Default, Clone)]
 pub struct SoftApiTable {
     entries: Vec<RuntimeFakeApiEntry>,
-    /// Lowercase key `"library\0name"` → index into `entries`.
+    /// Lowercase `(library, name)` → index into `entries`.
     ///
     /// Only used by [`Self::intern`]; the enum-of-callers path reads through
     /// [`Self::get`] by dense index, so lookups on the hot handler path stay
     /// O(1) without touching this map.
-    lookup: HashMap<String, u16>,
+    lookup: HashMap<SoftApiKey, u16>,
 }
 
 impl SoftApiTable {
+    /// Look up a soft entry by dense index (O(1) on the handler path).
     #[must_use]
     pub fn get(&self, index: u16) -> Option<&RuntimeFakeApiEntry> {
         self.entries.get(index as usize)
@@ -69,7 +71,7 @@ impl SoftApiTable {
         name: &str,
         iat_slot_va: u64,
     ) -> Result<(u64, RuntimeFakeApiEntry)> {
-        let key = intern_key(library, name);
+        let key = SoftApiKey::new(library, name);
         if let Some(&idx) = self.lookup.get(&key)
             && let Some(existing) = self.entries.get(usize::from(idx))
         {
@@ -90,20 +92,33 @@ impl SoftApiTable {
     }
 }
 
-/// Build the case-insensitive lookup key: lowercase(lib) + '\0' + lowercase(name).
+/// Case-insensitive `(library, name)` lookup key for [`SoftApiTable::intern`].
 ///
-/// NUL separator keeps `("a", "bc")` distinct from `("ab", "c")` without needing
-/// a real tuple key (which would require Hash impl on borrowed pairs).
-fn intern_key(library: &str, name: &str) -> String {
-    let mut s = String::with_capacity(library.len().saturating_add(name.len()).saturating_add(1));
-    for c in library.chars() {
-        s.push(c.to_ascii_lowercase());
+/// Both parts are ASCII-lowercased exactly like the old NUL-joined
+/// `"library\0name"` string key: `("a", "bc")` stays distinct from
+/// `("ab", "c")`, and mixed-case imports still hit the same slot.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SoftApiKey {
+    library: String,
+    name: String,
+}
+
+impl SoftApiKey {
+    fn new(library: &str, name: &str) -> Self {
+        Self {
+            library: lowercase_ascii(library),
+            name: lowercase_ascii(name),
+        }
     }
-    s.push('\0');
-    for c in name.chars() {
-        s.push(c.to_ascii_lowercase());
+}
+
+/// ASCII-lowercase `s` (byte-preserving for non-ASCII, as before).
+fn lowercase_ascii(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        out.push(c.to_ascii_lowercase());
     }
-    s
+    out
 }
 
 /// Resolved stop target after bit-decode (no HashMap).
@@ -179,9 +194,9 @@ pub fn resolve_import_fake_va(
 
 /// O(1) decode of a host-stop address into dispatch metadata.
 ///
-/// Traits (guest_stub, noisy, exit_process, …) are pre-computed by `make_entry`
-/// and embedded in `WinApiId::traits()` for Export entries — no need to
-/// re-classify guest stubs on the hot path.
+/// Hot-path classification (guest stub, noisy, exit process, …) is
+/// pre-computed by `make_entry` and embedded in `WinApiId::traits()` for Export
+/// entries — no need to re-classify guest stubs on the hot path.
 ///
 /// `library` and `name` borrow from [`winapi_id_export`]'s static strings for
 /// the Export/Alias path — zero allocation on every stop.  The Unresolved path
@@ -213,29 +228,14 @@ pub(crate) fn resolve_fake_api_at(address: u64, soft: &SoftApiTable) -> Option<R
     }
 }
 
-fn resolve_com(iface: u8, method: u8) -> Option<ResolvedFakeApi> {
-    use wie_winapi::{COM_IFACE_IDIRECT3D9, COM_IFACE_IDIRECT3DDEVICE9};
-
-    let name = match iface {
-        COM_IFACE_IDIRECT3D9 => {
-            let names = wie_winapi::d3d9::IDIRECT3D9_METHOD_NAMES;
-            names
-                .get(usize::from(method))
-                .copied()
-                .map(|s| s.to_owned())
-                .unwrap_or_else(|| format!("IDirect3D9::Slot{method:03}"))
-        }
-        COM_IFACE_IDIRECT3DDEVICE9 => {
-            wie_winapi::d3d9::idirect3ddevice9_method_name(usize::from(method))
-        }
-        _ => format!("Com{iface}::Method{method}"),
-    };
+fn resolve_com(iface: D3d9Iface, method: ComMethod) -> Option<ResolvedFakeApi> {
+    let name = method.name(iface);
     let library = "D3D9.dll";
-    let winapi_id = resolve_winapi_id(library, &name);
+    let winapi_id = resolve_winapi_id(library, name.as_ref());
     let traits = winapi_id.map(WinApiId::traits).unwrap_or_default();
     Some(ResolvedFakeApi {
         library: Cow::Borrowed(library),
-        name: Cow::Owned(name),
+        name,
         winapi_id,
         traits,
     })

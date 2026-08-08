@@ -1,4 +1,4 @@
-//! iced-x86 interpreter backend (WIE Phase 1). x86-64 only.
+//! iced-x86 interpreter backend. x86-64 only.
 
 use crate::exec::{self, HookWindow, StepResult};
 use crate::mem::{GuestMemory, GuestRegion};
@@ -34,6 +34,7 @@ pub struct IcedCpu {
 }
 
 impl IcedCpu {
+    /// Open a fresh iced interpreter with its own guest memory.
     #[must_use]
     pub fn open_x86_64() -> Self {
         Self {
@@ -47,6 +48,7 @@ impl IcedCpu {
         }
     }
 
+    /// Open a per-thread iced interpreter sharing `source`'s guest memory.
     #[must_use]
     pub fn new_shared(source: &Self) -> Self {
         Self {
@@ -75,11 +77,13 @@ impl IcedCpu {
         }
     }
 
+    /// Borrow the shared guest memory handle.
     #[must_use]
     pub fn guest_mem_arc(&self) -> &Arc<RwLock<GuestMemory>> {
         &self.mem
     }
 
+    /// Total interpreter steps retired.
     #[must_use]
     pub fn iced_steps(&self) -> u64 {
         self.iced_steps
@@ -110,11 +114,13 @@ impl IcedCpu {
         out
     }
 
+    /// Borrow the register file.
     #[must_use]
     pub fn regs(&self) -> &RegFile {
         &self.regs
     }
 
+    /// Borrow the register file mutably.
     pub fn regs_mut(&mut self) -> &mut RegFile {
         &mut self.regs
     }
@@ -160,7 +166,9 @@ impl IcedCpu {
             }
             StepResult::InvalidMemory(inv) => Err(CpuError::Message(format!(
                 "invalid memory {} at {:#x} size={}",
-                inv.access_type, inv.address, inv.size
+                inv.access_type.as_i32(),
+                inv.address,
+                inv.size
             ))),
         }
     }
@@ -194,6 +202,18 @@ impl CpuEngine for IcedCpu {
         // while the slice is alive.
         #[expect(unsafe_code)]
         Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    fn host_slice_mut(&self, address: u64, len: usize) -> Option<&mut [u8]> {
+        if len == 0 {
+            return Some(&mut []);
+        }
+        let ptr = lock_rd(&self.mem).host_span(address, len, true)?;
+        // SAFETY: as `host_slice` above, with `host_span(.., write=true)`
+        // additionally denying executable spans, so the slice can never alias
+        // JIT-compiled code and needs no SMC invalidation.
+        #[expect(unsafe_code)]
+        Some(unsafe { std::slice::from_raw_parts_mut(ptr, len) })
     }
 
     fn mem_copy(&mut self, dst: u64, src: u64, len: usize) -> bool {
@@ -342,7 +362,7 @@ impl CpuEngine for IcedCpu {
                         invalid_memory: InvalidMemoryAccess {
                             hit: true,
                             exception_code: crate::exception_code::ACCESS_VIOLATION,
-                            access_type: inv.access_type,
+                            access_type: inv.access_type.as_i32(),
                             address: inv.address,
                             size: inv.size,
                             value: inv.value,

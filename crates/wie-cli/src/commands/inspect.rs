@@ -28,11 +28,13 @@ fn format_pe_kind(is_pe64: bool) -> &'static str {
     if is_pe64 { "PE64" } else { "PE32" }
 }
 
-fn format_machine(machine: u16) -> String {
+fn format_machine(machine: wie_pe::Machine) -> String {
     match machine {
-        0x8664 => "AMD64 (0x8664)".to_owned(),
-        0x014c => "I386 (0x014c)".to_owned(),
-        other => format!("unknown ({other:#06x})"),
+        wie_pe::Machine::X64 => "AMD64 (0x8664)".to_owned(),
+        other => match other.into_u16() {
+            0x014c => "I386 (0x014c)".to_owned(),
+            other => format!("unknown ({other:#06x})"),
+        },
     }
 }
 

@@ -34,6 +34,7 @@
 //! **ReadFile host**, **Seek+GetFileSize guest**. `WIE_GUEST_IO=all` enables guest
 //! Read too (large ≥64 B still hybrid→host). `WIE_GUEST_IO=0` → all host.
 
+use crate::asm_utils::{patch_rel8, patch_rel32};
 use crate::hooks::RuntimeFakeApiEntry;
 use crate::memory::RuntimeMemoryLayout;
 use anyhow::{Context, Result};
@@ -49,15 +50,25 @@ pub const GUEST_IO_SLOT_SIZE: usize = 40;
 /// Guest-side I/O services configuration (also stored on `WinApiState` via layout).
 #[derive(Debug, Clone)]
 pub struct GuestIoConfig {
+    /// Guest VA of the handle table (fixed-layout slots).
     pub table_va: u64,
+    /// First byte of the guest helper code region.
     pub code_base: u64,
+    /// Guest VA where mirrored file bytes are stored.
     pub file_data_base: u64,
+    /// Size of the mirrored file-data arena.
     pub file_data_size: usize,
+    /// Guest VA of the in-guest `ReadFile` helper body.
     pub readfile_impl_va: u64,
+    /// Guest VA of the in-guest `SetFilePointer` helper body.
     pub setfp_impl_va: u64,
+    /// Guest VA of the in-guest `GetFileSize` helper body.
     pub getfs_impl_va: u64,
+    /// Hooked fake VA the read helper jumps to for unregistered handles.
     pub readfile_fallback_va: u64,
+    /// Hooked fake VA the seek helper jumps to for unregistered handles.
     pub setfp_fallback_va: u64,
+    /// Hooked fake VA the size helper jumps to for unregistered handles.
     pub getfs_fallback_va: u64,
 }
 
@@ -343,17 +354,6 @@ fn build_readfile_bytes(table: u64, fallback: u64, max_slots: u64, slot_size: u6
     patch_rel32(&mut c, jmp_loop + 1, jmp_loop + 5, loop_pos);
 
     c
-}
-
-fn patch_rel32(code: &mut [u8], imm_at: usize, next_ip: usize, target: usize) {
-    let rel = target as i32 - next_ip as i32;
-    code[imm_at..imm_at + 4].copy_from_slice(&rel.to_le_bytes());
-}
-
-fn patch_rel8(code: &mut [u8], imm_at: usize, next_ip: usize, target: usize) {
-    let rel = target as isize - next_ip as isize;
-    assert!((-128..128).contains(&rel), "rel8 out of range {rel}");
-    code[imm_at] = rel as i8 as u8;
 }
 
 fn write_setfilepointer_impl(

@@ -14,31 +14,34 @@
 //!    GDI/D3D allocations cannot collide with guest-side ones.
 //! 5. Large sizes / wrong heap handle / exotic flags fall back to the hooked host path.
 
+use crate::asm_utils::patch_rel32;
 use crate::hooks::RuntimeFakeApiEntry;
 use crate::memory::RuntimeMemoryLayout;
 use anyhow::{Context, Result};
+use wie_winapi::guest_heap::{HEAP_SIZE_CLASS_COUNT, LARGE_THRESHOLD, SIZE_CLASSES};
 use wie_winapi::{WinApiId, encode_alias};
-
-/// Must match `wie_winapi::guest_heap` size classes.
-const HEAP_SIZE_CLASS_COUNT: usize = 24;
-const SIZE_CLASSES: [u64; HEAP_SIZE_CLASS_COUNT] = [
-    16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192,
-    12288, 16384, 24576, 32768, 49152, 65536,
-];
-const LARGE_THRESHOLD: u64 = 65_536;
 
 /// Control block: bump (u64) + freelist heads (24 × u64).
 pub const HEAP_CTRL_SIZE: usize = 8 + HEAP_SIZE_CLASS_COUNT * 8;
 
+/// Layout of the in-guest heap control block and helper code region.
 #[derive(Debug, Clone)]
 pub struct GuestHeapAccelConfig {
+    /// Guest VA of the control block (bump cursor + freelist heads).
     pub ctrl_va: u64,
+    /// First byte of the guest process-heap arena.
     pub heap_base: u64,
+    /// One past the last byte of the guest process-heap arena.
     pub heap_end: u64,
+    /// The process-heap handle `HeapAlloc` receives in RCX.
     pub process_heap_handle: u64,
+    /// Guest VA of the in-guest `HeapAlloc` helper body.
     pub alloc_impl_va: u64,
+    /// Guest VA of the in-guest `HeapFree` helper body.
     pub free_impl_va: u64,
+    /// Hooked fake VA the alloc helper jumps to for large/exotic requests.
     pub alloc_fallback_va: u64,
+    /// Hooked fake VA the free helper jumps to for unhandled pointers.
     pub free_fallback_va: u64,
 }
 
@@ -105,11 +108,6 @@ pub(crate) fn install_guest_heap_accel(
         "installed guest heap acceleration"
     );
     Ok(config)
-}
-
-fn patch_rel32(code: &mut [u8], imm_at: usize, next_ip: usize, target: usize) {
-    let rel = target as i32 - next_ip as i32;
-    code[imm_at..imm_at + 4].copy_from_slice(&rel.to_le_bytes());
 }
 
 // --- HeapAlloc guest implementation ------------------------------------------------
@@ -216,7 +214,7 @@ fn write_heap_alloc_impl(
     // ensure header size
     c.extend_from_slice(&[0x48, 0x89, 0x5f, 0xf8]); // mov [rdi-8], rbx
     let jmp_ret = c.len();
-    c.extend_from_slice(&[0xe9, 0, 0, 0, 0]); // jmp ret_ptr
+    c.extend_from_slice(&[0xe9, 0, 0, 0, 0]); // jmp ret_pos
 
     // bump path
     let bump_pos = c.len();
@@ -242,7 +240,7 @@ fn write_heap_alloc_impl(
     c.extend_from_slice(&[0x48, 0x89, 0x5f, 0xf8]); // mov [rdi-8], rbx
 
     // Skip HEAP_ZERO_MEMORY: host path ignores zeroing too; Unicorn rep-stos is costly.
-    let ret_ptr = c.len();
+    let ret_pos = c.len();
     c.extend_from_slice(&[0x48, 0x89, 0xf8]); // mov rax, rdi
     c.extend_from_slice(&[0x5f, 0x5e, 0x5d, 0x5b, 0xc3]); // pop; ret
 
@@ -265,7 +263,7 @@ fn write_heap_alloc_impl(
     patch_rel32(&mut c, jz_bump + 2, jz_bump + 6, bump_pos);
     patch_rel32(&mut c, jb_bad_head + 2, jb_bad_head + 6, bump_pos);
     patch_rel32(&mut c, jae_bad_head + 2, jae_bad_head + 6, bump_pos);
-    patch_rel32(&mut c, jmp_ret + 1, jmp_ret + 5, ret_ptr);
+    patch_rel32(&mut c, jmp_ret + 1, jmp_ret + 5, ret_pos);
     patch_rel32(&mut c, ja_oom + 2, ja_oom + 6, fallback);
 
     engine

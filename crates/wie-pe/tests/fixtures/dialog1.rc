@@ -1,0 +1,16 @@
+// Minimal RT_DIALOG fixture for wie-pe's resource parser.
+// Compile: x86_64-w64-mingw32-windres dialog1.rc -o dialog1.o
+//          x86_64-w64-mingw32-gcc main.c dialog1.o -o dialog1.exe -mwindows
+// The template id is numeric (100) so the resource tree is fully by-id.
+// Controls (order matters for the test): PUSHBUTTON -> BUTTON, EDITTEXT -> EDIT,
+// LTEXT -> STATIC, with control ids 1, 2, 3.
+
+100 DIALOG 10, 20, 160, 60
+STYLE 0x00000040 | 0x80000000 | 0x00C00000
+CAPTION "Test Dialog"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    PUSHBUTTON "OK", 1, 20, 20, 50, 14
+    EDITTEXT 2, 80, 20, 50, 14
+    LTEXT "Label", 3, 20, 40, 50, 10
+END

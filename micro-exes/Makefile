@@ -5,6 +5,7 @@
 # Force mingw cross-compiler (do not use make's default CC=cc).
 MINGW_CC   ?= x86_64-w64-mingw32-gcc
 MINGW_CXX  ?= x86_64-w64-mingw32-g++
+WINDRES    ?= x86_64-w64-mingw32-windres
 
 OUT      := out
 CFLAGS   := -O2 -ffreestanding -fno-stack-protector -fno-asynchronous-unwind-tables
@@ -12,9 +13,9 @@ LDFLAGS  := -nostdlib -Wl,--subsystem,console -Wl,--entry,entry
 # Ordinary CRT-linked apps (independent-style): full toolchain defaults.
 CRT_CFLAGS := -O2
 
-.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes dll_tests game_exes interactive_exes ucrt_coverage
+.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes dll_tests game_exes interactive_exes ucrt_coverage gui_exes print_bmp version_query
 
-all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes game_exes interactive_exes dll_tests ucrt_coverage
+all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes game_exes interactive_exes dll_tests ucrt_coverage gui_exes version_query
 
 $(OUT):
 	mkdir -p $(OUT)
@@ -51,6 +52,13 @@ rand_test: $(OUT)/rand_test.exe
 snake: $(OUT)/snake.exe
 seh_access_violation: $(OUT)/seh_access_violation.exe
 seh_div_zero: $(OUT)/seh_div_zero.exe
+print_bmp: $(OUT)/print_bmp.exe
+version_query: $(OUT)/version_query.exe
+
+# Print-DC pipeline (P1a): CreateDCW → StartDocW → StartPage/EndPage → EndDoc.
+$(OUT)/print_bmp.exe: print_bmp/main.c | $(OUT)
+	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32 -lgdi32
+	@echo "built $@"
 
 # ---- Правила для отдельных .exe ----
 $(OUT)/heap_alloc.exe: heap_alloc/main.c | $(OUT)
@@ -267,6 +275,65 @@ ucrt_coverage: $(OUT)/ucrt_coverage.exe
 
 $(OUT)/ucrt_coverage.exe: ucrt_coverage/main.c | $(OUT)
 	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $<
+	@echo "built $@"
+
+gui_exes: $(OUT)/gui_blit.exe $(OUT)/gui_menu.exe $(OUT)/gui_text.exe $(OUT)/gui_control.exe $(OUT)/gui_edit.exe $(OUT)/gui_dialog.exe $(OUT)/gui_d3d9.exe $(OUT)/gui_demo.exe
+
+GUI_CFLAGS   := -O1 -ffreestanding -fno-stack-protector -fno-asynchronous-unwind-tables
+GUI_LDFLAGS  := -nostdlib -Wl,--subsystem,windows -Wl,--entry,entry
+GUI_LIBS     := -lkernel32 -luser32 -lgdi32
+
+$(OUT)/gui_blit_res.o: gui_blit/dialog.rc | $(OUT)
+	$(WINDRES) gui_blit/dialog.rc -o $@
+	@echo "built $@"
+
+$(OUT)/gui_blit.exe: gui_blit/main.c $(OUT)/gui_blit_res.o | $(OUT)
+	$(MINGW_CC) $(GUI_CFLAGS) $(GUI_LDFLAGS) -o $@ gui_blit/main.c $(OUT)/gui_blit_res.o $(GUI_LIBS)
+	@echo "built $@"
+
+$(OUT)/gui_menu.exe: gui_menu/main.c | $(OUT)
+	$(MINGW_CC) $(GUI_CFLAGS) $(GUI_LDFLAGS) -o $@ $< $(GUI_LIBS)
+	@echo "built $@"
+
+$(OUT)/gui_text.exe: gui_text/main.c | $(OUT)
+	$(MINGW_CC) $(GUI_CFLAGS) $(GUI_LDFLAGS) -o $@ $< $(GUI_LIBS)
+	@echo "built $@"
+
+$(OUT)/gui_control.exe: gui_control/main.c | $(OUT)
+	$(MINGW_CC) $(GUI_CFLAGS) $(GUI_LDFLAGS) -o $@ $< $(GUI_LIBS)
+	@echo "built $@"
+
+$(OUT)/gui_edit.exe: gui_edit/main.c | $(OUT)
+	$(MINGW_CC) $(GUI_CFLAGS) $(GUI_LDFLAGS) -o $@ $< $(GUI_LIBS)
+	@echo "built $@"
+
+$(OUT)/gui_dialog_res.o: gui_dialog/dialog.rc | $(OUT)
+	$(WINDRES) gui_dialog/dialog.rc -o $@
+	@echo "built $@"
+
+$(OUT)/gui_dialog.exe: gui_dialog/main.c $(OUT)/gui_dialog_res.o | $(OUT)
+	$(MINGW_CC) $(GUI_CFLAGS) $(GUI_LDFLAGS) -o $@ gui_dialog/main.c $(OUT)/gui_dialog_res.o $(GUI_LIBS)
+	@echo "built $@"
+
+$(OUT)/gui_demo_res.o: gui_demo/dialog.rc | $(OUT)
+	$(WINDRES) gui_demo/dialog.rc -o $@
+	@echo "built $@"
+
+$(OUT)/gui_demo.exe: gui_demo/main.c $(OUT)/gui_demo_res.o | $(OUT)
+	$(MINGW_CC) $(GUI_CFLAGS) $(GUI_LDFLAGS) -o $@ gui_demo/main.c $(OUT)/gui_demo_res.o $(GUI_LIBS)
+	@echo "built $@"
+
+$(OUT)/gui_d3d9.exe: gui_d3d9/main.c | $(OUT)
+	$(MINGW_CC) $(GUI_CFLAGS) $(GUI_LDFLAGS) -o $@ $< $(GUI_LIBS) -ld3d9
+	@echo "built $@"
+
+# Version API (version.dll): the RT_VERSION resource comes from windres.
+$(OUT)/version_query_res.o: version_query/version.rc | $(OUT)
+	$(WINDRES) version_query/version.rc -o $@
+	@echo "built $@"
+
+$(OUT)/version_query.exe: version_query/main.c $(OUT)/version_query_res.o | $(OUT)
+	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ version_query/main.c $(OUT)/version_query_res.o -lkernel32 -lversion
 	@echo "built $@"
 
 clean:

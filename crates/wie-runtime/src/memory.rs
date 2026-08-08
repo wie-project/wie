@@ -1,5 +1,6 @@
 //! Guest memory layout and WinAPI environment bootstrap helpers.
 
+use ahash::HashMapExt;
 use anyhow::{Context, Result};
 
 /// Guest virtual-memory layout used by the WIE runtime.
@@ -74,9 +75,13 @@ pub struct RuntimeMemoryLayout {
     /// Guest MultiByteToWideChar helper code.
     pub guest_mbwc_code_base: u64,
     pub guest_mbwc_code_size: usize,
-    /// Guest-visible tables for Phase 5 stubs (metrics, colors, cwd wide path).
+    /// Guest-visible tables for the data-backed stubs (metrics, colors, cwd wide path).
     pub guest_stub_data_base: u64,
     pub guest_stub_data_size: usize,
+    /// Host-written guest clock table (6 × u64 — refreshed each host stop).
+    pub clock_table_va: u64,
+    /// Size of the guest clock table mapping.
+    pub clock_table_size: usize,
 }
 
 impl RuntimeMemoryLayout {
@@ -131,6 +136,9 @@ impl RuntimeMemoryLayout {
             // Metrics[256×u32] + colors[32×u32] + cwd wide blob.
             guest_stub_data_base: 0x0000_7000_0040_9000,
             guest_stub_data_size: 0x2000,
+            // Host-refreshed 6×u64 clock table (GetTickCount/timeGetTime/QPC/…).
+            clock_table_va: 0x0000_7000_0040_B000,
+            clock_table_size: 0x1000,
         }
     }
 
@@ -224,7 +232,7 @@ pub const CALLBACK_RETURN_TRAMPOLINE_VA: u64 = DEFAULT_LAYOUT.callback_return_tr
 
 pub(crate) fn default_winapi_state(
     layout: &RuntimeMemoryLayout,
-    executable_file_bytes: Vec<u8>,
+    executable_file_bytes: std::sync::Arc<Vec<u8>>,
     process: &wie_pe::ProcessIdentity,
 ) -> Result<wie_winapi::WinApiState> {
     let heap_size_u64 =
@@ -246,31 +254,38 @@ pub(crate) fn default_winapi_state(
         },
         process: wie_winapi::ProcessState {
             last_error: 0,
-            next_registry_key_handle: 0x0000_0000_7000_0000,
+            next_registry_key_handle: wie_winapi::RegistryKeyHandle::from(0x0000_0000_7000_0000),
             registry_keys: Vec::new(),
             main_module_file_name: process.module_file_name.clone(),
             main_module_path: process.module_path.clone(),
             main_module_host_dir: None,
             error_mode: 0,
-            suspended_threads: std::collections::HashMap::new(),
+            suspended_threads: ahash::HashMap::new(),
             environment: Vec::new(),
+            // The main module's RT_DIALOG/RT_MENU/RT_STRING/RT_ACCELERATOR
+            // resources are parsed in session init (the section map is not
+            // available here).
+            main_module_dialogs: Vec::new(),
+            main_module_menus: Vec::new(),
+            main_module_strings: Vec::new(),
+            main_module_accelerators: Vec::new(),
         },
         kernel: wie_winapi::KernelState {
             threads: wie_winapi::ThreadState::primary(),
             sync: wie_winapi::SyncState::new(),
-            seh_pending: std::collections::HashMap::new(),
+            seh_pending: ahash::HashMap::new(),
         },
         file_io: wie_winapi::FileIoState {
             executable_file_size,
             executable_file_bytes,
             executable_file_cursor: 0,
-            next_find_handle: 0x0000_0000_6200_0000,
+            next_find_handle: wie_winapi::FindFileHandle::from(0x0000_0000_6200_0000),
             find_handles: Vec::new(),
             host_file_mounts: Vec::new(),
             virtual_files: Vec::new(),
-            open_files: std::collections::HashMap::new(),
-            next_file_handle: 0x0000_0000_6700_0001,
-            next_resource_handle: 0x0000_0000_6300_0000,
+            open_files: ahash::HashMap::new(),
+            next_file_handle: wie_winapi::FileHandle::from(0x0000_0000_6700_0001),
+            next_resource_handle: wie_winapi::ResourceHandle::from(0x0000_0000_6300_0000),
             resources: Vec::new(),
             current_directory_wide: process.current_directory.encode_utf16().collect(),
             bottle_root: wie_winapi::bottle_root_from_env(),
@@ -278,7 +293,7 @@ pub(crate) fn default_winapi_state(
                 let bottle = wie_winapi::bottle_root_from_env();
                 let drive_d = wie_winapi::drive_d_from_env();
                 if let Some(ref root) = bottle {
-                    let _ = wie_winapi::ensure_bottle_skeleton(root);
+                    let _ = wie_winapi::seed_default_skeleton(root);
                 }
                 wie_winapi::VolumeConfig::from_parts(bottle, drive_d)
             },
@@ -287,16 +302,21 @@ pub(crate) fn default_winapi_state(
             stdin_bytes: Vec::new(),
             stdin_cursor: 0,
             stdin_mode: wie_winapi::GuestStdinMode::InjectOnly,
-            ucrt_files: std::collections::HashMap::new(),
+            ucrt_files: ahash::HashMap::new(),
             ucrt_next_file_va: 0x0000_0000_6900_0000,
-            cached_streams: std::collections::HashMap::new(),
+            cached_streams: ahash::HashMap::new(),
         },
         dll_states: wie_winapi::DllStateMap::new(),
+        message_queue: std::sync::Arc::new(std::sync::Mutex::new(
+            wie_winapi::present::MessageQueue::default(),
+        )),
         module_state: wie_winapi::ModuleState {
-            loaded_modules: std::collections::HashMap::new(),
+            loaded_modules: ahash::HashMap::new(),
             import_resolver: None,
-            get_proc_address_cache: std::collections::HashMap::with_capacity(64),
-            next_module_handle: wie_winapi::dll_loader::REAL_MODULE_HANDLE_BASE,
+            get_proc_address_cache: ahash::HashMap::with_capacity(64),
+            next_module_handle: wie_winapi::ModuleHandle::from(
+                wie_winapi::dll_loader::REAL_MODULE_HANDLE_BASE,
+            ),
         },
     })
 }

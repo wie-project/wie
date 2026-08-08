@@ -9,19 +9,7 @@
 //! with its own CPU engine.
 
 #![expect(dead_code)]
-#![allow(
-    unreachable_pub,
-    clippy::module_name_repetitions,
-    clippy::match_same_arms,
-    clippy::single_match_else,
-    clippy::struct_excessive_bools,
-    clippy::arithmetic_side_effects,
-    clippy::range_plus_one,
-    clippy::nonminimal_bool,
-    clippy::or_fun_call,
-    clippy::manual_range_contains,
-    clippy::default_trait_access
-)]
+#![allow(unreachable_pub)]
 //!
 //! # Guest ABI
 //!
@@ -67,7 +55,8 @@ mod locks;
 mod objects;
 mod threads;
 
-use std::collections::HashMap;
+use ahash::HashMap;
+use ahash::HashMapExt;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -137,7 +126,7 @@ const ERRNO_VA: u64 = 0x7EFD_0070;
 /// Tag in the high 16 bits of every guest-visible pthread object id.
 ///
 /// Chosen so the value is a positive `intptr_t` (never mistaken for one of the
-/// negative static initialisers) and never a plausible guest pointer.
+/// negative static initialisers) and never a plausible guest VA.
 pub const PT_TAG: u64 = 0x5054_0000_0000_0000;
 const PT_TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
 
@@ -594,7 +583,6 @@ pub fn dispatch(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiHandle
 }
 
 /// Scheduling, clocks, and the `_np` extensions.
-#[expect(clippy::too_many_lines, reason = "flat export table; one arm per name")]
 fn dispatch_misc(
     engine: &mut dyn CpuEngine,
     state: &mut WinApiState,
@@ -759,7 +747,7 @@ fn nanosleep(
     let Some((secs, nsecs)) = read_timespec(engine, req, bits64) else {
         return ret_errno(engine, EINVAL);
     };
-    if nsecs < 0 || nsecs > 999_999_999 || secs < 0 {
+    if !(0..=999_999_999).contains(&nsecs) || secs < 0 {
         return ret_errno(engine, EINVAL);
     }
     std::thread::sleep(timespec_to_duration(secs, nsecs));

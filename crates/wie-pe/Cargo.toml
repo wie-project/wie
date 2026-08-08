@@ -9,3 +9,4 @@ license.workspace = true
 anyhow.workspace = true
 goblin.workspace = true
 serde.workspace = true
+thiserror.workspace = true

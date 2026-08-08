@@ -9,6 +9,8 @@ pub const CP_ACP: u32 = 1252;
 pub const CP_OEMCP: u32 = 437;
 /// UTF-8 code page.
 pub const CP_UTF8: u32 = 65001;
+/// UTF-16LE code page (`WideCharToMultiByte` / `MultiByteToWideChar`).
+pub const CP_UTF16: u32 = 1200;
 
 /// Windows-1252 mapping for bytes 0x80..=0x9F (rest is Latin-1 / identity).
 const CP1252_80_9F: [u16; 32] = [
@@ -69,6 +71,18 @@ pub fn encode_acp(text: &str) -> Vec<u8> {
     out
 }
 
+/// Decode guest ANSI string bytes, preferring UTF-8 (WIE's A-string
+/// convention: the write side emits UTF-8 and mingw-cross-compiled guests
+/// produce UTF-8 literals), falling back to ACP-1252 when the bytes are not
+/// valid UTF-8 (real Windows binaries pass ACP-encoded strings).
+#[must_use]
+pub fn decode_ansi_utf8_first(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_owned(),
+        Err(_) => decode_acp(bytes),
+    }
+}
+
 /// Decode multi-byte input for `MultiByteToWideChar`.
 ///
 /// - CP_ACP / 1252 / 0 / 1 / 2 / 3 / 437: single-byte zero-extend via CP1252 for 1252/ACP,
@@ -121,7 +135,7 @@ pub fn wide_to_multibyte(code_page: u32, units: &[u16]) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -143,5 +157,22 @@ mod tests {
     fn ascii_identity_acp() {
         assert_eq!(decode_acp(b"C:\\App\\x.txt"), r"C:\App\x.txt");
         assert_eq!(encode_acp(r"C:\App\x.txt"), b"C:\\App\\x.txt".to_vec());
+    }
+
+    #[test]
+    fn ansi_utf8_first_decodes_utf8_literals() {
+        // A mingw UTF-8 literal (em dash, U+2014 = E2 80 94) must decode to
+        // one char — the regression behind `-` rendering as `â€"`.
+        assert_eq!(decode_ansi_utf8_first(&[0xE2, 0x80, 0x94]), "—");
+        assert_eq!(decode_ansi_utf8_first("café — ✓".as_bytes()), "café — ✓");
+        assert_eq!(decode_ansi_utf8_first(b"plain ascii"), "plain ascii");
+    }
+
+    #[test]
+    fn ansi_utf8_first_falls_back_to_cp1252() {
+        // Lone 0x80 is not valid UTF-8 → CP1252 euro sign, preserving the
+        // real-Windows-binaries ACP behavior.
+        assert_eq!(decode_ansi_utf8_first(&[0x80]), "€");
+        assert_eq!(decode_ansi_utf8_first(&[0xE9]), "é");
     }
 }

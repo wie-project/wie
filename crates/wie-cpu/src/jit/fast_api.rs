@@ -3,8 +3,6 @@
 //! When a guest `call` resolves to one of these fake-API VAs, the lowerer emits a
 //! Cranelift `call` to a host helper instead of exiting to the runtime host-stop
 //! loop (saves most of the CRT startup / `printf` path stops).
-//!
-//! Clippy cast/index allows are inherited from `jit/mod.rs`.
 
 use super::lower::JitCtx;
 use crate::mem::GuestMemory;

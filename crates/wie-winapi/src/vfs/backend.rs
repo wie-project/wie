@@ -2,6 +2,7 @@
 
 use super::path::{guest_basename, paths_equal_ci, wildcard_match};
 use super::volume::{VolumeConfig, guest_path_to_host};
+use ahash::HashMapExt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -52,8 +53,8 @@ struct StatCacheEntry {
 }
 
 thread_local! {
-    static STAT_CACHE: std::cell::RefCell<std::collections::HashMap<PathBuf, StatCacheEntry>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+    static STAT_CACHE: std::cell::RefCell<ahash::HashMap<PathBuf, StatCacheEntry>> =
+        std::cell::RefCell::new(ahash::HashMap::new());
 }
 
 /// Invalidate every cached stat. Called by mutating entry points.
@@ -510,17 +511,41 @@ pub fn host_set_len(path: &Path, len: u64) -> std::io::Result<()> {
 }
 
 /// Default synthetic directory list for Win10 skeleton probes.
+///
+/// Mirrors [`BOTTLE_SKELETON_DIRS`](super::volume::BOTTLE_SKELETON_DIRS): these
+/// paths report as directories even before a bottle is seeded, and their
+/// children list in `list_dir`. The seeded skeleton makes them real on the
+/// host; this list is the virtual fallback.
 pub const DEFAULT_SYNTHETIC_DIRS: &[&str] = &[
     r"C:\",
     r"C:\App",
     r"C:\Windows",
     r"C:\Windows\System32",
     r"C:\Windows\SysWOW64",
+    r"C:\Program Files",
+    r"C:\Program Files\Common Files",
+    r"C:\Program Files (x86)",
+    r"C:\ProgramData",
     r"C:\Users",
+    r"C:\Users\Public",
+    r"C:\Users\Public\Documents",
     r"C:\Users\WIE",
+    r"C:\Users\WIE\Desktop",
+    r"C:\Users\WIE\Documents",
+    r"C:\Users\WIE\Downloads",
+    r"C:\Users\WIE\Pictures",
+    r"C:\Users\WIE\Music",
+    r"C:\Users\WIE\Videos",
     r"C:\Users\WIE\AppData",
+    r"C:\Users\WIE\AppData\Roaming",
     r"C:\Users\WIE\AppData\Local",
     r"C:\Users\WIE\AppData\Local\Temp",
+    r"C:\Users\WIE\AppData\LocalLow",
+    r"C:\Users\WIE\Favorites",
+    r"C:\Users\WIE\Links",
+    r"C:\Users\WIE\Saved Games",
+    r"C:\Users\WIE\Searches",
+    r"C:\Users\WIE\Templates",
+    r"C:\Users\WIE\Contacts",
     r"C:\Temp",
-    r"C:\ProgramData",
 ];

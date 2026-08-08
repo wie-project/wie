@@ -1,4 +1,4 @@
-//! Virtual Address Descriptor (VAD) table for Phase 3 VirtualAlloc/Free.
+//! Virtual Address Descriptor (VAD) table for VirtualAlloc/Free.
 //!
 //! Tracks reservation bases, sizes, and allocation protect. Per-page state lives
 //! in [`super::pagemap::PageMap`]; this table answers “which allocation owns VA?”
@@ -230,10 +230,6 @@ impl VadTable {
 
 /// Round `x` down to multiple of `gran`.
 #[must_use]
-#[allow(
-    clippy::integer_division,
-    clippy::arithmetic_side_effects // intentional floor alignment
-)]
 pub fn align_down(x: u64, gran: u64) -> u64 {
     if gran == 0 {
         return x;
@@ -243,10 +239,6 @@ pub fn align_down(x: u64, gran: u64) -> u64 {
 
 /// Round `x` up to multiple of `gran` (saturating).
 #[must_use]
-#[allow(
-    clippy::integer_division,
-    clippy::arithmetic_side_effects // intentional remainder alignment
-)]
 pub fn align_up(x: u64, gran: u64) -> u64 {
     if gran == 0 {
         return x;
@@ -266,23 +258,31 @@ pub const ERROR_INVALID_PARAMETER: u32 = 87;
 /// Win32 `ERROR_NOT_ENOUGH_MEMORY`
 pub const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
 
-/// Build a `CpuError` carrying a Win32 code in a stable string form.
+/// Build a `CpuError` carrying a Win32 code in the typed [`CpuError::Win32`] form.
 #[must_use]
-pub(crate) fn va_error(win32: u32, msg: impl Into<String>) -> CpuError {
-    CpuError::Message(format!("win32({win32}): {}", msg.into()))
+pub(crate) fn va_error(win32: u32, msg: &'static str) -> CpuError {
+    CpuError::Win32(win32, msg)
 }
 
-/// Parse `win32(N):` prefix from a [`CpuError`] message, if present.
+/// Extract the Win32 code from a [`CpuError`], if present.
+///
+/// Fast path for the typed [`CpuError::Win32`] variant; falls back to parsing
+/// the legacy `win32(N):` string prefix for [`CpuError::Message`].
 #[must_use]
 pub fn win32_from_cpu_error(err: &CpuError) -> Option<u32> {
-    let s = err.to_string();
-    let rest = s.strip_prefix("win32(")?;
-    let (num, _) = rest.split_once(')')?;
-    num.parse().ok()
+    match err {
+        CpuError::Win32(code, _) => Some(*code),
+        other => {
+            let s = other.to_string();
+            let rest = s.strip_prefix("win32(")?;
+            let (num, _) = rest.split_once(')')?;
+            num.parse().ok()
+        }
+    }
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

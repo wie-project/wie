@@ -34,19 +34,18 @@ fn ret_invalid_handle(ctx: &mut HandlerContext<'_>, api: &str) -> Result<WinApiH
 /// `Read` removes the records it returns; `Peek` leaves them queued. Both block
 /// only in the `Read` case, and only when the queue is empty — that is the
 /// documented difference and what a poll loop depends on.
-#[allow(clippy::integer_division)] // deliberate truncation — bytes.len() is always a multiple
 fn read_or_peek(
     ctx: &mut HandlerContext<'_>,
     api: &str,
     consume: bool,
 ) -> Result<WinApiHandlerResult> {
     let handle = ctx.engine.read_rcx().context("ReadConsoleInput RCX")?;
-    let buffer_ptr = ctx.engine.read_rdx().context("ReadConsoleInput RDX")?;
+    let buffer_va = ctx.engine.read_rdx().context("ReadConsoleInput RDX")?;
     let length = low_u32(
         ctx.engine.read_r8().context("ReadConsoleInput R8")?,
         "ReadConsoleInput length",
     )?;
-    let count_ptr = ctx.engine.read_r9().context("ReadConsoleInput R9")?;
+    let count_va = ctx.engine.read_r9().context("ReadConsoleInput R9")?;
 
     if handle != super::FAKE_STDIN_HANDLE {
         return ret_invalid_handle(ctx, api);
@@ -56,7 +55,7 @@ fn read_or_peek(
     let capacity = usize::try_from(length)
         .unwrap_or(0)
         .min(MAX_RECORDS_PER_CALL);
-    if buffer_ptr == 0 || capacity == 0 {
+    if buffer_va == 0 || capacity == 0 {
         ctx.state.process.last_error = super::ERROR_INVALID_PARAMETER;
         return ret_u64(ctx.engine, 0, api);
     }
@@ -69,8 +68,8 @@ fn read_or_peek(
         if added == 0 && consume {
             // No terminal to wait on (piped stdin): report zero events rather
             // than spin forever.
-            if count_ptr != 0 {
-                write_guest_u32(ctx.engine, count_ptr, 0)?;
+            if count_va != 0 {
+                write_guest_u32(ctx.engine, count_va, 0)?;
             }
             return ret_bool_true(ctx.engine, api);
         }
@@ -93,11 +92,11 @@ fn read_or_peek(
     let written = bytes.len() / INPUT_RECORD_SIZE;
     if !bytes.is_empty() {
         ctx.engine
-            .mem_write(buffer_ptr, &bytes)
+            .mem_write(buffer_va, &bytes)
             .context("ReadConsoleInput guest buffer")?;
     }
-    if count_ptr != 0 {
-        write_guest_u32(ctx.engine, count_ptr, u32::try_from(written).unwrap_or(0))?;
+    if count_va != 0 {
+        write_guest_u32(ctx.engine, count_va, u32::try_from(written).unwrap_or(0))?;
     }
     ret_bool_true(ctx.engine, api)
 }
@@ -129,17 +128,17 @@ pub fn handle_get_number_of_console_input_events(
         .engine
         .read_rcx()
         .context("GetNumberOfConsoleInputEvents RCX")?;
-    let count_ptr = ctx
+    let count_va = ctx
         .engine
         .read_rdx()
         .context("GetNumberOfConsoleInputEvents RDX")?;
-    if handle != super::FAKE_STDIN_HANDLE || count_ptr == 0 {
+    if handle != super::FAKE_STDIN_HANDLE || count_va == 0 {
         return ret_invalid_handle(ctx, "GetNumberOfConsoleInputEvents");
     }
     pump::ensure_input_ready(ctx.state);
     let _ = pump::pump(ctx.state, 0);
     let count = u32::try_from(ctx.state.console().pending_input.len()).unwrap_or(u32::MAX);
-    write_guest_u32(ctx.engine, count_ptr, count)?;
+    write_guest_u32(ctx.engine, count_va, count)?;
     ret_bool_true(ctx.engine, "GetNumberOfConsoleInputEvents")
 }
 

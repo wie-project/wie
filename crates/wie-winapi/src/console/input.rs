@@ -5,14 +5,7 @@
 //! A Windows console reports *key transitions*: a press and a release, each
 
 #![expect(dead_code)]
-#![allow(
-    unreachable_pub,
-    clippy::redundant_closure,
-    clippy::cast_sign_loss,
-    clippy::match_same_arms,
-    clippy::unnecessary_fold,
-    clippy::option_if_let_else
-)]
+#![allow(unreachable_pub)]
 //! carrying a virtual-key code, a scan code, the translated character, and a
 //! modifier mask. A Unix terminal reports *characters*, with special keys
 //! encoded as multi-byte escape sequences and no release information at all.
@@ -318,7 +311,7 @@ fn decode_csi(bytes: &[u8]) -> Step {
         .get(1)
         .copied()
         .flatten()
-        .map_or(0, |value| xterm_modifier_mask(value));
+        .map_or(0, xterm_modifier_mask);
 
     let virtual_key = match final_byte {
         b'A' => VK_UP,
@@ -551,7 +544,7 @@ fn add_modifier(record: InputRecord, modifier: u32) -> InputRecord {
 #[cfg(test)]
 // Tests assert on decoded shapes; a wrong variant should fail loudly rather
 // than be threaded through an Option the assertions then ignore.
-#[expect(clippy::panic)]
+#[allow(clippy::panic)]
 mod tests {
     use super::*;
 

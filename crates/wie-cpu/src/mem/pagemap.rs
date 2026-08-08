@@ -1,4 +1,4 @@
-//! Sparse run-length guest page map (state + protect) for Phase 3 SPC / VirtualQuery.
+//! Sparse run-length guest page map (state + protect) for SPC / VirtualQuery.
 //!
 //! Absence of a page key means [`PageState::Free`]. Host storage is owned by the
 //! backend; this map is the Windows-visible correctness plane only.
@@ -381,7 +381,7 @@ impl PageMap {
         self.runs.insert(right.start_page, right);
     }
 
-    /// Homogeneous run starting at or covering `va` for VirtualQuery (Phase 3.2+).
+    /// Homogeneous run starting at or covering `va` for VirtualQuery.
     #[must_use]
     pub fn query_run(&self, va: u64) -> Option<PageRun> {
         let page = va >> PAGE_SHIFT;
@@ -410,7 +410,7 @@ fn access_denied(va: u64, kind: AccessKind, why: &str) -> CpuError {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::mem::protect::{AccessKind, PageProtect};

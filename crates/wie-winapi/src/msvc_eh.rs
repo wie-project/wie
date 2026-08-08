@@ -5,13 +5,6 @@
 //! PE/COFF language data + widely documented structure field orders — no
 //! third-party OS source.
 
-#![allow(
-    clippy::arithmetic_side_effects,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::as_conversions
-)]
-
 use crate::exception::MemRead;
 
 /// `FuncInfo.magicNumber` values used by MSVC C++ EH.

@@ -205,8 +205,15 @@ pub fn run_micro_exe_with_options(
         crate::SessionOptions {
             guest_args: options.guest_args,
             stdin_bytes: options.stdin_bytes,
+            // Threaded through the session so the process identity (module
+            // path) derives from the same roots the volume config will use.
+            bottle_root: options.bottle_root.clone(),
+            drive_d_root: options.drive_d_root.clone(),
         },
     )?;
+    // An explicit `None` root means "no bottle, ignore WIE_ROOT" — the
+    // setters make that authoritative over the env fallback applied during
+    // session construction (idempotent when a root was given).
     session.set_bottle_root(options.bottle_root);
     if options.drive_d_root.is_some() {
         session.set_drive_d(options.drive_d_root);
@@ -243,7 +250,7 @@ pub fn run_micro_exe_with_options(
 
 /// Runs until the runtime yields waiting for a message or another terminal condition.
 ///
-/// Phase 6: under [`wie_winapi::IdlePolicy::Park`] (default for persistent when
+/// Under [`wie_winapi::IdlePolicy::Park`] (default for persistent when
 /// `WIE_IDLE` is unset), empty `GetMessage` parks the host for short quanta and
 /// re-enters until a message arrives or `WIE_IDLE_MAX_PARKS` is hit (then yields).
 pub fn run_persistent_until_yield(
@@ -257,7 +264,9 @@ pub fn run_persistent_until_yield(
     let mut session = RuntimeSession::new(path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)?;
 
     if session.profile_enabled() {
-        session.profile_mut().idle_policy = idle.as_str().to_owned();
+        session
+            .profile_mut()
+            .set_idle_policy(idle.as_str().to_owned());
     }
 
     let entry_point_va = session.entry_point_va();
@@ -292,9 +301,7 @@ pub fn run_persistent_until_yield(
                 let park_ns = t0.elapsed().as_nanos();
                 message_parks = message_parks.saturating_add(1);
                 if session.profile_enabled() {
-                    let p = session.profile_mut();
-                    p.idle_parks = p.idle_parks.saturating_add(1);
-                    p.idle_park_ns = p.idle_park_ns.saturating_add(park_ns);
+                    session.profile_mut().record_idle_park(park_ns);
                 }
                 // Re-enter GetMessage (guest still at fake-API entry).
             }

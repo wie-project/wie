@@ -12,7 +12,7 @@ use super::{
 use crate::console::{
     CharInfo, Coord, RenderMode, ScreenBuffer, SmallRect, codepage, host_term, screen,
 };
-use crate::guest_memory::{read_bytes as read_guest_bytes, read_u16 as read_guest_u16};
+use crate::guest_memory::{read_bytes as read_guest_bytes, read_u16};
 
 /// `ERROR_INVALID_HANDLE`.
 const ERROR_INVALID_HANDLE: u32 = 6;
@@ -34,7 +34,7 @@ fn stack_arg(ctx: &mut HandlerContext<'_>, index: usize, api: &str) -> Result<u6
         .with_context(|| format!("{api} RSP"))?;
     let offset = 0x28_u64.saturating_add((u64::try_from(index).unwrap_or(0)).saturating_mul(8));
     let address = super::checked_address(rsp, offset, api);
-    super::read_guest_u64(ctx.engine, address)
+    super::read_u64(ctx.engine, address)
 }
 
 /// Resolve an output handle to a screen-buffer handle.
@@ -152,8 +152,8 @@ pub fn handle_set_console_text_attribute(
 /// `CONSOLE_CURSOR_INFO` is `{ DWORD dwSize; BOOL bVisible; }`.
 pub fn handle_get_console_cursor_info(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let handle = ctx.engine.read_rcx().context("GetConsoleCursorInfo RCX")?;
-    let info_ptr = ctx.engine.read_rdx().context("GetConsoleCursorInfo RDX")?;
-    if info_ptr == 0 {
+    let info_va = ctx.engine.read_rdx().context("GetConsoleCursorInfo RDX")?;
+    if info_va == 0 {
         return ret_invalid_handle(ctx, "GetConsoleCursorInfo");
     }
     let Some(buffer_handle) = buffer_handle_for(ctx.state, handle) else {
@@ -166,25 +166,25 @@ pub fn handle_get_console_cursor_info(ctx: &mut HandlerContext<'_>) -> Result<Wi
         .map_or((25, 1), |buffer| {
             (buffer.cursor_size, u32::from(buffer.cursor_visible))
         });
-    write_guest_u32(ctx.engine, info_ptr, size)?;
-    let visible_ptr = super::checked_address(info_ptr, 4, "GetConsoleCursorInfo bVisible");
-    write_guest_u32(ctx.engine, visible_ptr, visible)?;
+    write_guest_u32(ctx.engine, info_va, size)?;
+    let visible_va = super::checked_address(info_va, 4, "GetConsoleCursorInfo bVisible");
+    write_guest_u32(ctx.engine, visible_va, visible)?;
     ret_bool_true(ctx.engine, "GetConsoleCursorInfo")
 }
 
 /// `SetConsoleCursorInfo(HANDLE, const CONSOLE_CURSOR_INFO*)`.
 pub fn handle_set_console_cursor_info(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let handle = ctx.engine.read_rcx().context("SetConsoleCursorInfo RCX")?;
-    let info_ptr = ctx.engine.read_rdx().context("SetConsoleCursorInfo RDX")?;
-    if info_ptr == 0 {
+    let info_va = ctx.engine.read_rdx().context("SetConsoleCursorInfo RDX")?;
+    if info_va == 0 {
         return ret_invalid_handle(ctx, "SetConsoleCursorInfo");
     }
     let Some(buffer_handle) = buffer_handle_for(ctx.state, handle) else {
         return ret_invalid_handle(ctx, "SetConsoleCursorInfo");
     };
-    let size = super::read_guest_u32(ctx.engine, info_ptr)?;
-    let visible_ptr = super::checked_address(info_ptr, 4, "SetConsoleCursorInfo bVisible");
-    let visible = super::read_guest_u32(ctx.engine, visible_ptr)? != 0;
+    let size = super::read_u32(ctx.engine, info_va)?;
+    let visible_va = super::checked_address(info_va, 4, "SetConsoleCursorInfo bVisible");
+    let visible = super::read_u32(ctx.engine, visible_va)? != 0;
     if let Some(buffer) = ctx.state.console().buffer_mut(buffer_handle) {
         buffer.cursor_size = size;
         buffer.cursor_visible = visible;
@@ -215,7 +215,7 @@ fn fill_console_output(
         "FillConsoleOutput length",
     )?;
     let start = Coord::from_packed(ctx.engine.read_r9().context("FillConsoleOutput R9")?);
-    let written_ptr = stack_arg(ctx, 0, api)?;
+    let written_va = stack_arg(ctx, 0, api)?;
 
     let Some(buffer_handle) = buffer_handle_for(ctx.state, handle) else {
         return ret_invalid_handle(ctx, api);
@@ -235,7 +235,7 @@ fn fill_console_output(
         FillKind::Attribute => u16::try_from(raw_value & 0xFFFF).unwrap_or(0),
     };
 
-    let mut filled = 0_u32;
+    let mut cells_filled = 0_u32;
     if let Some(buffer) = ctx.state.console().buffer_mut(buffer_handle) {
         let total = usize::try_from(length).unwrap_or(0).min(MAX_CELLS);
         let Some(origin) = buffer.index_of(start.x, start.y) else {
@@ -253,13 +253,13 @@ fn fill_console_output(
                 FillKind::Attribute => cell.attributes = unit,
                 FillKind::Wide | FillKind::Ansi => cell.unit = unit,
             }
-            filled = filled.saturating_add(1);
+            cells_filled = cells_filled.saturating_add(1);
         }
     }
 
     flush_active(ctx);
-    if written_ptr != 0 {
-        write_guest_u32(ctx.engine, written_ptr, filled)?;
+    if written_va != 0 {
+        write_guest_u32(ctx.engine, written_va, cells_filled)?;
     }
     ret_bool_true(ctx.engine, api)
 }
@@ -292,10 +292,10 @@ pub fn handle_fill_console_output_attribute(
 
 /// Read a `SMALL_RECT` from guest memory (four `SHORT`s, inclusive edges).
 fn read_small_rect(ctx: &mut HandlerContext<'_>, address: u64, api: &str) -> Result<SmallRect> {
-    let left = read_guest_u16(ctx.engine, address)?;
-    let top = read_guest_u16(ctx.engine, super::checked_address(address, 2, api))?;
-    let right = read_guest_u16(ctx.engine, super::checked_address(address, 4, api))?;
-    let bottom = read_guest_u16(ctx.engine, super::checked_address(address, 6, api))?;
+    let left = read_u16(ctx.engine, address)?;
+    let top = read_u16(ctx.engine, super::checked_address(address, 2, api))?;
+    let right = read_u16(ctx.engine, super::checked_address(address, 4, api))?;
+    let bottom = read_u16(ctx.engine, super::checked_address(address, 6, api))?;
     Ok(SmallRect {
         left: i16::from_ne_bytes(left.to_ne_bytes()),
         top: i16::from_ne_bytes(top.to_ne_bytes()),
@@ -339,21 +339,21 @@ fn write_console_output(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinA
         "WriteConsoleOutputA"
     };
     let handle = ctx.engine.read_rcx().context("WriteConsoleOutput RCX")?;
-    let source_ptr = ctx.engine.read_rdx().context("WriteConsoleOutput RDX")?;
+    let source_va = ctx.engine.read_rdx().context("WriteConsoleOutput RDX")?;
     let source_size = Coord::from_packed(ctx.engine.read_r8().context("WriteConsoleOutput R8")?);
     let source_origin = Coord::from_packed(ctx.engine.read_r9().context("WriteConsoleOutput R9")?);
-    let region_ptr = stack_arg(ctx, 0, api)?;
+    let region_va = stack_arg(ctx, 0, api)?;
 
     let Some(buffer_handle) = buffer_handle_for(ctx.state, handle) else {
         return ret_invalid_handle(ctx, api);
     };
-    if source_ptr == 0 || region_ptr == 0 {
+    if source_va == 0 || region_va == 0 {
         ctx.state.process.last_error = super::ERROR_INVALID_PARAMETER;
         return ret_u64(ctx.engine, 0, api);
     }
     enter_cells_mode(ctx);
 
-    let region = read_small_rect(ctx, region_ptr, api)?;
+    let region = read_small_rect(ctx, region_va, api)?;
     let source_cells = usize::try_from(source_size.x.max(0))
         .unwrap_or(0)
         .saturating_mul(usize::try_from(source_size.y.max(0)).unwrap_or(0))
@@ -363,7 +363,7 @@ fn write_console_output(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinA
     }
 
     let mut raw = vec![0_u8; source_cells.saturating_mul(CHAR_INFO_SIZE)];
-    read_guest_bytes(ctx.engine, source_ptr, &mut raw).context("WriteConsoleOutput source")?;
+    read_guest_bytes(ctx.engine, source_va, &mut raw).context("WriteConsoleOutput source")?;
     let code_page = ctx.state.console().output_code_page;
 
     let (width, height) = ctx
@@ -443,7 +443,7 @@ fn write_console_output(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinA
     }
 
     flush_active(ctx);
-    write_small_rect(ctx, region_ptr, clipped, api)?;
+    write_small_rect(ctx, region_va, clipped, api)?;
     ret_bool_true(ctx.engine, api)
 }
 
@@ -465,13 +465,13 @@ fn write_console_output_run(
     kind: RunKind,
 ) -> Result<WinApiHandlerResult> {
     let handle = ctx.engine.read_rcx().context("WriteConsoleOutputRun RCX")?;
-    let source_ptr = ctx.engine.read_rdx().context("WriteConsoleOutputRun RDX")?;
+    let source_va = ctx.engine.read_rdx().context("WriteConsoleOutputRun RDX")?;
     let length = low_u32(
         ctx.engine.read_r8().context("WriteConsoleOutputRun R8")?,
         "WriteConsoleOutputRun length",
     )?;
     let start = Coord::from_packed(ctx.engine.read_r9().context("WriteConsoleOutputRun R9")?);
-    let written_ptr = stack_arg(ctx, 0, api)?;
+    let written_va = stack_arg(ctx, 0, api)?;
 
     let Some(buffer_handle) = buffer_handle_for(ctx.state, handle) else {
         return ret_invalid_handle(ctx, api);
@@ -479,19 +479,19 @@ fn write_console_output_run(
     enter_cells_mode(ctx);
 
     let count = usize::try_from(length).unwrap_or(0).min(MAX_CELLS);
-    let values: Vec<u16> = if source_ptr == 0 || count == 0 {
+    let values: Vec<u16> = if source_va == 0 || count == 0 {
         Vec::new()
     } else {
         match kind {
             RunKind::Ansi => {
                 let mut bytes = vec![0_u8; count];
-                read_guest_bytes(ctx.engine, source_ptr, &mut bytes)
+                read_guest_bytes(ctx.engine, source_va, &mut bytes)
                     .context("WriteConsoleOutputCharacterA source")?;
                 codepage::decode_to_units(ctx.state.console().output_code_page, &bytes)
             }
             RunKind::Wide | RunKind::Attribute => {
                 let mut bytes = vec![0_u8; count.saturating_mul(2)];
-                read_guest_bytes(ctx.engine, source_ptr, &mut bytes)
+                read_guest_bytes(ctx.engine, source_va, &mut bytes)
                     .context("WriteConsoleOutputRun source")?;
                 bytes
                     .as_chunks::<2>()
@@ -530,8 +530,8 @@ fn write_console_output_run(
     }
 
     flush_active(ctx);
-    if written_ptr != 0 {
-        write_guest_u32(ctx.engine, written_ptr, written)?;
+    if written_va != 0 {
+        write_guest_u32(ctx.engine, written_va, written)?;
     }
     ret_bool_true(ctx.engine, api)
 }
@@ -569,13 +569,13 @@ fn read_console_output_run(
     kind: RunKind,
 ) -> Result<WinApiHandlerResult> {
     let handle = ctx.engine.read_rcx().context("ReadConsoleOutputRun RCX")?;
-    let dest_ptr = ctx.engine.read_rdx().context("ReadConsoleOutputRun RDX")?;
+    let dest_va = ctx.engine.read_rdx().context("ReadConsoleOutputRun RDX")?;
     let length = low_u32(
         ctx.engine.read_r8().context("ReadConsoleOutputRun R8")?,
         "ReadConsoleOutputRun length",
     )?;
     let start = Coord::from_packed(ctx.engine.read_r9().context("ReadConsoleOutputRun R9")?);
-    let read_ptr = stack_arg(ctx, 0, api)?;
+    let read_va = stack_arg(ctx, 0, api)?;
 
     let Some(buffer_handle) = buffer_handle_for(ctx.state, handle) else {
         return ret_invalid_handle(ctx, api);
@@ -602,7 +602,7 @@ fn read_console_output_run(
     }
 
     let read = u32::try_from(values.len()).unwrap_or(0);
-    if dest_ptr != 0 && !values.is_empty() {
+    if dest_va != 0 && !values.is_empty() {
         let bytes = match kind {
             RunKind::Ansi => codepage::encode_from_units(code_page, &values),
             RunKind::Wide | RunKind::Attribute => {
@@ -614,11 +614,11 @@ fn read_console_output_run(
             }
         };
         ctx.engine
-            .mem_write(dest_ptr, &bytes)
+            .mem_write(dest_va, &bytes)
             .context("ReadConsoleOutputRun dest")?;
     }
-    if read_ptr != 0 {
-        write_guest_u32(ctx.engine, read_ptr, read)?;
+    if read_va != 0 {
+        write_guest_u32(ctx.engine, read_va, read)?;
     }
     ret_bool_true(ctx.engine, api)
 }
@@ -649,19 +649,19 @@ fn read_console_output(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinAp
         "ReadConsoleOutputA"
     };
     let handle = ctx.engine.read_rcx().context("ReadConsoleOutput RCX")?;
-    let dest_ptr = ctx.engine.read_rdx().context("ReadConsoleOutput RDX")?;
+    let dest_va = ctx.engine.read_rdx().context("ReadConsoleOutput RDX")?;
     let dest_size = Coord::from_packed(ctx.engine.read_r8().context("ReadConsoleOutput R8")?);
     let dest_origin = Coord::from_packed(ctx.engine.read_r9().context("ReadConsoleOutput R9")?);
-    let region_ptr = stack_arg(ctx, 0, api)?;
+    let region_va = stack_arg(ctx, 0, api)?;
 
     let Some(buffer_handle) = buffer_handle_for(ctx.state, handle) else {
         return ret_invalid_handle(ctx, api);
     };
-    if dest_ptr == 0 || region_ptr == 0 {
+    if dest_va == 0 || region_va == 0 {
         ctx.state.process.last_error = super::ERROR_INVALID_PARAMETER;
         return ret_u64(ctx.engine, 0, api);
     }
-    let region = read_small_rect(ctx, region_ptr, api)?;
+    let region = read_small_rect(ctx, region_va, api)?;
     let cells = usize::try_from(dest_size.x.max(0))
         .unwrap_or(0)
         .saturating_mul(usize::try_from(dest_size.y.max(0)).unwrap_or(0))
@@ -735,9 +735,9 @@ fn read_console_output(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinAp
     }
 
     ctx.engine
-        .mem_write(dest_ptr, &raw)
+        .mem_write(dest_va, &raw)
         .context("ReadConsoleOutput dest")?;
-    write_small_rect(ctx, region_ptr, clipped, api)?;
+    write_small_rect(ctx, region_va, clipped, api)?;
     ret_bool_true(ctx.engine, api)
 }
 
@@ -759,31 +759,31 @@ fn scroll_console_screen_buffer(
     api: &str,
 ) -> Result<WinApiHandlerResult> {
     let handle = ctx.engine.read_rcx().context("ScrollConsole RCX")?;
-    let scroll_ptr = ctx.engine.read_rdx().context("ScrollConsole RDX")?;
-    let clip_ptr = ctx.engine.read_r8().context("ScrollConsole R8")?;
+    let scroll_va = ctx.engine.read_rdx().context("ScrollConsole RDX")?;
+    let clip_va = ctx.engine.read_r8().context("ScrollConsole R8")?;
     let destination = Coord::from_packed(ctx.engine.read_r9().context("ScrollConsole R9")?);
-    let fill_ptr = stack_arg(ctx, 0, api)?;
+    let fill_va = stack_arg(ctx, 0, api)?;
 
     let Some(buffer_handle) = buffer_handle_for(ctx.state, handle) else {
         return ret_invalid_handle(ctx, api);
     };
-    if scroll_ptr == 0 {
+    if scroll_va == 0 {
         ctx.state.process.last_error = super::ERROR_INVALID_PARAMETER;
         return ret_u64(ctx.engine, 0, api);
     }
     enter_cells_mode(ctx);
 
-    let scroll = read_small_rect(ctx, scroll_ptr, api)?;
-    let clip = if clip_ptr == 0 {
+    let scroll = read_small_rect(ctx, scroll_va, api)?;
+    let clip = if clip_va == 0 {
         None
     } else {
-        Some(read_small_rect(ctx, clip_ptr, api)?)
+        Some(read_small_rect(ctx, clip_va, api)?)
     };
-    let fill = if fill_ptr == 0 {
+    let fill = if fill_va == 0 {
         CharInfo::default()
     } else {
-        let raw_char = read_guest_u16(ctx.engine, fill_ptr)?;
-        let attributes = read_guest_u16(ctx.engine, super::checked_address(fill_ptr, 2, api))?;
+        let raw_char = read_u16(ctx.engine, fill_va)?;
+        let attributes = read_u16(ctx.engine, super::checked_address(fill_va, 2, api))?;
         CharInfo {
             unit: raw_char,
             attributes,
@@ -959,15 +959,15 @@ pub fn handle_set_console_screen_buffer_size(
 pub fn handle_set_console_window_info(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let handle = ctx.engine.read_rcx().context("SetConsoleWindowInfo RCX")?;
     let _absolute = ctx.engine.read_rdx().context("SetConsoleWindowInfo RDX")?;
-    let rect_ptr = ctx.engine.read_r8().context("SetConsoleWindowInfo R8")?;
+    let rect_va = ctx.engine.read_r8().context("SetConsoleWindowInfo R8")?;
     if buffer_handle_for(ctx.state, handle).is_none() {
         return ret_invalid_handle(ctx, "SetConsoleWindowInfo");
     }
-    if rect_ptr == 0 {
+    if rect_va == 0 {
         ctx.state.process.last_error = super::ERROR_INVALID_PARAMETER;
         return ret_u64(ctx.engine, 0, "SetConsoleWindowInfo");
     }
-    let _rect = read_small_rect(ctx, rect_ptr, "SetConsoleWindowInfo")?;
+    let _rect = read_small_rect(ctx, rect_va, "SetConsoleWindowInfo")?;
     ret_bool_true(ctx.engine, "SetConsoleWindowInfo")
 }
 

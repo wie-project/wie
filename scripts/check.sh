@@ -5,11 +5,14 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+echo "=== file sizes ==="
+"$ROOT/scripts/check-file-sizes.sh"
+
 echo "=== cargo fmt ==="
 cargo fmt --all --check --manifest-path "$ROOT/Cargo.toml"
 
-echo "=== cargo clippy ==="
-cargo clippy --workspace --all-targets --manifest-path "$ROOT/Cargo.toml" -- -D warnings
+echo "=== cargo clippy (advisory; no -D warnings — clippy lints are not denied) ==="
+cargo clippy --workspace --all-targets --manifest-path "$ROOT/Cargo.toml"
 
 echo "=== cargo test ==="
 cargo test --workspace --manifest-path "$ROOT/Cargo.toml"

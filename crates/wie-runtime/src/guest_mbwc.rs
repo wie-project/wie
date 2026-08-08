@@ -7,14 +7,18 @@
 //! UTF-16 code unit via zero-extension. Multi-byte pages (CP_UTF8=65001, …)
 //! fall back to the host handler.
 
+use crate::asm_utils::{patch_rel8, patch_rel32};
 use crate::hooks::RuntimeFakeApiEntry;
 use crate::memory::RuntimeMemoryLayout;
 use anyhow::{Context, Result};
 use wie_winapi::{WinApiId, encode_alias};
 
+/// Guest `MultiByteToWideChar` helper placement for the single-byte path.
 #[derive(Debug, Clone)]
 pub struct GuestMbwcConfig {
+    /// Guest VA of the in-guest expand helper body.
     pub impl_va: u64,
+    /// Hooked fake VA the helper jumps to for multi-byte pages.
     pub fallback_va: u64,
 }
 
@@ -60,17 +64,6 @@ pub(crate) fn install_guest_mbwc(
         "installed guest MultiByteToWideChar acceleration"
     );
     Ok(config)
-}
-
-fn patch_rel32(code: &mut [u8], imm_at: usize, next_ip: usize, target: usize) {
-    let rel = target as i32 - next_ip as i32;
-    code[imm_at..imm_at + 4].copy_from_slice(&rel.to_le_bytes());
-}
-
-fn patch_rel8(code: &mut [u8], imm_at: usize, next_ip: usize, target: usize) {
-    let rel = target as isize - next_ip as isize;
-    assert!((-128..128).contains(&rel), "rel8 out of range {rel}");
-    code[imm_at] = rel as i8 as u8;
 }
 
 fn write_mbwc_impl(engine: &mut dyn wie_cpu::CpuEngine, config: &GuestMbwcConfig) -> Result<()> {

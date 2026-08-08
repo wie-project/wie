@@ -5,6 +5,7 @@
 //! process start. Semantics match the Cranelift-lowered path (guest `ret`,
 //! shadow stack, optional late-bound chain).
 
+use super::ALL_DIRTY_BITS;
 use super::block::{BlockTerm, DecodedInsn};
 use super::lower::{
     CHAIN_SLOTS, JitCtx, MAX_CHAIN_DEPTH, SHADOW_DEPTH, chain_hash, wie_jit_load, wie_jit_store,
@@ -365,7 +366,7 @@ fn chain_tail(ctx: &mut JitCtx) {
     }
     // Successor may be a Cranelift block that dirties arbitrary GPRs without
     // updating `gpr_dirty_bits` — force full host writeback for this session.
-    ctx.gpr_dirty_bits = 0xffff;
+    ctx.gpr_dirty_bits = u64::from(ALL_DIRTY_BITS);
     ctx.chain_depth = ctx.chain_depth.saturating_add(1);
     // SAFETY: pointer published by chain_table_insert from a finalized block.
     let f: unsafe extern "C" fn(*mut JitCtx) =

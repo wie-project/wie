@@ -1,12 +1,12 @@
-//! Process execution state: single `ProcessResources` for both JIT and Iced.
+//! Process execution state: per-thread engine spawn/join and shared resources.
 //!
-//! Per-thread engines: each guest thread runs on its own `CpuEngine` instance.
-//! JIT workers share `Arc<JitShared>` (compilation cache). Iced workers share
-//! `Arc<RwLock<GuestMemory>>` extracted from the primary `IcedCpu` and passed to
-//! workers at spawn time. WinAPI is always behind `Arc<Mutex<>>`.
+//! Each guest thread runs on its own `CpuEngine` instance. JIT workers share
+//! `Arc<JitShared>` (compilation cache); Iced workers share
+//! `Arc<RwLock<GuestMemory>>`. WinAPI is always behind `Arc<Mutex<>>`.
 
 use crate::hooks::{SoftApiTable, resolve_fake_api_at};
 use crate::memory::RuntimeMemoryLayout;
+use crate::session::GuestTid;
 use anyhow::{Context, Result};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::thread::JoinHandle;
@@ -16,7 +16,7 @@ use wie_winapi::{HandlerContext, HostParkReason, PendingSpawn, WinApiControlSign
 
 // ── Lock helpers ───────────────────────────────────────────────────────
 
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
@@ -32,17 +32,24 @@ pub(crate) fn mt_debug() -> bool {
 
 #[derive(Clone)]
 pub(crate) struct ProcessConfig {
+    /// Hook table the fake-API stop range resolves through.
     pub soft_apis: SoftApiTable,
+    /// Process-wide environment (paths, command line) served to WinAPI.
     pub environment: wie_winapi::WinApiEnvironment,
+    /// Fixed guest memory layout (stack, heaps, fake-API range, stub pages).
     pub layout: RuntimeMemoryLayout,
+    /// Bitmap marking which fake-API VAs stop the host vs pass through.
     pub stop_bitmap: Arc<[u8]>,
-    pub primary_tid: u32,
+    /// Guest thread id of the primary (entry-point) thread.
+    pub primary_tid: GuestTid,
 }
 
 // ── ProcessResources: single struct for both JIT and Iced ──────────────
 
+/// Shared process state: config, primary engine, backend caches, WinAPI.
 pub(crate) struct ProcessResources {
     pub config: ProcessConfig,
+    /// Primary (guest-entry) engine; workers get their own engine at spawn.
     pub engine: Box<dyn CpuEngine>,
     /// `Some` when the JIT backend is active; workers clone this to share
     /// the compilation cache. `None` for the Iced interpreter backend.
@@ -51,6 +58,10 @@ pub(crate) struct ProcessResources {
     /// guest memory (mmap arenas + page tables). `None` for JIT.
     pub guest_mem: Option<Arc<RwLock<GuestMemory>>>,
     pub shared_winapi: Arc<Mutex<WinApiState>>,
+    /// Guest message queue behind its own mutex — host input posts through
+    /// this without ever locking `shared_winapi`.
+    pub shared_message_queue: Arc<Mutex<wie_winapi::present::MessageQueue>>,
+    /// Join handles for spawned guest worker threads.
     pub worker_joins: Vec<JoinHandle<()>>,
 }
 
@@ -97,7 +108,17 @@ impl ProcessResources {
         &self.config.soft_apis
     }
     pub(crate) fn primary_tid(&self) -> u32 {
-        self.config.primary_tid
+        self.config.primary_tid.0
+    }
+
+    pub(crate) fn winapi_arc(&self) -> Arc<Mutex<WinApiState>> {
+        Arc::clone(&self.shared_winapi)
+    }
+
+    /// Clone of the guest message-queue Arc — host posts without locking the
+    /// big WinApiState mutex.
+    pub(crate) fn message_queue_arc(&self) -> Arc<Mutex<wie_winapi::present::MessageQueue>> {
+        Arc::clone(&self.shared_message_queue)
     }
 
     pub(crate) fn join_workers(&mut self) {
@@ -112,7 +133,7 @@ impl ProcessResources {
             return Ok(());
         }
         if mt_debug() {
-            eprintln!(
+            tracing::error!(
                 "[mt] drain_spawns count={} tids={:?}",
                 spawns.len(),
                 spawns
@@ -143,6 +164,7 @@ impl ProcessResources {
                 .stack_size(STACK)
                 .spawn(move || worker_main(engine, winapi, cfg, spawn.tid))
                 .context("failed to spawn guest worker")?;
+            tracing::debug!(target: "wiegui", tid = spawn.tid, "guest worker thread started");
             self.worker_joins.push(handle);
         }
         Ok(())
@@ -167,6 +189,8 @@ fn join_workers_impl(winapi: &Arc<Mutex<WinApiState>>, joins: &mut Vec<JoinHandl
                         t.finish(1);
                     }
                 }
+                // File mappings hold no waiters; nothing to wake at teardown.
+                wie_winapi::KernelObject::FileMapping(_) => {}
             }
         }
     }
@@ -184,7 +208,7 @@ fn worker_main(
     tid: u32,
 ) {
     if mt_debug() {
-        eprintln!("[mt] worker_main start tid={tid:#x}");
+        tracing::error!("[mt] worker_main start tid={tid:#x}");
     }
     let layout = &config.layout;
     let budget = layout.instruction_budget;
@@ -200,7 +224,7 @@ fn worker_main(
     ) {
         tracing::error!(tid, error = %e, "failed to install runtime hooks for worker");
         if mt_debug() {
-            eprintln!("[mt] worker_main hooks failed tid={tid:#x}: {e}");
+            tracing::error!("[mt] worker_main hooks failed tid={tid:#x}: {e}");
         }
         // Always mark finished so joiners do not hang forever.
         let st = lock(&shared_winapi);
@@ -244,7 +268,7 @@ fn worker_main(
                 Ok(r) => r,
                 Err(e) => {
                     if mt_debug() {
-                        eprintln!("[mt] worker_main run error tid={tid:#x}: {e}");
+                        tracing::error!("[mt] worker_main run error tid={tid:#x}: {e}");
                     }
                     let st = lock(&shared_winapi);
                     finish_tid(&st, tid, 1);
@@ -261,7 +285,7 @@ fn worker_main(
         {
             let return_value = engine.read_rax().unwrap_or(0);
             if mt_debug() {
-                eprintln!("[mt] worker tid={tid:#x} pthread return value={return_value:#x}");
+                tracing::error!("[mt] worker tid={tid:#x} pthread return value={return_value:#x}");
             }
             let mut st = lock(&shared_winapi);
             st.kernel.threads.activate(tid);
@@ -282,7 +306,7 @@ fn worker_main(
         if rip_now == 0 || (run.invalid_memory.hit && run.invalid_memory.address == 0) {
             let code = u32::try_from(engine.read_rax().unwrap_or(0) & 0xffff_ffff).unwrap_or(0);
             if mt_debug() {
-                eprintln!("[mt] worker_main exit tid={tid:#x} code={code} (ret-to-0)");
+                tracing::error!("[mt] worker_main exit tid={tid:#x} code={code} (ret-to-0)");
             }
             let st = lock(&shared_winapi);
             finish_tid(&st, tid, code);
@@ -369,6 +393,16 @@ fn worker_main(
                         return;
                     }
                 }
+            }
+            // Flush coalesced publishes only when the worker is about to
+            // block (park) — a repaint cycle's BitBlt + control paints across
+            // dispatches publish once at the park boundary instead of once per
+            // dispatch (which emitted child-less intermediate frames). Workers
+            // have no guest callbacks. While the worker keeps dispatching, the
+            // pending publishes accumulate in the shared set; the primary's
+            // idle drain publishes them whenever it reaches an empty queue.
+            if park_reason.is_some() {
+                st.present().drain_pending_publishes();
             }
         } // drop WinAPI lock before host park
 
