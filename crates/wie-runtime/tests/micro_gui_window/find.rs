@@ -675,9 +675,11 @@ struct FaceSession {
     dy: i32,
 }
 
-fn face_session_new(cy: i32) -> FaceSession {
+fn face_session_new(cy: i32) -> Option<FaceSession> {
     use wie_runtime::EntryTraceTermination;
-    let path = real_exe("notepad.exe").expect("notepad.exe present");
+    // None when real_exes/notepad.exe is absent (CI has no real exes) — the
+    // callers skip instead of panicking.
+    let path = real_exe("notepad.exe")?;
     let mut session =
         wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
             .expect("notepad session starts");
@@ -713,14 +715,14 @@ fn face_session_new(cy: i32) -> FaceSession {
         .first_guest_window_info()
         .unwrap_or((0, String::new(), 0, 0));
     let (dx, dy) = (w.saturating_sub(FIND_DLG_CX) / 2, h.saturating_sub(cy) / 2);
-    FaceSession {
+    Some(FaceSession {
         session,
         handle,
         main,
         main_edit,
         dx,
         dy,
-    }
+    })
 }
 
 /// Open the Find/Replace dialog (`cmd`), type "hello" into its search EDIT,
@@ -834,14 +836,18 @@ fn click_dialog_button(
 fn find_dialog_face_stays_gray_through_find_next_click() {
     let _suite = gui_suite_serialize();
     use wie_runtime::EntryTraceTermination;
-    let FaceSession {
+    let Some(FaceSession {
         mut session,
         handle,
         main,
         main_edit: _,
         dx,
         dy,
-    } = face_session_new(FIND_DLG_CY);
+    }) = face_session_new(FIND_DLG_CY)
+    else {
+        eprintln!("skip: real_exes/notepad.exe not present");
+        return;
+    };
 
     let mut post_click_failures = 0_u32;
     let mut open_failures = 0_u32;
@@ -907,14 +913,18 @@ fn replace_dialog_face_stays_gray_through_replace_click() {
     let _suite = gui_suite_serialize();
     use wie_runtime::EntryTraceTermination;
 
-    let FaceSession {
+    let Some(FaceSession {
         mut session,
         handle,
         main,
         main_edit: _,
         dx,
         dy,
-    } = face_session_new(FIND_DLG_CY_REPLACE);
+    }) = face_session_new(FIND_DLG_CY_REPLACE)
+    else {
+        eprintln!("skip: real_exes/notepad.exe not present");
+        return;
+    };
     let dialog = face_dialog_open(&mut session, &handle, main, dx, dy, CMD_REPLACE);
     assert_ne!(dialog, 0, "replace dialog opens");
 
@@ -991,14 +1001,18 @@ fn replace_dialog_face_stays_gray_through_replace_click() {
 fn find_dialog_face_survives_selection_in_its_row_range() {
     let _suite = gui_suite_serialize();
     use wie_runtime::EntryTraceTermination;
-    let FaceSession {
+    let Some(FaceSession {
         mut session,
         handle,
         main,
         main_edit,
         dx,
         dy,
-    } = face_session_new(FIND_DLG_CY);
+    }) = face_session_new(FIND_DLG_CY)
+    else {
+        eprintln!("skip: real_exes/notepad.exe not present");
+        return;
+    };
 
     // Grow the document tall enough that line ~10 lands inside the dialog's
     // row range (dy=165, dialog rows 9..27 = owner rows 174..192; line N at
@@ -1066,9 +1080,11 @@ fn find_dialog_face_survives_selection_in_its_row_range() {
 /// With whole-word OFF the first match is the leading "catalog" (x ≈ text
 /// origin); with whole-word ON the embedded match is rejected and the first
 /// match is the standalone trailing "cat" (~8 chars to the right).
-fn whole_word_probe(whole_word: bool) -> u32 {
+fn whole_word_probe(whole_word: bool) -> Option<u32> {
     use wie_runtime::EntryTraceTermination;
-    let path = real_exe("notepad.exe").expect("notepad.exe present");
+    // None when real_exes/notepad.exe is absent (CI has no real exes) — the
+    // caller skips instead of panicking.
+    let path = real_exe("notepad.exe")?;
     let mut session =
         wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
             .expect("notepad session starts");
@@ -1200,12 +1216,12 @@ fn whole_word_probe(whole_word: bool) -> u32 {
                 .map(|(i, _)| u32::try_from(i % frame.width as usize).unwrap_or(0))
                 .min();
             if let Some(left) = leftmost {
-                return left;
+                return Some(left);
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    u32::MAX
+    Some(u32::MAX)
 }
 
 /// LIVE-BUG regression: "Match whole word" in the Find dialog must work (and
@@ -1230,8 +1246,14 @@ fn whole_word_find_next_does_not_crash() {
     }
     let _suite = gui_suite_serialize();
 
-    let sub_left = whole_word_probe(false);
-    let ww_left = whole_word_probe(true);
+    let Some(sub_left) = whole_word_probe(false) else {
+        eprintln!("skip: real_exes/notepad.exe not present");
+        return;
+    };
+    let Some(ww_left) = whole_word_probe(true) else {
+        eprintln!("skip: real_exes/notepad.exe not present");
+        return;
+    };
 
     assert_ne!(sub_left, u32::MAX, "plain Find Next selects a match");
     assert_ne!(ww_left, u32::MAX, "whole-word Find Next selects a match");
