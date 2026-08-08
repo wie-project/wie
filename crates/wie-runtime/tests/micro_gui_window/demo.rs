@@ -619,17 +619,18 @@ fn gui_demo_dialog_opens_on_click() {
         // selftest's verification retries on later ticks, so the host has
         // unbounded time to observe the face; a publish-model regression now
         // fails the 300-iteration bound instead of racing the close.
-        if saw_dialog_face && saw_button_hit_test && !closed_dialog {
-            if let Some((hwnd, rx, ry)) = handle.window_at(240, 248)
-                && hwnd != 0
-                && rx < 120
-                && ry < 40
-            {
-                let lparam = u64::from(ry << 16 | rx);
-                handle.post_message_at(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lparam, 240, 248);
-                handle.post_message_at(hwnd, WM_LBUTTONUP, 0, lparam, 240, 248);
-                closed_dialog = true;
-            }
+        if saw_dialog_face
+            && saw_button_hit_test
+            && !closed_dialog
+            && let Some((hwnd, rx, ry)) = handle.window_at(240, 248)
+            && hwnd != 0
+            && rx < 120
+            && ry < 40
+        {
+            let lparam = u64::from(ry << 16 | rx);
+            handle.post_message_at(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lparam, 240, 248);
+            handle.post_message_at(hwnd, WM_LBUTTONUP, 0, lparam, 240, 248);
+            closed_dialog = true;
         }
 
         match summary.termination {
