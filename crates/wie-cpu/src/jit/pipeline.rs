@@ -664,25 +664,17 @@ impl JitCpu {
         for (i, slot) in gpr.iter_mut().enumerate() {
             *slot = regs.gpr(i);
         }
-        // Pure GPR blocks skip the XMM bank copy on both sides of the call.
-        // SSE blocks load only live XMMs (live-mask selective entry load).
+        // Full xmm snapshot: a chained successor may load any live xmm from
+        // JitCtx even when THIS block is pure-GPR (its segment can still chain
+        // into an SSE block). The old `uses_sse`-gated live-mask load zeroed
+        // ctx.xmm for GPR blocks, so a chained SSE successor read zeros — e.g.
+        // notepad's CRLF expansion `movd [rcx], xmm0` wrote 0x0000 pairs and
+        // the loaded file truncated at the first such NUL.
         let mut xmm = [XmmSlot::ZERO; 16];
-        if meta.uses_sse {
-            let mut m = meta.xmm_live_mask;
-            // If mask is empty but uses_sse (fp-only edge), load all.
-            if m == 0 {
-                m = ALL_DIRTY_BITS;
-            }
-            let mut i = 0_usize;
-            while m != 0 {
-                if m & 1 != 0 {
-                    let v = regs.xmm_at(i);
-                    if let Some(slot) = xmm.get_mut(i) {
-                        *slot = XmmSlot::from_u128(v);
-                    }
-                }
-                m >>= 1;
-                i = i.saturating_add(1);
+        for i in 0..16 {
+            let v = regs.xmm_at(i);
+            if let Some(slot) = xmm.get_mut(i) {
+                *slot = XmmSlot::from_u128(v);
             }
         }
         let mut ctx = JitCtx {

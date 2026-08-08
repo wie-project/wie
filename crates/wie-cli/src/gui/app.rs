@@ -1199,8 +1199,7 @@ pub fn run_gui_windowed(
                                 // not the first one (the per-window slot fix).
                                 // set_parent consumes the builder, so apply it
                                 // before the chain.
-                                let Some(parent) =
-                                    resolve_dialog_parent(&handle, &window_slots)
+                                let Some(parent) = resolve_dialog_parent(&handle, &window_slots)
                                 else {
                                     return show_unparented_ns_alert(caption, text, mb_type);
                                 };

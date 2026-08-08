@@ -1187,7 +1187,129 @@ fn notepad_file_open_native_bridge_accept_reads_picked_file() {
     let _ = std::fs::remove_dir_all(&bottle);
 }
 
-/// SAVE→OPEN roundtrip through the native bridge: a file saved by the guest
+/// REPRO: a LARGE picked file (>4 KiB) must load in FULL into the EDIT.
+/// The live report: the imported content stops partway (line 103 of a 166-line
+/// file). This pins the byte count that actually lands and prints the API
+/// sequence so the truncating handler is identifiable.
+#[test]
+fn notepad_file_open_large_picked_file_loads_in_full() {
+    let Some(path) = real_exe("notepad.exe") else {
+        eprintln!("skip: real_exes/notepad.exe not present");
+        return;
+    };
+    let _suite = gui_suite_serialize();
+    use wie_runtime::EntryTraceTermination;
+
+    const WM_COMMAND: u32 = 0x0111;
+    const CMD_OPEN: u32 = 258;
+
+    let bottle =
+        std::env::temp_dir().join(format!("wie-ofn-large-open-bottle-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(bottle.join("drive_c"));
+    let picked_host = std::env::temp_dir().join(format!(
+        "wie-ofn-large-open-picked-{}.txt",
+        std::process::id()
+    ));
+    // Distinctive per-line content: 200 lines x ~53 bytes ≈ 10.6 KiB, far
+    // above any plausible read cap. notepad normalizes LF to CRLF when it
+    // adopts the view into the EDIT, so the expected text is the seed with
+    // every `\n` expanded to `\r\n`.
+    let original: Vec<u8> = (1..=200)
+        .flat_map(|i| {
+            format!("REPRO line {i:03} of two hundred - filler filler filler\n").into_bytes()
+        })
+        .collect();
+    let expected = String::from_utf8_lossy(&original).replace('\n', "\r\n");
+    std::fs::write(&picked_host, &original).expect("seed the picked file");
+
+    let mut session =
+        wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
+            .expect("notepad session starts");
+    session.set_bottle_root(Some(bottle.clone()));
+    session.set_file_dialog_policy(wie_winapi::FileDialogPolicy::Interactive);
+    let handle = session.guest_handle();
+    let picked = picked_host.clone();
+    handle.set_file_dialog_bridge(Box::new(move |request| {
+        assert!(!request.is_save, "CMD_OPEN opens an Open panel");
+        Some(wie_winapi::FileDialogPick {
+            host_path: picked.clone(),
+        })
+    }));
+    pump_until_windows_ready(&mut session);
+
+    let main = session.first_guest_window_handle().unwrap_or(0);
+    handle.post_message(main, WM_COMMAND, u64::from(CMD_OPEN), 0);
+
+    let mut session_alive = true;
+    let mut stop_message = String::new();
+    let mut api_sequence: Vec<String> = Vec::new();
+    for _ in 0..200 {
+        let summary = session.run_until_stop(1_000_000).expect("run");
+        for event in &summary.events {
+            api_sequence.push(format!(
+                "{}!{} handled={} ret={:?}",
+                event.library, event.name, event.handled, event.return_value
+            ));
+        }
+        match summary.termination {
+            EntryTraceTermination::ExitProcess { .. } => break,
+            EntryTraceTermination::WaitingForMessage => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            EntryTraceTermination::RuntimeStop(message) => {
+                session_alive = false;
+                stop_message = message.clone();
+                break;
+            }
+            EntryTraceTermination::UnsupportedApi(message) => {
+                session_alive = false;
+                stop_message = message.clone();
+                break;
+            }
+            other => {
+                eprintln!("DIAG LARGE OPEN other: {other:?}");
+            }
+        }
+    }
+
+    assert!(
+        session_alive,
+        "the large-file OPEN flow must not stop the session; stop={stop_message}"
+    );
+    let edit = session
+        .guest_windows_snapshot()
+        .iter()
+        .find(|(_, cls, ..)| cls == "EDIT")
+        .map(|(h, ..)| *h)
+        .unwrap_or(0);
+    assert_ne!(edit, 0, "notepad must have an EDIT control");
+    let mut edit_text = String::new();
+    for _ in 0..50 {
+        edit_text = handle.control_text(edit).unwrap_or_default();
+        if edit_text.len() >= expected.len() {
+            break;
+        }
+        let _ = session.run_until_stop(1_000_000).expect("run");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(
+        edit_text.len(),
+        expected.len(),
+        "the EDIT must hold the FULL picked file ({} units, {} bytes with \
+         CRLF); got {} — last received line: {:?}\napi sequence:\n{}",
+        expected.len(),
+        original.len(),
+        edit_text.len(),
+        edit_text.lines().last(),
+        api_sequence.join("\n")
+    );
+    assert_eq!(
+        edit_text, expected,
+        "the EDIT content must match the picked file, LF normalized to CRLF"
+    );
+    let _ = std::fs::remove_file(&picked_host);
+    let _ = std::fs::remove_dir_all(&bottle);
+}
 /// (via the pick-mount) must re-open with the SAME content in the EDIT. This
 /// pins the full content path — the save's WriteFile, the re-open's
 /// CreateFileMappingW → MapViewOfFile view, and the guest's EM_SETHANDLE
