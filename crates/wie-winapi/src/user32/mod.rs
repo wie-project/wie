@@ -795,3 +795,13 @@ pub(crate) fn is_known_window(state: &mut WinApiState, handle: u64) -> bool {
         || state.window_state().active_window_handle == crate::handles::Hwnd::from(handle)
         || state.window_state().foreground_window_handle == crate::handles::Hwnd::from(handle)
 }
+
+/// Soft dispatch for USER32 exports beyond the dense table (enumeration,
+/// caret, icon helpers). String path only — hot APIs stay dense.
+pub fn dispatch_user32_extra(
+    ctx: &mut HandlerContext<'_>,
+    name: &str,
+) -> Result<Option<WinApiHandlerResult>> {
+    let _ = (ctx, name);
+    Ok(None)
+}

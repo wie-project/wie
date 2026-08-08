@@ -1332,6 +1332,26 @@ pub fn dispatch_winapi(
     {
         return Ok(r);
     }
+    if library.eq_ignore_ascii_case("user32.dll")
+        && let Some(r) = crate::user32::dispatch_user32_extra(ctx, name)?
+    {
+        return Ok(r);
+    }
+    if library.eq_ignore_ascii_case("gdi32.dll")
+        && let Some(r) = crate::gdi32::dispatch_gdi32_extra(ctx, name)?
+    {
+        return Ok(r);
+    }
+    if library.eq_ignore_ascii_case("comctl32.dll")
+        && let Some(r) = crate::comctl32::dispatch_comctl32_extra(ctx, name)?
+    {
+        return Ok(r);
+    }
+    if library.eq_ignore_ascii_case("winmm.dll")
+        && let Some(r) = crate::winmm::dispatch_winmm_extra(ctx, name)?
+    {
+        return Ok(r);
+    }
     if library.eq_ignore_ascii_case("imm32.dll")
         && let Some(r) = crate::imm32::dispatch_imm32(ctx, name)?
     {

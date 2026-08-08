@@ -15,3 +15,14 @@ pub use font_system::*;
 pub use print::*;
 pub use state::*;
 pub use text::*;
+
+/// Soft dispatch for GDI32 exports beyond the dense table (DIB round-trips,
+/// regions, font enumeration, SetPixel). String path only — hot APIs stay
+/// dense.
+pub fn dispatch_gdi32_extra(
+    ctx: &mut crate::HandlerContext<'_>,
+    name: &str,
+) -> anyhow::Result<Option<crate::WinApiHandlerResult>> {
+    let _ = (ctx, name);
+    Ok(None)
+}

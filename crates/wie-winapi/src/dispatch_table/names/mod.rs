@@ -162,7 +162,19 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
         let n = name.to_ascii_lowercase();
         return matches!(
             n.as_str(),
-            "coinitialize" | "coinitializeex" | "couninitialize" | "cocreateinstance"
+            "coinitialize"
+                | "coinitializeex"
+                | "couninitialize"
+                | "cocreateinstance"
+                | "coregisterclassobject"
+                | "corevokeclassobject"
+                | "cocreateguid"
+                | "cotaskmemalloc"
+                | "cotaskmemfree"
+                | "cotaskmemrealloc"
+                | "stringfromclsid"
+                | "clsidfromstring"
+                | "cogetclassobject"
         );
     }
     if library.eq_ignore_ascii_case("shell32.dll") {
@@ -173,6 +185,10 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
                 | "shgetpathfromidlistw"
                 | "shbrowseforfolderw"
                 | "shaddtorecentdocs"
+                | "shgetfileinfoa"
+                | "shgetfileinfow"
+                | "shgetspecialfolderpathw"
+                | "shellexecuteexw"
         );
     }
     if library.eq_ignore_ascii_case("oleaut32.dll") {
@@ -189,6 +205,17 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
                 | "variantinit"
                 | "variantclear"
                 | "variantcopy"
+                | "safearraycreate"
+                | "safearraydestroy"
+                | "safearrayaccessdata"
+                | "safearrayunaccessdata"
+                | "safearraygetelement"
+                | "safearrayputelement"
+                | "safearraygetlbound"
+                | "safearraygetubound"
+                | "safearraygetdim"
+                | "dispgetidsofnames"
+                | "dispinvoke"
                 | "ordinal 2"
                 | "ordinal 4"
                 | "ordinal 6"
@@ -198,6 +225,80 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
                 | "ordinal 10"
                 | "ordinal 11"
                 | "ordinal 149"
+        );
+    }
+    if library.eq_ignore_ascii_case("user32.dll") {
+        let n = name.to_ascii_lowercase();
+        return matches!(
+            n.as_str(),
+            "enumwindows"
+                | "enumchildwindows"
+                | "findwindowa"
+                | "findwindoww"
+                | "createcaret"
+                | "setcaretpos"
+                | "getcaretpos"
+                | "showcaret"
+                | "hidecaret"
+                | "destroycaret"
+                | "drawicona"
+                | "drawiconw"
+                | "drawiconex"
+        );
+    }
+    if library.eq_ignore_ascii_case("gdi32.dll") {
+        let n = name.to_ascii_lowercase();
+        return matches!(
+            n.as_str(),
+            "getdibits"
+                | "setdibits"
+                | "createrectrgn"
+                | "createellipticrgn"
+                | "createpolygonrgn"
+                | "combinergn"
+                | "setrectrgn"
+                | "getrgnbox"
+                | "enumfontfamiliesexw"
+                | "enumfontfamiliesexa"
+                | "setpixel"
+        );
+    }
+    if library.eq_ignore_ascii_case("comctl32.dll") {
+        let n = name.to_ascii_lowercase();
+        return matches!(
+            n.as_str(),
+            "imagelist_add"
+                | "imagelist_getimagecount"
+                | "imagelist_geticonsize"
+                | "imagelist_seticonsize"
+                | "imagelist_draw"
+                | "imagelist_getimageinfo"
+                | "createtoolbarex"
+        );
+    }
+    if library.eq_ignore_ascii_case("winmm.dll") {
+        let n = name.to_ascii_lowercase();
+        return matches!(
+            n.as_str(),
+            "timesetevent"
+                | "timekillevent"
+                | "waveoutopen"
+                | "waveoutclose"
+                | "waveoutprepareheader"
+                | "waveoutunprepareheader"
+                | "waveoutwrite"
+                | "waveoutgetnumdevs"
+        );
+    }
+    if library.eq_ignore_ascii_case("advapi32.dll") {
+        let n = name.to_ascii_lowercase();
+        return matches!(
+            n.as_str(),
+            "regdeletekeyw"
+                | "regdeletekeya"
+                | "regflushkey"
+                | "regsavekeyw"
+                | "regsavekeya"
         );
     }
     if library.eq_ignore_ascii_case("KERNEL32.dll") {

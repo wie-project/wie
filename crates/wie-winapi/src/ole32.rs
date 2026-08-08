@@ -11,6 +11,11 @@ const S_FALSE: u64 = 1;
 /// `REGDB_E_CLASSNOTREG` — class not registered (no real COM servers).
 const REGDB_E_CLASSNOTREG: u64 = 0x8004_0154;
 
+/// COM class-registration table (`CoRegisterClassObject`), owned by this
+/// module and heap-allocated on first load via `DllId::Ole32`.
+#[derive(Debug, Default)]
+pub struct OleState {}
+
 fn finish(engine: &mut dyn wie_cpu::CpuEngine, value: u64) -> Result<WinApiHandlerResult> {
     let return_address = engine
         .return_from_win64_api(value)

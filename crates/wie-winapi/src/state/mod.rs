@@ -140,6 +140,10 @@ pub enum DllId {
     Ws2,
     /// Crypto provider/hash handles (`CRYPT32.dll`).
     Crypt32,
+    /// COM class registration table (`OLE32.dll` — CLSID → class factory).
+    Ole32,
+    /// Timer/audio handle tables (`WINMM.dll` — timeSetEvent, waveOut).
+    Winmm,
 }
 
 impl DllId {
@@ -192,6 +196,8 @@ const fn dll_index(id: DllId) -> usize {
         DllId::DragDrop => 8,
         DllId::Ws2 => 9,
         DllId::Crypt32 => 10,
+        DllId::Ole32 => 11,
+        DllId::Winmm => 12,
     }
 }
 
@@ -223,6 +229,8 @@ const fn slot_of(i: usize) -> &'static str {
         8 => "dragdrop",
         9 => "ws2",
         10 => "crypt32",
+        11 => "ole32",
+        12 => "winmm",
         _ => "?",
     }
 }
@@ -452,6 +460,20 @@ impl WinApiState {
     pub fn crypt32(&mut self) -> &mut crate::crypt32::Crypt32State {
         self.dll_states
             .get_or_init::<crate::crypt32::Crypt32State>(DllId::Crypt32)
+    }
+
+    /// Mutable access to the COM class-registration table. Lazy: allocated
+    /// on first `OLE32` call.
+    pub fn ole32(&mut self) -> &mut crate::ole32::OleState {
+        self.dll_states
+            .get_or_init::<crate::ole32::OleState>(DllId::Ole32)
+    }
+
+    /// Mutable access to the WINMM timer/audio handle tables. Lazy:
+    /// allocated on first `WINMM` call.
+    pub fn winmm(&mut self) -> &mut crate::winmm::WinmmState {
+        self.dll_states
+            .get_or_init::<crate::winmm::WinmmState>(DllId::Winmm)
     }
 
     /// Read-only access — returns `None` if the state was never initialised.

@@ -14,9 +14,9 @@ LDFLAGS  := -nostdlib -Wl,--subsystem,console -Wl,--entry,entry
 # Ordinary CRT-linked apps (independent-style): full toolchain defaults.
 CRT_CFLAGS := -O2
 
-.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes dll_tests game_exes interactive_exes ucrt_coverage gui_exes print_bmp version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo http_get
+.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes dll_tests game_exes interactive_exes ucrt_coverage gui_exes print_bmp version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo http_get ole_com shell_folders reg_roundtrip user32_enum gdi_regions comctl_toolbar winmm_audio
 
-all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes game_exes interactive_exes dll_tests ucrt_coverage gui_exes version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo http_get
+all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes game_exes interactive_exes dll_tests ucrt_coverage gui_exes version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo http_get ole_com shell_folders reg_roundtrip user32_enum gdi_regions comctl_toolbar winmm_audio
 
 $(OUT):
 	mkdir -p $(OUT)
@@ -395,3 +395,53 @@ $(OUT)/http_get.exe: http_get/main.c | $(OUT)
 
 clean:
 	rm -rf $(OUT)
+
+# OLE32/OLEAUT32 (ole_com): CoCreateGuid + SafeArray round-trip through the
+# COM class table.
+ole_com: $(OUT)/ole_com.exe
+
+$(OUT)/ole_com.exe: ole_com/main.c | $(OUT)
+	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $< -lole32 -loleaut32
+	@echo "built $@"
+
+# SHELL32 (shell_folders): SHGetFileInfo / SHGetSpecialFolderPath / CSIDLs.
+shell_folders: $(OUT)/shell_folders.exe
+
+$(OUT)/shell_folders.exe: shell_folders/main.c | $(OUT)
+	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $< -lshell32
+	@echo "built $@"
+
+# ADVAPI32 (reg_roundtrip): RegCreateKeyEx/SetValue/Query/Delete/Flush.
+reg_roundtrip: $(OUT)/reg_roundtrip.exe
+
+$(OUT)/reg_roundtrip.exe: reg_roundtrip/main.c | $(OUT)
+	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $< -ladvapi32
+	@echo "built $@"
+
+# USER32 (user32_enum): EnumWindows/FindWindow/caret/drawicon.
+user32_enum: $(OUT)/user32_enum.exe
+
+$(OUT)/user32_enum.exe: user32_enum/main.c | $(OUT)
+	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $< -luser32
+	@echo "built $@"
+
+# GDI32 (gdi_regions): GetDIBits/SetDIBits + region ops.
+gdi_regions: $(OUT)/gdi_regions.exe
+
+$(OUT)/gdi_regions.exe: gdi_regions/main.c | $(OUT)
+	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $< -lgdi32
+	@echo "built $@"
+
+# COMCTL32 (comctl_toolbar): ImageList rest + toolbar.
+comctl_toolbar: $(OUT)/comctl_toolbar.exe
+
+$(OUT)/comctl_toolbar.exe: comctl_toolbar/main.c | $(OUT)
+	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $< -lcomctl32
+	@echo "built $@"
+
+# WINMM (winmm_audio): waveOut stubs + timeSetEvent.
+winmm_audio: $(OUT)/winmm_audio.exe
+
+$(OUT)/winmm_audio.exe: winmm_audio/main.c | $(OUT)
+	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $< -lwinmm
+	@echo "built $@"

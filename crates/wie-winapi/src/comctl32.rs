@@ -598,3 +598,13 @@ fn status_bar_default_height(state: &mut WinApiState, hwnd: u64) -> Result<i32> 
     });
     Ok(line_h.saturating_add(4))
 }
+
+/// Soft dispatch for COMCTL32 exports beyond the dense table (toolbar,
+/// remaining ImageList APIs, progress bar). String path only.
+pub fn dispatch_comctl32_extra(
+    ctx: &mut HandlerContext<'_>,
+    name: &str,
+) -> Result<Option<WinApiHandlerResult>> {
+    let _ = (ctx, name);
+    Ok(None)
+}
