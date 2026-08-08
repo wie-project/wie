@@ -16,7 +16,7 @@ cargo build -p wie-cli --release
 
 # Or install the prebuilt binary with Homebrew
 brew tap wie-project/wie
-brew install wie
+brew install wie-project/wie/wie
 
 # Prebuilt release binaries are built by the release-on-tag workflow (.github/workflows/release.yml)
 # and published as GitHub release assets.
