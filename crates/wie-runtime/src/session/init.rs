@@ -126,126 +126,19 @@ fn register_layout_regions(
         }
     }
 
-    // Pure data regions are RW (not RWX). Soft-translate W is denied on
-    // executable pages; stack/heap must stay non-X for the pin super path.
-    let data_rw = wie_cpu::RwxPerms::READ_WRITE;
-    let code_rwx = wie_cpu::RwxPerms::ALL;
-    let regs: [GuestRegion; 16] = [
-        GuestRegion::new(
-            "stack",
-            RegionKind::Stack,
-            layout.stack_base,
-            layout.stack_size,
-            data_rw,
-        ),
-        GuestRegion::new(
-            "process_heap",
-            RegionKind::Heap,
-            layout.process_heap_base,
-            layout.process_heap_size,
-            data_rw,
-        ),
-        GuestRegion::new(
-            "process_heap_shadow",
-            RegionKind::Heap,
-            layout.process_heap_shadow_base(),
-            layout.process_heap_size,
-            data_rw,
-        ),
-        GuestRegion::new(
-            "fake_api",
-            RegionKind::FakeApi,
-            layout.fake_api_base,
-            layout.fake_api_size,
-            code_rwx,
-        ),
-        GuestRegion::new(
-            "teb",
-            RegionKind::Teb,
-            layout.teb_low_base,
-            layout.teb_low_size,
-            data_rw,
-        ),
-        GuestRegion::new(
-            "env",
-            RegionKind::Env,
-            layout.env_data_base,
-            layout.env_data_size,
-            data_rw,
-        ),
-        GuestRegion::new(
-            "resource",
-            RegionKind::Resource,
-            layout.resource_data_base,
-            layout.resource_data_size,
-            data_rw,
-        ),
-        GuestRegion::new(
-            "guest_io_code",
-            RegionKind::GuestCode,
-            layout.guest_io_code_base,
-            layout.guest_io_code_size,
-            code_rwx,
-        ),
-        GuestRegion::new(
-            "guest_io_table",
-            RegionKind::GuestIo,
-            layout.guest_io_table_base,
-            layout.guest_io_table_size,
-            data_rw,
-        ),
-        GuestRegion::new(
-            "guest_file_data",
-            RegionKind::GuestIo,
-            layout.guest_file_data_base,
-            layout.guest_file_data_size,
-            data_rw,
-        ),
-        GuestRegion::new(
-            "guest_fls",
-            RegionKind::Other,
-            layout.guest_fls_table_base,
-            layout.guest_fls_table_size,
-            data_rw,
-        ),
-        GuestRegion::new(
-            "guest_heap_ctrl",
-            RegionKind::Heap,
-            layout.guest_heap_ctrl_base,
-            layout.guest_heap_ctrl_size,
-            data_rw,
-        ),
-        GuestRegion::new(
-            "guest_heap_code",
-            RegionKind::GuestCode,
-            layout.guest_heap_code_base,
-            layout.guest_heap_code_size,
-            code_rwx,
-        ),
-        GuestRegion::new(
-            "guest_mbwc_code",
-            RegionKind::GuestCode,
-            layout.guest_mbwc_code_base,
-            layout.guest_mbwc_code_size,
-            code_rwx,
-        ),
-        GuestRegion::new(
-            "fast_api_stub",
-            RegionKind::GuestCode,
-            layout.fast_api_stub_base,
-            layout.fast_api_stub_size,
-            code_rwx,
-        ),
-        GuestRegion::new(
-            "clock_table",
-            RegionKind::Other,
-            layout.clock_table_va,
-            layout.clock_table_size,
-            data_rw,
-        ),
-    ];
-    for region in regs {
-        engine.register_region(region);
+    // Fixed layout regions — single source of truth is `RuntimeMemoryLayout`
+    // (names, kinds, perms, geometry all live in the layout, validated at
+    // compile time). Soft-translate W is denied on executable pages; stack
+    // and heap stay non-X for the pin super path, so perms come from the
+    // layout rather than being re-derived here.
+    for region in layout.regions() {
+        engine.register_region(GuestRegion::new(
+            region.name,
+            region.kind,
+            region.base,
+            region.size,
+            region.perms,
+        ));
     }
 }
 
@@ -488,16 +381,17 @@ impl super::RuntimeSession {
 
         engine
             .mem_map(
-                layout.fake_api_base,
-                layout.fake_api_size,
+                layout.fake_api.base,
+                layout.fake_api.size,
                 wie_cpu::RwxPerms::ALL,
             )
             .context("failed to map fake API memory")?;
 
         let fake_api_size_u64 =
-            u64::try_from(layout.fake_api_size).context("fake API size does not fit u64")?;
+            u64::try_from(layout.fake_api.size).context("fake API size does not fit u64")?;
         let fake_api_end = layout
-            .fake_api_base
+            .fake_api
+            .base
             .checked_add(fake_api_size_u64)
             .context("fake API end overflow")?
             .checked_sub(1)
@@ -506,37 +400,37 @@ impl super::RuntimeSession {
         // Guest acceleration regions (outside host-stop hook range for helpers).
         engine
             .mem_map(
-                layout.guest_io_code_base,
-                layout.guest_io_code_size,
+                layout.guest_io_code.base,
+                layout.guest_io_code.size,
                 wie_cpu::RwxPerms::ALL,
             )
             .context("failed to map guest I/O code region")?;
         let data_rw = wie_cpu::RwxPerms::READ_WRITE;
         engine
             .mem_map(
-                layout.guest_io_table_base,
-                layout.guest_io_table_size,
+                layout.guest_io_table.base,
+                layout.guest_io_table.size,
                 data_rw,
             )
             .context("failed to map guest I/O handle table")?;
         engine
             .mem_map(
-                layout.guest_file_data_base,
-                layout.guest_file_data_size,
+                layout.guest_file_data.base,
+                layout.guest_file_data.size,
                 data_rw,
             )
             .context("failed to map guest file-data arena")?;
         engine
             .mem_map(
-                layout.guest_fls_table_base,
-                layout.guest_fls_table_size,
+                layout.guest_fls_table.base,
+                layout.guest_fls_table.size,
                 data_rw,
             )
             .context("failed to map guest FLS table")?;
         engine
             .mem_write(
-                layout.guest_fls_table_base,
-                &vec![0_u8; layout.guest_fls_table_size],
+                layout.guest_fls_table.base,
+                &vec![0_u8; layout.guest_fls_table.size],
             )
             .context("failed to zero guest FLS table")?;
 
@@ -545,14 +439,14 @@ impl super::RuntimeSession {
         // page must be executable (RWX like the code regions above).
         engine
             .mem_map(
-                layout.guest_stub_data_base,
-                layout.guest_stub_data_size,
+                layout.guest_stub_data.base,
+                layout.guest_stub_data.size,
                 wie_cpu::RwxPerms::ALL,
             )
             .context("failed to map guest stub data page")?;
         let stub_page = crate::guest_stubs::build_stub_data_page();
         engine
-            .mem_write(layout.guest_stub_data_base, &stub_page)
+            .mem_write(layout.guest_stub_data.base, &stub_page)
             .context("failed to write guest stub data page")?;
 
         let stub_cfg = crate::guest_stubs::GuestStubConfig::from_layout(&layout);
@@ -579,9 +473,9 @@ impl super::RuntimeSession {
         // under `WIE_FIXED_CLOCK=1`), then refreshed every host stop so the
         // in-guest clock stubs advance without stopping the host.
         engine
-            .mem_map(layout.clock_table_va, layout.clock_table_size, data_rw)
+            .mem_map(layout.clock_table.base, layout.clock_table.size, data_rw)
             .context("failed to map guest clock table")?;
-        crate::guest_stubs::refresh_clock_table(engine.as_mut(), layout.clock_table_va)
+        crate::guest_stubs::refresh_clock_table(engine.as_mut(), layout.clock_table.base)
             .context("failed to initialize guest clock table")?;
 
         let stub_cfg = crate::guest_stubs::GuestStubConfig::from_layout(&layout);
@@ -592,11 +486,11 @@ impl super::RuntimeSession {
         let mut stop_bitmap = crate::guest_stubs::plant_guest_stubs(
             &mut engine,
             &fake_api_entries,
-            layout.fake_api_base,
-            layout.fake_api_size,
+            layout.fake_api.base,
+            layout.fake_api.size,
             &stub_cfg,
-            layout.guest_io_code_base + 0x600,
-            layout.guest_io_code_size.saturating_sub(0x600),
+            layout.guest_io_code.base + 0x600,
+            layout.guest_io_code.size.saturating_sub(0x600),
         )?;
 
         let guest_io_config = crate::guest_io::install_guest_io(
@@ -608,15 +502,15 @@ impl super::RuntimeSession {
 
         engine
             .mem_map(
-                layout.guest_heap_ctrl_base,
-                layout.guest_heap_ctrl_size,
+                layout.guest_heap_ctrl.base,
+                layout.guest_heap_ctrl.size,
                 data_rw,
             )
             .context("failed to map guest heap control")?;
         engine
             .mem_map(
-                layout.guest_heap_code_base,
-                layout.guest_heap_code_size,
+                layout.guest_heap_code.base,
+                layout.guest_heap_code.size,
                 wie_cpu::RwxPerms::ALL,
             )
             .context("failed to map guest heap code")?;
@@ -630,8 +524,8 @@ impl super::RuntimeSession {
 
         engine
             .mem_map(
-                layout.guest_mbwc_code_base,
-                layout.guest_mbwc_code_size,
+                layout.guest_mbwc_code.base,
+                layout.guest_mbwc_code.size,
                 wie_cpu::RwxPerms::ALL,
             )
             .context("failed to map guest MultiByteToWideChar code")?;
@@ -652,12 +546,13 @@ impl super::RuntimeSession {
                 }
             }
             let heap_end = layout
-                .process_heap_base
-                .saturating_add(layout.process_heap_size as u64);
+                .process_heap
+                .base
+                .saturating_add(layout.process_heap.size as u64);
             engine.configure_jit_fast_path(wie_cpu::JitFastPathConfig {
                 heap: wie_cpu::JitHeapLayout {
                     ctrl_va: guest_heap_cfg.ctrl_va,
-                    base: layout.process_heap_base,
+                    base: layout.process_heap.base,
                     end: heap_end,
                 },
                 pairs,
@@ -668,7 +563,7 @@ impl super::RuntimeSession {
         // instead of paying a per-thread `Vec::clone` of the fake-API bitmap.
         let stop_bitmap: Arc<[u8]> = Arc::from(stop_bitmap.into_boxed_slice());
         engine
-            .install_runtime_hooks(layout.fake_api_base, fake_api_end, Arc::clone(&stop_bitmap))
+            .install_runtime_hooks(layout.fake_api.base, fake_api_end, Arc::clone(&stop_bitmap))
             .context("failed to install persistent runtime hooks")?;
 
         // Selective precompile: in-guest stubs (GetLastError / CS / …) and the
@@ -685,17 +580,18 @@ impl super::RuntimeSession {
 
         engine
             .mem_map(
-                layout.stack_base,
-                layout.stack_size,
+                layout.stack.base,
+                layout.stack.size,
                 wie_cpu::RwxPerms::READ_WRITE,
             )
             .context("failed to map entry stack memory")?;
 
         let stack_size_u64 =
-            u64::try_from(layout.stack_size).context("stack size does not fit u64")?;
+            u64::try_from(layout.stack.size).context("stack size does not fit u64")?;
 
         let stack_top = layout
-            .stack_base
+            .stack
+            .base
             .checked_add(stack_size_u64)
             .context("entry stack top overflow")?;
 
@@ -709,24 +605,24 @@ impl super::RuntimeSession {
 
         engine
             .mem_map(
-                layout.teb_low_base,
-                layout.teb_low_size,
+                layout.teb_low.base,
+                layout.teb_low.size,
                 wie_cpu::RwxPerms::READ_WRITE,
             )
             .context("failed to map fake low TEB page")?;
 
-        let stack_limit = layout.stack_base;
+        let stack_limit = layout.stack.base;
 
         engine
             .mem_write(
-                layout.teb_low_base.wrapping_add(0x08),
+                layout.teb_low.base.wrapping_add(0x08),
                 &stack_top.to_le_bytes(),
             )
             .context("failed to write fake TEB StackBase")?;
 
         engine
             .mem_write(
-                layout.teb_low_base.wrapping_add(0x10),
+                layout.teb_low.base.wrapping_add(0x10),
                 &stack_limit.to_le_bytes(),
             )
             .context("failed to write fake TEB StackLimit")?;
@@ -734,8 +630,8 @@ impl super::RuntimeSession {
         // TEB.Self (x64 offset 0x30) — guest PEB / TLS lookups.
         engine
             .mem_write(
-                layout.teb_low_base.wrapping_add(0x30),
-                &layout.teb_low_base.to_le_bytes(),
+                layout.teb_low.base.wrapping_add(0x30),
+                &layout.teb_low.base.to_le_bytes(),
             )
             .context("failed to write fake TEB Self")?;
 
@@ -746,8 +642,8 @@ impl super::RuntimeSession {
 
         engine
             .mem_map(
-                layout.env_data_base,
-                layout.env_data_size,
+                layout.env_data.base,
+                layout.env_data.size,
                 wie_cpu::RwxPerms::READ_WRITE,
             )
             .context("failed to map entry environment data memory")?;
@@ -767,27 +663,32 @@ impl super::RuntimeSession {
         }
 
         let command_line_a_ptr = layout
-            .env_data_base
+            .env_data
+            .base
             .checked_add(0x100)
             .context("entry command line A pointer overflow")?;
 
         let command_line_w_ptr = layout
-            .env_data_base
+            .env_data
+            .base
             .checked_add(0x200)
             .context("entry command line W pointer overflow")?;
 
         let environment_strings_w_ptr = layout
-            .env_data_base
+            .env_data
+            .base
             .checked_add(0x400)
             .context("entry environment strings W pointer overflow")?;
 
         let module_file_name_a_ptr = layout
-            .env_data_base
+            .env_data
+            .base
             .checked_add(0x700)
             .context("entry module file name A pointer overflow")?;
 
         let module_file_name_w_ptr = layout
-            .env_data_base
+            .env_data
+            .base
             .checked_add(0x800)
             .context("entry module file name W pointer overflow")?;
 
@@ -846,8 +747,8 @@ impl super::RuntimeSession {
 
         engine
             .mem_map(
-                layout.process_heap_base,
-                layout.process_heap_size,
+                layout.process_heap.base,
+                layout.process_heap.size,
                 wie_cpu::RwxPerms::READ_WRITE,
             )
             .context("failed to map fake process heap memory")?;
@@ -855,15 +756,15 @@ impl super::RuntimeSession {
         engine
             .mem_map(
                 layout.process_heap_shadow_base(),
-                layout.process_heap_size,
+                layout.process_heap.size,
                 wie_cpu::RwxPerms::READ_WRITE,
             )
             .context("failed to map fake process heap shadow memory")?;
 
         engine
             .mem_map(
-                layout.resource_data_base,
-                layout.resource_data_size,
+                layout.resource_data.base,
+                layout.resource_data.size,
                 wie_cpu::RwxPerms::READ_WRITE,
             )
             .context("failed to map fake resource memory")?;
@@ -972,8 +873,8 @@ impl super::RuntimeSession {
             file_data_base: guest_io_config.file_data_base,
             file_data_size: guest_io_config.file_data_size,
         });
-        winapi_state.file_io.guest_file_data_next = layout.guest_file_data_base;
-        winapi_state.heap_state.guest_fls_table_va = layout.guest_fls_table_base;
+        winapi_state.file_io.guest_file_data_next = layout.guest_file_data.base;
+        winapi_state.heap_state.guest_fls_table_va = layout.guest_fls_table.base;
         // Empty inject ⇒ live host stdin on ReadFile(STD_INPUT); non-empty
         // inject is deterministic and never blocks on the TTY.
         winapi_state.file_io.stdin_mode = if options.stdin_bytes.is_empty() {

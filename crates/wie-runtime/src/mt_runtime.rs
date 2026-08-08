@@ -213,12 +213,13 @@ fn worker_main(
     let layout = &config.layout;
     let budget = layout.instruction_budget;
     let fake_api_end = layout
-        .fake_api_base
-        .saturating_add(u64::try_from(layout.fake_api_size).unwrap_or(0))
+        .fake_api
+        .base
+        .saturating_add(u64::try_from(layout.fake_api.size).unwrap_or(0))
         .saturating_sub(1);
 
     if let Err(e) = engine.install_runtime_hooks(
-        layout.fake_api_base,
+        layout.fake_api.base,
         fake_api_end,
         config.stop_bitmap.clone(),
     ) {
@@ -264,7 +265,7 @@ fn worker_main(
 
         // Guest compute / iced / JIT: no shared WinAPI mutex.
         let run =
-            match engine.run_until_stop(begin, 0, 0, budget, layout.fake_api_base, fake_api_end) {
+            match engine.run_until_stop(begin, 0, 0, budget, layout.fake_api.base, fake_api_end) {
                 Ok(r) => r,
                 Err(e) => {
                     if mt_debug() {

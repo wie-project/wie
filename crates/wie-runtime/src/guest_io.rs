@@ -75,12 +75,12 @@ pub struct GuestIoConfig {
 impl GuestIoConfig {
     #[must_use]
     pub fn from_layout(layout: &RuntimeMemoryLayout) -> Self {
-        let code_base = layout.guest_io_code_base;
+        let code_base = layout.guest_io_code.base;
         Self {
-            table_va: layout.guest_io_table_base,
+            table_va: layout.guest_io_table.base,
             code_base,
-            file_data_base: layout.guest_file_data_base,
-            file_data_size: layout.guest_file_data_size,
+            file_data_base: layout.guest_file_data.base,
+            file_data_size: layout.guest_file_data.size,
             // Code layout inside the helper region (fixed offsets).
             readfile_impl_va: code_base,
             setfp_impl_va: code_base + 0x200,
@@ -161,8 +161,8 @@ pub(crate) fn install_guest_io(
         engine,
         entries,
         stop_bitmap,
-        fake_api_base: layout.fake_api_base,
-        fake_api_size: layout.fake_api_size,
+        fake_api_base: layout.fake_api.base,
+        fake_api_size: layout.fake_api.size,
     };
     if rewire.read {
         api.rewire("KERNEL32.dll", "ReadFile", config.readfile_impl_va)?;

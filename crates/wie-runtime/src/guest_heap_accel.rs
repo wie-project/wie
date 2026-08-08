@@ -48,13 +48,14 @@ pub struct GuestHeapAccelConfig {
 impl GuestHeapAccelConfig {
     #[must_use]
     pub fn from_layout(layout: &RuntimeMemoryLayout) -> Self {
-        let code = layout.guest_heap_code_base;
+        let code = layout.guest_heap_code.base;
         let heap_end = layout
-            .process_heap_base
-            .saturating_add(layout.process_heap_size as u64);
+            .process_heap
+            .base
+            .saturating_add(layout.process_heap.size as u64);
         Self {
-            ctrl_va: layout.guest_heap_ctrl_base,
-            heap_base: layout.process_heap_base,
+            ctrl_va: layout.guest_heap_ctrl.base,
+            heap_base: layout.process_heap.base,
             heap_end,
             process_heap_handle: layout.process_heap_handle,
             alloc_impl_va: code,
@@ -95,8 +96,8 @@ pub(crate) fn install_guest_heap_accel(
             engine,
             entries,
             stop_bitmap,
-            fake_api_base: layout.fake_api_base,
-            fake_api_size: layout.fake_api_size,
+            fake_api_base: layout.fake_api.base,
+            fake_api_size: layout.fake_api.size,
         };
         api.rewire("KERNEL32.dll", "HeapAlloc", config.alloc_impl_va)?;
         api.rewire("KERNEL32.dll", "HeapFree", config.free_impl_va)?;

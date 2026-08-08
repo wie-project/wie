@@ -26,7 +26,7 @@ impl GuestMbwcConfig {
     #[must_use]
     pub fn from_layout(layout: &RuntimeMemoryLayout) -> Self {
         Self {
-            impl_va: layout.guest_mbwc_code_base,
+            impl_va: layout.guest_mbwc_code.base,
             fallback_va: encode_alias(WinApiId::Kernel32Multibytetowidechar),
         }
     }
@@ -52,8 +52,8 @@ pub(crate) fn install_guest_mbwc(
             engine,
             entries,
             stop_bitmap,
-            fake_api_base: layout.fake_api_base,
-            fake_api_size: layout.fake_api_size,
+            fake_api_base: layout.fake_api.base,
+            fake_api_size: layout.fake_api.size,
         }
         .rewire("KERNEL32.dll", "MultiByteToWideChar", config.impl_va)?;
     }

@@ -122,10 +122,10 @@ fn dialog_callee_vas_resolve_without_imports() {
     );
     // The dialog-result slot lives inside the mapped stub data page.
     assert!(
-        cfg.dialog_result_va >= crate::memory::DEFAULT_LAYOUT.guest_stub_data_base
+        cfg.dialog_result_va >= crate::memory::DEFAULT_LAYOUT.guest_stub_data.base
             && cfg.dialog_result_va
-                < crate::memory::DEFAULT_LAYOUT.guest_stub_data_base
-                    + crate::memory::DEFAULT_LAYOUT.guest_stub_data_size as u64
+                < crate::memory::DEFAULT_LAYOUT.guest_stub_data.base
+                    + crate::memory::DEFAULT_LAYOUT.guest_stub_data.size as u64
     );
     // CLASSIFY_ONLY must differ from the real config (forces the
     // needs_real_guest_addresses re-classification path).
@@ -236,19 +236,19 @@ fn refresh_clock_table_writes_advancing_slots() {
     let layout = crate::memory::DEFAULT_LAYOUT;
     engine
         .mem_map(
-            layout.clock_table_va,
-            layout.clock_table_size,
+            layout.clock_table.base,
+            layout.clock_table.size,
             wie_cpu::RwxPerms::READ_WRITE,
         )
         .expect("map clock table");
 
     let read_slot = |engine: &mut dyn wie_cpu::CpuEngine, slot: u64| -> u64 {
         let mut buf = [0_u8; 8];
-        let _ = engine.mem_read(layout.clock_table_va.saturating_add(slot), &mut buf);
+        let _ = engine.mem_read(layout.clock_table.base.saturating_add(slot), &mut buf);
         u64::from_le_bytes(buf)
     };
 
-    refresh_clock_table(&mut *engine, layout.clock_table_va).expect("first refresh");
+    refresh_clock_table(&mut *engine, layout.clock_table.base).expect("first refresh");
     let first_tick = read_slot(&mut *engine, CLOCK_TABLE_SLOT_TICK64);
     let first_qpc = read_slot(&mut *engine, CLOCK_TABLE_SLOT_QPC);
     assert_eq!(
@@ -258,7 +258,7 @@ fn refresh_clock_table_writes_advancing_slots() {
     );
 
     std::thread::sleep(std::time::Duration::from_millis(10));
-    refresh_clock_table(&mut *engine, layout.clock_table_va).expect("second refresh");
+    refresh_clock_table(&mut *engine, layout.clock_table.base).expect("second refresh");
     let second_tick = read_slot(&mut *engine, CLOCK_TABLE_SLOT_TICK64);
     let second_qpc = read_slot(&mut *engine, CLOCK_TABLE_SLOT_QPC);
 

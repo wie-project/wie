@@ -32,7 +32,7 @@ impl super::RuntimeSession {
     /// guest memory and the host is between quanta here, so no worker runs on
     /// this engine concurrently.
     fn refresh_clock_table(&mut self) {
-        let clock_table_va = self.process.layout().clock_table_va;
+        let clock_table_va = self.process.layout().clock_table.base;
         let _ = crate::guest_stubs::refresh_clock_table(&mut *self.process.engine, clock_table_va);
     }
 
@@ -45,10 +45,11 @@ impl super::RuntimeSession {
         let primary_tid = self.process.primary_tid();
 
         let fake_api_size_u64 =
-            u64::try_from(layout.fake_api_size).context("fake API size does not fit u64")?;
+            u64::try_from(layout.fake_api.size).context("fake API size does not fit u64")?;
 
         let fake_api_end = layout
-            .fake_api_base
+            .fake_api
+            .base
             .checked_add(fake_api_size_u64)
             .context("fake API end overflow")?
             .checked_sub(1)
@@ -146,7 +147,7 @@ impl super::RuntimeSession {
                 0,
                 0,
                 instruction_budget,
-                layout.fake_api_base,
+                layout.fake_api.base,
                 fake_api_end,
             );
             if let Some(t0) = emu_t0 {

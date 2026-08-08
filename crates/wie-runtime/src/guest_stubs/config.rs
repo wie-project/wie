@@ -87,14 +87,14 @@ impl GuestStubConfig {
 
     #[must_use]
     pub(crate) fn from_layout(layout: &crate::memory::RuntimeMemoryLayout) -> Self {
-        let base = layout.guest_stub_data_base;
+        let base = layout.guest_stub_data.base;
         Self {
-            fls_table_va: layout.guest_fls_table_base,
+            fls_table_va: layout.guest_fls_table.base,
             metrics_table_va: base,
             colors_table_va: base + OFFSET_COLORS,
             cwd_blob_va: base + OFFSET_CWD,
-            command_line_a_va: layout.env_data_base + 0x100,
-            command_line_w_va: layout.env_data_base + 0x200,
+            command_line_a_va: layout.env_data.base + 0x100,
+            command_line_w_va: layout.env_data.base + 0x200,
             // The modal-loop callees are WinApiIds with deterministic dense
             // fake VAs; they resolve even when the guest never imported them
             // (the stop bitmap defaults to host-stop everywhere).
@@ -112,7 +112,7 @@ impl GuestStubConfig {
                 wie_winapi::WinApiId::User32Dispatchmessagea,
             ),
             dialog_result_va: base + DIALOG_RESULT_OFFSET,
-            clock_table_va: layout.clock_table_va,
+            clock_table_va: layout.clock_table.base,
             file_dialog_loop_va: base + FILE_DIALOG_LOOP_OFFSET,
             file_dialog_proc_va: base + FILE_DIALOG_PROC_OFFSET,
         }

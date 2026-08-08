@@ -44,7 +44,7 @@ pub use regs::{RegFile, Rflags, ThreadContext};
 pub use simd::{blend_0rgb_4x, fill_0rgb_4x, mask_bgra_to_0rgb, mul_0rgb_4x, stretch_nearest};
 
 /// Guest GS segment base — points to the Thread Environment Block (TEB).
-/// Shared with `wie_runtime::DEFAULT_LAYOUT.teb_low_base`.
+/// Shared with `wie_runtime::DEFAULT_LAYOUT.teb_low.base`.
 pub const GS_BASE: u64 = 0x0000_0000_7EFD_0000;
 
 /// Memory protection flags for [`CpuEngine::mem_map`] (Unicorn-compatible r/w/x bits).
