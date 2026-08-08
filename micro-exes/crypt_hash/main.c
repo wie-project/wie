@@ -1,7 +1,7 @@
 /*
  * Micro-PE CRYPT32.1: real SHA-1 / SHA-256 hashing + host entropy.
  *
- * Freestanding PE64. Drives the host crypt32 handlers end to end:
+ * CRT-linked console program. Drives the host crypt32 handlers end to end:
  * acquire a provider, draw 16 bytes of entropy, hash "abc" with SHA-1
  * and SHA-256, and compare against the published test vectors.
  *
@@ -17,6 +17,7 @@
 
 #include <windows.h>
 #include <wincrypt.h>
+#include <stdio.h>
 
 /* SHA-1("abc") = a9993e364706816aba3e25717850c26c9cd0d89d */
 static const BYTE SHA1_ABC[20] = {
@@ -81,7 +82,7 @@ static int hash_round_trip(HCRYPTPROV h_prov, ALG_ID algid,
     return 1;
 }
 
-void entry(void) {
+int main(void) {
     HCRYPTPROV h_prov = 0;
     HCRYPTHASH h_hash = 0;
     BYTE rand_buf[16];
@@ -89,41 +90,59 @@ void entry(void) {
     DWORD len;
 
     /* 1: acquire a provider (strings NULL → default provider). */
+    printf("crypt_hash: CryptAcquireContextW...\n");
     if (!CryptAcquireContextW(&h_prov, NULL, NULL, PROV_RSA_FULL, 0)) {
-        ExitProcess(1);
+        printf("  FAILED\n");
+        return 1;
     }
+    printf("  ok\n");
 
     /* 2: 16 bytes of real entropy, must not be all zero. */
+    printf("crypt_hash: CryptGenRandom(16)...\n");
     if (!CryptGenRandom(h_prov, sizeof(rand_buf), rand_buf)) {
-        ExitProcess(2);
+        printf("  FAILED\n");
+        return 2;
     }
     if (all_zero(rand_buf, sizeof(rand_buf))) {
-        ExitProcess(2);
+        printf("  FAILED (all zero)\n");
+        return 2;
     }
+    printf("  ok\n");
 
     /* 3–5: SHA-1("abc"). */
+    printf("crypt_hash: SHA-1(\"abc\")...\n");
     if (!CryptCreateHash(h_prov, CALG_SHA1, 0, 0, &h_hash)) {
-        ExitProcess(3);
+        printf("  FAILED (create)\n");
+        return 3;
     }
     if (!CryptHashData(h_hash, (const BYTE *)"abc", 3, 0)) {
-        ExitProcess(4);
+        printf("  FAILED (hash data)\n");
+        return 4;
     }
     len = sizeof(digest);
     if (!CryptGetHashParam(h_hash, HP_HASHVAL, digest, &len, 0)) {
-        ExitProcess(5);
+        printf("  FAILED (get param)\n");
+        return 5;
     }
     if (len != 20 || !memeq(digest, SHA1_ABC, 20)) {
-        ExitProcess(5);
+        printf("  FAILED (digest mismatch)\n");
+        return 5;
     }
     if (!CryptDestroyHash(h_hash)) {
-        ExitProcess(5);
+        printf("  FAILED (destroy)\n");
+        return 5;
     }
+    printf("  matches a9993e364706816aba3e25717850c26c9cd0d89d\n");
 
     /* 6: SHA-256("abc"). */
+    printf("crypt_hash: SHA-256(\"abc\")...\n");
     if (!hash_round_trip(h_prov, CALG_SHA_256, SHA256_ABC, 32)) {
-        ExitProcess(6);
+        printf("  FAILED\n");
+        return 6;
     }
+    printf("  matches ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\n");
 
     CryptReleaseContext(h_prov, 0);
-    ExitProcess(0);
+    printf("crypt_hash: done\n");
+    return 0;
 }

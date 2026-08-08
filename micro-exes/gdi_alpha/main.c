@@ -1,7 +1,7 @@
 // MSIMG32 AlphaBlend micro-test: per-pixel source-alpha compositing between
 // two memory DCs (windowless — pure DIB math, no GUI).
 //
-// Freestanding PE64 (void entry, ExitProcess, no CRT). Exits 0 only when:
+// CRT-linked console program. Exits 0 only when:
 //   1. two compatible DCs + 32-bpp 64x64 DIBs create (else 1)
 //   2. the src DIB is filled with 50%-alpha red and the dst with opaque
 //      black (else 2)
@@ -13,6 +13,7 @@
 
 #include <windows.h>
 #include <wingdi.h>
+#include <stdio.h>
 
 // mingw-w64 does not ship msimg32.h: AlphaBlend / TransparentBlt / GradientFill
 // and the BLENDFUNCTION/TRIVERTEX/GRADIENT_RECT types are declared in wingdi.h
@@ -61,23 +62,27 @@ static HDC make_dib_dc(void **bits_out) {
 
 static void fill_pixels(void *bits, unsigned int color) {
     unsigned int *pixels = (unsigned int *)bits;
-    for (int i = 0; i < SIZE * SIZE; i++) {
+    int i;
+    for (i = 0; i < SIZE * SIZE; i++) {
         pixels[i] = color;
     }
 }
 
-void entry(void) {
+int main(void) {
     // 1. Two compatible DCs + 32-bpp DIBs.
     void *src_bits = NULL;
     HDC src_dc = make_dib_dc(&src_bits);
     HDC dst_dc = make_dib_dc(&g_dst_bits);
     if (src_dc == NULL || dst_dc == NULL || src_bits == NULL || g_dst_bits == NULL) {
-        ExitProcess(1);
+        printf("gdi_alpha: FAILED to create DCs/DIBs\n");
+        return 1;
     }
+    printf("gdi_alpha: DCs + 32-bpp DIBs created\n");
 
     // 2. Src = 50% alpha red (0x80FF0000), dst = opaque black (0xFF000000).
     fill_pixels(src_bits, 0x80FF0000);
     fill_pixels(g_dst_bits, 0xFF000000);
+    printf("gdi_alpha: src filled 50%%-alpha red, dst filled opaque black\n");
 
     // 3. AlphaBlend must succeed. BlendOp = AC_SRC_OVER, constant alpha 255,
     //    AlphaFormat = AC_SRC_ALPHA (per-pixel source alpha).
@@ -87,19 +92,24 @@ void entry(void) {
     bf.SourceConstantAlpha = 255;
     bf.AlphaFormat = AC_SRC_ALPHA;
     if (!AlphaBlend(dst_dc, 0, 0, SIZE, SIZE, src_dc, 0, 0, SIZE, SIZE, bf)) {
-        ExitProcess(3);
+        printf("gdi_alpha: AlphaBlend FAILED\n");
+        return 3;
     }
+    printf("gdi_alpha: AlphaBlend ok\n");
 
     // 4. Blending 50% alpha red over black must leave red > 0 at (0,0).
     {
         unsigned int px = ((unsigned int *)g_dst_bits)[0];
         unsigned int red = (px >> 16) & 0xFF;
+        printf("gdi_alpha: blended pixel (0,0) = 0x%08X (red=%u)\n", px, red);
         if (red == 0) {
-            ExitProcess(4);
+            printf("gdi_alpha: FAILED — no red survived the blend\n");
+            return 4;
         }
     }
 
     DeleteDC(src_dc);
     DeleteDC(dst_dc);
-    ExitProcess(0);
+    printf("gdi_alpha: done\n");
+    return 0;
 }

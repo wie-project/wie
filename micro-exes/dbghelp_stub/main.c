@@ -2,8 +2,9 @@
  * Micro-PE: the DBGHELP symbol flow — SymInitializeW → SymFromAddrW →
  * SymCleanup.
  *
- * WIE loads no symbols: initialization must succeed, a lookup for an
- * arbitrary address must fail gracefully, and cleanup must succeed.
+ * CRT-linked console program. WIE loads no symbols: initialization must
+ * succeed, a lookup for an arbitrary address must fail gracefully, and
+ * cleanup must succeed.
  *
  * Exit codes:
  *   0  — ok
@@ -17,27 +18,38 @@
 
 #include <windows.h>
 #include <dbghelp.h>
+#include <stdio.h>
 
-void entry(void) {
+int main(void) {
   HANDLE process;
   DWORD64 displacement = 0;
-  /* Static storage: zero-filled .bss keeps the micro freestanding (no heap). */
-  static SYMBOL_INFOW symbol;
+  SYMBOL_INFOW symbol;
 
   process = GetCurrentProcess();
-  if (!SymInitializeW(process, NULL, TRUE)) {
-    ExitProcess(1);
-  }
 
+  printf("dbghelp_stub: SymInitializeW...\n");
+  if (!SymInitializeW(process, NULL, TRUE)) {
+    printf("  FAILED\n");
+    return 1;
+  }
+  printf("  ok\n");
+
+  printf("dbghelp_stub: SymFromAddrW(0x140001000)...\n");
   symbol.SizeOfStruct = sizeof(SYMBOL_INFOW);
   symbol.MaxNameLen = sizeof(symbol.Name);
   if (SymFromAddrW(process, 0x140001000, &displacement, &symbol) != 0) {
-    ExitProcess(2);
+    printf("  FAILED — expected graceful miss\n");
+    return 2;
   }
+  printf("  ok (no symbols loaded — lookup fails gracefully)\n");
 
+  printf("dbghelp_stub: SymCleanup...\n");
   if (!SymCleanup(process)) {
-    ExitProcess(3);
+    printf("  FAILED\n");
+    return 3;
   }
+  printf("  ok\n");
 
-  ExitProcess(0);
+  printf("dbghelp_stub: done\n");
+  return 0;
 }

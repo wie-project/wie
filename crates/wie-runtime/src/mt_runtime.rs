@@ -368,6 +368,10 @@ fn worker_main(
 
             if resolved.traits.exit_process() {
                 st.kernel.sync.process_dying = true;
+                // Flush buffered CRT console output (printf/puts buffer in the
+                // guest stream; fwrite bypasses it). Windows flushes stdout at
+                // process exit — without this, trailing printf is lost.
+                st.flush_console();
                 let code = u32::try_from(engine.read_rcx().unwrap_or(0) & 0xffff_ffff).unwrap_or(0);
                 finish_tid(&st, tid, code);
                 return;

@@ -448,6 +448,11 @@ impl super::RuntimeSession {
                                 );
                             }
                             winapi_state.kernel.sync.process_dying = true;
+                            // Flush buffered CRT console output (printf/puts
+                            // buffer in the guest stream; fwrite bypasses it).
+                            // Windows flushes stdout at process exit — without
+                            // this, trailing printf output is silently lost.
+                            winapi_state.flush_console();
                             break_term =
                                 Some(EntryTraceTermination::ExitProcess { code: exit_code });
                             quantum = Quantum::Break;

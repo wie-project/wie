@@ -350,31 +350,31 @@ $(OUT)/libcrypt32api.a: crypt_hash/crypt32api.def | $(OUT)
 	@echo "built $@"
 
 $(OUT)/crypt_hash.exe: crypt_hash/main.c $(OUT)/libcrypt32api.a | $(OUT)
-	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -L$(OUT) -lcrypt32api -lkernel32
+	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $< -L$(OUT) -lcrypt32api
 	@echo "built $@"
 
 # Setup API (SETUPAPI.dll + CFGMGR32.dll): empty device enumeration.
 $(OUT)/setupapi_list.exe: setupapi_list/main.c | $(OUT)
-	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lsetupapi -lkernel32
+	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $< -lsetupapi
 	@echo "built $@"
 
 # Debug helpers (DBGHELP.dll + IMAGEHLP.dll): symbol init / failed lookup / cleanup.
 $(OUT)/dbghelp_stub.exe: dbghelp_stub/main.c | $(OUT)
-	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -ldbghelp -lkernel32
+	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $< -ldbghelp
 	@echo "built $@"
 
 # MSIMG32 (gdi_alpha): AlphaBlend source-alpha compositing onto a DIB.
 gdi_alpha: $(OUT)/gdi_alpha.exe
 
 $(OUT)/gdi_alpha.exe: gdi_alpha/main.c | $(OUT)
-	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lmsimg32 -lgdi32 -lkernel32
+	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $< -lmsimg32 -lgdi32
 	@echo "built $@"
 
 # IMM32 (ime_noop): every IME API returns the benign "no IME" value.
 ime_noop: $(OUT)/ime_noop.exe
 
 $(OUT)/ime_noop.exe: ime_noop/main.c | $(OUT)
-	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -limm32 -lkernel32
+	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $< -limm32
 	@echo "built $@"
 
 # WS2_32 (ws2_echo): single-process loopback TCP echo through the real
@@ -382,7 +382,7 @@ $(OUT)/ime_noop.exe: ime_noop/main.c | $(OUT)
 ws2_echo: $(OUT)/ws2_echo.exe
 
 $(OUT)/ws2_echo.exe: ws2_echo/main.c | $(OUT)
-	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lws2_32 -lkernel32
+	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $< -lws2_32
 	@echo "built $@"
 
 clean:
