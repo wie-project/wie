@@ -9,11 +9,9 @@ use crate::{HandlerContext, WinApiHandlerResult};
 
 /// Dispatch an `IMM32.dll` export by name (case-insensitive).
 pub fn dispatch_imm32(
-    ctx: &mut HandlerContext<'_>,
+    _ctx: &mut HandlerContext<'_>,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
-    let n = name.to_ascii_lowercase();
-    match n.as_str() {
-        _ => Ok(None),
-    }
+    let _ = name;
+    Ok(None)
 }

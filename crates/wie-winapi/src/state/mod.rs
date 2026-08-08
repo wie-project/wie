@@ -115,15 +115,14 @@ pub struct KernelState {
 /// # Adding a new DLL
 ///
 /// 1. Add a variant here.
-/// 2. Add a `None` to the array in [`DllStateMap::new`].
-/// 3. Add a match arm to [`DllStateMap::slot_of`].
-/// 4. Add an accessor on [`WinApiState`].
+/// 2. Add a match arm to [`DllStateMap::slot_of`].
+/// 3. Add an accessor on [`WinApiState`].
 ///
-/// That is the entire change. One file, four lines.
-/// [`DllId::COUNT`] is derived from the number of variants and must match
-/// the `new()` array — the compile-time assertion at [`DLL_ID_SLOT_COUNT`]
-/// catches mismatches.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// That is the entire change. The slot array length derives from
+/// [`DllId::COUNT`] (see the struct definition and `new()`), so a variant
+/// without a slot is a compile error; [`DllId::COUNT`] itself derives from
+/// the number of variants.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, strum::EnumCount)]
 pub enum DllId {
     Console,
     Window,
@@ -137,12 +136,17 @@ pub enum DllId {
     Registry,
     /// The shell drag-drop list behind `WM_DROPFILES` (Task 5.2).
     DragDrop,
+    /// Winsock socket table (`WS2_32.dll` — guest `SOCKET` → host socket).
+    Ws2,
+    /// Crypto provider/hash handles (`CRYPT32.dll`).
+    Crypt32,
 }
 
 impl DllId {
-    /// Number of variants. The assertion at [`DLL_ID_SLOT_COUNT`] ensures
-    /// it stays in sync with the slot array in [`DllStateMap::new`].
-    pub const COUNT: usize = 9;
+    /// Number of variants (strum-derived) — the slot-array length, so a new
+    /// variant automatically grows [`DllStateMap`] and a mismatch is a
+    /// compile error.
+    pub const COUNT: usize = <Self as strum::EnumCount>::COUNT;
 }
 
 /// Lazy DLL state storage. Fixed-size array, zero per-call overhead.
@@ -156,15 +160,16 @@ impl DllId {
 ///
 /// # Adding a new DLL (alongside [`DllId`])
 ///
-/// Add a `None` to the array in `new()` and a match arm to `slot_of`.
-/// Both must stay in sync — the const assertion catches drift.
+/// Add a variant to [`DllId`] and a match arm to `slot_of`. The slot array
+/// length is `DllId::COUNT` in both the struct definition and `new()`, so a
+/// missing slot is a compile error rather than a silent empty slot.
 pub struct DllStateMap {
     slots: [Option<Box<dyn Any + Send>>; DllId::COUNT],
 }
 
 // The struct field `slots: [Option<Box<dyn Any + Send>>; DllId::COUNT]`
-// and the `new()` array literal are kept in sync by the type system:
-// a mismatch in element count is a compile error.
+// and the `new()` initializer share `DllId::COUNT`, so the enum and the
+// array can never drift.
 
 impl Default for DllStateMap {
     fn default() -> Self {
@@ -185,6 +190,8 @@ const fn dll_index(id: DllId) -> usize {
         DllId::Clipboard => 6,
         DllId::Registry => 7,
         DllId::DragDrop => 8,
+        DllId::Ws2 => 9,
+        DllId::Crypt32 => 10,
     }
 }
 
@@ -214,15 +221,18 @@ const fn slot_of(i: usize) -> &'static str {
         6 => "clipboard",
         7 => "registry",
         8 => "dragdrop",
+        9 => "ws2",
+        10 => "crypt32",
         _ => "?",
     }
 }
 
 impl DllStateMap {
-    /// All slots start unloaded. Add a `None` per new [`DllId`] variant.
+    /// All slots start unloaded. `DllId::COUNT` drives the array length, so a
+    /// variant added without a matching slot here is a compile error.
     pub fn new() -> Self {
         Self {
-            slots: [None, None, None, None, None, None, None, None, None],
+            slots: [const { None }; DllId::COUNT],
         }
     }
 
@@ -428,6 +438,19 @@ impl WinApiState {
     pub fn drag_drop(&mut self) -> &mut DragDropState {
         self.dll_states
             .get_or_init::<DragDropState>(DllId::DragDrop)
+    }
+
+    /// Mutable access to the Winsock socket table (guest `SOCKET` → host
+    /// socket). Lazy: allocated on first `WS2_32` call.
+    pub fn ws2(&mut self) -> &mut crate::ws2_32::Ws2State {
+        self.dll_states.get_or_init::<crate::ws2_32::Ws2State>(DllId::Ws2)
+    }
+
+    /// Mutable access to the crypto handle tables. Lazy: allocated on first
+    /// `CRYPT32` call.
+    pub fn crypt32(&mut self) -> &mut crate::crypt32::Crypt32State {
+        self.dll_states
+            .get_or_init::<crate::crypt32::Crypt32State>(DllId::Crypt32)
     }
 
     /// Read-only access — returns `None` if the state was never initialised.

@@ -1312,6 +1312,38 @@ pub fn dispatch_winapi(
     {
         return Ok(r);
     }
+    if library.eq_ignore_ascii_case("ws2_32.dll")
+        && let Some(r) = crate::ws2_32::dispatch_ws2(ctx, name)?
+    {
+        return Ok(r);
+    }
+    if library.eq_ignore_ascii_case("crypt32.dll")
+        && let Some(r) = crate::crypt32::dispatch_crypt32(ctx, name)?
+    {
+        return Ok(r);
+    }
+    if library.eq_ignore_ascii_case("msimg32.dll")
+        && let Some(r) = crate::msimg32::dispatch_msimg32(ctx, name)?
+    {
+        return Ok(r);
+    }
+    if library.eq_ignore_ascii_case("imm32.dll")
+        && let Some(r) = crate::imm32::dispatch_imm32(ctx, name)?
+    {
+        return Ok(r);
+    }
+    if (library.eq_ignore_ascii_case("setupapi.dll")
+        || library.eq_ignore_ascii_case("cfgmgr32.dll"))
+        && let Some(r) = crate::setupapi::dispatch_setupapi(ctx, name)?
+    {
+        return Ok(r);
+    }
+    if (library.eq_ignore_ascii_case("dbghelp.dll")
+        || library.eq_ignore_ascii_case("imagehlp.dll"))
+        && let Some(r) = crate::dbghelp::dispatch_dbghelp(ctx, name)?
+    {
+        return Ok(r);
+    }
     // Mingw runtime DLLs (pthread, libstdc++).
     if library.eq_ignore_ascii_case("libwinpthread-1.dll")
         || library.eq_ignore_ascii_case("libwinpthread-1")

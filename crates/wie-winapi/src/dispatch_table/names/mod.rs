@@ -293,6 +293,95 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
                 | "openfilemappinga"
         );
     }
+    if library.eq_ignore_ascii_case("ws2_32.dll") {
+        let n = name.to_ascii_lowercase();
+        return matches!(
+            n.as_str(),
+            "wsastartup"
+                | "wsacleanup"
+                | "wsagetlasterror"
+                | "wsasetlasterror"
+                | "socket"
+                | "closesocket"
+                | "bind"
+                | "listen"
+                | "accept"
+                | "connect"
+                | "send"
+                | "recv"
+                | "select"
+                | "getaddrinfo"
+                | "freeaddrinfo"
+                | "gethostbyname"
+                | "inet_addr"
+                | "inet_ntoa"
+                | "htons"
+                | "ntohs"
+                | "getsockname"
+                | "getpeername"
+                | "setsockopt"
+                | "getsockopt"
+                | "shutdown"
+                | "ioctlsocket"
+        );
+    }
+    if library.eq_ignore_ascii_case("crypt32.dll") {
+        let n = name.to_ascii_lowercase();
+        return matches!(
+            n.as_str(),
+            "cryptacquirecontexta"
+                | "cryptacquirecontextw"
+                | "cryptreleasecontext"
+                | "cryptgenrandom"
+                | "cryptcreatehash"
+                | "cryptdestroyhash"
+                | "crypthashdata"
+                | "cryptgethashparam"
+        );
+    }
+    if library.eq_ignore_ascii_case("msimg32.dll") {
+        let n = name.to_ascii_lowercase();
+        return matches!(
+            n.as_str(),
+            "alphablend" | "transparentblt" | "gradientfill"
+        );
+    }
+    if library.eq_ignore_ascii_case("imm32.dll") {
+        let n = name.to_ascii_lowercase();
+        return matches!(
+            n.as_str(),
+            "immgetcontext" | "immgetopenstatus" | "immreleasecontext" | "immgetcompositionstringw"
+        );
+    }
+    if library.eq_ignore_ascii_case("setupapi.dll")
+        || library.eq_ignore_ascii_case("cfgmgr32.dll")
+    {
+        let n = name.to_ascii_lowercase();
+        return matches!(
+            n.as_str(),
+            "setupdigetclassdevsw"
+                | "setupdigetclassdevsa"
+                | "setupdienumdeviceinfo"
+                | "setupdidestroydeviceinfolist"
+                | "cm_get_device_id_listw"
+                | "cm_get_device_id_lista"
+        );
+    }
+    if library.eq_ignore_ascii_case("dbghelp.dll")
+        || library.eq_ignore_ascii_case("imagehlp.dll")
+    {
+        let n = name.to_ascii_lowercase();
+        return matches!(
+            n.as_str(),
+            "syminitializew"
+                | "syminitialize"
+                | "symcleanup"
+                | "symfromaddrw"
+                | "symfromaddr"
+                | "mapfileandchecksumw"
+                | "mapfileandchecksuma"
+        );
+    }
     false
 }
 
