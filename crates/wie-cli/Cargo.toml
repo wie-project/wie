@@ -68,7 +68,12 @@ rfd = { version = "0.17", default-features = false }
 # winit's macos backend already enables, plus NSNumber for the copies value.
 # NSPageLayout: the P4 page-setup panel (gui/print.rs) — the macOS
 # OS-equivalent of Windows' PageSetupDlg, edits paper size + orientation.
-objc2-app-kit = { version = "0.2", features = ["NSView", "NSWindow", "NSPrintInfo", "NSPrintPanel", "NSPageLayout", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSPrintOperation", "NSGraphics"] }
+# NSAlert/NSButton: the pre-window MessageBox fallback (gui/app.rs) — a
+# MessageBox raised before the first frame created a winit window must not
+# take rfd's unparented CFUserNotificationDisplayAlert path (it prints a
+# "will block waiting for a response" line on the main thread), so it shows
+# a bare NSAlert instead.
+objc2-app-kit = { version = "0.2", features = ["NSView", "NSWindow", "NSPrintInfo", "NSPrintPanel", "NSPageLayout", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSPrintOperation", "NSGraphics", "NSAlert", "NSButton"] }
 objc2 = { version = "0.5", default-features = false, features = ["std", "alloc"] }
 objc2-foundation = { version = "0.2", default-features = false, features = [
     "dispatch",

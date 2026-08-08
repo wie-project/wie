@@ -869,6 +869,78 @@ fn map_alert_result(result: rfd::MessageDialogResult) -> i32 {
     }
 }
 
+/// Show a MessageBox with NO parent winit window via a direct NSAlert.
+///
+/// rfd's unparented `MessageDialog::show()` falls back to the legacy
+/// `CFUserNotificationDisplayAlert` API on macOS, which prints a
+/// "called from main application thread, will block waiting for a response"
+/// line to stderr. A bare NSAlert (the same modern API rfd uses internally
+/// once a parent exists) never touches that path — a MessageBox raised
+/// before the first frame created a winit window stays silent.
+#[cfg(target_os = "macos")]
+#[expect(unsafe_code)]
+fn show_unparented_ns_alert(caption: &str, text: &str, mb_type: u32) -> i32 {
+    use objc2_app_kit::{
+        NSAlert, NSAlertFirstButtonReturn, NSAlertSecondButtonReturn, NSAlertStyle,
+        NSAlertThirdButtonReturn,
+    };
+    use objc2_foundation::{NSString, run_on_main};
+
+    let (buttons, level) = map_message_box_buttons(mb_type);
+    run_on_main(|mtm| {
+        // SAFETY: `new(mtm)` is the main-thread-only constructor (NSAlert is
+        // a MainThreadOnly class); the returned Retained owns the alert.
+        let alert = unsafe { NSAlert::new(mtm) };
+        // SAFETY: plain property setters on the owned alert.
+        unsafe {
+            alert.setMessageText(&NSString::from_str(caption));
+            alert.setInformativeText(&NSString::from_str(text));
+            let style = match level {
+                rfd::MessageLevel::Error => NSAlertStyle::Critical,
+                rfd::MessageLevel::Warning => NSAlertStyle::Warning,
+                rfd::MessageLevel::Info => NSAlertStyle::Informational,
+            };
+            alert.setAlertStyle(style);
+        }
+        // First added button is the default (rightmost, Enter). The order
+        // mirrors the Win32 button set so the response index maps to the id.
+        let titles: &[&str] = match buttons {
+            rfd::MessageButtons::Ok => &["OK"],
+            rfd::MessageButtons::OkCancel => &["OK", "Cancel"],
+            rfd::MessageButtons::YesNoCancel => &["Yes", "No", "Cancel"],
+            rfd::MessageButtons::YesNo => &["Yes", "No"],
+            // Unknown button bits fall back to Ok (matching real MessageBox).
+            _ => &["OK"],
+        };
+        for title in titles {
+            // SAFETY: appends a button to the owned alert; the returned
+            // Retained<NSButton> is dropped (the alert retains it).
+            unsafe {
+                let _ = alert.addButtonWithTitle(&NSString::from_str(title));
+            }
+        }
+        // SAFETY: runModal on the main thread (we are inside run_on_main)
+        // blocks until the user clicks — MessageBox semantics; the guest
+        // thread is blocked in the bridge.
+        let response = unsafe { alert.runModal() };
+        if response == NSAlertFirstButtonReturn {
+            match buttons {
+                rfd::MessageButtons::YesNo | rfd::MessageButtons::YesNoCancel => IDYES,
+                _ => IDOK,
+            }
+        } else if response == NSAlertSecondButtonReturn {
+            match buttons {
+                rfd::MessageButtons::YesNo | rfd::MessageButtons::YesNoCancel => IDNO,
+                _ => IDCANCEL,
+            }
+        } else if response == NSAlertThirdButtonReturn {
+            IDCANCEL
+        } else {
+            IDCANCEL
+        }
+    })
+}
+
 /// Resolve the winit window a native dialog (MessageBox, file panel) should
 /// parent to.
 ///
@@ -1106,11 +1178,12 @@ pub fn run_gui_windowed(
                         // modern NSAlert API (dispatched to the main thread;
                         // the guest thread blocks until the user clicks —
                         // MessageBox semantics) and maps the result to the
-                        // Win32 id. With no parent, rfd falls back to the
-                        // legacy CFUserNotificationDisplayAlert path, which
-                        // prints "will block waiting for a response" on the
-                        // main thread — the window slots below switch to
-                        // NSAlert once a winit window exists.
+                        // Win32 id. With no parent (a MessageBox raised before
+                        // the first frame created a winit window), rfd would
+                        // fall back to the legacy CFUserNotificationDisplayAlert
+                        // path, which prints "will block waiting for a
+                        // response" on the main thread — use a bare NSAlert
+                        // instead (the same modern API, no legacy print).
                         #[cfg(target_os = "macos")]
                         handle.set_message_box_bridge(Box::new({
                             let handle = handle.clone();
@@ -1120,19 +1193,20 @@ pub fn run_gui_windowed(
                                     target: "wiegui",
                                     "MessageBox: {caption}: {text} (type 0x{mb_type:x})"
                                 );
-                                let (buttons, level) = map_message_box_buttons(mb_type);
                                 // Parent to the FOCUSED (or primary) window's
                                 // slot — a MessageBox raised while a second
                                 // top-level is active parents to THAT window,
                                 // not the first one (the per-window slot fix).
                                 // set_parent consumes the builder, so apply it
                                 // before the chain.
-                                let parent = resolve_dialog_parent(&handle, &window_slots);
-                                let mut dialog = rfd::MessageDialog::new();
-                                if let Some(parent) = &parent {
-                                    dialog = dialog.set_parent(parent.as_ref());
-                                }
-                                let result = dialog
+                                let Some(parent) =
+                                    resolve_dialog_parent(&handle, &window_slots)
+                                else {
+                                    return show_unparented_ns_alert(caption, text, mb_type);
+                                };
+                                let (buttons, level) = map_message_box_buttons(mb_type);
+                                let result = rfd::MessageDialog::new()
+                                    .set_parent(parent.as_ref())
                                     .set_title(caption.to_owned())
                                     .set_description(text.to_owned())
                                     .set_level(level)
