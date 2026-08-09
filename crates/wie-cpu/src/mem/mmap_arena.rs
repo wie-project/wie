@@ -48,6 +48,13 @@ impl MmapArenaBackend {
         self.arenas.arena_guest_base_for_va(va)
     }
 
+    /// True when every host frame in `[address, end)` is at the mmap default
+    /// (RW) per the per-frame host-prot cache. Pure lookups, no syscalls.
+    #[must_use]
+    pub(super) fn span_all_frames_default_rw(&self, address: u64, end: u64) -> bool {
+        self.arenas.span_all_frames_default_rw(address, end)
+    }
+
     /// MEM_RELEASE: munmap exact reservation arena.
     pub(super) fn unmap_range(&mut self, address: u64, size: usize) {
         self.arenas.unmap_exact(address, size);

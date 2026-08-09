@@ -280,10 +280,19 @@ impl super::RuntimeSession {
         options: SessionOptions,
     ) -> Result<Self> {
         let t_init = Instant::now();
+        let mut phase = |name: &str, t0: Instant| {
+            tracing::debug!(
+                phase = name,
+                ms = t0.elapsed().as_secs_f64() * 1e3,
+                "init phase"
+            );
+            Instant::now()
+        };
         // Env heap override applies even when callers pass `DEFAULT_LAYOUT` explicitly
         // (CLI / tests). Callers that need a fixed size should set a non-default size
         // after `with_env_overrides`, or clear the env var.
         let layout = layout.with_env_overrides();
+        let mut t_phase = Instant::now();
         let mut soft_apis = SoftApiTable::default();
         // Plant Interlocked* (and other soft-only GPA targets) at fixed soft
         // indices 0..N so GetProcAddress encode_unresolved matches.
@@ -309,6 +318,7 @@ impl super::RuntimeSession {
             .context("failed to extract PE identity")?;
         let image_size =
             usize::try_from(identity.size_of_image).context("size_of_image does not fit usize")?;
+        t_phase = phase("pe-read-parse", t_phase);
 
         // WIE CPU backend (JIT default; `WIE_CPU=iced` for interpreter).
         let backend = wie_cpu::open_cpu().context("failed to open WIE CPU backend")?;
@@ -316,6 +326,7 @@ impl super::RuntimeSession {
             wie_cpu::CpuBackend::Jit { engine, shared } => (engine, Some(shared), None),
             wie_cpu::CpuBackend::Iced { engine, guest_mem } => (engine, None, Some(guest_mem)),
         };
+        t_phase = phase("backend-open", t_phase);
 
         // One MEM_IMAGE arena, temporary RWX — headers/sections/IAT are written
         // directly into guest memory (no intermediate Vec<u8> buffer).
@@ -378,6 +389,7 @@ impl super::RuntimeSession {
 
         apply_pe_section_protects(engine.as_mut(), &pe_map_plan)
             .context("failed to apply PE section protects")?;
+        t_phase = phase("image-load+protects", t_phase);
 
         engine
             .mem_map(
@@ -535,6 +547,7 @@ impl super::RuntimeSession {
             &mut stop_bitmap,
             &layout,
         )?;
+        t_phase = phase("stub-planting+accelerators", t_phase);
 
         // JIT: direct UCRT imports (malloc/memcpy/strlen/…) + guest heap layout.
         // Dense: small VA→kind table from soft/IAT names (no runtime HashMap probe on stop).
@@ -577,6 +590,7 @@ impl super::RuntimeSession {
             }
         }
         engine.precompile_at(image_summary.entry_point_va);
+        t_phase = phase("precompile", t_phase);
 
         engine
             .mem_map(
@@ -598,6 +612,7 @@ impl super::RuntimeSession {
         let initial_rsp = stack_top
             .checked_sub(0x1008)
             .context("entry initial RSP underflow")?;
+        t_phase = phase("stack-map", t_phase);
 
         engine
             .write_rsp(initial_rsp)
@@ -691,6 +706,7 @@ impl super::RuntimeSession {
             .base
             .checked_add(0x800)
             .context("entry module file name W pointer overflow")?;
+        t_phase = phase("teb+crt+env-addrs", t_phase);
 
         // Effective volume roots: explicit session options win, else `WIE_ROOT`
         // / `WIE_DRIVE_D`, else the global app-data bottle. The identity is
@@ -744,6 +760,7 @@ impl super::RuntimeSession {
         engine
             .mem_write(environment_strings_w_ptr, &environment_strings_w)
             .context("failed to write entry UTF-16 environment strings")?;
+        t_phase = phase("identity+env-strings", t_phase);
 
         engine
             .mem_map(
@@ -768,6 +785,7 @@ impl super::RuntimeSession {
                 wie_cpu::RwxPerms::READ_WRITE,
             )
             .context("failed to map fake resource memory")?;
+        t_phase = phase("heap+resource-maps", t_phase);
 
         // Register named layout and PE section ranges.
         register_layout_regions(
@@ -777,6 +795,7 @@ impl super::RuntimeSession {
             image_summary.image_size,
             Some(&pe_map_plan),
         );
+        t_phase = phase("regions-registered", t_phase);
 
         let environment = default_winapi_environment(
             &layout,
@@ -787,10 +806,12 @@ impl super::RuntimeSession {
             module_file_name_a_ptr,
             module_file_name_w_ptr,
         );
+        t_phase = phase("regions+env", t_phase);
 
         let executable_file_bytes = pe_bytes.clone();
 
         let mut winapi_state = default_winapi_state(&layout, executable_file_bytes, &process)?;
+        t_phase = phase("winapi-state", t_phase);
         // `default_winapi_state` built its volume config from the environment;
         // re-apply the effective roots so the state's volumes agree with the
         // identity derived above (an explicit `SessionOptions` root overrides
@@ -803,6 +824,7 @@ impl super::RuntimeSession {
         winapi_state.file_io.volumes = volumes;
         winapi_state.file_io.bottle_root = bottle_root;
         let _ = wie_winapi::seed_default_skeleton(&effective_root);
+        t_phase = phase("seed-skeleton", t_phase);
         // Register the primary thread kernel object so DuplicateHandle
         // can resolve GetCurrentThread/GetCurrentProcess pseudohandles.
         {
@@ -919,6 +941,7 @@ impl super::RuntimeSession {
             GuestVa(image_summary.entry_point_va),
             GuestStackPtr(initial_rsp),
         ));
+        t_phase = phase("winapi-state+session", t_phase);
         if session.profile_enabled {
             session.profile.set_init_ns(t_init.elapsed().as_nanos());
             session.profile.set_mem_backend(

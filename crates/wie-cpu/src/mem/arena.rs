@@ -13,7 +13,9 @@
 )]
 
 use super::backend::{PAGE_SIZE, PAGE_SIZE_USIZE};
+use super::vad::align_down;
 use crate::CpuError;
+use ahash::HashMapExt; // ahash::HashMap::new is not an inherent method on the alias
 
 /// One contiguous anonymous mapping covering a guest VA range.
 pub(super) struct MmapArena {
@@ -25,6 +27,12 @@ pub(super) struct MmapArena {
     host: *mut u8,
     /// Software permission bits (may apply `mprotect`).
     perms: u32,
+    /// Last host `mprotect` applied per host frame (guest frame VA → prot).
+    ///
+    /// Absent = the `mmap` default (`PROT_READ | PROT_WRITE`), so a freshly
+    /// mapped arena needs zero syscalls: `sync_host_protect` recomputes the
+    /// same RW for uniform RW pages and we skip the no-op call.
+    host_prot: ahash::HashMap<u64, i32>,
 }
 
 // SAFETY: arenas are only accessed through exclusive/shared borrows on the
@@ -87,6 +95,7 @@ impl MmapArena {
             size,
             host: ptr.cast(),
             perms,
+            host_prot: ahash::HashMap::new(),
         })
     }
 
@@ -250,6 +259,51 @@ impl ArenaSet {
             .unwrap_or(self.arenas.len());
         self.arenas.insert(pos, arena);
         Ok(())
+    }
+
+    /// True when every host frame in `[address, end)` is at the `mmap` default
+    /// (RW): never touched (absent from the per-frame cache) or explicitly RW.
+    ///
+    /// Pure cache lookups — no syscalls. Used by `sync_host_protect`'s fast
+    /// path to skip the per-frame walk when the whole span is fresh RW: if any
+    /// frame was ever tightened (cached as non-RW), the fast path must not
+    /// skip, because the host mapping may still be tighter than RW.
+    pub(super) fn span_all_frames_default_rw(&self, address: u64, end: u64) -> bool {
+        if end <= address {
+            return true;
+        }
+        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        let host_ps = {
+            let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            if n > 0 {
+                u64::try_from(n).unwrap_or(PAGE_SIZE)
+            } else {
+                PAGE_SIZE
+            }
+        };
+        if host_ps == 0 {
+            return false;
+        }
+        let mut va = address;
+        while va < end {
+            let Some(arena_base) = self.arena_guest_base_for_va(va) else {
+                return false;
+            };
+            let off = va.saturating_sub(arena_base);
+            let frame_guest = arena_base.saturating_add(align_down(off, host_ps));
+            let Some(arena) = self.find_va(frame_guest) else {
+                return false;
+            };
+            if arena.host_prot.get(&frame_guest).copied().unwrap_or(rw) != rw {
+                return false;
+            }
+            let next = frame_guest.saturating_add(host_ps);
+            if next <= va {
+                return false;
+            }
+            va = next;
+        }
+        true
     }
 
     /// Host base of page `page_key` if mapped in some arena.
@@ -508,9 +562,30 @@ impl ArenaSet {
         if off_usize.saturating_add(size) > arena.size() {
             return Ok(());
         }
+        // Skip the syscall when this frame already carries the requested host
+        // protection. Absent from the cache means the frame was never synced,
+        // so it is still at the `mmap` default (RW) — a freshly mapped arena
+        // therefore pays zero syscalls, which matters for the 512 MiB process
+        // heap + shadow at session init (previously ~65K no-op mprotect calls
+        // ≈ 36 ms of startup). A frame that was ever tightened is always
+        // inserted, so "absent" is unambiguous.
+        let mmap_default = libc::PROT_READ | libc::PROT_WRITE;
+        if arena
+            .host_prot
+            .get(&address)
+            .copied()
+            .unwrap_or(mmap_default)
+            == prot
+        {
+            return Ok(());
+        }
         // SAFETY: host came from mmap of arena.size; offset+size host-page aligned in arena.
         let rc = unsafe { libc::mprotect(arena.host().add(off_usize).cast(), size, prot) };
-        if rc == 0 { Ok(()) } else { Err(()) }
+        if rc != 0 {
+            return Err(()); // host state unchanged — retry on the next sync
+        }
+        arena.host_prot.insert(address, prot);
+        Ok(())
     }
 
     /// Zero host bytes in `[address, address+size)` without munmap (MEM_DECOMMIT).

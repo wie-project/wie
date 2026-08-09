@@ -2,6 +2,7 @@
 //! `VirtualProtect` / `VirtualQuery` plus the private `va_*` reserve / commit /
 //! decommit / release helpers and the allocation-span VAD query.
 
+use super::backend::PAGE_SHIFT;
 use super::{
     ERROR_INVALID_ADDRESS, ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY,
     GUEST_ALLOC_GRANULARITY, GuestMemBackend, MEM_COMMIT, MEM_DECOMMIT, MEM_FREE, MEM_RELEASE,
@@ -262,6 +263,19 @@ impl super::GuestMemory {
         }
         let host_ps_u64 = u64::try_from(host_ps).unwrap_or(PAGE_SIZE);
         let end = address.saturating_add(u64::try_from(size).unwrap_or(0));
+        // Fast path: host mprotect only ever *tightens* non-writable pages
+        // (see host_prot_for_frame). A span that is entirely committed-writable
+        // is therefore already at the mmap default (RW) — no syscalls at all.
+        // This is the session-init case: the 512 MiB process heap + shadow map
+        // as one committed RW run, so the per-frame walk below would otherwise
+        // touch ~65K frames. The cache must agree that no frame in the span
+        // was ever tightened — otherwise an earlier VirtualProtect left the
+        // host at R while the page map says writable.
+        if self.span_all_committed_writable(address, end)
+            && self.backend.span_all_frames_default_rw(address, end)
+        {
+            return;
+        }
         let mut va = address;
         while va < end {
             let Some(arena_base) = self.backend.arena_guest_base_for_va(va) else {
@@ -283,6 +297,31 @@ impl super::GuestMemory {
                 va = next;
             }
         }
+    }
+
+    /// True when every guest page in `[address, end)` is committed and writable.
+    ///
+    /// Run-based: each `lookup` returns a whole run, so this is O(runs) not
+    /// O(pages) — a freshly mapped 512 MiB heap is a single committed RW run.
+    fn span_all_committed_writable(&self, address: u64, end: u64) -> bool {
+        if end <= address {
+            return true;
+        }
+        let mut page = address >> PAGE_SHIFT;
+        let last_page = end.saturating_sub(1) >> PAGE_SHIFT;
+        while page <= last_page {
+            let Some(run) = self.pages.lookup(page) else {
+                return false;
+            };
+            if run.state != PageState::Committed || !run.protect.allows_write() {
+                return false;
+            }
+            if run.end_page <= page {
+                return false;
+            }
+            page = run.end_page;
+        }
+        true
     }
 
     /// Host PROT flags for one host page frame covering `frame`..`frame+host_ps`.
