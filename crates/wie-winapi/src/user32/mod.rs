@@ -286,6 +286,7 @@ pub(crate) const COLOR_3DDKSHADOW: u32 = 21;
 pub(crate) const COLOR_INFOBK: u32 = 24;
 
 pub mod accel;
+mod charfmt;
 pub mod controls;
 pub mod dc;
 pub mod dialog;
@@ -798,10 +799,14 @@ pub(crate) fn is_known_window(state: &mut WinApiState, handle: u64) -> bool {
 }
 
 /// Soft dispatch for USER32 exports beyond the dense table (enumeration,
-/// caret, icon helpers). String path only — hot APIs stay dense.
+/// caret, icon helpers, char/format helpers). String path only — hot APIs
+/// stay dense.
 pub fn dispatch_user32_extra(
     ctx: &mut HandlerContext<'_>,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
-    enum_caret::dispatch_enum_caret(ctx, name)
+    if let Some(result) = enum_caret::dispatch_enum_caret(ctx, name)? {
+        return Ok(Some(result));
+    }
+    charfmt::dispatch_charfmt(ctx, name)
 }

@@ -14,9 +14,9 @@ LDFLAGS  := -nostdlib -Wl,--subsystem,console -Wl,--entry,entry
 # Ordinary CRT-linked apps (independent-style): full toolchain defaults.
 CRT_CFLAGS := -O2
 
-.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes dll_tests game_exes interactive_exes ucrt_coverage gui_exes print_bmp version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo http_get ole_com shell_folders reg_roundtrip user32_enum gdi_regions comctl_toolbar winmm_audio
+.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes dll_tests game_exes interactive_exes ucrt_coverage gui_exes print_bmp version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo http_get ole_com shell_folders reg_roundtrip user32_enum user32_char gdi_regions comctl_toolbar winmm_audio
 
-all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes game_exes interactive_exes dll_tests ucrt_coverage gui_exes version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo http_get ole_com shell_folders reg_roundtrip user32_enum gdi_regions comctl_toolbar winmm_audio
+all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes game_exes interactive_exes dll_tests ucrt_coverage gui_exes version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo http_get ole_com shell_folders reg_roundtrip user32_enum user32_char gdi_regions comctl_toolbar winmm_audio
 
 $(OUT):
 	mkdir -p $(OUT)
@@ -422,6 +422,13 @@ $(OUT)/reg_roundtrip.exe: reg_roundtrip/main.c | $(OUT)
 user32_enum: $(OUT)/user32_enum.exe
 
 $(OUT)/user32_enum.exe: user32_enum/main.c | $(OUT)
+	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $< -luser32
+	@echo "built $@"
+
+# USER32 (user32_char): CharUpperW/CharPrevExA/wsprintfW + trivial no-ops.
+user32_char: $(OUT)/user32_char.exe
+
+$(OUT)/user32_char.exe: user32_char/main.c | $(OUT)
 	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $< -luser32
 	@echo "built $@"
 

@@ -247,8 +247,11 @@ const OLEAUT32_DLL_EXPORTS: &[&str] = &[
 
 /// Soft-dispatched `user32.dll` exports (mirror of the `dispatch_*` fallback arms).
 const USER32_DLL_EXPORTS: &[&str] = &[
+    "charprevexa",
+    "charupperw",
     "createcaret",
     "destroycaret",
+    "dialogboxparamw",
     "drawicona",
     "drawiconex",
     "drawiconw",
@@ -259,7 +262,10 @@ const USER32_DLL_EXPORTS: &[&str] = &[
     "getcaretpos",
     "hidecaret",
     "setcaretpos",
+    "setprocessdefaultlayout",
     "showcaret",
+    "winhelpw",
+    "wsprintfw",
 ];
 
 /// Soft-dispatched `gdi32.dll` exports (mirror of the `dispatch_*` fallback arms).

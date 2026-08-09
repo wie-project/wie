@@ -1,5 +1,6 @@
 use crate::guest_memory::{
-    checked_address, read_u64, write_u32 as write_guest_u32, write_u64 as write_guest_u64,
+    checked_address, read_bytes, read_u32, read_u64, write_u32 as write_guest_u32,
+    write_u64 as write_guest_u64,
 };
 use crate::guest_string::{
     read_ansi_lossy as read_guest_ansi_lossy, read_utf16_lossy as read_guest_utf16_lossy,
@@ -272,8 +273,58 @@ pub fn dispatch_advapi32_extra(
         "systemfunction036" => Ok(Some(handle_system_function036(ctx)?)),
         "getfilesecurityw" | "getfilesecuritya" => Ok(Some(handle_get_file_security(ctx)?)),
         "setfilesecurityw" | "setfilesecuritya" => Ok(Some(handle_set_file_security(ctx)?)),
+        "istextunicode" => Ok(Some(handle_istextunicode(ctx)?)),
         _ => Ok(None),
     }
+}
+
+/// Handles `ADVAPI32.dll!IsTextUnicode` — KISS subset: BOM signatures
+/// (0xFFFE/0xFEFF), null-byte density, odd length, ASCII16 (even-position bytes
+/// all zero) and the classic odd/even byte-sum divergence heuristic (4x
+/// threshold) for STATISTICS. The full flag word is ANDed with the caller's
+/// in-mask before writing `*lpiResult`; the return value reflects the unmasked
+/// determination.
+pub fn handle_istextunicode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let (buf, lpi) = (engine.read_rcx()?, engine.read_r8()?);
+    let n = usize::try_from((engine.read_rdx()? & 0xffff_ffff).min(0x1_0000)).unwrap_or(0);
+    let mut b = vec![0_u8; n];
+    let mut f = 0_u32;
+    if buf != 0 && n > 0 {
+        read_bytes(engine, buf, &mut b)?;
+        if b.starts_with(&[0xff, 0xfe]) {
+            f |= 0x0008;
+        }
+        if b.starts_with(&[0xfe, 0xff]) {
+            f |= 0x0080;
+        }
+        if n & 1 == 1 {
+            f |= 0x0200;
+        }
+        if b.iter().filter(|x| **x == 0).count() >= 2 {
+            f |= 0x1000;
+        }
+        let e = b.iter().step_by(2).map(|&x| u64::from(x)).sum::<u64>();
+        let o = b
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .map(|&x| u64::from(x))
+            .sum::<u64>();
+        if e >= o * 4 {
+            f |= 0x0002;
+        } else if o > e * 4 {
+            f |= 0x0020;
+        }
+        if e == 0 {
+            f |= 0x0001;
+        }
+    }
+    if lpi != 0 {
+        let m = read_u32(engine, lpi)?;
+        write_guest_u32(engine, lpi, f & m)?;
+    }
+    return_bool(engine, f != 0)
 }
 
 const FAKE_PROCESS_TOKEN: u64 = 0x0000_0000_7000_0001;
