@@ -280,7 +280,7 @@ impl super::RuntimeSession {
         options: SessionOptions,
     ) -> Result<Self> {
         let t_init = Instant::now();
-        let mut phase = |name: &str, t0: Instant| {
+        let phase = |name: &str, t0: Instant| {
             tracing::debug!(
                 phase = name,
                 ms = t0.elapsed().as_secs_f64() * 1e3,
@@ -584,9 +584,15 @@ impl super::RuntimeSession {
         // Full .text section precompile is deferred — precompiling every fake-API
         // VA spikes init peak RAM, and precompiling large sections adds startup
         // time disproportionate to the interpreted warmup saved.
+        //
+        // Stubs go to the background compiler (deferred): the guest cannot call
+        // any stub until it starts executing, so the Cranelift work overlaps
+        // with the entry-point run instead of blocking session init. Only the
+        // entry point compiles synchronously — the very first block must be
+        // ready before the guest runs.
         for entry in &fake_api_entries {
             if entry.traits.guest_stub() {
-                engine.precompile_at(entry.fake_target_va);
+                engine.precompile_deferred_at(entry.fake_target_va);
             }
         }
         engine.precompile_at(image_summary.entry_point_va);
@@ -941,7 +947,7 @@ impl super::RuntimeSession {
             GuestVa(image_summary.entry_point_va),
             GuestStackPtr(initial_rsp),
         ));
-        t_phase = phase("winapi-state+session", t_phase);
+        let _ = phase("winapi-state+session", t_phase);
         if session.profile_enabled {
             session.profile.set_init_ns(t_init.elapsed().as_nanos());
             session.profile.set_mem_backend(

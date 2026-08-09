@@ -302,6 +302,15 @@ pub trait CpuEngine: Send {
     /// No-op for non-JIT backends or when the block is not compilable.
     fn precompile_at(&mut self, _address: u64) {}
 
+    /// Eagerly compile guest code at `address`, without blocking the caller.
+    ///
+    /// For JIT backends this enqueues the block to the background compiler so
+    /// the guest can start running while the compile overlaps with its first
+    /// instructions; the block lands in the cache when done. The entry point
+    /// should still use [`Self::precompile_at`] so the very first guest block
+    /// runs compiled. No-op for non-JIT backends.
+    fn precompile_deferred_at(&mut self, _address: u64) {}
+
     /// Snapshot of CPU/JIT diagnostics (empty for non-JIT backends).
     fn cpu_stats(&self) -> Option<JitStats> {
         None

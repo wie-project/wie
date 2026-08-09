@@ -262,6 +262,34 @@ impl CpuEngine for JitCpu {
         }
     }
 
+    fn precompile_deferred_at(&mut self, address: u64) {
+        if !self.shared.engine_ready.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(hook) = self.thread.hooks.as_ref()
+            && hook.should_host_stop(address)
+        {
+            return;
+        }
+        // Decode once here, then hand the block to the background compiler so
+        // session init does not block on Cranelift. The guest cannot reach the
+        // stub until it starts executing, so the compile overlaps with the
+        // entry-point run; the miss path waits (bounded) if it is not done.
+        let kind = {
+            let mem = self.shared.mem.read().unwrap();
+            super::block::decode_pure_gpr_block(&mem, self.thread.hooks.as_ref(), address)
+        };
+        match self.enqueue_bg(address, &kind) {
+            super::shared::BgEnqueueOutcome::Queued(_) | super::shared::BgEnqueueOutcome::Ready => {
+            }
+            super::shared::BgEnqueueOutcome::Unavailable => {
+                // Worker absent or queue full: compile inline (same fallback
+                // the hot miss path uses) so the stub is still prewarmed.
+                self.precompile_at(address);
+            }
+        }
+    }
+
     fn run_until_stop(
         &mut self,
         begin: u64,
