@@ -260,6 +260,10 @@ pub fn dispatch_advapi32_extra(
         "regenumkeyexw" | "regenumkeyexa" => Ok(Some(handle_reg_enum_key_ex(ctx)?)),
         "regenumvaluew" | "regenumvaluea" => Ok(Some(handle_reg_enum_value(ctx)?)),
         "regdeletevaluew" => Ok(Some(handle_reg_delete_value_w(ctx)?)),
+        "regdeletekeyw" => Ok(Some(handle_reg_delete_key_w(ctx)?)),
+        "regdeletekeya" => Ok(Some(handle_reg_delete_key_a(ctx)?)),
+        "regflushkey" => Ok(Some(handle_reg_flush_key(ctx)?)),
+        "regsavekeyw" | "regsavekeya" => Ok(Some(handle_reg_save_key(ctx)?)),
         "openprocesstoken" => Ok(Some(handle_open_process_token(ctx)?)),
         "adjusttokenprivileges" => Ok(Some(handle_adjust_token_privileges(ctx)?)),
         "lookupprivilegevaluew" | "lookupprivilegevaluea" => {
@@ -660,6 +664,102 @@ fn delete_registry_value(
             ERROR_FILE_NOT_FOUND
         },
     )
+}
+
+/// Handles `ADVAPI32.dll!RegDeleteKeyW`.
+pub fn handle_reg_delete_key_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let parent = engine.read_rcx().context("RegDeleteKeyW RCX")?;
+    let subkey_va = engine.read_rdx().context("RegDeleteKeyW RDX")?;
+    let subkey = read_optional_utf16_string(engine, subkey_va)?;
+    delete_registry_key(engine, state, parent, &subkey)
+}
+
+/// Handles `ADVAPI32.dll!RegDeleteKeyA`.
+pub fn handle_reg_delete_key_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let parent = engine.read_rcx().context("RegDeleteKeyA RCX")?;
+    let subkey_va = engine.read_rdx().context("RegDeleteKeyA RDX")?;
+    let subkey = read_optional_ansi_string(engine, subkey_va)?;
+    delete_registry_key(engine, state, parent, &subkey)
+}
+
+/// Shared `RegDeleteKey` body: drops every handle record resolving to the
+/// deleted path (or a subpath) and all values stored at-or-below it.
+fn delete_registry_key(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+    parent: u64,
+    subkey: &str,
+) -> Result<WinApiHandlerResult> {
+    let Some(parent_path) = registry_key_full_path(state, parent) else {
+        return return_status(engine, ERROR_INVALID_HANDLE);
+    };
+    let full_path = if parent_path.is_empty() {
+        subkey.to_owned()
+    } else {
+        format!("{parent_path}\\{subkey}")
+    };
+    let prefix = format!("{full_path}\\");
+    let doomed: Vec<u64> = state
+        .process
+        .registry_keys
+        .iter()
+        .filter(|k| {
+            let Some(path) = registry_key_full_path(state, k.handle) else {
+                return false;
+            };
+            path == full_path || path.starts_with(&prefix)
+        })
+        .map(|k| k.handle)
+        .collect();
+    state
+        .process
+        .registry_keys
+        .retain(|k| !doomed.contains(&k.handle));
+    let root = state.file_io.bottle_root.clone();
+    let had_values = {
+        let store = state.registry();
+        store.ensure_loaded(root.as_deref());
+        store.delete_key(&full_path)
+    };
+    let removed = had_values || !doomed.is_empty();
+    if removed && root.is_some() {
+        state.registry().persist(root.as_deref());
+    }
+    return_status(
+        engine,
+        if removed {
+            ERROR_SUCCESS
+        } else {
+            ERROR_FILE_NOT_FOUND
+        },
+    )
+}
+
+/// `LSTATUS RegFlushKey(HKEY)` — values are write-through to the bottle hive
+/// at mutation time, so the flush persists again (belt-and-braces) and
+/// succeeds.
+fn handle_reg_flush_key(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let _key = engine.read_rcx().context("RegFlushKey RCX")?;
+    let root = state.file_io.bottle_root.clone();
+    if root.is_some() {
+        state.registry().persist(root.as_deref());
+    }
+    return_status(engine, ERROR_SUCCESS)
+}
+
+/// `LSTATUS RegSaveKeyW(HKEY, LPCWSTR, LPSECURITY_ATTRIBUTES)` — documented
+/// no-op: the host hive already persists per-bottle, and no guest file is
+/// written.
+fn handle_reg_save_key(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let _key = engine.read_rcx().context("RegSaveKey RCX")?;
+    return_status(engine, ERROR_SUCCESS)
 }
 
 /// Resolve a key handle to its full hive path (`HKCU\Software\...`).

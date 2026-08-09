@@ -1,7 +1,13 @@
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use anyhow::{Context, Result};
 
 use crate::gdi32::window_font_resolution_or_default;
-use crate::guest_memory::{checked_address, read_i32, write_u32 as write_guest_u32};
+use crate::guest_memory::{
+    checked_address, read_i32, read_u64 as read_guest_u64, write_u32 as write_guest_u32,
+    write_u64 as write_guest_u64,
+};
 use crate::user32::controls::{
     CCS_BOTTOM, CCS_NOPARENTALIGN, CCS_NORESIZE, ControlClassKind, ControlState, SB_GETPARTS,
     SB_GETTEXTA, SB_GETTEXTLENGTHA, SB_GETTEXTLENGTHW, SB_GETTEXTW, SB_SETPARTS, SB_SETTEXTA,
@@ -9,7 +15,7 @@ use crate::user32::controls::{
 };
 use crate::user32::{
     CreateWindowRequest, WS_CHILD, WinApiState, WindowClassIdentifier, create_window_record,
-    find_window, find_window_mut, read_guest_ansi_lossy, read_guest_utf16_lossy,
+    find_window, find_window_mut, low_i32, read_guest_ansi_lossy, read_guest_utf16_lossy,
     window_client_size, write_guest_ansi_c_string, write_guest_i32, write_guest_utf16_c_string,
 };
 use crate::{HandlerContext, WinApiHandlerResult};
@@ -17,6 +23,63 @@ use crate::{HandlerContext, WinApiHandlerResult};
 const S_OK: u64 = 0;
 const FAKE_IMAGE_LIST_HANDLE: u64 = 0x0000_0000_6900_0001;
 const CLR_NONE: u32 = 0xffff_ffff;
+
+/// `ToolbarWindow32` — the comctl32 toolbar class name.
+///
+/// `CreateToolbarEx` always creates the child with this class. Like
+/// `STATUSCLASSNAMEW` it is a system class the guest never registers, so the
+/// record gets no guest WndProc (a plain window).
+const TOOLBAR_CLASS: &str = "ToolbarWindow32";
+
+/// Richer per-image-list record for the string-path ImageList APIs
+/// (`ImageList_Add`, `GetImageCount`, `GetIconSize`, `SetIconSize`, `Draw`,
+/// `GetImageInfo`).
+///
+/// The dense table (`ImageList_Create`/`AddMasked`/`Destroy`) tracks only the
+/// count in `WindowState::image_list_counts`; this table carries the icon size
+/// and per-image HBITMAPs the new handlers need. It is keyed by the fake
+/// image-list handle — one record per list, kept in lockstep with the dense
+/// count on every create/add/destroy.
+#[derive(Debug, Clone, Default)]
+struct ImageListRecord {
+    /// Stored icon cell width (`ImageList_Create` / `ImageList_SetIconSize`).
+    icon_width: i32,
+    /// Stored icon cell height.
+    icon_height: i32,
+    /// One slot per image: the HBITMAP recorded at add time (0 when the add
+    /// passed no bitmap).
+    images: Vec<u64>,
+}
+
+/// The process-global image-list table.
+///
+/// `WindowState` cannot grow (its fields are owned by the state module), so
+/// this table lives here — the same shared-mutable-state seam as
+/// `vfs::pick_mount::PICK_MOUNTS`. `HashMap` needs a runtime seed, hence
+/// `LazyLock` (plain `Mutex::new(HashMap::new())` is not const).
+static IMAGE_LISTS: std::sync::LazyLock<Mutex<HashMap<u64, ImageListRecord>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Lock the image-list table, failing closed (`None`) on a poisoned lock so a
+/// panicking thread cannot unwind into the guest.
+fn lock_image_lists() -> Option<std::sync::MutexGuard<'static, HashMap<u64, ImageListRecord>>> {
+    IMAGE_LISTS.lock().ok()
+}
+
+/// Reset the rich record for `himl` to a fresh empty list
+/// (`ImageList_Create` semantics — count 0, size from the create args).
+fn seed_image_list_record(himl: u64, icon_width: i32, icon_height: i32) {
+    if let Ok(mut lists) = IMAGE_LISTS.lock() {
+        lists.insert(
+            himl,
+            ImageListRecord {
+                icon_width,
+                icon_height,
+                images: Vec::new(),
+            },
+        );
+    }
+}
 
 /// `WM_SIZE` — the message the status bar intercepts to reposition itself.
 const WM_SIZE_MSG: u32 = crate::user32::wm::WinMsg::WM_SIZE.as_u32();
@@ -97,13 +160,19 @@ pub fn handle_init_common_controls_ex(ctx: &mut HandlerContext<'_>) -> Result<Wi
 pub fn handle_image_list_create(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _icon_width = engine
-        .read_rcx()
-        .context("failed to read RCX for ImageList_Create")?;
+    let icon_width = low_i32(
+        engine
+            .read_rcx()
+            .context("failed to read RCX for ImageList_Create")?,
+        "ImageList_Create icon width",
+    )?;
 
-    let _icon_height = engine
-        .read_rdx()
-        .context("failed to read RDX for ImageList_Create")?;
+    let icon_height = low_i32(
+        engine
+            .read_rdx()
+            .context("failed to read RDX for ImageList_Create")?,
+        "ImageList_Create icon height",
+    )?;
 
     let _flags = engine
         .read_r8()
@@ -126,6 +195,10 @@ pub fn handle_image_list_create(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
             .image_list_counts
             .push((FAKE_IMAGE_LIST_HANDLE, 0));
     }
+
+    // Seed the rich record (icon size + image slots) so the string-path
+    // ImageList handlers (ImageList_Add/GetImageInfo/…) see a fresh list.
+    seed_image_list_record(FAKE_IMAGE_LIST_HANDLE, icon_width, icon_height);
 
     ctx.finish(FAKE_IMAGE_LIST_HANDLE)
 }
@@ -160,6 +233,14 @@ pub fn handle_image_list_add_masked(ctx: &mut HandlerContext<'_>) -> Result<WinA
         *count = count
             .checked_add(1)
             .context("image list item count overflow")?;
+
+        // Keep the rich record in lockstep so ImageList_GetImageInfo returns
+        // the stored HBITMAP for the new slot.
+        if let Ok(mut lists) = IMAGE_LISTS.lock()
+            && let Some(record) = lists.get_mut(&image_list_handle)
+        {
+            record.images.push(bitmap_handle);
+        }
 
         image_index
     } else {
@@ -239,11 +320,285 @@ pub fn handle_image_list_destroy(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
             .window_state()
             .image_list_background_colors
             .retain(|(handle, _)| *handle != image_list_handle);
+
+        if let Ok(mut lists) = IMAGE_LISTS.lock() {
+            lists.remove(&image_list_handle);
+        }
     }
 
     let return_value = u64::from(existed);
 
     ctx.finish(return_value)
+}
+
+// ── String-path ImageList APIs (Tier-2) ─────────────────────────────────
+//
+// These run through `dispatch_comctl32_extra` (no `WinApiId` rows). The
+// rich record above (`IMAGE_LISTS`) carries the icon size and per-image
+// HBITMAPs; the dense `WindowState` table stays the count's home, and every
+// handler here keeps the two in lockstep.
+
+/// Handles `COMCTL32.dll!ImageList_Add`.
+///
+/// Signature: `int ImageList_Add(HIMAGELIST himl, HBITMAP hbmImage,
+/// HBITMAP hbmMask)`. Appends one slot to the rich record and returns its
+/// 0-based index (`-1` = `u64::MAX` on failure). The HBITMAP is stored by
+/// handle — `ImageList_GetImageInfo` returns it verbatim; the pixels are not
+/// copied (there is no DIB snapshot for `ImageList_Draw`).
+pub fn handle_image_list_add(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let image_list_handle = engine
+        .read_rcx()
+        .context("failed to read RCX for ImageList_Add")?;
+    let bitmap_handle = engine
+        .read_rdx()
+        .context("failed to read RDX for ImageList_Add")?;
+    let _mask_handle = engine
+        .read_r8()
+        .context("failed to read R8 for ImageList_Add")?;
+
+    let registered = state
+        .window_state()
+        .image_list_counts
+        .iter()
+        .any(|(handle, _)| *handle == image_list_handle);
+
+    let image_index = if image_list_handle == FAKE_IMAGE_LIST_HANDLE && registered {
+        let Some(mut lists) = lock_image_lists() else {
+            // Poisoned lock: fail closed, no index handed out.
+            return ctx.finish(u64::MAX);
+        };
+        let record = lists.entry(image_list_handle).or_default();
+        let index = u64::try_from(record.images.len()).context("image list index overflow")?;
+        record.images.push(bitmap_handle);
+        if let Some((_, count)) = state
+            .window_state()
+            .image_list_counts
+            .iter_mut()
+            .find(|(handle, _)| *handle == image_list_handle)
+        {
+            *count = index.saturating_add(1);
+        }
+        index
+    } else {
+        u64::MAX
+    };
+
+    ctx.finish(image_index)
+}
+
+/// Handles `COMCTL32.dll!ImageList_GetImageCount`.
+///
+/// Signature: `int ImageList_GetImageCount(HIMAGELIST himl)`. Reads the dense
+/// `WindowState` count — both add paths (`ImageList_Add` and the dense
+/// `ImageList_AddMasked`) keep it in lockstep with the rich record.
+pub fn handle_image_list_get_image_count(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let image_list_handle = engine
+        .read_rcx()
+        .context("failed to read RCX for ImageList_GetImageCount")?;
+
+    let count = state
+        .window_state()
+        .image_list_counts
+        .iter()
+        .find(|(handle, _)| *handle == image_list_handle)
+        .map_or(0, |(_, count)| *count);
+
+    ctx.finish(count)
+}
+
+/// Handles `COMCTL32.dll!ImageList_GetIconSize`.
+///
+/// Signature: `BOOL ImageList_GetIconSize(HIMAGELIST himl, int *cx, int *cy)`.
+/// Writes the stored cell size (0s when the list is unknown) and returns
+/// TRUE.
+pub fn handle_image_list_get_icon_size(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let image_list_handle = engine
+        .read_rcx()
+        .context("failed to read RCX for ImageList_GetIconSize")?;
+    let cx_va = engine
+        .read_rdx()
+        .context("failed to read RDX for ImageList_GetIconSize")?;
+    let cy_va = engine
+        .read_r8()
+        .context("failed to read R8 for ImageList_GetIconSize")?;
+
+    let (width, height) = lock_image_lists()
+        .and_then(|lists| lists.get(&image_list_handle).cloned())
+        .map_or((0, 0), |record| (record.icon_width, record.icon_height));
+
+    if cx_va != 0 {
+        write_guest_i32(engine, cx_va, width)?;
+    }
+    if cy_va != 0 {
+        write_guest_i32(engine, cy_va, height)?;
+    }
+
+    ctx.finish(1)
+}
+
+/// Handles `COMCTL32.dll!ImageList_SetIconSize`.
+///
+/// Signature: `BOOL ImageList_SetIconSize(HIMAGELIST himl, int cx, int cy)`.
+/// Stores the cell size on the rich record (no-op for unknown lists) and
+/// returns TRUE.
+pub fn handle_image_list_set_icon_size(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let image_list_handle = engine
+        .read_rcx()
+        .context("failed to read RCX for ImageList_SetIconSize")?;
+    let cx = low_i32(
+        engine
+            .read_rdx()
+            .context("failed to read RDX for ImageList_SetIconSize")?,
+        "ImageList_SetIconSize cx",
+    )?;
+    let cy = low_i32(
+        engine
+            .read_r8()
+            .context("failed to read R8 for ImageList_SetIconSize")?,
+        "ImageList_SetIconSize cy",
+    )?;
+
+    let registered = state
+        .window_state()
+        .image_list_counts
+        .iter()
+        .any(|(handle, _)| *handle == image_list_handle);
+
+    if image_list_handle == FAKE_IMAGE_LIST_HANDLE
+        && registered
+        && let Some(mut lists) = lock_image_lists()
+    {
+        let record = lists.entry(image_list_handle).or_default();
+        record.icon_width = cx;
+        record.icon_height = cy;
+    }
+
+    ctx.finish(1)
+}
+
+/// Handles `COMCTL32.dll!ImageList_Draw`.
+///
+/// Signature: `BOOL ImageList_Draw(HIMAGELIST himl, int i, HDC hdcDst, int x,
+/// int y, UINT fStyle)`. Documented no-op: the rich record stores HBITMAP
+/// handles, not DIB snapshots, so there is nothing to blit — the honest blit
+/// path (`gdi32` `BitBlt`) needs a source DIB we deliberately do not keep for
+/// this milestone.
+pub fn handle_image_list_draw(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let image_list_handle = engine
+        .read_rcx()
+        .context("failed to read RCX for ImageList_Draw")?;
+    let _image_index = engine
+        .read_rdx()
+        .context("failed to read RDX for ImageList_Draw")?;
+    let _target_dc = engine
+        .read_r8()
+        .context("failed to read R8 for ImageList_Draw")?;
+    let _x = engine
+        .read_r9()
+        .context("failed to read R9 for ImageList_Draw")?;
+
+    tracing::debug!(
+        target: "wie_winapi",
+        himl = format_args!("{image_list_handle:#x}"),
+        "ImageList_Draw: documented no-op (no DIB snapshot)"
+    );
+
+    ctx.finish(1)
+}
+
+/// Handles `COMCTL32.dll!ImageList_GetImageInfo`.
+///
+/// Signature: `BOOL ImageList_GetImageInfo(HIMAGELIST himl, int i,
+/// IMAGEINFO *pImageInfo)`. Fills `IMAGEINFO` with the stored HBITMAP for
+/// slot `i` and the cell size. Layout verified against the mingw `commctrl.h`
+/// header (NOT the task sheet, whose rcImage offset of 32 was wrong):
+/// hbmImage@0, hbmMask@8, Unused1@16, Unused2@20, RECT rcImage@24.
+pub fn handle_image_list_get_image_info(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let image_list_handle = engine
+        .read_rcx()
+        .context("failed to read RCX for ImageList_GetImageInfo")?;
+    let image_index_raw = engine
+        .read_rdx()
+        .context("failed to read RDX for ImageList_GetImageInfo")?;
+    let image_info_va = engine
+        .read_r8()
+        .context("failed to read R8 for ImageList_GetImageInfo")?;
+
+    if image_info_va == 0 {
+        return ctx.finish(0);
+    }
+
+    let image_index = usize::try_from(image_index_raw).unwrap_or(usize::MAX);
+
+    let (stored_bitmap, icon_width, icon_height) = lock_image_lists()
+        .and_then(|lists| lists.get(&image_list_handle).cloned())
+        .map_or((0, 0, 0), |record| {
+            (
+                record.images.get(image_index).copied().unwrap_or(0),
+                record.icon_width,
+                record.icon_height,
+            )
+        });
+
+    write_guest_u64(
+        engine,
+        checked_address(image_info_va, 0, "IMAGEINFO hbmImage"),
+        stored_bitmap,
+    )?;
+    write_guest_u64(
+        engine,
+        checked_address(image_info_va, 8, "IMAGEINFO hbmMask"),
+        0,
+    )?;
+    write_guest_u32(
+        engine,
+        checked_address(image_info_va, 16, "IMAGEINFO Unused1"),
+        0,
+    )?;
+    write_guest_u32(
+        engine,
+        checked_address(image_info_va, 20, "IMAGEINFO Unused2"),
+        0,
+    )?;
+    write_guest_i32(
+        engine,
+        checked_address(image_info_va, 24, "IMAGEINFO rcImage.left"),
+        0,
+    )?;
+    write_guest_i32(
+        engine,
+        checked_address(image_info_va, 28, "IMAGEINFO rcImage.top"),
+        0,
+    )?;
+    write_guest_i32(
+        engine,
+        checked_address(image_info_va, 32, "IMAGEINFO rcImage.right"),
+        icon_width,
+    )?;
+    write_guest_i32(
+        engine,
+        checked_address(image_info_va, 36, "IMAGEINFO rcImage.bottom"),
+        icon_height,
+    )?;
+
+    ctx.finish(1)
 }
 
 /// Handles `COMCTL32.dll!CreateStatusWindowA`.
@@ -599,12 +954,124 @@ fn status_bar_default_height(state: &mut WinApiState, hwnd: u64) -> Result<i32> 
     Ok(line_h.saturating_add(4))
 }
 
+/// Handles `COMCTL32.dll!CreateToolbarEx` (string-path).
+///
+/// Signature (mingw `commctrl.h`, 13 args): `CreateToolbarEx(HWND hwnd,
+/// DWORD ws, UINT wID, int nBitmaps, HINSTANCE hBMInst, UINT_PTR wBMID,
+/// LPCTBBUTTON lpButtons, int iNumButtons, int dxButton, int dyButton,
+/// int dxBitmap, int dyBitmap, UINT uStructSize)`. Creates the
+/// `ToolbarWindow32` child through the same internal path
+/// `CreateStatusWindowA/W` use (`create_window_record`), forcing `WS_CHILD`
+/// onto the caller's style, and returns the new HWND (0 on failure).
+pub fn handle_create_toolbar_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let parent_handle = engine
+        .read_rcx()
+        .context("failed to read RCX for CreateToolbarEx")?;
+    let style_raw = engine
+        .read_rdx()
+        .context("failed to read RDX for CreateToolbarEx")?;
+    let window_id = engine
+        .read_r8()
+        .context("failed to read R8 for CreateToolbarEx")?;
+    let _bitmap_count = engine
+        .read_r9()
+        .context("failed to read R9 for CreateToolbarEx")?;
+
+    let rsp = engine
+        .read_rsp()
+        .context("failed to read RSP for CreateToolbarEx")?;
+    // Args 5..13 live on the stack at 0x28 upward (Win64 ABI). Only the
+    // button cell size feeds the window record; the bitmap/button arrays are
+    // out of scope for the milestone.
+    let _bitmap_instance = read_guest_u64(
+        engine,
+        checked_address(rsp, 0x28, "CreateToolbarEx hBMInst"),
+    )
+    .context("failed to read CreateToolbarEx hBMInst")?;
+    let _bitmap_id = read_guest_u64(engine, checked_address(rsp, 0x30, "CreateToolbarEx wBMID"))
+        .context("failed to read CreateToolbarEx wBMID")?;
+    let _buttons_va = read_guest_u64(
+        engine,
+        checked_address(rsp, 0x38, "CreateToolbarEx lpButtons"),
+    )
+    .context("failed to read CreateToolbarEx lpButtons")?;
+    let _button_count = read_guest_u64(
+        engine,
+        checked_address(rsp, 0x40, "CreateToolbarEx iNumButtons"),
+    )
+    .context("failed to read CreateToolbarEx iNumButtons")?;
+    let button_width = read_i32(
+        engine,
+        checked_address(rsp, 0x48, "CreateToolbarEx dxButton"),
+    )
+    .context("failed to read CreateToolbarEx dxButton")?;
+    let button_height = read_i32(
+        engine,
+        checked_address(rsp, 0x50, "CreateToolbarEx dyButton"),
+    )
+    .context("failed to read CreateToolbarEx dyButton")?;
+    let _bitmap_width = read_i32(
+        engine,
+        checked_address(rsp, 0x58, "CreateToolbarEx dxBitmap"),
+    )
+    .context("failed to read CreateToolbarEx dxBitmap")?;
+    let _bitmap_height = read_i32(
+        engine,
+        checked_address(rsp, 0x60, "CreateToolbarEx dyBitmap"),
+    )
+    .context("failed to read CreateToolbarEx dyBitmap")?;
+    let _struct_size = read_guest_u64(
+        engine,
+        checked_address(rsp, 0x68, "CreateToolbarEx uStructSize"),
+    )
+    .context("failed to read CreateToolbarEx uStructSize")?;
+
+    let style = u32::try_from(style_raw).context("CreateToolbarEx style does not fit u32")?;
+
+    let (toolbar_handle, _window_proc, _class_unicode) = create_window_record(
+        state,
+        CreateWindowRequest {
+            class_identifier: WindowClassIdentifier::Name(TOOLBAR_CLASS.to_owned()),
+            title: String::new(),
+            style: style | WS_CHILD,
+            extended_style: 0,
+            parent_handle,
+            // wID is the child-window identifier (menu_handle slot).
+            menu_handle: window_id,
+            instance_handle: 0,
+            x: 0,
+            y: 0,
+            width: button_width,
+            height: button_height,
+        },
+        false,
+    )
+    .context("failed to create toolbar window for CreateToolbarEx")?;
+
+    ctx.finish(toolbar_handle)
+}
+
 /// Soft dispatch for COMCTL32 exports beyond the dense table (toolbar,
 /// remaining ImageList APIs, progress bar). String path only.
 pub fn dispatch_comctl32_extra(
     ctx: &mut HandlerContext<'_>,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
-    let _ = (ctx, name);
-    Ok(None)
+    let n = name.to_ascii_lowercase();
+    match n.as_str() {
+        "imagelist_add" => Ok(Some(handle_image_list_add(ctx)?)),
+        "imagelist_getimagecount" => Ok(Some(handle_image_list_get_image_count(ctx)?)),
+        "imagelist_geticonsize" => Ok(Some(handle_image_list_get_icon_size(ctx)?)),
+        "imagelist_seticonsize" => Ok(Some(handle_image_list_set_icon_size(ctx)?)),
+        "imagelist_draw" => Ok(Some(handle_image_list_draw(ctx)?)),
+        "imagelist_getimageinfo" => Ok(Some(handle_image_list_get_image_info(ctx)?)),
+        // mingw declares CreateToolbarEx without an A/W split; keep the
+        // suffixed names as a defensive match for other toolchains.
+        "createtoolbarex" | "createtoolbarexa" | "createtoolbarexw" => {
+            Ok(Some(handle_create_toolbar_ex(ctx)?))
+        }
+        _ => Ok(None),
+    }
 }

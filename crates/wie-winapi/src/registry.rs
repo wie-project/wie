@@ -108,6 +108,25 @@ impl RegistryState {
         deleted
     }
 
+    /// Remove a key and every value at or below it (subkeys included);
+    /// returns `true` when any value record was present.
+    ///
+    /// `RegDeleteKey` subtree semantics for this model: the whole subtree goes,
+    /// matching the handle-record cleanup in `advapi32.rs`.
+    pub fn delete_key(&mut self, path: &str) -> bool {
+        let prefix = format!("{path}\\");
+        let mut deleted = false;
+        self.values.retain(|key, _| {
+            if key == path || key.starts_with(&prefix) {
+                deleted = true;
+                false
+            } else {
+                true
+            }
+        });
+        deleted
+    }
+
     /// Write the whole value map through to the bottle's hive file.
     ///
     /// Write-through on every mutation, not on shutdown: a kill -9 after a
@@ -132,23 +151,27 @@ impl RegistryState {
 /// fake key handle, which the path walk resolves through the key records.
 #[must_use]
 pub(crate) fn root_prefix(handle: u64) -> Option<&'static str> {
+    // 64-bit guests pass the sign-extended root spelling
+    // (`(HKEY)(ULONG_PTR)((LONG)0x8000_000x)` = `0xffff_ffff_8000_000x`); the
+    // zero-extended spelling is accepted too for robustness.
     match handle {
-        HKEY_CLASSES_ROOT => Some("HKCR"),
-        HKEY_CURRENT_USER => Some("HKCU"),
-        HKEY_LOCAL_MACHINE => Some("HKLM"),
-        HKEY_USERS => Some("HKU"),
-        HKEY_CURRENT_CONFIG => Some("HKCC"),
+        HKEY_CLASSES_ROOT | 0x8000_0000 => Some("HKCR"),
+        HKEY_CURRENT_USER | 0x8000_0001 => Some("HKCU"),
+        HKEY_LOCAL_MACHINE | 0x8000_0002 => Some("HKLM"),
+        HKEY_USERS | 0x8000_0003 => Some("HKU"),
+        HKEY_CURRENT_CONFIG | 0x8000_0005 => Some("HKCC"),
         _ => None,
     }
 }
 
 // WinNT.h root-handle constants: the handle values guests pass to
-// `RegOpenKey*` / `RegCreateKeyEx*` as the parent key.
-pub(crate) const HKEY_CLASSES_ROOT: u64 = 0x8000_0000;
-pub(crate) const HKEY_CURRENT_USER: u64 = 0x8000_0001;
-pub(crate) const HKEY_LOCAL_MACHINE: u64 = 0x8000_0002;
-pub(crate) const HKEY_USERS: u64 = 0x8000_0003;
-pub(crate) const HKEY_CURRENT_CONFIG: u64 = 0x8000_0005;
+// `RegOpenKey*` / `RegCreateKeyEx*` as the parent key. Stored in the
+// sign-extended Win64 spelling, which is what a real 64-bit guest bakes in.
+pub(crate) const HKEY_CLASSES_ROOT: u64 = 0xffff_ffff_8000_0000;
+pub(crate) const HKEY_CURRENT_USER: u64 = 0xffff_ffff_8000_0001;
+pub(crate) const HKEY_LOCAL_MACHINE: u64 = 0xffff_ffff_8000_0002;
+pub(crate) const HKEY_USERS: u64 = 0xffff_ffff_8000_0003;
+pub(crate) const HKEY_CURRENT_CONFIG: u64 = 0xffff_ffff_8000_0005;
 
 /// The hive file lives at `{bottle_root}/registry/hive.dat`, beside `drive_c/`.
 fn hive_file_path(root: &Path) -> PathBuf {

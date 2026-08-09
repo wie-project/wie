@@ -9,6 +9,7 @@
 
 use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 use anyhow::{Context, Result};
+use std::sync::Mutex;
 
 /// `VARENUM` / `VARTYPE` constants.
 const VT_I2: u16 = 2;
@@ -83,6 +84,19 @@ pub fn dispatch_oleaut32(
         "varr8fromi4" => Ok(Some(handle_var_num_from_num(ctx, VT_R8, VT_I4)?)),
         "vardatefromi4" => Ok(Some(handle_var_num_from_num(ctx, VT_DATE, VT_I4)?)),
         "vardatefromr8" => Ok(Some(handle_var_num_from_num(ctx, VT_DATE, VT_R8)?)),
+        // SafeArray family
+        "safearraycreate" => Ok(Some(handle_safe_array_create(ctx)?)),
+        "safearraydestroy" => Ok(Some(handle_safe_array_destroy(ctx)?)),
+        "safearrayaccessdata" => Ok(Some(handle_safe_array_access_data(ctx)?)),
+        "safearrayunaccessdata" => Ok(Some(handle_safe_array_unaccess_data(ctx)?)),
+        "safearraygetelement" => Ok(Some(handle_safe_array_get_element(ctx)?)),
+        "safearrayputelement" => Ok(Some(handle_safe_array_put_element(ctx)?)),
+        "safearraygetlbound" => Ok(Some(handle_safe_array_get_lbound(ctx)?)),
+        "safearraygetubound" => Ok(Some(handle_safe_array_get_ubound(ctx)?)),
+        "safearraygetdim" => Ok(Some(handle_safe_array_get_dim(ctx)?)),
+        // IDispatch stubs
+        "dispgetidsofnames" => Ok(Some(handle_disp_get_ids_of_names(ctx)?)),
+        "dispinvoke" => Ok(Some(handle_disp_invoke(ctx)?)),
         _ => Ok(None),
     }
 }
@@ -539,4 +553,301 @@ fn handle_var_num_from_num(
     let (_svt, val) = read_variant_num(engine, psrc)?;
     write_variant_num(engine, presult, out_vt, val)?;
     finish(engine, 0)
+}
+
+// ── SafeArray family ───────────────────────────────────────────────────────
+
+/// One live SafeArray. The element buffer lives in **guest** memory (a process
+/// heap allocation) so `SafeArrayAccessData` can hand the guest a real
+/// writable VA — the guest reads/writes elements in place.
+struct SafeArrayData {
+    /// Dimensions in order: `(cElements, lLbound)`.
+    dims: Vec<(u32, u32)>,
+    /// Guest VA of the element buffer.
+    data_va: u64,
+    /// Bytes per element.
+    element_size: u64,
+}
+
+/// Live SafeArrays keyed by fake `SAFEARRAY*` handle. Static (not per-session)
+/// because the shared state file owns the DllId table — same pattern as the
+/// UCRT `strtok` static save slot.
+static SAFE_ARRAYS: Mutex<Vec<(u64, SafeArrayData)>> = Mutex::new(Vec::new());
+
+/// Next fake `SAFEARRAY*` handle (counter from `0x5300_0000`).
+fn next_sa_handle() -> u64 {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x5300_0000);
+    COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn sa_table() -> std::sync::MutexGuard<'static, Vec<(u64, SafeArrayData)>> {
+    SAFE_ARRAYS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Zero `len` bytes of guest memory (fresh heap bump may hold stale freelist
+/// data; SafeArrayCreate must present a zeroed buffer like the real one).
+fn zero_guest(engine: &mut dyn wie_cpu::CpuEngine, va: u64, len: u64) -> Result<()> {
+    let mut remaining = len;
+    let mut cursor = va;
+    let chunk = vec![0_u8; 4096];
+    while remaining > 0 {
+        let n = remaining.min(4096);
+        let n_usize = usize::try_from(n).unwrap_or(0);
+        let slice = chunk.get(..n_usize).context("zero chunk bounds")?;
+        engine.mem_write(cursor, slice)?;
+        cursor = cursor.wrapping_add(n);
+        remaining = remaining.wrapping_sub(n);
+    }
+    Ok(())
+}
+
+/// Flat byte offset for `rgIndices`, or `None` if any index is out of bounds.
+///
+/// Row-major with the FIRST dimension fastest: offset =
+/// Σ (idx[i] - lbound[i]) × stride[i], stride[i] = Π count[j] for j > i.
+fn flat_offset(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    data: &SafeArrayData,
+    rg_indices: u64,
+) -> Result<Option<u64>> {
+    let mut offset = 0_u64;
+    let mut stride = 1_u64;
+    for (i, (count, lbound)) in data.dims.iter().enumerate().rev() {
+        let mut idx_bytes = [0_u8; 4];
+        let off = u64::try_from(i).unwrap_or(0).wrapping_mul(4);
+        engine.mem_read(rg_indices.wrapping_add(off), &mut idx_bytes)?;
+        let idx = u32::from_le_bytes(idx_bytes);
+        if idx < *lbound || idx >= lbound.wrapping_add(*count) {
+            return Ok(None);
+        }
+        let rel = u64::from(idx.wrapping_sub(*lbound));
+        offset = offset.wrapping_add(rel.wrapping_mul(stride));
+        stride = stride.wrapping_mul(u64::from(*count));
+    }
+    Ok(Some(offset.wrapping_mul(data.element_size)))
+}
+
+/// `SAFEARRAY *SafeArrayCreate(UINT cDims, SAFEARRAYBOUND *rgBounds, ULONG cbElements)`
+fn handle_safe_array_create(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let c_dims = engine.read_rcx()? & 0xffff_ffff;
+    let rg_bounds = engine.read_rdx()?;
+    let cb_elements = engine.read_r8()? & 0xffff_ffff;
+    let n_dims = usize::try_from(c_dims).unwrap_or(0);
+    if n_dims == 0 || n_dims > 32 || rg_bounds == 0 {
+        return finish(engine, 0);
+    }
+    let mut dims = Vec::with_capacity(n_dims);
+    let mut total_bytes = 1_u64;
+    for i in 0..n_dims {
+        let mut c_bytes = [0_u8; 4];
+        let mut l_bytes = [0_u8; 4];
+        let entry_va = rg_bounds.wrapping_add(u64::try_from(i).unwrap_or(0).wrapping_mul(8));
+        engine.mem_read(entry_va, &mut c_bytes)?;
+        engine.mem_read(entry_va.wrapping_add(4), &mut l_bytes)?;
+        let count = u32::from_le_bytes(c_bytes);
+        let lbound = u32::from_le_bytes(l_bytes);
+        dims.push((count, lbound));
+        total_bytes = total_bytes.saturating_mul(u64::from(count));
+    }
+    total_bytes = total_bytes.saturating_mul(cb_elements);
+    let data_va = ctx
+        .state
+        .heap_state
+        .heap
+        .alloc_coherent(engine, total_bytes);
+    if data_va == 0 {
+        return finish(engine, 0); // OOM — SafeArrayCreate returns NULL
+    }
+    zero_guest(engine, data_va, total_bytes)?;
+    let handle = next_sa_handle();
+    sa_table().push((
+        handle,
+        SafeArrayData {
+            dims,
+            data_va,
+            element_size: cb_elements,
+        },
+    ));
+    finish(engine, handle)
+}
+
+/// `HRESULT SafeArrayDestroy(SAFEARRAY *psa)`
+fn handle_safe_array_destroy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let psa = engine.read_rcx()?;
+    let mut table = sa_table();
+    let idx = table.iter().position(|(h, _)| *h == psa);
+    if let Some(i) = idx {
+        let (_, data) = table.swap_remove(i);
+        if data.data_va != 0 {
+            let _ = ctx
+                .state
+                .heap_state
+                .heap
+                .free_coherent(engine, data.data_va);
+        }
+        finish(engine, 0) // S_OK
+    } else {
+        finish(engine, E_INVALIDARG)
+    }
+}
+
+/// `HRESULT SafeArrayAccessData(SAFEARRAY *psa, void **ppvData)`
+fn handle_safe_array_access_data(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let psa = engine.read_rcx()?;
+    let ppv = engine.read_rdx()?;
+    let data_va = sa_table()
+        .iter()
+        .find(|(h, _)| *h == psa)
+        .map(|(_, d)| d.data_va)
+        .unwrap_or(0);
+    if data_va != 0 {
+        if ppv != 0 {
+            engine.mem_write(ppv, &data_va.to_le_bytes())?;
+        }
+        finish(engine, 0) // S_OK
+    } else {
+        finish(engine, E_INVALIDARG)
+    }
+}
+
+/// `HRESULT SafeArrayUnaccessData(SAFEARRAY *psa)` — the guest wrote in place.
+fn handle_safe_array_unaccess_data(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let psa = engine.read_rcx()?;
+    let found = sa_table().iter().any(|(h, _)| *h == psa);
+    finish(engine, if found { 0 } else { E_INVALIDARG })
+}
+
+/// `HRESULT SafeArrayGetElement(SAFEARRAY *psa, LONG *rgIndices, void *pvOut)`
+fn handle_safe_array_get_element(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let psa = engine.read_rcx()?;
+    let rg_indices = engine.read_rdx()?;
+    let pv_out = engine.read_r8()?;
+    let table = sa_table();
+    let Some(data) = table.iter().find(|(h, _)| *h == psa).map(|(_, d)| d) else {
+        return finish(engine, E_INVALIDARG);
+    };
+    let Some(off) = flat_offset(engine, data, rg_indices)? else {
+        return finish(engine, E_INVALIDARG);
+    };
+    let n = usize::try_from(data.element_size).unwrap_or(0);
+    let mut buf = vec![0_u8; n];
+    engine.mem_read(data.data_va.wrapping_add(off), &mut buf)?;
+    if pv_out != 0 {
+        engine.mem_write(pv_out, &buf)?;
+    }
+    finish(engine, 0) // S_OK
+}
+
+/// `HRESULT SafeArrayPutElement(SAFEARRAY *psa, LONG *rgIndices, void *pvIn)`
+fn handle_safe_array_put_element(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let psa = engine.read_rcx()?;
+    let rg_indices = engine.read_rdx()?;
+    let pv_in = engine.read_r8()?;
+    let table = sa_table();
+    let Some(data) = table.iter().find(|(h, _)| *h == psa).map(|(_, d)| d) else {
+        return finish(engine, E_INVALIDARG);
+    };
+    let Some(off) = flat_offset(engine, data, rg_indices)? else {
+        return finish(engine, E_INVALIDARG);
+    };
+    let n = usize::try_from(data.element_size).unwrap_or(0);
+    let mut buf = vec![0_u8; n];
+    if pv_in != 0 {
+        engine.mem_read(pv_in, &mut buf)?;
+    }
+    engine.mem_write(data.data_va.wrapping_add(off), &buf)?;
+    finish(engine, 0) // S_OK
+}
+
+/// `HRESULT SafeArrayGetLBound(SAFEARRAY *psa, UINT nDim, LONG *plLbound)`
+fn handle_safe_array_get_lbound(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let psa = engine.read_rcx()?;
+    let n_dim = engine.read_rdx()?;
+    let pl = engine.read_r8()?;
+    let table = sa_table();
+    let Some(data) = table.iter().find(|(h, _)| *h == psa).map(|(_, d)| d) else {
+        return finish(engine, E_INVALIDARG);
+    };
+    let dim_idx = usize::try_from(n_dim.wrapping_sub(1)).unwrap_or(0);
+    let Some((_, lbound)) = data.dims.get(dim_idx).copied() else {
+        return finish(engine, E_INVALIDARG);
+    };
+    if pl != 0 {
+        engine.mem_write(pl, &lbound.to_le_bytes())?;
+    }
+    finish(engine, 0) // S_OK
+}
+
+/// `HRESULT SafeArrayGetUBound(SAFEARRAY *psa, UINT nDim, LONG *plUbound)`
+fn handle_safe_array_get_ubound(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let psa = engine.read_rcx()?;
+    let n_dim = engine.read_rdx()?;
+    let pl = engine.read_r8()?;
+    let table = sa_table();
+    let Some(data) = table.iter().find(|(h, _)| *h == psa).map(|(_, d)| d) else {
+        return finish(engine, E_INVALIDARG);
+    };
+    let dim_idx = usize::try_from(n_dim.wrapping_sub(1)).unwrap_or(0);
+    let Some((count, lbound)) = data.dims.get(dim_idx).copied() else {
+        return finish(engine, E_INVALIDARG);
+    };
+    let ubound = lbound.wrapping_add(count).wrapping_sub(1);
+    if pl != 0 {
+        engine.mem_write(pl, &ubound.to_le_bytes())?;
+    }
+    finish(engine, 0) // S_OK
+}
+
+/// `UINT SafeArrayGetDim(SAFEARRAY *psa)`
+fn handle_safe_array_get_dim(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let psa = engine.read_rcx()?;
+    let dims = sa_table()
+        .iter()
+        .find(|(h, _)| *h == psa)
+        .map(|(_, d)| d.dims.len())
+        .unwrap_or(0);
+    finish(engine, u64::try_from(dims).unwrap_or(0))
+}
+
+// ── IDispatch stubs ────────────────────────────────────────────────────────
+
+/// `HRESULT DispGetIDsOfNames(riid, rgszNames, cNames, lcid, rgDispId)`
+///
+/// KISS: every name is unknown — write `DISPID_UNKNOWN` (-1) to each slot and
+/// return `DISP_E_UNKNOWNNAME`; guests fall back to `DISPID_UNKNOWN` anyway.
+fn handle_disp_get_ids_of_names(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let _riid = engine.read_rcx()?;
+    let _names = engine.read_rdx()?;
+    let c_names = (engine.read_r8()? & 0xffff_ffff).min(4096);
+    let _lcid = engine.read_r9()?;
+    let rsp = engine.read_rsp()?;
+    let mut slot = [0_u8; 8];
+    engine.mem_read(rsp.wrapping_add(0x28), &mut slot)?;
+    let rg_disp_id = u64::from_le_bytes(slot);
+    let unknown = 0xffff_ffff_u32; // DISPID_UNKNOWN = (LONG)-1
+    for i in 0..c_names {
+        let off = i.wrapping_mul(4);
+        if rg_disp_id != 0 {
+            engine.mem_write(rg_disp_id.wrapping_add(off), &unknown.to_le_bytes())?;
+        }
+    }
+    finish(engine, 0x8002_0006) // DISP_E_UNKNOWNNAME
+}
+
+/// `HRESULT DispInvoke(...)` — KISS: `E_NOTIMPL` (args accepted, unused).
+fn handle_disp_invoke(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    finish(engine, 0x8000_4001) // E_NOTIMPL
 }

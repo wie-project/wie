@@ -1,9 +1,13 @@
 //! Minimal `shell32.dll` stubs (folder paths / browse UI / About / launch) for CLI tools.
 
-use crate::guest_memory::{read_u64, write_u32 as write_guest_u32};
-use crate::guest_string::{read_utf16_lossy, write_utf16_c_string};
+use crate::guest_memory::{read_u64, write_u32 as write_guest_u32, write_u64 as write_guest_u64};
+use crate::guest_string::{
+    read_arg_string, read_utf16_lossy, write_ansi_c_string, write_utf16_c_string,
+};
 use crate::state::{MessageBoxRequest, PendingNativeMessageBox, WinApiControlSignal, WindowFlags};
-use crate::user32::{IDOK, ModalResult, NativePanelCtx, NativePanelKind, find_window_mut};
+use crate::user32::{
+    FAKE_ICON_HANDLE, IDOK, ModalResult, NativePanelCtx, NativePanelKind, find_window_mut,
+};
 use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 use anyhow::{Context, Result};
 
@@ -79,7 +83,34 @@ pub fn dispatch_shell32(
         "shbrowseforfolderw" => Ok(Some(handle_sh_browse_for_folder_w(ctx)?)),
         "commandlinetoargvw" => Ok(Some(handle_command_line_to_argv_w(ctx)?)),
         "shaddtorecentdocs" => Ok(Some(handle_sh_add_to_recent_docs(ctx)?)),
+        "shgetfileinfoa" => Ok(Some(handle_sh_get_file_info(ctx, false)?)),
+        "shgetfileinfow" => Ok(Some(handle_sh_get_file_info(ctx, true)?)),
+        "shgetspecialfolderpathw" => Ok(Some(handle_sh_get_special_folder_path_w(ctx)?)),
+        "shellexecuteexw" => Ok(Some(handle_sh_execute_ex_w(ctx)?)),
         _ => Ok(None),
+    }
+}
+
+/// Map a `CSIDL` folder id to the synthetic bottle path WIE exposes.
+///
+/// Every returned path points INTO the seeded default skeleton
+/// ([`crate::vfs::BOTTLE_SKELETON_DIRS`]), so the folder exists on the host
+/// once the bottle is materialized — except `CSIDL_PROGRAMS`, which the
+/// fCreate path of `SHGetSpecialFolderPathW` materializes on demand.
+fn csidl_to_guest_path(csidl: u64) -> &'static str {
+    match csidl {
+        0x00 => r"C:\Users\WIE\Desktop", // CSIDL_DESKTOP
+        0x02 => r"C:\Users\WIE\AppData\Roaming\Microsoft\Windows\Start Menu\Programs", // CSIDL_PROGRAMS
+        0x05 => r"C:\Users\WIE\Documents", // CSIDL_PERSONAL / My Documents
+        0x1a => r"C:\Users\WIE\AppData\Roaming", // CSIDL_APPDATA
+        0x1c => r"C:\Users\WIE\AppData\Local", // CSIDL_LOCAL_APPDATA
+        0x23 => r"C:\ProgramData",         // CSIDL_COMMON_APPDATA
+        0x24 => r"C:\Windows",             // CSIDL_WINDOWS
+        0x25 => r"C:\Windows\System32",    // CSIDL_SYSTEM
+        0x26 => r"C:\Program Files",       // CSIDL_PROGRAM_FILES
+        0x2a => r"C:\Program Files\Common Files", // CSIDL_PROGRAM_FILES_COMMON
+        // CSIDL_PROFILE (0x28) and unknown → user home.
+        _ => r"C:\Users\WIE",
     }
 }
 
@@ -102,24 +133,106 @@ fn handle_sh_get_folder_path_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
 
     // Common CSIDL values → synthetic bottle paths (MAX_PATH buffer expected).
     // `csidl` already masked to low 32 bits (u64).
-    let path = match csidl {
-        0x00 => r"C:\Users\WIE\Desktop",          // CSIDL_DESKTOP
-        0x05 => r"C:\Users\WIE\Documents",        // CSIDL_PERSONAL / My Documents
-        0x1a => r"C:\Users\WIE\AppData\Roaming",  // CSIDL_APPDATA
-        0x1c => r"C:\Users\WIE\AppData\Local",    // CSIDL_LOCAL_APPDATA
-        0x23 => r"C:\ProgramData",                // CSIDL_COMMON_APPDATA
-        0x24 => r"C:\Windows",                    // CSIDL_WINDOWS
-        0x25 => r"C:\Windows\System32",           // CSIDL_SYSTEM
-        0x26 => r"C:\Program Files",              // CSIDL_PROGRAM_FILES
-        0x2a => r"C:\Program Files\Common Files", // CSIDL_PROGRAM_FILES_COMMON
-        // CSIDL_PROFILE (0x28) and unknown → user home.
-        _ => r"C:\Users\WIE",
-    };
+    let path = csidl_to_guest_path(csidl);
 
     if path_va != 0 {
         write_utf16_c_string(engine, path_va, 260, path)?;
     }
     finish(engine, S_OK)
+}
+
+/// `BOOL SHGetSpecialFolderPathW(hwnd, pszPath, csidl, fCreate)`
+///
+/// Same CSIDL → bottle-path map as [`handle_sh_get_folder_path_w`], with the
+/// `fCreate` flag honored: when set, the mapped host directory is materialized
+/// under the bottle (a no-op for the seeded skeleton folders — and what makes
+/// `CSIDL_PROGRAMS`, which the skeleton lacks, resolvable). Returns TRUE.
+fn handle_sh_get_special_folder_path_w(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    let (path_va, csidl, f_create) = {
+        let engine = &mut *ctx.engine;
+        let _hwnd = engine.read_rcx()?;
+        let path_va = engine.read_rdx()?;
+        let csidl = engine.read_r8()? & 0xffff_ffff;
+        let f_create = engine.read_r9()?;
+        (path_va, csidl, f_create)
+    };
+    let path = csidl_to_guest_path(csidl);
+    if f_create != 0
+        && let Some(map) = crate::vfs::guest_path_to_host(&ctx.state.file_io.volumes, path)
+    {
+        let _created = std::fs::create_dir_all(map.host);
+    }
+    if path_va != 0 {
+        write_utf16_c_string(ctx.engine, path_va, 260, path)?;
+    }
+    finish(ctx.engine, 1)
+}
+
+/// `SHFILEINFO` fixed prefix size (hIcon + iIcon + dwAttributes).
+const SHFILEINFO_PREFIX_SIZE: u64 = 16;
+/// `sizeof(SHFILEINFOW)`: HICON hIcon @0, int iIcon @8, DWORD dwAttributes
+/// @12, WCHAR szDisplayName[260] @16, WCHAR szTypeName[80] @536 (offsets
+/// verified against the Windows SDK headers).
+const SHFILEINFO_W_SIZE: u64 = 696;
+/// `sizeof(SHFILEINFOA)`: same prefix; CHAR szDisplayName[260] @16,
+/// CHAR szTypeName[80] @276.
+const SHFILEINFO_A_SIZE: u64 = 356;
+
+/// `DWORD_PTR SHGetFileInfoA/W(pszPath, dwFileAttributes, psfi, cbFileInfo, uFlags)`
+///
+/// KISS shell info: fills the SHFILEINFO prefix with a fake icon handle,
+/// `iIcon = 0`, and `dwAttributes = FILE_ATTRIBUTE_NORMAL` when `pszPath`
+/// names an existing guest file; the display name (file-name portion) is
+/// written when `cbFileInfo` covers the full struct. Returns 1 (non-zero) —
+/// real Windows returns 0 only when the struct is too small or NULL.
+fn handle_sh_get_file_info(
+    ctx: &mut HandlerContext<'_>,
+    wide: bool,
+) -> Result<WinApiHandlerResult> {
+    let (path, psfi, cb_file_info) = {
+        let engine = &mut *ctx.engine;
+        let path_va = engine.read_rcx()?;
+        let _dw_file_attributes = engine.read_rdx()?;
+        let psfi = engine.read_r8()?;
+        let cb_file_info = engine.read_r9()?;
+        let rsp = engine.read_rsp()?;
+        let _u_flags = read_u64(engine, rsp.wrapping_add(0x28))?;
+        let path = read_arg_string(engine, path_va, wide)?;
+        (path, psfi, cb_file_info)
+    };
+    if psfi == 0 || cb_file_info < SHFILEINFO_PREFIX_SIZE {
+        return finish(ctx.engine, 0);
+    }
+    let exists = crate::vfs::guest_path_to_host(&ctx.state.file_io.volumes, &path)
+        .is_some_and(|map| map.host.is_file());
+    write_guest_u64(ctx.engine, psfi.wrapping_add(0), FAKE_ICON_HANDLE)?;
+    write_guest_u32(ctx.engine, psfi.wrapping_add(8), 0)?; // iIcon
+    write_guest_u32(
+        // dwAttributes
+        ctx.engine,
+        psfi.wrapping_add(12),
+        if exists {
+            crate::vfs::FILE_ATTRIBUTE_NORMAL
+        } else {
+            0
+        },
+    )?;
+    let full_size = if wide {
+        SHFILEINFO_W_SIZE
+    } else {
+        SHFILEINFO_A_SIZE
+    };
+    if cb_file_info >= full_size {
+        let display_name = crate::vfs::guest_basename(&path);
+        if wide {
+            write_utf16_c_string(ctx.engine, psfi.wrapping_add(16), 260, display_name)?;
+        } else {
+            write_ansi_c_string(ctx.engine, psfi.wrapping_add(16), 260, display_name)?;
+        }
+    }
+    finish(ctx.engine, 1)
 }
 
 /// `LPWSTR* CommandLineToArgvW(LPCWSTR lpCmdLine, int* pNumArgs)`.
@@ -429,6 +542,39 @@ pub fn handle_shell_execute_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     finish(ctx.engine, return_value)
 }
 
+/// `BOOL ShellExecuteExW(pExecInfo)` — mirrors [`handle_shell_execute_w`]
+/// through the SHELLEXECUTEINFOW indirection.
+///
+/// Reads the struct pointed to by RCX (Win64 SDK layout: `lpVerb` @0x10,
+/// `lpFile` @0x18, `hInstApp` @0x38). Verb NULL/"open" on an existing guest
+/// path spawns a fresh WIE instance (fire-and-forget, same as
+/// [`handle_shell_execute_w`]) and returns TRUE; every other verb — or an
+/// empty file — writes the `SE_ERR_*` code into `hInstApp` and returns FALSE.
+fn handle_sh_execute_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let (exec_info_va, verb, file) = {
+        let engine = &mut *ctx.engine;
+        let exec_info_va = engine.read_rcx()?;
+        if exec_info_va == 0 {
+            return finish(engine, 0);
+        }
+        let verb_va = read_u64(engine, exec_info_va.wrapping_add(0x10))?;
+        let file_va = read_u64(engine, exec_info_va.wrapping_add(0x18))?;
+        let verb = read_utf16_lossy(engine, verb_va, 64)?;
+        let file = read_utf16_lossy(engine, file_va, 1024)?;
+        (exec_info_va, verb, file)
+    };
+    let (h_inst_app, ok) = if file.is_empty() {
+        (SE_ERR_FNF, false)
+    } else if verb.is_empty() || verb.eq_ignore_ascii_case("open") {
+        let launched = shell_execute_open(ctx.state, &file);
+        (launched, launched > 32)
+    } else {
+        (SE_ERR_NOASSOC, false)
+    };
+    write_guest_u64(ctx.engine, exec_info_va.wrapping_add(0x38), h_inst_app)?;
+    finish(ctx.engine, if ok { 1 } else { 0 })
+}
+
 /// Spawn a new WIE instance of the guest exe at `guest_path` (`wie-cli run`).
 ///
 /// Detached: the child is spawned and never waited on, so the guest thread
@@ -508,6 +654,7 @@ mod tests {
     };
     use ahash::HashMap;
     use ahash::HashMapExt;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use wie_cpu::{CpuEngine, IcedCpu, RwxPerms};
 
@@ -835,5 +982,224 @@ mod tests {
     fn resolve_launch_host_path_unknown_path_is_none() {
         let state = test_state();
         assert!(resolve_launch_host_path(&state, r"C:\does\not\exist.exe").is_none());
+    }
+
+    /// A `WinApiState` with a temp override bottle (unique per test thread —
+    /// `test_state`'s default volumes would hit the global app-data bottle).
+    fn test_bottle_state(tag: &str) -> (WinApiState, PathBuf) {
+        let mut state = test_state();
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("unnamed")
+            .to_owned();
+        let bottle =
+            std::env::temp_dir().join(format!("wie-shell32-{tag}-{}-{thread}", std::process::id()));
+        std::fs::create_dir_all(bottle.join("drive_c/App")).expect("mkdir bottle App");
+        state.file_io.volumes = VolumeConfig {
+            bottle_root: Some(bottle.clone()),
+            drive_d_root: None,
+        };
+        (state, bottle)
+    }
+
+    fn write_ansi(engine: &mut IcedCpu, va: u64, s: &str) {
+        let mut bytes = s.as_bytes().to_vec();
+        bytes.push(0);
+        engine.mem_write(va, &bytes).expect("write ansi string");
+    }
+
+    fn read_guest_u64(engine: &mut IcedCpu, addr: u64) -> u64 {
+        let mut bytes = [0_u8; 8];
+        engine.mem_read(addr, &mut bytes).expect("read guest u64");
+        u64::from_le_bytes(bytes)
+    }
+
+    fn read_guest_u32(engine: &mut IcedCpu, addr: u64) -> u32 {
+        let mut bytes = [0_u8; 4];
+        engine.mem_read(addr, &mut bytes).expect("read guest u32");
+        u32::from_le_bytes(bytes)
+    }
+
+    #[test]
+    fn sh_get_special_folder_path_w_maps_csidl_personal() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        write_regs(&mut engine, 0, 0x5000, 0x05, 0); // CSIDL_PERSONAL, fCreate=FALSE
+        let result = handle_sh_get_special_folder_path_w(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("SHGetSpecialFolderPathW should succeed");
+        assert_eq!(result.return_value, 1, "returns TRUE");
+        let text = read_utf16_lossy(&mut engine, 0x5000, 64).expect("read path");
+        assert_eq!(text, r"C:\Users\WIE\Documents");
+    }
+
+    #[test]
+    fn sh_get_special_folder_path_w_programs_with_fcreate() {
+        let (mut state, bottle) = test_bottle_state("special-programs");
+        let mut engine = test_engine();
+        write_regs(&mut engine, 0, 0x5000, 0x02, 1); // CSIDL_PROGRAMS, fCreate=TRUE
+        let result = handle_sh_get_special_folder_path_w(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("SHGetSpecialFolderPathW should succeed");
+        assert_eq!(result.return_value, 1, "returns TRUE");
+        let text = read_utf16_lossy(&mut engine, 0x5000, 128).expect("read path");
+        assert_eq!(
+            text,
+            r"C:\Users\WIE\AppData\Roaming\Microsoft\Windows\Start Menu\Programs"
+        );
+        // fCreate materialized the host dir — this path is NOT in the seeded
+        // skeleton, so only the fCreate branch could have created it.
+        assert!(
+            bottle
+                .join("drive_c/Users/WIE/AppData/Roaming/Microsoft/Windows/Start Menu/Programs")
+                .is_dir(),
+            "fCreate must materialize CSIDL_PROGRAMS under the bottle"
+        );
+        let _cleanup = std::fs::remove_dir_all(&bottle);
+    }
+
+    #[test]
+    fn sh_get_file_info_w_fills_struct_for_existing_file() {
+        let (mut state, bottle) = test_bottle_state("fileinfo-w");
+        std::fs::write(bottle.join("drive_c/App/shell_test.txt"), b"hello")
+            .expect("write test file");
+        let mut engine = test_engine();
+        write_wide(&mut engine, 0x3000, r"C:\App\shell_test.txt");
+        write_regs(&mut engine, 0x3000, 0, 0x5000, SHFILEINFO_W_SIZE);
+        let result = handle_sh_get_file_info(
+            &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+            true,
+        )
+        .expect("SHGetFileInfoW should succeed");
+        assert_eq!(result.return_value, 1, "returns non-zero");
+        assert_eq!(
+            read_guest_u64(&mut engine, 0x5000),
+            FAKE_ICON_HANDLE,
+            "hIcon"
+        );
+        assert_eq!(read_guest_u32(&mut engine, 0x5008), 0, "iIcon");
+        assert_eq!(
+            read_guest_u32(&mut engine, 0x500c),
+            crate::vfs::FILE_ATTRIBUTE_NORMAL,
+            "dwAttributes on an existing file"
+        );
+        let name = read_utf16_lossy(&mut engine, 0x5010, 64).expect("read display name");
+        assert_eq!(name, "shell_test.txt");
+        let _cleanup = std::fs::remove_dir_all(&bottle);
+    }
+
+    #[test]
+    fn sh_get_file_info_a_fills_struct_for_existing_file() {
+        let (mut state, bottle) = test_bottle_state("fileinfo-a");
+        std::fs::write(bottle.join("drive_c/App/shell_test.txt"), b"hello")
+            .expect("write test file");
+        let mut engine = test_engine();
+        write_ansi(&mut engine, 0x3000, r"C:\App\shell_test.txt");
+        write_regs(&mut engine, 0x3000, 0, 0x5000, SHFILEINFO_A_SIZE);
+        let result = handle_sh_get_file_info(
+            &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+            false,
+        )
+        .expect("SHGetFileInfoA should succeed");
+        assert_eq!(result.return_value, 1, "returns non-zero");
+        let mut name_bytes = [0_u8; 15];
+        engine
+            .mem_read(0x5010, &mut name_bytes)
+            .expect("read ANSI display name");
+        assert_eq!(
+            &name_bytes, b"shell_test.txt\0",
+            "ANSI name, NUL-terminated"
+        );
+        let _cleanup = std::fs::remove_dir_all(&bottle);
+    }
+
+    #[test]
+    fn sh_get_file_info_w_missing_file_has_zero_attributes() {
+        let (mut state, _bottle) = test_bottle_state("fileinfo-missing");
+        let mut engine = test_engine();
+        write_wide(&mut engine, 0x3000, r"C:\App\missing.txt");
+        write_regs(&mut engine, 0x3000, 0, 0x5000, SHFILEINFO_W_SIZE);
+        let result = handle_sh_get_file_info(
+            &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+            true,
+        )
+        .expect("SHGetFileInfoW should succeed");
+        assert_eq!(result.return_value, 1, "KISS: still returns non-zero");
+        assert_eq!(read_guest_u32(&mut engine, 0x500c), 0, "no attributes");
+    }
+
+    #[test]
+    fn sh_get_file_info_w_null_struct_returns_zero() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        write_wide(&mut engine, 0x3000, r"C:\App\shell_test.txt");
+        write_regs(&mut engine, 0x3000, 0, 0, SHFILEINFO_W_SIZE); // psfi = NULL
+        let result = handle_sh_get_file_info(
+            &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+            true,
+        )
+        .expect("SHGetFileInfoW should succeed");
+        assert_eq!(result.return_value, 0, "NULL struct → failure");
+    }
+
+    /// Build a SHELLEXECUTEINFOW at `0x5000` with `lpVerb` (wide, at `0x3000`)
+    /// and `lpFile` (wide, at `0x4000`), pointers at the SDK offsets.
+    fn write_exec_info(engine: &mut IcedCpu) {
+        engine
+            .mem_write(0x5010, &0x3000_u64.to_le_bytes())
+            .expect("write lpVerb pointer");
+        engine
+            .mem_write(0x5018, &0x4000_u64.to_le_bytes())
+            .expect("write lpFile pointer");
+    }
+
+    #[test]
+    fn sh_execute_ex_w_other_verb_sets_noassoc() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        write_wide(&mut engine, 0x3000, "edit");
+        write_wide(&mut engine, 0x4000, r"C:\App\notepad.exe");
+        write_exec_info(&mut engine);
+        write_regs(&mut engine, 0x5000, 0, 0, 0);
+        let result = handle_sh_execute_ex_w(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("ShellExecuteExW should succeed");
+        assert_eq!(result.return_value, 0, "non-open verb returns FALSE");
+        assert_eq!(
+            read_guest_u64(&mut engine, 0x5038),
+            SE_ERR_NOASSOC,
+            "hInstApp = SE_ERR_NOASSOC"
+        );
+    }
+
+    #[test]
+    fn sh_execute_ex_w_empty_file_sets_fnf() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        write_wide(&mut engine, 0x3000, "open");
+        write_wide(&mut engine, 0x4000, "");
+        write_exec_info(&mut engine);
+        write_regs(&mut engine, 0x5000, 0, 0, 0);
+        let result = handle_sh_execute_ex_w(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("ShellExecuteExW should succeed");
+        assert_eq!(result.return_value, 0, "empty file returns FALSE");
+        assert_eq!(
+            read_guest_u64(&mut engine, 0x5038),
+            SE_ERR_FNF,
+            "hInstApp = SE_ERR_FNF"
+        );
     }
 }

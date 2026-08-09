@@ -64,7 +64,13 @@ MSVCR71/MSVCP71 forwarding. Zero-coverage table now holds only WININET/URLMON.
 | `COMCTL32` | ImageList rest, toolbar, listview, treeview, progress bar | `comctl_toolbar` |
 | `WINMM` | waveOut*, timeSetEvent | `winmm_audio` — waveOut stubs (no host audio) |
 
-**Milestone M2**: Tier 2 complete.
+**Milestone M2**: ✅ LANDED (2026-08) — five of six families complete:
+- `SHELL32` — SHGetFileInfoA/W (SHFILEINFO + real path resolution), SHGetSpecialFolderPathW (CSIDL→bottle map, fCreate materializes dirs), ShellExecuteExW (detached wie-cli run, SE_ERR_* on failure). `shell_folders` micro green.
+- `ADVAPI32` — RegDeleteKeyW/A (subkey + values via RegistryState::delete_key), RegFlushKey (write-through persist), RegSaveKey (documented no-op — host per-bottle persistence). Bonus fix: HKEY root constants now match the sign-extended Win64 spellings real guests pass (was ERROR_INVALID_HANDLE on every root op). `reg_roundtrip` micro green.
+- `USER32` — EnumWindows/EnumChildWindows (guest callback via GuestCallbackRequested bridge), FindWindowA/W (class+title match), caret family (per-window size + thread position), DrawIcon no-op. `user32_enum` micro green. NOTE: the callback bridge completes after one callback — full N-window iteration needs a runtime continuation hook.
+- `GDI32` — GetDIBits/SetDIBits (DIB-section resolution, top-down/bottom-up rows, size-query mode), region objects (CreateRectRgn/Elliptic/Polygon, CombineRgn AND/OR/DIFF/XOR/COPY with NULL/SIMPLE/COMPLEX), GetRgnBox, SetRectRgn. EnumFontFamiliesEx/SetPixel documented no-ops. `gdi_regions` micro green.
+- `COMCTL32` + `WINMM` — ImageList_Add/GetImageCount/GetIconSize/SetIconSize/Draw/GetImageInfo (record table in lockstep with the dense handlers), CreateToolbarEx (real child window); waveOutOpen/Close/PrepareHeader/UnprepareHeader/Write/GetNumDevs (stubs, no host audio), timeSetEvent/timeKillEvent (store-only, callbacks fire on a future host stop). `comctl_toolbar` + `winmm_audio` micros green.
+- `OLE32` + `OLEAUT32` — CoRegisterClassObject/Revoke + CoCreateInstance class table, CoCreateGuid, CoTaskMemAlloc/Free/Realloc, StringFromCLSID/CLSIDFromString, SafeArray create/destroy/access/get/put/bounds, DispGetIDsOfNames/DispInvoke stubs. `ole_com` micro.
 
 ## Tier 3 — infrastructure breadth
 

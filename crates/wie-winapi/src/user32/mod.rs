@@ -291,6 +291,7 @@ pub mod dc;
 pub mod dialog;
 pub mod display;
 pub mod dragdrop;
+mod enum_caret;
 pub mod input;
 pub mod lang;
 pub mod menu;
@@ -802,6 +803,5 @@ pub fn dispatch_user32_extra(
     ctx: &mut HandlerContext<'_>,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
-    let _ = (ctx, name);
-    Ok(None)
+    enum_caret::dispatch_enum_caret(ctx, name)
 }

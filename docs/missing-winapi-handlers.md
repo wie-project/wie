@@ -112,7 +112,7 @@ Any call to these returns `bail!("unsupported WinAPI call: {library}!{name}")`:
 
 ---
 
-## SHELL32.dll — 12 exports
+## SHELL32.dll — 16 exports
 
 **Implemented:**
 - `SHGetFolderPathW` — functional, maps CSIDL to synthetic bottle paths
@@ -124,13 +124,18 @@ Any call to these returns `bail!("unsupported WinAPI call: {library}!{name}")`:
   every open/save; `handle_sh_add_to_recent_docs`)
 - `DragAcceptFiles`, `DragQueryFileA/W`, `DragQueryPoint`, `DragFinish` + `WM_DROPFILES` (see "Recently landed")
 - `ShellAboutW` (MessageBox bridge), `ShellExecuteW` ("open" → detached `wie-cli run`)
+- `SHGetFileInfoA/W` — fills SHFILEINFO prefix (icon handle, attributes via real
+  guest-path resolution) + display name when the buffer fits (Tier 2)
+- `SHGetSpecialFolderPathW` — CSIDL→bottle map shared with SHGetFolderPathW;
+  `fCreate` materializes the mapped host dir (Tier 2)
+- `ShellExecuteExW` — mirrors ShellExecuteW (open → detached `wie-cli run`,
+  `SE_ERR_*` into hInstApp on failure) (Tier 2)
 
 **Missing:**
 - `ShellExecuteA`
-- `ShellExecuteExA` / `ShellExecuteExW`
+- `ShellExecuteExA`
 - `FindExecutableA` / `FindExecutableW`
-- `SHGetFileInfoA` / `SHGetFileInfoW`
-- `SHGetSpecialFolderPathA` / `SHGetSpecialFolderPathW`
+- `SHGetSpecialFolderPathA`
 - `SHCreateDirectoryExA` / `SHCreateDirectoryExW`
 - `SHEmptyRecycleBinA` / `SHEmptyRecycleBinW`
 - `SHQueryRecycleBinA` / `SHQueryRecycleBinW`
@@ -222,7 +227,7 @@ region-limited present; 51 `IDirect3DDevice9` methods + the `IDirect3D9` core
 
 ---
 
-## GDI32.dll — 38 exports, real text/print/blit
+## GDI32.dll — 38+ exports, real text/print/blit
 
 **Implemented (real, not stubs):**
 - **Text**: `TextOutA/W`, `ExtTextOutW`, `DrawTextA/W` — real glyph rasterization
@@ -235,6 +240,12 @@ region-limited present; 51 `IDirect3DDevice9` methods + the `IDirect3D9` core
 - **Blits**: `BitBlt` (real 32-bpp SRCCOPY blit to window surfaces),
   `PatBlt` (fills with the DC's selected brush color), `FillRect`
   (`gdi32/blit.rs` — `FillRect` is dispatched from the `user32.dll` name rows)
+- **DIB round-trips** (Tier 2, `gdi32/dib.rs`): `GetDIBits`/`SetDIBits` — resolve
+  the HBITMAP to its DIB-section buffer, size-query mode fills a full
+  BITMAPINFOHEADER, scan-line copies honor top-down/bottom-up orientation
+- **Regions** (Tier 2, `gdi32/regions.rs`): `CreateRectRgn`/`CreateEllipticRgn`/
+  `CreatePolygonRgn`, `CombineRgn` (rect-list AND/OR/DIFF/XOR/COPY with
+  NULL/SIMPLE/COMPLEX classification), `SetRectRgn`, `GetRgnBox`
 - **Objects/state**: `CreateSolidBrush`, `CreatePen`, `CreateFontA/W`,
   `CreateFontIndirectA/W`, `CreateCompatibleBitmap`, `CreateCompatibleDC`,
   `CreateDIBSection` (allocates a pixel buffer selectable into DCs),
@@ -247,11 +258,10 @@ region-limited present; 51 `IDirect3DDevice9` methods + the `IDirect3D9` core
 **Stubs (accept input, return success, do nothing):**
 - `StretchBlt` — returns 1, no scaling
 - `GetPixel` — returns `FAKE_PIXEL_COLOR` (0)
+- `EnumFontFamiliesExW/A`, `SetPixel` — TRUE no-ops (Tier 2)
 
 **Missing entirely:**
-- `AlphaBlend`, `TransparentBlt`, `GradientFill`
-- `SetPixel`, `GetDIBits`, `SetDIBits`, `SetDIBitsToDevice`, `StretchDIBits`
-- `CreateEllipticRgn`, `CreateRectRgn`, `CreatePolygonRgn`, `CombineRgn`
+- `SetDIBitsToDevice`, `StretchDIBits`
 - `FrameRgn`, `FillRgn`, `InvertRgn`, `PaintRgn`
 - `GetRandomRgn`, `GetRegionData`
 - `SetWorldTransform`, `GetWorldTransform`, `ModifyWorldTransform`
@@ -295,7 +305,8 @@ region-limited present; 51 `IDirect3DDevice9` methods + the `IDirect3D9` core
 
 **Missing entirely (superseded items — accelerators, dialogs, focus/capture, menu APIs,
 window placement, clipboard, SetTimer/WM_TIMER, drag-drop, SetWindowText-family, the
-find/replace + Go To + font dialogs, status-bar paint, the EDIT caret + EM_SETHANDLE —
+find/replace + Go To + font dialogs, status-bar paint, the EDIT caret + EM_SETHANDLE,
+EnumWindows/EnumChildWindows, FindWindowA/W, caret family, DrawIcon —
 are landed; see "Recently landed"):**
 - `CreateAcceleratorTableA/W` (runtime-built tables; resource tables + TranslateAccelerator are landed)
 - `MapDialogRect`
@@ -304,18 +315,15 @@ are landed; see "Recently landed"):**
 - `SetWindowRgn`, `GetWindowRgn`
 - `ArrangeIconicWindows`
 - `SetSysColors`, `SetSysColorsTemp`
-- `DrawIcon`, `DrawIconEx`, `DrawTextExA/W`, `TabbedTextOutA/W`
+- `DrawTextExA/W`, `TabbedTextOutA/W`
 - `DrawEdge`, `DrawFrameControl`, `DrawCaption`
 - `FrameRect`, `InvertRect`
 - `WindowFromPoint`, `ChildWindowFromPoint`, `ChildWindowFromPointEx`
-- `FindWindowA/W`, `FindWindowExA/W`
-- `EnumWindows`, `EnumChildWindows`, `EnumThreadWindows`
+- `FindWindowExA/W`
+- `EnumThreadWindows`
 - `FlashWindow`, `FlashWindowEx`
 - `OpenIcon`, `CloseWindow`
 - `LockWindowUpdate`
-- `CreateCaret`, `ShowCaret`, `HideCaret`, `SetCaretPos`, `GetCaretPos`, `DestroyCaret`
-  (the EDIT control's caret blink is internal to the control; these Win32 caret APIs are
-  not dispatched)
 - `SetCursorPos`, `ShowCursor`, `LoadCursorFromFileA/W`
   (`GetCursorPos`, `SetCursor`, `GetCursor`, `ClipCursor`, `GetClipCursor` landed)
 - `CascadeWindows`, `TileWindows`
@@ -327,17 +335,17 @@ are landed; see "Recently landed"):**
 
 ---
 
-## ADVAPI32.dll — ~40% coverage, registry is minimal
+## ADVAPI32.dll — ~50% coverage, registry is minimal
 
 **Registry missing (value/key storage landed — RegQueryValueExA/W, RegSetValueExA/W,
 RegDeleteValueA/W, RegOpenKeyA/W, RegOpenKeyExA/W, RegCreateKeyExA/W, RegCloseKey +
 per-bottle hive persistence; enumeration landed — RegEnumKeyExA/W, RegEnumValueA/W in
-`dispatch_advapi32_extra`; see "Recently landed"):**
-- `RegDeleteKeyA` / `RegDeleteKeyW`
+`dispatch_advapi32_extra`; key deletion + flush landed — RegDeleteKeyA/W, RegFlushKey
+in `dispatch_advapi32_extra`; see "Recently landed"):**
 - `RegLoadKeyA` / `RegLoadKeyW`
 - `RegUnLoadKeyA` / `RegUnLoadKeyW`
 - `RegConnectRegistryA` / `RegConnectRegistryW`
-- `RegSaveKeyA` / `RegSaveKeyW`
+- `RegSaveKeyA` / `RegSaveKeyW` — documented no-op success (host per-bottle persistence covers it)
 - `RegReplaceKeyA` / `RegReplaceKeyW`
 - `RegSetKeySecurity` / `RegGetKeySecurity`
 - `RegGetKeyName`
@@ -408,20 +416,23 @@ per-bottle hive persistence; enumeration landed — RegEnumKeyExA/W, RegEnumValu
 
 ---
 
-## COMCTL32.dll — status bar + a few ImageList functions
+## COMCTL32.dll — status bar + ImageList family + toolbar
 
 **Implemented:**
 - `DLLGetVersion`, `InitCommonControls` (ordinal 17), `InitCommonControlsEx`
-- ImageList: `ImageList_Create`, `ImageList_AddMasked`, `ImageList_SetBkColor`, `ImageList_Destroy`
+- ImageList: `ImageList_Create`, `ImageList_AddMasked`, `ImageList_SetBkColor`, `ImageList_Destroy`,
+  plus (Tier 2) `ImageList_Add`, `ImageList_GetImageCount`, `ImageList_GetIconSize`,
+  `ImageList_SetIconSize`, `ImageList_Draw` (no-op), `ImageList_GetImageInfo` — a record
+  table keeps the string-path and dense handlers in lockstep
 - Status bar: `CreateStatusWindowA/W`, `STATUSCLASSNAMEW` class, `SB_SETPARTS`/`SB_SETTEXTW`/`SB_GETTEXTW`/`SB_GETTEXTLENGTHW` (see "Recently landed")
+- Toolbar: `CreateToolbarEx` (Tier 2 — creates a real `ToolbarWindow32` child window record)
 
 **Missing:**
-- Rest of the ImageList family: `ImageList_Add`, `ImageList_ReplaceIcon`, `ImageList_Remove`,
-  `ImageList_GetImageCount`, `ImageList_SetImageCount`, `ImageList_GetIconSize`,
-  `ImageList_SetIconSize`, `ImageList_GetIcon`, `ImageList_SetOverlayImage`, `ImageList_BeginDrag`,
+- Rest of the ImageList family: `ImageList_ReplaceIcon`, `ImageList_Remove`,
+  `ImageList_SetImageCount`, `ImageList_GetIcon`, `ImageList_SetOverlayImage`, `ImageList_BeginDrag`,
   `ImageList_EndDrag`, `ImageList_DragEnter`, `ImageList_DragLeave`, `ImageList_DragMove`,
   `ImageList_GetDragImage`, `ImageList_SetDragCursorImage`
-- All toolbar APIs: `CreateToolbarEx`, `CommandBar_*`, `Toolbar_Set*`
+- Toolbar messages: `Toolbar_Set*` (TB_* handled host-side only for the created window)
 - All listview APIs: `ListView_Set*`, `ListView_Get*`, `ListView_InsertColumn`, `ListView_InsertItem`
 - All treeview APIs: `TreeView_InsertItem`, `TreeView_DeleteItem`, `TreeView_Expand`, `TreeView_SelectItem`
 - All tab control APIs: `TabCtrl_InsertItem`, `TabCtrl_DeleteItem`, `TabCtrl_SetCurSel`, `TabCtrl_GetCurSel`
@@ -432,6 +443,22 @@ per-bottle hive persistence; enumeration landed — RegEnumKeyExA/W, RegEnumValu
 - All rebar APIs
 - All property sheet APIs: `PropertySheet`, `CreatePropertySheetPage`, `DestroyPropertySheetPage`
 - All task dialog APIs: `TaskDialog`, `TaskDialogIndirect`
+
+---
+
+## WINMM.dll — timer + waveOut stubs
+
+**Implemented:**
+- `timeGetTime` — dense row, ms-since-session-epoch (guest clock table slot 2)
+- `timeSetEvent` / `timeKillEvent` (Tier 2) — timer handle table in `WinmmState`
+  (DllId::Winmm); store-only, callbacks fire on a future host stop
+- `waveOutOpen` / `waveOutClose` / `waveOutPrepareHeader` / `waveOutUnprepareHeader` /
+  `waveOutWrite` / `waveOutGetNumDevs` (Tier 2) — stub family, no host audio;
+  a fake wave-out device exists
+
+**Missing:**
+- All other multimedia APIs: waveIn*, mixer*, midi*, aux*, joy*, PlaySound, mciSendString,
+  timeGetSystemTime, timeBeginPeriod/timeEndPeriod
 
 ---
 
