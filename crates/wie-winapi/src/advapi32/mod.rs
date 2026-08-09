@@ -1029,6 +1029,5 @@ fn read_optional_utf16_string(engine: &mut dyn wie_cpu::CpuEngine, address: u64)
     }
 }
 
-
 #[cfg(test)]
 mod tests;
