@@ -67,6 +67,510 @@ pub fn winapi_id_export(id: WinApiId) -> Option<(&'static str, &'static str)> {
     None
 }
 
+/// Soft-dispatched UCRT/msvcrt callable exports (mirror of `dispatch_ucrt` arms).
+const UCRT_CALLABLE: &[&str] = &[
+    "??1type_info@@ueaa@xz",
+    "?terminate@@yaxxz",
+    "__acrt_iob_func",
+    "__c_specific_handler",
+    "__dllonexit",
+    "__getmainargs",
+    "__p___argc",
+    "__p___argv",
+    "__p___wargv",
+    "__p__acmdln",
+    "__p__commode",
+    "__p__environ",
+    "__p__fmode",
+    "__p__wenviron",
+    "__set_app_type",
+    "__setusermatherr",
+    "__stdio_common_vfprintf",
+    "__stdio_common_vfscanf",
+    "__stdio_common_vsprintf",
+    "__stdio_common_vsscanf",
+    "_beginthreadex",
+    "_c_exit",
+    "_cexit",
+    "_configthreadlocale",
+    "_configure_narrow_argv",
+    "_configure_wide_argv",
+    "_crt_atexit",
+    "_cxxthrowexception",
+    "_endthreadex",
+    "_errno",
+    "_exit",
+    "_fpreset",
+    "_get_osfhandle",
+    "_getch",
+    "_initialize_narrow_environment",
+    "_initialize_wide_environment",
+    "_initterm",
+    "_initterm_e",
+    "_isatty",
+    "_kbhit",
+    "_localtime64",
+    "_onexit",
+    "_purecall",
+    "_set_app_type",
+    "_set_invalid_parameter_handler",
+    "_set_new_mode",
+    "_time64",
+    "_vsnprintf",
+    "_vsnwprintf",
+    "_wcsnicmp",
+    "_xcptfilter",
+    "abort",
+    "atoi",
+    "atol",
+    "calloc",
+    "exit",
+    "fclose",
+    "fflush",
+    "fgetc",
+    "fgets",
+    "fopen",
+    "fputc",
+    "fputs",
+    "free",
+    "fwrite",
+    "getchar",
+    "getenv",
+    "isalnum",
+    "isalpha",
+    "isdigit",
+    "islower",
+    "isspace",
+    "isupper",
+    "iswctype",
+    "malloc",
+    "memcmp",
+    "memcpy",
+    "memmove",
+    "memset",
+    "perror",
+    "putchar",
+    "puts",
+    "rand",
+    "realloc",
+    "setlocale",
+    "setvbuf",
+    "signal",
+    "srand",
+    "strchr",
+    "strcmp",
+    "strerror",
+    "strlen",
+    "strncmp",
+    "strncpy",
+    "strstr",
+    "strtod",
+    "strtof",
+    "strtok",
+    "strtol",
+    "strtoul",
+    "system",
+    "tolower",
+    "toupper",
+    "towupper",
+    "wcscat",
+    "wcscmp",
+    "wcscpy",
+    "wcslen",
+    "wcsncmp",
+    "wcsncpy",
+    "wcsrchr",
+    "wcsstr",
+];
+
+/// Soft-dispatched `ole32.dll` exports (mirror of the `dispatch_*` fallback arms).
+const OLE32_DLL_EXPORTS: &[&str] = &[
+    "clsidfromstring",
+    "cocreateguid",
+    "cocreateinstance",
+    "cogetclassobject",
+    "coinitialize",
+    "coinitializeex",
+    "coregisterclassobject",
+    "corevokeclassobject",
+    "cotaskmemalloc",
+    "cotaskmemfree",
+    "cotaskmemrealloc",
+    "couninitialize",
+    "stringfromclsid",
+];
+
+/// Soft-dispatched `shell32.dll` exports (mirror of the `dispatch_*` fallback arms).
+const SHELL32_DLL_EXPORTS: &[&str] = &[
+    "commandlinetoargvw",
+    "shaddtorecentdocs",
+    "shbrowseforfolderw",
+    "shellexecuteexw",
+    "shgetfileinfoa",
+    "shgetfileinfow",
+    "shgetfolderpathw",
+    "shgetpathfromidlistw",
+    "shgetspecialfolderpathw",
+];
+
+/// Soft-dispatched `oleaut32.dll` exports (mirror of the `dispatch_*` fallback arms).
+const OLEAUT32_DLL_EXPORTS: &[&str] = &[
+    "dispgetidsofnames",
+    "dispinvoke",
+    "ordinal 10",
+    "ordinal 11",
+    "ordinal 149",
+    "ordinal 2",
+    "ordinal 4",
+    "ordinal 6",
+    "ordinal 7",
+    "ordinal 8",
+    "ordinal 9",
+    "safearrayaccessdata",
+    "safearraycreate",
+    "safearraydestroy",
+    "safearraygetdim",
+    "safearraygetelement",
+    "safearraygetlbound",
+    "safearraygetubound",
+    "safearrayputelement",
+    "safearrayunaccessdata",
+    "sysallocstring",
+    "sysallocstringlen",
+    "sysfreestring",
+    "sysstringbyteslen",
+    "sysstringlen",
+    "variantclear",
+    "variantcopy",
+    "variantinit",
+];
+
+/// Soft-dispatched `user32.dll` exports (mirror of the `dispatch_*` fallback arms).
+const USER32_DLL_EXPORTS: &[&str] = &[
+    "createcaret",
+    "destroycaret",
+    "drawicona",
+    "drawiconex",
+    "drawiconw",
+    "enumchildwindows",
+    "enumwindows",
+    "findwindowa",
+    "findwindoww",
+    "getcaretpos",
+    "hidecaret",
+    "setcaretpos",
+    "showcaret",
+];
+
+/// Soft-dispatched `gdi32.dll` exports (mirror of the `dispatch_*` fallback arms).
+const GDI32_DLL_EXPORTS: &[&str] = &[
+    "combinergn",
+    "createellipticrgn",
+    "createpolygonrgn",
+    "createrectrgn",
+    "enumfontfamiliesexa",
+    "enumfontfamiliesexw",
+    "getdibits",
+    "getrgnbox",
+    "setdibits",
+    "setpixel",
+    "setrectrgn",
+];
+
+/// Soft-dispatched `comctl32.dll` exports (mirror of the `dispatch_*` fallback arms).
+const COMCTL32_DLL_EXPORTS: &[&str] = &[
+    "createtoolbarex",
+    "imagelist_add",
+    "imagelist_draw",
+    "imagelist_geticonsize",
+    "imagelist_getimagecount",
+    "imagelist_getimageinfo",
+    "imagelist_seticonsize",
+];
+
+/// Soft-dispatched `winmm.dll` exports (mirror of the `dispatch_*` fallback arms).
+const WINMM_DLL_EXPORTS: &[&str] = &[
+    "timekillevent",
+    "timesetevent",
+    "waveoutclose",
+    "waveoutgetnumdevs",
+    "waveoutopen",
+    "waveoutprepareheader",
+    "waveoutunprepareheader",
+    "waveoutwrite",
+];
+
+/// Soft-dispatched `advapi32.dll` exports (mirror of the `dispatch_*` fallback arms).
+const ADVAPI32_DLL_EXPORTS: &[&str] = &[
+    "adjusttokenprivileges",
+    "getfilesecuritya",
+    "getfilesecurityw",
+    "lookupprivilegevaluea",
+    "lookupprivilegevaluew",
+    "openprocesstoken",
+    "regcreatekeyexw",
+    "regdeletekeya",
+    "regdeletekeyw",
+    "regdeletevaluew",
+    "regenumkeyexa",
+    "regenumkeyexw",
+    "regenumvaluea",
+    "regenumvaluew",
+    "regflushkey",
+    "regopenkeyexw",
+    "regsavekeya",
+    "regsavekeyw",
+    "setfilesecuritya",
+    "setfilesecurityw",
+    "systemfunction036",
+];
+
+/// Soft-dispatched `kernel32.dll` exports (mirror of the `dispatch_*` fallback arms).
+const KERNEL32_DLL_EXPORTS: &[&str] = &[
+    "allocconsole",
+    "assignprocesstojobobject",
+    "attachconsole",
+    "backupread",
+    "backupseek",
+    "backupwrite",
+    "comparefiletime",
+    "createconsolescreenbuffer",
+    "createeventa",
+    "createeventw",
+    "createfilemappingw",
+    "createhardlinkw",
+    "createjobobjecta",
+    "createjobobjectw",
+    "createsemaphorea",
+    "createsemaphorew",
+    "createthread",
+    "debugbreak",
+    "deviceiocontrol",
+    "dosdatetimetofiletime",
+    "duplicatehandle",
+    "exitthread",
+    "expandenvironmentstringsa",
+    "expandenvironmentstringsw",
+    "filetimetodosdatetime",
+    "fillconsoleoutputattribute",
+    "fillconsoleoutputcharactera",
+    "fillconsoleoutputcharacterw",
+    "findfirststreamw",
+    "findnextstreamw",
+    "flushconsoleinputbuffer",
+    "flushinstructioncache",
+    "formatmessagew",
+    "freeconsole",
+    "getcompressedfilesizea",
+    "getcompressedfilesizew",
+    "getcomputernamea",
+    "getcomputernameexw",
+    "getcomputernamew",
+    "getconsolecp",
+    "getconsolecursorinfo",
+    "getconsolemode",
+    "getconsoleoutputcp",
+    "getconsolescreenbufferinfo",
+    "getconsoletitlea",
+    "getconsoletitlew",
+    "getconsolewindow",
+    "getcurrentthread",
+    "getdiskfreespaceexw",
+    "getdiskfreespacew",
+    "getenvironmentvariablea",
+    "getenvironmentvariablew",
+    "getexitcodethread",
+    "getfileattributesexa",
+    "getfileattributesexw",
+    "getlargepageminimum",
+    "getlargestconsolewindowsize",
+    "getlogicaldrivestringsw",
+    "getlongpathnamea",
+    "getlongpathnamew",
+    "getmodulehandlew",
+    "getnumberofconsoleinputevents",
+    "getnumberofconsolemousebuttons",
+    "getprocessaffinitymask",
+    "getprocesstimes",
+    "getshortpathnamea",
+    "getshortpathnamew",
+    "getsysteminfo",
+    "getthreadpriority",
+    "gettickcount64",
+    "getusernamea",
+    "getusernamew",
+    "getuserprofiledirectorya",
+    "getuserprofiledirectoryw",
+    "getversion",
+    "getvolumeinformationa",
+    "getvolumeinformationw",
+    "globalmemorystatusex",
+    "interlockedcompareexchange",
+    "interlockedcompareexchange64",
+    "interlockeddecrement",
+    "interlockeddecrement64",
+    "interlockedexchange",
+    "interlockedexchange64",
+    "interlockedexchangeadd",
+    "interlockedexchangeadd64",
+    "interlockedincrement",
+    "interlockedincrement64",
+    "isdebuggerpresent",
+    "isprocessorfeaturepresent",
+    "localfiletimetofiletime",
+    "lockfile",
+    "lstrcatw",
+    "lstrcpyw",
+    "lstrlenw",
+    "mapviewoffile",
+    "movefilewithprogressw",
+    "openeventa",
+    "openeventw",
+    "openfilemappinga",
+    "openfilemappingw",
+    "openthread",
+    "outputdebugstringa",
+    "outputdebugstringw",
+    "peekconsoleinputw",
+    "queryfullprocessimagenamea",
+    "queryfullprocessimagenamew",
+    "queryperformancefrequency",
+    "raiseexception",
+    "readconsolea",
+    "readconsoleinputw",
+    "readconsolew",
+    "releasesemaphore",
+    "resetevent",
+    "resumethread",
+    "rtlcapturecontext",
+    "rtlunwindex",
+    "scrollconsolescreenbufferw",
+    "setconsoleactivescreenbuffer",
+    "setconsolecp",
+    "setconsolectrlhandler",
+    "setconsolecursorinfo",
+    "setconsolecursorposition",
+    "setconsolemode",
+    "setconsoleoutputcp",
+    "setconsolescreenbuffersize",
+    "setconsoletitlea",
+    "setconsoletitlew",
+    "setconsolewindowinfo",
+    "setenvironmentvariablea",
+    "setenvironmentvariablew",
+    "seterrormode",
+    "setevent",
+    "setfileapistooem",
+    "setfileattributesw",
+    "setfiletime",
+    "setfilevaliddata",
+    "setprocessaffinitymask",
+    "setthreadaffinitymask",
+    "setthreaderrormode",
+    "signalobjectandwait",
+    "suspendthread",
+    "terminateprocess",
+    "terminatethread",
+    "tlsalloc",
+    "tlsfree",
+    "tlsgetvalue",
+    "tlssetvalue",
+    "unlockfile",
+    "unmapviewoffile",
+    "virtualalloc",
+    "virtualfree",
+    "virtualprotect",
+    "virtualquery",
+    "waitformultipleobjects",
+    "waitforsingleobject",
+    "writeconsolea",
+    "writeconsoleoutputattribute",
+    "writeconsoleoutputcharactera",
+    "writeconsoleoutputcharacterw",
+    "writeconsolew",
+];
+
+/// Soft-dispatched `ws2_32.dll` exports (mirror of the `dispatch_*` fallback arms).
+const WS2_32_DLL_EXPORTS: &[&str] = &[
+    "accept",
+    "bind",
+    "closesocket",
+    "connect",
+    "freeaddrinfo",
+    "getaddrinfo",
+    "gethostbyname",
+    "getpeername",
+    "getsockname",
+    "getsockopt",
+    "htons",
+    "inet_addr",
+    "inet_ntoa",
+    "ioctlsocket",
+    "listen",
+    "ntohs",
+    "recv",
+    "select",
+    "send",
+    "setsockopt",
+    "shutdown",
+    "socket",
+    "wsacleanup",
+    "wsagetlasterror",
+    "wsasetlasterror",
+    "wsastartup",
+];
+
+/// Soft-dispatched `crypt32.dll` exports (mirror of the `dispatch_*` fallback arms).
+const CRYPT32_DLL_EXPORTS: &[&str] = &[
+    "cryptacquirecontexta",
+    "cryptacquirecontextw",
+    "cryptcreatehash",
+    "cryptdestroyhash",
+    "cryptgenrandom",
+    "cryptgethashparam",
+    "crypthashdata",
+    "cryptreleasecontext",
+];
+
+/// Soft-dispatched `msimg32.dll` exports (mirror of the `dispatch_*` fallback arms).
+const MSIMG32_DLL_EXPORTS: &[&str] = &["alphablend", "gradientfill", "transparentblt"];
+
+/// Soft-dispatched `imm32.dll` exports (mirror of the `dispatch_*` fallback arms).
+const IMM32_DLL_EXPORTS: &[&str] = &[
+    "immgetcompositionstringw",
+    "immgetcontext",
+    "immgetopenstatus",
+    "immreleasecontext",
+];
+
+/// Soft-dispatched `uxtheme.dll` exports (mirror of the `dispatch_*` fallback arms).
+const UXTHEME_DLL_EXPORTS: &[&str] = &[
+    "closethemedata",
+    "getwindowtheme",
+    "isthemeactive",
+    "openthemedata",
+];
+
+/// Soft-dispatched `setupapi.dll` exports (mirror of the `dispatch_*` fallback arms).
+const SETUPAPI_CFGMGR32: &[&str] = &[
+    "cm_get_device_id_lista",
+    "cm_get_device_id_listw",
+    "setupdidestroydeviceinfolist",
+    "setupdienumdeviceinfo",
+    "setupdigetclassdevsa",
+    "setupdigetclassdevsw",
+];
+
+/// Soft-dispatched `dbghelp.dll` exports (mirror of the `dispatch_*` fallback arms).
+const DBGHELP_IMAGEHLP: &[&str] = &[
+    "mapfileandchecksuma",
+    "mapfileandchecksumw",
+    "symcleanup",
+    "symfromaddr",
+    "symfromaddrw",
+    "syminitialize",
+    "syminitializew",
+];
 pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
     if resolve_winapi_id(library, name).is_some() {
         return true;
@@ -76,544 +580,30 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
         if crate::ucrt::crt_data_import_va(name).is_some() {
             return true;
         }
-        // Mirror dispatch_ucrt arms that are callable exports.
         let n = name.to_ascii_lowercase();
-        return matches!(
-            n.as_str(),
-            "__acrt_iob_func"
-                | "fwrite"
-                | "fflush"
-                | "setvbuf"
-                | "_vsnwprintf"
-                | "_vsnprintf"
-                | "__stdio_common_vfprintf"
-                | "malloc"
-                | "calloc"
-                | "free"
-                | "_set_new_mode"
-                | "__p__environ"
-                | "__p__acmdln"
-                | "__p___argc"
-                | "__p___argv"
-                | "__p___wargv"
-                | "__p__wenviron"
-                | "__p__commode"
-                | "__p__fmode"
-                | "_configthreadlocale"
-                | "__setusermatherr"
-                | "__c_specific_handler"
-                | "memcpy"
-                | "memmove"
-                | "memcmp"
-                | "memset"
-                | "strlen"
-                | "strncmp"
-                | "strchr"
-                | "strstr"
-                | "_initterm"
-                | "_initterm_e"
-                | "_configure_narrow_argv"
-                | "_initialize_narrow_environment"
-                | "_configure_wide_argv"
-                | "_initialize_wide_environment"
-                | "_fpreset"
-                | "_crt_atexit"
-                | "_set_app_type"
-                | "__set_app_type"
-                | "_set_invalid_parameter_handler"
-                | "__getmainargs"
-                | "_xcptfilter"
-                | "_cexit"
-                | "_c_exit"
-                | "signal"
-                | "exit"
-                | "_exit"
-                | "abort"
-                | "realloc"
-                | "_isatty"
-                | "_get_osfhandle"
-                | "fputc"
-                | "putchar"
-                | "getchar"
-                | "fputs"
-                | "fgetc"
-                | "strcmp"
-                | "strncpy"
-                | "wcscmp"
-                | "wcsstr"
-                | "wcslen"
-                | "wcscat"
-                | "wcscpy"
-                | "wcsncmp"
-                | "wcsncpy"
-                | "_wcsnicmp"
-                | "towupper"
-                | "wcsrchr"
-                | "_onexit"
-                | "__dllonexit"
-                | "_beginthreadex"
-                | "_endthreadex"
-                | "_purecall"
-                | "perror"
-                | "iswctype"
-                | "puts"
-                | "rand"
-                | "srand"
-                | "atoi"
-                | "atol"
-                | "strtol"
-                | "strtoul"
-                | "strtod"
-                | "strtof"
-                | "strtok"
-                | "fopen"
-                | "fclose"
-                | "fgets"
-                | "getenv"
-                | "setlocale"
-                | "strerror"
-                | "system"
-                | "_getch"
-                | "_kbhit"
-                | "_localtime64"
-                | "_time64"
-                | "_errno"
-                | "__stdio_common_vsprintf"
-                | "__stdio_common_vfscanf"
-                | "__stdio_common_vsscanf"
-                | "isalpha"
-                | "isdigit"
-                | "isalnum"
-                | "islower"
-                | "isupper"
-                | "isspace"
-                | "toupper"
-                | "tolower"
-                | "_cxxthrowexception"
-                | "?terminate@@yaxxz"
-                | "??1type_info@@ueaa@xz"
-        );
+        return UCRT_CALLABLE.contains(&n.as_str());
     }
-    if library.eq_ignore_ascii_case("ole32.dll") {
-        let n = name.to_ascii_lowercase();
-        return matches!(
-            n.as_str(),
-            "coinitialize"
-                | "coinitializeex"
-                | "couninitialize"
-                | "cocreateinstance"
-                | "coregisterclassobject"
-                | "corevokeclassobject"
-                | "cocreateguid"
-                | "cotaskmemalloc"
-                | "cotaskmemfree"
-                | "cotaskmemrealloc"
-                | "stringfromclsid"
-                | "clsidfromstring"
-                | "cogetclassobject"
-        );
+    let n = name.to_ascii_lowercase();
+    let n = n.as_str();
+    match library.to_ascii_lowercase().as_str() {
+        "ole32.dll" => OLE32_DLL_EXPORTS.contains(&n),
+        "shell32.dll" => SHELL32_DLL_EXPORTS.contains(&n),
+        "oleaut32.dll" => OLEAUT32_DLL_EXPORTS.contains(&n),
+        "user32.dll" => USER32_DLL_EXPORTS.contains(&n),
+        "gdi32.dll" => GDI32_DLL_EXPORTS.contains(&n),
+        "comctl32.dll" => COMCTL32_DLL_EXPORTS.contains(&n),
+        "winmm.dll" => WINMM_DLL_EXPORTS.contains(&n),
+        "advapi32.dll" => ADVAPI32_DLL_EXPORTS.contains(&n),
+        "kernel32.dll" => KERNEL32_DLL_EXPORTS.contains(&n),
+        "ws2_32.dll" => WS2_32_DLL_EXPORTS.contains(&n),
+        "crypt32.dll" => CRYPT32_DLL_EXPORTS.contains(&n),
+        "msimg32.dll" => MSIMG32_DLL_EXPORTS.contains(&n),
+        "imm32.dll" => IMM32_DLL_EXPORTS.contains(&n),
+        "uxtheme.dll" => UXTHEME_DLL_EXPORTS.contains(&n),
+        "setupapi.dll" | "cfgmgr32.dll" => SETUPAPI_CFGMGR32.contains(&n),
+        "dbghelp.dll" | "imagehlp.dll" => DBGHELP_IMAGEHLP.contains(&n),
+        _ => false,
     }
-    if library.eq_ignore_ascii_case("shell32.dll") {
-        let n = name.to_ascii_lowercase();
-        return matches!(
-            n.as_str(),
-            "shgetfolderpathw"
-                | "shgetpathfromidlistw"
-                | "shbrowseforfolderw"
-                | "shaddtorecentdocs"
-                | "shgetfileinfoa"
-                | "shgetfileinfow"
-                | "shgetspecialfolderpathw"
-                | "shellexecuteexw"
-                | "commandlinetoargvw"
-        );
-    }
-    if library.eq_ignore_ascii_case("oleaut32.dll") {
-        let n = name.to_ascii_lowercase();
-        // Ordinals: 2 Alloc, 4 AllocLen, 6 Free, 7 StringLen, 8 Init,
-        // 9 Clear, 10 Copy (Wine/Windows OLEAUT32).
-        return matches!(
-            n.as_str(),
-            "sysallocstring"
-                | "sysallocstringlen"
-                | "sysfreestring"
-                | "sysstringlen"
-                | "sysstringbyteslen"
-                | "variantinit"
-                | "variantclear"
-                | "variantcopy"
-                | "safearraycreate"
-                | "safearraydestroy"
-                | "safearrayaccessdata"
-                | "safearrayunaccessdata"
-                | "safearraygetelement"
-                | "safearrayputelement"
-                | "safearraygetlbound"
-                | "safearraygetubound"
-                | "safearraygetdim"
-                | "dispgetidsofnames"
-                | "dispinvoke"
-                | "ordinal 2"
-                | "ordinal 4"
-                | "ordinal 6"
-                | "ordinal 7"
-                | "ordinal 8"
-                | "ordinal 9"
-                | "ordinal 10"
-                | "ordinal 11"
-                | "ordinal 149"
-        );
-    }
-    if library.eq_ignore_ascii_case("user32.dll") {
-        let n = name.to_ascii_lowercase();
-        return matches!(
-            n.as_str(),
-            "enumwindows"
-                | "enumchildwindows"
-                | "findwindowa"
-                | "findwindoww"
-                | "createcaret"
-                | "setcaretpos"
-                | "getcaretpos"
-                | "showcaret"
-                | "hidecaret"
-                | "destroycaret"
-                | "drawicona"
-                | "drawiconw"
-                | "drawiconex"
-        );
-    }
-    if library.eq_ignore_ascii_case("gdi32.dll") {
-        let n = name.to_ascii_lowercase();
-        return matches!(
-            n.as_str(),
-            "getdibits"
-                | "setdibits"
-                | "createrectrgn"
-                | "createellipticrgn"
-                | "createpolygonrgn"
-                | "combinergn"
-                | "setrectrgn"
-                | "getrgnbox"
-                | "enumfontfamiliesexw"
-                | "enumfontfamiliesexa"
-                | "setpixel"
-        );
-    }
-    if library.eq_ignore_ascii_case("comctl32.dll") {
-        let n = name.to_ascii_lowercase();
-        return matches!(
-            n.as_str(),
-            "imagelist_add"
-                | "imagelist_getimagecount"
-                | "imagelist_geticonsize"
-                | "imagelist_seticonsize"
-                | "imagelist_draw"
-                | "imagelist_getimageinfo"
-                | "createtoolbarex"
-        );
-    }
-    if library.eq_ignore_ascii_case("winmm.dll") {
-        let n = name.to_ascii_lowercase();
-        return matches!(
-            n.as_str(),
-            "timesetevent"
-                | "timekillevent"
-                | "waveoutopen"
-                | "waveoutclose"
-                | "waveoutprepareheader"
-                | "waveoutunprepareheader"
-                | "waveoutwrite"
-                | "waveoutgetnumdevs"
-        );
-    }
-    if library.eq_ignore_ascii_case("advapi32.dll") {
-        let n = name.to_ascii_lowercase();
-        return matches!(
-            n.as_str(),
-            "regdeletekeyw"
-                | "regdeletekeya"
-                | "regflushkey"
-                | "regsavekeyw"
-                | "regsavekeya"
-                | "regopenkeyexw"
-                | "regcreatekeyexw"
-                | "regenumkeyexw"
-                | "regenumkeyexa"
-                | "regenumvaluew"
-                | "regenumvaluea"
-                | "regdeletevaluew"
-                | "openprocesstoken"
-                | "adjusttokenprivileges"
-                | "lookupprivilegevaluew"
-                | "lookupprivilegevaluea"
-                | "systemfunction036"
-                | "getfilesecurityw"
-                | "getfilesecuritya"
-                | "setfilesecurityw"
-                | "setfilesecuritya"
-        );
-    }
-    if library.eq_ignore_ascii_case("KERNEL32.dll") {
-        let n = name.to_ascii_lowercase();
-        return matches!(
-            n.as_str(),
-            "getversion"
-                | "getmodulehandlew"
-                | "lstrlenw"
-                | "lstrcpyw"
-                | "lstrcatw"
-                | "virtualalloc"
-                | "virtualfree"
-                | "virtualprotect"
-                | "virtualquery"
-                | "flushinstructioncache"
-                | "tlsgetvalue"
-                | "tlssetvalue"
-                | "tlsalloc"
-                | "tlsfree"
-                | "createthread"
-                | "exitthread"
-                | "getexitcodethread"
-                | "waitforsingleobject"
-                | "createeventa"
-                | "createeventw"
-                | "setevent"
-                | "resetevent"
-                | "getcurrentthread"
-                | "setconsolectrlhandler"
-                | "getconsolemode"
-                | "setconsolemode"
-                | "getconsolescreenbufferinfo"
-                | "writeconsolew"
-                | "writeconsolea"
-                | "readconsolew"
-                | "readconsolea"
-                | "getconsolecp"
-                | "getconsoleoutputcp"
-                | "setconsolecp"
-                | "setconsoleoutputcp"
-                | "setconsoletitlew"
-                | "setconsoletitlea"
-                | "getconsoletitlew"
-                | "getconsoletitlea"
-                | "allocconsole"
-                | "freeconsole"
-                | "attachconsole"
-                | "getconsolewindow"
-                | "getlargestconsolewindowsize"
-                | "getnumberofconsolemousebuttons"
-                | "gettickcount64"
-                | "getenvironmentvariablea"
-                | "getenvironmentvariablew"
-                | "setenvironmentvariablea"
-                | "setenvironmentvariablew"
-                | "expandenvironmentstringsa"
-                | "expandenvironmentstringsw"
-                | "setfileapistooem"
-                | "queryperformancefrequency"
-                | "getsysteminfo"
-                | "isprocessorfeaturepresent"
-                | "globalmemorystatusex"
-                | "getprocesstimes"
-                | "getlargepageminimum"
-                | "getprocessaffinitymask"
-                | "setprocessaffinitymask"
-                | "setthreadaffinitymask"
-                | "comparefiletime"
-                | "localfiletimetofiletime"
-                | "filetimetodosdatetime"
-                | "dosdatetimetofiletime"
-                | "getdiskfreespaceexw"
-                | "getdiskfreespacew"
-                | "getlogicaldrivestringsw"
-                | "setfileattributesw"
-                | "setfiletime"
-                | "formatmessagew"
-                | "resumethread"
-                | "createsemaphorew"
-                | "createsemaphorea"
-                | "releasesemaphore"
-                | "openeventw"
-                | "openeventa"
-                | "waitformultipleobjects"
-                | "movefilewithprogressw"
-                | "createhardlinkw"
-                | "findfirststreamw"
-                | "findnextstreamw"
-                | "deviceiocontrol"
-                | "mapviewoffile"
-                | "unmapviewoffile"
-                | "createfilemappingw"
-                | "openfilemappingw"
-                | "openfilemappinga"
-                | "assignprocesstojobobject"
-                | "backupread"
-                | "backupseek"
-                | "backupwrite"
-                | "createconsolescreenbuffer"
-                | "createjobobjecta"
-                | "createjobobjectw"
-                | "debugbreak"
-                | "duplicatehandle"
-                | "fillconsoleoutputattribute"
-                | "fillconsoleoutputcharactera"
-                | "fillconsoleoutputcharacterw"
-                | "flushconsoleinputbuffer"
-                | "getcompressedfilesizea"
-                | "getcompressedfilesizew"
-                | "getcomputernamea"
-                | "getcomputernameexw"
-                | "getcomputernamew"
-                | "getconsolecursorinfo"
-                | "getfileattributesexa"
-                | "getfileattributesexw"
-                | "getlongpathnamea"
-                | "getlongpathnamew"
-                | "getnumberofconsoleinputevents"
-                | "getshortpathnamea"
-                | "getshortpathnamew"
-                | "getthreadpriority"
-                | "getusernamea"
-                | "getusernamew"
-                | "getuserprofiledirectorya"
-                | "getuserprofiledirectoryw"
-                | "getvolumeinformationa"
-                | "getvolumeinformationw"
-                | "interlockedcompareexchange"
-                | "interlockedcompareexchange64"
-                | "interlockeddecrement"
-                | "interlockeddecrement64"
-                | "interlockedexchange"
-                | "interlockedexchange64"
-                | "interlockedexchangeadd"
-                | "interlockedexchangeadd64"
-                | "interlockedincrement"
-                | "interlockedincrement64"
-                | "isdebuggerpresent"
-                | "lockfile"
-                | "openthread"
-                | "outputdebugstringa"
-                | "outputdebugstringw"
-                | "peekconsoleinputw"
-                | "queryfullprocessimagenamea"
-                | "queryfullprocessimagenamew"
-                | "raiseexception"
-                | "readconsoleinputw"
-                | "rtlcapturecontext"
-                | "rtlunwindex"
-                | "scrollconsolescreenbufferw"
-                | "setconsoleactivescreenbuffer"
-                | "setconsolecursorinfo"
-                | "setconsolecursorposition"
-                | "setconsolescreenbuffersize"
-                | "setconsolewindowinfo"
-                | "seterrormode"
-                | "setfilevaliddata"
-                | "setthreaderrormode"
-                | "signalobjectandwait"
-                | "suspendthread"
-                | "terminateprocess"
-                | "terminatethread"
-                | "unlockfile"
-                | "writeconsoleoutputattribute"
-                | "writeconsoleoutputcharactera"
-                | "writeconsoleoutputcharacterw"
-        );
-    }
-    if library.eq_ignore_ascii_case("ws2_32.dll") {
-        let n = name.to_ascii_lowercase();
-        return matches!(
-            n.as_str(),
-            "wsastartup"
-                | "wsacleanup"
-                | "wsagetlasterror"
-                | "wsasetlasterror"
-                | "socket"
-                | "closesocket"
-                | "bind"
-                | "listen"
-                | "accept"
-                | "connect"
-                | "send"
-                | "recv"
-                | "select"
-                | "getaddrinfo"
-                | "freeaddrinfo"
-                | "gethostbyname"
-                | "inet_addr"
-                | "inet_ntoa"
-                | "htons"
-                | "ntohs"
-                | "getsockname"
-                | "getpeername"
-                | "setsockopt"
-                | "getsockopt"
-                | "shutdown"
-                | "ioctlsocket"
-        );
-    }
-    if library.eq_ignore_ascii_case("crypt32.dll") {
-        let n = name.to_ascii_lowercase();
-        return matches!(
-            n.as_str(),
-            "cryptacquirecontexta"
-                | "cryptacquirecontextw"
-                | "cryptreleasecontext"
-                | "cryptgenrandom"
-                | "cryptcreatehash"
-                | "cryptdestroyhash"
-                | "crypthashdata"
-                | "cryptgethashparam"
-        );
-    }
-    if library.eq_ignore_ascii_case("msimg32.dll") {
-        let n = name.to_ascii_lowercase();
-        return matches!(n.as_str(), "alphablend" | "transparentblt" | "gradientfill");
-    }
-    if library.eq_ignore_ascii_case("imm32.dll") {
-        let n = name.to_ascii_lowercase();
-        return matches!(
-            n.as_str(),
-            "immgetcontext" | "immgetopenstatus" | "immreleasecontext" | "immgetcompositionstringw"
-        );
-    }
-    if library.eq_ignore_ascii_case("uxtheme.dll") {
-        let n = name.to_ascii_lowercase();
-        // SetWindowTheme is a dense-row API; these are the string-dispatched
-        // no-op extensions (open/close theme data, theme-active queries).
-        return matches!(
-            n.as_str(),
-            "openthemedata" | "closethemedata" | "isthemeactive" | "getwindowtheme"
-        );
-    }
-    if library.eq_ignore_ascii_case("setupapi.dll") || library.eq_ignore_ascii_case("cfgmgr32.dll")
-    {
-        let n = name.to_ascii_lowercase();
-        return matches!(
-            n.as_str(),
-            "setupdigetclassdevsw"
-                | "setupdigetclassdevsa"
-                | "setupdienumdeviceinfo"
-                | "setupdidestroydeviceinfolist"
-                | "cm_get_device_id_listw"
-                | "cm_get_device_id_lista"
-        );
-    }
-    if library.eq_ignore_ascii_case("dbghelp.dll") || library.eq_ignore_ascii_case("imagehlp.dll") {
-        let n = name.to_ascii_lowercase();
-        return matches!(
-            n.as_str(),
-            "syminitializew"
-                | "syminitialize"
-                | "symcleanup"
-                | "symfromaddrw"
-                | "symfromaddr"
-                | "mapfileandchecksumw"
-                | "mapfileandchecksuma"
-        );
-    }
-    false
 }
 
 #[cfg(test)]
