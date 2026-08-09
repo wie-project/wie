@@ -14,9 +14,9 @@ LDFLAGS  := -nostdlib -Wl,--subsystem,console -Wl,--entry,entry
 # Ordinary CRT-linked apps (independent-style): full toolchain defaults.
 CRT_CFLAGS := -O2
 
-.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes dll_tests game_exes interactive_exes ucrt_coverage gui_exes print_bmp version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo http_get ole_com shell_folders reg_roundtrip user32_enum user32_char gdi_regions comctl_toolbar winmm_audio
+.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes dll_tests game_exes interactive_exes ucrt_coverage gui_exes print_bmp version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo http_get ole_com shell_folders reg_roundtrip user32_enum user32_char gdi_regions comctl_toolbar winmm_audio msvcrt_gaps
 
-all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes game_exes interactive_exes dll_tests ucrt_coverage gui_exes version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo http_get ole_com shell_folders reg_roundtrip user32_enum user32_char gdi_regions comctl_toolbar winmm_audio
+all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes game_exes interactive_exes dll_tests ucrt_coverage gui_exes version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo http_get ole_com shell_folders reg_roundtrip user32_enum user32_char gdi_regions comctl_toolbar winmm_audio msvcrt_gaps
 
 $(OUT):
 	mkdir -p $(OUT)
@@ -451,4 +451,11 @@ winmm_audio: $(OUT)/winmm_audio.exe
 
 $(OUT)/winmm_audio.exe: winmm_audio/main.c | $(OUT)
 	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $< -lwinmm
+	@echo "built $@"
+
+# msvcrt/ucrt gaps (msvcrt_gaps): fgetwc/getc/vfprintf via injected stdin.
+msvcrt_gaps: $(OUT)/msvcrt_gaps.exe
+
+$(OUT)/msvcrt_gaps.exe: msvcrt_gaps/main.c | $(OUT)
+	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $<
 	@echo "built $@"

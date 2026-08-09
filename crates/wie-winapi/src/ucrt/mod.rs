@@ -50,10 +50,10 @@ use misc::{
     handle_system, handle_terminate_cxx, handle_time64, handle_type_info_dtor, handle_xcpt_filter,
 };
 use stdio::{
-    handle_acrt_iob_func, handle_fclose, handle_fflush, handle_fgetc, handle_fgets, handle_fopen,
-    handle_fputc, handle_fputs, handle_fwrite, handle_getchar, handle_putchar, handle_puts,
-    handle_setvbuf, handle_stdio_common_vfprintf, handle_stdio_common_vfscanf,
-    handle_stdio_common_vsprintf, handle_stdio_common_vsscanf,
+    handle_acrt_iob_func, handle_fclose, handle_fflush, handle_fgetc, handle_fgets, handle_fgetwc,
+    handle_fopen, handle_fputc, handle_fputs, handle_fwrite, handle_getchar, handle_putchar,
+    handle_puts, handle_setvbuf, handle_stdio_common_vfprintf, handle_stdio_common_vfscanf,
+    handle_stdio_common_vsprintf, handle_stdio_common_vsscanf, handle_vfprintf,
 };
 use string::{
     handle_isalnum, handle_isalpha, handle_isdigit, handle_islower, handle_isspace, handle_isupper,
@@ -147,6 +147,18 @@ pub fn crt_data_import_va(name: &str) -> Option<u64> {
         "_fmode" => Some(FMODE_SLOT),
         "_commode" => Some(COMMODE_SLOT),
         "_acmdln" => Some(ACMDLN_PTR_SLOT),
+        // Legacy msvcrt: `wchar_t *_wcmdln` (wide command line). The session
+        // materializes no dedicated wide slot and `crt_data_import_va` is pure
+        // (no engine to write one), so `_wcmdln` aliases the narrow
+        // `ACMDLN_PTR_SLOT` cell: the session fills it with the ANSI command
+        // line pointer (`env_data.base + 0x100`), a valid mapped address. Read
+        // as `wchar_t*` it is a NUL-terminated buffer of interleaved ANSI
+        // bytes (no spaces — notepad's `*__p__wcmdln()` + wchar scan sees no
+        // args), never a dangling pointer. WIE's host-side `__wgetmainargs` /
+        // `GetCommandLineW` paths use the wide env-page buffer
+        // (`env_data.base + 0x200`) directly, so this value is only a
+        // load-safety contract.
+        "_wcmdln" => Some(ACMDLN_PTR_SLOT),
         // Legacy msvcrt: `FILE _iob[]` / `char **__initenv`.
         // Point `_iob` at stdin cookie; fputs/fputc treat nearby streams as console.
         "_iob" => Some(FILE_STDIN),
@@ -182,7 +194,8 @@ pub fn dispatch_ucrt(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiH
         "__p__fmode" => handle_p_fmode(ctx),
         "_configthreadlocale" => handle_config_thread_locale(ctx),
         "__setusermatherr" => handle_set_user_matherr(ctx),
-        "__c_specific_handler" | "__cxxframehandler" => handle_c_specific_handler(ctx),
+        "__c_specific_handler" => handle_c_specific_handler(ctx),
+        "__cxxframehandler" => handle_cxx_frame_handler(ctx),
         "memcpy" | "memmove" => handle_memcpy(ctx),
         "memcmp" => handle_memcmp(ctx),
         "memset" => handle_memset(ctx),
@@ -235,6 +248,10 @@ pub fn dispatch_ucrt(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiH
         "fclose" => handle_fclose(ctx),
         "fgets" => handle_fgets(ctx),
         "fgetc" => handle_fgetc(ctx),
+        // getc is a macro for fgetc in the real headers; msvcrt exports both.
+        "getc" => handle_fgetc(ctx),
+        "fgetwc" => handle_fgetwc(ctx),
+        "vfprintf" => handle_vfprintf(ctx),
         "strtok" => handle_strtok(ctx),
         "strcmp" => handle_strcmp(ctx),
         "strchr" => handle_strchr(ctx),
@@ -287,6 +304,26 @@ fn finish(engine: &mut dyn wie_cpu::CpuEngine, value: u64) -> Result<WinApiHandl
 fn i32_status_to_u64(v: i32) -> u64 {
     // i32 → i64 sign-extends; `from_ne_bytes` reinterprets bits (same as `as u64` on two's complement).
     u64::from_ne_bytes(i64::from(v).to_ne_bytes())
+}
+/// `__CxxFrameHandler(pExceptionObject, pContextRecord, pDispatcherContext,
+/// pFuncInfo)` — the MSVC x64 C++ EH frame entry.
+///
+/// WIE drives MSVC EH host-side (`msvc_eh::find_msvc_catch` from
+/// `_CxxThrowException`; see `crates/wie-winapi/src/seh.rs`), so the guest
+/// never calls this export during a dispatch — MSVC-compiled PEs still import
+/// it, so it must resolve. When guest code calls it directly there is no
+/// host-dispatched handler in progress, so the honest disposition is
+/// `EXCEPTION_CONTINUE_SEARCH` (0).
+pub(crate) fn handle_cxx_frame_handler(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let pfunc_info = engine.read_r9()?;
+    tracing::debug!(
+        pfunc_info = format_args!("{pfunc_info:#x}"),
+        "msvcrt!__CxxFrameHandler → EXCEPTION_CONTINUE_SEARCH (host-side MSVC EH dispatch not active)"
+    );
+    finish(engine, 0)
 }
 fn handle_malloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
