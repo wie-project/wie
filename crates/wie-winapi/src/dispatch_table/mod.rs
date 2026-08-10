@@ -1368,6 +1368,29 @@ pub fn dispatch_winapi(
     {
         return Ok(r);
     }
+    // WININET / URLMON — Internet surface (string dispatch, host HTTP).
+    if library.eq_ignore_ascii_case("wininet.dll")
+        && let Some(r) = crate::wininet::dispatch_wininet(ctx, name)?
+    {
+        return Ok(r);
+    }
+    if library.eq_ignore_ascii_case("urlmon.dll")
+        && let Some(r) = crate::urlmon::dispatch_urlmon(ctx, name)?
+    {
+        return Ok(r);
+    }
+    // ntdll Nt*/Rtl* surface (string dispatch, forwards to kernel32/ucrt).
+    if library.eq_ignore_ascii_case("ntdll.dll")
+        && let Some(r) = crate::ntdll::dispatch_ntdll(ctx, name)?
+    {
+        return Ok(r);
+    }
+    // opengl32 WGL + legacy gl* surface (string dispatch, stub layer).
+    if library.eq_ignore_ascii_case("opengl32.dll")
+        && let Some(r) = crate::opengl32::dispatch_opengl32(ctx, name)?
+    {
+        return Ok(r);
+    }
     // Mingw runtime DLLs (pthread, libstdc++).
     if library.eq_ignore_ascii_case("libwinpthread-1.dll")
         || library.eq_ignore_ascii_case("libwinpthread-1")

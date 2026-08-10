@@ -63,6 +63,600 @@ pub const PREPLANTED_SOFT_APIS: &[DynamicFakeApi] = &[
         library: "KERNEL32.dll",
         name: "InterlockedExchangeAdd64",
     },
+    // IDataObject vtable slots (OLE clipboard). Order IS the vtable ABI
+    // (slot index = position, per the Windows IDataObject layout), appended
+    // after the Interlocked* family — append only. The guest vtable builder
+    // in `ole32.rs` re-discovers the index by position, so the names must
+    // match `ole32::IDATAOBJECT_METHODS` exactly.
+    DynamicFakeApi {
+        library: "OLE32.dll",
+        name: "IDataObject::QueryInterface",
+    },
+    DynamicFakeApi {
+        library: "OLE32.dll",
+        name: "IDataObject::AddRef",
+    },
+    DynamicFakeApi {
+        library: "OLE32.dll",
+        name: "IDataObject::Release",
+    },
+    DynamicFakeApi {
+        library: "OLE32.dll",
+        name: "IDataObject::GetData",
+    },
+    DynamicFakeApi {
+        library: "OLE32.dll",
+        name: "IDataObject::GetDataHere",
+    },
+    DynamicFakeApi {
+        library: "OLE32.dll",
+        name: "IDataObject::QueryGetData",
+    },
+    DynamicFakeApi {
+        library: "OLE32.dll",
+        name: "IDataObject::GetCanonicalFormatEtc",
+    },
+    DynamicFakeApi {
+        library: "OLE32.dll",
+        name: "IDataObject::SetData",
+    },
+    DynamicFakeApi {
+        library: "OLE32.dll",
+        name: "IDataObject::EnumFormatEtc",
+    },
+    DynamicFakeApi {
+        library: "OLE32.dll",
+        name: "IDataObject::DAdvise",
+    },
+    DynamicFakeApi {
+        library: "OLE32.dll",
+        name: "IDataObject::DUnadvise",
+    },
+    DynamicFakeApi {
+        library: "OLE32.dll",
+        name: "IDataObject::EnumDAdvise",
+    },
+    // opengl32 WGL + gl* exports — the same names as
+    // `opengl32::OPENGL32_EXPORT_NAMES` (the dispatch census). `wglGetProcAddress`
+    // encodes these by position (append only — the order is the ABI), and the
+    // kernel32 `GetProcAddress` path resolves them too. A unit test pins the
+    // lists together so they cannot drift.
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "wglcreatecontext",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "wgldeletecontext",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "wglmakecurrent",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "wglgetprocaddress",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "wglchoosepixelformat",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "wglsetpixelformat",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "wgldescribepixelformat",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "wglgetpixelformat",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "wglswapbuffers",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "wglsharelists",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "wglgetcurrentcontext",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "wglgetcurrentdc",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glclearcolor",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glcleardepth",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glclear",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glbegin",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glend",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glvertex2f",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glvertex3f",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glvertex4f",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glvertex2fv",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glvertex3fv",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glvertex4fv",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glcolor3f",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glcolor4f",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glcolor3fv",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glcolor4fv",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glcolor3ub",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glcolor4ub",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glcolor3ubv",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glcolor4ubv",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gltexcoord1f",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gltexcoord2f",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gltexcoord3f",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gltexcoord4f",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gltexcoord1fv",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gltexcoord2fv",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gltexcoord3fv",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gltexcoord4fv",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glmatrixmode",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glloadidentity",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glloadmatrixf",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glmultmatrixf",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glortho",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glfrustum",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gltranslatef",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glrotatef",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glscalef",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glpushmatrix",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glpopmatrix",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glviewport",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gldepthfunc",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gldepthmask",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glenable",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gldisable",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glblendfunc",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glpolygonmode",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glgentextures",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gldeletetextures",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glbindtexture",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glteximage2d",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gltexparameteri",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gltexenvi",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gltexenvf",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glpixelstorei",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glreadpixels",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glflush",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glfinish",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glgeterror",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glgetstring",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glgetintegerv",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glgetfloatv",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glgetbooleanv",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glscissor",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glenableclientstate",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gldisableclientstate",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glvertexpointer",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glcolorpointer",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gltexcoordpointer",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glnormalpointer",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gldrawarrays",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gldrawelements",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gldeletebuffers",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glisbuffer",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glbindbuffer",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glbufferdata",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glbuffersubdata",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glreadbuffer",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gllightfv",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gllightmodelfv",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glmaterialfv",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glmaterialf",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glcolormaterial",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glshademodel",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glnormal3fv",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glcullface",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glfrontface",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glpointsizef",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gllinewidth",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glnewlist",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glendlist",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glcalllist",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glcalllists",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glgenlists",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glislist",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gldeletelists",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gllistbase",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glisshader",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glshadersource",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glcompileshader",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glcreateprogram",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glcreateshader",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glgenbuffers",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glnormal3f",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gldeleteshader",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glgetshaderiv",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glgetshaderinfolog",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glattachshader",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gldetachshader",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gllinkprogram",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gluseprogram",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glgetprogramiv",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glgetprograminfolog",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gldeleteprogram",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glisprogram",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glvalidateprogram",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glgetuniformlocation",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gluniform1f",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gluniform2f",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gluniform3f",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gluniform4f",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gluniform1i",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "gluniformmatrix4fv",
+    },
+    DynamicFakeApi {
+        library: "opengl32.dll",
+        name: "glactivetexture",
+    },
 ];
 
 /// Dynamic exports resolvable via `GetProcAddress` (generic PE64 + legacy apps).
@@ -257,6 +851,54 @@ mod tests {
             original_len,
             "duplicate export names in DYNAMIC_FAKE_APIS"
         );
+    }
+
+    #[test]
+    fn opengl32_dispatch_names_are_all_preplanted() {
+        // `wglGetProcAddress` encodes by position in PREPLANTED_SOFT_APIS;
+        // every `opengl32` dispatch export must be planted so the fake VA
+        // decodes to ("opengl32.dll", name) at runtime.
+        for name in crate::opengl32::OPENGL32_EXPORT_NAMES {
+            let found = PREPLANTED_SOFT_APIS
+                .iter()
+                .any(|e| e.library.eq_ignore_ascii_case("opengl32.dll") && e.name == *name);
+            assert!(
+                found,
+                "opengl32 export {name} missing from PREPLANTED_SOFT_APIS"
+            );
+        }
+        // And the reverse: every planted opengl32 name is a dispatch export
+        // (a stale planted entry is dead weight at worst, but catch it).
+        for entry in PREPLANTED_SOFT_APIS {
+            if entry.library.eq_ignore_ascii_case("opengl32.dll") {
+                assert!(
+                    crate::opengl32::OPENGL32_EXPORT_NAMES.contains(&entry.name),
+                    "planted opengl32 name {} not in OPENGL32_EXPORT_NAMES",
+                    entry.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wgl_get_proc_address_encodes_dispatch_names() {
+        // The opengl32 exports must encode to resolvable soft VAs that decode
+        // back to the same (library, name) pair.
+        for entry in PREPLANTED_SOFT_APIS {
+            if !entry.library.eq_ignore_ascii_case("opengl32.dll") {
+                continue;
+            }
+            let va = crate::fake_va::encode_unresolved(
+                u16::try_from(
+                    PREPLANTED_SOFT_APIS
+                        .iter()
+                        .position(|e| std::ptr::eq(e, entry))
+                        .unwrap_or(0),
+                )
+                .unwrap_or(0),
+            );
+            assert!(va >= crate::fake_va::FAKE_API_BASE);
+        }
     }
 
     #[test]
