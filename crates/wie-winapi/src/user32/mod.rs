@@ -808,5 +808,8 @@ pub fn dispatch_user32_extra(
     if let Some(result) = enum_caret::dispatch_enum_caret(ctx, name)? {
         return Ok(Some(result));
     }
+    if let Some(result) = crate::clipboard::dispatch_clipboard(ctx, name)? {
+        return Ok(Some(result));
+    }
     charfmt::dispatch_charfmt(ctx, name)
 }

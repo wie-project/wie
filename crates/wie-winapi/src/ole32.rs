@@ -2,7 +2,12 @@
 //!
 //! The class-registration table is real (CoRegisterClassObject → CoCreateInstance
 //! finds the class); the resulting class objects are fake opaque pointers.
+//!
+//! The OLE clipboard / drag-drop lane (OleInitialize, OleSet/GetClipboard,
+//! the host-synthesized `IDataObject`, DoDragDrop stubs) lives in the
+//! `ole_clipboard` submodule; the string arms below dispatch to it.
 
+use crate::clipboard::ClipboardStore;
 use crate::guest_string::write_utf16_units;
 use crate::{HandlerContext, WinApiHandlerResult};
 use ahash::HashMap;
@@ -24,6 +29,34 @@ const CO_E_CLASSSTRING: u64 = 0x8004_01F3;
 /// Fake `IUnknown*` handed to guests for registered classes (opaque).
 const FAKE_IUNKNOWN: u64 = 0x5200_0001;
 
+/// The IDataObject vtable ABI. Order IS the vtable slot (0..12), matching the
+/// Windows SDK `IDataObjectVtbl`; the session preplants these names into the
+/// soft table at stable indices (see `dynamic_apis::PREPLANTED_SOFT_APIS`) so
+/// each slot encodes to a resolvable fake VA via `encode_unresolved`.
+pub(crate) const IDATAOBJECT_METHODS: [&str; 12] = [
+    "IDataObject::QueryInterface",
+    "IDataObject::AddRef",
+    "IDataObject::Release",
+    "IDataObject::GetData",
+    "IDataObject::GetDataHere",
+    "IDataObject::QueryGetData",
+    "IDataObject::GetCanonicalFormatEtc",
+    "IDataObject::SetData",
+    "IDataObject::EnumFormatEtc",
+    "IDataObject::DAdvise",
+    "IDataObject::DUnadvise",
+    "IDataObject::EnumDAdvise",
+];
+
+/// `IDataObject` vtable + COM object allocation: 12 slot pointers + the
+/// object struct (a single `lpVtbl` pointer).
+pub(crate) const IDATAOBJECT_ALLOCATION_SIZE: u64 = 13 * 8;
+
+/// OLE clipboard / drag-drop lane (the `ole_clipboard` submodule; kept here
+/// behind a `#[path]` because `lib.rs` is frozen and cannot declare it).
+#[path = "ole_clipboard.rs"]
+mod ole_clipboard;
+
 /// COM class-registration table (`CoRegisterClassObject`), owned by this
 /// module and heap-allocated on first load via `DllId::Ole32`.
 #[derive(Debug)]
@@ -32,6 +65,19 @@ pub struct OleState {
     classes: HashMap<[u8; 16], u32>,
     /// Next registration cookie (starts at 1; 0 is never handed out).
     next_cookie: u32,
+    /// The guest-side clipboard (classic USER32 + OLE share this store; see
+    /// `crate::clipboard`). Owned here because `DllId`/state accessors are
+    /// frozen — this is the only shared-state slot this lane may grow.
+    pub clipboard: ClipboardStore,
+    /// `OleInitialize` per-process flag.
+    pub ole_initialized: bool,
+    /// Guest `IDataObject*` from `OleSetClipboard` (0 = none stored).
+    pub clipboard_data_object: u64,
+    /// Host-synthesized `IDataObject` guest block, created on first
+    /// `OleGetClipboard` when no guest object is stored.
+    pub synthesized_data_object: u64,
+    /// `RegisterDragDrop` table: hwnd → guest `IDropTarget*`.
+    pub drop_targets: HashMap<u64, u64>,
 }
 
 impl Default for OleState {
@@ -39,6 +85,11 @@ impl Default for OleState {
         Self {
             classes: HashMap::new(),
             next_cookie: 1,
+            clipboard: ClipboardStore::default(),
+            ole_initialized: false,
+            clipboard_data_object: 0,
+            synthesized_data_object: 0,
+            drop_targets: HashMap::new(),
         }
     }
 }
@@ -90,8 +141,53 @@ pub fn dispatch_ole32(
         "stringfromclsid" => Ok(Some(handle_string_from_clsid(ctx)?)),
         "clsidfromstring" => Ok(Some(handle_clsid_from_string(ctx)?)),
         "cogetclassobject" => Ok(Some(handle_co_get_class_object(ctx)?)),
+        // ── OLE clipboard / drag-drop lane ─────────────────────────────
+        "oleinitialize" => Ok(Some(ole_clipboard::handle_ole_initialize(ctx)?)),
+        "oleuninitialize" => Ok(Some(ole_clipboard::handle_ole_uninitialize(ctx)?)),
+        "olesetclipboard" => Ok(Some(ole_clipboard::handle_ole_set_clipboard(ctx)?)),
+        "olegetclipboard" => Ok(Some(ole_clipboard::handle_ole_get_clipboard(ctx)?)),
+        "oleflushclipboard" => Ok(Some(ole_clipboard::handle_ole_flush_clipboard(ctx)?)),
+        "registerdragdrop" => Ok(Some(ole_clipboard::handle_register_drag_drop(ctx)?)),
+        "revokedragdrop" => Ok(Some(ole_clipboard::handle_revoke_drag_drop(ctx)?)),
+        "dodragdrop" => Ok(Some(ole_clipboard::handle_do_drag_drop(ctx)?)),
+        // Host-synthesized IDataObject vtable slots (soft-dispatch names —
+        // the session preplants them; see dynamic_apis.rs).
+        "idataobject::queryinterface" => Ok(Some(ole_clipboard::handle_query_interface(ctx)?)),
+        "idataobject::addref" => Ok(Some(ole_clipboard::handle_add_ref(ctx)?)),
+        "idataobject::release" => Ok(Some(ole_clipboard::handle_release(ctx)?)),
+        "idataobject::getdata" => Ok(Some(ole_clipboard::handle_get_data(ctx)?)),
+        "idataobject::setdata" => Ok(Some(ole_clipboard::handle_set_data(ctx)?)),
+        "idataobject::enumformatetc" => Ok(Some(ole_clipboard::handle_enum_format_etc(ctx)?)),
+        "idataobject::getdatahere"
+        | "idataobject::querygetdata"
+        | "idataobject::getcanonicalformatetc"
+        | "idataobject::dadvise"
+        | "idataobject::dunadvise"
+        | "idataobject::enumdadvise" => Ok(Some(ole_clipboard::handle_e_notimpl(ctx)?)),
         _ => Ok(None),
     }
+}
+
+/// The fake VA for IDataObject vtable slot `slot` (0..12).
+///
+/// The slot encodes as a soft-table unresolved VA: the session preplants the
+/// `IDataObject::*` names at stable indices (dynamic_apis.rs), so the slot's
+/// call stops in the fake-API window and resolves to `ole32.dll!IDataObject::X`,
+/// which `dispatch_ole32` routes to the `ole_clipboard` lane.
+pub(crate) fn idataobject_method_va(slot: usize) -> Result<u64> {
+    let name = IDATAOBJECT_METHODS
+        .get(slot)
+        .with_context(|| format!("IDataObject method slot {slot} out of range"))?;
+    let idx = crate::dynamic_apis::PREPLANTED_SOFT_APIS
+        .iter()
+        .position(|entry| {
+            entry.library.eq_ignore_ascii_case("OLE32.dll") && entry.name.eq_ignore_ascii_case(name)
+        })
+        .with_context(|| {
+            format!("IDataObject slot {slot} ({name}) missing from PREPLANTED_SOFT_APIS")
+        })?;
+    let idx = u16::try_from(idx).context("IDataObject soft-table index does not fit u16")?;
+    Ok(crate::fake_va::encode_unresolved(idx))
 }
 
 /// `HRESULT CoInitialize(LPVOID pvReserved)`
