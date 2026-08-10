@@ -191,6 +191,16 @@ fn join_workers_impl(winapi: &Arc<Mutex<WinApiState>>, joins: &mut Vec<JoinHandl
                 }
                 // File mappings hold no waiters; nothing to wake at teardown.
                 wie_winapi::KernelObject::FileMapping(_) => {}
+                // Directory watches: waking the parked waiter unblocks the
+                // join; the watcher itself stops when the object drops.
+                wie_winapi::KernelObject::DirectoryWatch(d) => d.deactivate(),
+                // Child-process objects: wake waiters so a parked
+                // WaitForSingleObject never blocks the teardown join.
+                wie_winapi::KernelObject::Process(p) => {
+                    if !p.is_finished() {
+                        p.finish(1);
+                    }
+                }
             }
         }
     }

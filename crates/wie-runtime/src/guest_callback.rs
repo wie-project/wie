@@ -23,7 +23,62 @@ pub(crate) fn install_guest_callback_frame(
     let dispatch_rsp = engine
         .read_rsp()
         .context("failed to read RSP before guest callback")?;
+    write_callback_frame(
+        engine,
+        trampoline,
+        dispatch_rsp,
+        [
+            request.window_handle,
+            u64::from(request.message),
+            request.word_parameter,
+            request.long_parameter,
+        ],
+        request.callback_address,
+    )?;
+    Ok(dispatch_rsp)
+}
 
+/// Set up a Win64 frame + args for a guest `FONTENUMPROC` callback.
+///
+/// The enumeration callback ABI is `(lpelfe, lpntme, FontType, lParam)` in
+/// RCX/RDX/R8/R9 — the `lpntme` pointer must cross RDX in full 64 bits, which
+/// the WndProc bridge (RDX = 32-bit message) cannot. The request packs the
+/// args as `window_handle = lpelfe`, `word_parameter = lpntme`, `message =
+/// FontType`, `long_parameter = lParam`.
+///
+/// `dispatch_rsp` is the RSP the frame is installed relative to. For the first
+/// callback it is the current RSP; for a continuation it is the ORIGINAL outer
+/// API RSP (so the final completion restores the true outer frame even though
+/// each re-entry grows the stack down by 0x30).
+pub(crate) fn install_guest_enum_callback_frame(
+    engine: &mut dyn CpuEngine,
+    request: &GuestCallbackRequest,
+    trampoline: u64,
+    dispatch_rsp: u64,
+) -> Result<()> {
+    write_callback_frame(
+        engine,
+        trampoline,
+        dispatch_rsp,
+        [
+            request.window_handle,
+            request.word_parameter,
+            u64::from(request.message),
+            request.long_parameter,
+        ],
+        request.callback_address,
+    )
+}
+
+/// Shared Win64 callback-frame writer: write the trampoline return address,
+/// clear the shadow space, set RSP/args/RIP.
+fn write_callback_frame(
+    engine: &mut dyn CpuEngine,
+    trampoline: u64,
+    dispatch_rsp: u64,
+    args: [u64; 4],
+    callback_address: u64,
+) -> Result<()> {
     // 0x30 keeps WndProc entry RSP ≡ 8 (mod 16) when the outer API entry
     // was itself 8-aligned, matching the Win64 ABI.
     let frame_rsp = dispatch_rsp
@@ -46,22 +101,22 @@ pub(crate) fn install_guest_callback_frame(
         .write_rsp(frame_rsp)
         .context("failed to set RSP for guest callback")?;
     engine
-        .write_rcx(request.window_handle)
-        .context("failed to set RCX (hwnd) for guest callback")?;
+        .write_rcx(args[0])
+        .context("failed to set RCX for guest callback")?;
     engine
-        .write_rdx(u64::from(request.message))
-        .context("failed to set RDX (message) for guest callback")?;
+        .write_rdx(args[1])
+        .context("failed to set RDX for guest callback")?;
     engine
-        .write_r8(request.word_parameter)
-        .context("failed to set R8 (wParam) for guest callback")?;
+        .write_r8(args[2])
+        .context("failed to set R8 for guest callback")?;
     engine
-        .write_r9(request.long_parameter)
-        .context("failed to set R9 (lParam) for guest callback")?;
+        .write_r9(args[3])
+        .context("failed to set R9 for guest callback")?;
     engine
-        .write_rip(request.callback_address)
+        .write_rip(callback_address)
         .context("failed to set RIP for guest callback")?;
 
-    Ok(dispatch_rsp)
+    Ok(())
 }
 
 /// CreateWindowEx returns the HWND unless WM_CREATE returned -1.
