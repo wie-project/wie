@@ -1,10 +1,11 @@
-//! UCRT string/memory/ctype handlers: `mem*`, `str*`, `wcs*`, and the
-//! character-class helpers.
+//! UCRT string/memory/ctype handlers: `mem*`, `str*`, `wcs*`, the
+//! character-class helpers, and the secure-CRT `_s` variants (MSVCR100+).
 
+use crate::guest_memory::read_u64;
 use crate::{HandlerContext, WinApiHandlerResult};
 use anyhow::Result;
 
-use super::{finish, i32_status_to_u64, read_guest_str};
+use super::{EINVAL, ERANGE, finish, i32_status_to_u64, read_guest_str};
 pub(crate) fn handle_memcpy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let dest = engine.read_rcx()?;
@@ -870,4 +871,535 @@ pub(crate) fn handle_strchr(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         }
     }
     finish(engine, 0)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Secure-CRT `_s` variants (MSVCR100+)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Every handler follows the CRT contract: `errno_t` return (0 on success),
+// sizes validated before touching the destination, and the destination
+// cleared (at least `dest[0] = 0`) on failure so it can never be misread as
+// a valid string.
+
+/// Zero `n` bytes at `va` (secure-CRT failure contract). Failures ignored —
+/// the write is best-effort on a buffer the guest already owns.
+fn zero_memory(engine: &mut dyn wie_cpu::CpuEngine, va: u64, n: usize) {
+    if va != 0 && n > 0 {
+        let zeros = vec![0_u8; n];
+        drop(engine.mem_write(va, &zeros));
+    }
+}
+
+/// Write one NUL byte at `dest` (the "empty string on failure" contract).
+fn empty_string(engine: &mut dyn wie_cpu::CpuEngine, dest: u64) {
+    if dest != 0 {
+        drop(engine.mem_write(dest, &[0_u8]));
+    }
+}
+
+/// Shared core of `memcpy_s` / `memmove_s`: bounds-checked copy with the
+/// `errno_t` contract. `engine.mem_copy` already has memmove semantics, so
+/// the overlap-undefined `memcpy_s` case is served safely.
+fn mem_copy_s_core(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    dest: u64,
+    destsz: u64,
+    src: u64,
+    count: u64,
+) -> Result<WinApiHandlerResult> {
+    if dest == 0 || src == 0 {
+        zero_memory(engine, dest, usize::try_from(destsz).unwrap_or(0));
+        return finish(engine, i32_status_to_u64(EINVAL));
+    }
+    if count == 0 {
+        return finish(engine, 0);
+    }
+    if count > destsz {
+        zero_memory(engine, dest, usize::try_from(destsz).unwrap_or(0));
+        return finish(engine, i32_status_to_u64(ERANGE));
+    }
+    let n = usize::try_from(count).unwrap_or(0);
+    if engine.mem_copy(dest, src, n) {
+        return finish(engine, 0);
+    }
+    // Cross-arena or SPC-denied: bounce through a host buffer.
+    let mut buf = vec![0_u8; n];
+    engine.mem_read(src, &mut buf)?;
+    engine.mem_write(dest, &buf)?;
+    finish(engine, 0)
+}
+
+/// `memcpy_s(dest, destsz, src, count)` — `(dest, destsz, src, count)` order.
+pub(crate) fn handle_memcpy_s(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let dest = engine.read_rcx()?;
+    let destsz = engine.read_rdx()?;
+    let src = engine.read_r8()?;
+    let count = engine.read_r9()?;
+    mem_copy_s_core(engine, dest, destsz, src, count)
+}
+
+/// `memmove_s(dest, destsz, src, count)` — same order and contract.
+pub(crate) fn handle_memmove_s(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let dest = engine.read_rcx()?;
+    let destsz = engine.read_rdx()?;
+    let src = engine.read_r8()?;
+    let count = engine.read_r9()?;
+    mem_copy_s_core(engine, dest, destsz, src, count)
+}
+
+/// `memset_s(dest, destsz, value, count)` — bounds-checked fill.
+pub(crate) fn handle_memset_s(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let dest = engine.read_rcx()?;
+    let destsz = engine.read_rdx()?;
+    let value = u8::try_from(engine.read_r8()? & 0xff).unwrap_or(0);
+    let count = engine.read_r9()?;
+    if dest == 0 {
+        return finish(engine, i32_status_to_u64(EINVAL));
+    }
+    if count == 0 {
+        return finish(engine, 0);
+    }
+    if count > destsz {
+        zero_memory(engine, dest, usize::try_from(destsz).unwrap_or(0));
+        return finish(engine, i32_status_to_u64(ERANGE));
+    }
+    let n = usize::try_from(count).unwrap_or(0);
+    if engine.mem_fill(dest, value, n) {
+        return finish(engine, 0);
+    }
+    let buf = vec![value; n];
+    engine.mem_write(dest, &buf)?;
+    finish(engine, 0)
+}
+
+/// `strcpy_s(dest, destsz, src)` — copy a NUL-terminated string into a
+/// sized buffer; ERANGE (with `dest[0] = 0`) when the string does not fit.
+pub(crate) fn handle_strcpy_s(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let dest = engine.read_rcx()?;
+    let destsz = engine.read_rdx()?;
+    let src = engine.read_r8()?;
+    if dest == 0 || destsz == 0 {
+        return finish(engine, i32_status_to_u64(EINVAL));
+    }
+    if src == 0 {
+        empty_string(engine, dest);
+        return finish(engine, i32_status_to_u64(EINVAL));
+    }
+    let cap = usize::try_from(destsz).unwrap_or(0);
+    let bytes = crate::guest_string::read_ansi_bytes(engine, src, cap).unwrap_or_default();
+    // No NUL found within the budget → the terminator cannot fit.
+    if bytes.len() >= cap {
+        empty_string(engine, dest);
+        return finish(engine, i32_status_to_u64(ERANGE));
+    }
+    let mut out = bytes;
+    out.push(0);
+    engine.mem_write(dest, &out)?;
+    finish(engine, 0)
+}
+
+/// `strncpy_s(dest, destsz, src, count)` — copy at most `count` chars. A
+/// short source is NUL-padded to `count` (strncpy behavior); a source of
+/// `count` or more chars is copied exactly (no NUL, no error). `count` must
+/// fit in `destsz` or ERANGE is returned with `dest[0] = 0`.
+pub(crate) fn handle_strncpy_s(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let dest = engine.read_rcx()?;
+    let destsz = engine.read_rdx()?;
+    let src = engine.read_r8()?;
+    let count = engine.read_r9()?;
+    if dest == 0 || destsz == 0 {
+        return finish(engine, i32_status_to_u64(EINVAL));
+    }
+    if src == 0 {
+        empty_string(engine, dest);
+        return finish(engine, i32_status_to_u64(EINVAL));
+    }
+    if count == 0 {
+        return finish(engine, 0);
+    }
+    let dest_cap = usize::try_from(destsz).unwrap_or(0);
+    let count_us = usize::try_from(count).unwrap_or(0);
+    if count_us > dest_cap {
+        empty_string(engine, dest);
+        return finish(engine, i32_status_to_u64(ERANGE));
+    }
+    // Read up to count+1 bytes so a NUL found at exactly `count` is visible
+    // (a short source then pads the rest of `count` with NULs).
+    let bytes = crate::guest_string::read_ansi_bytes(engine, src, count_us.saturating_add(1))
+        .unwrap_or_default();
+    if bytes.len() < count_us {
+        // Short source: content + NUL, then NUL-pad to `count`.
+        let mut out = bytes;
+        out.push(0);
+        out.resize(count_us, 0);
+        engine.mem_write(dest, &out)?;
+    } else {
+        // Source has at least `count` chars: copy exactly `count` (no NUL).
+        let mut out = bytes;
+        out.truncate(count_us);
+        engine.mem_write(dest, &out)?;
+    }
+    finish(engine, 0)
+}
+
+/// `strcat_s(dest, destsz, src)` — size-checked append.
+pub(crate) fn handle_strcat_s(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let dest = engine.read_rcx()?;
+    let destsz = engine.read_rdx()?;
+    let src = engine.read_r8()?;
+    if dest == 0 || destsz == 0 {
+        return finish(engine, i32_status_to_u64(EINVAL));
+    }
+    if src == 0 {
+        empty_string(engine, dest);
+        return finish(engine, i32_status_to_u64(EINVAL));
+    }
+    let cap = usize::try_from(destsz).unwrap_or(0);
+    let dest_bytes = crate::guest_string::read_ansi_bytes(engine, dest, cap).unwrap_or_default();
+    if dest_bytes.len() >= cap {
+        // Destination is not NUL-terminated inside the buffer.
+        empty_string(engine, dest);
+        return finish(engine, i32_status_to_u64(EINVAL));
+    }
+    let src_bytes = crate::guest_string::read_ansi_bytes(engine, src, cap).unwrap_or_default();
+    if dest_bytes
+        .len()
+        .saturating_add(src_bytes.len())
+        .saturating_add(1)
+        > cap
+    {
+        empty_string(engine, dest);
+        return finish(engine, i32_status_to_u64(ERANGE));
+    }
+    let mut out = dest_bytes;
+    out.extend_from_slice(&src_bytes);
+    out.push(0);
+    engine.mem_write(dest, &out)?;
+    finish(engine, 0)
+}
+
+/// `strncat_s(dest, destsz, src, count)` — size-checked append of at most
+/// `count` source chars.
+pub(crate) fn handle_strncat_s(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let dest = engine.read_rcx()?;
+    let destsz = engine.read_rdx()?;
+    let src = engine.read_r8()?;
+    let count = engine.read_r9()?;
+    if dest == 0 || destsz == 0 {
+        return finish(engine, i32_status_to_u64(EINVAL));
+    }
+    if src == 0 {
+        empty_string(engine, dest);
+        return finish(engine, i32_status_to_u64(EINVAL));
+    }
+    let cap = usize::try_from(destsz).unwrap_or(0);
+    let dest_bytes = crate::guest_string::read_ansi_bytes(engine, dest, cap).unwrap_or_default();
+    if dest_bytes.len() >= cap {
+        empty_string(engine, dest);
+        return finish(engine, i32_status_to_u64(EINVAL));
+    }
+    let count_us = usize::try_from(count).unwrap_or(0);
+    let src_bytes = crate::guest_string::read_ansi_bytes(engine, src, count_us.saturating_add(1))
+        .unwrap_or_default();
+    let appended = count_us.min(src_bytes.len());
+    if dest_bytes.len().saturating_add(appended).saturating_add(1) > cap {
+        empty_string(engine, dest);
+        return finish(engine, i32_status_to_u64(ERANGE));
+    }
+    let mut out = dest_bytes;
+    out.extend_from_slice(src_bytes.get(..appended).unwrap_or(&[]));
+    out.push(0);
+    engine.mem_write(dest, &out)?;
+    finish(engine, 0)
+}
+
+/// `strtok_s(str, delim, context)` — context-pointer tokenizer (also serves
+/// `_strtok_s`). The continuation pointer lives in the guest `char**` cell
+/// instead of the static buffer `strtok` uses; `*context` is set to NULL when
+/// no more tokens exist (the secure contract).
+pub(crate) fn handle_strtok_s(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let str_va = engine.read_rcx()?;
+    let d_va = engine.read_rdx()?;
+    let context_va = engine.read_r8()?;
+    if context_va == 0 || d_va == 0 {
+        return finish(engine, 0);
+    }
+    let mut saved_bytes = [0_u8; 8];
+    if engine.mem_read(context_va, &mut saved_bytes).is_err() {
+        return finish(engine, 0);
+    }
+    let saved = u64::from_le_bytes(saved_bytes);
+    let ptr = if str_va == 0 { saved } else { str_va };
+    if ptr == 0 {
+        return finish(engine, 0);
+    }
+    let delim = read_guest_str(engine, d_va, 32).unwrap_or_default();
+    // Skip leading delimiters.
+    let mut start = ptr;
+    loop {
+        let mut b = [0_u8; 1];
+        if engine.mem_read(start, &mut b).is_err() {
+            break;
+        }
+        if b[0] == 0 {
+            break;
+        }
+        if delim.contains(b[0] as char) {
+            start = start.wrapping_add(1);
+            continue;
+        }
+        break;
+    }
+    // Find the first delimiter after `start`; replace it with NUL.
+    let mut end_off = 0_u64;
+    loop {
+        let mut b = [0_u8; 1];
+        if engine
+            .mem_read(start.wrapping_add(end_off), &mut b)
+            .is_err()
+        {
+            break;
+        }
+        if b[0] == 0 {
+            break;
+        }
+        if delim.contains(b[0] as char) {
+            let nul = [0_u8];
+            drop(engine.mem_write(start.wrapping_add(end_off), &nul));
+            let next = start.wrapping_add(end_off).wrapping_add(1);
+            engine.mem_write(context_va, &next.to_le_bytes())?;
+            return finish(engine, start);
+        }
+        end_off = end_off.saturating_add(1);
+    }
+    // No more delimiters: the final token; the secure contract NULLs the
+    // context so a later call with NULL str stops cleanly.
+    engine.mem_write(context_va, &0_u64.to_le_bytes())?;
+    let mut b = [0_u8; 1];
+    if engine.mem_read(start, &mut b).is_ok() && b[0] != 0 {
+        finish(engine, start)
+    } else {
+        finish(engine, 0)
+    }
+}
+
+// ── qsort_s (guest-comparator re-entry bridge) ──────────────────────────
+
+/// One in-flight `qsort_s` sort per guest thread.
+///
+/// The guest comparator is invoked through the re-entry bridge the pthread
+/// exports use: the handler overwrites its own return-address slot with its
+/// fake VA, jumps to the comparator, and the comparator's `ret` re-enters
+/// this export, where the pending record routes to the next step. RSP is
+/// restored to the original caller frame before every comparator call so the
+/// guest stack never walks up into the caller's locals and `rsp % 16 == 8`
+/// alignment holds for each call.
+struct QsortPending {
+    base: u64,
+    count: usize,
+    size: usize,
+    context: u64,
+    compare: u64,
+    /// Original caller return address (restored on finish).
+    return_va: u64,
+    /// Original caller RSP — the return-address slot is at this address.
+    return_rsp: u64,
+    /// Insertion-sort outer cursor: element `i` is being inserted.
+    i: usize,
+    /// Right-hand compare index (`i-1` downward; `-1` = front reached).
+    j: i64,
+    /// Host copy of the element being inserted (written back at its slot).
+    key: Vec<u8>,
+    /// Guest copy of the same element (the comparator's `elem2` argument).
+    key_va: u64,
+}
+
+/// Per-thread pending sorts. Keyed by guest TID; a comparator that itself
+/// calls `qsort_s` would clobber the outer record (documented limitation).
+static QSORT_PENDING: std::sync::LazyLock<std::sync::Mutex<ahash::HashMap<u32, QsortPending>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(ahash::HashMap::default()));
+
+/// `qsort_s(base, count, size, compare, context)` — context-pointer qsort.
+///
+/// MSDN argument order: `qsort_s(base, num, width, compare, context)` — the
+/// comparator comes fourth (R9) and the context fifth (`[rsp+0x28]`). An
+/// insertion sort drives one guest comparator call per element-pair via the
+/// re-entry bridge.
+pub(crate) fn handle_qsort_s(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let tid = state.kernel.threads.current_tid();
+
+    // Re-entry: the guest comparator returned; RAX holds its result.
+    let taken = QSORT_PENDING
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&tid);
+    if let Some(qs) = taken {
+        let raw = engine.read_rax()? & u64::from(u32::MAX);
+        let cmp = i32::from_ne_bytes(u32::try_from(raw).unwrap_or(0).to_ne_bytes());
+        return qsort_advance(engine, state, qs, cmp);
+    }
+
+    let base = engine.read_rcx()?;
+    let count_raw = engine.read_rdx()?;
+    let size_raw = engine.read_r8()?;
+    let compare = engine.read_r9()?;
+    let rsp = engine.read_rsp()?;
+    let mut ctx_buf = [0_u8; 8];
+    engine.mem_read(rsp.wrapping_add(0x28), &mut ctx_buf)?;
+    let context = u64::from_le_bytes(ctx_buf);
+
+    let count = usize::try_from(count_raw).unwrap_or(0);
+    let size = usize::try_from(size_raw).unwrap_or(0);
+    if base == 0 || compare == 0 || (count > 0 && size == 0) {
+        return finish(engine, i32_status_to_u64(EINVAL));
+    }
+    if count <= 1 {
+        return finish(engine, 0);
+    }
+    // First key: element 1 (element 0 is compared against it).
+    let key_va = state
+        .heap_state
+        .heap
+        .alloc_coherent(engine, u64::try_from(size).unwrap_or(0));
+    if key_va == 0 {
+        return finish(engine, i32_status_to_u64(EINVAL));
+    }
+    let mut key = vec![0_u8; size];
+    engine.mem_read(qsort_elem_va(base, size, 1), &mut key)?;
+    engine.mem_write(key_va, &key)?;
+    let return_va = read_u64(engine, rsp).unwrap_or(0);
+    let qs = QsortPending {
+        base,
+        count,
+        size,
+        context,
+        compare,
+        return_va,
+        return_rsp: rsp,
+        i: 1,
+        j: 0,
+        key,
+        key_va,
+    };
+    qsort_park_and_compare(engine, state, qs)
+}
+
+/// Guest address of element `index` (bounds are guaranteed by the caller).
+fn qsort_elem_va(base: u64, size: usize, index: usize) -> u64 {
+    base.wrapping_add(
+        u64::try_from(index)
+            .unwrap_or(0)
+            .wrapping_mul(u64::try_from(size).unwrap_or(0)),
+    )
+}
+
+/// Advance one insertion-sort step after the comparator returned `cmp`.
+fn qsort_advance(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut crate::WinApiState,
+    mut qs: QsortPending,
+    cmp: i32,
+) -> Result<WinApiHandlerResult> {
+    if cmp > 0 {
+        // base[j] > key → shift base[j] up one slot and scan left.
+        let j = usize::try_from(qs.j).unwrap_or(0);
+        let src = qsort_elem_va(qs.base, qs.size, j);
+        let dst = qsort_elem_va(qs.base, qs.size, j.saturating_add(1));
+        if !engine.mem_copy(dst, src, qs.size) {
+            let mut buf = vec![0_u8; qs.size];
+            engine.mem_read(src, &mut buf)?;
+            engine.mem_write(dst, &buf)?;
+        }
+        qs.j = qs.j.saturating_sub(1);
+        if qs.j < 0 {
+            // Front reached: the key goes at base[0].
+            engine.mem_write(qs.base, &qs.key)?;
+            qsort_next(engine, state, qs)
+        } else {
+            qsort_park_and_compare(engine, state, qs)
+        }
+    } else {
+        // base[j] <= key → insert the key right after base[j].
+        let j = usize::try_from(qs.j).unwrap_or(0);
+        engine.mem_write(
+            qsort_elem_va(qs.base, qs.size, j.saturating_add(1)),
+            &qs.key,
+        )?;
+        qsort_next(engine, state, qs)
+    }
+}
+
+/// Move the outer cursor to the next element, or finish the sort.
+fn qsort_next(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut crate::WinApiState,
+    mut qs: QsortPending,
+) -> Result<WinApiHandlerResult> {
+    qs.i = qs.i.saturating_add(1);
+    if qs.i >= qs.count {
+        // Done: release the guest key copy and return to the caller.
+        let _ = state.heap_state.heap.free_coherent(engine, qs.key_va);
+        engine.write_rsp(qs.return_rsp)?;
+        engine.mem_write(qs.return_rsp, &qs.return_va.to_le_bytes())?;
+        return finish(engine, 0);
+    }
+    let mut key = vec![0_u8; qs.size];
+    engine.mem_read(qsort_elem_va(qs.base, qs.size, qs.i), &mut key)?;
+    engine.mem_write(qs.key_va, &key)?;
+    qs.key = key;
+    qs.j = i64::try_from(qs.i).unwrap_or(0).saturating_sub(1);
+    qsort_park_and_compare(engine, state, qs)
+}
+
+/// Store the pending record and dispatch the next comparator call.
+fn qsort_park_and_compare(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut crate::WinApiState,
+    qs: QsortPending,
+) -> Result<WinApiHandlerResult> {
+    let tid = state.kernel.threads.current_tid();
+    {
+        let mut guard = QSORT_PENDING.lock().unwrap_or_else(|p| p.into_inner());
+        guard.insert(tid, qs);
+    }
+    // Re-fetch the Copy fields the call setup needs (qs moved into the map).
+    let (base, j, size, key_va, context, compare, return_rsp) = {
+        let guard = QSORT_PENDING.lock().unwrap_or_else(|p| p.into_inner());
+        let q = guard
+            .get(&tid)
+            .ok_or_else(|| anyhow::anyhow!("qsort_s pending record vanished"))?;
+        (
+            q.base,
+            q.j,
+            q.size,
+            q.key_va,
+            q.context,
+            q.compare,
+            q.return_rsp,
+        )
+    };
+    // Reset to the caller frame, plant the re-entry, and enter the comparator.
+    engine.write_rsp(return_rsp)?;
+    let self_va = engine.read_rip()?;
+    engine.mem_write(return_rsp, &self_va.to_le_bytes())?;
+    engine.write_rcx(context)?;
+    let left = qsort_elem_va(base, size, usize::try_from(j).unwrap_or(0));
+    engine.write_rdx(left)?;
+    engine.write_r8(key_va)?;
+    engine.write_rip(compare)?;
+    Ok(WinApiHandlerResult {
+        return_address: compare,
+        return_value: 0,
+    })
 }

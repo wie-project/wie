@@ -5,7 +5,9 @@ use crate::guest_memory::read_u64;
 use crate::{GuestStdinMode, HandlerContext, WinApiHandlerResult};
 use anyhow::{Context, Result};
 
-use super::{FILE_STDERR, FILE_STDIN, FILE_STDOUT, finish, read_guest_str};
+use super::{
+    EINVAL, ENOENT, FILE_STDERR, FILE_STDIN, FILE_STDOUT, finish, i32_status_to_u64, read_guest_str,
+};
 /// `__acrt_iob_func(ix)` → `FILE*` for stdin/stdout/stderr.
 pub(crate) fn handle_acrt_iob_func(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -780,6 +782,41 @@ pub(crate) fn handle_fopen(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
     drop(read_guest_str(engine, p, 1024).ok());
     drop(read_guest_str(engine, m, 16).ok());
     finish(engine, 0) // NULL = not implemented yet (needs VFS-to-CRT bridge)
+}
+
+/// `fopen_s(FILE **pFile, const char *filename, const char *mode)` — secure
+/// `FILE*` variant. `fopen` has no VFS-to-CRT bridge and always fails, so the
+/// honest outcome is `*pFile = NULL` plus an errno; ENOENT mirrors the most
+/// common real failure callers branch on.
+pub(crate) fn handle_fopen_s(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let pfile = engine.read_rcx()?;
+    let filename = engine.read_rdx()?;
+    let mode = engine.read_r8()?;
+    if pfile == 0 {
+        return finish(engine, i32_status_to_u64(EINVAL));
+    }
+    drop(read_guest_str(engine, filename, 1024).ok());
+    drop(read_guest_str(engine, mode, 16).ok());
+    engine.mem_write(pfile, &0_u64.to_le_bytes())?;
+    finish(engine, i32_status_to_u64(ENOENT))
+}
+
+/// `freopen_s(FILE **pFile, const char *path, const char *mode, FILE *stream)`
+/// — same secure contract as `fopen_s` (no file streams exist today).
+pub(crate) fn handle_freopen_s(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let pfile = engine.read_rcx()?;
+    let path = engine.read_rdx()?;
+    let mode = engine.read_r8()?;
+    let _stream = engine.read_r9()?;
+    if pfile == 0 {
+        return finish(engine, i32_status_to_u64(EINVAL));
+    }
+    drop(read_guest_str(engine, path, 1024).ok());
+    drop(read_guest_str(engine, mode, 16).ok());
+    engine.mem_write(pfile, &0_u64.to_le_bytes())?;
+    finish(engine, i32_status_to_u64(ENOENT))
 }
 
 /// `fclose(stream)` — close a stdio file handle.

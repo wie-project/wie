@@ -715,3 +715,202 @@ fn iswctype_classifies_against_the_crt_mask() {
     // Surrogate (not a valid char) matches nothing.
     expect(&mut engine, &mut state, 0xD800, alnum, 0);
 }
+
+// --- Secure-CRT `_s` variants (MSVCR100+) ---
+
+#[test]
+fn memcpy_s_copies_within_bounds() {
+    let mut engine = test_engine();
+    let mut state = test_state();
+    engine.mem_write(0x4000, b"hello\0").expect("write src");
+    write_regs(&mut engine, 0x3000, 16, 0x4000, 6);
+    let r = dispatch("msvcrt.dll", "memcpy_s", &mut engine, &mut state);
+    assert_eq!(r.return_value, 0);
+    let mut out = [0_u8; 8];
+    engine.mem_read(0x3000, &mut out).expect("read dest");
+    assert_eq!(&out[..6], b"hello\0");
+}
+
+#[test]
+fn memcpy_s_oversized_count_zeroes_dest_and_returns_erange() {
+    let mut engine = test_engine();
+    let mut state = test_state();
+    engine.mem_write(0x4000, b"hello\0").expect("write src");
+    // destsz=4 < count=6 → ERANGE (34), dest zeroed per the secure contract.
+    write_regs(&mut engine, 0x3000, 4, 0x4000, 6);
+    let r = dispatch("msvcrt.dll", "memcpy_s", &mut engine, &mut state);
+    assert_eq!(r.return_value, i32_status_to_u64(34));
+    let mut out = [0xff_u8; 8];
+    engine.mem_read(0x3000, &mut out).expect("read dest");
+    assert_eq!(&out[..4], &[0, 0, 0, 0]);
+}
+
+#[test]
+fn memcpy_s_null_dest_returns_einval() {
+    let mut engine = test_engine();
+    let mut state = test_state();
+    engine.mem_write(0x4000, b"x\0").expect("write src");
+    write_regs(&mut engine, 0, 8, 0x4000, 1);
+    let r = dispatch("msvcrt.dll", "memcpy_s", &mut engine, &mut state);
+    assert_eq!(r.return_value, i32_status_to_u64(22));
+}
+
+#[test]
+fn memset_s_fills_within_bounds() {
+    let mut engine = test_engine();
+    let mut state = test_state();
+    write_regs(&mut engine, 0x3000, 8, u64::from(b'x'), 4);
+    let r = dispatch("msvcrt.dll", "memset_s", &mut engine, &mut state);
+    assert_eq!(r.return_value, 0);
+    let mut out = [0_u8; 6];
+    engine.mem_read(0x3000, &mut out).expect("read dest");
+    assert_eq!(&out[..4], b"xxxx");
+}
+
+#[test]
+fn strcpy_s_copies_and_nul_terminates() {
+    let mut engine = test_engine();
+    let mut state = test_state();
+    engine.mem_write(0x4000, b"hi\0").expect("write src");
+    write_regs(&mut engine, 0x3000, 16, 0x4000, 0);
+    let r = dispatch("msvcrt.dll", "strcpy_s", &mut engine, &mut state);
+    assert_eq!(r.return_value, 0);
+    let mut out = [0_u8; 4];
+    engine.mem_read(0x3000, &mut out).expect("read dest");
+    assert_eq!(&out[..3], b"hi\0");
+}
+
+#[test]
+fn strcpy_s_truncation_empties_dest() {
+    let mut engine = test_engine();
+    let mut state = test_state();
+    engine.mem_write(0x4000, b"hello\0").expect("write src");
+    // destsz=3: "hello" + NUL needs 6 bytes → ERANGE, dest[0]=0.
+    write_regs(&mut engine, 0x3000, 3, 0x4000, 0);
+    let r = dispatch("msvcrt.dll", "strcpy_s", &mut engine, &mut state);
+    assert_eq!(r.return_value, i32_status_to_u64(34));
+    let mut out = [0xff_u8; 4];
+    engine.mem_read(0x3000, &mut out).expect("read dest");
+    assert_eq!(out[0], 0);
+}
+
+#[test]
+fn strncpy_s_pads_short_source() {
+    let mut engine = test_engine();
+    let mut state = test_state();
+    engine.mem_write(0x4000, b"ab\0").expect("write src");
+    // count=6, src shorter → "ab" + NUL padded to 6.
+    write_regs(&mut engine, 0x3000, 8, 0x4000, 6);
+    let r = dispatch("msvcrt.dll", "strncpy_s", &mut engine, &mut state);
+    assert_eq!(r.return_value, 0);
+    let mut out = [0xff_u8; 8];
+    engine.mem_read(0x3000, &mut out).expect("read dest");
+    assert_eq!(&out[..6], b"ab\0\0\0\0");
+}
+
+#[test]
+fn strcat_s_appends_within_bounds() {
+    let mut engine = test_engine();
+    let mut state = test_state();
+    engine.mem_write(0x3000, b"ab\0").expect("write dest");
+    engine.mem_write(0x4000, b"cd\0").expect("write src");
+    write_regs(&mut engine, 0x3000, 8, 0x4000, 0);
+    let r = dispatch("msvcrt.dll", "strcat_s", &mut engine, &mut state);
+    assert_eq!(r.return_value, 0);
+    let mut out = [0_u8; 6];
+    engine.mem_read(0x3000, &mut out).expect("read dest");
+    assert_eq!(&out[..5], b"abcd\0");
+}
+
+#[test]
+fn strtok_s_uses_guest_context() {
+    let mut engine = test_engine();
+    let mut state = test_state();
+    engine.mem_write(0x3000, b"a,b\0").expect("write str");
+    engine.mem_write(0x4000, b",\0").expect("write delim");
+    engine
+        .mem_write(0x6000, &0_u64.to_le_bytes())
+        .expect("write ctx");
+    // First token: "a", context moves past the comma.
+    write_regs(&mut engine, 0x3000, 0x4000, 0x6000, 0);
+    let r = dispatch("msvcrt.dll", "strtok_s", &mut engine, &mut state);
+    assert_eq!(r.return_value, 0x3000);
+    let mut ctx = [0_u8; 8];
+    engine.mem_read(0x6000, &mut ctx).expect("read ctx");
+    assert_eq!(u64::from_le_bytes(ctx), 0x3002);
+    // Second token with NULL str: "b", then the context is NULLed.
+    write_regs(&mut engine, 0, 0x4000, 0x6000, 0);
+    let r = dispatch("msvcrt.dll", "strtok_s", &mut engine, &mut state);
+    assert_eq!(r.return_value, 0x3002);
+    engine.mem_read(0x6000, &mut ctx).expect("read ctx");
+    assert_eq!(u64::from_le_bytes(ctx), 0);
+}
+
+#[test]
+fn sprintf_s_formats_register_vararg() {
+    let mut engine = test_engine();
+    let mut state = test_state();
+    engine.mem_write(0x5000, b"%d\0").expect("write format");
+    // sprintf_s(buf, size, fmt, ...): the first vararg is in R9.
+    write_regs(&mut engine, 0x3000, 64, 0x5000, 42);
+    let r = dispatch("msvcrt.dll", "sprintf_s", &mut engine, &mut state);
+    assert_eq!(r.return_value, 0);
+    let mut out = [0_u8; 8];
+    engine.mem_read(0x3000, &mut out).expect("read dest");
+    assert_eq!(&out[..3], b"42\0");
+}
+
+#[test]
+fn vsnprintf_s_truncation_returns_erange() {
+    let mut engine = test_engine();
+    let mut state = test_state();
+    engine.mem_write(0x5000, b"%s\0").expect("write format");
+    engine.mem_write(0x7000, b"hello\0").expect("write string");
+    write_va_list(&mut engine, 0x6000, &[0x7000]);
+    // _vsnprintf_s(buf, size, count, fmt, va_list): va_list at [rsp+0x28].
+    write_regs(&mut engine, 0x3000, 8, 4, 0x5000);
+    engine
+        .mem_write(STACK_TOP + 0x28, &0x6000_u64.to_le_bytes())
+        .expect("write va_list slot");
+    let r = dispatch("msvcrt.dll", "_vsnprintf_s", &mut engine, &mut state);
+    assert_eq!(r.return_value, i32_status_to_u64(34));
+    // Truncation writes cap-1 content units + NUL ("hel\0" for cap=4).
+    let mut out = [0xff_u8; 8];
+    engine.mem_read(0x3000, &mut out).expect("read dest");
+    assert_eq!(&out[..4], b"hel\0");
+}
+
+#[test]
+fn fopen_s_writes_null_and_returns_enoent() {
+    let mut engine = test_engine();
+    let mut state = test_state();
+    engine.mem_write(0x4000, b"x.txt\0").expect("write name");
+    engine.mem_write(0x5000, b"r\0").expect("write mode");
+    engine
+        .mem_write(0x3000, &[0xff_u8; 8])
+        .expect("write pFile");
+    write_regs(&mut engine, 0x3000, 0x4000, 0x5000, 0);
+    let r = dispatch("msvcrt.dll", "fopen_s", &mut engine, &mut state);
+    assert_eq!(r.return_value, i32_status_to_u64(2)); // ENOENT
+    let mut cell = [0xff_u8; 8];
+    engine.mem_read(0x3000, &mut cell).expect("read pFile");
+    assert_eq!(u64::from_le_bytes(cell), 0);
+}
+
+#[test]
+fn qsort_s_validates_and_shortcircuits() {
+    let mut engine = test_engine();
+    let mut state = test_state();
+    // count <= 1: no comparator calls needed → success.
+    write_regs(&mut engine, 0x3000, 1, 8, 0x7000);
+    let r = dispatch("msvcrt.dll", "qsort_s", &mut engine, &mut state);
+    assert_eq!(r.return_value, 0);
+    // NULL base → EINVAL.
+    write_regs(&mut engine, 0, 5, 4, 0x7000);
+    let r = dispatch("msvcrt.dll", "qsort_s", &mut engine, &mut state);
+    assert_eq!(r.return_value, i32_status_to_u64(22));
+    // count > 0 with zero element size → EINVAL.
+    write_regs(&mut engine, 0x3000, 5, 0, 0x7000);
+    let r = dispatch("msvcrt.dll", "qsort_s", &mut engine, &mut state);
+    assert_eq!(r.return_value, i32_status_to_u64(22));
+}

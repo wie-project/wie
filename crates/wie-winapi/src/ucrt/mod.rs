@@ -40,7 +40,11 @@ use crt::{
     handle_p_commode, handle_p_environ, handle_p_fmode, handle_p_wargv, handle_p_wenviron,
     handle_set_app_type, handle_set_new_mode,
 };
-use format::{handle_vsnprintf, handle_vsnwprintf};
+use format::{
+    handle_snprintf_s, handle_sprintf_s, handle_stdio_common_vsprintf_s,
+    handle_stdio_common_vswprintf_s, handle_vsnprintf, handle_vsnprintf_s, handle_vsnwprintf,
+    handle_vsnwprintf_s,
+};
 use misc::{
     handle_atoi, handle_atol, handle_begin_thread_ex, handle_c_specific_handler,
     handle_config_thread_locale, handle_cxx_throw_exception, handle_end_thread_ex, handle_errno,
@@ -51,21 +55,28 @@ use misc::{
 };
 use stdio::{
     handle_acrt_iob_func, handle_fclose, handle_fflush, handle_fgetc, handle_fgets, handle_fgetwc,
-    handle_fopen, handle_fputc, handle_fputs, handle_fwrite, handle_getchar, handle_putchar,
-    handle_puts, handle_setvbuf, handle_stdio_common_vfprintf, handle_stdio_common_vfscanf,
-    handle_stdio_common_vsprintf, handle_stdio_common_vsscanf, handle_vfprintf,
+    handle_fopen, handle_fopen_s, handle_fputc, handle_fputs, handle_freopen_s, handle_fwrite,
+    handle_getchar, handle_putchar, handle_puts, handle_setvbuf, handle_stdio_common_vfprintf,
+    handle_stdio_common_vfscanf, handle_stdio_common_vsprintf, handle_stdio_common_vsscanf,
+    handle_vfprintf,
 };
 use string::{
     handle_isalnum, handle_isalpha, handle_isdigit, handle_islower, handle_isspace, handle_isupper,
-    handle_iswctype, handle_memcmp, handle_memcpy, handle_memset, handle_strchr, handle_strcmp,
-    handle_strlen, handle_strncmp, handle_strncpy, handle_strstr, handle_strtod, handle_strtok,
-    handle_strtol, handle_strtoul, handle_tolower, handle_toupper, handle_towupper, handle_wcscat,
-    handle_wcscmp, handle_wcscpy, handle_wcslen, handle_wcsncmp, handle_wcsncpy, handle_wcsnicmp,
-    handle_wcsrchr, handle_wcsstr,
+    handle_iswctype, handle_memcmp, handle_memcpy, handle_memcpy_s, handle_memmove_s,
+    handle_memset, handle_memset_s, handle_qsort_s, handle_strcat_s, handle_strchr, handle_strcmp,
+    handle_strcpy_s, handle_strlen, handle_strncat_s, handle_strncmp, handle_strncpy,
+    handle_strncpy_s, handle_strstr, handle_strtod, handle_strtok, handle_strtok_s, handle_strtol,
+    handle_strtoul, handle_tolower, handle_toupper, handle_towupper, handle_wcscat, handle_wcscmp,
+    handle_wcscpy, handle_wcslen, handle_wcsncmp, handle_wcsncpy, handle_wcsnicmp, handle_wcsrchr,
+    handle_wcsstr,
 };
 /// Guest VA base for synthetic CRT objects (FILE cookies, env pointers, etc.).
 const ACMDLN_PTR_SLOT: u64 = CRT_GUEST_BASE + 0x328;
 const CRT_GUEST_BASE: u64 = 0x0000_0000_6800_0000;
+/// CRT `errno` values the secure `_s` handlers report (Win32 CRT numbering).
+pub(crate) const EINVAL: i32 = 22;
+pub(crate) const ERANGE: i32 = 34;
+pub(crate) const ENOENT: i32 = 2;
 const FILE_STDIN: u64 = CRT_GUEST_BASE;
 const FILE_STDOUT: u64 = CRT_GUEST_BASE + 0x100;
 const FILE_STDERR: u64 = CRT_GUEST_BASE + 0x200;
@@ -124,15 +135,23 @@ pub fn is_ucrt_library(library: &str) -> bool {
     let mut scratch = [0_u8; ASCII_LOWER_SCRATCH];
     let mut owned: Option<String> = None;
     let l = ascii_lower(library, &mut scratch, &mut owned);
-    // Legacy VC7 runtimes forward to the same name dispatch as msvcrt: their
-    // exports (printf, memcpy, `??2@YAPEAX_K@Z`, …) are all CRT functions
-    // already handled below. Data imports (_iob, _fmode, …) resolve via
-    // `crt_data_import_va`.
+    // Legacy VC7+ runtimes (msvcr71 … msvcp140) forward to the same name
+    // dispatch as msvcrt: their exports (printf, memcpy, sprintf_s,
+    // `??2@YAPEAX_K@Z`, …) are all CRT functions already handled below. Data
+    // imports (_iob, _fmode, …) resolve via `crt_data_import_va`.
     l.starts_with("api-ms-win-crt-")
         || l == "ucrtbase.dll"
         || l == "msvcrt.dll"
         || l == "msvcr71.dll"
         || l == "msvcp71.dll"
+        || l == "msvcr100.dll"
+        || l == "msvcp100.dll"
+        || l == "msvcr110.dll"
+        || l == "msvcp110.dll"
+        || l == "msvcr120.dll"
+        || l == "msvcp120.dll"
+        || l == "msvcr140.dll"
+        || l == "msvcp140.dll"
 }
 /// Guest VA for legacy `msvcrt` **data** imports (`_fmode`, `_commode`, `_acmdln`).
 ///
@@ -178,6 +197,13 @@ pub fn dispatch_ucrt(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiH
         "setvbuf" => handle_setvbuf(ctx),
         "_vsnwprintf" => handle_vsnwprintf(ctx),
         "_vsnprintf" => handle_vsnprintf(ctx),
+        // Secure-CRT `_s` format variants (MSVCR100+).
+        "sprintf_s" => handle_sprintf_s(ctx),
+        "snprintf_s" | "_snprintf_s" => handle_snprintf_s(ctx),
+        "_vsnprintf_s" => handle_vsnprintf_s(ctx),
+        "_vsnwprintf_s" => handle_vsnwprintf_s(ctx),
+        "__stdio_common_vsprintf_s" => handle_stdio_common_vsprintf_s(ctx),
+        "__stdio_common_vswprintf_s" => handle_stdio_common_vswprintf_s(ctx),
         "__stdio_common_vfprintf" => handle_stdio_common_vfprintf(ctx),
         "__stdio_common_vsprintf" => handle_stdio_common_vsprintf(ctx),
         "__stdio_common_vsscanf" => handle_stdio_common_vsscanf(ctx),
@@ -199,6 +225,10 @@ pub fn dispatch_ucrt(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiH
         "memcpy" | "memmove" => handle_memcpy(ctx),
         "memcmp" => handle_memcmp(ctx),
         "memset" => handle_memset(ctx),
+        // Secure-CRT bounds-checked memory variants.
+        "memcpy_s" => handle_memcpy_s(ctx),
+        "memmove_s" => handle_memmove_s(ctx),
+        "memset_s" => handle_memset_s(ctx),
         "strlen" => handle_strlen(ctx),
         "strncmp" => handle_strncmp(ctx),
         "_initterm" => handle_initterm(ctx),
@@ -246,6 +276,9 @@ pub fn dispatch_ucrt(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiH
         "strtod" | "strtof" => handle_strtod(ctx),
         "fopen" => handle_fopen(ctx),
         "fclose" => handle_fclose(ctx),
+        // Secure-CRT FILE** variants (fopen always fails: no VFS-to-CRT bridge).
+        "fopen_s" => handle_fopen_s(ctx),
+        "freopen_s" => handle_freopen_s(ctx),
         "fgets" => handle_fgets(ctx),
         "fgetc" => handle_fgetc(ctx),
         // getc is a macro for fgetc in the real headers; msvcrt exports both.
@@ -257,6 +290,13 @@ pub fn dispatch_ucrt(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiH
         "strchr" => handle_strchr(ctx),
         "strstr" => handle_strstr(ctx),
         "strncpy" => handle_strncpy(ctx),
+        // Secure-CRT size-checked string variants.
+        "strcpy_s" => handle_strcpy_s(ctx),
+        "strncpy_s" => handle_strncpy_s(ctx),
+        "strcat_s" => handle_strcat_s(ctx),
+        "strncat_s" => handle_strncat_s(ctx),
+        "strtok_s" | "_strtok_s" => handle_strtok_s(ctx),
+        "qsort_s" => handle_qsort_s(ctx),
         "isalpha" => handle_isalpha(ctx),
         "isdigit" => handle_isdigit(ctx),
         "isalnum" => handle_isalnum(ctx),

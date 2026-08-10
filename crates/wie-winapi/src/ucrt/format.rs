@@ -29,7 +29,7 @@ use crate::guest_memory::read_u64;
 use crate::{HandlerContext, WinApiHandlerResult};
 use anyhow::Result;
 
-use super::{finish, i32_status_to_u64};
+use super::{EINVAL, ERANGE, finish, i32_status_to_u64};
 
 /// Absolute ceiling for one formatted result. Real callers pass buffer sizes
 /// in the low KBs (notepad's status bar); this only guards hostile formats.
@@ -446,4 +446,300 @@ pub(crate) fn handle_vsnprintf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     crate::guest_memory::write_bytes(engine, buf, &out)?;
     let written = u64::try_from(out.len().saturating_sub(1)).unwrap_or(0);
     finish(engine, written)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Secure-CRT `_s` format variants (MSVCR100+)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Contract: `errno_t` return — 0 on success, EINVAL for invalid arguments,
+// ERANGE on truncation. On failure the destination is emptied (`buf[0] = 0`)
+// so it can never be misread as a valid string. `count` is treated as the
+// total unit budget including the terminating NUL, matching the existing
+// `_vsn*` handlers' convention; `_TRUNCATE` (-1) means "as much as fits".
+
+/// Guest scratch for the synthetic `sprintf_s` va_list: the free region of
+/// the CRT page between the env slots (0x338) and the argv table (0x400).
+const FORMAT_SCRATCH: u64 = super::CRT_GUEST_BASE + 0x340;
+/// Stack vararg slots staged next to R9's value for `sprintf_s`.
+const MAX_VARARG_STACK_SLOTS: usize = 16;
+
+/// Shared `_s` formatting walk: format `fmt` with the va cursor `va` into a
+/// host unit vector capped at `cap` (including the NUL). The caller owns the
+/// concrete write (narrow vs wide) so this stays monomorphic per `U`.
+///
+/// Returns the formatted units and whether `cap` was exhausted (truncation).
+fn format_s_units<U: FmtUnit>(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    cap: usize,
+    fmt: &[U],
+    va: &mut u64,
+    read_string: &mut dyn FnMut(&mut dyn wie_cpu::CpuEngine, u64) -> Vec<U>,
+) -> (Vec<U>, bool) {
+    let mut out: Vec<U> = Vec::with_capacity(64);
+    let truncated = format_into(engine, fmt, va, &mut out, cap, read_string);
+    (out, truncated)
+}
+
+/// Narrow `_s` write: append the NUL and emit to `buf`; ERANGE on truncation.
+fn write_s_narrow(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    buf: u64,
+    cap: usize,
+    mut out: Vec<u8>,
+    truncated: bool,
+) -> Result<i32> {
+    if truncated {
+        let keep = cap.saturating_sub(1).min(out.len());
+        out.truncate(keep);
+        out.push(0);
+        crate::guest_memory::write_bytes(engine, buf, &out)?;
+        Ok(ERANGE)
+    } else {
+        out.push(0);
+        crate::guest_memory::write_bytes(engine, buf, &out)?;
+        Ok(0)
+    }
+}
+
+/// Wide `_s` write: append the NUL unit and emit to `buf`; ERANGE on truncation.
+fn write_s_wide(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    buf: u64,
+    cap: usize,
+    mut out: Vec<u16>,
+    truncated: bool,
+) -> Result<i32> {
+    if truncated {
+        let keep = cap.saturating_sub(1).min(out.len());
+        out.truncate(keep);
+        out.push(0);
+        crate::guest_string::write_utf16_units(engine, buf, &out)?;
+        Ok(ERANGE)
+    } else {
+        out.push(0);
+        crate::guest_string::write_utf16_units(engine, buf, &out)?;
+        Ok(0)
+    }
+}
+
+/// `sprintf_s(char *buffer, size_t size, const char *format, ...)`.
+///
+/// Win64 varargs put the first `...` argument in R9 and the rest on the guest
+/// stack at `rsp+0x28`; a synthetic va_list is staged in the CRT page scratch
+/// area so the shared walker consumes slots uniformly.
+pub(crate) fn handle_sprintf_s(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let buf = engine.read_rcx()?;
+    let size_raw = engine.read_rdx()?;
+    let fmt_va = engine.read_r8()?;
+    let first_vararg = engine.read_r9()?;
+    if buf == 0 || fmt_va == 0 || size_raw == 0 {
+        empty_secure_buf(engine, buf, size_raw);
+        return finish(engine, i32_status_to_u64(EINVAL));
+    }
+    let size = usize::try_from(size_raw)
+        .unwrap_or(0)
+        .min(MAX_FORMAT_OUTPUT);
+    // Stage slot 0 (R9's value) + the stack slots into the scratch area.
+    engine.mem_write(FORMAT_SCRATCH, &first_vararg.to_le_bytes())?;
+    let rsp = engine.read_rsp()?;
+    let mut stack_slots = Vec::with_capacity(8 * MAX_VARARG_STACK_SLOTS);
+    for i in 0..MAX_VARARG_STACK_SLOTS {
+        let mut slot = [0_u8; 8];
+        let off = 0x28_u64.wrapping_add(u64::try_from(i).unwrap_or(0).wrapping_mul(8));
+        if engine.mem_read(rsp.wrapping_add(off), &mut slot).is_err() {
+            slot = [0_u8; 8];
+        }
+        stack_slots.extend_from_slice(&slot);
+    }
+    engine.mem_write(FORMAT_SCRATCH + 8, &stack_slots)?;
+    let mut va = FORMAT_SCRATCH;
+    let fmt = crate::guest_string::read_ansi_bytes(engine, fmt_va, 4096).unwrap_or_default();
+    let mut read_string = |engine: &mut dyn wie_cpu::CpuEngine, p: u64| -> Vec<u8> {
+        crate::guest_string::read_ansi_bytes(engine, p, MAX_FORMAT_OUTPUT).unwrap_or_default()
+    };
+    let (out, truncated) = format_s_units(engine, size, &fmt, &mut va, &mut read_string);
+    let err = write_s_narrow(engine, buf, size, out, truncated)?;
+    finish(engine, i32_status_to_u64(err))
+}
+
+/// `snprintf_s(char *buffer, size_t size, size_t count, const char *format,
+/// ...)` — also serves `_snprintf_s`. All varargs sit on the stack at
+/// `rsp+0x28` (no register vararg).
+pub(crate) fn handle_snprintf_s(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let buf = engine.read_rcx()?;
+    let size_raw = engine.read_rdx()?;
+    let count_raw = engine.read_r8()?;
+    let fmt_va = engine.read_r9()?;
+    if buf == 0 || fmt_va == 0 || size_raw == 0 || count_raw == 0 {
+        empty_secure_buf(engine, buf, size_raw);
+        return finish(engine, i32_status_to_u64(EINVAL));
+    }
+    let size = usize::try_from(size_raw)
+        .unwrap_or(0)
+        .min(MAX_FORMAT_OUTPUT);
+    // `_TRUNCATE` (-1) = "as much as fits" → the whole buffer.
+    let cap = if count_raw == u64::MAX {
+        size
+    } else {
+        usize::try_from(count_raw).unwrap_or(0).min(size)
+    };
+    if cap == 0 {
+        empty_secure_buf(engine, buf, size_raw);
+        return finish(engine, i32_status_to_u64(EINVAL));
+    }
+    let rsp = engine.read_rsp()?;
+    let mut va = rsp.wrapping_add(0x28);
+    let fmt = crate::guest_string::read_ansi_bytes(engine, fmt_va, 4096).unwrap_or_default();
+    let mut read_string = |engine: &mut dyn wie_cpu::CpuEngine, p: u64| -> Vec<u8> {
+        crate::guest_string::read_ansi_bytes(engine, p, MAX_FORMAT_OUTPUT).unwrap_or_default()
+    };
+    let (out, truncated) = format_s_units(engine, cap, &fmt, &mut va, &mut read_string);
+    let err = write_s_narrow(engine, buf, cap, out, truncated)?;
+    finish(engine, i32_status_to_u64(err))
+}
+
+/// `_vsnprintf_s(char *buffer, size_t size, size_t count, const char *format,
+/// va_list)` — the explicit va_list sits at `rsp+0x28`.
+pub(crate) fn handle_vsnprintf_s(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let buf = engine.read_rcx()?;
+    let size_raw = engine.read_rdx()?;
+    let count_raw = engine.read_r8()?;
+    let fmt_va = engine.read_r9()?;
+    let rsp = engine.read_rsp()?;
+    let mut va = read_u64(engine, rsp.wrapping_add(0x28)).unwrap_or(0);
+    if buf == 0 || fmt_va == 0 || size_raw == 0 || count_raw == 0 {
+        empty_secure_buf(engine, buf, size_raw);
+        return finish(engine, i32_status_to_u64(EINVAL));
+    }
+    let size = usize::try_from(size_raw)
+        .unwrap_or(0)
+        .min(MAX_FORMAT_OUTPUT);
+    let cap = if count_raw == u64::MAX {
+        size
+    } else {
+        usize::try_from(count_raw).unwrap_or(0).min(size)
+    };
+    if cap == 0 {
+        empty_secure_buf(engine, buf, size_raw);
+        return finish(engine, i32_status_to_u64(EINVAL));
+    }
+    let fmt = crate::guest_string::read_ansi_bytes(engine, fmt_va, 4096).unwrap_or_default();
+    let mut read_string = |engine: &mut dyn wie_cpu::CpuEngine, p: u64| -> Vec<u8> {
+        crate::guest_string::read_ansi_bytes(engine, p, MAX_FORMAT_OUTPUT).unwrap_or_default()
+    };
+    let (out, truncated) = format_s_units(engine, cap, &fmt, &mut va, &mut read_string);
+    let err = write_s_narrow(engine, buf, cap, out, truncated)?;
+    finish(engine, i32_status_to_u64(err))
+}
+
+/// `_vsnwprintf_s(wchar_t *buffer, size_t size, size_t count, const wchar_t
+/// *format, va_list)` — wide twin of `_vsnprintf_s`.
+pub(crate) fn handle_vsnwprintf_s(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let buf = engine.read_rcx()?;
+    let size_raw = engine.read_rdx()?;
+    let count_raw = engine.read_r8()?;
+    let fmt_va = engine.read_r9()?;
+    let rsp = engine.read_rsp()?;
+    let mut va = read_u64(engine, rsp.wrapping_add(0x28)).unwrap_or(0);
+    if buf == 0 || fmt_va == 0 || size_raw == 0 || count_raw == 0 {
+        empty_secure_buf(engine, buf, size_raw);
+        return finish(engine, i32_status_to_u64(EINVAL));
+    }
+    let size = usize::try_from(size_raw)
+        .unwrap_or(0)
+        .min(MAX_FORMAT_OUTPUT);
+    let cap = if count_raw == u64::MAX {
+        size
+    } else {
+        usize::try_from(count_raw).unwrap_or(0).min(size)
+    };
+    if cap == 0 {
+        empty_secure_buf(engine, buf, size_raw);
+        return finish(engine, i32_status_to_u64(EINVAL));
+    }
+    let fmt = crate::guest_string::read_utf16_lossy(engine, fmt_va, 4096)
+        .map(|s| s.encode_utf16().collect::<Vec<u16>>())
+        .unwrap_or_default();
+    let mut read_string = |engine: &mut dyn wie_cpu::CpuEngine, p: u64| -> Vec<u16> {
+        crate::guest_string::read_utf16_lossy(engine, p, MAX_FORMAT_OUTPUT)
+            .map(|s| s.encode_utf16().collect())
+            .unwrap_or_default()
+    };
+    let (out, truncated) = format_s_units(engine, cap, &fmt, &mut va, &mut read_string);
+    let err = write_s_wide(engine, buf, cap, out, truncated)?;
+    finish(engine, i32_status_to_u64(err))
+}
+
+/// `__stdio_common_vsprintf_s(options, buffer, bufferSize, format, locale,
+/// va_list)` — the API-set core the UCRT `sprintf_s` family inlines to. The
+/// va_list sits at `rsp+0x30` (after options/buffer/size/format/locale).
+pub(crate) fn handle_stdio_common_vsprintf_s(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let _options = engine.read_rcx()?;
+    let buf = engine.read_rdx()?;
+    let size_raw = engine.read_r8()?;
+    let fmt_va = engine.read_r9()?;
+    let rsp = engine.read_rsp()?;
+    let mut va = read_u64(engine, rsp.wrapping_add(0x30)).unwrap_or(0);
+    if buf == 0 || fmt_va == 0 || size_raw == 0 {
+        empty_secure_buf(engine, buf, size_raw);
+        return finish(engine, i32_status_to_u64(EINVAL));
+    }
+    let size = usize::try_from(size_raw)
+        .unwrap_or(0)
+        .min(MAX_FORMAT_OUTPUT);
+    let fmt = crate::guest_string::read_ansi_bytes(engine, fmt_va, 4096).unwrap_or_default();
+    let mut read_string = |engine: &mut dyn wie_cpu::CpuEngine, p: u64| -> Vec<u8> {
+        crate::guest_string::read_ansi_bytes(engine, p, MAX_FORMAT_OUTPUT).unwrap_or_default()
+    };
+    let (out, truncated) = format_s_units(engine, size, &fmt, &mut va, &mut read_string);
+    let err = write_s_narrow(engine, buf, size, out, truncated)?;
+    finish(engine, i32_status_to_u64(err))
+}
+
+/// `__stdio_common_vswprintf_s(options, buffer, bufferSize, format, locale,
+/// va_list)` — wide twin of `__stdio_common_vsprintf_s`.
+pub(crate) fn handle_stdio_common_vswprintf_s(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let _options = engine.read_rcx()?;
+    let buf = engine.read_rdx()?;
+    let size_raw = engine.read_r8()?;
+    let fmt_va = engine.read_r9()?;
+    let rsp = engine.read_rsp()?;
+    let mut va = read_u64(engine, rsp.wrapping_add(0x30)).unwrap_or(0);
+    if buf == 0 || fmt_va == 0 || size_raw == 0 {
+        empty_secure_buf(engine, buf, size_raw);
+        return finish(engine, i32_status_to_u64(EINVAL));
+    }
+    let size = usize::try_from(size_raw)
+        .unwrap_or(0)
+        .min(MAX_FORMAT_OUTPUT);
+    let fmt = crate::guest_string::read_utf16_lossy(engine, fmt_va, 4096)
+        .map(|s| s.encode_utf16().collect::<Vec<u16>>())
+        .unwrap_or_default();
+    let mut read_string = |engine: &mut dyn wie_cpu::CpuEngine, p: u64| -> Vec<u16> {
+        crate::guest_string::read_utf16_lossy(engine, p, MAX_FORMAT_OUTPUT)
+            .map(|s| s.encode_utf16().collect())
+            .unwrap_or_default()
+    };
+    let (out, truncated) = format_s_units(engine, size, &fmt, &mut va, &mut read_string);
+    let err = write_s_wide(engine, buf, size, out, truncated)?;
+    finish(engine, i32_status_to_u64(err))
+}
+
+/// Empty a secure-`_s` destination on failure (`buf[0] = 0`) when the buffer
+/// pointer and size are plausible.
+fn empty_secure_buf(engine: &mut dyn wie_cpu::CpuEngine, buf: u64, size_raw: u64) {
+    if buf != 0 && size_raw != 0 {
+        drop(engine.mem_write(buf, &[0_u8]));
+    }
 }
