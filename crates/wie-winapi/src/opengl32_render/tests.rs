@@ -768,11 +768,7 @@ fn texture2d_in_fragment_shader_samples_texel() {
 fn shader_compile_error_reports_log() {
     let mut ctx = test_ctx();
     let vs = glsl::gl_create_shader(&mut ctx, glsl::GL_VERTEX_SHADER);
-    glsl::gl_shader_source(
-        &mut ctx,
-        vs,
-        "void main() { gl_Position = gl_Vertex; }",
-    );
+    glsl::gl_shader_source(&mut ctx, vs, "void main() { gl_Position = gl_Vertex; }");
     glsl::gl_compile_shader(&mut ctx, vs);
     assert_eq!(glsl::gl_shader_compile_status(&ctx, vs), 1, "VS compiles");
     let bad = glsl::gl_create_shader(&mut ctx, glsl::GL_FRAGMENT_SHADER);
@@ -855,9 +851,6 @@ fn uniform_matrix4fv_affects_position() {
         "the original triangle position is now clear"
     );
 }
-
-
-
 
 /// The micro's quad-center readback must survive a WM_SIZE: after the
 /// backbuffer follows the window's new client size (what `resize_window`

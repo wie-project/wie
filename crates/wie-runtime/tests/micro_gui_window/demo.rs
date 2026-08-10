@@ -266,13 +266,8 @@ fn gl_quad_renders_clear_and_quads() {
                 let far = frame.pixels.get(idx(50, h - 1 - 330)).copied().unwrap_or(0);
                 // Gradient quad (GL (230,30) dark vs (410,210) bright): the
                 // uv-mapped FS color rises toward the top-right corner.
-                let grad_dark = frame
-                    .pixels
-                    .get(idx(230, h - 1 - 30))
-                    .copied()
-                    .unwrap_or(0)
-                    >> 16
-                    & 0xFF;
+                let grad_dark =
+                    frame.pixels.get(idx(230, h - 1 - 30)).copied().unwrap_or(0) >> 16 & 0xFF;
                 let grad_bright = frame
                     .pixels
                     .get(idx(410, h - 1 - 210))
@@ -968,9 +963,7 @@ fn gl_quad_resize_keeps_quad_center_readback() {
         // Resize once the guest window exists — the host-side hook app.rs
         // calls at settle time, before WM_SIZE reaches the guest. The micro
         // exits after 3 rendered frames, so the resize lands mid-run.
-        if !resized
-            && let Some(hwnd) = session.first_guest_window_handle()
-        {
+        if !resized && let Some(hwnd) = session.first_guest_window_handle() {
             session.guest_handle().resize_window(
                 wie_winapi::handles::Hwnd::from(hwnd),
                 wie_winapi::user32::Dimension {

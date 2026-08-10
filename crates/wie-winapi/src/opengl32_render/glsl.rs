@@ -115,7 +115,10 @@ impl GlslType {
     /// against in GLSL componentwise arithmetic.
     #[must_use]
     fn is_scalar(self) -> bool {
-        matches!(self, GlslType::Scalar(BaseType::Float | BaseType::Int | BaseType::Bool))
+        matches!(
+            self,
+            GlslType::Scalar(BaseType::Float | BaseType::Int | BaseType::Bool)
+        )
     }
 
     /// The number of float-equivalent components a constructor argument of
@@ -1943,7 +1946,8 @@ fn parse_shader(source: &str, kind: u32) -> Result<ParsedShader, String> {
             Qualifier::Varying => {
                 varyings.push(g.name.clone());
                 if let Some(t) = parse_type_name(&g.type_name) {
-                    varying_comps.insert(g.name.clone(), u32::try_from(t.components()).unwrap_or(0));
+                    varying_comps
+                        .insert(g.name.clone(), u32::try_from(t.components()).unwrap_or(0));
                 }
             }
             Qualifier::Attribute => attributes.push(g.name.clone()),
