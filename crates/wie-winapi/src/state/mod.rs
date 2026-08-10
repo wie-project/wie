@@ -144,6 +144,8 @@ pub enum DllId {
     Ole32,
     /// Timer/audio handle tables (`WINMM.dll` — timeSetEvent, waveOut).
     Winmm,
+    /// Internet/HTTP handle tables (`WININET.dll` — HINTERNET sessions).
+    Wininet,
 }
 
 impl DllId {
@@ -198,6 +200,7 @@ const fn dll_index(id: DllId) -> usize {
         DllId::Crypt32 => 10,
         DllId::Ole32 => 11,
         DllId::Winmm => 12,
+        DllId::Wininet => 13,
     }
 }
 
@@ -231,6 +234,7 @@ const fn slot_of(i: usize) -> &'static str {
         10 => "crypt32",
         11 => "ole32",
         12 => "winmm",
+        13 => "wininet",
         _ => "?",
     }
 }
@@ -474,6 +478,13 @@ impl WinApiState {
     pub fn winmm(&mut self) -> &mut crate::winmm::WinmmState {
         self.dll_states
             .get_or_init::<crate::winmm::WinmmState>(DllId::Winmm)
+    }
+
+    /// Mutable access to the Internet/HTTP handle tables. Lazy: allocated on
+    /// first `WININET` call.
+    pub fn wininet(&mut self) -> &mut crate::wininet::WininetState {
+        self.dll_states
+            .get_or_init::<crate::wininet::WininetState>(DllId::Wininet)
     }
 
     /// Read-only access — returns `None` if the state was never initialised.
