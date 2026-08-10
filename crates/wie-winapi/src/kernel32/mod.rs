@@ -531,6 +531,18 @@ pub fn dispatch_kernel32_extra(
         "backupread" => Ok(Some(handle_backup_read(ctx)?)),
         "backupseek" => Ok(Some(handle_backup_seek(ctx)?)),
         "backupwrite" => Ok(Some(handle_backup_write(ctx)?)),
+        // Directory change notifications (FindFirst/Next/CloseChangeNotification,
+        // ReadDirectoryChangesW — see kernel32/file_io/watch.rs).
+        "findfirstchangenotificationw" => Ok(Some(handle_find_first_change_notification_w(ctx)?)),
+        "findfirstchangenotificationa" => Ok(Some(handle_find_first_change_notification_a(ctx)?)),
+        "findnextchangenotification" => Ok(Some(handle_find_next_change_notification(ctx)?)),
+        "findclosechangenotification" => Ok(Some(handle_find_close_change_notification(ctx)?)),
+        "readdirectorychangesw" => Ok(Some(handle_read_directory_changes_w(ctx)?)),
+        // CreateProcess + process-wait surface (child guest sessions).
+        "createprocessw" => Ok(Some(handle_create_process_w(ctx)?)),
+        "createprocessa" => Ok(Some(handle_create_process_a(ctx)?)),
+        "getexitcodeprocess" => Ok(Some(handle_get_exit_code_process(ctx)?)),
+        "openprocess" => Ok(Some(handle_open_process(ctx)?)),
         // Console surface: the hot calls have their own arms above; the rest
         // live in `console` so this match does not grow a fourth screenful.
         _ => console::dispatch_console_extra(ctx, n.as_str()),

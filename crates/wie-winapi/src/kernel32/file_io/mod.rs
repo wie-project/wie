@@ -25,6 +25,7 @@ pub use path::*;
 pub use rw::*;
 pub use time::*;
 pub use vol::*;
+pub use watch::*;
 
 mod dir;
 mod open;
@@ -32,6 +33,7 @@ mod path;
 mod rw;
 mod time;
 mod vol;
+mod watch;
 
 /// Handles `KERNEL32.dll!GetFileType`.
 pub fn handle_get_file_type(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -274,6 +276,10 @@ pub fn handle_close_handle(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
         // Best-effort teardown: failure to sync is not fatal.
         let _ = crate::guest_io_host::unregister_open_file(engine, state, handle).ok();
         state.file_io.open_files.remove(&handle);
+        // Drop any directory-watch anchor for this handle (stops the watcher).
+        if let Some(watch) = state.kernel.sync.watch_handles.remove(&handle) {
+            watch.deactivate();
+        }
         // Drop the cached streaming `File` (if any) so the host fd is released.
         state.file_io.cached_streams.remove(&handle);
         state.process.last_error = 0;
@@ -735,6 +741,24 @@ pub(crate) fn finish_create_file(
     creation_disposition: u64,
     api_name: &str,
 ) -> u64 {
+    // Directories are not regular files. Opening one with FILE_LIST_DIRECTORY
+    // (0x1 — the FILE_READ_DATA value aliased for directory handles) succeeds
+    // as a ReadDirectoryChangesW anchor; anything else falls through to the
+    // regular open, which cannot load a directory's bytes.
+    if (desired_access & FILE_LIST_DIRECTORY) != 0
+        && let Some(handle) = open_directory_for_watch(state, file_name)
+    {
+        state.process.last_error = 0;
+        tracing::info!(
+            path = %file_name,
+            desired_access,
+            creation_disposition,
+            handle,
+            "{api_name} (directory watch anchor)"
+        );
+        return handle;
+    }
+
     let return_value =
         match open_or_create_guest_path(state, file_name, desired_access, creation_disposition) {
             Ok(OpenFileOutcome::Handle(handle)) => {
@@ -783,6 +807,51 @@ pub(crate) fn finish_create_file(
     }
 
     return_value
+}
+
+/// `FILE_LIST_DIRECTORY` — the `CreateFileW` access right that real Windows
+/// requires to read directory change notifications. Aliases `FILE_READ_DATA`
+/// (0x1) for directory handles.
+const FILE_LIST_DIRECTORY: u64 = 0x1;
+
+/// Open an existing mapped directory as a `ReadDirectoryChangesW` anchor.
+///
+/// Real Windows returns a directory handle for `CreateFileW(path,
+/// FILE_LIST_DIRECTORY, ...)`. We have no host handle for directories, so the
+/// "handle" is an [`OpenGuestFile`] with empty bytes whose `host_path` is the
+/// directory; `ReadDirectoryChangesW` resolves handle → host path. A watch
+/// object is pre-created (watcher not started) so the read can find it
+/// without touching the kernel-object table.
+///
+/// Returns `None` when the path is not an existing mapped directory — the
+/// caller falls through to the regular file-open path, which reports the
+/// normal error.
+fn open_directory_for_watch(state: &mut WinApiState, file_name: &str) -> Option<u64> {
+    if file_name.is_empty() {
+        return None;
+    }
+    if state.file_io.volumes.bottle_root != state.file_io.bottle_root {
+        state.file_io.volumes.bottle_root = state.file_io.bottle_root.clone();
+    }
+    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
+    let full_path = resolve_full_windows_path(&cwd, file_name);
+    let host_path = crate::kernel32::file_io::watch::resolve_watch_host_path(state, &full_path)?;
+
+    let handle = allocate_open_file_ex(
+        state,
+        &full_path,
+        Vec::new(),
+        Some(host_path.clone()),
+        false,
+    )
+    .ok()?;
+    state.kernel.sync.watch_handles.insert(
+        handle,
+        std::sync::Arc::new(crate::sync_obj::DirectoryWatchObject::new(
+            &full_path, host_path,
+        )),
+    );
+    Some(handle)
 }
 
 /// Stat a guest path using the VFS, building the resolve context from state.

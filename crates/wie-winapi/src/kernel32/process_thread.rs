@@ -1,14 +1,15 @@
 use super::{
-    CREATE_SUSPENDED, Context, DEFAULT_MT_MAX_THREADS, DEFAULT_WORKER_STACK, ERROR_INVALID_HANDLE,
-    ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_SUPPORTED_MT,
+    CREATE_SUSPENDED, Context, DEFAULT_MT_MAX_THREADS, DEFAULT_WORKER_STACK, ERROR_FILE_NOT_FOUND,
+    ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_SUPPORTED_MT,
     FAKE_CURRENT_PROCESS_ID, FIXED_SYSTEM_FILETIME, HandlerContext, MEM_COMMIT, MEM_RESERVE,
     PAGE_READWRITE, Result, THREAD_ENTRY_HOME_AND_RET, WORKER_STACK_REGION_BASE,
     WORKER_STACK_STRIDE, WinApiHandlerResult, WinApiState, checked_address,
     read_create_file_stack_u32, read_u64, write_guest_u32, write_guest_u64,
 };
 
-use crate::guest_layout::StartupInfo;
+use crate::guest_layout::{ProcessInformation, StartupInfo};
 use crate::guest_memory::with_typed_write;
+use crate::guest_string::read_arg_string;
 
 /// Write the Win64 `STARTUPINFO{A,W}` struct (both variants are
 /// layout-identical: the ANSI character pointers are still 8 bytes).
@@ -584,4 +585,299 @@ pub(crate) fn handle_get_current_thread(
     // CURRENT_THREAD_PSEUDO_HANDLE = (HANDLE)-2
     let return_value = u64::MAX - 1;
     ctx.finish(return_value)
+}
+
+// ── CreateProcessW/A + the process-wait surface (GetExitCodeProcess / OpenProcess) ──
+
+/// Split a Windows command line into argv tokens — a clean-room subset of
+/// `CommandLineToArgvW`: whitespace-delimited, double quotes group a token,
+/// `""` inside a quoted run is one literal quote. The full backslash-escape
+/// table is not implemented (enough for the micro spawn surface).
+fn split_command_line(line: &str) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '"' => {
+                if in_quotes && chars.get(i + 1) == Some(&'"') {
+                    // Escaped quote: `""` inside a quoted run → one literal `"`.
+                    current.push('"');
+                    i += 2;
+                    continue;
+                }
+                in_quotes = !in_quotes;
+                i += 1;
+            }
+            ' ' | '\t' if !in_quotes => {
+                if !current.is_empty() {
+                    args.push(std::mem::take(&mut current));
+                }
+                i += 1;
+            }
+            _ => {
+                current.push(c);
+                i += 1;
+            }
+        }
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    args
+}
+
+/// Turn a CreateProcess app/module name into a guest path the volume mapper
+/// understands: `C:\child.exe` stays drive-qualified, a bare `child.exe` or
+/// `\child.exe` gets the `C:` prefix (Windows searches PATH + cwd; WIE
+/// resolves the C: volume root).
+fn qualify_child_guest_path(raw: &str) -> String {
+    let trimmed = raw.trim().trim_matches('"');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.chars().nth(1) == Some(':') {
+        trimmed.to_owned()
+    } else if trimmed.starts_with('\\') {
+        format!("C:{trimmed}")
+    } else {
+        format!(r"C:\{trimmed}")
+    }
+}
+
+/// Write the four `PROCESS_INFORMATION` fields into the guest buffer. The
+/// typed view starts zeroed, so untouched tail padding never leaks caller
+/// garbage.
+fn write_process_information(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    process_information_va: u64,
+    h_process: u64,
+    h_thread: u64,
+    dw_process_id: u32,
+    dw_thread_id: u32,
+) -> Result<()> {
+    with_typed_write::<ProcessInformation, _, _>(engine, process_information_va, |pi| {
+        pi.h_process = h_process;
+        pi.h_thread = h_thread;
+        pi.dw_process_id = dw_process_id;
+        pi.dw_thread_id = dw_thread_id;
+        Ok(())
+    })
+    .context("failed to write PROCESS_INFORMATION")
+}
+
+/// Shared `CreateProcessW` / `CreateProcessA` body.
+///
+/// The handler runs in TWO entries around the spawn, mirroring the
+/// MessageBox bridge pattern:
+///
+/// - **First entry** (state lock held): parse `lpApplicationName` /
+///   `lpCommandLine`, resolve the child PE guest→host through the bottle
+///   volumes, record the [`PendingChildProcessSpawn`] write-back slot, and
+///   return [`crate::WinApiControlSignal::ChildProcessSpawnRequested`]. The
+///   runtime builds the child `RuntimeSession`, spawns its host thread,
+///   registers the `KernelObject::Process` in THIS parent's handle table, and
+///   stores the spawn result.
+/// - **Re-entry** (the engine re-executes the fake API): take the pending
+///   record, write `PROCESS_INFORMATION`, and return TRUE.
+fn create_process_common(
+    ctx: &mut HandlerContext<'_>,
+    wide: bool,
+    app_name_va: u64,
+    command_line_va: u64,
+    environment_va: u64,
+    process_information_va: u64,
+    api_name: &str,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+
+    // Re-entry: the runtime answered the spawn; hand the result to the guest.
+    if let Some(pending) = state.window_state().pending_child_process_spawn.take() {
+        return match pending.result {
+            Some(result) => {
+                if pending.process_information_va != 0 {
+                    write_process_information(
+                        engine,
+                        pending.process_information_va,
+                        result.h_process,
+                        result.h_thread,
+                        result.dw_process_id,
+                        result.dw_thread_id,
+                    )?;
+                }
+                state.process.last_error = 0;
+                ctx.finish(1)
+            }
+            None => {
+                // The runtime never answered (spawn failed / teardown race):
+                // fail closed rather than hang the guest.
+                state.process.last_error = ERROR_INVALID_PARAMETER;
+                ctx.finish(0)
+            }
+        };
+    }
+
+    if process_information_va == 0 {
+        state.process.last_error = ERROR_INVALID_PARAMETER;
+        return ctx.finish(0);
+    }
+
+    let app_name = if app_name_va != 0 {
+        read_arg_string(engine, app_name_va, wide)?
+    } else {
+        String::new()
+    };
+    let command_line = if command_line_va != 0 {
+        read_arg_string(engine, command_line_va, wide)?
+    } else {
+        String::new()
+    };
+
+    // Child module: lpApplicationName wins; otherwise the first command-line
+    // token is the module and the remaining tokens are its argv.
+    let mut tokens = split_command_line(&command_line);
+    let app_guest_path = if !app_name.is_empty() {
+        if tokens
+            .first()
+            .is_some_and(|t| t.eq_ignore_ascii_case(&app_name))
+        {
+            // The command line repeats the module as argv[0]; drop it so the
+            // child session's own argv materialization does not duplicate it.
+            tokens.remove(0);
+        }
+        app_name
+    } else if let Some(first) = tokens.first().cloned() {
+        tokens.remove(0);
+        first
+    } else {
+        state.process.last_error = ERROR_FILE_NOT_FOUND;
+        return ctx.finish(0);
+    };
+
+    let qualified = qualify_child_guest_path(&app_guest_path);
+    let Some(mapped) = crate::vfs::guest_path_to_host(&state.file_io.volumes, &qualified) else {
+        state.process.last_error = ERROR_FILE_NOT_FOUND;
+        return ctx.finish(0);
+    };
+    if !mapped.host.is_file() {
+        state.process.last_error = ERROR_FILE_NOT_FOUND;
+        return ctx.finish(0);
+    }
+
+    tracing::info!(
+        api = api_name,
+        app = %qualified,
+        host = %mapped.host.display(),
+        args = ?tokens,
+        inherit_env = environment_va == 0,
+        "CreateProcess: spawning child guest session"
+    );
+
+    if !state
+        .window_state()
+        .begin_child_spawn(process_information_va)
+    {
+        // A spawn is already pending without a re-entry — cannot overlap.
+        state.process.last_error = ERROR_INVALID_PARAMETER;
+        return ctx.finish(0);
+    }
+    Err(crate::WinApiControlSignal::ChildProcessSpawnRequested {
+        host_path: mapped.host,
+        guest_args: tokens,
+        inherit_environment: environment_va == 0,
+    }
+    .into())
+}
+
+/// Handles `KERNEL32.dll!CreateProcessW`.
+pub fn handle_create_process_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let app_name_va = engine.read_rcx()?;
+    let command_line_va = engine.read_rdx()?;
+    let _proc_attrs = engine.read_r8()?;
+    let _thread_attrs = engine.read_r9()?;
+    // Stack args (Win64 home space): bInheritHandles @0x28, dwCreationFlags
+    // @0x30, lpEnvironment @0x38, lpCurrentDirectory @0x40, lpStartupInfo
+    // @0x48, lpProcessInformation @0x50. Attributes/flags/current-directory
+    // semantics are accepted and ignored (documented emulator scope).
+    let environment_va = read_stack_u64(engine, 0x38)?;
+    let process_information_va = read_stack_u64(engine, 0x50)?;
+    create_process_common(
+        ctx,
+        true,
+        app_name_va,
+        command_line_va,
+        environment_va,
+        process_information_va,
+        "CreateProcessW",
+    )
+}
+
+/// Handles `KERNEL32.dll!CreateProcessA`.
+pub fn handle_create_process_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let app_name_va = engine.read_rcx()?;
+    let command_line_va = engine.read_rdx()?;
+    let _proc_attrs = engine.read_r8()?;
+    let _thread_attrs = engine.read_r9()?;
+    let environment_va = read_stack_u64(engine, 0x38)?;
+    let process_information_va = read_stack_u64(engine, 0x50)?;
+    create_process_common(
+        ctx,
+        false,
+        app_name_va,
+        command_line_va,
+        environment_va,
+        process_information_va,
+        "CreateProcessA",
+    )
+}
+
+/// Handles `KERNEL32.dll!GetExitCodeProcess` — mirror of
+/// `handle_get_exit_code_thread`: read the Process object's exit-code atomic.
+pub fn handle_get_exit_code_process(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let handle = engine.read_rcx()?;
+    let out_va = engine.read_rdx()?;
+    // Pseudohandle (HANDLE)-1 = the current process: always STILL_ACTIVE.
+    let code = if handle == u64::MAX {
+        crate::STILL_ACTIVE
+    } else if let Some(p) = state.kernel.sync.process_by_handle(handle) {
+        p.exit_code.load(std::sync::atomic::Ordering::Acquire)
+    } else {
+        state.process.last_error = ERROR_INVALID_HANDLE;
+        return ctx.finish(0);
+    };
+    if out_va != 0 {
+        drop(engine.mem_write(out_va, &code.to_le_bytes()));
+    }
+    state.process.last_error = 0;
+    ctx.finish(1)
+}
+
+/// Handles `KERNEL32.dll!OpenProcess` — look up a child pid and return its
+/// kernel handle (same handle value the creator received).
+pub fn handle_open_process(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let _desired_access = engine.read_rcx()?;
+    let _inherit_handle = engine.read_rdx()?;
+    let pid_raw = engine.read_r8()?;
+    let pid = u32::try_from(pid_raw & 0xffff_ffff).unwrap_or(u32::MAX);
+    if u64::from(pid) == FAKE_CURRENT_PROCESS_ID {
+        // The current process's own pid → the (HANDLE)-1 pseudohandle.
+        state.process.last_error = 0;
+        return ctx.finish(u64::MAX);
+    }
+    if let Some(handle) = state.kernel.sync.pid_to_handle(pid) {
+        state.process.last_error = 0;
+        return ctx.finish(handle);
+    }
+    state.process.last_error = ERROR_INVALID_PARAMETER;
+    ctx.finish(0)
 }

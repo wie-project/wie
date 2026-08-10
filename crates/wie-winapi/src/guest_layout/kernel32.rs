@@ -203,6 +203,44 @@ const _: () = {
     );
 };
 
+/// Win64 `PROCESS_INFORMATION` (processthreadsapi.h, `CreateProcessW/A`):
+/// `HANDLE hProcess` @0, `HANDLE hThread` @8, `DWORD dwProcessId` @16,
+/// `DWORD dwThreadId` @20 — 24 bytes, align 8 (verified against
+/// mingw-w64 14.0.0; the two DWORDs pack at 0x10/0x14, they are NOT one
+/// 8-byte slot each).
+#[derive(Debug, Clone, Copy, KnownLayout, Immutable, FromBytes, IntoBytes)]
+#[repr(C)]
+pub(crate) struct ProcessInformation {
+    pub(crate) h_process: u64,
+    pub(crate) h_thread: u64,
+    pub(crate) dw_process_id: u32,
+    pub(crate) dw_thread_id: u32,
+}
+
+/// Compile-time layout check for [`ProcessInformation`].
+const _: () = {
+    assert!(
+        core::mem::size_of::<ProcessInformation>() == 24,
+        "PROCESS_INFORMATION must be 24 bytes on Win64"
+    );
+    assert!(
+        core::mem::offset_of!(ProcessInformation, h_process) == 0,
+        "hProcess @0"
+    );
+    assert!(
+        core::mem::offset_of!(ProcessInformation, h_thread) == 8,
+        "hThread @8"
+    );
+    assert!(
+        core::mem::offset_of!(ProcessInformation, dw_process_id) == 16,
+        "dwProcessId @16"
+    );
+    assert!(
+        core::mem::offset_of!(ProcessInformation, dw_thread_id) == 20,
+        "dwThreadId @20"
+    );
+};
+
 /// Win64 `BY_HANDLE_FILE_INFORMATION` (fileapi.h, `GetFileInformationByHandle`):
 /// `DWORD dwFileAttributes` @0, `FILETIME ftCreationTime` @4,
 /// `ftLastAccessTime` @12, `ftLastWriteTime` @20, `DWORD dwVolumeSerialNumber`
@@ -321,6 +359,40 @@ const _: () = {
     assert!(
         core::mem::offset_of!(FileAttributeData, n_file_size_low) == 32,
         "nFileSizeLow @32"
+    );
+};
+
+/// Win64 `FILE_NOTIFY_INFORMATION` record header (winnt.h, filled by
+/// `ReadDirectoryChangesW`): `DWORD NextEntryOffset` @0, `DWORD Action` @4,
+/// `DWORD FileNameLength` @8 — 12 bytes, align 4. The variable-length
+/// `WCHAR FileName[]` tail starts @12; `FileNameLength` counts its **bytes**
+/// (not WCHARs) and the name is not NUL-terminated. The tail is written by
+/// the caller, mirroring the `FindDataHeader` + manual-name split above.
+#[derive(Debug, Clone, Copy, KnownLayout, Immutable, FromBytes, IntoBytes)]
+#[repr(C)]
+pub(crate) struct FileNotifyInformation {
+    pub(crate) next_entry_offset: u32,
+    pub(crate) action: u32,
+    pub(crate) file_name_length: u32,
+}
+
+/// Compile-time layout check for [`FileNotifyInformation`].
+const _: () = {
+    assert!(
+        core::mem::size_of::<FileNotifyInformation>() == 12,
+        "FILE_NOTIFY_INFORMATION header must be 12 bytes on Win64"
+    );
+    assert!(
+        core::mem::offset_of!(FileNotifyInformation, next_entry_offset) == 0,
+        "NextEntryOffset @0"
+    );
+    assert!(
+        core::mem::offset_of!(FileNotifyInformation, action) == 4,
+        "Action @4"
+    );
+    assert!(
+        core::mem::offset_of!(FileNotifyInformation, file_name_length) == 8,
+        "FileNameLength @8"
     );
 };
 
@@ -608,6 +680,68 @@ mod kernel32_lane_tests {
             Ok(())
         })
         .expect("typed WIN32_FILE_ATTRIBUTE_DATA read");
+    }
+
+    #[test]
+    fn file_notify_information_header_write_and_read_back() {
+        let mut engine = test_engine();
+        with_typed_write::<FileNotifyInformation, _, _>(&mut engine, 0x9600, |record| {
+            record.next_entry_offset = 20;
+            record.action = crate::sync_obj::FILE_ACTION_ADDED;
+            record.file_name_length = 8;
+            Ok(())
+        })
+        .expect("typed FILE_NOTIFY_INFORMATION write");
+        let bytes = raw_bytes(&mut engine, 0x9600, 12);
+        assert_eq!(&bytes[0..4], &20_u32.to_le_bytes(), "NextEntryOffset");
+        assert_eq!(
+            &bytes[4..8],
+            &crate::sync_obj::FILE_ACTION_ADDED.to_le_bytes(),
+            "Action"
+        );
+        assert_eq!(&bytes[8..12], &8_u32.to_le_bytes(), "FileNameLength");
+
+        with_typed_read::<FileNotifyInformation, _, _>(&mut engine, 0x9600, |record| {
+            assert_eq!(record.next_entry_offset, 20);
+            assert_eq!(record.action, crate::sync_obj::FILE_ACTION_ADDED);
+            assert_eq!(record.file_name_length, 8);
+            Ok(())
+        })
+        .expect("typed FILE_NOTIFY_INFORMATION read");
+    }
+
+    #[test]
+    fn process_information_write_matches_windows_layout() {
+        let mut engine = test_engine();
+        with_typed_write::<ProcessInformation, _, _>(&mut engine, 0x9700, |pi| {
+            pi.h_process = 0x1234_5678_9abc_def0;
+            pi.h_thread = 0x0fed_cba9_8765_4321;
+            pi.dw_process_id = 0x1235;
+            pi.dw_thread_id = 0x5678;
+            Ok(())
+        })
+        .expect("typed PROCESS_INFORMATION write");
+        let bytes = raw_bytes(&mut engine, 0x9700, 24);
+        assert_eq!(
+            &bytes[0..8],
+            &0x1234_5678_9abc_def0_u64.to_le_bytes(),
+            "hProcess @0"
+        );
+        assert_eq!(
+            &bytes[8..16],
+            &0x0fed_cba9_8765_4321_u64.to_le_bytes(),
+            "hThread @8"
+        );
+        assert_eq!(
+            &bytes[16..20],
+            &0x1235_u32.to_le_bytes(),
+            "dwProcessId @16 (DWORD, packed)"
+        );
+        assert_eq!(
+            &bytes[20..24],
+            &0x5678_u32.to_le_bytes(),
+            "dwThreadId @20 (DWORD, packed)"
+        );
     }
 
     #[test]

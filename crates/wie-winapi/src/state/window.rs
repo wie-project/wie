@@ -651,9 +651,59 @@ pub struct WindowState {
     /// native-bridge families carry their frame in the pending-bridge record
     /// instead (they have no guest window to key by).
     pub(crate) modal_frames: ahash::HashMap<crate::handles::Hwnd, ModalFrame>,
+    /// In-flight child-process spawn (`CreateProcessW/A`). The guest is
+    /// parked in the handler while the runtime builds + starts the child
+    /// session. See [`PendingChildProcessSpawn`].
+    pub(crate) pending_child_process_spawn: Option<PendingChildProcessSpawn>,
 }
 
 impl WindowState {
+    /// Record the write-back slot for an in-flight `CreateProcessW/A` spawn.
+    ///
+    /// The handler calls this on its first entry (state lock held) before
+    /// returning [`WinApiControlSignal::ChildProcessSpawnRequested`]; the
+    /// runtime later fills the result via [`Self::set_child_spawn_result`].
+    /// Returns false when a spawn is already pending — the handler then fails
+    /// closed (nested CreateProcess with no intervening re-entry).
+    #[must_use]
+    pub fn begin_child_spawn(&mut self, process_information_va: u64) -> bool {
+        if self.pending_child_process_spawn.is_some() {
+            return false;
+        }
+        self.pending_child_process_spawn = Some(PendingChildProcessSpawn {
+            process_information_va,
+            result: None,
+        });
+        true
+    }
+
+    /// Record the outcome of a child-process spawn for the re-entering
+    /// `CreateProcessW/A` handler. Returns false when no spawn is pending
+    /// (the caller then leaves the pending record untouched).
+    ///
+    /// Kept as a primitive-signature method (no crate-private types in the
+    /// signature) so the runtime crate can call it without naming the
+    /// pending-record types.
+    #[must_use]
+    pub fn set_child_spawn_result(
+        &mut self,
+        h_process: u64,
+        h_thread: u64,
+        dw_process_id: u32,
+        dw_thread_id: u32,
+    ) -> bool {
+        let Some(pending) = self.pending_child_process_spawn.as_mut() else {
+            return false;
+        };
+        pending.result = Some(ChildProcessSpawnResult {
+            h_process,
+            h_thread,
+            dw_process_id,
+            dw_thread_id,
+        });
+        true
+    }
+
     /// The EDIT control's caret/selection for `hwnd`, when its control state
     /// has been seeded: `(caret, sel_start, sel_end)` in character indices.
     ///
@@ -767,6 +817,7 @@ impl Default for WindowState {
             menu_dirty: false,
             accel_tables: Vec::new(),
             resource_menus: Vec::new(),
+            pending_child_process_spawn: None,
         }
     }
 }
@@ -1130,6 +1181,38 @@ pub enum MessageQueueIdlePolicy {
     YieldOnIdle,
 }
 
+/// One in-flight `CreateProcessW/A` spawn (child guest session).
+///
+/// The handler records this on its first entry (state lock held) and returns
+/// [`WinApiControlSignal::ChildProcessSpawnRequested`]; the runtime then
+/// builds the child `RuntimeSession`, spawns its host thread, registers the
+/// `KernelObject::Process` in THIS parent's handle table, and stores the
+/// resulting handles back here. The engine re-executes the fake API, the
+/// handler re-enters, takes this record, and writes `PROCESS_INFORMATION`
+/// into the guest buffer. Mirrors the `PendingNativeMessageBox` seam.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingChildProcessSpawn {
+    /// Guest VA of the caller's `PROCESS_INFORMATION` buffer.
+    pub(crate) process_information_va: u64,
+    /// The runtime's spawn outcome. `None` = the spawn never answered (a
+    /// racing teardown must not hang the guest — the handler fails closed).
+    pub(crate) result: Option<ChildProcessSpawnResult>,
+}
+
+/// Handles of a successfully spawned child process.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ChildProcessSpawnResult {
+    /// Kernel handle of the child's Process object (this parent's table).
+    pub(crate) h_process: u64,
+    /// Kernel handle of the child's primary-thread object (this parent's
+    /// table — a detached thread object, see `SyncState::register_detached_thread`).
+    pub(crate) h_thread: u64,
+    /// Guest-visible process id of the child.
+    pub(crate) dw_process_id: u32,
+    /// Guest-visible thread id of the child's primary thread.
+    pub(crate) dw_thread_id: u32,
+}
+
 /// Non-error control signal emitted by a WinAPI handler.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum WinApiControlSignal {
@@ -1142,6 +1225,25 @@ pub enum WinApiControlSignal {
     GuestCallbackRequested {
         /// Description of the pending guest callback.
         request: GuestCallbackRequest,
+    },
+
+    /// A font-enumeration API (`EnumFontFamiliesExW/A`, …) requires execution
+    /// of a guest `FONTENUMPROC` callback.
+    ///
+    /// Distinct from [`WinApiControlSignal::GuestCallbackRequested`] because
+    /// the enumeration callback uses a different ABI (RCX = `lpelfe`, RDX =
+    /// `lpntme`, R8 = `FontType`, R9 = `lParam` — the WndProc bridge truncates
+    /// RDX to 32 bits, which would corrupt the 64-bit `lpntme` pointer) and
+    /// because the runtime must re-enter the callback for every item while the
+    /// callback returns non-zero. `enumeration_id` keys the host-side item
+    /// list so the runtime can advance to the next item on continuation.
+    #[error("guest font-enumeration callback requested: {request:?}")]
+    EnumerationCallbackRequested {
+        /// Description of the pending guest callback (args packed for the
+        /// `FONTENUMPROC` ABI).
+        request: GuestCallbackRequest,
+        /// Host-side enumeration state key (see `gdi32::enumerate`).
+        enumeration_id: u64,
     },
 
     /// `GetOpenFileName`/`GetSaveFileName` wants the host file panel shown.
@@ -1221,6 +1323,30 @@ pub enum WinApiControlSignal {
     ExitThread {
         /// Thread exit code.
         code: u32,
+    },
+
+    /// `CreateProcessW/A` wants a child guest session spawned.
+    ///
+    /// The runtime builds the child `RuntimeSession` (its own engine +
+    /// WinApiState — never shared with the parent), spawns a host thread
+    /// running `run_until_stop`, registers the `KernelObject::Process` in the
+    /// parent's handle table, and writes the `PROCESS_INFORMATION` back via
+    /// [`PendingChildProcessSpawn`]; the handler's re-entry then returns TRUE.
+    /// `host_path` is the child PE already resolved guest→host through the
+    /// parent's bottle volumes.
+    #[error("child process spawn requested")]
+    ChildProcessSpawnRequested {
+        /// Resolved host path of the child PE (bottle-mapped by the handler).
+        host_path: std::path::PathBuf,
+        /// Command-line args after argv[0] (the child session materializes
+        /// its argv from these, so `GetCommandLine`/`argv` stay coherent).
+        guest_args: Vec<String>,
+        /// `lpEnvironment == NULL` — inherit the parent's environment.
+        ///
+        /// Carried for the runtime to honour later; today the child session
+        /// always builds the standard WIE guest environment, so this is
+        /// informational.
+        inherit_environment: bool,
     },
 }
 

@@ -650,6 +650,15 @@ pub(crate) fn handle_wait_for_single_object(
             Some(crate::KernelObject::Event(e)) => format!("Event(manual={})", e.manual_reset),
             Some(crate::KernelObject::Semaphore(_)) => "Sem".into(),
             Some(crate::KernelObject::FileMapping(_)) => "Map".into(),
+            Some(crate::KernelObject::DirectoryWatch(d)) => {
+                format!(
+                    "DirWatch(pending={})",
+                    d.pending.lock().map_or(0, |g| g.len())
+                )
+            }
+            Some(crate::KernelObject::Process(p)) => {
+                format!("Process(pid={},fin={})", p.pid, p.is_finished())
+            }
             None => "INVALID".into(),
         };
         tracing::error!(
@@ -678,6 +687,18 @@ pub(crate) fn handle_wait_for_single_object(
         }
         Some(crate::KernelObject::Semaphore(s)) => {
             if s.try_acquire() {
+                state.process.last_error = 0;
+                return ctx.finish(u64::from(crate::WAIT_OBJECT_0));
+            }
+        }
+        Some(crate::KernelObject::DirectoryWatch(d)) => {
+            if d.try_wait() {
+                state.process.last_error = 0;
+                return ctx.finish(u64::from(crate::WAIT_OBJECT_0));
+            }
+        }
+        Some(crate::KernelObject::Process(p)) => {
+            if p.is_finished() {
                 state.process.last_error = 0;
                 return ctx.finish(u64::from(crate::WAIT_OBJECT_0));
             }

@@ -199,12 +199,18 @@ pub fn handle_get_volume_information_w(
     let _root = engine.read_rcx()?;
     let vol_name = engine.read_rdx()?;
     let vol_name_len = engine.read_r8()?;
-    let _serial = engine.read_r9()?;
+    let serial_va = engine.read_r9()?;
     let rsp = engine.read_rsp()?;
-    let max_comp_va = checked_address(rsp, 0x28, "lpMaximumComponentLength");
-    let flags_va = checked_address(rsp, 0x30, "lpFileSystemFlags");
-    let name_va = checked_address(rsp, 0x38, "lpFileSystemNameBuffer");
-    let fs_len_va = checked_address(rsp, 0x40, "lpFileSystemNameLength");
+    // Trailing outputs are POINTERS stored in the caller's stack arg slots —
+    // read each slot, then write through the pointed-to guest buffer.
+    let max_comp_va = read_u64(engine, rsp.wrapping_add(0x28))
+        .context("failed to read lpMaximumComponentLength for GetVolumeInformationW")?;
+    let flags_va = read_u64(engine, rsp.wrapping_add(0x30))
+        .context("failed to read lpFileSystemFlags for GetVolumeInformationW")?;
+    let name_va = read_u64(engine, rsp.wrapping_add(0x38))
+        .context("failed to read lpFileSystemNameBuffer for GetVolumeInformationW")?;
+    let fs_len_va = read_u64(engine, rsp.wrapping_add(0x40))
+        .context("failed to read nFileSystemNameSize for GetVolumeInformationW")?;
 
     // Derive volume label from the bottle root name, or use a default.
     let label = state
@@ -217,6 +223,10 @@ pub fn handle_get_volume_information_w(
         .to_owned();
     write_mock_string_w(engine, state, &label, vol_name, vol_name_len)?;
 
+    // Same fake volume serial the BY_HANDLE_FILE_INFORMATION path reports.
+    if serial_va != 0 {
+        let _unused = write_guest_u32(engine, serial_va, 0x1234_abcd);
+    }
     // MaximumComponentLength = 255 (NTFS)
     if max_comp_va != 0 {
         let _unused = write_guest_u32(engine, max_comp_va, 255);
@@ -225,12 +235,19 @@ pub fn handle_get_volume_information_w(
     if flags_va != 0 {
         let _unused = write_guest_u32(engine, flags_va, fs_flags);
     }
-    // FileSystemName = "NTFS"
-    if name_va != 0 {
-        let _unused = write_mock_string_w(engine, state, "NTFS", name_va, 16);
-    }
+    // FileSystemName = "NTFS"; nFileSystemNameSize receives the character
+    // count excluding NUL (or the required count when the buffer is NULL).
+    let fs_name_written = if name_va != 0 {
+        write_mock_string_w(engine, state, "NTFS", name_va, 16)?
+    } else {
+        4
+    };
     if fs_len_va != 0 {
-        let _unused = write_guest_u32(engine, fs_len_va, 4);
+        let _unused = write_guest_u32(
+            engine,
+            fs_len_va,
+            u32::try_from(fs_name_written).unwrap_or(0),
+        );
     }
     state.process.last_error = 0;
     ctx.finish(1)
@@ -244,12 +261,18 @@ pub fn handle_get_volume_information_a(
     let _root = engine.read_rcx()?;
     let vol_name = engine.read_rdx()?;
     let vol_name_len = engine.read_r8()?;
-    let _serial = engine.read_r9()?;
+    let serial_va = engine.read_r9()?;
     let rsp = engine.read_rsp()?;
-    let max_comp_va = checked_address(rsp, 0x28, "lpMaximumComponentLength");
-    let flags_va = checked_address(rsp, 0x30, "lpFileSystemFlags");
-    let name_va = checked_address(rsp, 0x38, "lpFileSystemNameBuffer");
-    let fs_len_va = checked_address(rsp, 0x40, "lpFileSystemNameLength");
+    // Trailing outputs are POINTERS stored in the caller's stack arg slots —
+    // read each slot, then write through the pointed-to guest buffer.
+    let max_comp_va = read_u64(engine, rsp.wrapping_add(0x28))
+        .context("failed to read lpMaximumComponentLength for GetVolumeInformationA")?;
+    let flags_va = read_u64(engine, rsp.wrapping_add(0x30))
+        .context("failed to read lpFileSystemFlags for GetVolumeInformationA")?;
+    let name_va = read_u64(engine, rsp.wrapping_add(0x38))
+        .context("failed to read lpFileSystemNameBuffer for GetVolumeInformationA")?;
+    let fs_len_va = read_u64(engine, rsp.wrapping_add(0x40))
+        .context("failed to read nFileSystemNameSize for GetVolumeInformationA")?;
 
     let label = state
         .file_io
@@ -261,6 +284,10 @@ pub fn handle_get_volume_information_a(
         .to_owned();
     write_mock_string_a(engine, state, &label, vol_name, vol_name_len)?;
 
+    // Same fake volume serial the BY_HANDLE_FILE_INFORMATION path reports.
+    if serial_va != 0 {
+        let _unused = write_guest_u32(engine, serial_va, 0x1234_abcd);
+    }
     if max_comp_va != 0 {
         let _unused = write_guest_u32(engine, max_comp_va, 255);
     }
@@ -268,11 +295,19 @@ pub fn handle_get_volume_information_a(
     if flags_va != 0 {
         let _unused = write_guest_u32(engine, flags_va, fs_flags);
     }
-    if name_va != 0 {
-        let _unused = write_mock_string_a(engine, state, "NTFS", name_va, 16);
-    }
+    // FileSystemName = "NTFS"; nFileSystemNameSize receives the byte count
+    // excluding NUL (or the required count when the buffer is NULL).
+    let fs_name_written = if name_va != 0 {
+        write_mock_string_a(engine, state, "NTFS", name_va, 16)?
+    } else {
+        4
+    };
     if fs_len_va != 0 {
-        let _unused = write_guest_u32(engine, fs_len_va, 4);
+        let _unused = write_guest_u32(
+            engine,
+            fs_len_va,
+            u32::try_from(fs_name_written).unwrap_or(0),
+        );
     }
 
     state.process.last_error = 0;

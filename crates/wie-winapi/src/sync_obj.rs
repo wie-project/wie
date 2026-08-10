@@ -6,6 +6,8 @@
 
 use ahash::HashMap;
 use ahash::HashMapExt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -15,6 +17,39 @@ use crate::state::handle_newtype;
 
 /// `STILL_ACTIVE` — thread has not terminated (`GetExitCodeThread`).
 pub const STILL_ACTIVE: u32 = 259;
+
+/// First guest pid handed to a child spawned by `CreateProcessW/A`.
+///
+/// The parent's own `GetCurrentProcessId` returns the fixed
+/// `FAKE_CURRENT_PROCESS_ID` (0x1234, kernel32/mod.rs); children get
+/// monotonic ids strictly after it so `OpenProcess` lookups never collide.
+const FIRST_CHILD_PID: u32 = 0x1235;
+
+// ── Directory change notifications (FindFirstChangeNotification* / ReadDirectoryChangesW) ──
+
+/// `FILE_NOTIFY_CHANGE_FILE_NAME` — a file was created/removed/renamed.
+pub(crate) const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x0000_0001;
+/// `FILE_NOTIFY_CHANGE_DIR_NAME` — a directory was created/removed/renamed.
+pub(crate) const FILE_NOTIFY_CHANGE_DIR_NAME: u32 = 0x0000_0002;
+/// `FILE_NOTIFY_CHANGE_ATTRIBUTES` — attributes changed.
+pub(crate) const FILE_NOTIFY_CHANGE_ATTRIBUTES: u32 = 0x0000_0004;
+/// `FILE_NOTIFY_CHANGE_SIZE` — file size changed.
+pub(crate) const FILE_NOTIFY_CHANGE_SIZE: u32 = 0x0000_0008;
+/// `FILE_NOTIFY_CHANGE_LAST_WRITE` — last write time changed.
+pub(crate) const FILE_NOTIFY_CHANGE_LAST_WRITE: u32 = 0x0000_0010;
+/// `FILE_NOTIFY_CHANGE_LAST_ACCESS` — last access time changed.
+pub(crate) const FILE_NOTIFY_CHANGE_LAST_ACCESS: u32 = 0x0000_0020;
+
+/// `FILE_ACTION_ADDED` — the file was added to the directory.
+pub(crate) const FILE_ACTION_ADDED: u32 = 1;
+/// `FILE_ACTION_REMOVED` — the file was removed from the directory.
+pub(crate) const FILE_ACTION_REMOVED: u32 = 2;
+/// `FILE_ACTION_MODIFIED` — the file was modified.
+pub(crate) const FILE_ACTION_MODIFIED: u32 = 3;
+/// `FILE_ACTION_RENAMED_OLD_NAME` — old name of a renamed file.
+pub(crate) const FILE_ACTION_RENAMED_OLD_NAME: u32 = 4;
+/// `FILE_ACTION_RENAMED_NEW_NAME` — new name of a renamed file.
+pub(crate) const FILE_ACTION_RENAMED_NEW_NAME: u32 = 5;
 
 // A kernel-object handle (thread / event / semaphore) in the [`SyncState`]
 // table. Typed so a `KernelHandle` cannot be mixed with file, window, or other
@@ -56,12 +91,27 @@ pub struct SyncState {
     pub(crate) suspended_spawns: HashMap<u64, PendingSpawn>,
     /// Pending `WaitForMultipleObjects` args, keyed by guest TID of the waiter.
     pub multi_wait: HashMap<u32, MultiWaitRequest>,
+    /// `ReadDirectoryChangesW` anchors keyed by the guest file handle that
+    /// `CreateFileW(FILE_LIST_DIRECTORY)` returned for a directory.
+    ///
+    /// The anchor object is created at open time but its notify watcher is
+    /// started lazily by the first `ReadDirectoryChangesW` on the handle, so
+    /// opening a directory never spawns a background thread. `CloseHandle`
+    /// removes the entry, which drops the last strong ref and stops the
+    /// watcher (the watcher callback holds only a weak ref).
+    pub watch_handles: HashMap<u64, Arc<DirectoryWatchObject>>,
     /// Process is dying (`ExitProcess`); workers should stop.
     pub process_dying: bool,
     /// Per-module function tables (image_base → sorted Vec of RuntimeFunction).
     /// Used by `RtlLookupFunctionEntry` to find unwind info for a given RIP.
     /// Seeded by the runtime at session init (`parse_pdata`).
     pub function_tables: HashMap<u64, Vec<crate::exception::RuntimeFunction>>,
+    /// Guest pid → kernel handle of its `KernelObject::Process` (children
+    /// spawned via `CreateProcessW/A`; the parent's own fixed pid is not
+    /// registered). `OpenProcess` resolves through this.
+    pub process_by_pid: HashMap<u32, u64>,
+    /// Next guest pid for a spawned child (see [`FIRST_CHILD_PID`]).
+    pub(crate) next_child_pid: u32,
 }
 
 /// Detached args for one `WaitForMultipleObjects` host park.
@@ -88,8 +138,11 @@ impl SyncState {
             pending_spawns: Vec::new(),
             suspended_spawns: HashMap::new(),
             multi_wait: HashMap::new(),
+            watch_handles: HashMap::new(),
             process_dying: false,
             function_tables: HashMap::new(),
+            process_by_pid: HashMap::new(),
+            next_child_pid: FIRST_CHILD_PID,
         }
     }
 
@@ -179,14 +232,109 @@ impl SyncState {
         (handle_u64, obj)
     }
 
+    /// Register a directory change notification object
+    /// (`FindFirstChangeNotification*`).
+    ///
+    /// The object is registered in the kernel table and therefore waitable;
+    /// the notify watcher itself is started by the caller
+    /// ([`crate::kernel32::file_io::watch`]) so a failed `watch()` can clean
+    /// up before the handle is returned.
+    pub fn register_directory_watch(
+        &mut self,
+        guest_path: &str,
+        host_path: PathBuf,
+        mask: u32,
+    ) -> (u64, Arc<DirectoryWatchObject>) {
+        let handle = self.alloc_handle();
+        let handle_u64 = handle.as_u64();
+        let obj = Arc::new(DirectoryWatchObject::new(guest_path, host_path));
+        obj.mask.store(mask, Ordering::Release);
+        self.objects
+            .insert(handle, KernelObject::DirectoryWatch(Arc::clone(&obj)));
+        (handle_u64, obj)
+    }
+
+    /// Register a child-process object for guest pid; returns (handle, Arc
+    /// body). The object starts with `STILL_ACTIVE`; the child-session
+    /// wrapper calls [`ProcessObject::finish`] when the child terminates.
+    pub fn register_process(&mut self, pid: u32) -> (u64, Arc<ProcessObject>) {
+        let handle = self.alloc_handle();
+        let handle_u64 = handle.as_u64();
+        let obj = Arc::new(ProcessObject {
+            handle: handle_u64,
+            pid,
+            exit_code: std::sync::atomic::AtomicU32::new(STILL_ACTIVE),
+            finished: Mutex::new(false),
+            finished_cv: Condvar::new(),
+        });
+        self.process_by_pid.insert(pid, handle_u64);
+        self.objects
+            .insert(handle, KernelObject::Process(Arc::clone(&obj)));
+        (handle_u64, obj)
+    }
+
+    /// Register a detached thread object with NO guest CPU-context slot.
+    ///
+    /// Used for a spawned child's primary-thread handle: the child runs in
+    /// its OWN session, so the parent-side object is only a closeable /
+    /// waitable handle — inserting a `thread_cpu` entry under the real
+    /// `PRIMARY_THREAD_ID` would clobber the parent's own primary context.
+    /// `tid` is purely informational (callers pass the child's pid, which
+    /// never collides with a live guest tid).
+    pub fn register_detached_thread(&mut self, tid: u32) -> (u64, Arc<ThreadObject>) {
+        let handle = self.alloc_handle();
+        let handle_u64 = handle.as_u64();
+        let obj = Arc::new(ThreadObject {
+            tid,
+            handle: handle_u64,
+            exit_code: std::sync::atomic::AtomicU32::new(STILL_ACTIVE),
+            finished: Mutex::new(false),
+            finished_cv: Condvar::new(),
+        });
+        self.objects
+            .insert(handle, KernelObject::Thread(Arc::clone(&obj)));
+        (handle_u64, obj)
+    }
+
     /// Look up a thread object by handle.
     pub fn thread_by_handle(&self, handle: u64) -> Option<Arc<ThreadObject>> {
         match self.objects.get(&KernelHandle::from(handle))? {
             KernelObject::Thread(t) => Some(Arc::clone(t)),
-            KernelObject::Event(_) | KernelObject::Semaphore(_) | KernelObject::FileMapping(_) => {
-                None
-            }
+            KernelObject::Event(_)
+            | KernelObject::Semaphore(_)
+            | KernelObject::FileMapping(_)
+            | KernelObject::DirectoryWatch(_)
+            | KernelObject::Process(_) => None,
         }
+    }
+
+    /// Look up a child-process object by handle.
+    pub fn process_by_handle(&self, handle: u64) -> Option<Arc<ProcessObject>> {
+        match self.objects.get(&KernelHandle::from(handle))? {
+            KernelObject::Process(p) => Some(Arc::clone(p)),
+            KernelObject::Thread(_)
+            | KernelObject::Event(_)
+            | KernelObject::Semaphore(_)
+            | KernelObject::FileMapping(_)
+            | KernelObject::DirectoryWatch(_) => None,
+        }
+    }
+
+    /// Kernel handle registered for guest pid (child processes only).
+    pub fn pid_to_handle(&self, pid: u32) -> Option<u64> {
+        self.process_by_pid.get(&pid).copied()
+    }
+
+    /// Next guest pid for a spawned child (monotonic, wraps past `u32::MAX`
+    /// to the first child pid again — an emulator-only simplification).
+    pub fn alloc_child_pid(&mut self) -> u32 {
+        let pid = self.next_child_pid;
+        self.next_child_pid = if self.next_child_pid == u32::MAX {
+            FIRST_CHILD_PID
+        } else {
+            self.next_child_pid.saturating_add(1)
+        };
+        pid
     }
 
     /// Look up any waitable object.
@@ -236,6 +384,17 @@ pub enum KernelObject {
     /// A file mapping (`CreateFileMappingW`) — a snapshot of an open file's
     /// bytes that `MapViewOfFile` copies into guest memory.
     FileMapping(Arc<FileMappingObject>),
+    /// A directory change notification (`FindFirstChangeNotification*`).
+    ///
+    /// Kept at the end of the enum so a concurrently-landed kernel-object
+    /// variant (e.g. Process) does not shift variant ordering.
+    DirectoryWatch(Arc<DirectoryWatchObject>),
+    /// A child process spawned via `CreateProcessW/A` (waitable on exit).
+    ///
+    /// Registered in the PARENT's handle table; the child's own session is a
+    /// separate `RuntimeSession` whose termination notifies this object (see
+    /// `wie-runtime`'s `ChildProcessSpawnRequested` pump arm).
+    Process(Arc<ProcessObject>),
 }
 
 /// Guest thread waitable + exit state.
@@ -307,6 +466,81 @@ impl ThreadObject {
             return false;
         }
         true
+    }
+}
+
+/// Guest child-process object (`CreateProcessW/A`), waitable on termination.
+///
+/// Mirrors [`ThreadObject`]: the exit code starts at [`STILL_ACTIVE`] and the
+/// child-session wrapper stores the real code via [`ProcessObject::finish`].
+/// A process handle never resets — once finished it stays signaled.
+#[derive(Debug)]
+pub struct ProcessObject {
+    /// Kernel handle value (in the parent's table).
+    pub handle: u64,
+    /// Guest-visible process id (`PROCESS_INFORMATION.dwProcessId`,
+    /// `OpenProcess`).
+    pub pid: u32,
+    /// Exit code or [`STILL_ACTIVE`].
+    pub exit_code: std::sync::atomic::AtomicU32,
+    /// True after the child session terminated.
+    pub finished: Mutex<bool>,
+    /// Notified when the child terminates.
+    pub finished_cv: Condvar,
+}
+
+impl ProcessObject {
+    /// Mark finished with `code` and wake waiters.
+    pub fn finish(&self, code: u32) {
+        self.exit_code
+            .store(code, std::sync::atomic::Ordering::Release);
+        if let Ok(mut g) = self.finished.lock() {
+            *g = true;
+            self.finished_cv.notify_all();
+        }
+    }
+
+    /// Whether the child has terminated.
+    pub fn is_finished(&self) -> bool {
+        self.finished.lock().map_or(true, |g| *g)
+    }
+
+    /// Block until finished or timeout. Returns true if finished.
+    pub fn wait_until_finished(&self, timeout_ms: u32) -> bool {
+        let Ok(guard) = self.finished.lock() else {
+            return true;
+        };
+        if *guard {
+            return true;
+        }
+        if timeout_ms == 0 {
+            return false;
+        }
+        if timeout_ms == INFINITE {
+            let mut g = guard;
+            while !*g {
+                g = match self.finished_cv.wait(g) {
+                    Ok(x) => x,
+                    Err(p) => p.into_inner(),
+                };
+            }
+            return true;
+        }
+        let remain = Duration::from_millis(u64::from(timeout_ms));
+        let (next, timeout_result) = match self.finished_cv.wait_timeout(guard, remain) {
+            Ok(x) => x,
+            Err(p) => {
+                let (inner, _) = p.into_inner();
+                return *inner;
+            }
+        };
+        if *next {
+            return true;
+        }
+        // Spurious wake without finish: report retry so poll-loop callers
+        // re-check rather than returning success on nothing.
+        let _ = timeout_result;
+        false
     }
 }
 
@@ -519,6 +753,159 @@ pub struct FileMappingObject {
     pub size: u64,
 }
 
+/// One queued change notification for a [`DirectoryWatchObject`].
+#[derive(Debug, Clone)]
+pub struct FileNotifyRecord {
+    /// `FILE_ACTION_*` code (ADDED / REMOVED / MODIFIED / RENAMED_*).
+    pub action: u32,
+    /// File name relative to the watched directory (guest `WCHAR` units,
+    /// `\`-separated for subdirectories under recursive watches).
+    pub file_name: String,
+}
+
+/// Directory change notification object backing `FindFirstChangeNotification*`
+/// and `ReadDirectoryChangesW`.
+///
+/// The notify-crate watcher lives inside the object behind
+/// `Arc<Mutex<Option<_>>>` so the object stays `Clone` (the kernel table
+/// derives `Clone`). The watcher's callback holds a **weak** reference, so
+/// dropping the last strong ref (`FindCloseChangeNotification`, `CloseHandle`
+/// of a `ReadDirectoryChangesW` anchor) drops the watcher and stops event
+/// delivery without a reference cycle.
+///
+/// Signaled state: `pending` is non-empty, or the watch was closed
+/// (`active == false`). Unlike events, waiting does **not** consume records —
+/// `ReadDirectoryChangesW` drains them; `FindNextChangeNotification` resets.
+pub struct DirectoryWatchObject {
+    /// Kernel handle when registered in the objects table (0 for
+    /// `ReadDirectoryChangesW`-only anchors held in [`SyncState::watch_handles`]).
+    pub handle: u64,
+    /// Guest Windows path of the watched directory (`C:\...`).
+    pub guest_path: Arc<str>,
+    /// Host path the notify watcher monitors.
+    pub host_path: Arc<Path>,
+    /// `FILE_NOTIFY_CHANGE_*` filter mask; events not matching are dropped.
+    pub mask: AtomicU32,
+    /// Pending change records (consumed by `ReadDirectoryChangesW`).
+    pub pending: Mutex<Vec<FileNotifyRecord>>,
+    /// Waiter notification: a pushed record wakes parked host waits.
+    pub cv: Condvar,
+    /// False after close/teardown; wakes waiters so they stop blocking.
+    pub active: AtomicBool,
+    /// The notify watcher, started lazily. `pub(crate)` so the watch module
+    /// (`kernel32/file_io/watch.rs`) can create it via
+    /// [`DirectoryWatchObject::start_watching`].
+    pub(crate) watcher: Arc<Mutex<Option<notify::RecommendedWatcher>>>,
+}
+
+impl std::fmt::Debug for DirectoryWatchObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirectoryWatchObject")
+            .field("handle", &self.handle)
+            .field("guest_path", &self.guest_path)
+            .field("host_path", &self.host_path)
+            .field("mask", &self.mask.load(Ordering::Relaxed))
+            .field("pending_len", &self.pending.lock().map_or(0, |g| g.len()))
+            .field("active", &self.active.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl DirectoryWatchObject {
+    /// Build an inactive watch (no watcher started). `mask` starts at 0, so
+    /// no events match until a handler stores the real filter.
+    #[must_use]
+    pub fn new(guest_path: &str, host_path: PathBuf) -> Self {
+        Self {
+            handle: 0,
+            guest_path: Arc::from(guest_path),
+            host_path: Arc::from(host_path.as_path()),
+            mask: AtomicU32::new(0),
+            pending: Mutex::new(Vec::new()),
+            cv: Condvar::new(),
+            active: AtomicBool::new(true),
+            watcher: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// The waitable "signaled" state: a change is pending, or the watch
+    /// closed. A poisoned pending mutex counts as signaled (fail open), like
+    /// [`EventObject::wait`].
+    pub fn is_signaled(&self) -> bool {
+        if !self.active.load(Ordering::Acquire) {
+            return true;
+        }
+        self.pending.lock().map_or(true, |guard| !guard.is_empty())
+    }
+
+    /// Non-blocking readiness check (does not consume records).
+    pub fn try_wait(&self) -> bool {
+        self.is_signaled()
+    }
+
+    /// Block until a change is pending or the watch closes. Does **not**
+    /// consume records. Returns false only on timeout (or a spurious wake
+    /// with no pending records, which the poll-loop callers treat as retry).
+    pub fn wait(&self, timeout_ms: u32) -> bool {
+        let Ok(mut guard) = self.pending.lock() else {
+            return true;
+        };
+        if !guard.is_empty() || !self.active.load(Ordering::Acquire) {
+            return true;
+        }
+        if timeout_ms == 0 {
+            return false;
+        }
+        if timeout_ms == INFINITE {
+            while guard.is_empty() && self.active.load(Ordering::Acquire) {
+                guard = match self.cv.wait(guard) {
+                    Ok(next) => next,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+            }
+            return !guard.is_empty() || !self.active.load(Ordering::Acquire);
+        }
+        let remain = Duration::from_millis(u64::from(timeout_ms));
+        let (next, timeout_result) = match self.cv.wait_timeout(guard, remain) {
+            Ok(pair) => pair,
+            Err(poisoned) => {
+                let (inner, _) = poisoned.into_inner();
+                return !inner.is_empty() || !self.active.load(Ordering::Acquire);
+            }
+        };
+        guard = next;
+        if !guard.is_empty() || !self.active.load(Ordering::Acquire) {
+            return true;
+        }
+        // Spurious wake without records: report retry so the 50 ms poll-loop
+        // callers re-check rather than returning success on nothing.
+        let _ = timeout_result;
+        false
+    }
+    /// `FindNextChangeNotification`: clear pending records so the next wait
+    /// re-blocks until NEW changes arrive.
+    pub fn reset(&self) {
+        if let Ok(mut guard) = self.pending.lock() {
+            guard.clear();
+        }
+    }
+
+    /// `FindCloseChangeNotification` / teardown: stop delivering and wake any
+    /// parked waiter (a wait on a closed watch returns satisfied).
+    pub fn deactivate(&self) {
+        self.active.store(false, Ordering::Release);
+        self.cv.notify_all();
+    }
+
+    /// Queue one change record and wake parked waiters.
+    pub fn push(&self, record: FileNotifyRecord) {
+        if let Ok(mut guard) = self.pending.lock() {
+            guard.push(record);
+            self.cv.notify_all();
+        }
+    }
+}
+
 /// Wait queue for one guest critical section VA.
 #[derive(Debug)]
 pub struct CsWaitQueue {
@@ -587,6 +974,10 @@ pub enum WaitTarget {
     Event(Arc<EventObject>),
     /// Semaphore object.
     Semaphore(Arc<SemaphoreObject>),
+    /// Directory change notification object.
+    DirectoryWatch(Arc<DirectoryWatchObject>),
+    /// Child-process object (signaled when the child session terminated).
+    Process(Arc<ProcessObject>),
 }
 
 impl WaitTarget {
@@ -596,6 +987,8 @@ impl WaitTarget {
             Self::Thread(t) => t.is_finished(),
             Self::Event(e) => e.wait(0),
             Self::Semaphore(s) => s.try_acquire(),
+            Self::DirectoryWatch(d) => d.try_wait(),
+            Self::Process(p) => p.is_finished(),
         }
     }
 
@@ -618,6 +1011,20 @@ impl WaitTarget {
             }
             Self::Semaphore(s) => {
                 if s.wait(timeout_ms) {
+                    WAIT_OBJECT_0
+                } else {
+                    WAIT_TIMEOUT
+                }
+            }
+            Self::DirectoryWatch(d) => {
+                if d.wait(timeout_ms) {
+                    WAIT_OBJECT_0
+                } else {
+                    WAIT_TIMEOUT
+                }
+            }
+            Self::Process(p) => {
+                if p.wait_until_finished(timeout_ms) {
                     WAIT_OBJECT_0
                 } else {
                     WAIT_TIMEOUT
@@ -728,6 +1135,8 @@ impl SyncState {
             KernelObject::Semaphore(s) => Some(WaitTarget::Semaphore(Arc::clone(s))),
             // File mappings are not waitable.
             KernelObject::FileMapping(_) => None,
+            KernelObject::DirectoryWatch(d) => Some(WaitTarget::DirectoryWatch(Arc::clone(d))),
+            KernelObject::Process(p) => Some(WaitTarget::Process(Arc::clone(p))),
         }
     }
 
@@ -738,5 +1147,175 @@ impl SyncState {
             out.push(self.wait_target(h)?);
         }
         Some(out)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod directory_watch_tests {
+    use super::*;
+
+    fn watch_obj() -> DirectoryWatchObject {
+        DirectoryWatchObject::new("C:\\watch", PathBuf::from("/tmp/watch"))
+    }
+
+    #[test]
+    fn directory_watch_wait_reset_semantics() {
+        let obj = Arc::new(watch_obj());
+        assert!(!obj.try_wait(), "fresh watch is not signaled");
+        assert!(!obj.wait(0), "zero-timeout wait on a fresh watch times out");
+
+        obj.push(FileNotifyRecord {
+            action: FILE_ACTION_ADDED,
+            file_name: "x.txt".into(),
+        });
+        assert!(obj.try_wait(), "pushed record signals the watch");
+        // Waiting must NOT consume: FindNextChangeNotification owns the reset.
+        assert!(obj.wait(0), "wait is satisfied while records are pending");
+        assert!(obj.try_wait(), "records survive the wait");
+
+        obj.reset();
+        assert!(!obj.try_wait(), "reset clears the signaled state");
+
+        obj.push(FileNotifyRecord {
+            action: FILE_ACTION_REMOVED,
+            file_name: "x.txt".into(),
+        });
+        let waiter = {
+            let obj = Arc::clone(&obj);
+            std::thread::spawn(move || obj.wait(5_000))
+        };
+        assert!(
+            waiter.join().expect("waiter thread"),
+            "push wakes a parked waiter"
+        );
+        obj.deactivate();
+        assert!(obj.try_wait(), "a closed watch reads as signaled");
+        assert!(obj.wait(0), "zero-timeout wait on a closed watch succeeds");
+    }
+
+    #[test]
+    fn directory_watch_kernel_object_wait_target() {
+        let mut sync = SyncState::new();
+        let (handle, obj) =
+            sync.register_directory_watch("C:\\watch", PathBuf::from("/tmp/watch"), 0);
+        assert!(
+            sync.wait_target(handle).is_some(),
+            "watch handles resolve to a wait target"
+        );
+        obj.push(FileNotifyRecord {
+            action: FILE_ACTION_MODIFIED,
+            file_name: "y.txt".into(),
+        });
+        let target = sync.wait_target(handle).expect("wait target");
+        assert!(target.try_wait(), "signaled watch is immediately waitable");
+        let result = target.wait(0);
+        assert_eq!(
+            result, WAIT_OBJECT_0,
+            "wait on a signaled watch returns WAIT_OBJECT_0"
+        );
+    }
+
+    #[test]
+    fn process_object_wait_semantics() {
+        let obj = Arc::new(ProcessObject {
+            handle: 0x1234,
+            pid: FIRST_CHILD_PID,
+            exit_code: std::sync::atomic::AtomicU32::new(STILL_ACTIVE),
+            finished: Mutex::new(false),
+            finished_cv: Condvar::new(),
+        });
+        assert!(!obj.is_finished(), "a fresh child is running");
+        assert_eq!(
+            obj.exit_code.load(std::sync::atomic::Ordering::Acquire),
+            STILL_ACTIVE,
+            "STILL_ACTIVE until the child terminates"
+        );
+        assert!(!obj.wait_until_finished(0), "zero-timeout wait times out");
+        assert!(!obj.wait_until_finished(1), "1 ms wait times out");
+
+        obj.finish(42);
+        assert!(obj.is_finished(), "finish marks the child terminated");
+        assert_eq!(
+            obj.exit_code.load(std::sync::atomic::Ordering::Acquire),
+            42,
+            "finish stores the exit code"
+        );
+        // A process handle never resets: it stays signaled forever.
+        assert!(
+            obj.wait_until_finished(0),
+            "finished is immediately waitable"
+        );
+        assert!(
+            obj.wait_until_finished(5_000),
+            "a long wait on a finished process returns immediately"
+        );
+
+        // Parked waiter is woken by finish from another thread.
+        let waiter_obj = Arc::new(ProcessObject {
+            handle: 0x1235,
+            pid: FIRST_CHILD_PID + 1,
+            exit_code: std::sync::atomic::AtomicU32::new(STILL_ACTIVE),
+            finished: Mutex::new(false),
+            finished_cv: Condvar::new(),
+        });
+        let waiter_clone = Arc::clone(&waiter_obj);
+        let waiter = std::thread::spawn(move || waiter_clone.wait_until_finished(5_000));
+        std::thread::sleep(Duration::from_millis(20));
+        waiter_obj.finish(7);
+        assert!(
+            waiter.join().expect("waiter thread"),
+            "finish wakes a parked waiter"
+        );
+    }
+
+    #[test]
+    fn process_pid_map_round_trip() {
+        let mut sync = SyncState::new();
+        let first_pid = sync.alloc_child_pid();
+        assert!(
+            first_pid >= FIRST_CHILD_PID,
+            "child pids start after the parent's fixed pid"
+        );
+        let second_pid = sync.alloc_child_pid();
+        assert_ne!(first_pid, second_pid, "pids are monotonic");
+
+        let (handle, obj) = sync.register_process(first_pid);
+        assert_eq!(
+            sync.pid_to_handle(first_pid),
+            Some(handle),
+            "pid maps to the registered handle"
+        );
+        assert_eq!(
+            sync.process_by_handle(handle).map(|p| p.pid),
+            Some(first_pid),
+            "handle maps back to the pid"
+        );
+        assert_eq!(
+            obj.exit_code.load(std::sync::atomic::Ordering::Acquire),
+            STILL_ACTIVE,
+            "a fresh process reports STILL_ACTIVE"
+        );
+        assert_eq!(
+            sync.pid_to_handle(second_pid),
+            None,
+            "unregistered pids do not resolve"
+        );
+        assert!(
+            sync.process_by_handle(0).is_none(),
+            "handle 0 is never a process"
+        );
+        // Process objects participate in the wait-target table.
+        assert!(
+            sync.wait_target(handle).is_some(),
+            "process handles resolve to a wait target"
+        );
+        obj.finish(3);
+        let target = sync.wait_target(handle).expect("process wait target");
+        assert!(
+            target.try_wait(),
+            "a finished process is immediately waitable"
+        );
+        assert_eq!(target.wait(0), WAIT_OBJECT_0);
     }
 }

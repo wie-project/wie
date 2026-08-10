@@ -1376,3 +1376,116 @@ fn test_windows_system_and_temp_dir_handlers_return_seeded_paths() {
     }
     let _unused = std::fs::remove_dir_all(&root);
 }
+
+// --- CreateProcess process-wait surface (GetExitCodeProcess / OpenProcess) ---
+
+#[test]
+fn get_exit_code_process_reports_still_active_then_code() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let (handle, proc_obj) = state.kernel.sync.register_process(0x2000);
+    let out_va = 0x5000_u64;
+
+    // Running child → TRUE + STILL_ACTIVE.
+    write_regs(&mut engine, handle, out_va, 0, 0, STACK_TOP);
+    kernel32::handle_get_exit_code_process(&mut HandlerContext::new(
+        &mut engine,
+        default_env(),
+        &mut state,
+    ))
+    .expect("get exit code while running");
+    assert_eq!(engine.read_rax().expect("rax"), 1, "returns TRUE");
+    let mut code = [0_u8; 4];
+    engine.mem_read(out_va, &mut code).expect("read exit code");
+    assert_eq!(
+        u32::from_le_bytes(code),
+        crate::STILL_ACTIVE,
+        "STILL_ACTIVE while the child runs"
+    );
+
+    // Finished child → the stored exit code.
+    proc_obj.finish(42);
+    write_regs(&mut engine, handle, out_va, 0, 0, STACK_TOP);
+    kernel32::handle_get_exit_code_process(&mut HandlerContext::new(
+        &mut engine,
+        default_env(),
+        &mut state,
+    ))
+    .expect("get exit code after finish");
+    engine
+        .mem_read(out_va, &mut code)
+        .expect("read exit code 2");
+    assert_eq!(u32::from_le_bytes(code), 42, "the stored exit code");
+
+    // Unknown handle → FALSE + ERROR_INVALID_HANDLE (6).
+    write_regs(&mut engine, 0xdead_beef, out_va, 0, 0, STACK_TOP);
+    kernel32::handle_get_exit_code_process(&mut HandlerContext::new(
+        &mut engine,
+        default_env(),
+        &mut state,
+    ))
+    .expect("get exit code invalid handle");
+    assert_eq!(engine.read_rax().expect("rax"), 0, "invalid handle → FALSE");
+    assert_eq!(state.process.last_error, 6, "ERROR_INVALID_HANDLE");
+}
+
+#[test]
+fn get_exit_code_process_pseudohandle_always_still_active() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let out_va = 0x5000_u64;
+
+    write_regs(&mut engine, u64::MAX, out_va, 0, 0, STACK_TOP);
+    kernel32::handle_get_exit_code_process(&mut HandlerContext::new(
+        &mut engine,
+        default_env(),
+        &mut state,
+    ))
+    .expect("get exit code pseudohandle");
+    let mut code = [0_u8; 4];
+    engine.mem_read(out_va, &mut code).expect("read exit code");
+    assert_eq!(
+        u32::from_le_bytes(code),
+        crate::STILL_ACTIVE,
+        "the (HANDLE)-1 pseudohandle is always STILL_ACTIVE"
+    );
+}
+
+#[test]
+fn open_process_resolves_pid_map_pseudohandle_and_unknown() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let pid = 0x2000_u32;
+    let (handle, _) = state.kernel.sync.register_process(pid);
+
+    // OpenProcess on a child's pid returns the same handle value.
+    write_regs(&mut engine, 0x1f0fff, 0, u64::from(pid), 0, STACK_TOP);
+    kernel32::handle_open_process(&mut HandlerContext::new(
+        &mut engine,
+        default_env(),
+        &mut state,
+    ))
+    .expect("open process known pid");
+    assert_eq!(engine.read_rax().expect("rax"), handle);
+
+    // Unknown pid → NULL + ERROR_INVALID_PARAMETER (87).
+    write_regs(&mut engine, 0x1f0fff, 0, u64::from(pid + 1), 0, STACK_TOP);
+    kernel32::handle_open_process(&mut HandlerContext::new(
+        &mut engine,
+        default_env(),
+        &mut state,
+    ))
+    .expect("open process unknown pid");
+    assert_eq!(engine.read_rax().expect("rax"), 0, "unknown pid → NULL");
+    assert_eq!(state.process.last_error, 87, "ERROR_INVALID_PARAMETER");
+
+    // The current process's own fixed pid → the (HANDLE)-1 pseudohandle.
+    write_regs(&mut engine, 0x1f0fff, 0, 0x1234, 0, STACK_TOP);
+    kernel32::handle_open_process(&mut HandlerContext::new(
+        &mut engine,
+        default_env(),
+        &mut state,
+    ))
+    .expect("open process self pid");
+    assert_eq!(engine.read_rax().expect("rax"), u64::MAX);
+}
