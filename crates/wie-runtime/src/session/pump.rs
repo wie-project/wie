@@ -453,6 +453,17 @@ impl super::RuntimeSession {
                             // Windows flushes stdout at process exit — without
                             // this, trailing printf output is silently lost.
                             winapi_state.flush_console();
+                            // A non-zero exit code is a failure signal — log it
+                            // so a live run shows WHY the guest stopped, not
+                            // just the bare code (micro self-tests exit with
+                            // the failing stage's code and trace the reason
+                            // through OutputDebugStringA before exiting).
+                            if exit_code != 0 {
+                                tracing::error!(
+                                    exit_code,
+                                    "guest exited with a non-zero code (see the guest's OutputDebugStringA trace for the failing stage)"
+                                );
+                            }
                             break_term =
                                 Some(EntryTraceTermination::ExitProcess { code: exit_code });
                             quantum = Quantum::Break;
@@ -733,6 +744,59 @@ impl super::RuntimeSession {
                                         continue 'outer;
                                     }
                                     Ok(
+                                        wie_winapi::WinApiControlSignal::EnumerationCallbackRequested {
+                                            request,
+                                            enumeration_id,
+                                        },
+                                    ) => {
+                                        charged_api = charged_api.saturating_add(1);
+                                        // begin_guest_enum_callback needs full self — mark and handle after drop
+                                        drop(pair);
+                                        let outer_library =
+                                            self.intern_outer_api_name(resolved.library);
+                                        let outer_name = self.intern_outer_api_name(resolved.name);
+                                        events.push(EntryTraceEvent {
+                                            index,
+                                            library: Arc::clone(&outer_library),
+                                            name: Arc::clone(&outer_name),
+                                            fake_target_va: hook.address,
+                                            handled: true,
+                                            return_value: None,
+                                            return_address: None,
+                                        });
+                                        // The first item's frame is installed
+                                        // relative to the current RSP.
+                                        let dispatch_rsp = match self
+                                            .process
+                                            .with_mut(|engine, _| engine.read_rsp())
+                                        {
+                                            Ok(rsp) => rsp,
+                                            Err(error) => {
+                                                termination =
+                                                    EntryTraceTermination::RuntimeStop(format!(
+                                                        "failed to read RSP for enum callback: {error}"
+                                                    ));
+                                                break 'outer;
+                                            }
+                                        };
+                                        if let Err(error) = self.begin_guest_enum_callback(
+                                            request,
+                                            enumeration_id,
+                                            outer_library,
+                                            outer_name,
+                                            hook.address,
+                                            dispatch_rsp,
+                                        ) {
+                                            termination = EntryTraceTermination::RuntimeStop(
+                                                format!(
+                                                    "failed to begin enum callback: {error}"
+                                                ),
+                                            );
+                                            break 'outer;
+                                        }
+                                        continue 'outer;
+                                    }
+                                    Ok(
                                         wie_winapi::WinApiControlSignal::FileDialogBridgeRequested {
                                             request,
                                         },
@@ -940,6 +1004,198 @@ impl super::RuntimeSession {
                                         // Continue: the engine re-executes the fake
                                         // API stop, the handler re-enters and returns
                                         // the success flag as the EndDoc result.
+                                        quantum = Quantum::Continue;
+                                    }
+                                    Ok(wie_winapi::WinApiControlSignal::ChildProcessSpawnRequested {
+                                        host_path,
+                                        guest_args,
+                                        // Informational today: the child always
+                                        // builds the standard WIE guest env.
+                                        inherit_environment: _,
+                                    }) => {
+                                        // Spawn a child guest process: the child gets
+                                        // its OWN RuntimeSession (engine + WinApiState —
+                                        // never shared with the parent) registered as a
+                                        // Process kernel object in THIS parent's handle
+                                        // table, so the parent's GetExitCodeProcess /
+                                        // WaitForSingleObject / OpenProcess resolve it.
+                                        // The wrapper thread is the single caller of
+                                        // ProcessObject::finish (after run_until_stop
+                                        // returns — ANY termination, not just
+                                        // ExitProcess), so a crashing child cannot hang a
+                                        // waiting parent.
+                                        //
+                                        // Snapshot the parent's volume roots while the
+                                        // state lock is held so the child sees the same
+                                        // C:\ / D:\ mapping.
+                                        let (bottle_root, drive_d_root) = {
+                                            let st = winapi_state;
+                                            (
+                                                st.file_io.volumes.bottle_root.clone(),
+                                                st.file_io.volumes.drive_d_root.clone(),
+                                            )
+                                        };
+                                        drop(pair);
+
+                                        // Build the child session OUTSIDE the parent's
+                                        // state lock: it is fully self-contained (own
+                                        // engine, WinApiState, guest memory). The session
+                                        // API does not accept a shared JitShared, so each
+                                        // child builds its own compilation cache
+                                        // (correctness-neutral; a per-process cache).
+                                        let build = crate::RuntimeSession::new_with_options(
+                                            &host_path,
+                                            wie_winapi::MessageQueueIdlePolicy::ExitOnIdle,
+                                            crate::DEFAULT_LAYOUT,
+                                            crate::SessionOptions {
+                                                bottle_root,
+                                                drive_d_root,
+                                                guest_args,
+                                                ..crate::SessionOptions::default()
+                                            },
+                                        );
+
+                                        // (hProcess, hThread, dwProcessId, dwThreadId).
+                                        let spawn_outcome: Option<(u64, u64, u32, u32)> =
+                                            match build {
+                                                Ok(mut child) => {
+                                                    let pid = self.process.with_mut(|_, st| {
+                                                        st.kernel.sync.alloc_child_pid()
+                                                    });
+                                                    let (h_process, proc_obj) =
+                                                        self.process.with_mut(|_, st| {
+                                                            st.kernel.sync.register_process(pid)
+                                                        });
+                                                    let (h_thread, thread_obj) =
+                                                        self.process.with_mut(|_, st| {
+                                                            st.kernel
+                                                                .sync
+                                                                .register_detached_thread(pid)
+                                                        });
+                                                    let spawned = std::thread::Builder::new()
+                                                        .name(format!("wie-child-{pid}"))
+                                                        .stack_size(8 * 1024 * 1024)
+                                                        .spawn(move || {
+                                                            let summary = child.run_until_stop(
+                                                                super::MAX_API_QUANTUM,
+                                                            );
+                                                            let code = match &summary {
+                                                                Ok(s) => match &s.termination {
+                                                                    EntryTraceTermination::ExitProcess {
+                                                                        code,
+                                                                    } => *code,
+                                                                    _ => 1,
+                                                                },
+                                                                Err(error) => {
+                                                                    tracing::error!(
+                                                                        pid,
+                                                                        error = %error,
+                                                                        "child session stopped with an error"
+                                                                    );
+                                                                    1
+                                                                }
+                                                            };
+                                                            tracing::info!(
+                                                                target: "wiegui",
+                                                                pid,
+                                                                code,
+                                                                "child guest process exited"
+                                                            );
+                                                            proc_obj.finish(code);
+                                                            thread_obj.finish(code);
+                                                        });
+                                                    match spawned {
+                                                        Ok(_) => {
+                                                            // JoinHandle dropped: the child
+                                                            // host thread is detached and
+                                                            // notifies the Process object when
+                                                            // it finishes.
+                                                            Some((
+                                                                h_process,
+                                                                h_thread,
+                                                                pid,
+                                                                primary_tid,
+                                                            ))
+                                                        }
+                                                        Err(error) => {
+                                                            tracing::error!(
+                                                                pid,
+                                                                error = %error,
+                                                                "failed to spawn child host thread"
+                                                            );
+                                                            self.process.with_mut(|_, st| {
+                                                                st.kernel
+                                                                    .sync
+                                                                    .objects
+                                                                    .remove(
+                                                                        &wie_winapi::KernelHandle::from(
+                                                                            h_process,
+                                                                        ),
+                                                                    );
+                                                                st.kernel
+                                                                    .sync
+                                                                    .objects
+                                                                    .remove(
+                                                                        &wie_winapi::KernelHandle::from(
+                                                                            h_thread,
+                                                                        ),
+                                                                    );
+                                                                st.kernel
+                                                                    .sync
+                                                                    .process_by_pid
+                                                                    .remove(&pid);
+                                                            });
+                                                            None
+                                                        }
+                                                    }
+                                                }
+                                                Err(error) => {
+                                                    tracing::error!(
+                                                        path = %host_path.display(),
+                                                        error = %error,
+                                                        "failed to build child session"
+                                                    );
+                                                    None
+                                                }
+                                            };
+
+                                        if let Some((h_process, h_thread, pid, tid)) =
+                                            spawn_outcome
+                                        {
+                                            let recorded = self.process.with_mut(
+                                                |_, winapi_state| {
+                                                    if winapi_state.kernel.threads.active.tid
+                                                        != primary_tid
+                                                    {
+                                                        winapi_state
+                                                            .kernel
+                                                            .threads
+                                                            .activate(primary_tid);
+                                                    }
+                                                    winapi_state
+                                                        .window_state()
+                                                        .set_child_spawn_result(
+                                                            h_process,
+                                                            h_thread,
+                                                            pid,
+                                                            tid,
+                                                        )
+                                                },
+                                            );
+                                            if !recorded {
+                                                // The write-back slot vanished (the
+                                                // handler's re-entry raced a teardown):
+                                                // the guest will fail closed.
+                                                tracing::warn!(
+                                                    pid,
+                                                    "child spawned but PROCESS_INFORMATION write-back slot missing"
+                                                );
+                                            }
+                                        }
+                                        // Continue: the engine re-executes the fake API
+                                        // stop, the handler re-enters, takes the pending
+                                        // record, and writes PROCESS_INFORMATION (a `None`
+                                        // result reads as FALSE + ERROR_INVALID_PARAMETER).
                                         quantum = Quantum::Continue;
                                     }
                                     Ok(wie_winapi::WinApiControlSignal::HostPark { reason }) => {
