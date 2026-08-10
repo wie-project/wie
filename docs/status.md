@@ -58,26 +58,28 @@ surface. Each pillar lists what it takes, why real apps need it, and the current
 
 | DLL | What real apps use it for | State |
 | --- | --- | --- |
-| `WS2_32` | **QtNetwork**, game multiplayer, updaters, any TCP/UDP | ⬜ 0 handlers |
-| `WININET` / `URLMON` | HTTP/update checks, web content | ⬜ |
-| `CRYPT32` | Certificates, code signing, hash APIs | ⬜ |
-| `MSIMG32` | AlphaBlend/TransparentBlt (GDI-era UI polish) | ⬜ |
-| `IMM32` | IME text input (CJK apps, Qt text fields) | ⬜ |
-| `SETUPAPI` / `CFGMGR32` | Installers, device queries | ⬜ |
-| `UXTHEME` | Visual styles — Qt apps call `SetWindowTheme` | 🟡 `SetWindowTheme` no-op only |
-| `MSVCR71` / `MSVCP71` | Legacy CRT binaries | ⬜ |
-| `DBGHELP` / `IMAGEHLP` | Crash handlers, stack walking | ⬜ |
+| `WS2_32` | **QtNetwork**, game multiplayer, updaters, any TCP/UDP | ✅ real loopback TCP (Tier-1 wave) |
+| `WININET` / `URLMON` | HTTP/update checks, web content | ✅ host HTTP + URLDownloadToFile (Tier-3 wave) |
+| `CRYPT32` | Certificates, code signing, hash APIs | ✅ real SHA-1/SHA-256 + urandom (Tier-1 wave) |
+| `MSIMG32` | AlphaBlend/TransparentBlt (GDI-era UI polish) | ✅ real (Tier-1 wave) |
+| `IMM32` | IME text input (CJK apps, Qt text fields) | ✅ benign no-ops (IME is a non-goal) |
+| `SETUPAPI` / `CFGMGR32` | Installers, device queries | ✅ empty device enumeration (Tier-1 wave) |
+| `UXTHEME` | Visual styles — Qt apps call `SetWindowTheme` | ✅ no-ops (Tier-1 wave) |
+| `MSVCR71` / `MSVCP71` + `MSVCR100/110/120/140` | Legacy CRT binaries | ✅ forwarded into ucrt + `_s` family (Tier-1/3 waves) |
+| `DBGHELP` / `IMAGEHLP` | Crash handlers, stack walking | ✅ minimal init/fail-graceful (Tier-1 wave) |
+| `ntdll` | Nt*/Rtl* surface modern toolchains link | ✅ Nt* + Rtl* dispatch + api-set check (Tier-3 wave) |
+| `opengl32` | Qt GL contexts (WGL), legacy gl* | ✅ real GL 1.1 fixed-function software renderer + GL 1.5 buffer objects + display lists + Gouraud lighting — matrices, immediate mode, client arrays, VBOs, display lists, depth + blend, GL_RGBA textures, swap publishes the rendered frame, wglGetProcAddress resolves dispatch exports (GLSL/stencil/FBO stubs remain) |
 
 ### 3. Qt-class apps (Qt5/Qt6, Electron-class)
 
-- **OpenGL (WGL/`opengl32`)** — Qt Quick and the Qt OpenGL backend render through it; the biggest single blocker for real Qt apps. ⬜
-- **API-set forwarding** (`api-ms-win-*`) — modern Qt6 links these names; forwarding exists (7 sites). ✅
-- **OLE clipboard + drag-drop** (`IDropTarget`, OLE formats) — Qt's clipboard and DnD are OLE-based, not CF_* based. 🟡
+- **OpenGL (WGL/`opengl32`)** — Qt Quick and the Qt OpenGL backend render through it; the biggest single blocker for real Qt apps. ✅ real GL 1.1 fixed-function software renderer + GL 1.5 buffer objects + display lists + Gouraud lighting + **GLSL ES 1.00 shaders** (hand-written lexer/parser/interpreter: attribute/varying/uniform, constructors, swizzles, ternary, constant-bounded for, user functions, built-ins gl_Position/gl_FragColor/gl_FragCoord/texture2D/gl_ModelViewProjectionMatrix; per-pixel varying interpolation; glGetUniformLocation/glUniform*/glUniformMatrix4fv). `gl_quad` micro renders a red quad, checkerboard texture, client-array + VBO triangles, a lit quad, a display list, a v_uv-gradient shader quad, and a texture2D shader quad — all self-verified via glReadPixels. Still stubbed: stencil, FBOs/multisample, mipmaps, dynamic loop bounds (link error), custom attribute names (link error)
+- **API-set forwarding** (`api-ms-win-*`) — modern Qt6 links these names; forwarding exists (7 sites); `tests/api_sets.rs` asserts the crt-* families classify. ✅
+- **OLE clipboard + drag-drop** (`IDropTarget`, OLE formats) — Qt's clipboard and DnD are OLE-based, not CF_* based. 🟡 guest-side landed (OleSet/OleGetClipboard + IDataObject + classic clipboard family); NSPasteboard host bridge + real DnD are future lanes
 - **COM registration lookup** — `CoCreateInstance` returns `REGDB_E_CLASSNOTREG`; Qt ActiveX/QAxWidget and many frameworks need real COM servers. ⬜
 - **Registry breadth** — QSettings reads/writes the hive; per-bottle persistence exists; the `RegDelete*`/security family is still missing. 🟡
-- **Fonts** — `EnumFontFamiliesEx`, `AddFontResource`, font linking; Qt enumerates system fonts for its font dialogs. 🟡 text works, enumeration missing
-- **`ReadDirectoryChangesW`** — `QFileSystemWatcher` (0 handlers today). ⬜
-- **`CreateProcess`** — `QProcess` and every app that spawns a child (0 handlers today; today's apps must be single-process). ⬜
+- **Fonts** — `EnumFontFamiliesEx`, `AddFontResource`, font linking; Qt enumerates system fonts for its font dialogs. 🟡 EnumFontFamiliesExW/A + EnumFonts + AddFontResource/RemoveFontResource landed (real fontdb enumeration, full-iteration callback bridge); GetGlyphOutline GGO_BITMAP; font linking ⬜
+- **`ReadDirectoryChangesW`** — `QFileSystemWatcher`. ✅ landed (notify/kqueue-backed, sync form; FindFirstChangeNotification family too)
+- **`CreateProcess`** — `QProcess` and every app that spawns a child. ✅ landed (in-process child session: CreateProcessW/A, GetExitCodeProcess, OpenProcess, WaitForSingleObject on process handles; `spawn_child` micro verifies exit code 42)
 - **Locales** — `CompareString`, `LCMapString`, `GetLocaleInfo` for collation and string mapping. ⬜
 - **Console APIs** — full `ReadConsoleInput` etc. for interactive CLIs. 🟡
 

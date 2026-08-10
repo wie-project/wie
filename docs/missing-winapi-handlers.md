@@ -78,8 +78,105 @@ Any call to these returns `bail!("unsupported WinAPI call: {library}!{name}")`:
 
 | DLL | Purpose |
 |-----|---------|
-| `WININET.dll` | Internet APIs |
-| `URLMON.dll` | URL Moniker |
+| *(none — WININET/URLMON landed in the Tier-3 wave; see below)* | |
+
+**Recently landed (Tier-3 wave, release 0.2):**
+
+- `WININET.dll` — host HTTP over `std::net` (no FFI): InternetOpen/CloseHandle,
+  InternetConnect, InternetOpenUrl, HttpOpenRequest/HttpSendRequest (HTTP/1.1 with
+  chunked decoding), InternetReadFile, InternetSetOption (accept-and-ignore),
+  InternetGetConnectedState. HINTERNET tables in `DllId::Wininet` (`WininetState`).
+  `wininet_http` micro fetches example.com and asserts HTTP 200. `https://` is
+  rejected with ERROR_INTERNET_UNRECOGNIZED_SCHEME (documented).
+- `URLMON.dll` — URLDownloadToFileW/A (bottle-resolved destination, GET via the
+  wininet machinery), CoInternetCreateSecurityManager/CoInternetGetSession → E_NOTIMPL.
+- `ntdll.dll` — the Nt*/Rtl* surface modern toolchains link: NtClose,
+  NtQueryInformationProcess (basic info class), NtQuerySystemInformation (basic),
+  NtDelayExecution, NtQueryPerformanceCounter, NtAllocateVirtualMemory/
+  NtFreeVirtualMemory/NtProtectVirtualMemory/NtQueryVirtualMemory,
+  NtQuerySystemTime, RtlCloseHandle, RtlAllocateHeap/RtlFreeHeap/RtlReAllocateHeap
+  (NULL-heap → process heap), RtlMoveMemory/CopyMemory/ZeroMemory/CompareMemory,
+  RtlInitUnicodeString, RtlEnter/Leave/Initialize/DeleteCriticalSection,
+  RtlGetCurrentPeb/Thread, RtlCaptureContext/RtlUnwindEx (forwarded to kernel32).
+  `tests/api_sets.rs` asserts the api-ms-win-crt-* families classify and the ntdll
+  census stays honest; `api-ms-win-core-*` non-CRT sets remain a documented gap.
+- `MSVCR100/110/120/140.dll` + `MSVCP100/110/120/140.dll` — legacy CRT forwarders
+  added to `is_ucrt_library` (same dispatch as msvcrt), plus the secure-CRT `_s`
+  family those versions call: memcpy_s/memmove_s/memset_s, strcpy_s/strncpy_s/
+  strcat_s/strncat_s, strtok_s, qsort_s (real guest-comparator re-entry),
+  sprintf_s/snprintf_s/_vsnprintf_s/_vsnwprintf_s (incl. the
+  __stdio_common_vsprintf_s cores), fopen_s/freopen_s (NULL + errno — fopen has no
+  VFS bridge). 13 focused unit tests.
+- `opengl32.dll` — REAL GL 1.1 fixed-function software renderer + GL 1.5
+  buffer objects + display lists + fixed-function lighting: WGL handle
+  semantics (wglCreateContext/DeleteContext/MakeCurrent/GetCurrentContext/
+  GetCurrentDC/GetProcAddress/ChoosePixelFormat/SetPixelFormat/
+  DescribePixelFormat/GetPixelFormat/ShareLists), the legacy gl* core
+  (matrix stacks with glOrtho/glFrustum/glTranslate/glRotate/glScale/
+  glPushMatrix/glPopMatrix, immediate mode glBegin/glEnd with
+  POINTS..POLYGON, glVertex*/glColor*/glTexCoord* incl. the fv/ub forms,
+  scanline rasterization with barycentric color/uv/depth interpolation, the
+  top-left fill rule, near-plane clipping, GL_LESS/LEQUAL/GEQUAL/GREATER/
+  EQUAL/NOTEQUAL/NEVER/ALWAYS depth test, SRC_ALPHA/ONE_MINUS_SRC_ALPHA/
+  ONE/ZERO/SRC_COLOR/DST_COLOR + one-minus blend factors,
+  GL_MODULATE/GL_REPLACE texenv, glGenTextures/glBindTexture/
+  glDeleteTextures/glTexImage2D (GL_RGBA/RGB/LUMINANCE/ALPHA ×
+  GL_UNSIGNED_BYTE, bottom-up rows, GL_UNPACK_ALIGNMENT), nearest/linear
+  filters, repeat/clamp wrap, glReadPixels (GL_RGBA/GL_UNSIGNED_BYTE),
+  glClear/glClearColor/glClearDepth, glViewport/glDepthFunc/glDepthMask/
+  glBlendFunc/glPixelStorei/glPolygonMode, glGetError/glGetString("1.1")/
+  glGetIntegerv/glGetFloatv), vertex arrays (glEnable/DisableClientState,
+  glVertexPointer/glColorPointer/glTexCoordPointer/glNormalPointer with
+  GL_FLOAT/GL_DOUBLE/GL_SHORT components, glDrawArrays/glDrawElements with
+  GL_UNSIGNED_BYTE/SHORT/INT indices — guest pointers read via
+  soft-translate, current values fill gaps), GL 1.5 buffer objects
+  (glGenBuffers/glDeleteBuffers/glIsBuffer/glBindBuffer for ARRAY_/
+  ELEMENT_ARRAY_BUFFER, glBufferData/glBufferSubData — pointer args become
+  VBO offsets when a buffer is bound), display lists (glGenLists/glIsList/
+  glDeleteLists/glNewList GL_COMPILE|GL_COMPILE_AND_EXECUTE/glEndList/
+  glCallList/glCallLists — the compiled command set is recorded and replayed
+  through the same pipeline; nested calls bounded at depth 64), and
+  fixed-function Gouraud lighting (glLightfv GL_AMBIENT/DIFFUSE/SPECULAR/
+  POSITION/attenuation, glLightModelfv ambient + two-side accepted-ignored,
+  glMaterialfv ambient/diffuse/specular/emission + glMaterialf shininess,
+  glNormal3f/glNormalPointer, glShadeModel GL_SMOOTH|GL_FLAT — per-vertex
+  N·L + N·H^shininess with the modelview inverse-transpose normal transform;
+  see the documented approximations below). `wglGetProcAddress` returns a
+  callable fake VA for every dispatch export (the preplanted soft table), so
+  GL 1.5+ entry points resolve like real ICD functions. `wglSwapBuffers`
+  publishes the rendered backbuffer through the present path (the same
+  surface GDI/D3D9 use). The pipeline lives in the `opengl32_render/`
+  submodule (arrays.rs / fragment.rs / light.rs / lists.rs / matrix.rs /
+  sample.rs); the rasterizer reuses the D3D9 transform math
+  (`d3d9_render` vertex helpers) with GL's own z convention (NDC z ∈ [-1, 1]
+  mapped to the [0, 1] depth range).
+  Documented deviations: GL_LIGHT_MODEL_TWO_SIDE accepted-and-ignored (back
+  faces use the front material); the specular formula is best-effort (the
+  standard N·H^shininess with the half-angle vector — no per-pixel terms);
+  lighting positions are transformed by the modelview at glLightfv time per
+  spec; list capture records commands that later error (the error flag is
+  still raised); glCallList replays array draws against the array state
+  current at CALL time while glDrawElements index pointers are captured at
+  record time. **GLSL shaders landed (2026-08)**: a hand-written GLSL ES 1.00
+  lexer/parser/interpreter drives `glCreateShader`/`glShaderSource`/
+  `glCompileShader`/`glCreateProgram`/`glAttachShader`/`glLinkProgram`/
+  `glUseProgram` (float/int/bool/vec2-4/mat2-4/sampler2D; attribute/varying/
+  uniform; constructors incl. mixed arity; operators incl. swizzle + ternary;
+  if/else/return/constant-bound for; user functions; built-ins gl_Position/
+  gl_FragColor/gl_FragCoord/texture2D/gl_Vertex/gl_Color/gl_Normal/
+  gl_MultiTexCoord0/gl_ModelViewProjectionMatrix), with varying interpolation
+  per-pixel and uniform plumbing (glGetUniformLocation/glUniform*/glUniformMatrix4fv).
+  Documented subset limits: dynamic loop bounds → link error, custom attribute
+  names → link error, per-pixel FS execution is slow (tree-walker). Still
+  stubbed (accepted no-ops, documented): stencil
+  (glClearStencil), framebuffer objects, multisample, glColorMaterial,
+  `wglShareLists` texture sharing, mipmaps (filter names accepted, base
+  filter used). Unknown exports are still NOT silently succeeded. ~130
+  exports via one OPENGL32_DISPATCH table; `gl_quad` micro renders a red
+  quad, a checkerboard texture, a client-array triangle, a VBO triangle
+  (with glBindBuffer resolved via wglGetProcAddress), a lit quad, and a
+  display list drawn twice, self-verifying every frame with glReadPixels
+  (exit 0 only when all pixel assertions hold).
 
 **Recently landed (Tier-1 universal-DLL wave, release 0.2):**
 
@@ -166,18 +263,28 @@ conversion family in `dispatch_oleaut32` (`oleaut32.rs`): `VarAdd/Sub/Mul/Div/Mo
 
 ---
 
-## OLE32.dll — COM stubs only
+## OLE32.dll — COM + OLE clipboard (Tier-2/3 landed)
 
-**Implemented:** CoInitialize, CoInitializeEx, CoUninitialize (all return S_OK),
-CoCreateInstance (returns `REGDB_E_CLASSNOTREG` — no COM servers registered)
+**Implemented:** CoInitialize, CoInitializeEx, CoUninitialize (S_OK); CoCreateInstance
+(class table via CoRegisterClassObject/CoRevokeClassObject — Tier 2, returns
+`REGDB_E_CLASSNOTREG` for unknown CLSIDs); CoGetClassObject; CoCreateGuid
+(/dev/urandom); CoTaskMemAlloc/Free/Realloc (guest heap); StringFromCLSID/
+CLSIDFromString.
+
+**OLE clipboard / drag-drop (Tier 3, landed):** OleInitialize/OleUninitialize
+(per-process flag), OleSetClipboard/OleGetClipboard/OleFlushClipboard with a
+host-synthesized IDataObject vtable (GetData/SetData real over the guest
+ClipboardStore; QueryInterface returns self; AddRef/Release → 1; rest E_NOTIMPL),
+RegisterDragDrop/RevokeDragDrop (per-hwnd table), DoDragDrop (honest stub:
+DRAGDROP_S_CANCEL + DROPEFFECT_NONE). Classic clipboard family landed alongside:
+RegisterClipboardFormatW/A (0xC000+ registry), Open/Close/EmptyClipboard,
+SetClipboardData/GetClipboardData (HGLOBAL ↔ ClipboardStore), EnumClipboardFormats,
+IsClipboardFormatAvailable. `ole_clip` micro round-trips text through
+OleGetClipboard→IDataObject. Guest-side only — macOS NSPasteboard bridging is a
+documented future lane.
 
 **Missing (would bail):**
-- `CoGetClassObject`
-- `CoRegisterClassObject`, `CoRevokeClassObject`
-- `CoCreateGuid`
-- `CoTaskMemAlloc`, `CoTaskMemFree`, `CoTaskMemRealloc`
-- `StringFromGUID2`, `StringFromCLSID`, `CLSIDFromString`, `CLSIDFromProgID`
-- `OleInitialize`, `OleUninitialize`
+- `StringFromGUID2`, `CLSIDFromProgID`
 - `GetRunningObjectTable`, `CreateBindCtx`, `MkParseDisplayName`
 - All DCOM / marshaling / apartment APIs
 
@@ -258,7 +365,19 @@ region-limited present; 51 `IDirect3DDevice9` methods + the `IDirect3D9` core
 **Stubs (accept input, return success, do nothing):**
 - `StretchBlt` — returns 1, no scaling
 - `GetPixel` — returns `FAKE_PIXEL_COLOR` (0)
-- `EnumFontFamiliesExW/A`, `SetPixel` — TRUE no-ops (Tier 2)
+- `SetPixel` — TRUE no-op (Tier 2)
+
+**Font enumeration (landed, Tier 3):**
+- `EnumFontFamiliesExW/A`, `EnumFontFamiliesW/A`, `EnumFontsW/A` — REAL enumeration
+  over the host fontdb database (gdi32/enumerate.rs). Each family is written as
+  ENUMLOGFONTEXW + TEXTMETRIC and delivered through the full-iteration guest-callback
+  bridge (new `EnumerationCallbackRequested` signal; EnumWindows one-shot behavior
+  preserved). `font_enum` micro counts 395 families.
+- `GetGlyphOutlineW/A` — GGO_BITMAP (real monochrome rasterization + GLYPHMETRICS);
+  GGO_NATIVE returns GDI_ERROR with a documented TODO.
+- `AddFontResourceW/A` / `RemoveFontResourceW/A` — bottle-resolved fontdb
+  load/unload (added fonts are enumerated from a separate database; documented
+  limitation).
 
 **Missing entirely:**
 - `SetDIBitsToDevice`, `StretchDIBits`
@@ -391,7 +510,16 @@ in `dispatch_advapi32_extra`; see "Recently landed"):**
 `DebugBreak`/`IsDebuggerPresent`/`OutputDebugStringA/W`, `QueryFullProcessImageNameA/W`,
 `GetProcessTimes`, `TerminateProcess`/`TerminateThread`, `SuspendThread`/`ResumeThread`,
 `SignalObjectAndWait`, `SetThreadAffinityMask`, `CreateSemaphoreA/W`+`ReleaseSemaphore`
-(see also `kernel32/misc/identity.rs`, `process_thread.rs`, `memory.rs`, `file_io/vol.rs`).
+(see also `kernel32/misc/identity.rs`, `process_thread.rs`, `memory.rs`, `file_io/vol.rs`),
+`FindFirstChangeNotificationW/A`, `FindNextChangeNotification`,
+`FindCloseChangeNotification`, `ReadDirectoryChangesW` (synchronous form; backed by the
+`notify` crate on kqueue — `DirectoryWatchObject` in sync_obj.rs, `CreateFileW(FILE_LIST_DIRECTORY)`
+opens a directory as a watch anchor; overlapped/async → FALSE + ERROR_INVALID_PARAMETER),
+`CreateProcessW/A` (in-process child `RuntimeSession` on a detached host thread —
+`WinApiControlSignal::ChildProcessSpawnRequested`, `KernelObject::Process` in the parent
+table, exit code delivered by the wrapper thread via `ProcessObject::finish`),
+`GetExitCodeProcess` (STILL_ACTIVE until the child finishes), `OpenProcess`
+(pid → handle map; self-pid pseudohandle). `spawn_child` micro verifies a child exits 42.
 
 **Missing / stub:**
 - `DeviceIoControl` — returns FALSE, `ERROR_INVALID_FUNCTION` (comment: "unsupported")
@@ -501,13 +629,15 @@ Beyond the implemented set above (`TextOutA/W`, `ExtTextOutW`, `DrawTextA/W`,
 `GetTextMetricsA/W`, `SetBkColor`/`SetBkMode`/`SetTextColor`, print path, `BitBlt`,
 `PatBlt`, `FillRect`, object/state management):
 - `GetDeviceCaps` — partial (only some indexes)
-- `GetGlyphOutlineA/W` — no real font outline
+- `GetGlyphOutlineA/W` — GGO_BITMAP real (GGO_NATIVE TODO)
 - `GetCharABCWidthsA/W`, `GetCharWidthA/W`, `GetCharWidth32A/W`
 - `GetOutlineTextMetricsA/W`
 - `GetKerningPairsA/W`
 - `CreateScalableFontResourceA/W`
-- `AddFontResourceA/W`, `AddFontMemResourceEx`, `RemoveFontResourceA/W`
-- `EnumFontsA/W`, `EnumFontFamiliesA/W`, `EnumFontFamiliesExA/W`
+- `AddFontResourceA/W`, `AddFontMemResourceEx`, `RemoveFontResourceA/W` — the A/W
+  file forms landed (fontdb load/unload); `AddFontMemResourceEx` missing
+- `EnumFontsA/W`, `EnumFontFamiliesA/W`, `EnumFontFamiliesExA/W` — landed (real
+  fontdb enumeration, see above)
 - `GetFontLanguageInfo`, `GetFontUnicodeRanges`
 - `GetGlyphIndicesA/W`
 - `GetRasterizerCaps`

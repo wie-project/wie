@@ -11,8 +11,8 @@ Dispatch-table export counts per DLL:
 
 | DLL | Exports in dispatch | Notes |
 | --- | ---: | --- |
-| user32 | 188 | ~80% covered, many stubs |
-| kernel32 | 139 | ~90% covered |
+| user32 | 188 | ~80% claimed (soft estimate; many stubs) |
+| kernel32 | 139 | ~90% claimed, but ~35 constant-return stubs lack unit tests |
 | d3d9 | 81 | software renderer, 51/119 device methods |
 | gdi32 | 37 | real text/print/blit; specialty missing |
 | version | 18 | done (RNotepad dependency) |
@@ -23,9 +23,12 @@ Dispatch-table export counts per DLL:
 | winmm | 1 | timeGetTime only |
 | uxtheme | 1 | SetWindowTheme no-op |
 
-Zero-coverage DLLs (any call bails): `MSIMG32`, `IMM32`, `WS2_32`, `WININET`,
-`URLMON`, `CRYPT32`, `IMAGEHLP`, `DBGHELP`, `SETUPAPI`, `CFGMGR32`,
-`MSVCR71`, `MSVCP71`.
+Zero-coverage DLLs (any call bails): none — the Tier-3 wave (2026-08) landed
+`WININET`, `URLMON`, `ntdll` (Nt*/Rtl*), `opengl32` (WGL stub layer), the
+`MSVCR100/110/120/140` + `MSVCP100/110/120/140` forwarders, the `_s` secure-CRT
+family, `ReadDirectoryChangesW`/`FindFirstChangeNotification`, the OLE
+clipboard/DnD surface, and font enumeration (EnumFontFamiliesEx, GetGlyphOutline
+GGO_BITMAP, AddFontResource).
 
 API sets (`api-ms-win-*`) and `ntdll` already resolve into the kernel32/ucrt
 tables — the api-set forwarding is in place.
@@ -80,7 +83,21 @@ MSVCR71/MSVCP71 forwarding. Zero-coverage table now holds only WININET/URLMON.
   `api-ms-win-*` import resolves.
 - Legacy CRT forwarders (MSVCR100/120/140 into ucrt) so pre-UCRT binaries link.
 
-**Milestone M3**: Tier 3 complete.
+**Milestone M3**: ✅ LANDED (2026-08) — `ntdll.dll` dispatches 27 Nt*/Rtl*
+exports (NtClose, NtQueryInformationProcess, NtQuerySystemInformation,
+NtDelayExecution, NtQueryPerformanceCounter, Nt*VirtualMemory forwards,
+RtlCloseHandle, RtlAllocateHeap/Free/ReAllocate, RtlMoveMemory/ZeroMemory/
+CompareMemory, RtlInitUnicodeString, Rtl*CriticalSection forwards,
+RtlCaptureContext/RtlUnwindEx); `tests/api_sets.rs` asserts every
+`api-ms-win-crt-*` family classifies and the ntdll census stays honest
+(`api-ms-win-core-*` non-CRT sets are a documented gap); MSVCR100/110/120/140 +
+MSVCP100/110/120/140 forward into `dispatch_ucrt` (added to `is_ucrt_library`)
+with the secure-CRT `_s` family (memcpy_s/strcpy_s/qsort_s/sprintf_s/
+fopen_s + 19 arms, 13 unit tests). Bonus Tier-3-adjacent: WININET/URLMON
+(host HTTP + URLDownloadToFile), opengl32 WGL/gl* stub layer, OLE clipboard/DnD
+surface, ReadDirectoryChangesW/FindFirstChangeNotification (notify/kqueue), font
+enumeration (EnumFontFamiliesExW/A real, GetGlyphOutline GGO_BITMAP,
+AddFontResource).
 
 ## Cross-cutting
 
