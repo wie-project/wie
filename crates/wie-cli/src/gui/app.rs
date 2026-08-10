@@ -13,6 +13,7 @@ use wie_runtime::MenuNode;
 use wie_runtime::RuntimeSession;
 use wie_runtime::{GuiControl, run_windowed};
 use wie_winapi::handles::Hwnd;
+use wie_winapi::user32::Dimension;
 
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
@@ -439,7 +440,7 @@ struct WindowRuntime {
     /// recreation at the same size — and the guest thread being busy with
     /// that recreation delays close/quit handling).  Guest sizes are
     /// LOGICAL 96-DPI pixels.
-    last_sent_size: Option<(u32, u32)>,
+    last_sent_size: Option<Dimension>,
     /// The window's device scale factor (physical pixels per logical
     /// 96-DPI pixel), read at creation and refreshed on
     /// `ScaleFactorChanged`.  The guest space is logical; every winit
@@ -552,17 +553,6 @@ fn window_attributes(title: &str, width: u32, height: u32) -> winit::window::Win
         .with_inner_size(LogicalSize::new(width, height))
 }
 
-/// The guest-LOGICAL size a physical winit `inner_size` corresponds to at
-/// `scale_factor`: physical ÷ sf with the crate's standard rounding (see
-/// [`input::physical_to_logical`]). This is the size posted as WM_SIZE and
-/// written to the guest-visible window record.
-fn guest_size_from_physical(width: u32, height: u32, scale_factor: f64) -> (u32, u32) {
-    (
-        input::physical_to_logical(f64::from(width), scale_factor) as u32,
-        input::physical_to_logical(f64::from(height), scale_factor) as u32,
-    )
-}
-
 /// winit application state: bridges the guest windows to the present backend.
 struct WieApp {
     handle: Option<GuestHandle>,
@@ -655,14 +645,14 @@ impl ApplicationHandler<WieEvent> for WieApp {
                 continue;
             };
             // The guest DIB is LOGICAL 96-DPI: post the PHYSICAL inner
-            // size divided by the device scale factor.
-            let (lw, lh) = guest_size_from_physical(w, h, rt.scale_factor);
+            // size divided by the device scale factor (one conversion point).
+            let size = input::physical_size_to_dimension(w, h, rt.scale_factor);
             tracing::debug!(
                 "settle: pending={}x{} guest={}x{} last_sent={:?}",
                 w,
                 h,
-                lw,
-                lh,
+                size.width,
+                size.height,
                 rt.last_sent_size
             );
             // Skip if the size hasn't changed since the last posted
@@ -670,19 +660,19 @@ impl ApplicationHandler<WieEvent> for WieApp {
             // drag, and re-posting the same size would re-trigger the
             // guest's expensive DIB recreation (which also delays
             // close/quit handling).
-            if rt.last_sent_size != Some((lw, lh)) {
+            if rt.last_sent_size != Some(size) {
                 let hwnd = rt.hwnd;
                 if let Some(handle) = self.handle.as_ref() {
                     // Update the guest-visible record now — together with
                     // the WM_SIZE post — so GetClientRect matches the size
                     // the guest is about to recreate its DIB at.
-                    handle.resize_window(hwnd.as_u64(), lw, lh);
-                    let lparam = input::make_lparam(lw as u16, lh as u16);
+                    handle.resize_window(hwnd, size);
+                    let lparam = input::size_to_wm_size_lparam(size);
                     handle.post_message(hwnd.as_u64(), input::WM_SIZE, 0, lparam);
                     handle.post_message(hwnd.as_u64(), input::WM_PAINT, 0, 0);
-                    tracing::debug!("resize settled: WM_SIZE {}x{}", lw, lh);
+                    tracing::debug!("resize settled: WM_SIZE {}x{}", size.width, size.height);
                 }
-                rt.last_sent_size = Some((lw, lh));
+                rt.last_sent_size = Some(size);
             }
         }
         if any_settled {
@@ -1014,6 +1004,22 @@ pub fn run_gui_windowed(
                                 // before the chain.
                                 let Some(parent) = resolve_dialog_parent(&handle, &window_slots)
                                 else {
+                                    // rfd's unparented path invokes the legacy
+                                    // CFUserNotificationDisplayAlert API, which prints
+                                    // "will block waiting for a response" to stderr.
+                                    // Take that path ONLY under tracing::debug (the
+                                    // line is then a diagnostic); normal runs use the
+                                    // silent bare NSAlert.
+                                    if tracing::enabled!(target: "wiegui", tracing::Level::DEBUG) {
+                                        let (buttons, level) = map_message_box_buttons(mb_type);
+                                        let result = rfd::MessageDialog::new()
+                                            .set_title(caption.to_owned())
+                                            .set_description(text.to_owned())
+                                            .set_level(level)
+                                            .set_buttons(buttons)
+                                            .show();
+                                        return map_alert_result(result);
+                                    }
                                     return show_unparented_ns_alert(caption, text, mb_type);
                                 };
                                 let (buttons, level) = map_message_box_buttons(mb_type);
@@ -1086,9 +1092,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        OCCLUDED_RETRY_MAX, OCCLUDED_RETRY_MS, PARKED_RETRY_MS, guest_size_from_physical,
-        map_alert_result, map_message_box_buttons, resolve_gui_run_source, retry_delay,
-        wheel_notches, window_attributes,
+        OCCLUDED_RETRY_MAX, OCCLUDED_RETRY_MS, PARKED_RETRY_MS, map_alert_result,
+        map_message_box_buttons, resolve_gui_run_source, retry_delay, wheel_notches,
+        window_attributes,
     };
 
     /// A physical wheel notch (LineDelta ±1 → ±120) emits exactly one notch
@@ -1243,13 +1249,27 @@ mod tests {
     /// ÷ sf with the crate's rounding.
     #[test]
     fn settle_posts_logical_size() {
+        use crate::gui::input::physical_size_to_dimension;
+        use wie_winapi::user32::Dimension;
         // Retina 2×: a 1280×960 physical window is a 640×480 logical window.
-        assert_eq!(guest_size_from_physical(1280, 960, 2.0), (640, 480));
+        assert_eq!(
+            physical_size_to_dimension(1280, 960, 2.0),
+            Dimension::new(640, 480)
+        );
         // Non-integer division rounds half away from zero (320.5 → 321).
-        assert_eq!(guest_size_from_physical(641, 481, 2.0), (321, 241));
+        assert_eq!(
+            physical_size_to_dimension(641, 481, 2.0),
+            Dimension::new(321, 241)
+        );
         // Scale factor 1.0 reproduces today's physical-as-logical posting.
-        assert_eq!(guest_size_from_physical(640, 480, 1.0), (640, 480));
-        assert_eq!(guest_size_from_physical(886, 776, 1.0), (886, 776));
+        assert_eq!(
+            physical_size_to_dimension(640, 480, 1.0),
+            Dimension::new(640, 480)
+        );
+        assert_eq!(
+            physical_size_to_dimension(886, 776, 1.0),
+            Dimension::new(886, 776)
+        );
     }
 
     /// The retry policy for a `NotDrawn` present: the first skip of a frame

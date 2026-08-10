@@ -12,6 +12,7 @@
 // core dispatches on.
 // ---------------------------------------------------------------------------
 
+use wie_winapi::user32::Dimension;
 use wie_winapi::user32::wm::WinMsg;
 
 pub(crate) const WM_KEYDOWN: u32 = WinMsg::WM_KEYDOWN.as_u32();
@@ -108,6 +109,35 @@ pub(crate) fn physical_to_logical(physical: f64, scale_factor: f64) -> f64 {
 #[must_use]
 pub(crate) fn logical_to_physical(logical: f64, scale_factor: f64) -> f64 {
     (logical * scale_factor).round()
+}
+
+/// Convert a winit PHYSICAL window extent to the guest LOGICAL (96-DPI)
+/// [`Dimension`] — the size the window record and WM_SIZE carry. One
+/// conversion point for the resize path; callers never re-derive the pair.
+#[must_use]
+pub(crate) fn physical_size_to_dimension(width: u32, height: u32, scale_factor: f64) -> Dimension {
+    Dimension::new(
+        logical_pixel(width, scale_factor),
+        logical_pixel(height, scale_factor),
+    )
+}
+
+/// One logical pixel: `physical ÷ scale_factor`, rounded, in the i32 domain
+/// the window record stores (`physical_to_logical` is already integral after
+/// `.round()`, so the `as u32` cast is exact — the same style the rest of
+/// this module's scale conversions use).
+#[must_use]
+fn logical_pixel(physical: u32, scale_factor: f64) -> i32 {
+    i32::try_from(physical_to_logical(f64::from(physical), scale_factor) as u32).unwrap_or(0)
+}
+
+/// Pack a guest [`Dimension`] into a `WM_SIZE` LPARAM (`MAKELPARAM(w, h)`).
+#[must_use]
+pub(crate) fn size_to_wm_size_lparam(size: Dimension) -> u64 {
+    make_lparam(
+        u16::try_from(size.width.max(0)).unwrap_or(0),
+        u16::try_from(size.height.max(0)).unwrap_or(0),
+    )
 }
 
 /// Convert a PHYSICAL pixel DELTA (a scroll delta, a drag distance) to

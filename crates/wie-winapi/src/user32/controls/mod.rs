@@ -49,12 +49,21 @@ pub(super) struct PaintFont<'a> {
     pub key: &'a FontKey,
 }
 
-/// A control's client extent — the width/height pair every paint path
-/// resolves from the window record (bundle for the paint signatures).
+/// A client extent — the width/height pair every paint path resolves from
+/// the window record (bundle for the paint signatures; also the size handed
+/// to the GL default framebuffer on WM_SIZE).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Dimension {
+pub struct Dimension {
     pub width: i32,
     pub height: i32,
+}
+
+impl Dimension {
+    /// Bundle a width/height pair.
+    #[must_use]
+    pub const fn new(width: i32, height: i32) -> Self {
+        Self { width, height }
+    }
 }
 
 /// The text-layout geometry a paint call draws into.

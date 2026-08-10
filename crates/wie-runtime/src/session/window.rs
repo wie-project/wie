@@ -2,8 +2,8 @@
 
 use super::menu::{MenuNode, MenuTreeCache, build_menu_tree};
 use std::sync::Arc;
-use wie_winapi::WindowFlags;
-use wie_winapi::handles::Hmenu;
+use wie_winapi::user32::Dimension;
+use wie_winapi::{WindowFlags, handles::Hmenu, handles::Hwnd};
 
 /// Host-side handle to the WinAPI state for cross-thread access.
 ///
@@ -599,15 +599,14 @@ impl GuestHandle {
     /// mid-API-call: if the record can't be locked right now, the settled
     /// `WM_SIZE` carries the final size anyway (and the guest's own
     /// `recreate_dib` reads `lParam`, not the record).
-    pub fn resize_window(&self, hwnd: u64, width: u32, height: u32) {
+    pub fn resize_window(&self, hwnd: Hwnd, size: Dimension) {
         let Ok(mut state) = self.state.try_lock() else {
             return;
         };
         let ws = state.window_state();
-        let hwnd = wie_winapi::handles::Hwnd::from(hwnd);
         if let Some(window) = ws.windows.iter_mut().find(|w| w.handle == hwnd) {
-            window.width = i32::try_from(width).unwrap_or(0);
-            window.height = i32::try_from(height).unwrap_or(0);
+            window.width = size.width;
+            window.height = size.height;
             window.client_rect = (0, 0, window.width, window.height);
             // The guest DIB is reallocated ZEROED on resize, so the resized
             // window itself must enter the erase/paint cycle: the class-brush
@@ -670,6 +669,8 @@ mod tests {
     use crate::memory::DEFAULT_LAYOUT;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex, RwLock};
+    use wie_winapi::handles::Hwnd;
+    use wie_winapi::user32::Dimension;
     use wie_winapi::user32::menu::{MenuEntry, MenuRecord};
     use wie_winapi::vfs::VolumeConfig;
 
@@ -1271,7 +1272,7 @@ mod tests {
             menu_tree_cache: Arc::new(RwLock::new(None)),
         };
 
-        handle.resize_window(top, 800, 600);
+        handle.resize_window(Hwnd::from(top), Dimension::new(800, 600));
 
         let mut state = handle.state.lock().expect("lock state");
         let ws = state.window_state();
