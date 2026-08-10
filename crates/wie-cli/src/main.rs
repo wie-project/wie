@@ -19,6 +19,7 @@ const TRACE_MAX_API_DEFAULT: usize = 20;
 
 #[derive(Debug, Parser)]
 #[command(name = "wie")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "WIE — PE64 userspace emulator")]
 #[command(long_about = "\
 Generic PE64 userspace emulator CLI.\n\
