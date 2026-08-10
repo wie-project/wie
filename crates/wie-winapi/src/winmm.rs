@@ -44,6 +44,18 @@ struct WinmmTimerRecord {
     user_data: u64,
 }
 
+#[cfg(test)]
+impl WinmmState {
+    /// Test-only projection of the live timer table: `(handle, delay_ms,
+    /// callback_va, user_data)` per registration.
+    pub(crate) fn timer_records(&self) -> Vec<(u64, u32, u64, u64)> {
+        self.timers
+            .iter()
+            .map(|t| (t.handle, t.delay_ms, t.callback_va, t.user_data))
+            .collect()
+    }
+}
+
 /// Dispatch a `WINMM.dll` export by name (case-insensitive) — the string
 /// path for APIs beyond the dense `timeGetTime` row.
 pub fn dispatch_winmm_extra(

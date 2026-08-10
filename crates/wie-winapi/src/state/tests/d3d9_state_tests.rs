@@ -721,3 +721,309 @@ fn test_d3d9_stage_state_typed_round_trip() {
         crate::d3d9_render::D3DTADDRESS_CLAMP
     );
 }
+
+// ── Stream / index binding ──────────────────────────────────────────
+
+/// SetStreamSource(NULL) + GetStreamSource returns NULL / zero stride.
+#[test]
+fn test_d3d9_set_get_stream_source_null() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+
+    write_regs(&mut engine, 1, 0, 0, 0, 0); // stream=0, data=NULL, offset=0, stride=0
+    engine
+        .mem_write(STACK_TOP + 0x28, &0_u32.to_le_bytes())
+        .expect("write stride 0");
+    assert_return_value!(
+        d3d9::handle_set_stream_source(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+
+    let pp_data = 0x7400_u64;
+    let p_offset = 0x7408_u64;
+    let p_stride = 0x7410_u64;
+    write_regs(&mut engine, 1, 0, pp_data, p_offset, 0);
+    engine.mem_write(p_stride, &0_u32.to_le_bytes()).ok();
+    assert_return_value!(
+        d3d9::handle_get_stream_source(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut out = [0_u8; 8];
+    engine.mem_read(pp_data, &mut out).expect("read buffer");
+    assert_eq!(u64::from_le_bytes(out), 0, "stream 0 NULL → buffer VA 0");
+    let mut off = [0_u8; 4];
+    engine.mem_read(p_offset, &mut off).expect("read offset");
+    assert_eq!(u32::from_le_bytes(off), 0, "stream 0 NULL → offset 0");
+    let mut strd = [0_u8; 4];
+    engine.mem_read(p_stride, &mut strd).expect("read stride");
+    assert_eq!(u32::from_le_bytes(strd), 0, "stream 0 NULL → stride 0");
+}
+
+/// SetIndices(NULL) + GetIndices returns NULL.
+#[test]
+fn test_d3d9_set_get_indices_null() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+
+    write_regs(&mut engine, 1, 0, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_set_indices(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+
+    let pp_index = 0x7400_u64;
+    write_regs(&mut engine, 1, pp_index, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_get_indices(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut out = [0_u8; 8];
+    engine
+        .mem_read(pp_index, &mut out)
+        .expect("read index buffer");
+    assert_eq!(
+        u64::from_le_bytes(out),
+        0,
+        "SetIndices(NULL) → GetIndices returns NULL"
+    );
+}
+
+// ── Shader slot binding ─────────────────────────────────────────────
+
+/// SetVertexShader(NULL) + GetVertexShader returns NULL.
+#[test]
+fn test_d3d9_set_get_vertex_shader_slot_null() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+
+    write_regs(&mut engine, 1, 0, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_set_vertex_shader(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+
+    let pp_shader = 0x7400_u64;
+    write_regs(&mut engine, 1, pp_shader, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_get_vertex_shader(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut out = [0_u8; 8];
+    engine.mem_read(pp_shader, &mut out).expect("read shader");
+    assert_eq!(
+        u64::from_le_bytes(out),
+        0,
+        "SetVertexShader(NULL) → GetVertexShader returns NULL"
+    );
+}
+
+/// SetPixelShader(NULL) + GetPixelShader returns NULL.
+#[test]
+fn test_d3d9_set_get_pixel_shader_slot_null() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+
+    write_regs(&mut engine, 1, 0, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_set_pixel_shader(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+
+    let pp_shader = 0x7400_u64;
+    write_regs(&mut engine, 1, pp_shader, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_get_pixel_shader(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut out = [0_u8; 8];
+    engine.mem_read(pp_shader, &mut out).expect("read shader");
+    assert_eq!(
+        u64::from_le_bytes(out),
+        0,
+        "SetPixelShader(NULL) → GetPixelShader returns NULL"
+    );
+}
+
+// ── Shader float constants ──────────────────────────────────────────
+
+/// SetPixelShaderConstantF + GetPixelShaderConstantF round-trip: one float4 slot.
+#[test]
+fn test_d3d9_set_get_pixel_shader_constant_f_round_trip() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+
+    // Write {1.0, 2.0, 3.0, 4.0} at register 5 via SetPixelShaderConstantF.
+    let data_va = 0x6000_u64;
+    let values: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    for (i, v) in values.iter().enumerate() {
+        engine
+            .mem_write(
+                data_va + u64::try_from(i).unwrap_or(0) * 4,
+                &v.to_le_bytes(),
+            )
+            .expect("write constant");
+    }
+    write_regs(&mut engine, 1, 5, data_va, 1, 0); // start=5, count=1
+    assert_return_value!(
+        d3d9::handle_set_pixel_shader_constant_f(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+
+    // Read it back via GetPixelShaderConstantF.
+    let out_va = 0x7400_u64;
+    write_regs(&mut engine, 1, 5, out_va, 1, 0);
+    assert_return_value!(
+        d3d9::handle_get_pixel_shader_constant_f(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+
+    let mut out = [0_u8; 16];
+    engine
+        .mem_read(out_va, &mut out)
+        .expect("read constants back");
+    let retrieved: [f32; 4] = [
+        f32::from_le_bytes(out[0..4].try_into().unwrap_or([0; 4])),
+        f32::from_le_bytes(out[4..8].try_into().unwrap_or([0; 4])),
+        f32::from_le_bytes(out[8..12].try_into().unwrap_or([0; 4])),
+        f32::from_le_bytes(out[12..16].try_into().unwrap_or([0; 4])),
+    ];
+    assert_eq!(
+        retrieved, values,
+        "GetPixelShaderConstantF must return what SetPixelShaderConstantF wrote"
+    );
+}
+
+/// SetVertexShaderConstantF + GetVertexShaderConstantF round-trip: two float4 slots.
+#[test]
+fn test_d3d9_set_get_vertex_shader_constant_f_round_trip() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+
+    // Write two float4s starting at register 10.
+    let data_va = 0x6000_u64;
+    let values: [[f32; 4]; 2] = [[1.0, 2.0, 3.0, 4.0], [-1.0, 0.5, 0.0, 1.0]];
+    for (reg, vec) in values.iter().enumerate() {
+        for (i, v) in vec.iter().enumerate() {
+            engine
+                .mem_write(
+                    data_va
+                        + u64::try_from(reg).unwrap_or(0) * 16
+                        + u64::try_from(i).unwrap_or(0) * 4,
+                    &v.to_le_bytes(),
+                )
+                .expect("write constant");
+        }
+    }
+    write_regs(&mut engine, 1, 10, data_va, 2, 0); // start=10, count=2
+    assert_return_value!(
+        d3d9::handle_set_vertex_shader_constant_f(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+
+    // Read back the second slot via GetVertexShaderConstantF.
+    let out_va = 0x7400_u64;
+    write_regs(&mut engine, 1, 11, out_va, 1, 0); // start=11, count=1
+    assert_return_value!(
+        d3d9::handle_get_vertex_shader_constant_f(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+
+    let mut out = [0_u8; 16];
+    engine
+        .mem_read(out_va, &mut out)
+        .expect("read constants back");
+    let retrieved: [f32; 4] = [
+        f32::from_le_bytes(out[0..4].try_into().unwrap_or([0; 4])),
+        f32::from_le_bytes(out[4..8].try_into().unwrap_or([0; 4])),
+        f32::from_le_bytes(out[8..12].try_into().unwrap_or([0; 4])),
+        f32::from_le_bytes(out[12..16].try_into().unwrap_or([0; 4])),
+    ];
+    assert_eq!(
+        retrieved, values[1],
+        "GetVertexShaderConstantF(slot 11) must return the written value"
+    );
+}
+
+// ── Shader release ──────────────────────────────────────────────────
+
+/// Release of an unknown pixel-shader pointer returns 0 (not in the map).
+#[test]
+fn test_d3d9_pixel_shader_release_unknown_returns_zero() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+
+    write_regs(&mut engine, 0xDEAD_BEEF, 0, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_pixel_shader_release(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+}
+
+/// Release of an unknown vertex-shader pointer returns 0 (not in the map).
+#[test]
+fn test_d3d9_vertex_shader_release_unknown_returns_zero() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+
+    write_regs(&mut engine, 0xDEAD_BEEF, 0, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_vertex_shader_release(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+}

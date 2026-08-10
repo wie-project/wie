@@ -882,3 +882,274 @@ fn test_d3d9_render_target_lock_unlock_round_trip() {
     );
     assert!(!state.d3d9().d3d9_render_targets.contains_key(&rt_va));
 }
+
+/// D3DFVF_XYZ | D3DFVF_DIFFUSE — position (12 bytes) + diffuse (4 bytes) = stride 16.
+const FVF_XYZ_DIFFUSE: u32 = 0x0002 | 0x0040;
+/// D3DPT_TRIANGLELIST.
+const D3DPT_TRIANGLELIST: u32 = 4;
+
+/// DrawPrimitive (buffer form) with a bound vertex buffer — triangle in bottom-left half.
+#[test]
+fn test_d3d9_draw_primitive_triangle() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // Seed the guest heap bump cursor before any Create* allocation.
+    engine
+        .mem_write(0x2000, &0x2000_u64.to_le_bytes())
+        .expect("seed bump cursor");
+
+    // ── Minimal device state: backbuffer, viewport, scene ───────────────
+    {
+        let d3d = state.d3d9();
+        d3d.d3d9_backbuffer_width = 16;
+        d3d.d3d9_backbuffer_height = 16;
+        d3d.d3d9_backbuffer = vec![0_u32; 16 * 16];
+        d3d.d3d9_viewport = (0, 0, 16, 16, 0.0, 1.0);
+    }
+
+    write_regs(&mut engine, 1, u64::from(FVF_XYZ_DIFFUSE), 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_set_fvf(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+
+    write_regs(&mut engine, 1, 0, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_begin_scene(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+
+    // Clear to red.
+    write_regs(&mut engine, 1, 0, 0, u64::from(D3DCLEAR_TARGET), 0);
+    engine
+        .mem_write(STACK_TOP + 0x28, &0xFF_C8_00_00_u32.to_le_bytes())
+        .expect("write clear color");
+    assert_return_value!(
+        d3d9::handle_clear(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+
+    // ── CreateVertexBuffer — 3 vertices × stride 16 ───────────────────
+    let pp_buffer = 0x7000_u64;
+    write_regs(&mut engine, 1, 3 * 16, 0, u64::from(FVF_XYZ_DIFFUSE), 0);
+    engine
+        .mem_write(STACK_TOP + 0x28, &1_u32.to_le_bytes()) // D3DPOOL_MANAGED
+        .expect("write pool");
+    engine
+        .mem_write(STACK_TOP + 0x30, &pp_buffer.to_le_bytes())
+        .expect("write ppBuffer");
+    assert_return_value!(
+        d3d9::handle_create_vertex_buffer(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut buf_bytes = [0_u8; 8];
+    engine
+        .mem_read(pp_buffer, &mut buf_bytes)
+        .expect("read buffer ptr");
+    let vb_va = u64::from_le_bytes(buf_bytes);
+    assert_ne!(vb_va, 0, "CreateVertexBuffer must return an object");
+
+    // Lock entire buffer and fill three XYZRHW + diffuse vertices.
+    let pp_data = 0x7100_u64;
+    write_regs(&mut engine, vb_va, 0, 0, pp_data, 0);
+    assert_return_value!(
+        d3d9::handle_vertex_buffer_lock(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut data_bytes = [0_u8; 8];
+    engine
+        .mem_read(pp_data, &mut data_bytes)
+        .expect("read lock ptr");
+    let data_va = u64::from_le_bytes(data_bytes);
+
+    // Three vertices forming a triangle covering the bottom-left half.
+    // Each vertex: x, y, z (f32) + diffuse (u32 BGRA).
+    let vertices: [[f32; 3]; 3] = [[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [-1.0, 1.0, 0.0]];
+    let colors: [u32; 3] = [0xFF_FF_00_00, 0xFF_00_FF_00, 0xFF_00_00_FF];
+    for (i, vertex) in vertices.iter().enumerate() {
+        for (j, component) in vertex.iter().enumerate() {
+            engine
+                .mem_write(
+                    data_va
+                        + u64::try_from(i).unwrap_or(0) * 16
+                        + u64::try_from(j).unwrap_or(0) * 4,
+                    &component.to_le_bytes(),
+                )
+                .expect("write vertex pos");
+        }
+        engine
+            .mem_write(
+                data_va + u64::try_from(i).unwrap_or(0) * 16 + 12,
+                &colors[i].to_le_bytes(),
+            )
+            .expect("write diffuse");
+    }
+    assert_return_value!(
+        d3d9::handle_vertex_buffer_unlock(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+
+    // ── Bind the vertex buffer and draw ────────────────────────────────
+    write_regs(&mut engine, 1, 0, vb_va, 0, 0); // stream 0, offset 0
+    engine
+        .mem_write(STACK_TOP + 0x28, &16_u32.to_le_bytes())
+        .expect("write stride");
+    assert_return_value!(
+        d3d9::handle_set_stream_source(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+
+    // DrawPrimitive(TRIANGLELIST, startVertex=0, primitiveCount=1).
+    write_regs(&mut engine, 1, u64::from(D3DPT_TRIANGLELIST), 0, 1, 0);
+    assert_return_value!(
+        d3d9::handle_draw_primitive(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+
+    // Pixel checks mirror the DrawPrimitiveUP test.
+    let back = &state.d3d9().d3d9_backbuffer;
+    let pixel = |x: u32, y: u32| {
+        back.get(usize::try_from(y).unwrap_or(0) * 16 + usize::try_from(x).unwrap_or(0))
+            .copied()
+    };
+    assert_eq!(
+        pixel(14, 1),
+        Some(0x00_C8_00_00),
+        "pixels above diagonal keep clear color"
+    );
+    let red_channel = (pixel(1, 14).unwrap_or(0) >> 16) & 0xFF;
+    let green_channel = (pixel(14, 14).unwrap_or(0) >> 8) & 0xFF;
+    let blue_channel = pixel(1, 1).unwrap_or(0) & 0xFF;
+    assert!(
+        red_channel > 0xB0,
+        "bottom-left corner red-dominant ({red_channel:#x})"
+    );
+    assert!(
+        green_channel > 0xB0,
+        "bottom-right corner green-dominant ({green_channel:#x})"
+    );
+    assert!(
+        blue_channel > 0xB0,
+        "top-left corner blue-dominant ({blue_channel:#x})"
+    );
+    assert_eq!(state.d3d9().d3d9_dirty, None, "draw keeps full-frame dirty");
+
+    // EndScene + Present (verifies the full pipeline wired together).
+    write_regs(&mut engine, 1, 0, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_end_scene(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    write_regs(&mut engine, 1, 0, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_present(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+}
+
+/// Clear sets the dirty flag; Present clears it after publishing.
+#[test]
+fn test_d3d9_clear_sets_dirty_and_present_clears() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    {
+        let d3d = state.d3d9();
+        d3d.d3d9_backbuffer_width = 4;
+        d3d.d3d9_backbuffer_height = 4;
+        d3d.d3d9_backbuffer = vec![0_u32; 4 * 4];
+        d3d.d3d9_viewport = (0, 0, 4, 4, 0.0, 1.0);
+    }
+
+    write_regs(&mut engine, 1, 0, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_begin_scene(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+
+    // Before clear: dirty flag is None.
+    assert_eq!(
+        state.d3d9().d3d9_dirty,
+        None,
+        "no dirty region before clear"
+    );
+
+    // Clear sets the dirty flag (None = full frame).
+    write_regs(&mut engine, 1, 0, 0, u64::from(D3DCLEAR_TARGET), 0);
+    engine
+        .mem_write(STACK_TOP + 0x28, &0xFF_00_00_00_u32.to_le_bytes())
+        .expect("write clear color");
+    assert_return_value!(
+        d3d9::handle_clear(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    assert_eq!(state.d3d9().d3d9_dirty, None, "Clear sets full-frame dirty");
+
+    write_regs(&mut engine, 1, 0, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_end_scene(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    write_regs(&mut engine, 1, 0, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_present(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    // Present publishes and clears the dirty flag.
+    assert_eq!(state.d3d9().d3d9_dirty, None, "Present clears dirty flag");
+}

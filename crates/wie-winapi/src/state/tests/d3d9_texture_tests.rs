@@ -998,3 +998,199 @@ fn test_d3d9_depth_surface_create_bind_and_clear() {
     assert!(!state.d3d9().d3d9_depth_surfaces.contains_key(&surface_va));
     assert_eq!(state.d3d9().d3d9_depth_stencil, 0, "release must unbind");
 }
+
+// ── Buffer helpers ──────────────────────────────────────────────────
+
+/// CreateIndexBuffer + GetDesc round-trip (IB variant of the existing VB test).
+#[test]
+fn test_d3d9_index_buffer_get_desc() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    engine
+        .mem_write(0x2000, &0x2000_u64.to_le_bytes())
+        .expect("seed bump cursor");
+
+    // CreateIndexBuffer(100 bytes, format=D3DFMT_INDEX16, pool=MANAGED).
+    // R9 must hold the format (D3DFMT_INDEX16=101); stack 0x28=pool, 0x30=ppBuffer.
+    let pp_buffer = 0x7000_u64;
+    write_regs(&mut engine, 1, 100, 0, u64::from(d3d9::D3DFMT_INDEX16), 0);
+    engine
+        .mem_write(STACK_TOP + 0x28, &1_u32.to_le_bytes())
+        .expect("write pool MANAGED");
+    engine
+        .mem_write(STACK_TOP + 0x30, &pp_buffer.to_le_bytes())
+        .expect("write ppBuffer");
+    assert_return_value!(
+        d3d9::handle_create_index_buffer(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut buf_bytes = [0_u8; 8];
+    engine
+        .mem_read(pp_buffer, &mut buf_bytes)
+        .expect("read buffer ptr");
+    let ib = u64::from_le_bytes(buf_bytes);
+    assert_ne!(ib, 0, "CreateIndexBuffer must return an object");
+
+    // GetDesc → D3DINDEXBUFFER_DESC (20 bytes, offsets from d3d9types.h):
+    //   Format @0 (4), Type @4 (4), Usage @8 (4), Pool @12 (4), Size @16 (4).
+    let desc_va = 0x7200_u64;
+    write_regs(&mut engine, ib, desc_va, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_index_buffer_get_desc(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut desc = [0_u8; 20];
+    engine.mem_read(desc_va, &mut desc).expect("read desc");
+    assert_eq!(
+        u32::from_le_bytes(desc[0..4].try_into().unwrap_or([0; 4])),
+        d3d9::D3DFMT_INDEX16,
+        "Format = INDEX16"
+    );
+    assert_eq!(
+        u32::from_le_bytes(desc[4..8].try_into().unwrap_or([0; 4])),
+        7,
+        "Type = INDEXBUFFER"
+    );
+    assert_eq!(
+        u32::from_le_bytes(desc[12..16].try_into().unwrap_or([0; 4])),
+        1,
+        "Pool = MANAGED"
+    );
+    assert_eq!(
+        u32::from_le_bytes(desc[16..20].try_into().unwrap_or([0; 4])),
+        100,
+        "Size = 100"
+    );
+}
+
+// ── Texture / surface helpers ───────────────────────────────────────
+
+/// GetLevelCount on a 2-level texture returns 2.
+#[test]
+fn test_d3d9_texture_get_level_count() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    engine
+        .mem_write(0x2000, &0x2000_u64.to_le_bytes())
+        .expect("seed bump cursor");
+
+    // CreateTexture(16x8, levels=2, format=A8R8G8B8) → texture at 0x7000.
+    let pp_texture = 0x7000_u64;
+    write_regs(&mut engine, 1, 16, 8, 2, 0);
+    engine
+        .mem_write(STACK_TOP + 0x30, &D3DFMT_A8R8G8B8.to_le_bytes())
+        .expect("write format");
+    engine
+        .mem_write(STACK_TOP + 0x40, &pp_texture.to_le_bytes())
+        .expect("write ppTexture");
+    assert_return_value!(
+        d3d9::handle_create_texture(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut tex_bytes = [0_u8; 8];
+    engine
+        .mem_read(pp_texture, &mut tex_bytes)
+        .expect("read texture ptr");
+    let texture_va = u64::from_le_bytes(tex_bytes);
+    assert_ne!(texture_va, 0);
+
+    // GetLevelCount — the handler returns the level count directly as the
+    // WinApiHandlerResult return value (not via an output pointer).
+    write_regs(&mut engine, texture_va, 0, 0, 0, 0);
+    let result = d3d9::handle_texture_get_level_count(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("handler should succeed");
+    assert_eq!(
+        result.return_value, 2,
+        "GetLevelCount on 2-level texture returns level count directly"
+    );
+}
+
+/// GetDesc on a render-target surface writes a 64-byte D3DSURFACE_DESC to guest memory.
+#[test]
+fn test_d3d9_surface_get_desc() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    engine
+        .mem_write(0x2000, &0x2000_u64.to_le_bytes())
+        .expect("seed bump cursor");
+
+    // CreateRenderTarget(8x4, format=A8R8G8B8) → surface at 0x7000.
+    let pp_surface = 0x7000_u64;
+    write_regs(&mut engine, 1, 8, 4, u64::from(D3DFMT_A8R8G8B8), 0);
+    engine
+        .mem_write(STACK_TOP + 0x40, &pp_surface.to_le_bytes())
+        .expect("write ppSurface");
+    assert_return_value!(
+        d3d9::handle_create_render_target(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+    let mut surf_bytes = [0_u8; 8];
+    engine
+        .mem_read(pp_surface, &mut surf_bytes)
+        .expect("read surface ptr");
+    let surface_va = u64::from_le_bytes(surf_bytes);
+    assert_ne!(surface_va, 0);
+
+    // GetDesc → D3DSURFACE_DESC at 0x7100.
+    let desc_va = 0x7100_u64;
+    write_regs(&mut engine, surface_va, desc_va, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_surface_get_desc(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        0
+    );
+
+    // Layout the handler actually writes (32 bytes, simplified D3DSURFACE_DESC):
+    //   @0: format, @4: D3DRTYPE_SURFACE, @16: MultiSampleType=0, @20: MultiSampleQuality=0,
+    //   @24: width, @28: height.  Gaps at @8–15 and @12–15 are left as 0.
+    let mut desc = [0_u8; 32];
+    engine.mem_read(desc_va, &mut desc).expect("read desc");
+    assert_eq!(
+        u32::from_le_bytes(desc[0..4].try_into().unwrap_or([0; 4])),
+        D3DFMT_A8R8G8B8,
+        "Format = A8R8G8B8"
+    );
+    assert_eq!(
+        u32::from_le_bytes(desc[4..8].try_into().unwrap_or([0; 4])),
+        3, // D3DRTYPE_SURFACE
+        "Type = SURFACE"
+    );
+    assert_eq!(
+        u32::from_le_bytes(desc[16..20].try_into().unwrap_or([0; 4])),
+        0,
+        "MultiSampleType = NONE"
+    );
+    assert_eq!(
+        u32::from_le_bytes(desc[24..28].try_into().unwrap_or([0; 4])),
+        8,
+        "Width = 8"
+    );
+    assert_eq!(
+        u32::from_le_bytes(desc[28..32].try_into().unwrap_or([0; 4])),
+        4,
+        "Height = 4"
+    );
+}
