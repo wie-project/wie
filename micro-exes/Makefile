@@ -14,9 +14,9 @@ LDFLAGS  := -nostdlib -Wl,--subsystem,console -Wl,--entry,entry
 # Ordinary CRT-linked apps (independent-style): full toolchain defaults.
 CRT_CFLAGS := -O2
 
-.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes dll_tests game_exes interactive_exes ucrt_coverage gui_exes print_bmp version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo http_get ole_com shell_folders reg_roundtrip user32_enum user32_char gdi_regions comctl_toolbar winmm_audio msvcrt_gaps
+.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes dll_tests game_exes interactive_exes ucrt_coverage gui_exes print_bmp version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo http_get ole_com shell_folders reg_roundtrip user32_enum user32_char gdi_regions comctl_toolbar winmm_audio msvcrt_gaps wininet_http gl_quad dir_watch ole_clip font_enum child_proc spawn_child
 
-all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes game_exes interactive_exes dll_tests ucrt_coverage gui_exes version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo http_get ole_com shell_folders reg_roundtrip user32_enum user32_char gdi_regions comctl_toolbar winmm_audio msvcrt_gaps
+all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes game_exes interactive_exes dll_tests ucrt_coverage gui_exes version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo http_get ole_com shell_folders reg_roundtrip user32_enum user32_char gdi_regions comctl_toolbar winmm_audio msvcrt_gaps wininet_http gl_quad dir_watch ole_clip font_enum child_proc spawn_child
 
 $(OUT):
 	mkdir -p $(OUT)
@@ -457,5 +457,54 @@ $(OUT)/winmm_audio.exe: winmm_audio/main.c | $(OUT)
 msvcrt_gaps: $(OUT)/msvcrt_gaps.exe
 
 $(OUT)/msvcrt_gaps.exe: msvcrt_gaps/main.c | $(OUT)
+	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $<
+	@echo "built $@"
+
+# WININET (wininet_http): InternetOpenUrlW -> InternetReadFile against example.com.
+wininet_http: $(OUT)/wininet_http.exe
+
+$(OUT)/wininet_http.exe: wininet_http/main.c | $(OUT)
+	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $< -lwininet
+	@echo "built $@"
+
+# OPENGL32 (gl_quad): WGL context + fixed-function triangle + swap (GUI).
+gl_quad: $(OUT)/gl_quad.exe
+
+$(OUT)/gl_quad.exe: gl_quad/main.c | $(OUT)
+	$(MINGW_CC) $(GUI_CFLAGS) $(GUI_LDFLAGS) -o $@ $< $(GUI_LIBS) -lopengl32
+	@echo "built $@"
+
+# KERNEL32 (dir_watch): FindFirstChangeNotificationW + WaitForSingleObject.
+dir_watch: $(OUT)/dir_watch.exe
+
+$(OUT)/dir_watch.exe: dir_watch/main.c | $(OUT)
+	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $<
+	@echo "built $@"
+
+# OLE32 (ole_clip): OleSetClipboard/OleGetClipboard + IDataObject round-trip.
+ole_clip: $(OUT)/ole_clip.exe
+
+$(OUT)/ole_clip.exe: ole_clip/main.c | $(OUT)
+	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $< -lole32
+	@echo "built $@"
+
+# GDI32 (font_enum): EnumFontFamiliesExW over the host font database.
+font_enum: $(OUT)/font_enum.exe
+
+$(OUT)/font_enum.exe: font_enum/main.c | $(OUT)
+	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $< -lgdi32 -luser32
+	@echo "built $@"
+
+# KERNEL32 (child_proc): the child spawned by spawn_child; exits 42.
+child_proc: $(OUT)/child_proc.exe
+
+$(OUT)/child_proc.exe: child_proc/main.c | $(OUT)
+	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $<
+	@echo "built $@"
+
+# KERNEL32 (spawn_child): CreateProcessW -> WaitForSingleObject -> GetExitCodeProcess==42.
+spawn_child: $(OUT)/spawn_child.exe
+
+$(OUT)/spawn_child.exe: spawn_child/main.c | $(OUT)
 	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $<
 	@echo "built $@"

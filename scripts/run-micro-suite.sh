@@ -68,6 +68,14 @@ if [[ "$CATEGORY" == "all" ]]; then
   # Pthread tests via libwinpthread-1.dll
   run_one "$OUT/pt_basic.exe"
   run_one "$OUT/pt_cond.exe"
+
+  # CreateProcess: stage child + parent in one bottle (child embeds the
+  # compile-time path C:\child_proc.exe), parent waits + checks exit 42.
+  SPAWN_ROOT="$(mktemp -d)"
+  mkdir -p "$SPAWN_ROOT/drive_c"
+  cp "$OUT/child_proc.exe" "$SPAWN_ROOT/drive_c/child_proc.exe"
+  run_bottle_n2 "$OUT/spawn_child.exe" "$SPAWN_ROOT"
+  rm -rf "$SPAWN_ROOT"
 fi
 
 if [[ "$CATEGORY" == "console_tests" ]]; then
