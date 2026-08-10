@@ -331,8 +331,6 @@ fn every_stub_needing_real_addresses_is_listed() {
         ("KERNEL32.dll", "FlsGetValue"),
         ("KERNEL32.dll", "FlsSetValue"),
         ("KERNEL32.dll", "SetHandleCount"),
-        ("KERNEL32.dll", "OutputDebugStringA"),
-        ("KERNEL32.dll", "OutputDebugStringW"),
         ("KERNEL32.dll", "GetCurrentProcessId"),
         ("KERNEL32.dll", "GetCurrentThreadId"),
         ("KERNEL32.dll", "IsDebuggerPresent"),

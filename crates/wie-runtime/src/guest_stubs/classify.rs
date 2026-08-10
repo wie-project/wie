@@ -166,8 +166,12 @@ static CLASSIFY_TABLE: &[(&str, &str, StubKindBuilder)] = &[
         }
     }),
     (NT_LIBRARY, "SetHandleCount", |_| GuestStubKind::VoidRet),
-    (NT_LIBRARY, "OutputDebugStringA", |_| GuestStubKind::VoidRet),
-    (NT_LIBRARY, "OutputDebugStringW", |_| GuestStubKind::VoidRet),
+    // OutputDebugString* deliberately NOT stubbed: the guest's debug output
+    // must reach the host trace (the kernel32 handler logs it), so a live run
+    // shows WHY a guest failed — not just a bare exit code. A VoidRet stub
+    // would swallow the message silently.
+    // (NT_LIBRARY, "OutputDebugStringA", |_| GuestStubKind::VoidRet),
+    // (NT_LIBRARY, "OutputDebugStringW", |_| GuestStubKind::VoidRet),
     // The host refreshes a guest clock table on every stop; these in-guest
     // stubs read it with no host stop. A constant stub is deliberately NOT
     // planted — a guest frame loop computing `dt = now - last` would busy-wait
