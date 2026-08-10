@@ -172,6 +172,148 @@ fn gui_d3d9_renders_clear_and_triangle() {
     );
 }
 
+/// Run gl_quad end-to-end and prove the GL 1.1 fixed-function software
+/// renderer: wglCreateContext/MakeCurrent → glClearColor + glClear → a red
+/// immediate-mode GL_QUADS → a textured checkerboard quad
+/// (glGenTextures/glBindTexture/glTexImage2D + GL_MODULATE) →
+/// wglSwapBuffers publishes the rendered backbuffer. The exe self-verifies
+/// every frame with glReadPixels (quad center red, corner clear color, three
+/// checkerboard texel centers) and exits 0 after a few rendered frames; the
+/// host additionally pins the published frame's pixels: clear color at the
+/// top-left corner, red at the viewport center, and the checkerboard's
+/// red/green/white texels at the GL-coordinate-mapped rows.
+#[test]
+fn gl_quad_renders_clear_and_quads() {
+    let Some(path) = micro_exe("gl_quad.exe") else {
+        eprintln!("skip: micro-exes/out/gl_quad.exe not built (run make -C micro-exes gl_quad)");
+        return;
+    };
+    // Serialized suite: see GUI_SUITE_LOCK.
+    let _suite = gui_suite_serialize();
+
+    use wie_runtime::EntryTraceTermination;
+
+    let mut session =
+        wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
+            .expect("GUI session starts");
+    session
+        .set_guest_env("WIE_SELFTEST", "1")
+        .expect("inject WIE_SELFTEST");
+
+    let mut iterations = 0;
+    let mut saw_gl_frame = false;
+    let exit_code = loop {
+        let summary = session
+            .run_until_stop(1_000_000)
+            .expect("GUI session run_until_stop");
+        iterations += 1;
+        assert!(
+            iterations < 300,
+            "gl_quad.exe did not exit within 300 iterations"
+        );
+
+        // The 640x480 client's published frame: clear 0x1A1A66 + red quad at
+        // the viewport center + the 4x4 checkerboard (rows mapped from GL
+        // bottom-up coords: GL y = 80 → row h-1-80, GL y = 200 → row h-1-200).
+        if let Some(owner) = session.first_guest_window_handle()
+            && let Some(frame) = session.take_frame(owner)
+        {
+            assert!(
+                frame.width >= 640 && frame.height >= 480,
+                "gl_quad frame must be at least 640x480, got {}x{}",
+                frame.width,
+                frame.height
+            );
+            let w = frame.width;
+            let h = frame.height;
+            let idx = |x: u32, y: u32| {
+                usize::try_from(y).unwrap_or(0) * w as usize + usize::try_from(x).unwrap_or(0)
+            };
+            if frame.pixels.get(idx(5, 5)).copied() == Some(0x00_1A_1A_66)
+                // Clear color (0.1, 0.1, 0.4, 1) at the top-left corner.
+                && frame.pixels.get(idx(w / 2, h / 2)).copied() == Some(0x00_FF_00_00)
+                // Red quad centered at (320, 240) — NDC (0, 0).
+                && frame.pixels.get(idx(451, h - 1 - 80)).copied() == Some(0x00_FF_00_00)
+                // Checkerboard texel (0,0) bottom-left: red.
+                && frame.pixels.get(idx(493, h - 1 - 80)).copied() == Some(0x00_00_FF_00)
+                // Checkerboard texel (1,0): green.
+                && frame.pixels.get(idx(451, h - 1 - 200)).copied() == Some(0x00_FF_FF_FF)
+            // Checkerboard texel (0,3) top-left: white (proves the GL
+            // bottom-up upload flip).
+            // ── Stage 2: arrays / VBO / lighting / display lists ────────
+            && frame.pixels.get(idx(60, h - 1 - 60)).copied() == Some(0x00_FF_FF_00)
+                // Client-array triangle (GL (60,60)): yellow.
+                && frame.pixels.get(idx(60, h - 1 - 200)).copied() == Some(0x00_FF_00_FF)
+                // VBO triangle (GL (60,200)): magenta.
+                && frame.pixels.get(idx(380, h - 1 - 370)).copied() == Some(0x00_00_FF_FF)
+                // Display-list instance 1 (GL (380,370)): cyan.
+                && frame.pixels.get(idx(270, h - 1 - 370)).copied() == Some(0x00_00_FF_FF)
+                // Display-list instance 2, translated −90 (GL (270,370)).
+                && frame.pixels.get(idx(210, h - 1 - 370)).copied() == Some(0x00_1A_1A_66)
+            // The gap between the two instances stays the clear color.
+            // ── Stage 3: GLSL shaders ────────────────────────────────────
+            && frame.pixels.get(idx(515, h - 1 - 380)).copied() == Some(0x00_FF_00_00)
+            // Texture2D quad (GL (515,380)): the FS samples the checkerboard
+            // at uv (0.125,0.125) → the bottom-left texel (red).
+            {
+                // Lit quad: the near-light corner (GL (180,430)) must be
+                // brighter than the far corner (GL (50,330)).
+                let near = frame
+                    .pixels
+                    .get(idx(180, h - 1 - 430))
+                    .copied()
+                    .unwrap_or(0);
+                let far = frame.pixels.get(idx(50, h - 1 - 330)).copied().unwrap_or(0);
+                // Gradient quad (GL (230,30) dark vs (410,210) bright): the
+                // uv-mapped FS color rises toward the top-right corner.
+                let grad_dark = frame
+                    .pixels
+                    .get(idx(230, h - 1 - 30))
+                    .copied()
+                    .unwrap_or(0)
+                    >> 16
+                    & 0xFF;
+                let grad_bright = frame
+                    .pixels
+                    .get(idx(410, h - 1 - 210))
+                    .copied()
+                    .unwrap_or(0)
+                    >> 16
+                    & 0xFF;
+                if (near >> 16) & 0xFF > ((far >> 16) & 0xFF).saturating_add(40)
+                    && grad_bright > grad_dark.saturating_add(100)
+                {
+                    saw_gl_frame = true;
+                }
+            }
+        }
+
+        match summary.termination {
+            EntryTraceTermination::ExitProcess { code } => break Some(code),
+            EntryTraceTermination::WaitingForMessage => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            other => {
+                panic!("GUI session stopped unexpectedly: {other:?}");
+            }
+        }
+    };
+
+    assert_eq!(
+        exit_code,
+        Some(0),
+        "gl_quad.exe must exit 0 (proves wglMakeCurrent → glClearColor/glClear \
+         → red GL_QUADS → glGenTextures/glBindTexture/glTexImage2D → textured \
+         quad → the in-exe glReadPixels assertions → wglSwapBuffers all held); \
+         got {exit_code:?}"
+    );
+    assert!(
+        saw_gl_frame,
+        "the GL frame (clear 0x1A1A66 + red center quad + checkerboard \
+         texture) was never observed in the window's published surface"
+    );
+}
+
 /// Run gui_blit end-to-end and prove every capability tier.
 ///
 /// gui_blit now exercises text (TextOutA/DrawTextA into a DIB), timers,
@@ -782,4 +924,81 @@ fn gui_demo_dialog_ok_click_closes_dialog() {
              click — EndDialog must erase the owner"
         );
     }
+}
+
+/// Resize-robustness regression for the GL backbuffer + the micro's
+/// readbacks: WIE must resize the current context's default framebuffer with
+/// the guest window (real Windows does this before WM_PAINT), and gl_quad's
+/// self-checks read at world-space points mapped through the viewport so they
+/// hold at any client size. Before the fixes, the first paint after a resize
+/// drew/read back against a stale-sized buffer and the micro died on its
+/// size-independent quad-center check (110); then, with the backbuffer fix,
+/// the 640×480-anchored readbacks drifted and it died on the first
+/// size-dependent check (112). A resized run must now exit 0.
+#[test]
+fn gl_quad_resize_keeps_quad_center_readback() {
+    let Some(path) = micro_exe("gl_quad.exe") else {
+        eprintln!("skip: micro-exes/out/gl_quad.exe not built (run make -C micro-exes gl_quad)");
+        return;
+    };
+    // Serialized suite: see GUI_SUITE_LOCK.
+    let _suite = gui_suite_serialize();
+
+    use wie_runtime::EntryTraceTermination;
+
+    let mut session =
+        wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
+            .expect("GUI session starts");
+    session
+        .set_guest_env("WIE_SELFTEST", "1")
+        .expect("inject WIE_SELFTEST");
+
+    let mut iterations = 0;
+    let mut resized = false;
+    let exit_code = loop {
+        let summary = session
+            .run_until_stop(1_000_000)
+            .expect("GUI session run_until_stop");
+        iterations += 1;
+        assert!(
+            iterations < 300,
+            "gl_quad.exe did not exit within 300 iterations"
+        );
+
+        // Resize once the guest window exists — the host-side hook app.rs
+        // calls at settle time, before WM_SIZE reaches the guest. The micro
+        // exits after 3 rendered frames, so the resize lands mid-run.
+        if !resized
+            && let Some(hwnd) = session.first_guest_window_handle()
+        {
+            session.guest_handle().resize_window(
+                wie_winapi::handles::Hwnd::from(hwnd),
+                wie_winapi::user32::Dimension {
+                    width: 900,
+                    height: 700,
+                },
+            );
+            resized = true;
+        }
+
+        match summary.termination {
+            EntryTraceTermination::ExitProcess { code } => break Some(code),
+            EntryTraceTermination::WaitingForMessage => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            other => {
+                panic!("GUI session stopped unexpectedly: {other:?}");
+            }
+        }
+    };
+
+    assert!(resized, "the window was never resized mid-run");
+    assert_eq!(
+        exit_code,
+        Some(0),
+        "gl_quad.exe must exit 0 after a resize: the GL backbuffer must follow \
+         the window's client size (resized before WM_PAINT) AND the micro's \
+         world-anchored readbacks must still land on the same texels/quads at \
+         the new size. got {exit_code:?}"
+    );
 }
