@@ -4,6 +4,7 @@
 
 mod blit;
 mod dib;
+pub mod enumerate;
 mod font_system;
 mod pixel;
 mod print;
@@ -14,6 +15,7 @@ mod text;
 // Re-export every public handler function from the submodules.
 pub use blit::*;
 pub use dib::*;
+pub use enumerate::*;
 pub use font_system::*;
 pub use print::*;
 pub use regions::*;
@@ -37,12 +39,19 @@ pub fn dispatch_gdi32_extra(
         "combinergn" => Ok(Some(regions::handle_combine_rgn(ctx)?)),
         "setrectrgn" => Ok(Some(regions::handle_set_rect_rgn(ctx)?)),
         "getrgnbox" => Ok(Some(regions::handle_get_rgn_box(ctx)?)),
-        // Font enumeration and SetPixel are decorative for the Tier-2
-        // milestone: report success (TRUE) without doing the work. A real
-        // EnumFontFamiliesExW would need the guest-callback re-entry machine
-        // (pthread's call_guest pattern); enumeration is not worth that risk
-        // until a guest actually needs the family list.
-        "enumfontfamiliesexw" | "enumfontfamiliesexa" => Ok(Some(ctx.finish(1)?)),
+        // Font enumeration, glyph outlines and font resources (soft-dispatch).
+        "enumfontfamiliesexw" => Ok(Some(enumerate::handle_enum_font_families_ex_w(ctx)?)),
+        "enumfontfamiliesexa" => Ok(Some(enumerate::handle_enum_font_families_ex_a(ctx)?)),
+        "enumfontfamiliesw" => Ok(Some(enumerate::handle_enum_font_families_w(ctx)?)),
+        "enumfontfamiliesa" => Ok(Some(enumerate::handle_enum_font_families_a(ctx)?)),
+        "enumfontsw" => Ok(Some(enumerate::handle_enum_fonts_w(ctx)?)),
+        "enumfontsa" => Ok(Some(enumerate::handle_enum_fonts_a(ctx)?)),
+        "getglyphoutlinew" => Ok(Some(enumerate::handle_get_glyph_outline_w(ctx)?)),
+        "getglyphoutlinea" => Ok(Some(enumerate::handle_get_glyph_outline_a(ctx)?)),
+        "addfontresourcew" => Ok(Some(enumerate::handle_add_font_resource_w(ctx)?)),
+        "addfontresourcea" => Ok(Some(enumerate::handle_add_font_resource_a(ctx)?)),
+        "removefontresourcew" => Ok(Some(enumerate::handle_remove_font_resource_w(ctx)?)),
+        "removefontresourcea" => Ok(Some(enumerate::handle_remove_font_resource_a(ctx)?)),
         "setpixel" => Ok(Some(ctx.finish(1)?)),
         _ => Ok(None),
     }

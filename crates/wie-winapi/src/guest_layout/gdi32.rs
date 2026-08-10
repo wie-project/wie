@@ -554,6 +554,117 @@ const _: () = {
     );
 };
 
+/// Win64 `ENUMLOGFONTEXW` (wingdi.h): a `LOGFONTW` (92 bytes) followed by
+/// `WCHAR elfFullName[LF_FULLFACESIZE=64]`, `WCHAR elfStyle[LF_FACESIZE=32]`
+/// and `WCHAR elfScript[LF_FACESIZE=32]` — 348 bytes, align 4, no padding.
+///
+/// `EnumFontFamiliesExW` passes this to the guest `FONTENUMPROCW` as the
+/// `lpelfe` argument; the `LOGFONTW` front is layout-identical to the plain
+/// `ENUMLOGFONTW` that `EnumFontFamiliesW`/`EnumFonts` pass, so one payload
+/// serves all three enumeration APIs.
+#[derive(Debug, Clone, Copy, KnownLayout, Immutable, FromBytes, IntoBytes)]
+#[repr(C)]
+pub(crate) struct EnumLogFontExW {
+    pub(crate) log_font: LogFontW,
+    pub(crate) full_name: [u16; 64],
+    pub(crate) style: [u16; 32],
+    pub(crate) script: [u16; 32],
+}
+
+/// Compile-time layout check for [`EnumLogFontExW`].
+const _: () = {
+    assert!(
+        core::mem::size_of::<EnumLogFontExW>() == 348,
+        "ENUMLOGFONTEXW must be 348 bytes on Win64"
+    );
+    assert!(
+        core::mem::offset_of!(EnumLogFontExW, log_font) == 0,
+        "elfLogFont @0"
+    );
+    assert!(
+        core::mem::offset_of!(EnumLogFontExW, full_name) == 92,
+        "elfFullName @92"
+    );
+    assert!(
+        core::mem::offset_of!(EnumLogFontExW, style) == 220,
+        "elfStyle @220"
+    );
+    assert!(
+        core::mem::offset_of!(EnumLogFontExW, script) == 284,
+        "elfScript @284"
+    );
+};
+
+/// Win64 `ENUMLOGFONTEXA` (wingdi.h): a `LOGFONTA` (60 bytes) followed by
+/// `CHAR elfFullName[64]`, `CHAR elfStyle[32]`, `CHAR elfScript[32]` — 188
+/// bytes, align 4, no padding.
+#[derive(Debug, Clone, Copy, KnownLayout, Immutable, FromBytes, IntoBytes)]
+#[repr(C)]
+pub(crate) struct EnumLogFontExA {
+    pub(crate) log_font: LogFontA,
+    pub(crate) full_name: [u8; 64],
+    pub(crate) style: [u8; 32],
+    pub(crate) script: [u8; 32],
+}
+
+/// Compile-time layout check for [`EnumLogFontExA`].
+const _: () = {
+    assert!(
+        core::mem::size_of::<EnumLogFontExA>() == 188,
+        "ENUMLOGFONTEXA must be 188 bytes on Win64"
+    );
+    assert!(
+        core::mem::offset_of!(EnumLogFontExA, log_font) == 0,
+        "elfLogFont @0"
+    );
+    assert!(
+        core::mem::offset_of!(EnumLogFontExA, full_name) == 60,
+        "elfFullName @60"
+    );
+    assert!(
+        core::mem::offset_of!(EnumLogFontExA, style) == 124,
+        "elfStyle @124"
+    );
+    assert!(
+        core::mem::offset_of!(EnumLogFontExA, script) == 156,
+        "elfScript @156"
+    );
+};
+
+/// Win64 `GLYPHMETRICS` (wingdi.h): `UINT gmBlackBoxX`, `UINT gmBlackBoxY`,
+/// `POINT gmptGlyphOrigin` (two `LONG`s), `short gmCellIncX`, `short
+/// gmCellIncY` — 20 bytes, align 4, no padding.
+#[derive(Debug, Clone, Copy, KnownLayout, Immutable, FromBytes, IntoBytes)]
+#[repr(C)]
+pub(crate) struct GlyphMetrics {
+    pub(crate) black_box_x: u32,
+    pub(crate) black_box_y: u32,
+    pub(crate) glyph_origin_x: i32,
+    pub(crate) glyph_origin_y: i32,
+    pub(crate) cell_inc_x: i16,
+    pub(crate) cell_inc_y: i16,
+}
+
+/// Compile-time layout check for [`GlyphMetrics`].
+const _: () = {
+    assert!(
+        core::mem::size_of::<GlyphMetrics>() == 20,
+        "GLYPHMETRICS must be 20 bytes on Win64"
+    );
+    assert!(
+        core::mem::offset_of!(GlyphMetrics, black_box_x) == 0,
+        "gmBlackBoxX @0"
+    );
+    assert!(
+        core::mem::offset_of!(GlyphMetrics, glyph_origin_x) == 8,
+        "gmptGlyphOrigin.x @8"
+    );
+    assert!(
+        core::mem::offset_of!(GlyphMetrics, cell_inc_x) == 16,
+        "gmCellIncX @16"
+    );
+};
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {

@@ -317,7 +317,10 @@ impl RasterizedGlyph {
 /// `#[expect(casts)]`: the glyph bbox is float-px; the coverage buffer is
 /// indexed by the integer pixel bounds (clamped to the bbox, so truncation is
 /// bounded and sign is preserved by the clamp).
-fn outline_glyph(scaled: &PxScaleFont<&FontArc>, gid: GlyphId) -> Option<RasterizedGlyph> {
+pub(crate) fn outline_glyph(
+    scaled: &PxScaleFont<&FontArc>,
+    gid: GlyphId,
+) -> Option<RasterizedGlyph> {
     let positioned = scaled.outline_glyph(Glyph {
         id: gid,
         scale: scaled.scale(),
@@ -413,6 +416,16 @@ impl ResolvedFont {
         round_px(self.ascent)
             .saturating_sub(round_px(self.descent))
             .saturating_add(round_px(self.line_gap))
+    }
+
+    /// Rasterize `ch` into a coverage buffer at this font's pixel scale.
+    ///
+    /// Thin wrapper over [`outline_glyph`] so the enumeration / glyph-outline
+    /// lanes can rasterize a glyph without reaching into the private helper.
+    pub(crate) fn glyph_outline(&self, ch: char) -> Option<RasterizedGlyph> {
+        let scaled = self.scaled();
+        let gid = scaled.glyph_id(ch);
+        outline_glyph(&scaled, gid)
     }
 }
 
