@@ -480,15 +480,27 @@ mod tests {
     #[test]
     fn add_defaults_target_to_c_basename() {
         let dir = temp_dir();
-        create(&dir, "b").unwrap();
-        let root = bottle_root(&dir, "b");
         let file = dir.join("tool.exe");
-        fs::write(&file, b"x").unwrap();
-        // The dispatcher's default target is `C:\<basename>`; pin that the
-        // resulting guest path resolves to drive_c/<basename>.
-        let guest_target = format!(r"C:\{}", file.file_name().unwrap().to_string_lossy());
-        let dst = resolve_guest_path(&root, &guest_target).unwrap();
-        assert_eq!(dst, drive_c_dir(&root).join("tool.exe"));
+        fs::write(&file, b"xyz").unwrap();
+
+        // The dispatcher resolves bottles via the real bottles dir, so the
+        // bottle must exist there. Use a PID-unique name and clean up after;
+        // on a panicking assert the uniquely named bottle may remain.
+        let name = format!("test-{}", std::process::id());
+        create(&bottles_dir(), &name).unwrap();
+
+        // Exercise the real Add dispatcher arm with no --target: the default
+        // `C:\<basename>` must land in drive_c and copy the file.
+        bottle(crate::BottleCommand::Add {
+            name: name.clone(),
+            host_path: file,
+            target: None,
+        })
+        .unwrap();
+        let copied = drive_c_dir(&bottle_root(&bottles_dir(), &name)).join("tool.exe");
+        assert_eq!(fs::read(&copied).unwrap(), b"xyz");
+
+        delete(&bottles_dir(), &name).unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
 }
