@@ -9,7 +9,7 @@ One-page playbook for regressions after the foundational work and the **great cl
 | Active CPU | `WIE_CPU` unset → **jit**; `WIE_CPU=iced` for interpreter |
 | Active mem | Always **mmap** arenas (`WIE_RUNTIME_PROFILE=1` → `mem_backend=mmap`) |
 | Active idle | profile line `idle_policy=…` |
-| CLI | `inspect` / `run` / `trace` (`run-micro` and `entry-trace` are aliases) |
+| CLI | `inspect` / `run` / `trace` / `bottle` (`run-micro` and `entry-trace` are aliases) |
 | Interactive console | `wie-cli run --console <exe>` — raw-mode run for terminal games (per-key input, no Enter; terminal restored on exit) |
 
 ## Symptoms → actions
@@ -86,6 +86,22 @@ The README keeps the shortlist; the complete set lives here.
 | `WIE_MT=0` | Disable guest worker spawn |
 | `WIE_MT_MAX_THREADS` | Cap on guest worker threads (default **64**) |
 | `RUST_LOG` | tracing filter (CLI defaults to `warn`) |
+
+## Bottles
+
+Named bottles live under `~/Library/Application Support/WIE/bottles/<name>/`
+(each with a `drive_c/` — the guest `C:\` volume; the default single bottle
+at `WIE/bottle` is unchanged). Manage them with:
+
+    wie bottle create <name>                 # new empty bottle
+    wie bottle list                          # existing bottles
+    wie bottle info <name>                   # path, drive_c, size
+    wie bottle path <name>                   # host root (for --root scripting)
+    wie bottle delete <name> [--yes]         # remove a bottle
+    wie bottle add <name> <host-path> [--target C:\Apps\Foo]   # copy file/folder in
+    wie bottle run <name> C:\App\app.exe [args...]             # run inside the bottle
+
+`bottle run` is `run --root <bottle>` with the exe resolved inside `drive_c`.
 
 ## Docs map
 

@@ -476,4 +476,19 @@ mod tests {
         );
         fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn add_defaults_target_to_c_basename() {
+        let dir = temp_dir();
+        create(&dir, "b").unwrap();
+        let root = bottle_root(&dir, "b");
+        let file = dir.join("tool.exe");
+        fs::write(&file, b"x").unwrap();
+        // The dispatcher's default target is `C:\<basename>`; pin that the
+        // resulting guest path resolves to drive_c/<basename>.
+        let guest_target = format!(r"C:\{}", file.file_name().unwrap().to_string_lossy());
+        let dst = resolve_guest_path(&root, &guest_target).unwrap();
+        assert_eq!(dst, drive_c_dir(&root).join("tool.exe"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }
