@@ -152,6 +152,11 @@ fn resolve_guest_path(bottle_root: &Path, guest_path: &str) -> Result<PathBuf> {
         .with_context(|| format!("guest path '{guest_path}' must live under C:\\"))
 }
 
+/// Host path of a guest exe inside the bottle, e.g. `C:\App\app.exe`.
+fn resolve_exe(bottle_root: &Path, guest_exe: &str) -> Result<PathBuf> {
+    resolve_guest_path(bottle_root, guest_exe)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -334,6 +339,18 @@ mod tests {
         assert!(
             !dst.join("loop").exists(),
             "symlinks must be skipped, not followed"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_exe_maps_guest_exe_to_host() {
+        let dir = temp_dir();
+        create(&dir, "b").unwrap();
+        let root = bottle_root(&dir, "b");
+        assert_eq!(
+            resolve_exe(&root, r"C:\App\app.exe").unwrap(),
+            drive_c_dir(&root).join("App/app.exe")
         );
         fs::remove_dir_all(&dir).unwrap();
     }
