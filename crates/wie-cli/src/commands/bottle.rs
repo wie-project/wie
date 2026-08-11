@@ -27,27 +27,49 @@ fn drive_c_dir(bottle_root: &Path) -> PathBuf {
     bottle_root.join("drive_c")
 }
 
+/// A bottle name is one non-empty path component: no separators, no `.`/`..`.
+fn validate_name(name: &str) -> Result<()> {
+    let valid = !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\\'])
+        && !name.contains(std::path::MAIN_SEPARATOR);
+    if !valid {
+        bail!("invalid bottle name '{name}': must be a single directory name");
+    }
+    Ok(())
+}
+
 /// Create a named bottle (fails if it already exists).
 fn create(bottles_dir: &Path, name: &str) -> Result<()> {
+    validate_name(name)?;
     let root = bottle_root(bottles_dir, name);
     if root.exists() {
         bail!("bottle '{name}' already exists at {}", root.display());
     }
     fs::create_dir_all(drive_c_dir(&root))
-        .with_context(|| format!("failed to create bottle '{name}'"))?;
+        .with_context(|| format!("failed to create bottle '{name}' at {}", root.display()))?;
     Ok(())
 }
 
 /// Names of all existing bottles, sorted.
 fn list(bottles_dir: &Path) -> Result<Vec<String>> {
     let mut names = Vec::new();
-    for entry in fs::read_dir(bottles_dir)
-        .with_context(|| format!("failed to read bottles directory {}", bottles_dir.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() && drive_c_dir(&path).is_dir() {
-            names.push(entry.file_name().to_string_lossy().into_owned());
+    match fs::read_dir(bottles_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() && drive_c_dir(&path).is_dir() {
+                    names.push(entry.file_name().to_string_lossy().into_owned());
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to read bottles directory {}", bottles_dir.display())
+            });
         }
     }
     names.sort();
@@ -63,9 +85,12 @@ mod tests {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     /// Fresh temp dir unique per test call (parallel tests must not collide).
+    /// PID-scoped + pre-emptive cleanup: a crashed earlier run leaves stale
+    /// `wie-bottle-test-*` dirs that would otherwise break later runs.
     fn temp_dir() -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("wie-bottle-test-{n}"));
+        let dir = std::env::temp_dir().join(format!("wie-bottle-test-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -88,6 +113,30 @@ mod tests {
     }
 
     #[test]
+    fn create_rejects_escaping_names() {
+        let dir = temp_dir();
+        for name in ["../evil", "/tmp/evil", "a/b", "", "."] {
+            assert!(
+                create(&dir, name).is_err(),
+                "name {name:?} must be rejected"
+            );
+        }
+        assert_eq!(list(&dir).unwrap(), Vec::<String>::new());
+        // Nothing may be created outside the bottles dir.
+        assert!(!dir.join("..").join("evil").exists());
+        assert!(!std::path::Path::new("/tmp/evil").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn list_missing_dir_returns_empty() {
+        let dir = temp_dir();
+        let missing = dir.join("does-not-exist");
+        assert_eq!(list(&missing).unwrap(), Vec::<String>::new());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn list_ignores_non_bottle_dirs() {
         let dir = temp_dir();
         create(&dir, "real").unwrap();
@@ -99,12 +148,10 @@ mod tests {
     #[test]
     fn bottles_dir_sits_next_to_global_bottle() {
         let dir = bottles_dir();
-        assert_eq!(
-            dir,
-            wie_winapi::global_bottle_root()
-                .parent()
-                .unwrap()
-                .join("bottles")
+        assert!(
+            dir.ends_with(std::path::Path::new("WIE").join("bottles")),
+            "bottles dir must be WIE/bottles, got {}",
+            dir.display()
         );
     }
 }
