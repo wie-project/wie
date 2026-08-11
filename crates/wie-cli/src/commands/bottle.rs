@@ -77,14 +77,22 @@ fn list(bottles_dir: &Path) -> Result<Vec<String>> {
 }
 
 /// Sum of all file sizes under `root`, recursively (bytes).
+///
+/// Symlinks are NOT followed (a link to an ancestor would loop forever);
+/// only regular files count toward the total. Read errors and missing
+/// entries are skipped silently, so a partial/unreadable tree reports a
+/// partial total — 0 is not proof the bottle is empty.
 fn dir_size(root: &Path) -> u64 {
     let mut total = 0;
     if let Ok(entries) = fs::read_dir(root) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() {
                 total += dir_size(&path);
-            } else if let Ok(meta) = fs::metadata(&path) {
+            } else if meta.is_file() {
                 total += meta.len();
             }
         }
@@ -99,7 +107,8 @@ fn delete(bottles_dir: &Path, name: &str) -> Result<()> {
     if !root.is_dir() {
         bail!("bottle '{name}' does not exist");
     }
-    fs::remove_dir_all(&root).with_context(|| format!("failed to delete bottle '{name}'"))?;
+    fs::remove_dir_all(&root)
+        .with_context(|| format!("failed to delete bottle '{name}' at {}", root.display()))?;
     Ok(())
 }
 
@@ -186,11 +195,33 @@ mod tests {
     fn info_reports_path_and_size() {
         let dir = temp_dir();
         create(&dir, "apps").unwrap();
-        // A 10-byte file inside drive_c.
-        let f = drive_c_dir(&bottle_root(&dir, "apps")).join("hello.txt");
-        fs::write(&f, b"0123456789").unwrap();
+        // A 10-byte file inside drive_c, and a 20-byte file in a subdir.
+        let drive_c = drive_c_dir(&bottle_root(&dir, "apps"));
+        fs::write(drive_c.join("hello.txt"), b"0123456789").unwrap();
+        fs::create_dir_all(drive_c.join("sub")).unwrap();
+        fs::write(
+            drive_c.join("sub").join("nested.bin"),
+            b"01234567890123456789",
+        )
+        .unwrap();
         let root = bottle_root(&dir, "apps");
-        assert_eq!(dir_size(&root), 10);
+        assert_eq!(dir_size(&root), 30);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_size_skips_symlinks() {
+        let dir = temp_dir();
+        create(&dir, "links").unwrap();
+        let root = bottle_root(&dir, "links");
+        let real = root.join("real.txt");
+        fs::write(&real, b"12345").unwrap();
+        // A symlink to the file and a loop back to the bottle root itself:
+        // neither may be followed (the loop would previously stack-overflow).
+        std::os::unix::fs::symlink(&real, root.join("file-link")).unwrap();
+        std::os::unix::fs::symlink(&root, root.join("root-loop")).unwrap();
+        assert_eq!(dir_size(&root), 5);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -201,6 +232,11 @@ mod tests {
         delete(&dir, "gone").unwrap();
         assert!(!bottle_root(&dir, "gone").exists());
         assert!(delete(&dir, "gone").is_err());
+        // The bottles dir itself must survive a bottle delete.
+        assert!(
+            dir.is_dir(),
+            "bottles dir itself must survive a bottle delete"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 }
