@@ -42,6 +42,19 @@ fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a bottle's host root, validating the name and requiring the
+/// bottle to exist. Shared by every subcommand that operates on an
+/// existing bottle — an unvalidated name like `..` would otherwise escape
+/// the bottles directory (e.g. `add ..` copying into the global bottle).
+fn require_bottle(bottles_dir: &Path, name: &str) -> Result<PathBuf> {
+    validate_name(name)?;
+    let root = bottle_root(bottles_dir, name);
+    if !root.is_dir() {
+        bail!("bottle '{name}' does not exist");
+    }
+    Ok(root)
+}
+
 /// Create a named bottle (fails if it already exists).
 fn create(bottles_dir: &Path, name: &str) -> Result<()> {
     validate_name(name)?;
@@ -172,10 +185,7 @@ pub(crate) fn bottle(command: BottleCommand) -> Result<()> {
             }
         }
         BottleCommand::Info { name } => {
-            let root = bottle_root(&bottles_dir(), &name);
-            if !root.is_dir() {
-                bail!("bottle '{name}' does not exist");
-            }
+            let root = require_bottle(&bottles_dir(), &name)?;
             let mut out = std::io::stdout().lock();
             write_line(
                 &mut out,
@@ -188,10 +198,7 @@ pub(crate) fn bottle(command: BottleCommand) -> Result<()> {
             )?;
         }
         BottleCommand::Path { name } => {
-            let root = bottle_root(&bottles_dir(), &name);
-            if !root.is_dir() {
-                bail!("bottle '{name}' does not exist");
-            }
+            let root = require_bottle(&bottles_dir(), &name)?;
             let mut out = std::io::stdout().lock();
             write_line(&mut out, &root.display().to_string())?;
         }
@@ -201,7 +208,8 @@ pub(crate) fn bottle(command: BottleCommand) -> Result<()> {
                 eprintln!("delete bottle '{name}' and ALL its contents? [y/N]");
                 let mut line = String::new();
                 std::io::stdin().read_line(&mut line)?;
-                if !line.trim().eq_ignore_ascii_case("y") {
+                let answer = line.trim();
+                if !(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")) {
                     eprintln!("aborted");
                     return Ok(());
                 }
@@ -213,10 +221,7 @@ pub(crate) fn bottle(command: BottleCommand) -> Result<()> {
             host_path,
             target,
         } => {
-            let root = bottle_root(&bottles_dir(), &name);
-            if !root.is_dir() {
-                bail!("bottle '{name}' does not exist");
-            }
+            let root = require_bottle(&bottles_dir(), &name)?;
             // The explicit source argument must not be a symlink: interior
             // symlinks are skipped by copy_into, but a symlinked *source*
             // would silently copy nothing.
@@ -242,10 +247,7 @@ pub(crate) fn bottle(command: BottleCommand) -> Result<()> {
             exe,
             guest_args,
         } => {
-            let root = bottle_root(&bottles_dir(), &name);
-            if !root.is_dir() {
-                bail!("bottle '{name}' does not exist");
-            }
+            let root = require_bottle(&bottles_dir(), &name)?;
             let host_exe = resolve_exe(&root, &exe)?;
             if !host_exe.is_file() {
                 bail!("guest exe not found in bottle: '{exe}'");
@@ -313,6 +315,19 @@ mod tests {
         // Nothing may be created outside the bottles dir.
         assert!(!dir.join("..").join("evil").exists());
         assert!(!std::path::Path::new("/tmp/evil").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn require_bottle_rejects_invalid_names() {
+        let dir = temp_dir();
+        create(&dir, "ok").unwrap();
+        assert!(require_bottle(&dir, "..").is_err());
+        assert!(require_bottle(&dir, "../evil").is_err());
+        assert!(require_bottle(&dir, "").is_err());
+        // Valid name + existing bottle resolves; missing bottle errors.
+        assert!(require_bottle(&dir, "ok").is_ok());
+        assert!(require_bottle(&dir, "missing").is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
 
