@@ -113,8 +113,15 @@ fn delete(bottles_dir: &Path, name: &str) -> Result<()> {
 }
 
 /// Recursively copy `src` to `dst` (file or directory tree).
+///
+/// Symlinks are NOT followed: a link to an ancestor would loop forever, and
+/// a link to outside content would copy files that are not part of the
+/// source tree. Symlinks in the source are skipped (mirrors `dir_size`'s
+/// un-followed contract); only regular files are copied.
 fn copy_into(src: &Path, dst: &Path) -> Result<()> {
-    if src.is_dir() {
+    let meta =
+        fs::symlink_metadata(src).with_context(|| format!("failed to stat {}", src.display()))?;
+    if meta.is_dir() {
         fs::create_dir_all(dst).with_context(|| format!("failed to create {}", dst.display()))?;
         for entry in
             fs::read_dir(src).with_context(|| format!("failed to read {}", src.display()))?
@@ -123,13 +130,16 @@ fn copy_into(src: &Path, dst: &Path) -> Result<()> {
             copy_into(&entry.path(), &dst.join(entry.file_name()))?;
         }
         Ok(())
-    } else {
+    } else if meta.is_file() {
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
         fs::copy(src, dst)
             .with_context(|| format!("failed to copy {} → {}", src.display(), dst.display()))?;
+        Ok(())
+    } else {
+        // Symlink (or other non-regular entry): skipped, never followed.
         Ok(())
     }
 }
@@ -304,6 +314,27 @@ mod tests {
         copy_into(&src_dir, &dst.join("tree")).unwrap();
         assert_eq!(fs::read(dst.join("a.txt")).unwrap(), b"hi");
         assert_eq!(fs::read(dst.join("tree/sub/b.txt")).unwrap(), b"yo");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn copy_into_skips_symlinks() {
+        let dir = temp_dir();
+        let src_dir = dir.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("real.txt"), b"x").unwrap();
+        // Symlink to an ancestor — following it would loop forever.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&dir, src_dir.join("loop")).unwrap();
+
+        let dst = dir.join("dst");
+        copy_into(&src_dir, &dst).unwrap();
+        assert_eq!(fs::read(dst.join("real.txt")).unwrap(), b"x");
+        #[cfg(unix)]
+        assert!(
+            !dst.join("loop").exists(),
+            "symlinks must be skipped, not followed"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 }
