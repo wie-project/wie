@@ -112,6 +112,36 @@ fn delete(bottles_dir: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Recursively copy `src` to `dst` (file or directory tree).
+fn copy_into(src: &Path, dst: &Path) -> Result<()> {
+    if src.is_dir() {
+        fs::create_dir_all(dst).with_context(|| format!("failed to create {}", dst.display()))?;
+        for entry in
+            fs::read_dir(src).with_context(|| format!("failed to read {}", src.display()))?
+        {
+            let entry = entry?;
+            copy_into(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        fs::copy(src, dst)
+            .with_context(|| format!("failed to copy {} → {}", src.display(), dst.display()))?;
+        Ok(())
+    }
+}
+
+/// Resolve a guest path (e.g. `C:\Apps\Foo`) to its host path inside the
+/// bottle's `drive_c`. Rejects paths that do not stay under `C:\`.
+fn resolve_guest_path(bottle_root: &Path, guest_path: &str) -> Result<PathBuf> {
+    wie_winapi::bottle::guest_path_to_host(bottle_root, guest_path)
+        .filter(|host| host.starts_with(drive_c_dir(bottle_root)))
+        .with_context(|| format!("guest path '{guest_path}' must live under C:\\"))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -237,6 +267,43 @@ mod tests {
             dir.is_dir(),
             "bottles dir itself must survive a bottle delete"
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_guest_path_maps_under_drive_c() {
+        let dir = temp_dir();
+        create(&dir, "b").unwrap();
+        let root = bottle_root(&dir, "b");
+        let host = resolve_guest_path(&root, r"C:\Apps\Foo\a.txt").unwrap();
+        assert_eq!(host, drive_c_dir(&root).join("Apps/Foo/a.txt"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_guest_path_rejects_escape() {
+        let dir = temp_dir();
+        create(&dir, "b").unwrap();
+        let root = bottle_root(&dir, "b");
+        assert!(resolve_guest_path(&root, r"C:\..\escape").is_err());
+        assert!(resolve_guest_path(&root, r"D:\other").is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn copy_into_copies_file_and_dir() {
+        let dir = temp_dir();
+        let src_file = dir.join("a.txt");
+        fs::write(&src_file, b"hi").unwrap();
+        let src_dir = dir.join("tree");
+        fs::create_dir_all(src_dir.join("sub")).unwrap();
+        fs::write(src_dir.join("sub/b.txt"), b"yo").unwrap();
+
+        let dst = dir.join("out");
+        copy_into(&src_file, &dst.join("a.txt")).unwrap();
+        copy_into(&src_dir, &dst.join("tree")).unwrap();
+        assert_eq!(fs::read(dst.join("a.txt")).unwrap(), b"hi");
+        assert_eq!(fs::read(dst.join("tree/sub/b.txt")).unwrap(), b"yo");
         fs::remove_dir_all(&dir).unwrap();
     }
 }
