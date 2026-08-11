@@ -76,6 +76,33 @@ fn list(bottles_dir: &Path) -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// Sum of all file sizes under `root`, recursively (bytes).
+fn dir_size(root: &Path) -> u64 {
+    let mut total = 0;
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                total += dir_size(&path);
+            } else if let Ok(meta) = fs::metadata(&path) {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
+/// Remove a bottle (fails if it does not exist).
+fn delete(bottles_dir: &Path, name: &str) -> Result<()> {
+    validate_name(name)?;
+    let root = bottle_root(bottles_dir, name);
+    if !root.is_dir() {
+        bail!("bottle '{name}' does not exist");
+    }
+    fs::remove_dir_all(&root).with_context(|| format!("failed to delete bottle '{name}'"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -153,5 +180,27 @@ mod tests {
             "bottles dir must be WIE/bottles, got {}",
             dir.display()
         );
+    }
+
+    #[test]
+    fn info_reports_path_and_size() {
+        let dir = temp_dir();
+        create(&dir, "apps").unwrap();
+        // A 10-byte file inside drive_c.
+        let f = drive_c_dir(&bottle_root(&dir, "apps")).join("hello.txt");
+        fs::write(&f, b"0123456789").unwrap();
+        let root = bottle_root(&dir, "apps");
+        assert_eq!(dir_size(&root), 10);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn delete_removes_and_missing_fails() {
+        let dir = temp_dir();
+        create(&dir, "gone").unwrap();
+        delete(&dir, "gone").unwrap();
+        assert!(!bottle_root(&dir, "gone").exists());
+        assert!(delete(&dir, "gone").is_err());
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
