@@ -1,4 +1,5 @@
 //! CLI command implementations.
+mod bottle;
 mod inspect;
 mod run;
 mod trace;
