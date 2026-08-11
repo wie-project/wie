@@ -127,6 +127,59 @@ enum Command {
         #[arg(long, default_value_t = TRACE_MAX_API_DEFAULT)]
         max_api: usize,
     },
+
+    /// Named-bottle management (create/list/info/delete/add/run).
+    Bottle {
+        #[command(subcommand)]
+        command: BottleCommand,
+    },
+}
+
+/// Named-bottle management (`Bottle` subcommand surface).
+#[derive(Debug, Subcommand)]
+pub(crate) enum BottleCommand {
+    /// Create a new named bottle (guest `C:\` root under `WIE/bottles/<name>`).
+    Create {
+        /// Bottle name (a directory name under the bottles dir).
+        name: String,
+    },
+
+    /// List all named bottles.
+    List,
+
+    /// Show a bottle's host path, drive layout and size.
+    Info { name: String },
+
+    /// Print a bottle's host root path (for `run --root` scripting).
+    Path { name: String },
+
+    /// Delete a bottle and its contents.
+    Delete {
+        name: String,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+
+    /// Copy a host file or folder into a bottle's `drive_c`.
+    Add {
+        name: String,
+        /// Host path to copy (file or directory, copied recursively).
+        host_path: PathBuf,
+        /// Guest destination under `C:\`, e.g. `C:\Apps\Foo` (default: `C:\<basename>`).
+        #[arg(long)]
+        target: Option<String>,
+    },
+
+    /// Run a guest exe inside a bottle (delegates to `run --root`).
+    Run {
+        name: String,
+        /// Guest path of the exe inside the bottle, e.g. `C:\App\app.exe`.
+        exe: String,
+        /// Guest argv after the exe.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        guest_args: Vec<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -256,6 +309,7 @@ fn main() -> Result<()> {
         Command::Trace { path, max_api } => {
             commands::entry_trace(&path, max_api)?;
         }
+        Command::Bottle { command } => commands::bottle(command)?,
     }
 
     Ok(())

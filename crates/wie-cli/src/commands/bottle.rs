@@ -5,6 +5,8 @@
 //! default single bottle (`WIE/bottle`) is untouched — named bottles are
 //! siblings under `WIE/bottles/`.
 
+use crate::BottleCommand;
+use crate::commands::util::write_line;
 use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -155,6 +157,111 @@ fn resolve_guest_path(bottle_root: &Path, guest_path: &str) -> Result<PathBuf> {
 /// Host path of a guest exe inside the bottle, e.g. `C:\App\app.exe`.
 fn resolve_exe(bottle_root: &Path, guest_exe: &str) -> Result<PathBuf> {
     resolve_guest_path(bottle_root, guest_exe)
+}
+
+/// Entry point for `wie bottle …` (called from `main`).
+pub(crate) fn bottle(command: BottleCommand) -> Result<()> {
+    match command {
+        BottleCommand::Create { name } => create(&bottles_dir(), &name)?,
+        BottleCommand::List => {
+            let mut out = std::io::stdout().lock();
+            for name in list(&bottles_dir())? {
+                if !write_line(&mut out, &name)? {
+                    return Ok(());
+                }
+            }
+        }
+        BottleCommand::Info { name } => {
+            let root = bottle_root(&bottles_dir(), &name);
+            if !root.is_dir() {
+                bail!("bottle '{name}' does not exist");
+            }
+            let mut out = std::io::stdout().lock();
+            write_line(
+                &mut out,
+                &format!(
+                    "name: {name}\nroot: {}\ndrive_c: {}\nsize: {} bytes",
+                    root.display(),
+                    drive_c_dir(&root).display(),
+                    dir_size(&root)
+                ),
+            )?;
+        }
+        BottleCommand::Path { name } => {
+            let root = bottle_root(&bottles_dir(), &name);
+            if !root.is_dir() {
+                bail!("bottle '{name}' does not exist");
+            }
+            let mut out = std::io::stdout().lock();
+            write_line(&mut out, &root.display().to_string())?;
+        }
+        BottleCommand::Delete { name, yes } => {
+            validate_name(&name)?;
+            if !yes {
+                eprintln!("delete bottle '{name}' and ALL its contents? [y/N]");
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                if !line.trim().eq_ignore_ascii_case("y") {
+                    eprintln!("aborted");
+                    return Ok(());
+                }
+            }
+            delete(&bottles_dir(), &name)?;
+        }
+        BottleCommand::Add {
+            name,
+            host_path,
+            target,
+        } => {
+            let root = bottle_root(&bottles_dir(), &name);
+            if !root.is_dir() {
+                bail!("bottle '{name}' does not exist");
+            }
+            // The explicit source argument must not be a symlink: interior
+            // symlinks are skipped by copy_into, but a symlinked *source*
+            // would silently copy nothing.
+            if fs::symlink_metadata(&host_path)
+                .with_context(|| format!("failed to stat {}", host_path.display()))?
+                .is_symlink()
+            {
+                bail!("source is a symlink: {}", host_path.display());
+            }
+            let guest_target = target.unwrap_or_else(|| {
+                let base = host_path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "root".to_owned());
+                format!(r"C:\{base}")
+            });
+            let dst = resolve_guest_path(&root, &guest_target)?;
+            copy_into(&host_path, &dst)?;
+            eprintln!("copied {} → {}", host_path.display(), dst.display());
+        }
+        BottleCommand::Run {
+            name,
+            exe,
+            guest_args,
+        } => {
+            let root = bottle_root(&bottles_dir(), &name);
+            if !root.is_dir() {
+                bail!("bottle '{name}' does not exist");
+            }
+            let host_exe = resolve_exe(&root, &exe)?;
+            if !host_exe.is_file() {
+                bail!("guest exe not found in bottle: '{exe}'");
+            }
+            crate::commands::run_micro(
+                &host_exe,
+                crate::MICRO_MAX_API_DEFAULT,
+                0,
+                Some(&root),
+                None,
+                None,
+                &guest_args,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
