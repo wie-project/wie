@@ -12,10 +12,13 @@ use std::path::PathBuf;
 /// `ExitProcess`). Matches the runtime's own `run_micro_exe` default.
 const MICRO_MAX_API_DEFAULT: usize = 256;
 /// Default host-API-stop cap for the persistent run loop (yields on idle
-/// instead of gating on `ExitProcess`).
-const PERSISTENT_MAX_API_DEFAULT: usize = 3400;
-/// Default cap for `trace` (controlled entry-point API trace).
-const TRACE_MAX_API_DEFAULT: usize = 20;
+/// instead of gating on `ExitProcess`). Real guests (SDL2 games) make
+/// millions of host stops — every guest WinAPI call stops the host — so the
+/// cap is generous; `--max-api` still bounds it for CI micro runs.
+const PERSISTENT_MAX_API_DEFAULT: usize = 5_000_000;
+/// Default cap for `trace` (controlled entry-point API trace). Games need
+/// more than a handful of stops to reach a meaningful point.
+const TRACE_MAX_API_DEFAULT: usize = 1_000;
 
 #[derive(Debug, Parser)]
 #[command(name = "wie")]
