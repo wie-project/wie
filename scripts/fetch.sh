@@ -7,9 +7,10 @@
 #   ./scripts/fetch.sh --list | --help
 #
 # Apps:
-#   7za      — 7-Zip Extra x64 console PE        [curl + p7zip]
-#   2048     — mevdschee/2048.c terminal game    [curl + mingw-w64]
-#   notepad  — katahiromz/RNotepad               [git + cmake + mingw-w64]
+#   7za       — 7-Zip Extra x64 console PE        [curl + p7zip]
+#   2048      — mevdschee/2048.c terminal game    [curl + mingw-w64]
+#   notepad   — katahiromz/RNotepad               [git + cmake + mingw-w64]
+#   doomretro — DOOM Retro v6.3 win64 (SDL2/GL)   [curl + unzip]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -165,6 +166,33 @@ fetch_notepad() {
   file "$DEST/notepad.exe"
 }
 
+# ------------------------------------------------------------ DOOM Retro
+fetch_doomretro() {
+  # One-time setup: download the DOOM Retro v6.3 win64 bundle (game exe +
+  # WAD + SDL2/SDL2_mixer + audio codecs) into real_exes/doomretro/.
+  # Requires: curl, unzip.
+  DIR="$DEST/doomretro"
+  if [[ -f "$DIR/doomretro.exe" ]]; then
+    echo "doomretro already present at $DIR/doomretro.exe"
+    file "$DIR/doomretro.exe"
+    exit 0
+  fi
+
+  mkdir -p "$DIR"
+  TMP="/tmp/doomretro-$$"
+  mkdir -p "$TMP"
+
+  curl -fL -o "$TMP/doomretro.zip"     "https://github.com/bradharding/doomretro/releases/download/v6.3/doomretro-6.3-win64.zip"
+
+  unzip -q "$TMP/doomretro.zip" -d "$DIR"
+
+  rm -rf "$TMP"
+
+  echo "downloaded:"
+  file "$DIR/doomretro.exe"
+  echo "note: needs a Doom WAD (doom1.wad etc.) next to the exe to actually run"
+}
+
 # ------------------------------------------------------------------ main
 main() {
   local app="${1:-}"
@@ -183,6 +211,7 @@ main() {
       echo "  7za      — 7-Zip Extra x64 console PE        [curl + p7zip]"
       echo "  2048     — mevdschee/2048.c terminal game    [curl + mingw-w64]"
       echo "  notepad  — katahiromz/RNotepad               [git + cmake + mingw-w64]"
+      echo "  doomretro — DOOM Retro v6.3 win64 (SDL2/GL)   [curl + unzip]"
       echo
       echo "Fetch one:  ./scripts/fetch.sh <app>"
       exit 0
@@ -195,6 +224,9 @@ main() {
       ;;
     notepad | rnotepad)
       fetch_notepad
+      ;;
+    doomretro | doom)
+      fetch_doomretro
       ;;
     *)
       echo "Error: unknown app '$app'" >&2
