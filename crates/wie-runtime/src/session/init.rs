@@ -13,10 +13,81 @@ use crate::memory::{
 use crate::mt_runtime::{ProcessConfig, ProcessResources};
 use ahash::{HashMap, HashMapExt};
 use anyhow::{Context, Result};
+use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use super::profile::RuntimeProfile;
+
+/// Copy `.wad` game data from the host exe dir into the guest-visible exe
+/// dir (the bottle). DOOM Retro's bundle ships `doomretro.wad` (resource)
+/// and `freedoom1.wad` / `freedoom2.wad` (free IWADs) beside the exe, but the
+/// guest can only reach the bottle; without them it errors out at startup
+/// ("doomretro.wad can't be found"). The freedoom IWADs are also aliased to
+/// the classic names (`DOOM1.WAD` / `DOOM2.WAD`) classic Doom engines search
+/// for. No-op when the exe already runs from inside the bottle.
+fn stage_wad_payload(
+    volumes: &wie_winapi::VolumeConfig,
+    exe: &Path,
+    module_path: &str,
+) -> Result<()> {
+    let Some(host_exe_dir) = exe.parent() else {
+        return Ok(());
+    };
+    let guest_dir = wie_winapi::vfs::guest_parent(module_path);
+    let Some(map) = wie_winapi::vfs::guest_path_to_host(volumes, &guest_dir) else {
+        return Ok(());
+    };
+    let dest_dir = map.host;
+    if host_exe_dir == dest_dir {
+        return Ok(()); // data already sits beside the guest-visible exe
+    }
+    std::fs::create_dir_all(&dest_dir)
+        .with_context(|| format!("create bottle app dir: {}", dest_dir.display()))?;
+    for entry in std::fs::read_dir(host_exe_dir)
+        .with_context(|| format!("read exe dir for WAD payload: {}", host_exe_dir.display()))?
+    {
+        let entry = entry.with_context(|| "read exe-dir entry".to_string())?;
+        let src = entry.path();
+        if !src.is_file() {
+            continue;
+        }
+        let Some(fname) = src.file_name() else {
+            continue;
+        };
+        let Some(ext) = src.extension() else {
+            continue;
+        };
+        if !ext.eq_ignore_ascii_case("wad") {
+            continue;
+        }
+        let target = dest_dir.join(fname);
+        std::fs::copy(&src, &target).with_context(|| {
+            format!(
+                "copy WAD payload into bottle ({} -> {})",
+                src.display(),
+                target.display()
+            )
+        })?;
+        let lower = fname.to_string_lossy().to_ascii_lowercase();
+        let alias = match lower.as_str() {
+            "freedoom1.wad" => Some("DOOM1.WAD"),
+            "freedoom2.wad" => Some("DOOM2.WAD"),
+            _ => None,
+        };
+        if let Some(alias_name) = alias {
+            let alias_path = dest_dir.join(alias_name);
+            std::fs::copy(&src, &alias_path).with_context(|| {
+                format!(
+                    "copy WAD payload alias into bottle ({} -> {})",
+                    src.display(),
+                    alias_path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
 
 /// Register default layout ranges into the CPU region table.
 fn register_layout_regions(
@@ -749,6 +820,9 @@ impl super::RuntimeSession {
         if let Some(guest_path) = wie_winapi::host_path_to_guest(&volumes, path) {
             process.module_path = guest_path;
         }
+        // Make sibling `.wad` game data guest-visible (DOOM Retro needs its
+        // IWAD + resource WAD; the host exe dir is outside the bottle).
+        stage_wad_payload(&volumes, path, &process.module_path)?;
         write_process_identity_strings(
             &mut engine,
             command_line_a_ptr,
@@ -1077,8 +1151,69 @@ impl super::RuntimeSession {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use wie_winapi::MessageQueueIdlePolicy;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("wie-init-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// `stage_wad_payload` copies sibling `.wad` game data into the
+    /// guest-visible exe dir (the bottle's `C:\` root for an unbottled exe)
+    /// and aliases the freedoom IWADs to the classic names Doom engines
+    /// search for (freedoom1.wad → DOOM1.WAD, freedoom2.wad → DOOM2.WAD).
+    #[test]
+    fn stage_wad_payload_copies_wads_with_freedoom_aliases() {
+        let src = TempDir::new("wad-src");
+        let exe = src.path().join("doomretro.exe");
+        std::fs::write(&exe, b"MZ").expect("write fake exe");
+        for name in ["doomretro.wad", "freedoom1.wad", "freedoom2.wad"] {
+            std::fs::write(src.path().join(name), format!("wad-{name}")).expect("write fake wad");
+        }
+        // A non-WAD sibling must not be copied.
+        std::fs::write(src.path().join("readme.txt"), b"hi").expect("write readme");
+
+        let bottle = TempDir::new("wad-bottle");
+        let volumes = wie_winapi::VolumeConfig::from_parts(Some(bottle.path().to_path_buf()), None);
+        // The unbottled exe's guest module path is `C:\{name}` → exe dir `C:\`.
+        super::stage_wad_payload(&volumes, &exe, r"C:\doomretro.exe").expect("stage");
+
+        let drive_c = bottle.path().join("drive_c");
+        for (name, content) in [
+            ("doomretro.wad", "wad-doomretro.wad"),
+            ("freedoom1.wad", "wad-freedoom1.wad"),
+            ("freedoom2.wad", "wad-freedoom2.wad"),
+            ("DOOM1.WAD", "wad-freedoom1.wad"),
+            ("DOOM2.WAD", "wad-freedoom2.wad"),
+        ] {
+            assert_eq!(
+                std::fs::read_to_string(drive_c.join(name)).expect("read staged wad"),
+                content,
+                "staged {name}"
+            );
+        }
+        assert!(
+            !drive_c.join("readme.txt").exists(),
+            "non-WAD sibling untouched"
+        );
+    }
 
     /// A staged in-bottle copy's guest module path derives through the volume
     /// mapping: `{root}/drive_c/Program Files/{name}/{name}.exe` becomes
