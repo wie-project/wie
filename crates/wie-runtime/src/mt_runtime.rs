@@ -42,6 +42,10 @@ pub(crate) struct ProcessConfig {
     pub stop_bitmap: Arc<[u8]>,
     /// Guest thread id of the primary (entry-point) thread.
     pub primary_tid: GuestTid,
+    /// Statically-loaded guest DLLs awaiting `DllMain(PROCESS_ATTACH)`, in
+    /// load order (dependencies before dependents). The session pump runs
+    /// them before dispatching the exe entry point.
+    pub static_dll_mains: Vec<wie_winapi::dll_loader::StaticDllMain>,
 }
 
 // ── ProcessResources: single struct for both JIT and Iced ──────────────
@@ -109,6 +113,10 @@ impl ProcessResources {
     }
     pub(crate) fn primary_tid(&self) -> u32 {
         self.config.primary_tid.0
+    }
+
+    pub(crate) fn static_dll_mains(&self) -> &[wie_winapi::dll_loader::StaticDllMain] {
+        &self.config.static_dll_mains
     }
 
     pub(crate) fn winapi_arc(&self) -> Arc<Mutex<WinApiState>> {

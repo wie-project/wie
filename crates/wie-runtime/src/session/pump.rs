@@ -58,6 +58,34 @@ impl super::RuntimeSession {
         let instruction_budget = layout.instruction_budget;
         let no_hook_limit = layout.no_hook_slice_limit;
 
+        // Static-dependency DllMain(PROCESS_ATTACH) init phase: Windows calls
+        // each static dep's DllMain in load order (dependencies first) BEFORE
+        // the exe entry point. Runs once, on the first quantum, guarded by
+        // `entry_reached`; completing the phase resets RIP to 0 so the next
+        // iteration dispatches the exe entry. Skipped entirely when the
+        // budget is zero (preparing would push a return address nothing ever
+        // pops).
+        let dll_main_return_va = wie_winapi::dll_main_return_trampoline_va();
+        let mut dll_main_index = 0_usize;
+        let static_dll_mains: Vec<wie_winapi::dll_loader::StaticDllMain> = if self.entry_reached {
+            Vec::new()
+        } else {
+            self.process.static_dll_mains().to_vec()
+        };
+        if max_api > 0
+            && let Some(first) = static_dll_mains.first()
+        {
+            wie_winapi::dll_loader::prepare_dll_main_call(
+                &mut *self.process.engine,
+                first.image_base,
+                first.entry_rva,
+                wie_winapi::dll_loader::DLL_PROCESS_ATTACH,
+                1, // lpvReserved: non-zero marks a static (loader) call.
+                dll_main_return_va,
+            )
+            .context("failed to prepare first static DllMain call")?;
+        }
+
         // Ceiling on API stops that did not charge toward `max_api` (noisy
         // fast-path returns): 50× the budget, at least a fixed 50k slack.
         const NOISY_API_FACTOR: usize = 50;
@@ -296,6 +324,48 @@ impl super::RuntimeSession {
                     }
                 } else {
                     self.no_hook_slices = 0;
+
+                    // A statically-loaded dependency's DllMain returned. RAX
+                    // carries the BOOL result; FALSE aborts process init
+                    // (Windows STATUS_DLL_INIT_FAILED semantics) — the exe
+                    // entry never runs.
+                    if !self.entry_reached && hook.address == dll_main_return_va {
+                        let dll_ok = engine
+                            .read_rax()
+                            .context("failed to read RAX after static DllMain")?;
+                        let name = static_dll_mains
+                            .get(dll_main_index)
+                            .map(|m| m.name.as_str())
+                            .unwrap_or("?");
+                        if dll_ok == 0 {
+                            termination = EntryTraceTermination::RuntimeStop(format!(
+                                "{name}!DllMain returned FALSE (DLL_PROCESS_ATTACH) \
+                                 — process init aborted"
+                            ));
+                            break 'outer;
+                        }
+                        dll_main_index = dll_main_index
+                            .checked_add(1)
+                            .context("static DllMain index overflow")?;
+                        if let Some(next) = static_dll_mains.get(dll_main_index) {
+                            wie_winapi::dll_loader::prepare_dll_main_call(
+                                engine,
+                                next.image_base,
+                                next.entry_rva,
+                                wie_winapi::dll_loader::DLL_PROCESS_ATTACH,
+                                1,
+                                dll_main_return_va,
+                            )
+                            .context("failed to prepare next static DllMain call")?;
+                        } else {
+                            // Init phase complete: reset RIP so the next
+                            // iteration dispatches the exe entry point.
+                            engine
+                                .write_rip(0)
+                                .context("failed to reset RIP after static DllMain phase")?;
+                        }
+                        continue 'outer;
+                    }
 
                     if hook.address == layout.callback_return_trampoline_va {
                         // complete_guest_callback needs &mut self — handle outside.

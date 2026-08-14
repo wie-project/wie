@@ -18,61 +18,6 @@ use std::time::Instant;
 
 use super::profile::RuntimeProfile;
 
-/// Apply final PE section and header page protects after image copy.
-///
-/// Sequence: whole image → `PAGE_NOACCESS` (gap pages), headers → RO, each
-/// section → characteristics-derived protect. IAT must already be patched in
-/// the host-side image buffer before this runs.
-fn apply_pe_section_protects(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    plan: &wie_pe::PeMapPlan,
-) -> Result<()> {
-    use wie_cpu::protect::{PAGE_NOACCESS, PAGE_READONLY};
-
-    let image_size = usize::try_from(plan.size_of_image).context("size_of_image")?;
-    if image_size == 0 {
-        return Ok(());
-    }
-    // Gaps / padding: committed NOACCESS so VirtualQuery sees image space.
-    engine
-        .virtual_protect(plan.image_base, image_size, PAGE_NOACCESS)
-        .context("PE gap NOACCESS protect")?;
-
-    let header_len = u64::from(plan.header_size);
-    if let Some((start, end)) = wie_pe::page_align_image_range(0, header_len, plan.size_of_image) {
-        let len = usize::try_from(end.saturating_sub(start)).context("header range")?;
-        if len > 0 {
-            engine
-                .virtual_protect(plan.image_base.saturating_add(start), len, PAGE_READONLY)
-                .context("PE headers protect")?;
-        }
-    }
-
-    for sec in &plan.sections {
-        let rva = u64::from(sec.va);
-        let vsize = u64::from(sec.virtual_size);
-        if vsize == 0 {
-            continue;
-        }
-        let Some((start, end)) = wie_pe::page_align_image_range(rva, vsize, plan.size_of_image)
-        else {
-            continue;
-        };
-        let len = usize::try_from(end.saturating_sub(start)).context("section range")?;
-        if len == 0 {
-            continue;
-        }
-        engine
-            .virtual_protect(
-                plan.image_base.saturating_add(start),
-                len,
-                sec.final_protect,
-            )
-            .with_context(|| format!("PE section {} protect", sec.name))?;
-    }
-    Ok(())
-}
-
 /// Register default layout ranges into the CPU region table.
 fn register_layout_regions(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -152,6 +97,7 @@ pub(crate) struct SessionInit {
     pub(crate) stop_bitmap: Arc<[u8]>,
     pub(crate) shared_jit: Option<Arc<wie_cpu::JitShared>>,
     pub(crate) guest_mem: Option<Arc<RwLock<wie_cpu::GuestMemory>>>,
+    pub(crate) static_dll_mains: Vec<wie_winapi::dll_loader::StaticDllMain>,
     pub(crate) entry_point_va: GuestVa,
     pub(crate) initial_rsp: GuestStackPtr,
 }
@@ -169,6 +115,7 @@ impl SessionInit {
         stop_bitmap: Arc<[u8]>,
         shared_jit: Option<Arc<wie_cpu::JitShared>>,
         guest_mem: Option<Arc<RwLock<wie_cpu::GuestMemory>>>,
+        static_dll_mains: Vec<wie_winapi::dll_loader::StaticDllMain>,
         entry_point_va: GuestVa,
         initial_rsp: GuestStackPtr,
     ) -> Self {
@@ -181,6 +128,7 @@ impl SessionInit {
             stop_bitmap,
             shared_jit,
             guest_mem,
+            static_dll_mains,
             entry_point_va,
             initial_rsp,
         }
@@ -226,6 +174,7 @@ impl super::RuntimeSession {
             stop_bitmap,
             shared_jit,
             guest_mem,
+            static_dll_mains,
             ..
         } = init;
         let config = ProcessConfig {
@@ -234,6 +183,7 @@ impl super::RuntimeSession {
             layout,
             stop_bitmap,
             primary_tid: GuestTid::PRIMARY,
+            static_dll_mains,
         };
         let shared_winapi = Arc::new(Mutex::new(winapi_state));
         // Clone the message-queue Arc so the host can post input without ever
@@ -340,6 +290,14 @@ impl super::RuntimeSession {
         // Collect RuntimeFakeApiEntry during the resolution pass so we can skip
         // the redundant build_iat_fake_api_entries call later.
         let mut iat_entries: Vec<RuntimeFakeApiEntry> = Vec::new();
+        // Static guest-DLL imports (SDL2.dll, libogg-0.dll, …): pass 1 records
+        // `(library, name, iat slot)`; pass 2 loads the real DLL and overwrites
+        // the slot once winapi_state + import_resolver + main_module_host_dir
+        // exist (all created after the image load below). The IAT slot span is
+        // tracked here (pass 2 relaxes it to writable before patching).
+        let mut deferred_guest_imports: Vec<(String, String, u64)> = Vec::new();
+        let mut deferred_first_slot: Option<u64> = None;
+        let mut deferred_last_slot: Option<u64> = None;
         let (image_summary, pe_map_plan, _patched_imports) = {
             let engine_ref = &mut *engine;
             wie_pe::load_pe_direct_from_parsed(
@@ -372,6 +330,19 @@ impl super::RuntimeSession {
                         iat_entries.push(entry);
                         return Ok(data_va);
                     }
+                    // Static guest-DLL import: record the IAT slot for pass 2,
+                    // which loads the real DLL and overwrites the slot. The
+                    // soft placeholder below keeps today's "unsupported API"
+                    // stop if the DLL cannot be loaded (graceful degradation).
+                    if !wie_winapi::is_winapi_library(&import.library) {
+                        let slot = import.iat_slot_va;
+                        deferred_guest_imports.push((import.library.clone(), name.clone(), slot));
+                        let slot_end = slot.saturating_add(8);
+                        deferred_first_slot =
+                            Some(deferred_first_slot.map_or(slot, |first| first.min(slot)));
+                        deferred_last_slot =
+                            Some(deferred_last_slot.map_or(slot_end, |last| last.max(slot_end)));
+                    }
                     let (va, entry) = resolve_import_fake_va(
                         &import.library,
                         &name,
@@ -387,8 +358,12 @@ impl super::RuntimeSession {
 
         let fake_api_entries = collect_stub_entries(&iat_entries, &soft_apis);
 
-        apply_pe_section_protects(engine.as_mut(), &pe_map_plan)
-            .context("failed to apply PE section protects")?;
+        wie_winapi::dll_loader::apply_pe_section_protects(
+            engine.as_mut(),
+            &pe_map_plan,
+            pe_map_plan.image_base,
+        )
+        .context("failed to apply PE section protects")?;
         t_phase = phase("image-load+protects", t_phase);
 
         engine
@@ -935,6 +910,92 @@ impl super::RuntimeSession {
             winapi_state.process.main_module_host_dir = Some(parent.to_owned());
         }
 
+        // Pass 2: static guest-DLL imports. Pass 1 left soft placeholders in
+        // the IAT slots; now that winapi_state, the import resolver, and the
+        // main module's host dir exist, load each guest DLL and overwrite the
+        // slot with the export's real guest VA. Failures keep the placeholder
+        // (the guest sees today's "unsupported API" stop — graceful
+        // degradation). No-op for the current micros (no guest-DLL imports).
+        // Statically-loaded deps are also pinned against FreeLibrary and
+        // recorded (load order) for the DllMain(PROCESS_ATTACH) phase the
+        // session pump runs before the exe entry.
+        let mut static_dll_mains: Vec<wie_winapi::dll_loader::StaticDllMain> = Vec::new();
+        if let (Some(first_slot), Some(last_slot)) = (deferred_first_slot, deferred_last_slot) {
+            let mut fake_resolve = |lib: &str, name: &str, slot: u64| -> anyhow::Result<u64> {
+                let (va, _entry) =
+                    crate::hooks::resolve_import_fake_va(lib, name, slot, &mut soft_apis)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                Ok(va)
+            };
+            // The IAT lives in a READONLY section (protects applied at image
+            // load); relax the slot span, patch, then re-apply the protects.
+            // The restore is unconditional: a failed patch write must not
+            // leave the IAT span relaxed.
+            let slot_span = last_slot.saturating_sub(first_slot);
+            engine
+                .virtual_protect(
+                    first_slot,
+                    usize::try_from(slot_span).context("static import IAT span too large")?,
+                    wie_cpu::protect::PAGE_READWRITE,
+                )
+                .context("failed to relax IAT span for static guest import patching")?;
+            let patch_result = (|| -> anyhow::Result<()> {
+                for (library, name, slot) in &deferred_guest_imports {
+                    match wie_winapi::dll_loader::resolve_static_guest_import(
+                        engine.as_mut(),
+                        &mut winapi_state,
+                        library,
+                        name,
+                        &mut fake_resolve,
+                        &mut static_dll_mains,
+                    ) {
+                        Ok(Some(export_va)) => {
+                            engine
+                                .mem_write(*slot, &export_va.to_le_bytes())
+                                .with_context(|| {
+                                    format!(
+                                        "failed to patch static guest import {library}!{name} at {slot:#x}"
+                                    )
+                                })?;
+                        }
+                        Ok(None) => {
+                            tracing::debug!(
+                                target: "wiegui",
+                                library, name,
+                                "static guest import unavailable; keeping placeholder"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "wiegui",
+                                library, name,
+                                error = %format!("{e:#}"),
+                                "static guest import load failed; keeping placeholder"
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            })();
+            let restored = wie_winapi::dll_loader::apply_pe_section_protects(
+                engine.as_mut(),
+                &pe_map_plan,
+                pe_map_plan.image_base,
+            )
+            .context("failed to re-apply PE section protects after static import patching");
+            if let Err(patch_err) = patch_result {
+                if let Err(restore_err) = restored {
+                    tracing::warn!(
+                        target: "wiegui",
+                        error = %format!("{restore_err:#}"),
+                        "failed to restore PE section protects after static patch error"
+                    );
+                }
+                return Err(patch_err);
+            }
+            restored?;
+        }
+
         let mut session = Self::from_init(SessionInit::new(
             engine,
             environment,
@@ -944,6 +1005,7 @@ impl super::RuntimeSession {
             stop_bitmap,
             shared_jit,
             guest_mem,
+            static_dll_mains,
             GuestVa(image_summary.entry_point_va),
             GuestStackPtr(initial_rsp),
         ));
