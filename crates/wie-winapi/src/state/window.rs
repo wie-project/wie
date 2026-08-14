@@ -474,6 +474,9 @@ pub struct FontDialogSession {
 /// caller snapshots the whole window state.
 pub struct WindowState {
     pub(crate) window_long_ptr_values: Vec<(u64, i64, u64)>,
+    /// Per-window property list (`SetPropW`/`GetPropW`/`RemovePropW`):
+    /// `(hwnd, name, value)`.
+    pub(crate) window_props: Vec<(u64, String, u64)>,
     pub(crate) image_list_counts: Vec<(u64, u64)>,
     pub(crate) image_list_background_colors: Vec<(u64, u32)>,
     pub(crate) window_visible: bool,
@@ -766,6 +769,7 @@ impl Default for WindowState {
             registered_messages: ahash::HashMap::new(),
             next_timer_id: 1,
             window_long_ptr_values: Vec::new(),
+            window_props: Vec::new(),
             image_list_counts: Vec::new(),
             image_list_background_colors: Vec::new(),
             window_visible: false,

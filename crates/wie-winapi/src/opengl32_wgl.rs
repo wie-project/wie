@@ -121,7 +121,7 @@ pub(super) fn handle_wgl_get_proc_address(
 
 /// `int wglChoosePixelFormat(HDC hdc, const PIXELFORMATDESCRIPTOR *ppfd)`
 /// — the single RGBA double-buffer format always matches.
-pub(super) fn handle_wgl_choose_pixel_format(
+pub(crate) fn handle_wgl_choose_pixel_format(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -136,7 +136,7 @@ pub(super) fn handle_wgl_choose_pixel_format(
 
 /// `BOOL wglSetPixelFormat(HDC hdc, int format,
 /// const PIXELFORMATDESCRIPTOR *ppfd)` — records the format on the HDC.
-pub(super) fn handle_wgl_set_pixel_format(
+pub(crate) fn handle_wgl_set_pixel_format(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -156,7 +156,7 @@ pub(super) fn handle_wgl_set_pixel_format(
 /// `int wglDescribePixelFormat(HDC hdc, int iPixelFormat, UINT nBytes,
 /// const PIXELFORMATDESCRIPTOR *ppfd)` — writes the descriptor and reports
 /// one pixel format.
-pub(super) fn handle_wgl_describe_pixel_format(
+pub(crate) fn handle_wgl_describe_pixel_format(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -180,7 +180,7 @@ pub(super) fn handle_wgl_describe_pixel_format(
 
 /// `int wglGetPixelFormat(HDC hdc)` — the format `wglSetPixelFormat` stored,
 /// or 0 when none was set.
-pub(super) fn handle_wgl_get_pixel_format(
+pub(crate) fn handle_wgl_get_pixel_format(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -200,7 +200,7 @@ pub(super) fn handle_wgl_get_pixel_format(
 /// (`crate::gdi32::resolve_dest_info`); an unresolvable DC falls back to the
 /// topmost top-level window. With no window at all the swap is a silent
 /// no-op — still TRUE, so the guest's present loop keeps running.
-pub(super) fn handle_wgl_swap_buffers(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+pub(crate) fn handle_wgl_swap_buffers(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let hdc = engine

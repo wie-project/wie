@@ -146,6 +146,8 @@ pub enum DllId {
     Winmm,
     /// Internet/HTTP handle tables (`WININET.dll` — HINTERNET sessions).
     Wininet,
+    /// WinHTTP handle table (`WINHTTP.dll` — SDL2 online-probe handles).
+    Winhttp,
 }
 
 impl DllId {
@@ -201,6 +203,7 @@ const fn dll_index(id: DllId) -> usize {
         DllId::Ole32 => 11,
         DllId::Winmm => 12,
         DllId::Wininet => 13,
+        DllId::Winhttp => 14,
     }
 }
 
@@ -485,6 +488,13 @@ impl WinApiState {
     pub fn wininet(&mut self) -> &mut crate::wininet::WininetState {
         self.dll_states
             .get_or_init::<crate::wininet::WininetState>(DllId::Wininet)
+    }
+
+    /// Mutable access to the WinHTTP handle table. Lazy: allocated on first
+    /// `WINHTTP` call.
+    pub fn winhttp(&mut self) -> &mut crate::winhttp::WinhttpState {
+        self.dll_states
+            .get_or_init::<crate::winhttp::WinhttpState>(DllId::Winhttp)
     }
 
     /// Read-only access — returns `None` if the state was never initialised.

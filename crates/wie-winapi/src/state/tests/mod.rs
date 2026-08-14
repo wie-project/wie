@@ -18,8 +18,8 @@ use crate::sync_obj::SyncState;
 use crate::thread::{PRIMARY_THREAD_ID, ThreadState};
 use crate::vfs::VolumeConfig;
 use crate::{
-    advapi32, comctl32, comdlg32, d3d9, dll_loader, gdi32, kernel32, oleaut32, present, shell32,
-    user32,
+    advapi32, comctl32, comdlg32, d3d9, dbghelp, dll_loader, gdi32, imm32, kernel32, ole32,
+    oleaut32, present, setupapi, shell32, user32, winhttp, winmm,
 };
 
 const STACK_VA: u64 = 0x100_0000;
@@ -701,6 +701,8 @@ mod menu;
 mod message_box;
 mod modal_frame;
 mod ole_auto;
+mod phase2_stubs;
+mod phase3_stubs;
 mod registry;
 mod repaint;
 mod seh_dispatch;

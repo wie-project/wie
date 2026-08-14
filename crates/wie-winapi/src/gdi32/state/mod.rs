@@ -6,7 +6,7 @@ use crate::handles::{Hbitmap, Hbrush, Hdc, Hfont, Hpen};
 use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 
 mod metrics;
-mod objects;
+pub(crate) mod objects;
 mod records;
 
 // Re-export everything the old single-file `state` module exposed, so

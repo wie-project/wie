@@ -87,6 +87,9 @@ pub fn dispatch_shell32(
         "shgetfileinfow" => Ok(Some(handle_sh_get_file_info(ctx, true)?)),
         "shgetspecialfolderpathw" => Ok(Some(handle_sh_get_special_folder_path_w(ctx)?)),
         "shellexecuteexw" => Ok(Some(handle_sh_execute_ex_w(ctx)?)),
+        // Phase-3 stub wave: the ANSI variants share the W logic.
+        "shellexecutea" => Ok(Some(handle_shell_execute_a(ctx)?)),
+        "shellexecuteexa" => Ok(Some(handle_sh_execute_ex_a(ctx)?)),
         _ => Ok(None),
     }
 }
@@ -639,6 +642,74 @@ fn spill_main_module(state: &WinApiState) -> Option<std::path::PathBuf> {
         std::env::temp_dir().join(format!("wie-relaunch-{}-{file_name}", std::process::id()));
     std::fs::write(&path, state.file_io.executable_file_bytes.as_ref()).ok()?;
     Some(path)
+}
+
+/// `HINSTANCE ShellExecuteA(HWND, LPCSTR, LPCSTR, LPCSTR, LPCSTR, INT)` — the
+/// ANSI variant of [`handle_shell_execute_w`] (same detached-run semantics).
+fn handle_shell_execute_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let (operation, file) = {
+        let engine = &mut *ctx.engine;
+        let _hwnd = engine
+            .read_rcx()
+            .context("failed to read RCX for ShellExecuteA")?;
+        let operation_va = engine
+            .read_rdx()
+            .context("failed to read RDX for ShellExecuteA")?;
+        let file_va = engine
+            .read_r8()
+            .context("failed to read R8 for ShellExecuteA")?;
+        let _parameters_va = engine
+            .read_r9()
+            .context("failed to read R9 for ShellExecuteA")?;
+        let operation = crate::guest_string::read_ansi_lossy(engine, operation_va, 64)?;
+        let file = crate::guest_string::read_ansi_lossy(engine, file_va, 1024)?;
+        (operation, file)
+    };
+
+    let return_value = if file.is_empty() {
+        SE_ERR_FNF
+    } else if operation.is_empty() || operation.eq_ignore_ascii_case("open") {
+        shell_execute_open(ctx.state, &file)
+    } else {
+        SE_ERR_NOASSOC
+    };
+
+    tracing::info!(
+        target: "wiegui",
+        operation = %operation,
+        file = %file,
+        return_value,
+        "ShellExecuteA"
+    );
+    finish(ctx.engine, return_value)
+}
+
+/// `BOOL ShellExecuteExA(pExecInfo)` — the ANSI variant of
+/// [`handle_sh_execute_ex_w`] (the `SHELLEXECUTEINFOA` layout matches the W
+/// struct; only the pointed-to strings are ANSI).
+fn handle_sh_execute_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let (exec_info_va, verb, file) = {
+        let engine = &mut *ctx.engine;
+        let exec_info_va = engine.read_rcx()?;
+        if exec_info_va == 0 {
+            return finish(engine, 0);
+        }
+        let verb_va = read_u64(engine, exec_info_va.wrapping_add(0x10))?;
+        let file_va = read_u64(engine, exec_info_va.wrapping_add(0x18))?;
+        let verb = crate::guest_string::read_ansi_lossy(engine, verb_va, 64)?;
+        let file = crate::guest_string::read_ansi_lossy(engine, file_va, 1024)?;
+        (exec_info_va, verb, file)
+    };
+    let (h_inst_app, ok) = if file.is_empty() {
+        (SE_ERR_FNF, false)
+    } else if verb.is_empty() || verb.eq_ignore_ascii_case("open") {
+        let launched = shell_execute_open(ctx.state, &file);
+        (launched, launched > 32)
+    } else {
+        (SE_ERR_NOASSOC, false)
+    };
+    write_guest_u64(ctx.engine, exec_info_va.wrapping_add(0x38), h_inst_app)?;
+    finish(ctx.engine, if ok { 1 } else { 0 })
 }
 
 #[cfg(test)]

@@ -18,6 +18,14 @@ pub fn dispatch_imm32(
         "immgetopenstatus" => Ok(Some(handle_imm_get_open_status(ctx)?)),
         "immreleasecontext" => Ok(Some(handle_imm_release_context(ctx)?)),
         "immgetcompositionstringw" => Ok(Some(handle_imm_get_composition_string_w(ctx)?)),
+        // Phase-3 stub wave: the remaining IME surface reports "no IME".
+        "immassociatecontext" => Ok(Some(handle_imm_associate_context(ctx)?)),
+        "immgetcandidatelistw" => Ok(Some(handle_imm_get_candidate_list_w(ctx)?)),
+        "immgetimefilenamea" => Ok(Some(handle_imm_get_ime_file_name_a(ctx)?)),
+        "immnotifyime" => Ok(Some(handle_imm_notify_ime(ctx)?)),
+        "immsetcandidatewindow" => Ok(Some(handle_imm_set_false(ctx)?)),
+        "immsetcompositionstringw" => Ok(Some(handle_imm_set_false(ctx)?)),
+        "immsetcompositionwindow" => Ok(Some(handle_imm_set_false(ctx)?)),
         _ => Ok(None),
     }
 }
@@ -71,5 +79,50 @@ fn handle_imm_get_composition_string_w(
     let _dw_buf_len = engine
         .read_r9()
         .context("failed to read R9 for ImmGetCompositionStringW")?;
+    ctx.finish(0)
+}
+
+/// `HIMC ImmAssociateContext(HWND hwnd, HIMC himc)` — no IME, so the call
+/// succeeds conceptually but returns NULL (no default IME context exists).
+fn handle_imm_associate_context(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _hwnd = ctx.engine.read_rcx()?;
+    let _himc = ctx.engine.read_rdx()?;
+    ctx.finish(0)
+}
+
+/// `DWORD ImmGetCandidateListW(HIMC, DWORD, LPCANDIDATELIST, DWORD)` — no
+/// candidate list; returns 0.
+fn handle_imm_get_candidate_list_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _himc = ctx.engine.read_rcx()?;
+    let _index = ctx.engine.read_rdx()?;
+    let _list = ctx.engine.read_r8()?;
+    let _size = ctx.engine.read_r9()?;
+    ctx.finish(0)
+}
+
+/// `DWORD ImmGetIMEFileNameA(HIMC, LPSTR, DWORD)` — no IME file; returns 0.
+fn handle_imm_get_ime_file_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _himc = ctx.engine.read_rcx()?;
+    let _name = ctx.engine.read_rdx()?;
+    let _size = ctx.engine.read_r8()?;
+    ctx.finish(0)
+}
+
+/// `BOOL ImmNotifyIME(HIMC, DWORD, DWORD, DWORD)` — no IME; FALSE.
+fn handle_imm_notify_ime(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _himc = ctx.engine.read_rcx()?;
+    let _action = ctx.engine.read_rdx()?;
+    let _index = ctx.engine.read_r8()?;
+    let _value = ctx.engine.read_r9()?;
+    ctx.finish(0)
+}
+
+/// Shared `BOOL` FALSE for the `ImmSet*` family — the (absent) IME rejects
+/// candidate/composition window changes.
+fn handle_imm_set_false(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _arg0 = ctx.engine.read_rcx()?;
+    let _arg1 = ctx.engine.read_rdx()?;
+    let _arg2 = ctx.engine.read_r8()?;
+    let _arg3 = ctx.engine.read_r9()?;
     ctx.finish(0)
 }

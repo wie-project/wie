@@ -72,6 +72,30 @@ pub fn dispatch_winmm_extra(
         "waveoutunprepareheader" => Ok(Some(handle_wave_out_unprepare_header(ctx)?)),
         "waveoutwrite" => Ok(Some(handle_wave_out_write(ctx)?)),
         "waveoutgetnumdevs" => Ok(Some(handle_wave_out_get_num_devs(ctx)?)),
+        "waveoutgetdevcapsw" => Ok(Some(handle_wave_out_get_dev_caps_w(ctx)?)),
+        "waveoutgeterrortextw" => Ok(Some(handle_wave_out_get_error_text_w(ctx)?)),
+        "waveoutreset" => Ok(Some(handle_wave_out_reset(ctx)?)),
+        "waveingetnumdevs" => Ok(Some(handle_wave_in_get_num_devs(ctx)?)),
+        "waveinopen"
+        | "waveinclose"
+        | "waveinaddbuffer"
+        | "waveinprepareheader"
+        | "waveinunprepareheader"
+        | "waveinstart"
+        | "waveinreset" => Ok(Some(handle_wave_in_no_driver(ctx)?)),
+        "waveingetdevcapsw" => Ok(Some(handle_wave_in_no_driver(ctx)?)),
+        "midioutgetdevcapsa"
+        | "midioutprepareheader"
+        | "midioutreset"
+        | "midioutsetvolume"
+        | "midioutshortmsg"
+        | "midioutunprepareheader" => Ok(Some(handle_midi_no_driver(ctx)?)),
+        "midioutgeterrortexta" => Ok(Some(handle_midi_out_get_error_text_a(ctx)?)),
+        "midistreamopen" | "midistreamclose" | "midistreamout" | "midistreampause"
+        | "midistreamproperty" | "midistreamrestart" | "midistreamstop" => {
+            Ok(Some(handle_midi_no_driver(ctx)?))
+        }
+        "timebeginperiod" | "timeendperiod" => Ok(Some(handle_time_begin_end_period(ctx)?)),
         _ => Ok(None),
     }
 }
@@ -266,4 +290,146 @@ pub fn handle_time_get_time(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     let return_value = crate::kernel32::clock::tick_count_32();
 
     ctx.finish(return_value)
+}
+
+/// `MMSYSERR_NODRIVER` — no MIDI / capture device driver is present.
+const MMSYSERR_NODRIVER: u64 = 97;
+
+/// Handles `WINMM.dll!waveOutGetDevCapsW` — the single fake wave-out device's
+/// capabilities (kept consistent with `waveOutGetNumDevs` = 1).
+pub fn handle_wave_out_get_dev_caps_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let _device_id = engine
+        .read_rcx()
+        .context("failed to read RCX for waveOutGetDevCapsW")?;
+    let caps_va = engine
+        .read_rdx()
+        .context("failed to read RDX for waveOutGetDevCapsW")?;
+    let _caps_size = engine
+        .read_r8()
+        .context("failed to read R8 for waveOutGetDevCapsW")?;
+    if caps_va == 0 {
+        return ctx.finish(MMSYSERR_INVALPARAM);
+    }
+    // WAVEOUTCAPSW (84 bytes): wMid@0, wPid@2, vDriverVersion@4, dwFormats@8,
+    // wChannels@12, wReserved1@14, dwSupport@16, wszPname[32]@20.
+    let mut buf = [0_u8; 84];
+    buf[8..12].copy_from_slice(&0xFFFF_u32.to_le_bytes()); // all WAVE_FORMAT_* bits
+    buf[12..14].copy_from_slice(&2_u16.to_le_bytes()); // stereo
+    let name = "WIE Virtual Audio";
+    for (i, b) in name.encode_utf16().enumerate() {
+        let off = 20 + i * 2;
+        if off + 2 <= buf.len() {
+            buf[off..off + 2].copy_from_slice(&b.to_le_bytes());
+        }
+    }
+    engine
+        .mem_write(caps_va, &buf)
+        .context("failed to write WAVEOUTCAPSW")?;
+    ctx.finish(MMSYSERR_NOERROR)
+}
+
+/// Handles `WINMM.dll!waveOutGetErrorTextW` — writes the error text for the
+/// common codes into the guest buffer.
+pub fn handle_wave_out_get_error_text_w(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let error_code = engine
+        .read_rcx()
+        .context("failed to read RCX for waveOutGetErrorTextW")?;
+    let text_va = engine
+        .read_rdx()
+        .context("failed to read RDX for waveOutGetErrorTextW")?;
+    let text_len = engine
+        .read_r8()
+        .context("failed to read R8 for waveOutGetErrorTextW")?;
+    let text: &str = match error_code {
+        MMSYSERR_NOERROR => "No error.",
+        MMSYSERR_INVALPARAM => "Invalid parameter.",
+        MMSYSERR_NODRIVER => "No device driver is present.",
+        _ => "Unknown error.",
+    };
+    if text_va != 0 {
+        crate::guest_string::write_utf16_c_string(
+            engine,
+            text_va,
+            usize::try_from(text_len).unwrap_or(0),
+            text,
+        )
+        .context("failed to write waveOutGetErrorTextW buffer")?;
+    }
+    ctx.finish(MMSYSERR_NOERROR)
+}
+
+/// Handles `WINMM.dll!waveOutReset` — the fake device plays nothing, so the
+/// reset is a no-op like `waveOutWrite`.
+pub fn handle_wave_out_reset(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _hwo = ctx.engine.read_rcx()?;
+    ctx.finish(MMSYSERR_NOERROR)
+}
+
+/// Handles `WINMM.dll!waveInGetNumDevs` — no capture devices.
+pub fn handle_wave_in_get_num_devs(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    ctx.finish(0)
+}
+
+/// Handles the `WINMM.dll!waveIn*` family — no capture device driver, so
+/// every operation fails with `MMSYSERR_NODRIVER`.
+pub fn handle_wave_in_no_driver(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _arg0 = ctx.engine.read_rcx()?;
+    let _arg1 = ctx.engine.read_rdx()?;
+    let _arg2 = ctx.engine.read_r8()?;
+    let _arg3 = ctx.engine.read_r9()?;
+    ctx.finish(MMSYSERR_NODRIVER)
+}
+
+/// Handles the `WINMM.dll!midiOut*` / `midiStream*` families — no MIDI device
+/// driver, so every operation fails with `MMSYSERR_NODRIVER`.
+pub fn handle_midi_no_driver(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _arg0 = ctx.engine.read_rcx()?;
+    let _arg1 = ctx.engine.read_rdx()?;
+    let _arg2 = ctx.engine.read_r8()?;
+    let _arg3 = ctx.engine.read_r9()?;
+    ctx.finish(MMSYSERR_NODRIVER)
+}
+
+/// Handles `WINMM.dll!midiOutGetErrorTextA` — writes the error text for the
+/// common codes into the guest ANSI buffer.
+pub fn handle_midi_out_get_error_text_a(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let error_code = engine
+        .read_rcx()
+        .context("failed to read RCX for midiOutGetErrorTextA")?;
+    let text_va = engine
+        .read_rdx()
+        .context("failed to read RDX for midiOutGetErrorTextA")?;
+    let text_len = engine
+        .read_r8()
+        .context("failed to read R8 for midiOutGetErrorTextA")?;
+    let text: &str = match error_code {
+        MMSYSERR_NOERROR => "No error.",
+        MMSYSERR_INVALPARAM => "Invalid parameter.",
+        MMSYSERR_NODRIVER => "No device driver is present.",
+        _ => "Unknown error.",
+    };
+    if text_va != 0 {
+        crate::guest_string::write_ansi_c_string(
+            engine,
+            text_va,
+            usize::try_from(text_len).unwrap_or(0),
+            text,
+        )
+        .context("failed to write midiOutGetErrorTextA buffer")?;
+    }
+    ctx.finish(MMSYSERR_NOERROR)
+}
+
+/// Handles `WINMM.dll!timeBeginPeriod` / `timeEndPeriod` — accepted no-ops
+/// returning `TIMERR_NOERROR` (host timers are not quantum-constrained).
+pub fn handle_time_begin_end_period(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _period = ctx.engine.read_rcx()?;
+    ctx.finish(TIMERR_NOERROR)
 }

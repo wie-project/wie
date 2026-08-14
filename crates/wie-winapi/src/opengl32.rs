@@ -38,7 +38,7 @@ mod render;
 
 /// The WGL context/surface handlers (fake-HGLRC handle table).
 #[path = "opengl32_wgl.rs"]
-mod wgl;
+pub(crate) mod wgl;
 
 /// The stage-2 `gl*` handlers (arrays, VBOs, lists, lighting).
 #[path = "opengl32_gl2.rs"]

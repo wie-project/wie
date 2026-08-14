@@ -141,6 +141,8 @@ pub fn dispatch_ole32(
         "stringfromclsid" => Ok(Some(handle_string_from_clsid(ctx)?)),
         "clsidfromstring" => Ok(Some(handle_clsid_from_string(ctx)?)),
         "cogetclassobject" => Ok(Some(handle_co_get_class_object(ctx)?)),
+        // Phase-3 stub wave.
+        "propvariantclear" => Ok(Some(handle_prop_variant_clear(ctx)?)),
         // ── OLE clipboard / drag-drop lane ─────────────────────────────
         "oleinitialize" => Ok(Some(ole_clipboard::handle_ole_initialize(ctx)?)),
         "oleuninitialize" => Ok(Some(ole_clipboard::handle_ole_uninitialize(ctx)?)),
@@ -482,4 +484,20 @@ fn hex_nibble(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
+}
+
+/// `HRESULT PropVariantClear(PROPVARIANT *pvar)` — zeroes the 16-byte
+/// `PROPVARIANT` (the union's `vt` is set to `VT_EMPTY` = 0) and returns
+/// `S_OK`. No heap payloads are owned, so the clear is a plain zero.
+fn handle_prop_variant_clear(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let variant_va = engine
+        .read_rcx()
+        .context("failed to read RCX for PropVariantClear")?;
+    if variant_va != 0 {
+        engine
+            .mem_write(variant_va, &[0_u8; 16])
+            .context("failed to zero PROPVARIANT")?;
+    }
+    finish(engine, S_OK)
 }

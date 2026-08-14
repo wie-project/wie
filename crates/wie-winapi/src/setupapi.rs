@@ -32,6 +32,13 @@ pub fn dispatch_setupapi(
         "setupdidestroydeviceinfolist" => Ok(Some(handle_setup_di_destroy_device_info_list(ctx)?)),
         "cm_get_device_id_listw" => Ok(Some(handle_cm_get_device_id_list(ctx, true)?)),
         "cm_get_device_id_lista" => Ok(Some(handle_cm_get_device_id_list(ctx, false)?)),
+        // Phase-3 stub wave: devnode-level queries report no such device.
+        "cm_get_device_ida" => Ok(Some(handle_cm_no_such_devnode(ctx)?)),
+        "cm_get_parent" => Ok(Some(handle_cm_no_such_devnode(ctx)?)),
+        "cm_locate_devnodea" => Ok(Some(handle_cm_no_such_devnode(ctx)?)),
+        "setupdienumdeviceinterfaces" => Ok(Some(handle_setup_di_no_more_items(ctx)?)),
+        "setupdigetdeviceinterfacedetaila" => Ok(Some(handle_setup_di_no_more_items(ctx)?)),
+        "setupdigetdeviceregistrypropertya" => Ok(Some(handle_setup_di_no_more_items(ctx)?)),
         _ => Ok(None),
     }
 }
@@ -116,4 +123,27 @@ fn handle_cm_get_device_id_list(
         }
     }
     ctx.finish(0) // CR_SUCCESS
+}
+
+/// `CR_NO_SUCH_DEVNODE` (cfgmgr32.h) — the devnode does not exist.
+const CR_NO_SUCH_DEVNODE: u64 = 0x0E;
+
+/// Shared `CONFIGRET` for the `CM_*` devnode queries — no host devices.
+fn handle_cm_no_such_devnode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _arg0 = ctx.engine.read_rcx()?;
+    let _arg1 = ctx.engine.read_rdx()?;
+    let _arg2 = ctx.engine.read_r8()?;
+    let _arg3 = ctx.engine.read_r9()?;
+    ctx.finish(CR_NO_SUCH_DEVNODE)
+}
+
+/// Shared FALSE for the `SetupDiGet*` interface/property queries — the empty
+/// device set yields no interfaces, so `ERROR_NO_MORE_ITEMS`.
+fn handle_setup_di_no_more_items(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _arg0 = ctx.engine.read_rcx()?;
+    let _arg1 = ctx.engine.read_rdx()?;
+    let _arg2 = ctx.engine.read_r8()?;
+    let _arg3 = ctx.engine.read_r9()?;
+    ctx.state.process.last_error = ERROR_NO_MORE_ITEMS;
+    ctx.finish(0)
 }

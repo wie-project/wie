@@ -206,7 +206,7 @@ pub fn handle_create_compatible_bitmap(
     ctx.finish(handle)
 }
 
-fn next_gdi_bitmap_handle(state: &mut WinApiState) -> Result<u64> {
+pub(crate) fn next_gdi_bitmap_handle(state: &mut WinApiState) -> Result<u64> {
     // Use bump-heap high bits as a cheap monotonic discriminator.
     let live = u64::try_from(state.heap_state.heap.live_count()).unwrap_or(0);
     let index = (state.heap_state.heap.bump_cursor() >> 4).wrapping_add(live);

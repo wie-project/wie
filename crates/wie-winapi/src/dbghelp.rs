@@ -26,6 +26,14 @@ pub fn dispatch_dbghelp(
         "mapfileandchecksumw" | "mapfileandchecksuma" => {
             Ok(Some(handle_map_file_and_checksum(ctx)?))
         }
+        // Phase-3 stub wave: crash-dump / stack-walk surface.
+        "symsetoptions" => Ok(Some(handle_sym_set_options(ctx)?)),
+        "symfunctiontableaccess64" => Ok(Some(handle_sym_function_table_access(ctx)?)),
+        "symgetmodulebase64" => Ok(Some(handle_sym_get_module_base(ctx)?)),
+        "symgetmoduleinfo64" => Ok(Some(handle_sym_get_module_info(ctx)?)),
+        "symgetlinefromaddr64" => Ok(Some(handle_sym_get_line_from_addr(ctx)?)),
+        "stackwalk64" => Ok(Some(handle_stack_walk(ctx)?)),
+        "minidumpwritedump" => Ok(Some(handle_mini_dump_write_dump(ctx)?)),
         _ => Ok(None),
     }
 }
@@ -100,5 +108,72 @@ fn handle_map_file_and_checksum(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     if checksum != 0 {
         engine.mem_write(checksum, &zeros)?;
     }
+    ctx.finish(0)
+}
+
+/// `DWORD SymSetOptions(DWORD SymOptions)` — stateless; accepts and returns
+/// the previous options (0).
+fn handle_sym_set_options(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _options = ctx.engine.read_rcx()?;
+    ctx.finish(0)
+}
+
+/// `PVOID SymFunctionTableAccess64(HANDLE, DWORD64)` — no unwind tables; NULL.
+fn handle_sym_function_table_access(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _process = ctx.engine.read_rcx()?;
+    let _address = ctx.engine.read_rdx()?;
+    ctx.finish(0)
+}
+
+/// `DWORD64 SymGetModuleBase64(HANDLE, DWORD64)` — the base of the module
+/// containing the address, or 0 (reuses the Phase-2 module lookup).
+fn handle_sym_get_module_base(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let _process = engine.read_rcx()?;
+    let address = engine
+        .read_rdx()
+        .context("failed to read RDX for SymGetModuleBase64")?;
+    let base = crate::kernel32::module::module_containing(state, ctx.environment, address)
+        .map(|(base, _)| base)
+        .unwrap_or(0);
+    ctx.finish(base)
+}
+
+/// `BOOL SymGetModuleInfo64(HANDLE, DWORD64, IMAGEHLP_MODULE64*)` — FALSE.
+fn handle_sym_get_module_info(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _process = ctx.engine.read_rcx()?;
+    let _address = ctx.engine.read_rdx()?;
+    let _info = ctx.engine.read_r8()?;
+    ctx.finish(0)
+}
+
+/// `BOOL SymGetLineFromAddr64(HANDLE, DWORD64, PDWORD, IMAGEHLP_LINE64*)` —
+/// no line info; FALSE.
+fn handle_sym_get_line_from_addr(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _process = ctx.engine.read_rcx()?;
+    let _address = ctx.engine.read_rdx()?;
+    let _displacement = ctx.engine.read_r8()?;
+    let _line = ctx.engine.read_r9()?;
+    ctx.finish(0)
+}
+
+/// `BOOL StackWalk64(DWORD, HANDLE, HANDLE, STACKFRAME64*, ...)` — no frames;
+/// FALSE.
+fn handle_stack_walk(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _machine = ctx.engine.read_rcx()?;
+    let _process = ctx.engine.read_rdx()?;
+    let _thread = ctx.engine.read_r8()?;
+    let _frame = ctx.engine.read_r9()?;
+    ctx.finish(0)
+}
+
+/// `BOOL MiniDumpWriteDump(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, ...)` — no
+/// crash dumps; FALSE.
+fn handle_mini_dump_write_dump(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _process = ctx.engine.read_rcx()?;
+    let _pid = ctx.engine.read_rdx()?;
+    let _file = ctx.engine.read_r8()?;
+    let _type = ctx.engine.read_r9()?;
     ctx.finish(0)
 }
