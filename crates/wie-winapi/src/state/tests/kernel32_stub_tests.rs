@@ -1067,3 +1067,94 @@ fn test_raise_exception_unhandled_surfaces_error() {
         "an unhandled RaiseException must surface as an error"
     );
 }
+
+/// Streaming (host-backed, >BUFFER_SIZE_THRESHOLD) files must honor
+/// SetFilePointerEx to a high offset followed by ReadFile — the DOOM Retro
+/// WAD load seeks to the lump directory at ~28 MiB and reads it back.
+#[test]
+fn test_streaming_seek_to_high_offset_then_read() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // Build a host file with a recognizable marker at a 28 MiB offset.
+    let tmp = std::env::temp_dir().join(format!("wie-stream-{}.bin", std::process::id()));
+    let _ = std::fs::remove_file(&tmp).ok();
+    std::fs::write(&tmp, b"HEAD").expect("write head");
+    let marker = b"LUMPS-AT-HIGH-OFFSET";
+    let marker_off = 28 * 1024 * 1024u64;
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&tmp)
+            .expect("open tmp");
+        use std::io::{Seek, SeekFrom, Write};
+        f.seek(SeekFrom::Start(marker_off)).expect("seek tmp");
+        f.write_all(marker).expect("write marker");
+        f.flush().expect("flush");
+    }
+
+    let handle = kernel32::allocate_open_file_ex(
+        &mut state,
+        r"C:\big.bin",
+        Vec::new(),
+        Some(tmp.clone()),
+        true,
+    )
+    .expect("open streaming file");
+    assert!(
+        state
+            .file_io
+            .open_files
+            .get(&handle)
+            .expect("file")
+            .streaming
+    );
+
+    // SetFilePointerEx(hFile, liDistanceToMove, lpNewFilePointer, dwMoveMethod):
+    // R8 = lpNewFilePointer (output pointer), R9 = dwMoveMethod (FILE_BEGIN=0).
+    let new_pos_va = 0x6000_u64;
+    write_regs(&mut engine, handle, marker_off, new_pos_va, 0, 0);
+    let ret = {
+        let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
+        crate::dispatch_winapi_id(&mut ctx, crate::WinApiId::Kernel32Setfilepointerex)
+            .expect("dispatch")
+            .return_value
+    };
+    assert_eq!(ret, 1, "SetFilePointerEx TRUE");
+    let mut pos_bytes = [0_u8; 8];
+    engine
+        .mem_read(new_pos_va, &mut pos_bytes)
+        .expect("read pos");
+    assert_eq!(u64::from_le_bytes(pos_bytes), marker_off, "new position");
+    assert_eq!(
+        state.file_io.open_files.get(&handle).expect("file").cursor,
+        marker_off,
+        "cursor lands at the high offset"
+    );
+
+    // ReadFile(handle, buf, marker.len(), &n, NULL) at the high offset.
+    let buf_va = 0x7000_u64;
+    let n_va = 0x7100_u64;
+    write_regs(&mut engine, handle, buf_va, marker.len() as u64, n_va, 0);
+    let ret = {
+        let mut ctx = HandlerContext::new(&mut engine, default_env(), &mut state);
+        crate::dispatch_winapi_id(&mut ctx, crate::WinApiId::Kernel32Readfile)
+            .expect("dispatch")
+            .return_value
+    };
+    assert_eq!(ret, 1, "ReadFile TRUE");
+    assert_eq!(
+        read_test_i32(&mut engine, n_va) as usize,
+        marker.len(),
+        "bytes read"
+    );
+    let mut got = [0_u8; 32];
+    let got_len = got.len().min(marker.len());
+    engine
+        .mem_read(buf_va, &mut got[..got_len])
+        .expect("read guest buffer");
+    assert_eq!(&got[..got_len], marker, "marker read back at high offset");
+
+    let _ = std::fs::remove_file(&tmp).ok();
+}

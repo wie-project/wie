@@ -382,8 +382,10 @@ pub fn handle_set_file_pointer_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     // Win64: DistanceToMove is LARGE_INTEGER by value in RDX (signed 64-bit).
     let distance_raw = engine.read_rdx()?;
     let distance = i64::from_le_bytes(distance_raw.to_le_bytes());
-    let move_method = engine.read_r8()?;
-    let new_pos_va = engine.read_r9()?;
+    // SetFilePointerEx(hFile, liDistanceToMove, lpNewFilePointer, dwMoveMethod):
+    // R8 = lpNewFilePointer (output pointer), R9 = dwMoveMethod.
+    let new_pos_va = engine.read_r8()?;
+    let move_method = engine.read_r9()?;
 
     let valid_method =
         move_method == FILE_BEGIN || move_method == FILE_CURRENT || move_method == FILE_END;
