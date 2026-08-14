@@ -29,7 +29,9 @@ use gpr::{
 use ops::{ArithOp, BitOp, ShiftKind, cond_from_cmov, cond_from_jcc, cond_from_setcc};
 use sse::{
     exec_sse_bitwise, exec_sse_byte_shift, exec_sse_comis, exec_sse_cvt_fp_to_gpr,
-    exec_sse_cvt_gpr_to_fp, exec_sse_cvt_packed, exec_sse_cvtdq2pd, exec_sse_int_binop,
+    exec_sse_cvt_gpr_to_fp, exec_sse_cvt_packed, exec_sse_cvtdq2pd, exec_sse_cvtpd2dq,
+    exec_sse_cvtpd2ps, exec_sse_cvtps2pd, exec_sse_cvtsd2ss, exec_sse_cvtss2sd,
+    exec_sse_int_binop,
     exec_sse_minmax_packed, exec_sse_minmax_scalar, exec_sse_mov, exec_sse_movd, exec_sse_movhlps,
     exec_sse_movhps, exec_sse_movq, exec_sse_packed_fp, exec_sse_pmovmskb, exec_sse_psadbw,
     exec_sse_pshufb, exec_sse_pshufd, exec_sse_pshuflw_hw, exec_sse_punpck, exec_sse_punpck_lanes,
@@ -280,6 +282,8 @@ fn execute_one(
         Mnemonic::Sar => exec_shift(mem, regs, instr, ShiftKind::Sar),
         Mnemonic::Rol => exec_shift(mem, regs, instr, ShiftKind::Rol),
         Mnemonic::Ror => exec_shift(mem, regs, instr, ShiftKind::Ror),
+        Mnemonic::Rcl => exec_shift(mem, regs, instr, ShiftKind::Rcl),
+        Mnemonic::Rcr => exec_shift(mem, regs, instr, ShiftKind::Rcr),
 
         Mnemonic::Jmp => exec_jmp(mem, regs, instr),
         Mnemonic::Call => exec_call(mem, regs, instr, next_ip),
@@ -554,6 +558,30 @@ fn execute_one(
         }
         // CVTDQ2PD: two packed dwords (low 64 bits) → two packed doubles.
         Mnemonic::Cvtdq2pd => exec_sse_cvtdq2pd(mem, regs, instr),
+        // CVTPS2PD: two packed singles (low 64 bits) → two packed doubles.
+        Mnemonic::Cvtps2pd => exec_sse_cvtps2pd(mem, regs, instr),
+        // CVTPD2DQ / CVTPD2PS: two packed doubles → dwords / singles.
+        Mnemonic::Cvtpd2dq => exec_sse_cvtpd2dq(mem, regs, instr),
+        Mnemonic::Cvtpd2ps => exec_sse_cvtpd2ps(mem, regs, instr),
+        // Scalar converts: low lane only, upper destination bits preserved.
+        Mnemonic::Cvtsd2ss => exec_sse_cvtsd2ss(mem, regs, instr),
+        Mnemonic::Cvtss2sd => exec_sse_cvtss2sd(mem, regs, instr),
+        // STMXCSR/LDMXCSR: store/load the MXCSR control register to/from m32.
+        // FP semantics use the native ARM64 rounding (default = nearest, which
+        // matches the x86 reset value), so only the stored word is tracked.
+        Mnemonic::Stmxcsr => {
+            let addr = effective_address(regs, instr)?;
+            write_mem_value(mem, addr, u64::from(regs.mxcsr()), 4)?;
+            Ok(())
+        }
+        Mnemonic::Ldmxcsr => {
+            let addr = effective_address(regs, instr)?;
+            let value = read_mem_value(mem, addr, 4)?;
+            let word = u32::try_from(value)
+                .map_err(|_| StepExecError::Cpu(CpuError::Message("ldmxcsr value".into())))?;
+            regs.set_mxcsr(word);
+            Ok(())
+        }
         Mnemonic::Addss => exec_sse_scalar_fp(mem, regs, instr, FpOp::Add, false),
         Mnemonic::Subss => exec_sse_scalar_fp(mem, regs, instr, FpOp::Sub, false),
         Mnemonic::Mulss => exec_sse_scalar_fp(mem, regs, instr, FpOp::Mul, false),
@@ -740,20 +768,26 @@ fn exec_shift(
     let mask = regs::size_mask(size);
     let dst = read_op(mem, regs, instr, 0)? & mask;
     let count_raw = read_op(mem, regs, instr, 1)? as u32;
-    // 64-bit mode: count masked with 0x3F; rotate width further reduces.
-    let count_masked = count_raw & 0x3f;
+    // 64-bit mode: count masked with 0x3F; other widths with 0x1F.
+    let count_masked = count_raw & if bits == 64 { 0x3f } else { 0x1f };
+    // Rotate-through-carry treats the operand as `width + 1` bits (CF + data);
+    // plain shifts/rotates reduce modulo the operand width.
     let width = u32::try_from(bits).unwrap_or(64);
-    let count_mod = if width == 64 {
-        count_masked
-    } else if width == 0 {
+    let rot_width = if matches!(kind, ShiftKind::Rcl | ShiftKind::Rcr) {
+        width.saturating_add(1)
+    } else {
+        width
+    };
+    let count_mod = if rot_width == 0 {
         0
     } else {
-        count_masked % width
+        count_masked % rot_width
     };
     if count_mod == 0 {
         return Ok(());
     }
     let count_usize = count_mod as usize;
+    let cf_in = regs.flag(Rflags::CF);
     let (result, cf) = match kind {
         ShiftKind::Shl => {
             let cf_bit = if count_usize <= bits {
@@ -784,6 +818,24 @@ fn exec_shift(
             let cf_bit = (r >> bits.saturating_sub(1)) & 1;
             (r, cf_bit != 0)
         }
+        ShiftKind::Rcl => {
+            // {CF, dst} as a (width+1)-bit value with CF at bit `width`, rotated left.
+            let total = u32::try_from(rot_width).unwrap_or(64);
+            let t = (u128::from(dst) << 1) | u128::from(cf_in);
+            let total_mask = (u128::from(1_u64) << total).wrapping_sub(1);
+            let t = ((t << count_mod) | (t >> (total - count_mod))) & total_mask;
+            let cf_bit = (t >> u32::try_from(bits).unwrap_or(64)) & 1;
+            ((t as u64) & mask, cf_bit != 0)
+        }
+        ShiftKind::Rcr => {
+            // {CF, dst} rotated right.
+            let total = u32::try_from(rot_width).unwrap_or(64);
+            let t = (u128::from(dst) << 1) | u128::from(cf_in);
+            let total_mask = (u128::from(1_u64) << total).wrapping_sub(1);
+            let t = ((t >> count_mod) | (t << (total - count_mod))) & total_mask;
+            let cf_bit = t & 1;
+            ((t as u64) & mask, cf_bit != 0)
+        }
     };
     regs.set_flag(Rflags::CF, cf);
     // ROL/ROR do not update ZF/SF/PF; SHL/SHR/SAR do.
@@ -801,6 +853,11 @@ fn exec_shift(
             ShiftKind::Sar => false,
             ShiftKind::Rol => ((result >> bits.saturating_sub(1)) ^ (result & 1)) != 0,
             ShiftKind::Ror => {
+                let b1 = (result >> bits.saturating_sub(1)) & 1;
+                let b2 = (result >> bits.saturating_sub(2)) & 1;
+                b1 != b2
+            }
+            ShiftKind::Rcl => (cf as u64 ^ ((result >> bits.saturating_sub(1)) & 1)) != 0,            ShiftKind::Rcr => {
                 let b1 = (result >> bits.saturating_sub(1)) & 1;
                 let b2 = (result >> bits.saturating_sub(2)) & 1;
                 b1 != b2

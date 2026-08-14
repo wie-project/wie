@@ -249,6 +249,14 @@ pub(crate) enum SseCvtOp {
     Cvtdq2ps = 13,
     /// 2 f32 lanes → 2 i32 lanes (truncate).
     Cvttps2dq = 14,
+    /// 1 f64 lane (64-bit half) → i32 (MXCSR round-nearest; default).
+    Cvtpd2dq = 15,
+    /// 1 f64 lane (64-bit half) → f32 (64-bit half → f32 bits).
+    Cvtpd2ps = 16,
+    /// 1 f64 lane → f32 bits (scalar cvtsd2ss; 32-bit result).
+    Cvtsd2ss = 17,
+    /// 1 f32 lane → f64 bits (scalar cvtss2sd).
+    Cvtss2sd = 18,
 }
 
 impl SseCvtOp {
@@ -277,6 +285,10 @@ impl TryFrom<u64> for SseCvtOp {
             12 => Self::Cvtps2dq,
             13 => Self::Cvtdq2ps,
             14 => Self::Cvttps2dq,
+            15 => Self::Cvtpd2dq,
+            16 => Self::Cvtpd2ps,
+            17 => Self::Cvtsd2ss,
+            18 => Self::Cvtss2sd,
             _ => return Err(()),
         })
     }

@@ -1070,6 +1070,147 @@ mod tests {
     }
 
     #[test]
+    fn simd_cvtps2pd_matches_iced() {
+        // CVTPS2PD xmm, xmm/m64: two packed singles → two doubles (0F 5A).
+        for (name, bytes, is_mem) in [
+            ("cvtps2pd reg", &[0x0f, 0x5a, 0xc1][..], false),
+            ("cvtps2pd mem", &[0x0f, 0x5a, 0x01][..], true),
+        ] {
+            let (iced, jit) = simd_dual(
+                bytes,
+                &[0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0xc0],
+                |r| {
+                    set_pair(r, 0, 0);
+                    if is_mem {
+                        r.set_gpr_public(1, SIMD_DATA); // RCX = m64 base
+                    }
+                },
+            );
+            assert_same_regs(&iced, &jit, name);
+        }
+        // Hand-check: singles 1.0f and -2.0f → doubles 1.0 (low) and -2.0 (high).
+        let src = u128::from(0xc000_0000_3f80_0000_u64);
+        let expect = u128::from(1.0_f64.to_bits()) | (u128::from((-2.0_f64).to_bits()) << 64);
+        let (iced, jit) = simd_dual(&[0x0f, 0x5a, 0xc1], &[], |r| set_pair(r, 0, src));
+        assert_eq!(iced.xmm_at(0), expect, "iced cvtps2pd 1,-2");
+        assert_eq!(jit.xmm_at(0), expect, "jit cvtps2pd 1,-2");
+    }
+
+    #[test]
+    fn simd_cvtpd2dq_matches_iced() {
+        // CVTPD2DQ xmm, xmm/m128 (F2 0F E6): two doubles → two dwords, upper zeroed.
+        for (name, bytes, is_mem) in [
+            ("cvtpd2dq reg", &[0xf2, 0x0f, 0xe6, 0xc1][..], false),
+            ("cvtpd2dq mem", &[0xf2, 0x0f, 0xe6, 0x01][..], true),
+        ] {
+            let (iced, jit) = simd_dual(
+                bytes,
+                &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f,
+                  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0],
+                |r| {
+                    set_pair(r, 0, 0x1234_5678_9abc_def0);
+                    if is_mem {
+                        r.set_gpr_public(1, SIMD_DATA); // RCX = m128 base
+                    }
+                },
+            );
+            assert_same_regs(&iced, &jit, name);
+        }
+        // Hand-check: doubles 1.0 and -2.0 → dwords 1 and -2 in the low 64 bits.
+        let src = u128::from((-2.0_f64).to_bits()) << 64 | u128::from(1.0_f64.to_bits());
+        let expect = u128::from(1_u64) | (u128::from(0xffff_fffe_u64) << 32);
+        let (iced, jit) = simd_dual(&[0xf2, 0x0f, 0xe6, 0xc1], &[], |r| set_pair(r, 0, src));
+        assert_eq!(iced.xmm_at(0), expect, "iced cvtpd2dq 1,-2");
+        assert_eq!(jit.xmm_at(0), expect, "jit cvtpd2dq 1,-2");
+    }
+
+    #[test]
+    fn simd_cvtpd2ps_matches_iced() {
+        // CVTPD2PS xmm, xmm/m128 (66 0F 5A): two doubles → two singles, upper zeroed.
+        for (name, bytes, is_mem) in [
+            ("cvtpd2ps reg", &[0x66, 0x0f, 0x5a, 0xc1][..], false),
+            ("cvtpd2ps mem", &[0x66, 0x0f, 0x5a, 0x01][..], true),
+        ] {
+            let (iced, jit) = simd_dual(
+                bytes,
+                &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f,
+                  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0],
+                |r| {
+                    set_pair(r, 0, 0x1122_3344_5566_7788);
+                    if is_mem {
+                        r.set_gpr_public(1, SIMD_DATA); // RCX = m128 base
+                    }
+                },
+            );
+            assert_same_regs(&iced, &jit, name);
+        }
+        // Hand-check: doubles 1.0 and -2.0 → singles 1.0f and -2.0f.
+        let src = u128::from((-2.0_f64).to_bits()) << 64 | u128::from(1.0_f64.to_bits());
+        let expect = u128::from(1.0_f32.to_bits()) | (u128::from((-2.0_f32).to_bits()) << 32);
+        let (iced, jit) = simd_dual(&[0x66, 0x0f, 0x5a, 0xc1], &[], |r| set_pair(r, 0, src));
+        assert_eq!(iced.xmm_at(0), expect, "iced cvtpd2ps 1,-2");
+        assert_eq!(jit.xmm_at(0), expect, "jit cvtpd2ps 1,-2");
+    }
+
+    #[test]
+    fn simd_cvtsd2ss_matches_iced() {
+        // CVTSD2SS xmm, xmm/m64 (F2 0F 5A): low double → single, upper preserved.
+        for (name, bytes, is_mem) in [
+            ("cvtsd2ss reg", &[0xf2, 0x0f, 0x5a, 0xc1][..], false),
+            ("cvtsd2ss mem", &[0xf2, 0x0f, 0x5a, 0x01][..], true),
+        ] {
+            let (iced, jit) = simd_dual(
+                bytes,
+                &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f],
+                |r| {
+                    set_pair(r, 0, 0x1234_5678_9abc_def0_1122_3344_5566_7788);
+                    if is_mem {
+                        r.set_gpr_public(1, SIMD_DATA); // RCX = m64 base
+                    }
+                },
+            );
+            assert_same_regs(&iced, &jit, name);
+        }
+        // Hand-check: low double 1.0 → single 1.0f, bits 32-127 preserved.
+        let old = u128::from(0xdead_beef_cafe_babe_u64) << 64 | u128::from(0x1122_3344_5566_7788_u64);
+        let src = u128::from(1.0_f64.to_bits());
+        let expect =
+            (old & 0xffff_ffff_ffff_ffff_ffff_ffff_0000_0000_u128) | u128::from(1.0_f32.to_bits());
+        let (iced, jit) = simd_dual(&[0xf2, 0x0f, 0x5a, 0xc1], &[], |r| set_pair(r, old, src));
+        assert_eq!(iced.xmm_at(0), expect, "iced cvtsd2ss preserve");
+        assert_eq!(jit.xmm_at(0), expect, "jit cvtsd2ss preserve");
+    }
+
+    #[test]
+    fn simd_cvtss2sd_matches_iced() {
+        // CVTSS2SD xmm, xmm/m32 (F3 0F 5A): low single → double, upper preserved.
+        for (name, bytes, is_mem) in [
+            ("cvtss2sd reg", &[0xf3, 0x0f, 0x5a, 0xc1][..], false),
+            ("cvtss2sd mem", &[0xf3, 0x0f, 0x5a, 0x01][..], true),
+        ] {
+            let (iced, jit) = simd_dual(
+                bytes,
+                &[0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x00],
+                |r| {
+                    set_pair(r, 0, 0x1234_5678_9abc_def0_1122_3344_5566_7788);
+                    if is_mem {
+                        r.set_gpr_public(1, SIMD_DATA); // RCX = m32 base
+                    }
+                },
+            );
+            assert_same_regs(&iced, &jit, name);
+        }
+        // Hand-check: low single 1.0f → double 1.0, bits 64-127 preserved.
+        let old = u128::from(0xdead_beef_cafe_babe_u64) << 64 | u128::from(0x1122_3344_5566_7788_u64);
+        let src = u128::from(1.0_f32.to_bits());
+        let expect = (old & 0xffff_ffff_ffff_ffff_0000_0000_0000_0000_u128)
+            | u128::from(1.0_f64.to_bits());
+        let (iced, jit) = simd_dual(&[0xf3, 0x0f, 0x5a, 0xc1], &[], |r| set_pair(r, old, src));
+        assert_eq!(iced.xmm_at(0), expect, "iced cvtss2sd preserve");
+        assert_eq!(jit.xmm_at(0), expect, "jit cvtss2sd preserve");
+    }
+
+    #[test]
     fn simd_pack_unpack_matches_iced() {
         let x0 = 0x807F_FF00_1234_5678_0001_FFFF_8000_7FFF_u128;
         let x1 = 0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10_u128;

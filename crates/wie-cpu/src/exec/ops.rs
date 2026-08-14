@@ -33,6 +33,8 @@ pub(super) enum ShiftKind {
     Sar,
     Rol,
     Ror,
+    Rcl,
+    Rcr,
 }
 
 pub(super) fn cond_from_jcc(m: Mnemonic, regs: &RegFile) -> bool {

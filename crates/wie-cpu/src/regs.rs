@@ -97,6 +97,9 @@ pub struct ThreadContext {
     pub rip: u64,
     /// RFLAGS (includes reserved bit 1).
     pub rflags: Rflags,
+    /// MXCSR control/status register (x86 reset value 0x1F80: all exception
+    /// masks set, round-to-nearest, no DAZ/FZ).
+    pub mxcsr: u32,
 }
 
 impl Default for ThreadContext {
@@ -106,6 +109,7 @@ impl Default for ThreadContext {
             xmm: [0; 16],
             rip: 0,
             rflags: Rflags::DEFAULT,
+            mxcsr: RegFile::MXCSR_DEFAULT,
         }
     }
 }
@@ -127,6 +131,11 @@ pub struct RegFile {
     xmm: [u128; 16],
     pub rip: u64,
     pub rflags: Rflags,
+    /// MXCSR control/status register (x86 reset value 0x1F80: all exception
+    /// masks set, round-to-nearest, no DAZ/FZ). FP ops use the native ARM64
+    /// rounding, so only the stored value is tracked (matches the default
+    /// round-to-nearest behavior guests rely on).
+    pub mxcsr: u32,
 }
 
 impl Default for RegFile {
@@ -136,11 +145,16 @@ impl Default for RegFile {
             xmm: [0; 16],
             rip: 0,
             rflags: Rflags::DEFAULT,
+            mxcsr: Self::MXCSR_DEFAULT,
         }
     }
 }
 
 impl RegFile {
+    /// x86 MXCSR reset value: all six exception masks set (0x1F80), rounding
+    /// control = nearest, DAZ/FZ clear.
+    pub const MXCSR_DEFAULT: u32 = 0x1F80;
+
     /// Create a fresh all-zero register file with default RFLAGS.
     #[must_use]
     pub fn new() -> Self {
@@ -155,6 +169,7 @@ impl RegFile {
             xmm: self.xmm,
             rip: self.rip,
             rflags: self.rflags,
+            mxcsr: self.mxcsr,
         }
     }
 
@@ -164,6 +179,18 @@ impl RegFile {
         self.xmm = ctx.xmm;
         self.rip = ctx.rip;
         self.set_rflags_checked(ctx.rflags);
+        self.mxcsr = ctx.mxcsr;
+    }
+
+    /// Read the guest MXCSR control/status register.
+    #[must_use]
+    pub fn mxcsr(&self) -> u32 {
+        self.mxcsr
+    }
+
+    /// Write the guest MXCSR control/status register.
+    pub(crate) fn set_mxcsr(&mut self, value: u32) {
+        self.mxcsr = value;
     }
 
     /// Read GPR `idx` (RAX=0 … R15=15); out-of-range reads yield 0.

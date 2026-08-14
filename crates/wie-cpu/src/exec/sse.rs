@@ -737,6 +737,83 @@ pub(super) fn exec_sse_cvtdq2pd(
     write_sse_op(mem, regs, instr, 0, r, 16, false)
 }
 
+/// `Cvtps2pd xmm, xmm/m64` — convert two packed single-precision floats (the
+/// low 64 bits of the source) to two packed doubles in the destination. The
+/// upper 64 bits of an XMM source are ignored.
+pub(super) fn exec_sse_cvtps2pd(
+    mem: &GuestMemory,
+    regs: &mut RegFile,
+    instr: &Instruction,
+) -> Result<(), StepExecError> {
+    let src = read_sse_op(mem, regs, instr, 1, 8)?;
+    let f0 = f64::from(f32::from_bits(src as u32));
+    let f1 = f64::from(f32::from_bits((src >> 32) as u32));
+    let r = u128::from(f0.to_bits()) | (u128::from(f1.to_bits()) << 64);
+    write_sse_op(mem, regs, instr, 0, r, 16, false)
+}
+
+/// `Cvtpd2dq xmm, xmm/m128` — convert two packed doubles to two packed signed
+/// dwords (MXCSR rounding, nearest-even by default). The upper 64 bits of the
+/// destination are zeroed.
+pub(super) fn exec_sse_cvtpd2dq(
+    mem: &GuestMemory,
+    regs: &mut RegFile,
+    instr: &Instruction,
+) -> Result<(), StepExecError> {
+    let src = read_sse_op(mem, regs, instr, 1, 16)?;
+    let lo = sse_cvt(SseCvtOp::Cvtpd2dq, src as u64);
+    let hi = sse_cvt(SseCvtOp::Cvtpd2dq, (src >> 64) as u64);
+    let r = u128::from(lo) | (u128::from(hi) << 32);
+    write_sse_op(mem, regs, instr, 0, r, 16, false)
+}
+
+/// `Cvtpd2ps xmm, xmm/m128` — convert two packed doubles to two packed singles
+/// (MXCSR rounding). The upper 64 bits of the destination are zeroed.
+pub(super) fn exec_sse_cvtpd2ps(
+    mem: &GuestMemory,
+    regs: &mut RegFile,
+    instr: &Instruction,
+) -> Result<(), StepExecError> {
+    let src = read_sse_op(mem, regs, instr, 1, 16)?;
+    let lo = sse_cvt(SseCvtOp::Cvtpd2ps, src as u64);
+    let hi = sse_cvt(SseCvtOp::Cvtpd2ps, (src >> 64) as u64);
+    let r = u128::from(lo) | (u128::from(hi) << 32);
+    write_sse_op(mem, regs, instr, 0, r, 16, false)
+}
+
+/// `Cvtsd2ss xmm, xmm/m64` — convert the low double to a single; bits 32-127
+/// of the destination are preserved.
+pub(super) fn exec_sse_cvtsd2ss(
+    mem: &GuestMemory,
+    regs: &mut RegFile,
+    instr: &Instruction,
+) -> Result<(), StepExecError> {
+    let dst = instr.op_register(0);
+    let src = read_sse_op(mem, regs, instr, 1, 8)?;
+    let f = f64::from_bits(src as u64) as f32;
+    let old = regs.read_xmm(dst)?;
+    // Keep bits 32-127; replace only the low 32 bits with the f32 result.
+    let r = (old & 0xffff_ffff_ffff_ffff_ffff_ffff_0000_0000_u128) | u128::from(f.to_bits());
+    regs.write_xmm(dst, r)?;
+    Ok(())
+}
+
+/// `Cvtss2sd xmm, xmm/m32` — convert the low single to a double; bits 64-127
+/// of the destination are preserved.
+pub(super) fn exec_sse_cvtss2sd(
+    mem: &GuestMemory,
+    regs: &mut RegFile,
+    instr: &Instruction,
+) -> Result<(), StepExecError> {
+    let dst = instr.op_register(0);
+    let src = read_sse_op(mem, regs, instr, 1, 4)?;
+    let f = f64::from(f32::from_bits(src as u32));
+    let old = regs.read_xmm(dst)?;
+    let r = (old & 0xffff_ffff_ffff_ffff_0000_0000_0000_0000_u128) | u128::from(f.to_bits());
+    regs.write_xmm(dst, r)?;
+    Ok(())
+}
+
 /// `Unpcklpd` — unpack low packed double-precision floats (identical to punpcklqdq).
 pub(super) fn exec_sse_unpcklpd(
     regs: &mut RegFile,
@@ -1233,6 +1310,13 @@ pub(crate) fn sse_cvt(op: SseCvtOp, a: u64) -> u64 {
             let f1 = ((a >> 32) as u32 as i32) as f32;
             u64::from(f0.to_bits()) | (u64::from(f1.to_bits()) << 32)
         }
+        // One f64 lane (the 64-bit input half) → i32 dword, MXCSR round-nearest.
+        SseCvtOp::Cvtpd2dq => u64::from(f64_to_i32_round(f64::from_bits(a)) as u32),
+        // One f64 lane → f32 bits (one single lane of the packed result).
+        SseCvtOp::Cvtpd2ps => u64::from((f64::from_bits(a) as f32).to_bits()),
+        // Scalar converts: one lane, 32/64-bit result.
+        SseCvtOp::Cvtsd2ss => u64::from((f64::from_bits(a) as f32).to_bits()),
+        SseCvtOp::Cvtss2sd => f64::from(f32::from_bits(a as u32)).to_bits(),
     }
 }
 

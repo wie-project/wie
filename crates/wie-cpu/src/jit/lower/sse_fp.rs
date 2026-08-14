@@ -342,6 +342,117 @@ pub(super) fn lower_sse_cvtdq2pd(
     Ok(())
 }
 
+/// `Cvtps2pd xmm, xmm/m64` — convert two packed single-precision floats (the
+/// low 64 bits of the source) to two packed doubles via native `fpromote`.
+pub(super) fn lower_sse_cvtps2pd(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
+) -> Result<(), String> {
+    let dst = instr.op_register(0);
+    let di = xmm_index(dst)?;
+    let lo = match instr.op1_kind() {
+        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?.0,
+        OpKind::Memory => {
+            let addr = effective_addr(bcx, instr, gpr)?;
+            load_sse_mem(bcx, mem, gpr, rflags, addr, 8, instr.ip())?.0
+        }
+        _ => return Err("cvtps2pd src".into()),
+    };
+    let shift = iconst_u64(bcx, 32);
+    let lo32 = bcx.ins().ireduce(types::I32, lo);
+    let hi32v = bcx.ins().ushr(lo, shift);
+    let hi32 = bcx.ins().ireduce(types::I32, hi32v);
+    let f0 = bcx.ins().bitcast(types::F32, mem.flags, lo32);
+    let f1 = bcx.ins().bitcast(types::F32, mem.flags, hi32);
+    let d0 = bcx.ins().fpromote(types::F64, f0);
+    let d1 = bcx.ins().fpromote(types::F64, f1);
+    let lo_bits = bcx.ins().bitcast(types::I64, mem.flags, d0);
+    let hi_bits = bcx.ins().bitcast(types::I64, mem.flags, d1);
+    store_xmm_pair(bcx, mem, xmm, di, lo_bits, hi_bits);
+    Ok(())
+}
+
+/// `Cvtpd2dq/Cvtpd2ps xmm, xmm/m128` — convert two packed doubles to two packed
+/// dwords (round-nearest) or two packed singles. Shares the host `sse_cvt`
+/// helper with the iced path so the rounding semantics match exactly.
+pub(super) fn lower_sse_cvtpd_packed(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
+    op: exec::SseCvtOp,
+) -> Result<(), String> {
+    let dst = instr.op_register(0);
+    let di = xmm_index(dst)?;
+    let (s_lo, s_hi) = match instr.op1_kind() {
+        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
+        OpKind::Memory => {
+            let addr = effective_addr(bcx, instr, gpr)?;
+            load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
+        }
+        _ => return Err("cvtpd src".into()),
+    };
+    let cref = mem.sse_cvt_ref.ok_or("cvt helper missing")?;
+    let op_v = iconst_u64(bcx, op.to_abi());
+    let c1 = bcx.ins().call(cref, &[op_v, s_lo]);
+    let lo = bcx.inst_results(c1)[0];
+    let c2 = bcx.ins().call(cref, &[op_v, s_hi]);
+    let hi = bcx.inst_results(c2)[0];
+    // Two 32-bit lanes packed into the low 64 bits; upper 64 zeroed.
+    let hi_shift = bcx.ins().ishl_imm(hi, 32);
+    let lo_bits = bcx.ins().bor(lo, hi_shift);
+    let zero = bcx.ins().iconst(types::I64, 0);
+    store_xmm_pair(bcx, mem, xmm, di, lo_bits, zero);
+    Ok(())
+}
+
+/// `Cvtsd2ss/Cvtss2sd xmm, xmm/m64|m32` — convert the low lane only; the upper
+/// destination lanes are preserved. Shares the host `sse_cvt` helper.
+pub(super) fn lower_sse_cvt_scalar_preserve(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
+    op: exec::SseCvtOp,
+    src_bytes: u64,
+) -> Result<(), String> {
+    let dst = instr.op_register(0);
+    let di = xmm_index(dst)?;
+    let lo = match instr.op1_kind() {
+        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?.0,
+        OpKind::Memory => {
+            let addr = effective_addr(bcx, instr, gpr)?;
+            let sz = u32::try_from(src_bytes).unwrap_or(8);
+            load_sse_mem(bcx, mem, gpr, rflags, addr, sz, instr.ip())?.0
+        }
+        _ => return Err("cvt scalar src".into()),
+    };
+    let (d_lo, d_hi) = read_xmm_pair(xmm, dst)?;
+    let cref = mem.sse_cvt_ref.ok_or("cvt helper missing")?;
+    let op_v = iconst_u64(bcx, op.to_abi());
+    let call = bcx.ins().call(cref, &[op_v, lo]);
+    let converted = bcx.inst_results(call)[0];
+    let result = match op {
+        exec::SseCvtOp::Cvtsd2ss => {
+            // Low 32 bits replaced; bits 32-63 and the upper 64 preserved.
+            let keep = iconst_u64(bcx, 0xffff_ffff_0000_0000);
+            let kept = bcx.ins().band(d_lo, keep);
+            bcx.ins().bor(kept, converted)
+        }
+        _ => converted,
+    };
+    store_xmm_pair(bcx, mem, xmm, di, result, d_hi);
+    Ok(())
+}
+
 /// `PSHUFB` — byte-wise table lookup (real semantics; the old no-op silently
 /// corrupted any guest that used it).
 pub(super) fn lower_sse_pshufb(
