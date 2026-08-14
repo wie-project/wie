@@ -18,10 +18,11 @@ use super::sse::{
     lower_sse_punpck_lanes, lower_sse_shufpd, sse_int_op, sse_shift_op,
 };
 use super::sse_fp::{
-    FloatBinOp, FloatWidth, lower_sse_bitwise, lower_sse_comis, lower_sse_cvt_fp_to_gpr,
-    lower_sse_cvt_gpr_to_fp, lower_sse_cvt_packed, lower_sse_fp_binop_packed,
-    lower_sse_fp_binop_scalar, lower_sse_fp_unop_packed, lower_sse_fp_unop_scalar,
-    lower_sse_packed_fp, lower_sse_pshufb, lower_sse_scalar_fp, lower_sse_shift,
+    FloatBinOp, FloatWidth, lower_sse_bitwise, lower_sse_byte_shift, lower_sse_comis,
+    lower_sse_cvt_fp_to_gpr, lower_sse_cvt_gpr_to_fp, lower_sse_cvt_packed, lower_sse_cvtdq2pd,
+    lower_sse_fp_binop_packed, lower_sse_fp_binop_scalar, lower_sse_fp_unop_packed,
+    lower_sse_fp_unop_scalar, lower_sse_packed_fp, lower_sse_pshufb, lower_sse_scalar_fp,
+    lower_sse_shift,
 };
 use super::{SseBit, lower_cmov, lower_setcc, lower_shift_lazy};
 
@@ -244,7 +245,16 @@ pub(super) fn lower_insn(
     xmm: &mut [Value; 32],
 ) -> Result<(), String> {
     match instr.mnemonic() {
-        Mnemonic::Nop | Mnemonic::Endbr64 | Mnemonic::Endbr32 => Ok(()),
+        // True no-ops: NOP/endbranch and the prefetch cache hints (no arch state).
+        Mnemonic::Nop
+        | Mnemonic::Endbr64
+        | Mnemonic::Endbr32
+        | Mnemonic::Prefetchnta
+        | Mnemonic::Prefetcht0
+        | Mnemonic::Prefetcht1
+        | Mnemonic::Prefetcht2
+        | Mnemonic::Prefetchw
+        | Mnemonic::Prefetchwt1 => Ok(()),
         // Non-flag ops: leave pending (may be overwritten later).
         Mnemonic::Mov => lower_mov(bcx, instr, gpr, dirty, *rflags, mem),
         Mnemonic::Movzx => lower_movx(bcx, instr, gpr, dirty, *rflags, mem, false),
@@ -658,6 +668,10 @@ pub(super) fn lower_insn(
             let op = sse_shift_op(instr.mnemonic()).ok_or("sse shift op")?;
             lower_sse_shift(bcx, instr, gpr, *rflags, mem, xmm, op)
         }
+        // Whole-XMM byte shifts (imm8 count).
+        Mnemonic::Psrldq | Mnemonic::Pslldq => {
+            lower_sse_byte_shift(bcx, instr, gpr, *rflags, mem, xmm)
+        }
         // Scalar FP sqrt / min / max.
         Mnemonic::Sqrtss => {
             lower_sse_fp_unop_scalar(bcx, instr, gpr, *rflags, mem, xmm, exec::SseFpUnOp::Sqrtss)
@@ -719,6 +733,8 @@ pub(super) fn lower_insn(
             };
             lower_sse_cvt_packed(bcx, instr, gpr, *rflags, mem, xmm, op)
         }
+        // CVTDQ2PD: two dwords → two doubles (native f64 conversion).
+        Mnemonic::Cvtdq2pd => lower_sse_cvtdq2pd(bcx, instr, gpr, *rflags, mem, xmm),
         other => Err(format!("not lowerable {other:?}")),
     }
 }

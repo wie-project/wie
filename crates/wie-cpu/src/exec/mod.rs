@@ -28,13 +28,13 @@ use gpr::{
 };
 use ops::{ArithOp, BitOp, ShiftKind, cond_from_cmov, cond_from_jcc, cond_from_setcc};
 use sse::{
-    exec_sse_bitwise, exec_sse_comis, exec_sse_cvt_fp_to_gpr, exec_sse_cvt_gpr_to_fp,
-    exec_sse_cvt_packed, exec_sse_int_binop, exec_sse_minmax_packed, exec_sse_minmax_scalar,
-    exec_sse_mov, exec_sse_movd, exec_sse_movhlps, exec_sse_movhps, exec_sse_movq,
-    exec_sse_packed_fp, exec_sse_pmovmskb, exec_sse_psadbw, exec_sse_pshufb, exec_sse_pshufd,
-    exec_sse_pshuflw_hw, exec_sse_punpck, exec_sse_punpck_lanes, exec_sse_scalar_fp,
-    exec_sse_shift, exec_sse_shufpd, exec_sse_sqrt_packed, exec_sse_sqrt_scalar, exec_sse_unpcklpd,
-    is_sse_movsd, sse_int_op, sse_shift_op,
+    exec_sse_bitwise, exec_sse_byte_shift, exec_sse_comis, exec_sse_cvt_fp_to_gpr,
+    exec_sse_cvt_gpr_to_fp, exec_sse_cvt_packed, exec_sse_cvtdq2pd, exec_sse_int_binop,
+    exec_sse_minmax_packed, exec_sse_minmax_scalar, exec_sse_mov, exec_sse_movd, exec_sse_movhlps,
+    exec_sse_movhps, exec_sse_movq, exec_sse_packed_fp, exec_sse_pmovmskb, exec_sse_psadbw,
+    exec_sse_pshufb, exec_sse_pshufd, exec_sse_pshuflw_hw, exec_sse_punpck, exec_sse_punpck_lanes,
+    exec_sse_scalar_fp, exec_sse_shift, exec_sse_shufpd, exec_sse_sqrt_packed,
+    exec_sse_sqrt_scalar, exec_sse_unpcklpd, is_sse_movsd, sse_int_op, sse_shift_op,
 };
 use sse_types::{FpOp, SseBitOp};
 use string::{exec_cmps, exec_lods, exec_movs, exec_scas, exec_stos};
@@ -233,7 +233,15 @@ fn execute_one(
         // it hints the pipeline to pause; semantically it's a no-op. Failure mode
         // before this stub was intermittent worker crashes in `cpp_threads` when
         // the CRT lock happened to spin (see also the JIT `Mnemonic::Pause` lower).
-        | Mnemonic::Pause => Ok(()),
+        | Mnemonic::Pause
+        // Prefetch hints (0F 18 /0-/3, 0F 0D /1, 0F 0D /2): cache hints with no
+        // architectural effect — SDL2's memcpy paths emit them liberally.
+        | Mnemonic::Prefetchnta
+        | Mnemonic::Prefetcht0
+        | Mnemonic::Prefetcht1
+        | Mnemonic::Prefetcht2
+        | Mnemonic::Prefetchw
+        | Mnemonic::Prefetchwt1 => Ok(()),
 
         Mnemonic::Mov => exec_mov(mem, regs, instr),
         Mnemonic::Movzx => exec_movzx(mem, regs, instr, false),
@@ -515,6 +523,8 @@ fn execute_one(
         | Mnemonic::Psrlq
         | Mnemonic::Psraw
         | Mnemonic::Psrad => exec_sse_shift(mem, regs, instr, sse_shift_op(instr.mnemonic())),
+        // Whole-XMM byte shifts (66 0F 73 /3 ib and /7 ib; imm8 count only).
+        Mnemonic::Psrldq | Mnemonic::Pslldq => exec_sse_byte_shift(regs, instr),
         Mnemonic::Psadbw => exec_sse_psadbw(mem, regs, instr),
         Mnemonic::Unpcklpd => exec_sse_unpcklpd(regs, instr),
         // FP sqrt / min / max (scalar + packed).
@@ -542,6 +552,8 @@ fn execute_one(
         Mnemonic::Cvtps2dq | Mnemonic::Cvtdq2ps | Mnemonic::Cvttps2dq => {
             exec_sse_cvt_packed(mem, regs, instr)
         }
+        // CVTDQ2PD: two packed dwords (low 64 bits) → two packed doubles.
+        Mnemonic::Cvtdq2pd => exec_sse_cvtdq2pd(mem, regs, instr),
         Mnemonic::Addss => exec_sse_scalar_fp(mem, regs, instr, FpOp::Add, false),
         Mnemonic::Subss => exec_sse_scalar_fp(mem, regs, instr, FpOp::Sub, false),
         Mnemonic::Mulss => exec_sse_scalar_fp(mem, regs, instr, FpOp::Mul, false),

@@ -1004,6 +1004,72 @@ mod tests {
     }
 
     #[test]
+    fn simd_byte_shifts_match_iced() {
+        // Psrldq/Pslldq: whole-128-bit byte shifts (66 0F 73 /3 ib and /7 ib).
+        let x0 = 0xF0E0_D0C0_B0A0_9080_7060_5040_3020_1000_u128;
+        for (name, bytes) in [
+            ("psrldq imm1", &[0x66, 0x0f, 0x73, 0xd8, 0x01][..]),
+            ("psrldq imm8", &[0x66, 0x0f, 0x73, 0xd8, 0x08][..]),
+            ("psrldq imm15", &[0x66, 0x0f, 0x73, 0xd8, 0x0f][..]),
+            ("psrldq imm16", &[0x66, 0x0f, 0x73, 0xd8, 0x10][..]),
+            ("pslldq imm1", &[0x66, 0x0f, 0x73, 0xf8, 0x01][..]),
+            ("pslldq imm8", &[0x66, 0x0f, 0x73, 0xf8, 0x08][..]),
+            ("pslldq imm15", &[0x66, 0x0f, 0x73, 0xf8, 0x0f][..]),
+            ("pslldq imm16", &[0x66, 0x0f, 0x73, 0xf8, 0x10][..]),
+        ] {
+            let (iced, jit) = simd_dual(bytes, &[], |r| set_pair(r, x0, 0));
+            assert_same_regs(&iced, &jit, name);
+        }
+        // Hand-check PSRLDQ imm1: byte 0 dropped, zero-filled on the left.
+        let (iced, jit) = simd_dual(&[0x66, 0x0f, 0x73, 0xd8, 0x01], &[], |r| set_pair(r, x0, 0));
+        assert_eq!(
+            iced.xmm_at(0),
+            0x00F0_E0D0_C0B0_A090_8070_6050_4030_2010,
+            "iced psrldq 1"
+        );
+        assert_eq!(
+            jit.xmm_at(0),
+            0x00F0_E0D0_C0B0_A090_8070_6050_4030_2010,
+            "jit psrldq 1"
+        );
+        // Hand-check PSRLDQ imm15: only the top byte survives (shifted to bit 0).
+        let (iced, jit) = simd_dual(&[0x66, 0x0f, 0x73, 0xd8, 0x0f], &[], |r| set_pair(r, x0, 0));
+        assert_eq!(iced.xmm_at(0), 0xF0, "iced psrldq 15");
+        assert_eq!(jit.xmm_at(0), 0xF0, "jit psrldq 15");
+        // Hand-check PSRLDQ imm16 → zero.
+        let (iced, jit) = simd_dual(&[0x66, 0x0f, 0x73, 0xd8, 0x10], &[], |r| set_pair(r, x0, 0));
+        assert_eq!(iced.xmm_at(0), 0, "iced psrldq 16 zeroes");
+        assert_eq!(jit.xmm_at(0), 0, "jit psrldq 16 zeroes");
+    }
+
+    #[test]
+    fn simd_cvtdq2pd_matches_iced() {
+        // CVTDQ2PD xmm, xmm/m64: two packed signed dwords → two doubles.
+        for (name, bytes, is_mem) in [
+            ("cvtdq2pd reg", &[0xf3, 0x0f, 0xe6, 0xc1][..], false),
+            ("cvtdq2pd mem", &[0xf3, 0x0f, 0xe6, 0x01][..], true),
+        ] {
+            let (iced, jit) = simd_dual(
+                bytes,
+                &[0x02, 0x00, 0x00, 0x00, 0xfe, 0xff, 0xff, 0xff],
+                |r| {
+                    set_pair(r, 0, 0);
+                    if is_mem {
+                        r.set_gpr_public(1, SIMD_DATA); // RCX = m64 base
+                    }
+                },
+            );
+            assert_same_regs(&iced, &jit, name);
+        }
+        // Hand-check: dwords 1 and -2 → doubles 1.0 (low) and -2.0 (high).
+        let src = 0xffff_fffe_0000_0001_u128;
+        let expect = u128::from(1.0_f64.to_bits()) | (u128::from((-2.0_f64).to_bits()) << 64);
+        let (iced, jit) = simd_dual(&[0xf3, 0x0f, 0xe6, 0xc1], &[], |r| set_pair(r, 0, src));
+        assert_eq!(iced.xmm_at(0), expect, "iced cvtdq2pd 1,-2");
+        assert_eq!(jit.xmm_at(0), expect, "jit cvtdq2pd 1,-2");
+    }
+
+    #[test]
     fn simd_pack_unpack_matches_iced() {
         let x0 = 0x807F_FF00_1234_5678_0001_FFFF_8000_7FFF_u128;
         let x1 = 0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10_u128;

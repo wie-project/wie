@@ -224,6 +224,12 @@ fn is_lowerable(instr: &Instruction) -> bool {
         Mnemonic::Nop
         | Mnemonic::Endbr64
         | Mnemonic::Endbr32
+        | Mnemonic::Prefetchnta
+        | Mnemonic::Prefetcht0
+        | Mnemonic::Prefetcht1
+        | Mnemonic::Prefetcht2
+        | Mnemonic::Prefetchw
+        | Mnemonic::Prefetchwt1
         | Mnemonic::Cwde
         | Mnemonic::Cdqe
         | Mnemonic::Cbw
@@ -412,12 +418,14 @@ fn is_lowerable(instr: &Instruction) -> bool {
         | Mnemonic::Psrlq
         | Mnemonic::Psraw
         | Mnemonic::Psrad => sse_shift_is_lowerable(instr),
+        // Whole-XMM byte shifts (66 0F 73 /3 ib and /7 ib; imm8 count only).
+        Mnemonic::Psrldq | Mnemonic::Pslldq => sse_shift_is_lowerable(instr),
         // Integer ↔ FP converts (GPR↔XMM).
         Mnemonic::Cvtsi2ss | Mnemonic::Cvtsi2sd => sse_cvt_gpr_to_xmm_is_lowerable(instr),
         Mnemonic::Cvttss2si | Mnemonic::Cvttsd2si | Mnemonic::Cvtss2si | Mnemonic::Cvtsd2si => {
             sse_cvt_xmm_to_gpr_is_lowerable(instr)
         }
-        Mnemonic::Cvtps2dq | Mnemonic::Cvtdq2ps | Mnemonic::Cvttps2dq => {
+        Mnemonic::Cvtps2dq | Mnemonic::Cvtdq2ps | Mnemonic::Cvttps2dq | Mnemonic::Cvtdq2pd => {
             sse_bitwise_is_lowerable(instr)
         }
         // Scalar / packed FP sqrt + min/max.

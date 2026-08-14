@@ -15,7 +15,7 @@ use super::super::block::mem_width_bytes;
 use crate::exec::{self};
 use crate::regs::Rflags;
 use cranelift::prelude::*;
-use iced_x86::{Instruction, OpKind};
+use iced_x86::{Instruction, Mnemonic, OpKind};
 
 /// SSE floating-point binary operation.
 ///
@@ -239,6 +239,107 @@ pub(super) fn splat_count(imm: u64, width: u32) -> u64 {
         }
         _ => imm,
     }
+}
+
+/// `Psrldq/Psldq` — byte-granular shift of the whole 128-bit XMM register
+/// (66 0F 73 /3 ib and /7 ib). The imm8 byte count is a compile-time
+/// constant, so the lo/hi u64 pair is shifted with scalar ops (a whole-XMM
+/// byte shift is not a lane-wise op and has no NEON direct equivalent).
+pub(super) fn lower_sse_byte_shift(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
+) -> Result<(), String> {
+    let _ = (gpr, rflags); // reg-only op: no GPR or flags involvement
+    let dst = instr.op_register(0);
+    let di = xmm_index(dst)?;
+    let (a_lo, a_hi) = read_xmm_pair(xmm, dst)?;
+    if !is_imm_kind(instr.op1_kind()) {
+        return Err("byte shift needs imm8".into());
+    }
+    let bytes = (instr.immediate(1) & 0xff) as u32;
+    let right = instr.mnemonic() == Mnemonic::Psrldq;
+    let (lo, hi) = byte_shift_pair(bcx, right, a_lo, a_hi, bytes);
+    store_xmm_pair(bcx, mem, xmm, di, lo, hi);
+    Ok(())
+}
+
+/// Emit the shifted lo/hi pair for a constant whole-XMM byte shift.
+fn byte_shift_pair(
+    bcx: &mut FunctionBuilder<'_>,
+    right: bool,
+    a_lo: Value,
+    a_hi: Value,
+    bytes: u32,
+) -> (Value, Value) {
+    let zero = iconst_u64(bcx, 0);
+    if bytes >= 16 {
+        return (zero, zero);
+    }
+    if bytes == 0 {
+        return (a_lo, a_hi);
+    }
+    if bytes < 8 {
+        // Both halves participate: the shifted-out bits cross into the other
+        // half. bits < 64, so the complement shift amount is in range.
+        let bits = iconst_u64(bcx, u64::from(bytes) * 8);
+        let comp = iconst_u64(bcx, 64 - u64::from(bytes) * 8);
+        if right {
+            let lo_s = bcx.ins().ushr(a_lo, bits);
+            let cross = bcx.ins().ishl(a_hi, comp);
+            let hi_s = bcx.ins().ushr(a_hi, bits);
+            (bcx.ins().bor(lo_s, cross), hi_s)
+        } else {
+            let lo_s = bcx.ins().ishl(a_lo, bits);
+            let cross = bcx.ins().ushr(a_lo, comp);
+            let hi_s = bcx.ins().ishl(a_hi, bits);
+            (lo_s, bcx.ins().bor(hi_s, cross))
+        }
+    } else {
+        // bytes in 8..16: one half becomes the shifted other half, the other
+        // half zeroes.
+        let sub = iconst_u64(bcx, u64::from(bytes) * 8 - 64);
+        if right {
+            (bcx.ins().ushr(a_hi, sub), zero)
+        } else {
+            (zero, bcx.ins().ishl(a_lo, sub))
+        }
+    }
+}
+
+/// `Cvtdq2pd xmm, xmm/m64` — convert two packed signed dwords (the low 64
+/// bits of the source) to two packed doubles via native `fcvt_from_sint`.
+pub(super) fn lower_sse_cvtdq2pd(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
+) -> Result<(), String> {
+    let dst = instr.op_register(0);
+    let di = xmm_index(dst)?;
+    let lo = match instr.op1_kind() {
+        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?.0,
+        OpKind::Memory => {
+            let addr = effective_addr(bcx, instr, gpr)?;
+            load_sse_mem(bcx, mem, gpr, rflags, addr, 8, instr.ip())?.0
+        }
+        _ => return Err("cvtdq2pd src".into()),
+    };
+    let shift = iconst_u64(bcx, 32);
+    let d0 = bcx.ins().ireduce(types::I32, lo);
+    let hi32 = bcx.ins().ushr(lo, shift);
+    let d1 = bcx.ins().ireduce(types::I32, hi32);
+    let f0 = bcx.ins().fcvt_from_sint(types::F64, d0);
+    let f1 = bcx.ins().fcvt_from_sint(types::F64, d1);
+    let lo_bits = bcx.ins().bitcast(types::I64, mem.flags, f0);
+    let hi_bits = bcx.ins().bitcast(types::I64, mem.flags, f1);
+    store_xmm_pair(bcx, mem, xmm, di, lo_bits, hi_bits);
+    Ok(())
 }
 
 /// `PSHUFB` — byte-wise table lookup (real semantics; the old no-op silently

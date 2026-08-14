@@ -529,6 +529,33 @@ pub(super) fn exec_sse_shift(
     write_sse_op(mem, regs, instr, 0, sse_shift_u128(op, a, count), 16, false)
 }
 
+/// `Psrldq/Psldq` — byte-granular shift of the whole 128-bit XMM register
+/// (66 0F 73 /3 ib and /7 ib). Only the imm8 form exists; a count of 16 or
+/// more zeroes the register (the shift is masked to 4 bits on x86).
+pub(super) fn exec_sse_byte_shift(
+    regs: &mut RegFile,
+    instr: &Instruction,
+) -> Result<(), StepExecError> {
+    let dst = instr.op_register(0);
+    let a = regs.read_xmm(dst)?;
+    let bytes = (instr.immediate(1) & 0xff) as u32;
+    let right = instr.mnemonic() == Mnemonic::Psrldq;
+    regs.write_xmm(dst, sse_byte_shift_u128(right, a, bytes))?;
+    Ok(())
+}
+
+/// Whole-XMM byte shift core shared by both directions.
+fn sse_byte_shift_u128(right: bool, a: u128, bytes: u32) -> u128 {
+    if bytes >= 16 {
+        return 0;
+    }
+    if bytes == 0 {
+        return a;
+    }
+    let bits = u128::from(bytes) * 8;
+    if right { a >> bits } else { a << bits }
+}
+
 /// `Sqrtss/Sqrtsd` — scalar FP square root, merged into the destination's low lane.
 pub(super) fn exec_sse_sqrt_scalar(
     mem: &GuestMemory,
@@ -692,6 +719,21 @@ pub(super) fn exec_sse_cvt_packed(
     };
     let r =
         u128::from(sse_cvt(op, src as u64)) | (u128::from(sse_cvt(op, (src >> 64) as u64)) << 64);
+    write_sse_op(mem, regs, instr, 0, r, 16, false)
+}
+
+/// `Cvtdq2pd xmm, xmm/m64` — convert two packed signed dwords (the low 64
+/// bits of the source) to two packed doubles in the destination. The upper
+/// 64 bits of an XMM source are ignored.
+pub(super) fn exec_sse_cvtdq2pd(
+    mem: &GuestMemory,
+    regs: &mut RegFile,
+    instr: &Instruction,
+) -> Result<(), StepExecError> {
+    let src = read_sse_op(mem, regs, instr, 1, 8)?;
+    let d0 = f64::from(src as u32 as i32);
+    let d1 = f64::from(((src >> 32) as u32) as i32);
+    let r = u128::from(d0.to_bits()) | (u128::from(d1.to_bits()) << 64);
     write_sse_op(mem, regs, instr, 0, r, 16, false)
 }
 
