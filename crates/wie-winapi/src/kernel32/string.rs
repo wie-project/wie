@@ -542,3 +542,66 @@ pub fn handle_lc_map_string_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 
     ctx.finish(return_value)
 }
+
+/// Compare two strings and return the CSTR_* ordering (1 = less, 2 = equal,
+/// 3 = greater).
+fn compare_result(ordering: std::cmp::Ordering) -> u64 {
+    match ordering {
+        std::cmp::Ordering::Less => 1,
+        std::cmp::Ordering::Equal => 2,
+        std::cmp::Ordering::Greater => 3,
+    }
+}
+/// Handles `KERNEL32.dll!CompareStringA` — binary byte comparison (the locale
+/// flags are accepted; WIE has no collation tables).
+pub fn handle_compare_string_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let _locale = engine.read_rcx()?;
+    let _flags = engine.read_rdx()?;
+    let s1_va = engine.read_r8()?;
+    let s1_len = engine.read_r9()?;
+    // s2 (stack), s2 length (stack+8)
+    let rsp = engine.read_rsp()?;
+    let s2_va = read_u64(engine, rsp.wrapping_add(0x28))?;
+    let s2_len = read_u64(engine, rsp.wrapping_add(0x30))?;
+    let mut read = |va: u64, len: u64| -> Result<Vec<u8>> {
+        let count = usize::try_from(len).unwrap_or(0);
+        let mut out = vec![0_u8; count];
+        if count > 0 {
+            crate::guest_memory::read_bytes(engine, va, &mut out)?;
+        }
+        Ok(out)
+    };
+    let a = read(s1_va, s1_len)?;
+    let b = read(s2_va, s2_len)?;
+    ctx.finish(compare_result(a.cmp(&b)))
+}
+/// Handles `KERNEL32.dll!CompareStringW` — binary UTF-16 unit comparison.
+pub fn handle_compare_string_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let _locale = engine.read_rcx()?;
+    let _flags = engine.read_rdx()?;
+    let s1_va = engine.read_r8()?;
+    let s1_len = engine.read_r9()?;
+    let rsp = engine.read_rsp()?;
+    let s2_va = read_u64(engine, rsp.wrapping_add(0x28))?;
+    let s2_len = read_u64(engine, rsp.wrapping_add(0x30))?;
+    let mut read_units = |va: u64, len: u64| -> Result<Vec<u16>> {
+        let count = usize::try_from(len).unwrap_or(0);
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let mut b = [0_u8; 2];
+            engine
+                .mem_read(
+                    va.wrapping_add(u64::try_from(i).unwrap_or(0).wrapping_mul(2)),
+                    &mut b,
+                )
+                .context("failed to read CompareStringW unit")?;
+            out.push(u16::from_le_bytes(b));
+        }
+        Ok(out)
+    };
+    let a = read_units(s1_va, s1_len)?;
+    let b = read_units(s2_va, s2_len)?;
+    ctx.finish(compare_result(a.cmp(&b)))
+}

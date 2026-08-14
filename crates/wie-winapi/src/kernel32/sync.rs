@@ -44,6 +44,52 @@ pub fn handle_initialize_critical_section(
     // void return; RAX is unused but cleared for determinism.
     ctx.finish(0)
 }
+/// Handles `KERNEL32.dll!InitializeCriticalSectionEx`.
+///
+/// Same state as `InitializeCriticalSectionAndSpinCount`: the `dwSpinCount`
+/// goes into `RTL_CRITICAL_SECTION.SpinCount`; `dwFlags` (0 or
+/// `CRITICAL_SECTION_NO_DEBUG_INFO`) is accepted and ignored.
+pub fn handle_initialize_critical_section_ex(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let critical_section_va = engine
+        .read_rcx()
+        .context("failed to read RCX for InitializeCriticalSectionEx")?;
+    let spin_count = engine
+        .read_rdx()
+        .context("failed to read RDX for InitializeCriticalSectionEx")?;
+    let _flags = engine
+        .read_r8()
+        .context("failed to read R8 for InitializeCriticalSectionEx")?;
+
+    if critical_section_va != 0 {
+        write_critical_section_unlocked(engine, critical_section_va, spin_count)?;
+    }
+
+    ctx.finish(1)
+}
+/// Handles `KERNEL32.dll!TryEnterCriticalSection`.
+///
+/// Returns nonzero when the caller acquired the lock (or already owns it
+/// recursively); 0 when the lock is held by another thread. Never parks.
+pub fn handle_try_enter_critical_section(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let cs = engine
+        .read_rcx()
+        .context("failed to read RCX for TryEnterCriticalSection")?;
+
+    if cs == 0 {
+        return ctx.finish(1);
+    }
+    match try_enter_critical_section_guest(engine, cs, state.kernel.threads.current_tid())? {
+        EnterCsResult::Acquired => ctx.finish(1),
+        EnterCsResult::NeedPark => ctx.finish(0),
+    }
+}
 /// Handles `KERNEL32.dll!EnterCriticalSection` (reentrant; blocks when needed).
 pub fn handle_enter_critical_section(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -211,6 +257,80 @@ pub fn handle_create_semaphore(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     let (handle, _) = state.kernel.sync.register_semaphore(initial, maximum);
     state.process.last_error = 0;
     ret_u64(engine, handle, "CreateSemaphore")
+}
+/// Handles `KERNEL32.dll!CreateMutexA`.
+///
+/// A mutex is modeled as a binary semaphore (maximum 1) that starts signaled
+/// (unowned): `WaitForSingleObject` acquires it, `ReleaseMutex` re-signals it.
+/// Ownership is not tracked — enough for the boot-stub contract.
+pub fn handle_create_mutex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let _attrs = engine.read_rcx()?;
+    let _initial_owner = engine.read_rdx()?;
+    let _name = engine.read_r8()?; // named: ignore (anonymous only)
+    let (handle, _) = state.kernel.sync.register_semaphore(1, 1);
+    state.process.last_error = 0;
+    ret_u64(engine, handle, "CreateMutexA")
+}
+/// Handles `KERNEL32.dll!ReleaseMutex`.
+///
+/// Re-signals the binary-semaphore mutex; returns TRUE. FALSE with
+/// `ERROR_INVALID_HANDLE` when the handle is not a mutex.
+pub fn handle_release_mutex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let handle = engine.read_rcx()?;
+    let Some(crate::KernelObject::Semaphore(sem)) = state.kernel.sync.object(handle).cloned()
+    else {
+        state.process.last_error = ERROR_INVALID_HANDLE;
+        return ret_u64(engine, 0, "ReleaseMutex");
+    };
+    let _ = sem.release(1);
+    state.process.last_error = 0;
+    ret_u64(engine, 1, "ReleaseMutex")
+}
+/// Handles `KERNEL32.dll!InitializeSListHead` — zero the 16-byte `SLIST_HEADER`.
+pub fn handle_initialize_slist_head(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let head_va = engine
+        .read_rcx()
+        .context("failed to read RCX for InitializeSListHead")?;
+    if head_va != 0 {
+        engine
+            .mem_write(head_va, &[0_u8; 16])
+            .context("failed to zero SLIST_HEADER")?;
+    }
+    ctx.finish(0)
+}
+/// Handles `KERNEL32.dll!InterlockedFlushSList`.
+///
+/// Returns the first element pointer (low 16-bit tag bits masked off) and
+/// resets the 16-byte `SLIST_HEADER` to empty.
+pub fn handle_interlocked_flush_slist(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let head_va = engine
+        .read_rcx()
+        .context("failed to read RCX for InterlockedFlushSList")?;
+    let mut header = [0_u8; 16];
+    if head_va == 0 || engine.mem_read(head_va, &mut header).is_err() {
+        state.process.last_error = ERROR_INVALID_PARAMETER;
+        return ctx.finish(0);
+    }
+    let first = u64::from_le_bytes(header[..8].try_into().unwrap_or([0; 8])) & !0xf;
+    engine
+        .mem_write(head_va, &[0_u8; 16])
+        .context("failed to clear SLIST_HEADER")?;
+    state.process.last_error = 0;
+    ctx.finish(first)
+}
+/// Handles `KERNEL32.dll!WaitForSingleObjectEx` — same semantics as
+/// `WaitForSingleObject`; the `bAlertable` flag is accepted and ignored.
+pub fn handle_wait_for_single_object_ex(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    handle_wait_for_single_object(ctx)
 }
 pub fn handle_release_semaphore(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;

@@ -79,7 +79,7 @@ pub(crate) fn handle_fflush(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 
 /// Host console write without `std::io::{stdout,stderr}` lock (hot CRT path).
 #[cfg(unix)]
-fn write_host_console(stream: u64, bytes: &[u8]) {
+pub(crate) fn write_host_console(stream: u64, bytes: &[u8]) {
     let fd = if stream == FILE_STDOUT {
         libc::STDOUT_FILENO
     } else {
@@ -121,7 +121,7 @@ pub(crate) fn write_all_fd(fd: libc::c_int, bytes: &[u8]) {
 }
 
 #[cfg(not(unix))]
-fn write_host_console(stream: u64, bytes: &[u8]) {
+pub(crate) fn write_host_console(stream: u64, bytes: &[u8]) {
     use std::io::Write;
     if stream == FILE_STDOUT {
         drop(std::io::stdout().write_all(bytes));
@@ -143,7 +143,11 @@ pub(crate) fn handle_setvbuf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
 /// starting at `va` (8 bytes per slot, Win64). Returns the formatted bytes
 /// without a NUL terminator; the caller picks the sink. Sibling walkers with
 /// buffer targets live inside `handle_stdio_common_vsprintf`.
-fn walk_vfprintf_format(engine: &mut dyn wie_cpu::CpuEngine, fmt: &str, mut va: u64) -> Vec<u8> {
+pub(crate) fn walk_vfprintf_format(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    fmt: &str,
+    mut va: u64,
+) -> Vec<u8> {
     const MAX_OUTPUT: usize = 4096;
     let mut out = Vec::with_capacity(256);
     let bytes = fmt.as_bytes();

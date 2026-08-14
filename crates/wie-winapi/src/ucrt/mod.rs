@@ -329,6 +329,29 @@ pub fn dispatch_ucrt(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiH
         "_kbhit" => handle_kbhit(ctx),
         "_getch" => handle_getch(ctx),
         "system" => handle_system(ctx),
+        // Legacy msvcrt surface (Phase 2 boot wave).
+        "__iob_func" => handle_iob_func(ctx),
+        "_amsg_exit" => handle_amsg_exit(ctx),
+        "_fdopen" => handle_fdopen(ctx),
+        "_filelengthi64" => handle_filelengthi64(ctx),
+        "_fileno" => handle_fileno(ctx),
+        "_lock" | "_unlock" => handle_lock_unlock(ctx),
+        "_wfopen" => handle_wfopen(ctx),
+        "_wfreopen" => handle_wfreopen(ctx),
+        "feof" => handle_feof(ctx),
+        "ferror" => handle_ferror(ctx),
+        "fgetpos" => handle_fgetpos(ctx),
+        "fread" => handle_fread(ctx),
+        "fseek" => handle_fseek(ctx),
+        "fsetpos" => handle_fsetpos(ctx),
+        "ftell" => handle_ftell(ctx),
+        "fprintf" => handle_fprintf(ctx),
+        "isprint" => handle_isprint(ctx),
+        "log10" => handle_log10(ctx),
+        "memchr" => handle_memchr(ctx),
+        "qsort" => handle_qsort(ctx),
+        "strcpy" => handle_strcpy(ctx),
+        "strrchr" => handle_strrchr(ctx),
         _ => anyhow::bail!("unsupported UCRT export: {name}"),
     }
 }
@@ -470,4 +493,227 @@ fn read_guest_str(engine: &mut dyn wie_cpu::CpuEngine, ptr: u64, max: usize) -> 
         bytes.push(b[0]);
     }
     Ok(String::from_utf8_lossy(&bytes).to_string())
+}
+
+// ── Legacy msvcrt surface (msvcrt.dll routes here via `is_ucrt_library`) ──
+
+/// `__iob_func()` — legacy msvcrt `FILE*` array base (same slots as the UCRT
+/// `__acrt_iob_func`).
+pub(crate) fn handle_iob_func(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    stdio::handle_acrt_iob_func(ctx)
+}
+/// `_amsg_exit(rterrnum, str)` — legacy CRT fatal error; terminates like
+/// `abort` (the caller never continues past a CRT runtime error).
+pub(crate) fn handle_amsg_exit(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _rterrnum = ctx.engine.read_rcx()?;
+    let _message = ctx.engine.read_rdx()?;
+    crt::handle_abort(ctx)
+}
+/// `_fdopen(fd, mode)` — no CRT file streams exist; NULL.
+pub(crate) fn handle_fdopen(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _fd = ctx.engine.read_rcx()?;
+    let _mode = ctx.engine.read_rdx()?;
+    finish(&mut *ctx.engine, 0)
+}
+/// `_filelengthi64(fd)` — no CRT fd mapping; INVALID_FILE_SIZE (-1).
+pub(crate) fn handle_filelengthi64(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _fd = ctx.engine.read_rcx()?;
+    finish(&mut *ctx.engine, u64::MAX)
+}
+/// `_fileno(stream)` — no CRT FILE→fd mapping; -1.
+pub(crate) fn handle_fileno(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _stream = ctx.engine.read_rcx()?;
+    finish(&mut *ctx.engine, u64::MAX)
+}
+/// `_lock(fd)` / `_unlock(fd)` — the CRT I/O lock is a no-op (single-threaded
+/// host dispatch under the big WinAPI mutex).
+pub(crate) fn handle_lock_unlock(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _fd = ctx.engine.read_rcx()?;
+    finish(&mut *ctx.engine, 0)
+}
+/// `_wfopen(path, mode)` — no VFS-to-CRT bridge; NULL (mirrors `fopen`).
+pub(crate) fn handle_wfopen(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _path = ctx.engine.read_rcx()?;
+    let _mode = ctx.engine.read_rdx()?;
+    finish(&mut *ctx.engine, 0)
+}
+/// `_wfreopen(path, mode, stream)` — NULL (mirrors `freopen_s`).
+pub(crate) fn handle_wfreopen(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _path = ctx.engine.read_rcx()?;
+    let _mode = ctx.engine.read_rdx()?;
+    let _stream = ctx.engine.read_r8()?;
+    finish(&mut *ctx.engine, 0)
+}
+/// `feof(stream)` — no file streams reach EOF; 0.
+pub(crate) fn handle_feof(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _stream = ctx.engine.read_rcx()?;
+    finish(&mut *ctx.engine, 0)
+}
+/// `ferror(stream)` — no stream errors; 0.
+pub(crate) fn handle_ferror(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _stream = ctx.engine.read_rcx()?;
+    finish(&mut *ctx.engine, 0)
+}
+/// `fgetpos(stream, pos)` — no seekable streams; -1.
+pub(crate) fn handle_fgetpos(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _stream = ctx.engine.read_rcx()?;
+    let _pos = ctx.engine.read_rdx()?;
+    if _pos != 0 {
+        let _unused = crate::guest_memory::write_u64(&mut *ctx.engine, _pos, 0);
+    }
+    finish(&mut *ctx.engine, u64::MAX)
+}
+/// `fread(buf, size, count, stream)` — no file streams to read; 0 items.
+pub(crate) fn handle_fread(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _buf = ctx.engine.read_rcx()?;
+    let _size = ctx.engine.read_rdx()?;
+    let _count = ctx.engine.read_r8()?;
+    let _stream = ctx.engine.read_r9()?;
+    finish(&mut *ctx.engine, 0)
+}
+/// `fseek(stream, offset, origin)` — no seekable streams; -1.
+pub(crate) fn handle_fseek(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _stream = ctx.engine.read_rcx()?;
+    let _offset = ctx.engine.read_rdx()?;
+    let _origin = ctx.engine.read_r8()?;
+    finish(&mut *ctx.engine, u64::MAX)
+}
+/// `fsetpos(stream, pos)` — no seekable streams; -1.
+pub(crate) fn handle_fsetpos(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _stream = ctx.engine.read_rcx()?;
+    let _pos = ctx.engine.read_rdx()?;
+    finish(&mut *ctx.engine, u64::MAX)
+}
+/// `ftell(stream)` — no seekable streams; -1.
+pub(crate) fn handle_ftell(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _stream = ctx.engine.read_rcx()?;
+    finish(&mut *ctx.engine, u64::MAX)
+}
+/// `fprintf(stream, fmt, ...)` — format with the varargs read from the guest
+/// stack (Win64: the 5th+ args live at `[rsp+0x28]`), reusing the UCRT format
+/// engine; stdout/stderr go to the console.
+pub(crate) fn handle_fprintf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let (out, is_stderr) = {
+        let engine = &mut *ctx.engine;
+        let stream = engine.read_rcx()?;
+        let fmt_va = engine.read_rdx()?;
+        if fmt_va == 0 {
+            return finish(engine, 0);
+        }
+        let fmt = read_guest_str(engine, fmt_va, 4096)?;
+        let rsp = engine.read_rsp()?;
+        let va = rsp.wrapping_add(0x28);
+        (
+            stdio::walk_vfprintf_format(engine, &fmt, va),
+            stream == FILE_STDERR,
+        )
+    };
+    if is_stderr {
+        stdio::write_host_console(FILE_STDERR, &out);
+    } else {
+        crate::kernel32::console::emit_text_from_bytes(ctx, &out);
+    }
+    finish(&mut *ctx.engine, u64::try_from(out.len()).unwrap_or(0))
+}
+/// `isprint(c)` — printable ASCII (0x20..=0x7E).
+pub(crate) fn handle_isprint(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let c = ctx.engine.read_rcx()? & 0xff;
+    finish(&mut *ctx.engine, u64::from((0x20..=0x7E).contains(&c)))
+}
+/// `log10(x)` — host double, returned in XMM0 (Win64 FP return register).
+pub(crate) fn handle_log10(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let x = f64::from_bits(ctx.engine.read_rcx()?);
+    let result = x.log10();
+    ctx.engine.write_xmm0(result.to_bits())?;
+    finish(&mut *ctx.engine, 0)
+}
+/// `memchr(buf, c, count)` — first byte equal to `c`; NULL when absent.
+pub(crate) fn handle_memchr(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let buf = engine.read_rcx()?;
+    let c = u8::try_from(engine.read_rdx()? & 0xff).unwrap_or(0);
+    let count = usize::try_from(engine.read_r8()?).unwrap_or(0);
+    if buf == 0 || count == 0 {
+        return finish(engine, 0);
+    }
+    let mut found = 0_u64;
+    for i in 0..count {
+        let mut b = [0_u8; 1];
+        if engine
+            .mem_read(buf.wrapping_add(u64::try_from(i).unwrap_or(0)), &mut b)
+            .is_err()
+        {
+            break;
+        }
+        if b[0] == c {
+            found = buf.wrapping_add(u64::try_from(i).unwrap_or(0));
+            break;
+        }
+    }
+    finish(engine, found)
+}
+/// `qsort(base, count, size, compar)` — the guest comparator would need a
+/// host callback round-trip; the sort is a no-op (documented gap, not hit at
+/// boot).
+pub(crate) fn handle_qsort(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _base = ctx.engine.read_rcx()?;
+    let _count = ctx.engine.read_rdx()?;
+    let _size = ctx.engine.read_r8()?;
+    let _compar = ctx.engine.read_r9()?;
+    finish(&mut *ctx.engine, 0)
+}
+/// `strcpy(dst, src)` — copy the NUL-terminated source; returns `dst`.
+pub(crate) fn handle_strcpy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let dst = engine.read_rcx()?;
+    let src = engine.read_rdx()?;
+    if dst == 0 || src == 0 {
+        return finish(engine, dst);
+    }
+    let mut i = 0_u64;
+    loop {
+        let mut b = [0_u8; 1];
+        if engine.mem_read(src.wrapping_add(i), &mut b).is_err() {
+            break;
+        }
+        if engine.mem_write(dst.wrapping_add(i), &b).is_err() {
+            break;
+        }
+        if b[0] == 0 {
+            break;
+        }
+        i = i.saturating_add(1);
+        if i > 1_000_000 {
+            break;
+        }
+    }
+    finish(engine, dst)
+}
+/// `strrchr(s, c)` — last occurrence of `c` in `s`; NULL when absent.
+pub(crate) fn handle_strrchr(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let s = engine.read_rcx()?;
+    let c = u8::try_from(engine.read_rdx()? & 0xff).unwrap_or(0);
+    if s == 0 {
+        return finish(engine, 0);
+    }
+    let mut last = 0_u64;
+    let mut i = 0_u64;
+    loop {
+        let mut b = [0_u8; 1];
+        if engine.mem_read(s.wrapping_add(i), &mut b).is_err() {
+            break;
+        }
+        if b[0] == 0 {
+            break;
+        }
+        if b[0] == c {
+            last = s.wrapping_add(i);
+        }
+        i = i.saturating_add(1);
+        if i > 1_000_000 {
+            break;
+        }
+    }
+    finish(engine, last)
 }

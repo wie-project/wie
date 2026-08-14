@@ -19,7 +19,7 @@ pub(crate) use std::path::Path;
 pub(crate) use std::sync::OnceLock;
 
 const FIXED_SYSTEM_FILETIME: u64 = 133_485_408_000_000_000;
-const FAKE_CURRENT_PROCESS_ID: u64 = 0x1234;
+pub(crate) const FAKE_CURRENT_PROCESS_ID: u64 = 0x1234;
 const FIXED_TICK_COUNT: u64 = 12_345;
 const FIXED_PERFORMANCE_COUNTER: u64 = 1_000_000;
 const FLS_OUT_OF_INDEXES: u64 = 0xffff_ffff;
@@ -543,6 +543,40 @@ pub fn dispatch_kernel32_extra(
         "createprocessa" => Ok(Some(handle_create_process_a(ctx)?)),
         "getexitcodeprocess" => Ok(Some(handle_get_exit_code_process(ctx)?)),
         "openprocess" => Ok(Some(handle_open_process(ctx)?)),
+        // Phase-2 stub wave: boot-surface names for DOOM Retro / SDL2.
+        "initializecriticalsectionex" => Ok(Some(handle_initialize_critical_section_ex(ctx)?)),
+        "tryentercriticalsection" => Ok(Some(handle_try_enter_critical_section(ctx)?)),
+        "createmutexa" => Ok(Some(handle_create_mutex_a(ctx)?)),
+        "releasemutex" => Ok(Some(handle_release_mutex(ctx)?)),
+        "initializeslisthead" => Ok(Some(handle_initialize_slist_head(ctx)?)),
+        "interlockedflushslist" => Ok(Some(handle_interlocked_flush_slist(ctx)?)),
+        "waitforsingleobjectex" => Ok(Some(handle_wait_for_single_object_ex(ctx)?)),
+        "getmodulehandleexw" => Ok(Some(handle_get_module_handle_ex_w(ctx)?)),
+        "getprocessid" => Ok(Some(handle_get_process_id(ctx)?)),
+        "rtlpctofileheader" => Ok(Some(handle_rtl_pc_to_file_header(ctx)?)),
+        "rtllookupfunctionentry" => Ok(Some(handle_rtl_lookup_function_entry(ctx)?)),
+        "rtlunwind" => Ok(Some(handle_rtl_unwind(ctx)?)),
+        "rtlvirtualunwind" => Ok(Some(handle_rtl_virtual_unwind(ctx)?)),
+        "comparestringa" => Ok(Some(handle_compare_string_a(ctx)?)),
+        "comparestringw" => Ok(Some(handle_compare_string_w(ctx)?)),
+        "findfirstfileexw" => Ok(Some(handle_find_first_file_ex_w(ctx)?)),
+        "movefileexw" => Ok(Some(handle_move_file_ex_w(ctx)?)),
+        "peeknamedpipe" => Ok(Some(handle_peek_named_pipe(ctx)?)),
+        "setnamedpipehandlestate" => Ok(Some(handle_set_named_pipe_handle_state(ctx)?)),
+        "getoverlappedresult" => Ok(Some(handle_get_overlapped_result(ctx)?)),
+        "cancelio" => Ok(Some(handle_cancel_io(ctx)?)),
+        "getsystempowerstatus" => Ok(Some(handle_get_system_power_status(ctx)?)),
+        "setthreadexecutionstate" => Ok(Some(handle_set_thread_execution_state(ctx)?)),
+        "setthreadpriority" => Ok(Some(handle_set_thread_priority(ctx)?)),
+        "setstdhandle" => Ok(Some(handle_set_std_handle(ctx)?)),
+        "unhandledexceptionfilter" => Ok(Some(handle_unhandled_exception_filter(ctx)?)),
+        "systemtimetotzspecificlocaltime" => {
+            Ok(Some(handle_system_time_to_tz_specific_local_time(ctx)?))
+        }
+        "getlocaleinfoa" => Ok(Some(handle_get_locale_info_a(ctx)?)),
+        "versetconditionmask" => Ok(Some(handle_ver_set_condition_mask(ctx)?)),
+        "verifyversioninfow" => Ok(Some(handle_verify_version_info_w(ctx)?)),
+        "enumresourcenamesw" => Ok(Some(handle_enum_resource_names_w(ctx)?)),
         // Console surface: the hot calls have their own arms above; the rest
         // live in `console` so this match does not grow a fourth screenful.
         _ => console::dispatch_console_extra(ctx, n.as_str()),

@@ -941,3 +941,65 @@ pub(crate) fn write_fixed_dir_a(
         return_value,
     })
 }
+/// Handles `KERNEL32.dll!FindFirstFileExW` — `FindFirstFileW` semantics with
+/// the extended argument list (info level / search op / filter / flags are
+/// accepted; the basic info level writes the same `WIN32_FIND_DATAW`).
+pub fn handle_find_first_file_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let pattern_va = engine
+        .read_rcx()
+        .context("failed to read RCX for FindFirstFileExW")?;
+    let _info_level = engine.read_rdx()?;
+    let find_data_va = engine
+        .read_r8()
+        .context("failed to read R8 for FindFirstFileExW")?;
+    let _search_op = engine.read_r9()?;
+    let pattern = read_wide_string_from_cpu(engine, pattern_va, 1024)?;
+    let return_value = finish_find_first(engine, state, &pattern, find_data_va, true)?;
+    ctx.finish(return_value)
+}
+/// Handles `KERNEL32.dll!PeekNamedPipe`.
+///
+/// No named-pipe handles exist under WIE; pipes created by `CreatePipe` are
+/// anonymous byte pipes. Return FALSE with `ERROR_INVALID_HANDLE` for the
+/// probe (the boot paths that call it guard on the failure).
+pub fn handle_peek_named_pipe(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _handle = ctx.engine.read_rcx()?;
+    ctx.state.process.last_error = ERROR_INVALID_HANDLE;
+    ctx.finish(0)
+}
+/// Handles `KERNEL32.dll!SetNamedPipeHandleState` — accepted no-op.
+pub fn handle_set_named_pipe_handle_state(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    let _handle = ctx.engine.read_rcx()?;
+    let _mode = ctx.engine.read_rdx()?;
+    let _max_collect = ctx.engine.read_r8()?;
+    let _collect_data_timeout = ctx.engine.read_r9()?;
+    ctx.finish(1)
+}
+/// Handles `KERNEL32.dll!GetOverlappedResult`.
+///
+/// No overlapped I/O is in flight under WIE: writes 0 bytes transferred and
+/// returns TRUE for a valid file handle, FALSE with `ERROR_INVALID_HANDLE`
+/// otherwise. `bWait` is accepted and ignored.
+pub fn handle_get_overlapped_result(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let handle = engine
+        .read_rcx()
+        .context("failed to read RCX for GetOverlappedResult")?;
+    let _overlapped = engine.read_rdx()?;
+    let transferred_va = engine.read_r8()?;
+    let _wait = engine.read_r9()?;
+    if transferred_va != 0 {
+        crate::guest_memory::write_u32(engine, transferred_va, 0)?;
+    }
+    if state.file_io.open_files.contains_key(&handle) {
+        state.process.last_error = 0;
+        return ctx.finish(1);
+    }
+    state.process.last_error = ERROR_INVALID_HANDLE;
+    ctx.finish(0)
+}

@@ -231,3 +231,25 @@ pub(crate) fn finish_move_file(state: &mut WinApiState, from: &str, to: &str) ->
         0
     }
 }
+/// Handles `KERNEL32.dll!MoveFileExW` — `MoveFileW` semantics; the flags
+/// (`MOVEFILE_REPLACE_EXISTING` etc.) are accepted; plain overwrite is
+/// already the behaviour of `finish_move_file`.
+pub fn handle_move_file_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let from_va = engine.read_rcx()?;
+    let to_va = engine.read_rdx()?;
+    let _flags = engine.read_r8()?;
+    let from = if from_va == 0 {
+        String::new()
+    } else {
+        read_wide_string_from_cpu(engine, from_va, 32_768)?
+    };
+    let to = if to_va == 0 {
+        String::new()
+    } else {
+        read_wide_string_from_cpu(engine, to_va, 32_768)?
+    };
+    let return_value = finish_move_file(state, &from, &to);
+    ctx.finish(return_value)
+}

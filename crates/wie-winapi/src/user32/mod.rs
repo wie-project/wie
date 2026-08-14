@@ -299,6 +299,7 @@ pub mod menu;
 pub mod message;
 pub mod misc;
 pub mod rect;
+pub mod stubs;
 pub mod window;
 pub mod wm;
 pub use accel::*;
@@ -313,6 +314,7 @@ pub use menu::*;
 pub use message::*;
 pub use misc::*;
 pub use rect::*;
+pub use stubs::*;
 pub use window::*;
 pub use wm::*;
 
@@ -811,5 +813,54 @@ pub fn dispatch_user32_extra(
     if let Some(result) = crate::clipboard::dispatch_clipboard(ctx, name)? {
         return Ok(Some(result));
     }
-    charfmt::dispatch_charfmt(ctx, name)
+    let n = name.to_ascii_lowercase();
+    match n.as_str() {
+        "attachthreadinput" => Ok(Some(stubs::handle_attach_thread_input(ctx)?)),
+        "bringwindowtotop" => Ok(Some(stubs::handle_bring_window_to_top(ctx)?)),
+        "changedisplaysettingsexw" => Ok(Some(stubs::handle_change_display_settings_ex_w(ctx)?)),
+        "copyimage" => Ok(Some(stubs::handle_copy_image(ctx)?)),
+        "createiconfromresource" => Ok(Some(stubs::handle_create_icon_from_resource(ctx)?)),
+        "createiconindirect" => Ok(Some(stubs::handle_create_icon_indirect(ctx)?)),
+        "dialogboxindirectparamw" => Ok(Some(stubs::handle_dialog_box_indirect_param_w(ctx)?)),
+        "enumdisplaysettingsw" => Ok(Some(stubs::handle_enum_display_settings_w(ctx)?)),
+        "flashwindowex" => Ok(Some(stubs::handle_flash_window_ex(ctx)?)),
+        "getclassinfoexw" => Ok(Some(stubs::handle_get_class_info_ex_w(ctx)?)),
+        "getclipboardsequencenumber" => Ok(Some(stubs::handle_get_clipboard_sequence_number(ctx)?)),
+        "getdoubleclicktime" => Ok(Some(stubs::handle_get_double_click_time(ctx)?)),
+        "getkeyboardlayout" => Ok(Some(stubs::handle_get_keyboard_layout(ctx)?)),
+        "getmessageextrainfo" => Ok(Some(stubs::handle_get_message_extra_info(ctx)?)),
+        "getmessagetime" => Ok(Some(stubs::handle_get_message_time(ctx)?)),
+        "getpropw" => Ok(Some(stubs::handle_get_prop_w(ctx)?)),
+        "getrawinputdata" => Ok(Some(stubs::handle_get_raw_input_data(ctx)?)),
+        "getrawinputdeviceinfoa" => Ok(Some(stubs::handle_get_raw_input_device_info_a(ctx)?)),
+        "getrawinputdevicelist" => Ok(Some(stubs::handle_get_raw_input_device_list(ctx)?)),
+        "getupdaterect" => Ok(Some(stubs::handle_get_update_rect(ctx)?)),
+        "getwindowlongw" => Ok(Some(stubs::handle_get_window_long_w(ctx)?)),
+        "intersectrect" => Ok(Some(stubs::handle_intersect_rect(ctx)?)),
+        "keybd_event" => Ok(Some(stubs::handle_keybd_event(ctx)?)),
+        "mapvirtualkeyw" => Ok(Some(stubs::handle_map_virtual_key_w(ctx)?)),
+        "monitorfromrect" => Ok(Some(display::handle_monitor_from_rect(ctx)?)),
+        "msgwaitformultipleobjects" => Ok(Some(stubs::handle_msg_wait_for_multiple_objects(ctx)?)),
+        "postthreadmessagew" => Ok(Some(stubs::handle_post_thread_message_w(ctx)?)),
+        "ptinrect" => Ok(Some(stubs::handle_pt_in_rect(ctx)?)),
+        "registerdevicenotificationw" => {
+            Ok(Some(stubs::handle_register_device_notification_w(ctx)?))
+        }
+        "registerhotkey" => Ok(Some(stubs::handle_register_hot_key(ctx)?)),
+        "registerrawinputdevices" => Ok(Some(stubs::handle_register_raw_input_devices(ctx)?)),
+        "removepropw" => Ok(Some(stubs::handle_remove_prop_w(ctx)?)),
+        "setcursorpos" => Ok(Some(stubs::handle_set_cursor_pos(ctx)?)),
+        "setlayeredwindowattributes" => Ok(Some(stubs::handle_set_layered_window_attributes(ctx)?)),
+        "setpropw" => Ok(Some(stubs::handle_set_prop_w(ctx)?)),
+        "setwindowrgn" => Ok(Some(stubs::handle_set_window_rgn(ctx)?)),
+        "systemparametersinfoa" => Ok(Some(stubs::handle_system_parameters_info_a(ctx)?)),
+        "systemparametersinfow" => Ok(Some(stubs::handle_system_parameters_info_w(ctx)?)),
+        "tounicode" => Ok(Some(stubs::handle_to_unicode(ctx)?)),
+        "unregisterdevicenotification" => {
+            Ok(Some(stubs::handle_unregister_device_notification(ctx)?))
+        }
+        "unregisterhotkey" => Ok(Some(stubs::handle_unregister_hot_key(ctx)?)),
+        "waitforinputidle" => Ok(Some(stubs::handle_wait_for_input_idle(ctx)?)),
+        _ => charfmt::dispatch_charfmt(ctx, name),
+    }
 }
