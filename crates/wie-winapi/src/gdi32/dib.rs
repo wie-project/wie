@@ -210,6 +210,19 @@ pub fn handle_get_dib_bits(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
     let (hbm, start, c_lines, lpv_bits, lpbi) = read_dib_bits_args(ctx, "GetDIBits")?;
     let state = &mut *ctx.state;
     let Some(dib) = resolve_dib(state, hbm) else {
+        // A compatible bitmap (`CreateCompatibleBitmap`) has no DIB record.
+        // A size-only query still gets a header so callers can detect the
+        // pixel format (SDL2's video init probes a 1×1 compatible bitmap);
+        // report 32bpp BI_BITFIELDS with the standard RGB888 channel masks.
+        if lpv_bits == 0 && lpbi != 0 {
+            write_compatible_bitmap_info_header(ctx.engine, lpbi)?;
+            let rows = if c_lines > 0 {
+                u64::from(c_lines)
+            } else {
+                1
+            };
+            return ctx.finish(rows);
+        }
         tracing::debug!(hbm, "GetDIBits: unknown DIB");
         return ctx.finish(0);
     };
@@ -231,6 +244,38 @@ pub fn handle_get_dib_bits(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
 
     let copied = copy_scan_lines(ctx.engine, &dib, start, c_lines, lpv_bits, true)?;
     ctx.finish(copied)
+}
+
+/// Write the 40-byte `BITMAPINFOHEADER` for a 1×1 32bpp `BI_BITFIELDS` bitmap
+/// plus the three channel masks, then the header for a compatible bitmap.
+fn write_compatible_bitmap_info_header(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    lpbi: u64,
+) -> Result<()> {
+    with_typed_write::<BitmapInfoHeader, _, _>(engine, lpbi, |header| {
+        header.bi_size = u32::try_from(std::mem::size_of::<BitmapInfoHeader>()).unwrap_or(0);
+        header.bi_width = 1;
+        header.bi_height = 1;
+        header.bi_planes = 1;
+        header.bi_bit_count = 32;
+        header.bi_compression = 3; // BI_BITFIELDS
+        header.bi_size_image = 4;
+        Ok(())
+    })
+    .context("failed to write compatible-bitmap BITMAPINFOHEADER")?;
+    // The three BI_BITFIELDS masks follow the header: R, G, B (RGB888).
+    let masks = [0x00FF0000_u32, 0x0000FF00, 0x000000FF];
+    for (i, mask) in masks.iter().enumerate() {
+        let off = u64::try_from(std::mem::size_of::<BitmapInfoHeader>())
+            .unwrap_or(0)
+            .saturating_add(u64::try_from(i * 4).unwrap_or(0));
+        crate::guest_memory::write_u32(
+            engine,
+            crate::guest_memory::checked_address(lpbi, off, "bmiColors"),
+            *mask,
+        )?;
+    }
+    Ok(())
 }
 
 /// Handles `GDI32.dll!SetDIBits` — copy scan lines from a guest buffer into a

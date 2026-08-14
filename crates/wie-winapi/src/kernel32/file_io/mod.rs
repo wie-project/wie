@@ -783,13 +783,27 @@ pub(crate) fn finish_create_file(
                 handle
             }
             Err(win_error) => {
-                tracing::error!(
-                    path = %file_name,
-                    desired_access,
-                    creation_disposition,
-                    win_error,
-                    "{api_name} open failed"
-                );
+                // Not-found on an OPEN_EXISTING probe is a routine existence
+                // check (e.g. a game scanning for its data files) — keep it
+                // out of the error channel; anything else is a real failure.
+                if win_error == ERROR_FILE_NOT_FOUND
+                    && creation_disposition == OPEN_EXISTING
+                {
+                    tracing::debug!(
+                        path = %file_name,
+                        desired_access,
+                        win_error,
+                        "{api_name} probe not found"
+                    );
+                } else {
+                    tracing::error!(
+                        path = %file_name,
+                        desired_access,
+                        creation_disposition,
+                        win_error,
+                        "{api_name} open failed"
+                    );
+                }
                 state.process.last_error = win_error;
                 INVALID_HANDLE_VALUE
             }

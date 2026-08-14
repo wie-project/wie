@@ -78,8 +78,8 @@ pub fn handle_dialog_box_indirect_param_w(
 }
 /// Handles `USER32.dll!EnumDisplaySettingsW`.
 ///
-/// Mode 0 reports a 1024x768@60 DEVMODE (a plausible default); any later mode
-/// returns FALSE (the enumeration is exhausted).
+/// Reports a 1920×1080@60 DEVMODE for mode 0 and `ENUM_CURRENT_SETTINGS` (-1);
+/// any other mode returns FALSE (the enumeration is exhausted).
 pub fn handle_enum_display_settings_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let _device = engine.read_rcx()?;
@@ -89,7 +89,8 @@ pub fn handle_enum_display_settings_w(ctx: &mut HandlerContext<'_>) -> Result<Wi
     let mode_va = engine
         .read_r8()
         .context("failed to read R8 for EnumDisplaySettingsW")?;
-    if mode_index != 0 || mode_va == 0 {
+    // ENUM_CURRENT_SETTINGS is -1 (0xFFFFFFFF); ENUM_REGISTRY_SETTINGS is -2.
+    if (mode_index != 0 && mode_index != 0xFFFF_FFFF) || mode_va == 0 {
         return ctx.finish(0);
     }
     // DEVMODEW layout (offsets that SDL reads):
@@ -98,8 +99,8 @@ pub fn handle_enum_display_settings_w(ctx: &mut HandlerContext<'_>) -> Result<Wi
     let mut buf = [0_u8; 0x40];
     buf[0..2].copy_from_slice(&(0x40_u16).to_le_bytes()); // wSize
     buf[0x16..0x1A].copy_from_slice(&32_u32.to_le_bytes()); // 32bpp
-    buf[0x1C..0x20].copy_from_slice(&1024_u32.to_le_bytes());
-    buf[0x20..0x24].copy_from_slice(&768_u32.to_le_bytes());
+    buf[0x1C..0x20].copy_from_slice(&1920_u32.to_le_bytes());
+    buf[0x20..0x24].copy_from_slice(&1080_u32.to_le_bytes());
     buf[0x28..0x2C].copy_from_slice(&60_u32.to_le_bytes()); // refresh
     engine
         .mem_write(mode_va, &buf)
