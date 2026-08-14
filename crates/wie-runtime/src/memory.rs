@@ -497,7 +497,14 @@ pub(crate) fn default_winapi_state(
             main_module_host_dir: None,
             error_mode: 0,
             suspended_threads: ahash::HashMap::new(),
-            environment: Vec::new(),
+            // SDL2 guests: disable the DirectInput joystick driver — WIE has
+            // no DirectInput COM implementation, and SDL2's fallback (DInput
+            // driver init failing → SDL_InitSubSystem failing → video torn
+            // down) would break the display for games that use SDL_Init.
+            environment: vec![(
+                "SDL_DIRECTINPUT_ENABLED".to_string(),
+                "0".to_string(),
+            )],
             // The main module's RT_DIALOG/RT_MENU/RT_STRING/RT_ACCELERATOR
             // resources are parsed in session init (the section map is not
             // available here).
@@ -631,6 +638,11 @@ pub(crate) fn build_default_environment_strings_w() -> Result<Vec<u8>> {
         "PATH=C:\\Windows\\System32",
         "TEMP=C:\\Users\\WIE\\AppData\\Local\\Temp",
         "TMP=C:\\Users\\WIE\\AppData\\Local\\Temp",
+        // SDL2 guests: disable the DirectInput joystick driver (no WIE
+        // DirectInput COM). Without the hint, the dinput driver's
+        // CoCreateInstance fails → SDL_InitSubSystem fails → the already-
+        // initialized video subsystem gets torn down.
+        "SDL_DIRECTINPUT_ENABLED=0",
     ];
 
     let mut bytes = Vec::new();

@@ -852,6 +852,15 @@ impl super::RuntimeSession {
         engine
             .mem_write(environment_strings_w_ptr, &environment_strings_w)
             .context("failed to write entry UTF-16 environment strings")?;
+        // RTL_USER_PROCESS_PARAMETERS.Environment (x64 offset 0x78): point the
+        // guest CRT `getenv` (which walks PEB→ProcessParameters→Environment)
+        // at the block above — SDL2 reads its SDL_HINT_* env vars this way.
+        engine
+            .mem_write(
+                fake_pp_va.wrapping_add(0x78),
+                &environment_strings_w_ptr.to_le_bytes(),
+            )
+            .context("failed to write fake PP Environment pointer")?;
         t_phase = phase("identity+env-strings", t_phase);
 
         engine
