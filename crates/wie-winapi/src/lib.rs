@@ -47,6 +47,7 @@ pub mod user32;
 pub mod uxtheme;
 pub mod version;
 pub mod vfs;
+pub mod winhttp;
 pub mod wininet;
 pub mod winmm;
 pub mod ws2_32;
@@ -67,10 +68,10 @@ mod exception_helpers;
 mod exception_tests;
 pub use fake_va::{
     ComMethod, D3d9Iface, Device9Method, Direct3D9Method, FAKE_API_BASE, FAKE_API_SIZE, FakeVa,
-    IndexBuffer9Method, PixelShader9Method, SPECIAL_CALLBACK_RETURN, SPECIAL_SEH_CONTINUE,
-    Surface9Method, Texture9Method, VertexBuffer9Method, VertexShader9Method,
-    callback_return_trampoline_va, decode as decode_fake_va, encode_alias, encode_com,
-    encode_export, encode_unresolved, seh_continue_trampoline_va,
+    IndexBuffer9Method, PixelShader9Method, SPECIAL_CALLBACK_RETURN, SPECIAL_DLL_MAIN_RETURN,
+    SPECIAL_SEH_CONTINUE, Surface9Method, Texture9Method, VertexBuffer9Method, VertexShader9Method,
+    callback_return_trampoline_va, decode as decode_fake_va, dll_main_return_trampoline_va,
+    encode_alias, encode_com, encode_export, encode_unresolved, seh_continue_trampoline_va,
 };
 pub use guest_heap::GuestHeap;
 pub use idle::{IdleContext, IdlePolicy};
@@ -97,5 +98,5 @@ pub use state::{
 mod dispatch_table;
 pub use dispatch_table::{
     WINAPI_ID_COUNT, WinApiId, WinApiTraits, dispatch_winapi, dispatch_winapi_id,
-    is_winapi_implemented, resolve_winapi_id, winapi_id_export,
+    is_winapi_implemented, is_winapi_library, resolve_winapi_id, winapi_id_export,
 };

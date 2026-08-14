@@ -72,6 +72,15 @@ const UCRT_CALLABLE: &[&str] = &[
     "??1type_info@@ueaa@xz",
     "?terminate@@yaxxz",
     "__acrt_iob_func",
+    "__iob_func",
+    "_amsg_exit",
+    "_fdopen",
+    "_filelengthi64",
+    "_fileno",
+    "_lock",
+    "_unlock",
+    "_wfopen",
+    "_wfreopen",
     "__c_specific_handler",
     "__dllonexit",
     "__getmainargs",
@@ -132,6 +141,14 @@ const UCRT_CALLABLE: &[&str] = &[
     "calloc",
     "exit",
     "fclose",
+    "feof",
+    "ferror",
+    "fgetpos",
+    "fprintf",
+    "fread",
+    "fseek",
+    "fsetpos",
+    "ftell",
     "fflush",
     "fgetc",
     "fgets",
@@ -146,12 +163,14 @@ const UCRT_CALLABLE: &[&str] = &[
     "getenv",
     "isalnum",
     "isalpha",
+    "isprint",
     "isdigit",
     "islower",
     "isspace",
     "isupper",
     "iswctype",
     "malloc",
+    "memchr",
     "memcmp",
     "memcpy",
     "memcpy_s",
@@ -163,6 +182,8 @@ const UCRT_CALLABLE: &[&str] = &[
     "putchar",
     "puts",
     "qsort_s",
+    "qsort",
+    "log10",
     "rand",
     "realloc",
     "setlocale",
@@ -173,6 +194,8 @@ const UCRT_CALLABLE: &[&str] = &[
     "srand",
     "strcat_s",
     "strchr",
+    "strcpy",
+    "strrchr",
     "strcmp",
     "strcpy_s",
     "strerror",
@@ -222,6 +245,7 @@ const OLE32_DLL_EXPORTS: &[&str] = &[
     "oleinitialize",
     "oleuninitialize",
     "olesetclipboard",
+    "propvariantclear",
     "registerdragdrop",
     "revokedragdrop",
     "stringfromclsid",
@@ -232,6 +256,8 @@ const SHELL32_DLL_EXPORTS: &[&str] = &[
     "commandlinetoargvw",
     "shaddtorecentdocs",
     "shbrowseforfolderw",
+    "shellexecutea",
+    "shellexecuteexa",
     "shellexecuteexw",
     "shgetfileinfoa",
     "shgetfileinfow",
@@ -274,40 +300,91 @@ const OLEAUT32_DLL_EXPORTS: &[&str] = &[
 
 /// Soft-dispatched `user32.dll` exports (mirror of the `dispatch_*` fallback arms).
 const USER32_DLL_EXPORTS: &[&str] = &[
+    "attachthreadinput",
+    "bringwindowtotop",
+    "changedisplaysettingsexw",
     "charprevexa",
     "charupperw",
+    "copyimage",
     "createcaret",
+    "createiconfromresource",
+    "createiconindirect",
     "destroycaret",
+    "dialogboxindirectparamw",
     "dialogboxparamw",
     "drawicona",
     "drawiconex",
     "drawiconw",
     "enumchildwindows",
+    "enumdisplaysettingsw",
     "enumwindows",
     "findwindowa",
     "findwindoww",
+    "flashwindowex",
     "getcaretpos",
+    "getclassinfoexw",
+    "getclipboardsequencenumber",
+    "getdoubleclicktime",
+    "getkeyboardlayout",
+    "getmessageextrainfo",
+    "getmessagetime",
+    "getpropw",
+    "getrawinputdata",
+    "getrawinputdeviceinfoa",
+    "getrawinputdevicelist",
+    "getupdaterect",
+    "getwindowlongw",
     "hidecaret",
+    "intersectrect",
+    "keybd_event",
+    "mapvirtualkeyw",
+    "monitorfromrect",
+    "msgwaitformultipleobjects",
+    "postthreadmessagew",
+    "ptinrect",
+    "registerdevicenotificationw",
+    "registerhotkey",
+    "registerrawinputdevices",
+    "removepropw",
     "setcaretpos",
+    "setcursorpos",
+    "setlayeredwindowattributes",
     "setprocessdefaultlayout",
+    "setpropw",
+    "setwindowrgn",
     "showcaret",
+    "systemparametersinfoa",
+    "systemparametersinfow",
+    "tounicode",
+    "unregisterdevicenotification",
+    "unregisterhotkey",
+    "waitforinputidle",
     "winhelpw",
     "wsprintfw",
 ];
 
 /// Soft-dispatched `gdi32.dll` exports (mirror of the `dispatch_*` fallback arms).
 const GDI32_DLL_EXPORTS: &[&str] = &[
+    "choosepixelformat",
     "combinergn",
+    "createbitmap",
     "createellipticrgn",
     "createpolygonrgn",
     "createrectrgn",
+    "describepixelformat",
     "enumfontfamiliesexa",
     "enumfontfamiliesexw",
+    "getdevicegammaramp",
     "getdibits",
+    "geticmprofilew",
+    "getpixelformat",
     "getrgnbox",
+    "setdevicegammaramp",
     "setdibits",
     "setpixel",
+    "setpixelformat",
     "setrectrgn",
+    "swapbuffers",
 ];
 
 /// Soft-dispatched `comctl32.dll` exports (mirror of the `dispatch_*` fallback arms).
@@ -323,12 +400,40 @@ const COMCTL32_DLL_EXPORTS: &[&str] = &[
 
 /// Soft-dispatched `winmm.dll` exports (mirror of the `dispatch_*` fallback arms).
 const WINMM_DLL_EXPORTS: &[&str] = &[
+    "midioutgetdevcapsa",
+    "midioutgeterrortexta",
+    "midioutprepareheader",
+    "midioutreset",
+    "midioutsetvolume",
+    "midioutshortmsg",
+    "midioutunprepareheader",
+    "midistreamclose",
+    "midistreamopen",
+    "midistreamout",
+    "midistreampause",
+    "midistreamproperty",
+    "midistreamrestart",
+    "midistreamstop",
+    "timebeginperiod",
+    "timeendperiod",
     "timekillevent",
     "timesetevent",
+    "waveinaddbuffer",
+    "waveinclose",
+    "waveingetdevcapsw",
+    "waveingetnumdevs",
+    "waveinopen",
+    "waveinprepareheader",
+    "waveinreset",
+    "waveinstart",
+    "waveinunprepareheader",
     "waveoutclose",
+    "waveoutgetdevcapsw",
+    "waveoutgeterrortextw",
     "waveoutgetnumdevs",
     "waveoutopen",
     "waveoutprepareheader",
+    "waveoutreset",
     "waveoutunprepareheader",
     "waveoutwrite",
 ];
@@ -366,7 +471,10 @@ const KERNEL32_DLL_EXPORTS: &[&str] = &[
     "backupread",
     "backupseek",
     "backupwrite",
+    "cancelio",
     "comparefiletime",
+    "comparestringa",
+    "comparestringw",
     "createconsolescreenbuffer",
     "createeventa",
     "createeventw",
@@ -374,6 +482,7 @@ const KERNEL32_DLL_EXPORTS: &[&str] = &[
     "createhardlinkw",
     "createjobobjecta",
     "createjobobjectw",
+    "createmutexa",
     "createsemaphorea",
     "createsemaphorew",
     "createthread",
@@ -381,6 +490,7 @@ const KERNEL32_DLL_EXPORTS: &[&str] = &[
     "deviceiocontrol",
     "dosdatetimetofiletime",
     "duplicatehandle",
+    "enumresourcenamesw",
     "exitthread",
     "expandenvironmentstringsa",
     "expandenvironmentstringsw",
@@ -388,6 +498,7 @@ const KERNEL32_DLL_EXPORTS: &[&str] = &[
     "fillconsoleoutputattribute",
     "fillconsoleoutputcharactera",
     "fillconsoleoutputcharacterw",
+    "findfirstfileexw",
     "findfirststreamw",
     "findnextstreamw",
     "flushconsoleinputbuffer",
@@ -417,17 +528,22 @@ const KERNEL32_DLL_EXPORTS: &[&str] = &[
     "getfileattributesexw",
     "getlargepageminimum",
     "getlargestconsolewindowsize",
+    "getlocaleinfoa",
     "getlogicaldrivestringsw",
     "getlongpathnamea",
     "getlongpathnamew",
+    "getmodulehandleexw",
     "getmodulehandlew",
     "getnumberofconsoleinputevents",
     "getnumberofconsolemousebuttons",
+    "getoverlappedresult",
     "getprocessaffinitymask",
+    "getprocessid",
     "getprocesstimes",
     "getshortpathnamea",
     "getshortpathnamew",
     "getsysteminfo",
+    "getsystempowerstatus",
     "getthreadpriority",
     "gettickcount64",
     "getusernamea",
@@ -438,6 +554,8 @@ const KERNEL32_DLL_EXPORTS: &[&str] = &[
     "getvolumeinformationa",
     "getvolumeinformationw",
     "globalmemorystatusex",
+    "initializecriticalsectionex",
+    "initializeslisthead",
     "interlockedcompareexchange",
     "interlockedcompareexchange64",
     "interlockeddecrement",
@@ -446,6 +564,7 @@ const KERNEL32_DLL_EXPORTS: &[&str] = &[
     "interlockedexchange64",
     "interlockedexchangeadd",
     "interlockedexchangeadd64",
+    "interlockedflushslist",
     "interlockedincrement",
     "interlockedincrement64",
     "isdebuggerpresent",
@@ -456,6 +575,7 @@ const KERNEL32_DLL_EXPORTS: &[&str] = &[
     "lstrcpyw",
     "lstrlenw",
     "mapviewoffile",
+    "movefileexw",
     "movefilewithprogressw",
     "openeventa",
     "openeventw",
@@ -465,6 +585,7 @@ const KERNEL32_DLL_EXPORTS: &[&str] = &[
     "outputdebugstringa",
     "outputdebugstringw",
     "peekconsoleinputw",
+    "peeknamedpipe",
     "queryfullprocessimagenamea",
     "queryfullprocessimagenamew",
     "queryperformancefrequency",
@@ -472,11 +593,16 @@ const KERNEL32_DLL_EXPORTS: &[&str] = &[
     "readconsolea",
     "readconsoleinputw",
     "readconsolew",
+    "releasemutex",
     "releasesemaphore",
     "resetevent",
     "resumethread",
     "rtlcapturecontext",
+    "rtllookupfunctionentry",
+    "rtlpctofileheader",
+    "rtlunwind",
     "rtlunwindex",
+    "rtlvirtualunwind",
     "scrollconsolescreenbufferw",
     "setconsoleactivescreenbuffer",
     "setconsolecp",
@@ -497,25 +623,35 @@ const KERNEL32_DLL_EXPORTS: &[&str] = &[
     "setfileattributesw",
     "setfiletime",
     "setfilevaliddata",
+    "setnamedpipehandlestate",
     "setprocessaffinitymask",
+    "setstdhandle",
     "setthreadaffinitymask",
     "setthreaderrormode",
+    "setthreadexecutionstate",
+    "setthreadpriority",
     "signalobjectandwait",
     "suspendthread",
+    "systemtimetotzspecificlocaltime",
     "terminateprocess",
     "terminatethread",
     "tlsalloc",
     "tlsfree",
     "tlsgetvalue",
     "tlssetvalue",
+    "tryentercriticalsection",
+    "unhandledexceptionfilter",
     "unlockfile",
     "unmapviewoffile",
+    "versetconditionmask",
+    "verifyversioninfow",
     "virtualalloc",
     "virtualfree",
     "virtualprotect",
     "virtualquery",
     "waitformultipleobjects",
     "waitforsingleobject",
+    "waitforsingleobjectex",
     "writeconsolea",
     "writeconsoleoutputattribute",
     "writeconsoleoutputcharactera",
@@ -570,10 +706,17 @@ const MSIMG32_DLL_EXPORTS: &[&str] = &["alphablend", "gradientfill", "transparen
 
 /// Soft-dispatched `imm32.dll` exports (mirror of the `dispatch_*` fallback arms).
 const IMM32_DLL_EXPORTS: &[&str] = &[
+    "immassociatecontext",
+    "immgetcandidatelistw",
     "immgetcompositionstringw",
     "immgetcontext",
+    "immgetimefilenamea",
     "immgetopenstatus",
+    "immnotifyime",
     "immreleasecontext",
+    "immsetcandidatewindow",
+    "immsetcompositionstringw",
+    "immsetcompositionwindow",
 ];
 
 /// Soft-dispatched `uxtheme.dll` exports (mirror of the `dispatch_*` fallback arms).
@@ -584,26 +727,101 @@ const UXTHEME_DLL_EXPORTS: &[&str] = &[
     "openthemedata",
 ];
 
+/// Soft-dispatched `winhttp.dll` exports (mirror of the `dispatch_*` fallback arms).
+const WINHTTP_DLL_EXPORTS: &[&str] = &[
+    "winhttpaddrequestheaders",
+    "winhttpclosehandle",
+    "winhttpconnect",
+    "winhttpopen",
+    "winhttpopenrequest",
+    "winhttpquerydataavailable",
+    "winhttpreaddata",
+    "winhttpreceiveresponse",
+    "winhttpsendrequest",
+];
+
 /// Soft-dispatched `setupapi.dll` exports (mirror of the `dispatch_*` fallback arms).
 const SETUPAPI_CFGMGR32: &[&str] = &[
+    "cm_get_device_ida",
     "cm_get_device_id_lista",
     "cm_get_device_id_listw",
+    "cm_get_parent",
+    "cm_locate_devnodea",
     "setupdidestroydeviceinfolist",
     "setupdienumdeviceinfo",
+    "setupdienumdeviceinterfaces",
     "setupdigetclassdevsa",
     "setupdigetclassdevsw",
+    "setupdigetdeviceinterfacedetaila",
+    "setupdigetdeviceregistrypropertya",
 ];
 
 /// Soft-dispatched `dbghelp.dll` exports (mirror of the `dispatch_*` fallback arms).
 const DBGHELP_IMAGEHLP: &[&str] = &[
     "mapfileandchecksuma",
     "mapfileandchecksumw",
+    "minidumpwritedump",
+    "stackwalk64",
     "symcleanup",
     "symfromaddr",
     "symfromaddrw",
+    "symfunctiontableaccess64",
+    "symgetlinefromaddr64",
+    "symgetmodulebase64",
+    "symgetmoduleinfo64",
     "syminitialize",
     "syminitializew",
+    "symsetoptions",
 ];
+/// Known WinAPI DLL libraries — handled by WIE's dense/soft dispatch, never
+/// loaded as guest modules.
+///
+/// A static import from one of these libraries that is NOT in the dispatch
+/// tables is a genuine missing-WinAPI-stub case (soft placeholder +
+/// "unsupported API" stop); an import from any other library is a plausible
+/// guest DLL (SDL2.dll, libogg-0.dll, …) eligible for static loading.
+#[must_use]
+pub fn is_winapi_library(library: &str) -> bool {
+    if crate::ucrt::is_ucrt_library(library) {
+        return true;
+    }
+    let lower = library.to_ascii_lowercase();
+    let lower = lower.as_str();
+    // Dense dispatch-table DLLs, string-dispatch DLLs, virtual API-set
+    // prefixes, and the mingw runtime DLLs. Anything else may exist on disk
+    // as a loadable guest module.
+    matches!(
+        lower,
+        "kernel32.dll"
+            | "advapi32.dll"
+            | "user32.dll"
+            | "comctl32.dll"
+            | "comdlg32.dll"
+            | "gdi32.dll"
+            | "uxtheme.dll"
+            | "winmm.dll"
+            | "d3d9.dll"
+            | "shell32.dll"
+            | "version.dll"
+            | "ole32.dll"
+            | "oleaut32.dll"
+            | "ws2_32.dll"
+            | "crypt32.dll"
+            | "msimg32.dll"
+            | "imm32.dll"
+            | "setupapi.dll"
+            | "cfgmgr32.dll"
+            | "dbghelp.dll"
+            | "imagehlp.dll"
+            | "wininet.dll"
+            | "urlmon.dll"
+            | "ntdll.dll"
+            | "opengl32.dll"
+            | "winhttp.dll"
+    ) || lower.starts_with("libwinpthread")
+        || lower.starts_with("libstdc++")
+        || lower.starts_with("api-ms-win-")
+}
 pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
     if resolve_winapi_id(library, name).is_some() {
         return true;
@@ -636,6 +854,7 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
         "setupapi.dll" | "cfgmgr32.dll" => SETUPAPI_CFGMGR32.contains(&n),
         "dbghelp.dll" | "imagehlp.dll" => DBGHELP_IMAGEHLP.contains(&n),
         "wininet.dll" => crate::wininet::is_export(n),
+        "winhttp.dll" => WINHTTP_DLL_EXPORTS.contains(&n),
         "urlmon.dll" => crate::urlmon::is_export(n),
         "ntdll.dll" => crate::ntdll::is_export(n),
         "opengl32.dll" => crate::opengl32::is_export(n),
@@ -646,6 +865,111 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn winapi_library_classification_keeps_guest_dlls_out() {
+        // Dense table, string dispatch, UCRT family, mingw runtime, API sets.
+        for lib in [
+            "KERNEL32.dll",
+            "kernel32.dll",
+            "USER32.dll",
+            "gdi32.dll",
+            "winmm.dll",
+            "ole32.dll",
+            "oleaut32.dll",
+            "ws2_32.dll",
+            "ntdll.dll",
+            "opengl32.dll",
+            "version.dll",
+            "d3d9.dll",
+            "setupapi.dll",
+            "cfgmgr32.dll",
+            "dbghelp.dll",
+            "imagehlp.dll",
+            "wininet.dll",
+            "urlmon.dll",
+            "winhttp.dll",
+            "msvcrt.dll",
+            "ucrtbase.dll",
+            "api-ms-win-crt-runtime-l1-1-0.dll",
+            "libwinpthread-1.dll",
+            "libstdc++-6.dll",
+        ] {
+            assert!(is_winapi_library(lib), "{lib} should classify as WinAPI");
+        }
+        // Guest DLLs are not WinAPI libraries — they are loadable modules.
+        for lib in [
+            "SDL2.dll",
+            "SDL2_mixer.dll",
+            "libogg-0.dll",
+            "libopus-0.dll",
+            "dll_static_import_funcs.dll",
+            "my_plugin.dll",
+            "LIBOGG-0.DLL",
+        ] {
+            assert!(
+                !is_winapi_library(lib),
+                "{lib} should classify as guest DLL"
+            );
+        }
+    }
+
+    /// Every library that can carry a dispatched export must classify as a
+    /// WinAPI library — otherwise pass 1 would treat a genuine WinAPI import
+    /// as a loadable guest DLL and pass 2 would search for (and potentially
+    /// load) a host file that is not app payload.
+    ///
+    /// Enforces the coupling between the dispatch surface and
+    /// [`is_winapi_library`]: adding a dense row for a new DLL, or a
+    /// string-dispatch arm, without classifying the library fails here.
+    #[test]
+    fn every_dispatched_library_is_winapi_classified() {
+        // Dense dispatch rows: every WinApiId's library must classify as WinAPI.
+        for raw in 0..crate::dispatch_table::WINAPI_ID_COUNT {
+            let raw = u16::try_from(raw).expect("count fits u16");
+            let Some(id) = WinApiId::from_u16(raw) else {
+                continue;
+            };
+            let (lib, _name) = winapi_id_export(id).expect("every discriminant has a row");
+            assert!(
+                is_winapi_library(lib),
+                "dense row library {lib} must classify as WinAPI"
+            );
+        }
+        // String-dispatch DLLs without dense rows (dispatch_winapi arms).
+        for lib in [
+            "ole32.dll",
+            "oleaut32.dll",
+            "ws2_32.dll",
+            "crypt32.dll",
+            "msimg32.dll",
+            "imm32.dll",
+            "setupapi.dll",
+            "cfgmgr32.dll",
+            "dbghelp.dll",
+            "imagehlp.dll",
+            "wininet.dll",
+            "urlmon.dll",
+            "ntdll.dll",
+            "opengl32.dll",
+            "winhttp.dll",
+        ] {
+            assert!(is_winapi_library(lib), "{lib} must classify as WinAPI");
+        }
+        // UCRT family (is_winapi_library delegates to is_ucrt_library) and
+        // the mingw runtime DLLs.
+        for lib in [
+            "msvcrt.dll",
+            "msvcr140.dll",
+            "msvcp140.dll",
+            "ucrtbase.dll",
+            "api-ms-win-crt-runtime-l1-1-0.dll",
+            "libwinpthread-1.dll",
+            "libstdc++-6.dll",
+        ] {
+            assert!(is_winapi_library(lib), "{lib} must classify as WinAPI");
+        }
+    }
 
     /// Every `WinApiId` discriminant resolves to exactly one `(library, name)`
     /// row that maps straight back to the same id (the two holes are skipped).

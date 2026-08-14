@@ -50,6 +50,13 @@ pub const SPECIAL_CALLBACK_RETURN: u16 = 0;
 /// `kind=Special` payload: SEH / C++ EH cleanup + catch-funclet continuation.
 pub const SPECIAL_SEH_CONTINUE: u16 = 1;
 
+/// `kind=Special` payload: static-dependency `DllMain` return trampoline.
+///
+/// `prepare_dll_main_call` pushes this VA as the return address of every
+/// statically-loaded DLL's `DllMain`; the session pump recognizes the stop
+/// and verifies the `BOOL` result before dispatching the exe entry.
+pub const SPECIAL_DLL_MAIN_RETURN: u16 = 2;
+
 /// COM interface identity (`kind=Com` high payload byte — ABI: guests call
 /// through real vtable positions, so the mapping must not shift).
 ///
@@ -911,6 +918,14 @@ pub const fn callback_return_trampoline_va() -> u64 {
 #[must_use]
 pub const fn seh_continue_trampoline_va() -> u64 {
     encode_special(SPECIAL_SEH_CONTINUE)
+}
+
+/// Static-dependency `DllMain` return trampoline VA (inside the fake-API
+/// window; the stop bitmap covers it, so the session pump intercepts the
+/// return from every statically-loaded DLL's `DllMain`).
+#[must_use]
+pub const fn dll_main_return_trampoline_va() -> u64 {
+    encode_special(SPECIAL_DLL_MAIN_RETURN)
 }
 
 /// Decode a guest VA into a [`FakeVa`], if it lies in the fake-API window.

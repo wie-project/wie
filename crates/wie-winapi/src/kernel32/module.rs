@@ -1,11 +1,11 @@
 use super::{
-    Context, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_HANDLE, ERROR_MOD_NOT_FOUND,
-    ERROR_PROC_NOT_FOUND, FAKE_ADVAPI32_MODULE, FAKE_COMCTL32_MODULE, FAKE_COMDLG32_MODULE,
-    FAKE_GDI32_MODULE, FAKE_KERNEL32_MODULE, FAKE_SHELL32_MODULE, FAKE_USER32_MODULE,
-    FAKE_WINMM_MODULE, HandlerContext, Result, WinApiHandlerResult, WinApiState,
-    copy_path_a_to_guest_buffer, copy_path_w_to_guest_buffer, create_fake_resource_record,
-    dll_loader, find_resource_by_handle, guest_basename, paths_match_guest,
-    read_ansi_string_from_cpu, read_guest_ansi_lossy, read_guest_utf16_lossy,
+    Context, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER,
+    ERROR_MOD_NOT_FOUND, ERROR_PROC_NOT_FOUND, FAKE_ADVAPI32_MODULE, FAKE_COMCTL32_MODULE,
+    FAKE_COMDLG32_MODULE, FAKE_GDI32_MODULE, FAKE_KERNEL32_MODULE, FAKE_SHELL32_MODULE,
+    FAKE_USER32_MODULE, FAKE_WINMM_MODULE, HandlerContext, Result, WinApiHandlerResult,
+    WinApiState, copy_path_a_to_guest_buffer, copy_path_w_to_guest_buffer,
+    create_fake_resource_record, dll_loader, find_resource_by_handle, guest_basename,
+    paths_match_guest, read_ansi_string_from_cpu, read_guest_ansi_lossy, read_guest_utf16_lossy,
     read_wide_string_from_cpu,
 };
 
@@ -337,6 +337,14 @@ pub fn handle_free_library(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
         };
 
         if let Some(module) = state.module_state.loaded_modules.get_mut(&name) {
+            // Static (IAT) dependencies are pinned for the process lifetime:
+            // the exe's IAT slots point into the image, so FreeLibrary must
+            // not unmap it. Windows keeps the load count floored for static
+            // imports; the call still succeeds (returns TRUE).
+            if module.static_dependency {
+                state.process.last_error = 0;
+                return ctx.finish(1);
+            }
             if module.ref_count > 0 {
                 module.ref_count = module.ref_count.saturating_sub(1);
             }
@@ -564,6 +572,225 @@ pub fn handle_sizeof_resource(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         .map_or(0, |resource| u64::from(resource.size));
 
     ctx.finish(return_value)
+}
+
+const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u64 = 0x4;
+const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u64 = 0x2;
+const GET_MODULE_HANDLE_EX_FLAG_PIN: u64 = 0x1;
+
+/// Module base + name for the module containing a guest address (main image
+/// or a loaded DLL), if any.
+pub(crate) fn module_containing(
+    state: &WinApiState,
+    environment: crate::WinApiEnvironment,
+    addr: u64,
+) -> Option<(u64, String)> {
+    // Main module.
+    let main_size = u64::try_from(state.file_io.executable_file_bytes.len()).unwrap_or(0);
+    let main_end = environment.image_base.saturating_add(main_size);
+    if addr >= environment.image_base && addr < main_end {
+        return Some((
+            environment.image_base,
+            state.process.main_module_file_name.clone(),
+        ));
+    }
+    // Loaded guest DLLs.
+    for module in state.module_state.loaded_modules.values() {
+        let end = module
+            .image_base
+            .saturating_add(u64::try_from(module.image_size).unwrap_or(0));
+        if addr >= module.image_base && addr < end {
+            return Some((module.image_base, module.name.clone()));
+        }
+    }
+    None
+}
+/// Handles `KERNEL32.dll!GetModuleHandleExW`.
+///
+/// Supports `GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS` (resolve the module
+/// containing `lpModuleName`); otherwise behaves like `GetModuleHandleW` and
+/// writes the handle to `phModule`.
+pub fn handle_get_module_handle_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let environment = ctx.environment;
+    let flags = engine
+        .read_rcx()
+        .context("failed to read RCX for GetModuleHandleExW")?;
+    let module_name_va = engine
+        .read_rdx()
+        .context("failed to read RDX for GetModuleHandleExW")?;
+    let out_va = engine
+        .read_r8()
+        .context("failed to read R8 for GetModuleHandleExW")?;
+
+    let handle = if flags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS != 0 {
+        if module_name_va == 0 {
+            state.process.last_error = ERROR_INVALID_PARAMETER;
+            return ctx.finish(0);
+        }
+        module_containing(state, environment, module_name_va)
+            .map(|(base, _)| base)
+            .unwrap_or(0)
+    } else if module_name_va == 0 {
+        environment.image_base
+    } else {
+        let name = read_wide_string_from_cpu(engine, module_name_va, 260)?;
+        resolve_loaded_module_handle(&name, environment.image_base, state)
+    };
+
+    let _unused = GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT | GET_MODULE_HANDLE_EX_FLAG_PIN;
+    if handle == 0 {
+        state.process.last_error = ERROR_MOD_NOT_FOUND;
+        return ctx.finish(0);
+    }
+    if out_va != 0 {
+        crate::guest_memory::write_u64(engine, out_va, handle)?;
+    }
+    state.process.last_error = 0;
+    ctx.finish(1)
+}
+/// Handles `KERNEL32.dll!GetProcessId`.
+///
+/// Returns the pid of the process object; the `(HANDLE)-1` pseudohandle maps
+/// to the current (fake) process id.
+pub fn handle_get_process_id(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let handle = engine
+        .read_rcx()
+        .context("failed to read RCX for GetProcessId")?;
+    if handle == u64::MAX {
+        return ctx.finish(super::FAKE_CURRENT_PROCESS_ID);
+    }
+    let pid = match state.kernel.sync.object(handle) {
+        Some(crate::KernelObject::Process(p)) => u64::from(p.pid),
+        _ => {
+            state.process.last_error = ERROR_INVALID_HANDLE;
+            return ctx.finish(0);
+        }
+    };
+    state.process.last_error = 0;
+    ctx.finish(pid)
+}
+/// Handles `KERNEL32.dll!RtlPcToFileHeader`.
+///
+/// Writes the base address of the module containing `pcValue` to
+/// `*pBaseOfDll` and returns it (NULL when no module contains the address).
+pub fn handle_rtl_pc_to_file_header(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let environment = ctx.environment;
+    let pc_value = engine
+        .read_rcx()
+        .context("failed to read RCX for RtlPcToFileHeader")?;
+    let out_va = engine
+        .read_rdx()
+        .context("failed to read RDX for RtlPcToFileHeader")?;
+    let Some((base, _)) = module_containing(state, environment, pc_value) else {
+        if out_va != 0 {
+            crate::guest_memory::write_u64(engine, out_va, 0)?;
+        }
+        return ctx.finish(0);
+    };
+    if out_va != 0 {
+        crate::guest_memory::write_u64(engine, out_va, base)?;
+    }
+    ctx.finish(base)
+}
+/// Handles `KERNEL32.dll!RtlLookupFunctionEntry`.
+///
+/// Looks up the `RUNTIME_FUNCTION` covering `controlPc` in the registered
+/// `.pdata` tables; writes the module base to `*imageBase` and returns the
+/// function entry's begin VA (NULL when not found).
+pub fn handle_rtl_lookup_function_entry(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let control_pc = engine
+        .read_rcx()
+        .context("failed to read RCX for RtlLookupFunctionEntry")?;
+    let image_base_out = engine
+        .read_rdx()
+        .context("failed to read RDX for RtlLookupFunctionEntry")?;
+    let _history_table = engine.read_r8()?;
+
+    let Some(found) = crate::exception::lookup_function_entry(&state.kernel.sync, control_pc)
+    else {
+        if image_base_out != 0 {
+            crate::guest_memory::write_u64(engine, image_base_out, 0)?;
+        }
+        return ctx.finish(0);
+    };
+    let module_base = found.image_base;
+    let entry_va = found.entry.begin_va(found.image_base);
+    if image_base_out != 0 {
+        crate::guest_memory::write_u64(engine, image_base_out, module_base)?;
+    }
+    ctx.finish(entry_va)
+}
+/// Handles `KERNEL32.dll!RtlUnwind` — same forced-unwind machinery as
+/// `RtlUnwindEx` (the extra history-table argument is absent here).
+pub fn handle_rtl_unwind(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let target_frame = engine
+        .read_rcx()
+        .context("failed to read RCX for RtlUnwind")?;
+    let target_ip = engine
+        .read_rdx()
+        .context("failed to read RDX for RtlUnwind")?;
+    let _exception_record = engine.read_r8()?;
+    let return_value = engine
+        .read_r9()
+        .context("failed to read R9 for RtlUnwind")?;
+    crate::seh::forced_unwind_to(
+        engine,
+        state,
+        target_ip,
+        (target_frame != 0).then_some(target_frame),
+        return_value,
+    )
+}
+/// Handles `KERNEL32.dll!RtlVirtualUnwind`.
+///
+/// Minimal stub: reports "no unwind info" (`UNW_FLAG_NHANDLER`-style) by
+/// zeroing the output frame and returning NULL — the common probe path checks
+/// the function-entry return for NULL before unwinding further.
+pub fn handle_rtl_virtual_unwind(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    // ARGUMENTS: dwHandlerType (rcx), ip (rdx), controlPc (r8), context (r9),
+    // frame (stack+0x28), contextSwitch (stack+0x30)
+    let _handler_type = engine.read_rcx()?;
+    let _base_address = engine.read_rdx()?;
+    let _control_pc = engine.read_r8()?;
+    let context_va = engine.read_r9()?;
+    let rsp = engine.read_rsp()?;
+    let frame_va = rsp.wrapping_add(0x28);
+    if context_va != 0 {
+        // Tidy a KNONVOLATILE_CONTEXT-shaped frame: zero the RSP-slot fields
+        // the caller reads after a NULL return (best-effort).
+        let _unused = engine.mem_write(context_va.wrapping_add(0x98), &rsp.to_le_bytes());
+    }
+    if frame_va != 0 {
+        let _unused = engine.mem_write(frame_va, &0_u64.to_le_bytes());
+    }
+    ctx.finish(0)
+}
+
+/// Handles `KERNEL32.dll!EnumResourceNamesW`.
+///
+/// WIE does not track the module's `.rsrc` name table, so no resources are
+/// enumerable: returns FALSE with `ERROR_RESOURCE_DATA_NOT_FOUND` without
+/// invoking the callback.
+pub fn handle_enum_resource_names_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let _module = ctx.engine.read_rcx()?;
+    let _resource_type = ctx.engine.read_rdx()?;
+    let _callback = ctx.engine.read_r8()?;
+    let _lparam = ctx.engine.read_r9()?;
+    ctx.state.process.last_error = 1812; // ERROR_RESOURCE_DATA_NOT_FOUND
+    ctx.finish(0)
 }
 
 #[cfg(test)]

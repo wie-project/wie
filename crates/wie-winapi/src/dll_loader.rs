@@ -50,6 +50,11 @@ pub struct LoadedModule {
     pub host_path: std::path::PathBuf,
     /// Reference count (LoadLibrary increments, FreeLibrary decrements).
     pub ref_count: u64,
+    /// Pinned against `FreeLibrary`: the module is a static (IAT) dependency
+    /// of the exe, so its image must stay mapped for the process lifetime
+    /// (the exe's IAT slots point into it). `FreeLibrary` succeeds but never
+    /// unloads such a module.
+    pub static_dependency: bool,
     /// Parsed export directory: name → RVA (relative to image_base).
     pub exports_by_name: HashMap<String, u64>,
     /// Parsed export directory: ordinal → RVA.
@@ -88,6 +93,22 @@ impl LoadedModule {
         }
         Some(self.image_base.wrapping_add(rva))
     }
+}
+
+/// One statically-loaded guest DLL awaiting `DllMain(PROCESS_ATTACH)` before
+/// the exe entry point runs.
+///
+/// Windows calls each static dependency's `DllMain` in load order (dependencies
+/// before dependents); the session pump executes the recorded calls and treats
+/// a `FALSE` result as a failed process init.
+#[derive(Debug, Clone)]
+pub struct StaticDllMain {
+    /// Guest image base (the `hinstDLL` argument).
+    pub image_base: u64,
+    /// Entry point RVA (nonzero — modules without `DllMain` are not recorded).
+    pub entry_rva: u64,
+    /// Module base name for the failure diagnostic ("sdl2.dll").
+    pub name: String,
 }
 
 /// Read a u32 from a slice at a given offset (little-endian).
@@ -565,13 +586,22 @@ pub struct DllLoadResult {
     pub image_base: u64,
     /// Names of DLLs this module depends on (for recursive loading).
     pub dependencies: Vec<String>,
+    /// Section map plan with final protects, as applied to the loaded image.
+    ///
+    /// Callers that patch IAT slots after [`load_dll`] returns (static
+    /// guest-DLL imports) must relax the slot pages, then re-apply these
+    /// protects to restore the READONLY sections.
+    pub map_plan: wie_pe::PeMapPlan,
 }
 
 /// Apply PE section-level page protections from a map plan at a given base.
 ///
-/// Mirrors the logic in `wie-runtime::session::apply_pe_section_protects` but
-/// works for any image base (not just the main PE).
-fn apply_pe_section_protects(
+/// Shared by `wie-runtime::session` (main PE image) and this loader (guest
+/// DLLs): whole image → `PAGE_NOACCESS` (gap pages), headers → RO, each
+/// section → characteristics-derived protect. `image_base` is explicit
+/// because a DLL may load at an alternative base (the plan holds the
+/// preferred base).
+pub fn apply_pe_section_protects(
     engine: &mut dyn CpuEngine,
     plan: &wie_pe::PeMapPlan,
     image_base: u64,
@@ -584,7 +614,7 @@ fn apply_pe_section_protects(
     // Gap pages: NOACCESS so VirtualQuery sees image space.
     engine
         .virtual_protect(image_base, image_size, wie_cpu::protect::PAGE_NOACCESS)
-        .context("DLL gap NOACCESS protect")?;
+        .context("image gap NOACCESS protect")?;
 
     // Headers: READONLY.
     let header_len = u64::from(plan.header_size);
@@ -597,7 +627,7 @@ fn apply_pe_section_protects(
                     len,
                     wie_cpu::protect::PAGE_READONLY,
                 )
-                .context("DLL headers protect")?;
+                .context("image headers protect")?;
         }
     }
 
@@ -618,7 +648,7 @@ fn apply_pe_section_protects(
         }
         engine
             .virtual_protect(image_base.saturating_add(start), len, sec.final_protect)
-            .with_context(|| format!("DLL section {} protect", sec.name))?;
+            .with_context(|| format!("image section {} protect", sec.name))?;
     }
 
     Ok(())
@@ -675,9 +705,17 @@ pub fn load_dll(
 
     // Step 3: Map guest memory. Try preferred base first.
     let load_base = preferred_base;
-    let image_base = if engine
-        .mem_map(load_base, size_of_image, wie_cpu::RwxPerms::ALL)
-        .is_ok()
+    // Preferred base is only usable when the range is actually free: a
+    // collision (another guest DLL already mapped at the same preferred base)
+    // must fall back to the alternative base instead of silently mapping over
+    // the existing image. `mem_map` allows re-mapping over an existing arena
+    // (carve semantics the runtime/tests rely on), so the free check is
+    // explicit here.
+    let preferred_free = engine.virtual_query(load_base).state == wie_cpu::MEM_FREE;
+    let image_base = if preferred_free
+        && engine
+            .mem_map(load_base, size_of_image, wie_cpu::RwxPerms::ALL)
+            .is_ok()
     {
         load_base
     } else {
@@ -803,6 +841,7 @@ pub fn load_dll(
         guest_path: guest_path.to_owned(),
         host_path: host_path.to_owned(),
         ref_count: 1,
+        static_dependency: false,
         exports_by_name: exports.by_name,
         exports_by_ordinal: exports.by_ordinal,
         ordinal_base: exports.ordinal_base,
@@ -823,7 +862,172 @@ pub fn load_dll(
         module,
         image_base,
         dependencies,
+        map_plan,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Static (IAT) guest-DLL resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve a static IAT import of a guest DLL to the export's real guest VA.
+///
+/// Session init calls this once per non-WinAPI static import (SDL2.dll,
+/// libogg-0.dll, …) after the [`WinApiState`] exists. `fake_resolve` handles
+/// the WinAPI half of a loaded DLL's own imports (dense fake VA or soft-table
+/// placeholder); this function handles only the guest-DLL half:
+///
+/// 1. WinAPI library → `Ok(None)` (the caller keeps its placeholder).
+/// 2. Already-loaded module → export lookup.
+/// 3. Host search (same order as LoadLibrary) → [`load_dll`].
+/// 4. The loaded DLL's own guest-DLL imports recurse via a deferred list:
+///    [`load_dll`] holds `engine`/`state` while its callback runs, so nested
+///    loads happen after it returns and the nested IAT slots are patched then.
+///
+/// Returns `Ok(None)` when the library is a WinAPI library, the DLL file is
+/// not found, or the export is missing — the caller leaves the pass-1
+/// placeholder, so the guest sees the same "unsupported API" stop as before
+/// (graceful degradation). `Err` means the DLL exists but could not be loaded.
+pub fn resolve_static_guest_import(
+    engine: &mut dyn CpuEngine,
+    state: &mut crate::WinApiState,
+    library: &str,
+    name: &str,
+    fake_resolve: &mut dyn FnMut(&str, &str, u64) -> anyhow::Result<u64>,
+    static_dll_mains: &mut Vec<StaticDllMain>,
+) -> Result<Option<u64>> {
+    // kernel32/ucrt/… are handled by WIE's dispatch; never load them as guest
+    // modules (their host files are system DLLs, not app payloads).
+    if crate::dispatch_table::is_winapi_library(library) {
+        return Ok(None);
+    }
+
+    let norm = normalize_dll_name(library);
+
+    // Already loaded (a dependency resolved earlier in pass 2): export lookup.
+    if let Some(module) = state.module_state.loaded_modules.get(&norm) {
+        return Ok(module.get_export_va(name));
+    }
+
+    // Host search: app dir → guest system dirs → drive_c, then the main
+    // module's host dir fallback — the same order LoadLibrary uses.
+    let Some(host) = resolve_dll_path(
+        library,
+        &state.process.main_module_path,
+        &state.file_io.volumes,
+        state.process.main_module_host_dir.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+
+    let guest_cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
+    let guest_path = crate::kernel32::resolve_windows_dll_path(
+        library,
+        &state.process.main_module_path,
+        &guest_cwd,
+    );
+
+    // Load the DLL. Its own imports go through the callback: WinAPI libraries
+    // resolve via `fake_resolve` (dense or placeholder, as in LoadLibrary);
+    // guest-DLL imports are deferred so the recursion below can run after
+    // `load_dll` releases its borrow of `engine`/`state`.
+    let mut nested: Vec<(String, String, u64)> = Vec::new();
+    let mut nested_first: Option<u64> = None;
+    let mut nested_last: Option<u64> = None;
+    let result = load_dll(engine, state, &host, &guest_path, &mut |lib, imp, slot| {
+        if crate::dispatch_table::is_winapi_library(lib) {
+            return fake_resolve(lib, imp, slot);
+        }
+        nested.push((lib.to_owned(), imp.to_owned(), slot));
+        let slot_end = slot.saturating_add(8);
+        nested_first = Some(nested_first.map_or(slot, |first| first.min(slot)));
+        nested_last = Some(nested_last.map_or(slot_end, |last| last.max(slot_end)));
+        // Placeholder for now; patched with the real export VA below.
+        fake_resolve(lib, imp, slot)
+    })
+    .with_context(|| format!("failed to load guest DLL {}", host.display()))?;
+
+    // Static (IAT) dependency: pinned against FreeLibrary for the process
+    // lifetime, and DllMain(PROCESS_ATTACH) runs before the exe entry.
+    if let Some(stored) = state.module_state.loaded_modules.get_mut(&norm) {
+        stored.static_dependency = true;
+    }
+    if result.module.entry_rva != 0 {
+        static_dll_mains.push(StaticDllMain {
+            image_base: result.image_base,
+            entry_rva: result.module.entry_rva,
+            name: result.module.name.clone(),
+        });
+    }
+
+    tracing::info!(
+        target: "wiegui",
+        name = %norm,
+        path = %host.display(),
+        image_base = format!("{:#x}", result.image_base),
+        "loaded static guest DLL"
+    );
+
+    // Resolve the loaded DLL's own guest-DLL imports. `load_dll` already
+    // applied the DLL's section protects (IAT is READONLY), so relax the
+    // nested-slot span, patch, then re-apply the protects. A failed nested
+    // load keeps that slot's placeholder — the parent DLL still loads and its
+    // own exports remain usable. The protects restore is unconditional: a
+    // failed patch write must not leave the IAT span relaxed.
+    if let (Some(first_slot), Some(last_slot)) = (nested_first, nested_last) {
+        let slot_span = last_slot.saturating_sub(first_slot);
+        engine
+            .virtual_protect(
+                first_slot,
+                usize::try_from(slot_span).context("nested IAT span too large")?,
+                wie_cpu::protect::PAGE_READWRITE,
+            )
+            .context("failed to relax nested IAT span for static import patching")?;
+
+        let patch_result = (|| -> Result<()> {
+            for (lib, imp, slot) in nested {
+                match resolve_static_guest_import(
+                    engine,
+                    state,
+                    &lib,
+                    &imp,
+                    fake_resolve,
+                    static_dll_mains,
+                ) {
+                    Ok(Some(va)) => {
+                        engine.mem_write(slot, &va.to_le_bytes()).with_context(|| {
+                            format!("failed to patch nested static import {lib}!{imp}")
+                        })?;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "wiegui",
+                            lib, imp,
+                            error = %format!("{e:#}"),
+                            "nested static guest import load failed; keeping placeholder"
+                        );
+                    }
+                }
+            }
+            Ok(())
+        })();
+        let restored = apply_pe_section_protects(engine, &result.map_plan, result.image_base)
+            .context("failed to re-apply DLL section protects after nested static patching");
+        if let Err(patch_err) = patch_result {
+            if let Err(restore_err) = restored {
+                tracing::warn!(
+                    target: "wiegui",
+                    error = %format!("{restore_err:#}"),
+                    "failed to restore DLL section protects after nested patch error"
+                );
+            }
+            return Err(patch_err);
+        }
+        restored?;
+    }
+
+    Ok(result.module.get_export_va(name))
 }
 
 // ---------------------------------------------------------------------------
@@ -850,7 +1054,8 @@ pub const DLL_PROCESS_DETACH: u32 = 0;
 ///
 /// # Arguments
 /// * `engine` - CPU engine to modify guest state.
-/// * `module` - The loaded DLL module descriptor.
+/// * `image_base` - Guest image base of the DLL (the `hinstDLL` argument).
+/// * `entry_rva` - DLL entry point RVA (zero → nothing to call).
 /// * `reason` - DllMain reason code (DLL_PROCESS_ATTACH, etc.).
 /// * `reserved` - Reserved parameter (0 for dynamic loads, 1 for static).
 /// * `fake_return_va` - A fake VA in the host-stop hook range that the
@@ -861,16 +1066,17 @@ pub const DLL_PROCESS_DETACH: u32 = 0;
 /// * `Err` if guest state could not be modified.
 pub fn prepare_dll_main_call(
     engine: &mut dyn CpuEngine,
-    module: &LoadedModule,
+    image_base: u64,
+    entry_rva: u64,
     reason: u32,
     reserved: u64,
     fake_return_va: u64,
 ) -> Result<()> {
-    if module.entry_rva == 0 {
+    if entry_rva == 0 {
         return Ok(()); // No entry point — nothing to call.
     }
 
-    let entry_va = module.image_base.wrapping_add(module.entry_rva);
+    let entry_va = image_base.wrapping_add(entry_rva);
 
     // Push the fake return address onto the guest stack.
     let rsp = engine
@@ -886,7 +1092,7 @@ pub fn prepare_dll_main_call(
 
     // Set calling convention registers (Microsoft x64 calling convention).
     engine
-        .write_rcx(module.image_base)
+        .write_rcx(image_base)
         .context("failed to write RCX (hinstDLL) for DllMain")?;
     engine
         .write_rdx(u64::from(reason))

@@ -5,7 +5,7 @@
 //! else (the enum, dispatch, traits) stays here.
 
 mod names;
-pub use names::{is_winapi_implemented, resolve_winapi_id, winapi_id_export};
+pub use names::{is_winapi_implemented, is_winapi_library, resolve_winapi_id, winapi_id_export};
 
 mod traits;
 pub use traits::WinApiTraits;
@@ -1371,6 +1371,12 @@ pub fn dispatch_winapi(
     // WININET / URLMON — Internet surface (string dispatch, host HTTP).
     if library.eq_ignore_ascii_case("wininet.dll")
         && let Some(r) = crate::wininet::dispatch_wininet(ctx, name)?
+    {
+        return Ok(r);
+    }
+    // WINHTTP — SDL2 online-probe surface (fake handles, clean failure).
+    if library.eq_ignore_ascii_case("winhttp.dll")
+        && let Some(r) = crate::winhttp::dispatch_winhttp(ctx, name)?
     {
         return Ok(r);
     }
