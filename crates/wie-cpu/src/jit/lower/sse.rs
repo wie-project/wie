@@ -201,6 +201,44 @@ pub(super) fn lower_sse_movq(
     Err("movq form".into())
 }
 
+/// Lower `Pmovmskb r32, xmm`: pack the MSB of each of the 16 bytes of the
+/// source XMM into the low 16 bits of the destination GPR (byte i → bit i,
+/// low half first); the upper GPR bits are zeroed. The VEX `VPMOVMSKB` form
+/// decodes to the same mnemonic and lowers identically.
+pub(super) fn lower_sse_pmovmskb(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
+    xmm: &mut [Value; 32],
+) -> Result<(), String> {
+    let r0 = instr.op_register(0);
+    let r1 = instr.op_register(1);
+    if !(r0.is_gpr32() || r0.is_gpr64()) || !r1.is_xmm() {
+        return Err("pmovmskb form".into());
+    }
+    let (lo, hi) = read_xmm_pair(xmm, r1)?;
+    let mut mask = iconst_u64(bcx, 0);
+    let one = iconst_u64(bcx, 1);
+    for i in 0_u64..8 {
+        // Sign bit of byte i: bit (i*8+7).
+        let sign_shift = iconst_u64(bcx, i.saturating_mul(8).saturating_add(7));
+        let lo_pos = iconst_u64(bcx, i);
+        let hi_pos = iconst_u64(bcx, i.saturating_add(8));
+        // Byte i of the low half → bit i.
+        let lo_bit = bcx.ins().ushr(lo, sign_shift);
+        let lo_bit = bcx.ins().band(lo_bit, one);
+        let lo_bit = bcx.ins().ishl(lo_bit, lo_pos);
+        mask = bcx.ins().bor(mask, lo_bit);
+        // Byte i of the high half → bit 8+i.
+        let hi_bit = bcx.ins().ushr(hi, sign_shift);
+        let hi_bit = bcx.ins().band(hi_bit, one);
+        let hi_bit = bcx.ins().ishl(hi_bit, hi_pos);
+        mask = bcx.ins().bor(mask, hi_bit);
+    }
+    write_gpr(bcx, gpr, dirty, r0, mask)
+}
+
 pub(super) fn lower_sse_movd(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,

@@ -277,12 +277,14 @@ fn is_lowerable(instr: &Instruction) -> bool {
             (OpKind::Memory, OpKind::Register) => mem_ea_ok(instr) && mem_size_ok(instr),
             _ => false,
         },
-        // Bsr: bit scan reverse — dst reg, src reg/mem.
-        Mnemonic::Bsr => match (instr.op0_kind(), instr.op1_kind()) {
-            (OpKind::Register, OpKind::Register) => true,
-            (OpKind::Register, OpKind::Memory) => mem_ea_ok(instr) && mem_size_ok(instr),
-            _ => false,
-        },
+        // Bsr/Lzcnt: bit scan — dst reg, src reg/mem.
+        Mnemonic::Bsr | Mnemonic::Bsf | Mnemonic::Lzcnt => {
+            match (instr.op0_kind(), instr.op1_kind()) {
+                (OpKind::Register, OpKind::Register) => true,
+                (OpKind::Register, OpKind::Memory) => mem_ea_ok(instr) && mem_size_ok(instr),
+                _ => false,
+            }
+        }
         Mnemonic::Cmove
         | Mnemonic::Cmovne
         | Mnemonic::Cmova
@@ -323,6 +325,14 @@ fn is_lowerable(instr: &Instruction) -> bool {
         Mnemonic::Movsd if sse_movsd_is_sse(instr) => sse_mov_is_lowerable(instr, 8),
         Mnemonic::Movq => sse_movq_is_lowerable(instr),
         Mnemonic::Movd => sse_movd_is_lowerable(instr),
+        // Pmovmskb/Vpmovmskb: r32 ← sign bits of the 16 source-xmm bytes
+        // (reg-only form; the VEX prefix decodes to its own mnemonic).
+        Mnemonic::Pmovmskb | Mnemonic::Vpmovmskb => {
+            matches!(
+                (instr.op0_kind(), instr.op1_kind()),
+                (OpKind::Register, OpKind::Register)
+            )
+        }
         Mnemonic::Xorps
         | Mnemonic::Xorpd
         | Mnemonic::Pxor

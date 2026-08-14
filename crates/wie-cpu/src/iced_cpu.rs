@@ -457,6 +457,10 @@ impl CpuEngine for IcedCpu {
         self.regs.set_rax(value);
         Ok(())
     }
+    fn write_xmm0(&mut self, value: u64) -> Result<(), CpuError> {
+        self.regs
+            .write_xmm(iced_x86::Register::XMM0, u128::from(value))
+    }
     fn read_rcx(&mut self) -> Result<u64, CpuError> {
         Ok(self.regs.rcx())
     }

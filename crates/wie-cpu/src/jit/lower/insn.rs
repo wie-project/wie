@@ -7,14 +7,14 @@ use super::flags::{
     lower_inc_dec_lazy, lower_neg_lazy, lower_not, replace_flag, select_flag,
 };
 use super::gpr::{
-    Arith, lower_arith, lower_arith_lazy, lower_bit_test_op, lower_bsr, lower_bswap, lower_cbw,
-    lower_cmp_test_lazy, lower_cmpxchg, lower_cwd, lower_cwde_cdqe, lower_div, lower_imul,
-    lower_lea, lower_leave, lower_mov, lower_movx, lower_pop, lower_popfq, lower_push,
-    lower_pushfq, lower_xadd, lower_xchg, sext_to_i64,
+    Arith, lower_arith, lower_arith_lazy, lower_bit_test_op, lower_bsf, lower_bsr, lower_bswap,
+    lower_cbw, lower_cmp_test_lazy, lower_cmpxchg, lower_cwd, lower_cwde_cdqe, lower_div,
+    lower_imul, lower_lea, lower_leave, lower_lzcnt, lower_mov, lower_movx, lower_pop, lower_popfq,
+    lower_push, lower_pushfq, lower_xadd, lower_xchg, sext_to_i64,
 };
 use super::sse::{
     lower_sse_int_binop, lower_sse_mov, lower_sse_movd, lower_sse_movhlps, lower_sse_movhps,
-    lower_sse_movq, lower_sse_pshufd, lower_sse_pshuflw_hw, lower_sse_punpck,
+    lower_sse_movq, lower_sse_pmovmskb, lower_sse_pshufd, lower_sse_pshuflw_hw, lower_sse_punpck,
     lower_sse_punpck_lanes, lower_sse_shufpd, sse_int_op, sse_shift_op,
 };
 use super::sse_fp::{
@@ -299,10 +299,19 @@ pub(super) fn lower_insn(
             flush_pending(bcx, rflags, pending);
             lower_cmpxchg(bcx, instr, gpr, dirty, rflags, mem)
         }
-        // Bsr: bit scan reverse — flush flags, find most significant set bit.
+        // Bsr/Bsf: bit scans — flush flags, scan for the set-bit index.
         Mnemonic::Bsr => {
             flush_pending(bcx, rflags, pending);
             lower_bsr(bcx, instr, gpr, dirty, rflags, mem)
+        }
+        Mnemonic::Bsf => {
+            flush_pending(bcx, rflags, pending);
+            lower_bsf(bcx, instr, gpr, dirty, rflags, mem)
+        }
+        // Lzcnt: count leading zeros — flush flags, zero src yields width.
+        Mnemonic::Lzcnt => {
+            flush_pending(bcx, rflags, pending);
+            lower_lzcnt(bcx, instr, gpr, dirty, rflags, mem)
         }
         // Lazy-capable ALU (overwrite pending without materializing).
         Mnemonic::Add => lower_arith_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, Arith::Add),
@@ -414,6 +423,8 @@ pub(super) fn lower_insn(
         Mnemonic::Movsd => lower_sse_mov(bcx, instr, gpr, *rflags, mem, xmm, 8, true),
         Mnemonic::Movq => lower_sse_movq(bcx, instr, gpr, dirty, *rflags, mem, xmm),
         Mnemonic::Movd => lower_sse_movd(bcx, instr, gpr, dirty, *rflags, mem, xmm),
+        // Pmovmskb/Vpmovmskb: pack 16 xmm byte sign bits into the low GPR half.
+        Mnemonic::Pmovmskb | Mnemonic::Vpmovmskb => lower_sse_pmovmskb(bcx, instr, gpr, dirty, xmm),
         Mnemonic::Movhps => lower_sse_movhps(bcx, instr, gpr, dirty, *rflags, mem, xmm),
         Mnemonic::Movhlps | Mnemonic::Movlhps => lower_sse_movhlps(bcx, instr, xmm, mem),
         Mnemonic::Xorps | Mnemonic::Xorpd | Mnemonic::Pxor => {

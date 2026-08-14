@@ -221,6 +221,10 @@ pub(super) fn block_needs_flags(insns: &[DecodedInsn], term: Option<BlockTerm>) 
                 | Mnemonic::Bts
                 | Mnemonic::Btr
                 | Mnemonic::Btc
+                // Bit scans write ZF (and leave the rest undefined).
+                | Mnemonic::Bsr
+                | Mnemonic::Bsf
+                | Mnemonic::Lzcnt
                 | Mnemonic::Cld
                 | Mnemonic::Std
                 | Mnemonic::Pushfq

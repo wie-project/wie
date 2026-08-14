@@ -31,10 +31,10 @@ use sse::{
     exec_sse_bitwise, exec_sse_comis, exec_sse_cvt_fp_to_gpr, exec_sse_cvt_gpr_to_fp,
     exec_sse_cvt_packed, exec_sse_int_binop, exec_sse_minmax_packed, exec_sse_minmax_scalar,
     exec_sse_mov, exec_sse_movd, exec_sse_movhlps, exec_sse_movhps, exec_sse_movq,
-    exec_sse_packed_fp, exec_sse_psadbw, exec_sse_pshufb, exec_sse_pshufd, exec_sse_pshuflw_hw,
-    exec_sse_punpck, exec_sse_punpck_lanes, exec_sse_scalar_fp, exec_sse_shift, exec_sse_shufpd,
-    exec_sse_sqrt_packed, exec_sse_sqrt_scalar, exec_sse_unpcklpd, is_sse_movsd, sse_int_op,
-    sse_shift_op,
+    exec_sse_packed_fp, exec_sse_pmovmskb, exec_sse_psadbw, exec_sse_pshufb, exec_sse_pshufd,
+    exec_sse_pshuflw_hw, exec_sse_punpck, exec_sse_punpck_lanes, exec_sse_scalar_fp,
+    exec_sse_shift, exec_sse_shufpd, exec_sse_sqrt_packed, exec_sse_sqrt_scalar, exec_sse_unpcklpd,
+    is_sse_movsd, sse_int_op, sse_shift_op,
 };
 use sse_types::{FpOp, SseBitOp};
 use string::{exec_cmps, exec_lods, exec_movs, exec_scas, exec_stos};
@@ -260,6 +260,12 @@ fn execute_one(
         Mnemonic::Mul => exec_mul(mem, regs, instr),
         Mnemonic::Div => exec_div(mem, regs, instr, false),
         Mnemonic::Idiv => exec_div(mem, regs, instr, true),
+        Mnemonic::Lzcnt => exec_lzcnt(mem, regs, instr),
+        // Bsr/Bsf: bit scan reverse / forward — ZF = (src == 0), dst undefined
+        // on zero (written 0). The JIT lowers Bsr; iced needs both for
+        // fallback blocks (mingw SDL2's video init uses Bsr).
+        Mnemonic::Bsr => exec_bit_scan(mem, regs, instr, true),
+        Mnemonic::Bsf => exec_bit_scan(mem, regs, instr, false),
 
         Mnemonic::Shl | Mnemonic::Sal => exec_shift(mem, regs, instr, ShiftKind::Shl),
         Mnemonic::Shr => exec_shift(mem, regs, instr, ShiftKind::Shr),
@@ -438,6 +444,7 @@ fn execute_one(
         | Mnemonic::Movapd
         | Mnemonic::Movupd => exec_sse_mov(mem, regs, instr, 16, false),
         Mnemonic::Movq => exec_sse_movq(mem, regs, instr),
+        Mnemonic::Pmovmskb | Mnemonic::Vpmovmskb => exec_sse_pmovmskb(regs, instr),
         Mnemonic::Xorps | Mnemonic::Xorpd | Mnemonic::Pxor => {
             exec_sse_bitwise(mem, regs, instr, SseBitOp::Xor)
         }
@@ -652,6 +659,61 @@ fn exec_not(
     let dst = read_op(mem, regs, instr, 0)? & regs::size_mask(size);
     let result = !dst;
     write_op(mem, regs, instr, 0, result & regs::size_mask(size))?;
+    Ok(())
+}
+
+/// Lzcnt: count leading zeros of `src` into `dst`.
+///
+/// A zero `src` yields the operand width (32/64) — the defined difference
+/// from Bsr. CF = (src == 0); ZF = (result == 0); other flags undefined
+/// (left untouched).
+fn exec_lzcnt(
+    mem: &GuestMemory,
+    regs: &mut RegFile,
+    instr: &Instruction,
+) -> Result<(), StepExecError> {
+    let size = op_size_bytes(instr, 1)?;
+    let bits = u32::try_from(size.saturating_mul(8))
+        .map_err(|_| StepExecError::Cpu(CpuError::Message("lzcnt size overflow".into())))?;
+    let src = read_op(mem, regs, instr, 1)? & regs::size_mask(size);
+    let result = if src == 0 {
+        u64::from(bits)
+    } else {
+        // leading_zeros() counts in 64-bit; a narrower operand masks the top
+        // bits to zero, so subtract the 64-bit slack.
+        u64::from(src.leading_zeros()).saturating_sub(u64::from(64_u32.saturating_sub(bits)))
+    };
+    regs.set_flag(Rflags::CF, src == 0);
+    regs.set_flag(Rflags::ZF, result == 0);
+    write_op(mem, regs, instr, 0, result)?;
+    Ok(())
+}
+
+/// Bsr/Bsf: scan `src` for the most significant (`reverse`) / least
+/// significant set bit and write its index into `dst`.
+///
+/// `src == 0` sets ZF and leaves `dst` undefined (written 0); otherwise ZF is
+/// cleared. The 64-bit `leading_zeros`/`trailing_zeros` counts are correct for
+/// narrower operands because the masked value's upper bits are zero.
+fn exec_bit_scan(
+    mem: &GuestMemory,
+    regs: &mut RegFile,
+    instr: &Instruction,
+    reverse: bool,
+) -> Result<(), StepExecError> {
+    let size = op_size_bytes(instr, 1)?;
+    let src = read_op(mem, regs, instr, 1)? & regs::size_mask(size);
+    let result = if src == 0 {
+        0
+    } else if reverse {
+        // Bsr index = 63 - leading_zeros (the 32-bit slack in the 64-bit
+        // count cancels, so the formula is width-independent).
+        u64::from(63_u32).saturating_sub(u64::from(src.leading_zeros()))
+    } else {
+        u64::from(src.trailing_zeros())
+    };
+    regs.set_flag(Rflags::ZF, src == 0);
+    write_op(mem, regs, instr, 0, result)?;
     Ok(())
 }
 

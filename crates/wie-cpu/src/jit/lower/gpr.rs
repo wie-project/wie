@@ -200,9 +200,29 @@ pub(super) fn effective_addr(
         return Ok(disp_c);
     }
     let mut addr = disp_c;
+    let mut seg_added = false;
+    // FS/GS segment overrides: Windows x64 uses GS:0 as the TEB base, so a
+    // segment-relative access (gs:[0x30] → TEB.Self) addresses the fake TEB
+    // page, never absolute zero. Mirrors the iced interpreter's
+    // `effective_address`. The decoder reports the segment either as
+    // `memory_segment` (override) or as the base register (segment-base
+    // addressing); add the TEB base once.
+    let seg = instr.memory_segment();
+    if seg == Register::GS || seg == Register::FS {
+        let teb = iconst_u64(bcx, crate::GS_BASE);
+        addr = bcx.ins().iadd(addr, teb);
+        seg_added = true;
+    }
     if base != Register::None {
-        let b = read_gpr(gpr, base)?;
-        addr = bcx.ins().iadd(b, addr);
+        if base == Register::GS || base == Register::FS {
+            if !seg_added {
+                let teb = iconst_u64(bcx, crate::GS_BASE);
+                addr = bcx.ins().iadd(addr, teb);
+            }
+        } else {
+            let b = read_gpr(gpr, base)?;
+            addr = bcx.ins().iadd(b, addr);
+        }
     }
     let index = instr.memory_index();
     if index != Register::None {
@@ -1127,24 +1147,23 @@ pub(super) fn lower_cmpxchg(
     Ok(())
 }
 
-/// Lower Bsr (bit scan reverse): scan src for most significant 1 bit.
-/// If src == 0: ZF=1, dst undefined.
-/// If src != 0: ZF=0, dst = index of most significant set bit.
-pub(super) fn lower_bsr(
+/// Lower Bsr/Bsf (bit scan reverse/forward): scan src for the most
+/// significant (`reverse`) / least significant set bit.
+/// If src == 0: ZF=1, dst undefined (written 0).
+/// If src != 0: ZF=0, dst = index of the scanned set bit.
+pub(super) fn lower_bit_scan(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
     gpr: &mut [Value; 16],
     dirty: &mut [bool; 16],
     rflags: &mut Value,
     mem: &mut MemEnv,
+    reverse: bool,
 ) -> Result<(), String> {
     let bits = op_width_bits(instr, 1)?;
     let src_raw = read_op_mem(bcx, instr, 1, gpr, *rflags, mem)?;
     let src_val = mask_width(bcx, src_raw, bits);
 
-    // Use Cranelift ctlz (count leading zeros) to find MSB position.
-    // Bsr result = bit_width - 1 - ctlz(val) when val != 0
-    let bit_width: u32 = if bits <= 32 { 32 } else { 64 };
     let src_ext = if bits < 64 {
         if bits <= 32 {
             let reduced = bcx.ins().ireduce(types::I32, src_val);
@@ -1156,20 +1175,90 @@ pub(super) fn lower_bsr(
         src_val
     };
 
-    let bw_val = iconst_u64(bcx, u64::from(bit_width.saturating_sub(1)));
-    let clz = bcx.ins().clz(src_ext);
-    let msb = bcx.ins().isub(bw_val, clz);
+    // Bsr: msb = 63 − clz(zext(val)); Bsf: lsb = ctz(zext(val)). Both are
+    // width-independent — a 32-bit operand's zero-extended top half is counted
+    // by clz and cancels, and ctz ignores it.
+    let idx = if reverse {
+        let clz = bcx.ins().clz(src_ext);
+        let sixty_three = iconst_u64(bcx, 63);
+        bcx.ins().isub(sixty_three, clz)
+    } else {
+        bcx.ins().ctz(src_ext)
+    };
 
     // ZF = (src == 0)
     let zero_c = iconst_u64(bcx, 0);
     let is_zero = bcx.ins().icmp(IntCC::Equal, src_ext, zero_c);
 
-    // Result: if zero, undefined (write 0); else write MSB index
-    let result = bcx.ins().select(is_zero, zero_c, msb);
+    // Result: if zero, undefined (write 0); else write the scan index.
+    let result = bcx.ins().select(is_zero, zero_c, idx);
     write_gpr(bcx, gpr, dirty, instr.op_register(0), result)?;
 
     // Set ZF flag
     let zf_on = select_flag(bcx, is_zero, Rflags::ZF);
+    *rflags = replace_flag(bcx, *rflags, Rflags::ZF, zf_on);
+    Ok(())
+}
+
+/// Lower Bsr (bit scan reverse).
+pub(super) fn lower_bsr(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
+    rflags: &mut Value,
+    mem: &mut MemEnv,
+) -> Result<(), String> {
+    lower_bit_scan(bcx, instr, gpr, dirty, rflags, mem, true)
+}
+
+/// Lower Bsf (bit scan forward).
+pub(super) fn lower_bsf(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
+    rflags: &mut Value,
+    mem: &mut MemEnv,
+) -> Result<(), String> {
+    lower_bit_scan(bcx, instr, gpr, dirty, rflags, mem, false)
+}
+
+/// Lower Lzcnt (count leading zeros): `dst` = number of leading zero bits in
+/// `src`; a zero `src` yields the operand width (32/64) — the defined
+/// difference from Bsr. CF = (src == 0); ZF = (result == 0); other flags
+/// undefined (left as-is).
+pub(super) fn lower_lzcnt(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
+    rflags: &mut Value,
+    mem: &mut MemEnv,
+) -> Result<(), String> {
+    let bits = op_width_bits(instr, 1)?;
+    let src_raw = read_op_mem(bcx, instr, 1, gpr, *rflags, mem)?;
+    let src_val = mask_width(bcx, src_raw, bits);
+
+    // Cranelift clz is defined for zero input (returns the input width), which
+    // matches Lzcnt exactly when the operand width is preserved: 32-bit
+    // operands must yield 32 for src == 0, so clz on the reduced I32 value.
+    let result = if bits <= 32 {
+        let reduced = bcx.ins().ireduce(types::I32, src_val);
+        let c = bcx.ins().clz(reduced);
+        bcx.ins().uextend(types::I64, c)
+    } else {
+        bcx.ins().clz(src_val)
+    };
+    write_gpr(bcx, gpr, dirty, instr.op_register(0), result)?;
+
+    // CF = (src == 0); ZF = (result == 0).
+    let zero_c = iconst_u64(bcx, 0);
+    let is_zero = bcx.ins().icmp(IntCC::Equal, src_val, zero_c);
+    let cf_on = select_flag(bcx, is_zero, Rflags::CF);
+    *rflags = replace_flag(bcx, *rflags, Rflags::CF, cf_on);
+    let result_zero = bcx.ins().icmp(IntCC::Equal, result, zero_c);
+    let zf_on = select_flag(bcx, result_zero, Rflags::ZF);
     *rflags = replace_flag(bcx, *rflags, Rflags::ZF, zf_on);
     Ok(())
 }

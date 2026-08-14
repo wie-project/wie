@@ -777,6 +777,110 @@ mod tests {
         assert_eq!(jit.xmm_at(0), want, "jit paddd");
     }
 
+    /// Reference `PMOVMSKB` mask for a 128-bit xmm value (byte i sign → bit i).
+    fn pmovmskb_expected(x: u128) -> u64 {
+        let mut mask = 0_u64;
+        for i in 0_u64..16 {
+            if (x >> (i.saturating_mul(8))) & 0x80 != 0 {
+                mask |= 1_u64 << i;
+            }
+        }
+        mask
+    }
+
+    #[test]
+    fn simd_pmovmskb_matches_iced() {
+        // PMOVMSKB eax, xmm1 (66 0F D7 C1): pack the 16 byte-sign bits of
+        // xmm1 into the low 16 bits of eax; the upper GPR bits are zeroed.
+        // Low 8 bytes 0x80 → bits 0-7 set; high 8 bytes 0x00 → bits 8-15 clear.
+        let x1 = 0x0000_0000_0000_0000_8080_8080_8080_8080_u128;
+        let (iced, jit) = simd_dual(&[0x66, 0x0f, 0xd7, 0xc1], &[], |r| set_pair(r, 0, x1));
+        assert_same_regs(&iced, &jit, "pmovmskb");
+        assert_eq!(iced.gpr(0), 0xFF, "iced pmovmskb mask");
+        assert_eq!(jit.gpr(0), 0xFF, "jit pmovmskb mask");
+
+        // Every byte 0xFF → all 16 sign bits set; RAX stays 32-bit zero-extended.
+        let (iced, jit) = simd_dual(&[0x66, 0x0f, 0xd7, 0xc1], &[], |r| {
+            set_pair(r, 0, u128::MAX)
+        });
+        assert_same_regs(&iced, &jit, "pmovmskb all-set");
+        assert_eq!(iced.gpr(0), 0xFFFF, "iced pmovmskb all-set");
+        assert_eq!(jit.gpr(0), 0xFFFF, "jit pmovmskb all-set");
+    }
+
+    #[test]
+    fn simd_vpmovmskb_matches_iced() {
+        // VEX VPMOVMSKB eax, xmm1 (C5 F9 D7 C1) — same semantics, own mnemonic.
+        let x1 = 0x807F_0080_FF00_0001_8000_7F7F_8080_0100_u128;
+        let (iced, jit) = simd_dual(&[0xc5, 0xf9, 0xd7, 0xc1], &[], |r| set_pair(r, 0, x1));
+        assert_same_regs(&iced, &jit, "vpmovmskb");
+        let want = pmovmskb_expected(x1);
+        assert_eq!(iced.gpr(0), want, "iced vpmovmskb");
+        assert_eq!(jit.gpr(0), want, "jit vpmovmskb");
+    }
+
+    #[test]
+    fn gpr_bsr_bsf_matches_iced() {
+        // BSR/BSF: the index of the most/least significant set bit;
+        // src == 0 → ZF=1, dst written 0.
+        // 32-bit form (0F BD C1 / 0F BC C1 — eax, ecx) and the REX.W 64-bit
+        // form (48 0F BD C1 / 48 0F BC C1 — rax, rcx).
+        for (name, bytes32, bytes64) in [
+            (
+                "bsr",
+                &[0x0f, 0xbd, 0xc1][..],
+                &[0x48, 0x0f, 0xbd, 0xc1][..],
+            ),
+            (
+                "bsf",
+                &[0x0f, 0xbc, 0xc1][..],
+                &[0x48, 0x0f, 0xbc, 0xc1][..],
+            ),
+        ] {
+            for (label, rcx) in [
+                ("low", 0x1_u64),
+                ("mid", 0x0400_0000_u64),
+                ("high", 0x8000_0000_u64),
+                ("zero", 0_u64),
+            ] {
+                let (iced, jit) = simd_dual(bytes32, &[], |r| {
+                    r.set_gpr(1, rcx);
+                });
+                assert_same_regs(&iced, &jit, name);
+                // 63 − leading_zeros works for both widths: the 32-bit operand's
+                // zero-extended top half is counted by clz and cancels.
+                let want = if rcx == 0 {
+                    0
+                } else if name == "bsr" {
+                    u64::from(63_u32).saturating_sub(u64::from(rcx.leading_zeros()))
+                } else {
+                    u64::from(rcx.trailing_zeros())
+                };
+                assert_eq!(iced.gpr(0), want, "iced {name} 32-bit {label}");
+                assert_eq!(jit.gpr(0), want, "jit {name} 32-bit {label}");
+            }
+            for (label, rcx) in [
+                ("low", 0x1_u64),
+                ("high", 0x8000_0000_0000_0000_u64),
+                ("zero", 0_u64),
+            ] {
+                let (iced, jit) = simd_dual(bytes64, &[], |r| {
+                    r.set_gpr(1, rcx);
+                });
+                assert_same_regs(&iced, &jit, name);
+                let want = if rcx == 0 {
+                    0
+                } else if name == "bsr" {
+                    u64::from(63_u32).saturating_sub(u64::from(rcx.leading_zeros()))
+                } else {
+                    u64::from(rcx.trailing_zeros())
+                };
+                assert_eq!(iced.gpr(0), want, "iced {name} 64-bit {label}");
+                assert_eq!(jit.gpr(0), want, "jit {name} 64-bit {label}");
+            }
+        }
+    }
+
     #[test]
     fn simd_saturating_arith_matches_iced() {
         // Signed/unsigned saturation edges: 0x7F+1, 0x80+0x80, 0x00-1, 0xFFFF+1.

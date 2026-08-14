@@ -441,6 +441,13 @@ pub trait CpuEngine: Send {
     fn read_rax(&mut self) -> Result<u64, CpuError>;
     /// # Errors
     fn write_rax(&mut self, value: u64) -> Result<(), CpuError>;
+    /// Write the low 64 bits of XMM0 (the Win64 floating/vector return
+    /// register) — used by FP-returning API stubs (e.g. UCRT `log10`).
+    ///
+    /// # Errors
+    fn write_xmm0(&mut self, _value: u64) -> Result<(), CpuError> {
+        Err(CpuError::Message("write_xmm0 not implemented".into()))
+    }
     /// # Errors
     fn read_rcx(&mut self) -> Result<u64, CpuError>;
     /// # Errors

@@ -177,6 +177,30 @@ pub(super) fn exec_sse_movd(
     )))
 }
 
+/// `PMOVMSKB r32, xmm` — pack the MSB (sign bit) of each of the 16 bytes of
+/// the source XMM register into the low 16 bits of the destination GPR
+/// (byte 0's sign bit → bit 0, … byte 15's sign bit → bit 15); the upper
+/// bits of the GPR are zeroed (the 32-bit destination write zero-extends).
+///
+/// The VEX-encoded `VPMOVMSKB` decodes to the same mnemonic and register
+/// operands, so this handler covers both forms.
+pub(super) fn exec_sse_pmovmskb(
+    regs: &mut RegFile,
+    instr: &Instruction,
+) -> Result<(), StepExecError> {
+    let src = regs.read_xmm(instr.op_register(1))?;
+    let mut mask: u32 = 0;
+    for i in 0_u32..16 {
+        let shift = i.saturating_mul(8);
+        let byte = (src >> shift) & 0xff;
+        if byte & 0x80 != 0 {
+            mask |= 1_u32 << i;
+        }
+    }
+    regs.write_reg(instr.op_register(0), u64::from(mask))?;
+    Ok(())
+}
+
 /// `MOVHPS` — move 64 bits between XMM upper half and memory.
 ///
 /// Two forms:
