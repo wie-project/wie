@@ -235,6 +235,7 @@ pub struct JitStats {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    mod chain_tests;
     use super::*;
     use crate::exec::StepResult;
     use crate::mem::protect;

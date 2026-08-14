@@ -318,7 +318,17 @@ unsafe extern "C" fn tramp_set_last_error(ctx: *mut JitCtx) {
 
 #[inline]
 fn mark_dirty(ctx: &mut JitCtx, mask: u16) {
-    ctx.gpr_dirty_bits |= u64::from(mask);
+    // When a micro-stub runs inside a chain (`chain_depth > 0`), the enclosing
+    // Cranelift blocks have dirtied arbitrary GPRs without touching
+    // `gpr_dirty_bits`. A partial mask would make the outermost writeback
+    // (run_compiled) sync only the stub's regs back to the host regfile and
+    // drop the chain's other register updates (e.g. a `lea r12` two blocks
+    // earlier) — the next dispatched block then reloads a stale value.
+    if ctx.chain_depth != 0 {
+        ctx.gpr_dirty_bits = u64::from(ALL_DIRTY_BITS);
+    } else {
+        ctx.gpr_dirty_bits |= u64::from(mask);
+    }
 }
 
 /// Pop guest return address, update RSP / shadow, set RIP.

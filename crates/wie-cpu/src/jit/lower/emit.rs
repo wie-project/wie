@@ -34,8 +34,14 @@ pub(super) fn term_chain_targets(t: BlockTerm) -> Vec<u64> {
 
 /// Write SSA GPRs back into `JitCtx`.
 ///
-/// When `gpr_dirty` is `Some`, only dirty+loaded regs are stored (reg-mapping opt).
-/// When `None`, every loaded reg is stored (safe default for host helpers / unknown).
+/// When `gpr_dirty` is `Some`, every body-written (dirty) reg is stored —
+/// whether or not it was loaded at entry. A reg written without a prior read
+/// (e.g. `mov rcx,r12` setting a call argument) is not a live-in, so
+/// `gpr_loaded[i]` is false; gating the store on `dirty && loaded` silently
+/// dropped such writes from the JitCtx and the next chained block (the callee)
+/// reloaded a stale value. Loaded regs are stored too (idempotent for
+/// read-only live-ins, and covers string-op counter/pointer writes that are
+/// not tracked in `gpr_dirty`). When `None`, every loaded reg is stored.
 // The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn writeback_gprs(
@@ -51,7 +57,7 @@ pub(super) fn writeback_gprs(
 ) {
     for i in 0..16 {
         let do_store = match gpr_dirty {
-            Some(d) => d[i] && gpr_loaded[i],
+            Some(d) => d[i] || gpr_loaded[i],
             None => gpr_loaded[i],
         };
         if do_store {
