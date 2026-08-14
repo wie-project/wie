@@ -631,6 +631,43 @@ impl super::RuntimeSession {
             )
             .context("failed to write fake TEB Self")?;
 
+        // TEB.ProcessEnvironmentBlock (x64 offset 0x60): point at a minimal
+        // guest PEB stashed in the spare upper half of the TEB page, so
+        // TEB→PEB→ProcessParameters walks (e.g. the UCRT `_get_app_type`
+        // check that reads PP->Flags bit 31) return well-defined values
+        // instead of dereferencing a NULL PEB and faulting.
+        let fake_peb_va = layout.teb_low.base.wrapping_add(0x800);
+        let fake_pp_va = layout.teb_low.base.wrapping_add(0x900);
+        engine
+            .mem_write(
+                layout.teb_low.base.wrapping_add(0x60),
+                &fake_peb_va.to_le_bytes(),
+            )
+            .context("failed to write fake TEB PEB pointer")?;
+        // PEB.ImageBaseAddress (0x10), ProcessParameters (0x20), ProcessHeap
+        // (0x30) — the fields guests probe most. BeingDebugged (0x02) stays 0
+        // (the mapped page is zero-filled).
+        engine
+            .mem_write(
+                fake_peb_va.wrapping_add(0x10),
+                &identity.image_base.to_le_bytes(),
+            )
+            .context("failed to write fake PEB ImageBaseAddress")?;
+        engine
+            .mem_write(fake_peb_va.wrapping_add(0x20), &fake_pp_va.to_le_bytes())
+            .context("failed to write fake PEB ProcessParameters")?;
+        engine
+            .mem_write(
+                fake_peb_va.wrapping_add(0x30),
+                &layout.process_heap.base.to_le_bytes(),
+            )
+            .context("failed to write fake PEB ProcessHeap")?;
+        // RTL_USER_PROCESS_PARAMETERS.Flags (0x8) = 0: the UCRT app-type
+        // check reads bit 31 and takes the normal (desktop) path.
+        engine
+            .mem_write(fake_pp_va.wrapping_add(0x8), &0_u32.to_le_bytes())
+            .context("failed to zero fake PP Flags")?;
+
         // TEB.LastErrorValue (x64 offset 0x68) — guest GetLastError/SetLastError stubs.
         engine
             .mem_write(crate::guest_stubs::TEB_LAST_ERROR_VA, &0_u32.to_le_bytes())

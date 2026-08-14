@@ -195,14 +195,14 @@ fn test_reg_open_key_ex_a_missing_returns_file_not_found_and_does_not_create() {
     let subkey_va = 0x5000;
     let phk_va = 0x3000;
     write_guest_ansi(&mut engine, subkey_va, "Software\\Missing\\Key");
-    // RegOpenKeyExA passes phkResult in the 5th stack slot: [rsp+0x30].
+    // RegOpenKeyExA passes phkResult in the 5th stack slot: [rsp+0x28].
     engine
-        .mem_write(STACK_TOP + 0x30, &u64::to_le_bytes(phk_va))
+        .mem_write(STACK_TOP + 0x28, &u64::to_le_bytes(phk_va))
         .expect("write phkResult arg");
     engine
         .mem_write(phk_va, &0xDEAD_BEEF_u64.to_le_bytes())
         .expect("write sentinel phkResult");
-    // RegOpenKeyExA(hKey=HKCU, lpSubKey=subkey_va, ulOptions=0, samDesired=0, phkResult=[rsp+0x30])
+    // RegOpenKeyExA(hKey=HKCU, lpSubKey=subkey_va, ulOptions=0, samDesired=0, phkResult=[rsp+0x28])
     write_regs(&mut engine, HKEY_CURRENT_USER, subkey_va, 0, 0, 0);
     let status = reg_open_key("advapi32.dll", "RegOpenKeyExA", &mut state, &mut engine);
     assert_eq!(status, 2); // ERROR_FILE_NOT_FOUND
@@ -231,7 +231,7 @@ fn test_reg_open_key_ex_w_missing_returns_file_not_found() {
     let phk_va = 0x3000;
     write_guest_utf16(&mut engine, subkey_va, "Software\\Missing\\Key");
     engine
-        .mem_write(STACK_TOP + 0x30, &u64::to_le_bytes(phk_va))
+        .mem_write(STACK_TOP + 0x28, &u64::to_le_bytes(phk_va))
         .expect("write phkResult arg");
     engine
         .mem_write(phk_va, &0xDEAD_BEEF_u64.to_le_bytes())
@@ -262,7 +262,7 @@ fn test_reg_open_key_ex_a_opens_existing_key() {
     let phk_va = 0x3000;
     write_guest_ansi(&mut engine, subkey_va, "Software\\Microsoft\\Notepad");
     engine
-        .mem_write(STACK_TOP + 0x30, &u64::to_le_bytes(phk_va))
+        .mem_write(STACK_TOP + 0x28, &u64::to_le_bytes(phk_va))
         .expect("write phkResult arg");
     engine
         .mem_write(phk_va, &0xDEAD_BEEF_u64.to_le_bytes())
@@ -270,6 +270,39 @@ fn test_reg_open_key_ex_a_opens_existing_key() {
     write_regs(&mut engine, HKEY_CURRENT_USER, subkey_va, 0, 0, 0);
     let status = reg_open_key("advapi32.dll", "RegOpenKeyExA", &mut state, &mut engine);
     assert_eq!(status, 0); // ERROR_SUCCESS
+    assert_eq!(read_guest_handle(&mut engine, phk_va), 0x100);
+}
+
+/// Pins the Win64 stack-arg ABI for `RegOpenKeyExA`: with 4 register args,
+/// `phkResult` is the 5th argument at `[rsp+0x28]`. The handler must read
+/// that slot and never the `[rsp+0x30]` slot (an off-by-8 there made the
+/// handler write the result to a caller local and fail in the guest).
+#[test]
+fn test_reg_open_key_ex_a_abi_offset_is_rsp_plus_0x28() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    state.process.registry_keys.push(crate::RegistryKey {
+        handle: 0x100,
+        parent: HKEY_CURRENT_USER,
+        subkey: "Software\\Microsoft\\Notepad".into(),
+    });
+    let subkey_va = 0x5000;
+    let phk_va = 0x3000;
+    write_guest_ansi(&mut engine, subkey_va, "Software\\Microsoft\\Notepad");
+    engine
+        .mem_write(STACK_TOP + 0x28, &u64::to_le_bytes(phk_va))
+        .expect("write phkResult arg at [rsp+0x28]");
+    // A sentinel in the wrong-slot [rsp+0x30]: if the handler read it, the
+    // write would target this unmapped address and error out.
+    engine
+        .mem_write(STACK_TOP + 0x30, &0x1000_0000_u64.to_le_bytes())
+        .expect("write wrong-slot sentinel");
+    engine
+        .mem_write(phk_va, &0xDEAD_BEEF_u64.to_le_bytes())
+        .expect("write sentinel phkResult");
+    write_regs(&mut engine, HKEY_CURRENT_USER, subkey_va, 0, 0, 0);
+    let status = reg_open_key("advapi32.dll", "RegOpenKeyExA", &mut state, &mut engine);
+    assert_eq!(status, 0); // ERROR_SUCCESS — read the correct [rsp+0x28] slot
     assert_eq!(read_guest_handle(&mut engine, phk_va), 0x100);
 }
 
@@ -291,7 +324,8 @@ fn test_reg_create_key_ex_a_creates_missing_key() {
     let phk_va = 0x3000;
     let disposition_va = 0x3100;
     write_guest_ansi(&mut engine, subkey_va, "Software\\Missing\\Key");
-    // RegCreateKeyExA passes phkResult at [rsp+0x40] and lpdwDisposition at [rsp+0x48].
+    // RegCreateKeyExA has 9 args (incl. lpClass): phkResult is the 8th arg at
+    // [rsp+0x40] and lpdwDisposition the 9th at [rsp+0x48].
     engine
         .mem_write(STACK_TOP + 0x40, &u64::to_le_bytes(phk_va))
         .expect("write phkResult arg");
@@ -310,7 +344,7 @@ fn test_reg_create_key_ex_a_creates_missing_key() {
     // The previously-missing path now opens with the created handle.
     let open_phk = 0x3200;
     engine
-        .mem_write(STACK_TOP + 0x30, &u64::to_le_bytes(open_phk))
+        .mem_write(STACK_TOP + 0x28, &u64::to_le_bytes(open_phk))
         .expect("write phkResult arg");
     engine
         .mem_write(open_phk, &0xDEAD_BEEF_u64.to_le_bytes())

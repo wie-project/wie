@@ -74,7 +74,7 @@ pub fn handle_reg_open_key_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .read_rsp()
         .context("failed to read RSP for RegOpenKeyExA")?;
 
-    let phk_result_address = checked_address(rsp, 0x30, "RegOpenKeyExA phkResult");
+    let phk_result_address = checked_address(rsp, 0x28, "RegOpenKeyExA phkResult");
     let phk_result = read_u64(engine, phk_result_address)?;
 
     let subkey = read_optional_ansi_string(engine, subkey_va)?;
@@ -112,7 +112,7 @@ pub fn handle_reg_open_key_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .read_rsp()
         .context("failed to read RSP for RegOpenKeyExW")?;
 
-    let phk_result_address = checked_address(rsp, 0x30, "RegOpenKeyExW phkResult");
+    let phk_result_address = checked_address(rsp, 0x28, "RegOpenKeyExW phkResult");
     let phk_result = read_u64(engine, phk_result_address)?;
 
     let subkey = read_optional_utf16_string(engine, subkey_va)?;
