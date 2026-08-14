@@ -232,15 +232,17 @@ DLL_EXE_LDFLAGS := -nostdlib -Wl,--subsystem,console -Wl,--entry,entry
 DLL_BASIC_OBJS    := $(OUT)/dll_basic_funcs.dll
 DLL_ORDINAL_OBJS  := $(OUT)/dll_ordinal_funcs.dll
 DLL_MATH_OBJS     := $(OUT)/dll_math_funcs.dll
+DLL_STATIC_OBJS   := $(OUT)/dll_static_import_funcs.dll $(OUT)/libstatic_import_funcs.a
 
 DLL_TEST_EXES := \
   $(OUT)/dll_basic.exe \
   $(OUT)/dll_not_found.exe \
   $(OUT)/dll_ordinal.exe \
   $(OUT)/dll_refcount.exe \
-  $(OUT)/dll_multi_dll.exe
+  $(OUT)/dll_multi_dll.exe \
+  $(OUT)/dll_static_import.exe
 
-dll_tests: $(DLL_BASIC_OBJS) $(DLL_ORDINAL_OBJS) $(DLL_MATH_OBJS) $(DLL_TEST_EXES)
+dll_tests: $(DLL_BASIC_OBJS) $(DLL_ORDINAL_OBJS) $(DLL_MATH_OBJS) $(DLL_STATIC_OBJS) $(DLL_TEST_EXES)
 
 $(OUT)/dll_basic_funcs.dll: dll_tests/basic/dll.c | $(OUT)
 	$(MINGW_CC) $(DLL_CFLAGS) -o $@ $< -lkernel32
@@ -272,6 +274,23 @@ $(OUT)/dll_refcount.exe: dll_tests/refcount/main.c $(OUT)/dll_math_funcs.dll | $
 
 $(OUT)/dll_multi_dll.exe: dll_tests/multi_dll/main.c $(OUT)/dll_basic_funcs.dll $(OUT)/dll_math_funcs.dll | $(OUT)
 	$(MINGW_CC) $(DLL_EXE_CFLAGS) $(DLL_EXE_LDFLAGS) -o $@ $< -lkernel32
+	@echo "built $@"
+
+# Static-import test: the exe links an import lib (dlltool from a .def), so its
+# IAT statically imports `add` — resolved by WIE's pass-2 guest-DLL loader at
+# process init, with no LoadLibrary/GetProcAddress in guest code. The DLL entry
+# is DllMain itself (not the mingw CRT startup), so the DllMain(PROCESS_ATTACH)
+# phase exercises the handler without needing UCRT onexit-table exports.
+$(OUT)/dll_static_import_funcs.dll: dll_tests/static_import/dll.c | $(OUT)
+	$(MINGW_CC) $(DLL_CFLAGS) -Wl,--entry,DllMain -o $@ $< -lkernel32
+	@echo "built $@"
+
+$(OUT)/libstatic_import_funcs.a: dll_tests/static_import/static_import.def | $(OUT)
+	$(DLLTOOL) -d $< -l $@ -D dll_static_import_funcs.dll
+	@echo "built $@"
+
+$(OUT)/dll_static_import.exe: dll_tests/static_import/main.c $(OUT)/libstatic_import_funcs.a $(OUT)/dll_static_import_funcs.dll | $(OUT)
+	$(MINGW_CC) $(DLL_EXE_CFLAGS) $(DLL_EXE_LDFLAGS) -o $@ $< $(OUT)/libstatic_import_funcs.a -lkernel32
 	@echo "built $@"
 
 

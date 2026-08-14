@@ -1,0 +1,3 @@
+LIBRARY dll_static_import_funcs.dll
+EXPORTS
+    add
