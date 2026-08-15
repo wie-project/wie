@@ -105,6 +105,13 @@ pub struct RuntimeMemoryLayout {
     pub stack: LayoutRegion,
     /// Fake low TEB/TIB page for initial GS-relative CRT reads.
     pub teb_low: LayoutRegion,
+    /// Pool of distinct per-thread TEB pages for guest workers (`CreateThread`).
+    ///
+    /// Each page is one `PerThreadTeb` (see `wie_cpu::teb`); a worker's engine
+    /// is bound to its page via `CpuEngine::set_gs_base`. The primary thread
+    /// keeps `teb_low` (the fixed `GS_BASE` page); this region backs every
+    /// worker so their GS-relative state never aliases the primary's.
+    pub worker_tebs: LayoutRegion,
     /// Environment string / module path data page.
     pub env_data: LayoutRegion,
     /// Fake resource data blob.
@@ -233,6 +240,16 @@ impl RuntimeMemoryLayout {
                 size: 0x1000,
                 perms: RwxPerms::READ_WRITE,
             },
+            // 64 pages — one per concurrent worker, matching the 64-thread cap
+            // (`DEFAULT_MT_MAX_THREADS`). Exited workers return their page to
+            // the pool (free list), so sequential spawn/join cycles reuse pages.
+            worker_tebs: LayoutRegion {
+                name: "worker_tebs",
+                kind: RegionKind::Teb,
+                base: 0x0000_7000_0040_C000,
+                size: 0x0001_0000,
+                perms: RwxPerms::READ_WRITE,
+            },
             env_data: LayoutRegion {
                 name: "env",
                 kind: RegionKind::Env,
@@ -280,7 +297,7 @@ impl RuntimeMemoryLayout {
     /// [`Self::validate`] checks pairwise. The PE image is runtime-known and
     /// added by [`Self::validate_with_image`].
     #[must_use]
-    pub const fn regions(&self) -> [LayoutRegion; 17] {
+    pub const fn regions(&self) -> [LayoutRegion; 18] {
         [
             self.fake_api,
             self.fast_api_stub,
@@ -295,6 +312,7 @@ impl RuntimeMemoryLayout {
             self.clock_table,
             self.stack,
             self.teb_low,
+            self.worker_tebs,
             self.env_data,
             self.resource_data,
             self.process_heap,
@@ -427,6 +445,26 @@ const _: () = assert!(
     "default guest memory layout has overlapping, overflowing, or misaligned regions"
 );
 
+/// Compile-time gate: the primary TEB (`teb_low`) must sit at the fixed
+/// `GS_BASE`. `PerThreadTeb::primary()` (wie-cpu) and the layout agree on the
+/// primary TEB address; drift here would orphan the primary engine's
+/// GS-relative last-error slot (`GS_BASE + TEB_LAST_ERROR_OFFSET`).
+const _: () = assert!(
+    RuntimeMemoryLayout::default().teb_low.base == wie_cpu::GS_BASE,
+    "teb_low must sit at the fixed GS_BASE (primary TEB address)"
+);
+
+/// Compile-time gate: the worker TEB pool must not contain the primary TEB
+/// page — `PerThreadTeb::primary()` (GS_BASE) is the primary's own page and
+/// must never be handed to a worker. Overlap with any other region is already
+/// rejected by the layout `validate` gate above.
+const _: () = assert!(
+    !RuntimeMemoryLayout::default()
+        .worker_tebs
+        .contains(wie_cpu::GS_BASE),
+    "worker TEB pool must not overlap the primary TEB at GS_BASE"
+);
+
 /// Default layout constants re-exported for existing call sites.
 pub const DEFAULT_LAYOUT: RuntimeMemoryLayout = RuntimeMemoryLayout::default();
 
@@ -501,10 +539,7 @@ pub(crate) fn default_winapi_state(
             // no DirectInput COM implementation, and SDL2's fallback (DInput
             // driver init failing → SDL_InitSubSystem failing → video torn
             // down) would break the display for games that use SDL_Init.
-            environment: vec![(
-                "SDL_DIRECTINPUT_ENABLED".to_string(),
-                "0".to_string(),
-            )],
+            environment: vec![("SDL_DIRECTINPUT_ENABLED".to_string(), "0".to_string())],
             // The main module's RT_DIALOG/RT_MENU/RT_STRING/RT_ACCELERATOR
             // resources are parsed in session init (the section map is not
             // available here).

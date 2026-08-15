@@ -70,6 +70,7 @@ fn vfs_roundtrip_host_d_to_bottle_c_and_back() {
             drive_d_root: Some(host_user.clone()),
             guest_args: vec![],
             stdin_bytes: vec![],
+            ..wie_runtime::MicroRunOptions::default()
         },
     )
     .expect("run vfs_roundtrip");
@@ -157,6 +158,7 @@ fn vfs_roundtrip_custom_paths_via_guest_flags() {
                 r"D:\custom_out.txt".into(),
             ],
             stdin_bytes: vec![],
+            ..wie_runtime::MicroRunOptions::default()
         },
     )
     .expect("run with flags");
@@ -229,6 +231,7 @@ fn vfs_roundtrip_optional_real_downloads() {
                 format!(r"D:\{out_name}"),
             ],
             stdin_bytes: vec![],
+            ..wie_runtime::MicroRunOptions::default()
         },
     )
     .expect("run against Downloads");

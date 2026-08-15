@@ -30,8 +30,6 @@ mod plant;
 #[cfg(test)]
 mod tests;
 
-pub use classify::TEB_LAST_ERROR_VA;
-
 pub(crate) use classify::classify_guest_stub;
 pub(crate) use config::GuestStubConfig;
 pub(crate) use data::{build_stub_data_page, publish_cwd_wide, refresh_clock_table};

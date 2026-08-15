@@ -13,6 +13,7 @@ mod gui_loop;
 mod hooks;
 mod memory;
 mod mt_runtime;
+mod quantum;
 mod session;
 mod trace;
 
@@ -29,7 +30,7 @@ pub use session::{GuestHandle, MenuNode, RuntimeProfile, RuntimeSession, Session
 pub use trace::{
     EntryTraceEvent, EntryTraceSummary, EntryTraceTermination, MicroRunOptions, MicroRunSummary,
     RuntimeRunSummary, entry_trace, run_micro_exe, run_micro_exe_with_options,
-    run_micro_exe_with_root, run_persistent_until_yield,
+    run_micro_exe_with_root, run_persistent_until_yield, run_persistent_until_yield_with_options,
 };
 pub use wie_cpu::{CpuEngine, CpuError, IcedCpu, JitCpu, active_backend_name, open_default_cpu};
 pub use wie_winapi::{FileDialogPolicy, IdleContext, IdlePolicy};

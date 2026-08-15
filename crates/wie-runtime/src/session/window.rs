@@ -22,6 +22,9 @@ pub struct GuestHandle {
     /// loop stops reconstructing the tree (and locking the big mutex) on
     /// every frame.
     pub(super) menu_tree_cache: MenuTreeCache,
+    /// Shared `shared_winapi` wait accumulators (Task 7) — the presenter
+    /// side of the same counters the guest threads write.
+    pub(super) lock_wait_stats: Arc<crate::mt_runtime::LockWaitStats>,
 }
 
 /// Descend the child hierarchy of `root` with z-order hit-testing: at each
@@ -54,10 +57,28 @@ fn hit_test_subtree(
 }
 
 impl GuestHandle {
+    /// Acquire the shared WinAPI state lock for a presenter-side access,
+    /// timing the wait when runtime profiling is enabled.
+    ///
+    /// Mirrors the callers' poison policy: a poisoned lock reads as `None`
+    /// (fail soft) exactly like the previous `.lock().ok()?` patterns, so
+    /// poison behavior is unchanged. Disabled path pays one relaxed atomic
+    /// load before the plain lock.
+    pub(super) fn lock_state(&self) -> Option<std::sync::MutexGuard<'_, wie_winapi::WinApiState>> {
+        if !self.lock_wait_stats.enabled() {
+            return self.state.lock().ok();
+        }
+        let t0 = std::time::Instant::now();
+        let guard = self.state.lock().ok()?;
+        self.lock_wait_stats
+            .record_presenter(u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        Some(guard)
+    }
+
     /// Take the latest published frame for `hwnd`, if any.
     #[must_use]
     pub fn take_frame(&self, hwnd: u64) -> Option<wie_winapi::present::SurfaceFrame> {
-        let state = self.state.lock().ok()?;
+        let state = self.lock_state()?;
         state
             .try_present()?
             .published
@@ -71,7 +92,7 @@ impl GuestHandle {
     /// after a guest `EM_SETSEL`/`EM_SCROLLCARET`.
     #[must_use]
     pub fn edit_selection(&self, hwnd: u64) -> Option<(usize, usize, usize)> {
-        let state = self.state.lock().ok()?;
+        let state = self.lock_state()?;
         state.try_window_state()?.edit_selection(hwnd)
     }
 
@@ -80,7 +101,7 @@ impl GuestHandle {
     /// a dialog field's contents.
     #[must_use]
     pub fn control_text(&self, hwnd: u64) -> Option<String> {
-        let state = self.state.lock().ok()?;
+        let state = self.lock_state()?;
         state
             .try_window_state()?
             .control_text(hwnd)
@@ -92,7 +113,7 @@ impl GuestHandle {
     /// Ln/Col indicator text after a guest mutation.
     #[must_use]
     pub fn status_bar_part_text(&self, hwnd: u64, part: usize) -> Option<String> {
-        let state = self.state.lock().ok()?;
+        let state = self.lock_state()?;
         state.try_window_state()?.status_bar_part_text(hwnd, part)
     }
 
@@ -106,7 +127,7 @@ impl GuestHandle {
     /// the host to skip redundant presents of an unchanged frame.
     #[must_use]
     pub fn present_generation(&self) -> u64 {
-        let Ok(state) = self.state.lock() else {
+        let Some(state) = self.lock_state() else {
             return 0;
         };
         state.try_present().map_or(0, |p| p.generation)
@@ -118,7 +139,7 @@ impl GuestHandle {
         if !wie_winapi::present::frame_timing_enabled() {
             return;
         }
-        if let Ok(mut state) = self.state.lock() {
+        if let Some(mut state) = self.lock_state() {
             state.present().record_present(ns);
         }
     }
@@ -126,7 +147,7 @@ impl GuestHandle {
     /// Publish duration of the most recent frame (ns; 0 when timing disabled).
     #[must_use]
     pub fn present_publish_ns_last(&self) -> u128 {
-        let Ok(state) = self.state.lock() else {
+        let Some(state) = self.lock_state() else {
             return 0;
         };
         state.try_present().map_or(0, |p| p.publish_ns_last)
@@ -135,7 +156,7 @@ impl GuestHandle {
     /// Return the first (and typically only) guest-created window handle.
     #[must_use]
     pub fn first_guest_window_handle(&self) -> Option<u64> {
-        let state = self.state.lock().ok()?;
+        let state = self.lock_state()?;
         state
             .try_window_state()?
             .windows
@@ -161,7 +182,7 @@ impl GuestHandle {
     /// headless/screenshot callers.
     #[must_use]
     pub fn window_at(&self, x: i32, y: i32) -> Option<(u64, u32, u32)> {
-        let state = self.state.lock().ok()?;
+        let state = self.lock_state()?;
         let windows = &state.try_window_state()?.windows;
         let top = windows
             .iter()
@@ -180,7 +201,7 @@ impl GuestHandle {
     /// window (a destroyed handle must not hit-test stale children).
     #[must_use]
     pub fn window_at_in(&self, hwnd: u64, x: i32, y: i32) -> Option<(u64, u32, u32)> {
-        let state = self.state.lock().ok()?;
+        let state = self.lock_state()?;
         let windows = &state.try_window_state()?.windows;
         let root = wie_winapi::handles::Hwnd::from(hwnd);
         windows.iter().find(|w| w.handle == root)?;
@@ -199,7 +220,7 @@ impl GuestHandle {
     /// top-level client space, not just `button.x`.
     #[must_use]
     pub fn capture_target(&self, x: i32, y: i32) -> Option<(u64, u32, u32)> {
-        let state = self.state.lock().ok()?;
+        let state = self.lock_state()?;
         let ws = state.try_window_state()?;
         let capture = ws.capture_window_handle;
         if capture == wie_winapi::handles::Hwnd::NULL {
@@ -226,7 +247,7 @@ impl GuestHandle {
     /// The window currently holding the mouse capture, if any.
     #[must_use]
     pub fn capture_window(&self) -> Option<u64> {
-        let state = self.state.lock().ok()?;
+        let state = self.lock_state()?;
         let capture = state.try_window_state()?.capture_window_handle;
         (capture != wie_winapi::handles::Hwnd::NULL).then_some(capture.as_u64())
     }
@@ -239,7 +260,7 @@ impl GuestHandle {
     /// an unchanged window set skips the enumerate+diff entirely.
     #[must_use]
     pub fn windows_rev(&self) -> u64 {
-        let Ok(state) = self.state.lock() else {
+        let Some(state) = self.lock_state() else {
             return 0;
         };
         state.try_present().map_or(0, |p| p.windows_rev)
@@ -252,7 +273,7 @@ impl GuestHandle {
     /// The Frame handler re-orders its NSWindows only when this changes.
     #[must_use]
     pub fn z_rev(&self) -> u64 {
-        let Ok(state) = self.state.lock() else {
+        let Some(state) = self.lock_state() else {
             return 0;
         };
         state.try_present().map_or(0, |p| p.z_rev)
@@ -266,7 +287,7 @@ impl GuestHandle {
     /// HWND_BOTTOM reorder it; creation stacks each new top-level on top.
     #[must_use]
     pub fn top_level_z_order(&self) -> Vec<u64> {
-        let Ok(state) = self.state.lock() else {
+        let Some(state) = self.lock_state() else {
             return Vec::new();
         };
         state.try_present().map_or_else(Vec::new, |p| {
@@ -284,7 +305,7 @@ impl GuestHandle {
     /// revision it compared actually describes.
     #[must_use]
     pub fn z_snapshot(&self) -> (u64, Vec<u64>) {
-        let Ok(state) = self.state.lock() else {
+        let Some(state) = self.lock_state() else {
             return (0, Vec::new());
         };
         let Some(present) = state.try_present() else {
@@ -304,7 +325,7 @@ impl GuestHandle {
     /// falls back to the primary window.
     #[must_use]
     pub fn focused_top_level(&self) -> Option<u64> {
-        let state = self.state.lock().ok()?;
+        let state = self.lock_state()?;
         let ws = state.try_window_state()?;
         let mut current = ws.focus_window_handle;
         if current == wie_winapi::handles::Hwnd::NULL {
@@ -322,7 +343,7 @@ impl GuestHandle {
     /// The window with keyboard focus (what `GetFocus` returns in-guest).
     #[must_use]
     pub fn focus_window(&self) -> Option<u64> {
-        let state = self.state.lock().ok()?;
+        let state = self.lock_state()?;
         let focus = state.try_window_state()?.focus_window_handle;
         (focus != wie_winapi::handles::Hwnd::NULL).then_some(focus.as_u64())
     }
@@ -333,7 +354,7 @@ impl GuestHandle {
     /// windows — without a `TrackMouseEvent` call Windows sends neither.
     #[must_use]
     pub fn mouse_tracking(&self, hwnd: u64) -> bool {
-        let Ok(state) = self.state.lock() else {
+        let Some(state) = self.lock_state() else {
             return false;
         };
         state.try_window_state().is_some_and(|ws| {
@@ -349,7 +370,7 @@ impl GuestHandle {
     ///
     /// `pressed` sets or clears bit 0x80 (the "key is down" flag) for `vk`.
     pub fn set_key_state(&self, vk: u16, pressed: bool) {
-        let Ok(mut state) = self.state.lock() else {
+        let Some(mut state) = self.lock_state() else {
             return;
         };
         let ws = state.window_state();
@@ -365,7 +386,7 @@ impl GuestHandle {
     /// Return info for the first guest window: (hwnd, title, width, height).
     #[must_use]
     pub fn first_guest_window_info(&self) -> Option<(u64, String, i32, i32)> {
-        let state = self.state.lock().ok()?;
+        let state = self.lock_state()?;
         let w = state.try_window_state()?.windows.first()?;
         Some((w.handle.as_u64(), w.title.clone(), w.width, w.height))
     }
@@ -390,7 +411,7 @@ impl GuestHandle {
     /// when no window has a menu.
     #[must_use]
     pub fn window_menu_items(&self) -> Arc<Vec<MenuNode>> {
-        let Ok(mut state) = self.state.lock() else {
+        let Some(mut state) = self.lock_state() else {
             return Arc::new(Vec::new());
         };
         let Some(ws) = state.try_window_state() else {
@@ -474,7 +495,7 @@ impl GuestHandle {
     /// cancels. When no bridge is registered the handlers keep the in-app
     /// emulated dialog, so headless runs and `trace` never hang.
     pub fn set_file_dialog_bridge(&self, cb: wie_winapi::FileDialogBridge) {
-        if let Ok(mut state) = self.state.lock() {
+        if let Some(mut state) = self.lock_state() {
             state.window_state().file_dialog_bridge = Some(cb);
         }
     }
@@ -491,7 +512,7 @@ impl GuestHandle {
     /// which is dialog semantics. When no bridge is registered the handler
     /// cancels, so headless runs and `trace` never hang.
     pub fn set_print_dialog_bridge(&self, cb: wie_winapi::PrintDialogBridge) {
-        if let Ok(mut state) = self.state.lock() {
+        if let Some(mut state) = self.lock_state() {
             state.window_state().print_dialog_bridge = Some(cb);
         }
     }
@@ -509,7 +530,7 @@ impl GuestHandle {
     /// which is dialog semantics. When no bridge is registered the handler
     /// cancels, so headless runs and `trace` never hang.
     pub fn set_page_setup_dialog_bridge(&self, cb: wie_winapi::PageSetupDialogBridge) {
-        if let Ok(mut state) = self.state.lock() {
+        if let Some(mut state) = self.lock_state() {
             state.window_state().page_setup_dialog_bridge = Some(cb);
         }
     }
@@ -526,14 +547,14 @@ impl GuestHandle {
     /// is print semantics. When no bridge is registered the handler keeps the
     /// `WIE_PRINT_TO` BMP oracle, so headless runs and `trace` never block.
     pub fn set_print_job_bridge(&self, cb: wie_winapi::PrintJobBridge) {
-        if let Ok(mut state) = self.state.lock() {
+        if let Some(mut state) = self.lock_state() {
             state.window_state().print_job_bridge = Some(cb);
         }
     }
 
     /// Set the wake callback — called when a new frame is published.
     pub fn set_wake(&self, cb: Box<dyn Fn() + Send>) {
-        if let Ok(mut state) = self.state.lock() {
+        if let Some(mut state) = self.lock_state() {
             state.present().wake = Some(cb);
         }
     }
@@ -551,7 +572,7 @@ impl GuestHandle {
     /// guest. When no bridge is registered the handlers keep the
     /// console-echo + IDOK fallback, so headless runs and `trace` never hang.
     pub fn set_message_box_bridge(&self, cb: wie_winapi::present::MessageBoxBridge) {
-        if let Ok(mut state) = self.state.lock() {
+        if let Some(mut state) = self.lock_state() {
             state.present().message_box_bridge = Some(cb);
         }
     }
@@ -571,7 +592,7 @@ impl GuestHandle {
     /// reads back via `DragQueryPoint`.
     #[must_use]
     pub fn set_drop_files(&self, paths: Vec<std::path::PathBuf>, point: (i32, i32)) -> u64 {
-        let Ok(mut state) = self.state.lock() else {
+        let Some(mut state) = self.lock_state() else {
             return 0;
         };
         let volumes = state.file_io.volumes.clone();
@@ -652,9 +673,7 @@ impl GuestHandle {
     /// the shared `WinApiState`, applied on the event-loop thread.
     #[must_use]
     pub fn take_host_geometry_request(&self) -> Option<(u64, i32, i32, i32, i32)> {
-        let Ok(mut state) = self.state.lock() else {
-            return None;
-        };
+        let mut state = self.lock_state()?;
         let ws = state.window_state();
         let rect = ws.host_geometry_request.take()?;
         let hwnd = ws.host_geometry_hwnd.take()?;
@@ -726,6 +745,7 @@ mod tests {
             state: Arc::new(Mutex::new(winapi_state)),
             queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
             menu_tree_cache: Arc::new(RwLock::new(None)),
+            lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
         };
 
         let first = handle.window_menu_items();
@@ -807,6 +827,7 @@ mod tests {
             state: Arc::new(Mutex::new(winapi_state)),
             queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
             menu_tree_cache: Arc::new(RwLock::new(None)),
+            lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
         };
 
         let first = handle.window_menu_items();
@@ -931,6 +952,7 @@ mod tests {
             state: Arc::new(Mutex::new(winapi_state)),
             queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
             menu_tree_cache: Arc::new(RwLock::new(None)),
+            lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
         };
 
         // Focus sits on B's child EDIT → the bar mirrors B's menu.
@@ -1002,6 +1024,7 @@ mod tests {
             state: Arc::new(Mutex::new(winapi_state)),
             queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
             menu_tree_cache: Arc::new(RwLock::new(None)),
+            lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
         };
 
         assert_eq!(
@@ -1078,6 +1101,7 @@ mod tests {
             state: Arc::new(Mutex::new(winapi_state)),
             queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
             menu_tree_cache: Arc::new(RwLock::new(None)),
+            lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
         };
 
         // A click at (20, 20) in window B's space hits B's edit, NOT A's
@@ -1139,6 +1163,7 @@ mod tests {
             state: Arc::new(Mutex::new(winapi_state)),
             queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
             menu_tree_cache: Arc::new(RwLock::new(None)),
+            lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
         };
 
         assert_eq!(
@@ -1198,6 +1223,7 @@ mod tests {
             state: Arc::new(Mutex::new(winapi_state)),
             queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
             menu_tree_cache: Arc::new(RwLock::new(None)),
+            lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
         };
 
         // Focus on the dialog's button → the owner top-level (main).
@@ -1270,6 +1296,7 @@ mod tests {
             state: Arc::new(Mutex::new(winapi_state)),
             queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
             menu_tree_cache: Arc::new(RwLock::new(None)),
+            lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
         };
 
         handle.resize_window(Hwnd::from(top), Dimension::new(800, 600));
@@ -1336,6 +1363,7 @@ mod tests {
             state: Arc::new(Mutex::new(winapi_state)),
             queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
             menu_tree_cache: Arc::new(RwLock::new(None)),
+            lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
         };
 
         let hdrop = handle.set_drop_files(
@@ -1387,6 +1415,7 @@ mod tests {
             state: Arc::new(Mutex::new(winapi_state)),
             queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
             menu_tree_cache: Arc::new(RwLock::new(None)),
+            lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
         };
 
         let hdrop = handle.set_drop_files(
@@ -1433,6 +1462,7 @@ mod tests {
             state: Arc::new(Mutex::new(winapi_state)),
             queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
             menu_tree_cache: Arc::new(RwLock::new(None)),
+            lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
         };
 
         let (rev, order) = handle.z_snapshot();
@@ -1456,5 +1486,81 @@ mod tests {
         assert!(rev2 > rev, "the z-change bumps the revision");
         assert_eq!(order2, vec![0x300, 0x200, 0x100], "reordered snapshot");
         assert_eq!(rev2, handle.z_rev(), "still consistent after the change");
+    }
+
+    // ── Task 7: presenter-side lock-wait timing ────────────────────────
+
+    /// A presenter-side `GuestHandle` + shared stats fixture.
+    fn handle_with_stats() -> (GuestHandle, Arc<crate::mt_runtime::LockWaitStats>) {
+        let process = wie_pe::ProcessIdentity {
+            module_file_name: "wait.exe".to_owned(),
+            module_path: r"C:\App\wait.exe".to_owned(),
+            current_directory: r"C:\App".to_owned(),
+            command_line: "wait.exe".to_owned(),
+        };
+        let winapi_state =
+            crate::memory::default_winapi_state(&DEFAULT_LAYOUT, Arc::new(Vec::new()), &process)
+                .expect("winapi state");
+        let stats = Arc::new(crate::mt_runtime::LockWaitStats::new());
+        let handle = GuestHandle {
+            state: Arc::new(Mutex::new(winapi_state)),
+            queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+            menu_tree_cache: Arc::new(RwLock::new(None)),
+            lock_wait_stats: Arc::clone(&stats),
+        };
+        (handle, stats)
+    }
+
+    /// `take_frame` (the presenter's per-frame read path) times its wait on
+    /// `shared_winapi` while profiling is enabled: with the guest holding
+    /// the lock, the blocked acquisition lands in the presenter-side stats
+    /// (total + max) and never in the guest side.
+    #[test]
+    fn take_frame_times_presenter_wait_when_enabled() {
+        let (handle, stats) = handle_with_stats();
+        stats.set_enabled(true);
+        let state = Arc::clone(&handle.state);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = state.lock().ok();
+            let _ = tx.send(());
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        });
+        let _ = rx.recv();
+        let frame = handle.take_frame(0x100);
+        assert!(frame.is_none(), "no published frame yet");
+        let _ = holder.join();
+        let snap = stats.snapshot();
+        assert!(
+            snap.presenter_total_ns >= 5_000_000,
+            "the 10 ms held lock must be observed on the presenter side (got {} ns)",
+            snap.presenter_total_ns
+        );
+        assert!(
+            snap.presenter_max_ns >= 5_000_000,
+            "the presenter max must capture the same wait (got {} ns)",
+            snap.presenter_max_ns
+        );
+        assert_eq!(
+            snap.guest_total_ns, 0,
+            "presenter waits never mix with guest"
+        );
+        assert_eq!(snap.guest_max_ns, 0);
+    }
+
+    /// Disabled mode: presenter-side reads take the lock without recording —
+    /// the shared stats stay zero, so the per-frame path pays only the
+    /// atomic gate load.
+    #[test]
+    fn take_frame_disabled_records_nothing() {
+        let (handle, stats) = handle_with_stats();
+        assert!(!stats.enabled(), "stats start disabled");
+        let _ = handle.take_frame(0x100);
+        let _ = handle.z_snapshot();
+        let snap = stats.snapshot();
+        assert_eq!(snap.presenter_total_ns, 0);
+        assert_eq!(snap.presenter_max_ns, 0);
+        assert_eq!(snap.guest_total_ns, 0);
+        assert_eq!(snap.guest_max_ns, 0);
     }
 }

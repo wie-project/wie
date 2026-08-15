@@ -4,6 +4,46 @@ use super::config::{
 };
 use super::*;
 
+/// GetLastError/SetLastError plant GS-relative stubs so every thread reads
+/// or writes ITS OWN TEB last-error slot (the GS base resolves per engine).
+/// The body embeds `TEB_LAST_ERROR_OFFSET` as a disp32 — ModRM 04 + SIB 25
+/// forces the base-less form (mod=00 rm=101 would be RIP-relative in x86-64).
+#[test]
+fn last_error_stubs_are_gs_relative_per_thread() {
+    let cfg = GuestStubConfig::CLASSIFY_ONLY;
+
+    let get =
+        classify_guest_stub("KERNEL32.dll", "GetLastError", &cfg).expect("GetLastError classifies");
+    assert_eq!(get, GuestStubKind::LoadLastError);
+    let body = get.encode(&cfg);
+    assert_eq!(
+        body,
+        vec![0x65, 0x8b, 0x04, 0x25, 0x68, 0x00, 0x00, 0x00, 0xc3],
+        "GetLastError must be mov eax, [gs:0x68]; ret"
+    );
+
+    let set =
+        classify_guest_stub("KERNEL32.dll", "SetLastError", &cfg).expect("SetLastError classifies");
+    assert_eq!(set, GuestStubKind::StoreLastError);
+    let body = set.encode(&cfg);
+    assert_eq!(
+        body,
+        vec![0x65, 0x89, 0x0c, 0x25, 0x68, 0x00, 0x00, 0x00, 0xc3],
+        "SetLastError must be mov [gs:0x68], ecx; ret"
+    );
+
+    // No embedded guest VA: the body is config-independent and fits the IAT stride.
+    assert!(!get.needs_real_guest_addresses());
+    assert!(!set.needs_real_guest_addresses());
+    assert!(!get.needs_out_of_line_helper());
+    assert!(!set.needs_out_of_line_helper());
+    // The displacement matches the shared guest-layout constant.
+    assert_eq!(
+        u32::try_from(wie_cpu::guest_layout::TEB_LAST_ERROR_OFFSET).unwrap_or(0),
+        0x68
+    );
+}
+
 #[test]
 fn get_cwd_stub_encodes_and_patches_rel8() {
     let cfg = GuestStubConfig::from_layout(&crate::memory::DEFAULT_LAYOUT);

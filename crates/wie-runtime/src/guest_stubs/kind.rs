@@ -2,6 +2,7 @@
 
 use super::config::GuestStubConfig;
 use super::encode::{StubCtx, encode_copy_u64_to_ptr, encode_load_u32_table};
+use wie_cpu::guest_layout::TEB_LAST_ERROR_OFFSET;
 
 /// Kind of in-guest stub to plant at a fake API VA.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -20,8 +21,14 @@ pub(crate) enum GuestStubKind {
     LoadZx32FromVa(u64),
     /// `mov rax, imm64; mov rax, [rax]; ret` — load QWORD from fixed guest VA.
     LoadZx64FromVa(u64),
-    /// `mov [rax], ecx; ret` — store DWORD to fixed guest VA.
-    StoreEcxToVa(u64),
+    /// `mov eax, [gs:TEB_LAST_ERROR_OFFSET]; ret` — per-thread TEB last-error
+    /// load (`GetLastError`). GS-relative on purpose: the GS base resolves per
+    /// engine at run time, so a worker thread reads ITS TEB page, never the
+    /// primary's fixed `TEB_LAST_ERROR_VA`.
+    LoadLastError,
+    /// `mov [gs:TEB_LAST_ERROR_OFFSET], ecx; ret` — per-thread TEB last-error
+    /// store (`SetLastError`). Same GS-relative rationale as [`Self::LoadLastError`].
+    StoreLastError,
     /// `*rcx = qword[slot_va]` — copy one u64 table slot through a guest
     /// pointer (`GetSystemTimeAsFileTime`; NULL pointer skipped, void return).
     CopyU64FromVaToRcxPtr { slot_va: u64 },
@@ -94,9 +101,18 @@ impl GuestStubKind {
                 buf[2..10].copy_from_slice(&va.to_le_bytes());
                 buf
             }
-            Self::StoreEcxToVa(va) => {
-                let mut buf = vec![0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0x89, 0x08, 0xc3];
-                buf[2..10].copy_from_slice(&va.to_le_bytes());
+            Self::LoadLastError => {
+                // mov eax, [gs:disp32]; ret — per-thread via the engine's GS
+                // base. ModRM 04 + SIB 25 forces the base-less disp32 form
+                // (mod=00 rm=101 would decode as RIP-relative in x86-64).
+                let mut buf = vec![0x65, 0x8b, 0x04, 0x25, 0, 0, 0, 0, 0xc3];
+                buf[4..8].copy_from_slice(&last_error_disp32().to_le_bytes());
+                buf
+            }
+            Self::StoreLastError => {
+                // mov [gs:disp32], ecx; ret — same SIB-forced base-less form.
+                let mut buf = vec![0x65, 0x89, 0x0c, 0x25, 0, 0, 0, 0, 0xc3];
+                buf[4..8].copy_from_slice(&last_error_disp32().to_le_bytes());
                 buf
             }
             Self::CopyU64FromVaToRcxPtr { slot_va } => encode_copy_u64_to_ptr(slot_va, false),
@@ -156,7 +172,8 @@ impl GuestStubKind {
             Self::ReturnImm64(_) => false,
             Self::LoadZx32FromVa(_) => false,
             Self::LoadZx64FromVa(_) => false,
-            Self::StoreEcxToVa(_) => false,
+            Self::LoadLastError => false,
+            Self::StoreLastError => false,
             Self::CopyU64FromVaToRcxPtr { .. } => true,
             Self::CopyU64FromVaToRcxPtrRetOne { .. } => true,
             Self::FlsGetValue { .. } => true,
@@ -191,9 +208,10 @@ impl GuestStubKind {
             Self::ReturnZero => false,
             Self::ReturnImm32(_) => false,
             Self::ReturnImm64(_) => true, // GetCommandLineA/W, GetProcessHeap, GetDesktopWindow
-            Self::LoadZx32FromVa(_) => true, // TEB_LAST_ERROR_VA (constant, but safe to re-classify)
+            Self::LoadZx32FromVa(_) => true, // clock-table slot VA (config-derived)
             Self::LoadZx64FromVa(_) => true, // clock-table slot VA (config-derived)
-            Self::StoreEcxToVa(_) => true,   // TEB_LAST_ERROR_VA (same)
+            Self::LoadLastError => false, // GS-relative: no embedded guest VA
+            Self::StoreLastError => false, // GS-relative: no embedded guest VA
             Self::CopyU64FromVaToRcxPtr { .. } => true, // clock-table slot VA
             Self::CopyU64FromVaToRcxPtrRetOne { .. } => true, // clock-table slot VA
             Self::FlsGetValue { .. } => true,
@@ -219,4 +237,10 @@ fn encode_with(cfg: &GuestStubConfig, encode: impl FnOnce(&mut StubCtx<'_>)) -> 
     let mut ctx = StubCtx::new(&mut buf, cfg);
     encode(&mut ctx);
     buf
+}
+
+/// The `TEB.LastErrorValue` offset as a `u32` x86 disp32 (`0x68`; fixed
+/// constant, so this cannot fail).
+fn last_error_disp32() -> u32 {
+    u32::try_from(TEB_LAST_ERROR_OFFSET).unwrap_or(0)
 }

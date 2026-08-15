@@ -1,1380 +1,1298 @@
 //! `run_until_stop` quantum loop and quiescent drain for the session.
+//!
+//! The per-quantum state machine (activate → run → resolve → dispatch →
+//! park → finish) lives in `crate::quantum`; this module drives it for the
+//! PRIMARY thread and supplies the primary-only behaviors through
+//! [`SessionPumpHooks`]: the static DllMain phase, guest-callback completion,
+//! session journaling, the host bridges, and child-process spawns.
 
-use super::{invalid_memory_diagnostic, journal_api_return};
-use crate::hooks::resolve_fake_api_at;
+use super::RuntimeProfile;
+use super::callback::{GuestCallbackCompletion, PendingGuestCallback};
+use super::journal_api_return;
+use crate::hooks::ResolvedFakeApi;
+use crate::quantum::{QuantumCore, QuantumHooks, Step};
 use crate::trace::{EntryTraceEvent, EntryTraceTermination, RuntimeRunSummary};
+use ahash::HashMap;
 use anyhow::{Context, Result};
-use std::sync::Arc;
+use std::borrow::Cow;
+use std::sync::{Arc, MutexGuard};
 use std::time::Instant;
+use wie_cpu::CpuError;
+use wie_winapi::{
+    GuestCallbackRequest, HostParkReason, KernelHandle, WinApiControlSignal, WinApiState,
+    dll_loader,
+};
 
-impl super::RuntimeSession {
-    /// Publish host `last_error` into guest TEB.LastErrorValue so in-guest
-    /// `GetLastError` stubs stay coherent with host-side API failures.
-    fn publish_last_error_to_guest(&mut self) {
-        let err = self.process.with_mut(|_, st| st.process.last_error);
-        if self.last_published_last_error == Some(err) {
-            return;
-        }
-        let bytes = err.to_le_bytes();
-        // Best-effort: TEB page is always mapped for this layout.
-        let ok = self.process.with_mut(|eng, _| {
-            eng.mem_write(crate::guest_stubs::TEB_LAST_ERROR_VA, &bytes)
-                .is_ok()
-        });
-        if ok {
-            self.last_published_last_error = Some(err);
+/// Primary-thread hook state for one `run_until_stop` segment.
+///
+/// Holds `&mut` references to the session fields the quantum loop touches and
+/// the per-segment counters the journaling arms mutate. Process access goes
+/// through the [`QuantumCore`] the hooks receive, never through the session.
+struct SessionPumpHooks<'a> {
+    /// PE entry-point VA to dispatch when RIP is 0 (before entry is reached).
+    entry_point_va: u64,
+    /// Whether the guest entry point has been reached.
+    entry_reached: &'a mut bool,
+    /// Next API-stop index (journal ordering; undone on message yield / CS park).
+    next_api_index: &'a mut usize,
+    /// Consecutive no-hook slice counter (session stop diagnostic).
+    no_hook_slices: &'a mut usize,
+    /// In-flight bridged guest callbacks.
+    pending_callbacks: &'a mut Vec<PendingGuestCallback>,
+    /// Cache of `Arc<str>` copies of callback-outer API names, so every
+    /// bridged window message clones a refcounted string instead of
+    /// allocating a fresh `Arc` box + copy per message.
+    outer_api_names: &'a mut HashMap<String, Arc<str>>,
+    /// Whether `WIE_RUNTIME_PROFILE` is active for this session.
+    profile_enabled: bool,
+    /// Accumulated host-side profile.
+    profile: &'a mut RuntimeProfile,
+    /// Journaled API events for the run summary.
+    events: &'a mut Vec<EntryTraceEvent>,
+    /// Statically-loaded guest DLLs awaiting `DllMain(PROCESS_ATTACH)`, in
+    /// load order (dependencies before dependents).
+    static_dll_mains: Vec<dll_loader::StaticDllMain>,
+    /// Index of the next static DllMain to run.
+    dll_main_index: usize,
+    /// Trampoline each static DllMain returns through.
+    dll_main_return_va: u64,
+    /// Guest TID of the primary (entry-point) thread.
+    primary_tid: u32,
+    /// APIs charged toward `max_api` this run segment.
+    charged_api: usize,
+    /// Fast-path (noisy) API stops not charged toward `max_api`.
+    noisy_api: usize,
+}
+
+impl<'a> SessionPumpHooks<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        entry_point_va: u64,
+        entry_reached: &'a mut bool,
+        next_api_index: &'a mut usize,
+        no_hook_slices: &'a mut usize,
+        pending_callbacks: &'a mut Vec<PendingGuestCallback>,
+        outer_api_names: &'a mut HashMap<String, Arc<str>>,
+        profile_enabled: bool,
+        profile: &'a mut RuntimeProfile,
+        events: &'a mut Vec<EntryTraceEvent>,
+        static_dll_mains: Vec<dll_loader::StaticDllMain>,
+        dll_main_return_va: u64,
+        primary_tid: u32,
+    ) -> Self {
+        Self {
+            entry_point_va,
+            entry_reached,
+            next_api_index,
+            no_hook_slices,
+            pending_callbacks,
+            outer_api_names,
+            profile_enabled,
+            profile,
+            events,
+            static_dll_mains,
+            dll_main_index: 0,
+            dll_main_return_va,
+            primary_tid,
+            charged_api: 0,
+            noisy_api: 0,
         }
     }
 
-    /// Publish the current clock snapshot into the guest clock table.
+    /// Publish the ACTIVE (primary) thread's last-error into the primary
+    /// engine's GS-relative TEB slot so in-guest `GetLastError` stubs stay
+    /// coherent with host-side API failures.
     ///
-    /// Uses the primary engine directly (no WinAPI lock): the table lives in
-    /// guest memory and the host is between quanta here, so no worker runs on
-    /// this engine concurrently.
-    fn refresh_clock_table(&mut self) {
-        let clock_table_va = self.process.layout().clock_table.base;
-        let _ = crate::guest_stubs::refresh_clock_table(&mut *self.process.engine, clock_table_va);
+    /// Runs after a bridged guest callback completes (guest WndProc code may
+    /// have `SetLastError`'d through the in-guest stub since the last
+    /// dispatch): absorb the engine's TEB slot into the primary's per-thread
+    /// slot first, then publish it back. Re-activates the primary like the
+    /// bridge arms — a worker may have claimed `active` while the callback ran
+    /// on the primary engine without the WinAPI lock.
+    fn publish_last_error_to_guest(&mut self, core: &mut QuantumCore) {
+        let primary_tid = self.primary_tid;
+        core.with_locked(|engine, st| {
+            if st.kernel.threads.active.tid != primary_tid {
+                st.kernel.threads.activate(primary_tid);
+            }
+            st.absorb_guest_last_error(engine);
+            st.publish_last_error_to_guest(engine);
+        });
     }
 
-    /// Runs the guest until it yields, terminates, reaches an unsupported API,
-    /// or processes `max_api` additional API calls.
-    pub fn run_until_stop(&mut self, max_api: usize) -> Result<RuntimeRunSummary> {
-        let layout = *self.process.layout();
-        let environment = *self.process.environment();
-        let soft_apis = self.process.soft_apis().clone();
-        let primary_tid = self.process.primary_tid();
+    /// Returns a shareable `Arc<str>` for a callback-outer API name, caching
+    /// the first conversion so every subsequent bridged window message clones
+    /// a refcounted string (refcount bump) instead of allocating a fresh
+    /// `Arc` box + string copy per message.
+    fn intern_outer_api_name(&mut self, name: Cow<'static, str>) -> Arc<str> {
+        if let Some(arc) = self.outer_api_names.get(name.as_ref()) {
+            return Arc::clone(arc);
+        }
+        let arc: Arc<str> = Arc::from(name);
+        self.outer_api_names
+            .insert(arc.to_string(), Arc::clone(&arc));
+        arc
+    }
 
-        let fake_api_size_u64 =
-            u64::try_from(layout.fake_api.size).context("fake API size does not fit u64")?;
+    /// Sets up Win64 calling convention and transfers control to a guest WndProc.
+    ///
+    /// Stack layout below the original `DispatchMessageA` frame:
+    /// ```text
+    /// [dispatch_rsp]      return address of DispatchMessageA caller
+    /// [dispatch_rsp-8]    alignment padding
+    /// [dispatch_rsp-0x28] 32-byte shadow space
+    /// [dispatch_rsp-0x30] trampoline return address  ← new RSP / WndProc entry
+    /// ```
+    fn begin_guest_callback(
+        &mut self,
+        core: &mut QuantumCore,
+        request: GuestCallbackRequest,
+        outer_library: Arc<str>,
+        outer_name: Arc<str>,
+        outer_fake_va: u64,
+    ) -> Result<()> {
+        let trampoline = core.layout().callback_return_trampoline_va;
+        let dispatch_rsp = core.with_locked(|engine, _| {
+            crate::guest_callback::install_guest_callback_frame(engine, &request, trampoline)
+        })?;
 
-        let fake_api_end = layout
-            .fake_api
-            .base
-            .checked_add(fake_api_size_u64)
-            .context("fake API end overflow")?
-            .checked_sub(1)
-            .context("fake API end underflow")?;
+        self.pending_callbacks.push(PendingGuestCallback {
+            dispatch_rsp,
+            request,
+            outer_library,
+            outer_name,
+            outer_fake_va,
+            outer_return: request.outer_return,
+            enumeration_id: None,
+        });
 
-        let instruction_budget = layout.instruction_budget;
-        let no_hook_limit = layout.no_hook_slice_limit;
+        Ok(())
+    }
 
+    /// Begins a guest `FONTENUMPROC` callback for one item of a font
+    /// enumeration.
+    ///
+    /// `dispatch_rsp` is the RSP the frame is installed relative to: the
+    /// current RSP for the first item, or the ORIGINAL outer API RSP for a
+    /// continuation (so the final completion restores the true outer frame
+    /// even though each re-entry grows the stack down by 0x30).
+    #[allow(clippy::too_many_arguments)] // one arg per Win64 callback slot
+    fn begin_guest_enum_callback(
+        &mut self,
+        core: &mut QuantumCore,
+        request: GuestCallbackRequest,
+        enumeration_id: u64,
+        outer_library: Arc<str>,
+        outer_name: Arc<str>,
+        outer_fake_va: u64,
+        dispatch_rsp: u64,
+    ) -> Result<()> {
+        let trampoline = core.layout().callback_return_trampoline_va;
+        core.with_locked(|engine, _| {
+            crate::guest_callback::install_guest_enum_callback_frame(
+                engine,
+                &request,
+                trampoline,
+                dispatch_rsp,
+            )
+        })?;
+
+        self.pending_callbacks.push(PendingGuestCallback {
+            dispatch_rsp,
+            request,
+            outer_library,
+            outer_name,
+            outer_fake_va,
+            outer_return: request.outer_return,
+            enumeration_id: Some(enumeration_id),
+        });
+
+        Ok(())
+    }
+
+    /// Completes the most recent guest WndProc and returns from the outer host API.
+    fn complete_guest_callback(
+        &mut self,
+        core: &mut QuantumCore,
+    ) -> Result<GuestCallbackCompletion> {
+        let pending = self
+            .pending_callbacks
+            .pop()
+            .context("callback trampoline hit without a pending guest callback")?;
+
+        // Read the callback's return value (RAX) without restoring the frame
+        // yet — a font-enumeration continuation needs it to decide whether to
+        // re-enter with the next item.
+        let lresult = core
+            .with_locked(|engine, _| engine.read_rax())
+            .context("failed to read guest callback return value")?;
+
+        // Full-iteration continuation: while the callback returns non-zero and
+        // more items remain, re-enter with the next item instead of completing
+        // the outer API. One-shot callers (EnumWindows, WndProc dispatch) have
+        // `enumeration_id == None` and always fall through to completion.
+        if let Some(enumeration_id) = pending.enumeration_id
+            && lresult != 0
+        {
+            let next = core.with_locked(|engine, winapi_state| {
+                wie_winapi::gdi32::enumerate::advance_enumeration(
+                    engine,
+                    winapi_state,
+                    enumeration_id,
+                )
+            })?;
+            if let Some(next_request) = next {
+                // Re-enter with the next item, preserving the ORIGINAL outer
+                // frame RSP so the final completion restores it correctly.
+                self.begin_guest_enum_callback(
+                    core,
+                    next_request,
+                    enumeration_id,
+                    Arc::clone(&pending.outer_library),
+                    Arc::clone(&pending.outer_name),
+                    pending.outer_fake_va,
+                    pending.dispatch_rsp,
+                )?;
+                return Ok(GuestCallbackCompletion {
+                    outer_library: pending.outer_library,
+                    outer_name: pending.outer_name,
+                    outer_fake_va: pending.outer_fake_va,
+                    return_value: lresult,
+                    // Not used for a continuation: the pump re-enters the loop
+                    // and the next callback runs on the following iteration.
+                    return_address: 0,
+                });
+            }
+        }
+
+        let (return_value, return_address) = core.with_locked(|engine, _| {
+            crate::guest_callback::finish_guest_callback(
+                engine,
+                pending.dispatch_rsp,
+                pending.outer_return,
+            )
+        })?;
+
+        tracing::debug!(
+            outer = %format!("{}!{}", pending.outer_library.as_ref(), pending.outer_name.as_ref()),
+            callback = pending.request.callback_address,
+            hwnd = pending.request.window_handle,
+            message = pending.request.message,
+            return_value,
+            resume = return_address,
+            "completed guest window callback"
+        );
+
+        Ok(GuestCallbackCompletion {
+            outer_library: pending.outer_library,
+            outer_name: pending.outer_name,
+            outer_fake_va: pending.outer_fake_va,
+            return_value,
+            return_address,
+        })
+    }
+}
+
+impl QuantumHooks for SessionPumpHooks<'_> {
+    fn prepare_quantum(&mut self, core: &mut QuantumCore) -> Result<usize> {
+        let index = *self.next_api_index;
+        *self.next_api_index = self
+            .next_api_index
+            .checked_add(1)
+            .context("runtime API index overflow")?;
+
+        // Refresh the host-written guest clock table ahead of this quantum so
+        // the in-guest clock stubs (GetTickCount / timeGetTime / QPC / …)
+        // observe advancing values with no host stop. Frozen under
+        // `WIE_FIXED_CLOCK=1` — the table was written once at session init,
+        // so a guest busy-waiting on a constant never spins.
+        if !wie_winapi::kernel32::clock::clock_is_fixed() {
+            let clock_table_va = core.layout().clock_table.base;
+            let _ = crate::guest_stubs::refresh_clock_table(core.engine(), clock_table_va);
+        }
+        Ok(index)
+    }
+
+    fn prepare_first_quantum(&mut self, core: &mut QuantumCore) -> Result<()> {
         // Static-dependency DllMain(PROCESS_ATTACH) init phase: Windows calls
         // each static dep's DllMain in load order (dependencies first) BEFORE
         // the exe entry point. Runs once, on the first quantum, guarded by
         // `entry_reached`; completing the phase resets RIP to 0 so the next
         // iteration dispatches the exe entry. Skipped entirely when the
         // budget is zero (preparing would push a return address nothing ever
-        // pops).
+        // pops) — the caller gates on `max_api > 0`.
+        if let Some(first) = self.static_dll_mains.first() {
+            dll_loader::prepare_dll_main_call(
+                core.engine(),
+                first.image_base,
+                first.entry_rva,
+                dll_loader::DLL_PROCESS_ATTACH,
+                1, // lpvReserved: non-zero marks a static (loader) call.
+                self.dll_main_return_va,
+            )
+            .context("failed to prepare first static DllMain call")?;
+        }
+        Ok(())
+    }
+
+    fn zero_rip_begin(&mut self, _core: &mut QuantumCore) -> Result<Option<u64>> {
+        if !*self.entry_reached {
+            *self.entry_reached = true;
+            tracing::info!(
+                target: "wiegui",
+                entry = self.entry_point_va,
+                "guest entry reached"
+            );
+        }
+        Ok(Some(self.entry_point_va))
+    }
+
+    fn claim_hook_locked(
+        &mut self,
+        core: &mut QuantumCore,
+        _st: &mut WinApiState,
+        address: u64,
+    ) -> Result<Option<Step>> {
+        // A statically-loaded dependency's DllMain returned. RAX carries the
+        // BOOL result; FALSE aborts process init (Windows
+        // STATUS_DLL_INIT_FAILED semantics) — the exe entry never runs.
+        if !*self.entry_reached && address == self.dll_main_return_va {
+            let dll_ok = core
+                .engine()
+                .read_rax()
+                .context("failed to read RAX after static DllMain")?;
+            let name = self
+                .static_dll_mains
+                .get(self.dll_main_index)
+                .map(|m| m.name.as_str())
+                .unwrap_or("?");
+            if dll_ok == 0 {
+                return Ok(Some(Step::Stop(EntryTraceTermination::RuntimeStop(
+                    format!(
+                        "{name}!DllMain returned FALSE (DLL_PROCESS_ATTACH) \
+                     — process init aborted"
+                    ),
+                ))));
+            }
+            self.dll_main_index = self
+                .dll_main_index
+                .checked_add(1)
+                .context("static DllMain index overflow")?;
+            if let Some(next) = self.static_dll_mains.get(self.dll_main_index) {
+                dll_loader::prepare_dll_main_call(
+                    core.engine(),
+                    next.image_base,
+                    next.entry_rva,
+                    dll_loader::DLL_PROCESS_ATTACH,
+                    1,
+                    self.dll_main_return_va,
+                )
+                .context("failed to prepare next static DllMain call")?;
+            } else {
+                // Init phase complete: reset RIP so the next iteration
+                // dispatches the exe entry point.
+                core.engine()
+                    .write_rip(0)
+                    .context("failed to reset RIP after static DllMain phase")?;
+            }
+            return Ok(Some(Step::Next));
+        }
+        Ok(None)
+    }
+
+    fn on_callback_return(
+        &mut self,
+        core: &mut QuantumCore,
+        guard: MutexGuard<'_, WinApiState>,
+        _address: u64,
+        api_index: usize,
+    ) -> Result<Step> {
+        // complete_guest_callback needs the lock dropped (it re-locks through
+        // the core) — release the guard before running it.
+        drop(guard);
+        match self.complete_guest_callback(core) {
+            Ok(completion) => {
+                self.charged_api = self.charged_api.saturating_add(1);
+                self.events.push(EntryTraceEvent {
+                    index: api_index,
+                    library: completion.outer_library,
+                    name: completion.outer_name,
+                    fake_target_va: completion.outer_fake_va,
+                    handled: true,
+                    return_value: Some(completion.return_value),
+                    return_address: Some(completion.return_address),
+                });
+                self.publish_last_error_to_guest(core);
+                // Do NOT publish a frame here. A guest WndProc is one message
+                // of a repaint cycle (parent BitBlt → child control paints
+                // across several messages); publishing mid-cycle would emit a
+                // frame with the children still missing. The drain happens
+                // once at the empty-queue idle boundary
+                // (WaitingForMessage) — one frame per full cycle.
+                Ok(Step::Next)
+            }
+            Err(error) => Ok(Step::Stop(EntryTraceTermination::RuntimeStop(format!(
+                "failed to complete guest callback: {error}"
+            )))),
+        }
+    }
+
+    fn on_seh_continue(
+        &mut self,
+        _core: &mut QuantumCore,
+        api_index: usize,
+        address: u64,
+        return_value: u64,
+        return_address: u64,
+    ) {
+        self.charged_api = self.charged_api.saturating_add(1);
+        self.events.push(EntryTraceEvent {
+            index: api_index,
+            library: "ntdll.dll".into(),
+            name: "SehContinue".into(),
+            fake_target_va: address,
+            handled: true,
+            return_value: Some(return_value),
+            return_address: Some(return_address),
+        });
+    }
+
+    fn on_no_hook(&mut self, core: &mut QuantumCore, begin: u64) -> Result<Step> {
+        let no_hook_limit = core.layout().no_hook_slice_limit;
+        *self.no_hook_slices = self
+            .no_hook_slices
+            .checked_add(1)
+            .context("no-hook slice count overflow")?;
+        if *self.no_hook_slices == 1
+            || self.no_hook_slices.is_multiple_of(5)
+            || *self.no_hook_slices == no_hook_limit
+        {
+            let rip = core.engine().read_rip().context("rip after no-hook")?;
+            let rsp = core.engine().read_rsp().context("rsp after no-hook")?;
+            let rax = core.engine().read_rax().context("rax after no-hook")?;
+            let rcx = core.engine().read_rcx().context("rcx after no-hook")?;
+            let rdx = core.engine().read_rdx().context("rdx after no-hook")?;
+            tracing::debug!(
+                slice = *self.no_hook_slices,
+                limit = no_hook_limit,
+                begin,
+                rip,
+                rsp,
+                rax,
+                rcx,
+                rdx,
+                "runtime no-hook slice"
+            );
+        }
+        if *self.no_hook_slices >= no_hook_limit {
+            let rip = core.engine().read_rip().context("rip after no-hook")?;
+            let rsp = core.engine().read_rsp().context("rsp after no-hook")?;
+            let rax = core.engine().read_rax().context("rax after no-hook")?;
+            let rcx = core.engine().read_rcx().context("rcx after no-hook")?;
+            let rdx = core.engine().read_rdx().context("rdx after no-hook")?;
+            return Ok(Step::Stop(EntryTraceTermination::RuntimeStop(format!(
+                "emulation stopped without hitting fake API hook after {} slices: \
+                 begin={begin:#018x}; rip={rip:#018x}; rsp={rsp:#018x}; \
+                 rax={rax:#018x}; rcx={rcx:#018x}; rdx={rdx:#018x}; \
+                 budget={}",
+                *self.no_hook_slices,
+                core.layout().instruction_budget,
+            ))));
+        }
+        Ok(Step::Next)
+    }
+
+    fn on_run_error(
+        &mut self,
+        core: &mut QuantumCore,
+        error: &CpuError,
+        api_index: usize,
+    ) -> Result<Step> {
+        let rip = core
+            .engine()
+            .read_rip()
+            .context("failed to read RIP after runtime emulation error")?;
+        let rsp = core
+            .engine()
+            .read_rsp()
+            .context("failed to read RSP after runtime emulation error")?;
+        let mut slot = [0_u8; 8];
+        let slot_va = rsp.wrapping_add(0x160);
+        let slot_val = core
+            .engine()
+            .mem_read(slot_va, &mut slot)
+            .ok()
+            .map(|()| u64::from_le_bytes(slot));
+        let last_api = match self.events.last() {
+            Some(e) => format!("{}!{}", e.library.as_ref(), e.name.as_ref()),
+            None => "-".into(),
+        };
+        Ok(Step::Stop(EntryTraceTermination::RuntimeStop(format!(
+            "emulation error (api_index={api_index}, last_api={last_api}): {error}; \
+             rip={rip:#018x}; rsp={rsp:#018x}; [rsp+0x160]={slot_val:?}"
+        ))))
+    }
+
+    fn wants_timing(&self) -> bool {
+        self.profile_enabled
+    }
+
+    fn on_emu_time(&mut self, _core: &mut QuantumCore, ns: u128) {
+        self.profile.add_emu_ns(ns);
+    }
+
+    fn on_resolved(&mut self, _core: &mut QuantumCore, ns: u128) {
+        self.profile.add_resolve_ns(ns);
+        self.profile.inc_host_stops();
+    }
+
+    fn dispatch(
+        &mut self,
+        core: &mut QuantumCore,
+        mut guard: MutexGuard<'_, WinApiState>,
+        resolved: &ResolvedFakeApi,
+        hook_address: u64,
+        api_index: usize,
+    ) -> Result<Step> {
+        tracing::trace!(
+            api_index = api_index,
+            api = %format!(
+                "{}!{}",
+                resolved.library.as_ref(),
+                resolved.name.as_ref()
+            ),
+            "host API stop"
+        );
+        if self.profile_enabled {
+            self.profile.inc_host_stops();
+        }
+        let export_key = if self.profile_enabled {
+            Some(format!(
+                "{}!{}",
+                resolved.library.as_ref(),
+                resolved.name.as_ref()
+            ))
+        } else {
+            None
+        };
+
+        if resolved.traits.exit_process() {
+            let handler_t0 = self.profile_enabled.then(Instant::now);
+            let exit_code_raw = core
+                .engine()
+                .read_rcx()
+                .context("failed to read RCX for ExitProcess")?;
+            let exit_code = u32::try_from(exit_code_raw & u64::from(u32::MAX))
+                .context("ExitProcess code does not fit u32")?;
+            self.events.push(EntryTraceEvent {
+                index: api_index,
+                library: resolved.library.clone().into(),
+                name: resolved.name.clone().into(),
+                fake_target_va: hook_address,
+                handled: true,
+                return_value: None,
+                return_address: None,
+            });
+            if let Some(t0) = handler_t0 {
+                self.profile
+                    .record_handler(t0.elapsed().as_nanos(), false, export_key.as_deref());
+            }
+            guard.kernel.sync.process_dying = true;
+            // Flush buffered CRT console output (printf/puts buffer in the
+            // guest stream; fwrite bypasses it). Windows flushes stdout at
+            // process exit — without this, trailing printf output is silently
+            // lost.
+            guard.flush_console();
+            // A non-zero exit code is a failure signal — log it so a live run
+            // shows WHY the guest stopped, not just the bare code (micro
+            // self-tests exit with the failing stage's code and trace the
+            // reason through OutputDebugStringA before exiting).
+            if exit_code != 0 {
+                tracing::error!(
+                    exit_code,
+                    "guest exited with a non-zero code (see the guest's OutputDebugStringA trace for the failing stage)"
+                );
+            }
+            return Ok(Step::Stop(EntryTraceTermination::ExitProcess {
+                code: exit_code,
+            }));
+        }
+
+        if resolved.traits.fast_void_sync() {
+            let handler_t0 = self.profile_enabled.then(Instant::now);
+            core.engine()
+                .return_from_win64_api(0)
+                .context("failed to return from fast synchronization API")?;
+            if let Some(t0) = handler_t0 {
+                self.profile
+                    .record_handler(t0.elapsed().as_nanos(), true, export_key.as_deref());
+            }
+            self.noisy_api = self.noisy_api.saturating_add(1);
+            // Publish handler writes back to the engine's GS-relative TEB slot.
+            guard.publish_last_error_to_guest(core.engine());
+            return Ok(Step::Next);
+        }
+
+        if resolved.winapi_id.is_some() && resolved.traits.fast_sync() {
+            // Fast host sync (HeapAlloc / HeapFree / MultiByteToWideChar): one
+            // dispatch tail. Dense-id dispatch (the trait is only assigned to
+            // WinApiId exports), noisy unbilled accounting, no event
+            // journaling, and last-error publication — the trailing publish is
+            // what keeps a failed MultiByteToWideChar visible to a guest
+            // GetLastError stub (its engine's GS-relative TEB read, no host
+            // stop).
+            let handler_t0 = self.profile_enabled.then(Instant::now);
+            {
+                let st = &mut *guard;
+                core.run_handler(st, resolved)?;
+            }
+            if let Some(t0) = handler_t0 {
+                self.profile
+                    .record_handler(t0.elapsed().as_nanos(), true, export_key.as_deref());
+            }
+            self.noisy_api = self.noisy_api.saturating_add(1);
+            guard.publish_last_error_to_guest(core.engine());
+            return Ok(Step::Next);
+        }
+
+        let handler_t0 = self.profile_enabled.then(Instant::now);
+        let dispatch_result = core.run_handler(&mut guard, resolved);
+        let handler_ns = handler_t0.map(|t0| t0.elapsed().as_nanos()).unwrap_or(0);
+
+        match dispatch_result {
+            Ok(handler_result) => {
+                if resolved.traits.noisy() {
+                    if self.profile_enabled {
+                        self.profile
+                            .record_handler(handler_ns, true, export_key.as_deref());
+                    }
+                    self.noisy_api = self.noisy_api.saturating_add(1);
+                } else {
+                    if self.profile_enabled {
+                        self.profile
+                            .record_handler(handler_ns, false, export_key.as_deref());
+                    }
+                    self.charged_api = self.charged_api.saturating_add(1);
+                    self.events.push(EntryTraceEvent {
+                        index: api_index,
+                        library: resolved.library.clone().into(),
+                        name: resolved.name.clone().into(),
+                        fake_target_va: hook_address,
+                        handled: true,
+                        return_value: Some(handler_result.return_value),
+                        return_address: Some(handler_result.return_address),
+                    });
+                }
+                guard.publish_last_error_to_guest(core.engine());
+                journal_api_return(
+                    api_index,
+                    resolved.library.as_ref(),
+                    resolved.name.as_ref(),
+                    core.engine(),
+                    handler_result.return_value,
+                    handler_result.return_address,
+                );
+                Ok(Step::Next)
+            }
+            Err(error) => {
+                if self.profile_enabled {
+                    self.profile
+                        .record_handler(handler_ns, false, export_key.as_deref());
+                }
+                // Owned downcast: the print-job arm MOVES its `PrintJobRequest`
+                // (page canvases ~34 MB each) into the bridge — a reference
+                // would force a clone. The consumed error is restored for the
+                // unsupported-API diagnostic below.
+                match error.downcast::<WinApiControlSignal>() {
+                    Ok(WinApiControlSignal::WaitingForMessage) => {
+                        *self.next_api_index = self
+                            .next_api_index
+                            .checked_sub(1)
+                            .context("runtime API index underflow after message yield")?;
+                        // The message queue is empty and no idle messages
+                        // (timers / paints) remain to synthesize — every
+                        // WM_PAINT of this repaint cycle has been dispatched,
+                        // so the coalesced publishes are complete. Emit one
+                        // frame per full cycle (parent + children) instead of
+                        // one per dispatch, which published child-less
+                        // intermediate frames during a resize.
+                        //
+                        // Drain unconditionally — also while a guest callback
+                        // is in flight. A modal dialog opened from a bridged
+                        // WM_COMMAND (button click → guest WndProc →
+                        // DialogBoxParam) runs its in-guest modal GetMessage
+                        // loop INSIDE that callback; skipping the drain here
+                        // leaves the dialog's painted frame (and the button's
+                        // unpressed repaint) unpublished until the callback
+                        // pops — the dialog never appears. The empty-queue
+                        // quiescence IS the cycle-complete point regardless of
+                        // callback nesting, and full-frame publishes make the
+                        // emitted snapshot always coherent.
+                        guard.present().drain_pending_publishes();
+                        // The pull half of the repaint latch: republish every
+                        // top-level whose content revision advanced since its
+                        // last publish. A mutation that painted this cycle was
+                        // already published by the drain (its surface buffer
+                        // is now empty, so the publish no-ops); a mutation
+                        // that produced no deferred publish still reaches the
+                        // host here.
+                        guard.present().reconcile_and_publish();
+                        Ok(Step::Stop(EntryTraceTermination::WaitingForMessage))
+                    }
+                    Ok(WinApiControlSignal::GuestCallbackRequested { request }) => {
+                        self.charged_api = self.charged_api.saturating_add(1);
+                        drop(guard);
+                        // Intern once per unique outer API name; every
+                        // subsequent bridged message clones the cached Arc
+                        // (refcount bump) instead of allocating a fresh Arc
+                        // box + string copy per message.
+                        let outer_library = self.intern_outer_api_name(resolved.library.clone());
+                        let outer_name = self.intern_outer_api_name(resolved.name.clone());
+                        self.events.push(EntryTraceEvent {
+                            index: api_index,
+                            library: Arc::clone(&outer_library),
+                            name: Arc::clone(&outer_name),
+                            fake_target_va: hook_address,
+                            handled: true,
+                            return_value: None,
+                            return_address: None,
+                        });
+                        if let Err(error) = self.begin_guest_callback(
+                            core,
+                            request,
+                            outer_library,
+                            outer_name,
+                            hook_address,
+                        ) {
+                            return Ok(Step::Stop(EntryTraceTermination::RuntimeStop(format!(
+                                "failed to begin guest callback: {error}"
+                            ))));
+                        }
+                        Ok(Step::Next)
+                    }
+                    Ok(WinApiControlSignal::EnumerationCallbackRequested {
+                        request,
+                        enumeration_id,
+                    }) => {
+                        self.charged_api = self.charged_api.saturating_add(1);
+                        drop(guard);
+                        let outer_library = self.intern_outer_api_name(resolved.library.clone());
+                        let outer_name = self.intern_outer_api_name(resolved.name.clone());
+                        self.events.push(EntryTraceEvent {
+                            index: api_index,
+                            library: Arc::clone(&outer_library),
+                            name: Arc::clone(&outer_name),
+                            fake_target_va: hook_address,
+                            handled: true,
+                            return_value: None,
+                            return_address: None,
+                        });
+                        // The first item's frame is installed relative to the
+                        // current RSP.
+                        let dispatch_rsp = match core.with_locked(|engine, _| engine.read_rsp()) {
+                            Ok(rsp) => rsp,
+                            Err(error) => {
+                                return Ok(Step::Stop(EntryTraceTermination::RuntimeStop(
+                                    format!("failed to read RSP for enum callback: {error}"),
+                                )));
+                            }
+                        };
+                        if let Err(error) = self.begin_guest_enum_callback(
+                            core,
+                            request,
+                            enumeration_id,
+                            outer_library,
+                            outer_name,
+                            hook_address,
+                            dispatch_rsp,
+                        ) {
+                            return Ok(Step::Stop(EntryTraceTermination::RuntimeStop(format!(
+                                "failed to begin enum callback: {error}"
+                            ))));
+                        }
+                        Ok(Step::Next)
+                    }
+                    Ok(WinApiControlSignal::FileDialogBridgeRequested { request }) => {
+                        // The native panel (rfd) blocks the MAIN thread for
+                        // the whole session, and the winit event loop needs
+                        // the SAME shared state lock to service frame/user
+                        // events while the panel is up (take_frame, reconcile,
+                        // hit-testing). Holding the lock across the bridge
+                        // deadlocks into the beachball, so drop it for the
+                        // whole panel session — the GuestCallbackRequested
+                        // pattern. Take the bridge out first (it lives behind
+                        // the lock) and restore it on return.
+                        let bridge = guard.window_state().file_dialog_bridge.take();
+                        drop(guard);
+                        let picked = bridge.as_ref().and_then(|bridge| bridge(&request));
+                        core.with_locked(|_, winapi_state| {
+                            if winapi_state.kernel.threads.active.tid != self.primary_tid {
+                                winapi_state.kernel.threads.activate(self.primary_tid);
+                            }
+                            let window_state = winapi_state.window_state();
+                            window_state.file_dialog_bridge = bridge;
+                            if let Some(pending) = window_state.pending_native_file_dialog.as_mut()
+                            {
+                                pending.pick = picked;
+                            }
+                        });
+                        // Continue: the engine re-executes the fake API stop,
+                        // the handler re-enters and writes the pick back.
+                        Ok(Step::Next)
+                    }
+                    Ok(WinApiControlSignal::MessageBoxBridgeRequested { request }) => {
+                        // The native alert (rfd) blocks the MAIN thread for
+                        // the whole session, and the winit event loop needs
+                        // the SAME shared state lock to service frame/user
+                        // events while the alert is up (take_frame, reconcile,
+                        // hit-testing). Holding the lock across the bridge
+                        // deadlocks into the beachball (the confirm-dialog
+                        // hang), so drop it for the whole alert session — the
+                        // GuestCallbackRequested pattern, mirroring the
+                        // file-dialog arm above. Take the bridge out first (it
+                        // lives behind the lock) and restore it on return.
+                        let bridge = guard.present().message_box_bridge.take();
+                        drop(guard);
+                        let picked = bridge.as_ref().map(|bridge| {
+                            bridge(&request.caption, &request.text, request.message_box_type)
+                        });
+                        core.with_locked(|_, winapi_state| {
+                            if winapi_state.kernel.threads.active.tid != self.primary_tid {
+                                winapi_state.kernel.threads.activate(self.primary_tid);
+                            }
+                            winapi_state.present().message_box_bridge = bridge;
+                            if let Some(pending) = winapi_state
+                                .window_state()
+                                .pending_native_message_box
+                                .as_mut()
+                            {
+                                pending.pick = picked;
+                            }
+                        });
+                        Ok(Step::Next)
+                    }
+                    Ok(WinApiControlSignal::PrintDialogBridgeRequested { request }) => {
+                        // The native print panel (NSPrintPanel) blocks the
+                        // MAIN thread for the whole session, and the winit
+                        // event loop needs the SAME shared state lock to
+                        // service frame/user events while the panel is up.
+                        // Holding the lock across the bridge deadlocks into
+                        // the beachball, so drop it for the whole panel
+                        // session — the GuestCallbackRequested pattern,
+                        // mirroring the file-dialog arm above. Take the
+                        // bridge out first (it lives behind the lock) and
+                        // restore it on return.
+                        let bridge = guard.window_state().print_dialog_bridge.take();
+                        drop(guard);
+                        let picked = bridge.as_ref().and_then(|bridge| bridge(&request));
+                        core.with_locked(|_, winapi_state| {
+                            if winapi_state.kernel.threads.active.tid != self.primary_tid {
+                                winapi_state.kernel.threads.activate(self.primary_tid);
+                            }
+                            let window_state = winapi_state.window_state();
+                            window_state.print_dialog_bridge = bridge;
+                            if let Some(pending) = window_state.pending_native_print_dialog.as_mut()
+                            {
+                                pending.pick = picked;
+                            }
+                        });
+                        Ok(Step::Next)
+                    }
+                    Ok(WinApiControlSignal::PageSetupBridgeRequested { request }) => {
+                        // The native page-layout panel (NSPageLayout) blocks
+                        // the MAIN thread for the whole session, and the winit
+                        // event loop needs the SAME shared state lock to
+                        // service frame/user events while the panel is up.
+                        // Holding the lock across the bridge deadlocks into
+                        // the beachball, so drop it for the whole panel
+                        // session — the print-dialog arm above. Take the
+                        // bridge out first (it lives behind the lock) and
+                        // restore it on return.
+                        let bridge = guard.window_state().page_setup_dialog_bridge.take();
+                        drop(guard);
+                        let picked = bridge.as_ref().and_then(|bridge| bridge(&request));
+                        core.with_locked(|_, winapi_state| {
+                            if winapi_state.kernel.threads.active.tid != self.primary_tid {
+                                winapi_state.kernel.threads.activate(self.primary_tid);
+                            }
+                            let window_state = winapi_state.window_state();
+                            window_state.page_setup_dialog_bridge = bridge;
+                            if let Some(pending) = window_state.pending_native_page_setup.as_mut() {
+                                pending.pick = picked;
+                            }
+                        });
+                        Ok(Step::Next)
+                    }
+                    Ok(WinApiControlSignal::PrintJobBridgeRequested { request }) => {
+                        // The native NSPrintOperation blocks the MAIN thread
+                        // for the whole print session, and the winit event
+                        // loop needs the SAME shared state lock to service
+                        // frame/user events while the operation runs. Holding
+                        // the lock across the bridge deadlocks into the
+                        // beachball, so drop it for the whole operation — the
+                        // GuestCallbackRequested pattern, mirroring the
+                        // print-dialog arm above. Take the bridge out first
+                        // (it lives behind the lock) and restore it on return.
+                        let bridge = guard.window_state().print_job_bridge.take();
+                        drop(guard);
+                        // The request is moved in BY VALUE (the ~34 MB page
+                        // canvases travel straight into the native pipeline —
+                        // never cloned).
+                        let succeeded = bridge.as_ref().map(|bridge| bridge(request));
+                        core.with_locked(|_, winapi_state| {
+                            if winapi_state.kernel.threads.active.tid != self.primary_tid {
+                                winapi_state.kernel.threads.activate(self.primary_tid);
+                            }
+                            let window_state = winapi_state.window_state();
+                            window_state.print_job_bridge = bridge;
+                            if let Some(pending) = window_state.pending_native_print_job.as_mut() {
+                                pending.success = succeeded;
+                            }
+                        });
+                        Ok(Step::Next)
+                    }
+                    Ok(WinApiControlSignal::ChildProcessSpawnRequested {
+                        host_path,
+                        guest_args,
+                        // Informational today: the child always builds the
+                        // standard WIE guest env.
+                        inherit_environment: _,
+                    }) => {
+                        // Spawn a child guest process: the child gets its OWN
+                        // RuntimeSession (engine + WinApiState — never shared
+                        // with the parent) registered as a Process kernel
+                        // object in THIS parent's handle table, so the
+                        // parent's GetExitCodeProcess / WaitForSingleObject /
+                        // OpenProcess resolve it. The wrapper thread is the
+                        // single caller of ProcessObject::finish (after
+                        // run_until_stop returns — ANY termination, not just
+                        // ExitProcess), so a crashing child cannot hang a
+                        // waiting parent.
+                        //
+                        // Snapshot the parent's volume roots while the state
+                        // lock is held so the child sees the same C:\ / D:\
+                        // mapping.
+                        let (bottle_root, drive_d_root) = {
+                            let st = &mut *guard;
+                            (
+                                st.file_io.volumes.bottle_root.clone(),
+                                st.file_io.volumes.drive_d_root.clone(),
+                            )
+                        };
+                        drop(guard);
+
+                        // Build the child session OUTSIDE the parent's state
+                        // lock: it is fully self-contained (own engine,
+                        // WinApiState, guest memory). The session API does not
+                        // accept a shared JitShared, so each child builds its
+                        // own compilation cache (correctness-neutral; a
+                        // per-process cache).
+                        let build = crate::RuntimeSession::new_with_options(
+                            &host_path,
+                            wie_winapi::MessageQueueIdlePolicy::ExitOnIdle,
+                            crate::DEFAULT_LAYOUT,
+                            crate::SessionOptions {
+                                bottle_root,
+                                drive_d_root,
+                                guest_args,
+                                ..crate::SessionOptions::default()
+                            },
+                        );
+
+                        // (hProcess, hThread, dwProcessId, dwThreadId).
+                        let spawn_outcome: Option<(u64, u64, u32, u32)> = match build {
+                            Ok(mut child) => {
+                                let pid =
+                                    core.with_locked(|_, st| st.kernel.sync.alloc_child_pid());
+                                let (h_process, proc_obj) =
+                                    core.with_locked(|_, st| st.kernel.sync.register_process(pid));
+                                let (h_thread, thread_obj) = core.with_locked(|_, st| {
+                                    st.kernel.sync.register_detached_thread(pid)
+                                });
+                                let spawned = std::thread::Builder::new()
+                                    .name(format!("wie-child-{pid}"))
+                                    .stack_size(8 * 1024 * 1024)
+                                    .spawn(move || {
+                                        let summary = child.run_until_stop(super::MAX_API_QUANTUM);
+                                        let code = match &summary {
+                                            Ok(s) => match &s.termination {
+                                                EntryTraceTermination::ExitProcess { code } => {
+                                                    *code
+                                                }
+                                                _ => 1,
+                                            },
+                                            Err(error) => {
+                                                tracing::error!(
+                                                    pid,
+                                                    error = %error,
+                                                    "child session stopped with an error"
+                                                );
+                                                1
+                                            }
+                                        };
+                                        tracing::info!(
+                                            target: "wiegui",
+                                            pid,
+                                            code,
+                                            "child guest process exited"
+                                        );
+                                        proc_obj.finish(code);
+                                        thread_obj.finish(code);
+                                    });
+                                match spawned {
+                                    Ok(_) => {
+                                        // JoinHandle dropped: the child host
+                                        // thread is detached and notifies the
+                                        // Process object when it finishes.
+                                        Some((h_process, h_thread, pid, self.primary_tid))
+                                    }
+                                    Err(error) => {
+                                        tracing::error!(
+                                            pid,
+                                            error = %error,
+                                            "failed to spawn child host thread"
+                                        );
+                                        core.with_locked(|_, st| {
+                                            st.kernel
+                                                .sync
+                                                .objects
+                                                .remove(&KernelHandle::from(h_process));
+                                            st.kernel
+                                                .sync
+                                                .objects
+                                                .remove(&KernelHandle::from(h_thread));
+                                            st.kernel.sync.process_by_pid.remove(&pid);
+                                        });
+                                        None
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    path = %host_path.display(),
+                                    error = %error,
+                                    "failed to build child session"
+                                );
+                                None
+                            }
+                        };
+
+                        if let Some((h_process, h_thread, pid, tid)) = spawn_outcome {
+                            let recorded = core.with_locked(|_, winapi_state| {
+                                if winapi_state.kernel.threads.active.tid != self.primary_tid {
+                                    winapi_state.kernel.threads.activate(self.primary_tid);
+                                }
+                                winapi_state
+                                    .window_state()
+                                    .set_child_spawn_result(h_process, h_thread, pid, tid)
+                            });
+                            if !recorded {
+                                // The write-back slot vanished (the handler's
+                                // re-entry raced a teardown): the guest will
+                                // fail closed.
+                                tracing::warn!(
+                                    pid,
+                                    "child spawned but PROCESS_INFORMATION write-back slot missing"
+                                );
+                            }
+                        }
+                        // Continue: the engine re-executes the fake API stop,
+                        // the handler re-enters, takes the pending record, and
+                        // writes PROCESS_INFORMATION (a `None` result reads as
+                        // FALSE + ERROR_INVALID_PARAMETER).
+                        Ok(Step::Next)
+                    }
+                    Ok(WinApiControlSignal::HostPark { reason }) => {
+                        // Per-thread engine: primary regs are already in
+                        // `engine`; only persist thread bookkeeping for TLS
+                        // tracking.
+                        guard.kernel.threads.save_active();
+                        // The guest is about to block on a wait — flush any
+                        // coalesced publishes so the frame reaches the host
+                        // before the park. Skipped while a guest callback is
+                        // in flight (the callback owns the paint cycle).
+                        if self.pending_callbacks.is_empty() {
+                            guard.present().drain_pending_publishes();
+                        }
+                        Ok(Step::Park(reason))
+                    }
+                    Ok(WinApiControlSignal::ExitThread { code }) => {
+                        // Flush pending publishes before the thread exits so
+                        // the last painted frame is not lost.
+                        if self.pending_callbacks.is_empty() {
+                            guard.present().drain_pending_publishes();
+                        }
+                        Ok(Step::ExitThread(code))
+                    }
+                    Err(error) => {
+                        let api = format!(
+                            "{}!{}: {error}",
+                            resolved.library.as_ref(),
+                            resolved.name.as_ref(),
+                        );
+                        // Surface the failure through tracing so a live run
+                        // (console or GUI) shows WHY the session stopped — the
+                        // guest-fault family (e.g. an unsupported UCRT export)
+                        // is otherwise only visible in the entry-trace summary
+                        // and headless reproductions.
+                        tracing::error!(
+                            api = %api,
+                            rip = format_args!("{:#x}", hook_address),
+                            "unsupported API (session will stop)"
+                        );
+                        self.events.push(EntryTraceEvent {
+                            index: api_index,
+                            library: resolved.library.clone().into(),
+                            name: resolved.name.clone().into(),
+                            fake_target_va: hook_address,
+                            handled: false,
+                            return_value: None,
+                            return_address: None,
+                        });
+                        Ok(Step::Stop(EntryTraceTermination::UnsupportedApi(api)))
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl super::RuntimeSession {
+    /// Runs the guest until it yields, terminates, reaches an unsupported API,
+    /// or processes `max_api` additional API calls.
+    pub fn run_until_stop(&mut self, max_api: usize) -> Result<RuntimeRunSummary> {
+        let primary_tid = self.process.primary_tid();
         let dll_main_return_va = wie_winapi::dll_main_return_trampoline_va();
-        let mut dll_main_index = 0_usize;
-        let static_dll_mains: Vec<wie_winapi::dll_loader::StaticDllMain> = if self.entry_reached {
+        let static_dll_mains: Vec<dll_loader::StaticDllMain> = if self.entry_reached {
             Vec::new()
         } else {
             self.process.static_dll_mains().to_vec()
         };
-        if max_api > 0
-            && let Some(first) = static_dll_mains.first()
-        {
-            wie_winapi::dll_loader::prepare_dll_main_call(
-                &mut *self.process.engine,
-                first.image_base,
-                first.entry_rva,
-                wie_winapi::dll_loader::DLL_PROCESS_ATTACH,
-                1, // lpvReserved: non-zero marks a static (loader) call.
-                dll_main_return_va,
-            )
-            .context("failed to prepare first static DllMain call")?;
-        }
 
         // Ceiling on API stops that did not charge toward `max_api` (noisy
         // fast-path returns): 50× the budget, at least a fixed 50k slack.
         const NOISY_API_FACTOR: usize = 50;
         const NOISY_API_SLACK: usize = 50_000;
-
-        let mut events: Vec<crate::trace::EntryTraceEvent> = Vec::new();
-        let mut termination = EntryTraceTermination::ApiLimit;
-
         let max_noisy_api = max_api
             .saturating_mul(NOISY_API_FACTOR)
             .max(max_api.saturating_add(NOISY_API_SLACK));
-        let mut charged_api = 0_usize;
-        let mut noisy_api = 0_usize;
 
-        'outer: while charged_api < max_api {
-            if noisy_api >= max_noisy_api {
+        let mut events: Vec<EntryTraceEvent> = Vec::new();
+        let mut termination = EntryTraceTermination::ApiLimit;
+
+        let mut hooks = SessionPumpHooks::new(
+            self.entry_point_va.0,
+            &mut self.entry_reached,
+            &mut self.next_api_index,
+            &mut self.no_hook_slices,
+            &mut self.pending_callbacks,
+            &mut self.outer_api_names,
+            self.profile_enabled,
+            &mut self.profile,
+            &mut events,
+            static_dll_mains,
+            dll_main_return_va,
+            primary_tid,
+        );
+
+        // Static-dependency DllMain(PROCESS_ATTACH) init phase: Windows calls
+        // each static dep's DllMain in load order (dependencies first) BEFORE
+        // the exe entry point. Skipped when the budget is zero (preparing
+        // would push a return address nothing ever pops).
+        if max_api > 0 {
+            let mut core = QuantumCore::new(
+                &mut *self.process.engine,
+                &self.process.config,
+                &self.process.shared_winapi,
+                primary_tid,
+                &self.process.lock_wait_stats,
+            )?;
+            hooks.prepare_first_quantum(&mut core)?;
+        }
+
+        'outer: while hooks.charged_api < max_api {
+            if hooks.noisy_api >= max_noisy_api {
                 termination = EntryTraceTermination::ApiLimit;
                 break;
             }
 
             // Start any CreateThread workers before the next quantum.
             self.process.drain_spawns()?;
-            let index = self.next_api_index;
-            self.next_api_index = self
-                .next_api_index
-                .checked_add(1)
-                .context("runtime API index overflow")?;
 
-            // Outcome of one locked quantum (locks dropped before host park).
-            enum Quantum {
-                Continue,
-                Break,
-                /// Park then retry same guest API (CS) or complete wait return.
-                Park(wie_winapi::HostParkReason),
-                /// Worker/primary ExitThread.
-                ExitThread(u32),
-            }
-
-            let mut quantum = Quantum::Continue;
-            let mut break_term: Option<EntryTraceTermination> = None;
-
-            // Activate primary under WinAPI lock only — pure guest run must not
-            // hold `shared_winapi` so worker quanta can overlap (per-thread engines).
-            {
-                let mut st = self
-                    .process
-                    .shared_winapi
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner());
-                if st.kernel.threads.active.tid != primary_tid {
-                    st.kernel.threads.activate(primary_tid);
-                }
-            }
-
-            let begin = {
-                let engine = &mut *self.process.engine;
-                let current_rip = engine
-                    .read_rip()
-                    .context("failed to read RIP before runtime step")?;
-                if current_rip == 0 {
-                    if !self.entry_reached {
-                        self.entry_reached = true;
-                        tracing::info!(
-                            target: "wiegui",
-                            entry = self.entry_point_va.0,
-                            "guest entry reached"
-                        );
-                    }
-                    self.entry_point_va.0
-                } else {
-                    current_rip
-                }
+            // One shared quantum — activate → run → resolve → dispatch →
+            // park/finish decision. The primary-only hooks (DllMain phase,
+            // callbacks, bridges, journaling) live in `hooks`; the core owns
+            // the lock ordering, active-TID rules, and instruction budget.
+            // The core is scoped so its engine borrow drops before the park
+            // arm touches `self.process` again.
+            let step = {
+                let mut core = QuantumCore::new(
+                    &mut *self.process.engine,
+                    &self.process.config,
+                    &self.process.shared_winapi,
+                    primary_tid,
+                    &self.process.lock_wait_stats,
+                )?;
+                core.step(&mut hooks)?
             };
 
-            // Refresh the host-written guest clock table ahead of this
-            // quantum so the in-guest clock stubs (GetTickCount / timeGetTime
-            // / QPC / …) observe advancing values with no host stop. Frozen
-            // under `WIE_FIXED_CLOCK=1` — the table was written once at
-            // session init, so a guest busy-waiting on a constant never spins.
-            if !wie_winapi::kernel32::clock::clock_is_fixed() {
-                self.refresh_clock_table();
-            }
-
-            let emu_t0 = self.profile_enabled.then(Instant::now);
-            let hook_result = self.process.engine.run_until_stop(
-                begin,
-                0,
-                0,
-                instruction_budget,
-                layout.fake_api.base,
-                fake_api_end,
-            );
-            if let Some(t0) = emu_t0 {
-                self.profile.add_emu_ns(t0.elapsed().as_nanos());
-            }
-
-            {
-                let mut pair = self.process.lock_pair();
-                let (engine, winapi_state) = pair.both();
-                // Workers may have activated themselves while we ran pure guest
-                // code without the WinAPI lock. Reclaim primary identity before
-                // any dispatch that uses current_tid() (CS owner, TLS, waits).
-                if winapi_state.kernel.threads.active.tid != primary_tid {
-                    winapi_state.kernel.threads.activate(primary_tid);
-                }
-
-                let (hook, invalid_memory) = match hook_result {
-                    Ok(result) => (result.code, result.invalid_memory),
-                    Err(wie_cpu::CpuError::DivideByZero(div_rip)) => {
-                        match wie_winapi::seh::dispatch_hardware_fault(
-                            engine,
-                            winapi_state,
-                            wie_cpu::exception_code::INT_DIVIDE_BY_ZERO,
-                            div_rip,
-                        ) {
-                            Ok(result) => {
-                                tracing::trace!(
-                                    rip = div_rip,
-                                    resume_rip = result.return_value,
-                                    "divide-by-zero handled by SEH"
-                                );
-                                continue;
-                            }
-                            Err(_) => {
-                                tracing::debug!(rip = div_rip, "unhandled divide-by-zero");
-                                let reason = format!("integer divide by zero at rip={div_rip:#x}");
-                                break_term = Some(EntryTraceTermination::RuntimeStop(reason));
-                                quantum = Quantum::Break;
-                            }
-                        }
-                        (
-                            wie_cpu::CodeHookOutcome::default(),
-                            wie_cpu::InvalidMemoryAccess::default(),
-                        )
-                    }
-                    Err(error) => {
-                        let rip = engine
-                            .read_rip()
-                            .context("failed to read RIP after runtime emulation error")?;
-                        let rsp = engine
-                            .read_rsp()
-                            .context("failed to read RSP after runtime emulation error")?;
-                        let mut slot = [0_u8; 8];
-                        let slot_va = rsp.wrapping_add(0x160);
-                        let slot_val = engine
-                            .mem_read(slot_va, &mut slot)
-                            .ok()
-                            .map(|()| u64::from_le_bytes(slot));
-                        let last_api = match events.last() {
-                            Some(e) => format!("{}!{}", e.library.as_ref(), e.name.as_ref()),
-                            None => "-".into(),
-                        };
-                        break_term = Some(EntryTraceTermination::RuntimeStop(format!(
-                            "emulation error (api_index={index}, last_api={last_api}): {error}; \
-                             rip={rip:#018x}; rsp={rsp:#018x}; [rsp+0x160]={slot_val:?}"
-                        )));
-                        quantum = Quantum::Break;
-                        (
-                            wie_cpu::CodeHookOutcome::default(),
-                            wie_cpu::InvalidMemoryAccess::default(),
-                        )
-                    }
-                };
-
-                if matches!(quantum, Quantum::Break) {
-                    // already set break_term
-                } else if invalid_memory.hit {
-                    // Route through guest SEH before terminating.
-                    match wie_winapi::seh::dispatch_hardware_fault(
-                        engine,
-                        winapi_state,
-                        invalid_memory.exception_code,
-                        invalid_memory.address,
-                    ) {
-                        Ok(result) => {
-                            // Handler found — guest continues at catch block.
-                            tracing::trace!(
-                                exc = invalid_memory.exception_code,
-                                addr = invalid_memory.address,
-                                resume_rip = result.return_value,
-                                "hardware fault handled by guest SEH"
-                            );
-                            continue;
-                        }
-                        Err(_unhandled) => {
-                            tracing::debug!(
-                                exc = invalid_memory.exception_code,
-                                "unhandled hardware fault"
-                            );
-                            break_term = Some(invalid_memory_diagnostic(engine, &invalid_memory)?);
-                            quantum = Quantum::Break;
-                        }
-                    }
-                } else if !hook.hit {
-                    self.no_hook_slices = self
-                        .no_hook_slices
-                        .checked_add(1)
-                        .context("no-hook slice count overflow")?;
-                    if self.no_hook_slices == 1
-                        || self.no_hook_slices.is_multiple_of(5)
-                        || self.no_hook_slices == no_hook_limit
-                    {
-                        let rip = engine.read_rip().context("rip after no-hook")?;
-                        let rsp = engine.read_rsp().context("rsp after no-hook")?;
-                        let rax = engine.read_rax().context("rax after no-hook")?;
-                        let rcx = engine.read_rcx().context("rcx after no-hook")?;
-                        let rdx = engine.read_rdx().context("rdx after no-hook")?;
-                        tracing::debug!(
-                            slice = self.no_hook_slices,
-                            limit = no_hook_limit,
-                            begin,
-                            rip,
-                            rsp,
-                            rax,
-                            rcx,
-                            rdx,
-                            "runtime no-hook slice"
-                        );
-                    }
-                    if self.no_hook_slices >= no_hook_limit {
-                        let rip = engine.read_rip().context("rip after no-hook")?;
-                        let rsp = engine.read_rsp().context("rsp after no-hook")?;
-                        let rax = engine.read_rax().context("rax after no-hook")?;
-                        let rcx = engine.read_rcx().context("rcx after no-hook")?;
-                        let rdx = engine.read_rdx().context("rdx after no-hook")?;
-                        break_term = Some(EntryTraceTermination::RuntimeStop(format!(
-                            "emulation stopped without hitting fake API hook after {} slices: \
-                             begin={begin:#018x}; rip={rip:#018x}; rsp={rsp:#018x}; \
-                             rax={rax:#018x}; rcx={rcx:#018x}; rdx={rdx:#018x}; \
-                             budget={instruction_budget}",
-                            self.no_hook_slices,
-                        )));
-                        quantum = Quantum::Break;
-                    } else {
-                        quantum = Quantum::Continue;
-                    }
-                } else {
-                    self.no_hook_slices = 0;
-
-                    // A statically-loaded dependency's DllMain returned. RAX
-                    // carries the BOOL result; FALSE aborts process init
-                    // (Windows STATUS_DLL_INIT_FAILED semantics) — the exe
-                    // entry never runs.
-                    if !self.entry_reached && hook.address == dll_main_return_va {
-                        let dll_ok = engine
-                            .read_rax()
-                            .context("failed to read RAX after static DllMain")?;
-                        let name = static_dll_mains
-                            .get(dll_main_index)
-                            .map(|m| m.name.as_str())
-                            .unwrap_or("?");
-                        if dll_ok == 0 {
-                            termination = EntryTraceTermination::RuntimeStop(format!(
-                                "{name}!DllMain returned FALSE (DLL_PROCESS_ATTACH) \
-                                 — process init aborted"
-                            ));
-                            break 'outer;
-                        }
-                        dll_main_index = dll_main_index
-                            .checked_add(1)
-                            .context("static DllMain index overflow")?;
-                        if let Some(next) = static_dll_mains.get(dll_main_index) {
-                            wie_winapi::dll_loader::prepare_dll_main_call(
-                                engine,
-                                next.image_base,
-                                next.entry_rva,
-                                wie_winapi::dll_loader::DLL_PROCESS_ATTACH,
-                                1,
-                                dll_main_return_va,
-                            )
-                            .context("failed to prepare next static DllMain call")?;
-                        } else {
-                            // Init phase complete: reset RIP so the next
-                            // iteration dispatches the exe entry point.
-                            engine
-                                .write_rip(0)
-                                .context("failed to reset RIP after static DllMain phase")?;
-                        }
-                        continue 'outer;
-                    }
-
-                    if hook.address == layout.callback_return_trampoline_va {
-                        // complete_guest_callback needs &mut self — handle outside.
-                        // Save marker via special path: use pending flag.
-                        drop(pair);
-                        match self.complete_guest_callback() {
-                            Ok(completion) => {
-                                charged_api = charged_api.saturating_add(1);
-                                events.push(EntryTraceEvent {
-                                    index,
-                                    library: completion.outer_library,
-                                    name: completion.outer_name,
-                                    fake_target_va: completion.outer_fake_va,
-                                    handled: true,
-                                    return_value: Some(completion.return_value),
-                                    return_address: Some(completion.return_address),
-                                });
-                                self.publish_last_error_to_guest();
-                                // Do NOT publish here. A guest WndProc
-                                // is one message of a repaint cycle (parent
-                                // BitBlt → child control paints across several
-                                // messages); publishing mid-cycle would emit a
-                                // frame with the children still missing. The
-                                // drain happens once at the empty-queue idle
-                                // boundary (WaitingForMessage) — one frame per
-                                // full cycle.
-                                continue 'outer;
-                            }
-                            Err(error) => {
-                                termination = EntryTraceTermination::RuntimeStop(format!(
-                                    "failed to complete guest callback: {error}"
-                                ));
-                                break 'outer;
-                            }
-                        }
-                    }
-
-                    // SEH / C++ EH continuation (UnwindMap actions, MSVC catch funclets).
-                    let seh_handled = if hook.address == wie_winapi::seh_continue_trampoline_va() {
-                        match wie_winapi::seh::continue_pending(engine, winapi_state) {
-                            Ok(result) => {
-                                charged_api = charged_api.saturating_add(1);
-                                events.push(EntryTraceEvent {
-                                    index,
-                                    library: "ntdll.dll".into(),
-                                    name: "SehContinue".into(),
-                                    fake_target_va: hook.address,
-                                    handled: true,
-                                    return_value: Some(result.return_value),
-                                    return_address: Some(result.return_address),
-                                });
-                                let err = winapi_state.process.last_error;
-                                if self.last_published_last_error != Some(err) {
-                                    let bytes = err.to_le_bytes();
-                                    if engine
-                                        .mem_write(crate::guest_stubs::TEB_LAST_ERROR_VA, &bytes)
-                                        .is_ok()
-                                    {
-                                        self.last_published_last_error = Some(err);
-                                    }
-                                }
-                                quantum = Quantum::Continue;
-                                true
-                            }
-                            Err(error) => {
-                                break_term = Some(EntryTraceTermination::RuntimeStop(format!(
-                                    "failed to continue SEH sequence: {error}"
-                                )));
-                                quantum = Quantum::Break;
-                                true
-                            }
-                        }
-                    } else {
-                        false
-                    };
-
-                    let resolve_t0 = self.profile_enabled.then(Instant::now);
-                    let resolved_opt = if seh_handled {
-                        None
-                    } else {
-                        resolve_fake_api_at(hook.address, &soft_apis)
-                    };
-                    if !seh_handled && resolved_opt.is_none() {
-                        break_term = Some(EntryTraceTermination::RuntimeStop(format!(
-                            "unresolved fake API at {:#018x}",
-                            hook.address,
-                        )));
-                        quantum = Quantum::Break;
-                    }
-
-                    if let Some(resolved) = resolved_opt {
-                        tracing::trace!(
-                            api_index = index,
-                            api = %format!(
-                                "{}!{}",
-                                resolved.library.as_ref(),
-                                resolved.name.as_ref()
-                            ),
-                            "host API stop"
-                        );
-                        if let Some(t0) = resolve_t0 {
-                            self.profile.add_resolve_ns(t0.elapsed().as_nanos());
-                        }
-
-                        if self.profile_enabled {
-                            self.profile.inc_host_stops();
-                        }
-
-                        let export_key = if self.profile_enabled {
-                            Some(format!(
-                                "{}!{}",
-                                resolved.library.as_ref(),
-                                resolved.name.as_ref()
-                            ))
-                        } else {
-                            None
-                        };
-
-                        {
-                            let mut teb_err = [0_u8; 4];
-                            if engine
-                                .mem_read(crate::guest_stubs::TEB_LAST_ERROR_VA, &mut teb_err)
-                                .is_ok()
-                            {
-                                winapi_state.process.last_error = u32::from_le_bytes(teb_err);
-                            }
-                        }
-
-                        if resolved.traits.exit_process() {
-                            let handler_t0 = self.profile_enabled.then(Instant::now);
-                            let exit_code_raw = engine
-                                .read_rcx()
-                                .context("failed to read RCX for ExitProcess")?;
-                            let exit_code = u32::try_from(exit_code_raw & u64::from(u32::MAX))
-                                .context("ExitProcess code does not fit u32")?;
-                            events.push(EntryTraceEvent {
-                                index,
-                                library: resolved.library.clone().into(),
-                                name: resolved.name.clone().into(),
-                                fake_target_va: hook.address,
-                                handled: true,
-                                return_value: None,
-                                return_address: None,
-                            });
-                            if let Some(t0) = handler_t0 {
-                                self.profile.record_handler(
-                                    t0.elapsed().as_nanos(),
-                                    false,
-                                    export_key.as_deref(),
-                                );
-                            }
-                            winapi_state.kernel.sync.process_dying = true;
-                            // Flush buffered CRT console output (printf/puts
-                            // buffer in the guest stream; fwrite bypasses it).
-                            // Windows flushes stdout at process exit — without
-                            // this, trailing printf output is silently lost.
-                            winapi_state.flush_console();
-                            // A non-zero exit code is a failure signal — log it
-                            // so a live run shows WHY the guest stopped, not
-                            // just the bare code (micro self-tests exit with
-                            // the failing stage's code and trace the reason
-                            // through OutputDebugStringA before exiting).
-                            if exit_code != 0 {
-                                tracing::error!(
-                                    exit_code,
-                                    "guest exited with a non-zero code (see the guest's OutputDebugStringA trace for the failing stage)"
-                                );
-                            }
-                            break_term =
-                                Some(EntryTraceTermination::ExitProcess { code: exit_code });
-                            quantum = Quantum::Break;
-                        } else if resolved.traits.fast_void_sync() {
-                            let handler_t0 = self.profile_enabled.then(Instant::now);
-                            engine
-                                .return_from_win64_api(0)
-                                .context("failed to return from fast synchronization API")?;
-                            if let Some(t0) = handler_t0 {
-                                self.profile.record_handler(
-                                    t0.elapsed().as_nanos(),
-                                    true,
-                                    export_key.as_deref(),
-                                );
-                            }
-                            noisy_api = noisy_api.saturating_add(1);
-                            // publish last error
-                            let err = winapi_state.process.last_error;
-                            if self.last_published_last_error != Some(err) {
-                                let bytes = err.to_le_bytes();
-                                if engine
-                                    .mem_write(crate::guest_stubs::TEB_LAST_ERROR_VA, &bytes)
-                                    .is_ok()
-                                {
-                                    self.last_published_last_error = Some(err);
-                                }
-                            }
-                            quantum = Quantum::Continue;
-                        } else if matches!(
-                            resolved.winapi_id,
-                            Some(wie_winapi::WinApiId::Kernel32Heapalloc)
-                        ) {
-                            let handler_t0 = self.profile_enabled.then(Instant::now);
-                            {
-                                let mut ctx = wie_winapi::HandlerContext::new(
-                                    engine,
-                                    environment,
-                                    winapi_state,
-                                );
-                                wie_winapi::kernel32::handle_heap_alloc(&mut ctx)?;
-                            }
-                            if let Some(t0) = handler_t0 {
-                                self.profile.record_handler(
-                                    t0.elapsed().as_nanos(),
-                                    true,
-                                    export_key.as_deref(),
-                                );
-                            }
-                            noisy_api = noisy_api.saturating_add(1);
-                            let err = winapi_state.process.last_error;
-                            if self.last_published_last_error != Some(err) {
-                                let bytes = err.to_le_bytes();
-                                if engine
-                                    .mem_write(crate::guest_stubs::TEB_LAST_ERROR_VA, &bytes)
-                                    .is_ok()
-                                {
-                                    self.last_published_last_error = Some(err);
-                                }
-                            }
-                            quantum = Quantum::Continue;
-                        } else if matches!(
-                            resolved.winapi_id,
-                            Some(wie_winapi::WinApiId::Kernel32Heapfree)
-                        ) {
-                            let handler_t0 = self.profile_enabled.then(Instant::now);
-                            {
-                                let mut ctx = wie_winapi::HandlerContext::new(
-                                    engine,
-                                    environment,
-                                    winapi_state,
-                                );
-                                wie_winapi::kernel32::handle_heap_free(&mut ctx)?;
-                            }
-                            if let Some(t0) = handler_t0 {
-                                self.profile.record_handler(
-                                    t0.elapsed().as_nanos(),
-                                    true,
-                                    export_key.as_deref(),
-                                );
-                            }
-                            noisy_api = noisy_api.saturating_add(1);
-                            let err = winapi_state.process.last_error;
-                            if self.last_published_last_error != Some(err) {
-                                let bytes = err.to_le_bytes();
-                                if engine
-                                    .mem_write(crate::guest_stubs::TEB_LAST_ERROR_VA, &bytes)
-                                    .is_ok()
-                                {
-                                    self.last_published_last_error = Some(err);
-                                }
-                            }
-                            quantum = Quantum::Continue;
-                        } else if matches!(
-                            resolved.winapi_id,
-                            Some(wie_winapi::WinApiId::Kernel32Multibytetowidechar)
-                        ) {
-                            let handler_t0 = self.profile_enabled.then(Instant::now);
-                            {
-                                let mut ctx = wie_winapi::HandlerContext::new(
-                                    engine,
-                                    environment,
-                                    winapi_state,
-                                );
-                                wie_winapi::kernel32::handle_multi_byte_to_wide_char(&mut ctx)?;
-                            }
-                            if let Some(t0) = handler_t0 {
-                                self.profile.record_handler(
-                                    t0.elapsed().as_nanos(),
-                                    true,
-                                    export_key.as_deref(),
-                                );
-                            }
-                            noisy_api = noisy_api.saturating_add(1);
-                            quantum = Quantum::Continue;
-                        } else {
-                            let handler_t0 = self.profile_enabled.then(Instant::now);
-                            let mut ctx =
-                                wie_winapi::HandlerContext::new(engine, environment, winapi_state);
-                            let dispatch_result = if let Some(id) = resolved.winapi_id {
-                                wie_winapi::dispatch_winapi_id(&mut ctx, id)
-                            } else {
-                                wie_winapi::dispatch_winapi(
-                                    &mut ctx,
-                                    &resolved.library,
-                                    &resolved.name,
-                                )
-                            };
-                            let handler_ns =
-                                handler_t0.map(|t0| t0.elapsed().as_nanos()).unwrap_or(0);
-
-                            match dispatch_result {
-                                Ok(handler_result) => {
-                                    if resolved.traits.noisy() {
-                                        if self.profile_enabled {
-                                            self.profile.record_handler(
-                                                handler_ns,
-                                                true,
-                                                export_key.as_deref(),
-                                            );
-                                        }
-                                        noisy_api = noisy_api.saturating_add(1);
-                                    } else {
-                                        if self.profile_enabled {
-                                            self.profile.record_handler(
-                                                handler_ns,
-                                                false,
-                                                export_key.as_deref(),
-                                            );
-                                        }
-                                        charged_api = charged_api.saturating_add(1);
-                                        events.push(EntryTraceEvent {
-                                            index,
-                                            library: resolved.library.clone().into(),
-                                            name: resolved.name.clone().into(),
-                                            fake_target_va: hook.address,
-                                            handled: true,
-                                            return_value: Some(handler_result.return_value),
-                                            return_address: Some(handler_result.return_address),
-                                        });
-                                    }
-                                    let err = winapi_state.process.last_error;
-                                    if self.last_published_last_error != Some(err) {
-                                        let bytes = err.to_le_bytes();
-                                        if engine
-                                            .mem_write(
-                                                crate::guest_stubs::TEB_LAST_ERROR_VA,
-                                                &bytes,
-                                            )
-                                            .is_ok()
-                                        {
-                                            self.last_published_last_error = Some(err);
-                                        }
-                                    }
-                                    journal_api_return(
-                                        index,
-                                        resolved.library.as_ref(),
-                                        resolved.name.as_ref(),
-                                        engine,
-                                        handler_result.return_value,
-                                        handler_result.return_address,
-                                    );
-                                    quantum = Quantum::Continue;
-                                }
-                                Err(error) => {
-                                    if self.profile_enabled {
-                                        self.profile.record_handler(
-                                            handler_ns,
-                                            false,
-                                            export_key.as_deref(),
-                                        );
-                                    }
-                                    // Owned downcast: the print-job arm MOVES its
-                                    // `PrintJobRequest` (page canvases ~34 MB each)
-                                    // into the bridge — a reference would force a
-                                    // clone. The consumed error is restored for the
-                                    // unsupported-API diagnostic below.
-                                    match error.downcast::<wie_winapi::WinApiControlSignal>() {
-                                    Ok(wie_winapi::WinApiControlSignal::WaitingForMessage) => {
-                                        self.next_api_index = self
-                                            .next_api_index
-                                            .checked_sub(1)
-                                            .context(
-                                                "runtime API index underflow after message yield",
-                                            )?;
-                                        // The message queue is empty and no
-                                        // idle messages (timers / paints) remain to
-                                        // synthesize — every WM_PAINT of this repaint
-                                        // cycle has been dispatched, so the coalesced
-                                        // publishes are complete. Emit one frame per
-                                        // full cycle (parent + children) instead of
-                                        // one per dispatch, which published
-                                        // child-less intermediate frames during a
-                                        // resize.
-                                        //
-                                        // Drain unconditionally — also while a guest
-                                        // callback is in flight. A modal dialog
-                                        // opened from a bridged WM_COMMAND (button
-                                        // click → guest WndProc → DialogBoxParam)
-                                        // runs its in-guest modal GetMessage loop
-                                        // INSIDE that callback; skipping the drain
-                                        // here leaves the dialog's painted frame (and
-                                        // the button's unpressed repaint) unpublished
-                                        // until the callback pops — the dialog never
-                                        // appears. The empty-queue quiescence IS the
-                                        // cycle-complete point regardless of callback
-                                        // nesting, and full-frame publishes make the
-                                        // emitted snapshot always coherent.
-                                        winapi_state.present().drain_pending_publishes();
-                                        // The pull half of the repaint latch:
-                                        // republish every top-level whose
-                                        // content revision advanced since its
-                                        // last publish. A mutation that painted
-                                        // this cycle was already published by
-                                        // the drain (its surface buffer is now
-                                        // empty, so the publish no-ops); a
-                                        // mutation that produced no deferred
-                                        // publish still reaches the host here.
-                                        winapi_state.present().reconcile_and_publish();
-                                        break_term =
-                                            Some(EntryTraceTermination::WaitingForMessage);
-                                        quantum = Quantum::Break;
-                                    }
-                                    Ok(
-                                        wie_winapi::WinApiControlSignal::GuestCallbackRequested {
-                                            request,
-                                        },
-                                    ) => {
-                                        charged_api = charged_api.saturating_add(1);
-                                        // begin_guest_callback needs full self — mark and handle after drop
-                                        drop(pair);
-                                        // Intern once per unique outer API name; every
-                                        // subsequent bridged message clones the cached
-                                        // Arc (refcount bump) instead of allocating a
-                                        // fresh Arc box + string copy per message.
-                                        let outer_library =
-                                            self.intern_outer_api_name(resolved.library);
-                                        let outer_name = self.intern_outer_api_name(resolved.name);
-                                        events.push(EntryTraceEvent {
-                                            index,
-                                            library: Arc::clone(&outer_library),
-                                            name: Arc::clone(&outer_name),
-                                            fake_target_va: hook.address,
-                                            handled: true,
-                                            return_value: None,
-                                            return_address: None,
-                                        });
-                                        if let Err(error) = self.begin_guest_callback(
-                                            request,
-                                            outer_library,
-                                            outer_name,
-                                            hook.address,
-                                        ) {
-                                            termination = EntryTraceTermination::RuntimeStop(
-                                                format!("failed to begin guest callback: {error}"),
-                                            );
-                                            break 'outer;
-                                        }
-                                        continue 'outer;
-                                    }
-                                    Ok(
-                                        wie_winapi::WinApiControlSignal::EnumerationCallbackRequested {
-                                            request,
-                                            enumeration_id,
-                                        },
-                                    ) => {
-                                        charged_api = charged_api.saturating_add(1);
-                                        // begin_guest_enum_callback needs full self — mark and handle after drop
-                                        drop(pair);
-                                        let outer_library =
-                                            self.intern_outer_api_name(resolved.library);
-                                        let outer_name = self.intern_outer_api_name(resolved.name);
-                                        events.push(EntryTraceEvent {
-                                            index,
-                                            library: Arc::clone(&outer_library),
-                                            name: Arc::clone(&outer_name),
-                                            fake_target_va: hook.address,
-                                            handled: true,
-                                            return_value: None,
-                                            return_address: None,
-                                        });
-                                        // The first item's frame is installed
-                                        // relative to the current RSP.
-                                        let dispatch_rsp = match self
-                                            .process
-                                            .with_mut(|engine, _| engine.read_rsp())
-                                        {
-                                            Ok(rsp) => rsp,
-                                            Err(error) => {
-                                                termination =
-                                                    EntryTraceTermination::RuntimeStop(format!(
-                                                        "failed to read RSP for enum callback: {error}"
-                                                    ));
-                                                break 'outer;
-                                            }
-                                        };
-                                        if let Err(error) = self.begin_guest_enum_callback(
-                                            request,
-                                            enumeration_id,
-                                            outer_library,
-                                            outer_name,
-                                            hook.address,
-                                            dispatch_rsp,
-                                        ) {
-                                            termination = EntryTraceTermination::RuntimeStop(
-                                                format!(
-                                                    "failed to begin enum callback: {error}"
-                                                ),
-                                            );
-                                            break 'outer;
-                                        }
-                                        continue 'outer;
-                                    }
-                                    Ok(
-                                        wie_winapi::WinApiControlSignal::FileDialogBridgeRequested {
-                                            request,
-                                        },
-                                    ) => {
-                                        // The native panel (rfd) blocks the MAIN thread for the
-                                        // whole session, and the winit event loop needs the SAME
-                                        // shared state lock to service frame/user events while the
-                                        // panel is up (take_frame, reconcile, hit-testing). Holding
-                                        // the lock across the bridge deadlocks into the beachball,
-                                        // so drop it for the whole panel session — the
-                                        // GuestCallbackRequested pattern. Take the bridge out first
-                                        // (it lives behind the lock) and restore it on return.
-                                        let bridge = winapi_state
-                                            .window_state()
-                                            .file_dialog_bridge
-                                            .take();
-                                        drop(pair);
-                                        let picked =
-                                            bridge.as_ref().and_then(|bridge| bridge(&request));
-                                        self.process.with_mut(|_, winapi_state| {
-                                            if winapi_state.kernel.threads.active.tid != primary_tid
-                                            {
-                                                winapi_state.kernel.threads.activate(primary_tid);
-                                            }
-                                            let window_state = winapi_state.window_state();
-                                            window_state.file_dialog_bridge = bridge;
-                                            if let Some(pending) =
-                                                window_state.pending_native_file_dialog.as_mut()
-                                            {
-                                                pending.pick = picked;
-                                            }
-                                        });
-                                        // Continue: the engine re-executes the fake API stop, the
-                                        // handler re-enters and writes the pick back.
-                                        quantum = Quantum::Continue;
-                                    }
-                                    Ok(
-                                        wie_winapi::WinApiControlSignal::MessageBoxBridgeRequested {
-                                            request,
-                                        },
-                                    ) => {
-                                        // The native alert (rfd) blocks the MAIN thread for the
-                                        // whole session, and the winit event loop needs the SAME
-                                        // shared state lock to service frame/user events while the
-                                        // alert is up (take_frame, reconcile, hit-testing). Holding
-                                        // the lock across the bridge deadlocks into the beachball
-                                        // (the confirm-dialog hang), so drop it for the whole alert
-                                        // session — the GuestCallbackRequested pattern, mirroring
-                                        // the file-dialog arm above. Take the bridge out first (it
-                                        // lives behind the lock) and restore it on return.
-                                        let bridge = winapi_state
-                                            .present()
-                                            .message_box_bridge
-                                            .take();
-                                        drop(pair);
-                                        let picked = bridge.as_ref().map(|bridge| {
-                                            bridge(
-                                                &request.caption,
-                                                &request.text,
-                                                request.message_box_type,
-                                            )
-                                        });
-                                        self.process.with_mut(|_, winapi_state| {
-                                            if winapi_state.kernel.threads.active.tid != primary_tid
-                                            {
-                                                winapi_state.kernel.threads.activate(primary_tid);
-                                            }
-                                            winapi_state.present().message_box_bridge = bridge;
-                                            if let Some(pending) =
-                                                winapi_state
-                                                    .window_state()
-                                                    .pending_native_message_box
-                                                    .as_mut()
-                                            {
-                                                pending.pick = picked;
-                                            }
-                                        });
-                                        // Continue: the engine re-executes the fake API stop, the
-                                        // handler re-enters and returns the chosen id.
-                                        quantum = Quantum::Continue;
-                                    }
-                                    Ok(
-                                        wie_winapi::WinApiControlSignal::PrintDialogBridgeRequested {
-                                            request,
-                                        },
-                                    ) => {
-                                        // The native print panel (NSPrintPanel)
-                                        // blocks the MAIN thread for the whole
-                                        // session, and the winit event loop needs
-                                        // the SAME shared state lock to service
-                                        // frame/user events while the panel is up.
-                                        // Holding the lock across the bridge
-                                        // deadlocks into the beachball, so drop it
-                                        // for the whole panel session — the
-                                        // GuestCallbackRequested pattern, mirroring
-                                        // the file-dialog arm above. Take the
-                                        // bridge out first (it lives behind the
-                                        // lock) and restore it on return.
-                                        let bridge = winapi_state
-                                            .window_state()
-                                            .print_dialog_bridge
-                                            .take();
-                                        drop(pair);
-                                        let picked =
-                                            bridge.as_ref().and_then(|bridge| bridge(&request));
-                                        self.process.with_mut(|_, winapi_state| {
-                                            if winapi_state.kernel.threads.active.tid != primary_tid
-                                            {
-                                                winapi_state.kernel.threads.activate(primary_tid);
-                                            }
-                                            let window_state = winapi_state.window_state();
-                                            window_state.print_dialog_bridge = bridge;
-                                            if let Some(pending) =
-                                                window_state.pending_native_print_dialog.as_mut()
-                                            {
-                                                pending.pick = picked;
-                                            }
-                                        });
-                                        // Continue: the engine re-executes the fake
-                                        // API stop, the handler re-enters and
-                                        // writes the pick back.
-                                        quantum = Quantum::Continue;
-                                    }
-                                    Ok(
-                                        wie_winapi::WinApiControlSignal::PageSetupBridgeRequested {
-                                            request,
-                                        },
-                                    ) => {
-                                        // The native page-layout panel
-                                        // (NSPageLayout) blocks the MAIN thread
-                                        // for the whole session, and the winit
-                                        // event loop needs the SAME shared
-                                        // state lock to service frame/user
-                                        // events while the panel is up.
-                                        // Holding the lock across the bridge
-                                        // deadlocks into the beachball, so drop
-                                        // it for the whole panel session — the
-                                        // print-dialog arm above. Take the
-                                        // bridge out first (it lives behind
-                                        // the lock) and restore it on return.
-                                        let bridge = winapi_state
-                                            .window_state()
-                                            .page_setup_dialog_bridge
-                                            .take();
-                                        drop(pair);
-                                        let picked =
-                                            bridge.as_ref().and_then(|bridge| bridge(&request));
-                                        self.process.with_mut(|_, winapi_state| {
-                                            if winapi_state.kernel.threads.active.tid != primary_tid
-                                            {
-                                                winapi_state.kernel.threads.activate(primary_tid);
-                                            }
-                                            let window_state = winapi_state.window_state();
-                                            window_state.page_setup_dialog_bridge = bridge;
-                                            if let Some(pending) =
-                                                window_state.pending_native_page_setup.as_mut()
-                                            {
-                                                pending.pick = picked;
-                                            }
-                                        });
-                                        // Continue: the engine re-executes the fake
-                                        // API stop, the handler re-enters and
-                                        // writes the pick back.
-                                        quantum = Quantum::Continue;
-                                    }
-                                    Ok(
-                                        wie_winapi::WinApiControlSignal::PrintJobBridgeRequested {
-                                            request,
-                                        },
-                                    ) => {
-                                        // The native NSPrintOperation blocks the
-                                        // MAIN thread for the whole print session,
-                                        // and the winit event loop needs the SAME
-                                        // shared state lock to service frame/user
-                                        // events while the operation runs. Holding
-                                        // the lock across the bridge deadlocks into
-                                        // the beachball, so drop it for the whole
-                                        // operation — the GuestCallbackRequested
-                                        // pattern, mirroring the print-dialog arm
-                                        // above. Take the bridge out first (it lives
-                                        // behind the lock) and restore it on return.
-                                        let bridge = winapi_state
-                                            .window_state()
-                                            .print_job_bridge
-                                            .take();
-                                        drop(pair);
-                                        // The request is moved in BY VALUE (the
-                                        // ~34 MB page canvases travel straight into
-                                        // the native pipeline — never cloned).
-                                        let succeeded =
-                                            bridge.as_ref().map(|bridge| bridge(request));
-                                        self.process.with_mut(|_, winapi_state| {
-                                            if winapi_state.kernel.threads.active.tid != primary_tid
-                                            {
-                                                winapi_state.kernel.threads.activate(primary_tid);
-                                            }
-                                            let window_state = winapi_state.window_state();
-                                            window_state.print_job_bridge = bridge;
-                                            if let Some(pending) =
-                                                window_state.pending_native_print_job.as_mut()
-                                            {
-                                                pending.success = succeeded;
-                                            }
-                                        });
-                                        // Continue: the engine re-executes the fake
-                                        // API stop, the handler re-enters and returns
-                                        // the success flag as the EndDoc result.
-                                        quantum = Quantum::Continue;
-                                    }
-                                    Ok(wie_winapi::WinApiControlSignal::ChildProcessSpawnRequested {
-                                        host_path,
-                                        guest_args,
-                                        // Informational today: the child always
-                                        // builds the standard WIE guest env.
-                                        inherit_environment: _,
-                                    }) => {
-                                        // Spawn a child guest process: the child gets
-                                        // its OWN RuntimeSession (engine + WinApiState —
-                                        // never shared with the parent) registered as a
-                                        // Process kernel object in THIS parent's handle
-                                        // table, so the parent's GetExitCodeProcess /
-                                        // WaitForSingleObject / OpenProcess resolve it.
-                                        // The wrapper thread is the single caller of
-                                        // ProcessObject::finish (after run_until_stop
-                                        // returns — ANY termination, not just
-                                        // ExitProcess), so a crashing child cannot hang a
-                                        // waiting parent.
-                                        //
-                                        // Snapshot the parent's volume roots while the
-                                        // state lock is held so the child sees the same
-                                        // C:\ / D:\ mapping.
-                                        let (bottle_root, drive_d_root) = {
-                                            let st = winapi_state;
-                                            (
-                                                st.file_io.volumes.bottle_root.clone(),
-                                                st.file_io.volumes.drive_d_root.clone(),
-                                            )
-                                        };
-                                        drop(pair);
-
-                                        // Build the child session OUTSIDE the parent's
-                                        // state lock: it is fully self-contained (own
-                                        // engine, WinApiState, guest memory). The session
-                                        // API does not accept a shared JitShared, so each
-                                        // child builds its own compilation cache
-                                        // (correctness-neutral; a per-process cache).
-                                        let build = crate::RuntimeSession::new_with_options(
-                                            &host_path,
-                                            wie_winapi::MessageQueueIdlePolicy::ExitOnIdle,
-                                            crate::DEFAULT_LAYOUT,
-                                            crate::SessionOptions {
-                                                bottle_root,
-                                                drive_d_root,
-                                                guest_args,
-                                                ..crate::SessionOptions::default()
-                                            },
-                                        );
-
-                                        // (hProcess, hThread, dwProcessId, dwThreadId).
-                                        let spawn_outcome: Option<(u64, u64, u32, u32)> =
-                                            match build {
-                                                Ok(mut child) => {
-                                                    let pid = self.process.with_mut(|_, st| {
-                                                        st.kernel.sync.alloc_child_pid()
-                                                    });
-                                                    let (h_process, proc_obj) =
-                                                        self.process.with_mut(|_, st| {
-                                                            st.kernel.sync.register_process(pid)
-                                                        });
-                                                    let (h_thread, thread_obj) =
-                                                        self.process.with_mut(|_, st| {
-                                                            st.kernel
-                                                                .sync
-                                                                .register_detached_thread(pid)
-                                                        });
-                                                    let spawned = std::thread::Builder::new()
-                                                        .name(format!("wie-child-{pid}"))
-                                                        .stack_size(8 * 1024 * 1024)
-                                                        .spawn(move || {
-                                                            let summary = child.run_until_stop(
-                                                                super::MAX_API_QUANTUM,
-                                                            );
-                                                            let code = match &summary {
-                                                                Ok(s) => match &s.termination {
-                                                                    EntryTraceTermination::ExitProcess {
-                                                                        code,
-                                                                    } => *code,
-                                                                    _ => 1,
-                                                                },
-                                                                Err(error) => {
-                                                                    tracing::error!(
-                                                                        pid,
-                                                                        error = %error,
-                                                                        "child session stopped with an error"
-                                                                    );
-                                                                    1
-                                                                }
-                                                            };
-                                                            tracing::info!(
-                                                                target: "wiegui",
-                                                                pid,
-                                                                code,
-                                                                "child guest process exited"
-                                                            );
-                                                            proc_obj.finish(code);
-                                                            thread_obj.finish(code);
-                                                        });
-                                                    match spawned {
-                                                        Ok(_) => {
-                                                            // JoinHandle dropped: the child
-                                                            // host thread is detached and
-                                                            // notifies the Process object when
-                                                            // it finishes.
-                                                            Some((
-                                                                h_process,
-                                                                h_thread,
-                                                                pid,
-                                                                primary_tid,
-                                                            ))
-                                                        }
-                                                        Err(error) => {
-                                                            tracing::error!(
-                                                                pid,
-                                                                error = %error,
-                                                                "failed to spawn child host thread"
-                                                            );
-                                                            self.process.with_mut(|_, st| {
-                                                                st.kernel
-                                                                    .sync
-                                                                    .objects
-                                                                    .remove(
-                                                                        &wie_winapi::KernelHandle::from(
-                                                                            h_process,
-                                                                        ),
-                                                                    );
-                                                                st.kernel
-                                                                    .sync
-                                                                    .objects
-                                                                    .remove(
-                                                                        &wie_winapi::KernelHandle::from(
-                                                                            h_thread,
-                                                                        ),
-                                                                    );
-                                                                st.kernel
-                                                                    .sync
-                                                                    .process_by_pid
-                                                                    .remove(&pid);
-                                                            });
-                                                            None
-                                                        }
-                                                    }
-                                                }
-                                                Err(error) => {
-                                                    tracing::error!(
-                                                        path = %host_path.display(),
-                                                        error = %error,
-                                                        "failed to build child session"
-                                                    );
-                                                    None
-                                                }
-                                            };
-
-                                        if let Some((h_process, h_thread, pid, tid)) =
-                                            spawn_outcome
-                                        {
-                                            let recorded = self.process.with_mut(
-                                                |_, winapi_state| {
-                                                    if winapi_state.kernel.threads.active.tid
-                                                        != primary_tid
-                                                    {
-                                                        winapi_state
-                                                            .kernel
-                                                            .threads
-                                                            .activate(primary_tid);
-                                                    }
-                                                    winapi_state
-                                                        .window_state()
-                                                        .set_child_spawn_result(
-                                                            h_process,
-                                                            h_thread,
-                                                            pid,
-                                                            tid,
-                                                        )
-                                                },
-                                            );
-                                            if !recorded {
-                                                // The write-back slot vanished (the
-                                                // handler's re-entry raced a teardown):
-                                                // the guest will fail closed.
-                                                tracing::warn!(
-                                                    pid,
-                                                    "child spawned but PROCESS_INFORMATION write-back slot missing"
-                                                );
-                                            }
-                                        }
-                                        // Continue: the engine re-executes the fake API
-                                        // stop, the handler re-enters, takes the pending
-                                        // record, and writes PROCESS_INFORMATION (a `None`
-                                        // result reads as FALSE + ERROR_INVALID_PARAMETER).
-                                        quantum = Quantum::Continue;
-                                    }
-                                    Ok(wie_winapi::WinApiControlSignal::HostPark { reason }) => {
-                                        // Per-thread engine: primary regs are already in `engine`;
-                                        // only persist thread bookkeeping for TLS tracking.
-                                        winapi_state.kernel.threads.save_active();
-                                        // The guest is about to block on a
-                                        // wait — flush any coalesced publishes so
-                                        // the frame reaches the host before the
-                                        // park. Skipped while a guest callback is
-                                        // in flight (the callback owns the paint
-                                        // cycle).
-                                        if self.pending_callbacks.is_empty() {
-                                            winapi_state.present().drain_pending_publishes();
-                                        }
-                                        quantum = Quantum::Park(reason);
-                                    }
-                                    Ok(wie_winapi::WinApiControlSignal::ExitThread { code }) => {
-                                        // Flush pending publishes before the
-                                        // thread exits so the last painted frame is
-                                        // not lost.
-                                        if self.pending_callbacks.is_empty() {
-                                            winapi_state.present().drain_pending_publishes();
-                                        }
-                                        quantum = Quantum::ExitThread(code);
-                                    }
-                                    Err(error) => {
-                                        let api = format!(
-                                            "{}!{}: {error}",
-                                            resolved.library.as_ref(),
-                                            resolved.name.as_ref(),
-                                        );
-                                        // Surface the failure through tracing so a
-                                        // live run (console or GUI) shows WHY the
-                                        // session stopped — the guest-fault family
-                                        // (e.g. an unsupported UCRT export) is
-                                        // otherwise only visible in the entry-trace
-                                        // summary and headless reproductions.
-                                        tracing::error!(
-                                            api = %api,
-                                            rip = format_args!("{:#x}", hook.address),
-                                            "unsupported API (session will stop)"
-                                        );
-                                        events.push(EntryTraceEvent {
-                                            index,
-                                            library: resolved.library.clone().into(),
-                                            name: resolved.name.clone().into(),
-                                            fake_target_va: hook.address,
-                                            handled: false,
-                                            return_value: None,
-                                            return_address: None,
-                                        });
-                                        break_term =
-                                            Some(EntryTraceTermination::UnsupportedApi(api));
-                                        quantum = Quantum::Break;
-                                    }
-                                }
-                                }
-                            }
-                        }
-                    } // break_term.is_none resolved block
-                }
-            } // drop pair (process locks)
-
-            match quantum {
-                Quantum::Continue => {}
-                Quantum::Break => {
-                    if let Some(t) = break_term {
-                        termination = t;
-                    }
+            match step {
+                Step::Next | Step::PureCompute => {}
+                Step::Stop(term) => {
+                    termination = term;
                     break 'outer;
                 }
-                Quantum::ExitThread(code) => {
-                    // Primary ExitThread ≈ ExitProcess for session.
+                Step::ExitThread(code) => {
+                    // Primary ExitThread ≈ ExitProcess for the session.
                     termination = EntryTraceTermination::ExitProcess { code };
                     break 'outer;
                 }
-                Quantum::Park(reason) => {
-                    match reason {
-                        wie_winapi::HostParkReason::CriticalSection { cs } => {
-                            // Clone queue under lock, park **without** process locks
-                            // so the CS owner can Leave and wake us.
-                            let q = self
-                                .process
-                                .with_mut(|_, st| wie_winapi::kernel32::resolve_cs_queue(st, cs));
-                            q.park_brief();
-                            // Retry Enter: per-thread engine keeps primary regs; only restore TLS.
-                            self.process.with_mut(|_eng, st| {
-                                st.kernel.threads.activate(primary_tid);
-                            });
-                            // Do not charge API index again — undo increment.
-                            self.next_api_index = self.next_api_index.saturating_sub(1);
-                        }
-                        wie_winapi::HostParkReason::WaitObject { handle, timeout_ms } => {
-                            // Detach waitable object, wait **outside** process locks
-                            // so workers can ExitThread / SetEvent / CreateThread.
-                            let _ = self.process.drain_spawns();
-                            if crate::mt_runtime::mt_debug() {
+                Step::Park(reason) => {
+                    if crate::mt_runtime::mt_debug() {
+                        match reason {
+                            HostParkReason::WaitObject { handle, timeout_ms } => {
                                 tracing::error!(
                                     "[mt] primary park WaitObject handle={handle:#x} timeout={timeout_ms:#x}"
                                 );
                             }
+                            HostParkReason::PthreadWait => {
+                                tracing::error!("[mt] primary park PthreadWait");
+                            }
+                            HostParkReason::WaitMultiple => {
+                                tracing::error!("[mt] primary park WaitMultiple");
+                            }
+                            HostParkReason::CriticalSection { .. } => {}
+                        }
+                    }
+                    match reason {
+                        HostParkReason::CriticalSection { cs } => {
+                            // Clone queue under lock, park **without** process
+                            // locks so the CS owner can Leave and wake us.
+                            let q = self
+                                .process
+                                .with_mut(|_, st| wie_winapi::kernel32::resolve_cs_queue(st, cs));
+                            q.park_brief();
+                            // Retry Enter: per-thread engine keeps primary
+                            // regs; only restore TLS.
+                            self.process.with_mut(|_eng, st| {
+                                st.kernel.threads.activate(primary_tid);
+                            });
+                            // Do not charge API index again — undo increment.
+                            *hooks.next_api_index = hooks.next_api_index.saturating_sub(1);
+                        }
+                        HostParkReason::WaitObject { handle, timeout_ms } => {
+                            // Detach waitable object, wait **outside** process
+                            // locks so workers can ExitThread / SetEvent /
+                            // CreateThread.
+                            let _ = self.process.drain_spawns();
                             let target = self.process.with_mut(|_, st| {
                                 wie_winapi::kernel32::resolve_wait_target(st, handle)
                             });
                             let result = match target {
                                 Some(t) => {
-                                    // Slice infinite waits: drain nested CreateThread
-                                    // from workers and observe process_dying.
+                                    // Slice infinite waits: drain nested
+                                    // CreateThread from workers and observe
+                                    // process_dying.
                                     if timeout_ms == wie_winapi::INFINITE {
                                         loop {
                                             let r = t.wait(50);
@@ -1401,24 +1319,19 @@ impl super::RuntimeSession {
                                     tracing::error!("guest stack corrupted on wait park: {e}")
                                 });
                             });
-                            charged_api = charged_api.saturating_add(1);
+                            hooks.charged_api = hooks.charged_api.saturating_add(1);
                         }
-                        wie_winapi::HostParkReason::PthreadWait => {
-                            // Drain any pending CreateThread/pthread_create spawns
-                            // so the worker can start executing guest code.
+                        HostParkReason::PthreadWait => {
+                            // Drain any pending CreateThread/pthread_create
+                            // spawns so the worker can start executing guest
+                            // code.
                             let _ = self.process.drain_spawns();
-                            if crate::mt_runtime::mt_debug() {
-                                tracing::error!("[mt] primary park PthreadWait");
-                            }
                             // Yield briefly so the handler can re-check its
                             // condition (WakeQueue park) on re-entry.
                             std::thread::sleep(std::time::Duration::from_millis(1));
                         }
-                        wie_winapi::HostParkReason::WaitMultiple => {
+                        HostParkReason::WaitMultiple => {
                             let _ = self.process.drain_spawns();
-                            if crate::mt_runtime::mt_debug() {
-                                tracing::error!("[mt] primary park WaitMultiple");
-                            }
                             let req = self
                                 .process
                                 .with_mut(|_, st| st.kernel.sync.multi_wait.remove(&primary_tid));
@@ -1467,16 +1380,19 @@ impl super::RuntimeSession {
                                     tracing::error!("guest stack corrupted on wait park: {e}")
                                 });
                             });
-                            charged_api = charged_api.saturating_add(1);
+                            hooks.charged_api = hooks.charged_api.saturating_add(1);
                         }
                     }
                 }
             }
         }
 
+        let charged_api = hooks.charged_api;
+        drop(hooks);
+
         // Per-frame timing sample — sync present accumulators into the
-        // profile and log host-stop / iced-vs-jit deltas on publish. Locks are
-        // dropped; only active when `WIE_RUNTIME_PROFILE` (or
+        // profile and log host-stop / iced-vs-jit deltas on publish. Locks
+        // are dropped; only active when `WIE_RUNTIME_PROFILE` (or
         // `enable_frame_timing`) is set.
         if self.profile_enabled {
             self.sample_frame_timing();

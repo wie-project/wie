@@ -25,7 +25,9 @@ use super::profile::RuntimeProfile;
 /// guest can only reach the bottle; without them it errors out at startup
 /// ("doomretro.wad can't be found"). The freedoom IWADs are also aliased to
 /// the classic names (`DOOM1.WAD` / `DOOM2.WAD`) classic Doom engines search
-/// for. No-op when the exe already runs from inside the bottle.
+/// for. When the exe already runs from inside the bottle (or the CLI's
+/// app-folder staging copied the WADs in), the copy is a no-op but the
+/// freedoom aliases still materialize from whatever is present.
 fn stage_wad_payload(
     volumes: &wie_winapi::VolumeConfig,
     exe: &Path,
@@ -40,7 +42,10 @@ fn stage_wad_payload(
     };
     let dest_dir = map.host;
     if host_exe_dir == dest_dir {
-        return Ok(()); // data already sits beside the guest-visible exe
+        // The CLI's app-folder staging already copied the WAD payload beside
+        // the guest-visible exe; only the classic freedoom alias names
+        // (`DOOM1.WAD` / `DOOM2.WAD`) still need materializing.
+        return materialize_freedoom_aliases(&dest_dir);
     }
     std::fs::create_dir_all(&dest_dir)
         .with_context(|| format!("create bottle app dir: {}", dest_dir.display()))?;
@@ -69,22 +74,57 @@ fn stage_wad_payload(
                 target.display()
             )
         })?;
-        let lower = fname.to_string_lossy().to_ascii_lowercase();
-        let alias = match lower.as_str() {
-            "freedoom1.wad" => Some("DOOM1.WAD"),
-            "freedoom2.wad" => Some("DOOM2.WAD"),
-            _ => None,
+        materialize_freedoom_alias(&dest_dir, fname, &src)?;
+    }
+    Ok(())
+}
+
+/// Materialize the classic Doom IWAD alias for one freedoom WAD already
+/// present in `dir`: `freedoom1.wad` → `DOOM1.WAD`, `freedoom2.wad` →
+/// `DOOM2.WAD`. No-op for any other name.
+fn materialize_freedoom_alias(dir: &Path, wad_name: &std::ffi::OsStr, src: &Path) -> Result<()> {
+    let Some(alias_name) = freedoom_alias_name(wad_name) else {
+        return Ok(());
+    };
+    let alias_path = dir.join(alias_name);
+    std::fs::copy(src, &alias_path)
+        .with_context(|| {
+            format!(
+                "copy WAD payload alias into bottle ({} -> {})",
+                src.display(),
+                alias_path.display()
+            )
+        })
+        .map(|_| ())
+}
+
+/// The classic alias name for a freedoom IWAD, or `None` for other WADs.
+fn freedoom_alias_name(wad_name: &std::ffi::OsStr) -> Option<&'static str> {
+    match wad_name.to_string_lossy().to_ascii_lowercase().as_str() {
+        "freedoom1.wad" => Some("DOOM1.WAD"),
+        "freedoom2.wad" => Some("DOOM2.WAD"),
+        _ => None,
+    }
+}
+
+/// Copy `freedoom1.wad` / `freedoom2.wad` in `dir` to their classic alias
+/// names. Idempotent: an existing alias is left untouched. Covers the
+/// whole-folder-staging case where the WAD payload already sits beside the
+/// guest-visible exe (the copy loop above never runs).
+fn materialize_freedoom_aliases(dir: &Path) -> Result<()> {
+    for wad_name in ["freedoom1.wad", "freedoom2.wad"] {
+        let src = dir.join(wad_name);
+        let Some(wad_os) = src.file_name() else {
+            continue;
         };
-        if let Some(alias_name) = alias {
-            let alias_path = dest_dir.join(alias_name);
-            std::fs::copy(&src, &alias_path).with_context(|| {
-                format!(
-                    "copy WAD payload alias into bottle ({} -> {})",
-                    src.display(),
-                    alias_path.display()
-                )
-            })?;
+        let Some(alias_name) = freedoom_alias_name(wad_os) else {
+            continue;
+        };
+        let alias_path = dir.join(alias_name);
+        if alias_path.exists() || !src.is_file() {
+            continue;
         }
+        materialize_freedoom_alias(dir, wad_os, &src)?;
     }
     Ok(())
 }
@@ -207,15 +247,20 @@ impl SessionInit {
 }
 
 impl super::RuntimeSession {
-    fn from_init(init: SessionInit) -> Self {
+    fn from_init(init: SessionInit) -> Result<Self> {
         let profile_enabled = std::env::var_os("WIE_RUNTIME_PROFILE").is_some();
         if profile_enabled {
             wie_winapi::present::set_frame_timing_enabled(true);
         }
         let entry_point_va = init.entry_point_va;
         let initial_rsp = init.initial_rsp;
-        let process = Self::build_process(init);
-        Self {
+        let process = Self::build_process(init)?;
+        // Arm the lock-wait timing gate alongside the frame-timing gate:
+        // both live behind the same `profile_enabled` flag.
+        if profile_enabled {
+            process.lock_wait_stats.set_enabled(true);
+        }
+        Ok(Self {
             process,
             entry_point_va,
             initial_rsp,
@@ -225,17 +270,16 @@ impl super::RuntimeSession {
             outer_api_names: HashMap::new(),
             profile_enabled,
             profile: RuntimeProfile::default(),
-            last_published_last_error: None,
             entry_reached: false,
             was_waiting_for_message: false,
             frame_last_gen: 0,
             frame_last_stops: 0,
             frame_last_iced: 0,
             frame_last_jit: 0,
-        }
+        })
     }
 
-    fn build_process(init: SessionInit) -> ProcessResources {
+    fn build_process(init: SessionInit) -> Result<ProcessResources> {
         let SessionInit {
             engine,
             environment,
@@ -264,15 +308,24 @@ impl super::RuntimeSession {
             guard.message_queue.clone()
         };
 
-        ProcessResources {
+        // Worker TEB pages come from a shared pool: distinct per worker, with
+        // exited workers returning their page for reuse (spawn/join cycles).
+        let worker_teb_pool = Arc::new(Mutex::new(
+            crate::mt_runtime::WorkerTebPool::new(&layout)
+                .context("failed to build worker TEB pool")?,
+        ));
+
+        Ok(ProcessResources {
             config,
             engine,
             shared_jit,
             guest_mem,
             shared_winapi,
+            lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
             shared_message_queue,
             worker_joins: Vec::new(),
-        }
+            worker_teb_pool,
+        })
     }
 
     /// Creates and initializes a long-lived Lunar Magic runtime session.
@@ -536,8 +589,6 @@ impl super::RuntimeSession {
         crate::guest_stubs::refresh_clock_table(engine.as_mut(), layout.clock_table.base)
             .context("failed to initialize guest clock table")?;
 
-        let stub_cfg = crate::guest_stubs::GuestStubConfig::from_layout(&layout);
-
         // Plant trivial WinAPI as real x86-64 stubs and build stop-bit mask.
         // OOL helpers live after guest_io ReadFile/SetFP/GetFS (0x000/0x200/0x400).
         // Use the remainder of the guest_io code mapping (~0x1A00 bytes).
@@ -678,43 +729,38 @@ impl super::RuntimeSession {
             )
             .context("failed to map fake low TEB page")?;
 
+        // Per-thread TEB pages for guest workers (`CreateThread`). The pages
+        // stay mapped for the session; the worker pool re-initializes a page
+        // (zero-fill + standard fields) before handing it to a new worker.
+        engine
+            .mem_map(
+                layout.worker_tebs.base,
+                layout.worker_tebs.size,
+                wie_cpu::RwxPerms::READ_WRITE,
+            )
+            .context("failed to map worker TEB pool")?;
+
         let stack_limit = layout.stack.base;
 
-        engine
-            .mem_write(
-                layout.teb_low.base.wrapping_add(0x08),
-                &stack_top.to_le_bytes(),
-            )
-            .context("failed to write fake TEB StackBase")?;
-
-        engine
-            .mem_write(
-                layout.teb_low.base.wrapping_add(0x10),
-                &stack_limit.to_le_bytes(),
-            )
-            .context("failed to write fake TEB StackLimit")?;
-
-        // TEB.Self (x64 offset 0x30) — guest PEB / TLS lookups.
-        engine
-            .mem_write(
-                layout.teb_low.base.wrapping_add(0x30),
-                &layout.teb_low.base.to_le_bytes(),
-            )
-            .context("failed to write fake TEB Self")?;
-
-        // TEB.ProcessEnvironmentBlock (x64 offset 0x60): point at a minimal
-        // guest PEB stashed in the spare upper half of the TEB page, so
-        // TEB→PEB→ProcessParameters walks (e.g. the UCRT `_get_app_type`
-        // check that reads PP->Flags bit 31) return well-defined values
-        // instead of dereferencing a NULL PEB and faulting.
+        // Primary TEB page: one 4 KiB page at GS_BASE (a compile-time gate in
+        // `crate::memory` pins `teb_low.base == GS_BASE`). The field layout
+        // and write order are canonicalized in `wie_cpu::teb` /
+        // `guest_layout`; per-thread TEBs for workers are a later phase once
+        // CpuEngine grows a per-engine GS-base API. The PEB pointer lives in
+        // the spare upper half of the TEB page, so TEB→PEB→ProcessParameters
+        // walks (e.g. the UCRT `_get_app_type` check that reads PP->Flags bit
+        // 31) return well-defined values instead of dereferencing a NULL PEB.
         let fake_peb_va = layout.teb_low.base.wrapping_add(0x800);
         let fake_pp_va = layout.teb_low.base.wrapping_add(0x900);
-        engine
-            .mem_write(
-                layout.teb_low.base.wrapping_add(0x60),
-                &fake_peb_va.to_le_bytes(),
-            )
-            .context("failed to write fake TEB PEB pointer")?;
+        let primary_teb = wie_cpu::PerThreadTeb::primary();
+        let teb_init = wie_cpu::TebInit {
+            stack_top,
+            stack_limit,
+            peb_va: fake_peb_va,
+        };
+        primary_teb
+            .init(&mut *engine, &teb_init)
+            .context("failed to initialize fake low TEB page")?;
         // PEB.ImageBaseAddress (0x10), ProcessParameters (0x20), ProcessHeap
         // (0x30) — the fields guests probe most. BeingDebugged (0x02) stays 0
         // (the mapped page is zero-filled).
@@ -738,11 +784,6 @@ impl super::RuntimeSession {
         engine
             .mem_write(fake_pp_va.wrapping_add(0x8), &0_u32.to_le_bytes())
             .context("failed to zero fake PP Flags")?;
-
-        // TEB.LastErrorValue (x64 offset 0x68) — guest GetLastError/SetLastError stubs.
-        engine
-            .mem_write(crate::guest_stubs::TEB_LAST_ERROR_VA, &0_u32.to_le_bytes())
-            .context("failed to zero TEB LastErrorValue")?;
 
         engine
             .mem_map(
@@ -819,6 +860,13 @@ impl super::RuntimeSession {
         // under a mapped volume — the bottle's `drive_c` or the D: bridge.
         if let Some(guest_path) = wie_winapi::host_path_to_guest(&volumes, path) {
             process.module_path = guest_path;
+        }
+        // The CLI stages external app folders beside the exe and sets the
+        // process current directory to the staged app dir (normal Windows
+        // launch semantics: relative resource paths resolve from the exe's
+        // directory). `None` keeps the loader default (`C:\`).
+        if let Some(cwd) = options.current_directory.as_deref() {
+            process.current_directory = cwd.to_owned();
         }
         // Make sibling `.wad` game data guest-visible (DOOM Retro needs its
         // IWAD + resource WAD; the host exe dir is outside the bottle).
@@ -1128,7 +1176,7 @@ impl super::RuntimeSession {
             static_dll_mains,
             GuestVa(image_summary.entry_point_va),
             GuestStackPtr(initial_rsp),
-        ));
+        ))?;
         let _ = phase("winapi-state+session", t_phase);
         if session.profile_enabled {
             session.profile.set_init_ns(t_init.elapsed().as_nanos());
@@ -1267,5 +1315,76 @@ mod tests {
             .with_winapi_ref(|s| s.process.main_module_path.clone());
         assert_eq!(module_path, r"C:\Program Files\crt_hello\crt_hello.exe");
         let _ = std::fs::remove_dir_all(&bottle);
+    }
+
+    /// `SessionOptions::current_directory` (the CLI's staged-app folder)
+    /// overrides the loader's `C:\` default in the guest file-io state — the
+    /// value relative path resolution (CreateFileA/W, FindFirstFileA, DLL
+    /// search) reads.
+    #[test]
+    fn session_options_current_directory_reaches_guest_file_io() {
+        let mut micro = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        micro.pop();
+        micro.pop();
+        micro.push("micro-exes/out/crt_hello.exe");
+        if !micro.is_file() {
+            tracing::error!(
+                "skip: micro-exes/out/crt_hello.exe not built (run make -C micro-exes)"
+            );
+            return;
+        }
+        let bottle = TempDir::new("cwd-bottle");
+
+        let session = crate::RuntimeSession::new_with_options(
+            &micro,
+            MessageQueueIdlePolicy::ExitOnIdle,
+            crate::DEFAULT_LAYOUT,
+            crate::SessionOptions {
+                bottle_root: Some(bottle.path().to_path_buf()),
+                current_directory: Some(r"C:\Program Files\app".to_owned()),
+                ..crate::SessionOptions::default()
+            },
+        )
+        .expect("session builds");
+
+        let cwd = session
+            .process
+            .with_winapi_ref(|s| String::from_utf16_lossy(&s.file_io.current_directory_wide));
+        assert_eq!(cwd, r"C:\Program Files\app");
+        // The module path still derives through the volume config — the cwd
+        // override must not disturb module identity.
+        let module_path = session
+            .process
+            .with_winapi_ref(|s| s.process.main_module_path.clone());
+        assert_eq!(module_path, r"C:\crt_hello.exe");
+    }
+
+    /// With whole-folder staging the WAD payload already sits beside the
+    /// guest-visible exe, so `stage_wad_payload` early-returns — but the
+    /// classic freedoom alias names (`DOOM1.WAD` / `DOOM2.WAD`) must still
+    /// materialize from the staged files.
+    #[test]
+    fn in_bottle_wads_get_freedoom_aliases() {
+        let bottle = TempDir::new("inbottle-wads");
+        let app = bottle.path().join("drive_c").join("App");
+        std::fs::create_dir_all(&app).expect("create app dir");
+        std::fs::write(app.join("app.exe"), b"MZ").expect("write fake exe");
+        std::fs::write(app.join("freedoom1.wad"), b"wad1").expect("write freedoom1");
+        let volumes = wie_winapi::VolumeConfig::from_parts(Some(bottle.path().to_path_buf()), None);
+
+        // The in-bottle exe's module path is C:\App\app.exe → exe dir C:\App,
+        // which equals the host app dir — the early-return (staged-folder)
+        // path.
+        super::stage_wad_payload(&volumes, &app.join("app.exe"), r"C:\App\app.exe").expect("stage");
+
+        assert_eq!(
+            std::fs::read(app.join("DOOM1.WAD")).expect("alias created"),
+            b"wad1",
+            "freedoom1.wad aliases to DOOM1.WAD even when already staged"
+        );
+        assert!(
+            !app.join("DOOM2.WAD").exists(),
+            "no freedoom2.wad present → no DOOM2.WAD alias"
+        );
     }
 }

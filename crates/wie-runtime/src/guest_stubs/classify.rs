@@ -6,15 +6,13 @@ use super::config::{
     FAKE_DESKTOP_WINDOW, FAKE_SYSCOLOR_BRUSH_BASE, GuestStubConfig, LANG_EN_US, METRICS_COUNT,
 };
 use super::kind::GuestStubKind;
-
-/// x64 TEB.LastErrorValue offset (also used as our guest mirror VA when TEB base is 0).
-pub const TEB_LAST_ERROR_VA: u64 = wie_cpu::GS_BASE + 0x68;
+use wie_cpu::guest_layout::{
+    CRT_ACMDLN_PTR_SLOT, CRT_ARGC_SLOT, CRT_ARGV_PTR_SLOT, CRT_COMMODE_SLOT, CRT_ENVIRON_PTR_SLOT,
+    CRT_FMODE_SLOT,
+};
 
 /// Guest FLS table slot count (index 0..N-1 accelerated).
 pub const GUEST_FLS_SLOT_COUNT: u32 = 256;
-
-/// Guest UCRT data-page base (CRT pointer slots live at `CRT + 0x3xx`).
-const CRT: u64 = crate::session::CRT_GUEST_BASE;
 
 /// Marker library for the UCRT group in [`CLASSIFY_TABLE`].
 ///
@@ -74,22 +72,22 @@ static CLASSIFY_TABLE: &[(&str, &str, StubKindBuilder)] = &[
     (UCRT_LIBRARY, "signal", |_| GuestStubKind::ReturnZero),
     // CRT pointer slots in the guest UCRT data page.
     (UCRT_LIBRARY, "__p__environ", |_| {
-        GuestStubKind::ReturnImm64(CRT + 0x300)
+        GuestStubKind::ReturnImm64(CRT_ENVIRON_PTR_SLOT)
     }),
     (UCRT_LIBRARY, "__p___argv", |_| {
-        GuestStubKind::ReturnImm64(CRT + 0x308)
+        GuestStubKind::ReturnImm64(CRT_ARGV_PTR_SLOT)
     }),
     (UCRT_LIBRARY, "__p___argc", |_| {
-        GuestStubKind::ReturnImm64(CRT + 0x310)
+        GuestStubKind::ReturnImm64(CRT_ARGC_SLOT)
     }),
     (UCRT_LIBRARY, "__p__commode", |_| {
-        GuestStubKind::ReturnImm64(CRT + 0x318)
+        GuestStubKind::ReturnImm64(CRT_COMMODE_SLOT)
     }),
     (UCRT_LIBRARY, "__p__fmode", |_| {
-        GuestStubKind::ReturnImm64(CRT + 0x320)
+        GuestStubKind::ReturnImm64(CRT_FMODE_SLOT)
     }),
     (UCRT_LIBRARY, "__p__acmdln", |_| {
-        GuestStubKind::ReturnImm64(CRT + 0x328)
+        GuestStubKind::ReturnImm64(CRT_ACMDLN_PTR_SLOT)
     }),
     // ── USER32 pure queries (fixed guest desktop environment) ──
     ("USER32.dll", "GetSystemMetrics", |cfg| {
@@ -147,11 +145,11 @@ static CLASSIFY_TABLE: &[(&str, &str, StubKindBuilder)] = &[
     }),
     // Enter/Leave/DeleteCriticalSection stay on host (real owner/
     // recursion); InitializeCriticalSection* writes RTL_CRITICAL_SECTION.
-    (NT_LIBRARY, "GetLastError", |_| {
-        GuestStubKind::LoadZx32FromVa(TEB_LAST_ERROR_VA)
-    }),
+    // GetLastError/SetLastError plant GS-relative stubs: the GS base resolves
+    // per engine, so every thread reads/writes ITS own TEB last-error slot.
+    (NT_LIBRARY, "GetLastError", |_| GuestStubKind::LoadLastError),
     (NT_LIBRARY, "SetLastError", |_| {
-        GuestStubKind::StoreEcxToVa(TEB_LAST_ERROR_VA)
+        GuestStubKind::StoreLastError
     }),
     (NT_LIBRARY, "FlsGetValue", |cfg| {
         GuestStubKind::FlsGetValue {
@@ -225,7 +223,7 @@ static CLASSIFY_TABLE: &[(&str, &str, StubKindBuilder)] = &[
         GuestStubKind::ReturnImm64(u64::MAX)
     }),
     (NT_LIBRARY, "GetProcessHeap", |_| {
-        GuestStubKind::ReturnImm64(0x0000_0000_5000_0000)
+        GuestStubKind::ReturnImm64(crate::memory::PROCESS_HEAP_HANDLE)
     }),
     // Microsoft: returns pointer to the command-line string for the process.
     (NT_LIBRARY, "GetCommandLineA", |cfg| {

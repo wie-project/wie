@@ -42,21 +42,22 @@ pub struct SessionOptions {
     /// Optional host root for guest `D:\…` (`None` = `WIE_DRIVE_D`, else no
     /// D: drive).
     pub drive_d_root: Option<std::path::PathBuf>,
+    /// Guest current directory the process starts in (e.g.
+    /// `C:\Program Files\{name}`). `None` keeps the loader default (`C:\`,
+    /// the drive root). Set by the CLI when it stages an external app folder,
+    /// so relative resource paths resolve from the staged exe's directory
+    /// like a normal Windows launch.
+    pub current_directory: Option<String>,
 }
 
-/// Guest CRT page layout (must match `wie_winapi::ucrt` and guest stubs).
-pub(crate) const CRT_GUEST_BASE: u64 = 0x0000_0000_6800_0000;
-const CRT_ENVIRON_PTR_SLOT: u64 = CRT_GUEST_BASE + 0x300;
-const CRT_ARGV_PTR_SLOT: u64 = CRT_GUEST_BASE + 0x308;
-const CRT_ARGC_SLOT: u64 = CRT_GUEST_BASE + 0x310;
-const CRT_COMMODE_SLOT: u64 = CRT_GUEST_BASE + 0x318;
-const CRT_FMODE_SLOT: u64 = CRT_GUEST_BASE + 0x320;
-const CRT_ACMDLN_PTR_SLOT: u64 = CRT_GUEST_BASE + 0x328;
-/// Pointer table for `char *argv[]` (null-terminated).
-const CRT_ARGV_TABLE: u64 = CRT_GUEST_BASE + 0x400;
-/// Storage for argv string bodies.
-const CRT_ARGV_STRINGS: u64 = CRT_GUEST_BASE + 0x500;
-const CRT_PAGE_END: u64 = CRT_GUEST_BASE + 0x1000;
+/// Guest CRT page layout constants (must match `wie_winapi::ucrt` and guest
+/// stubs). Re-exported from the shared `wie_cpu::guest_layout` home so the
+/// session init and the stub builders cannot drift apart.
+pub(crate) use wie_cpu::guest_layout::CRT_GUEST_BASE;
+use wie_cpu::guest_layout::{
+    CRT_ACMDLN_PTR_SLOT, CRT_ARGC_SLOT, CRT_ARGV_PTR_SLOT, CRT_ARGV_STRINGS, CRT_ARGV_TABLE,
+    CRT_COMMODE_SLOT, CRT_ENVIRON_PTR_SLOT, CRT_FMODE_SLOT, CRT_PAGE_END,
+};
 
 /// Default per-quantum API-stop budget for [`RuntimeSession::run_until_stop`]
 /// callers that do not need a custom cap (the GUI loop uses this).
@@ -144,8 +145,6 @@ pub struct RuntimeSession {
     /// When true, accumulate [`RuntimeProfile`] across `run_until_stop` calls.
     profile_enabled: bool,
     profile: RuntimeProfile,
-    /// Last value written to guest TEB.LastErrorValue (skip redundant mem_write).
-    last_published_last_error: Option<u32>,
     /// Whether the guest entry point has been reached (set on the first run).
     entry_reached: bool,
     /// Whether the previous `run_until_stop` returned `WaitingForMessage`;
@@ -237,7 +236,7 @@ impl RuntimeSession {
             anyhow::bail!("invalid guest environment variable name: {name:?}");
         }
         let shared_winapi = self.process.winapi_arc();
-        let mut state = crate::mt_runtime::lock(&shared_winapi);
+        let mut state = crate::mt_runtime::lock_wait(&shared_winapi, &self.process.lock_wait_stats);
         let environment = &mut state.process.environment;
         match environment
             .iter()
@@ -325,6 +324,7 @@ impl RuntimeSession {
             state: self.process.winapi_arc(),
             queue: self.process.message_queue_arc(),
             menu_tree_cache: Arc::new(RwLock::new(None)),
+            lock_wait_stats: Arc::clone(&self.process.lock_wait_stats),
         }
     }
 
@@ -480,7 +480,7 @@ impl GuestHandle {
     /// [`top_level_window_rows`] predicate with the session API.
     #[must_use]
     pub fn guest_top_level_windows(&self) -> Vec<(u64, String, i32, i32)> {
-        let Ok(state) = self.state.lock() else {
+        let Some(state) = self.lock_state() else {
             return Vec::new();
         };
         state
@@ -509,8 +509,12 @@ impl Drop for RuntimeSession {
 /// [`Cold`] diagnostic for invalid memory access — 32 stack slot reads + object
 /// dump + vtable dump.  Kept out of line so the normal `run_until_stop` hot path
 /// does not pay the I-cache cost of this heavyweight crash instrumentation.
+///
+/// Shared by the primary pump (via the quantum executor) and the entry-trace
+/// helpers; the module lives here so the dump can reuse the session's layout
+/// constants without a crate cycle.
 #[cold]
-fn invalid_memory_diagnostic(
+pub(crate) fn invalid_memory_diagnostic(
     engine: &mut dyn wie_cpu::CpuEngine,
     access: &wie_cpu::InvalidMemoryAccess,
 ) -> Result<EntryTraceTermination> {
@@ -663,6 +667,7 @@ mod tests {
             state: Arc::new(Mutex::new(winapi_state)),
             queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
             menu_tree_cache: Arc::new(RwLock::new(None)),
+            lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
         }
     }
 

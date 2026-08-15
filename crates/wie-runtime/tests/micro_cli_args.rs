@@ -30,6 +30,7 @@ fn cli_args_flags_and_stdin_inject() {
             ],
             // Non-empty inject: deterministic, no TTY hang.
             stdin_bytes: b"hello-inject\n".to_vec(),
+            ..wie_runtime::MicroRunOptions::default()
         },
     )
     .expect("run_micro_exe_with_options");
@@ -55,6 +56,7 @@ fn cli_args_missing_flag_exits_2() {
             guest_args: vec!["-m".into(), "only".into()],
             // No -i: guest never reads stdin.
             stdin_bytes: b"unused\n".to_vec(),
+            ..wie_runtime::MicroRunOptions::default()
         },
     )
     .expect("run_micro_exe_with_options");
@@ -73,6 +75,7 @@ fn cli_args_flags_only_no_stdin_flag() {
             drive_d_root: None,
             guest_args: vec!["-n".into(), "3".into(), "-m".into(), "hi".into()],
             stdin_bytes: Vec::new(),
+            ..wie_runtime::MicroRunOptions::default()
         },
     )
     .expect("run_micro_exe_with_options");

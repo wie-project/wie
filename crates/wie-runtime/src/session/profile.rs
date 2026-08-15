@@ -41,6 +41,14 @@ pub struct RuntimeProfile {
     last_frame_host_stops: u64,
     last_frame_iced_insns: u64,
     last_frame_jit_insns: u64,
+    /// Guest-side accumulated `shared_winapi` wait (ns; Task 7).
+    guest_lock_wait_ns: u128,
+    /// Largest single guest-side `shared_winapi` wait (ns).
+    guest_lock_wait_max_ns: u128,
+    /// Presenter-side accumulated `shared_winapi` wait (ns).
+    presenter_lock_wait_ns: u128,
+    /// Largest single presenter-side `shared_winapi` wait (ns).
+    presenter_lock_wait_max_ns: u128,
 }
 
 impl RuntimeProfile {
@@ -184,6 +192,28 @@ impl RuntimeProfile {
     pub fn last_frame_jit_insns(&self) -> u64 {
         self.last_frame_jit_insns
     }
+    /// Guest-side accumulated `shared_winapi` wait (ns) — the primary pump
+    /// and worker threads blocked on the big mutex while a peer held it.
+    #[must_use]
+    pub fn guest_lock_wait_ns(&self) -> u128 {
+        self.guest_lock_wait_ns
+    }
+    /// Largest single guest-side `shared_winapi` wait (ns).
+    #[must_use]
+    pub fn guest_lock_wait_max_ns(&self) -> u128 {
+        self.guest_lock_wait_max_ns
+    }
+    /// Presenter-side accumulated `shared_winapi` wait (ns) — the host
+    /// frame loop blocked on the big mutex while the guest held it.
+    #[must_use]
+    pub fn presenter_lock_wait_ns(&self) -> u128 {
+        self.presenter_lock_wait_ns
+    }
+    /// Largest single presenter-side `shared_winapi` wait (ns).
+    #[must_use]
+    pub fn presenter_lock_wait_max_ns(&self) -> u128 {
+        self.presenter_lock_wait_max_ns
+    }
 
     /// Accumulate one `run_until_stop` quantum into `emu_ns`.
     pub(crate) fn add_emu_ns(&mut self, ns: u128) {
@@ -277,6 +307,16 @@ impl RuntimeProfile {
             self.noisy_calls(),
             self.charged_calls()
         ));
+        if self.guest_lock_wait_ns() > 0 || self.presenter_lock_wait_ns() > 0 {
+            lines.push(format!(
+                "winapi_lock_wait: guest_ms={:.3} guest_max_ms={:.3} \
+                 presenter_ms={:.3} presenter_max_ms={:.3}",
+                self.guest_lock_wait_ns() as f64 / 1e6,
+                self.guest_lock_wait_max_ns() as f64 / 1e6,
+                self.presenter_lock_wait_ns() as f64 / 1e6,
+                self.presenter_lock_wait_max_ns() as f64 / 1e6,
+            ));
+        }
         if self.wall_ns() > 0 || self.cpu_user_us() > 0 || self.cpu_sys_us() > 0 {
             let wall_ms = self.wall_ns() as f64 / 1e6;
             let cpu_ms = (self.cpu_user_us().saturating_add(self.cpu_sys_us())) as f64 / 1e3;
@@ -419,6 +459,7 @@ impl super::RuntimeSession {
     /// frame-time budget gate.
     pub fn enable_frame_timing(&mut self) {
         self.profile_enabled = true;
+        self.process.lock_wait_stats.set_enabled(true);
         wie_winapi::present::set_frame_timing_enabled(true);
     }
 
@@ -429,11 +470,27 @@ impl super::RuntimeSession {
             .with_winapi_ref(|st| st.try_present().map_or(0, |p| p.publish_ns_last))
     }
 
+    /// Copy the shared `shared_winapi` wait accumulators (Task 7) into the
+    /// profile snapshot. The atomics are read without taking the WinAPI
+    /// lock, so this is safe while guest workers are still running.
+    pub(super) fn sync_lock_wait_stats(&mut self) {
+        let snap = self.process.lock_wait_stats.snapshot();
+        self.profile.guest_lock_wait_ns = u128::from(snap.guest_total_ns);
+        self.profile.guest_lock_wait_max_ns = u128::from(snap.guest_max_ns);
+        self.profile.presenter_lock_wait_ns = u128::from(snap.presenter_total_ns);
+        self.profile.presenter_lock_wait_max_ns = u128::from(snap.presenter_max_ns);
+    }
+
     /// Per-frame timing — copy the present-side accumulators (publish,
     /// blit-copy, host present) into the profile and log per-frame host-stop /
     /// iced-vs-jit deltas whenever a new frame was published since the last
     /// sample. Runs once per host-stop quantum when profiling is enabled.
     pub(super) fn sample_frame_timing(&mut self) {
+        // Fold the lock-free `shared_winapi` wait accumulators (written by
+        // guest workers and the presenter without the session profile) into
+        // the profile snapshot. Runs before the present-state read so the
+        // sync also applies to non-GUI sessions (no present state).
+        self.sync_lock_wait_stats();
         let present = self.process.with_winapi_ref(|st| {
             st.try_present().map(|p| {
                 (
@@ -508,5 +565,65 @@ impl super::RuntimeSession {
         self.frame_last_stops = self.profile.host_stops;
         self.frame_last_iced = iced;
         self.frame_last_jit = jit;
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::RuntimeProfile;
+
+    /// The report folds guest + presenter wait totals and maxima into one
+    /// line with ms precision, and only when profiling actually recorded
+    /// waits — the disabled default prints nothing.
+    #[test]
+    fn report_includes_lock_wait_line_only_when_nonzero() {
+        let profile = RuntimeProfile::default();
+        assert!(
+            !profile.report().contains("winapi_lock_wait"),
+            "disabled profiling must not emit the lock-wait line"
+        );
+
+        let profile = RuntimeProfile {
+            guest_lock_wait_ns: 1_500_000,
+            guest_lock_wait_max_ns: 1_200_000,
+            presenter_lock_wait_ns: 250_000,
+            presenter_lock_wait_max_ns: 250_000,
+            ..RuntimeProfile::default()
+        };
+        let report = profile.report();
+        assert!(report.contains("winapi_lock_wait"), "{report}");
+        assert!(report.contains("guest_ms=1.500"), "{report}");
+        assert!(report.contains("guest_max_ms=1.200"), "{report}");
+        assert!(report.contains("presenter_ms=0.250"), "{report}");
+        assert!(report.contains("presenter_max_ms=0.250"), "{report}");
+        // The getters surface the same values.
+        assert_eq!(profile.guest_lock_wait_ns(), 1_500_000);
+        assert_eq!(profile.guest_lock_wait_max_ns(), 1_200_000);
+        assert_eq!(profile.presenter_lock_wait_ns(), 250_000);
+        assert_eq!(profile.presenter_lock_wait_max_ns(), 250_000);
+    }
+
+    /// A snapshot fold (the `sync_lock_wait_stats` shape) copies the
+    /// lock-free atomics into the profile totals and maxima.
+    #[test]
+    fn lock_wait_snapshot_folds_into_profile() {
+        let stats = crate::mt_runtime::LockWaitStats::new();
+        stats.set_enabled(true);
+        stats.record_guest(1_000);
+        stats.record_guest(3_000);
+        stats.record_presenter(2_000);
+        let snap = stats.snapshot();
+        let profile = RuntimeProfile {
+            guest_lock_wait_ns: u128::from(snap.guest_total_ns),
+            guest_lock_wait_max_ns: u128::from(snap.guest_max_ns),
+            presenter_lock_wait_ns: u128::from(snap.presenter_total_ns),
+            presenter_lock_wait_max_ns: u128::from(snap.presenter_max_ns),
+            ..RuntimeProfile::default()
+        };
+        assert_eq!(profile.guest_lock_wait_ns(), 4_000);
+        assert_eq!(profile.guest_lock_wait_max_ns(), 3_000);
+        assert_eq!(profile.presenter_lock_wait_ns(), 2_000);
+        assert_eq!(profile.presenter_lock_wait_max_ns(), 2_000);
     }
 }

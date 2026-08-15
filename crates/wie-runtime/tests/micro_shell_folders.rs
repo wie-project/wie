@@ -36,6 +36,7 @@ fn shell_folders_csidl_and_fileinfo_roundtrip() {
             drive_d_root: None,
             guest_args: vec![],
             stdin_bytes: vec![],
+            ..wie_runtime::MicroRunOptions::default()
         },
     )
     .expect("run shell_folders");

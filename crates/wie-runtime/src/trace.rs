@@ -188,6 +188,9 @@ pub struct MicroRunOptions {
     /// Console stdin bytes for `ReadFile(STD_INPUT_HANDLE)`.
     /// Non-empty injects and disables live host read; empty enables live host.
     pub stdin_bytes: Vec<u8>,
+    /// Guest current directory the process starts in (see
+    /// [`crate::SessionOptions::current_directory`]); `None` = `C:\`.
+    pub current_directory: Option<String>,
 }
 
 /// Like [`run_micro_exe_with_root`], with guest argv and stdin injection.
@@ -209,6 +212,7 @@ pub fn run_micro_exe_with_options(
             // path) derives from the same roots the volume config will use.
             bottle_root: options.bottle_root.clone(),
             drive_d_root: options.drive_d_root.clone(),
+            current_directory: options.current_directory,
         },
     )?;
     // An explicit `None` root means "no bottle, ignore WIE_ROOT" — the
@@ -257,11 +261,26 @@ pub fn run_persistent_until_yield(
     path: &std::path::Path,
     max_api: usize,
 ) -> Result<EntryTraceSummary> {
+    run_persistent_until_yield_with_options(path, max_api, crate::SessionOptions::default())
+}
+
+/// Like [`run_persistent_until_yield`], with explicit bootstrap options (the
+/// CLI uses it to pass the staged app folder's guest current directory).
+pub fn run_persistent_until_yield_with_options(
+    path: &std::path::Path,
+    max_api: usize,
+    options: crate::SessionOptions,
+) -> Result<EntryTraceSummary> {
     use std::time::Instant;
     use wie_winapi::{IdleContext, IdlePolicy};
 
     let idle = IdlePolicy::from_env_for(IdleContext::Persistent);
-    let mut session = RuntimeSession::new(path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)?;
+    let mut session = RuntimeSession::new_with_options(
+        path,
+        wie_winapi::MessageQueueIdlePolicy::YieldOnIdle,
+        crate::DEFAULT_LAYOUT,
+        options,
+    )?;
 
     if session.profile_enabled() {
         session
