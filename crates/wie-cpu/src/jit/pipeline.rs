@@ -73,6 +73,14 @@ impl JitCpu {
         s.bg_compiles = s
             .bg_compiles
             .saturating_add(self.shared.bg_compiles.load(Ordering::Relaxed));
+        // Fold the worker's lock-free compile timing into the per-thread
+        // snapshot so `WIE_RUNTIME_PROFILE` sees background work.
+        let bg = &self.shared.bg_compile;
+        s.profile.compile_us = s
+            .profile
+            .compile_us
+            .saturating_add(bg.compile_us.load(Ordering::Relaxed));
+        bg.fold_into(&mut s.profile.compile_by_insns);
         s
     }
 
@@ -102,6 +110,12 @@ impl JitCpu {
 
     pub(super) fn insert_ready(&mut self, rip: u64, compiled: CompiledBlock) {
         self.shared.insert_ready(rip, compiled);
+    }
+
+    /// Mark `rip` as `Never` (cold / non-pure) and count it for diagnostics.
+    fn mark_never(&mut self, rip: u64) {
+        self.shared.cache.pin().insert(rip, CacheEntry::Never);
+        self.stats.profile.never_marks = self.stats.profile.never_marks.saturating_add(1);
     }
 
     pub(super) fn clear_compiled(&mut self) {
@@ -301,7 +315,7 @@ impl JitCpu {
                             self.insert_ready(rip, compiled);
                             return Ok(self.finish_compiled(rip, meta));
                         }
-                        self.shared.cache.pin().insert(rip, CacheEntry::Never);
+                        self.mark_never(rip);
                     }
                     CacheEntry::Hot { visits, thr } => {
                         let next = visits.saturating_add(1);
@@ -315,6 +329,8 @@ impl JitCpu {
                             // enqueue and keep executing on iced this visit; the
                             // compiled block lands in the cache for the next one.
                             // Inline compilation is only the fallback.
+                            self.stats.profile.hot_compiles =
+                                self.stats.profile.hot_compiles.saturating_add(1);
                             let kind = {
                                 let mem = self.shared.mem.read().unwrap();
                                 block::decode_pure_gpr_block(&mem, self.thread.hooks.as_ref(), rip)
@@ -329,7 +345,7 @@ impl JitCpu {
                                         self.insert_ready(rip, compiled);
                                         return Ok(self.finish_compiled(rip, meta));
                                     }
-                                    self.shared.cache.pin().insert(rip, CacheEntry::Never);
+                                    self.mark_never(rip);
                                 }
                             }
                         }
@@ -345,17 +361,18 @@ impl JitCpu {
                 };
                 let is_ucrt = block_kind_ends_in_fast_ucrt(&self.shared, &self.fast_api, &kind);
                 let is_loop = pure_is_self_loop(&kind, rip);
-                let thr = if is_ucrt {
-                    2
-                } else if is_loop {
-                    JitConfig::get().pure_loop_hotness()
-                } else {
-                    JitConfig::get().hotness_threshold()
-                };
-                if thr == 0 || is_ucrt {
+                let (thr, eager) = select_hot_threshold(
+                    is_ucrt,
+                    is_loop,
+                    JitConfig::get().pure_loop_hotness(),
+                    JitConfig::get().hotness_threshold(),
+                );
+                if eager {
                     // Eager compile: the entry is required NOW (there may be no
                     // revisit). Prefer the background worker and block briefly
                     // on this entry only; inline compile is the fallback.
+                    self.stats.profile.eager_compiles =
+                        self.stats.profile.eager_compiles.saturating_add(1);
                     match self.enqueue_bg(rip, &kind) {
                         BgEnqueueOutcome::Queued(notify) => {
                             if let Some(compiled) = self.wait_bg_ready(rip, &notify) {
@@ -368,7 +385,7 @@ impl JitCpu {
                                 self.insert_ready(rip, compiled);
                                 return Ok(self.finish_compiled(rip, meta));
                             }
-                            self.shared.cache.pin().insert(rip, CacheEntry::Never);
+                            self.mark_never(rip);
                         }
                         BgEnqueueOutcome::Ready => {
                             // Worker beat us: the cache already holds Ready.
@@ -391,7 +408,7 @@ impl JitCpu {
                                 self.insert_ready(rip, compiled);
                                 return Ok(self.finish_compiled(rip, meta));
                             }
-                            self.shared.cache.pin().insert(rip, CacheEntry::Never);
+                            self.mark_never(rip);
                         }
                     }
                 } else {
@@ -406,6 +423,7 @@ impl JitCpu {
         // Iced does not maintain the shadow return stack — drop prediction.
         self.thread.shadow_sp = 0;
         self.stats.iced_insns = self.stats.iced_insns.saturating_add(1);
+        self.stats.profile.iced_fallbacks = self.stats.profile.iced_fallbacks.saturating_add(1);
         // Inline step_once_result: push RIP trace, call exec::step, update counters.
         {
             let rip = self.thread.regs.rip;
@@ -445,7 +463,7 @@ impl JitCpu {
             return BgEnqueueOutcome::Unavailable;
         }
         if matches!(kind, BlockKind::NotPure) {
-            self.shared.cache.pin().insert(rip, CacheEntry::Never);
+            self.mark_never(rip);
             return BgEnqueueOutcome::Unavailable;
         }
         let tx_guard = self.shared.bg_tx.lock().unwrap();
@@ -461,6 +479,7 @@ impl JitCpu {
             None | Some(CacheEntry::Hot { .. }) => {
                 let cell = BgWaitCell::new();
                 cache.insert(rip, CacheEntry::Queued(Arc::clone(&cell)));
+                self.stats.profile.bg_enqueues = self.stats.profile.bg_enqueues.saturating_add(1);
                 BgEnqueueOutcome::Queued(cell)
             }
             Some(CacheEntry::Queued(_) | CacheEntry::Never) => BgEnqueueOutcome::Unavailable,
@@ -498,6 +517,8 @@ impl JitCpu {
                     self.stats.compile_stall_us = self.stats.compile_stall_us.saturating_add(
                         u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX),
                     );
+                    self.stats.profile.bg_wait_hits =
+                        self.stats.profile.bg_wait_hits.saturating_add(1);
                     return Some(c);
                 }
                 Some(BgWaitState::Never) => return None, // worker failed → iced
@@ -512,6 +533,8 @@ impl JitCpu {
                     .saturating_add(u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX));
                 self.stats.compile_stall_fallback =
                     self.stats.compile_stall_fallback.saturating_add(1);
+                self.stats.profile.bg_wait_timeouts =
+                    self.stats.profile.bg_wait_timeouts.saturating_add(1);
                 return None;
             }
             // Chunked wait: a notification that races with our re-check (or a
@@ -554,14 +577,24 @@ impl JitCpu {
     /// this wrapper adds the per-thread side effects: compile stats and the
     /// thread-local chain-table entry.
     fn try_compile_from_kind(&mut self, rip: u64, result: BlockKind) -> Option<CompiledBlock> {
+        // Compile timing lives at the rare compile seam, so it is always
+        // recorded (no cost-model gate needed).
+        let start = Instant::now();
         let compiled = self
             .shared
             .compile_from_kind_shared(&self.fast_api, rip, result);
+        let us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
         let Some(compiled) = compiled else {
             self.stats.compile_skip = self.stats.compile_skip.saturating_add(1);
             return None;
         };
         self.stats.compiles = self.stats.compiles.saturating_add(1);
+        self.stats.profile.inline_compiles = self.stats.profile.inline_compiles.saturating_add(1);
+        self.stats.profile.compile_us = self.stats.profile.compile_us.saturating_add(us);
+        self.stats
+            .profile
+            .compile_by_insns
+            .record(u64::from(compiled.insn_count), us);
         if JitConfig::get().chain_enabled() {
             let fn_ptr = compiled.func as usize as u64;
             chain_table_insert(self.thread.chain_slots.as_mut(), rip, fn_ptr);
@@ -890,6 +923,29 @@ impl From<&CompiledBlock> for CompiledRunMeta {
 #[inline]
 pub(super) fn ranges_overlap(a0: u64, a1: u64, b0: u64, b1: u64) -> bool {
     a0 < b1 && b0 < a1
+}
+
+/// Select the visit threshold and eagerness for a decoded block.
+///
+/// Fast-UCRT blocks always compile eagerly. Self-loops use the dedicated loop
+/// hotness. Otherwise the fixed hotness threshold applies.
+///
+/// Returns `(threshold, eager)`. `eager` is true when the block must compile
+/// on its first visit (fast-UCRT, or a zero fixed threshold).
+#[must_use]
+pub(super) fn select_hot_threshold(
+    is_ucrt: bool,
+    is_loop: bool,
+    loop_hotness: u32,
+    fixed_hotness: u32,
+) -> (u32, bool) {
+    if is_ucrt {
+        (2, true)
+    } else if is_loop {
+        (loop_hotness, loop_hotness == 0)
+    } else {
+        (fixed_hotness, fixed_hotness == 0)
+    }
 }
 
 /// Follow PE import thunks / short jumps to the final callee VA.

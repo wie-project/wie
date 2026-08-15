@@ -24,11 +24,13 @@ mod fast_api;
 mod gen_tlb;
 mod lower;
 mod pipeline;
+mod profile;
 mod shared;
 mod trampolines;
 
 pub(crate) use engine::JitEngine;
 pub use fast_api::{FastApiKind, JitFastPathConfig, JitHeapLayout};
+pub use profile::{BgCompileProfile, JitProfile, PROFILE_BUCKETS, TimeBuckets};
 pub use shared::{JitShared, PerThreadJitState};
 
 use config::JitConfig;
@@ -231,6 +233,8 @@ pub struct JitStats {
     pub pin_heap_bytes: u64,
     /// Last pin allow bits: bit0 stack R, bit1 stack W, bit2 heap R, bit3 heap W.
     pub pin_allow_bits: u64,
+    /// Adaptive-JIT cost-model instrumentation (timing + decision counters).
+    pub profile: JitProfile,
 }
 #[cfg(test)]
 #[allow(clippy::expect_used)]
@@ -638,6 +642,50 @@ mod tests {
             ),
             "re-enqueue of a queued rip must not re-queue"
         );
+    }
+
+    // --- Adaptive-JIT hotness threshold ---
+
+    #[test]
+    fn hot_threshold_crossing_compiles_and_invalidates() {
+        let mut cpu = JitCpu::open_x86_64();
+        let base = 0x1031_0000_u64;
+        cpu.virtual_alloc(
+            base,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT,
+            protect::PAGE_EXECUTE_READWRITE,
+        )
+        .expect("alloc");
+        cpu.mem_write(base, &[0xb8, 0x2a, 0x00, 0x00, 0x00, 0x90, 0x0f, 0x0b])
+            .expect("write");
+        cpu.write_rip(base).expect("rip");
+
+        // Plant a Hot entry with a cost-model-style threshold of 3: the first
+        // visit (visits=1 → next=2 < 3) must not cross; the second must.
+        cpu.shared
+            .cache
+            .pin()
+            .insert(base, CacheEntry::Hot { visits: 1, thr: 3 });
+        // Visit 1: not crossed → stays Hot, runs one iced insn (RIP advances).
+        cpu.write_rip(base).expect("rip");
+        let (result, _) = cpu.step_one().expect("step 1");
+        assert!(matches!(result, StepResult::Continue));
+        assert!(!cpu.has_ready_at(base), "threshold not crossed on visit 1");
+        assert!(matches!(
+            cpu.shared.cache.pin().get(&base),
+            Some(CacheEntry::Hot { visits: 2, .. })
+        ));
+
+        // Visit 2: next=3, not < 3 → crossed → compile.
+        cpu.write_rip(base).expect("rip");
+        let (result, _) = cpu.step_one().expect("step 2");
+        assert!(matches!(result, StepResult::Continue));
+        assert!(cpu.has_ready_at(base), "threshold crossed → compiled");
+
+        // Invalidation clears the compiled block (SMC / unmap path).
+        cpu.invalidate_code_range(base, 8);
+        assert!(!cpu.has_ready_at(base), "invalidation must drop the block");
     }
 
     // --- B4: integer-SIMD JIT family — iced vs JIT dual-path gates ---

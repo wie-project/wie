@@ -81,12 +81,21 @@ fn stage_wad_payload(
 
 /// Materialize the classic Doom IWAD alias for one freedoom WAD already
 /// present in `dir`: `freedoom1.wad` → `DOOM1.WAD`, `freedoom2.wad` →
-/// `DOOM2.WAD`. No-op for any other name.
+/// `DOOM2.WAD`. No-op for any other name. The alias is written only when it
+/// is missing or a zero-byte placeholder and the source is a non-empty file;
+/// a non-empty existing alias (e.g. a user-provided commercial IWAD) is
+/// preserved.
 fn materialize_freedoom_alias(dir: &Path, wad_name: &std::ffi::OsStr, src: &Path) -> Result<()> {
     let Some(alias_name) = freedoom_alias_name(wad_name) else {
         return Ok(());
     };
+    if !is_non_empty_file(src) {
+        return Ok(());
+    }
     let alias_path = dir.join(alias_name);
+    if is_non_empty_file(&alias_path) {
+        return Ok(());
+    }
     std::fs::copy(src, &alias_path)
         .with_context(|| {
             format!(
@@ -96,6 +105,11 @@ fn materialize_freedoom_alias(dir: &Path, wad_name: &std::ffi::OsStr, src: &Path
             )
         })
         .map(|_| ())
+}
+
+/// True when `path` names an existing regular file with a non-zero length.
+fn is_non_empty_file(path: &Path) -> bool {
+    path.is_file() && path.metadata().is_ok_and(|m| m.len() > 0)
 }
 
 /// The classic alias name for a freedoom IWAD, or `None` for other WADs.
@@ -108,22 +122,16 @@ fn freedoom_alias_name(wad_name: &std::ffi::OsStr) -> Option<&'static str> {
 }
 
 /// Copy `freedoom1.wad` / `freedoom2.wad` in `dir` to their classic alias
-/// names. Idempotent: an existing alias is left untouched. Covers the
-/// whole-folder-staging case where the WAD payload already sits beside the
-/// guest-visible exe (the copy loop above never runs).
+/// names. Idempotent: a non-empty existing alias is left untouched, while a
+/// missing or zero-byte alias is replaced from the non-empty freedoom WAD.
+/// Covers the whole-folder-staging case where the WAD payload already sits
+/// beside the guest-visible exe (the copy loop above never runs).
 fn materialize_freedoom_aliases(dir: &Path) -> Result<()> {
     for wad_name in ["freedoom1.wad", "freedoom2.wad"] {
         let src = dir.join(wad_name);
         let Some(wad_os) = src.file_name() else {
             continue;
         };
-        let Some(alias_name) = freedoom_alias_name(wad_os) else {
-            continue;
-        };
-        let alias_path = dir.join(alias_name);
-        if alias_path.exists() || !src.is_file() {
-            continue;
-        }
         materialize_freedoom_alias(dir, wad_os, &src)?;
     }
     Ok(())
@@ -1385,6 +1393,100 @@ mod tests {
         assert!(
             !app.join("DOOM2.WAD").exists(),
             "no freedoom2.wad present → no DOOM2.WAD alias"
+        );
+    }
+
+    /// A missing classic alias materializes from the non-empty freedoom WAD
+    /// beside it (the in-bottle / staged-folder path).
+    #[test]
+    fn missing_alias_materializes_from_freedoom_wad() {
+        let dir = TempDir::new("alias-missing");
+        std::fs::write(dir.path().join("freedoom2.wad"), b"wad2").expect("write freedoom2");
+        super::materialize_freedoom_aliases(dir.path()).expect("materialize");
+        assert_eq!(
+            std::fs::read(dir.path().join("DOOM2.WAD")).expect("alias created"),
+            b"wad2",
+            "missing alias materialized from the freedoom IWAD"
+        );
+    }
+
+    /// A zero-byte stale alias is replaced from the non-empty freedoom WAD —
+    /// the DoomRetro failure mode (a placeholder DOOM2.WAD shadowing the real
+    /// IWAD and forcing the file picker).
+    #[test]
+    fn zero_byte_alias_is_replaced_from_freedoom_wad() {
+        let dir = TempDir::new("alias-zero");
+        std::fs::write(dir.path().join("freedoom2.wad"), b"wad2").expect("write freedoom2");
+        std::fs::write(dir.path().join("DOOM2.WAD"), b"").expect("write stale alias");
+        super::materialize_freedoom_aliases(dir.path()).expect("materialize");
+        assert_eq!(
+            std::fs::read(dir.path().join("DOOM2.WAD")).expect("alias replaced"),
+            b"wad2",
+            "zero-byte placeholder replaced by the freedoom IWAD"
+        );
+    }
+
+    /// A non-empty existing alias — a real user-provided commercial IWAD — is
+    /// preserved, never overwritten by the freedoom copy.
+    #[test]
+    fn non_empty_alias_is_preserved() {
+        let dir = TempDir::new("alias-keep");
+        std::fs::write(dir.path().join("freedoom2.wad"), b"wad2").expect("write freedoom2");
+        std::fs::write(dir.path().join("DOOM2.WAD"), b"commercial").expect("write commercial IWAD");
+        super::materialize_freedoom_aliases(dir.path()).expect("materialize");
+        assert_eq!(
+            std::fs::read(dir.path().join("DOOM2.WAD")).expect("alias preserved"),
+            b"commercial",
+            "non-empty alias untouched"
+        );
+    }
+
+    /// With no freedoom source present no alias appears, and an existing
+    /// alias is left alone.
+    #[test]
+    fn absent_source_creates_no_alias() {
+        let dir = TempDir::new("alias-absent");
+        std::fs::write(dir.path().join("DOOM1.WAD"), b"commercial").expect("write commercial IWAD");
+        super::materialize_freedoom_aliases(dir.path()).expect("materialize");
+        assert_eq!(
+            std::fs::read(dir.path().join("DOOM1.WAD")).expect("alias preserved"),
+            b"commercial",
+            "existing alias untouched when the freedoom source is absent"
+        );
+        assert!(
+            !dir.path().join("DOOM2.WAD").exists(),
+            "no freedoom2.wad → no DOOM2.WAD alias"
+        );
+    }
+
+    /// The unbottled-exe copy path applies the same rule: a zero-byte alias
+    /// already in the bottle is replaced, a non-empty commercial IWAD is kept.
+    #[test]
+    fn copy_path_replaces_zero_byte_alias_but_keeps_commercial() {
+        let src = TempDir::new("wad-src2");
+        let exe = src.path().join("doomretro.exe");
+        std::fs::write(&exe, b"MZ").expect("write fake exe");
+        std::fs::write(src.path().join("freedoom2.wad"), b"wad2").expect("write freedoom2");
+
+        let bottle = TempDir::new("wad-bottle2");
+        let drive_c = bottle.path().join("drive_c");
+        std::fs::create_dir_all(&drive_c).expect("create drive_c");
+        // A stale zero-byte placeholder and a real commercial IWAD side by side.
+        std::fs::write(drive_c.join("DOOM2.WAD"), b"").expect("write stale alias");
+        std::fs::write(drive_c.join("DOOM1.WAD"), b"commercial").expect("write commercial IWAD");
+
+        let volumes = wie_winapi::VolumeConfig::from_parts(Some(bottle.path().to_path_buf()), None);
+        super::stage_wad_payload(&volumes, &exe, r"C:\doomretro.exe").expect("stage");
+
+        assert_eq!(
+            std::fs::read(drive_c.join("DOOM2.WAD")).expect("alias replaced"),
+            b"wad2",
+            "zero-byte placeholder replaced during the copy path"
+        );
+        assert_eq!(
+            std::fs::read(drive_c.join("DOOM1.WAD")).expect("alias preserved"),
+            b"commercial",
+            "commercial IWAD preserved during the copy path"
         );
     }
 }

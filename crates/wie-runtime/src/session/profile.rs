@@ -359,6 +359,22 @@ impl RuntimeProfile {
                 j.load_calls,
                 j.store_calls
             ));
+            // General JIT decision + compile-timing diagnostics.
+            let p = &j.profile;
+            if p.compile_us > 0 {
+                lines.push(format!(
+                    "jit_profile: compile_us={} eager={} hot={} bg_enq={} bg_hit={} bg_to={} inline={} iced_fb={} never={}",
+                    p.compile_us,
+                    p.eager_compiles,
+                    p.hot_compiles,
+                    p.bg_enqueues,
+                    p.bg_wait_hits,
+                    p.bg_wait_timeouts,
+                    p.inline_compiles,
+                    p.iced_fallbacks,
+                    p.never_marks
+                ));
+            }
         }
         if self.frames_published() > 0 || self.publish_ns_last() > 0 {
             lines.push(format!(

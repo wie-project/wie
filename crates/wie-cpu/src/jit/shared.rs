@@ -20,6 +20,7 @@ use super::lower::{
     TLB_WAYS_PER_SET, TlbValue, compile_block,
 };
 use super::pipeline::resolve_thunk_va;
+use super::profile::BgCompileProfile;
 use super::trampolines::match_micro_stub;
 use crate::ConcurrentHashMap;
 use crate::exec::HookWindow;
@@ -30,7 +31,7 @@ use ahash::HashMapExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Per-entry wait cell for background compiles.
 ///
@@ -138,6 +139,9 @@ pub struct JitShared {
     /// the worker lowers calls exactly like the inline path would. Shared as an
     /// `Arc<[_]>` so each background job pays a refcount bump, not a Vec clone.
     pub bg_fast_api: Mutex<Arc<[(u64, FastApiKind)]>>,
+    /// Lock-free background-compile timing (worker writes, per-thread
+    /// snapshots read via [`super::JitCpu::stats`]).
+    pub bg_compile: BgCompileProfile,
     /// Test-only latch forcing the background path on for this instance
     /// (env-independent, and per-`JitShared` so parallel unit tests cannot
     /// interfere with each other).
@@ -174,6 +178,7 @@ impl JitShared {
             cache_epoch: AtomicU64::new(0),
             bg_compiles: AtomicU64::new(0),
             bg_fast_api: Mutex::new(Arc::from(Vec::new())),
+            bg_compile: BgCompileProfile::default(),
             #[cfg(test)]
             bg_force: AtomicBool::new(false),
         }
@@ -267,7 +272,11 @@ impl JitShared {
             let mem_gen_before = shared.mem_gen.load(Ordering::Acquire);
             // Arc clone: refcount bump only (table is built once per engine).
             let fast_api = shared.bg_fast_api.lock().unwrap().clone();
+            let start = Instant::now();
             let compiled = shared.compile_from_kind_shared(fast_api.as_ref(), rip, kind);
+            let us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
+            let insns = compiled.as_ref().map_or(0, |c| u64::from(c.insn_count));
+            shared.bg_compile.record(insns, us);
             // If guest memory was remapped (map/protect/free) or a code page
             // write is pending while we compiled, the cached bytes may be
             // stale — drop the result and let the guest re-request.

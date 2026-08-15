@@ -77,7 +77,7 @@ impl JitConfig {
             // Compile after this many visits to the same guest entry (skip
             // cold code). Default 100: lower values cut residual iced but thrash
             // short non-loop blocks on 7za and increase wall. Tests use 0.
-            hotness_threshold: env_u32("WIE_JIT_HOTNESS", 100, true),
+            hotness_threshold: hotness_threshold_from_env(),
             // Known pure self-loops: compile sooner (one Cranelift pass vs iced
             // warmup). Default 8; tests 0.
             pure_loop_hotness: env_u32("WIE_JIT_LOOP_HOTNESS", 8, true),
@@ -296,6 +296,29 @@ impl JitConfig {
     pub(super) fn string_inline_enabled(&self) -> bool {
         self.string_inline_enabled
     }
+}
+
+/// Upper bound on the fixed hotness threshold (`WIE_JIT_HOTNESS_THRESHOLD`).
+///
+/// Clamping keeps an experimental override from deferring a genuinely hot block
+/// forever; the default (100) is far below this cap.
+const HOTNESS_THRESHOLD_MAX: u32 = 1_000_000;
+
+/// Parse the fixed hotness threshold from `WIE_JIT_HOTNESS_THRESHOLD`.
+///
+/// Default 100 (the historical fixed threshold). Parsed safely and clamped to
+/// `[1, HOTNESS_THRESHOLD_MAX]` so an invalid or absurd value cannot break the
+/// block-decision path. Under `cfg(test)` the threshold is 0 so every block
+/// compiles eagerly (deterministic unit suite).
+fn hotness_threshold_from_env() -> u32 {
+    if cfg!(test) {
+        return 0;
+    }
+    let raw = std::env::var("WIE_JIT_HOTNESS_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(100);
+    raw.clamp(1, HOTNESS_THRESHOLD_MAX)
 }
 
 /// Parse `name` as `u32`, falling back to `default` on absence/invalid input.
