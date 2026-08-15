@@ -240,12 +240,8 @@ fn handle_get_text_extent_point_32_impl(
         match resolved {
             Some((key, resolved)) => {
                 let chars = crate::gdi32::text::read_text_chars(engine, text_va, count, wide)?;
-                let mut width = 0_i32;
-                for ch in chars {
-                    if let Some(ch) = char::from_u32(ch) {
-                        width = width.saturating_add(font_engine.char_advance(&resolved, &key, ch));
-                    }
-                }
+                let text: String = chars.iter().filter_map(|&cp| char::from_u32(cp)).collect();
+                let width = font_engine.text_advance(&resolved, &key, &text, text.len());
                 Ok((width, resolved.line_height()))
             }
             None => Ok((0, 16)),

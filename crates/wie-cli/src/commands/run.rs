@@ -415,7 +415,7 @@ pub(crate) fn run_micro(path: &Path, options: MicroRunOptions<'_>) -> Result<()>
     }
 
     if let Some(profile) = &summary.profile {
-        tracing::debug!("{}", profile.report());
+        eprintln!("{}", profile.report());
     }
 
     match summary.exit_code {

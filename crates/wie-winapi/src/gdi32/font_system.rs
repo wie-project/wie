@@ -505,9 +505,44 @@ impl FontEngine {
         text: &str,
         end: usize,
     ) -> i32 {
+        let scaled = resolved.scaled();
+        self.text_advance_with_scaled(&scaled, resolved, key, text, end)
+    }
+
+    /// Like [`Self::text_advance`] but with a pre-computed scaled font.
+    ///
+    /// Avoids the per-character `FontKey` clone and `scaled()` rebuild that
+    /// [`Self::char_advance`] pays — the hot path for
+    /// `GetTextExtentPoint32A` on long strings.
+    pub(crate) fn text_advance_with_scaled(
+        &mut self,
+        scaled: &PxScaleFont<&FontArc>,
+        resolved: &ResolvedFont,
+        key: &FontKey,
+        text: &str,
+        end: usize,
+    ) -> i32 {
         let mut total = 0_i32;
         for ch in text.chars().take(end) {
-            total = total.saturating_add(self.char_advance(resolved, key, ch));
+            let cache_key = (key.clone(), resolved.height_px, ch);
+            if let Some(glyph) = self.glyph_cache.get(&cache_key) {
+                total = total.saturating_add(glyph.advance);
+                continue;
+            }
+            let gid = scaled.glyph_id(ch);
+            if gid.0 != 0 {
+                total = total.saturating_add(round_px(scaled.h_advance(gid)));
+                continue;
+            }
+            if let Some(fallback) = self.fallback_font(key, ch) {
+                let fallback_scaled = fallback.as_scaled(PxScale::from(resolved.scale));
+                let gid = fallback_scaled.glyph_id(ch);
+                if gid.0 != 0 {
+                    total = total.saturating_add(round_px(fallback_scaled.h_advance(gid)));
+                    continue;
+                }
+            }
+            total = total.saturating_add(round_px(scaled.h_advance(scaled.glyph_id(' '))));
         }
         total
     }
