@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Pre-commit hook: fast checks that should pass before every commit.
+# Run manually: .githooks/pre-commit
+# Skip: git commit --no-verify
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+echo "pre-commit: formatting..."
+if ! cargo fmt --all --check --manifest-path "$ROOT/Cargo.toml"; then
+    echo ""
+    echo "  → Run: cargo fmt --all"
+    exit 1
+fi
+
+echo "pre-commit: file sizes..."
+if ! "$ROOT/scripts/check-file-sizes.sh"; then
+    exit 1
+fi
+
+echo "pre-commit: clippy..."
+if ! cargo clippy --workspace --all-targets --manifest-path "$ROOT/Cargo.toml"; then
+    echo ""
+    echo "  → Fix clippy warnings before committing"
+    exit 1
+fi
+
+echo "pre-commit: all checks passed"

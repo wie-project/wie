@@ -14,8 +14,8 @@ cargo fmt --all --check --manifest-path "$ROOT/Cargo.toml"
 echo "=== cargo clippy (advisory; no -D warnings — clippy lints are not denied) ==="
 cargo clippy --workspace --all-targets --manifest-path "$ROOT/Cargo.toml"
 
-echo "=== cargo test ==="
-cargo test --workspace --manifest-path "$ROOT/Cargo.toml"
+echo "=== cargo nextest ==="
+cargo nextest run --workspace --manifest-path "$ROOT/Cargo.toml"
 
 echo "=== micro-suite ==="
 # Separate statements, not `make && suite`: `set -e` exempts the left operand of

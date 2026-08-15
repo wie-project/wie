@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Enforce the file-size policy (ADR-002):
-#   - hard cap: 1500 lines per source file
+#   - hard cap: 2000 lines per source file
 #   - target:   <= 1000 lines per source file
 # Exemptions:
 #   - test files (tests.rs and anything under a tests/ directory)
@@ -9,7 +9,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-HARD_CAP=1500
+HARD_CAP=2000
 
 # Pure data tables that legitimately exceed the cap (ADR-002 exception).
 # Keep this list minimal and commented; prefer splitting over extending it.

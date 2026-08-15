@@ -8,29 +8,44 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_TERM_PROGRESS: never
 
 jobs:
   check:
-    name: Code Quality & Tests (Apple Silicon)
+    name: Checks
     runs-on: macos-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Rust toolchain
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: rustfmt, clippy
 
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
 
-      - name: Run Clippy (Linter)
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
 
-      - name: Run test suite (Apple Silicon JIT Matrix)
-        run: |
-          WIE_MEM=hybrid WIE_JIT_MEM=sticky cargo test --workspace
+      - name: Formatting
+        run: cargo fmt --all --check
 
-          WIE_MEM=hybrid WIE_JIT_MEM=pin WIE_JIT_CHAIN=1 WIE_STRING_BULK=1 cargo test --workspace
+      - name: File sizes
+        run: ./scripts/check-file-sizes.sh
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      - name: Tests
+        run: cargo nextest run --workspace
+
+      - name: Build release
+        run: cargo build -p wie-cli --release

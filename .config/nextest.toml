@@ -1,0 +1,20 @@
+[store]
+dir = "target/nextest"
+
+[profile.default]
+# Fail quickly on first test failure in CI-style runs.
+fail-fast = false
+# Run tests in parallel across all available cores.
+test-threads = "num-cpus"
+# Show which tests are running.
+status-level = "skip"
+
+[profile.default.junit]
+# Write JUnit XML reports for CI integration.
+path = "target/nextest/junit.xml"
+
+[profile.ci]
+# CI profile: stricter settings.
+fail-fast = true
+test-threads = "num-cpus"
+retries = 0
