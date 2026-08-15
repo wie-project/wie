@@ -103,6 +103,76 @@ at `WIE/bottle` is unchanged). Manage them with:
 
 `bottle run` is `run --root <bottle>` with the exe resolved inside `drive_c`.
 
+## Launching apps
+
+Launch commands below use the debug build (`target/debug/wie`). `run` modes:
+micro (default, until `ExitProcess`) | `--persistent` | `--console` | `--gui`
+| `--screenshot`.
+
+### Standalone executable — stages only the exe
+
+```bash
+target/debug/wie run /path/to/app.exe
+```
+
+Copies just the executable into the bottle — `{root}/drive_c/Program Files/{name}/{name}.exe`
+(install-style; the source is untouched) — and starts the guest with that folder as its
+current directory. Sibling files from the exe's host folder stay out.
+
+### Full portable app folder
+
+```bash
+target/debug/wie run --app-dir /path/to/App app.exe -- relative-resource.dat
+```
+
+`--app-dir <HOST_DIR>` stages the whole folder: DLLs, plugins, data files and nested
+subdirectories keep their relative paths under `C:\Program Files\{name}\`, and relative
+guest args resolve against that staged folder. The run source must live inside the folder
+(a miss is rejected up front). Micro / `--gui` / `--screenshot` only — `--console` /
+`--persistent` reject it.
+
+### Named bottle: create → stage → run
+
+```bash
+wie bottle create doomretro
+wie bottle add doomretro /path/to/DoomRetro --target 'C:\Program Files\DoomRetro'
+target/debug/wie run --bottle doomretro doomretro.exe -- C:\DOOM2.WAD
+```
+
+`bottle add` copies the host file/folder into the bottle's `drive_c` (`--target` defaults
+to `C:\<basename>`). With `--bottle <name>` the exe argument may be a bare basename
+(unique, case-insensitive match anywhere under `drive_c`), a `drive_c`-relative path, an
+explicit guest `C:\…` path (mapped, must exist), or an existing host path (passed
+through). No match is an error naming the searched exe and bottle; several basename
+matches are an ambiguity error listing the candidates and suggesting a full `C:\…` path.
+
+### GUI runs: named bottle vs explicit root
+
+```bash
+target/debug/wie run --gui --bottle doomretro doomretro.exe
+target/debug/wie run --gui --root /path/to/bottle app.exe
+```
+
+`--bottle <name>` is the only root form `--console` / `--persistent` accept, and works for
+every entry; `--root <PATH>` (env `WIE_ROOT`) is the explicit host-root form for the micro
+/ `--gui` / `--screenshot` entries. The two are mutually exclusive. With `--gui`, every
+absolute `C:` / `D:` guest argument is preflighted against the mapped volumes BEFORE the
+guest thread starts — a missing file fails the launch with a clear error (naming the guest
+path and its mapped host path) instead of a runtime open failure. No file dialog ever pops
+for it (GetOpenFileName stays interactive); a `D:` arg with no `--drive-d` bridge is
+unmappable and passes through.
+
+### Flags
+
+| Flag | Effect |
+| --- | --- |
+| `--` | Everything after it is guest argv, verbatim (`run app.exe -- -n 3 -m hi`). Micro and `--gui` accept it; `--console` / `--persistent` reject it |
+| `--app-dir <dir>` | Stage a complete host folder instead of the exe-only default (above) |
+| `--root <path>` | Explicit host root for guest `C:\` (env `WIE_ROOT`); micro / `--gui` / `--screenshot` only |
+| `--bottle <name>` | Named bottle (guest `C:\` = `WIE/bottles/<name>/drive_c`); the only root form `--console` / `--persistent` accept; exe resolved inside `drive_c` (above) |
+| `--persistent` | Message-driven loop that yields on idle instead of gating on `ExitProcess` — for message-loop guests (games, GUI apps); bounded by `--max-api` (default 5,000,000) |
+| `--console` | Raw-mode interactive terminal for terminal games: per-key input (no Enter), terminal restored on exit; runs until the guest exits |
+
 ## Docs map
 
 | Topic | Doc |
