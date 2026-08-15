@@ -1,6 +1,7 @@
 //! Cross-thread GUI presenter: winit window + wgpu (Metal) surface.
 
 pub(crate) mod app;
+pub(crate) mod arg_preflight;
 pub(crate) mod file_dialog;
 pub(crate) mod find_dialog;
 pub(crate) mod font_dialog;

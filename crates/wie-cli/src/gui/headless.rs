@@ -10,17 +10,43 @@ use wie_runtime::RuntimeSession;
 use wie_runtime::{GuiControl, GuiOutcome, run_windowed};
 
 /// Run the guest headlessly and write a screenshot to `out_path`.
-pub fn run_screenshot(path: &Path, out_path: &Path) -> Result<()> {
+///
+/// `bottle_root` / `drive_d_root` are the effective `--bottle` / `--root` /
+/// `--drive-d` roots from the CLI (`None` = env fallback only), threaded like
+/// the windowed entry so named bottles work in screenshot mode too.
+/// `app_dir` is the explicit `--app-dir` (complete-folder staging), `None`
+/// keeping the exe-only default.
+pub fn run_screenshot(
+    path: &Path,
+    out_path: &Path,
+    bottle_root: Option<&Path>,
+    drive_d_root: Option<&Path>,
+    app_dir: Option<&Path>,
+) -> Result<()> {
     // FS policy: an exe outside the bottle runs from a drive_c copy first
-    // (the guest identity's `C:\{name}` label then maps to a real bottle file).
-    let run_path = crate::commands::ensure_exe_in_bottle(
+    // (the guest identity's `C:\…` label then maps to a real bottle file,
+    // and the staged folder is the process cwd). Only the exe is staged by
+    // default; `--app-dir` names a complete folder instead.
+    let volumes = crate::commands::resolve_volume_config(bottle_root, drive_d_root);
+    let staged = crate::commands::stage_run_source(
         path,
-        wie_winapi::bottle_root_from_env().as_deref(),
-        wie_winapi::drive_d_from_env().as_deref(),
+        &volumes,
+        crate::commands::StageMode::from_run_entry(app_dir),
     )?;
     let run_t0 = std::time::Instant::now();
-    let mut session =
-        RuntimeSession::new(&run_path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)?;
+    let mut session = RuntimeSession::new_with_options(
+        &staged.run_path,
+        wie_winapi::MessageQueueIdlePolicy::YieldOnIdle,
+        wie_runtime::DEFAULT_LAYOUT,
+        wie_runtime::SessionOptions {
+            current_directory: staged.guest_current_directory,
+            // The staged root must reach the session (same rationale as the
+            // console/persistent entries): the session would otherwise fall
+            // back to `WIE_ROOT` / the global bottle.
+            bottle_root: bottle_root.map(std::path::Path::to_path_buf),
+            ..wie_runtime::SessionOptions::default()
+        },
+    )?;
     let handle = session.guest_handle();
     let control = GuiControl::new();
     control

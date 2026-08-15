@@ -797,52 +797,63 @@ impl ApplicationHandler<WieEvent> for WieApp {
     }
 }
 
-/// Resolve the run source for the windowed GUI entry under the FS bottle
-/// policy: an exe outside the bottle runs from a `drive_c` copy (see
-/// [`crate::commands::ensure_exe_in_bottle`]), so the guest identity's
-/// `C:\{name}` label maps back to a real bottle file. The roots are threaded
-/// the same way the other run entries thread them — `run_gui_windowed`
-/// propagates the CLI's `--root`/`--drive-d` into `WIE_ROOT`/`WIE_DRIVE_D`,
-/// which this resolution (and the winapi volume config) read. Explicit roots
-/// keep the wiring testable without mutating the process environment.
-fn resolve_gui_run_source(
-    path: &std::path::Path,
-    bottle_root: Option<&std::path::Path>,
-    drive_d_root: Option<&std::path::Path>,
-) -> Result<std::path::PathBuf> {
-    crate::commands::ensure_exe_in_bottle(path, bottle_root, drive_d_root)
-}
-
 /// Run the guest with a winit window.
 ///
 /// `input_script` is a parsed input-script path (see
 /// [`crate::gui::input_script`]); `None` runs without scripted input. The
 /// script is read and parsed up front so a bad path or syntax fails before
 /// the guest thread and event loop start.
+///
+/// `guest_args` are the argv entries after the module name (the same entries
+/// the micro entry threads through). They reach the guest through the session
+/// bootstrap options, but only after
+/// [`crate::gui::arg_preflight::preflight_guest_args`] verifies that every
+/// absolute `C:`/`D:` file argument exists in the mapped volumes — a missing
+/// one fails the launch with a clear error before the guest thread starts
+/// (the `--gui` contract).
 pub fn run_gui_windowed(
     path: &std::path::Path,
     input_script: Option<std::path::PathBuf>,
     bottle_root: Option<&std::path::Path>,
     drive_d_root: Option<&std::path::Path>,
+    app_dir: Option<&std::path::Path>,
+    guest_args: &[String],
 ) -> Result<()> {
     // The winapi volume config and the run-source resolution read the bottle
     // from WIE_ROOT/WIE_DRIVE_D. Propagate the GUI-entry flags into the
     // environment so `--root`/`--drive-d` work in GUI mode too (the console
     // entries consume the flags directly; this mirrors their env-channel).
-    let resolved_root = bottle_root
-        .map(std::path::Path::to_path_buf)
-        .or_else(wie_winapi::bottle_root_from_env);
-    let resolved_drive_d = drive_d_root
-        .map(std::path::Path::to_path_buf)
-        .or_else(wie_winapi::drive_d_from_env);
-    if let Some(root) = resolved_root.as_deref() {
+    let volumes = crate::commands::resolve_volume_config(bottle_root, drive_d_root);
+    if let Some(root) = volumes.bottle_root.as_deref() {
         // SAFETY: set before the guest thread or any session reads it.
         unsafe { std::env::set_var("WIE_ROOT", root) };
     }
-    if let Some(d) = resolved_drive_d.as_deref() {
+    if let Some(d) = volumes.drive_d_root.as_deref() {
         // SAFETY: set before the guest thread or any session reads it.
         unsafe { std::env::set_var("WIE_DRIVE_D", d) };
     }
+    // FS policy: an exe outside the bottle runs from a drive_c copy so the
+    // guest identity's `C:\Program Files\{name}\{name}.exe` label maps back
+    // to a real bottle file (the non-GUI run entries wire `stage_run_source`
+    // at the same point, before the session build). Only the exe is staged
+    // by default; `--app-dir` names a complete folder instead.
+    let staged = crate::commands::stage_run_source(
+        path,
+        &volumes,
+        crate::commands::StageMode::from_run_entry(app_dir),
+    )?;
+
+    // Explicit guest argv entries that name absolute `C:`/`D:` files must
+    // exist in the mapped volumes BEFORE the guest thread starts — a missing
+    // one is a launch error, not a runtime open failure. The volumes here are
+    // the exact roots the session will derive from the propagated env, so the
+    // preflight and the guest agree on what `C:\…` / `D:\…` mean. Deliberately
+    // does not touch FileDialogPolicy: GetOpenFileName stays interactive.
+    let mut session_options =
+        crate::gui::arg_preflight::preflight_guest_args(guest_args, &volumes)?;
+    // A staged app starts in its own folder (Windows launch semantics): the
+    // guest resolves relative resource paths from the staged exe's directory.
+    session_options.current_directory = staged.guest_current_directory;
     let script_steps = match &input_script {
         Some(script_path) => Some(crate::gui::input_script::read_script(script_path)?),
         None => None,
@@ -864,16 +875,6 @@ pub fn run_gui_windowed(
     let window_slots: ParentWindowSlots = Arc::new(Mutex::new(HashMap::new()));
     let window_slots_guest = window_slots.clone();
 
-    // FS policy: an exe outside the bottle runs from a drive_c copy so the
-    // guest identity's `C:\{name}` label maps back to a real bottle file
-    // (the non-GUI run entries wire `ensure_exe_in_bottle` at the same
-    // point, before the session build).
-    let run_path = resolve_gui_run_source(
-        path,
-        wie_winapi::bottle_root_from_env().as_deref(),
-        wie_winapi::drive_d_from_env().as_deref(),
-    )?;
-
     let handle_rx = {
         let (tx, rx) = mpsc::channel::<GuestHandle>();
         let proxy = proxy.clone();
@@ -883,9 +884,11 @@ pub fn run_gui_windowed(
             .name("wie-guest-primary".into())
             .stack_size(GUEST_THREAD_STACK_BYTES)
             .spawn(move || {
-                match RuntimeSession::new(
-                    &run_path,
+                match RuntimeSession::new_with_options(
+                    &staged.run_path,
                     wie_winapi::MessageQueueIdlePolicy::YieldOnIdle,
+                    wie_runtime::DEFAULT_LAYOUT,
+                    session_options,
                 ) {
                     Ok(mut session) => {
                         // Interactive file dialogs: GetOpenFileNameW /
@@ -1088,13 +1091,11 @@ pub fn run_gui_windowed(
 #[cfg(all(test, target_os = "macos"))]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
-    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     use super::{
         OCCLUDED_RETRY_MAX, OCCLUDED_RETRY_MS, PARKED_RETRY_MS, map_alert_result,
-        map_message_box_buttons, resolve_gui_run_source, retry_delay, wheel_notches,
-        window_attributes,
+        map_message_box_buttons, retry_delay, wheel_notches, window_attributes,
     };
 
     /// A physical wheel notch (LineDelta ±1 → ±120) emits exactly one notch
@@ -1310,97 +1311,5 @@ mod tests {
             retry_delay(false, true, OCCLUDED_RETRY_MAX),
             Some(Duration::ZERO)
         );
-    }
-
-    // -----------------------------------------------------------------------
-    // FS bottle-policy wiring (`resolve_gui_run_source`): the windowed GUI
-    // entry's copy happens before the session build, same as the other run
-    // entries. `run_gui_windowed` itself opens a real winit window, so these
-    // pin the copy + identity half of that wiring headlessly.
-    // -----------------------------------------------------------------------
-
-    /// Unique temp dir under the system temp dir; removed on drop.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(tag: &str) -> Self {
-            let path =
-                std::env::temp_dir().join(format!("wie-gui-bottle-{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&path);
-            std::fs::create_dir_all(&path).expect("create temp dir");
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    /// A real file `ensure_exe_in_bottle` can copy.
-    fn fake_exe(dir: &Path, name: &str) -> PathBuf {
-        let path = dir.join(name);
-        std::fs::write(&path, b"MZ\x90\x00").expect("write fake exe");
-        path
-    }
-
-    /// The GUI entry's copy + identity wiring, mirroring
-    /// `run_micro_runs_outside_exe_from_bottle_copy`: an exe outside the
-    /// bottle resolves to a `drive_c` copy, and that copy's identity is its
-    /// Program Files guest label — the reason the copy must happen before the
-    /// session build.
-    #[test]
-    fn gui_run_source_copies_outside_exe_into_bottle() {
-        let outside = TempDir::new("copy-src");
-        let src_exe = fake_exe(outside.path(), "app.exe");
-        let bottle = TempDir::new("copy-bottle");
-
-        let resolved = resolve_gui_run_source(&src_exe, Some(bottle.path()), None)
-            .expect("copy into the bottle should succeed");
-        let expected = bottle
-            .path()
-            .join("drive_c")
-            .join("Program Files")
-            .join("app")
-            .join("app.exe");
-        assert_eq!(
-            resolved, expected,
-            "the GUI run source is the Program Files copy"
-        );
-        assert!(expected.is_file(), "bottle copy must exist");
-        assert!(
-            src_exe.is_file(),
-            "the copy is non-destructive: the source stays"
-        );
-
-        let identity = wie_pe::process_identity_from_host_path_with_args(&resolved, &[]);
-        assert_eq!(identity.module_file_name, "app.exe");
-        // The runtime remaps the loader's `C:\{name}` through the volume
-        // config, so the copy's guest module path is its real location.
-        let volumes = wie_winapi::VolumeConfig::from_parts(Some(bottle.path().to_path_buf()), None);
-        assert_eq!(
-            wie_winapi::host_path_to_guest(&volumes, &resolved).as_deref(),
-            Some(r"C:\Program Files\app\app.exe"),
-            "the copy's guest module path is its Program Files location"
-        );
-        assert_eq!(identity.current_directory, r"C:\");
-    }
-
-    /// An in-bottle GUI source passes through unchanged (no re-copy).
-    #[test]
-    fn gui_run_source_passes_in_bottle_exe_through() {
-        let bottle = TempDir::new("inside-bottle");
-        let drive_c = bottle.path().join("drive_c");
-        std::fs::create_dir_all(&drive_c).expect("create drive_c");
-        let exe = fake_exe(&drive_c, "app.exe");
-
-        let resolved = resolve_gui_run_source(&exe, Some(bottle.path()), None)
-            .expect("in-bottle exe passes through");
-        assert_eq!(resolved, exe, "the in-bottle exe is its own run source");
     }
 }

@@ -4,6 +4,7 @@ use super::util::write_entry_trace_summary;
 use anyhow::{Context, Result, bail};
 use std::io;
 use std::path::{Path, PathBuf};
+use wie_winapi::VolumeConfig;
 
 /// Whether a stdin path represents an interactive terminal rather than a file.
 /// When true, the emulator reads line-by-line from the host TTY instead of
@@ -20,93 +21,297 @@ fn is_interactive_stdin(path: &Path) -> bool {
             .is_some_and(|n| n == std::ffi::OsStr::new("stdin"))
 }
 
-/// Copy `host_path` into the bottle when it lives outside any mapped volume,
-/// returning the host path the run should load.
+/// A run source after bottle staging: the host path to load plus the guest
+/// current directory the process should start in.
+#[derive(Debug)]
+pub(crate) struct StagedRunSource {
+    /// Host path of the run source (the in-bottle copy when staged).
+    pub run_path: PathBuf,
+    /// Guest current directory for the launched process. `None` when no
+    /// staging happened (the loader default `C:\` applies).
+    pub guest_current_directory: Option<String>,
+}
+
+/// What to stage into the bottle for an out-of-bottle run source.
 ///
-/// FS policy: an exe launched from outside a *configured* bottle gets a copy
-/// of its own at `{root}/drive_c/Program Files/{name}/{name}.exe` where
+/// The `wie run app.exe` default is [`StageMode::ExeOnly`]: only the
+/// executable enters the bottle, so unrelated sibling files from the exe's
+/// host folder are never copied. The console/persistent entries keep the
+/// legacy whole-parent-folder default ([`StageMode::ParentFolder`]);
+/// `--app-dir <HOST_DIR>` names a complete folder explicitly
+/// ([`StageMode::AppDir`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum StageMode<'a> {
+    /// Copy only the executable file into the bottle.
+    ExeOnly,
+    /// Copy the executable's parent directory (the pre-`--app-dir` default,
+    /// kept unchanged for `--console` / `--persistent`).
+    ParentFolder,
+    /// Copy the complete folder named by `--app-dir`, preserving relative
+    /// paths (data files, DLLs, plugins, subdirectories).
+    AppDir(&'a Path),
+}
+
+impl<'a> StageMode<'a> {
+    /// The staging mode for a micro / GUI / screenshot run entry: an explicit
+    /// `--app-dir`, else the exe-only default.
+    #[must_use]
+    pub(crate) fn from_run_entry(app_dir: Option<&'a Path>) -> Self {
+        match app_dir {
+            Some(dir) => Self::AppDir(dir),
+            None => Self::ExeOnly,
+        }
+    }
+}
+
+/// Stage a run source into the bottle before the session starts.
+///
+/// FS policy, selected by `stage`: an exe launched from outside a
+/// *configured* bottle lands in `{root}/drive_c/Program Files/{name}/` where
 /// `{name}` is the exe's file stem (install-style — the source stays
 /// untouched). The guest identity derives through the volume mapping, so the
-/// copy's guest path is `C:\Program Files\{name}\{name}.exe`: the guest's
-/// self-path (GetModuleFileName) and the shell32 "New Window" relaunch both
-/// resolve the in-bottle copy.
+/// copy's guest path is `C:\Program Files\{name}\{name}.exe` and the process
+/// current directory is the staged folder: relative resource paths resolve
+/// like a normal Windows launch.
 ///
-/// Pass-through cases: no explicit bottle (`None`), or the exe already lives
-/// under a mapped volume (`{root}/drive_c` or the optional D: bridge). Without
-/// an explicit root the exe runs in place — its own file ops still land in the
-/// global app-data bottle, so nothing needs copying. A nested in-bottle exe
-/// passes through unchanged even though its `C:\…` label then maps to the
-/// volume root rather than the real file — accepted per the in-bottle policy.
-/// A same-named file already at the copy target is overwritten: the bottle
-/// copy is this run's own (no hash check — that would be over-engineering).
-pub(crate) fn ensure_exe_in_bottle(
+/// [`StageMode::ExeOnly`] (the default) copies just the executable — sibling
+/// files from the exe's host folder stay out of the bottle. The complete
+/// folder is copied only when named explicitly: [`StageMode::AppDir`] for an
+/// explicit `--app-dir` (relative paths, DLLs, plugins and data files
+/// preserved), [`StageMode::ParentFolder`] for the legacy whole-parent-folder
+/// behavior of the console/persistent entries.
+///
+/// Pass-through cases: no explicit bottle root in `volumes`, or the exe
+/// already lives under a mapped volume (`{root}/drive_c` or the optional D:
+/// bridge). Without an explicit root the exe runs in place — its own file ops
+/// still land in the global app-data bottle, so nothing needs copying. A
+/// nested in-bottle exe passes through unchanged even though its `C:\…` label
+/// then maps to the volume root rather than the real file — accepted per the
+/// in-bottle policy.
+///
+/// Symlinks are rejected, never followed: a link inside the source app
+/// directory could point outside it (copying foreign files into the bottle)
+/// or loop back on an ancestor, and a link planted at a destination path
+/// could redirect the copy outside the bottle.
+pub(crate) fn stage_run_source(
     host_path: &Path,
-    bottle_root: Option<&Path>,
-    drive_d_root: Option<&Path>,
-) -> Result<PathBuf> {
-    let Some(root) = bottle_root else {
-        return Ok(host_path.to_path_buf());
+    volumes: &VolumeConfig,
+    stage: StageMode<'_>,
+) -> Result<StagedRunSource> {
+    let Some(root) = volumes.bottle_root.as_deref() else {
+        return Ok(StagedRunSource {
+            run_path: host_path.to_path_buf(),
+            guest_current_directory: None,
+        });
     };
     if is_under(host_path, &root.join("drive_c"))
-        || drive_d_root.is_some_and(|d| is_under(host_path, d))
+        || volumes
+            .drive_d_root
+            .as_deref()
+            .is_some_and(|d| is_under(host_path, d))
     {
-        return Ok(host_path.to_path_buf());
+        return Ok(StagedRunSource {
+            run_path: host_path.to_path_buf(),
+            guest_current_directory: None,
+        });
     }
-    if !host_path.is_file() {
-        bail!("run source is not a file: {}", host_path.display());
+    let exe_meta = std::fs::symlink_metadata(host_path)
+        .with_context(|| format!("stat run source: {}", host_path.display()))?;
+    if exe_meta.file_type().is_symlink() || !exe_meta.is_file() {
+        bail!(
+            "run source is not a regular file (symlinks are rejected): {}",
+            host_path.display()
+        );
     }
     let Some(file_name) = host_path.file_name() else {
         bail!("run source has no file name: {}", host_path.display());
     };
     // Install-style layout: the stem names the app dir under Program Files,
     // the file keeps its original basename.
-    let app_dir = host_path
+    let stem = host_path
         .file_stem()
         .filter(|stem| !stem.is_empty())
         .unwrap_or(file_name);
     let drive_c = root.join("drive_c");
-    let dest_dir = drive_c.join("Program Files").join(app_dir);
-    std::fs::create_dir_all(&dest_dir)
-        .with_context(|| format!("create bottle app dir: {}", dest_dir.display()))?;
-    let dest = dest_dir.join(file_name);
-    std::fs::copy(host_path, &dest).with_context(|| {
-        format!(
-            "copy exe into bottle ({} -> {})",
-            host_path.display(),
-            dest.display()
-        )
-    })?;
-    tracing::debug!(
-        "bottle: copied exe in ({} -> {})",
-        host_path.display(),
-        dest.display()
-    );
-    Ok(dest)
+    let dest_dir = drive_c.join("Program Files").join(stem);
+
+    // Resolve the source tree to copy (if any) and the run path relative to
+    // the staged dir root. The exe-only mode copies a single file; both
+    // folder modes copy a complete tree.
+    let (source_dir, rel_run_path) = match stage {
+        StageMode::ExeOnly => (None, PathBuf::from(file_name)),
+        StageMode::ParentFolder => {
+            let Some(source_dir) = host_path.parent() else {
+                bail!(
+                    "run source has no parent directory: {}",
+                    host_path.display()
+                );
+            };
+            require_real_dir(source_dir, "run source app dir")?;
+            (Some(source_dir), PathBuf::from(file_name))
+        }
+        StageMode::AppDir(app_dir) => {
+            let Some(rel) = relative_to(host_path, app_dir) else {
+                bail!(
+                    "run source is not inside --app-dir: {} is not under {}",
+                    host_path.display(),
+                    app_dir.display()
+                );
+            };
+            require_real_dir(app_dir, "--app-dir")?;
+            (Some(app_dir), rel)
+        }
+    };
+
+    match source_dir {
+        Some(source_dir) => {
+            copy_tree_reject_symlinks(source_dir, &dest_dir)?;
+            tracing::debug!(
+                "bottle: staged app folder in ({} -> {})",
+                source_dir.display(),
+                dest_dir.display()
+            );
+        }
+        None => {
+            // Single-file staging: the dest dir must exist first, then the
+            // tree copier's file branch applies the same symlink guards.
+            reject_symlink_dest(&dest_dir)?;
+            std::fs::create_dir_all(&dest_dir)
+                .with_context(|| format!("create staged dir: {}", dest_dir.display()))?;
+            copy_tree_reject_symlinks(host_path, &dest_dir.join(&rel_run_path))?;
+            tracing::debug!(
+                "bottle: staged exe in ({} -> {})",
+                host_path.display(),
+                dest_dir.display()
+            );
+        }
+    }
+    let run_path = dest_dir.join(&rel_run_path);
+    // The staged dir's guest label is the process current directory (the
+    // exe's own guest path stays `C:\Program Files\{name}\{name}.exe`).
+    let guest_current_directory = wie_winapi::host_path_to_guest(volumes, &dest_dir);
+    Ok(StagedRunSource {
+        run_path,
+        guest_current_directory,
+    })
+}
+
+/// Resolve the effective volume config for a run: an explicit CLI flag wins
+/// over `WIE_ROOT` / `WIE_DRIVE_D`. `None` for both leaves the environment as
+/// the only source (the console / persistent / headless / windowed entries'
+/// behavior).
+pub(crate) fn resolve_volume_config(
+    bottle_root: Option<&Path>,
+    drive_d_root: Option<&Path>,
+) -> VolumeConfig {
+    VolumeConfig::from_parts(
+        bottle_root
+            .map(std::path::Path::to_path_buf)
+            .or_else(wie_winapi::bottle_root_from_env),
+        drive_d_root
+            .map(std::path::Path::to_path_buf)
+            .or_else(wie_winapi::drive_d_from_env),
+    )
+}
+
+/// Recursively copy the source tree into `dst`, preserving relative paths.
+///
+/// Rejects every symlink instead of following it: a link could point outside
+/// the source app directory and pull foreign files into the bottle (or loop
+/// back on an ancestor). Regular files and directories only.
+fn copy_tree_reject_symlinks(src: &Path, dst: &Path) -> Result<()> {
+    let meta = std::fs::symlink_metadata(src)
+        .with_context(|| format!("stat source entry: {}", src.display()))?;
+    let file_type = meta.file_type();
+    if file_type.is_symlink() {
+        bail!("refusing to stage symlink: {}", src.display());
+    }
+    if file_type.is_dir() {
+        reject_symlink_dest(dst)?;
+        std::fs::create_dir_all(dst)
+            .with_context(|| format!("create staged dir: {}", dst.display()))?;
+        for entry in
+            std::fs::read_dir(src).with_context(|| format!("read source dir: {}", src.display()))?
+        {
+            let entry =
+                entry.with_context(|| format!("read source dir entry in {}", src.display()))?;
+            copy_tree_reject_symlinks(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else if file_type.is_file() {
+        reject_symlink_dest(dst)?;
+        std::fs::copy(src, dst)
+            .with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
+        Ok(())
+    } else {
+        bail!("refusing to stage non-regular file: {}", src.display());
+    }
+}
+
+/// Reject a destination that is an existing symlink — a planted link could
+/// redirect the copy outside the bottle. Missing or real entries pass (other
+/// errors surface on the create/copy that follows).
+fn reject_symlink_dest(dst: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(dst) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            bail!(
+                "refusing to stage through symlinked dest: {}",
+                dst.display()
+            )
+        }
+        Ok(_) | Err(_) => Ok(()),
+    }
+}
+
+/// A staged source dir must be a real directory: a symlinked dir would copy
+/// a different tree than the user pointed at. `what` names the dir in the
+/// error message ("run source app dir" / `--app-dir`).
+fn require_real_dir(dir: &Path, what: &str) -> Result<()> {
+    let meta = std::fs::symlink_metadata(dir)
+        .with_context(|| format!("stat {what}: {}", dir.display()))?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        bail!(
+            "{what} is not a real directory (symlinks are rejected): {}",
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
+/// Lexical containment that never touches the FS: `path` is inside `dir`
+/// after `.`/`..` normalization. `Some(rel)` carries the relative path of
+/// `path` within `dir`; `None` when not contained.
+fn relative_to(path: &Path, dir: &Path) -> Option<PathBuf> {
+    let path = std::path::absolute(path).ok()?;
+    let dir = std::path::absolute(dir).ok()?;
+    path.strip_prefix(&dir).ok().map(Path::to_path_buf)
 }
 
 /// Lexical containment check (`.`/`..` normalized) that never touches the FS.
 fn is_under(path: &Path, dir: &Path) -> bool {
-    let Ok(path) = std::path::absolute(path) else {
-        return false;
-    };
-    let Ok(dir) = std::path::absolute(dir) else {
-        return false;
-    };
-    path.starts_with(dir)
+    relative_to(path, dir).is_some()
 }
+/// Context for a micro run entry: the volume/staging switches and the guest
+/// bootstrap inputs (argv, stdin). Grouped so [`run_micro`] keeps a short
+/// signature; `path` stays a separate argument because callers (bottle run)
+/// resolve it independently.
+pub(crate) struct MicroRunOptions<'a> {
+    /// Cap host API stops (the CLI applies the mode default before building).
+    pub max_api: usize,
+    /// Expected ExitProcess code (default 0).
+    pub expect_code: u32,
+    pub bottle_root: Option<&'a Path>,
+    pub drive_d: Option<&'a Path>,
+    pub stdin_path: Option<&'a Path>,
+    pub guest_args: &'a [String],
+    pub app_dir: Option<&'a Path>,
+}
+
 /// Runs a freestanding / micro PE until `ExitProcess` and checks the exit code.
-pub(crate) fn run_micro(
-    path: &Path,
-    max_api: usize,
-    expect_code: u32,
-    bottle_root: Option<&Path>,
-    drive_d: Option<&Path>,
-    stdin_path: Option<&Path>,
-    guest_args: &[String],
-) -> Result<()> {
-    let root = bottle_root
-        .map(std::path::Path::to_path_buf)
-        .or_else(wie_winapi::bottle_root_from_env);
+pub(crate) fn run_micro(path: &Path, options: MicroRunOptions<'_>) -> Result<()> {
+    let volumes = resolve_volume_config(options.bottle_root, options.drive_d);
+    let root = volumes.bottle_root.clone();
+    let drive_d_root = volumes.drive_d_root.clone();
     match root.as_ref() {
         Some(r) => tracing::debug!("bottle_root: {} (override)", r.display()),
         None => tracing::debug!(
@@ -114,17 +319,16 @@ pub(crate) fn run_micro(
             wie_winapi::global_bottle_root().display()
         ),
     }
-    let drive_d_root = drive_d
-        .map(std::path::Path::to_path_buf)
-        .or_else(wie_winapi::drive_d_from_env);
     if let Some(ref d) = drive_d_root {
         tracing::debug!("drive_d: {}", d.display());
     }
-    // FS policy: an exe outside the bottle runs from a drive_c copy so the
-    // guest identity's `C:\Program Files\{name}\{name}.exe` label maps back
-    // to a real bottle file.
-    let run_path = ensure_exe_in_bottle(path, root.as_deref(), drive_d_root.as_deref())?;
-    let stdin_bytes = match stdin_path {
+    // FS policy: an exe outside the bottle runs from a drive_c copy. Only the
+    // exe itself is staged by default; `--app-dir` names a complete folder so
+    // the guest identity's `C:\Program Files\{name}\{name}.exe` label maps
+    // back to a real bottle file and relative resource paths resolve from the
+    // staged folder.
+    let staged = stage_run_source(path, &volumes, StageMode::from_run_entry(options.app_dir))?;
+    let stdin_bytes = match options.stdin_path {
         Some(p) if is_interactive_stdin(p) => {
             // Interactive stdin: let the emulator read line-by-line from the host
             // TTY via LiveHost mode (empty bytes = live reading).
@@ -135,20 +339,21 @@ pub(crate) fn run_micro(
             .with_context(|| format!("failed to read guest stdin file: {}", p.display()))?,
         None => Vec::new(),
     };
-    if !guest_args.is_empty() {
-        println!("guest_args: {guest_args:?}");
+    if !options.guest_args.is_empty() {
+        println!("guest_args: {:?}", options.guest_args);
     }
-    if stdin_path.is_some() && !stdin_bytes.is_empty() {
+    if options.stdin_path.is_some() && !stdin_bytes.is_empty() {
         println!("guest_stdin_bytes: {} (inject)", stdin_bytes.len());
     }
     let summary = wie_runtime::run_micro_exe_with_options(
-        &run_path,
-        max_api,
+        &staged.run_path,
+        options.max_api,
         wie_runtime::MicroRunOptions {
             bottle_root: root,
             drive_d_root,
-            guest_args: guest_args.to_vec(),
+            guest_args: options.guest_args.to_vec(),
             stdin_bytes,
+            current_directory: staged.guest_current_directory,
         },
     )?;
 
@@ -214,12 +419,12 @@ pub(crate) fn run_micro(
     }
 
     match summary.exit_code {
-        Some(code) if code == expect_code => {
+        Some(code) if code == options.expect_code => {
             tracing::debug!("run_micro: ok exit={code}");
             Ok(())
         }
         Some(code) => {
-            bail!("run_micro: exit={code} expected={expect_code}");
+            bail!("run_micro: exit={code} expected={}", options.expect_code);
         }
         None => {
             bail!(
@@ -231,13 +436,17 @@ pub(crate) fn run_micro(
 }
 
 /// Runs a PE until the persistent runtime yields (or exits).
-pub(crate) fn run_until_yield(path: &Path, max_api: usize) -> Result<()> {
-    // FS policy: an exe outside the bottle runs from a drive_c copy first.
-    let run_path = ensure_exe_in_bottle(
-        path,
-        wie_winapi::bottle_root_from_env().as_deref(),
-        wie_winapi::drive_d_from_env().as_deref(),
-    )?;
+pub(crate) fn run_until_yield(
+    path: &Path,
+    max_api: usize,
+    bottle_root: Option<&Path>,
+) -> Result<()> {
+    // FS policy: an exe outside the bottle runs from a drive_c copy of its
+    // whole application folder first (the session options carry the staged
+    // folder's guest cwd). Unchanged for `--persistent`: the entry never
+    // takes `--app-dir`, so it keeps the legacy parent-folder default.
+    let volumes = resolve_volume_config(bottle_root, None);
+    let staged = stage_run_source(path, &volumes, StageMode::ParentFolder)?;
     // Ensure Sleep(n>0) actually sleeps and the idle loop parks the host
     // thread when waiting for messages. Otherwise every Sleep is a no-op
     // and interactive programs render all frames instantly.
@@ -249,7 +458,18 @@ pub(crate) fn run_until_yield(path: &Path, max_api: usize) -> Result<()> {
     unsafe {
         std::env::set_var("WIE_IDLE", "park");
     }
-    let summary = wie_runtime::run_persistent_until_yield(&run_path, max_api)?;
+    let summary = wie_runtime::run_persistent_until_yield_with_options(
+        &staged.run_path,
+        max_api,
+        wie_runtime::SessionOptions {
+            current_directory: staged.guest_current_directory,
+            // The staged root must reach the session: without it the session
+            // would fall back to `WIE_ROOT` / the global bottle and map
+            // `C:\…` differently than the staging above.
+            bottle_root: bottle_root.map(std::path::Path::to_path_buf),
+            ..wie_runtime::SessionOptions::default()
+        },
+    )?;
     let stdout = io::stdout();
     let mut output = stdout.lock();
     write_entry_trace_summary(&mut output, &summary)
@@ -295,13 +515,17 @@ const QUANTUM_MAX_API_DEFAULT: usize = 1_000_000;
 /// loop is the frame clock (Windows-identical). With `VMIN`/`VTIME = 0` the
 /// read returns instantly with whatever the pump buffered, so every keystroke
 /// arrives immediately — no Enter, no host tick source.
-pub(crate) fn run_console_interactive(path: &Path, max_api: Option<usize>) -> Result<()> {
-    // FS policy: an exe outside the bottle runs from a drive_c copy first.
-    let run_path = ensure_exe_in_bottle(
-        path,
-        wie_winapi::bottle_root_from_env().as_deref(),
-        wie_winapi::drive_d_from_env().as_deref(),
-    )?;
+pub(crate) fn run_console_interactive(
+    path: &Path,
+    max_api: Option<usize>,
+    bottle_root: Option<&Path>,
+) -> Result<()> {
+    // FS policy: an exe outside the bottle runs from a drive_c copy of its
+    // whole application folder first; the session options carry the staged
+    // folder's guest current directory. Unchanged for `--console`: the entry
+    // never takes `--app-dir`, so it keeps the legacy parent-folder default.
+    let volumes = resolve_volume_config(bottle_root, None);
+    let staged = stage_run_source(path, &volumes, StageMode::ParentFolder)?;
     let _raw = TerminalRawGuard::enter();
 
     // The guest's frame loop is Sleep + input poll, so Sleep(n>0) must park
@@ -313,16 +537,17 @@ pub(crate) fn run_console_interactive(path: &Path, max_api: Option<usize>) -> Re
     }
 
     let mut session = wie_runtime::RuntimeSession::new_with_options(
-        &run_path,
+        &staged.run_path,
         wie_winapi::MessageQueueIdlePolicy::YieldOnIdle,
         wie_runtime::DEFAULT_LAYOUT,
+        // Defaults: no guest argv and empty stdin bytes → LiveHost mode, so
+        // ReadFile(STD_INPUT_HANDLE) and ReadConsoleInputW read from the host
+        // terminal. The staging above used the env roots (or the `--bottle`
+        // root), so the session resolves the same root — threaded explicitly
+        // when a bottle was named, env → global bottle otherwise.
         wie_runtime::SessionOptions {
-            guest_args: Vec::new(),
-            // Empty stdin bytes → LiveHost mode, so ReadFile(STD_INPUT_HANDLE)
-            // and ReadConsoleInputW read from the host terminal.
-            stdin_bytes: Vec::new(),
-            // Console mode has no `--root` flag; the copy above used the env
-            // roots, so the session defaults (env → global bottle) match.
+            current_directory: staged.guest_current_directory,
+            bottle_root: bottle_root.map(std::path::Path::to_path_buf),
             ..wie_runtime::SessionOptions::default()
         },
     )?;
@@ -385,21 +610,34 @@ mod tests {
         }
     }
 
-    /// A real file that `ensure_exe_in_bottle` can copy.
+    /// A real file the staging can copy.
     fn fake_exe(dir: &Path, name: &str) -> PathBuf {
         let path = dir.join(name);
         std::fs::write(&path, b"MZ\x90\x00").expect("write fake exe");
         path
     }
 
-    #[test]
-    fn copies_outside_exe_into_bottle_program_files() {
-        let source = TempDir::new("copy-src");
-        let src_exe = fake_exe(source.path(), "app.exe");
-        let bottle = TempDir::new("copy-bottle");
+    /// A volume config with only a C: bottle (the common test shape).
+    fn c_volumes(bottle: &Path) -> VolumeConfig {
+        VolumeConfig::from_parts(Some(bottle.to_path_buf()), None)
+    }
 
-        let resolved =
-            ensure_exe_in_bottle(&src_exe, Some(bottle.path()), None).expect("copy should succeed");
+    /// The default `wie run app.exe` stages ONLY the executable into the
+    /// bottle: sibling files from the exe's host folder stay out, and the
+    /// staged exe keeps the install-style Program Files identity + guest cwd.
+    #[test]
+    fn stages_standalone_exe_only_into_bottle() {
+        let source = TempDir::new("exe-only-src");
+        let src_exe = fake_exe(source.path(), "app.exe");
+        // Siblings that must NOT enter the bottle under the exe-only default.
+        std::fs::write(source.path().join("data.bin"), b"data").expect("write data");
+        std::fs::write(source.path().join("libfoo.dll"), b"dll").expect("write dll");
+        std::fs::create_dir_all(source.path().join("plugins")).expect("create plugins");
+        std::fs::write(source.path().join("plugins/p1.dll"), b"p1").expect("write plugin");
+        let bottle = TempDir::new("exe-only-bottle");
+
+        let staged = stage_run_source(&src_exe, &c_volumes(bottle.path()), StageMode::ExeOnly)
+            .expect("copy should succeed");
         let expected = bottle
             .path()
             .join("drive_c")
@@ -407,7 +645,7 @@ mod tests {
             .join("app")
             .join("app.exe");
         assert_eq!(
-            resolved, expected,
+            staged.run_path, expected,
             "resolved path is the Program Files copy"
         );
         assert!(expected.is_file(), "bottle copy must exist");
@@ -417,6 +655,17 @@ mod tests {
             "copy carries the source bytes"
         );
         assert!(src_exe.is_file(), "copy is non-destructive: source stays");
+        for rel in ["data.bin", "libfoo.dll", "plugins/p1.dll"] {
+            assert!(
+                !expected.parent().unwrap().join(rel).exists(),
+                "sibling {rel} must not be staged under the exe-only default"
+            );
+        }
+        assert_eq!(
+            staged.guest_current_directory.as_deref(),
+            Some(r"C:\Program Files\app"),
+            "the staged app's guest current directory is its app folder"
+        );
     }
 
     #[test]
@@ -425,14 +674,14 @@ mod tests {
         let src_exe = fake_exe(source.path(), "app.exe");
         let bottle = TempDir::new("copy-guest-path-bottle");
 
-        let resolved =
-            ensure_exe_in_bottle(&src_exe, Some(bottle.path()), None).expect("copy should succeed");
+        let staged = stage_run_source(&src_exe, &c_volumes(bottle.path()), StageMode::ExeOnly)
+            .expect("copy should succeed");
         // The loader default labels every exe `C:\{name}`; the runtime remaps
         // the module path through the volume config, which is what this test
         // mirrors (see session/init.rs identity derivation).
-        let volumes = wie_winapi::VolumeConfig::from_parts(Some(bottle.path().to_path_buf()), None);
+        let volumes = c_volumes(bottle.path());
         assert_eq!(
-            wie_winapi::host_path_to_guest(&volumes, &resolved).as_deref(),
+            wie_winapi::host_path_to_guest(&volumes, &staged.run_path).as_deref(),
             Some(r"C:\Program Files\app\app.exe"),
             "the in-bottle copy resolves to its Program Files guest path"
         );
@@ -445,8 +694,13 @@ mod tests {
         std::fs::create_dir_all(&drive_c).expect("create drive_c");
         let exe = fake_exe(&drive_c, "app.exe");
 
-        let resolved = ensure_exe_in_bottle(&exe, Some(bottle.path()), None).expect("pass through");
-        assert_eq!(resolved, exe, "in-bottle exe is its own run source");
+        let staged = stage_run_source(&exe, &c_volumes(bottle.path()), StageMode::ExeOnly)
+            .expect("pass through");
+        assert_eq!(staged.run_path, exe, "in-bottle exe is its own run source");
+        assert_eq!(
+            staged.guest_current_directory, None,
+            "an in-bottle exe keeps the default cwd"
+        );
     }
 
     #[test]
@@ -454,9 +708,20 @@ mod tests {
         let bridge = TempDir::new("inside-drive-d");
         let exe = fake_exe(bridge.path(), "app.exe");
 
-        let resolved = ensure_exe_in_bottle(&exe, Some(bridge.path()), Some(bridge.path()))
-            .expect("pass through");
-        assert_eq!(resolved, exe, "D: bridge exe is its own run source");
+        let staged = stage_run_source(
+            &exe,
+            &VolumeConfig::from_parts(
+                Some(bridge.path().to_path_buf()),
+                Some(bridge.path().to_path_buf()),
+            ),
+            StageMode::ExeOnly,
+        )
+        .expect("pass through");
+        assert_eq!(staged.run_path, exe, "D: bridge exe is its own run source");
+        assert_eq!(
+            staged.guest_current_directory, None,
+            "a D: bridge exe keeps the default cwd"
+        );
     }
 
     #[test]
@@ -464,8 +729,10 @@ mod tests {
         let source = TempDir::new("no-bottle");
         let exe = fake_exe(source.path(), "app.exe");
 
-        let resolved = ensure_exe_in_bottle(&exe, None, None).expect("pass through");
-        assert_eq!(resolved, exe, "no bottle means no copy");
+        let staged = stage_run_source(&exe, &VolumeConfig::default(), StageMode::ExeOnly)
+            .expect("pass through");
+        assert_eq!(staged.run_path, exe, "no bottle means no copy");
+        assert_eq!(staged.guest_current_directory, None);
     }
 
     #[test]
@@ -473,16 +740,288 @@ mod tests {
         let bottle = TempDir::new("missing-src");
         let ghost = bottle.path().join("ghost.exe");
 
-        let err = ensure_exe_in_bottle(&ghost, Some(bottle.path()), None).expect_err("must fail");
+        let err = stage_run_source(&ghost, &c_volumes(bottle.path()), StageMode::ExeOnly)
+            .expect_err("must fail");
         assert!(
-            err.to_string().contains("not a file"),
+            err.to_string().contains("ghost.exe"),
             "error names the missing file: {err}"
         );
     }
 
+    /// `--app-dir` stages a complete app folder: the exe, sibling data files,
+    /// DLLs, plugins and nested subdirectories all land in
+    /// `Program Files/{name}/` with their relative paths preserved.
+    #[test]
+    fn explicit_app_dir_stages_complete_folder_preserving_nested_resources() {
+        let source = TempDir::new("folder-src");
+        std::fs::write(source.path().join("app.exe"), b"MZ").expect("write exe");
+        std::fs::write(source.path().join("data.bin"), b"data").expect("write data");
+        std::fs::write(source.path().join("libfoo.dll"), b"dll").expect("write dll");
+        std::fs::create_dir_all(source.path().join("plugins")).expect("create plugins");
+        std::fs::write(source.path().join("plugins/p1.dll"), b"p1").expect("write plugin");
+        std::fs::create_dir_all(source.path().join("assets/sounds/deep"))
+            .expect("create nested dirs");
+        std::fs::write(source.path().join("assets/sounds/deep/amb.wav"), b"wav")
+            .expect("write nested file");
+        let bottle = TempDir::new("folder-bottle");
+
+        let staged = stage_run_source(
+            &source.path().join("app.exe"),
+            &c_volumes(bottle.path()),
+            StageMode::AppDir(source.path()),
+        )
+        .expect("stage the app folder");
+
+        let root = bottle
+            .path()
+            .join("drive_c")
+            .join("Program Files")
+            .join("app");
+        assert_eq!(staged.run_path, root.join("app.exe"));
+        assert_eq!(
+            std::fs::read(root.join("data.bin")).expect("staged data"),
+            b"data"
+        );
+        assert_eq!(
+            std::fs::read(root.join("libfoo.dll")).expect("staged dll"),
+            b"dll"
+        );
+        assert_eq!(
+            std::fs::read(root.join("plugins/p1.dll")).expect("staged plugin"),
+            b"p1"
+        );
+        assert_eq!(
+            std::fs::read(root.join("assets/sounds/deep/amb.wav")).expect("staged nested resource"),
+            b"wav"
+        );
+        // The source tree is untouched.
+        assert!(source.path().join("data.bin").is_file());
+        assert!(source.path().join("plugins/p1.dll").is_file());
+    }
+
+    /// `--app-dir` with the exe nested inside the folder: the exe's relative
+    /// path (and every sibling's) is preserved under the staged root, and the
+    /// guest cwd stays the staged app folder.
+    #[test]
+    fn explicit_app_dir_stages_nested_exe_with_relative_paths() {
+        let app_dir = TempDir::new("nested-app-dir");
+        std::fs::create_dir_all(app_dir.path().join("bin")).expect("create bin");
+        std::fs::write(app_dir.path().join("bin/app.exe"), b"MZ").expect("write exe");
+        std::fs::write(app_dir.path().join("data.bin"), b"data").expect("write data");
+        std::fs::create_dir_all(app_dir.path().join("plugins")).expect("create plugins");
+        std::fs::write(app_dir.path().join("plugins/p1.dll"), b"p1").expect("write plugin");
+        let bottle = TempDir::new("nested-app-bottle");
+
+        let staged = stage_run_source(
+            &app_dir.path().join("bin/app.exe"),
+            &c_volumes(bottle.path()),
+            StageMode::AppDir(app_dir.path()),
+        )
+        .expect("stage the app folder");
+
+        let root = bottle
+            .path()
+            .join("drive_c")
+            .join("Program Files")
+            .join("app");
+        assert_eq!(
+            staged.run_path,
+            root.join("bin/app.exe"),
+            "the nested exe keeps its relative path under the staged root"
+        );
+        assert!(root.join("bin/app.exe").is_file(), "nested exe staged");
+        assert_eq!(
+            std::fs::read(root.join("data.bin")).expect("staged data"),
+            b"data"
+        );
+        assert_eq!(
+            std::fs::read(root.join("plugins/p1.dll")).expect("staged plugin"),
+            b"p1"
+        );
+        assert_eq!(
+            staged.guest_current_directory.as_deref(),
+            Some(r"C:\Program Files\app"),
+            "the guest cwd is the staged app folder, not the exe's subdir"
+        );
+    }
+
+    /// An `--app-dir` that does not contain the run source fails up front with
+    /// a clear error naming both paths.
+    #[test]
+    fn app_dir_not_containing_exe_is_rejected() {
+        let app_dir = TempDir::new("app-dir-miss");
+        let other = TempDir::new("app-dir-other");
+        std::fs::write(app_dir.path().join("app.exe"), b"MZ").expect("write exe");
+        let exe = fake_exe(other.path(), "stray.exe");
+        let bottle = TempDir::new("app-dir-miss-bottle");
+
+        let err = stage_run_source(
+            &exe,
+            &c_volumes(bottle.path()),
+            StageMode::AppDir(app_dir.path()),
+        )
+        .expect_err("--app-dir must contain the run source");
+        assert!(
+            err.to_string().contains("not inside --app-dir"),
+            "error is clearly a containment failure: {err}"
+        );
+        assert!(
+            err.to_string().contains(&exe.display().to_string()),
+            "error names the run source: {err}"
+        );
+        assert!(
+            !bottle.path().join("drive_c").join("stray.exe").exists(),
+            "nothing is staged when the app-dir check fails"
+        );
+    }
+
+    /// An `--app-dir` that is not a real directory (here: a regular file)
+    /// is rejected like any staged source dir.
+    #[test]
+    fn app_dir_must_be_a_real_directory() {
+        let app_dir = TempDir::new("app-dir-file");
+        let exe = fake_exe(app_dir.path(), "app.exe");
+        let bottle = TempDir::new("app-dir-file-bottle");
+
+        let err = stage_run_source(&exe, &c_volumes(bottle.path()), StageMode::AppDir(&exe))
+            .expect_err("--app-dir pointing at a file must fail");
+        assert!(
+            err.to_string().contains("--app-dir"),
+            "error names the app-dir: {err}"
+        );
+        assert!(
+            err.to_string().contains("real directory"),
+            "error is clearly a directory failure: {err}"
+        );
+    }
+
+    /// A symlink inside the source app folder is rejected, never followed —
+    /// a link pointing outside the app dir would copy foreign files into the
+    /// bottle (or loop back on an ancestor).
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escape_in_source_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let source = TempDir::new("link-src");
+        let app_dir = source.path().join("app");
+        std::fs::create_dir_all(&app_dir).expect("create app dir");
+        std::fs::write(app_dir.join("app.exe"), b"MZ").expect("write exe");
+        // A link that escapes the app dir (and one looping to an ancestor).
+        let outside = TempDir::new("link-outside");
+        std::fs::write(outside.path().join("secret.txt"), b"s3cret").expect("write secret");
+        symlink(outside.path(), app_dir.join("escape")).expect("plant escape link");
+        symlink(&app_dir, app_dir.join("loop")).expect("plant loop link");
+        let bottle = TempDir::new("link-bottle");
+
+        let err = stage_run_source(
+            &app_dir.join("app.exe"),
+            &c_volumes(bottle.path()),
+            StageMode::AppDir(&app_dir),
+        )
+        .expect_err("symlinks must be rejected");
+        assert!(
+            err.to_string().contains("symlink"),
+            "error names the symlink: {err}"
+        );
+        assert!(
+            !bottle.path().join("drive_c").join("secret.txt").exists(),
+            "no foreign file may reach the bottle through a symlink"
+        );
+    }
+
+    /// A symlinked exe (or symlinked app dir) is rejected up front — the
+    /// copy would silently materialize a different tree than the user
+    /// pointed at.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_run_source_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let source = TempDir::new("exe-link-src");
+        let real = source.path().join("real");
+        std::fs::create_dir_all(&real).expect("create real dir");
+        let real_exe = fake_exe(&real, "app.exe");
+        let link = source.path().join("app.exe");
+        symlink(&real_exe, &link).expect("symlink the exe");
+        let bottle = TempDir::new("exe-link-bottle");
+
+        let err = stage_run_source(&link, &c_volumes(bottle.path()), StageMode::ExeOnly)
+            .expect_err("must reject");
+        assert!(
+            err.to_string().contains("symlink"),
+            "error names the symlink: {err}"
+        );
+    }
+
+    /// A symlinked `--app-dir` is rejected up front — the copy would silently
+    /// materialize a different tree than the user pointed at. The exe is
+    /// reached through the symlink, so the containment check passes lexically
+    /// and the symlink rejection is what fires.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_app_dir_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let source = TempDir::new("app-dir-link-src");
+        let real = source.path().join("real");
+        std::fs::create_dir_all(&real).expect("create real dir");
+        fake_exe(&real, "app.exe");
+        let link = source.path().join("app");
+        symlink(&real, &link).expect("symlink the app dir");
+        let bottle = TempDir::new("app-dir-link-bottle");
+
+        let err = stage_run_source(
+            &link.join("app.exe"),
+            &c_volumes(bottle.path()),
+            StageMode::AppDir(&link),
+        )
+        .expect_err("symlinked --app-dir must be rejected");
+        assert!(
+            err.to_string().contains("symlink"),
+            "error names the symlink: {err}"
+        );
+    }
+
+    /// A symlink planted at a destination path inside the bottle is rejected
+    /// too — the copy would otherwise follow it and write outside the bottle.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_planted_in_dest_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let source = TempDir::new("dest-link-src");
+        let app_dir = source.path().join("app");
+        std::fs::create_dir_all(&app_dir).expect("create app dir");
+        std::fs::write(app_dir.join("app.exe"), b"MZ").expect("write exe");
+        let bottle = TempDir::new("dest-link-bottle");
+        let dest = bottle
+            .path()
+            .join("drive_c")
+            .join("Program Files")
+            .join("app");
+        std::fs::create_dir_all(&dest).expect("create dest");
+        // Plant a symlinked subdir at the destination of the source's "data".
+        std::fs::create_dir_all(app_dir.join("data")).expect("create source data dir");
+        std::fs::write(app_dir.join("data/x.bin"), b"x").expect("write source data");
+        symlink(bottle.path(), dest.join("data")).expect("plant dest link");
+
+        let err = stage_run_source(
+            &app_dir.join("app.exe"),
+            &c_volumes(bottle.path()),
+            StageMode::AppDir(&app_dir),
+        )
+        .expect_err("planted dest symlink must be rejected");
+        assert!(
+            err.to_string().contains("symlink"),
+            "error names the planted symlink: {err}"
+        );
+    }
+
     /// End-to-end: a micro exe outside the bottle runs from a drive_c copy,
-    /// and the guest identity labels that copy (`C:\Program Files\…` → real
-    /// bottle file).
+    /// the guest identity labels that copy (`C:\Program Files\…` → real
+    /// bottle file), and the guest current directory is the staged app folder
+    /// (`C:\Program Files\crt_hello`), not the drive root.
     #[test]
     fn run_micro_runs_outside_exe_from_bottle_copy() {
         let mut micro = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -500,8 +1039,19 @@ mod tests {
         std::fs::copy(&micro, &src_exe).expect("stage exe outside the bottle");
         let bottle = TempDir::new("run-flow-bottle");
 
-        run_micro(&src_exe, 1024, 0, Some(bottle.path()), None, None, &[])
-            .expect("run_micro exits 0 from the bottle copy");
+        run_micro(
+            &src_exe,
+            MicroRunOptions {
+                max_api: 1024,
+                expect_code: 0,
+                bottle_root: Some(bottle.path()),
+                drive_d: None,
+                stdin_path: None,
+                guest_args: &[],
+                app_dir: None,
+            },
+        )
+        .expect("run_micro exits 0 from the bottle copy");
 
         let copy = bottle
             .path()
@@ -515,12 +1065,22 @@ mod tests {
         // through that mapping (loader default is `C:\{name}`).
         let identity = wie_pe::process_identity_from_host_path_with_args(&copy, &[]);
         assert_eq!(identity.module_file_name, "crt_hello.exe");
-        let volumes = wie_winapi::VolumeConfig::from_parts(Some(bottle.path().to_path_buf()), None);
+        let volumes = c_volumes(bottle.path());
         assert_eq!(
             wie_winapi::host_path_to_guest(&volumes, &copy).as_deref(),
             Some(r"C:\Program Files\crt_hello\crt_hello.exe"),
             "the copy's guest module path is its Program Files location"
         );
+        // The raw loader identity defaults the cwd to the drive root; the
+        // session applies the staged folder's guest cwd (`stage_run_source`
+        // reports it, and the session-level test pins the propagation).
         assert_eq!(identity.current_directory, r"C:\");
+        let staged = stage_run_source(&src_exe, &c_volumes(bottle.path()), StageMode::ExeOnly)
+            .expect("re-staging reports the cwd");
+        assert_eq!(
+            staged.guest_current_directory.as_deref(),
+            Some(r"C:\Program Files\crt_hello"),
+            "the staged app's guest current directory is its app folder"
+        );
     }
 }
