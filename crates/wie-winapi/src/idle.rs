@@ -31,8 +31,8 @@ pub enum IdleContext {
 impl IdlePolicy {
     /// Parse `WIE_IDLE=busy|yield|park`. Unset → depends on [`IdleContext`].
     ///
-    /// Legacy: `WIE_HOST_SLEEP=1` alone does **not** change the policy enum, but
-    /// enables Sleep parking via [`Self::should_park_sleep`].
+    /// `WIE_HOST_SLEEP=1` is **deprecated** and no longer affects the policy enum
+    /// or [`should_park_sleep`]; Sleep parking is controlled entirely by [`IdlePolicy::Park`].
     #[must_use]
     pub fn from_env_for(ctx: IdleContext) -> Self {
         if let Some(p) = parse_wie_idle() {
@@ -63,7 +63,7 @@ impl IdlePolicy {
     /// Whether `Sleep(milliseconds > 0)` should block the host thread.
     #[must_use]
     pub fn should_park_sleep(self) -> bool {
-        matches!(self, Self::Park) || host_sleep_legacy_enabled()
+        matches!(self, Self::Park)
     }
 
     /// Whether the outer run loop should sleep on empty `GetMessage`.
@@ -143,11 +143,8 @@ fn parse_wie_idle() -> Option<IdlePolicy> {
     }
 }
 
-/// Legacy `WIE_HOST_SLEEP=1` — enables Sleep parking only.
-fn host_sleep_legacy_enabled() -> bool {
-    std::env::var_os("WIE_HOST_SLEEP").is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-}
-
+/// [`WIE_HOST_SLEEP=1`] is **deprecated** and no longer parsed.
+/// Sleep parking is now controlled entirely by [`IdlePolicy::Park`].
 fn parse_u64_env(name: &str) -> Option<u64> {
     std::env::var(name).ok()?.parse().ok()
 }

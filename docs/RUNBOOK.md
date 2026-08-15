@@ -68,6 +68,7 @@ The README keeps the shortlist; the complete set lives here.
 | `WIE_JIT_SIMD=0` | Scalar XMM lowering (no CLIF SIMD / Neon) |
 | `WIE_TLB_NEON=0` | Scalar 4-way TLB tag scan |
 | `WIE_JIT_OPT=speed\|speed_and_size\|none` | Cranelift opt_level (default **speed**) |
+| `WIE_JIT_HOTNESS_THRESHOLD` | **Experimental** fixed hotness threshold override (default **100**; clamped to `[1, 1_000_000]`) |
 | `WIE_JIT_VERIFY=1` | Enable Cranelift IR verifier outside tests |
 | `WIE_FIXED_CLOCK=1` | Freeze the guest clock table (deterministic runs) |
 | `WIE_D3D9_SCALE=2\|4\|8` | D3D9 render resolution divisor (quarter-scale = 4; Present upscales to the window) |
@@ -83,6 +84,9 @@ The README keeps the shortlist; the complete set lives here.
 | `WIE_IDLE=busy\|yield\|park` | Host idle policy: micros default **yield**; interactive default **park** |
 | `WIE_IDLE_PARK_MS` / `WIE_IDLE_MAX_PARKS` | Message-park quantum / cap |
 | `WIE_HOST_SLEEP=1` | **Legacy:** `Sleep(n>0)` park only |
+| `WIE_API_TRACE=1` | Full API dump (head+tail only by default) |
+| `WIE_INPUT_SCRIPT=<path>` | GUI input script path |
+| `WIE_VFS_DOWNLOADS=1` | Optional live check against real macOS user dir |
 | `WIE_MT=0` | Disable guest worker spawn |
 | `WIE_MT_MAX_THREADS` | Cap on guest worker threads (default **64**) |
 | `RUST_LOG` | tracing filter (CLI defaults to `warn`) |
