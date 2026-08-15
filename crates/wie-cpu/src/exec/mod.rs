@@ -16,6 +16,7 @@ mod sse_types;
 mod string;
 
 use crate::CpuError;
+use crate::consts::{DWORD_BYTES, QWORD_BITS, SHIFT_MASK_32, SHIFT_MASK_64, XMM_BYTES};
 use crate::mem::GuestMemory;
 use crate::regs::{self, RegFile, Rflags};
 use iced_x86::{Instruction, MemorySize, Mnemonic, OpKind, Register};
@@ -30,8 +31,7 @@ use ops::{ArithOp, BitOp, ShiftKind, cond_from_cmov, cond_from_jcc, cond_from_se
 use sse::{
     exec_sse_bitwise, exec_sse_byte_shift, exec_sse_comis, exec_sse_cvt_fp_to_gpr,
     exec_sse_cvt_gpr_to_fp, exec_sse_cvt_packed, exec_sse_cvtdq2pd, exec_sse_cvtpd2dq,
-    exec_sse_cvtpd2ps, exec_sse_cvtps2pd, exec_sse_cvtsd2ss, exec_sse_cvtss2sd,
-    exec_sse_int_binop,
+    exec_sse_cvtpd2ps, exec_sse_cvtps2pd, exec_sse_cvtsd2ss, exec_sse_cvtss2sd, exec_sse_int_binop,
     exec_sse_minmax_packed, exec_sse_minmax_scalar, exec_sse_mov, exec_sse_movd, exec_sse_movhlps,
     exec_sse_movhps, exec_sse_movq, exec_sse_packed_fp, exec_sse_pmovmskb, exec_sse_psadbw,
     exec_sse_pshufb, exec_sse_pshufd, exec_sse_pshuflw_hw, exec_sse_punpck, exec_sse_punpck_lanes,
@@ -454,7 +454,7 @@ fn execute_one(
         | Mnemonic::Movdqa
         | Mnemonic::Movdqu
         | Mnemonic::Movapd
-        | Mnemonic::Movupd => exec_sse_mov(mem, regs, instr, 16, false),
+        | Mnemonic::Movupd => exec_sse_mov(mem, regs, instr, XMM_BYTES, false),
         Mnemonic::Movq => exec_sse_movq(mem, regs, instr),
         Mnemonic::Pmovmskb | Mnemonic::Vpmovmskb => exec_sse_pmovmskb(regs, instr),
         Mnemonic::Xorps | Mnemonic::Xorpd | Mnemonic::Pxor => {
@@ -571,12 +571,12 @@ fn execute_one(
         // matches the x86 reset value), so only the stored word is tracked.
         Mnemonic::Stmxcsr => {
             let addr = effective_address(regs, instr)?;
-            write_mem_value(mem, addr, u64::from(regs.mxcsr()), 4)?;
+            write_mem_value(mem, addr, u64::from(regs.mxcsr()), DWORD_BYTES)?;
             Ok(())
         }
         Mnemonic::Ldmxcsr => {
             let addr = effective_address(regs, instr)?;
-            let value = read_mem_value(mem, addr, 4)?;
+            let value = read_mem_value(mem, addr, DWORD_BYTES)?;
             let word = u32::try_from(value)
                 .map_err(|_| StepExecError::Cpu(CpuError::Message("ldmxcsr value".into())))?;
             regs.set_mxcsr(word);
@@ -713,15 +713,14 @@ fn exec_lzcnt(
     instr: &Instruction,
 ) -> Result<(), StepExecError> {
     let size = op_size_bytes(instr, 1)?;
-    let bits = u32::try_from(size.saturating_mul(8))
-        .map_err(|_| StepExecError::Cpu(CpuError::Message("lzcnt size overflow".into())))?;
+    let bits = regs::size_bits(size);
     let src = read_op(mem, regs, instr, 1)? & regs::size_mask(size);
     let result = if src == 0 {
         u64::from(bits)
     } else {
         // leading_zeros() counts in 64-bit; a narrower operand masks the top
         // bits to zero, so subtract the 64-bit slack.
-        u64::from(src.leading_zeros()).saturating_sub(u64::from(64_u32.saturating_sub(bits)))
+        u64::from(src.leading_zeros()).saturating_sub(u64::from(QWORD_BITS.saturating_sub(bits)))
     };
     regs.set_flag(Rflags::CF, src == 0);
     regs.set_flag(Rflags::ZF, result == 0);
@@ -748,7 +747,7 @@ fn exec_bit_scan(
     } else if reverse {
         // Bsr index = 63 - leading_zeros (the 32-bit slack in the 64-bit
         // count cancels, so the formula is width-independent).
-        u64::from(63_u32).saturating_sub(u64::from(src.leading_zeros()))
+        u64::from(SHIFT_MASK_64).saturating_sub(u64::from(src.leading_zeros()))
     } else {
         u64::from(src.trailing_zeros())
     };
@@ -768,8 +767,13 @@ fn exec_shift(
     let mask = regs::size_mask(size);
     let dst = read_op(mem, regs, instr, 0)? & mask;
     let count_raw = read_op(mem, regs, instr, 1)? as u32;
-    // 64-bit mode: count masked with 0x3F; other widths with 0x1F.
-    let count_masked = count_raw & if bits == 64 { 0x3f } else { 0x1f };
+    // 64-bit operands mask the count with 0x3F; narrower operands with 0x1F.
+    let count_masked = count_raw
+        & if u32::try_from(bits).unwrap_or(u32::MAX) >= QWORD_BITS {
+            SHIFT_MASK_64
+        } else {
+            SHIFT_MASK_32
+        };
     // Rotate-through-carry treats the operand as `width + 1` bits (CF + data);
     // plain shifts/rotates reduce modulo the operand width.
     let width = u32::try_from(bits).unwrap_or(64);
@@ -820,7 +824,7 @@ fn exec_shift(
         }
         ShiftKind::Rcl => {
             // {CF, dst} as a (width+1)-bit value with CF at bit `width`, rotated left.
-            let total = u32::try_from(rot_width).unwrap_or(64);
+            let total = rot_width;
             let t = (u128::from(dst) << 1) | u128::from(cf_in);
             let total_mask = (u128::from(1_u64) << total).wrapping_sub(1);
             let t = ((t << count_mod) | (t >> (total - count_mod))) & total_mask;
@@ -829,7 +833,7 @@ fn exec_shift(
         }
         ShiftKind::Rcr => {
             // {CF, dst} rotated right.
-            let total = u32::try_from(rot_width).unwrap_or(64);
+            let total = rot_width;
             let t = (u128::from(dst) << 1) | u128::from(cf_in);
             let total_mask = (u128::from(1_u64) << total).wrapping_sub(1);
             let t = ((t >> count_mod) | (t << (total - count_mod))) & total_mask;
@@ -841,12 +845,12 @@ fn exec_shift(
     // ROL/ROR do not update ZF/SF/PF; SHL/SHR/SAR do.
     if matches!(kind, ShiftKind::Shl | ShiftKind::Shr | ShiftKind::Sar) {
         regs.set_flag(Rflags::ZF, result == 0);
-        let sign = 1_u64 << bits.saturating_sub(1);
+        let sign = regs::size_sign_bit(size);
         regs.set_flag(Rflags::SF, (result & sign) != 0);
         regs.set_flag(Rflags::PF, (result as u8).count_ones().is_multiple_of(2));
     }
     if count_mod == 1 {
-        let sign = 1_u64 << bits.saturating_sub(1);
+        let sign = regs::size_sign_bit(size);
         let of = match kind {
             ShiftKind::Shl => ((result ^ dst) & sign) != 0,
             ShiftKind::Shr => (dst & sign) != 0,
@@ -857,7 +861,8 @@ fn exec_shift(
                 let b2 = (result >> bits.saturating_sub(2)) & 1;
                 b1 != b2
             }
-            ShiftKind::Rcl => (cf as u64 ^ ((result >> bits.saturating_sub(1)) & 1)) != 0,            ShiftKind::Rcr => {
+            ShiftKind::Rcl => (cf as u64 ^ ((result >> bits.saturating_sub(1)) & 1)) != 0,
+            ShiftKind::Rcr => {
                 let b1 = (result >> bits.saturating_sub(1)) & 1;
                 let b2 = (result >> bits.saturating_sub(2)) & 1;
                 b1 != b2
@@ -1231,11 +1236,13 @@ fn effective_address(regs: &RegFile, instr: &Instruction) -> Result<u64, StepExe
     let mut addr = instr.memory_displacement64();
 
     // FS/GS segment overrides (x64: FS and GS are the only meaningful segments).
-    // Windows x64 uses GS:0 as TEB base.  When an instruction carries a GS segment
-    // prefix, the effective address is relative to the TEB, not to address zero.
+    // Windows x64 uses GS:0 as the per-thread TEB base, which lives at
+    // `regs.gs_base()` — the engine's bound TEB page, NOT a process-wide
+    // constant. When an instruction carries a GS segment prefix, the effective
+    // address is relative to that base, not to address zero.
     let seg = instr.memory_segment();
     if seg == Register::GS || seg == Register::FS {
-        addr = addr.wrapping_add(crate::GS_BASE);
+        addr = addr.wrapping_add(regs.gs_base());
     }
     // Non-IP-relative: treat displacement as signed when displ size is set.
     // iced keeps mem_displ as unsigned bits of the signed field; for pure disp

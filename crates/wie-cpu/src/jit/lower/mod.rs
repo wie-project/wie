@@ -272,6 +272,13 @@ pub(super) struct JitCtx {
     pub gpr: [u64; 16],
     pub rflags: u64,
     pub rip: u64,
+    /// Guest GS segment base — the TEB page the executing thread is bound to.
+    ///
+    /// GS-relative guest accesses (`gs:[0x68]` last-error, `gs:[0x30]`
+    /// TEB.Self, …) resolve against this runtime value, never the compile-time
+    /// [`crate::GS_BASE`]. The compiled-code cache is shared across threads,
+    /// so a hardcoded base would make a worker engine read the primary TEB.
+    pub gs_base: u64,
     /// Guest memory for load/store host helpers (cross-page / fault).
     pub mem: *mut GuestMemory,
     /// Non-zero → invalid memory; `rip` holds faulting guest IP.
@@ -388,6 +395,7 @@ pub(super) struct MemPathSlice {
 // gpr[16] @ 0, rflags @ 128, rip @ 136, mem @ 144, fault @ 152, …
 pub(super) const OFF_RFLAGS: i32 = std::mem::offset_of!(JitCtx, rflags) as i32;
 pub(super) const OFF_RIP: i32 = std::mem::offset_of!(JitCtx, rip) as i32;
+pub(super) const OFF_GS_BASE: i32 = std::mem::offset_of!(JitCtx, gs_base) as i32;
 pub(super) const OFF_FAULT: i32 = std::mem::offset_of!(JitCtx, fault) as i32;
 pub(super) const OFF_SHADOW_SP: i32 = std::mem::offset_of!(JitCtx, shadow_sp) as i32;
 pub(super) const OFF_XMM: i32 = std::mem::offset_of!(JitCtx, xmm) as i32;
@@ -419,6 +427,7 @@ pub(super) const MAX_CHAIN_DEPTH: u64 = 48;
 const _: () = {
     assert!(std::mem::offset_of!(JitCtx, rflags) as i32 == OFF_RFLAGS);
     assert!(std::mem::offset_of!(JitCtx, rip) as i32 == OFF_RIP);
+    assert!(std::mem::offset_of!(JitCtx, gs_base) as i32 == OFF_GS_BASE);
     assert!(std::mem::offset_of!(JitCtx, fault) as i32 == OFF_FAULT);
     assert!(std::mem::offset_of!(JitCtx, xmm) as i32 == OFF_XMM);
     assert!(std::mem::offset_of!(JitCtx, shadow_sp) as i32 == OFF_SHADOW_SP);
@@ -1324,7 +1333,7 @@ pub(super) fn lower_setcc(
     match instr.op0_kind() {
         OpKind::Register => write_gpr(bcx, gpr, dirty, instr.op_register(0), val),
         OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             call_store(bcx, mem, gpr, rflags, addr, 1, val, instr.ip())
         }
         _ => Err("setcc form".into()),

@@ -681,6 +681,7 @@ impl JitCpu {
             gpr,
             rflags: u64::from(regs.rflags),
             rip: entry_rip,
+            gs_base: regs.gs_base(),
             mem: mem_ptr,
             fault: 0,
             fault_addr: 0,

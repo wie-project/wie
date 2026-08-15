@@ -111,7 +111,7 @@ pub(super) fn lower_sse_mov(
             read_xmm_pair(xmm, instr.op_register(1))?
         }
         OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             load_sse_mem(bcx, mem, gpr, rflags, addr, nbytes, ip)?
         }
         _ => return Err("sse mov src".into()),
@@ -145,7 +145,7 @@ pub(super) fn lower_sse_mov(
             Ok(())
         }
         OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             store_sse_mem(bcx, mem, gpr, rflags, addr, src_lo, src_hi, nbytes, ip)
         }
         _ => Err("sse mov dst".into()),
@@ -173,7 +173,7 @@ pub(super) fn lower_sse_movq(
                 (v, iconst_u64(bcx, 0))
             }
             OpKind::Memory => {
-                let addr = effective_addr(bcx, instr, gpr)?;
+                let addr = effective_addr(bcx, instr, gpr, mem)?;
                 load_sse_mem(bcx, mem, gpr, rflags, addr, 8, ip)?
             }
             _ => return Err("movq src".into()),
@@ -187,7 +187,7 @@ pub(super) fn lower_sse_movq(
     if instr.op1_kind() == OpKind::Register && r1.is_xmm() {
         let (lo, _) = read_xmm_pair(xmm, r1)?;
         if instr.op0_kind() == OpKind::Memory {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             return call_store(bcx, mem, gpr, rflags, addr, 8, lo, ip);
         }
         return write_gpr(bcx, gpr, dirty, r0, lo);
@@ -195,7 +195,7 @@ pub(super) fn lower_sse_movq(
     // mem, xmm
     if instr.op0_kind() == OpKind::Memory && r1.is_xmm() {
         let (lo, _) = read_xmm_pair(xmm, r1)?;
-        let addr = effective_addr(bcx, instr, gpr)?;
+        let addr = effective_addr(bcx, instr, gpr, mem)?;
         return call_store(bcx, mem, gpr, rflags, addr, 8, lo, ip);
     }
     Err("movq form".into())
@@ -259,7 +259,7 @@ pub(super) fn lower_sse_movd(
                 bcx.ins().band(v, m)
             }
             OpKind::Memory => {
-                let addr = effective_addr(bcx, instr, gpr)?;
+                let addr = effective_addr(bcx, instr, gpr, mem)?;
                 call_load(bcx, mem, gpr, rflags, addr, 4, ip)?
             }
             _ => return Err("movd src".into()),
@@ -274,7 +274,7 @@ pub(super) fn lower_sse_movd(
         let m = iconst_u64(bcx, 0xffff_ffff);
         let v = bcx.ins().band(lo, m);
         if instr.op0_kind() == OpKind::Memory {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             return call_store(bcx, mem, gpr, rflags, addr, 4, v, ip);
         }
         return write_gpr(bcx, gpr, dirty, r0, v);
@@ -296,7 +296,7 @@ pub(super) fn lower_sse_movhps(
     let r0 = instr.op_register(0);
     if r0.is_xmm() {
         // xmm, m64: load 8 bytes from memory into upper 64 bits
-        let addr = effective_addr(bcx, instr, gpr)?;
+        let addr = effective_addr(bcx, instr, gpr, mem)?;
         let loaded = call_load(bcx, mem, gpr, rflags, addr, 8, ip)?;
         let (old_lo, _) = read_xmm_pair(xmm, r0)?;
         store_xmm_pair(bcx, mem, xmm, xmm_index(r0)?, old_lo, loaded);
@@ -305,7 +305,7 @@ pub(super) fn lower_sse_movhps(
     // m64, xmm: store upper 64 bits of XMM to memory
     let r1 = instr.op_register(1);
     let (_, hi) = read_xmm_pair(xmm, r1)?;
-    let addr = effective_addr(bcx, instr, gpr)?;
+    let addr = effective_addr(bcx, instr, gpr, mem)?;
     call_store(bcx, mem, gpr, rflags, addr, 8, hi, ip)
 }
 
@@ -367,7 +367,7 @@ pub(super) fn lower_sse_punpck_lanes(
     let (b_lo, b_hi) = match instr.op1_kind() {
         OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
         OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
         }
         _ => return Err("punpck lanes src".into()),
@@ -495,7 +495,7 @@ pub(super) fn lower_sse_pshufd(
     let (s_lo, s_hi) = match instr.op1_kind() {
         OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
         OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
         }
         _ => return Err("pshufd src".into()),
@@ -548,7 +548,7 @@ pub(super) fn lower_sse_shufpd(
     let (s2_lo, s2_hi) = match instr.op1_kind() {
         OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
         OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
         }
         _ => return Err("shufpd src".into()),
@@ -574,7 +574,7 @@ pub(super) fn lower_sse_pshuflw_hw(
     let (s_lo, s_hi) = match instr.op1_kind() {
         OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
         OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
         }
         _ => return Err("pshuflw/hw src".into()),
@@ -820,7 +820,7 @@ pub(super) fn lower_sse_int_binop(
     let (b_lo, b_hi) = match instr.op1_kind() {
         OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
         OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
         }
         _ => return Err("sse int binop src".into()),

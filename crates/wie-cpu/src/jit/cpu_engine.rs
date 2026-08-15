@@ -542,4 +542,12 @@ impl CpuEngine for JitCpu {
         self.invalidate_tlb();
         self.invalidate_chain_and_shadow();
     }
+
+    fn set_gs_base(&mut self, base: u64) {
+        self.thread.regs.set_gs_base(base);
+    }
+
+    fn gs_base(&self) -> u64 {
+        self.thread.regs.gs_base()
+    }
 }

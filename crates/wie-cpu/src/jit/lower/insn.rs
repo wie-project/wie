@@ -19,8 +19,8 @@ use super::sse::{
 };
 use super::sse_fp::{
     FloatBinOp, FloatWidth, lower_sse_bitwise, lower_sse_byte_shift, lower_sse_comis,
-    lower_sse_cvt_fp_to_gpr, lower_sse_cvt_gpr_to_fp, lower_sse_cvt_packed, lower_sse_cvtdq2pd,
-    lower_sse_cvtpd_packed, lower_sse_cvtps2pd, lower_sse_cvt_scalar_preserve,
+    lower_sse_cvt_fp_to_gpr, lower_sse_cvt_gpr_to_fp, lower_sse_cvt_packed,
+    lower_sse_cvt_scalar_preserve, lower_sse_cvtdq2pd, lower_sse_cvtpd_packed, lower_sse_cvtps2pd,
     lower_sse_fp_binop_packed, lower_sse_fp_binop_scalar, lower_sse_fp_unop_packed,
     lower_sse_fp_unop_scalar, lower_sse_packed_fp, lower_sse_pshufb, lower_sse_scalar_fp,
     lower_sse_shift,
@@ -266,7 +266,7 @@ pub(super) fn lower_insn(
         Mnemonic::Cwde | Mnemonic::Cdqe => lower_cwde_cdqe(bcx, instr, gpr, dirty),
         Mnemonic::Cbw => lower_cbw(bcx, gpr, dirty),
         Mnemonic::Cwd => lower_cwd(bcx, gpr, dirty),
-        Mnemonic::Lea => lower_lea(bcx, instr, gpr, dirty),
+        Mnemonic::Lea => lower_lea(bcx, instr, gpr, dirty, mem),
         Mnemonic::Push => lower_push(bcx, instr, gpr, dirty, *rflags, mem),
         Mnemonic::Pop => lower_pop(bcx, instr, gpr, dirty, *rflags, mem),
         // PUSHFQ/POPFQ/LEAVE: need live flags (push) or overwrite them (pop).
@@ -739,24 +739,12 @@ pub(super) fn lower_insn(
         // CVTPS2PD: two singles → two doubles (native f32→f64 promote).
         Mnemonic::Cvtps2pd => lower_sse_cvtps2pd(bcx, instr, gpr, *rflags, mem, xmm),
         // CVTPD2DQ / CVTPD2PS: two doubles → dwords / singles (host helper).
-        Mnemonic::Cvtpd2dq => lower_sse_cvtpd_packed(
-            bcx,
-            instr,
-            gpr,
-            *rflags,
-            mem,
-            xmm,
-            exec::SseCvtOp::Cvtpd2dq,
-        ),
-        Mnemonic::Cvtpd2ps => lower_sse_cvtpd_packed(
-            bcx,
-            instr,
-            gpr,
-            *rflags,
-            mem,
-            xmm,
-            exec::SseCvtOp::Cvtpd2ps,
-        ),
+        Mnemonic::Cvtpd2dq => {
+            lower_sse_cvtpd_packed(bcx, instr, gpr, *rflags, mem, xmm, exec::SseCvtOp::Cvtpd2dq)
+        }
+        Mnemonic::Cvtpd2ps => {
+            lower_sse_cvtpd_packed(bcx, instr, gpr, *rflags, mem, xmm, exec::SseCvtOp::Cvtpd2ps)
+        }
         // Scalar converts: low lane only, upper destination bits preserved.
         Mnemonic::Cvtsd2ss => lower_sse_cvt_scalar_preserve(
             bcx,

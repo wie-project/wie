@@ -5,6 +5,10 @@
 //! `SseFpBinOp` / `SseCvtOp`) live in [`super::sse_types`].
 
 use crate::CpuError;
+use crate::consts::{
+    BITS_PER_BYTE, DWORD_BITS, DWORD_BYTES, DWORD_MASK, QWORD_BITS, QWORD_BYTES, SPLAT_DWORD,
+    SPLAT_WORD, WORD_BITS, XMM_BYTES,
+};
 use crate::mem::GuestMemory;
 use crate::regs::{RegFile, Rflags};
 use iced_x86::{Instruction, Mnemonic, OpKind};
@@ -13,6 +17,23 @@ use super::{
     AccessType, FpOp, InvalidMem, SseBitOp, SseCvtOp, SseFpBinOp, SseFpUnOp, SseIntOp, SseShiftOp,
     StepExecError, effective_address, read_mem_value, write_mem_value,
 };
+
+/// Packed f64 lanes in an XMM register (2 × 64-bit).
+const F64_LANES: usize = 2;
+/// Packed f32 lanes in an XMM register (4 × 32-bit).
+const F32_LANES: usize = 4;
+
+/// Bytes of a scalar FP operand: 8 for double, 4 for single.
+#[must_use]
+fn scalar_fp_bytes(is_double: bool) -> usize {
+    if is_double { QWORD_BYTES } else { DWORD_BYTES }
+}
+
+/// All-ones mask covering the low `nbytes` bytes of a 128-bit XMM value.
+#[must_use]
+fn xmm_low_mask(nbytes: usize) -> u128 {
+    (1u128 << (nbytes.saturating_mul(8))) - 1
+}
 
 pub(super) fn is_sse_movsd(instr: &Instruction) -> bool {
     instr.op0_register().is_xmm()
@@ -104,15 +125,15 @@ pub(super) fn exec_sse_packed_fp(
     let b = read_sse_op(mem, regs, instr, 1, 16)?;
     let mut out = 0_u128;
     if is_f64 {
-        for i in 0..2 {
-            let shift = i * 64;
+        for i in 0..F64_LANES {
+            let shift = i * usize::try_from(QWORD_BITS).unwrap_or(0);
             let fa = f64::from_bits(((a >> shift) & u128::from(u64::MAX)) as u64);
             let fb = f64::from_bits(((b >> shift) & u128::from(u64::MAX)) as u64);
             out |= u128::from(fp64(op, fa, fb).to_bits()) << shift;
         }
     } else {
-        for i in 0..4 {
-            let shift = i * 32;
+        for i in 0..F32_LANES {
+            let shift = i * usize::try_from(DWORD_BITS).unwrap_or(0);
             let fa = f32::from_bits(((a >> shift) & 0xffff_ffff) as u32);
             let fb = f32::from_bits(((b >> shift) & 0xffff_ffff) as u32);
             out |= u128::from(fp32(op, fa, fb).to_bits()) << shift;
@@ -128,7 +149,7 @@ pub(super) fn exec_sse_movq(
 ) -> Result<(), StepExecError> {
     // `MOVQ xmm, r/m64`: low quadword moved, bits [127:64] cleared.
     if instr.op0_register().is_xmm() {
-        let v = read_sse_op(mem, regs, instr, 1, 8)?;
+        let v = read_sse_op(mem, regs, instr, 1, QWORD_BYTES)?;
         let v = v & u128::from(u64::MAX);
         regs.write_xmm(instr.op_register(0), v)?;
         return Ok(());
@@ -137,7 +158,7 @@ pub(super) fn exec_sse_movq(
     if instr.op1_register().is_xmm() {
         let v = regs.read_xmm(instr.op_register(1))? as u64;
         if instr.op0_kind() == OpKind::Memory {
-            write_mem_value(mem, effective_address(regs, instr)?, v, 8)?;
+            write_mem_value(mem, effective_address(regs, instr)?, v, QWORD_BYTES)?;
         } else {
             regs.write_reg(instr.op_register(0), v)?;
         }
@@ -155,7 +176,7 @@ pub(super) fn exec_sse_movd(
 ) -> Result<(), StepExecError> {
     if instr.op0_register().is_xmm() {
         let v = if instr.op1_kind() == OpKind::Memory {
-            read_mem_value(mem, effective_address(regs, instr)?, 4)?
+            read_mem_value(mem, effective_address(regs, instr)?, DWORD_BYTES)?
         } else {
             regs.read_reg(instr.op_register(1))? & 0xffff_ffff
         };
@@ -166,7 +187,7 @@ pub(super) fn exec_sse_movd(
     if instr.op1_register().is_xmm() {
         let v = regs.read_xmm(instr.op_register(1))? as u64 & 0xffff_ffff;
         if instr.op0_kind() == OpKind::Memory {
-            write_mem_value(mem, effective_address(regs, instr)?, v, 4)?;
+            write_mem_value(mem, effective_address(regs, instr)?, v, DWORD_BYTES)?;
         } else {
             regs.write_reg(instr.op_register(0), v)?;
         }
@@ -190,7 +211,7 @@ pub(super) fn exec_sse_pmovmskb(
 ) -> Result<(), StepExecError> {
     let src = regs.read_xmm(instr.op_register(1))?;
     let mut mask: u32 = 0;
-    for i in 0_u32..16 {
+    for i in 0..XMM_BYTES {
         let shift = i.saturating_mul(8);
         let byte = (src >> shift) & 0xff;
         if byte & 0x80 != 0 {
@@ -213,7 +234,7 @@ pub(super) fn exec_sse_movhps(
 ) -> Result<(), StepExecError> {
     if instr.op0_register().is_xmm() {
         // xmm_dst, m64_src  → load into upper 64 bits
-        let src = read_sse_op(mem, regs, instr, 1, 8)?; // 8 bytes from memory
+        let src = read_sse_op(mem, regs, instr, 1, QWORD_BYTES)?; // 8 bytes from memory
         let old = regs.read_xmm(instr.op_register(0))?; // current XMM value
         let new = (old & u128::from(u64::MAX)) | (src << 64); // merge into upper half
         regs.write_xmm(instr.op_register(0), new)?;
@@ -222,7 +243,7 @@ pub(super) fn exec_sse_movhps(
         let src_reg = instr.op_register(1);
         let xmm_val = regs.read_xmm(src_reg)?;
         let upper = (xmm_val >> 64) as u64;
-        write_sse_op(mem, regs, instr, 0, u128::from(upper), 8, false)?;
+        write_sse_op(mem, regs, instr, 0, u128::from(upper), QWORD_BYTES, false)?;
     }
     Ok(())
 }
@@ -286,9 +307,9 @@ pub(super) fn exec_sse_pshufd(
     instr: &Instruction,
 ) -> Result<(), StepExecError> {
     let dst = instr.op_register(0);
-    let src_val = read_sse_op(mem, regs, instr, 1, 16)?;
+    let src_val = read_sse_op(mem, regs, instr, 1, XMM_BYTES)?;
     let imm8 = instr.immediate(2) as u8;
-    let lanes: Vec<u32> = (0..4)
+    let lanes: Vec<u32> = (0..F32_LANES)
         .map(|i| {
             let src_lane = ((imm8 >> (i * 2)) & 3) as usize;
             ((src_val >> (src_lane * 32)) & 0xffff_ffff) as u32
@@ -339,7 +360,7 @@ pub(super) fn exec_sse_pshuflw_hw(
     instr: &Instruction,
 ) -> Result<(), StepExecError> {
     let dst = instr.op_register(0);
-    let src_val = read_sse_op(mem, regs, instr, 1, 16)?;
+    let src_val = read_sse_op(mem, regs, instr, 1, XMM_BYTES)?;
     let imm8 = instr.immediate(2) as u8;
     let low = instr.mnemonic() == Mnemonic::Pshuflw;
     // The untouched half (high words for pshuflw, low words for pshufhw) is
@@ -349,10 +370,10 @@ pub(super) fn exec_sse_pshuflw_hw(
     } else {
         src_val & u128::from(u64::MAX)
     };
-    let base = if low { 0 } else { 4 };
-    for i in 0..4 {
+    let base = if low { 0 } else { F32_LANES };
+    for i in 0..F32_LANES {
         let src_lane = ((imm8 >> (i * 2)) & 3) as usize;
-        let from = if low { src_lane } else { 4 + src_lane };
+        let from = if low { src_lane } else { F32_LANES + src_lane };
         let word = ((src_val >> (from * 16)) & 0xffff) as u16;
         result |= u128::from(word) << ((base + i) * 16);
     }
@@ -508,25 +529,33 @@ pub(super) fn exec_sse_shift(
     instr: &Instruction,
     op: SseShiftOp,
 ) -> Result<(), StepExecError> {
-    let a = read_sse_op(mem, regs, instr, 0, 16)?;
+    let a = read_sse_op(mem, regs, instr, 0, XMM_BYTES)?;
     let count = match instr.op_kind(1) {
         OpKind::Immediate8 | OpKind::Immediate16 | OpKind::Immediate32 => {
             let c = u64::from(instr.immediate(1) as u8);
             let width = match op {
-                SseShiftOp::Psllw | SseShiftOp::Psrlw | SseShiftOp::Psraw => 16,
-                SseShiftOp::Pslld | SseShiftOp::Psrld | SseShiftOp::Psrad => 32,
-                SseShiftOp::Psllq | SseShiftOp::Psrlq => 64,
+                SseShiftOp::Psllw | SseShiftOp::Psrlw | SseShiftOp::Psraw => WORD_BITS,
+                SseShiftOp::Pslld | SseShiftOp::Psrld | SseShiftOp::Psrad => DWORD_BITS,
+                SseShiftOp::Psllq | SseShiftOp::Psrlq => QWORD_BITS,
             };
             let splat = match width {
-                16 => c * 0x0001_0001_0001_0001,
-                32 => c * 0x0000_0001_0000_0001,
+                WORD_BITS => c * SPLAT_WORD,
+                DWORD_BITS => c * SPLAT_DWORD,
                 _ => c,
             };
             u128::from(splat) | (u128::from(splat) << 64)
         }
-        _ => read_sse_op(mem, regs, instr, 1, 16)?,
+        _ => read_sse_op(mem, regs, instr, 1, XMM_BYTES)?,
     };
-    write_sse_op(mem, regs, instr, 0, sse_shift_u128(op, a, count), 16, false)
+    write_sse_op(
+        mem,
+        regs,
+        instr,
+        0,
+        sse_shift_u128(op, a, count),
+        XMM_BYTES,
+        false,
+    )
 }
 
 /// `Psrldq/Psldq` — byte-granular shift of the whole 128-bit XMM register
@@ -563,7 +592,7 @@ pub(super) fn exec_sse_sqrt_scalar(
     instr: &Instruction,
     is_double: bool,
 ) -> Result<(), StepExecError> {
-    let nbytes = if is_double { 8 } else { 4 };
+    let nbytes = scalar_fp_bytes(is_double);
     let src = read_sse_op(mem, regs, instr, 1, nbytes)?;
     let op = if is_double {
         SseFpUnOp::Sqrtsd
@@ -581,15 +610,15 @@ pub(super) fn exec_sse_sqrt_packed(
     instr: &Instruction,
     is_double: bool,
 ) -> Result<(), StepExecError> {
-    let src = read_sse_op(mem, regs, instr, 1, 16)?;
+    let src = read_sse_op(mem, regs, instr, 1, XMM_BYTES)?;
     let op = if is_double {
         SseFpUnOp::Sqrtpd
     } else {
         SseFpUnOp::Sqrtps
     };
     let r = u128::from(sse_fp_unop(op, src as u64))
-        | (u128::from(sse_fp_unop(op, (src >> 64) as u64)) << 64);
-    write_sse_op(mem, regs, instr, 0, r, 16, false)
+        | (u128::from(sse_fp_unop(op, (src >> QWORD_BITS) as u64)) << QWORD_BITS);
+    write_sse_op(mem, regs, instr, 0, r, XMM_BYTES, false)
 }
 
 /// `Minss/Minsd/Maxss/Maxsd` — scalar FP min/max, merged into the low lane.
@@ -600,7 +629,7 @@ pub(super) fn exec_sse_minmax_scalar(
     op: SseFpBinOp,
 ) -> Result<(), StepExecError> {
     let is_double = matches!(op, SseFpBinOp::Minsd | SseFpBinOp::Maxsd);
-    let nbytes = if is_double { 8 } else { 4 };
+    let nbytes = scalar_fp_bytes(is_double);
     let a = read_sse_op(mem, regs, instr, 0, nbytes)?;
     let b = read_sse_op(mem, regs, instr, 1, nbytes)?;
     let r = sse_fp_binop(op, a as u64, b as u64);
@@ -614,11 +643,15 @@ pub(super) fn exec_sse_minmax_packed(
     instr: &Instruction,
     op: SseFpBinOp,
 ) -> Result<(), StepExecError> {
-    let a = read_sse_op(mem, regs, instr, 0, 16)?;
-    let b = read_sse_op(mem, regs, instr, 1, 16)?;
+    let a = read_sse_op(mem, regs, instr, 0, XMM_BYTES)?;
+    let b = read_sse_op(mem, regs, instr, 1, XMM_BYTES)?;
     let r = u128::from(sse_fp_binop(op, a as u64, b as u64))
-        | (u128::from(sse_fp_binop(op, (a >> 64) as u64, (b >> 64) as u64)) << 64);
-    write_sse_op(mem, regs, instr, 0, r, 16, false)
+        | (u128::from(sse_fp_binop(
+            op,
+            (a >> QWORD_BITS) as u64,
+            (b >> QWORD_BITS) as u64,
+        )) << QWORD_BITS);
+    write_sse_op(mem, regs, instr, 0, r, XMM_BYTES, false)
 }
 
 /// `Comiss/Comisd/Ucomiss/Ucomisd` — compare FP, set ZF/PF/CF (OF/AF/SF cleared).
@@ -628,7 +661,7 @@ pub(super) fn exec_sse_comis(
     instr: &Instruction,
     is_double: bool,
 ) -> Result<(), StepExecError> {
-    let nbytes = if is_double { 8 } else { 4 };
+    let nbytes = scalar_fp_bytes(is_double);
     let a = read_sse_op(mem, regs, instr, 0, nbytes)?;
     let b = read_sse_op(mem, regs, instr, 1, nbytes)?;
     let (unordered, eq, lt) = if is_double {
@@ -663,7 +696,7 @@ pub(super) fn exec_sse_cvt_gpr_to_fp(
     };
     let src = if instr.op1_kind() == OpKind::Memory {
         let addr = effective_address(regs, instr)?;
-        let w = if is64 { 8 } else { 4 };
+        let w = if is64 { QWORD_BYTES } else { DWORD_BYTES };
         read_mem_value(mem, addr, w)?
     } else {
         regs.read_reg(instr.op_register(1))?
@@ -675,7 +708,7 @@ pub(super) fn exec_sse_cvt_gpr_to_fp(
         (true, true) => SseCvtOp::Cvtsi2sd64,
     };
     let bits = sse_cvt(op, src);
-    let nbytes = if is_double { 8 } else { 4 };
+    let nbytes = scalar_fp_bytes(is_double);
     write_sse_op(mem, regs, instr, 0, u128::from(bits), nbytes, true)
 }
 
@@ -688,7 +721,7 @@ pub(super) fn exec_sse_cvt_fp_to_gpr(
     let is_double = matches!(instr.mnemonic(), Mnemonic::Cvttsd2si | Mnemonic::Cvtsd2si);
     let trunc = matches!(instr.mnemonic(), Mnemonic::Cvttss2si | Mnemonic::Cvttsd2si);
     let is64 = instr.op_register(0).size() == 8;
-    let nbytes = if is_double { 8 } else { 4 };
+    let nbytes = scalar_fp_bytes(is_double);
     let a = read_sse_op(mem, regs, instr, 1, nbytes)?;
     let op = match (is_double, is64, trunc) {
         (false, false, true) => SseCvtOp::Cvttss2si32,
@@ -730,11 +763,11 @@ pub(super) fn exec_sse_cvtdq2pd(
     regs: &mut RegFile,
     instr: &Instruction,
 ) -> Result<(), StepExecError> {
-    let src = read_sse_op(mem, regs, instr, 1, 8)?;
+    let src = read_sse_op(mem, regs, instr, 1, QWORD_BYTES)?;
     let d0 = f64::from(src as u32 as i32);
-    let d1 = f64::from(((src >> 32) as u32) as i32);
-    let r = u128::from(d0.to_bits()) | (u128::from(d1.to_bits()) << 64);
-    write_sse_op(mem, regs, instr, 0, r, 16, false)
+    let d1 = f64::from(((src >> DWORD_BITS) as u32) as i32);
+    let r = u128::from(d0.to_bits()) | (u128::from(d1.to_bits()) << QWORD_BITS);
+    write_sse_op(mem, regs, instr, 0, r, XMM_BYTES, false)
 }
 
 /// `Cvtps2pd xmm, xmm/m64` — convert two packed single-precision floats (the
@@ -745,11 +778,11 @@ pub(super) fn exec_sse_cvtps2pd(
     regs: &mut RegFile,
     instr: &Instruction,
 ) -> Result<(), StepExecError> {
-    let src = read_sse_op(mem, regs, instr, 1, 8)?;
+    let src = read_sse_op(mem, regs, instr, 1, QWORD_BYTES)?;
     let f0 = f64::from(f32::from_bits(src as u32));
-    let f1 = f64::from(f32::from_bits((src >> 32) as u32));
-    let r = u128::from(f0.to_bits()) | (u128::from(f1.to_bits()) << 64);
-    write_sse_op(mem, regs, instr, 0, r, 16, false)
+    let f1 = f64::from(f32::from_bits((src >> DWORD_BITS) as u32));
+    let r = u128::from(f0.to_bits()) | (u128::from(f1.to_bits()) << QWORD_BITS);
+    write_sse_op(mem, regs, instr, 0, r, XMM_BYTES, false)
 }
 
 /// `Cvtpd2dq xmm, xmm/m128` — convert two packed doubles to two packed signed
@@ -760,11 +793,11 @@ pub(super) fn exec_sse_cvtpd2dq(
     regs: &mut RegFile,
     instr: &Instruction,
 ) -> Result<(), StepExecError> {
-    let src = read_sse_op(mem, regs, instr, 1, 16)?;
+    let src = read_sse_op(mem, regs, instr, 1, XMM_BYTES)?;
     let lo = sse_cvt(SseCvtOp::Cvtpd2dq, src as u64);
-    let hi = sse_cvt(SseCvtOp::Cvtpd2dq, (src >> 64) as u64);
-    let r = u128::from(lo) | (u128::from(hi) << 32);
-    write_sse_op(mem, regs, instr, 0, r, 16, false)
+    let hi = sse_cvt(SseCvtOp::Cvtpd2dq, (src >> QWORD_BITS) as u64);
+    let r = u128::from(lo) | (u128::from(hi) << DWORD_BITS);
+    write_sse_op(mem, regs, instr, 0, r, XMM_BYTES, false)
 }
 
 /// `Cvtpd2ps xmm, xmm/m128` — convert two packed doubles to two packed singles
@@ -774,11 +807,11 @@ pub(super) fn exec_sse_cvtpd2ps(
     regs: &mut RegFile,
     instr: &Instruction,
 ) -> Result<(), StepExecError> {
-    let src = read_sse_op(mem, regs, instr, 1, 16)?;
+    let src = read_sse_op(mem, regs, instr, 1, XMM_BYTES)?;
     let lo = sse_cvt(SseCvtOp::Cvtpd2ps, src as u64);
-    let hi = sse_cvt(SseCvtOp::Cvtpd2ps, (src >> 64) as u64);
-    let r = u128::from(lo) | (u128::from(hi) << 32);
-    write_sse_op(mem, regs, instr, 0, r, 16, false)
+    let hi = sse_cvt(SseCvtOp::Cvtpd2ps, (src >> QWORD_BITS) as u64);
+    let r = u128::from(lo) | (u128::from(hi) << DWORD_BITS);
+    write_sse_op(mem, regs, instr, 0, r, XMM_BYTES, false)
 }
 
 /// `Cvtsd2ss xmm, xmm/m64` — convert the low double to a single; bits 32-127
@@ -789,7 +822,7 @@ pub(super) fn exec_sse_cvtsd2ss(
     instr: &Instruction,
 ) -> Result<(), StepExecError> {
     let dst = instr.op_register(0);
-    let src = read_sse_op(mem, regs, instr, 1, 8)?;
+    let src = read_sse_op(mem, regs, instr, 1, QWORD_BYTES)?;
     let f = f64::from_bits(src as u64) as f32;
     let old = regs.read_xmm(dst)?;
     // Keep bits 32-127; replace only the low 32 bits with the f32 result.
@@ -806,7 +839,7 @@ pub(super) fn exec_sse_cvtss2sd(
     instr: &Instruction,
 ) -> Result<(), StepExecError> {
     let dst = instr.op_register(0);
-    let src = read_sse_op(mem, regs, instr, 1, 4)?;
+    let src = read_sse_op(mem, regs, instr, 1, DWORD_BYTES)?;
     let f = f64::from(f32::from_bits(src as u32));
     let old = regs.read_xmm(dst)?;
     let r = (old & 0xffff_ffff_ffff_ffff_0000_0000_0000_0000_u128) | u128::from(f.to_bits());
@@ -824,7 +857,7 @@ pub(super) fn exec_sse_unpcklpd(
     let a = regs.read_xmm(dst)?;
     let b = regs.read_xmm(src)?;
     // Low 64 bits from dst, low 64 bits from src.
-    let result = (a & 0xffff_ffff_ffff_ffff) | ((b & 0xffff_ffff_ffff_ffff) << 64);
+    let result = (a & u128::from(u64::MAX)) | ((b & u128::from(u64::MAX)) << QWORD_BITS);
     regs.write_xmm(dst, result)?;
     Ok(())
 }
@@ -837,26 +870,26 @@ pub(super) fn exec_sse_psadbw(
     regs: &mut RegFile,
     instr: &Instruction,
 ) -> Result<(), StepExecError> {
-    let a = read_sse_op(mem, regs, instr, 0, 16)?;
-    let b = read_sse_op(mem, regs, instr, 1, 16)?;
-    let low_sum: u64 = (0..8)
+    let a = read_sse_op(mem, regs, instr, 0, XMM_BYTES)?;
+    let b = read_sse_op(mem, regs, instr, 1, XMM_BYTES)?;
+    let low_sum: u64 = (0..QWORD_BYTES)
         .map(|i| {
-            let shift = i * 8;
+            let shift = i * usize::try_from(BITS_PER_BYTE).unwrap_or(0);
             let a_byte = ((a >> shift) & 0xff) as u64;
             let b_byte = ((b >> shift) & 0xff) as u64;
             a_byte.abs_diff(b_byte)
         })
         .sum();
-    let high_sum: u64 = (0..8)
+    let high_sum: u64 = (0..QWORD_BYTES)
         .map(|i| {
-            let shift = (i + 8) * 8;
+            let shift = (i + QWORD_BYTES) * usize::try_from(BITS_PER_BYTE).unwrap_or(0);
             let a_byte = ((a >> shift) & 0xff) as u64;
             let b_byte = ((b >> shift) & 0xff) as u64;
             a_byte.abs_diff(b_byte)
         })
         .sum();
     let result = u128::from(low_sum) | (u128::from(high_sum) << 64);
-    write_sse_op(mem, regs, instr, 0, result, 16, false)
+    write_sse_op(mem, regs, instr, 0, result, XMM_BYTES, false)
 }
 
 // --- Packed integer SSE2: shared lane core (interpreter + JIT host helpers) ---
@@ -891,7 +924,7 @@ fn sse_lane_binop<F>(a: u64, b: u64, bits: u32, f: F) -> u64
 where
     F: Fn(u64, u64) -> u64,
 {
-    let lanes = 64 / bits;
+    let lanes = QWORD_BITS / bits;
     let mask = u64_mask(bits);
     let mut out = 0_u64;
     for i in 0..lanes {
@@ -1065,36 +1098,60 @@ fn sse_punpck_half(a: u64, b: u64, bits: u32, high: bool) -> u64 {
 /// the element width produce 0 (x86 PSLL/PSRL/PSRA semantics).
 pub(crate) fn sse_shift_half(op: SseShiftOp, a: u64, count: u64) -> u64 {
     match op {
-        SseShiftOp::Psllw => sse_lane_shift(a, count, 16, |x, c| {
-            if c >= 16 { 0 } else { x.wrapping_shl(c as u32) }
-        }),
-        SseShiftOp::Pslld => sse_lane_shift(a, count, 32, |x, c| {
-            if c >= 32 { 0 } else { x.wrapping_shl(c as u32) }
-        }),
-        SseShiftOp::Psllq => sse_lane_shift(a, count, 64, |x, c| {
-            if c >= 64 { 0 } else { x.wrapping_shl(c as u32) }
-        }),
-        SseShiftOp::Psrlw => sse_lane_shift(a, count, 16, |x, c| {
-            if c >= 16 { 0 } else { x.wrapping_shr(c as u32) }
-        }),
-        SseShiftOp::Psrld => sse_lane_shift(a, count, 32, |x, c| {
-            if c >= 32 { 0 } else { x.wrapping_shr(c as u32) }
-        }),
-        SseShiftOp::Psrlq => sse_lane_shift(a, count, 64, |x, c| {
-            if c >= 64 { 0 } else { x.wrapping_shr(c as u32) }
-        }),
-        SseShiftOp::Psraw => sse_lane_shift(a, count, 16, |x, c| {
-            if c >= 16 {
+        SseShiftOp::Psllw => sse_lane_shift(a, count, WORD_BITS, |x, c| {
+            if c >= u64::from(WORD_BITS) {
                 0
             } else {
-                (sign_extend_bits(x, 16) >> c) as u64
+                x.wrapping_shl(c as u32)
             }
         }),
-        SseShiftOp::Psrad => sse_lane_shift(a, count, 32, |x, c| {
-            if c >= 32 {
+        SseShiftOp::Pslld => sse_lane_shift(a, count, DWORD_BITS, |x, c| {
+            if c >= u64::from(DWORD_BITS) {
                 0
             } else {
-                (sign_extend_bits(x, 32) >> c) as u64
+                x.wrapping_shl(c as u32)
+            }
+        }),
+        SseShiftOp::Psllq => sse_lane_shift(a, count, QWORD_BITS, |x, c| {
+            if c >= u64::from(QWORD_BITS) {
+                0
+            } else {
+                x.wrapping_shl(c as u32)
+            }
+        }),
+        SseShiftOp::Psrlw => sse_lane_shift(a, count, WORD_BITS, |x, c| {
+            if c >= u64::from(WORD_BITS) {
+                0
+            } else {
+                x.wrapping_shr(c as u32)
+            }
+        }),
+        SseShiftOp::Psrld => sse_lane_shift(a, count, DWORD_BITS, |x, c| {
+            if c >= u64::from(DWORD_BITS) {
+                0
+            } else {
+                x.wrapping_shr(c as u32)
+            }
+        }),
+        SseShiftOp::Psrlq => sse_lane_shift(a, count, QWORD_BITS, |x, c| {
+            if c >= u64::from(QWORD_BITS) {
+                0
+            } else {
+                x.wrapping_shr(c as u32)
+            }
+        }),
+        SseShiftOp::Psraw => sse_lane_shift(a, count, WORD_BITS, |x, c| {
+            if c >= u64::from(WORD_BITS) {
+                0
+            } else {
+                (sign_extend_bits(x, WORD_BITS) >> c) as u64
+            }
+        }),
+        SseShiftOp::Psrad => sse_lane_shift(a, count, DWORD_BITS, |x, c| {
+            if c >= u64::from(DWORD_BITS) {
+                0
+            } else {
+                (sign_extend_bits(x, DWORD_BITS) >> c) as u64
             }
         }),
     }
@@ -1174,12 +1231,12 @@ fn sse_fp_minmax64(a: f64, b: f64, want_min: bool) -> f64 {
 pub(crate) fn sse_fp_unop(op: SseFpUnOp, a: u64) -> u64 {
     match op {
         SseFpUnOp::Sqrtps => {
-            let f0 = f32::from_bits((a & 0xffff_ffff) as u32).sqrt();
-            let f1 = f32::from_bits(((a >> 32) & 0xffff_ffff) as u32).sqrt();
-            u64::from(f0.to_bits()) | (u64::from(f1.to_bits()) << 32)
+            let f0 = f32::from_bits((a & DWORD_MASK) as u32).sqrt();
+            let f1 = f32::from_bits(((a >> DWORD_BITS) & DWORD_MASK) as u32).sqrt();
+            u64::from(f0.to_bits()) | (u64::from(f1.to_bits()) << DWORD_BITS)
         }
         SseFpUnOp::Sqrtpd | SseFpUnOp::Sqrtsd => f64::from_bits(a).sqrt().to_bits(),
-        SseFpUnOp::Sqrtss => u64::from(f32::from_bits((a & 0xffff_ffff) as u32).sqrt().to_bits()),
+        SseFpUnOp::Sqrtss => u64::from(f32::from_bits((a & DWORD_MASK) as u32).sqrt().to_bits()),
     }
 }
 
@@ -1189,16 +1246,16 @@ pub(crate) fn sse_fp_binop(op: SseFpBinOp, a: u64, b: u64) -> u64 {
         SseFpBinOp::Minps | SseFpBinOp::Maxps => {
             let want_min = op == SseFpBinOp::Minps;
             let f0 = sse_fp_minmax32(
-                f32::from_bits((a & 0xffff_ffff) as u32),
-                f32::from_bits((b & 0xffff_ffff) as u32),
+                f32::from_bits((a & DWORD_MASK) as u32),
+                f32::from_bits((b & DWORD_MASK) as u32),
                 want_min,
             );
             let f1 = sse_fp_minmax32(
-                f32::from_bits(((a >> 32) & 0xffff_ffff) as u32),
-                f32::from_bits(((b >> 32) & 0xffff_ffff) as u32),
+                f32::from_bits(((a >> DWORD_BITS) & DWORD_MASK) as u32),
+                f32::from_bits(((b >> DWORD_BITS) & DWORD_MASK) as u32),
                 want_min,
             );
-            u64::from(f0.to_bits()) | (u64::from(f1.to_bits()) << 32)
+            u64::from(f0.to_bits()) | (u64::from(f1.to_bits()) << DWORD_BITS)
         }
         SseFpBinOp::Minpd | SseFpBinOp::Maxpd => sse_fp_minmax64(
             f64::from_bits(a),
@@ -1208,8 +1265,8 @@ pub(crate) fn sse_fp_binop(op: SseFpBinOp, a: u64, b: u64) -> u64 {
         .to_bits(),
         SseFpBinOp::Minss | SseFpBinOp::Maxss => u64::from(
             sse_fp_minmax32(
-                f32::from_bits((a & 0xffff_ffff) as u32),
-                f32::from_bits((b & 0xffff_ffff) as u32),
+                f32::from_bits((a & DWORD_MASK) as u32),
+                f32::from_bits((b & DWORD_MASK) as u32),
                 op == SseFpBinOp::Minss,
             )
             .to_bits(),
@@ -1296,19 +1353,21 @@ pub(crate) fn sse_cvt(op: SseCvtOp, a: u64) -> u64 {
         SseCvtOp::Cvttsd2si64 => f64_to_i64_trunc(f64::from_bits(a)) as u64,
         SseCvtOp::Cvtsd2si64 => f64_to_i64_round(f64::from_bits(a)) as u64,
         SseCvtOp::Cvtps2dq => {
-            let d0 = f32_to_i32_round(f32::from_bits((a & 0xffff_ffff) as u32)) as u32;
-            let d1 = f32_to_i32_round(f32::from_bits(((a >> 32) & 0xffff_ffff) as u32)) as u32;
-            u64::from(d0) | (u64::from(d1) << 32)
+            let d0 = f32_to_i32_round(f32::from_bits((a & DWORD_MASK) as u32)) as u32;
+            let d1 =
+                f32_to_i32_round(f32::from_bits(((a >> DWORD_BITS) & DWORD_MASK) as u32)) as u32;
+            u64::from(d0) | (u64::from(d1) << DWORD_BITS)
         }
         SseCvtOp::Cvttps2dq => {
-            let d0 = f32_to_i32_trunc(f32::from_bits((a & 0xffff_ffff) as u32)) as u32;
-            let d1 = f32_to_i32_trunc(f32::from_bits(((a >> 32) & 0xffff_ffff) as u32)) as u32;
-            u64::from(d0) | (u64::from(d1) << 32)
+            let d0 = f32_to_i32_trunc(f32::from_bits((a & DWORD_MASK) as u32)) as u32;
+            let d1 =
+                f32_to_i32_trunc(f32::from_bits(((a >> DWORD_BITS) & DWORD_MASK) as u32)) as u32;
+            u64::from(d0) | (u64::from(d1) << DWORD_BITS)
         }
         SseCvtOp::Cvtdq2ps => {
             let f0 = (a as u32 as i32) as f32;
-            let f1 = ((a >> 32) as u32 as i32) as f32;
-            u64::from(f0.to_bits()) | (u64::from(f1.to_bits()) << 32)
+            let f1 = ((a >> DWORD_BITS) as u32 as i32) as f32;
+            u64::from(f0.to_bits()) | (u64::from(f1.to_bits()) << DWORD_BITS)
         }
         // One f64 lane (the 64-bit input half) → i32 dword, MXCSR round-nearest.
         SseCvtOp::Cvtpd2dq => u64::from(f64_to_i32_round(f64::from_bits(a)) as u32),
@@ -1343,10 +1402,10 @@ fn read_sse_op(
     match instr.op_kind(op) {
         OpKind::Register if instr.op_register(op).is_xmm() => {
             let v = regs.read_xmm(instr.op_register(op))?;
-            let mask = if nbytes >= 16 {
+            let mask = if nbytes >= XMM_BYTES {
                 u128::MAX
             } else {
-                (1u128 << (nbytes.saturating_mul(8))) - 1
+                xmm_low_mask(nbytes)
             };
             Ok(v & mask)
         }
@@ -1393,22 +1452,22 @@ fn write_sse_op(
     match instr.op_kind(op) {
         OpKind::Register if instr.op_register(op).is_xmm() => {
             let reg = instr.op_register(op);
-            let new = if scalar_merge && nbytes < 16 {
+            let new = if scalar_merge && nbytes < XMM_BYTES {
                 let old = regs.read_xmm(reg)?;
-                let mask = (1u128 << (nbytes.saturating_mul(8))) - 1;
+                let mask = xmm_low_mask(nbytes);
                 (old & !mask) | (value & mask)
-            } else if nbytes >= 16 {
+            } else if nbytes >= XMM_BYTES {
                 value
             } else {
                 // Zero upper bits for full vector store of partial (non-merge).
-                value & ((1u128 << (nbytes.saturating_mul(8))) - 1)
+                value & xmm_low_mask(nbytes)
             };
             // For movsd/movss scalar to xmm: merge low bits, keep upper (SSE legacy).
             // For movaps full: replace all.
             let final_v = if scalar_merge {
                 new
-            } else if nbytes < 16 {
-                value & ((1u128 << (nbytes.saturating_mul(8))) - 1)
+            } else if nbytes < XMM_BYTES {
+                value & xmm_low_mask(nbytes)
             } else {
                 value
             };

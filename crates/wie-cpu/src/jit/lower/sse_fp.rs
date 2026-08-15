@@ -155,7 +155,7 @@ pub(super) fn lower_sse_shift(
         match instr.op1_kind() {
             OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
             OpKind::Memory => {
-                let addr = effective_addr(bcx, instr, gpr)?;
+                let addr = effective_addr(bcx, instr, gpr, mem)?;
                 load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
             }
             _ => return Err("sse shift src".into()),
@@ -325,7 +325,7 @@ pub(super) fn lower_sse_cvtdq2pd(
     let lo = match instr.op1_kind() {
         OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?.0,
         OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             load_sse_mem(bcx, mem, gpr, rflags, addr, 8, instr.ip())?.0
         }
         _ => return Err("cvtdq2pd src".into()),
@@ -357,7 +357,7 @@ pub(super) fn lower_sse_cvtps2pd(
     let lo = match instr.op1_kind() {
         OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?.0,
         OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             load_sse_mem(bcx, mem, gpr, rflags, addr, 8, instr.ip())?.0
         }
         _ => return Err("cvtps2pd src".into()),
@@ -393,7 +393,7 @@ pub(super) fn lower_sse_cvtpd_packed(
     let (s_lo, s_hi) = match instr.op1_kind() {
         OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
         OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
         }
         _ => return Err("cvtpd src".into()),
@@ -414,6 +414,8 @@ pub(super) fn lower_sse_cvtpd_packed(
 
 /// `Cvtsd2ss/Cvtss2sd xmm, xmm/m64|m32` — convert the low lane only; the upper
 /// destination lanes are preserved. Shares the host `sse_cvt` helper.
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lower_sse_cvt_scalar_preserve(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
@@ -429,7 +431,7 @@ pub(super) fn lower_sse_cvt_scalar_preserve(
     let lo = match instr.op1_kind() {
         OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?.0,
         OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             let sz = u32::try_from(src_bytes).unwrap_or(8);
             load_sse_mem(bcx, mem, gpr, rflags, addr, sz, instr.ip())?.0
         }
@@ -470,7 +472,7 @@ pub(super) fn lower_sse_pshufb(
     let (b_lo, b_hi) = match instr.op1_kind() {
         OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
         OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
         }
         _ => return Err("pshufb src".into()),
@@ -502,7 +504,7 @@ pub(super) fn lower_sse_fp_unop_scalar(
     let (src_lo, _) = match instr.op1_kind() {
         OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
         OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             let w = if is_double { 8 } else { 4 };
             load_sse_mem(bcx, mem, gpr, rflags, addr, w, instr.ip())?
         }
@@ -540,7 +542,7 @@ pub(super) fn lower_sse_fp_unop_packed(
     let (s_lo, s_hi) = match instr.op1_kind() {
         OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
         OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
         }
         _ => return Err("fp unop packed src".into()),
@@ -572,7 +574,7 @@ pub(super) fn lower_sse_fp_binop_scalar(
     let (b_lo, _) = match instr.op1_kind() {
         OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
         OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             let w = if is_double { 8 } else { 4 };
             load_sse_mem(bcx, mem, gpr, rflags, addr, w, instr.ip())?
         }
@@ -611,7 +613,7 @@ pub(super) fn lower_sse_fp_binop_packed(
     let (b_lo, b_hi) = match instr.op1_kind() {
         OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
         OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
         }
         _ => return Err("fp binop packed src".into()),
@@ -644,7 +646,7 @@ pub(super) fn lower_sse_comis(
     let (b_lo, _) = match instr.op1_kind() {
         OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
         OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             let w = if is_double { 8 } else { 4 };
             load_sse_mem(bcx, mem, gpr, *rflags, addr, w, ip)?
         }
@@ -708,7 +710,7 @@ pub(super) fn lower_sse_cvt_gpr_to_fp(
     let src = match instr.op1_kind() {
         OpKind::Register => read_gpr(gpr, instr.op_register(1))?,
         OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             let w = mem_width_bytes(instr)?;
             call_load(bcx, mem, gpr, rflags, addr, w, ip)?
         }
@@ -759,7 +761,7 @@ pub(super) fn lower_sse_cvt_fp_to_gpr(
     let (lo, _) = match instr.op1_kind() {
         OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
         OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             let w = if is_double { 8 } else { 4 };
             load_sse_mem(bcx, mem, gpr, rflags, addr, w, ip)?
         }
@@ -797,7 +799,7 @@ pub(super) fn lower_sse_cvt_packed(
     let (s_lo, s_hi) = match instr.op1_kind() {
         OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
         OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
         }
         _ => return Err("cvt packed src".into()),
@@ -827,7 +829,7 @@ pub(super) fn lower_sse_bitwise(
     let (b_lo, b_hi) = match instr.op1_kind() {
         OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
         OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
         }
         _ => return Err("sse bitwise src".into()),
@@ -899,7 +901,7 @@ pub(super) fn lower_sse_scalar_fp(
     let (b_lo, b_hi) = match instr.op1_kind() {
         OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
         OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             let nbytes = if width == FloatWidth::F64 { 8 } else { 4 };
             load_sse_mem(bcx, mem, gpr, rflags, addr, nbytes, instr.ip())?
         }
@@ -967,7 +969,7 @@ pub(super) fn lower_sse_packed_fp(
     let (b_lo, b_hi) = match instr.op1_kind() {
         OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
         OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
         }
         _ => return Err("sse packed fp src".into()),

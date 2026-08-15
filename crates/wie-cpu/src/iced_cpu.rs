@@ -505,4 +505,12 @@ impl CpuEngine for IcedCpu {
     }
 
     fn on_thread_switch(&mut self) {}
+
+    fn set_gs_base(&mut self, base: u64) {
+        self.regs.set_gs_base(base);
+    }
+
+    fn gs_base(&self) -> u64 {
+        self.regs.gs_base()
+    }
 }

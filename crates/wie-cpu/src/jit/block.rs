@@ -425,11 +425,15 @@ fn is_lowerable(instr: &Instruction) -> bool {
         Mnemonic::Cvttss2si | Mnemonic::Cvttsd2si | Mnemonic::Cvtss2si | Mnemonic::Cvtsd2si => {
             sse_cvt_xmm_to_gpr_is_lowerable(instr)
         }
-        Mnemonic::Cvtps2dq | Mnemonic::Cvtdq2ps | Mnemonic::Cvttps2dq | Mnemonic::Cvtdq2pd
-        | Mnemonic::Cvtps2pd | Mnemonic::Cvtpd2dq | Mnemonic::Cvtpd2ps | Mnemonic::Cvtsd2ss
-        | Mnemonic::Cvtss2sd => {
-            sse_bitwise_is_lowerable(instr)
-        }
+        Mnemonic::Cvtps2dq
+        | Mnemonic::Cvtdq2ps
+        | Mnemonic::Cvttps2dq
+        | Mnemonic::Cvtdq2pd
+        | Mnemonic::Cvtps2pd
+        | Mnemonic::Cvtpd2dq
+        | Mnemonic::Cvtpd2ps
+        | Mnemonic::Cvtsd2ss
+        | Mnemonic::Cvtss2sd => sse_bitwise_is_lowerable(instr),
         // Scalar / packed FP sqrt + min/max.
         Mnemonic::Sqrtss
         | Mnemonic::Sqrtsd

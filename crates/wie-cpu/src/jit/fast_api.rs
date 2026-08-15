@@ -5,6 +5,11 @@
 //! loop (saves most of the CRT startup / `printf` path stops).
 
 use super::lower::JitCtx;
+use crate::guest_layout::{
+    CRT_FILE_STDERR as FILE_STDERR, CRT_FILE_STDIN as FILE_STDIN, CRT_FILE_STDOUT as FILE_STDOUT,
+    HEAP_BLOCK_HEADER_SIZE, HEAP_CTRL_BUMP_OFFSET, HEAP_CTRL_HEAD_BASE, HEAP_CTRL_HEAD_STRIDE,
+    HEAP_PAYLOAD_ALIGN, LARGE_THRESHOLD, SIZE_CLASSES,
+};
 use crate::mem::GuestMemory;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -86,22 +91,10 @@ static HEAP_CTRL: AtomicU64 = AtomicU64::new(0);
 static HEAP_BASE: AtomicU64 = AtomicU64::new(0);
 static HEAP_END: AtomicU64 = AtomicU64::new(0);
 
-/// Must match `wie_winapi::ucrt` FILE* cookies.
-const FILE_STDIN: u64 = 0x0000_0000_6800_0000;
-const FILE_STDOUT: u64 = FILE_STDIN + 0x100;
-const FILE_STDERR: u64 = FILE_STDIN + 0x200;
-
-/// Size classes — keep in lockstep with `wie_winapi::guest_heap`.
-const SIZE_CLASSES: [u64; 24] = [
-    16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192,
-    12288, 16384, 24576, 32768, 49152, 65536,
-];
-
-/// Must match `wie_winapi::guest_heap::LARGE_THRESHOLD` (65 536).
-///
-/// Historically this was 16 MiB, which made `round_up_size(65537..=16MiB)` return a full
-/// 16 MiB slab on every medium `malloc` — progressive process-heap burn during 7za/LZMA.
-const LARGE_THRESHOLD: u64 = 65_536;
+// FILE* cookies (`FILE_STDIN/OUT/ERR`) and size-class ladder
+// (`SIZE_CLASSES`/`LARGE_THRESHOLD`) are re-exported from
+// [`crate::guest_layout`], the shared home kept in lockstep with
+// `wie_winapi::ucrt` and `wie_winapi::guest_heap`.
 
 /// Host-side large free list for JIT `malloc`/`free` when size > [`LARGE_THRESHOLD`].
 /// Guest control block only stores size-class heads; large blocks need a host list
@@ -151,11 +144,16 @@ fn round_up_size(size: u64) -> u64 {
             }
         }
         // size is in (last class, LARGE_THRESHOLD] — should not happen with classes
-        // ending at LARGE_THRESHOLD; keep exact 16-byte align as a safe fallback.
-        size.wrapping_add(15) & !15_u64
+        // ending at LARGE_THRESHOLD; keep exact payload align as a safe fallback.
+        align_up_payload(size)
     } else {
-        size.wrapping_add(15) & !15_u64
+        align_up_payload(size)
     }
+}
+
+/// Align `size` up to [`HEAP_PAYLOAD_ALIGN`] (the JIT bump/header layout).
+fn align_up_payload(size: u64) -> u64 {
+    size.wrapping_add(HEAP_PAYLOAD_ALIGN - 1) & !(HEAP_PAYLOAD_ALIGN - 1)
 }
 
 fn size_class_index(size: u64) -> usize {
@@ -168,8 +166,11 @@ fn size_class_index(size: u64) -> usize {
 }
 
 fn head_va(ctrl: u64, class: usize) -> u64 {
-    ctrl.wrapping_add(8)
-        .wrapping_add(u64::try_from(class).unwrap_or(0).wrapping_mul(8))
+    ctrl.wrapping_add(HEAP_CTRL_HEAD_BASE).wrapping_add(
+        u64::try_from(class)
+            .unwrap_or(0)
+            .wrapping_mul(HEAP_CTRL_HEAD_STRIDE),
+    )
 }
 
 fn find_large_fit(list: &[(u64, u64)], need: u64) -> Option<usize> {
@@ -199,7 +200,7 @@ fn large_alloc(mem: &mut GuestMemory, heap: &JitHeapLayout, rounded: u64) -> u64
                 list.push((residual_addr, residual_size));
             }
         }
-        let _ = write_u64(mem, addr.wrapping_sub(8), rounded);
+        let _ = write_u64(mem, addr.wrapping_sub(HEAP_BLOCK_HEADER_SIZE), rounded);
         return addr;
     }
     bump_alloc(mem, heap, rounded)
@@ -237,29 +238,29 @@ pub(super) unsafe extern "C" fn wie_ucrt_malloc(ctx: *mut JitCtx, size: u64) -> 
         if !write_u64(mem, hva, next) {
             return 0;
         }
-        let _ = write_u64(mem, head.wrapping_sub(8), rounded);
+        let _ = write_u64(mem, head.wrapping_sub(HEAP_BLOCK_HEADER_SIZE), rounded);
         return head;
     }
     bump_alloc(mem, &heap, rounded)
 }
 
 fn bump_alloc(mem: &mut GuestMemory, heap: &JitHeapLayout, rounded: u64) -> u64 {
-    let Some(mut bump) = read_u64(mem, heap.ctrl_va) else {
+    let Some(mut bump) = read_u64(mem, heap.ctrl_va.wrapping_add(HEAP_CTRL_BUMP_OFFSET)) else {
         return 0;
     };
     if bump < heap.base {
         bump = heap.base;
     }
-    let pre = bump.wrapping_add(8);
-    let payload = pre.wrapping_add(15) & !15_u64;
+    let pre = bump.wrapping_add(HEAP_BLOCK_HEADER_SIZE);
+    let payload = pre.wrapping_add(HEAP_PAYLOAD_ALIGN - 1) & !(HEAP_PAYLOAD_ALIGN - 1);
     let end = payload.wrapping_add(rounded);
     if payload < heap.base || end > heap.end || end < payload {
         return 0;
     }
-    if !write_u64(mem, heap.ctrl_va, end) {
+    if !write_u64(mem, heap.ctrl_va.wrapping_add(HEAP_CTRL_BUMP_OFFSET), end) {
         return 0;
     }
-    let _ = write_u64(mem, payload.wrapping_sub(8), rounded);
+    let _ = write_u64(mem, payload.wrapping_sub(HEAP_BLOCK_HEADER_SIZE), rounded);
     payload
 }
 
@@ -277,14 +278,14 @@ pub(super) unsafe extern "C" fn wie_ucrt_free(ctx: *mut JitCtx, ptr: u64) {
         return;
     }
     let mem = mem_mut(ctx);
-    let Some(size) = read_u64(mem, ptr.wrapping_sub(8)) else {
+    let Some(size) = read_u64(mem, ptr.wrapping_sub(HEAP_BLOCK_HEADER_SIZE)) else {
         return;
     };
     if size == 0 {
         return;
     }
     // Poison header so double-free is a no-op (matches host free_coherent).
-    let _ = write_u64(mem, ptr.wrapping_sub(8), 0);
+    let _ = write_u64(mem, ptr.wrapping_sub(HEAP_BLOCK_HEADER_SIZE), 0);
     if size > LARGE_THRESHOLD {
         if let Ok(mut list) = LARGE_FREE.lock() {
             list.push((ptr, size));

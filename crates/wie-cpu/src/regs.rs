@@ -1,6 +1,7 @@
 //! x86-64 GPRs + RFLAGS for the iced interpreter.
 
 use crate::CpuError;
+use crate::consts::{BITS_PER_BYTE, BYTE_MASK};
 use iced_x86::Register;
 use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, Not};
 
@@ -100,6 +101,10 @@ pub struct ThreadContext {
     /// MXCSR control/status register (x86 reset value 0x1F80: all exception
     /// masks set, round-to-nearest, no DAZ/FZ).
     pub mxcsr: u32,
+    /// Guest GS segment base — the TEB page this thread's GS-relative
+    /// accesses resolve to. Carried through thread switches with the rest of
+    /// the architectural state.
+    pub gs_base: u64,
 }
 
 impl Default for ThreadContext {
@@ -110,6 +115,7 @@ impl Default for ThreadContext {
             rip: 0,
             rflags: Rflags::DEFAULT,
             mxcsr: RegFile::MXCSR_DEFAULT,
+            gs_base: crate::GS_BASE,
         }
     }
 }
@@ -136,6 +142,10 @@ pub struct RegFile {
     /// rounding, so only the stored value is tracked (matches the default
     /// round-to-nearest behavior guests rely on).
     pub mxcsr: u32,
+    /// Guest GS segment base — the TEB page this engine's GS-relative
+    /// accesses resolve to. The primary thread keeps the fixed [`crate::GS_BASE`];
+    /// workers are rebound to their per-thread TEB page.
+    gs_base: u64,
 }
 
 impl Default for RegFile {
@@ -146,14 +156,19 @@ impl Default for RegFile {
             rip: 0,
             rflags: Rflags::DEFAULT,
             mxcsr: Self::MXCSR_DEFAULT,
+            gs_base: crate::GS_BASE,
         }
     }
 }
 
 impl RegFile {
-    /// x86 MXCSR reset value: all six exception masks set (0x1F80), rounding
-    /// control = nearest, DAZ/FZ clear.
-    pub const MXCSR_DEFAULT: u32 = 0x1F80;
+    /// MXCSR exception-mask field: bits 7–12, one per masked exception
+    /// (invalid-op, denormal, zero-divide, overflow, underflow, precision).
+    pub const MXCSR_EXC_MASKS: u32 = 0x3f << 7;
+
+    /// x86 MXCSR reset value: all six exception masks set (`0x1F80`), rounding
+    /// control = nearest (field 0), DAZ/FZ clear.
+    pub const MXCSR_DEFAULT: u32 = Self::MXCSR_EXC_MASKS;
 
     /// Create a fresh all-zero register file with default RFLAGS.
     #[must_use]
@@ -170,6 +185,7 @@ impl RegFile {
             rip: self.rip,
             rflags: self.rflags,
             mxcsr: self.mxcsr,
+            gs_base: self.gs_base,
         }
     }
 
@@ -180,6 +196,18 @@ impl RegFile {
         self.rip = ctx.rip;
         self.set_rflags_checked(ctx.rflags);
         self.mxcsr = ctx.mxcsr;
+        self.gs_base = ctx.gs_base;
+    }
+
+    /// The guest GS segment base (this thread's TEB page).
+    #[must_use]
+    pub fn gs_base(&self) -> u64 {
+        self.gs_base
+    }
+
+    /// Rebind the GS segment base to another TEB page.
+    pub fn set_gs_base(&mut self, base: u64) {
+        self.gs_base = base;
     }
 
     /// Read the guest MXCSR control/status register.
@@ -473,12 +501,26 @@ fn gpr_index(full: Register) -> Result<usize, CpuError> {
     }
 }
 
+/// Bit width of an operand of `size` bytes (`BITS_PER_BYTE * size`).
+#[must_use]
+pub(crate) fn size_bits(size: usize) -> u32 {
+    u32::try_from(size)
+        .unwrap_or(0)
+        .saturating_mul(BITS_PER_BYTE)
+}
+
+/// Sign bit of an operand of `size` bytes (`1 << (bits - 1)`).
+#[must_use]
+pub(crate) fn size_sign_bit(size: usize) -> u64 {
+    1_u64 << size_bits(size).saturating_sub(1)
+}
+
 /// Update ZF/SF/PF from a result of `size` bytes; leave CF/OF/AF to caller.
 pub(crate) fn set_logic_flags(regs: &mut RegFile, result: u64, size: usize) {
     let mask = size_mask(size);
     let v = result & mask;
     regs.set_flag(Rflags::ZF, v == 0);
-    let sign_bit = 1_u64 << ((size.saturating_mul(8)).saturating_sub(1));
+    let sign_bit = size_sign_bit(size);
     regs.set_flag(Rflags::SF, (v & sign_bit) != 0);
     regs.set_flag(Rflags::PF, parity_even(low_byte(v)));
     regs.set_flag(Rflags::CF, false);
@@ -498,7 +540,7 @@ pub(crate) fn set_arith_flags(
     cf: bool,
     of: bool,
 ) {
-    let sign = 1_u64 << (size.saturating_mul(8)).saturating_sub(1);
+    let sign = size_sign_bit(size);
 
     regs.set_flag(Rflags::CF, cf);
     regs.set_flag(Rflags::ZF, r == 0);
@@ -514,7 +556,7 @@ pub(crate) fn set_add_flags(regs: &mut RegFile, dst: u64, src: u64, result: u64,
     let d = dst & mask;
     let s = src & mask;
     let r = result & mask;
-    let sign = 1_u64 << (size.saturating_mul(8)).saturating_sub(1);
+    let sign = size_sign_bit(size);
 
     let wide = u128::from(d).wrapping_add(u128::from(s));
     // OF: same sign operands, result different sign
@@ -528,7 +570,7 @@ pub(crate) fn set_sub_flags(regs: &mut RegFile, dst: u64, src: u64, result: u64,
     let d = dst & mask;
     let s = src & mask;
     let r = result & mask;
-    let sign = 1_u64 << (size.saturating_mul(8)).saturating_sub(1);
+    let sign = size_sign_bit(size);
 
     // OF: different sign operands, result sign != dst sign
     let of = ((d ^ s) & (d ^ r) & sign) != 0;
@@ -549,7 +591,7 @@ pub(crate) fn size_mask(size: usize) -> u64 {
 #[inline]
 #[must_use]
 fn low_byte(v: u64) -> u8 {
-    u8::try_from(v & 0xff).unwrap_or(0)
+    u8::try_from(v & BYTE_MASK).unwrap_or(0)
 }
 
 #[must_use]

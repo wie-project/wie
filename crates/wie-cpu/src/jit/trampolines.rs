@@ -10,9 +10,8 @@ use super::block::{BlockTerm, DecodedInsn};
 use super::lower::{
     CHAIN_SLOTS, JitCtx, MAX_CHAIN_DEPTH, SHADOW_DEPTH, chain_hash, wie_jit_load, wie_jit_store,
 };
+use crate::guest_layout::TEB_LAST_ERROR_OFFSET;
 use iced_x86::{Mnemonic, OpKind, Register};
-
-const TEB_LAST_ERROR_VA: u64 = crate::GS_BASE + 0x68;
 
 /// Recognized micro-stub patterns that have a hand-written host trampoline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,9 +24,9 @@ pub(super) enum MicroStub {
     IdentityRcx,
     /// `mov eax, imm32` then `ret`.
     ReturnImm32(u32),
-    /// `mov rax, imm64; mov eax, [rax]; ret` with imm = TEB last-error VA.
+    /// `mov eax, [gs:0x68]` then `ret` — per-thread TEB last-error load.
     GetLastError,
-    /// `mov rax, imm64; mov [rax], ecx; ret` with imm = TEB last-error VA.
+    /// `mov [gs:0x68], ecx` then `ret` — per-thread TEB last-error store.
     SetLastError,
 }
 
@@ -61,7 +60,7 @@ impl MicroStub {
         match self {
             Self::Ret => 1,
             Self::ReturnZero | Self::IdentityRcx | Self::ReturnImm32(_) => 2,
-            Self::GetLastError | Self::SetLastError => 3,
+            Self::GetLastError | Self::SetLastError => 2,
         }
     }
 }
@@ -86,7 +85,6 @@ pub(super) fn match_micro_stub(
     match n {
         1 => Some(MicroStub::Ret),
         2 => classify_two_insn(&insns[0].instr),
-        3 => classify_three_insn(&insns[0].instr, &insns[1].instr),
         _ => None,
     }
 }
@@ -133,44 +131,29 @@ fn classify_two_insn(instr: &iced_x86::Instruction) -> Option<MicroStub> {
         let imm = instr.immediate32();
         return Some(MicroStub::ReturnImm32(imm));
     }
-    None
-}
-
-fn classify_three_insn(a: &iced_x86::Instruction, b: &iced_x86::Instruction) -> Option<MicroStub> {
-    // mov rax, imm64
-    if a.mnemonic() != Mnemonic::Mov
-        || a.op0_kind() != OpKind::Register
-        || a.op_register(0) != Register::RAX
-        || !matches!(
-            a.op1_kind(),
-            OpKind::Immediate64 | OpKind::Immediate32 | OpKind::Immediate32to64
-        )
-    {
-        return None;
-    }
-    let va = a.immediate64();
-    if va != TEB_LAST_ERROR_VA {
-        return None;
-    }
-    // mov eax, [rax]
-    if b.mnemonic() == Mnemonic::Mov
-        && b.op0_kind() == OpKind::Register
-        && matches!(b.op_register(0), Register::EAX | Register::RAX)
-        && b.op1_kind() == OpKind::Memory
-        && b.memory_base() == Register::RAX
-        && b.memory_index() == Register::None
-        && b.memory_displacement64() == 0
+    // mov eax, [gs:TEB_LAST_ERROR_OFFSET] — per-thread TEB last-error load
+    // (`GetLastError` guest stub; the GS base resolves per engine at run time).
+    if instr.mnemonic() == Mnemonic::Mov
+        && instr.op0_kind() == OpKind::Register
+        && matches!(instr.op_register(0), Register::EAX | Register::RAX)
+        && instr.op1_kind() == OpKind::Memory
+        && instr.memory_segment() == Register::GS
+        && instr.memory_base() == Register::None
+        && instr.memory_index() == Register::None
+        && instr.memory_displacement64() == TEB_LAST_ERROR_OFFSET
     {
         return Some(MicroStub::GetLastError);
     }
-    // mov [rax], ecx
-    if b.mnemonic() == Mnemonic::Mov
-        && b.op0_kind() == OpKind::Memory
-        && b.op1_kind() == OpKind::Register
-        && matches!(b.op_register(1), Register::ECX | Register::RCX)
-        && b.memory_base() == Register::RAX
-        && b.memory_index() == Register::None
-        && b.memory_displacement64() == 0
+    // mov [gs:TEB_LAST_ERROR_OFFSET], ecx — per-thread TEB last-error store
+    // (`SetLastError` guest stub).
+    if instr.mnemonic() == Mnemonic::Mov
+        && instr.op0_kind() == OpKind::Memory
+        && instr.op1_kind() == OpKind::Register
+        && matches!(instr.op_register(1), Register::ECX | Register::RCX)
+        && instr.memory_segment() == Register::GS
+        && instr.memory_base() == Register::None
+        && instr.memory_index() == Register::None
+        && instr.memory_displacement64() == TEB_LAST_ERROR_OFFSET
     {
         return Some(MicroStub::SetLastError);
     }
@@ -295,7 +278,10 @@ unsafe extern "C" fn tramp_return_imm32_generic(ctx: *mut JitCtx) {
 unsafe extern "C" fn tramp_get_last_error(ctx: *mut JitCtx) {
     let ctx = unsafe { &mut *ctx };
     mark_dirty(ctx, MicroStub::GetLastError.dirty_mask());
-    let v = tramp_load_u32(ctx, TEB_LAST_ERROR_VA);
+    // Resolve the LAST-ERROR slot against the engine's bound TEB page: a
+    // worker's `gs:[0x68]` stub must read ITS TEB, not the primary's fixed VA.
+    let last_error_va = ctx.gs_base.wrapping_add(TEB_LAST_ERROR_OFFSET);
+    let v = tramp_load_u32(ctx, last_error_va);
     if ctx.fault != 0 {
         return;
     }
@@ -308,7 +294,8 @@ unsafe extern "C" fn tramp_set_last_error(ctx: *mut JitCtx) {
     let ctx = unsafe { &mut *ctx };
     mark_dirty(ctx, MicroStub::SetLastError.dirty_mask());
     let ecx = ctx.gpr[1] as u32;
-    tramp_store_u32(ctx, TEB_LAST_ERROR_VA, ecx);
+    let last_error_va = ctx.gs_base.wrapping_add(TEB_LAST_ERROR_OFFSET);
+    tramp_store_u32(ctx, last_error_va, ecx);
     if ctx.fault != 0 {
         return;
     }

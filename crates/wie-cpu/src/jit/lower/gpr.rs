@@ -9,8 +9,8 @@ use super::flags::{
 use super::insn::PendingFlags;
 use super::mem::{call_load, call_store};
 use super::{
-    OFF_MEM_GEN, OFF_STICKY_GEN, OFF_STICKY_PAGE, OFF_STICKY_PROT, OFF_STICKY_PTR, STICKY_WAYS,
-    TLB_PROT_R, TLB_PROT_W,
+    OFF_GS_BASE, OFF_MEM_GEN, OFF_STICKY_GEN, OFF_STICKY_PAGE, OFF_STICKY_PROT, OFF_STICKY_PTR,
+    STICKY_WAYS, TLB_PROT_R, TLB_PROT_W,
 };
 
 use super::super::block::mem_width_bytes;
@@ -191,6 +191,7 @@ pub(super) fn effective_addr(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
     gpr: &[Value; 16],
+    mem: &MemEnv,
 ) -> Result<Value, String> {
     let base = instr.memory_base();
     let disp = instr.memory_displacement64();
@@ -202,22 +203,27 @@ pub(super) fn effective_addr(
     let mut addr = disp_c;
     let mut seg_added = false;
     // FS/GS segment overrides: Windows x64 uses GS:0 as the TEB base, so a
-    // segment-relative access (gs:[0x30] → TEB.Self) addresses the fake TEB
-    // page, never absolute zero. Mirrors the iced interpreter's
-    // `effective_address`. The decoder reports the segment either as
+    // segment-relative access (gs:[0x30] → TEB.Self) addresses the TEB page
+    // bound to the executing engine, never absolute zero. Mirrors the iced
+    // interpreter's `effective_address`. The base is loaded from `JitCtx` at
+    // run time (`ctx.gs_base`), not baked in at compile time, so the shared
+    // compiled-code cache stays correct when a worker engine binds a
+    // different TEB page. The decoder reports the segment either as
     // `memory_segment` (override) or as the base register (segment-base
     // addressing); add the TEB base once.
     let seg = instr.memory_segment();
     if seg == Register::GS || seg == Register::FS {
-        let teb = iconst_u64(bcx, crate::GS_BASE);
-        addr = bcx.ins().iadd(addr, teb);
+        let gs_p = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_GS_BASE));
+        let gs = bcx.ins().load(types::I64, mem.flags, gs_p, 0);
+        addr = bcx.ins().iadd(addr, gs);
         seg_added = true;
     }
     if base != Register::None {
         if base == Register::GS || base == Register::FS {
             if !seg_added {
-                let teb = iconst_u64(bcx, crate::GS_BASE);
-                addr = bcx.ins().iadd(addr, teb);
+                let gs_p = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_GS_BASE));
+                let gs = bcx.ins().load(types::I64, mem.flags, gs_p, 0);
+                addr = bcx.ins().iadd(addr, gs);
             }
         } else {
             let b = read_gpr(gpr, base)?;
@@ -268,7 +274,7 @@ pub(super) fn read_op_mem(
     match instr.op_kind(op) {
         OpKind::Register => read_gpr(gpr, instr.op_register(op)),
         OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             let width = mem_width_bytes(instr)?;
             call_load(bcx, mem, gpr, rflags, addr, width, instr.ip())
         }
@@ -383,19 +389,19 @@ pub(super) fn lower_mov(
     let ip = instr.ip();
     match (k0, k1) {
         (OpKind::Register, OpKind::Memory) => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             let width = mem_width_bytes(instr)?;
             let val = call_load(bcx, mem, gpr, rflags, addr, width, ip)?;
             write_gpr(bcx, gpr, dirty, instr.op_register(0), val)
         }
         (OpKind::Memory, OpKind::Register) => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             let width = mem_width_bytes(instr)?;
             let val = read_gpr(gpr, instr.op_register(1))?;
             call_store(bcx, mem, gpr, rflags, addr, width, val, ip)
         }
         (OpKind::Memory, _) => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             let width = mem_width_bytes(instr)?;
             let val = read_op(bcx, instr, 1, gpr)?;
             call_store(bcx, mem, gpr, rflags, addr, width, val, ip)
@@ -423,7 +429,7 @@ pub(super) fn lower_movx(
         reg_size_bits(instr.op_register(1))
     };
     let src = if instr.op1_kind() == OpKind::Memory {
-        let addr = effective_addr(bcx, instr, gpr)?;
+        let addr = effective_addr(bcx, instr, gpr, mem)?;
         let width = mem_width_bytes(instr)?;
         call_load(bcx, mem, gpr, rflags, addr, width, instr.ip())?
     } else {
@@ -623,8 +629,9 @@ pub(super) fn lower_lea(
     instr: &Instruction,
     gpr: &mut [Value; 16],
     dirty: &mut [bool; 16],
+    mem: &MemEnv,
 ) -> Result<(), String> {
-    let addr = effective_addr(bcx, instr, gpr)?;
+    let addr = effective_addr(bcx, instr, gpr, mem)?;
     write_gpr(bcx, gpr, dirty, instr.op_register(0), addr)
 }
 
@@ -641,7 +648,7 @@ pub(super) fn lower_push(
     let val = match instr.op0_kind() {
         OpKind::Register => read_gpr(gpr, instr.op_register(0))?,
         OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             let width = mem_width_bytes(instr)?;
             call_load(bcx, mem, gpr, rflags, addr, width, instr.ip())?
         }
@@ -675,7 +682,7 @@ pub(super) fn lower_pop(
             write_gpr(bcx, gpr, dirty, instr.op_register(0), val)
         }
         OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             let width = mem_width_bytes(instr)?;
             call_store(bcx, mem, gpr, rflags, addr, width, val, instr.ip())
         }
@@ -1296,7 +1303,7 @@ pub(super) fn lower_xchg(
                 64 => 8,
                 other => return Err(format!("xchg bits {other}")),
             };
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             let mem_v = call_load(bcx, mem, gpr, rflags, addr, width, instr.ip())?;
             let reg_v = read_gpr(gpr, reg)?;
             write_gpr(bcx, gpr, dirty, reg, mem_v)?;
@@ -1322,7 +1329,7 @@ pub(super) fn write_op_mem(
     match instr.op_kind(op) {
         OpKind::Register => write_gpr(bcx, gpr, dirty, instr.op_register(op), val),
         OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr)?;
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
             let width = match bits {
                 8 => 1_u32,
                 16 => 2,

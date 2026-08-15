@@ -9,12 +9,15 @@
 use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
+mod consts;
 mod exec;
+pub mod guest_layout;
 mod iced_cpu;
 mod jit;
 mod mem;
 mod regs;
 mod simd;
+mod teb;
 
 /// Concurrent hash map for cross-thread JIT state.
 ///
@@ -42,6 +45,8 @@ pub use mem::{
 pub use regs::{RegFile, Rflags, ThreadContext};
 /// SIMD pixel helpers for the GUI present path (NEON on aarch64).
 pub use simd::{blend_0rgb_4x, fill_0rgb_4x, mask_bgra_to_0rgb, mul_0rgb_4x, stretch_nearest};
+/// Per-thread TEB ownership, allocation, and initialization.
+pub use teb::{PerThreadTeb, TebInit, TebPool};
 
 /// Guest GS segment base — points to the Thread Environment Block (TEB).
 /// Shared with `wie_runtime::DEFAULT_LAYOUT.teb_low.base`.
@@ -485,6 +490,24 @@ pub trait CpuEngine: Send {
     ///
     /// No-op for pure interpreter backends.
     fn on_thread_switch(&mut self) {}
+
+    /// Bind this engine to a guest thread's TEB page (the x64 GS segment base).
+    ///
+    /// WIE is 1:1 — each engine is owned by exactly one guest thread — so the
+    /// value must point at THAT thread's TEB page: every GS-relative guest
+    /// access (`gs:[0x68]` last-error, `gs:[0x30]` TEB.Self, …) resolves to
+    /// the bound page. The primary thread keeps the fixed [`GS_BASE`] default;
+    /// workers are rebound to their [`PerThreadTeb`] before guest execution.
+    ///
+    /// Default: ignore (engines that never switch threads keep [`GS_BASE`]).
+    fn set_gs_base(&mut self, base: u64) {
+        let _ = base;
+    }
+
+    /// The GS segment base currently bound to this engine.
+    fn gs_base(&self) -> u64 {
+        GS_BASE
+    }
 }
 
 impl CpuEngine for Box<dyn CpuEngine> {
@@ -645,6 +668,12 @@ impl CpuEngine for Box<dyn CpuEngine> {
     }
     fn on_thread_switch(&mut self) {
         (**self).on_thread_switch();
+    }
+    fn set_gs_base(&mut self, base: u64) {
+        (**self).set_gs_base(base);
+    }
+    fn gs_base(&self) -> u64 {
+        (**self).gs_base()
     }
 }
 
