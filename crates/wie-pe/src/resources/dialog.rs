@@ -125,6 +125,25 @@ pub struct DialogItemTemplate {
     pub pixel_rect: PixelRect,
 }
 
+/// Class ordinal of the standard `BUTTON` control (winuser.h `WC_BUTTON`).
+const CLASS_BUTTON_ORDINAL: u16 = 0x0080;
+
+/// Class ordinal of the standard `EDIT` control (winuser.h `WC_EDIT`).
+const CLASS_EDIT_ORDINAL: u16 = 0x0081;
+
+/// Class ordinal of the standard `STATIC` control (winuser.h `WC_STATIC`).
+const CLASS_STATIC_ORDINAL: u16 = 0x0082;
+
+/// Class ordinal of the standard `LISTBOX` control (winuser.h `WC_LISTBOX`).
+const CLASS_LISTBOX_ORDINAL: u16 = 0x0083;
+
+/// Class ordinal of the standard `COMBOBOX` control (winuser.h `WC_COMBOBOX`).
+const CLASS_COMBOBOX_ORDINAL: u16 = 0x0085;
+
+/// High byte of a control-class WORD whose low byte carries the class id
+/// (PE spec shorthand for the standard classes).
+const CLASS_ID_HIGH_BYTE_MARKER: u16 = 0xFF;
+
 /// Standard control classes. `Other` carries the raw class ordinal; a
 /// non-standard class *name* has no ordinal and maps to `Other(0)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -414,7 +433,7 @@ fn parse_item_class(bytes: &[u8], pos: usize) -> Option<(ItemClass, usize)> {
         let ordinal = read_u16_at(bytes, pos.checked_add(2)?)?;
         return Some((ItemClass::from_ordinal(ordinal), pos.checked_add(4)?));
     }
-    if word >> 8 == 0xFF {
+    if word >> 8 == CLASS_ID_HIGH_BYTE_MARKER {
         return Some((ItemClass::from_ordinal(word & 0xFF), pos.checked_add(2)?));
     }
     let (name, next) = read_utf16_string(bytes, pos, Some(word))?;
@@ -434,11 +453,11 @@ impl ItemClass {
     /// Map a class ordinal to the matching standard variant.
     fn from_ordinal(ordinal: u16) -> Self {
         match ordinal {
-            0x0080 => Self::Button,
-            0x0081 => Self::Edit,
-            0x0082 => Self::Static,
-            0x0083 => Self::ListBox,
-            0x0085 => Self::ComboBox,
+            CLASS_BUTTON_ORDINAL => Self::Button,
+            CLASS_EDIT_ORDINAL => Self::Edit,
+            CLASS_STATIC_ORDINAL => Self::Static,
+            CLASS_LISTBOX_ORDINAL => Self::ListBox,
+            CLASS_COMBOBOX_ORDINAL => Self::ComboBox,
             other => Self::Other(other),
         }
     }

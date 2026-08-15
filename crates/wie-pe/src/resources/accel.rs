@@ -8,6 +8,9 @@ use crate::PeSectionMap;
 
 use super::common::{RT_ACCELERATOR, parse_resource_type, read_u16_at};
 
+/// Byte size of one `ACCEL` entry (three `WORD`s: `fFlags`, `wAnsi`, `wId`).
+const ACCEL_ENTRY_SIZE: usize = 6;
+
 /// One parsed `RT_ACCELERATOR` table.
 ///
 /// Layout (winuser.h `ACCEL`, as stored in the resource): a sequence of
@@ -54,8 +57,9 @@ fn parse_accel_table(table_id: u16, lang: u16, bytes: &[u8]) -> Option<AccelTemp
     let mut pos = 0usize;
     // A partial trailing entry (fewer than 6 bytes) ends the walk; the table
     // has no count field.
-    while let Some(entry) = bytes.get(pos..pos.checked_add(6)?) {
-        // `entry` is exactly 6 bytes, so every field read below succeeds.
+    while let Some(entry) = bytes.get(pos..pos.checked_add(ACCEL_ENTRY_SIZE)?) {
+        // `entry` is exactly `ACCEL_ENTRY_SIZE` bytes, so every field read
+        // below succeeds.
         let flags = read_u16_at(entry, 0)?;
         let key = read_u16_at(entry, 2)?;
         let command_id = read_u16_at(entry, 4)?;
@@ -64,7 +68,7 @@ fn parse_accel_table(table_id: u16, lang: u16, bytes: &[u8]) -> Option<AccelTemp
             key,
             command_id,
         });
-        pos = pos.checked_add(6)?;
+        pos = pos.checked_add(ACCEL_ENTRY_SIZE)?;
     }
     // A table that contains no full entry is treated as absent.
     if entries.is_empty() {

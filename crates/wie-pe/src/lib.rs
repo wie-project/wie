@@ -581,6 +581,35 @@ pub fn inspect_pe_sections_bytes(bytes: &[u8]) -> Result<Vec<PeSectionSummary>> 
 /// `IMAGE_SIZEOF_IMPORT_DESCRIPTOR` — stride between import descriptors.
 const IMPORT_DESCRIPTOR_SIZE: u32 = 20;
 
+/// `IMAGE_IMPORT_DESCRIPTOR::TimeDateStamp` — field offset (4 bytes past
+/// `OriginalFirstThunk`).
+const IMPORT_DESCRIPTOR_TIME_DATE_STAMP_OFFSET: usize = 4;
+
+/// `IMAGE_IMPORT_DESCRIPTOR::ForwarderChain` — field offset.
+const IMPORT_DESCRIPTOR_FORWARDER_CHAIN_OFFSET: usize = 8;
+
+/// `IMAGE_IMPORT_DESCRIPTOR::Name` — field offset (RVA of the DLL name).
+const IMPORT_DESCRIPTOR_NAME_OFFSET: usize = 12;
+
+/// `IMAGE_IMPORT_DESCRIPTOR::FirstThunk` — field offset (RVA of the IAT).
+const IMPORT_DESCRIPTOR_FIRST_THUNK_OFFSET: usize = 16;
+
+/// Size of one `IMAGE_THUNK_DATA64` entry (8 bytes: a single `u64`); the
+/// stride of both the import lookup table and the IAT.
+const THUNK_ENTRY_SIZE: u64 = 8;
+
+/// `IMAGE_ORDINAL_FLAG64` — high bit of a thunk value marking an ordinal
+/// import; the ordinal then sits in the low 16 bits.
+const IMAGE_ORDINAL_FLAG64: u64 = 0x8000_0000_0000_0000;
+
+/// Mask isolating the ordinal within an ordinal-flagged thunk value (the low
+/// 16 bits; the flag bit occupies the top of the value).
+const IMAGE_ORDINAL_MASK64: u64 = 0xFFFF;
+
+/// Size of the `IMAGE_IMPORT_BY_NAME::Hint` field (a `WORD`) preceding the
+/// imported name in the hint/name table.
+const IMPORT_HINT_SIZE: usize = 2;
+
 /// Read import metadata from a `PE` image on disk.
 pub fn inspect_pe_imports(path: &Path) -> Result<Vec<PeImportSummary>> {
     let bytes = read_pe_file(path)?;
@@ -619,10 +648,22 @@ fn inspect_pe_imports_from_parsed(pe: &PE, bytes: &[u8]) -> Result<Vec<PeImportS
         })?;
 
         let original_first_thunk = read_u32(bytes, descriptor_offset)?;
-        let _time_date_stamp = read_u32(bytes, checked_add_usize(descriptor_offset, 4)?)?;
-        let _forwarder_chain = read_u32(bytes, checked_add_usize(descriptor_offset, 8)?)?;
-        let name_rva = read_u32(bytes, checked_add_usize(descriptor_offset, 12)?)?;
-        let first_thunk = read_u32(bytes, checked_add_usize(descriptor_offset, 16)?)?;
+        let _time_date_stamp = read_u32(
+            bytes,
+            checked_add_usize(descriptor_offset, IMPORT_DESCRIPTOR_TIME_DATE_STAMP_OFFSET)?,
+        )?;
+        let _forwarder_chain = read_u32(
+            bytes,
+            checked_add_usize(descriptor_offset, IMPORT_DESCRIPTOR_FORWARDER_CHAIN_OFFSET)?,
+        )?;
+        let name_rva = read_u32(
+            bytes,
+            checked_add_usize(descriptor_offset, IMPORT_DESCRIPTOR_NAME_OFFSET)?,
+        )?;
+        let first_thunk = read_u32(
+            bytes,
+            checked_add_usize(descriptor_offset, IMPORT_DESCRIPTOR_FIRST_THUNK_OFFSET)?,
+        )?;
 
         if original_first_thunk == 0 && name_rva == 0 && first_thunk == 0 {
             break;
@@ -670,7 +711,7 @@ fn read_import_thunks(
         let lookup_entry_rva = u64::from(lookup_thunk_rva)
             .checked_add(
                 index
-                    .checked_mul(8)
+                    .checked_mul(THUNK_ENTRY_SIZE)
                     .context("lookup thunk index overflow")?,
             )
             .context("lookup thunk RVA overflow")?;
@@ -685,18 +726,20 @@ fn read_import_thunks(
         }
 
         let iat_slot_rva = u64::from(first_thunk_rva)
-            .checked_add(index.checked_mul(8).context("IAT index overflow")?)
+            .checked_add(
+                index
+                    .checked_mul(THUNK_ENTRY_SIZE)
+                    .context("IAT index overflow")?,
+            )
             .context("IAT slot RVA overflow")?;
 
         let iat_slot_va = image_base
             .checked_add(iat_slot_rva)
             .context("IAT slot VA overflow")?;
 
-        let ordinal_flag = 0x8000_0000_0000_0000_u64;
-
-        if (thunk_value & ordinal_flag) != 0 {
-            let ordinal =
-                u16::try_from(thunk_value & 0xffff).context("ordinal does not fit u16")?;
+        if (thunk_value & IMAGE_ORDINAL_FLAG64) != 0 {
+            let ordinal = u16::try_from(thunk_value & IMAGE_ORDINAL_MASK64)
+                .context("ordinal does not fit u16")?;
             imports.push(PeImportSummary {
                 library: library.to_owned(),
                 name: String::new(),
@@ -714,7 +757,7 @@ fn read_import_thunks(
                 })?;
 
             let hint = read_u16(bytes, hint_name_offset)?;
-            let name_offset = checked_add_usize(hint_name_offset, 2)?;
+            let name_offset = checked_add_usize(hint_name_offset, IMPORT_HINT_SIZE)?;
             let name = read_c_string_at_offset(bytes, name_offset)?;
 
             imports.push(PeImportSummary {
@@ -925,10 +968,12 @@ fn copy_section(
         usize::try_from(section.size_of_raw_data).context("section raw size does not fit usize")?;
     let virtual_address = usize::try_from(section.virtual_address)
         .context("section virtual address does not fit usize")?;
-    let virtual_size =
-        usize::try_from(section.virtual_size).context("section virtual size does not fit usize")?;
 
-    let bytes_to_copy = raw_size.min(virtual_size.max(raw_size));
+    // The Windows loader copies `SizeOfRawData` bytes from the file into the
+    // section's virtual range; the remainder up to `VirtualSize` is
+    // zero-filled by the loader, and `image` is already zero-initialized, so
+    // only the raw bytes need copying.
+    let bytes_to_copy = raw_size;
 
     if bytes_to_copy == 0 {
         return Ok(());
@@ -1167,7 +1212,9 @@ where
             usize::try_from(import.iat_slot_rva).context("IAT slot RVA does not fit usize")?;
 
         let slot_end = slot_offset
-            .checked_add(8)
+            .checked_add(
+                usize::try_from(THUNK_ENTRY_SIZE).context("thunk size does not fit usize")?,
+            )
             .context("IAT slot write range overflow")?;
 
         let slot = image

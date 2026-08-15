@@ -51,6 +51,12 @@ const IMAGE_NT_OPTIONAL_HDR64_MAGIC: u16 = 0x20B;
 /// DOS header `e_lfanew` field offset (points at the `PE\0\0` signature).
 const E_LFANEW_OFFSET: usize = 0x3C;
 
+/// The `PE\0\0` signature DWORD at `e_lfanew` (`IMAGE_NT_SIGNATURE`).
+const PE_SIGNATURE: &[u8] = b"PE\0\0";
+
+/// Byte size of the `PE\0\0` signature (one DWORD).
+const PE_SIGNATURE_SIZE: usize = 4;
+
 /// `IMAGE_SIZEOF_FILE_HEADER` — COFF file-header size (optional header follows).
 const IMAGE_SIZEOF_FILE_HEADER: usize = 20;
 
@@ -67,6 +73,24 @@ const IMAGE_DIRECTORY_ENTRY_RESOURCE: u32 = 2;
 /// Size of one `IMAGE_DATA_DIRECTORY` entry (8 bytes: `VirtualAddress` +
 /// `Size`).
 const IMAGE_DATA_DIRECTORY_SIZE: usize = 8;
+
+/// `IMAGE_RESOURCE_DIRECTORY::NumberOfNamedEntries` — field offset.
+const RESOURCE_DIR_NAMED_ENTRIES_OFF: usize = 12;
+
+/// `IMAGE_RESOURCE_DIRECTORY::NumberOfIdEntries` — field offset.
+const RESOURCE_DIR_ID_ENTRIES_OFF: usize = 14;
+
+/// Byte size of the fixed `IMAGE_RESOURCE_DIRECTORY` header (16 bytes); the
+/// directory entries follow immediately.
+const RESOURCE_DIR_HEADER_SIZE: usize = 16;
+
+/// Stride of one `IMAGE_RESOURCE_DIRECTORY_ENTRY` (8 bytes: `Name` +
+/// `OffsetToData`).
+const RESOURCE_DIR_ENTRY_SIZE: usize = 8;
+
+/// `IMAGE_RESOURCE_DATA_ENTRY::Size` — field offset (4 bytes past the data
+/// RVA).
+const RESOURCE_DATA_ENTRY_SIZE_OFF: usize = 4;
 
 /// Marker word for ordinal template fields (dialog menus/classes/titles and
 /// item classes): a `0xFFFF` word means the next WORD is an ordinal.
@@ -241,7 +265,7 @@ fn push_template_from_leaf<T>(
 fn read_data_entry(walk: &ResourceWalk<'_>, entry_off: u32) -> Option<(u32, u32)> {
     let off = entry_target(walk, entry_off)?;
     let data_rva = read_u32_at(walk.image, off)?;
-    let size = read_u32_at(walk.image, off.checked_add(4)?)?;
+    let size = read_u32_at(walk.image, off.checked_add(RESOURCE_DATA_ENTRY_SIZE_OFF)?)?;
     Some((data_rva, size))
 }
 
@@ -258,14 +282,14 @@ fn resource_root_rva(image: &[u8], sections: &[PeSectionMap]) -> Option<u32> {
 /// optional header of the PE in `image`.
 fn pe_resource_root_rva(image: &[u8]) -> Option<u32> {
     let pe_off = usize::try_from(read_u32_at(image, E_LFANEW_OFFSET)?).ok()?;
-    let sig_off = pe_off.checked_add(4)?;
-    let sig_end = sig_off.checked_add(4)?;
-    if image.get(sig_off..sig_end) != Some(&b"PE\0\0"[..]) {
+    let sig_off = pe_off.checked_add(PE_SIGNATURE_SIZE)?;
+    let sig_end = sig_off.checked_add(PE_SIGNATURE_SIZE)?;
+    if image.get(sig_off..sig_end) != Some(PE_SIGNATURE) {
         return None;
     }
-    // The optional header starts after the 20-byte COFF header.
+    // The optional header starts after the signature and the COFF header.
     let opt_off = pe_off
-        .checked_add(4)?
+        .checked_add(PE_SIGNATURE_SIZE)?
         .checked_add(IMAGE_SIZEOF_FILE_HEADER)?;
     // PE32+ only; PE32 (0x10B) is rejected by WIE and has different offsets.
     if read_u16_at(image, opt_off)? != IMAGE_NT_OPTIONAL_HDR64_MAGIC {
@@ -295,9 +319,11 @@ fn resource_section_rva(sections: &[PeSectionMap]) -> Option<u32> {
             return Some(sec.va);
         }
     }
+    // Fallback profile of a `.rsrc`-like section: initialized data + read,
+    // no write bit.
+    const INIT_READ: u32 =
+        IMAGE_SCN_CNT_INITIALIZED_DATA | crate::SectionCharacteristics::READ.bits();
     for sec in sections {
-        const INIT_READ: u32 =
-            IMAGE_SCN_CNT_INITIALIZED_DATA | crate::SectionCharacteristics::READ.bits();
         let matches = sec.characteristics & INIT_READ == INIT_READ
             && sec.characteristics & crate::SectionCharacteristics::WRITE.bits() == 0;
         if matches {
@@ -311,17 +337,17 @@ fn resource_section_rva(sections: &[PeSectionMap]) -> Option<u32> {
 fn read_resource_dir(image: &[u8], off: usize) -> Option<ResourceDir> {
     // Fixed 16-byte header: Characteristics, TimeDateStamp, MajorVersion,
     // MinorVersion, NumberOfNamedEntries, NumberOfIdEntries.
-    let named = read_u16_at(image, off.checked_add(12)?)?;
-    let by_id = read_u16_at(image, off.checked_add(14)?)?;
+    let named = read_u16_at(image, off.checked_add(RESOURCE_DIR_NAMED_ENTRIES_OFF)?)?;
+    let by_id = read_u16_at(image, off.checked_add(RESOURCE_DIR_ID_ENTRIES_OFF)?)?;
     let total = u32::from(named).checked_add(u32::from(by_id))?;
     // Bound the iteration by what the image can physically hold.
     let count = usize::try_from(total)
         .unwrap_or(usize::MAX)
-        .min(image.len() >> 3);
-    let base = off.checked_add(16)?;
+        .min(image.len() / RESOURCE_DIR_ENTRY_SIZE);
+    let base = off.checked_add(RESOURCE_DIR_HEADER_SIZE)?;
     let mut entries = Vec::new();
     for i in 0..count {
-        let e = base.checked_add(i.checked_mul(8)?)?;
+        let e = base.checked_add(i.checked_mul(RESOURCE_DIR_ENTRY_SIZE)?)?;
         entries.push((
             read_u32_at(image, e)?,
             read_u32_at(image, e.checked_add(4)?)?,
@@ -364,18 +390,24 @@ fn rva_to_file(image: &[u8], sections: &[PeSectionMap], rva: u32) -> Option<usiz
     None
 }
 
+/// Read `N` raw bytes at `pos` (bounds-checked), like [`crate::read_array`]
+/// but returning `None` on any out-of-range read.
+fn read_array_at<const N: usize>(bytes: &[u8], pos: usize) -> Option<[u8; N]> {
+    crate::read_array::<N>(bytes, pos).ok()
+}
+
 pub(crate) fn read_u16_at(bytes: &[u8], pos: usize) -> Option<u16> {
-    let raw = crate::read_array::<2>(bytes, pos).ok()?;
+    let raw = read_array_at::<2>(bytes, pos)?;
     Some(u16::from_le_bytes(raw))
 }
 
 pub(crate) fn read_u32_at(bytes: &[u8], pos: usize) -> Option<u32> {
-    let raw = crate::read_array::<4>(bytes, pos).ok()?;
+    let raw = read_array_at::<4>(bytes, pos)?;
     Some(u32::from_le_bytes(raw))
 }
 
 pub(crate) fn read_i16_at(bytes: &[u8], pos: usize) -> Option<i16> {
-    let raw = crate::read_array::<2>(bytes, pos).ok()?;
+    let raw = read_array_at::<2>(bytes, pos)?;
     Some(i16::from_le_bytes(raw))
 }
 
@@ -432,8 +464,10 @@ pub(crate) mod test_util {
             virtual_size: 0x1000,
             pointer_to_raw_data: 0x200,
             size_of_raw_data: 0x1000,
-            characteristics: 0x4000_0040,
-            final_protect: 0x04,
+            // `.rsrc` profile: initialized data + read, no write bit.
+            characteristics: super::IMAGE_SCN_CNT_INITIALIZED_DATA
+                | crate::SectionCharacteristics::READ.bits(),
+            final_protect: crate::PAGE_READWRITE,
         }
     }
 

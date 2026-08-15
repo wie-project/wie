@@ -7,6 +7,10 @@ use crate::PeSectionMap;
 
 use super::common::{MAX_STRING_WORDS, RT_STRING, parse_resource_type, read_u16_at};
 
+/// Number of strings in one `RT_STRING` block (Microsoft Learn: a string
+/// table stores its entries in blocks of 16).
+const STRING_BLOCK_SLOTS: usize = 16;
+
 /// One parsed `RT_STRING` block: 16 length-prefixed UTF-16 strings.
 ///
 /// A string table stores its entries in blocks of 16 (Microsoft Learn,
@@ -46,7 +50,7 @@ fn parse_string_block(block_id: u16, lang: u16, bytes: &[u8]) -> Option<StringBl
         // Not even one length prefix: treat the block as absent.
         return None;
     }
-    let mut strings: [String; 16] = std::array::from_fn(|_| String::new());
+    let mut strings: [String; STRING_BLOCK_SLOTS] = std::array::from_fn(|_| String::new());
     let mut pos = 0usize;
     for slot in &mut strings {
         let Some(len) = read_u16_at(bytes, pos) else {
@@ -101,7 +105,7 @@ mod tests {
                 put_u16(&mut b, unit);
             }
         }
-        for _ in strings.len()..16 {
+        for _ in strings.len()..STRING_BLOCK_SLOTS {
             put_u16(&mut b, 0);
         }
         b
