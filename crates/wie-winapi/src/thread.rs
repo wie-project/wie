@@ -8,8 +8,13 @@
 //! - Guest TID is independent of host pthread id.
 //! - TLS **indices** are process-wide (`TlsAlloc`); **values** live on the
 //!   active [`GuestThread`].
-//! - TEB last-error is still mirrored at a fixed low VA for the primary
-//!   thread until multi-TEB / GS-base (later phase).
+//! - Last-error is per-guest-thread on the host side ([`GuestThread::last_error`],
+//!   exactly like real Windows' per-TEB storage) and in guest memory: the
+//!   primary engine's GS base is the fixed [`crate::GS_BASE`] page and each
+//!   worker engine is bound to its own TEB page (`CpuEngine::set_gs_base`),
+//!   so GS-relative last-error accesses resolve per thread, never to one
+//!   shared mirror. The `WinApiState` absorb/publish helpers keep the ACTIVE
+//!   engine's TEB slot and the host slot coherent across API dispatches.
 
 use ahash::HashMap;
 use ahash::HashMapExt;
@@ -118,6 +123,16 @@ pub struct GuestThread {
     pub tid: u32,
     /// Values for process TLS indices (`TlsGetValue` / `TlsSetValue`).
     pub tls_values: Vec<u64>,
+    /// This thread's last-error value — the per-thread authoritative store.
+    ///
+    /// Windows keeps last-error in the per-thread TEB; `handle_get_last_error`
+    /// / `handle_set_last_error` and every host handler that sets
+    /// `ProcessState::last_error` operate on the ACTIVE thread through the
+    /// `process.last_error` alias. The `WinApiState` absorb/publish helpers
+    /// hydrate this slot from the ACTIVE engine's GS-relative TEB slot before
+    /// a dispatch and publish it back (to that same per-engine slot) after —
+    /// each thread's value lives in its own TEB page, never a shared mirror.
+    pub last_error: u32,
 }
 
 impl GuestThread {
@@ -127,6 +142,7 @@ impl GuestThread {
         Self {
             tid: PRIMARY_THREAD_ID,
             tls_values: Vec::new(),
+            last_error: 0,
         }
     }
 
@@ -136,6 +152,7 @@ impl GuestThread {
         Self {
             tid,
             tls_values: Vec::new(),
+            last_error: 0,
         }
     }
 }

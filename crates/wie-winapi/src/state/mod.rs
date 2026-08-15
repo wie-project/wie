@@ -7,8 +7,10 @@
 use std::any::Any;
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use strum::IntoEnumIterator;
 use wie_cpu::CpuEngine;
+use wie_cpu::guest_layout::TEB_LAST_ERROR_OFFSET;
 
 use crate::console;
 use crate::gdi32;
@@ -115,14 +117,14 @@ pub struct KernelState {
 /// # Adding a new DLL
 ///
 /// 1. Add a variant here.
-/// 2. Add a match arm to [`DllStateMap::slot_of`].
+/// 2. Add a match arm to [`dll_slot`].
 /// 3. Add an accessor on [`WinApiState`].
 ///
 /// That is the entire change. The slot array length derives from
 /// [`DllId::COUNT`] (see the struct definition and `new()`), so a variant
 /// without a slot is a compile error; [`DllId::COUNT`] itself derives from
 /// the number of variants.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, strum::EnumCount)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, strum::EnumCount, strum::EnumIter)]
 pub enum DllId {
     Console,
     Window,
@@ -168,7 +170,7 @@ impl DllId {
 ///
 /// # Adding a new DLL (alongside [`DllId`])
 ///
-/// Add a variant to [`DllId`] and a match arm to `slot_of`. The slot array
+/// Add a variant to [`DllId`] and a match arm to [`dll_slot`]. The slot array
 /// length is `DllId::COUNT` in both the struct definition and `new()`, so a
 /// missing slot is a compile error rather than a silent empty slot.
 pub struct DllStateMap {
@@ -185,60 +187,52 @@ impl Default for DllStateMap {
     }
 }
 
-/// Map a [`DllId`] to its index in the slot array. Matches explicitly
-/// so the compiler warns if a variant is added without a corresponding arm.
-const fn dll_index(id: DllId) -> usize {
+/// Map a [`DllId`] to its slot: the index into [`DllStateMap::slots`] and the
+/// debug label, both from one match arm so they can never disagree.
+///
+/// This is the single authoritative `DllId` ↔ slot mapping — it replaces the
+/// old `dll_index` + `slot_of` pair, which drifted (slot 14, `Winhttp`, had no
+/// label and fell into `slot_of`'s `_ => "?"` arm). The match is exhaustive,
+/// so a new variant without an arm is a compile error; the slot-array length
+/// is [`DllId::COUNT`] in both the struct definition and `new()`, so the enum
+/// and the array cannot drift either.
+const fn dll_slot(id: DllId) -> (usize, &'static str) {
     match id {
-        DllId::Console => 0,
-        DllId::Window => 1,
-        DllId::D3D9 => 2,
-        DllId::Pthread => 3,
-        DllId::Gdi => 4,
-        DllId::Present => 5,
-        DllId::Clipboard => 6,
-        DllId::Registry => 7,
-        DllId::DragDrop => 8,
-        DllId::Ws2 => 9,
-        DllId::Crypt32 => 10,
-        DllId::Ole32 => 11,
-        DllId::Winmm => 12,
-        DllId::Wininet => 13,
-        DllId::Winhttp => 14,
+        DllId::Console => (0, "console"),
+        DllId::Window => (1, "window"),
+        DllId::D3D9 => (2, "d3d9"),
+        DllId::Pthread => (3, "pthread"),
+        DllId::Gdi => (4, "gdi"),
+        DllId::Present => (5, "present"),
+        DllId::Clipboard => (6, "clipboard"),
+        DllId::Registry => (7, "registry"),
+        DllId::DragDrop => (8, "dragdrop"),
+        DllId::Ws2 => (9, "ws2"),
+        DllId::Crypt32 => (10, "crypt32"),
+        DllId::Ole32 => (11, "ole32"),
+        DllId::Winmm => (12, "winmm"),
+        DllId::Wininet => (13, "wininet"),
+        DllId::Winhttp => (14, "winhttp"),
     }
 }
 
 impl std::fmt::Debug for DllStateMap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let loaded: Vec<&str> = self
-            .slots
-            .iter()
-            .enumerate()
-            .filter_map(|(i, slot)| slot.as_ref().map(|_| slot_of(i)))
+        // Iterate the enum (declaration order equals slot order) so every
+        // loaded slot is labelled by its own `dll_slot` arm — one source of
+        // truth for both index and name.
+        let loaded: Vec<&str> = DllId::iter()
+            .filter_map(|id| {
+                let (index, label) = dll_slot(id);
+                self.slots
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .map(|_| label)
+            })
             .collect();
         f.debug_struct("DllStateMap")
             .field("loaded", &loaded)
             .finish()
-    }
-}
-
-/// Slot label for debug output. Add a match arm per new [`DllId`] variant.
-const fn slot_of(i: usize) -> &'static str {
-    match i {
-        0 => "console",
-        1 => "window",
-        2 => "d3d9",
-        3 => "pthread",
-        4 => "gdi",
-        5 => "present",
-        6 => "clipboard",
-        7 => "registry",
-        8 => "dragdrop",
-        9 => "ws2",
-        10 => "crypt32",
-        11 => "ole32",
-        12 => "winmm",
-        13 => "wininet",
-        _ => "?",
     }
 }
 
@@ -251,29 +245,46 @@ impl DllStateMap {
         }
     }
 
+    /// Fallible core of [`DllStateMap::get_or_init`]: heap-allocates a
+    /// default on first call, like `get_or_init`, but reports the two
+    /// programming-error cases — a slot index outside the array, or a
+    /// [`DllId`] reused for a different state type — as `Err` instead of
+    /// terminating mid-call. Valid callers never see them: `dll_slot` is
+    /// exhaustive over in-range indices and each slot holds exactly one type,
+    /// invariants pinned by the `dll_slot_round_trip_covers_every_variant`
+    /// test.
+    fn try_get_or_init<T: Default + Send + 'static>(&mut self, id: DllId) -> Result<&mut T> {
+        let (index, label) = dll_slot(id);
+        let slot = self.slots.get_mut(index).ok_or_else(|| {
+            anyhow!(
+                "{id:?} ({label}) maps to slot index {index}, outside the {count}-slot array",
+                count = DllId::COUNT
+            )
+        })?;
+        let boxed = slot.get_or_insert_with(|| Box::new(T::default()));
+        boxed
+            .as_mut()
+            .downcast_mut::<T>()
+            .ok_or_else(|| anyhow!("{id:?} ({label}) slot {index} holds a different state type"))
+    }
+
     /// Access the state for `id`, heap-allocating a default on first call.
     ///
-    /// # Panics
-    /// If the slot type does not match `T` — a programming error when a
-    /// `DllId` variant is reused for a different type.
+    /// # Aborts
+    /// On the two programming errors [`DllStateMap::try_get_or_init`]
+    /// reports — a [`DllId`] variant mapped outside the slot array, or reused
+    /// for a different state type. Both are impossible for a valid build; the
+    /// infallible signature is what the [`WinApiState`] accessors need.
     pub fn get_or_init<T: Default + Send + 'static>(&mut self, id: DllId) -> &mut T {
-        let idx = dll_index(id);
-        let Some(slot) = self.slots.get_mut(idx) else {
-            std::process::abort();
-        };
-        slot.get_or_insert_with(|| Box::new(T::default()));
-        let Some(boxed) = slot.as_mut() else {
-            std::process::abort();
-        };
-        let Some(t) = boxed.as_mut().downcast_mut::<T>() else {
-            std::process::abort();
-        };
-        t
+        match self.try_get_or_init(id) {
+            Ok(state) => state,
+            Err(_) => std::process::abort(),
+        }
     }
 
     /// Read-only access — returns `None` if the slot was never initialised.
     pub fn get<T: 'static>(&self, id: DllId) -> Option<&T> {
-        let boxed = self.slots.get(dll_index(id))?.as_ref()?;
+        let boxed = self.slots.get(dll_slot(id).0)?.as_ref()?;
         boxed.as_ref().downcast_ref::<T>()
     }
 }
@@ -365,6 +376,58 @@ impl std::fmt::Debug for WinApiState {
 // When adding a new DLL, add a pair of methods here (mut + try_)
 // and a variant to [`DllId`]. That is the only change needed.
 impl WinApiState {
+    /// Absorb the ACTIVE engine's GS-relative TEB last-error slot into the
+    /// ACTIVE thread's per-thread slot and refresh the `process.last_error`
+    /// alias.
+    ///
+    /// Called before host API dispatch, under the WinAPI lock with `active`
+    /// set to the thread that owns the engine: the in-guest `SetLastError`
+    /// stub writes the engine's TEB slot directly (a pure guest memory store,
+    /// no host stop), so the slot may hold a newer value than this thread last
+    /// published. Host handlers that READ `process.last_error` as input
+    /// (`WSAGetLastError`, `GetLastError` when not stubbed, …) must observe
+    /// that guest-side value. The engine's GS base binds the read to the
+    /// ACTIVE thread's own TEB page — the primary engine keeps the fixed
+    /// `GS_BASE`, each worker engine is bound to its own `PerThreadTeb` page
+    /// at spawn — so a peer thread's stub write can never race this read.
+    pub fn absorb_guest_last_error(&mut self, engine: &mut dyn CpuEngine) {
+        let teb_va = engine.gs_base();
+        let mut teb_err = [0_u8; 4];
+        if engine
+            .mem_read(teb_va + TEB_LAST_ERROR_OFFSET, &mut teb_err)
+            .is_err()
+        {
+            // Best-effort: the TEB page is always mapped for the real layout.
+            return;
+        }
+        let value = u32::from_le_bytes(teb_err);
+        self.kernel.threads.active.last_error = value;
+        self.process.last_error = value;
+    }
+
+    /// Publish the ACTIVE thread's last-error into the ACTIVE engine's
+    /// GS-relative TEB slot.
+    ///
+    /// Folds any `process.last_error` handler writes into the active thread's
+    /// slot first, then writes the slot value into the TEB page the engine is
+    /// bound to (`engine.gs_base() + TEB_LAST_ERROR_OFFSET`). Called after
+    /// host API dispatch; at thread-activation boundaries callers first
+    /// refresh the alias from the active slot (`process.last_error =
+    /// threads.active.last_error`) because the alias still holds the PREVIOUS
+    /// thread's value there and must not overwrite the newly active thread's
+    /// slot. Every write lands in the ACTIVE thread's own TEB page: the
+    /// primary engine writes the fixed `GS_BASE` page, each worker engine its
+    /// own `PerThreadTeb` page — never one shared mirror.
+    pub fn publish_last_error_to_guest(&mut self, engine: &mut dyn CpuEngine) {
+        let threads = &mut self.kernel.threads;
+        threads.active.last_error = self.process.last_error;
+        let value = threads.active.last_error;
+        let teb_va = engine.gs_base();
+        let bytes = value.to_le_bytes();
+        // Best-effort: the TEB page is always mapped for the real layout.
+        drop(engine.mem_write(teb_va + TEB_LAST_ERROR_OFFSET, &bytes));
+    }
+
     /// Flush buffered Stream-mode console output to the host terminal.
     /// Called at frame boundaries (Sleep, _getch, etc.) so multiple
     /// WriteConsole calls within one frame render atomically.

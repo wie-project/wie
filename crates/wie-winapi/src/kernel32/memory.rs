@@ -13,6 +13,8 @@ const MEM_RESERVE: u32 = 0x2000;
 const MEM_RELEASE: u32 = 0x8000;
 /// `PAGE_READWRITE` (page protection).
 const PAGE_READWRITE: u32 = 0x04;
+/// Byte size of `MEMORY_BASIC_INFORMATION` (winnt.h, Win64).
+const MEMORY_BASIC_INFORMATION_SIZE: u64 = 48;
 
 /// Handles `KERNEL32.dll!CreateFileMappingW`.
 ///
@@ -246,7 +248,7 @@ pub(crate) fn handle_virtual_query(ctx: &mut HandlerContext<'_>) -> Result<WinAp
     let buffer = engine.read_rdx()?;
     let length = engine.read_r8()?;
 
-    if buffer == 0 || length < 48 {
+    if buffer == 0 || length < MEMORY_BASIC_INFORMATION_SIZE {
         state.process.last_error = ERROR_INVALID_PARAMETER;
         return ctx.finish(0);
     }
@@ -255,5 +257,5 @@ pub(crate) fn handle_virtual_query(ctx: &mut HandlerContext<'_>) -> Result<WinAp
     let bytes = mbi.to_bytes();
     engine.mem_write(buffer, &bytes)?;
     state.process.last_error = 0;
-    ctx.finish(48)
+    ctx.finish(MEMORY_BASIC_INFORMATION_SIZE)
 }

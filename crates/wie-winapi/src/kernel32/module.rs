@@ -9,6 +9,10 @@ use super::{
     read_wide_string_from_cpu,
 };
 
+/// Win32 `MAX_PATH` (260 chars incl. NUL) — the longest module/name buffer
+/// WIE reads from the guest.
+const MAX_PATH: usize = 260;
+
 /// Handles `KERNEL32.dll!GetModuleHandleA`.
 /// Handles `KERNEL32.dll!GetModuleHandleA`.
 pub fn handle_get_module_handle_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -23,7 +27,7 @@ pub fn handle_get_module_handle_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
         state.process.last_error = 0;
         environment.image_base
     } else {
-        let module_name = read_ansi_string_from_cpu(engine, module_name_va, 260)?;
+        let module_name = read_ansi_string_from_cpu(engine, module_name_va, MAX_PATH)?;
         let handle = resolve_loaded_module_handle(&module_name, environment.image_base, state);
         if handle == 0 {
             state.process.last_error = ERROR_MOD_NOT_FOUND;
@@ -48,7 +52,7 @@ pub fn handle_get_module_handle_w(ctx: &mut HandlerContext<'_>) -> Result<WinApi
         state.process.last_error = 0;
         environment.image_base
     } else {
-        let module_name = read_guest_utf16_lossy(engine, module_name_va, 260)?;
+        let module_name = read_guest_utf16_lossy(engine, module_name_va, MAX_PATH)?;
         let handle = resolve_loaded_module_handle(&module_name, environment.image_base, state);
         if handle == 0 {
             state.process.last_error = ERROR_MOD_NOT_FOUND;
@@ -275,7 +279,7 @@ pub fn handle_load_library_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         state.process.last_error = ERROR_MOD_NOT_FOUND;
         0
     } else {
-        let library_name = read_ansi_string_from_cpu(engine, library_name_va, 260)?;
+        let library_name = read_ansi_string_from_cpu(engine, library_name_va, MAX_PATH)?;
         let handle = resolve_or_load_dll(&library_name, engine, environment, state);
         if handle == 0 {
             state.process.last_error = ERROR_MOD_NOT_FOUND;
@@ -300,7 +304,7 @@ pub fn handle_load_library_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         state.process.last_error = ERROR_MOD_NOT_FOUND;
         0
     } else {
-        let library_name = read_wide_string_from_cpu(engine, library_name_va, 260)?;
+        let library_name = read_wide_string_from_cpu(engine, library_name_va, MAX_PATH)?;
         let handle = resolve_or_load_dll(&library_name, engine, environment, state);
         if handle == 0 {
             state.process.last_error = ERROR_MOD_NOT_FOUND;
@@ -479,7 +483,7 @@ pub fn handle_load_library_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .read_r8()
         .context("failed to read R8 for LoadLibraryExA")?;
 
-    let library_name = read_ansi_string_from_cpu(engine, library_name_va, 260)?;
+    let library_name = read_ansi_string_from_cpu(engine, library_name_va, MAX_PATH)?;
     let return_value = resolve_or_load_dll(&library_name, engine, environment, state);
 
     ctx.finish(return_value)
@@ -501,7 +505,7 @@ pub fn handle_load_library_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         .read_r8()
         .context("failed to read R8 for LoadLibraryExW")?;
 
-    let library_name = read_wide_string_from_cpu(engine, library_name_va, 260)?;
+    let library_name = read_wide_string_from_cpu(engine, library_name_va, MAX_PATH)?;
     let return_value = resolve_or_load_dll(&library_name, engine, environment, state);
 
     ctx.finish(return_value)
@@ -574,8 +578,12 @@ pub fn handle_sizeof_resource(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     ctx.finish(return_value)
 }
 
+/// `GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS` (libloaderapi.h) — resolve the
+/// module containing `lpModuleName`.
 const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u64 = 0x4;
+/// `GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT` — do not bump the refcount.
 const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u64 = 0x2;
+/// `GET_MODULE_HANDLE_EX_FLAG_PIN` — pin the module in memory.
 const GET_MODULE_HANDLE_EX_FLAG_PIN: u64 = 0x1;
 
 /// Module base + name for the module containing a guest address (main image
@@ -635,7 +643,7 @@ pub fn handle_get_module_handle_ex_w(ctx: &mut HandlerContext<'_>) -> Result<Win
     } else if module_name_va == 0 {
         environment.image_base
     } else {
-        let name = read_wide_string_from_cpu(engine, module_name_va, 260)?;
+        let name = read_wide_string_from_cpu(engine, module_name_va, MAX_PATH)?;
         resolve_loaded_module_handle(&name, environment.image_base, state)
     };
 
@@ -779,6 +787,10 @@ pub fn handle_rtl_virtual_unwind(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     ctx.finish(0)
 }
 
+/// Win32 `ERROR_RESOURCE_DATA_NOT_FOUND` — the module has no enumerable
+/// resource-name table.
+const ERROR_RESOURCE_DATA_NOT_FOUND: u32 = 1812;
+
 /// Handles `KERNEL32.dll!EnumResourceNamesW`.
 ///
 /// WIE does not track the module's `.rsrc` name table, so no resources are
@@ -789,7 +801,7 @@ pub fn handle_enum_resource_names_w(ctx: &mut HandlerContext<'_>) -> Result<WinA
     let _resource_type = ctx.engine.read_rdx()?;
     let _callback = ctx.engine.read_r8()?;
     let _lparam = ctx.engine.read_r9()?;
-    ctx.state.process.last_error = 1812; // ERROR_RESOURCE_DATA_NOT_FOUND
+    ctx.state.process.last_error = ERROR_RESOURCE_DATA_NOT_FOUND;
     ctx.finish(0)
 }
 

@@ -98,10 +98,13 @@ const FAKE_COMDLG32_MODULE: u64 = 0x0000_0000_6100_6000;
 const FAKE_WINMM_MODULE: u64 = 0x0000_0000_6100_7000;
 
 const INVALID_FILE_ATTRIBUTES: u64 = 0xffff_ffff;
+/// `FILE_ATTRIBUTE_DIRECTORY` (winnt.h) — the entry is a directory.
 const FILE_ATTRIBUTE_DIRECTORY: u64 = 0x0000_0010;
+/// `FILE_ATTRIBUTE_ARCHIVE` (winnt.h) — the entry is marked for archiving.
 const FILE_ATTRIBUTE_ARCHIVE: u64 = 0x0000_0020;
 
 pub(crate) const INVALID_HANDLE_VALUE: u64 = u64::MAX;
+/// Win32 `ERROR_NO_MORE_FILES` — the enumeration is exhausted.
 const ERROR_NO_MORE_FILES: u32 = 18;
 
 /// Win32 `ERROR_INVALID_FUNCTION` — the operation is not supported on this handle.
@@ -120,8 +123,11 @@ const FAKE_RESOURCE_BYTES: [u8; 16] = [
 
 const LANG_EN_US: u64 = 0x0409;
 
+/// Win32 `ERROR_INVALID_HANDLE` — the handle is not open (fileapi.h).
 const ERROR_INVALID_HANDLE: u32 = 6;
+/// Win32 `ERROR_INVALID_PARAMETER` — an argument is malformed.
 const ERROR_INVALID_PARAMETER: u32 = 87;
+/// Win32 `ERROR_INSUFFICIENT_BUFFER` — the caller's buffer is too small.
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 /// Win32 `ERROR_READ_FAULT` — host console stdin I/O failure.
 const ERROR_READ_FAULT: u32 = 30;
@@ -129,28 +135,44 @@ const ERROR_READ_FAULT: u32 = 30;
 const TIME_ZONE_ID_UNKNOWN: u64 = 0;
 const TIME_ZONE_ID_INVALID: u64 = 0xffff_ffff;
 
+/// `FILE_BEGIN` — `SetFilePointer` move method: relative to the file start.
 const FILE_BEGIN: u64 = 0;
+/// `FILE_CURRENT` — `SetFilePointer` move method: relative to the current position.
 const FILE_CURRENT: u64 = 1;
+/// `FILE_END` — `SetFilePointer` move method: relative to the file end.
 const FILE_END: u64 = 2;
+/// `INVALID_SET_FILE_POINTER` — the `SetFilePointer` failure sentinel.
 const INVALID_SET_FILE_POINTER: u64 = 0xffff_ffff;
 
+/// Win32 `ERROR_FILE_NOT_FOUND` — the named file does not exist.
 const ERROR_FILE_NOT_FOUND: u32 = 2;
+/// Win32 `ERROR_PATH_NOT_FOUND` — a path component does not exist.
 const ERROR_PATH_NOT_FOUND: u32 = 3;
+/// Win32 `ERROR_ACCESS_DENIED` — the operation is not permitted.
 const ERROR_ACCESS_DENIED: u32 = 5;
 /// Win32 `ERROR_INVALID_DRIVE` — SetCurrentDirectory on an unmapped drive.
 const ERROR_INVALID_DRIVE: u32 = 15;
 /// CreateFile CREATE_NEW when the file already exists (Microsoft Learn).
 const ERROR_FILE_EXISTS: u32 = 80;
+/// Win32 `ERROR_MOD_NOT_FOUND` — the requested module is not loaded.
 const ERROR_MOD_NOT_FOUND: u32 = 126;
+/// Win32 `ERROR_PROC_NOT_FOUND` — the requested export is not present.
 const ERROR_PROC_NOT_FOUND: u32 = 127;
+/// Win32 `ERROR_ALREADY_EXISTS` — the object already exists.
 const ERROR_ALREADY_EXISTS: u32 = 183;
+/// Win32 `ERROR_DIR_NOT_EMPTY` — the directory still holds entries.
 const ERROR_DIR_NOT_EMPTY: u32 = 145;
 
-// CreateFile disposition values.
+// CreateFile disposition values (fileapi.h `CREATE_*` / `OPEN_*`).
+/// CreateFile `CREATE_NEW` — fail if the file already exists.
 const CREATE_NEW: u64 = 1;
+/// CreateFile `CREATE_ALWAYS` — overwrite an existing file.
 const CREATE_ALWAYS: u64 = 2;
+/// CreateFile `OPEN_EXISTING` — fail if the file does not exist.
 const OPEN_EXISTING: u64 = 3;
+/// CreateFile `OPEN_ALWAYS` — open, creating when absent.
 const OPEN_ALWAYS: u64 = 4;
+/// CreateFile `TRUNCATE_EXISTING` — open and truncate to zero length.
 const TRUNCATE_EXISTING: u64 = 5;
 
 /// Result returned by a WinAPI handler.
@@ -598,6 +620,7 @@ const PAGE_READWRITE: u32 = 0x04;
 // Default max guest worker threads (`CreateThread`), overridable by env.
 const DEFAULT_MT_MAX_THREADS: u32 = 64;
 
+/// Win32 `ERROR_NOT_ENOUGH_MEMORY` — the allocation failed.
 const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
 /// `ERROR_NOT_SUPPORTED` — used when `WIE_MT=0` refuses `CreateThread`.
 const ERROR_NOT_SUPPORTED_MT: u32 = 50;

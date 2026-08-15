@@ -374,6 +374,50 @@ pub fn handle_get_file_size_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     };
     ctx.finish(return_value)
 }
+/// Byte offset of the `cursor` field inside a guest I/O table slot.
+///
+/// Slot layout (matches `crate::guest_io_host` and the runtime guest helper):
+/// handle `+0`, data_va `+8`, size `+16`, cursor `+24`, flags `+32`.
+const GUEST_IO_SLOT_CURSOR_OFFSET: u64 = 24;
+
+/// Push an open file's cursor into its guest I/O table slot.
+///
+/// `SetFilePointerEx` moves the host-side cursor, but the next host-side
+/// `ReadFile` pulls the cursor back from the guest table first
+/// (`guest_io_host::sync_host_cursor_from_guest`). Without this push a host
+/// seek is silently clobbered by the stale pre-seek table value and the
+/// following read lands at the wrong offset — the DOOM Retro WAD-directory
+/// read regression. Files without a guest slot are no-ops.
+fn sync_cursor_to_guest_table(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &WinApiState,
+    handle: u64,
+) -> Result<()> {
+    let Some(cfg) = state.file_io.guest_io.as_ref() else {
+        return Ok(());
+    };
+    let Some(file) = find_open_file(state, handle) else {
+        return Ok(());
+    };
+    let Some(slot_index) = file.guest_slot_index else {
+        return Ok(());
+    };
+    let slot_index =
+        usize::try_from(slot_index).context("guest I/O slot index does not fit usize")?;
+    let slot_offset = slot_index
+        .checked_mul(crate::guest_io_host::GUEST_IO_SLOT_SIZE)
+        .context("guest I/O slot offset overflow")?;
+    let slot_offset =
+        u64::try_from(slot_offset).context("guest I/O slot offset does not fit u64")?;
+    let cursor_va = cfg
+        .table_va
+        .checked_add(slot_offset)
+        .context("guest I/O slot cursor address overflow")?
+        .checked_add(GUEST_IO_SLOT_CURSOR_OFFSET)
+        .context("guest I/O slot cursor field overflow")?;
+    write_guest_u64(engine, cursor_va, file.cursor)
+}
+
 /// Handles `KERNEL32.dll!SetFilePointerEx`.
 pub fn handle_set_file_pointer_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -416,6 +460,11 @@ pub fn handle_set_file_pointer_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApi
             if new_pos_va != 0 {
                 write_guest_u64(engine, new_pos_va, new_cursor)?;
             }
+            // Keep the guest I/O table cursor in sync with this host-side seek
+            // so a subsequent host-side ReadFile (which pulls the table cursor
+            // first) does not clobber the seek. Best-effort: no guest slot is
+            // a no-op.
+            let _ = sync_cursor_to_guest_table(engine, state, handle).ok();
             state.process.last_error = 0;
             1
         }
@@ -786,9 +835,7 @@ pub(crate) fn finish_create_file(
                 // Not-found on an OPEN_EXISTING probe is a routine existence
                 // check (e.g. a game scanning for its data files) — keep it
                 // out of the error channel; anything else is a real failure.
-                if win_error == ERROR_FILE_NOT_FOUND
-                    && creation_disposition == OPEN_EXISTING
-                {
+                if win_error == ERROR_FILE_NOT_FOUND && creation_disposition == OPEN_EXISTING {
                     tracing::debug!(
                         path = %file_name,
                         desired_access,

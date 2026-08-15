@@ -29,7 +29,7 @@ use crate::guest_memory::read_u64;
 use crate::{HandlerContext, WinApiHandlerResult};
 use anyhow::Result;
 
-use super::{EINVAL, ERANGE, finish, i32_status_to_u64};
+use super::{EINVAL, ERANGE, MAX_GUEST_STR, finish, i32_status_to_u64};
 
 /// Absolute ceiling for one formatted result. Real callers pass buffer sizes
 /// in the low KBs (notepad's status bar); this only guards hostile formats.
@@ -391,7 +391,7 @@ pub(crate) fn handle_vsnwprintf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let count = usize::try_from(count_raw)
         .unwrap_or(0)
         .min(MAX_FORMAT_OUTPUT);
-    let fmt = crate::guest_string::read_utf16_lossy(engine, fmt_va, 4096)
+    let fmt = crate::guest_string::read_utf16_lossy(engine, fmt_va, MAX_GUEST_STR)
         .map(|s| s.encode_utf16().collect::<Vec<u16>>())
         .unwrap_or_default();
     let mut va = va_list;
@@ -428,7 +428,8 @@ pub(crate) fn handle_vsnprintf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     let count = usize::try_from(count_raw)
         .unwrap_or(0)
         .min(MAX_FORMAT_OUTPUT);
-    let fmt = crate::guest_string::read_ansi_bytes(engine, fmt_va, 4096).unwrap_or_default();
+    let fmt =
+        crate::guest_string::read_ansi_bytes(engine, fmt_va, MAX_GUEST_STR).unwrap_or_default();
     let mut va = va_list;
     let mut out: Vec<u8> = Vec::with_capacity(64);
     let mut read_string = |engine: &mut dyn wie_cpu::CpuEngine, p: u64| -> Vec<u8> {
@@ -555,7 +556,8 @@ pub(crate) fn handle_sprintf_s(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     }
     engine.mem_write(FORMAT_SCRATCH + 8, &stack_slots)?;
     let mut va = FORMAT_SCRATCH;
-    let fmt = crate::guest_string::read_ansi_bytes(engine, fmt_va, 4096).unwrap_or_default();
+    let fmt =
+        crate::guest_string::read_ansi_bytes(engine, fmt_va, MAX_GUEST_STR).unwrap_or_default();
     let mut read_string = |engine: &mut dyn wie_cpu::CpuEngine, p: u64| -> Vec<u8> {
         crate::guest_string::read_ansi_bytes(engine, p, MAX_FORMAT_OUTPUT).unwrap_or_default()
     };
@@ -592,7 +594,8 @@ pub(crate) fn handle_snprintf_s(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     }
     let rsp = engine.read_rsp()?;
     let mut va = rsp.wrapping_add(0x28);
-    let fmt = crate::guest_string::read_ansi_bytes(engine, fmt_va, 4096).unwrap_or_default();
+    let fmt =
+        crate::guest_string::read_ansi_bytes(engine, fmt_va, MAX_GUEST_STR).unwrap_or_default();
     let mut read_string = |engine: &mut dyn wie_cpu::CpuEngine, p: u64| -> Vec<u8> {
         crate::guest_string::read_ansi_bytes(engine, p, MAX_FORMAT_OUTPUT).unwrap_or_default()
     };
@@ -627,7 +630,8 @@ pub(crate) fn handle_vsnprintf_s(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         empty_secure_buf(engine, buf, size_raw);
         return finish(engine, i32_status_to_u64(EINVAL));
     }
-    let fmt = crate::guest_string::read_ansi_bytes(engine, fmt_va, 4096).unwrap_or_default();
+    let fmt =
+        crate::guest_string::read_ansi_bytes(engine, fmt_va, MAX_GUEST_STR).unwrap_or_default();
     let mut read_string = |engine: &mut dyn wie_cpu::CpuEngine, p: u64| -> Vec<u8> {
         crate::guest_string::read_ansi_bytes(engine, p, MAX_FORMAT_OUTPUT).unwrap_or_default()
     };
@@ -662,7 +666,7 @@ pub(crate) fn handle_vsnwprintf_s(ctx: &mut HandlerContext<'_>) -> Result<WinApi
         empty_secure_buf(engine, buf, size_raw);
         return finish(engine, i32_status_to_u64(EINVAL));
     }
-    let fmt = crate::guest_string::read_utf16_lossy(engine, fmt_va, 4096)
+    let fmt = crate::guest_string::read_utf16_lossy(engine, fmt_va, MAX_GUEST_STR)
         .map(|s| s.encode_utf16().collect::<Vec<u16>>())
         .unwrap_or_default();
     let mut read_string = |engine: &mut dyn wie_cpu::CpuEngine, p: u64| -> Vec<u16> {
@@ -695,7 +699,8 @@ pub(crate) fn handle_stdio_common_vsprintf_s(
     let size = usize::try_from(size_raw)
         .unwrap_or(0)
         .min(MAX_FORMAT_OUTPUT);
-    let fmt = crate::guest_string::read_ansi_bytes(engine, fmt_va, 4096).unwrap_or_default();
+    let fmt =
+        crate::guest_string::read_ansi_bytes(engine, fmt_va, MAX_GUEST_STR).unwrap_or_default();
     let mut read_string = |engine: &mut dyn wie_cpu::CpuEngine, p: u64| -> Vec<u8> {
         crate::guest_string::read_ansi_bytes(engine, p, MAX_FORMAT_OUTPUT).unwrap_or_default()
     };
@@ -723,7 +728,7 @@ pub(crate) fn handle_stdio_common_vswprintf_s(
     let size = usize::try_from(size_raw)
         .unwrap_or(0)
         .min(MAX_FORMAT_OUTPUT);
-    let fmt = crate::guest_string::read_utf16_lossy(engine, fmt_va, 4096)
+    let fmt = crate::guest_string::read_utf16_lossy(engine, fmt_va, MAX_GUEST_STR)
         .map(|s| s.encode_utf16().collect::<Vec<u16>>())
         .unwrap_or_default();
     let mut read_string = |engine: &mut dyn wie_cpu::CpuEngine, p: u64| -> Vec<u16> {

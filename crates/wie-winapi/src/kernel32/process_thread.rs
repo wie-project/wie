@@ -11,6 +11,13 @@ use crate::guest_layout::{ProcessInformation, StartupInfo};
 use crate::guest_memory::with_typed_write;
 use crate::guest_string::read_arg_string;
 
+/// Byte size of `STARTUPINFO{A,W}` (both variants share the Win64 layout).
+const STARTUPINFO_CB: u32 = 104;
+/// Win64 stack offset of `CreateProcess`'s `lpEnvironment` argument.
+const CREATE_PROCESS_ENV_STACK_OFFSET: u64 = 0x38;
+/// Win64 stack offset of `CreateProcess`'s `lpProcessInformation` argument.
+const CREATE_PROCESS_PROCESS_INFO_STACK_OFFSET: u64 = 0x50;
+
 /// Write the Win64 `STARTUPINFO{A,W}` struct (both variants are
 /// layout-identical: the ANSI character pointers are still 8 bytes).
 ///
@@ -23,7 +30,7 @@ fn write_startup_info(engine: &mut dyn wie_cpu::CpuEngine, startup_info_va: u64)
         return Ok(());
     }
     with_typed_write::<StartupInfo, _, _>(engine, startup_info_va, |info| {
-        info.cb = 104;
+        info.cb = STARTUPINFO_CB;
         info.dw_flags = 0;
         info.w_show_window = 1;
         Ok(())
@@ -804,8 +811,8 @@ pub fn handle_create_process_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     // @0x30, lpEnvironment @0x38, lpCurrentDirectory @0x40, lpStartupInfo
     // @0x48, lpProcessInformation @0x50. Attributes/flags/current-directory
     // semantics are accepted and ignored (documented emulator scope).
-    let environment_va = read_stack_u64(engine, 0x38)?;
-    let process_information_va = read_stack_u64(engine, 0x50)?;
+    let environment_va = read_stack_u64(engine, CREATE_PROCESS_ENV_STACK_OFFSET)?;
+    let process_information_va = read_stack_u64(engine, CREATE_PROCESS_PROCESS_INFO_STACK_OFFSET)?;
     create_process_common(
         ctx,
         true,
@@ -824,8 +831,8 @@ pub fn handle_create_process_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     let command_line_va = engine.read_rdx()?;
     let _proc_attrs = engine.read_r8()?;
     let _thread_attrs = engine.read_r9()?;
-    let environment_va = read_stack_u64(engine, 0x38)?;
-    let process_information_va = read_stack_u64(engine, 0x50)?;
+    let environment_va = read_stack_u64(engine, CREATE_PROCESS_ENV_STACK_OFFSET)?;
+    let process_information_va = read_stack_u64(engine, CREATE_PROCESS_PROCESS_INFO_STACK_OFFSET)?;
     create_process_common(
         ctx,
         false,

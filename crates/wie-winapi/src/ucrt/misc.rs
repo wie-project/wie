@@ -7,7 +7,15 @@ use crate::sync_obj::KernelObject;
 use crate::{HandlerContext, WinApiControlSignal, WinApiHandlerResult};
 use anyhow::{Context, Result};
 
-use super::{finish, read_guest_str};
+use super::{MAX_GUEST_STR, finish, read_guest_str};
+
+/// Guest address of the CRT `errno` slot: TEB page (0x7EFD_0000) + 0x70,
+/// just past `TEB.LastErrorValue` at 0x68.
+const ERRNO_SLOT_VA: u64 = 0x7EFD_0070;
+/// Guest address of the static `"Unknown error"` string for `strerror`.
+const STRERROR_SLOT_VA: u64 = 0x7EFD_0080;
+/// Guest address of the static `"C"` locale string for `setlocale`.
+const LOCALE_SLOT_VA: u64 = 0x7EFD_0090;
 /// Shared RNG state between `srand` and `rand`.
 /// Uses a host `AtomicU32` so seeding and reading are properly ordered
 /// even if the guest remains single-threaded through the emulator.
@@ -228,7 +236,7 @@ pub(crate) fn handle_system(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         }
         cmd_bytes.push(byte[0]);
         addr = addr.wrapping_add(1);
-        if cmd_bytes.len() > 4096 {
+        if cmd_bytes.len() > MAX_GUEST_STR {
             break; // safety cap
         }
     }
@@ -352,7 +360,7 @@ pub(crate) fn handle_strerror(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     if va == 0 {
         let msg = b"Unknown error\0";
         // Write to a known address after errno slot.
-        let addr = 0x7EFD_0080;
+        let addr = STRERROR_SLOT_VA;
         drop(engine.mem_write(addr, msg));
         STRERROR_VA.store(addr, std::sync::atomic::Ordering::Relaxed);
         finish(engine, addr)
@@ -370,7 +378,7 @@ pub(crate) fn handle_setlocale(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         static LOCALE_VA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let va = LOCALE_VA.load(std::sync::atomic::Ordering::Relaxed);
         if va == 0 {
-            let addr = 0x7EFD_0090;
+            let addr = LOCALE_SLOT_VA;
             drop(engine.mem_write(addr, b"C\0"));
             LOCALE_VA.store(addr, std::sync::atomic::Ordering::Relaxed);
             finish(engine, addr)
@@ -380,7 +388,7 @@ pub(crate) fn handle_setlocale(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     } else {
         // Set: ignore, return the old locale.
         // For now, return "C" as the old locale.
-        let old = 0x7EFD_0090;
+        let old = LOCALE_SLOT_VA;
         drop(engine.mem_write(old, b"C\0"));
         finish(engine, old)
     }
@@ -394,7 +402,7 @@ pub(crate) fn handle_errno(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
         // Use a fixed address in the guest data area for errno.
         // The TEB page is at 0x7EFD_0000; place errno at 0x7EFD_0070
         // which is just after TEB.LastErrorValue at 0x68.
-        let addr = 0x7EFD_0070; // TEB page + offset after LastErrorValue
+        let addr = ERRNO_SLOT_VA; // TEB page + offset after LastErrorValue
         engine.mem_write(addr, &[0u8; 4]).ok();
         ERRNO_VA.store(addr, std::sync::atomic::Ordering::Relaxed);
         finish(engine, addr)
@@ -413,7 +421,7 @@ pub(crate) fn handle_perror(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     };
     // Read errno from the fixed guest slot (set by _errno() / pthread).
     let mut errno_bytes = [0_u8; 4];
-    if engine.mem_read(0x7EFD_0070, &mut errno_bytes).is_ok() {
+    if engine.mem_read(ERRNO_SLOT_VA, &mut errno_bytes).is_ok() {
         let errno_val = i32::from_le_bytes(errno_bytes);
         let desc = std::io::Error::from_raw_os_error(errno_val).to_string();
         let msg = if prefix.is_empty() {

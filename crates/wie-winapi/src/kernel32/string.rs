@@ -1,9 +1,15 @@
 use super::{
     ANSI_CODE_PAGE, C1_ALPHA, C1_BLANK, C1_CNTRL, C1_DIGIT, C1_LOWER, C1_PUNCT, C1_SPACE, C1_UPPER,
-    C1_XDIGIT, CT_CTYPE1, Context, HandlerContext, OEM_CODE_PAGE, Result, WinApiHandlerResult,
-    checked_address, read_u16, read_u64, write_guest_u16, write_guest_u32,
+    C1_XDIGIT, CT_CTYPE1, Context, ERROR_INSUFFICIENT_BUFFER, HandlerContext, OEM_CODE_PAGE,
+    Result, WinApiHandlerResult, checked_address, read_u16, read_u64, write_guest_u16,
+    write_guest_u32,
 };
 use crate::user32::low_i32;
+
+/// Cap on a single `lstr*W` scan: unit count for `lstrlenW`, doubled to a
+/// byte offset for the copy/append helpers (2 bytes per UTF-16 unit). A
+/// bogus pointer therefore cannot make the guest stall forever.
+const MAX_LSTR_SCAN: u64 = 1_000_000;
 
 /// Handles `KERNEL32.dll!lstrlenW`.
 pub fn handle_lstrlen_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -22,7 +28,7 @@ pub fn handle_lstrlen_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
                 break;
             }
             len = len.saturating_add(1);
-            if len > 1_000_000 {
+            if len > MAX_LSTR_SCAN {
                 break;
             }
         }
@@ -49,7 +55,7 @@ pub fn handle_lstrcpy_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
                 break;
             }
             offset = offset.saturating_add(2);
-            if offset > 2_000_000 {
+            if offset > MAX_LSTR_SCAN.saturating_mul(2) {
                 break;
             }
         }
@@ -75,7 +81,7 @@ pub fn handle_lstrcat_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
                 break;
             }
             dest_end = dest_end.saturating_add(2);
-            if dest_end > 2_000_000 {
+            if dest_end > MAX_LSTR_SCAN.saturating_mul(2) {
                 break;
             }
         }
@@ -88,7 +94,7 @@ pub fn handle_lstrcat_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
                 break;
             }
             offset = offset.saturating_add(2);
-            if offset > 2_000_000 {
+            if offset > MAX_LSTR_SCAN.saturating_mul(2) {
                 break;
             }
         }
@@ -431,6 +437,7 @@ pub fn handle_get_string_type_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 /// Handles `KERNEL32.dll!MultiByteToWideChar`.
 pub fn handle_multi_byte_to_wide_char(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let code_page = engine.read_rcx()?;
     let _flags = engine.read_rdx()?;
     let input_va = engine.read_r8()?;
@@ -459,6 +466,9 @@ pub fn handle_multi_byte_to_wide_char(ctx: &mut HandlerContext<'_>) -> Result<Wi
         let output_len_usize = usize::try_from(output_len)
             .context("MultiByteToWideChar output size does not fit usize")?;
         if output_len_usize < units.len() {
+            // Too small a buffer: Windows fails with ERROR_INSUFFICIENT_BUFFER
+            // (the pump publishes it to the TEB so a guest GetLastError sees it).
+            state.process.last_error = ERROR_INSUFFICIENT_BUFFER;
             0
         } else {
             // Bulk LE write without per-unit extend_from_slice.

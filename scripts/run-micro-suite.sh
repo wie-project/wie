@@ -54,8 +54,11 @@ if [[ "$CATEGORY" == "all" ]]; then
   run_one "$OUT/cpp_types.exe"
   run_one "$OUT/cpp_threads.exe"
 
+  # DLL tests load their sibling *_funcs.dll files by bare name, so the whole
+  # out/ folder is named explicitly with --app-dir (the default `wie run`
+  # staging copies only the exe itself).
   for exe in "$OUT"/dll_*.exe; do
-    [ -f "$exe" ] && run_one "$exe"
+    [ -f "$exe" ] && run_one "$exe" --app-dir "$OUT"
   done
 
   # Console output tests (non-interactive: no stdin needed)
@@ -76,6 +79,10 @@ if [[ "$CATEGORY" == "all" ]]; then
   cp "$OUT/child_proc.exe" "$SPAWN_ROOT/drive_c/child_proc.exe"
   run_bottle_n2 "$OUT/spawn_child.exe" "$SPAWN_ROOT"
   rm -rf "$SPAWN_ROOT"
+
+  # Fast-sync tail: failed MultiByteToWideChar -> GetLastError must observe
+  # ERROR_INSUFFICIENT_BUFFER (exit 0 on success).
+  run_one "$OUT/mbwc_lasterror.exe"
 fi
 
 if [[ "$CATEGORY" == "console_tests" ]]; then
@@ -101,8 +108,10 @@ if [[ "$CATEGORY" == "seh_exes" ]]; then
 fi
 
 if [[ "$CATEGORY" == "dll_tests" ]]; then
+  # Same --app-dir staging as the `all` category: the DLL micros load their
+  # sibling *_funcs.dll files by bare name.
   for exe in "$OUT"/dll_*.exe; do
-    [ -f "$exe" ] && run_one "$exe"
+    [ -f "$exe" ] && run_one "$exe" --app-dir "$OUT"
   done
 fi
 

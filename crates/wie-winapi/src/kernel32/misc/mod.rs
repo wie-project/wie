@@ -311,6 +311,23 @@ pub fn handle_query_performance_frequency(
     }
     ret_bool_true(engine, "QueryPerformanceFrequency")
 }
+/// `SYSTEM_INFO` field offsets (sysinfoapi.h, Win64).
+const SI_PROCESSOR_ARCHITECTURE: usize = 0;
+/// End offset of the 16-bit processor-architecture field in the `SYSTEM_INFO` union.
+const SI_PROCESSOR_ARCHITECTURE_END: usize = 2;
+const SI_PAGE_SIZE: usize = 4;
+const SI_MIN_APP_ADDRESS: usize = 8;
+const SI_MAX_APP_ADDRESS: usize = 16;
+const SI_ACTIVE_PROCESSOR_MASK: usize = 24;
+const SI_NUMBER_OF_PROCESSORS: usize = 32;
+const SI_PROCESSOR_TYPE: usize = 36;
+const SI_ALLOCATION_GRANULARITY: usize = 40;
+const SI_PROCESSOR_LEVEL: usize = 44;
+const SI_PROCESSOR_REVISION: usize = 46;
+/// Byte size of `SYSTEM_INFO` on Win64.
+const SYSTEM_INFO_SIZE: usize = 48;
+
+/// Handles `KERNEL32.dll!GetSystemInfo` — the fixed mock identity.
 pub fn handle_get_system_info(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let ptr = engine.read_rcx().context("GetSystemInfo RCX")?;
@@ -326,26 +343,30 @@ pub fn handle_get_system_info(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         // DWORD dwAllocationGranularity;
         // WORD wProcessorLevel;
         // WORD wProcessorRevision;
-        let mut buf = [0_u8; 48];
+        let mut buf = [0_u8; SYSTEM_INFO_SIZE];
         // wProcessorArchitecture = 9 (PROCESSOR_ARCHITECTURE_AMD64)
-        buf[0..2].copy_from_slice(&9_u16.to_le_bytes());
+        buf[SI_PROCESSOR_ARCHITECTURE..SI_PROCESSOR_ARCHITECTURE_END]
+            .copy_from_slice(&9_u16.to_le_bytes());
         // dwPageSize = 0x1000
-        buf[4..8].copy_from_slice(&0x1000_u32.to_le_bytes());
+        buf[SI_PAGE_SIZE..SI_MIN_APP_ADDRESS].copy_from_slice(&0x1000_u32.to_le_bytes());
         // min app address 0x10000
-        buf[8..16].copy_from_slice(&0x1_0000_u64.to_le_bytes());
+        buf[SI_MIN_APP_ADDRESS..SI_MAX_APP_ADDRESS].copy_from_slice(&0x1_0000_u64.to_le_bytes());
         // max app address
-        buf[16..24].copy_from_slice(&0x0000_7fff_ffff_ffff_u64.to_le_bytes());
+        buf[SI_MAX_APP_ADDRESS..SI_ACTIVE_PROCESSOR_MASK]
+            .copy_from_slice(&0x0000_7fff_ffff_ffff_u64.to_le_bytes());
         // active processor mask = 1
-        buf[24..32].copy_from_slice(&1_u64.to_le_bytes());
+        buf[SI_ACTIVE_PROCESSOR_MASK..SI_NUMBER_OF_PROCESSORS]
+            .copy_from_slice(&1_u64.to_le_bytes());
         // number of processors = 1
-        buf[32..36].copy_from_slice(&1_u32.to_le_bytes());
+        buf[SI_NUMBER_OF_PROCESSORS..SI_PROCESSOR_TYPE].copy_from_slice(&1_u32.to_le_bytes());
         // processor type = 8664
-        buf[36..40].copy_from_slice(&8664_u32.to_le_bytes());
+        buf[SI_PROCESSOR_TYPE..SI_ALLOCATION_GRANULARITY].copy_from_slice(&8664_u32.to_le_bytes());
         // allocation granularity = 0x10000
-        buf[40..44].copy_from_slice(&0x1_0000_u32.to_le_bytes());
+        buf[SI_ALLOCATION_GRANULARITY..SI_PROCESSOR_LEVEL]
+            .copy_from_slice(&0x1_0000_u32.to_le_bytes());
         // level / revision
-        buf[44..46].copy_from_slice(&6_u16.to_le_bytes());
-        buf[46..48].copy_from_slice(&0x3c03_u16.to_le_bytes());
+        buf[SI_PROCESSOR_LEVEL..SI_PROCESSOR_REVISION].copy_from_slice(&6_u16.to_le_bytes());
+        buf[SI_PROCESSOR_REVISION..].copy_from_slice(&0x3c03_u16.to_le_bytes());
         engine.mem_write(ptr, &buf).context("GetSystemInfo write")?;
     }
     ret_u64(engine, 0, "GetSystemInfo")
@@ -393,12 +414,15 @@ pub fn handle_debug_break(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     tracing::warn!("DebugBreak called");
     ctx.finish(0)
 }
+/// Cap on one `OutputDebugString` message read from guest memory.
+const MAX_DEBUG_STRING: usize = 1024;
+
 /// Handles `KERNEL32.dll!OutputDebugStringA` — log and return.
 pub fn handle_output_debug_string_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let msg_va = engine.read_rcx()?;
     if msg_va != 0 {
-        let msg = read_guest_ansi_lossy(engine, msg_va, 1024).unwrap_or_default();
+        let msg = read_guest_ansi_lossy(engine, msg_va, MAX_DEBUG_STRING).unwrap_or_default();
         tracing::debug!("OutputDebugStringA: {msg}");
     }
     ctx.finish(1)
@@ -408,7 +432,7 @@ pub fn handle_output_debug_string_w(ctx: &mut HandlerContext<'_>) -> Result<WinA
     let engine = &mut *ctx.engine;
     let msg_va = engine.read_rcx()?;
     if msg_va != 0 {
-        let msg = read_guest_utf16_lossy(engine, msg_va, 1024).unwrap_or_default();
+        let msg = read_guest_utf16_lossy(engine, msg_va, MAX_DEBUG_STRING).unwrap_or_default();
         tracing::debug!("OutputDebugStringW: {msg}");
     }
     ctx.finish(1)
@@ -441,6 +465,16 @@ pub(crate) fn handle_raise_exception(ctx: &mut HandlerContext<'_>) -> Result<Win
     let state = &mut *ctx.state;
     crate::seh::dispatch_exception(engine, state)
 }
+/// Win64 `CONTEXT64` layout offsets written by `RtlCaptureContext` (winnt.h).
+const CONTEXT64_SIZE: usize = 0x200;
+const CONTEXT64_FLAGS: usize = 0x30;
+const CONTEXT64_GPRS: usize = 0x78;
+const CONTEXT64_RFLAGS: usize = 0x44;
+const CONTEXT64_RIP: usize = 0xF8;
+const CONTEXT64_XMMS: usize = 0x100;
+/// `CONTEXT_AMD64 | CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_FLOATING_POINT`.
+const CONTEXT64_FLAGS_VALUE: u32 = 0x0010_001F;
+
 pub(crate) fn handle_rtl_capture_context(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
@@ -454,30 +488,30 @@ pub(crate) fn handle_rtl_capture_context(
 
     let tctx = engine.snapshot_thread_context();
     // Write CONTEXT64 at ctx_va (subset of the Win64 CONTEXT layout).
-    let mut cbuf = [0u8; 0x200];
+    let mut cbuf = [0_u8; CONTEXT64_SIZE];
     // ContextFlags at +0x30
-    if let Some(slot) = cbuf.get_mut(0x30..0x34) {
-        slot.copy_from_slice(&0x0010_001Fu32.to_le_bytes());
+    if let Some(slot) = cbuf.get_mut(CONTEXT64_FLAGS..CONTEXT64_FLAGS.saturating_add(4)) {
+        slot.copy_from_slice(&CONTEXT64_FLAGS_VALUE.to_le_bytes());
     }
     // GPRs at +0x78..+0xF8 (Rax..R15), Rip at +0xF8
     for reg in 0_usize..16 {
-        let off = 0x78_usize.saturating_add(reg.saturating_mul(8));
+        let off = CONTEXT64_GPRS.saturating_add(reg.saturating_mul(8));
         if let (Some(slot), Some(val)) =
             (cbuf.get_mut(off..off.saturating_add(8)), tctx.gpr.get(reg))
         {
             slot.copy_from_slice(&val.to_le_bytes());
         }
     }
-    if let Some(slot) = cbuf.get_mut(0xF8..0x100) {
+    if let Some(slot) = cbuf.get_mut(CONTEXT64_RIP..CONTEXT64_RIP.saturating_add(8)) {
         slot.copy_from_slice(&tctx.rip.to_le_bytes());
     }
     // Rflags at +0x44
-    if let Some(slot) = cbuf.get_mut(0x44..0x4C) {
+    if let Some(slot) = cbuf.get_mut(CONTEXT64_RFLAGS..CONTEXT64_RFLAGS.saturating_add(8)) {
         slot.copy_from_slice(&u64::from(tctx.rflags).to_le_bytes());
     }
     // XMM0..XMM15 at +0x100
     for i in 0_usize..16 {
-        let off = 0x100_usize.saturating_add(i.saturating_mul(16));
+        let off = CONTEXT64_XMMS.saturating_add(i.saturating_mul(16));
         if let (Some(slot), Some(val)) =
             (cbuf.get_mut(off..off.saturating_add(16)), tctx.xmm.get(i))
         {

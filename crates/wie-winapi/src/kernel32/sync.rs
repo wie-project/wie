@@ -5,6 +5,17 @@ use super::{
     write_guest_u32, write_guest_u64,
 };
 
+/// Byte offset of `RTL_CRITICAL_SECTION.LockCount` (LONG; -1 = unlocked).
+const CS_LOCK_COUNT: u64 = 8;
+/// Byte offset of `RTL_CRITICAL_SECTION.RecursionCount`.
+const CS_RECURSION_COUNT: u64 = 12;
+/// Byte offset of `RTL_CRITICAL_SECTION.OwningThread` (HANDLE; 0 = unowned).
+const CS_OWNING_THREAD: u64 = 16;
+/// Byte offset of `RTL_CRITICAL_SECTION.SpinCount` (ULONG_PTR).
+const CS_SPIN_COUNT: u64 = 32;
+/// Byte size of `RTL_CRITICAL_SECTION` on Win64.
+const CS_SIZE: usize = 40;
+
 pub(crate) fn write_critical_section_unlocked(
     engine: &mut dyn wie_cpu::CpuEngine,
     critical_section_va: u64,
@@ -20,10 +31,16 @@ pub(crate) fn write_critical_section_unlocked(
     //   +0x10 OwningThread   HANDLE (0)
     //   +0x18 LockSemaphore  HANDLE (0)
     //   +0x20 SpinCount      ULONG_PTR
-    let mut buf = [0_u8; 40];
+    let lock_count_off = usize::try_from(CS_LOCK_COUNT).unwrap_or(0);
+    let spin_count_off = usize::try_from(CS_SPIN_COUNT).unwrap_or(0);
+    let mut buf = [0_u8; CS_SIZE];
     // DebugInfo, RecursionCount, OwningThread, LockSemaphore already zero.
-    buf[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
-    buf[32..40].copy_from_slice(&spin_count.to_le_bytes());
+    if let Some(slot) = buf.get_mut(lock_count_off..lock_count_off.saturating_add(4)) {
+        slot.copy_from_slice(&u32::MAX.to_le_bytes());
+    }
+    if let Some(slot) = buf.get_mut(spin_count_off..) {
+        slot.copy_from_slice(&spin_count.to_le_bytes());
+    }
     engine
         .mem_write(critical_section_va, &buf)
         .context("failed to write RTL_CRITICAL_SECTION init state")
@@ -151,9 +168,9 @@ pub(crate) fn try_enter_critical_section_guest(
     cs: u64,
     owner_tid: u32,
 ) -> Result<EnterCsResult> {
-    let lock_va = checked_address(cs, 8, "LockCount");
-    let recursion_va = checked_address(cs, 12, "RecursionCount");
-    let owner_va = checked_address(cs, 16, "OwningThread");
+    let lock_va = checked_address(cs, CS_LOCK_COUNT, "LockCount");
+    let recursion_va = checked_address(cs, CS_RECURSION_COUNT, "RecursionCount");
+    let owner_va = checked_address(cs, CS_OWNING_THREAD, "OwningThread");
 
     let owning = read_u64(engine, owner_va).unwrap_or(0);
     let me = u64::from(owner_tid);
@@ -186,9 +203,9 @@ pub(crate) fn leave_critical_section_guest(
     cs: u64,
     owner_tid: u32,
 ) -> Result<bool> {
-    let lock_va = checked_address(cs, 8, "LockCount");
-    let recursion_va = checked_address(cs, 12, "RecursionCount");
-    let owner_va = checked_address(cs, 16, "OwningThread");
+    let lock_va = checked_address(cs, CS_LOCK_COUNT, "LockCount");
+    let recursion_va = checked_address(cs, CS_RECURSION_COUNT, "RecursionCount");
+    let owner_va = checked_address(cs, CS_OWNING_THREAD, "OwningThread");
 
     let owning = read_u64(engine, owner_va).unwrap_or(0);
     let me = u64::from(owner_tid);

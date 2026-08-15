@@ -186,6 +186,26 @@ pub(crate) fn apply_input_mode_to_host(state: &ConsoleState) {
     host_term::enter_raw(processed);
 }
 
+/// Cap on a console title read from guest memory (bytes or UTF-16 units).
+const MAX_CONSOLE_TITLE: usize = 1024;
+
+/// `CONSOLE_SCREEN_BUFFER_INFO` field offsets (wincon.h, Win64). The struct
+/// is 22 bytes on disk; the writer pads to [`CSBI_SIZE`] so short guest
+/// stacks stay safe.
+const CSBI_SIZE_X: usize = 0;
+const CSBI_SIZE_Y: usize = 2;
+const CSBI_CURSOR_X: usize = 4;
+const CSBI_CURSOR_Y: usize = 6;
+const CSBI_ATTRIBUTES: usize = 8;
+const CSBI_WINDOW_LEFT: usize = 10;
+const CSBI_WINDOW_TOP: usize = 12;
+const CSBI_WINDOW_RIGHT: usize = 14;
+const CSBI_WINDOW_BOTTOM: usize = 16;
+const CSBI_MAX_SIZE_X: usize = 18;
+const CSBI_MAX_SIZE_Y: usize = 20;
+/// Padded byte size of `CONSOLE_SCREEN_BUFFER_INFO`.
+const CSBI_SIZE: usize = 24;
+
 pub fn handle_get_console_screen_buffer_info(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
@@ -218,32 +238,32 @@ pub fn handle_get_console_screen_buffer_info(
     // CONSOLE_SCREEN_BUFFER_INFO is 22 bytes; pad to 24 so short stacks stay safe.
     // COORD dwSize {X,Y} at 0; COORD dwCursorPosition at 4; WORD wAttributes at 8;
     // SMALL_RECT srWindow at 10; COORD dwMaximumWindowSize at 18.
-    let mut buf = [0_u8; 24];
-    write_le_u16(&mut buf, 0, columns);
-    write_le_u16(&mut buf, 2, rows);
-    write_le_i16(&mut buf, 4, cursor.x);
-    write_le_i16(&mut buf, 6, cursor.y);
-    write_le_u16(&mut buf, 8, attributes);
+    let mut buf = [0_u8; CSBI_SIZE];
+    write_le_u16(&mut buf, CSBI_SIZE_X, columns);
+    write_le_u16(&mut buf, CSBI_SIZE_Y, rows);
+    write_le_i16(&mut buf, CSBI_CURSOR_X, cursor.x);
+    write_le_i16(&mut buf, CSBI_CURSOR_Y, cursor.y);
+    write_le_u16(&mut buf, CSBI_ATTRIBUTES, attributes);
     // srWindow is inclusive on all four edges.
-    write_le_u16(&mut buf, 10, 0);
-    write_le_u16(&mut buf, 12, 0);
-    write_le_u16(&mut buf, 14, columns.saturating_sub(1));
-    write_le_u16(&mut buf, 16, rows.saturating_sub(1));
-    write_le_u16(&mut buf, 18, columns);
-    write_le_u16(&mut buf, 20, rows);
+    write_le_u16(&mut buf, CSBI_WINDOW_LEFT, 0);
+    write_le_u16(&mut buf, CSBI_WINDOW_TOP, 0);
+    write_le_u16(&mut buf, CSBI_WINDOW_RIGHT, columns.saturating_sub(1));
+    write_le_u16(&mut buf, CSBI_WINDOW_BOTTOM, rows.saturating_sub(1));
+    write_le_u16(&mut buf, CSBI_MAX_SIZE_X, columns);
+    write_le_u16(&mut buf, CSBI_MAX_SIZE_Y, rows);
     ctx.engine
         .mem_write(info_va, &buf)
         .context("GetConsoleScreenBufferInfo write")?;
     ret_bool_true(ctx.engine, "GetConsoleScreenBufferInfo")
 }
 
-fn write_le_u16(buf: &mut [u8; 24], offset: usize, value: u16) {
+fn write_le_u16(buf: &mut [u8; CSBI_SIZE], offset: usize, value: u16) {
     if let Some(slot) = buf.get_mut(offset..offset.saturating_add(2)) {
         slot.copy_from_slice(&value.to_le_bytes());
     }
 }
 
-fn write_le_i16(buf: &mut [u8; 24], offset: usize, value: i16) {
+fn write_le_i16(buf: &mut [u8; CSBI_SIZE], offset: usize, value: i16) {
     write_le_u16(buf, offset, u16::from_ne_bytes(value.to_ne_bytes()));
 }
 
@@ -657,9 +677,9 @@ fn set_console_title(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiH
     let title = if title_va == 0 {
         String::new()
     } else if wide {
-        read_guest_utf16_lossy(ctx.engine, title_va, 1024)?
+        read_guest_utf16_lossy(ctx.engine, title_va, MAX_CONSOLE_TITLE)?
     } else {
-        let bytes = read_ansi_bytes(ctx.engine, title_va, 1024)?;
+        let bytes = read_ansi_bytes(ctx.engine, title_va, MAX_CONSOLE_TITLE)?;
         let code_page = ctx.state.console().output_code_page;
         codepage::units_to_host_utf8(&codepage::decode_to_units(code_page, &bytes))
     };

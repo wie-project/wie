@@ -1,52 +1,19 @@
 //! Name → id resolution table and lookups for the dense WinAPI dispatch.
 //!
-//! The `(library, name, id)` rows live per-DLL in the sibling modules; this
-//! module assembles the lookup table from their slices and implements the
-//! lookups. Row order mirrors the dense `WinApiId` enumeration.
+//! The `(library, name, id)` rows are generated from the single declaration in
+//! `super::decl`; this module implements the lookups over that flat row list
+//! and the soft-dispatched (non-dense) export lists.
 
-mod advapi32;
-mod comctl32;
-mod comdlg32;
-mod d3d9;
-mod gdi32;
-mod kernel32;
-mod shell32;
-mod user32;
-mod uxtheme;
-mod version;
-mod winmm;
-
+use super::decl::WINAPI_NAME_ROWS;
 use crate::dispatch_table::WinApiId;
-
-/// All `(library, name, id)` rows, as per-DLL slices.
-///
-/// Slices are listed in first-appearance order of the original dense table;
-/// within a slice the rows keep the original order. The dense id↔name
-/// correspondence (every `WinApiId` discriminant → its original row) is pinned
-/// by the tests below, so the slice order here is not load-bearing.
-static WINAPI_NAME_ROWS: &[&[(&str, &str, WinApiId)]] = &[
-    kernel32::ROWS,
-    advapi32::ROWS,
-    user32::ROWS,
-    comctl32::ROWS,
-    comdlg32::ROWS,
-    gdi32::ROWS,
-    uxtheme::ROWS,
-    winmm::ROWS,
-    d3d9::ROWS,
-    shell32::ROWS,
-    version::ROWS,
-];
 
 /// Resolve library/export to id. Case-insensitive, allocation-free.
 /// Intended for session setup (once per import), not the hot emu loop.
 #[must_use]
 pub fn resolve_winapi_id(library: &str, name: &str) -> Option<WinApiId> {
-    for rows in WINAPI_NAME_ROWS {
-        for &(lib, export, id) in *rows {
-            if lib.eq_ignore_ascii_case(library) && export.eq_ignore_ascii_case(name) {
-                return Some(id);
-            }
+    for &(lib, export, id) in WINAPI_NAME_ROWS {
+        if lib.eq_ignore_ascii_case(library) && export.eq_ignore_ascii_case(name) {
+            return Some(id);
         }
     }
     None
@@ -54,14 +21,13 @@ pub fn resolve_winapi_id(library: &str, name: &str) -> Option<WinApiId> {
 
 /// Reverse lookup: dense id → (`library`, `export`) as stored in the name table.
 ///
-/// Names are lowercase (as in the per-DLL `ROWS` slices). Used for trace/profile only.
+/// Names are lowercase (as in the generated rows). Returns the first row for
+/// the id (export aliases share the id). Used for trace/profile only.
 #[must_use]
 pub fn winapi_id_export(id: WinApiId) -> Option<(&'static str, &'static str)> {
-    for rows in WINAPI_NAME_ROWS {
-        for &(lib, export, row_id) in *rows {
-            if row_id == id {
-                return Some((lib, export));
-            }
+    for &(lib, export, row_id) in WINAPI_NAME_ROWS {
+        if row_id == id {
+            return Some((lib, export));
         }
     }
     None

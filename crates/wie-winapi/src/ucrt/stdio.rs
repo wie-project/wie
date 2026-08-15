@@ -6,8 +6,13 @@ use crate::{GuestStdinMode, HandlerContext, WinApiHandlerResult};
 use anyhow::{Context, Result};
 
 use super::{
-    EINVAL, ENOENT, FILE_STDERR, FILE_STDIN, FILE_STDOUT, finish, i32_status_to_u64, read_guest_str,
+    EINVAL, ENOENT, FILE_STDERR, FILE_STDIN, FILE_STDOUT, MAX_GUEST_STR, finish, i32_status_to_u64,
+    read_guest_str,
 };
+
+/// Cap on one host-stdin line buffered for the CRT (`fgets` / `getchar` /
+/// scanf refills) so a huge paste cannot grow the buffer without bound.
+const MAX_STDIN_LINE: usize = 4096;
 /// `__acrt_iob_func(ix)` → `FILE*` for stdin/stdout/stderr.
 pub(crate) fn handle_acrt_iob_func(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -228,7 +233,7 @@ pub(crate) fn handle_stdio_common_vfprintf(
         if fmt_va == 0 {
             return finish(engine, 0);
         }
-        let fmt = read_guest_str(engine, fmt_va, 4096)?;
+        let fmt = read_guest_str(engine, fmt_va, MAX_GUEST_STR)?;
         let rsp = engine.read_rsp()?;
         let va = read_u64(engine, rsp.wrapping_add(0x28)).unwrap_or(0);
         (walk_vfprintf_format(engine, &fmt, va), file_va == 2)
@@ -256,7 +261,7 @@ pub(crate) fn handle_vfprintf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         if fmt_va == 0 {
             return finish(engine, 0);
         }
-        let fmt = read_guest_str(engine, fmt_va, 4096)?;
+        let fmt = read_guest_str(engine, fmt_va, MAX_GUEST_STR)?;
         (
             walk_vfprintf_format(engine, &fmt, argptr),
             stream == FILE_STDERR,
@@ -294,7 +299,7 @@ pub(crate) fn handle_stdio_common_vsprintf(
     if buf == 0 || fmt_va == 0 {
         return finish(engine, 0);
     }
-    let fmt = read_guest_str(engine, fmt_va, 4096)?;
+    let fmt = read_guest_str(engine, fmt_va, MAX_GUEST_STR)?;
     let rsp = engine.read_rsp()?;
     let mut va = read_u64(engine, rsp.wrapping_add(0x30)).unwrap_or(0);
 
@@ -388,8 +393,8 @@ pub(crate) fn handle_stdio_common_vsscanf(
     if src_va == 0 || fmt_va == 0 {
         return finish(engine, 0);
     }
-    let src = read_guest_str(engine, src_va, 4096)?;
-    let fmt = read_guest_str(engine, fmt_va, 4096)?;
+    let src = read_guest_str(engine, src_va, MAX_GUEST_STR)?;
+    let fmt = read_guest_str(engine, fmt_va, MAX_GUEST_STR)?;
     let rsp = engine.read_rsp()?;
     let mut va = read_u64(engine, rsp.wrapping_add(0x30)).unwrap_or(0);
     let sb = src.as_bytes();
@@ -477,7 +482,7 @@ pub(crate) fn handle_stdio_common_vfscanf(
     if fmt_va == 0 {
         return finish(engine, 0);
     }
-    let fmt = read_guest_str(engine, fmt_va, 4096)?;
+    let fmt = read_guest_str(engine, fmt_va, MAX_GUEST_STR)?;
     let rsp = engine.read_rsp()?;
     let mut va = read_u64(engine, rsp.wrapping_add(0x28)).unwrap_or(0);
     let fb = fmt.as_bytes();
@@ -496,7 +501,7 @@ pub(crate) fn handle_stdio_common_vfscanf(
             let mut byte = [0_u8; 1];
             let mut host_stdin = std::io::stdin().lock();
             loop {
-                if line.len() >= 4096 || host_stdin.read(&mut byte).unwrap_or(0) == 0 {
+                if line.len() >= MAX_STDIN_LINE || host_stdin.read(&mut byte).unwrap_or(0) == 0 {
                     break;
                 }
                 line.push(byte[0]);
@@ -705,7 +710,7 @@ pub(crate) fn handle_getchar(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         let mut byte = [0_u8; 1];
         let mut host_stdin = std::io::stdin().lock();
         loop {
-            if line.len() >= 4096 || host_stdin.read(&mut byte).unwrap_or(0) == 0 {
+            if line.len() >= MAX_STDIN_LINE || host_stdin.read(&mut byte).unwrap_or(0) == 0 {
                 break;
             }
             line.push(byte[0]);
@@ -850,7 +855,7 @@ pub(crate) fn handle_fgets(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
         let mut byte = [0_u8; 1];
         let mut stdin = std::io::stdin().lock();
         loop {
-            if line.len() >= 4096 || stdin.read(&mut byte).unwrap_or(0) == 0 {
+            if line.len() >= MAX_STDIN_LINE || stdin.read(&mut byte).unwrap_or(0) == 0 {
                 break;
             }
             line.push(byte[0]);
@@ -928,7 +933,7 @@ fn stdin_read_byte(state: &mut crate::WinApiState) -> Option<u8> {
     let mut byte = [0_u8; 1];
     let mut host_stdin = std::io::stdin().lock();
     loop {
-        if line.len() >= 4096 || host_stdin.read(&mut byte).unwrap_or(0) == 0 {
+        if line.len() >= MAX_STDIN_LINE || host_stdin.read(&mut byte).unwrap_or(0) == 0 {
             break;
         }
         line.push(byte[0]);

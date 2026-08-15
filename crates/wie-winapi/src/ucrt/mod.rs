@@ -77,6 +77,9 @@ const CRT_GUEST_BASE: u64 = 0x0000_0000_6800_0000;
 pub(crate) const EINVAL: i32 = 22;
 pub(crate) const ERANGE: i32 = 34;
 pub(crate) const ENOENT: i32 = 2;
+/// Cap on one guest string read (format strings, argv entries, command
+/// lines) so a bogus pointer cannot make the host scan without bound.
+pub(crate) const MAX_GUEST_STR: usize = 4096;
 const FILE_STDIN: u64 = CRT_GUEST_BASE;
 const FILE_STDOUT: u64 = CRT_GUEST_BASE + 0x100;
 const FILE_STDERR: u64 = CRT_GUEST_BASE + 0x200;
@@ -600,7 +603,7 @@ pub(crate) fn handle_fprintf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         if fmt_va == 0 {
             return finish(engine, 0);
         }
-        let fmt = read_guest_str(engine, fmt_va, 4096)?;
+        let fmt = read_guest_str(engine, fmt_va, MAX_GUEST_STR)?;
         let rsp = engine.read_rsp()?;
         let va = rsp.wrapping_add(0x28);
         (

@@ -7,18 +7,15 @@
 
 use ahash::HashMap;
 use ahash::HashMapExt;
+use wie_cpu::guest_layout::{
+    HEAP_BLOCK_HEADER_SIZE, HEAP_CTRL_BUMP_OFFSET, HEAP_CTRL_HEAD_BASE, HEAP_CTRL_HEAD_STRIDE,
+    HEAP_PAYLOAD_ALIGN,
+};
 
-/// Number of fixed size classes (powers-of-two-ish ladder).
-pub const HEAP_SIZE_CLASS_COUNT: usize = 24;
-
-/// Size classes in bytes (must be strictly increasing, all ≥ 16 and 16-byte aligned).
-pub const SIZE_CLASSES: [u64; HEAP_SIZE_CLASS_COUNT] = [
-    16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192,
-    12288, 16384, 24576, 32768, 49152, 65536,
-];
-
-/// Threshold above which blocks use the large free-list instead of size classes.
-pub const LARGE_THRESHOLD: u64 = 65_536;
+/// Size-class ladder + large threshold, shared with the JIT `malloc`/`free`
+/// helpers and the in-guest heap accelerator. Single home:
+/// [`wie_cpu::guest_layout`].
+pub use wie_cpu::guest_layout::{HEAP_SIZE_CLASS_COUNT, LARGE_THRESHOLD, SIZE_CLASSES};
 
 /// One free large block awaiting reuse.
 #[derive(Debug, Clone, Copy)]
@@ -80,7 +77,8 @@ impl GuestHeap {
 
     fn head_va(ctrl: u64, class: usize) -> u64 {
         let class_u64 = u64::try_from(class).unwrap_or(0);
-        ctrl.wrapping_add(8).wrapping_add(class_u64.wrapping_mul(8))
+        ctrl.wrapping_add(HEAP_CTRL_HEAD_BASE)
+            .wrapping_add(class_u64.wrapping_mul(HEAP_CTRL_HEAD_STRIDE))
     }
 
     /// Pull only the bump cursor (O(1)). Freelists stay in guest memory.
@@ -88,7 +86,7 @@ impl GuestHeap {
         let Some(ctrl) = self.guest_ctrl_va else {
             return;
         };
-        if let Some(bump) = Self::read_u64(engine, ctrl) {
+        if let Some(bump) = Self::read_u64(engine, ctrl.wrapping_add(HEAP_CTRL_BUMP_OFFSET)) {
             self.bump = bump;
         }
     }
@@ -97,7 +95,7 @@ impl GuestHeap {
         let Some(ctrl) = self.guest_ctrl_va else {
             return;
         };
-        Self::write_u64(engine, ctrl, self.bump);
+        Self::write_u64(engine, ctrl.wrapping_add(HEAP_CTRL_BUMP_OFFSET), self.bump);
     }
 
     /// High-water mark used by GDI handle generators (not a free cursor).
@@ -180,7 +178,7 @@ impl GuestHeap {
             {
                 let next = Self::read_u64(engine, head).unwrap_or(0);
                 Self::write_u64(engine, hva, next);
-                Self::write_u64(engine, head.wrapping_sub(8), rounded);
+                Self::write_u64(engine, head.wrapping_sub(HEAP_BLOCK_HEADER_SIZE), rounded);
                 self.live.insert(head, rounded);
                 return head;
             }
@@ -188,7 +186,7 @@ impl GuestHeap {
             self.sync_bump_from_guest(engine);
             let addr = self.bump_alloc(rounded);
             if addr != 0 {
-                Self::write_u64(engine, addr.wrapping_sub(8), rounded);
+                Self::write_u64(engine, addr.wrapping_sub(HEAP_BLOCK_HEADER_SIZE), rounded);
                 self.sync_bump_to_guest(engine);
             }
             return addr;
@@ -199,7 +197,7 @@ impl GuestHeap {
         let addr = self.alloc(size);
         if addr != 0 {
             if let Some(sz) = self.live.get(&addr).copied() {
-                Self::write_u64(engine, addr.wrapping_sub(8), sz);
+                Self::write_u64(engine, addr.wrapping_sub(HEAP_BLOCK_HEADER_SIZE), sz);
             }
             self.sync_bump_to_guest(engine);
         }
@@ -244,7 +242,7 @@ impl GuestHeap {
         // Zeroed header after a prior free → double-free / unknown → false.
         if address >= self.base
             && address < self.end
-            && let Some(size) = Self::read_u64(engine, address.wrapping_sub(8))
+            && let Some(size) = Self::read_u64(engine, address.wrapping_sub(HEAP_BLOCK_HEADER_SIZE))
             && size != 0
         {
             return self.free_known_block(engine, ctrl, address, size);
@@ -270,7 +268,7 @@ impl GuestHeap {
             Self::write_u64(engine, address, old_head);
             Self::write_u64(engine, hva, address);
         }
-        Self::write_u64(engine, address.wrapping_sub(8), 0);
+        Self::write_u64(engine, address.wrapping_sub(HEAP_BLOCK_HEADER_SIZE), 0);
         true
     }
 
@@ -305,12 +303,12 @@ impl GuestHeap {
     }
 
     fn bump_alloc(&mut self, rounded: u64) -> u64 {
-        // Layout matches guest helper: 8-byte size header, then 16-byte-aligned payload.
-        // payload = align16(bump + 8); header at payload-8; bump' = payload + rounded.
-        let Some(pre) = self.bump.checked_add(8) else {
+        // Layout matches guest helper: size header, then aligned payload.
+        // payload = align16(bump + header); header at payload-header; bump' = payload + rounded.
+        let Some(pre) = self.bump.checked_add(HEAP_BLOCK_HEADER_SIZE) else {
             return 0;
         };
-        let payload = pre.wrapping_add(15) & !15_u64;
+        let payload = pre.wrapping_add(HEAP_PAYLOAD_ALIGN - 1) & !(HEAP_PAYLOAD_ALIGN - 1);
         if payload < self.base {
             return 0;
         }
@@ -350,7 +348,7 @@ fn round_up_size(size: u64) -> u64 {
         let class = size_class_index(size);
         SIZE_CLASSES.get(class).copied().unwrap_or(0)
     } else {
-        size.wrapping_add(15) & !15_u64
+        size.wrapping_add(HEAP_PAYLOAD_ALIGN - 1) & !(HEAP_PAYLOAD_ALIGN - 1)
     }
 }
 

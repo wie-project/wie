@@ -1489,3 +1489,105 @@ fn open_process_resolves_pid_map_pseudohandle_and_unknown() {
     .expect("open process self pid");
     assert_eq!(engine.read_rax().expect("rax"), u64::MAX);
 }
+
+/// A failed MultiByteToWideChar (output buffer too small) returns 0 and
+/// publishes `ERROR_INSUFFICIENT_BUFFER` — the pump's fast-sync tail writes it
+/// to the guest TEB so a following GetLastError stub observes it.
+#[test]
+fn multi_byte_to_wide_char_insufficient_buffer_sets_last_error() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let input_va = 0x6000_u64;
+    let output_va = 0x7000_u64;
+    write_guest_ansi(&mut engine, input_va, "hello");
+    state.process.last_error = 0;
+
+    // cbMultiByte = 5 (no NUL), cchWideChar = 2 — too small for 5 units.
+    write_regs(&mut engine, 0, 0, input_va, 5, STACK_TOP);
+    engine
+        .mem_write(STACK_TOP + 0x28, &output_va.to_le_bytes())
+        .expect("write lpWideCharStr");
+    engine
+        .mem_write(STACK_TOP + 0x30, &2_u64.to_le_bytes())
+        .expect("write cchWideChar");
+    let r = kernel32::handle_multi_byte_to_wide_char(&mut HandlerContext::new(
+        &mut engine,
+        default_env(),
+        &mut state,
+    ))
+    .expect("MultiByteToWideChar fails cleanly");
+    assert_eq!(r.return_value, 0, "too-small buffer must fail");
+    assert_eq!(state.process.last_error, 122, "ERROR_INSUFFICIENT_BUFFER");
+}
+
+/// A successful MultiByteToWideChar writes the wide units and must not leave
+/// `ERROR_INSUFFICIENT_BUFFER` behind.
+#[test]
+fn multi_byte_to_wide_char_success_writes_units() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let input_va = 0x6000_u64;
+    let output_va = 0x7000_u64;
+    write_guest_ansi(&mut engine, input_va, "hello");
+    engine
+        .mem_write(output_va, &[0_u8; 16])
+        .expect("zero the output buffer");
+    state.process.last_error = 0;
+
+    write_regs(&mut engine, 0, 0, input_va, 5, STACK_TOP);
+    engine
+        .mem_write(STACK_TOP + 0x28, &output_va.to_le_bytes())
+        .expect("write lpWideCharStr");
+    engine
+        .mem_write(STACK_TOP + 0x30, &5_u64.to_le_bytes())
+        .expect("write cchWideChar");
+    let r = kernel32::handle_multi_byte_to_wide_char(&mut HandlerContext::new(
+        &mut engine,
+        default_env(),
+        &mut state,
+    ))
+    .expect("MultiByteToWideChar succeeds");
+    assert_eq!(r.return_value, 5, "5 units written");
+    assert_eq!(
+        read_guest_utf16_raw(&mut engine, output_va, 8),
+        "hello",
+        "guest buffer holds the widened text"
+    );
+    assert_eq!(
+        state.process.last_error, 0,
+        "success must not publish ERROR_INSUFFICIENT_BUFFER"
+    );
+}
+
+/// The size query (NULL output, zero length) returns the required unit count
+/// without touching last error — Windows treats it as a success.
+#[test]
+fn multi_byte_to_wide_char_size_query_keeps_last_error() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let input_va = 0x6000_u64;
+    write_guest_ansi(&mut engine, input_va, "hello");
+    state.process.last_error = 99; // pre-existing error, not this API's business
+
+    write_regs(&mut engine, 0, 0, input_va, 5, STACK_TOP);
+    engine
+        .mem_write(STACK_TOP + 0x28, &0_u64.to_le_bytes())
+        .expect("write lpWideCharStr (NULL)");
+    engine
+        .mem_write(STACK_TOP + 0x30, &0_u64.to_le_bytes())
+        .expect("write cchWideChar (0)");
+    let r = kernel32::handle_multi_byte_to_wide_char(&mut HandlerContext::new(
+        &mut engine,
+        default_env(),
+        &mut state,
+    ))
+    .expect("MultiByteToWideChar size query");
+    assert_eq!(
+        r.return_value, 5,
+        "size query returns the required unit count"
+    );
+    assert_eq!(
+        state.process.last_error, 99,
+        "size query must not clobber last error"
+    );
+}

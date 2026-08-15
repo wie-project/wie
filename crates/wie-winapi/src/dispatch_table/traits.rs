@@ -16,6 +16,7 @@ impl WinApiTraits {
     const FAST_VOID_SYNC: u8 = 1 << 1;
     const EXIT_PROCESS: u8 = 1 << 2;
     const GUEST_STUB: u8 = 1 << 3;
+    const FAST_SYNC: u8 = 1 << 4;
 
     /// No flags set.
     pub const EMPTY: Self = Self { bits: 0 };
@@ -44,6 +45,12 @@ impl WinApiTraits {
             bits: self.bits | Self::GUEST_STUB,
         }
     }
+    #[must_use]
+    pub const fn with_fast_sync(self) -> Self {
+        Self {
+            bits: self.bits | Self::FAST_SYNC,
+        }
+    }
 
     #[must_use]
     pub const fn noisy(self) -> bool {
@@ -60,6 +67,10 @@ impl WinApiTraits {
     #[must_use]
     pub const fn guest_stub(self) -> bool {
         self.bits & Self::GUEST_STUB != 0
+    }
+    #[must_use]
+    pub const fn fast_sync(self) -> bool {
+        self.bits & Self::FAST_SYNC != 0
     }
 
     pub fn set_noisy(&mut self, on: bool) {

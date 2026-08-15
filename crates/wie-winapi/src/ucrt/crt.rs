@@ -6,8 +6,14 @@ use anyhow::{Context, Result};
 
 use super::{
     ACMDLN_PTR_SLOT, ARGC_SLOT, ARGV_PTR_SLOT, COMMODE_SLOT, CRT_GUEST_BASE, ENVIRON_PTR_SLOT,
-    FMODE_SLOT, NARROW_ARGV_TABLE, WARGV_PTR_SLOT, WENVIRON_PTR_SLOT, finish, read_guest_str,
+    FMODE_SLOT, MAX_GUEST_STR, NARROW_ARGV_TABLE, WARGV_PTR_SLOT, WENVIRON_PTR_SLOT, finish,
+    read_guest_str,
 };
+
+/// Cap on the number of environment/argv entries materialized into the guest
+/// (a hostile host environment cannot bloat the CRT page without bound).
+const MAX_CRT_ENTRIES: usize = 4096;
+
 pub(crate) fn handle_set_new_mode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let _mode = engine.read_rcx()?;
@@ -195,7 +201,7 @@ fn materialize_wide_env(
     // Host env vars → L"KEY=VALUE" strings (lossy for non-UTF-8 hosts).
     let vars: Vec<String> = std::env::vars_os()
         .map(|(key, value)| format!("{}={}", key.to_string_lossy(), value.to_string_lossy()))
-        .take(4096)
+        .take(MAX_CRT_ENTRIES)
         .collect();
 
     let table_len = (vars.len() + 1).saturating_mul(8); // entries + NULL terminator
@@ -271,7 +277,7 @@ fn materialize_wide_argv(
         .mem_read(ARGC_SLOT, &mut argc_bytes)
         .context("__p___wargv read argc")?;
     let argc = u32::from_le_bytes(argc_bytes);
-    let count = usize::try_from(argc).unwrap_or(0).min(4096);
+    let count = usize::try_from(argc).unwrap_or(0).min(MAX_CRT_ENTRIES);
 
     let mut args: Vec<String> = Vec::with_capacity(count.min(64));
     for i in 0..count {
@@ -284,7 +290,7 @@ fn materialize_wide_argv(
         if ptr == 0 {
             break;
         }
-        args.push(read_guest_str(engine, ptr, 4096)?);
+        args.push(read_guest_str(engine, ptr, MAX_GUEST_STR)?);
     }
 
     let table_len = (args.len() + 1).saturating_mul(8); // entries + NULL terminator

@@ -76,7 +76,7 @@ pub fn handle_heap_realloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
             .or_else(|| {
                 let mut hb = [0_u8; 8];
                 engine
-                    .mem_read(memory.wrapping_sub(8), &mut hb)
+                    .mem_read(memory.wrapping_sub(HEAP_BLOCK_HEADER_BYTES), &mut hb)
                     .ok()
                     .map(|()| u64::from_le_bytes(hb))
             })
@@ -167,7 +167,7 @@ pub fn handle_heap_size(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
             }
             let mut hb = [0_u8; 8];
             engine
-                .mem_read(memory.wrapping_sub(8), &mut hb)
+                .mem_read(memory.wrapping_sub(HEAP_BLOCK_HEADER_BYTES), &mut hb)
                 .ok()
                 .map(|()| u64::from_le_bytes(hb))
                 .filter(|&s| s != 0)
@@ -176,6 +176,29 @@ pub fn handle_heap_size(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 
     ctx.finish(return_value)
 }
+/// Bytes of guest-heap block header stored immediately before the payload
+/// (used to recover a block's size from its pointer).
+const HEAP_BLOCK_HEADER_BYTES: u64 = 8;
+
+/// Mock `dwMemoryLoad` reported by the memory-status structs (25% busy).
+const MEM_LOAD_PERCENT: u32 = 25;
+/// Mock `dwTotalPhys`: 8 GiB of physical memory.
+const MEM_TOTAL_PHYS: u64 = 8 * 1024 * 1024 * 1024;
+/// Mock `dwAvailPhys`: 6 GiB of physical memory available.
+const MEM_AVAIL_PHYS: u64 = 6 * 1024 * 1024 * 1024;
+/// Mock `dwTotalPageFile`: 16 GiB committed-page limit.
+const MEM_TOTAL_PAGEFILE: u64 = 16 * 1024 * 1024 * 1024;
+/// Mock `dwAvailPageFile`: 12 GiB available for commit.
+const MEM_AVAIL_PAGEFILE: u64 = 12 * 1024 * 1024 * 1024;
+/// Mock `dwTotalVirtual`: 128 GiB of user-mode address space.
+const MEM_TOTAL_VIRTUAL: u64 = 128 * 1024 * 1024 * 1024;
+/// Mock `dwAvailVirtual`: 120 GiB of address space available.
+const MEM_AVAIL_VIRTUAL: u64 = 120 * 1024 * 1024 * 1024;
+/// Byte size of `MEMORYSTATUS` (Win64).
+const MEMORYSTATUS_SIZE: usize = 56;
+/// Byte size of `MEMORYSTATUSEX` (Win64).
+const MEMORYSTATUSEX_SIZE: usize = 64;
+
 /// Handles `KERNEL32.dll!GlobalMemoryStatus`.
 pub fn handle_global_memory_status(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -196,15 +219,15 @@ pub fn handle_global_memory_status(ctx: &mut HandlerContext<'_>) -> Result<WinAp
         //   +32 dwAvailPageFile  u64
         //   +40 dwTotalVirtual   u64
         //   +48 dwAvailVirtual   u64
-        let mut buf = [0_u8; 56];
-        buf[0..4].copy_from_slice(&56_u32.to_le_bytes());
-        buf[4..8].copy_from_slice(&25_u32.to_le_bytes());
-        buf[8..16].copy_from_slice(&(8_u64 * 1024 * 1024 * 1024).to_le_bytes());
-        buf[16..24].copy_from_slice(&(6_u64 * 1024 * 1024 * 1024).to_le_bytes());
-        buf[24..32].copy_from_slice(&(16_u64 * 1024 * 1024 * 1024).to_le_bytes());
-        buf[32..40].copy_from_slice(&(12_u64 * 1024 * 1024 * 1024).to_le_bytes());
-        buf[40..48].copy_from_slice(&(128_u64 * 1024 * 1024 * 1024).to_le_bytes());
-        buf[48..56].copy_from_slice(&(120_u64 * 1024 * 1024 * 1024).to_le_bytes());
+        let mut buf = [0_u8; MEMORYSTATUS_SIZE];
+        buf[0..4].copy_from_slice(&u32::try_from(MEMORYSTATUS_SIZE).unwrap_or(0).to_le_bytes());
+        buf[4..8].copy_from_slice(&MEM_LOAD_PERCENT.to_le_bytes());
+        buf[8..16].copy_from_slice(&MEM_TOTAL_PHYS.to_le_bytes());
+        buf[16..24].copy_from_slice(&MEM_AVAIL_PHYS.to_le_bytes());
+        buf[24..32].copy_from_slice(&MEM_TOTAL_PAGEFILE.to_le_bytes());
+        buf[32..40].copy_from_slice(&MEM_AVAIL_PAGEFILE.to_le_bytes());
+        buf[40..48].copy_from_slice(&MEM_TOTAL_VIRTUAL.to_le_bytes());
+        buf[48..56].copy_from_slice(&MEM_AVAIL_VIRTUAL.to_le_bytes());
         engine
             .mem_write(memory_status_va, &buf)
             .context("failed to write MEMORYSTATUS")?;
@@ -237,15 +260,19 @@ pub fn handle_global_memory_status_ex(ctx: &mut HandlerContext<'_>) -> Result<Wi
     //   +40 ullTotalVirtual  u64
     //   +48 ullAvailVirtual  u64
     //   +56 ullAvailExtVirt  u64
-    let mut buf = [0_u8; 64];
-    buf[0..4].copy_from_slice(&64_u32.to_le_bytes());
-    buf[4..8].copy_from_slice(&25_u32.to_le_bytes());
-    buf[8..16].copy_from_slice(&(8_u64 * 1024 * 1024 * 1024).to_le_bytes());
-    buf[16..24].copy_from_slice(&(6_u64 * 1024 * 1024 * 1024).to_le_bytes());
-    buf[24..32].copy_from_slice(&(16_u64 * 1024 * 1024 * 1024).to_le_bytes());
-    buf[32..40].copy_from_slice(&(12_u64 * 1024 * 1024 * 1024).to_le_bytes());
-    buf[40..48].copy_from_slice(&(128_u64 * 1024 * 1024 * 1024).to_le_bytes());
-    buf[48..56].copy_from_slice(&(120_u64 * 1024 * 1024 * 1024).to_le_bytes());
+    let mut buf = [0_u8; MEMORYSTATUSEX_SIZE];
+    buf[0..4].copy_from_slice(
+        &u32::try_from(MEMORYSTATUSEX_SIZE)
+            .unwrap_or(0)
+            .to_le_bytes(),
+    );
+    buf[4..8].copy_from_slice(&MEM_LOAD_PERCENT.to_le_bytes());
+    buf[8..16].copy_from_slice(&MEM_TOTAL_PHYS.to_le_bytes());
+    buf[16..24].copy_from_slice(&MEM_AVAIL_PHYS.to_le_bytes());
+    buf[24..32].copy_from_slice(&MEM_TOTAL_PAGEFILE.to_le_bytes());
+    buf[32..40].copy_from_slice(&MEM_AVAIL_PAGEFILE.to_le_bytes());
+    buf[40..48].copy_from_slice(&MEM_TOTAL_VIRTUAL.to_le_bytes());
+    buf[48..56].copy_from_slice(&MEM_AVAIL_VIRTUAL.to_le_bytes());
     // ullAvailExtendedVirtual at [56..64] already zero.
     engine
         .mem_write(ptr, &buf)

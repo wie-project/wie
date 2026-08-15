@@ -216,11 +216,7 @@ pub fn handle_get_dib_bits(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
         // report 32bpp BI_BITFIELDS with the standard RGB888 channel masks.
         if lpv_bits == 0 && lpbi != 0 {
             write_compatible_bitmap_info_header(ctx.engine, lpbi)?;
-            let rows = if c_lines > 0 {
-                u64::from(c_lines)
-            } else {
-                1
-            };
+            let rows = if c_lines > 0 { u64::from(c_lines) } else { 1 };
             return ctx.finish(rows);
         }
         tracing::debug!(hbm, "GetDIBits: unknown DIB");
