@@ -96,6 +96,42 @@ fn test_get_stock_object_unknown_returns_zero() {
     );
 }
 
+// ── GetObjectA / GetObjectW ────────────────────────────────────────────
+
+/// GetObjectW mirrors GetObjectA: a NULL buffer is a size-only query that
+/// returns the 32-byte Win64 BITMAP size; a real buffer gets the 16×16 32-bpp
+/// BITMAP (bmWidth @4 == 16, bmPlanes @16 == 1, bmBitsPixel @18 == 32).
+#[test]
+fn test_get_object_w_size_query_returns_bitmap_size_and_buffer_is_filled() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+
+    // Size-only query: object_handle non-zero, NULL buffer → 32 bytes.
+    write_regs(&mut engine, 0x6820_0000, 0, 0, 0, STACK_TOP);
+    assert_return_value!(
+        gdi32::handle_get_object_w(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state
+        )),
+        32
+    );
+
+    // With a large-enough buffer, the BITMAP is written and the type matches.
+    write_regs(&mut engine, 0x6820_0000, 32, 0x4000, 0, STACK_TOP);
+    assert_return_value!(
+        gdi32::handle_get_object_w(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state
+        )),
+        32
+    );
+    assert_eq!(read_test_i32(&mut engine, 0x4000), 0, "bmType");
+    assert_eq!(read_test_i32(&mut engine, 0x4004), 16, "bmWidth");
+    assert_eq!(read_test_i32(&mut engine, 0x4008), 16, "bmHeight");
+}
+
 // ── gdi32 lane: TEXTMETRIC byte layouts (zerocopy writes) ─────────────
 
 /// Create a memory DC and return its HDC through the real handler.
@@ -174,4 +210,301 @@ fn test_get_text_metrics_w_writes_textmetricw_byte_layout() {
     assert_eq!(bytes[55], 0x01, "tmPitchAndFamily @55");
     assert_eq!(bytes[56], 0, "tmCharSet @56");
     assert_eq!(&bytes[57..60], &[0, 0, 0], "trailing pad @57..59 zeroed");
+}
+
+// ── Top-level DIB blits ────────────────────────────────────────────────
+
+/// `SetDIBitsToDevice` reports the number of scan lines set (cLines, the 9th
+/// stack arg) with a non-null source buffer; 0 when the buffer is null.
+#[test]
+fn test_set_dib_bits_to_device_reports_scan_line_count() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // rcx=hdc, rdx=xDest, r8=yDest, r9=w; stack: h@0x28, cLines@0x48, lpvBits@0x50.
+    write_regs(&mut engine, 0x100, 0, 0, 100, STACK_TOP);
+    engine
+        .mem_write(STACK_TOP + 0x28, &100_u32.to_le_bytes())
+        .ok();
+    engine
+        .mem_write(STACK_TOP + 0x48, &64_u32.to_le_bytes())
+        .ok(); // cLines
+    engine
+        .mem_write(STACK_TOP + 0x50, &0x5000_u64.to_le_bytes())
+        .ok(); // lpvBits
+    assert_return_value!(
+        gdi32::handle_set_dib_bits_to_device(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state
+        )),
+        64
+    );
+
+    // Null source buffer → 0 scan lines.
+    write_regs(&mut engine, 0x100, 0, 0, 100, STACK_TOP);
+    engine
+        .mem_write(STACK_TOP + 0x28, &100_u32.to_le_bytes())
+        .ok();
+    engine
+        .mem_write(STACK_TOP + 0x48, &64_u32.to_le_bytes())
+        .ok(); // cLines
+    engine
+        .mem_write(STACK_TOP + 0x50, &0_u64.to_le_bytes())
+        .ok(); // lpvBits = NULL
+    assert_return_value!(
+        gdi32::handle_set_dib_bits_to_device(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state
+        )),
+        0
+    );
+}
+
+/// `StretchDIBits` reports the number of scan lines copied (sized by the
+/// source height) with a non-null bit buffer; 0 when the buffer is null.
+#[test]
+fn test_stretch_dib_bits_reports_source_height() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // rcx=hdc, rdx=XDest, r8=YDest, r9=nDestWidth; stack: nSrcHeight@0x48, lpBits@0x50.
+    write_regs(&mut engine, 0x100, 0, 0, 200, STACK_TOP);
+    engine
+        .mem_write(STACK_TOP + 0x48, &40_u32.to_le_bytes())
+        .ok(); // nSrcHeight
+    engine
+        .mem_write(STACK_TOP + 0x50, &0x5000_u64.to_le_bytes())
+        .ok(); // lpBits
+    assert_return_value!(
+        gdi32::handle_stretch_dib_bits(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state
+        )),
+        40
+    );
+
+    write_regs(&mut engine, 0x100, 0, 0, 200, STACK_TOP);
+    engine
+        .mem_write(STACK_TOP + 0x48, &40_u32.to_le_bytes())
+        .ok();
+    engine
+        .mem_write(STACK_TOP + 0x50, &0_u64.to_le_bytes())
+        .ok(); // lpBits = NULL
+    assert_return_value!(
+        gdi32::handle_stretch_dib_bits(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state
+        )),
+        0
+    );
+}
+
+// ── Palette surface ───────────────────────────────────────────────────
+
+/// CreatePalette returns a non-null fake HPALETTE for a valid LOGPALETTE
+/// pointer and NULL for a null one; RealizePalette reports 0 entries;
+/// GetSystemPaletteEntries fills the output and returns the count.
+#[test]
+fn test_palette_surface_create_realize_and_entries() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+
+    // CreatePalette with a valid LOGPALETTE → a non-null fake handle.
+    write_regs(&mut engine, 0x4000, 0, 0, 0, STACK_TOP);
+    let created = gdi32::handle_create_palette(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("CreatePalette must succeed")
+    .return_value;
+    assert_ne!(created, 0, "a valid LOGPALETTE yields a fake HPALETTE");
+
+    // CreatePalette with a null LOGPALETTE → NULL.
+    write_regs(&mut engine, 0, 0, 0, 0, STACK_TOP);
+    assert_return_value!(
+        gdi32::handle_create_palette(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state
+        )),
+        0
+    );
+
+    // RealizePalette on a screen DC → 0 entries realized.
+    write_regs(&mut engine, 1, 0, 0, 0, STACK_TOP);
+    assert_return_value!(
+        gdi32::handle_realize_palette(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state
+        )),
+        0
+    );
+
+    // GetSystemPaletteEntries fills the buffer with cEntries zero PALETTEENTRYs
+    // and returns the count.
+    write_regs(&mut engine, 1, 0, 3, 0x5000, STACK_TOP);
+    assert_return_value!(
+        gdi32::handle_get_system_palette_entries(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state
+        )),
+        3
+    );
+    let filled = read_guest_bytes(&mut engine, 0x5000, 3 * 4);
+    assert_eq!(&filled[..], &[0_u8; 12], "zeroed PALETTEENTRYs");
+}
+
+// ── Device-DIB present lane ───────────────────────────────────────────
+
+/// `SetDIBitsToDevice` on a window DC blits the guest buffer into the window's
+/// present surface and defers a publish — the same `ensure_surface` +
+/// `publish_deferred` lane `BitBlt` uses — while still reporting the scan-line
+/// count (`cLines`).
+#[test]
+fn test_set_dib_bits_to_device_publishes_to_window_surface() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let hwnd = 0x6610_0101_u64;
+    state.window_state().windows.push(WindowRecord {
+        handle: crate::handles::Hwnd::from(hwnd),
+        title: "Test".to_owned(),
+        visible: true,
+        width: 320,
+        height: 240,
+        ..Default::default()
+    });
+    // GetDC(hwnd) → a Window DC.
+    write_regs(&mut engine, hwnd, 0, 0, 0, 0);
+    let hdc = crate::user32::handle_get_dc(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("GetDC")
+    .return_value;
+    assert_ne!(hdc, 0, "GetDC returns a window DC");
+
+    // 4×4 top-down 32-bpp source at 0x5000, BITMAPINFO header at 0x6000.
+    let src_px = |row: u32, col: u32| -> u32 {
+        0xFF00_0000 | (row << 16) | (col << 8) // BGRA: B=0, G=col, R=row, A=0xFF
+    };
+    let mut src = Vec::new();
+    for row in 0..4_u32 {
+        for col in 0..4_u32 {
+            src.extend_from_slice(&src_px(row, col).to_le_bytes());
+        }
+    }
+    engine.mem_write(0x5000, &src).expect("write source pixels");
+    let mut bmi = [0_u8; 40];
+    bmi[0..4].copy_from_slice(&40_u32.to_le_bytes()); // biSize
+    bmi[4..8].copy_from_slice(&4_i32.to_le_bytes()); // biWidth
+    bmi[8..12].copy_from_slice(&(-4_i32).to_le_bytes()); // biHeight (top-down)
+    bmi[12..14].copy_from_slice(&1_u16.to_le_bytes()); // biPlanes
+    bmi[14..16].copy_from_slice(&32_u16.to_le_bytes()); // biBitCount
+    engine.mem_write(0x6000, &bmi).expect("write BITMAPINFO");
+
+    // SetDIBitsToDevice(hdc, 0, 0, w=4, h=4, 0, 0, StartScan=0, cLines=4,
+    //                  lpvBits=0x5000, lpbmi=0x6000, ColorUse=0).
+    write_regs(&mut engine, hdc, 0, 0, 4, STACK_TOP);
+    engine
+        .mem_write(STACK_TOP + 0x28, &4_u32.to_le_bytes())
+        .ok(); // h
+    engine
+        .mem_write(STACK_TOP + 0x30, &0_u32.to_le_bytes())
+        .ok(); // xSrc
+    engine
+        .mem_write(STACK_TOP + 0x38, &0_u32.to_le_bytes())
+        .ok(); // ySrc
+    engine
+        .mem_write(STACK_TOP + 0x40, &0_u32.to_le_bytes())
+        .ok(); // StartScan
+    engine
+        .mem_write(STACK_TOP + 0x48, &4_u32.to_le_bytes())
+        .ok(); // cLines
+    engine
+        .mem_write(STACK_TOP + 0x50, &0x5000_u64.to_le_bytes())
+        .ok(); // lpvBits
+    engine
+        .mem_write(STACK_TOP + 0x58, &0x6000_u64.to_le_bytes())
+        .ok(); // lpbmi
+    engine
+        .mem_write(STACK_TOP + 0x60, &0_u32.to_le_bytes())
+        .ok(); // ColorUse
+    let r = gdi32::handle_set_dib_bits_to_device(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("SetDIBitsToDevice");
+    assert_eq!(r.return_value, 4, "reports cLines scan lines");
+
+    // A surface exists for the top-level window, the blit landed, and a
+    // deferred publish was registered.
+    let hwnd_h = crate::handles::Hwnd::from(hwnd);
+    let surf = state
+        .present()
+        .surfaces
+        .get(&hwnd_h)
+        .expect("window present surface exists");
+    assert_eq!(surf.width, 320, "surface width");
+    assert_eq!(surf.height, 240, "surface height");
+    assert_eq!(surf.pixels[0], 0x0000_0000, "row0 col0 (R=0,G=0)");
+    assert_eq!(surf.pixels[1], 0x0000_0100, "row0 col1 (G=1)");
+    assert_eq!(
+        surf.pixels[320], 0x0001_0000,
+        "row1 col0 (R=1) (row stride = 320)"
+    );
+    let _ = surf;
+    assert!(
+        state.present().pending_publishes.contains(&hwnd_h),
+        "SetDIBitsToDevice defers a publish for the window"
+    );
+    assert!(
+        state.present().drain_pending_publishes() >= 1,
+        "the deferred publish drains to a frame"
+    );
+}
+
+/// A device-DIB blit to a memory/screen DC (no window surface) publishes
+/// nothing and still reports its scan-line count.
+#[test]
+fn test_set_dib_bits_to_device_to_memory_dc_does_not_publish() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // rcx=hdc (unknown), stack args present, non-null lpvBits.
+    write_regs(&mut engine, 0x100, 0, 0, 100, STACK_TOP);
+    engine
+        .mem_write(STACK_TOP + 0x28, &100_u32.to_le_bytes())
+        .ok(); // h
+    engine
+        .mem_write(STACK_TOP + 0x30, &0_u32.to_le_bytes())
+        .ok(); // xSrc
+    engine
+        .mem_write(STACK_TOP + 0x38, &0_u32.to_le_bytes())
+        .ok(); // ySrc
+    engine
+        .mem_write(STACK_TOP + 0x40, &0_u32.to_le_bytes())
+        .ok(); // StartScan
+    engine
+        .mem_write(STACK_TOP + 0x48, &64_u32.to_le_bytes())
+        .ok(); // cLines
+    engine
+        .mem_write(STACK_TOP + 0x50, &0x5000_u64.to_le_bytes())
+        .ok(); // lpvBits
+    let r = gdi32::handle_set_dib_bits_to_device(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("SetDIBitsToDevice");
+    assert_eq!(r.return_value, 64, "reports cLines scan lines");
+    assert!(
+        state.present().pending_publishes.is_empty(),
+        "no publish for a non-window DC"
+    );
 }

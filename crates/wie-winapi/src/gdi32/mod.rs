@@ -6,6 +6,7 @@ mod blit;
 mod dib;
 pub mod enumerate;
 mod font_system;
+mod palette;
 mod pixel;
 mod print;
 mod regions;
@@ -17,6 +18,7 @@ pub use blit::*;
 pub use dib::*;
 pub use enumerate::*;
 pub use font_system::*;
+pub use palette::*;
 pub use print::*;
 pub use regions::*;
 pub use state::*;
@@ -33,6 +35,11 @@ pub fn dispatch_gdi32_extra(
     match n.as_str() {
         "getdibits" => Ok(Some(dib::handle_get_dib_bits(ctx)?)),
         "setdibits" => Ok(Some(dib::handle_set_dib_bits(ctx)?)),
+        "setdibitstodevice" => Ok(Some(dib::handle_set_dib_bits_to_device(ctx)?)),
+        "stretchdibits" => Ok(Some(dib::handle_stretch_dib_bits(ctx)?)),
+        "createpalette" => Ok(Some(palette::handle_create_palette(ctx)?)),
+        "realizepalette" => Ok(Some(palette::handle_realize_palette(ctx)?)),
+        "getsystempaletteentries" => Ok(Some(palette::handle_get_system_palette_entries(ctx)?)),
         "createrectrgn" => Ok(Some(regions::handle_create_rect_rgn(ctx)?)),
         "createellipticrgn" => Ok(Some(regions::handle_create_elliptic_rgn(ctx)?)),
         "createpolygonrgn" => Ok(Some(regions::handle_create_polygon_rgn(ctx)?)),
