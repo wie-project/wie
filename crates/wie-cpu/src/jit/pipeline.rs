@@ -361,11 +361,17 @@ impl JitCpu {
                 };
                 let is_ucrt = block_kind_ends_in_fast_ucrt(&self.shared, &self.fast_api, &kind);
                 let is_loop = pure_is_self_loop(&kind, rip);
+                let pure_insns = match &kind {
+                    BlockKind::Pure { insns, .. } => insns.len(),
+                    BlockKind::NotPure => 0,
+                };
                 let (thr, eager) = select_hot_threshold(
                     is_ucrt,
                     is_loop,
+                    pure_insns,
                     JitConfig::get().pure_loop_hotness(),
                     JitConfig::get().hotness_threshold(),
+                    JitConfig::get().eager_block_insns(),
                 );
                 if eager {
                     // Eager compile: the entry is required NOW (there may be no
@@ -818,30 +824,22 @@ impl JitCpu {
                 i = i.saturating_add(1);
             }
         }
-        if meta.uses_sse {
-            // Cranelift blocks skip the per-def `xmm_dirty_bits` RMW — the static
-            // `xmm_may_def_mask` covers them. Trampolines still set dirty from Rust,
-            // so we always OR both so trampoline-only writes and Cranelift writes
-            // are both covered.
-            let dirty = if ctx.fault != 0 {
-                u16::try_from(ctx.xmm_dirty_bits).unwrap_or(ALL_DIRTY_BITS)
-            } else {
-                u16::try_from(ctx.xmm_dirty_bits).unwrap_or(0)
-            };
-            let mut mask = dirty | meta.xmm_may_def_mask;
-            if mask == 0 {
-                mask = meta.xmm_live_mask;
-            }
-            let mut i = 0_usize;
-            let mut m = mask;
-            while m != 0 {
-                if m & 1 != 0
-                    && let Some(slot) = ctx.xmm.get(i)
-                {
-                    regs.set_xmm_at(i, slot.to_u128());
-                }
-                m >>= 1;
-                i = i.saturating_add(1);
+        // XMM writeback is full, not mask-gated on the entry block's metadata.
+        // `ctx.xmm` is write-through — every xmm def in the run (including in
+        // chained successor blocks) lands in JitCtx immediately, so it is the
+        // authoritative guest xmm snapshot for the whole run. The previous
+        // masked writeback used the ENTRY block's `xmm_may_def_mask` / fallback
+        // `xmm_live_mask`; a run that entered a pure-GPR block, chained through
+        // an SSE block (def'ing xmm), then returned through a block whose mask
+        // excluded xmm dropped the def — the engine kept a stale value and the
+        // next dispatcher entry re-snapshotted it from the engine. Observed
+        // on Doom Retro: `movups xmm0,[mem]` in one block and
+        // `movdqu [obj],xmm0` in a later dispatcher block — the store wrote 0.
+        // GPRs already write back fully on the Cranelift path
+        // (`gpr_dirty_bits == 0` → ALL_DIRTY); make XMM consistent.
+        for i in 0..16 {
+            if let Some(slot) = ctx.xmm.get(i) {
+                regs.set_xmm_at(i, slot.to_u128());
             }
         }
         regs.set_rflags_checked(Rflags::from(ctx.rflags));
@@ -900,11 +898,6 @@ impl JitCpu {
 pub(super) struct CompiledRunMeta {
     func: unsafe extern "C" fn(*mut JitCtx),
     insn_count: u32,
-    uses_sse: bool,
-    /// XMMi referenced in the block (selective entry load).
-    xmm_live_mask: u16,
-    /// XMMi that may be defined (conservative exit writeback on fault).
-    xmm_may_def_mask: u16,
 }
 
 impl From<&CompiledBlock> for CompiledRunMeta {
@@ -912,9 +905,6 @@ impl From<&CompiledBlock> for CompiledRunMeta {
         Self {
             func: c.func,
             insn_count: c.insn_count,
-            uses_sse: c.uses_sse,
-            xmm_live_mask: c.xmm_live_mask,
-            xmm_may_def_mask: c.xmm_may_def_mask,
         }
     }
 }
@@ -928,21 +918,30 @@ pub(super) fn ranges_overlap(a0: u64, a1: u64, b0: u64, b1: u64) -> bool {
 /// Select the visit threshold and eagerness for a decoded block.
 ///
 /// Fast-UCRT blocks always compile eagerly. Self-loops use the dedicated loop
-/// hotness. Otherwise the fixed hotness threshold applies.
+/// hotness. Otherwise the fixed hotness threshold applies, except that a Pure
+/// block with a large lowerable body length (`pure_insns >= eager_block_insns`)
+/// also compiles eagerly on first sight: one-shot cold-init code never revisits
+/// enough times to cross the fixed threshold, so it must skip the wait or it
+/// runs forever on iced.
 ///
 /// Returns `(threshold, eager)`. `eager` is true when the block must compile
-/// on its first visit (fast-UCRT, or a zero fixed threshold).
+/// on its first visit (fast-UCRT, a zero fixed threshold, or a large Pure body).
+/// `eager_block_insns == 0` disables the large-body rule.
 #[must_use]
 pub(super) fn select_hot_threshold(
     is_ucrt: bool,
     is_loop: bool,
+    pure_insns: usize,
     loop_hotness: u32,
     fixed_hotness: u32,
+    eager_block_insns: usize,
 ) -> (u32, bool) {
     if is_ucrt {
         (2, true)
     } else if is_loop {
         (loop_hotness, loop_hotness == 0)
+    } else if eager_block_insns > 0 && pure_insns >= eager_block_insns {
+        (fixed_hotness, true)
     } else {
         (fixed_hotness, fixed_hotness == 0)
     }
@@ -1013,4 +1012,66 @@ pub(super) fn resolve_thunk_va(mem: &GuestMemory, mut va: u64) -> u64 {
         return va;
     }
     va
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_hot_threshold;
+
+    const CUTOFF: usize = 48; // mirrored default; kept explicit so the test is self-contained
+
+    /// A large Pure body on first sight must compile eagerly (bypasses the
+    /// fixed visit wait) so one-shot cold init leaves the interpreter.
+    #[test]
+    fn large_pure_body_compiles_eagerly() {
+        let (thr, eager) = select_hot_threshold(false, false, CUTOFF, 8, 100, CUTOFF);
+        assert_eq!(thr, 100);
+        assert!(eager, "large pure body must compile eagerly");
+    }
+
+    /// A short Pure body stays visit-gated: it must NOT compile eagerly, so
+    /// short-block compile thrash does not regress.
+    #[test]
+    fn short_pure_body_stays_visit_gated() {
+        let (thr, eager) = select_hot_threshold(false, false, 4, 8, 100, CUTOFF);
+        assert_eq!(thr, 100);
+        assert!(!eager, "short pure body must remain visit-gated");
+    }
+
+    /// `eager_block_insns == 0` disables the large-body rule entirely; even a
+    /// huge body falls back to the fixed threshold (diagnosability switch).
+    #[test]
+    fn zero_cutoff_disables_large_body_rule() {
+        let (thr, eager) = select_hot_threshold(false, false, 10_000, 8, 100, 0);
+        assert_eq!(thr, 100);
+        assert!(!eager, "cutoff 0 must leave the body visit-gated");
+    }
+
+    /// Fast-UCRT blocks always compile eagerly regardless of body length or
+    /// disabled cutoff.
+    #[test]
+    fn ucrt_always_eager() {
+        assert!(select_hot_threshold(true, false, 1, 8, 100, CUTOFF).1);
+        assert!(select_hot_threshold(true, false, 1, 8, 100, 0).1);
+    }
+
+    /// Self-loops use the dedicated loop hotness, not the large-body rule; with
+    /// a nonzero loop hotness they are not eager.
+    #[test]
+    fn self_loop_uses_loop_hotness_not_body_rule() {
+        let (thr, eager) = select_hot_threshold(false, true, 10_000, 8, 100, CUTOFF);
+        assert_eq!(thr, 8);
+        assert!(
+            !eager,
+            "self-loop eagerness comes from loop hotness, not body size"
+        );
+    }
+
+    /// A zero fixed hotness (unit-suite regime) compiles everything eagerly,
+    /// independent of body size.
+    #[test]
+    fn zero_fixed_hotness_is_eager() {
+        assert!(select_hot_threshold(false, false, 4, 8, 0, CUTOFF).1);
+        assert!(select_hot_threshold(false, false, 4, 8, 0, 0).1);
+    }
 }

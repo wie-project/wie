@@ -47,6 +47,7 @@ enum SuperMode {
 pub(super) struct JitConfig {
     hotness_threshold: u32,
     pure_loop_hotness: u32,
+    eager_block_insns: usize,
     jit_mem_mode: JitMemMode,
     mem_path_trace: bool,
     super_mode: SuperMode,
@@ -81,6 +82,9 @@ impl JitConfig {
             // Known pure self-loops: compile sooner (one Cranelift pass vs iced
             // warmup). Default 8; tests 0.
             pure_loop_hotness: env_u32("WIE_JIT_LOOP_HOTNESS", 8, true),
+            // Large one-shot Pure blocks skip the fixed hotness wait (see
+            // `eager_block_insns_from_env`). Default 48; `=0` disables.
+            eager_block_insns: eager_block_insns_from_env(),
             jit_mem_mode: match std::env::var("WIE_JIT_MEM") {
                 Ok(v)
                     if v.eq_ignore_ascii_case("slow")
@@ -214,6 +218,16 @@ impl JitConfig {
         self.pure_loop_hotness
     }
 
+    /// One-shot eager-compile cutoff. Pure, non-loop, non-UCRT blocks with at
+    /// least this many guest instructions (lowerable body length) compile on
+    /// first sight instead of waiting out the fixed hotness threshold. This
+    /// tunes interpreter-bound cold init off iced; short fragments stay
+    /// visit-gated so short-block compile thrash does not regress. `0` disables.
+    #[must_use]
+    pub(super) fn eager_block_insns(&self) -> usize {
+        self.eager_block_insns
+    }
+
     /// Whether Cranelift may emit inline sticky-TLB load/store (not helper-only).
     #[must_use]
     pub(crate) fn mem_inline_enabled(&self) -> bool {
@@ -319,6 +333,19 @@ fn hotness_threshold_from_env() -> u32 {
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(100);
     raw.clamp(1, HOTNESS_THRESHOLD_MAX)
+}
+
+/// Eager-compile cutoff for large one-shot Pure blocks (`WIE_JIT_EAGER_BLOCK_INSNS`).
+///
+/// Default 48. `0` disables eager-by-size, so every non-loop block waits out
+/// the fixed hotness threshold (useful for diagnosing compile-thrash regressions).
+/// The decision cost is a usize compare during decode; when the fixed hotness
+/// is already `0` (unit suite) the block compiles eagerly regardless.
+fn eager_block_insns_from_env() -> usize {
+    std::env::var("WIE_JIT_EAGER_BLOCK_INSNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(48)
 }
 
 /// Parse `name` as `u32`, falling back to `default` on absence/invalid input.

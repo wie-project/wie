@@ -468,10 +468,15 @@ pub(super) struct CompiledBlock {
     pub insn_count: u32,
     /// Block touches XMM/SSE state — host must sync the XMM bank.
     /// Pure GPR blocks skip XMM copy on entry/exit (CPU + cache win).
+    /// Retained for selective masking; the dispatcher currently syncs the
+    /// full XMM bank on entry/exit.
+    #[allow(dead_code)]
     pub uses_sse: bool,
     /// Bit `i` set if XMMi is referenced (selective entry load).
+    #[allow(dead_code)]
     pub xmm_live_mask: u16,
     /// Bit `i` set if XMMi may be written (selective exit writeback).
+    #[allow(dead_code)]
     pub xmm_may_def_mask: u16,
     /// Guest code range covered by this block `[guest_start, guest_end)`.
     /// Used for range-selective cache invalidation on `mem_write`.
