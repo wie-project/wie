@@ -15,13 +15,16 @@ use wie_runtime::{GuiControl, GuiOutcome, run_windowed};
 /// `--drive-d` roots from the CLI (`None` = env fallback only), threaded like
 /// the windowed entry so named bottles work in screenshot mode too.
 /// `app_dir` is the explicit `--app-dir` (complete-folder staging), `None`
-/// keeping the exe-only default.
+/// keeping the exe-only default. `guest_args` are the argv entries after the
+/// module name, forwarded into the guest session bootstrap exactly like the
+/// GUI/micro entries (e.g. Doom Retro's `-iwad freedoom1.wad`).
 pub fn run_screenshot(
     path: &Path,
     out_path: &Path,
     bottle_root: Option<&Path>,
     drive_d_root: Option<&Path>,
     app_dir: Option<&Path>,
+    guest_args: &[String],
 ) -> Result<()> {
     // FS policy: an exe outside the bottle runs from a drive_c copy first
     // (the guest identity's `C:\…` label then maps to a real bottle file,
@@ -40,6 +43,10 @@ pub fn run_screenshot(
         wie_runtime::DEFAULT_LAYOUT,
         wie_runtime::SessionOptions {
             current_directory: staged.guest_current_directory,
+            // Forward guest argv after the module name (same entries the
+            // GUI/micro entries thread through) so headless apps that need
+            // argv (e.g. Doom Retro's `-iwad`) can be driven by a screenshot.
+            guest_args: guest_args.to_vec(),
             // The staged root must reach the session (same rationale as the
             // console/persistent entries): the session would otherwise fall
             // back to `WIE_ROOT` / the global bottle.

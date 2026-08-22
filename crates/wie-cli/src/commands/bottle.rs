@@ -422,6 +422,16 @@ pub(crate) fn bottle(command: BottleCommand) -> Result<()> {
         BottleCommand::Run {
             name,
             exe,
+            max_api,
+            expect_code,
+            drive_d,
+            stdin,
+            app_dir,
+            persistent,
+            console,
+            gui,
+            screenshot,
+            input_script,
             guest_args,
         } => {
             let root = require_bottle(&bottles_dir(), &name)?;
@@ -429,17 +439,25 @@ pub(crate) fn bottle(command: BottleCommand) -> Result<()> {
             // or a basename / relative path searched inside the bottle's
             // drive_c (unique match required — see resolve_bottle_exe).
             let host_exe = resolve_bottle_exe(&root, Path::new(&exe))?;
-            crate::commands::run_micro(
+            // Dispatch through the same entry used by `run --bottle <name>`:
+            // `root` is the effective bottle root (no `--root` flag), so the
+            // micro-only rejection sees no raw flag while the bottle-derived
+            // root is allowed on console/persistent.
+            crate::run_entry(
                 &host_exe,
-                crate::commands::MicroRunOptions {
-                    max_api: crate::MICRO_MAX_API_DEFAULT,
-                    expect_code: 0,
-                    bottle_root: Some(&root),
-                    drive_d: None,
-                    stdin_path: None,
-                    guest_args: &guest_args,
-                    app_dir: None,
-                },
+                Some(root),
+                None,
+                max_api,
+                expect_code,
+                drive_d,
+                stdin,
+                app_dir,
+                persistent,
+                console,
+                gui,
+                screenshot,
+                input_script,
+                guest_args,
             )?;
         }
     }

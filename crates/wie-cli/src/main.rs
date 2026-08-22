@@ -210,14 +210,74 @@ pub(crate) enum BottleCommand {
         target: Option<String>,
     },
 
-    /// Run a guest exe inside a bottle (delegates to `run --root`).
+    /// Run a guest exe inside a bottle (delegates to `run --bottle`).
     Run {
         name: String,
         /// Exe to run: a full guest path (`C:\App\app.exe`), an existing
         /// host path, or a basename / relative path resolved inside the
         /// bottle's `drive_c` (unique match required).
         exe: String,
-        /// Guest argv after the exe.
+
+        /// Cap host API stops (defaults: 2,000 micro; 5,000,000 persistent;
+        /// 1,000,000 per quantum console).
+        #[arg(long)]
+        max_api: Option<usize>,
+
+        /// Expected ExitProcess code (micro mode only; default 0).
+        #[arg(long, default_value_t = 0)]
+        expect_code: u32,
+
+        /// Host root for guest `D:\…` bridge (env `WIE_DRIVE_D`; `auto` =
+        /// host cwd). Micro / `--gui` / `--screenshot` entries only — rejected
+        /// with `--console` / `--persistent`.
+        #[arg(long)]
+        drive_d: Option<PathBuf>,
+
+        /// Host file whose bytes are injected as guest console stdin (micro
+        /// mode only; `/dev/stdin`, `/dev/tty` or `-` read live from the
+        /// terminal).
+        #[arg(long)]
+        stdin: Option<PathBuf>,
+
+        /// Stage this complete host folder into the bottle instead of just
+        /// the executable: relative paths, DLLs, plugins and data files are
+        /// preserved under `C:\Program Files\<name>\`. The run source must
+        /// live inside this folder. Micro / `--gui` / `--screenshot` entries
+        /// only — rejected with `--console` / `--persistent`.
+        #[arg(long)]
+        app_dir: Option<PathBuf>,
+
+        /// Persistent run loop: run the guest session as a message-driven
+        /// loop that yields on idle instead of gating on `ExitProcess`. For
+        /// message-loop guests (games, GUI apps). Bounded by `--max-api`.
+        #[arg(long)]
+        persistent: bool,
+
+        /// Raw-mode interactive console run for terminal games: every
+        /// keystroke reaches the guest immediately (no Enter), terminal
+        /// restored on exit. Runs until the guest exits.
+        #[arg(long)]
+        console: bool,
+
+        /// Native windowed GUI run: guest windows render in a macOS window
+        /// (winit + wgpu/Metal), the loop yields on idle, and guest menu bar
+        /// and dialogs are bridged to native UI.
+        #[arg(long)]
+        gui: bool,
+
+        /// Headless GUI run: render the guest without a window and write the
+        /// first captured frame to this BMP file.
+        #[arg(long)]
+        screenshot: Option<PathBuf>,
+
+        /// Drive a `--gui` guest with a scripted input file (lines: sleep
+        /// <ms> | key <vk> [shift|ctrl] | type <text> | menu <id> | click
+        /// <x> <y> | snapshot <file>). Requires --gui. The `WIE_INPUT_SCRIPT`
+        /// env var names a script too.
+        #[arg(long)]
+        input_script: Option<PathBuf>,
+
+        /// Guest argv after the exe: everything after `--` passes verbatim.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         guest_args: Vec<String>,
     },
@@ -244,6 +304,114 @@ fn reject_micro_only_flags(
     }
     if !guest_args.is_empty() {
         bail!("guest argv is only supported in micro mode (omit {mode})");
+    }
+    Ok(())
+}
+
+/// Shared run-entry dispatch, used by both `run` (via `--bottle` / `--root`)
+/// and `bottle run <name>`.
+///
+/// `path` is the already-resolved run source — an in-bottle host exe when the
+/// entry named a bottle, a plain host path otherwise. `root` is the effective
+/// bottle root (the resolved bottle / `--root`, or `None` for the global
+/// default). `root_flag` is the raw `--root` flag, kept separate so the
+/// console/persistent entries can still reject it while permitting the
+/// bottle-derived root.
+///
+/// Applies the mode precedence GUI → screenshot → console/persistent/micro
+/// and the micro-only flag rejections, then dispatches to the runtime. A
+/// single source of truth so `bottle run` behaves identically to
+/// `run --bottle`.
+#[allow(clippy::too_many_arguments)]
+fn run_entry(
+    path: &std::path::Path,
+    root: Option<PathBuf>,
+    root_flag: Option<PathBuf>,
+    max_api: Option<usize>,
+    expect_code: u32,
+    drive_d: Option<PathBuf>,
+    stdin: Option<PathBuf>,
+    app_dir: Option<PathBuf>,
+    persistent: bool,
+    console: bool,
+    gui: bool,
+    screenshot: Option<PathBuf>,
+    input_script: Option<PathBuf>,
+    guest_args: Vec<String>,
+) -> Result<()> {
+    // GUI/screenshot mode takes precedence over persistent/micro.
+    if gui || screenshot.is_some() {
+        if gui {
+            if let Some(script) = input_script.as_ref()
+                && !script.is_file()
+            {
+                bail!("input script not found: {}", script.display());
+            }
+            let script = gui::input_script::script_path(input_script.as_deref());
+            return gui::app::run_gui_windowed(
+                path,
+                script,
+                root.as_deref(),
+                drive_d.as_deref(),
+                app_dir.as_deref(),
+                &guest_args,
+            );
+        }
+        if let Some(out_path) = screenshot {
+            return gui::headless::run_screenshot(
+                path,
+                &out_path,
+                root.as_deref(),
+                drive_d.as_deref(),
+                app_dir.as_deref(),
+                &guest_args,
+            );
+        }
+    }
+    if input_script.is_some() {
+        bail!("--input-script requires --gui");
+    }
+
+    if console {
+        if persistent {
+            bail!("--console and --persistent are mutually exclusive");
+        }
+        reject_micro_only_flags(
+            "--console",
+            &root_flag,
+            &stdin,
+            &drive_d,
+            &app_dir,
+            expect_code,
+            &guest_args,
+        )?;
+        commands::run_console_interactive(path, max_api, root.as_deref())?;
+    } else if persistent {
+        reject_micro_only_flags(
+            "--persistent",
+            &root_flag,
+            &stdin,
+            &drive_d,
+            &app_dir,
+            expect_code,
+            &guest_args,
+        )?;
+        let max = max_api.unwrap_or(PERSISTENT_MAX_API_DEFAULT);
+        commands::run_until_yield(path, max, root.as_deref())?;
+    } else {
+        let max = max_api.unwrap_or(MICRO_MAX_API_DEFAULT);
+        commands::run_micro(
+            path,
+            commands::MicroRunOptions {
+                max_api: max,
+                expect_code,
+                bottle_root: root.as_deref(),
+                drive_d: drive_d.as_deref(),
+                stdin_path: stdin.as_deref(),
+                guest_args: &guest_args,
+                app_dir: app_dir.as_deref(),
+            },
+        )?;
     }
     Ok(())
 }
@@ -345,79 +513,22 @@ fn main() -> Result<()> {
                 _ => path,
             };
 
-            // GUI/screenshot mode takes precedence over persistent/micro.
-            if gui || screenshot.is_some() {
-                if gui {
-                    if let Some(script) = input_script.as_ref()
-                        && !script.is_file()
-                    {
-                        bail!("input script not found: {}", script.display());
-                    }
-                    let script = gui::input_script::script_path(input_script.as_deref());
-                    return gui::app::run_gui_windowed(
-                        &path,
-                        script,
-                        root.as_deref(),
-                        drive_d.as_deref(),
-                        app_dir.as_deref(),
-                        &guest_args,
-                    );
-                }
-                if let Some(out_path) = screenshot {
-                    return gui::headless::run_screenshot(
-                        &path,
-                        &out_path,
-                        root.as_deref(),
-                        drive_d.as_deref(),
-                        app_dir.as_deref(),
-                    );
-                }
-            }
-            if input_script.is_some() {
-                bail!("--input-script requires --gui");
-            }
-
-            if console {
-                if persistent {
-                    bail!("--console and --persistent are mutually exclusive");
-                }
-                reject_micro_only_flags(
-                    "--console",
-                    &root_flag,
-                    &stdin,
-                    &drive_d,
-                    &app_dir,
-                    expect_code,
-                    &guest_args,
-                )?;
-                commands::run_console_interactive(&path, max_api, root.as_deref())?;
-            } else if persistent {
-                reject_micro_only_flags(
-                    "--persistent",
-                    &root_flag,
-                    &stdin,
-                    &drive_d,
-                    &app_dir,
-                    expect_code,
-                    &guest_args,
-                )?;
-                let max = max_api.unwrap_or(PERSISTENT_MAX_API_DEFAULT);
-                commands::run_until_yield(&path, max, root.as_deref())?;
-            } else {
-                let max = max_api.unwrap_or(MICRO_MAX_API_DEFAULT);
-                commands::run_micro(
-                    &path,
-                    commands::MicroRunOptions {
-                        max_api: max,
-                        expect_code,
-                        bottle_root: root.as_deref(),
-                        drive_d: drive_d.as_deref(),
-                        stdin_path: stdin.as_deref(),
-                        guest_args: &guest_args,
-                        app_dir: app_dir.as_deref(),
-                    },
-                )?;
-            }
+            run_entry(
+                &path,
+                root,
+                root_flag,
+                max_api,
+                expect_code,
+                drive_d,
+                stdin,
+                app_dir,
+                persistent,
+                console,
+                gui,
+                screenshot,
+                input_script,
+                guest_args,
+            )?;
         }
         Command::Trace { path, max_api } => {
             commands::entry_trace(&path, max_api)?;
@@ -728,11 +839,228 @@ mod tests {
             .expect("bottle run argv parses")
             .command,
             Command::Bottle {
-                command: BottleCommand::Run { name, exe, guest_args },
+                command: BottleCommand::Run { name, exe, guest_args, .. },
             } if name == "doomretro"
                 && exe == "doomretro.exe"
                 && guest_args == [r"C:\DOOM2.WAD"]
         ));
+    }
+
+    /// `--screenshot` with guest argv after `--` parses: the path becomes the
+    /// screenshot output while the hyphens stay guest argv (`-iwad` etc.), so a
+    /// headless screenshot can drive apps that need argv (e.g. Doom Retro's
+    /// IWAD selection).
+    #[test]
+    fn screenshot_with_guest_args_parse() {
+        assert!(matches!(
+            parse_run(&[
+                "--bottle",
+                "doomretro",
+                "--screenshot",
+                "/tmp/doom.bmp",
+                "--",
+                "-iwad",
+                "freedoom1.wad",
+            ]),
+            Command::Run {
+                bottle: Some(ref name),
+                screenshot: Some(ref out),
+                guest_args,
+                ..
+            } if name.as_str() == "doomretro"
+                && out == std::path::Path::new("/tmp/doom.bmp")
+                && guest_args == ["-iwad", "freedoom1.wad"]
+        ));
+    }
+
+    /// Parse `wie bottle run <name> <exe> <args>` and return the parsed
+    /// `BottleCommand`.
+    fn parse_bottle_run(name: &str, exe: &str, args: &[&str]) -> BottleCommand {
+        let mut argv = vec!["wie", "bottle", "run", name, exe];
+        argv.extend_from_slice(args);
+        match Cli::try_parse_from(argv)
+            .expect("parse bottle run argv")
+            .command
+        {
+            Command::Bottle { command } => command,
+            other => panic!("expected BottleCommand, got {other:?}"),
+        }
+    }
+
+    /// `bottle run` parses every mode flag as a flag, not as guest argv. The
+    /// old bug swallowed `--gui` and friends into `guest_args`; the shape
+    /// must now mirror `run --bottle` exactly.
+    #[test]
+    fn bottle_run_parses_mode_flags_as_flags() {
+        assert!(matches!(
+            parse_bottle_run(
+                "doom",
+                "doom.exe",
+                &["--gui", "--app-dir", "/tmp/MyApp", "--max-api", "500", "--", "-n", "3"],
+            ),
+            BottleCommand::Run {
+                gui: true,
+                app_dir: Some(ref dir),
+                max_api: Some(500),
+                guest_args,
+                ..
+            } if dir == std::path::Path::new("/tmp/MyApp")
+                && guest_args == ["-n", "3"]
+        ));
+    }
+
+    /// `bottle run <name> <exe> --gui` must NOT swallow `--gui` into
+    /// `guest_args` (the original bug), and parses as the GUI mode.
+    #[test]
+    fn bottle_run_gui_flag_is_not_a_guest_arg() {
+        assert!(matches!(
+            parse_bottle_run("doom", "doom.exe", &["--gui"]),
+            BottleCommand::Run {
+                gui: true,
+                guest_args,
+                ..
+            } if guest_args.is_empty()
+        ));
+    }
+
+    /// The remaining mode flags parse on `bottle run` like `run --bottle`.
+    #[test]
+    fn bottle_run_parses_persistent_screenshot_expect_code() {
+        assert!(matches!(
+            parse_bottle_run("doom", "doom.exe", &["--persistent", "--max-api", "1000"]),
+            BottleCommand::Run {
+                persistent: true,
+                max_api: Some(1000),
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_bottle_run("doom", "doom.exe", &["--screenshot", "out.bmp"]),
+            BottleCommand::Run {
+                screenshot: Some(ref out),
+                ..
+            } if out == std::path::Path::new("out.bmp")
+        ));
+        assert!(matches!(
+            parse_bottle_run("doom", "doom.exe", &["--expect-code", "7"]),
+            BottleCommand::Run { expect_code: 7, .. }
+        ));
+    }
+
+    /// `bottle run <name> <exe>` with no mode flag is the micro default — the
+    /// exact behavior preserved from before the shared dispatch refactor.
+    #[test]
+    fn bottle_run_default_is_micro() {
+        assert!(matches!(
+            parse_bottle_run("doom", "doom.exe", &[]),
+            BottleCommand::Run {
+                gui: false,
+                console: false,
+                persistent: false,
+                screenshot: None,
+                max_api: None,
+                expect_code: 0,
+                ..
+            }
+        ));
+    }
+
+    /// The shared dispatch gives GUI precedence over the lower modes and
+    /// enforces the micro-only flag rules — the same contract for `bottle run`
+    /// and `run --bottle`.
+    #[test]
+    fn run_entry_gui_precedence_and_micro_only_rejections() {
+        // GUI is selected over the (also-set) micro flags, and an input
+        // script that is not a file fails up front in the GUI branch.
+        let script = std::env::temp_dir().join("wie-no-such-script-0.txt");
+        let err = run_entry(
+            std::path::Path::new("app.exe"),
+            None,
+            None,
+            Some(100),
+            0,
+            None,
+            None,
+            None,
+            false,
+            false,
+            true, // gui
+            None,
+            Some(script.clone()),
+            Vec::new(),
+        )
+        .expect_err("gui with a missing input script must fail");
+        assert!(
+            err.to_string().contains("input script not found"),
+            "took the GUI branch: {err}"
+        );
+        // A script without --gui is rejected regardless of mode.
+        let err = run_entry(
+            std::path::Path::new("app.exe"),
+            None,
+            None,
+            Some(100),
+            0,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            Some(script),
+            Vec::new(),
+        )
+        .expect_err("--input-script without --gui must fail");
+        assert!(
+            err.to_string().contains("--input-script requires --gui"),
+            "rejects input script outside gui: {err}"
+        );
+        // Console mode rejects the micro-only --drive-d flag.
+        let err = run_entry(
+            std::path::Path::new("app.exe"),
+            None,
+            None,
+            None,
+            0,
+            Some(std::path::PathBuf::from("/tmp/d")),
+            None,
+            None,
+            false,
+            true, // console
+            false,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect_err("console mode must reject --drive-d");
+        assert!(
+            err.to_string().contains("micro mode"),
+            "console rejects drive-d: {err}"
+        );
+        // The bottle-derived root is allowed on console (no raw --root flag).
+        let root = std::env::temp_dir().join("wie-run-entry-root");
+        let err = run_entry(
+            std::path::Path::new(&root.join("app.exe")),
+            Some(root.clone()),
+            None, // no raw --root flag
+            None,
+            0,
+            None,
+            None,
+            None,
+            false,
+            true, // console
+            false,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect_err("console run with a missing exe must fail at staging");
+        assert!(
+            err.to_string().contains("stat run source"),
+            "console reached the staging/run step (bottle root allowed): {err}"
+        );
     }
 
     /// `--console` + `--persistent` and `--gui` + `--persistent` all parse:
