@@ -8,6 +8,7 @@
 //! `ole_clipboard` submodule; the string arms below dispatch to it.
 
 use crate::clipboard::ClipboardStore;
+use crate::guest_layout::Guid;
 use crate::guest_string::write_utf16_units;
 use crate::{HandlerContext, WinApiHandlerResult};
 use ahash::HashMap;
@@ -410,80 +411,16 @@ fn handle_co_get_class_object(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     }
 }
 
-/// `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}` (uppercase hex, Windows layout:
-/// Data1/Data2/Data3 as little-endian values, Data4 in byte order).
+/// `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}` via the canonical [`Guid`] text
+/// form (`Data1`/`Data2`/`Data3` little-endian in memory, `Data4` byte order).
 fn format_guid(guid: &[u8; 16]) -> String {
-    let b = |i: usize| guid.get(i).copied().unwrap_or(0);
-    let d1 = u32::from_le_bytes([b(0), b(1), b(2), b(3)]);
-    let d2 = u16::from_le_bytes([b(4), b(5)]);
-    let d3 = u16::from_le_bytes([b(6), b(7)]);
-    format!(
-        "{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
-        d1,
-        d2,
-        d3,
-        b(8),
-        b(9),
-        b(10),
-        b(11),
-        b(12),
-        b(13),
-        b(14),
-        b(15)
-    )
+    Guid::from_bytes(*guid).to_string()
 }
 
-/// Parse the `StringFromCLSID` output back into the 16 CLSID bytes.
-///
-/// Data1/Data2/Data3 appear in the string as big-endian hex of the u32/u16
-/// values but are stored little-endian in the GUID; Data4 is byte order.
+/// Parse the `StringFromCLSID` output back into the 16 CLSID bytes
+/// (delegates to [`Guid::parse_windows`]).
 fn parse_guid(s: &str) -> Option<[u8; 16]> {
-    let hex = s.trim().strip_prefix('{')?.strip_suffix('}')?;
-    let parts: Vec<&str> = hex.split('-').collect();
-    if parts.len() != 5 {
-        return None;
-    }
-    let g1 = parts.first()?;
-    let g2 = parts.get(1)?;
-    let g3 = parts.get(2)?;
-    let g4 = parts.get(3)?;
-    let g5 = parts.get(4)?;
-    if g1.len() != 8 || g2.len() != 4 || g3.len() != 4 || g4.len() != 4 || g5.len() != 12 {
-        return None;
-    }
-    let mut out = [0_u8; 16];
-    let d1 = u32::from_str_radix(g1, 16).ok()?;
-    let d2 = u16::from_str_radix(g2, 16).ok()?;
-    let d3 = u16::from_str_radix(g3, 16).ok()?;
-    for (i, v) in d1.to_le_bytes().iter().enumerate() {
-        *out.get_mut(i)? = *v;
-    }
-    for (i, v) in d2.to_le_bytes().iter().enumerate() {
-        *out.get_mut(4 + i)? = *v;
-    }
-    for (i, v) in d3.to_le_bytes().iter().enumerate() {
-        *out.get_mut(6 + i)? = *v;
-    }
-    for (i, pair) in g4.as_bytes().chunks(2).enumerate() {
-        let hi = hex_nibble(pair.first().copied()?)?;
-        let lo = hex_nibble(pair.get(1).copied()?)?;
-        *out.get_mut(8 + i)? = (hi << 4) | lo;
-    }
-    for (i, pair) in g5.as_bytes().chunks(2).enumerate() {
-        let hi = hex_nibble(pair.first().copied()?)?;
-        let lo = hex_nibble(pair.get(1).copied()?)?;
-        *out.get_mut(10 + i)? = (hi << 4) | lo;
-    }
-    Some(out)
-}
-
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
+    Guid::parse_windows(s).map(Guid::to_bytes)
 }
 
 /// `HRESULT PropVariantClear(PROPVARIANT *pvar)` — zeroes the 16-byte

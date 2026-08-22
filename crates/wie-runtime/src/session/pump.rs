@@ -609,6 +609,86 @@ impl QuantumHooks for SessionPumpHooks<'_> {
             // self-tests exit with the failing stage's code and trace the
             // reason through OutputDebugStringA before exiting).
             if exit_code != 0 {
+                // [VER] temporary: dump Doom Retro's s_VERSION (char* at guest
+                // 0x1404bb560) so the failing version check's actual value is visible.
+                {
+                    let engine = core.engine();
+                    let mut p = [0_u8; 8];
+                    if engine.mem_read(0x1404_bb56_0, &mut p).is_ok() {
+                        let sptr = u64::from_le_bytes(p);
+                        let mut s = [0_u8; 96];
+                        let mut out = String::new();
+                        if sptr != 0 && engine.mem_read(sptr, &mut s).is_ok() {
+                            for b in s {
+                                if b == 0 {
+                                    break;
+                                }
+                                out.push(b as char);
+                            }
+                        }
+                        eprintln!(
+                            "[VER] s_VERSION var@0x1404bb560 ptr={sptr:#x} content=\"{out}\""
+                        );
+                        // [VER] temporary: parser line-buffer region hexdump
+                        let mut lb = [0_u8; 128];
+                        if engine.mem_read(0x207f_e500, &mut lb).is_ok() {
+                            let mut hex = String::new();
+                            for (i, b) in lb.iter().enumerate() {
+                                if i % 16 == 0 {
+                                    hex.push_str(&format!(
+                                        "\n[VER] {:06x}:",
+                                        0x207f_e500 + i as u64
+                                    ));
+                                }
+                                let c = if (0x20..0x7f).contains(b) {
+                                    *b as char
+                                } else {
+                                    '.'
+                                };
+                                hex.push_str(&format!(" {:02x}{}", b, c));
+                            }
+                            eprintln!("[VER] LB-REGION{hex}");
+                        }
+                        // [VER] temporary: char-class chain integrity vs exe file
+                        {
+                            let exe = std::fs::read("real_exes/doomretro/doomretro.exe")
+                                .unwrap_or_default();
+                            let va2off = |va: u64| -> Option<usize> {
+                                Some(match va {
+                                    0x1400_0100_0..0x1401_5600_00 => {
+                                        (va - 0x1400_0000_0 - 0x1000 + 0x400) as usize
+                                    }
+                                    0x1401_5600_00..0x1401_b200_00 => {
+                                        (va - 0x1400_0000_0 - 0x1560_00 + 0x1552_00) as usize
+                                    }
+                                    _ => (va - 0x1400_0000_0 - 0x1b20_00 + 0x1b0a_00) as usize,
+                                })
+                            };
+                            for (va, len) in [
+                                (0x1401_b21c_0_u64, 16_u64),
+                                (0x1401_b21d_0_u64, 16),
+                                (0x1401_58f_d0_u64, 32),
+                            ] {
+                                let mut g = vec![0_u8; len as usize];
+                                if engine.mem_read(va, &mut g).is_ok() {
+                                    if let Some(o) = va2off(va) {
+                                        let f = exe.get(o..o + len as usize).unwrap_or(&[]);
+                                        eprintln!(
+                                            "[VER] CHAIN va={va:#x} guest={:02x?} file={:02x?} match={}",
+                                            g,
+                                            f,
+                                            g == f
+                                        );
+                                    }
+                                } else {
+                                    eprintln!("[VER] CHAIN va={va:#x} UNREADABLE");
+                                }
+                            }
+                        }
+                    } else {
+                        eprintln!("[VER] s_VERSION slot unreadable");
+                    }
+                }
                 tracing::error!(
                     exit_code,
                     "guest exited with a non-zero code (see the guest's OutputDebugStringA trace for the failing stage)"

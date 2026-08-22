@@ -1,9 +1,9 @@
 use super::{
     Context, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_READ_FAULT, FAKE_STDERR_HANDLE,
     FAKE_STDIN_HANDLE, FAKE_STDOUT_HANDLE, HandlerContext, OpenGuestFile, Result,
-    WinApiHandlerResult, find_open_file, find_open_file_mut, is_main_module_path,
-    is_open_file_handle, maybe_promote_open_file_to_streaming, persist_open_file_to_host,
-    read_stack_u64, refill_stdin_from_host, write_guest_u32,
+    WinApiHandlerResult, find_open_file, find_open_file_mut, guest_basename, is_main_module_path,
+    is_open_file_handle, maybe_promote_open_file_to_streaming, paths_match_guest,
+    persist_open_file_to_host, read_stack_u64, refill_stdin_from_host, write_guest_u32,
 };
 
 pub(crate) fn is_console_output_handle(handle: u64) -> bool {
@@ -101,127 +101,162 @@ pub fn handle_read_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
         return ctx.finish(0);
     }
 
-    let success = is_open_file_handle(state, handle);
+    // Single classification lookup: existence + streaming flag (replaces the
+    // separate `is_open_file_handle` probe).
+    let streaming = match find_open_file(state, handle) {
+        Some(f) => f.streaming,
+        None => {
+            state.process.last_error = ERROR_INVALID_HANDLE;
+            return ctx.finish(0);
+        }
+    };
 
-    if success {
-        // Best-effort teardown: failure to sync is not fatal.
-        let _ = crate::guest_io_host::sync_host_cursor_from_guest(engine, state, handle).ok();
-        let requested =
-            usize::try_from(bytes_to_read).context("ReadFile byte count does not fit usize")?;
+    // Best-effort teardown: failure to sync is not fatal.
+    let _ = crate::guest_io_host::sync_host_cursor_from_guest(engine, state, handle).ok();
+    let requested =
+        usize::try_from(bytes_to_read).context("ReadFile byte count does not fit usize")?;
 
-        let streaming = find_open_file(state, handle).is_some_and(|f| f.streaming);
-        if streaming {
-            let (host_path, cursor_before, path) = {
-                let open_file =
-                    find_open_file(state, handle).context("open file vanished during ReadFile")?;
-                (
-                    open_file.host_path.clone(),
-                    open_file.cursor,
-                    open_file.path.clone(),
-                )
-            };
-            let Some(host) = host_path else {
-                state.process.last_error = ERROR_INVALID_HANDLE;
-                return ctx.finish(0);
-            };
-            let mut data = vec![0_u8; requested];
-            // Cache an open `File` per handle so streaming ReadFile loops don't
-            // reopen the host file on every 64 KiB chunk.
-            let cached = state
-                .file_io
-                .cached_streams
-                .get(&handle)
-                .cloned()
-                .or_else(|| {
-                    let f = crate::vfs::open_stream_cached(&host).ok()?;
-                    state.file_io.cached_streams.insert(handle, f.clone());
-                    Some(f)
-                });
-            let n = if let Some(ref f) = cached {
-                crate::vfs::cached_read_at(f, cursor_before, &mut data).unwrap_or(0)
-            } else {
-                crate::vfs::host_read_at(&host, cursor_before, &mut data).unwrap_or(0)
-            };
-            data.truncate(n);
-            engine
-                .mem_write(buffer_va, &data)
-                .context("failed to write ReadFile stream bytes")?;
-            if let Some(open_file) = find_open_file_mut(state, handle) {
-                open_file.cursor = cursor_before.saturating_add(u64::try_from(n).unwrap_or(0));
-            }
-            if bytes_read_va != 0 {
-                write_guest_u32(engine, bytes_read_va, u32::try_from(n).unwrap_or(0))?;
-            }
-            if is_main_module_path(state, &path) {
-                state.file_io.executable_file_cursor =
-                    cursor_before.saturating_add(u64::try_from(n).unwrap_or(0));
-            }
-            state.process.last_error = 0;
+    if streaming {
+        let (host_path, cursor_before, path) = {
+            let open_file =
+                find_open_file(state, handle).context("open file vanished during ReadFile")?;
+            (
+                open_file.host_path.clone(),
+                open_file.cursor,
+                open_file.path.clone(),
+            )
+        };
+        let Some(host) = host_path else {
+            state.process.last_error = ERROR_INVALID_HANDLE;
+            return ctx.finish(0);
+        };
+        let mut data = vec![0_u8; requested];
+        // Cache an open `File` per handle so streaming ReadFile loops don't
+        // reopen the host file on every 64 KiB chunk.
+        let cached = state
+            .file_io
+            .cached_streams
+            .get(&handle)
+            .cloned()
+            .or_else(|| {
+                let f = crate::vfs::open_stream_cached(&host).ok()?;
+                state.file_io.cached_streams.insert(handle, f.clone());
+                Some(f)
+            });
+        let n = if let Some(ref f) = cached {
+            crate::vfs::cached_read_at(f, cursor_before, &mut data).unwrap_or(0)
         } else {
-            // Phase 1: advance cursor and capture slice bounds without cloning the path/body.
-            let (start, end, cursor_after, is_exe) = {
-                let (cursor_usize, end, cursor_after, path_for_exe) = {
-                    let open_file = find_open_file_mut(state, handle)
-                        .context("open file vanished during ReadFile")?;
+            crate::vfs::host_read_at(&host, cursor_before, &mut data).unwrap_or(0)
+        };
+        data.truncate(n);
+        engine
+            .mem_write(buffer_va, &data)
+            .context("failed to write ReadFile stream bytes")?;
+        if let Some(open_file) = find_open_file_mut(state, handle) {
+            open_file.cursor = cursor_before.saturating_add(u64::try_from(n).unwrap_or(0));
+        }
+        if bytes_read_va != 0 {
+            write_guest_u32(engine, bytes_read_va, u32::try_from(n).unwrap_or(0))?;
+        }
+        if is_main_module_path(state, &path) {
+            state.file_io.executable_file_cursor =
+                cursor_before.saturating_add(u64::try_from(n).unwrap_or(0));
+        }
+        state.process.last_error = 0;
+    } else {
+        // Buffered path: exe-flag strings are cloned before the single
+        // mutable borrow so no extra hash lookups are needed inside.
+        let is_exe_of = {
+            let p = &state.process;
+            let main_path = p.main_module_path.clone();
+            let main_name = p.main_module_file_name.clone();
+            move |pg: &str| {
+                paths_match_guest(pg, &main_path)
+                    || guest_basename(pg).eq_ignore_ascii_case(&main_name)
+            }
+        };
+        // Phase 1: advance cursor and capture slice bounds without cloning the path/body.
+        let (start, end, cursor_after, is_exe, path_disp) = {
+            let (cursor_usize, end, cursor_after, path_for_exe) = {
+                let open_file = find_open_file_mut(state, handle)
+                    .context("open file vanished during ReadFile")?;
 
-                    let cursor_before = open_file.cursor;
-                    let cursor_usize =
-                        usize::try_from(cursor_before).context("file cursor does not fit usize")?;
-                    let available = open_file.bytes.len().saturating_sub(cursor_usize);
-                    let read_len = requested.min(available);
-                    let end = cursor_usize
-                        .checked_add(read_len)
-                        .context("ReadFile end offset overflow")?;
-                    let read_len_u64 =
-                        u64::try_from(read_len).context("ReadFile byte count does not fit u64")?;
-                    open_file.cursor = cursor_before
-                        .checked_add(read_len_u64)
-                        .context("ReadFile cursor overflow")?;
-                    (cursor_usize, end, open_file.cursor, open_file.path.clone())
-                };
-                let is_exe = is_main_module_path(state, &path_for_exe);
-                (cursor_usize, end, cursor_after, is_exe)
+                let cursor_before = open_file.cursor;
+                let cursor_usize =
+                    usize::try_from(cursor_before).context("file cursor does not fit usize")?;
+                let available = open_file.bytes.len().saturating_sub(cursor_usize);
+                let read_len = requested.min(available);
+                let end = cursor_usize
+                    .checked_add(read_len)
+                    .context("ReadFile end offset overflow")?;
+                let read_len_u64 =
+                    u64::try_from(read_len).context("ReadFile byte count does not fit u64")?;
+                open_file.cursor = cursor_before
+                    .checked_add(read_len_u64)
+                    .context("ReadFile cursor overflow")?;
+                (cursor_usize, end, open_file.cursor, open_file.path.clone())
             };
+            let is_exe = is_exe_of(&path_for_exe);
+            (cursor_usize, end, cursor_after, is_exe, path_for_exe)
+        };
 
-            // Phase 2: immutable borrow for zero-copy mem_write of the file slice.
-            {
-                let open_file = find_open_file(state, handle)
-                    .context("open file vanished during ReadFile write")?;
-                let data = open_file
-                    .bytes
-                    .get(start..end)
-                    .context("ReadFile slice out of range")?;
-                engine
-                    .mem_write(buffer_va, data)
-                    .context("failed to write ReadFile bytes")?;
-
-                let read_len_u32 =
-                    u32::try_from(data.len()).context("ReadFile byte count does not fit u32")?;
-                if bytes_read_va != 0 {
-                    write_guest_u32(engine, bytes_read_va, read_len_u32)?;
+        // Phase 2: immutable borrow for zero-copy mem_write of the file slice.
+        {
+            let open_file =
+                find_open_file(state, handle).context("ReadFile write: open file vanished")?;
+            // [VER] temporary: which doomretro.wad offsets does the guest read?
+            if open_file.path.contains("doomretro.wad") {
+                eprintln!(
+                    "[VER] READ doomretro.wad off={start:#x} len={} buffer_va={buffer_va:#x}",
+                    end - start
+                );
+                // [VER] temporary: dump the DEHACKED lump read as delivered to guest
+                if start == 0xc && end - start >= 48 {
+                    let head: String = open_file.bytes[start..start + 40]
+                        .iter()
+                        .map(|&b| {
+                            if (0x20..0x7f).contains(&b) {
+                                b as char
+                            } else {
+                                '.'
+                            }
+                        })
+                        .collect();
+                    eprintln!("[VER] DEHACKED read head: {head:?}");
                 }
             }
+            let data = open_file
+                .bytes
+                .get(start..end)
+                .context("ReadFile slice out of range")?;
+            engine
+                .mem_write(buffer_va, data)
+                .context("failed to write ReadFile bytes")?;
 
-            if is_exe {
-                state.file_io.executable_file_cursor = cursor_after;
+            let read_len_u32 =
+                u32::try_from(data.len()).context("ReadFile byte count does not fit u32")?;
+            if bytes_read_va != 0 {
+                write_guest_u32(engine, bytes_read_va, read_len_u32)?;
             }
-
-            state.process.last_error = 0;
-            // Best-effort teardown: failure to sync is not fatal.
-            let _ = crate::guest_io_host::sync_slot_from_host(engine, state, handle).ok();
         }
-    } else {
-        state.process.last_error = ERROR_INVALID_HANDLE;
+
+        if is_exe {
+            state.file_io.executable_file_cursor = cursor_after;
+        }
+
+        state.process.last_error = 0;
+        // Best-effort teardown: failure to sync is not fatal.
+        let _ = crate::guest_io_host::sync_slot_from_host(engine, state, handle).ok();
+        // The read side of the open/read chain: one line per real-file read
+        // (the console paths return earlier). Failures return before this
+        // point, so reaching here means success.
+        tracing::info!(handle, path = %path_disp, ret = 1_u64, "ReadFile");
     }
 
-    let return_value = u64::from(success);
     // The read side of the open/read chain: one line per real-file read (the
-    // console paths return earlier) — a repro's log ends HERE with ret = 0
-    // when the read fails, or never reaches this line when the guest does not
-    // call ReadFile at all.
-    if let Some(open_file) = find_open_file(state, handle) {
-        tracing::info!(handle, path = %open_file.path, ret = return_value, "ReadFile");
-    }
+    // console paths return earlier) — see the buffered branch's info! line.
+    // Failures return earlier, so reaching this line means success.
+    let return_value = 1_u64;
     ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!WriteFile`.

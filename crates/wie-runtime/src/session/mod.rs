@@ -909,21 +909,15 @@ mod tests {
         };
         let bmi_va = SCRATCH_VA + 0x100;
         let bits_out_va = SCRATCH_VA + 0x200;
-        engine
-            .mem_write(bmi_va, &40_u32.to_le_bytes())
-            .expect("biSize");
-        engine
-            .mem_write(bmi_va + 4, &320_i32.to_le_bytes())
-            .expect("biWidth");
-        engine
-            .mem_write(bmi_va + 8, &(-200_i32).to_le_bytes())
-            .expect("biHeight (top-down)");
-        engine
-            .mem_write(bmi_va + 12, &1_u16.to_le_bytes())
-            .expect("biPlanes");
-        engine
-            .mem_write(bmi_va + 14, &32_u16.to_le_bytes())
-            .expect("biBitCount");
+        // One contiguous BITMAPINFOHEADER staging buffer instead of five
+        // scattered slot writes; field offsets follow wingdi.h.
+        let mut bmi = [0_u8; 40];
+        bmi[0..4].copy_from_slice(&40_u32.to_le_bytes()); // biSize
+        bmi[4..8].copy_from_slice(&320_i32.to_le_bytes()); // biWidth
+        bmi[8..12].copy_from_slice(&(-200_i32).to_le_bytes()); // biHeight (top-down)
+        bmi[12..14].copy_from_slice(&1_u16.to_le_bytes()); // biPlanes
+        bmi[14..16].copy_from_slice(&32_u16.to_le_bytes()); // biBitCount
+        engine.mem_write(bmi_va, &bmi).expect("BITMAPINFOHEADER");
         let (hbitmap, dib_bits_va) = {
             let mut st = handle.state.lock().expect("lock");
             write_regs(&mut engine, mem_dc, bmi_va, 0, bits_out_va);

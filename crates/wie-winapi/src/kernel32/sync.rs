@@ -168,6 +168,37 @@ pub(crate) fn try_enter_critical_section_guest(
     cs: u64,
     owner_tid: u32,
 ) -> Result<EnterCsResult> {
+    let me = u64::from(owner_tid);
+
+    // Fast path: one soft-translate of the contiguous 16-byte field block
+    // (LockCount/RecursionCount/OwningThread) — native field ops instead of
+    // ~6 per-access page walks. CRS structs are plain RW guest data, so the
+    // write-span is always resolvable when the CS is mapped.
+    // SAFETY: host_span validated 16 writable bytes at `cs + 8`; the pointers
+    // stay valid for the duration of this call (same contract as mem_copy).
+    #[expect(unsafe_code)]
+    unsafe {
+        if let Some(base) = engine.host_span(cs + CS_LOCK_COUNT, 16, true) {
+            let lock = base as *mut u32;
+            let recursion = base.add(4) as *mut u32;
+            let owner = base.add(8) as *mut u64;
+            let owning = *owner;
+            if owning == 0 || owning == me {
+                if owning == 0 {
+                    *lock = 0;
+                    *recursion = 1;
+                    *owner = me;
+                } else {
+                    *lock = (*lock).wrapping_add(1);
+                    *recursion = (*recursion).wrapping_add(1);
+                }
+                return Ok(EnterCsResult::Acquired);
+            }
+            // Contended: park host (session waits on CS queue, then retries).
+            return Ok(EnterCsResult::NeedPark);
+        }
+    }
+
     let lock_va = checked_address(cs, CS_LOCK_COUNT, "LockCount");
     let recursion_va = checked_address(cs, CS_RECURSION_COUNT, "RecursionCount");
     let owner_va = checked_address(cs, CS_OWNING_THREAD, "OwningThread");
@@ -203,6 +234,32 @@ pub(crate) fn leave_critical_section_guest(
     cs: u64,
     owner_tid: u32,
 ) -> Result<bool> {
+    let me = u64::from(owner_tid);
+
+    // Fast path: one soft-translate of the 16-byte field block (see enter).
+    // SAFETY: host_span validated 16 writable bytes at `cs + 8`.
+    #[expect(unsafe_code)]
+    unsafe {
+        if let Some(base) = engine.host_span(cs + CS_LOCK_COUNT, 16, true) {
+            let lock = base as *mut u32;
+            let recursion = base.add(4) as *mut u32;
+            let owner = base.add(8) as *mut u64;
+            if *owner != me {
+                // Windows: leaving a CS you do not own is undefined; ignore.
+                return Ok(false);
+            }
+            if *recursion <= 1 {
+                *lock = u32::MAX; // -1 unlocked
+                *recursion = 0;
+                *owner = 0;
+                return Ok(true);
+            }
+            *lock = (*lock).wrapping_sub(1);
+            *recursion = (*recursion).wrapping_sub(1);
+            return Ok(false);
+        }
+    }
+
     let lock_va = checked_address(cs, CS_LOCK_COUNT, "LockCount");
     let recursion_va = checked_address(cs, CS_RECURSION_COUNT, "RecursionCount");
     let owner_va = checked_address(cs, CS_OWNING_THREAD, "OwningThread");

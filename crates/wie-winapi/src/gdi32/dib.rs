@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 
 use crate::gdi32::blit::{IRect, resolve_dest_info};
 use crate::guest_layout::BitmapInfoHeader;
-use crate::guest_memory::{checked_address, read_u32, read_u64, with_typed_write};
+use crate::guest_memory::{checked_address, read_typed_copy, read_u32, read_u64, with_typed_write};
 use crate::handles::Hbitmap;
 use crate::user32::low_i32;
 use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
@@ -297,8 +297,7 @@ pub fn handle_set_dib_bits(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
 /// Read the destination geometry from a `BITMAPINFO` header.
 ///
 /// Returns `(image_width, image_height, bottom_up, bit_count)`; `None` when the
-/// header is absent or has no valid 24/32-bpp image. `biWidth` @+4, `biHeight`
-/// @+8 (signed; negative = top-down), `biBitCount` @+14.
+/// header is absent or has no valid 24/32-bpp image.
 fn read_bmi_geometry(
     engine: &mut dyn wie_cpu::CpuEngine,
     lpbi: u64,
@@ -306,13 +305,15 @@ fn read_bmi_geometry(
     if lpbi == 0 {
         return Ok(None);
     }
-    let mut b = [0_u8; 16];
-    if engine.mem_read(lpbi, &mut b).is_err() {
+    // A failed read means the guest buffer is unmapped — same "no usable
+    // header" outcome as the validation below (`BitmapInfoHeader` is all
+    // scalar fields, so `FromBytes` itself cannot reject a bit pattern).
+    let Ok(header) = read_typed_copy::<BitmapInfoHeader>(engine, lpbi) else {
         return Ok(None);
-    }
-    let w = i32::from_le_bytes(b[4..8].try_into().unwrap_or([0; 4]));
-    let h = i32::from_le_bytes(b[8..12].try_into().unwrap_or([0; 4]));
-    let bpp = u16::from_le_bytes(b[14..16].try_into().unwrap_or([0; 2]));
+    };
+    let w = header.bi_width;
+    let h = header.bi_height;
+    let bpp = header.bi_bit_count;
     if w <= 0 || h == 0 || (bpp != 24 && bpp != 32) {
         return Ok(None);
     }

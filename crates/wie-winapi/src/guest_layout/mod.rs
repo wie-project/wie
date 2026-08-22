@@ -21,6 +21,7 @@
 mod comdlg32;
 mod core;
 mod gdi32;
+mod guid;
 mod kernel32;
 mod print_lane;
 mod user32;
@@ -28,6 +29,7 @@ mod user32;
 pub(crate) use comdlg32::*;
 pub(crate) use core::*;
 pub(crate) use gdi32::*;
+pub(crate) use guid::*;
 pub(crate) use kernel32::*;
 pub(crate) use print_lane::*;
 pub(crate) use user32::*;
