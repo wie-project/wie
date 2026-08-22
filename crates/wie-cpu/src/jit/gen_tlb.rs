@@ -78,31 +78,39 @@ where
     /// Way search + generation compare (same arithmetic as the old scalar
     /// `tlb_bucket_lookup_scalar`).
     ///
-    /// `allow` runs last per way so the caller keeps its own validity rules on
-    /// the value (non-null host base, R/W prot bits) without making `GenTlb`
-    /// value-type-aware. Predicates are order-independent and the way tags are
-    /// unique, so this is behavior-identical to the old inline loop.
+    /// Branchless way select: each way folds its tag- and generation-match
+    /// predicates into one bit, and `pick` becomes `way + 1` (0 = miss). The
+    /// `+1` offset lets way 0 be a valid match while 0 still unambiguously
+    /// means miss. Tags are unique (`insert` refreshes in place), so at most
+    /// one way matches and "first match wins" equals "only match". The scan is
+    /// straight-line arithmetic with a single exit branch instead of up to 2
+    /// mispredictable `continue`s per way — TLB-way scans run on every TLB
+    /// miss, where the winning way varies with the access stream.
+    ///
+    /// `allow` runs once, on the selected way only, so the caller keeps its own
+    /// validity rules on the value (non-null host base, R/W prot bits) without
+    /// making `GenTlb` value-type-aware. Predicates are order-independent and
+    /// the way tags are unique, so this is behavior-identical to the old
+    /// inline loop.
     #[inline]
     pub(super) fn lookup<F>(&self, key: K, stamp: u64, mut allow: F) -> Option<V>
     where
         F: FnMut(V) -> bool,
     {
         let s = self.sets.get(self.set_index(key))?;
+        let mut pick = 0_usize; // 0 = miss; else (winning way + 1)
         for way in 0..WAYS {
-            if s.tags.get(way).copied() != Some(key) {
-                continue;
-            }
-            if s.gens.get(way).copied() != Some(stamp) {
-                continue;
-            }
-            let Some(value) = s.values.get(way).copied() else {
-                continue;
-            };
-            if allow(value) {
-                return Some(value);
-            }
+            let m = usize::from(
+                s.tags.get(way).copied() == Some(key) && s.gens.get(way).copied() == Some(stamp),
+            );
+            pick |= m * (way + 1);
         }
-        None
+        if pick == 0 {
+            return None;
+        }
+        let way = pick - 1;
+        let value = s.values.get(way).copied()?;
+        if allow(value) { Some(value) } else { None }
     }
 
     /// Refresh-if-present, else round-robin victim install (`rr & (WAYS-1)`).

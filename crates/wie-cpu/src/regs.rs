@@ -468,17 +468,20 @@ impl RegFile {
         }
     }
 
-    /// Set or clear the flags in `mask`.
+    /// Set or clear the flags in `mask`, branchlessly.
+    ///
+    /// `on` selects between the mask and zero arithmetically: `0 - on` wraps to
+    /// all-ones when `on` is true and 0 when false, so `mask & (0 - on)` is
+    /// `mask` or `0`. The per-flag `if` would otherwise be a data-dependent
+    /// branch executed ~6 times per arithmetic op in the interpreter.
+    /// (No `|= ALWAYS1` here: bit 1 does not overlap any flag mask defined on
+    /// `Rflags`, so a per-flag re-assert is pure overhead; the invariant is
+    /// instead established at every wholesale RFLAGS assignment via
+    /// [`Self::set_rflags_checked`].)
     pub(crate) fn set_flag(&mut self, mask: Rflags, on: bool) {
-        // No `|= ALWAYS1` here: bit 1 does not overlap any flag mask defined on
-        // `Rflags`, so a per-flag re-assert is pure overhead (6 redundant
-        // OR+stores per arithmetic op). The invariant is instead established at
-        // every wholesale RFLAGS assignment via [`Self::set_rflags_checked`].
-        if on {
-            self.rflags |= mask;
-        } else {
-            self.rflags &= !mask;
-        }
+        let m = u64::from(mask);
+        let sel = m & 0_u64.wrapping_sub(u64::from(on));
+        self.rflags = Rflags::from((u64::from(self.rflags) & !m) | sel);
     }
 
     /// Assign the whole RFLAGS word, re-asserting the architectural reserved

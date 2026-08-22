@@ -127,6 +127,8 @@ pub(super) fn classify_addr_vs_pins(ctx: &mut JitCtx, addr: u64, size: usize) {
 /// Why multi sticky would miss (first failing predicate; exclusive buckets).
 pub(super) fn classify_sticky_miss(ctx: &mut JitCtx, page_key: u64, write: bool) {
     let cur_gen = ctx.mem_gen;
+    // `write` is loop-invariant; fold it into a permission mask once.
+    let need = if write { TLB_PROT_W } else { TLB_PROT_R };
     let mut saw_key = false;
     let mut saw_gen = false;
     for w in 0..STICKY_WAYS {
@@ -147,7 +149,7 @@ pub(super) fn classify_sticky_miss(ctx: &mut JitCtx, page_key: u64, write: bool)
             continue;
         }
         let prot = u8::try_from(ctx.sticky_prot.get(w).copied().unwrap_or(0)).unwrap_or(0);
-        if !tlb_prot_allows(prot, write) {
+        if !tlb_prot_allows(prot, need) {
             ctx.mem_path.sticky_miss_prot = ctx.mem_path.sticky_miss_prot.saturating_add(1);
             return;
         }
@@ -163,13 +165,18 @@ pub(super) fn classify_sticky_miss(ctx: &mut JitCtx, page_key: u64, write: bool)
     }
 }
 
+/// Software R/W check against a precomputed `need` mask (`TLB_PROT_R` /
+/// `TLB_PROT_W`).
+///
+/// Callers fold the `write` branch into `need` once per helper invocation,
+/// hoisting it out of the per-way TLB scans below; each way check then stays
+/// a single arithmetic bit test. Mirrors the IR-side fold in
+/// [`sticky_tlb_probe`](crate::jit::lower::gpr::sticky_tlb_probe), which
+/// computes `need = if write { TLB_PROT_W } else { TLB_PROT_R }` so the
+/// emitted probes share one permission vocabulary.
 #[inline]
-pub(super) fn tlb_prot_allows(prot: u8, write: bool) -> bool {
-    if write {
-        (u64::from(prot) & TLB_PROT_W) != 0
-    } else {
-        (u64::from(prot) & TLB_PROT_R) != 0
-    }
+pub(super) fn tlb_prot_allows(prot: u8, need: u64) -> bool {
+    (u64::from(prot) & need) != 0
 }
 
 pub(super) fn pack_tlb_prot(allow_r: bool, allow_w: bool) -> u8 {
@@ -199,6 +206,8 @@ pub(super) fn pin_resolve(
     let va = GuestVa::new(addr);
     let end = va.checked_add(size_u)?;
     let cur_gen = ctx.mem_gen;
+    // `write` is loop-invariant; fold it into a permission mask once.
+    let need = if write { TLB_PROT_W } else { TLB_PROT_R };
     // Copy the matching pin out so the TLB can be mutated afterwards.
     // Previously a positional `(u64, u64, u64, u8)` tuple whose meaning lived
     // in a trailing comment — transposing guest_base and host_base there would
@@ -212,7 +221,7 @@ pub(super) fn pin_resolve(
             continue;
         }
         let prot = u8::try_from(pin.allow).unwrap_or(0);
-        if !tlb_prot_allows(prot, write) {
+        if !tlb_prot_allows(prot, need) {
             continue;
         }
         matched = Some((*pin, prot));
@@ -255,10 +264,13 @@ pub(super) fn tlb_bucket_lookup(
     write: bool,
     cur_gen: u64,
 ) -> Option<(*mut u8, u8)> {
+    // `write` is loop-invariant here; precompute the permission mask once so
+    // the per-way scans below only do arithmetic bit tests.
+    let need = if write { TLB_PROT_W } else { TLB_PROT_R };
     if !JitConfig::get().tlb_neon_enabled() {
         return tlb
             .lookup(page_key, cur_gen, |v| {
-                !v.host.is_null() && tlb_prot_allows(v.prot, write)
+                !v.host.is_null() && tlb_prot_allows(v.prot, need)
             })
             .map(|v| (v.host, v.prot));
     }
@@ -283,7 +295,7 @@ pub(super) fn tlb_bucket_lookup(
         if s.gens.get(way).copied() != Some(cur_gen) {
             return None;
         }
-        if !tlb_prot_allows(v.prot, write) {
+        if !tlb_prot_allows(v.prot, need) {
             return None;
         }
         Some((v.host, v.prot))
@@ -291,7 +303,7 @@ pub(super) fn tlb_bucket_lookup(
     #[cfg(not(target_arch = "aarch64"))]
     {
         tlb.lookup(page_key, cur_gen, |v| {
-            !v.host.is_null() && tlb_prot_allows(v.prot, write)
+            !v.host.is_null() && tlb_prot_allows(v.prot, need)
         })
         .map(|v| (v.host, v.prot))
     }
@@ -353,25 +365,38 @@ pub(super) unsafe fn tlb_page_ptr(
     let page_key = addr >> 12; // PAGE_SIZE = 0x1000
     let cur_gen = ctx.mem_gen;
     // Multi sticky hit first (matches inline IR fast path).
+    //
+    // Branchless way select (same predicate folding as the inline
+    // `sticky_tlb_probe` IR): each way folds key / gen / prot / non-null into
+    // one bit, and `pick` becomes `winning_way + 1` (0 = miss). The scan is
+    // straight-line arithmetic with a single exit branch instead of up to 4
+    // mispredictable `continue`s per way — sticky probes fire on the TLB-miss
+    // helper path, where the way index varies with the access stream.
+    let need = if write { TLB_PROT_W } else { TLB_PROT_R };
+    let mut pick = 0_usize; // 0 = miss; else (winning way + 1)
     for w in 0..STICKY_WAYS {
-        if ctx.sticky_page.get(w).copied() != Some(page_key) {
-            continue;
-        }
+        let key_ok = ctx.sticky_page.get(w).copied() == Some(page_key);
         let host = ctx
             .sticky_ptr
             .get(w)
             .copied()
             .unwrap_or(std::ptr::null_mut());
-        if host.is_null() {
-            continue;
-        }
-        if ctx.sticky_gen.get(w).copied() != Some(cur_gen) {
-            continue;
-        }
+        let gen_ok = ctx.sticky_gen.get(w).copied() == Some(cur_gen);
         let prot = u8::try_from(ctx.sticky_prot.get(w).copied().unwrap_or(0)).unwrap_or(0);
-        if !tlb_prot_allows(prot, write) {
-            continue;
-        }
+        let m = usize::from(key_ok & gen_ok & !host.is_null() & tlb_prot_allows(prot, need));
+        pick |= m * (w + 1);
+    }
+    if pick == 0 {
+        classify_sticky_miss(ctx, page_key, write);
+    } else {
+        let w = pick - 1;
+        // Re-fetch the winning way by index — no per-way select branch.
+        let host = ctx
+            .sticky_ptr
+            .get(w)
+            .copied()
+            .unwrap_or(std::ptr::null_mut());
+        let prot = u8::try_from(ctx.sticky_prot.get(w).copied().unwrap_or(0)).unwrap_or(0);
         ctx.mem_path.sticky_hit = ctx.mem_path.sticky_hit.saturating_add(1);
         // Keep last-hit mirror coherent with the way that hit.
         ctx.tlb_hot_page = page_key;
@@ -381,7 +406,6 @@ pub(super) unsafe fn tlb_page_ptr(
         // SAFETY: sticky ptr is a mapped page base; access stays in-page; SPC bits match.
         return Some(unsafe { host.add(page_off) });
     }
-    classify_sticky_miss(ctx, page_key, write);
     let hit = tlb_bucket_lookup(&ctx.tlb, page_key, write, cur_gen);
     if let Some((page_base, prot)) = hit {
         ctx.mem_path.multi_hit = ctx.mem_path.multi_hit.saturating_add(1);
@@ -409,7 +433,7 @@ pub(super) unsafe fn tlb_page_ptr(
     let prot = pack_tlb_prot(entry.allow_r, entry.allow_w);
     tlb_install(ctx, page_key, entry.host, prot, entry.generation);
     tlb_set_hot(ctx, page_key, entry.host, prot, entry.generation);
-    if !tlb_prot_allows(prot, write) {
+    if !tlb_prot_allows(prot, need) {
         ctx.mem_path.slow = ctx.mem_path.slow.saturating_add(1);
         return None;
     }

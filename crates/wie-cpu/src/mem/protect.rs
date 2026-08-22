@@ -92,38 +92,58 @@ impl PageProtect {
         }
     }
 
-    /// Whether a data read is permitted.
+    /// 3-bit rwx mask (bit0 read, bit1 write, bit2 execute) of this protection.
+    ///
+    /// Encoding permissions as bits lets every `allows_*` check be one branchless
+    /// bit test instead of a `matches!` chain over the variants. Bit positions
+    /// intentionally match [`crate::perm`] so `PageProtect` and `RwxPerms` share
+    /// one vocabulary (their *values* remain distinct types, see type docs).
+    #[must_use]
+    pub fn rwx(self) -> u8 {
+        use crate::perm::{EXEC, READ, WRITE};
+        match self {
+            Self::NoAccess => 0,
+            Self::ReadOnly => READ as u8,
+            Self::ReadWrite => (READ | WRITE) as u8,
+            Self::Execute => EXEC as u8,
+            Self::ExecuteRead => (READ | EXEC) as u8,
+            Self::ExecuteReadWrite => (READ | WRITE | EXEC) as u8,
+        }
+    }
+
+    /// rwx bit (1/2/4) selected by `kind`.
+    #[must_use]
+    fn kind_rwx_bit(kind: AccessKind) -> u8 {
+        use crate::perm::{EXEC, READ, WRITE};
+        match kind {
+            AccessKind::Read => READ as u8,
+            AccessKind::Write => WRITE as u8,
+            AccessKind::Execute => EXEC as u8,
+        }
+    }
+
+    /// Whether a data read is permitted (bit test on [`Self::rwx`]).
     #[must_use]
     pub fn allows_read(self) -> bool {
-        matches!(
-            self,
-            Self::ReadOnly | Self::ReadWrite | Self::ExecuteRead | Self::ExecuteReadWrite
-        )
+        self.rwx() & crate::perm::READ as u8 != 0
     }
 
-    /// Whether a data write is permitted.
+    /// Whether a data write is permitted (bit test on [`Self::rwx`]).
     #[must_use]
     pub fn allows_write(self) -> bool {
-        matches!(self, Self::ReadWrite | Self::ExecuteReadWrite)
+        self.rwx() & crate::perm::WRITE as u8 != 0
     }
 
-    /// Whether instruction fetch is permitted.
+    /// Whether instruction fetch is permitted (bit test on [`Self::rwx`]).
     #[must_use]
     pub fn allows_execute(self) -> bool {
-        matches!(
-            self,
-            Self::Execute | Self::ExecuteRead | Self::ExecuteReadWrite
-        )
+        self.rwx() & crate::perm::EXEC as u8 != 0
     }
 
-    /// Whether `kind` is permitted.
+    /// Whether `kind` is permitted (bit test on [`Self::rwx`]).
     #[must_use]
     pub fn allows(self, kind: AccessKind) -> bool {
-        match kind {
-            AccessKind::Read => self.allows_read(),
-            AccessKind::Write => self.allows_write(),
-            AccessKind::Execute => self.allows_execute(),
-        }
+        self.rwx() & Self::kind_rwx_bit(kind) != 0
     }
 
     /// Nearest Windows protection for a set of rwx bits.
@@ -245,5 +265,65 @@ mod tests {
         assert_eq!(perm::EXEC, PAGE_READWRITE);
         // …and the combined rwx set is not a valid protection at all.
         assert_eq!(PageProtect::from_win32(RwxPerms::ALL.bits()), None);
+    }
+
+    /// Full 6×3 truth table pinning the bit-test rewrite to the old
+    /// `matches!`-chain semantics (all protections × all access kinds).
+    #[test]
+    fn allows_truth_table_matches_matches_chains() {
+        // Expected values transcribed from the pre-rewrite `matches!` chains.
+        let table = [
+            // (protect, read, write, execute)
+            (PageProtect::NoAccess, false, false, false),
+            (PageProtect::ReadOnly, true, false, false),
+            (PageProtect::ReadWrite, true, true, false),
+            (PageProtect::Execute, false, false, true),
+            (PageProtect::ExecuteRead, true, false, true),
+            (PageProtect::ExecuteReadWrite, true, true, true),
+        ];
+        let kinds = [
+            (AccessKind::Read, 1),
+            (AccessKind::Write, 2),
+            (AccessKind::Execute, 4),
+        ];
+        for &(p, read, write, exec) in &table {
+            assert_eq!(p.allows_read(), read, "{p:?}.allows_read");
+            assert_eq!(p.allows_write(), write, "{p:?}.allows_write");
+            assert_eq!(p.allows_execute(), exec, "{p:?}.allows_execute");
+            for &(kind, bit) in &kinds {
+                assert_eq!(p.allows(kind), p.rwx() & bit != 0, "{p:?}.allows({kind:?})");
+            }
+        }
+    }
+
+    /// `rwx()` encodes each variant with the same bits as [`crate::perm`].
+    #[test]
+    fn rwx_encoding_covers_all_variants() {
+        assert_eq!(PageProtect::NoAccess.rwx(), 0b000);
+        assert_eq!(PageProtect::ReadOnly.rwx(), perm::READ as u8);
+        assert_eq!(
+            PageProtect::ReadWrite.rwx(),
+            (perm::READ | perm::WRITE) as u8
+        );
+        assert_eq!(PageProtect::Execute.rwx(), perm::EXEC as u8);
+        assert_eq!(
+            PageProtect::ExecuteRead.rwx(),
+            (perm::READ | perm::EXEC) as u8
+        );
+        assert_eq!(
+            PageProtect::ExecuteReadWrite.rwx(),
+            (perm::READ | perm::WRITE | perm::EXEC) as u8
+        );
+        // Bit positions match `crate::perm`, so `rwx()` agrees with `to_rwx`.
+        for p in [
+            PageProtect::NoAccess,
+            PageProtect::ReadOnly,
+            PageProtect::ReadWrite,
+            PageProtect::Execute,
+            PageProtect::ExecuteRead,
+            PageProtect::ExecuteReadWrite,
+        ] {
+            assert_eq!(u32::from(p.rwx()), p.to_rwx().bits(), "{p:?}");
+        }
     }
 }
