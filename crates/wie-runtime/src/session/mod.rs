@@ -579,6 +579,91 @@ pub(crate) fn invalid_memory_diagnostic(
     )))
 }
 
+/// Transient `[FAULT]` capture: one tagged line with faulting guest RIP
+/// (resolved to module+offset), faulting address, access kind, and the raw
+/// instruction bytes at RIP for offline disassembly.
+#[cold]
+pub(crate) fn fault_capture(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &wie_winapi::WinApiState,
+    tid: u32,
+    access: &wie_cpu::InvalidMemoryAccess,
+) {
+    let rip = engine.read_rip().unwrap_or(0);
+    let rsp = engine.read_rsp().unwrap_or(0);
+    let regs = [
+        engine.read_rax().unwrap_or(0),
+        engine.read_rcx().unwrap_or(0),
+        engine.read_rdx().unwrap_or(0),
+        engine.read_r8().unwrap_or(0),
+        engine.read_r9().unwrap_or(0),
+    ];
+    let access_kind = match access.access_type {
+        0 => "read",
+        1 => "write",
+        16 => "exec",
+        _ => "?",
+    };
+    let mut module = String::from("?");
+    for m in state.module_state.loaded_modules.values() {
+        if rip >= m.image_base && rip < m.image_base.saturating_add(m.image_size as u64) {
+            module = format!("{} +0x{:x}", m.name, rip - m.image_base);
+            break;
+        }
+    }
+    // Main exe fallback: derive its base from the PE header found by walking
+    // the standard high half (preferred base for PE32+ images).
+    if module == "?" && rip >= 0x10000 {
+        module = format!("<main_exe> +0x{:x}", rip - 0x140000000);
+    }
+    //
+    let mut bytes = [0_u8; 15];
+    let n = engine
+        .mem_read(rip, &mut bytes)
+        .map(|_| bytes.len())
+        .unwrap_or(0);
+    let hex: Vec<String> = bytes[..n].iter().map(|b| format!("{b:02x}")).collect();
+    let resolve = |va: u64| -> Option<String> {
+        for m in state.module_state.loaded_modules.values() {
+            if va >= m.image_base && va < m.image_base.saturating_add(m.image_size as u64) {
+                return Some(format!("{} +0x{:x}", m.name, va - m.image_base));
+            }
+        }
+        None
+    };
+    let mut stack = String::new();
+    for i in 0_u64..40 {
+        let mut b = [0_u8; 8];
+        let va = rsp.wrapping_add(i.wrapping_mul(8));
+        match engine.mem_read(va, &mut b) {
+            Ok(()) => {
+                let v = u64::from_le_bytes(b);
+                let ann = match resolve(v) {
+                    Some(sym) => format!(" <= {sym}"),
+                    None => String::new(),
+                };
+                stack.push_str(&format!(" [{rsp:#x}+{:#x}]={v:#x}{ann}", i * 8))
+            }
+            Err(_) => stack.push_str(&format!(" [{rsp:#x}+{:#x}]=?", i * 8)),
+        }
+    }
+    let msg = format!(
+        "[FAULT] tid={tid:#x} exc={:#x} rip={rip:#x} ({module}) fault_addr={:#x} access={access_kind} size={} insn=[{}] rax={:#x} rcx={:#x} rdx={:#x} r8={:#x} r9={:#x} rbx={:#x} r12={:#x} rsp={rsp:#x}{stack}",
+        access.exception_code,
+        access.address,
+        access.size,
+        hex.join(" "),
+        regs[0],
+        regs[1],
+        regs[2],
+        regs[3],
+        regs[4],
+        engine.read_rbx().unwrap_or(0),
+        engine.read_r12().unwrap_or(0),
+    );
+    tracing::error!("{msg}");
+}
+
 fn journal_api_return(
     index: usize,
     library: &str,
@@ -635,9 +720,11 @@ mod tests {
     use super::top_level_window_rows;
     use crate::memory::DEFAULT_LAYOUT;
     use std::sync::{Arc, Mutex, RwLock};
+    use wie_cpu::{CpuEngine, IcedCpu};
     use wie_pe::ProcessIdentity;
     use wie_winapi::WindowRecord;
     use wie_winapi::handles::Hwnd;
+    use wie_winapi::{HandlerContext, WinApiEnvironment, gdi32, user32};
 
     fn record(handle: u64, parent: u64, title: &str, width: i32, height: i32) -> WindowRecord {
         WindowRecord {
@@ -702,5 +789,240 @@ mod tests {
         let handle = handle_with_windows(Vec::new());
         assert!(handle.guest_top_level_windows().is_empty());
         assert!(top_level_window_rows(&[]).is_empty());
+    }
+
+    // ── Host-window-on-first-frame contract ──────────────────────────────
+
+    /// A fixed scratch address for the guest BITMAPINFO / `*ppvBits` slots,
+    /// far from the runtime layout's process heap (0x1_6000_0000) and stack.
+    const SCRATCH_VA: u64 = 0x0000_0001_7000_0000;
+    /// The test stack top: handlers read stack args at `rsp + 0x28…` and the
+    /// dummy return address at `rsp`.
+    const STACK_TOP: u64 = 0x0000_0001_8000_0000;
+
+    fn write_regs(cpu: &mut IcedCpu, rcx: u64, rdx: u64, r8: u64, r9: u64) {
+        cpu.write_rcx(rcx).ok();
+        cpu.write_rdx(rdx).ok();
+        cpu.write_r8(r8).ok();
+        cpu.write_r9(r9).ok();
+        cpu.write_rsp(STACK_TOP).ok();
+    }
+
+    /// The full "guest rendered its first frame" contract at the seam the
+    /// host presenter reads: a software-renderer blit into a PARENTLESS
+    /// window's DC must publish a frame that `GuestHandle::take_frame` can
+    /// drain, while the window stays visible to the presenter's reconcile
+    /// (`guest_top_level_windows`) and the window-set revision advances so
+    /// the host `Frame` handler's reconcile latch fires.
+    ///
+    /// This mirrors exactly how Doom Retro presents under WIE: its SDL2.dll
+    /// holds the main window's HDC, renders into a DIB section selected into
+    /// a memory DC (`CreateDIBSection` + `CreateCompatibleDC` +
+    /// `SelectObject`), and `SDL_UpdateWindowSurface`'s Windows framebuffer
+    /// updater runs `BitBlt(window_dc ← mem_dc)` — the signature SDL2.dll
+    /// imports from GDI32. Until such a blit publishes a frame there is no
+    /// host window, only a dock icon, so this is the "visible window" proof.
+    #[test]
+    fn top_level_software_blit_publishes_frame_the_host_presenter_drains() {
+        let mut engine = IcedCpu::open_x86_64();
+        // Map a slice of the runtime process heap (the DIB backing buffer
+        // lands there), plus scratch and stack regions for the guest-side
+        // arguments.
+        let heap_base = crate::memory::PROCESS_HEAP_BASE;
+        engine
+            .mem_map(heap_base, 0x10_0000, wie_cpu::RwxPerms::ALL)
+            .expect("map process heap slice");
+        engine
+            .mem_map(SCRATCH_VA, 0x1_0000, wie_cpu::RwxPerms::ALL)
+            .expect("map scratch");
+        engine
+            .mem_map(STACK_TOP, 0x1_000, wie_cpu::RwxPerms::ALL)
+            .expect("map stack");
+        engine
+            .mem_write(STACK_TOP, &0_u64.to_le_bytes())
+            .expect("dummy return address");
+        engine.write_rsp(STACK_TOP).ok();
+
+        let process = ProcessIdentity {
+            module_file_name: "doomretro.exe".to_owned(),
+            module_path: r"C:\Program Files\DoomRetro\doomretro.exe".to_owned(),
+            current_directory: r"C:\Program Files\DoomRetro".to_owned(),
+            command_line: "doomretro.exe".to_owned(),
+        };
+        let mut state =
+            crate::memory::default_winapi_state(&DEFAULT_LAYOUT, Arc::new(Vec::new()), &process)
+                .expect("winapi state");
+
+        // SDL_CreateWindow's main window: parentless and visible, 320×200.
+        let hwnd: u64 = 0x6610_0101;
+        state.window_state().windows.push(WindowRecord {
+            handle: Hwnd::from(hwnd),
+            title: "D00M".to_owned(),
+            visible: true,
+            width: 320,
+            height: 200,
+            ..Default::default()
+        });
+        // Exactly what the CreateWindowExA/W handlers do for parentless
+        // windows: enter the host-visible window set (bumps `windows_rev`, the
+        // Frame handler's reconcile latch).
+        state.present().register_top_level(Hwnd::from(hwnd));
+        let handle = GuestHandle {
+            state: Arc::new(Mutex::new(state)),
+            queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+            menu_tree_cache: Arc::new(RwLock::new(None)),
+            lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
+        };
+        let env = || WinApiEnvironment {
+            image_base: 0,
+            command_line_a_ptr: 0,
+            command_line_w_ptr: 0,
+            environment_strings_w_ptr: 0,
+            module_file_name_a_ptr: 0,
+            module_file_name_w_ptr: 0,
+            process_heap_handle: 0,
+        };
+
+        // GetDC(main) — the window DC SDL's framebuffer updater blits into.
+        let window_dc = {
+            let mut st = handle.state.lock().expect("lock");
+            write_regs(&mut engine, hwnd, 0, 0, 0);
+            let r = user32::handle_get_dc(&mut HandlerContext::new(&mut engine, env(), &mut st))
+                .expect("GetDC");
+            assert_ne!(r.return_value, 0, "GetDC returns a window DC");
+            r.return_value
+        };
+
+        // SDL's framebuffer: a memory DC holding a top-down 320×200 32-bpp
+        // DIB section (CreateCompatibleDC + CreateDIBSection + SelectObject).
+        let mem_dc = {
+            let mut st = handle.state.lock().expect("lock");
+            write_regs(&mut engine, 0, 0, 0, 0);
+            let r = gdi32::handle_create_compatible_dc(&mut HandlerContext::new(
+                &mut engine,
+                env(),
+                &mut st,
+            ))
+            .expect("CreateCompatibleDC");
+            assert_ne!(r.return_value, 0, "memory DC");
+            r.return_value
+        };
+        let bmi_va = SCRATCH_VA + 0x100;
+        let bits_out_va = SCRATCH_VA + 0x200;
+        engine
+            .mem_write(bmi_va, &40_u32.to_le_bytes())
+            .expect("biSize");
+        engine
+            .mem_write(bmi_va + 4, &320_i32.to_le_bytes())
+            .expect("biWidth");
+        engine
+            .mem_write(bmi_va + 8, &(-200_i32).to_le_bytes())
+            .expect("biHeight (top-down)");
+        engine
+            .mem_write(bmi_va + 12, &1_u16.to_le_bytes())
+            .expect("biPlanes");
+        engine
+            .mem_write(bmi_va + 14, &32_u16.to_le_bytes())
+            .expect("biBitCount");
+        let (hbitmap, dib_bits_va) = {
+            let mut st = handle.state.lock().expect("lock");
+            write_regs(&mut engine, mem_dc, bmi_va, 0, bits_out_va);
+            let r = gdi32::handle_create_dib_section(&mut HandlerContext::new(
+                &mut engine,
+                env(),
+                &mut st,
+            ))
+            .expect("CreateDIBSection");
+            assert_ne!(r.return_value, 0, "DIB handle");
+            let mut bits = [0_u8; 8];
+            engine
+                .mem_read(bits_out_va, &mut bits)
+                .expect("read *ppvBits");
+            (r.return_value, u64::from_le_bytes(bits))
+        };
+        assert_ne!(dib_bits_va, 0, "DIB backing buffer");
+        {
+            let mut st = handle.state.lock().expect("lock");
+            write_regs(&mut engine, mem_dc, hbitmap, 0, 0);
+            let _ =
+                gdi32::handle_select_object(&mut HandlerContext::new(&mut engine, env(), &mut st))
+                    .expect("SelectObject");
+        }
+
+        // The renderer painted the whole DIB: BGRA (A=FF, B=0, G=0, R=FF)
+        // → 0RGB red (0x00FF0000) in the present surface.
+        let red_row = vec![0x00_u8, 0x00, 0xFF, 0xFF]; // B, G, R, A bytes → BGRA red
+        let mut dib_bytes = Vec::with_capacity(320 * 200 * 4);
+        for _ in 0..(320 * 200) {
+            dib_bytes.extend_from_slice(&red_row);
+        }
+        engine
+            .mem_write(dib_bits_va, &dib_bytes)
+            .expect("fill DIB pixels");
+
+        // BitBlt(window_dc, 0, 0, 320, 200, mem_dc, 0, 0, SRCCOPY) —
+        // SDL_UpdateWindowSurface's Windows framebuffer blit, 1:1.
+        {
+            let mut st = handle.state.lock().expect("lock");
+            write_regs(&mut engine, window_dc, 0, 0, 320);
+            engine
+                .mem_write(STACK_TOP + 0x28, &200_i32.to_le_bytes())
+                .expect("cy");
+            engine
+                .mem_write(STACK_TOP + 0x30, &mem_dc.to_le_bytes())
+                .expect("hdcSrc");
+            engine
+                .mem_write(STACK_TOP + 0x38, &0_i32.to_le_bytes())
+                .expect("x1");
+            engine
+                .mem_write(STACK_TOP + 0x40, &0_i32.to_le_bytes())
+                .expect("y1");
+            engine
+                .mem_write(STACK_TOP + 0x48, &0x00CC_0020_u32.to_le_bytes())
+                .expect("SRCCOPY rop");
+            let r = gdi32::handle_bit_blt(&mut HandlerContext::new(&mut engine, env(), &mut st))
+                .expect("BitBlt");
+            assert_eq!(r.return_value, 1, "BitBlt succeeds");
+        }
+
+        // The blit deferred a publish (one frame per repaint cycle): nothing
+        // is in the published slot until the runtime drains at the idle
+        // boundary — `take_frame` reads that same slot, so it sees nothing
+        // before the drain.
+        assert!(
+            handle.take_frame(hwnd).is_none(),
+            "the blit defers: nothing published pre-drain"
+        );
+        {
+            let mut st = handle.state.lock().expect("lock");
+            assert!(
+                st.present().drain_pending_publishes() >= 1,
+                "the runtime drain publishes the blit frame"
+            );
+        }
+
+        // The host contract: take_frame drains the frame the presenter's
+        // RedrawRequested reads; the window is a parentless top-level the
+        // reconcile would build a winit window for; the window-set revision
+        // advanced so the host Frame handler's reconcile latch fires.
+        let frame = handle
+            .take_frame(hwnd)
+            .expect("take_frame drains the published frame");
+        assert_eq!((frame.width, frame.height), (320, 200));
+        assert_eq!(frame.pixels.len(), 320 * 200);
+        assert_eq!(
+            frame.pixels[0], 0x00FF_0000,
+            "the blit's red pixels reached the frame"
+        );
+        assert_eq!(
+            handle.guest_top_level_windows(),
+            vec![(hwnd, "D00M".to_owned(), 320, 200)],
+            "the parentless window is visible to the host reconcile"
+        );
+        assert_eq!(
+            handle.windows_rev(),
+            1,
+            "the top-level create bumped the reconcile latch"
+        );
     }
 }

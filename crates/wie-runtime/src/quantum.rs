@@ -428,6 +428,12 @@ impl<'a> QuantumCore<'a> {
                     invalid_memory: result.invalid_memory,
                 };
                 if outcome.invalid_memory.hit {
+                    crate::session::fault_capture(
+                        self.engine,
+                        &guard,
+                        guard.kernel.threads.active.tid,
+                        &outcome.invalid_memory,
+                    );
                     // Route through guest SEH before terminating.
                     match wie_winapi::seh::dispatch_hardware_fault(
                         self.engine,
