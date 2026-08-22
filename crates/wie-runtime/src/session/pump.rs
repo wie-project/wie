@@ -274,7 +274,8 @@ impl<'a> SessionPumpHooks<'a> {
         })?;
 
         tracing::debug!(
-            outer = %format!("{}!{}", pending.outer_library.as_ref(), pending.outer_name.as_ref()),
+            outer_library = %pending.outer_library.as_ref(),
+            outer_name = %pending.outer_name.as_ref(),
             callback = pending.request.callback_address,
             hwnd = pending.request.window_handle,
             message = pending.request.message,
