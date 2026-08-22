@@ -41,7 +41,15 @@ fn stage_wad_payload(
         return Ok(());
     };
     let dest_dir = map.host;
-    if host_exe_dir == dest_dir {
+    // On a case-insensitive filesystem (macOS / Windows defaults) two path
+    // strings that differ only in letter case can denote the SAME directory
+    // (e.g. `Program Files\doomretro` vs `Program Files\DoomRetro`). Compare
+    // canonicalized forms so this guard fires whenever both names resolve to
+    // the same physical dir. Without it the copy loop below runs and copies
+    // each WAD onto itself, which `std::fs::copy` truncates to 0 *before*
+    // reading — zeroing every guest WAD during session init. See
+    // `stage_wad_payload_does_not_self_copy_wads_across_case_variants`.
+    if same_host_dir(host_exe_dir, &dest_dir) {
         // The CLI's app-folder staging already copied the WAD payload beside
         // the guest-visible exe; only the classic freedoom alias names
         // (`DOOM1.WAD` / `DOOM2.WAD`) still need materializing.
@@ -118,6 +126,23 @@ fn freedoom_alias_name(wad_name: &std::ffi::OsStr) -> Option<&'static str> {
         "freedoom1.wad" => Some("DOOM1.WAD"),
         "freedoom2.wad" => Some("DOOM2.WAD"),
         _ => None,
+    }
+}
+
+/// True when `a` and `b` name the same physical directory, regardless of
+/// letter-case spelling (case-insensitive filesystems) or symlink indirection.
+///
+/// Exact path equality short-circuits; otherwise the two paths are compared
+/// through [`std::fs::canonicalize`], which resolves symlinks and normalizes
+/// to the on-disk case. A failed canonicalization (a path that does not exist
+/// yet) falls back to `false` so the caller's normal creation/copy path runs.
+fn same_host_dir(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
     }
 }
 
@@ -1278,6 +1303,52 @@ mod tests {
             !drive_c.join("readme.txt").exists(),
             "non-WAD sibling untouched"
         );
+    }
+
+    /// Regression for the WAD-truncation bug: `stage_wad_payload` must not
+    /// copy a WAD onto itself when the source and destination directories are
+    /// the same physical dir reached under different letter-case spelling
+    /// (case-insensitive filesystems such as macOS/Windows defaults). The
+    /// CLI stages the app folder as `Program Files\{stem}` (lowercase from the
+    /// exe name); the guest module path derives through the volume mapping and
+    /// carries the on-disk casing (`DoomRetro`). `std::fs::copy(src, target)`
+    /// with `src` aliasing `target` truncates the file to 0 *before* reading —
+    /// zeroing every guest WAD at startup (see `same_host_dir`).
+    #[test]
+    fn stage_wad_payload_does_not_self_copy_wads_across_case_variants() {
+        let bottle = TempDir::new("wad-selfcopy-bottle");
+        // Guest-visible app dir under the on-disk casing the module path
+        // carries (`DoomRetro`).
+        let drive_c = bottle.path().join("drive_c");
+        let app = drive_c.join("Program Files").join("DoomRetro");
+        std::fs::create_dir_all(&app).expect("create DoomRetro dir");
+        std::fs::write(app.join("doomretro.wad"), vec![0xAB; 65536]).expect("write real wad");
+        std::fs::write(app.join("doomretro.exe"), b"MZ").expect("write exe");
+
+        // Only reproducible where the filesystem is case-insensitive: there
+        // `Program Files\doomretro` (the lowercase staged path) IS the same
+        // directory as `Program Files\DoomRetro`. On case-sensitive systems
+        // the two casings are distinct dirs and the staging copy is legitimate.
+        if !app.join("doomretro").is_dir() {
+            tracing::warn!("skip: filesystem is case-sensitive; case-alias cannot occur");
+            return;
+        }
+
+        // The staged exe's host path keeps the lowercase stem spelling, while
+        // the module path carries the on-disk casing — the exact mismatch that
+        // used to send the copy loop down the self-copy path.
+        let exe = app.join("doomretro").join("doomretro.exe");
+        let volumes = wie_winapi::VolumeConfig::from_parts(Some(bottle.path().to_path_buf()), None);
+        super::stage_wad_payload(&volumes, &exe, r"C:\Program Files\DoomRetro\doomretro.exe")
+            .expect("stage should succeed");
+
+        let result = std::fs::read(app.join("doomretro.wad")).expect("read staged wad");
+        assert_eq!(
+            result.len(),
+            65536,
+            "WAD must not be truncated to 0 by a case-insensitive self-copy"
+        );
+        assert_eq!(result[0], 0xAB, "WAD content preserved");
     }
 
     /// A staged in-bottle copy's guest module path derives through the volume
