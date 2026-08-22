@@ -45,6 +45,86 @@ pub fn handle_get_local_time(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
 
     ctx.finish(0)
 }
+/// Convert a `FILETIME` (100-ns units since 1601-01-01 UTC) to the eight
+/// `WORD` fields of a `SYSTEMTIME` (`wYear`, `wMonth`, `wDayOfWeek`, `wDay`,
+/// `wHour`, `wMinute`, `wSecond`, `wMilliseconds`) in UTC.
+///
+/// Shares the civil-date conversion (Hinnant's `civil_from_days` algorithm)
+/// with no other code in this crate — the only other SYSTEMTIME producer is
+/// the deterministic fake `GetLocalTime`. Tested against the fixed-clock
+/// [`FIXED_SYSTEM_FILETIME`] constant, which maps to 2024-01-01T00:00:00Z.
+#[must_use]
+fn filetime_to_system_time(filetime: u64) -> [u16; 8] {
+    let hundred_ns = u128::from(filetime);
+    let total_seconds = hundred_ns / 10_000_000;
+    let sub_second = hundred_ns % 10_000_000;
+    // Whole seconds from the UNIX epoch (1601-01-01 + 11_644_473_600 s).
+    let unix_seconds = total_seconds.saturating_sub(11_644_473_600);
+    let days_since_epoch = i64::try_from(unix_seconds / 86_400).unwrap_or(0);
+    let day_seconds = unix_seconds % 86_400;
+    let hour = u16::try_from(day_seconds / 3_600).unwrap_or(0);
+    let minute = u16::try_from((day_seconds % 3_600) / 60).unwrap_or(0);
+    let second = u16::try_from(day_seconds % 60).unwrap_or(0);
+    // 1 ms = 10,000 hundred-ns units; the sub-second part is < 1 s.
+    let milliseconds = u16::try_from(sub_second / 10_000).unwrap_or(0);
+
+    // Hinnant's civil_from_days: days since 1970-01-01 → (y, m, d).
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y0 = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = u16::try_from(doy - (153 * mp + 2) / 5 + 1).unwrap_or(0);
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let mut year = y0;
+    if month <= 2 {
+        year += 1;
+    }
+    let month = u16::try_from(month).unwrap_or(0);
+    let year = u16::try_from(year).unwrap_or(0);
+    // 1970-01-01 was a Thursday = wDayOfWeek 4 (Sunday is 0).
+    let day_of_week = u16::try_from(days_since_epoch.rem_euclid(7) + 4).unwrap_or(0) % 7;
+
+    [
+        year,
+        month,
+        day_of_week,
+        day,
+        hour,
+        minute,
+        second,
+        milliseconds,
+    ]
+}
+
+/// Handles `KERNEL32.dll!GetSystemTime` — fill a UTC `SYSTEMTIME`.
+///
+/// Reads the current wall-clock `FILETIME` from the same clock source as
+/// `GetSystemTimeAsFileTime` (so `WIE_FIXED_CLOCK=1` freezes it too) and
+/// converts it to the sub-fielded `SYSTEMTIME`. Returns void.
+pub fn handle_get_system_time(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let system_time_va = engine
+        .read_rcx()
+        .context("failed to read RCX for GetSystemTime")?;
+
+    if system_time_va != 0 {
+        let filetime = crate::kernel32::clock::system_time_filetime();
+        let fields = filetime_to_system_time(filetime);
+        for (i, value) in fields.iter().enumerate() {
+            let offset = u64::try_from(i * 2).unwrap_or(0);
+            write_guest_u16(
+                engine,
+                checked_address(system_time_va, offset, "SYSTEMTIME"),
+                *value,
+            )?;
+        }
+    }
+
+    ctx.finish(0)
+}
 /// Handles `KERNEL32.dll!GetTimeZoneInformation`.
 pub fn handle_get_time_zone_information(
     ctx: &mut HandlerContext<'_>,
@@ -470,5 +550,34 @@ mod tests {
         assert_eq!(format_date_parts(&parts(), "yyyy-MM-dd"), "2026-07-09");
         assert_eq!(format_date_parts(&parts(), "ddd"), "Thu");
         assert_eq!(format_date_parts(&parts(), "MMMM"), "July");
+    }
+
+    /// GetSystemTime fills a UTC SYSTEMTIME — the pure conversion core is
+    /// pinned against known FILETIMEs:
+    /// - the fixed-clock `FIXED_SYSTEM_FILETIME` (2024-01-01T00:00:00Z, Monday),
+    /// - the UNIX epoch (1970-01-01T00:00:00Z, Thursday),
+    /// - a real date/time (2026-07-09T14:05:03Z, Thursday).
+    #[test]
+    fn filetime_to_system_time_matches_known_utc_instants() {
+        assert_eq!(
+            filetime_to_system_time(crate::kernel32::FIXED_SYSTEM_FILETIME),
+            [2024, 1, 1, 1, 0, 0, 0, 0],
+            "fixed clock = 2024-01-01T00:00:00Z, Monday"
+        );
+        let epoch = 11_644_473_600_u64.saturating_mul(10_000_000);
+        assert_eq!(
+            filetime_to_system_time(epoch),
+            [1970, 1, 4, 1, 0, 0, 0, 0],
+            "UNIX epoch = 1970-01-01T00:00:00Z, Thursday"
+        );
+        // 2026-07-09T14:05:03Z in 100-ns FILETIME units.
+        let filetime = 11_644_473_600_u64
+            .saturating_add(1_783_605_903)
+            .saturating_mul(10_000_000);
+        assert_eq!(
+            filetime_to_system_time(filetime),
+            [2026, 7, 4, 9, 14, 5, 3, 0],
+            "a real UTC instant round-trips"
+        );
     }
 }

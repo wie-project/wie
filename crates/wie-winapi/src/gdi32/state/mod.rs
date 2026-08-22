@@ -44,18 +44,33 @@ pub(crate) const STOCK_NULL_PEN_HANDLE: u64 = 0x0000_0000_6800_500B;
 
 /// Handles `GDI32.dll!GetObjectA`.
 pub fn handle_get_object_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_get_object_impl(ctx, "GetObjectA")
+}
+
+/// Handles `GDI32.dll!GetObjectW`.
+///
+/// `GetObject` reports the same `BITMAP` regardless of the A/W spelling — the
+/// object data is binary, not text — so this mirrors `GetObjectA` exactly.
+pub fn handle_get_object_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_get_object_impl(ctx, "GetObjectW")
+}
+
+fn handle_get_object_impl(
+    ctx: &mut HandlerContext<'_>,
+    api_name: &str,
+) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let object_handle = engine
         .read_rcx()
-        .context("failed to read RCX for GetObjectA")?;
+        .with_context(|| format!("failed to read RCX for {api_name}"))?;
 
     let buffer_size = engine
         .read_rdx()
-        .context("failed to read RDX for GetObjectA")?;
+        .with_context(|| format!("failed to read RDX for {api_name}"))?;
 
     let object_buffer_va = engine
         .read_r8()
-        .context("failed to read R8 for GetObjectA")?;
+        .with_context(|| format!("failed to read R8 for {api_name}"))?;
 
     let can_write_bitmap =
         object_handle != 0 && object_buffer_va != 0 && buffer_size >= BITMAP_STRUCT_SIZE;
@@ -240,8 +255,11 @@ fn handle_get_text_extent_point_32_impl(
         match resolved {
             Some((key, resolved)) => {
                 let chars = crate::gdi32::text::read_text_chars(engine, text_va, count, wide)?;
-                let text: String = chars.iter().filter_map(|&cp| char::from_u32(cp)).collect();
-                let width = font_engine.text_advance(&resolved, &key, &text, text.len());
+                // No String round trip: the advance lane takes the raw code
+                // points directly (and reuses one cached lookup key across
+                // all characters — no per-char allocations).
+                let scaled = resolved.scaled();
+                let width = font_engine.text_advance_codepoints(&scaled, &resolved, &key, &chars);
                 Ok((width, resolved.line_height()))
             }
             None => Ok((0, 16)),

@@ -21,6 +21,34 @@ pub fn handle_get_dc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult
 
     ctx.finish(dc_handle.as_u64())
 }
+/// Handles `USER32.dll!GetDCEx`.
+///
+/// Mirrors `GetDC` — allocate a window DC for a known window — but returns
+/// NULL (fail) for an unknown window, matching `GetDCEx`'s documented failure
+/// mode. The clip region and the `DCX_EXCLUDERGN` / `DCX_INTERSECTRGN` flags
+/// only affect the returned DC's clipping, which this surface does not model,
+/// so they are read and otherwise ignored.
+pub fn handle_get_dc_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let window_handle = engine
+        .read_rcx()
+        .context("failed to read RCX for GetDCEx")?;
+    let _clip_region = engine
+        .read_rdx()
+        .context("failed to read RDX for GetDCEx")?;
+    let _flags = engine.read_r8().context("failed to read R8 for GetDCEx")?;
+
+    let dc_handle = if super::is_known_window(state, window_handle) {
+        state
+            .gdi_state()
+            .alloc_dc(DcKind::Window(crate::handles::Hwnd::from(window_handle)))
+    } else {
+        crate::handles::Hdc::NULL
+    };
+
+    ctx.finish(dc_handle.as_u64())
+}
 /// Handles `USER32.dll!ReleaseDC`.
 pub fn handle_release_dc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;

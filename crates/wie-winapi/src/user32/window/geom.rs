@@ -431,6 +431,71 @@ pub fn handle_adjust_window_rect_ex(ctx: &mut HandlerContext<'_>) -> Result<WinA
 
     ctx.finish(return_value)
 }
+/// Handles `USER32.dll!AdjustWindowRect` — the plain 3-arg form of
+/// `AdjustWindowRectEx` (no extended style).
+///
+/// Mirrors `handle_adjust_window_rect_ex` with `dwExStyle` fixed at 0: the
+/// same classic non-client metrics (frame, caption, optional menu bar) are
+/// added to the passed client `RECT`.
+pub fn handle_adjust_window_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let rect_va = engine
+        .read_rcx()
+        .context("failed to read RCX for AdjustWindowRect")?;
+
+    let _style = engine
+        .read_rdx()
+        .context("failed to read RDX for AdjustWindowRect")?;
+
+    let has_menu = engine
+        .read_r8()
+        .context("failed to read R8 for AdjustWindowRect")?;
+
+    let success = rect_va != 0;
+
+    if success {
+        // Read-all → compute → write-all (one shared-lock borrow per view).
+        let (left, top, right, bottom) =
+            with_typed_read::<WinRect, _, _>(engine, rect_va, |rect| {
+                Ok((rect.left, rect.top, rect.right, rect.bottom))
+            })
+            .context("failed to read RECT for AdjustWindowRect")?;
+
+        // Approximate classic non-client metrics (same NC_* constants as
+        // AdjustWindowRectEx; no extended style to account for).
+        let menu_height = if has_menu != 0 { NC_MENU_PX } else { 0 };
+
+        let adjusted_left = left
+            .checked_sub(NC_FRAME_PX)
+            .context("AdjustWindowRect left overflow")?;
+
+        let adjusted_top = top
+            .checked_sub(NC_CAPTION_PX)
+            .and_then(|value| value.checked_sub(menu_height))
+            .context("AdjustWindowRect top overflow")?;
+
+        let adjusted_right = right
+            .checked_add(NC_FRAME_PX)
+            .context("AdjustWindowRect right overflow")?;
+
+        let adjusted_bottom = bottom
+            .checked_add(NC_FRAME_PX)
+            .context("AdjustWindowRect bottom overflow")?;
+
+        with_typed_write::<WinRect, _, _>(engine, rect_va, |rect| {
+            rect.left = adjusted_left;
+            rect.top = adjusted_top;
+            rect.right = adjusted_right;
+            rect.bottom = adjusted_bottom;
+            Ok(())
+        })
+        .context("failed to write RECT for AdjustWindowRect")?;
+    }
+
+    let return_value = u64::from(success);
+
+    ctx.finish(return_value)
+}
 /// Handles `USER32.dll!ScrollWindowEx` (no-op success stub).
 pub fn handle_scroll_window_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -650,8 +715,8 @@ pub fn handle_set_window_placement(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{
-        COLOR_INFOBK, FAKE_WINDOW_HANDLE, find_window_mut, handle_get_client_rect, sys_color,
-        window_client_size,
+        COLOR_INFOBK, FAKE_WINDOW_HANDLE, find_window_mut, handle_adjust_window_rect,
+        handle_get_client_rect, sys_color, window_client_size,
     };
 
     use crate::user32::read_i32;
@@ -943,6 +1008,71 @@ mod tests {
     #[test]
     fn sys_color_infobk_is_tooltip_yellow() {
         assert_eq!(sys_color(COLOR_INFOBK), 0x00ff_ffe1);
+    }
+
+    /// AdjustWindowRect (the plain 3-arg form) adds the classic non-client
+    /// metrics to the passed client rect: frame on all sides, caption above,
+    /// optional menu bar above that — mirroring AdjustWindowRectEx with no
+    /// extended style.
+    #[test]
+    fn adjust_window_rect_grows_a_client_rect_by_the_non_client_metrics() {
+        let mut engine = test_engine();
+        let mut state = test_state();
+        let write_rect = |engine: &mut IcedCpu, left: i32, top: i32, right: i32, bottom: i32| {
+            crate::user32::write_guest_i32(engine, RECT_BUF, left).unwrap();
+            crate::user32::write_guest_i32(engine, RECT_BUF + 4, top).unwrap();
+            crate::user32::write_guest_i32(engine, RECT_BUF + 8, right).unwrap();
+            crate::user32::write_guest_i32(engine, RECT_BUF + 12, bottom).unwrap();
+        };
+
+        // No menu bar: left/top shrink by frame/caption, right/bottom grow by frame.
+        write_rect(&mut engine, 10, 20, 110, 220);
+        engine.write_rcx(RECT_BUF).ok();
+        engine.write_rdx(0).ok(); // style (unused)
+        engine.write_r8(0).ok(); // hasMenu = FALSE
+        let ret = handle_adjust_window_rect(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("AdjustWindowRect handler")
+        .return_value;
+        assert_eq!(ret, 1, "a valid rect returns TRUE");
+        assert_eq!(read_i32(&mut engine, RECT_BUF).unwrap(), 2, "left - frame");
+        assert_eq!(
+            read_i32(&mut engine, RECT_BUF + 4).unwrap(),
+            -11,
+            "top - caption"
+        );
+        assert_eq!(
+            read_i32(&mut engine, RECT_BUF + 8).unwrap(),
+            118,
+            "right + frame"
+        );
+        assert_eq!(
+            read_i32(&mut engine, RECT_BUF + 12).unwrap(),
+            228,
+            "bottom + frame"
+        );
+
+        // With a menu: the top also drops the menu-bar height.
+        write_rect(&mut engine, 10, 20, 110, 220);
+        engine.write_rcx(RECT_BUF).ok();
+        engine.write_rdx(0).ok();
+        engine.write_r8(1).ok(); // hasMenu = TRUE
+        let ret = handle_adjust_window_rect(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        ))
+        .expect("AdjustWindowRect handler")
+        .return_value;
+        assert_eq!(ret, 1);
+        assert_eq!(
+            read_i32(&mut engine, RECT_BUF + 4).unwrap(),
+            -31,
+            "top - caption - menu"
+        );
     }
 
     /// RNotepad's WM_SIZE handler calls MoveWindow on its multiline EDIT; the

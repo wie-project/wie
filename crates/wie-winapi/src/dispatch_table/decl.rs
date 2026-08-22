@@ -75,16 +75,16 @@ macro_rules! winapi_ids {
 }
 
 /// Compile-time coverage: the declaration must keep emitting exactly the
-/// historical surface — 505 variants, 507 discriminants (two holes), 506 name
-/// rows (505 variants + the `getdlgitem`/`getdlgitema` alias pair). Dispatch
+/// configured surface — 510 variants, 512 discriminants (two holes), 511 name
+/// rows (510 variants + the `getdlgitem`/`getdlgitema` alias pair). Dispatch
 /// coverage is exhaustive by construction: the match is generated with one arm
 /// per declaration row, so the compiler rejects any variant without a handler.
 const _: () = {
-    assert!(WinApiId::COUNT == 505, "variant count drifted");
-    assert!(super::WINAPI_ID_COUNT == 507, "discriminant span drifted");
+    assert!(WinApiId::COUNT == 510, "variant count drifted");
+    assert!(super::WINAPI_ID_COUNT == 512, "discriminant span drifted");
     assert!(
-        WINAPI_NAME_ROWS.len() == 506,
-        "name-row count drifted (505 variants + 1 alias)"
+        WINAPI_NAME_ROWS.len() == 511,
+        "name-row count drifted (510 variants + 1 alias)"
     );
 };
 
@@ -597,4 +597,9 @@ winapi_ids! {
     504 D3d9Idirect3ddevice9Setrendertarget "d3d9.dll" "idirect3ddevice9::setrendertarget" => d3d9::handle_set_render_target(ctx);
     505 D3d9Idirect3ddevice9Getrendertarget "d3d9.dll" "idirect3ddevice9::getrendertarget" => d3d9::handle_get_render_target(ctx);
     506 D3d9Idirect3dsurface9Getdesc "d3d9.dll" "idirect3dsurface9::getdesc" => d3d9::handle_surface_get_desc(ctx);
+    507 User32Getdcex "user32.dll" "getdcex" => user32::handle_get_dc_ex(ctx);
+    508 User32Adjustwindowrect "user32.dll" "adjustwindowrect" => user32::handle_adjust_window_rect(ctx);
+    509 Gdi32Getobjectw "gdi32.dll" "getobjectw" => gdi32::handle_get_object_w(ctx);
+    510 Gdi32Createdca "gdi32.dll" "createdca" => gdi32::handle_create_dc_a(ctx);
+    511 Kernel32Getsystemtime "kernel32.dll" "getsystemtime" => kernel32::handle_get_system_time(ctx);
 }

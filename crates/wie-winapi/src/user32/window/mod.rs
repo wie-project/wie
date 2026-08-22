@@ -30,11 +30,12 @@ pub use class::{
 };
 pub use create::{handle_create_window_ex_a, handle_create_window_ex_w};
 pub use geom::{
-    handle_adjust_window_rect_ex, handle_client_to_screen, handle_get_client_rect,
-    handle_get_desktop_window, handle_get_dlg_ctrl_id, handle_get_sys_color,
-    handle_get_sys_color_brush, handle_get_window, handle_get_window_placement,
-    handle_get_window_thread_process_id, handle_is_child, handle_is_iconic, handle_is_zoomed,
-    handle_screen_to_client, handle_scroll_window_ex, handle_set_rect, handle_set_window_placement,
+    handle_adjust_window_rect, handle_adjust_window_rect_ex, handle_client_to_screen,
+    handle_get_client_rect, handle_get_desktop_window, handle_get_dlg_ctrl_id,
+    handle_get_sys_color, handle_get_sys_color_brush, handle_get_window,
+    handle_get_window_placement, handle_get_window_thread_process_id, handle_is_child,
+    handle_is_iconic, handle_is_zoomed, handle_screen_to_client, handle_scroll_window_ex,
+    handle_set_rect, handle_set_window_placement,
 };
 pub use geom_ops::{handle_move_window, handle_set_window_pos};
 pub use mgr::{

@@ -23,7 +23,9 @@ use anyhow::{Context, Result};
 
 use crate::guest_layout::DocInfoW;
 use crate::guest_memory::{checked_address, read_i32, with_typed_read};
-use crate::guest_string::read_utf16_lossy as read_guest_utf16_lossy;
+use crate::guest_string::{
+    read_ansi_lossy as read_guest_ansi_lossy, read_utf16_lossy as read_guest_utf16_lossy,
+};
 use crate::handles::{Hbrush, Hdc, Hpen};
 use crate::user32::low_i32;
 use crate::{HandlerContext, WinApiHandlerResult};
@@ -49,6 +51,28 @@ pub fn handle_create_dc_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     if driver_va != 0 {
         let driver = read_guest_utf16_lossy(engine, driver_va, 64).unwrap_or_default();
         tracing::debug!(driver, "CreateDCW");
+    }
+
+    let handle = state.gdi_state().alloc_print_dc();
+
+    ctx.finish(handle.as_u64())
+}
+
+/// Handles `GDI32.dll!CreateDCA` — the ANSI spelling of `CreateDCW`.
+///
+/// Mirrors `CreateDCW` (any driver name produces a print DC); only the driver
+/// name is read as an ANSI string instead of UTF-16. `lpszDevice` /
+/// `lpszOutput` / `lpInitData` are ignored, as in `CreateDCW`.
+pub fn handle_create_dc_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let driver_va = engine
+        .read_rcx()
+        .context("failed to read RCX for CreateDCA")?;
+
+    if driver_va != 0 {
+        let driver = read_guest_ansi_lossy(engine, driver_va, 64).unwrap_or_default();
+        tracing::debug!(driver, "CreateDCA");
     }
 
     let handle = state.gdi_state().alloc_print_dc();

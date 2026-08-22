@@ -25,7 +25,7 @@ use anyhow::{Result, bail};
 /// so `WinApiId::COUNT` is lower. Deriving from the final variant keeps the
 /// alias correct by construction: appending a variant with a higher
 /// discriminant updates this constant with it.
-pub const WINAPI_ID_COUNT: usize = WinApiId::D3d9Idirect3dsurface9Getdesc.to_u16() as usize + 1;
+pub const WINAPI_ID_COUNT: usize = WinApiId::Kernel32Getsystemtime.to_u16() as usize + 1;
 
 impl WinApiId {
     /// Discriminant as `u16` (`#[repr(u16)]`).
@@ -290,10 +290,10 @@ mod tests {
     /// an append/renumber/backfill shows up as a test diff.
     #[test]
     fn count_is_pinned_to_enum() {
-        let last_plus_one = usize::from(WinApiId::D3d9Idirect3dsurface9Getdesc.to_u16()) + 1;
+        let last_plus_one = usize::from(WinApiId::Kernel32Getsystemtime.to_u16()) + 1;
         assert_eq!(WINAPI_ID_COUNT, last_plus_one);
-        assert_eq!(WINAPI_ID_COUNT, 507);
-        assert_eq!(WinApiId::COUNT, 505); // 505 variants, two discriminant holes
+        assert_eq!(WINAPI_ID_COUNT, 512);
+        assert_eq!(WinApiId::COUNT, 510); // 510 variants, two discriminant holes
     }
 
     /// Every discriminant is either a round-trippable variant (its `to_u16`
@@ -312,7 +312,7 @@ mod tests {
         }
         // The final variant is exactly the highest discriminant.
         let last = u16::try_from(WINAPI_ID_COUNT - 1).expect("count fits u16");
-        assert_eq!(WinApiId::D3d9Idirect3dsurface9Getdesc.to_u16(), last);
+        assert_eq!(WinApiId::Kernel32Getsystemtime.to_u16(), last);
     }
 
     /// Coverage: every variant resolves to a name row (id → export), and every
