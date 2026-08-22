@@ -695,6 +695,7 @@ mod edit_scroll;
 mod edit_undo;
 mod fake_handles;
 mod gdi;
+mod guest_io_dirty;
 mod kernel32_stub_tests;
 mod kernel32_tests;
 mod listbox;

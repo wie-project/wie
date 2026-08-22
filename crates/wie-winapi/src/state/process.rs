@@ -365,6 +365,10 @@ pub struct OpenGuestFile {
 
     /// Index into the guest I/O handle table (if registered).
     pub guest_slot_index: Option<u32>,
+
+    /// Set when buffered `bytes` changed since the last guest-I/O mirror, so
+    /// `sync_slot_from_host` re-mirrors the arena only on writes, never on reads.
+    pub guest_dirty: bool,
 }
 
 impl OpenGuestFile {

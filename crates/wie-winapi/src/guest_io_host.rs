@@ -123,18 +123,25 @@ pub fn unregister_open_file(
     Ok(())
 }
 
-/// Syncs guest table cursor/size (and optional mirror bytes) from host state.
+/// Syncs guest table cursor/size (and, only when dirty, mirror bytes) from host state.
+///
+/// The cheap cursor/size u64 writes always run (SetFilePointerEx / ReadFile cursor
+/// sync depends on them). The O(filesize) byte mirror runs only when the file's
+/// buffered bytes changed since the last mirror (`guest_dirty`), so a pure read —
+/// which leaves `bytes` untouched — never re-copies the file into the arena and
+/// never trips the JIT's code-write cache flush.
 pub fn sync_slot_from_host(
     engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
+    state: &mut WinApiState,
     handle: u64,
 ) -> Result<()> {
-    let Some(file) = state.file_io.open_files.get(&handle) else {
+    let Some(file) = state.file_io.open_files.get_mut(&handle) else {
         return Ok(());
     };
     let Some(slot_i) = file.guest_slot_index else {
         return Ok(());
     };
+    let guest_dirty = file.guest_dirty;
     let Some(cfg) = state.file_io.guest_io.as_ref() else {
         return Ok(());
     };
@@ -147,10 +154,13 @@ pub fn sync_slot_from_host(
     let size = u64::try_from(file.bytes.len()).unwrap_or(0);
     write_u64(engine, slot_va.wrapping_add(16), size)?;
     write_u64(engine, slot_va.wrapping_add(24), file.cursor)?;
-    if let Some(data_va) = file.guest_data_va
-        && !file.bytes.is_empty()
-    {
-        engine.mem_write(data_va, &file.bytes)?;
+    if guest_dirty {
+        if let Some(data_va) = file.guest_data_va
+            && !file.bytes.is_empty()
+        {
+            engine.mem_write(data_va, &file.bytes)?;
+        }
+        file.guest_dirty = false;
     }
     Ok(())
 }

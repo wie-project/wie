@@ -354,6 +354,10 @@ pub fn handle_write_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
                 .context("WriteFile slice out of range")?
                 .copy_from_slice(&data);
 
+            // Buffered bytes mutated: the guest-I/O arena mirror is now stale.
+            // `sync_slot_from_host` re-mirrors (and clears) this before any guest read.
+            open_file.guest_dirty = true;
+
             let write_len_u64 =
                 u64::try_from(write_len).context("WriteFile byte count does not fit u64")?;
 
@@ -373,6 +377,13 @@ pub fn handle_write_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
         // CloseHandle / FlushFileBuffers / SetEndOfFile.
         if !streaming {
             maybe_promote_open_file_to_streaming(engine, state, handle);
+        }
+
+        // Push the updated buffered bytes + cursor/size into the guest-I/O arena
+        // so a following guest fast-path read (WIE_GUEST_IO=all) sees them. Gated
+        // by `guest_dirty`: this re-mirrors only on a real write, never on reads.
+        if !streaming {
+            let _ = crate::guest_io_host::sync_slot_from_host(engine, state, handle).ok();
         }
 
         if is_main_module_path(state, &path) {
@@ -500,31 +511,38 @@ pub fn handle_backup_write(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
         return ctx.finish(1);
     }
     let to_write_usize = usize::try_from(to_write).unwrap_or(0);
-    if let Some(file) = state.file_io.open_files.get_mut(&handle) {
-        let mut chunk = vec![0_u8; to_write_usize];
-        engine.mem_read(buf, &mut chunk)?;
-        let cursor_usize = usize::try_from(file.cursor).unwrap_or(0);
-        // Extend the file bytes if needed.
-        if cursor_usize.saturating_add(to_write_usize) > file.bytes.len() {
-            file.bytes
-                .resize(cursor_usize.saturating_add(to_write_usize), 0);
+    let ok = match state.file_io.open_files.get_mut(&handle) {
+        Some(file) => {
+            let mut chunk = vec![0_u8; to_write_usize];
+            engine.mem_read(buf, &mut chunk)?;
+            let cursor_usize = usize::try_from(file.cursor).unwrap_or(0);
+            // Extend the file bytes if needed.
+            if cursor_usize.saturating_add(to_write_usize) > file.bytes.len() {
+                file.bytes
+                    .resize(cursor_usize.saturating_add(to_write_usize), 0);
+            }
+            if let Some(dst) = file
+                .bytes
+                .get_mut(cursor_usize..cursor_usize.saturating_add(to_write_usize))
+            {
+                dst.copy_from_slice(&chunk);
+            }
+            // Buffered bytes mutated: mark the guest-I/O arena mirror stale.
+            file.guest_dirty = true;
+            file.cursor = file.cursor.saturating_add(to_write);
+            if written_va != 0 {
+                write_guest_u32(engine, written_va, u32::try_from(to_write).unwrap_or(0))?;
+            }
+            true
         }
-        if let Some(dst) = file
-            .bytes
-            .get_mut(cursor_usize..cursor_usize.saturating_add(to_write_usize))
-        {
-            dst.copy_from_slice(&chunk);
-        }
-        file.cursor = file.cursor.saturating_add(to_write);
-        if written_va != 0 {
-            write_guest_u32(engine, written_va, u32::try_from(to_write).unwrap_or(0))?;
-        }
-        state.process.last_error = 0;
-        ctx.finish(1)
-    } else {
-        state.process.last_error = ERROR_INVALID_HANDLE;
-        ctx.finish(0)
+        None => false,
+    };
+    if ok {
+        // Push the new bytes/cursor into the guest-I/O arena before any guest read.
+        let _ = crate::guest_io_host::sync_slot_from_host(engine, state, handle).ok();
     }
+    state.process.last_error = if ok { 0 } else { ERROR_INVALID_HANDLE };
+    ctx.finish(u64::from(ok))
 }
 pub fn handle_flush_file_buffers(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;

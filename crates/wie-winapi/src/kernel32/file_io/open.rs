@@ -329,6 +329,7 @@ pub(crate) fn allocate_open_file_ex(
             streaming,
             guest_data_va: None,
             guest_slot_index: None,
+            guest_dirty: false,
         },
     );
 
