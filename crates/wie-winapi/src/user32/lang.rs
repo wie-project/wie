@@ -88,6 +88,14 @@ fn host_ui_language() -> u32 {
 /// The `defaults` command fails (non-macOS host, sandboxed launch) and the
 /// dump can carry no quoted entry; both cases fall back to the `LANG` env
 /// parse via [`host_ui_language`].
+///
+/// NOTE: the `defaults` subprocess spawn costs ~8 ms on the process's FIRST
+/// `GetUserDefaultUILanguage` call (the result is memoized in a `OnceLock`,
+/// so later calls are free). A faster alternative would be reading
+/// `~/Library/Preferences/.GlobalPreferences.plist` directly (no subprocess),
+/// but that needs boilerplate plist parsing (XML and binary variants), so the
+/// subprocess is kept — revisit only if startup-time language lookup ever
+/// shows up on a hot path.
 #[must_use]
 fn apple_languages_ui_language() -> Option<u32> {
     let output = std::process::Command::new("defaults")
