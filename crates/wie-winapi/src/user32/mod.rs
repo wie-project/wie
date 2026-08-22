@@ -17,9 +17,9 @@ pub(crate) use crate::guest_string::{
 };
 pub(crate) use crate::state::WindowFlags;
 pub(crate) use crate::{
-    GuestCallbackRequest, HandlerContext, MessageQueueIdlePolicy, QueuedWindowMessage, TimerRecord,
-    WinApiControlSignal, WinApiHandlerResult, WinApiState, WindowClassRecord, WindowRecord,
-    WindowsHookRecord,
+    GuestCallbackRequest, HandlerContext, MessageQueueIdlePolicy, OuterReturn, QueuedWindowMessage,
+    TimerRecord, WinApiControlSignal, WinApiHandlerResult, WinApiState, WindowClassRecord,
+    WindowRecord, WindowsHookRecord,
 };
 pub(crate) use anyhow::{Context, Result};
 
@@ -822,6 +822,7 @@ pub fn dispatch_user32_extra(
         "createiconfromresource" => Ok(Some(stubs::handle_create_icon_from_resource(ctx)?)),
         "createiconindirect" => Ok(Some(stubs::handle_create_icon_indirect(ctx)?)),
         "dialogboxindirectparamw" => Ok(Some(stubs::handle_dialog_box_indirect_param_w(ctx)?)),
+        "enumdisplaysettingsa" => Ok(Some(stubs::handle_enum_display_settings_a(ctx)?)),
         "enumdisplaysettingsw" => Ok(Some(stubs::handle_enum_display_settings_w(ctx)?)),
         "flashwindowex" => Ok(Some(stubs::handle_flash_window_ex(ctx)?)),
         "getclassinfoexw" => Ok(Some(stubs::handle_get_class_info_ex_w(ctx)?)),

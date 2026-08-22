@@ -93,18 +93,100 @@ pub fn handle_enum_display_settings_w(ctx: &mut HandlerContext<'_>) -> Result<Wi
     if (mode_index != 0 && mode_index != 0xFFFF_FFFF) || mode_va == 0 {
         return ctx.finish(0);
     }
-    // DEVMODEW layout (offsets that SDL reads):
-    //   +0x00 wSize (u16), +0x16 dmBitsPerPel (u32), +0x1C dmPelsWidth (u32),
-    //   +0x20 dmPelsHeight (u32), +0x28 dmDisplayFrequency (u32)
-    let mut buf = [0_u8; 0x40];
-    buf[0..2].copy_from_slice(&(0x40_u16).to_le_bytes()); // wSize
-    buf[0x16..0x1A].copy_from_slice(&32_u32.to_le_bytes()); // 32bpp
-    buf[0x1C..0x20].copy_from_slice(&1920_u32.to_le_bytes());
-    buf[0x20..0x24].copy_from_slice(&1080_u32.to_le_bytes());
-    buf[0x28..0x2C].copy_from_slice(&60_u32.to_le_bytes()); // refresh
+    // DEVMODEW layout (Win64; SDL's WIN_GetDisplayModeFromDevMode / WIN_InitModes
+    // reads these compiled offsets — the struct is 220 = 0xDC bytes):
+    //   dmSpecVersion @0x40 (WORD), dmDriverVersion @0x42, dmSize @0x44 (WORD),
+    //   dmFields @0x48 (DWORD), dmPosition @0x4C (8B), dmDisplayOrientation @0x54,
+    //   dmBitsPerPel @0xA8, dmPelsWidth @0xAC, dmPelsHeight @0xB0,
+    //   dmDisplayFrequency @0xB8
+    const DMSPECVERSION: u16 = 0x0401;
+    const DMSIZE: u16 = 220; // sizeof(DEVMODEW) on Win64
+    const DM_POSITION: u32 = 0x20;
+    const DM_DISPLAYORIENTATION: u32 = 0x80;
+    const DM_DISPLAYFLAGS: u32 = 0x0020_0000;
+    const DM_BITSPERPEL: u32 = 0x0004_0000;
+    const DM_PELSWIDTH: u32 = 0x0008_0000;
+    const DM_PELSHEIGHT: u32 = 0x0010_0000;
+    const DM_DISPLAYFREQUENCY: u32 = 0x0040_0000;
+    let mut buf = [0_u8; DMSIZE as usize];
+    buf[0x40..0x42].copy_from_slice(&DMSPECVERSION.to_le_bytes());
+    buf[0x42..0x44].copy_from_slice(&DMSPECVERSION.to_le_bytes());
+    buf[0x44..0x46].copy_from_slice(&DMSIZE.to_le_bytes()); // dmSize
+    let fields = DM_POSITION
+        | DM_DISPLAYORIENTATION
+        | DM_BITSPERPEL
+        | DM_PELSWIDTH
+        | DM_PELSHEIGHT
+        | DM_DISPLAYFLAGS
+        | DM_DISPLAYFREQUENCY;
+    buf[0x48..0x4C].copy_from_slice(&fields.to_le_bytes()); // dmFields
+    // dmPosition = {0,0} (already zeroed), dmDisplayOrientation = DMDO_DEFAULT (0).
+    buf[0xA8..0xAC].copy_from_slice(&32_u32.to_le_bytes()); // dmBitsPerPel
+    buf[0xAC..0xB0].copy_from_slice(&1920_u32.to_le_bytes()); // dmPelsWidth
+    buf[0xB0..0xB4].copy_from_slice(&1080_u32.to_le_bytes()); // dmPelsHeight
+    buf[0xB8..0xBC].copy_from_slice(&60_u32.to_le_bytes()); // dmDisplayFrequency
     engine
         .mem_write(mode_va, &buf)
         .context("failed to write DEVMODEW")?;
+    ctx.finish(1)
+}
+/// Handles `USER32.dll!EnumDisplaySettingsA` — the ANSI spelling of
+/// `EnumDisplaySettingsW`.
+///
+/// Reports the same single 1920×1080@60 `DEVMODEA` for mode 0 and
+/// `ENUM_CURRENT_SETTINGS` (-1); any other mode returns FALSE. The fields this
+/// surface writes (`dmSize`, `dmBitsPerPel`, `dmPelsWidth`, `dmPelsHeight`,
+/// `dmDisplayFrequency`) are binary, not text, so the A/W layouts agree here;
+/// this mirrors `EnumDisplaySettingsW` field-for-field.
+pub fn handle_enum_display_settings_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let _device = engine.read_rcx()?;
+    let mode_index = engine
+        .read_rdx()
+        .context("failed to read RDX for EnumDisplaySettingsA")?;
+    let mode_va = engine
+        .read_r8()
+        .context("failed to read R8 for EnumDisplaySettingsA")?;
+    // ENUM_CURRENT_SETTINGS is -1 (0xFFFFFFFF); ENUM_REGISTRY_SETTINGS is -2.
+    if (mode_index != 0 && mode_index != 0xFFFF_FFFF) || mode_va == 0 {
+        return ctx.finish(0);
+    }
+    // DEVMODEA layout (Win64; the ANSI struct's CHAR name fields are half the
+    // W width, so every offset after dmDeviceName is 0x20 less than DEVMODEW;
+    // the struct is 156 = 0x9C bytes):
+    //   dmSpecVersion @0x20, dmDriverVersion @0x22, dmSize @0x24 (WORD),
+    //   dmFields @0x28 (DWORD), dmPosition @0x2C (8B), dmDisplayOrientation @0x34,
+    //   dmBitsPerPel @0x68, dmPelsWidth @0x6C, dmPelsHeight @0x70,
+    //   dmDisplayFrequency @0x78
+    const DMSPECVERSION: u16 = 0x0401;
+    const DMSIZE: u16 = 156; // sizeof(DEVMODEA) on Win64
+    const DM_POSITION: u32 = 0x20;
+    const DM_DISPLAYORIENTATION: u32 = 0x80;
+    const DM_DISPLAYFLAGS: u32 = 0x0020_0000;
+    const DM_BITSPERPEL: u32 = 0x0004_0000;
+    const DM_PELSWIDTH: u32 = 0x0008_0000;
+    const DM_PELSHEIGHT: u32 = 0x0010_0000;
+    const DM_DISPLAYFREQUENCY: u32 = 0x0040_0000;
+    let mut buf = [0_u8; DMSIZE as usize];
+    buf[0x20..0x22].copy_from_slice(&DMSPECVERSION.to_le_bytes());
+    buf[0x22..0x24].copy_from_slice(&DMSPECVERSION.to_le_bytes());
+    buf[0x24..0x26].copy_from_slice(&DMSIZE.to_le_bytes()); // dmSize
+    let fields = DM_POSITION
+        | DM_DISPLAYORIENTATION
+        | DM_BITSPERPEL
+        | DM_PELSWIDTH
+        | DM_PELSHEIGHT
+        | DM_DISPLAYFLAGS
+        | DM_DISPLAYFREQUENCY;
+    buf[0x28..0x2C].copy_from_slice(&fields.to_le_bytes()); // dmFields
+    // dmPosition = {0,0} (zeroed), dmDisplayOrientation = DMDO_DEFAULT (0).
+    buf[0x68..0x6C].copy_from_slice(&32_u32.to_le_bytes()); // dmBitsPerPel
+    buf[0x6C..0x70].copy_from_slice(&1920_u32.to_le_bytes()); // dmPelsWidth
+    buf[0x70..0x74].copy_from_slice(&1080_u32.to_le_bytes()); // dmPelsHeight
+    buf[0x78..0x7C].copy_from_slice(&60_u32.to_le_bytes()); // dmDisplayFrequency
+    engine
+        .mem_write(mode_va, &buf)
+        .context("failed to write DEVMODEA")?;
     ctx.finish(1)
 }
 /// Handles `USER32.dll!FlashWindowEx` — no-op success.

@@ -359,3 +359,130 @@ fn test_raw_input_device_list_is_empty() {
     engine.mem_read(count_va, &mut n).expect("count");
     assert_eq!(u32::from_le_bytes(n), 0);
 }
+
+/// Read a guest u32 at `addr` (test-side mirror of `read_guest_u32`).
+fn read_guest_u32_test(engine: &mut IcedCpu, addr: u64) -> u32 {
+    let mut b = [0_u8; 4];
+    engine.mem_read(addr, &mut b).expect("read guest u32");
+    u32::from_le_bytes(b)
+}
+
+/// Read a guest u16 at `addr`.
+fn read_guest_u16_test(engine: &mut IcedCpu, addr: u64) -> u16 {
+    let mut b = [0_u8; 2];
+    engine.mem_read(addr, &mut b).expect("read guest u16");
+    u16::from_le_bytes(b)
+}
+
+/// `EnumDisplaySettingsW` writes the Win64 `DEVMODEW` fields at the real
+/// offsets SDL2 reads (`WIN_GetDisplayModeFromDevMode`): `dmSize` @0x44 = 220,
+/// `dmBitsPerPel` @0xA8, `dmPelsWidth` @0xAC, `dmPelsHeight` @0xB0,
+/// `dmDisplayFrequency` @0xB8. The old stub wrote them at 0x16..0x2C, which SDL
+/// reads as zeros → a 0×0 @0bpp desktop mode that failed `WIN_InitModes`.
+#[test]
+fn test_enum_display_settings_w_writes_real_devmodew_offsets() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let mode_va = 0x7000_u64;
+    // rcx=device (ignored), rdx=mode 0, r8=mode_va.
+    write_regs(&mut engine, 0, 0, mode_va, 0, 0);
+    let r = user32::handle_enum_display_settings_w(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("EnumDisplaySettingsW must dispatch");
+    assert_eq!(r.return_value, 1, "mode 0 enumerates");
+
+    assert_eq!(
+        read_guest_u16_test(&mut engine, mode_va + 0x44),
+        220,
+        "dmSize @0x44"
+    );
+    assert_eq!(
+        read_guest_u32_test(&mut engine, mode_va + 0xA8),
+        32,
+        "dmBitsPerPel @0xA8"
+    );
+    assert_eq!(
+        read_guest_u32_test(&mut engine, mode_va + 0xAC),
+        1920,
+        "dmPelsWidth @0xAC"
+    );
+    assert_eq!(
+        read_guest_u32_test(&mut engine, mode_va + 0xB0),
+        1080,
+        "dmPelsHeight @0xB0"
+    );
+    assert_eq!(
+        read_guest_u32_test(&mut engine, mode_va + 0xB8),
+        60,
+        "dmDisplayFrequency @0xB8"
+    );
+
+    // ENUM_CURRENT_SETTINGS (-1) reports the same desktop mode.
+    write_regs(&mut engine, 0, u64::from(u32::MAX), mode_va, 0, 0);
+    let r = user32::handle_enum_display_settings_w(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("EnumDisplaySettingsW (current) must dispatch");
+    assert_eq!(r.return_value, 1, "ENUM_CURRENT_SETTINGS enumerates");
+    assert_eq!(read_guest_u32_test(&mut engine, mode_va + 0xAC), 1920);
+
+    // Any other mode is the exhausted end of the enumeration.
+    write_regs(&mut engine, 0, 5, mode_va, 0, 0);
+    let r = user32::handle_enum_display_settings_w(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("EnumDisplaySettingsW (mode 5) must dispatch");
+    assert_eq!(r.return_value, 0, "mode 5 is past the end");
+}
+
+/// `EnumDisplaySettingsA` writes the Win64 `DEVMODEA` fields (the ANSI struct's
+/// CHAR name fields are half the W width, so every offset after the device name
+/// is 0x20 less than `DEVMODEW`): `dmSize` @0x24 = 156, `dmBitsPerPel` @0x68,
+/// `dmPelsWidth` @0x6C, `dmPelsHeight` @0x70, `dmDisplayFrequency` @0x78.
+#[test]
+fn test_enum_display_settings_a_writes_real_devmodea_offsets() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let mode_va = 0x7000_u64;
+    write_regs(&mut engine, 0, 0, mode_va, 0, 0);
+    let r = user32::handle_enum_display_settings_a(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("EnumDisplaySettingsA must dispatch");
+    assert_eq!(r.return_value, 1, "mode 0 enumerates");
+
+    assert_eq!(
+        read_guest_u16_test(&mut engine, mode_va + 0x24),
+        156,
+        "dmSize @0x24"
+    );
+    assert_eq!(
+        read_guest_u32_test(&mut engine, mode_va + 0x68),
+        32,
+        "dmBitsPerPel @0x68"
+    );
+    assert_eq!(
+        read_guest_u32_test(&mut engine, mode_va + 0x6C),
+        1920,
+        "dmPelsWidth @0x6C"
+    );
+    assert_eq!(
+        read_guest_u32_test(&mut engine, mode_va + 0x70),
+        1080,
+        "dmPelsHeight @0x70"
+    );
+    assert_eq!(
+        read_guest_u32_test(&mut engine, mode_va + 0x78),
+        60,
+        "dmDisplayFrequency @0x78"
+    );
+}

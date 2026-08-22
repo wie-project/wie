@@ -36,6 +36,162 @@ fn test_get_async_key_state_down() {
     );
 }
 
+/// EnumDisplaySettingsA mirrors EnumDisplaySettingsW: mode 0 (and
+/// ENUM_CURRENT_SETTINGS) fills a single 1920×1080@60, 32-bpp DEVMODEA and
+/// returns TRUE; any other mode is exhausted (FALSE).
+#[test]
+fn test_enum_display_settings_a_returns_a_single_default_mode() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+
+    // mode 0 at buffer 0x4000 (device string is ignored).
+    write_regs(&mut engine, 0, 0, 0x4000, 0, STACK_TOP);
+    assert_return_value!(
+        user32::handle_enum_display_settings_a(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state
+        )),
+        1
+    );
+    let read_u32 = |engine: &mut IcedCpu, addr: u64| -> u32 {
+        let mut b = [0_u8; 4];
+        engine.mem_read(addr, &mut b).expect("read DEVMODE u32");
+        u32::from_le_bytes(b)
+    };
+    let read_u16 = |engine: &mut IcedCpu, addr: u64| -> u16 {
+        let mut b = [0_u8; 2];
+        engine.mem_read(addr, &mut b).expect("read DEVMODE u16");
+        u16::from_le_bytes(b)
+    };
+    // Win64 DEVMODEA: CHAR name fields make every post-name offset 0x20 less
+    // than DEVMODEW (dmSize @0x24 = 156, bits @0x68, width @0x6C, height @0x70,
+    // frequency @0x78).
+    assert_eq!(read_u16(&mut engine, 0x4024), 156, "dmSize");
+    assert_eq!(read_u32(&mut engine, 0x4068), 32, "dmBitsPerPel");
+    assert_eq!(read_u32(&mut engine, 0x406C), 1920, "dmPelsWidth");
+    assert_eq!(read_u32(&mut engine, 0x4070), 1080, "dmPelsHeight");
+    assert_eq!(read_u32(&mut engine, 0x4078), 60, "dmDisplayFrequency");
+
+    // A mode beyond the single entry is exhausted (FALSE).
+    write_regs(&mut engine, 0, 1, 0x4000, 0, STACK_TOP);
+    assert_return_value!(
+        user32::handle_enum_display_settings_a(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state
+        )),
+        0
+    );
+}
+
+/// EnumDisplayMonitors must invoke the guest `MONITORENUMPROC` exactly once,
+/// forwarding `(hMonitor, hdcMonitor, lprcMonitor, dwData)` and — via
+/// `Passthrough` — returning the callback's BOOL as the outer API's result.
+///
+/// SDL2's windows video driver depends on this: `WIN_InitModes` enumerates
+/// displays through `EnumDisplayMonitors`, so a handler that never calls back
+/// makes the driver see zero displays and `SDL_InitSubSystem(SDL_INIT_VIDEO)`
+/// fail.
+#[test]
+fn test_enum_display_monitors_bridges_to_guest_callback() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // Seed the guest-control bump cursor (ctrl_va 0x2000, bump offset 0) so the
+    // handler's coherent heap alloc for the fake RECT returns a valid address in
+    // this thin harness; the real runtime seeds the same cursor at startup.
+    engine
+        .mem_write(0x2000, &0x3000_u64.to_le_bytes())
+        .expect("seed guest heap bump cursor");
+    // RCX=hdc, RDX=clip-rect, R8=MONITORENUMPROC, R9=dwData.
+    write_regs(&mut engine, 0, 0, 0x9000, 0x1234, STACK_TOP);
+    let result = user32::handle_enum_display_monitors(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ));
+    let error = result.expect_err("EnumDisplayMonitors must bridge to the guest callback");
+    let signal = error
+        .downcast_ref::<crate::WinApiControlSignal>()
+        .expect("control signal");
+    match signal {
+        crate::WinApiControlSignal::GuestCallbackRequested { request } => {
+            assert_eq!(
+                request.callback_address, 0x9000,
+                "the guest MONITORENUMPROC"
+            );
+            assert_eq!(
+                request.window_handle,
+                user32::FAKE_MONITOR_HANDLE,
+                "hMonitor goes in RCX"
+            );
+            assert_eq!(
+                u64::from(request.message),
+                user32::FAKE_DEVICE_CONTEXT_HANDLE,
+                "hdcMonitor in RDX (fits in 32 bits)"
+            );
+            assert_eq!(request.long_parameter, 0x1234, "dwData in R9");
+            assert_eq!(request.outer_return, crate::OuterReturn::Passthrough);
+            // lprcMonitor must point at a real 1920×1080 RECT (not NULL) — other
+            // callers besides SDL may dereference it.
+            let rect_va = request.word_parameter;
+            let read_i32 = |engine: &mut IcedCpu, addr: u64| -> i32 {
+                let mut b = [0_u8; 4];
+                engine.mem_read(addr, &mut b).expect("read RECT i32");
+                i32::from_le_bytes(b)
+            };
+            assert_eq!(read_i32(&mut engine, rect_va), 0, "lprcMonitor.left");
+            assert_eq!(read_i32(&mut engine, rect_va + 4), 0, "lprcMonitor.top");
+            assert_eq!(
+                read_i32(&mut engine, rect_va + 8),
+                1920,
+                "lprcMonitor.right"
+            );
+            assert_eq!(
+                read_i32(&mut engine, rect_va + 12),
+                1080,
+                "lprcMonitor.bottom"
+            );
+        }
+        other => panic!("unexpected signal: {other:?}"),
+    }
+}
+
+/// A NULL `MONITORENUMPROC` (invalid per Win32) bails out with success rather
+/// than faulting or bridging into a null pointer.
+#[test]
+fn test_enum_display_monitors_null_callback_succeeds() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    write_regs(&mut engine, 0, 0, 0, 0, STACK_TOP);
+    assert_return_value!(
+        user32::handle_enum_display_monitors(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state,
+        )),
+        1
+    );
+}
+
+/// GetDCEx returns NULL (0) for an unknown window instead of a fake DC handle,
+/// honoring GetDCEx's documented failure mode (GetDC's fake-handle fallback is
+/// not reused here).
+#[test]
+fn test_get_dc_ex_returns_zero_for_an_unknown_window() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    write_regs(&mut engine, 0x1234, 0, 0, 0, STACK_TOP);
+    assert_return_value!(
+        user32::handle_get_dc_ex(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state
+        )),
+        0
+    );
+}
+
 #[test]
 fn test_keyboard_state_shift_update_path() {
     // Mirrors the host input seam (app.rs set_key_state): pressing the

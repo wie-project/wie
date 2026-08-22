@@ -1,7 +1,8 @@
 use super::{
     Context, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICE_PRIMARY_DEVICE,
-    FAKE_MONITOR_HANDLE, HandlerContext, Result, WinApiHandlerResult, checked_address,
-    write_guest_fixed_ansi, write_guest_fixed_utf16, write_guest_i32, write_guest_u32,
+    FAKE_DEVICE_CONTEXT_HANDLE, FAKE_MONITOR_HANDLE, HandlerContext, Result, WinApiHandlerResult,
+    checked_address, write_guest_fixed_ansi, write_guest_fixed_utf16, write_guest_i32,
+    write_guest_u32,
 };
 
 pub(crate) fn write_fake_monitor_info(
@@ -241,6 +242,18 @@ pub fn handle_monitor_from_point(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     ctx.finish(FAKE_MONITOR_HANDLE)
 }
 /// Handles dynamic `USER32.dll!EnumDisplayMonitors`.
+///
+/// Reports one fake attached primary monitor by invoking the guest
+/// `MONITORENUMPROC` callback exactly once, mirroring Windows: the callback
+/// receives `(hMonitor, hdcMonitor, lprcMonitor, dwData)` and its BOOL return
+/// becomes `EnumDisplayMonitors`'s own return (continue=TRUE, stop=FALSE).
+///
+/// SDL2's windows video driver relies on this: `WIN_InitModes` enumerates
+/// displays via `EnumDisplayMonitors`, so if no callback is ever invoked the
+/// driver sees zero displays, `WIN_InitModes` fails with "No displays
+/// available", and `SDL_InitSubSystem(SDL_INIT_VIDEO)` bails — leaving
+/// `SDL_GetNumVideoDisplays` to report "Video subsystem has not been
+/// initialized".
 pub fn handle_enum_display_monitors(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let _device_context = engine
@@ -251,21 +264,55 @@ pub fn handle_enum_display_monitors(ctx: &mut HandlerContext<'_>) -> Result<WinA
         .read_rdx()
         .context("failed to read RDX for EnumDisplayMonitors")?;
 
-    let _callback_va = engine
+    let callback_va = engine
         .read_r8()
         .context("failed to read R8 for EnumDisplayMonitors")?;
 
-    let _callback_data = engine
+    let callback_data = engine
         .read_r9()
         .context("failed to read R9 for EnumDisplayMonitors")?;
 
-    // First-pass behavior:
-    // report success, but do not call the callback yet.
-    //
-    // If Lunar Magic later depends on the callback being invoked, we will need
-    // to emulate a Win64 callback call into guest code with:
-    //   callback(fake_monitor, fake_hdc, rect_va, data)
-    ctx.finish(1)
+    if callback_va == 0 {
+        // A NULL callback is invalid per Win32, but fail soft and report
+        // success so no caller can crash.
+        return ctx.finish(1);
+    }
+
+    let state = &mut *ctx.state;
+
+    // The visible region of the fake monitor, as the MONITORENUMPROC
+    // `lprcMonitor` argument (a RECT). SDL ignores it; other callers may read
+    // it, so point it at the 1920×1080 desktop geometry the rest of the fake
+    // surface reports rather than NULL.
+    let rect_va = state.heap_state.heap.alloc_coherent(engine, 16);
+    if rect_va != 0 {
+        write_guest_i32(engine, checked_address(rect_va, 0, "lprcMonitor.left"), 0)?;
+        write_guest_i32(engine, checked_address(rect_va, 4, "lprcMonitor.top"), 0)?;
+        write_guest_i32(
+            engine,
+            checked_address(rect_va, 8, "lprcMonitor.right"),
+            1920,
+        )?;
+        write_guest_i32(
+            engine,
+            checked_address(rect_va, 12, "lprcMonitor.bottom"),
+            1080,
+        )?;
+    }
+
+    // Pack for the WndProc bridge: RCX=hMonitor, RDX=hdcMonitor, R8=lprcMonitor,
+    // R9=dwData; `Passthrough` forwards the callback's BOOL as the outer API's
+    // return value.
+    let request = super::GuestCallbackRequest {
+        callback_address: callback_va,
+        window_handle: FAKE_MONITOR_HANDLE,
+        message: u32::try_from(FAKE_DEVICE_CONTEXT_HANDLE).unwrap_or(0),
+        word_parameter: rect_va,
+        long_parameter: callback_data,
+        unicode: true,
+        outer_return: super::OuterReturn::Passthrough,
+    };
+    Err(super::WinApiControlSignal::GuestCallbackRequested { request }.into())
 }
 /// Handles dynamic `USER32.dll!EnumDisplayDevicesA`.
 pub fn handle_enum_display_devices_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
