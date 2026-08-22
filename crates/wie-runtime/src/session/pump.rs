@@ -629,26 +629,6 @@ impl QuantumHooks for SessionPumpHooks<'_> {
                         eprintln!(
                             "[VER] s_VERSION var@0x1404bb560 ptr={sptr:#x} content=\"{out}\""
                         );
-                        // [VER] temporary: parser line-buffer region hexdump
-                        let mut lb = [0_u8; 128];
-                        if engine.mem_read(0x207f_e500, &mut lb).is_ok() {
-                            let mut hex = String::new();
-                            for (i, b) in lb.iter().enumerate() {
-                                if i % 16 == 0 {
-                                    hex.push_str(&format!(
-                                        "\n[VER] {:06x}:",
-                                        0x207f_e500 + i as u64
-                                    ));
-                                }
-                                let c = if (0x20..0x7f).contains(b) {
-                                    *b as char
-                                } else {
-                                    '.'
-                                };
-                                hex.push_str(&format!(" {:02x}{}", b, c));
-                            }
-                            eprintln!("[VER] LB-REGION{hex}");
-                        }
                         // [VER] temporary: char-class chain integrity vs exe file
                         {
                             let exe = std::fs::read("real_exes/doomretro/doomretro.exe")
@@ -664,6 +644,31 @@ impl QuantumHooks for SessionPumpHooks<'_> {
                                     _ => (va - 0x1400_0000_0 - 0x1b20_00 + 0x1b0a_00) as usize,
                                 })
                             };
+                            let mut mode = [0_u8; 4];
+                            let _ = engine.mem_read(0x1405_7145_c, &mut mode);
+                            eprintln!(
+                                "[VER] MODE global@0x14057145c = {:#x}",
+                                u32::from_le_bytes(mode)
+                            );
+                            // [VER] temporary: which strlookup string-vars were
+                            // reassigned to heap pointers (proves BEX processing)?
+                            let mut vars = vec![0_u8; 0xC00];
+                            if engine.mem_read(0x1404_bb400, &mut vars).is_ok() {
+                                let mut n = 0_u32;
+                                for (k, chunk) in vars.chunks_exact(8).enumerate() {
+                                    let v = u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8]));
+                                    // heap-ish pointers under WIE: above the
+                                    // exe image, below 64 GiB
+                                    if (0x1_0000_0000..0x10_0000_0000).contains(&v) {
+                                        eprintln!(
+                                            "[VER] ASSIGNED var@{:#x} -> heap {v:#x}",
+                                            0x1404_bb400 + (k * 8) as u64
+                                        );
+                                        n += 1;
+                                    }
+                                }
+                                eprintln!("[VER] ASSIGNED count={n}");
+                            }
                             for (va, len) in [
                                 (0x1401_b21c_0_u64, 16_u64),
                                 (0x1401_b21d_0_u64, 16),

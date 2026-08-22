@@ -52,44 +52,30 @@ Reference constants: correct wrapper pair `{0x1401b21d0 (char-class struct ptr),
 SDL2.dll ImageBase `0x180000000`; deterministic guest stack slot `obj=0x207fddf0`,
 wrapper `W=0x207fdf60`.
 
-## 4. Open blocker (Lane S1): version `I_Error`
+## 4. Open blocker (Lane S1): version `I_Error` — narrowing chain (all verified)
 
-Symptom: guest prints *"The wrong version of C:\Program Files\DoomRetro\doomretro.wad was
-found."* then exits -1. Site: d_main.c:2863
-`if (!M_StringCompare(s_VERSION,"DOOM Retro v6.3")) I_Error(...)`. `s_VERSION` set from
-DEHACKED `[STRINGS]` (`src/d_deh.c`: deh_procStrings → deh_procStringSub → `*ppstr = value`).
+1. `s_VERSION` (`@0x1404bb560`) receives **zero stores** on every visible path across
+   entire slow-JIT runs -> neither doomretro.wad nor freedoom2.wad `[STRINGS]` processing
+   ever assigns VERSION.
+2. The `"VERSION"` lookup name (`@0x140180a10`) is **never read** ->
+   `deh_procStringSub`'s key compare never executes.
+3. DEHACKED dispatch IS running: `[STRINGS]`-entry byte[0] read **609x**; bytes[1..8]
+   read exactly **once each** -> doomretro.wad's own `[STRINGS]` header line was compared
+   once, walked the full name...
+4. ...and line-buffer content at compares is byte-correct (`"Patch File for D"`,
+   `"Doom version = 1"` = freedoom2's lump; `[STRINGS]` candidates present).
+5. => Failure is INSIDE `deh_procStrings` (or its first `dehfgets`/`deh_GetData`): the
+   handler bails before any key compare.
+6. Probes in flight: loads from the delivered DEHACKED guest buffer (`buffer_va`,
+   observed candidate `0x1600068d0`) -> discriminates "mem_fgets reads wrong bytes"
+   vs "deh_GetData/compare mis-executes".
 
-Verified facts:
-- `doomretro.wad` valid; DEHACKED lump @ file off 0x0c size 0x603b starting
-  `"[STRINGS]\r\nVERSION = DOOM Retro v6.3\r\n..."`. Wad opened + read (214 OK ReadFile).
-- Post-fix, crash gone; failure now nondeterministic across runs (v1 fail, v2 pass-until-
-  API-budget-exhausted, v3 fail).
-
-Static anchors already computed (exe sections):
-```
-.text  VA 0x140001000 raw? .rdata VA 0x140156000  .data VA 0x1401b2000 (ptr 0x1b0a00)
-"VERSION\0" occurs exactly once in file @ 0x17fc10   (section mapping TBD — see note)
-```
-NOTE: a quick offset→VA script had SizeOfRawData/PointerToRawData swapped; redo mapping
-with correct PE layout (+8 VirtualSize, +12 VA, +16 SizeOfRawData, +20 PointerToRawData).
-
-Anchors (COMPUTED, correct mapping):
-- `"VERSION\0"` @ VA `0x140180a10` (.rdata)
-- `deh_strlookup` entry @ `0x1404bba50` (entry+8 = lookup ptr)
-- **`s_VERSION` variable @ guest VA `0x1404bb560`** ([var] = char* of parsed string)
-- `[VER]` probe installed at pump.rs ExitProcess handler (exit_code != 0 → dump ptr+content).
-
-Method to find `s_VERSION`:
-1. Map file 0x17fc10 → true VA (call it V_STR).
-2. Scan `.data` raw for qword == V_STR at 8-byte alignment → that address is
-   `&entry.lookup` (= entry+8); entry+0 holds `&s_VERSION` variable (call it S_VAR).
-3. At runtime dump: `u64 p = mem[S_VAR]; string bytes at p`.
-Hook point: pump.rs "guest exited with a non-zero code" site (or ExitProcess handler);
-needs engine memory read access there.
-
-Hypotheses: s_VERSION empty (VERSION key never matched), mis-parsed value, or compare
-mis-execution. Watchpoint alternative: tag writes to `[S_VAR, +8)` in `GuestMemory::write`
-(caveat: JIT fast-path stores bypass it).
+Static anchors: `"VERSION\0"` @ `0x140180a10`; strlookup entry @ `0x1404bba50`;
+`s_VERSION` var @ `0x1404bb560`; char-class chain `0x1401b21c0->0x1401594d2`,
+`0x1401b21d0->0x140158fd0` (u16 table) - all verified intact in guest memory vs exe image.
+Parse-loop source (v6.3): `D_ProcessDehFile` loop = `dehfgets(inbuffer)` -> skip
+blank/#/space -> INCLUDE check -> `strncasecmp` scan of `deh_blocks[].key` -> else re-run
+last block handler (BEX style). `[STRINGS]` = index 10.
 
 ## 5. Optimization lanes
 
@@ -147,6 +133,19 @@ WIE_RUNTIME_PROFILE=1 ./target/release/wie run --max-api 20000000 --bottle doomr
 | S5 file path | ✅ buffered ReadFile 7→4 lookups (211→52 ms combined, −75%) |
 | S6 present | ◑ agent landed typed-BMIH refactor in dib.rs (kept); BitBlt 84 ms is debug-inflated — deprioritized |
 | cargo test | ✅ green after S4+S5 |
+
+
+### Verified post-fix profile deltas (debug, Doom Retro startup)
+
+| Row | Before | After |
+|---|---|---|
+| handler_ms total | 931 ms | 302 ms |
+| readfile | 151.8 ms / 3174 | 40.8 ms |
+| setfilepointerex | 59.6 ms / 2898 | 11.5 ms |
+| entercriticalsection | 120.4 ms / 12424 | 12.7 ms |
+| leavecriticalsection | 113.0 ms / 12424 | 12.8 ms |
+
+Handlers are now noise vs emulation; further perf work = S2/S3 JIT lanes.
 
 Dispatch note: 14 background sessions died silently with zero-to-partial output; two
 contaminated shared manifests (broken `zerocopy.byteorder` feature — fixed by revert).

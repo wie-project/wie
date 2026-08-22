@@ -204,27 +204,6 @@ pub fn handle_read_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
         {
             let open_file =
                 find_open_file(state, handle).context("ReadFile write: open file vanished")?;
-            // [VER] temporary: which doomretro.wad offsets does the guest read?
-            if open_file.path.contains("doomretro.wad") {
-                eprintln!(
-                    "[VER] READ doomretro.wad off={start:#x} len={} buffer_va={buffer_va:#x}",
-                    end - start
-                );
-                // [VER] temporary: dump the DEHACKED lump read as delivered to guest
-                if start == 0xc && end - start >= 48 {
-                    let head: String = open_file.bytes[start..start + 40]
-                        .iter()
-                        .map(|&b| {
-                            if (0x20..0x7f).contains(&b) {
-                                b as char
-                            } else {
-                                '.'
-                            }
-                        })
-                        .collect();
-                    eprintln!("[VER] DEHACKED read head: {head:?}");
-                }
-            }
             let data = open_file
                 .bytes
                 .get(start..end)

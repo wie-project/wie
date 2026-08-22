@@ -13,7 +13,7 @@ use super::*;
 /// Run `code` at [`SIMD_BASE`] through iced (stepping until `stop_rip`) and
 /// the JIT (chained `step_one` loop until `stop_rip`), then return both
 /// register files. Unlike [`super::simd_dual`], supports loops and calls.
-fn chain_dual(
+pub(super) fn chain_dual(
     code: &[u8],
     stop_rip: u64,
     setup: impl Fn(&mut RegFile) + Copy,

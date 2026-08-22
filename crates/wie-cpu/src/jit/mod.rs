@@ -240,6 +240,7 @@ pub struct JitStats {
 #[allow(clippy::expect_used)]
 mod tests {
     mod chain_tests;
+    mod strlen_repro;
     use super::*;
     use crate::exec::StepResult;
     use crate::mem::protect;

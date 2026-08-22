@@ -11,12 +11,6 @@ use super::{
 };
 
 use crate::exec::{self, StringOpKind};
-use std::cell::Cell;
-
-thread_local! {
-    /// [VER] temporary: fire the CANDIDATE deref dump exactly once.
-    static CMP_DEREF_DONE: Cell<bool> = const { Cell::new(false) };
-}
 use crate::jit::config::JitConfig;
 use crate::regs::{RegFile, Rflags};
 use cranelift::codegen::ir::{BlockArg, FuncRef};
@@ -115,109 +109,6 @@ pub(crate) unsafe extern "C" fn wie_jit_load(
     // SAFETY: caller passes a live `JitCtx` for the duration of the block.
     let ctx = unsafe { &mut *ctx };
     ctx.load_calls = ctx.load_calls.saturating_add(1);
-    // [VER] temporary: section-dispatch compare reads of "[STRINGS]" literal
-    if addr >= 0x140183168 && addr < 0x140183178 {
-        eprintln!("[VER] LOAD [STRINGS] lit addr={addr:#x} size={size} insn_ip={insn_ip:#x}");
-    }
-    // [VER] temporary: DEHACKED VERSION-key name reads (deh_strlookup compare)
-    if addr >= 0x140180a10 && addr < 0x140180a18 {
-        eprintln!("[VER] LOAD VERSION-name addr={addr:#x} size={size} insn_ip={insn_ip:#x}");
-    }
-    // [VER] temporary: loads from the delivered DEHACKED lump buffer (0x1600068d0
-    // observed as the ReadFile dest for the off=0xc lump read)
-    if addr >= 0x1600_068d_0 && addr < 0x1600_068d_0 + 0x6048 {
-        eprintln!("[VER] LUMPBUF load addr={addr:#x} ip={insn_ip:#x}");
-    }
-    // [VER] temporary: capture candidate text while comparing the [STRINGS] entry
-    if addr >= 0x140183168 && addr < 0x140183172 && insn_ip == 0x140133608 {
-        let mut p = [0_u8; 8];
-        let mem = unsafe { &*ctx.mem };
-        // r11/rbx roles per disassembly: this site reads the TABLE byte at `addr`;
-        // the candidate line pointer is whatever the paired site (…600) used — dump
-        // the known candidate slot for context.
-        if mem.read(0x207f_e570, &mut p).is_ok() {
-            let sptr = u64::from_le_bytes(p);
-            let mut s = [0_u8; 40];
-            let mut out = String::new();
-            if sptr != 0 && mem.read(sptr, &mut s).is_ok() {
-                for x in s {
-                    if x == 0 {
-                        break;
-                    }
-                    out.push(x as char);
-                }
-            }
-            eprintln!(
-                "[VER] STRINGS-CMP table_byte_addr={addr:#x} cand_slot_ptr={sptr:#x} deref=\"{out}\""
-            );
-        }
-    }
-    // [VER] temporary: byte-compare operands of M_StringCompare loop
-    if matches!(insn_ip, 0x140133600 | 0x140133608) {
-        let mut b = [0_u8; 1];
-        let mem = unsafe { &*ctx.mem };
-        match mem.read(addr, &mut b) {
-            Ok(()) => eprintln!(
-                "[VER] CMPBYTE ip={insn_ip:#x} addr={addr:#x} b={:#04x} '{}'",
-                b[0],
-                if (0x20..0x7f).contains(&b[0]) {
-                    b[0] as char
-                } else {
-                    '.'
-                }
-            ),
-            Err(_) => eprintln!("[VER] CMPBYTE ip={insn_ip:#x} addr={addr:#x} ERR"),
-        }
-        // [VER] one-shot deref of the candidate "line" pointer at the DEHACKED dispatch
-        if insn_ip == 0x140133600 && addr == 0x207f_e570 && !CMP_DEREF_DONE.get() {
-            CMP_DEREF_DONE.set(true);
-            let mut p = [0_u8; 8];
-            if mem.read(addr, &mut p).is_ok() {
-                let sptr = u64::from_le_bytes(p);
-                let mut s = [0_u8; 48];
-                let mut out = String::new();
-                if sptr != 0 && mem.read(sptr, &mut s).is_ok() {
-                    for x in s {
-                        if x == 0 {
-                            break;
-                        }
-                        out.push(x as char);
-                    }
-                }
-                eprintln!("[VER] CANDIDATE slot={addr:#x} -> ptr={sptr:#x} text=\"{out}\"");
-            }
-        }
-        // [VER] capture candidate inline text while comparing the [STRINGS] entry
-        if addr >= 0x140183168 && addr < 0x140183172 && insn_ip == 0x140133608 {
-            let mut slot = [0_u8; 16];
-            if mem.read(0x207f_e570, &mut slot).is_ok() {
-                let sptr = u64::from_le_bytes(slot[0..8].try_into().unwrap_or([0; 8]));
-                let mut s = [0_u8; 40];
-                let mut out = String::new();
-                if sptr != 0 && sptr < 0x1000_0000_000 && mem.read(sptr, &mut s).is_ok() {
-                    for x in s {
-                        if x == 0 {
-                            break;
-                        }
-                        out.push(x as char);
-                    }
-                }
-                let inline: String = slot
-                    .iter()
-                    .map(|&b| {
-                        if (0x20..0x7f).contains(&b) {
-                            b as char
-                        } else {
-                            '.'
-                        }
-                    })
-                    .collect();
-                eprintln!(
-                    "[VER] STRINGS-CMP tbl={addr:#x} cand_qword={sptr:#x} inline16=\"{inline}\" deref=\"{out}\""
-                );
-            }
-        }
-    }
     if ctx.fault != 0 {
         return 0;
     }
@@ -270,18 +161,6 @@ pub(crate) unsafe extern "C" fn wie_jit_store(
     // SAFETY: caller passes a live `JitCtx` for the duration of the block.
     let ctx = unsafe { &mut *ctx };
     ctx.store_calls = ctx.store_calls.saturating_add(1);
-    // [VER] temporary: line-buffer construction watch (Doom Retro parser)
-    if addr >= 0x207f_e570 && addr < 0x207f_e5b0 {
-        eprintln!(
-            "[VER] LB-STORE addr={addr:#x} size={size} value={value:#x} insn_ip={insn_ip:#x}"
-        );
-    }
-    // [VER] temporary: s_VERSION slot assignment watch
-    if addr >= 0x1404bb560 && addr < 0x1404bb568 {
-        eprintln!(
-            "[VER] STORE s_VERSION slot addr={addr:#x} value={value:#x} insn_ip={insn_ip:#x}"
-        );
-    }
     if ctx.fault != 0 {
         return;
     }

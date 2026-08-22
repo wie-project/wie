@@ -15,7 +15,7 @@ impl super::GuestMemory {
     /// so this method takes `&self` and is safe for concurrent caller threads.
     pub(crate) fn write(&self, address: u64, bytes: &[u8]) -> Result<(), crate::CpuError> {
         // [VER] temporary: s_VERSION slot store via the interpreter/host path
-        if address >= 0x1404_bb56_0 && address < 0x1404_bb56_8 {
+        if (0x1404_bb56_0..0x1404_bb56_8).contains(&address) {
             eprintln!(
                 "[VER] INTERP/HOST STORE s_VERSION slot addr={address:#x} len={} data={}",
                 bytes.len(),
