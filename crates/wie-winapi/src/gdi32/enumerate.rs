@@ -30,7 +30,7 @@ use crate::{
     WinApiState,
 };
 
-use super::font_system::{FontKey, ResolvedFont, system_family_names};
+use super::font_system::{EnumFamilyMetrics, enum_family_metrics, system_family_names};
 use super::state::dc_resolved_font;
 
 /// `TRUETYPE_FONTTYPE` — the `FontType` reported for every fontdb face.
@@ -103,23 +103,23 @@ fn round_i32(value: f32) -> i32 {
     value.round() as i32
 }
 
-/// Compute the shared TEXTMETRIC fields from a resolved font — mirrors
-/// `gdi32::state::metrics::resolve_text_metrics` so enumeration metrics agree
-/// with `GetTextMetrics`.
-fn text_metrics_from_resolved(resolved: &ResolvedFont, charset: u8) -> TextMetrics {
-    let ascent = round_i32(resolved.ascent);
-    let descent = 0_i32.saturating_sub(round_i32(resolved.descent));
-    let external = round_i32(resolved.line_gap);
+/// Compute the shared TEXTMETRIC fields from the zero-copy enumeration
+/// metrics — mirrors `gdi32::state::metrics::resolve_text_metrics` so
+/// enumerated metrics agree with `GetTextMetrics`.
+fn text_metrics_from_enum(metrics: &EnumFamilyMetrics, charset: u8) -> TextMetrics {
+    let ascent = round_i32(metrics.ascent);
+    let descent = 0_i32.saturating_sub(round_i32(metrics.descent));
+    let external = round_i32(metrics.line_gap);
     let height = ascent.saturating_add(descent);
-    let internal = round_i32((resolved.ascent - resolved.descent - resolved.scale).max(0.0));
+    let internal = round_i32((metrics.ascent - metrics.descent - 16.0).max(0.0));
     TextMetrics {
         height,
         ascent,
         descent,
         internal_leading: internal,
         external_leading: external,
-        avg_width: resolved.avg_advance,
-        max_width: resolved.max_advance,
+        avg_width: metrics.avg_advance,
+        max_width: metrics.max_advance,
         weight: 400,
         italic: false,
         charset,
@@ -195,37 +195,32 @@ fn log_font_w_from_a(lf: &LogFontA) -> LogFontW {
 /// (case-insensitive); an empty filter enumerates every family. `charset` is
 /// the requested `lfCharSet` (DEFAULT_CHARSET matches all).
 fn build_items(
-    state: &mut WinApiState,
+    _state: &mut WinApiState,
     filter: Option<&str>,
     charset: u8,
 ) -> Result<Vec<EnumItem>> {
-    let families = system_family_names();
-    state.with_font_engine(|_state, font_engine| {
-        let mut items = Vec::new();
-        for family in families {
-            if let Some(f) = filter
-                && !family.to_lowercase().contains(&f.to_lowercase())
-            {
-                continue;
-            }
-            let key = FontKey {
-                family: family.clone(),
-                weight: 400,
-                ..Default::default()
-            };
-            if let Some(resolved) = font_engine.resolve(&key, 16) {
-                let metrics = text_metrics_from_resolved(&resolved, charset);
-                items.push(EnumItem {
-                    log_font: make_logfont(&family, charset),
-                    full_name: family.clone(),
-                    style: "Regular".to_string(),
-                    script: String::new(),
-                    metrics,
-                });
-            }
+    let _t0 = std::time::Instant::now();
+    let _families = system_family_names();
+    let mut items = Vec::with_capacity(_families.len().min(1024));
+    for family in _families {
+        if let Some(f) = filter
+            && !family.to_lowercase().contains(&f.to_lowercase())
+        {
+            continue;
         }
-        Ok(items)
-    })
+        // Zero-copy metrics: enumerate must not load (and copy) every system
+        // face into an owned FontArc just to report a TEXTMETRIC per family.
+        if let Some(metrics) = enum_family_metrics(&family) {
+            items.push(EnumItem {
+                log_font: make_logfont(&family, charset),
+                full_name: family.clone(),
+                style: "Regular".to_string(),
+                script: String::new(),
+                metrics: text_metrics_from_enum(&metrics, charset),
+            });
+        }
+    }
+    Ok(items)
 }
 
 /// Register a new enumeration and return its id.

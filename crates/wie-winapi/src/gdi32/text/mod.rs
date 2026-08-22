@@ -724,13 +724,10 @@ fn handle_draw_text_impl(
             let resolved_font = dc_resolved_font(state, hdc, font_engine);
             match &resolved_font {
                 Some((key, resolved)) => {
-                    let mut width = 0_i32;
-                    for &code in &chars {
-                        if let Some(ch) = char::from_u32(code) {
-                            width =
-                                width.saturating_add(font_engine.char_advance(resolved, key, ch));
-                        }
-                    }
+                    // One advance pass over the raw code points: no per-char
+                    // char_advance calls (each cloned the FontKey).
+                    let scaled = resolved.scaled();
+                    let width = font_engine.text_advance_codepoints(&scaled, resolved, key, &chars);
                     (resolved.line_height(), width)
                 }
                 None => (16, 0),

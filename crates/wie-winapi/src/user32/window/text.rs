@@ -58,17 +58,16 @@ fn handle_set_window_text_impl(
                 // A label control's old caption must survive the replacement:
                 // the text-change invalidation measures both captions so the
                 // next paint erases the previous glyphs (same as the WM_SETTEXT
-                // dispatch arm).
-                let old_text = if matches!(
-                    window.control_kind,
+                // dispatch arm). Only Button/Static label controls consume the
+                // old caption — the clone is skipped for every other kind
+                // (EDITs etc.), the common `SetWindowText` target.
+                let kind = window.control_kind;
+                let old_text = matches!(
+                    kind,
                     Some(crate::user32::controls::ControlClassKind::Button)
                         | Some(crate::user32::controls::ControlClassKind::Static)
-                ) {
-                    window.control_text.clone()
-                } else {
-                    String::new()
-                };
-                let kind = window.control_kind;
+                )
+                .then(|| window.control_text.clone());
                 window.control_text = text.clone();
                 window.invalidated = true;
                 // Real Windows clears an EDIT's undo buffer when the program
@@ -85,11 +84,7 @@ fn handle_set_window_text_impl(
                     crate::user32::controls::edit_set_selection(state, window_handle, -1, -1);
                     crate::user32::controls::edit_reset_invalid_rows(state, window_handle);
                 }
-                if matches!(
-                    kind,
-                    Some(crate::user32::controls::ControlClassKind::Button)
-                        | Some(crate::user32::controls::ControlClassKind::Static)
-                ) {
+                if let Some(old_text) = old_text {
                     crate::user32::controls::label_invalidate_text_change(
                         state,
                         window_handle,

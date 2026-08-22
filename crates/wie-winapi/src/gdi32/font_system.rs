@@ -15,7 +15,9 @@
 use ahash::HashMap;
 use std::sync::OnceLock;
 
-use ab_glyph::{Font, FontArc, FontVec, Glyph, GlyphId, Point, PxScale, PxScaleFont, ScaleFont};
+use ab_glyph::{
+    Font, FontArc, FontRef, FontVec, Glyph, GlyphId, Point, PxScale, PxScaleFont, ScaleFont,
+};
 use fontdb::{Family, Query, Stretch, Style, Weight};
 
 /// Process-wide system font database (read-only after init).
@@ -46,6 +48,58 @@ pub(crate) fn system_family_names() -> Vec<String> {
     names.sort();
     names.dedup();
     names
+}
+
+/// The px metrics one enumerated family reports (16 px, weight 400).
+///
+/// Same fields `build_resolved` computes at `height_px == 16`
+/// (scale = 16 = character height), so the TEXTMETRIC the guest sees from
+/// `EnumFontFamiliesExW` is byte-identical to the old font-engine path.
+#[derive(Debug, Clone, Copy)]
+pub struct EnumFamilyMetrics {
+    pub ascent: f32,
+    pub descent: f32,
+    pub line_gap: f32,
+    pub avg_advance: i32,
+    pub max_advance: i32,
+}
+
+/// Zero-copy 16 px metrics for `family` — the enumeration lane's metric path.
+///
+/// The enumeration reports a TEXTMETRIC for every system family. Loading an
+/// owned [`FontArc`] (the [`FontEngine::resolve`] path) copies the entire font
+/// file (`FontVec::try_from_vec` owns its data); for a tens-of-MB CJK/emoji
+/// `.ttc` that copy dominates `EnumFontFamiliesExW`. Borrowing the raw font
+/// data as a [`FontRef`] computes the identical px metrics from only the
+/// cmap/hhea/hmtx tables, faulting in a fraction of each file. The file is
+/// still opened via `with_face_data`, but no full-file copy or whole-face
+/// parse happens.
+///
+/// [`FontEngine::resolve`]: FontEngine::resolve
+#[must_use]
+pub(crate) fn enum_family_metrics(family: &str) -> Option<EnumFamilyMetrics> {
+    let db = system_font_db();
+    let selection = family_selection_for(family, false);
+    let (id, _, _) = face_id_for(&selection, 400, false, false)?;
+    db.with_face_data(id, |data, index| {
+        let font = FontRef::try_from_slice_and_index(data, index).ok()?;
+        let scaled = font.as_scaled(PxScale::from(16.0));
+        let avg_advance = round_px(
+            (scaled.h_advance(scaled.glyph_id('x')) + scaled.h_advance(scaled.glyph_id('m'))) * 0.5,
+        );
+        let max_advance = (0x20_u32..=0x7E)
+            .filter_map(char::from_u32)
+            .map(|ch| round_px(scaled.h_advance(scaled.glyph_id(ch))))
+            .fold(0_i32, i32::max);
+        Some(EnumFamilyMetrics {
+            ascent: scaled.ascent(),
+            descent: scaled.descent(),
+            line_gap: scaled.line_gap(),
+            avg_advance,
+            max_advance,
+        })
+    })
+    .flatten()
 }
 
 /// Fallback faces tried (in order) when the primary face lacks a glyph
@@ -274,7 +328,6 @@ fn load_face(id: fontdb::ID) -> Option<FontArc> {
     })
     .flatten()
 }
-
 /// Round a px advance to an integer (the unit all metric APIs report).
 fn round_px(value: f32) -> i32 {
     value.round() as i32
@@ -522,9 +575,44 @@ impl FontEngine {
         text: &str,
         end: usize,
     ) -> i32 {
+        self.accumulate_advances(scaled, resolved, key, text.chars().take(end))
+    }
+
+    /// Advance sum over raw code points (the extent path's `Vec<u32>` from
+    /// `read_text_chars`) — skips the intermediate `String`/UTF-8 round trip
+    /// `GetTextExtentPoint32*` used to pay on every measurement call.
+    pub(crate) fn text_advance_codepoints(
+        &mut self,
+        scaled: &PxScaleFont<&FontArc>,
+        resolved: &ResolvedFont,
+        key: &FontKey,
+        codes: &[u32],
+    ) -> i32 {
+        self.accumulate_advances(
+            scaled,
+            resolved,
+            key,
+            codes.iter().filter_map(|&cp| char::from_u32(cp)),
+        )
+    }
+
+    /// Core advance accumulation shared by the `&str` and code-point lanes.
+    ///
+    /// The glyph-cache lookup key is built ONCE per call — one `FontKey` clone
+    /// — and the per-character loop only mutates the `char` slot of a stack
+    /// tuple. A long extent measure therefore makes no per-char heap
+    /// allocations (the old loop cloned the key — two allocs per character).
+    fn accumulate_advances(
+        &mut self,
+        scaled: &PxScaleFont<&FontArc>,
+        resolved: &ResolvedFont,
+        key: &FontKey,
+        chars: impl Iterator<Item = char>,
+    ) -> i32 {
         let mut total = 0_i32;
-        for ch in text.chars().take(end) {
-            let cache_key = (key.clone(), resolved.height_px, ch);
+        let mut cache_key = (key.clone(), resolved.height_px, '\0');
+        for ch in chars {
+            cache_key.2 = ch;
             if let Some(glyph) = self.glyph_cache.get(&cache_key) {
                 total = total.saturating_add(glyph.advance);
                 continue;
