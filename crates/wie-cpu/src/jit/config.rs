@@ -160,7 +160,7 @@ impl JitConfig {
             // inline compilation. A single compile is ~50–500 µs, so 10 ms is
             // ~20× headroom; the fallback only triggers on queue backlog or a
             // dead worker.
-            bg_wait_timeout: Duration::from_micros(env_u64("WIE_JIT_BG_TIMEOUT_US", 10_000)),
+            bg_wait_timeout: Duration::from_micros(env_u64("WIE_JIT_BG_TIMEOUT_US", 1_000)),
             // Cranelift `opt_level`: `speed` | `speed_and_size` | `none`.
             // Default `speed` (hot guest blocks over code size).
             opt_level: match std::env::var("WIE_JIT_OPT") {
