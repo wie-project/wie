@@ -126,7 +126,7 @@ WIE_RUNTIME_PROFILE=1 ./target/release/wie run --max-api 20000000 --bottle doomr
 | Item | State |
 |---|---|
 | xmm writeback fix | ✅ committed (checkpoint) |
-| S1 version `I_Error` | 🔎 narrowing: compare receives non-text pointer slot (`0x207fe570`, first byte `'A'` = pointer low byte); CANDIDATE-deref probe running |
+| S1 version `I_Error` | ⏳ JIT high-byte testb bug FOUND & FIXED (gpr.rs read+write); version error persists → additional byte-reg or mem-stream defect remains; see docs/lanes/S1.md for full chain |
 | S2 stalls | ⏸ notes only (`docs/lanes/S2.md`) |
 | S3 dispatcher | ⏸ not started |
 | S4 kernel32 misc | ✅ CRS fast path via one `host_span` (233→25.5 ms, −89%); locale/env caching pending |
