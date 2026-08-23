@@ -97,7 +97,11 @@ impl JitConfig {
                 Ok(v) if v.eq_ignore_ascii_case("sticky") || v.eq_ignore_ascii_case("fast") => {
                     JitMemMode::Sticky
                 }
-                _ => JitMemMode::Sticky,
+                _ => {
+                    // Pin mode reduces helper-path memory ops by ~89% on
+                    // Doom Retro startup (21M→2.4M load helpers).
+                    JitMemMode::Pin
+                }
             },
             // Opt-in mem helper resolution histogram (also dumps when residual
             // iced trace is on, for profiling runs).

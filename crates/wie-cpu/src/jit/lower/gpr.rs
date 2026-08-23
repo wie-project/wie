@@ -295,8 +295,8 @@ pub(super) fn read_op_mem(
                 )
             {
                 let full = read_gpr(gpr, reg)?;
-                let shift = bcx.ins().iconst(types::I64, 8);
-                Ok(bcx.ins().ushr(full, shift))
+                let sh = bcx.ins().iconst(types::I64, 8);
+                Ok(bcx.ins().ushr(full, sh))
             } else {
                 read_gpr(gpr, reg)
             }
