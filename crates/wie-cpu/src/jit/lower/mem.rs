@@ -109,6 +109,38 @@ pub(crate) unsafe extern "C" fn wie_jit_load(
     // SAFETY: caller passes a live `JitCtx` for the duration of the block.
     let ctx = unsafe { &mut *ctx };
     ctx.load_calls = ctx.load_calls.saturating_add(1);
+
+    // [VER] temporary: capture candidate text while comparing the [STRINGS] entry
+    if ctx.fault == 0 && addr >= 0x140183168 && addr < 0x140183172 && insn_ip == 0x140133608 {
+        let mem = unsafe { &*ctx.mem };
+        let mut slot = [0_u8; 16];
+        if mem.read(0x207f_e570, &mut slot).is_ok() {
+            let sptr = u64::from_le_bytes(slot[0..8].try_into().unwrap_or([0; 8]));
+            let mut sb = [0_u8; 40];
+            let mut out = String::new();
+            if sptr != 0 && sptr < 0x1000_0000_000 && mem.read(sptr, &mut sb).is_ok() {
+                for x in sb {
+                    if x == 0 {
+                        break;
+                    }
+                    out.push(x as char);
+                }
+            }
+            let inline: String = slot
+                .iter()
+                .map(|&b| {
+                    if (0x20..0x7f).contains(&b) {
+                        b as char
+                    } else {
+                        '.'
+                    }
+                })
+                .collect();
+            eprintln!(
+                "[VER] SCMP tbl={addr:#x} cand_qword={sptr:#x} inline16=\"{inline}\" deref=\"{out}\""
+            );
+        }
+    }
     if ctx.fault != 0 {
         return 0;
     }

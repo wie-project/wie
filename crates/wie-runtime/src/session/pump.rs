@@ -650,6 +650,39 @@ impl QuantumHooks for SessionPumpHooks<'_> {
                                 "[VER] MODE global@0x14057145c = {:#x}",
                                 u32::from_le_bytes(mode)
                             );
+                            // [VER] temporary: dump deh_strlookup[0] (the VERSION
+                            // entry: {ppstr, lookup, assigned}) — assigned != 0
+                            // proves the key was processed.
+                            let mut e0 = [0_u8; 24];
+                            if engine.mem_read(0x1404_bba50, &mut e0).is_ok() {
+                                let pp = u64::from_le_bytes(e0[0..8].try_into().unwrap_or([0; 8]));
+                                let lk = u64::from_le_bytes(e0[8..16].try_into().unwrap_or([0; 8]));
+                                let asg =
+                                    u32::from_le_bytes(e0[16..20].try_into().unwrap_or([0; 4]));
+                                let mut nm = [0_u8; 12];
+                                let _ = engine.mem_read(lk, &mut nm);
+                                let name: String = nm
+                                    .iter()
+                                    .take_while(|&&b| b != 0)
+                                    .map(|&b| b as char)
+                                    .collect();
+                                let mut sv = [0_u8; 40];
+                                let mut val = String::new();
+                                let sptr =
+                                    u64::from_le_bytes(e0[0..8].try_into().unwrap_or([0; 8]));
+                                let _ = engine.mem_read(pp, &mut sv[..8]);
+                                let vp = u64::from_le_bytes(sv[..8].try_into().unwrap_or([0; 8]));
+                                let _ = engine.mem_read(vp, &mut sv);
+                                for b in sv {
+                                    if b == 0 {
+                                        break;
+                                    }
+                                    val.push(b as char);
+                                }
+                                eprintln!(
+                                    "[VER] strlookup[0] name={name:?} ppstr={pp:#x} -> string-ptr={vp:#x} string={val:?} assigned={asg}"
+                                );
+                            }
                             // [VER] temporary: which strlookup string-vars were
                             // reassigned to heap pointers (proves BEX processing)?
                             let mut vars = vec![0_u8; 0xC00];
@@ -668,6 +701,25 @@ impl QuantumHooks for SessionPumpHooks<'_> {
                                     }
                                 }
                                 eprintln!("[VER] ASSIGNED count={n}");
+                                // deref each reassigned var to identify its key text
+                                for (k, chunk) in vars.chunks_exact(8).enumerate() {
+                                    let v = u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8]));
+                                    if !(0x1_0000_0000..0x10_0000_0000).contains(&v) {
+                                        continue;
+                                    }
+                                    let va = 0x1404_bb400 + (k * 8) as u64;
+                                    let mut sb = [0_u8; 40];
+                                    let mut txt = String::new();
+                                    if engine.mem_read(v, &mut sb).is_ok() {
+                                        for b in sb {
+                                            if b == 0 {
+                                                break;
+                                            }
+                                            txt.push(b as char);
+                                        }
+                                    }
+                                    eprintln!("[VER] Deref var@{va:#x} = {txt:?}");
+                                }
                             }
                             for (va, len) in [
                                 (0x1401_b21c_0_u64, 16_u64),

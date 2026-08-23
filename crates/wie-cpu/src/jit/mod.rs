@@ -241,6 +241,7 @@ pub struct JitStats {
 mod tests {
     mod chain_tests;
     mod strlen_repro;
+    mod testb_high_byte;
     use super::*;
     use crate::exec::StepResult;
     use crate::mem::protect;

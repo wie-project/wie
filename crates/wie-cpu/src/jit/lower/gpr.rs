@@ -121,11 +121,23 @@ pub(super) fn write_gpr(
         let low = bcx.ins().band(val, low_mask);
         bcx.ins().bor(cleared, low)
     } else {
+        // Legacy high-byte registers (AH/BH/CH/DH) live at bits 8..15 of the
+        // full register: merge `val & 0xFF` into that byte.
         if matches!(
             reg,
             Register::AH | Register::BH | Register::CH | Register::DH
         ) {
-            return Err("AH/BH/CH/DH not in JIT v1".into());
+            let old = gpr[i];
+            let keep = bcx.ins().iconst(types::I64, !0xff00_i64);
+            let cleared = bcx.ins().band(old, keep);
+            let low_mask = bcx.ins().iconst(types::I64, 0xff);
+            let low = bcx.ins().band(val, low_mask);
+            let shift = bcx.ins().iconst(types::I64, 8);
+            let shifted = bcx.ins().ishl(low, shift);
+            let new_v = bcx.ins().bor(cleared, shifted);
+            gpr[i] = new_v;
+            dirty[i] = true;
+            return Ok(());
         }
         let old = gpr[i];
         let mask = bcx.ins().iconst(types::I64, !0xff_i64);
@@ -272,7 +284,23 @@ pub(super) fn read_op_mem(
     mem: &mut MemEnv,
 ) -> Result<Value, String> {
     match instr.op_kind(op) {
-        OpKind::Register => read_gpr(gpr, instr.op_register(op)),
+        OpKind::Register => {
+            let reg = instr.op_register(op);
+            // Legacy high-byte regs (AH/BH/CH/DH) live at bits 8..15 of the
+            // full register: shift down so width masking selects them.
+            if reg.size() == 1
+                && matches!(
+                    reg,
+                    Register::AH | Register::BH | Register::CH | Register::DH
+                )
+            {
+                let full = read_gpr(gpr, reg)?;
+                let shift = bcx.ins().iconst(types::I64, 8);
+                Ok(bcx.ins().ushr(full, shift))
+            } else {
+                read_gpr(gpr, reg)
+            }
+        }
         OpKind::Memory => {
             let addr = effective_addr(bcx, instr, gpr, mem)?;
             let width = mem_width_bytes(instr)?;
